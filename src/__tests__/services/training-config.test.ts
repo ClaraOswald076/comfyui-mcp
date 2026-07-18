@@ -96,6 +96,33 @@ describe("buildTrainingConfig (character / flux1-dev)", () => {
     expect(parse(yaml)).toEqual(config);
   });
 
+  it("never lets a dots-only name escape the output dir (codex #1)", () => {
+    expect(proc({ ...base, name: ".." }).name).toBe("lora");
+    expect(proc({ ...base, name: "." }).name).toBe("lora");
+    // "/" collapses to "_" → ".._evil": no longer a ".." segment, harmless dir name.
+    expect(proc({ ...base, name: "../evil" }).name).toBe(".._evil");
+    expect(proc({ ...base, name: "  " }).name).toBe("lora");
+  });
+
+  it("inserts a trigger containing replace special sequences literally (codex #2)", () => {
+    const { p } = proc({ ...base, trigger: "$&" });
+    const prompts = (p.sample as { prompts: string[] }).prompts;
+    expect(prompts[0].startsWith("$& ")).toBe(true);
+    expect(prompts.some((pr) => pr.includes("[trigger]"))).toBe(false);
+  });
+
+  it("ignores undefined param overrides instead of erasing defaults (codex #3)", () => {
+    const { p } = proc({ ...base, params: { steps: undefined, rank: undefined } });
+    expect((p.train as Record<string, unknown>).steps).toBe(DEFAULT_PARAMS.steps);
+    expect((p.network as Record<string, unknown>).linear).toBe(DEFAULT_PARAMS.rank);
+  });
+
+  it("rejects non-positive or empty params", () => {
+    expect(() => buildTrainingConfig({ ...base, params: { steps: 0 } })).toThrow(/must be positive/);
+    expect(() => buildTrainingConfig({ ...base, params: { resolution: [] } })).toThrow(/resolution/);
+    expect(() => buildTrainingConfig({ ...base, params: { resolution: [0] } })).toThrow(/resolution/);
+  });
+
   it("rejects unsupported flow/model", () => {
     // @ts-expect-error - exercising the runtime guard with a bad flow
     expect(() => buildTrainingConfig({ ...base, flow: "style" })).toThrow(/unsupported training flow/);

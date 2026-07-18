@@ -116,10 +116,14 @@ export interface BuiltTrainingConfig {
   yaml: string;
 }
 
-/** ai-toolkit uses the job name as a filesystem path — keep it safe. */
+/** ai-toolkit uses the job name as a filesystem path segment (it joins
+ *  training_folder/name and writes there) — keep it safe. Dots-only names like
+ *  "." / ".." would escape or collapse the per-job directory, so they fall back
+ *  to "lora" (codex review finding #1). */
 function sanitizeName(name: string): string {
   const cleaned = name.trim().replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "");
-  return cleaned || "lora";
+  if (!cleaned || /^\.+$/.test(cleaned)) return "lora";
+  return cleaned;
 }
 
 /**
@@ -137,10 +141,24 @@ export function buildTrainingConfig(input: TrainingConfigInput): BuiltTrainingCo
   }
 
   const jobName = sanitizeName(input.name);
-  const p: TrainParams = { ...DEFAULT_PARAMS, ...input.params };
+  // Drop undefined overrides so `{steps: undefined}` can't erase a default
+  // (codex finding #3), then validate the merged values.
+  const overrides = Object.fromEntries(
+    Object.entries(input.params ?? {}).filter(([, v]) => v !== undefined),
+  ) as Partial<TrainParams>;
+  const p: TrainParams = { ...DEFAULT_PARAMS, ...overrides };
+  if (!(p.steps > 0) || !(p.lr > 0) || !(p.rank > 0) || !(p.batchSize > 0) || !(p.saveEvery > 0) || !(p.sampleEvery > 0)) {
+    throw new Error("invalid training params: steps/lr/rank/batchSize/saveEvery/sampleEvery must be positive");
+  }
+  if (!Array.isArray(p.resolution) || p.resolution.length === 0 || p.resolution.some((r) => !(r > 0))) {
+    throw new Error("invalid training params: resolution must be a non-empty list of positive sizes");
+  }
   const device = input.device ?? "cuda:0";
+  // Function replacer: a trigger like "$&" must be inserted literally, not
+  // interpreted as a String.replace special sequence (codex finding #2).
+  const trigger = input.trigger;
   const prompts = (input.samplePrompts ?? DEFAULT_CHARACTER_PROMPTS).map((s) =>
-    input.trigger ? s.replace(/\[trigger\]/g, input.trigger) : s.replace(/\[trigger\]\s*/g, ""),
+    trigger ? s.replace(/\[trigger\]/g, () => trigger) : s.replace(/\[trigger\]\s*/g, ""),
   );
 
   const process: Record<string, unknown> = {
