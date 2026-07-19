@@ -652,6 +652,10 @@ const CALL_TOOL_WHITELIST = new Set<string>([
   // the same story server-side from history + re-validating the graph that ran.
   // Read-only.
   "diagnose_run",
+  // Read-only training surface: flow/model discovery + progress polling for the
+  // mobile Training tab (train_start/cancel stay agent-side for now).
+  "train_list_flows",
+  "train_status",
 ]);
 
 /** Lazily build ONE in-process MCP client wired to the full comfyui tool surface,

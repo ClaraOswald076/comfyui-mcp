@@ -136,6 +136,11 @@ export interface TrainingProgress {
  * Parse one stdout line from ai-toolkit into a progress tick. ai-toolkit prints a
  * tqdm-style bar with the job name, `<step>/<total>` and a `loss: <n>` postfix,
  * e.g. `my_lora:  12%|#2 | 240/2000 [01:03<07:41, ... loss: 3.9e-01]`.
+ *
+ * A bare `<n>/<total>` is NOT trusted as training progress: ai-toolkit also
+ * prints dataset-scan / download / weight-loading bars (e.g. `6/6`) that would
+ * otherwise masquerade as steps (found by the first real E2E run). Step/total
+ * is only assigned when the line also carries a loss reading.
  */
 export function parseTrainingProgress(line: string): TrainingProgress | null {
   const raw = line.trim();
@@ -145,7 +150,7 @@ export function parseTrainingProgress(line: string): TrainingProgress | null {
   const sampleMatch = raw.match(/(?:saved|sample).*?([^\s'"]+\.(?:png|jpg|jpeg))/i);
   if (!stepMatch && !lossMatch && !sampleMatch) return null;
   const tick: TrainingProgress = { raw };
-  if (stepMatch) {
+  if (stepMatch && lossMatch) {
     tick.step = Number(stepMatch[1]);
     tick.totalSteps = Number(stepMatch[2]);
   }
@@ -154,6 +159,8 @@ export function parseTrainingProgress(line: string): TrainingProgress | null {
     if (Number.isFinite(n)) tick.loss = n;
   }
   if (sampleMatch) tick.sample = sampleMatch[1];
+  // A line with ONLY a bare step/total (no loss, no sample) is not progress.
+  if (tick.step === undefined && tick.loss === undefined && tick.sample === undefined) return null;
   return tick;
 }
 
@@ -176,7 +183,10 @@ export function startTraining(opts: {
   const args = [
     "run", "--rm", "--gpus", "all", "--name", opts.containerName,
     "-v", `${opts.configPath}:/config.yml:ro`,
-    "-v", `${opts.datasetPath}:/dataset:ro`,
+    // Dataset is mounted READ-WRITE: ai-toolkit writes cache files into it
+    // (.aitk_size.json, latent caches) — a read-only mount fails the run
+    // ([Errno 30] on .aitk_size.json, found by the first real E2E run).
+    "-v", `${opts.datasetPath}:/dataset`,
     "-v", `${opts.outputDir}:/output`,
   ];
   if (opts.hfCacheDir) args.push("-v", `${opts.hfCacheDir}:/root/.cache/huggingface`);
@@ -208,11 +218,26 @@ export function startTraining(opts: {
   return { containerName: opts.containerName, done, child };
 }
 
-/** Stop a running training container (best-effort). `docker stop` on an
- *  already-gone container is idempotent success for us. */
+/** Stop a running training container. The envelope is honest about failure:
+ *  a non-zero `docker stop` (daemon down, timeout) yields ok:false so callers
+ *  don't report a container as stopped while it keeps burning GPU. An
+ *  already-gone container counts as stopped. */
 export async function stopTraining(containerName: string): Promise<TrainerEnvelope<{ stopped: string }>> {
-  await execDocker(["stop", "-t", "10", containerName], 30_000);
+  const r = await execDocker(["stop", "-t", "10", containerName], 30_000);
+  if (r.code !== 0 && !/no such (object|container)/i.test(r.stderr)) {
+    return fail("train_cancel", "stop_failed", `docker stop ${containerName} failed: ${r.stderr.trim() || `exit ${r.code}`}`, r.stderr);
+  }
   return ok("train_cancel", { stopped: containerName });
+}
+
+/** Is this training container currently running? `false` when it definitively
+ *  does not exist, `null` when we can't tell (docker daemon down, etc.) — the
+ *  registry uses this to avoid mis-marking a live foreign-process job failed. */
+export async function containerRunning(containerName: string): Promise<boolean | null> {
+  const r = await execDocker(["inspect", "-f", "{{.State.Running}}", containerName]);
+  if (r.code === 0) return r.stdout.trim() === "true";
+  if (/no such (object|container)/i.test(r.stderr)) return false;
+  return null;
 }
 
 // ---- helpers ---------------------------------------------------------------

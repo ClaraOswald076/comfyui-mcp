@@ -53,6 +53,7 @@ import { registerCalculateTools } from "./calculate.js";
 import { registerComfyUISettingsTools } from "./comfyui-settings.js";
 import { registerNodeDevTools } from "./node-dev.js";
 import { registerComfyCliTools } from "./comfy-cli.js";
+import { registerTrainTools } from "./train.js";
 import { DefaultsManager } from "../services/defaults-manager.js";
 import { ToolCatalog } from "./catalog.js";
 
@@ -115,6 +116,7 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   ["diagnostics", registerCalculateTools],
   ["server", registerComfyUISettingsTools],
   ["custom-nodes", registerNodeDevTools],
+  ["training", registerTrainTools],
 ];
 
 // ── Blind content mode (panel issue #90) ────────────────────────────────────

@@ -28,6 +28,14 @@ describe("parseTrainingProgress", () => {
     expect(parseTrainingProgress("   ")).toBeNull();
   });
 
+  it("ignores bare dataset/download bars without a loss reading", () => {
+    // Real E2E artifact: the dataset-scan bar "6/6" was misparsed as step 6/6.
+    expect(parseTrainingProgress("100%|##########| 6/6 [00:00<00:00, 15.00it/s]")).toBeNull();
+    expect(parseTrainingProgress(" 33%|###       | 2/6 [00:00<00:00, 14.54it/s]")).toBeNull();
+    const t = parseTrainingProgress("Loading weights: 100%|###| 196/196 [00:00<00:00, 2669.35it/s]");
+    expect(t).toBeNull();
+  });
+
   it("always keeps the raw line", () => {
     const t = parseTrainingProgress("100/200 loss: 0.5");
     expect(t!.raw).toBe("100/200 loss: 0.5");

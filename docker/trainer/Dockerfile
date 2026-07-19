@@ -12,14 +12,15 @@
 # Run (bind config + dataset + output + HF cache; --gpus all is required):
 #   docker run --rm --gpus all \
 #     -v /path/config.yml:/config.yml:ro \
-#     -v /path/dataset:/dataset:ro \
+#     -v /path/dataset:/dataset \
 #     -v /path/output:/output \
 #     -v $HOME/.cache/huggingface:/root/.cache/huggingface \
 #     -e HF_TOKEN=$HF_TOKEN \
 #     comfyui-mcp-trainer:latest /config.yml
 #
 # The config's training_folder must be /output and datasets[].folder_path /dataset
-# (the driver in src/services/ai-toolkit.ts wires these paths).
+# (the driver in src/services/ai-toolkit.ts wires these paths). /dataset must be
+# writable: ai-toolkit caches (.aitk_size.json, latents) inside it.
 
 FROM nvidia/cuda:12.8.1-devel-ubuntu24.04
 
