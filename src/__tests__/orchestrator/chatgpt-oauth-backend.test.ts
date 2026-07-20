@@ -214,7 +214,35 @@ describe("GPT-5.6-only model policy (issue #241 + 2026-07-20 deprecation)", () =
     }
   });
 
-  it("CHATGPT_DEFAULT_MODEL is gpt-5.6-luna", () => {
+  it.skipIf(!!process.env.COMFYUI_MCP_CHATGPT_MODEL)("CHATGPT_DEFAULT_MODEL is gpt-5.6-luna", () => {
+    // (skipped when COMFYUI_MCP_CHATGPT_MODEL overrides the baked default)
     expect(CHATGPT_DEFAULT_MODEL).toBe("gpt-5.6-luna");
+  });
+
+  it("migrates a deprecated ACTIVE model to the family default instead of re-inserting it", async () => {
+    const home = mkdtempSync(join(tmpdir(), "cmcp-56c-"));
+    mkdirSync(join(home, ".codex"), { recursive: true });
+    writeFileSync(
+      join(home, ".codex", "models_cache.json"),
+      JSON.stringify({ models: [
+        { id: "gpt-5.6-sol" }, { id: "gpt-5.6-terra" }, { id: "gpt-5.6-luna" }, { id: "gpt-5.4-mini" },
+      ] }),
+    );
+    const prev = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = join(home, ".codex");
+    try {
+      // A tab that saved the OLD default keeps pushing it on reconnect — the
+      // list must not re-insert it at the head (it 400s every turn now).
+      const b = new ChatGptOAuthBackend({
+        model: "gpt-5.4-mini",
+        connectToolClients: async () => ({ comfyui: fakeMcpClient() }),
+      });
+      const ids = (await b.listModels()).map((m) => m.id);
+      expect(ids).not.toContain("gpt-5.4-mini");
+      expect(ids[0].startsWith("gpt-5.6")).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = prev;
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });

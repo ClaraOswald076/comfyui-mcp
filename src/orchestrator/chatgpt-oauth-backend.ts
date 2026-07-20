@@ -456,6 +456,16 @@ export class ChatGptOAuthBackend extends OllamaBackend {
       : cached.length
         ? cached
         : ["gpt-5.6-sol", "gpt-5.6-terra", CHATGPT_DEFAULT_MODEL];
+    // A deprecated ACTIVE model (e.g. a tab that saved the old gpt-5.4-mini
+    // default) must not be re-inserted at the head of the filtered list — that
+    // kept it selected and 400ing every turn (codex review). Migrate the
+    // instance to the family default instead so the next turn works.
+    if (fam.length && this.model && !this.model.startsWith("gpt-5.6")) {
+      logger.info(
+        `[chatgpt-oauth-backend] active model ${this.model} is deprecated — migrating to ${CHATGPT_DEFAULT_MODEL}`,
+      );
+      this.model = ids.includes(CHATGPT_DEFAULT_MODEL) ? CHATGPT_DEFAULT_MODEL : ids[0];
+    }
     const rest = ids.filter((id) => id !== this.model).slice(0, 40);
     return [this.model, ...rest].map((id) => ({ id, label: id }));
   }
