@@ -6,6 +6,18 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+### MCP
+
+#### Changed
+- **GPT-5.6 family (Sol / Terra / Luna) with the extended effort scale
+  (`max`, `ultra`)** — the bundled Codex SDK is now 0.145.0-alpha.24 (the
+  stable 0.144.6 crashes renewing a Codex-Desktop 0.145 models cache; the
+  alpha is the field-verified pairing — #241), and pre-5.6 models are
+  DEPRECATED: the picker hides them whenever the account has the 5.6 family
+  (accounts without 5.6 keep their catalog). ChatGPT-direct default is now
+  `gpt-5.6-luna` (successor to the retired `gpt-5.4-mini`); Claude-max→xhigh
+  effort downmapping removed (`max` is native now)
+
 ## [0.40.0] - 2026-07-19
 
 ### MCP

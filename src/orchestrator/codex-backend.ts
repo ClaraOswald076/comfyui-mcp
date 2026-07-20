@@ -363,7 +363,9 @@ class AppServerClient {
 // present) AND toCodexEffort() further down (the validity check), to avoid drift.
 // The backend ALREADY applies effort to every turn via toCodexEffort regardless
 // of model, so advertising it for all Codex models matches current behavior.
-const CODEX_EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh"] as const;
+// GPT-5.6 extends the scale with `max` and `ultra` (verified live per model:
+// sol/terra accept through ultra, luna through max — issue #241's catalog).
+const CODEX_EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
 
 // ---- model fallback ----
 // config/read does not enumerate a model CATALOG (it reports the active provider
@@ -371,9 +373,13 @@ const CODEX_EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh"
 // model family. The panel picker degrades gracefully on an empty list. Each entry
 // advertises the Codex effort scale so the panel enables the reasoning-effort
 // dropdown for these models (the backend applies effort to every turn anyway).
+// GPT-5.6 family ONLY (product decision 2026-07-20): older GPT-5.x are
+// deprecated — the live catalog is filtered to the 5.6 family and these
+// fallbacks match it. Per-variant effort ceilings from the live model/list.
 const CODEX_FALLBACK_MODELS: ModelChoice[] = [
-  { id: "gpt-5.5", label: "GPT-5.5", supportsEffort: true, supportedEffortLevels: [...CODEX_EFFORT_LEVELS] },
-  { id: "gpt-5.5-codex", label: "GPT-5.5 Codex", supportsEffort: true, supportedEffortLevels: [...CODEX_EFFORT_LEVELS] },
+  { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", supportsEffort: true, supportedEffortLevels: ["low", "medium", "high", "xhigh", "max", "ultra"] },
+  { id: "gpt-5.6-terra", label: "GPT-5.6 Terra", supportsEffort: true, supportedEffortLevels: ["low", "medium", "high", "xhigh", "max", "ultra"] },
+  { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", supportsEffort: true, supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"] },
 ];
 
 /** Does this id look like an OpenAI/Codex model (vs. a Claude panel model)? Used
@@ -398,7 +404,9 @@ function toCodexEffort(effort: string | undefined): string | null {
   if (!effort) return null;
   const e = effort.toLowerCase();
   if ((CODEX_EFFORTS as readonly string[]).includes(e)) return e;
-  if (e === "max") return "xhigh"; // Claude's top level → Codex's nearest valid
+  // ("max" is now a NATIVE Codex level on GPT-5.6 — the old Claude-max→xhigh
+  // downmap is gone; per-model ceilings are enforced by the picker, and an
+  // over-ceiling level is clamped app-server-side.)
   return null; // unknown level → let the app-server pick its default
 }
 
@@ -1195,8 +1203,18 @@ export class CodexBackend implements AgentBackend {
             };
           });
         if (live.length) {
-          this.liveCatalog = live;
-          return live;
+          // GPT-5.6-only policy: hide deprecated 5.x/codex ids from the picker
+          // when the account has the 5.6 family. Accounts WITHOUT any 5.6
+          // model keep their full catalog (never brick an older plan).
+          const fam = live.filter((m) => m.id.startsWith("gpt-5.6"));
+          if (fam.length && fam.length < live.length) {
+            logger.debug(
+              `[codex-backend] hiding ${live.length - fam.length} deprecated pre-5.6 model(s) from the picker`,
+            );
+          }
+          const chosen = fam.length ? fam : live;
+          this.liveCatalog = chosen;
+          return chosen;
         }
       }
     } catch (err) {

@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ChatGptOAuthBackend } from "../../orchestrator/chatgpt-oauth-backend.js";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ChatGptOAuthBackend, CHATGPT_DEFAULT_MODEL } from "../../orchestrator/chatgpt-oauth-backend.js";
 import type { McpToolClient } from "../../orchestrator/ollama-backend.js";
 import type { AgentEvent, NeutralTurn } from "../../orchestrator/agent-backend.js";
 
@@ -155,5 +158,63 @@ describe("ChatGptOAuthBackend — Responses-API image delivery (#218)", () => {
   it("text-only turns carry no input_image items", async () => {
     await collect(makeBackend(), turnsOf({ text: "hello" }));
     expect(userContent(responsesRequests[0]).every((c) => c.type === "input_text")).toBe(true);
+  });
+});
+
+describe("GPT-5.6-only model policy (issue #241 + 2026-07-20 deprecation)", () => {
+  it("hides deprecated pre-5.6 ids when the codex cache carries the 5.6 family", async () => {
+    const home = mkdtempSync(join(tmpdir(), "cmcp-56-"));
+    mkdirSync(join(home, ".codex"), { recursive: true });
+    writeFileSync(
+      join(home, ".codex", "models_cache.json"),
+      JSON.stringify({ models: [
+        { id: "gpt-5.6-sol" }, { id: "gpt-5.6-terra" }, { id: "gpt-5.6-luna" },
+        { id: "gpt-5.5" }, { id: "gpt-5.4-mini" },
+      ] }),
+    );
+    const prev = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = join(home, ".codex");
+    try {
+      const b = new ChatGptOAuthBackend({
+        model: "gpt-5.6-sol",
+        connectToolClients: async () => ({ comfyui: fakeMcpClient() }),
+      });
+      const ids = (await b.listModels()).map((m) => m.id);
+      expect(ids).toContain("gpt-5.6-sol");
+      expect(ids).toContain("gpt-5.6-terra");
+      expect(ids).toContain("gpt-5.6-luna");
+      expect(ids).not.toContain("gpt-5.5");
+      expect(ids).not.toContain("gpt-5.4-mini");
+    } finally {
+      if (prev === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = prev;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the full cache when no 5.6 model is present (older plans never brick)", async () => {
+    const home = mkdtempSync(join(tmpdir(), "cmcp-56b-"));
+    mkdirSync(join(home, ".codex"), { recursive: true });
+    writeFileSync(
+      join(home, ".codex", "models_cache.json"),
+      JSON.stringify({ models: [{ id: "gpt-5.5" }, { id: "gpt-5.4-mini" }] }),
+    );
+    const prev = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = join(home, ".codex");
+    try {
+      const b = new ChatGptOAuthBackend({
+        model: "gpt-5.5",
+        connectToolClients: async () => ({ comfyui: fakeMcpClient() }),
+      });
+      const ids = (await b.listModels()).map((m) => m.id);
+      expect(ids).toContain("gpt-5.5");
+      expect(ids).toContain("gpt-5.4-mini");
+    } finally {
+      if (prev === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = prev;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("CHATGPT_DEFAULT_MODEL is gpt-5.6-luna", () => {
+    expect(CHATGPT_DEFAULT_MODEL).toBe("gpt-5.6-luna");
   });
 });
