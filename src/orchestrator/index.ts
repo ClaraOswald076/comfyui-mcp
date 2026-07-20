@@ -656,6 +656,13 @@ const CALL_TOOL_WHITELIST = new Set<string>([
   // mobile Training tab (train_start/cancel stay agent-side for now).
   "train_list_flows",
   "train_status",
+  // User-initiated training ops (panel/mobile Training wizard): stage a dataset,
+  // launch a GPU-container training run, cancel one. All validation lives in the
+  // tools themselves (dataset checks, docker/image preflight, liveness-verified
+  // cancel); the whitelist only gates reachability.
+  "train_prepare_dataset",
+  "train_start",
+  "train_cancel",
 ]);
 
 /** Lazily build ONE in-process MCP client wired to the full comfyui tool surface,
