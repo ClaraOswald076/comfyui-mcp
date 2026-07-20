@@ -15,6 +15,14 @@ All notable changes to this project are documented here. This project adheres to
   boundary wrapper replaces image blocks with an honest "withheld" note — on
   both the full MCP surface and the compact call_tool router; toggling Blind
   live respawns the tab's tool server at idle (panel issue #90)
+- **Gemini backend auth** — on an ACP `auth_required`, the backend now selects the
+  API-key auth method (`USE_GEMINI`) when `GEMINI_API_KEY` is set, instead of
+  blindly retrying `authMethods[0]` (the Google/Code-Assist OAuth method). Google
+  retired the free "Sign in with Google" login for individuals on 2026-06-18, which
+  turned that blind retry into an infinite auth loop and took the whole backend
+  down. API keys still work; set a restricted Gemini API key (Google AI Studio) in
+  `~/.comfyui-mcp/.env`. Failure messages now point at the key path rather than a
+  dead sign-in flow.
 
 ## [0.41.0] - 2026-07-20
 

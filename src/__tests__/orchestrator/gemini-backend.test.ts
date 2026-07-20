@@ -28,7 +28,17 @@ const hoisted = vi.hoisted(() => ({
   received: [] as Array<Record<string, unknown>>,
   // Per-test server behavior: "complete" auto-finishes the prompt with end_turn;
   // "cancel" streams a bit then WAITS for session/cancel before resolving.
-  config: { mode: "complete" as "complete" | "cancel" },
+  config: {
+    mode: "complete" as "complete" | "cancel",
+    // authMethods advertised in the initialize result (empty = none).
+    authMethods: [] as Array<{ id?: string; name?: string; description?: string }>,
+    // When true, session/new fails with an `auth_required` error until the client
+    // has sent an `authenticate` request (models the CLI being signed out).
+    requireAuth: false,
+    // Flipped by the authenticate handler; the last methodId the client sent.
+    authenticated: false,
+    lastAuthMethodId: undefined as string | undefined,
+  },
 }));
 
 vi.mock("node:child_process", async (importOriginal) => {
@@ -139,14 +149,24 @@ vi.mock("node:child_process", async (importOriginal) => {
                 mcpCapabilities: { http: true, sse: false },
               },
               agentInfo: { name: "gemini", title: "Gemini", version: "test" },
-              authMethods: [],
+              authMethods: hoisted.config.authMethods,
             },
           });
         } else if (method === "session/new" && id !== undefined) {
-          write({ jsonrpc: "2.0", id, result: { sessionId: SESSION_ID } });
+          if (hoisted.config.requireAuth && !hoisted.config.authenticated) {
+            write({
+              jsonrpc: "2.0",
+              id,
+              error: { code: -32000, message: "auth required", data: { reason: "auth_required" } },
+            });
+          } else {
+            write({ jsonrpc: "2.0", id, result: { sessionId: SESSION_ID } });
+          }
         } else if (method === "session/load" && id !== undefined) {
           write({ jsonrpc: "2.0", id, result: {} });
         } else if (method === "authenticate" && id !== undefined) {
+          hoisted.config.authenticated = true;
+          hoisted.config.lastAuthMethodId = (msg.params as { methodId?: string } | undefined)?.methodId;
           write({ jsonrpc: "2.0", id, result: {} });
         } else if (method === "session/prompt" && id !== undefined) {
           // Stream on the next tick so the request is registered first.
@@ -183,6 +203,11 @@ beforeEach(async () => {
   hoisted.spawnArgs.length = 0;
   hoisted.received.length = 0;
   hoisted.config.mode = "complete";
+  hoisted.config.authMethods = [];
+  hoisted.config.requireAuth = false;
+  hoisted.config.authenticated = false;
+  hoisted.config.lastAuthMethodId = undefined;
+  delete process.env.GEMINI_API_KEY;
   ({ GeminiBackend } = await import("../../orchestrator/gemini-backend.js"));
 });
 
@@ -299,6 +324,82 @@ describe("GeminiBackend (ACP over stdio)", () => {
     expect(promptBlocks[0].text).toContain("<system>");
     expect(promptBlocks[0].text).toContain("BE NICE.");
     expect(promptBlocks[0].text).toContain("hi there");
+
+    await backend.close();
+  });
+
+  it("on auth_required, authenticates with the API-KEY method when GEMINI_API_KEY is set (not method[0])", async () => {
+    // The free Google/Code-Assist OAuth login was retired 2026-06-18; the fix must
+    // pick the API-key method, not blindly authMethods[0] (the OAuth one).
+    process.env.GEMINI_API_KEY = "AIza-test-key";
+    hoisted.config.requireAuth = true;
+    hoisted.config.authMethods = [
+      { id: "oauth-personal", name: "Log in with Google" },
+      { id: "gemini-api-key", name: "Gemini API Key" },
+    ];
+
+    const backend = new GeminiBackend({ cwd: process.cwd() });
+    const channel = makeChannel();
+    const events: AgentEvent[] = [];
+    const run = consume(backend.run({ channel: channel.iterable }), events);
+
+    channel.push({ text: "hi" });
+    await waitFor(() => events.some((e) => e.type === "result"));
+    channel.close();
+    await run;
+
+    // It authenticated with the API-key method id, then completed a normal turn.
+    expect(hoisted.config.lastAuthMethodId).toBe("gemini-api-key");
+    expect(events.some((e) => e.type === "result" && e.ok === true)).toBe(true);
+
+    await backend.close();
+  });
+
+  it("on auth_required, falls back to the first advertised method when no GEMINI_API_KEY", async () => {
+    delete process.env.GEMINI_API_KEY;
+    hoisted.config.requireAuth = true;
+    hoisted.config.authMethods = [
+      { id: "oauth-personal", name: "Log in with Google" },
+      { id: "gemini-api-key", name: "Gemini API Key" },
+    ];
+
+    const backend = new GeminiBackend({ cwd: process.cwd() });
+    const channel = makeChannel();
+    const events: AgentEvent[] = [];
+    const run = consume(backend.run({ channel: channel.iterable }), events);
+
+    channel.push({ text: "hi" });
+    await waitFor(() => events.some((e) => e.type === "result"));
+    channel.close();
+    await run;
+
+    expect(hoisted.config.lastAuthMethodId).toBe("oauth-personal");
+
+    await backend.close();
+  });
+
+  it("prefers the real gemini-api-key method over a Vertex decoy that mentions 'API key'", async () => {
+    process.env.GEMINI_API_KEY = "AIza-test-key";
+    hoisted.config.requireAuth = true;
+    // Vertex is advertised FIRST and its blurb mentions "API key" — the strong
+    // match must still pick the canonical gemini-api-key method, not the decoy.
+    hoisted.config.authMethods = [
+      { id: "vertex-ai", name: "Vertex AI", description: "Use a Google Cloud project or API key" },
+      { id: "gemini-api-key", name: "Gemini API Key" },
+      { id: "oauth-personal", name: "Log in with Google" },
+    ];
+
+    const backend = new GeminiBackend({ cwd: process.cwd() });
+    const channel = makeChannel();
+    const events: AgentEvent[] = [];
+    const run = consume(backend.run({ channel: channel.iterable }), events);
+
+    channel.push({ text: "hi" });
+    await waitFor(() => events.some((e) => e.type === "result"));
+    channel.close();
+    await run;
+
+    expect(hoisted.config.lastAuthMethodId).toBe("gemini-api-key");
 
     await backend.close();
   });
