@@ -50,7 +50,11 @@ RUN pip install --break-system-packages --no-cache-dir \
 #    requirements. Requirements are installed from the cloned file so they layer
 #    after torch.
 ARG AI_TOOLKIT_REPO=https://github.com/ostris/ai-toolkit.git
-ARG AI_TOOLKIT_REF=main
+# Pinned to the commit the P1 end-to-end run was validated against (200-step
+# character LoRA on a 4090). `main` moves, so an unpinned default silently
+# rebuilds a DIFFERENT trainer than the one we tested — override with
+# --build-arg AI_TOOLKIT_REF=<sha> to move deliberately.
+ARG AI_TOOLKIT_REF=a0224793
 WORKDIR /opt
 RUN git clone --recurse-submodules "${AI_TOOLKIT_REPO}" ai-toolkit \
     && cd ai-toolkit \
