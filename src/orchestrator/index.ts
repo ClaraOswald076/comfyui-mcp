@@ -1594,7 +1594,9 @@ export async function runPanelOrchestrator(): Promise<void> {
   // (persisted by panel-secrets) lands in the comfyui server's spawn env. The
   // comfyui server is declared LAST so it always wins over any user entry that
   // slipped through (defensive — the reader already filters comfyui-mcp entries).
-  const buildMcpServers = () => ({
+  // `panelTab` (when given) layers per-tab spawn env — the Blind content gate
+  // (panel issue #90). The tab-less form remains for the static fallback.
+  const buildMcpServers = (panelTab?: string) => ({
     // The user's inherited servers first… (re-read so a panel_add_mcp is picked
     // up on the same in-process respawn, mirroring a soft reload).
     ...readUserMcpServers(),
@@ -1609,6 +1611,8 @@ export async function runPanelOrchestrator(): Promise<void> {
         // Local mode → enables download_model, apply_manifest (installer packs),
         // and model scans so the agent installs the right way instead of curl.
         ...(comfyuiPath ? { COMFYUI_PATH: comfyuiPath } : forceRemoteEnv()),
+        // Blind tab (issue #90): this tab's tool server withholds image pixels.
+        ...(panelTab && blindTabs.has(panelTab) ? { COMFYUI_MCP_BLIND: "1" } : {}),
       }),
     },
   });
@@ -1627,6 +1631,10 @@ export async function runPanelOrchestrator(): Promise<void> {
         ? createPanelMcpServer(bridge, panelTabOf(key), workflowTargets)
         : undefined,
     mcpServers: buildMcpServers(),
+    // Per-KEY factory — the CLAUDE path's spawns must also reflect per-tab state
+    // (the Blind gate); the static set above stays as the fallback. Codex-review
+    // F1 on issue #90: without this, the default backend bypassed the gate.
+    makeMcpServers: (key) => buildMcpServers(panelTabOf(key)),
     // NOTE: manager callbacks fire with the composite agent key `tabId::backend`;
     // panelTabOf() recovers the PANEL tab so every push reaches the right socket.
     onSay: (key, text, meta) => {
@@ -2072,10 +2080,25 @@ export async function runPanelOrchestrator(): Promise<void> {
           : undefined;
       const backend = reqBackend && KNOWN_BACKENDS.has(reqBackend) ? reqBackend : defaultBackend;
       // Blind content mode rides the hello (issue #90) so the FIRST agent spawn
-      // already carries the right tool-server env — a toggle later goes through
-      // set_content_mode below.
-      if ((event as { blind?: unknown }).blind === true) blindTabs.add(panelTab);
-      else if ((event as { blind?: unknown }).blind === false) blindTabs.delete(panelTab);
+      // already carries the right tool-server env. A CHANGE against a live
+      // agent also respawns it (codex-review F2: the set_content_mode frame is
+      // lost when toggled during a socket drop — the re-hello is the recovery
+      // path, so it must enforce, not just record). Absence = no-op (old panels
+      // never send the field; it must not clear a prior state).
+      {
+        const helloBlind = (event as { blind?: unknown }).blind;
+        if (helloBlind === true || helloBlind === false) {
+          const changed = helloBlind !== blindTabs.has(panelTab);
+          if (helloBlind) blindTabs.add(panelTab);
+          else blindTabs.delete(panelTab);
+          if (changed && manager.hasLiveAgent(agentKeyFor(panelTab))) {
+            manager.restartForMcpEnv(agentKeyFor(panelTab));
+            logger.info(
+              `[panel-orchestrator] tab ${panelTab.slice(0, 8)} blind=${String(helloBlind)} via hello — live agent respawn queued`,
+            );
+          }
+        }
+      }
       // Tab-id migration (issue #210): the BRIDGE stamps `migrated_from` on a
       // hello when the SAME socket re-helloed under a new tab id (panel update
       // changed the id scheme, e.g. random UUID → tmp:/wf:). That same-socket
@@ -2826,7 +2849,12 @@ export async function runPanelOrchestrator(): Promise<void> {
         logger.info(`[panel-orchestrator] tab ${event.tab_id.slice(0, 8)} run_error → agent (interrupt)`);
         return;
       }
-      const delivered = manager.injectEvent(agentKeyFor(event.tab_id), ev);
+      // Blind tab (issue #90, codex-review F3): strip render pixels at the
+      // SERVER boundary too — the desktop panel already drops them client-side,
+      // but a mirror viewer (mobile has no Blind concept) can inject
+      // agent_event frames with images onto a blinded desktop tab.
+      const evForTab = blindTabs.has(event.tab_id) ? { ...ev, images: [] } : ev;
+      const delivered = manager.injectEvent(agentKeyFor(event.tab_id), evForTab);
       if (delivered) {
         logger.info(`[panel-orchestrator] tab ${event.tab_id.slice(0, 8)} event → agent: ${event.kind}`);
       }
@@ -3081,9 +3109,18 @@ export async function runPanelOrchestrator(): Promise<void> {
         ? ((event as { context?: string }).context as string).trim()
         : "";
     if (replay) outText = `${replay}\n\n${outText}`;
+    // Blind tab (issue #90): the toggle promises the agent NEVER receives
+    // pixels — that includes composer attachments. Withhold them with an
+    // honest note (the user can toggle Blind off to share an image).
+    const attachedImages = (event as { images?: Array<{ filename: string; subfolder?: string; type?: string }> })
+      .images;
+    const tabIsBlind = blindTabs.has(event.tab_id);
+    if (tabIsBlind && attachedImages?.length) {
+      outText += `\n\n[panel note: ${attachedImages.length} image attachment(s) withheld — Blind mode is ON. You cannot see them; ask the user to describe the content or turn Blind off.]`;
+    }
     const sendOpts = {
       title: event.title,
-      images: (event as { images?: Array<{ filename: string; subfolder?: string; type?: string }> }).images,
+      images: tabIsBlind ? undefined : attachedImages,
       mid: userMid,
     };
     // Local-agent VRAM pause: if this tab runs the local Ollama model AND a

@@ -1033,6 +1033,11 @@ export interface PanelAgentManagerOptions {
    *  undefined for a backend that hosts its panel_* tools out-of-process (codex/
    *  gemini use the loopback HTTP MCP instead of this in-process SDK server). */
   makePanelServer?: (tabId: string) => McpSdkServerConfigWithInstance | undefined;
+  /** Per-KEY mcpServers factory (key = tabId::backend). When provided it wins
+   *  over the static `mcpServers` for every spawn — required for per-tab spawn
+   *  env like the Blind content gate (panel issue #90): a static object shared
+   *  across tabs cannot express per-tab COMFYUI_MCP_BLIND. */
+  makeMcpServers?: (key: string) => Options["mcpServers"];
   /** Bundled plugin dir whose skills make the agent an expert (optional). */
   pluginPath?: string;
   /**
@@ -1118,7 +1123,9 @@ export class PanelAgentManager {
     // PanelAgent constructor defaults to ClaudeBackend (existing behavior).
     const backend = this.opts.makeBackend?.(tabId);
     return new PanelAgent(tabId, {
-      mcpServers: this.opts.mcpServers,
+      // The factory (fresh per spawn — re-reads closures AND per-tab state like
+      // the Blind gate) wins over the static set (kept for tests/back-compat).
+      mcpServers: this.opts.makeMcpServers?.(tabId) ?? this.opts.mcpServers,
       comfyuiUrl: this.opts.comfyuiUrl,
       systemAppend: this.opts.systemAppend,
       model: this.modelFor(tabId),
