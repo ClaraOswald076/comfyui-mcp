@@ -75,7 +75,7 @@ export const OPENAI_KEY_PROVIDERS: OpenAiKeyProvider[] = [
   {
     id: "glm",
     slotLabel: "GLM / Zhipu",
-    slotHelp: "GLM provider",
+    slotHelp: "Z.AI Coding Plan (GLM / Zhipu)",
     envKeys: ["GLM_API_KEY", "ZHIPU_API_KEY", "ZHIPUAI_API_KEY", "ZAI_API_KEY"],
     modelEnv: "COMFYUI_MCP_GLM_MODEL",
     defaultModel: process.env.COMFYUI_MCP_GLM_MODEL?.trim() || "glm-4.7",
@@ -138,4 +138,24 @@ export function simpleKeyProvider(id: string): OpenAiKeyProvider | undefined {
  *  the old `<provider>Model = process.env.<MODEL_ENV> ?? <DEFAULT_MODEL>`. */
 export function openAiKeyProviderModel(p: OpenAiKeyProvider): string {
   return process.env[p.modelEnv] ?? p.defaultModel;
+}
+
+/**
+ * One-line "which model am I on, and how do I change it?" hint for the panel's
+ * API Keys card.
+ *
+ * These providers ship a pinned default (glm-4.7, kimi-for-coding, kimi-k3) and
+ * a `modelEnv` override, but NOTHING in the UI ever said the override existed —
+ * so a user on a newer model (e.g. GLM 5.2) had no way to discover they could
+ * point at it without reading the source. Generated from the registry rather
+ * than hand-written per provider, so it can never drift from the real default.
+ *
+ * Reports the ACTIVE model (env override if set, else the default) and names the
+ * env var either way, so the card also answers "why am I not on the model I set?".
+ */
+export function providerModelHint(p: OpenAiKeyProvider): string {
+  const active = openAiKeyProviderModel(p);
+  return active === p.defaultModel
+    ? `Model ${active} (default) — set ${p.modelEnv} to use another.`
+    : `Model ${active} (via ${p.modelEnv}; default ${p.defaultModel}).`;
 }

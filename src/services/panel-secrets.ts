@@ -21,7 +21,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "n
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { logger } from "../utils/logger.js";
-import { OPENAI_KEY_PROVIDERS } from "./openai-provider-registry.js";
+import { OPENAI_KEY_PROVIDERS, providerModelHint } from "./openai-provider-registry.js";
 
 interface PanelSecrets {
   /** Env vars injected into the built-in comfyui MCP server's spawn env. */
@@ -495,7 +495,10 @@ export const CREDENTIAL_SLOTS: CredentialSlot[] = [
       label: p.slotLabel,
       envKeys: p.envKeys,
       store: "agent",
-      help: p.slotHelp,
+      // Append the generated model hint so the card says which model the
+      // provider is actually on and how to change it — the override env var
+      // existed but was invisible outside the source.
+      help: `${p.slotHelp} · ${providerModelHint(p)}`,
     }),
   ),
   { id: "civitai", label: "Civitai", envKeys: ["CIVITAI_API_TOKEN"], store: "comfyui", help: "Model downloads" },
