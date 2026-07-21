@@ -149,29 +149,38 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
   // In-flight guard: on a hung network a slow poll must not stack up under the
   // interval — a tick that lands while the previous poll is still running JOINS
   // it (no second concurrent RunPod request) instead of starting an overlap.
-  let inflight: Promise<void> | null = null;
+  // Keyed by pod id: a tick after the target CHANGED (watch(B) while A is in
+  // flight) starts a FRESH poll for the new target, and the stale poll's result
+  // is discarded on arrival (never published, never auto-stops the wrong pod).
+  let inflight: { id: string; promise: Promise<void> } | null = null;
 
   function poll(): Promise<void> {
-    if (inflight) return inflight;
-    inflight = pollOnce().finally(() => {
-      inflight = null;
+    const id = podId;
+    if (!id) return Promise.resolve();
+    if (inflight && inflight.id === id) return inflight.promise;
+    const promise = pollOnce(id).finally(() => {
+      if (inflight?.promise === promise) inflight = null;
     });
-    return inflight;
+    inflight = { id, promise };
+    return promise;
   }
 
-  async function pollOnce(): Promise<void> {
-    if (!podId || autoStopping) return;
+  async function pollOnce(id: string): Promise<void> {
+    if (autoStopping) return;
     let pod: RunpodPod | null;
     try {
-      pod = await getPod(podId);
+      pod = await getPod(id);
     } catch (err) {
       // Transient RunPod API blip — keep the last frame, try again next tick.
-      logger.debug(`[runpod-watch] poll failed for ${podId}: ${err instanceof Error ? err.message : err}`);
+      logger.debug(`[runpod-watch] poll failed for ${id}: ${err instanceof Error ? err.message : err}`);
       return;
     }
+    // The watch target moved on while this request was in flight — drop the
+    // stale result entirely (no publish, no unwatch, no auto-stop).
+    if (id !== podId) return;
     if (!pod) {
       // Pod vanished (terminated) — stop watching.
-      logger.info(`[runpod-watch] pod ${podId} no longer exists — unwatching`);
+      logger.info(`[runpod-watch] pod ${id} no longer exists — unwatching`);
       unwatch();
       return;
     }
@@ -183,7 +192,7 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
     const running = pod.desiredStatus === "RUNNING" && !!pod.runtime;
     let idleSeconds: number | null = null;
     let autostopIn: number | null = null;
-    if (running && deps.renderingOnPod(podId) && deps.comfyuiIdle()) {
+    if (running && deps.renderingOnPod(id) && deps.comfyuiIdle()) {
       if (idleSinceMs == null) idleSinceMs = now();
       idleSeconds = Math.floor((now() - idleSinceMs) / 1000);
       if (idleStopMs > 0) {
@@ -192,15 +201,15 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
         if (remainMs <= 0) {
           // Fire auto-stop once; broadcast the reason so the UI can show it.
           autoStopping = true;
-          logger.info(`[runpod-watch] pod ${podId} idle ${idleSeconds}s ≥ ${deps.idleStopMinutes}m — auto-stopping to save cost`);
+          logger.info(`[runpod-watch] pod ${id} idle ${idleSeconds}s ≥ ${deps.idleStopMinutes}m — auto-stopping to save cost`);
           try {
-            await stopPod(podId);
+            await stopPod(id);
           } catch (err) {
             // MONEY SAFETY: the stop FAILED — the pod is still RUNNING and still
             // BILLING. Do NOT pretend it exited and do NOT stop watching: broadcast
             // the TRUE status with an autostop_failed hint so the UI can warn, keep
             // the idle clock (remainMs stays ≤ 0), and retry the stop next tick.
-            logger.warn(`[runpod-watch] auto-stop of ${podId} FAILED — pod still running/billing, will retry next tick: ${err instanceof Error ? err.message : err}`);
+            logger.warn(`[runpod-watch] auto-stop of ${id} FAILED — pod still running/billing, will retry next tick: ${err instanceof Error ? err.message : err}`);
             autoStopping = false;
             pushIfChanged({ ...frameFor(pod, idleSeconds, 0), autostop_failed: true });
             return;

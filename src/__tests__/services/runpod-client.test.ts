@@ -197,4 +197,29 @@ describe("createPod (GPU fallback + billing safety)", () => {
     expect(isProvablyNotCreatedError(new Error("RunPod API HTTP 500"))).toBe(false);
     expect(isProvablyNotCreatedError(new Error("RunPod API request timed out after 10s"))).toBe(false);
   });
+
+  it("serializes concurrent creates so billed mutations never overlap", async () => {
+    let release: (() => void) | null = null;
+    let deployCall = 0;
+    const fetchMock = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      const body = JSON.parse((init as { body: string }).body) as GqlBody;
+      if (body.query.includes("podFindAndDeployOnDemand")) {
+        deployCall++;
+        if (deployCall === 1) await new Promise<void>((r) => (release = r)); // first create hangs mid-mutation
+        return gqlResponse(deployed(`pod${deployCall}`));
+      }
+      return gqlResponse(emptyList); // prior-ids snapshots
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const p1 = createPod({ gpuTypeIds: ["GPU-A"] });
+    await new Promise((r) => setImmediate(r)); // let p1 reach its (hung) mutation
+    const p2 = createPod({ gpuTypeIds: ["GPU-A"] });
+    await new Promise((r) => setImmediate(r));
+    expect(deployCall).toBe(1); // p2 is queued BEHIND p1 — no second in-flight mutation
+    release!();
+    const [pod1, pod2] = await Promise.all([p1, p2]);
+    expect(deployCall).toBe(2); // serialized, then proceeded
+    expect(pod1.id).toBe("pod1");
+    expect(pod2.id).toBe("pod2");
+  });
 });

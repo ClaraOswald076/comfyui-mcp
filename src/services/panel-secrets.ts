@@ -468,9 +468,15 @@ export function buildAgentSpawnEnv(
   opts: { keep?: readonly string[] } = {},
 ): NodeJS.ProcessEnv {
   const keep = new Set(opts.keep ?? []);
-  const out: NodeJS.ProcessEnv = { ...base };
-  for (const k of TOOL_ONLY_SECRET_ENV_KEYS) {
-    if (!keep.has(k)) delete out[k];
+  // Case-insensitive match: on Windows process.env lookups ignore case, so a
+  // secret set as $env:runpod_api_key RESOLVES via RUNPOD_API_KEY but spreads
+  // under the lowercase key — deleting only the canonical casing would leak it
+  // into every agent-provider spawn (codex finding).
+  const strip = new Set(TOOL_ONLY_SECRET_ENV_KEYS.filter((k) => !keep.has(k)).map((k) => k.toUpperCase()));
+  const out: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(base)) {
+    if (strip.has(k.toUpperCase())) continue;
+    out[k] = v;
   }
   return out;
 }

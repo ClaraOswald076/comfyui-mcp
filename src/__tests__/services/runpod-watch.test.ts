@@ -168,6 +168,28 @@ describe("runpod-watch — idle auto-stop", () => {
     expect(getPodMock).toHaveBeenCalledTimes(2);
   });
 
+  it("watch(B) during an in-flight poll for A polls B immediately and discards A's late frame", async () => {
+    let resolveA: ((p: unknown) => void) | null = null;
+    const aPod = runningPod({ id: "podA", name: "a" });
+    const bPod = runningPod({ id: "podB", name: "b" });
+    getPodMock.mockImplementation((id: string) => {
+      if (id === "podA" && !resolveA) return new Promise((res) => (resolveA = res));
+      return Promise.resolve(id === "podA" ? aPod : bPod);
+    });
+    const frames: RunpodStatusFrame[] = [];
+    const w = createRunpodWatcher({ push: (f) => frames.push(f as RunpodStatusFrame), comfyuiIdle: () => false, renderingOnPod: () => true, idleStopMinutes: 0 });
+    w.watch("podA"); // poll for A hangs in flight
+    await new Promise((r) => setImmediate(r));
+    w.watch("podB"); // target change — must NOT wait for A's request
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    expect(frames.at(-1)?.pod_id).toBe("podB"); // B was polled + published already
+    resolveA!(aPod); // A's late response arrives → discarded, never published
+    await new Promise((r) => setImmediate(r));
+    expect(frames.filter((f) => f.pod_id === "podA")).toHaveLength(0);
+    expect(w.watchedPodId()).toBe("podB");
+  });
+
   it("never auto-stops when disabled (idleStopMinutes = 0)", async () => {
     getPodMock.mockResolvedValue(runningPod());
     const c = clock();

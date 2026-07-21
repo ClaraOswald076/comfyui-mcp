@@ -302,8 +302,20 @@ async function findPodCreatedByThisCall(
  *  5xx/parse — the pod may exist even though the response was lost) we reconcile
  *  by listing pods under the requested name: if this call's pod appeared, return
  *  it; otherwise fail WITHOUT retrying so a lost-response create can never fan
- *  out into extra billable pods. */
+ *  out into extra billable pods.
+ *
+ *  CONCURRENCY: creates are serialized in-process (two concurrent same-name
+ *  calls would snapshot the same priorIds and could cross-attribute a
+ *  reconciled pod — codex finding). Cross-process creates remain name-
+ *  correlated best-effort; the orchestrator is the single issuer in practice. */
+let createChain: Promise<unknown> = Promise.resolve();
 export async function createPod(opts: RunpodCreateOptions = {}): Promise<RunpodPod> {
+  const run = createChain.then(() => createPodOnce(opts));
+  createChain = run.catch(() => {}); // a failed create must not wedge the queue
+  return run;
+}
+
+async function createPodOnce(opts: RunpodCreateOptions): Promise<RunpodPod> {
   const gpuTypeIds = opts.gpuTypeIds?.length ? opts.gpuTypeIds : RUNPOD_DEFAULT_GPU_TYPES;
   const cloudTypes: Array<"COMMUNITY" | "SECURE"> = opts.cloudType ? [opts.cloudType] : ["COMMUNITY", "SECURE"];
   const name = opts.name ?? "comfyui-mcp";

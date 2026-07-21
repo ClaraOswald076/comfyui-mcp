@@ -258,5 +258,21 @@ describe("panel-secrets (canonical .env store)", () => {
       buildAgentSpawnEnv();
       expect(process.env.RUNPOD_API_KEY).toBe("rp-secret");
     });
+
+    it("strips secrets set with NON-canonical casing (Windows $env:runpod_api_key)", async () => {
+      const { buildAgentSpawnEnv } = await import("../../services/panel-secrets.js");
+      // On Windows process.env lookup is case-insensitive, but a key set with
+      // lowercase casing SPREADS as lowercase — deleting only the canonical
+      // casing would leak it (codex finding).
+      const base = { runpod_api_key: "rp-lower", PATH: "x", Other_Key: "y" } as unknown as NodeJS.ProcessEnv;
+      const env = buildAgentSpawnEnv(base);
+      expect(env.runpod_api_key).toBeUndefined();
+      expect(env.RUNPOD_API_KEY).toBeUndefined();
+      expect(env.PATH).toBe("x");
+      expect(env.Other_Key).toBe("y");
+      // keep-list still works case-insensitively for the provider's own key
+      const gem = buildAgentSpawnEnv({ gemini_api_key: "gm-lower" } as unknown as NodeJS.ProcessEnv, { keep: ["GEMINI_API_KEY"] });
+      expect(gem.gemini_api_key).toBe("gm-lower");
+    });
   });
 });
