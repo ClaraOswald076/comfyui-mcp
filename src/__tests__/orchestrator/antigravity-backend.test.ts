@@ -111,6 +111,22 @@ beforeEach(() => {
   hoisted.procs.length = 0;
   hoisted.killed.length = 0;
   hoisted.script.length = 0;
+  // killProcessTree has TWO platform paths: Windows shells out to `taskkill`
+  // (mocked via spawnSync above), POSIX signals the process group with
+  // process.kill(-pid). Only the Windows path was emulated, so on Linux/macOS
+  // the fake child was never terminated and every interrupt test hung to the
+  // 5s timeout — green on a Windows dev box, red on CI. Emulate the POSIX path
+  // too so these tests assert the same behavior on every platform.
+  vi.spyOn(process, "kill").mockImplementation(((pid: number) => {
+    const target = Math.abs(Number(pid)); // POSIX group kill passes -pid
+    hoisted.killed.push(target);
+    const proc = hoisted.procs.find((p) => p.pid === target);
+    if (proc && proc.exitCode === null) {
+      proc.exitCode = 1;
+      (proc as { emit: (ev: string, ...a: unknown[]) => void }).emit("exit", null, "SIGKILL");
+    }
+    return true;
+  }) as unknown as typeof process.kill);
   process.env.COMFYUI_MCP_ANTIGRAVITY_PATH = FAKE_BIN;
   delete process.env.COMFYUI_MCP_ANTIGRAVITY_PRINT_TIMEOUT;
   workDir = mkdtempSync(join(tmpdir(), "agy-test-"));
@@ -119,6 +135,7 @@ beforeEach(() => {
 afterEach(() => {
   delete process.env.COMFYUI_MCP_ANTIGRAVITY_PATH;
   rmSync(workDir, { recursive: true, force: true });
+  vi.mocked(process.kill).mockRestore?.();
 });
 
 describe("parseAgyModels", () => {
