@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -10,57 +10,86 @@ import {
   onComfyuiSecretsChanged,
   removeComfyuiSecret,
   setComfyuiSecret,
+  COMFYUI_SECRET_ENV_ALLOWLIST,
+  AGENT_SECRET_ENV_ALLOWLIST,
+  envFilePath,
 } from "../../services/panel-secrets.js";
 
+// The canonical store is now ~/.comfyui-mcp/.env (a real dotenv), so these tests
+// point COMFYUI_MCP_ENV_FILE at a temp file AND isolate process.env: the real
+// ~/.comfyui-mcp/.env is loaded at import, so allowlisted keys (HF_TOKEN, …) may
+// already be present and would pollute exact-match assertions.
+const ALL_KEYS = [...new Set([...COMFYUI_SECRET_ENV_ALLOWLIST, ...AGENT_SECRET_ENV_ALLOWLIST])];
+
 let dir: string;
-let secretsPath: string;
+let envPath: string;
+let savedEnv: Record<string, string | undefined>;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "cmcp-secrets-"));
-  secretsPath = join(dir, "panel-secrets.json");
-  process.env.COMFYUI_MCP_PANEL_SECRETS = secretsPath;
+  envPath = join(dir, ".env");
+  process.env.COMFYUI_MCP_ENV_FILE = envPath;
+  savedEnv = {};
+  for (const k of ALL_KEYS) {
+    savedEnv[k] = process.env[k];
+    delete process.env[k];
+  }
 });
 
 afterEach(() => {
-  delete process.env.COMFYUI_MCP_PANEL_SECRETS;
+  delete process.env.COMFYUI_MCP_ENV_FILE;
+  for (const k of ALL_KEYS) {
+    if (savedEnv[k] === undefined) delete process.env[k];
+    else process.env[k] = savedEnv[k];
+  }
   rmSync(dir, { recursive: true, force: true });
 });
 
-describe("panel-secrets", () => {
+describe("panel-secrets (canonical .env store)", () => {
   it("starts empty when no file exists", () => {
     expect(loadComfyuiSecretEnv()).toEqual({});
     expect(comfyuiSecretKeys()).toEqual([]);
-    expect(existsSync(secretsPath)).toBe(false);
+    expect(existsSync(envPath)).toBe(false);
   });
 
   it("persists a saved secret and exposes it as a comfyui env var", () => {
     setComfyuiSecret("CIVITAI_API_TOKEN", "tok_abc123");
     expect(loadComfyuiSecretEnv()).toEqual({ CIVITAI_API_TOKEN: "tok_abc123" });
     expect(comfyuiSecretKeys()).toEqual(["CIVITAI_API_TOKEN"]);
+    expect(process.env.CIVITAI_API_TOKEN).toBe("tok_abc123"); // live in-process too
   });
 
-  it("round-trips the secret to disk so a respawned process reads it back", () => {
+  it("round-trips the secret to ~/.comfyui-mcp/.env so a respawned process reads it back", () => {
     setComfyuiSecret("HF_TOKEN", "hf_xyz");
-    const raw = JSON.parse(readFileSync(secretsPath, "utf-8"));
-    expect(raw.comfyuiEnv.HF_TOKEN).toBe("hf_xyz");
+    expect(envFilePath()).toBe(envPath);
+    const raw = readFileSync(envPath, "utf-8");
+    expect(raw).toMatch(/^HF_TOKEN=hf_xyz$/m);
   });
 
-  // THE BUG: a saved secret must land in the comfyui MCP server's SPAWN ENV.
-  // buildComfyuiMcpEnv is the single env-builder both provider paths use, so this
-  // proves request_secret → store → spawn env end-to-end (env-builder under test).
+  it("upserts a single line, preserving the rest of the user's .env", () => {
+    // A hand-written .env with comments + unrelated keys must survive a save.
+    const { writeFileSync } = require("node:fs");
+    writeFileSync(envPath, "# my env\nCOMFYUI_HOST=127.0.0.1\nHF_TOKEN=old\n");
+    setComfyuiSecret("HF_TOKEN", "new");
+    setComfyuiSecret("CIVITAI_API_TOKEN", "civ");
+    const raw = readFileSync(envPath, "utf-8");
+    expect(raw).toMatch(/^# my env$/m); // comment preserved
+    expect(raw).toMatch(/^COMFYUI_HOST=127\.0\.0\.1$/m); // unrelated key preserved
+    expect(raw).toMatch(/^HF_TOKEN=new$/m); // replaced in place
+    expect(raw).not.toMatch(/HF_TOKEN=old/); // old value gone
+    expect(raw).toMatch(/^CIVITAI_API_TOKEN=civ$/m); // new key appended
+  });
+
+  // A saved secret must land in the comfyui MCP server's SPAWN ENV (both provider
+  // paths use buildComfyuiMcpEnv), proving request_secret → .env/process.env → spawn.
   it("injects a saved secret into the comfyui MCP server spawn env", () => {
     const base = { COMFYUI_URL: "http://127.0.0.1:8188", COMFYUI_MCP_PROGRESS_DIR: "/tmp/p" };
-    // Before saving: the base env carries no token.
     expect(buildComfyuiMcpEnv(base).CIVITAI_API_TOKEN).toBeUndefined();
-
     setComfyuiSecret("CIVITAI_API_TOKEN", "tok_live_999");
-
     const env = buildComfyuiMcpEnv(base);
-    // The secret is now present in the spawn env, alongside the base vars.
     expect(env.CIVITAI_API_TOKEN).toBe("tok_live_999");
     expect(env.COMFYUI_URL).toBe("http://127.0.0.1:8188");
     expect(env.COMFYUI_MCP_PROGRESS_DIR).toBe("/tmp/p");
-    // The base object is not mutated.
     expect((base as Record<string, string>).CIVITAI_API_TOKEN).toBeUndefined();
   });
 
@@ -70,7 +99,7 @@ describe("panel-secrets", () => {
     expect(buildComfyuiMcpEnv(base).CIVITAI_API_TOKEN).toBe("from-panel");
   });
 
-  it("supports multiple distinct secrets (generic, not civitai-only)", () => {
+  it("supports multiple distinct secrets", () => {
     setComfyuiSecret("CIVITAI_API_TOKEN", "a");
     setComfyuiSecret("HUGGINGFACE_TOKEN", "b");
     expect(loadComfyuiSecretEnv()).toEqual({ CIVITAI_API_TOKEN: "a", HUGGINGFACE_TOKEN: "b" });
@@ -83,25 +112,24 @@ describe("panel-secrets", () => {
     expect(cb).toHaveBeenCalledTimes(1);
     off();
     setComfyuiSecret("CIVITAI_API_TOKEN", "tok2");
-    expect(cb).toHaveBeenCalledTimes(1); // unsubscribed → not called again
+    expect(cb).toHaveBeenCalledTimes(1);
   });
 
-  it("removes a secret and reports absence", () => {
+  it("removes a secret from .env + process.env and reports absence", () => {
     setComfyuiSecret("CIVITAI_API_TOKEN", "tok");
     expect(removeComfyuiSecret("CIVITAI_API_TOKEN")).toBe(true);
     expect(loadComfyuiSecretEnv()).toEqual({});
+    expect(process.env.CIVITAI_API_TOKEN).toBeUndefined();
+    expect(readFileSync(envPath, "utf-8")).not.toMatch(/CIVITAI_API_TOKEN/);
     expect(removeComfyuiSecret("CIVITAI_API_TOKEN")).toBe(false);
   });
 
   it("rejects an invalid env var name without writing", () => {
     expect(() => setComfyuiSecret("bad name", "x")).toThrow(/Invalid env var name/);
-    expect(existsSync(secretsPath)).toBe(false);
+    expect(existsSync(envPath)).toBe(false);
   });
 
-  // P1a — arbitrary env injection guard. The comfyui MCP child is a Node
-  // subprocess; a non-allowlisted key (NODE_OPTIONS, PATH, COMFYUI_PATH, …) must
-  // never reach its env — neither on SAVE nor on LOAD.
-  describe("env-key allowlist (P1a)", () => {
+  describe("env-key allowlist (P1a — no arbitrary env injection)", () => {
     it("exposes the allowlist membership helper", () => {
       expect(isAllowedComfyuiSecretKey("CIVITAI_API_TOKEN")).toBe(true);
       expect(isAllowedComfyuiSecretKey("HUGGINGFACE_TOKEN")).toBe(true);
@@ -112,50 +140,72 @@ describe("panel-secrets", () => {
 
     it("REJECTS a non-allowlisted key on save and writes nothing", () => {
       expect(() => setComfyuiSecret("NODE_OPTIONS", "--inspect-brk")).toThrow(/not an accepted comfyui tool secret/);
-      expect(existsSync(secretsPath)).toBe(false);
-      // A valid one still goes through.
+      expect(existsSync(envPath)).toBe(false);
       setComfyuiSecret("CIVITAI_API_TOKEN", "ok");
       expect(loadComfyuiSecretEnv()).toEqual({ CIVITAI_API_TOKEN: "ok" });
     });
 
-    it("IGNORES a non-allowlisted key on load (corrupt/hand-edited file)", () => {
-      // Simulate a tampered panel-secrets.json that smuggles NODE_OPTIONS/PATH in.
-      writeFileSync(
-        secretsPath,
-        JSON.stringify({
-          comfyuiEnv: {
-            CIVITAI_API_TOKEN: "legit",
-            NODE_OPTIONS: "--inspect-brk",
-            PATH: "/evil/bin",
-            COMFYUI_PATH: "/evil",
-          },
-        }),
-      );
-      const env = loadComfyuiSecretEnv();
-      expect(env).toEqual({ CIVITAI_API_TOKEN: "legit" });
-      // And it can never leak into the spawn env either.
-      const spawnEnv = buildComfyuiMcpEnv({ COMFYUI_URL: "http://x" });
-      expect(spawnEnv.NODE_OPTIONS).toBeUndefined();
-      expect(spawnEnv.PATH).toBeUndefined();
-      expect(spawnEnv.CIVITAI_API_TOKEN).toBe("legit");
+    it("IGNORES a non-allowlisted key on load (even if present in process.env)", () => {
+      // A stray/dangerous key in the environment must never reach the spawn env —
+      // loadComfyuiSecretEnv only ever reads ALLOWLISTED keys.
+      process.env.NODE_OPTIONS = "--inspect-brk";
+      process.env.CIVITAI_API_TOKEN = "legit";
+      try {
+        expect(loadComfyuiSecretEnv()).toEqual({ CIVITAI_API_TOKEN: "legit" });
+        const spawnEnv = buildComfyuiMcpEnv({ COMFYUI_URL: "http://x" });
+        expect(spawnEnv.NODE_OPTIONS).toBeUndefined();
+        expect(spawnEnv.CIVITAI_API_TOKEN).toBe("legit");
+      } finally {
+        delete process.env.NODE_OPTIONS;
+      }
     });
   });
 
-  describe("agent-secret allowlist (provider keys, issue #162)", () => {
-    it("accepts the custom-endpoint key and hydrates it into env", async () => {
+  describe("migration: legacy panel-secrets.json → .env (non-destructive)", () => {
+    it("moves legacy tokens into .env without clobbering existing .env content", async () => {
+      const { writeFileSync } = require("node:fs");
+      // A legacy JSON store with tokens in both maps.
+      const jsonPath = join(dir, "panel-secrets.json");
+      process.env.COMFYUI_MCP_PANEL_SECRETS = jsonPath;
+      writeFileSync(
+        jsonPath,
+        JSON.stringify({
+          comfyuiEnv: { CIVITAI_API_TOKEN: "civ-legacy", NODE_OPTIONS: "--evil" },
+          agentEnv: { OPENROUTER_API_KEY: "or-legacy" },
+        }),
+      );
+      // A pre-existing .env with a comment + an unrelated key + one key that must WIN.
+      writeFileSync(envPath, "# keep me\nCOMFYUI_HOST=1.2.3.4\nCIVITAI_API_TOKEN=civ-newer\n");
+      process.env.CIVITAI_API_TOKEN = "civ-newer"; // .env already loaded → must not be overwritten
+
+      const { migrateSecretsToEnv } = await import("../../services/panel-secrets.js");
+      const migrated = migrateSecretsToEnv();
+
+      const raw = readFileSync(envPath, "utf-8");
+      expect(raw).toMatch(/^# keep me$/m); // comment preserved
+      expect(raw).toMatch(/^COMFYUI_HOST=1\.2\.3\.4$/m); // unrelated key preserved
+      expect(raw).toMatch(/^CIVITAI_API_TOKEN=civ-newer$/m); // existing value NOT overwritten
+      expect(raw).toMatch(/^OPENROUTER_API_KEY=or-legacy$/m); // legacy agent key migrated in
+      expect(raw).not.toMatch(/NODE_OPTIONS/); // non-allowlisted legacy key NOT migrated
+      expect(process.env.OPENROUTER_API_KEY).toBe("or-legacy");
+      expect(migrated).toContain("OPENROUTER_API_KEY");
+      expect(migrated).not.toContain("CIVITAI_API_TOKEN"); // skipped (already present)
+      delete process.env.COMFYUI_MCP_PANEL_SECRETS;
+    });
+  });
+
+  describe("agent-secret allowlist (provider keys)", () => {
+    it("accepts the custom-endpoint key and applies it to env", async () => {
       const { setAgentSecret, loadAgentSecretEnv, isAllowedAgentSecretKey } = await import(
         "../../services/panel-secrets.js"
       );
       expect(isAllowedAgentSecretKey("COMFYUI_MCP_CUSTOM_API_KEY")).toBe(true);
       expect(isAllowedAgentSecretKey("OPENROUTER_API_KEY")).toBe(true);
       expect(isAllowedAgentSecretKey("NODE_OPTIONS")).toBe(false);
-      const prev = process.env.COMFYUI_MCP_CUSTOM_API_KEY;
-      delete process.env.COMFYUI_MCP_CUSTOM_API_KEY;
       setAgentSecret("COMFYUI_MCP_CUSTOM_API_KEY", "sk-custom-1");
       expect(loadAgentSecretEnv().COMFYUI_MCP_CUSTOM_API_KEY).toBe("sk-custom-1");
       expect(process.env.COMFYUI_MCP_CUSTOM_API_KEY).toBe("sk-custom-1");
-      if (prev === undefined) delete process.env.COMFYUI_MCP_CUSTOM_API_KEY;
-      else process.env.COMFYUI_MCP_CUSTOM_API_KEY = prev;
+      expect(readFileSync(envPath, "utf-8")).toMatch(/^COMFYUI_MCP_CUSTOM_API_KEY=sk-custom-1$/m);
     });
   });
 });
