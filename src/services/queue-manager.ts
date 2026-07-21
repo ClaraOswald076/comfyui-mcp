@@ -13,7 +13,12 @@ import { isCloudMode } from "../config.js";
 import type { QueueItem, WorkflowJSON } from "../comfyui/types.js";
 import { logger } from "../utils/logger.js";
 import { ComfyUIError, ValidationError } from "../utils/errors.js";
-import { analyzeHistoryEntry, type ExecutionErrorDetails, type ExecutionStats } from "./job-history.js";
+import {
+  analyzeHistoryEntry,
+  type ExecutionErrorDetails,
+  type ExecutionStats,
+  type TextOutput,
+} from "./job-history.js";
 import { JobWatcher } from "./job-watcher.js";
 
 export interface QueueSummary {
@@ -49,6 +54,10 @@ export interface JobStatus {
   status_str?: string;
   error?: ExecutionErrorDetails;
   execution_stats?: ExecutionStats;
+  /** Text emitted by preview/show-text nodes (Preview as Text, ShowText, …).
+   *  These write no file, so without this a text-producing workflow finishes
+   *  with nothing for the agent to report. Omitted when the run produced none. */
+  text_outputs?: TextOutput[];
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -287,6 +296,7 @@ export async function getJobStatus(
       status_str: entry.status.status_str,
       error: analysis.error,
       execution_stats: analysis.execution_stats,
+      ...(analysis.text_outputs ? { text_outputs: analysis.text_outputs } : {}),
     };
   } catch (err) {
     logger.warn("Could not enrich job status from history", {

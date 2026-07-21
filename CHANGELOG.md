@@ -6,6 +6,22 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+### MCP
+
+#### Fixed
+- **Text-preview node results are no longer invisible to the agent.** Nodes like
+  *Preview as Text* / `PreviewAny` / `ShowText` write no file — they publish into
+  the node's `ui` dict, which ComfyUI stores under `outputs[nodeId].text`. We only
+  ever harvested `images` / `videos` from history, so caption, prompt-builder and
+  other LLM-text workflows completed with **nothing for the agent to read**: it
+  would say it was going to report the text back, then have nothing to report.
+  History analysis now also extracts text, and it surfaces as `text_outputs` on
+  both `get_job_status` and the job-watcher completion record (omitted entirely
+  for image-only runs). Tolerates the shapes seen in the wild — `{text:[…]}`,
+  `{text:"…"}`, and packs that use `string` — and the parser is pinned by a
+  regression test using a payload captured verbatim from a live ComfyUI run.
+  (reported by seanmcmagic)
+
 ## [0.43.0] - 2026-07-20
 
 ### MCP

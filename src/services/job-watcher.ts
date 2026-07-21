@@ -21,6 +21,7 @@ import {
   normalizeHistoryMessages,
   type ExecutionStats,
   type ExecutionErrorDetails,
+  type TextOutput,
 } from "./job-history.js";
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -63,6 +64,9 @@ export interface CompletionNotification {
     node_id: string;
     videos: MediaOutput[];
   }>;
+  /** Text emitted by preview/show-text nodes — no file on disk, so it would
+   *  otherwise be invisible to whoever reads this completion record. */
+  text_outputs?: TextOutput[];
   cached_nodes: string[];
   execution_stats?: ExecutionStats;
 }
@@ -234,6 +238,7 @@ export function buildCompletionNotification(
     error,
     outputs,
     video_outputs,
+    ...(analysis.text_outputs ? { text_outputs: analysis.text_outputs } : {}),
     cached_nodes: cachedNodes,
     execution_stats: analysis.execution_stats,
   };
@@ -334,6 +339,7 @@ async function handleCompletion(
         (n, o) => n + o.videos.length,
         0,
       ),
+      text_nodes: notification.text_outputs?.length ?? 0,
     });
   } catch (err) {
     logger.error("Failed to write completion file", {

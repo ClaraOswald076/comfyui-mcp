@@ -19,9 +19,18 @@ export interface ExecutionStats {
   nodes: Record<string, { duration_ms: number }>;
 }
 
+/** Text produced by a preview/show-text node, keyed by the node that emitted it. */
+export interface TextOutput {
+  node_id: string;
+  text: string[];
+}
+
 export interface HistoryAnalysis {
   error?: ExecutionErrorDetails;
   execution_stats?: ExecutionStats;
+  /** Present only when the run actually produced text (omitted otherwise so
+   *  image-only runs don't carry an empty array around). */
+  text_outputs?: TextOutput[];
 }
 
 export type HistoryStatusMessage = readonly [string, Record<string, unknown>];
@@ -165,9 +174,56 @@ export function extractExecutionStats(
   };
 }
 
+/**
+ * Pull TEXT results out of a finished run.
+ *
+ * Text-preview nodes (ComfyUI's "Preview as Text", ShowText, and the many pack
+ * equivalents) have no file on disk — they publish their result into the node's
+ * `ui` dict, which is exactly what /history stores under
+ * `outputs[nodeId]`. We only ever harvested `images` / `videos` there, so an
+ * LLM-caption / prompt-builder / text workflow completed with the agent seeing
+ * NOTHING — it would say it was going to report back and then have nothing to
+ * report (help-thread report from seanmcmagic).
+ *
+ * Shapes in the wild: `{ text: ["hi"] }` (the common one), `{ text: "hi" }`, and
+ * packs that use `string` instead of `text`. Non-string scalars are stringified;
+ * empty strings are dropped so a node that emitted nothing stays absent.
+ */
+export function extractTextOutputs(entry: HistoryEntry): TextOutput[] {
+  const results: TextOutput[] = [];
+  const outputs = (entry as { outputs?: Record<string, unknown> }).outputs;
+  if (!outputs || typeof outputs !== "object") return results;
+
+  for (const [nodeId, nodeOutput] of Object.entries(outputs)) {
+    if (!nodeOutput || typeof nodeOutput !== "object") continue;
+    const record = nodeOutput as Record<string, unknown>;
+    const text: string[] = [];
+
+    for (const key of ["text", "string"] as const) {
+      const value = record[key];
+      if (typeof value === "string") {
+        if (value.length > 0) text.push(value);
+      } else if (Array.isArray(value)) {
+        for (const item of value) {
+          if (typeof item === "string") {
+            if (item.length > 0) text.push(item);
+          } else if (typeof item === "number" || typeof item === "boolean") {
+            text.push(String(item));
+          }
+        }
+      }
+    }
+
+    if (text.length > 0) results.push({ node_id: nodeId, text });
+  }
+  return results;
+}
+
 export function analyzeHistoryEntry(entry: HistoryEntry): HistoryAnalysis {
+  const text_outputs = extractTextOutputs(entry);
   return {
     error: extractExecutionError(entry),
     execution_stats: extractExecutionStats(entry),
+    ...(text_outputs.length > 0 ? { text_outputs } : {}),
   };
 }
