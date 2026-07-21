@@ -34,6 +34,7 @@ import { registerReportIssueTools } from "./report-issue.js";
 import { registerNodeAuthoringTools } from "./node-authoring.js";
 import { registerNodeVerifyTools } from "./node-verify.js";
 import { registerWorkflowDepsTools } from "./workflow-deps.js";
+import { registerMissingModelTools } from "./missing-models.js";
 import { registerInstallComfyUITools } from "./install-comfyui.js";
 import { registerUpdateComfyUITools } from "./update-comfyui.js";
 import { registerWorkspaceEnvTools } from "./workspace-env.js";
@@ -95,6 +96,7 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   ["custom-nodes", registerNodeManagementTools],
   ["diagnostics", registerReportIssueTools],
   ["workflows", registerWorkflowDepsTools],
+  ["models", registerMissingModelTools],
   ["server", registerInstallComfyUITools],
   ["server", registerUpdateComfyUITools],
   ["models", registerModelExtrasTools],
