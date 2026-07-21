@@ -15,6 +15,14 @@ All notable changes to this project are documented here. This project adheres to
   boundary wrapper replaces image blocks with an honest "withheld" note — on
   both the full MCP surface and the compact call_tool router; toggling Blind
   live respawns the tab's tool server at idle (panel issue #90)
+- **Gemini model catalog was dead on arrival** — both catalog entries
+  (`gemini-2.5-pro`, the default, and `gemini-2.5-flash`) now return 404 *"no
+  longer available to new users"* from Google, so every new Gemini user hit a
+  failing turn on the very first prompt. The catalog now leads with Google's
+  floating aliases (`gemini-pro-latest`, `gemini-flash-latest`) so it stops
+  rotting, plus the pinned models they currently resolve to (`gemini-3.1-pro-preview`,
+  `gemini-3.5-flash`). Default is now `gemini-pro-latest`. Verified live against
+  the Gemini API on 2026-07-20.
 - **Gemini backend auth** — on an ACP `auth_required`, the backend now selects the
   API-key auth method (`USE_GEMINI`) when `GEMINI_API_KEY` is set, instead of
   blindly retrying `authMethods[0]` (the Google/Code-Assist OAuth method). Google

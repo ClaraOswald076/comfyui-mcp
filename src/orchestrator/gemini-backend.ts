@@ -408,12 +408,26 @@ interface AcpInitializeResult {
 // Gemini's "thinking" is a token BUDGET, not a discrete effort scale, so we do
 // NOT advertise supportsEffort/supportedEffortLevels: the panel's normalizeModels
 // then hides the effort dropdown (omission is the documented "no effort control"
-// signal). gemini-2.5-pro is the default.
+// signal).
+//
+// PIN THE FLOATING ALIASES FIRST. A static catalog rots: as of 2026-07-20 Google
+// returns 404 "no longer available to new users" for BOTH former entries
+// (gemini-2.5-pro AND gemini-2.5-flash) on a newly-issued API key, so the old
+// default was dead on arrival for every new user. `gemini-pro-latest` /
+// `gemini-flash-latest` are Google's floating aliases (verified resolving to
+// gemini-3.1-pro-preview / gemini-3.5-flash) and keep tracking the current
+// generation without another code change. The pinned ids below are the concrete
+// models those aliases resolved to, kept for reproducibility.
+// Verified against generativelanguage.googleapis.com on 2026-07-20: the four
+// entries below return 200; gemini-2.5-pro / gemini-2.5-flash / gemini-3-pro-preview
+// return 404.
 const GEMINI_MODELS: ModelChoice[] = [
-  { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
-  { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
+  { id: "gemini-pro-latest", label: "Gemini Pro (latest)" },
+  { id: "gemini-flash-latest", label: "Gemini Flash (latest)" },
+  { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro (preview)" },
+  { id: "gemini-3.5-flash", label: "Gemini 3.5 Flash" },
 ];
-const GEMINI_DEFAULT_MODEL = "gemini-2.5-pro";
+const GEMINI_DEFAULT_MODEL = "gemini-pro-latest";
 
 /** Does this id look like a Gemini model (vs. the Claude panel model PanelAgent
  *  unconditionally passes as opts.model)? Used so the configured Gemini model
@@ -664,6 +678,27 @@ export class GeminiBackend implements AgentBackend {
       if (!res?.sessionId) throw new Error("gemini --acp session/new returned no sessionId.");
       return res.sessionId;
     };
+    // PROACTIVE API-key auth. When GEMINI_API_KEY is set we authenticate up front
+    // rather than only reacting to `auth_required`. Why: a CLI that was previously
+    // signed in keeps `security.auth.selectedType: "oauth-personal"` + cached OAuth
+    // creds, which OUTRANK GEMINI_API_KEY — so `session/new` SUCCEEDS via the (now
+    // dead, post-2026-06-18) individual OAuth without ever raising `auth_required`,
+    // then fails at request time ("session keeps ending"). Authenticating with the
+    // API-key method here switches the CLI to USE_GEMINI and clears the stale creds
+    // (the ACP `authenticate` handler drops cached creds when the method changes),
+    // so the reactive retry below only matters for a never-signed-in CLI.
+    if (process.env.GEMINI_API_KEY?.trim()) {
+      const apiKeyMethod = this.pickAuthMethod();
+      if (apiKeyMethod) {
+        try {
+          await client.request("authenticate", { methodId: apiKeyMethod });
+        } catch (err) {
+          logger.warn(
+            `[gemini-backend] proactive API-key authenticate failed (${msgOf(err)}) — continuing to session/new`,
+          );
+        }
+      }
+    }
     try {
       this.sessionId = await createNew();
     } catch (err) {

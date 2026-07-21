@@ -437,7 +437,12 @@ describe("GeminiBackend (ACP over stdio)", () => {
   it("listModels returns the static Gemini catalog (no effort metadata)", async () => {
     const backend = new GeminiBackend();
     const models = await backend.listModels();
-    expect(models.map((m) => m.id)).toEqual(["gemini-2.5-pro", "gemini-2.5-flash"]);
+    expect(models.map((m) => m.id)).toEqual([
+      "gemini-pro-latest",
+      "gemini-flash-latest",
+      "gemini-3.1-pro-preview",
+      "gemini-3.5-flash",
+    ]);
     // Gemini has no discrete effort scale → no effort metadata (panel hides picker).
     expect(models.every((m) => m.supportsEffort === undefined && m.supportedEffortLevels === undefined)).toBe(true);
   });
@@ -448,7 +453,7 @@ describe("GeminiBackend (ACP over stdio)", () => {
     const backend = new GeminiBackend({ cwd: process.cwd() });
     const channel = makeChannel();
     const events: AgentEvent[] = [];
-    const run = consume(backend.run({ channel: channel.iterable, model: "gemini-2.5-flash" }), events);
+    const run = consume(backend.run({ channel: channel.iterable, model: "gemini-flash-latest" }), events);
 
     channel.push({ text: "hi" });
     await waitFor(() => events.some((e) => e.type === "result"));
@@ -458,13 +463,13 @@ describe("GeminiBackend (ACP over stdio)", () => {
     expect(hoisted.spawnArgs).toHaveLength(1);
     expect(hoisted.spawnArgs[0]).toContain("--acp");
     expect(hoisted.spawnArgs[0]).toContain("--model");
-    expect(hoisted.spawnArgs[0][hoisted.spawnArgs[0].indexOf("--model") + 1]).toBe("gemini-2.5-flash");
+    expect(hoisted.spawnArgs[0][hoisted.spawnArgs[0].indexOf("--model") + 1]).toBe("gemini-flash-latest");
 
     await backend.close();
   });
 
   it("a live setModel() respawns the CLI with the new --model and a fresh session", async () => {
-    const backend = new GeminiBackend({ cwd: process.cwd(), model: "gemini-2.5-pro" });
+    const backend = new GeminiBackend({ cwd: process.cwd(), model: "gemini-pro-latest" });
     const channel = makeChannel();
     const events: AgentEvent[] = [];
     const run = consume(backend.run({ channel: channel.iterable }), events);
@@ -473,10 +478,10 @@ describe("GeminiBackend (ACP over stdio)", () => {
     channel.push({ text: "turn one" });
     await waitFor(() => events.filter((e) => e.type === "result").length >= 1);
     expect(hoisted.spawnArgs).toHaveLength(1);
-    expect(hoisted.spawnArgs[0][hoisted.spawnArgs[0].indexOf("--model") + 1]).toBe("gemini-2.5-pro");
+    expect(hoisted.spawnArgs[0][hoisted.spawnArgs[0].indexOf("--model") + 1]).toBe("gemini-pro-latest");
 
     // Live model switch (panel picker → PanelAgent.setOptions → agent.setModel).
-    await backend.setModel("gemini-2.5-flash");
+    await backend.setModel("gemini-flash-latest");
 
     // Next turn must transparently respawn with the new --model + a fresh session.
     channel.push({ text: "turn two" });
@@ -487,7 +492,7 @@ describe("GeminiBackend (ACP over stdio)", () => {
     // A SECOND `gemini --acp` was spawned, pinned to the new model.
     expect(hoisted.spawnArgs).toHaveLength(2);
     expect(hoisted.spawnArgs[1]).toContain("--acp");
-    expect(hoisted.spawnArgs[1][hoisted.spawnArgs[1].indexOf("--model") + 1]).toBe("gemini-2.5-flash");
+    expect(hoisted.spawnArgs[1][hoisted.spawnArgs[1].indexOf("--model") + 1]).toBe("gemini-flash-latest");
 
     // The respawn opened a fresh session → a second `session` event was emitted.
     expect(events.filter((e) => e.type === "session").length).toBe(2);
@@ -498,7 +503,7 @@ describe("GeminiBackend (ACP over stdio)", () => {
   });
 
   it("ignores a non-Gemini model id passed to setModel (e.g. the Claude panel model)", async () => {
-    const backend = new GeminiBackend({ cwd: process.cwd(), model: "gemini-2.5-pro" });
+    const backend = new GeminiBackend({ cwd: process.cwd(), model: "gemini-pro-latest" });
     const channel = makeChannel();
     const events: AgentEvent[] = [];
     const run = consume(backend.run({ channel: channel.iterable }), events);
