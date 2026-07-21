@@ -2079,26 +2079,6 @@ export async function runPanelOrchestrator(): Promise<void> {
           ? ((event as { backend?: string }).backend as string).toLowerCase()
           : undefined;
       const backend = reqBackend && KNOWN_BACKENDS.has(reqBackend) ? reqBackend : defaultBackend;
-      // Blind content mode rides the hello (issue #90) so the FIRST agent spawn
-      // already carries the right tool-server env. A CHANGE against a live
-      // agent also respawns it (codex-review F2: the set_content_mode frame is
-      // lost when toggled during a socket drop — the re-hello is the recovery
-      // path, so it must enforce, not just record). Absence = no-op (old panels
-      // never send the field; it must not clear a prior state).
-      {
-        const helloBlind = (event as { blind?: unknown }).blind;
-        if (helloBlind === true || helloBlind === false) {
-          const changed = helloBlind !== blindTabs.has(panelTab);
-          if (helloBlind) blindTabs.add(panelTab);
-          else blindTabs.delete(panelTab);
-          if (changed && manager.hasLiveAgent(agentKeyFor(panelTab))) {
-            manager.restartForMcpEnv(agentKeyFor(panelTab));
-            logger.info(
-              `[panel-orchestrator] tab ${panelTab.slice(0, 8)} blind=${String(helloBlind)} via hello — live agent respawn queued`,
-            );
-          }
-        }
-      }
       // Tab-id migration (issue #210): the BRIDGE stamps `migrated_from` on a
       // hello when the SAME socket re-helloed under a new tab id (panel update
       // changed the id scheme, e.g. random UUID → tmp:/wf:). That same-socket
@@ -2141,6 +2121,28 @@ export async function runPanelOrchestrator(): Promise<void> {
         tabBackends.delete(migratedFrom);
         headlessTabs.delete(migratedFrom);
         workflowTargets.clear(migratedFrom);
+      }
+      // Blind content mode rides the hello (issue #90) so the FIRST agent spawn
+      // already carries the right tool-server env. A CHANGE against a live
+      // agent also respawns it (codex-review F2: the set_content_mode frame is
+      // lost when toggled during a socket drop — the re-hello is the recovery
+      // path, so it must enforce, not just record). Runs AFTER the migrated_from
+      // rebind so a simultaneous lost-toggle + tab-id migration still finds the
+      // (rebound) live agent (review note). Absence = no-op (old panels
+      // never send the field; it must not clear a prior state).
+      {
+        const helloBlind = (event as { blind?: unknown }).blind;
+        if (helloBlind === true || helloBlind === false) {
+          const changed = helloBlind !== blindTabs.has(panelTab);
+          if (helloBlind) blindTabs.add(panelTab);
+          else blindTabs.delete(panelTab);
+          if (changed && manager.hasLiveAgent(agentKeyFor(panelTab))) {
+            manager.restartForMcpEnv(agentKeyFor(panelTab));
+            logger.info(
+              `[panel-orchestrator] tab ${panelTab.slice(0, 8)} blind=${String(helloBlind)} via hello — live agent respawn queued`,
+            );
+          }
+        }
       }
       const prev = tabBackends.get(panelTab);
       if (prev && prev !== backend) {
