@@ -10,6 +10,7 @@ import { registerModelExtrasTools } from "./model-extras.js";
 import { registerExtraPathsTools } from "./extra-paths.js";
 import { registerSkillGeneratorTools } from "./skill-generator.js";
 import { registerDiagnosticsTools } from "./diagnostics.js";
+import { registerRunpodTools } from "./runpod.js";
 import { registerWorkflowLibraryTools } from "./workflow-library.js";
 import { registerWorkflowUrlTools } from "./workflow-url.js";
 import { registerProcessControlTools } from "./process-control.js";
@@ -73,6 +74,7 @@ const TOOL_GROUPS: ReadonlyArray<readonly [category: string, register: (server: 
   ["models", registerModelManagementTools],
   ["skills-config", registerSkillGeneratorTools],
   ["diagnostics", registerDiagnosticsTools],
+  ["runpod", registerRunpodTools],
   ["workflow-authoring", registerWorkflowLibraryTools],
   ["workflows", registerWorkflowUrlTools],
   ["server", registerProcessControlTools],
