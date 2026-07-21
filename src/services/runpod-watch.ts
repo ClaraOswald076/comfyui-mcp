@@ -1,0 +1,229 @@
+// Live RunPod pod status broadcast + idle auto-stop.
+//
+// Mirrors the queue-status / download-progress broadcasters: a poller turns the
+// watched pod's live state into a `runpod_status` bridge frame so the panel and
+// mobile control panels update in real time, change-only (an unchanged frame is
+// not re-sent). RunPod's API is rate-limited, so we poll on a SLOW interval
+// (default 15s) — unlike the 1s local ComfyUI queue tick.
+//
+// Idle auto-stop (gpu-cli parity): while the connected pod's ComfyUI queue is
+// empty AND nothing is running, we accumulate idle time; once it crosses the
+// configured timeout the pod is stopped automatically (pods bill per running
+// GPU-second even when doing nothing). Off when idleStopMinutes <= 0.
+
+import { getPod, stopPod, comfyuiPortExposed, runpodProxyUrl, type RunpodPod } from "./runpod-client.js";
+import { logger } from "../utils/logger.js";
+
+/** Wire shape of one live pod-status broadcast (panel/mobile control panels). */
+export interface RunpodStatusFrame extends Record<string, unknown> {
+  type: "runpod_status";
+  /** Are we actively watching a pod? false → the rest is a cleared/idle frame. */
+  watching: boolean;
+  pod_id: string | null;
+  name: string | null;
+  /** RUNNING | EXITED | TERMINATED | … (null when not watching). */
+  status: string | null;
+  gpu: string | null;
+  cost_per_hr: number | null;
+  uptime_seconds: number | null;
+  gpu_util: number | null;
+  vram_util: number | null;
+  /** The pod's ComfyUI proxy URL when running + exposed (else null). */
+  comfyui_url: string | null;
+  /** How long the pod's ComfyUI has been idle (queue empty, nothing running). */
+  idle_seconds: number | null;
+  /** Configured idle-stop timeout in minutes (null when disabled). */
+  autostop_minutes: number | null;
+  /** Seconds until auto-stop fires (null when disabled / not idle / not running). */
+  autostop_in_seconds: number | null;
+}
+
+const CLEARED_FRAME: RunpodStatusFrame = {
+  type: "runpod_status",
+  watching: false,
+  pod_id: null,
+  name: null,
+  status: null,
+  gpu: null,
+  cost_per_hr: null,
+  uptime_seconds: null,
+  gpu_util: null,
+  vram_util: null,
+  comfyui_url: null,
+  idle_seconds: null,
+  autostop_minutes: null,
+  autostop_in_seconds: null,
+};
+
+export interface RunpodWatcherDeps {
+  /** Broadcast a frame to all panel/mobile tabs (the bridge's fire-and-forget push). */
+  push: (frame: Record<string, unknown>) => void;
+  /** True when the pod's ComfyUI queue is empty and nothing is running (idle). */
+  comfyuiIdle: () => boolean;
+  /** Idle-stop timeout in minutes; <= 0 disables auto-stop. */
+  idleStopMinutes: number;
+  /** Poll interval in ms (default 15000). */
+  pollMs?: number;
+  /** Injectable clock for tests. */
+  now?: () => number;
+}
+
+export interface RunpodWatcher {
+  /** Start (or switch to) watching a pod — its status broadcasts live. */
+  watch(podId: string): void;
+  /** Stop watching; broadcasts a cleared frame. */
+  unwatch(): void;
+  /** The pod currently watched, or null. */
+  watchedPodId(): string | null;
+  /** The last frame sent (for seeding a tab that just connected). */
+  current(): RunpodStatusFrame;
+  /** Poll once now (also driven internally by the interval). Exposed for tests. */
+  poll(): Promise<void>;
+  /** Begin the poll interval. */
+  start(): void;
+  /** Stop the interval (does not unwatch). */
+  stop(): void;
+}
+
+// ── Process-wide singleton ──────────────────────────────────────────────────
+// The orchestrator owns the watcher (it has the bridge push + the ComfyUI queue
+// monitor). The runpod_* tools run in the same process and reach it here; in a
+// bare MCP-only setup (no orchestrator) it's null and watch/unwatch are no-ops
+// (the one-shot runpod_pod_status tool still works).
+let singleton: RunpodWatcher | null = null;
+export function initRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
+  singleton?.stop();
+  singleton = createRunpodWatcher(deps);
+  singleton.start();
+  return singleton;
+}
+export function getRunpodWatcher(): RunpodWatcher | null {
+  return singleton;
+}
+
+export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
+  const now = deps.now ?? Date.now;
+  const pollMs = deps.pollMs ?? 15000;
+  const idleStopMs = deps.idleStopMinutes > 0 ? deps.idleStopMinutes * 60_000 : 0;
+
+  let podId: string | null = null;
+  let last: RunpodStatusFrame = CLEARED_FRAME;
+  let idleSinceMs: number | null = null;
+  let timer: ReturnType<typeof setInterval> | null = null;
+  let autoStopping = false;
+
+  function pushIfChanged(frame: RunpodStatusFrame): void {
+    if (JSON.stringify(frame) === JSON.stringify(last)) return;
+    last = frame;
+    deps.push(frame);
+  }
+
+  function frameFor(pod: RunpodPod, idleSeconds: number | null, autostopIn: number | null): RunpodStatusFrame {
+    const g = pod.runtime?.gpus?.[0];
+    return {
+      type: "runpod_status",
+      watching: true,
+      pod_id: pod.id,
+      name: pod.name,
+      status: pod.desiredStatus,
+      gpu: pod.machine?.gpuDisplayName ?? null,
+      cost_per_hr: pod.costPerHr ?? null,
+      uptime_seconds: pod.runtime?.uptimeInSeconds ?? null,
+      gpu_util: g?.gpuUtilPercent ?? null,
+      vram_util: g?.memoryUtilPercent ?? null,
+      comfyui_url: comfyuiPortExposed(pod) ? runpodProxyUrl(pod.id) : null,
+      idle_seconds: idleSeconds,
+      autostop_minutes: idleStopMs > 0 ? deps.idleStopMinutes : null,
+      autostop_in_seconds: autostopIn,
+    };
+  }
+
+  async function poll(): Promise<void> {
+    if (!podId || autoStopping) return;
+    let pod: RunpodPod | null;
+    try {
+      pod = await getPod(podId);
+    } catch (err) {
+      // Transient RunPod API blip — keep the last frame, try again next tick.
+      logger.debug(`[runpod-watch] poll failed for ${podId}: ${err instanceof Error ? err.message : err}`);
+      return;
+    }
+    if (!pod) {
+      // Pod vanished (terminated) — stop watching.
+      logger.info(`[runpod-watch] pod ${podId} no longer exists — unwatching`);
+      unwatch();
+      return;
+    }
+
+    // Idle tracking: only a RUNNING pod with an idle ComfyUI accrues idle time.
+    const running = pod.desiredStatus === "RUNNING" && !!pod.runtime;
+    let idleSeconds: number | null = null;
+    let autostopIn: number | null = null;
+    if (running && deps.comfyuiIdle()) {
+      if (idleSinceMs == null) idleSinceMs = now();
+      idleSeconds = Math.floor((now() - idleSinceMs) / 1000);
+      if (idleStopMs > 0) {
+        const remainMs = idleStopMs - (now() - idleSinceMs);
+        autostopIn = Math.max(0, Math.ceil(remainMs / 1000));
+        if (remainMs <= 0) {
+          // Fire auto-stop once; broadcast the reason so the UI can show it.
+          autoStopping = true;
+          logger.info(`[runpod-watch] pod ${podId} idle ${idleSeconds}s ≥ ${deps.idleStopMinutes}m — auto-stopping to save cost`);
+          try {
+            await stopPod(podId);
+          } catch (err) {
+            logger.warn(`[runpod-watch] auto-stop of ${podId} failed: ${err instanceof Error ? err.message : err}`);
+          }
+          const stopped: RunpodStatusFrame = {
+            ...frameFor(pod, idleSeconds, 0),
+            status: "EXITED",
+            autostop_in_seconds: 0,
+          };
+          pushIfChanged(stopped);
+          // Stop watching WITHOUT clearing — the panel keeps showing the pod as
+          // EXITED (so the user can restart it) instead of the card vanishing.
+          podId = null;
+          idleSinceMs = null;
+          autoStopping = false;
+          return;
+        }
+      }
+    } else {
+      idleSinceMs = null; // active or not-running → reset the idle clock
+    }
+
+    pushIfChanged(frameFor(pod, idleSeconds, autostopIn));
+  }
+
+  function watch(id: string): void {
+    podId = id;
+    idleSinceMs = null;
+    // Kick an immediate poll so the panel doesn't wait a full interval.
+    void poll();
+  }
+
+  function unwatch(): void {
+    podId = null;
+    idleSinceMs = null;
+    pushIfChanged(CLEARED_FRAME);
+  }
+
+  return {
+    watch,
+    unwatch,
+    watchedPodId: () => podId,
+    current: () => last,
+    poll,
+    start() {
+      if (timer) return;
+      timer = setInterval(() => void poll(), pollMs);
+      if (typeof timer === "object" && timer && "unref" in timer) (timer as { unref: () => void }).unref();
+    },
+    stop() {
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+    },
+  };
+}

@@ -82,6 +82,7 @@ import { startPanelConsoleHttpServer, type PanelConsoleHttpServer } from "./pane
 import type { AgentBackend } from "./agent-backend.js";
 import { readComfyuiCrashLog, formatCrashNote } from "../services/crash-log.js";
 import { QueueMonitor, type StallReport } from "../services/queue-monitor.js";
+import { initRunpodWatcher, getRunpodWatcher } from "../services/runpod-watch.js";
 import {
   buildQueueStatusFrame,
   createQueueStatusBroadcaster,
@@ -2217,6 +2218,10 @@ export async function runPanelOrchestrator(): Promise<void> {
       // are change-only, so a tab connecting MID-render would otherwise wait for
       // the next state transition to learn a job is already running.
       bridge.push(buildQueueStatusFrame(QueueMonitor.snapshot()), panelTab);
+      // Seed the RunPod control panel too — a tab that just connected gets the
+      // current pod-status frame (or a cleared one when nothing is watched).
+      const rpFrame = getRunpodWatcher()?.current();
+      if (rpFrame) bridge.push(rpFrame, panelTab);
       // Re-push the last usage so the context meter isn't blank after a reload.
       const lastStatus = manager.lastStatusFor(key);
       if (lastStatus) pushStatus(panelTab, lastStatus);
@@ -3248,6 +3253,25 @@ export async function runPanelOrchestrator(): Promise<void> {
   );
   const queueStatusTimer = setInterval(() => queueStatusBroadcaster.tick(), 1000);
   queueStatusTimer.unref?.();
+
+  // RunPod live-status broadcast + idle auto-stop (services/runpod-watch.ts).
+  // Polls the WATCHED pod (set by runpod_pod_connect / runpod_watch) every ~15s
+  // and pushes a `runpod_status` frame to the panel/mobile control panels; when
+  // the connected pod's ComfyUI sits idle past RUNPOD_IDLE_STOP_MINUTES (default
+  // 15; 0 disables) it auto-stops the pod to save GPU cost (gpu-cli parity). No
+  // pod watched → the poller is a no-op, so this costs an idle rig nothing.
+  const runpodIdleStopMinutes = (() => {
+    const v = Number(process.env.RUNPOD_IDLE_STOP_MINUTES);
+    return Number.isFinite(v) && v >= 0 ? v : 15;
+  })();
+  initRunpodWatcher({
+    push: (frame) => void bridge.push(frame),
+    comfyuiIdle: () => {
+      const s = QueueMonitor.snapshot();
+      return s.connected && !s.running && s.queueDepth === 0;
+    },
+    idleStopMinutes: runpodIdleStopMinutes,
+  });
 
   // Keep the pod's stored bridge URL fresh so a ComfyUI RESTART self-heals fast.
   // The panel's advertised wss:// URL/token lives in the pod ComfyUI process's

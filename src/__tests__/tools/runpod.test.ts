@@ -17,7 +17,11 @@ vi.mock("../../services/runpod-client.js", () => ({
     (pod.runtime?.ports ?? []).some((p) => p.privatePort === 8188 && p.type === "http"),
   runpodProxyUrl: (id: string, port = 8188) => `https://${id}-${port}.proxy.runpod.net`,
   runpodDeployLink: () => "https://console.runpod.io/deploy?template=bnqtkvcer3&ref=dkx71w9b",
+  GPU_CLI_CREDIT: "Pod control inspired by gpu-cli.sh (https://gpu-cli.sh) — a cloud-GPU CLI worth checking out.",
 }));
+
+// runpod tools also import the watcher singleton — stub it (no orchestrator here).
+vi.mock("../../services/runpod-watch.js", () => ({ getRunpodWatcher: () => null }));
 
 const setComfyuiTargetMock = vi.fn(() => true);
 vi.mock("../../config.js", () => ({ setComfyuiTarget: (...a: unknown[]) => setComfyuiTargetMock(...a) }));

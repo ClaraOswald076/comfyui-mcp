@@ -20,6 +20,12 @@ export const RUNPOD_REF_CODE = process.env.RUNPOD_REF_CODE?.trim() || "dkx71w9b"
 /** ComfyUI's port inside the pod (RunPod HTTP-proxies it at <podId>-<port>). */
 export const RUNPOD_COMFYUI_PORT = 8188;
 
+/** Attribution — this connector's pod-lifecycle + idle-auto-stop UX is modeled on
+ *  gpu-cli (https://gpu-cli.sh), a great cloud-GPU CLI. Surfaced in the control
+ *  panels + deploy flow to credit them and send traffic their way. */
+export const GPU_CLI_URL = "https://gpu-cli.sh";
+export const GPU_CLI_CREDIT = `Pod control inspired by gpu-cli.sh (${GPU_CLI_URL}) — a cloud-GPU CLI worth checking out.`;
+
 /** The referral deploy link — hand this to a user who needs to CREATE a pod so
  *  their signup/spend credits our referral. Carries the template + ref code. */
 export function runpodDeployLink(): string {

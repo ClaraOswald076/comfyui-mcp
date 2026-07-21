@@ -12,8 +12,10 @@ import {
   runpodProxyUrl,
   runpodDeployLink,
   RUNPOD_COMFYUI_PORT,
+  GPU_CLI_CREDIT,
   type RunpodPod,
 } from "../services/runpod-client.js";
+import { getRunpodWatcher } from "../services/runpod-watch.js";
 
 /** Human-friendly uptime. */
 function fmtUptime(sec: number | null | undefined): string {
@@ -124,10 +126,47 @@ export function registerRunpodTools(server: McpServer): void {
     async (args) => {
       try {
         const r = await stopPod(args.pod_id);
+        // Stop live-status/idle-watch if this was the watched pod.
+        const w = getRunpodWatcher();
+        if (w?.watchedPodId() === r.id) w.unwatch();
         return { content: [{ type: "text", text: `Stopped pod \`${r.id}\` → **${r.desiredStatus}**. GPU released; disk kept. Start it again with runpod_pod_start.` }] };
       } catch (err) {
         return errorToToolResult(err);
       }
+    },
+  );
+
+  // ── WATCH / UNWATCH (live status broadcast + idle auto-stop) ──────────────
+  server.tool(
+    "runpod_watch",
+    "Start broadcasting a pod's LIVE status to the control panel (desktop + mobile) — status, GPU/VRAM utilization, uptime, $/hr, and an idle-auto-stop countdown — refreshed every ~15s. runpod_pod_connect already starts this for the pod it connects to; call this to watch a pod WITHOUT retargeting comfyui-mcp at it (e.g. monitor a pod that's still booting). While watched, if the pod's ComfyUI sits idle past the configured timeout it is auto-stopped to save cost.",
+    {
+      pod_id: z.string().describe("The RunPod pod ID to watch."),
+    },
+    async (args) => {
+      try {
+        const w = getRunpodWatcher();
+        if (!w) return { content: [{ type: "text", text: `Live status watch isn't available (no orchestrator/panel connected). runpod_pod_status gives a one-shot snapshot.` }] };
+        // Validate the pod exists before watching, for a clear error.
+        const pod = await getPod(args.pod_id);
+        if (!pod) return { content: [{ type: "text", text: `No pod \`${args.pod_id}\` on this account (runpod_list_pods).` }] };
+        w.watch(args.pod_id);
+        return { content: [{ type: "text", text: `Now broadcasting live status for pod \`${args.pod_id}\` to the control panel (idle auto-stop active). Stop with runpod_unwatch.` }] };
+      } catch (err) {
+        return errorToToolResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "runpod_unwatch",
+    "Stop broadcasting a pod's live status to the control panel (does NOT stop the pod itself — use runpod_pod_stop for that). Also disables idle auto-stop for it.",
+    {},
+    async () => {
+      const w = getRunpodWatcher();
+      const was = w?.watchedPodId();
+      w?.unwatch();
+      return { content: [{ type: "text", text: was ? `Stopped watching pod \`${was}\`. The pod is still running — runpod_pod_stop to stop it.` : `No pod was being watched.` }] };
     },
   );
 
@@ -196,7 +235,9 @@ export function registerRunpodTools(server: McpServer): void {
         const applied = setComfyuiTarget(url);
         if (!applied) return { content: [{ type: "text", text: `Resolved ${url} but could not retarget (unexpected URL parse failure).` }] };
         resetClient();
-        return { content: [{ type: "text", text: `✅ Connected to RunPod pod \`${pod.id}\` — comfyui-mcp now targets ${url}. All comfyui tools this session run against the pod.` }] };
+        // Start live status broadcasts + idle auto-stop for this pod (control panels).
+        getRunpodWatcher()?.watch(pod.id);
+        return { content: [{ type: "text", text: `✅ Connected to RunPod pod \`${pod.id}\` — comfyui-mcp now targets ${url}. All comfyui tools this session run against the pod. Live status is now broadcasting to the control panel (with idle auto-stop).` }] };
       } catch (err) {
         return errorToToolResult(err);
       }
@@ -213,7 +254,7 @@ export function registerRunpodTools(server: McpServer): void {
         content: [
           {
             type: "text",
-            text: `Deploy a new comfyui-mcp pod here (pre-loaded with our template; the link carries our referral so your usage supports the project):\n\n${runpodDeployLink()}\n\nAfter it deploys, grab the pod ID from the RunPod console and use runpod_pod_connect to point this session at it.`,
+            text: `Deploy a new comfyui-mcp pod here (pre-loaded with our template; the link carries our referral so your usage supports the project):\n\n${runpodDeployLink()}\n\nAfter it deploys, grab the pod ID from the RunPod console and use runpod_pod_connect to point this session at it.\n\n${GPU_CLI_CREDIT}`,
           },
         ],
       };
