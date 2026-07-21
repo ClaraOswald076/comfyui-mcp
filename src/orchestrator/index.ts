@@ -1286,6 +1286,13 @@ export async function runPanelOrchestrator(): Promise<void> {
   // the same secrets — reach either provider.
   // A FUNCTION (not a frozen object) so it always reflects the CURRENT retargeted
   // comfyuiUrl/comfyuiPath — makeHttpBackendMcpServers calls it per (re)spawn.
+  // Tabs whose panel Blind toggle is ON (issue #90): their comfyui tool-server
+  // spawns get COMFYUI_MCP_BLIND=1 so image-returning tools withhold pixels
+  // mechanically. Seeded from `blind` on hello; toggled live via the
+  // set_content_mode frame (which respawns the tab's agent at idle so the new
+  // env applies). Keyed by tab id (the spawn is per tab, not per backend).
+  const blindTabs = new Set<string>();
+
   const comfyuiBaseEnv = (): Record<string, string> => ({
     COMFYUI_URL: comfyuiUrl,
     COMFYUI_MCP_PROGRESS_DIR: progressDir,
@@ -1353,7 +1360,12 @@ export async function runPanelOrchestrator(): Promise<void> {
       args: [mcpEntry], // dist/index.js
       // Merge persisted tool secrets at SPAWN time so a respawn picks up a
       // just-saved CIVITAI_API_TOKEN / HF_TOKEN without a process restart.
-      env: buildComfyuiMcpEnv(comfyuiBaseEnv()),
+      // Blind tabs (issue #90) add COMFYUI_MCP_BLIND=1 so the tool server
+      // withholds image pixels from the model.
+      env: buildComfyuiMcpEnv({
+        ...comfyuiBaseEnv(),
+        ...(blindTabs.has(tabId) ? { COMFYUI_MCP_BLIND: "1" } : {}),
+      }),
     },
     // Live-graph panel_* tools for THIS tab over the loopback HTTP MCP.
     ...(panelMcpHttp
@@ -2059,6 +2071,11 @@ export async function runPanelOrchestrator(): Promise<void> {
           ? ((event as { backend?: string }).backend as string).toLowerCase()
           : undefined;
       const backend = reqBackend && KNOWN_BACKENDS.has(reqBackend) ? reqBackend : defaultBackend;
+      // Blind content mode rides the hello (issue #90) so the FIRST agent spawn
+      // already carries the right tool-server env — a toggle later goes through
+      // set_content_mode below.
+      if ((event as { blind?: unknown }).blind === true) blindTabs.add(panelTab);
+      else if ((event as { blind?: unknown }).blind === false) blindTabs.delete(panelTab);
       // Tab-id migration (issue #210): the BRIDGE stamps `migrated_from` on a
       // hello when the SAME socket re-helloed under a new tab id (panel update
       // changed the id scheme, e.g. random UUID → tmp:/wf:). That same-socket
@@ -2721,6 +2738,34 @@ export async function runPanelOrchestrator(): Promise<void> {
     // reaches this handler); the ack echoes it verbatim (plus
     // `requested_model`, the pre-guard id) so the client can resolve exactly
     // the attempt each ack answers. See options-ack.ts.
+    // Blind toggle (issue #90): record the tab's content mode and, when an
+    // agent is live, respawn it at idle so the comfyui tool server restarts
+    // with the new COMFYUI_MCP_BLIND env — the same coalesced restart path a
+    // saved secret uses. The session resumes; only the tool subprocess env
+    // changes.
+    if (event.type === "set_content_mode" && event.tab_id) {
+      const tabId = event.tab_id;
+      const nextBlind = (event as { blind?: unknown }).blind === true;
+      const changed = nextBlind !== blindTabs.has(tabId);
+      if (nextBlind) blindTabs.add(tabId);
+      else blindTabs.delete(tabId);
+      const key = agentKeyFor(tabId);
+      if (changed && manager.hasLiveAgent(key)) {
+        manager.restartForMcpEnv(key);
+        bridge.push(
+          {
+            type: "say",
+            text: nextBlind
+              ? "🕶️ Blind mode ON — the agent's image tools now withhold pixels (applies after the current turn; the session resumes automatically)."
+              : "👁️ Blind mode OFF — the agent's image tools deliver pixels again (applies after the current turn).",
+          },
+          tabId,
+        );
+      }
+      bridge.push({ type: "ack", ok: true, kind: "set_content_mode", blind: nextBlind }, tabId);
+      return;
+    }
+
     if (event.type === "set_options" && event.tab_id) {
       const tabId = event.tab_id;
       const meta = optionsRequestMeta(event as { cid?: unknown; model?: unknown });

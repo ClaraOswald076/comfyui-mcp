@@ -1196,6 +1196,15 @@ export class PanelAgentManager {
     }
   }
 
+  /** Single-tab variant of restartAllForMcpEnv — used when ONE tab's tool-server
+   *  spawn env changed (e.g. the Blind toggle, issue #90). Same coalesced
+   *  at-idle replacement; no-op when the tab has no live agent. */
+  restartForMcpEnv(key: string, nudge?: string): void {
+    if (!this.agents.has(key)) return;
+    this.pendingMcpRestart.set(key, nudge ?? null);
+    this.applyPendingRestarts(key);
+  }
+
   /**
    * Apply any deferred session-restart for a tab once it's idle — COALESCING a
    * pending effort change and a pending comfyui-MCP-env respawn into ONE

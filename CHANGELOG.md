@@ -6,6 +6,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+### MCP
+
+#### Fixed
+- the panel's **Blind** toggle now mechanically gates EVERY image-returning
+  tool (get_image, view_image, convert previews, …): blind tabs spawn their
+  comfyui tool server with COMFYUI_MCP_BLIND=1 and a single registration-
+  boundary wrapper replaces image blocks with an honest "withheld" note — on
+  both the full MCP surface and the compact call_tool router; toggling Blind
+  live respawns the tab's tool server at idle (panel issue #90)
+
 ## [0.41.0] - 2026-07-20
 
 ### MCP
