@@ -377,7 +377,12 @@ export class AntigravityBackend implements AgentBackend {
       ...(this.model ? ["--model", this.model] : []),
     ];
 
-    this.interrupted = false;
+    // NOTE: `interrupted` is deliberately NOT cleared here. A Stop can land
+    // while this turn is still starting up (run() awaits prepare() and the
+    // channel before reaching runTurn), and clearing at turn START silently
+    // discarded it — the turn then ran with nothing able to stop it. The flag is
+    // cleared when a turn SETTLES instead, so it survives setup and the child
+    // assignment below acts on it.
     const queue: AgentEvent[] = [];
     let wake: (() => void) | null = null;
     let done = false;
@@ -481,10 +486,21 @@ export class AntigravityBackend implements AgentBackend {
         this.continueNext = true;
         push({ type: "result", ok: true, subtype: "end_turn" });
       }
+      // Clear the interrupt HERE (turn end), not at turn start — see the note
+      // where the queue is set up. The flag has now been consumed to pick this
+      // turn's result, so the next turn starts clean.
+      this.interrupted = false;
       finish();
     };
     child.on("error", (err) => settle(null, err));
     child.on("exit", (code) => settle(code));
+
+    // An interrupt can arrive while spawn() is in flight — `this.child` was
+    // still null then, so interrupt() could only raise the flag. Honor it now.
+    // This MUST come after the exit/error listeners above: killing earlier can
+    // deliver the child's death before anything is listening, and then the turn
+    // never settles (exactly what hung the interrupt test).
+    if (this.interrupted) killProcessTree(child.pid);
 
     // Drain the bridged queue until the child settles.
     while (true) {
@@ -500,9 +516,16 @@ export class AntigravityBackend implements AgentBackend {
   /** Stop the current turn: kill the in-flight child's process tree. The next
    *  turn continues the conversation (`-c`) with whatever agy recorded. */
   async interrupt(): Promise<void> {
-    const child = this.child;
-    if (!child) return;
+    // Set the flag FIRST and UNCONDITIONALLY. `this.child` is only assigned
+    // after spawn() returns, so an interrupt landing in that window used to hit
+    // the `if (!child) return` below, leave `interrupted` false, and never kill
+    // anything — the turn then ran to completion with nothing able to stop it.
+    // In the panel that is "hit Stop right after Send and the turn hangs
+    // forever"; in CI it was a 5s timeout in the interrupt test. run() re-checks
+    // this flag the moment it assigns the child, so a kill is never lost.
     this.interrupted = true;
+    const child = this.child;
+    if (!child) return; // spawn window — run() kills it as soon as it exists
     killProcessTree(child.pid);
   }
 

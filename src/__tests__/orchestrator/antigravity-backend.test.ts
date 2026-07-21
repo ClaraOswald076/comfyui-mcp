@@ -311,6 +311,34 @@ describe("AntigravityBackend turns", () => {
     ]);
   });
 
+  it("honors an interrupt that lands BEFORE the child is assigned (spawn window)", async () => {
+    // The regression: interrupt() used to bail on `if (!this.child) return`
+    // WITHOUT setting `interrupted`. `this.child` is assigned only after
+    // spawn() returns, so a Stop pressed in that window was silently dropped
+    // and the turn ran forever (CI saw this as a 5s timeout in the interrupt
+    // test; a user sees the stop button do nothing).
+    hoisted.script.push({ hang: true });
+    const backend = new AntigravityBackend({ cwd: workDir });
+    const gen = backend.run({ channel: channelOf([{ text: "long job" }]) });
+    const events: AgentEvent[] = [];
+    const drain = (async () => {
+      for await (const ev of gen) events.push(ev);
+    })();
+
+    // Interrupt IMMEDIATELY — deliberately without waiting for the spawn, so
+    // this lands in (or before) the spawn window.
+    await backend.interrupt();
+
+    // Must still terminate. Pre-fix this hung until the test timeout.
+    await drain;
+
+    expect(events.filter((e) => e.type === "result")).toEqual([
+      { type: "result", ok: false, subtype: "cancelled" },
+    ]);
+    // and the child must not be left running
+    if (hoisted.procs[0]) expect(hoisted.killed).toContain(hoisted.procs[0]!.pid);
+  });
+
   it("prepare() fails fast with install guidance when agy is missing", async () => {
     delete process.env.COMFYUI_MCP_ANTIGRAVITY_PATH;
     const savedPath = process.env.PATH;
