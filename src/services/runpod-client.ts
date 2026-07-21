@@ -169,3 +169,82 @@ export function comfyuiPortExposed(pod: RunpodPod): boolean {
   const ports = pod.runtime?.ports ?? [];
   return ports.some((p) => p.privatePort === RUNPOD_COMFYUI_PORT && p.type === "http");
 }
+
+// ── Pod creation (deploy our template via the API) ───────────────────────────
+// The referral in runpodDeployLink() attaches a NEW signup to our account; once
+// a user is a referred signup, EVERY pod they create — API or console — credits
+// us. So a user with a RunPod account + API key can one-tap deploy our template
+// here, while runpod_deploy_link onboards brand-new users. GPU availability is
+// spotty on-demand, so createPod tries a list of GPU types in order until one
+// deploys (all 24GB+, enough for krea2 etc.).
+
+/** GPU types tried in order by createPod (24GB+, community-common). Override via
+ *  RUNPOD_GPU_TYPES (comma-separated) for other budgets/regions. */
+export const RUNPOD_DEFAULT_GPU_TYPES: string[] = (
+  process.env.RUNPOD_GPU_TYPES?.split(",").map((s) => s.trim()).filter(Boolean) || [
+    "NVIDIA GeForce RTX 4090",
+    "NVIDIA RTX A5000",
+    "NVIDIA A40",
+  ]
+);
+
+export interface RunpodCreateOptions {
+  /** GPU types to try in order (default RUNPOD_DEFAULT_GPU_TYPES). */
+  gpuTypeIds?: string[];
+  gpuCount?: number; // default 1
+  /** COMMUNITY (cheaper, default) or SECURE. */
+  cloudType?: "COMMUNITY" | "SECURE";
+  name?: string; // default "comfyui-mcp"
+  templateId?: string; // default RUNPOD_TEMPLATE_ID (our image)
+  containerDiskInGb?: number; // default 20 (matches our template)
+  volumeInGb?: number; // default 60 (matches our template; /workspace)
+}
+
+/** Deploy a fresh on-demand pod from our template. Tries each GPU type until one
+ *  has capacity; throws a descriptive error listing what RunPod rejected if none
+ *  do. The returned pod is freshly created (runtime null — it still needs to boot;
+ *  follow with getPod/runpod_pod_connect which waits for ComfyUI). */
+export async function createPod(opts: RunpodCreateOptions = {}): Promise<RunpodPod> {
+  const gpuTypeIds = opts.gpuTypeIds?.length ? opts.gpuTypeIds : RUNPOD_DEFAULT_GPU_TYPES;
+  const attempts: string[] = [];
+  for (const gpuTypeId of gpuTypeIds) {
+    try {
+      const data = await runpodGql<{ podFindAndDeployOnDemand: RunpodPod | null }>(
+        `mutation Deploy($input: PodFindAndDeployOnDemandInput!) {
+           podFindAndDeployOnDemand(input: $input) {
+             id name desiredStatus costPerHr machine { gpuDisplayName }
+           }
+         }`,
+        {
+          input: {
+            cloudType: opts.cloudType ?? "COMMUNITY",
+            gpuCount: opts.gpuCount ?? 1,
+            gpuTypeId,
+            templateId: opts.templateId ?? RUNPOD_TEMPLATE_ID,
+            name: opts.name ?? "comfyui-mcp",
+            containerDiskInGb: opts.containerDiskInGb ?? 20,
+            volumeInGb: opts.volumeInGb ?? 60,
+            volumeMountPath: "/workspace",
+            // Guarantee ComfyUI is reachable through RunPod's HTTP proxy even if
+            // the template's port config drifts.
+            ports: `${RUNPOD_COMFYUI_PORT}/http`,
+          },
+        },
+      );
+      const pod = data.podFindAndDeployOnDemand;
+      if (pod?.id) {
+        // Ensure the runtime shape is present (deploy returns it null).
+        return { ...pod, runtime: pod.runtime ?? null } as RunpodPod;
+      }
+      attempts.push(`${gpuTypeId}: no capacity available`);
+    } catch (err) {
+      attempts.push(`${gpuTypeId}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  throw new Error(
+    `Could not deploy a pod on any of [${gpuTypeIds.join(", ")}]. RunPod reported:\n` +
+      attempts.map((a) => `  • ${a}`).join("\n") +
+      `\nTry again shortly (capacity fluctuates), set RUNPOD_GPU_TYPES to other GPUs, ` +
+      `or deploy from the console with runpod_deploy_link.`,
+  );
+}

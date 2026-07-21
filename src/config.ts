@@ -463,6 +463,54 @@ if (cloudActive) {
 
 export const config: Config = { ...parsedConfig, resolvedPort };
 
+// Process-start ComfyUI target, captured before any runtime retarget (RunPod
+// connect / panel "Local" switch), so a "switch back to local" can restore it.
+// If the process itself booted pointed at a remote host, fall back to the
+// conventional loopback default so the Local action still means "this machine".
+const bootComfyui = {
+  host: config.comfyuiHost,
+  port: config.resolvedPort,
+  ssl: config.comfyuiSsl,
+  basePath: config.comfyuiBasePath,
+};
+
+/** The loopback ComfyUI URL to fall back to when leaving a remote pod. */
+export function getLocalComfyuiUrl(): string {
+  const local = isLoopbackHost(bootComfyui.host);
+  const host = local ? bootComfyui.host : "127.0.0.1";
+  const port = local && bootComfyui.port ? bootComfyui.port : 8188;
+  const proto = local && bootComfyui.ssl ? "https" : "http";
+  return `${proto}://${host}:${port}${local ? bootComfyui.basePath : ""}`;
+}
+
+/** True when the ACTIVE ComfyUI target is loopback (renders run on this machine
+ *  rather than a remote pod) — the honest-host-indicator predicate. */
+export function isTargetingLocal(): boolean {
+  return isLoopbackHost(config.comfyuiHost);
+}
+
+// ── Target-change subscribers (honest host indicator) ────────────────────────
+// setComfyuiTarget() fires these so the orchestrator can broadcast a
+// `comfyui_target` frame to the control panels the moment renders move between
+// local and a RunPod pod — the UI must never lie about where a job runs.
+type ComfyuiTargetListener = (url: string, isLocal: boolean) => void;
+const comfyuiTargetListeners = new Set<ComfyuiTargetListener>();
+export function onComfyuiTargetChanged(cb: ComfyuiTargetListener): () => void {
+  comfyuiTargetListeners.add(cb);
+  return () => comfyuiTargetListeners.delete(cb);
+}
+function emitComfyuiTargetChanged(): void {
+  const url = getComfyUIBaseUrl();
+  const local = isTargetingLocal();
+  for (const cb of comfyuiTargetListeners) {
+    try {
+      cb(url, local);
+    } catch {
+      // A subscriber must never break a retarget.
+    }
+  }
+}
+
 // ── Mode helpers ──────────────────────────────────────────────────────────
 // Three modes, mutually exclusive in practice:
 //   - cloud:  COMFYUI_API_KEY set → talk to Comfy Cloud over HTTPS+X-API-Key
@@ -545,6 +593,8 @@ export function setComfyuiTarget(url: string): boolean {
     cloud: isCloudMode(),
     remoteHost: t.host,
   });
+  // Tell the control panels where renders run now (local ⇄ pod).
+  emitComfyuiTargetChanged();
   return true;
 }
 

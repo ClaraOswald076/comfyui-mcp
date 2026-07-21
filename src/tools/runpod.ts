@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { setComfyuiTarget } from "../config.js";
+import { setComfyuiTarget, getLocalComfyuiUrl } from "../config.js";
 import { resetClient } from "../comfyui/client.js";
 import { errorToToolResult } from "../utils/errors.js";
 import {
@@ -8,14 +8,24 @@ import {
   listPods,
   resumePod,
   stopPod,
+  createPod,
   comfyuiPortExposed,
   runpodProxyUrl,
   runpodDeployLink,
   RUNPOD_COMFYUI_PORT,
+  RUNPOD_DEFAULT_GPU_TYPES,
   GPU_CLI_CREDIT,
   type RunpodPod,
 } from "../services/runpod-client.js";
 import { getRunpodWatcher } from "../services/runpod-watch.js";
+
+/** Retarget comfyui-mcp back to the local ComfyUI (shared by stop + use_local). */
+function retargetLocal(): string {
+  const url = getLocalComfyuiUrl();
+  setComfyuiTarget(url);
+  resetClient();
+  return url;
+}
 
 /** Human-friendly uptime. */
 function fmtUptime(sec: number | null | undefined): string {
@@ -125,11 +135,87 @@ export function registerRunpodTools(server: McpServer): void {
     },
     async (args) => {
       try {
+        const w = getRunpodWatcher();
+        const wasConnected = w?.watchedPodId() === args.pod_id;
         const r = await stopPod(args.pod_id);
         // Stop live-status/idle-watch if this was the watched pod.
+        if (wasConnected) w?.unwatch();
+        // If comfyui-mcp was pointed at THIS pod, its proxy URL is now dead —
+        // fall back to the local ComfyUI so rendering keeps working (the swap
+        // half of the local⇄pod flow). Only when we were connected to it.
+        let localNote = "";
+        if (wasConnected) {
+          const url = retargetLocal();
+          localNote = ` comfyui-mcp switched back to local ComfyUI (${url}).`;
+        }
+        return { content: [{ type: "text", text: `Stopped pod \`${r.id}\` → **${r.desiredStatus}**. GPU released; disk kept.${localNote} Start it again with runpod_pod_start.` }] };
+      } catch (err) {
+        return errorToToolResult(err);
+      }
+    },
+  );
+
+  // ── CREATE (deploy our template via the API — referral-earning) ───────────
+  server.tool(
+    "runpod_pod_create",
+    "Deploy a BRAND-NEW RunPod pod from our comfyui-mcp template (image with the panel + Manager + our nodes preinstalled), then it can be started/connected like any pod. One-tap alternative to the console deploy link for a user who already has a RunPod account + API key. Because our template is used, the agent can install the user's exact custom nodes/LoRAs + download models on it → full canvas parity. Tries several GPU types until one has capacity (on-demand availability fluctuates). NOTE: this bills GPU-time as soon as the pod boots — confirm with the user first, and stop it (runpod_pod_stop) when done. For onboarding a NEW RunPod user, prefer runpod_deploy_link so their signup credits our referral.",
+    {
+      name: z.string().optional().describe("Pod name (default 'comfyui-mcp')."),
+      gpu_type: z.string().optional().describe(`GPU type to prefer, e.g. "NVIDIA GeForce RTX 4090". Default tries: ${RUNPOD_DEFAULT_GPU_TYPES.join(", ")}.`),
+      cloud_type: z.enum(["COMMUNITY", "SECURE"]).optional().describe("COMMUNITY (cheaper, default) or SECURE."),
+      connect: z.boolean().optional().describe("After it boots, wait and auto-connect comfyui-mcp to it (default false — deploy returns immediately; the pod still needs ~1-3min to boot)."),
+    },
+    async (args) => {
+      try {
+        const pod = await createPod({
+          name: args.name,
+          gpuTypeIds: args.gpu_type ? [args.gpu_type] : undefined,
+          cloudType: args.cloud_type,
+        });
+        const cost = pod.costPerHr != null ? ` at $${pod.costPerHr.toFixed(3)}/hr` : "";
+        const gpu = pod.machine?.gpuDisplayName ? ` on ${pod.machine.gpuDisplayName}` : "";
+        // Broadcast its status to the control panels while it boots.
+        getRunpodWatcher()?.watch(pod.id);
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `🚀 Deployed pod \`${pod.id}\` (${pod.name || "comfyui-mcp"})${gpu}${cost}. ` +
+                `It's booting now — ComfyUI takes ~1-3min to come up (model volume warm-up on first boot). ` +
+                `Watch it with runpod_pod_status, then runpod_pod_connect \`${pod.id}\` once ready. ` +
+                `Live status is broadcasting to the control panel (idle auto-stop active). ` +
+                `Stop it with runpod_pod_stop when done to end billing.\n\n${GPU_CLI_CREDIT}`,
+            },
+          ],
+        };
+      } catch (err) {
+        return errorToToolResult(err);
+      }
+    },
+  );
+
+  // ── USE LOCAL (switch renders back to this machine) ───────────────────────
+  server.tool(
+    "runpod_use_local",
+    "Switch comfyui-mcp back to the LOCAL ComfyUI on this machine (the 'Local' half of the local⇄pod switch) — retargets rendering to loopback so generate/workflows run on the local GPU again. Stops broadcasting the pod's status but does NOT stop the pod itself (use runpod_pod_stop to end billing). Use when the user wants to render locally again after working on a pod.",
+    {},
+    async () => {
+      try {
         const w = getRunpodWatcher();
-        if (w?.watchedPodId() === r.id) w.unwatch();
-        return { content: [{ type: "text", text: `Stopped pod \`${r.id}\` → **${r.desiredStatus}**. GPU released; disk kept. Start it again with runpod_pod_start.` }] };
+        const was = w?.watchedPodId();
+        w?.unwatch();
+        const url = retargetLocal();
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `✅ comfyui-mcp now targets the local ComfyUI (${url}). Renders run on this machine.` +
+                (was ? ` Pod \`${was}\` is still running — stop it with runpod_pod_stop to end billing, or reconnect with runpod_pod_connect.` : ""),
+            },
+          ],
+        };
       } catch (err) {
         return errorToToolResult(err);
       }

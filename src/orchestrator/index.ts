@@ -46,7 +46,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { registerAllTools } from "../tools/index.js";
-import { isForceRemoteFlagSet, isLoopbackHost, detectLocalComfyUIPath, setComfyuiTarget } from "../config.js";
+import { isForceRemoteFlagSet, isLoopbackHost, detectLocalComfyUIPath, setComfyuiTarget, onComfyuiTargetChanged, isTargetingLocal, getComfyUIBaseUrl } from "../config.js";
 import {
   buildComfyuiMcpEnv,
   comfyuiSecretKeys,
@@ -672,6 +672,22 @@ const CALL_TOOL_WHITELIST = new Set<string>([
   "train_prepare_dataset",
   "train_start",
   "train_cancel",
+  // RunPod control panel (desktop + mobile): the one-tap pod lifecycle + the
+  // local⇄pod host switch. Read-only status/list/troubleshoot plus the
+  // user-initiated lifecycle actions (create/start/stop/connect/use_local/
+  // watch/unwatch) and the referral deploy link. Each tool validates its own
+  // pod state; the whitelist only gates reachability from a canvas-less client.
+  "runpod_pod_status",
+  "runpod_list_pods",
+  "runpod_pod_start",
+  "runpod_pod_stop",
+  "runpod_pod_create",
+  "runpod_pod_connect",
+  "runpod_pod_troubleshoot",
+  "runpod_use_local",
+  "runpod_watch",
+  "runpod_unwatch",
+  "runpod_deploy_link",
 ]);
 
 /** Lazily build ONE in-process MCP client wired to the full comfyui tool surface,
@@ -2222,6 +2238,8 @@ export async function runPanelOrchestrator(): Promise<void> {
       // current pod-status frame (or a cleared one when nothing is watched).
       const rpFrame = getRunpodWatcher()?.current();
       if (rpFrame) bridge.push(rpFrame, panelTab);
+      // Seed the honest host indicator: tell this tab where renders run now.
+      bridge.push({ type: "comfyui_target", url: getComfyUIBaseUrl(), is_local: isTargetingLocal() }, panelTab);
       // Re-push the last usage so the context meter isn't blank after a reload.
       const lastStatus = manager.lastStatusFor(key);
       if (lastStatus) pushStatus(panelTab, lastStatus);
@@ -3271,6 +3289,15 @@ export async function runPanelOrchestrator(): Promise<void> {
       return s.connected && !s.running && s.queueDepth === 0;
     },
     idleStopMinutes: runpodIdleStopMinutes,
+  });
+
+  // Honest host indicator: whenever the ComfyUI target moves (RunPod connect,
+  // pod stop → local fallback, "Local" switch), broadcast a `comfyui_target`
+  // frame so every control panel truthfully shows where renders run. Seeded per
+  // tab on connect (below) so a fresh tab knows the host without waiting for a
+  // switch.
+  onComfyuiTargetChanged((url, isLocal) => {
+    void bridge.push({ type: "comfyui_target", url, is_local: isLocal });
   });
 
   // Keep the pod's stored bridge URL fresh so a ComfyUI RESTART self-heals fast.

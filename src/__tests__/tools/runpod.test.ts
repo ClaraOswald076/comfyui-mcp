@@ -7,12 +7,15 @@ const getPodMock = vi.fn();
 const listPodsMock = vi.fn();
 const resumePodMock = vi.fn();
 const stopPodMock = vi.fn();
+const createPodMock = vi.fn();
 vi.mock("../../services/runpod-client.js", () => ({
   getPod: (...a: unknown[]) => getPodMock(...a),
   listPods: (...a: unknown[]) => listPodsMock(...a),
   resumePod: (...a: unknown[]) => resumePodMock(...a),
   stopPod: (...a: unknown[]) => stopPodMock(...a),
+  createPod: (...a: unknown[]) => createPodMock(...a),
   RUNPOD_COMFYUI_PORT: 8188,
+  RUNPOD_DEFAULT_GPU_TYPES: ["NVIDIA GeForce RTX 4090", "NVIDIA RTX A5000", "NVIDIA A40"],
   comfyuiPortExposed: (pod: { runtime?: { ports?: Array<{ privatePort: number; type: string }> } }) =>
     (pod.runtime?.ports ?? []).some((p) => p.privatePort === 8188 && p.type === "http"),
   runpodProxyUrl: (id: string, port = 8188) => `https://${id}-${port}.proxy.runpod.net`,
@@ -20,11 +23,24 @@ vi.mock("../../services/runpod-client.js", () => ({
   GPU_CLI_CREDIT: "Pod control inspired by gpu-cli.sh (https://gpu-cli.sh) — a cloud-GPU CLI worth checking out.",
 }));
 
-// runpod tools also import the watcher singleton — stub it (no orchestrator here).
-vi.mock("../../services/runpod-watch.js", () => ({ getRunpodWatcher: () => null }));
+// runpod tools also import the watcher singleton — stub it with a controllable
+// fake so we can assert watch/unwatch and the "was this pod connected?" branch.
+const watcherState = { watched: null as string | null };
+const watchMock = vi.fn((id: string) => { watcherState.watched = id; });
+const unwatchMock = vi.fn(() => { watcherState.watched = null; });
+vi.mock("../../services/runpod-watch.js", () => ({
+  getRunpodWatcher: () => ({
+    watch: (id: string) => watchMock(id),
+    unwatch: () => unwatchMock(),
+    watchedPodId: () => watcherState.watched,
+  }),
+}));
 
 const setComfyuiTargetMock = vi.fn(() => true);
-vi.mock("../../config.js", () => ({ setComfyuiTarget: (...a: unknown[]) => setComfyuiTargetMock(...a) }));
+vi.mock("../../config.js", () => ({
+  setComfyuiTarget: (...a: unknown[]) => setComfyuiTargetMock(...a),
+  getLocalComfyuiUrl: () => "http://127.0.0.1:8188",
+}));
 const resetClientMock = vi.fn();
 vi.mock("../../comfyui/client.js", () => ({ resetClient: () => resetClientMock() }));
 
@@ -55,6 +71,7 @@ const runningPod = (over: Record<string, unknown> = {}) => ({
 
 beforeEach(() => {
   vi.clearAllMocks();
+  watcherState.watched = null;
   setComfyuiTargetMock.mockReturnValue(true);
   // default probe: ComfyUI answers
   global.fetch = vi.fn(async () => ({ ok: true, status: 200 })) as unknown as typeof fetch;
@@ -112,6 +129,56 @@ describe("runpod_pod_start / stop", () => {
     const t = (await getHandler("runpod_pod_stop")({ pod_id: "pod123" })).content[0].text;
     expect(t).toContain("Stopped");
     expect(t).toContain("EXITED");
+  });
+  it("falls back to local ComfyUI when stopping the CONNECTED pod (the swap)", async () => {
+    watcherState.watched = "pod123"; // we were connected to it
+    stopPodMock.mockResolvedValue({ id: "pod123", desiredStatus: "EXITED" });
+    const t = (await getHandler("runpod_pod_stop")({ pod_id: "pod123" })).content[0].text;
+    expect(unwatchMock).toHaveBeenCalled();
+    expect(setComfyuiTargetMock).toHaveBeenCalledWith("http://127.0.0.1:8188");
+    expect(resetClientMock).toHaveBeenCalled();
+    expect(t).toContain("switched back to local");
+  });
+  it("does NOT retarget when stopping a pod we weren't connected to", async () => {
+    watcherState.watched = "otherpod";
+    stopPodMock.mockResolvedValue({ id: "pod123", desiredStatus: "EXITED" });
+    await getHandler("runpod_pod_stop")({ pod_id: "pod123" });
+    expect(setComfyuiTargetMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("runpod_pod_create", () => {
+  it("deploys our template and watches the new pod", async () => {
+    createPodMock.mockResolvedValue({ id: "newpod", name: "comfyui-mcp", costPerHr: 0.44, machine: { gpuDisplayName: "RTX 4090" }, runtime: null });
+    const t = (await getHandler("runpod_pod_create")({})).content[0].text;
+    expect(createPodMock).toHaveBeenCalled();
+    expect(watchMock).toHaveBeenCalledWith("newpod");
+    expect(t).toContain("newpod");
+    expect(t).toContain("RTX 4090");
+    expect(t).toContain("$0.440/hr");
+    expect(t).toContain("runpod_pod_connect");
+  });
+  it("passes a specific gpu_type through as a single-element preference", async () => {
+    createPodMock.mockResolvedValue({ id: "p", name: "x", costPerHr: null, machine: null, runtime: null });
+    await getHandler("runpod_pod_create")({ gpu_type: "NVIDIA A40", cloud_type: "SECURE" });
+    expect(createPodMock).toHaveBeenCalledWith(expect.objectContaining({ gpuTypeIds: ["NVIDIA A40"], cloudType: "SECURE" }));
+  });
+  it("surfaces a no-capacity deploy failure", async () => {
+    createPodMock.mockRejectedValue(new Error("Could not deploy a pod on any of [RTX 4090]"));
+    const t = (await getHandler("runpod_pod_create")({})).content[0].text;
+    expect(t).toContain("Could not deploy");
+  });
+});
+
+describe("runpod_use_local", () => {
+  it("retargets to local and unwatches the pod without stopping it", async () => {
+    watcherState.watched = "pod123";
+    const t = (await getHandler("runpod_use_local")({})).content[0].text;
+    expect(unwatchMock).toHaveBeenCalled();
+    expect(setComfyuiTargetMock).toHaveBeenCalledWith("http://127.0.0.1:8188");
+    expect(resetClientMock).toHaveBeenCalled();
+    expect(t).toContain("local ComfyUI");
+    expect(t).toContain("still running"); // reminds you the pod bills until stopped
   });
 });
 
