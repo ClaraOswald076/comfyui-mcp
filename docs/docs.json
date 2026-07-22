@@ -86,6 +86,7 @@
               "tools/defaults-stats-skills",
               "tools/runpod",
               "tools/training",
+              "tools/apps",
               "tools/comfy-cli",
               "tools/skills-knowledge"
             ]
