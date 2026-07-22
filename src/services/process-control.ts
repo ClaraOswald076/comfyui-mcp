@@ -807,7 +807,10 @@ const REBOOT_ROUTES: ReadonlyArray<{ path: string; method: "POST" | "GET" }> = [
  */
 function isConnectionDrop(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
-  return /ECONNRESET|socket hang up|fetch failed|network|ECONNREFUSED|ECONNABORTED|EPIPE|terminated|premature close|other side closed|aborted/i.test(
+  // NOTE: ECONNREFUSED is deliberately absent — it means "nothing is listening"
+  // (the origin was ALREADY down before we called), not "we killed it mid-request".
+  // A process reboot we caused surfaces as ECONNRESET / socket-hang-up / terminated.
+  return /ECONNRESET|socket hang up|fetch failed|network|ECONNABORTED|EPIPE|terminated|premature close|other side closed|aborted/i.test(
     msg,
   );
 }
@@ -836,8 +839,8 @@ async function rebootViaManager(): Promise<RebootResult> {
           rebooting: false,
           reason: "manager-security",
           note:
-            "ComfyUI-Manager blocked the reboot (HTTP 403) — its security level " +
-            "forbids remote reboot; lower it or reboot on the host.",
+            "Reboot refused (HTTP 403) — ComfyUI-Manager's security level (or an " +
+            "access proxy in front) forbids it; lower the Manager security level or reboot on the host.",
         };
       }
       if (res.status === 502 || res.status === 503 || res.status === 504) {
@@ -921,11 +924,12 @@ async function restartRemoteViaManager(): Promise<RestartResult> {
   const timing = getRemoteRebootTiming();
   if (timing.settleMs > 0) await sleep(timing.settleMs);
 
-  const maxTries = Math.max(1, Math.ceil(timing.budgetMs / timing.intervalMs));
-  const readiness = await waitForApiReady({
-    intervalMs: timing.intervalMs,
-    maxTries,
-  });
+  // Clamp the interval to a sane floor: a 0 (or tiny) env value would make
+  // maxTries unbounded (ceil(budget/0) = Infinity) and hot-loop the poller,
+  // hanging the tool call if the host never returns.
+  const intervalMs = Math.max(250, timing.intervalMs);
+  const maxTries = Math.max(1, Math.ceil(timing.budgetMs / intervalMs));
+  const readiness = await waitForApiReady({ intervalMs, maxTries });
 
   if (!readiness.ready) {
     return {
