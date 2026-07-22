@@ -9,10 +9,10 @@
 // panel-agent.ts). Each agent runs on the user's Claude SUBSCRIPTION with no API
 // key. See docs/design/panel-orchestrator.md.
 
-import { existsSync, writeFileSync, unlinkSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync, unlinkSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { tmpdir, networkInterfaces } from "node:os";
-import { join } from "node:path";
+import { tmpdir, homedir, networkInterfaces } from "node:os";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import readline from "node:readline";
@@ -46,7 +46,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { registerAllTools } from "../tools/index.js";
-import { isForceRemoteFlagSet, isLoopbackHost, detectLocalComfyUIPath, setComfyuiTarget, onComfyuiTargetChanged, isTargetingLocal, getComfyUIBaseUrl } from "../config.js";
+import { isForceRemoteFlagSet, isLoopbackHost, detectLocalComfyUIPath, setComfyuiTarget, onComfyuiTargetChanged, isTargetingLocal, isTargetingLocalOrLan, isTargetingPod, getComfyUIBaseUrl, getLocalComfyuiUrl, rescopeLocalTargetFile, getComfyUIAuthHeaders } from "../config.js";
 import {
   buildComfyuiMcpEnv,
   comfyuiSecretKeys,
@@ -84,7 +84,9 @@ import { startPanelConsoleHttpServer, type PanelConsoleHttpServer } from "./pane
 import type { AgentBackend } from "./agent-backend.js";
 import { readComfyuiCrashLog, formatCrashNote } from "../services/crash-log.js";
 import { QueueMonitor, type StallReport } from "../services/queue-monitor.js";
-import { initRunpodWatcher, getRunpodWatcher } from "../services/runpod-watch.js";
+import { initRunpodWatcher, getRunpodWatcher, type RunpodStatusFrame, type RunpodAlertFrame } from "../services/runpod-watch.js";
+import { getPod } from "../services/runpod-client.js";
+import { listTargetChangeRequests, consumeTargetChange, ackTargetChange, setProgressDir, CONTROL_PREFIX } from "../services/download-progress.js";
 import { hasActiveTrainingJob, reconcileStaleTrainingJobs } from "../services/training-jobs.js";
 import {
   buildQueueStatusFrame,
@@ -818,13 +820,21 @@ export async function runPanelOrchestrator(): Promise<void> {
   const bridgeHost = (process.env.COMFYUI_MCP_BRIDGE_HOST ?? "127.0.0.1").trim() || "127.0.0.1";
   const lanBridge = !isLoopbackBindHost(bridgeHost);
   const envBridgeToken = process.env.COMFYUI_MCP_BRIDGE_TOKEN?.trim() || null;
-  const bridgeToken =
+  // Provisioned eagerly for secure/LAN boots, LAZILY on the first remote
+  // retarget (a loopback boot must not permanently rule out the secure bridge
+  // the pod's HTTPS panel needs — codex finding).
+  let bridgeToken =
     envBridgeToken ?? (wantSecureBridge || lanBridge ? randomBytes(24).toString("hex") : null);
 
   // Dedicated PANEL bridge port (default 9180). Token-gated in secure/LAN mode.
   const lockPort = Number(process.env.COMFYUI_MCP_BRIDGE_PORT) || 9180;
   const lockPath = orchLockPath(lockPort);
   const bridge = startUiBridge(lockPort, bridgeToken, bridgeHost);
+  // The LISTENER'S auth was fixed at construction: a null boot token means a
+  // tokenless listener FOREVER — lazily provisioning a token later would
+  // advertise a tunnel whose token is not enforced (codex finding). The lazy
+  // secure-bridge path must refuse in that case, not expose it publicly.
+  const bridgeListenerTokenless = bridgeToken === null;
 
   // On-demand phone pairing (the panel "Remote control" button). Off by default:
   // the FIRST pair request lazily binds a SECOND, token-gated listener on all
@@ -1049,10 +1059,31 @@ export async function runPanelOrchestrator(): Promise<void> {
     }
   }
 
-  // Cross-process download-progress channel: each tab's comfyui MCP subprocess
-  // writes per-download JSON here; the watcher below broadcasts it to the panel
-  // tray. Port-scoped so parallel orchestrators don't cross streams.
-  const progressDir = join(tmpdir(), `comfyui-mcp-progress-${bridgePort}`);
+  // Cross-process download-progress + control channel: each tab's comfyui MCP
+  // subprocess writes per-download JSON (and runpod_* target requests) here;
+  // the watcher below broadcasts downloads to the panel tray and applies
+  // control requests. Port-scoped so parallel orchestrators don't cross
+  // streams, NONCED + mode-0700 so another local user can't pre-create the
+  // predictable path and inject a hostile retarget (codex finding — the
+  // applied URL receives configured auth headers on later requests).
+  const progressNonce = randomBytes(12).toString("hex");
+  const progressDir = join(tmpdir(), `comfyui-mcp-progress-${bridgePort}-${progressNonce}`);
+  // Reap dirs from dead processes on this port (auto-restarts would otherwise
+  // accumulate them forever — codex finding). Same port ⇒ same orchestrator,
+  // so any other dir with the prefix belongs to a previous life.
+  try {
+    for (const d of readdirSync(tmpdir())) {
+      if (d.startsWith(`comfyui-mcp-progress-${bridgePort}-`) && join(tmpdir(), d) !== progressDir) {
+        rmSync(join(tmpdir(), d), { recursive: true, force: true });
+      }
+    }
+  } catch {
+    /* best-effort */
+  }
+  mkdirSync(progressDir, { recursive: true, mode: 0o700 });
+  // Late-bind the channel dir so the control channel works IN-PROCESS too
+  // (direct/mobile tool calls — codex finding: it was dead without the env var).
+  setProgressDir(progressDir);
 
   // The bundled plugin (skills) ships alongside dist/ in the package root. Load
   // it so the background agents are ComfyUI experts out of the box.
@@ -1879,7 +1910,19 @@ export async function runPanelOrchestrator(): Promise<void> {
     } catch {
       return false; // not a valid URL — ignore (keep current target)
     }
-    if (!host || next === comfyuiUrl) return false;
+    // Same-URL check is DEFAULT-PORT-INSENSITIVE but SCHEME-AWARE: strip only
+    // the scheme's actual default (:443 for https, :80 for http) — http://h:443
+    // and http://h are NOT the same endpoint (codex finding).
+    const canon = (u: string): string => {
+      try {
+        const p = new URL(u);
+        if ((p.protocol === "https:" && p.port === "443") || (p.protocol === "http:" && p.port === "80")) p.port = "";
+        return p.toString().replace(/\/+$/, "");
+      } catch {
+        return u.replace(/\/+$/, "");
+      }
+    };
+    if (!host || canon(next) === canon(comfyuiUrl)) return false;
     const prev = comfyuiUrl;
     comfyuiUrl = next;
     comfyuiPath = localPathForTarget(next);
@@ -1891,21 +1934,11 @@ export async function runPanelOrchestrator(): Promise<void> {
     // forces getClient() to rebuild against the new host on its next use.
     setComfyuiTarget(next);
     resetClient();
-    // Point every provider at the new target: Claude via its rebuilt MCP env, the
-    // manager's image-fetch URL, then respawn active agents so the live comfyui MCP
-    // subprocess is recreated with the new COMFYUI_URL (no-op if none are running —
-    // the next spawn picks it up from the now-updated closures).
-    manager.setMcpServers(buildMcpServers());
-    manager.setComfyuiUrl(comfyuiUrl);
-    manager.restartAllForMcpEnv();
-    // Re-point the render watchdog and re-probe the env (remote vs local differs).
-    try {
-      QueueMonitor.stop();
-    } catch {
-      /* best-effort */
-    }
-    QueueMonitor.start(comfyuiUrl);
-    void refreshEnvCapabilities();
+    // The heavy retarget work (QueueMonitor restart, agent MCP-env respawn,
+    // env-capability re-probe) runs in the onComfyuiTargetChanged listener
+    // fired by setComfyuiTarget above — ONE fan-out for every retarget path
+    // (hello, runpod tools, watcher auto-stop/vanish), so they can't drift
+    // split-brained again (#269).
     logger.info(
       `[panel-orchestrator] retargeted ComfyUI ${prev} → ${comfyuiUrl} (${isLoopbackUrl(next) ? "local" : "remote"} mode) from panel hello`,
     );
@@ -2299,8 +2332,11 @@ export async function runPanelOrchestrator(): Promise<void> {
       // current pod-status frame (or a cleared one when nothing is watched).
       const rpFrame = getRunpodWatcher()?.current();
       if (rpFrame) bridge.push(rpFrame, panelTab);
+      // Seed any failed auto-connect warnings too — they live SEPARATELY from
+      // the watched frame so this tab sees every still-billing failure (codex).
+      for (const f of getRunpodWatcher()?.failedFrames() ?? []) bridge.push(f, panelTab);
       // Seed the honest host indicator: tell this tab where renders run now.
-      bridge.push({ type: "comfyui_target", url: getComfyUIBaseUrl(), is_local: isTargetingLocal() }, panelTab);
+      bridge.push({ type: "comfyui_target", url: getComfyUIBaseUrl(), is_local: isTargetingLocalOrLan() }, panelTab);
       // Re-push the last usage so the context meter isn't blank after a reload.
       const lastStatus = manager.lastStatusFor(key);
       if (lastStatus) pushStatus(panelTab, lastStatus);
@@ -3287,6 +3323,78 @@ export async function runPanelOrchestrator(): Promise<void> {
   // a downloading row that stops updating for 60s is treated as a dead writer.
   const DOWNLOAD_LINGER_MS = 8000;
   const downloadRemoveAt = new Map<string, number>();
+  /** Boolean URL probe with a timeout — readiness checks for pending pod connects. */
+  const probeOk = async (url: string, timeoutMs = 8_000): Promise<boolean> => {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), timeoutMs);
+    try {
+      // Carry configured auth (COMFYUI_AUTH_TOKEN / custom header) — a
+      // protected pod's ComfyUI 401s otherwise and connect:true always times
+      // out (codex finding).
+      const res = await fetch(url, { signal: ctl.signal, headers: getComfyUIAuthHeaders() });
+      return res.ok;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(t);
+    }
+  };
+  // Genuinely-in-flight download rows (set by pollDownloads) — read by the pod
+  // idle-stop veto, SCOPED per pod via each row's stamped target (#269).
+  let downloadingRows: Array<Record<string, unknown>> = [];
+  // create-with-connect pending boot: per-pod pending connects (a second
+  // create(connect:true) must not silently displace the first's promise —
+  // codex finding: the displaced pod kept billing with no deadline, no
+  // notification, and no auto-stop). Any deliberate target event clears ALL
+  // of them (the user chose something else) — EXCEPT a readiness-driven
+  // completion, which would otherwise wipe its siblings' promises (codex):
+  // machineRetargetInFlight distinguishes machine- from user-driven retargets.
+  // PERSISTED (user-private config dir): an orchestrator self-restart mid-boot
+  // must not strand a promised auto-connect (codex finding — the replacement
+  // process gets a fresh progress dir, so in-memory state alone is lost).
+  const pendingPodConnects = new Map<string, { url: string; deadline: number; lastProbe: number }>();
+  let machineRetargetInFlight = false;
+  const pendingConnectsFile = join(homedir(), ".comfyui-mcp", `runpod-pending-connects-${bridgePort}.json`);
+  // Port-scope the saved-target file too, and re-restore for a pod boot (the
+  // module-init read ran unscoped at import — codex finding).
+  rescopeLocalTargetFile(join(homedir(), ".comfyui-mcp", `local-target-${bridgePort}.json`));
+  const persistPendingConnects = () => {
+    try {
+      if (pendingPodConnects.size === 0) {
+        unlinkSync(pendingConnectsFile);
+        return;
+      }
+      mkdirSync(dirname(pendingConnectsFile), { recursive: true });
+      writeFileSync(pendingConnectsFile, JSON.stringify(Object.fromEntries([...pendingPodConnects].map(([k, v]) => [k, { url: v.url, deadline: v.deadline }]))));
+    } catch {
+      /* best-effort */
+    }
+  };
+  // Restore promises made before a restart; an already-past deadline fires the
+  // honest timeout on the first poll tick. RESTORE on a pod boot OR any
+  // self-restart generation (the common create(connect:true) case restarts
+  // with the target still LOCAL mid-wait — codex finding: requiring a pod
+  // target deleted the promise on the normal self-restart). A deliberate
+  // fresh non-pod boot (gen 0) invalidates old pendings instead.
+  try {
+    const restartGen = Number(process.env.COMFYUI_MCP_RESTART_GEN ?? "0");
+    if (!isTargetingPod() && !(restartGen > 0)) {
+      if (existsSync(pendingConnectsFile)) {
+        logger.info("[panel-orchestrator] discarding saved pending pod auto-connect(s) — this boot selected a non-pod target explicitly");
+        unlinkSync(pendingConnectsFile);
+      }
+    } else {
+      const saved = JSON.parse(readFileSync(pendingConnectsFile, "utf-8")) as Record<string, { url: string; deadline: number }>;
+      for (const [podId, v] of Object.entries(saved)) {
+        if (typeof v?.url === "string" && typeof v?.deadline === "number") {
+          pendingPodConnects.set(podId, { url: v.url, deadline: v.deadline, lastProbe: 0 });
+        }
+      }
+      if (pendingPodConnects.size > 0) logger.info(`[panel-orchestrator] restored ${pendingPodConnects.size} pending pod auto-connect(s) from before the restart`);
+    }
+  } catch {
+    // no saved state
+  }
   let lastDownloadSnapshot = "[]";
   const pollDownloads = () => {
     let files: string[] = [];
@@ -3298,6 +3406,7 @@ export async function runPanelOrchestrator(): Promise<void> {
     const now = Date.now();
     const downloads: Array<Record<string, unknown>> = [];
     for (const f of files) {
+      if (f.startsWith(CONTROL_PREFIX)) continue; // control channel, not a download row
       const full = join(progressDir, f);
       let row: Record<string, unknown>;
       try {
@@ -3326,11 +3435,204 @@ export async function runPanelOrchestrator(): Promise<void> {
       }
       downloads.push(row);
     }
+    // Live-download rows for the idle-stop veto (#269): rows surviving the loop
+    // above are fresh (dead writers >60s are already unlinked), so a
+    // "downloading" row here is genuinely in flight — and a pod mid-download
+    // must not count as idle. Self-healing: a crashed writer's row ages out.
+    downloadingRows = downloads.filter((d) => d.status === "downloading");
     downloads.sort((a, b) => String(a.name ?? "").localeCompare(String(b.name ?? "")));
     const snapshot = JSON.stringify(downloads);
     if (snapshot !== lastDownloadSnapshot) {
       lastDownloadSnapshot = snapshot;
       bridge.push({ type: "download_progress", downloads }); // broadcast to all tabs
+    }
+    // MCP-child control channel (#269): runpod_* tools that ran in spawned
+    // agent children ask the orchestrator to retarget / watch / unwatch /
+    // auto-connect here — through the SAME applyComfyuiUrl fan-out as a panel
+    // hello. Each request is its own file: consumption deletes exactly the
+    // file read, so concurrent children can't clobber each other (codex).
+    try {
+      for (const { req, file } of listTargetChangeRequests(progressDir)) {
+        // Apply EVERY request — per-request files make the old timestamp
+        // watermark both unnecessary and wrong (two same-millisecond requests
+        // — e.g. create's watch + auto-connect — would drop the second, codex
+        // finding). A crash between apply and delete replays an idempotent op
+        // once on restart; a dropped auto-connect bills an unwatched pod.
+        // A `local` request resolves the fallback HERE — the orchestrator owns
+        // the learned-LAN memory; the requesting child (spawned post-connect)
+        // may know nothing but loopback (codex finding). `onlyIfTarget` guards
+        // it: a stale child's stop-fallback applies only when the CURRENT
+        // target really is that pod (codex finding — it dragged the target
+        // off a newer pod). The ack below reports the resulting URL either
+        // way, so the stale child ALIGNS to it.
+        const localGuardOk = !req.onlyIfTarget || getComfyUIBaseUrl().includes(req.onlyIfTarget);
+        // Generation guard for URL retargets: drop the retarget when a NEWER
+        // direct choice moved the target after the child wrote this (codex
+        // finding: a queued pod-A request applied after the user picked pod B).
+        const urlGenOk = !req.expectedCurrentUrl || getComfyUIBaseUrl() === req.expectedCurrentUrl;
+        // Only an APPLIED target/unwatch choice supersedes pending auto-connects
+        // (watch-ONLY isn't a choice; a guarded-OUT or generation-STALE request
+        // applied nothing and must not drop a booting pod's promise — codex
+        // findings on both axes).
+        const appliedChoice = urlGenOk && (!!req.url || ((!!req.local || !!req.unwatch) && localGuardOk));
+        if (!req.connectWhenReady && appliedChoice) { pendingPodConnects.clear(); persistPendingConnects(); }
+        if (req.local && localGuardOk && urlGenOk) applyComfyuiUrl(getLocalComfyuiUrl());
+        else if (req.url && urlGenOk) applyComfyuiUrl(req.url); // dropped when a newer choice superseded it
+        if (req.unwatch && localGuardOk && urlGenOk) {
+          // Scoped for stop-fallbacks: only the stopped pod's own watch dies
+          // (codex finding: stopping A killed unrelated watched B).
+          if (req.unwatchPodId) {
+            const w = getRunpodWatcher();
+            if (w?.watchedPodId() === req.unwatchPodId) w.unwatch();
+          } else {
+            getRunpodWatcher()?.unwatch();
+          }
+        }
+        // A confirmed stop clears the pod's recorded auto-connect failure —
+        // including the spawned-child case, where the caller had no watcher
+        // of its own (codex finding: stopped pods kept "billing" forever).
+        // And it CANCELS any pending auto-connect for it — otherwise the
+        // readiness loop could still retarget to a just-stopped pod, or warn
+        // about a timeout for a pod the user deliberately stopped (codex).
+        if (req.stoppedPodId) {
+          getRunpodWatcher()?.clearConnectFailed(req.stoppedPodId);
+          if (pendingPodConnects.delete(req.stoppedPodId)) persistPendingConnects();
+        }
+        if (req.watchPodId) {
+          // Boot-status arm for a create: never displace the ACTIVE render
+          // target's watch — its idle auto-stop / dead-target cleanup is the
+          // billing guard (codex finding: creating pod B while rendering on
+          // pod A left A unguarded and billing indefinitely). The new pod gets
+          // watched when its pending connect completes (it becomes the target).
+          const w = getRunpodWatcher();
+          const cur = w?.watchedPodId();
+          const curIsActiveTarget = !!cur && !isTargetingLocal() && getComfyUIBaseUrl().includes(cur);
+          if (!(curIsActiveTarget && cur !== req.watchPodId)) w?.watch(req.watchPodId);
+        }
+        // Whether the watch request actually LANDED (the guard above may have
+        // refused it) — computed AFTER the attempt; the ack carries it so the
+        // child's create result can't claim a watch we rejected (codex finding).
+        const watchApplied = !!req.watchPodId && getRunpodWatcher()?.watchedPodId() === req.watchPodId;
+        // Whether a URL retarget landed (generation-guarded): the ack must
+        // confirm the AUTHORITATIVE retarget before the child reports success
+        // (codex finding: rejected writes still read "connected").
+        const connectApplied = !!req.url && urlGenOk && getComfyUIBaseUrl() === req.url;
+        if (req.connectWhenReady && urlGenOk) {
+          // The ORCHESTRATOR waits for boot (the tool call returned inside the
+          // MCP 60s lifetime): probe every ~10s, retarget+watch on ready, and
+          // report honestly on deadline — never block the MCP child (codex).
+          // Per-pod slot: concurrent creates each keep their own deadline.
+          // Generation-guarded: a stale registration must not re-arm after the
+          // user already chose a newer target (codex finding).
+          pendingPodConnects.set(req.connectWhenReady.podId, {
+            url: req.connectWhenReady.url,
+            deadline: Date.now() + 8 * 60_000,
+            lastProbe: 0,
+          });
+          persistPendingConnects();
+        }
+        consumeTargetChange(file);
+        // Ack with the RESULTING target ONLY when the requester is waiting —
+        // fire-and-forget requests would leak ack files (codex finding). The
+        // `applied` flag distinguishes an applied local switch from a guarded
+        // skip (onlyIfTarget didn't match — codex finding).
+        if (req.wantAck) ackTargetChange(file, getComfyUIBaseUrl(), req.onlyIfTarget ? localGuardOk && urlGenOk : req.url ? connectApplied : req.connectWhenReady ? urlGenOk : req.watchPodId ? watchApplied : true);
+      }
+    } catch {
+      /* best-effort — the next tick retries a partially-written file */
+    }
+
+    // Pending create-and-connects: probe each until its pod's ComfyUI answers
+    // BOTH readiness endpoints, then retarget through the shared fan-out.
+    const reportConnectFailed = async (podId: string, supersededBy?: string) => {
+      // HONEST failure frame (codex finding: fabricated watching:true/RUNNING
+      // read as a healthy pod while it bills unguarded). Fetch the real state;
+      // `watching` reflects whether the single watcher actually follows it.
+      let status = "UNKNOWN"; // unconfirmed — never present a terminal state we didn't verify (codex)
+      let name: string | null = null;
+      let gpu: string | null = null;
+      let costPerHr: number | null = null;
+      let uptime: number | null = null;
+      try {
+        const pod = await getPod(podId);
+        status = pod?.desiredStatus ?? "TERMINATED";
+        name = pod?.name ?? null;
+        gpu = pod?.machine?.gpuDisplayName ?? null;
+        costPerHr = pod?.costPerHr ?? null;
+        uptime = pod?.runtime?.uptimeInSeconds ?? null;
+      } catch { /* keep fallbacks */ }
+      // RECHECK before installing: a manual connect/stop during the getPod
+      // await already resolved this — installing now would resurrect a stale
+      // alert on a healthy target (codex finding).
+      if (!isTargetingLocal() && getComfyUIBaseUrl().includes(podId)) return;
+      // Suppress the alert ONLY for proven terminal/gone states — a booting
+      // (CREATED/RESTARTING) or unverifiable (UNKNOWN) pod may still be billing
+      // and keeps its warning (codex finding).
+      if (status === "EXITED" || status === "TERMINATED" || status === "DEAD" || status === "PAUSED") return;
+      const frame = {
+        type: "runpod_alert",
+        pod_id: podId,
+        reason: supersededBy ? "superseded" : "timeout",
+        status,
+        name,
+        gpu,
+        cost_per_hr: costPerHr,
+        uptime_seconds: uptime,
+        ...(supersededBy ? { superseded_by: supersededBy } : {}),
+      } satisfies RunpodAlertFrame;
+      // Route through the watcher so the failure STICKS (seeds to new tabs and
+      // rides later frames until the pod exits — codex finding: a one-shot
+      // push lets the only warning evaporate on the next routine poll). The
+      // alert channel can't clobber the watched pod's status slot (codex).
+      const w = getRunpodWatcher();
+      if (w) w.markConnectFailed(podId, frame);
+      else void bridge.push(frame);
+    };
+    for (const [podId, p] of pendingPodConnects) {
+      if (Date.now() > p.deadline) {
+        pendingPodConnects.delete(podId);
+        persistPendingConnects();
+        logger.warn(`[panel-orchestrator] pod ${podId} was not ready within 8 minutes — NOT auto-connecting (connect manually with runpod_pod_connect)`);
+        // The tool call is long gone and idle auto-stop can't fire on a pod we
+        // never connected to (renderingOnPod is false) — the failed pod keeps
+        // billing with no visible failure unless we say so (codex finding).
+        void reportConnectFailed(podId);
+        continue;
+      }
+      if (Date.now() - p.lastProbe >= 10_000) {
+        p.lastProbe = Date.now();
+        void (async () => {
+          const stats = await probeOk(`${p.url}/system_stats`);
+          const queue = stats ? await probeOk(`${p.url}/queue`) : false;
+          if (!pendingPodConnects.has(podId) || pendingPodConnects.get(podId) !== p) return; // superseded/cleared
+          if (stats && queue) {
+            pendingPodConnects.delete(podId);
+            persistPendingConnects();
+            // A readiness-driven retarget — NOT a user override: siblings'
+            // pending connects stay alive through the listener (codex).
+            machineRetargetInFlight = true;
+            try {
+              applyComfyuiUrl(p.url);
+            } finally {
+              machineRetargetInFlight = false;
+            }
+            // ONE winner: a second readiness would displace this pod's watch
+            // (its idle-stop guard), so competing pending connects are resolved
+            // as SUPERSEDED — with an HONEST frame: the loser is UNWATCHED
+            // (nothing guards its cost) and connect_failed says why (codex).
+            for (const [otherId, other] of pendingPodConnects) {
+              pendingPodConnects.delete(otherId);
+              persistPendingConnects();
+              logger.warn(`[panel-orchestrator] pod ${otherId} auto-connect superseded by pod ${podId} (one active target) — it is UNWATCHED and still billing; stop it to end billing if unused`);
+              void reportConnectFailed(otherId, podId);
+              void other;
+            }
+            getRunpodWatcher()?.watch(podId);
+            logger.info(`[panel-orchestrator] pod ${podId} ready — auto-connected (${p.url})`);
+            void bridge.push({ type: "runpod_connected", pod_id: podId, url: p.url });
+          }
+        })();
+      }
     }
   };
   const downloadTimer = setInterval(pollDownloads, 700);
@@ -3370,6 +3672,9 @@ export async function runPanelOrchestrator(): Promise<void> {
   })();
   initRunpodWatcher({
     push: (frame) => void bridge.push(frame),
+    // Persist unresolved connect-failure alerts per port (restart-proof — a
+    // self-restart must not lose a still-billing warning, codex finding).
+    persistPath: join(homedir(), ".comfyui-mcp", `runpod-connect-failures-${bridgePort}.json`),
     comfyuiIdle: (podId) => {
       const s = QueueMonitor.snapshot();
       // NOT idle while a training job is alive on THIS pod: training isn't a
@@ -3377,14 +3682,39 @@ export async function runPanelOrchestrator(): Promise<void> {
       // run "idle" and auto-stop the pod mid-flight (P4 guard; review finding
       // on the connector). hasActiveTrainingJob is a probe-free file scan,
       // scoped to the watched pod so a run on another pod doesn't suppress
-      // this pod's idle-stop (codex #274).
-      return s.connected && !s.running && s.queueDepth === 0 && !hasActiveTrainingJob("pod", podId);
+      // this pod's idle-stop (codex #274). Also NOT idle while THIS POD is
+      // downloading — rows are target-stamped by their writer (#269; an
+      // unstamped pre-fix row errs toward "busy", the cost-safe direction).
+      const podDownloading = downloadingRows.some((d) => {
+        const t = typeof d.target === "string" ? d.target : "";
+        return t === "" || t.includes(podId);
+      });
+      return s.connected && !s.running && s.queueDepth === 0 && !podDownloading && !hasActiveTrainingJob("pod", podId);
     },
     // Idle auto-stop only applies to a pod we're actually rendering on: the active
     // ComfyUI target is that pod's proxy (its id appears in the URL). A pod we
     // merely watch while it boots stays local-targeted, so this is false and it is
     // never auto-stopped on the local rig's idleness.
     renderingOnPod: (podId) => !isTargetingLocal() && getComfyUIBaseUrl().includes(podId),
+    // The watched pod vanished or was auto-stopped (#269 dead-target cleanup):
+    // when renders were pointing AT it, fall back to the local target — via
+    // setComfyuiTarget, so the shared retarget fan-out (QueueMonitor, agents,
+    // frame) runs too. Not every watched pod is the render target, so guard.
+    onPodUnavailable: (goneId) => {
+      if (isTargetingLocal() || !getComfyUIBaseUrl().includes(goneId)) return;
+      const local = getLocalComfyuiUrl();
+      logger.warn(`[panel-orchestrator] pod ${goneId} unavailable while targeted — retargeting local ComfyUI (${local})`);
+      // A MACHINE-driven fallback (auto-stop/vanish), not a user override:
+      // pending create-and-connects on OTHER pods must survive it — otherwise
+      // a booting pod silently loses its promised auto-connect (codex finding).
+      machineRetargetInFlight = true;
+      try {
+        setComfyuiTarget(local);
+      } finally {
+        machineRetargetInFlight = false;
+      }
+      resetClient();
+    },
     idleStopMinutes: runpodIdleStopMinutes,
   });
 
@@ -3406,12 +3736,48 @@ export async function runPanelOrchestrator(): Promise<void> {
   }, 5 * 60_000);
   trainingReconcileTimer.unref?.();
 
-  // Honest host indicator: whenever the ComfyUI target moves (RunPod connect,
-  // pod stop → local fallback, "Local" switch), broadcast a `comfyui_target`
-  // frame so every control panel truthfully shows where renders run. Seeded per
-  // tab on connect (below) so a fresh tab knows the host without waiting for a
-  // switch.
+  // Honest host indicator + RETARGET FAN-OUT: whenever the ComfyUI target moves
+  // (RunPod connect, pod stop → local fallback, "Local" switch, panel hello),
+  // setComfyuiTarget fires this ONE listener — it repoints everything that was
+  // previously left split-brained (#269): QueueMonitor (its WS/polls keep
+  // talking to the OLD host), the agent subprocesses' MCP env (respawned via
+  // restartAllForMcpEnv), and the env-capability probe, then broadcasts the
+  // `comfyui_target` frame so every panel truthfully shows where renders run.
+  // Same-URL retargets (a repeated connect to the current target) skip the
+  // restart storm and only re-broadcast. Seeded per tab on connect (below) so
+  // a fresh tab knows the host without waiting for a switch.
+  let lastRetargetUrl: string | null = comfyuiUrl; // seeded: a first same-URL event must not restart everything
   onComfyuiTargetChanged((url, isLocal) => {
+    // ANY target event — a change OR a reaffirmation of the current target —
+    // supersedes ALL pending auto-connects (codex findings: direct
+    // setComfyuiTarget callers bypass applyComfyuiUrl, and an explicit
+    // Local/Stop at the SAME target must not let a booting pod steal it back
+    // later) — EXCEPT a readiness-driven completion, which must leave its
+    // siblings' pending promises intact (codex finding).
+    if (!machineRetargetInFlight) { pendingPodConnects.clear(); persistPendingConnects(); }
+    if (url !== lastRetargetUrl) {
+      lastRetargetUrl = url;
+      // Sync the shared target closures FIRST: retargets that did NOT come
+      // through applyComfyuiUrl (runpod tools, watcher callbacks) leave them
+      // holding the OLD host — and buildMcpServers()/refreshEnvCapabilities()
+      // below would rebuild/respawn agents against it (codex finding).
+      comfyuiUrl = url;
+      comfyuiPath = localPathForTarget(url);
+      try {
+        QueueMonitor.stop();
+      } catch {
+        /* best-effort */
+      }
+      QueueMonitor.start(url);
+      manager.setMcpServers(buildMcpServers());
+      manager.setComfyuiUrl(url);
+      manager.restartAllForMcpEnv();
+      void refreshEnvCapabilities();
+    }
+    // The readvertise timer follows the target too (created only at startup
+    // before — a local→pod retarget left the pod unable to learn the bridge
+    // URL, codex finding). Cheap no-op for same-url events.
+    syncReadvertise(url);
     void bridge.push({ type: "comfyui_target", url, is_local: isLocal });
   });
 
@@ -3427,14 +3793,98 @@ export async function runPanelOrchestrator(): Promise<void> {
   // the advertise on a cheap idempotent timer repopulates the pod's store within
   // one interval of any reboot (from any cause: the agent's restart, a Manager
   // UI restart, a crash), so the browser's reclaim poll reconnects promptly.
-  // Only meaningful for a remote https target with a secure bridge.
+  // Only meaningful for a remote https target with a secure bridge. Driven by
+  // syncReadvertise at STARTUP and on every retarget (codex finding: a
+  // local→pod retarget later left the timer nonexistent, so the pod could
+  // never learn the WSS URL/token — the very deadlock it prevents). The
+  // bridge itself is created LAZILY on the first remote target too (a local
+  // boot has wantSecureBridge=false — codex finding).
   let readvertiseTimer: ReturnType<typeof setInterval> | null = null;
-  if (secureBridge && isRemoteHttpsUrl(comfyuiUrl)) {
-    readvertiseTimer = setInterval(() => {
-      if (secureBridge && isRemoteHttpsUrl(comfyuiUrl)) void secureBridge.advertise(comfyuiUrl);
-    }, 5000);
-    readvertiseTimer.unref?.();
-  }
+  // One in-flight setup MAX — concurrent ticks must not each start a tunnel
+  // (codex finding: a slow first attempt spawned multiple cloudflared clients).
+  let secureBridgeSetup: Promise<void> | null = null;
+  // A tokenless primary listener does NOT rule out pod panels: the tunnel gets
+  // its OWN token-gated listener (same addListener mechanism the phone-pair
+  // flow uses) on a dedicated port — never retrofit auth onto the public path
+  // and never open a tunnel in front of an unauthenticated one (codex P1).
+  // Port map: +0 bridge, +1 panel_* HTTP-MCP, +2 phone-pair, +3 console (line
+  // ~1427), +4 tunnel listener (codex finding: +3 was already taken).
+  const tunnelPort = lockPort + 4;
+  let tunnelToken: string | null = null;
+  let tunnelListenerStarted = false;
+  const ensureSecureBridge = async (url: string): Promise<void> => {
+    if (secureBridge) return;
+    if (!secureBridgeSetup) {
+      secureBridgeSetup = (async () => {
+        try {
+          let port = lockPort;
+          let token: string;
+          if (bridgeListenerTokenless) {
+            // Primary listener stays tokenless for local use; the tunnel binds
+            // its own token-gated listener (pair-flow precedent) and advertises
+            // THAT token — enforced, because this listener was built with it.
+            // Bound ONCE: a retried setup must reuse it, not EADDRINUSE (codex).
+            tunnelToken ??= randomBytes(24).toString("hex");
+            if (!tunnelListenerStarted) {
+              await bridge.addListener("0.0.0.0", tunnelPort, tunnelToken);
+              tunnelListenerStarted = true;
+            }
+            port = tunnelPort;
+            token = tunnelToken;
+          } else if (bridgeToken) {
+            token = bridgeToken;
+          } else {
+            return; // unreachable — the tokenless branch above covers this
+          }
+          secureBridge = await setupSecureBridge({
+            bridgePort: port,
+            comfyuiUrl: url,
+            token,
+            bridge,
+            // The setup itself advertises on completion — guard it too: a slow
+            // tunnel must not hand the bridge URL to a pod the user already
+            // left (codex finding: the post-await guard alone couldn't stop it).
+            shouldAdvertise: (t) => comfyuiUrl === t && isRemoteHttpsUrl(t),
+          });
+        } catch (err) {
+          logger.error(
+            `[panel-orchestrator] secure bridge (cloudflared) failed: ${err instanceof Error ? err.message : String(err)}. ` +
+              `Install cloudflared (npm i -g cloudflared), or re-run with --insecure-bridge and open the pod through an ` +
+              `SSH tunnel (ssh -L 3000:localhost:3000 …) at http://localhost:3000.`,
+          );
+        } finally {
+          secureBridgeSetup = null;
+        }
+      })();
+    }
+    return secureBridgeSetup;
+  };
+  const syncReadvertise = (url: string) => {
+    const wanted = !insecureBridge && isRemoteHttpsUrl(url);
+    if (wanted && !readvertiseTimer) {
+      // Immediate first advertise (creating the tunnel on a local→pod
+      // transition), then the interval.
+      void (async () => {
+        await ensureSecureBridge(url);
+        // The user may have moved on while the tunnel came up — advertising an
+        // OLD pod now would let its panel hello steal the newer target (codex).
+        if (secureBridge && comfyuiUrl === url && isRemoteHttpsUrl(url)) void secureBridge.advertise(url);
+      })();
+      readvertiseTimer = setInterval(() => {
+        void (async () => {
+          if (isRemoteHttpsUrl(comfyuiUrl)) {
+            await ensureSecureBridge(comfyuiUrl);
+            if (secureBridge) void secureBridge.advertise(comfyuiUrl);
+          }
+        })();
+      }, 5000);
+      readvertiseTimer.unref?.();
+    } else if (!wanted && readvertiseTimer) {
+      clearInterval(readvertiseTimer);
+      readvertiseTimer = null;
+    }
+  };
+  syncReadvertise(comfyuiUrl);
 
   // The no-path suffix must not read as an error when it is BY DESIGN: for a
   // remote target a local path is the wrong filesystem and is deliberately
@@ -3465,6 +3915,13 @@ export async function runPanelOrchestrator(): Promise<void> {
     clearInterval(queueStatusTimer);
     if (readvertiseTimer) clearInterval(readvertiseTimer);
     QueueMonitor.stop();
+    // Remove OUR nonced progress dir (startup reaps previous lives') so the
+    // auto-restart cycle doesn't accumulate temp dirs (codex finding).
+    try {
+      rmSync(progressDir, { recursive: true, force: true });
+    } catch {
+      /* best-effort */
+    }
     unsubscribeSecrets();
     unsubscribeAgentSecrets();
     await manager.stopAll();

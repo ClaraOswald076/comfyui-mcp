@@ -277,3 +277,91 @@ describe("COMFYUI_PATH nested/wrapper self-heal (doubled-path bug)", () => {
     expect(mod.descendToNestedRoot(nested)).toBe(nested);
   });
 });
+
+describe("getLocalComfyuiUrl (#269 LAN fallback)", () => {
+  let fakeHome: string;
+  beforeEach(() => {
+    vi.resetModules();
+    process.env = { ...OLD_ENV };
+    process.argv = [...OLD_ARGV];
+    // setComfyuiTarget persists local-target.json under homedir — sandbox it.
+    fakeHome = mkdtempSync(join(tmpdir(), "config-home-"));
+    // vitest workers ignore HOME/USERPROFILE overrides — the persistence path
+    // is env-overridable instead.
+    process.env.COMFYUI_MCP_LOCAL_TARGET_FILE = join(fakeHome, "local-target.json");
+    process.env.COMFYUI_API_KEY = "";
+    process.env.COMFYUI_PATH = "";
+    process.env.COMFYUI_HOST = "";
+    process.env.COMFYUI_PORT = "8188";
+    process.env.COMFYUI_MCP_FORCE_REMOTE = "";
+  });
+  afterEach(() => {
+    process.env = OLD_ENV;
+    process.argv = OLD_ARGV;
+  });
+
+  it("returns the LAN boot URL when local ComfyUI lives on another LAN host", async () => {
+    process.env.COMFYUI_URL = "http://192.168.1.50:8188";
+    const mod = await import("../config.js");
+    expect(mod.getLocalComfyuiUrl()).toBe("http://192.168.1.50:8188");
+  });
+
+  it("returns loopback when booted against a RunPod pod proxy", async () => {
+    process.env.COMFYUI_URL = "https://abc123-3000.proxy.runpod.net";
+    const mod = await import("../config.js");
+    expect(mod.getLocalComfyuiUrl()).toBe("http://127.0.0.1:8188");
+  });
+
+  it("returns the loopback boot URL for a loopback boot", async () => {
+    process.env.COMFYUI_URL = "http://127.0.0.1:8188";
+    const mod = await import("../config.js");
+    expect(mod.getLocalComfyuiUrl()).toBe("http://127.0.0.1:8188");
+  });
+
+  it("tracks a LAN target learned AFTER boot (hello retarget) as the local fallback", async () => {
+    process.env.COMFYUI_URL = "http://127.0.0.1:8188";
+    const mod = await import("../config.js");
+    expect(mod.setComfyuiTarget("http://192.168.1.50:8188")).toBe(true);
+    expect(mod.getLocalComfyuiUrl()).toBe("http://192.168.1.50:8188");
+  });
+
+  it("a pod retarget does NOT overwrite the learned local fallback", async () => {
+    process.env.COMFYUI_URL = "http://192.168.1.50:8188";
+    const mod = await import("../config.js");
+    expect(mod.setComfyuiTarget("https://abc123-3000.proxy.runpod.net")).toBe(true);
+    expect(mod.getLocalComfyuiUrl()).toBe("http://192.168.1.50:8188");
+  });
+
+  it("a VPS boot target is NOT a local fallback (falls back to loopback)", async () => {
+    process.env.COMFYUI_URL = "https://comfy.example-vps.com:8188";
+    const mod = await import("../config.js");
+    expect(mod.getLocalComfyuiUrl()).toBe("http://127.0.0.1:8188");
+  });
+
+  it("a VPS target learned later does NOT become the local fallback", async () => {
+    process.env.COMFYUI_URL = "http://192.168.1.50:8188";
+    const mod = await import("../config.js");
+    expect(mod.setComfyuiTarget("https://comfy.example-vps.com:8188")).toBe(true);
+    expect(mod.getLocalComfyuiUrl()).toBe("http://192.168.1.50:8188");
+  });
+
+  it("a pod-boot (self-restart) restores the persisted LAN target", async () => {
+    process.env.COMFYUI_URL = "http://192.168.1.50:8188";
+    const first = await import("../config.js");
+    expect(first.setComfyuiTarget("http://192.168.1.50:8188")).toBe(true); // writes local-target.json
+    vi.resetModules();
+    process.env.COMFYUI_URL = "https://abc123-3000.proxy.runpod.net"; // restart boots ON the pod
+    const second = await import("../config.js");
+    expect(second.getLocalComfyuiUrl()).toBe("http://192.168.1.50:8188");
+  });
+
+  it("a VPS boot does NOT restore a persisted LAN target", async () => {
+    process.env.COMFYUI_URL = "http://192.168.1.50:8188";
+    const first = await import("../config.js");
+    expect(first.setComfyuiTarget("http://192.168.1.50:8188")).toBe(true);
+    vi.resetModules();
+    process.env.COMFYUI_URL = "https://comfy.example-vps.com:8188";
+    const second = await import("../config.js");
+    expect(second.getLocalComfyuiUrl()).toBe("http://127.0.0.1:8188");
+  });
+});
