@@ -226,6 +226,7 @@ describe("download_civitai_model", () => {
       "https://civitai.com/api/download/models/201",
       "checkpoints",
       "cool.safetensors",
+      undefined,
     );
     expect(res.isError).toBeFalsy();
     expect(res.content[0].text).toContain("Cool Model");
@@ -248,6 +249,7 @@ describe("download_civitai_model", () => {
       "https://civitai.com/api/download/models/55",
       "loras",
       "v.safetensors",
+      undefined,
     );
     expect(res.isError).toBeFalsy();
   });
@@ -284,6 +286,7 @@ describe("download_civitai_model", () => {
       "https://civitai.com/api/download/models/55",
       "loras",
       "custom.safetensors",
+      undefined,
     );
   });
 

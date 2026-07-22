@@ -4,10 +4,18 @@ import { unlink, writeFile } from "node:fs/promises";
 import { isLocalMode, config } from "../config.js";
 import { logger } from "../utils/logger.js";
 import {
-  downloadModel,
   resolveExistingModelFile,
   MODEL_SUBDIRS,
 } from "../services/model-resolver.js";
+import { startDownloadJob } from "../services/download-jobs.js";
+
+/** Mirrors download_model's grace window — see download-jobs.ts. CivitAI
+ *  checkpoints are routinely multi-GB, so this is the path that actually
+ *  triggered the reported hang. */
+function civitaiGraceMs(): number {
+  const raw = Number(process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 20_000;
+}
 import {
   resolveCivitaiModel,
   resolveCivitaiModelVersion,
@@ -399,68 +407,93 @@ export function registerModelExtrasTools(server: McpServer): void {
             : await resolveCivitaiModelVersion(args.model_version_id!);
 
         const filename = args.filename ?? resolved.filename;
-        const savedPath = await downloadModel(
+
+        // Everything that used to run inline AFTER the await now runs as the
+        // job's completion hook, so it still happens when a big CivitAI
+        // checkpoint outlives the tool call. Its output lands on job.notes.
+        const postDownload = async (savedPath: string): Promise<string[]> => {
+          const lines: string[] = [];
+          // NOT-A-MODEL guard (live panel finding: the agent downloaded a
+          // 'Workflows'-type zip into loras/ and told the user their LoRA was
+          // installed). Loud warning when the entry type / file extension can't
+          // load as a model so the agent corrects course instead of celebrating.
+          const civitaiType = resolved.metadata?.modelType;
+          const NON_MODEL_TYPES = new Set(["Workflows", "Poses", "Wildcards", "Other"]);
+          const fileExt = (filename ?? savedPath).toLowerCase().match(/\.([a-z0-9]+)$/)?.[1];
+          const NON_MODEL_EXTS = new Set(["zip", "rar", "7z", "json", "txt", "png", "jpg"]);
+          if ((civitaiType && NON_MODEL_TYPES.has(civitaiType)) || (fileExt && NON_MODEL_EXTS.has(fileExt))) {
+            lines.push(
+              `  WARNING: this CivitAI entry is type "${civitaiType ?? "unknown"}" (file: .${fileExt ?? "?"}) — it is NOT a loadable model file and will not appear in a ${args.target_subfolder} loader. ` +
+                `If the user wanted a LoRA/checkpoint, re-run search_civitai_models with types:["LORA"] (or ["Checkpoint"]) and download a hit whose type matches. Do not tell the user a model was installed.`,
+            );
+          }
+
+          // Write usage-docs sidecars beside the file so the panel agent has the
+          // description, trigger words, and example generation params on hand.
+          // Local-only: remote mode has no local FS (savedPath is a status string).
+          if (isLocalMode() && resolved.metadata) {
+            const sidecar = await writeCivitaiSidecar(savedPath, resolved.metadata);
+            if (sidecar) {
+              const tw = resolved.metadata.trainedWords;
+              if (tw.length) lines.push(`  Trigger words: ${tw.join(", ")}`);
+              const recipes = resolved.metadata.examples.filter(
+                (e) => e.meta && Object.keys(e.meta).length > 0,
+              ).length;
+              lines.push(
+                `  Metadata: ${sidecar.md}` +
+                  (recipes ? ` (${recipes} example recipe${recipes === 1 ? "" : "s"})` : ""),
+              );
+            }
+          }
+          return lines;
+        };
+
+        const { job, settled } = startDownloadJob(
           resolved.downloadUrl,
           args.target_subfolder,
           filename,
+          undefined,
+          postDownload,
         );
 
+        let timer: NodeJS.Timeout | undefined;
+        await Promise.race([
+          settled,
+          new Promise<void>((r) => {
+            timer = setTimeout(r, civitaiGraceMs());
+          }),
+        ]);
+        if (timer) clearTimeout(timer);
+
+        if (job.status === "error") {
+          return errorToToolResult(new Error(job.error ?? "CivitAI download failed"));
+        }
+        if (job.status === "downloading") {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text:
+                  `CivitAI download STARTED and is still running — id \`${job.id}\`.\n` +
+                  (resolved.modelName ? `  Model: ${resolved.modelName}\n` : "") +
+                  `  Version id: ${resolved.versionId}\n\n` +
+                  `This is NOT a failure. The file is streaming to disk and will land on its own; ` +
+                  `trigger words and metadata are written when it completes. Tell the user it is ` +
+                  `downloading, then read \`download_status\` with this id — do not re-issue the ` +
+                  `download and do not report it as incomplete.`,
+              },
+            ],
+          };
+        }
+
+        const savedPath = job.path!;
         const lines = [
           "CivitAI model downloaded successfully:",
           `  ${savedPath}`,
         ];
         if (resolved.modelName) lines.push(`  Model: ${resolved.modelName}`);
         lines.push(`  Version id: ${resolved.versionId}`);
-        // NOT-A-MODEL guard (live panel finding: the agent downloaded a
-        // 'Workflows'-type zip into loras/ and told the user their LoRA was
-        // installed). Loud warning when the entry type / file extension can't
-        // load as a model so the agent corrects course instead of celebrating.
-        const civitaiType = resolved.metadata?.modelType;
-        const NON_MODEL_TYPES = new Set(["Workflows", "Poses", "Wildcards", "Other"]);
-        const fileExt = (filename ?? savedPath).toLowerCase().match(/\.([a-z0-9]+)$/)?.[1];
-        const NON_MODEL_EXTS = new Set(["zip", "rar", "7z", "json", "txt", "png", "jpg"]);
-        if ((civitaiType && NON_MODEL_TYPES.has(civitaiType)) || (fileExt && NON_MODEL_EXTS.has(fileExt))) {
-          lines.push(
-            `  WARNING: this CivitAI entry is type "${civitaiType ?? "unknown"}" (file: .${fileExt ?? "?"}) — it is NOT a loadable model file and will not appear in a ${args.target_subfolder} loader. ` +
-              `If the user wanted a LoRA/checkpoint, re-run search_civitai_models with types:["LORA"] (or ["Checkpoint"]) and download a hit whose type matches. Do not tell the user a model was installed.`,
-          );
-        }
-
-        // Write usage-docs sidecars beside the file so the panel agent has the
-        // description, trigger words, and example generation params on hand.
-        // Local-only: remote mode has no local FS (savedPath is a status string).
-        if (isLocalMode() && resolved.metadata) {
-          const sidecar = await writeCivitaiSidecar(savedPath, resolved.metadata);
-          if (sidecar) {
-            const tw = resolved.metadata.trainedWords;
-            if (tw.length) lines.push(`  Trigger words: ${tw.join(", ")}`);
-            const recipes = resolved.metadata.examples.filter(
-              (e) => e.meta && Object.keys(e.meta).length > 0,
-            ).length;
-            lines.push(
-              `  Metadata: ${sidecar.md}` +
-                (recipes ? ` (${recipes} example recipe${recipes === 1 ? "" : "s"})` : ""),
-            );
-          }
-        }
-
-        // Write usage-docs sidecars beside the file so the panel agent has the
-        // description, trigger words, and example generation params on hand.
-        // Local-only: remote mode has no local FS (savedPath is a status string).
-        if (isLocalMode() && resolved.metadata) {
-          const sidecar = await writeCivitaiSidecar(savedPath, resolved.metadata);
-          if (sidecar) {
-            const tw = resolved.metadata.trainedWords;
-            if (tw.length) lines.push(`  Trigger words: ${tw.join(", ")}`);
-            const recipes = resolved.metadata.examples.filter(
-              (e) => e.meta && Object.keys(e.meta).length > 0,
-            ).length;
-            lines.push(
-              `  Metadata: ${sidecar.md}` +
-                (recipes ? ` (${recipes} example recipe${recipes === 1 ? "" : "s"})` : ""),
-            );
-          }
-        }
+        lines.push(...(job.notes ?? []));
 
         return {
           content: [{ type: "text" as const, text: lines.join("\n") }],

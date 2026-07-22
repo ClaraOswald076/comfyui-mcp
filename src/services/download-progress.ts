@@ -9,7 +9,7 @@
 // This no-ops entirely when COMFYUI_MCP_PROGRESS_DIR is unset — i.e. for every
 // normal (non-panel) use of the MCP — so it costs nothing outside the panel.
 
-import { mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 export interface DownloadProgress {
@@ -62,6 +62,24 @@ export function reportDownloadProgress(
     writeFileSync(fileFor(p.id), JSON.stringify({ ...p, updated: now }));
   } catch {
     // best-effort — progress is cosmetic, never fail a download over it
+  }
+}
+
+/**
+ * Read back one download's latest snapshot, so `download_status` can report
+ * bytes/throughput instead of a bare "still going". Returns null when progress
+ * reporting is off (no COMFYUI_MCP_PROGRESS_DIR) or nothing has been written
+ * yet — callers must treat byte counts as decoration, never as the source of
+ * truth for whether a download finished.
+ */
+export function readDownloadProgress(id: string): DownloadProgress | null {
+  if (!PROGRESS_DIR) return null;
+  try {
+    const raw = readFileSync(fileFor(id), "utf8");
+    const parsed = JSON.parse(raw) as DownloadProgress;
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null; // absent or mid-write — not an error
   }
 }
 

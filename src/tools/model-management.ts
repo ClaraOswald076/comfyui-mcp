@@ -3,10 +3,26 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   searchHuggingFaceModels,
   listLocalModels,
-  downloadModel,
   MODEL_SUBDIRS,
 } from "../services/model-resolver.js";
-import { errorToToolResult } from "../utils/errors.js";
+import {
+  startDownloadJob,
+  getDownloadJob,
+  listDownloadJobs,
+  type DownloadJob,
+} from "../services/download-jobs.js";
+import { readDownloadProgress } from "../services/download-progress.js";
+import { errorToToolResult, ModelError } from "../utils/errors.js";
+
+/**
+ * How long download_model waits before handing back a handle instead of a path.
+ * Long enough that ordinary files (LoRAs, VAEs, cache hits) still return a path
+ * as they always did; short enough that a big checkpoint never pins the turn.
+ */
+function downloadGraceMs(): number {
+  const raw = Number(process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 20_000;
+}
 
 const modelTypeEnum = z.enum(MODEL_SUBDIRS);
 
@@ -115,21 +131,109 @@ export function registerModelManagementTools(server: McpServer): void {
     },
     async (args) => {
       try {
-        const savedPath = await downloadModel(
+        // Start it, then wait only a GRACE WINDOW rather than the whole
+        // transfer. Small files (a VAE, a LoRA, a cache hit) still finish
+        // inside the window and return a path exactly as before, so the common
+        // case is unchanged. A multi-GB checkpoint hands back a handle instead
+        // of pinning the turn for ten minutes — which is what made the agent
+        // look stuck and then wrongly disclaim a download that was running.
+        const { job, settled } = startDownloadJob(
           args.url,
           args.target_subfolder,
           args.filename,
           args.auth,
         );
 
+        let timer: NodeJS.Timeout | undefined;
+        await Promise.race([
+          settled,
+          new Promise<void>((r) => {
+            timer = setTimeout(r, downloadGraceMs());
+          }),
+        ]);
+        if (timer) clearTimeout(timer);
+
+        if (job.status === "done") {
+          return {
+            content: [{ type: "text", text: `Model downloaded successfully to:\n${job.path}` }],
+          };
+        }
+        if (job.status === "error") {
+          return errorToToolResult(new ModelError(job.error ?? "Download failed", { url: args.url }));
+        }
+
+        const p = readDownloadProgress(job.id);
+        const pct =
+          p && p.total > 0 ? ` (${Math.floor((p.downloaded / p.total) * 100)}%)` : "";
         return {
           content: [
             {
               type: "text",
-              text: `Model downloaded successfully to:\n${savedPath}`,
+              text:
+                `Download STARTED and is still running${pct} — id \`${job.id}\`.\n\n` +
+                `This is NOT a failure and you must not describe it as one. The file is ` +
+                `streaming to disk in the background and will land on its own.\n\n` +
+                `Tell the user it is downloading, then check \`download_status\` with this id ` +
+                `when they ask. Do NOT call download_model again for this URL — a repeat ` +
+                `request adopts the same job rather than starting a second copy, but saying ` +
+                `"I'll leave it to you" or reporting it as incomplete would be wrong.`,
             },
           ],
         };
+      } catch (err) {
+        return errorToToolResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "download_status",
+    "Check on model downloads started by download_model. Reports each download's state (downloading / done / error), its destination path once it lands, and byte progress when the panel progress channel is enabled. " +
+      "Use this after download_model reports a download is still running — that means the transfer is in flight, NOT that it failed. Read-only.",
+    {
+      id: z
+        .string()
+        .optional()
+        .describe("Download id from download_model. Omit to list every download this session."),
+    },
+    async (args) => {
+      try {
+        const list = args.id
+          ? [getDownloadJob(args.id)].filter((j): j is DownloadJob => !!j)
+          : listDownloadJobs();
+
+        if (list.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: args.id
+                  ? `No download with id \`${args.id}\`. Downloads are tracked per server session, so an id from a previous session won't resolve — check the panel download tray instead.`
+                  : "No downloads have been started this session.",
+              },
+            ],
+          };
+        }
+
+        const lines = list.map((j) => {
+          const p = readDownloadProgress(j.id);
+          const bytes =
+            p && p.total > 0
+              ? `  ${(p.downloaded / 1024 ** 3).toFixed(2)}/${(p.total / 1024 ** 3).toFixed(2)} GB (${Math.floor((p.downloaded / p.total) * 100)}%)`
+              : p && p.downloaded > 0
+                ? `  ${(p.downloaded / 1024 ** 3).toFixed(2)} GB so far`
+                : "";
+          const head = `- \`${j.id}\` **${j.status}**${bytes}`;
+          const detail =
+            j.status === "done"
+              ? `\n    landed at: ${j.path}`
+              : j.status === "error"
+                ? `\n    failed: ${j.error}`
+                : `\n    still streaming — started ${Math.round((Date.now() - j.started_at) / 1000)}s ago`;
+          return `${head}${detail}\n    from: ${j.url}`;
+        });
+
+        return { content: [{ type: "text", text: `## Downloads\n\n${lines.join("\n")}` }] };
       } catch (err) {
         return errorToToolResult(err);
       }
