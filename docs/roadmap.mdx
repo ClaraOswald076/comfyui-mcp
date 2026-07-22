@@ -4,6 +4,27 @@ description: "What's shipped, what's being built, what's next — and what we've
 icon: "map"
 ---
 
+## What this covers
+
+**The whole project, not one repository.** comfyui-mcp is several pieces that
+ship separately and version independently:
+
+| Piece | Repo | What it is |
+|---|---|---|
+| **MCP server + plugin** | [`comfyui-mcp`](https://github.com/artokun/comfyui-mcp) | the tools and the orchestrator — the control plane |
+| **Panel** | [`comfyui-mcp-panel`](https://github.com/artokun/comfyui-mcp-panel) | the agent sidebar inside ComfyUI |
+| **Mobile app** | [`comfyui-mcp-mobile`](https://github.com/artokun/comfyui-mcp-mobile) | chat, queue, LoRAs and desktop-tab mirroring |
+| **Relay** | [`comfyui-mcp-relay`](https://github.com/artokun/comfyui-mcp-relay) | Cloudflare Worker for a stable `wss://` remote bridge |
+
+Items below are labelled by piece where it matters. Everything is planned as one
+product even though it lands in four places.
+
+<Warning>
+  The version numbers in [How it got here](#how-it-got-here) are the **MCP
+  server's**. The panel and the mobile app carry their own, unrelated version
+  lines — panel 0.9.x is not "behind" server v0.44. Don't compare them.
+</Warning>
+
 ## How to read this
 
 **There are no dates on this page, and that's deliberate.**
@@ -126,7 +147,10 @@ coarse — for what changed in a specific release, see the
   starting from the initial commit on **2026-02-15**.
 </Note>
 
-| Era | Releases | What it was about |
+Releases shown are the **MCP server's** — the panel and mobile app version
+separately, and the eras below describe the project as a whole.
+
+| Era | Server releases | What it was about |
 |---|---|---|
 | **The MCP server**<br/>Feb 2026 | v0.2 – v0.3 | The original idea: drive ComfyUI from an agent. Image generation, workflow analysis, a UI→API workflow converter, hierarchical visualisation, model skills, and the shift from blocking runs to a non-blocking queue with background progress and process control. |
 | **Quiet stretch**<br/>Mar – Apr 2026 | v0.3.x | Three feature commits in two months. Remote ComfyUI over HTTP, subgraph/component expansion in the converter, HTTPS/WSS support. Groundwork, not headlines. |
