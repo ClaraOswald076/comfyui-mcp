@@ -59,6 +59,41 @@ function jsonText(data: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
 }
 
+/** Registry URLs apps_import may fetch from. This is a SERVER-side fetch, so
+ *  an open URL is an SSRF primitive (loopback/LAN, or a public URL redirecting
+ *  into one) — the tool only talks to the default registry or origins the
+ *  operator explicitly allowlists (comma-separated, for dev/staging). */
+function allowedRegistryBases(): string[] {
+  const extra = (process.env.COMFYUI_MCP_REGISTRY_URLS || "")
+    .split(",")
+    .map((s) => s.trim().replace(/\/+$/, ""))
+    .filter(Boolean);
+  return ["https://cmcp-apps-registry.artokun.workers.dev", ...extra];
+}
+
+const MAX_BUNDLE_BYTES = 16 * 1024 * 1024;
+
+/** Bounded GET: 30s timeout, 16MB cap on the buffered body (checked on the
+ *  declared length AND the actual bytes). */
+async function boundedJson(url: string): Promise<unknown> {
+  const res = await fetch(url, {
+    redirect: "error", // no redirect-follow into a second origin
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!res.ok) {
+    throw new ComfyUIError(`registry fetch failed: HTTP ${res.status}`, "APPS_IMPORT_REGISTRY");
+  }
+  const declared = Number(res.headers.get("content-length") || 0);
+  if (declared > MAX_BUNDLE_BYTES) {
+    throw new ComfyUIError("registry bundle too large", "APPS_IMPORT_TOO_LARGE");
+  }
+  const buf = await res.arrayBuffer();
+  if (buf.byteLength > MAX_BUNDLE_BYTES) {
+    throw new ComfyUIError("registry bundle too large", "APPS_IMPORT_TOO_LARGE");
+  }
+  return JSON.parse(new TextDecoder().decode(buf));
+}
+
 export function registerAppsTools(server: McpServer): void {
   server.tool(
     "apps_list",
@@ -129,11 +164,22 @@ export function registerAppsTools(server: McpServer): void {
       "run's outputs (image/video file refs under each output node, text outputs). Read-only.",
     {
       app_id: z.string().uuid().describe("The app's uuid."),
-      prompt_id: z.string().describe("The prompt_id returned by apps_run."),
+      // ComfyUI prompt ids are uuids; constraining the shape also blocks
+      // route traversal (a "prompt_id" like ../../system_stats would escape
+      // the apps route when interpolated into the URL — codex finding).
+      prompt_id: z
+        .string()
+        .regex(/^[0-9a-zA-Z-]{1,64}$/, "must be a ComfyUI prompt id (alphanumeric/dashes)")
+        .describe("The prompt_id returned by apps_run."),
     },
     async (args) => {
       try {
-        return jsonText(await appsFetch(`/${args.app_id}/runs/${args.prompt_id}`));
+        // In-handler too (not just the zod boundary): any direct caller with a
+        // traversal-shaped id must never reach the URL builder.
+        if (!/^[0-9a-zA-Z-]{1,64}$/.test(args.prompt_id)) {
+          throw new ComfyUIError("invalid prompt_id", "APPS_BAD_PROMPT_ID");
+        }
+        return jsonText(await appsFetch(`/${args.app_id}/runs/${encodeURIComponent(args.prompt_id)}`));
       } catch (err) {
         return errorToToolResult(err);
       }
@@ -151,7 +197,10 @@ export function registerAppsTools(server: McpServer): void {
       registry_url: z
         .string()
         .url()
-        .describe("Registry worker base URL, e.g. https://cmcp-apps-registry.example.workers.dev"),
+        .describe(
+          "Registry worker base URL. Must be the default public registry or an origin the operator " +
+            "allowlisted via COMFYUI_MCP_REGISTRY_URLS (the fetch is server-side — open URLs would be SSRF).",
+        ),
       app_id: z.string().uuid().describe("The registry app's uuid (from the explore list)."),
       slug: z.string().optional().describe("The app's registry slug (recorded in local metadata)."),
       version: z.number().int().optional().describe("The registry version (recorded in local metadata)."),
@@ -159,16 +208,14 @@ export function registerAppsTools(server: McpServer): void {
     async (args) => {
       try {
         const base = args.registry_url.replace(/\/+$/, "");
-        // Only allow http(s) registry URLs — this is a server-side fetch, so no
-        // arbitrary-scheme redirects to file:/gopher: etc.
-        if (!/^https?:\/\//i.test(base)) {
-          throw new ComfyUIError("registry_url must be http(s)", "APPS_IMPORT_BAD_URL");
+        if (!allowedRegistryBases().includes(base)) {
+          throw new ComfyUIError(
+            `registry_url must be the default registry or an operator-allowlisted origin ` +
+              `(COMFYUI_MCP_REGISTRY_URLS); got ${base}`,
+            "APPS_IMPORT_BAD_URL",
+          );
         }
-        const res = await fetch(`${base}/v1/apps/${args.app_id}/bundle`);
-        if (!res.ok) {
-          throw new ComfyUIError(`registry bundle fetch failed: HTTP ${res.status}`, "APPS_IMPORT_REGISTRY");
-        }
-        const bundle = (await res.json()) as {
+        const bundle = (await boundedJson(`${base}/v1/apps/${args.app_id}/bundle`)) as {
           manifest?: Record<string, unknown>;
           prompt?: unknown;
           workflow?: unknown;
@@ -186,6 +233,23 @@ export function registerAppsTools(server: McpServer): void {
             publishedVersion: args.version || null,
           },
         };
+        // Thumbnails live at a separate registry endpoint, not inside the JSON
+        // bundle — fetch and forward so the installed app keeps its card art.
+        let thumbnail_b64: string | undefined;
+        try {
+          const thumbRes = await fetch(`${base}/v1/apps/${args.app_id}/thumbnail`, {
+            redirect: "error",
+            signal: AbortSignal.timeout(15_000),
+          });
+          if (thumbRes.ok) {
+            const buf = await thumbRes.arrayBuffer();
+            if (buf.byteLength <= 5 * 1024 * 1024) {
+              thumbnail_b64 = Buffer.from(buf).toString("base64");
+            }
+          }
+        } catch {
+          /* no thumbnail — cosmetic only */
+        }
         const created = await appsFetch("", {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -193,6 +257,7 @@ export function registerAppsTools(server: McpServer): void {
             manifest,
             prompt: bundle.prompt,
             ...(bundle.workflow ? { workflow: bundle.workflow } : {}),
+            ...(thumbnail_b64 ? { thumbnail_b64 } : {}),
           }),
         });
         return jsonText({ ok: true, installed: created, deps: (bundle.manifest as { deps?: unknown }).deps || {} });

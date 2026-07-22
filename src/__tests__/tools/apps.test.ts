@@ -92,6 +92,8 @@ describe("apps tools", () => {
 
   it("apps_import fetches the registry bundle and POSTs it to the panel", async () => {
     const REG = "https://reg.example.workers.dev";
+    process.env.COMFYUI_MCP_REGISTRY_URLS = REG;
+    try {
     fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
       if (url === `${REG}/v1/apps/${APP_ID}/bundle`) {
         return jsonResponse({
@@ -100,13 +102,18 @@ describe("apps tools", () => {
           workflow: { nodes: [] },
         });
       }
+      if (url === `${REG}/v1/apps/${APP_ID}/thumbnail`) {
+        return new Response(new Uint8Array([1, 2, 3]), { status: 200 });
+      }
       if (url.endsWith("/comfyui_mcp_panel/apps") && init?.method === "POST") {
         const body = JSON.parse(String(init.body)) as {
           manifest: { id: string; source: { type: string }; published: { slug: string } };
+          thumbnail_b64?: string;
         };
         expect(body.manifest.id).toBe(APP_ID);
         expect(body.manifest.source.type).toBe("registry");
         expect(body.manifest.published.slug).toBe("maker/cloud-app");
+        expect(body.thumbnail_b64).toBe(Buffer.from([1, 2, 3]).toString("base64"));
         return jsonResponse({ ok: true, id: APP_ID });
       }
       throw new Error(`unexpected fetch ${url}`);
@@ -119,11 +126,21 @@ describe("apps tools", () => {
     });
     expect(res.isError).toBeFalsy();
     expect(JSON.parse(res.content[0].text).ok).toBe(true);
+    } finally {
+      delete process.env.COMFYUI_MCP_REGISTRY_URLS;
+    }
   });
 
-  it("apps_import rejects a non-http registry URL", async () => {
-    const res = await getHandler("apps_import")({ registry_url: "file:///etc/passwd", app_id: APP_ID });
+  it("apps_import rejects a registry URL outside the allowlist", async () => {
+    const res = await getHandler("apps_import")({ registry_url: "http://169.254.169.254/latest", app_id: APP_ID });
     expect(res.isError).toBe(true);
-    expect(res.content[0].text).toContain("http(s)");
+    expect(res.content[0].text).toContain("allowlisted");
+  });
+
+  it("apps_run_status rejects a traversal-shaped prompt_id", async () => {
+    const res = await getHandler("apps_run_status")({ app_id: APP_ID, prompt_id: "../../../../system_stats" });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("invalid prompt_id");
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
