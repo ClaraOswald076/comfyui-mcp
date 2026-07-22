@@ -33,13 +33,17 @@ vi.mock("../../services/runpod-watch.js", () => ({
     watch: (id: string) => watchMock(id),
     unwatch: () => unwatchMock(),
     watchedPodId: () => watcherState.watched,
+    clearConnectFailed: () => {},
   }),
 }));
 
 const setComfyuiTargetMock = vi.fn(() => true);
+// Mutable active-target URL for the stop handler's targetingThisPod check.
+let mockBaseUrl = "http://127.0.0.1:8188";
 vi.mock("../../config.js", () => ({
   setComfyuiTarget: (...a: unknown[]) => setComfyuiTargetMock(...a),
   getLocalComfyuiUrl: () => "http://127.0.0.1:3000",
+  getComfyUIBaseUrl: () => mockBaseUrl,
 }));
 const resetClientMock = vi.fn();
 vi.mock("../../comfyui/client.js", () => ({ resetClient: () => resetClientMock() }));
@@ -72,6 +76,7 @@ const runningPod = (over: Record<string, unknown> = {}) => ({
 beforeEach(() => {
   vi.clearAllMocks();
   watcherState.watched = null;
+  mockBaseUrl = "http://127.0.0.1:8188";
   setComfyuiTargetMock.mockReturnValue(true);
   // default probe: ComfyUI answers
   global.fetch = vi.fn(async () => ({ ok: true, status: 200 })) as unknown as typeof fetch;
@@ -132,6 +137,7 @@ describe("runpod_pod_start / stop", () => {
   });
   it("falls back to local ComfyUI when stopping the CONNECTED pod (the swap)", async () => {
     watcherState.watched = "pod123"; // we were connected to it
+    mockBaseUrl = "https://pod123-3000.proxy.runpod.net"; // active target IS the pod
     stopPodMock.mockResolvedValue({ id: "pod123", desiredStatus: "EXITED" });
     const t = (await getHandler("runpod_pod_stop")({ pod_id: "pod123" })).content[0].text;
     expect(unwatchMock).toHaveBeenCalled();
@@ -141,6 +147,7 @@ describe("runpod_pod_start / stop", () => {
   });
   it("does NOT retarget when stopping a pod we weren't connected to", async () => {
     watcherState.watched = "otherpod";
+    mockBaseUrl = "http://127.0.0.1:8188"; // active target is local, not the pod
     stopPodMock.mockResolvedValue({ id: "pod123", desiredStatus: "EXITED" });
     await getHandler("runpod_pod_stop")({ pod_id: "pod123" });
     expect(setComfyuiTargetMock).not.toHaveBeenCalled();

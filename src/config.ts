@@ -2,8 +2,9 @@ import { z } from "zod";
 import dotenv from "dotenv";
 import { fileURLToPath } from "url";
 import { dirname, resolve, join } from "path";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
+import { isIP } from "node:net";
 import { parseComfyUIUrl, type ComfyUITarget } from "./transport/comfyui-url.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -220,10 +221,13 @@ const LOOPBACK_HOSTS = new Set([
   "0.0.0.0",
 ]);
 
-/** True when a hostname is loopback (or absent → assume local). */
+/** True when a hostname is loopback (or absent → assume local). Bracketed IPv6
+ *  (`[::1]`, as URL parsing stores it) is normalized first so every consumer
+ *  classifies it the same (codex finding: is_local frame vs FS gating split). */
 export function isLoopbackHost(host: string | undefined): boolean {
   if (!host) return true; // No URL → assume local
-  return LOOPBACK_HOSTS.has(host.toLowerCase());
+  const h = host.toLowerCase().replace(/^\[|\]$/g, "");
+  return LOOPBACK_HOSTS.has(h);
 }
 
 /**
@@ -476,13 +480,135 @@ const bootComfyui = {
   basePath: config.comfyuiBasePath,
 };
 
-/** The loopback ComfyUI URL to fall back to when leaving a remote pod. */
+/** True when a host is a RunPod proxy (a pod) — the pod/not-pod boundary the
+ *  host indicator + local-fallback logic share. */
+function isRunpodProxyHost(host: string): boolean {
+  return /\.proxy\.runpod\.net$/i.test(host);
+}
+
+/** "Local" for the fallback means THIS machine or a private-LAN rig — NOT an
+ *  arbitrary remote host: booting against a VPS must still fall back to
+ *  loopback (codex finding; the pre-#269 behavior deliberately did). The
+ *  numeric ranges apply ONLY to IP literals — a DNS name like
+ *  `192.168.example.com` or `fd.example.com` is NOT private (codex finding). */
+function isLocalOrLanHost(host: string): boolean {
+  const h = host.toLowerCase().replace(/^\[|\]$/g, ""); // strip IPv6 brackets
+  if (isLoopbackHost(h)) return true;
+  // Local DNS forms: bare single-label names (comfybox), mDNS/home suffixes —
+  // only when NOT an IP literal (a public IPv6 like 2001:4860::8888 has no dot
+  // and must not pass as a bare hostname — codex finding).
+  if (!h.includes(".") && isIP(h) === 0) return true;
+  if (h.endsWith(".local") || h.endsWith(".internal") || h.endsWith(".lan") || h.endsWith(".home.arpa")) return true;
+  if (isIP(h) === 0) return false; // other DNS names — only IP literals get range checks
+  return (
+    h.startsWith("10.") ||
+    h.startsWith("192.168.") ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(h) ||
+    /^f[cd]/.test(h) || // IPv6 ULA fc00::/7 (fc00–fdff)
+    /^fe[89ab][0-9a-f]:/.test(h) // IPv6 link-local fe80::/10 (fe80–febf)
+  );
+}
+
+/** True when the ACTIVE target is a pod. */
+export function isTargetingPod(): boolean {
+  return isRunpodProxyHost(config.comfyuiHost);
+}
+
+/** True when the ACTIVE target is this machine or a private-LAN rig — the
+ *  panels' `is_local` frame predicate (#269): a RunPod pod is false, a
+ *  loopback/LAN rig is true, and a generic remote host (VPS, cloud) is ALSO
+ *  false — neither "local" nor "pod" (codex rounds on both sides of this). */
+export function isTargetingLocalOrLan(): boolean {
+  return isLocalOrLanHost(config.comfyuiHost);
+}
+
+/** The most recent NON-POD target ("local" = this rig or a LAN rig — #269).
+ *  Seeded from the boot target when that IS local/LAN (a VPS/pod boot seeds
+ *  nothing; cloud mode's placeholder port 0 is treated as unknown). When the
+ *  boot is NOT local/LAN — e.g. a self-restart that inherited the POD url
+ *  through the mutated process env — the last learned target is restored from
+ *  disk instead (codex finding: restarts forgot the LAN rig and fell back to
+ *  127.0.0.1). Advanced by setComfyuiTarget + persisted on every change. */
+/** The saved-target path. Default is profile-global; an orchestrator sets
+ *  COMFYUI_MCP_LOCAL_TARGET_FILE to a port-scoped path at startup so parallel
+ *  orchestrators for DIFFERENT rigs never restore each other's rig (codex
+ *  finding). Evaluated per call so the startup assignment takes effect. */
+function localTargetFile(): string {
+  return process.env.COMFYUI_MCP_LOCAL_TARGET_FILE || join(homedir(), ".comfyui-mcp", "local-target.json");
+}
+
+function readSavedLocalTarget(): string | null {
+  try {
+    const v = JSON.parse(readFileSync(localTargetFile(), "utf-8")) as { url?: unknown };
+    return typeof v?.url === "string" ? v.url : null;
+  } catch {
+    return null;
+  }
+}
+
+const bootLocalTarget =
+  isLocalOrLanHost(bootComfyui.host) && bootComfyui.port > 0
+    ? `${bootComfyui.ssl ? "https" : "http"}://${bootComfyui.host}:${bootComfyui.port}${bootComfyui.basePath}`
+    : null;
+// Restore the saved target ONLY for the pod/restart boot (a self-restart
+// inherits the pod URL through the mutated env) — a deliberate boot against a
+// VPS must fall back to loopback, not a stale saved rig (codex finding).
+let lastNonPodTarget: string | null = bootLocalTarget ?? (isRunpodProxyHost(bootComfyui.host) ? readSavedLocalTarget() : null);
+// A deliberate boot against an explicit non-local, non-pod URL invalidates the
+// saved rig for this session (codex finding: the stale LAN file was later
+// restored after a pod retarget + restart, pointing use_local at the old rig).
+// Cloud boots (API key, no explicit URL) leave it alone.
+if (!bootLocalTarget && !isRunpodProxyHost(bootComfyui.host) && process.env.COMFYUI_URL?.trim() && !isLoopbackHost(bootComfyui.host)) {
+  try {
+    rmSync(localTargetFile(), { force: true });
+  } catch {
+    /* no saved file */
+  }
+}
+
+/** The loopback-or-LAN ComfyUI URL to fall back to when leaving a remote pod.
+ *  "Local" means the most recent non-pod target (boot or learned), falling
+ *  back to the loopback default only when nothing non-pod is known (#269:
+ *  forcing 127.0.0.1 broke rigs whose local ComfyUI lives on another LAN host). */
 export function getLocalComfyuiUrl(): string {
-  const local = isLoopbackHost(bootComfyui.host);
-  const host = local ? bootComfyui.host : "127.0.0.1";
-  const port = local && bootComfyui.port ? bootComfyui.port : 8188;
-  const proto = local && bootComfyui.ssl ? "https" : "http";
-  return `${proto}://${host}:${port}${local ? bootComfyui.basePath : ""}`;
+  return lastNonPodTarget ?? "http://127.0.0.1:8188";
+}
+
+/** Orchestrator startup hook: re-point the saved-target file (port-scoped, so
+ *  parallel orchestrators for different rigs never restore each other's rig)
+ *  and re-restore when booted on a pod — the module-init restore ran before
+ *  the scoped path was known (codex finding). */
+export function rescopeLocalTargetFile(path: string): void {
+  process.env.COMFYUI_MCP_LOCAL_TARGET_FILE = path;
+  // The deliberate non-local, non-pod boot invalidation from module init ran
+  // BEFORE this scoped path existed — repeat it here, or the stale scoped file
+  // resurrects the old LAN rig after a pod retarget + restart (codex finding).
+  if (!bootLocalTarget && !isRunpodProxyHost(bootComfyui.host) && process.env.COMFYUI_URL?.trim() && !isLoopbackHost(bootComfyui.host)) {
+    try {
+      rmSync(path, { force: true });
+    } catch {
+      /* no saved file */
+    }
+    lastNonPodTarget = null;
+    return;
+  }
+  if (isRunpodProxyHost(bootComfyui.host)) {
+    // Pod/restart boot: the SCOPED file is THIS orchestrator's rig — it wins
+    // over any profile-global value the module-init restore picked up (codex
+    // finding: a headless session's global save defeated the port isolation).
+    lastNonPodTarget = readSavedLocalTarget();
+  }
+  if (lastNonPodTarget !== null) {
+    // Persist into the scoped file so the next restart restores it — a direct
+    // LAN boot otherwise lives in memory only and the pod-inherited restart
+    // falls back to 127.0.0.1 (codex finding).
+    try {
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, JSON.stringify({ url: lastNonPodTarget }));
+    } catch {
+      /* best-effort */
+    }
+  }
 }
 
 /** True when the ACTIVE ComfyUI target is loopback (renders run on this machine
@@ -503,7 +629,10 @@ export function onComfyuiTargetChanged(cb: ComfyuiTargetListener): () => void {
 }
 function emitComfyuiTargetChanged(): void {
   const url = getComfyUIBaseUrl();
-  const local = isTargetingLocal();
+  // is_local = loopback/LAN rig (#269): pod → false, VPS/cloud remote → false
+  // (neither local nor pod), restored LAN rig → true. One predicate for the
+  // seed frame and every change frame.
+  const local = isTargetingLocalOrLan();
   for (const cb of comfyuiTargetListeners) {
     try {
       cb(url, local);
@@ -595,6 +724,24 @@ export function setComfyuiTarget(url: string): boolean {
     cloud: isCloudMode(),
     remoteHost: t.host,
   });
+  // Track the newest local/LAN non-pod target — it is what "Local" means from
+  // now on (boot may have been loopback while the real rig was learned later,
+  // #269). A VPS or other generic remote target is NOT a local fallback.
+  // Persisted: an orchestrator self-restart boots on the POD url (env was
+  // mutated) and would otherwise forget the rig (codex finding).
+  if (isLocalOrLanHost(t.host)) {
+    lastNonPodTarget = `${t.ssl ? "https" : "http"}://${t.host}:${t.port}${t.basePath}`;
+    try {
+      mkdirSync(dirname(localTargetFile()), { recursive: true });
+      writeFileSync(localTargetFile(), JSON.stringify({ url: lastNonPodTarget }));
+    } catch {
+      /* best-effort */
+    }
+  }
+  // Keep the process env in step: readers like reportDownloadProgress stamp
+  // from COMFYUI_URL, and a runtime retarget must not leave them pinning the
+  // process-start host (codex finding).
+  process.env.COMFYUI_URL = url;
   // Tell the control panels where renders run now (local ⇄ pod).
   emitComfyuiTargetChanged();
   return true;
