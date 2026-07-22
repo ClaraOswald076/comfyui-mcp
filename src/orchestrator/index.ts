@@ -699,6 +699,18 @@ const CALL_TOOL_WHITELIST = new Set<string>([
   "runpod_watch",
   "runpod_unwatch",
   "runpod_deploy_link",
+  // Micro-Apps (panel "Apps" feature): the canvas-less client's list/run/poll
+  // surface. Same risk posture as enqueue_workflow (already whitelisted): run
+  // queues a job the user explicitly tapped; list/get/status are read-only.
+  "apps_list",
+  "apps_get",
+  "apps_run",
+  "apps_run_status",
+  // Registry install (mobile Explore): the rig fetches the bundle from the
+  // public registry and imports it locally. Same risk as save_workflow +
+  // download_model (already whitelisted): writes a local app bundle, no
+  // model/system mutation. Deps install stays a separate consented action.
+  "apps_import",
 ]);
 
 /** Lazily build ONE in-process MCP client wired to the full comfyui tool surface,
