@@ -69,12 +69,26 @@ route, an API gateway, an SSO edge) — this is **not** Comfy Cloud:
 <ParamField path="COMFYUI_AUTH_SCHEME" type="string" default="Bearer for Authorization, else none">
   Scheme prefix on the token value, e.g. `Bearer`, `Token`.
 </ParamField>
+<ParamField path="CF_ACCESS_CLIENT_ID" type="string">
+  Cloudflare Access **service token** Client ID. Set together with
+  `CF_ACCESS_CLIENT_SECRET` to reach a ComfyUI fronted by Cloudflare Access — both
+  are sent (as `CF-Access-Client-Id` / `CF-Access-Client-Secret`) on **every**
+  ComfyUI request (HTTP and the queue-watcher WebSocket), so the connector passes
+  the Access gate instead of getting the interactive sign-in page. Additive to
+  `COMFYUI_AUTH_TOKEN`; both take effect if both are set. Never logged.
+</ParamField>
+<ParamField path="CF_ACCESS_CLIENT_SECRET" type="string">
+  Cloudflare Access service token Client Secret (the pair to `CF_ACCESS_CLIENT_ID`).
+  Only sent when **both** are set — a half-configured token is ignored. Never logged.
+</ParamField>
 
 ```bash
 # Authorization: Bearer <token>, requests under /comfyapi
 COMFYUI_URL=https://gateway.example.com/comfyapi COMFYUI_AUTH_TOKEN=<token> npx -y comfyui-mcp@latest
 # custom header: X-API-Key: <token>
 COMFYUI_URL=https://gateway.example.com/comfyapi COMFYUI_AUTH_HEADER=X-API-Key COMFYUI_AUTH_TOKEN=<token> npx -y comfyui-mcp@latest
+# ComfyUI behind Cloudflare Access — pass a service token (keeps the human sign-in page up)
+COMFYUI_URL=https://comfy.example.com CF_ACCESS_CLIENT_ID=<id>.access CF_ACCESS_CLIENT_SECRET=<secret> npx -y comfyui-mcp@latest
 ```
 
 ## Comfy Cloud

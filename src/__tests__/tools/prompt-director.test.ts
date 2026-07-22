@@ -37,7 +37,12 @@ describe("prompt_director_inspect tool", () => {
     const inspect = makeServer();
     const result = await inspect({ node_id: "42" });
 
-    expect(fetchMock).toHaveBeenCalledWith("http://127.0.0.1:8188/prompt_director/inspection?node_id=42");
+    // Routed through comfyuiFetch now (so CF Access / COMFYUI_AUTH_* headers reach
+    // this endpoint too); with no auth configured it calls fetch(url, {}).
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8188/prompt_director/inspection?node_id=42",
+      {},
+    );
     expect(result.content[0].text).toContain('"node_id": "42"');
     expect(result.content[0].text).toContain("prompt_director_auto");
   });

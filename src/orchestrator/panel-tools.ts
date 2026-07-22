@@ -27,6 +27,7 @@ import { z } from "zod";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { extname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { comfyuiFetch } from "../comfyui/fetch.js";
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { parse as parseYaml } from "yaml";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
@@ -1954,7 +1955,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                 const base = (process.env.COMFYUI_URL ?? "http://127.0.0.1:8188").replace(/\/+$/, "");
                 const qs = new URLSearchParams({ filename: src.filename, type: src.type ?? "output" });
                 if (src.subfolder) qs.set("subfolder", src.subfolder);
-                const resp = await fetch(`${base}/view?${qs.toString()}`);
+                const resp = await comfyuiFetch(`${base}/view?${qs.toString()}`);
                 if (resp.ok) {
                   const mime = resp.headers.get("content-type") ?? "";
                   const buf = Buffer.from(await resp.arrayBuffer());

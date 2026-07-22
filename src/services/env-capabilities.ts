@@ -17,6 +17,7 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
+import { comfyuiFetch } from "../comfyui/fetch.js";
 import { platform, release, totalmem, cpus } from "node:os";
 import { join } from "node:path";
 import { isForceRemoteFlagSet } from "../config.js";
@@ -155,7 +156,7 @@ async function probeManagerGeneration(
 ): Promise<"v4" | "legacy" | "unknown"> {
   const probe = async (path: string): Promise<boolean> => {
     try {
-      const res = await fetch(new URL(path, comfyuiUrl), {
+      const res = await comfyuiFetch(new URL(path, comfyuiUrl), {
         signal: AbortSignal.timeout(timeoutMs),
       });
       return res.ok;
@@ -198,7 +199,7 @@ async function fetchSystemStats(
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   timer.unref?.();
   try {
-    const res = await fetch(`${base}/system_stats`, { signal: controller.signal });
+    const res = await comfyuiFetch(`${base}/system_stats`, { signal: controller.signal });
     if (!res.ok) return undefined;
     return (await res.json()) as SystemStatsLike;
   } catch {

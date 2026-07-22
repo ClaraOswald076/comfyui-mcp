@@ -378,6 +378,13 @@ const configSchema = z.object({
   comfyuiAuthHeader: z.string().optional(),
   comfyuiAuthScheme: z.string().optional(),
   comfyuiAuthToken: z.string().optional(),
+  // Cloudflare Access service token (a Client ID + Client Secret PAIR). When both
+  // are set, every ComfyUI request carries CF-Access-Client-Id / -Secret so a
+  // ComfyUI endpoint fronted by Cloudflare Access lets the connector through
+  // instead of returning the interactive sign-in page. Independent of, and
+  // additive to, COMFYUI_AUTH_TOKEN.
+  cfAccessClientId: z.string().optional(),
+  cfAccessClientSecret: z.string().optional(),
   huggingfaceToken: z.string().optional(),
   githubToken: z.string().optional(),
   civitaiApiToken: z.string().optional(),
@@ -447,6 +454,8 @@ const parsedConfig = configSchema.parse({
   comfyuiAuthHeader: process.env.COMFYUI_AUTH_HEADER,
   comfyuiAuthScheme: process.env.COMFYUI_AUTH_SCHEME,
   comfyuiAuthToken: process.env.COMFYUI_AUTH_TOKEN,
+  cfAccessClientId: process.env.CF_ACCESS_CLIENT_ID,
+  cfAccessClientSecret: process.env.CF_ACCESS_CLIENT_SECRET,
   // HF_TOKEN is the canonical var the huggingface_hub libs read; HUGGINGFACE_TOKEN
   // is a legacy alias we still honor as a fallback.
   huggingfaceToken: process.env.HF_TOKEN || process.env.HUGGINGFACE_TOKEN,
@@ -778,14 +787,27 @@ export function getComfyUIBaseUrl(): string {
  * This is independent of Comfy Cloud mode (COMFYUI_API_KEY / X-API-Key).
  */
 export function getComfyUIAuthHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {};
   const token = config.comfyuiAuthToken?.trim();
-  if (!token) return {};
-  const header = config.comfyuiAuthHeader?.trim() || "Authorization";
-  // An unset/empty scheme defaults to "Bearer" for the Authorization header and
-  // to none (raw token) for any custom header. Set COMFYUI_AUTH_SCHEME to force
-  // a specific scheme (e.g. "Token").
-  const scheme =
-    config.comfyuiAuthScheme?.trim() ||
-    (header.toLowerCase() === "authorization" ? "Bearer" : "");
-  return { [header]: scheme ? `${scheme} ${token}` : token };
+  if (token) {
+    const header = config.comfyuiAuthHeader?.trim() || "Authorization";
+    // An unset/empty scheme defaults to "Bearer" for the Authorization header and
+    // to none (raw token) for any custom header. Set COMFYUI_AUTH_SCHEME to force
+    // a specific scheme (e.g. "Token").
+    const scheme =
+      config.comfyuiAuthScheme?.trim() ||
+      (header.toLowerCase() === "authorization" ? "Bearer" : "");
+    headers[header] = scheme ? `${scheme} ${token}` : token;
+  }
+  // Cloudflare Access service token — sent as a PAIR (both headers) or not at all,
+  // so a half-configured token never produces a broken request. Additive: works
+  // alongside or instead of COMFYUI_AUTH_TOKEN, and applies to every ComfyUI
+  // endpoint (harmless on endpoints not behind Cloudflare Access — they ignore it).
+  const cfId = config.cfAccessClientId?.trim();
+  const cfSecret = config.cfAccessClientSecret?.trim();
+  if (cfId && cfSecret) {
+    headers["CF-Access-Client-Id"] = cfId;
+    headers["CF-Access-Client-Secret"] = cfSecret;
+  }
+  return headers;
 }

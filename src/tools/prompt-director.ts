@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { errorToToolResult } from "../utils/errors.js";
+import { comfyuiFetch } from "../comfyui/fetch.js";
 
 
 function comfyBase(): string {
@@ -25,7 +26,7 @@ export function registerPromptDirectorTools(server: McpServer): void {
     async (args) => {
       try {
         const query = args.node_id ? `?node_id=${encodeURIComponent(args.node_id)}` : "";
-        const response = await fetch(`${comfyBase()}/prompt_director/inspection${query}`);
+        const response = await comfyuiFetch(`${comfyBase()}/prompt_director/inspection${query}`);
         if (!response.ok) {
           return errorToToolResult(
             new Error(

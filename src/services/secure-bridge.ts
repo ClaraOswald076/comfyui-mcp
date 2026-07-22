@@ -26,6 +26,7 @@ import { randomBytes } from "node:crypto";
 import { startQuickTunnel, type QuickTunnel } from "./tunnel.js";
 import { RelayClient } from "./relay-client.js";
 import { logger } from "../utils/logger.js";
+import { getComfyUIAuthHeaders } from "../config.js";
 import type { UiBridge } from "./ui-bridge.js";
 
 export interface SecureBridge {
@@ -44,16 +45,6 @@ function toWssUrl(httpsUrl: string, token: string): string {
   u.search = "";
   u.searchParams.set("token", token);
   return u.toString();
-}
-
-/** Auth headers for the pod's ComfyUI, mirroring the connect-time env the docs
- *  document (COMFYUI_AUTH_TOKEN + optional header/scheme). Empty when unset. */
-function comfyuiAuthHeaders(): Record<string, string> {
-  const token = process.env.COMFYUI_AUTH_TOKEN?.trim();
-  if (!token) return {};
-  const header = process.env.COMFYUI_AUTH_HEADER?.trim() || "Authorization";
-  const scheme = process.env.COMFYUI_AUTH_SCHEME?.trim() ?? "Bearer";
-  return { [header]: scheme ? `${scheme} ${token}` : token };
 }
 
 /** Mask the token when logging a wss URL. */
@@ -80,7 +71,7 @@ export async function advertiseBridge(comfyuiUrl: string, wssUrl: string, should
     try {
       const res = await fetch(endpoint, {
         method: "POST",
-        headers: { "Content-Type": "application/json", ...comfyuiAuthHeaders() },
+        headers: { "Content-Type": "application/json", ...getComfyUIAuthHeaders() },
         body: JSON.stringify({ url: wssUrl }),
       });
       if (res.ok) return true;
