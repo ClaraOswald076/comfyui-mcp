@@ -8,7 +8,7 @@
 // persistent /workspace only pays the ~10min install ONCE across restarts.
 
 import childProcess from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
@@ -117,6 +117,13 @@ export async function bootstrapToolkit(opts: { onLog?: (line: string) => void } 
     r = await stream("git", ["submodule", "update", "--init", "--recursive"], dir, log);
     if (r.code !== 0) return fail("train_bootstrap", "submodule_failed", `submodule update exited ${r.code}`, r.tail);
 
+    // Invalidate any previous completion marker BEFORE the install steps: a
+    // recreated venv whose pip steps now fail must NOT inherit the old env's
+    // "ready" (codex finding — the stale marker let a partial env launch).
+    // It is rewritten only after every step below succeeds.
+    const { rmSync: rmMarker } = await import("node:fs");
+    rmMarker(join(dir, ".bootstrap-ok"), { force: true });
+
     if (!existsSync(resolveAiToolkitPython())) {
       r = await stream(basePython(), ["-m", "venv", "venv"], dir, log);
       if (r.code !== 0) return fail("train_bootstrap", "venv_failed", `venv creation exited ${r.code}`, r.tail);
@@ -134,6 +141,10 @@ export async function bootstrapToolkit(opts: { onLog?: (line: string) => void } 
     if (!status.ready) {
       return fail("train_bootstrap", "verify_failed", "bootstrap finished but run.py/venv python are still missing");
     }
+    // Completion marker: every pip step exited 0 to get here. nativeToolkitReady
+    // requires it (or a torch presence check for pre-marker envs) so a checkout
+    // whose dependency install FAILED is never selected as "ready" (codex).
+    writeFileSync(join(dir, ".bootstrap-ok"), `${AI_TOOLKIT_REF} ${new Date().toISOString()}\n`);
     return ok("train_bootstrap", status);
   } catch (err) {
     return fail("train_bootstrap", "error", err instanceof Error ? err.message : String(err));

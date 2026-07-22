@@ -31,7 +31,10 @@ import { homedir } from "node:os";
 import { basename, dirname, extname, join, resolve, sep } from "node:path";
 import {
   containerRunning,
+  nativeProcessRunning,
+  startNativeTraining,
   startTraining,
+  stopNativeByConfig,
   stopTraining,
   type TrainingHandle,
   type TrainingProgress,
@@ -133,6 +136,8 @@ export interface TrainingJob {
 /** Injectable seams so tests can run without docker / a ComfyUI install. */
 export interface TrainingJobDeps {
   startTraining?: typeof startTraining;
+  /** Native (dockerless) local start seam — used when StartJobInput.native. */
+  startNativeTraining?: typeof startNativeTraining;
   stopTraining?: typeof defaultTrainingStop;
   /** Container liveness probe (false = definitively gone, null = unknown).
    *  The optional 2nd arg scopes pod probes to a job's config path (see
@@ -851,25 +856,38 @@ export async function listJobs(deps: TrainingJobDeps = {}): Promise<TrainingJob[
 /** The default container liveness probe, pod-aware: `pod|…` names go over ssh.
  *  The probe MUST be scoped to the job's own config path (same as the stop),
  *  or an unrelated `run.py` alive on the pod makes this job's cancel falsely
- *  report still-running (codex finding). */
+ *  report still-running (codex finding). `native-…` (dockerless local) jobs
+ *  probe their local `run.py <config>` process the same way — WITHOUT a
+ *  definitive false the dead-owner recovery can never fire and orphaned
+ *  native runs would sit "running" forever (#275). No config path → null. */
 export function defaultContainerProbe(name: string, remoteConfigPath?: string): Promise<boolean | null> {
-  return name.startsWith("pod|") ? sshProcessRunning(name, remoteConfigPath) : containerRunning(name);
+  if (name.startsWith("pod|")) return sshProcessRunning(name, remoteConfigPath);
+  if (name.startsWith("native-")) return remoteConfigPath ? nativeProcessRunning(remoteConfigPath) : Promise.resolve(null);
+  return containerRunning(name);
 }
 
 /** The remote config path a pod job's kill AND liveness probe must both scope
  *  to (undefined for docker jobs, which ignore it). Keeps the probe and the
  *  stop pointed at the SAME `run.py <config>` so a cancel can't be fooled by an
- *  unrelated run.py on the pod. */
+ *  unrelated run.py on the pod. Native jobs scope to their LOCAL config.yml. */
 function jobProbeConfigPath(job: TrainingJob): string | undefined {
-  return job.containerName?.startsWith("pod|") ? podJobPaths(job.id, job.name).configPath : undefined;
+  if (job.containerName?.startsWith("pod|")) return podJobPaths(job.id, job.name).configPath;
+  if (job.containerName?.startsWith("native-")) return join(job.jobDir, "config.yml");
+  return undefined;
 }
 
 /** The default stop, pod-aware. Pod stops are SCOPED to the job's own config
  *  path (pkill 'run.py <config>'): an unscoped pattern kills EVERY ai-toolkit
  *  run.py on the pod — including runs from other registries/processes (codex
- *  finding). */
+ *  finding). Native (dockerless local) jobs stop by their LOCAL config path. */
 export function defaultTrainingStop(name: string, remoteConfigPath?: string): ReturnType<typeof stopTraining> {
-  return name.startsWith("pod|") ? stopSshTraining(name, remoteConfigPath) : stopTraining(name);
+  if (name.startsWith("pod|")) return stopSshTraining(name, remoteConfigPath);
+  if (name.startsWith("native-")) {
+    return remoteConfigPath
+      ? stopNativeByConfig(remoteConfigPath)
+      : Promise.resolve({ ok: false as const, command: "train_cancel", error: { code: "no_config", message: `native job stop needs the job's config path (got none for ${name})` } });
+  }
+  return stopTraining(name);
 }
 
 /** Any job currently running/queued — FILE SCAN ONLY, no liveness probes (ssh
@@ -1084,6 +1102,10 @@ export interface StartJobInput {
   /** Override for the base model path as the trainer sees it (e.g. a pod-local
    *  HF snapshot dir) — bypasses downloading the default HF repo id. */
   modelPath?: string;
+  /** Local only: run the NATIVE (dockerless) trainer instead of the docker
+   *  image — the tool layer sets this when docker is unavailable but the
+   *  native bootstrap is ready (issue #275). Config uses real host paths. */
+  native?: boolean;
 }
 
 function countDatasetImages(datasetPath: string): number {
@@ -1476,16 +1498,18 @@ export async function startTrainingJob(input: StartJobInput, deps: TrainingJobDe
   mkdirSync(outputDir, { recursive: true });
 
   const isPod = target === "pod";
+  const isNative = !isPod && input.native === true;
   // Config paths: docker sees CONTAINER mount points; a pod-native run sees
   // REAL pod paths (no mount rewrite) — built from the SANITIZED job name
-  // (raw input could traverse or break the pod fs layout; codex finding).
+  // (raw input could traverse or break the pod fs layout; codex finding). A
+  // LOCAL native run (dockerless) sees REAL host paths the same way (#275).
   const podPaths = isPod ? podJobPaths(id, sanitizeJobName(input.name)) : null;
   const built = buildTrainingConfig({
     name: input.name,
     flow: input.flow,
     model: input.model,
-    datasetPath: isPod ? podPaths!.datasetDir : CONTAINER_DATASET,
-    outputDir: isPod ? podPaths!.outputDir : CONTAINER_OUTPUT,
+    datasetPath: isPod ? podPaths!.datasetDir : isNative ? datasetPath : CONTAINER_DATASET,
+    outputDir: isPod ? podPaths!.outputDir : isNative ? outputDir : CONTAINER_OUTPUT,
     trigger: input.trigger,
     device: input.device,
     params: input.params,
@@ -1502,7 +1526,7 @@ export async function startTrainingJob(input: StartJobInput, deps: TrainingJobDe
     trigger: input.trigger,
     status: "queued",
     progress: { samples: [] },
-    containerName: isPod ? encodePodContainerName(input.podEndpoint!) : `comfyui-train-${id}`,
+    containerName: isPod ? encodePodContainerName(input.podEndpoint!) : isNative ? `native-${id}` : `comfyui-train-${id}`,
     target,
     deliverTo: input.deliverTo ?? "both",
     podId: input.podId,
@@ -1625,6 +1649,19 @@ export async function startTrainingJob(input: StartJobInput, deps: TrainingJobDe
       });
       if ("error" in h) throw new Error(h.error);
       handle = h;
+    } else if (isNative) {
+      // Dockerless local run: the venv's python executes run.py directly with
+      // REAL host paths (the config above points at them). Issue #275.
+      handle = (deps.startNativeTraining ?? startNativeTraining)({
+        containerName: job.containerName!,
+        configPath,
+        datasetPath,
+        outputDir,
+        hfCacheDir: hfCacheRoot(),
+        hfToken: process.env.HF_TOKEN?.trim() || undefined,
+        onProgress,
+        onLog,
+      });
     } else {
       handle = start({
         containerName: job.containerName!,

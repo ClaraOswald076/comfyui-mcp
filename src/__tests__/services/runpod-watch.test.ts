@@ -235,3 +235,17 @@ describe("runpod-watch — idle auto-stop", () => {
     expect(frames.at(-1)?.autostop_in_seconds).toBeNull();
   });
 });
+
+it("passes the watched pod's id to comfyuiIdle (per-pod idle veto, #274)", async () => {
+  getPodMock.mockResolvedValue(runningPod());
+  const seen: string[] = [];
+  const w = createRunpodWatcher({
+    push: () => {},
+    comfyuiIdle: (podId: string) => { seen.push(podId); return false; },
+    renderingOnPod: () => true,
+    idleStopMinutes: 15,
+  });
+  w.watch("podXYZ");
+  await w.poll();
+  expect(seen).toContain("podXYZ");
+});

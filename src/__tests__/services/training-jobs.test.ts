@@ -1647,3 +1647,74 @@ describe("pod target (P4)", () => {
     await new Promise((r) => setTimeout(r, 30));
   });
 });
+
+describe("native local start (#275)", () => {
+  function stageDataset() {
+    const dataset = join(mod.datasetsRoot(), "dataset");
+    mkdirSync(dataset, { recursive: true });
+    makeImage(dataset, "img_00001.png");
+    return dataset;
+  }
+
+  it("native local start — real host paths in config, native-* name, native driver used", async () => {
+    const d = deferred<{ code: number; tail: string }>();
+    const nativeStart = vi.fn(() => fakeHandle(d));
+    const dataset = stageDataset();
+    const job = await mod.startTrainingJob(
+      { name: "nat_lora", flow: "character", model: "flux1-dev", datasetPath: dataset, native: true },
+      { startNativeTraining: nativeStart as never, lorasDir: () => join(root, "loras"), catalog: fakeCatalog() } as never,
+    );
+    expect(job.containerName).toBe(`native-${job.id}`);
+    expect(nativeStart).toHaveBeenCalledTimes(1);
+    const { parse } = await import("yaml");
+    const cfg = parse(readFileSync(join(job.jobDir, "config.yml"), "utf-8")) as {
+      config: { process: Array<{ datasets: Array<{ folder_path: string }>; training_folder: string }> };
+    };
+    expect(cfg.config.process[0].datasets[0].folder_path).toBe(dataset);
+    expect(cfg.config.process[0].training_folder).toBe(join(job.jobDir, "output"));
+    d.resolve({ code: 1, tail: "cleanup" });
+    await new Promise((r) => setTimeout(r, 30));
+  });
+
+  it("cancel routes a native job's stop to its LOCAL config path", async () => {
+    const d = deferred<{ code: number; tail: string }>();
+    const stopCalls: unknown[][] = [];
+    const deps = {
+      startNativeTraining: () => fakeHandle(d),
+      stopTraining: async (...a: unknown[]) => { stopCalls.push(a); return { ok: true, command: "train_cancel" }; },
+      containerRunning: async () => true,
+      lorasDir: () => join(root, "loras"),
+      catalog: fakeCatalog(),
+    };
+    const job = await mod.startTrainingJob(
+      { name: "nat_cancel", flow: "character", model: "flux1-dev", datasetPath: stageDataset(), native: true },
+      deps as never,
+    );
+    await mod.cancelJob(job.id, deps as never);
+    expect(stopCalls[0]?.[0]).toBe(`native-${job.id}`);
+    expect(stopCalls[0]?.[1]).toBe(join(job.jobDir, "config.yml"));
+    d.resolve({ code: 1, tail: "cleanup" });
+    await new Promise((r) => setTimeout(r, 30));
+  });
+
+  it("an orphaned native job terminalizes via the config-scoped probe (dead owner + no live run.py)", async () => {
+    const id = "tnat1";
+    const jobDir = join(mod.jobsRoot(), id);
+    mkdirSync(join(jobDir, "output"), { recursive: true });
+    writeFileSync(join(jobDir, "config.yml"), "job: extension\n");
+    writeFileSync(join(mod.jobsRoot(), `${id}.json`), JSON.stringify({
+      id, name: "nat_orphan", status: "running", target: "local",
+      containerName: `native-${id}`, ownerPid: 999999,
+      datasetPath: mod.datasetsRoot(), jobDir, outputDir: join(jobDir, "output"),
+      lorasDir: join(root, "loras"),
+      createdAt: "2026-01-01T00:00:00.000Z", updatedAt: new Date(Date.now() - 3600_000).toISOString(),
+      progress: { samples: [] }, log: [],
+    }));
+    // No containerRunning dep → the REAL nativeProcessRunning probe runs.
+    const n = await mod.reconcileStaleTrainingJobs({ lockBudgetMs: 300 } as never);
+    expect(n).toBe(1);
+    const after = JSON.parse(readFileSync(join(mod.jobsRoot(), `${id}.json`), "utf-8")) as { status: string; error?: string };
+    expect(after.status).toBe("failed");
+    expect(after.error).toMatch(/no longer running|container/i);
+  });
+});

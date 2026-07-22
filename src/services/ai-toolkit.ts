@@ -8,8 +8,9 @@
 // normalized into a small envelope so callers/tools get a uniform shape.
 
 import childProcess from "node:child_process";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { logger } from "../utils/logger.js";
 
 /** Uniform result shape for trainer operations (mirrors the comfy-cli envelope). */
@@ -228,11 +229,69 @@ export function resolveAiToolkitPython(): string {
     : join(dir, "venv", "bin", "python");
 }
 
-/** Is a native training environment present (checkout + venv python)? */
+/** Is a native training environment present AND complete? run.py + venv python
+ *  alone are NOT enough: a bootstrap whose pip steps died midway still has both
+ *  (codex finding — an incomplete env was selected, then failed asynchronously
+ *  on missing imports). A completed bootstrap writes `.bootstrap-ok` — trusted
+ *  ONLY for the bundled venv it was created against. Anything else (pre-marker
+ *  envs, a COMFYUI_MCP_AI_TOOLKIT_PYTHON override) must show the full critical
+ *  package set in the CONFIGURED interpreter's site-packages (codex findings:
+ *  torch alone let a torch-but-no-requirements env through; the venv-only
+ *  probe broke the override both ways). */
 export async function nativeToolkitReady(): Promise<boolean> {
   try {
-    const { existsSync } = await import("node:fs");
-    return existsSync(join(resolveAiToolkitDir(), "run.py")) && existsSync(resolveAiToolkitPython());
+    const dir = resolveAiToolkitDir();
+    const python = resolveAiToolkitPython();
+    if (!existsSync(join(dir, "run.py")) || !existsSync(python)) return false;
+    const bundled = process.platform === "win32" ? join(dir, "venv", "Scripts", "python.exe") : join(dir, "venv", "bin", "python");
+    // Marker trusted ONLY when it was written for the CURRENT pinned ref — an
+    // install that survives an app upgrade (new AI_TOOLKIT_REF) must re-verify
+    // via the package probe below instead of inheriting "ready" (codex).
+    if (python === bundled && existsSync(join(dir, ".bootstrap-ok"))) {
+      try {
+        const marker = readFileSync(join(dir, ".bootstrap-ok"), "utf-8").trim().split(/\s+/)[0];
+        if (marker === AI_TOOLKIT_REF) return true;
+      } catch { /* unreadable marker → fall through to the probe */ }
+    }
+    return pythonEnvComplete(python) && checkoutMatchesRef(dir);
+  } catch {
+    return false;
+  }
+}
+
+/** Is the ai-toolkit checkout on the pinned ref? Unverifiable WITHOUT .git
+ *  (a plain copy) → trust the package probe; a git checkout on the WRONG ref
+ *  (stale after an app upgrade changed AI_TOOLKIT_REF) → not ready, so
+ *  train_bootstrap re-pins it (codex finding: package-only probing selected
+ *  the stale checkout). */
+function checkoutMatchesRef(dir: string): boolean {
+  if (!existsSync(join(dir, ".git"))) return true;
+  try {
+    const head = childProcess.execFileSync("git", ["-C", dir, "rev-parse", "HEAD"], { encoding: "utf-8", timeout: 5_000 }).trim();
+    return head === AI_TOOLKIT_REF;
+  } catch {
+    return false;
+  }
+}
+
+/** The critical packages a native FLUX LoRA run imports — a pip step that died
+ *  midway through ANY of torch / requirements / hf_transfer leaves at least one
+ *  missing, so the set can't false-positive on an incomplete env. */
+const REQUIRED_NATIVE_PACKAGES = ["torch", "diffusers", "transformers", "accelerate", "hf_transfer"];
+
+/** Every REQUIRED_NATIVE_PACKAGES module resolvable by the CONFIGURED
+ *  interpreter itself, via importlib find_spec (no module execution — ~200ms).
+ *  Path-derived probes can't model sys.path for system pythons, pyenv shims,
+ *  dist-packages or user-site layouts (codex finding). An interpreter that
+ *  can't answer is not a usable trainer → false. */
+function pythonEnvComplete(python: string): boolean {
+  try {
+    childProcess.execFileSync(
+      python,
+      ["-c", `import importlib.util as u, sys; sys.exit(0 if all(u.find_spec(m) for m in ${JSON.stringify(REQUIRED_NATIVE_PACKAGES)}) else 1)`],
+      { timeout: 20_000, stdio: "ignore", windowsHide: true },
+    );
+    return true;
   } catch {
     return false;
   }
@@ -281,6 +340,115 @@ export async function stopNativeTraining(child: childProcess.ChildProcess): Prom
     return ok("train_cancel", { stopped: String(child.pid ?? "unknown") });
   } catch (err) {
     return fail("train_cancel", "stop_failed", `could not stop native training (pid ${child.pid}): ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/** Escape a literal string for use inside a POSIX ERE (pgrep/pkill -f): config
+ *  paths can contain regex metacharacters ([ ( . + …) from COMFYUI_MCP_TRAINING_DIR,
+ *  which would otherwise make the pattern invalid or mis-match (codex finding). */
+function escapeEre(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Escape a literal string for a PowerShell -like wildcard pattern (`*?[]`). */
+function escapePsLike(s: string): string {
+  return s.replace(/([[\]?*])/g, "`$1");
+}
+
+/** The process-image filter for Windows probes. We deliberately match the
+ *  COMMAND LINE ONLY (no image-name filter): the configured interpreter may be
+ *  python.exe, python3.exe, or a renamed launcher — and a DIFFERENT MCP process
+ *  than the launcher may run this probe, so any name filter risks making a live
+ *  trainer invisible (codex finding: cancelled-on-paper, still-burning-GPU).
+ *  The cmdline match (run.py + the job's unique id dir) is already specific;
+ *  the trade is a full-table CIM scan (~1s). */
+function nativeCmdlinePredicate(jobKey: string): string {
+  // `-ne $PID` excludes the probing PowerShell itself: its own command line
+  // carries this predicate text (which contains "run.py" AND the job key), so
+  // without the exclusion the probe ALWAYS matches itself (codex finding).
+  return `($_.ProcessId -ne $PID) -and $_.CommandLine -like '*run.py*' -and $_.CommandLine -like '*${escapePsLike(jobKey)}*'`;
+}
+
+/** Stop a NATIVE training process WITHOUT a handle, by its config path (the
+ *  cross-process cancel path — e.g. a second MCP process canceling a job whose
+ *  owner died). Matches the run.py cmdline against the config's job-id dir
+ *  (unique per job) so unrelated python/run.py processes survive. The [r]
+ *  bracket keeps the probe's own cmdline from self-matching on posix. */
+export async function stopNativeByConfig(configPath: string): Promise<TrainerEnvelope<{ stopped: string }>> {
+  const jobKey = basename(dirname(configPath));
+  try {
+    if (process.platform === "win32") {
+      const script =
+        `Get-CimInstance Win32_Process | Where-Object { ${nativeCmdlinePredicate(jobKey)} } | ` +
+        `ForEach-Object { & taskkill /PID $_.ProcessId /T /F | Out-Null; Write-Output $_.ProcessId }`;
+      const out = childProcess.execFileSync("powershell.exe", ["-NoProfile", "-Command", script], { timeout: 15_000, windowsHide: true, encoding: "utf-8" });
+      // taskkill is synchronous, but the CIM scan can lag the actual teardown —
+      // confirm exit so an immediate liveness re-probe can't see a zombie
+      // (codex finding: cancel reverted to running, then finalized as failed).
+      await waitNativeGone(configPath, 7_000);
+      return ok("train_cancel", { stopped: out.trim() || jobKey });
+    }
+    // POSIX: signal the trainer's whole PROCESS GROUP, not just cmdline
+    // matches — spawnTrainer detaches (the trainer is its group leader) and
+    // ai-toolkit workers carry different cmdlines, so a cmdline-only pkill
+    // leaves them burning GPU after "cancel" (codex finding).
+    const pg = childProcess.execFileSync("pgrep", ["-f", `[r]un.py ${escapeEre(configPath)}`], { timeout: 10_000, encoding: "utf-8" });
+    const pids = pg.split(/\s+/).filter(Boolean);
+    for (const pid of pids) {
+      try {
+        childProcess.execFileSync("kill", ["-TERM", `-${pid}`], { timeout: 5_000 }); // negative = the process group
+      } catch {
+        try { childProcess.execFileSync("kill", ["-TERM", pid], { timeout: 5_000 }); } catch { /* already gone */ }
+      }
+    }
+    // SIGTERM delivery is not exit: a cancel that reports success while the
+    // trainer is still dying gets probed as "still running" and wrongly
+    // reverts to running (codex finding) — wait for disappearance.
+    if (await waitNativeGone(configPath, 7_000)) {
+      return ok("train_cancel", { stopped: jobKey });
+    }
+    return fail("train_cancel", "still_running", `SIGTERM sent but the trainer for ${jobKey} is still alive after 7s`);  } catch (err) {
+    // pkill exits 1 on no match — that is success for an idempotent cancel.
+    const code = (err as { status?: number })?.status;
+    if (process.platform !== "win32" && code === 1) return ok("train_cancel", { stopped: `${jobKey} (already gone)` });
+    return fail("train_cancel", "stop_failed", `could not stop native training for ${jobKey}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/** Poll until no native run.py for this config remains (true) or the budget
+ *  runs out (false). Probe failures count as "gone" — matching the unknown-is-
+ *  not-running semantics of the liveness probe's callers. */
+async function waitNativeGone(configPath: string, budgetMs: number): Promise<boolean> {
+  const start = Date.now();
+  for (;;) {
+    const alive = await nativeProcessRunning(configPath);
+    if (alive !== true) return true;
+    if (Date.now() - start > budgetMs) return false;
+    await new Promise((r) => setTimeout(r, 400));
+  }
+}
+
+/** Is a NATIVE training process for this config path still alive? Config-scoped
+ *  like stopNativeByConfig (the job-id dir is the match key). Returns false only
+ *  when the process is DEFINITIVELY gone — null on probe failure (unknown).
+ *  Without this the registry's dead-owner recovery can never fire for native
+ *  jobs (it recovers only on a definitive false) and a finished-but-orphaned
+ *  run would sit "running" forever, never handing off its LoRA (codex finding). */
+export async function nativeProcessRunning(configPath: string): Promise<boolean | null> {
+  const jobKey = basename(dirname(configPath));
+  try {
+    if (process.platform === "win32") {
+      const script =
+        `@(Get-CimInstance Win32_Process | Where-Object { ${nativeCmdlinePredicate(jobKey)} }).Count`;
+      const out = childProcess.execFileSync("powershell.exe", ["-NoProfile", "-Command", script], { timeout: 15_000, windowsHide: true, encoding: "utf-8" });
+      return Number(out.trim()) > 0;
+    }
+    childProcess.execFileSync("pgrep", ["-f", `[r]un.py ${escapeEre(configPath)}`], { timeout: 10_000, stdio: "ignore" });
+    return true;
+  } catch (err) {
+    const code = (err as { status?: number })?.status;
+    if (process.platform !== "win32" && code === 1) return false; // pgrep: no match
+    return null; // probe itself failed — unknown
   }
 }
 

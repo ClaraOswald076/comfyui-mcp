@@ -148,6 +148,7 @@ export function registerTrainTools(server: McpServer): void {
       try {
         let podEndpoint: import("../services/runpod-ssh.js").PodSshEndpoint | undefined;
         let podId: string | undefined;
+        let nativeLocal = false;
         if (args.target === "pod") {
           const pod = await resolvePodForTraining(args.pod_id);
           if (typeof pod === "string") return textEnvelope({ ok: false, error: { code: "no_pod", message: pod } });
@@ -159,11 +160,32 @@ export function registerTrainTools(server: McpServer): void {
           podEndpoint = ep;
           podId = pod.id;
         } else {
-          if (!(await dockerAvailable())) {
-            return textEnvelope({ ok: false, error: { code: "no_docker", message: "Docker daemon not reachable — start Docker Desktop / the docker engine, then re-run. See train_doctor." } });
-          }
-          if (!(await trainerImageExists())) {
-            return textEnvelope({ ok: false, error: { code: "no_image", message: `Trainer image ${TRAINER_IMAGE} not built yet — run train_build_image once (several minutes), then re-run train_start.` } });
+          // Local: docker preferred; the NATIVE (dockerless) trainer is the
+          // fallback when docker/image is missing but train_bootstrap already
+          // prepared the local venv (issue #275 — native bootstrap used to be
+          // a dead end: ready, but train_start still demanded docker).
+          const dockerOk = (await dockerAvailable()) && (await trainerImageExists());
+          if (!dockerOk) {
+            const { nativeToolkitReady } = await import("../services/ai-toolkit.js");
+            if (await nativeToolkitReady()) {
+              // model_path was documented as the CONTAINER-visible path — under
+              // the native fallback it must be a HOST-absolute, EXISTING path;
+              // a container-style value (/root/.cache/…) would silently not
+              // exist for the host process (codex).
+              if (args.model_path) {
+                const isWin = process.platform === "win32";
+                const hostAbsolute = isWin ? /^[a-zA-Z]:[\\/]|^[\\/]{2}/.test(args.model_path) : args.model_path.startsWith("/");
+                const { existsSync } = await import("node:fs");
+                if (!hostAbsolute || !existsSync(args.model_path)) {
+                  return textEnvelope({ ok: false, error: { code: "model_path_native", message: `model_path "${args.model_path}" ${hostAbsolute ? "does not exist on this machine" : "isn't a HOST-absolute path"} — the native (dockerless) fallback runs locally, so supply an existing absolute host path${isWin ? " (e.g. C:/...)" : ""} or omit it to use the default HF repo.` } });
+                }
+              }
+              nativeLocal = true;
+            } else if (!(await dockerAvailable())) {
+              return textEnvelope({ ok: false, error: { code: "no_docker", message: "No docker daemon AND no native trainer — either start docker + run train_build_image, or run train_bootstrap (target local) for the dockerless trainer. See train_doctor." } });
+            } else {
+              return textEnvelope({ ok: false, error: { code: "no_image", message: `Trainer image ${TRAINER_IMAGE} not built and no native trainer ready — run train_build_image (docker) or train_bootstrap (native, target local), then re-run train_start.` } });
+            }
           }
         }
         const job = await startTrainingJob({
@@ -177,6 +199,7 @@ export function registerTrainTools(server: McpServer): void {
           target: args.target,
           podEndpoint,
           podId,
+          native: nativeLocal,
           deliverTo: args.deliverTo,
           modelPath: args.model_path,
         });
