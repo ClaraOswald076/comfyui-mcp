@@ -100,7 +100,11 @@ gated by a per-session random token — so it just works everywhere with no prom
 
 <Note>
 If the pod sits behind auth, set `COMFYUI_AUTH_TOKEN` (plus optional
-`COMFYUI_AUTH_HEADER` / `COMFYUI_AUTH_SCHEME`) on the local `connect` command.
+`COMFYUI_AUTH_HEADER` / `COMFYUI_AUTH_SCHEME`) on the local `connect` command. For a
+pod fronted by **Cloudflare Access**, create an Access **service token** and set
+`CF_ACCESS_CLIENT_ID` + `CF_ACCESS_CLIENT_SECRET` — both ride every ComfyUI request
+(HTTP + the queue-watcher WebSocket), so the connector passes the gate while the
+human sign-in page stays up for browsers.
 </Note>
 
 ### Keep everything on your machine (no Cloudflare)

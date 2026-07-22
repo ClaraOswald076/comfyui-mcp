@@ -30,6 +30,8 @@
 
 import WebSocket from "ws";
 import { logger } from "../utils/logger.js";
+import { getComfyUIAuthHeaders } from "../config.js";
+import { comfyuiFetch } from "../comfyui/fetch.js";
 
 interface MonitorState {
   connected: boolean;
@@ -229,7 +231,14 @@ class QueueMonitorImpl {
     if (this.stopped) return;
     let ws: WebSocket;
     try {
-      ws = new WebSocket(this.wsUrl());
+      // Ride the same auth as HTTP (COMFYUI_AUTH_* + Cloudflare Access service
+      // token) on the WS handshake, so the watchdog reaches a ComfyUI behind a
+      // proxy / CF Access. undefined when unauth'd → identical to `new WebSocket(url)`.
+      const authHeaders = getComfyUIAuthHeaders();
+      ws = new WebSocket(
+        this.wsUrl(),
+        Object.keys(authHeaders).length ? { headers: authHeaders } : undefined,
+      );
     } catch (err) {
       logger.debug(`[queue-monitor] WS construct failed: ${err instanceof Error ? err.message : String(err)}`);
       this.scheduleReconnect();
@@ -445,7 +454,7 @@ class QueueMonitorImpl {
     const timer = setTimeout(() => ctrl.abort(), 2500);
     (timer as { unref?: () => void }).unref?.();
     try {
-      const res = await fetch(`${this.url.replace(/\/+$/, "")}${path}`, { signal: ctrl.signal });
+      const res = await comfyuiFetch(`${this.url.replace(/\/+$/, "")}${path}`, { signal: ctrl.signal });
       if (!res.ok) return null;
       return (await res.json()) as unknown;
     } catch {

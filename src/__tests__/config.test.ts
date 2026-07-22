@@ -135,6 +135,8 @@ describe("remote self-hosted: path prefix + generic auth (#52)", () => {
     process.env.COMFYUI_AUTH_HEADER = "";
     process.env.COMFYUI_AUTH_SCHEME = "";
     process.env.COMFYUI_AUTH_TOKEN = "";
+    process.env.CF_ACCESS_CLIENT_ID = "";
+    process.env.CF_ACCESS_CLIENT_SECRET = "";
   });
 
   afterEach(() => {
@@ -181,6 +183,34 @@ describe("remote self-hosted: path prefix + generic auth (#52)", () => {
     process.env.COMFYUI_AUTH_TOKEN = "abc123";
     const mod = await import("../config.js");
     expect(mod.getComfyUIAuthHeaders()).toEqual({ Authorization: "Token abc123" });
+  });
+
+  it("Cloudflare Access service token → both CF-Access headers (no COMFYUI_AUTH_TOKEN needed)", async () => {
+    process.env.CF_ACCESS_CLIENT_ID = "cid.access";
+    process.env.CF_ACCESS_CLIENT_SECRET = "csecret";
+    const mod = await import("../config.js");
+    expect(mod.getComfyUIAuthHeaders()).toEqual({
+      "CF-Access-Client-Id": "cid.access",
+      "CF-Access-Client-Secret": "csecret",
+    });
+  });
+
+  it("CF Access + COMFYUI_AUTH_TOKEN → both auth schemes coexist", async () => {
+    process.env.COMFYUI_AUTH_TOKEN = "abc123";
+    process.env.CF_ACCESS_CLIENT_ID = "cid.access";
+    process.env.CF_ACCESS_CLIENT_SECRET = "csecret";
+    const mod = await import("../config.js");
+    expect(mod.getComfyUIAuthHeaders()).toEqual({
+      Authorization: "Bearer abc123",
+      "CF-Access-Client-Id": "cid.access",
+      "CF-Access-Client-Secret": "csecret",
+    });
+  });
+
+  it("half-configured CF Access (id only, no secret) → no CF headers", async () => {
+    process.env.CF_ACCESS_CLIENT_ID = "cid.access";
+    const mod = await import("../config.js");
+    expect(mod.getComfyUIAuthHeaders()).toEqual({});
   });
 
   it("generic auth does NOT enable Comfy Cloud mode", async () => {
