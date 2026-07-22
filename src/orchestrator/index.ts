@@ -1898,6 +1898,20 @@ export async function runPanelOrchestrator(): Promise<void> {
   // ComfyUI the user actually has open — local OR a RunPod proxy — with no
   // `connect <url>`. Loopback → LOCAL mode (keep COMFYUI_PATH); non-loopback →
   // REMOTE mode (drop the path). No-op if unchanged. Returns true if it retargeted.
+  // Same-URL canonicalization, DEFAULT-PORT-INSENSITIVE but SCHEME-AWARE:
+  // strip only the scheme's actual default (:443 for https, :80 for http) —
+  // http://h:443 and http://h are NOT the same endpoint (codex finding).
+  // Shared by applyComfyuiUrl's dedupe and the control-channel ack check
+  // (runpodProxyUrl omits :443 while getComfyUIBaseUrl includes it — codex).
+  const canonTargetUrl = (u: string): string => {
+    try {
+      const p = new URL(u);
+      if ((p.protocol === "https:" && p.port === "443") || (p.protocol === "http:" && p.port === "80")) p.port = "";
+      return p.toString().replace(/\/+$/, "");
+    } catch {
+      return u.replace(/\/+$/, "");
+    }
+  };
   const applyComfyuiUrl = (rawUrl: unknown): boolean => {
     if (typeof rawUrl !== "string") return false;
     const next = rawUrl.trim().replace(/\/+$/, "");
@@ -1910,19 +1924,7 @@ export async function runPanelOrchestrator(): Promise<void> {
     } catch {
       return false; // not a valid URL — ignore (keep current target)
     }
-    // Same-URL check is DEFAULT-PORT-INSENSITIVE but SCHEME-AWARE: strip only
-    // the scheme's actual default (:443 for https, :80 for http) — http://h:443
-    // and http://h are NOT the same endpoint (codex finding).
-    const canon = (u: string): string => {
-      try {
-        const p = new URL(u);
-        if ((p.protocol === "https:" && p.port === "443") || (p.protocol === "http:" && p.port === "80")) p.port = "";
-        return p.toString().replace(/\/+$/, "");
-      } catch {
-        return u.replace(/\/+$/, "");
-      }
-    };
-    if (!host || canon(next) === canon(comfyuiUrl)) return false;
+    if (!host || canonTargetUrl(next) === canonTargetUrl(comfyuiUrl)) return false;
     const prev = comfyuiUrl;
     comfyuiUrl = next;
     comfyuiPath = localPathForTarget(next);
@@ -3469,7 +3471,7 @@ export async function runPanelOrchestrator(): Promise<void> {
         // Generation guard for URL retargets: drop the retarget when a NEWER
         // direct choice moved the target after the child wrote this (codex
         // finding: a queued pod-A request applied after the user picked pod B).
-        const urlGenOk = !req.expectedCurrentUrl || getComfyUIBaseUrl() === req.expectedCurrentUrl;
+        const urlGenOk = !req.expectedCurrentUrl || canonTargetUrl(getComfyUIBaseUrl()) === canonTargetUrl(req.expectedCurrentUrl);
         // Only an APPLIED target/unwatch choice supersedes pending auto-connects
         // (watch-ONLY isn't a choice; a guarded-OUT or generation-STALE request
         // applied nothing and must not drop a booting pod's promise — codex
@@ -3516,7 +3518,7 @@ export async function runPanelOrchestrator(): Promise<void> {
         // Whether a URL retarget landed (generation-guarded): the ack must
         // confirm the AUTHORITATIVE retarget before the child reports success
         // (codex finding: rejected writes still read "connected").
-        const connectApplied = !!req.url && urlGenOk && getComfyUIBaseUrl() === req.url;
+        const connectApplied = !!req.url && urlGenOk && canonTargetUrl(getComfyUIBaseUrl()) === canonTargetUrl(req.url);
         if (req.connectWhenReady && urlGenOk) {
           // The ORCHESTRATOR waits for boot (the tool call returned inside the
           // MCP 60s lifetime): probe every ~10s, retarget+watch on ready, and
