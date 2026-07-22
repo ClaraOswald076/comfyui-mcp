@@ -1,0 +1,234 @@
+---
+title: "Apps (micro-apps)"
+description: "Turn a workflow into a one-click app: a manifest, an exposed run form, and an API prompt snapshot that values are patched into per run. Convert in the panel, run from the panel, the phone, or an agent, and publish to a public registry."
+icon: "layout-grid"
+---
+
+An **app** is a workflow packaged for one-click runs **without a canvas**. It is a
+directory on your rig holding four things:
+
+| File | What it is |
+|---|---|
+| `manifest.json` | name, description, `appMode {inputs, outputs}`, `deps`, `hideWorkflow`, `published` |
+| `prompt.json` | the API-format prompt **snapshot** — values are patched into this per run |
+| `workflow.json` | the litegraph UI graph — **absent** when `hideWorkflow` is set |
+| `thumbnail.png` | optional card art |
+
+Bundles live under ComfyUI's user dir at
+`<user>/comfyui-mcp-panel/apps/<app-id>/` — deliberately **not** the workflows
+dir, so a hidden app never surfaces in the workflow browser.
+
+```
+workflow ⇄ convert (panel) ⇄ app bundle on disk ⇄ run form ⇄ patch snapshot ⇄ ComfyUI queue
+                                    ⇅
+                        publish / install ⇄ public registry
+```
+
+The reason apps exist as their own layer: the canvas is the wrong interface for
+*running* a workflow you already trust. A form with five labelled fields is the
+right one, and it is the only interface a phone or an agent can drive at all.
+
+<Note>
+  There is **one** storage and run implementation — the panel pack's HTTP routes
+  (`/comfyui_mcp_panel/apps/*`). The desktop panel, the mobile Apps tab, and the
+  `apps_*` MCP tools are all clients of it, so an app behaves identically
+  wherever you launch it from.
+</Note>
+
+## Requirements
+
+Apps are served by the **panel pack** (`comfyui-mcp-panel`), not by the MCP
+server alone. If the pack on your ComfyUI predates the feature, `apps_list`
+fails with an explicit *"the panel pack on this ComfyUI predates the Apps
+feature"* message — update the pack and restart ComfyUI.
+
+## Converting a workflow into an app
+
+In the panel, the **Apps** toolbar button (next to Civitai) opens the app grid.
+Converting the open workflow does three things:
+
+1. **Imports ComfyUI APP-mode config** if the workflow already carries one, and
+   otherwise picks inputs and outputs **heuristically** (prompt widgets, seeds,
+   sampler settings; `SaveImage`-class nodes as outputs). Imported APP-mode
+   inputs are honored on **any** node type, so custom-node endpoints survive the
+   conversion.
+2. **Scans dependencies** — the models and custom-node packs the graph needs —
+   into `manifest.deps`.
+3. **Snapshots the prompt** in API format. Widget values at conversion time
+   become each input's form `default`.
+
+Each input in `appMode.inputs` carries `nodeId`, `widget`, `label`, and a `kind`
+of `text`, `number`, `combo`, `toggle`, `image`, or `model`; combos also carry
+`choices`. That is what the run form renders from — on desktop and on mobile.
+
+### Hiding the workflow
+
+`hideWorkflow` drops `workflow.json` from the bundle entirely, so the graph
+isn't handed to whoever runs or installs the app.
+
+<Warning>
+  **`hideWorkflow` is obfuscation, never security.** The API prompt is still
+  visible to anyone who runs the app via ComfyUI's own `/history`, and the
+  models and custom nodes the app installs reveal the graph's dependencies.
+  Treat it as "don't clutter my workflow browser", not as protection for a graph
+  you can't afford to leak.
+</Warning>
+
+## Running an app
+
+A run patches your form values into the stored snapshot and queues the result.
+Patch keys are `"<nodeId>.<widget>"` — for example `{"6.text": "a cat",
+"3.seed": 42}`. The key splits on the **first** dot only, so widget names that
+themselves contain dots (LoRA stacks, `lora_1.model`) stay intact.
+
+Patching is **strict**: a key addressing a node or an input that doesn't exist
+in the snapshot is a hard error, not a silent skip. A miss means the manifest
+has drifted from the snapshot, and failing loudly beats running with stale
+values. Inputs you omit keep their conversion-time defaults.
+
+The run returns a `prompt_id`; poll it for status (`pending` → `running` →
+`done`, or `unknown` if ComfyUI has never heard of it) and for the outputs
+grouped under each output node.
+
+### Running on a RunPod pod
+
+The panel's **Run on RunPod** path reuses the same patch engine in **dry** mode:
+the panel asks for the patched prompt *without* queueing it locally, pushes any
+pinned dependencies to the pod, and enqueues the prompt there instead.
+
+<Warning>
+  Apps with an **image input** refuse to run on a pod. Uploads land on the
+  **local** ComfyUI, which the pod cannot reach — so the panel declines
+  honestly rather than queueing a run that would fail on a missing file.
+</Warning>
+
+## Publish and Explore
+
+The panel's **Explore** tab is a public registry (a Cloudflare Worker backed by
+D1 + R2) with trending / new / most-starred listings and search. Trending is
+7-day `stars * 3 + runs`. Publishing uploads the bundle — manifest, prompt,
+workflow unless hidden, thumbnail — under a sha256-keyed creator identity.
+
+Installing from Explore shows a **dependency-consent dialog** first: an app's
+`deps` are *reported*, never silently installed. Nothing installs a model or a
+custom-node pack on your rig because you tapped a card.
+
+<Note>
+  `pricing_json` and `hosted_only` exist in the manifest schema and are passed
+  through unchanged, but nothing reads them. They reserve space for a
+  design-only monetization phase — there is no paid-app behavior today.
+</Note>
+
+## The `apps_*` MCP tools
+
+Five tools, all thin proxies over the panel's Apps API. They are the
+**canvas-less** surface: what the mobile app and a directly-driven agent use.
+All five are on the orchestrator's `call_tool` whitelist — `list`/`get`/`status`
+are read-only, and `run` carries the same risk posture as `enqueue_workflow`
+(it queues a job the user explicitly tapped).
+
+| Tool | Effect |
+|---|---|
+| `apps_list` | List every app registered on this ComfyUI — each entry is the full manifest plus `has_workflow` / `has_prompt` / `has_thumbnail`. No parameters. Read-only. |
+| `apps_get` | One app's manifest + bundle facts by id. `appMode.inputs` is the run form. Read-only. |
+| `apps_run` | Patch `values` into the snapshot and queue it. Returns `prompt_id`. |
+| `apps_run_status` | Poll one run by `prompt_id`: `status` plus the run's outputs (image/video file refs per output node, text outputs). Read-only. |
+| `apps_import` | Install an app from the public registry onto this ComfyUI. |
+
+### Parameters
+
+| Tool | Parameter | Type | Notes |
+|---|---|---|---|
+| `apps_get` | `app_id` | `string` (uuid), required | from `apps_list` |
+| `apps_run` | `app_id` | `string` (uuid), required | |
+| | `values` | `object`, optional | keys `"<nodeId>.<widget>"`; unknown keys fail loudly |
+| `apps_run_status` | `app_id` | `string` (uuid), required | |
+| | `prompt_id` | `string`, required | must match `^[0-9a-zA-Z-]{1,64}$` |
+| `apps_import` | `registry_url` | `string` (URL), required | must be the default registry or an allowlisted origin |
+| | `app_id` | `string` (uuid), required | the **registry** app's uuid |
+| | `slug` | `string`, optional | recorded in local metadata |
+| | `version` | `integer`, optional | recorded in local metadata |
+
+The `prompt_id` shape constraint is enforced **twice** — at the schema boundary
+and again inside the handler — because the id is interpolated into a URL path. A
+traversal-shaped "prompt id" must never reach the URL builder even if a caller
+bypasses the schema.
+
+For the generated per-tool schema reference, see
+[Apps tools](/tools/apps).
+
+### Importing from the registry
+
+`apps_import` fetches the registry bundle server-side and creates it as a local
+app. The **registry id becomes the local id**, so re-importing an app you
+already have reports an id conflict rather than duplicating it. The thumbnail
+lives at a separate registry endpoint and is fetched and forwarded separately,
+so an installed app keeps its card art.
+
+Dependencies are **not** installed. The tool returns the manifest's `deps` so
+the caller can report them and let the user install them deliberately.
+
+<Warning>
+  `registry_url` is an allowlist, not a free URL. The fetch happens **on the
+  server**, so an arbitrary URL would be an SSRF primitive — loopback or LAN
+  addresses, or a public URL redirecting into one. Only the default public
+  registry is accepted unless the operator allowlists extra origins via
+  `COMFYUI_MCP_REGISTRY_URLS` (comma-separated, intended for dev/staging).
+  Redirects are refused outright rather than followed.
+</Warning>
+
+## Limits and validation
+
+Things you can actually hit:
+
+| Limit | Value | Where |
+|---|---|---|
+| Bundle / prompt JSON | 16 MB | roomier than a plain graph because a prompt can carry base64 images |
+| Thumbnail | 5 MB | decoded and validated **before** anything is written, so a bad thumbnail can't leave a half-created bundle behind |
+| App name | 120 chars | truncated |
+| Description | 4000 chars | truncated |
+| Combo `choices` | 200 entries | truncated |
+| Registry fetch | 16 MB, 30s | checked on the declared `content-length` **and** the actual bytes |
+
+Validation you'll notice:
+
+- **App ids must be uuids.** Anything else is rejected before a path is built,
+  and the resolved bundle path is re-checked for containment under the apps
+  root.
+- **A prompt must be API format** — numeric node-id keys, each node a
+  `{class_type, inputs}` object. UI-format graphs are rejected.
+- **A UI workflow is required unless `hideWorkflow`** is set.
+- **Creating an app that already exists** is a conflict, not an overwrite.
+- **Partial manifest updates are genuinely partial.** Publishing or hiding an
+  app sends only its own fields and will not wipe your name, description, or
+  `appMode`.
+- **Unknown manifest keys are dropped**, except the reserved pass-through
+  fields, so an older rig ignores fields it doesn't understand instead of
+  failing.
+
+The apps root is overridable with `COMFYUI_MCP_APPS_DIR` (primarily for tests);
+by default it's derived from ComfyUI's own user directory, so it survives
+portable installs.
+
+## On the phone
+
+The mobile app ships a real **Apps** tab — not a preview. It has two halves:
+
+- **My Apps** — the apps installed on your rig, listed over the bridge via
+  `apps_list`. Tapping one opens a generated run form, queues it with
+  `apps_run`, and polls `apps_run_status` every 2s (bounded at 30 minutes)
+  until the outputs render.
+- **Explore** — the public registry, hit **directly over HTTPS** from the phone
+  (no bridge hop, so browsing works before you've paired). Installing goes the
+  other direction: the rig fetches the bundle itself via `apps_import`.
+
+This is the clearest thing the phone can do that chat cannot — run a real
+workflow, with real inputs, without a canvas anywhere in sight.
+
+## See also
+
+- [Apps tools](/tools/apps) — the generated per-tool schema reference
+- [Sidebar Panel](/panel) — where apps are converted, published, and explored
+- [Mobile app](/mobile) — the Apps tab in context
+- [RunPod pods](/tools/runpod) — the pod the "Run on RunPod" path targets
+- [Roadmap](/roadmap)
