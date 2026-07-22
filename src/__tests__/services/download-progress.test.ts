@@ -36,6 +36,29 @@ describe("download target stamping (#269)", () => {
   });
 });
 
+describe("readDownloadProgress (target-scoped read, #290)", () => {
+  it("reads back a row written under a remote COMFYUI_URL (target-scoped filename)", () => {
+    // The writer scopes the filename by target; readDownloadProgress must find it
+    // without knowing the target (the old single-file read returned null here).
+    process.env.COMFYUI_URL = "https://podabc-3000.proxy.runpod.net";
+    mod.reportDownloadProgress({ id: "d1", name: "m.safetensors", downloaded: 42, total: 100, bytes_per_sec: 7, status: "downloading" }, true);
+    const p = mod.readDownloadProgress("d1");
+    expect(p).not.toBeNull();
+    expect(p?.id).toBe("d1");
+    expect(p?.downloaded).toBe(42);
+  });
+
+  it("returns the most-recently-updated variant when the same id has several targets", () => {
+    writeFileSync(join(dir, "d2-local.json"), JSON.stringify({ id: "d2", name: "m", downloaded: 10, total: 100, bytes_per_sec: 1, status: "downloading", updated: 1000 }));
+    writeFileSync(join(dir, "d2-pod.json"), JSON.stringify({ id: "d2", name: "m", downloaded: 55, total: 100, bytes_per_sec: 1, status: "downloading", updated: 2000 }));
+    expect(mod.readDownloadProgress("d2")?.downloaded).toBe(55);
+  });
+
+  it("returns null when nothing has been written for the id", () => {
+    expect(mod.readDownloadProgress("nope")).toBeNull();
+  });
+});
+
 describe("control channel (#269 MCP child → orchestrator)", () => {
   it("round-trips a target request as its own file (url + watchPodId)", () => {
     expect(mod.requestTargetChange({ url: "https://podabc-3000.proxy.runpod.net", watchPodId: "podabc" })).toBeTruthy();

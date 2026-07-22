@@ -114,6 +114,38 @@ export function reportDownloadProgress(
   }
 }
 
+/**
+ * Read back one download's latest snapshot, so `download_status` can report
+ * bytes/throughput instead of a bare "still going". Progress files are
+ * TARGET-SCOPED ({id}-{disc}.json — the same URL can download for local AND a
+ * pod at once), so scan every variant for this id and return the most recently
+ * updated snapshot. Returns null when progress reporting is off (no
+ * COMFYUI_MCP_PROGRESS_DIR) or nothing has been written yet — callers must
+ * treat byte counts as decoration, never as the source of truth for whether a
+ * download finished.
+ */
+export function readDownloadProgress(id: string): DownloadProgress | null {
+  if (!PROGRESS_DIR) return null;
+  try {
+    const prefix = `${id.replace(/[^a-zA-Z0-9_.-]/g, "_")}-`;
+    let best: DownloadProgress | null = null;
+    for (const f of readdirSync(PROGRESS_DIR)) {
+      if (!f.startsWith(prefix) || !f.endsWith(".json")) continue;
+      try {
+        const parsed = JSON.parse(readFileSync(join(PROGRESS_DIR, f), "utf8")) as DownloadProgress;
+        if (parsed && typeof parsed === "object" && typeof parsed.updated === "number") {
+          if (!best || parsed.updated > best.updated) best = parsed;
+        }
+      } catch {
+        // skip an absent/mid-write variant
+      }
+    }
+    return best;
+  } catch {
+    return null; // absent or mid-write — not an error
+  }
+}
+
 /** Remove a download's progress file(s) (e.g. on cancel). Target-scoped files
  *  share the id prefix, so clear every variant for the logical download. */
 export function clearDownloadProgress(id: string): void {
