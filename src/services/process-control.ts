@@ -342,8 +342,21 @@ function getRestartPolicy(): RestartPolicy {
   };
 }
 
-async function waitForApiReady(): Promise<StartupReadinessResult> {
-  const { intervalMs, maxTries } = getStartupReadinessConfig();
+/**
+ * Poll `/system_stats` until ComfyUI answers 2xx. This poller is TOLERANT of the
+ * down window: a thrown fetch error (ECONNRESET / socket hang up / fetch failed)
+ * and any non-2xx (including a 502/503/504 from a proxy/tunnel in front of a
+ * killed origin) are all swallowed and treated as "not ready yet — keep polling".
+ * That property is what lets the same routine cover both a locally-spawned start
+ * and a remote ComfyUI-Manager reboot (where ComfyUI briefly disappears).
+ *
+ * `cfg` overrides the interval/try budget — the local start uses the short
+ * env-tuned default; the remote reboot passes a longer budget.
+ */
+async function waitForApiReady(
+  cfg?: { intervalMs: number; maxTries: number },
+): Promise<StartupReadinessResult> {
+  const { intervalMs, maxTries } = cfg ?? getStartupReadinessConfig();
   const probeUrl = `${getComfyUIBaseUrl()}/system_stats`;
   const start = Date.now();
   let attempts = 0;
@@ -760,12 +773,197 @@ export async function startComfyUI(): Promise<StartResult> {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Remote restart — reboot a remote/tunnelled ComfyUI through ComfyUI-Manager.
+//
+// A locally-spawned ComfyUI is restarted by killing + relaunching the process.
+// A REMOTE ComfyUI (reached via --comfyui-url, e.g. a Cloudflare-tunnelled
+// ComfyUI Desktop app) can't be process-controlled from here — but ComfyUI
+// Desktop self-supervises, so a ComfyUI-Manager HTTP reboot DOES bring it back.
+// We fire that reboot and poll readiness instead of throwing.
+// ---------------------------------------------------------------------------
+
+interface RebootResult {
+  rebooting: boolean;
+  endpoint?: string;
+  method?: string;
+  reason?: string;
+  note?: string;
+}
+
+// Match the repo's Manager path convention (node-management.ts appends these to
+// getComfyUIBaseUrl() with no `/api` prefix — the panel's `/api/...` form is only
+// because its browser `api.fetchApi` prepends `/api`). Canonical v4 POST route
+// first, then the legacy GET route for older Manager builds.
+const REBOOT_ROUTES: ReadonlyArray<{ path: string; method: "POST" | "GET" }> = [
+  { path: "/v2/manager/reboot", method: "POST" },
+  { path: "/manager/reboot", method: "GET" },
+];
+
+/**
+ * A dropped/aborted connection is the SUCCESS signal for a reboot: the Manager
+ * handler calls exit(0) the instant it accepts the request, so the origin dies
+ * before it can send an HTTP response and `fetch` rejects.
+ */
+function isConnectionDrop(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  // NOTE: ECONNREFUSED is deliberately absent — it means "nothing is listening"
+  // (the origin was ALREADY down before we called), not "we killed it mid-request".
+  // A process reboot we caused surfaces as ECONNRESET / socket-hang-up / terminated.
+  return /ECONNRESET|socket hang up|fetch failed|network|ECONNABORTED|EPIPE|terminated|premature close|other side closed|aborted/i.test(
+    msg,
+  );
+}
+
+/**
+ * Fire a ComfyUI-Manager reboot over HTTP against the connected (remote) base URL.
+ * Classification:
+ *   FIRED   (rebooting:true)  — res.ok (2xx) OR a connection drop OR HTTP 502/503/504.
+ *                               A killed origin behind a proxy/Cloudflare surfaces
+ *                               as a 5xx bad-gateway (NOT a raw socket drop), so we
+ *                               must treat those as "reboot fired" too.
+ *   REFUSED (rebooting:false) — HTTP 403 → Manager security forbids remote reboot.
+ *   NO-ENDPOINT (rebooting:false) — every route gave a non-firing failure (e.g. 404).
+ */
+async function rebootViaManager(): Promise<RebootResult> {
+  const base = getComfyUIBaseUrl();
+  const failures: string[] = [];
+
+  for (const { path, method } of REBOOT_ROUTES) {
+    const url = `${base}${path}`;
+    try {
+      const res = await comfyuiFetch(url, { method });
+      if (res.ok) return { rebooting: true, endpoint: path, method };
+      if (res.status === 403) {
+        return {
+          rebooting: false,
+          reason: "manager-security",
+          note:
+            "Reboot refused (HTTP 403) — ComfyUI-Manager's security level (or an " +
+            "access proxy in front) forbids it; lower the Manager security level or reboot on the host.",
+        };
+      }
+      if (res.status === 502 || res.status === 503 || res.status === 504) {
+        return {
+          rebooting: true,
+          endpoint: path,
+          method,
+          note: `reboot fired — the origin dropped behind a proxy (HTTP ${res.status}) as it went down`,
+        };
+      }
+      // 404 / other non-OK: wrong route for this Manager build — try the next.
+      failures.push(`${method} ${path} → HTTP ${res.status}`);
+    } catch (err) {
+      if (isConnectionDrop(err)) {
+        return {
+          rebooting: true,
+          endpoint: path,
+          method,
+          note: "connection dropped (origin going down) — reboot fired",
+        };
+      }
+      failures.push(
+        `${method} ${path} → ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  return {
+    rebooting: false,
+    reason: "no-endpoint",
+    note: `No reachable ComfyUI-Manager reboot endpoint.${
+      failures.length ? ` Tried: ${failures.join("; ")}` : ""
+    }`,
+  };
+}
+
+interface RemoteRebootTiming {
+  /** Grace pause after firing before we start probing (lets the origin actually go down). */
+  settleMs: number;
+  /** Total readiness budget. */
+  budgetMs: number;
+  /** Interval between readiness probes. */
+  intervalMs: number;
+}
+
+let remoteRebootTimingOverride: RemoteRebootTiming | null = null;
+
+function getRemoteRebootTiming(): RemoteRebootTiming {
+  if (remoteRebootTimingOverride) return remoteRebootTimingOverride;
+  return {
+    settleMs: Math.round(
+      parsePositiveNumberEnv("COMFYUI_REMOTE_REBOOT_SETTLE_S", 3) * 1000,
+    ),
+    budgetMs: Math.round(
+      parsePositiveNumberEnv("COMFYUI_REMOTE_REBOOT_BUDGET_S", 120) * 1000,
+    ),
+    intervalMs: Math.round(
+      parsePositiveNumberEnv("COMFYUI_REMOTE_REBOOT_INTERVAL_S", 2) * 1000,
+    ),
+  };
+}
+
+async function restartRemoteViaManager(): Promise<RestartResult> {
+  logger.info("Restarting remote ComfyUI via ComfyUI-Manager reboot...");
+
+  const reboot = await rebootViaManager();
+  if (!reboot.rebooting) {
+    return {
+      stopped: false,
+      started: false,
+      message: reboot.note ?? "ComfyUI-Manager reboot could not be triggered.",
+    };
+  }
+
+  logger.info("ComfyUI-Manager reboot fired", {
+    endpoint: reboot.endpoint,
+    method: reboot.method,
+    note: reboot.note,
+  });
+
+  const timing = getRemoteRebootTiming();
+  if (timing.settleMs > 0) await sleep(timing.settleMs);
+
+  // Clamp the interval to a sane floor: a 0 (or tiny) env value would make
+  // maxTries unbounded (ceil(budget/0) = Infinity) and hot-loop the poller,
+  // hanging the tool call if the host never returns.
+  const intervalMs = Math.max(250, timing.intervalMs);
+  const maxTries = Math.max(1, Math.ceil(timing.budgetMs / intervalMs));
+  const readiness = await waitForApiReady({ intervalMs, maxTries });
+
+  if (!readiness.ready) {
+    return {
+      stopped: true,
+      started: false,
+      ready: false,
+      readiness,
+      message:
+        `Reboot was triggered but ComfyUI did not come back within ${timing.budgetMs}ms — ` +
+        "check the host (is it the Desktop app / supervised?).",
+    };
+  }
+
+  // Back and ready — refresh the WS client singleton + memoized /object_info,
+  // since a reboot is exactly when the node set may have changed.
+  resetClient();
+  resetObjectInfoCache();
+
+  return {
+    stopped: true,
+    started: true,
+    ready: true,
+    readiness,
+    message:
+      `ComfyUI rebooted via ComfyUI-Manager and came back ready (${readiness.waited_ms}ms) — ` +
+      "remote/supervised restart.",
+  };
+}
+
 export async function restartComfyUI(): Promise<RestartResult> {
   if (isRemoteMode()) {
-    throw new ProcessControlError(
-      "restart_comfyUI operates on the local machine's ComfyUI process and is not " +
-        "available when targeting a remote instance via --comfyui-url.",
-    );
+    // Remote target: can't process-control it, but a Manager HTTP reboot brings
+    // back a self-supervised ComfyUI (e.g. the tunnelled Desktop app).
+    return restartRemoteViaManager();
   }
   logger.info("Restarting ComfyUI...");
 
@@ -813,8 +1011,13 @@ export const __processControlTestHooks = {
     supervisorRestartCount = 0;
     supervisorWindowStartedAt = 0;
     supervisorGaveUp = false;
+    remoteRebootTimingOverride = null;
   },
   setLastProcessInfo(info: ProcessInfo): void {
     lastProcessInfo = info;
+  },
+  /** Inject fast remote-reboot timing so tests don't wait the real ~120s budget. */
+  setRemoteRebootTimingForTests(timing: RemoteRebootTiming | null): void {
+    remoteRebootTimingOverride = timing;
   },
 };

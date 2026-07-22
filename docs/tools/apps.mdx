@@ -1,0 +1,143 @@
+---
+title: "Apps (micro-apps)"
+description: "List, inspect, and run the panel's micro-apps — named, one-click workflow apps with exposed inputs — for canvas-less clients (mobile)."
+icon: "layout-grid"
+---
+
+<Info>5 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
+
+## apps_list
+
+List the micro-apps registered on this ComfyUI (panel Apps feature). Each entry is the app's manifest: id, name, description, appMode &#123;inputs, outputs&#125;, deps, hideWorkflow, published. Use apps_get for one app's full detail and apps_run to execute one. Read-only.
+
+<Note>This tool takes no parameters.</Note>
+
+### Example
+
+<Note>Example coming soon — the call below is a generated skeleton.</Note>
+
+```json
+{
+  "tool": "apps_list",
+  "arguments": {}
+}
+```
+
+---
+
+## apps_get
+
+Get one micro-app's manifest + bundle facts (has_workflow/has_prompt/has_thumbnail) by id. The manifest's appMode.inputs is the app's run form: each input has nodeId, widget, label, kind (text|number|combo|toggle|image|model), optional choices and default. Read-only.
+
+### Parameters
+
+<ParamField path="app_id" type="string" required>
+  The app's uuid (from apps_list).
+</ParamField>
+
+### Example
+
+<Note>Example coming soon — the call below is a generated skeleton.</Note>
+
+```json
+{
+  "tool": "apps_get",
+  "arguments": {
+    "app_id": "<app_id>"
+  }
+}
+```
+
+---
+
+## apps_run
+
+Run a micro-app once: patches `values` (keys '&lt;nodeId&gt;.&lt;widget&gt;', e.g. &#123;"6.text": "a cat"&#125;) into the app's stored prompt snapshot and queues it on ComfyUI. Returns the prompt_id — poll apps_run_status for completion and outputs. Only pass values for inputs listed in the app's appMode.inputs; omitted inputs keep their conversion-time defaults.
+
+### Parameters
+
+<ParamField path="app_id" type="string" required>
+  The app's uuid (from apps_list).
+</ParamField>
+<ParamField path="values" type="object">
+  Input overrides keyed '&lt;nodeId&gt;.&lt;widget&gt;' (e.g. &#123;"6.text": "a cat", "3.seed": 42&#125;). Unknown keys fail loudly (the manifest drifted from the snapshot).
+</ParamField>
+
+### Example
+
+<Note>Example coming soon — the call below is a generated skeleton.</Note>
+
+```json
+{
+  "tool": "apps_run",
+  "arguments": {
+    "app_id": "<app_id>"
+  }
+}
+```
+
+---
+
+## apps_run_status
+
+Check one app run by prompt_id (from apps_run): status (pending|running|done|unknown) plus the run's outputs (image/video file refs under each output node, text outputs). Read-only.
+
+### Parameters
+
+<ParamField path="app_id" type="string" required>
+  The app's uuid.
+</ParamField>
+<ParamField path="prompt_id" type="string" required>
+  The prompt_id returned by apps_run.
+</ParamField>
+
+### Example
+
+<Note>Example coming soon — the call below is a generated skeleton.</Note>
+
+```json
+{
+  "tool": "apps_run_status",
+  "arguments": {
+    "app_id": "<app_id>",
+    "prompt_id": "<prompt_id>"
+  }
+}
+```
+
+---
+
+## apps_import
+
+Install an app from the public registry onto this ComfyUI: fetches the registry bundle (manifest + prompt snapshot [+ workflow unless hidden]) and creates it as a local app via the panel's Apps API. The registry id becomes the local id, so re-importing the same app reports an id conflict (already installed). Deps (models/custom nodes) are NOT installed — report the manifest's deps to the user so they can install them before running.
+
+### Parameters
+
+<ParamField path="registry_url" type="string" required>
+  Registry worker base URL, e.g. https://cmcp-apps-registry.example.workers.dev
+</ParamField>
+<ParamField path="app_id" type="string" required>
+  The registry app's uuid (from the explore list).
+</ParamField>
+<ParamField path="slug" type="string">
+  The app's registry slug (recorded in local metadata).
+</ParamField>
+<ParamField path="version" type="integer">
+  The registry version (recorded in local metadata).
+</ParamField>
+
+### Example
+
+<Note>Example coming soon — the call below is a generated skeleton.</Note>
+
+```json
+{
+  "tool": "apps_import",
+  "arguments": {
+    "registry_url": "<registry_url>",
+    "app_id": "<app_id>"
+  }
+}
+```
+
+---

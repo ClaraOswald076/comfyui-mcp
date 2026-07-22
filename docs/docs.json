@@ -58,6 +58,7 @@
               "concepts",
               "plugin",
               "panel",
+              "apps",
               "mobile",
               "backends",
               "local-llms",
@@ -86,6 +87,7 @@
               "tools/defaults-stats-skills",
               "tools/runpod",
               "tools/training",
+              "tools/apps",
               "tools/comfy-cli",
               "tools/skills-knowledge"
             ]
@@ -99,6 +101,7 @@
             "group": "Blog",
             "pages": [
               "blog/index",
+              "blog/micro-apps",
               "blog/runpod-comfyui",
               "blog/train-lora-runpod",
               "blog/lora-trainer-p1",

@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { setComfyuiTarget, getLocalComfyuiUrl } from "../config.js";
+import { setComfyuiTarget, getLocalComfyuiUrl, getComfyUIBaseUrl } from "../config.js";
 import { resetClient } from "../comfyui/client.js";
 import { errorToToolResult } from "../utils/errors.js";
 import {
@@ -18,13 +18,39 @@ import {
   type RunpodPod,
 } from "../services/runpod-client.js";
 import { getRunpodWatcher } from "../services/runpod-watch.js";
+import { requestTargetChange, awaitTargetApplied, progressEnabled } from "../services/download-progress.js";
 
-/** Retarget comfyui-mcp back to the local ComfyUI (shared by stop + use_local). */
-function retargetLocal(): string {
+/** Retarget comfyui-mcp back to the local ComfyUI (shared by stop + use_local).
+ *  Returns { url, applied } for display (url null when the channel is down).
+ *  applied=false means the orchestrator SKIPPED the guarded switch (another
+ *  tab/pod owns the target now) — the caller must not claim a local switch
+ *  (codex finding). */
+async function retargetLocal(condOnPodId?: string): Promise<{ url: string | null; applied: boolean }> {
+  if (progressEnabled()) {
+    // condOnPodId: the stop-fallback — fall back ONLY if the orchestrator is
+    // really on that pod (a stale child may lag a newer target, codex). The
+    // unwatch is SCOPED to the stopped pod the same way (an unrelated watched
+    // pod must survive — codex finding).
+    const reqFile = requestTargetChange({ local: true, unwatch: true, wantAck: true, expectedCurrentUrl: getComfyUIBaseUrl(), ...(condOnPodId ? { onlyIfTarget: condOnPodId, unwatchPodId: condOnPodId } : {}) });
+    if (!reqFile) return { url: null, applied: false };
+    const ack = await awaitTargetApplied(reqFile);
+    if (ack) {
+      // Align THIS child's config to the AUTHORITATIVE target either way
+      // (codex finding: a guarded skip left the child on a dead pod for the
+      // rest of the turn). `applied` only narrates whether the requested
+      // local switch actually happened.
+      setComfyuiTarget(ack.url);
+      resetClient();
+    }
+    return { url: ack?.url ?? null, applied: ack?.applied ?? false };
+  }
   const url = getLocalComfyuiUrl();
   setComfyuiTarget(url);
   resetClient();
-  return url;
+  // In-process: the direct path did everything (pending clears ride the target
+  // event; failure clears are direct calls). Do NOT also replay a local
+  // request through the channel — same stale-overwrite race (codex finding).
+  return { url, applied: true };
 }
 
 /** Human-friendly uptime. */
@@ -136,17 +162,35 @@ export function registerRunpodTools(server: McpServer): void {
     async (args) => {
       try {
         const w = getRunpodWatcher();
-        const wasConnected = w?.watchedPodId() === args.pod_id;
         const r = await stopPod(args.pod_id);
-        // Stop live-status/idle-watch if this was the watched pod.
-        if (wasConnected) w?.unwatch();
+        // Clear any recorded auto-connect failure for this pod — it's stopped
+        // now, so "still billing" reports must stop too. Both locally (when
+        // the watcher exists) AND through the control channel (spawned-child
+        // case, where it doesn't — codex finding).
+        getRunpodWatcher()?.clearConnectFailed(args.pod_id);
+        requestTargetChange({ stoppedPodId: args.pod_id });
+        // Unwatch ONLY after the stop succeeded — clearing it first would
+        // leave a possibly-still-running pod unwatched and billing when the
+        // API call times out or is rejected (codex finding).
+        if (w?.watchedPodId() === args.pod_id) w?.unwatch();
         // If comfyui-mcp was pointed at THIS pod, its proxy URL is now dead —
         // fall back to the local ComfyUI so rendering keeps working (the swap
-        // half of the local⇄pod flow). Only when we were connected to it.
+        // half of the local⇄pod flow). The ORCHESTRATOR decides whether its
+        // authoritative target matches (onlyIfTarget) — a spawned child's own
+        // base URL can be a turn stale (codex finding: stopping B while the
+        // child lagged on A left the orchestrator on B's dead proxy).
         let localNote = "";
-        if (wasConnected) {
-          const url = retargetLocal();
-          localNote = ` comfyui-mcp switched back to local ComfyUI (${url}).`;
+        if (progressEnabled()) {
+          const r = await retargetLocal(args.pod_id);
+          localNote = r.applied && r.url
+            ? ` comfyui-mcp switched back to local ComfyUI (${r.url}).`
+            : r.applied
+              ? " comfyui-mcp is switching back to the local ComfyUI (the orchestrator resolves the target)."
+              : " the session's active target moved to another pod in the meantime — leaving it there.";
+        } else if (getComfyUIBaseUrl().includes(args.pod_id)) {
+          // In-process: this IS the orchestrator — the local check is current.
+          const r = await retargetLocal(args.pod_id);
+          localNote = r.applied && r.url ? ` comfyui-mcp switched back to local ComfyUI (${r.url}).` : "";
         }
         return { content: [{ type: "text", text: `Stopped pod \`${r.id}\` → **${r.desiredStatus}**. GPU released; disk kept.${localNote} Start it again with runpod_pod_start.` }] };
       } catch (err) {
@@ -163,7 +207,7 @@ export function registerRunpodTools(server: McpServer): void {
       name: z.string().optional().describe("Pod name (default 'comfyui-mcp')."),
       gpu_type: z.string().optional().describe(`GPU type to prefer, e.g. "NVIDIA GeForce RTX 4090". Default tries: ${RUNPOD_DEFAULT_GPU_TYPES.join(", ")}.`),
       cloud_type: z.enum(["COMMUNITY", "SECURE"]).optional().describe("COMMUNITY (cheaper, default) or SECURE."),
-      connect: z.boolean().optional().describe("After it boots, wait and auto-connect comfyui-mcp to it (default false — deploy returns immediately; the pod still needs ~1-3min to boot)."),
+      connect: z.boolean().optional().describe("Auto-connect when booted: the ORCHESTRATOR waits for ComfyUI to answer (1-3min), then retargets + watches — this call returns immediately (default false: deploy only; connect later with runpod_pod_connect)."),
     },
     async (args) => {
       try {
@@ -174,8 +218,109 @@ export function registerRunpodTools(server: McpServer): void {
         });
         const cost = pod.costPerHr != null ? ` at $${pod.costPerHr.toFixed(3)}/hr` : "";
         const gpu = pod.machine?.gpuDisplayName ? ` on ${pod.machine.gpuDisplayName}` : "";
-        // Broadcast its status to the control panels while it boots.
-        getRunpodWatcher()?.watch(pod.id);
+        // Broadcast its status to the control panels while it boots — including
+        // the spawned-child case: a watch-ONLY control request (no retarget yet)
+        // so the orchestrator starts broadcasting immediately, not just after
+        // the readiness wait (codex finding: boot-time + timeout path were
+        // unwatched while the result claimed live status). NEVER displace an
+        // ACTIVE render target's watch for this — the current pod's idle
+        // auto-stop / dead-target cleanup is its billing guard (codex). Track
+        // whether it actually GOT watched so the result doesn't claim otherwise
+        // (codex finding: guarded-out creates still said "status broadcasting").
+        let watchedNow = false;
+        let activeOtherPod: string | null = null;
+        if (getRunpodWatcher()) {
+          const w = getRunpodWatcher()!;
+          const cur = w.watchedPodId();
+          const curIsActiveTarget = !!cur && getComfyUIBaseUrl().includes(cur);
+          if (curIsActiveTarget && cur !== pod.id) activeOtherPod = cur;
+          if (!activeOtherPod) {
+            w.watch(pod.id);
+            watchedNow = true;
+          }
+        }
+        // Queue the orchestrator watch ONLY when this process has no watcher
+        // (spawned child) — in-process the direct watch above already applied
+        // synchronously, and a delayed duplicate could re-watch after a user's
+        // unwatch; the wantAck would also never be consumed (codex finding).
+        const watchReqFile = getRunpodWatcher() ? null : requestTargetChange({ watchPodId: pod.id, wantAck: true });
+        // In the spawned child the watcher is null — confirm the orchestrator
+        // actually accepted the watch (its active-target guard may REFUSE it
+        // to protect the current pod; claiming otherwise would lie — codex).
+        let watchedEffectively = watchedNow;
+        let watchUnknown = false;
+        if (!watchedEffectively && watchReqFile) {
+          const ack = await awaitTargetApplied(watchReqFile, 3_000);
+          if (ack) watchedEffectively = ack.applied;
+          else watchUnknown = true; // NO ack: unconfirmed — never claim watched (codex)
+        }
+        const watchNote = watchedNow
+          ? "Live status is broadcasting to the control panel (idle auto-stop active)."
+          : watchedEffectively
+            ? "Live status broadcasts on the orchestrator's next poll (idle auto-stop active)."
+            : watchUnknown
+              ? `Live status was requested but is UNCONFIRMED (no orchestrator ack yet) — check \`${pod.id}\` with runpod_pod_status in a moment; idle auto-stop may not be armed yet.`
+              : `NOTE: still rendering on the current pod — \`${pod.id}\` is booting UNWATCHED (its idle auto-stop is NOT armed) so the active pod keeps its billing guard; it gets watched when it becomes the target — or watch it yourself with runpod_watch once the current pod is free.`;
+        if (args.connect) {
+          // connect: true actually connects (#269 — it was a documented no-op),
+          // but the WAIT lives in the orchestrator, not here: an MCP tool call
+          // dies at the SDK's 60s default timeout while a pod takes 1-3min to
+          // boot (codex finding). Ask the orchestrator to probe until ready,
+          // then retarget+watch; this call returns immediately. NO channel
+          // (headless MCP server, no progress dir) → say so honestly instead of
+          // promising an auto-connect nothing will perform (codex).
+          const url = runpodProxyUrl(pod.id);
+          const reqFile = requestTargetChange({ watchPodId: pod.id, connectWhenReady: { url, podId: pod.id }, expectedCurrentUrl: getComfyUIBaseUrl(), wantAck: true });
+          if (!reqFile) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text:
+                    `🚀 Deployed pod \`${pod.id}\` (${pod.name || "comfyui-mcp"})${gpu}${cost}. It's booting (~1-3min) — auto-connect AND live status/idle auto-stop are unavailable in this mode (no panel orchestrator), so connect once it's up with runpod_pod_connect \`${pod.id}\`, watch it with runpod_pod_status, and stop it with runpod_pod_stop when done to end billing.\n\n${GPU_CLI_CREDIT}`,
+                },
+              ],
+            };
+          }
+          // Confirm the registration actually landed (a newer target choice
+          // can generation-reject it — codex finding: the tool still promised
+          // auto-connect while no pending entry existed). A MISSING ack (e.g.
+          // the channel dir rotating under a restart) is UNCONFIRMED, not a
+          // promise (codex finding).
+          const regAck = await awaitTargetApplied(reqFile, 4_000);
+          if (!regAck) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text:
+                    `🚀 Deployed pod \`${pod.id}\` (${pod.name || "comfyui-mcp"})${gpu}${cost}. It's booting — auto-connect is UNCONFIRMED (the orchestrator hasn't acked the registration). Check \`${pod.id}\` with runpod_pod_status in a moment, or connect manually with runpod_pod_connect when it's ready. Stop it with runpod_pod_stop when done to end billing.\n\n${GPU_CLI_CREDIT}`,
+                },
+              ],
+            };
+          }
+          if (!regAck.applied) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text:
+                    `🚀 Deployed pod \`${pod.id}\` (${pod.name || "comfyui-mcp"})${gpu}${cost}. It's booting, but auto-connect was SKIPPED — a newer target choice won the race. Connect manually when ready: runpod_pod_connect \`${pod.id}\`. Stop it with runpod_pod_stop when done to end billing.\n\n${GPU_CLI_CREDIT}`,
+                },
+              ],
+            };
+          }
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `🚀 Deployed pod \`${pod.id}\` (${pod.name || "comfyui-mcp"})${gpu}${cost}. It's booting — the orchestrator will AUTO-CONNECT when ComfyUI answers (usually 1-3min; it gives up honestly after 8). ` +
+                  `${watchNote} Stop it with runpod_pod_stop when done to end billing.\n\n${GPU_CLI_CREDIT}`,
+              },
+            ],
+          };
+        }
         return {
           content: [
             {
@@ -184,7 +329,7 @@ export function registerRunpodTools(server: McpServer): void {
                 `🚀 Deployed pod \`${pod.id}\` (${pod.name || "comfyui-mcp"})${gpu}${cost}. ` +
                 `It's booting now — ComfyUI takes ~1-3min to come up (model volume warm-up on first boot). ` +
                 `Watch it with runpod_pod_status, then runpod_pod_connect \`${pod.id}\` once ready. ` +
-                `Live status is broadcasting to the control panel (idle auto-stop active). ` +
+                `${watchNote} ` +
                 `Stop it with runpod_pod_stop when done to end billing.\n\n${GPU_CLI_CREDIT}`,
             },
           ],
@@ -205,13 +350,17 @@ export function registerRunpodTools(server: McpServer): void {
         const w = getRunpodWatcher();
         const was = w?.watchedPodId();
         w?.unwatch();
-        const url = retargetLocal();
+        const r = await retargetLocal();
         return {
           content: [
             {
               type: "text",
               text:
-                `✅ comfyui-mcp now targets the local ComfyUI (${url}). Renders run on this machine.` +
+                (r.applied && r.url
+                  ? `✅ comfyui-mcp now targets the local ComfyUI (${r.url}). Renders run on this machine.`
+                  : r.applied
+                    ? `✅ comfyui-mcp is switching back to the local ComfyUI — the orchestrator resolves its remembered target and un-watches the pod.`
+                    : `⚠️ The local switch was skipped — the active target changed in the meantime (check runpod_status / the host pill).`) +
                 (was ? ` Pod \`${was}\` is still running — stop it with runpod_pod_stop to end billing, or reconnect with runpod_pod_connect.` : ""),
             },
           ],
@@ -313,6 +462,11 @@ export function registerRunpodTools(server: McpServer): void {
         if (!comfyuiPortExposed(pod)) {
           return { content: [{ type: "text", text: `Pod \`${pod.id}\` is RUNNING but doesn't expose ComfyUI on port ${RUNPOD_COMFYUI_PORT} — run runpod_pod_troubleshoot for the fix.` }] };
         }
+        // The generation guard needs the PRE-retarget view (the target I
+        // believe the orchestrator is on NOW) — capturing it after
+        // setComfyuiTarget would stamp the NEW url and the orchestrator would
+        // reject its own legitimate request every time (codex finding).
+        const preRetargetUrl = getComfyUIBaseUrl();
         const url = runpodProxyUrl(pod.id);
         const probeRes = await probe(`${url}/system_stats`);
         if (!probeRes.ok) {
@@ -328,6 +482,32 @@ export function registerRunpodTools(server: McpServer): void {
         const applied = setComfyuiTarget(url);
         if (!applied) return { content: [{ type: "text", text: `Resolved ${url} but could not retarget (unexpected URL parse failure).` }] };
         resetClient();
+        // Cover the spawned-child case ONLY: it asks the orchestrator to
+        // retarget + watch through the control channel (#269). In-process the
+        // direct path already did everything synchronously — replaying the
+        // same URL through the channel up to 700ms later could overwrite a
+        // NEWER choice made meanwhile (codex finding). The generation guard
+        // (expectedCurrentUrl) lets the orchestrator drop it if one happened.
+        if (progressEnabled()) {
+          // Confirm the AUTHORITATIVE retarget before reporting success: the
+          // generation guard may have rejected this (a newer target won), and
+          // only the child's private config changed otherwise (codex finding).
+          const reqFile = requestTargetChange({ url, watchPodId: pod.id, expectedCurrentUrl: preRetargetUrl, wantAck: true });
+          const ack = reqFile ? await awaitTargetApplied(reqFile, 4_000) : null;
+          if (!ack?.applied) {
+            // Rejected by the generation guard (a newer target won) — realign
+            // THIS child to the authoritative target too, or it keeps using
+            // the rejected pod for the rest of the turn (codex finding).
+            if (ack?.url) {
+              setComfyuiTarget(ack.url);
+              resetClient();
+            }
+            return { content: [{ type: "text", text: `⚠️ Pod \`${pod.id}\` is ready at ${url}, but the session did NOT retarget — the orchestrator moved to a newer target in the meantime (or the request didn't land). Retry runpod_pod_connect \`${pod.id}\` if that's wrong.` }] };
+          }
+          // Align this child to the confirmed target (its setComfyuiTarget
+          // above already did, but keep it explicit after the ack).
+          return { content: [{ type: "text", text: `✅ Connected to RunPod pod \`${pod.id}\` — comfyui-mcp now targets ${url}. All comfyui tools this session run against the pod. Live status is now broadcasting to the control panel (with idle auto-stop).` }] };
+        }
         // Start live status broadcasts + idle auto-stop for this pod (control panels).
         getRunpodWatcher()?.watch(pod.id);
         return { content: [{ type: "text", text: `✅ Connected to RunPod pod \`${pod.id}\` — comfyui-mcp now targets ${url}. All comfyui tools this session run against the pod. Live status is now broadcasting to the control panel (with idle auto-stop).` }] };

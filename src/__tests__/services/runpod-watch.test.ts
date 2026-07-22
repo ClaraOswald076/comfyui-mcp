@@ -249,3 +249,56 @@ it("passes the watched pod's id to comfyuiIdle (per-pod idle veto, #274)", async
   await w.poll();
   expect(seen).toContain("podXYZ");
 });
+
+it("fires onPodUnavailable when the watched pod vanishes (#269 dead-target)", async () => {
+  getPodMock.mockResolvedValue(null);
+  const gone: string[] = [];
+  const w = createRunpodWatcher({
+    push: () => {},
+    comfyuiIdle: () => false,
+    renderingOnPod: () => true,
+    idleStopMinutes: 0,
+    onPodUnavailable: (id) => gone.push(id),
+  });
+  w.watch("podGone");
+  await w.poll();
+  expect(gone).toEqual(["podGone"]);
+  expect(w.watchedPodId()).toBeNull();
+});
+
+it("fires onPodUnavailable after a successful auto-stop (#269 dead-target)", async () => {
+  getPodMock.mockResolvedValue(runningPod());
+  stopPodMock.mockResolvedValue({ id: "podIdle", desiredStatus: "EXITED" });
+  const c = clock();
+  const gone: string[] = [];
+  const w = createRunpodWatcher({
+    push: () => {},
+    comfyuiIdle: () => true,
+    renderingOnPod: () => true,
+    idleStopMinutes: 15,
+    now: c.now,
+    onPodUnavailable: (id) => gone.push(id),
+  });
+  w.watch("podIdle");
+  await w.poll(); // idle clock starts
+  c.advance(16 * 60_000);
+  await w.poll(); // auto-stop fires
+  expect(stopPodMock).toHaveBeenCalledWith("podIdle");
+  expect(gone).toEqual(["podIdle"]);
+});
+
+it("fires onPodUnavailable when a watched pod is EXITED externally (retained pod, runtime null)", async () => {
+  getPodMock.mockResolvedValue({ id: "podStop", name: "s", desiredStatus: "EXITED", costPerHr: 0.4, machine: null, runtime: null });
+  const gone: string[] = [];
+  const w = createRunpodWatcher({
+    push: () => {},
+    comfyuiIdle: () => false,
+    renderingOnPod: () => true,
+    idleStopMinutes: 15,
+    onPodUnavailable: (id) => gone.push(id),
+  });
+  w.watch("podStop");
+  await w.poll();
+  expect(gone).toEqual(["podStop"]);
+  expect(w.watchedPodId()).toBeNull();
+});

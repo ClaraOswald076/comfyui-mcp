@@ -11,6 +11,8 @@
 // configured timeout the pod is stopped automatically (pods bill per running
 // GPU-second even when doing nothing). Off when idleStopMinutes <= 0.
 
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { getPod, stopPod, comfyuiPortExposed, runpodProxyUrl, type RunpodPod } from "./runpod-client.js";
 import { logger } from "../utils/logger.js";
 
@@ -36,9 +38,30 @@ export interface RunpodStatusFrame extends Record<string, unknown> {
   autostop_minutes: number | null;
   /** Seconds until auto-stop fires (null when disabled / not idle / not running). */
   autostop_in_seconds: number | null;
-  /** True when an idle auto-stop ATTEMPT failed — the pod is still running (and
-   *  billing); the watcher keeps watching and retries next tick. */
-  autostop_failed?: boolean;
+  /** True when a promised create-and-auto-connect did NOT happen (readiness
+   *  timeout or superseded by a sibling winner). Decorates ONLY this pod's own
+   *  status frames — failure ALERTS for other pods ride `runpod_alert` so they
+   *  can't clobber the single watched-pod status slot (codex finding). */
+  connect_failed?: boolean;
+  /** The winning pod that superseded this one's auto-connect, when relevant. */
+  superseded_by?: string;
+}
+
+/** A billing-relevant auto-connect FAILURE, on its own channel so it can't
+ *  overwrite the watched pod's status in the single-slot panel store (codex
+ *  finding). `resolved: true` retracts a previous alert (stopped/reconciled). */
+export interface RunpodAlertFrame extends Record<string, unknown> {
+  type: "runpod_alert";
+  pod_id: string;
+  /** "timeout" | "superseded" | "resolved" */
+  reason: string;
+  status: string;
+  name?: string | null;
+  gpu?: string | null;
+  cost_per_hr?: number | null;
+  uptime_seconds?: number | null;
+  superseded_by?: string;
+  resolved?: boolean;
 }
 
 const CLEARED_FRAME: RunpodStatusFrame = {
@@ -70,8 +93,19 @@ export interface RunpodWatcherDeps {
    *  (e.g. while it boots, before connect) must never be stopped on the LOCAL
    *  ComfyUI's idleness, which comfyuiIdle() reports when we haven't connected. */
   renderingOnPod: (podId: string) => boolean;
+  /** The watched pod VANISHED (terminated externally) or was auto-stopped. The
+   *  orchestrator uses this to fall back to the local target when the dead pod
+   *  was the ACTIVE render target — otherwise renders keep failing against a
+   *  dead proxy (#269 dead-target cleanup). Guarded there (not every watched
+   *  pod is the render target). */
+  onPodUnavailable?: (podId: string) => void;
   /** Idle-stop timeout in minutes; <= 0 disables auto-stop. */
   idleStopMinutes: number;
+  /** Optional: persist unresolved connect-failure records here (per-port path)
+   *  so an orchestrator self-restart doesn't lose billing warnings for pods
+   *  that are still running (codex finding). Restored at creation; re-saved on
+   *  every mutation. */
+  persistPath?: string;
   /** Poll interval in ms (default 15000). */
   pollMs?: number;
   /** Injectable clock for tests. */
@@ -87,6 +121,19 @@ export interface RunpodWatcher {
   watchedPodId(): string | null;
   /** The last frame sent (for seeding a tab that just connected). */
   current(): RunpodStatusFrame;
+  /** Failure frames for pods whose auto-connect failed (timeout/superseded) —
+   *  held SEPARATELY from the single watched frame so a routine poll of the
+   *  watched pod can't overwrite the only warning (codex finding). Seeded to
+   *  new tabs alongside current(). */
+  failedFrames(): RunpodAlertFrame[];
+  /** Record a failed auto-connect for a pod: the failure is stored (current()
+ *  seeds it to new tabs) and `connect_failed` rides every later frame for that
+ *  pod until it exits/vanishes (codex finding: a one-shot bridge push lets the
+ *  only warning evaporate on the next routine poll). */
+  markConnectFailed(podId: string, frame: RunpodAlertFrame): void;
+  /** Clear a pod's failure record (e.g. after a successful runpod_pod_stop —
+ *  otherwise an unwatched failed pod reports "still billing" forever). */
+  clearConnectFailed(podId: string): void;
   /** Poll once now (also driven internally by the interval). Exposed for tests. */
   poll(): Promise<void>;
   /** Begin the poll interval. */
@@ -145,7 +192,85 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
       idle_seconds: idleSeconds,
       autostop_minutes: idleStopMs > 0 ? deps.idleStopMinutes : null,
       autostop_in_seconds: autostopIn,
+      // A failed auto-connect STICKS to this pod's frames until it exits or
+      // vanishes (markConnectFailed) — the only warning must not evaporate on
+      // the next routine uptime tick (codex finding).
+      ...(connectFailedPods.has(pod.id) ? { connect_failed: true as const } : {}),
     };
+  }
+
+  /** Pods whose auto-connect failed (timeout/superseded) — failure sticks to
+   *  their frames + the seed until they're gone. */
+  const connectFailedPods = new Set<string>();
+  /** Failure frames by pod — the seed channel, independent of `last`. */
+  const failedById = new Map<string, RunpodAlertFrame>();
+  /** Clear + broadcast "resolved" — every removal path (janitor, stop, connect,
+   *  vanish, terminal) goes through here so panels RETRACT the alert instead of
+   *  keeping a stale billing warning (codex finding). */
+  function clearFailure(id: string): void {
+    const prior = failedById.get(id);
+    connectFailedPods.delete(id);
+    failedById.delete(id);
+    if (prior) deps.push({ ...prior, reason: "resolved", resolved: true });
+    persistFailures();
+  }
+
+  /** Persist unresolved failures across orchestrator self-restarts (pods keep
+   *  billing while the process cycles — codex finding). Best-effort. */
+  function persistFailures(): void {
+    if (!deps.persistPath) return;
+    try {
+      mkdirSync(dirname(deps.persistPath), { recursive: true });
+      if (failedById.size === 0) {
+        rmSync(deps.persistPath, { force: true });
+        return;
+      }
+      writeFileSync(deps.persistPath, JSON.stringify([...failedById.values()]));
+    } catch {
+      /* best-effort */
+    }
+  }
+  // Restore failures recorded before a restart (not re-broadcast — new tabs
+  // seed from failedFrames(); future polls re-decorate via frameFor).
+  if (deps.persistPath) {
+    try {
+      const saved = JSON.parse(readFileSync(deps.persistPath, "utf-8")) as RunpodAlertFrame[];
+      for (const f of saved) {
+        if (f && typeof f.pod_id === "string") {
+          failedById.set(f.pod_id, f);
+          connectFailedPods.add(f.pod_id);
+        }
+      }
+    } catch {
+      // no saved state
+    }
+  }
+  /** Janitor: every ~10 polls, reconcile failure entries for pods we are NOT
+   *  watching (their stop/vanish never reaches our poll paths — codex finding:
+   *  an externally-stopped loser warned "still billing" forever). */
+  let reconcileCounter = 0;
+  async function reconcileFailedPods(): Promise<void> {
+    for (const id of [...failedById.keys()]) {
+      if (id === podId) continue; // the watched pod's own poll paths handle it
+      try {
+        const pod = await getPod(id);
+        if (!pod || pod.desiredStatus === "EXITED" || pod.desiredStatus === "TERMINATED" || pod.desiredStatus === "DEAD" || pod.desiredStatus === "PAUSED") {
+          // Same broadcast correction as clearConnectFailed — the janitor's
+          // delete must not leave the stale failure on panels (codex).
+          const prior = failedById.get(id);
+          failedById.delete(id);
+          connectFailedPods.delete(id);
+          if (prior) {
+            // Retract the alert with the TERMINAL status (the stale RUNNING
+            // line must not live forever — codex finding).
+            deps.push({ ...prior, reason: "resolved", resolved: true, status: pod?.desiredStatus ?? "TERMINATED" });
+          }
+        }
+      } catch {
+        // unknown — keep the warning (cost-safe direction)
+      }
+    }
+    persistFailures();
   }
 
   // In-flight guard: on a hung network a slow poll must not stack up under the
@@ -154,6 +279,13 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
   let inflight: Promise<void> | null = null;
 
   function poll(): Promise<void> {
+    // Janitor tick BEFORE the target check: failures must reconcile even with
+    // NO watched pod (codex finding — an externally-stopped loser warned
+    // "still billing" forever). Cheap: only when failures exist, ~10 polls.
+    if (failedById.size > 0 && ++reconcileCounter >= 10) {
+      reconcileCounter = 0;
+      void reconcileFailedPods();
+    }
     if (inflight) return inflight;
     inflight = pollOnce().finally(() => {
       inflight = null;
@@ -179,9 +311,31 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
     }
     if (podId !== target) return; // target changed while awaiting → stale, drop
     if (!pod) {
-      // Pod vanished (terminated) — stop watching.
+      // Pod vanished (terminated) — stop watching, and tell the orchestrator:
+      // if renders were targeting this pod's proxy, the active target is now
+      // DEAD and must fall back to local (#269 dead-target cleanup).
       logger.info(`[runpod-watch] pod ${target} no longer exists — unwatching`);
+      clearFailure(target);
       unwatch();
+      deps.onPodUnavailable?.(target);
+      return;
+    }
+    // A RETAINED pod still answers getPod after being stopped externally
+    // (console / another process): desiredStatus EXITED/TERMINATED/DEAD with
+    // runtime null. Same dead-target cleanup as the vanish path — otherwise
+    // the dead proxy stays the active render target forever (codex finding).
+    // Booting states (CREATED/RESTARTING) merely keep watching.
+    if (pod.desiredStatus === "EXITED" || pod.desiredStatus === "TERMINATED" || pod.desiredStatus === "DEAD" || pod.desiredStatus === "PAUSED") {
+      logger.info(`[runpod-watch] pod ${target} is ${pod.desiredStatus} — unwatching`);
+      // Clear the failure BEFORE the terminal frame is cached as `last` —
+      // otherwise current() seeds a stale connect_failed flag to new tabs even
+      // though the alert was resolved (codex finding).
+      clearFailure(target);
+      pushIfChanged(frameFor(pod, null, null));
+      const goneTarget = target;
+      podId = null;
+      idleSinceMs = null;
+      deps.onPodUnavailable?.(goneTarget);
       return;
     }
 
@@ -224,8 +378,12 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
           pushIfChanged(stopped);
           // Stop watching WITHOUT clearing — the panel keeps showing the pod as
           // EXITED (so the user can restart it) instead of the card vanishing.
+          const goneTarget = target;
           podId = null;
           idleSinceMs = null;
+          // Same dead-target cleanup as the vanish path: if renders pointed at
+          // this pod, fall back to local (#269).
+          deps.onPodUnavailable?.(goneTarget);
           return;
         }
       }
@@ -240,6 +398,11 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
     const switching = podId !== id;
     podId = id;
     idleSinceMs = null;
+    // A SUCCESSFUL connect (we're now rendering on this pod) resolves its past
+    // failure — but a watch-ONLY flow (boot monitor, runpod_watch) must not
+    // erase a persisted warning for an unconnected, still-billing pod (codex
+    // finding). clearFailure broadcasts the "resolved" alert.
+    if (deps.renderingOnPod(id)) clearFailure(id);
     // Kick an immediate poll so the panel doesn't wait a full interval. If a poll
     // for the PREVIOUS target is still in flight, don't overlap it — chain a fresh
     // poll after it settles (that stale poll drops its own result via the
@@ -262,6 +425,21 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
     unwatch,
     watchedPodId: () => podId,
     current: () => last,
+    markConnectFailed(id, frame) {
+      // Record the failure: stored SEPARATELY from `last` (a routine poll of
+      // the watched pod must not overwrite the only warning — codex finding),
+      // broadcast WITHOUT touching the watched-frame cache (a new tab must
+      // still get the watched pod's real status from current(), not the
+      // loser's failure — codex finding), and stuck to this pod's later
+      // frames (frameFor) until it exits/vanishes or is intentionally
+      // reconnected (watch()).
+      connectFailedPods.add(id);
+      failedById.set(id, frame);
+      deps.push(frame);
+      persistFailures();
+    },
+    failedFrames: () => [...failedById.values()],
+    clearConnectFailed: clearFailure,
     poll,
     start() {
       if (timer) return;

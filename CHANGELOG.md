@@ -6,6 +6,37 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.46.0] - 2026-07-22
+
+### MCP
+
+#### Added
+- **`apps_*` tools — run a micro-app from a canvas-less client.** Sibling to the
+  panel Apps work: thin proxies over the panel pack's
+  `/comfyui_mcp_panel/apps/*` routes, so the panel remains the single storage and
+  run implementation for both desktop and mobile. `apps_list` / `apps_get` read the
+  registered micro-apps (manifest with appMode inputs/outputs, deps, hideWorkflow);
+  `apps_run` patches `<nodeId>.<widget>` values into the app's prompt snapshot and
+  queues it, returning a `prompt_id`; `apps_run_status` polls status and outputs;
+  `apps_import` fetches a bundle from the public registry and installs it. (#285)
+- **Grok 4.5** in the Agent Panel model catalog. (#283)
+- **`restart_comfyui` now works against a remote or tunnelled ComfyUI.** It used to
+  hard-throw in remote mode (`--comfyui-url`), so an agent pointed at a tunnelled
+  ComfyUI Desktop could not restart it — even though Desktop self-supervises and a
+  ComfyUI-Manager HTTP reboot brings it straight back. Remote mode now fires a
+  Manager reboot (`POST /v2/manager/reboot`, falling back to `GET /manager/reboot`)
+  and polls for readiness instead of refusing. (#296)
+
+#### Fixed
+- **RunPod retarget, connection and idle-stop correctness.** Switching the ComfyUI
+  target now performs the full fan-out on *every* path — queue-monitor restart,
+  agent MCP-env respawn, capability probe, host-indicator frame — after syncing the
+  closed-over URL so the hello, tool and watcher origins cannot drift apart. Adds
+  `connect: true` semantics, a LAN fallback, and download-aware idle so a pod is not
+  auto-stopped while a model download is still streaming. Closes the remaining
+  cluster from #269. (#286)
+
+
 ## [0.45.0] - 2026-07-22
 
 ### MCP

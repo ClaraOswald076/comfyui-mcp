@@ -215,6 +215,13 @@ const CATEGORIES: Array<{
     ],
   },
   {
+    group: "Apps (micro-apps)",
+    slug: "apps",
+    icon: "layout-grid",
+    description: "List, inspect, and run the panel's micro-apps — named, one-click workflow apps with exposed inputs — for canvas-less clients (mobile).",
+    tools: ["apps_list", "apps_get", "apps_run", "apps_run_status", "apps_import"],
+  },
+  {
     group: "comfy-cli",
     slug: "comfy-cli",
     icon: "terminal",
