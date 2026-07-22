@@ -41,7 +41,7 @@ export function registerProcessControlTools(server: McpServer): void {
 
   server.tool(
     "restart_comfyui",
-    "Restart ComfyUI: stops the running process (capturing its config), waits for the port to free, relaunches with the same arguments, and polls the API for bounded readiness.",
+    "Restart ComfyUI: stops the running process (capturing its config), waits for the port to free, relaunches with the same arguments, and polls the API for bounded readiness. Also works against a REMOTE/tunnelled ComfyUI (via --comfyui-url) by rebooting through ComfyUI-Manager over HTTP and polling for it to come back (requires ComfyUI-Manager present and its security level permitting the reboot).",
     {},
     async () => {
       try {
