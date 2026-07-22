@@ -1,0 +1,195 @@
+---
+title: "Micro-Apps: turn a ComfyUI workflow into a form anyone can run"
+description: "A workflow is a graph, and a graph is a hostile interface for someone who just wants to change three things and hit Go. Apps package a workflow as a manifest plus an API-format prompt snapshot, generate a run form from it, and expose the whole thing over apps_* MCP tools — so the panel, the phone, and the agent all run the same app through one implementation."
+keywords:
+  - ComfyUI micro apps
+  - ComfyUI APP mode
+  - ComfyUI workflow to app
+  - ComfyUI one-click workflow
+  - comfyui-mcp apps tools
+  - ComfyUI app registry
+  - run ComfyUI without the canvas
+  - ComfyUI agent MCP
+---
+
+_by [artokun](https://github.com/artokun) · apps · panel · mobile · registry_
+
+You built the workflow. It works. Now someone else wants to use it — a friend, a
+client, your own self on a phone in a different room — and the thing you have to
+hand them is **a graph**.
+
+That's the whole problem. A ComfyUI workflow is an authoring artifact: 40 nodes,
+a dozen of them wired through loaders you never touch, and exactly three widgets
+that actually matter for the job at hand. Handing someone the canvas means
+handing them every decision you already made, plus the ability to break any of
+them. The honest interface for "run this thing with a different prompt and a
+different seed" is not a node editor. It's **a form**.
+
+Apps are that form.
+
+## What an app actually is
+
+An app is a workflow packaged for one-click runs, stored as a bundle in
+ComfyUI's user dir — deliberately *not* the workflows dir, so hidden apps never
+leak back into the workflow browser:
+
+```
+<user>/comfyui-mcp-panel/apps/<app-id>/
+  manifest.json   # name, description, appMode{inputs,outputs}, deps, flags
+  workflow.json   # litegraph UI format — ABSENT when hideWorkflow is set
+  prompt.json     # API-format snapshot, patched per run
+  thumbnail.png   # optional card art
+```
+
+Two files carry the idea. `prompt.json` is a frozen API-format snapshot of the
+graph — the thing that actually queues. `manifest.json` describes which parts of
+that snapshot a human is allowed to touch: `appMode.inputs`, a list of
+`{nodeId, widget, label, kind, choices?, default?}` entries where `kind` is one
+of `text | number | combo | toggle | image | model`. Running the app means
+patching values keyed `<nodeId>.<widget>` into the snapshot and queueing it.
+Nothing else moves.
+
+That's why an app is not "a workflow with a nicer skin." The graph is *fixed at
+conversion time*. The only degrees of freedom are the ones the author declared.
+
+## Converting: import what the author meant, guess the rest
+
+Conversion happens in the panel, from the live canvas. It reads the workflow's
+**APP-mode config** if the frontend has one — ComfyUI's own app-mode input/output
+selection — and honors those inputs on *any* node type, including custom-node
+endpoints. If the workflow has no app-mode config at all, the builder falls back
+to a heuristic: input-hint nodes' non-link-driven widgets become inputs, output
+nodes (`SaveImage`, `PreviewImage`, `SaveVideo`, `ShowText`, …) become outputs,
+and widget kinds get classified by shape — `LoadImage` becomes an image upload,
+anything matching a loader or a `*_name` widget becomes a model picker, numbers
+become numbers, arrays become combos.
+
+The same pass scans the API prompt for **deps**: model filenames pulled off
+loader widgets, and every `class_type` your ComfyUI doesn't already know, which
+is the custom-node list. Those ride in the manifest so the person installing the
+app finds out what it needs *before* they run it and eat a red node.
+
+There's also a `hideWorkflow` flag, and the copy around it is deliberately
+unflattering. Hiding the workflow drops `workflow.json` from the bundle so the
+graph isn't handed over with the app. It is **best-effort obfuscation, never
+security** — the prompt still runs on the viewer's ComfyUI, which means it's
+visible through `/history`, and the deps list spells out the architecture
+anyway. The UI says exactly that at the point where you'd click it.
+
+## The agent angle
+
+Here's the part that isn't just a nicer front end.
+
+The panel's Apps routes are server-side, not browser fetches, which means the
+same storage and run engine backs a set of MCP tools. The agent gets five:
+
+| Tool | What it does |
+| --- | --- |
+| `apps_list` | Every app registered on this ComfyUI, as manifests |
+| `apps_get` | One app's manifest + bundle facts (`has_workflow`/`has_prompt`/`has_thumbnail`) |
+| `apps_run` | Patch `values` into the snapshot and queue it → `prompt_id` |
+| `apps_run_status` | Poll one run: `pending`/`running`/`done`/`unknown` + outputs |
+| `apps_import` | Install an app from the public registry onto this ComfyUI |
+
+So the agent can read the run form the same way a human does — `appMode.inputs`
+*is* the schema — fill it, queue it, and collect the outputs. No canvas, no
+graph surgery, no guessing which of the 40 nodes holds the positive prompt.
+
+A worked run, end to end:
+
+```jsonc
+// 1. What's installed?
+apps_list {}
+// → [{ id: "6f1c…", name: "Portrait Upscale", appMode: { inputs: [...] }, … }]
+
+// 2. What does it want?
+apps_get { "app_id": "6f1c…" }
+// → appMode.inputs: [
+//     { nodeId: 6,  widget: "text",     label: "Prompt",   kind: "text" },
+//     { nodeId: 3,  widget: "seed",     label: "Seed",     kind: "number" },
+//     { nodeId: 14, widget: "ckpt_name", label: "Checkpoint", kind: "model",
+//       choices: ["flux1-dev.safetensors", …] }
+//   ]
+
+// 3. Run it.
+apps_run {
+  "app_id": "6f1c…",
+  "values": { "6.text": "a tabby cat in a sunbeam", "3.seed": 42 }
+}
+// → { "prompt_id": "a9d3…" }
+
+// 4. Poll.
+apps_run_status { "app_id": "6f1c…", "prompt_id": "a9d3…" }
+// → { "status": "done", "outputs": { "9": { "images": [ … ] } } }
+```
+
+Omitted inputs keep their conversion-time defaults. Unknown keys **fail loudly**
+rather than silently no-op'ing — if a value key doesn't resolve against the
+snapshot, the manifest has drifted from the prompt and you want to hear about it
+immediately, not after a render that ignored half your parameters.
+
+The tools are whitelisted on the orchestrator's `call_tool` path, which is what
+lets **canvas-less clients** drive them. That's the real unlock: a phone has no
+node editor and never will, but it doesn't need one to render a `<nodeId>.<widget>`
+map as a form.
+
+## On the phone
+
+The mobile Apps tab is **real, not a placeholder** — the previous "coming soon"
+stub is gone. It renders My Apps as a card grid with thumbnails (via
+`apps_list`), generates the input form from the manifest on the detail screen —
+text, number, combo, toggle, model pickers, and gallery image upload — fires
+`apps_run` on a tap, polls `apps_run_status` every two seconds, and shows the
+outputs gallery plus any text outputs. Hidden-workflow apps carry the same
+honest best-effort warning the panel shows.
+
+Explore works on the phone too: it browses the public registry over direct
+HTTPS, but **install goes rig-side through `apps_import`** — the phone asks your
+ComfyUI to fetch and install the bundle rather than shipping it over the bridge
+itself.
+
+## Publish and Explore
+
+Published apps live in a registry: a dependency-free Cloudflare Worker on D1 +
+R2. Publishing uploads the manifest, the prompt snapshot, the workflow (unless
+hidden), and a thumbnail, under a creator identity keyed by a sha256 hash.
+Explore gives you **Trending / New / Most starred** plus search, with keyset
+pagination; trending is a 7-day window weighting stars over runs. You can star,
+unstar, and report.
+
+Installing from Explore goes through a **deps-consent dialog** — you see the
+models and custom nodes the app needs before anything lands. Same posture on the
+tool side: `apps_import` does *not* install deps. It returns them, and the agent
+is expected to tell you what's missing so you can decide.
+
+`apps_import` also refuses to fetch from arbitrary origins. The fetch is
+server-side, so an open `registry_url` would be a straightforward SSRF
+primitive — loopback, LAN, or a public URL redirecting into one. It accepts the
+default public registry, plus anything the operator explicitly allowlists via
+`COMFYUI_MCP_REGISTRY_URLS`, with redirects refused outright and a 16MB cap on
+the bundle checked against both the declared length and the actual bytes.
+
+## Running on a pod
+
+Apps run on the local ComfyUI by default. If you have a RunPod pod connected
+through the panel, **Run on RunPod** dry-patches the snapshot locally, pushes
+the pinned deps, and enqueues the resulting prompt on the pod instead.
+
+One case it refuses rather than fudges: apps with an **image input** can't run on
+a pod. Uploads land on the *local* ComfyUI, which the pod can't reach, so the
+button declines with that explanation instead of queueing something that would
+fail confusingly ten seconds later.
+
+## What this is, honestly
+
+Apps don't make workflows easier to build. They make workflows easier to
+*hand off* — to another person, to another device, or to an agent that doesn't
+want to reason about a graph just to change a prompt and a seed. The graph is
+still the source of truth. It's just no longer the interface.
+
+---
+
+Convert your first workflow from the Apps button in the
+[Agent Panel](/panel) toolbar, or ask the agent what's installed with
+`apps_list`. Issues and ideas:
+[artokun/comfyui-mcp](https://github.com/artokun/comfyui-mcp/issues).

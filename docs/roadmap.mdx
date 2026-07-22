@@ -56,6 +56,7 @@ Everything here works today and is covered by the docs.
 | **Models & custom nodes** | Search, install and repair node packs; find and download models — including working out which models a workflow is missing and which quantisation fits your VRAM. |
 | **Civitai browser** | Browse images, videos and models in-panel, filter by base model and creator, and pull a workflow straight onto the canvas. |
 | **Mobile app** | Chat to the agent, watch the queue, browse LoRAs, and mirror a desktop tab to drive your rig from your phone. See [Mobile](/mobile). |
+| **Apps (micro-apps)** | Turn a workflow into a one-click app with a real form: convert and publish in the panel, run it locally or on a pod, install others' apps from the public registry — and run the same apps from the phone's Apps tab or an agent via the `apps_*` tools. See [Apps](/apps). |
 | **Remote & cloud** | Point the panel at a remote ComfyUI, a self-hosted relay, or Comfy Cloud. See [Remote connector](/remote-connector). |
 | **RunPod pods** | Create, connect to and stop RunPod pods from the panel, with billing-safe defaults and an honest host indicator. |
 | **LoRA training (local)** | Character LoRAs on FLUX.1-dev, driven by the agent through `train_*` tools in a GPU Docker container — dataset in, `.safetensors` in `models/loras/` out. |
@@ -75,9 +76,8 @@ Queued and specified, not started. Ordered.
 
 | Item | Why it's here |
 |---|---|
-| **Honest previews in the mobile app** | The app ships **Apps** and **Training** tabs that are placeholders. They read as shipped features and have already misled people into asking how far along they are. Either label them plainly or hide them — the cheapest fix on this list. |
-| **Mobile training** | Wire the mobile Training tab to the trainer that already works. The hard part is done; this is mostly plumbing, and it retires half the item above. |
-| **Apps on mobile** | ComfyUI's workflow-as-form Apps, rendered on the phone — run a workflow without the canvas. The clearest missing capability in the mobile app. |
+| **Honest previews in the mobile app** | The **Training** tab is still inert placeholder UI — six cards that read as a shipped feature and have already misled people into asking how far along it is. Either label it plainly or hide it — the cheapest fix on this list. (The **Apps** tab was the other half of this item and is now real; see [Apps](/apps).) |
+| **Mobile training** | Wire the mobile Training tab to the trainer that already works. The hard part is done; this is mostly plumbing, and it retires the item above. |
 | **Tablet layout** | Real, unglamorous responsive work. Worth doing once the screens above have something worth showing. |
 
 ## Under consideration
