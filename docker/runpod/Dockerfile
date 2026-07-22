@@ -315,6 +315,12 @@ COPY starting.html   /usr/share/nginx/html/readme.html
 COPY post_start.sh   /post_start.sh
 RUN chmod +x /post_start.sh
 
+# Dead-man switch (#269) — heartbeat server + self-stop watchdog, launched by
+# post_start.sh only when the pod env carries RUNPOD_API_KEY + DEADMAN_TOKEN
+# (i.e. pods created via runpod_pod_create). See deadman_watch.sh's header.
+COPY deadman_server.py deadman_watch.sh /opt/comfyui-mcp-deadman/
+RUN chmod +x /opt/comfyui-mcp-deadman/deadman_watch.sh
+
 # File Browser (https://filebrowser.org) — a single Go binary web file manager.
 # Placed LATE so it doesn't bust the expensive torch/ComfyUI layer cache. The
 # entrypoint runs it rooted at /workspace (browse/upload/download/delete), fronted
@@ -418,12 +424,18 @@ RUN set -e; \
              "${COMFY_HOME}/custom_nodes_seed/comfyui-mcp-panel/web/js/comfyui-mcp-panel.js" \
              "${COMFY_HOME}/extra_model_paths.yaml" \
              "${COMFY_HOME}/config.ini.seed" \
-             /post_start.sh; do \
+             /post_start.sh \
+             /opt/comfyui-mcp-deadman/deadman_server.py \
+             /opt/comfyui-mcp-deadman/deadman_watch.sh; do \
       [ -s "$f" ] || { echo "INTEGRITY GATE FAILED: $f is missing or 0 bytes"; exit 1; }; \
     done; \
     EMPTY="$(find "${COMFY_HOME}/custom_nodes_seed" -type f -size 0 | head -20)"; \
     [ -z "$EMPTY" ] || { echo "INTEGRITY GATE FAILED: 0-byte files in custom_nodes_seed:"; echo "$EMPTY"; exit 1; }; \
     bash -n /post_start.sh || { echo "INTEGRITY GATE FAILED: /post_start.sh has syntax errors"; exit 1; }; \
+    bash -n /opt/comfyui-mcp-deadman/deadman_watch.sh \
+      || { echo "INTEGRITY GATE FAILED: deadman_watch.sh has syntax errors"; exit 1; }; \
+    "${COMFY_HOME}/venv/bin/python" -m py_compile /opt/comfyui-mcp-deadman/deadman_server.py \
+      || { echo "INTEGRITY GATE FAILED: deadman_server.py does not compile"; exit 1; }; \
     "${COMFY_HOME}/venv/bin/python" -c "import torch; import importlib.metadata as m; m.version('comfyui-manager')" \
       || { echo "INTEGRITY GATE FAILED: venv torch import / comfyui-manager package"; exit 1; }; \
     command -v aria2c >/dev/null \
@@ -482,5 +494,6 @@ RUN rm -rf /workspace/.cache /workspace/.logs && mkdir -p /workspace
 #   8083  File Browser (via nginx -> :8082; rooted at /workspace)
 #   8081  code-server (via nginx -> :8080)
 #   8001  app-manager (via nginx -> :8000)
+#   8189  dead-man heartbeat server (token-gated; only armed on API-created pods)
 #   22    SSH (base; RunPod PUBLIC_KEY)
-EXPOSE 3000 8888 8083 8081 8001 22
+EXPOSE 3000 8888 8083 8081 8001 8189 22

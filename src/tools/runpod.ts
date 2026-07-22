@@ -202,12 +202,13 @@ export function registerRunpodTools(server: McpServer): void {
   // ── CREATE (deploy our template via the API — referral-earning) ───────────
   server.tool(
     "runpod_pod_create",
-    "Deploy a BRAND-NEW RunPod pod from our comfyui-mcp template (image with the panel + Manager + our nodes preinstalled), then it can be started/connected like any pod. One-tap alternative to the console deploy link for a user who already has a RunPod account + API key. Because our template is used, the agent can install the user's exact custom nodes/LoRAs + download models on it → full canvas parity. Tries several GPU types until one has capacity (on-demand availability fluctuates). NOTE: this bills GPU-time as soon as the pod boots — confirm with the user first, and stop it (runpod_pod_stop) when done. For onboarding a NEW RunPod user, prefer runpod_deploy_link so their signup credits our referral.",
+    "Deploy a BRAND-NEW RunPod pod from our comfyui-mcp template (image with the panel + Manager + our nodes preinstalled), then it can be started/connected like any pod. One-tap alternative to the console deploy link for a user who already has a RunPod account + API key. Because our template is used, the agent can install the user's exact custom nodes/LoRAs + download models on it → full canvas parity. Tries several GPU types until one has capacity (on-demand availability fluctuates). NOTE: this bills GPU-time as soon as the pod boots — confirm with the user first, and stop it (runpod_pod_stop) when done. Created pods carry a DEAD-MAN SWITCH: if comfyui-mcp stops minding the pod (crash/offline), the pod STOPS ITSELF after a grace period so it can't bill forever — that needs your RunPod API key injected into the pod's env (opt out with deadman:false). For onboarding a NEW RunPod user, prefer runpod_deploy_link so their signup credits our referral.",
     {
       name: z.string().optional().describe("Pod name (default 'comfyui-mcp')."),
       gpu_type: z.string().optional().describe(`GPU type to prefer, e.g. "NVIDIA GeForce RTX 4090". Default tries: ${RUNPOD_DEFAULT_GPU_TYPES.join(", ")}.`),
       cloud_type: z.enum(["COMMUNITY", "SECURE"]).optional().describe("COMMUNITY (cheaper, default) or SECURE."),
       connect: z.boolean().optional().describe("Auto-connect when booted: the ORCHESTRATOR waits for ComfyUI to answer (1-3min), then retargets + watches — this call returns immediately (default false: deploy only; connect later with runpod_pod_connect)."),
+      deadman: z.boolean().optional().describe("Arm the pod-side dead-man watchdog (default true): the pod STOPS ITSELF if comfyui-mcp's heartbeats stop (process crash/offline — boot grace ~45min, then ~20min without beats). Requires injecting your RunPod API key into the pod's env (unscoped key — any process on the pod could read it); false deploys without the watchdog."),
     },
     async (args) => {
       try {
@@ -215,6 +216,7 @@ export function registerRunpodTools(server: McpServer): void {
           name: args.name,
           gpuTypeIds: args.gpu_type ? [args.gpu_type] : undefined,
           cloudType: args.cloud_type,
+          deadman: args.deadman,
         });
         const cost = pod.costPerHr != null ? ` at $${pod.costPerHr.toFixed(3)}/hr` : "";
         const gpu = pod.machine?.gpuDisplayName ? ` on ${pod.machine.gpuDisplayName}` : "";

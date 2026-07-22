@@ -13,7 +13,7 @@
 
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { getPod, stopPod, comfyuiPortExposed, runpodProxyUrl, type RunpodPod } from "./runpod-client.js";
+import { getPod, stopPod, comfyuiPortExposed, runpodProxyUrl, beatDeadman, type RunpodPod } from "./runpod-client.js";
 import { logger } from "../utils/logger.js";
 
 /** Wire shape of one live pod-status broadcast (panel/mobile control panels). */
@@ -265,6 +265,10 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
             // line must not live forever — codex finding).
             deps.push({ ...prior, reason: "resolved", resolved: true, status: pod?.desiredStatus ?? "TERMINATED" });
           }
+        } else if (pod.desiredStatus === "RUNNING") {
+          // A failed-connect pod is still OUR managed billing pod — feed its
+          // dead-man watchdog too, or it would self-stop while we warn (#269).
+          void beatDeadman(pod);
         }
       } catch {
         // unknown — keep the warning (cost-safe direction)
@@ -390,6 +394,11 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
     } else {
       idleSinceMs = null; // active or not-running → reset the idle clock
     }
+
+    // Dead-man heartbeat (#269): while we manage this pod, feed its pod-side
+    // watchdog — if this process dies, beats stop and the pod stops ITSELF.
+    // Best-effort (own timeout, errors swallowed): never breaks the status path.
+    if (running) void beatDeadman(pod);
 
     pushIfChanged(frameFor(pod, idleSeconds, autostopIn));
   }

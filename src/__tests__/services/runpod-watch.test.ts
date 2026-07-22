@@ -3,9 +3,11 @@ import { describe, expect, it, beforeEach, vi } from "vitest";
 // Mock the RunPod client the watcher polls/acts on.
 const getPodMock = vi.fn();
 const stopPodMock = vi.fn();
+const beatMock = vi.fn(() => true);
 vi.mock("../../services/runpod-client.js", () => ({
   getPod: (...a: unknown[]) => getPodMock(...a),
   stopPod: (...a: unknown[]) => stopPodMock(...a),
+  beatDeadman: (...a: unknown[]) => beatMock(...a),
   comfyuiPortExposed: (pod: { runtime?: { ports?: Array<{ privatePort: number; type: string }> } }) =>
     (pod.runtime?.ports ?? []).some((p) => p.privatePort === 8188 && p.type === "http"),
   runpodProxyUrl: (id: string) => `https://${id}-8188.proxy.runpod.net`,
@@ -54,6 +56,19 @@ describe("runpod-watch — status broadcast", () => {
     const before = frames.length;
     await w.poll();
     expect(frames.length).toBe(before);
+  });
+
+  it("feeds the pod's dead-man watchdog while it RUNS under our watch (#269), not when stopped", async () => {
+    getPodMock.mockResolvedValue(runningPod());
+    const w = createRunpodWatcher({ push: () => {}, comfyuiIdle: () => false, renderingOnPod: () => true, idleStopMinutes: 0 });
+    w.watch("pod1");
+    await w.poll();
+    expect(beatMock).toHaveBeenCalledWith(expect.objectContaining({ id: "pod1", name: "c" }));
+    // A stopped pod gets no beat (its watchdog is down with the pod anyway).
+    beatMock.mockClear();
+    getPodMock.mockResolvedValue(runningPod({ desiredStatus: "EXITED", runtime: null }));
+    await w.poll();
+    expect(beatMock).not.toHaveBeenCalled();
   });
 
   it("clears the frame on unwatch", async () => {

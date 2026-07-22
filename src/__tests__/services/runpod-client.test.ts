@@ -1,10 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   createPod,
+  getPod,
   isProvablyNotCreatedError,
   runpodDeployLink,
   runpodProxyUrl,
   comfyuiPortExposed,
+  deadmanToken,
+  beatDeadman,
+  RUNPOD_DEADMAN_PORT,
   RUNPOD_DEFAULT_GPU_TYPES,
   type RunpodPod,
 } from "../../services/runpod-client.js";
@@ -128,7 +132,8 @@ describe("createPod (GPU fallback + billing safety)", () => {
     expect(deployCall.variables.input.templateId).toBe("bnqtkvcer3");
     expect(deployCall.variables.input.cloudType).toBe("COMMUNITY");
     expect(deployCall.variables.input.gpuTypeId).toBe("NVIDIA A40");
-    expect(deployCall.variables.input.ports).toBe("3000/http,22/tcp");
+    // Deadman watchdog (default on) adds its heartbeat port (#269).
+    expect(deployCall.variables.input.ports).toBe("3000/http,22/tcp,8189/http");
   });
 
   it("has sane default GPU types (24GB+ cards)", () => {
@@ -256,5 +261,92 @@ describe("createPod (GPU fallback + billing safety)", () => {
     // Still TRUE for the real rejection phrasings.
     expect(isProvablyNotCreatedError(new Error("no capacity available for this GPU"))).toBe(true);
     expect(isProvablyNotCreatedError(new Error("insufficient capacity"))).toBe(true);
+  });
+});
+
+describe("response validation (#269 — no more blind casts)", () => {
+  const goodPod = {
+    id: "pod1",
+    name: "c",
+    desiredStatus: "RUNNING",
+    costPerHr: 0.4,
+    machine: { gpuDisplayName: "RTX 4090" },
+    runtime: {
+      uptimeInSeconds: 60,
+      ports: [{ ip: "1", isIpPublic: true, privatePort: 3000, publicPort: 3000, type: "http" }],
+      gpus: [{ id: "g", gpuUtilPercent: 5, memoryUtilPercent: 10 }],
+    },
+  };
+
+  it("accepts a well-formed pod (and ignores ADDITIVE new fields)", async () => {
+    global.fetch = vi.fn(async () =>
+      gqlResponse({ data: { pod: { ...goodPod, brandNewField: { nested: [1, 2] } } } }),
+    ) as unknown as typeof fetch;
+    const pod = await getPod("pod1");
+    expect(pod?.id).toBe("pod1");
+  });
+
+  it("throws LOUDLY when a field we read changes shape (was: silent wrong values)", async () => {
+    global.fetch = vi.fn(async () =>
+      gqlResponse({ data: { pod: { ...goodPod, desiredStatus: { code: "RUNNING" } } } }),
+    ) as unknown as typeof fetch;
+    await expect(getPod("pod1")).rejects.toThrow(/unexpected shape.*getPod/);
+  });
+
+  it("throws when a required field vanishes (a null cast would have read as idle/exited)", async () => {
+    const { desiredStatus: _omit, ...noStatus } = goodPod;
+    global.fetch = vi.fn(async () => gqlResponse({ data: { pod: noStatus } })) as unknown as typeof fetch;
+    await expect(getPod("pod1")).rejects.toThrow(/unexpected shape/);
+  });
+});
+
+describe("deadman switch (#269)", () => {
+  const deployInput = (fetchMock: ReturnType<typeof vi.fn>) =>
+    fetchMock.mock.calls
+      .map((c) => JSON.parse((c[1] as { body: string }).body))
+      .find((b) => b.query.includes("podFindAndDeployOnDemand")).variables.input;
+
+  it("derives a deterministic per-name token from the API key (no storage needed)", () => {
+    expect(deadmanToken("pod-a")).toBe(deadmanToken("pod-a"));
+    expect(deadmanToken("pod-a")).not.toBe(deadmanToken("pod-b"));
+    expect(deadmanToken("pod-a")).toMatch(/^[0-9a-f]{64}$/);
+    expect(deadmanToken("pod-a")).not.toContain("rp-test-key"); // derived, never the raw key
+  });
+
+  it("injects the watchdog env + heartbeat port by default", async () => {
+    const { fetchMock } = mockGql((b) => (b.query.includes("myself") ? emptyList : deployed("pod1")));
+    await createPod({ gpuTypeIds: ["GPU-A"], name: "dm-pod" });
+    const input = deployInput(fetchMock);
+    expect(input.ports).toContain(`${RUNPOD_DEADMAN_PORT}/http`);
+    const env = Object.fromEntries((input.env as Array<{ key: string; value: string }>).map((e) => [e.key, e.value]));
+    expect(env.RUNPOD_API_KEY).toBe("rp-test-key");
+    expect(env.DEADMAN_TOKEN).toBe(deadmanToken("dm-pod"));
+    expect(Number(env.DEADMAN_BOOT_GRACE_S)).toBeGreaterThanOrEqual(60);
+    expect(Number(env.DEADMAN_BEAT_GRACE_S)).toBeGreaterThanOrEqual(60);
+  });
+
+  it("deadman:false deploys WITHOUT the key/token/heartbeat port", async () => {
+    const { fetchMock } = mockGql((b) => (b.query.includes("myself") ? emptyList : deployed("pod1")));
+    await createPod({ gpuTypeIds: ["GPU-A"], name: "plain-pod", deadman: false });
+    const input = deployInput(fetchMock);
+    expect(input.ports).toBe("3000/http,22/tcp");
+    expect(input.env ?? []).toHaveLength(0);
+  });
+
+  it("beatDeadman heartbeats the pod's proxy URL with the derived token", async () => {
+    const fetchMock = vi.fn(async () => ({ ok: true }) as Response);
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const ok = await beatDeadman({ id: "abc123", name: "dm-pod" });
+    expect(ok).toBe(true);
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toBe(`https://abc123-${RUNPOD_DEADMAN_PORT}.proxy.runpod.net/heartbeat?token=${deadmanToken("dm-pod")}`);
+  });
+
+  it("beatDeadman is best-effort: network failure / missing name → false, never throws", async () => {
+    global.fetch = vi.fn(async () => {
+      throw new Error("dns");
+    }) as unknown as typeof fetch;
+    await expect(beatDeadman({ id: "abc123", name: "dm-pod" })).resolves.toBe(false);
+    await expect(beatDeadman({ id: "abc123", name: null })).resolves.toBe(false);
   });
 });
