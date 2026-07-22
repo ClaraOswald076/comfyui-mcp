@@ -17,7 +17,8 @@ import { z } from "zod";
 const RUNPOD_GRAPHQL_ENDPOINT = "https://api.runpod.io/graphql";
 
 /** The RunPod template a fresh pod deploys from (our comfyui-mcp image). */
-export const RUNPOD_TEMPLATE_ID = process.env.RUNPOD_TEMPLATE_ID?.trim() || "bnqtkvcer3";
+const DEFAULT_TEMPLATE_ID = "bnqtkvcer3";
+export const RUNPOD_TEMPLATE_ID = process.env.RUNPOD_TEMPLATE_ID?.trim() || DEFAULT_TEMPLATE_ID;
 /** Our RunPod referral code — a user deploying via the link below credits us. */
 export const RUNPOD_REF_CODE = process.env.RUNPOD_REF_CODE?.trim() || "dkx71w9b";
 /** ComfyUI's external port on a RunPod pod. RunPod ComfyUI templates front ComfyUI
@@ -355,7 +356,13 @@ async function deployOnce(
   opts: RunpodCreateOptions,
 ): Promise<RunpodPod | null> {
   const podName = opts.name ?? "comfyui-mcp";
-  const deadman = opts.deadman ?? RUNPOD_DEADMAN_DEFAULT;
+  const templateId = opts.templateId ?? RUNPOD_TEMPLATE_ID;
+  // Dead-man defaults ON only for OUR stock template — a template override
+  // (RUNPOD_TEMPLATE_ID / opts.templateId) points at an image we don't control:
+  // it has no watchdog (zero protection) and any process in it could read the
+  // injected, UNSCOPED account key (codex finding). Overrides need an explicit
+  // deadman:true — the caller is asserting their image ships the watchdog.
+  const deadman = opts.deadman ?? (templateId === DEFAULT_TEMPLATE_ID && RUNPOD_DEADMAN_DEFAULT);
   const data = await runpodGql<{ podFindAndDeployOnDemand: RunpodPod | null }>(
     `mutation Deploy($input: PodFindAndDeployOnDemandInput!) {
        podFindAndDeployOnDemand(input: $input) {
@@ -367,7 +374,7 @@ async function deployOnce(
         cloudType,
         gpuCount: opts.gpuCount ?? 1,
         gpuTypeId,
-        templateId: opts.templateId ?? RUNPOD_TEMPLATE_ID,
+        templateId,
         name: podName,
         containerDiskInGb: opts.containerDiskInGb ?? 20,
         volumeInGb: opts.volumeInGb ?? 60,

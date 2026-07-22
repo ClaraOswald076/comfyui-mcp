@@ -71,6 +71,31 @@ describe("runpod-watch — status broadcast", () => {
     expect(beatMock).not.toHaveBeenCalled();
   });
 
+  it("keeps heartbeating a managed pod after unwatch — use_local must not self-stop it (#269 codex)", async () => {
+    getPodMock.mockResolvedValue(runningPod());
+    const w = createRunpodWatcher({ push: () => {}, comfyuiIdle: () => false, renderingOnPod: () => true, idleStopMinutes: 0 });
+    w.watch("pod1");
+    await w.poll();
+    expect(beatMock).toHaveBeenCalledTimes(1);
+    w.unwatch(); // UI stops watching; the pod is still OUR managed billing pod
+    beatMock.mockClear();
+    // The janitor (every ~10 polls) owes it beats even with nothing watched.
+    for (let i = 0; i < 10; i++) await w.poll();
+    expect(beatMock).toHaveBeenCalledWith(expect.objectContaining({ id: "pod1", name: "c" }));
+  });
+
+  it("drops a pod from the managed set once it exits (no beats for a dead pod)", async () => {
+    getPodMock.mockResolvedValue(runningPod());
+    const w = createRunpodWatcher({ push: () => {}, comfyuiIdle: () => false, renderingOnPod: () => true, idleStopMinutes: 0 });
+    w.watch("pod1");
+    await w.poll();
+    getPodMock.mockResolvedValue(runningPod({ desiredStatus: "EXITED", runtime: null }));
+    await w.poll(); // poll path sees EXITED → unwatch + managed-set delete
+    beatMock.mockClear();
+    for (let i = 0; i < 10; i++) await w.poll();
+    expect(beatMock).not.toHaveBeenCalled();
+  });
+
   it("clears the frame on unwatch", async () => {
     getPodMock.mockResolvedValue(runningPod());
     const frames: RunpodStatusFrame[] = [];

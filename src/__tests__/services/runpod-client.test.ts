@@ -333,6 +333,26 @@ describe("deadman switch (#269)", () => {
     expect(input.env ?? []).toHaveLength(0);
   });
 
+  it("a custom template gets NO key injection by default (unscoped key must not leak into images we don't control)", async () => {
+    const { fetchMock } = mockGql((b) => (b.query.includes("myself") ? emptyList : deployed("pod1")));
+    await createPod({ gpuTypeIds: ["GPU-A"], name: "custom-tpl-pod", templateId: "some-other-template" });
+    const input = deployInput(fetchMock);
+    expect(input.templateId).toBe("some-other-template");
+    expect(input.ports).toBe("3000/http,22/tcp");
+    const keys = ((input.env ?? []) as Array<{ key: string }>).map((e) => e.key);
+    expect(keys).not.toContain("RUNPOD_API_KEY");
+    expect(keys).not.toContain("DEADMAN_TOKEN");
+  });
+
+  it("a custom template CAN opt in explicitly with deadman:true (caller asserts the image ships the watchdog)", async () => {
+    const { fetchMock } = mockGql((b) => (b.query.includes("myself") ? emptyList : deployed("pod1")));
+    await createPod({ gpuTypeIds: ["GPU-A"], name: "custom-tpl-armed", templateId: "my-rebuild", deadman: true });
+    const input = deployInput(fetchMock);
+    expect(input.ports).toContain("8189/http");
+    const env = Object.fromEntries((input.env as Array<{ key: string; value: string }>).map((e) => [e.key, e.value]));
+    expect(env.DEADMAN_TOKEN).toBe(deadmanToken("custom-tpl-armed"));
+  });
+
   it("beatDeadman heartbeats the pod's proxy URL with the derived token", async () => {
     const fetchMock = vi.fn(async () => ({ ok: true }) as Response);
     global.fetch = fetchMock as unknown as typeof fetch;

@@ -40,8 +40,33 @@ TICK="${DEADMAN_TICK_S:-60}"                 # check cadence (env for tests)
 BEAT_FILE="${DEADMAN_BEAT_FILE:-/tmp/comfyui-mcp-deadman-beat}"
 ENDPOINT="${RUNPOD_GRAPHQL_ENDPOINT:-https://api.runpod.io/graphql}"
 START_TS="$(date +%s)"
+# JSON parsing for the podStop verdict — grep can false-positive on
+# {"data":{"podStop":null}} / errors[].path (codex finding); parse for real.
+PYBIN="$([ -x "${COMFY_HOME:-/opt/ComfyUI}/venv/bin/python" ] && echo "${COMFY_HOME:-/opt/ComfyUI}/venv/bin/python" || command -v python3)"
+
+# The container disk SURVIVES a pod stop/start, so a beat file from the previous
+# boot can already be older than BEAT_GRACE — trust it and we'd stop the pod on
+# the first tick instead of granting boot grace (codex finding). Always start
+# from a clean slate: only beats fresher than THIS watchdog's start count.
+rm -f "${BEAT_FILE}"
 
 log "armed: boot grace ${BOOT_GRACE}s, beat grace ${BEAT_GRACE}s, tick ${TICK}s, beat file ${BEAT_FILE}"
+
+# Exit 0 only on a PARSED, non-null podStop result with no GraphQL errors —
+# anything else (HTTP error, {"podStop":null}, errors[].path) means the pod is
+# still running and we must keep guarding (codex finding).
+stop_accepted() {  # $1 = raw GraphQL response body
+  [ -n "${PYBIN}" ] || return 1
+  printf '%s' "$1" | "${PYBIN}" -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+ps = (d.get("data") or {}).get("podStop")
+sys.exit(0 if (not d.get("errors") and isinstance(ps, dict) and ps.get("id")) else 1)
+'
+}
 
 stop_pod() {  # $1 = reason
   log "STOPPING POD ${RUNPOD_POD_ID}: $1"
@@ -53,12 +78,12 @@ stop_pod() {  # $1 = reason
   rc=$?
   log "podStop rc=${rc}: ${out}"
   # Keep looping on failure (transient API blip must not disarm the guard);
-  # once RunPod accepts the stop the pod goes down and takes us with it.
-  if [ "${rc}" -eq 0 ] && echo "${out}" | grep -q '"podStop"'; then
+  # once RunPod ACCEPTS the stop the pod goes down and takes us with it.
+  if [ "${rc}" -eq 0 ] && stop_accepted "${out}"; then
     log "stop accepted — watchdog done"
     exit 0
   fi
-  log "stop FAILED — retrying next cycle (pod still billing!)"
+  log "stop FAILED or unconfirmed — retrying next cycle (pod still billing!)"
 }
 
 while :; do

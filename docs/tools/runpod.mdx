@@ -25,7 +25,7 @@ Deploy a BRAND-NEW RunPod pod from our comfyui-mcp template (image with the pane
   Auto-connect when booted: the ORCHESTRATOR waits for ComfyUI to answer (1-3min), then retargets + watches — this call returns immediately (default false: deploy only; connect later with runpod_pod_connect).
 </ParamField>
 <ParamField path="deadman" type="boolean">
-  Arm the pod-side dead-man watchdog (default true): the pod STOPS ITSELF if comfyui-mcp's heartbeats stop (process crash/offline — boot grace ~45min, then ~20min without beats). Requires injecting your RunPod API key into the pod's env (unscoped key — any process on the pod could read it); false deploys without the watchdog.
+  Arm the pod-side dead-man watchdog (default true for OUR stock template): the pod STOPS ITSELF if comfyui-mcp's heartbeats stop (process crash/offline — boot grace ~45min, then ~20min without beats). Requires injecting your RunPod API key into the pod's env (unscoped key — any process on the pod could read it); false deploys without the watchdog. With a custom template (RUNPOD_TEMPLATE_ID) the default is OFF — pass true only if that image ships our watchdog.
 </ParamField>
 
 ### Example

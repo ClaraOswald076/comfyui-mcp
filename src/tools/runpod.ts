@@ -208,7 +208,7 @@ export function registerRunpodTools(server: McpServer): void {
       gpu_type: z.string().optional().describe(`GPU type to prefer, e.g. "NVIDIA GeForce RTX 4090". Default tries: ${RUNPOD_DEFAULT_GPU_TYPES.join(", ")}.`),
       cloud_type: z.enum(["COMMUNITY", "SECURE"]).optional().describe("COMMUNITY (cheaper, default) or SECURE."),
       connect: z.boolean().optional().describe("Auto-connect when booted: the ORCHESTRATOR waits for ComfyUI to answer (1-3min), then retargets + watches — this call returns immediately (default false: deploy only; connect later with runpod_pod_connect)."),
-      deadman: z.boolean().optional().describe("Arm the pod-side dead-man watchdog (default true): the pod STOPS ITSELF if comfyui-mcp's heartbeats stop (process crash/offline — boot grace ~45min, then ~20min without beats). Requires injecting your RunPod API key into the pod's env (unscoped key — any process on the pod could read it); false deploys without the watchdog."),
+      deadman: z.boolean().optional().describe("Arm the pod-side dead-man watchdog (default true for OUR stock template): the pod STOPS ITSELF if comfyui-mcp's heartbeats stop (process crash/offline — boot grace ~45min, then ~20min without beats). Requires injecting your RunPod API key into the pod's env (unscoped key — any process on the pod could read it); false deploys without the watchdog. With a custom template (RUNPOD_TEMPLATE_ID) the default is OFF — pass true only if that image ships our watchdog."),
     },
     async (args) => {
       try {

@@ -204,6 +204,12 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
   const connectFailedPods = new Set<string>();
   /** Failure frames by pod — the seed channel, independent of `last`. */
   const failedById = new Map<string, RunpodAlertFrame>();
+  /** Pods we OWE heartbeats — independent of the UI watch lifecycle (#269
+   *  codex finding): runpod_unwatch / use_local only change what we DISPLAY;
+   *  they must not cut a managed pod's only heartbeat and let its watchdog
+   *  self-stop a workload the tools promised would keep running. Membership
+   *  ends only when the pod exits/vanishes (poll or janitor discovers it). */
+  const managedPods = new Set<string>();
   /** Clear + broadcast "resolved" — every removal path (janitor, stop, connect,
    *  vanish, terminal) goes through here so panels RETRACT the alert instead of
    *  keeping a stale billing warning (codex finding). */
@@ -239,22 +245,25 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
         if (f && typeof f.pod_id === "string") {
           failedById.set(f.pod_id, f);
           connectFailedPods.add(f.pod_id);
+          managedPods.add(f.pod_id); // still-billing pod → still owed beats
         }
       }
     } catch {
       // no saved state
     }
   }
-  /** Janitor: every ~10 polls, reconcile failure entries for pods we are NOT
+  /** Janitor: every ~10 polls, reconcile + HEARTBEAT managed pods we are NOT
    *  watching (their stop/vanish never reaches our poll paths — codex finding:
-   *  an externally-stopped loser warned "still billing" forever). */
+   *  an externally-stopped loser warned "still billing" forever; and a
+   *  use_local'd / unwatched pod still needs its beats — codex #269). */
   let reconcileCounter = 0;
-  async function reconcileFailedPods(): Promise<void> {
-    for (const id of [...failedById.keys()]) {
+  async function reconcileManagedPods(): Promise<void> {
+    for (const id of [...managedPods]) {
       if (id === podId) continue; // the watched pod's own poll paths handle it
       try {
         const pod = await getPod(id);
         if (!pod || pod.desiredStatus === "EXITED" || pod.desiredStatus === "TERMINATED" || pod.desiredStatus === "DEAD" || pod.desiredStatus === "PAUSED") {
+          managedPods.delete(id); // gone → no longer ours to mind
           // Same broadcast correction as clearConnectFailed — the janitor's
           // delete must not leave the stale failure on panels (codex).
           const prior = failedById.get(id);
@@ -266,8 +275,8 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
             deps.push({ ...prior, reason: "resolved", resolved: true, status: pod?.desiredStatus ?? "TERMINATED" });
           }
         } else if (pod.desiredStatus === "RUNNING") {
-          // A failed-connect pod is still OUR managed billing pod — feed its
-          // dead-man watchdog too, or it would self-stop while we warn (#269).
+          // Still-billing managed pod: feed its watchdog no matter what the UI
+          // is watching (#269).
           void beatDeadman(pod);
         }
       } catch {
@@ -283,12 +292,13 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
   let inflight: Promise<void> | null = null;
 
   function poll(): Promise<void> {
-    // Janitor tick BEFORE the target check: failures must reconcile even with
-    // NO watched pod (codex finding — an externally-stopped loser warned
-    // "still billing" forever). Cheap: only when failures exist, ~10 polls.
-    if (failedById.size > 0 && ++reconcileCounter >= 10) {
+    // Janitor tick BEFORE the target check: managed pods must reconcile (and
+    // get their heartbeats) even with NO watched pod (codex finding — an
+    // externally-stopped loser warned "still billing" forever; a use_local'd
+    // pod still needs beats — #269). Cheap: only when managed pods exist.
+    if (managedPods.size > 0 && ++reconcileCounter >= 10) {
       reconcileCounter = 0;
-      void reconcileFailedPods();
+      void reconcileManagedPods();
     }
     if (inflight) return inflight;
     inflight = pollOnce().finally(() => {
@@ -319,6 +329,7 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
       // if renders were targeting this pod's proxy, the active target is now
       // DEAD and must fall back to local (#269 dead-target cleanup).
       logger.info(`[runpod-watch] pod ${target} no longer exists — unwatching`);
+      managedPods.delete(target); // gone → no longer owed beats (#269)
       clearFailure(target);
       unwatch();
       deps.onPodUnavailable?.(target);
@@ -339,6 +350,7 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
       const goneTarget = target;
       podId = null;
       idleSinceMs = null;
+      managedPods.delete(goneTarget); // terminal → no longer owed beats (#269)
       deps.onPodUnavailable?.(goneTarget);
       return;
     }
@@ -385,6 +397,7 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
           const goneTarget = target;
           podId = null;
           idleSinceMs = null;
+          managedPods.delete(goneTarget); // stopped → no longer owed beats (#269)
           // Same dead-target cleanup as the vanish path: if renders pointed at
           // this pod, fall back to local (#269).
           deps.onPodUnavailable?.(goneTarget);
@@ -407,6 +420,7 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
     const switching = podId !== id;
     podId = id;
     idleSinceMs = null;
+    managedPods.add(id); // we owe it heartbeats until it exits/vanishes (#269)
     // A SUCCESSFUL connect (we're now rendering on this pod) resolves its past
     // failure — but a watch-ONLY flow (boot monitor, runpod_watch) must not
     // erase a persisted warning for an unconnected, still-billing pod (codex
@@ -444,6 +458,7 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
       // reconnected (watch()).
       connectFailedPods.add(id);
       failedById.set(id, frame);
+      managedPods.add(id); // failed-connect pod is still OURS (billing) — beats
       deps.push(frame);
       persistFailures();
     },
