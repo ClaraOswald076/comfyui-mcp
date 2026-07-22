@@ -1,0 +1,152 @@
+---
+title: "Roadmap"
+description: "What's shipped, what's being built, what's next — and what we've decided not to build, with the reasoning. Ordered by priority, not by date."
+icon: "map"
+---
+
+## How to read this
+
+**There are no dates on this page, and that's deliberate.**
+
+This project ships fast and reorders often — the RunPod arc jumped the queue in
+a single week. A roadmap with quarters on it would be wrong within days, and a
+wrong date is worse than no date: it turns a plan into a promise nobody made.
+
+So this page commits to **order, not timing**. "Next" means next in line, not
+next month. If something here matters to you, say so in
+[Discord](https://discord.gg/cW9arBhzCu) — what people actually do day to day
+moves things up this list far more reliably than the size of the request.
+
+The most useful section is probably the last one. **[Not planned](#not-planned)**
+says what we've decided *against* and why, so you can stop waiting for it.
+
+---
+
+## Shipped
+
+Everything here works today and is covered by the docs.
+
+| Area | What you get |
+|---|---|
+| **Agent in ComfyUI** | The panel puts an agent beside your canvas — it reads the graph, edits nodes, runs workflows, and explains failures. See [Panel](/panel). |
+| **Bring your own model** | Claude, ChatGPT/Codex, Gemini, Antigravity, Grok, Kimi, GLM, Ollama, LM Studio, llama.cpp, OpenRouter, or a custom endpoint — one picker, one orchestrator. See [Backends](/backends). |
+| **Local models** | Fully local operation through Ollama / LM Studio / llama.cpp, including small models. See [Local LLMs](/local-llms). |
+| **Workflow authoring** | Build, patch, slice, validate and lock workflows from natural language; import from an image's metadata. |
+| **Models & custom nodes** | Search, install and repair node packs; find and download models — including working out which models a workflow is missing and which quantisation fits your VRAM. |
+| **Civitai browser** | Browse images, videos and models in-panel, filter by base model and creator, and pull a workflow straight onto the canvas. |
+| **Mobile app** | Chat to the agent, watch the queue, browse LoRAs, and mirror a desktop tab to drive your rig from your phone. See [Mobile](/mobile). |
+| **Remote & cloud** | Point the panel at a remote ComfyUI, a self-hosted relay, or Comfy Cloud. See [Remote connector](/remote-connector). |
+| **RunPod pods** | Create, connect to and stop RunPod pods from the panel, with billing-safe defaults and an honest host indicator. |
+| **LoRA training (local)** | Character LoRAs on FLUX.1-dev, driven by the agent through `train_*` tools in a GPU Docker container — dataset in, `.safetensors` in `models/loras/` out. |
+
+## Building now
+
+Actively in progress. These are the things most likely to move next.
+
+| Item | Where it stands |
+|---|---|
+| **LoRA training on RunPod pods** | The transport landed; follow-up work continues on idle-stop scoping and a dockerless native path for machines without Docker. |
+| **Training beyond character LoRAs** | Style, slider and edit flows, and base models past FLUX.1-dev. The config layer was built to broaden; the flows aren't written yet. |
+
+## Next
+
+Queued and specified, not started. Ordered.
+
+| Item | Why it's here |
+|---|---|
+| **Honest previews in the mobile app** | The app ships **Apps** and **Training** tabs that are placeholders. They read as shipped features and have already misled people into asking how far along they are. Either label them plainly or hide them — the cheapest fix on this list. |
+| **Mobile training** | Wire the mobile Training tab to the trainer that already works. The hard part is done; this is mostly plumbing, and it retires half the item above. |
+| **Apps on mobile** | ComfyUI's workflow-as-form Apps, rendered on the phone — run a workflow without the canvas. The clearest missing capability in the mobile app. |
+| **Tablet layout** | Real, unglamorous responsive work. Worth doing once the screens above have something worth showing. |
+
+## Under consideration
+
+Wanted, but blocked on a design question rather than on effort. No commitment.
+
+### Multi-user sessions
+
+Letting someone else connect to *your* session and drive *your* machine — pair
+debugging a broken workflow, or a shared studio rig.
+
+Worth being precise about the blocker, because it isn't the obvious one:
+**the transport already exists.** Pairing, socket fan-out and per-session auth
+were all built for phone-to-desktop mirroring, which is the same plumbing.
+
+What's missing is a **trust model**. Who is allowed to drive? What can they see
+of your canvas, your history, your file system? How do you revoke access from
+someone mid-run? Those questions need answering before any of it gets built —
+shipping a half-designed answer on someone else's GPU is how people get hurt.
+
+---
+
+## Not planned
+
+Decided against, with the reasoning, so nobody waits on them. Not permanent —
+a good argument reopens any of these — but nothing here is queued.
+
+### Dates and version-numbered milestones
+
+See [the top of this page](#how-to-read-this). Order, not timing.
+
+### Voice-only control (smart glasses, headsets)
+
+Driving the desktop agent by voice from glasses comes up regularly, and the
+plumbing would mostly reuse the mirroring transport.
+
+The reason it isn't queued is that a voice-only surface **has no canvas**.
+There's no preview to glance at, no way to resolve *"use the other LoRA"* when
+two are loaded, and no visible undo when the agent does the wrong thing to your
+graph. Those are the actual problems, and adding a microphone doesn't solve any
+of them. Until there's an answer, this would ship as a demo that's unpleasant
+to rely on.
+
+### Smartwatch
+
+Everything above applies, on a smaller screen with a tighter power budget. Nobody
+has yet described a job it does better than the phone already does.
+
+### A hosted service that runs ComfyUI for you
+
+This project is a **local-first control plane**. It connects to your ComfyUI —
+on your machine, your remote box, your pod, or Comfy Cloud — and it doesn't want
+your files or your prompts. Running inference on your behalf is a different
+product with a different trust model, and it isn't this one.
+
+---
+
+## How it got here
+
+The arc so far, for context on where the next items sit. This is deliberately
+coarse — for what changed in a specific release, see the
+[Changelog](/changelog).
+
+<Note>
+  Public releases begin at **v0.2.0**. There is no v0.0.1 or v0.1.x — the first
+  two weeks of work landed straight on `main` before the package was published,
+  starting from the initial commit on **2026-02-15**.
+</Note>
+
+| Era | Releases | What it was about |
+|---|---|---|
+| **The MCP server**<br/>Feb 2026 | v0.2 – v0.3 | The original idea: drive ComfyUI from an agent. Image generation, workflow analysis, a UI→API workflow converter, hierarchical visualisation, model skills, and the shift from blocking runs to a non-blocking queue with background progress and process control. |
+| **Quiet stretch**<br/>Mar – Apr 2026 | v0.3.x | Three feature commits in two months. Remote ComfyUI over HTTP, subgraph/component expansion in the converter, HTTPS/WSS support. Groundwork, not headlines. |
+| **Environment & lifecycle**<br/>May 2026 | v0.4 – v0.8 | Making it survive real installs: custom-node verify/scaffold with CI, installs pinned to a git ref, auth for gated and private models, declarative environment manifests, cloud storage providers, server-side image conversion, and cached node-skill discovery. The embedded panel was designed at the end of this stretch. |
+| **The panel era**<br/>Jun 2026 | v0.9 – v0.22 | The biggest month by volume (~102 feature commits). The agent moved *into* ComfyUI beside the canvas, gained multiple providers, and grew the infrastructure to run anywhere: one-click installer packs, a RunPod image, a secure `wss://` bridge with an opt-in relay, and live reasoning visibility. |
+| **Reach and depth**<br/>Jul 2026 | v0.23 – v0.44 | Two directions at once. **Reach:** the mobile app, desktop-tab mirroring, the Civitai browser, more providers (Antigravity, GLM, Kimi), and compact tool mode so small local models can drive the tools. **Depth:** the LLM Arena, first-party RunPod pods with billing-safe defaults, LoRA training, and missing-model resolution that accounts for your VRAM. |
+
+Two things that table won't tell you. The pace is uneven on purpose — a
+two-month lull in spring, then ~180 feature commits across June and July.
+And the ordering has never been fixed in advance: RunPod and training both
+jumped the queue because they turned out to matter more than what was
+nominally next. That's the main reason this page carries no dates.
+
+## Something missing?
+
+If you're waiting on something that isn't listed, or one of the "not planned"
+calls looks wrong for how you actually work, open an issue on
+[GitHub](https://github.com/artokun/comfyui-mcp/issues) or say so in
+[Discord](https://discord.gg/cW9arBhzCu).
+
+Requests that describe **what you're trying to do** are far more useful than
+ones that name a feature — several items on this page are ordered the way they
+are because someone explained their day, not because they asked loudest.
