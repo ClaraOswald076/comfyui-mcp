@@ -55,6 +55,20 @@ describe("listDatasets / getDataset", () => {
     expect(() => getDataset("../secrets")).toThrow(/invalid dataset name/);
     expect(() => getDataset("no-such-set")).toThrow(/no dataset/);
   });
+
+  it("excludes internal staging dirs from list AND detail (codex: partial sets must not train)", () => {
+    stageDataset("partial.staging-1234-abcd", [["img_00001.png", "x"]]);
+    expect(listDatasets().map((d) => d.name)).not.toContain("partial.staging-1234-abcd");
+    expect(() => getDataset("partial.staging-1234-abcd")).toThrow(/staging/);
+  });
+
+  it("accepts dot-prefixed dataset names (legal per sanitizeDirName — list and detail must agree)", () => {
+    stageDataset(".portrait", [["img_00001.png", "y"]]);
+    expect(listDatasets().map((d) => d.name)).toContain(".portrait");
+    expect(getDataset(".portrait").items).toHaveLength(1);
+    expect(() => getDataset("..")).toThrow(/invalid dataset name/);
+    expect(() => getDataset(".")).toThrow(/invalid dataset name/);
+  });
 });
 
 describe("readTrainingFile (train_file)", () => {

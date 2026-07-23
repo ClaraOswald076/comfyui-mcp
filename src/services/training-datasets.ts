@@ -43,11 +43,17 @@ function contained(child: string, root: string): boolean {
   return norm(c) === norm(r) || norm(c).startsWith(norm(r) + sep);
 }
 
-/** Resolve a dataset dir by NAME, with traversal + existence checks. */
+/** Resolve a dataset dir by NAME. Rules mirror prepareDataset's sanitizeDirName
+ *  (dot-prefixed names like ".portrait" are legal dataset dirs; dots-only
+ *  collapses and separators are not). Staging dirs from in-flight/crashed
+ *  prepares are internal and never resolve here (codex finding). */
 function datasetDir(name: string): string {
   const clean = name.trim();
-  if (!clean || clean !== basename(clean) || clean.startsWith(".")) {
+  if (!clean || clean !== basename(clean) || /^\.+$/.test(clean)) {
     throw new Error(`invalid dataset name "${name}"`);
+  }
+  if (clean.includes(".staging-")) {
+    throw new Error(`"${clean}" is an internal staging dir, not a dataset`);
   }
   const dir = join(datasetsRoot(), clean);
   if (!contained(dir, datasetsRoot())) {
@@ -81,12 +87,14 @@ function summarize(dir: string, name: string): DatasetSummary {
   };
 }
 
-/** Every staged dataset, newest first. */
+/** Every staged dataset, newest first. Internal staging dirs from in-flight
+ *  or crashed prepares (`<name>.staging-<pid>-<rand>`) are NOT datasets — an
+ *  abandoned partial set must never be advertised as trainable (codex). */
 export function listDatasets(): DatasetSummary[] {
   const root = datasetsRoot();
   if (!existsSync(root)) return [];
   return readdirSync(root, { withFileTypes: true })
-    .filter((d) => d.isDirectory())
+    .filter((d) => d.isDirectory() && !d.name.includes(".staging-"))
     .map((d) => summarize(join(root, d.name), d.name))
     .filter((s) => s.imageCount > 0)
     .sort((a, b) => b.modified.localeCompare(a.modified));
