@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeAll, afterAll, vi } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -168,6 +168,20 @@ describe("updateDataset / deleteDataset", () => {
     expect(r.warnings).toHaveLength(2);
     const d = getDataset("alpha");
     expect(d.items).toEqual([{ file: "img_00001.png", caption: "ohwx a person, smiling" }]);
+  });
+
+  it("rejects non-image mutation targets (caption sidecars, cache files)", async () => {
+    const dir = join(root, "datasets", "alpha");
+    writeFileSync(join(dir, "img_00001.txt"), "cap");
+    writeFileSync(join(dir, "cache.bin"), "x");
+    const r = await updateDataset("alpha", {
+      setCaptions: { "img_00001.txt": "hijack", "cache.bin": "hijack" },
+      deleteImages: ["img_00001.txt", "cache.bin"],
+    });
+    expect(r.captionsSet).toBe(0);
+    expect(r.imagesDeleted).toBe(0);
+    expect(r.warnings).toHaveLength(4);
+    expect(readFileSync(join(dir, "img_00001.txt"), "utf-8")).toBe("cap"); // untouched
   });
 
   it("rejects edits and deletes while a running job trains from the dataset", async () => {

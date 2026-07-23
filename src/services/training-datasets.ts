@@ -133,7 +133,7 @@ function samePath(a: string, b: string): boolean {
 /** A dataset dir a RUNNING/QUEUED job trains from must not be edited or
  *  deleted (the dir is bind-mounted into the running container — same guard
  *  as prepareDataset's replace check, codex finding lineage). */
-async function assertDatasetEditable(dir: string, what: string): Promise<void> {
+export async function assertDatasetEditable(dir: string, what: string): Promise<void> {
   const active = await listJobs();
   const inUse = active.find(
     (j) => (j.status === "running" || j.status === "queued") && j.datasetPath && samePath(j.datasetPath, dir),
@@ -161,12 +161,12 @@ export async function updateDataset(
   let captionsSet = 0;
   let imagesDeleted = 0;
   for (const [file, caption] of Object.entries(opts.setCaptions ?? {})) {
-    if (file !== basename(file)) {
-      warnings.push(`${file}: skipped (not a plain filename)`);
+    if (file !== basename(file) || !IMAGE_EXTS.has(extname(file).toLowerCase())) {
+      warnings.push(`${file}: skipped (not a supported image file)`);
       continue;
     }
     const img = join(dir, file);
-    if (!existsSync(img)) {
+    if (!existsSync(img) || !statSync(img).isFile()) {
       warnings.push(`${file}: no such image — caption not written`);
       continue;
     }
@@ -177,12 +177,12 @@ export async function updateDataset(
     captionsSet++;
   }
   for (const file of opts.deleteImages ?? []) {
-    if (file !== basename(file)) {
-      warnings.push(`${file}: skipped (not a plain filename)`);
+    if (file !== basename(file) || !IMAGE_EXTS.has(extname(file).toLowerCase())) {
+      warnings.push(`${file}: skipped (not a supported image file)`);
       continue;
     }
     const img = join(dir, file);
-    if (!existsSync(img)) {
+    if (!existsSync(img) || !statSync(img).isFile()) {
       warnings.push(`${file}: no such image`);
       continue;
     }
