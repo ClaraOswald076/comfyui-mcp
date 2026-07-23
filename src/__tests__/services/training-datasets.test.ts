@@ -226,7 +226,7 @@ describe("previewConfig", () => {
 });
 
 describe("deleteJob", () => {
-  function writeJob(id: string, status: string) {
+  function writeJob(id: string, status: string, containerName?: string) {
     const jobDir = join(root, "jobs", id);
     mkdirSync(jobDir, { recursive: true });
     writeFileSync(join(jobDir, "config.yml"), "job: extension\n");
@@ -234,6 +234,7 @@ describe("deleteJob", () => {
       join(root, "jobs", `${id}.json`),
       JSON.stringify({
         id, name: id, flow: "character", model: "flux1-dev", status,
+        ...(containerName ? { containerName } : {}),
         progress: { samples: [] }, datasetPath: join(root, "datasets", "alpha"),
         jobDir, outputDir: join(jobDir, "output"), log: [],
         createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
@@ -262,5 +263,29 @@ describe("deleteJob", () => {
     expect(existsSync(join(root, "jobs", "livejob.json"))).toBe(true);
     await expect(deleteJob("no-such-job")).rejects.toThrow(/no training job/);
     rmSync(join(root, "jobs", "livejob.json"), { force: true });
+  });
+
+  it("a CANCELLED job deletes only when its container is verified gone (codex r3 BLOCKER)", async () => {
+    const { deleteJob } = await import("../../services/training-jobs.js");
+    writeJob("cjob", "cancelled", "comfyui-train-cjob");
+    // Container still ALIVE (or unknown) → refuse: the registry must not be
+    // erased while training may be live.
+    await expect(
+      deleteJob("cjob", {}, { containerRunning: () => Promise.resolve(true) }),
+    ).rejects.toThrow(/unconfirmed/);
+    expect(existsSync(join(root, "jobs", "cjob.json"))).toBe(true);
+    // Verified gone → delete proceeds.
+    await deleteJob("cjob", {}, { containerRunning: () => Promise.resolve(false) });
+    expect(existsSync(join(root, "jobs", "cjob.json"))).toBe(false);
+  });
+
+  it("refresh prunes disk-deleted records from the in-memory registry (codex r3 MAJOR)", async () => {
+    const jobs = await import("../../services/training-jobs.js");
+    writeJob("ghost", "completed");
+    // Seed the cache via listJobs, then delete the FILE and re-list.
+    await jobs.listJobs();
+    rmSync(join(root, "jobs", "ghost.json"), { force: true });
+    const after = await jobs.listJobs();
+    expect(after.find((j) => j.id === "ghost")).toBeUndefined();
   });
 });
