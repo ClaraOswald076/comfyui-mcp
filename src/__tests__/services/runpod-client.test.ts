@@ -368,7 +368,7 @@ describe("deadman switch (#269)", () => {
     expect(Number(env.DEADMAN_BEAT_GRACE_S)).toBeGreaterThanOrEqual(60);
   });
 
-  it("deadman:false deploys WITHOUT the key/token/heartbeat port", async () => {
+  it("deadman:false deploys WITHOUT the watchdog token/grace env or heartbeat port", async () => {
     const { fetchMock } = mockGql((b) => (b.query.includes("myself") ? emptyList : deployed("pod1")));
     await createPod({ gpuTypeIds: ["GPU-A"], name: "plain-pod", deadman: false });
     const input = deployInput(fetchMock);
