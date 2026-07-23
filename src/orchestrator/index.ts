@@ -2225,8 +2225,23 @@ export async function runPanelOrchestrator(): Promise<void> {
     if (event.type === "hello" && event.tab_id) {
       const panelTab = event.tab_id;
       // Retarget ComfyUI to the URL the browser was served from (window.location),
-      // BEFORE the readiness probe so the "ready" ack reflects the right instance.
-      applyComfyuiUrl((event as { comfyui_url?: unknown }).comfyui_url);
+      // BEFORE the readiness probe so the "ready" ack reflects the right instance —
+      // but a hello can arrive from a STALE browser tab on a DEAD instance (E2E
+      // finding: a zombie :8189 tab kept retargeting the orchestrator to a corpse
+      // and silently breaking every tool that probes the target). Probe
+      // loopback/LAN hellos first; RunPod proxies skip the probe (booting pods
+      // answer late — readiness is the connector's job).
+      const helloUrl = (event as { comfyui_url?: unknown }).comfyui_url;
+      void (async () => {
+        if (typeof helloUrl === "string" && !/\.proxy\.runpod\.net/i.test(helloUrl)) {
+          const base = helloUrl.trim().replace(/\/+$/, "");
+          if (base && !(await probeOk(`${base}/system_stats`, 3_000))) {
+            logger.warn(`[panel-orchestrator] ignoring hello retarget to unreachable ${base} (stale tab on a dead instance?) — keeping ${comfyuiUrl}`);
+            return;
+          }
+        }
+        applyComfyuiUrl(helloUrl);
+      })();
       // Re-advertise the secure bridge on EVERY hello, not just when the URL
       // changes: advertiseBridge's own retries are short (~3s) and can race a
       // pod-side ComfyUI restart, permanently leaving the pod's stored bridge
