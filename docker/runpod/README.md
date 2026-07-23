@@ -364,13 +364,14 @@ without a pod-side guard the pod would bill forever. So:
   beat once managed, or 45 min after boot with no heartbeat at all
   (`DEADMAN_BEAT_GRACE_S` / `DEADMAN_BOOT_GRACE_S`).
 
-It arms only when the pod env carries `RUNPOD_API_KEY` + `RUNPOD_POD_ID` +
-`DEADMAN_TOKEN` — which `runpod_pod_create` injects (the watchdog needs the
-owner's key *on the pod* to stop it; RunPod has no scoped keys — opt out with
-`deadman:false` / `RUNPOD_DEADMAN=0` at create, or `DEADMAN_DISABLE=1` as a pod
-env). Console-deployed pods never carry the key, so their watchdog stays inert.
-The token is derived from the API key + unique deploy name and authorizes
-heartbeats **only** — it is not the API key and cannot stop the pod.
+The stop is authorized by the **pod-scoped `RUNPOD_API_KEY` RunPod auto-injects
+into every pod** — the owner's account-wide key never leaves the orchestrator.
+Arming is signaled by the pod env carrying `DEADMAN_TOKEN` (injected by
+`runpod_pod_create`; a sha256 of key + unique deploy name, authorizes
+heartbeats **only** — it is not an API key and cannot stop the pod).
+Console-deployed pods have no token, so their watchdog stays inert. Opt out of
+arming with `deadman:false` / `RUNPOD_DEADMAN=0` at create, or
+`DEADMAN_DISABLE=1` as a pod env.
 
 ---
 

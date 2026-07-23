@@ -14,10 +14,12 @@
 # STOP (not terminate): the /workspace volume survives and the pod can be
 # resumed later — same severity as the in-process idle auto-stop.
 #
-# Requires RUNPOD_API_KEY + RUNPOD_POD_ID in the pod env (injected at create;
-# RunPod has no scoped keys, which is exactly why this feature is opt-out via
-# `deadman:false` / RUNPOD_DEADMAN=0 at create time, or DEADMAN_DISABLE=1 as a
-# pod env any time). RUNPOD_GRAPHQL_ENDPOINT is overridable for tests.
+# Requires RUNPOD_POD_ID + DEADMAN_TOKEN in the pod env. The stop itself is
+# authorized by RUNPOD_API_KEY — the POD-SCOPED key RunPod auto-injects into
+# every pod (docs.runpod.io/pods/templates/environment-variables), NOT the
+# owner's account key, which never leaves the orchestrator. Opt out of arming
+# with `deadman:false` / RUNPOD_DEADMAN=0 at create time, or DEADMAN_DISABLE=1
+# as a pod env any time. RUNPOD_GRAPHQL_ENDPOINT is overridable for tests.
 # =============================================================================
 set -uo pipefail
 

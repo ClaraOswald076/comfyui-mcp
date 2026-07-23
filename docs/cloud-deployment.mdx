@@ -67,12 +67,13 @@ seconds; if the beats stop, the pod **stops itself** (never terminates — your
 heartbeat, then 20 min between beats; `RUNPOD_DEADMAN_BOOT_GRACE_S` /
 `RUNPOD_DEADMAN_BEAT_GRACE_S`). "Minding" survives **Use Local** and
 **Unwatch** — those only change what the UI shows; the watchdog fires only
-when comfyui-mcp itself is gone (or the pod exits). The watchdog needs your
-RunPod API key *on the pod* to stop it, so create injects it as a pod env var —
-RunPod has no scoped keys, so if you'd rather not have the key on the pod, opt
-out with `deadman:false` on `runpod_pod_create` (or `RUNPOD_DEADMAN=0`), or
-`DEADMAN_DISABLE=1` as a pod env. Console-deployed pods never carry it, and
-custom-template deploys (`RUNPOD_TEMPLATE_ID`) default it **off** — pass
+when comfyui-mcp itself is gone (or the pod exits). The watchdog stops the pod
+with the **pod-scoped API key RunPod auto-injects into every pod** — your
+account-wide key never leaves your machine, and there is nothing credential-
+wise to opt out of. Leave it unarmed with `deadman:false` on
+`runpod_pod_create` (or `RUNPOD_DEADMAN=0`), or `DEADMAN_DISABLE=1` as a pod
+env. Console-deployed pods never carry the heartbeat token, and custom-
+template deploys (`RUNPOD_TEMPLATE_ID`) default it **off** — pass
 `deadman:true` only if that image ships our watchdog.
 
 <Note>

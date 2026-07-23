@@ -280,8 +280,9 @@ command -v croc >/dev/null 2>&1 && log "croc available (on-demand P2P transfer)"
 # Dead-man switch (#269): pods created via runpod_pod_create carry a heartbeat
 # server (:8189, token-gated) + a watchdog loop that STOPS THE POD if
 # comfyui-mcp's heartbeats stop (orchestrator crash/offline = the in-process
-# idle auto-stop died with it). Only armed when the create injected
-# RUNPOD_API_KEY + DEADMAN_TOKEN — console-deployed pods stay inert.
+# idle auto-stop died with it). The stop is authorized by the POD-SCOPED
+# RUNPOD_API_KEY RunPod auto-injects (never the owner's account key). Arms
+# only when the pod env carries DEADMAN_TOKEN — console-deployed pods stay inert.
 if [ "${DEADMAN_DISABLE:-0}" = "1" ]; then
   log "dead-man switch disabled (DEADMAN_DISABLE=1)"
 elif [ -n "${RUNPOD_API_KEY:-}" ] && [ -n "${RUNPOD_POD_ID:-}" ] && [ -n "${DEADMAN_TOKEN:-}" ] \

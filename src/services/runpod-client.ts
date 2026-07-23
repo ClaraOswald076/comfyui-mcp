@@ -119,17 +119,19 @@ export async function runpodGql<T = unknown>(
 // so additive API changes never break us; only changes to fields we USE do.
 
 const PortSchema = z.looseObject({
-  ip: z.string(),
-  isIpPublic: z.boolean(),
-  privatePort: z.number(),
-  publicPort: z.number(),
-  type: z.string(),
+  // Every leaf nullable: RunPod's GraphQL declares these WITHOUT `!` — a null
+  // port field or GPU reading is API-VALID and must not throw (#269 r2).
+  ip: z.string().nullable(),
+  isIpPublic: z.boolean().nullable(),
+  privatePort: z.number().nullable(),
+  publicPort: z.number().nullable(),
+  type: z.string().nullable(),
 });
 
 const GpuRuntimeSchema = z.looseObject({
-  id: z.string(),
-  gpuUtilPercent: z.number(),
-  memoryUtilPercent: z.number(),
+  id: z.string().nullable(),
+  gpuUtilPercent: z.number().nullable(),
+  memoryUtilPercent: z.number().nullable(),
 });
 
 const PodSchema = z.looseObject({
@@ -165,17 +167,17 @@ function validate<S extends z.ZodType>(schema: S, data: unknown, what: string): 
 // ── Typed shapes (only the fields we use) ────────────────────────────────────
 
 export interface RunpodPort {
-  ip: string;
-  isIpPublic: boolean;
-  privatePort: number;
-  publicPort: number;
-  type: string; // "http" | "tcp"
+  ip: string | null;
+  isIpPublic: boolean | null;
+  privatePort: number | null;
+  publicPort: number | null;
+  type: string | null; // "http" | "tcp"
 }
 
 export interface RunpodGpuRuntime {
-  id: string;
-  gpuUtilPercent: number;
-  memoryUtilPercent: number;
+  id: string | null;
+  gpuUtilPercent: number | null;
+  memoryUtilPercent: number | null;
 }
 
 export interface RunpodPod {
@@ -212,7 +214,7 @@ export async function getPod(podId: string): Promise<RunpodPod | null> {
     `query Pod($input: PodFilter!) { pod(input: $input) { ${POD_FIELDS} } }`,
     { input: { podId } },
   );
-  validate(z.looseObject({ pod: PodSchema.nullish() }), data, `getPod(${podId})`);
+  validate(z.looseObject({ pod: PodSchema.nullable() }), data, `getPod(${podId})`);
   return data.pod ?? null;
 }
 
@@ -221,7 +223,10 @@ export async function listPods(): Promise<RunpodPod[]> {
   const data = await runpodGql<{ myself: { pods: RunpodPod[] } | null }>(
     `query { myself { pods { ${POD_FIELDS} } } }`,
   );
-  validate(z.looseObject({ myself: z.looseObject({ pods: z.array(PodSchema) }).nullish() }), data, "listPods");
+  // Nullable-but-REQUIRED wrappers: an ABSENT property is an API shape change
+  // and must throw (never read as "no such pod" — codex r2), while an explicit
+  // null is a legitimate answer.
+  validate(z.looseObject({ myself: z.looseObject({ pods: z.array(PodSchema) }).nullable() }), data, "listPods");
   return data.myself?.pods ?? [];
 }
 
@@ -260,10 +265,13 @@ export function comfyuiPortExposed(pod: RunpodPod): boolean {
 // DEADMAN_PORT plus a loop that stops the pod itself when our heartbeats stop.
 // Semantics: while comfyui-mcp minds a pod it beats every poll; if it vanishes
 // (crash/offline) the pod STOPS ITSELF after the beat grace — a managed pod is
-// never orphaned into infinite billing. Tradeoff (documented to the user at
-// create): the watchdog needs the owner's RunPod API key on the pod to stop it,
-// so createPod injects it as a pod env var (opt out with deadman:false /
-// RUNPOD_DEADMAN=0; pods deployed from the console never carry it).
+// never orphaned into infinite billing.
+// CREDENTIALS: the watchdog stops the pod with the POD-SCOPED RunPod API key
+// that RunPod auto-injects into every pod (docs.runpod.io/pods/templates/
+// environment-variables) — the owner's account-wide key NEVER leaves the
+// orchestrator. No key injection, nothing to opt out of on credential grounds;
+// `deadman:false` / RUNPOD_DEADMAN=0 / pod env DEADMAN_DISABLE=1 simply leave
+// the watchdog unarmed.
 
 /** The pod's heartbeat-server port (exposed as an HTTP proxy port at create). */
 export const RUNPOD_DEADMAN_PORT = 8189;
@@ -358,10 +366,10 @@ async function deployOnce(
   const podName = opts.name ?? "comfyui-mcp";
   const templateId = opts.templateId ?? RUNPOD_TEMPLATE_ID;
   // Dead-man defaults ON only for OUR stock template — a template override
-  // (RUNPOD_TEMPLATE_ID / opts.templateId) points at an image we don't control:
-  // it has no watchdog (zero protection) and any process in it could read the
-  // injected, UNSCOPED account key (codex finding). Overrides need an explicit
-  // deadman:true — the caller is asserting their image ships the watchdog.
+  // (RUNPOD_TEMPLATE_ID / opts.templateId) points at an image we can't verify
+  // SHIPS the watchdog (arming one without it would silently grant nothing).
+  // Overrides need an explicit deadman:true — the caller is asserting their
+  // image ships the watchdog.
   const deadman = opts.deadman ?? (templateId === DEFAULT_TEMPLATE_ID && RUNPOD_DEADMAN_DEFAULT);
   const data = await runpodGql<{ podFindAndDeployOnDemand: RunpodPod | null }>(
     `mutation Deploy($input: PodFindAndDeployOnDemandInput!) {
@@ -388,12 +396,11 @@ async function deployOnce(
         env: [
           // SSH auth for the trainer: the template injects this at boot.
           ...(opts.publicKey ? [{ key: "PUBLIC_KEY", value: opts.publicKey }] : []),
-          // Dead-man switch (#269): the watchdog needs the owner's key ON the
-          // pod to stop itself (RunPod has no scoped keys) — see the section
-          // comment above for the tradeoff + opt-outs.
+          // Dead-man switch (#269): heartbeat token + grace knobs. NO API key
+          // here — the watchdog self-stops with the POD-SCOPED key RunPod
+          // auto-injects; the owner's account key never leaves this process.
           ...(deadman
             ? [
-                { key: "RUNPOD_API_KEY", value: getApiKey() },
                 { key: "DEADMAN_TOKEN", value: deadmanToken(podName) },
                 { key: "DEADMAN_BOOT_GRACE_S", value: String(DEADMAN_BOOT_GRACE_S) },
                 { key: "DEADMAN_BEAT_GRACE_S", value: String(DEADMAN_BEAT_GRACE_S) },
@@ -403,7 +410,11 @@ async function deployOnce(
       },
     },
   );
-  validate(z.looseObject({ podFindAndDeployOnDemand: PodSchema.nullish() }), data, "createPod(deploy)");
+  // Nullable-but-REQUIRED: explicit null = "no capacity for this slot" (try
+  // the next), but an ABSENT property is a shape change → validate THROWS →
+  // createPod's generic catch treats the create as AMBIGUOUS and reconciles
+  // instead of falling through to another billed attempt (codex r2).
+  validate(z.looseObject({ podFindAndDeployOnDemand: PodSchema.nullable() }), data, "createPod(deploy)");
   const pod = data.podFindAndDeployOnDemand;
   return pod?.id ? ({ ...pod, runtime: pod.runtime ?? null } as RunpodPod) : null;
 }

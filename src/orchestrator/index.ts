@@ -3732,6 +3732,17 @@ export async function runPanelOrchestrator(): Promise<void> {
     idleStopMinutes: runpodIdleStopMinutes,
   });
 
+  // Boot re-watch (#269 r2): a restart rebuilds the watcher EMPTY — a pod that
+  // stayed the ACTIVE target across the restart (its proxy URL is still the
+  // configured target) would otherwise get no more heartbeats and self-stop
+  // ~20min later even though renders keep flowing. Re-watch it immediately:
+  // beats + live status resume, and its dead-man watchdog stays fed.
+  const bootPodMatch = getComfyUIBaseUrl().match(/^https:\/\/([a-z0-9]+)-\d+\.proxy\.runpod\.net/i);
+  if (bootPodMatch) {
+    logger.info(`[panel-orchestrator] re-watching active RunPod target ${bootPodMatch[1]} after restart`);
+    getRunpodWatcher()?.watch(bootPodMatch[1]);
+  }
+
   // Money guard (codex #263): the idle predicate above trusts persisted
   // training records blindly (hasActiveTrainingJob is a probe-free file scan),
   // and owner-death reconciliation otherwise only runs via getJob/listJobs —

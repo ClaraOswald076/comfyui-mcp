@@ -298,6 +298,47 @@ describe("response validation (#269 — no more blind casts)", () => {
     global.fetch = vi.fn(async () => gqlResponse({ data: { pod: noStatus } })) as unknown as typeof fetch;
     await expect(getPod("pod1")).rejects.toThrow(/unexpected shape/);
   });
+
+  it("throws when the pod PROPERTY is absent entirely (must never read as 'pod vanished')", async () => {
+    global.fetch = vi.fn(async () => gqlResponse({ data: {} })) as unknown as typeof fetch;
+    await expect(getPod("pod1")).rejects.toThrow(/unexpected shape/);
+    // …while an EXPLICIT null is the legitimate "no such pod" answer.
+    global.fetch = vi.fn(async () => gqlResponse({ data: { pod: null } })) as unknown as typeof fetch;
+    await expect(getPod("pod1")).resolves.toBeNull();
+  });
+
+  it("accepts API-valid NULL telemetry (port fields, GPU readings are nullable in RunPod's schema)", async () => {
+    global.fetch = vi.fn(async () =>
+      gqlResponse({
+        data: {
+          pod: {
+            ...goodPod,
+            runtime: {
+              uptimeInSeconds: null,
+              ports: [{ ip: null, isIpPublic: null, privatePort: null, publicPort: null, type: null }],
+              gpus: [{ id: null, gpuUtilPercent: null, memoryUtilPercent: null }],
+            },
+          },
+        },
+      }),
+    ) as unknown as typeof fetch;
+    const pod = await getPod("pod1");
+    expect(pod?.runtime?.gpus?.[0]?.gpuUtilPercent).toBeNull();
+  });
+
+  it("an ABSENT deploy-result property is AMBIGUOUS — never a billed retry (codex r2)", async () => {
+    let deployAttempts = 0;
+    global.fetch = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      const body = JSON.parse((init as { body: string }).body) as GqlBody;
+      if (body.query.includes("podFindAndDeployOnDemand")) {
+        deployAttempts++;
+        return gqlResponse({ data: {} }); // shape change: property missing
+      }
+      return gqlResponse(emptyList);
+    }) as unknown as typeof fetch;
+    await expect(createPod({ gpuTypeIds: ["GPU-A", "GPU-B"], name: "x" })).rejects.toThrow(/could not be confirmed|unexpected shape|NOT retrying/i);
+    expect(deployAttempts).toBe(1); // NO blind billed retry on a malformed response
+  });
 });
 
 describe("deadman switch (#269)", () => {
@@ -313,13 +354,15 @@ describe("deadman switch (#269)", () => {
     expect(deadmanToken("pod-a")).not.toContain("rp-test-key"); // derived, never the raw key
   });
 
-  it("injects the watchdog env + heartbeat port by default", async () => {
+  it("injects the watchdog token + grace + heartbeat port by default — and NEVER the account key", async () => {
     const { fetchMock } = mockGql((b) => (b.query.includes("myself") ? emptyList : deployed("pod1")));
     await createPod({ gpuTypeIds: ["GPU-A"], name: "dm-pod" });
     const input = deployInput(fetchMock);
     expect(input.ports).toContain(`${RUNPOD_DEADMAN_PORT}/http`);
     const env = Object.fromEntries((input.env as Array<{ key: string; value: string }>).map((e) => [e.key, e.value]));
-    expect(env.RUNPOD_API_KEY).toBe("rp-test-key");
+    // The watchdog self-stops with RunPod's auto-injected POD-SCOPED key —
+    // the owner's account-wide key must never leave this process (codex r2).
+    expect(env.RUNPOD_API_KEY).toBeUndefined();
     expect(env.DEADMAN_TOKEN).toBe(deadmanToken("dm-pod"));
     expect(Number(env.DEADMAN_BOOT_GRACE_S)).toBeGreaterThanOrEqual(60);
     expect(Number(env.DEADMAN_BEAT_GRACE_S)).toBeGreaterThanOrEqual(60);

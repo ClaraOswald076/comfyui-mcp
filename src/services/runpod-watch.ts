@@ -208,8 +208,29 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
    *  codex finding): runpod_unwatch / use_local only change what we DISPLAY;
    *  they must not cut a managed pod's only heartbeat and let its watchdog
    *  self-stop a workload the tools promised would keep running. Membership
-   *  ends only when the pod exits/vanishes (poll or janitor discovers it). */
+   *  ends only when the pod exits/vanishes (poll or janitor discovers it) —
+   *  or when the beat leash below decides there is no watchdog to feed. */
   const managedPods = new Set<string>();
+  /** First failed-beat timestamp per managed pod. Pods that NEVER ack a beat
+   *  (no watchdog — console deploys, deadman:false, pre-image pods) must not
+   *  cost a janitor API call forever (codex r2): after 25min of straight
+   *  failures (one grace longer than the pod's own beat grace — if it HAD a
+   *  watchdog it has already self-stopped) the pod drops out of managed. */
+  const managedBeatFailSince = new Map<string, number>();
+  const MANAGED_BEAT_FAIL_DROP_MS = 25 * 60_000;
+  async function beat(pod: RunpodPod): Promise<void> {
+    if (await beatDeadman(pod)) {
+      managedBeatFailSince.delete(pod.id);
+      return;
+    }
+    const since = managedBeatFailSince.get(pod.id) ?? now();
+    managedBeatFailSince.set(pod.id, since);
+    if (now() - since > MANAGED_BEAT_FAIL_DROP_MS) {
+      managedBeatFailSince.delete(pod.id);
+      managedPods.delete(pod.id);
+      logger.info(`[runpod-watch] pod ${pod.id} never acked a heartbeat in 25min — no watchdog there; un-managing`);
+    }
+  }
   /** Clear + broadcast "resolved" — every removal path (janitor, stop, connect,
    *  vanish, terminal) goes through here so panels RETRACT the alert instead of
    *  keeping a stale billing warning (codex finding). */
@@ -264,6 +285,7 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
         const pod = await getPod(id);
         if (!pod || pod.desiredStatus === "EXITED" || pod.desiredStatus === "TERMINATED" || pod.desiredStatus === "DEAD" || pod.desiredStatus === "PAUSED") {
           managedPods.delete(id); // gone → no longer ours to mind
+          managedBeatFailSince.delete(id);
           // Same broadcast correction as clearConnectFailed — the janitor's
           // delete must not leave the stale failure on panels (codex).
           const prior = failedById.get(id);
@@ -276,8 +298,8 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
           }
         } else if (pod.desiredStatus === "RUNNING") {
           // Still-billing managed pod: feed its watchdog no matter what the UI
-          // is watching (#269).
-          void beatDeadman(pod);
+          // is watching (#269). Leashed — never-acking pods drop out (r2).
+          void beat(pod);
         }
       } catch {
         // unknown — keep the warning (cost-safe direction)
@@ -291,14 +313,19 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
   // it (no second concurrent RunPod request) instead of starting an overlap.
   let inflight: Promise<void> | null = null;
 
+  let reconcileInFlight = false;
   function poll(): Promise<void> {
     // Janitor tick BEFORE the target check: managed pods must reconcile (and
     // get their heartbeats) even with NO watched pod (codex finding — an
     // externally-stopped loser warned "still billing" forever; a use_local'd
-    // pod still needs beats — #269). Cheap: only when managed pods exist.
-    if (managedPods.size > 0 && ++reconcileCounter >= 10) {
+    // pod still needs beats — #269). Cheap: only when managed pods exist, and
+    // never overlapping (a slow sweep must not stack, codex r2).
+    if (managedPods.size > 0 && !reconcileInFlight && ++reconcileCounter >= 10) {
       reconcileCounter = 0;
-      void reconcileManagedPods();
+      reconcileInFlight = true;
+      void reconcileManagedPods().finally(() => {
+        reconcileInFlight = false;
+      });
     }
     if (inflight) return inflight;
     inflight = pollOnce().finally(() => {
@@ -330,6 +357,7 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
       // DEAD and must fall back to local (#269 dead-target cleanup).
       logger.info(`[runpod-watch] pod ${target} no longer exists — unwatching`);
       managedPods.delete(target); // gone → no longer owed beats (#269)
+      managedBeatFailSince.delete(target);
       clearFailure(target);
       unwatch();
       deps.onPodUnavailable?.(target);
@@ -351,6 +379,7 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
       podId = null;
       idleSinceMs = null;
       managedPods.delete(goneTarget); // terminal → no longer owed beats (#269)
+      managedBeatFailSince.delete(goneTarget);
       deps.onPodUnavailable?.(goneTarget);
       return;
     }
@@ -398,6 +427,7 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
           podId = null;
           idleSinceMs = null;
           managedPods.delete(goneTarget); // stopped → no longer owed beats (#269)
+          managedBeatFailSince.delete(goneTarget);
           // Same dead-target cleanup as the vanish path: if renders pointed at
           // this pod, fall back to local (#269).
           deps.onPodUnavailable?.(goneTarget);
@@ -411,7 +441,7 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
     // Dead-man heartbeat (#269): while we manage this pod, feed its pod-side
     // watchdog — if this process dies, beats stop and the pod stops ITSELF.
     // Best-effort (own timeout, errors swallowed): never breaks the status path.
-    if (running) void beatDeadman(pod);
+    if (running) void beat(pod);
 
     pushIfChanged(frameFor(pod, idleSeconds, autostopIn));
   }
