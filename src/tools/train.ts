@@ -59,10 +59,14 @@ async function resolvePodForTraining(podId?: string): Promise<import("../service
 
 const paramsSchema = z
   .object({
-    steps: z.number().int().min(1).optional().describe("Total training steps (200 = smoke test, 1500-3000 real)."),
-    lr: z.number().positive().optional().describe("Learning rate."),
-    rank: z.number().int().min(1).optional().describe("LoRA rank (16 simple, 16-32 detailed)."),
-    resolution: z.array(z.number().int().positive()).min(1).optional().describe("Resolution buckets, e.g. [512,768,1024]."),
+    // Upper bounds (panel #104): the Custom preset is free-form, and a typo
+    // like steps=10^9 / rank=100000 / resolution=100000 starts a doomed,
+    // OOM, BILLED run. Ceilings are generous but sane; the panel wizard
+    // mirrors them client-side.
+    steps: z.number().int().min(1).max(100_000).optional().describe("Total training steps (200 = smoke test, 1500-3000 real; max 100000)."),
+    lr: z.number().positive().max(1).optional().describe("Learning rate (max 1)."),
+    rank: z.number().int().min(1).max(1024).optional().describe("LoRA rank (16 simple, 16-32 detailed; max 1024)."),
+    resolution: z.array(z.number().int().min(64).max(4096)).min(1).optional().describe("Resolution buckets, e.g. [512,768,1024] (each 64-4096)."),
     batchSize: z.number().int().min(1).optional(),
     saveEvery: z.number().int().min(1).optional().describe("Checkpoint cadence (steps)."),
     sampleEvery: z.number().int().min(1).optional().describe("Sample-image cadence (steps)."),
