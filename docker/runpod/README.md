@@ -345,10 +345,33 @@ transparent to ComfyUI and the agent.
 | **runpod-uploader** | — | COPY from donor | file uploader; best-effort |
 | **croc** | — | COPY from donor | on-demand P2P transfer |
 | **cron** | — | apt | best-effort |
+| **dead-man watchdog** | 8189 (heartbeat) | `deadman_server.py` + `deadman_watch.sh` | see below |
 
 All ancillary services are launched **best-effort** — if a binary is absent (e.g.
 you dropped the donor COPYs) the entrypoint logs `skip` and carries on, so the
 image still boots ComfyUI fine.
+
+### Dead-man switch (#269)
+
+Pods **created via `runpod_pod_create`** carry a billing dead-man switch. The
+in-process idle auto-stop dies with the orchestrator (crash / closed laptop);
+without a pod-side guard the pod would bill forever. So:
+
+- `deadman_server.py` (:8189, token-gated) receives the orchestrator's
+  heartbeats (one per watch poll) and refreshes a beat file;
+- `deadman_watch.sh` stops the pod **itself** (GraphQL `podStop` — stop, never
+  terminate, so `/workspace` survives) when the beats stop: 20 min without a
+  beat once managed, or 45 min after boot with no heartbeat at all
+  (`DEADMAN_BEAT_GRACE_S` / `DEADMAN_BOOT_GRACE_S`).
+
+The stop is authorized by the **pod-scoped `RUNPOD_API_KEY` RunPod auto-injects
+into every pod** — the owner's account-wide key never leaves the orchestrator.
+Arming is signaled by the pod env carrying `DEADMAN_TOKEN` (injected by
+`runpod_pod_create`; a sha256 of key + unique deploy name, authorizes
+heartbeats **only** — it is not an API key and cannot stop the pod).
+Console-deployed pods have no token, so their watchdog stays inert. Opt out of
+arming with `deadman:false` / `RUNPOD_DEADMAN=0` at create, or
+`DEADMAN_DISABLE=1` as a pod env.
 
 ---
 

@@ -30,7 +30,9 @@ export const POD_TRAINING_ROOT = "/workspace/training";
  *  public ip:port). Null when the pod isn't running or exposes no ssh. */
 export function podSshEndpoint(pod: RunpodPod, user = "root"): PodSshEndpoint | null {
   const p = (pod.runtime?.ports ?? []).find((x) => x.privatePort === 22 && x.type === "tcp" && x.isIpPublic);
-  if (!p || !p.ip) return null;
+  // Port fields are nullable in RunPod's schema (#269 r2) — a partial row is
+  // simply "no endpoint".
+  if (!p || !p.ip || p.publicPort == null) return null;
   return { userHost: `${user}@${p.ip}`, port: p.publicPort };
 }
 

@@ -3,9 +3,11 @@ import { describe, expect, it, beforeEach, vi } from "vitest";
 // Mock the RunPod client the watcher polls/acts on.
 const getPodMock = vi.fn();
 const stopPodMock = vi.fn();
+const beatMock = vi.fn(() => true);
 vi.mock("../../services/runpod-client.js", () => ({
   getPod: (...a: unknown[]) => getPodMock(...a),
   stopPod: (...a: unknown[]) => stopPodMock(...a),
+  beatDeadman: (...a: unknown[]) => beatMock(...a),
   comfyuiPortExposed: (pod: { runtime?: { ports?: Array<{ privatePort: number; type: string }> } }) =>
     (pod.runtime?.ports ?? []).some((p) => p.privatePort === 8188 && p.type === "http"),
   runpodProxyUrl: (id: string) => `https://${id}-8188.proxy.runpod.net`,
@@ -54,6 +56,86 @@ describe("runpod-watch — status broadcast", () => {
     const before = frames.length;
     await w.poll();
     expect(frames.length).toBe(before);
+  });
+
+  it("feeds the pod's dead-man watchdog while it RUNS under our watch (#269), not when stopped", async () => {
+    getPodMock.mockResolvedValue(runningPod());
+    const w = createRunpodWatcher({ push: () => {}, comfyuiIdle: () => false, renderingOnPod: () => true, idleStopMinutes: 0 });
+    w.watch("pod1");
+    await w.poll();
+    expect(beatMock).toHaveBeenCalledWith(expect.objectContaining({ id: "pod1", name: "c" }));
+    // A stopped pod gets no beat (its watchdog is down with the pod anyway).
+    beatMock.mockClear();
+    getPodMock.mockResolvedValue(runningPod({ desiredStatus: "EXITED", runtime: null }));
+    await w.poll();
+    expect(beatMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps heartbeating a managed pod after unwatch — use_local must not self-stop it (#269 codex)", async () => {
+    getPodMock.mockResolvedValue(runningPod());
+    const w = createRunpodWatcher({ push: () => {}, comfyuiIdle: () => false, renderingOnPod: () => true, idleStopMinutes: 0 });
+    w.watch("pod1");
+    await w.poll();
+    expect(beatMock).toHaveBeenCalledTimes(1);
+    w.unwatch(); // UI stops watching; the pod is still OUR managed billing pod
+    beatMock.mockClear();
+    // The janitor (every ~10 polls) owes it beats even with nothing watched.
+    for (let i = 0; i < 10; i++) await w.poll();
+    expect(beatMock).toHaveBeenCalledWith(expect.objectContaining({ id: "pod1", name: "c" }));
+  });
+
+  it("drops a pod from the managed set once it exits (no beats for a dead pod)", async () => {
+    getPodMock.mockResolvedValue(runningPod());
+    const w = createRunpodWatcher({ push: () => {}, comfyuiIdle: () => false, renderingOnPod: () => true, idleStopMinutes: 0 });
+    w.watch("pod1");
+    await w.poll();
+    getPodMock.mockResolvedValue(runningPod({ desiredStatus: "EXITED", runtime: null }));
+    await w.poll(); // poll path sees EXITED → unwatch + managed-set delete
+    beatMock.mockClear();
+    for (let i = 0; i < 10; i++) await w.poll();
+    expect(beatMock).not.toHaveBeenCalled();
+  });
+
+  it("drops a never-acking managed pod after 25min — console/deadman:false pods don't chatter forever (codex r2)", async () => {
+    const clk = clock(0);
+    getPodMock.mockResolvedValue(runningPod());
+    beatMock.mockReturnValue(false); // no watchdog answering anywhere
+    const w = createRunpodWatcher({ push: () => {}, comfyuiIdle: () => false, renderingOnPod: () => true, idleStopMinutes: 0, now: clk.now });
+    w.watch("pod1");
+    await w.poll(); // first beat fails at t=0 → leash starts
+    w.unwatch(); // still managed (beats owed) — janitor path now
+    for (let i = 0; i < 10; i++) await w.poll(); // first janitor sweep beats (fail)
+    const sweeps1 = beatMock.mock.calls.length;
+    expect(sweeps1).toBeGreaterThan(0);
+    // 26 min of straight failures → the leash drops it from managed.
+    clk.advance(26 * 60_000);
+    beatMock.mockClear();
+    for (let i = 0; i < 10; i++) await w.poll();
+    expect(beatMock.mock.calls.length).toBe(1); // the beat that triggered the drop
+    beatMock.mockClear();
+    getPodMock.mockClear();
+    for (let i = 0; i < 10; i++) await w.poll();
+    expect(getPodMock).not.toHaveBeenCalled(); // unmanaged → janitor done with it
+    expect(beatMock).not.toHaveBeenCalled();
+  });
+
+  it("a late heartbeat ack RE-MANAGES a leash-dropped pod (boot-window recovery, codex r3)", async () => {
+    const clk = clock(0);
+    getPodMock.mockResolvedValue(runningPod());
+    beatMock.mockReturnValue(false);
+    const w = createRunpodWatcher({ push: () => {}, comfyuiIdle: () => false, renderingOnPod: () => true, idleStopMinutes: 0, now: clk.now });
+    w.watch("pod1");
+    await w.poll(); // first beat fails at t=0 → leash starts
+    clk.advance(26 * 60_000);
+    await w.poll(); // leash drops it from managed
+    // Endpoint comes up (still inside the boot window): the next beat succeeds
+    // → the pod must be re-managed, or a later unwatch leaves it unfed (r3).
+    beatMock.mockReturnValue(true);
+    await w.poll();
+    w.unwatch();
+    beatMock.mockClear();
+    for (let i = 0; i < 10; i++) await w.poll();
+    expect(beatMock).toHaveBeenCalledWith(expect.objectContaining({ id: "pod1" }));
   });
 
   it("clears the frame on unwatch", async () => {

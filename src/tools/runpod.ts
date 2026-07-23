@@ -70,7 +70,14 @@ function summarizePod(pod: RunpodPod): string[] {
   if (pod.runtime) {
     lines.push(`Uptime: ${fmtUptime(pod.runtime.uptimeInSeconds)}`);
     const g = pod.runtime.gpus?.[0];
-    if (g) lines.push(`GPU util: ${g.gpuUtilPercent}% · VRAM: ${g.memoryUtilPercent}%`);
+    // Telemetry leaves are nullable in RunPod's schema (#269 r2) — render
+    // each only when actually reported, never a literal "null%".
+    if (g) {
+      const util = g.gpuUtilPercent != null ? `GPU util: ${g.gpuUtilPercent}%` : "";
+      const vram = g.memoryUtilPercent != null ? `VRAM: ${g.memoryUtilPercent}%` : "";
+      const both = [util, vram].filter(Boolean).join(" · ");
+      if (both) lines.push(both);
+    }
   }
   if (comfyuiPortExposed(pod)) {
     lines.push(`ComfyUI: ${runpodProxyUrl(pod.id)} (connect with runpod_pod_connect)`);
@@ -202,12 +209,13 @@ export function registerRunpodTools(server: McpServer): void {
   // ── CREATE (deploy our template via the API — referral-earning) ───────────
   server.tool(
     "runpod_pod_create",
-    "Deploy a BRAND-NEW RunPod pod from our comfyui-mcp template (image with the panel + Manager + our nodes preinstalled), then it can be started/connected like any pod. One-tap alternative to the console deploy link for a user who already has a RunPod account + API key. Because our template is used, the agent can install the user's exact custom nodes/LoRAs + download models on it → full canvas parity. Tries several GPU types until one has capacity (on-demand availability fluctuates). NOTE: this bills GPU-time as soon as the pod boots — confirm with the user first, and stop it (runpod_pod_stop) when done. For onboarding a NEW RunPod user, prefer runpod_deploy_link so their signup credits our referral.",
+    "Deploy a BRAND-NEW RunPod pod from our comfyui-mcp template (image with the panel + Manager + our nodes preinstalled), then it can be started/connected like any pod. One-tap alternative to the console deploy link for a user who already has a RunPod account + API key. Because our template is used, the agent can install the user's exact custom nodes/LoRAs + download models on it → full canvas parity. Tries several GPU types until one has capacity (on-demand availability fluctuates). NOTE: this bills GPU-time as soon as the pod boots — confirm with the user first, and stop it (runpod_pod_stop) when done. Created pods carry a DEAD-MAN SWITCH: if comfyui-mcp stops minding the pod (crash/offline), the pod STOPS ITSELF after a grace period so it can't bill forever — it uses the pod-scoped key RunPod auto-injects, so your account key never leaves this machine (disable with deadman:false). For onboarding a NEW RunPod user, prefer runpod_deploy_link so their signup credits our referral.",
     {
       name: z.string().optional().describe("Pod name (default 'comfyui-mcp')."),
       gpu_type: z.string().optional().describe(`GPU type to prefer, e.g. "NVIDIA GeForce RTX 4090". Default tries: ${RUNPOD_DEFAULT_GPU_TYPES.join(", ")}.`),
       cloud_type: z.enum(["COMMUNITY", "SECURE"]).optional().describe("COMMUNITY (cheaper, default) or SECURE."),
       connect: z.boolean().optional().describe("Auto-connect when booted: the ORCHESTRATOR waits for ComfyUI to answer (1-3min), then retargets + watches — this call returns immediately (default false: deploy only; connect later with runpod_pod_connect)."),
+      deadman: z.boolean().optional().describe("Arm the pod-side dead-man watchdog (default true for OUR stock template): the pod STOPS ITSELF if comfyui-mcp's heartbeats stop (process crash/offline — boot grace ~45min, then ~20min without beats). Uses the pod-scoped API key RunPod auto-injects into every pod — your account key never leaves this machine. false deploys without the watchdog. With a custom template (RUNPOD_TEMPLATE_ID) the default is OFF — pass true only if that image ships our watchdog."),
     },
     async (args) => {
       try {
@@ -215,6 +223,7 @@ export function registerRunpodTools(server: McpServer): void {
           name: args.name,
           gpuTypeIds: args.gpu_type ? [args.gpu_type] : undefined,
           cloudType: args.cloud_type,
+          deadman: args.deadman,
         });
         const cost = pod.costPerHr != null ? ` at $${pod.costPerHr.toFixed(3)}/hr` : "";
         const gpu = pod.machine?.gpuDisplayName ? ` on ${pod.machine.gpuDisplayName}` : "";
