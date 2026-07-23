@@ -22,6 +22,7 @@ import {
   startTrainingJob,
   trainingRoot,
 } from "../services/training-jobs.js";
+import { getDataset, getJobConfig, listDatasets, readTrainingFile } from "../services/training-datasets.js";
 import { errorToToolResult } from "../utils/errors.js";
 import { isRemoteMode } from "../config.js";
 
@@ -328,6 +329,66 @@ export function registerTrainTools(server: McpServer): void {
         }
         const jobs = await listJobs();
         return textEnvelope({ ok: true, count: jobs.length, jobs });
+      } catch (error) {
+        return errorToToolResult(error);
+      }
+    },
+  );
+
+  // ── Datasets + job config (read-only views for the panel/mobile surfaces) ──
+  server.tool(
+    "train_list_datasets",
+    "List staged training datasets (the dirs from train_prepare_dataset), newest-first, with image/caption counts. Read-only — pair with train_dataset_detail to see one dataset's images + captions.",
+    {},
+    async () => {
+      try {
+        return textEnvelope({ ok: true, datasets: listDatasets() });
+      } catch (error) {
+        return errorToToolResult(error);
+      }
+    },
+  );
+
+  server.tool(
+    "train_dataset_detail",
+    "Show one staged dataset: its dir (datasetPath — reusable as train_start's datasetPath) and every image with its caption (null when uncaptioned). Images render via train_file. Read-only.",
+    {
+      name: z.string().min(1).describe("Dataset name (from train_list_datasets)."),
+    },
+    async (args) => {
+      try {
+        return textEnvelope({ ok: true, ...getDataset(args.name) });
+      } catch (error) {
+        return errorToToolResult(error);
+      }
+    },
+  );
+
+  server.tool(
+    "train_job_config",
+    "Show the effective settings a training job ran with (steps/lr/rank/resolution/batch/saveEvery/sampleEvery/quantize) read back from the ai-toolkit config.yml it consumed, plus flow/model/trigger/datasetPath — everything needed to run the job again with tweaks. Read-only.",
+    {
+      id: z.string().min(1).describe("Job id from train_start."),
+    },
+    async (args) => {
+      try {
+        return textEnvelope({ ok: true, ...(await getJobConfig(args.id)) });
+      } catch (error) {
+        return errorToToolResult(error);
+      }
+    },
+  );
+
+  server.tool(
+    "train_file",
+    "Fetch an image under the training root (dataset image, job sample) as an inline image — the tunnel-safe way for a phone/panel to render training files it can't reach over /view. Bounded: image files only, ≤ 2MB.",
+    {
+      path: z.string().min(1).describe("Absolute path under the training root (from train_dataset_detail's datasetPath or train_status's samples)."),
+    },
+    async (args) => {
+      try {
+        const { data, mimeType } = readTrainingFile(args.path);
+        return { content: [{ type: "image" as const, data, mimeType }] };
       } catch (error) {
         return errorToToolResult(error);
       }

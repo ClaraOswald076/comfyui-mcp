@@ -668,10 +668,15 @@ const CALL_TOOL_WHITELIST = new Set<string>([
   // Read-only.
   "diagnose_run",
   // Read-only training surface: flow/model discovery + progress polling +
-  // docker/GPU/image preflight for the panel/mobile Training tab.
+  // docker/GPU/image preflight for the panel/mobile Training tab, and the
+  // dataset/job-config/file readers behind its Jobs/Datasets views.
   "train_list_flows",
   "train_status",
   "train_doctor",
+  "train_list_datasets",
+  "train_dataset_detail",
+  "train_job_config",
+  "train_file",
   // User-initiated training ops (panel/mobile Training wizard): stage a dataset,
   // launch a GPU-container training run, cancel one. All validation lives in the
   // tools themselves (dataset checks, docker/image preflight, liveness-verified
