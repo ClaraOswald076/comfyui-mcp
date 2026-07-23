@@ -17,7 +17,7 @@ afterAll(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
-import { getDataset, getJobConfig, listDatasets, readTrainingFile } from "../../services/training-datasets.js";
+import { getDataset, getJobConfig, listDatasets, previewConfig, readTrainingFile, deleteDataset, updateDataset } from "../../services/training-datasets.js";
 
 function stageDataset(name: string, files: Array<[string, string | null]>) {
   const dir = join(root, "datasets", name);
@@ -81,7 +81,9 @@ describe("readTrainingFile (train_file)", () => {
   it("rejects escapes, non-images, and oversize files", () => {
     expect(() => readTrainingFile(join(tmpdir(), "outside.png"))).toThrow(/escapes/);
     expect(() => readTrainingFile(join(root, "datasets", "alpha", "img_00001.txt"))).toThrow(/only image files/);
-    const big = join(root, "datasets", "alpha", "big.png");
+    const bigDir = join(root, "datasets", "bigset");
+    mkdirSync(bigDir, { recursive: true });
+    const big = join(bigDir, "big.png");
     writeFileSync(big, Buffer.alloc(2 * 1024 * 1024 + 1));
     expect(() => readTrainingFile(big)).toThrow(/too large/);
   });
@@ -153,5 +155,58 @@ describe("getJobConfig", () => {
 
   it("throws on an unknown job id", async () => {
     await expect(getJobConfig("nope")).rejects.toThrow(/no training job/);
+  });
+});
+
+describe("updateDataset / deleteDataset", () => {
+  it("sets captions atomically, deletes images with their caption files, warns on unknown files", async () => {
+    const r = await updateDataset("alpha", {
+      setCaptions: { "img_00001.png": "ohwx a person, smiling", "ghost.png": "nope" },
+      deleteImages: ["img_00002.png", "ghost2.png"],
+    });
+    expect(r).toMatchObject({ captionsSet: 1, imagesDeleted: 1 });
+    expect(r.warnings).toHaveLength(2);
+    const d = getDataset("alpha");
+    expect(d.items).toEqual([{ file: "img_00001.png", caption: "ohwx a person, smiling" }]);
+  });
+
+  it("rejects edits and deletes while a running job trains from the dataset", async () => {
+    const jobDir = join(root, "jobs", "active1");
+    mkdirSync(jobDir, { recursive: true });
+    writeFileSync(
+      join(root, "jobs", "active1.json"),
+      JSON.stringify({
+        id: "active1", name: "x", flow: "character", model: "flux1-dev", status: "running",
+        progress: { samples: [] }, datasetPath: join(root, "datasets", "alpha"),
+        jobDir, outputDir: join(jobDir, "output"), log: [],
+        createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      }),
+    );
+    await expect(updateDataset("alpha", { setCaptions: { "img_00001.png": "y" } })).rejects.toThrow(/in use/);
+    await expect(deleteDataset("alpha")).rejects.toThrow(/in use/);
+    // cleanup the record so later tests aren't blocked
+    rmSync(join(root, "jobs", "active1.json"));
+  });
+
+  it("deletes an unused dataset wholesale", async () => {
+    stageDataset("doomed", [["img_00001.png", "x"]]);
+    await deleteDataset("doomed");
+    expect(listDatasets().map((d) => d.name)).not.toContain("doomed");
+    expect(() => getDataset("doomed")).toThrow(/no dataset/);
+  });
+});
+
+describe("previewConfig", () => {
+  it("returns the raw ai-toolkit YAML for the settings (no side effects)", () => {
+    const v = previewConfig({
+      name: "prev",
+      datasetPath: join(root, "datasets", "alpha"),
+      trigger: "ohwx",
+      params: { steps: 200, rank: 32 },
+    });
+    expect(v.jobName).toBe("prev");
+    expect(v.yaml).toContain("steps: 200");
+    expect(v.yaml).toContain("linear: 32");
+    expect(v.yaml).toContain("trigger_word: ohwx");
   });
 });

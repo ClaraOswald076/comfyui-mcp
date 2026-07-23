@@ -22,7 +22,8 @@ import {
   startTrainingJob,
   trainingRoot,
 } from "../services/training-jobs.js";
-import { getDataset, getJobConfig, listDatasets, readTrainingFile } from "../services/training-datasets.js";
+import { getDataset, getJobConfig, listDatasets, previewConfig, readTrainingFile, deleteDataset, updateDataset } from "../services/training-datasets.js";
+import { captionDataset, captionImage } from "../services/train-caption.js";
 import { errorToToolResult } from "../utils/errors.js";
 import { isRemoteMode } from "../config.js";
 
@@ -389,6 +390,93 @@ export function registerTrainTools(server: McpServer): void {
       try {
         const { data, mimeType } = readTrainingFile(args.path);
         return { content: [{ type: "image" as const, data, mimeType }] };
+      } catch (error) {
+        return errorToToolResult(error);
+      }
+    },
+  );
+
+  server.tool(
+    "train_dataset_update",
+    "Edit a staged dataset: set/replace per-image captions and/or delete images (with their caption files). Refuses while a running/queued job trains from it. Returns per-file warnings for unknown files.",
+    {
+      name: z.string().min(1).describe("Dataset name (from train_list_datasets)."),
+      setCaptions: z.record(z.string(), z.string()).optional().describe("{filename: caption} pairs to write (replaces existing captions)."),
+      deleteImages: z.array(z.string()).optional().describe("Image filenames to delete from the dataset (caption files go too)."),
+    },
+    async (args) => {
+      try {
+        return textEnvelope({ ok: true, ...(await updateDataset(args.name, { setCaptions: args.setCaptions, deleteImages: args.deleteImages })) });
+      } catch (error) {
+        return errorToToolResult(error);
+      }
+    },
+  );
+
+  server.tool(
+    "train_dataset_delete",
+    "Delete a whole staged dataset (images + captions). Refuses while a running/queued job trains from it. Irreversible — confirm with the user first.",
+    {
+      name: z.string().min(1).describe("Dataset name (from train_list_datasets)."),
+    },
+    async (args) => {
+      try {
+        await deleteDataset(args.name);
+        return textEnvelope({ ok: true });
+      } catch (error) {
+        return errorToToolResult(error);
+      }
+    },
+  );
+
+  server.tool(
+    "train_preview_config",
+    "Show the RAW ai-toolkit config.yml train_start would write for these settings (the ostris-UI 'raw config' view) — no side effects. Use it to review/edit a run before launching; pass the same params to train_start to execute.",
+    {
+      name: z.string().min(1).describe("Job name (becomes the output folder + .safetensors basename)."),
+      datasetPath: z.string().min(1).describe("Staged dataset dir (from train_prepare_dataset or train_dataset_detail)."),
+      trigger: z.string().optional().describe("Trigger word."),
+      params: z.record(z.string(), z.unknown()).optional().describe("Param overrides (steps/lr/rank/resolution/batchSize/saveEvery/sampleEvery/quantize)."),
+    },
+    async (args) => {
+      try {
+        return textEnvelope({ ok: true, ...previewConfig(args) });
+      } catch (error) {
+        return errorToToolResult(error);
+      }
+    },
+  );
+
+  server.tool(
+    "train_caption_image",
+    "Caption ONE dataset/training image with the user's own Claude subscription (one vision turn through the Agent SDK — not a paid API). Returns the bare caption (does NOT write it — review then save with train_dataset_update, or use train_caption_dataset to write directly). Optional guide text steers the style; optional trigger is prepended by the model.",
+    {
+      path: z.string().min(1).describe("Absolute path of an image under the training root (train_dataset_detail's datasetPath + filename)."),
+      guide: z.string().optional().describe("Extra style guidance for the captioner (e.g. 'focus on outfits and backgrounds')."),
+      trigger: z.string().optional().describe("Trigger word to prepend in the caption."),
+    },
+    async (args) => {
+      try {
+        const caption = await captionImage({ imagePath: args.path, guide: args.guide, trigger: args.trigger });
+        return textEnvelope({ ok: true, caption });
+      } catch (error) {
+        return errorToToolResult(error);
+      }
+    },
+  );
+
+  server.tool(
+    "train_caption_dataset",
+    "Caption a whole staged dataset (or a subset) with the user's own Claude subscription and WRITE the captions into its .txt files (one vision turn per image, sequential). Use after gathering images, before train_start. Per-file failures are reported without stopping the batch. Optional guide text steers all captions; optional trigger is prepended to each.",
+    {
+      name: z.string().min(1).describe("Dataset name (from train_list_datasets)."),
+      guide: z.string().optional().describe("Extra style guidance applied to every caption."),
+      trigger: z.string().optional().describe("Trigger word prepended to every caption."),
+      only: z.array(z.string()).optional().describe("Subset of filenames to caption (default: all images)."),
+    },
+    async (args) => {
+      try {
+        return textEnvelope({ ok: true, ...(await captionDataset(args.name, { guide: args.guide, trigger: args.trigger, only: args.only })) });
       } catch (error) {
         return errorToToolResult(error);
       }
