@@ -26,6 +26,8 @@ export interface IpAdapterArgs extends CommonArgs {
   reference_image: string;
   weight?: number;
   preset?: string;
+  /** IPAdapter weight mode ('standard' | 'prompt is more important' | 'style transfer'). */
+  weight_type?: string;
 }
 
 export interface ConditionedDeps {
@@ -153,6 +155,7 @@ export async function generateWithIpAdapter(
     reference_image: args.reference_image,
     weight: args.weight,
     preset: args.preset,
+    weight_type: args.weight_type,
   });
 
   const { prompt_id, queue_remaining } = await deps.enqueue(workflow);
