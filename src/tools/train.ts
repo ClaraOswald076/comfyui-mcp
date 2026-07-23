@@ -15,6 +15,7 @@ import {
 import { DEFAULT_PARAMS } from "../services/training-config.js";
 import {
   cancelJob,
+  deleteJob,
   getJob,
   hfCacheRoot,
   listJobs,
@@ -477,6 +478,23 @@ export function registerTrainTools(server: McpServer): void {
     async (args) => {
       try {
         return textEnvelope({ ok: true, ...(await captionDataset(args.name, { guide: args.guide, trigger: args.trigger, only: args.only })) });
+      } catch (error) {
+        return errorToToolResult(error);
+      }
+    },
+  );
+
+  server.tool(
+    "train_delete_job",
+    "Delete an old training job's record (+ its output dir with checkpoints/samples unless keep_outputs is true) — cleanup for the Jobs view. The delivered LoRA in models/loras is NOT removed. Running/queued jobs must be cancelled first (train_cancel). Confirm with the user before deleting.",
+    {
+      id: z.string().min(1).describe("Job id from train_start."),
+      keep_outputs: z.boolean().optional().describe("Keep the job's output dir (checkpoints/samples) — delete only the record."),
+    },
+    async (args) => {
+      try {
+        await deleteJob(args.id, { keepOutputs: args.keep_outputs });
+        return textEnvelope({ ok: true });
       } catch (error) {
         return errorToToolResult(error);
       }

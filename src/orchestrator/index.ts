@@ -682,6 +682,7 @@ const CALL_TOOL_WHITELIST = new Set<string>([
   "train_dataset_delete",
   "train_caption_image",
   "train_caption_dataset",
+  "train_delete_job",
   // User-initiated training ops (panel/mobile Training wizard): stage a dataset,
   // launch a GPU-container training run, cancel one. All validation lives in the
   // tools themselves (dataset checks, docker/image preflight, liveness-verified

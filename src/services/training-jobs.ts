@@ -1847,3 +1847,30 @@ async function cancelJobBody(id: string, job: TrainingJob, deps: TrainingJobDeps
 export function toJobSummary(job: TrainingJob): TrainingJob {
   return job;
 }
+
+/** Delete an old job's registry record + (unless keepOutputs) its job dir
+ *  (config/log/checkpoints/samples). Cleanup for the Jobs view — the
+ *  DELIVERED LoRA in models/loras is NOT touched. Running/queued jobs refuse:
+ *  a deleted record would orphan the container from the cancel/reconcile
+ *  machinery (billing!). */
+export async function deleteJob(id: string, opts: { keepOutputs?: boolean } = {}): Promise<void> {
+  const job = await getJob(id);
+  if (!job) throw new Error(`no training job ${id}`);
+  if (job.status === "running" || job.status === "queued") {
+    throw new Error(`job ${id} is ${job.status} — cancel it first (train_cancel), then delete`);
+  }
+  jobs.delete(id);
+  rmSync(jobFile(id), { force: true });
+  // Stale-claim/lock sidecars — a later same-name launch must not trip on them.
+  rmSync(join(jobsRoot(), `${id}.lock`), { force: true });
+  if (!opts.keepOutputs) {
+    // Containment: delete only inside the jobs root — never trust a record's
+    // jobDir blindly (a corrupted record must not reach outside it).
+    const root = resolve(jobsRoot());
+    const dir = resolve(job.jobDir);
+    const norm = (p: string) => (process.platform === "win32" ? p.toLowerCase() : p);
+    if (norm(dir) !== norm(root) && norm(dir).startsWith(norm(root) + sep) && existsSync(dir)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+}

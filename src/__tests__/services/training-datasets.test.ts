@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeAll, afterAll, vi } from "vitest";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -222,5 +222,45 @@ describe("previewConfig", () => {
     expect(v.yaml).toContain("steps: 200");
     expect(v.yaml).toContain("linear: 32");
     expect(v.yaml).toContain("trigger_word: ohwx");
+  });
+});
+
+describe("deleteJob", () => {
+  function writeJob(id: string, status: string) {
+    const jobDir = join(root, "jobs", id);
+    mkdirSync(jobDir, { recursive: true });
+    writeFileSync(join(jobDir, "config.yml"), "job: extension\n");
+    writeFileSync(
+      join(root, "jobs", `${id}.json`),
+      JSON.stringify({
+        id, name: id, flow: "character", model: "flux1-dev", status,
+        progress: { samples: [] }, datasetPath: join(root, "datasets", "alpha"),
+        jobDir, outputDir: join(jobDir, "output"), log: [],
+        createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      }),
+    );
+    return jobDir;
+  }
+
+  it("removes the record + job dir (keep_outputs spares the dir)", async () => {
+    const { deleteJob } = await import("../../services/training-jobs.js");
+    const dir = writeJob("oldjob", "completed");
+    await deleteJob("oldjob");
+    expect(existsSync(join(root, "jobs", "oldjob.json"))).toBe(false);
+    expect(existsSync(dir)).toBe(false);
+
+    const dir2 = writeJob("keepme", "completed");
+    await deleteJob("keepme", { keepOutputs: true });
+    expect(existsSync(join(root, "jobs", "keepme.json"))).toBe(false);
+    expect(existsSync(dir2)).toBe(true);
+  });
+
+  it("refuses to delete a running job (cancel first) and unknown ids", async () => {
+    const { deleteJob } = await import("../../services/training-jobs.js");
+    writeJob("livejob", "running");
+    await expect(deleteJob("livejob")).rejects.toThrow(/cancel it first/);
+    expect(existsSync(join(root, "jobs", "livejob.json"))).toBe(true);
+    await expect(deleteJob("no-such-job")).rejects.toThrow(/no training job/);
+    rmSync(join(root, "jobs", "livejob.json"), { force: true });
   });
 });
