@@ -6,6 +6,62 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.47.0] - 2026-07-23
+
+### MCP
+
+#### Added
+- **Cloudflare Access service tokens on every ComfyUI endpoint.** A ComfyUI
+  fronted by Cloudflare Access served a sign-in page to the CLI instead of the
+  API, which broke connect/advertise and the queue watcher (the
+  `--insecure-bridge` workaround existed only to dodge this). Set
+  `CF_ACCESS_CLIENT_ID` + `CF_ACCESS_CLIENT_SECRET` and the headers are attached
+  to every request. (#289)
+- **RunPod pod-side dead-man switch.** Pods created via `runpod_pod_create` now
+  carry a watchdog (`deadman_server.py` heartbeat + `deadman_watch.sh` self-stop
+  loop): while comfyui-mcp is minding the pod it heartbeats each poll, and if the
+  controller disappears the pod stops itself rather than billing forever. Adds
+  structural GraphQL validation. Closes the last deferred findings from #269. (#301)
+- **Training data is now readable by app clients.** `train_list_datasets`,
+  dataset detail, effective job-config, and `train_file` readers over the
+  whitelisted channel, plus `list_output_images` gaining a `format: 'json'`
+  mode — the backend half of "see my labeled datasets / job settings / run it
+  again", unblocking the mobile Training tab. (#302, #306)
+
+#### Fixed
+- **Downloads no longer pin the turn, and a download that ran is never disclaimed.**
+  `download_model` and `download_civitai_model` awaited the entire transfer, so a
+  multi-GB checkpoint left the turn pending for minutes — and cancelling to break
+  the apparent hang made the agent report a download as not-done while the file
+  was still streaming to disk. Both tools now return a handle after a grace window
+  (small files still return a path inline), with a new `download_status` tool.
+  Reported by seanmcmagic. (#290)
+- **Interrupted and retrying Codex turns are recoverable.** Bounds the three
+  unbounded waits that let a live-but-silent Codex app-server hang a turn forever;
+  emits one controlled interrupted result, detaches the stale client, and lets
+  PanelAgent resume on a fresh app-server. Honors `ErrorNotification.willRetry`.
+  Thanks to @JusticeWay for the diagnosis. (#294)
+- **A zombie browser tab can no longer drag the orchestrator to a dead ComfyUI.**
+  A stale tab pointed at a dead instance kept re-helloing and retargeting the
+  orchestrator to the corpse, silently degrading every target-probing tool.
+  Unreachable hello retargets are now ignored. (#303)
+- **`train_doctor` no longer flaps red on a cold Docker.** The parallel GPU
+  docker-run and image-inspect raced on a cold Docker Desktop and intermittently
+  reported the trainer image absent when it was present; the probes are serialized
+  and the image check retries once. (#304)
+- **`train_start` rejects doomed parameter values.** The Custom preset is
+  free-form, so `steps=10^9` / `rank=100000` used to pass the schema and start an
+  OOM-bound billed run. Bounded: `steps<=100000`, `lr<=1`, `rank<=1024`,
+  resolution 64..4096. (#300)
+- **IP-Adapter generation works again.** The `ip_adapter` template omitted
+  `weight_type`, which current `ComfyUI_IPAdapter_plus` requires, so every
+  `generate_with_ip_adapter` failed validation. Now always sent (default
+  `standard`). Reported on 0.46.0. (#305)
+
+#### Internal
+- CI pins GitHub Actions to commit SHAs. (#295)
+
+
 ## [0.46.0] - 2026-07-22
 
 ### MCP
