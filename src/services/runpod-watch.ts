@@ -221,6 +221,10 @@ export function createRunpodWatcher(deps: RunpodWatcherDeps): RunpodWatcher {
   async function beat(pod: RunpodPod): Promise<void> {
     if (await beatDeadman(pod)) {
       managedBeatFailSince.delete(pod.id);
+      // A watchdog answered (only pods carrying OUR token can) — (re)manage
+      // it. Leash recovery: a booting pod whose endpoint came up AFTER the
+      // leash dropped it must not be left unfed (codex r3).
+      managedPods.add(pod.id);
       return;
     }
     const since = managedBeatFailSince.get(pod.id) ?? now();

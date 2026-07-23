@@ -119,6 +119,25 @@ describe("runpod-watch — status broadcast", () => {
     expect(beatMock).not.toHaveBeenCalled();
   });
 
+  it("a late heartbeat ack RE-MANAGES a leash-dropped pod (boot-window recovery, codex r3)", async () => {
+    const clk = clock(0);
+    getPodMock.mockResolvedValue(runningPod());
+    beatMock.mockReturnValue(false);
+    const w = createRunpodWatcher({ push: () => {}, comfyuiIdle: () => false, renderingOnPod: () => true, idleStopMinutes: 0, now: clk.now });
+    w.watch("pod1");
+    await w.poll(); // first beat fails at t=0 → leash starts
+    clk.advance(26 * 60_000);
+    await w.poll(); // leash drops it from managed
+    // Endpoint comes up (still inside the boot window): the next beat succeeds
+    // → the pod must be re-managed, or a later unwatch leaves it unfed (r3).
+    beatMock.mockReturnValue(true);
+    await w.poll();
+    w.unwatch();
+    beatMock.mockClear();
+    for (let i = 0; i < 10; i++) await w.poll();
+    expect(beatMock).toHaveBeenCalledWith(expect.objectContaining({ id: "pod1" }));
+  });
+
   it("clears the frame on unwatch", async () => {
     getPodMock.mockResolvedValue(runningPod());
     const frames: RunpodStatusFrame[] = [];

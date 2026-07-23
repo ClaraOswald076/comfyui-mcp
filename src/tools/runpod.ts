@@ -70,7 +70,14 @@ function summarizePod(pod: RunpodPod): string[] {
   if (pod.runtime) {
     lines.push(`Uptime: ${fmtUptime(pod.runtime.uptimeInSeconds)}`);
     const g = pod.runtime.gpus?.[0];
-    if (g) lines.push(`GPU util: ${g.gpuUtilPercent}% · VRAM: ${g.memoryUtilPercent}%`);
+    // Telemetry leaves are nullable in RunPod's schema (#269 r2) — render
+    // each only when actually reported, never a literal "null%".
+    if (g) {
+      const util = g.gpuUtilPercent != null ? `GPU util: ${g.gpuUtilPercent}%` : "";
+      const vram = g.memoryUtilPercent != null ? `VRAM: ${g.memoryUtilPercent}%` : "";
+      const both = [util, vram].filter(Boolean).join(" · ");
+      if (both) lines.push(both);
+    }
   }
   if (comfyuiPortExposed(pod)) {
     lines.push(`ComfyUI: ${runpodProxyUrl(pod.id)} (connect with runpod_pod_connect)`);

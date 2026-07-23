@@ -376,7 +376,7 @@ describe("deadman switch (#269)", () => {
     expect(input.env ?? []).toHaveLength(0);
   });
 
-  it("a custom template gets NO key injection by default (unscoped key must not leak into images we don't control)", async () => {
+  it("a custom template is NOT armed by default (unverified image may lack the watchdog)", async () => {
     const { fetchMock } = mockGql((b) => (b.query.includes("myself") ? emptyList : deployed("pod1")));
     await createPod({ gpuTypeIds: ["GPU-A"], name: "custom-tpl-pod", templateId: "some-other-template" });
     const input = deployInput(fetchMock);
@@ -387,7 +387,7 @@ describe("deadman switch (#269)", () => {
     expect(keys).not.toContain("DEADMAN_TOKEN");
   });
 
-  it("a custom template CAN opt in explicitly with deadman:true (caller asserts the image ships the watchdog)", async () => {
+  it("a custom template CAN be armed explicitly with deadman:true (caller asserts the image ships the watchdog)", async () => {
     const { fetchMock } = mockGql((b) => (b.query.includes("myself") ? emptyList : deployed("pod1")));
     await createPod({ gpuTypeIds: ["GPU-A"], name: "custom-tpl-armed", templateId: "my-rebuild", deadman: true });
     const input = deployInput(fetchMock);

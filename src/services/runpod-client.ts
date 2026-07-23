@@ -352,9 +352,11 @@ export interface RunpodCreateOptions {
   volumeInGb?: number; // default 60 (matches our template; /workspace)
   /** SSH public key injected as PUBLIC_KEY (trainer drives the pod over ssh). */
   publicKey?: string;
-  /** Arm the pod-side dead-man watchdog (default RUNPOD_DEADMAN_DEFAULT): injects
-   *  RUNPOD_API_KEY + a per-deploy heartbeat token as pod env and exposes the
-   *  heartbeat port, so the pod can STOP ITSELF if comfyui-mcp stops minding it. */
+  /** Arm the pod-side dead-man watchdog (default RUNPOD_DEADMAN_DEFAULT): adds
+   *  a per-deploy heartbeat token + grace knobs as pod env and exposes the
+   *  heartbeat port, so the pod can STOP ITSELF if comfyui-mcp stops minding
+   *  it. The stop is authorized by RunPod's auto-injected POD-SCOPED key — the
+   *  owner's account key is never added to the pod env. */
   deadman?: boolean;
 }
 

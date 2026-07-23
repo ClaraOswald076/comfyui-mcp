@@ -83,6 +83,18 @@ beforeEach(() => {
 });
 
 describe("runpod_pod_status", () => {
+  it("omits null GPU telemetry instead of printing null% (nullable leaves, #269 r2)", async () => {
+    getPodMock.mockResolvedValue(runningPod({
+      runtime: {
+        uptimeInSeconds: 60,
+        ports: [{ ip: "1.2.3.4", isIpPublic: true, privatePort: 3000, publicPort: 3000, type: "http" }],
+        gpus: [{ id: null, gpuUtilPercent: null, memoryUtilPercent: null }],
+      },
+    }));
+    const t = (await getHandler("runpod_pod_status")({ pod_id: "pod123" })).content[0].text;
+    expect(t).not.toContain("null%");
+  });
+
   it("summarizes a running pod incl. the ComfyUI proxy URL", async () => {
     getPodMock.mockResolvedValue(runningPod());
     const t = (await getHandler("runpod_pod_status")({ pod_id: "pod123" })).content[0].text;
