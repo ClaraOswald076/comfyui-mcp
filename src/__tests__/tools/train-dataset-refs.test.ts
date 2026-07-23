@@ -1,5 +1,8 @@
 import { describe, expect, it, beforeEach, vi } from "vitest";
 import { resolve } from "node:path";
+import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, realpathSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 // train_prepare_dataset items now take path OR a ComfyUI ref — refs are how
 // phone/panel pickers hand over selections. Pin the resolution semantics
@@ -23,11 +26,13 @@ vi.mock("../../services/ai-toolkit.js", () => ({
   trainerImageExists: vi.fn(),
   TRAINER_IMAGE: "trainer:test",
 }));
+let outRoot = "/comfy/output";
+let remote = false;
 vi.mock("../../services/output-dir.js", () => ({
-  resolveOutputDir: () => Promise.resolve("/comfy/output"),
+  resolveOutputDir: () => Promise.resolve(outRoot),
   resolveInputDir: () => Promise.resolve("/comfy/input"),
 }));
-vi.mock("../../config.js", () => ({ isRemoteMode: () => false }));
+vi.mock("../../config.js", () => ({ isRemoteMode: () => remote }));
 
 import { registerTrainTools } from "../../tools/train.js";
 
@@ -44,7 +49,11 @@ function getTool(name: string): { handler: ToolHandler; shape: Record<string, { 
 
 const call = (items: unknown[]) => getTool("train_prepare_dataset").handler({ name: "ds", items });
 
-beforeEach(() => vi.clearAllMocks());
+beforeEach(() => {
+  vi.clearAllMocks();
+  outRoot = "/comfy/output";
+  remote = false;
+});
 
 describe("train_prepare_dataset — path/ref items", () => {
   it("path-only items pass through untouched", async () => {
@@ -89,5 +98,41 @@ describe("train_prepare_dataset — path/ref items", () => {
     expect(items.safeParse([{ caption: "lost" }]).success).toBe(false);
     expect(items.safeParse([{ path: "/x.png" }]).success).toBe(true);
     expect(items.safeParse([{ ref: { filename: "x.png" } }]).success).toBe(true);
+  });
+
+  it("refs are REJECTED in remote mode (the paths would resolve on the wrong machine)", async () => {
+    remote = true;
+    const res = await call([{ ref: { filename: "a.png" } }]);
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("LOCAL ComfyUI");
+    expect(prepareMock).not.toHaveBeenCalled();
+  });
+
+  it("a symlinked subfolder pointing OUTSIDE the root is rejected (codex: lexical check bypass)", async () => {
+    const base = mkdtempSync(join(tmpdir(), "dsref-"));
+    const out = join(base, "output");
+    const outside = join(base, "outside");
+    mkdirSync(out, { recursive: true });
+    mkdirSync(outside);
+    writeFileSync(join(outside, "x.png"), "x");
+    symlinkSync(outside, join(out, "link"), "junction");
+    outRoot = out;
+    const res = await call([{ ref: { filename: "x.png", subfolder: "link" } }]);
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("escapes");
+    expect(prepareMock).not.toHaveBeenCalled();
+  });
+
+  it("a symlink INSIDE the root pointing inside the root resolves to its real path", async () => {
+    const base = mkdtempSync(join(tmpdir(), "dsref-"));
+    const out = join(base, "output");
+    const real = join(out, "real");
+    mkdirSync(real, { recursive: true });
+    writeFileSync(join(real, "y.png"), "y");
+    symlinkSync(real, join(out, "alias"), "junction");
+    outRoot = out;
+    await call([{ ref: { filename: "y.png", subfolder: "alias" } }]);
+    expect(prepareMock).toHaveBeenCalled();
+    expect(prepareMock.mock.calls[0][0].items[0].path).toBe(realpathSync(join(out, "alias", "y.png")));
   });
 });

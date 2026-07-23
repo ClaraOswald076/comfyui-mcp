@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { fileURLToPath } from "node:url";
 import { existsSync } from "node:fs";
+import { realpath } from "node:fs/promises";
 import { basename, join, resolve, sep } from "node:path";
 import { resolveInputDir, resolveOutputDir } from "../services/output-dir.js";
 import {
@@ -76,6 +77,12 @@ async function resolveDatasetItems(
       // An explicit host path always wins over a ref (both are allowed so a
       // caller can attach a ref for traceability).
       if (it.path) return { path: it.path, caption: it.caption };
+      // Refs resolve on the ORCHESTRATOR's filesystem — against a remote
+      // ComfyUI (pod/LAN) the root would come from that machine's stats while
+      // prepareDataset checks/copies locally (codex finding). Reject honestly.
+      if (isRemoteMode()) {
+        throw new Error("ref items need a LOCAL ComfyUI (the orchestrator must share its filesystem) — pass absolute paths, or fetch the remote outputs first");
+      }
       const { filename, subfolder, type } = it.ref!;
       if (filename !== basename(filename)) {
         throw new Error(`ref filename must be a plain basename, got "${filename}"`);
@@ -83,10 +90,15 @@ async function resolveDatasetItems(
       const kind = type ?? "output";
       const root = resolve(kind === "input" ? await resolveInputDir() : await resolveOutputDir());
       const candidate = resolve(root, subfolder ?? "", filename);
-      if (norm(candidate) !== norm(root) && !norm(candidate).startsWith(norm(root) + sep)) {
+      // Containment on REAL paths — a symlinked subfolder/file pointing outside
+      // the root must not smuggle the copy across (codex finding). A missing
+      // target keeps its lexical path; prepareDataset reports it not-found.
+      const realRoot = await realpath(root).catch(() => root);
+      const realCandidate = await realpath(candidate).catch(() => candidate);
+      if (norm(realCandidate) !== norm(realRoot) && !norm(realCandidate).startsWith(norm(realRoot) + sep)) {
         throw new Error(`ref "${subfolder ?? ""}/${filename}" escapes the ${kind} dir`);
       }
-      return { path: candidate, caption: it.caption };
+      return { path: realCandidate, caption: it.caption };
     }),
   );
 }
