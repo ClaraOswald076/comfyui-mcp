@@ -23,8 +23,12 @@ jobs:
 
       - run: npm ci
       - run: npm run lint
-      - run: npm run build
+      - run: npm run build
       - run: npm test
+
+      # The README advertises tool/skill/pack counts. They are derived from the
+      # registry, not written by hand — this fails the build when prose drifts.
+      - run: node scripts/asset-counts.mjs --check
 
   pack-smoke:
     runs-on: ubuntu-latest
