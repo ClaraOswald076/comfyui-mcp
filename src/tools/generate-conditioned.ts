@@ -86,6 +86,10 @@ export function registerConditionedGenerationTools(server: McpServer): void {
       reference_image: z.string().describe("Filename of the (already-uploaded) reference image in ComfyUI's input dir"),
       weight: z.number().optional().describe("IP-Adapter influence on the output, typically 0.0-1.0 (default 0.8); higher = closer to the reference"),
       preset: z.string().optional().describe("IPAdapterUnifiedLoader preset (default 'PLUS (high strength)')"),
+      weight_type: z
+        .enum(["standard", "prompt is more important", "style transfer"])
+        .optional()
+        .describe("IPAdapter weight mode (default 'standard' — required by current IPAdapter_plus builds)"),
       ...commonShape,
     },
     async (args) => {

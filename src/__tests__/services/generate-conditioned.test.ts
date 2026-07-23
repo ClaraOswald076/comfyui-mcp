@@ -120,6 +120,19 @@ describe("generateWithIpAdapter", () => {
     expect(node(wf, "IPAdapter")!.inputs.weight).toBe(0.8);
   });
 
+  it("always sends weight_type (required by current IPAdapter_plus, #305), honoring an override", async () => {
+    const { deps, enqueued } = makeDeps();
+    await generateWithIpAdapter({ prompt: "p", reference_image: "r.png", checkpoint: "x.safetensors" }, deps);
+    expect(node(enqueued[0], "IPAdapter")!.inputs.weight_type).toBe("standard");
+
+    const { deps: deps2, enqueued: enqueued2 } = makeDeps();
+    await generateWithIpAdapter(
+      { prompt: "p", reference_image: "r.png", weight_type: "style transfer", checkpoint: "x.safetensors" },
+      deps2,
+    );
+    expect(node(enqueued2[0], "IPAdapter")!.inputs.weight_type).toBe("style transfer");
+  });
+
   it("auto-resolves the checkpoint when absent", async () => {
     const { deps, enqueued } = makeDeps();
     await generateWithIpAdapter({ prompt: "p", reference_image: "r.png" }, deps);

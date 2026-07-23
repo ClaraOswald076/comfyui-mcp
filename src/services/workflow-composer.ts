@@ -54,6 +54,9 @@ interface IpAdapterParams extends Txt2ImgParams {
   reference_image?: string;
   weight?: number;
   preset?: string;
+  /** IPAdapter's weight mode — REQUIRED by current IPAdapter_plus (a missing
+   *  key fails prompt validation, issue #305). */
+  weight_type?: string;
 }
 
 type TemplateParams =
@@ -818,6 +821,9 @@ function buildIpAdapter(p: IpAdapterParams): WorkflowJSON {
         ipadapter: conn("3", 1),
         image: conn("2", 0),
         weight,
+        // Required by current IPAdapter_plus — without it the prompt fails
+        // validation with "Required input is missing: weight_type" (#305).
+        weight_type: p.weight_type ?? "standard",
         start_at: 0.0,
         end_at: 1.0,
       },
