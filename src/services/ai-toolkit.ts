@@ -98,7 +98,17 @@ export async function trainerDoctor(): Promise<TrainerEnvelope<{
     hints.push("Docker daemon not reachable — install/start Docker Desktop (Windows) or the docker engine.");
     return ok("train_doctor", { docker, gpu: false, image: false, image_tag: TRAINER_IMAGE, hints });
   }
-  const [gpu, image] = await Promise.all([gpuDockerAvailable(), trainerImageExists()]);
+  // Serial probes, and one retry on the image check: on a cold Docker Desktop
+  // the PARALLEL gpu-run/image-inspect pair intermittently failed the inspect
+  // (on-device E2E flake: the first doctor after an orchestrator start reported
+  // image:false with the image present; later calls true). The image check is
+  // the fast one — run it first, retry once, then the heavy gpu run.
+  let image = await trainerImageExists();
+  if (!image) {
+    await new Promise((r) => setTimeout(r, 2_000));
+    image = await trainerImageExists();
+  }
+  const gpu = await gpuDockerAvailable();
   if (!gpu) hints.push("`docker run --gpus all` failed — install the NVIDIA Container Toolkit and enable GPU support in Docker.");
   if (!image) hints.push(`Trainer image ${TRAINER_IMAGE} not built yet — run train_build_image (one-time, several minutes).`);
   return ok("train_doctor", { docker, gpu, image, image_tag: TRAINER_IMAGE, hints });
