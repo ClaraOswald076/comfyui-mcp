@@ -2,7 +2,8 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { fileURLToPath } from "node:url";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join, resolve, sep } from "node:path";
+import { resolveInputDir, resolveOutputDir } from "../services/output-dir.js";
 import {
   buildTrainerImage,
   dockerAvailable,
@@ -57,6 +58,39 @@ async function resolvePodForTraining(podId?: string): Promise<import("../service
   return pod;
 }
 
+/** Map tool items (path | ComfyUI ref) to host-absolute DatasetItems. Refs
+ *  resolve against the connected ComfyUI's output/input root with containment:
+ *  the filename must be a plain basename and the resolved path must stay INSIDE
+ *  the root — otherwise a crafted ref could stage ANY host file into a dataset
+ *  (path traversal). prepareDataset then verifies existence/type per item. */
+async function resolveDatasetItems(
+  items: Array<{
+    path?: string;
+    ref?: { filename: string; subfolder?: string; type?: "output" | "input" };
+    caption?: string;
+  }>,
+): Promise<Array<{ path: string; caption?: string }>> {
+  const norm = (p: string) => (process.platform === "win32" ? p.toLowerCase() : p);
+  return Promise.all(
+    items.map(async (it) => {
+      // An explicit host path always wins over a ref (both are allowed so a
+      // caller can attach a ref for traceability).
+      if (it.path) return { path: it.path, caption: it.caption };
+      const { filename, subfolder, type } = it.ref!;
+      if (filename !== basename(filename)) {
+        throw new Error(`ref filename must be a plain basename, got "${filename}"`);
+      }
+      const kind = type ?? "output";
+      const root = resolve(kind === "input" ? await resolveInputDir() : await resolveOutputDir());
+      const candidate = resolve(root, subfolder ?? "", filename);
+      if (norm(candidate) !== norm(root) && !norm(candidate).startsWith(norm(root) + sep)) {
+        throw new Error(`ref "${subfolder ?? ""}/${filename}" escapes the ${kind} dir`);
+      }
+      return { path: candidate, caption: it.caption };
+    }),
+  );
+}
+
 const paramsSchema = z
   .object({
     steps: z.number().int().min(1).optional().describe("Total training steps (200 = smoke test, 1500-3000 real)."),
@@ -105,22 +139,33 @@ export function registerTrainTools(server: McpServer): void {
 
   server.tool(
     "train_prepare_dataset",
-    "Stage training images + captions into a dataset dir the trainer consumes. Each item is an image path with an optional caption (a missing caption falls back to defaultCaption — typically the trigger word). Returns the datasetPath to pass to train_start. Character LoRA guidance: 10-30 varied images; caption what changes between images, keep the trigger word constant.",
+    "Stage training images + captions into a dataset dir the trainer consumes. Each item is an image (absolute `path`, OR a ComfyUI `ref` {filename,subfolder?,type?} resolved against the connected ComfyUI's output/input dirs — how phone/panel pickers hand over selections) with an optional caption (a missing caption falls back to defaultCaption — typically the trigger word). Returns the datasetPath to pass to train_start. Character LoRA guidance: 10-30 varied images; caption what changes between images, keep the trigger word constant.",
     {
       name: z.string().min(1).describe("Dataset name (becomes the staging dir name)."),
       items: z
         .array(
-          z.object({
-            path: z.string().min(1).describe("Absolute path to a source image (png/jpg/jpeg/webp)."),
-            caption: z.string().optional().describe("Caption for this image."),
-          }),
+          z
+            .object({
+              path: z.string().min(1).optional().describe("Absolute path to a source image (png/jpg/jpeg/webp)."),
+              ref: z
+                .object({
+                  filename: z.string().min(1).describe("Basename only — no path separators."),
+                  subfolder: z.string().optional().describe("Subfolder under the root (default top level)."),
+                  type: z.enum(["output", "input"]).optional().default("output").describe("Which ComfyUI dir to resolve against (default output)."),
+                })
+                .optional()
+                .describe("ComfyUI file ref (e.g. from list_output_images format:json) — resolved server-side with containment checks. Give path OR ref."),
+              caption: z.string().optional().describe("Caption for this image."),
+            })
+            .refine((it) => !!it.path || !!it.ref, { message: "each item needs path or ref" }),
         )
         .min(1),
       defaultCaption: z.string().optional().describe("Fallback caption for items without one — usually the trigger word."),
     },
     async (args) => {
       try {
-        const prepared = await prepareDataset({ name: args.name, items: args.items, defaultCaption: args.defaultCaption });
+        const items = await resolveDatasetItems(args.items);
+        const prepared = await prepareDataset({ name: args.name, items, defaultCaption: args.defaultCaption });
         return textEnvelope({ ok: true, ...prepared });
       } catch (error) {
         return errorToToolResult(error);

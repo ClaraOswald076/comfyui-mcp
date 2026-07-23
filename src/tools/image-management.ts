@@ -303,6 +303,10 @@ export function registerImageManagementTools(server: McpServer): void {
         .string()
         .optional()
         .describe("Filter by filename pattern (case-insensitive substring match)"),
+      format: z
+        .enum(["markdown", "json"])
+        .optional()
+        .describe("Response shape: markdown (default, human/agent-readable) or json ({images:[{filename,subfolder,kind,size,modified}]} — for app clients building pick grids)."),
     },
     async (args) => {
       try {
@@ -310,6 +314,26 @@ export function registerImageManagementTools(server: McpServer): void {
           limit: args.limit,
           pattern: args.pattern,
         });
+        if (args.format === "json") {
+          // Machine-readable form for app clients (the mobile dataset picker):
+          // same entries, no prose. Thumbs render client-side via /view URLs.
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify({
+                  images: images.map((img) => ({
+                    filename: img.filename,
+                    subfolder: img.subfolder,
+                    kind: img.kind,
+                    ...(img.size > 0 ? { size: img.size } : {}),
+                    ...(img.modified ? { modified: img.modified } : {}),
+                  })),
+                }),
+              },
+            ],
+          };
+        }
         if (images.length === 0) {
           return {
             content: [

@@ -97,7 +97,7 @@ Set up the NATIVE (dockerless) trainer on this machine or a pod: clone ai-toolki
 
 ## train_prepare_dataset
 
-Stage training images + captions into a dataset dir the trainer consumes. Each item is an image path with an optional caption (a missing caption falls back to defaultCaption — typically the trigger word). Returns the datasetPath to pass to train_start. Character LoRA guidance: 10-30 varied images; caption what changes between images, keep the trigger word constant.
+Stage training images + captions into a dataset dir the trainer consumes. Each item is an image (absolute `path`, OR a ComfyUI `ref` &#123;filename,subfolder?,type?&#125; resolved against the connected ComfyUI's output/input dirs — how phone/panel pickers hand over selections) with an optional caption (a missing caption falls back to defaultCaption — typically the trigger word). Returns the datasetPath to pass to train_start. Character LoRA guidance: 10-30 varied images; caption what changes between images, keep the trigger word constant.
 
 ### Parameters
 
