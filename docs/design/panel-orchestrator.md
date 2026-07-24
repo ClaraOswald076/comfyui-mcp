@@ -59,7 +59,7 @@ comfyui-mcp --panel-orchestrator   (standalone, long-lived background process)
   tab's agent.
 - **`src/orchestrator/panel-agent.ts`** (`PanelAgent` / `PanelAgentManager`):
   one streaming `query()` session per `tab_id`, spawned lazily on the tab's
-  first message. Options: `model: claude-opus-4-8`, `permissionMode:
+  first message. Options: `model: claude-opus-5`, `permissionMode:
   "bypassPermissions"`, `strictMcpConfig: true`, `mcpServers: { comfyui: … }`
   (this build run as a stdio MCP in **non-channels** mode, so it generates
   against the live ComfyUI over `COMFYUI_URL` and never contends for the bridge
@@ -80,7 +80,7 @@ with a clear message instead of running uselessly. Override the port with
   orchestrator instead of an MCP server.
 - `COMFYUI_URL` — live ComfyUI the spawned agents generate against.
 - `COMFYUI_MCP_PANEL_MODEL` — override the panel agent model (default
-  `claude-opus-4-8`).
+  `claude-opus-5`).
 - `COMFYUI_MCP_BRIDGE_PORT` — bridge port (default 9101).
 
 ## Testing

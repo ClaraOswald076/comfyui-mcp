@@ -1068,7 +1068,7 @@ export async function runPanelOrchestrator(): Promise<void> {
     isForceRemoteFlagSet() || !isLoopbackUrl(comfyuiUrl)
       ? { COMFYUI_MCP_FORCE_REMOTE: "1" }
       : {};
-  const model = process.env.COMFYUI_MCP_PANEL_MODEL ?? "claude-opus-4-8";
+  const model = process.env.COMFYUI_MCP_PANEL_MODEL ?? "claude-opus-5";
   const envEffort = process.env.COMFYUI_MCP_PANEL_EFFORT;
   const effort: Effort | undefined = isEffort(envEffort) ? envEffort : undefined;
   // Single-port multi-provider: ONE orchestrator on ONE bridge port (default
@@ -1170,7 +1170,7 @@ export async function runPanelOrchestrator(): Promise<void> {
   // declared to the app-server alongside the headless comfyui (stdio) MCP. Claude
   // keeps its in-process SDK panel server unchanged.
   const backendId = (process.env.PANEL_AGENT_BACKEND ?? "claude").toLowerCase();
-  // The panel's `model` is a Claude id (e.g. claude-opus-4-8) and is NOT a valid
+  // The panel's `model` is a Claude id (e.g. claude-opus-5) and is NOT a valid
   // Codex model — so for codex we only pass a model when COMFYUI_MCP_CODEX_MODEL
   // is set explicitly; otherwise Codex uses the account's default (e.g. gpt-5.5).
   const codexModel = process.env.COMFYUI_MCP_CODEX_MODEL;

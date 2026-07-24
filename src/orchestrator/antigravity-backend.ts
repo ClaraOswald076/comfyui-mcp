@@ -860,7 +860,7 @@ export class AntigravityBackend implements AgentBackend {
   /** Decide whether `model` is usable for THIS provider: non-claude ids pass
    *  (they come from our own picker/config); claude-shaped ids are checked
    *  against the live catalog — Antigravity DOES serve some claude-* models, but
-   *  the panel also leaks its Anthropic-side default (e.g. claude-opus-4-8)
+   *  the panel also leaks its Anthropic-side default (e.g. claude-opus-5)
    *  through opts.model, which must be dropped. Returns the model when
    *  acceptable, undefined when not. Catalog unavailable → drop claude ids
    *  (conservative: a wrong --model makes every turn fail). */
