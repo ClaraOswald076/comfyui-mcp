@@ -65,13 +65,17 @@ async function armedTurn() {
 }
 
 describe("Codex watchdog liveness (#307)", () => {
-  it("re-arms for active-turn item/* and turn/* notifications", async () => {
+  it("re-arms for active-turn item/*, turn/*, and model/* turn events", async () => {
     const { onActivity, notify } = await armedTurn();
     onActivity.mockClear();
     notify({ method: "item/started", params: { threadId: "thread-1", turnId: "turn-1" } });
     notify({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1" } });
     notify({ method: "turn/started", params: { threadId: "thread-1", turn: { id: "turn-1" } } });
-    expect(onActivity).toHaveBeenCalledTimes(3);
+    // model/* turn events (provider routing/safety) carry a turnId and ARE
+    // progress — a bare item/turn prefix check missed them (review finding 2).
+    notify({ method: "model/safetyBuffering/updated", params: { threadId: "thread-1", turnId: "turn-1" } });
+    notify({ method: "model/rerouted", params: { threadId: "thread-1", turnId: "turn-1" } });
+    expect(onActivity).toHaveBeenCalledTimes(5);
   });
 
   it("re-arms for a retrying active-turn error (Codex still owns the turn)", async () => {
@@ -84,15 +88,16 @@ describe("Codex watchdog liveness (#307)", () => {
     expect(onActivity).toHaveBeenCalledTimes(1);
   });
 
-  it("does NOT re-arm for background account/model/token notifications", async () => {
+  it("does NOT re-arm for background account/token-usage notifications", async () => {
     const { onActivity, notify } = await armedTurn();
     onActivity.mockClear();
-    // These arrive while the active turn is silent. Attributing them as liveness
-    // is exactly what kept a wedged turn alive forever.
-    notify({ method: "account/read", params: { threadId: "thread-1" } });
-    notify({ method: "model/list", params: {} });
-    notify({ method: "token/usage", params: { threadId: "thread-1", turnId: "turn-1" } });
-    notify({ method: "usage/updated", params: { threadId: "thread-1", turnId: "turn-1" } });
+    // Real app-server background notifications (not requests): they arrive while
+    // the active turn is silent, and attributing them as liveness is exactly what
+    // kept a wedged turn alive forever. (account/read and model/list are REQUESTS,
+    // sent via client.request — they never reach notificationHandler.)
+    notify({ method: "account/updated", params: {} });
+    notify({ method: "account/rateLimits/updated", params: {} });
+    notify({ method: "thread/tokenUsage/updated", params: { threadId: "thread-1", turnId: "turn-1" } });
     expect(onActivity).not.toHaveBeenCalled();
   });
 
@@ -113,9 +118,9 @@ describe("Codex watchdog liveness (#307)", () => {
     const { onActivity, notify } = await armedTurn();
     onActivity.mockClear();
     for (let i = 0; i < 25; i += 1) {
-      notify({ method: "account/read", params: { threadId: "thread-1" } });
-      notify({ method: "model/list", params: {} });
-      notify({ method: "item/updated", params: { threadId: "thread-1", turnId: "turn-STALE" } });
+      notify({ method: "account/updated", params: {} });
+      notify({ method: "thread/tokenUsage/updated", params: { threadId: "thread-1", turnId: "turn-1" } });
+      notify({ method: "item/started", params: { threadId: "thread-1", turnId: "turn-STALE" } });
     }
     expect(onActivity).not.toHaveBeenCalled();
   });

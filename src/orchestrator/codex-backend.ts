@@ -1028,8 +1028,18 @@ export class CodexBackend implements AgentBackend {
     // wedged turn (nothing on its own item/turn stream while background chatter
     // continued) never reached the stall deadline. Gating on belongsToTurn AND
     // the active-turn method set is what makes the deadline reachable. (#307)
+    // item/* and turn/* are the streaming lifecycle; `error` is a (possibly
+    // retrying) turn error. The model/* trio are turn events the pinned
+    // app-server emits around provider routing/safety — they carry threadId +
+    // turnId, so they ARE active-turn progress and must re-arm the watchdog, but
+    // a bare item/turn prefix check misses them (#307 review, finding 2).
+    const MODEL_TURN_EVENTS = new Set([
+      "model/safetyBuffering/updated",
+      "model/rerouted",
+      "model/verification",
+    ]);
     const TURN_LIVENESS = (m: string) =>
-      m.startsWith("item/") || m.startsWith("turn/") || m === "error";
+      m.startsWith("item/") || m.startsWith("turn/") || m === "error" || MODEL_TURN_EVENTS.has(m);
     const bumpTurnActivity = (msg: RpcMessage): void => {
       if (!belongsToTurn(msg) || !TURN_LIVENESS(msg.method ?? "")) return;
       try {
