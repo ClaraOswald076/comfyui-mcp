@@ -881,7 +881,7 @@ export class CodexBackend implements AgentBackend {
     if (!client) throw new Error("codex app-server not initialized");
     const cwd = opts.cwd ?? this.deps.cwd ?? process.cwd();
     // MODEL PRECEDENCE (P1-1): PanelAgent.start() always passes opts.model = the
-    // CLAUDE panel model (e.g. claude-opus-4-8), which is NOT a valid Codex model.
+    // CLAUDE panel model (e.g. claude-opus-5), which is NOT a valid Codex model.
     // The Codex model configured at construction (deps.model, from
     // COMFYUI_MCP_CODEX_MODEL) must win. Only honor opts.model if it actually looks
     // like a Codex model (so a future Codex-aware picker can still switch live);
