@@ -133,7 +133,7 @@ export interface PanelAgentDeps {
   comfyuiUrl?: string;
   /** Persona appended to the claude_code system-prompt preset. */
   systemAppend: string;
-  /** Pinned model (e.g. claude-opus-4-8). */
+  /** Pinned model (e.g. claude-opus-5). */
   model: string;
   /** Reasoning effort for the session (low..max). Omitted = SDK default. */
   effort?: Effort;
