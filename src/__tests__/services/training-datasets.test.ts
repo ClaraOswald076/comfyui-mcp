@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeAll, afterAll, vi } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -17,7 +17,7 @@ afterAll(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
-import { getDataset, getJobConfig, listDatasets, readTrainingFile } from "../../services/training-datasets.js";
+import { getDataset, getJobConfig, listDatasets, previewConfig, readTrainingFile, deleteDataset, updateDataset } from "../../services/training-datasets.js";
 
 function stageDataset(name: string, files: Array<[string, string | null]>) {
   const dir = join(root, "datasets", name);
@@ -81,7 +81,9 @@ describe("readTrainingFile (train_file)", () => {
   it("rejects escapes, non-images, and oversize files", () => {
     expect(() => readTrainingFile(join(tmpdir(), "outside.png"))).toThrow(/escapes/);
     expect(() => readTrainingFile(join(root, "datasets", "alpha", "img_00001.txt"))).toThrow(/only image files/);
-    const big = join(root, "datasets", "alpha", "big.png");
+    const bigDir = join(root, "datasets", "bigset");
+    mkdirSync(bigDir, { recursive: true });
+    const big = join(bigDir, "big.png");
     writeFileSync(big, Buffer.alloc(2 * 1024 * 1024 + 1));
     expect(() => readTrainingFile(big)).toThrow(/too large/);
   });
@@ -153,5 +155,137 @@ describe("getJobConfig", () => {
 
   it("throws on an unknown job id", async () => {
     await expect(getJobConfig("nope")).rejects.toThrow(/no training job/);
+  });
+});
+
+describe("updateDataset / deleteDataset", () => {
+  it("sets captions atomically, deletes images with their caption files, warns on unknown files", async () => {
+    const r = await updateDataset("alpha", {
+      setCaptions: { "img_00001.png": "ohwx a person, smiling", "ghost.png": "nope" },
+      deleteImages: ["img_00002.png", "ghost2.png"],
+    });
+    expect(r).toMatchObject({ captionsSet: 1, imagesDeleted: 1 });
+    expect(r.warnings).toHaveLength(2);
+    const d = getDataset("alpha");
+    expect(d.items).toEqual([{ file: "img_00001.png", caption: "ohwx a person, smiling" }]);
+  });
+
+  it("rejects non-image mutation targets (caption sidecars, cache files)", async () => {
+    const dir = join(root, "datasets", "alpha");
+    writeFileSync(join(dir, "img_00001.txt"), "cap");
+    writeFileSync(join(dir, "cache.bin"), "x");
+    const r = await updateDataset("alpha", {
+      setCaptions: { "img_00001.txt": "hijack", "cache.bin": "hijack" },
+      deleteImages: ["img_00001.txt", "cache.bin"],
+    });
+    expect(r.captionsSet).toBe(0);
+    expect(r.imagesDeleted).toBe(0);
+    expect(r.warnings).toHaveLength(4);
+    expect(readFileSync(join(dir, "img_00001.txt"), "utf-8")).toBe("cap"); // untouched
+  });
+
+  it("rejects edits and deletes while a running job trains from the dataset", async () => {
+    const jobDir = join(root, "jobs", "active1");
+    mkdirSync(jobDir, { recursive: true });
+    writeFileSync(
+      join(root, "jobs", "active1.json"),
+      JSON.stringify({
+        id: "active1", name: "x", flow: "character", model: "flux1-dev", status: "running",
+        progress: { samples: [] }, datasetPath: join(root, "datasets", "alpha"),
+        jobDir, outputDir: join(jobDir, "output"), log: [],
+        createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      }),
+    );
+    await expect(updateDataset("alpha", { setCaptions: { "img_00001.png": "y" } })).rejects.toThrow(/in use/);
+    await expect(deleteDataset("alpha")).rejects.toThrow(/in use/);
+    // cleanup the record so later tests aren't blocked
+    rmSync(join(root, "jobs", "active1.json"));
+  });
+
+  it("deletes an unused dataset wholesale", async () => {
+    stageDataset("doomed", [["img_00001.png", "x"]]);
+    await deleteDataset("doomed");
+    expect(listDatasets().map((d) => d.name)).not.toContain("doomed");
+    expect(() => getDataset("doomed")).toThrow(/no dataset/);
+  });
+});
+
+describe("previewConfig", () => {
+  it("returns the raw ai-toolkit YAML for the settings (no side effects)", () => {
+    const v = previewConfig({
+      name: "prev",
+      datasetPath: join(root, "datasets", "alpha"),
+      trigger: "ohwx",
+      params: { steps: 200, rank: 32 },
+    });
+    expect(v.jobName).toBe("prev");
+    expect(v.yaml).toContain("steps: 200");
+    expect(v.yaml).toContain("linear: 32");
+    expect(v.yaml).toContain("trigger_word: ohwx");
+  });
+});
+
+describe("deleteJob", () => {
+  function writeJob(id: string, status: string, containerName?: string) {
+    const jobDir = join(root, "jobs", id);
+    mkdirSync(jobDir, { recursive: true });
+    writeFileSync(join(jobDir, "config.yml"), "job: extension\n");
+    writeFileSync(
+      join(root, "jobs", `${id}.json`),
+      JSON.stringify({
+        id, name: id, flow: "character", model: "flux1-dev", status,
+        ...(containerName ? { containerName } : {}),
+        progress: { samples: [] }, datasetPath: join(root, "datasets", "alpha"),
+        jobDir, outputDir: join(jobDir, "output"), log: [],
+        createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      }),
+    );
+    return jobDir;
+  }
+
+  it("removes the record + job dir (keep_outputs spares the dir)", async () => {
+    const { deleteJob } = await import("../../services/training-jobs.js");
+    const dir = writeJob("oldjob", "completed");
+    await deleteJob("oldjob");
+    expect(existsSync(join(root, "jobs", "oldjob.json"))).toBe(false);
+    expect(existsSync(dir)).toBe(false);
+
+    const dir2 = writeJob("keepme", "completed");
+    await deleteJob("keepme", { keepOutputs: true });
+    expect(existsSync(join(root, "jobs", "keepme.json"))).toBe(false);
+    expect(existsSync(dir2)).toBe(true);
+  });
+
+  it("refuses to delete a running job (cancel first) and unknown ids", async () => {
+    const { deleteJob } = await import("../../services/training-jobs.js");
+    writeJob("livejob", "running");
+    await expect(deleteJob("livejob")).rejects.toThrow(/cancel it first/);
+    expect(existsSync(join(root, "jobs", "livejob.json"))).toBe(true);
+    await expect(deleteJob("no-such-job")).rejects.toThrow(/no training job/);
+    rmSync(join(root, "jobs", "livejob.json"), { force: true });
+  });
+
+  it("a CANCELLED job deletes only when its container is verified gone (codex r3 BLOCKER)", async () => {
+    const { deleteJob } = await import("../../services/training-jobs.js");
+    writeJob("cjob", "cancelled", "comfyui-train-cjob");
+    // Container still ALIVE (or unknown) → refuse: the registry must not be
+    // erased while training may be live.
+    await expect(
+      deleteJob("cjob", {}, { containerRunning: () => Promise.resolve(true) }),
+    ).rejects.toThrow(/unconfirmed/);
+    expect(existsSync(join(root, "jobs", "cjob.json"))).toBe(true);
+    // Verified gone → delete proceeds.
+    await deleteJob("cjob", {}, { containerRunning: () => Promise.resolve(false) });
+    expect(existsSync(join(root, "jobs", "cjob.json"))).toBe(false);
+  });
+
+  it("refresh prunes disk-deleted records from the in-memory registry (codex r3 MAJOR)", async () => {
+    const jobs = await import("../../services/training-jobs.js");
+    writeJob("ghost", "completed");
+    // Seed the cache via listJobs, then delete the FILE and re-list.
+    await jobs.listJobs();
+    rmSync(join(root, "jobs", "ghost.json"), { force: true });
+    const after = await jobs.listJobs();
+    expect(after.find((j) => j.id === "ghost")).toBeUndefined();
   });
 });

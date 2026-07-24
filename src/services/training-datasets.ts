@@ -3,7 +3,7 @@
 // root: dataset names are basename-checked, train_file paths are realpath-
 // contained, and inlining is size-capped (a phone is the other end).
 
-import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { basename, extname, join, resolve, sep } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { datasetsRoot, getJob, trainingRoot } from "./training-jobs.js";
@@ -119,6 +119,107 @@ export function getDataset(name: string): DatasetDetail {
   return { ...summarize(dir, name), datasetPath: dir, items };
 }
 
+// ── Dataset mutations (edit captions, delete images, delete datasets) ───────
+
+import { rmSync, renameSync } from "node:fs";
+import { listJobs } from "./training-jobs.js";
+import { buildTrainingConfig, type TrainParams } from "./training-config.js";
+
+function samePath(a: string, b: string): boolean {
+  const norm = (x: string) => (process.platform === "win32" ? x.toLowerCase() : x);
+  return norm(resolve(a)) === norm(resolve(b));
+}
+
+/** A dataset dir a RUNNING/QUEUED job trains from must not be edited or
+ *  deleted (the dir is bind-mounted into the running container — same guard
+ *  as prepareDataset's replace check, codex finding lineage). */
+export async function assertDatasetEditable(dir: string, what: string): Promise<void> {
+  const active = await listJobs();
+  const inUse = active.find(
+    (j) => (j.status === "running" || j.status === "queued") && j.datasetPath && samePath(j.datasetPath, dir),
+  );
+  if (inUse) {
+    throw new Error(`dataset is in use by ${inUse.status} job ${inUse.id} — ${what} is blocked until it finishes (or cancel it first)`);
+  }
+}
+
+export interface DatasetUpdateResult {
+  captionsSet: number;
+  imagesDeleted: number;
+  warnings: string[];
+}
+
+/** Edit captions and/or delete images in a staged dataset. Caption writes are
+ *  atomic per file (tmp+rename); unknown files are warnings, never silent. */
+export async function updateDataset(
+  name: string,
+  opts: { setCaptions?: Record<string, string>; deleteImages?: string[] },
+): Promise<DatasetUpdateResult> {
+  const dir = datasetDir(name);
+  await assertDatasetEditable(dir, "editing");
+  const warnings: string[] = [];
+  let captionsSet = 0;
+  let imagesDeleted = 0;
+  for (const [file, caption] of Object.entries(opts.setCaptions ?? {})) {
+    if (file !== basename(file) || !IMAGE_EXTS.has(extname(file).toLowerCase())) {
+      warnings.push(`${file}: skipped (not a supported image file)`);
+      continue;
+    }
+    const img = join(dir, file);
+    if (!existsSync(img) || !statSync(img).isFile()) {
+      warnings.push(`${file}: no such image — caption not written`);
+      continue;
+    }
+    const cap = join(dir, `${basename(file, extname(file))}.txt`);
+    const tmp = `${cap}.tmp-${process.pid}`;
+    writeFileSync(tmp, caption.trim());
+    renameSync(tmp, cap);
+    captionsSet++;
+  }
+  for (const file of opts.deleteImages ?? []) {
+    if (file !== basename(file) || !IMAGE_EXTS.has(extname(file).toLowerCase())) {
+      warnings.push(`${file}: skipped (not a supported image file)`);
+      continue;
+    }
+    const img = join(dir, file);
+    if (!existsSync(img) || !statSync(img).isFile()) {
+      warnings.push(`${file}: no such image`);
+      continue;
+    }
+    rmSync(img, { force: true });
+    rmSync(join(dir, `${basename(file, extname(file))}.txt`), { force: true });
+    imagesDeleted++;
+  }
+  return { captionsSet, imagesDeleted, warnings };
+}
+
+/** Delete a whole staged dataset (dir + captions). In-use guard as above. */
+export async function deleteDataset(name: string): Promise<void> {
+  const dir = datasetDir(name);
+  await assertDatasetEditable(dir, "deleting");
+  rmSync(dir, { recursive: true, force: true });
+}
+
+/** The raw YAML train_start would write for these settings — the ostris-UI
+ *  "raw config" preview. NO side effects (nothing is written or started). */
+export function previewConfig(input: {
+  name: string;
+  datasetPath: string;
+  trigger?: string;
+  params?: Partial<TrainParams>;
+}): { jobName: string; yaml: string } {
+  const built = buildTrainingConfig({
+    name: input.name,
+    flow: "character",
+    model: "flux1-dev",
+    datasetPath: input.datasetPath,
+    outputDir: join(trainingRoot(), "jobs", "<job>", "output"),
+    trigger: input.trigger,
+    params: input.params,
+  });
+  return { jobName: built.jobName, yaml: built.yaml };
+}
+
 // ── train_file: bounded inline reads under the training root ───────────────
 
 /** Read an image under the training root (dataset images, job samples) as
@@ -149,6 +250,9 @@ export interface JobConfigView {
   model: string;
   trigger?: string;
   datasetPath: string;
+  /** The raw ai-toolkit config.yml text the job consumed (the ostris-UI "raw
+   *  config" view) — null when the file is gone/unreadable. */
+  rawYaml: string | null;
   params: {
     steps?: number;
     lr?: number;
@@ -171,8 +275,10 @@ export async function getJobConfig(id: string): Promise<JobConfigView> {
   if (!job) throw new Error(`no training job ${id}`);
   const params: JobConfigView["params"] = {};
   let source: JobConfigView["source"] = "unknown";
+  let rawYaml: string | null = null;
   try {
-    const doc = parseYaml(readFileSync(join(job.jobDir, "config.yml"), "utf-8")) as {
+    rawYaml = readFileSync(join(job.jobDir, "config.yml"), "utf-8");
+    const doc = parseYaml(rawYaml) as {
       config?: { process?: Array<Record<string, unknown>> };
     };
     const proc = (doc?.config?.process?.[0] ?? {}) as Record<string, Record<string, unknown> & { datasets?: Array<Record<string, unknown>> }>;
@@ -201,6 +307,7 @@ export async function getJobConfig(id: string): Promise<JobConfigView> {
     model: job.model,
     trigger: job.trigger,
     datasetPath: job.datasetPath,
+    rawYaml,
     params,
     source,
   };

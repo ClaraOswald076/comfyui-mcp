@@ -745,6 +745,16 @@ async function refreshRegistry(deps: TrainingJobDeps = {}): Promise<void> {
     }
     jobs.set(job.id, job);
   }
+  // Prune ids whose record files are GONE (train_delete_job removed them) —
+  // otherwise every long-lived sibling process keeps serving deleted jobs
+  // from cache and can act on their stale jobDir (codex r3 MAJOR: a later
+  // delete could wipe outputs previously spared with keep_outputs). Ids this
+  // process OWNS (handles) are never pruned — their files exist or are
+  // mid-persist (tmp+rename window).
+  const onDisk = new Set(files.map((f) => f.replace(/\.json$/, "")));
+  for (const id of [...jobs.keys()]) {
+    if (!onDisk.has(id) && !handles.has(id)) jobs.delete(id);
+  }
 }
 
 /** Pod jobs: pull the produced output (checkpoints + samples + LoRA) back to
@@ -1846,4 +1856,53 @@ async function cancelJobBody(id: string, job: TrainingJob, deps: TrainingJobDeps
  *  plain data; exposed so tools/tests have one obvious shape). */
 export function toJobSummary(job: TrainingJob): TrainingJob {
   return job;
+}
+
+/** Delete an old job's registry record + (unless keepOutputs) its job dir
+ *  (config/log/checkpoints/samples). Cleanup for the Jobs view — the
+ *  DELIVERED LoRA in models/loras is NOT touched. Running/queued jobs refuse:
+ *  a deleted record would orphan the container from the cancel/reconcile
+ *  machinery (billing!). Cancelled jobs must verify container-gone first —
+ *  "cancelled" persists BEFORE the stop is verified (cancelJob's ordering),
+ *  so a concurrent delete (or a record left by a dead cancel process) could
+ *  otherwise erase the registry while training is still live (codex r3
+ *  BLOCKER). Runs under the per-job CAS lock so a finalize/cancel can't
+ *  interleave. */
+export async function deleteJob(
+  id: string,
+  opts: { keepOutputs?: boolean } = {},
+  deps: TrainingJobDeps = {},
+): Promise<void> {
+  const job = await getJob(id, deps);
+  if (!job) throw new Error(`no training job ${id}`);
+  if (job.status === "running" || job.status === "queued") {
+    throw new Error(`job ${id} is ${job.status} — cancel it first (train_cancel), then delete`);
+  }
+  if (job.status === "cancelled" && job.containerName) {
+    const probe = deps.containerRunning ?? defaultContainerProbe;
+    const alive = await probe(job.containerName, jobProbeConfigPath(job)).catch(() => null);
+    if (alive !== false) {
+      throw new Error(
+        `job ${id} is marked cancelled but its container state is unconfirmed — it may still be running. ` +
+          `Re-run train_cancel first (it re-stops and verifies), then delete.`,
+      );
+    }
+  }
+  const lock = join(jobsRoot(), `${id}.lock`);
+  if (!(await acquireLock(lock, deps.lockBudgetMs ?? LOCK_WAIT_MS, 5 * 60_000))) {
+    throw new Error(`job ${id} is busy (a finalize/cancel is in flight) — try again in a moment`);
+  }
+  try {
+    jobs.delete(id);
+    rmSync(jobFile(id), { force: true });
+    if (!opts.keepOutputs) {
+      // realpath-aware containment (pathWithin) — a symlink/junction inside
+      // the jobs root must not let recursive removal reach outside it.
+      if (existsSync(job.jobDir) && pathWithin(jobsRoot(), job.jobDir)) {
+        rmSync(job.jobDir, { recursive: true, force: true });
+      }
+    }
+  } finally {
+    releaseLock(lock);
+  }
 }
