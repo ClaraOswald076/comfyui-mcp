@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeAll, afterAll, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -36,7 +36,15 @@ describe("listDatasets / getDataset", () => {
     stageDataset("alpha", [["img_00001.png", "ohwx a person"], ["img_00002.png", null]]);
     stageDataset("empty", []);
     mkdirSync(join(root, "datasets", "beta"), { recursive: true });
-    writeFileSync(join(root, "datasets", "beta", "img_00001.png"), "x");
+    const betaImg = join(root, "datasets", "beta", "img_00001.png");
+    writeFileSync(betaImg, "x");
+    // Force beta genuinely newer than alpha, rather than trusting that two writes
+    // in the same test land in different mtime buckets — coarse filesystem mtime
+    // granularity made this "newest-first" assertion flake on CI when alpha and
+    // beta tied. summarize() takes the max file mtime, so stamping beta's only
+    // file into the future is enough.
+    const future = new Date(Date.now() + 60_000);
+    utimesSync(betaImg, future, future);
     const list = listDatasets();
     expect(list.map((d) => d.name)).toEqual(["beta", "alpha"]);
     expect(list.find((d) => d.name === "alpha")).toMatchObject({ imageCount: 2, captionedCount: 1 });
