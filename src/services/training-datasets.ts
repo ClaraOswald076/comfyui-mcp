@@ -93,11 +93,14 @@ function summarize(dir: string, name: string): DatasetSummary {
 export function listDatasets(): DatasetSummary[] {
   const root = datasetsRoot();
   if (!existsSync(root)) return [];
+  // Newest first; a deterministic name tiebreaker keeps the order STABLE when two
+  // datasets share an mtime (coarse filesystem granularity) — otherwise the order
+  // follows readdir and varies by platform.
   return readdirSync(root, { withFileTypes: true })
     .filter((d) => d.isDirectory() && !d.name.includes(".staging-"))
     .map((d) => summarize(join(root, d.name), d.name))
     .filter((s) => s.imageCount > 0)
-    .sort((a, b) => b.modified.localeCompare(a.modified));
+    .sort((a, b) => b.modified.localeCompare(a.modified) || a.name.localeCompare(b.name));
 }
 
 /** One dataset's items with their captions (null when uncaptioned). */
