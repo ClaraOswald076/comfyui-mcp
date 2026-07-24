@@ -6,6 +6,27 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.0] - 2026-07-24
+
+### MCP
+
+#### Changed
+- **The panel agent now defaults to Claude Opus 5.** `COMFYUI_MCP_PANEL_MODEL`
+  still pinned `claude-opus-4-8`, so new panel sessions started on the previous
+  Opus unless you overrode it. Set `COMFYUI_MCP_PANEL_MODEL` to pin a different
+  model. No panel-side change was required: the model picker is populated from
+  `query.supportedModels()` rather than a hardcoded catalog, its fallback row
+  uses the `opus` family alias, the advertised Claude effort scale already
+  covers Opus 5's full `low|medium|high|xhigh|max` ladder, and the context
+  window is read from the SDK rather than assumed.
+
+#### Fixed
+- **Double-encoded em dash in published metadata.** The em dash in
+  `package.json`'s `description` and in `docs/docs.json` had been decoded as
+  CP1252 and re-encoded as UTF-8, leaving a literal `â€"`. The description ships
+  to npm and is scraped by third-party directories, so the artifact propagated
+  to every downstream listing.
+
 ## [0.47.0] - 2026-07-23
 
 ### MCP
