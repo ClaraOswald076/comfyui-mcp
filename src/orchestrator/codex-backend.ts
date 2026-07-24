@@ -1013,6 +1013,42 @@ export class CodexBackend implements AgentBackend {
       return activeTurnId === null || msgTurnId === null || msgTurnId === activeTurnId;
     };
 
+    // LIVENESS (watchdog re-arm): re-arm PanelAgent's idle watchdog ONLY for
+    // notifications that represent work or an outcome for THIS active turn. A
+    // long tool call streams item/* and turn/* notifications that carry no
+    // AgentEvent of their own — a multi-minute ComfyUI generation emits
+    // item/started, item/updated, … — so without this a healthy long run looks
+    // idle and the watchdog falsely trips. `error` counts too: a retrying
+    // provider error (willRetry) is Codex still owning the turn.
+    //
+    // It must NOT fire for the background traffic the app-server interleaves —
+    // account, model-catalog and token-usage notifications arrive while the
+    // active turn is silent — nor for notifications belonging to a stale or
+    // other thread/turn. Both kept the watchdog armed forever, so a genuinely
+    // wedged turn (nothing on its own item/turn stream while background chatter
+    // continued) never reached the stall deadline. Gating on belongsToTurn AND
+    // the active-turn method set is what makes the deadline reachable. (#307)
+    // item/* and turn/* are the streaming lifecycle; `error` is a (possibly
+    // retrying) turn error. The model/* trio are turn events the pinned
+    // app-server emits around provider routing/safety — they carry threadId +
+    // turnId, so they ARE active-turn progress and must re-arm the watchdog, but
+    // a bare item/turn prefix check misses them (#307 review, finding 2).
+    const MODEL_TURN_EVENTS = new Set([
+      "model/safetyBuffering/updated",
+      "model/rerouted",
+      "model/verification",
+    ]);
+    const TURN_LIVENESS = (m: string) =>
+      m.startsWith("item/") || m.startsWith("turn/") || m === "error" || MODEL_TURN_EVENTS.has(m);
+    const bumpTurnActivity = (msg: RpcMessage): void => {
+      if (!belongsToTurn(msg) || !TURN_LIVENESS(msg.method ?? "")) return;
+      try {
+        onActivity?.();
+      } catch {
+        // a watchdog bump must never break the protocol reader
+      }
+    };
+
     // Track the streamed item id so deltas + the final commit share one bubble id
     // (the panel reconciles by id, like the Claude stream path). Reasoning and
     // reply text each open/close their own stream (P2-1: reasoning was previously
@@ -1129,9 +1165,9 @@ export class CodexBackend implements AgentBackend {
           // and terminal errors. `willRetry: true` means Codex is still owning the
           // turn and will continue it after reconnecting; completing our iterator
           // here would abort that recovery and make the panel report e.g.
-          // "Reconnecting... 2/5" as the final failure. The notification already
-          // bumped onActivity above, so keep waiting for either a later terminal
-          // error or turn/completed.
+          // "Reconnecting... 2/5" as the final failure. `error` is in the turn
+          // liveness set, so this already re-armed the watchdog — keep waiting
+          // for either a later terminal error or turn/completed.
           const e = (params.error ?? {}) as { message?: string };
           if (params.willRetry === true) break;
           // A non-retrying `error` ends the turn: emit it AND finish, so a turn that
@@ -1156,27 +1192,15 @@ export class CodexBackend implements AgentBackend {
 
     const prev = client.notificationHandler;
     client.notificationHandler = (msg: RpcMessage) => {
-      // LIVENESS (watchdog re-arm): ANY notification received while this turn is
-      // in flight is a sign the app-server is alive and working — fire onActivity
-      // BEFORE buffering/filtering/translating, so even raw notifications that
-      // produce NO AgentEvent (a long MCP tool call running a multi-minute ComfyUI
-      // generation: item/started, item/updated, tool/exec progress, …) keep
-      // PanelAgent's idle watchdog armed. Without this a HEALTHY long generation
-      // looks idle and the watchdog falsely trips. A genuine zero-event freeze
-      // (the app-server emits nothing at all) never reaches here, so the real
-      // freeze-catch is preserved. Cheap + best-effort — never let it throw into
-      // the JSON-RPC reader.
-      try {
-        onActivity?.();
-      } catch {
-        // a watchdog bump must never break the protocol reader
-      }
-      // Until the turnId is known, buffer everything (we can't yet tell which
-      // turn a notification belongs to). Replayed after turn/start resolves.
+      // Until the turnId is known, buffer everything — we can't yet tell which
+      // turn a notification belongs to, so we can't yet decide whether it counts
+      // as liveness either. Replayed (and bumped) after turn/start resolves, so
+      // the watchdog rule lives in exactly one place: bumpTurnActivity.
       if (!turnIdKnown) {
         buffered.push(msg);
         return;
       }
+      bumpTurnActivity(msg);
       if (!belongsToTurn(msg)) {
         prev?.(msg); // stale / other-turn / other-thread → pass through
         return;
@@ -1258,6 +1282,9 @@ export class CodexBackend implements AgentBackend {
           }
           turnIdKnown = true;
           for (const msg of buffered) {
+            // Same watchdog rule as the live path: a buffered item/*, turn/* or
+            // error for this turn counts as liveness now that we can attribute it.
+            bumpTurnActivity(msg);
             if (belongsToTurn(msg)) apply(msg);
             else prev?.(msg);
           }

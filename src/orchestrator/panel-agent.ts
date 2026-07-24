@@ -46,6 +46,18 @@ function msgOf(err: unknown): string {
  *  COMFYUI_MCP_TURN_IDLE_MS. Default 3.5 min. */
 const TURN_IDLE_MS = Number(process.env.COMFYUI_MCP_TURN_IDLE_MS) || 210_000;
 
+/** Longest a single tool call may hold the idle watchdog off before it's treated
+ *  as genuinely stuck rather than legitimately slow. An MCP tool call streams NO
+ *  progress notification between its start and end (e.g. install_custom_node
+ *  awaiting ComfyUI-Manager's 600s cap), so while one is in flight the turn is
+ *  working even though the app-server is silent — the watchdog must not trip. But
+ *  a tool open past THIS is more likely wedged than slow, so the watchdog is
+ *  allowed to fire. Generous (> Manager's 600s). Read live (not a load-time
+ *  const) so it stays overridable per test. */
+function toolBusyMaxMs(): number {
+  return Number(process.env.COMFYUI_MCP_TOOL_BUSY_MAX_MS) || 900_000;
+}
+
 /** How long after an interrupt to wait for the aborted turn's `result` (which
  *  releases the turn gate at the correct moment) before force-releasing it as a
  *  fallback. Short enough to feel immediate if a result somehow never arrives;
@@ -209,6 +221,15 @@ export class PanelAgent {
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   /** Guards against a trip firing twice / racing a real result for one turn. */
   private idleTripped = false;
+  /** Tool calls started (item/started) but not yet ended (item/completed). A tool
+   *  in flight is legitimate work even when the app-server sends nothing, so the
+   *  watchdog defers while this is > 0 — the fix for the #307-review finding that
+   *  narrowing raw-notification liveness could false-trip a long silent tool call.
+   *  Reset per turn so a leaked start can't wedge the next turn's watchdog. */
+  private openToolCalls = 0;
+  /** When the current run of open tool calls began (0 → 1 transition), so the
+   *  defer can be bounded by TOOL_BUSY_MAX_MS. */
+  private toolBusySince = 0;
   // ---- turn gate (race-free) ----
   // The channel releases ONE batch per turn so the SDK can't read ahead (which
   // prematurely "read" queued messages and lost them on interrupt). Implemented
@@ -821,6 +842,10 @@ export class PanelAgent {
       this.idleTimer = null;
     }
     this.idleTripped = false;
+    // The turn ended — drop any tool-busy state so a start whose matching end was
+    // never seen (errored/interrupted turn) can't defer the NEXT turn's watchdog.
+    this.openToolCalls = 0;
+    this.toolBusySince = 0;
   }
 
   /** The current turn produced NO events for the whole idle window → it's frozen.
@@ -830,6 +855,15 @@ export class PanelAgent {
    *  capped at yieldedTurns so a late real result can't double-advance the gate. */
   private onTurnStalled(): void {
     if (this.closed || this.idleTripped || !this.busy) return;
+    // A tool call in flight is legitimate work even with a silent app-server (an
+    // MCP tool call has no progress notification between its start and end). Defer
+    // and re-arm rather than kill a healthy long tool call — UNLESS a tool has
+    // been open past TOOL_BUSY_MAX_MS, in which case it's more likely wedged than
+    // slow and we fall through to the real trip. (#307 review finding.)
+    if (this.openToolCalls > 0 && Date.now() - this.toolBusySince < toolBusyMaxMs()) {
+      this.bumpIdleWatchdog();
+      return;
+    }
     this.idleTripped = true;
     this.idleTimer = null;
     logger.error(
@@ -926,7 +960,15 @@ export class PanelAgent {
         this.busy = true;
         this.deps.onTurn?.(this.tabId, "working");
         if (ev.phase === "start") {
+          // Enter "tool busy": while a tool runs the app-server can be silent for
+          // longer than the idle window, so onTurnStalled() defers rather than
+          // trips (bounded by TOOL_BUSY_MAX_MS). Stamp the start of the run on the
+          // 0 → 1 edge only, so several overlapping tools share one deadline.
+          if (this.openToolCalls === 0) this.toolBusySince = Date.now();
+          this.openToolCalls += 1;
           this.deps.onToolCall?.(this.tabId, ev.name);
+        } else {
+          this.openToolCalls = Math.max(0, this.openToolCalls - 1);
         }
         break;
       }
