@@ -187,7 +187,8 @@ export function registerRunTemplateTools(server: McpServer): void {
         }
 
         // 4. Minimal wait: poll get_job_status until done or timeout.
-        //    (A richer wait_for_job tool exists separately; keep this simple.)
+        //    (Kept deliberately simple — for a bare enqueue, call
+        //    enqueue_workflow and poll get_job_status yourself.)
         const timeoutMs = (args.timeout_s ?? 300) * 1000;
         const start = Date.now();
         for (;;) {
