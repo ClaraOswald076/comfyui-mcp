@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.1] - 2026-07-26
+
+### MCP
+
+#### Fixed
+- remove wait_for_job — copy-paste holdover from the official Comfy MCP/CLI (#320)
+
+
 ## [0.48.0] - 2026-07-24
 
 ### MCP
