@@ -78,7 +78,7 @@ export const OPENAI_KEY_PROVIDERS: OpenAiKeyProvider[] = [
     slotHelp: "Z.AI Coding Plan (GLM / Zhipu)",
     envKeys: ["GLM_API_KEY", "ZHIPU_API_KEY", "ZHIPUAI_API_KEY", "ZAI_API_KEY"],
     modelEnv: "COMFYUI_MCP_GLM_MODEL",
-    defaultModel: process.env.COMFYUI_MCP_GLM_MODEL?.trim() || "glm-4.7",
+    defaultModel: process.env.COMFYUI_MCP_GLM_MODEL?.trim() || "glm-5.2",
     ackFallbackLabel: "GLM",
     readyMessage: (agentLabel) =>
       `🟢 comfyui-mcp agent ready — ${agentLabel} on your Z.AI GLM Coding Plan. Ask away.`,
@@ -144,7 +144,7 @@ export function openAiKeyProviderModel(p: OpenAiKeyProvider): string {
  * One-line "which model am I on, and how do I change it?" hint for the panel's
  * API Keys card.
  *
- * These providers ship a pinned default (glm-4.7, kimi-for-coding, kimi-k3) and
+ * These providers ship a pinned default (glm-5.2, kimi-for-coding, kimi-k3) and
  * a `modelEnv` override, but NOTHING in the UI ever said the override existed —
  * so a user on a newer model (e.g. GLM 5.2) had no way to discover they could
  * point at it without reading the source. Generated from the registry rather
