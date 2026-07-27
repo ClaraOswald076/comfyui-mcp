@@ -1329,7 +1329,7 @@
         1,
         5,
         43,
-        "fixed",
+        "randomize",
         true,
         "euler",
         0,
@@ -3211,7 +3211,7 @@
       },
       "widgets_values": [
         43,
-        "fixed"
+        "randomize"
       ]
     },
     {

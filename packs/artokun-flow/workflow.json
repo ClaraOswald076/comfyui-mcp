@@ -252,7 +252,7 @@
         1,
         5,
         42,
-        "fixed",
+        "randomize",
         true,
         "dpm++_sde",
         0,
@@ -2106,7 +2106,7 @@
             },
             "widgets_values": [
               42,
-              "fixed",
+              "randomize",
               1080,
               1080,
               21,
@@ -2239,7 +2239,7 @@
             },
             "widgets_values": [
               2,
-              "fixed"
+              "randomize"
             ]
           },
           {

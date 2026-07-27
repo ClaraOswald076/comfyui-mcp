@@ -198,7 +198,7 @@
       },
       "widgets_values": [
         908195154852613,
-        "fixed"
+        "randomize"
       ]
     },
     {
@@ -5919,7 +5919,7 @@
             },
             "widgets_values": [
               0,
-              "fixed",
+              "randomize",
               12,
               3,
               "er_sde",

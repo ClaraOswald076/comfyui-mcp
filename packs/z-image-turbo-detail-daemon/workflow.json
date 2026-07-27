@@ -200,7 +200,7 @@
       },
       "widgets_values": [
         350700258930986,
-        "fixed",
+        "randomize",
         8,
         1,
         "euler",
@@ -646,7 +646,7 @@
         "noise on beginning steps",
         20,
         2374501933,
-        "fixed",
+        "randomize",
         "beginning",
         0,
         false
@@ -1025,7 +1025,7 @@
       },
       "widgets_values": [
         0,
-        "fixed",
+        "randomize",
         2,
         1,
         "euler",
@@ -1360,7 +1360,7 @@
         "noise on beginning steps",
         20,
         2374501933,
-        "fixed",
+        "randomize",
         "beginning",
         0,
         false
@@ -1414,7 +1414,7 @@
       },
       "widgets_values": [
         350700258930986,
-        "fixed"
+        "randomize"
       ],
       "color": "#2a363b",
       "bgcolor": "#3f5159"

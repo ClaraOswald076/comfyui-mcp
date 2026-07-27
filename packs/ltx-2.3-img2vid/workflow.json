@@ -624,7 +624,7 @@
             },
             "widgets_values": [
               42,
-              "fixed"
+              "randomize"
             ]
           },
           {
@@ -2100,7 +2100,7 @@
             },
             "widgets_values": [
               720,
-              "fixed"
+              "randomize"
             ]
           },
           {
@@ -2159,7 +2159,7 @@
             },
             "widgets_values": [
               25,
-              "fixed"
+              "randomize"
             ]
           },
           {
@@ -2217,7 +2217,7 @@
             },
             "widgets_values": [
               5,
-              "fixed"
+              "randomize"
             ]
           },
           {
@@ -2918,7 +2918,7 @@
             },
             "widgets_values": [
               1280,
-              "fixed"
+              "randomize"
             ]
           },
           {

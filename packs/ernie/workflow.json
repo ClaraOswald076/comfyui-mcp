@@ -1148,7 +1148,7 @@
       },
       "widgets_values": [
         1049185209513149,
-        "fixed",
+        "randomize",
         9,
         1,
         "euler",
@@ -1408,7 +1408,7 @@
       },
       "widgets_values": [
         1049185209513149,
-        "fixed",
+        "randomize",
         9,
         1,
         "euler",
@@ -4223,7 +4223,7 @@
       },
       "widgets_values": [
         1049185209513149,
-        "fixed",
+        "randomize",
         9,
         1,
         "euler",
@@ -4916,7 +4916,7 @@
       },
       "widgets_values": [
         997032332094579,
-        "fixed",
+        "randomize",
         9,
         1,
         "euler",
@@ -4989,7 +4989,7 @@
       },
       "widgets_values": [
         997032332094579,
-        "fixed",
+        "randomize",
         9,
         1,
         "euler",
@@ -5380,7 +5380,7 @@
       },
       "widgets_values": [
         411777674790761,
-        "fixed",
+        "randomize",
         9,
         1,
         "euler",
@@ -7066,7 +7066,7 @@
       },
       "widgets_values": [
         997032332094579,
-        "fixed",
+        "randomize",
         8,
         1,
         "euler",

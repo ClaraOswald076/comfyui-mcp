@@ -696,7 +696,7 @@
       },
       "widgets_values": [
         548943998778239,
-        "fixed",
+        "randomize",
         9,
         1,
         "euler",
@@ -2361,7 +2361,7 @@
       },
       "widgets_values": [
         411777674790761,
-        "fixed",
+        "randomize",
         9,
         1,
         "euler",
@@ -2655,7 +2655,7 @@
       },
       "widgets_values": [
         414261067932190,
-        "fixed",
+        "randomize",
         9,
         1,
         "euler",
@@ -3642,7 +3642,7 @@
       },
       "widgets_values": [
         1049185209513149,
-        "fixed",
+        "randomize",
         9,
         1,
         "euler",
@@ -5926,7 +5926,7 @@
       },
       "widgets_values": [
         350700258930986,
-        "fixed",
+        "randomize",
         8,
         1,
         "euler",
@@ -5991,7 +5991,7 @@
       },
       "widgets_values": [
         0,
-        "fixed",
+        "randomize",
         2,
         1,
         "euler",
@@ -6173,7 +6173,7 @@
       },
       "widgets_values": [
         350700258930986,
-        "fixed"
+        "randomize"
       ],
       "color": "#2a363b",
       "bgcolor": "#3f5159"
@@ -7062,7 +7062,7 @@
         "noise on beginning steps",
         20,
         2374501933,
-        "fixed",
+        "randomize",
         "beginning",
         0,
         false
@@ -7123,7 +7123,7 @@
         "noise on beginning steps",
         20,
         2374501933,
-        "fixed",
+        "randomize",
         "beginning",
         0,
         false
@@ -8228,7 +8228,7 @@
       },
       "widgets_values": [
         8,
-        "fixed"
+        "randomize"
       ]
     },
     {
@@ -8270,7 +8270,7 @@
       },
       "widgets_values": [
         4,
-        "fixed"
+        "randomize"
       ]
     },
     {
@@ -8437,7 +8437,7 @@
       "widgets_values": [
         "disable",
         0,
-        "fixed",
+        "randomize",
         8,
         1,
         "euler",
