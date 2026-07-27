@@ -1,0 +1,67 @@
+name: "Register a third-party host"
+description: "Register an integration built on the comfyui-mcp pairing / remote-control protocol (Blender panel, browser extension, another app, …)."
+title: "[Host] <your integration name>"
+labels: ["third-party-host"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for building on comfyui-mcp! Registering your host lets us list it
+        and flag protocol changes to you before they ship. See the
+        [Third-party hosts guide](https://comfyui-mcp.artokun.io/docs/third-party-hosts)
+        for the protocol.
+  - type: input
+    id: name
+    attributes:
+      label: Integration name
+      placeholder: "e.g. ComfyUI Agent — Blender Panel"
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform / host environment
+      placeholder: "e.g. Blender add-on, Chrome extension, Neovim plugin, iOS app"
+    validations:
+      required: true
+  - type: input
+    id: repo
+    attributes:
+      label: Repository or homepage
+      placeholder: "https://github.com/you/your-host"
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What does it do?
+      placeholder: "One or two sentences — what your host lets a user do with their ComfyUI agent session."
+    validations:
+      required: true
+  - type: input
+    id: protocol-ref
+    attributes:
+      label: Protocol version / commit built against
+      description: "The ui-bridge.ts commit SHA or release tag you built against, so we can warn you if the frames move."
+      placeholder: "e.g. v0.48.2 or a commit SHA"
+    validations:
+      required: true
+  - type: checkboxes
+    id: security
+    attributes:
+      label: Security invariants
+      description: "Confirm your host preserves the pairing contract (see the guide)."
+      options:
+        - label: "Connects only with a user-provided pair token (never embedded/auto-provisioned)."
+          required: true
+        - label: "Relies on the server's authoritative attach_tab stamping — never spoofs tab_id to target an un-attached tab."
+          required: true
+        - label: "Attaches only to non-headless desktop tabs; one active attachment per connection."
+          required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else?
+      placeholder: "Optional — status (alpha/beta/stable), platforms, contact, etc."
+    validations:
+      required: false

@@ -1,0 +1,220 @@
+---
+title: "Third-party hosts"
+description: "Build your own front-end (Blender panel, browser extension, another app) on the same pairing protocol the mobile app uses — one agent, shared context, thin client. The message shapes, endpoints, security invariants, and a copy-paste prompt to have an LLM scaffold your adapter."
+icon: "plug"
+---
+
+The Agent Panel, the [mobile app](/mobile), and any tool that pairs with a running
+session all speak **one small WebSocket protocol** to the orchestrator's pairing
+listener. A **third-party host** is any client you build on that protocol — a
+Blender panel, a browser extension, a CLI, another editor — that **attaches to a
+live desktop tab and drives its agent session**. Same agent, same context, no
+second Claude Code process, nothing extra for the user to install.
+
+<Note>
+This is the exact surface the mobile app is built on. If you can open a WebSocket
+and send JSON, you can build a host.
+</Note>
+
+## How it works
+
+<Steps>
+<Step title="The desktop is already listening">
+When the Agent Panel is open, the orchestrator runs a **token-gated pairing
+listener** on the LAN (see [Endpoints](#endpoints)). Each open panel tab is a
+**desktop tab** with a stable `tab_id` and a live agent session.
+</Step>
+<Step title="Your host connects with the pairing token">
+Open a WebSocket to the pairing URL with the token in the query string. Without a
+valid token the connection is refused — pairing is the whole security boundary.
+</Step>
+<Step title="List and attach to a tab">
+Send `list_tabs` to discover the open desktop tabs, then `attach_tab` to mirror
+one. Your host now **receives that tab's activity** (streamed) and can **drive it**.
+</Step>
+<Step title="Drive the shared session">
+Send `user_message` frames. While attached, the server routes them to the
+**mirrored tab** — so your message enters the *same* conversation the desktop
+agent is in. That's what makes it "one agent, shared context" rather than a
+second session.
+</Step>
+</Steps>
+
+## Endpoints
+
+The pairing listener is derived from the bridge port (`COMFYUI_MCP_BRIDGE_PORT`,
+default **9180**):
+
+| Port | Purpose |
+|---|---|
+| `bridge` (9180) | The panel ⇄ orchestrator UI bridge (the desktop's own connection). |
+| `bridge + 1` (9181) | The `panel_*` HTTP-MCP surface — **not** this protocol. |
+| **`bridge + 2` (9182)** | **The pairing / remote-control listener you connect to.** Token-gated, bound on `0.0.0.0` (LAN-reachable). |
+
+**Pairing URL:**
+
+```
+ws://<desktop-machine-ip>:9182/?token=<PAIR_TOKEN>
+```
+
+- The token is either **pinned** by the user via `COMFYUI_MCP_PAIR_TOKEN`
+  (always-on pairing) or **minted per session** and handed out through the
+  panel's QR / pair flow. Your host obtains it the same way the mobile app does:
+  the user pairs it once.
+- Bound to the LAN only. There is no built-in public exposure — if a user wants
+  remote reach they front it with their own tunnel, and the token still gates it.
+
+## Message shapes
+
+All frames are JSON objects with a `type`. Request/response frames carry a `cid`
+(correlation id) you choose, echoed back on the matching reply.
+
+### Inbound — host → orchestrator
+
+| `type` | Fields | Effect |
+|---|---|---|
+| `hello` | `tab_id`, `headless: true` | Register your connection. Third-party hosts are **headless** clients (no canvas of their own). |
+| `list_tabs` | `cid` | Ask for the open desktop tabs. |
+| `attach_tab` | `cid`, `target_tab_id` | Mirror + drive that desktop tab. Valid only for a **real, non-headless** desktop tab. |
+| `detach_tab` | — | Stop mirroring/driving; your input reverts to your own (empty) session. |
+| `user_message` | `text` (+ your usual message fields) | A turn in the **mirrored** tab's conversation. Server-stamped to the attached tab. |
+
+Any other panel event you send while attached is likewise routed to the mirrored
+tab.
+
+### Outbound — orchestrator → host
+
+| `type` | Fields | Meaning |
+|---|---|---|
+| `tab_list` | `cid`, `tabs[]` | Reply to `list_tabs`: the attachable desktop tabs. |
+| `tab_attached` | `cid`, `tab_id`, `ok`, `error?` | Reply to `attach_tab`. `ok:false` + `error` if the target is stale/headless. |
+| `mailbox_flush` | buffered frames | Replay of anything the tab produced while you had no live connection. |
+
+Plus the mirrored tab's live agent activity (streamed replies, status, cards),
+which your host renders.
+
+<Warning>
+**`attach_tab` is authoritative — you cannot forge the target.** The server
+overwrites any `tab_id` you put on an outbound frame with the tab you actually
+attached to. A host can only ever drive a tab it has explicitly attached to. This
+is deliberate; see below.
+</Warning>
+
+## Security invariants — a host MUST preserve these
+
+These are the guarantees that make pairing safe. Building a host that respects
+them is the whole contract; a host that tries to bypass them is exactly what the
+listener is designed to reject.
+
+<Note>
+Preserving these isn't a constraint on your host — it *is* the feature. They stop
+a client from hijacking a session it never paired to.
+</Note>
+
+1. **Token gate.** The listener refuses any connection without a valid pair token
+   (`verifyClient`). Never build a flow that ships or embeds the token
+   automatically — the user pairs, once, deliberately.
+2. **Authoritative `attach_tab` stamping.** The server, not the client, decides
+   which tab your frames target. Don't rely on client-supplied `tab_id` for
+   routing; attach first, then send.
+3. **Non-headless targets only.** You may attach to a real desktop tab, never to
+   another headless client (you can't mirror another phone/host).
+4. **One tab at a time.** Attaching to B drops your subscription to A. Model a
+   single active mirror per connection.
+5. **Pinned socket kind.** A connection's kind (headless vs desktop) is fixed on
+   its first `hello`; don't try to flip it to escape the takeover guards.
+
+## Minimal reference client
+
+```js
+const token = "<PAIR_TOKEN>";            // obtained via the user's pair flow
+const ws = new WebSocket(`ws://192.168.1.50:9182/?token=${token}`);
+let cid = 0;
+
+ws.onopen = () => {
+  ws.send(JSON.stringify({ type: "hello", tab_id: "myhost:" + crypto.randomUUID(), headless: true }));
+  ws.send(JSON.stringify({ type: "list_tabs", cid: ++cid }));
+};
+
+ws.onmessage = (ev) => {
+  const m = JSON.parse(ev.data);
+  if (m.type === "tab_list") {
+    // pick a desktop tab and attach to it
+    const target = m.tabs[0]?.tab_id;
+    if (target) ws.send(JSON.stringify({ type: "attach_tab", cid: ++cid, target_tab_id: target }));
+  } else if (m.type === "tab_attached" && m.ok) {
+    // now you're driving that tab's session
+    ws.send(JSON.stringify({ type: "user_message", text: "Add a KSampler and wire it up." }));
+  } else {
+    // render streamed agent activity for the mirrored tab
+    console.log("from session:", m);
+  }
+};
+```
+
+## Teach an LLM to build your adapter
+
+Paste the prompt below into Claude, ChatGPT, or your coding agent to have it
+scaffold a host adapter for your platform. It carries the full protocol contract,
+so the model doesn't have to guess.
+
+```text Copy this into your LLM
+You are building a THIRD-PARTY HOST ("adapter") for comfyui-mcp. A host connects
+to a running comfyui-mcp orchestrator over WebSocket, attaches to a live desktop
+"tab", and drives that tab's agent session — same agent, shared context, no second
+session. Build the adapter for THIS platform: <describe your platform, e.g. a
+Blender sidebar panel / a Chrome extension / a Neovim plugin>.
+
+CONNECTION
+- WebSocket to:  ws://<desktop-ip>:9182/?token=<PAIR_TOKEN>
+  (port = bridge port + 2; bridge default 9180. Token is provided by the user via
+  their pairing flow — NEVER hardcode, embed, or auto-provision it.)
+- On open, send:  {"type":"hello","tab_id":"<your-unique-id>","headless":true}
+
+DISCOVER + ATTACH
+- Send {"type":"list_tabs","cid":1}; you receive {"type":"tab_list","cid":1,"tabs":[...]}.
+- Send {"type":"attach_tab","cid":2,"target_tab_id":"<a tab_id from tab_list>"};
+  you receive {"type":"tab_attached","cid":2,"tab_id":"...","ok":true|false,"error"?}.
+  Only real, non-headless desktop tabs are attachable.
+
+DRIVE
+- Send {"type":"user_message","text":"..."} to post a turn into the ATTACHED tab's
+  conversation. The server routes it to the mirrored tab automatically.
+- Send {"type":"detach_tab"} to stop.
+
+RENDER
+- After attaching you receive the mirrored tab's live activity (streamed agent
+  replies, status, interactive cards) and a {"type":"mailbox_flush"} replay of
+  anything produced while you were disconnected. Render these in your UI.
+
+SECURITY — these are non-negotiable; preserve every one:
+1. Only connect with a user-provided pair token; never embed or auto-ship it.
+2. Never assume you can target a tab you did not attach_tab to — the server stamps
+   the target authoritatively; trust tab_attached.ok, don't spoof tab_id.
+3. Attach only to non-headless desktop tabs; never to another headless client.
+4. One active attachment per connection (attaching to a new tab drops the old).
+5. Do not try to change your connection's kind after the first hello.
+
+DELIVERABLE
+- A minimal, working adapter for the platform above: connect → list → attach →
+  send a user_message → render streamed replies → detach. Handle reconnects and
+  the mailbox_flush replay. Keep the pairing/token handling explicit and
+  user-driven.
+```
+
+## Register your integration
+
+Built something? **Register it** so it can be listed and so we can flag protocol
+changes to you before they ship:
+
+<Card title="Register a third-party host" icon="plug" href="https://github.com/artokun/comfyui-mcp/issues/new?template=third-party-host.yml">
+Open the registration template on GitHub — name, platform, repo, and which
+protocol version you built against.
+</Card>
+
+<Note>
+**Stability:** the frames above are what the mobile app ships on, but this is not
+yet a frozen, versioned contract — read the source
+([`src/services/ui-bridge.ts`](https://github.com/artokun/comfyui-mcp/blob/main/src/services/ui-bridge.ts))
+as the authority, and register your host so you're notified when the shapes move.
+</Note>
