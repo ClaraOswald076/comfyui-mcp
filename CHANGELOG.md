@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.2] - 2026-07-27
+
+### MCP
+
+#### Fixed
+- default the z.ai GLM provider to glm-5.2 (#323)
+
+
 ## [0.48.1] - 2026-07-26
 
 ### MCP
