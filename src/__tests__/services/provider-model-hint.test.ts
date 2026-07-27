@@ -30,7 +30,7 @@ afterEach(() => {
 describe("providerModelHint", () => {
   it("names the default model AND the env var that overrides it", () => {
     const hint = providerModelHint(GLM);
-    expect(hint).toContain(GLM.defaultModel); // e.g. glm-4.7
+    expect(hint).toContain(GLM.defaultModel); // e.g. glm-5.2
     expect(hint).toContain(GLM.modelEnv); // COMFYUI_MCP_GLM_MODEL
     expect(hint).toMatch(/default/i);
   });
