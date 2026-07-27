@@ -387,7 +387,7 @@
       "widgets_values": [
         "disable",
         0,
-        "fixed",
+        "randomize",
         8,
         1,
         "euler",
@@ -436,7 +436,7 @@
       },
       "widgets_values": [
         4,
-        "fixed"
+        "randomize"
       ]
     },
     {
@@ -478,7 +478,7 @@
       },
       "widgets_values": [
         8,
-        "fixed"
+        "randomize"
       ]
     },
     {

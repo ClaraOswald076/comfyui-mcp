@@ -2322,7 +2322,7 @@
       },
       "widgets_values": [
         1335735769456,
-        "fixed"
+        "randomize"
       ],
       "color": "#233",
       "bgcolor": "#355"
@@ -2751,7 +2751,7 @@
       },
       "widgets_values": [
         1335735769456,
-        "fixed"
+        "randomize"
       ],
       "color": "#233",
       "bgcolor": "#355"
