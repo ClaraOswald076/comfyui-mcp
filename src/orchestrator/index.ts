@@ -1377,12 +1377,22 @@ export async function runPanelOrchestrator(): Promise<void> {
   // panelSystemAppend at each makeBackend(). Updating both keeps the providers in
   // sync without rebuilding the manager.
   let liveManager: PanelAgentManager | undefined;
+  // Generation guard: refreshes can overlap (ComfyUI reconnect + a panel hello
+  // carrying a new panel_version). Without this, an OLDER gather finishing LAST
+  // would clobber envCaps with stale values — and since latestPanelVersion has
+  // already advanced, later identical hellos dedupe and never repair it. So each
+  // call takes a ticket and only the newest-started refresh may publish its result.
+  let envRefreshGen = 0;
   async function refreshEnvCapabilities(): Promise<void> {
+    const gen = ++envRefreshGen;
     try {
-      envCaps = await gatherEnvCapabilities({ comfyuiUrl, comfyuiPath, backendId, mcpVersion, panelVersion: latestPanelVersion });
+      const caps = await gatherEnvCapabilities({ comfyuiUrl, comfyuiPath, backendId, mcpVersion, panelVersion: latestPanelVersion });
+      if (gen !== envRefreshGen) return; // a newer refresh superseded us — drop this stale result
+      envCaps = caps;
       panelSystemAppend = buildPanelSystemAppend(resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND), envCaps);
       if (liveManager) liveManager.setSystemAppend(panelSystemAppend);
     } catch (err) {
+      if (gen !== envRefreshGen) return; // superseded — let the newer refresh own the prompt
       // Belt-and-suspenders: gather is internally guarded, but never let a stray
       // throw break the prompt — fall back to the static append.
       panelSystemAppend = resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND);
