@@ -6,6 +6,18 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.4] - 2026-07-28
+
+### MCP
+
+#### Fixed
+- resolve Windows argv paths host-agnostically (#330)
+- anchor a relative main.py argv[0] to the ComfyUI root (#330)
+- rebind panel session tabId on explicit signal — self-heal after reconnect/reload/workflow-switch (#322, #331, #332)
+- relaunch ComfyUI via resolved Python, not sys.argv[0] script (#330)
+- stop truncating the model list at 150 (#326)
+
+
 ## [0.48.3] - 2026-07-28
 
 ### MCP
