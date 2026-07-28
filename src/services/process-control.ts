@@ -1,6 +1,6 @@
 import { execSync, spawn, type ChildProcess } from "node:child_process";
 import { platform } from "node:os";
-import { basename, isAbsolute, join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { getSystemStats, resetClient, resetObjectInfoCache } from "../comfyui/client.js";
 import { config, getComfyUIBaseUrl, isRemoteMode } from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
@@ -521,10 +521,19 @@ function resolveLaunchCommand(
     // relative script would resolve against the wrong dir (…/ComfyUI/ComfyUI/
     // main.py). Anchor it: use the absolute path as-is, otherwise main.py under
     // the resolved ComfyUI root.
+    //
+    // The argv mirrors the running ComfyUI's sys.argv, which is Windows-flavored
+    // when ComfyUI runs on Windows — regardless of what OS this process is on.
+    // So detect absoluteness and the script basename in a separator-agnostic way
+    // rather than trusting the host `path` module (which mangles `C:\…` / `\`
+    // paths on POSIX). The final join stays host-native to match comfyuiPath.
+    const isWindowsAbsolute =
+      /^[a-zA-Z]:[\\/]/.test(first) || /^\\\\/.test(first);
+    const scriptBasename = first.split(/[\\/]/).pop() || first;
     const script =
-      isAbsolute(first) || !config.comfyuiPath
+      isAbsolute(first) || isWindowsAbsolute || !config.comfyuiPath
         ? first
-        : join(config.comfyuiPath, basename(first));
+        : join(config.comfyuiPath, scriptBasename);
     return { exe: python, args: [script, ...rest] };
   }
   return { exe: first, args: rest };
