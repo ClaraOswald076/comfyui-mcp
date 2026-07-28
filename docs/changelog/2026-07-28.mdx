@@ -1,0 +1,63 @@
+---
+title: "July 28: a security patch, reconnect self-heal, and OpenRouter's full catalog"
+description: "Path-traversal hardening on the upload tools, a panel session that self-heals after a full reconnect/reload/workflow-switch instead of getting stuck on a dead tab, the complete OpenRouter model list, a Windows restart fix, and a third-party host protocol guide."
+---
+
+_July 28, 2026_
+
+The v0.48.1 → v0.48.4 line — a batch of reliability and safety fixes driven by
+real via-panel user reports, plus docs for hosting your own backend.
+
+## Path-traversal hardening on the upload tools
+
+`upload_image` / `upload_video` / `upload_audio` took a caller-supplied
+`filename` and copied into ComfyUI's `input/` directory without confining it — a
+value like `../../../tmp/evil.png` escaped the directory and wrote attacker-chosen
+bytes anywhere the server could write (CWE-22). Under the MCP threat model the
+client (the LLM and any content it reads) is untrusted, so prompt injection was a
+realistic path to that sink. Both upload paths now route the filename through a
+strict `assertSafeInputFilename` guard that rejects — rather than silently
+sanitizes — anything with path components, on both Windows and POSIX. Legitimate
+bare filenames are unaffected.
+
+## Panel sessions self-heal after a reconnect
+
+An agent session bound its panel tools to a single tab id captured once at
+session start. When the panel's browser socket came back as a genuinely **new**
+socket with a new tab id — a full ComfyUI reconnect, a frontend reload /
+`panel_reload({scope:"frontend"})`, or switching to a different workflow file —
+the session's id was orphaned and every `panel_*` call failed forever with
+`no connected tab with id …`, with no way to recover from inside the session
+(#322, #331, #332).
+
+The fix rebinds at the orchestrator layer: `panel_set_workflow_target({mode:"current"})`
+and `panel_reload` are now the explicit "re-point me at the active tab" recovery
+signals, re-binding a stuck session onto the live tab. The low-level bridge
+routing stays deliberately conservative — the multi-tab / multi-viewer /
+remote-phone deployments depend on it not guessing — so recovery is an explicit
+signal, not an implicit fallback.
+
+## OpenRouter's full catalog
+
+Connecting OpenRouter listed models alphabetically and cut the list off early, so
+late-alphabet vendors (including `z-ai/*` GLM 5.x) were unreachable from the
+picker (#326). The list now serves the whole catalog.
+
+## Also
+
+- **Windows `restart_comfyui`** stopped the process but failed to relaunch with
+  `spawn EFTYPE` (#330): the relaunch spawned the `main.py` script path directly,
+  so Windows tried to exec a `.py` as a binary. It now resolves the real Python
+  interpreter and passes the script as its argument, handling both absolute and
+  relative portable-launcher argv.
+- **Bundled workflow seeds** now default to `randomize` rather than `fixed`, so a
+  freshly loaded pack varies between runs instead of repeating one image (#325).
+- **GLM defaults to `glm-5.2`** for the z.ai provider.
+- **`wait_for_job`** was removed — a copy-paste holdover from the upstream CLI
+  that was never wired to anything.
+
+## Docs
+
+- **[Hosting a third-party backend](/third-party-hosts)** — a new guide to the
+  panel↔backend protocol: how to register a host, the endpoints and handshake, and
+  a copy-paste prompt for teaching an LLM to build an adapter (#327).
