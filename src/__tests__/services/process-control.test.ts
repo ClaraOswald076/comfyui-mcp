@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 
 const mockConfig = vi.hoisted(() => ({
@@ -31,6 +32,11 @@ vi.mock("../../comfyui/client.js", () => ({
 
 vi.mock("../../utils/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
+
+const mockFindComfyuiPython = vi.hoisted(() => vi.fn());
+vi.mock("../../services/env-capabilities.js", () => ({
+  findComfyuiPython: mockFindComfyuiPython,
 }));
 
 import {
@@ -97,6 +103,7 @@ beforeEach(() => {
   delete process.env.COMFYUI_STARTUP_CHECK_MAX_TRIES;
   mockConfig.resolvedPort = 8188;
   mockConfig.comfyuiPath = "/fake/ComfyUI";
+  mockFindComfyuiPython.mockReturnValue("/fake/ComfyUI/python_embeded/python.exe");
   __processControlTestHooks.reset();
 });
 
@@ -140,6 +147,68 @@ describe("process-control startup readiness", () => {
     );
     expect(children[0].unref).toHaveBeenCalled();
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("relaunches via the resolved Python interpreter when argv[0] is a main.py script (#330)", async () => {
+    // Real ComfyUI /system_stats argv is sys.argv: argv[0] is the SCRIPT path
+    // (…/main.py), NOT the interpreter. Spawning that directly on Windows fails
+    // with `spawn EFTYPE`; the relaunch must resolve the Python interpreter and
+    // pass the whole argv as its args.
+    __processControlTestHooks.setLastProcessInfo({
+      pid: 0,
+      port: 8188,
+      argv: ["C:\\ComfyUI\\main.py", "--port", "8188"],
+      isDesktopApp: false,
+    });
+    const children = mockSpawnedChildren();
+    mockNoPortProcess();
+    mockFetchOk(true);
+
+    const result = await startComfyUI();
+
+    expect(result.started).toBe(true);
+    expect(mockFindComfyuiPython).toHaveBeenCalledWith("/fake/ComfyUI", [
+      "C:\\ComfyUI\\main.py",
+      "--port",
+      "8188",
+    ]);
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "/fake/ComfyUI/python_embeded/python.exe",
+      ["C:\\ComfyUI\\main.py", "--port", "8188"],
+      expect.objectContaining({
+        detached: true,
+        cwd: "/fake/ComfyUI",
+        shell: false,
+        stdio: "ignore",
+        windowsHide: true,
+      }),
+    );
+    expect(children[0].unref).toHaveBeenCalled();
+  });
+
+  it("anchors a RELATIVE script argv[0] to the ComfyUI root (portable launcher, #330)", async () => {
+    // The standard Windows portable launcher runs `python ComfyUI\main.py` from
+    // the portable ROOT, so sys.argv[0] is relative. Since we force cwd to the
+    // nested ComfyUI dir, passing it verbatim would look for ComfyUI\ComfyUI\
+    // main.py — it must be anchored to config.comfyuiPath.
+    __processControlTestHooks.setLastProcessInfo({
+      pid: 0,
+      port: 8188,
+      argv: ["ComfyUI\\main.py", "--port", "8188"],
+      isDesktopApp: false,
+    });
+    mockSpawnedChildren();
+    mockNoPortProcess();
+    mockFetchOk(true);
+
+    const result = await startComfyUI();
+
+    expect(result.started).toBe(true);
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "/fake/ComfyUI/python_embeded/python.exe",
+      [join("/fake/ComfyUI", "main.py"), "--port", "8188"],
+      expect.objectContaining({ cwd: "/fake/ComfyUI", shell: false }),
+    );
   });
 
   it("reports timeout instead of ready when bounded probes never succeed", async () => {
