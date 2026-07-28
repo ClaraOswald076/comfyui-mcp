@@ -122,6 +122,8 @@ If a workflow needs a custom node the user doesn't have, don't silently skip it 
 
 CRASH RECOVERY — when a custom node BREAKS or CRASHED ComfyUI, fix it before giving up. If your turn begins with a "⚠️ ComfyUI crashed …" note (it names the fatal log block and the most likely culprit custom node + file:line), or a run dies with a node-level error you can pin to one pack, do NOT just re-run the same graph — ESCALATE to actually fix that node, narrating each step to the user as you go: (a) UPDATE it to the latest code — call panel_update_node with the culprit's id (or the comfyui MCP update_custom_node / fix_custom_node). Try version 'nightly' to grab a just-landed upstream fix. Poll panel_node_queue_status, then panel_restart_comfyui → you resume and RETRY the action to see if the crash is gone. (b) If updating doesn't fix it, reach into COMFYUI_PATH/custom_nodes/<NodeDir> with your shell (Bash): if it's a git repo (a .git dir), run git fetch && git pull (or check out the nightly branch) to force the latest, reinstall its requirements if needed, then restart + retry. (c) If there's no git or it's still broken, attempt a TARGETED source patch of the crashing file:line, then VERIFY the fix actually resolves the crash (restart + retry the same action — confirm it no longer faults). Once verified, OFFER to suggest the fix upstream to the repo owner (open an issue or PR describing the crash + your patch) — describe it and ask the user first; do NOT auto-file anything. Combine this cleanly with the normal install→restart→continue flow above: a fresh install that crashes on first use is the same loop (update/patch the just-installed node, don't abandon it).
 
+REPORT OUR OWN BUGS (we're in beta — bias HARD toward filing) — distinct from the third-party case above. Whenever YOU hit a defect in comfyui-mcp or the sidebar panel ITSELF — a tool/panel/orchestrator call that errors, crashes ComfyUI, returns wrong/misleading/empty output, fails silently, or a limitation that forced you into an awkward workaround/retry — invoke the report-bug skill (read_skill "report-bug") to autonomously file a via-panel report, EVEN IF you already recovered or worked around it. You do NOT need to be blocked, and it does NOT need to be fatal — the workaround itself is the signal. The skill scrubs secrets and files through our intake Worker (which dedupes server-side, so over-reporting is cheap); then just drop the user a one-line note. Do NOT ask permission for OUR bugs — file them autonomously (unlike third-party/custom-node bugs above, where you OFFER and ask first). Ordinary generation errors (OOM, missing model, bad params, user mistakes) are NOT bug reports — those stay troubleshooting.
+
 WEDGED RENDER / OOM / VRAM PINNED — when a generation is stuck or hits CUDA out-of-memory, or a cancel didn't actually free GPU memory (models still resident, VRAM pinned, the next run still OOMs), call panel_free_vram to UNLOAD all models and free VRAM before retrying — it does NOT restart ComfyUI, so it's the cheap first move. Escalation ladder: cancel the run → panel_free_vram (unload + free) → retry; only as a LAST RESORT panel_restart_comfyui (which refuses mid-render and guards the running generation). Reach for panel_free_vram before a restart whenever a cancel left memory pinned.
 
 WORKFLOW TARGETING — by default your panel_* graph edits follow whichever workflow tab the user is currently viewing. If the user wants you to work on a DIFFERENT open workflow while they browse another tab, call panel_set_workflow_target(mode:"pinned", path:<from panel_list_workflows>) to pin edits to that workflow; panel_get_workflow_target shows the current binding. Set mode:"current" to follow the user's active tab again. Pinning does NOT switch what the user sees — it only routes your graph tools. When pinned, still use panel_open_workflow only when you intentionally want to switch the user's view.
@@ -1362,6 +1364,12 @@ export async function runPanelOrchestrator(): Promise<void> {
   // just the static text (no env block). Built once; refreshed after a ComfyUI
   // restart/reconnect via refreshEnvCapabilities() below.
   let envCaps: EnvCapabilities | undefined;
+  // Our own build versions, auto-stamped into the agent's ENV block so bug
+  // reports are version-pinned without the agent digging. mcp version is a local
+  // fact; panel version is learned from the panel's `hello` frame (below) and, on
+  // first sight, triggers an env refresh so the block picks it up.
+  const mcpVersion = detectInstallMode().currentVersion ?? undefined;
+  let latestPanelVersion: string | undefined;
   let panelSystemAppend = resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND);
   // Set once the manager exists so a later refresh (after a ComfyUI restart) feeds
   // the freshly-gathered env into newly-spawned agents too — Claude reads
@@ -1369,12 +1377,22 @@ export async function runPanelOrchestrator(): Promise<void> {
   // panelSystemAppend at each makeBackend(). Updating both keeps the providers in
   // sync without rebuilding the manager.
   let liveManager: PanelAgentManager | undefined;
+  // Generation guard: refreshes can overlap (ComfyUI reconnect + a panel hello
+  // carrying a new panel_version). Without this, an OLDER gather finishing LAST
+  // would clobber envCaps with stale values — and since latestPanelVersion has
+  // already advanced, later identical hellos dedupe and never repair it. So each
+  // call takes a ticket and only the newest-started refresh may publish its result.
+  let envRefreshGen = 0;
   async function refreshEnvCapabilities(): Promise<void> {
+    const gen = ++envRefreshGen;
     try {
-      envCaps = await gatherEnvCapabilities({ comfyuiUrl, comfyuiPath, backendId });
+      const caps = await gatherEnvCapabilities({ comfyuiUrl, comfyuiPath, backendId, mcpVersion, panelVersion: latestPanelVersion });
+      if (gen !== envRefreshGen) return; // a newer refresh superseded us — drop this stale result
+      envCaps = caps;
       panelSystemAppend = buildPanelSystemAppend(resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND), envCaps);
       if (liveManager) liveManager.setSystemAppend(panelSystemAppend);
     } catch (err) {
+      if (gen !== envRefreshGen) return; // superseded — let the newer refresh own the prompt
       // Belt-and-suspenders: gather is internally guarded, but never let a stray
       // throw break the prompt — fall back to the static append.
       panelSystemAppend = resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND);
@@ -1403,7 +1421,7 @@ export async function runPanelOrchestrator(): Promise<void> {
   QueueMonitor.start(comfyuiUrl);
   if (envCaps) {
     logger.info(
-      `[panel-orchestrator] env: OS=${envCaps.os ?? "?"} GPU=${envCaps.gpu ?? "?"}${typeof envCaps.vramTotalGb === "number" ? ` ${envCaps.vramTotalGb}GB` : ""} torch=${envCaps.torch ?? "?"} cuda=${envCaps.cuda ?? "?"} py=${envCaps.python ?? "?"} comfyui=${envCaps.comfyui ?? "?"} (${envCaps.location ?? "?"}) triton=${envCaps.triton ?? "?"} sage=${envCaps.sageattention ?? "?"} backend=${envCaps.backend ?? "?"}`,
+      `[panel-orchestrator] env: OS=${envCaps.os ?? "?"} GPU=${envCaps.gpu ?? "?"}${typeof envCaps.vramTotalGb === "number" ? ` ${envCaps.vramTotalGb}GB` : ""} torch=${envCaps.torch ?? "?"} cuda=${envCaps.cuda ?? "?"} py=${envCaps.python ?? "?"} comfyui=${envCaps.comfyui ?? "?"} (${envCaps.location ?? "?"}) triton=${envCaps.triton ?? "?"} sage=${envCaps.sageattention ?? "?"} backend=${envCaps.backend ?? "?"} mcp=${envCaps.mcpVersion ?? "?"} panel=${envCaps.panelVersion ?? "?"}`,
     );
   }
 
@@ -2247,6 +2265,15 @@ export async function runPanelOrchestrator(): Promise<void> {
     // tell the difference (and warn if no ack arrives).
     if (event.type === "hello" && event.tab_id) {
       const panelTab = event.tab_id;
+      // Learn the sidebar panel's version from its hello and, the first time we
+      // see it (or when it changes on a panel update), refresh the env block so
+      // the agent's ENVIRONMENT line carries the panel version — bug reports get
+      // both our versions auto-stamped, no digging.
+      const helloPanelVer = (event as { panel_version?: unknown }).panel_version;
+      if (typeof helloPanelVer === "string" && helloPanelVer && helloPanelVer !== latestPanelVersion) {
+        latestPanelVersion = helloPanelVer;
+        void refreshEnvCapabilities();
+      }
       // Retarget ComfyUI to the URL the browser was served from (window.location),
       // BEFORE the readiness probe so the "ready" ack reflects the right instance —
       // but a hello can arrive from a STALE browser tab on a DEAD instance (E2E

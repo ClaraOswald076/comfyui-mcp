@@ -1,6 +1,6 @@
 ---
 name: report-bug
-description: Self-heal + report bugs to make the ecosystem better. When you hit a reproducible bug in comfyui-mcp / the sidebar panel, OR in a third-party custom node / ComfyUI core, use this: diagnose it, attempt a local fix so the user can keep working, and report it the right way (our intake Worker for our repos; the node's own GitHub for third-party). Acts autonomously and just informs the user — it does not ask permission for each step. Triggers on tool/panel/orchestrator errors you can't work around, or when the user says "report this" / "fix this bug".
+description: Self-heal + report bugs to make the ecosystem better. When you hit ANY defect in comfyui-mcp / the sidebar panel, OR in a third-party custom node / ComfyUI core, use this: diagnose it, attempt a local fix so the user can keep working, and report it the right way (our intake Worker for our repos; the node's own GitHub for third-party). Acts autonomously and just informs the user — it does not ask permission for each step. **BETA — bias HARD toward filing:** trigger on any comfyui-mcp/panel defect you notice — an error, a crash, a tool that returns wrong/misleading/empty output, a silent failure, a confusing result, or a limitation that forced an awkward workaround — EVEN IF you recovered or worked around it. You do NOT need to be blocked. Also on "report this" / "fix this bug". If a future user would hit the same friction, file it — the intake Worker dedupes, so over-reporting is cheap and under-reporting costs us the bug.
 ---
 
 # Self-heal & report bugs (make the ecosystem better)
@@ -14,6 +14,31 @@ can't make safe — explain and ask.)
 
 This is for **bugs in software**, not ordinary workflow/generation errors (OOM,
 missing model, bad params → use `troubleshooting`). First decide whose bug it is.
+
+## When to file — bias HARD toward reporting (we're in beta)
+
+While comfyui-mcp is in beta, **the default is to file.** You do NOT need to be
+blocked, and it does NOT need to be fatal. If you notice a defect in our software,
+report it — even after you've already recovered. File when any of these happen:
+
+- A tool/panel/orchestrator call **errors**, throws, or crashes ComfyUI.
+- A tool returns **wrong, misleading, empty, or malformed** output — or succeeds
+  but did the wrong thing.
+- A **silent failure**: something didn't happen that should have, with no error.
+- You had to **retry, work around, or take an awkward path** because a tool or the
+  panel misbehaved or lacked an obvious capability. (Report it even though you
+  recovered — the workaround is the signal.)
+- Behavior that is **confusing, inconsistent, or surprising** for our own surface
+  (a flag that didn't take, a stale/duplicate state, a race, a reconnect glitch).
+
+**Still NOT bug reports** (route elsewhere): ordinary generation/workflow failures —
+OOM, missing model/node, bad params, user mistakes — use `troubleshooting`; and
+third-party/custom-node bugs go to **their** GitHub (Step 6), where you still
+**offer and ask first** rather than auto-file.
+
+Don't over-think dedup or "is it worth it" — the intake Worker dedupes server-side,
+so a duplicate is a no-op. **Under-reporting is the expensive failure mode.** When
+in doubt during beta, file it and move on.
 
 ## Step 1 — Diagnose (root cause, not symptom)
 
@@ -71,7 +96,12 @@ so we can reproduce and merge:
 <applied locally: yes/no>  <upstream-only: yes/no>
 <the diff / patch, or the precise change needed if upstream-only>
 ### Environment
-OS / ComfyUI version / GPU+VRAM / comfyui-mcp branch or version
+OS / ComfyUI version / GPU+VRAM / **comfyui-mcp version** / **panel version**.
+Always include BOTH our versions — a bug is only actionable if we know which mcp +
+panel build it came from. They're already in your **ENVIRONMENT line** (the
+`mcp <ver> · panel <ver>` segment), so just copy them from there. Fallbacks if the
+ENV line is missing them: mcp = its `package.json` `version` (or `get_environment`);
+panel = `PANEL_VERSION` near the top of the pack's `comfyui-mcp-panel.js`.
 ```
 
 Then file it (no need to ask):
