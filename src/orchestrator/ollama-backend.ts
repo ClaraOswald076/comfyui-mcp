@@ -1088,14 +1088,18 @@ export class OllamaBackend implements AgentBackend {
         const recommended = RECOMMENDED_OPENROUTER_MODELS.filter((m) => available.has(m.id));
         const recIds = new Set(recommended.map((m) => m.id));
         // Sort the overflow alphabetically so a vendor's models CLUSTER (all
-        // deepseek/* together, findable), and widen the cap — the old unsorted
-        // 40-slice made newer models effectively invisible ("the list is very
-        // old" — Discord #help: deepseek-v4-pro existed upstream but never
-        // showed because it sat past the cut in OpenRouter's arrival order).
+        // deepseek/* together, findable). The cap must cover OpenRouter's WHOLE
+        // catalog: because the list is sorted alphabetically, any cap shorter than
+        // the catalog silently drops whole late-alphabet vendors — a 150-slice hid
+        // every `z-ai/*` model (GLM 5.x), so the list "stopped at moonshot/kimi-k3"
+        // and z-ai was unreachable (issue #326; the earlier 40-slice hid
+        // deepseek-v4-pro the same way). OpenRouter serves ~300-400 models; keep a
+        // large bound so nothing is cut, but still guard against a pathological
+        // response. The picker has search, so a long list is fine.
         const rest = ids
           .filter((id) => id !== this.model && !recIds.has(id))
           .sort((a, b) => a.localeCompare(b))
-          .slice(0, 150);
+          .slice(0, 1000);
         // llama-server reports its single model as the GGUF's FILE PATH —
         // keep the id verbatim (the server echoes it) but label by basename
         // so the picker isn't a wall of C:\...\model.gguf.
