@@ -96,11 +96,12 @@ so we can reproduce and merge:
 <applied locally: yes/no>  <upstream-only: yes/no>
 <the diff / patch, or the precise change needed if upstream-only>
 ### Environment
-OS / ComfyUI version / GPU+VRAM / **comfyui-mcp version** (its `package.json`
-`version`, or `self_update`/`get_environment`) / **panel version** (`PANEL_VERSION`
-near the top of the pack's `comfyui-mcp-panel.js`, or the pack's `pyproject.toml`
-`version`). Always include BOTH our versions — a bug is only actionable if we know
-which mcp + panel build it came from.
+OS / ComfyUI version / GPU+VRAM / **comfyui-mcp version** / **panel version**.
+Always include BOTH our versions — a bug is only actionable if we know which mcp +
+panel build it came from. They're already in your **ENVIRONMENT line** (the
+`mcp <ver> · panel <ver>` segment), so just copy them from there. Fallbacks if the
+ENV line is missing them: mcp = its `package.json` `version` (or `get_environment`);
+panel = `PANEL_VERSION` near the top of the pack's `comfyui-mcp-panel.js`.
 ```
 
 Then file it (no need to ask):

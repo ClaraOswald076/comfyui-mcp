@@ -22,9 +22,12 @@ describe("formatEnvBlock", () => {
       sageattention: "not-installed",
       backend: "Codex",
       otherBackendAvailable: true,
+      mcpVersion: "0.48.4",
+      panelVersion: "0.11.3",
     };
     const out = formatEnvBlock(caps);
     expect(out).toContain("ENVIRONMENT (live, this machine):");
+    expect(out).toContain("comfyui-mcp 0.48.4 · panel 0.11.3");
     expect(out).toContain("OS Windows 11");
     expect(out).toContain("GPU NVIDIA RTX 4090 (24 GB VRAM)");
     expect(out).toContain("64 GB RAM");
@@ -84,6 +87,16 @@ describe("formatEnvBlock", () => {
     // guidance tail's "Triton/SageAttention" mention is fine.
     expect(out).not.toContain("Triton:");
     expect(out).not.toContain("SageAttention:");
+  });
+
+  it("renders only the known build version, and omits the segment when neither is set", () => {
+    expect(formatEnvBlock({ os: "Linux", mcpVersion: "0.48.4" })).toContain("comfyui-mcp 0.48.4");
+    expect(formatEnvBlock({ os: "Linux", mcpVersion: "0.48.4" })).not.toContain("panel ");
+    expect(formatEnvBlock({ os: "Linux", panelVersion: "nightly" })).toContain("panel nightly");
+    // Neither version → no version segment at all (no stray separators).
+    const bare = formatEnvBlock({ os: "Linux" });
+    expect(bare).not.toContain("comfyui-mcp ");
+    expect(bare).not.toContain("panel ");
   });
 
   it("renders ComfyUI location even when the version is unknown", () => {

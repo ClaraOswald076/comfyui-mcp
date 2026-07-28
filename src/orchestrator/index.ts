@@ -1364,6 +1364,12 @@ export async function runPanelOrchestrator(): Promise<void> {
   // just the static text (no env block). Built once; refreshed after a ComfyUI
   // restart/reconnect via refreshEnvCapabilities() below.
   let envCaps: EnvCapabilities | undefined;
+  // Our own build versions, auto-stamped into the agent's ENV block so bug
+  // reports are version-pinned without the agent digging. mcp version is a local
+  // fact; panel version is learned from the panel's `hello` frame (below) and, on
+  // first sight, triggers an env refresh so the block picks it up.
+  const mcpVersion = detectInstallMode().currentVersion ?? undefined;
+  let latestPanelVersion: string | undefined;
   let panelSystemAppend = resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND);
   // Set once the manager exists so a later refresh (after a ComfyUI restart) feeds
   // the freshly-gathered env into newly-spawned agents too — Claude reads
@@ -1373,7 +1379,7 @@ export async function runPanelOrchestrator(): Promise<void> {
   let liveManager: PanelAgentManager | undefined;
   async function refreshEnvCapabilities(): Promise<void> {
     try {
-      envCaps = await gatherEnvCapabilities({ comfyuiUrl, comfyuiPath, backendId });
+      envCaps = await gatherEnvCapabilities({ comfyuiUrl, comfyuiPath, backendId, mcpVersion, panelVersion: latestPanelVersion });
       panelSystemAppend = buildPanelSystemAppend(resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND), envCaps);
       if (liveManager) liveManager.setSystemAppend(panelSystemAppend);
     } catch (err) {
@@ -1405,7 +1411,7 @@ export async function runPanelOrchestrator(): Promise<void> {
   QueueMonitor.start(comfyuiUrl);
   if (envCaps) {
     logger.info(
-      `[panel-orchestrator] env: OS=${envCaps.os ?? "?"} GPU=${envCaps.gpu ?? "?"}${typeof envCaps.vramTotalGb === "number" ? ` ${envCaps.vramTotalGb}GB` : ""} torch=${envCaps.torch ?? "?"} cuda=${envCaps.cuda ?? "?"} py=${envCaps.python ?? "?"} comfyui=${envCaps.comfyui ?? "?"} (${envCaps.location ?? "?"}) triton=${envCaps.triton ?? "?"} sage=${envCaps.sageattention ?? "?"} backend=${envCaps.backend ?? "?"}`,
+      `[panel-orchestrator] env: OS=${envCaps.os ?? "?"} GPU=${envCaps.gpu ?? "?"}${typeof envCaps.vramTotalGb === "number" ? ` ${envCaps.vramTotalGb}GB` : ""} torch=${envCaps.torch ?? "?"} cuda=${envCaps.cuda ?? "?"} py=${envCaps.python ?? "?"} comfyui=${envCaps.comfyui ?? "?"} (${envCaps.location ?? "?"}) triton=${envCaps.triton ?? "?"} sage=${envCaps.sageattention ?? "?"} backend=${envCaps.backend ?? "?"} mcp=${envCaps.mcpVersion ?? "?"} panel=${envCaps.panelVersion ?? "?"}`,
     );
   }
 
@@ -2249,6 +2255,15 @@ export async function runPanelOrchestrator(): Promise<void> {
     // tell the difference (and warn if no ack arrives).
     if (event.type === "hello" && event.tab_id) {
       const panelTab = event.tab_id;
+      // Learn the sidebar panel's version from its hello and, the first time we
+      // see it (or when it changes on a panel update), refresh the env block so
+      // the agent's ENVIRONMENT line carries the panel version — bug reports get
+      // both our versions auto-stamped, no digging.
+      const helloPanelVer = (event as { panel_version?: unknown }).panel_version;
+      if (typeof helloPanelVer === "string" && helloPanelVer && helloPanelVer !== latestPanelVersion) {
+        latestPanelVersion = helloPanelVer;
+        void refreshEnvCapabilities();
+      }
       // Retarget ComfyUI to the URL the browser was served from (window.location),
       // BEFORE the readiness probe so the "ready" ack reflects the right instance —
       // but a hello can arrive from a STALE browser tab on a DEAD instance (E2E
