@@ -60,6 +60,7 @@
               "panel",
               "apps",
               "mobile",
+              "third-party-hosts",
               "backends",
               "local-llms",
               "arena",
