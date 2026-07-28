@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.5] - 2026-07-28
+
+### MCP
+
+#### Added
+- bias hard toward via-panel bug reports during beta (#339)
+
+
 ## [0.48.4] - 2026-07-28
 
 ### MCP
