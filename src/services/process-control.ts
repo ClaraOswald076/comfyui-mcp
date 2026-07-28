@@ -5,6 +5,7 @@ import { config, getComfyUIBaseUrl, isRemoteMode } from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
 import { ProcessControlError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
+import { findComfyuiPython } from "./env-capabilities.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -481,14 +482,41 @@ function spawnFromProcessInfo(info: ProcessInfo): ChildProcess | null {
     });
   }
 
-  if (info.argv.length === 0) return null;
-  const [pythonExe, ...args] = info.argv;
-  return spawn(pythonExe, args, {
+  const cmd = resolveLaunchCommand(info);
+  if (!cmd) return null;
+  return spawn(cmd.exe, cmd.args, {
     detached: true,
     stdio: "ignore",
     cwd: config.comfyuiPath ?? undefined,
     shell: false,
+    windowsHide: true,
   });
+}
+
+/**
+ * Turn captured process info into a spawnable (executable, args) pair.
+ *
+ * The argv we save comes from ComfyUI's `/system_stats` — i.e. Python's
+ * `sys.argv`, whose argv[0] is the SCRIPT path (`…/main.py`), NOT the Python
+ * interpreter. Spawning that script directly with `shell:false` fails on
+ * Windows with `spawn EFTYPE` (the OS cannot exec a `.py` as a PE binary),
+ * which is exactly the restart_comfyui relaunch failure in #330. When argv[0]
+ * is a script we resolve the real ComfyUI Python interpreter and pass the whole
+ * argv (main.py + flags) as its args. When argv[0] is already an interpreter
+ * (e.g. a supervised child we spawned ourselves), we spawn it verbatim.
+ */
+function resolveLaunchCommand(
+  info: ProcessInfo,
+): { exe: string; args: string[] } | null {
+  if (info.argv.length === 0) return null;
+  const [first, ...rest] = info.argv;
+  const looksLikeScript = /\.pyw?$/i.test(first.trim());
+  if (looksLikeScript) {
+    const python = findComfyuiPython(config.comfyuiPath ?? undefined, info.argv);
+    if (!python) return null;
+    return { exe: python, args: info.argv };
+  }
+  return { exe: first, args: rest };
 }
 
 function handleSupervisedChildStop(

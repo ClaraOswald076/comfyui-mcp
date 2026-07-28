@@ -33,6 +33,11 @@ vi.mock("../../utils/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
+const mockFindComfyuiPython = vi.hoisted(() => vi.fn());
+vi.mock("../../services/env-capabilities.js", () => ({
+  findComfyuiPython: mockFindComfyuiPython,
+}));
+
 import {
   __processControlTestHooks,
   startComfyUI,
@@ -97,6 +102,7 @@ beforeEach(() => {
   delete process.env.COMFYUI_STARTUP_CHECK_MAX_TRIES;
   mockConfig.resolvedPort = 8188;
   mockConfig.comfyuiPath = "/fake/ComfyUI";
+  mockFindComfyuiPython.mockReturnValue("/fake/ComfyUI/python_embeded/python.exe");
   __processControlTestHooks.reset();
 });
 
@@ -140,6 +146,43 @@ describe("process-control startup readiness", () => {
     );
     expect(children[0].unref).toHaveBeenCalled();
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("relaunches via the resolved Python interpreter when argv[0] is a main.py script (#330)", async () => {
+    // Real ComfyUI /system_stats argv is sys.argv: argv[0] is the SCRIPT path
+    // (…/main.py), NOT the interpreter. Spawning that directly on Windows fails
+    // with `spawn EFTYPE`; the relaunch must resolve the Python interpreter and
+    // pass the whole argv as its args.
+    __processControlTestHooks.setLastProcessInfo({
+      pid: 0,
+      port: 8188,
+      argv: ["C:\\ComfyUI\\main.py", "--port", "8188"],
+      isDesktopApp: false,
+    });
+    const children = mockSpawnedChildren();
+    mockNoPortProcess();
+    mockFetchOk(true);
+
+    const result = await startComfyUI();
+
+    expect(result.started).toBe(true);
+    expect(mockFindComfyuiPython).toHaveBeenCalledWith("/fake/ComfyUI", [
+      "C:\\ComfyUI\\main.py",
+      "--port",
+      "8188",
+    ]);
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "/fake/ComfyUI/python_embeded/python.exe",
+      ["C:\\ComfyUI\\main.py", "--port", "8188"],
+      expect.objectContaining({
+        detached: true,
+        cwd: "/fake/ComfyUI",
+        shell: false,
+        stdio: "ignore",
+        windowsHide: true,
+      }),
+    );
+    expect(children[0].unref).toHaveBeenCalled();
   });
 
   it("reports timeout instead of ready when bounded probes never succeed", async () => {
