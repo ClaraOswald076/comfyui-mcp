@@ -285,6 +285,21 @@ export interface PanelToolCtx {
   tabId: string;
   /** Per-tab workflow pin store (optional for tests). */
   workflowTarget?: WorkflowTargetStore;
+  /**
+   * EXPLICIT self-heal: re-point THIS session at the currently active/sole
+   * connected tab. The tabId captured at session creation is frozen; a full
+   * ComfyUI reconnect (#332), a frontend reload (#322), or switching to a
+   * different workflow FILE (#331) can surface a brand-NEW browser socket under
+   * a NEW tab id with no migration alias, orphaning the session so every
+   * panel_* call throws `no connected tab`. This rebinds `ctx.tabId` (which
+   * `call`/`confirm` read LIVE) to the active tab — but ONLY when the current
+   * tabId no longer reaches a live tab, so a healthy (possibly multi-tab)
+   * session is never disturbed. It is the deliberate consent signal wired into
+   * panel_set_workflow_target({mode:"current"}) and panel_reload — NOT baked
+   * into resolveTarget. Throws (clear message) when a single active tab can't be
+   * determined. Optional so lightweight test contexts can omit it.
+   */
+  rebindToActiveTab?: () => { previous: string; current: string; rebound: boolean };
 }
 
 /** Build a tab-bound execution context shared by both transports. */
@@ -293,11 +308,20 @@ export function makePanelToolCtx(
   tabId: string,
   workflowTargets?: WorkflowTargetStore,
 ): PanelToolCtx {
+  // The routing tab id is held on the returned ctx object (NOT captured by
+  // value) so an explicit rebind can re-point this session in place: call/
+  // confirm and every handler read `ctx.tabId` LIVE. See rebindToActiveTab.
+  const ctx = {
+    bridge,
+    tabId,
+    workflowTarget: workflowTargets,
+  } as PanelToolCtx;
+
   const call = async (cmd: Record<string, unknown>, timeoutMs?: number): Promise<ToolResult> => {
     try {
-      const target = workflowTargets?.get(tabId);
+      const target = workflowTargets?.get(ctx.tabId);
       const routed = target ? withWorkflowTarget(cmd, target) : cmd;
-      return ok(await bridge.send(routed as { cmd: string }, { tabId, timeoutMs }));
+      return ok(await bridge.send(routed as { cmd: string }, { tabId: ctx.tabId, timeoutMs }));
     } catch (err) {
       return fail(err);
     }
@@ -320,14 +344,38 @@ export function makePanelToolCtx(
             { label: "No, cancel", description: "" },
           ],
         } as { cmd: string },
-        { tabId, timeoutMs: 300000 },
+        { tabId: ctx.tabId, timeoutMs: 300000 },
       );
       return isAffirmative(reply);
     } catch {
       return false;
     }
   };
-  return { call, confirm, bridge, tabId, workflowTarget: workflowTargets };
+
+  // EXPLICIT self-heal — see PanelToolCtx.rebindToActiveTab. Only rebinds when
+  // the current tabId is genuinely orphaned (no live tab reachable); a healthy
+  // session is left untouched so this never hijacks routing on a multi-tab
+  // deployment. Throws (clear message, via resolveActiveTabId) when a single
+  // active tab can't be picked.
+  const rebindToActiveTab = (): { previous: string; current: string; rebound: boolean } => {
+    const previous = ctx.tabId;
+    if (bridge.canReach(previous)) return { previous, current: previous, rebound: false };
+    const current = bridge.resolveActiveTabId(); // throws if no single active tab
+    // Carry a pinned workflow target across to the new tab id so a pinned
+    // session keeps its pin after self-healing.
+    const pinned = workflowTargets?.get(previous);
+    if (workflowTargets && pinned && pinned.mode === "pinned") {
+      workflowTargets.clear(previous);
+      workflowTargets.set(current, pinned);
+    }
+    ctx.tabId = current;
+    return { previous, current, rebound: true };
+  };
+
+  ctx.call = call;
+  ctx.confirm = confirm;
+  ctx.rebindToActiveTab = rebindToActiveTab;
+  return ctx;
 }
 
 /**
@@ -962,8 +1010,22 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           .optional()
           .describe("'orchestrator' (default): respawn the agent for new backend code. 'frontend': reload the panel UI for new web code."),
       },
-      async (args: A, ctx) =>
-        ctx.call({ cmd: "soft_reload", scope: (args.scope as string) ?? "orchestrator" }, 15000),
+      async (args: A, ctx) => {
+        // panel_reload is an explicit "recover me now" signal — if THIS session's
+        // tab id was orphaned by a reconnect/reload/workflow-switch, self-heal it
+        // onto the active tab first so a stuck session can recover by calling this
+        // (and so the soft_reload frame actually reaches a live tab). A healthy
+        // session is left untouched; an ambiguous multi-tab case surfaces a clear
+        // error rather than guessing.
+        if (ctx.rebindToActiveTab) {
+          try {
+            ctx.rebindToActiveTab();
+          } catch (err) {
+            return fail(err);
+          }
+        }
+        return ctx.call({ cmd: "soft_reload", scope: (args.scope as string) ?? "orchestrator" }, 15000);
+      },
     ),
     def(
       "panel_list_mcp",
@@ -1441,7 +1503,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_set_workflow_target",
-      "Pin the agent to a specific open workflow tab, or release the pin to follow the user's current tab. Use pinned when the user asks you to work on workflow A while they browse workflow B — set mode:'pinned' and path from panel_list_workflows. Set mode:'current' (or omit path) to follow the active tab again. Does NOT switch what the user sees; it only routes your panel_* graph edits.",
+      "Pin the agent to a specific open workflow tab, or release the pin to follow the user's current tab. Use pinned when the user asks you to work on workflow A while they browse workflow B — set mode:'pinned' and path from panel_list_workflows. Set mode:'current' (or omit path) to follow the active tab again. Does NOT switch what the user sees; it only routes your panel_* graph edits. mode:'current' is ALSO the explicit RECOVERY signal: if your panel_* calls started failing with `no connected tab` after ComfyUI reconnected, the panel reloaded, or the user switched to a different workflow FILE, call this with mode:'current' to rebind this session onto the tab that's live now.",
       {
         mode: z
           .enum(["current", "pinned"])
@@ -1462,13 +1524,29 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         if (mode === "pinned" && !(path ?? "").trim()) {
           return fail("Provide path when pinning — use panel_list_workflows to list open workflows.");
         }
+        // mode:'current' is the explicit, user/agent-initiated "rebind me to the
+        // tab that's live now" consent signal. Self-heal a session whose captured
+        // tab id was orphaned (reconnect/reload/workflow-switch) BEFORE writing the
+        // pin store, so subsequent panel_* calls route to the live tab. Surfaces a
+        // clear error if a single active tab can't be determined.
+        let rebindNote = "";
+        if (mode === "current" && ctx.rebindToActiveTab) {
+          try {
+            const { previous, current, rebound } = ctx.rebindToActiveTab();
+            if (rebound) {
+              rebindNote = ` Rebound this session from tab ${previous.slice(0, 8)} onto the active tab ${current.slice(0, 8)}.`;
+            }
+          } catch (err) {
+            return fail(err);
+          }
+        }
         const target = ctx.workflowTarget.set(ctx.tabId, { mode, path, filename });
         ctx.bridge.push({ type: "workflow_target", target }, ctx.tabId);
         const hint =
           target.mode === "pinned"
             ? `Pinned to "${target.filename ?? target.path}". Graph tools will target that workflow without switching the user's view.`
             : "Following the user's current workflow tab.";
-        return ok({ ...target, note: hint });
+        return ok({ ...target, note: hint + rebindNote });
       },
     ),
     def(

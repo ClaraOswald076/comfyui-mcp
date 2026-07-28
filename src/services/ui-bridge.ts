@@ -714,6 +714,30 @@ export class UiBridge {
     return this.conns.size > 0;
   }
 
+  /** Would a command bound to this EXACT tabId reach a live tab right now?
+   *  (Exact id, an unambiguous prefix, or a live same-socket migration alias —
+   *  the same acceptance `resolveTarget` uses, but as a boolean and never
+   *  throwing.) The orchestrator uses this to tell an orphaned session from a
+   *  healthy one before deciding whether to self-heal via a rebind. */
+  canReach(tabId: string): boolean {
+    try {
+      this.resolveTarget(tabId);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** The id of the tab a NO-tabId command would target right now: the sole
+   *  connection, else the last active tab. Throws the SAME clear errors as the
+   *  no-tabId `send` path when it can't pick a single one (none connected, or
+   *  2+ with no last-active). This is the EXPLICIT resolution the orchestrator
+   *  invokes at a user/agent-initiated rebind moment — it deliberately does NOT
+   *  weaken `resolveTarget`, so multi-tab routing stays conservative. */
+  resolveActiveTabId(): string {
+    return this.resolveTarget().tabId;
+  }
+
   /** True when the tab advertised itself as a canvas-less (mobile/remote) client
    *  in its `hello`. Unknown tabs → false. */
   isHeadless(tabId: string): boolean {

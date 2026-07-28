@@ -478,6 +478,46 @@ describe("UiBridge (multi-tab)", () => {
     sockB.close();
   });
 
+  it("canReach + resolveActiveTabId back the orchestrator's explicit self-heal (#322/#331/#332)", async () => {
+    // A session was bound to old-tab, which then DIES and a genuinely new socket
+    // reconnects under new-tab — NO migration alias (different socket, first hello).
+    const sockOld = await connectPanel();
+    autoReply(sockOld, "old");
+    sockOld.send(JSON.stringify({ type: "hello", tab_id: "old-tab" }));
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    sockOld.close();
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(0));
+
+    const sockNew = await connectPanel();
+    autoReply(sockNew, "new");
+    sockNew.send(JSON.stringify({ type: "hello", tab_id: "new-tab" }));
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+
+    // The old id is orphaned (no migration) — canReach is false, and the no-tabId
+    // resolution the orchestrator invokes at the explicit rebind lands on the sole
+    // live tab. resolveTarget itself is NOT weakened: the old id still throws.
+    expect(bridge.canReach("old-tab")).toBe(false);
+    expect(bridge.canReach("new-tab")).toBe(true);
+    expect(bridge.resolveActiveTabId()).toBe("new-tab");
+    await expect(bridge.send({ cmd: "x" }, { tabId: "old-tab" })).rejects.toThrow(/no connected tab/);
+
+    sockNew.close();
+  });
+
+  it("resolveActiveTabId throws (no guess) when 2+ tabs are connected with no last-active", async () => {
+    const sockA = await connectPanel();
+    autoReply(sockA, "A");
+    sockA.send(JSON.stringify({ type: "hello", tab_id: "tab-a" }));
+    const sockB = await connectPanel();
+    autoReply(sockB, "B");
+    sockB.send(JSON.stringify({ type: "hello", tab_id: "tab-b" }));
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+
+    expect(() => bridge.resolveActiveTabId()).toThrow(/Multiple panel tabs/);
+    sockA.close();
+    sockB.close();
+  });
+
   it("follows MIGRATION CHAINS: uuid → tmp: → wf: (the exact #210 field sequence)", async () => {
     // The reported failure re-helloed TWICE: legacy random UUID, then the
     // unsaved-tab tmp:<uuid> id, then the saved wf:<hash> id. The ORIGINAL id
