@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 
 const mockConfig = vi.hoisted(() => ({
@@ -183,6 +184,31 @@ describe("process-control startup readiness", () => {
       }),
     );
     expect(children[0].unref).toHaveBeenCalled();
+  });
+
+  it("anchors a RELATIVE script argv[0] to the ComfyUI root (portable launcher, #330)", async () => {
+    // The standard Windows portable launcher runs `python ComfyUI\main.py` from
+    // the portable ROOT, so sys.argv[0] is relative. Since we force cwd to the
+    // nested ComfyUI dir, passing it verbatim would look for ComfyUI\ComfyUI\
+    // main.py — it must be anchored to config.comfyuiPath.
+    __processControlTestHooks.setLastProcessInfo({
+      pid: 0,
+      port: 8188,
+      argv: ["ComfyUI\\main.py", "--port", "8188"],
+      isDesktopApp: false,
+    });
+    mockSpawnedChildren();
+    mockNoPortProcess();
+    mockFetchOk(true);
+
+    const result = await startComfyUI();
+
+    expect(result.started).toBe(true);
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "/fake/ComfyUI/python_embeded/python.exe",
+      [join("/fake/ComfyUI", "main.py"), "--port", "8188"],
+      expect.objectContaining({ cwd: "/fake/ComfyUI", shell: false }),
+    );
   });
 
   it("reports timeout instead of ready when bounded probes never succeed", async () => {

@@ -1,5 +1,6 @@
 import { execSync, spawn, type ChildProcess } from "node:child_process";
 import { platform } from "node:os";
+import { basename, isAbsolute, join } from "node:path";
 import { getSystemStats, resetClient, resetObjectInfoCache } from "../comfyui/client.js";
 import { config, getComfyUIBaseUrl, isRemoteMode } from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
@@ -514,7 +515,17 @@ function resolveLaunchCommand(
   if (looksLikeScript) {
     const python = findComfyuiPython(config.comfyuiPath ?? undefined, info.argv);
     if (!python) return null;
-    return { exe: python, args: info.argv };
+    // sys.argv[0] can be RELATIVE (the standard Windows portable launcher runs
+    // `python ComfyUI\main.py` from the portable root). We force cwd to
+    // config.comfyuiPath — the ComfyUI dir that directly holds main.py — so a
+    // relative script would resolve against the wrong dir (…/ComfyUI/ComfyUI/
+    // main.py). Anchor it: use the absolute path as-is, otherwise main.py under
+    // the resolved ComfyUI root.
+    const script =
+      isAbsolute(first) || !config.comfyuiPath
+        ? first
+        : join(config.comfyuiPath, basename(first));
+    return { exe: python, args: [script, ...rest] };
   }
   return { exe: first, args: rest };
 }
