@@ -528,6 +528,108 @@ describe("panel-tools: workflow target (per-workflow agent)", () => {
   });
 });
 
+describe("panel-tools: session tabId self-heal (#322 reload / #331 workflow-switch / #332 reconnect)", () => {
+  // A minimal fake bridge modelling the ONE fact that matters: which tab ids are
+  // currently live. `send` routes only to a live id (throws `no connected tab`
+  // otherwise, exactly like UiBridge.resolveTarget); canReach/resolveActiveTabId
+  // mirror the real bridge's no-throw / no-tabId helpers.
+  function fakeBridge(live: Set<string>) {
+    const sent: Array<{ cmd: Record<string, unknown>; tabId?: string }> = [];
+    const bridge = {
+      send: async (cmd: Record<string, unknown>, opts?: { tabId?: string }) => {
+        const id = opts?.tabId;
+        if (id && !live.has(id)) throw new Error(`no connected tab with id "${id}"`);
+        sent.push({ cmd, tabId: id });
+        return { ok: true, routedTo: id };
+      },
+      push: () => 1,
+      canReach: (tabId: string) => live.has(tabId),
+      resolveActiveTabId: () => {
+        if (live.size === 1) return [...live][0];
+        if (live.size === 0) throw new Error("Panel not reachable: no panel connected");
+        throw new Error("Multiple panel tabs are connected and none is last active — pass tab_id.");
+      },
+    } as unknown as PanelToolCtx["bridge"];
+    return { bridge, sent };
+  }
+
+  it("panel_set_workflow_target({mode:'current'}) rebinds a DEAD session onto the sole live tab; calls then succeed", async () => {
+    const store = new WorkflowTargetStore();
+    // Only the NEW tab is live; the session was created bound to the old (dead) id.
+    const { bridge, sent } = fakeBridge(new Set(["new-live-tab"]));
+    const ctx = makePanelToolCtx(bridge, "dead-old-tab", store);
+
+    // Before rebind, a graph call to the dead tab fails.
+    const before = await defByName("panel_graph_outline").handler({}, ctx);
+    expect(before.isError).toBe(true);
+
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    expect(res.isError).toBeUndefined();
+    expect(ctx.tabId).toBe("new-live-tab");
+    const text = (res.content[0] as { text: string }).text;
+    expect(text).toContain("Rebound this session");
+
+    // After rebind, subsequent panel_* calls route to the live tab and succeed.
+    const after = await defByName("panel_graph_outline").handler({}, ctx);
+    expect(after.isError).toBeUndefined();
+    expect(sent.at(-1)?.tabId).toBe("new-live-tab");
+  });
+
+  it("panel_reload rebinds a DEAD session onto the sole live tab, then forwards soft_reload there", async () => {
+    const store = new WorkflowTargetStore();
+    const { bridge, sent } = fakeBridge(new Set(["reconnected-tab"]));
+    const ctx = makePanelToolCtx(bridge, "orphaned-tab", store);
+
+    const res = await defByName("panel_reload").handler({}, ctx);
+    expect(res.isError).toBeUndefined();
+    expect(ctx.tabId).toBe("reconnected-tab");
+    expect(sent.at(-1)).toMatchObject({
+      cmd: { cmd: "soft_reload", scope: "orchestrator" },
+      tabId: "reconnected-tab",
+    });
+  });
+
+  it("does NOT disturb a HEALTHY session: mode:'current' leaves a still-live tabId in place", async () => {
+    const store = new WorkflowTargetStore();
+    // Two live tabs incl. the session's own — a healthy multi-tab deployment.
+    const { bridge } = fakeBridge(new Set(["my-tab", "other-tab"]));
+    const ctx = makePanelToolCtx(bridge, "my-tab", store);
+
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    expect(res.isError).toBeUndefined();
+    // Untouched — no rebind (canReach true), so no hijack onto another tab.
+    expect(ctx.tabId).toBe("my-tab");
+    const text = (res.content[0] as { text: string }).text;
+    expect(text).not.toContain("Rebound");
+  });
+
+  it("surfaces a CLEAR error (no guess) when the session is dead AND no single active tab exists", async () => {
+    const store = new WorkflowTargetStore();
+    // Session's tab is dead and 2+ others are live with no last-active → ambiguous.
+    const { bridge } = fakeBridge(new Set(["a", "b"]));
+    const ctx = makePanelToolCtx(bridge, "dead-tab", store);
+
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    expect(res.isError).toBe(true);
+    expect((res.content[0] as { text: string }).text).toMatch(/Multiple panel tabs/);
+    // tabId is NOT silently changed to some arbitrary tab.
+    expect(ctx.tabId).toBe("dead-tab");
+  });
+
+  it("carries a PINNED workflow target across the rebind to the new tab id", async () => {
+    const store = new WorkflowTargetStore();
+    store.set("dead-old-tab", { mode: "pinned", path: "workflows/pinned.json" });
+    const { bridge } = fakeBridge(new Set(["new-live-tab"]));
+    const ctx = makePanelToolCtx(bridge, "dead-old-tab", store);
+
+    // panel_reload triggers the rebind without releasing the pin.
+    await defByName("panel_reload").handler({}, ctx);
+    expect(ctx.tabId).toBe("new-live-tab");
+    expect(store.get("new-live-tab")).toMatchObject({ mode: "pinned", path: "workflows/pinned.json" });
+    expect(store.get("dead-old-tab")).toMatchObject({ mode: "current" });
+  });
+});
+
 describe("panel_connect slot aliases (live panel finding: stripped aliases → auto-match scramble)", () => {
   it("maps from_slot_name/to_slot_name onto from_output/to_input on the wire", async () => {
     const { ctx, calls } = makeFakeCtx();
