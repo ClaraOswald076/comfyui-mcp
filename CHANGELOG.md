@@ -6,6 +6,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.3] - 2026-07-28
+
+### MCP
+
+#### Fixed
+- reject path-traversal filenames in image/media upload (#329)
+- default all bundled-workflow seeds to randomize (#325)
+
+
 ## [0.48.2] - 2026-07-27
 
 ### MCP
