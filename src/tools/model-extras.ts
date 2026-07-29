@@ -250,7 +250,10 @@ export function registerModelExtrasTools(server: McpServer): void {
       "<30 days ago]); with a `query` it searches usernames (public /api/v1/creators; partial match, returns " +
       "model counts, NOT ranked). Each hit's username feeds search_civitai_models {creator: <username>} " +
       "directly. Flow: search_civitai_creators → pick a creator → search_civitai_models {creator, types?} → " +
-      "download_civitai_model.",
+      "download_civitai_model. SCOPE CAVEAT: the /api/v1/creators index only lists creators who have published " +
+      "MODELS. A creator who posts only images/videos (no models) legitimately returns 0 hits here — that is a " +
+      "gap in this endpoint, NOT proof the creator doesn't exist. For a media-only creator, browse their images " +
+      "via the panel CivitAI browser (panel_open_civitai {creator}) or the logged-in browser session instead.",
     {
       query: z
         .string()
@@ -280,7 +283,10 @@ export function registerModelExtrasTools(server: McpServer): void {
                   type: "text",
                   text:
                     `No CivitAI creators matched "${args.query}". Usernames match on substrings — ` +
-                    `try a shorter fragment, or omit the query for the top-creators leaderboard.`,
+                    `try a shorter fragment, or omit the query for the top-creators leaderboard. ` +
+                    `Note: this index only covers creators who have published MODELS — a creator who ` +
+                    `posts only images/videos won't appear here even if the exact username is correct. ` +
+                    `For a media-only creator, browse their posts via the panel CivitAI browser instead.`,
                 },
               ],
             };

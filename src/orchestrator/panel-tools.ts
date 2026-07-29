@@ -127,6 +127,14 @@ function sanitizeBrowsingLevels(levels: unknown): number[] | undefined {
   return safe;
 }
 
+/** Normalize an agent-supplied CivitAI creator username: trim, strip a leading
+ *  @, drop surrounding whitespace. Returns "" when nothing usable was supplied
+ *  (so callers can treat it as "no creator filter"). */
+function normalizeCreator(creator: unknown): string {
+  if (typeof creator !== "string") return "";
+  return creator.trim().replace(/^@+/, "").trim();
+}
+
 // ---- server-side pack workflow resolution (for panel_load_workflow) --------
 // Read a bundled pack's UI workflow.json on the SERVER so the (large) graph
 // never has to shuttle through the agent's conversation. Mirrors the package-
@@ -1316,6 +1324,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           .string()
           .optional()
           .describe("Search term to pre-fill (e.g. 'anime lineart', 'Flux photoreal'). Omit for a plain browse."),
+        creator: z
+          .string()
+          .optional()
+          .describe("Pre-scope the browse to one CivitAI username (with or without a leading @). Folded into the query as an @creator token. Note: a media-only creator (images/videos, no published models) may not resolve on the model tabs, and account-gated content needs an authenticated session."),
         tab: z
           .enum(["images", "videos", "checkpoints", "loras", "workflows", "favorites"])
           .optional()
@@ -1343,10 +1355,15 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       async (args: A, ctx) => {
         try {
           const browsingLevels = sanitizeBrowsingLevels(args.browsingLevels);
+          const creator = normalizeCreator(args.creator);
+          const rawQuery = typeof args.query === "string" ? args.query : "";
+          const query = creator
+            ? `@${creator}${rawQuery ? " " + rawQuery : " "}`
+            : args.query;
           return await ctx.call(
             {
               cmd: "open_civitai",
-              query: args.query,
+              query,
               tab: args.tab,
               browsingLevels,
               filters: args.filters,
@@ -1361,7 +1378,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_civitai_results",
-      "READ the CivitAI browser's CURRENT results as text (metadata + media URLs only — you will NOT be shown the images; you reason from the text and pick which URLs matter). This is the READ step of the show-don't-tell flow: rather than answering a 'good X model/LoRA?' question purely in a text table, open the docked browser, read the real results here, then panel_civitai_highlight your picks so the user SEES the cards. Open the browser first with panel_open_civitai. Returns { items, total, loading }. Each item carries EXACTLY these fields and nothing else — a MEDIA item is { id, kind:'image'|'video', title:null, creator, baseModel, type, stats:{ reactions }, prompt (length-capped ~600 chars), urls:[] }; a MODEL item is { id, kind:'model', title (the model's name), creator, baseModel, type, stats:{ downloadCount, thumbsUp }, prompt:null, urls:[] }. Note: stats is a NESTED object (reactions for media; downloadCount+thumbsUp for models), urls is an ARRAY of media URL(s), and media items have title:null while models have prompt:null. Model descriptions are NOT included (they require a separate detail fetch) — do not expect them. Use this to see what's on screen before you highlight, switch tabs, or open the lightbox. `loading:true` means a fetch is still in flight and the panel is reporting what it has so far. The browser must be open — otherwise the panel replies with an honest error.",
+      "READ the CivitAI browser's CURRENT results as text (metadata + media URLs only — you will NOT be shown the images; you reason from the text and pick which URLs matter). This is the READ step of the show-don't-tell flow: rather than answering a 'good X model/LoRA?' question purely in a text table, open the docked browser, read the real results here, then panel_civitai_highlight your picks so the user SEES the cards. Open the browser first with panel_open_civitai. Returns { items, total, loading }. Each item carries EXACTLY these fields and nothing else — a MEDIA item is { id, kind:'image'|'video', title:null, creator, baseModel, type, stats:{ reactions }, prompt (length-capped ~600 chars), urls:[] }; a MODEL item is { id, kind:'model', title (the model's name), creator, baseModel, type, stats:{ downloadCount, thumbsUp }, prompt:null, urls:[] }. Note: stats is a NESTED object (reactions for media; downloadCount+thumbsUp for models), urls is an ARRAY of media URL(s), and media items have title:null while models have prompt:null. Model descriptions are NOT included (they require a separate detail fetch) — do not expect them. Use this to see what's on screen before you highlight, switch tabs, or open the lightbox. `loading:true` means a fetch is still in flight and the panel is reporting what it has so far. The browser must be open — otherwise the panel replies with an honest error.\n\nDISAMBIGUATING AN EMPTY GRID: a `total:0` result is NOT automatically 'no matches'. Newer panels attach status fields you MUST check before concluding anything from an empty set: `error` (e.g. { status:503, message:'CivitAI API 503: Service Unavailable' } — an UPSTREAM failure, retry rather than narrowing filters), and on the favorites tab a `favoritesStatus` (e.g. 'ok' | 'signed_out' | 'no_likes_collection' | 'filtered_out') plus `authenticated`. If `error` is present the grid is empty because the request FAILED, not because nothing matched; if `favoritesStatus` is 'signed_out'/'no_likes_collection' the favorites couldn't be located at all. Only treat total:0 as a true empty result when `error` is null and (off the favorites tab, or favoritesStatus is 'ok').",
       {
         limit: z
           .number()
@@ -1406,9 +1423,13 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_civitai_search",
-      "Run a NEW search inside the already-open CivitAI browser (re-queries the current tab with a fresh term and optional filters). Use this to refine or pivot the browse after reading results — e.g. narrow by base model or change the sort — while keeping the recommendation VISUAL: this is a step in the show-don't-tell flow, so drive the docked browser toward the models/LoRAs you'll recommend rather than dropping back to a text-only list. Follow with panel_civitai_results to read the new results, then panel_civitai_highlight your picks. To open the browser in the first place, use panel_open_civitai instead. The browser must be open — otherwise the panel replies with an honest error.",
+      "Run a NEW search inside the already-open CivitAI browser (re-queries the current tab with a fresh term and optional filters). Use this to refine or pivot the browse after reading results — e.g. narrow by base model or change the sort — while keeping the recommendation VISUAL: this is a step in the show-don't-tell flow, so drive the docked browser toward the models/LoRAs you'll recommend rather than dropping back to a text-only list. Follow with panel_civitai_results to read the new results, then panel_civitai_highlight your picks. To open the browser in the first place, use panel_open_civitai instead. The browser must be open — otherwise the panel replies with an honest error.\n\nCreator filter: pass `creator` to scope results to one CivitAI username (it is folded into the query as an `@creator` token and echoed back in the reply's `creator` field). IMPORTANT caveats that make an empty result EXPLAINABLE rather than mysterious: (1) if the reply comes back with `creator:null` or a `warning`, the filter was NOT honored — do not report the empty grid as 'this creator has no content'. (2) A creator who posts ONLY images/videos (no published models) may not be resolvable by username on the model tabs. (3) On the image/video tabs the username filter only sees content the CivitAI session is authorized to see — if the user set an XXX/NSFW filter on their own civitai account, an UNAUTHENTICATED session won't apply it. Check the reply's `warning`/`creator` fields before concluding anything from a zero-result set.",
       {
-        query: z.string().describe("The new search term (e.g. 'ghibli background', 'Flux portrait')."),
+        query: z.string().describe("The new search term (e.g. 'ghibli background', 'Flux portrait'). Pass \"\" to browse a creator with no keyword."),
+        creator: z
+          .string()
+          .optional()
+          .describe("Scope results to one CivitAI username (with or without a leading @). Folded into the query as an @creator token and echoed back as `creator`; a `warning` is returned if it could not be applied."),
         filters: z
           .object({
             period: z.string().optional().describe("Time window filter (e.g. 'Week', 'Month', 'AllTime')."),
@@ -1426,10 +1447,38 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       async (args: A, ctx) => {
         try {
           const browsingLevels = sanitizeBrowsingLevels(args.browsingLevels);
-          return await ctx.call(
-            { cmd: "civitai_search", query: args.query, filters: args.filters, browsingLevels },
-            10000,
+          const creator = normalizeCreator(args.creator);
+          const rawQuery = typeof args.query === "string" ? args.query : "";
+          // Fold the creator into the query as an @creator token so the panel's
+          // existing parseCreatorQuery path applies it (issue #374 — the tool used
+          // to drop `creator` silently, echoing creator:null with zero results).
+          const query = creator ? `@${creator}${rawQuery ? " " + rawQuery : " "}` : rawQuery;
+          const reply = await ctx.bridge.send(
+            { cmd: "civitai_search", query, filters: args.filters, browsingLevels } as { cmd: string },
+            { tabId: ctx.tabId, timeoutMs: 10000 },
           );
+          // Do NOT let a supplied-but-unapplied creator filter masquerade as a
+          // legitimate empty result: if the panel echoes back a different (or null)
+          // creator, surface an explicit warning so the caller can tell "filter
+          // never applied" from "this creator has no content".
+          if (creator && reply && typeof reply === "object") {
+            const applied = (reply as { creator?: unknown }).creator;
+            const appliedStr = typeof applied === "string" ? applied : "";
+            if (appliedStr.toLowerCase() !== creator.toLowerCase()) {
+              return ok({
+                ...(reply as Record<string, unknown>),
+                warning:
+                  `The creator filter "${creator}" was NOT applied (the browser reports creator: ` +
+                  `${appliedStr ? `"${appliedStr}"` : "null"}). Any empty/other results below are NOT ` +
+                  `evidence that this creator has no content. Likely causes: the creator publishes only ` +
+                  `images/videos (no models, so username lookup on model tabs can miss them), the username ` +
+                  `is misspelled, or the CivitAI session is unauthenticated (a signed-out session can't see ` +
+                  `account-gated content). Verify the exact username with search_civitai_creators, or drive ` +
+                  `the logged-in browser session directly.`,
+              });
+            }
+          }
+          return ok(reply);
         } catch (err) {
           return fail(err);
         }
