@@ -2698,26 +2698,38 @@ export async function runPanelOrchestrator(): Promise<void> {
       let ollamaChanged = false;
       if (Array.isArray(cfg.preferred_models)) {
         const ids = cfg.preferred_models.filter((m): m is string => typeof m === "string");
-        setAgentSettings({ preferredModels: ids });
-        ollamaChanged = true;
-        logger.info(`[panel-orchestrator] preferred models → [${ids.join(", ")}]`);
+        // The panel re-sends set_config on EVERY heartbeat. Only apply + re-push on
+        // an ACTUAL change — otherwise re-pushing models makes the panel re-send,
+        // which re-pushes… a tight ~150/s feedback loop that wedges the orchestrator
+        // (a multi-provider user hit exactly this). Mirror the stall_seconds guard.
+        const prevIds = getAgentSettings().preferredModels ?? [];
+        if (ids.length !== prevIds.length || ids.some((v, i) => v !== prevIds[i])) {
+          setAgentSettings({ preferredModels: ids });
+          ollamaChanged = true;
+          logger.info(`[panel-orchestrator] preferred models → [${ids.join(", ")}]`);
+        }
       }
       if (cfg.ollama && typeof cfg.ollama === "object") {
         const o = cfg.ollama as { model?: unknown; api?: unknown; base_url?: unknown };
         const patch: { model?: string; api?: "ollama" | "openai"; baseUrl?: string } = {};
+        // Only count a field as changed when it's env-unset AND the value actually
+        // differs from the current one — so a repeated identical heartbeat config is
+        // a no-op (no re-push, no loop). An env override wins and never "changes".
+        let changed = false;
         if (typeof o.model === "string" && o.model.trim()) {
           patch.model = o.model.trim();
-          if (!process.env.COMFYUI_MCP_OLLAMA_MODEL) ollamaModel = patch.model;
+          if (!process.env.COMFYUI_MCP_OLLAMA_MODEL && patch.model !== ollamaModel) { changed = true; ollamaModel = patch.model; }
         }
         if (o.api === "openai" || o.api === "ollama") {
           patch.api = o.api;
-          if (!process.env.COMFYUI_MCP_OLLAMA_API) ollamaApi = o.api;
+          if (!process.env.COMFYUI_MCP_OLLAMA_API && o.api !== ollamaApi) { changed = true; ollamaApi = o.api; }
         }
         if (typeof o.base_url === "string") {
           patch.baseUrl = o.base_url.trim();
-          if (!process.env.COMFYUI_MCP_OLLAMA_BASE_URL) ollamaBaseUrl = patch.baseUrl || undefined;
+          const nb = patch.baseUrl || undefined;
+          if (!process.env.COMFYUI_MCP_OLLAMA_BASE_URL && nb !== ollamaBaseUrl) { changed = true; ollamaBaseUrl = nb; }
         }
-        if (Object.keys(patch).length) {
+        if (Object.keys(patch).length && changed) {
           setAgentSettings({ ollama: patch });
           ollamaChanged = true;
           // Endpoint may have moved — drop the cached probe backend so the next
@@ -2763,15 +2775,19 @@ export async function runPanelOrchestrator(): Promise<void> {
       if (cucfg && typeof cucfg === "object") {
         const o = cucfg as { model?: unknown; base_url?: unknown };
         const patch: { model?: string; baseUrl?: string } = {};
+        // Change-guard (see preferred_models above): pushReadiness on every heartbeat
+        // config is what drives the panel↔orchestrator feedback loop, so only fire on
+        // an actual change; an env override wins and never counts as changed.
+        let changed = false;
         if (typeof o.model === "string" && o.model.trim()) {
           patch.model = o.model.trim();
-          if (!process.env.COMFYUI_MCP_CUSTOM_MODEL) customModel = patch.model;
+          if (!process.env.COMFYUI_MCP_CUSTOM_MODEL && patch.model !== customModel) { changed = true; customModel = patch.model; }
         }
         if (typeof o.base_url === "string") {
           patch.baseUrl = o.base_url.trim().replace(/[/]$/, "");
-          if (!process.env.COMFYUI_MCP_CUSTOM_BASE_URL) customBaseUrl = patch.baseUrl;
+          if (!process.env.COMFYUI_MCP_CUSTOM_BASE_URL && patch.baseUrl !== customBaseUrl) { changed = true; customBaseUrl = patch.baseUrl; }
         }
-        if (Object.keys(patch).length) {
+        if (Object.keys(patch).length && changed) {
           setAgentSettings({ custom: patch });
           const pb = probeBackends.get("custom");
           if (pb?.close) void pb.close().catch(() => {});
