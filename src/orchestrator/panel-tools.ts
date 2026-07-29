@@ -300,6 +300,17 @@ export interface PanelToolCtx {
    * determined. Optional so lightweight test contexts can omit it.
    */
   rebindToActiveTab?: () => { previous: string; current: string; rebound: boolean };
+  /**
+   * Best-effort in-place self-heal for the handful of tools that call the bridge
+   * DIRECTLY (not via `ctx.call`) — e.g. panel_request_adult_consent's ask_user
+   * (#372) and the live-canvas graph_serialize. Silently rebinds an orphaned,
+   * current-mode session onto the sole active tab (identical conservative guard
+   * to rebindToActiveTab: only when the current tab is unreachable AND a single
+   * active tab is unambiguous; pinned sessions untouched). Never throws. `call`
+   * and `confirm` already invoke it internally, so most handlers need not. Optional
+   * so lightweight test contexts can omit it.
+   */
+  ensureReachable?: () => void;
 }
 
 /** Build a tab-bound execution context shared by both transports. */
@@ -317,8 +328,44 @@ export function makePanelToolCtx(
     workflowTarget: workflowTargets,
   } as PanelToolCtx;
 
+  // AUTO-HEAL an orphaned session in place. When THIS session's captured tabId no
+  // longer reaches a live tab (a full ComfyUI restart/reconnect #178/#170, a
+  // frontend reload #322, or a switch to a different workflow FILE #331/#372
+  // surfaces a NEW socket under a NEW tab id with no migration alias), silently
+  // rebind onto the sole active tab BEFORE the command is sent — so a session that
+  // was merely orphaned by a reconnect recovers on its own instead of throwing
+  // `no connected tab` on every call and forcing the agent to hand-call
+  // panel_set_workflow_target({mode:"current"}).
+  //
+  // CONSERVATIVE by construction (must not weaken multi-tab routing):
+  //  - fires ONLY when the current tab is genuinely unreachable (canReach false);
+  //    a healthy session — including a healthy MULTI-tab one — is never touched;
+  //  - uses the SAME resolveActiveTabId the explicit rebind uses, which THROWS on
+  //    ambiguity (2+ live tabs, no last-active) and when nothing is connected, so
+  //    an orphaned session is never silently hijacked onto an arbitrary tab —
+  //    the throw is swallowed and the command falls through to the bridge's clear
+  //    `no connected tab` / `Multiple panel tabs` error;
+  //  - PINNED sessions are left strict: a session pinned to a specific workflow
+  //    keeps requiring the explicit rebind consent signal. Only "current"-mode
+  //    (follow-the-active-tab) sessions self-heal, which is faithful to what that
+  //    mode already means.
+  // It routes through makePanelToolCtx only — bridge.resolveTarget itself is
+  // untouched, so the dead-alias security invariant (ui-bridge.test.ts:459) holds.
+  const ensureReachable = (): void => {
+    if (typeof bridge.canReach !== "function") return; // lightweight test ctx
+    if (bridge.canReach(ctx.tabId)) return;
+    if (workflowTargets?.get(ctx.tabId)?.mode === "pinned") return; // stay strict
+    try {
+      rebindToActiveTab();
+    } catch {
+      // Ambiguous (2+ tabs) or nothing connected — leave tabId as-is and let the
+      // command surface the bridge's own clear, tab-listing error.
+    }
+  };
+
   const call = async (cmd: Record<string, unknown>, timeoutMs?: number): Promise<ToolResult> => {
     try {
+      ensureReachable();
       const target = workflowTargets?.get(ctx.tabId);
       const routed = target ? withWorkflowTarget(cmd, target) : cmd;
       return ok(await bridge.send(routed as { cmd: string }, { tabId: ctx.tabId, timeoutMs }));
@@ -334,6 +381,7 @@ export function makePanelToolCtx(
   // approvalPolicy "never", so the same in-tool gate is the only safeguard.)
   const confirm = async (question: string, header: string): Promise<boolean> => {
     try {
+      ensureReachable();
       const reply = await bridge.send(
         {
           cmd: "ask_user",
@@ -375,6 +423,7 @@ export function makePanelToolCtx(
   ctx.call = call;
   ctx.confirm = confirm;
   ctx.rebindToActiveTab = rebindToActiveTab;
+  ctx.ensureReachable = ensureReachable;
   return ctx;
 }
 
@@ -398,6 +447,7 @@ async function resolveWorkflowInput(
   }
   let reply: unknown;
   try {
+    ctx.ensureReachable?.();
     reply = await ctx.bridge.send({ cmd: "graph_serialize" } as { cmd: string }, {
       tabId: ctx.tabId,
       timeoutMs: 30000,
@@ -1196,6 +1246,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             "Adult-content gate — to enable NSFW work in this session, please confirm BOTH that you are at least 18 years old AND that creating/viewing adult content is legal in your country/region." +
             (args.reason ? `\n\nContext: ${args.reason}` : "") +
             "\n\nThis is recorded as your consent and can be turned off anytime.";
+          // #372: the consent card goes over the bridge DIRECTLY (not ctx.call), so
+          // self-heal an orphaned current-mode session first — otherwise a session
+          // that lost its live binding (reconnect/reload/workflow-switch) throws a
+          // false `no connected tab` here even though graph tools just worked.
+          ctx.ensureReachable?.();
           const reply = await ctx.bridge.send(
             {
               cmd: "ask_user",
