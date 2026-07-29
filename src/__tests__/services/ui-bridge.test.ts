@@ -899,6 +899,14 @@ describe("makeUnknownCommandError (old-panel version gate)", () => {
     expect(makeUnknownCommandError("panel reported an error")).toBeNull();
   });
 
+  it("does NOT rewrite an error that merely quotes the phrase mid-message (anchored)", () => {
+    // A genuine command failure whose text happens to embed the phrase must pass
+    // through untouched — only the panel dispatcher's own leading reply matches.
+    expect(
+      makeUnknownCommandError('graph_run failed: node emitted Unknown command "foo" to stdout'),
+    ).toBeNull();
+  });
+
   it("tolerates smart quotes and varied casing", () => {
     expect(makeUnknownCommandError("unknown command “graph_serialize”")?.message).toContain(
       "graph_serialize",

@@ -93,8 +93,11 @@ export function makeUnknownCommandError(
   panelVersion?: string,
 ): Error | null {
   // Match the panel's exact shape: `Unknown command "graph_query"` (quotes
-  // optional/variable). Case-insensitive, tolerant of straight or smart quotes.
-  const m = /unknown command\s*["“']?([\w.-]+)["”']?/i.exec(error);
+  // optional/variable). ANCHORED at the start of the (trimmed) message so an
+  // unrelated error that merely QUOTES an unknown-command phrase somewhere in its
+  // text is never rewritten — only the panel dispatcher's own reply, which is
+  // exactly this string. Case-insensitive, tolerant of straight or smart quotes.
+  const m = /^unknown command\s*["“']?([\w.-]+)["”']?/i.exec(error.trim());
   if (!m) return null;
   const cmd = m[1];
   const detected = panelVersion ? ` (detected ${panelVersion})` : "";
