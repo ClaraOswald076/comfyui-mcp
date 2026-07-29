@@ -137,17 +137,30 @@ export async function getSystemStats(): Promise<SystemStats> {
 // Perf gap flagged by josephoibrahim/comfy-cozy (re-validate ~7 s → ~0.5 s).
 let objectInfoCache: ObjectInfo | null = null;
 let objectInfoInflight: Promise<ObjectInfo> | null = null;
+// Invalidation epoch. resetObjectInfoCache() bumps it; a fetch that STARTED under
+// an older epoch must not commit its result to the cache — otherwise a request
+// in flight when a restart invalidates the cache can resolve afterward and
+// repopulate it with the PRE-restart schema, and future callers would await that
+// stale value (codex WS-3 finding #1).
+let objectInfoEpoch = 0;
 
 export async function getObjectInfo(): Promise<ObjectInfo> {
   if (isCloudMode()) return cloudClient.getObjectInfo();
   if (objectInfoCache) return objectInfoCache;
   if (objectInfoInflight) return objectInfoInflight;
 
-  objectInfoInflight = (async () => {
+  const startEpoch = objectInfoEpoch;
+  // Commit to the shared cache ONLY if no invalidation happened while we were
+  // fetching. Awaiters of this promise still get the value (they asked before
+  // the reset), but the cache is not poisoned for callers that arrive after.
+  const commit = (info: ObjectInfo): ObjectInfo => {
+    if (objectInfoEpoch === startEpoch) objectInfoCache = info;
+    return info;
+  };
+
+  const inflight = (async () => {
     try {
-      const info = (await getClient().getNodeDefs()) as unknown as ObjectInfo;
-      objectInfoCache = info;
-      return info;
+      return commit((await getClient().getNodeDefs()) as unknown as ObjectInfo);
     } catch (err) {
       // A managed restart/reboot leaves the cached client bound to a socket that
       // was torn down, so the first call after it surfaces a bare "fetch failed"
@@ -157,27 +170,32 @@ export async function getObjectInfo(): Promise<ObjectInfo> {
         error: err instanceof Error ? err.message : String(err),
       });
       resetClient();
-      const info = (await getClient().getNodeDefs()) as unknown as ObjectInfo;
-      objectInfoCache = info;
-      return info;
+      return commit((await getClient().getNodeDefs()) as unknown as ObjectInfo);
     }
   })();
+  objectInfoInflight = inflight;
 
   try {
-    return await objectInfoInflight;
+    return await inflight;
   } finally {
-    objectInfoInflight = null;
+    // Only clear the shared slot if it's still ours — a concurrent reset may have
+    // already abandoned it and a newer fetch may have taken the slot.
+    if (objectInfoInflight === inflight) objectInfoInflight = null;
   }
 }
 
 /**
  * Drop the memoized /object_info so the next call refetches. Called after
  * ComfyUI restarts (node packs may have changed) and available for tools
- * that mutate the node set mid-session.
+ * that mutate the node set mid-session. Bumps the invalidation epoch and
+ * abandons any in-flight fetch so a fetch started before the reset can never
+ * commit a pre-restart result to the cache.
  */
 export function resetObjectInfoCache(): void {
   objectInfoCache = null;
-  logger.debug("object_info cache reset");
+  objectInfoInflight = null;
+  objectInfoEpoch++;
+  logger.debug("object_info cache reset", { epoch: objectInfoEpoch });
 }
 
 /**
