@@ -64,7 +64,11 @@ Claude will find (or download) a checkpoint, build a workflow, execute it, and r
 
 **More than a bridge.** Most ComfyUI MCP servers are thin connectors — they forward a prompt and hand back an image. `comfyui-mcp` is a full control plane: it authors and edits the graph node-by-node, runs and iterates on workflows, manages models and custom nodes, and ships model-specific expertise (samplers, CFG, resolutions, curated model URLs) so the agent gets it right without trial and error. If you want a minimal local relay, a lightweight server is fine; if you want an agent that actually *operates* ComfyUI, that's this project.
 
-For **Comfy Cloud** users, [Comfy-Org ships an official Comfy Cloud MCP](https://docs.comfy.org/development/cloud/mcp-server) (currently invite-only beta) which is cloud-exclusive and maintained by the Comfy team. `comfyui-mcp` *also* includes a community cloud-mode (set `COMFYUI_API_KEY` — see [Deployment modes](#deployment-modes)) so a single MCP can target all three deployment shapes from one config; pick whichever fits your workflow.
+For **Comfy Cloud** users, Comfy-Org ships its own [agent tooling](https://docs.comfy.org/agent-tools): **Comfy Cloud MCP** (public beta, hosted on Comfy Cloud GPUs), the **Comfy In-App Agent** (private alpha, inside Comfy Cloud), and a first-party **Comfy Local MCP** (private test, not publicly available yet) — all maintained by the Comfy team. If you don't have a GPU or you want zero setup, that's the better path; go use it.
+
+Where this project differs is that it runs on **your** install and **your** choice of model — including a free local one via Ollama with no account and no network at all. `comfyui-mcp` *also* includes a community cloud-mode (set `COMFYUI_API_KEY` — see [Deployment modes](#deployment-modes)) so a single MCP can target all three deployment shapes from one config.
+
+📊 **[Local vs. Comfy Cloud agent](https://comfyui-mcp.artokun.io/docs/local-vs-comfy-cloud)** — an honest side-by-side, including when Comfy Cloud is the right answer. *(Statuses above are as of July 2026; Comfy-Org ships fast — check their docs for the current state.)*
 
 ### Remote / hosted connector (one command)
 
