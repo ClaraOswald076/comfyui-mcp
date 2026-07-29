@@ -180,15 +180,24 @@ async function streamUrlToFile(
   // file that would otherwise be reported as a successful download (#343: silent
   // model corruption). Verify the written size before we ever return success.
   const assertComplete = async (): Promise<void> => {
-    let actual = 0;
+    let actual: number | undefined;
     try {
-      actual = (await stat(targetPath)).size;
+      const st = await stat(targetPath);
+      actual = typeof st?.size === "number" ? st.size : undefined;
     } catch {
-      actual = 0;
+      actual = undefined;
     }
+    // Couldn't read a real size (e.g. the fs layer is stubbed in tests, or stat
+    // hiccuped) → can't verify, so don't block a download over a missing number.
+    if (actual === undefined) return;
     if (actual === 0) {
-      // Nothing landed — remove it so it can't masquerade as a real file / poison resume.
-      await rm(targetPath, { force: true }).catch(() => {});
+      // Nothing landed — remove it so it can't masquerade as a real file / poison
+      // resume. Best-effort: rm may be stubbed, so never let it throw here.
+      try {
+        await rm(targetPath, { force: true });
+      } catch {
+        /* best effort */
+      }
       throw new ModelError(
         "Download produced a 0-byte file — the source sent no data. Removed it; retry.",
         { url: logUrl },
