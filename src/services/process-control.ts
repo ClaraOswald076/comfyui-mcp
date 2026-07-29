@@ -1,4 +1,5 @@
 import { execSync, spawn, type ChildProcess } from "node:child_process";
+import { existsSync } from "node:fs";
 import { platform } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { getSystemStats, resetClient, resetObjectInfoCache } from "../comfyui/client.js";
@@ -329,7 +330,11 @@ function getStartupReadinessConfig(): { intervalMs: number; maxTries: number } {
     intervalMs: Math.round(
       parsePositiveNumberEnv("COMFYUI_STARTUP_CHECK_INTERVAL_S", 1) * 1000,
     ),
-    maxTries: parsePositiveIntEnv("COMFYUI_STARTUP_CHECK_MAX_TRIES", 20),
+    // Default budget is 60s (was 20s). ComfyUI with a normal set of custom nodes
+    // routinely takes >20s to answer /system_stats on a cold start, so a 20-probe
+    // budget reported `started:false` moments before a healthy instance became
+    // ready (issue #367). Tunable via COMFYUI_STARTUP_CHECK_MAX_TRIES.
+    maxTries: parsePositiveIntEnv("COMFYUI_STARTUP_CHECK_MAX_TRIES", 60),
   };
 }
 
@@ -539,6 +544,115 @@ function resolveLaunchCommand(
   return { exe: first, args: rest };
 }
 
+function fileExists(p: string | undefined): boolean {
+  if (!p) return false;
+  try {
+    return existsSync(p);
+  } catch {
+    return false;
+  }
+}
+
+/** True when a token looks like a filesystem path (has a separator or a drive). */
+function looksLikePath(s: string): boolean {
+  return /[\\/]/.test(s) || /^[a-zA-Z]:/.test(s);
+}
+
+/**
+ * Can we actually relaunch this instance? A restart must be atomic-ish: if we
+ * can't build (and validate) a relaunch command, we must NOT stop the running
+ * server — losing a restart is cheap, losing the server is not (issues
+ * #368/#370). For a Desktop app this also RESOLVES + validates the launcher exe
+ * (mutating `info.desktopExePath`) so the subsequent spawn uses a real path
+ * rather than a regex guess that never matched the current "Comfy Desktop"
+ * branding. For a script-based install it confirms the resolved interpreter and
+ * `main.py` exist on disk — catching a stale COMFYUI_PATH that points at an
+ * install with no runnable server.
+ */
+function assessRelaunch(info: ProcessInfo): { ok: boolean; reason?: string } {
+  if (info.isDesktopApp) {
+    if (IS_WIN) {
+      const exe = fileExists(info.desktopExePath)
+        ? info.desktopExePath
+        : findDesktopExeFromCommonPaths();
+      if (!exe || !fileExists(exe)) {
+        return {
+          ok: false,
+          reason:
+            "Could not determine (or locate on disk) the ComfyUI Desktop executable to relaunch.",
+        };
+      }
+      info.desktopExePath = exe;
+      return { ok: true };
+    }
+    // macOS: relaunch via `open -a`, which accepts an app bundle path or name.
+    // Prefer a bundle that still exists on disk; fall back to a located one.
+    const appPath = fileExists(info.desktopExePath)
+      ? info.desktopExePath
+      : findDesktopExeFromCommonPaths();
+    if (!appPath || !fileExists(appPath)) {
+      return {
+        ok: false,
+        reason:
+          "Could not determine (or locate on disk) the ComfyUI Desktop app to relaunch.",
+      };
+    }
+    info.desktopExePath = appPath;
+    return { ok: true };
+  }
+
+  const cmd = resolveLaunchCommand(info);
+  if (!cmd) {
+    return {
+      ok: false,
+      reason:
+        "Could not build a relaunch command from the running server's launch arguments.",
+    };
+  }
+  if (looksLikePath(cmd.exe) && !fileExists(cmd.exe)) {
+    return {
+      ok: false,
+      reason: `Resolved Python interpreter does not exist on disk: ${cmd.exe}.`,
+    };
+  }
+  const script = cmd.args[0];
+  if (script && /\.pyw?$/i.test(script) && looksLikePath(script) && !fileExists(script)) {
+    return {
+      ok: false,
+      reason:
+        `Resolved ComfyUI script does not exist on disk: ${script} — ` +
+        "COMFYUI_PATH may point at a stale/old install that has no runnable server.",
+    };
+  }
+  return { ok: true };
+}
+
+/**
+ * Resolve the running instance to control: ComfyUI's /system_stats argv + the
+ * PID on the port, falling back to OS-level Desktop-app detection when the API
+ * and port are unreachable. Returns null when nothing can be found.
+ */
+async function acquireProcessInfo(): Promise<ProcessInfo | null> {
+  try {
+    return await gatherProcessInfo();
+  } catch {
+    const desktopPids = findDesktopAppPids();
+    if (desktopPids.length > 0) {
+      logger.info(
+        `API unreachable but found Desktop app PIDs: ${desktopPids.join(", ")}`,
+      );
+      return {
+        pid: desktopPids[0],
+        port: config.resolvedPort,
+        argv: [],
+        isDesktopApp: true,
+        desktopExePath: findDesktopExeFromCommonPaths(),
+      };
+    }
+    return null;
+  }
+}
+
 function handleSupervisedChildStop(
   child: ChildProcess,
   reason: {
@@ -646,7 +760,7 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
 // Public API
 // ---------------------------------------------------------------------------
 
-export async function stopComfyUI(): Promise<StopResult> {
+export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
   if (isRemoteMode()) {
     throw new ProcessControlError(
       "stop_comfyui operates on the local machine's ComfyUI process and is not " +
@@ -656,33 +770,15 @@ export async function stopComfyUI(): Promise<StopResult> {
   logger.info("Stopping ComfyUI...");
   detachSupervisor();
 
-  // Gather info before we kill it
-  let info: ProcessInfo;
-  try {
-    info = await gatherProcessInfo();
-  } catch (err) {
-    // API and port are dead — try OS-level Desktop app detection
-    const desktopPids = findDesktopAppPids();
-    if (desktopPids.length > 0) {
-      logger.info(`API unreachable but found Desktop app PIDs: ${desktopPids.join(", ")}`);
-      const port = config.resolvedPort;
-      info = {
-        pid: desktopPids[0],
-        port,
-        argv: [],
-        isDesktopApp: true,
-        desktopExePath: findDesktopExeFromCommonPaths(),
-      };
-    } else {
-      return {
-        stopped: false,
-        message:
-          err instanceof ProcessControlError
-            ? err.message
-            : `Failed to find ComfyUI process: ${err}`,
-        has_restart_info: false,
-      };
-    }
+  // Gather info before we kill it (or reuse the caller's pre-validated info so a
+  // relaunch preflight in restartComfyUI is not discarded).
+  const info = preInfo ?? (await acquireProcessInfo());
+  if (!info) {
+    return {
+      stopped: false,
+      message: `No ComfyUI process found on port ${config.resolvedPort}. Is ComfyUI running?`,
+      has_restart_info: false,
+    };
   }
 
   // Save for later start
@@ -1015,8 +1111,33 @@ export async function restartComfyUI(): Promise<RestartResult> {
   }
   logger.info("Restarting ComfyUI...");
 
-  // Stop
-  const stopResult = await stopComfyUI();
+  // Preflight: resolve the RUNNING instance and confirm we can relaunch it
+  // BEFORE stopping anything. A restart must be atomic-ish — if the relaunch
+  // command can't be built/validated (stale COMFYUI_PATH, unknown Desktop exe),
+  // refuse and leave the server up rather than take it down with no way back
+  // (issues #368/#370).
+  const info = await acquireProcessInfo();
+  if (!info) {
+    return {
+      stopped: false,
+      started: false,
+      message: `No ComfyUI process found on port ${config.resolvedPort} to restart. Is ComfyUI running?`,
+    };
+  }
+  const relaunch = assessRelaunch(info);
+  if (!relaunch.ok) {
+    return {
+      stopped: false,
+      started: false,
+      message:
+        `Refusing to restart: ${relaunch.reason} ComfyUI was left running (not stopped) ` +
+        "so you don't lose the server. Fix the launch path (e.g. COMFYUI_PATH) and try again.",
+    };
+  }
+
+  // Stop — hand it the pre-validated info so the relaunch details (incl. the
+  // resolved Desktop exe) survive into startComfyUI's lastProcessInfo.
+  const stopResult = await stopComfyUI(info);
   if (!stopResult.stopped) {
     return {
       stopped: false,

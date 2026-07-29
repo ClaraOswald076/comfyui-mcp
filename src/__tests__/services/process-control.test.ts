@@ -24,6 +24,14 @@ vi.mock("node:child_process", () => ({
   spawn: mockSpawn,
 }));
 
+// assessRelaunch (restart preflight) validates the resolved interpreter/script
+// exist on disk. Default: everything exists; a test overrides for the stale-path
+// case.
+const mockExistsSync = vi.hoisted(() => vi.fn((_p: string) => true));
+vi.mock("node:fs", () => ({
+  existsSync: mockExistsSync,
+}));
+
 vi.mock("../../comfyui/client.js", () => ({
   getSystemStats: mockGetSystemStats,
   resetClient: mockResetClient,
@@ -41,6 +49,7 @@ vi.mock("../../services/env-capabilities.js", () => ({
 
 import {
   __processControlTestHooks,
+  restartComfyUI,
   startComfyUI,
   stopComfyUI,
 } from "../../services/process-control.js";
@@ -104,6 +113,7 @@ beforeEach(() => {
   mockConfig.resolvedPort = 8188;
   mockConfig.comfyuiPath = "/fake/ComfyUI";
   mockFindComfyuiPython.mockReturnValue("/fake/ComfyUI/python_embeded/python.exe");
+  mockExistsSync.mockImplementation(() => true);
   __processControlTestHooks.reset();
 });
 
@@ -129,7 +139,7 @@ describe("process-control startup readiness", () => {
       ready: true,
       timed_out: false,
       attempts: 1,
-      max_tries: 20,
+      max_tries: 60,
       interval_ms: 1000,
       waited_ms: expect.any(Number),
       probe_url: "http://127.0.0.1:8188/system_stats",
@@ -343,5 +353,74 @@ describe("process-control crash supervision", () => {
     expect(startResult.started).toBe(true);
     expect(mockSpawn).toHaveBeenCalledTimes(3);
     expect(children).toHaveLength(3);
+  });
+});
+
+describe("process-control restart relaunch preflight (#368/#370)", () => {
+  // execSync mock that reports a live PID on the port (so the running instance
+  // is found) but records any kill so a test can assert the server was NOT taken
+  // down.
+  function mockLivePortNoKill(): void {
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (cmd.includes("netstat"))
+        return "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
+      if (cmd.includes("lsof")) return "4321";
+      // tasklist (desktop detection), taskkill, `if exist`, etc. → nothing found
+      return "";
+    });
+  }
+
+  it("refuses to stop when the resolved script points at a stale install that doesn't exist", async () => {
+    mockLivePortNoKill();
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: ["C:\\stale\\ComfyUI\\main.py", "--port", "8188"] },
+    });
+    // The interpreter resolves and exists, but the stale main.py does not.
+    mockExistsSync.mockImplementation((p: string) => !/stale/i.test(p));
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(false);
+    expect(result.started).toBe(false);
+    expect(result.message).toMatch(/refusing to restart/i);
+    expect(result.message).toMatch(/stale/i);
+    // Server must be left running: no relaunch spawn, no kill, no client reset
+    // (resetClient only fires inside the stop path).
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(mockResetClient).not.toHaveBeenCalled();
+    expect(
+      mockExecSync.mock.calls.some(([c]) => /taskkill/i.test(String(c))),
+    ).toBe(false);
+    expect(killSpy).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  });
+
+  it("refuses to stop a Desktop app whose launcher exe cannot be located", async () => {
+    mockLivePortNoKill();
+    mockGetSystemStats.mockResolvedValue({
+      system: {
+        argv: [
+          "C:\\Users\\x\\AppData\\Local\\Programs\\Comfy Desktop\\resources\\ComfyUI\\main.py",
+          "--port",
+          "8188",
+        ],
+      },
+    });
+    // Nothing exists on disk — the Desktop exe cannot be located.
+    mockExistsSync.mockImplementation(() => false);
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(false);
+    expect(result.started).toBe(false);
+    expect(result.message).toMatch(/refusing to restart/i);
+    expect(result.message).toMatch(/desktop/i);
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(mockResetClient).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
   });
 });

@@ -17,6 +17,11 @@ import {
   parseInputDirFromArgv,
   localInputDirFallback,
   resolveInputDir,
+  parseBaseDirFromArgv,
+  parseModelsDirFromArgv,
+  parseExtraModelPathsConfigsFromArgv,
+  resolveModelsDir,
+  resolveServerExtraModelConfig,
 } from "../../services/output-dir.js";
 import { config } from "../../config.js";
 
@@ -149,6 +154,93 @@ describe("localInputDirFallback", () => {
   it("throws when COMFYUI_PATH is unset", () => {
     (config as { comfyuiPath?: string }).comfyuiPath = undefined;
     expect(() => localInputDirFallback()).toThrow(/COMFYUI_PATH/);
+  });
+});
+
+describe("models dir + extra-config argv parsing (#345/#346/#369)", () => {
+  it("parseBaseDirFromArgv reads --base-directory", () => {
+    const base = resolve("/C/COMFY");
+    expect(parseBaseDirFromArgv(["main.py", "--base-directory", base])).toBe(base);
+    expect(parseBaseDirFromArgv(["main.py", "--listen"])).toBeUndefined();
+  });
+
+  it("parseModelsDirFromArgv derives <base>/models", () => {
+    const base = resolve("/C/COMFY");
+    expect(parseModelsDirFromArgv(["main.py", "--base-directory", base])).toBe(
+      join(base, "models"),
+    );
+    expect(parseModelsDirFromArgv(["main.py"])).toBeUndefined();
+  });
+
+  it("parseModelsDirFromArgv lets --models-directory override <base>/models", () => {
+    const base = resolve("/C/COMFY");
+    const models = resolve("/D/models");
+    expect(
+      parseModelsDirFromArgv([
+        "main.py",
+        "--base-directory",
+        base,
+        "--models-directory",
+        models,
+      ]),
+    ).toBe(models);
+  });
+
+  it("parseExtraModelPathsConfigsFromArgv collects repeated AND multi-value flags (nargs='+', append)", () => {
+    const a = resolve("/cfg/shared_model_paths.yaml");
+    const b = resolve("/cfg/other.yaml");
+    const c = resolve("/cfg/third.yaml");
+    // repeated flag + `=value` form
+    expect(
+      parseExtraModelPathsConfigsFromArgv([
+        "main.py",
+        "--extra-model-paths-config",
+        a,
+        `--extra-model-paths-config=${b}`,
+      ]),
+    ).toEqual([a, b]);
+    // multiple values after a single flag, then another option
+    expect(
+      parseExtraModelPathsConfigsFromArgv([
+        "main.py",
+        "--extra-model-paths-config",
+        a,
+        b,
+        c,
+        "--port",
+        "8188",
+      ]),
+    ).toEqual([a, b, c]);
+    expect(parseExtraModelPathsConfigsFromArgv(["main.py"])).toEqual([]);
+  });
+
+  it("resolveModelsDir prefers the live server's --base-directory/models over COMFYUI_PATH", async () => {
+    const base = resolve("/C/COMFY");
+    getSystemStats.mockResolvedValue({
+      system: { argv: ["python", "main.py", "--base-directory", base] },
+    });
+    const got = await resolveModelsDir();
+    expect(got).toBe(join(base, "models"));
+    expect(got).not.toBe(resolve("/comfy", "models"));
+  });
+
+  it("resolveModelsDir falls back to <COMFYUI_PATH>/models when unreachable", async () => {
+    getSystemStats.mockRejectedValue(new Error("ECONNREFUSED"));
+    expect(await resolveModelsDir()).toBe(resolve("/comfy", "models"));
+  });
+
+  it("resolveServerExtraModelConfig returns the server's config file, undefined when absent", async () => {
+    const cfg = resolve("/cfg/shared_model_paths.yaml");
+    getSystemStats.mockResolvedValue({
+      system: { argv: ["python", "main.py", "--extra-model-paths-config", cfg] },
+    });
+    expect(await resolveServerExtraModelConfig()).toBe(cfg);
+
+    getSystemStats.mockResolvedValue({ system: { argv: ["python", "main.py"] } });
+    expect(await resolveServerExtraModelConfig()).toBeUndefined();
+
+    getSystemStats.mockRejectedValue(new Error("down"));
+    expect(await resolveServerExtraModelConfig()).toBeUndefined();
   });
 });
 

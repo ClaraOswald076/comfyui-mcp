@@ -35,6 +35,13 @@ vi.mock("node:fs/promises", () => ({
   utimes: vi.fn(),
 }));
 
+// downloadModel now roots the destination at the LIVE server's models dir
+// (resolveModelsDir, from /system_stats argv). Stub it to the COMFYUI_PATH-based
+// dir so these path-safety tests stay hermetic (no real ComfyUI connection).
+vi.mock("../../services/output-dir.js", () => ({
+  resolveModelsDir: vi.fn(async () => "/comfy/models"),
+}));
+
 import { config } from "../../config.js";
 import { downloadModel } from "../../services/model-resolver.js";
 import { ModelError } from "../../utils/errors.js";

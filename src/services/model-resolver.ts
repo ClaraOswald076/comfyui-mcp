@@ -11,6 +11,7 @@ import { ModelError, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { downloadWithCache } from "./download-cache.js";
 import { reportDownloadProgress } from "./download-progress.js";
+import { resolveModelsDir } from "./output-dir.js";
 import {
   applyDownloadAuth,
   redactUrlForLogs,
@@ -380,6 +381,36 @@ export function resolveModelSubfolder(targetSubfolder: string): string {
 }
 
 /**
+ * Like resolveModelSubfolder, but roots the destination at the CONNECTED
+ * server's real models directory (its `--base-directory`/models, read from
+ * /system_stats argv) rather than blindly at `<COMFYUI_PATH>/models`. On a
+ * ComfyUI Desktop install those diverge, so a download rooted at COMFYUI_PATH
+ * lands somewhere the live server never reads — reported success, model
+ * invisible (issues #346/#369). Falls back to `<COMFYUI_PATH>/models` when the
+ * server is unreachable or was not launched with `--base-directory`. Applies the
+ * same containment guard as the sync variant.
+ */
+export async function resolveModelSubfolderPreferServer(
+  targetSubfolder: string,
+): Promise<string> {
+  const raw = (targetSubfolder ?? "").trim();
+  if (!raw) {
+    throw new ModelError("target_subfolder is required (e.g. 'loras', 'checkpoints').");
+  }
+  if (isAbsolute(raw)) {
+    throw new ModelError(
+      `target_subfolder must be relative to models/, not absolute: ${raw}`,
+    );
+  }
+  const modelsRoot = resolve(await resolveModelsDir());
+  const targetDir = resolve(modelsRoot, raw);
+  if (targetDir !== modelsRoot && !targetDir.startsWith(modelsRoot + sep)) {
+    throw new ModelError(`Refusing to write outside the models directory: ${raw}`);
+  }
+  return targetDir;
+}
+
+/**
  * Resolve a relative-to-models path against a known root, keeping the result
  * strictly INSIDE that root. Rejects absolute inputs, "" / "." (the root
  * itself), and ".." traversal escapes. Shared by the primary and extra-root
@@ -638,7 +669,10 @@ export async function downloadModel(
     return downloadModelViaManagerRemote(url, targetSubfolder, filename, auth);
   }
 
-  const targetDir = resolveModelSubfolder(targetSubfolder);
+  // Root the destination at the LIVE server's models dir (its --base-directory),
+  // not blindly at COMFYUI_PATH/models — otherwise a Desktop install downloads
+  // into a stale checkout the running server never reads (#346/#369).
+  const targetDir = await resolveModelSubfolderPreferServer(targetSubfolder);
 
   // Ensure target directory exists
   await mkdir(targetDir, { recursive: true });

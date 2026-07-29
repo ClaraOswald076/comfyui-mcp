@@ -148,10 +148,11 @@ describe("restartComfyUI — remote (Manager reboot)", () => {
 
     const res = await restartComfyUI();
 
-    // Went down the local stop→start path (which reports it couldn't stop),
-    // never the Manager reboot path.
+    // Went down the local stop→start path (the relaunch preflight finds no
+    // running process to restart), never the Manager reboot path.
     expect(res.started).toBe(false);
-    expect(res.message).toContain("Could not stop");
+    expect(res.stopped).toBe(false);
+    expect(res.message).toContain("No ComfyUI process found");
     expect(findCall((p) => p.endsWith("/manager/reboot"))).toBeUndefined();
   });
 });

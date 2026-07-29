@@ -144,10 +144,23 @@ export async function getObjectInfo(): Promise<ObjectInfo> {
   if (objectInfoInflight) return objectInfoInflight;
 
   objectInfoInflight = (async () => {
-    const client = getClient();
-    const info = (await client.getNodeDefs()) as unknown as ObjectInfo;
-    objectInfoCache = info;
-    return info;
+    try {
+      const info = (await getClient().getNodeDefs()) as unknown as ObjectInfo;
+      objectInfoCache = info;
+      return info;
+    } catch (err) {
+      // A managed restart/reboot leaves the cached client bound to a socket that
+      // was torn down, so the first call after it surfaces a bare "fetch failed"
+      // (issue #376). Drop the stale client and retry once against a fresh one
+      // before giving up — this is exactly the reconnect the caller expects.
+      logger.warn("getObjectInfo failed; resetting client and retrying once", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      resetClient();
+      const info = (await getClient().getNodeDefs()) as unknown as ObjectInfo;
+      objectInfoCache = info;
+      return info;
+    }
   })();
 
   try {
