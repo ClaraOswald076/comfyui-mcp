@@ -68,6 +68,43 @@ interface Conn {
   /** Canvas-less client (mobile/remote pseudo-panel) — advertised in `hello`.
    *  Lets tools resolve media to inline bytes instead of a browser /view ref. */
   headless: boolean;
+  /** The sidebar panel's advertised version (`panel_version` in its `hello`), if
+   *  sent. Used to make an "Unknown command" reply from an OLD panel actionable
+   *  (see makeUnknownCommandError) — the panel gained these bridge commands in
+   *  0.11.4, so older builds reject graph_* / ui_* with a raw dispatch error. */
+  panelVersion?: string;
+}
+
+/** Panel build that first implements the full graph_* / ui_* bridge command set.
+ *  Reports of "Unknown command <x>" come from panels older than this. */
+export const MIN_PANEL_VERSION_FOR_BRIDGE_COMMANDS = "0.11.4";
+
+/**
+ * A panel replies `{ ok: false, error: 'Unknown command "<cmd>"' }` when the
+ * orchestrator dispatches a bridge command the (older) panel doesn't register —
+ * graph_query, ui_render, graph_serialize, graph_view_nodes_in_viewport, etc. all
+ * shipped in the panel at 0.11.4. Detect that raw dispatch error and rewrite it
+ * into an actionable "update your panel" message instead of surfacing the opaque
+ * internal command name to the agent/user. Returns null when `error` is anything
+ * else (a genuine command failure), so the happy/normal-error path is untouched.
+ */
+export function makeUnknownCommandError(
+  error: string,
+  panelVersion?: string,
+): Error | null {
+  // Match the panel's exact shape: `Unknown command "graph_query"` (quotes
+  // optional/variable). ANCHORED at the start of the (trimmed) message so an
+  // unrelated error that merely QUOTES an unknown-command phrase somewhere in its
+  // text is never rewritten — only the panel dispatcher's own reply, which is
+  // exactly this string. Case-insensitive, tolerant of straight or smart quotes.
+  const m = /^unknown command\s*["“']?([\w.-]+)["”']?/i.exec(error.trim());
+  if (!m) return null;
+  const cmd = m[1];
+  const detected = panelVersion ? ` (detected ${panelVersion})` : "";
+  return new Error(
+    `This ComfyUI-MCP panel is too old for "${cmd}"${detected} — update the ComfyUI-MCP panel ` +
+      `to ≥${MIN_PANEL_VERSION_FOR_BRIDGE_COMMANDS} (ComfyUI Manager → update comfyui-mcp panel), then reconnect.`,
+  );
 }
 
 export interface BridgeCommand {
@@ -539,6 +576,10 @@ export class UiBridge {
           title: typeof msg.title === "string" && msg.title ? msg.title : "untitled",
           connectedAt: existing?.connectedAt ?? new Date().toISOString(),
           headless: incomingHeadless,
+          panelVersion:
+            typeof (msg as { panel_version?: unknown }).panel_version === "string"
+              ? ((msg as { panel_version?: string }).panel_version || undefined)
+              : existing?.panelVersion,
         });
         if (incomingHeadless) this.headlessSeen.add(tabId);
         this.broadcastTabList(); // a tab connected/reconnected — refresh mirror pickers
@@ -883,6 +924,14 @@ export class UiBridge {
     }
     const rid = randomUUID();
     return new Promise((resolve, reject) => {
+      // Rewrite an old-panel "Unknown command" rejection into an actionable
+      // update-your-panel message (see makeUnknownCommandError). Applied to the
+      // reply-error path only; the happy path and genuine command errors are
+      // passed through untouched.
+      const rejectMapped = (err: Error) => {
+        const friendly = makeUnknownCommandError(err.message, conn.panelVersion);
+        reject(friendly ?? err);
+      };
       const timer = setTimeout(() => {
         this.pending.delete(rid);
         reject(
@@ -891,7 +940,12 @@ export class UiBridge {
           ),
         );
       }, timeoutMs);
-      const pending: Pending & { sock?: BridgeSocket } = { resolve, reject, timer, sock: conn.sock };
+      const pending: Pending & { sock?: BridgeSocket } = {
+        resolve,
+        reject: rejectMapped,
+        timer,
+        sock: conn.sock,
+      };
       this.pending.set(rid, pending);
       try {
         conn.sock.send(JSON.stringify({ rid, ...cmd }));
