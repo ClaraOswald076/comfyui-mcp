@@ -16,6 +16,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { logger } from "../utils/logger.js";
+import { errorText } from "./error-text.js";
 import type {
   AgentBackend,
   AgentEvent,
@@ -193,7 +194,7 @@ export const RECOMMENDED_OPENROUTER_MODELS: readonly RecommendedModel[] = [
 ];
 
 function msgOf(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  return errorText(err);
 }
 
 function textOf(result: McpCallResult): string {

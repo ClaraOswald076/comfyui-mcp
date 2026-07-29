@@ -42,6 +42,7 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import { logger } from "../utils/logger.js";
+import { errorText, promptText } from "./error-text.js";
 import { buildAgentSpawnEnv } from "../services/panel-secrets.js";
 import {
   type AgentBackend,
@@ -54,7 +55,7 @@ import {
 import type { ImageRef } from "./panel-agent.js";
 
 function msgOf(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  return errorText(err);
 }
 
 const configuredInterruptTimeoutMs = Number(process.env.COMFYUI_MCP_CODEX_INTERRUPT_TIMEOUT_MS);
@@ -1226,11 +1227,11 @@ export class CodexBackend implements AgentBackend {
     // FIRST-TURN PERSONA: the app-server has no thread-level instructions field,
     // so the panel system prompt is prepended to the first turn's input as a
     // clearly-marked system/context preamble (later turns send plain text).
-    let turnText = turn.text;
+    let turnText = promptText(turn.text);
     if (this.needsSystemPreamble && this.deps.systemAppend) {
       turnText =
         `<system>\n${this.deps.systemAppend}\n</system>\n\n` +
-        `The user's first message follows.\n\n${turn.text}`;
+        `The user's first message follows.\n\n${turnText}`;
       this.needsSystemPreamble = false;
     }
 

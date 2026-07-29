@@ -20,6 +20,7 @@ import type {
   McpSdkServerConfigWithInstance,
 } from "@anthropic-ai/claude-agent-sdk";
 import { logger } from "../utils/logger.js";
+import { errorText } from "./error-text.js";
 import { buildAgentSpawnEnv } from "../services/panel-secrets.js";
 import {
   type AgentBackend,
@@ -63,7 +64,7 @@ export async function loadQuery(): Promise<NonNullable<typeof queryFn>> {
 }
 
 function msgOf(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  return errorText(err);
 }
 
 /**

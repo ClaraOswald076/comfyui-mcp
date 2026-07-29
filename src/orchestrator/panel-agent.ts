@@ -23,6 +23,7 @@ import type {
   McpSdkServerConfigWithInstance,
 } from "@anthropic-ai/claude-agent-sdk";
 import { logger } from "../utils/logger.js";
+import { errorText } from "./error-text.js";
 import type { SessionStore } from "./session-store.js";
 import type { AgentBackend, AgentEvent, NeutralTurn } from "./agent-backend.js";
 import {
@@ -37,7 +38,7 @@ export type { ModelInfo, SlashCommand };
 export { fetchSupportedModels, fetchSupportedCommands };
 
 function msgOf(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  return errorText(err);
 }
 
 /** Idle window for the per-turn freeze watchdog: if a turn that's in flight

@@ -46,6 +46,7 @@
 
 import { ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
+import { errorText } from "./error-text.js";
 import type { AgentEvent, BackendStartOptions, NeutralTurn } from "./agent-backend.js";
 import { COPILOT_CAPABILITIES } from "./agent-backend.js";
 import { OllamaBackend, type OllamaBackendDeps } from "./ollama-backend.js";
@@ -57,7 +58,7 @@ import {
 import { assertAllowedTokenHost, OAUTH_PROVIDERS, redactTokens } from "../services/oauth-flow.js";
 
 function msgOf(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  return errorText(err);
 }
 
 /** GET endpoint that exchanges the long-lived `ghu_` token for a short-lived
