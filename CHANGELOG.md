@@ -6,6 +6,18 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.6] - 2026-07-29
+
+### MCP
+
+#### Fixed
+- change-guard set_config to stop a heartbeat feedback loop (#393)
+- surface filter/upstream failures instead of empty results (WS-6) (#381)
+- resolve live ComfyUI base dir for relaunch/model-dirs/extra-paths (WS-2) (#383)
+- auto-heal orphaned workflow-tab binding to prevent cross-tab writes (WS-1) (#382)
+- graceful message for graph_* commands unknown to old panels (WS-0) (#380)
+
+
 ## [0.48.5] - 2026-07-28
 
 ### MCP
