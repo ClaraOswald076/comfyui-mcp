@@ -120,7 +120,15 @@
     "ltx-video",
     "ai-agent",
     "comfyui-extension",
-    "workflow-automation"
+    "workflow-automation",
+    "ollama",
+    "local-llm",
+    "offline",
+    "self-hosted",
+    "gemini",
+    "openrouter",
+    "local-ai",
+    "byo-model"
   ],
   "author": "artokun",
   "license": "MIT",

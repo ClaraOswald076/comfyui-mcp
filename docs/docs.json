@@ -236,6 +236,15 @@
     "LTX video",
     "workflow",
     "AI agent",
-    "ComfyUI extension"
+    "ComfyUI extension",
+    "local ComfyUI agent",
+    "offline ComfyUI agent",
+    "self-hosted ComfyUI agent",
+    "ComfyUI Ollama",
+    "ComfyUI local LLM",
+    "ComfyUI agent no API key",
+    "ComfyUI local MCP",
+    "ComfyUI Gemini",
+    "run ComfyUI agent locally"
   ]
 }
