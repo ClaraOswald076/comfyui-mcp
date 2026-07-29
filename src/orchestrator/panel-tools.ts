@@ -1453,6 +1453,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // existing parseCreatorQuery path applies it (issue #374 — the tool used
           // to drop `creator` silently, echoing creator:null with zero results).
           const query = creator ? `@${creator}${rawQuery ? " " + rawQuery : " "}` : rawQuery;
+          // Self-heal an orphaned session before a raw bridge.send (matches every
+          // other direct-bridge call site) — without this an orphaned session
+          // wrongly returns "no connected tab" even when a live tab exists (#381).
+          ctx.ensureReachable?.();
           const reply = await ctx.bridge.send(
             { cmd: "civitai_search", query, filters: args.filters, browsingLevels } as { cmd: string },
             { tabId: ctx.tabId, timeoutMs: 10000 },

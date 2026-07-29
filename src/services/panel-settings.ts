@@ -105,14 +105,23 @@ export function getAgentSettings(): AgentSettings {
  * replaces the whole list (the panel sends the full edited list); `ollama`
  * fields merge per-key so e.g. a model change doesn't clobber the base URL.
  */
+/**
+ * Canonical form of a preferred-models list: trim, drop blanks, dedup, cap at 50.
+ * Exported so the set_config handler can compare an INCOMING list against the
+ * persisted one on the SAME footing — comparing a raw payload against this
+ * normalized list would report "changed" on every heartbeat and revive the
+ * config-repush loop (#393 follow-up).
+ */
+export function normalizePreferredModels(list: string[]): string[] {
+  return [...new Set(list.map((m) => m.trim()).filter(Boolean))].slice(0, 50);
+}
+
 export function setAgentSettings(patch: AgentSettings): AgentSettings {
   const settings = read();
   const prev = settings.agent ?? {};
   const next: AgentSettings = { ...prev };
   if (patch.preferredModels !== undefined) {
-    next.preferredModels = [
-      ...new Set(patch.preferredModels.map((m) => m.trim()).filter(Boolean)),
-    ].slice(0, 50);
+    next.preferredModels = normalizePreferredModels(patch.preferredModels);
   }
   if (patch.ollama !== undefined) {
     next.ollama = { ...prev.ollama, ...patch.ollama };

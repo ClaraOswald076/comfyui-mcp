@@ -100,7 +100,7 @@ import {
   warmLmstudio,
 } from "../services/lmstudio-lifecycle.js";
 import { llamacppProps, llamacppToolsReady } from "../services/llamacpp-probe.js";
-import { getAgentSettings, setAgentSettings } from "../services/panel-settings.js";
+import { getAgentSettings, setAgentSettings, normalizePreferredModels } from "../services/panel-settings.js";
 import {
   gatherEnvCapabilities,
   buildPanelSystemAppend,
@@ -2697,11 +2697,16 @@ export async function runPanelOrchestrator(): Promise<void> {
       const cfg = event as { preferred_models?: unknown; ollama?: unknown };
       let ollamaChanged = false;
       if (Array.isArray(cfg.preferred_models)) {
-        const ids = cfg.preferred_models.filter((m): m is string => typeof m === "string");
         // The panel re-sends set_config on EVERY heartbeat. Only apply + re-push on
         // an ACTUAL change — otherwise re-pushing models makes the panel re-send,
         // which re-pushes… a tight ~150/s feedback loop that wedges the orchestrator
         // (a multi-provider user hit exactly this). Mirror the stall_seconds guard.
+        // NORMALIZE the incoming list the SAME way persistence does before comparing,
+        // else a payload with whitespace/dupes never equals the stored (normalized)
+        // list and re-pushes forever, reviving the loop (#393 follow-up).
+        const ids = normalizePreferredModels(
+          cfg.preferred_models.filter((m): m is string => typeof m === "string"),
+        );
         const prevIds = getAgentSettings().preferredModels ?? [];
         if (ids.length !== prevIds.length || ids.some((v, i) => v !== prevIds[i])) {
           setAgentSettings({ preferredModels: ids });
