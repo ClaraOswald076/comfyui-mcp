@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import WebSocket, { WebSocketServer } from "ws";
-import { UiBridge } from "../../services/ui-bridge.js";
+import {
+  UiBridge,
+  makeUnknownCommandError,
+  MIN_PANEL_VERSION_FOR_BRIDGE_COMMANDS,
+} from "../../services/ui-bridge.js";
 
 let bridge: UiBridge;
 let port: number;
@@ -870,5 +874,55 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     await settle();
     const msg = seen.find((e) => e.type === "user_message" && e.text === "after-close");
     expect(msg?.tab_id).toBe("phone-c"); // reverted to own tab, not routed into the dead id
+  });
+});
+
+describe("makeUnknownCommandError (old-panel version gate)", () => {
+  it("rewrites an Unknown command reply into an actionable update message", () => {
+    const e = makeUnknownCommandError('Unknown command "graph_query"');
+    expect(e).not.toBeNull();
+    expect(e?.message).toContain("graph_query");
+    expect(e?.message).toContain(MIN_PANEL_VERSION_FOR_BRIDGE_COMMANDS);
+    expect(e?.message.toLowerCase()).toContain("update");
+    expect(e?.message.toLowerCase()).toContain("reconnect");
+    // The opaque raw internal error must not leak through.
+    expect(e?.message).not.toBe('Unknown command "graph_query"');
+  });
+
+  it("includes the detected panel version when known", () => {
+    const e = makeUnknownCommandError('Unknown command "ui_render"', "0.6.8");
+    expect(e?.message).toContain("0.6.8");
+  });
+
+  it("passes through a genuine command error (returns null)", () => {
+    expect(makeUnknownCommandError("node 5 not found")).toBeNull();
+    expect(makeUnknownCommandError("panel reported an error")).toBeNull();
+  });
+
+  it("tolerates smart quotes and varied casing", () => {
+    expect(makeUnknownCommandError("unknown command “graph_serialize”")?.message).toContain(
+      "graph_serialize",
+    );
+  });
+});
+
+describe("UiBridge.send (graceful gate end-to-end)", () => {
+  it("surfaces an actionable message (with panel version) when an old panel rejects a bridge command", async () => {
+    const sock = await connectPanel(undefined);
+    // Old panel: advertises its version, then rejects unknown bridge commands.
+    sock.send(JSON.stringify({ type: "hello", tab_id: "old-tab", title: "wf", panel_version: "0.6.8" }));
+    sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd) {
+        sock.send(
+          JSON.stringify({ rid: msg.rid, ok: false, error: `Unknown command "${msg.cmd}"` }),
+        );
+      }
+    });
+    await new Promise((r) => setTimeout(r, 50));
+
+    await expect(bridge.send({ cmd: "graph_query" }, { tabId: "old-tab" })).rejects.toThrow(
+      /too old for "graph_query".*0\.6\.8.*update/is,
+    );
   });
 });
