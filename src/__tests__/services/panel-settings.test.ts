@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   getAgentSettings,
   getNsfwConsent,
+  normalizePreferredModels,
   setAgentSettings,
   setNsfwConsent,
 } from "../../services/panel-settings.js";
@@ -95,5 +96,21 @@ describe("panel-settings agent model preferences", () => {
     setAgentSettings({ preferredModels: ["m:1"] });
     expect(getNsfwConsent().allowed).toBe(true);
     expect(getAgentSettings().preferredModels).toEqual(["m:1"]);
+  });
+});
+
+describe("normalizePreferredModels (#393 loop guard)", () => {
+  it("trims, drops blanks, dedupes, and caps at 50 — the same shape setAgentSettings persists", () => {
+    expect(normalizePreferredModels([" a ", "a", "", "  ", "b"])).toEqual(["a", "b"]);
+    expect(normalizePreferredModels(Array.from({ length: 60 }, (_, i) => `m${i}`)).length).toBe(50);
+  });
+
+  it("is idempotent, so a re-sent normalized list compares EQUAL (no heartbeat re-push)", () => {
+    const once = normalizePreferredModels([" x ", "x", "y"]);
+    expect(normalizePreferredModels(once)).toEqual(once);
+    // What the set_config guard actually compares: raw payload normalized vs the
+    // persisted (already-normalized) list must be equal when nothing changed.
+    setAgentSettings({ preferredModels: [" x ", "x", "y"] });
+    expect(getAgentSettings().preferredModels).toEqual(normalizePreferredModels([" x ", "x", "y"]));
   });
 });
