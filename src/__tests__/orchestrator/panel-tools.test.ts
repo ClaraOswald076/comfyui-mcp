@@ -559,10 +559,7 @@ describe("panel-tools: session tabId self-heal (#322 reload / #331 workflow-swit
     const { bridge, sent } = fakeBridge(new Set(["new-live-tab"]));
     const ctx = makePanelToolCtx(bridge, "dead-old-tab", store);
 
-    // Before rebind, a graph call to the dead tab fails.
-    const before = await defByName("panel_graph_outline").handler({}, ctx);
-    expect(before.isError).toBe(true);
-
+    // Explicit rebind (no prior graph call, so auto-heal hasn't fired yet).
     const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
     expect(res.isError).toBeUndefined();
     expect(ctx.tabId).toBe("new-live-tab");
@@ -573,6 +570,66 @@ describe("panel-tools: session tabId self-heal (#322 reload / #331 workflow-swit
     const after = await defByName("panel_graph_outline").handler({}, ctx);
     expect(after.isError).toBeUndefined();
     expect(sent.at(-1)?.tabId).toBe("new-live-tab");
+  });
+
+  // ---- Auto-heal: an orphaned current-mode session self-recovers on the next
+  // panel_* call, WITHOUT an explicit panel_set_workflow_target (#372/#178/#170/
+  // #165/#166/#195). Conservative: only when the current tab is unreachable AND a
+  // single active tab is unambiguous; healthy and pinned sessions stay strict.
+  it("auto-heals a DEAD current-mode session onto the sole live tab on the next call", async () => {
+    const store = new WorkflowTargetStore();
+    const { bridge, sent } = fakeBridge(new Set(["reconnected-tab"]));
+    const ctx = makePanelToolCtx(bridge, "stale-tmp-tab", store);
+
+    // No explicit rebind — a plain graph call recovers on its own.
+    const res = await defByName("panel_graph_outline").handler({}, ctx);
+    expect(res.isError).toBeUndefined();
+    expect(ctx.tabId).toBe("reconnected-tab");
+    expect(sent.at(-1)?.tabId).toBe("reconnected-tab");
+  });
+
+  it("does NOT auto-heal a HEALTHY session (no hijack of a live multi-tab deployment)", async () => {
+    const store = new WorkflowTargetStore();
+    const { bridge, sent } = fakeBridge(new Set(["my-tab", "other-tab"]));
+    const ctx = makePanelToolCtx(bridge, "my-tab", store);
+
+    const res = await defByName("panel_graph_outline").handler({}, ctx);
+    expect(res.isError).toBeUndefined();
+    expect(ctx.tabId).toBe("my-tab");
+    expect(sent.at(-1)?.tabId).toBe("my-tab");
+  });
+
+  it("does NOT auto-heal a PINNED session — it keeps requiring explicit rebind", async () => {
+    const store = new WorkflowTargetStore();
+    store.set("dead-pinned-tab", { mode: "pinned", path: "workflows/keep.json" });
+    const { bridge } = fakeBridge(new Set(["some-live-tab"]));
+    const ctx = makePanelToolCtx(bridge, "dead-pinned-tab", store);
+
+    const res = await defByName("panel_graph_outline").handler({}, ctx);
+    // Pinned + dead tab: no silent rebind, so the call surfaces the clear error.
+    expect(res.isError).toBe(true);
+    expect(ctx.tabId).toBe("dead-pinned-tab");
+  });
+
+  it("does NOT auto-heal into an AMBIGUOUS multi-tab set (dead tab, 2+ live, no last-active)", async () => {
+    const store = new WorkflowTargetStore();
+    const { bridge } = fakeBridge(new Set(["a", "b"]));
+    const ctx = makePanelToolCtx(bridge, "dead-tab", store);
+
+    const res = await defByName("panel_graph_outline").handler({}, ctx);
+    expect(res.isError).toBe(true); // bridge's own "no connected tab" error
+    expect(ctx.tabId).toBe("dead-tab"); // never silently hijacked
+  });
+
+  it("auto-heals the direct-send adult-consent path (#372)", async () => {
+    const store = new WorkflowTargetStore();
+    const { bridge, sent } = fakeBridge(new Set(["live-again-tab"]));
+    const ctx = makePanelToolCtx(bridge, "orphaned-tab", store);
+
+    await defByName("panel_request_adult_consent").handler({}, ctx);
+    expect(ctx.tabId).toBe("live-again-tab");
+    // The ask_user consent card went to the healed tab, not the dead one.
+    expect(sent.at(-1)?.tabId).toBe("live-again-tab");
   });
 
   it("panel_reload rebinds a DEAD session onto the sole live tab, then forwards soft_reload there", async () => {
