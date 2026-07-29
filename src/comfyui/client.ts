@@ -368,9 +368,31 @@ export function getComfyUIPath(): string | undefined {
 
 export async function getLogs(): Promise<string[]> {
   if (isCloudMode()) return cloudClient.getLogs();
-  const client = getClient();
-  const res = await client.fetchApi("/internal/logs");
-  const text = await res.text();
+
+  // A managed/panel restart or Manager reboot leaves the cached client bound to
+  // a socket that was torn down, so the first /internal/logs call after it
+  // surfaces a bare "fetch failed" (issue #399) — regardless of any keyword the
+  // caller passed, since filtering happens after this fetch. Mirror the
+  // getObjectInfo reset-and-retry: drop the stale client and retry once against
+  // a fresh one before giving up, and surface the underlying error if it still
+  // fails so callers see more than "fetch failed".
+  let text: string;
+  try {
+    text = await getClient().fetchApi("/internal/logs").then((r) => r.text());
+  } catch (err) {
+    logger.warn("getLogs failed; resetting client and retrying once", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    resetClient();
+    try {
+      text = await getClient().fetchApi("/internal/logs").then((r) => r.text());
+    } catch (err2) {
+      const detail = err2 instanceof Error ? err2.message : String(err2);
+      throw new ConnectionError(
+        `Failed to fetch ComfyUI logs after reconnect retry: ${detail}`,
+      );
+    }
+  }
 
   // ComfyUI returns logs as a JSON-encoded string with \n separators,
   // or as raw text depending on version. Handle both.

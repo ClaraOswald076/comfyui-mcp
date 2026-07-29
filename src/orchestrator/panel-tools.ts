@@ -47,7 +47,12 @@ import { setComfyuiSecret, setAgentSecret, isAllowedAgentSecretKey } from "../se
 import { flattenUiWorkflow } from "../services/flatten-workflow.js";
 import { getNsfwConsent, setNsfwConsent } from "../services/panel-settings.js";
 import { QueueMonitor } from "../services/queue-monitor.js";
-import { getObjectInfo, backfillObjectInfo } from "../comfyui/client.js";
+import {
+  getObjectInfo,
+  backfillObjectInfo,
+  resetClient,
+  resetObjectInfoCache,
+} from "../comfyui/client.js";
 import { convertUiToApi, collectNodeTypes } from "../services/workflow-converter.js";
 import { sliceWorkflow } from "../services/workflow-slicer.js";
 import { validateA2UISpecServer } from "../services/a2ui-spec.js";
@@ -2048,7 +2053,17 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         ) {
           return ok("Cancelled — ComfyUI was not restarted.");
         }
-        return ctx.call({ cmd: "comfy_reboot", force: force === true }, 15000);
+        const res = await ctx.call({ cmd: "comfy_reboot", force: force === true }, 15000);
+        // A panel/Manager reboot restarts ComfyUI out-of-band from the MCP
+        // process-control path, so the orchestrator's WebSocket client and its
+        // memoized /object_info survive the restart and go stale: get_node_info
+        // then returns pre-restart schemas, model dropdowns, and required/optional
+        // placement (#353/#378/#394), and newly installed nodes stay invisible
+        // (#357). The reboot is the triggering event — drop both caches here so
+        // the next call refetches against the fresh server.
+        resetClient();
+        resetObjectInfoCache();
+        return res;
       },
     ),
     def(
