@@ -170,6 +170,31 @@ describe("downloadModel cache", () => {
     await expect(readFile(target, "utf-8")).resolves.toBe("full body from server");
   });
 
+  it("rejects a truncated download (Content-Length exceeds bytes received) instead of reporting success (#343)", async () => {
+    // Stream body yields only "short" (5 bytes) but the server claims 1000 —
+    // pipeline() resolves on the early end, so without the size check this would
+    // be saved + reported as a complete download.
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) { c.enqueue(new TextEncoder().encode("short")); c.close(); },
+    });
+    fetchMock.mockResolvedValueOnce(
+      new Response(stream, { status: 200, statusText: "OK", headers: { "content-length": "1000" } }),
+    );
+    await expect(
+      downloadModel("https://example.com/models/trunc.safetensors", "checkpoints", "trunc.safetensors"),
+    ).rejects.toThrow(/truncat/i);
+  });
+
+  it("rejects and removes a 0-byte download (source sent no data) (#343)", async () => {
+    fetchMock.mockResolvedValueOnce(new Response("", { status: 200, statusText: "OK" }));
+    await expect(
+      downloadModel("https://example.com/models/empty.safetensors", "checkpoints", "empty.safetensors"),
+    ).rejects.toThrow(/0-byte/i);
+    // The empty file must not linger in the cache to masquerade as a real download.
+    const cached = await readdir(cacheDir).catch(() => [] as string[]);
+    expect(cached.some((f) => f.endsWith(".safetensors"))).toBe(false);
+  });
+
   it("evicts least-recently-used cache files when the optional limit is exceeded", async () => {
     process.env.COMFYUI_LRU_CACHE_SIZE_GB = String(12 / 1024 / 1024 / 1024);
     await fsPromises.mkdir(cacheDir, { recursive: true });

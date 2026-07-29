@@ -170,17 +170,49 @@ async function streamUrlToFile(
   const nodeStream = Readable.fromWeb(res.body as import("node:stream/web").ReadableStream);
   const fileStream = createWriteStream(targetPath, { flags });
 
+  // Content-Length is the REMAINING bytes for a 206 resume, so add the bytes
+  // already on disk to get the true expected total.
+  const lengthHeader = Number(res.headers.get("content-length") || 0);
+  const expectedTotal = lengthHeader > 0 ? lengthHeader + (appendMode ? resumeFromBytes : 0) : 0;
+
+  // A pipeline() can resolve on a stream that ended EARLY (server dropped the
+  // connection, proxy cut it, disk edge case) — leaving a 0-byte or truncated
+  // file that would otherwise be reported as a successful download (#343: silent
+  // model corruption). Verify the written size before we ever return success.
+  const assertComplete = async (): Promise<void> => {
+    let actual = 0;
+    try {
+      actual = (await stat(targetPath)).size;
+    } catch {
+      actual = 0;
+    }
+    if (actual === 0) {
+      // Nothing landed — remove it so it can't masquerade as a real file / poison resume.
+      await rm(targetPath, { force: true }).catch(() => {});
+      throw new ModelError(
+        "Download produced a 0-byte file — the source sent no data. Removed it; retry.",
+        { url: logUrl },
+      );
+    }
+    if (expectedTotal > 0 && actual < expectedTotal) {
+      // Truncated. Keep the partial on disk so a later call can range-resume it,
+      // but do NOT report this as a completed download.
+      throw new ModelError(
+        `Download truncated: wrote ${actual} of ${expectedTotal} bytes — the stream ended early. Not complete; retry to resume.`,
+        { url: logUrl },
+      );
+    }
+  };
+
   // No progress wanted (internal/cache caller, or not under the panel) → straight pipe.
   if (!progress) {
     await pipeline(nodeStream, fileStream);
+    await assertComplete();
     return;
   }
 
-  // Tally bytes as they flow and report throughput to the panel tray. Content-
-  // Length is the REMAINING bytes for a 206 resume, so add the bytes already on
-  // disk to get the true total.
-  const lengthHeader = Number(res.headers.get("content-length") || 0);
-  const total = lengthHeader > 0 ? lengthHeader + (appendMode ? resumeFromBytes : 0) : 0;
+  // Tally bytes as they flow and report throughput to the panel tray.
+  const total = expectedTotal;
   let downloaded = appendMode ? resumeFromBytes : 0;
   let windowStart = Date.now();
   let windowBytes = downloaded;
@@ -207,6 +239,7 @@ async function streamUrlToFile(
   });
   try {
     await pipeline(nodeStream, counter, fileStream);
+    await assertComplete();
     bytesPerSec = 0;
     emit("done", true);
   } catch (err) {
