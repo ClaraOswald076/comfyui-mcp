@@ -23,7 +23,9 @@ import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
 
 type Forwarded = Record<string, unknown>;
 
-function makeFakeCtx(): { ctx: PanelToolCtx; calls: Forwarded[] } {
+function makeFakeCtx(
+  bridgeReply?: unknown,
+): { ctx: PanelToolCtx; calls: Forwarded[] } {
   const calls: Forwarded[] = [];
   const ctx: PanelToolCtx = {
     call: async (cmd) => {
@@ -31,7 +33,15 @@ function makeFakeCtx(): { ctx: PanelToolCtx; calls: Forwarded[] } {
       return { content: [{ type: "text", text: JSON.stringify(cmd) }] };
     },
     confirm: async () => true,
-    bridge: {} as PanelToolCtx["bridge"],
+    // Some tools (panel_civitai_search) go through the raw bridge so they can
+    // inspect the panel's reply. Record the forwarded cmd on the same `calls`
+    // array and hand back a caller-supplied reply.
+    bridge: {
+      send: async (cmd: Forwarded) => {
+        calls.push(cmd);
+        return bridgeReply ?? {};
+      },
+    } as unknown as PanelToolCtx["bridge"],
     tabId: "test-tab",
   };
   return { ctx, calls };
@@ -788,7 +798,7 @@ describe("panel-tools: agent-driven CivitAI + training modals", () => {
   });
 
   it("panel_civitai_search forwards query + filters", async () => {
-    const { ctx, calls } = makeFakeCtx();
+    const { ctx, calls } = makeFakeCtx({ creator: null });
     await defByName("panel_civitai_search").handler(
       { query: "ghibli", filters: { baseModels: ["Flux.1 D"] } },
       ctx,
@@ -798,6 +808,55 @@ describe("panel-tools: agent-driven CivitAI + training modals", () => {
       query: "ghibli",
       filters: { baseModels: ["Flux.1 D"] },
     });
+  });
+
+  it("panel_civitai_search folds a creator into the query as an @creator token (#374)", async () => {
+    const { ctx, calls } = makeFakeCtx({ creator: "tenstrip" });
+    await defByName("panel_civitai_search").handler(
+      { query: "portrait", creator: "@tenstrip" },
+      ctx,
+    );
+    // Leading @ is stripped/normalized, then re-prefixed so the panel's
+    // parseCreatorQuery applies the username filter.
+    expect(calls[0]).toMatchObject({ cmd: "civitai_search", query: "@tenstrip portrait" });
+  });
+
+  it("panel_civitai_search browses a creator with an empty query (@creator + trailing space)", async () => {
+    const { ctx, calls } = makeFakeCtx({ creator: "tenstrip" });
+    await defByName("panel_civitai_search").handler({ query: "", creator: "tenstrip" }, ctx);
+    expect(calls[0]).toMatchObject({ cmd: "civitai_search", query: "@tenstrip " });
+  });
+
+  it("panel_civitai_search WARNS when a requested creator was not applied (creator:null) — #374", async () => {
+    // Panel echoes creator:null → the filter never took. The tool must surface an
+    // explicit warning so the empty grid is not read as 'creator has no content'.
+    const { ctx } = makeFakeCtx({ creator: null, total: 0, items: [] });
+    const res = await defByName("panel_civitai_search").handler(
+      { query: "", creator: "media-only-person" },
+      ctx,
+    );
+    const text = res.content.map((c) => ("text" in c ? c.text : "")).join("");
+    expect(text).toContain("was NOT applied");
+    expect(text.toLowerCase()).toContain("media-only-person".toLowerCase());
+  });
+
+  it("panel_civitai_search does NOT warn when the creator was honored", async () => {
+    const { ctx } = makeFakeCtx({ creator: "tenstrip", total: 3, items: [] });
+    const res = await defByName("panel_civitai_search").handler(
+      { query: "", creator: "TenStrip" }, // case-insensitive match
+      ctx,
+    );
+    const text = res.content.map((c) => ("text" in c ? c.text : "")).join("");
+    expect(text).not.toContain("was NOT applied");
+  });
+
+  it("panel_open_civitai folds a creator into the query too (#374)", async () => {
+    const { ctx, calls } = makeFakeCtx();
+    await defByName("panel_open_civitai").handler(
+      { query: "flux", creator: "someone", tab: "images" },
+      ctx,
+    );
+    expect(calls[0]).toMatchObject({ cmd: "open_civitai", query: "@someone flux" });
   });
 
   it("panel_training_get_state forwards training_get_state with no args", async () => {
