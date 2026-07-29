@@ -44,6 +44,7 @@
             "pages": [
               "index",
               "quickstart",
+              "local-vs-comfy-cloud",
               "installation",
               "roadmap"
             ]
@@ -245,6 +246,11 @@
     "ComfyUI agent no API key",
     "ComfyUI local MCP",
     "ComfyUI Gemini",
-    "run ComfyUI agent locally"
+    "run ComfyUI agent locally",
+    "Comfy In-App Agent alternative",
+    "Comfy Cloud MCP alternative",
+    "ComfyUI agent without cloud account",
+    "local ComfyUI MCP vs Comfy Cloud",
+    "self-hosted ComfyUI agent alternative"
   ]
 }
