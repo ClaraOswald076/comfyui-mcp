@@ -56,6 +56,95 @@ export function parseOutputDirFromArgv(argv: string[] | undefined): string | und
   return undefined;
 }
 
+/**
+ * Parse the running server's base directory (`--base-directory`) out of its
+ * launch argv. This is the authoritative root ComfyUI derives models/, input/,
+ * output/, and user/ from — on a Desktop install it commonly points at a drive
+ * entirely different from COMFYUI_PATH (the code checkout). Returns undefined
+ * when the flag is absent.
+ */
+export function parseBaseDirFromArgv(argv: string[] | undefined): string | undefined {
+  if (!argv || argv.length === 0) return undefined;
+  let baseDir: string | undefined;
+  for (let i = 0; i < argv.length; i++) {
+    baseDir = flagValue(argv, i, "--base-directory") ?? baseDir;
+  }
+  return baseDir ? resolveDir(baseDir) : undefined;
+}
+
+/**
+ * Parse the models directory the running server actually reads from. ComfyUI has
+ * no dedicated `--models-directory` flag; the models root is `<base>/models`
+ * when `--base-directory` is set. Returns undefined when the flag is absent.
+ */
+export function parseModelsDirFromArgv(argv: string[] | undefined): string | undefined {
+  const base = parseBaseDirFromArgv(argv);
+  return base ? join(base, "models") : undefined;
+}
+
+/**
+ * Parse every `--extra-model-paths-config` value out of the launch argv (the
+ * flag may be repeated). This is the config file the running server actually
+ * loads extra model search paths from — on ComfyUI Desktop it is an
+ * auto-generated `…\Comfy Desktop\shared_model_paths.yaml`, NOT the app-data
+ * `ComfyUI\extra_models_config.yaml` the tools historically guessed. Returns []
+ * when the flag is absent.
+ */
+export function parseExtraModelPathsConfigsFromArgv(argv: string[] | undefined): string[] {
+  if (!argv || argv.length === 0) return [];
+  const out: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const v = flagValue(argv, i, "--extra-model-paths-config");
+    if (v) out.push(resolveDir(v));
+  }
+  return out;
+}
+
+/**
+ * Resolve the models directory the CONNECTED server actually reads from. Asks
+ * the running ComfyUI (/system_stats argv → `--base-directory`) first; falls
+ * back to `<COMFYUI_PATH>/models`. This is the source of truth for
+ * download_model's destination so files land where the live server sees them
+ * (issues #346/#369) rather than in a stale COMFYUI_PATH install.
+ */
+export async function resolveModelsDir(): Promise<string> {
+  try {
+    const stats = await getSystemStats();
+    const fromArgv = parseModelsDirFromArgv(stats.system?.argv);
+    if (fromArgv) {
+      logger.debug("Resolved ComfyUI models directory from launch argv", {
+        modelsDir: fromArgv,
+      });
+      return fromArgv;
+    }
+  } catch (err) {
+    logger.debug(
+      "Could not resolve models dir from /system_stats; using COMFYUI_PATH/models",
+      { error: err instanceof Error ? err.message : String(err) },
+    );
+  }
+  if (!config.comfyuiPath) {
+    throw new ValidationError(
+      "COMFYUI_PATH is not configured. Set the COMFYUI_PATH environment variable.",
+    );
+  }
+  return resolve(config.comfyuiPath, "models");
+}
+
+/**
+ * Best-effort: the running server's `--extra-model-paths-config` file, or
+ * undefined when unreachable / not launched with the flag. Never throws.
+ */
+export async function resolveServerExtraModelConfig(): Promise<string | undefined> {
+  try {
+    const stats = await getSystemStats();
+    const configs = parseExtraModelPathsConfigsFromArgv(stats.system?.argv);
+    return configs[0];
+  } catch {
+    return undefined;
+  }
+}
+
 /** <COMFYUI_PATH>/output fallback. Throws if COMFYUI_PATH is unset. */
 export function localOutputDirFallback(): string {
   if (!config.comfyuiPath) {

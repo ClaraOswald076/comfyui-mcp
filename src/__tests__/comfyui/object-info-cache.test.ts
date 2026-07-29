@@ -62,9 +62,22 @@ describe("getObjectInfo memoization", () => {
     expect(getNodeDefs).toHaveBeenCalledTimes(2);
   });
 
-  it("does not cache a failed fetch", async () => {
+  it("does not cache a failed fetch (both the call and its one-shot retry fail)", async () => {
+    // A transport failure now triggers one client-reset + retry (#376); when the
+    // retry also fails the call rejects and nothing is cached.
+    getNodeDefs.mockRejectedValueOnce(new Error("ECONNREFUSED"));
     getNodeDefs.mockRejectedValueOnce(new Error("ECONNREFUSED"));
     await expect(getObjectInfo()).rejects.toThrow("ECONNREFUSED");
+    expect(getNodeDefs).toHaveBeenCalledTimes(2);
+    // Failure was not cached — a later call refetches and can succeed.
+    getNodeDefs.mockResolvedValueOnce({ KSampler: {} });
+    await expect(getObjectInfo()).resolves.toEqual({ KSampler: {} });
+  });
+
+  it("recovers a stale post-restart client by resetting and retrying once (#376)", async () => {
+    // First call fails on the stale (torn-down) client; the retry against a
+    // fresh client succeeds, so the caller never sees the bare "fetch failed".
+    getNodeDefs.mockRejectedValueOnce(new Error("fetch failed"));
     getNodeDefs.mockResolvedValueOnce({ KSampler: {} });
     await expect(getObjectInfo()).resolves.toEqual({ KSampler: {} });
     expect(getNodeDefs).toHaveBeenCalledTimes(2);
