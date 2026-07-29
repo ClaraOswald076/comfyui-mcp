@@ -73,20 +73,46 @@ export function parseBaseDirFromArgv(argv: string[] | undefined): string | undef
 }
 
 /**
- * Parse the models directory the running server actually reads from. ComfyUI has
- * no dedicated `--models-directory` flag; the models root is `<base>/models`
- * when `--base-directory` is set. Returns undefined when the flag is absent.
+ * Parse the models directory the running server actually reads from. ComfyUI's
+ * `--models-directory` overrides the models folder in `--base-directory`, so it
+ * wins; otherwise the models root is `<base>/models`. Returns undefined when
+ * neither flag is present.
  */
 export function parseModelsDirFromArgv(argv: string[] | undefined): string | undefined {
+  if (!argv || argv.length === 0) return undefined;
   const base = parseBaseDirFromArgv(argv);
+  let modelsDir: string | undefined;
+  for (let i = 0; i < argv.length; i++) {
+    modelsDir = flagValue(argv, i, "--models-directory") ?? modelsDir;
+  }
+  if (modelsDir) return resolveDir(modelsDir, base);
   return base ? join(base, "models") : undefined;
 }
 
 /**
- * Parse every `--extra-model-paths-config` value out of the launch argv (the
- * flag may be repeated). This is the config file the running server actually
- * loads extra model search paths from — on ComfyUI Desktop it is an
- * auto-generated `…\Comfy Desktop\shared_model_paths.yaml`, NOT the app-data
+ * Collect all values that follow `flag` at position `index`, supporting both
+ * `--flag a b` (argparse nargs='+') and `--flag=a`. Consumes consecutive tokens
+ * until the next `--option`. Returns [] when the token at `index` isn't `flag`.
+ */
+function multiFlagValues(argv: string[], index: number, flag: string): string[] {
+  const token = argv[index];
+  if (token.startsWith(`${flag}=`)) return [token.slice(flag.length + 1)];
+  if (token !== flag) return [];
+  const values: string[] = [];
+  for (let j = index + 1; j < argv.length; j++) {
+    if (argv[j].startsWith("--")) break;
+    values.push(argv[j]);
+  }
+  return values;
+}
+
+/**
+ * Parse every `--extra-model-paths-config` value out of the launch argv. ComfyUI
+ * declares this flag as `nargs='+', action='append'`, so it can carry multiple
+ * files per occurrence AND be repeated — both forms are collected here. This is
+ * the config file(s) the running server actually loads extra model search paths
+ * from — on ComfyUI Desktop it is an auto-generated
+ * `…\Comfy Desktop\shared_model_paths.yaml`, NOT the app-data
  * `ComfyUI\extra_models_config.yaml` the tools historically guessed. Returns []
  * when the flag is absent.
  */
@@ -94,8 +120,9 @@ export function parseExtraModelPathsConfigsFromArgv(argv: string[] | undefined):
   if (!argv || argv.length === 0) return [];
   const out: string[] = [];
   for (let i = 0; i < argv.length; i++) {
-    const v = flagValue(argv, i, "--extra-model-paths-config");
-    if (v) out.push(resolveDir(v));
+    for (const v of multiFlagValues(argv, i, "--extra-model-paths-config")) {
+      out.push(resolveDir(v));
+    }
   }
   return out;
 }

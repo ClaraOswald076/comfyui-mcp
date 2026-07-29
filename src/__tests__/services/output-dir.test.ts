@@ -172,9 +172,25 @@ describe("models dir + extra-config argv parsing (#345/#346/#369)", () => {
     expect(parseModelsDirFromArgv(["main.py"])).toBeUndefined();
   });
 
-  it("parseExtraModelPathsConfigsFromArgv collects every --extra-model-paths-config", () => {
+  it("parseModelsDirFromArgv lets --models-directory override <base>/models", () => {
+    const base = resolve("/C/COMFY");
+    const models = resolve("/D/models");
+    expect(
+      parseModelsDirFromArgv([
+        "main.py",
+        "--base-directory",
+        base,
+        "--models-directory",
+        models,
+      ]),
+    ).toBe(models);
+  });
+
+  it("parseExtraModelPathsConfigsFromArgv collects repeated AND multi-value flags (nargs='+', append)", () => {
     const a = resolve("/cfg/shared_model_paths.yaml");
     const b = resolve("/cfg/other.yaml");
+    const c = resolve("/cfg/third.yaml");
+    // repeated flag + `=value` form
     expect(
       parseExtraModelPathsConfigsFromArgv([
         "main.py",
@@ -183,6 +199,18 @@ describe("models dir + extra-config argv parsing (#345/#346/#369)", () => {
         `--extra-model-paths-config=${b}`,
       ]),
     ).toEqual([a, b]);
+    // multiple values after a single flag, then another option
+    expect(
+      parseExtraModelPathsConfigsFromArgv([
+        "main.py",
+        "--extra-model-paths-config",
+        a,
+        b,
+        c,
+        "--port",
+        "8188",
+      ]),
+    ).toEqual([a, b, c]);
     expect(parseExtraModelPathsConfigsFromArgv(["main.py"])).toEqual([]);
   });
 

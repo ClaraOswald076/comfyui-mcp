@@ -586,11 +586,15 @@ function assessRelaunch(info: ProcessInfo): { ok: boolean; reason?: string } {
       return { ok: true };
     }
     // macOS: relaunch via `open -a`, which accepts an app bundle path or name.
-    const appPath = info.desktopExePath ?? findDesktopExeFromCommonPaths();
-    if (!appPath) {
+    // Prefer a bundle that still exists on disk; fall back to a located one.
+    const appPath = fileExists(info.desktopExePath)
+      ? info.desktopExePath
+      : findDesktopExeFromCommonPaths();
+    if (!appPath || !fileExists(appPath)) {
       return {
         ok: false,
-        reason: "Could not determine the ComfyUI Desktop app to relaunch.",
+        reason:
+          "Could not determine (or locate on disk) the ComfyUI Desktop app to relaunch.",
       };
     }
     info.desktopExePath = appPath;
