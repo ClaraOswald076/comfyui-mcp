@@ -802,6 +802,38 @@ describe("downloadModel cache", () => {
     await expect(readFile(two, "utf-8")).resolves.toBe("SHARED-BYTES");
   });
 
+  it("preserves the physical download's resume diagnostic for a COALESCED same-key consumer (#467 P1-b)", async () => {
+    const { downloadWithCache, getResumeDiagnostic } = await import(
+      "../../services/download-cache.js"
+    );
+    const { trayIdForUrl } = await import("../../services/download-resume-diag.js");
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    await fsPromises.mkdir(comfyDir, { recursive: true });
+    const url = "https://example.com/models/coalesce-diag.safetensors";
+    const { createHash } = await import("node:crypto");
+    const hash = createHash("sha256").update(url).digest("hex").slice(0, 32);
+    // Validator-less partial → the ONE physical download declines + records.
+    await writeFile(join(cacheDir, `.${hash}.safetensors.partial`), "OLDPARTIALBYTES");
+
+    // A single, initially-pending fetch — both callers coalesce onto it.
+    let release!: (r: Response) => void;
+    fetchMock.mockReturnValueOnce(
+      new Promise<Response>((res) => {
+        release = res;
+      }),
+    );
+
+    const a = downloadWithCache({ url, headers: {}, targetPath: join(comfyDir, "a.safetensors") });
+    const b = downloadWithCache({ url, headers: {}, targetPath: join(comfyDir, "b.safetensors") });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1)); // coalesced to ONE fetch
+    release(okResponse("FRESHFULLBODY"));
+    await Promise.all([a, b]);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    // The coalesced second consumer must NOT have wiped the recorded decision.
+    expect(getResumeDiagnostic(trayIdForUrl(url))?.outcome).toBe("declined:no-validator");
+  });
+
   it("gives same-URL DIFFERENT-auth downloads DISTINCT resume-diagnostic slots (#467 P2)", async () => {
     const { resumeKeyFor, recordResumeDiagnostic, getResumeDiagnostic, trayIdForUrl } =
       await import("../../services/download-resume-diag.js");

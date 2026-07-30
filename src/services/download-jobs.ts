@@ -21,7 +21,7 @@ import {
   shouldDispatchDownloadToManager,
 } from "./model-resolver.js";
 import type { DownloadAuth } from "./download-auth.js";
-import { clearResumeDiagnostic, resumeKeyFor } from "./download-resume-diag.js";
+import { resumeKeyFor } from "./download-resume-diag.js";
 import { logger } from "../utils/logger.js";
 
 export interface DownloadJob {
@@ -240,13 +240,11 @@ export async function startDownloadJob(
   // Representation-aware diagnostic slot: same URL + different auth ⇒ different
   // physical cache download ⇒ different resume decision (#467 P2). The auth param
   // is the per-caller differentiator (config-global tokens are identical across
-  // concurrent calls, so they need not enter the key).
+  // concurrent calls, so they need not enter the key). The per-attempt RESET of
+  // this slot happens where a genuinely-new physical download begins (inside
+  // streamUrlToFile), NOT here — clearing here would wipe an in-flight download's
+  // recorded decision when THIS job merely coalesces onto it (#467 P1-b).
   const resumeKey = resumeKeyFor(url, auth ? JSON.stringify(auth) : undefined);
-
-  // A fresh attempt: clear any resume decision left by an EARLIER attempt for the
-  // same slot so download_status can only ever surface THIS attempt's outcome (a
-  // per-attempt reset — robust where a timestamp compare isn't; #467 P2).
-  clearResumeDiagnostic(resumeKey);
 
   const job: DownloadJob = {
     id,

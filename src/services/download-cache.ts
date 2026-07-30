@@ -20,7 +20,11 @@ import { ModelError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { redactUrlForLogs } from "./download-auth.js";
 import { reportDownloadProgress, type DownloadProgress } from "./download-progress.js";
-import { recordResumeDiagnostic, trayIdForUrl } from "./download-resume-diag.js";
+import {
+  clearResumeDiagnostic,
+  recordResumeDiagnostic,
+  trayIdForUrl,
+} from "./download-resume-diag.js";
 // Re-export the resume-diagnostic read/reset API so existing importers of
 // download-cache keep working; the registry itself now lives in a dep-light
 // module (download-resume-diag) to avoid pulling storage/* into consumers' mocks.
@@ -276,6 +280,13 @@ async function streamUrlToFile(
 ): Promise<void> {
   // The slot this download's resume decision is recorded under.
   const diagKey = resumeKey ?? trayIdForUrl(url);
+  // Per-attempt reset (#467 P2): a GENUINELY-NEW physical download clears any
+  // decision left by an EARLIER attempt for this slot, then records its own
+  // below. This lives HERE — the single physical-download entry point — not in
+  // startDownloadJob, so a job that merely COALESCES onto an in-flight download
+  // (downloadIntoCache's inflight map) never runs it and therefore can't wipe the
+  // active stream's recorded decision (#467 P1-b).
+  if (resumable) clearResumeDiagnostic(diagKey);
   if (supportsCloudDownload(url)) {
     await downloadCloudUrlToFile(url, targetPath, storageAuth);
     // #343 edge: the S3/Azure path bypasses the HTTP size gate below. The cloud
@@ -512,20 +523,29 @@ async function streamUrlToFile(
             : " on a redirect hop") +
           ")"
         : "the resume crossed origins to a CDN that returned no content-addressed validator, so an unchanged upstream can't be proven";
+      // Remove the stale partial + sidecar, then CONFIRM the partial is actually
+      // gone (safeRm swallows failures) before claiming it — a swallowed rm
+      // failure must not be reported as "removed", and would otherwise leave a
+      // partial a retry re-hits (#467 P1-a). The declined outcome is accurate
+      // regardless (we refused to append); only the removal wording is conditional.
       await safeRm(targetPath);
       await safeRm(validatorSidecar);
+      const removed = await partialConfirmedDiscarded(targetPath);
       recordResumeDiagnostic(
         diagKey,
         provenChange ? "declined:etag-changed" : "declined:unverifiable",
         resumeFromBytes,
       );
+      const tail = removed
+        ? "Removed the stale partial so a retry restarts cleanly."
+        : "Could not remove the stale partial — a retry may repeat this rejection; delete the .partial manually if so.";
       logger.warn(
-        `Discarding a ${resumeFromBytes}-byte partial download and restarting from 0: ${why}. ` +
-          `Refusing to append the 206 (would risk corrupting the file, #343). Removed the partial; retry.`,
-        { url: logUrl, discardedBytes: resumeFromBytes },
+        `Refusing to append a 206 and ${removed ? "discarded" : "abandoning"} a ${resumeFromBytes}-byte ` +
+          `partial: ${why} — appending would risk corrupting the file (#343). ${tail}`,
+        { url: logUrl, discardedBytes: resumeFromBytes, partialRemoved: removed },
       );
       throw new ModelError(
-        `Download resume rejected: ${why}. Removed the stale partial so a retry restarts cleanly.`,
+        `Download resume rejected: ${why}. ${tail}`,
         { url: logUrl },
       );
     }
