@@ -933,6 +933,40 @@ describe("downloadModel cache", () => {
     expect(capB.box.d?.outcome).toBe("declined:no-validator");
   });
 
+  it("materializes concurrent same-destination DIFFERENT-representation downloads without poisoning either cache entry (#467)", async () => {
+    const { downloadWithCache } = await import("../../services/download-cache.js");
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    await fsPromises.mkdir(comfyDir, { recursive: true });
+    const url = "https://example.com/models/samedest.safetensors";
+    // Two representations (different auth) → two distinct cache entries. Return the
+    // body by Authorization header (NOT call order — the two downloads race under
+    // Promise.all), so each representation deterministically gets its own bytes and
+    // any cross-contamination would be a genuine cache poison, not a mock artifact.
+    fetchMock.mockImplementation((_u: string, init: { headers?: Record<string, string> }) =>
+      Promise.resolve(
+        okResponse(init?.headers?.Authorization === "Bearer alice" ? "ALICE-CACHE-BYTES" : "BOB-CACHE-BYTES"),
+      ),
+    );
+    // ...materialized to the SAME on-disk destination (concurrent writers).
+    const dest = join(comfyDir, "same.safetensors");
+    await Promise.all([
+      downloadWithCache({ url, headers: { Authorization: "Bearer alice" }, targetPath: dest }),
+      downloadWithCache({ url, headers: { Authorization: "Bearer bob" }, targetPath: dest }),
+    ]);
+
+    // Each cache entry must retain ITS OWN bytes — the atomic temp+rename
+    // materialize must never write through a hardlink into the other's inode.
+    const aHash = cacheHashFor(url, { Authorization: "Bearer alice" });
+    const bHash = cacheHashFor(url, { Authorization: "Bearer bob" });
+    await expect(readFile(join(cacheDir, `${aHash}.safetensors`), "utf-8")).resolves.toBe("ALICE-CACHE-BYTES");
+    await expect(readFile(join(cacheDir, `${bHash}.safetensors`), "utf-8")).resolves.toBe("BOB-CACHE-BYTES");
+    // The destination holds one of the two (last writer wins) — but a VALID one.
+    expect(["ALICE-CACHE-BYTES", "BOB-CACHE-BYTES"]).toContain(await readFile(dest, "utf-8"));
+    // No leftover temp materialization files.
+    const leftovers = (await readdir(comfyDir)).filter((f) => f.includes(".mat-"));
+    expect(leftovers).toHaveLength(0);
+  });
+
   it("does NOT serve a LEGACY bare-URL cache entry to an unauthenticated caller — no cross-auth leak (#467 P1-C)", async () => {
     await fsPromises.mkdir(cacheDir, { recursive: true });
     await fsPromises.mkdir(comfyDir, { recursive: true });

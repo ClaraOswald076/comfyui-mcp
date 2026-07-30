@@ -179,8 +179,8 @@ function cacheSizeLimitBytes(): number {
  *  header case the URL can't. Hashes EVERY caller-supplied header (an allowlist
  *  would silently miss custom auth headers) — these are the request headers built
  *  from the caller's auth/config, NOT the volatile hop headers (Range/If-Range),
- *  which are added later inside streamUrlToFile and never reach here. Empty ⇒ the
- *  key is the bare URL, so unauthenticated public downloads keep existing paths. */
+ *  which are added later inside streamUrlToFile and never reach here. Empty ⇒ no
+ *  header line is added to the identity (the URL still carries the v2 namespace). */
 function representationKey(headers: Record<string, string>): string {
   const relevant = Object.keys(headers)
     .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
@@ -200,16 +200,42 @@ function representationKey(headers: Record<string, string>): string {
  *  out via LRU when COMFYUI_LRU_CACHE_SIZE_GB is set, else are inert on disk). */
 const CACHE_NS = "v2";
 
-function cacheIdentity(url: string, headers: Record<string, string>): string {
-  const repr = representationKey(headers);
-  // Namespaced for BOTH authed and unauthed so neither can collide with a legacy
-  // bare-URL entry of unknown auth provenance (#467 P1-C).
-  return repr ? `${CACHE_NS}\n${url}\n${repr}` : `${CACHE_NS}\n${url}`;
+/** Discriminator for cloud (S3/Azure) credentials/endpoint. `storageAuth` selects
+ *  a different client/credentials (and can select a different endpoint/bucket) for
+ *  a `s3://`/azure URL, but it travels SEPARATELY from the HTTP headers — so
+ *  without folding it in, an authenticated cloud download could populate a cache
+ *  entry later served to an unauthenticated caller, or two distinct-auth cloud
+ *  jobs could coalesce onto one transfer (#467). */
+function cloudAuthKey(storageAuth?: CloudStorageAuth): string {
+  if (!storageAuth || Object.keys(storageAuth).length === 0) return "";
+  return createHash("sha256").update(JSON.stringify(storageAuth)).digest("hex").slice(0, 12);
 }
 
-function cachePathForUrl(url: string, headers: Record<string, string> = {}): string {
+function cacheIdentity(
+  url: string,
+  headers: Record<string, string>,
+  storageAuth?: CloudStorageAuth,
+): string {
+  const repr = representationKey(headers);
+  const cloud = cloudAuthKey(storageAuth);
+  // Namespaced for BOTH authed and unauthed so neither can collide with a legacy
+  // bare-URL entry of unknown auth provenance (#467 P1-C). Representation-affecting
+  // HTTP headers AND cloud credentials each add a line so different auth can never
+  // share bytes (#467 P1-2). Empty discriminators are omitted, so unauthenticated
+  // public downloads stay stable under the v2 namespace.
+  let id = `${CACHE_NS}\n${url}`;
+  if (repr) id += `\n${repr}`;
+  if (cloud) id += `\ncloud:${cloud}`;
+  return id;
+}
+
+function cachePathForUrl(
+  url: string,
+  headers: Record<string, string> = {},
+  storageAuth?: CloudStorageAuth,
+): string {
   const hash = createHash("sha256")
-    .update(cacheIdentity(url, headers))
+    .update(cacheIdentity(url, headers, storageAuth))
     .digest("hex")
     .slice(0, HASH_CHARS);
   let extension = "";
@@ -820,10 +846,10 @@ async function downloadIntoCache(
   progress?: ProgressMeta,
   onResume?: ResumeReporter,
 ): Promise<string> {
-  // Header-aware identity (#467 P1-2): a same-URL download with a different
-  // Authorization/Cookie/API-key gets its OWN cache file, partial and in-flight
-  // slot — never coalesced onto another caller's stream/representation.
-  const target = cachePathForUrl(url, headers);
+  // Representation-aware identity (#467): a same-URL download with different HTTP
+  // auth headers OR different cloud (S3/Azure) credentials gets its OWN cache file,
+  // partial and in-flight slot — never coalesced onto another caller's stream.
+  const target = cachePathForUrl(url, headers, storageAuth);
   const key = target;
 
   const existing = inflight.get(key);
@@ -918,20 +944,48 @@ async function downloadIntoCache(
   }
 }
 
+let materializeSeq = 0;
+
 async function materializeCacheFile(
   cachePath: string,
   targetPath: string,
 ): Promise<"hardlink" | "copy"> {
   if (resolve(cachePath) === resolve(targetPath)) return "hardlink";
 
-  await downloadCacheFs.rm(targetPath, { force: true });
+  // Materialize ATOMICALLY via a unique temp entry + rename, never by writing
+  // directly at targetPath (#467). Two jobs materializing DIFFERENT representations
+  // to the SAME on-disk path can race: if one linked targetPath to its cache inode
+  // and the other then copyFile()'d over that path, the copy would write THROUGH
+  // the hardlink INTO the first job's cache inode — poisoning that cache entry with
+  // the other representation's bytes. Building in a fresh temp (a hardlink to, or a
+  // copy of, our OWN cache inode) and renaming over targetPath keeps every cache
+  // inode read-only from here and makes the final swap atomic (last-writer-wins on
+  // the destination only, never on a cache entry).
+  const tmp = `${targetPath}.mat-${process.pid}-${materializeSeq++}.tmp`;
+  let mode: "hardlink" | "copy";
   try {
-    await downloadCacheFs.link(cachePath, targetPath);
-    return "hardlink";
+    await downloadCacheFs.link(cachePath, tmp);
+    mode = "hardlink";
   } catch {
-    await downloadCacheFs.copyFile(cachePath, targetPath);
-    return "copy";
+    await downloadCacheFs.copyFile(cachePath, tmp);
+    mode = "copy";
   }
+  try {
+    await downloadCacheFs.rename(tmp, targetPath);
+  } catch {
+    // Windows can EPERM when renaming OVER an existing (or hardlinked) target —
+    // remove it and retry. The temp already holds the fully-materialized bytes, so
+    // the brief gap where targetPath is absent is safe: it's the DESTINATION, not a
+    // cache inode, and last-writer-wins on it is the intended concurrent semantics.
+    await downloadCacheFs.rm(targetPath, { force: true }).catch(() => undefined);
+    try {
+      await downloadCacheFs.rename(tmp, targetPath);
+    } catch (err) {
+      await downloadCacheFs.rm(tmp, { force: true }).catch(() => undefined);
+      throw err;
+    }
+  }
+  return mode;
 }
 
 async function evictLruIfNeeded(): Promise<void> {

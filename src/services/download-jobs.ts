@@ -100,14 +100,16 @@ export function downloadIdFor(url: string): string {
 }
 
 /**
- * The download's DISTINCT public id — a hash of the canonical resolved on-disk
- * `targetPath` (from the shared resolveDownloadTarget), used as BOTH the registry
- * key and `job.id`. Identity is the DESTINATION, not the URL: two requests that
- * resolve to the SAME file are one job/one writer (even from different URLs);
- * requests to different destinations are separately pollable via download_status.
+ * The download's DISTINCT public id — a hash of the given identity string. Callers
+ * pass the canonical resolved on-disk `targetPath` PLUS an auth discriminator
+ * (#467 P1-A), so identity is the DESTINATION *and representation*: two requests
+ * that resolve to the SAME file with the SAME auth are one job/one writer (even
+ * from different URLs), but the SAME file with DIFFERENT auth are DIFFERENT
+ * downloads (a different representation) and must not dedup. Requests to different
+ * destinations are separately pollable via download_status.
  */
-export function downloadJobIdFor(targetPath: string): string {
-  return createHash("sha256").update(targetPath).digest("hex").slice(0, 16);
+export function downloadJobIdFor(identity: string): string {
+  return createHash("sha256").update(identity).digest("hex").slice(0, 16);
 }
 
 /**
