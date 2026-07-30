@@ -13,6 +13,36 @@ import { config } from "../config.js";
 // the live /object_info fallback for comfy_cli_search_nodes (#354).
 // ---------------------------------------------------------------------------
 
+/**
+ * comfy-cli's `models search --type` accepts singular type aliases and maps them
+ * to the real ComfyUI model folder before scanning (e.g. `checkpoint` →
+ * `checkpoints`, `lora` → `loras`, `unet` → `diffusion_models`). The fallback
+ * must apply the SAME mapping or a valid search returns a wrong empty result.
+ * Unknown / already-canonical values pass through unchanged.
+ */
+const TYPE_ALIASES: Record<string, string> = {
+  checkpoint: "checkpoints",
+  lora: "loras",
+  vae: "vae",
+  unet: "diffusion_models",
+  diffusion_model: "diffusion_models",
+  controlnet: "controlnet",
+  embedding: "embeddings",
+  clip: "clip",
+  clip_vision: "clip_vision",
+  text_encoder: "text_encoders",
+  upscale_model: "upscale_models",
+  hypernetwork: "hypernetworks",
+  style_model: "style_models",
+  diffuser: "diffusers",
+  gligen: "gligen",
+  photomaker: "photomaker",
+};
+
+function resolveModelFolder(type: string): string {
+  return TYPE_ALIASES[type.toLowerCase()] ?? type;
+}
+
 /** Read-only comfy_cli_models actions that can be served without comfy-cli. */
 export type LocalModelsListAction = "list-folders" | "list-folder" | "search" | "show";
 
@@ -71,13 +101,17 @@ export async function listLocalModelsFallback(args: {
     }
     case "list-folder": {
       if (!args.folder) throw new Error("folder is required for list-folder");
-      const models = await listLocalModels(args.folder);
+      const folder = resolveModelFolder(args.folder);
+      const models = await listLocalModels(folder);
       if (models.length === 0) await assertLocalSourceAvailable();
-      const files = models.map((m) => m.name);
-      return { command: `models list-folder ${args.folder}`, data: { folder: args.folder, count: files.length, files } };
+      let files = models.map((m) => m.name);
+      // comfy-cli forwards `--limit` for list-folder; cap the same way.
+      if (args.limit && args.limit > 0) files = files.slice(0, args.limit);
+      return { command: `models list-folder ${folder}`, data: { folder, count: files.length, files } };
     }
     case "search": {
-      const models = await listLocalModels(args.type);
+      // Map the CLI's singular `--type` alias to the real folder before scanning.
+      const models = await listLocalModels(args.type ? resolveModelFolder(args.type) : undefined);
       if (models.length === 0) await assertLocalSourceAvailable();
       const needle = (args.text ?? "").trim().toLowerCase();
       let hits = needle ? models.filter((m) => m.name.toLowerCase().includes(needle)) : models;
@@ -90,9 +124,11 @@ export async function listLocalModelsFallback(args: {
       const models = await listLocalModels();
       if (models.length === 0) await assertLocalSourceAvailable();
       const needle = args.name.toLowerCase();
-      const match =
-        models.find((m) => m.name.toLowerCase() === needle) ??
-        models.find((m) => m.name.toLowerCase().includes(needle));
+      // comfy `models show <name>` addresses a specific model by name — return
+      // the EXACT (case-insensitive) match only. A substring guess would report
+      // an arbitrary model (e.g. show "flux" picking one of several), so no
+      // exact match is a clear not-found.
+      const match = models.find((m) => m.name.toLowerCase() === needle);
       if (!match) throw new Error(`Model '${args.name}' was not found among the connected ComfyUI's local models.`);
       return {
         command: `models show ${args.name}`,
