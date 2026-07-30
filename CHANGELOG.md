@@ -6,6 +6,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.13] - 2026-07-30
+
+### MCP
+
+#### Fixed
+- Gemini backend readiness recognizes API-key auth (GEMINI_API_KEY/GOOGLE_API_KEY, or ~/.gemini/settings.json security.auth.selectedType=gemini-api-key), not just OAuth — so an API-key-authed Gemini no longer shows as "Not signed in" (#456)
+- comfy_cli_models list actions (list-folders/list-folder/search/show) fall back to the connected local server's /models when comfy-cli is absent (mirrors #354), with faithful comfy-cli semantics — type-alias→folder mapping, exact-match show, list-folder limit; mutations still require comfy-cli; pinned workspace / cloud never substituted (#460)
+
+
 ## [0.48.12] - 2026-07-30
 
 ### MCP
