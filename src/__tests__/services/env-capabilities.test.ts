@@ -1,10 +1,17 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, beforeEach, afterEach } from "vitest";
+import { mkdtemp, rm, mkdir, writeFile } from "node:fs/promises";
+import { tmpdir, platform } from "node:os";
+import { join } from "node:path";
 import {
   formatEnvBlock,
   applyStats,
   buildPanelSystemAppend,
+  resolveComfyuiPython,
+  reconcileProbeState,
   type EnvCapabilities,
 } from "../../services/env-capabilities.js";
+
+const IS_WIN = platform() === "win32";
 
 describe("formatEnvBlock", () => {
   it("renders the full compact block from a complete caps object", () => {
@@ -171,6 +178,89 @@ describe("applyStats", () => {
     });
     expect(caps.gpu).toBe("NVIDIA RTX 4090");
     expect(caps.vramTotalGb).toBe(24);
+  });
+});
+
+describe("resolveComfyuiPython (#401)", () => {
+  let dir: string;
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "comfyui-py-"));
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("returns the on-disk venv interpreter as VERIFIED", async () => {
+    const venvBin = IS_WIN ? join(dir, ".venv", "Scripts") : join(dir, ".venv", "bin");
+    await mkdir(venvBin, { recursive: true });
+    const exe = join(venvBin, IS_WIN ? "python.exe" : "python3");
+    await writeFile(exe, "", "utf-8");
+
+    const res = resolveComfyuiPython(dir, undefined);
+    expect(res.verified).toBe(true);
+    expect(res.python).toBe(exe);
+  });
+
+  it("finds the embedded python of a portable install as VERIFIED (not just .venv)", async () => {
+    if (!IS_WIN) return; // python_embeded is a Windows-portable layout
+    const embedded = join(dir, "python_embeded");
+    await mkdir(embedded, { recursive: true });
+    const exe = join(embedded, "python.exe");
+    await writeFile(exe, "", "utf-8");
+
+    const res = resolveComfyuiPython(dir, undefined);
+    expect(res.verified).toBe(true);
+    expect(res.python).toBe(exe);
+  });
+
+  it("falls back to a bare PATH name as UNVERIFIED when no venv exists", () => {
+    // A directory with no interpreter under it — the wrong-python scenario.
+    const res = resolveComfyuiPython(dir, undefined);
+    expect(res.verified).toBe(false);
+    expect(res.python).toBe(IS_WIN ? "python.exe" : "python3");
+  });
+});
+
+describe("reconcileProbeState (#401 — no false 'not installed')", () => {
+  it("keeps 'not-installed' only when the interpreter is verified AND versions match", () => {
+    expect(
+      reconcileProbeState("not-installed", {
+        verified: true,
+        runningPython: "3.12",
+        probePython: "3.12",
+      }),
+    ).toBe("not-installed");
+  });
+
+  it("degrades 'not-installed' to 'unknown' when the interpreter is UNVERIFIED", () => {
+    expect(
+      reconcileProbeState("not-installed", {
+        verified: false,
+        runningPython: "3.12",
+        probePython: "3.12",
+      }),
+    ).toBe("unknown");
+  });
+
+  it("degrades 'not-installed' to 'unknown' when probe python DISAGREES with the running instance", () => {
+    // The exact issue: running ComfyUI is 3.12, but we probed a 3.11 PATH python.
+    expect(
+      reconcileProbeState("not-installed", {
+        verified: true,
+        runningPython: "3.12",
+        probePython: "3.11",
+      }),
+    ).toBe("unknown");
+  });
+
+  it("passes a positive 'installed' through untouched even from an untrusted interpreter", () => {
+    expect(
+      reconcileProbeState("installed", { verified: false, runningPython: "3.12", probePython: "3.11" }),
+    ).toBe("installed");
+  });
+
+  it("treats undefined as 'unknown'", () => {
+    expect(reconcileProbeState(undefined, { verified: true })).toBe("unknown");
   });
 });
 

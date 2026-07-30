@@ -35,6 +35,9 @@ vi.mock("../../comfyui/client.js", () => ({
 vi.mock("node:child_process", () => ({
   execSync: hoisted.execSync,
   spawn: hoisted.spawn,
+  // workspace-env.ts (pulled in transitively via env-capabilities → process-control)
+  // wraps execFile with promisify at load, so the mock must export a function.
+  execFile: vi.fn(),
 }));
 
 import {

@@ -21,6 +21,7 @@ import { comfyuiFetch } from "../comfyui/fetch.js";
 import { platform, release, totalmem, cpus } from "node:os";
 import { join } from "node:path";
 import { isForceRemoteFlagSet } from "../config.js";
+import { resolveEffectiveComfyUIBase } from "./workspace-env.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -308,16 +309,27 @@ async function detectAttentionFromComfyLog(
  * Locate the python that ComfyUI actually runs on, the way the
  * triton-sageattention skill describes: prefer the standalone-env / python_embeded
  * / .venv interpreter under COMFYUI_PATH (or the install root inferred from the
- * running server's argv main.py), then fall back to PATH python. Returns the
- * first candidate that exists on disk, or a PATH name as a last resort.
+ * running server's argv main.py), then fall back to PATH python.
+ *
+ * Returns BOTH the interpreter and whether it was VERIFIED — i.e. an actual
+ * on-disk venv/embedded interpreter under a known ComfyUI install root. When no
+ * such interpreter is found we fall back to a bare PATH name (`verified: false`),
+ * which is emphatically NOT guaranteed to be ComfyUI's interpreter: on a portable
+ * install whose venv sits outside the checked locations, PATH python is a DIFFERENT
+ * environment. Probing it for triton/sage there yields a FALSE "not installed"
+ * (issue #401), so callers must treat an unverified interpreter's negative result
+ * as "unknown", not "not-installed".
  */
-export function findComfyuiPython(
+export function resolveComfyuiPython(
   comfyuiPath: string | undefined,
   statsArgv: string[] | undefined,
-): string | undefined {
+): { python: string | undefined; verified: boolean } {
   const names = IS_WIN ? ["python.exe", "python"] : ["python3", "python"];
   const roots: string[] = [];
-  if (comfyuiPath) roots.push(comfyuiPath);
+  // Prefer the explicit COMFYUI_PATH, else the effective local base (saved default
+  // workspace) resolved exactly like every other filesystem-backed tool (#418).
+  const base = comfyuiPath ?? resolveEffectiveComfyUIBase();
+  if (base) roots.push(base);
   // Infer the install root from the running server's argv (…/main.py).
   if (Array.isArray(statsArgv)) {
     const mainPy = statsArgv.find((a) => typeof a === "string" && /main\.py$/i.test(a));
@@ -350,14 +362,25 @@ export function findComfyuiPython(
     // paths are instant. (Linux/Mac UNC isn't a thing; this is the Windows risk.)
     if (/^\\\\/.test(c)) continue;
     try {
-      if (existsSync(c)) return c;
+      if (existsSync(c)) return { python: c, verified: true };
     } catch {
       // ignore and continue
     }
   }
-  // Last resort: a PATH-resolved interpreter (may not be ComfyUI's, but better
-  // than nothing for the import probe).
-  return names[0];
+  // Last resort: a PATH-resolved interpreter. It may NOT be ComfyUI's (see above),
+  // so it is explicitly unverified — a negative probe result off it is untrustworthy.
+  return { python: names[0], verified: false };
+}
+
+/**
+ * Back-compat shim: returns just the interpreter path. Prefer resolveComfyuiPython
+ * when the caller needs to know whether the interpreter was verified as ComfyUI's.
+ */
+export function findComfyuiPython(
+  comfyuiPath: string | undefined,
+  statsArgv: string[] | undefined,
+): string | undefined {
+  return resolveComfyuiPython(comfyuiPath, statsArgv).python;
 }
 
 /**
@@ -370,16 +393,20 @@ export function findComfyuiPython(
 export function probeTritonSage(
   pythonExe: string | undefined,
   timeoutMs = 5000,
-): Promise<{ triton: TriState; sageattention: TriState }> {
+): Promise<{ triton: TriState; sageattention: TriState; pythonVersion?: string }> {
   return new Promise((resolve) => {
     if (!pythonExe) {
       resolve({ triton: "unknown", sageattention: "unknown" });
       return;
     }
     // Print a clear per-package marker so we can tell which imported, even if one
-    // succeeds and the other fails (avoids an all-or-nothing answer).
+    // succeeds and the other fails (avoids an all-or-nothing answer). Also print
+    // the interpreter's own major.minor so the caller can confirm we probed the
+    // SAME python the running ComfyUI reports (#401 — a mismatch means we're
+    // looking at the wrong environment and any negative is untrustworthy).
     const code =
-      "import importlib.util as u;" +
+      "import importlib.util as u,sys;" +
+      "print('python', '%d.%d' % sys.version_info[:2]);" +
       "print('triton', u.find_spec('triton') is not None);" +
       "print('sageattention', u.find_spec('sageattention') is not None)";
     let done = false;
@@ -401,10 +428,15 @@ export function probeTritonSage(
           if (!m) return "unknown";
           return m[1] === "True" ? "installed" : "not-installed";
         };
+        const pyMatch = out.match(/^python\s+(\d+\.\d+)/m);
         // If python ran but errored AFTER printing partial output, still trust
         // whatever lines we got; missing lines stay "unknown".
         void err;
-        resolve({ triton: read("triton"), sageattention: read("sageattention") });
+        resolve({
+          triton: read("triton"),
+          sageattention: read("sageattention"),
+          pythonVersion: pyMatch ? pyMatch[1] : undefined,
+        });
       },
     );
     child.on?.("error", () => {
@@ -413,6 +445,31 @@ export function probeTritonSage(
       resolve({ triton: "unknown", sageattention: "unknown" });
     });
   });
+}
+
+/**
+ * Reconcile a raw import-probe tri-state against how much we trust the interpreter
+ * we probed (#401). A definitive "not-installed" is only believable when we probed
+ * ComfyUI's OWN python — i.e. a verified on-disk venv/embedded interpreter whose
+ * major.minor matches what /system_stats reports for the running instance. When the
+ * interpreter is unverified (bare PATH fallback) or its version disagrees with the
+ * running ComfyUI, we are looking at the wrong environment, so a "not-installed" is
+ * downgraded to "unknown" rather than emitted as a false negative that would make an
+ * agent disable working acceleration. Positives pass through unchanged (a positive
+ * can't be a harmful false negative).
+ */
+export function reconcileProbeState(
+  state: TriState | undefined,
+  opts: { verified: boolean; runningPython?: string; probePython?: string },
+): TriState {
+  const s = state ?? "unknown";
+  const versionMismatch = !!(
+    opts.runningPython &&
+    opts.probePython &&
+    opts.runningPython !== opts.probePython
+  );
+  const trustworthy = opts.verified && !versionMismatch;
+  return s === "not-installed" && !trustworthy ? "unknown" : s;
 }
 
 // ---------------------------------------------------------------------------
@@ -517,11 +574,28 @@ export async function gatherEnvCapabilities(opts: GatherOptions): Promise<EnvCap
   }
 
   // --- triton + sageattention (find python, import-probe, ~5s cap) ---
-  const python = findComfyuiPython(opts.comfyuiPath, statsArgv);
+  const { python, verified } = resolveComfyuiPython(opts.comfyuiPath, statsArgv);
   const tritonTimeout = opts.tritonTimeoutMs ?? 5000;
   const ts = await withTimeout(probeTritonSage(python, tritonTimeout), tritonTimeout + 1000);
-  caps.triton = ts?.triton ?? "unknown";
-  caps.sageattention = ts?.sageattention ?? "unknown";
+
+  // Only trust a definitive "not-installed" when we actually probed ComfyUI's own
+  // interpreter (#401). Two ways it can be the WRONG python:
+  //   1. We fell back to a bare PATH name (verified === false) — likely a different
+  //      environment than the running ComfyUI.
+  //   2. The probed interpreter's major.minor disagrees with what /system_stats
+  //      reports for the running instance — provably a different environment.
+  // In either case a "not-installed" is untrustworthy, so we degrade it to
+  // "unknown" rather than emit a false negative that makes an agent disable working
+  // acceleration. A positive ("installed") is still reported — it can't be a false
+  // negative, and the log-marker check below only ever reinforces a positive.
+  const reconcile = (state: TriState | undefined): TriState =>
+    reconcileProbeState(state, {
+      verified,
+      runningPython: caps.python,
+      probePython: ts?.pythonVersion,
+    });
+  caps.triton = reconcile(ts?.triton);
+  caps.sageattention = reconcile(ts?.sageattention);
 
   // A positive signal from the ComfyUI HOST's log wins over the local python probe:
   // in remote mode (pod) the probe can't reach the host, and even locally the log

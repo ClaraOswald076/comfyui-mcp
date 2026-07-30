@@ -319,32 +319,65 @@ async function probe(
   }
 }
 
-/** Resolve the python executable to probe, preferring a venv inside the workspace. */
-function pythonCandidates(workspacePath: string | undefined): string[] {
+/**
+ * Resolve python interpreters to probe, most-preferred first, each tagged with
+ * whether it is VERIFIED to be ComfyUI's own interpreter (an on-disk venv/embedded
+ * python under the workspace) vs a bare PATH fallback. Portable/standalone installs
+ * keep python under python_embeded / standalone-env — not just .venv — so we check
+ * all of them (#401: only checking .venv made a portable install fall through to a
+ * DIFFERENT PATH python, producing a false package report).
+ */
+function pythonCandidates(
+  workspacePath: string | undefined,
+): Array<{ exe: string; verified: boolean }> {
   const names = IS_WIN ? ["python.exe", "python"] : ["python3", "python"];
-  const candidates: string[] = [];
+  const candidates: Array<{ exe: string; verified: boolean }> = [];
   if (workspacePath) {
-    const venvBin = IS_WIN
-      ? join(workspacePath, ".venv", "Scripts")
-      : join(workspacePath, ".venv", "bin");
-    for (const n of names) {
-      const p = join(venvBin, n);
-      if (existsSync(p)) candidates.push(p);
+    const embedded = IS_WIN
+      ? [
+          join(workspacePath, "standalone-env", "python.exe"),
+          join(workspacePath, "python_embeded", "python.exe"),
+          join(workspacePath, "..", "python_embeded", "python.exe"),
+        ]
+      : [];
+    const venvBins = IS_WIN
+      ? [join(workspacePath, ".venv", "Scripts"), join(workspacePath, "venv", "Scripts")]
+      : [join(workspacePath, ".venv", "bin"), join(workspacePath, "venv", "bin")];
+    const onDisk: string[] = [...embedded];
+    for (const bin of venvBins) for (const n of names) onDisk.push(join(bin, n));
+    for (const p of onDisk) {
+      // Skip UNC paths — existsSync on a dead network share can block for seconds.
+      if (/^\\\\/.test(p)) continue;
+      try {
+        if (existsSync(p)) candidates.push({ exe: p, verified: true });
+      } catch {
+        // ignore and continue
+      }
     }
   }
-  // Fall back to PATH-resolved interpreters
-  candidates.push(...names);
+  // Fall back to PATH-resolved interpreters — NOT guaranteed to be ComfyUI's.
+  for (const n of names) candidates.push({ exe: n, verified: false });
   return candidates;
 }
 
 async function probePython(
   workspacePath: string | undefined,
-): Promise<{ executable: string; version: string } | undefined> {
-  for (const exe of pythonCandidates(workspacePath)) {
+): Promise<{ executable: string; version: string; verified: boolean } | undefined> {
+  for (const { exe, verified } of pythonCandidates(workspacePath)) {
     const version = await probe(exe, ["--version"]);
-    if (version) return { executable: exe, version: version.replace(/^Python\s+/i, "") };
+    if (version)
+      return { executable: exe, version: version.replace(/^Python\s+/i, ""), verified };
   }
   return undefined;
+}
+
+/** True when two python version strings share the same major.minor (3.12.11 ~ 3.12.0). */
+function pythonVersionsAgree(a: string | undefined, b: string | undefined): boolean {
+  if (!a || !b) return false;
+  const mm = (v: string): string | undefined => v.replace(/^Python\s+/i, "").match(/^(\d+\.\d+)/)?.[1];
+  const ma = mm(a);
+  const mb = mm(b);
+  return !!ma && ma === mb;
 }
 
 async function probePipPackages(
@@ -434,6 +467,11 @@ export interface EnvironmentInfo {
   local: {
     workspace_path?: string;
     python?: { executable: string; version: string };
+    /** Whether the probed python is trusted to be the running ComfyUI's own
+     *  interpreter. False when a bare PATH python was used or its version
+     *  disagrees with the running instance — in that case `packages` is omitted
+     *  rather than reporting versions from the wrong environment (#401). */
+    python_probe_trusted?: boolean;
     git?: { rev?: string; branch?: string };
     comfyui_manager_version?: string;
     packages?: Record<string, string>;
@@ -504,9 +542,31 @@ export async function getEnvironment(): Promise<EnvironmentInfo> {
 
   const py = await probePython(workspacePath);
   if (py) {
-    local.python = py;
-    const pkgs = await probePipPackages(py.executable, KEY_PACKAGES);
-    if (Object.keys(pkgs).length > 0) local.packages = pkgs;
+    local.python = { executable: py.executable, version: py.version };
+    // Decide whether to trust this interpreter as the running ComfyUI's own.
+    // The provable failure mode (#401): the running instance is reachable and its
+    // python major.minor disagrees with the interpreter we probed — then we are
+    // demonstrably looking at the WRONG environment, so reporting its package
+    // versions would be a false capability report. Degrade honestly instead.
+    const runningPy = running.python_version;
+    const provableMismatch =
+      running.reachable && !!runningPy && !pythonVersionsAgree(py.version, runningPy);
+    const trusted = !provableMismatch;
+    local.python_probe_trusted = trusted;
+    if (trusted) {
+      const pkgs = await probePipPackages(py.executable, KEY_PACKAGES);
+      if (Object.keys(pkgs).length > 0) local.packages = pkgs;
+    } else {
+      local.note = [
+        local.note,
+        `Probed python ${py.version} does not match the running ComfyUI python ` +
+          `${runningPy} — the probe interpreter is a different environment, so ` +
+          `package versions are omitted rather than reported from the wrong python (#401). ` +
+          `Point COMFYUI_PATH at the install whose venv runs ComfyUI for an accurate report.`,
+      ]
+        .filter(Boolean)
+        .join(" ");
+    }
   } else {
     local.note = [
       local.note,

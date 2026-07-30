@@ -411,4 +411,62 @@ describe("getEnvironment", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it("omits packages (no false report) when the probed python disagrees with the running ComfyUI (#401)", async () => {
+    const dir = await tmpDir();
+    const install = join(dir, "ComfyUI");
+    await mkdir(install, { recursive: true });
+    try {
+      configureWorkspace({ configPath: join(dir, "workspace.json") });
+      mockConfig.comfyuiPath = install;
+      // Running ComfyUI is on python 3.12.11 …
+      mockGetSystemStats.mockResolvedValueOnce({
+        system: { os: "nt", python_version: "3.12.11", comfyui_version: "0.27.1" },
+        devices: [],
+      });
+      // … but the interpreter we can probe (bare PATH python) is 3.11.7 — a DIFFERENT
+      // environment. torch etc. from it would be a false report, so degrade.
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version")) return { stdout: "Python 3.11.7\n" };
+        if (args.includes("pip"))
+          return { stdout: "Name: torch\nVersion: 9.9.9\n" }; // must NOT surface
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.python?.version).toBe("3.11.7");
+      expect(env.local.python_probe_trusted).toBe(false);
+      expect(env.local.packages).toBeUndefined();
+      expect(env.local.note).toMatch(/does not match the running ComfyUI python/i);
+      expect(env.local.note).toMatch(/#401/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports packages when the probed python matches the running ComfyUI major.minor", async () => {
+    const dir = await tmpDir();
+    const install = join(dir, "ComfyUI");
+    await mkdir(install, { recursive: true });
+    try {
+      configureWorkspace({ configPath: join(dir, "workspace.json") });
+      mockConfig.comfyuiPath = install;
+      mockGetSystemStats.mockResolvedValueOnce({
+        system: { os: "nt", python_version: "3.12.11", comfyui_version: "0.27.1" },
+        devices: [],
+      });
+      // Same major.minor (3.12) as the running instance → trusted.
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version")) return { stdout: "Python 3.12.4\n" };
+        if (args.includes("pip")) return { stdout: "Name: torch\nVersion: 2.5.0\n" };
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.python_probe_trusted).toBe(true);
+      expect(env.local.packages?.torch).toBe("2.5.0");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
