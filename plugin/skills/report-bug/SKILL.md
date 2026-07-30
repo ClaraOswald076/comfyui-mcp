@@ -1,16 +1,22 @@
 ---
 name: report-bug
-description: Self-heal + report bugs to make the ecosystem better. When you hit ANY defect in comfyui-mcp / the sidebar panel, OR in a third-party custom node / ComfyUI core, use this: diagnose it, attempt a local fix so the user can keep working, and report it the right way (our intake Worker for our repos; the node's own GitHub for third-party). Acts autonomously and just informs the user — it does not ask permission for each step. **BETA — bias HARD toward filing:** trigger on any comfyui-mcp/panel defect you notice — an error, a crash, a tool that returns wrong/misleading/empty output, a silent failure, a confusing result, or a limitation that forced an awkward workaround — EVEN IF you recovered or worked around it. You do NOT need to be blocked. Also on "report this" / "fix this bug". If a future user would hit the same friction, file it — the intake Worker dedupes, so over-reporting is cheap and under-reporting costs us the bug.
+description: Self-heal + report bugs to make the ecosystem better. When you hit ANY defect in comfyui-mcp / the sidebar panel, OR in a third-party custom node / ComfyUI core, use this: diagnose it, and for OUR repos (comfyui-mcp / comfyui-mcp-panel) **fix it locally FIRST** — patch the code where it actually runs so the user is unblocked immediately — then file a report that includes the diff, so reports arrive as near-PRs, not just tickets. (Attempt the fix exactly ONCE; if it's genuinely upstream-only, mark it and include the precise change needed.) Report it the right way: our intake Worker for our repos; the node's own GitHub for third-party. For OUR repos (artokun/comfyui-mcp, comfyui-mcp-panel, comfyui-mcp-issue-worker) act **autonomously** — fix-then-file and just inform the user, no per-step permission. For THIRD-PARTY / ComfyUI-core it is **offer-and-ask**: propose the workaround/report and act only with the user's go-ahead. **BETA — bias HARD toward fix-then-file (our repos):** trigger on any comfyui-mcp/panel defect you notice — an error, a crash, a tool that returns wrong/misleading/empty output, a silent failure, a confusing result, or a limitation that forced an awkward workaround — EVEN IF you recovered or worked around it. You do NOT need to be blocked. Also on "report this" / "fix this bug". If a future user would hit the same friction, fix-and-file it — the intake Worker dedupes, so over-reporting is cheap and under-reporting costs us the bug. THIRD-PARTY / ComfyUI-core bugs stay offer-and-ask.
 ---
 
 # Self-heal & report bugs (make the ecosystem better)
 
 Goal: when something is broken, don't just stop — **diagnose it, try to fix it so
 the user keeps working, and get the fix/report to whoever can fix it upstream.**
-Do this **autonomously**: act, then **inform** the user with a short summary —
-don't pepper them with permission prompts. (Exceptions where you DO pause: a fix
-that touches the user's own workflow/data, anything large/risky, or anything you
-can't make safe — explain and ask.)
+
+**Scope of autonomy — read this first.** For defects in **OUR repos**
+(`artokun/comfyui-mcp`, `comfyui-mcp-panel`, `comfyui-mcp-issue-worker`) act
+**autonomously**: fix-then-file, then **inform** the user with a short summary —
+don't pepper them with permission prompts. For **THIRD-PARTY / ComfyUI-core**
+defects it is **offer-and-ask** (Step 6): you propose the workaround and/or the
+report and act only once the user agrees — it's their call to patch someone
+else's node or post to someone else's tracker. (Even for our repos, DO pause for:
+a fix that touches the user's own workflow/data, anything large/risky, or
+anything you can't make safe — explain and ask.)
 
 This is for **bugs in software**, not ordinary workflow/generation errors (OOM,
 missing model, bad params → use `troubleshooting`). First decide whose bug it is.
@@ -48,13 +54,18 @@ in doubt during beta, file it and move on.
 
 ## Step 2 — Classify whose bug it is
 
-- **OURS** — `comfyui-mcp` (server/tools/orchestrator/agent) or
-  `comfyui-mcp-panel` (the sidebar pack / panel JS / `__init__.py`). → Steps 3–5 (self-heal + Worker/PR).
+- **OURS** — `comfyui-mcp` (server/tools/orchestrator/agent),
+  `comfyui-mcp-panel` (the sidebar pack / panel JS / `__init__.py`), or
+  `comfyui-mcp-issue-worker` (the intake Worker). → Steps 3–5 (self-heal + Worker/PR).
 - **THIRD-PARTY** — a custom node pack, or **ComfyUI core** itself. → Step 6 (their GitHub; our Worker can't file there).
 
-## Step 3 — Attempt a local fix (so the user keeps working)
+## Step 3 — Fix it locally FIRST (this is the default, not "when you can")
 
-Patch the code **where it actually runs** so relief is immediate:
+For any defect in **OUR** repos (`comfyui-mcp` / `comfyui-mcp-panel` /
+`comfyui-mcp-issue-worker`), the default is to **fix it before/alongside
+filing** — patch the code **where it actually runs** so the user is unblocked
+immediately and the report arrives as a near-PR (code + diff), not just a ticket.
+Do this every time; don't wait to be asked and don't downgrade it to optional.
 
 - `comfyui-mcp`: find the running install from the stack path. If a source
   checkout exists, fix the `.ts` source and `npm run build`; if only the built
@@ -63,11 +74,16 @@ Patch the code **where it actually runs** so relief is immediate:
 - `comfyui-mcp-panel`: patch the file under the pack (`web/js/…` for UI,
   `__init__.py` for the pack) — UI changes need a hard-refresh.
 
-Keep the patch **minimal and reversible**. It's fine that a future update will
-overwrite it — that's expected; the user runs the patched version in the
-meantime. If you genuinely **can't** fix it locally (the bug is upstream-only —
-in the SDK, ComfyUI, or needs a release), say so and skip to reporting, marked
-upstream-only.
+**Exactly ONE attempt — don't spiral.** Make one focused, minimal, reversible
+patch. If that single attempt doesn't land — or the bug is genuinely
+**upstream-only** (in the SDK, ComfyUI, or it needs a release you can't make from
+here) — stop patching, mark it `upstream-only`, and include the **precise change
+needed** in the report instead. It's fine that a future update will overwrite a
+local patch — that's expected; the user runs the patched version in the meantime.
+Capture the diff (`git diff`, or diff the file you touched) — Step 5 attaches it.
+
+(THIRD-PARTY / ComfyUI-core defects are the exception: there you still **offer
+and ask first** before patching or filing — see Step 6.)
 
 ## Step 4 — Verify the fix
 
@@ -112,6 +128,13 @@ Then file it (no need to ask):
 - **Default path (everyone):** POST the report to our intake Worker — no GitHub
   account needed:
 
+  The Worker files the issue **synchronously**: on success the POST response
+  ALWAYS carries the issue `url` inline (`{ ok:true, url, number, deduped?,
+  job_id }`), so the manual path is **one POST — no polling needed**. This shell
+  snippet is the **manual / non-Claude fallback** and **requires `jq`** for safe
+  JSON parsing (Claude agents should use the `report_issue` tool, which already
+  implements this correctly).
+
   ```bash
   # URL is baked in; override with $COMFYUI_MCP_ISSUE_WORKER_URL if set. The
   # client key is a soft anti-spam gate — read it from $COMFYUI_MCP_ISSUE_CLIENT_KEY.
@@ -119,27 +142,60 @@ Then file it (no need to ask):
   # Soft anti-spam gate (ships with the panel; not a real secret — the GitHub
   # token is server-side in the Worker). Override with $COMFYUI_MCP_ISSUE_CLIENT_KEY.
   CLIENT_KEY="${COMFYUI_MCP_ISSUE_CLIENT_KEY:-9b6f2abf09b64006dc6e033f59d2dc8112e34d8347a923c2}"
-  curl -fsS -X POST "$WORKER_URL" \
-    -H "Content-Type: application/json" -H "X-Client-Key: $CLIENT_KEY" \
-    --data @"$BODY_JSON_FILE"
+
+  # 1) Submit — ONE synchronous POST. Write the JSON to a temp file first (the
+  # body has newlines/quotes). --max-time bounds the request so a hung
+  # connection can't wedge us.
   # body: { "repo": "comfyui-mcp" | "comfyui-mcp-panel", "title", "body", "labels": ["via-panel"] }
+  RESP=$(curl -fsS --max-time 15 -X POST "$WORKER_URL" \
+    -H "Content-Type: application/json" -H "X-Client-Key: $CLIENT_KEY" \
+    --data @"$BODY_JSON_FILE" || true)
+
+  # 2) VALIDATE THE WHOLE BODY FIRST with `jq -e .` — it rejects anything that
+  # isn't a single valid JSON document (trailing garbage → non-zero), so the
+  # extraction below only ever runs on clean JSON (no partial output before a
+  # later parse error). Require ok==true AND status!="error" AND a url matching
+  # the exact GitHub issue shape. EXACTLY ONE outcome: real url → filed;
+  # anything else (non-2xx/timeout/unreachable, ok!=true, status:"error",
+  # missing/invalid url, invalid JSON) → prefilled report_issue fallback.
+  if ! printf '%s' "$RESP" | jq -e -s 'length == 1' >/dev/null 2>&1; then
+    echo "worker did not return valid JSON — fall back to the report_issue tool for a prefilled GitHub link"
+  else
+    URL=$(printf '%s' "$RESP" | jq -r \
+      'select(.ok==true and (.status!="error")) | .url // empty | select(test("^https://github.com/[^/]+/[^/]+/issues/[0-9]+$"))')
+    if [ -n "$URL" ]; then
+      echo "filed: $URL"
+    else
+      echo "worker did not return an issue link — fall back to the report_issue tool for a prefilled GitHub link"
+    fi
+  fi
   ```
-  Write the JSON to a temp file (the body has newlines/quotes). On success it
-  returns `{ ok, url, number, deduped? }`. A `401 unauthorized` means
-  `$COMFYUI_MCP_ISSUE_CLIENT_KEY` is unset/wrong — fall back to `report_issue`.
+  A real `url` from the POST is the only "filed" outcome. Any submit failure
+  (`401`/non-2xx/timeout/unreachable), `ok` not `true`, a `status:"error"` body,
+  a missing/invalid url, or invalid JSON → fall back to `report_issue` for a
+  prefilled link the user submits in one click; never tell the user it was
+  accepted without a real issue link. (A `GET /status/<job_id>` endpoint exists
+  to optionally re-fetch the link later, but it is NOT needed to file — don't
+  poll.) **Surface the link only if they want it** — the filing is autonomous,
+  so a one-line "filed #123" is enough (Step 7).
 - **Fallback** (no `gh`, no Worker URL): use the `report_issue` tool → a prefilled
   GitHub issue link the user can submit in one click.
 
-## Step 6 — Third-party / ComfyUI-core bugs
+## Step 6 — Third-party / ComfyUI-core bugs (offer + ASK first — not autonomous)
 
-Our Worker only files into OUR repos, so these go to **their** GitHub:
+Our Worker only files into OUR repos, so these go to **their** GitHub. Unlike
+our-repo defects (Steps 3–5, which you handle autonomously), third-party bugs
+are **offer-and-ask** at every step — patching someone else's node and posting
+to someone else's tracker are the user's calls, not yours:
 
-- Still attempt a **local workaround** if you safely can (e.g. patch the custom
-  node so the user isn't blocked) — same keep-the-patch logic.
-- To report: identify the node/project's GitHub repo (from its metadata /
-  `list_installed_nodes` / its folder), then use `report_issue` with that
-  `owner/repo` to produce a prefilled issue link, OR `gh issue create -R owner/repo`
-  if `gh` is authed.
+- **Ask before patching.** You may *offer* a local workaround (e.g. patch the
+  custom node so the user isn't blocked) — but apply it only once the user says
+  yes. Same keep-the-patch logic once approved.
+- **Ask before filing.** Identify the node/project's GitHub repo (from its
+  metadata / `list_installed_nodes` / its folder), then — with the user's
+  go-ahead — use `report_issue` with that `owner/repo` (it returns a **prefilled
+  link the user reviews and submits**; it does not auto-file into third-party
+  repos), OR `gh issue create -R owner/repo` if `gh` is authed and they agree.
 - If the user has **no GitHub account**, briefly offer to walk them through
   creating one (github.com/signup) so they can file it — that's how the bug
   reaches the people who can fix it. We can't file it for them.
