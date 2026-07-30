@@ -135,6 +135,28 @@ ValueError: bad input
     expect(r.culpritFrame).toBe("nodes.py:42");
   });
 
+  it("flags a real crash after a swallowed block even with CRLF line endings", () => {
+    // Windows logs use CRLF. The blank-line boundary in the swallowed-block
+    // look-back must recognize "\r\n\r\n", or a genuine crash within 1200 chars
+    // of an earlier swallowed block gets wrongly filtered out.
+    const mixed = [
+      "Exception ignored in: <function HostBuffer.__del__ at 0x0>",
+      "Traceback (most recent call last):",
+      '  File "~/comfy_aimdo/host_buffer.py", line 129, in __del__',
+      "OSError: exception: access violation writing 0x24",
+      "[INFO] Prompt executed in 7.18 seconds",
+      "",
+      "Windows fatal exception: access violation",
+      "",
+      "Current thread 0x00004abc (most recent call first):",
+      '  File "C:\\\\ComfyUI\\\\custom_nodes\\\\SomeNode\\\\nodes.py", line 42 in run',
+    ].join("\r\n");
+    const r = parseCrashBlock(mixed);
+    expect(r.fatal).toBe(true);
+    expect(r.culpritNode).toBe("SomeNode");
+    expect(r.culpritFrame).toBe("nodes.py:42");
+  });
+
   it("fingerprints a crash stably so it can be deduped", () => {
     const a = parseCrashBlock(WAN_CRASH);
     const b = parseCrashBlock(WAN_CRASH + "\n[INFO] more log appended after restart\n");

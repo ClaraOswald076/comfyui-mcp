@@ -76,7 +76,13 @@ const ANY_FRAME =
 function isSwallowedDestructorHit(text: string, index: number): boolean {
   const from = Math.max(0, index - 1200);
   const before = text.slice(from, index);
-  const cut = before.lastIndexOf("\n\n");
+  // Stop at the LAST blank line — handling LF, CRLF, and whitespace-only blank
+  // lines so a Windows (CRLF) log's block boundary isn't missed and the look-back
+  // can't reach into an unrelated earlier block.
+  const blank = /\r?\n[ \t]*\r?\n/g;
+  let cut = -1;
+  let b: RegExpExecArray | null;
+  while ((b = blank.exec(before)) !== null) cut = b.index;
   return /Exception ignored in:/i.test(cut >= 0 ? before.slice(cut) : before);
 }
 
