@@ -3,7 +3,16 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 const hoisted = vi.hoisted(() => ({
   resolvers: [] as Array<{ resolve: (p: string) => void; reject: (e: Error) => void; url: string }>,
   calls: 0,
+  remote: false,
+  resolveTargetCalls: 0,
 }));
+
+// isRemoteMode gates the identity branch in startDownloadJob. Keep every other
+// real config export (logger etc. depend on them); only the flag is controlled.
+vi.mock("../../config.js", async () => {
+  const actual = await vi.importActual<typeof import("../../config.js")>("../../config.js");
+  return { ...actual, isRemoteMode: () => hoisted.remote };
+});
 
 // startDownloadJob resolves the canonical destination with the SHARED
 // resolveDownloadTarget (so the job is keyed by the exact on-disk targetPath the
@@ -22,6 +31,7 @@ vi.mock("../../services/model-resolver.js", () => ({
     });
   }),
   resolveDownloadTarget: vi.fn(async (url: string, sub: string, filename?: string) => {
+    hoisted.resolveTargetCalls += 1;
     const s = String(sub ?? "").trim();
     if (filename !== undefined) {
       if (filename === "" || filename.includes("/") || filename.includes("\\")) {
@@ -49,6 +59,8 @@ describe("download job registry", () => {
   beforeEach(() => {
     hoisted.resolvers.length = 0;
     hoisted.calls = 0;
+    hoisted.remote = false;
+    hoisted.resolveTargetCalls = 0;
     resetDownloadJobs();
   });
 
@@ -141,6 +153,21 @@ describe("download job registry", () => {
     const retry = await startDownloadJob(URL_A, "checkpoints");
     expect(hoisted.calls).toBe(2);
     expect(getDownloadJob(retry.job.id)?.status).toBe("downloading");
+  });
+
+  it("in remote mode keys WITHOUT resolving a local target and dispatches to the Manager", async () => {
+    // Regression guard: the shared resolver throws when no local models dir exists
+    // (COMFYUI_PATH unset). Remote downloads go straight to the Manager, so
+    // startDownloadJob must NOT resolve a local targetPath in remote mode.
+    hoisted.remote = true;
+    const { job } = await startDownloadJob(URL_A, "checkpoints");
+    expect(job.status).toBe("downloading");
+    expect(hoisted.resolveTargetCalls).toBe(0); // no local resolution attempted
+    expect(hoisted.calls).toBe(1); // downloadModel invoked (takes the Manager path)
+    // A repeated identical remote request still adopts the in-flight job.
+    const again = await startDownloadJob(URL_A, "checkpoints");
+    expect(again.job).toBe(job);
+    expect(hoisted.calls).toBe(1);
   });
 
   it("lists newest first", async () => {

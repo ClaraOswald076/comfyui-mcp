@@ -15,6 +15,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { isRemoteMode } from "../config.js";
 import { downloadModel, resolveDownloadTarget } from "./model-resolver.js";
 import type { DownloadAuth } from "./download-auth.js";
 import { logger } from "../utils/logger.js";
@@ -69,6 +70,27 @@ export function downloadJobIdFor(targetPath: string): string {
 }
 
 /**
+ * REMOTE-mode id: there is NO local filesystem to resolve a targetPath from —
+ * downloadModel dispatches to the ComfyUI host's Manager, which decides the
+ * server-side destination. Key by a canonical, collision-safe JSON-encoded tuple
+ * of {url, trimmed subfolder, filename} so field boundaries are unambiguous and a
+ * repeated identical request still adopts the in-flight job. (We can't dedupe two
+ * DIFFERENT urls aimed at one server-side dest here — the server owns that.)
+ */
+function remoteDownloadJobIdFor(
+  url: string,
+  targetSubfolder: string,
+  filename?: string,
+): string {
+  const canonical = JSON.stringify([
+    url,
+    String(targetSubfolder ?? "").trim(),
+    filename ?? null,
+  ]);
+  return createHash("sha256").update(canonical).digest("hex").slice(0, 16);
+}
+
+/**
  * Start a download, or adopt one already running for the same on-disk destination.
  *
  * The adoption case matters: the visible symptom of the old bug was "the agent
@@ -94,11 +116,17 @@ export async function startDownloadJob(
    *  so they reach the user even when the download outlives the tool call. */
   onComplete?: (path: string) => Promise<string[]>,
 ): Promise<Entry> {
-  // Resolve the canonical destination with the SAME resolver the write uses.
-  // Throws (ModelError) on an invalid filename/subfolder — surfaced to the caller
-  // immediately, matching downloadModel's own rejection.
-  const { targetPath } = await resolveDownloadTarget(url, targetSubfolder, filename);
-  const id = downloadJobIdFor(targetPath);
+  // Identity depends on mode. LOCAL: resolve the canonical on-disk destination
+  // with the SAME resolver the write uses (throws on an invalid filename/subfolder
+  // — surfaced immediately, matching downloadModel's own rejection — and keys by
+  // the exact targetPath so identity is the destination, not the URL). REMOTE:
+  // there is NO local filesystem — downloadModel short-circuits to the Manager
+  // dispatch, so resolving a local models dir would wrongly THROW (COMFYUI_PATH
+  // unset). Key by a canonical remote identity instead and let downloadModel take
+  // the Manager path.
+  const id = isRemoteMode()
+    ? remoteDownloadJobIdFor(url, targetSubfolder, filename)
+    : downloadJobIdFor((await resolveDownloadTarget(url, targetSubfolder, filename)).targetPath);
   const trayId = downloadIdFor(url);
   const existing = jobs.get(id);
   if (existing && existing.job.status === "downloading") {
@@ -106,7 +134,6 @@ export async function startDownloadJob(
       url,
       target_subfolder: targetSubfolder,
       filename,
-      targetPath,
     });
     return existing;
   }
