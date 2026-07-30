@@ -10,6 +10,14 @@ vi.mock("../../comfyui/client.js", () => ({
   getSystemStats: (...a: unknown[]) => getSystemStats(...a),
 }));
 
+// resolveModelsDir's local fallback (COMFYUI_PATH → default workspace) is resolved
+// through the shared helper; back it by the mocked config + a settable default
+// workspace so tests can exercise the "no COMFYUI_PATH but a default workspace" path.
+let savedDefaultWorkspace: string | undefined;
+vi.mock("../../services/workspace-env.js", () => ({
+  resolveEffectiveComfyUIBase: () => config.comfyuiPath ?? savedDefaultWorkspace,
+}));
+
 import {
   parseOutputDirFromArgv,
   localOutputDirFallback,
@@ -28,6 +36,7 @@ import { config } from "../../config.js";
 beforeEach(() => {
   getSystemStats.mockReset();
   (config as { comfyuiPath?: string }).comfyuiPath = "/comfy";
+  savedDefaultWorkspace = undefined;
 });
 
 afterEach(() => {
@@ -227,6 +236,20 @@ describe("models dir + extra-config argv parsing (#345/#346/#369)", () => {
   it("resolveModelsDir falls back to <COMFYUI_PATH>/models when unreachable", async () => {
     getSystemStats.mockRejectedValue(new Error("ECONNREFUSED"));
     expect(await resolveModelsDir()).toBe(resolve("/comfy", "models"));
+  });
+
+  it("resolveModelsDir falls back to the saved default workspace when COMFYUI_PATH is unset (#415/#416)", async () => {
+    (config as { comfyuiPath?: string }).comfyuiPath = undefined;
+    savedDefaultWorkspace = resolve("/saved/workspace");
+    getSystemStats.mockRejectedValue(new Error("ECONNREFUSED"));
+    expect(await resolveModelsDir()).toBe(join(resolve("/saved/workspace"), "models"));
+  });
+
+  it("resolveModelsDir throws a clear, actionable error when nothing resolves", async () => {
+    (config as { comfyuiPath?: string }).comfyuiPath = undefined;
+    savedDefaultWorkspace = undefined;
+    getSystemStats.mockRejectedValue(new Error("ECONNREFUSED"));
+    await expect(resolveModelsDir()).rejects.toThrow(/set_default_workspace/);
   });
 
   it("resolveServerExtraModelConfig returns the server's config file, undefined when absent", async () => {

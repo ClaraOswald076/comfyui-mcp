@@ -1,7 +1,8 @@
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
-import { config, getComfyUIBaseUrl } from "../config.js";
+import { getComfyUIBaseUrl } from "../config.js";
+import { resolveEffectiveComfyUIBase } from "./workspace-env.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
 import { restartComfyUI } from "./process-control.js";
 import { ComfyUIError, ProcessControlError, ValidationError } from "../utils/errors.js";
@@ -84,8 +85,9 @@ const defaultDeps: VerifyDeps = {
     return Object.keys(data as Record<string, unknown>);
   },
   readPackInit: (packName: string) => {
-    if (!config.comfyuiPath) return undefined;
-    const initPath = join(config.comfyuiPath, "custom_nodes", packName, "__init__.py");
+    const base = resolveEffectiveComfyUIBase();
+    if (!base) return undefined;
+    const initPath = join(base, "custom_nodes", packName, "__init__.py");
     if (!existsSync(initPath)) return undefined;
     try {
       return readFileSync(initPath, "utf-8");
@@ -94,8 +96,9 @@ const defaultDeps: VerifyDeps = {
     }
   },
   readPackSources: (packName: string) => {
-    if (!config.comfyuiPath) return [];
-    const packDir = join(config.comfyuiPath, "custom_nodes", packName);
+    const base = resolveEffectiveComfyUIBase();
+    if (!base) return [];
+    const packDir = join(base, "custom_nodes", packName);
     if (!existsSync(packDir)) return [];
     const sources: string[] = [];
     const MAX_FILES = 200;
@@ -204,10 +207,17 @@ export async function verifyCustomNode(
   options: VerifyOptions,
   deps: VerifyDeps = defaultDeps,
 ): Promise<VerifyResult> {
-  if (!config.comfyuiPath) {
+  // Classify LOCAL vs remote by the EFFECTIVE local base (COMFYUI_PATH, else the
+  // saved default workspace when not targeting a remote ComfyUI), not by
+  // COMFYUI_PATH alone — otherwise a local instance backed only by a default
+  // workspace was wrongly rejected as remote when COMFYUI_PATH was unset
+  // (#386/#409). Only a genuinely remote target (or no local base at all) is
+  // unsupported here.
+  if (!resolveEffectiveComfyUIBase()) {
     throw new ProcessControlError(
       "verify_custom_node is local-only: it restarts and inspects a local ComfyUI " +
-        "install and needs COMFYUI_PATH. It cannot verify a remote --comfyui-url target.",
+        "install. It cannot verify a remote --comfyui-url target. Set the COMFYUI_PATH " +
+        "environment variable, or save a default workspace with set_default_workspace.",
     );
   }
 

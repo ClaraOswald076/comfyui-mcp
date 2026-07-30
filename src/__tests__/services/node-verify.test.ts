@@ -8,8 +8,17 @@ vi.mock("../../config.js", () => {
     config,
     getComfyUIApiHost: () => "127.0.0.1:8188",
     getComfyUIProtocol: () => "http",
+    isRemoteMode: () => false,
   };
 });
+
+// node-verify classifies local vs remote via resolveEffectiveComfyUIBase. Back it
+// by the mocked config's comfyuiPath (+ a settable default workspace) so tests can
+// exercise the "COMFYUI_PATH unset but a default workspace exists ⇒ LOCAL" path.
+let savedDefaultWorkspace: string | undefined;
+vi.mock("../../services/workspace-env.js", () => ({
+  resolveEffectiveComfyUIBase: () => config.comfyuiPath ?? savedDefaultWorkspace,
+}));
 
 // node-verify imports restartComfyUI at module load; stub it (tests inject deps).
 vi.mock("../../services/process-control.js", () => ({
@@ -65,6 +74,7 @@ NODE_CLASS_MAPPINGS = {
 describe("verifyCustomNode", () => {
   beforeEach(() => {
     config.comfyuiPath = "/fake/comfy";
+    savedDefaultWorkspace = undefined;
   });
 
   it("reports all node types loaded when present in /object_info", async () => {
@@ -118,11 +128,21 @@ describe("verifyCustomNode", () => {
     await expect(verifyCustomNode({}, deps)).rejects.toThrow(ValidationError);
   });
 
-  it("throws ProcessControlError in remote mode (no comfyuiPath)", async () => {
+  it("throws ProcessControlError when there is no local base (remote, no default workspace)", async () => {
     config.comfyuiPath = undefined;
+    savedDefaultWorkspace = undefined;
     await expect(
       verifyCustomNode({ classTypes: ["FooNode"] }, makeDeps()),
     ).rejects.toThrow(ProcessControlError);
+  });
+
+  it("classifies as LOCAL when COMFYUI_PATH is unset but a default workspace is saved (#386/#409)", async () => {
+    config.comfyuiPath = undefined;
+    savedDefaultWorkspace = "/saved/workspace";
+    // Must NOT throw the remote/local-only error; verification proceeds normally.
+    const res = await verifyCustomNode({ classTypes: ["FooNode"] }, makeDeps());
+    expect(res.loaded).toEqual(["FooNode"]);
+    expect(res.missing).toEqual([]);
   });
 
   it("infers from a re-exported literal in a non-__init__ pack source file", async () => {

@@ -4,7 +4,7 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { homedir, platform } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
-import { config, getComfyUIBaseUrl } from "../config.js";
+import { config, getComfyUIBaseUrl, isRemoteMode } from "../config.js";
 import { getSystemStats } from "../comfyui/client.js";
 import { logger } from "../utils/logger.js";
 import { ValidationError } from "../utils/errors.js";
@@ -67,6 +67,29 @@ export function getSavedDefaultWorkspaceSync(): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * The SINGLE source of truth for the effective LOCAL ComfyUI base directory used
+ * by every filesystem-backed tool (download_model, verify_custom_node, model
+ * lookups, apply_manifest's adoption). Resolution order, applied consistently so
+ * the tools never disagree about where ComfyUI lives when COMFYUI_PATH is unset:
+ *
+ *   1. config.comfyuiPath — COMFYUI_PATH env or auto-detection (wins).
+ *   2. When NOT targeting a remote ComfyUI, the saved DEFAULT WORKSPACE
+ *      (set via set_default_workspace) — this is what get_workspace /
+ *      get_environment already report, so local downloads / model lookups /
+ *      node verification work without COMFYUI_PATH.
+ *
+ * Never returns a local workspace in remote mode (that dir isn't the remote
+ * target; remote-mode callers route through ComfyUI-Manager instead). Returns
+ * undefined when no usable local path exists — callers then either detect a live
+ * server base dir (/system_stats) or emit a clear, actionable error.
+ */
+export function resolveEffectiveComfyUIBase(): string | undefined {
+  if (config.comfyuiPath) return config.comfyuiPath;
+  if (isRemoteMode()) return undefined;
+  return getSavedDefaultWorkspaceSync();
 }
 
 async function readWorkspaceConfig(): Promise<WorkspaceConfig> {

@@ -5,7 +5,7 @@ import { join, basename, resolve, relative, sep, isAbsolute } from "node:path";
 import { config, isRemoteMode } from "../config.js";
 import { getClient } from "../comfyui/client.js";
 import { getExtraModelRoots } from "./extra-paths.js";
-import { getSavedDefaultWorkspaceSync } from "./workspace-env.js";
+import { resolveEffectiveComfyUIBase } from "./workspace-env.js";
 import { installModelViaManager } from "./node-management.js";
 import { ModelError, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
@@ -134,9 +134,7 @@ export interface LocalModel {
  * target). Returns undefined when no usable local path exists.
  */
 function resolveComfyUIBase(): string | undefined {
-  if (config.comfyuiPath) return config.comfyuiPath;
-  if (isRemoteMode()) return undefined;
-  return getSavedDefaultWorkspaceSync();
+  return resolveEffectiveComfyUIBase();
 }
 
 function getModelsRoot(): string {
