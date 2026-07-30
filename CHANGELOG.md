@@ -6,6 +6,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.10] - 2026-07-30
+
+### MCP
+
+#### Fixed
+- download resume survives an orchestrator/panel reconnect: a nominally-local session that loses its resolvable ComfyUI base after reconnect now routes the download through the still-connected ComfyUI-Manager instead of failing with "COMFYUI_PATH is not configured"; the in-flight job registry is dual-keyed (route-independent request key + destination) so a Manager<->local route flip can't spawn a duplicate same-file writer (#420) (#440)
+- train_caption_dataset fails fast on a persistent Claude auth failure (not-logged-in / invalid key / expired token) with an actionable message, instead of looping every image re-hitting the same error; transient per-file errors still continue (#438) (#439)
+
+
 ## [0.48.9] - 2026-07-30
 
 ### MCP
