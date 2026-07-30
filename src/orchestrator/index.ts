@@ -35,6 +35,7 @@ import {
   type SlashCommand,
   type UsageStatus,
 } from "./panel-agent.js";
+import { promptText } from "./error-text.js";
 import { createPanelMcpServer } from "./panel-tools.js";
 import {
   optionsAckFrame,
@@ -3278,13 +3279,20 @@ export async function runPanelOrchestrator(): Promise<void> {
       return;
     }
 
-    if (
-      event.type !== "user_message" ||
-      typeof event.text !== "string" ||
-      !event.tab_id
-    ) {
+    if (event.type !== "user_message" || !event.tab_id) {
       return;
     }
+    // A well-behaved panel sends a string `text`, but a structured / multi-part
+    // payload must be COERCED here rather than silently dropped: dropping loses
+    // the whole turn, and letting a non-string flow downstream interpolates as
+    // "[object Object]" in the model prompt (#175). Coerce at ingress so every
+    // consumer (echo, batching join, backend preamble) sees a real string.
+    if (typeof event.text !== "string") {
+      const rawText = (event as { text?: unknown }).text;
+      if (rawText == null) return; // nothing to say (image-only turns were never accepted here)
+      (event as { text: string }).text = promptText(rawText);
+    }
+    if (typeof event.text !== "string") return; // coerced above — narrows the type for downstream use
     // Echo so the user immediately sees their own message land in the chat.
     bridge.push({ type: "echo", text: event.text }, event.tab_id);
     // Per-message ack: a live server-side signal that the agent received this

@@ -23,7 +23,7 @@ import type {
   McpSdkServerConfigWithInstance,
 } from "@anthropic-ai/claude-agent-sdk";
 import { logger } from "../utils/logger.js";
-import { errorText } from "./error-text.js";
+import { errorText, promptText } from "./error-text.js";
 import type { SessionStore } from "./session-store.js";
 import type { AgentBackend, AgentEvent, NeutralTurn } from "./agent-backend.js";
 import {
@@ -640,7 +640,9 @@ export class PanelAgent {
       for (const it of batch) {
         if (it.mid) this.deps.onSeen?.(this.tabId, it.mid);
       }
-      let text = batch.map((it) => it.text).join("\n\n");
+      // Coerce each part before joining: a structured payload that slipped past
+      // ingress would otherwise stringify to "[object Object]" here (#175).
+      let text = batch.map((it) => promptText(it.text)).join("\n\n");
       let images = batch.flatMap((it) => it.images ?? []);
       if (images.length && !this.backend.capabilities.vision) {
         // Text-only backend: every non-vision adapter silently ignores image

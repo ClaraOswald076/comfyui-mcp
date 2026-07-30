@@ -6,21 +6,41 @@
  * which then surfaces in the panel chat as an unreadable bubble (#176). Extract
  * a string `message` field when present, otherwise JSON-serialize, and only
  * fall back to `String()` for true primitives.
+ *
+ * Every property read runs inside try/catch: a value may be a Proxy or carry a
+ * throwing getter, and normalization must never itself throw.
  */
 export function errorText(err: unknown): string {
-  if (err instanceof Error) return err.message;
+  if (err instanceof Error) {
+    try {
+      // A subclass can carry a non-string `message` (e.g. an object) — that
+      // would re-introduce "[object Object]", so coerce it.
+      if (typeof err.message === "string" && err.message) return err.message;
+      if (err.message != null) return errorText(err.message);
+    } catch {
+      // fall through to the generic object handling below
+    }
+  }
   if (err && typeof err === "object") {
-    const message = (err as { message?: unknown }).message;
-    if (typeof message === "string" && message.trim()) return message;
+    try {
+      const message = (err as { message?: unknown }).message;
+      if (typeof message === "string" && message.trim()) return message;
+    } catch {
+      // throwing getter/proxy — ignore and try to serialize instead
+    }
     try {
       const json = JSON.stringify(err);
       if (typeof json === "string" && json && json !== "{}") return json;
     } catch {
-      // fall through to the primitive coercion below
+      // circular / bigint / throwing toJSON — fall through
     }
     return "unknown error";
   }
-  return String(err);
+  try {
+    return String(err);
+  } catch {
+    return "unknown error";
+  }
 }
 
 /**
@@ -30,21 +50,39 @@ export function errorText(err: unknown): string {
  * part reaching a prompt template interpolates as "[object Object]", silently
  * losing the message context in the model prompt (#175). Extract a string
  * `text` field when the value is an object, otherwise JSON-serialize — never
- * rely on implicit object coercion.
+ * rely on implicit object coercion, and never collapse a payload that still
+ * carries `parts` to an empty prompt.
  */
 export function promptText(value: unknown): string {
   if (typeof value === "string") return value;
   if (value == null) return "";
   if (typeof value === "object") {
-    const text = (value as { text?: unknown }).text;
-    if (typeof text === "string") return text;
+    let text: unknown;
+    let hasParts = false;
+    try {
+      text = (value as { text?: unknown }).text;
+      const parts = (value as { parts?: unknown }).parts;
+      hasParts = Array.isArray(parts) && parts.length > 0;
+    } catch {
+      // throwing getter/proxy — serialize the whole value below
+    }
+    // A non-empty text field is authoritative. An EMPTY text alongside `parts`
+    // must NOT win — that would drop the parts and yield an empty prompt; fall
+    // through to serialize the whole payload instead.
+    if (typeof text === "string" && (text || !hasParts)) return text;
     try {
       const json = JSON.stringify(value);
       if (typeof json === "string" && json && json !== "{}") return json;
     } catch {
-      // fall through
+      // circular / bigint / throwing toJSON — fall through
     }
+    // Serialization failed but the payload was real content; never hand the
+    // model an empty prompt that silently erases the user's turn.
+    return "[unserializable message payload]";
+  }
+  try {
+    return String(value);
+  } catch {
     return "";
   }
-  return String(value);
 }
