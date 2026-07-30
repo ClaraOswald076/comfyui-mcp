@@ -64,4 +64,18 @@ describe("searchObjectInfo", () => {
   it("honors the result limit", () => {
     expect(searchObjectInfo(objectInfo, "", 2)).toHaveLength(2);
   });
+
+  it("fuzzy-matches a typo when no substring match exists (ksamplr → KSampler)", () => {
+    // Strict substring finds nothing for the typo; the fuzzy (subsequence) pass
+    // recovers KSampler.
+    const hits = searchObjectInfo(objectInfo, "ksamplr");
+    expect(hits.map((h) => h.class_type)).toContain("KSampler");
+  });
+
+  it("prefers exact/substring matches over fuzzy (strict pass wins)", () => {
+    // "sampler" is a substring of KSampler; the strict pass returns it and the
+    // fuzzy pass never runs, so unrelated subsequence hits don't dilute results.
+    const hits = searchObjectInfo(objectInfo, "sampler");
+    expect(hits[0].class_type).toBe("KSampler");
+  });
 });

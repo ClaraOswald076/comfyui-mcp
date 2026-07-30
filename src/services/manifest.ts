@@ -29,7 +29,7 @@ import {
   MODEL_SUBDIRS,
   type ModelType,
 } from "./model-resolver.js";
-import { startDownloadJob } from "./download-jobs.js";
+import { startDownloadJob, type DownloadJob } from "./download-jobs.js";
 import { getSavedDefaultWorkspaceSync } from "./workspace-env.js";
 import { ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
@@ -84,7 +84,7 @@ export type ManifestAction =
   | "custom_node"
   | "model";
 
-export type ManifestItemStatus = "applied" | "skipped" | "failed";
+export type ManifestItemStatus = "applied" | "skipped" | "failed" | "pending";
 
 export interface ManifestItemReport {
   item: string;
@@ -525,6 +525,28 @@ function remoteModelTarget(model: ComfyManifest["models"][number]): {
   return { name: filename, type, save_path, filename, category };
 }
 
+/**
+ * #390: resolve a saved default workspace to adopt as the local FS target for
+ * THIS apply_manifest call, WITHOUT persisting it process-wide. Returns a path
+ * only when: we are in local mode (a loopback/local ComfyUI, not remote/cloud),
+ * COMFYUI_PATH is unset, and the saved default (what get_environment resolves)
+ * both exists and looks like a ComfyUI install (has models/ or custom_nodes/).
+ * The connected server is local (isRemoteMode() === false), so the saved default
+ * is a valid local mirror of it. Returns undefined otherwise.
+ */
+function adoptableLocalWorkspace(): string | undefined {
+  if (config.comfyuiPath || isRemoteMode()) return undefined;
+  const saved = getSavedDefaultWorkspaceSync();
+  if (
+    saved &&
+    existsSync(saved) &&
+    (existsSync(join(saved, "models")) || existsSync(join(saved, "custom_nodes")))
+  ) {
+    return saved;
+  }
+  return undefined;
+}
+
 async function installedNodesOrEmpty(): Promise<InstalledNode[]> {
   try {
     return await listInstalledNodes();
@@ -540,38 +562,46 @@ export async function applyManifest(
   opts: ApplyManifestOptions,
 ): Promise<ApplyManifestResult> {
   const manifest = await resolveManifest(opts);
+
+  // #390 (call-scoped): adopt a saved default workspace as the local FS target
+  // for THIS call ONLY — never persist it process-wide. Persisting
+  // config.comfyuiPath would make a later apply route to a stale/other workspace
+  // (and would never re-read a changed default), and would leak the adopted path
+  // to every other tab/tool sharing this process. Temp-set for the duration of
+  // the apply and always restore in finally. Safe for the background downloads
+  // enqueued below: downloadModel resolves its destination from the LIVE server's
+  // models dir (resolveModelSubfolderPreferServer), not config.comfyuiPath, so a
+  // restore before a job finishes cannot misplace the file.
+  const adopted = adoptableLocalWorkspace();
+  const priorComfyuiPath = config.comfyuiPath;
+  if (adopted) {
+    logger.info(
+      "apply_manifest: adopting saved default workspace as the local ComfyUI path for this call (COMFYUI_PATH unset)",
+      { path: adopted },
+    );
+    config.comfyuiPath = adopted;
+  }
+  try {
+    return await applyManifestSections(manifest);
+  } finally {
+    if (adopted) config.comfyuiPath = priorComfyuiPath;
+  }
+}
+
+async function applyManifestSections(
+  manifest: ComfyManifest,
+): Promise<ApplyManifestResult> {
   const results: ManifestItemReport[] = [];
 
   // Per-section mode handling. A LOCAL filesystem is usable only when we are NOT
-  // in remote (or cloud) mode AND COMFYUI_PATH is set; otherwise we are targeting
-  // a remote/cloud ComfyUI over HTTP. Keying off isRemoteMode() (rather than mere
+  // in remote (or cloud) mode AND COMFYUI_PATH is set (possibly a call-scoped
+  // adopted workspace, see applyManifest); otherwise we are targeting a
+  // remote/cloud ComfyUI over HTTP. Keying off isRemoteMode() (rather than mere
   // comfyuiPath presence) matters because a remote target can coexist with an
   // unrelated COMFYUI_PATH on this machine — in that case we must still route
   // pip/model handling remotely instead of touching the local install/disk.
   // custom_nodes and models can still be handled remotely through ComfyUI-Manager's
   // HTTP API, but pip/apt have no remote equivalent.
-  // #390: In LOCAL mode a saved default workspace (set via set_default_workspace,
-  // i.e. what get_environment resolves) is a valid local filesystem target even
-  // when COMFYUI_PATH is unset. Adopt it as the active local path so models
-  // download to the local disk and unregistered custom nodes can clone into
-  // custom_nodes — matching how model-resolver already treats the saved default
-  // as authoritative for local FS. Only when it exists AND looks like a ComfyUI
-  // install (has models/ or custom_nodes/), so a stale/garbage saved value isn't
-  // trusted. NOT done in remote/cloud mode (a remote target has no local FS).
-  if (!config.comfyuiPath && !isRemoteMode()) {
-    const saved = getSavedDefaultWorkspaceSync();
-    if (
-      saved &&
-      existsSync(saved) &&
-      (existsSync(join(saved, "models")) || existsSync(join(saved, "custom_nodes")))
-    ) {
-      logger.info(
-        "apply_manifest: adopting saved default workspace as the local ComfyUI path (COMFYUI_PATH unset)",
-        { path: saved },
-      );
-      config.comfyuiPath = saved;
-    }
-  }
   const comfyuiPath = config.comfyuiPath;
   const hasLocalFs = !isRemoteMode() && Boolean(comfyuiPath);
 
@@ -657,13 +687,24 @@ export async function applyManifest(
     }
   }
 
+  // #362: enqueue ALL local model downloads to the background job registry FIRST
+  // (no per-model blocking), then await ONE short grace window across the whole
+  // batch. A big pack has many multi-GB files; awaiting each sequentially — even
+  // with a per-file grace — scales with the number of models and blows past the
+  // 300s tools/call timeout. A single batch-wide grace is bounded regardless of
+  // count: quick/local files finish inside it (reported "applied"), the rest keep
+  // streaming and are reported "pending" with a job id to poll via
+  // download_status. A still-running download is NEVER counted as "applied", so
+  // top-level success never claims an unfinished download succeeded.
+  const enqueued: Array<{ item: string; job: DownloadJob; settled: Promise<void> }> = [];
   for (const model of manifest.models) {
     const item = model.local_path ?? model.filename ?? model.url;
     try {
       if (!hasLocalFs) {
         // REMOTE: no local filesystem to scan/write. Route the download to the
         // ComfyUI host via ComfyUI-Manager's install-model task (server-side
-        // fetch). Cloud mode has no Manager, so report it as unsupported.
+        // fetch, returns at handoff). Cloud mode has no Manager, so report it as
+        // unsupported.
         if (!isRemoteMode()) {
           results.push(
             report(
@@ -694,42 +735,12 @@ export async function applyManifest(
         results.push(report("model", item, "skipped", `Model already exists at ${existing}.`));
         continue;
       }
-      // #362: A large model pack can push the whole apply_manifest call past the
-      // MCP tools/call timeout (~300s) while it blocks on multi-GB downloads,
-      // leaving no resumable result. Hand each download to the background job
-      // registry (the same one download_model uses) and only await a short grace
-      // window: small files still land inline (reported "applied"), while a big
-      // download keeps streaming and is reported as started with a job id to poll
-      // via download_status — so the tool returns promptly and nothing is lost.
       const { job, settled } = startDownloadJob(
         model.url,
         target.targetSubfolder,
         target.filename,
       );
-      let graceTimer: NodeJS.Timeout | undefined;
-      await Promise.race([
-        settled,
-        new Promise<void>((r) => {
-          graceTimer = setTimeout(r, manifestDownloadGraceMs());
-        }),
-      ]);
-      if (graceTimer) clearTimeout(graceTimer);
-      if (job.status === "error") {
-        results.push(report("model", item, "failed", job.error ?? "Model download failed."));
-      } else if (job.status === "done") {
-        results.push(report("model", item, "applied", `Model downloaded to ${job.path}.`));
-      } else {
-        results.push(
-          report(
-            "model",
-            item,
-            "applied",
-            `Model download STARTED in the background (job ${job.id}) and is still running — ` +
-              `this is NOT a failure. Poll download_status with this id; the file lands on its own. ` +
-              `Do not re-issue the download.`,
-          ),
-        );
-      }
+      enqueued.push({ item, job, settled });
     } catch (err) {
       results.push(
         report(
@@ -742,14 +753,50 @@ export async function applyManifest(
     }
   }
 
+  if (enqueued.length > 0) {
+    // Single bounded grace over the whole batch (settled never rejects — the job
+    // registry captures errors onto job.status). allSettled resolves early if
+    // every download finishes fast; otherwise the timer caps the wait.
+    let graceTimer: NodeJS.Timeout | undefined;
+    await Promise.race([
+      Promise.allSettled(enqueued.map((e) => e.settled)),
+      new Promise<void>((r) => {
+        graceTimer = setTimeout(r, manifestDownloadGraceMs());
+      }),
+    ]);
+    if (graceTimer) clearTimeout(graceTimer);
+    for (const { item, job } of enqueued) {
+      if (job.status === "error") {
+        results.push(report("model", item, "failed", job.error ?? "Model download failed."));
+      } else if (job.status === "done") {
+        results.push(report("model", item, "applied", `Model downloaded to ${job.path}.`));
+      } else {
+        results.push(
+          report(
+            "model",
+            item,
+            "pending",
+            `Model download is RUNNING in the background (job ${job.id}) — NOT yet complete, ` +
+              `and NOT a failure. Poll download_status with this id; the file lands on its own. ` +
+              `Do not re-issue the download.`,
+          ),
+        );
+      }
+    }
+  }
+
   const summary: Record<ManifestItemStatus, number> = {
     applied: 0,
     skipped: 0,
     failed: 0,
+    pending: 0,
   };
   for (const result of results) summary[result.status]++;
 
   return {
+    // A still-running (pending) download is not a failure; success reflects only
+    // that nothing FAILED. Pending items are reported separately so the caller
+    // knows the apply isn't fully settled and must poll download_status.
     success: summary.failed === 0,
     summary,
     results,

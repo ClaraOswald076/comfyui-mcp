@@ -118,9 +118,16 @@ export function registerComfyCliTools(server: McpServer): void {
         // searching the connected local server (not Comfy Cloud, and not an
         // explicit offline object_info file), query the running ComfyUI's
         // /object_info directly instead of failing on the missing CLI.
+        // Honor an explicit `workspace`: /object_info comes from the CONNECTED
+        // server, which may be a DIFFERENT install than the one requested — so
+        // when a workspace is pinned we do NOT substitute it silently. Instead we
+        // fall through and let comfy-cli surface its clear not-found error for
+        // that workspace (install comfy-cli there, or drop `workspace` to search
+        // the connected server).
         if (
           args.where !== "cloud" &&
           !args.objectInfoPath &&
+          !args.workspace &&
           !resolveComfyCliExecutable({ workspace: args.workspace })
         ) {
           const results = await searchLiveObjectInfo(args.query, args.limit ?? 20);

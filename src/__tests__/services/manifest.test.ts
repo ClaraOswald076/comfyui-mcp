@@ -204,7 +204,7 @@ describe("applyManifest", () => {
       },
     });
 
-    expect(result.summary).toEqual({ applied: 0, skipped: 3, failed: 0 });
+    expect(result.summary).toEqual({ applied: 0, skipped: 3, failed: 0, pending: 0 });
     expect(result.results.map((r) => r.status)).toEqual(["skipped", "skipped", "skipped"]);
     expect(installCustomNodeMock).not.toHaveBeenCalled();
     expect(downloadModelMock).not.toHaveBeenCalled();
@@ -227,7 +227,7 @@ describe("applyManifest", () => {
     });
 
     expect(result.success).toBe(false);
-    expect(result.summary).toEqual({ applied: 1, skipped: 0, failed: 1 });
+    expect(result.summary).toEqual({ applied: 1, skipped: 0, failed: 1, pending: 0 });
     expect(result.results).toMatchObject([
       { action: "custom_node", item: "bad-node", status: "failed" },
       { action: "model", item: "loras/model.safetensors", status: "applied" },
@@ -314,7 +314,7 @@ describe("applyManifest", () => {
       },
     });
 
-    expect(result.summary).toEqual({ applied: 0, skipped: 1, failed: 0 });
+    expect(result.summary).toEqual({ applied: 0, skipped: 1, failed: 0, pending: 0 });
     expect(result.results).toMatchObject([
       { action: "model", status: "skipped", item: "big.safetensors" },
     ]);
@@ -345,7 +345,7 @@ describe("applyManifest", () => {
       },
     });
 
-    expect(result.summary).toEqual({ applied: 0, skipped: 1, failed: 0 });
+    expect(result.summary).toEqual({ applied: 0, skipped: 1, failed: 0, pending: 0 });
     expect(result.results[0].status).toBe("skipped");
     expect(listLocalModelsMock).toHaveBeenCalledWith("checkpoints");
     expect(downloadModelMock).not.toHaveBeenCalled();
@@ -369,7 +369,7 @@ describe("applyManifest", () => {
       },
     });
 
-    expect(result.summary).toEqual({ applied: 0, skipped: 1, failed: 0 });
+    expect(result.summary).toEqual({ applied: 0, skipped: 1, failed: 0, pending: 0 });
     expect(result.results[0].status).toBe("skipped");
     expect(listLocalModelsMock).toHaveBeenCalledWith("checkpoints");
     expect(downloadModelMock).not.toHaveBeenCalled();
@@ -394,7 +394,7 @@ describe("applyManifest", () => {
       },
     });
 
-    expect(result.summary).toEqual({ applied: 1, skipped: 0, failed: 0 });
+    expect(result.summary).toEqual({ applied: 1, skipped: 0, failed: 0, pending: 0 });
     expect(downloadModelMock).toHaveBeenCalledWith(
       "https://example.com/model.safetensors",
       expect.stringMatching(/checkpoints[\\/]foo/),
@@ -418,7 +418,7 @@ describe("applyManifest", () => {
       },
     });
 
-    expect(result.summary).toEqual({ applied: 1, skipped: 0, failed: 0 });
+    expect(result.summary).toEqual({ applied: 1, skipped: 0, failed: 0, pending: 0 });
     expect(downloadModelMock).toHaveBeenCalledWith(
       "https://example.com/new.safetensors",
       "loras",
@@ -434,7 +434,7 @@ describe("applyManifest", () => {
       manifest: { pip: ["torch==2.4.0"] },
     });
 
-    expect(result.summary).toEqual({ applied: 1, skipped: 0, failed: 0 });
+    expect(result.summary).toEqual({ applied: 1, skipped: 0, failed: 0, pending: 0 });
     expect(execFileSyncMock).toHaveBeenCalledWith(
       detectCmd,
       detectArgs,
@@ -483,7 +483,7 @@ describe("applyManifest", () => {
 
     const result = await applyManifest({ manifest: { pip: ["imageio-ffmpeg"] } });
 
-    expect(result.summary).toEqual({ applied: 1, skipped: 0, failed: 0 });
+    expect(result.summary).toEqual({ applied: 1, skipped: 0, failed: 0, pending: 0 });
     expect(execFileSyncMock).toHaveBeenCalledWith(
       expect.stringMatching(/python/),
       ["-m", "pip", "install", "imageio-ffmpeg"],
@@ -513,10 +513,12 @@ describe("applyManifest", () => {
 
     expect(result.summary).toMatchObject({ applied: 1, failed: 0 });
     expect(downloadModelMock).toHaveBeenCalled();
-    expect(mockConfig.comfyuiPath).toBe("/saved/ComfyUI");
+    // Call-scoped: the adopted path must NOT persist process-wide — it is
+    // restored so a later call re-reads/revalidates and other tabs aren't leaked.
+    expect(mockConfig.comfyuiPath).toBeUndefined();
   });
 
-  it("hands a slow model download to a background job instead of blocking (#362)", async () => {
+  it("hands a slow model download to a background job (pending, not applied) (#362)", async () => {
     const prevGrace = process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS;
     process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS = "0";
     downloadModelMock.mockReturnValue(new Promise<string>(() => {}));
@@ -529,8 +531,38 @@ describe("applyManifest", () => {
           ],
         },
       });
-      expect(result.summary).toMatchObject({ applied: 1, failed: 0 });
-      expect(result.results[0].message).toMatch(/background|STARTED/i);
+      // A still-running download is PENDING, never counted as applied.
+      expect(result.summary).toMatchObject({ applied: 0, failed: 0, pending: 1 });
+      expect(result.results[0].status).toBe("pending");
+      expect(result.results[0].message).toMatch(/background|RUNNING/i);
+      // success reflects only that nothing FAILED (the apply isn't fully settled).
+      expect(result.success).toBe(true);
+    } finally {
+      if (prevGrace === undefined) delete process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS;
+      else process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS = prevGrace;
+    }
+  });
+
+  it("does not block on MANY slow downloads — enqueues all, one bounded grace (#362)", async () => {
+    const prevGrace = process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS;
+    process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS = "50";
+    // Every download hangs; a per-model grace would be 50ms * N. One batch-wide
+    // grace must cap total wait near a single window regardless of count.
+    downloadModelMock.mockReturnValue(new Promise<string>(() => {}));
+    const models = Array.from({ length: 20 }, (_, i) => ({
+      url: `https://example.com/m${i}.safetensors`,
+      model_type: "checkpoints" as const,
+      filename: `m${i}.safetensors`,
+    }));
+
+    try {
+      const started = Date.now();
+      const result = await applyManifest({ manifest: { models } });
+      const elapsed = Date.now() - started;
+      expect(result.summary).toMatchObject({ applied: 0, failed: 0, pending: 20 });
+      // All 20 enqueued up front; total wait bounded by one grace window, not 20×.
+      expect(downloadModelMock).toHaveBeenCalledTimes(20);
+      expect(elapsed).toBeLessThan(1000);
     } finally {
       if (prevGrace === undefined) delete process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS;
       else process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS = prevGrace;

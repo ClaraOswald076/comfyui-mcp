@@ -63,6 +63,15 @@ describe("download job registry", () => {
     expect(listDownloadJobs()).toHaveLength(2);
   });
 
+  it("keys jobs by URL AND destination so different targets don't collapse", () => {
+    // Same URL fetched to two different destinations must be two downloads —
+    // collapsing them wrote only the first destination while reporting both done.
+    startDownloadJob(URL_A, "checkpoints");
+    startDownloadJob(URL_A, "loras", "renamed.safetensors");
+    expect(hoisted.calls).toBe(2);
+    expect(listDownloadJobs()).toHaveLength(2);
+  });
+
   it("records the landed path on success", async () => {
     const { job, settled } = startDownloadJob(URL_A, "checkpoints");
     hoisted.resolvers[0].resolve("C:/models/checkpoints/big.safetensors");
