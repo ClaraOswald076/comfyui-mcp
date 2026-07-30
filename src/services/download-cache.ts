@@ -4,6 +4,7 @@ import {
   copyFile,
   link,
   mkdir,
+  open,
   readFile,
   readdir,
   rename,
@@ -53,6 +54,291 @@ async function fileSizeOrUndefined(path: string): Promise<number | undefined> {
   } catch {
     return undefined;
   }
+}
+
+/** Destination extensions whose bytes MUST be a binary model payload — never an
+ *  HTML page or a JSON document. A download that lands under one of these but whose
+ *  body is actually an auth-challenge / error page is the #473 false-success class:
+ *  a login HTML or `{"error":...}` JSON saved as `.safetensors`, reported as a green
+ *  success, then failing at load time ("header too large"). Extensions NOT in this
+ *  set (e.g. `.json`, `.yaml`, `.txt`, config sidecars) are left unvalidated so a
+ *  legitimate text/JSON download is never rejected. */
+// Superset of every BINARY model format the repo recognizes as a downloadable
+// weight file — kept in sync with the recognizers in missing-models.ts (MODEL_EXTS)
+// and workflow-converter.ts (the model-file regex). Intentionally EXCLUDES the
+// textual formats those recognizers also allow (`.yaml`, `.json`): those legitimately
+// contain text, so validating them as binary would reject a valid download.
+const MODEL_BINARY_EXTS = new Set([
+  ".safetensors",
+  ".safetensor",
+  ".sft",
+  ".ckpt",
+  ".pt",
+  ".pt2",
+  ".pth",
+  ".bin",
+  ".gguf",
+  ".onnx",
+  ".vae",
+  ".pkl",
+  ".npz",
+  ".msgpack",
+]);
+
+/** How many leading bytes to sniff for a payload's shape. Enough to see an HTML
+ *  doctype/tag or a JSON error envelope's opening structure without reading a
+ *  multi-GB model in full. */
+const PAYLOAD_SNIFF_BYTES = 512;
+
+/** Read the first `n` bytes of a file WITHOUT loading the whole thing (models are
+ *  multi-GB) — used to sniff a completed download's shape. Best-effort: returns
+ *  undefined if the file can't be opened/read (never blocks a download over a read
+ *  hiccup — the size gate has already run). */
+async function readHead(path: string, n = PAYLOAD_SNIFF_BYTES): Promise<Buffer | undefined> {
+  let fh: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    fh = await open(path, "r");
+    const buf = Buffer.alloc(n);
+    // Loop: a single read() can return fewer bytes than requested even when more
+    // are available; fill up to n (or EOF) so a short first read can't truncate the
+    // sniff window and hide an HTML/JSON body after byte ~1.
+    let off = 0;
+    while (off < n) {
+      const { bytesRead } = await fh.read(buf, off, n - off, off);
+      if (bytesRead === 0) break; // EOF
+      off += bytesRead;
+    }
+    return buf.subarray(0, off);
+  } catch {
+    return undefined;
+  } finally {
+    await fh?.close().catch(() => undefined);
+  }
+}
+
+/** True when a run of bytes reads as a valid UTF-8 TEXT document (what an HTML page
+ *  or JSON error IS) rather than binary model bytes. This is a real UTF-8 validation,
+ *  not "any high byte counts as text": each non-ASCII byte must be a well-formed
+ *  UTF-8 lead followed by valid continuation bytes, and NUL / C0 control bytes
+ *  (except tab/LF/CR) hard-fail. Random binary that happens to start with `<`/`{`/`[`
+ *  almost immediately hits an invalid UTF-8 lead byte (0x80–0xC1 and 0xF5–0xFF — ~26%
+ *  of all byte values) or a control byte, so it is correctly kept binary; a safetensors
+ *  whose LE header length is 60 (0x3C='<') is followed by NUL padding and fails at once.
+ *  A multibyte sequence truncated by the end of the sniff window is accepted (we only
+ *  sampled a prefix), never treated as invalid. */
+function looksLikeText(slice: Buffer): boolean {
+  const n = slice.length;
+  if (n === 0) return false;
+  let i = 0;
+  while (i < n) {
+    const b = slice[i];
+    if (b < 0x80) {
+      // ASCII: printable + tab/LF/CR only. NUL/other C0 controls ⇒ not text.
+      if (b === 0x09 || b === 0x0a || b === 0x0d || (b >= 0x20 && b <= 0x7e)) {
+        i += 1;
+        continue;
+      }
+      return false;
+    }
+    // Multibyte lead byte → determine the sequence length; invalid leads reject.
+    let len: number;
+    if (b >= 0xc2 && b <= 0xdf) len = 2;
+    else if (b >= 0xe0 && b <= 0xef) len = 3;
+    else if (b >= 0xf0 && b <= 0xf4) len = 4;
+    else return false; // 0x80–0xC1 (bare continuation / overlong) or 0xF5–0xFF
+    if (i + len > n) return true; // sequence truncated by the sniff window — accept
+    // Strict continuation ranges reject overlong / surrogate / out-of-range forms:
+    //   E0 → A0..BF (else overlong), ED → 80..9F (else surrogate),
+    //   F0 → 90..BF (else overlong), F4 → 80..8F (else > U+10FFFF).
+    let lo = 0x80;
+    let hi = 0xbf;
+    if (b === 0xe0) lo = 0xa0;
+    else if (b === 0xed) hi = 0x9f;
+    else if (b === 0xf0) lo = 0x90;
+    else if (b === 0xf4) hi = 0x8f;
+    if (slice[i + 1] < lo || slice[i + 1] > hi) return false;
+    for (let k = 2; k < len; k += 1) {
+      const cont = slice[i + k];
+      if (cont < 0x80 || cont > 0xbf) return false; // not a valid continuation byte
+    }
+    i += len;
+  }
+  return true;
+}
+
+/** Classify a sniffed payload head as an HTML page, a JSON document, or opaque
+ *  binary. Skips a UTF-8 BOM and leading ASCII whitespace, then requires the run
+ *  that follows to read as TEXT before declaring html/json — so a binary model that
+ *  merely starts with byte `<`/`{`/`[` (e.g. a safetensors whose LE header length is
+ *  60=0x3C or 91=0x5B, followed by NUL padding) is correctly kept as "binary":
+ *   - leading `<` + text ⇒ "html"
+ *   - leading `{`/`[` + text ⇒ "json"
+ *   - anything else ⇒ "binary" (a real model payload). */
+/** Classify an already-DECODED text string (used for UTF-16 bodies): skips leading
+ *  whitespace, then a `<` ⇒ html / `{`|`[` ⇒ json when the run that follows is clean
+ *  text (no NUL / C0 control). A binary payload that merely decoded to a leading
+ *  `<`/`{` (e.g. a safetensors whose UTF-16 decode yields `<` then U+0000) fails the
+ *  text check and stays binary. */
+function classifyDecodedText(s: string): "html" | "json" | "binary" {
+  let j = 0;
+  while (j < s.length && (s[j] === " " || s[j] === "\t" || s[j] === "\n" || s[j] === "\r")) j += 1;
+  if (j >= s.length) return "binary";
+  const ch = s[j];
+  const rest = s.slice(j, j + 64);
+  const isText = (() => {
+    for (const c of rest) {
+      const cp = c.codePointAt(0)!;
+      if (cp === 0x09 || cp === 0x0a || cp === 0x0d) continue;
+      if (cp < 0x20 || cp === 0xfffd) return false; // NUL/C0 control or replacement char
+    }
+    return true;
+  })();
+  if (ch === "<") return isText ? "html" : "binary";
+  if (ch === "{" || ch === "[") return isText ? "json" : "binary";
+  return "binary";
+}
+
+function classifyPayload(buf: Buffer): "html" | "json" | "binary" {
+  // A UTF-16 BOM (FF FE = LE, FE FF = BE) marks a text document — an HTML/JSON auth
+  // page can be served UTF-16 (e.g. `text/html; charset=utf-16`, bytes FF FE 3C 00).
+  // Decode and classify as text so it isn't mistaken for binary. A binary model that
+  // coincidentally starts with a BOM byte pair decodes to control chars → stays binary.
+  if (
+    buf.length >= 2 &&
+    ((buf[0] === 0xff && buf[1] === 0xfe) || (buf[0] === 0xfe && buf[1] === 0xff))
+  ) {
+    try {
+      const label = buf[0] === 0xff ? "utf-16le" : "utf-16be";
+      return classifyDecodedText(new TextDecoder(label).decode(buf));
+    } catch {
+      return "binary";
+    }
+  }
+  let i = 0;
+  if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) i = 3; // UTF-8 BOM
+  while (
+    i < buf.length &&
+    (buf[i] === 0x20 || buf[i] === 0x09 || buf[i] === 0x0a || buf[i] === 0x0d)
+  ) {
+    i += 1;
+  }
+  if (i >= buf.length) return "binary";
+  const c = buf[i];
+  const rest = buf.subarray(i, Math.min(buf.length, i + 64));
+  if (c === 0x3c) return looksLikeText(rest) ? "html" : "binary"; // '<'
+  if (c === 0x7b || c === 0x5b) return looksLikeText(rest) ? "json" : "binary"; // '{' or '['
+  return "binary";
+}
+
+/** Given a completed download's sniffed head + Content-Type, decide whether the
+ *  bytes are an auth/error page masquerading as a model file (#473). Returns the
+ *  offending kind, or null when the payload is an acceptable model binary (or the
+ *  destination isn't a model-binary extension, so this validation doesn't apply).
+ *
+ *  Body shape is AUTHORITATIVE: an HTML page's leading `<` and a JSON error's leading
+ *  `{`/`[` are present regardless of how the server labels the response, so body magic
+ *  catches every realistic auth/error page. Content-Type is only a CORROBORATING
+ *  signal, applied solely when the body is NOT identifiably binary — it must never
+ *  override a genuinely-binary body, or a legitimate model served with a mislabeled
+ *  `text/html`/`application/json` header would be wrongly rejected (a false-negative).
+ *  (fetch() transparently decompresses gzip/br, so a compressed error page still
+ *  sniffs as its decoded HTML/JSON here.) */
+function detectNonModelPayload(
+  head: Buffer | undefined,
+  contentType: string,
+  modelExt: string,
+): "html" | "json" | null {
+  if (!modelExt || !MODEL_BINARY_EXTS.has(modelExt.toLowerCase())) return null;
+  const kind = head ? classifyPayload(head) : "binary";
+  if (kind === "html") return "html";
+  if (kind === "json") return "json";
+  // Body reads as opaque binary — a real model payload. A mislabeled Content-Type
+  // does NOT override that (avoids rejecting a legit binary). Content-Type only
+  // corroborates when we truly have no binary body evidence (an empty head — which
+  // the callers already treat as fail-closed before reaching here).
+  if (!head || head.length === 0) {
+    if (/text\/html|application\/xhtml/i.test(contentType)) return "html";
+    if (/(^|[/+])json\b/i.test(contentType)) return "json";
+  }
+  return null;
+}
+
+/** Actionable error for a rejected auth/error payload (#473). Names the concrete
+ *  failure (an HTML page / JSON error saved as a model) and, for CivitAI, the exact
+ *  fix (set/refresh the API token) — because a 200-with-auth-challenge is precisely
+ *  what CivitAI returns for a missing/invalid key or a gated model, and Manager /
+ *  a bare fetch would otherwise save that page under the `.safetensors` name. */
+function nonModelPayloadError(
+  kind: "html" | "json",
+  url: string,
+  logUrl: string,
+): ModelError {
+  let host = "";
+  try {
+    host = new URL(url).hostname;
+  } catch {
+    /* logUrl is used for reporting; host is only for the CivitAI hint */
+  }
+  const isCivitai = /(^|\.)civitai\.com$/i.test(host);
+  const what =
+    kind === "html"
+      ? "an HTML page (an authentication/login or error page)"
+      : "a JSON document (an API error or auth challenge)";
+  const civitaiHint = isCivitai
+    ? " CivitAI returns an auth challenge like this when no valid token is sent — set or refresh " +
+      "CIVITAI_API_TOKEN (panel Settings › “Set CivitAI token…”, or the env var; create one at " +
+      "civitai.com/user/account) and retry. Note: on a REMOTE ComfyUI target the token is NOT " +
+      "forwarded to ComfyUI-Manager, so a locally-set token does not fix a remote Manager download."
+    : "";
+  return new ModelError(
+    `Download rejected: the server returned ${what}, not a model file, but the destination is a ` +
+      `binary model file. Refusing to save it as a model (it would land as a corrupt file under a ` +
+      `false success and fail at load time, e.g. "header too large").${civitaiHint}`,
+    { url: logUrl },
+  );
+}
+
+/** Validate that a COMPLETED file at `targetPath` is a real model payload — not an
+ *  HTML/JSON auth/error page — when the destination is a binary-model extension
+ *  (#473). FAILS CLOSED: an offending payload OR an unreadable-for-sniffing file (we
+ *  can't confirm it) throws, after `onReject` cleans up, so a corrupt file is never
+ *  finalized under a success. A no-op for non-model destinations. `contentType` is a
+ *  secondary signal (empty on cache-hit/cloud paths, where only the bytes are known). */
+async function assertModelPayloadOrThrow(opts: {
+  targetPath: string;
+  modelExt: string;
+  contentType: string;
+  url: string;
+  logUrl: string;
+  onReject?: () => Promise<void>;
+  /** When true (the HTTP + cache-hit paths, where a real readable file was just
+   *  written), an unreadable/empty sniff head is treated as UNVERIFIED and REJECTED.
+   *  When false (the cloud S3/Azure path — a bonus check, and #473's vector is HTTP),
+   *  an unreadable head is a best-effort skip: the SDK's own Content-Length/0-byte
+   *  guards already ran, so we don't fail a cloud download we merely couldn't sniff. */
+  failClosed?: boolean;
+}): Promise<void> {
+  const { targetPath, modelExt, contentType, url, logUrl, failClosed = true } = opts;
+  if (!modelExt || !MODEL_BINARY_EXTS.has(modelExt.toLowerCase())) return;
+  const head = await readHead(targetPath);
+  // An unreadable OR unexpectedly-empty head (a non-empty file that read 0 bytes
+  // under an fs race) leaves the payload UNVERIFIED. On the fail-closed paths refuse
+  // to finalize it rather than trust it (#473/#467); on the best-effort cloud path,
+  // skip. (A genuinely 0-byte download is already rejected upstream by assertComplete
+  // / the cache-hit 0-byte guard.)
+  if (head === undefined || head.length === 0) {
+    if (!failClosed) return;
+    await opts.onReject?.();
+    throw new ModelError(
+      `Download could not be verified: the completed file could not be read to confirm it is a ` +
+        `model payload (and not an HTML/JSON auth/error page). Not finalizing it as a model; retry.`,
+      { url: logUrl },
+    );
+  }
+  const kind = detectNonModelPayload(head, contentType, modelExt);
+  if (!kind) return;
+  await opts.onReject?.();
+  throw nonModelPayloadError(kind, url, logUrl);
 }
 
 /** POSITIVELY true only when `path` is confirmed discarded — it no longer exists
@@ -314,6 +600,12 @@ async function streamUrlToFile(
    *  the outcome is stored on that job — never in a shared keyed map that could
    *  misattribute it to another job (#467). Absent for internal/direct callers. */
   onResume?: ResumeReporter,
+  /** Extension of the FINAL destination (e.g. ".safetensors"), NOT of the .partial
+   *  we stream into. When it's a binary-model extension the completed payload is
+   *  validated as a real model — an HTML/JSON auth/error body is rejected rather
+   *  than finalized as a corrupt model under a false success (#473). Empty ⇒ no
+   *  payload validation (unknown/non-model destination). */
+  modelExt = "",
 ): Promise<void> {
   if (supportsCloudDownload(url)) {
     // Cloud downloaders (S3/Azure) don't range-resume — they overwrite the target.
@@ -353,6 +645,18 @@ async function streamUrlToFile(
         { url: logUrl },
       );
     }
+    // A cloud (S3/Azure) object can also be an error document — e.g. an XML
+    // AccessDenied body saved under a `.safetensors` name. No HTTP Content-Type is
+    // available here, so sniff the body alone (an XML/HTML error starts with `<`).
+    await assertModelPayloadOrThrow({
+      targetPath,
+      modelExt,
+      contentType: "",
+      url,
+      logUrl,
+      onReject: () => safeRm(targetPath),
+      failClosed: false, // cloud is a best-effort bonus check; #473's vector is HTTP
+    });
     return;
   }
 
@@ -855,10 +1159,30 @@ async function streamUrlToFile(
     }
   };
 
+  // Reject a completed body that is an HTML/JSON auth/error page rather than a
+  // model file (#473). Runs AFTER assertComplete (size is right) but BEFORE the
+  // .partial is renamed into place / the sidecar is dropped — a plausibly-sized
+  // login page or `{"error":...}` would otherwise pass the size gate and finalize
+  // as a corrupt model under a green success. Removes the bad partial + sidecar so
+  // a retry starts clean, and surfaces an actionable (CivitAI-aware) error.
+  const assertModelPayload = (): Promise<void> =>
+    assertModelPayloadOrThrow({
+      targetPath,
+      modelExt,
+      contentType: res.headers.get("content-type") || "",
+      url,
+      logUrl,
+      onReject: async () => {
+        await safeRm(targetPath);
+        if (resumable) await safeRm(validatorSidecar);
+      },
+    });
+
   // No progress wanted (internal/cache caller, or not under the panel) → straight pipe.
   if (!progress) {
     await pipeline(nodeStream, fileStream);
     await assertComplete();
+    await assertModelPayload();
     // Complete: the validator sidecar is only needed to guard a resume, so drop it.
     if (resumable) await safeRm(validatorSidecar);
     return;
@@ -893,6 +1217,7 @@ async function streamUrlToFile(
   try {
     await pipeline(nodeStream, counter, fileStream);
     await assertComplete();
+    await assertModelPayload();
     if (resumable) await safeRm(validatorSidecar);
     bytesPerSec = 0;
     emit("done", true);
@@ -909,6 +1234,7 @@ async function downloadIntoCache(
   storageAuth: CloudStorageAuth = {},
   progress?: ProgressMeta,
   onResume?: ResumeReporter,
+  modelExt = "",
 ): Promise<string> {
   // Representation-aware identity (#467): a same-URL download with different HTTP
   // auth headers OR different cloud (S3/Azure) credentials gets its OWN cache file,
@@ -976,6 +1302,7 @@ async function downloadIntoCache(
         progress,
         true, // resumable: cache partials use the .partial + If-Range resume handshake
         onResume,
+        modelExt,
       );
       await downloadCacheFs.rename(partial, target);
       await touch(target);
@@ -1189,14 +1516,31 @@ export async function downloadUrlToFile(
   logUrl?: string,
   storageAuth: CloudStorageAuth = {},
   progress?: ProgressMeta,
+  modelExt = extname(targetPath),
 ): Promise<void> {
-  await streamUrlToFile(url, targetPath, headers, logUrl, storageAuth, 0, progress);
+  await streamUrlToFile(
+    url,
+    targetPath,
+    headers,
+    logUrl,
+    storageAuth,
+    0,
+    progress,
+    false,
+    undefined,
+    modelExt,
+  );
 }
 
 export async function downloadWithCache(
   options: DownloadCacheOptions,
 ): Promise<DownloadCacheResult> {
   const logUrl = options.logUrl ?? redactUrlForLogs(options.url);
+  // The FINAL destination extension drives model-payload validation (#473). Derived
+  // from the real targetPath here — NOT from the .partial / random temp we actually
+  // stream into (those carry `.partial`/`.tmp`) — and threaded down so the completed
+  // body is checked against what the destination IS (a `.safetensors` etc.).
+  const modelExt = extname(options.targetPath);
   try {
     const cachePath = await downloadIntoCache(
       options.url,
@@ -1205,7 +1549,25 @@ export async function downloadWithCache(
       options.storageAuth,
       options.progress,
       options.onResume,
+      modelExt,
     );
+    // Validate the CACHE FILE itself before materializing it to this destination —
+    // this is the authoritative per-caller gate (#473). It covers three cases the
+    // stream-time check can't: (1) a CACHE HIT that skipped streaming entirely,
+    // (2) a COALESCED caller whose .safetensors destination consumed a stream that
+    // ran under a different (e.g. non-model) caller's modelExt, and (3) a legacy
+    // cache entry poisoned before this fix. Content-Type is gone by now, so this is
+    // a body-magic-bytes check; the stream-time pass already used Content-Type too.
+    await assertModelPayloadOrThrow({
+      targetPath: cachePath,
+      modelExt,
+      contentType: "",
+      url: options.url,
+      logUrl,
+      // Drop the poisoned cache entry so a retry re-downloads clean rather than
+      // re-serving the same bad bytes on every call.
+      onReject: () => safeRm(cachePath),
+    });
     const materializedBy = await materializeCacheFile(cachePath, options.targetPath);
     await evictLruIfNeeded();
     return {
@@ -1237,6 +1599,7 @@ export async function downloadWithCache(
         logUrl,
         options.storageAuth,
         options.progress,
+        modelExt,
       );
       await renameTempOverDestination(tmp, options.targetPath);
     } catch (e) {

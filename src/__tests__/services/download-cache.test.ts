@@ -1305,3 +1305,237 @@ describe("downloadModel cache", () => {
     expect((await stat(remaining)).size).toBe(4);
   });
 });
+
+// ---------------------------------------------------------------------------
+// #473: an auth/error response BODY (HTML login page / JSON error) must NEVER be
+// finalized as a `.safetensors` (or any binary-model) file under a false success.
+// Before this fix a 200-with-HTML/JSON body of plausible size passed the #467
+// size gate and landed as a corrupt model. These drive the content-type/magic-byte
+// validation: the offending download FAILS with an actionable error and NO file is
+// finalized, while a legitimate binary body still succeeds.
+// ---------------------------------------------------------------------------
+describe("downloadModel model-payload validation (#473)", () => {
+  const HTML_AUTH_PAGE =
+    "<!DOCTYPE html>\n<html><head><title>Sign in</title></head>" +
+    "<body><form>Please log in to CivitAI to download this model.</form></body></html>";
+  const JSON_ERROR = '{"error":"Unauthorized","message":"An API key is required to download this asset."}';
+
+  async function expectRejectedAndNoFile(
+    url: string,
+    subfolder: string,
+    filename: string,
+    response: Response,
+  ) {
+    fetchMock.mockResolvedValueOnce(response);
+    await expect(downloadModel(url, subfolder, filename)).rejects.toThrow(/not a model file|model file/i);
+    // Nothing finalized in the models dir…
+    const modelsDir = join(comfyDir, "models", subfolder);
+    const landed = await readdir(modelsDir).catch(() => [] as string[]);
+    expect(landed).toHaveLength(0);
+    // …and nothing left in the cache masquerading as a completed download.
+    const cached = await readdir(cacheDir).catch(() => [] as string[]);
+    expect(cached.some((f) => f.endsWith(".safetensors"))).toBe(false);
+  }
+
+  it("rejects an HTML auth-challenge body saved as .safetensors (text/html)", async () => {
+    await expectRejectedAndNoFile(
+      "https://civitai.com/api/download/models/3174878",
+      "loras",
+      "gated.safetensors",
+      new Response(HTML_AUTH_PAGE, {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "text/html; charset=utf-8" },
+      }),
+    );
+  });
+
+  it("rejects an HTML auth-challenge body even when mislabeled as octet-stream (magic bytes win)", async () => {
+    await expectRejectedAndNoFile(
+      "https://example.com/models/mislabeled.safetensors",
+      "checkpoints",
+      "mislabeled.safetensors",
+      new Response(HTML_AUTH_PAGE, {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "application/octet-stream" },
+      }),
+    );
+  });
+
+  it("rejects a UTF-16LE HTML auth page saved as .safetensors", async () => {
+    // A real auth page can be served UTF-16 (bytes FF FE 3C 00 …). Body magic must
+    // decode the BOM and still detect the HTML (codex finding).
+    const utf16 = Buffer.concat([
+      Buffer.from([0xff, 0xfe]), // UTF-16LE BOM
+      Buffer.from(HTML_AUTH_PAGE, "utf16le"),
+    ]);
+    await expectRejectedAndNoFile(
+      "https://example.com/models/u16.safetensors",
+      "checkpoints",
+      "u16.safetensors",
+      new Response(utf16, {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "text/html; charset=utf-16le" },
+      }),
+    );
+  });
+
+  it("rejects a JSON error body saved as .safetensors", async () => {
+    await expectRejectedAndNoFile(
+      "https://civitai.com/api/download/models/999",
+      "loras",
+      "err.safetensors",
+      new Response(JSON_ERROR, {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "application/json" },
+      }),
+    );
+  });
+
+  it("rejects an HTML body saved as .pt2 (a non-safetensors binary model format)", async () => {
+    await expectRejectedAndNoFile(
+      "https://example.com/models/x.pt2",
+      "checkpoints",
+      "x.pt2",
+      new Response(HTML_AUTH_PAGE, {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "text/html" },
+      }),
+    );
+  });
+
+  it("surfaces an actionable CivitAI token hint for a CivitAI auth challenge", async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(HTML_AUTH_PAGE, {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "text/html" },
+      }),
+    );
+    await expect(
+      downloadModel("https://civitai.com/api/download/models/1", "loras", "c.safetensors"),
+    ).rejects.toThrow(/CIVITAI_API_TOKEN/);
+  });
+
+  it("still succeeds for a legitimate binary model body (GGUF magic)", async () => {
+    // A real binary payload — leading "GGUF" magic, then bytes that are not text.
+    const gguf = Buffer.concat([Buffer.from("GGUF"), Buffer.from([0x00, 0x01, 0x02, 0x03, 0x00])]);
+    fetchMock.mockResolvedValueOnce(
+      new Response(gguf, {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "application/octet-stream" },
+      }),
+    );
+    const out = await downloadModel(
+      "https://example.com/models/legit.gguf",
+      "checkpoints",
+      "legit.gguf",
+    );
+    expect((await stat(out)).size).toBe(gguf.length);
+  });
+
+  it("does NOT reject a legit safetensors whose LE header length starts with byte 0x3C ('<')", async () => {
+    // A real safetensors with a 60-byte JSON header: first 8 bytes are the LE length
+    // (60 = 0x3C, then NUL padding), so byte 0 is '<'. The NUL bytes that follow prove
+    // it is binary, so it must NOT be misclassified as an HTML page (codex finding).
+    const header = Buffer.from('{"__metadata__":{"format":"pt"},"a":{"x":1}}'.padEnd(60, " "));
+    const lenPrefix = Buffer.alloc(8);
+    lenPrefix.writeUInt32LE(header.length, 0); // 60 -> 0x3C 0x00 0x00 0x00 ...
+    const body = Buffer.concat([lenPrefix, header, Buffer.from([0x00, 0x11, 0x22, 0x33])]);
+    expect(body[0]).toBe(0x3c); // sanity: leading byte is '<'
+    fetchMock.mockResolvedValueOnce(
+      new Response(body, {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "application/octet-stream" },
+      }),
+    );
+    const out = await downloadModel(
+      "https://example.com/models/hdr60.safetensors",
+      "checkpoints",
+      "hdr60.safetensors",
+    );
+    expect((await stat(out)).size).toBe(body.length);
+  });
+
+  it("does NOT reject a raw .bin binary that happens to start with '<' but is not UTF-8 text", async () => {
+    // A generic binary payload whose first byte is '<' (0x3C) followed by bytes that
+    // are NOT valid UTF-8 text (bare continuation / invalid lead bytes). Must stay
+    // "binary" and download successfully (codex false-positive concern).
+    const body = Buffer.from([
+      0x3c, 0x80, 0x81, 0xff, 0xfe, 0x3c, 0x00, 0x9a, 0xc0, 0xc1, 0x3c, 0x42, 0x13, 0x37,
+    ]);
+    fetchMock.mockResolvedValueOnce(
+      new Response(body, {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "application/octet-stream" },
+      }),
+    );
+    const out = await downloadModel(
+      "https://example.com/models/raw.bin",
+      "checkpoints",
+      "raw.bin",
+    );
+    expect((await stat(out)).size).toBe(body.length);
+  });
+
+  it("rejects a cached HTML payload on a later cache-hit (per-caller cache gate)", async () => {
+    // Poison the cache via a NON-model destination (.json — not validated at stream
+    // time), then a .safetensors caller that HITS the same cache entry must still be
+    // rejected by the per-caller cache gate, not served the corrupt bytes.
+    const url = "https://example.com/models/poison.safetensors";
+    fetchMock.mockResolvedValueOnce(
+      new Response(HTML_AUTH_PAGE, {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "text/html" },
+      }),
+    );
+    // First call to a .json destination: not a model-binary ext, so it caches the
+    // HTML body without rejection.
+    await downloadModel(url, "checkpoints", "poison.json");
+    // Second call, SAME url → cache hit, but destination is .safetensors → rejected.
+    await expect(
+      downloadModel(url, "loras", "poison.safetensors"),
+    ).rejects.toThrow(/not a model file|model file/i);
+    const landed = await readdir(join(comfyDir, "models", "loras")).catch(() => [] as string[]);
+    expect(landed).toHaveLength(0);
+  });
+
+  it("rejects a JSON auth/error body with a non-ASCII (UTF-8) message", async () => {
+    await expectRejectedAndNoFile(
+      "https://example.com/models/utf8err.safetensors",
+      "checkpoints",
+      "utf8err.safetensors",
+      new Response('{"error":"Неавторизованный запрос — требуется ключ API"}', {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "application/json; charset=utf-8" },
+      }),
+    );
+  });
+
+  it("does NOT reject a JSON body for a non-model destination extension (.json config)", async () => {
+    // A legitimate `{...}` JSON download to a `.json` sidecar must be untouched by
+    // the binary-model validation — we validate by what the destination IS.
+    fetchMock.mockResolvedValueOnce(
+      new Response('{"scheduler":"ddim"}', {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const out = await downloadModel(
+      "https://example.com/configs/model_index.json",
+      "checkpoints",
+      "model_index.json",
+    );
+    await expect(readFile(out, "utf-8")).resolves.toBe('{"scheduler":"ddim"}');
+  });
+});

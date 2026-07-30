@@ -114,6 +114,25 @@ const fsPromisesMocks = vi.hoisted(() => ({
   copyFile: vi.fn(),
   link: vi.fn(),
   mkdir: vi.fn(),
+  // #473 payload validation reads the head of the completed file via fs/promises
+  // `open`. This mock (fs is fully mocked here — no real file is written) returns a
+  // handle that yields BINARY bytes, so a legitimate download passes validation.
+  open: vi.fn(async () => {
+    const src = Buffer.from("MODEL-BINARY-DATA\x00\x01\x02\x03");
+    return {
+      read: async (
+        buf: Buffer,
+        off: number,
+        len: number,
+        pos: number,
+      ): Promise<{ bytesRead: number }> => {
+        if (pos >= src.length) return { bytesRead: 0 };
+        const bytesRead = src.copy(buf, off, pos, Math.min(pos + len, src.length));
+        return { bytesRead };
+      },
+      close: async (): Promise<void> => undefined,
+    };
+  }),
   readdir: vi.fn(),
   rename: vi.fn(),
   realpath: vi.fn(),
@@ -128,6 +147,7 @@ vi.mock("node:fs/promises", () => ({
   copyFile: fsPromisesMocks.copyFile,
   link: fsPromisesMocks.link,
   mkdir: fsPromisesMocks.mkdir,
+  open: fsPromisesMocks.open,
   readdir: fsPromisesMocks.readdir,
   rename: fsPromisesMocks.rename,
   realpath: fsPromisesMocks.realpath,
