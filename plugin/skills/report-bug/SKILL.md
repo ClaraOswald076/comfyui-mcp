@@ -161,13 +161,14 @@ Then file it (no need to ask):
           sleep 1
           # Hard transport failure → stop and fall back (do NOT keep polling).
           STAT=$(curl -fsS --max-time 10 "$WORKER_URL/status/$JOB_ID") || break
-          # Server-side filing error → stop and fall back.
-          printf '%s' "$STAT" | grep -q '"status":"error"' && break
+          # A real url → done, filed.
           URL=$(printf '%s' "$STAT" | sed -n 's/.*"url"[: ]*"\([^"]*\)".*/\1/p')
           [ -n "$URL" ] && break
-          # Otherwise it's a well-formed queued/pending → keep polling until the
-          # ceiling. (A malformed body yields no url and no error marker, so it
-          # simply loops to the ceiling and then falls back — still never "filed".)
+          # No url yet: keep polling ONLY for a well-formed queued/pending.
+          # ANY other body — status:"error", "unknown", "done" without a url, or
+          # malformed JSON — is terminal: BREAK to the fallback, never loop on.
+          STATUS=$(printf '%s' "$STAT" | sed -n 's/.*"status"[: ]*"\([^"]*\)".*/\1/p')
+          [ "$STATUS" = "queued" ] || [ "$STATUS" = "pending" ] || break
         done
       fi
     fi
