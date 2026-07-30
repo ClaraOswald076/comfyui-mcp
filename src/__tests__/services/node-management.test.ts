@@ -1041,6 +1041,36 @@ describe("node-management service", () => {
       );
       expect(probes.length).toBe(1);
     });
+
+    // ── #424: updating ComfyUI-Manager ITSELF on legacy 3.x can't go through the
+    // queue (it 405s the self-update route) → git-pull the local checkout instead.
+    it("update of comfyui-manager self falls back to a local git pull (never the queue)", async () => {
+      const { calls } = stubLegacyFetch();
+      mockedExists.mockReturnValue(true); // custom_nodes/ComfyUI-Manager/.git present
+      mockedExec.mockReturnValue("Already up to date." as unknown as Buffer);
+
+      const res = await updateCustomNode({ id: "comfyui-manager" });
+
+      expect(res.mechanism).toBe("git-clone");
+      // A git pull of the Manager checkout was run …
+      const pull = mockedExec.mock.calls.find(
+        ([bin, args]) =>
+          bin === "git" && Array.isArray(args) && args.includes("pull"),
+      );
+      expect(pull).toBeDefined();
+      // … and the Manager queue update route was NEVER touched.
+      expect(legacyCallTo(calls, "/manager/queue/update")).toBeUndefined();
+    });
+
+    it("update of Manager self with NO local checkout errors actionably (no queue call)", async () => {
+      const { calls } = stubLegacyFetch();
+      mockedExists.mockReturnValue(false); // no on-disk ComfyUI-Manager checkout
+
+      await expect(updateCustomNode({ id: "ComfyUI-Manager" })).rejects.toThrow(
+        /pip install -U comfyui_manager|git pull/i,
+      );
+      expect(legacyCallTo(calls, "/manager/queue/update")).toBeUndefined();
+    });
   });
 
   // ── issue #235: pip Manager in legacy-UI mode = the "v2-batch" dialect ────

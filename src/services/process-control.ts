@@ -1084,9 +1084,17 @@ interface RebootResult {
 // getComfyUIBaseUrl() with no `/api` prefix — the panel's `/api/...` form is only
 // because its browser `api.fetchApi` prepends `/api`). Canonical v4 POST route
 // first, then the legacy GET route for older Manager builds.
+// TWO Manager generations serve reboot on DIFFERENT routes+verbs (issue #116):
+//   • v4 lineage (pip comfyui_manager ≥4.x): POST /v2/manager/reboot
+//   • released Manager 3.x legacy: GET /manager/reboot — and some 3.x builds
+//     register it under POST, so we try both verbs on the legacy path before
+//     giving up (panel #253/#266, this repo #425). ComfyUI's frontend catchall
+//     answers unknown GETs 200/404 and unregistered POSTs 405, so a wrong route
+//     surfaces as 404/405 and we fall through to the next candidate.
 const REBOOT_ROUTES: ReadonlyArray<{ path: string; method: "POST" | "GET" }> = [
   { path: "/v2/manager/reboot", method: "POST" },
   { path: "/manager/reboot", method: "GET" },
+  { path: "/manager/reboot", method: "POST" },
 ];
 
 /**
@@ -1114,6 +1122,26 @@ function isConnectionDrop(err: unknown): boolean {
  *   REFUSED (rebooting:false) — HTTP 403 → Manager security forbids remote reboot.
  *   NO-ENDPOINT (rebooting:false) — every route gave a non-firing failure (e.g. 404).
  */
+/**
+ * True when a 200 response is (almost certainly) ComfyUI's frontend SPA catchall
+ * rather than a real Manager reboot ack. The catchall serves the index HTML with
+ * Content-Type text/html; a Manager reboot route either drops the connection or
+ * returns a tiny non-HTML body. Best-effort and defensive: any read error →
+ * treat as NOT a catchall (don't suppress a genuine ack on a transient read
+ * failure).
+ */
+async function looksLikeSpaCatchall(res: Response): Promise<boolean> {
+  try {
+    const ctype = (res.headers.get("content-type") ?? "").toLowerCase();
+    if (ctype.includes("text/html")) return true;
+    // No/unknown content-type: sniff the first bytes for an HTML document.
+    const body = (await res.clone().text()).trimStart().slice(0, 256).toLowerCase();
+    return body.startsWith("<!doctype html") || body.startsWith("<html");
+  } catch {
+    return false;
+  }
+}
+
 async function rebootViaManager(): Promise<RebootResult> {
   const base = getComfyUIBaseUrl();
   const failures: string[] = [];
@@ -1122,7 +1150,21 @@ async function rebootViaManager(): Promise<RebootResult> {
     const url = `${base}${path}`;
     try {
       const res = await comfyuiFetch(url, { method });
-      if (res.ok) return { rebooting: true, endpoint: path, method };
+      if (res.ok) {
+        // GUARD (codex P1): ComfyUI's frontend catchall answers an UNKNOWN GET
+        // with the SPA index — HTTP 200 text/html — so a 200 here does NOT prove
+        // a reboot route exists. A genuine Manager reboot handler exits before it
+        // can respond (→ a connection drop, handled below) or returns a tiny
+        // non-HTML ack; treat a 200 that looks like the HTML catchall as "route
+        // absent" and fall through to the next candidate rather than falsely
+        // reporting a reboot that never fired (which readiness — a still-up
+        // server — would then rubber-stamp as success).
+        if (await looksLikeSpaCatchall(res)) {
+          failures.push(`${method} ${path} → HTTP 200 (frontend catchall, not a reboot route)`);
+          continue;
+        }
+        return { rebooting: true, endpoint: path, method };
+      }
       if (res.status === 403) {
         return {
           rebooting: false,
@@ -1160,9 +1202,12 @@ async function rebootViaManager(): Promise<RebootResult> {
   return {
     rebooting: false,
     reason: "no-endpoint",
-    note: `No reachable ComfyUI-Manager reboot endpoint.${
-      failures.length ? ` Tried: ${failures.join("; ")}` : ""
-    }`,
+    note:
+      `No reachable ComfyUI-Manager reboot endpoint (this ComfyUI likely runs the ` +
+      `LEGACY Manager 3.x, which does not expose an HTTP reboot route).${
+        failures.length ? ` Tried: ${failures.join("; ")}.` : ""
+      } For a LOCAL install, use the headless restart_comfyui tool (kill + relaunch); ` +
+      `otherwise restart ComfyUI on the host, or upgrade to Manager v4+.`,
   };
 }
 

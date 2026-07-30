@@ -143,6 +143,84 @@ describe("restartComfyUI — remote (Manager reboot)", () => {
     expect(hoisted.resetClient).not.toHaveBeenCalled();
   });
 
+  it("legacy Manager 3.x (v2 405, legacy 404/405) → no-endpoint, actionable message; tries legacy POST too", async () => {
+    // Reproduces #425/#253/#266 at the reboot boundary: the v2 route 405s and the
+    // legacy GET 404s. Before the fix we stopped there; now we ALSO try POST
+    // /manager/reboot, and when everything fails we return an actionable note.
+    __processControlTestHooks.setRemoteRebootTimingForTests({
+      settleMs: 0,
+      budgetMs: 50,
+      intervalMs: 5,
+    });
+    const rebootAttempts: string[] = [];
+    hoisted.fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      const path = pathOf(url);
+      if (path === "/v2/manager/reboot") {
+        rebootAttempts.push(`${init?.method} ${path}`);
+        return new Response("405: Method Not Allowed", { status: 405 });
+      }
+      if (path === "/manager/reboot") {
+        rebootAttempts.push(`${init?.method} ${path}`);
+        // GET 404s (classic legacy symptom), POST also unsupported.
+        return new Response("not found", { status: init?.method === "GET" ? 404 : 405 });
+      }
+      return new Response("", { status: 404 });
+    });
+
+    const res = await restartComfyUI();
+
+    expect(res.started).toBe(false);
+    // The legacy POST /manager/reboot fallback route is now attempted.
+    expect(rebootAttempts).toContain("POST /manager/reboot");
+    expect(res.message).toMatch(/legacy manager 3\.x/i);
+    expect(res.message).toMatch(/restart_comfyui/i);
+    // No endpoint fired → no readiness poll, no cache reset.
+    expect(findCall((p) => p === "/system_stats")).toBeUndefined();
+    expect(hoisted.resetClient).not.toHaveBeenCalled();
+  });
+
+  it("legacy GET /manager/reboot answered by the SPA catchall (200 HTML) is NOT a false reboot", async () => {
+    // codex P1: ComfyUI's frontend catchall serves the index HTML (200 text/html)
+    // for an unknown GET. A 200 there must NOT be classified as "reboot fired"
+    // (readiness — a still-up server — would rubber-stamp it). The legacy POST
+    // route must still be tried; when all fail → honest no-endpoint.
+    __processControlTestHooks.setRemoteRebootTimingForTests({
+      settleMs: 0,
+      budgetMs: 50,
+      intervalMs: 5,
+    });
+    const attempts: string[] = [];
+    hoisted.fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      const path = pathOf(url);
+      if (path === "/v2/manager/reboot") {
+        attempts.push(`${init?.method} ${path}`);
+        return new Response("405", { status: 405 });
+      }
+      if (path === "/manager/reboot") {
+        attempts.push(`${init?.method} ${path}`);
+        if (init?.method === "GET") {
+          // The SPA index — a 200 that is NOT a reboot.
+          return new Response("<!doctype html><html><body>ComfyUI</body></html>", {
+            status: 200,
+            headers: { "Content-Type": "text/html" },
+          });
+        }
+        return new Response("405", { status: 405 });
+      }
+      return new Response("", { status: 404 });
+    });
+
+    const res = await restartComfyUI();
+
+    // Did NOT falsely report a reboot off the HTML 200, and DID try the POST route.
+    expect(res.started).toBe(false);
+    expect(attempts).toContain("POST /manager/reboot");
+    expect(res.message).toMatch(/legacy manager 3\.x|no reachable/i);
+    // No readiness poll fired (nothing rebooted).
+    expect(findCall((p) => p === "/system_stats")).toBeUndefined();
+    expect(hoisted.resetClient).not.toHaveBeenCalled();
+  });
+
   it("local mode routes through stop/start — the remote reboot path is not taken", async () => {
     hoisted.remoteMode.value = false;
     // No PID on the port and no Desktop app process → stopComfyUI can't find it.
