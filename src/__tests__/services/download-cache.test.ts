@@ -1894,4 +1894,19 @@ describe("downloadModel model-payload validation (#473)", () => {
     expect((await stat(out)).size).toBe(gguf.length); // NOT rejected
     await expect(stat(ct)).rejects.toThrow(); // stale sidecar cleared
   });
+
+  it("IGNORES a stale text/html .ct whose stamped size mismatches the cache file (size-guard, rm-independent)", async () => {
+    // Even if a stale sidecar SURVIVES on disk (its clearing rm failed), it must not
+    // reject a legitimate model: the size stamp no longer matches the cache bytes, so
+    // it is ignored. Pre-seed a real GGUF cache entry + a stale text/html sidecar
+    // stamped for a DIFFERENT size, then a cache-HIT .safetensors caller must succeed.
+    const url = "https://example.com/models/sizeguard"; // extensionless → shared key
+    const hash = cacheHashFor(url);
+    await mkdir(cacheDir, { recursive: true });
+    const gguf = Buffer.concat([Buffer.from("GGUF"), Buffer.from([0x00, 0x01, 0x02, 0x03, 0x04])]);
+    await writeFile(join(cacheDir, hash), gguf); // valid cached model payload
+    await writeFile(join(cacheDir, `.${hash}.ct`), "text/html\n999999"); // stale, wrong size
+    const out = await downloadModel(url, "loras", "sg.safetensors");
+    expect((await stat(out)).size).toBe(gguf.length); // cache HIT, NOT rejected
+  });
 });

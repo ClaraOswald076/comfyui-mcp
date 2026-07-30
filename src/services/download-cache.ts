@@ -144,12 +144,19 @@ function isRejectableContentType(contentType: string): boolean {
 async function writeCacheContentType(cacheFilePath: string, contentType: string): Promise<void> {
   const sidecar = cacheCtSidecar(cacheFilePath);
   if (!contentType || !isRejectableContentType(contentType)) {
-    // Clear any stale sidecar so it can't attach to these clean bytes.
+    // Clear any stale sidecar so it can't attach to these clean bytes. Even if this
+    // rm fails, the SIZE stamp below makes a stale sidecar self-invalidate on read.
     await rm(sidecar, { force: true }).catch(() => undefined);
     return;
   }
   try {
-    await writeFile(sidecar, contentType);
+    // Stamp the payload SIZE alongside the Content-Type. On read we honor the type
+    // only when the stamped size still matches the cache file — so a stale sidecar
+    // left behind after a clean re-fill (different bytes ⇒ different size) is ignored
+    // and can NEVER reject a legitimate model, regardless of whether the clearing rm
+    // above succeeded (#473 — robust against the swallowed-delete false-positive).
+    const size = await fileSizeOrUndefined(cacheFilePath);
+    await writeFile(sidecar, `${contentType}\n${size ?? ""}`);
   } catch (err) {
     // Best effort — reuse falls back to body-magic-only validation, which still
     // catches every well-formed HTML/JSON page (only a synthetic body that sniffs
@@ -163,10 +170,22 @@ async function writeCacheContentType(cacheFilePath: string, contentType: string)
   }
 }
 
-/** Read the persisted Content-Type for a cache file, or "" when absent/unreadable. */
+/** Read the persisted Content-Type for a cache file, or "" when absent/unreadable OR
+ *  STALE. The sidecar stamps the payload size it was written for; if that size no
+ *  longer matches the cache file on disk the sidecar describes DIFFERENT (since
+ *  replaced) bytes and is ignored — so a leftover `text/html` tag can't reject a
+ *  legitimate model that later re-filled the same cache slot (#473). */
 async function readCacheContentType(cacheFilePath: string): Promise<string> {
   try {
-    return (await readFile(cacheCtSidecar(cacheFilePath), "utf-8")).trim();
+    const raw = await readFile(cacheCtSidecar(cacheFilePath), "utf-8");
+    const nl = raw.indexOf("\n");
+    if (nl < 0) return ""; // no size stamp (unexpected) → don't trust it
+    const contentType = raw.slice(0, nl).trim();
+    const stampedSize = Number(raw.slice(nl + 1).trim());
+    if (!contentType || !Number.isFinite(stampedSize)) return "";
+    const currentSize = await fileSizeOrUndefined(cacheFilePath);
+    // Only honor the tag when it was stamped for the bytes currently on disk.
+    return currentSize !== undefined && currentSize === stampedSize ? contentType : "";
   } catch {
     return "";
   }
