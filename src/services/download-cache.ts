@@ -62,31 +62,39 @@ async function rmOrLog(path: string, logUrl: string): Promise<boolean> {
   }
 }
 
+/** Remove `path`; if removal fails, NEUTRALIZE it by truncating to 0 bytes. Returns
+ *  true iff the path ends up removed OR emptied. A 0-byte partial is treated as fresh
+ *  (not resumed) and a 0-byte cache/sidecar entry carries no resumable state, so
+ *  zeroing is as safe as deleting. Logs (error) only when it can do NEITHER (#473 P1). */
+async function rmOrTruncate(path: string, logUrl: string): Promise<boolean> {
+  if (await rmOrLog(path, logUrl)) return true;
+  try {
+    await writeFile(path, "");
+    return true;
+  } catch (err) {
+    logger.error(
+      `Could not remove OR truncate a rejected download artifact "${path}"; a retry may re-serve ` +
+        `or resume it. Delete this file manually.`,
+      { url: logUrl, error: err instanceof Error ? err.message : String(err) },
+    );
+    return false;
+  }
+}
+
 /** Discard a payload that was REJECTED as a non-model (HTML/JSON auth/error) body.
- *  Removes the file and its resume sidecar and, CRUCIALLY, if the file itself can't
- *  be removed, NEUTRALIZES it by truncating to 0 bytes so a retry can neither resume
- *  onto the poisoned prefix (a 0-byte partial is treated as fresh) nor serve it as a
- *  cache hit (a 0-byte cache entry is treated as a miss). Surfaces a hard failure via
- *  the log when it can neither remove nor truncate (#473 P1). */
+ *  Neutralizes BOTH the payload file AND its resume sidecar (remove, else truncate to
+ *  0). A resume requires a NONZERO partial AND a valid (nonempty) sidecar, so zeroing
+ *  or removing EITHER makes a retry decline the resume and restart clean — the
+ *  guarantee holds as long as at least one of the two can be neutralized, not only
+ *  when the partial itself can be deleted (#473 P1). A hard failure to neutralize is
+ *  surfaced via the log inside rmOrTruncate. */
 async function discardRejectedPayload(
   path: string,
   sidecarPath: string | undefined,
   logUrl: string,
 ): Promise<void> {
-  const removed = await rmOrLog(path, logUrl);
-  if (sidecarPath) await rmOrLog(sidecarPath, logUrl);
-  if (removed) return;
-  // Removal failed — neutralize the still-present poisoned bytes so a retry can't
-  // resume onto them or re-serve them as a cache hit.
-  try {
-    await writeFile(path, "");
-  } catch (err) {
-    logger.error(
-      `Could not remove OR truncate a rejected non-model payload "${path}"; a retry may re-serve ` +
-        `or resume it. Delete this file manually.`,
-      { url: logUrl, error: err instanceof Error ? err.message : String(err) },
-    );
-  }
+  await rmOrTruncate(path, logUrl);
+  if (sidecarPath) await rmOrTruncate(sidecarPath, logUrl);
 }
 
 /** On-disk size, or undefined when it can't be determined (fs layer stubbed in
@@ -230,7 +238,15 @@ function looksLikeText(slice: Buffer): boolean {
  *  text check and stays binary. */
 function classifyDecodedText(s: string): "html" | "json" | "binary" {
   let j = 0;
-  while (j < s.length && (s[j] === " " || s[j] === "\t" || s[j] === "\n" || s[j] === "\r")) j += 1;
+  // Skip leading text whitespace INCLUDING VT/FF (\v \f) — an auth page can begin with
+  // a form-feed before the `<`/`{` (`\f<!DOCTYPE html>`); if we stopped at it the char
+  // scrutinized would be the control byte, not the tag, and the page would misclassify
+  // as binary (#473 P0-1).
+  while (j < s.length) {
+    const cp = s.charCodeAt(j);
+    if (cp === 0x20 || (cp >= 0x09 && cp <= 0x0d)) j += 1;
+    else break;
+  }
   if (j >= s.length) return "binary";
   const ch = s[j];
   // Require the WHOLE decoded run (not just the first 64 chars) to be clean text
@@ -268,9 +284,13 @@ function classifyPayload(buf: Buffer): "html" | "json" | "binary" {
   }
   let i = 0;
   if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) i = 3; // UTF-8 BOM
+  // Skip leading text whitespace INCLUDING VT(0x0b)/FF(0x0c) — a login page may open
+  // with a form-feed before the `<` (`\f<!DOCTYPE html>`). Stopping at that control
+  // byte would scrutinize it instead of the tag and misclassify the page as binary
+  // (#473 P0-1).
   while (
     i < buf.length &&
-    (buf[i] === 0x20 || buf[i] === 0x09 || buf[i] === 0x0a || buf[i] === 0x0d)
+    (buf[i] === 0x20 || (buf[i] >= 0x09 && buf[i] <= 0x0d))
   ) {
     i += 1;
   }

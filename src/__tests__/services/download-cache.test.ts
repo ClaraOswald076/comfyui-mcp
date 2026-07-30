@@ -1565,6 +1565,40 @@ describe("downloadModel model-payload validation (#473)", () => {
     );
   });
 
+  it("rejects an HTML page that LEADS with a form-feed before the tag (P0-1, octet-stream)", async () => {
+    // `\f<!DOCTYPE html>…` — the form-feed comes BEFORE the `<`. The leading-whitespace
+    // skip must treat \f/\v as whitespace so the FIRST scrutinized char is the tag, not
+    // the control byte (else it misclassifies as binary). Rejected by body magic alone.
+    await expectRejectedAndNoFile(
+      "https://example.com/models/leadff.safetensors",
+      "checkpoints",
+      "leadff.safetensors",
+      new Response("\f\v<!DOCTYPE html><html><body>Sign in</body></html>", {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "application/octet-stream" },
+      }),
+    );
+  });
+
+  it("rejects a UTF-16LE HTML page that LEADS with a form-feed (P0-1, decoded path)", async () => {
+    // Same leading-\f case through the UTF-16 decode path (classifyDecodedText).
+    const body = Buffer.concat([
+      Buffer.from([0xff, 0xfe]), // UTF-16LE BOM
+      Buffer.from("\f<!DOCTYPE html><html>Sign in</html>", "utf16le"),
+    ]);
+    await expectRejectedAndNoFile(
+      "https://example.com/models/leadff16.safetensors",
+      "checkpoints",
+      "leadff16.safetensors",
+      new Response(body, {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "application/octet-stream" },
+      }),
+    );
+  });
+
   it("rejects a form-feed HTML page served as text/html (P0-1, content-type belt)", async () => {
     await expectRejectedAndNoFile(
       "https://civitai.com/api/download/models/3174878",

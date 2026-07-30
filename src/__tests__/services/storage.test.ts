@@ -413,6 +413,31 @@ describe("cloud storage downloads", () => {
       expect.any(Object),
     );
   });
+
+  it("logs a hard failure when a rejected cloud payload can be neither removed nor truncated (#473 P1)", async () => {
+    // Worst case: BOTH unlink and truncate are denied. The impl must surface a hard
+    // error (logger.error) rather than swallow it — the poisoned leftover is visible.
+    awsMocks.send.mockResolvedValueOnce({ Body: Readable.from("<html>AccessDenied</html>") });
+    fsPromisesMocks.stat.mockResolvedValue({ size: 512 });
+    fsPromisesMocks.open.mockResolvedValueOnce(
+      openHandleYielding(Buffer.from("<html><body>AccessDenied</body></html>")),
+    );
+    fsPromisesMocks.rm.mockRejectedValue(Object.assign(new Error("EPERM"), { code: "EPERM" }));
+    fsPromisesMocks.writeFile.mockRejectedValue(Object.assign(new Error("EROFS"), { code: "EROFS" }));
+    await expect(
+      downloadUrlToFile(
+        "s3://models/checkpoints/stuck.safetensors",
+        "/tmp/stuck.safetensors",
+        {},
+        undefined,
+        { s3: { type: "s3", access_key_id: "A", secret_access_key: "s", region: "us-east-1" } },
+      ),
+    ).rejects.toThrow(/not a model file|model file/i);
+    expect(loggerMocks.error).toHaveBeenCalledWith(
+      expect.stringContaining("Could not remove OR truncate a rejected download artifact"),
+      expect.any(Object),
+    );
+  });
 });
 
 describe("cloud storage uploads", () => {

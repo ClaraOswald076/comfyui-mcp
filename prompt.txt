@@ -1,0 +1,15 @@
+You are an adversarial code reviewer. Review the CURRENT working tree of this repo (branch fix/473-reject-auth-error-bodies) focused on src/services/download-cache.ts and its tests src/__tests__/services/download-cache.test.ts and src/__tests__/services/storage.test.ts.
+
+Context: this branch hardens issue #473 — a remote CivitAI / any download that saves an auth/error HTML/JSON body as a .safetensors and reports success. A prior adversarial review found 3 P0s + 1 P1 that this revision claims to fix:
+
+P0-1: valid HTML with a form-feed (\f) control byte still finalized as a model, and Content-Type was ignored once the head was non-empty. Fix must (a) treat TAB/LF/VT/FF/CR as text-compatible whitespace so a \f-HTML page classifies as HTML, and (b) make Content-Type text/html or application/json AUTHORITATIVE for a binary-model destination (reject regardless of a stray control byte).
+
+P0-2: a legitimate raw binary starting with '<' + a printable 64-byte prefix was wrongly REJECTED (false-negative). Fix must require the WHOLE sniffed window to be valid text (or a real structural signature) before classifying html/json, so a raw .bin whose head merely starts with '<' is ACCEPTED.
+
+P0-3: cloud/direct finalize failed OPEN when the payload couldn't be sniffed. Fix must fail CLOSED (cannot verify => do not finalize), same as the HTTP path.
+
+P1: rejection cleanup swallowed all rm errors, leaving a poisoned partial/.etag/cache entry that a retry could resume/re-serve. Fix must surface/log cleanup failure AND ensure a left-behind poisoned partial can't be treated as resumable on retry.
+
+Verify each P0/P1 is genuinely fixed with no regression to the #467 hardening (resume/If-Range/redirect/size gates) or the working parts (ordinary <html>/JSON rejection, UTF-8/UTF-16 detection, GGUF/safetensors-0x3C-header acceptance). Look hard for NEW correctness bugs, false-positives that would reject legitimate downloads, and false-negatives that would still let an auth/error body finalize.
+
+Output your verdict. The VERY FIRST LINE of your response MUST be exactly "VERDICT: PASS" or "VERDICT: FAIL" (no other text on that line). Then explain, listing any concrete P0/P1 issues with file:line.
