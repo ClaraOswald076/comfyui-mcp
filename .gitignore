@@ -75,3 +75,6 @@ orch.err.log
 /design/mobile-agent-client.md
 /design/remote-and-cloud-modes.md
 /blog/comfyui-mcp-tdqs-case-study.md
+
+# Local Discord watchdog/notifier toolkit (token read from ~/.claude.json at runtime; not committed)
+/.discord/
