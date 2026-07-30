@@ -30,7 +30,12 @@ import {
   type ModelType,
 } from "./model-resolver.js";
 import { startDownloadJob, type DownloadJob } from "./download-jobs.js";
-import { getSavedDefaultWorkspaceSync } from "./workspace-env.js";
+import { resolveModelsDir } from "./output-dir.js";
+import {
+  getSavedDefaultWorkspaceSync,
+  resolveLiveComfyUIBase,
+  resolveRootInterpreter,
+} from "./workspace-env.js";
 import { ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 
@@ -40,6 +45,51 @@ import { logger } from "../utils/logger.js";
 function manifestDownloadGraceMs(): number {
   const raw = Number(process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS);
   return Number.isFinite(raw) && raw >= 0 ? raw : 15_000;
+}
+
+/** Overall wall-clock budget (ms) for the custom-node install phase. Node installs
+ *  drive the ComfyUI-Manager queue, which can legitimately run for minutes on a
+ *  big pack. Blocking apply_manifest until it drains blows past the MCP tools/call
+ *  timeout (300s) and the caller sees a FALSE failure while the Manager keeps
+ *  installing (#489). Bounding the phase well under that cap lets us hand back a
+ *  "pending" result (poll the Manager queue) instead. Env-tunable; default 240s. */
+function manifestNodeBudgetMs(): number {
+  const raw = Number(process.env.COMFYUI_MCP_MANIFEST_NODE_BUDGET_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 240_000;
+}
+
+/** Sentinel returned by raceDeadline when the wall-clock deadline wins. */
+const BUDGET_TIMEOUT = Symbol("manifest-node-budget-timeout");
+
+/**
+ * Await `p` but never past the absolute `deadline` (Date.now() ms). Returns the
+ * resolved value, or BUDGET_TIMEOUT if the deadline elapses first. Bounds EVERY
+ * async wait in the custom-node phase (#489) — the install itself AND the
+ * surrounding listInstalledNodes round-trips — so a slow Manager can never push
+ * apply_manifest past the MCP tools/call timeout; it hands back "pending" instead.
+ *
+ * CAVEAT (single-threaded runtime): this bounds ASYNC work only. A SYNCHRONOUS
+ * subprocess install unit — the git-clone / cm-cli fallback (execFileSync), like
+ * pip — blocks the event loop, so the timer cannot preempt one already running;
+ * each is instead bounded by its OWN execFileSync timeout. The race is what fixes
+ * #489's actual case: the ASYNC Manager-queue polling that keeps running for
+ * minutes. `p` must not reject (callers pass a pre-caught promise).
+ */
+async function raceDeadline<T>(
+  p: Promise<T>,
+  deadline: number,
+): Promise<T | typeof BUDGET_TIMEOUT> {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return BUDGET_TIMEOUT;
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<typeof BUDGET_TIMEOUT>((resolve) => {
+    timer = setTimeout(() => resolve(BUDGET_TIMEOUT), remaining);
+  });
+  try {
+    return await Promise.race([p, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 const IS_WIN = platform() === "win32";
@@ -150,13 +200,10 @@ function commandExists(cmd: string): boolean {
 
 function resolveWorkspacePython(comfyuiPath: string): string {
   if (process.env.COMFYUI_PYTHON) return process.env.COMFYUI_PYTHON;
-  for (const venv of [".venv", "venv"]) {
-    const py = IS_WIN
-      ? join(comfyuiPath, venv, "Scripts", "python.exe")
-      : join(comfyuiPath, venv, "bin", "python");
-    if (existsSync(py)) return py;
-  }
-  return IS_WIN ? "python" : "python3";
+  // Honors .venv/venv AND portable Windows layouts (python_embeded/standalone-env)
+  // so a manifest pip install targets the install's OWN interpreter, never a bare
+  // system python that would contaminate the host env (#463 codex review).
+  return resolveRootInterpreter(comfyuiPath);
 }
 
 function validatePipPackageSpec(pkg: string): void {
@@ -259,10 +306,6 @@ function nodeAlreadyInstalled(id: string, installed: InstalledNode[]): boolean {
   });
 }
 
-function modelsRoot(comfyuiPath: string): string {
-  return join(comfyuiPath, "models");
-}
-
 function defaultFilenameForUrl(url: string): string {
   return basename(new URL(url).pathname) || "model.safetensors";
 }
@@ -319,10 +362,16 @@ async function validateExistingModelAncestors(
 }
 
 async function resolveLocalModelPath(
-  comfyuiPath: string,
   model: ComfyManifest["models"][number],
 ): Promise<{ targetSubfolder: string; filename: string; targetPath: string }> {
-  const root = resolve(modelsRoot(comfyuiPath));
+  // Root the target — and therefore the local_path symlink/containment guards
+  // below — at the SAME directory the downloader actually writes to: the live
+  // connected server's models dir (resolveModelsDir, live-first), NOT
+  // <COMFYUI_PATH>/models. When the connected install differs from a stale
+  // COMFYUI_PATH (#490), validating against COMFYUI_PATH/models would leave a
+  // symlink that escapes the LIVE models dir unchecked and redirect the write
+  // outside it. Same canonical root as the writer = one authoritative guard.
+  const root = resolve(await resolveModelsDir());
 
   if (model.local_path) {
     if (isAbsolute(model.local_path)) {
@@ -563,46 +612,70 @@ export async function applyManifest(
 ): Promise<ApplyManifestResult> {
   const manifest = await resolveManifest(opts);
 
-  // #390 (call-scoped): adopt a saved default workspace as the local FS target
-  // for THIS call ONLY — never persist it process-wide. Persisting
-  // config.comfyuiPath would make a later apply route to a stale/other workspace
-  // (and would never re-read a changed default), and would leak the adopted path
-  // to every other tab/tool sharing this process. Temp-set for the duration of
-  // the apply and always restore in finally. Safe for the background downloads
-  // enqueued below: downloadModel resolves its destination from the LIVE server's
-  // models dir (resolveModelSubfolderPreferServer), not config.comfyuiPath, so a
-  // restore before a job finishes cannot misplace the file.
-  const adopted = adoptableLocalWorkspace();
-  const priorComfyuiPath = config.comfyuiPath;
-  if (adopted) {
+  // Resolve the LOCAL ComfyUI base this call should target, WITHOUT mutating the
+  // process-global config.comfyuiPath (a global temp-set would leak the path to
+  // every concurrent tab/tool and could be clobbered by an interleaved restore —
+  // #490/#463 codex review). We thread it explicitly to applyManifestSections
+  // instead. Precedence, local mode only:
+  //   1. config.comfyuiPath (COMFYUI_PATH / auto-detect) — unchanged, wins.
+  //   2. saved default workspace (#390).
+  //   3. the LIVE connected server's own install root from /system_stats argv
+  //      (#463) — a panel-connected local session with no COMFYUI_PATH still has
+  //      a real FS target, so models/pip aren't skipped as "no local filesystem".
+  // The actual on-disk model DESTINATION is always re-derived live-first by the
+  // downloader (resolveModelsDir), so this base only governs the local-vs-remote
+  // classification + pip's interpreter, never where a model lands.
+  const localBase = await resolveLocalManifestBase();
+
+  return applyManifestSections(manifest, localBase);
+}
+
+/**
+ * The effective LOCAL ComfyUI base for an apply_manifest call. Never mutates
+ * global config. Returns undefined in remote/cloud mode or when no local install
+ * can be found (COMFYUI_PATH unset, no saved default, no reachable live server).
+ */
+async function resolveLocalManifestBase(): Promise<string | undefined> {
+  if (config.comfyuiPath) return config.comfyuiPath;
+  if (isRemoteMode()) return undefined;
+  const saved = adoptableLocalWorkspace();
+  if (saved) return saved;
+  // #463: a live LOCAL ComfyUI is connected but COMFYUI_PATH/default are unset.
+  // Adopt its own install root (from /system_stats argv) only when it exists and
+  // looks like a ComfyUI install.
+  const liveBase = await resolveLiveComfyUIBase();
+  if (
+    liveBase &&
+    existsSync(liveBase) &&
+    (existsSync(join(liveBase, "models")) ||
+      existsSync(join(liveBase, "custom_nodes")))
+  ) {
     logger.info(
-      "apply_manifest: adopting saved default workspace as the local ComfyUI path for this call (COMFYUI_PATH unset)",
-      { path: adopted },
+      "apply_manifest: targeting the live connected ComfyUI root for this call (COMFYUI_PATH unset)",
+      { path: liveBase },
     );
-    config.comfyuiPath = adopted;
+    return liveBase;
   }
-  try {
-    return await applyManifestSections(manifest);
-  } finally {
-    if (adopted) config.comfyuiPath = priorComfyuiPath;
-  }
+  return undefined;
 }
 
 async function applyManifestSections(
   manifest: ComfyManifest,
+  localBase: string | undefined,
 ): Promise<ApplyManifestResult> {
   const results: ManifestItemReport[] = [];
 
   // Per-section mode handling. A LOCAL filesystem is usable only when we are NOT
-  // in remote (or cloud) mode AND COMFYUI_PATH is set (possibly a call-scoped
-  // adopted workspace, see applyManifest); otherwise we are targeting a
-  // remote/cloud ComfyUI over HTTP. Keying off isRemoteMode() (rather than mere
-  // comfyuiPath presence) matters because a remote target can coexist with an
-  // unrelated COMFYUI_PATH on this machine — in that case we must still route
-  // pip/model handling remotely instead of touching the local install/disk.
+  // in remote (or cloud) mode AND a local base was resolved (COMFYUI_PATH, saved
+  // default, or the live connected server's own root — see resolveLocalManifestBase,
+  // threaded here as `localBase` WITHOUT any global config mutation). Otherwise we
+  // are targeting a remote/cloud ComfyUI over HTTP. Keying off isRemoteMode()
+  // (rather than mere base presence) matters because a remote target can coexist
+  // with an unrelated COMFYUI_PATH on this machine — in that case we must still
+  // route pip/model handling remotely instead of touching the local install/disk.
   // custom_nodes and models can still be handled remotely through ComfyUI-Manager's
   // HTTP API, but pip/apt have no remote equivalent.
-  const comfyuiPath = config.comfyuiPath;
+  const comfyuiPath = localBase;
   const hasLocalFs = !isRemoteMode() && Boolean(comfyuiPath);
 
   for (const pkg of manifest.apt) {
@@ -645,43 +718,98 @@ async function applyManifestSections(
     }
   }
 
-  const installedNodes = await installedNodesOrEmpty();
+  // #489: bound the whole custom-node phase by a wall-clock budget. Each install
+  // drives the shared ComfyUI-Manager queue, which can legitimately run for
+  // minutes on a big pack; blocking until every one drains overruns the MCP
+  // tools/call timeout (300s) and the caller sees a FALSE failure while the
+  // Manager keeps installing. So we mirror the model-download grace pattern:
+  // install sequentially, but RACE each install against the remaining budget. If
+  // the budget wins, the install keeps running SERVER-SIDE (we stop awaiting it,
+  // swallowing its late result) and is reported "pending" — never failed — and
+  // every not-yet-started node is reported "pending" too. The caller polls the
+  // Manager queue / re-runs apply_manifest to finish. A node that SETTLES within
+  // budget is verified and reported applied/failed exactly as before.
+  const nodeDeadline = Date.now() + manifestNodeBudgetMs();
+  const pendingBudgetMessage = (started: boolean): string =>
+    started
+      ? "Still installing on the ComfyUI-Manager queue when the apply_manifest time " +
+        "budget elapsed. This is NOT a failure — the install continues server-side. " +
+        "Poll the Manager queue for completion; do not re-issue this node."
+      : "Not started: the apply_manifest time budget elapsed while ComfyUI-Manager " +
+        "was still installing earlier packs. This is NOT a failure — poll the " +
+        "Manager queue for completion, then re-run apply_manifest to continue.";
+  let nodeBudgetSpent = false;
+  // Even the INITIAL installed-list probe is budget-bounded — a hung Manager here
+  // must not blow the tools/call timeout before we can report anything.
+  const initialList = await raceDeadline(installedNodesOrEmpty(), nodeDeadline);
+  const installedNodes = initialList === BUDGET_TIMEOUT ? [] : initialList;
+  if (initialList === BUDGET_TIMEOUT) nodeBudgetSpent = true;
   for (const id of manifest.custom_nodes) {
     if (nodeAlreadyInstalled(id, installedNodes)) {
       results.push(report("custom_node", id, "skipped", "Custom node is already installed."));
       continue;
     }
-    try {
-      const res = await installCustomNode({ id });
-      // ComfyUI-Manager marks a git-URL task "done" (queue drained) even when it
-      // cloned NOTHING — e.g. a repo not in its registry resolves to nothing, no
-      // dir is created, but the queue still empties cleanly. So a successful
-      // installCustomNode() call is NOT proof of install. Re-query the installed
-      // list (it reflects on-disk custom_nodes via Manager's
-      // /v2/customnode/installed, so a freshly-cloned node shows up even before a
-      // reboot) and confirm the node is actually present before reporting success.
-      const verified = await installedNodesOrEmpty();
-      if (nodeAlreadyInstalled(id, verified)) {
-        installedNodes.length = 0;
-        installedNodes.push(...verified);
-        results.push(report("custom_node", id, "applied", res.message));
-      } else {
-        results.push(
-          report(
-            "custom_node",
-            id,
-            "failed",
-            `ComfyUI-Manager reported the install as queued/done, but the node is not present afterward — the source likely resolved to nothing (a git URL that isn't in the Manager registry won't clone). Install it directly (git clone into custom_nodes) or use a registry id. ${res.message}`,
-          ),
-        );
-      }
-    } catch (err) {
+    if (nodeBudgetSpent || Date.now() >= nodeDeadline) {
+      nodeBudgetSpent = true;
+      results.push(report("custom_node", id, "pending", pendingBudgetMessage(false)));
+      continue;
+    }
+
+    // Never REJECTS: fold success/failure into a tagged value so the un-awaited
+    // promise (when the deadline wins) can't surface as an unhandled rejection.
+    // Thread the call-scoped local base (no global config mutation) so the
+    // git-clone / ref-checkout fallback works for an adopted saved-default/live
+    // workspace when COMFYUI_PATH is unset (#463).
+    const installOutcome = installCustomNode({ id, comfyuiPath: localBase })
+      .then((res) => ({ kind: "settled" as const, res }))
+      .catch((err) => ({ kind: "error" as const, err }));
+    const outcome = await raceDeadline(installOutcome, nodeDeadline);
+
+    if (outcome === BUDGET_TIMEOUT) {
+      // Budget spent mid-install: leave it running server-side (installOutcome
+      // already has a .catch, so its eventual settle is safely ignored) and stop
+      // blocking on the remaining nodes.
+      nodeBudgetSpent = true;
+      results.push(report("custom_node", id, "pending", pendingBudgetMessage(true)));
+      continue;
+    }
+    if (outcome.kind === "error") {
       results.push(
         report(
           "custom_node",
           id,
           "failed",
-          err instanceof Error ? err.message : String(err),
+          outcome.err instanceof Error ? outcome.err.message : String(outcome.err),
+        ),
+      );
+      continue;
+    }
+    // ComfyUI-Manager marks a git-URL task "done" (queue drained) even when it
+    // cloned NOTHING — e.g. a repo not in its registry resolves to nothing, no
+    // dir is created, but the queue still empties cleanly. So a successful
+    // installCustomNode() call is NOT proof of install. Re-query the installed
+    // list (it reflects on-disk custom_nodes via Manager's
+    // /v2/customnode/installed, so a freshly-cloned node shows up even before a
+    // reboot) and confirm the node is actually present before reporting success.
+    // Budget-bounded too: if the confirm can't complete in time we report pending
+    // (conservative — the install itself already settled) rather than overrun.
+    const verified = await raceDeadline(installedNodesOrEmpty(), nodeDeadline);
+    if (verified === BUDGET_TIMEOUT) {
+      nodeBudgetSpent = true;
+      results.push(report("custom_node", id, "pending", pendingBudgetMessage(true)));
+      continue;
+    }
+    if (nodeAlreadyInstalled(id, verified)) {
+      installedNodes.length = 0;
+      installedNodes.push(...verified);
+      results.push(report("custom_node", id, "applied", outcome.res.message));
+    } else {
+      results.push(
+        report(
+          "custom_node",
+          id,
+          "failed",
+          `ComfyUI-Manager reported the install as queued/done, but the node is not present afterward — the source likely resolved to nothing (a git URL that isn't in the Manager registry won't clone). Install it directly (git clone into custom_nodes) or use a registry id. ${outcome.res.message}`,
         ),
       );
     }
@@ -729,7 +857,7 @@ async function applyManifestSections(
         results.push(report("model", item, "applied", res.message));
         continue;
       }
-      const target = await resolveLocalModelPath(comfyuiPath!, model);
+      const target = await resolveLocalModelPath(model);
       const existing = await findExistingModel(target);
       if (existing) {
         results.push(report("model", item, "skipped", `Model already exists at ${existing}.`));

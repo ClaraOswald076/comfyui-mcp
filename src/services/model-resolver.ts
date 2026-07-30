@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto";
-import type { Stats } from "node:fs";
-import { readdir, stat, mkdir, readFile } from "node:fs/promises";
-import { join, basename, resolve, relative, sep, isAbsolute } from "node:path";
+import { existsSync, type Stats } from "node:fs";
+import { readdir, stat, mkdir, readFile, lstat, realpath } from "node:fs/promises";
+import { dirname, join, basename, resolve, relative, sep, isAbsolute } from "node:path";
 import { config, isRemoteMode } from "../config.js";
 import { getClient, getSystemStats } from "../comfyui/client.js";
 import { getExtraModelRoots } from "./extra-paths.js";
-import { resolveEffectiveComfyUIBase } from "./workspace-env.js";
+import { resolveEffectiveComfyUIBase, liveRootFromArgv } from "./workspace-env.js";
 import { installModelViaManager } from "./node-management.js";
 import { ModelError, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
@@ -406,7 +406,62 @@ export async function resolveModelSubfolderPreferServer(
   if (targetDir !== modelsRoot && !targetDir.startsWith(modelsRoot + sep)) {
     throw new ModelError(`Refusing to write outside the models directory: ${raw}`);
   }
+  // Path-string containment (above) is not enough: an EXISTING symlink somewhere
+  // between modelsRoot and targetDir could redirect the real write OUTSIDE the
+  // models dir. Because THIS resolver is the single canonical write-target for
+  // every local download (startDownloadJob keying AND downloadModel's write), the
+  // guard belongs here — co-located with the resolution the write actually uses —
+  // so it can never diverge from a caller's separate pre-validation (e.g.
+  // apply_manifest resolving the root a second time; #490 codex review).
+  await assertNoEscapingSymlinkAncestor(modelsRoot, targetDir, raw);
   return targetDir;
+}
+
+/**
+ * Reject when any EXISTING directory STRICTLY BETWEEN `root` and `target` (a
+ * descendant of root, not root itself) is a symlink whose real location escapes
+ * root. The models root ITSELF is intentionally NOT checked: a ComfyUI install
+ * may legitimately symlink/junction its whole models dir onto another drive, so
+ * the root canonicalizes elsewhere by design — that is allowed. Descendants are
+ * compared against the CANONICAL root (realpath of root) so a subfolder that
+ * resolves back inside the real models tree is fine, while one escaping it is
+ * rejected. Best-effort: a not-yet-created segment is fine (the download mkdirs it
+ * inside root); never throws for a missing path — only for a genuine escape.
+ */
+async function assertNoEscapingSymlinkAncestor(
+  root: string,
+  target: string,
+  label: string,
+): Promise<void> {
+  // Canonical root: if the models dir is itself a symlink/junction, resolve it so
+  // descendants are checked against where it REALLY lives (not the lexical path).
+  let realRoot: string;
+  try {
+    realRoot = resolve(await realpath(root));
+  } catch {
+    realRoot = root; // root not yet created — lexical containment is all we can check.
+  }
+  // Walk descendants only: from target up to (but NOT including) root.
+  let cursor = target;
+  while (cursor !== root && cursor.startsWith(root + sep)) {
+    try {
+      const info = await lstat(cursor);
+      if (info.isSymbolicLink()) {
+        const real = resolve(await realpath(cursor));
+        if (real !== realRoot && !real.startsWith(realRoot + sep)) {
+          throw new ModelError(
+            `Refusing to write outside the models directory (a symlink in the path escapes it): ${label}`,
+          );
+        }
+      }
+    } catch (err) {
+      if (err instanceof ModelError) throw err;
+      // ENOENT / not yet created — safe; the writer will create it inside root.
+    }
+    const parent = dirname(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
+  }
 }
 
 export interface ResolvedDownloadTarget {
@@ -724,9 +779,27 @@ export async function shouldDispatchDownloadToManager(): Promise<boolean> {
   if (resolveEffectiveComfyUIBase()) return false;
   try {
     const stats = await getSystemStats();
-    // Reachable server: stream locally only if it exposes a base/models dir we can
-    // write to; otherwise hand the fetch to its ComfyUI-Manager (reconnect-safe).
-    return !parseModelsDirFromArgv(stats.system?.argv);
+    const argv = stats.system?.argv;
+    // Reachable server: stream locally when it exposes a base/models dir we can
+    // write to (--base-directory/--models-directory) OR when we can derive its own
+    // install root from argv (its main.py path) — the SAME live-first root the
+    // downloader writes into (resolveModelsDir). Keeping this in lockstep with
+    // resolveModelsDir is what lets a panel-connected local server with no
+    // COMFYUI_PATH stream models into its live install (#463) instead of bouncing
+    // through the Manager (which then fails when Manager isn't installed). Only
+    // dispatch to the Manager when NEITHER is discoverable (#420 reconnect with an
+    // opaque/relative argv we can't resolve).
+    if (parseModelsDirFromArgv(argv)) return false;
+    // Derive the server's own install root from argv (its main.py). Only treat it
+    // as a LOCAL stream target when that path ACTUALLY EXISTS on this filesystem:
+    // a loopback ComfyUI inside Docker / behind an SSH port-forward reports a
+    // container-side main.py path that is NOT the host's, so writing there would
+    // create a bogus host directory instead of reaching the server. When the root
+    // isn't locally present, hand the fetch to the connected Manager (server-side
+    // write), which lands in the real install regardless.
+    const liveRoot = liveRootFromArgv(argv, (stats.system as { cwd?: string })?.cwd);
+    if (liveRoot && existsSync(liveRoot)) return false;
+    return true;
   } catch {
     // No reachable server → nothing to dispatch to. Let the local resolver throw.
     return false;

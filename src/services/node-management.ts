@@ -6,6 +6,7 @@ import { config, getComfyUIBaseUrl } from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
 import { resetObjectInfoCache } from "../comfyui/client.js";
 import { progressEnabled, reportDownloadProgress } from "./download-progress.js";
+import { resolveRootInterpreter } from "./workspace-env.js";
 import { assertComfyCliOk, runComfyCliSync } from "./comfy-cli.js";
 import { ComfyUIError, ProcessControlError, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
@@ -704,11 +705,15 @@ function gitCheckoutDir(baseUrl: string): string {
   return basename(clean).replace(/\.git$/i, "");
 }
 
-function runGitCheckout(baseUrl: string, ref: string): void {
-  if (!config.comfyuiPath) {
+function runGitCheckout(baseUrl: string, ref: string, basePath?: string): void {
+  // basePath is the CALL-SCOPED local ComfyUI root (apply_manifest threads an
+  // adopted saved-default/live root WITHOUT mutating global config); fall back to
+  // config.comfyuiPath. Either may be unset in remote mode → clear error.
+  const comfyuiBase = basePath ?? config.comfyuiPath;
+  if (!comfyuiBase) {
     throw new ProcessControlError(
       "Checking out a custom-node git ref requires a local ComfyUI install, " +
-        "but config.comfyuiPath is not set.",
+        "but no ComfyUI path is set.",
     );
   }
 
@@ -719,7 +724,7 @@ function runGitCheckout(baseUrl: string, ref: string): void {
   assertSafeGitUrl(baseUrl);
   const repoName = gitCheckoutDir(baseUrl);
   assertSafeRepoName(repoName);
-  const customNodesRoot = resolve(config.comfyuiPath, "custom_nodes");
+  const customNodesRoot = resolve(comfyuiBase, "custom_nodes");
   const nodeDir = resolve(customNodesRoot, repoName);
   const rel = relative(customNodesRoot, nodeDir);
   if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) {
@@ -735,13 +740,13 @@ function runGitCheckout(baseUrl: string, ref: string): void {
 
   try {
     execFileSync("git", ["-C", nodeDir, "fetch", "--all", "--tags"], {
-      cwd: config.comfyuiPath,
+      cwd: comfyuiBase,
       encoding: "utf-8",
       timeout: GIT_CLONE_TIMEOUT,
       env: nonInteractiveGitEnv(),
     });
     execFileSync("git", ["-C", nodeDir, "checkout", "--detach", "--end-of-options", ref], {
-      cwd: config.comfyuiPath,
+      cwd: comfyuiBase,
       encoding: "utf-8",
       timeout: GIT_CLONE_TIMEOUT,
       env: nonInteractiveGitEnv(),
@@ -790,16 +795,18 @@ function nodeInstalledMatches(
 /**
  * Resolve the ComfyUI venv python for installing a cloned node's deps. Prefers
  * the install's own `.venv` (Windows Scripts/ or POSIX bin/), falling back to a
- * bare "python" on PATH.
+ * bare "python" on PATH. `basePath` is the CALL-SCOPED install root (apply_manifest
+ * threads an adopted saved-default/live root without mutating global config); when
+ * omitted it falls back to config.comfyuiPath. Passing it matters: otherwise a
+ * cloned node's requirements.txt / install.py would run under a BARE system python
+ * for an adopted workspace, corrupting/ missing the real ComfyUI environment while
+ * the node is still reported installed (#463 codex review).
  */
-function resolveVenvPython(): string {
-  if (config.comfyuiPath) {
-    const winPy = join(config.comfyuiPath, ".venv", "Scripts", "python.exe");
-    if (existsSync(winPy)) return winPy;
-    const posixPy = join(config.comfyuiPath, ".venv", "bin", "python");
-    if (existsSync(posixPy)) return posixPy;
-  }
-  return "python";
+function resolveVenvPython(basePath?: string): string {
+  // Honors .venv/venv AND portable Windows layouts (python_embeded/standalone-env)
+  // via the shared resolver, so a cloned node's deps target the install's OWN
+  // interpreter rather than a bare system python (#463 codex review).
+  return resolveRootInterpreter(basePath ?? config.comfyuiPath);
 }
 
 /**
@@ -859,11 +866,17 @@ function cloneCustomNodeFallback(
   repoName: string,
   gitRef: string | undefined,
   managerStatus: unknown,
+  basePath?: string,
 ): NodeOpResult {
-  if (!config.comfyuiPath) {
+  // basePath is the CALL-SCOPED local ComfyUI root (apply_manifest threads an
+  // adopted saved-default/live root here WITHOUT mutating global config, so a
+  // panel-connected local session with no COMFYUI_PATH can still clone an
+  // unregistered git pack); fall back to config.comfyuiPath.
+  const comfyuiBase = basePath ?? config.comfyuiPath;
+  if (!comfyuiBase) {
     throw new ProcessControlError(
       `"${repoName}" is not in the ComfyUI-Manager registry and cloning it ` +
-        `requires a local ComfyUI install, but config.comfyuiPath is not set ` +
+        `requires a local ComfyUI install, but no ComfyUI path is set ` +
         `(running in remote --comfyui-url mode). Install it on the ComfyUI host, ` +
         `or pass a registered pack id.`,
     );
@@ -874,10 +887,10 @@ function cloneCustomNodeFallback(
   assertSafeGitUrl(gitId);
   assertSafeRepoName(repoName);
 
-  // Resolve the target and ASSERT it stays inside <comfyuiPath>/custom_nodes,
+  // Resolve the target and ASSERT it stays inside <comfyuiBase>/custom_nodes,
   // mirroring manifest.ts's isWithinRoot containment check (defense in depth on
   // top of the repoName validation above).
-  const customNodesRoot = resolve(config.comfyuiPath, "custom_nodes");
+  const customNodesRoot = resolve(comfyuiBase, "custom_nodes");
   const nodeDir = resolve(customNodesRoot, repoName);
   const rel = relative(customNodesRoot, nodeDir);
   if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) {
@@ -898,7 +911,7 @@ function cloneCustomNodeFallback(
     logger.info("Cloning unregistered custom node", { gitId, nodeDir, gitRef });
     try {
       execFileSync("git", cloneArgs, {
-        cwd: config.comfyuiPath,
+        cwd: comfyuiBase,
         encoding: "utf-8",
         timeout: GIT_CLONE_TIMEOUT,
         env: nonInteractiveGitEnv(),
@@ -916,7 +929,7 @@ function cloneCustomNodeFallback(
         },
       );
     }
-    if (gitRef) runGitCheckout(gitId, gitRef);
+    if (gitRef) runGitCheckout(gitId, gitRef, comfyuiBase);
   }
 
   // VERIFY the clone landed before attempting deps.
@@ -930,7 +943,7 @@ function cloneCustomNodeFallback(
   const requirements = join(nodeDir, "requirements.txt");
   const installScript = join(nodeDir, "install.py");
   if (existsSync(requirements) || existsSync(installScript)) {
-    const python = resolveVenvPython();
+    const python = resolveVenvPython(comfyuiBase);
     if (existsSync(requirements)) {
       try {
         execFileSync(python, ["-m", "pip", "install", "-r", requirements], {
@@ -986,6 +999,11 @@ export interface InstallOptions {
   channel?: string;
   /** Force the official comfy-cli subprocess instead of the HTTP API. */
   useCmCli?: boolean;
+  /** CALL-SCOPED local ComfyUI root for the git-clone / ref-checkout fallback,
+   *  threaded by callers (e.g. apply_manifest) that resolve an adopted
+   *  saved-default/live root WITHOUT mutating global config.comfyuiPath. Falls
+   *  back to config.comfyuiPath when omitted. */
+  comfyuiPath?: string;
 }
 
 /**
@@ -1013,6 +1031,7 @@ async function installCustomNodeImpl(
   opts: InstallOptions,
 ): Promise<NodeOpResult> {
   const { id, version, mode = "remote", channel = "default" } = opts;
+  const basePath = opts.comfyuiPath ?? config.comfyuiPath;
   const parsedGit = parseGitUrl(id);
   const gitId = parsedGit.baseUrl;
   const gitRefCandidate = opts.ref ?? parsedGit.ref ?? version;
@@ -1039,7 +1058,7 @@ async function installCustomNodeImpl(
     const installId = source === "git" ? gitId : id;
     const out = runCmCli(["install", installId, "--mode", mode, "--channel", channel]);
     if (source === "git" && gitRef) {
-      runGitCheckout(gitId, gitRef);
+      runGitCheckout(gitId, gitRef, basePath);
     }
     return {
       mechanism: "comfy-cli",
@@ -1097,7 +1116,7 @@ async function installCustomNodeImpl(
         details: status,
       };
     }
-    return cloneCustomNodeFallback(gitId, repoName, gitRef, status);
+    return cloneCustomNodeFallback(gitId, repoName, gitRef, status, basePath);
   }
 
   // Registry (plain CNR id). Keep the prior defaults channel "default" /

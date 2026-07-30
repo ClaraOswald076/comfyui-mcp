@@ -445,6 +445,91 @@ describe("node-management service", () => {
       expect(cloneEnv?.GIT_ASKPASS).toBe("echo");
     });
 
+    it("clones an unregistered git pack into opts.comfyuiPath when global COMFYUI_PATH is unset (#463)", async () => {
+      // apply_manifest threads a call-scoped base (adopted saved-default/live root)
+      // WITHOUT mutating global config. The clone fallback must honor it, or an
+      // unregistered git URL fails despite a valid local workspace.
+      config.comfyuiPath = undefined;
+      const adopted = "/adopted/ComfyUI";
+      const adoptedNodeDir = resolve(adopted, "custom_nodes", "comfyui-teskors-utils");
+      stubFetch({ installedBody: {} });
+      let cloned = false;
+      mockedExists.mockImplementation((p: unknown) => {
+        const s = String(p);
+        if (s.includes("requirements.txt") || s.includes("install.py")) return false;
+        if (s.includes(".venv") || s.includes("cm-cli.py")) return false;
+        if (s.includes("comfyui-teskors-utils")) return cloned;
+        return false;
+      });
+      mockedExec.mockImplementation(((bin: string, args: string[]) => {
+        if (bin === "git" && args[0] === "clone") cloned = true;
+        return "";
+      }) as never);
+
+      const res = await installCustomNode({
+        id: "https://github.com/teskor-hub/comfyui-teskors-utils",
+        comfyuiPath: adopted,
+      });
+
+      expect(res.mechanism).toBe("git-clone");
+      const cloneCall = mockedExec.mock.calls.find(
+        (c) => c[0] === "git" && (c[1] as string[])[0] === "clone",
+      );
+      expect(cloneCall).toBeDefined();
+      // Cloned into the ADOPTED base's custom_nodes, not a global path.
+      expect((cloneCall![1] as string[]).at(-1)).toBe(adoptedNodeDir);
+      expect((cloneCall![2] as { cwd?: string }).cwd).toBe(adopted);
+    });
+
+    it("installs a cloned node's requirements.txt under the ADOPTED base's venv python, not bare system python (#463)", async () => {
+      // With no global COMFYUI_PATH, the deps install must target the adopted
+      // workspace's own .venv — otherwise requirements land under a bare system
+      // python, corrupting/missing the real ComfyUI env while we report success.
+      config.comfyuiPath = undefined;
+      const adopted = "/adopted/ComfyUI";
+      const IS_WIN = process.platform === "win32";
+      // resolveVenvPython builds this with path.join (NOT resolve), so no drive
+      // letter is prepended — mirror that exactly for the existsSync match.
+      const venvPy = join(
+        adopted,
+        ".venv",
+        IS_WIN ? "Scripts" : "bin",
+        IS_WIN ? "python.exe" : "python",
+      );
+      const nodeDir = resolve(adopted, "custom_nodes", "comfyui-teskors-utils");
+      const requirements = join(nodeDir, "requirements.txt");
+      stubFetch({ installedBody: {} });
+      let cloned = false;
+      mockedExists.mockImplementation((p: unknown) => {
+        const s = String(p);
+        if (s === venvPy) return true; // adopted venv python present
+        if (s === requirements) return true; // node ships requirements.txt
+        if (s.includes("install.py") || s.includes("cm-cli.py")) return false;
+        if (s.includes(".venv")) return false; // any OTHER venv path absent
+        if (s.includes("comfyui-teskors-utils")) return cloned;
+        return false;
+      });
+      mockedExec.mockImplementation(((bin: string, args: string[]) => {
+        if (bin === "git" && args[0] === "clone") cloned = true;
+        return "";
+      }) as never);
+
+      await installCustomNode({
+        id: "https://github.com/teskor-hub/comfyui-teskors-utils",
+        comfyuiPath: adopted,
+      });
+
+      const pipCall = mockedExec.mock.calls.find(
+        (c) =>
+          Array.isArray(c[1]) &&
+          (c[1] as string[]).includes("-r") &&
+          (c[1] as string[]).includes(requirements),
+      );
+      expect(pipCall).toBeDefined();
+      // The deps install ran under the ADOPTED venv python, not bare "python".
+      expect(pipCall![0]).toBe(venvPy);
+    });
+
     it("full-clones (no --depth) and checks out an explicit ref on fallback", async () => {
       stubFetch({ installedBody: {} });
       let cloned = false;

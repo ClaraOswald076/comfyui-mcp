@@ -31,6 +31,9 @@ const downloadModelMock = vi.hoisted(() => vi.fn());
 const resolveExistingModelFileMock = vi.hoisted(() => vi.fn());
 const listLocalModelsMock = vi.hoisted(() => vi.fn());
 const savedWorkspaceMock = vi.hoisted(() => vi.fn(() => undefined as string | undefined));
+const liveComfyBaseMock = vi.hoisted(() =>
+  vi.fn(async () => undefined as string | undefined),
+);
 
 vi.mock("../../config.js", () => ({
   config: mockConfig,
@@ -117,6 +120,21 @@ vi.mock("../../services/model-resolver.js", () => ({
 
 vi.mock("../../services/workspace-env.js", () => ({
   getSavedDefaultWorkspaceSync: (...a: unknown[]) => savedWorkspaceMock(...(a as [])),
+  resolveLiveComfyUIBase: (...a: unknown[]) => liveComfyBaseMock(...(a as [])),
+  // Mirrors the real resolver enough for the pip tests: an install-root python.
+  resolveRootInterpreter: (root: string | undefined) =>
+    root ? `${root}/python` : "python",
+}));
+
+// resolveLocalModelPath now roots local_path validation at the SAME live write
+// dir the downloader uses (resolveModelsDir), not <COMFYUI_PATH>/models (#490).
+// Back it with the fake install's models dir so the containment/symlink guards
+// run against the exact root the tests build their symlink fixtures under.
+const modelsDirMock = vi.hoisted(() =>
+  vi.fn(async () => "/fake/ComfyUI/models" as string),
+);
+vi.mock("../../services/output-dir.js", () => ({
+  resolveModelsDir: (...a: unknown[]) => modelsDirMock(...(a as [])),
 }));
 
 vi.mock("../../utils/logger.js", () => ({
@@ -149,6 +167,8 @@ beforeEach(() => {
   resolveExistingModelFileMock.mockReset().mockRejectedValue(new Error("not found"));
   listLocalModelsMock.mockReset().mockResolvedValue([]);
   savedWorkspaceMock.mockReset().mockReturnValue(undefined);
+  liveComfyBaseMock.mockReset().mockResolvedValue(undefined);
+  modelsDirMock.mockReset().mockResolvedValue("/fake/ComfyUI/models");
 });
 
 describe("loadManifestFile", () => {
@@ -534,6 +554,76 @@ describe("applyManifest", () => {
     expect(mockConfig.comfyuiPath).toBeUndefined();
   });
 
+  it("adopts the LIVE connected ComfyUI root when COMFYUI_PATH and saved default are both unset (#463)", async () => {
+    // #463: sidebar panel connected to a live local ComfyUI, no COMFYUI_PATH and
+    // no saved default. Without adoption the session is misclassified "no local
+    // filesystem" and every model is skipped. Adopting the live root (from
+    // /system_stats) gives a local FS target so the model downloads instead.
+    mockConfig.comfyuiPath = undefined;
+    mockConfig.remote = false; // local loopback target reached over the panel session
+    savedWorkspaceMock.mockReturnValue(undefined);
+    liveComfyBaseMock.mockResolvedValue("/live/ComfyUI");
+    existsSyncMock.mockImplementation((p: unknown) => {
+      const s = String(p);
+      return (
+        s.includes("live") &&
+        (s.endsWith("ComfyUI") || s.endsWith("models") || s.endsWith("custom_nodes"))
+      );
+    });
+
+    const result = await applyManifest({
+      manifest: {
+        models: [
+          { url: "https://example.com/m.safetensors", model_type: "loras", filename: "m.safetensors" },
+        ],
+      },
+    });
+
+    // Downloaded locally (NOT skipped as "no local filesystem").
+    expect(result.summary).toMatchObject({ applied: 1, failed: 0, skipped: 0 });
+    expect(downloadModelMock).toHaveBeenCalled();
+    // Call-scoped: the adopted live path must NOT persist process-wide.
+    expect(mockConfig.comfyuiPath).toBeUndefined();
+  });
+
+  it("reports a custom_node as PENDING (not failed) when the Manager queue is still installing at the budget (#489)", async () => {
+    // A node install that outlives the wall-clock budget must be reported
+    // "pending" (poll the Manager queue), never "failed" — the install keeps
+    // running server-side — and every not-yet-started node is reported pending too.
+    const prevBudget = process.env.COMFYUI_MCP_MANIFEST_NODE_BUDGET_MS;
+    process.env.COMFYUI_MCP_MANIFEST_NODE_BUDGET_MS = "40";
+    // First node never settles (simulates the Manager queue still draining); the
+    // budget timer must win and stop us blocking on the rest.
+    installCustomNodeMock.mockReturnValueOnce(new Promise(() => {}));
+
+    try {
+      const result = await applyManifest({
+        manifest: { custom_nodes: ["slow-pack", "next-pack"] },
+      });
+
+      expect(result.summary).toMatchObject({ applied: 0, failed: 0, pending: 2 });
+      expect(result.results[0]).toMatchObject({
+        action: "custom_node",
+        item: "slow-pack",
+        status: "pending",
+      });
+      expect(result.results[0].message).toMatch(/still installing/i);
+      // The second node is NOT started once the budget is spent — reported pending.
+      expect(result.results[1]).toMatchObject({
+        action: "custom_node",
+        item: "next-pack",
+        status: "pending",
+      });
+      expect(result.results[1].message).toMatch(/not started/i);
+      expect(installCustomNodeMock).toHaveBeenCalledTimes(1);
+      // Pending is not a failure: success stays true (nothing FAILED).
+      expect(result.success).toBe(true);
+    } finally {
+      if (prevBudget === undefined) delete process.env.COMFYUI_MCP_MANIFEST_NODE_BUDGET_MS;
+      else process.env.COMFYUI_MCP_MANIFEST_NODE_BUDGET_MS = prevBudget;
+    }
+  });
+
   it("hands a slow model download to a background job (pending, not applied) (#362)", async () => {
     const prevGrace = process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS;
     process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS = "0";
@@ -626,6 +716,36 @@ describe("applyManifest", () => {
     expect(result.results).toMatchObject([
       { action: "model", status: "failed", item: "link/model.safetensors" },
     ]);
+    expect(downloadModelMock).not.toHaveBeenCalled();
+  });
+
+  it("validates local_path symlinks against the LIVE models dir, not a stale COMFYUI_PATH (#490)", async () => {
+    // #490: COMFYUI_PATH is a stale install; the connected server writes under a
+    // DIFFERENT live root. A symlink that escapes the LIVE models dir must be
+    // caught — the guard has to run against the live write root the downloader
+    // uses, NOT <COMFYUI_PATH>/models (which is never written to here).
+    mockConfig.comfyuiPath = "/stale/ComfyUI";
+    const liveModels = resolve("/live/ComfyUI/models");
+    modelsDirMock.mockResolvedValue(liveModels);
+    const linkDir = join(liveModels, "link");
+    const outside = resolve("/tmp/escape");
+    realpathMock.mockImplementation((path: string) => {
+      if (path === liveModels) return Promise.resolve(liveModels);
+      if (path === linkDir) return Promise.resolve(outside);
+      return Promise.resolve(path);
+    });
+
+    const result = await applyManifest({
+      manifest: {
+        models: [{ url: "https://example.com/m.safetensors", local_path: "link/m.safetensors" }],
+      },
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.results).toMatchObject([
+      { action: "model", status: "failed", item: "link/m.safetensors" },
+    ]);
+    expect(result.results[0].message).toMatch(/escapes the models directory/i);
     expect(downloadModelMock).not.toHaveBeenCalled();
   });
 
