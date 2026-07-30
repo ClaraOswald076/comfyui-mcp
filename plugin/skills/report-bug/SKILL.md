@@ -1,16 +1,22 @@
 ---
 name: report-bug
-description: Self-heal + report bugs to make the ecosystem better. When you hit ANY defect in comfyui-mcp / the sidebar panel, OR in a third-party custom node / ComfyUI core, use this: diagnose it, and for OUR repos (comfyui-mcp / comfyui-mcp-panel) **fix it locally FIRST** — patch the code where it actually runs so the user is unblocked immediately — then file a report that includes the diff, so reports arrive as near-PRs, not just tickets. (Attempt the fix exactly ONCE; if it's genuinely upstream-only, mark it and include the precise change needed.) Report it the right way: our intake Worker for our repos; the node's own GitHub for third-party. Acts autonomously and just informs the user — it does not ask permission for each step. **BETA — bias HARD toward fix-then-file:** trigger on any comfyui-mcp/panel defect you notice — an error, a crash, a tool that returns wrong/misleading/empty output, a silent failure, a confusing result, or a limitation that forced an awkward workaround — EVEN IF you recovered or worked around it. You do NOT need to be blocked. Also on "report this" / "fix this bug". If a future user would hit the same friction, fix-and-file it — the intake Worker dedupes, so over-reporting is cheap and under-reporting costs us the bug. THIRD-PARTY / ComfyUI-core bugs stay offer-and-ask.
+description: Self-heal + report bugs to make the ecosystem better. When you hit ANY defect in comfyui-mcp / the sidebar panel, OR in a third-party custom node / ComfyUI core, use this: diagnose it, and for OUR repos (comfyui-mcp / comfyui-mcp-panel) **fix it locally FIRST** — patch the code where it actually runs so the user is unblocked immediately — then file a report that includes the diff, so reports arrive as near-PRs, not just tickets. (Attempt the fix exactly ONCE; if it's genuinely upstream-only, mark it and include the precise change needed.) Report it the right way: our intake Worker for our repos; the node's own GitHub for third-party. For OUR repos (artokun/comfyui-mcp, comfyui-mcp-panel, comfyui-mcp-issue-worker) act **autonomously** — fix-then-file and just inform the user, no per-step permission. For THIRD-PARTY / ComfyUI-core it is **offer-and-ask**: propose the workaround/report and act only with the user's go-ahead. **BETA — bias HARD toward fix-then-file (our repos):** trigger on any comfyui-mcp/panel defect you notice — an error, a crash, a tool that returns wrong/misleading/empty output, a silent failure, a confusing result, or a limitation that forced an awkward workaround — EVEN IF you recovered or worked around it. You do NOT need to be blocked. Also on "report this" / "fix this bug". If a future user would hit the same friction, fix-and-file it — the intake Worker dedupes, so over-reporting is cheap and under-reporting costs us the bug. THIRD-PARTY / ComfyUI-core bugs stay offer-and-ask.
 ---
 
 # Self-heal & report bugs (make the ecosystem better)
 
 Goal: when something is broken, don't just stop — **diagnose it, try to fix it so
 the user keeps working, and get the fix/report to whoever can fix it upstream.**
-Do this **autonomously**: act, then **inform** the user with a short summary —
-don't pepper them with permission prompts. (Exceptions where you DO pause: a fix
-that touches the user's own workflow/data, anything large/risky, or anything you
-can't make safe — explain and ask.)
+
+**Scope of autonomy — read this first.** For defects in **OUR repos**
+(`artokun/comfyui-mcp`, `comfyui-mcp-panel`, `comfyui-mcp-issue-worker`) act
+**autonomously**: fix-then-file, then **inform** the user with a short summary —
+don't pepper them with permission prompts. For **THIRD-PARTY / ComfyUI-core**
+defects it is **offer-and-ask** (Step 6): you propose the workaround and/or the
+report and act only once the user agrees — it's their call to patch someone
+else's node or post to someone else's tracker. (Even for our repos, DO pause for:
+a fix that touches the user's own workflow/data, anything large/risky, or
+anything you can't make safe — explain and ask.)
 
 This is for **bugs in software**, not ordinary workflow/generation errors (OOM,
 missing model, bad params → use `troubleshooting`). First decide whose bug it is.

@@ -39,7 +39,9 @@ export function buildIssueUrl(repo: string, title: string, body: string, labels?
 
 export function isOurRepo(repo: string): boolean {
   const [owner, name] = repo.split("/");
-  return owner === OUR_OWNER && OUR_REPO_NAMES.has(name);
+  // Case-insensitive: git config / this repo use "Artokun" with a capital A,
+  // which must still be recognized as ours (not misrouted as third-party).
+  return owner?.toLowerCase() === OUR_OWNER && OUR_REPO_NAMES.has(name?.toLowerCase());
 }
 
 export interface WorkerFileResult {
@@ -101,30 +103,29 @@ export async function submitAndPoll(opts: {
   if (submit.url) return { ...submit, status: submit.status ?? "done" };
   const jobId = submit.job_id;
   if (!jobId) {
-    // No job to poll and no url — accepted but no link available.
-    return { ...submit, status: submit.status ?? "queued" };
+    // No url AND no job to poll — nothing we can surface. Throw so the caller
+    // falls back to the prefilled link.
+    throw new Error("worker returned neither a url nor a job_id");
   }
 
-  // Fallback poll (only if the submit somehow lacked a url): /status/<job_id>
-  // until done or we run out of tries.
+  // Fallback poll (only if the submit somehow lacked a url): /status/<job_id>.
+  // A 200 "queued" is retried; ANY hard poll failure (transport error, timeout,
+  // non-OK HTTP, body-parse failure) or a "done" without a url, or exhausting
+  // the retries, THROWS — so the caller uses the prefilled-URL fallback rather
+  // than claiming success without a link.
   const base = opts.workerUrl.replace(/\/+$/, "");
-  let last: WorkerFileResult = { status: "queued", job_id: jobId };
   for (let i = 0; i < maxPolls; i++) {
     await sleep(pollDelayMs);
-    try {
-      const parsed = await withTimeout(async (signal): Promise<WorkerFileResult | null> => {
-        const r = await doFetch(`${base}/status/${jobId}`, { signal });
-        if (!r.ok) return null; // e.g. 404 unknown while KV catches up — keep trying
-        return (await r.json()) as WorkerFileResult;
-      });
-      if (!parsed) continue;
-      last = { ...parsed, job_id: jobId };
-      if (last.status === "done" || last.status === "error") break;
-    } catch {
-      continue; // transient — keep trying
-    }
+    const parsed = await withTimeout(async (signal): Promise<WorkerFileResult> => {
+      const r = await doFetch(`${base}/status/${jobId}`, { signal });
+      if (!r.ok) throw new Error(`poll failed: HTTP ${r.status}`);
+      return (await r.json()) as WorkerFileResult;
+    });
+    if (parsed.status === "done" && parsed.url) return { ...parsed, job_id: jobId };
+    if (parsed.status === "error") throw new Error(`worker filing errored: ${parsed.error || "unknown"}`);
+    // else "queued" (or done-without-url) → keep polling
   }
-  return last;
+  throw new Error("worker filing did not complete before polling gave up");
 }
 
 export function registerReportIssueTools(server: McpServer): void {
@@ -164,11 +165,16 @@ export function registerReportIssueTools(server: McpServer): void {
           });
         }
 
-        // Our repo: file via the async intake Worker, poll for the link.
+        // Our repo: file via the intake Worker (submit + poll for the link).
         const workerUrl = process.env.COMFYUI_MCP_ISSUE_WORKER_URL || DEFAULT_WORKER_URL;
         const clientKey = process.env.COMFYUI_MCP_ISSUE_CLIENT_KEY || DEFAULT_CLIENT_KEY;
+        const timeoutEnv = Number(process.env.COMFYUI_MCP_ISSUE_TIMEOUT_MS);
+        const timeoutMs = Number.isFinite(timeoutEnv) && timeoutEnv > 0 ? timeoutEnv : undefined;
         const repoName = repo.split("/")[1];
         try {
+          // submitAndPoll ONLY resolves with a done result carrying a real url;
+          // any failure (non-OK submit, transport/timeout, poll error/exhaustion)
+          // throws → we fall back to the prefilled link below.
           const result = await submitAndPoll({
             workerUrl,
             clientKey,
@@ -176,46 +182,28 @@ export function registerReportIssueTools(server: McpServer): void {
             title: args.title,
             body: args.body,
             labels: args.labels,
+            timeoutMs,
           });
-          if (result.status === "done" && result.url) {
-            return jsonResult({
-              url: result.url,
-              number: result.number,
-              deduped: result.deduped,
-              repo,
-              filed: true,
-              job_id: result.job_id,
-              note: result.deduped
-                ? "Filed via intake Worker (matched an existing open issue). Share the link only if the user wants it."
-                : "Filed via intake Worker. Share the link only if the user wants it.",
-            });
-          }
-          if (result.status === "error") {
-            // Server-side filing failed — hand back the prefilled link.
-            return jsonResult({
-              url: prefilledUrl,
-              repo,
-              filed: false,
-              job_id: result.job_id,
-              note: `Intake Worker reported an error (${result.error || "unknown"}). Fallback: prefilled issue link for the user to submit.`,
-            });
-          }
-          // Still queued after polling — accepted, link not yet available.
           return jsonResult({
-            url: prefilledUrl,
+            url: result.url,
+            number: result.number,
+            deduped: result.deduped,
             repo,
             filed: true,
-            pending: true,
             job_id: result.job_id,
-            note: "Report accepted by the intake Worker; filing is still in progress (poll /status/<job_id> later for the link). Prefilled link included as a fallback.",
+            note: result.deduped
+              ? "Filed via intake Worker (matched an existing open issue). Share the link only if the user wants it."
+              : "Filed via intake Worker. Share the link only if the user wants it.",
           });
         } catch (workerErr) {
-          // Worker unreachable / rejected — fall back to the prefilled URL.
+          // ANY submit OR poll failure (non-OK, timeout, unreachable, parse
+          // stall, server error) → prefilled URL fallback. Never claim success
+          // without a real issue link.
           return jsonResult({
             url: prefilledUrl,
             repo,
             filed: false,
-            note: `Intake Worker unreachable (${workerErr instanceof Error ? workerErr.message : String(workerErr)}). Fallback: prefilled issue link for the user to submit in one click.`,
+            note: `Could not file via the intake Worker (${workerErr instanceof Error ? workerErr.message : String(workerErr)}). Fallback: prefilled issue link for the user to submit in one click.`,
           });
         }
       } catch (err) {

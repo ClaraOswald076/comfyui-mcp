@@ -41,9 +41,12 @@ describe("normalizeRepo / buildIssueUrl / isOurRepo", () => {
     expect(() => normalizeRepo("nope")).toThrow();
   });
 
-  it("recognizes our repos only", () => {
+  it("recognizes our repos only, case-insensitively", () => {
     expect(isOurRepo("artokun/comfyui-mcp")).toBe(true);
     expect(isOurRepo("artokun/comfyui-mcp-panel")).toBe(true);
+    // git config / this repo use a capital A — must still be ours.
+    expect(isOurRepo("Artokun/comfyui-mcp")).toBe(true);
+    expect(isOurRepo("ARTOKUN/ComfyUI-MCP-Panel")).toBe(true);
     expect(isOurRepo("artokun/other")).toBe(false);
     expect(isOurRepo("someone/comfyui-mcp")).toBe(false);
   });
@@ -97,28 +100,73 @@ describe("submitAndPoll", () => {
     ).rejects.toThrow(/401/);
   });
 
-  it("surfaces a server-side error status from polling", async () => {
+  it("THROWS on a server-side error status from polling (→ caller falls back)", async () => {
     const fetchImpl = (async (url: string) => {
       if (url === "https://w") return res({ ok: true, job_id: "j3", status: "queued" });
       return res({ status: "error", error: "GitHub API error" });
     }) as unknown as typeof fetch;
-    const r = await submitAndPoll({ workerUrl: "https://w", clientKey: "k", repoName: "comfyui-mcp", title: "t", body: "b", fetchImpl, sleep: noSleep, pollDelayMs: 0 });
-    expect(r).toMatchObject({ status: "error", error: "GitHub API error", job_id: "j3" });
+    await expect(
+      submitAndPoll({ workerUrl: "https://w", clientKey: "k", repoName: "comfyui-mcp", title: "t", body: "b", fetchImpl, sleep: noSleep, pollDelayMs: 0 }),
+    ).rejects.toThrow(/errored/);
   });
 
-  it("gives up as queued if polling never resolves", async () => {
+  it("THROWS when polling never resolves (exhausts retries) instead of claiming queued success", async () => {
     const fetchImpl = (async (url: string) => {
       if (url === "https://w") return res({ ok: true, job_id: "j4", status: "queued" });
       return res({ status: "queued" });
     }) as unknown as typeof fetch;
-    const r = await submitAndPoll({ workerUrl: "https://w", clientKey: "k", repoName: "comfyui-mcp", title: "t", body: "b", fetchImpl, sleep: noSleep, pollDelayMs: 0, maxPolls: 3 });
-    expect(r.status).toBe("queued");
-    expect(r.job_id).toBe("j4");
+    await expect(
+      submitAndPoll({ workerUrl: "https://w", clientKey: "k", repoName: "comfyui-mcp", title: "t", body: "b", fetchImpl, sleep: noSleep, pollDelayMs: 0, maxPolls: 3 }),
+    ).rejects.toThrow(/did not complete/);
+  });
+
+  it("THROWS on a poll transport failure (HTTP error) → caller falls back", async () => {
+    const fetchImpl = (async (url: string) => {
+      if (url === "https://w") return res({ ok: true, job_id: "j5", status: "queued" });
+      return res({ error: "boom" }, 503);
+    }) as unknown as typeof fetch;
+    await expect(
+      submitAndPoll({ workerUrl: "https://w", clientKey: "k", repoName: "comfyui-mcp", title: "t", body: "b", fetchImpl, sleep: noSleep, pollDelayMs: 0 }),
+    ).rejects.toThrow(/poll failed/);
+  });
+
+  it("timeout: a SUBMIT whose .json() stalls until the AbortController fires → throws", async () => {
+    const fetchImpl = (async (_url: string, init: RequestInit) => ({
+      ok: true,
+      json: () =>
+        new Promise((_resolve, reject) => {
+          init.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+        }),
+    })) as unknown as typeof fetch;
+    await expect(
+      submitAndPoll({ workerUrl: "https://w", clientKey: "k", repoName: "comfyui-mcp", title: "t", body: "b", fetchImpl, sleep: noSleep, timeoutMs: 10 }),
+    ).rejects.toThrow();
+  });
+
+  it("timeout: a POLL whose .json() stalls until the AbortController fires → throws", async () => {
+    const fetchImpl = (async (url: string, init: RequestInit) => {
+      if (url === "https://w") return res({ ok: true, job_id: "j6", status: "queued" });
+      return {
+        ok: true,
+        json: () =>
+          new Promise((_resolve, reject) => {
+            init.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+          }),
+      };
+    }) as unknown as typeof fetch;
+    await expect(
+      submitAndPoll({ workerUrl: "https://w", clientKey: "k", repoName: "comfyui-mcp", title: "t", body: "b", fetchImpl, sleep: noSleep, pollDelayMs: 0, timeoutMs: 10 }),
+    ).rejects.toThrow();
   });
 });
 
 describe("report_issue tool (registered handler)", () => {
-  afterEach(() => vi.unstubAllGlobals());
+  const savedTimeout = process.env.COMFYUI_MCP_ISSUE_TIMEOUT_MS;
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    if (savedTimeout === undefined) delete process.env.COMFYUI_MCP_ISSUE_TIMEOUT_MS;
+    else process.env.COMFYUI_MCP_ISSUE_TIMEOUT_MS = savedTimeout;
+  });
 
   it("third-party repo → prefilled URL, filed:false, no network", async () => {
     const spy = vi.fn();
@@ -146,6 +194,54 @@ describe("report_issue tool (registered handler)", () => {
     const { json } = await callTool({ title: "t", body: "b" }); // default our repo
     expect(json).toMatchObject({ filed: true, number: 50 });
     expect(json.url).toBe("https://github.com/artokun/comfyui-mcp/issues/50");
+  });
+
+  it("mixed-case owner (Artokun/comfyui-mcp) is treated as OURS and files via the Worker", async () => {
+    const spy = vi.fn(async () => res({ ok: true, url: "https://github.com/Artokun/comfyui-mcp/issues/60", number: 60, job_id: "jm" }));
+    vi.stubGlobal("fetch", spy);
+    const { json } = await callTool({ title: "t", body: "b", repo: "Artokun/comfyui-mcp" });
+    expect(spy).toHaveBeenCalled(); // hit the Worker, not the prefilled path
+    expect(json).toMatchObject({ filed: true, number: 60 });
+  });
+
+  it("timeout regression (SUBMIT .json() stalls) → prefilled fallback", async () => {
+    process.env.COMFYUI_MCP_ISSUE_TIMEOUT_MS = "15";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async (_url: string, init: RequestInit) =>
+          ({
+            ok: true,
+            json: () =>
+              new Promise((_resolve, reject) => {
+                init.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+              }),
+          }) as unknown as Response,
+      ),
+    );
+    const { json } = await callTool({ title: "t", body: "b" });
+    expect(json).toMatchObject({ filed: false });
+    expect(json.url).toContain("/issues/new");
+  });
+
+  it("timeout regression (POLL .json() stalls) → prefilled fallback", async () => {
+    process.env.COMFYUI_MCP_ISSUE_TIMEOUT_MS = "15";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: RequestInit) => {
+        if (!String(url).includes("/status/")) return res({ ok: true, job_id: "jp2", status: "queued" });
+        return {
+          ok: true,
+          json: () =>
+            new Promise((_resolve, reject) => {
+              init.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+            }),
+        } as unknown as Response;
+      }),
+    );
+    const { json } = await callTool({ title: "t", body: "b" });
+    expect(json).toMatchObject({ filed: false });
+    expect(json.url).toContain("/issues/new");
   });
 
   it("our repo, Worker returns non-OK (500) → falls back to prefilled URL (generic, not just 401)", async () => {
