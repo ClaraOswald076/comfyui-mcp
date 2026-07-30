@@ -81,7 +81,9 @@ export function registerGenerateAudioTool(server: McpServer): void {
       guidance_scale: z
         .number()
         .optional()
-        .describe("Text encoder guidance scale (ACE only, default: 0.85)"),
+        .describe(
+          "TextEncodeAceStepAudio1.5 cfg_scale — text encoder guidance scale (ACE only, default: 2)",
+        ),
 
       // Stable Audio 3 specific
       checkpoint: z

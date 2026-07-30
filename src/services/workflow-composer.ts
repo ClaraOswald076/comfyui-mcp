@@ -621,6 +621,14 @@ interface AceStep15Txt2AudioParams {
   language?: string;
   musical_key?: string;
   guidance_scale?: number;
+  bpm?: number;
+  timesignature?: string;
+  temperature?: number;
+  top_p?: number;
+  top_k?: number;
+  min_p?: number;
+  generate_audio_codes?: boolean;
+  audio_quality?: string;
   filename_prefix?: string;
 }
 
@@ -654,13 +662,23 @@ function buildAceStep15Txt2Audio(p: AceStep15Txt2AudioParams): WorkflowJSON {
   const shift = p.shift ?? 3;
   const language = p.language ?? "en";
   const key = p.musical_key ?? "C major";
-  const posCfg = p.guidance_scale ?? 0.85;
+  // `cfg_scale` on TextEncodeAceStepAudio1.5 defaults to 2 in the node schema;
+  // it is distinct from the sampler's `cfg` and from `temperature` (0.85).
+  const cfgScale = p.guidance_scale ?? 2;
+  const bpm = p.bpm ?? 120;
+  const timesignature = p.timesignature ?? "4";
+  const temperature = p.temperature ?? 0.85;
+  const topP = p.top_p ?? 0.9;
+  const topK = p.top_k ?? 0;
+  const minP = p.min_p ?? 0;
+  const generateAudioCodes = p.generate_audio_codes ?? true;
+  const audioQuality = p.audio_quality ?? "320k";
   const prefix = p.filename_prefix ?? "audio/ace_step";
 
   return {
     "1": {
       class_type: "UNETLoader",
-      inputs: { ckpt_name: unet, weight_dtype: "default" },
+      inputs: { unet_name: unet, weight_dtype: "default" },
     },
     "2": {
       class_type: "DualCLIPLoader",
@@ -686,13 +704,20 @@ function buildAceStep15Txt2Audio(p: AceStep15Txt2AudioParams): WorkflowJSON {
       class_type: "TextEncodeAceStepAudio1.5",
       inputs: {
         clip: conn("2", 0),
-        seed,
-        duration,
-        text: prompt,
+        tags: prompt,
         lyrics,
+        seed,
+        bpm,
+        duration,
+        timesignature,
         language,
-        key,
-        cfg: posCfg,
+        keyscale: key,
+        generate_audio_codes: generateAudioCodes,
+        cfg_scale: cfgScale,
+        temperature,
+        top_p: topP,
+        top_k: topK,
+        min_p: minP,
       },
     },
     "7": {
@@ -720,7 +745,7 @@ function buildAceStep15Txt2Audio(p: AceStep15Txt2AudioParams): WorkflowJSON {
     },
     "10": {
       class_type: "SaveAudioMP3",
-      inputs: { audio: conn("9", 0), filename_prefix: prefix },
+      inputs: { audio: conn("9", 0), filename_prefix: prefix, quality: audioQuality },
     },
   };
 }
