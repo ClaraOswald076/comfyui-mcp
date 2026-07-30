@@ -509,7 +509,14 @@ describe("parseListenerPidFromNetstat — locale-independent port→PID (#449)",
 });
 
 describe("findPidByPort resilience to localized netstat state (#449)", () => {
-  it("stop_comfyui finds the listener PID even on non-English Windows", async () => {
+  // IS_WIN is captured from os.platform() at module load, so this test exercises
+  // the Windows `netstat` branch only on Windows. On Ubuntu CI findPidByPort
+  // takes the `lsof` path and this wiring test is not meaningful — the pure
+  // parseListenerPidFromNetstat suite above covers the locale mechanism on every
+  // platform. (The reachable-diagnostic tests below are platform-agnostic: they
+  // resolve no PID on either branch.)
+  const winIt = process.platform === "win32" ? it : it.skip;
+  winIt("stop_comfyui finds the listener PID even on non-English Windows", async () => {
     // Realistic German netstat -ano blob: state column is 'ABHÖREN', not
     // 'LISTENING'. The mock emulates the actual shell pipeline — a chained
     // `findstr LISTENING` (the OLD detector) would filter every line out,
