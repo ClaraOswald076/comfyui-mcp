@@ -137,7 +137,7 @@ export function registerModelManagementTools(server: McpServer): void {
         // case is unchanged. A multi-GB checkpoint hands back a handle instead
         // of pinning the turn for ten minutes — which is what made the agent
         // look stuck and then wrongly disclaim a download that was running.
-        const { job, settled } = startDownloadJob(
+        const { job, settled } = await startDownloadJob(
           args.url,
           args.target_subfolder,
           args.filename,

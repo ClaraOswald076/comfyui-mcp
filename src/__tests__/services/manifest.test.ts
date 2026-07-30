@@ -80,6 +80,12 @@ vi.mock("../../services/model-resolver.js", () => ({
     "unet",
   ],
   downloadModel: (...a: unknown[]) => downloadModelMock(...a),
+  // startDownloadJob resolves the destination via this before streaming; stub it
+  // so a distinct targetPath is derived per (subfolder, filename) without a server.
+  resolveDownloadTarget: async (url: string, sub: string, filename?: string) => {
+    const name = filename ?? String(url).split("/").pop() ?? "model.safetensors";
+    return { targetDir: `/fake/ComfyUI/models/${sub}`, filename: name, targetPath: `/fake/ComfyUI/models/${sub}/${name}` };
+  },
   resolveExistingModelFile: (...a: unknown[]) => resolveExistingModelFileMock(...a),
   listLocalModels: (...a: unknown[]) => listLocalModelsMock(...a),
   // Faithful mirror of the real managerModelDestination (pure logic) so the

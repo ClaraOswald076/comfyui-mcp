@@ -15,8 +15,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { basename, posix as posixPath } from "node:path";
-import { downloadModel } from "./model-resolver.js";
+import { downloadModel, resolveDownloadTarget } from "./model-resolver.js";
 import type { DownloadAuth } from "./download-auth.js";
 import { logger } from "../utils/logger.js";
 
@@ -59,78 +58,34 @@ export function downloadIdFor(url: string): string {
 }
 
 /**
- * Canonicalize a target subfolder the SAME way the write path does, so any two
- * inputs that resolve to one on-disk directory hash to one id. The write path
- * (resolveModelSubfolderPreferServer) does `resolve(modelsRoot, sub)` — which
- * collapses "." and ".." — against a CONSTANT models root; the varying part is
- * the relative remainder, so we resolve against a fixed sentinel root and take
- * the relative form. Thus "loras" and "checkpoints/../loras" (both → <models>/
- * loras on disk) produce the SAME id. Escapes ("../evil") keep their normalized
- * form here; the write path rejects them regardless.
+ * The download's DISTINCT public id — a hash of the canonical resolved on-disk
+ * `targetPath` (from the shared resolveDownloadTarget), used as BOTH the registry
+ * key and `job.id`. Identity is the DESTINATION, not the URL: two requests that
+ * resolve to the SAME file are one job/one writer (even from different URLs);
+ * requests to different destinations are separately pollable via download_status.
  */
-function normalizeSubfolder(sub: string): string {
-  const posixed = sub.replace(/\\/g, "/");
-  const resolved = posixPath.resolve("/__models_root__", posixed);
-  const rel = posixPath.relative("/__models_root__", resolved);
-  return rel;
+export function downloadJobIdFor(targetPath: string): string {
+  return createHash("sha256").update(targetPath).digest("hex").slice(0, 16);
 }
 
 /**
- * Resolve the on-disk filename EXACTLY as downloadModel does (model-resolver.ts):
- * an OMITTED filename derives from the URL pathname basename (→ "model.safetensors"
- * fallback), while ANY DEFINED filename — including a blank string — is taken as
- * `basename(filename)` verbatim (a blank one yields "", which downloadModel then
- * REJECTS). Critically, a defined-but-blank filename is NOT coerced to "omitted":
- * that would make a blank filename adopt the URL-derived job even though the write
- * paths diverge (one errors, one succeeds).
- */
-function resolveDownloadFilename(url: string, filename?: string): string {
-  if (filename === undefined) {
-    try {
-      return basename(new URL(url).pathname) || "model.safetensors";
-    } catch {
-      return "model.safetensors";
-    }
-  }
-  return basename(filename); // defined (incl. "") → mirror downloadModel's basename(rawFilename)
-}
-
-/**
- * DISTINCT public id, keyed on URL AND destination — used as BOTH the registry
- * key and `job.id`. The same URL fetched to two different subfolders/filenames
- * gets two ids, so each is a separate job that download_status can poll
- * individually (the URL-only scheme collapsed them into one, wrote only the
- * first destination, and reported both done). Adoption of an in-flight download
- * therefore requires the SAME target.
- *
- * The tuple is JSON-encoded (NOT space/char-joined) so field boundaries are
- * unambiguous: ("loras foo","bar") and ("loras","foo bar") must NOT collide, and
- * the filename is RESOLVED the same way the write resolves it so omitted ==
- * explicit-URL-basename produces one id (one writer), not two.
- */
-export function downloadJobIdFor(
-  url: string,
-  targetSubfolder: string,
-  filename?: string,
-): string {
-  const canonical = JSON.stringify([
-    url,
-    normalizeSubfolder(targetSubfolder),
-    resolveDownloadFilename(url, filename),
-  ]);
-  return createHash("sha256").update(canonical).digest("hex").slice(0, 16);
-}
-
-/**
- * Start a download, or adopt one already running for the same URL+destination.
+ * Start a download, or adopt one already running for the same on-disk destination.
  *
  * The adoption case matters: the visible symptom of the old bug was "the agent
  * looks stuck", and the natural user response is to ask again. Without this,
  * the second ask starts a SECOND stream onto the same target path — two writers,
- * one file. Returning the in-flight job makes a repeated request harmless. Two
- * requests for the same URL but DIFFERENT destinations are NOT the same job.
+ * one file. Returning the in-flight job makes a repeated request harmless.
+ *
+ * Async because the destination is resolved by the SAME code the write uses
+ * (resolveDownloadTarget), so the job is keyed by the exact `targetPath` the file
+ * lands at — any two inputs resolving to one file are one job — and an INVALID
+ * input (blank / path-ful filename, escaping subfolder) is REJECTED here, up
+ * front, exactly as the download itself would reject it (never basename'd into a
+ * collision with a valid request). REMOTE mode still resolves a canonical
+ * server-side targetPath for identity even though the bytes are fetched by the
+ * Manager, so duplicate remote dispatches to one destination also dedupe.
  */
-export function startDownloadJob(
+export async function startDownloadJob(
   url: string,
   targetSubfolder: string,
   filename?: string,
@@ -138,8 +93,12 @@ export function startDownloadJob(
   /** Post-download work (sidecars, type checks). Its lines land on `job.notes`
    *  so they reach the user even when the download outlives the tool call. */
   onComplete?: (path: string) => Promise<string[]>,
-): Entry {
-  const id = downloadJobIdFor(url, targetSubfolder, filename);
+): Promise<Entry> {
+  // Resolve the canonical destination with the SAME resolver the write uses.
+  // Throws (ModelError) on an invalid filename/subfolder — surfaced to the caller
+  // immediately, matching downloadModel's own rejection.
+  const { targetPath } = await resolveDownloadTarget(url, targetSubfolder, filename);
+  const id = downloadJobIdFor(targetPath);
   const trayId = downloadIdFor(url);
   const existing = jobs.get(id);
   if (existing && existing.job.status === "downloading") {
@@ -147,6 +106,7 @@ export function startDownloadJob(
       url,
       target_subfolder: targetSubfolder,
       filename,
+      targetPath,
     });
     return existing;
   }

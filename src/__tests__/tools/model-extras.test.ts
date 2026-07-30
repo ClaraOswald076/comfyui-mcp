@@ -39,6 +39,12 @@ vi.mock("../../services/model-resolver.js", async () => {
   return {
     ...actual,
     downloadModel: (...a: unknown[]) => downloadModelMock(...a),
+    // startDownloadJob resolves the destination via this before streaming; stub
+    // it so these tests don't need a live server to compute a targetPath.
+    resolveDownloadTarget: async (url: string, sub: string, filename?: string) => {
+      const name = filename ?? String(url).split("/").pop() ?? "model.safetensors";
+      return { targetDir: `/m/${sub}`, filename: name, targetPath: `/m/${sub}/${name}` };
+    },
   };
 });
 

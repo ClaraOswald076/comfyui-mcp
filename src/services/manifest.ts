@@ -735,7 +735,7 @@ async function applyManifestSections(
         results.push(report("model", item, "skipped", `Model already exists at ${existing}.`));
         continue;
       }
-      const { job, settled } = startDownloadJob(
+      const { job, settled } = await startDownloadJob(
         model.url,
         target.targetSubfolder,
         target.filename,
