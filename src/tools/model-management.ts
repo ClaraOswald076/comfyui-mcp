@@ -244,15 +244,19 @@ export function registerModelManagementTools(server: McpServer): void {
             const why =
               diag.outcome === "declined:no-validator"
                 ? "the host sent no ETag/Last-Modified validator to verify a safe resume (common on Hugging Face's Xet/CAS CDN)"
-                : "the upstream file changed since the partial was written, so appending would corrupt it";
-            // A declined:etag-changed via the 206-refusal path errors the job (a
-            // clean retry is needed); the no-validator and If-Range-miss paths
-            // restart within the same stream. Report each honestly.
-            const outcome =
+                : diag.outcome === "declined:full-response"
+                  ? "the host answered with a full response instead of a 206 — the upstream changed, or it doesn't support resuming"
+                  : diag.outcome === "declined:unverifiable"
+                    ? "the resume crossed origins to a CDN that gave no content-addressed validator, so an unchanged upstream couldn't be proven"
+                    : "the upstream file changed since the partial was written, so appending would corrupt it";
+            // The 206-refusal paths (etag-changed / unverifiable) error the job —
+            // a clean retry is needed; no-validator and full-response restart
+            // within the same stream. Report each honestly by job status.
+            const next =
               j.status === "error"
-                ? `the resume was REJECTED — re-issue download_model to restart cleanly`
-                : `re-downloading in full`;
-            resumeNote = `\n    resume: ${diag.outcome} — discarded ${gb} GB of a prior .partial because ${why}; ${outcome}`;
+                ? "the resume was REJECTED for safety — re-issue download_model to restart cleanly"
+                : "re-downloading in full";
+            resumeNote = `\n    resume: ${diag.outcome} — discarded ${gb} GB of a prior .partial because ${why}; ${next}`;
           }
           return `${head}${detail}${resumeNote}\n    from: ${j.url}`;
         });

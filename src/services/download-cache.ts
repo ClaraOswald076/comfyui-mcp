@@ -215,8 +215,19 @@ function extractValidator(res: Response): string | null {
  */
 export type ResumeOutcome =
   | "resumed"
+  /** No validator sidecar existed, so a safe resume couldn't even be attempted;
+   *  the partial was discarded and re-downloaded in full (in-stream restart). */
   | "declined:no-validator"
-  | "declined:etag-changed";
+  /** We attempted a conditional resume but the server answered with a full 200
+   *  instead of a 206 — the upstream changed OR the host doesn't support range
+   *  resume; either way the partial was discarded (in-stream restart). */
+  | "declined:full-response"
+  /** A 206 whose content-addressed validator PROVED the upstream object changed
+   *  — refused to avoid a corrupt append; the job errors and a retry restarts. */
+  | "declined:etag-changed"
+  /** A cross-origin (CDN) 206 that carried NO content-addressed validator, so an
+   *  unchanged upstream couldn't be proven — refused for safety; retry restarts. */
+  | "declined:unverifiable";
 
 export interface ResumeDiagnostic {
   outcome: ResumeOutcome;
@@ -309,6 +320,11 @@ async function streamUrlToFile(
   // response to distinguish a taken resume (206) from an If-Range MISS (200 =
   // upstream changed) so we can surface WHY the partial was discarded (#467).
   let requestedResume = false;
+  // Set when a partial existed but no sidecar validator did, so we declined to
+  // resume. The discard is only REPORTED once we actually truncate it (after a
+  // successful response), so a fetch/redirect/status failure before then can't
+  // falsely claim the partial was discarded (#467 codex round 4).
+  let resumeDeclinedNoValidator = false;
   // The persisted content-addressed validator we are resuming AGAINST — kept so
   // we can re-compare it to the value the resolve redirect reports NOW, and
   // refuse the append ourselves if they differ (belt-and-braces on top of the
@@ -326,23 +342,14 @@ async function streamUrlToFile(
       };
       requestedResume = true;
     } else {
-      // No trustworthy validator → discard the un-verifiable partial state. This
-      // is the deliberate #343 safety fallback, but it used to be SILENT: a
+      // No trustworthy validator → we will discard the un-verifiable partial and
+      // restart (the deliberate #343 safety fallback). This USED to be silent: a
       // multi-GB HF Xet partial (whose CAS CDN sent no ETag/Last-Modified, so no
       // sidecar was ever written) got thrown away and re-downloaded from 0 with
-      // no log and no signal to the agent (#467). Log it AND record a diagnostic
-      // download_status can surface.
+      // no log and no signal (#467). Defer the log/diagnostic until we actually
+      // truncate (below), so a pre-write failure can't falsely report a discard.
       effectiveResume = 0;
-      logger.warn(
-        `Discarding a ${resumeFromBytes}-byte partial download and restarting from 0: no ` +
-          `ETag/Last-Modified validator was ever persisted for it, so a safe resume can't be ` +
-          `verified (common on Hugging Face's Xet/CAS CDN, which omits both headers on the file ` +
-          `body). This is the safety-first behavior — an unverifiable resume risks a corrupt ` +
-          `file (#343). Future downloads capture the validator from the resolve redirect so they ` +
-          `CAN resume.`,
-        { url: logUrl, discardedBytes: resumeFromBytes },
-      );
-      if (resumable) recordResumeDiagnostic(url, "declined:no-validator", resumeFromBytes);
+      if (resumable) resumeDeclinedNoValidator = true;
     }
   }
   // The content-addressed validator captured from the resolve REDIRECT (HF's
@@ -483,12 +490,19 @@ async function streamUrlToFile(
       (redirectValidator !== null && redirectValidator !== priorValidator);
     const unprovenCrossOrigin = crossOriginRedirect && redirectValidator !== priorValidator; // includes missing
     if (provenChange || unprovenCrossOrigin) {
+      // provenChange (a validator we saw DIFFERS from the partial's) is a proven
+      // change; unprovenCrossOrigin alone (no validator to compare) is merely
+      // UNVERIFIABLE — report each honestly rather than always "changed".
       const why = provenChange
         ? "the resolve redirect now points at a DIFFERENT content-addressed object (X-Linked-Etag changed)"
         : "the resume crossed origins to a CDN that returned no content-addressed validator, so an unchanged upstream can't be proven";
       await safeRm(targetPath);
       await safeRm(validatorSidecar);
-      recordResumeDiagnostic(url, "declined:etag-changed", resumeFromBytes);
+      recordResumeDiagnostic(
+        url,
+        provenChange ? "declined:etag-changed" : "declined:unverifiable",
+        resumeFromBytes,
+      );
       logger.warn(
         `Discarding a ${resumeFromBytes}-byte partial download and restarting from 0: ${why}. ` +
           `Refusing to append the 206 (would risk corrupting the file, #343). Removed the partial; retry.`,
@@ -557,19 +571,33 @@ async function streamUrlToFile(
   // begin writing, a truncated partial is already paired with a MATCHING
   // validator. On a 206 append the existing sidecar already matches — leave it.
   if (resumable && !appendMode) {
-    // If we ASKED to resume (had a validator, sent Range+If-Range) but the
-    // server didn't honor it (200, not 206), the upstream file changed — the
-    // If-Range miss — so the partial is being discarded. Surface WHY (#467)
-    // rather than silently restarting.
+    // We are about to TRUNCATE the partial (flags "w") — this is the point the
+    // discard actually happens, so report it here (not before the response, which
+    // could have failed and left the partial intact — #467 codex round 4).
     if (requestedResume) {
+      // Asked to resume (had a validator, sent Range+If-Range) but got a full 200
+      // — the upstream changed OR the host doesn't support range resume. Either
+      // way the partial is discarded and the file re-downloaded in full.
       logger.warn(
         `Discarding a ${resumeFromBytes}-byte partial download and restarting from 0: the server ` +
-          `answered the If-Range resume request with a full ${res.status} instead of a 206, which ` +
-          `means the upstream file CHANGED since the partial was written. Appending would corrupt ` +
-          `it (#343), so re-downloading in full.`,
+          `answered the If-Range resume request with a full ${res.status} instead of a 206 — the ` +
+          `upstream file changed, or the host doesn't support resuming — so re-downloading in full.`,
         { url: logUrl, discardedBytes: resumeFromBytes },
       );
-      recordResumeDiagnostic(url, "declined:etag-changed", resumeFromBytes);
+      recordResumeDiagnostic(url, "declined:full-response", resumeFromBytes);
+    } else if (resumeDeclinedNoValidator) {
+      // A partial existed but no sidecar validator did, so we never even sent a
+      // Range — a safe resume couldn't be verified (common on HF's Xet/CAS CDN,
+      // which omits ETag/Last-Modified on the body). Discard + re-download in full.
+      logger.warn(
+        `Discarding a ${resumeFromBytes}-byte partial download and restarting from 0: no ` +
+          `ETag/Last-Modified validator was ever persisted for it, so a safe resume can't be ` +
+          `verified (common on Hugging Face's Xet/CAS CDN, which omits both headers on the file ` +
+          `body). This is the safety-first behavior — an unverifiable resume risks a corrupt file ` +
+          `(#343). Future downloads capture the validator from the resolve redirect so they CAN resume.`,
+        { url: logUrl, discardedBytes: resumeFromBytes },
+      );
+      recordResumeDiagnostic(url, "declined:no-validator", resumeFromBytes);
     }
     await safeRm(validatorSidecar);
     await safeRm(targetPath);

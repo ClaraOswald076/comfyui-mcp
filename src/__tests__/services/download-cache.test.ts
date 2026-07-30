@@ -598,7 +598,8 @@ describe("downloadModel cache", () => {
     ).rejects.toThrow(/resume rejected/i);
     await expect(stat(partial)).rejects.toThrow();
     await expect(stat(sidecar)).rejects.toThrow();
-    expect(getResumeDiagnostic(await trayIdFor(url))?.outcome).toBe("declined:etag-changed");
+    // Unverifiable, not proven-changed: no validator was available to compare.
+    expect(getResumeDiagnostic(await trayIdFor(url))?.outcome).toBe("declined:unverifiable");
   });
 
   it("REFUSES a resume 206 when a LATER redirect hop reports a changed X-Linked-Etag (multi-hop) (#467/#343)", async () => {
@@ -645,14 +646,14 @@ describe("downloadModel cache", () => {
     expect(getResumeDiagnostic(await trayIdFor(url))?.outcome).toBe("declined:etag-changed");
   });
 
-  it("declines + SURFACES a changed-upstream resume (If-Range miss, 200) — safety preserved (#467/#343)", async () => {
+  it("declines + SURFACES a full-response resume (If-Range miss / no range support, 200) — safety preserved (#467/#343)", async () => {
     await fsPromises.mkdir(cacheDir, { recursive: true });
     const url = "https://example.com/models/changed-surfaced.safetensors";
     const { partial, sidecar } = await cachePaths(url);
     await writeFile(partial, "AAAA"); // 4 bytes
     await writeFile(sidecar, '"etag-old"');
 
-    // Upstream changed → If-Range miss → server sends full 200, not a 206.
+    // Upstream changed (or no range support) → server sends full 200, not a 206.
     fetchMock.mockResolvedValueOnce(okResponse("BRANDNEWBODY"));
 
     const target = await downloadModel(url, "checkpoints", "changed-surfaced-out.safetensors");
@@ -660,7 +661,7 @@ describe("downloadModel cache", () => {
     await expect(readFile(target, "utf-8")).resolves.toBe("BRANDNEWBODY");
 
     const diag = getResumeDiagnostic(await trayIdFor(url));
-    expect(diag?.outcome).toBe("declined:etag-changed");
+    expect(diag?.outcome).toBe("declined:full-response");
     expect(diag?.discardedBytes).toBe(4);
   });
 
