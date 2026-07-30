@@ -29,6 +29,60 @@ const HASH_CHARS = 32;
 const MAX_HTTP_REDIRECTS = 5;
 const inflight = new Map<string, Promise<string>>();
 
+/**
+ * Extract the useful diagnostic bits from an error thrown by `fetch()` itself
+ * (a network-layer failure, not an HTTP status). undici surfaces these as
+ * `TypeError: fetch failed` whose real reason lives on `.cause` (an Error with
+ * a `code`/`errno` such as ENOTFOUND, ECONNRESET, UND_ERR_CONNECT_TIMEOUT, or
+ * a TLS `ERR_TLS_CERT_ALTNAME_INVALID`). The top-level message is the useless
+ * generic "fetch failed" (issue #411) — the actionable detail is one level
+ * down, so unwrap the cause chain into a single readable string.
+ */
+function describeFetchError(err: unknown): { message: string; code?: string } {
+  const parts: string[] = [];
+  let code: string | undefined;
+  let cur: unknown = err;
+  const seen = new Set<unknown>();
+  while (cur instanceof Error && !seen.has(cur)) {
+    seen.add(cur);
+    const c = (cur as { code?: unknown }).code;
+    if (typeof c === "string" && !code) code = c;
+    const label = typeof c === "string" ? `${cur.message} (${c})` : cur.message;
+    if (label && !parts.includes(label)) parts.push(label);
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  if (parts.length === 0) parts.push(String(err));
+  return { message: parts.join(": "), code };
+}
+
+/**
+ * Fetch that converts a network-layer failure into a ModelError carrying the
+ * unwrapped `cause` — so a Hugging Face Xet / CAS host that fails DNS, TLS, a
+ * connect timeout, or a proxy reset reports WHY instead of a bare "fetch
+ * failed" (issue #411). HTTP responses (any status) pass straight through; only
+ * a thrown fetch is wrapped. The ModelError is rethrown as-is by downloadWithCache
+ * (it never masks a ModelError), so the actionable cause reaches the tool result.
+ */
+async function fetchOrThrow(
+  url: string,
+  init: RequestInit,
+  logUrl: string,
+): Promise<Response> {
+  try {
+    return await fetch(url, init);
+  } catch (err) {
+    const { message, code } = describeFetchError(err);
+    throw new ModelError(
+      `Download request to the model host failed at the network layer: ${message}. ` +
+        `This is a connectivity/TLS/proxy failure reaching the file host (for Hugging Face ` +
+        `this is often the Xet/CAS CDN, e.g. cas-bridge.xethub.hf.co) — not an HTTP error. ` +
+        `Check DNS/connectivity to the host, any corporate proxy or firewall, and system time/TLS certs; ` +
+        `set HF_ENDPOINT to a reachable mirror if huggingface.co is blocked in your region, then retry.`,
+      { url: logUrl, code, cause: message },
+    );
+  }
+}
+
 export const downloadCacheFs = {
   copyFile,
   link,
@@ -116,28 +170,59 @@ async function streamUrlToFile(
   }
   let res: Response;
   for (let redirectCount = 0; ; redirectCount += 1) {
-    res = await fetch(currentUrl, { headers: currentHeaders, redirect: "manual" });
+    res = await fetchOrThrow(
+      currentUrl,
+      { headers: currentHeaders, redirect: "manual" },
+      currentUrl === url ? logUrl : redactUrlForLogs(currentUrl),
+    );
     if (res.status < 300 || res.status >= 400) break;
 
     if (redirectCount >= MAX_HTTP_REDIRECTS) {
-      throw new ModelError("Download redirect limit exceeded", {
-        url: redactUrlForLogs(currentUrl),
-        status: res.status,
-      });
+      throw new ModelError(
+        `Download redirect limit exceeded (${MAX_HTTP_REDIRECTS}) — the model host kept ` +
+          `redirecting (Hugging Face routes resolve URLs through the Xet/CAS CDN; a loop ` +
+          `here usually means a broken mirror or a proxy rewriting the redirect chain).`,
+        {
+          url: redactUrlForLogs(currentUrl),
+          status: res.status,
+        },
+      );
     }
 
     const location = res.headers.get("location");
-    if (!location) break;
+    if (!location) {
+      // A 3xx with no Location can't be followed. HF's Xet/CAS flow ALWAYS
+      // includes a Location on its resolve redirect, so a missing one means a
+      // proxy stripped it or the host mis-responded — say so instead of the
+      // confusing "Download failed: 302 Found" the !res.ok path would emit.
+      throw new ModelError(
+        `Download failed: the model host returned a ${res.status} redirect with no ` +
+          `Location header, so it can't be followed. For Hugging Face this usually means a ` +
+          `proxy stripped the redirect to the Xet/CAS CDN — check any corporate proxy, or ` +
+          `set HF_ENDPOINT to a reachable mirror and retry.`,
+        { url: redactUrlForLogs(currentUrl), status: res.status },
+      );
+    }
 
     let nextUrl: string;
     try {
       nextUrl = new URL(location, currentUrl).toString();
     } catch {
-      throw new ModelError("Download redirect location is invalid", {
-        url: redactUrlForLogs(currentUrl),
-        status: res.status,
-      });
+      throw new ModelError(
+        `Download failed: the model host returned a ${res.status} redirect to an invalid ` +
+          `Location ("${location}"). The redirect chain can't be followed — retry, or set ` +
+          `HF_ENDPOINT to a reachable mirror if this is a Hugging Face URL.`,
+        {
+          url: redactUrlForLogs(currentUrl),
+          status: res.status,
+        },
+      );
     }
+    // Drop request headers (Authorization etc.) when the redirect crosses
+    // origins. HF's resolve URL 302s to a *pre-signed* Xet/CAS URL on a
+    // different host (e.g. cas-bridge.xethub.hf.co) that needs no auth — and
+    // forwarding our HF Bearer token to a third-party CDN would leak it. This
+    // matches how huggingface_hub follows the CAS redirect.
     const sameOrigin = new URL(nextUrl).origin === new URL(currentUrl).origin;
     currentUrl = nextUrl;
     if (!sameOrigin) currentHeaders = {};
