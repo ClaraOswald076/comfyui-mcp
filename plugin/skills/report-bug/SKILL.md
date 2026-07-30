@@ -147,25 +147,27 @@ Then file it (no need to ask):
   # body has newlines/quotes). --max-time bounds the request so a hung
   # connection can't wedge us.
   # body: { "repo": "comfyui-mcp" | "comfyui-mcp-panel", "title", "body", "labels": ["via-panel"] }
-  URL=""
-  if RESP=$(curl -fsS --max-time 15 -X POST "$WORKER_URL" \
-      -H "Content-Type: application/json" -H "X-Client-Key: $CLIENT_KEY" \
-      --data @"$BODY_JSON_FILE"); then
-    # Validate entirely inside jq (no grep — a piped grep can be bypassed by a
-    # multi-line body). Require ok==true AND a url matching the exact GitHub
-    # issue shape. Invalid JSON → jq exits non-zero → URL stays empty → fallback.
-    URL=$(printf '%s' "$RESP" | jq -r \
-      'select(.ok==true) | .url // empty | select(test("^https://github.com/[^/]+/[^/]+/issues/[0-9]+$"))' \
-      2>/dev/null || true)
-  fi
+  RESP=$(curl -fsS --max-time 15 -X POST "$WORKER_URL" \
+    -H "Content-Type: application/json" -H "X-Client-Key: $CLIENT_KEY" \
+    --data @"$BODY_JSON_FILE" || true)
 
-  # 2) EXACTLY ONE outcome. A real issue url → print it. ANYTHING else —
-  # non-2xx / timeout / unreachable, ok!=true, status:"error", missing/invalid
-  # url, or invalid JSON — → prefilled report_issue fallback. Never "accepted".
-  if [ -n "$URL" ]; then
-    echo "filed: $URL"
+  # 2) VALIDATE THE WHOLE BODY FIRST with `jq -e .` — it rejects anything that
+  # isn't a single valid JSON document (trailing garbage → non-zero), so the
+  # extraction below only ever runs on clean JSON (no partial output before a
+  # later parse error). Require ok==true AND status!="error" AND a url matching
+  # the exact GitHub issue shape. EXACTLY ONE outcome: real url → filed;
+  # anything else (non-2xx/timeout/unreachable, ok!=true, status:"error",
+  # missing/invalid url, invalid JSON) → prefilled report_issue fallback.
+  if ! printf '%s' "$RESP" | jq -e . >/dev/null 2>&1; then
+    echo "worker did not return valid JSON — fall back to the report_issue tool for a prefilled GitHub link"
   else
-    echo "worker did not return an issue link — fall back to the report_issue tool for a prefilled GitHub link"
+    URL=$(printf '%s' "$RESP" | jq -r \
+      'select(.ok==true and (.status!="error")) | .url // empty | select(test("^https://github.com/[^/]+/[^/]+/issues/[0-9]+$"))')
+    if [ -n "$URL" ]; then
+      echo "filed: $URL"
+    else
+      echo "worker did not return an issue link — fall back to the report_issue tool for a prefilled GitHub link"
+    fi
   fi
   ```
   A real `url` from the POST is the only "filed" outcome. Any submit failure
