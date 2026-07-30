@@ -15,6 +15,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { basename } from "node:path";
 import { downloadModel } from "./model-resolver.js";
 import type { DownloadAuth } from "./download-auth.js";
 import { logger } from "../utils/logger.js";
@@ -57,23 +58,52 @@ export function downloadIdFor(url: string): string {
   return createHash("sha256").update(url).digest("hex").slice(0, 16);
 }
 
+/** Normalize a target subfolder to a canonical POSIX-ish form for id hashing:
+ *  backslashes → forward slashes, collapsed, no leading/trailing slash. */
+function normalizeSubfolder(sub: string): string {
+  return sub.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/^\/+|\/+$/g, "");
+}
+
+/**
+ * Resolve the on-disk filename EXACTLY as downloadModel does, so an omitted
+ * filename and an explicit one that equals the URL-derived name map to the SAME
+ * file (and thus the same job id) — otherwise two concurrent writers would race
+ * one path. Mirrors model-resolver.downloadModel: explicit filename → its
+ * basename; else the URL pathname basename; else "model.safetensors".
+ */
+function resolveDownloadFilename(url: string, filename?: string): string {
+  if (filename && filename.trim().length > 0) return basename(filename);
+  try {
+    return basename(new URL(url).pathname) || "model.safetensors";
+  } catch {
+    return "model.safetensors";
+  }
+}
+
 /**
  * DISTINCT public id, keyed on URL AND destination — used as BOTH the registry
  * key and `job.id`. The same URL fetched to two different subfolders/filenames
  * gets two ids, so each is a separate job that download_status can poll
  * individually (the URL-only scheme collapsed them into one, wrote only the
  * first destination, and reported both done). Adoption of an in-flight download
- * therefore requires the SAME target. ASCII space separators (never NUL).
+ * therefore requires the SAME target.
+ *
+ * The tuple is JSON-encoded (NOT space/char-joined) so field boundaries are
+ * unambiguous: ("loras foo","bar") and ("loras","foo bar") must NOT collide, and
+ * the filename is RESOLVED the same way the write resolves it so omitted ==
+ * explicit-URL-basename produces one id (one writer), not two.
  */
 export function downloadJobIdFor(
   url: string,
   targetSubfolder: string,
   filename?: string,
 ): string {
-  return createHash("sha256")
-    .update([url, targetSubfolder, filename ?? ""].join(" "))
-    .digest("hex")
-    .slice(0, 16);
+  const canonical = JSON.stringify([
+    url,
+    normalizeSubfolder(targetSubfolder),
+    resolveDownloadFilename(url, filename),
+  ]);
+  return createHash("sha256").update(canonical).digest("hex").slice(0, 16);
 }
 
 /**

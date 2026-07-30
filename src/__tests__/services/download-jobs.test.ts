@@ -83,6 +83,27 @@ describe("download job registry", () => {
     expect(getDownloadJob(b.job.id)?.target_subfolder).toBe("loras");
   });
 
+  it("does not collide on ambiguous field boundaries (JSON-encoded id)", () => {
+    // A naive space-join would hash ("loras foo","bar.safetensors") and
+    // ("loras","foo bar.safetensors") to the SAME id → wrong-destination adopt.
+    const a = startDownloadJob(URL_A, "loras foo", "bar.safetensors");
+    const b = startDownloadJob(URL_A, "loras", "foo bar.safetensors");
+    expect(a.job.id).not.toBe(b.job.id);
+    expect(hoisted.calls).toBe(2);
+    expect(listDownloadJobs()).toHaveLength(2);
+  });
+
+  it("treats an omitted filename and the explicit URL-derived name as one job", () => {
+    // URL basename is big.safetensors; passing it explicitly must resolve to the
+    // SAME id so a repeat request adopts the in-flight job (one writer, one file).
+    const first = startDownloadJob(URL_A, "checkpoints"); // omitted
+    const second = startDownloadJob(URL_A, "checkpoints", "big.safetensors"); // explicit == URL basename
+    expect(second.job).toBe(first.job);
+    expect(second.job.id).toBe(first.job.id);
+    expect(hoisted.calls).toBe(1);
+    expect(listDownloadJobs()).toHaveLength(1);
+  });
+
   it("records the landed path on success", async () => {
     const { job, settled } = startDownloadJob(URL_A, "checkpoints");
     hoisted.resolvers[0].resolve("C:/models/checkpoints/big.safetensors");
