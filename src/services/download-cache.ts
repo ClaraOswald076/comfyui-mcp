@@ -586,22 +586,27 @@ async function streamUrlToFile(
   // begin writing, a truncated partial is already paired with a MATCHING
   // validator. On a 206 append the existing sidecar already matches — leave it.
   if (resumable && !appendMode) {
-    // Drop the stale sidecar + partial FIRST, then only AFTER confirming the
-    // partial is actually gone do we announce the discard (#467 P1-1). safeRm
-    // swallows failures, so a diagnostic recorded before removal could otherwise
-    // claim "discarded" while the bytes are still on disk — and a later
-    // stream-open failure would leave them permanently. Confirm, then report.
+    // Drop any stale sidecar, then EXPLICITLY truncate the stale partial to zero
+    // and verify that truncation SUCCEEDED before we either (a) pair a new
+    // validator with the file or (b) report the discard. Doing the truncation
+    // ourselves (create-or-truncate to 0) — rather than relying on the lazy "w"
+    // stream open below — lets us confirm the old prefix is gone up front. The
+    // ordering is the #343 safety invariant: a new validator must NEVER be paired
+    // with un-truncated stale bytes (a later If-Range 206 would then append fresh
+    // bytes onto a stale prefix and silently corrupt the file). If truncation
+    // fails, we write NO validator (a retry sees no sidecar → safe restart) and
+    // report nothing (the discard didn't actually happen).
     await safeRm(validatorSidecar);
-    await safeRm(targetPath);
-    // POSITIVELY confirm the partial is gone (ENOENT) or truncated to empty —
-    // NOT merely "stat returned no number", which fileSizeOrUndefined also emits
-    // on a stat hiccup. A swallowed rm failure + a stat hiccup must NOT read as a
-    // confirmed discard (#467 P1-1): only a real ENOENT or size 0 counts.
-    const discardConfirmed = resumeFromBytes > 0 && (await partialConfirmedDiscarded(targetPath));
-    if (discardConfirmed && requestedResume) {
+    let truncated = true;
+    try {
+      await writeFile(targetPath, "");
+    } catch {
+      truncated = false;
+    }
+    if (truncated && resumeFromBytes > 0 && requestedResume) {
       // Asked to resume (had a validator, sent Range+If-Range) but got a full 200
-      // — the upstream changed OR the host doesn't support range resume. Either
-      // way the partial has now been discarded and the file re-downloaded in full.
+      // — the upstream changed OR the host doesn't support range resume. The
+      // partial is now truncated and the file is being re-downloaded in full.
       logger.warn(
         `Discarded a ${resumeFromBytes}-byte partial download and restarting from 0: the server ` +
           `answered the If-Range resume request with a full ${res.status} instead of a 206 — the ` +
@@ -609,10 +614,10 @@ async function streamUrlToFile(
         { url: logUrl, discardedBytes: resumeFromBytes },
       );
       onResume?.({ outcome: "declined:full-response", discardedBytes: resumeFromBytes, discarded: true });
-    } else if (discardConfirmed && resumeDeclinedNoValidator) {
+    } else if (truncated && resumeFromBytes > 0 && resumeDeclinedNoValidator) {
       // A partial existed but no sidecar validator did, so we never even sent a
       // Range — a safe resume couldn't be verified (common on HF's Xet/CAS CDN,
-      // which omits ETag/Last-Modified on the body). Discarded + re-download full.
+      // which omits ETag/Last-Modified on the body). Truncated + re-download full.
       logger.warn(
         `Discarded a ${resumeFromBytes}-byte partial download and restarting from 0: no ` +
           `ETag/Last-Modified validator was ever persisted for it, so a safe resume can't be ` +
@@ -623,11 +628,14 @@ async function streamUrlToFile(
       );
       onResume?.({ outcome: "declined:no-validator", discardedBytes: resumeFromBytes, discarded: true });
     }
-    // Prefer the final response's validator; fall back to one captured off the
-    // redirect chain (HF Xet: the CAS 200 has none, but the resolve 302 carried
-    // X-Linked-Etag) so the partial written now becomes resumable later (#467).
-    const validator = extractValidator(res) || redirectValidator;
-    if (validator) await writeValidatorSidecar(validatorSidecar, validator);
+    // Persist the new validator ONLY once the file is confirmed truncated, so it
+    // can never pair with a stale prefix (#343). Prefer the final response's
+    // validator; fall back to one captured off the redirect chain (HF Xet: the CAS
+    // 200 has none, but the resolve 302 carried X-Linked-Etag).
+    if (truncated) {
+      const validator = extractValidator(res) || redirectValidator;
+      if (validator) await writeValidatorSidecar(validatorSidecar, validator);
+    }
   } else if (appendMode) {
     // A resume was actually taken (validated 206 append). Record it so
     // download_status can report the partial was reused, not discarded (#467).
