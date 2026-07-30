@@ -349,6 +349,10 @@ export function resolveTemplateFromIndex(
 
   const all: string[] = [];
   const matches: TemplateIndexMatch[] = [];
+  // Dedupe by module/name: ComfyUI's index builder can list the same basename
+  // twice within one module (multiple recognized workflow dirs). That is NOT
+  // cross-source ambiguity, so collapse duplicates before the ambiguity check.
+  const seen = new Set<string>();
   for (const [mod, names] of Object.entries(index)) {
     if (!Array.isArray(names)) continue;
     for (const n of names) {
@@ -356,6 +360,9 @@ export function resolveTemplateFromIndex(
       if (typeof nm !== "string") continue;
       all.push(`${mod}/${nm}`);
       if (nm === qName && (qModule == null || mod === qModule)) {
+        const dedupeKey = `${mod}/${nm}`;
+        if (seen.has(dedupeKey)) continue;
+        seen.add(dedupeKey);
         matches.push({ module: mod, name: nm });
       }
     }

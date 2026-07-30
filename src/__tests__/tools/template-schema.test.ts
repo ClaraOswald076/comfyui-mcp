@@ -277,6 +277,15 @@ describe("resolveTemplateFromIndex (id/key alignment with list_workflow_template
     expect(r).toEqual({ match: { module: "ComfyUI-MVAdapter", name: "i2mv_sdxl_ldm_lora" } });
   });
 
+  it("does NOT flag a name duplicated WITHIN one module as ambiguous", () => {
+    // ComfyUI's index builder can list the same basename twice in one module.
+    const dupIndex: Record<string, unknown> = {
+      "ComfyUI-MVAdapter": ["i2mv_sdxl_ldm_lora", "i2mv_sdxl_ldm_lora"],
+    };
+    const r = resolveTemplateFromIndex(dupIndex, "i2mv_sdxl_ldm_lora");
+    expect(r).toEqual({ match: { module: "ComfyUI-MVAdapter", name: "i2mv_sdxl_ldm_lora" } });
+  });
+
   it("returns not-found (with the full module/name catalog) for an unknown template", () => {
     const r = resolveTemplateFromIndex(INDEX, "does_not_exist");
     expect("error" in r && r.error).toBe("not-found");
