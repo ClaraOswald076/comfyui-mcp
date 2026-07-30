@@ -23,6 +23,7 @@ vi.mock("node:fs/promises", () => ({
   link: vi.fn(),
   mkdir: vi.fn(),
   readdir: vi.fn(),
+  realpath: (p: string) => Promise.resolve(p), // identity — no symlinks in these tests
   rename: vi.fn(),
   rm: vi.fn(),
   stat: (...a: unknown[]) => statMock(...a),
@@ -234,6 +235,7 @@ describe("download_civitai_model", () => {
       "cool.safetensors",
       undefined,
       false, // routing decision threaded through (local, #420 codex round 1)
+      expect.any(Function), // onResume callback — reports the resume decision onto the job (#467)
     );
     expect(res.isError).toBeFalsy();
     expect(res.content[0].text).toContain("Cool Model");
@@ -258,6 +260,7 @@ describe("download_civitai_model", () => {
       "v.safetensors",
       undefined,
       false, // routing decision threaded through (local, #420 codex round 1)
+      expect.any(Function), // onResume callback — reports the resume decision onto the job (#467)
     );
     expect(res.isError).toBeFalsy();
   });
@@ -296,6 +299,7 @@ describe("download_civitai_model", () => {
       "custom.safetensors",
       undefined,
       false, // routing decision threaded through (local, #420 codex round 1)
+      expect.any(Function), // onResume callback — reports the resume decision onto the job (#467)
     );
   });
 

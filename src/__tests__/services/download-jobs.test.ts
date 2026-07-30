@@ -73,6 +73,10 @@ import {
   resetDownloadJobs,
   downloadIdFor,
 } from "../../services/download-jobs.js";
+import { downloadModel, resolveDownloadTarget } from "../../services/model-resolver.js";
+import { mkdtemp, mkdir, symlink, rm as fsRm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join as pathJoin } from "node:path";
 
 const URL_A = "https://huggingface.co/org/repo/resolve/main/big.safetensors";
 const URL_B = "https://huggingface.co/org/repo/resolve/main/other.safetensors";
@@ -324,5 +328,147 @@ describe("download job registry", () => {
     await new Promise((r) => setTimeout(r, 2));
     await startDownloadJob(URL_B, "loras");
     expect(listDownloadJobs()[0].url).toBe(URL_B);
+  });
+
+  // #467 P1-A: the job layer dedups BEFORE the header-aware cache layer, so it must
+  // fold auth into its keys — otherwise two concurrent same-URL+same-dest calls with
+  // DIFFERENT auth adopt the first job and the second caller gets the first's bytes
+  // AND resume callback. #467 P1-C: two such distinct jobs to ONE destination are
+  // SERIALIZED (not run concurrently) so each callback sees its own bytes.
+  it("does NOT coalesce concurrent same-URL+same-dest jobs with DIFFERENT auth (distinct + serialized)", async () => {
+    const a = await startDownloadJob(URL_A, "checkpoints", undefined, { type: "bearer", token: "alice" });
+    const b = await startDownloadJob(URL_A, "checkpoints", undefined, { type: "bearer", token: "bob" });
+    // Two DISTINCT jobs — the second was NOT adopted.
+    expect(b.job).not.toBe(a.job);
+    expect(b.job.id).not.toBe(a.job.id);
+    expect(listDownloadJobs()).toHaveLength(2);
+    // Serialized on the shared destination: only A's writer has started; B waits.
+    expect(hoisted.calls).toBe(1);
+
+    // Completing A releases B's OWN writer (its own bytes/callback, not A's).
+    hoisted.resolvers[0].resolve("/M/checkpoints/big.safetensors");
+    await a.settled;
+    // Let B's chained continuation run.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(hoisted.calls).toBe(2);
+  });
+
+  it("serializes same-dest different-auth so each onComplete sees ITS OWN bytes (#467 P1-C)", async () => {
+    // Simulate the shared destination: each writer overwrites it with its own token,
+    // and each job's onComplete records what it observed there.
+    let destContent = "";
+    const seen: Record<string, string> = {};
+    const orig = vi.mocked(downloadModel).getMockImplementation();
+    vi.mocked(downloadModel).mockImplementation(
+      async (_url: string, sub: string, fn?: string, auth?: unknown) => {
+        hoisted.calls += 1;
+        destContent = (auth as { token?: string })?.token ?? "none"; // "materialize"
+        return `/M/${sub}/${fn ?? "big.safetensors"}`;
+      },
+    );
+    try {
+      const a = await startDownloadJob(URL_A, "checkpoints", "m.safetensors", { type: "bearer", token: "alice" }, async () => {
+        seen.alice = destContent; // read the destination during Alice's own callback
+        return [];
+      });
+      const b = await startDownloadJob(URL_A, "checkpoints", "m.safetensors", { type: "bearer", token: "bob" }, async () => {
+        seen.bob = destContent;
+        return [];
+      });
+      await Promise.all([a.settled, b.settled]);
+
+      // Each callback saw ITS OWN representation's bytes — Bob's writer did not swap
+      // the destination out from under Alice's callback (would fail without #467 P1-C).
+      expect(seen.alice).toBe("alice");
+      expect(seen.bob).toBe("bob");
+    } finally {
+      if (orig) vi.mocked(downloadModel).mockImplementation(orig);
+    }
+  });
+
+  it("serializes case-variant same-file destinations on case-insensitive filesystems (#467 P1-C)", async () => {
+    // Same (no) auth but case-variant subfolders resolve to distinct path STRINGS,
+    // so they are distinct jobs — but on a case-insensitive FS they are ONE physical
+    // file and must be serialized.
+    const a = await startDownloadJob(URL_A, "checkpoints", "m.safetensors");
+    const b = await startDownloadJob(URL_A, "Checkpoints", "m.safetensors");
+    expect(b.job).not.toBe(a.job);
+    if (process.platform === "win32" || process.platform === "darwin") {
+      expect(hoisted.calls).toBe(1); // serialized — same physical file
+      hoisted.resolvers[0].resolve("/M/checkpoints/m.safetensors");
+      await a.settled;
+      await new Promise((r) => setTimeout(r, 0));
+      expect(hoisted.calls).toBe(2);
+    } else {
+      expect(hoisted.calls).toBe(2); // case-sensitive FS → genuinely different files
+    }
+  });
+
+  it("serializes REMOTE different-auth jobs whose subfolders canonicalize to one destination (#467 P1-C)", async () => {
+    hoisted.remote = true; // Manager dispatch — no local target resolution
+    // Same file+URL, subfolders that trim/normalize to the SAME remote destination,
+    // but DIFFERENT auth → distinct jobs that must be serialized (one server file).
+    const a = await startDownloadJob(URL_A, " loras/sub ", "m.safetensors", { type: "bearer", token: "alice" });
+    const b = await startDownloadJob(URL_A, "loras//sub", "m.safetensors", { type: "bearer", token: "bob" });
+    expect(b.job).not.toBe(a.job); // distinct (different auth)
+    expect(hoisted.calls).toBe(1); // serialized on the canonical remote destination
+    hoisted.resolvers[0].resolve("ok");
+    await a.settled;
+    await new Promise((r) => setTimeout(r, 0));
+    expect(hoisted.calls).toBe(2);
+  });
+
+  it("serializes different-auth jobs whose SYMLINKED subfolders resolve to one physical file (#467 P1-C)", async () => {
+    // Build base/real and base/alias -> base/real; the destination tail (sub/m)
+    // doesn't exist yet (the writer would mkdir it), exercising the deepest-existing
+    // -ancestor realpath collapse.
+    const base = await mkdtemp(pathJoin(tmpdir(), "djobs-symlink-"));
+    const realDir = pathJoin(base, "real");
+    const aliasDir = pathJoin(base, "alias");
+    await mkdir(realDir, { recursive: true });
+    try {
+      await symlink(realDir, aliasDir, "junction");
+    } catch {
+      await fsRm(base, { recursive: true, force: true });
+      return; // symlinks/junctions unsupported here — skip
+    }
+    try {
+      // Two distinct-auth jobs whose resolved targetPaths differ only by alias vs real.
+      vi.mocked(resolveDownloadTarget)
+        .mockResolvedValueOnce({ targetDir: pathJoin(aliasDir, "sub"), filename: "m.safetensors", targetPath: pathJoin(aliasDir, "sub", "m.safetensors") })
+        .mockResolvedValueOnce({ targetDir: pathJoin(realDir, "sub"), filename: "m.safetensors", targetPath: pathJoin(realDir, "sub", "m.safetensors") });
+
+      const a = await startDownloadJob(URL_A, "checkpoints", "m.safetensors", { type: "bearer", token: "alice" });
+      const b = await startDownloadJob(URL_A, "checkpoints", "m.safetensors", { type: "bearer", token: "bob" });
+      expect(b.job).not.toBe(a.job); // distinct (different auth + different lexical path)
+      // realpath collapses alias→real for the EXISTING prefix, so both share a chain.
+      expect(hoisted.calls).toBe(1);
+      hoisted.resolvers[0].resolve("ok");
+      await a.settled;
+      await new Promise((r) => setTimeout(r, 0));
+      expect(hoisted.calls).toBe(2);
+    } finally {
+      await fsRm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("STILL coalesces concurrent same-URL+same-dest jobs with the SAME auth", async () => {
+    const a = await startDownloadJob(URL_A, "checkpoints", undefined, { type: "bearer", token: "same" });
+    const b = await startDownloadJob(URL_A, "checkpoints", undefined, { type: "bearer", token: "same" });
+    expect(b.job).toBe(a.job); // adopted the in-flight job (one writer)
+    expect(hoisted.calls).toBe(1);
+    expect(listDownloadJobs()).toHaveLength(1);
+  });
+
+  it("does NOT let an authenticated job adopt a concurrent UNauthenticated one (same dest)", async () => {
+    const pub = await startDownloadJob(URL_A, "checkpoints"); // no auth
+    const authed = await startDownloadJob(URL_A, "checkpoints", undefined, { type: "bearer", token: "x" });
+    // Distinct jobs (not adopted); serialized behind the unauthenticated one.
+    expect(authed.job).not.toBe(pub.job);
+    expect(hoisted.calls).toBe(1);
+    hoisted.resolvers[0].resolve("/M/checkpoints/big.safetensors");
+    await pub.settled;
+    await new Promise((r) => setTimeout(r, 0));
+    expect(hoisted.calls).toBe(2);
   });
 });

@@ -1,6 +1,7 @@
 import { mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -21,6 +22,33 @@ vi.mock("../../config.js", () => {
 import { config } from "../../config.js";
 import { downloadCacheFs } from "../../services/download-cache.js";
 import { downloadModel } from "../../services/model-resolver.js";
+import type { ResumeDiagnostic } from "../../services/download-resume-diag.js";
+
+/** Capture the resume decision a physical download reports (#467). The decision
+ *  is delivered to the CALLER via an onResume callback (no shared map), so a test
+ *  passes this box's `onResume` to downloadModel and reads `box.d` afterward. */
+function resumeCapture() {
+  const box: { d?: ResumeDiagnostic } = {};
+  return { box, onResume: (d: ResumeDiagnostic) => { box.d = d; } };
+}
+
+/** Mirror of the impl's cache identity (download-cache.ts): the 32-hex cache-file
+ *  hash for a URL + optional request headers. Kept in lockstep with cacheIdentity
+ *  — namespaced (#467 P1-C) and header-aware (#467 P1-2). */
+function reprFor(headers: Record<string, string> = {}): string {
+  const keys = Object.keys(headers);
+  if (keys.length === 0) return "";
+  const joined = keys
+    .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
+    .map((k) => `${k.toLowerCase()}=${headers[k]}`)
+    .join("\n");
+  return createHash("sha256").update(joined).digest("hex").slice(0, 12);
+}
+function cacheHashFor(url: string, headers: Record<string, string> = {}): string {
+  const repr = reprFor(headers);
+  const identity = repr ? `v2\n${url}\n${repr}` : `v2\n${url}`;
+  return createHash("sha256").update(identity).digest("hex").slice(0, 32);
+}
 
 const fetchMock = vi.fn();
 let tempDir: string;
@@ -121,10 +149,8 @@ describe("downloadModel cache", () => {
   it("resumes from a leftover partial file using HTTP Range and appends a 206 response", async () => {
     await fsPromises.mkdir(cacheDir, { recursive: true });
     // Pre-seed the .partial that the cache deterministic-names.
-    // The cache key derives from sha256(url).slice(0,32) + the URL's pathname extension.
     const url = "https://example.com/models/resume.safetensors";
-    const { createHash } = await import("node:crypto");
-    const hash = createHash("sha256").update(url).digest("hex").slice(0, 32);
+    const hash = cacheHashFor(url);
     const partialPath = join(cacheDir, `.${hash}.safetensors.partial`);
     await writeFile(partialPath, "AAAA"); // 4 bytes of prior progress
     // A resume is only attempted when we hold the validator captured on the
@@ -156,8 +182,7 @@ describe("downloadModel cache", () => {
   it("overwrites the partial when the server replies 200 (Range unsupported)", async () => {
     await fsPromises.mkdir(cacheDir, { recursive: true });
     const url = "https://example.com/models/norange.safetensors";
-    const { createHash } = await import("node:crypto");
-    const hash = createHash("sha256").update(url).digest("hex").slice(0, 32);
+    const hash = cacheHashFor(url);
     const partialPath = join(cacheDir, `.${hash}.safetensors.partial`);
     await writeFile(partialPath, "STALE_PARTIAL_CONTENT");
     // With a validator present we send Range+If-Range; the server ignoring the
@@ -174,6 +199,63 @@ describe("downloadModel cache", () => {
     ];
     expect(init.headers.Range).toBe("bytes=21-"); // requested, but server ignored
     await expect(readFile(target, "utf-8")).resolves.toBe("full body from server");
+  });
+
+  it("uses HF X-Linked-Size (not an understated CAS Content-Length) to reject a short fresh download (#467)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://huggingface.co/org/repo/resolve/main/xlsize.safetensors";
+    // Hop 1: resolve 302 declares the AUTHORITATIVE object size via X-Linked-Size.
+    fetchMock.mockResolvedValueOnce(
+      new Response(null, {
+        status: 302,
+        headers: {
+          location: "https://cas-bridge.xethub.hf.co/xet-bridge-us/obj?sig=z",
+          "x-linked-etag": '"xet-v1"',
+          "x-linked-size": "4096",
+        },
+      }),
+    );
+    // Hop 2: the CAS 200 UNDERSTATES Content-Length (1024) and streams only 1024 of
+    // the real 4096 bytes — a truncating CDN. Trusting Content-Length would finalize
+    // a 1 KiB file as the whole 4096-byte model.
+    fetchMock.mockResolvedValueOnce(
+      new Response("A".repeat(1024), {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-length": "1024" },
+      }),
+    );
+
+    await expect(
+      downloadModel(url, "diffusion_models", "xlsize-out.safetensors"),
+    ).rejects.toThrow(/truncat/i);
+    // The short body was NOT renamed into cache as complete.
+    const cached = await readdir(cacheDir).catch(() => [] as string[]);
+    expect(cached.some((f) => f.endsWith(".safetensors"))).toBe(false);
+  });
+
+  it("REFUSES an UNSOLICITED partial 206 on a FRESH request — never finalizes a short prefix (#467 P0)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://example.com/models/unsolicited206.safetensors";
+    // Fresh request (no seeded partial → no Range sent). A misbehaving server/proxy
+    // answers with 206 bytes 0-1023/4096 and Content-Length 1024. Deriving the size
+    // from Content-Length (1024) instead of the Content-Range total (4096) would let
+    // a 1 KiB prefix be finalized into cache as the whole 4096-byte model.
+    fetchMock.mockResolvedValueOnce(
+      new Response("A".repeat(1024), {
+        status: 206,
+        statusText: "Partial Content",
+        headers: { "content-range": "bytes 0-1023/4096", "content-length": "1024" },
+      }),
+    );
+
+    await expect(
+      downloadModel(url, "checkpoints", "unsolicited206-out.safetensors"),
+    ).rejects.toThrow(/no Range|unsolicited|206/i);
+
+    // The short prefix must NOT have been renamed into the cache as a complete file.
+    const cached = await readdir(cacheDir).catch(() => [] as string[]);
+    expect(cached.some((f) => f.endsWith(".safetensors"))).toBe(false);
   });
 
   it("rejects a truncated download (Content-Length exceeds bytes received) instead of reporting success (#343)", async () => {
@@ -263,9 +345,8 @@ describe("downloadModel cache", () => {
   });
 
   // Deterministic cache paths for a URL (mirrors cachePathForUrl in the impl).
-  async function cachePaths(url: string) {
-    const { createHash } = await import("node:crypto");
-    const hash = createHash("sha256").update(url).digest("hex").slice(0, 32);
+  function cachePaths(url: string, headers: Record<string, string> = {}) {
+    const hash = cacheHashFor(url, headers);
     const target = join(cacheDir, `${hash}.safetensors`);
     const partial = join(cacheDir, `.${hash}.safetensors.partial`);
     return { hash, target, partial, sidecar: `${partial}.etag` };
@@ -399,6 +480,32 @@ describe("downloadModel cache", () => {
     await expect(stat(partial)).rejects.toThrow();
   });
 
+  it("REFUSES a resume 206 whose total UNDERSTATES the size the original download recorded (#467)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://example.com/models/shrink.safetensors";
+    const { partial, sidecar } = await cachePaths(url);
+    await writeFile(partial, "AAAA"); // 4 bytes already downloaded
+    // Sidecar records the validator AND the authoritative total the ORIGINAL 200
+    // declared (4096). A resume 206 that claims a SMALLER total is a server
+    // understating the size — must be refused (would finalize a short prefix).
+    await writeFile(sidecar, '"etag-v1"\n4096');
+
+    // Internally-consistent but understated 206: bytes 4-7/8 (total 8 ≠ 4096).
+    fetchMock.mockResolvedValueOnce(
+      new Response("BBBB", {
+        status: 206,
+        statusText: "Partial Content",
+        headers: { "content-range": "bytes 4-7/8" },
+      }),
+    );
+
+    await expect(
+      downloadModel(url, "checkpoints", "shrink-out.safetensors"),
+    ).rejects.toThrow(/total size|reports a total|resume rejected/i);
+    // The stale partial + sidecar are removed so a retry restarts clean.
+    await expect(stat(partial)).rejects.toThrow();
+  });
+
   it("does NOT resume a validator-less partial — restarts cleanly instead of appending (#343 edge)", async () => {
     await fsPromises.mkdir(cacheDir, { recursive: true });
     const url = "https://example.com/models/novalidator.safetensors";
@@ -417,6 +524,268 @@ describe("downloadModel cache", () => {
     expect(init.headers["If-Range"]).toBeUndefined();
     // The stale prefix is discarded — final file is the fresh body, not "AAAA...".
     await expect(readFile(target, "utf-8")).resolves.toBe("FRESHFULLBODY");
+  });
+
+  it("FAILS the download (never silently discards) when the stale partial can't be truncated on restart (#467/#343)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://example.com/models/untruncatable.safetensors";
+    const { partial } = await cachePaths(url);
+    // Make the partial path a DIRECTORY so writeFile(targetPath, "") (the explicit
+    // restart truncation) fails — we must throw, not fall through to a silent "w".
+    await fsPromises.mkdir(partial, { recursive: true });
+
+    fetchMock.mockResolvedValueOnce(okResponse("FRESHFULLBODY"));
+
+    await expect(
+      downloadModel(url, "checkpoints", "untruncatable-out.safetensors"),
+    ).rejects.toThrow(/restart failed|could not truncate/i);
+  });
+
+  it("SURFACES a validator-less declined resume instead of silently discarding the partial (#467)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://example.com/models/silentdiscard.safetensors";
+    const { partial } = await cachePaths(url);
+    // A 21-byte partial with NO sidecar (the HF Xet case: the CAS CDN sent no
+    // ETag/Last-Modified on the original body, so none was ever written).
+    await writeFile(partial, "STALE_PARTIAL_CONTENT"); // 21 bytes
+
+    fetchMock.mockResolvedValueOnce(okResponse("FRESHFULLBODY"));
+
+    const cap = resumeCapture();
+    const target = await downloadModel(
+      url, "checkpoints", "silentdiscard-out.safetensors", undefined, undefined, cap.onResume,
+    );
+    await expect(readFile(target, "utf-8")).resolves.toBe("FRESHFULLBODY");
+
+    // The discard is no longer silent: the decision records WHY and HOW MUCH.
+    expect(cap.box.d?.outcome).toBe("declined:no-validator");
+    expect(cap.box.d?.discardedBytes).toBe(21);
+    expect(cap.box.d?.discarded).toBe(true);
+  });
+
+  it("persists a validator from the HF resolve REDIRECT (X-Linked-Etag) so a Xet partial becomes resumable (#467)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://huggingface.co/org/repo/resolve/main/big.safetensors";
+    const { partial, sidecar } = await cachePaths(url);
+
+    // Hop 1: resolve URL 302s cross-origin to the CAS CDN, carrying the
+    // content-addressed X-Linked-Etag (but no plain ETag).
+    fetchMock.mockResolvedValueOnce(
+      new Response(null, {
+        status: 302,
+        headers: {
+          location: "https://cas-bridge.xethub.hf.co/xet-bridge-us/obj?sig=abc",
+          "x-linked-etag": '"xet-content-hash-v1"',
+        },
+      }),
+    );
+    // Hop 2: the CAS CDN serves the body with NEITHER ETag NOR Last-Modified,
+    // and the stream ends early (truncated) so the partial + sidecar survive.
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) { c.enqueue(new TextEncoder().encode("half")); c.close(); },
+    });
+    fetchMock.mockResolvedValueOnce(
+      new Response(stream, {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-length": "1000" },
+      }),
+    );
+
+    await expect(
+      downloadModel(url, "diffusion_models", "big-out.safetensors"),
+    ).rejects.toThrow(/truncat/i);
+
+    // Previously NO sidecar was written (final CAS 200 has no validator) so the
+    // partial could never resume. Now the redirect's X-Linked-Etag is captured,
+    // plus the authoritative total on line 2 (#467).
+    await expect(stat(partial)).resolves.toBeTruthy();
+    await expect(readFile(sidecar, "utf-8")).resolves.toBe('"xet-content-hash-v1"\n1000');
+  });
+
+  it("forwards Range across a cross-origin CAS redirect and APPENDS a 206 (HF Xet resume) (#467)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://huggingface.co/org/repo/resolve/main/resume-xet.safetensors";
+    const { partial, sidecar } = await cachePaths(url);
+    await writeFile(partial, "AAAA"); // 4 bytes already downloaded
+    await writeFile(sidecar, '"xet-content-hash-v1"');
+
+    // Hop 1: resolve URL 302s cross-origin, advertising the SAME content-addressed
+    // X-Linked-Etag as the partial — proving the object is unchanged, so the
+    // cross-origin 206 append is allowed (a cross-origin resume REQUIRES this).
+    fetchMock.mockResolvedValueOnce(
+      new Response(null, {
+        status: 302,
+        headers: {
+          location: "https://cas-bridge.xethub.hf.co/xet-bridge-us/obj?sig=abc",
+          "x-linked-etag": '"xet-content-hash-v1"',
+        },
+      }),
+    );
+    // Hop 2: the CAS CDN honors the byte range and returns a 206.
+    fetchMock.mockResolvedValueOnce(
+      new Response("BBBB", {
+        status: 206,
+        statusText: "Partial Content",
+        headers: { "content-range": "bytes 4-7/8" },
+      }),
+    );
+
+    const cap = resumeCapture();
+    const target = await downloadModel(
+      url, "diffusion_models", "resume-xet-out.safetensors", undefined, undefined, cap.onResume,
+    );
+
+    // Hop 1 (resolve) carried Range + If-Range...
+    const [, firstInit] = fetchMock.mock.calls[0] as [string, { headers: Record<string, string> }];
+    expect(firstInit.headers.Range).toBe("bytes=4-");
+    expect(firstInit.headers["If-Range"]).toBe('"xet-content-hash-v1"');
+    // ...and CRUCIALLY the cross-origin CAS hop STILL carried Range (previously
+    // dropped with all headers → resume was impossible on Xet).
+    const [casUrl, secondInit] = fetchMock.mock.calls[1] as [string, { headers: Record<string, string> }];
+    expect(casUrl).toContain("cas-bridge.xethub.hf.co");
+    expect(secondInit.headers.Range).toBe("bytes=4-");
+    // The bytes were appended, not re-downloaded from 0.
+    await expect(readFile(target, "utf-8")).resolves.toBe("AAAABBBB");
+    expect(cap.box.d?.outcome).toBe("resumed");
+  });
+
+  it("REFUSES to append a CAS 206 when the redirect's content-addressed X-Linked-Etag changed, even if the CDN honors the Range (#467/#343)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://huggingface.co/org/repo/resolve/main/xet-changed.safetensors";
+    const { partial, sidecar } = await cachePaths(url);
+    await writeFile(partial, "AAAA");
+    await writeFile(sidecar, '"xet-hash-OLD"'); // partial written against OLD content
+
+    // Hop 1: resolve 302 now advertises a DIFFERENT content hash (file changed).
+    fetchMock.mockResolvedValueOnce(
+      new Response(null, {
+        status: 302,
+        headers: {
+          location: "https://cas-bridge.xethub.hf.co/xet-bridge-us/obj?sig=new",
+          "x-linked-etag": '"xet-hash-NEW"',
+        },
+      }),
+    );
+    // Hop 2: a misbehaving CAS that honors the stale Range and 206s the NEW object.
+    fetchMock.mockResolvedValueOnce(
+      new Response("BBBB", {
+        status: 206,
+        statusText: "Partial Content",
+        headers: { "content-range": "bytes 4-7/8" },
+      }),
+    );
+
+    // We must NOT splice new-object bytes onto the stale prefix — reject instead.
+    const cap = resumeCapture();
+    await expect(
+      downloadModel(url, "diffusion_models", "xet-changed-out.safetensors", undefined, undefined, cap.onResume),
+    ).rejects.toThrow(/resume rejected/i);
+    // Stale partial + sidecar removed so a retry restarts clean.
+    await expect(stat(partial)).rejects.toThrow();
+    await expect(stat(sidecar)).rejects.toThrow();
+    expect(cap.box.d?.outcome).toBe("declined:etag-changed");
+    expect(cap.box.d?.discarded).toBe(true);
+  });
+
+  it("REFUSES a cross-origin CAS 206 whose redirect gives NO content-addressed validator (can't prove unchanged) (#467/#343)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://huggingface.co/org/repo/resolve/main/xet-unproven.safetensors";
+    const { partial, sidecar } = await cachePaths(url);
+    await writeFile(partial, "AAAA");
+    await writeFile(sidecar, '"xet-hash-v1"');
+
+    // Hop 1: resolve 302s cross-origin WITHOUT an X-Linked-Etag — we cannot prove
+    // the CAS object still matches the partial.
+    fetchMock.mockResolvedValueOnce(
+      new Response(null, {
+        status: 302,
+        headers: { location: "https://cas-bridge.xethub.hf.co/xet-bridge-us/obj?sig=x" },
+      }),
+    );
+    // Hop 2: CAS honors the stale Range and 206s — but we must NOT trust it.
+    fetchMock.mockResolvedValueOnce(
+      new Response("BBBB", {
+        status: 206,
+        statusText: "Partial Content",
+        headers: { "content-range": "bytes 4-7/8" },
+      }),
+    );
+
+    const cap = resumeCapture();
+    await expect(
+      downloadModel(url, "diffusion_models", "xet-unproven-out.safetensors", undefined, undefined, cap.onResume),
+    ).rejects.toThrow(/resume rejected/i);
+    await expect(stat(partial)).rejects.toThrow();
+    await expect(stat(sidecar)).rejects.toThrow();
+    // Unverifiable, not proven-changed: no validator was available to compare.
+    expect(cap.box.d?.outcome).toBe("declined:unverifiable");
+  });
+
+  it("REFUSES a resume 206 when a LATER redirect hop reports a changed X-Linked-Etag (multi-hop) (#467/#343)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://huggingface.co/org/repo/resolve/main/multihop.safetensors";
+    const { partial, sidecar } = await cachePaths(url);
+    await writeFile(partial, "AAAA");
+    await writeFile(sidecar, '"xet-hash-v1"');
+
+    // Hop 1: same-origin 302 whose X-Linked-Etag MATCHES the partial...
+    fetchMock.mockResolvedValueOnce(
+      new Response(null, {
+        status: 302,
+        headers: {
+          location: "https://huggingface.co/org/repo/resolve/main/multihop2",
+          "x-linked-etag": '"xet-hash-v1"',
+        },
+      }),
+    );
+    // Hop 2: a LATER cross-origin 302 that reports a DIFFERENT object — the file
+    // changed; an earlier match must not let this slip through.
+    fetchMock.mockResolvedValueOnce(
+      new Response(null, {
+        status: 302,
+        headers: {
+          location: "https://cas-bridge.xethub.hf.co/xet-bridge-us/obj?sig=z",
+          "x-linked-etag": '"xet-hash-v2-CHANGED"',
+        },
+      }),
+    );
+    // Hop 3: CAS 206 for the changed object.
+    fetchMock.mockResolvedValueOnce(
+      new Response("BBBB", {
+        status: 206,
+        statusText: "Partial Content",
+        headers: { "content-range": "bytes 4-7/8" },
+      }),
+    );
+
+    const cap = resumeCapture();
+    await expect(
+      downloadModel(url, "diffusion_models", "multihop-out.safetensors", undefined, undefined, cap.onResume),
+    ).rejects.toThrow(/resume rejected/i);
+    await expect(stat(partial)).rejects.toThrow();
+    expect(cap.box.d?.outcome).toBe("declined:etag-changed");
+  });
+
+  it("declines + SURFACES a full-response resume (If-Range miss / no range support, 200) — safety preserved (#467/#343)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://example.com/models/changed-surfaced.safetensors";
+    const { partial, sidecar } = await cachePaths(url);
+    await writeFile(partial, "AAAA"); // 4 bytes
+    await writeFile(sidecar, '"etag-old"');
+
+    // Upstream changed (or no range support) → server sends full 200, not a 206.
+    fetchMock.mockResolvedValueOnce(okResponse("BRANDNEWBODY"));
+
+    const cap = resumeCapture();
+    const target = await downloadModel(
+      url, "checkpoints", "changed-surfaced-out.safetensors", undefined, undefined, cap.onResume,
+    );
+    // Overwritten with the fresh body — safety preserved, no corrupt append.
+    await expect(readFile(target, "utf-8")).resolves.toBe("BRANDNEWBODY");
+
+    expect(cap.box.d?.outcome).toBe("declined:full-response");
+    expect(cap.box.d?.discardedBytes).toBe(4);
   });
 
   it("persists the validator sidecar on a fresh write so a later resume can guard with If-Range (#343 edge)", async () => {
@@ -441,9 +810,461 @@ describe("downloadModel cache", () => {
       downloadModel(url, "checkpoints", "sidecar-out.safetensors"),
     ).rejects.toThrow(/truncat/i);
 
-    // The validator was captured and PAIRS with the truncated partial bytes.
+    // The validator was captured and PAIRS with the truncated partial bytes, with
+    // the authoritative total (Content-Length 1000) on line 2 (#467).
     await expect(stat(partial)).resolves.toBeTruthy();
-    await expect(readFile(sidecar, "utf-8")).resolves.toBe('"captured-v9"');
+    await expect(readFile(sidecar, "utf-8")).resolves.toBe('"captured-v9"\n1000');
+  });
+
+  it("REJECTS + removes an OVERSIZED 206 that streams MORE than its Content-Range total (#467 P0-1)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://example.com/models/oversized206.safetensors";
+    const { partial, sidecar } = await cachePaths(url);
+    await writeFile(partial, "AAAA"); // resume offset 4
+    await writeFile(sidecar, '"ov-etag"');
+
+    // 206 claims bytes 4-7/8 (total 8) but the body is 6 bytes → 4+6 = 10 > 8.
+    // Without the exact-size check this corrupt 10-byte file would be finalized.
+    fetchMock.mockResolvedValueOnce(
+      new Response("BBBBBB", {
+        status: 206,
+        statusText: "Partial Content",
+        headers: { "content-range": "bytes 4-7/8" },
+      }),
+    );
+
+    await expect(
+      downloadModel(url, "checkpoints", "oversized206-out.safetensors"),
+    ).rejects.toThrow(/oversized/i);
+    // The corrupt bytes are removed (NOT left to masquerade as resumable).
+    await expect(stat(partial)).rejects.toThrow();
+    await expect(stat(sidecar)).rejects.toThrow();
+  });
+
+  it("REJECTS + removes an OVERSIZED 200 that streams MORE than its Content-Length (#467 P0-1)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://example.com/models/oversized200.safetensors";
+    // 200 claims 4 bytes but streams 9.
+    fetchMock.mockResolvedValueOnce(
+      new Response("TOOMANYBS", { status: 200, statusText: "OK", headers: { "content-length": "4" } }),
+    );
+    await expect(
+      downloadModel(url, "checkpoints", "oversized200-out.safetensors"),
+    ).rejects.toThrow(/oversized/i);
+    const cached = await readdir(cacheDir).catch(() => [] as string[]);
+    expect(cached.some((f) => f.endsWith(".safetensors"))).toBe(false);
+  });
+
+  it("REFUSES a cross-origin 206 whose FINAL response carries a DIFFERENT X-Linked-Etag than the matching redirect (#467 P0-2)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://huggingface.co/org/repo/resolve/main/finalconflict.safetensors";
+    const { partial, sidecar } = await cachePaths(url);
+    await writeFile(partial, "AAAA");
+    await writeFile(sidecar, '"xet-v1"');
+
+    // Hop 1: resolve 302 cross-origin whose X-Linked-Etag MATCHES the partial...
+    fetchMock.mockResolvedValueOnce(
+      new Response(null, {
+        status: 302,
+        headers: {
+          location: "https://cas-bridge.xethub.hf.co/xet-bridge-us/obj?sig=a",
+          "x-linked-etag": '"xet-v1"',
+        },
+      }),
+    );
+    // Hop 2: the FINAL CAS 206 advertises a DIFFERENT content hash — the object
+    // changed at the CDN. A matching redirect must NOT let this slip through.
+    fetchMock.mockResolvedValueOnce(
+      new Response("BBBB", {
+        status: 206,
+        statusText: "Partial Content",
+        headers: { "content-range": "bytes 4-7/8", "x-linked-etag": '"xet-v2-CHANGED"' },
+      }),
+    );
+
+    const cap = resumeCapture();
+    await expect(
+      downloadModel(url, "diffusion_models", "finalconflict-out.safetensors", undefined, undefined, cap.onResume),
+    ).rejects.toThrow(/resume rejected/i);
+    await expect(stat(partial)).rejects.toThrow();
+    await expect(stat(sidecar)).rejects.toThrow();
+    expect(cap.box.d?.outcome).toBe("declined:etag-changed");
+  });
+
+  it("does NOT coalesce same-URL downloads carrying DIFFERENT auth headers — each gets its own bytes (#467 P1-2)", async () => {
+    const { downloadWithCache } = await import("../../services/download-cache.js");
+    await fsPromises.mkdir(comfyDir, { recursive: true });
+    const url = "https://example.com/models/gated.safetensors";
+    // Two users, two tokens → two representations. They must NOT share a stream.
+    fetchMock.mockResolvedValueOnce(okResponse("ALICE-ONLY-BYTES"));
+    fetchMock.mockResolvedValueOnce(okResponse("BOB-ONLY-BYTES"));
+
+    const alice = join(comfyDir, "alice.safetensors");
+    const bob = join(comfyDir, "bob.safetensors");
+    await downloadWithCache({ url, headers: { Authorization: "Bearer alice" }, targetPath: alice });
+    await downloadWithCache({ url, headers: { Authorization: "Bearer bob" }, targetPath: bob });
+
+    // Separate representations → separate fetches, no cache coalescing.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await expect(readFile(alice, "utf-8")).resolves.toBe("ALICE-ONLY-BYTES");
+    await expect(readFile(bob, "utf-8")).resolves.toBe("BOB-ONLY-BYTES");
+  });
+
+  it("separates same-URL downloads by ANY custom auth header, not just known names (#467 P1-2)", async () => {
+    const { downloadWithCache } = await import("../../services/download-cache.js");
+    await fsPromises.mkdir(comfyDir, { recursive: true });
+    const url = "https://example.com/models/customhdr.safetensors";
+    // A NON-allowlisted custom auth header still selects a distinct representation.
+    fetchMock.mockResolvedValueOnce(okResponse("ALICE-CUSTOM"));
+    fetchMock.mockResolvedValueOnce(okResponse("BOB-CUSTOM"));
+
+    const alice = join(comfyDir, "ca.safetensors");
+    const bob = join(comfyDir, "cb.safetensors");
+    await downloadWithCache({ url, headers: { "X-Custom-Auth": "alice" }, targetPath: alice });
+    await downloadWithCache({ url, headers: { "X-Custom-Auth": "bob" }, targetPath: bob });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2); // NOT coalesced despite same URL
+    await expect(readFile(alice, "utf-8")).resolves.toBe("ALICE-CUSTOM");
+    await expect(readFile(bob, "utf-8")).resolves.toBe("BOB-CUSTOM");
+  });
+
+  it("DOES cache/coalesce same-URL downloads with the SAME auth header (public dedup preserved) (#467 P1-2)", async () => {
+    const { downloadWithCache } = await import("../../services/download-cache.js");
+    await fsPromises.mkdir(comfyDir, { recursive: true });
+    const url = "https://example.com/models/sameauth.safetensors";
+    fetchMock.mockResolvedValueOnce(okResponse("SHARED-BYTES"));
+
+    const one = join(comfyDir, "one.safetensors");
+    const two = join(comfyDir, "two.safetensors");
+    await downloadWithCache({ url, headers: { Authorization: "Bearer same" }, targetPath: one });
+    await downloadWithCache({ url, headers: { Authorization: "Bearer same" }, targetPath: two });
+
+    // Identical representation → second call is a cache hit, only one fetch.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await expect(readFile(one, "utf-8")).resolves.toBe("SHARED-BYTES");
+    await expect(readFile(two, "utf-8")).resolves.toBe("SHARED-BYTES");
+  });
+
+  it("reports the resume decision ONLY to the physical stream's caller; a COALESCED consumer gets none (#467 P1-b)", async () => {
+    const { downloadWithCache } = await import("../../services/download-cache.js");
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    await fsPromises.mkdir(comfyDir, { recursive: true });
+    const url = "https://example.com/models/coalesce-diag.safetensors";
+    const hash = cacheHashFor(url);
+    // Validator-less partial → the ONE physical download declines + reports.
+    await writeFile(join(cacheDir, `.${hash}.safetensors.partial`), "OLDPARTIALBYTES");
+
+    // A single, initially-pending fetch — both callers coalesce onto it.
+    let release!: (r: Response) => void;
+    fetchMock.mockReturnValueOnce(
+      new Promise<Response>((res) => {
+        release = res;
+      }),
+    );
+
+    const capA = resumeCapture();
+    const capB = resumeCapture();
+    const a = downloadWithCache({ url, headers: {}, targetPath: join(comfyDir, "a.safetensors"), onResume: capA.onResume });
+    const b = downloadWithCache({ url, headers: {}, targetPath: join(comfyDir, "b.safetensors"), onResume: capB.onResume });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1)); // coalesced to ONE fetch
+    release(okResponse("FRESHFULLBODY"));
+    await Promise.all([a, b]);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    // The stream's owner (A) got the decision; the coalesced consumer (B) got NONE
+    // — no shared map to clobber, and B is never misattributed A's decision.
+    expect(capA.box.d?.outcome).toBe("declined:no-validator");
+    expect(capB.box.d).toBeUndefined();
+  });
+
+  it("does NOT report a resume decision on a cache HIT (#467)", async () => {
+    const { downloadWithCache } = await import("../../services/download-cache.js");
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    await fsPromises.mkdir(comfyDir, { recursive: true });
+    const url = "https://example.com/models/cachehit-clear.safetensors";
+    const hash = cacheHashFor(url);
+    // A COMPLETE cache entry → this download is a hit (no fetch, no streamUrlToFile).
+    await writeFile(join(cacheDir, `${hash}.safetensors`), "CACHED-BYTES");
+
+    const cap = resumeCapture();
+    await downloadWithCache({ url, headers: {}, targetPath: join(comfyDir, "ch.safetensors"), onResume: cap.onResume });
+
+    expect(fetchMock).not.toHaveBeenCalled(); // served from cache
+    // No resume/discard happened, so nothing is reported (can't be misattributed).
+    expect(cap.box.d).toBeUndefined();
+  });
+
+  it("reports same-URL DIFFERENT-auth downloads to their OWN callers (no cross-talk) (#467 P2)", async () => {
+    const { downloadWithCache } = await import("../../services/download-cache.js");
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    await fsPromises.mkdir(comfyDir, { recursive: true });
+    const url = "https://example.com/models/p2.safetensors";
+    // Alice and Bob use different auth → different physical cache identities, so
+    // each seeds its OWN validator-less partial and gets its OWN decision.
+    for (const who of ["alice", "bob"]) {
+      const id = cacheHashFor(url, { Authorization: `Bearer ${who}` });
+      await writeFile(join(cacheDir, `.${id}.safetensors.partial`), `OLD-${who}`);
+    }
+    fetchMock.mockResolvedValueOnce(okResponse("ALICE-FRESH"));
+    fetchMock.mockResolvedValueOnce(okResponse("BOB-FRESH"));
+
+    const capA = resumeCapture();
+    const capB = resumeCapture();
+    await downloadWithCache({ url, headers: { Authorization: "Bearer alice" }, targetPath: join(comfyDir, "pa.safetensors"), onResume: capA.onResume });
+    await downloadWithCache({ url, headers: { Authorization: "Bearer bob" }, targetPath: join(comfyDir, "pb.safetensors"), onResume: capB.onResume });
+
+    // Each caller received its own decline — no shared key, no cross-talk.
+    expect(capA.box.d?.outcome).toBe("declined:no-validator");
+    expect(capB.box.d?.outcome).toBe("declined:no-validator");
+  });
+
+  it("cloudPrincipalKey separates S3/Azure principals by EXPLICIT auth AND env creds (#467 P1-B)", async () => {
+    const { cloudPrincipalKey } = await import("../../services/storage/index.js");
+    const s3url = "s3://bucket/key.safetensors";
+    // Explicit different access keys → different principals.
+    const alice = cloudPrincipalKey(s3url, { s3: { access_key_id: "AK-ALICE", secret_access_key: "x" } });
+    const bob = cloudPrincipalKey(s3url, { s3: { access_key_id: "AK-BOB", secret_access_key: "x" } });
+    expect(alice).not.toBe(bob);
+    expect(alice).toBeTruthy();
+
+    // ENV-derived creds also participate (the cross-principal-leak fix): an
+    // env-authenticated principal must differ from anonymous.
+    const prev = process.env.AWS_ACCESS_KEY_ID;
+    process.env.AWS_ACCESS_KEY_ID = "AK-FROM-ENV";
+    const envKey = cloudPrincipalKey(s3url, {});
+    delete process.env.AWS_ACCESS_KEY_ID;
+    const anonKey = cloudPrincipalKey(s3url, {});
+    if (prev !== undefined) process.env.AWS_ACCESS_KEY_ID = prev;
+    expect(envKey).not.toBe(anonKey);
+
+    // Azure env connection-string participates too.
+    const azUrl = "https://acct.blob.core.windows.net/c/blob.bin";
+    const prevAz = process.env.AZURE_STORAGE_CONNECTION_STRING;
+    process.env.AZURE_STORAGE_CONNECTION_STRING = "AccountName=acct;AccountKey=KKK==";
+    const azEnv = cloudPrincipalKey(azUrl, {});
+    delete process.env.AZURE_STORAGE_CONNECTION_STRING;
+    const azAnon = cloudPrincipalKey(azUrl, {});
+    if (prevAz !== undefined) process.env.AZURE_STORAGE_CONNECTION_STRING = prevAz;
+    expect(azEnv).not.toBe(azAnon);
+
+    // Ambient (no explicit key) is STABLE within a process (same nonce) so in-process
+    // cache hits stay safe; explicit auth is stable too.
+    expect(cloudPrincipalKey(s3url, {})).toBe(cloudPrincipalKey(s3url, {}));
+    expect(alice).toBe(cloudPrincipalKey(s3url, { s3: { access_key_id: "AK-ALICE", secret_access_key: "x" } }));
+
+    // SDK-level endpoint env vars change the EFFECTIVE endpoint even with explicit
+    // creds → must change the identity (#467 P1-B).
+    const explicit = { s3: { access_key_id: "AK", secret_access_key: "x" } };
+    const baseline = cloudPrincipalKey(s3url, explicit);
+    const prevEp = process.env.AWS_ENDPOINT_URL_S3;
+    process.env.AWS_ENDPOINT_URL_S3 = "https://minio.internal:9000";
+    const withEp = cloudPrincipalKey(s3url, explicit);
+    if (prevEp !== undefined) process.env.AWS_ENDPOINT_URL_S3 = prevEp;
+    else delete process.env.AWS_ENDPOINT_URL_S3;
+    expect(withEp).not.toBe(baseline);
+
+    // A non-cloud URL contributes no cloud discriminator.
+    expect(cloudPrincipalKey("https://example.com/x.safetensors", {})).toBe("");
+  });
+
+  it("materializes concurrent same-destination DIFFERENT-representation downloads without poisoning either cache entry (#467)", async () => {
+    const { downloadWithCache } = await import("../../services/download-cache.js");
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    await fsPromises.mkdir(comfyDir, { recursive: true });
+    const url = "https://example.com/models/samedest.safetensors";
+    // Two representations (different auth) → two distinct cache entries. Return the
+    // body by Authorization header (NOT call order — the two downloads race under
+    // Promise.all), so each representation deterministically gets its own bytes and
+    // any cross-contamination would be a genuine cache poison, not a mock artifact.
+    fetchMock.mockImplementation((_u: string, init: { headers?: Record<string, string> }) =>
+      Promise.resolve(
+        okResponse(init?.headers?.Authorization === "Bearer alice" ? "ALICE-CACHE-BYTES" : "BOB-CACHE-BYTES"),
+      ),
+    );
+    // ...materialized to the SAME on-disk destination (concurrent writers).
+    const dest = join(comfyDir, "same.safetensors");
+    await Promise.all([
+      downloadWithCache({ url, headers: { Authorization: "Bearer alice" }, targetPath: dest }),
+      downloadWithCache({ url, headers: { Authorization: "Bearer bob" }, targetPath: dest }),
+    ]);
+
+    // Each cache entry must retain ITS OWN bytes — the atomic temp+rename
+    // materialize must never write through a hardlink into the other's inode.
+    const aHash = cacheHashFor(url, { Authorization: "Bearer alice" });
+    const bHash = cacheHashFor(url, { Authorization: "Bearer bob" });
+    await expect(readFile(join(cacheDir, `${aHash}.safetensors`), "utf-8")).resolves.toBe("ALICE-CACHE-BYTES");
+    await expect(readFile(join(cacheDir, `${bHash}.safetensors`), "utf-8")).resolves.toBe("BOB-CACHE-BYTES");
+    // The destination holds one of the two (last writer wins) — but a VALID one.
+    expect(["ALICE-CACHE-BYTES", "BOB-CACHE-BYTES"]).toContain(await readFile(dest, "utf-8"));
+    // No leftover temp materialization files.
+    const leftovers = (await readdir(comfyDir)).filter((f) => f.includes(".mat-"));
+    expect(leftovers).toHaveLength(0);
+  });
+
+  it("direct-fallback (materialize failed) does NOT write through a destination hardlink into a cache inode (#467)", async () => {
+    const { downloadWithCache } = await import("../../services/download-cache.js");
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    await fsPromises.mkdir(comfyDir, { recursive: true });
+
+    // A pre-existing WINNER cache entry, with the destination HARDLINKED to it (as a
+    // concurrent successful materialize would leave it).
+    const winnerCache = join(cacheDir, "winner.safetensors");
+    await writeFile(winnerCache, "WINNER-BYTES");
+    const dest = join(comfyDir, "same.safetensors");
+    await fsPromises.link(winnerCache, dest); // dest shares WINNER's inode
+
+    // Force materialize to fail at its link/copy stage — BEFORE it touches dest — so
+    // downloadWithCache takes the DIRECT fallback while dest is STILL hardlinked to
+    // the winner's cache inode (the poison window). link/copyFile are used ONLY by
+    // materializeCacheFile, so this doesn't disturb the cache write.
+    const linkSpy = vi
+      .spyOn(downloadCacheFs, "link")
+      .mockRejectedValue(Object.assign(new Error("EXDEV"), { code: "EXDEV" }));
+    const copySpy = vi
+      .spyOn(downloadCacheFs, "copyFile")
+      .mockRejectedValue(Object.assign(new Error("EIO"), { code: "EIO" }));
+
+    const url = "https://example.com/models/fallback-poison.safetensors";
+    // Fresh Response per call (cache-write fetch + fallback fetch) — a body streams once.
+    fetchMock.mockImplementation(() => Promise.resolve(okResponse("LOSER-FRESH-BYTES")));
+
+    await downloadWithCache({ url, headers: {}, targetPath: dest });
+
+    // The WINNER cache inode must be UNTOUCHED — the fallback wrote a fresh temp and
+    // renamed over dest, never streaming "w" THROUGH dest's hardlink into the inode.
+    await expect(readFile(winnerCache, "utf-8")).resolves.toBe("WINNER-BYTES");
+    // The destination now holds the fallback's freshly-downloaded bytes.
+    await expect(readFile(dest, "utf-8")).resolves.toBe("LOSER-FRESH-BYTES");
+    // No leftover fallback/materialize temp files.
+    const leftovers = (await readdir(comfyDir)).filter((f) => f.includes(".dl-") || f.includes(".mat-"));
+    expect(leftovers).toHaveLength(0);
+    linkSpy.mockRestore();
+    copySpy.mockRestore();
+  });
+
+  it("a non-Windows rename failure during materialize/fallback does NOT destroy the existing destination (#467 P1-A)", async () => {
+    const { downloadWithCache } = await import("../../services/download-cache.js");
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    await fsPromises.mkdir(comfyDir, { recursive: true });
+    const dest = join(comfyDir, "keepme.safetensors");
+    await writeFile(dest, "ORIGINAL-PRECIOUS-BYTES");
+
+    // Fail ONLY the materialize/fallback swap renames (.mat-/.dl-) with a non-Windows
+    // error — the cache-write rename (.partial → cache file) must still pass through.
+    const renameSpy = vi
+      .spyOn(downloadCacheFs, "rename")
+      .mockImplementation(async (from: string, to: string) => {
+        if (String(from).includes(".mat-") || String(from).includes(".dl-")) {
+          throw Object.assign(new Error("EIO: simulated non-overwrite rename failure"), { code: "EIO" });
+        }
+        return fsPromises.rename(from, to);
+      });
+
+    const url = "https://example.com/models/rename-eio.safetensors";
+    fetchMock.mockImplementation(() => Promise.resolve(okResponse("NEW-BYTES")));
+
+    await expect(downloadWithCache({ url, headers: {}, targetPath: dest })).rejects.toThrow(/EIO/i);
+
+    // The EIO path must NOT have removed the destination (that rm only guards the
+    // Windows overwrite errors) — the original file is intact.
+    await expect(readFile(dest, "utf-8")).resolves.toBe("ORIGINAL-PRECIOUS-BYTES");
+    const leftovers = (await readdir(comfyDir)).filter((f) => f.includes(".mat-") || f.includes(".dl-"));
+    expect(leftovers).toHaveLength(0);
+    renameSpy.mockRestore();
+  });
+
+  it("preserves the existing destination when the Windows overwrite retry itself fails (#467)", async () => {
+    if (process.platform !== "win32") return; // the backup/restore path is Windows-only
+    const { downloadWithCache } = await import("../../services/download-cache.js");
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    await fsPromises.mkdir(comfyDir, { recursive: true });
+    const dest = join(comfyDir, "precious.safetensors");
+    await writeFile(dest, "ORIGINAL-PRECIOUS-BYTES");
+
+    // Force materialize to fail (link/copy) so the DIRECT fallback runs, then make
+    // the fallback's temp→dest swap EPERM (triggers the Windows backup dance) and
+    // its RETRY EIO (the retry itself fails) — the original dest must be restored.
+    const linkSpy = vi.spyOn(downloadCacheFs, "link").mockRejectedValue(Object.assign(new Error("EXDEV"), { code: "EXDEV" }));
+    const copySpy = vi.spyOn(downloadCacheFs, "copyFile").mockRejectedValue(Object.assign(new Error("EIO"), { code: "EIO" }));
+    let dlToDestAttempts = 0;
+    const renameSpy = vi.spyOn(downloadCacheFs, "rename").mockImplementation(async (from: string, to: string) => {
+      if (String(from).includes(".dl-") && to === dest) {
+        dlToDestAttempts += 1;
+        // First: EPERM (can't overwrite) → backup dance. Retry: EIO (retry fails).
+        throw Object.assign(new Error(dlToDestAttempts === 1 ? "EPERM" : "EIO"), { code: dlToDestAttempts === 1 ? "EPERM" : "EIO" });
+      }
+      return fsPromises.rename(from, to); // dest→backup and backup→dest restore run for real
+    });
+
+    const url = "https://example.com/models/winretry.safetensors";
+    fetchMock.mockImplementation(() => Promise.resolve(okResponse("NEW-BYTES")));
+
+    await expect(downloadWithCache({ url, headers: {}, targetPath: dest })).rejects.toThrow(/EIO/i);
+    // The original destination was RESTORED (never lost), despite the failed retry.
+    await expect(readFile(dest, "utf-8")).resolves.toBe("ORIGINAL-PRECIOUS-BYTES");
+    const leftovers = (await readdir(comfyDir)).filter((f) => /\.(dl|bak)-/.test(f));
+    expect(leftovers).toHaveLength(0);
+    linkSpy.mockRestore();
+    copySpy.mockRestore();
+    renameSpy.mockRestore();
+  });
+
+  it("PRESERVES the original at a named backup when even the Windows restore fails (never lost) (#467)", async () => {
+    if (process.platform !== "win32") return;
+    const { downloadWithCache } = await import("../../services/download-cache.js");
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    await fsPromises.mkdir(comfyDir, { recursive: true });
+    const dest = join(comfyDir, "precious2.safetensors");
+    await writeFile(dest, "ORIGINAL-PRECIOUS-BYTES");
+
+    const linkSpy = vi.spyOn(downloadCacheFs, "link").mockRejectedValue(Object.assign(new Error("EXDEV"), { code: "EXDEV" }));
+    const copySpy = vi.spyOn(downloadCacheFs, "copyFile").mockRejectedValue(Object.assign(new Error("EIO"), { code: "EIO" }));
+    let dlToDest = 0;
+    const renameSpy = vi.spyOn(downloadCacheFs, "rename").mockImplementation(async (from: string, to: string) => {
+      if (String(from).includes(".dl-") && to === dest) {
+        dlToDest += 1;
+        throw Object.assign(new Error(dlToDest === 1 ? "EPERM" : "EIO"), { code: dlToDest === 1 ? "EPERM" : "EIO" });
+      }
+      if (String(from).includes(".bak-") && to === dest) {
+        throw Object.assign(new Error("EIO: restore failed too"), { code: "EIO" }); // restore ALSO fails
+      }
+      return fsPromises.rename(from, to); // dest → .bak backup succeeds
+    });
+
+    const url = "https://example.com/models/winrestorefail.safetensors";
+    fetchMock.mockImplementation(() => Promise.resolve(okResponse("NEW-BYTES")));
+
+    // The error must NAME the backup so the file is recoverable (not silently lost).
+    await expect(downloadWithCache({ url, headers: {}, targetPath: dest })).rejects.toThrow(/PRESERVED at ".*\.bak-.*"/i);
+    // The original bytes still exist on disk under the backup name.
+    const baks = (await readdir(comfyDir)).filter((f) => f.includes(".bak-"));
+    expect(baks).toHaveLength(1);
+    await expect(readFile(join(comfyDir, baks[0]), "utf-8")).resolves.toBe("ORIGINAL-PRECIOUS-BYTES");
+    // No leftover .dl temp.
+    expect((await readdir(comfyDir)).some((f) => f.includes(".dl-"))).toBe(false);
+    linkSpy.mockRestore();
+    copySpy.mockRestore();
+    renameSpy.mockRestore();
+  });
+
+  it("does NOT serve a LEGACY bare-URL cache entry to an unauthenticated caller — no cross-auth leak (#467 P1-C)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    await fsPromises.mkdir(comfyDir, { recursive: true });
+    const url = "https://example.com/models/legacy.safetensors";
+    // Simulate a PRE-upgrade entry cached under the bare-URL namespace (sha256(url),
+    // no "v2" prefix) — which the OLD code ALSO used for AUTHENTICATED downloads,
+    // so serving it to a new unauthenticated caller would leak auth-scoped bytes.
+    const legacyHash = createHash("sha256").update(url).digest("hex").slice(0, 32);
+    await writeFile(join(cacheDir, `${legacyHash}.safetensors`), "LEAKED-AUTHED-BYTES");
+
+    fetchMock.mockResolvedValueOnce(okResponse("FRESH-PUBLIC-BYTES"));
+    const { downloadWithCache } = await import("../../services/download-cache.js");
+    const out = join(comfyDir, "legacy-out.safetensors");
+    await downloadWithCache({ url, headers: {}, targetPath: out });
+
+    // The legacy entry is namespaced away → a fresh download happened, no leak.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await expect(readFile(out, "utf-8")).resolves.toBe("FRESH-PUBLIC-BYTES");
   });
 
   it("never serves a 0-byte cache entry as a hit — re-downloads instead (#343 edge)", async () => {

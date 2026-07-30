@@ -71,6 +71,7 @@ describe("download_model tool", () => {
       "x.safetensors",
       auth,
       false, // routing decision threaded through (local, #420 codex round 1)
+      expect.any(Function), // onResume callback — reports the resume decision onto the job (#467)
     );
     expect(res.isError).toBeFalsy();
   });

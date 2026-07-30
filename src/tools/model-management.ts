@@ -230,7 +230,37 @@ export function registerModelManagementTools(server: McpServer): void {
               : j.status === "error"
                 ? `\n    failed: ${j.error}`
                 : `\n    still streaming — started ${Math.round((Date.now() - j.started_at) / 1000)}s ago`;
-          return `${head}${detail}\n    from: ${j.url}`;
+          // Surface a declined resume so the agent/user knows a pre-existing
+          // .partial was discarded and why — instead of it being silent (#467).
+          // The decision is stored on THIS job by its own physical download, so it
+          // can never be a stale/other job's.
+          const diag = j.resume;
+          let resumeNote = "";
+          if (diag && diag.outcome !== "resumed") {
+            const gb = (diag.discardedBytes / 1024 ** 3).toFixed(2);
+            const why =
+              diag.outcome === "declined:no-validator"
+                ? "the host sent no ETag/Last-Modified validator to verify a safe resume (common on Hugging Face's Xet/CAS CDN)"
+                : diag.outcome === "declined:full-response"
+                  ? "the host answered with a full response instead of a 206 — the upstream changed, or it doesn't support resuming"
+                  : diag.outcome === "declined:unverifiable"
+                    ? "the resume crossed origins to a CDN that gave no content-addressed validator, so an unchanged upstream couldn't be proven"
+                    : "the upstream file changed since the partial was written, so appending would corrupt it";
+            // Honest about BOTH what happened to the partial and what's next.
+            // A 206 refusal whose removal failed (diag.discarded === false) must
+            // NOT claim the partial was discarded (#467).
+            const fate = diag.discarded
+              ? `discarded ${gb} GB of a prior .partial`
+              : `refused to append a ${gb} GB prior .partial but could NOT remove it (delete the .partial manually if a retry keeps failing)`;
+            const next =
+              j.status === "error"
+                ? diag.discarded
+                  ? "the resume was REJECTED for safety — re-issue download_model to restart cleanly"
+                  : "the resume was REJECTED for safety — re-issue download_model to retry"
+                : "re-downloading in full";
+            resumeNote = `\n    resume: ${diag.outcome} — ${fate} because ${why}; ${next}`;
+          }
+          return `${head}${detail}${resumeNote}\n    from: ${j.url}`;
         });
 
         return { content: [{ type: "text", text: `## Downloads\n\n${lines.join("\n")}` }] };

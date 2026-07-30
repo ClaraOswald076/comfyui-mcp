@@ -250,6 +250,7 @@ describe("applyManifest", () => {
       "model.safetensors",
       undefined,
       false, // routing decision threaded through (local, #420 codex round 1)
+      expect.any(Function), // onResume callback — reports the resume decision onto the job (#467)
     );
   });
 
@@ -412,6 +413,7 @@ describe("applyManifest", () => {
       "model.safetensors",
       undefined,
       false, // routing decision threaded through (local, #420 codex round 1)
+      expect.any(Function), // onResume callback — reports the resume decision onto the job (#467)
     );
   });
 
@@ -437,6 +439,7 @@ describe("applyManifest", () => {
       "new.safetensors",
       undefined,
       false, // routing decision threaded through (local, #420 codex round 1)
+      expect.any(Function), // onResume callback — reports the resume decision onto the job (#467)
     );
   });
 

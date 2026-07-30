@@ -15,12 +15,15 @@
  */
 
 import { createHash } from "node:crypto";
+import { realpath } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import {
   downloadModel,
   resolveDownloadTarget,
   shouldDispatchDownloadToManager,
 } from "./model-resolver.js";
 import type { DownloadAuth } from "./download-auth.js";
+import type { ResumeDiagnostic } from "./download-resume-diag.js";
 import { logger } from "../utils/logger.js";
 
 export interface DownloadJob {
@@ -33,6 +36,12 @@ export interface DownloadJob {
    *  Kept separate from `id` so distinct-destination jobs still read their live
    *  byte progress from the tray. */
   trayId: string;
+  /** This job's OWN resume decision (#467), reported by its physical download via
+   *  a callback and stored here — so download_status surfaces exactly this job's
+   *  outcome and never a stale/other job's. Absent when no resumable download ran
+   *  (Manager dispatch, cache hit, a job that coalesced onto another's stream, or
+   *  a failure before streaming). */
+  resume?: ResumeDiagnostic;
   url: string;
   target_subfolder: string;
   filename?: string;
@@ -64,6 +73,91 @@ interface Entry {
 // is shared by all its keys.
 const jobs = new Map<string, Entry>();
 
+// Per-DESTINATION-PATH serialization chain (#467 P1-C). Two concurrent jobs for
+// the SAME on-disk destination with DIFFERENT auth are (correctly) distinct jobs
+// with distinct representations — but they both materialize to that ONE path, and
+// each runs post-download work (onComplete) against it. Running them concurrently
+// lets one job's writer replace the destination WHILE the other's onComplete reads
+// it — so Alice's callback could process Bob's bytes. We serialize by the auth-free
+// destination so each job's download+materialize+onComplete sees ITS OWN bytes
+// uninterrupted; the final on-disk file is deterministically the last-started job's
+// (inherent: one path can hold one file). Keyed by the realpath-collapsed,
+// case-normalized LOCAL targetPath, OR a canonical remote:<subfolder>/<name> for
+// Manager-dispatched jobs (which write ONE server-side file per subfolder+name).
+const destChains = new Map<string, Promise<void>>();
+
+/** Canonicalize a LOCAL destination key for the serialization chain. Case-
+ *  insensitive filesystems (Windows always; macOS by default) alias `Checkpoints/m`
+ *  and `checkpoints/m` to ONE physical file, so lower-case the key there to
+ *  serialize those too (#467 P1-C). POSIX (Linux) is case-sensitive — leave exact. */
+function normalizeLocalDestKey(key: string): string {
+  return process.platform === "win32" || process.platform === "darwin"
+    ? key.toLowerCase()
+    : key;
+}
+
+/** realpath the DEEPEST EXISTING ANCESTOR of `p` and re-append the not-yet-created
+ *  tail. `realpath(p)` alone fails (and falls back to the lexical path) whenever any
+ *  descendant is absent — but the writer mkdir's the tree later, so a symlink/
+ *  junction in the EXISTING prefix must still be collapsed (#467 P1-C). Walking up
+ *  to the deepest existing dir collapses that prefix regardless of the missing tail. */
+async function realpathDeepestExisting(p: string): Promise<string> {
+  const tail: string[] = [];
+  let current = p;
+  for (;;) {
+    try {
+      const real = await realpath(current);
+      return tail.length ? join(real, ...tail.reverse()) : real;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      // Only ABSENCE walks upward. An existing-but-unresolvable ancestor (EIO,
+      // EACCES, ELOOP, …) must NOT be treated as absent — walking past it would
+      // reconstruct the un-collapsed lexical ALIAS and defeat serialization (wrong-
+      // bytes race). Fail CLOSED: propagate so the job errors rather than risk it
+      // (#467). A transient error here is far rarer than the corruption it guards.
+      if (code !== "ENOENT" && code !== "ENOTDIR") throw err;
+      const parent = dirname(current);
+      if (parent === current) return p; // reached the root without resolving — give up
+      tail.push(basename(current));
+      current = parent;
+    }
+  }
+}
+
+/** The LOCAL serialization key: collapse symlinks/junctions in the destination path
+ *  (via the deepest existing ancestor), then case-normalize — so two aliased
+ *  subfolders resolving to ONE physical file share a chain (#467 P1-C). */
+async function localSerializeKey(targetPath: string): Promise<string> {
+  const real = await realpathDeepestExisting(targetPath);
+  return normalizeLocalDestKey(real);
+}
+
+/** The REMOTE serialization key. The Manager writes ONE server-side file per
+ *  (subfolder, name); derive the name the way the resolve/Manager path does
+ *  (URL pathname basename when no explicit filename) and normalize separators so
+ *  `a//b` == `a/b` and query variants collapse. The remote host's case-sensitivity
+ *  is UNKNOWN here, so lower-case unconditionally — over-serializing is safe, under-
+ *  serializing (concurrent same-file writes) is not (#467 P1-C). */
+function remoteSerializeKey(url: string, targetSubfolder: string, filename?: string): string {
+  let name = filename;
+  if (!name) {
+    try {
+      name = basename(new URL(url).pathname);
+    } catch {
+      name = url.split(/[/?#]/).filter(Boolean).pop();
+    }
+  }
+  // Mirror the Manager writer's trim() then separator-normalize so ` loras/sub `,
+  // `loras/sub`, and `loras//sub` all canonicalize to one key (#467 P1-C).
+  const sub = String(targetSubfolder ?? "")
+    .trim()
+    .split(/[/\\]+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .join("/");
+  return `remote:${sub}/${(name || "model").trim()}`.toLowerCase();
+}
+
 /**
  * Point `key` at `entry`, ENTRY-SCOPED (#420 codex round 3, rule 2/3): never clobber
  * a row currently owned by a DIFFERENT, still-in-flight writer — that would orphan a
@@ -93,14 +187,16 @@ export function downloadIdFor(url: string): string {
 }
 
 /**
- * The download's DISTINCT public id — a hash of the canonical resolved on-disk
- * `targetPath` (from the shared resolveDownloadTarget), used as BOTH the registry
- * key and `job.id`. Identity is the DESTINATION, not the URL: two requests that
- * resolve to the SAME file are one job/one writer (even from different URLs);
- * requests to different destinations are separately pollable via download_status.
+ * The download's DISTINCT public id — a hash of the given identity string. Callers
+ * pass the canonical resolved on-disk `targetPath` PLUS an auth discriminator
+ * (#467 P1-A), so identity is the DESTINATION *and representation*: two requests
+ * that resolve to the SAME file with the SAME auth are one job/one writer (even
+ * from different URLs), but the SAME file with DIFFERENT auth are DIFFERENT
+ * downloads (a different representation) and must not dedup. Requests to different
+ * destinations are separately pollable via download_status.
  */
-export function downloadJobIdFor(targetPath: string): string {
-  return createHash("sha256").update(targetPath).digest("hex").slice(0, 16);
+export function downloadJobIdFor(identity: string): string {
+  return createHash("sha256").update(identity).digest("hex").slice(0, 16);
 }
 
 /**
@@ -112,15 +208,30 @@ export function downloadJobIdFor(targetPath: string): string {
  * locally-resolvable job is ALSO indexed under its destination key (below) so the
  * "two different URLs → one local destination → one writer" dedup still holds.
  */
+/** A stable per-request discriminator for the caller's auth/representation. The
+ *  JOB layer dedups BEFORE the header-aware cache layer is reached, and it is
+ *  otherwise auth-blind — so without this, two concurrent same-URL+same-dest
+ *  calls with DIFFERENT bearer/custom headers would adopt the FIRST job and the
+ *  second caller would get the first's bytes AND resume callback (#467 P1-A). The
+ *  `auth` param is the per-caller differentiator (config-global tokens are
+ *  identical across concurrent calls, so they need not enter the key). Two auth
+ *  encodings that transmit the SAME headers may still be split here — harmless:
+ *  they then coalesce correctly at the cache layer (same representation). */
+function authIdentity(auth?: DownloadAuth): string {
+  return auth ? createHash("sha256").update(JSON.stringify(auth)).digest("hex").slice(0, 12) : "";
+}
+
 function requestDownloadKey(
   url: string,
   targetSubfolder: string,
   filename?: string,
+  auth?: DownloadAuth,
 ): string {
   const canonical = JSON.stringify([
     url,
     String(targetSubfolder ?? "").trim(),
     filename ?? null,
+    authIdentity(auth),
   ]);
   return createHash("sha256").update(canonical).digest("hex").slice(0, 16);
 }
@@ -179,11 +290,26 @@ export async function startDownloadJob(
   // "two different URLs → same local destination → one writer" dedup (WS-4). An
   // invalid filename/subfolder is REJECTED here (by resolveDownloadTarget), up
   // front, exactly as the write would reject it.
-  const reqKey = requestDownloadKey(url, targetSubfolder, filename);
+  const reqKey = requestDownloadKey(url, targetSubfolder, filename, auth);
   let destKey: string | undefined;
+  // The key jobs SERIALIZE on (#467 P1-C) — the physical destination, AUTH-FREE and
+  // normalized for case-insensitive filesystems, so two different-auth (or
+  // different-cased) requests to the same file run one-at-a-time and each callback
+  // sees its own bytes. LOCAL: the resolved on-disk targetPath. REMOTE: a canonical
+  // "remote:<subfolder>/<name>" — the Manager writes ONE server-side file per
+  // (subfolder, name), so overlapping different-auth dispatches to it are serialized
+  // too (the local callback race is inherently local, but this keeps the server
+  // write single-writer and the last-started result deterministic).
+  let serializeKey: string;
   if (!dispatchToManager) {
     const target = await resolveDownloadTarget(url, targetSubfolder, filename);
-    destKey = downloadJobIdFor(target.targetPath);
+    // Fold auth into the destination key too (#467 P1-A): two concurrent calls to
+    // the SAME on-disk destination with DIFFERENT auth are DIFFERENT downloads
+    // (different representations) and must NOT dedup to one writer/one job.
+    destKey = downloadJobIdFor(`${target.targetPath}\n${authIdentity(auth)}`);
+    serializeKey = await localSerializeKey(target.targetPath);
+  } else {
+    serializeKey = remoteSerializeKey(url, targetSubfolder, filename);
   }
   // The PUBLIC id (download_status handle): the destination key when we have one
   // (so distinct destinations are separately pollable), else the request key.
@@ -241,10 +367,23 @@ export async function startDownloadJob(
     started_at: Date.now(),
   };
 
+  // Serialize behind any in-flight job writing the SAME destination (#467 P1-C) so
+  // this job's download+materialize+onComplete run without a concurrent different-
+  // auth writer swapping the destination out from under its callback.
+  const priorSameDest = destChains.get(serializeKey);
+
   // The promise is stored, never left dangling — an unhandled rejection here
   // would take down the process on a simple 404.
-  const settled = downloadModel(url, targetSubfolder, filename, auth, dispatchToManager)
-    .then(async (path) => {
+  // The physical download reports its resume decision straight onto THIS job — no
+  // shared keyed map, so it can never be misattributed to another job (#467).
+  const settled = (async () => {
+    // Wait for the prior same-destination job to fully finish (never fail THIS job
+    // because that one errored — swallow its result).
+    if (priorSameDest) await priorSameDest.catch(() => undefined);
+    try {
+      const path = await downloadModel(url, targetSubfolder, filename, auth, dispatchToManager, (d) => {
+        job.resume = d;
+      });
       job.path = path;
       if (onComplete) {
         // Post-processing must not turn a landed file into a failed download —
@@ -260,12 +399,19 @@ export async function startDownloadJob(
       }
       job.status = "done";
       job.finished_at = Date.now();
-    })
-    .catch((err: unknown) => {
+    } catch (err: unknown) {
       job.status = "error";
       job.error = err instanceof Error ? err.message : String(err);
       job.finished_at = Date.now();
-    });
+    }
+  })();
+
+  // Make THIS job the tail of its destination's serialization chain, and prune the
+  // chain entry once it's the last one to settle (bounded map).
+  destChains.set(serializeKey, settled);
+  void settled.finally(() => {
+    if (destChains.get(serializeKey) === settled) destChains.delete(serializeKey);
+  });
 
   // Index under EVERY key (deduped) so any of them adopts this one writer. Uses the
   // entry-scoped registerKey guard so a fresh registration can never overwrite a row
@@ -297,4 +443,5 @@ export function listDownloadJobs(): DownloadJob[] {
 /** Test seam — the registry is process-global otherwise. */
 export function resetDownloadJobs(): void {
   jobs.clear();
+  destChains.clear();
 }
