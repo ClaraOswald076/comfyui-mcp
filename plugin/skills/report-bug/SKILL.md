@@ -158,7 +158,7 @@ Then file it (no need to ask):
   # the exact GitHub issue shape. EXACTLY ONE outcome: real url → filed;
   # anything else (non-2xx/timeout/unreachable, ok!=true, status:"error",
   # missing/invalid url, invalid JSON) → prefilled report_issue fallback.
-  if ! printf '%s' "$RESP" | jq -e . >/dev/null 2>&1; then
+  if ! printf '%s' "$RESP" | jq -e -s 'length == 1' >/dev/null 2>&1; then
     echo "worker did not return valid JSON — fall back to the report_issue tool for a prefilled GitHub link"
   else
     URL=$(printf '%s' "$RESP" | jq -r \
