@@ -2,7 +2,7 @@ import { z } from "zod";
 import { readFileSync } from "node:fs";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { errorToToolResult } from "../utils/errors.js";
-import { getComfyUIApiHost, getComfyUIProtocol } from "../config.js";
+import { getComfyUIBaseUrl, getComfyUIAuthHeaders } from "../config.js";
 import { getObjectInfo } from "../comfyui/client.js";
 import { convertUiToApi, isApiFormat, isUiFormat } from "../services/workflow-converter.js";
 import { enumeratePacks, resolvePackWorkflowFile } from "./skills-access.js";
@@ -317,14 +317,69 @@ export function templateGraphToApi(
   return null;
 }
 
+/** A single template entry located in the /api/workflow_templates index. */
+export interface TemplateIndexMatch {
+  module: string;
+  name: string;
+}
+
+/**
+ * Resolve a template query against the /api/workflow_templates index — the SAME
+ * index list_workflow_templates returns. Pure + offline so it is unit-testable
+ * independent of the live server.
+ *
+ * The query may be a bare template name ("i2mv_sdxl_ldm_view_selector") OR a
+ * source-qualified id ("ComfyUI-MVAdapter/i2mv_sdxl_ldm_view_selector") — the
+ * qualified form (module/name, matching how list_workflow_templates groups
+ * entries) disambiguates when the same name is provided by multiple modules.
+ */
+export function resolveTemplateFromIndex(
+  index: Record<string, unknown>,
+  query: string,
+):
+  | { match: TemplateIndexMatch }
+  | { error: "not-found"; all: string[] }
+  | { error: "ambiguous"; candidates: TemplateIndexMatch[] } {
+  // A source-qualified id splits on the FIRST slash into module + name. Module
+  // names don't contain slashes; template names in practice don't either, but
+  // splitting on the first slash keeps the (module) prefix authoritative.
+  const slash = query.indexOf("/");
+  const qModule = slash > 0 ? query.slice(0, slash) : null;
+  const qName = slash > 0 ? query.slice(slash + 1) : query;
+
+  const all: string[] = [];
+  const matches: TemplateIndexMatch[] = [];
+  for (const [mod, names] of Object.entries(index)) {
+    if (!Array.isArray(names)) continue;
+    for (const n of names) {
+      const nm = typeof n === "string" ? n : (n as { name?: string })?.name;
+      if (typeof nm !== "string") continue;
+      all.push(`${mod}/${nm}`);
+      if (nm === qName && (qModule == null || mod === qModule)) {
+        matches.push({ module: mod, name: nm });
+      }
+    }
+  }
+  if (matches.length === 0) return { error: "not-found", all };
+  if (matches.length > 1) return { error: "ambiguous", candidates: matches };
+  return { match: matches[0] };
+}
+
 /** Fetch an official workflow template's graph from the live ComfyUI. */
 async function loadServerTemplate(
   name: string,
 ): Promise<{ graph: unknown; source: string } | { error: string; available: string[] }> {
-  const base = `${getComfyUIProtocol()}://${getComfyUIApiHost()}`;
+  // Use the SAME canonical base URL + auth headers as the connected ComfyUI
+  // client (getObjectInfo/getClient). A bare protocol://host:port fetch drops
+  // the reverse-proxy base path and any gateway auth headers, so a proxied or
+  // authed remote that list_workflow_templates (now) reaches would otherwise
+  // look "unreachable" here — the inconsistency this issue reported.
+  const base = getComfyUIBaseUrl();
+  const authHeaders = getComfyUIAuthHeaders();
   let index: Record<string, unknown> = {};
   try {
     const res = await fetch(`${base}/api/workflow_templates`, {
+      headers: authHeaders,
       signal: AbortSignal.timeout(8000),
     });
     if (res.ok) index = (await res.json()) as Record<string, unknown>;
@@ -334,29 +389,27 @@ async function loadServerTemplate(
       available: [],
     };
   }
-  const all: string[] = [];
-  let module: string | null = null;
-  for (const [mod, names] of Object.entries(index)) {
-    if (!Array.isArray(names)) continue;
-    for (const n of names) {
-      const nm = typeof n === "string" ? n : (n as { name?: string })?.name;
-      if (typeof nm !== "string") continue;
-      all.push(nm);
-      if (nm === name && module == null) module = mod;
+
+  const resolved = resolveTemplateFromIndex(index, name);
+  if ("error" in resolved) {
+    if (resolved.error === "ambiguous") {
+      return {
+        error: `Template name "${name}" is provided by multiple sources — qualify it as "<module>/${name}".`,
+        available: resolved.candidates.map((c) => `${c.module}/${c.name}`),
+      };
     }
-  }
-  if (module == null) {
     const needle = name.toLowerCase();
-    const near = all.filter((n) => n.toLowerCase().includes(needle)).slice(0, 10);
+    const near = resolved.all.filter((n) => n.toLowerCase().includes(needle)).slice(0, 10);
     return {
       error: `No official workflow template named "${name}".`,
-      available: near.length ? near : all.slice(0, 20),
+      available: near.length ? near : resolved.all.slice(0, 20),
     };
   }
+  const { module, name: tmpl } = resolved.match;
   // Core templates ship in the comfyui-workflow-templates package served under
   // /templates/; custom-node templates under /api/workflow_templates/<module>/
   // (older servers: /extensions/<module>/example_workflows/). Try in order.
-  const enc = encodeURIComponent(name);
+  const enc = encodeURIComponent(tmpl);
   const candidates = [
     `${base}/templates/${enc}.json`,
     `${base}/api/workflow_templates/${encodeURIComponent(module)}/${enc}.json`,
@@ -364,7 +417,7 @@ async function loadServerTemplate(
   ];
   for (const url of candidates) {
     try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+      const res = await fetch(url, { headers: authHeaders, signal: AbortSignal.timeout(8000) });
       if (!res.ok) continue;
       return { graph: await res.json(), source: `server-template:${module}` };
     } catch {
@@ -372,7 +425,7 @@ async function loadServerTemplate(
     }
   }
   return {
-    error: `Template "${name}" is indexed (module "${module}") but its workflow JSON could not be fetched from the server.`,
+    error: `Template "${tmpl}" is indexed (module "${module}") but its workflow JSON could not be fetched from the server.`,
     available: [],
   };
 }
