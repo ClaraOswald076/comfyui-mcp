@@ -6,6 +6,18 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.12] - 2026-07-30
+
+### MCP
+
+#### Fixed
+- comfy_cli_models download uses a 120s IDLE/liveness timeout (progress resets the clock) instead of a fixed 60s wall-clock, so a long-but-live download isn't killed while a truly stalled one still times out (as a distinct idle_timeout error) (#417)
+- convertUiToApi keeps a declared asset value (unet/ckpt/vae/lora/model_path) and warns instead of silently swapping it for the first installed model when it's not present on the server — so e.g. Krea 2's krea2_turbo_fp8 no longer becomes flux-2-klein-9b; plain enum combos still fall back (#407)
+- download resume hardened (#343 edges): ETag/If-Range-gated resume, strict full Content-Range validation, failure-atomic sidecar handling, plus S3/Azure Content-Length truncation checks and 0-byte cache-hit recovery (#343)
+- built-in ace_step_15 audio template updated to the current comfy_extras nodes_ace schema (unet_name, full TextEncodeAceStepAudio required inputs, SaveAudioMP3 quality) (#448)
+- restart_comfyui/port detection: detect ComfyUI liveness via the reachable server (answered /system_stats) and parse netstat locale-independently, instead of falsely reporting "no process on port" (#449)
+
+
 ## [0.48.11] - 2026-07-30
 
 ### MCP
