@@ -316,3 +316,143 @@ describe("convertUiToApi — serialized-widget nodes (has_serialized_properties)
     expect(inputs.frame_rate).not.toBe(24);
   });
 });
+
+describe("convertUiToApi — asset-combo fallback (issue #407)", () => {
+  // Real Krea 2 manual-pack shape: node 54 is a UNETLoader whose saved
+  // unet_name is the advertised Krea Turbo model, but the CONNECTED server only
+  // has flux-2-klein installed. object_info's combo therefore lists the wrong
+  // files. Previously comboOpts[0] silently rewrote unet_name to the first
+  // installed model, producing a misleading "success".
+  const KREA_INFO = {
+    UNETLoader: {
+      input: {
+        required: {
+          unet_name: [
+            ["flux-2-klein-9b.safetensors", "some-other-unet.safetensors"],
+          ],
+          weight_dtype: [["default", "fp8_e4m3fn"]],
+        },
+      },
+    },
+    KSampler: {
+      input: {
+        required: {
+          model: ["MODEL"],
+          sampler_name: [["euler", "dpmpp_2m", "heun"]],
+          steps: ["INT"],
+        },
+      },
+    },
+  } as never;
+
+  function kreaGraph(unetName: string) {
+    return {
+      nodes: [
+        {
+          id: 54,
+          type: "UNETLoader",
+          mode: 0,
+          inputs: [],
+          outputs: [{ name: "MODEL", type: "MODEL", links: [10] }],
+          widgets_values: [unetName, "fp8_e4m3fn"],
+        },
+        {
+          id: 60,
+          type: "KSampler",
+          mode: 0,
+          inputs: [{ name: "model", type: "MODEL", link: 10 }],
+          outputs: [],
+          // sampler_name "euler" is valid; a stale value must still fall back.
+          widgets_values: ["euler", 20],
+        },
+      ],
+      links: [[10, 54, 0, 60, 0, "MODEL"]],
+    } as never;
+  }
+
+  it("keeps the declared model name when it is not installed, instead of substituting the first installed model", () => {
+    const declared = "krea2_turbo_fp8.safetensors";
+    const { workflow, warnings } = convertUiToApi(kreaGraph(declared), KREA_INFO);
+    // The declared model survives — NOT rewritten to flux-2-klein-9b.
+    expect(workflow["54"].inputs.unet_name).toBe(declared);
+    expect(workflow["54"].inputs.unet_name).not.toBe("flux-2-klein-9b.safetensors");
+    // …and the substitution is flagged so it surfaces as a real missing-asset error.
+    expect(
+      warnings.some(
+        (w) => w.includes("54") && w.includes(declared) && /missing-asset/.test(w),
+      ),
+    ).toBe(true);
+  });
+
+  it("still falls back for a non-asset enum combo (stale UI-helper value)", () => {
+    // A KSampler.sampler_name of a value not in the list is a plain enum, not a
+    // file — the harmless first-option fallback must still apply.
+    const graph = kreaGraph("flux-2-klein-9b.safetensors");
+    graph.nodes[1].widgets_values = ["totally_not_a_sampler", 20];
+    const { workflow } = convertUiToApi(graph, KREA_INFO);
+    expect(workflow["60"].inputs.sampler_name).toBe("euler"); // first option
+  });
+
+  it("does not warn or alter a valid installed model", () => {
+    const { workflow, warnings } = convertUiToApi(
+      kreaGraph("flux-2-klein-9b.safetensors"),
+      KREA_INFO,
+    );
+    expect(workflow["54"].inputs.unet_name).toBe("flux-2-klein-9b.safetensors");
+    expect(warnings.some((w) => /missing-asset/.test(w))).toBe(false);
+  });
+
+  it("keeps the declared value for an EXTENSIONLESS asset combo (DiffusersLoader.model_path)", () => {
+    // DiffusersLoader lists extensionless directory names — no file extension to
+    // key off, so detection must fall back to the asset-widget-name allowlist.
+    const info = {
+      DiffusersLoader: {
+        input: {
+          required: {
+            model_path: [["installed-diffusers-dir", "another-dir"]],
+          },
+        },
+      },
+    } as never;
+    const ui = {
+      nodes: [
+        {
+          id: 1,
+          type: "DiffusersLoader",
+          mode: 0,
+          inputs: [],
+          outputs: [],
+          widgets_values: ["krea-turbo-diffusers"],
+        },
+      ],
+      links: [],
+    } as never;
+    const { workflow, warnings } = convertUiToApi(ui, info);
+    expect(workflow["1"].inputs.model_path).toBe("krea-turbo-diffusers");
+    expect(workflow["1"].inputs.model_path).not.toBe("installed-diffusers-dir");
+    expect(warnings.some((w) => /missing-asset/.test(w))).toBe(true);
+  });
+
+  it("keeps the declared value for a .pt2 checkpoint (extension coverage)", () => {
+    const info = {
+      CheckpointLoaderSimple: {
+        input: { required: { ckpt_name: [["installed.pt2", "other.pt2"]] } },
+      },
+    } as never;
+    const ui = {
+      nodes: [
+        {
+          id: 1,
+          type: "CheckpointLoaderSimple",
+          mode: 0,
+          inputs: [],
+          outputs: [],
+          widgets_values: ["not-installed.pt2"],
+        },
+      ],
+      links: [],
+    } as never;
+    const { workflow } = convertUiToApi(ui, info);
+    expect(workflow["1"].inputs.ckpt_name).toBe("not-installed.pt2");
+  });
+});

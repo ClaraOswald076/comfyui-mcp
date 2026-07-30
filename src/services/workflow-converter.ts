@@ -83,6 +83,49 @@ function isPositionalWidgetSpec(spec: unknown): boolean {
 }
 
 /**
+ * Model/asset file extensions that appear in ComfyUI loader combos
+ * (unet_name, ckpt_name, vae_name, lora_name, control_net_name, clip_name, …).
+ * Used to distinguish an asset-selection combo — where substituting a different
+ * installed file silently swaps the user's model — from a plain enum combo
+ * (sampler_name, a stale "Select to add Wildcard" UI helper) where falling back
+ * to the first option is harmless.
+ */
+const ASSET_FILE_RE =
+  /\.(safetensors|safetensor|sft|ckpt|pt|pt2|pth|bin|gguf|onnx|vae|pkl|npz|yaml)$/i;
+
+function looksLikeAssetFilename(value: unknown): boolean {
+  return typeof value === "string" && ASSET_FILE_RE.test(value.trim());
+}
+
+/**
+ * Widget names that are ALWAYS server-side asset selectors, even when their
+ * options carry no file extension (e.g. DiffusersLoader.model_path lists
+ * extensionless directory names). Substituting a different entry here silently
+ * swaps the user's model, so these must never take the comboOpts[0] fallback.
+ * Deliberately excludes enum-shaped "_name" widgets (sampler_name, scheduler)
+ * whose first-option fallback is legitimate.
+ */
+const ASSET_WIDGET_NAMES = new Set([
+  "ckpt_name",
+  "unet_name",
+  "vae_name",
+  "lora_name",
+  "clip_name",
+  "clip_name1",
+  "clip_name2",
+  "clip_name3",
+  "clip_name4",
+  "control_net_name",
+  "controlnet_name",
+  "style_model_name",
+  "gligen_name",
+  "hypernetwork_name",
+  "clip_vision_name",
+  "model_path",
+  "diffusion_model",
+]);
+
+/**
  * Check if an input has control_after_generate in its spec config.
  * These inputs (like seed, noise_seed) have a phantom "fixed"/"randomize" widget
  * in the UI's widgets_values array that doesn't correspond to any named input.
@@ -1215,13 +1258,38 @@ export function convertUiToApi(
       // value from a node version with different options), fall back to the
       // default first option. ComfyUI hard-rejects "Value not in list" otherwise,
       // so defaulting is strictly safer than passing the stale value through.
+      //
+      // EXCEPTION (issue #407): an ASSET-selection combo (unet_name, ckpt_name,
+      // vae_name, lora_name, …) lists the files installed on the *connected*
+      // server. When the declared model isn't installed there, comboOpts[0] is a
+      // completely unrelated model — e.g. Krea 2's "krea2_turbo_fp8.safetensors"
+      // silently became "flux-2-klein-9b.safetensors" (the first installed unet).
+      // Silently swapping one model for another produces a misleading graph that
+      // can't render the advertised workflow. For asset combos we KEEP the
+      // declared value and warn, so it surfaces as an honest missing-asset error
+      // instead of a wrong-model success.
       const comboOpts = Array.isArray(spec) ? spec[0] : undefined;
       if (
         Array.isArray(comboOpts) &&
         comboOpts.length > 0 &&
         !comboOpts.includes(value as never)
       ) {
-        inputs[name] = comboOpts[0];
+        const isAssetCombo =
+          ASSET_WIDGET_NAMES.has(name) ||
+          looksLikeAssetFilename(value) ||
+          comboOpts.some((opt) => looksLikeAssetFilename(opt));
+        if (isAssetCombo) {
+          warnings.push(
+            `Node ${nodeId} (${classType}): widget "${name}" value "${String(
+              value,
+            )}" is not installed on the connected server — keeping the declared value so it surfaces as a missing-asset error rather than silently substituting "${String(
+              comboOpts[0],
+            )}".`,
+          );
+          // inputs[name] already holds the declared value; leave it untouched.
+        } else {
+          inputs[name] = comboOpts[0];
+        }
       }
 
       const opts = (
