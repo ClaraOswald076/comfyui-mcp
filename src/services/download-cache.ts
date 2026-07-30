@@ -190,6 +190,69 @@ async function writeValidatorSidecar(path: string, value: string): Promise<void>
   }
 }
 
+/** The strongest resume validator a response can offer, preferring Hugging
+ *  Face's content-addressed `X-Linked-Etag` (the LFS/Xet object hash — carried
+ *  on the huggingface.co/resolve 302, NOT on the CAS CDN's final 200) over a
+ *  plain ETag, falling back to Last-Modified. Capturing X-Linked-Etag from the
+ *  redirect is what lets HF Xet downloads persist a sidecar at all (#467): the
+ *  final CAS response returns neither ETag nor Last-Modified, so without this a
+ *  Xet partial could NEVER be safely resumed. */
+function extractValidator(res: Response): string | null {
+  return (
+    res.headers.get("x-linked-etag") ||
+    res.headers.get("etag") ||
+    res.headers.get("last-modified")
+  );
+}
+
+/**
+ * Why a resume was (or wasn't) taken on the most recent attempt for a given
+ * source URL. Recorded in-process so `download_status` — which runs in the SAME
+ * MCP server process as the streaming download — can tell the agent/user that a
+ * multi-GB `.partial` was discarded and WHY, instead of a silent full
+ * re-download (#467). Keyed by the tray id (a 16-hex hash of the source URL),
+ * matching DownloadJob.trayId so the status tool can look it up directly.
+ */
+export type ResumeOutcome =
+  | "resumed"
+  | "declined:no-validator"
+  | "declined:etag-changed";
+
+export interface ResumeDiagnostic {
+  outcome: ResumeOutcome;
+  /** Bytes of pre-existing `.partial` discarded on a declined resume (0 when the
+   *  resume was taken). */
+  discardedBytes: number;
+  /** Epoch ms this decision was made. */
+  at: number;
+}
+
+const resumeDiagnostics = new Map<string, ResumeDiagnostic>();
+
+/** Tray id for a source URL — MUST match download-jobs' downloadIdFor so
+ *  download_status can key a diagnostic off the job it already holds. */
+function trayIdForUrl(url: string): string {
+  return createHash("sha256").update(url).digest("hex").slice(0, 16);
+}
+
+function recordResumeDiagnostic(
+  url: string,
+  outcome: ResumeOutcome,
+  discardedBytes: number,
+): void {
+  resumeDiagnostics.set(trayIdForUrl(url), { outcome, discardedBytes, at: Date.now() });
+}
+
+/** Read the last resume decision for a download's tray id (or undefined). */
+export function getResumeDiagnostic(trayId: string): ResumeDiagnostic | undefined {
+  return resumeDiagnostics.get(trayId);
+}
+
+/** Test seam — the diagnostics map is process-global otherwise. */
+export function resetResumeDiagnostics(): void {
+  resumeDiagnostics.clear();
+}
+
 async function streamUrlToFile(
   url: string,
   targetPath: string,
@@ -242,6 +305,10 @@ async function streamUrlToFile(
   // validator — we cannot detect a changed file, so we must NOT append: fall
   // back to a clean restart (Range omitted, the "w" flag truncates the partial).
   let effectiveResume = resumeFromBytes;
+  // Did we actually ask the server to resume (Range + If-Range)? Used after the
+  // response to distinguish a taken resume (206) from an If-Range MISS (200 =
+  // upstream changed) so we can surface WHY the partial was discarded (#467).
+  let requestedResume = false;
   if (resumeFromBytes > 0) {
     const priorValidator = resumable
       ? await readValidatorSidecar(validatorSidecar)
@@ -252,11 +319,31 @@ async function streamUrlToFile(
         Range: `bytes=${resumeFromBytes}-`,
         "If-Range": priorValidator,
       };
+      requestedResume = true;
     } else {
-      // No trustworthy validator → discard the un-verifiable partial state.
+      // No trustworthy validator → discard the un-verifiable partial state. This
+      // is the deliberate #343 safety fallback, but it used to be SILENT: a
+      // multi-GB HF Xet partial (whose CAS CDN sent no ETag/Last-Modified, so no
+      // sidecar was ever written) got thrown away and re-downloaded from 0 with
+      // no log and no signal to the agent (#467). Log it AND record a diagnostic
+      // download_status can surface.
       effectiveResume = 0;
+      logger.warn(
+        `Discarding a ${resumeFromBytes}-byte partial download and restarting from 0: no ` +
+          `ETag/Last-Modified validator was ever persisted for it, so a safe resume can't be ` +
+          `verified (common on Hugging Face's Xet/CAS CDN, which omits both headers on the file ` +
+          `body). This is the safety-first behavior — an unverifiable resume risks a corrupt ` +
+          `file (#343). Future downloads capture the validator from the resolve redirect so they ` +
+          `CAN resume.`,
+        { url: logUrl, discardedBytes: resumeFromBytes },
+      );
+      if (resumable) recordResumeDiagnostic(url, "declined:no-validator", resumeFromBytes);
     }
   }
+  // Captured from the FIRST redirect hop that carries one (HF's resolve 302
+  // carries X-Linked-Etag even though the final CAS 200 carries no validator) —
+  // used as the sidecar fallback so Xet downloads become resumable (#467).
+  let redirectValidator: string | null = null;
   let res: Response;
   for (let redirectCount = 0; ; redirectCount += 1) {
     res = await fetchOrThrow(
@@ -265,6 +352,12 @@ async function streamUrlToFile(
       currentUrl === url ? logUrl : redactUrlForLogs(currentUrl),
     );
     if (res.status < 300 || res.status >= 400) break;
+
+    // Capture a resume validator off the redirect itself. HF's resolve URL 302s
+    // to the CAS CDN and carries X-Linked-Etag (the content-addressed object
+    // hash) on the 302; the final CAS 200 carries NO validator. Without this,
+    // Xet downloads never persisted a sidecar and could never resume (#467).
+    if (!redirectValidator) redirectValidator = extractValidator(res);
 
     if (redirectCount >= MAX_HTTP_REDIRECTS) {
       throw new ModelError(
@@ -307,14 +400,22 @@ async function streamUrlToFile(
         },
       );
     }
-    // Drop request headers (Authorization etc.) when the redirect crosses
-    // origins. HF's resolve URL 302s to a *pre-signed* Xet/CAS URL on a
+    // Drop credential-bearing headers (Authorization etc.) when the redirect
+    // crosses origins. HF's resolve URL 302s to a *pre-signed* Xet/CAS URL on a
     // different host (e.g. cas-bridge.xethub.hf.co) that needs no auth — and
     // forwarding our HF Bearer token to a third-party CDN would leak it. This
-    // matches how huggingface_hub follows the CAS redirect.
+    // matches how huggingface_hub follows the CAS redirect. BUT keep Range /
+    // If-Range: they are not credentials, and the pre-signed CAS URL supports
+    // byte-range requests — dropping them meant a resume's Range never reached
+    // the CDN, so HF Xet resumes always fell back to a full re-download (#467).
     const sameOrigin = new URL(nextUrl).origin === new URL(currentUrl).origin;
     currentUrl = nextUrl;
-    if (!sameOrigin) currentHeaders = {};
+    if (!sameOrigin) {
+      const preserved: Record<string, string> = {};
+      if (currentHeaders.Range) preserved.Range = currentHeaders.Range;
+      if (currentHeaders["If-Range"]) preserved["If-Range"] = currentHeaders["If-Range"];
+      currentHeaders = preserved;
+    }
   }
 
   if (!res.ok) {
@@ -391,10 +492,31 @@ async function streamUrlToFile(
   // begin writing, a truncated partial is already paired with a MATCHING
   // validator. On a 206 append the existing sidecar already matches — leave it.
   if (resumable && !appendMode) {
+    // If we ASKED to resume (had a validator, sent Range+If-Range) but the
+    // server didn't honor it (200, not 206), the upstream file changed — the
+    // If-Range miss — so the partial is being discarded. Surface WHY (#467)
+    // rather than silently restarting.
+    if (requestedResume) {
+      logger.warn(
+        `Discarding a ${resumeFromBytes}-byte partial download and restarting from 0: the server ` +
+          `answered the If-Range resume request with a full ${res.status} instead of a 206, which ` +
+          `means the upstream file CHANGED since the partial was written. Appending would corrupt ` +
+          `it (#343), so re-downloading in full.`,
+        { url: logUrl, discardedBytes: resumeFromBytes },
+      );
+      recordResumeDiagnostic(url, "declined:etag-changed", resumeFromBytes);
+    }
     await safeRm(validatorSidecar);
     await safeRm(targetPath);
-    const validator = res.headers.get("etag") || res.headers.get("last-modified");
+    // Prefer the final response's validator; fall back to one captured off the
+    // redirect chain (HF Xet: the CAS 200 has none, but the resolve 302 carried
+    // X-Linked-Etag) so the partial written now becomes resumable later (#467).
+    const validator = extractValidator(res) || redirectValidator;
     if (validator) await writeValidatorSidecar(validatorSidecar, validator);
+  } else if (appendMode) {
+    // A resume was actually taken (validated 206 append). Record it so
+    // download_status can report the partial was reused, not discarded (#467).
+    recordResumeDiagnostic(url, "resumed", 0);
   }
 
   const nodeStream = Readable.fromWeb(res.body as import("node:stream/web").ReadableStream);

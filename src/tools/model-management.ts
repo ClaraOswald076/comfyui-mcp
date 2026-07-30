@@ -12,6 +12,7 @@ import {
   type DownloadJob,
 } from "../services/download-jobs.js";
 import { readDownloadProgress } from "../services/download-progress.js";
+import { getResumeDiagnostic } from "../services/download-cache.js";
 import { errorToToolResult, ModelError } from "../utils/errors.js";
 
 /**
@@ -230,7 +231,20 @@ export function registerModelManagementTools(server: McpServer): void {
               : j.status === "error"
                 ? `\n    failed: ${j.error}`
                 : `\n    still streaming — started ${Math.round((Date.now() - j.started_at) / 1000)}s ago`;
-          return `${head}${detail}\n    from: ${j.url}`;
+          // Surface a declined resume so the agent/user knows a pre-existing
+          // .partial was discarded and a full re-download is under way, and why
+          // — instead of it being silent (#467).
+          const diag = getResumeDiagnostic(j.trayId);
+          let resumeNote = "";
+          if (diag && diag.outcome !== "resumed") {
+            const gb = (diag.discardedBytes / 1024 ** 3).toFixed(2);
+            const why =
+              diag.outcome === "declined:no-validator"
+                ? "the host sent no ETag/Last-Modified validator to verify a safe resume (common on Hugging Face's Xet/CAS CDN)"
+                : "the upstream file changed since the partial was written (If-Range miss), so appending would corrupt it";
+            resumeNote = `\n    resume: ${diag.outcome} — discarded ${gb} GB of a prior .partial and is re-downloading in full because ${why}`;
+          }
+          return `${head}${detail}${resumeNote}\n    from: ${j.url}`;
         });
 
         return { content: [{ type: "text", text: `## Downloads\n\n${lines.join("\n")}` }] };

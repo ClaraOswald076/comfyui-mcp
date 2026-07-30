@@ -19,8 +19,19 @@ vi.mock("../../config.js", () => {
 });
 
 import { config } from "../../config.js";
-import { downloadCacheFs } from "../../services/download-cache.js";
+import {
+  downloadCacheFs,
+  getResumeDiagnostic,
+  resetResumeDiagnostics,
+} from "../../services/download-cache.js";
 import { downloadModel } from "../../services/model-resolver.js";
+
+/** Tray id for a URL — mirrors download-jobs' downloadIdFor / the cache's
+ *  trayIdForUrl, so a test can look up the resume diagnostic (#467). */
+async function trayIdFor(url: string): Promise<string> {
+  const { createHash } = await import("node:crypto");
+  return createHash("sha256").update(url).digest("hex").slice(0, 16);
+}
 
 const fetchMock = vi.fn();
 let tempDir: string;
@@ -42,6 +53,7 @@ beforeEach(async () => {
   config.civitaiApiToken = undefined;
   vi.stubGlobal("fetch", fetchMock);
   fetchMock.mockReset();
+  resetResumeDiagnostics();
 });
 
 afterEach(async () => {
@@ -417,6 +429,122 @@ describe("downloadModel cache", () => {
     expect(init.headers["If-Range"]).toBeUndefined();
     // The stale prefix is discarded — final file is the fresh body, not "AAAA...".
     await expect(readFile(target, "utf-8")).resolves.toBe("FRESHFULLBODY");
+  });
+
+  it("SURFACES a validator-less declined resume instead of silently discarding the partial (#467)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://example.com/models/silentdiscard.safetensors";
+    const { partial } = await cachePaths(url);
+    // A 21-byte partial with NO sidecar (the HF Xet case: the CAS CDN sent no
+    // ETag/Last-Modified on the original body, so none was ever written).
+    await writeFile(partial, "STALE_PARTIAL_CONTENT"); // 21 bytes
+
+    fetchMock.mockResolvedValueOnce(okResponse("FRESHFULLBODY"));
+
+    const target = await downloadModel(url, "checkpoints", "silentdiscard-out.safetensors");
+    await expect(readFile(target, "utf-8")).resolves.toBe("FRESHFULLBODY");
+
+    // The discard is no longer silent: a diagnostic records WHY and HOW MUCH.
+    const diag = getResumeDiagnostic(await trayIdFor(url));
+    expect(diag?.outcome).toBe("declined:no-validator");
+    expect(diag?.discardedBytes).toBe(21);
+  });
+
+  it("persists a validator from the HF resolve REDIRECT (X-Linked-Etag) so a Xet partial becomes resumable (#467)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://huggingface.co/org/repo/resolve/main/big.safetensors";
+    const { partial, sidecar } = await cachePaths(url);
+
+    // Hop 1: resolve URL 302s cross-origin to the CAS CDN, carrying the
+    // content-addressed X-Linked-Etag (but no plain ETag).
+    fetchMock.mockResolvedValueOnce(
+      new Response(null, {
+        status: 302,
+        headers: {
+          location: "https://cas-bridge.xethub.hf.co/xet-bridge-us/obj?sig=abc",
+          "x-linked-etag": '"xet-content-hash-v1"',
+        },
+      }),
+    );
+    // Hop 2: the CAS CDN serves the body with NEITHER ETag NOR Last-Modified,
+    // and the stream ends early (truncated) so the partial + sidecar survive.
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) { c.enqueue(new TextEncoder().encode("half")); c.close(); },
+    });
+    fetchMock.mockResolvedValueOnce(
+      new Response(stream, {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-length": "1000" },
+      }),
+    );
+
+    await expect(
+      downloadModel(url, "diffusion_models", "big-out.safetensors"),
+    ).rejects.toThrow(/truncat/i);
+
+    // Previously NO sidecar was written (final CAS 200 has no validator) so the
+    // partial could never resume. Now the redirect's X-Linked-Etag is captured.
+    await expect(stat(partial)).resolves.toBeTruthy();
+    await expect(readFile(sidecar, "utf-8")).resolves.toBe('"xet-content-hash-v1"');
+  });
+
+  it("forwards Range across a cross-origin CAS redirect and APPENDS a 206 (HF Xet resume) (#467)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://huggingface.co/org/repo/resolve/main/resume-xet.safetensors";
+    const { partial, sidecar } = await cachePaths(url);
+    await writeFile(partial, "AAAA"); // 4 bytes already downloaded
+    await writeFile(sidecar, '"xet-content-hash-v1"');
+
+    // Hop 1: resolve URL 302s cross-origin (If-Range unchanged → range honored).
+    fetchMock.mockResolvedValueOnce(
+      new Response(null, {
+        status: 302,
+        headers: { location: "https://cas-bridge.xethub.hf.co/xet-bridge-us/obj?sig=abc" },
+      }),
+    );
+    // Hop 2: the CAS CDN honors the byte range and returns a 206.
+    fetchMock.mockResolvedValueOnce(
+      new Response("BBBB", {
+        status: 206,
+        statusText: "Partial Content",
+        headers: { "content-range": "bytes 4-7/8" },
+      }),
+    );
+
+    const target = await downloadModel(url, "diffusion_models", "resume-xet-out.safetensors");
+
+    // Hop 1 (resolve) carried Range + If-Range...
+    const [, firstInit] = fetchMock.mock.calls[0] as [string, { headers: Record<string, string> }];
+    expect(firstInit.headers.Range).toBe("bytes=4-");
+    expect(firstInit.headers["If-Range"]).toBe('"xet-content-hash-v1"');
+    // ...and CRUCIALLY the cross-origin CAS hop STILL carried Range (previously
+    // dropped with all headers → resume was impossible on Xet).
+    const [casUrl, secondInit] = fetchMock.mock.calls[1] as [string, { headers: Record<string, string> }];
+    expect(casUrl).toContain("cas-bridge.xethub.hf.co");
+    expect(secondInit.headers.Range).toBe("bytes=4-");
+    // The bytes were appended, not re-downloaded from 0.
+    await expect(readFile(target, "utf-8")).resolves.toBe("AAAABBBB");
+    expect(getResumeDiagnostic(await trayIdFor(url))?.outcome).toBe("resumed");
+  });
+
+  it("declines + SURFACES a changed-upstream resume (If-Range miss, 200) — safety preserved (#467/#343)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://example.com/models/changed-surfaced.safetensors";
+    const { partial, sidecar } = await cachePaths(url);
+    await writeFile(partial, "AAAA"); // 4 bytes
+    await writeFile(sidecar, '"etag-old"');
+
+    // Upstream changed → If-Range miss → server sends full 200, not a 206.
+    fetchMock.mockResolvedValueOnce(okResponse("BRANDNEWBODY"));
+
+    const target = await downloadModel(url, "checkpoints", "changed-surfaced-out.safetensors");
+    // Overwritten with the fresh body — safety preserved, no corrupt append.
+    await expect(readFile(target, "utf-8")).resolves.toBe("BRANDNEWBODY");
+
+    const diag = getResumeDiagnostic(await trayIdFor(url));
+    expect(diag?.outcome).toBe("declined:etag-changed");
+    expect(diag?.discardedBytes).toBe(4);
   });
 
   it("persists the validator sidecar on a fresh write so a later resume can guard with If-Range (#343 edge)", async () => {
