@@ -42,7 +42,7 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import { logger } from "../utils/logger.js";
-import { errorText, promptText } from "./error-text.js";
+import { errorText, messageText, promptText } from "./error-text.js";
 import { buildAgentSpawnEnv } from "../services/panel-secrets.js";
 import {
   type AgentBackend,
@@ -1057,6 +1057,10 @@ export class CodexBackend implements AgentBackend {
     let streamOpen = false;
     let streamKind: "text" | "thinking" | null = null;
     let interrupted = false;
+    // Accumulate the streamed reply text so a malformed final commit (structured
+    // `agentMessage.text` coercing to empty/"[object Object]") can fall back to the
+    // text the user already saw stream in, instead of clobbering it (#421, #422).
+    let assistantTextBuffer = "";
 
     const openStream = (id: string | null, kind: "text" | "thinking") => {
       if (streamOpen && streamKind === kind) return;
@@ -1110,6 +1114,7 @@ export class CodexBackend implements AgentBackend {
           const itemId = params.itemId as string | undefined;
           if (typeof delta === "string" && delta) {
             openStream(itemId ?? null, "text");
+            assistantTextBuffer += delta;
             push({ type: "assistant_delta", text: delta });
           }
           break;
@@ -1147,7 +1152,14 @@ export class CodexBackend implements AgentBackend {
           const itemType = item?.type as string | undefined;
           closeStream();
           if (itemType === "agentMessage") {
-            const text = ((item?.text as string | undefined) ?? "").trim();
+            // `item.text` is normally a string, but newer app-server builds can
+            // send structured content (arrays/objects) that String()-coerces to
+            // "[object Object]". Route it through the shared serializer, and if it
+            // still yields nothing readable, fall back to the streamed text the
+            // user already saw rather than committing an empty/garbage bubble that
+            // overwrites the good reply (#421, #422).
+            const committed = messageText(item?.text).trim();
+            const text = committed || assistantTextBuffer.trim();
             const id = item?.id as string | undefined;
             push({
               type: "assistant",
@@ -1155,6 +1167,9 @@ export class CodexBackend implements AgentBackend {
               ...(id ? { id } : {}),
               // No per-turn rewind anchor for Codex (forkAtAnchor=false) — omit uuid.
             });
+            // Reset for a possible next agentMessage in the same turn so its
+            // fallback can't inherit this one's streamed text.
+            assistantTextBuffer = "";
           } else {
             const name = toolNameOf(item);
             if (name) push({ type: "tool_call", name, phase: "end", detail: item });

@@ -91,3 +91,71 @@ export function promptText(value: unknown): string {
     return "";
   }
 }
+
+/**
+ * Coerce an assistant/agent-message payload into readable display text.
+ *
+ * A provider's run-finished commit (e.g. Codex app-server `item/completed` for an
+ * `agentMessage`) is normally `{ text: "…" }` with a string `text`, but newer
+ * structured content can nest the reply as an array of parts or an object under
+ * `text` / `content` / `value` / `output_text` / `message`. Blindly coercing that
+ * with `String()` yields the literal "[object Object]", which then OVERWRITES the
+ * already-streamed reply in the sidebar (#421, #422 — the orchestrator-side
+ * sibling of the WS-9 panel cluster).
+ *
+ * Recursively extract the first readable string, joining array parts. Return ""
+ * (never "[object Object]") when nothing readable is found, so callers can detect
+ * the empty/malformed case and fall back to their buffered stream text instead of
+ * clobbering it. Every property read runs inside try/catch — a value may be a
+ * Proxy or carry a throwing getter, and normalization must never itself throw.
+ */
+export function messageText(value: unknown): string {
+  return coerceMessageText(value, 0);
+}
+
+const MESSAGE_TEXT_KEYS = ["text", "content", "value", "output_text", "message"] as const;
+
+function coerceMessageText(value: unknown, depth: number): string {
+  if (typeof value === "string") {
+    // Judge EMPTINESS on the trimmed form: whitespace-only text and a padded
+    // sentinel (e.g. " [object Object] ") are both non-content and must fall
+    // through so a real sibling key (content/value/…) or the streamed fallback
+    // wins — but return the ORIGINAL string (preserving spacing) for genuine text.
+    const trimmed = value.trim();
+    if (trimmed === "" || trimmed === "[object Object]") return "";
+    return value;
+  }
+  if (value == null) return "";
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (depth > 6) return ""; // defend against adversarial / cyclic nesting
+  // Wrap ALL structural inspection (Array.isArray + every property read) in one
+  // try/catch: a revoked/hostile Proxy can throw on the type check itself, and
+  // normalization must degrade to "" rather than propagate the throw.
+  try {
+    if (Array.isArray(value)) {
+      const parts: string[] = [];
+      for (const part of value) {
+        const t = coerceMessageText(part, depth + 1);
+        if (t) parts.push(t);
+      }
+      return parts.join("");
+    }
+    if (typeof value === "object") {
+      for (const key of MESSAGE_TEXT_KEYS) {
+        let inner: unknown;
+        try {
+          inner = (value as Record<string, unknown>)[key];
+        } catch {
+          continue; // throwing getter/proxy on this key — try the next candidate
+        }
+        if (inner == null) continue;
+        const t = coerceMessageText(inner, depth + 1);
+        if (t) return t;
+      }
+      return "";
+    }
+  } catch {
+    return ""; // revoked Proxy / hostile trap — never propagate
+  }
+  return "";
+}
