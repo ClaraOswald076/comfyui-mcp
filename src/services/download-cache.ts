@@ -967,7 +967,13 @@ async function materializeCacheFile(
     await downloadCacheFs.link(cachePath, tmp);
     mode = "hardlink";
   } catch {
-    await downloadCacheFs.copyFile(cachePath, tmp);
+    try {
+      await downloadCacheFs.copyFile(cachePath, tmp);
+    } catch (e) {
+      // A partial copy could linger — clean the temp before propagating.
+      await downloadCacheFs.rm(tmp, { force: true }).catch(() => undefined);
+      throw e;
+    }
     mode = "copy";
   }
   try {
@@ -1057,14 +1063,34 @@ export async function downloadWithCache(
       url: logUrl,
       error: err instanceof Error ? err.message : String(err),
     });
-    await downloadUrlToFile(
-      options.url,
-      options.targetPath,
-      options.headers,
-      logUrl,
-      options.storageAuth,
-      options.progress,
-    );
+    // Write to a UNIQUE temp then rename over the destination — NEVER stream "w"
+    // directly at targetPath (#467). If a concurrent materialize already hardlinked
+    // targetPath to a cache inode, a direct "w" open would follow that hardlink and
+    // overwrite the OTHER representation's cache entry with these bytes (poison).
+    // A fresh temp is its own inode, and rename only swaps the directory entry — so
+    // cache inodes stay intact and a failed stream leaves the destination untouched.
+    const tmp = `${options.targetPath}.dl-${process.pid}-${materializeSeq++}.tmp`;
+    try {
+      await downloadUrlToFile(
+        options.url,
+        tmp,
+        options.headers,
+        logUrl,
+        options.storageAuth,
+        options.progress,
+      );
+      try {
+        await downloadCacheFs.rename(tmp, options.targetPath);
+      } catch {
+        // Windows can EPERM renaming over an existing/hardlinked target — remove it
+        // (breaking any cache hardlink WITHOUT writing through it) and retry.
+        await downloadCacheFs.rm(options.targetPath, { force: true }).catch(() => undefined);
+        await downloadCacheFs.rename(tmp, options.targetPath);
+      }
+    } catch (e) {
+      await downloadCacheFs.rm(tmp, { force: true }).catch(() => undefined);
+      throw e;
+    }
     return { targetPath: options.targetPath, usedCache: false };
   }
 }

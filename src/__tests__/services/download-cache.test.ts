@@ -967,6 +967,47 @@ describe("downloadModel cache", () => {
     expect(leftovers).toHaveLength(0);
   });
 
+  it("direct-fallback (materialize failed) does NOT write through a destination hardlink into a cache inode (#467)", async () => {
+    const { downloadWithCache } = await import("../../services/download-cache.js");
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    await fsPromises.mkdir(comfyDir, { recursive: true });
+
+    // A pre-existing WINNER cache entry, with the destination HARDLINKED to it (as a
+    // concurrent successful materialize would leave it).
+    const winnerCache = join(cacheDir, "winner.safetensors");
+    await writeFile(winnerCache, "WINNER-BYTES");
+    const dest = join(comfyDir, "same.safetensors");
+    await fsPromises.link(winnerCache, dest); // dest shares WINNER's inode
+
+    // Force materialize to fail at its link/copy stage — BEFORE it touches dest — so
+    // downloadWithCache takes the DIRECT fallback while dest is STILL hardlinked to
+    // the winner's cache inode (the poison window). link/copyFile are used ONLY by
+    // materializeCacheFile, so this doesn't disturb the cache write.
+    const linkSpy = vi
+      .spyOn(downloadCacheFs, "link")
+      .mockRejectedValue(Object.assign(new Error("EXDEV"), { code: "EXDEV" }));
+    const copySpy = vi
+      .spyOn(downloadCacheFs, "copyFile")
+      .mockRejectedValue(Object.assign(new Error("EIO"), { code: "EIO" }));
+
+    const url = "https://example.com/models/fallback-poison.safetensors";
+    // Fresh Response per call (cache-write fetch + fallback fetch) — a body streams once.
+    fetchMock.mockImplementation(() => Promise.resolve(okResponse("LOSER-FRESH-BYTES")));
+
+    await downloadWithCache({ url, headers: {}, targetPath: dest });
+
+    // The WINNER cache inode must be UNTOUCHED — the fallback wrote a fresh temp and
+    // renamed over dest, never streaming "w" THROUGH dest's hardlink into the inode.
+    await expect(readFile(winnerCache, "utf-8")).resolves.toBe("WINNER-BYTES");
+    // The destination now holds the fallback's freshly-downloaded bytes.
+    await expect(readFile(dest, "utf-8")).resolves.toBe("LOSER-FRESH-BYTES");
+    // No leftover fallback/materialize temp files.
+    const leftovers = (await readdir(comfyDir)).filter((f) => f.includes(".dl-") || f.includes(".mat-"));
+    expect(leftovers).toHaveLength(0);
+    linkSpy.mockRestore();
+    copySpy.mockRestore();
+  });
+
   it("does NOT serve a LEGACY bare-URL cache entry to an unauthenticated caller — no cross-auth leak (#467 P1-C)", async () => {
     await fsPromises.mkdir(cacheDir, { recursive: true });
     await fsPromises.mkdir(comfyDir, { recursive: true });
