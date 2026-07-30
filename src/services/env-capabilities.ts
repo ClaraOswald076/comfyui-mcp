@@ -326,17 +326,31 @@ export function resolveComfyuiPython(
 ): { python: string | undefined; verified: boolean } {
   const names = IS_WIN ? ["python.exe", "python"] : ["python3", "python"];
   const roots: string[] = [];
-  // Prefer the explicit COMFYUI_PATH, else the effective local base (saved default
-  // workspace) resolved exactly like every other filesystem-backed tool (#418).
-  const base = comfyuiPath ?? resolveEffectiveComfyUIBase();
-  if (base) roots.push(base);
-  // Infer the install root from the running server's argv (…/main.py).
+  // The LIVE running instance is the source of truth: resolve the interpreter from
+  // the running server's own argv (…/main.py) FIRST, so we verify the python that
+  // is ACTUALLY running ComfyUI — not merely the first venv found under a persisted
+  // default workspace, which may be a different install (a false negative there
+  // survives reconciliation, and process-control could relaunch the live server
+  // with the wrong python). See #401 / PR #433 review.
+  let hasLiveArgvRoot = false;
   if (Array.isArray(statsArgv)) {
     const mainPy = statsArgv.find((a) => typeof a === "string" && /main\.py$/i.test(a));
     if (mainPy) {
       const root = mainPy.replace(/[\\/]+main\.py$/i, "");
-      if (root && !roots.includes(root)) roots.push(root);
+      if (root) {
+        roots.push(root);
+        hasLiveArgvRoot = true;
+      }
     }
+  }
+  // Explicit COMFYUI_PATH (user-pinned install) next.
+  if (comfyuiPath && !roots.includes(comfyuiPath)) roots.push(comfyuiPath);
+  // The saved DEFAULT workspace (#418) is only a last-resort guess — consult it
+  // ONLY when we have neither a live argv NOR an explicit COMFYUI_PATH to trust.
+  // Otherwise a stale default could shadow the running server's interpreter.
+  if (!hasLiveArgvRoot && !comfyuiPath) {
+    const saved = resolveEffectiveComfyUIBase();
+    if (saved && !roots.includes(saved)) roots.push(saved);
   }
 
   const candidates: string[] = [];

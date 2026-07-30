@@ -219,6 +219,32 @@ describe("resolveComfyuiPython (#401)", () => {
     expect(res.verified).toBe(false);
     expect(res.python).toBe(IS_WIN ? "python.exe" : "python3");
   });
+
+  it("prefers the LIVE running instance's argv root over a pinned/saved workspace (PR #433 review)", async () => {
+    // Both installs exist with a venv on the same Python major.minor, but only the
+    // LIVE server (root B, from argv main.py) has the package. If we resolved the
+    // pinned/saved root A first, A's negative would survive as a false 'not-installed'
+    // AND process-control could relaunch B's main.py with A's python. The live argv
+    // root must win.
+    const mkVenv = async (root: string): Promise<string> => {
+      const bin = IS_WIN ? join(root, ".venv", "Scripts") : join(root, ".venv", "bin");
+      await mkdir(bin, { recursive: true });
+      const exe = join(bin, IS_WIN ? "python.exe" : "python3");
+      await writeFile(exe, "", "utf-8");
+      return exe;
+    };
+    const rootA = join(dir, "A"); // pinned COMFYUI_PATH / saved default
+    const rootB = join(dir, "B"); // the LIVE running server
+    await mkVenv(rootA);
+    const exeB = await mkVenv(rootB);
+
+    const res = resolveComfyuiPython(rootA, [
+      IS_WIN ? "python.exe" : "python3",
+      join(rootB, "main.py"),
+    ]);
+    expect(res.verified).toBe(true);
+    expect(res.python).toBe(exeB); // B, not A
+  });
 });
 
 describe("reconcileProbeState (#401 — no false 'not installed')", () => {
