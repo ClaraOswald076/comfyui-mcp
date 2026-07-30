@@ -54,17 +54,18 @@ in doubt during beta, file it and move on.
 
 ## Step 2 — Classify whose bug it is
 
-- **OURS** — `comfyui-mcp` (server/tools/orchestrator/agent) or
-  `comfyui-mcp-panel` (the sidebar pack / panel JS / `__init__.py`). → Steps 3–5 (self-heal + Worker/PR).
+- **OURS** — `comfyui-mcp` (server/tools/orchestrator/agent),
+  `comfyui-mcp-panel` (the sidebar pack / panel JS / `__init__.py`), or
+  `comfyui-mcp-issue-worker` (the intake Worker). → Steps 3–5 (self-heal + Worker/PR).
 - **THIRD-PARTY** — a custom node pack, or **ComfyUI core** itself. → Step 6 (their GitHub; our Worker can't file there).
 
 ## Step 3 — Fix it locally FIRST (this is the default, not "when you can")
 
-For any defect in **OUR** repos (`comfyui-mcp` / `comfyui-mcp-panel`), the
-default is to **fix it before/alongside filing** — patch the code **where it
-actually runs** so the user is unblocked immediately and the report arrives as a
-near-PR (code + diff), not just a ticket. Do this every time; don't wait to be
-asked and don't downgrade it to optional.
+For any defect in **OUR** repos (`comfyui-mcp` / `comfyui-mcp-panel` /
+`comfyui-mcp-issue-worker`), the default is to **fix it before/alongside
+filing** — patch the code **where it actually runs** so the user is unblocked
+immediately and the report arrives as a near-PR (code + diff), not just a ticket.
+Do this every time; don't wait to be asked and don't downgrade it to optional.
 
 - `comfyui-mcp`: find the running install from the stack path. If a source
   checkout exists, fix the `.ts` source and `npm run build`; if only the built
@@ -142,13 +143,10 @@ Then file it (no need to ask):
   # 1) Submit. Write the JSON to a temp file first (the body has newlines/quotes).
   # body: { "repo": "comfyui-mcp" | "comfyui-mcp-panel", "title", "body", "labels": ["via-panel"] }
   # --max-time bounds the whole request so a hung connection can't wedge us.
-  if ! RESP=$(curl -fsS --max-time 15 -X POST "$WORKER_URL" \
+  URL=""
+  if RESP=$(curl -fsS --max-time 15 -X POST "$WORKER_URL" \
       -H "Content-Type: application/json" -H "X-Client-Key: $CLIENT_KEY" \
       --data @"$BODY_JSON_FILE"); then
-    # ANY non-OK / unreachable (401, 5xx, timeout, DNS…): fall back to the
-    # report_issue tool for a prefilled GitHub link. Do NOT poll.
-    echo "worker submit failed — falling back to report_issue"
-  else
     URL=$(printf '%s' "$RESP" | sed -n 's/.*"url"[: ]*"\([^"]*\)".*/\1/p')
     # 2) Only poll if the submit lacked a url AND we actually got a job_id.
     if [ -z "$URL" ]; then
@@ -156,22 +154,35 @@ Then file it (no need to ask):
       if [ -n "$JOB_ID" ]; then
         for i in 1 2 3 4 5; do
           sleep 1
+          # A poll curl failure (error/timeout/non-2xx) is NOT success — keep
+          # trying; if we exhaust the loop with no url we fall back below.
           STAT=$(curl -fsS --max-time 10 "$WORKER_URL/status/$JOB_ID") || continue
+          # A done-with-error carries no url and must NOT be treated as filed.
+          printf '%s' "$STAT" | grep -q '"status":"error"' && break
           URL=$(printf '%s' "$STAT" | sed -n 's/.*"url"[: ]*"\([^"]*\)".*/\1/p')
           [ -n "$URL" ] && break
         done
       fi
     fi
-    # 3) PRINT the resulting issue link (inline-fast-path OR polled).
-    [ -n "$URL" ] && echo "filed: $URL" || echo "report accepted; link not yet available"
+  fi
+
+  # 3) EXACTLY ONE outcome. A real issue link → print it. ANYTHING else (submit
+  # failure, poll failure/timeout, done-with-error, or exhausted with no url) →
+  # fall back to the report_issue prefilled URL. NEVER claim accepted/pending
+  # without a real link.
+  if [ -n "$URL" ]; then
+    echo "filed: $URL"
+  else
+    echo "worker did not return an issue link — fall back to the report_issue tool for a prefilled GitHub link"
   fi
   ```
-  A `401 unauthorized` (or any non-2xx / timeout / unreachable) on submit means
-  fall back to `report_issue` for a prefilled link — don't poll with an empty
-  `JOB_ID`. If polling never yields a `url`, the report is still accepted
-  (filing is synchronous server-side); tell the user it's logged and move on.
-  **Surface the issue link to the user only if they want it** — the filing is
-  autonomous, so a one-line "filed #123" is enough (Step 7).
+  Mirror this in behavior: a real `url` (inline fast-path OR polled) is the only
+  "filed" outcome. Any submit failure (`401`/non-2xx/timeout/unreachable), any
+  poll failure, a `status:"error"`, or exhausting the poll with no `url` → fall
+  back to `report_issue` for a prefilled link the user submits in one click; do
+  **not** poll with an empty `JOB_ID` and do **not** tell the user it was
+  accepted without a real issue link. **Surface the link only if they want it** —
+  the filing is autonomous, so a one-line "filed #123" is enough (Step 7).
 - **Fallback** (no `gh`, no Worker URL): use the `report_issue` tool → a prefilled
   GitHub issue link the user can submit in one click.
 
