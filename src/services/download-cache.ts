@@ -92,9 +92,10 @@ async function discardRejectedPayload(
   path: string,
   sidecarPath: string | undefined,
   logUrl: string,
-): Promise<void> {
-  await rmOrTruncate(path, logUrl);
+): Promise<boolean> {
+  const neutralized = await rmOrTruncate(path, logUrl);
   if (sidecarPath) await rmOrTruncate(sidecarPath, logUrl);
+  return neutralized;
 }
 
 /** Drop a tiny "this partial was rejected as a non-model body" MARKER next to a
@@ -140,8 +141,16 @@ async function writeCacheContentType(cacheFilePath: string, contentType: string)
   if (!contentType || !isRejectableContentType(contentType)) return;
   try {
     await writeFile(cacheCtSidecar(cacheFilePath), contentType);
-  } catch {
-    /* best effort — reuse simply falls back to body-magic-only validation */
+  } catch (err) {
+    // Best effort — reuse falls back to body-magic-only validation, which still
+    // catches every well-formed HTML/JSON page (only a synthetic body that sniffs
+    // binary yet carries a text Content-Type would evade). Surface it rather than
+    // swallow so the degraded reuse check is at least visible (#473).
+    logger.warn(
+      `Could not persist the Content-Type for a cached download at "${cacheFilePath}"; ` +
+        `cache-reuse validation falls back to body magic only.`,
+      { error: err instanceof Error ? err.message : String(err) },
+    );
   }
 }
 
@@ -815,7 +824,9 @@ async function streamUrlToFile(
       contentType: "",
       url,
       logUrl,
-      onReject: () => discardRejectedPayload(targetPath, undefined, logUrl),
+      onReject: async () => {
+        await discardRejectedPayload(targetPath, undefined, logUrl);
+      },
       // FAIL CLOSED, same as the HTTP path: a cloud (S3/Azure) object can be an XML/
       // HTML AccessDenied body saved under a `.safetensors` name, and if we CAN'T
       // sniff the completed file (a transient open/read failure) we must NOT finalize
@@ -1811,8 +1822,13 @@ export async function downloadWithCache(
       // miss), and log if even that fails, so a poisoned cache entry can't silently
       // re-poison cache hits (#473 P1).
       onReject: async () => {
-        await discardRejectedPayload(cachePath, undefined, logUrl);
-        await safeRm(cacheCtSidecar(cachePath));
+        const neutralized = await discardRejectedPayload(cachePath, undefined, logUrl);
+        // Only drop the Content-Type sidecar once the poisoned cache file is actually
+        // gone/emptied. If the cache file SURVIVED (rm AND truncate both failed), KEEP
+        // the `.ct` so the NEXT caller can still reject it by its persisted
+        // Content-Type — deleting the evidence would let a Content-Type-only poison be
+        // re-served as a model on a later cache hit (#473 P1).
+        if (neutralized) await safeRm(cacheCtSidecar(cachePath));
       },
     });
     const materializedBy = await materializeCacheFile(cachePath, options.targetPath);
