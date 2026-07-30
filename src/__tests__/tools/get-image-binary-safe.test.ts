@@ -1,0 +1,77 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { ComfyUIError } from "../../utils/errors.js";
+
+// #483: get_image for a valid `type:"input"` image must return the binary
+// bytes as an inline image, and a non-image/empty /view body must yield a
+// structured not-found — never an uncaught "Unexpected end of JSON input"
+// from JSON-parsing a binary response. The binary-safe read + guard live in
+// getOutputImage (service, covered in image-management-traversal.test.ts);
+// this locks the TOOL handler contract on top of it.
+
+const getOutputImageMock = vi.fn();
+vi.mock("../../services/image-management.js", () => ({
+  extractWorkflowFromImage: vi.fn(),
+  listOutputImages: vi.fn(),
+  getOutputImage: (...a: unknown[]) => getOutputImageMock(...a),
+  uploadImageAuto: vi.fn(),
+  uploadVideoAuto: vi.fn(),
+  uploadAudioAuto: vi.fn(),
+  stageOutputAsInput: vi.fn(),
+}));
+
+// Don't actually touch disk when the handler saves the file.
+vi.mock("node:fs/promises", async () => {
+  const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+  return { ...actual, mkdir: vi.fn(async () => undefined), writeFile: vi.fn(async () => undefined) };
+});
+
+import { registerImageManagementTools } from "../../tools/image-management.js";
+
+type ToolResult = { isError?: boolean; content: Array<{ type: string; text?: string; data?: string; mimeType?: string }> };
+type ToolHandler = (args: Record<string, unknown>) => Promise<ToolResult>;
+function getHandler(name: string): ToolHandler {
+  let handler: ToolHandler | undefined;
+  const server = {
+    tool: (n: string, _d: string, _s: unknown, h: ToolHandler) => {
+      if (n === name) handler = h;
+    },
+  };
+  registerImageManagementTools(server as never);
+  if (!handler) throw new Error(`tool ${name} not registered`);
+  return handler;
+}
+
+describe("get_image — binary-safe (#483)", () => {
+  afterEach(() => vi.clearAllMocks());
+
+  it("returns an inline image block for a valid type:input image", async () => {
+    const base64 = Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString("base64");
+    getOutputImageMock.mockResolvedValue({ base64, mimeType: "image/png", filename: "src.png" });
+
+    const out = await getHandler("get_image")({
+      filename: "RogueTD_Ara_Locomotion_Source.png",
+      type: "input",
+      save_dir: "/tmp/x",
+    });
+
+    const image = out.content.find((c) => c.type === "image");
+    expect(image).toBeDefined();
+    expect(image?.data).toBe(base64);
+    expect(image?.mimeType).toBe("image/png");
+  });
+
+  it("returns a structured error (not a JSON-parse crash) for an empty/non-image body", async () => {
+    getOutputImageMock.mockRejectedValue(
+      new ComfyUIError(
+        'ComfyUI /view did not return an image for "x.png" (input); got an empty response.',
+        "IMAGE_NOT_FOUND",
+      ),
+    );
+
+    const out = await getHandler("get_image")({ filename: "x.png", type: "input" });
+    expect(out.isError).toBe(true);
+    const text = out.content.map((c) => c.text ?? "").join("");
+    expect(text).toContain("IMAGE_NOT_FOUND");
+    expect(text).not.toContain("Unexpected end of JSON input");
+  });
+});

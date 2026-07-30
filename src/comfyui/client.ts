@@ -8,7 +8,7 @@ import {
   isRemoteMode,
 } from "../config.js";
 import { logger } from "../utils/logger.js";
-import { ComfyUIError, ConnectionError } from "../utils/errors.js";
+import { ComfyUIError, ConnectionError, WorkflowExecutionError } from "../utils/errors.js";
 import { comfyuiFetch } from "./fetch.js";
 import * as cloudClient from "./cloud-client.js";
 import type { ObjectInfo, SystemStats, QueueStatus } from "./types.js";
@@ -298,39 +298,129 @@ export async function enqueuePrompt(
   opts?: { front?: boolean },
 ): Promise<{ prompt_id: string; queue_remaining?: number }> {
   if (isCloudMode()) return cloudClient.enqueuePrompt(workflow, extraData);
-  const client = getClient();
 
-  // The SDK's _enqueue_prompt does not forward `extra_data`, which is how
-  // comfy.org API-node credentials (api_key_comfy_org / auth_token_comfy_org)
-  // must travel to the server. It also cannot enqueue at the front. When either
-  // is needed, POST /prompt directly.
-  if ((extraData && Object.keys(extraData).length > 0) || opts?.front) {
-    const url = `${getComfyUIBaseUrl()}/prompt`;
-    const res = await comfyuiFetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        prompt: workflow,
-        client_id: "comfyui-mcp",
-        ...(extraData ? { extra_data: extraData } : {}),
-        ...(opts?.front ? { front: true } : {}),
-      }),
-    });
-    if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      throw new ConnectionError(
-        `ComfyUI /prompt returned ${res.status} ${res.statusText}: ${body.slice(0, 500)}`,
-      );
-    }
-    const data = (await res.json()) as { prompt_id: string; number?: number };
-    return { prompt_id: data.prompt_id, queue_remaining: data.number };
+  // POST /prompt directly (rather than the SDK's _enqueue_prompt) for two
+  // reasons: (1) the SDK does not forward `extra_data` — how comfy.org API-node
+  // credentials must travel — nor can it enqueue at the front; and (2) on an
+  // HTTP 400 the SDK throws a generic "Endpoint Bad Request" that discards
+  // ComfyUI's authoritative prompt-validation body (`node_errors`), so callers
+  // never learn which node/input was invalid (#485). Going direct lets us read
+  // and surface that body. `comfyuiFetch` applies the same auth headers the SDK
+  // would (CF Access / COMFYUI_AUTH_*).
+  const url = `${getComfyUIBaseUrl()}/prompt`;
+  const res = await comfyuiFetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      prompt: workflow,
+      client_id: "comfyui-mcp",
+      ...(extraData ? { extra_data: extraData } : {}),
+      ...(opts?.front ? { front: true } : {}),
+    }),
+  });
+  if (!res.ok) {
+    throw await buildEnqueueError(res);
+  }
+  const data = (await res.json()) as { prompt_id: string; number?: number };
+  // NB: `data.number` is ComfyUI's monotonic priority counter (and is NEGATIVE
+  // for front-inserted jobs) — NOT the remaining queue depth. The old SDK path
+  // returned exec_info.queue_remaining; to preserve an accurate count now that
+  // we POST directly, read /queue for the authoritative running+pending total.
+  // Fall back to undefined (never the misleading counter) if that read fails.
+  return { prompt_id: data.prompt_id, queue_remaining: await queueRemainingCount() };
+}
+
+/**
+ * Authoritative "jobs still in the queue" count (running + pending) via a direct
+ * /queue read. Returns undefined if the queue can't be read, so callers never
+ * surface ComfyUI's monotonic `number` counter as a remaining-count. Only
+ * reachable on the local/remote path — enqueuePrompt returns early in cloud mode.
+ */
+async function queueRemainingCount(): Promise<number | undefined> {
+  try {
+    const res = await comfyuiFetch(`${getComfyUIBaseUrl()}/queue`);
+    if (!res.ok) return undefined;
+    const q = (await res.json()) as {
+      queue_running?: unknown[];
+      queue_pending?: unknown[];
+      Running?: unknown[];
+      Pending?: unknown[];
+    };
+    const running = (q.queue_running ?? q.Running ?? []).length;
+    const pending = (q.queue_pending ?? q.Pending ?? []).length;
+    return running + pending;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Turn a non-OK /prompt response into a rich error. On the HTTP 400 that
+ * ComfyUI returns when prompt validation fails, the JSON body carries the
+ * authoritative diagnosis:
+ *   {
+ *     error: { type, message, details, extra_info },
+ *     node_errors: { "<id>": { class_type, errors: [{ message, details, ... }] } }
+ *   }
+ * We format the top-level message plus one line per offending node
+ * (`ClassType (node <id>): <message>`), and stash the raw payload in `details`.
+ * Falls back to the generic HTTP status only when the body is empty or is not
+ * the expected validation JSON (#485).
+ */
+async function buildEnqueueError(res: Response): Promise<ComfyUIError> {
+  const bodyText = await res.text().catch(() => "");
+  const generic = `ComfyUI /prompt returned ${res.status} ${res.statusText}`;
+
+  let parsed: unknown;
+  try {
+    parsed = bodyText ? JSON.parse(bodyText) : undefined;
+  } catch {
+    parsed = undefined;
   }
 
-  const result = await client._enqueue_prompt(workflow);
-  return {
-    prompt_id: result.prompt_id,
-    queue_remaining: result.exec_info?.queue_remaining,
-  };
+  if (parsed && typeof parsed === "object") {
+    const payload = parsed as {
+      error?: { message?: string; details?: string };
+      node_errors?: Record<
+        string,
+        { class_type?: string; errors?: Array<{ message?: string; details?: string }> }
+      >;
+    };
+    const nodeErrors = payload.node_errors ?? {};
+    const lines: string[] = [];
+    for (const [nodeId, info] of Object.entries(nodeErrors)) {
+      const cls = info?.class_type ?? "node";
+      const errs = Array.isArray(info?.errors) ? info.errors : [];
+      if (errs.length === 0) {
+        lines.push(`- ${cls} (node ${nodeId}): validation failed`);
+        continue;
+      }
+      for (const e of errs) {
+        const detail = e?.details ? ` (${e.details})` : "";
+        lines.push(`- ${cls} (node ${nodeId}): ${e?.message ?? "validation failed"}${detail}`);
+      }
+    }
+
+    const headline = payload.error?.message
+      ? `ComfyUI rejected the workflow (${res.status}): ${payload.error.message}`
+      : `ComfyUI rejected the workflow (${res.status})`;
+
+    if (lines.length > 0 || payload.error?.message) {
+      const message =
+        lines.length > 0 ? `${headline}\n${lines.join("\n")}` : headline;
+      return new WorkflowExecutionError(message, {
+        status: res.status,
+        error: payload.error,
+        node_errors: nodeErrors,
+      });
+    }
+  }
+
+  // Empty or unexpected body: fall back to the generic HTTP status, but keep
+  // any raw text so nothing is silently dropped.
+  return new ConnectionError(
+    bodyText ? `${generic}: ${bodyText.slice(0, 500)}` : generic,
+  );
 }
 
 /**
