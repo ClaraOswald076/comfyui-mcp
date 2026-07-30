@@ -201,6 +201,39 @@ describe("downloadModel cache", () => {
     await expect(readFile(target, "utf-8")).resolves.toBe("full body from server");
   });
 
+  it("uses HF X-Linked-Size (not an understated CAS Content-Length) to reject a short fresh download (#467)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://huggingface.co/org/repo/resolve/main/xlsize.safetensors";
+    // Hop 1: resolve 302 declares the AUTHORITATIVE object size via X-Linked-Size.
+    fetchMock.mockResolvedValueOnce(
+      new Response(null, {
+        status: 302,
+        headers: {
+          location: "https://cas-bridge.xethub.hf.co/xet-bridge-us/obj?sig=z",
+          "x-linked-etag": '"xet-v1"',
+          "x-linked-size": "4096",
+        },
+      }),
+    );
+    // Hop 2: the CAS 200 UNDERSTATES Content-Length (1024) and streams only 1024 of
+    // the real 4096 bytes — a truncating CDN. Trusting Content-Length would finalize
+    // a 1 KiB file as the whole 4096-byte model.
+    fetchMock.mockResolvedValueOnce(
+      new Response("A".repeat(1024), {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-length": "1024" },
+      }),
+    );
+
+    await expect(
+      downloadModel(url, "diffusion_models", "xlsize-out.safetensors"),
+    ).rejects.toThrow(/truncat/i);
+    // The short body was NOT renamed into cache as complete.
+    const cached = await readdir(cacheDir).catch(() => [] as string[]);
+    expect(cached.some((f) => f.endsWith(".safetensors"))).toBe(false);
+  });
+
   it("REFUSES an UNSOLICITED partial 206 on a FRESH request — never finalizes a short prefix (#467 P0)", async () => {
     await fsPromises.mkdir(cacheDir, { recursive: true });
     const url = "https://example.com/models/unsolicited206.safetensors";

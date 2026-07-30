@@ -440,6 +440,12 @@ async function streamUrlToFile(
   // cross-origin resume append MUST independently prove the content is unchanged
   // via the content-addressed X-Linked-Etag (#467/#343).
   let crossOriginRedirect = false;
+  // The AUTHORITATIVE full-file size Hugging Face declares on the resolve redirect
+  // (X-Linked-Size — the true LFS/Xet object size), captured because the final CAS
+  // 200's Content-Length can UNDERSTATE it (a truncating proxy/CDN). Used as the
+  // expected total so a short body fails verification instead of finalizing as
+  // complete — the fresh-download analogue of the resume total cross-check (#467).
+  let redirectSize: number | undefined;
   let res: Response;
   for (let redirectCount = 0; ; redirectCount += 1) {
     res = await fetchOrThrow(
@@ -463,6 +469,9 @@ async function streamUrlToFile(
         sawChangedRedirectValidator = true;
       }
     }
+    // Capture the authoritative object size the redirect declares (last non-empty).
+    const hopSize = Number(res.headers.get("x-linked-size"));
+    if (Number.isFinite(hopSize) && hopSize > 0) redirectSize = hopSize;
 
     if (redirectCount >= MAX_HTTP_REDIRECTS) {
       throw new ModelError(
@@ -680,7 +689,7 @@ async function streamUrlToFile(
       throw new ModelError(
         `Download resume rejected: the server now reports a total size of ${total} bytes, but the ` +
           `original download recorded ${priorTotal}. The upstream size changed — appending would ` +
-          `corrupt or truncate the file. Removed the partial; retry.`,
+          `corrupt or truncate the file. Refusing to append; retry from a clean restart.`,
         { url: logUrl, status: res.status },
       );
     }
@@ -755,7 +764,10 @@ async function streamUrlToFile(
     // Content-Length IS the total) so a later resume can reject a 206 that
     // understates it (#467).
     const validator = extractValidator(res) || redirectValidator;
-    const fullTotal = Number(res.headers.get("content-length")) || undefined;
+    // Authoritative total: the GREATER of Content-Length and HF's X-Linked-Size, so
+    // a later resume cross-checks against the TRUE size, not an understated one (#467).
+    const fullTotal =
+      Math.max(Number(res.headers.get("content-length")) || 0, redirectSize ?? 0) || undefined;
     if (validator) await writeValidatorSidecar(validatorSidecar, validator, fullTotal);
   } else if (appendMode) {
     // A resume was actually taken (validated 206 append). Record it so
@@ -766,15 +778,15 @@ async function streamUrlToFile(
   const nodeStream = Readable.fromWeb(res.body as import("node:stream/web").ReadableStream);
   const fileStream = createWriteStream(targetPath, { flags });
 
-  // Truncation target = the true full-file size. For a validated 206 that is the
-  // Content-Range total (NOT content-length, which is only the remaining slice
-  // and would mask a short 206). For a 200 it is the Content-Length.
+  // Truncation/verification target = the true full-file size. For a validated 206
+  // that is the Content-Range total (NOT content-length, which is only the
+  // remaining slice and would mask a short 206). For a fresh/restart 200 it is the
+  // GREATER of the response's Content-Length and Hugging Face's authoritative
+  // X-Linked-Size — so a CDN that UNDERSTATES Content-Length can't finalize a short
+  // body as complete (assertComplete then requires the full X-Linked-Size) (#467).
   const lengthHeader = Number(res.headers.get("content-length") || 0);
-  const expectedTotal = appendMode
-    ? (rangeTotal ?? 0)
-    : lengthHeader > 0
-      ? lengthHeader
-      : 0;
+  const fresh200Total = Math.max(lengthHeader > 0 ? lengthHeader : 0, redirectSize ?? 0);
+  const expectedTotal = appendMode ? (rangeTotal ?? 0) : fresh200Total;
 
   // A pipeline() can resolve on a stream that ended EARLY (server dropped the
   // connection, proxy cut it, disk edge case) — leaving a 0-byte or truncated
