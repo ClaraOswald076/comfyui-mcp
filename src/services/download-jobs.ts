@@ -21,6 +21,7 @@ import {
   shouldDispatchDownloadToManager,
 } from "./model-resolver.js";
 import type { DownloadAuth } from "./download-auth.js";
+import { clearResumeDiagnostic } from "./download-resume-diag.js";
 import { logger } from "../utils/logger.js";
 
 export interface DownloadJob {
@@ -230,6 +231,11 @@ export async function startDownloadJob(
       retired.add(e);
     }
   }
+
+  // A fresh attempt: clear any resume decision left by an EARLIER attempt for the
+  // same URL so download_status can only ever surface THIS attempt's outcome (a
+  // per-attempt reset — robust where a timestamp compare isn't; #467 P2).
+  clearResumeDiagnostic(trayId);
 
   const job: DownloadJob = {
     id,

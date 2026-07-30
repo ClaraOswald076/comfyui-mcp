@@ -20,6 +20,17 @@ import { ModelError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { redactUrlForLogs } from "./download-auth.js";
 import { reportDownloadProgress, type DownloadProgress } from "./download-progress.js";
+import { recordResumeDiagnostic } from "./download-resume-diag.js";
+// Re-export the resume-diagnostic read/reset API so existing importers of
+// download-cache keep working; the registry itself now lives in a dep-light
+// module (download-resume-diag) to avoid pulling storage/* into consumers' mocks.
+export {
+  getResumeDiagnostic,
+  clearResumeDiagnostic,
+  resetResumeDiagnostics,
+  type ResumeOutcome,
+  type ResumeDiagnostic,
+} from "./download-resume-diag.js";
 import {
   downloadCloudUrlToFile,
   supportsCloudDownload,
@@ -151,8 +162,35 @@ function cacheSizeLimitBytes(): number {
   return raw * 1024 * 1024 * 1024;
 }
 
-function cachePathForUrl(url: string): string {
-  const hash = createHash("sha256").update(url).digest("hex").slice(0, HASH_CHARS);
+/** Representation-affecting request headers, folded into the cache identity so a
+ *  same-URL fetch carrying DIFFERENT auth (e.g. two users' Bearer tokens, or a
+ *  Cookie/API-key that selects a user-scoped or gated representation) can NEVER
+ *  share a cache entry / in-flight stream and install the wrong bytes (#467
+ *  P1-2). Query-param auth already varies the URL itself (applyDownloadAuth folds
+ *  it in), so this covers the header-auth case the URL can't. Volatile hop
+ *  headers (Range/If-Range) are added later inside streamUrlToFile and are
+ *  deliberately excluded — they must not fragment the cache. Empty ⇒ the key is
+ *  the bare URL, so unauthenticated public downloads keep their existing paths. */
+function representationKey(headers: Record<string, string>): string {
+  const relevant = Object.keys(headers)
+    .filter((k) => /^(authorization|cookie|x-api-key|x-auth-token)$/i.test(k))
+    .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
+    .map((k) => `${k.toLowerCase()}=${headers[k]}`)
+    .join("\n");
+  return relevant ? createHash("sha256").update(relevant).digest("hex").slice(0, 12) : "";
+}
+
+function cacheIdentity(url: string, headers: Record<string, string>): string {
+  const repr = representationKey(headers);
+  // Backward compatible: no auth headers ⇒ hash the bare URL exactly as before.
+  return repr ? `${url}\n${repr}` : url;
+}
+
+function cachePathForUrl(url: string, headers: Record<string, string> = {}): string {
+  const hash = createHash("sha256")
+    .update(cacheIdentity(url, headers))
+    .digest("hex")
+    .slice(0, HASH_CHARS);
   let extension = "";
   try {
     extension = extname(basename(new URL(url).pathname));
@@ -203,74 +241,6 @@ function extractValidator(res: Response): string | null {
     res.headers.get("etag") ||
     res.headers.get("last-modified")
   );
-}
-
-/**
- * Why a resume was (or wasn't) taken on the most recent attempt for a given
- * source URL. Recorded in-process so `download_status` — which runs in the SAME
- * MCP server process as the streaming download — can tell the agent/user that a
- * multi-GB `.partial` was discarded and WHY, instead of a silent full
- * re-download (#467). Keyed by the tray id (a 16-hex hash of the source URL),
- * matching DownloadJob.trayId so the status tool can look it up directly.
- */
-export type ResumeOutcome =
-  | "resumed"
-  /** No validator sidecar existed, so a safe resume couldn't even be attempted;
-   *  the partial was discarded and re-downloaded in full (in-stream restart). */
-  | "declined:no-validator"
-  /** We attempted a conditional resume but the server answered with a full 200
-   *  instead of a 206 — the upstream changed OR the host doesn't support range
-   *  resume; either way the partial was discarded (in-stream restart). */
-  | "declined:full-response"
-  /** A 206 whose content-addressed validator PROVED the upstream object changed
-   *  — refused to avoid a corrupt append; the job errors and a retry restarts. */
-  | "declined:etag-changed"
-  /** A cross-origin (CDN) 206 that carried NO content-addressed validator, so an
-   *  unchanged upstream couldn't be proven — refused for safety; retry restarts. */
-  | "declined:unverifiable";
-
-export interface ResumeDiagnostic {
-  outcome: ResumeOutcome;
-  /** Bytes of pre-existing `.partial` discarded on a declined resume (0 when the
-   *  resume was taken). */
-  discardedBytes: number;
-  /** Epoch ms this decision was made. */
-  at: number;
-}
-
-const resumeDiagnostics = new Map<string, ResumeDiagnostic>();
-
-/** Tray id for a source URL — MUST match download-jobs' downloadIdFor so
- *  download_status can key a diagnostic off the job it already holds. */
-function trayIdForUrl(url: string): string {
-  return createHash("sha256").update(url).digest("hex").slice(0, 16);
-}
-
-function recordResumeDiagnostic(
-  url: string,
-  outcome: ResumeOutcome,
-  discardedBytes: number,
-): void {
-  resumeDiagnostics.set(trayIdForUrl(url), { outcome, discardedBytes, at: Date.now() });
-}
-
-/** Read the last resume decision for a download's tray id (or undefined).
- *
- *  Keyed by tray id (URL hash) BY DESIGN, not per job/destination: the cache
- *  coalesces every same-URL fetch into ONE `.partial` and ONE streamUrlToFile
- *  call (downloadIntoCache's inflight map is keyed by the URL-derived cache
- *  path), then hardlinks/copies that single file to each destination. So two
- *  concurrent jobs for one URL with different destinations are two VIEWS of the
- *  same physical download and share the same resume decision — reporting it on
- *  both is accurate. Callers still gate on `at >= job.started_at` so a decision
- *  from a PRIOR attempt for the same URL isn't attributed to a later job. */
-export function getResumeDiagnostic(trayId: string): ResumeDiagnostic | undefined {
-  return resumeDiagnostics.get(trayId);
-}
-
-/** Test seam — the diagnostics map is process-global otherwise. */
-export function resetResumeDiagnostics(): void {
-  resumeDiagnostics.clear();
 }
 
 async function streamUrlToFile(
@@ -487,17 +457,27 @@ async function streamUrlToFile(
   // a 206 already proves the resource is unchanged. A CROSS-ORIGIN 206 (HF resolve
   // → CAS CDN) cannot lean on that — the CDN may honor a stale Range and 206 a
   // CHANGED object regardless of the origin's If-Range — so we must independently
-  // prove the object is unchanged via the content-addressed X-Linked-Etag captured
-  // off the redirect: it MUST be present AND equal the validator the partial was
-  // written against. We also refuse any 206 whose redirect PROVES a change
-  // (X-Linked-Etag present but different), cross-origin or not. Only 206s are
-  // gated — a 200 is a full body and restarts cleanly through the branch below.
+  // prove the object is unchanged via the content-addressed X-Linked-Etag: it MUST
+  // be present AND equal the validator the partial was written against. We check
+  // BOTH the values captured off the 3xx redirects AND the FINAL response's own
+  // X-Linked-Etag — a matching redirect followed by a final CDN 206 carrying a
+  // DIFFERENT content hash must NOT slip through (#467 P0-2). We refuse any 206
+  // whose observed validators PROVE a change (present but different), cross-origin
+  // or not. Only 206s are gated — a 200 is a full body and restarts cleanly below.
   // On refusal, drop the partial + sidecar so a retry is a clean full download.
   if (requestedResume && res.status === 206) {
+    // The final response's OWN content-addressed validator (the CAS 206 usually
+    // omits it, but when present it describes exactly THESE bytes — authoritative).
+    const finalValidator = res.headers.get("x-linked-etag");
+    // Any content-addressed validator we observed that CONTRADICTS the partial's.
     const provenChange =
       sawChangedRedirectValidator ||
-      (redirectValidator !== null && redirectValidator !== priorValidator);
-    const unprovenCrossOrigin = crossOriginRedirect && redirectValidator !== priorValidator; // includes missing
+      (redirectValidator !== null && redirectValidator !== priorValidator) ||
+      (finalValidator !== null && finalValidator !== priorValidator);
+    // The validator that best binds THESE bytes: the final response's own, else
+    // the nearest redirect's. Used for the cross-origin "must be proven" check.
+    const boundValidator = finalValidator ?? redirectValidator;
+    const unprovenCrossOrigin = crossOriginRedirect && boundValidator !== priorValidator; // includes missing
     if (provenChange || unprovenCrossOrigin) {
       // provenChange (a validator we saw DIFFERS from the partial's) is a proven
       // change; unprovenCrossOrigin alone (no validator to compare) is merely
@@ -580,26 +560,33 @@ async function streamUrlToFile(
   // begin writing, a truncated partial is already paired with a MATCHING
   // validator. On a 206 append the existing sidecar already matches — leave it.
   if (resumable && !appendMode) {
-    // We are about to TRUNCATE the partial (flags "w") — this is the point the
-    // discard actually happens, so report it here (not before the response, which
-    // could have failed and left the partial intact — #467 codex round 4).
-    if (requestedResume) {
+    // Drop the stale sidecar + partial FIRST, then only AFTER confirming the
+    // partial is actually gone do we announce the discard (#467 P1-1). safeRm
+    // swallows failures, so a diagnostic recorded before removal could otherwise
+    // claim "discarded" while the bytes are still on disk — and a later
+    // stream-open failure would leave them permanently. Confirm, then report.
+    await safeRm(validatorSidecar);
+    await safeRm(targetPath);
+    const stillOnDisk = await fileSizeOrUndefined(targetPath);
+    const discardConfirmed =
+      resumeFromBytes > 0 && (stillOnDisk === undefined || stillOnDisk === 0);
+    if (discardConfirmed && requestedResume) {
       // Asked to resume (had a validator, sent Range+If-Range) but got a full 200
       // — the upstream changed OR the host doesn't support range resume. Either
-      // way the partial is discarded and the file re-downloaded in full.
+      // way the partial has now been discarded and the file re-downloaded in full.
       logger.warn(
-        `Discarding a ${resumeFromBytes}-byte partial download and restarting from 0: the server ` +
+        `Discarded a ${resumeFromBytes}-byte partial download and restarting from 0: the server ` +
           `answered the If-Range resume request with a full ${res.status} instead of a 206 — the ` +
           `upstream file changed, or the host doesn't support resuming — so re-downloading in full.`,
         { url: logUrl, discardedBytes: resumeFromBytes },
       );
       recordResumeDiagnostic(url, "declined:full-response", resumeFromBytes);
-    } else if (resumeDeclinedNoValidator) {
+    } else if (discardConfirmed && resumeDeclinedNoValidator) {
       // A partial existed but no sidecar validator did, so we never even sent a
       // Range — a safe resume couldn't be verified (common on HF's Xet/CAS CDN,
-      // which omits ETag/Last-Modified on the body). Discard + re-download in full.
+      // which omits ETag/Last-Modified on the body). Discarded + re-download full.
       logger.warn(
-        `Discarding a ${resumeFromBytes}-byte partial download and restarting from 0: no ` +
+        `Discarded a ${resumeFromBytes}-byte partial download and restarting from 0: no ` +
           `ETag/Last-Modified validator was ever persisted for it, so a safe resume can't be ` +
           `verified (common on Hugging Face's Xet/CAS CDN, which omits both headers on the file ` +
           `body). This is the safety-first behavior — an unverifiable resume risks a corrupt file ` +
@@ -608,8 +595,6 @@ async function streamUrlToFile(
       );
       recordResumeDiagnostic(url, "declined:no-validator", resumeFromBytes);
     }
-    await safeRm(validatorSidecar);
-    await safeRm(targetPath);
     // Prefer the final response's validator; fall back to one captured off the
     // redirect chain (HF Xet: the CAS 200 has none, but the resolve 302 carried
     // X-Linked-Etag) so the partial written now becomes resumable later (#467).
@@ -665,6 +650,22 @@ async function streamUrlToFile(
       // but do NOT report this as a completed download.
       throw new ModelError(
         `Download truncated: wrote ${actual} of ${expectedTotal} bytes — the stream ended early. Not complete; retry to resume.`,
+        { url: logUrl },
+      );
+    }
+    if (expectedTotal > 0 && actual > expectedTotal) {
+      // OVERSIZED — the server streamed MORE than the authoritative size (a 206
+      // Content-Range total, or a 200 Content-Length). A validated resume that
+      // claims `bytes 4-7/8` but streams extra bytes would otherwise finalize a
+      // corrupt file with no error (#467 P0-1). This is NOT resumable — the bytes
+      // on disk are wrong — so remove the partial + validator and fail; a retry
+      // starts clean rather than range-resuming a corrupt prefix.
+      await safeRm(targetPath);
+      if (resumable) await safeRm(validatorSidecar);
+      throw new ModelError(
+        `Download oversized: wrote ${actual} bytes but the file is only ${expectedTotal} — the ` +
+          `response sent more data than its declared size (corrupt or misbehaving server). Removed ` +
+          `the bad file; retry.`,
         { url: logUrl },
       );
     }
@@ -724,7 +725,10 @@ async function downloadIntoCache(
   storageAuth: CloudStorageAuth = {},
   progress?: ProgressMeta,
 ): Promise<string> {
-  const target = cachePathForUrl(url);
+  // Header-aware identity (#467 P1-2): a same-URL download with a different
+  // Authorization/Cookie/API-key gets its OWN cache file, partial and in-flight
+  // slot — never coalesced onto another caller's stream/representation.
+  const target = cachePathForUrl(url, headers);
   const key = target;
 
   const existing = inflight.get(key);

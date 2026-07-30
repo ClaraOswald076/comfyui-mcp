@@ -692,6 +692,116 @@ describe("downloadModel cache", () => {
     await expect(readFile(sidecar, "utf-8")).resolves.toBe('"captured-v9"');
   });
 
+  it("REJECTS + removes an OVERSIZED 206 that streams MORE than its Content-Range total (#467 P0-1)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://example.com/models/oversized206.safetensors";
+    const { partial, sidecar } = await cachePaths(url);
+    await writeFile(partial, "AAAA"); // resume offset 4
+    await writeFile(sidecar, '"ov-etag"');
+
+    // 206 claims bytes 4-7/8 (total 8) but the body is 6 bytes → 4+6 = 10 > 8.
+    // Without the exact-size check this corrupt 10-byte file would be finalized.
+    fetchMock.mockResolvedValueOnce(
+      new Response("BBBBBB", {
+        status: 206,
+        statusText: "Partial Content",
+        headers: { "content-range": "bytes 4-7/8" },
+      }),
+    );
+
+    await expect(
+      downloadModel(url, "checkpoints", "oversized206-out.safetensors"),
+    ).rejects.toThrow(/oversized/i);
+    // The corrupt bytes are removed (NOT left to masquerade as resumable).
+    await expect(stat(partial)).rejects.toThrow();
+    await expect(stat(sidecar)).rejects.toThrow();
+  });
+
+  it("REJECTS + removes an OVERSIZED 200 that streams MORE than its Content-Length (#467 P0-1)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://example.com/models/oversized200.safetensors";
+    // 200 claims 4 bytes but streams 9.
+    fetchMock.mockResolvedValueOnce(
+      new Response("TOOMANYBS", { status: 200, statusText: "OK", headers: { "content-length": "4" } }),
+    );
+    await expect(
+      downloadModel(url, "checkpoints", "oversized200-out.safetensors"),
+    ).rejects.toThrow(/oversized/i);
+    const cached = await readdir(cacheDir).catch(() => [] as string[]);
+    expect(cached.some((f) => f.endsWith(".safetensors"))).toBe(false);
+  });
+
+  it("REFUSES a cross-origin 206 whose FINAL response carries a DIFFERENT X-Linked-Etag than the matching redirect (#467 P0-2)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://huggingface.co/org/repo/resolve/main/finalconflict.safetensors";
+    const { partial, sidecar } = await cachePaths(url);
+    await writeFile(partial, "AAAA");
+    await writeFile(sidecar, '"xet-v1"');
+
+    // Hop 1: resolve 302 cross-origin whose X-Linked-Etag MATCHES the partial...
+    fetchMock.mockResolvedValueOnce(
+      new Response(null, {
+        status: 302,
+        headers: {
+          location: "https://cas-bridge.xethub.hf.co/xet-bridge-us/obj?sig=a",
+          "x-linked-etag": '"xet-v1"',
+        },
+      }),
+    );
+    // Hop 2: the FINAL CAS 206 advertises a DIFFERENT content hash — the object
+    // changed at the CDN. A matching redirect must NOT let this slip through.
+    fetchMock.mockResolvedValueOnce(
+      new Response("BBBB", {
+        status: 206,
+        statusText: "Partial Content",
+        headers: { "content-range": "bytes 4-7/8", "x-linked-etag": '"xet-v2-CHANGED"' },
+      }),
+    );
+
+    await expect(
+      downloadModel(url, "diffusion_models", "finalconflict-out.safetensors"),
+    ).rejects.toThrow(/resume rejected/i);
+    await expect(stat(partial)).rejects.toThrow();
+    await expect(stat(sidecar)).rejects.toThrow();
+    expect(getResumeDiagnostic(await trayIdFor(url))?.outcome).toBe("declined:etag-changed");
+  });
+
+  it("does NOT coalesce same-URL downloads carrying DIFFERENT auth headers — each gets its own bytes (#467 P1-2)", async () => {
+    const { downloadWithCache } = await import("../../services/download-cache.js");
+    await fsPromises.mkdir(comfyDir, { recursive: true });
+    const url = "https://example.com/models/gated.safetensors";
+    // Two users, two tokens → two representations. They must NOT share a stream.
+    fetchMock.mockResolvedValueOnce(okResponse("ALICE-ONLY-BYTES"));
+    fetchMock.mockResolvedValueOnce(okResponse("BOB-ONLY-BYTES"));
+
+    const alice = join(comfyDir, "alice.safetensors");
+    const bob = join(comfyDir, "bob.safetensors");
+    await downloadWithCache({ url, headers: { Authorization: "Bearer alice" }, targetPath: alice });
+    await downloadWithCache({ url, headers: { Authorization: "Bearer bob" }, targetPath: bob });
+
+    // Separate representations → separate fetches, no cache coalescing.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await expect(readFile(alice, "utf-8")).resolves.toBe("ALICE-ONLY-BYTES");
+    await expect(readFile(bob, "utf-8")).resolves.toBe("BOB-ONLY-BYTES");
+  });
+
+  it("DOES cache/coalesce same-URL downloads with the SAME auth header (public dedup preserved) (#467 P1-2)", async () => {
+    const { downloadWithCache } = await import("../../services/download-cache.js");
+    await fsPromises.mkdir(comfyDir, { recursive: true });
+    const url = "https://example.com/models/sameauth.safetensors";
+    fetchMock.mockResolvedValueOnce(okResponse("SHARED-BYTES"));
+
+    const one = join(comfyDir, "one.safetensors");
+    const two = join(comfyDir, "two.safetensors");
+    await downloadWithCache({ url, headers: { Authorization: "Bearer same" }, targetPath: one });
+    await downloadWithCache({ url, headers: { Authorization: "Bearer same" }, targetPath: two });
+
+    // Identical representation → second call is a cache hit, only one fetch.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await expect(readFile(one, "utf-8")).resolves.toBe("SHARED-BYTES");
+    await expect(readFile(two, "utf-8")).resolves.toBe("SHARED-BYTES");
+  });
+
   it("never serves a 0-byte cache entry as a hit — re-downloads instead (#343 edge)", async () => {
     await fsPromises.mkdir(cacheDir, { recursive: true });
     const url = "https://example.com/models/zerohit.safetensors";

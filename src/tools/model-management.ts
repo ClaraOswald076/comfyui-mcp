@@ -234,12 +234,12 @@ export function registerModelManagementTools(server: McpServer): void {
           // Surface a declined resume so the agent/user knows a pre-existing
           // .partial was discarded and a full re-download is under way, and why
           // — instead of it being silent (#467).
-          // Only surface a diagnostic from THIS attempt — the map is keyed by URL
-          // and persists across jobs, so a stale discard from an earlier attempt
-          // for the same URL must not be attributed to this one (#467).
+          // Only THIS attempt's diagnostic can be present: startDownloadJob clears
+          // any earlier decision for the tray id when a fresh job starts (#467 P2),
+          // so a stale discard from an earlier attempt can't be misattributed here.
           const diag = getResumeDiagnostic(j.trayId);
           let resumeNote = "";
-          if (diag && diag.outcome !== "resumed" && diag.at >= j.started_at) {
+          if (diag && diag.outcome !== "resumed") {
             const gb = (diag.discardedBytes / 1024 ** 3).toFixed(2);
             const why =
               diag.outcome === "declined:no-validator"
