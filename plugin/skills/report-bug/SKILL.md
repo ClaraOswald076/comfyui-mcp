@@ -121,9 +121,9 @@ Then file it (no need to ask):
 - **Default path (everyone):** POST the report to our intake Worker — no GitHub
   account needed:
 
-  The Worker is an **async intake**: the POST accepts + queues the report and
-  returns a `job_id`; the issue is filed in the background. Submit, then poll
-  `/status/<job_id>` a few times to get the issue link.
+  The Worker files the issue **synchronously** and returns the link inline
+  (`{ ok, url, number, deduped?, job_id }`); the `job_id` + `/status/<job_id>`
+  poll is only a fallback for the rare case the submit didn't carry a `url`.
 
   ```bash
   # URL is baked in; override with $COMFYUI_MCP_ISSUE_WORKER_URL if set. The
@@ -135,43 +135,55 @@ Then file it (no need to ask):
 
   # 1) Submit. Write the JSON to a temp file first (the body has newlines/quotes).
   # body: { "repo": "comfyui-mcp" | "comfyui-mcp-panel", "title", "body", "labels": ["via-panel"] }
-  RESP=$(curl -fsS -X POST "$WORKER_URL" \
-    -H "Content-Type: application/json" -H "X-Client-Key: $CLIENT_KEY" \
-    --data @"$BODY_JSON_FILE")
-  # Fast path may already include the issue: { ok, job_id, status:"done", url, number, deduped? }.
-  # Slow path: { ok, job_id, status:"queued" } — then poll.
-  JOB_ID=$(printf '%s' "$RESP" | sed -n 's/.*"job_id"[: ]*"\([^"]*\)".*/\1/p')
-
-  # 2) Poll a few times for the filed issue link (skip if the submit already had url).
-  if ! printf '%s' "$RESP" | grep -q '"url"'; then
-    for i in 1 2 3 4 5; do
-      sleep 1
-      STAT=$(curl -fsS "$WORKER_URL/status/$JOB_ID")
-      echo "$STAT" | grep -q '"status":"done"'  && { echo "$STAT"; break; }
-      echo "$STAT" | grep -q '"status":"error"' && { echo "$STAT"; break; }
-    done
+  # --max-time bounds the whole request so a hung connection can't wedge us.
+  if ! RESP=$(curl -fsS --max-time 15 -X POST "$WORKER_URL" \
+      -H "Content-Type: application/json" -H "X-Client-Key: $CLIENT_KEY" \
+      --data @"$BODY_JSON_FILE"); then
+    # ANY non-OK / unreachable (401, 5xx, timeout, DNS…): fall back to the
+    # report_issue tool for a prefilled GitHub link. Do NOT poll.
+    echo "worker submit failed — falling back to report_issue"
+  else
+    URL=$(printf '%s' "$RESP" | sed -n 's/.*"url"[: ]*"\([^"]*\)".*/\1/p')
+    # 2) Only poll if the submit lacked a url AND we actually got a job_id.
+    if [ -z "$URL" ]; then
+      JOB_ID=$(printf '%s' "$RESP" | sed -n 's/.*"job_id"[: ]*"\([^"]*\)".*/\1/p')
+      if [ -n "$JOB_ID" ]; then
+        for i in 1 2 3 4 5; do
+          sleep 1
+          STAT=$(curl -fsS --max-time 10 "$WORKER_URL/status/$JOB_ID") || continue
+          URL=$(printf '%s' "$STAT" | sed -n 's/.*"url"[: ]*"\([^"]*\)".*/\1/p')
+          [ -n "$URL" ] && break
+        done
+      fi
+    fi
+    # 3) PRINT the resulting issue link (inline-fast-path OR polled).
+    [ -n "$URL" ] && echo "filed: $URL" || echo "report accepted; link not yet available"
   fi
   ```
-  The final `{ status:"done", url, number, deduped? }` carries the created issue
-  link. A `401 unauthorized` on submit means `$COMFYUI_MCP_ISSUE_CLIENT_KEY` is
-  unset/wrong — fall back to `report_issue`. If polling keeps returning
-  `queued`, the report is still accepted (filing continues server-side); just
-  tell the user it's logged and move on. **Surface the issue link to the user
-  only if they want it** — the filing is autonomous, so a one-line "filed #123"
-  is enough (Step 7).
+  A `401 unauthorized` (or any non-2xx / timeout / unreachable) on submit means
+  fall back to `report_issue` for a prefilled link — don't poll with an empty
+  `JOB_ID`. If polling never yields a `url`, the report is still accepted
+  (filing is synchronous server-side); tell the user it's logged and move on.
+  **Surface the issue link to the user only if they want it** — the filing is
+  autonomous, so a one-line "filed #123" is enough (Step 7).
 - **Fallback** (no `gh`, no Worker URL): use the `report_issue` tool → a prefilled
   GitHub issue link the user can submit in one click.
 
-## Step 6 — Third-party / ComfyUI-core bugs
+## Step 6 — Third-party / ComfyUI-core bugs (offer + ASK first — not autonomous)
 
-Our Worker only files into OUR repos, so these go to **their** GitHub:
+Our Worker only files into OUR repos, so these go to **their** GitHub. Unlike
+our-repo defects (Steps 3–5, which you handle autonomously), third-party bugs
+are **offer-and-ask** at every step — patching someone else's node and posting
+to someone else's tracker are the user's calls, not yours:
 
-- Still attempt a **local workaround** if you safely can (e.g. patch the custom
-  node so the user isn't blocked) — same keep-the-patch logic.
-- To report: identify the node/project's GitHub repo (from its metadata /
-  `list_installed_nodes` / its folder), then use `report_issue` with that
-  `owner/repo` to produce a prefilled issue link, OR `gh issue create -R owner/repo`
-  if `gh` is authed.
+- **Ask before patching.** You may *offer* a local workaround (e.g. patch the
+  custom node so the user isn't blocked) — but apply it only once the user says
+  yes. Same keep-the-patch logic once approved.
+- **Ask before filing.** Identify the node/project's GitHub repo (from its
+  metadata / `list_installed_nodes` / its folder), then — with the user's
+  go-ahead — use `report_issue` with that `owner/repo` (it returns a **prefilled
+  link the user reviews and submits**; it does not auto-file into third-party
+  repos), OR `gh issue create -R owner/repo` if `gh` is authed and they agree.
 - If the user has **no GitHub account**, briefly offer to walk them through
   creating one (github.com/signup) so they can file it — that's how the bug
   reaches the people who can fix it. We can't file it for them.

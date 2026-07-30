@@ -73,7 +73,10 @@ export async function submitAndPoll(opts: {
   const pollDelayMs = opts.pollDelayMs ?? 1000;
   const timeoutMs = opts.timeoutMs ?? 8000;
 
-  const withTimeout = async (fn: (signal: AbortSignal) => Promise<Response>): Promise<Response> => {
+  // Keep the abort active through BOTH the fetch AND the body parse — otherwise
+  // a hung `.json()` after headers arrive would never time out. The whole
+  // request+parse runs under one AbortController + a hard timeout.
+  const withTimeout = async <T>(fn: (signal: AbortSignal) => Promise<T>): Promise<T> => {
     const ac = new AbortController();
     const t = setTimeout(() => ac.abort(), timeoutMs);
     try {
@@ -83,42 +86,43 @@ export async function submitAndPoll(opts: {
     }
   };
 
-  const submitRes = await withTimeout((signal) =>
-    doFetch(opts.workerUrl, {
+  const submit = await withTimeout(async (signal): Promise<WorkerFileResult> => {
+    const r = await doFetch(opts.workerUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Client-Key": opts.clientKey },
       body: JSON.stringify({ repo: opts.repoName, title: opts.title, body: opts.body, labels: opts.labels }),
       signal,
-    }),
-  );
-  if (!submitRes.ok) {
-    throw new Error(`worker submit failed: HTTP ${submitRes.status}`);
-  }
-  const submit = (await submitRes.json()) as WorkerFileResult;
+    });
+    if (!r.ok) throw new Error(`worker submit failed: HTTP ${r.status}`);
+    return (await r.json()) as WorkerFileResult;
+  });
 
-  // Fast path: the Worker already filed and returned the link inline.
+  // Common path: the Worker files synchronously and returns the link inline.
   if (submit.url) return { ...submit, status: submit.status ?? "done" };
   const jobId = submit.job_id;
   if (!jobId) {
-    // No job to poll and no url — treat as done-without-link (still accepted).
-    return submit;
+    // No job to poll and no url — accepted but no link available.
+    return { ...submit, status: submit.status ?? "queued" };
   }
 
-  // Poll /status/<job_id> until done/error or we run out of tries.
+  // Fallback poll (only if the submit somehow lacked a url): /status/<job_id>
+  // until done or we run out of tries.
   const base = opts.workerUrl.replace(/\/+$/, "");
   let last: WorkerFileResult = { status: "queued", job_id: jobId };
   for (let i = 0; i < maxPolls; i++) {
     await sleep(pollDelayMs);
-    let statusRes: Response;
     try {
-      statusRes = await withTimeout((signal) => doFetch(`${base}/status/${jobId}`, { signal }));
+      const parsed = await withTimeout(async (signal): Promise<WorkerFileResult | null> => {
+        const r = await doFetch(`${base}/status/${jobId}`, { signal });
+        if (!r.ok) return null; // e.g. 404 unknown while KV catches up — keep trying
+        return (await r.json()) as WorkerFileResult;
+      });
+      if (!parsed) continue;
+      last = { ...parsed, job_id: jobId };
+      if (last.status === "done" || last.status === "error") break;
     } catch {
       continue; // transient — keep trying
     }
-    if (!statusRes.ok) continue;
-    last = (await statusRes.json()) as WorkerFileResult;
-    last.job_id = jobId;
-    if (last.status === "done" || last.status === "error") break;
   }
   return last;
 }
