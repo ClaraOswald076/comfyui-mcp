@@ -29,10 +29,12 @@ vi.mock("node:fs/promises", () => ({
   link: vi.fn(),
   mkdir: (...a: unknown[]) => mkdirMock(...a),
   readdir: vi.fn(),
+  readFile: vi.fn(),
   rename: vi.fn(),
   rm: (...a: unknown[]) => rmMock(...a),
   stat: (...a: unknown[]) => statMock(...a),
   utimes: vi.fn(),
+  writeFile: vi.fn(),
 }));
 
 // downloadModel now roots the destination at the LIVE server's models dir

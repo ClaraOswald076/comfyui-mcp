@@ -383,6 +383,24 @@ describe("download job registry", () => {
     }
   });
 
+  it("serializes case-variant same-file destinations on case-insensitive filesystems (#467 P1-C)", async () => {
+    // Same (no) auth but case-variant subfolders resolve to distinct path STRINGS,
+    // so they are distinct jobs — but on a case-insensitive FS they are ONE physical
+    // file and must be serialized.
+    const a = await startDownloadJob(URL_A, "checkpoints", "m.safetensors");
+    const b = await startDownloadJob(URL_A, "Checkpoints", "m.safetensors");
+    expect(b.job).not.toBe(a.job);
+    if (process.platform === "win32" || process.platform === "darwin") {
+      expect(hoisted.calls).toBe(1); // serialized — same physical file
+      hoisted.resolvers[0].resolve("/M/checkpoints/m.safetensors");
+      await a.settled;
+      await new Promise((r) => setTimeout(r, 0));
+      expect(hoisted.calls).toBe(2);
+    } else {
+      expect(hoisted.calls).toBe(2); // case-sensitive FS → genuinely different files
+    }
+  });
+
   it("STILL coalesces concurrent same-URL+same-dest jobs with the SAME auth", async () => {
     const a = await startDownloadJob(URL_A, "checkpoints", undefined, { type: "bearer", token: "same" });
     const b = await startDownloadJob(URL_A, "checkpoints", undefined, { type: "bearer", token: "same" });

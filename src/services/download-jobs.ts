@@ -83,6 +83,16 @@ const jobs = new Map<string, Entry>();
 // downloads only — the Manager writes server-side and has no local race).
 const destChains = new Map<string, Promise<void>>();
 
+/** Canonicalize a destination key for the serialization chain. Case-insensitive
+ *  filesystems (Windows always; macOS by default) alias `Checkpoints/m` and
+ *  `checkpoints/m` to ONE physical file, so lower-case the key there to serialize
+ *  those too (#467 P1-C). POSIX (Linux) is case-sensitive — leave it exact. */
+function normalizeDestKey(key: string): string {
+  return process.platform === "win32" || process.platform === "darwin"
+    ? key.toLowerCase()
+    : key;
+}
+
 /**
  * Point `key` at `entry`, ENTRY-SCOPED (#420 codex round 3, rule 2/3): never clobber
  * a row currently owned by a DIFFERENT, still-in-flight writer — that would orphan a
@@ -217,14 +227,26 @@ export async function startDownloadJob(
   // front, exactly as the write would reject it.
   const reqKey = requestDownloadKey(url, targetSubfolder, filename, auth);
   let destKey: string | undefined;
-  let destPath: string | undefined;
+  // The key jobs SERIALIZE on (#467 P1-C) — the physical destination, AUTH-FREE and
+  // normalized for case-insensitive filesystems, so two different-auth (or
+  // different-cased) requests to the same file run one-at-a-time and each callback
+  // sees its own bytes. LOCAL: the resolved on-disk targetPath. REMOTE: a canonical
+  // "remote:<subfolder>/<name>" — the Manager writes ONE server-side file per
+  // (subfolder, name), so overlapping different-auth dispatches to it are serialized
+  // too (the local callback race is inherently local, but this keeps the server
+  // write single-writer and the last-started result deterministic).
+  let serializeKey: string;
   if (!dispatchToManager) {
     const target = await resolveDownloadTarget(url, targetSubfolder, filename);
-    destPath = target.targetPath;
     // Fold auth into the destination key too (#467 P1-A): two concurrent calls to
     // the SAME on-disk destination with DIFFERENT auth are DIFFERENT downloads
     // (different representations) and must NOT dedup to one writer/one job.
     destKey = downloadJobIdFor(`${target.targetPath}\n${authIdentity(auth)}`);
+    serializeKey = normalizeDestKey(target.targetPath);
+  } else {
+    const remoteName =
+      filename ?? (url.split(/[/?#]/).filter(Boolean).pop() ?? "model");
+    serializeKey = normalizeDestKey(`remote:${String(targetSubfolder ?? "").trim()}/${remoteName}`);
   }
   // The PUBLIC id (download_status handle): the destination key when we have one
   // (so distinct destinations are separately pollable), else the request key.
@@ -282,10 +304,10 @@ export async function startDownloadJob(
     started_at: Date.now(),
   };
 
-  // Serialize behind any in-flight job writing the SAME destination path (#467
-  // P1-C) so this job's download+materialize+onComplete run without a concurrent
-  // different-auth writer swapping the destination out from under its callback.
-  const priorSameDest = destPath ? destChains.get(destPath) : undefined;
+  // Serialize behind any in-flight job writing the SAME destination (#467 P1-C) so
+  // this job's download+materialize+onComplete run without a concurrent different-
+  // auth writer swapping the destination out from under its callback.
+  const priorSameDest = destChains.get(serializeKey);
 
   // The promise is stored, never left dangling — an unhandled rejection here
   // would take down the process on a simple 404.
@@ -323,13 +345,10 @@ export async function startDownloadJob(
 
   // Make THIS job the tail of its destination's serialization chain, and prune the
   // chain entry once it's the last one to settle (bounded map).
-  if (destPath) {
-    const key = destPath;
-    destChains.set(key, settled);
-    void settled.finally(() => {
-      if (destChains.get(key) === settled) destChains.delete(key);
-    });
-  }
+  destChains.set(serializeKey, settled);
+  void settled.finally(() => {
+    if (destChains.get(serializeKey) === settled) destChains.delete(serializeKey);
+  });
 
   // Index under EVERY key (deduped) so any of them adopts this one writer. Uses the
   // entry-scoped registerKey guard so a fresh registration can never overwrite a row

@@ -947,6 +947,26 @@ function randomTempPath(base: string, tag: string): string {
   return `${base}.${tag}-${randomBytes(12).toString("hex")}.tmp`;
 }
 
+/** Reserve an unguessable temp path by creating it EXCLUSIVELY (O_EXCL via the "wx"
+ *  flag), retrying on the astronomically-unlikely EEXIST. Guarantees the returned
+ *  path is a FRESH standalone inode — so a subsequent "w" open (streamUrlToFile /
+ *  the S3/Azure downloaders truncate) writes to our own new file and can NEVER
+ *  follow a pre-existing hardlink into a cache inode (#467 P1-A). */
+async function reserveExclusiveTemp(base: string, tag: string): Promise<string> {
+  for (let attempt = 1; ; attempt++) {
+    const p = randomTempPath(base, tag);
+    try {
+      await writeFile(p, "", { flag: "wx" });
+      return p;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === "EEXIST" && attempt < MATERIALIZE_TEMP_ATTEMPTS) {
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 /** True for a hardlink error that means "hardlinks aren't usable here" — the ONLY
  *  case where copy-fallback is legitimate. NOT EEXIST (a name collision — retry a
  *  new name; copy-falling-back there is what truncates a stale hardlinked temp and
@@ -955,22 +975,28 @@ function isHardlinkUnsupported(code: unknown): boolean {
   return code === "EXDEV" || code === "EPERM" || code === "ENOSYS" || code === "EACCES";
 }
 
-/** Rename `tmp` over `targetPath`, with a Windows EPERM-over-existing rm+retry.
- *  The temp already holds the fully-materialized bytes, so the brief gap where the
- *  DESTINATION is absent is safe (it's the destination, not a cache inode, and
- *  last-writer-wins on it is the intended concurrent semantics). Cleans `tmp` if
- *  the swap ultimately fails. */
+/** Rename `tmp` over `targetPath`. On POSIX, rename atomically replaces an existing
+ *  destination. Windows can't rename OVER an existing file and returns EPERM/EACCES/
+ *  EEXIST — ONLY then do we remove the destination and retry (the temp already holds
+ *  the fully-materialized bytes, so the brief gap where the destination is absent is
+ *  safe). Any OTHER rename error (ENOENT, EIO, EXDEV, …) must NOT destroy a valid
+ *  existing destination (#467): clean our temp and propagate. */
 async function renameTempOverDestination(tmp: string, targetPath: string): Promise<void> {
   try {
     await downloadCacheFs.rename(tmp, targetPath);
     return;
-  } catch {
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code !== "EPERM" && code !== "EACCES" && code !== "EEXIST") {
+      await downloadCacheFs.rm(tmp, { force: true }).catch(() => undefined);
+      throw err;
+    }
     await downloadCacheFs.rm(targetPath, { force: true }).catch(() => undefined);
     try {
       await downloadCacheFs.rename(tmp, targetPath);
-    } catch (err) {
+    } catch (e) {
       await downloadCacheFs.rm(tmp, { force: true }).catch(() => undefined);
-      throw err;
+      throw e;
     }
   }
 }
@@ -1091,15 +1117,15 @@ export async function downloadWithCache(
       url: logUrl,
       error: err instanceof Error ? err.message : String(err),
     });
-    // Write to an UNGUESSABLE temp then rename over the destination — NEVER stream
-    // "w" directly at targetPath (#467). If a concurrent materialize already
-    // hardlinked targetPath to a cache inode, a direct "w" open would follow that
-    // hardlink and overwrite the OTHER representation's cache entry with these bytes
-    // (poison). A random fresh temp is its own inode, and rename only swaps the
-    // directory entry — so cache inodes stay intact and a failed stream leaves the
-    // destination untouched. Random (not pid+counter) so a stale/reused-PID temp
-    // can't be silently truncated (#467 P1-A).
-    const tmp = randomTempPath(options.targetPath, "dl");
+    // Download to an EXCLUSIVELY-created, unguessable temp then rename over the
+    // destination — NEVER stream "w" directly at targetPath (#467). If a concurrent
+    // materialize already hardlinked targetPath to a cache inode, a direct "w" open
+    // would follow that hardlink and overwrite the OTHER representation's cache
+    // entry with these bytes (poison). Reserving the temp with O_EXCL guarantees a
+    // fresh standalone inode, so the downloader's "w"/truncate can never follow a
+    // pre-existing hardlink; rename only swaps the directory entry. A failed stream
+    // leaves the destination untouched.
+    const tmp = await reserveExclusiveTemp(options.targetPath, "dl");
     try {
       await downloadUrlToFile(
         options.url,

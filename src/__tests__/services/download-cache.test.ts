@@ -962,6 +962,11 @@ describe("downloadModel cache", () => {
     if (prevAz !== undefined) process.env.AZURE_STORAGE_CONNECTION_STRING = prevAz;
     expect(azEnv).not.toBe(azAnon);
 
+    // Ambient (no explicit key) is STABLE within a process (same nonce) so in-process
+    // cache hits stay safe; explicit auth is stable too.
+    expect(cloudPrincipalKey(s3url, {})).toBe(cloudPrincipalKey(s3url, {}));
+    expect(alice).toBe(cloudPrincipalKey(s3url, { s3: { access_key_id: "AK-ALICE", secret_access_key: "x" } }));
+
     // A non-cloud URL contributes no cloud discriminator.
     expect(cloudPrincipalKey("https://example.com/x.safetensors", {})).toBe("");
   });
@@ -1039,6 +1044,37 @@ describe("downloadModel cache", () => {
     expect(leftovers).toHaveLength(0);
     linkSpy.mockRestore();
     copySpy.mockRestore();
+  });
+
+  it("a non-Windows rename failure during materialize/fallback does NOT destroy the existing destination (#467 P1-A)", async () => {
+    const { downloadWithCache } = await import("../../services/download-cache.js");
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    await fsPromises.mkdir(comfyDir, { recursive: true });
+    const dest = join(comfyDir, "keepme.safetensors");
+    await writeFile(dest, "ORIGINAL-PRECIOUS-BYTES");
+
+    // Fail ONLY the materialize/fallback swap renames (.mat-/.dl-) with a non-Windows
+    // error — the cache-write rename (.partial → cache file) must still pass through.
+    const renameSpy = vi
+      .spyOn(downloadCacheFs, "rename")
+      .mockImplementation(async (from: string, to: string) => {
+        if (String(from).includes(".mat-") || String(from).includes(".dl-")) {
+          throw Object.assign(new Error("EIO: simulated non-overwrite rename failure"), { code: "EIO" });
+        }
+        return fsPromises.rename(from, to);
+      });
+
+    const url = "https://example.com/models/rename-eio.safetensors";
+    fetchMock.mockImplementation(() => Promise.resolve(okResponse("NEW-BYTES")));
+
+    await expect(downloadWithCache({ url, headers: {}, targetPath: dest })).rejects.toThrow(/EIO/i);
+
+    // The EIO path must NOT have removed the destination (that rm only guards the
+    // Windows overwrite errors) — the original file is intact.
+    await expect(readFile(dest, "utf-8")).resolves.toBe("ORIGINAL-PRECIOUS-BYTES");
+    const leftovers = (await readdir(comfyDir)).filter((f) => f.includes(".mat-") || f.includes(".dl-"));
+    expect(leftovers).toHaveLength(0);
+    renameSpy.mockRestore();
   });
 
   it("does NOT serve a LEGACY bare-URL cache entry to an unauthenticated caller — no cross-auth leak (#467 P1-C)", async () => {
