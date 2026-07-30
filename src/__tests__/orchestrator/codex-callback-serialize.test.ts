@@ -119,6 +119,40 @@ describe("CodexBackend run-finished commit serialization (#421, #422)", () => {
     expect(assistant?.text).not.toBe("[object Object]");
   });
 
+  it("resets the streamed-text buffer between commits in a multi-message turn", async () => {
+    const events = await driveTurn((client) => {
+      // First message: streamed, then a malformed commit → falls back to stream.
+      client.notificationHandler?.({
+        method: "item/agentMessage/delta",
+        params: { threadId: "thread-1", turnId: "turn-1", itemId: "m1", delta: "first reply" },
+      });
+      client.notificationHandler?.({
+        method: "item/completed",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          item: { type: "agentMessage", id: "m1", text: { bad: "shape" } },
+        },
+      });
+      // Second message: a DIFFERENT malformed commit with NO deltas. Its fallback
+      // must be "" (buffer reset), NOT the stale "first reply".
+      client.notificationHandler?.({
+        method: "item/completed",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          item: { type: "agentMessage", id: "m2", text: { also: "bad" } },
+        },
+      });
+      completedTurn(client);
+    });
+    const assistants = events.filter((e) => e.type === "assistant");
+    expect(assistants).toHaveLength(2);
+    expect(assistants[0]?.text).toBe("first reply");
+    // No stale carryover from the first message's stream buffer.
+    expect(assistants[1]?.text).toBe("");
+  });
+
   it("still commits a plain-string final commit unchanged", async () => {
     const events = await driveTurn((client) => {
       client.notificationHandler?.({

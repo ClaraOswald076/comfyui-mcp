@@ -169,6 +169,29 @@ describe("messageText (#421, #422)", () => {
     expect(messageText("[object Object]")).toBe("");
   });
 
+  it("treats a PADDED sentinel as empty (trims before judging)", () => {
+    expect(messageText(" [object Object] ")).toBe("");
+    expect(messageText({ text: "  [object Object]  " })).toBe("");
+  });
+
+  it("falls through a whitespace-only text to a real sibling key", () => {
+    expect(messageText({ text: " ", content: "real final" })).toBe("real final");
+  });
+
+  it("preserves internal/edge spacing of a genuine message", () => {
+    expect(messageText("  hello world  ")).toBe("  hello world  ");
+  });
+
+  it("returns '' (no throw) for a revoked Proxy payload", () => {
+    const revocable = Proxy.revocable({ text: "x" }, {});
+    revocable.revoke();
+    let out = "unset";
+    expect(() => {
+      out = messageText(revocable.proxy);
+    }).not.toThrow();
+    expect(out).toBe("");
+  });
+
   it("returns '' (never [object Object]) for an unreadable object so callers can fall back", () => {
     const out = messageText({ foo: 1, bar: 2 });
     expect(out).not.toBe("[object Object]");

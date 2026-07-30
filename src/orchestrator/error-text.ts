@@ -117,34 +117,45 @@ const MESSAGE_TEXT_KEYS = ["text", "content", "value", "output_text", "message"]
 
 function coerceMessageText(value: unknown, depth: number): string {
   if (typeof value === "string") {
-    // The literal sentinel is never real content — treat it as empty so the
-    // caller falls back to the streamed text rather than displaying it.
-    return value === "[object Object]" ? "" : value;
+    // Judge EMPTINESS on the trimmed form: whitespace-only text and a padded
+    // sentinel (e.g. " [object Object] ") are both non-content and must fall
+    // through so a real sibling key (content/value/…) or the streamed fallback
+    // wins — but return the ORIGINAL string (preserving spacing) for genuine text.
+    const trimmed = value.trim();
+    if (trimmed === "" || trimmed === "[object Object]") return "";
+    return value;
   }
   if (value == null) return "";
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   if (depth > 6) return ""; // defend against adversarial / cyclic nesting
-  if (Array.isArray(value)) {
-    const parts: string[] = [];
-    for (const part of value) {
-      const t = coerceMessageText(part, depth + 1);
-      if (t) parts.push(t);
-    }
-    return parts.join("");
-  }
-  if (typeof value === "object") {
-    for (const key of MESSAGE_TEXT_KEYS) {
-      let inner: unknown;
-      try {
-        inner = (value as Record<string, unknown>)[key];
-      } catch {
-        continue; // throwing getter/proxy — try the next candidate key
+  // Wrap ALL structural inspection (Array.isArray + every property read) in one
+  // try/catch: a revoked/hostile Proxy can throw on the type check itself, and
+  // normalization must degrade to "" rather than propagate the throw.
+  try {
+    if (Array.isArray(value)) {
+      const parts: string[] = [];
+      for (const part of value) {
+        const t = coerceMessageText(part, depth + 1);
+        if (t) parts.push(t);
       }
-      if (inner == null) continue;
-      const t = coerceMessageText(inner, depth + 1);
-      if (t) return t;
+      return parts.join("");
     }
-    return "";
+    if (typeof value === "object") {
+      for (const key of MESSAGE_TEXT_KEYS) {
+        let inner: unknown;
+        try {
+          inner = (value as Record<string, unknown>)[key];
+        } catch {
+          continue; // throwing getter/proxy on this key — try the next candidate
+        }
+        if (inner == null) continue;
+        const t = coerceMessageText(inner, depth + 1);
+        if (t) return t;
+      }
+      return "";
+    }
+  } catch {
+    return ""; // revoked Proxy / hostile trap — never propagate
   }
   return "";
 }
