@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.20] - 2026-07-30
+
+### Fixed
+- **`comfy_cli_*` tools resolve the workspace/venv CLI and fall back to the connected server (#506, #403, #360, #487).** Custom-node source tools now resolve the CLI from the saved default workspace when `COMFYUI_PATH` is unset (#506, #403); `comfy_cli_models` falls back to the connected server's API when the CLI is present-but-unsupported (not only absent — #487); and `comfy_cli_jobs` wait accepts the documented singular `promptId` (#360). (#510)
+- **Graph tools resolve a single authoritative workflow-tab target + rebind after reconnect (#478, #481, #459).** Pinned/active/nested-exec graph calls now resolve to the SAME correct tab (canonical `workflow_path` injection, fail-closed, strict rebind) instead of reading/editing a different workflow, and the session rebinds (with node-info cache invalidation) after a reboot/reload. (#512)
+- **Manager client detects and routes to ComfyUI-Manager 3.x-legacy vs v4/Desktop dialects (#423, #424, #425, #371).** Reboot now probes v2-POST → legacy-GET → legacy-POST with an SPA-catchall guard (a `200 text/html` from an unknown GET is no longer mistaken for a fired reboot); `panel_restart_comfyui` falls back to the headless managed restart for a LOCAL server with no working reboot endpoint (never for remote, never during a render); and legacy Manager self-update falls back to `git pull`. (#513)
+
 ## [0.48.19] - 2026-07-30
 
 ### Fixed
