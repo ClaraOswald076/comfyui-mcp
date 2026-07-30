@@ -18,6 +18,7 @@ import {
   makePanelToolCtx,
   registerPanelTools,
   __openWorkflowTestHooks,
+  __panelToolsTestHooks,
   type PanelToolCtx,
 } from "../../orchestrator/panel-tools.js";
 import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
@@ -536,6 +537,248 @@ describe("panel-tools: workflow target (per-workflow agent)", () => {
     });
     const text = (res.content[0] as { text: string }).text;
     expect(text).toContain("Pinned");
+  });
+});
+
+describe("panel-tools: single authoritative pin resolution (#259 wrong-tab)", () => {
+  // A bridge whose workflow_list reports the OPEN tabs. Pinning must bind to the
+  // authoritative record (canonical key), and FAIL CLOSED when the target isn't open.
+  function listBridge(workflows: Array<Record<string, unknown>>, active?: Record<string, unknown>) {
+    const sent: Record<string, unknown>[] = [];
+    const bridge = {
+      send: async (cmd: Record<string, unknown>) => {
+        sent.push(cmd);
+        if (cmd.cmd === "workflow_list") return { workflows, active: active ?? workflows[0] };
+        return { ok: true };
+      },
+      push: () => 1,
+      canReach: () => true,
+      resolveActiveTabId: () => "test-tab",
+    } as unknown as PanelToolCtx["bridge"];
+    return { bridge, sent };
+  }
+
+  it("canonicalizes a pin to the open workflow's stable key", async () => {
+    const store = new WorkflowTargetStore();
+    const { bridge } = listBridge([
+      { path: "workflows/LTX.json", filename: "LTX.json", key: "wf-ltx-key" },
+      { path: "workflows/krea.json", filename: "krea.json", key: "wf-krea-key" },
+    ]);
+    const ctx = makePanelToolCtx(bridge, "test-tab", store);
+    const res = await defByName("panel_set_workflow_target").handler(
+      { mode: "pinned", path: "workflows/LTX.json" },
+      ctx,
+    );
+    expect(res.isError).toBeFalsy();
+    // Pin stored by canonical key so routing survives rename/reconnect (#259).
+    expect(store.get("test-tab")).toMatchObject({ mode: "pinned", path: "wf-ltx-key" });
+  });
+
+  it("FAILS CLOSED when pinning to a workflow that is not open (never routes to another tab)", async () => {
+    const store = new WorkflowTargetStore();
+    const { bridge } = listBridge([
+      { path: "workflows/krea.json", filename: "krea.json", key: "wf-krea-key" },
+    ]);
+    const ctx = makePanelToolCtx(bridge, "test-tab", store);
+    const res = await defByName("panel_set_workflow_target").handler(
+      { mode: "pinned", path: "workflows/LTX23_10Eros_KREA_StartFrame_I2V.json" },
+      ctx,
+    );
+    expect(res.isError).toBe(true);
+    expect((res.content[0] as { text: string }).text).toMatch(/not open/i);
+    // Nothing was pinned — the session stays on "current" rather than a wrong tab.
+    expect(store.get("test-tab")).toMatchObject({ mode: "current" });
+  });
+
+  it("live-canvas capture (graph_serialize) carries the pinned workflow_path, not the visible tab", async () => {
+    const store = new WorkflowTargetStore();
+    store.set("test-tab", { mode: "pinned", path: "wf-pinned-key" });
+    const sent: Record<string, unknown>[] = [];
+    const bridge = {
+      send: async (cmd: Record<string, unknown>) => {
+        sent.push(cmd);
+        if (cmd.cmd === "graph_serialize") return { workflow: { nodes: [], links: [] } };
+        return { ok: true };
+      },
+      push: () => 1,
+      canReach: () => true,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, "test-tab", store);
+    // No pack/path/graph args ⇒ resolveWorkflowInput captures the live canvas.
+    await defByName("panel_flatten_workflow").handler({}, ctx);
+    const serialize = sent.find((c) => c.cmd === "graph_serialize");
+    expect(serialize).toBeDefined();
+    // The direct bridge.send must inject the pin so it reads the PINNED workflow.
+    expect(serialize).toMatchObject({ workflow_path: "wf-pinned-key" });
+  });
+
+  it("panel_screenshot carries the pinned workflow_path (direct graph_screenshot send)", async () => {
+    const store = new WorkflowTargetStore();
+    store.set("test-tab", { mode: "pinned", path: "wf-pinned-key" });
+    const sent: Record<string, unknown>[] = [];
+    const bridge = {
+      send: async (cmd: Record<string, unknown>) => {
+        sent.push(cmd);
+        return { image: "iVBORw0KGgo=", mimeType: "image/png" };
+      },
+      push: () => 1,
+      canReach: () => true,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, "test-tab", store);
+    await defByName("panel_screenshot").handler({}, ctx);
+    expect(sent[0]).toMatchObject({ cmd: "graph_screenshot", workflow_path: "wf-pinned-key" });
+  });
+});
+
+describe("panel-tools: post-reconnect retry-once (#278/#310/#332/#481)", () => {
+  beforeAll(() => __panelToolsTestHooks.setRetrySettleMs(0));
+  afterAll(() => __panelToolsTestHooks.setRetrySettleMs(null));
+
+  // A bridge that DROPS the first send (the tab was replaced under a new id during a
+  // reboot/free_vram/reconnect), then serves the reconnected tab on the retry.
+  function droppingBridge() {
+    const sent: Array<{ cmd: Record<string, unknown>; tabId?: string }> = [];
+    let live = new Set(["old-tab"]);
+    let dropsLeft = 1;
+    const bridge = {
+      send: async (cmd: Record<string, unknown>, opts?: { tabId?: string }) => {
+        const id = opts?.tabId;
+        if (dropsLeft > 0) {
+          dropsLeft--;
+          live = new Set(["new-tab"]); // the tab reconnected under a fresh id
+          throw new Error(`no connected tab with id "${id}". Connected: none`);
+        }
+        if (id && !live.has(id)) throw new Error(`no connected tab with id "${id}"`);
+        sent.push({ cmd, tabId: id });
+        return { ok: true, routedTo: id };
+      },
+      push: () => 1,
+      canReach: (id: string) => live.has(id),
+      resolveActiveTabId: () => {
+        if (live.size === 1) return [...live][0];
+        if (live.size === 0) throw new Error("Panel not reachable: no panel connected");
+        throw new Error("Multiple panel tabs are connected and none is last active — pass tab_id.");
+      },
+    } as unknown as PanelToolCtx["bridge"];
+    return { bridge, sent };
+  }
+
+  it("idempotent read (graph_get_errors) rebinds and succeeds after a mid-command drop (#310)", async () => {
+    const store = new WorkflowTargetStore();
+    const { bridge, sent } = droppingBridge();
+    const ctx = makePanelToolCtx(bridge, "old-tab", store);
+    const res = await defByName("panel_get_errors").handler({}, ctx);
+    expect(res.isError).toBeFalsy();
+    expect(ctx.tabId).toBe("new-tab"); // rebound onto the reconnected tab
+    expect(sent.at(-1)?.tabId).toBe("new-tab");
+  });
+
+  it("idempotent UI write (set_todo) survives a post-restart reconnect race (#481)", async () => {
+    const store = new WorkflowTargetStore();
+    const { bridge, sent } = droppingBridge();
+    const ctx = makePanelToolCtx(bridge, "old-tab", store);
+    const res = await defByName("panel_set_todo").handler({ items: [] }, ctx);
+    expect(res.isError).toBeFalsy();
+    expect(sent.at(-1)?.cmd).toMatchObject({ cmd: "set_todo" });
+    expect(sent.at(-1)?.tabId).toBe("new-tab");
+  });
+
+  it("Manager-backed list (nodes_list) retries a bare Failed-to-fetch during reconnect (#332)", async () => {
+    const store = new WorkflowTargetStore();
+    const sent: Array<{ tabId?: string }> = [];
+    let dropsLeft = 1;
+    let live = new Set(["old-tab"]);
+    const bridge = {
+      send: async (_cmd: Record<string, unknown>, opts?: { tabId?: string }) => {
+        if (dropsLeft > 0) {
+          dropsLeft--;
+          live = new Set(["new-tab"]);
+          throw new Error("Failed to fetch");
+        }
+        sent.push({ tabId: opts?.tabId });
+        return { nodes: [] };
+      },
+      push: () => 1,
+      canReach: (id: string) => live.has(id),
+      resolveActiveTabId: () => [...live][0],
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, "old-tab", store);
+    const res = await defByName("panel_list_nodes").handler({}, ctx);
+    expect(res.isError).toBeFalsy();
+    expect(sent.at(-1)?.tabId).toBe("new-tab");
+  });
+
+  it("MUTATING edit (graph_add_node) is NOT retried — no double-apply — and errors clearly", async () => {
+    const store = new WorkflowTargetStore();
+    const { bridge, sent } = droppingBridge();
+    const ctx = makePanelToolCtx(bridge, "old-tab", store);
+    const res = await defByName("panel_add_node").handler({ class_type: "KSampler" }, ctx);
+    expect(res.isError).toBe(true);
+    expect((res.content[0] as { text: string }).text).toMatch(/no connected tab/i);
+    // The drop happened before any successful send — nothing was applied twice.
+    expect(sent.length).toBe(0);
+  });
+
+  // Real-bridge behavior: with 2+ live tabs, resolveActiveTabId falls back to
+  // lastActiveTabId (does NOT throw). The SILENT auto-heal must NOT ride that
+  // fallback onto an unrelated tab — it must be strict-single (codex FAIL fix).
+  function multiTabBridge(liveTabs: string[], lastActive: string) {
+    const sent: Array<{ cmd: Record<string, unknown>; tabId?: string }> = [];
+    const live = new Set(liveTabs);
+    const bridge = {
+      send: async (cmd: Record<string, unknown>, opts?: { tabId?: string }) => {
+        const id = opts?.tabId;
+        if (id && !live.has(id)) throw new Error(`no connected tab with id "${id}". Connected: none`);
+        sent.push({ cmd, tabId: id });
+        return { ok: true, routedTo: id };
+      },
+      push: () => 1,
+      canReach: (id: string) => live.has(id),
+      tabs: () => liveTabs.map((t) => ({ tab_id: t, title: t, connected_at: 0 })),
+      // Mirrors the REAL bridge: returns last-active for 2+ tabs (no throw).
+      resolveActiveTabId: () => lastActive,
+    } as unknown as PanelToolCtx["bridge"];
+    return { bridge, sent };
+  }
+
+  it("does NOT silently auto-heal onto last-active among MULTIPLE live tabs (#265/#210 wrong-tab)", async () => {
+    const store = new WorkflowTargetStore();
+    // Session's own tab is dead; two OTHER tabs are live with a last-active fallback.
+    const { bridge, sent } = multiTabBridge(["wan-tab", "flux-tab"], "flux-tab");
+    const ctx = makePanelToolCtx(bridge, "dead-session-tab", store);
+    const res = await defByName("panel_get_errors").handler({}, ctx);
+    // Strict-single: refuses to guess, so the call errors instead of routing to flux.
+    expect(res.isError).toBe(true);
+    expect(ctx.tabId).toBe("dead-session-tab"); // never hijacked onto last-active
+    expect(sent.length).toBe(0);
+  });
+
+  it("panel_reload refuses to guess among multiple live tabs when orphaned", async () => {
+    const store = new WorkflowTargetStore();
+    const { bridge } = multiTabBridge(["a-tab", "b-tab"], "b-tab");
+    const ctx = makePanelToolCtx(bridge, "dead-session-tab", store);
+    const res = await defByName("panel_reload").handler({}, ctx);
+    expect(res.isError).toBe(true);
+    expect((res.content[0] as { text: string }).text).toMatch(/multiple tabs/i);
+  });
+
+  it("a genuinely-gone tab (no reconnect) still fails clearly after the single retry", async () => {
+    const store = new WorkflowTargetStore();
+    // Nothing ever becomes live — retry can't rebind, so it must surface an error.
+    const bridge = {
+      send: async (_cmd: Record<string, unknown>, opts?: { tabId?: string }) => {
+        throw new Error(`no connected tab with id "${opts?.tabId}". Connected: none`);
+      },
+      push: () => 1,
+      canReach: () => false,
+      resolveActiveTabId: () => {
+        throw new Error("Panel not reachable: no panel connected");
+      },
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, "gone-tab", store);
+    const res = await defByName("panel_get_errors").handler({}, ctx);
+    expect(res.isError).toBe(true);
+    expect((res.content[0] as { text: string }).text).toMatch(/reconnect|no connected tab/i);
   });
 });
 
