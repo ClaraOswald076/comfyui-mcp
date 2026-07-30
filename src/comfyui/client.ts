@@ -159,17 +159,21 @@ export async function getObjectInfo(): Promise<ObjectInfo> {
   };
 
   const inflight = (async () => {
+    // Capture the client this request runs on so the catch only resets THIS one.
+    const startClient = getClient();
     try {
-      return commit((await getClient().getNodeDefs()) as unknown as ObjectInfo);
+      return commit((await startClient.getNodeDefs()) as unknown as ObjectInfo);
     } catch (err) {
       // A managed restart/reboot leaves the cached client bound to a socket that
       // was torn down, so the first call after it surfaces a bare "fetch failed"
       // (issue #376). Drop the stale client and retry once against a fresh one
       // before giving up — this is exactly the reconnect the caller expects.
+      // Only reset if OUR client is still current: a concurrent reset may have
+      // already installed a newer client we must not close.
       logger.warn("getObjectInfo failed; resetting client and retrying once", {
         error: err instanceof Error ? err.message : String(err),
       });
-      resetClient();
+      resetClientIfCurrent(startClient);
       return commit((await getClient().getNodeDefs()) as unknown as ObjectInfo);
     }
   })();
@@ -379,6 +383,20 @@ export function resetClient(): void {
   }
 }
 
+/**
+ * Reset the singleton ONLY if it is still the client the caller was using. A
+ * failing request captures its client at start and passes it here in its catch;
+ * if a concurrent reset (resetObjectInfoCache abandons the in-flight slot) already
+ * spun up a NEW client in the meantime, we must not close that newer client + its
+ * fresh WebSocket out from under whoever created it (codex WS-3 round-2 finding).
+ * Returns true if it actually reset. A null argument never resets.
+ */
+export function resetClientIfCurrent(client: Client | null): boolean {
+  if (!client || clientInstance !== client) return false;
+  resetClient();
+  return true;
+}
+
 export function getComfyUIPath(): string | undefined {
   if (isCloudMode()) return cloudClient.getComfyUIPath();
   return config.comfyuiPath;
@@ -395,13 +413,16 @@ export async function getLogs(): Promise<string[]> {
   // a fresh one before giving up, and surface the underlying error if it still
   // fails so callers see more than "fetch failed".
   let text: string;
+  // Capture the client this request runs on so the catch only resets THIS one
+  // (not a newer client a concurrent reset may have installed).
+  const startClient = getClient();
   try {
-    text = await getClient().fetchApi("/internal/logs").then((r) => r.text());
+    text = await startClient.fetchApi("/internal/logs").then((r) => r.text());
   } catch (err) {
     logger.warn("getLogs failed; resetting client and retrying once", {
       error: err instanceof Error ? err.message : String(err),
     });
-    resetClient();
+    resetClientIfCurrent(startClient);
     try {
       text = await getClient().fetchApi("/internal/logs").then((r) => r.text());
     } catch (err2) {
