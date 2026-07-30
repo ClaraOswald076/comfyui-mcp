@@ -40,10 +40,13 @@ describe("download job registry", () => {
     expect(job.error).toBeUndefined();
   });
 
-  it("uses the same id as the panel tray so both name one download", () => {
+  it("exposes the URL-only tray id for progress correlation, plus a distinct job id", () => {
     const { job } = startDownloadJob(URL_A, "checkpoints");
-    expect(job.id).toBe(downloadIdFor(URL_A));
+    // trayId matches the panel tray / progress-file row (URL-only hash).
+    expect(job.trayId).toBe(downloadIdFor(URL_A));
+    // The public job id is distinct (keyed by URL+destination) but still 16 hex.
     expect(job.id).toHaveLength(16);
+    expect(getDownloadJob(job.id)?.trayId).toBe(job.trayId);
   });
 
   it("adopts an in-flight download instead of starting a second copy", async () => {
@@ -66,10 +69,18 @@ describe("download job registry", () => {
   it("keys jobs by URL AND destination so different targets don't collapse", () => {
     // Same URL fetched to two different destinations must be two downloads —
     // collapsing them wrote only the first destination while reporting both done.
-    startDownloadJob(URL_A, "checkpoints");
-    startDownloadJob(URL_A, "loras", "renamed.safetensors");
+    const a = startDownloadJob(URL_A, "checkpoints");
+    const b = startDownloadJob(URL_A, "loras", "renamed.safetensors");
     expect(hoisted.calls).toBe(2);
     expect(listDownloadJobs()).toHaveLength(2);
+    // Each has a DISTINCT public id and is individually pollable via that id,
+    // even though they share the URL-only trayId.
+    expect(a.job.id).not.toBe(b.job.id);
+    expect(a.job.trayId).toBe(b.job.trayId);
+    expect(getDownloadJob(a.job.id)).toBe(a.job);
+    expect(getDownloadJob(b.job.id)).toBe(b.job);
+    expect(getDownloadJob(a.job.id)?.target_subfolder).toBe("checkpoints");
+    expect(getDownloadJob(b.job.id)?.target_subfolder).toBe("loras");
   });
 
   it("records the landed path on success", async () => {
@@ -95,9 +106,9 @@ describe("download job registry", () => {
     hoisted.resolvers[0].reject(new Error("network reset"));
     await first.settled;
     // Adoption must not pin a dead job forever — a retry has to start a new one.
-    startDownloadJob(URL_A, "checkpoints");
+    const retry = startDownloadJob(URL_A, "checkpoints");
     expect(hoisted.calls).toBe(2);
-    expect(getDownloadJob(downloadIdFor(URL_A))?.status).toBe("downloading");
+    expect(getDownloadJob(retry.job.id)?.status).toBe("downloading");
   });
 
   it("lists newest first", async () => {

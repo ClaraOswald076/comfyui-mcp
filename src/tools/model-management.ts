@@ -162,7 +162,7 @@ export function registerModelManagementTools(server: McpServer): void {
           return errorToToolResult(new ModelError(job.error ?? "Download failed", { url: args.url }));
         }
 
-        const p = readDownloadProgress(job.id);
+        const p = readDownloadProgress(job.trayId);
         const pct =
           p && p.total > 0 ? ` (${Math.floor((p.downloaded / p.total) * 100)}%)` : "";
         return {
@@ -216,7 +216,7 @@ export function registerModelManagementTools(server: McpServer): void {
         }
 
         const lines = list.map((j) => {
-          const p = readDownloadProgress(j.id);
+          const p = readDownloadProgress(j.trayId);
           const bytes =
             p && p.total > 0
               ? `  ${(p.downloaded / 1024 ** 3).toFixed(2)}/${(p.total / 1024 ** 3).toFixed(2)} GB (${Math.floor((p.downloaded / p.total) * 100)}%)`
