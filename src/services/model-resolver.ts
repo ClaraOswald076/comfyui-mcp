@@ -737,6 +737,16 @@ export async function downloadModel(
   targetSubfolder: string,
   filename?: string,
   auth?: DownloadAuth,
+  /**
+   * The ALREADY-DECIDED route (Manager vs local disk). startDownloadJob computes
+   * shouldDispatchDownloadToManager() ONCE to key the job identity, then threads
+   * that same decision here so the writer can never diverge from the key — a
+   * reconnect/reachability flip BETWEEN two evaluations would otherwise split the
+   * job (Manager-key + local-writer, or a duplicate job) (#420 codex round 1).
+   * Omitted by direct callers (the download_model tool path without a job), which
+   * evaluate the predicate themselves.
+   */
+  dispatchToManager?: boolean,
 ): Promise<string> {
   // Region flags (issue #127) applied at THE choke point every download path
   // funnels through (local disk AND the remote Manager dispatch below).
@@ -754,7 +764,13 @@ export async function downloadModel(
   // can carry query params); header/basic/bearer auth can't be forwarded to
   // Manager, so those are surfaced as a clear warning rather than reported as a
   // clean success.
-  if (await shouldDispatchDownloadToManager()) {
+  // Use the route the caller already decided (job path), else evaluate it now
+  // (direct callers). Never re-evaluate when a decision was threaded in — that is
+  // the split-brain guard: the writer must follow the SAME route the job id was
+  // keyed on, even if reachability/base config flipped since (#420 codex round 1).
+  const routeToManager =
+    dispatchToManager ?? (await shouldDispatchDownloadToManager());
+  if (routeToManager) {
     return downloadModelViaManagerRemote(url, targetSubfolder, filename, auth);
   }
 

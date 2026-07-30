@@ -130,7 +130,14 @@ export async function startDownloadJob(
   // reconnect case: a nominally-local session whose effective base was lost still
   // routes through the connected Manager (and must NOT try to resolve a local
   // targetPath, which would throw), keying by the same canonical remote identity.
-  const id = (await shouldDispatchDownloadToManager())
+  //
+  // CRITICAL: evaluate the route EXACTLY ONCE and thread it into downloadModel
+  // below. The predicate awaits live /system_stats and reads mutable base config,
+  // so a reconnect/reachability flip between two evaluations would split the job —
+  // Manager-key + local-writer (or a duplicate job) for one request (#420 codex
+  // round 1). One decision keys the identity AND drives the writer.
+  const dispatchToManager = await shouldDispatchDownloadToManager();
+  const id = dispatchToManager
     ? remoteDownloadJobIdFor(url, targetSubfolder, filename)
     : downloadJobIdFor((await resolveDownloadTarget(url, targetSubfolder, filename)).targetPath);
   const trayId = downloadIdFor(url);
@@ -156,7 +163,7 @@ export async function startDownloadJob(
 
   // The promise is stored, never left dangling — an unhandled rejection here
   // would take down the process on a simple 404.
-  const settled = downloadModel(url, targetSubfolder, filename, auth)
+  const settled = downloadModel(url, targetSubfolder, filename, auth, dispatchToManager)
     .then(async (path) => {
       job.path = path;
       if (onComplete) {

@@ -233,6 +233,7 @@ describe("download_civitai_model", () => {
       "checkpoints",
       "cool.safetensors",
       undefined,
+      false, // routing decision threaded through (local, #420 codex round 1)
     );
     expect(res.isError).toBeFalsy();
     expect(res.content[0].text).toContain("Cool Model");
@@ -256,6 +257,7 @@ describe("download_civitai_model", () => {
       "loras",
       "v.safetensors",
       undefined,
+      false, // routing decision threaded through (local, #420 codex round 1)
     );
     expect(res.isError).toBeFalsy();
   });
@@ -293,6 +295,7 @@ describe("download_civitai_model", () => {
       "loras",
       "custom.safetensors",
       undefined,
+      false, // routing decision threaded through (local, #420 codex round 1)
     );
   });
 

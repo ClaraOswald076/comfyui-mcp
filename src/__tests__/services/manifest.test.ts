@@ -249,6 +249,7 @@ describe("applyManifest", () => {
       "loras",
       "model.safetensors",
       undefined,
+      false, // routing decision threaded through (local, #420 codex round 1)
     );
   });
 
@@ -410,6 +411,7 @@ describe("applyManifest", () => {
       expect.stringMatching(/checkpoints[\\/]foo/),
       "model.safetensors",
       undefined,
+      false, // routing decision threaded through (local, #420 codex round 1)
     );
   });
 
@@ -434,6 +436,7 @@ describe("applyManifest", () => {
       "loras",
       "new.safetensors",
       undefined,
+      false, // routing decision threaded through (local, #420 codex round 1)
     );
   });
 

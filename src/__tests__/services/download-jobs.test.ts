@@ -5,6 +5,14 @@ const hoisted = vi.hoisted(() => ({
   calls: 0,
   remote: false,
   resolveTargetCalls: 0,
+  // Routing-predicate instrumentation. `dispatchQueue` lets a test make the
+  // predicate FLIP between evaluations; `dispatchEvals` counts how many times it
+  // was actually evaluated; `lastDispatchArg` records the decision threaded into
+  // downloadModel — together they prove the route is decided ONCE and the writer
+  // follows it (#420 codex round 1 split-brain guard).
+  dispatchQueue: [] as boolean[],
+  dispatchEvals: 0,
+  lastDispatchArg: undefined as boolean | undefined,
 }));
 
 // isRemoteMode gates the identity branch in startDownloadJob. Keep every other
@@ -26,15 +34,24 @@ vi.mock("../../config.js", async () => {
 vi.mock("../../services/model-resolver.js", () => ({
   // The single routing decision startDownloadJob now consults to choose the job
   // identity: manager-dispatch (remote OR #420 reconnect-fallback) skips local
-  // target resolution; local streams key by the resolved targetPath. Driven by the
-  // same `hoisted.remote` flag so the existing remote-mode assertions hold.
-  shouldDispatchDownloadToManager: vi.fn(async () => hoisted.remote),
-  downloadModel: vi.fn((url: string) => {
-    hoisted.calls += 1;
-    return new Promise<string>((resolve, reject) => {
-      hoisted.resolvers.push({ resolve, reject, url });
-    });
+  // target resolution; local streams key by the resolved targetPath. `dispatchQueue`
+  // (when non-empty) supplies successive return values so a test can FLIP the
+  // predicate between evaluations; otherwise it mirrors `hoisted.remote`.
+  shouldDispatchDownloadToManager: vi.fn(async () => {
+    hoisted.dispatchEvals += 1;
+    return hoisted.dispatchQueue.length ? hoisted.dispatchQueue.shift()! : hoisted.remote;
   }),
+  // Capture the routing decision THREADED IN by startDownloadJob (5th arg) so a
+  // test can assert the writer used the job's decision, not a fresh evaluation.
+  downloadModel: vi.fn(
+    (url: string, _sub?: string, _fn?: string, _auth?: unknown, dispatchToManager?: boolean) => {
+      hoisted.calls += 1;
+      hoisted.lastDispatchArg = dispatchToManager;
+      return new Promise<string>((resolve, reject) => {
+        hoisted.resolvers.push({ resolve, reject, url });
+      });
+    },
+  ),
   resolveDownloadTarget: vi.fn(async (url: string, sub: string, filename?: string) => {
     hoisted.resolveTargetCalls += 1;
     const s = String(sub ?? "").trim();
@@ -66,6 +83,9 @@ describe("download job registry", () => {
     hoisted.calls = 0;
     hoisted.remote = false;
     hoisted.resolveTargetCalls = 0;
+    hoisted.dispatchQueue.length = 0;
+    hoisted.dispatchEvals = 0;
+    hoisted.lastDispatchArg = undefined;
     resetDownloadJobs();
   });
 
@@ -189,6 +209,35 @@ describe("download job registry", () => {
     const again = await startDownloadJob(URL_A, "loras");
     expect(again.job).toBe(job);
     expect(hoisted.calls).toBe(1);
+  });
+
+  it("#420 split-brain guard: the writer follows the job's ONE routing decision even if reachability would flip", async () => {
+    // The predicate awaits live /system_stats + mutable base config, so it could
+    // return DIFFERENT answers at the two points it used to be evaluated (job-id
+    // keying, then the writer). Model that flip: first eval → Manager, a hypothetical
+    // second eval → local. The fix evaluates ONCE and threads the result through, so:
+    hoisted.dispatchQueue.push(true, false); // [job-eval → true, would-be writer-eval → false]
+    const { job } = await startDownloadJob(URL_A, "loras");
+    // Keyed as a Manager job off the FIRST (only) evaluation — no local target resolved.
+    expect(hoisted.resolveTargetCalls).toBe(0);
+    // The predicate was evaluated EXACTLY ONCE (the "false" in the queue is untouched)…
+    expect(hoisted.dispatchEvals).toBe(1);
+    expect(hoisted.dispatchQueue).toEqual([false]);
+    // …and the writer received that SAME decision (true), NOT a fresh re-evaluation.
+    expect(hoisted.lastDispatchArg).toBe(true);
+    // One request → one writer, one job. No split, no duplicate.
+    expect(hoisted.calls).toBe(1);
+    expect(listDownloadJobs()).toHaveLength(1);
+  });
+
+  it("threads the LOCAL decision into the writer too (not just the Manager case)", async () => {
+    // Symmetric guard: a local job must hand downloadModel dispatchToManager=false
+    // so the writer streams to the same targetPath the id was keyed on.
+    hoisted.remote = false;
+    await startDownloadJob(URL_A, "checkpoints");
+    expect(hoisted.resolveTargetCalls).toBe(1); // local id keyed by resolved target
+    expect(hoisted.dispatchEvals).toBe(1);
+    expect(hoisted.lastDispatchArg).toBe(false);
   });
 
   it("lists newest first", async () => {

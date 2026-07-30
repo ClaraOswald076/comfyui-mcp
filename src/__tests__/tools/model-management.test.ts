@@ -10,6 +10,9 @@ vi.mock("../../services/model-resolver.js", async () => {
     ...actual,
     downloadModel: (...a: unknown[]) => downloadModelMock(...a),
     listLocalModels: (...a: unknown[]) => listLocalModelsMock(...a),
+    // Deterministic local routing (no live server probe) so startDownloadJob keys
+    // the job locally and threads dispatchToManager=false into downloadModel.
+    shouldDispatchDownloadToManager: async () => false,
     // startDownloadJob resolves the destination via this before streaming; stub
     // it so the tool tests don't need a live server to compute a targetPath.
     resolveDownloadTarget: async (url: string, sub: string, filename?: string) => {
@@ -67,6 +70,7 @@ describe("download_model tool", () => {
       "checkpoints",
       "x.safetensors",
       auth,
+      false, // routing decision threaded through (local, #420 codex round 1)
     );
     expect(res.isError).toBeFalsy();
   });
