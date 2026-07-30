@@ -73,16 +73,49 @@ describe("comfy_cli_models local fallback (#460)", () => {
     expect(data).toEqual({ folder: "loras", count: 2, files: ["a.safetensors", "b.safetensors"] });
   });
 
-  it("maps singular --type aliases to real folders for list-folder and search", async () => {
+  // Mirrors comfy-cli's _TYPE_TO_FOLDER (comfy_cli/command/models/search.py)
+  // EXACTLY — every alias must resolve to the same folder as the CLI.
+  const CLI_TYPE_TO_FOLDER: Record<string, string> = {
+    checkpoint: "checkpoints",
+    checkpoints: "checkpoints",
+    lora: "loras",
+    loras: "loras",
+    vae: "vae",
+    controlnet: "controlnet",
+    upscale: "upscale_models",
+    upscale_models: "upscale_models",
+    clip: "clip",
+    clip_vision: "clip_vision",
+    unet: "diffusion_models",
+    diffusion: "diffusion_models",
+    diffusion_models: "diffusion_models",
+    style: "style_models",
+    style_models: "style_models",
+    embeddings: "embeddings",
+    hypernetworks: "hypernetworks",
+    gligen: "gligen",
+  };
+
+  it("resolves every comfy-cli --type alias to the same folder for search", async () => {
     mocks.listLocalModels.mockResolvedValue([]);
     mocks.getSystemStats.mockResolvedValue({});
-    await listLocalModelsFallback({ action: "search", type: "checkpoint" });
-    await listLocalModelsFallback({ action: "search", type: "lora" });
-    await listLocalModelsFallback({ action: "search", type: "unet" });
+    const aliases = Object.keys(CLI_TYPE_TO_FOLDER);
+    for (const type of aliases) {
+      await listLocalModelsFallback({ action: "search", type });
+    }
+    expect(mocks.listLocalModels.mock.calls.map((c) => c[0])).toEqual(
+      aliases.map((a) => CLI_TYPE_TO_FOLDER[a]),
+    );
+  });
+
+  it("maps aliases for list-folder too (e.g. upscale→upscale_models, diffusion→diffusion_models)", async () => {
+    mocks.listLocalModels.mockResolvedValue([]);
+    mocks.getSystemStats.mockResolvedValue({});
+    await listLocalModelsFallback({ action: "list-folder", folder: "upscale" });
+    await listLocalModelsFallback({ action: "list-folder", folder: "diffusion" });
     await listLocalModelsFallback({ action: "list-folder", folder: "checkpoint" });
     expect(mocks.listLocalModels.mock.calls.map((c) => c[0])).toEqual([
-      "checkpoints",
-      "loras",
+      "upscale_models",
       "diffusion_models",
       "checkpoints",
     ]);

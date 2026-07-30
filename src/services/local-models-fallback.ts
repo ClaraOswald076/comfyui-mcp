@@ -14,29 +14,31 @@ import { config } from "../config.js";
 // ---------------------------------------------------------------------------
 
 /**
- * comfy-cli's `models search --type` accepts singular type aliases and maps them
- * to the real ComfyUI model folder before scanning (e.g. `checkpoint` →
- * `checkpoints`, `lora` → `loras`, `unet` → `diffusion_models`). The fallback
- * must apply the SAME mapping or a valid search returns a wrong empty result.
- * Unknown / already-canonical values pass through unchanged.
+ * comfy-cli's `models search --type` maps its `--type` value to the real ComfyUI
+ * model folder before scanning. This mirrors comfy-cli's `_TYPE_TO_FOLDER`
+ * (comfy_cli/command/models/search.py) EXACTLY so a `--type` that comfy-cli
+ * would resolve is resolved identically here — otherwise a valid fallback search
+ * returns a wrong empty result. Values not in the map pass through unchanged.
  */
 const TYPE_ALIASES: Record<string, string> = {
   checkpoint: "checkpoints",
+  checkpoints: "checkpoints",
   lora: "loras",
+  loras: "loras",
   vae: "vae",
-  unet: "diffusion_models",
-  diffusion_model: "diffusion_models",
   controlnet: "controlnet",
-  embedding: "embeddings",
+  upscale: "upscale_models",
+  upscale_models: "upscale_models",
   clip: "clip",
   clip_vision: "clip_vision",
-  text_encoder: "text_encoders",
-  upscale_model: "upscale_models",
-  hypernetwork: "hypernetworks",
-  style_model: "style_models",
-  diffuser: "diffusers",
+  unet: "diffusion_models",
+  diffusion: "diffusion_models",
+  diffusion_models: "diffusion_models",
+  style: "style_models",
+  style_models: "style_models",
+  embeddings: "embeddings",
+  hypernetworks: "hypernetworks",
   gligen: "gligen",
-  photomaker: "photomaker",
 };
 
 function resolveModelFolder(type: string): string {
