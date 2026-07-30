@@ -70,10 +70,11 @@ export function promptText(value: unknown): string {
       // `.parts` would otherwise return ""). Fall through to serialize/fallback.
       readOk = false;
     }
-    // A non-empty text field is authoritative. An EMPTY text alongside `parts`
-    // (or when the `.parts` read threw) must NOT win — that would drop content
-    // and yield an empty prompt; fall through to serialize the whole payload.
-    if (readOk && typeof text === "string" && (text || !hasParts)) return text;
+    // A non-empty text field is ALWAYS authoritative (even if the `.parts` read
+    // threw — the text itself is valid content). An EMPTY text may win only when
+    // the read succeeded AND there are no parts; otherwise fall through to
+    // serialize the whole payload rather than emit an empty prompt.
+    if (typeof text === "string" && (text || (readOk && !hasParts))) return text;
     try {
       const json = JSON.stringify(value);
       if (typeof json === "string" && json && json !== "{}") return json;
