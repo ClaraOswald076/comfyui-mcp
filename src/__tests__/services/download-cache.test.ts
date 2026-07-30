@@ -1859,4 +1859,39 @@ describe("downloadModel model-payload validation (#473)", () => {
     const landed = await readdir(join(comfyDir, "models", "loras")).catch(() => [] as string[]);
     expect(landed).toHaveLength(0);
   });
+
+  it("clears a STALE text/html .ct sidecar on a later clean octet-stream fill (no false rejection of a real model)", async () => {
+    // Regression: a `.ct` sidecar from an earlier HTML response must NOT attach to a
+    // later legitimate binary that fills the SAME cache key, or the real model would be
+    // wrongly rejected on reuse. Simulate an orphaned sidecar (payload evicted, .ct
+    // survived) then a clean octet-stream re-fill — it must succeed and clear the tag.
+    const url = "https://example.com/models/stale-ct"; // extensionless → shared key
+    const hash = cacheHashFor(url);
+    await mkdir(cacheDir, { recursive: true });
+    // Cold HTML via a .json (non-model) destination → writes payload + .ct=text/html.
+    fetchMock.mockResolvedValueOnce(
+      new Response("<html>hi</html>", {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "text/html" },
+      }),
+    );
+    await downloadModel(url, "checkpoints", "s.json");
+    // Simulate LRU evicting the payload but ORPHANING the sidecar (rm .ct swallowed).
+    await rm(join(cacheDir, hash), { force: true });
+    const ct = join(cacheDir, `.${hash}.ct`);
+    expect((await stat(ct)).size).toBeGreaterThan(0); // stale sidecar present
+    // Now a genuine octet-stream model fills the same key (cache miss → fresh fill).
+    const gguf = Buffer.concat([Buffer.from("GGUF"), Buffer.from([0x00, 0x01, 0x02, 0x03, 0x04])]);
+    fetchMock.mockResolvedValueOnce(
+      new Response(gguf, {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "application/octet-stream" },
+      }),
+    );
+    const out = await downloadModel(url, "loras", "clean.safetensors");
+    expect((await stat(out)).size).toBe(gguf.length); // NOT rejected
+    await expect(stat(ct)).rejects.toThrow(); // stale sidecar cleared
+  });
 });

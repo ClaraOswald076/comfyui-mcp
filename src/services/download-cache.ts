@@ -133,14 +133,23 @@ function isRejectableContentType(contentType: string): boolean {
   );
 }
 
-/** Persist the Content-Type beside a finalized cache file — ONLY for the reject-worthy
- *  shapes (text/html, application/json). Persisting every octet-stream/text-plain type
- *  would add a useless sidecar per cache entry; only an HTML/JSON label can flag a body
- *  that body-magic alone would miss on reuse, so that is the only type worth keeping. */
+/** Reconcile the Content-Type sidecar beside a freshly-finalized cache file. Writes it
+ *  ONLY for the reject-worthy shapes (text/html, application/json) — persisting every
+ *  octet-stream/text-plain type would add a useless sidecar per cache entry, and only
+ *  an HTML/JSON label can flag a body that body-magic alone would miss on reuse. For a
+ *  NON-reject-worthy (e.g. octet-stream) fill it REMOVES any pre-existing sidecar: a
+ *  clean model landing under a cache key that a prior HTML response had tagged
+ *  `text/html` must not inherit that stale tag and be wrongly rejected on reuse (#473 —
+ *  a false-positive against a legitimate model). */
 async function writeCacheContentType(cacheFilePath: string, contentType: string): Promise<void> {
-  if (!contentType || !isRejectableContentType(contentType)) return;
+  const sidecar = cacheCtSidecar(cacheFilePath);
+  if (!contentType || !isRejectableContentType(contentType)) {
+    // Clear any stale sidecar so it can't attach to these clean bytes.
+    await rm(sidecar, { force: true }).catch(() => undefined);
+    return;
+  }
   try {
-    await writeFile(cacheCtSidecar(cacheFilePath), contentType);
+    await writeFile(sidecar, contentType);
   } catch (err) {
     // Best effort — reuse falls back to body-magic-only validation, which still
     // catches every well-formed HTML/JSON page (only a synthetic body that sniffs
@@ -1503,8 +1512,16 @@ async function downloadIntoCache(
           { url: logUrl, bytes: resumeFromBytes },
         );
       }
-      await discardRejectedPayload(partial, `${partial}.etag`, logUrl ?? redactUrlForLogs(url));
-      await safeRm(rejectedMarker);
+      const neutralized = await discardRejectedPayload(
+        partial,
+        `${partial}.etag`,
+        logUrl ?? redactUrlForLogs(url),
+      );
+      // Keep the marker if the partial could NOT be neutralized (rm AND truncate both
+      // failed), so a still-poisoned leftover stays flagged for the next attempt.
+      // resumeFromBytes = 0 forces this attempt to re-download fresh ("w" truncates the
+      // leftover), so the poison is cleared here regardless.
+      if (neutralized) await safeRm(rejectedMarker);
       resumeFromBytes = 0;
     }
 
