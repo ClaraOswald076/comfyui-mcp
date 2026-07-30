@@ -235,11 +235,26 @@ async function streamUrlToFile(
   const validatorSidecar = `${targetPath}.etag`;
   let currentUrl = url;
   let currentHeaders = headers;
+  // How many bytes we will actually attempt to resume from. A resume is only
+  // SAFE when we can prove the upstream file is unchanged, which requires the
+  // validator (ETag/Last-Modified) we persisted on the first attempt. Without a
+  // sidecar — a stale partial from a pre-fix build, or a server that sent no
+  // validator — we cannot detect a changed file, so we must NOT append: fall
+  // back to a clean restart (Range omitted, the "w" flag truncates the partial).
+  let effectiveResume = resumeFromBytes;
   if (resumeFromBytes > 0) {
-    currentHeaders = { ...currentHeaders, Range: `bytes=${resumeFromBytes}-` };
-    if (resumable) {
-      const priorValidator = await readValidatorSidecar(validatorSidecar);
-      if (priorValidator) currentHeaders["If-Range"] = priorValidator;
+    const priorValidator = resumable
+      ? await readValidatorSidecar(validatorSidecar)
+      : null;
+    if (priorValidator) {
+      currentHeaders = {
+        ...currentHeaders,
+        Range: `bytes=${resumeFromBytes}-`,
+        "If-Range": priorValidator,
+      };
+    } else {
+      // No trustworthy validator → discard the un-verifiable partial state.
+      effectiveResume = 0;
     }
   }
   let res: Response;
@@ -320,28 +335,29 @@ async function streamUrlToFile(
     throw new ModelError("Download response has no body", { url: logUrl });
   }
 
-  // Decide append vs truncate based on the response. If we asked for a range
-  // and got 206, append; any other 2xx (typically 200) means the server is
-  // sending the full file so we must overwrite. A 200 to a range request is
-  // exactly what If-Range yields when the upstream file changed — the truncate
-  // path below discards the stale prefix and restarts, which is correct.
-  const appendMode = resumeFromBytes > 0 && res.status === 206;
+  // Decide append vs truncate based on the response. We only append when we
+  // actually asked for a range (effectiveResume > 0, i.e. we had a validator)
+  // AND the server honoured it with a 206. Any other 2xx (typically 200) means
+  // the server is sending the full file — exactly what If-Range yields when the
+  // upstream file changed — so we overwrite and restart, which is correct.
+  const appendMode = effectiveResume > 0 && res.status === 206;
 
   if (appendMode) {
-    // #343 edge: a 206 MUST resume from exactly the byte we asked for. A server
-    // that echoes a different Content-Range start (misconfigured proxy/mirror)
-    // would make us append at the wrong offset and silently corrupt the file.
-    // Refuse to append in that case — drop the partial + validator so the next
+    // #343 edge: a 206 MUST prove it resumes from exactly the byte we asked for.
+    // Reject it unless the Content-Range parses AND its start equals our resume
+    // offset — a missing/malformed header, or a different start (misconfigured
+    // proxy/mirror), would otherwise make us append at the wrong offset and
+    // silently corrupt the file. Drop the partial + validator so the next
     // attempt starts clean rather than compounding the corruption.
     const contentRange = res.headers.get("content-range");
     const m = contentRange ? /bytes\s+(\d+)-\d+\/(?:\d+|\*)/i.exec(contentRange) : null;
-    if (m && Number(m[1]) !== resumeFromBytes) {
+    if (!m || Number(m[1]) !== effectiveResume) {
       await safeRm(targetPath);
       await safeRm(validatorSidecar);
       throw new ModelError(
-        `Download resume mismatch: server sent a 206 starting at byte ${m[1]} but we resumed ` +
-          `from ${resumeFromBytes}. Refusing to append (would corrupt the file). Removed the ` +
-          `partial; retry for a clean download.`,
+        `Download resume rejected: expected a 206 resuming at byte ${effectiveResume} but the ` +
+          `server's Content-Range was ${contentRange ? `"${contentRange}"` : "absent"}. Refusing ` +
+          `to append (would corrupt the file). Removed the partial; retry for a clean download.`,
         { url: logUrl, status: res.status },
       );
     }
@@ -349,15 +365,17 @@ async function streamUrlToFile(
 
   const flags = appendMode ? "a" : "w";
 
-  // Persist the upstream validator so a FUTURE resume of this partial can send
-  // If-Range and detect a changed file. Only meaningful for a full/fresh write
-  // (flags "w") of a resumable (.partial) target — write it before streaming so
-  // that if THIS stream truncates, the sidecar already matches the bytes on
-  // disk. On a 206 append the sidecar already exists and still matches.
+  // On a fresh/full write (restart) of a resumable target, make the validator
+  // and the on-disk bytes failure-atomic: first drop any stale sidecar AND the
+  // stale partial (so a crash here leaves NO validator → the next attempt has no
+  // sidecar and safely restarts), THEN persist the new validator so that once we
+  // begin writing, a truncated partial is already paired with a MATCHING
+  // validator. On a 206 append the existing sidecar already matches — leave it.
   if (resumable && !appendMode) {
+    await safeRm(validatorSidecar);
+    await safeRm(targetPath);
     const validator = res.headers.get("etag") || res.headers.get("last-modified");
     if (validator) await writeValidatorSidecar(validatorSidecar, validator);
-    else await safeRm(validatorSidecar);
   }
 
   const nodeStream = Readable.fromWeb(res.body as import("node:stream/web").ReadableStream);
@@ -366,7 +384,7 @@ async function streamUrlToFile(
   // Content-Length is the REMAINING bytes for a 206 resume, so add the bytes
   // already on disk to get the true expected total.
   const lengthHeader = Number(res.headers.get("content-length") || 0);
-  const expectedTotal = lengthHeader > 0 ? lengthHeader + (appendMode ? resumeFromBytes : 0) : 0;
+  const expectedTotal = lengthHeader > 0 ? lengthHeader + (appendMode ? effectiveResume : 0) : 0;
 
   // A pipeline() can resolve on a stream that ended EARLY (server dropped the
   // connection, proxy cut it, disk edge case) — leaving a 0-byte or truncated
@@ -384,13 +402,11 @@ async function streamUrlToFile(
     // hiccuped) → can't verify, so don't block a download over a missing number.
     if (actual === undefined) return;
     if (actual === 0) {
-      // Nothing landed — remove it so it can't masquerade as a real file / poison
-      // resume. Best-effort: rm may be stubbed, so never let it throw here.
-      try {
-        await rm(targetPath, { force: true });
-      } catch {
-        /* best effort */
-      }
+      // Nothing landed — remove it (and its validator sidecar) so it can't
+      // masquerade as a real file / poison a resume with a validator that has
+      // no matching bytes. Best-effort: never let cleanup throw here.
+      await safeRm(targetPath);
+      if (resumable) await safeRm(validatorSidecar);
       throw new ModelError(
         "Download produced a 0-byte file — the source sent no data. Removed it; retry.",
         { url: logUrl },
@@ -417,7 +433,7 @@ async function streamUrlToFile(
 
   // Tally bytes as they flow and report throughput to the panel tray.
   const total = expectedTotal;
-  let downloaded = appendMode ? resumeFromBytes : 0;
+  let downloaded = appendMode ? effectiveResume : 0;
   let windowStart = Date.now();
   let windowBytes = downloaded;
   let bytesPerSec = 0;

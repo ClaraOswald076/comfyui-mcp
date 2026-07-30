@@ -127,6 +127,9 @@ describe("downloadModel cache", () => {
     const hash = createHash("sha256").update(url).digest("hex").slice(0, 32);
     const partialPath = join(cacheDir, `.${hash}.safetensors.partial`);
     await writeFile(partialPath, "AAAA"); // 4 bytes of prior progress
+    // A resume is only attempted when we hold the validator captured on the
+    // first attempt (replayed as If-Range); seed it so the resume proceeds.
+    await writeFile(`${partialPath}.etag`, '"resume-etag"');
 
     // Server returns 206 with the remaining bytes.
     fetchMock.mockResolvedValueOnce(
@@ -157,6 +160,9 @@ describe("downloadModel cache", () => {
     const hash = createHash("sha256").update(url).digest("hex").slice(0, 32);
     const partialPath = join(cacheDir, `.${hash}.safetensors.partial`);
     await writeFile(partialPath, "STALE_PARTIAL_CONTENT");
+    // With a validator present we send Range+If-Range; the server ignoring the
+    // range (or the file having changed) replies 200 and we overwrite cleanly.
+    await writeFile(`${partialPath}.etag`, '"stale-etag"');
 
     fetchMock.mockResolvedValueOnce(okResponse("full body from server"));
 
@@ -311,8 +317,9 @@ describe("downloadModel cache", () => {
   it("refuses to append a 206 whose Content-Range starts at the WRONG offset (would corrupt) (#343 edge)", async () => {
     await fsPromises.mkdir(cacheDir, { recursive: true });
     const url = "https://example.com/models/badrange.safetensors";
-    const { partial } = await cachePaths(url);
+    const { partial, sidecar } = await cachePaths(url);
     await writeFile(partial, "AAAA"); // resume offset = 4
+    await writeFile(sidecar, '"br-etag"');
 
     // Misbehaving server/proxy: says it's resuming from byte 0, not 4.
     fetchMock.mockResolvedValueOnce(
@@ -325,9 +332,74 @@ describe("downloadModel cache", () => {
 
     await expect(
       downloadModel(url, "checkpoints", "badrange-out.safetensors"),
-    ).rejects.toThrow(/resume mismatch/i);
+    ).rejects.toThrow(/resume rejected/i);
     // The corrupt partial (and its sidecar) are removed so a retry starts clean.
     await expect(stat(partial)).rejects.toThrow();
+    await expect(stat(sidecar)).rejects.toThrow();
+  });
+
+  it("refuses a 206 that omits Content-Range entirely (can't prove the offset) (#343 edge)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://example.com/models/nocr.safetensors";
+    const { partial, sidecar } = await cachePaths(url);
+    await writeFile(partial, "AAAA");
+    await writeFile(sidecar, '"nocr-etag"');
+
+    // 206 but NO Content-Range — we cannot verify where it resumes from.
+    fetchMock.mockResolvedValueOnce(
+      new Response("ZZZZ", { status: 206, statusText: "Partial Content" }),
+    );
+
+    await expect(
+      downloadModel(url, "checkpoints", "nocr-out.safetensors"),
+    ).rejects.toThrow(/resume rejected/i);
+  });
+
+  it("does NOT resume a validator-less partial — restarts cleanly instead of appending (#343 edge)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://example.com/models/novalidator.safetensors";
+    const { partial } = await cachePaths(url);
+    // A stale partial with NO sidecar (e.g. left by a pre-fix build). We cannot
+    // prove the upstream file is unchanged, so a Range resume is unsafe.
+    await writeFile(partial, "AAAA");
+
+    fetchMock.mockResolvedValueOnce(okResponse("FRESHFULLBODY"));
+
+    const target = await downloadModel(url, "checkpoints", "novalidator-out.safetensors");
+
+    const [, init] = fetchMock.mock.calls[0] as [string, { headers: Record<string, string> }];
+    // No Range / If-Range without a trustworthy validator.
+    expect(init.headers.Range).toBeUndefined();
+    expect(init.headers["If-Range"]).toBeUndefined();
+    // The stale prefix is discarded — final file is the fresh body, not "AAAA...".
+    await expect(readFile(target, "utf-8")).resolves.toBe("FRESHFULLBODY");
+  });
+
+  it("persists the validator sidecar on a fresh write so a later resume can guard with If-Range (#343 edge)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://example.com/models/sidecar.safetensors";
+    const { partial, sidecar } = await cachePaths(url);
+
+    // Fresh download (no partial) whose stream ends early → truncated, so the
+    // partial + its newly-written validator are left on disk for a resume.
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) { c.enqueue(new TextEncoder().encode("half")); c.close(); },
+    });
+    fetchMock.mockResolvedValueOnce(
+      new Response(stream, {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-length": "1000", etag: '"captured-v9"' },
+      }),
+    );
+
+    await expect(
+      downloadModel(url, "checkpoints", "sidecar-out.safetensors"),
+    ).rejects.toThrow(/truncat/i);
+
+    // The validator was captured and PAIRS with the truncated partial bytes.
+    await expect(stat(partial)).resolves.toBeTruthy();
+    await expect(readFile(sidecar, "utf-8")).resolves.toBe('"captured-v9"');
   });
 
   it("never serves a 0-byte cache entry as a hit — re-downloads instead (#343 edge)", async () => {
