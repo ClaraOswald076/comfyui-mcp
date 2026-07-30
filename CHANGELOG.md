@@ -6,6 +6,21 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.8] - 2026-07-30
+
+### MCP
+
+#### Fixed
+- download_model follows the HF Xet CAS redirect and surfaces the real network cause (DNS/proxy/TLS/HF_ENDPOINT) instead of a generic "fetch failed" (#411) (#427)
+- civitai search surfaces distinct upstream/auth(token-aware 401)/403/429/5xx/timeout/non-JSON failures instead of a misleading empty or generic error (WS-6) (#428)
+- crash detector no longer false-positives on a swallowed "Exception ignored in: __del__" finalizer traceback (#341) (#429)
+- get_job_status reports a present-but-empty ShowText/PreviewAny output instead of dropping it (#373) (#430)
+- model_metadata_read gives an actionable message when the optional model-explorer node is absent, instead of leaking a raw 404 (#363) (#431)
+- get_node_info honors the live /object_info registration key when backfilling, so a registered node (e.g. DetectorForNSFW) resolves (#404) (#432)
+- get_template_schema routes through the connected client's base URL + auth and resolves template ids consistently with list_workflow_templates (proxy/auth-safe) (#391) (#434)
+- get_image returns a structured not-found for non-image /view payloads (type=input refs) instead of a corrupt inline image / JSON parse error (#385) (#435)
+
+
 ## [0.48.7] - 2026-07-29
 
 ### MCP
