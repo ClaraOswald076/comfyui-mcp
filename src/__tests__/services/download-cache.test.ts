@@ -256,6 +256,96 @@ describe("downloadModel cache", () => {
     await expect(p).rejects.toThrow(/no.*Location header/i);
   });
 
+  // Deterministic cache paths for a URL (mirrors cachePathForUrl in the impl).
+  async function cachePaths(url: string) {
+    const { createHash } = await import("node:crypto");
+    const hash = createHash("sha256").update(url).digest("hex").slice(0, 32);
+    const target = join(cacheDir, `${hash}.safetensors`);
+    const partial = join(cacheDir, `.${hash}.safetensors.partial`);
+    return { hash, target, partial, sidecar: `${partial}.etag` };
+  }
+
+  it("sends If-Range from the persisted validator and RESTARTS (not appends) when the upstream file changed (#343 edge)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://example.com/models/changed.safetensors";
+    const { partial, sidecar } = await cachePaths(url);
+    // A leftover partial from a prior attempt, plus the validator we captured then.
+    await writeFile(partial, "AAAA");
+    await writeFile(sidecar, '"etag-v1"');
+
+    // The file changed upstream → server ignores the Range and returns 200 with
+    // the full (new) body. Appending would corrupt; we must overwrite.
+    fetchMock.mockResolvedValueOnce(okResponse("FULLNEWBODY"));
+
+    const target = await downloadModel(url, "checkpoints", "changed-out.safetensors");
+
+    const [, init] = fetchMock.mock.calls[0] as [string, { headers: Record<string, string> }];
+    expect(init.headers.Range).toBe("bytes=4-");
+    expect(init.headers["If-Range"]).toBe('"etag-v1"');
+    // Overwritten with the fresh body — NOT "AAAAFULLNEWBODY".
+    await expect(readFile(target, "utf-8")).resolves.toBe("FULLNEWBODY");
+  });
+
+  it("sends If-Range and appends a matching 206 whose Content-Range starts at the resume offset (#343 edge)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://example.com/models/match.safetensors";
+    const { partial, sidecar } = await cachePaths(url);
+    await writeFile(partial, "AAAA");
+    await writeFile(sidecar, '"etag-stable"');
+
+    fetchMock.mockResolvedValueOnce(
+      new Response("BBBB", {
+        status: 206,
+        statusText: "Partial Content",
+        headers: { "content-range": "bytes 4-7/8" },
+      }),
+    );
+
+    const target = await downloadModel(url, "checkpoints", "match-out.safetensors");
+
+    const [, init] = fetchMock.mock.calls[0] as [string, { headers: Record<string, string> }];
+    expect(init.headers["If-Range"]).toBe('"etag-stable"');
+    await expect(readFile(target, "utf-8")).resolves.toBe("AAAABBBB");
+  });
+
+  it("refuses to append a 206 whose Content-Range starts at the WRONG offset (would corrupt) (#343 edge)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://example.com/models/badrange.safetensors";
+    const { partial } = await cachePaths(url);
+    await writeFile(partial, "AAAA"); // resume offset = 4
+
+    // Misbehaving server/proxy: says it's resuming from byte 0, not 4.
+    fetchMock.mockResolvedValueOnce(
+      new Response("ZZZZZZZZ", {
+        status: 206,
+        statusText: "Partial Content",
+        headers: { "content-range": "bytes 0-7/8" },
+      }),
+    );
+
+    await expect(
+      downloadModel(url, "checkpoints", "badrange-out.safetensors"),
+    ).rejects.toThrow(/resume mismatch/i);
+    // The corrupt partial (and its sidecar) are removed so a retry starts clean.
+    await expect(stat(partial)).rejects.toThrow();
+  });
+
+  it("never serves a 0-byte cache entry as a hit — re-downloads instead (#343 edge)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://example.com/models/zerohit.safetensors";
+    const { target } = await cachePaths(url);
+    // A pre-existing empty cache file (interrupted rename / older build / tamper).
+    await writeFile(target, "");
+
+    fetchMock.mockResolvedValueOnce(okResponse("real bytes this time"));
+
+    const out = await downloadModel(url, "checkpoints", "zerohit-out.safetensors");
+
+    // The empty hit must NOT have short-circuited the download.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await expect(readFile(out, "utf-8")).resolves.toBe("real bytes this time");
+  });
+
   it("evicts least-recently-used cache files when the optional limit is exceeded", async () => {
     process.env.COMFYUI_LRU_CACHE_SIZE_GB = String(12 / 1024 / 1024 / 1024);
     await fsPromises.mkdir(cacheDir, { recursive: true });

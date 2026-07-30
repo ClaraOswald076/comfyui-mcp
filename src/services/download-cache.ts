@@ -4,11 +4,13 @@ import {
   copyFile,
   link,
   mkdir,
+  readFile,
   readdir,
   rename,
   rm,
   stat,
   utimes,
+  writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, extname, join, resolve } from "node:path";
@@ -28,6 +30,28 @@ const DEFAULT_CACHE_DIR = join(homedir(), ".comfyui-mcp", "cache");
 const HASH_CHARS = 32;
 const MAX_HTTP_REDIRECTS = 5;
 const inflight = new Map<string, Promise<string>>();
+
+/** Best-effort remove — never throws (rm may be stubbed in tests, or the file
+ *  may already be gone). Used on the integrity-failure cleanup paths. */
+async function safeRm(path: string): Promise<void> {
+  try {
+    await rm(path, { force: true });
+  } catch {
+    /* best effort */
+  }
+}
+
+/** On-disk size, or undefined when it can't be determined (fs layer stubbed in
+ *  tests, or a stat hiccup) — callers must not block a download over a missing
+ *  number, only over a number that proves corruption. */
+async function fileSizeOrUndefined(path: string): Promise<number | undefined> {
+  try {
+    const st = await stat(path);
+    return typeof st?.size === "number" ? st.size : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Extract the useful diagnostic bits from an error thrown by `fetch()` itself
@@ -144,6 +168,28 @@ async function touch(path: string): Promise<void> {
   await downloadCacheFs.utimes(path, now, now);
 }
 
+/** Read a persisted resume validator (ETag / Last-Modified) or null if absent.
+ *  Best-effort: a missing/unreadable sidecar just means "resume without an
+ *  If-Range guard" — never fatal. */
+async function readValidatorSidecar(path: string): Promise<string | null> {
+  try {
+    const raw = (await readFile(path, "utf-8")).trim();
+    return raw.length > 0 ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Persist the resume validator next to a .partial. Best-effort — a failure
+ *  here only costs us the change-detection guard on a later resume. */
+async function writeValidatorSidecar(path: string, value: string): Promise<void> {
+  try {
+    await writeFile(path, value, "utf-8");
+  } catch {
+    /* best effort */
+  }
+}
+
 async function streamUrlToFile(
   url: string,
   targetPath: string,
@@ -152,9 +198,22 @@ async function streamUrlToFile(
   storageAuth: CloudStorageAuth = {},
   resumeFromBytes = 0,
   progress?: ProgressMeta,
+  resumable = false,
 ): Promise<void> {
   if (supportsCloudDownload(url)) {
     await downloadCloudUrlToFile(url, targetPath, storageAuth);
+    // #343 edge: the S3/Azure path bypasses the HTTP size gate below. The cloud
+    // downloaders verify their own Content-Length (truncation), but a stream
+    // that yielded ZERO bytes can still resolve cleanly — backstop it here so a
+    // 0-byte cloud object can never be reported as a successful download.
+    const actual = await fileSizeOrUndefined(targetPath);
+    if (actual === 0) {
+      await safeRm(targetPath);
+      throw new ModelError(
+        "Download produced a 0-byte file — the cloud source (S3/Azure) sent no data. Removed it; retry.",
+        { url: logUrl },
+      );
+    }
     return;
   }
 
@@ -163,10 +222,25 @@ async function streamUrlToFile(
   // matching Content-Range we append; if it returns 200 (range unsupported,
   // or the file changed upstream) we truncate and restart. Idea from
   // josephoibrahim/comfy-cozy.
+  //
+  // #343 edge: a plain Range resume is unsafe if the upstream file CHANGED
+  // between the two calls — we would append fresh bytes onto a stale prefix and
+  // the size check could still pass, producing a corrupt file. Guard it with a
+  // conditional resume: we persist the first response's validator (ETag, else
+  // Last-Modified) in a sidecar next to the .partial and replay it as `If-Range`
+  // on resume. Per RFC 9110 the server then returns 206 (append) ONLY if the
+  // resource is byte-for-byte unchanged, otherwise 200 with the full body (which
+  // our append-vs-truncate logic below restarts cleanly). Belt-and-braces, we
+  // also validate the 206 Content-Range starts exactly at our resume offset.
+  const validatorSidecar = `${targetPath}.etag`;
   let currentUrl = url;
   let currentHeaders = headers;
   if (resumeFromBytes > 0) {
     currentHeaders = { ...currentHeaders, Range: `bytes=${resumeFromBytes}-` };
+    if (resumable) {
+      const priorValidator = await readValidatorSidecar(validatorSidecar);
+      if (priorValidator) currentHeaders["If-Range"] = priorValidator;
+    }
   }
   let res: Response;
   for (let redirectCount = 0; ; redirectCount += 1) {
@@ -248,9 +322,43 @@ async function streamUrlToFile(
 
   // Decide append vs truncate based on the response. If we asked for a range
   // and got 206, append; any other 2xx (typically 200) means the server is
-  // sending the full file so we must overwrite.
+  // sending the full file so we must overwrite. A 200 to a range request is
+  // exactly what If-Range yields when the upstream file changed — the truncate
+  // path below discards the stale prefix and restarts, which is correct.
   const appendMode = resumeFromBytes > 0 && res.status === 206;
+
+  if (appendMode) {
+    // #343 edge: a 206 MUST resume from exactly the byte we asked for. A server
+    // that echoes a different Content-Range start (misconfigured proxy/mirror)
+    // would make us append at the wrong offset and silently corrupt the file.
+    // Refuse to append in that case — drop the partial + validator so the next
+    // attempt starts clean rather than compounding the corruption.
+    const contentRange = res.headers.get("content-range");
+    const m = contentRange ? /bytes\s+(\d+)-\d+\/(?:\d+|\*)/i.exec(contentRange) : null;
+    if (m && Number(m[1]) !== resumeFromBytes) {
+      await safeRm(targetPath);
+      await safeRm(validatorSidecar);
+      throw new ModelError(
+        `Download resume mismatch: server sent a 206 starting at byte ${m[1]} but we resumed ` +
+          `from ${resumeFromBytes}. Refusing to append (would corrupt the file). Removed the ` +
+          `partial; retry for a clean download.`,
+        { url: logUrl, status: res.status },
+      );
+    }
+  }
+
   const flags = appendMode ? "a" : "w";
+
+  // Persist the upstream validator so a FUTURE resume of this partial can send
+  // If-Range and detect a changed file. Only meaningful for a full/fresh write
+  // (flags "w") of a resumable (.partial) target — write it before streaming so
+  // that if THIS stream truncates, the sidecar already matches the bytes on
+  // disk. On a 206 append the sidecar already exists and still matches.
+  if (resumable && !appendMode) {
+    const validator = res.headers.get("etag") || res.headers.get("last-modified");
+    if (validator) await writeValidatorSidecar(validatorSidecar, validator);
+    else await safeRm(validatorSidecar);
+  }
 
   const nodeStream = Readable.fromWeb(res.body as import("node:stream/web").ReadableStream);
   const fileStream = createWriteStream(targetPath, { flags });
@@ -302,6 +410,8 @@ async function streamUrlToFile(
   if (!progress) {
     await pipeline(nodeStream, fileStream);
     await assertComplete();
+    // Complete: the validator sidecar is only needed to guard a resume, so drop it.
+    if (resumable) await safeRm(validatorSidecar);
     return;
   }
 
@@ -334,6 +444,7 @@ async function streamUrlToFile(
   try {
     await pipeline(nodeStream, counter, fileStream);
     await assertComplete();
+    if (resumable) await safeRm(validatorSidecar);
     bytesPerSec = 0;
     emit("done", true);
   } catch (err) {
@@ -361,8 +472,16 @@ async function downloadIntoCache(
     try {
       const info = await downloadCacheFs.stat(target);
       if (info.isFile()) {
-        await touch(target);
-        return target;
+        // #343 edge: never serve a 0-byte cache entry as a hit. One could exist
+        // from an interrupted rename, an older build without the size gate, or
+        // external tampering — treat it as a miss and re-download rather than
+        // materializing an empty file that reports success.
+        if (info.size === 0) {
+          await downloadCacheFs.rm(target, { force: true }).catch(() => undefined);
+        } else {
+          await touch(target);
+          return target;
+        }
       }
     } catch {
       // Cache miss.
@@ -396,6 +515,7 @@ async function downloadIntoCache(
         storageAuth,
         resumeFromBytes,
         progress,
+        true, // resumable: cache partials use the .partial + If-Range resume handshake
       );
       await downloadCacheFs.rename(partial, target);
       await touch(target);
@@ -408,6 +528,10 @@ async function downloadIntoCache(
         const remaining = await downloadCacheFs.stat(partial);
         if (remaining.size === 0) {
           await downloadCacheFs.rm(partial, { force: true }).catch(() => undefined);
+          // The validator sidecar is only meaningful alongside a resumable
+          // partial — drop it too so a later attempt doesn't If-Range against a
+          // file that no longer exists.
+          await downloadCacheFs.rm(`${partial}.etag`, { force: true }).catch(() => undefined);
         }
       } catch {
         // Partial gone — nothing to clean.
