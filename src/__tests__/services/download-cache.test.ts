@@ -1340,7 +1340,11 @@ describe("downloadModel model-payload validation (#473)", () => {
     const cached = await readdir(cacheDir).catch(() => [] as string[]);
     const finalized = cached.filter((f) => !f.startsWith("."));
     expect(finalized).toHaveLength(0);
+    // Any leftover payload/sidecar (.partial/.etag) must be neutralized to 0 bytes so
+    // it can't be resumed/re-served. The `.rejected` poison MARKER is EXEMPT — it is a
+    // small non-empty sentinel that exists precisely to block a later resume.
     for (const f of cached) {
+      if (f.endsWith(".rejected")) continue;
       expect((await stat(join(cacheDir, f))).size).toBe(0);
     }
   }
@@ -1707,6 +1711,7 @@ describe("downloadModel model-payload validation (#473)", () => {
     const afterReject = await readdir(cacheDir).catch(() => [] as string[]);
     expect(afterReject.filter((f) => !f.startsWith("."))).toHaveLength(0);
     for (const f of afterReject) {
+      if (f.endsWith(".rejected")) continue; // poison marker is an intentional sentinel
       expect((await stat(join(cacheDir, f))).size).toBe(0);
     }
     // Second attempt: a real binary model. It must NOT resume onto the poisoned
@@ -1750,5 +1755,83 @@ describe("downloadModel model-payload validation (#473)", () => {
     const init = fetchMock.mock.calls[0][1] as RequestInit;
     const sentHeaders = (init.headers ?? {}) as Record<string, string>;
     expect(sentHeaders.Range).toBeUndefined();
+  });
+
+  it("does NOT resume a partial carrying a poison MARKER even when its bytes sniff as binary (P1 content-type-only)", async () => {
+    // The content-type-only rejection case: a prior attempt rejected the download
+    // purely on its Content-Type (gone by retry) and dropped a `.rejected` marker; the
+    // leftover partial's bytes look BINARY (so body-magic alone wouldn't flag them).
+    // The marker guard must still refuse the resume and restart fresh.
+    const url = "https://example.com/models/marked.safetensors";
+    const hash = cacheHashFor(url);
+    await mkdir(cacheDir, { recursive: true });
+    const partial = join(cacheDir, `.${hash}.safetensors.partial`);
+    await writeFile(partial, Buffer.from([0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]));
+    await writeFile(`${partial}.etag`, '"cafef00d"'); // would enable If-Range
+    await writeFile(`${partial}.rejected`, "rejected-non-model-payload");
+    const gguf = Buffer.concat([Buffer.from("GGUF"), Buffer.from([0x00, 0x01, 0x02, 0x03, 0x04])]);
+    fetchMock.mockResolvedValueOnce(
+      new Response(gguf, {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "application/octet-stream" },
+      }),
+    );
+    const out = await downloadModel(url, "checkpoints", "marked.safetensors");
+    expect((await stat(out)).size).toBe(gguf.length);
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    const sentHeaders = (init.headers ?? {}) as Record<string, string>;
+    expect(sentHeaders.Range).toBeUndefined();
+    // Marker cleaned up after the clean finalize.
+    await expect(stat(`${partial}.rejected`)).rejects.toThrow();
+  });
+
+  it("ACCEPTS a raw .bin whose invalid UTF-8 sequence is cut off at the 512-byte sniff boundary (P0-2 edge)", async () => {
+    // `<` + 509 'A' places byte 510 = 0xE0 (a 3-byte lead) with only 0x80 present after
+    // it — 0xE0 requires A0..BF, so this is INVALID UTF-8, not a truncated-but-valid
+    // run. The text check must validate the present continuation byte and keep it
+    // BINARY (accept the download) rather than wave it through as truncated (reject).
+    const body = Buffer.concat([
+      Buffer.from("<" + "A".repeat(509)), // bytes 0..509
+      Buffer.from([0xe0, 0x80]), // bytes 510,511 — invalid continuation at the boundary
+      Buffer.from([0x11, 0x22, 0x33, 0x44]), // trailing binary (file > sniff window)
+    ]);
+    expect(body.length).toBeGreaterThan(512);
+    fetchMock.mockResolvedValueOnce(
+      new Response(body, {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "application/octet-stream" },
+      }),
+    );
+    const out = await downloadModel(
+      "https://example.com/models/edge.bin",
+      "checkpoints",
+      "edge.bin",
+    );
+    expect((await stat(out)).size).toBe(body.length);
+  });
+
+  it("REJECTS a valid UTF-16LE HTML page whose emoji surrogate is split by the 512-byte sniff boundary (P0-1 edge)", async () => {
+    // Pad so a 😀 (surrogate pair D83D DE00) lands its HIGH surrogate at bytes 510–511
+    // and its LOW surrogate at 512–513 (outside the window). Decoding the raw window
+    // yields a trailing lone high surrogate → U+FFFD, which would make a valid auth
+    // page look binary and fail OPEN. Trimming the truncated code unit must let it
+    // still classify as HTML and be REJECTED (served here as octet-stream).
+    const str = "<" + "a".repeat(253) + "\u{1F600}" + "b".repeat(100);
+    const body = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(str, "utf16le")]);
+    // Sanity: the high surrogate's low byte 0x3D sits at index 510.
+    expect(body[510]).toBe(0x3d);
+    expect(body[511]).toBe(0xd8);
+    await expectRejectedAndNoFile(
+      "https://example.com/models/u16emoji.safetensors",
+      "checkpoints",
+      "u16emoji.safetensors",
+      new Response(body, {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "application/octet-stream" },
+      }),
+    );
   });
 });

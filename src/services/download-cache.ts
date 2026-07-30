@@ -97,6 +97,22 @@ async function discardRejectedPayload(
   if (sidecarPath) await rmOrTruncate(sidecarPath, logUrl);
 }
 
+/** Drop a tiny "this partial was rejected as a non-model body" MARKER next to a
+ *  resumable partial. Best-effort. It is the cleanup-INDEPENDENT signal that lets a
+ *  later attempt refuse to resume even when the rejection was based ONLY on the
+ *  response Content-Type (gone by retry) and both removal and truncation of the
+ *  partial+sidecar failed — a case body-magic alone can't re-derive (#473 P1). */
+async function writePoisonMarker(markerPath: string, logUrl: string): Promise<void> {
+  try {
+    await writeFile(markerPath, "rejected-non-model-payload");
+  } catch (err) {
+    logger.warn(`Could not write a poison marker "${markerPath}" for a rejected partial`, {
+      url: logUrl,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
 /** On-disk size, or undefined when it can't be determined (fs layer stubbed in
  *  tests, or a stat hiccup) — callers must not block a download over a missing
  *  number, only over a number that proves corruption. */
@@ -203,20 +219,24 @@ function looksLikeText(slice: Buffer): boolean {
     else if (b >= 0xe0 && b <= 0xef) len = 3;
     else if (b >= 0xf0 && b <= 0xf4) len = 4;
     else return false; // 0x80–0xC1 (bare continuation / overlong) or 0xF5–0xFF
-    if (i + len > n) return true; // sequence truncated by the sniff window — accept
     // Strict continuation ranges reject overlong / surrogate / out-of-range forms:
     //   E0 → A0..BF (else overlong), ED → 80..9F (else surrogate),
     //   F0 → 90..BF (else overlong), F4 → 80..8F (else > U+10FFFF).
-    let lo = 0x80;
-    let hi = 0xbf;
-    if (b === 0xe0) lo = 0xa0;
-    else if (b === 0xed) hi = 0x9f;
-    else if (b === 0xf0) lo = 0x90;
-    else if (b === 0xf4) hi = 0x8f;
-    if (slice[i + 1] < lo || slice[i + 1] > hi) return false;
-    for (let k = 2; k < len; k += 1) {
+    const lo = b === 0xe0 ? 0xa0 : b === 0xf0 ? 0x90 : 0x80;
+    const hi = b === 0xed ? 0x9f : b === 0xf4 ? 0x8f : 0xbf;
+    // Validate EVERY continuation byte that is PRESENT, even when the sequence is
+    // truncated by the sniff window: an already-visible byte that violates its range
+    // (e.g. `E0 80` — E0 requires A0..BF) proves the run is NOT valid UTF-8 and must
+    // reject, rather than being waved through as "truncated". Only a genuinely
+    // cut-off sequence — where we simply ran out of bytes before an INVALID one — is
+    // accepted (we only sampled a prefix). This closes a boundary false-positive that
+    // would misclassify a raw `.bin` as text/HTML (#473 P0-2 sniff-edge).
+    for (let k = 1; k < len; k += 1) {
+      if (i + k >= n) return true; // ran out of bytes with everything valid so far
       const cont = slice[i + k];
-      if (cont < 0x80 || cont > 0xbf) return false; // not a valid continuation byte
+      const clo = k === 1 ? lo : 0x80;
+      const chi = k === 1 ? hi : 0xbf;
+      if (cont < clo || cont > chi) return false; // present-but-invalid continuation
     }
     i += len;
   }
@@ -277,7 +297,20 @@ function classifyPayload(buf: Buffer): "html" | "json" | "binary" {
   ) {
     try {
       const label = buf[0] === 0xff ? "utf-16le" : "utf-16be";
-      return classifyDecodedText(new TextDecoder(label).decode(buf));
+      // Trim bytes the sniff window cut mid-code-unit BEFORE decoding, so a truncation
+      // artifact doesn't decode to U+FFFD and make a valid UTF-16 page look binary:
+      //  (1) an odd trailing byte (a half code unit), and (2) a trailing UNPAIRED high
+      //  surrogate (0xD800–0xDBFF) whose low half fell outside the window — e.g. an
+      //  emoji split across the 512-byte boundary. A mid-document U+FFFD (genuine
+      //  binary) is still caught by classifyDecodedText (#473 P0-1 sniff-edge).
+      let end = buf.length - (buf.length % 2);
+      if (end >= 2) {
+        const hi = label === "utf-16le" ? buf[end - 1] : buf[end - 2];
+        const loB = label === "utf-16le" ? buf[end - 2] : buf[end - 1];
+        const lastUnit = (hi << 8) | loB;
+        if (lastUnit >= 0xd800 && lastUnit <= 0xdbff) end -= 2; // drop lone high surrogate
+      }
+      return classifyDecodedText(new TextDecoder(label).decode(buf.subarray(0, end)));
     } catch {
       return "binary";
     }
@@ -1267,9 +1300,13 @@ async function streamUrlToFile(
       // Remove the rejected partial + its resume sidecar, and if removal fails,
       // NEUTRALIZE the partial (truncate to 0) so a retry can't resume onto the
       // poisoned HTML/JSON prefix (#473 P1). safeRm alone would swallow an EPERM and
-      // leave a resumable poisoned partial behind.
-      onReject: () =>
-        discardRejectedPayload(targetPath, resumable ? validatorSidecar : undefined, logUrl),
+      // leave a resumable poisoned partial behind. When resumable, ALSO drop a poison
+      // marker so a content-type-only rejection (whose body may sniff as binary on
+      // retry) still can't be resumed even if neutralization failed.
+      onReject: async () => {
+        await discardRejectedPayload(targetPath, resumable ? validatorSidecar : undefined, logUrl);
+        if (resumable) await writePoisonMarker(`${targetPath}.rejected`, logUrl);
+      },
     });
 
   // No progress wanted (internal/cache caller, or not under the panel) → straight pipe.
@@ -1371,6 +1408,7 @@ async function downloadIntoCache(
     // restarting from zero. (See streamUrlToFile for the Range + flags
     // handshake.) Cleanup on terminal failure stays unchanged.
     const partial = join(cacheDir(), `.${basename(target)}.partial`);
+    const rejectedMarker = `${partial}.rejected`;
     let resumeFromBytes = 0;
     try {
       const existing = await downloadCacheFs.stat(partial);
@@ -1385,7 +1423,31 @@ async function downloadIntoCache(
       // No partial — fresh download.
     }
 
-    // #473 P1 — cleanup-INDEPENDENT poison guard. A prior attempt may have REJECTED
+    // #473 P1 — poison MARKER guard (cleanup- AND content-type-independent). A prior
+    // attempt that REJECTED this download (even solely on the response Content-Type,
+    // which is gone now) drops a `.rejected` marker next to the partial. If it's
+    // present, the leftover partial is poison regardless of what its bytes sniff as —
+    // never resume onto it. Discard everything and restart from 0.
+    let markerPresent = false;
+    try {
+      markerPresent = (await downloadCacheFs.stat(rejectedMarker)).isFile();
+    } catch {
+      /* no marker */
+    }
+    if (markerPresent) {
+      if (resumeFromBytes > 0) {
+        logger.warn(
+          `Discarding a previously-rejected (${resumeFromBytes}-byte) partial before resume: a ` +
+            `poison marker from an earlier non-model rejection is present — restarting from 0 (#473).`,
+          { url: logUrl, bytes: resumeFromBytes },
+        );
+      }
+      await discardRejectedPayload(partial, `${partial}.etag`, logUrl ?? redactUrlForLogs(url));
+      await safeRm(rejectedMarker);
+      resumeFromBytes = 0;
+    }
+
+    // #473 P1 — cleanup-INDEPENDENT poison guard (body-magic). A prior attempt may have REJECTED
     // this download as an HTML/JSON auth/error body and then been UNABLE to remove or
     // truncate the leftover .partial (a denied rm AND a denied truncate). Re-inspect
     // the partial's HEAD here, before deciding to resume: if it is itself a non-model
@@ -1424,6 +1486,9 @@ async function downloadIntoCache(
       );
       await downloadCacheFs.rename(partial, target);
       await touch(target);
+      // Clean any stale poison marker now that a CLEAN payload finalized under this
+      // key — the partial is gone (renamed) and the bytes passed validation.
+      await safeRm(rejectedMarker);
       return target;
     } catch (err) {
       // Leave the partial on disk for a future resume; only nuke it if it
