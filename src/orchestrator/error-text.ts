@@ -91,3 +91,60 @@ export function promptText(value: unknown): string {
     return "";
   }
 }
+
+/**
+ * Coerce an assistant/agent-message payload into readable display text.
+ *
+ * A provider's run-finished commit (e.g. Codex app-server `item/completed` for an
+ * `agentMessage`) is normally `{ text: "…" }` with a string `text`, but newer
+ * structured content can nest the reply as an array of parts or an object under
+ * `text` / `content` / `value` / `output_text` / `message`. Blindly coercing that
+ * with `String()` yields the literal "[object Object]", which then OVERWRITES the
+ * already-streamed reply in the sidebar (#421, #422 — the orchestrator-side
+ * sibling of the WS-9 panel cluster).
+ *
+ * Recursively extract the first readable string, joining array parts. Return ""
+ * (never "[object Object]") when nothing readable is found, so callers can detect
+ * the empty/malformed case and fall back to their buffered stream text instead of
+ * clobbering it. Every property read runs inside try/catch — a value may be a
+ * Proxy or carry a throwing getter, and normalization must never itself throw.
+ */
+export function messageText(value: unknown): string {
+  return coerceMessageText(value, 0);
+}
+
+const MESSAGE_TEXT_KEYS = ["text", "content", "value", "output_text", "message"] as const;
+
+function coerceMessageText(value: unknown, depth: number): string {
+  if (typeof value === "string") {
+    // The literal sentinel is never real content — treat it as empty so the
+    // caller falls back to the streamed text rather than displaying it.
+    return value === "[object Object]" ? "" : value;
+  }
+  if (value == null) return "";
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (depth > 6) return ""; // defend against adversarial / cyclic nesting
+  if (Array.isArray(value)) {
+    const parts: string[] = [];
+    for (const part of value) {
+      const t = coerceMessageText(part, depth + 1);
+      if (t) parts.push(t);
+    }
+    return parts.join("");
+  }
+  if (typeof value === "object") {
+    for (const key of MESSAGE_TEXT_KEYS) {
+      let inner: unknown;
+      try {
+        inner = (value as Record<string, unknown>)[key];
+      } catch {
+        continue; // throwing getter/proxy — try the next candidate key
+      }
+      if (inner == null) continue;
+      const t = coerceMessageText(inner, depth + 1);
+      if (t) return t;
+    }
+    return "";
+  }
+  return "";
+}

@@ -3,7 +3,7 @@
 // (issues #176, #175).
 
 import { describe, expect, it } from "vitest";
-import { errorText, promptText } from "./error-text.js";
+import { errorText, messageText, promptText } from "./error-text.js";
 
 describe("errorText (#176)", () => {
   it("returns the message of an Error", () => {
@@ -137,5 +137,64 @@ describe("promptText (#175)", () => {
     }).not.toThrow();
     expect(out).not.toBe("");
     expect(out).not.toBe("[object Object]");
+  });
+});
+
+describe("messageText (#421, #422)", () => {
+  it("passes a plain string reply through unchanged", () => {
+    expect(messageText("Done — 4 images rendered.")).toBe("Done — 4 images rendered.");
+  });
+
+  it("extracts readable text from a structured object payload", () => {
+    const out = messageText({ text: "the run finished" });
+    expect(out).not.toBe("[object Object]");
+    expect(out).toBe("the run finished");
+  });
+
+  it("joins array-of-parts structured content", () => {
+    const out = messageText([
+      { type: "text", text: "hello " },
+      { type: "text", text: "world" },
+    ]);
+    expect(out).toBe("hello world");
+  });
+
+  it("reaches into content/value/output_text/message keys", () => {
+    expect(messageText({ content: "via content" })).toBe("via content");
+    expect(messageText({ output_text: "via output_text" })).toBe("via output_text");
+    expect(messageText({ message: { text: "nested" } })).toBe("nested");
+  });
+
+  it("treats the literal [object Object] sentinel as empty (not real content)", () => {
+    expect(messageText("[object Object]")).toBe("");
+  });
+
+  it("returns '' (never [object Object]) for an unreadable object so callers can fall back", () => {
+    const out = messageText({ foo: 1, bar: 2 });
+    expect(out).not.toBe("[object Object]");
+    expect(out).toBe("");
+  });
+
+  it("does not throw and returns '' for a throwing getter", () => {
+    const hostile = {
+      get text(): string {
+        throw new Error("boom");
+      },
+    };
+    let out = "";
+    expect(() => {
+      out = messageText(hostile);
+    }).not.toThrow();
+    expect(out).not.toBe("[object Object]");
+  });
+
+  it("does not recurse forever on a cyclic payload", () => {
+    const cyclic: Record<string, unknown> = {};
+    cyclic.text = cyclic;
+    let out = "";
+    expect(() => {
+      out = messageText(cyclic);
+    }).not.toThrow();
+    expect(out).toBe("");
   });
 });
