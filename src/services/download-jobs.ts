@@ -15,8 +15,11 @@
  */
 
 import { createHash } from "node:crypto";
-import { isRemoteMode } from "../config.js";
-import { downloadModel, resolveDownloadTarget } from "./model-resolver.js";
+import {
+  downloadModel,
+  resolveDownloadTarget,
+  shouldDispatchDownloadToManager,
+} from "./model-resolver.js";
 import type { DownloadAuth } from "./download-auth.js";
 import { logger } from "../utils/logger.js";
 
@@ -123,8 +126,11 @@ export async function startDownloadJob(
   // there is NO local filesystem — downloadModel short-circuits to the Manager
   // dispatch, so resolving a local models dir would wrongly THROW (COMFYUI_PATH
   // unset). Key by a canonical remote identity instead and let downloadModel take
-  // the Manager path.
-  const id = isRemoteMode()
+  // the Manager path. shouldDispatchDownloadToManager() also covers the #420
+  // reconnect case: a nominally-local session whose effective base was lost still
+  // routes through the connected Manager (and must NOT try to resolve a local
+  // targetPath, which would throw), keying by the same canonical remote identity.
+  const id = (await shouldDispatchDownloadToManager())
     ? remoteDownloadJobIdFor(url, targetSubfolder, filename)
     : downloadJobIdFor((await resolveDownloadTarget(url, targetSubfolder, filename)).targetPath);
   const trayId = downloadIdFor(url);

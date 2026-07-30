@@ -24,6 +24,11 @@ vi.mock("../../config.js", async () => {
 // blank/path-ful rejection) are covered against the real code in
 // model-resolver.test.ts.
 vi.mock("../../services/model-resolver.js", () => ({
+  // The single routing decision startDownloadJob now consults to choose the job
+  // identity: manager-dispatch (remote OR #420 reconnect-fallback) skips local
+  // target resolution; local streams key by the resolved targetPath. Driven by the
+  // same `hoisted.remote` flag so the existing remote-mode assertions hold.
+  shouldDispatchDownloadToManager: vi.fn(async () => hoisted.remote),
   downloadModel: vi.fn((url: string) => {
     hoisted.calls += 1;
     return new Promise<string>((resolve, reject) => {
@@ -166,6 +171,22 @@ describe("download job registry", () => {
     expect(hoisted.calls).toBe(1); // downloadModel invoked (takes the Manager path)
     // A repeated identical remote request still adopts the in-flight job.
     const again = await startDownloadJob(URL_A, "checkpoints");
+    expect(again.job).toBe(job);
+    expect(hoisted.calls).toBe(1);
+  });
+
+  it("#420: a reconnect-fallback Manager route keys WITHOUT resolving a local target", async () => {
+    // After a reconnect drops the effective base, shouldDispatchDownloadToManager
+    // returns true for a nominally-local session (driven here by hoisted.remote).
+    // startDownloadJob must then take the Manager path and NOT resolve a local
+    // targetPath (which would throw "no local ComfyUI path configured") — the exact
+    // #420 immediate failure. Adoption of a repeated request must still hold.
+    hoisted.remote = true;
+    const { job } = await startDownloadJob(URL_A, "loras");
+    expect(job.status).toBe("downloading");
+    expect(hoisted.resolveTargetCalls).toBe(0);
+    expect(hoisted.calls).toBe(1);
+    const again = await startDownloadJob(URL_A, "loras");
     expect(again.job).toBe(job);
     expect(hoisted.calls).toBe(1);
   });

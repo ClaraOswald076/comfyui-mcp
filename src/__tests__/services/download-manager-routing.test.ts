@@ -1,0 +1,91 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+/**
+ * Unit tests for shouldDispatchDownloadToManager — the single routing decision
+ * that keeps model downloads working after a panel/orchestrator RECONNECT drops
+ * the effective ComfyUI base (#420). Distinct from #418 (base resolution at
+ * START): here the base is LOST later, and a nominally-local (loopback) session
+ * must fall back to the connected ComfyUI-Manager route — the same live server
+ * list_local_models still reaches over HTTP — instead of throwing
+ * "no local ComfyUI path configured".
+ */
+
+const hoisted = vi.hoisted(() => ({
+  remote: false,
+  base: undefined as string | undefined,
+  stats: undefined as unknown,
+  statsThrows: false,
+}));
+
+// isRemoteMode is the first gate; keep every other real config export.
+vi.mock("../../config.js", async () => {
+  const actual = await vi.importActual<typeof import("../../config.js")>("../../config.js");
+  return { ...actual, isRemoteMode: () => hoisted.remote };
+});
+
+// resolveEffectiveComfyUIBase is the "do we have a local base?" gate. Control it
+// directly so the test doesn't depend on the host's real workspace config / FS.
+vi.mock("../../services/workspace-env.js", async () => {
+  const actual = await vi.importActual<typeof import("../../services/workspace-env.js")>(
+    "../../services/workspace-env.js",
+  );
+  return { ...actual, resolveEffectiveComfyUIBase: () => hoisted.base };
+});
+
+// getSystemStats stands in for the connected server's /system_stats. getClient is
+// pulled in transitively by model-resolver; stub it so the import doesn't fail.
+vi.mock("../../comfyui/client.js", () => ({
+  getClient: () => ({ fetchApi: vi.fn() }),
+  getSystemStats: vi.fn(async () => {
+    if (hoisted.statsThrows) throw new Error("ECONNREFUSED");
+    return hoisted.stats;
+  }),
+}));
+
+import { shouldDispatchDownloadToManager } from "../../services/model-resolver.js";
+
+beforeEach(() => {
+  hoisted.remote = false;
+  hoisted.base = undefined;
+  hoisted.stats = undefined;
+  hoisted.statsThrows = false;
+});
+
+describe("shouldDispatchDownloadToManager (#420 reconnect routing)", () => {
+  it("REMOTE mode always dispatches to the Manager", async () => {
+    hoisted.remote = true;
+    // Even if a local base somehow resolves, remote wins (no local FS).
+    hoisted.base = "/some/local/comfy";
+    expect(await shouldDispatchDownloadToManager()).toBe(true);
+  });
+
+  it("streams LOCAL when a local base is resolvable (COMFYUI_PATH / default workspace)", async () => {
+    hoisted.base = "/home/me/ComfyUI";
+    expect(await shouldDispatchDownloadToManager()).toBe(false);
+  });
+
+  it("#420: no local base + reachable server WITHOUT --base-directory → Manager route", async () => {
+    // The reconnect case: base lost, but the live server is still connected. It
+    // was NOT launched with --base-directory, so there's no local dir to stream
+    // to — hand the fetch to its Manager rather than failing.
+    hoisted.base = undefined;
+    hoisted.stats = { system: { argv: ["main.py", "--listen"] } };
+    expect(await shouldDispatchDownloadToManager()).toBe(true);
+  });
+
+  it("no local base + reachable server WITH --base-directory → still streams local", async () => {
+    // Desktop install advertises its real base dir via argv; that dir is on this
+    // same (loopback) filesystem, so keep the local streaming path.
+    hoisted.base = undefined;
+    hoisted.stats = {
+      system: { argv: ["main.py", "--base-directory", "/data/ComfyUI"] },
+    };
+    expect(await shouldDispatchDownloadToManager()).toBe(false);
+  });
+
+  it("no local base + UNREACHABLE server → stays local so the resolver throws a clear error", async () => {
+    hoisted.base = undefined;
+    hoisted.statsThrows = true;
+    expect(await shouldDispatchDownloadToManager()).toBe(false);
+  });
+});

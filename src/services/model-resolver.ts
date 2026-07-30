@@ -3,7 +3,7 @@ import type { Stats } from "node:fs";
 import { readdir, stat, mkdir, readFile } from "node:fs/promises";
 import { join, basename, resolve, relative, sep, isAbsolute } from "node:path";
 import { config, isRemoteMode } from "../config.js";
-import { getClient } from "../comfyui/client.js";
+import { getClient, getSystemStats } from "../comfyui/client.js";
 import { getExtraModelRoots } from "./extra-paths.js";
 import { resolveEffectiveComfyUIBase } from "./workspace-env.js";
 import { installModelViaManager } from "./node-management.js";
@@ -11,7 +11,7 @@ import { ModelError, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { downloadWithCache } from "./download-cache.js";
 import { reportDownloadProgress } from "./download-progress.js";
-import { resolveModelsDir } from "./output-dir.js";
+import { resolveModelsDir, parseModelsDirFromArgv } from "./output-dir.js";
 import {
   applyDownloadAuth,
   redactUrlForLogs,
@@ -695,6 +695,43 @@ async function downloadModelViaManagerRemote(
   return `${normalizedSubfolder}/${resolvedFilename} (dispatched to the remote ComfyUI via ComfyUI-Manager — download continues server-side; the file lists under /models when complete)${authWarning}`;
 }
 
+/**
+ * Decide whether a model download must be handed to the CONNECTED ComfyUI's
+ * ComfyUI-Manager (a server-side fetch) instead of being streamed to local disk.
+ *
+ * Returns true when:
+ *   - REMOTE mode — there is no local filesystem at all (the original behavior); OR
+ *   - we are NOMINALLY LOCAL (loopback target) but have NO resolvable local base:
+ *     COMFYUI_PATH is unset — or was LOST across a panel/orchestrator reconnect
+ *     (#420) — and no default workspace is saved, AND the connected server did not
+ *     advertise a discoverable `--base-directory` to stream into, YET a live server
+ *     IS reachable to accept a Manager dispatch. This is exactly the reconnect
+ *     failure in #420: the previous session downloaded fine, the reconnect dropped
+ *     the effective base, and the local path then threw "no local ComfyUI path
+ *     configured" instead of routing through the still-connected Manager (the same
+ *     route list_local_models keeps using over HTTP). #418 fixed base resolution
+ *     at START; this keeps downloads working when the base goes missing LATER.
+ *
+ * Stays LOCAL (false) whenever a local base is resolvable (resolveEffectiveComfyUIBase)
+ * OR the server reports a base/models dir we can write to directly; also false when
+ * no server is reachable, so the local resolver surfaces its clear, actionable error
+ * rather than silently succeeding.
+ */
+export async function shouldDispatchDownloadToManager(): Promise<boolean> {
+  if (isRemoteMode()) return true;
+  // A configured/auto-detected COMFYUI_PATH or saved default workspace → stream local.
+  if (resolveEffectiveComfyUIBase()) return false;
+  try {
+    const stats = await getSystemStats();
+    // Reachable server: stream locally only if it exposes a base/models dir we can
+    // write to; otherwise hand the fetch to its ComfyUI-Manager (reconnect-safe).
+    return !parseModelsDirFromArgv(stats.system?.argv);
+  } catch {
+    // No reachable server → nothing to dispatch to. Let the local resolver throw.
+    return false;
+  }
+}
+
 export async function downloadModel(
   url: string,
   targetSubfolder: string,
@@ -717,7 +754,7 @@ export async function downloadModel(
   // can carry query params); header/basic/bearer auth can't be forwarded to
   // Manager, so those are surfaced as a clear warning rather than reported as a
   // clean success.
-  if (isRemoteMode()) {
+  if (await shouldDispatchDownloadToManager()) {
     return downloadModelViaManagerRemote(url, targetSubfolder, filename, auth);
   }
 

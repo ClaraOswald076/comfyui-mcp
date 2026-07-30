@@ -80,6 +80,10 @@ vi.mock("../../services/model-resolver.js", () => ({
     "unet",
   ],
   downloadModel: (...a: unknown[]) => downloadModelMock(...a),
+  // startDownloadJob consults this to choose local-vs-Manager routing (#420).
+  // Mirror the same mode gate the config mock uses so manifest downloads key the
+  // same way they always did (local unless remote).
+  shouldDispatchDownloadToManager: async () => mockConfig.remote ?? !mockConfig.comfyuiPath,
   // startDownloadJob resolves the destination via this before streaming; stub it
   // so a distinct targetPath is derived per (subfolder, filename) without a server.
   resolveDownloadTarget: async (url: string, sub: string, filename?: string) => {

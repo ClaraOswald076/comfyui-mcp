@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { unlink, writeFile } from "node:fs/promises";
+import { isAbsolute } from "node:path";
 import { isLocalMode, config } from "../config.js";
 import { logger } from "../utils/logger.js";
 import {
@@ -436,8 +437,14 @@ export function registerModelExtrasTools(server: McpServer): void {
 
           // Write usage-docs sidecars beside the file so the panel agent has the
           // description, trigger words, and example generation params on hand.
-          // Local-only: remote mode has no local FS (savedPath is a status string).
-          if (isLocalMode() && resolved.metadata) {
+          // Only when the file actually landed on the LOCAL filesystem: a real
+          // streamed download returns an ABSOLUTE path, whereas a remote OR
+          // reconnect-fallback Manager dispatch (#420) returns a human-readable
+          // status descriptor — writing a sidecar beside that string would create a
+          // stray file. isAbsolute(savedPath) distinguishes the two precisely
+          // (a Manager dispatch is loopback-"local" mode too, so isLocalMode() alone
+          // would misfire on the #420 fallback).
+          if (isAbsolute(savedPath) && resolved.metadata) {
             const sidecar = await writeCivitaiSidecar(savedPath, resolved.metadata);
             if (sidecar) {
               const tw = resolved.metadata.trainedWords;
