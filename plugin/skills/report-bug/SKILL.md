@@ -131,6 +131,9 @@ Then file it (no need to ask):
   The Worker files the issue **synchronously** and returns the link inline
   (`{ ok, url, number, deduped?, job_id }`); the `job_id` + `/status/<job_id>`
   poll is only a fallback for the rare case the submit didn't carry a `url`.
+  This shell snippet is the **manual / non-Claude fallback** and **requires
+  `jq`** for safe JSON parsing (Claude agents should use the `report_issue`
+  tool, which already implements this correctly).
 
   ```bash
   # URL is baked in; override with $COMFYUI_MCP_ISSUE_WORKER_URL if set. The
@@ -140,6 +143,9 @@ Then file it (no need to ask):
   # token is server-side in the Worker). Override with $COMFYUI_MCP_ISSUE_CLIENT_KEY.
   CLIENT_KEY="${COMFYUI_MCP_ISSUE_CLIENT_KEY:-9b6f2abf09b64006dc6e033f59d2dc8112e34d8347a923c2}"
 
+  # A url counts as "filed" only if it's a real GitHub issue URL.
+  is_issue_url() { printf '%s' "$1" | grep -Eq '^https://github\.com/[^/]+/[^/]+/issues/[0-9]+$'; }
+
   # 1) Submit. Write the JSON to a temp file first (the body has newlines/quotes).
   # body: { "repo": "comfyui-mcp" | "comfyui-mcp-panel", "title", "body", "labels": ["via-panel"] }
   # --max-time bounds the whole request so a hung connection can't wedge us.
@@ -147,32 +153,36 @@ Then file it (no need to ask):
   if RESP=$(curl -fsS --max-time 15 -X POST "$WORKER_URL" \
       -H "Content-Type: application/json" -H "X-Client-Key: $CLIENT_KEY" \
       --data @"$BODY_JSON_FILE"); then
-    URL=$(printf '%s' "$RESP" | sed -n 's/.*"url"[: ]*"\([^"]*\)".*/\1/p')
+    # Parse with jq (NOT sed) — a regex can be fooled by an adversarial substring
+    # like `garbage "url":"..."`. jq failing (non-zero → not valid JSON) is
+    # terminal → fall through to the fallback with URL empty.
+    URL=$(printf '%s' "$RESP" | jq -r '.url // empty' 2>/dev/null || true)
     # 2) Only poll if the submit lacked a url AND we actually got a job_id.
     #    Mirrors the TS: keep polling ONLY while the Worker reports a well-formed
-    #    queued/pending. On the FIRST hard failure — curl transport error /
-    #    timeout / non-2xx, or a status:"error" body — BREAK immediately (do NOT
-    #    continue); the fallback below then prints the prefilled link. Exhausting
-    #    the attempt ceiling with no url is also a fallback, never "filed".
+    #    queued/pending. ANY hard failure (curl transport error/timeout/non-2xx,
+    #    invalid JSON, or a non-queued/pending status) BREAKs to the fallback.
     if [ -z "$URL" ]; then
-      JOB_ID=$(printf '%s' "$RESP" | sed -n 's/.*"job_id"[: ]*"\([^"]*\)".*/\1/p')
+      JOB_ID=$(printf '%s' "$RESP" | jq -r '.job_id // empty' 2>/dev/null || true)
       if [ -n "$JOB_ID" ]; then
         for i in 1 2 3 4 5; do
           sleep 1
           # Hard transport failure → stop and fall back (do NOT keep polling).
           STAT=$(curl -fsS --max-time 10 "$WORKER_URL/status/$JOB_ID") || break
+          # Invalid JSON → terminal, break to fallback.
+          echo "$STAT" | jq -e . >/dev/null 2>&1 || break
           # A real url → done, filed.
-          URL=$(printf '%s' "$STAT" | sed -n 's/.*"url"[: ]*"\([^"]*\)".*/\1/p')
+          URL=$(printf '%s' "$STAT" | jq -r '.url // empty')
           [ -n "$URL" ] && break
           # No url yet: keep polling ONLY for a well-formed queued/pending.
-          # ANY other body — status:"error", "unknown", "done" without a url, or
-          # malformed JSON — is terminal: BREAK to the fallback, never loop on.
-          STATUS=$(printf '%s' "$STAT" | sed -n 's/.*"status"[: ]*"\([^"]*\)".*/\1/p')
+          # ANY other value — error, unknown, done-without-url — is terminal.
+          STATUS=$(printf '%s' "$STAT" | jq -r '.status // empty')
           [ "$STATUS" = "queued" ] || [ "$STATUS" = "pending" ] || break
         done
       fi
     fi
   fi
+  # Only a real GitHub issue URL counts as filed; anything else → fallback.
+  is_issue_url "$URL" || URL=""
 
   # 3) EXACTLY ONE outcome. A real issue link → print it. ANYTHING else (submit
   # failure, poll failure/timeout, done-with-error, or exhausted with no url) →
