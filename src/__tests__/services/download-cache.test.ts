@@ -528,6 +528,42 @@ describe("downloadModel cache", () => {
     expect(getResumeDiagnostic(await trayIdFor(url))?.outcome).toBe("resumed");
   });
 
+  it("REFUSES to append a CAS 206 when the redirect's content-addressed X-Linked-Etag changed, even if the CDN honors the Range (#467/#343)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://huggingface.co/org/repo/resolve/main/xet-changed.safetensors";
+    const { partial, sidecar } = await cachePaths(url);
+    await writeFile(partial, "AAAA");
+    await writeFile(sidecar, '"xet-hash-OLD"'); // partial written against OLD content
+
+    // Hop 1: resolve 302 now advertises a DIFFERENT content hash (file changed).
+    fetchMock.mockResolvedValueOnce(
+      new Response(null, {
+        status: 302,
+        headers: {
+          location: "https://cas-bridge.xethub.hf.co/xet-bridge-us/obj?sig=new",
+          "x-linked-etag": '"xet-hash-NEW"',
+        },
+      }),
+    );
+    // Hop 2: a misbehaving CAS that honors the stale Range and 206s the NEW object.
+    fetchMock.mockResolvedValueOnce(
+      new Response("BBBB", {
+        status: 206,
+        statusText: "Partial Content",
+        headers: { "content-range": "bytes 4-7/8" },
+      }),
+    );
+
+    // We must NOT splice new-object bytes onto the stale prefix — reject instead.
+    await expect(
+      downloadModel(url, "diffusion_models", "xet-changed-out.safetensors"),
+    ).rejects.toThrow(/resume rejected/i);
+    // Stale partial + sidecar removed so a retry restarts clean.
+    await expect(stat(partial)).rejects.toThrow();
+    await expect(stat(sidecar)).rejects.toThrow();
+    expect(getResumeDiagnostic(await trayIdFor(url))?.outcome).toBe("declined:etag-changed");
+  });
+
   it("declines + SURFACES a changed-upstream resume (If-Range miss, 200) — safety preserved (#467/#343)", async () => {
     await fsPromises.mkdir(cacheDir, { recursive: true });
     const url = "https://example.com/models/changed-surfaced.safetensors";

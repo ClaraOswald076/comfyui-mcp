@@ -309,8 +309,13 @@ async function streamUrlToFile(
   // response to distinguish a taken resume (206) from an If-Range MISS (200 =
   // upstream changed) so we can surface WHY the partial was discarded (#467).
   let requestedResume = false;
+  // The persisted content-addressed validator we are resuming AGAINST — kept so
+  // we can re-compare it to the value the resolve redirect reports NOW, and
+  // refuse the append ourselves if they differ (belt-and-braces on top of the
+  // origin's If-Range: we never trust a CAS 206 whose upstream object changed).
+  let priorValidator: string | null = null;
   if (resumeFromBytes > 0) {
-    const priorValidator = resumable
+    priorValidator = resumable
       ? await readValidatorSidecar(validatorSidecar)
       : null;
     if (priorValidator) {
@@ -340,9 +345,13 @@ async function streamUrlToFile(
       if (resumable) recordResumeDiagnostic(url, "declined:no-validator", resumeFromBytes);
     }
   }
-  // Captured from the FIRST redirect hop that carries one (HF's resolve 302
-  // carries X-Linked-Etag even though the final CAS 200 carries no validator) —
-  // used as the sidecar fallback so Xet downloads become resumable (#467).
+  // The content-addressed validator captured from the resolve REDIRECT (HF's
+  // 302 carries X-Linked-Etag — the file's LFS/Xet content hash — even though
+  // the final CAS 200 carries no validator). Strictly X-Linked-Etag: a generic
+  // ETag/Last-Modified on a 3xx describes the redirect/pointer resource, NOT the
+  // target file, so it must never be promoted to the file's validator. Used
+  // both as the sidecar fallback (so Xet downloads become resumable) AND as the
+  // resume-time change check below (#467).
   let redirectValidator: string | null = null;
   let res: Response;
   for (let redirectCount = 0; ; redirectCount += 1) {
@@ -353,11 +362,12 @@ async function streamUrlToFile(
     );
     if (res.status < 300 || res.status >= 400) break;
 
-    // Capture a resume validator off the redirect itself. HF's resolve URL 302s
-    // to the CAS CDN and carries X-Linked-Etag (the content-addressed object
-    // hash) on the 302; the final CAS 200 carries NO validator. Without this,
-    // Xet downloads never persisted a sidecar and could never resume (#467).
-    if (!redirectValidator) redirectValidator = extractValidator(res);
+    // Capture the content-addressed resume validator off the redirect itself.
+    // HF's resolve URL 302s to the CAS CDN and carries X-Linked-Etag (the LFS/Xet
+    // object hash) on the 302; the final CAS 200 carries NO validator. Without
+    // this, Xet downloads never persisted a sidecar and could never resume (#467).
+    // ONLY X-Linked-Etag — a generic ETag on a 3xx is the pointer's, not the file's.
+    if (!redirectValidator) redirectValidator = res.headers.get("x-linked-etag");
 
     if (redirectCount >= MAX_HTTP_REDIRECTS) {
       throw new ModelError(
@@ -434,6 +444,36 @@ async function streamUrlToFile(
 
   if (!res.body) {
     throw new ModelError("Download response has no body", { url: logUrl });
+  }
+
+  // #467/#343 belt-and-braces: if the resolve redirect now reports a DIFFERENT
+  // content-addressed object (X-Linked-Etag) than the partial was written
+  // against, the upstream file changed — and because the cross-origin CAS URL
+  // may honor our Range and return a 206 REGARDLESS of the origin's If-Range, we
+  // must refuse the append OURSELVES rather than trust the CDN. Content-addressed
+  // ⇒ an equal validator proves identical bytes; an unequal one proves change.
+  // Drop the partial + sidecar so a retry is a clean full download.
+  if (
+    requestedResume &&
+    priorValidator &&
+    redirectValidator &&
+    redirectValidator !== priorValidator
+  ) {
+    await safeRm(targetPath);
+    await safeRm(validatorSidecar);
+    recordResumeDiagnostic(url, "declined:etag-changed", resumeFromBytes);
+    logger.warn(
+      `Discarding a ${resumeFromBytes}-byte partial download and restarting from 0: the resolve ` +
+        `redirect now points at a DIFFERENT content-addressed object (X-Linked-Etag changed), so ` +
+        `the upstream file changed since the partial was written. Refusing to append even if the ` +
+        `CDN returns a 206 (would corrupt the file, #343). Removed the partial; retry.`,
+      { url: logUrl, discardedBytes: resumeFromBytes },
+    );
+    throw new ModelError(
+      "Download resume rejected: the upstream file changed (content-addressed validator no longer " +
+        "matches the partial). Removed the stale partial so a retry restarts cleanly.",
+      { url: logUrl },
+    );
   }
 
   // Decide append vs truncate based on the response. We only append when we
