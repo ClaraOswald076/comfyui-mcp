@@ -9,7 +9,6 @@
 pip: []
 
 custom_nodes:
-  - https://github.com/ltdrdata/ComfyUI-Manager.git
   - https://github.com/rgthree/rgthree-comfy            # Power Lora Loader / Any Switch
   - https://github.com/kijai/ComfyUI-KJNodes            # Set/Get bus, Ideogram4PromptBuilderKJ, ImageSharpenKJ, INTConstant
   - https://github.com/cubiq/ComfyUI_essentials         # ImageResize+ (two-pass roundtrip resize)

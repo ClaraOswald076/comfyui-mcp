@@ -9,7 +9,6 @@
 pip: []
 
 custom_nodes:
-  - https://github.com/ltdrdata/ComfyUI-Manager.git
   - https://github.com/rgthree/rgthree-comfy            # Power Lora Loader / Any Switch
   - https://github.com/kijai/ComfyUI-KJNodes            # Set/Get bus, Ideogram4PromptBuilderKJ, ImageSharpenKJ
   - https://github.com/capitan01R/ComfyUI-Krea2T-Enhancer            # Krea2T-Enhancer — V2 model detail-boost patch (ships ACTIVE)
