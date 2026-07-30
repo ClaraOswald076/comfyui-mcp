@@ -6,6 +6,10 @@ import {
   runComfyCli,
 } from "../services/comfy-cli.js";
 import { searchLiveObjectInfo } from "../services/object-info-search.js";
+import {
+  isLocalModelsListAction,
+  listLocalModelsFallback,
+} from "../services/local-models-fallback.js";
 import { errorToToolResult } from "../utils/errors.js";
 
 const whereSchema = z.enum(["local", "cloud"]).optional();
@@ -212,7 +216,7 @@ export function registerComfyCliTools(server: McpServer): void {
 
   server.tool(
     "comfy_cli_models",
-    "Discover model folders/files locally or in Comfy Cloud, download model URLs into a workspace, or remove workspace model files through official comfy-cli.",
+    "Discover model folders/files locally or in Comfy Cloud, download model URLs into a workspace, or remove workspace model files through official comfy-cli. When comfy-cli is not installed/on PATH and the target is the connected (local) server, the read-only listing actions (list-folders, list-folder, search, show) fall back to that server's own local models (via /models) — so model discovery works without the CLI.",
     {
       action: z.enum(["list-folders", "list-folder", "search", "show", "download", "remove"]),
       folder: z.string().optional(),
@@ -228,6 +232,36 @@ export function registerComfyCliTools(server: McpServer): void {
     },
     async (args) => {
       try {
+        // Local models fallback (#460): the read-only listing actions don't
+        // need comfy-cli — the connected local ComfyUI already reports its
+        // installed models. When comfy-cli is absent and we're targeting the
+        // connected server (not Comfy Cloud, no pinned workspace), serve the
+        // listing from listLocalModels() instead of failing on the missing CLI.
+        // A pinned `workspace` may be a DIFFERENT install than the connected
+        // server, so we don't substitute silently — we fall through and let
+        // comfy-cli surface its clear not-found error for that workspace.
+        // Mirrors the live /object_info fallback for comfy_cli_search_nodes.
+        const listAction = isLocalModelsListAction(args.action) ? args.action : undefined;
+        if (
+          listAction &&
+          args.where !== "cloud" &&
+          !args.workspace &&
+          !resolveComfyCliExecutable({ workspace: args.workspace })
+        ) {
+          const { command, data } = await listLocalModelsFallback({ ...args, action: listAction });
+          return textEnvelope({
+            schema: "envelope/1",
+            type: "envelope",
+            ok: true,
+            command,
+            version: "local-models-fallback",
+            where: "local",
+            source: "local_models",
+            note: "comfy-cli was not found; listed the connected ComfyUI's local models instead.",
+            data,
+            error: null,
+          });
+        }
         const command = [args.action === "download" || args.action === "remove" ? "model" : "models", args.action];
         if (args.action === "list-folder") {
           if (!args.folder) throw new Error("folder is required for list-folder");
