@@ -22,6 +22,9 @@ vi.mock("../../config.js", () => ({
 vi.mock("node:child_process", () => ({
   execSync: mockExecSync,
   spawn: mockSpawn,
+  // workspace-env (imported transitively for live-first script anchoring)
+  // promisifies execFile at module load, so it must be present.
+  execFile: vi.fn(),
 }));
 
 // assessRelaunch (restart preflight) validates the resolved interpreter/script
