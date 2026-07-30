@@ -54,6 +54,8 @@ import {
   resetObjectInfoCache,
 } from "../comfyui/client.js";
 import { convertUiToApi, collectNodeTypes } from "../services/workflow-converter.js";
+import { restartComfyUI } from "../services/process-control.js";
+import { isRemoteMode } from "../config.js";
 import { sliceWorkflow } from "../services/workflow-slicer.js";
 import { validateA2UISpecServer } from "../services/a2ui-spec.js";
 import type { UiWorkflow } from "../comfyui/types.js";
@@ -132,6 +134,30 @@ export function rebootDropped(res: ToolResult): boolean {
   return /disconnected mid-command|OUTCOME UNKNOWN|ECONNRESET|socket hang up|premature close|other side closed|ECONNABORTED|EPIPE/i.test(
     text,
   );
+}
+
+/**
+ * True when a comfy_reboot ToolResult is a NON-error, NON-fired refusal whose
+ * cause is that the panel could reach NO ComfyUI-Manager reboot endpoint — i.e.
+ * every Manager reboot route answered 404/405 (the classic legacy Manager 3.x
+ * symptom: `POST /v2/manager/reboot → 405; GET /manager/reboot → 404`,
+ * panel #253/#266 and this repo #425). This is distinct from:
+ *   - a busy-guard refusal (a generation is running) — its text speaks to the
+ *     queue/generation, never to a "reboot endpoint", so it does NOT match; and
+ *   - a Manager-security 403 refusal — that speaks to "security"/"forbidden".
+ * Only a no-endpoint refusal is safe to retry through the headless managed
+ * restart (kill + relaunch), and only for a LOCAL, process-controllable target.
+ */
+export function rebootNoEndpoint(res: ToolResult): boolean {
+  if (res?.isError) return false;
+  const text = res?.content?.find((c) => c.type === "text")?.text ?? "";
+  // A busy-guard / security refusal must never be treated as "no endpoint" — a
+  // kill+relaunch fallback would abort a running render or defeat the security
+  // gate. Require the reboot-endpoint signature AND the absence of those.
+  if (/busy|in progress|generation|queue is|running|security|forbidden|403/i.test(text)) {
+    return false;
+  }
+  return /reboot endpoint|reboot route|was NOT restarted|no reachable .*reboot/i.test(text);
 }
 
 interface PanelRebootTiming {
@@ -2377,6 +2403,56 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         const fired = rebootConfirmed(res);
         const dropped = !fired && rebootDropped(res);
         if (!fired && !dropped) {
+          // The panel could not fire a Manager reboot. If the SOLE reason is that
+          // NO Manager reboot endpoint answered (legacy Manager 3.x: v2 route 405s,
+          // legacy route 404s — #425, panel #253/#266) AND the target is a LOCAL,
+          // process-controllable ComfyUI, fall back to the headless managed restart
+          // (kill + relaunch) — the same mechanism as the `restart_comfyui` tool.
+          // A busy-guard or security refusal is deliberately NOT eligible
+          // (rebootNoEndpoint excludes those), so this never aborts a running
+          // render or bypasses Manager's security gate.
+          if (!isRemoteMode() && rebootNoEndpoint(res)) {
+            let restart: Awaited<ReturnType<typeof restartComfyUI>> | undefined;
+            try {
+              restart = await restartComfyUI();
+            } catch (err) {
+              return fail(
+                "The built-in Manager exposed no reboot endpoint (legacy Manager 3.x), " +
+                  "and the headless managed restart also failed: " +
+                  (err instanceof Error ? err.message : String(err)) +
+                  " — restart ComfyUI on the host, then reconnect.",
+              );
+            }
+            if (!restart.started) {
+              return fail(
+                "The built-in Manager exposed no reboot endpoint (legacy Manager 3.x). " +
+                  "Tried the headless managed restart (kill + relaunch) as a fallback, but it " +
+                  `could not restart ComfyUI: ${restart.message} ` +
+                  "Restart ComfyUI on the host, then reconnect.",
+              );
+            }
+            // A managed kill+relaunch restarts ComfyUI out-of-band from the WS
+            // client, so drop the memoized caches exactly as the Manager-reboot
+            // path does before waiting for the panel to reconnect.
+            resetClient();
+            resetObjectInfoCache();
+            const timing = getPanelRebootTiming();
+            const recovery = await waitForPanelReady(ctx, timing);
+            return ok({
+              rebooting: true,
+              ready: recovery.ready,
+              recovered_ms: recovery.waited_ms,
+              probes: recovery.attempts,
+              via: "headless-managed-restart",
+              note:
+                "ComfyUI-Manager (legacy 3.x) had no reboot endpoint; restarted ComfyUI " +
+                `via the headless managed restart (kill + relaunch)${
+                  recovery.ready
+                    ? ` and it came back ready in ${(recovery.waited_ms / 1000).toFixed(1)}s.`
+                    : " but the panel did not reconnect within the readiness budget — verify with panel_node_queue_status."
+                }`,
+            });
+          }
           // Genuine refusal (or an unrelated error) — do NOT poll or reset caches.
           // Resetting on a refusal would close the shared client mid-generation
           // (codex WS-3 finding #2).

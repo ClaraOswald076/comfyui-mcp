@@ -1143,6 +1143,52 @@ export interface UpdateOptions {
   useCmCli?: boolean;
 }
 
+/** Does this update target refer to ComfyUI-Manager itself (any spelling)? */
+function isManagerSelfTarget(id: string): boolean {
+  const norm = basename(id.trim().toLowerCase()).replace(/[_\s]+/g, "-");
+  return norm === "comfyui-manager" || norm === "comfy-manager";
+}
+
+/**
+ * Directly git-pull the local custom_nodes/ComfyUI-Manager checkout as a
+ * fallback for the one op the legacy 3.x queue can't do — update the running
+ * Manager itself (#424). Returns undefined when there is no local install or no
+ * on-disk Manager checkout (e.g. pip comfyui_manager, which has no custom_nodes
+ * clone), so the caller can surface an actionable error. A NodeManagementError
+ * from the git pull itself propagates.
+ */
+function updateManagerSelfLocally(): NodeOpResult | undefined {
+  if (!config.comfyuiPath) return undefined;
+  const customNodesRoot = resolve(config.comfyuiPath, "custom_nodes");
+  const dir = ["ComfyUI-Manager", "comfyui-manager", "comfyui_manager"]
+    .map((d) => join(customNodesRoot, d))
+    .find((p) => existsSync(join(p, ".git")));
+  if (!dir) return undefined;
+  try {
+    const out = execFileSync("git", ["-C", dir, "pull", "--ff-only"], {
+      cwd: config.comfyuiPath,
+      encoding: "utf-8",
+      timeout: GIT_CLONE_TIMEOUT,
+      env: nonInteractiveGitEnv(),
+    });
+    return {
+      mechanism: "git-clone",
+      message:
+        `Updated ComfyUI-Manager itself via a direct git pull of ${dir} ` +
+        `(the legacy 3.x queue can't self-update the running Manager). ` +
+        `RESTART ComfyUI to load the new Manager.`,
+      details: out.trim(),
+    };
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException & { stdout?: Buffer | string; stderr?: Buffer | string };
+    throw new NodeManagementError(
+      `git pull of the local ComfyUI-Manager checkout (${dir}) failed: ${e.message}. ` +
+        `Update it manually (git pull, or pip install -U comfyui_manager) then restart ComfyUI.`,
+      { stdout: e.stdout?.toString() ?? "", stderr: e.stderr?.toString() ?? "" },
+    );
+  }
+}
+
 export function updateCustomNode(opts: UpdateOptions): Promise<NodeOpResult> {
   return withObjectInfoInvalidation(() => updateCustomNodeImpl(opts));
 }
@@ -1162,6 +1208,25 @@ async function updateCustomNodeImpl(
         : `Updated "${id}" via official comfy-cli.`,
       details: out.trim(),
     };
+  }
+
+  // Updating ComfyUI-Manager ITSELF through its own task queue is the one op the
+  // queue can't reliably perform: legacy Manager 3.x 405s the update route for
+  // the running Manager pack, so the in-panel 3.x→v4 upgrade path deadlocks
+  // (#424). When the target IS the Manager pack and we have a LOCAL install, do
+  // a direct `git pull` of the custom_nodes/ComfyUI-Manager checkout instead —
+  // the only in-repo way to actually advance it (a restart then loads the new
+  // code). Remote targets can't be git-controlled → clear, actionable error.
+  if (!all && isManagerSelfTarget(id) && (await detectManagerApi()) === "legacy") {
+    const local = updateManagerSelfLocally();
+    if (local) return local;
+    throw new NodeManagementError(
+      `Updating ComfyUI-Manager itself is not supported over the LEGACY Manager 3.x queue ` +
+        `API (it 405s the self-update route — #424), and no LOCAL custom_nodes/ComfyUI-Manager ` +
+        `checkout was found to git-pull directly. Update ComfyUI-Manager on the host ` +
+        `(git pull in custom_nodes/ComfyUI-Manager, or pip install -U comfyui_manager), then ` +
+        `restart ComfyUI.`,
+    );
   }
 
   let status: QueueStatus;
