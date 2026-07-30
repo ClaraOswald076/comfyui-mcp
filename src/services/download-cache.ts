@@ -267,18 +267,29 @@ async function streamUrlToFile(
   onResume?: ResumeReporter,
 ): Promise<void> {
   if (supportsCloudDownload(url)) {
-    // Cloud downloaders (S3/Azure) don't range-resume — they open a "w" stream
-    // and overwrite the target. If a partial exists, it's being discarded; surface
-    // that (#467) instead of silently restarting, mirroring the HTTP no-validator
-    // case (the cloud object carries no ETag/Last-Modified resume validator here).
+    // Cloud downloaders (S3/Azure) don't range-resume — they overwrite the target.
+    // If a partial exists it's being discarded; surface that (#467) instead of a
+    // silent restart. Truncate it OURSELVES first and CONFIRM (throw on failure)
+    // BEFORE reporting discarded:true — the cloud SDKs validate the request/body
+    // before opening their write stream, so reporting pre-download could otherwise
+    // claim a discard that a later auth/network failure never performed (P1-1).
     if (resumable && resumeFromBytes > 0) {
+      try {
+        await writeFile(targetPath, "");
+      } catch (err) {
+        throw new ModelError(
+          `Download restart failed: could not truncate the stale ${resumeFromBytes}-byte partial ` +
+            `before a cloud re-download. Retry (a fresh attempt restarts from 0).`,
+          { url: logUrl, cause: err instanceof Error ? err.message : String(err) },
+        );
+      }
       logger.warn(
-        `Discarding a ${resumeFromBytes}-byte partial download and restarting from 0: cloud ` +
-          `downloads (S3/Azure) don't support byte-range resume, so the partial is overwritten — ` +
+        `Discarded a ${resumeFromBytes}-byte partial download and restarting from 0: cloud ` +
+          `downloads (S3/Azure) don't support byte-range resume, so the partial was overwritten — ` +
           `re-downloading in full.`,
         { url: logUrl, discardedBytes: resumeFromBytes },
       );
-      onResume?.({ outcome: "declined:no-validator", discardedBytes: resumeFromBytes, discarded: true });
+      onResume?.({ outcome: "declined:full-response", discardedBytes: resumeFromBytes, discarded: true });
     }
     await downloadCloudUrlToFile(url, targetPath, storageAuth);
     // #343 edge: the S3/Azure path bypasses the HTTP size gate below. The cloud
