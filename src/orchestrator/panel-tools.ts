@@ -364,6 +364,116 @@ function parseToolResultJson(res: ToolResult): Record<string, unknown> | null {
   }
 }
 
+// ---- panel_run reply interpretation (#213/#331/#248/#194) -------------------
+// `panel_run` forwards `graph_run` to the panel, which drives `app.queuePrompt`
+// and forwards ComfyUI's /prompt outcome back. ComfyUI splits a rejection into
+// TWO channels:
+//   • per-node problems      -> `node_errors` (a map keyed by node id)
+//   • TOP-LEVEL problems     -> `error`       (e.g. prompt_outputs_failed_validation,
+//                                              missing_node_type) — leaves node_errors EMPTY
+// #213: the panel's success guard looked ONLY at node_errors, so a top-level
+// rejection (empty node_errors) slipped through as `queued:true` — a FALSE
+// success the agent then waited a whole turn on. We therefore DERIVE the verdict
+// from the authoritative fields (mirroring the #485 enqueue-validation parsing):
+// a reply is a rejection when it carries a non-empty `error`, a non-empty
+// `node_errors`, or an explicit `queued:false` — regardless of any `queued:true`
+// flag that may accompany it. Only a reply with NONE of those is a real queue.
+
+/** True when a graph_run reply's top-level `error` channel is populated (an
+ *  object with any keys, or a non-blank string). Empty object / "" / absent = no. */
+function hasTopLevelError(error: unknown): boolean {
+  if (typeof error === "string") return error.trim().length > 0;
+  if (error != null && typeof error === "object") return Object.keys(error as object).length > 0;
+  return false;
+}
+
+/** True when a graph_run reply's `node_errors` channel names at least one node. */
+function hasNodeErrors(nodeErrors: unknown): boolean {
+  return (
+    nodeErrors != null &&
+    typeof nodeErrors === "object" &&
+    Object.keys(nodeErrors as object).length > 0
+  );
+}
+
+/**
+ * Format a ComfyUI /prompt rejection payload (the top-level `error` object plus
+ * per-node `node_errors`) into a human-readable failure — the same shape the
+ * #485 HTTP enqueue path surfaces, so panel_run and enqueue_workflow read alike.
+ */
+function formatRunRejection(payload: { error?: unknown; node_errors?: unknown }): string {
+  let headline = "ComfyUI refused to queue the workflow";
+  const topError = payload.error;
+  const extraLines: string[] = [];
+  if (topError && typeof topError === "object") {
+    const te = topError as { type?: unknown; message?: unknown; details?: unknown };
+    const msg = typeof te.message === "string" ? te.message.trim() : "";
+    const type = typeof te.type === "string" ? te.type.trim() : "";
+    if (msg) headline = `ComfyUI refused to queue the workflow: ${msg}${type ? ` (${type})` : ""}`;
+    else if (type) headline = `ComfyUI refused to queue the workflow (${type})`;
+    const details = typeof te.details === "string" ? te.details.trim() : "";
+    if (details) extraLines.push(details);
+  } else if (typeof topError === "string" && topError.trim()) {
+    headline = `ComfyUI refused to queue the workflow: ${topError.trim()}`;
+  }
+
+  const lines: string[] = [...extraLines];
+  const ne = payload.node_errors;
+  if (ne && typeof ne === "object") {
+    for (const [nodeId, info] of Object.entries(ne as Record<string, unknown>)) {
+      const i = (info ?? {}) as { class_type?: unknown; errors?: unknown };
+      const cls = typeof i.class_type === "string" ? i.class_type : "node";
+      const errs = Array.isArray(i.errors) ? i.errors : [];
+      if (errs.length === 0) {
+        lines.push(`- ${cls} (node ${nodeId}): validation failed`);
+        continue;
+      }
+      for (const e of errs as Array<{ message?: unknown; details?: unknown }>) {
+        const detail = typeof e?.details === "string" && e.details ? ` (${e.details})` : "";
+        const m = typeof e?.message === "string" ? e.message : "validation failed";
+        lines.push(`- ${cls} (node ${nodeId}): ${m}${detail}`);
+      }
+    }
+  }
+  return lines.length ? `${headline}\n${lines.join("\n")}` : headline;
+}
+
+/**
+ * Inspect a graph_run ToolResult and return a FAILURE ToolResult when the run
+ * did NOT genuinely enter ComfyUI's queue, or `null` when it is a real queue
+ * (so the caller may append the success/anti-poll guidance).
+ *
+ *  - An isError reply (no connected tab #331, a thrown app.queuePrompt #248, a
+ *    transport drop) is passed through VERBATIM — its full detail/browser stack
+ *    is preserved and the success-only "you'll be notified" note is NOT added.
+ *  - A NON-error reply is parsed: a top-level `error`, a non-empty `node_errors`,
+ *    or an explicit `queued:false` is surfaced as a formatted failure (#213) —
+ *    even when a stale `queued:true` accompanies it.
+ *  - Anything else (a plain `queued:true`, or an unparseable reply we must not
+ *    regress) returns null and is treated as a genuine queue.
+ */
+function detectRunRejection(res: ToolResult): ToolResult | null {
+  // Bridge/transport/executor error: never a queue. Preserve it verbatim (#248),
+  // no success note (#331). fail() already carries err.message (incl. any stack).
+  if (res?.isError) return res;
+
+  const parsed = parseToolResultJson(res);
+  if (!parsed) return null; // unparseable non-error reply — don't regress a success
+
+  const topError = parsed.error;
+  const nodeErrors = parsed.node_errors;
+  const rejected =
+    hasTopLevelError(topError) || hasNodeErrors(nodeErrors) || parsed.queued === false;
+  if (!rejected) return null; // genuine queue (queued:true / no rejection signal)
+
+  return fail(formatRunRejection({ error: topError, node_errors: nodeErrors }));
+}
+
+export const __panelRunTestHooks = {
+  detectRunRejection,
+  formatRunRejection,
+};
+
 /** Drop a trailing .json (case-insensitive) so filename/path forms compare equal. */
 function stripJsonExt(s: unknown): string | null {
   return typeof s === "string" ? s.replace(/\.json$/i, "") : null;
@@ -1504,7 +1614,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_run",
-      "Queue the workflow the user has OPEN — exactly like them pressing Queue Prompt (current widget values, the live graph they can see). Returns queued:true, or queued:false with node_errors when frontend validation fails. Pass to_node_id to RUN ONLY ONE BRANCH ('run to node'): ComfyUI renders just that output node plus everything upstream of it and SKIPS every other output branch — handy for previewing or debugging part of a big graph without rendering the whole thing. to_node_id MUST be an OUTPUT node (SaveImage, PreviewImage, SaveVideo, …) — pick the one at the END of the branch you want; nodes are tagged is_output:true in panel_query_graph's detail rows. Omit it to run the whole graph. Use this so the render runs on THEIR canvas and they see the result.",
+      "Queue the workflow the user has OPEN — exactly like them pressing Queue Prompt (current widget values, the live graph they can see). On success it confirms the run was queued; if ComfyUI REFUSES the prompt (validation failure on either channel — per-node node_errors OR a top-level error like a missing node type) it returns a FAILURE with that rejection detail, never a false 'queued'. Pass to_node_id to RUN ONLY ONE BRANCH ('run to node'): ComfyUI renders just that output node plus everything upstream of it and SKIPS every other output branch — handy for previewing or debugging part of a big graph without rendering the whole thing. to_node_id MUST be an OUTPUT node (SaveImage, PreviewImage, SaveVideo, …) — pick the one at the END of the branch you want; nodes are tagged is_output:true in panel_query_graph's detail rows. Omit it to run the whole graph. Use this so the render runs on THEIR canvas and they see the result.",
       {
         batch_count: z
           .number()
@@ -1530,6 +1640,15 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           { cmd: "graph_run", batch_count: args.batch_count, to_node_id: args.to_node_id },
           20000,
         );
+        // Derive the verdict from the AUTHORITATIVE reply, not a bare `queued`
+        // flag. A rejection — a no-connected-tab / thrown-queuePrompt error
+        // (#331/#248), or a ComfyUI /prompt refusal on EITHER channel
+        // (top-level `error` with empty node_errors #213, or per-node
+        // node_errors) — is surfaced as a failure WITHOUT the success-only
+        // "you'll be notified automatically" guidance. Only a genuine queue
+        // gets the anti-poll note below.
+        const rejection = detectRunRejection(res);
+        if (rejection) return rejection;
         // Append anti-poll guidance: the agent should go idle after queuing so the
         // executed event auto-injects the output image, rather than busy-polling.
         const note =

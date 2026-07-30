@@ -19,7 +19,9 @@ import {
   registerPanelTools,
   __openWorkflowTestHooks,
   __panelToolsTestHooks,
+  __panelRunTestHooks,
   type PanelToolCtx,
+  type ToolResult,
 } from "../../orchestrator/panel-tools.js";
 import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
 
@@ -335,6 +337,200 @@ describe("panel-tools: panel_run (run-to-node partial execution)", () => {
     const { ctx, calls } = makeFakeCtx();
     await defByName("panel_run").handler({ to_node_id: 27 }, ctx);
     expect(calls[0]).toMatchObject({ cmd: "graph_run", to_node_id: 27 });
+  });
+});
+
+// A panel_run test ctx whose graph_run reply is fully controllable, so we can
+// drive the four rejection/acceptance edge-cases the panel forwards from
+// ComfyUI's /prompt. Records every forwarded cmd for assertion.
+function makeRunCtx(reply: ToolResult): { ctx: PanelToolCtx; calls: Forwarded[] } {
+  const calls: Forwarded[] = [];
+  const ctx: PanelToolCtx = {
+    call: async (cmd) => {
+      calls.push(cmd);
+      return reply;
+    },
+    confirm: async () => true,
+    bridge: {} as unknown as PanelToolCtx["bridge"],
+    tabId: "test-tab",
+  };
+  return { ctx, calls };
+}
+
+/** Extract the joined text of a ToolResult for content assertions. */
+function textOf(res: ToolResult): string {
+  return (res.content ?? [])
+    .filter((c): c is { type: "text"; text: string } => c.type === "text")
+    .map((c) => c.text)
+    .join("\n");
+}
+
+const QUEUED_NOTE = "notified automatically";
+
+describe("panel-tools: panel_run verdict is derived from the ComfyUI reply", () => {
+  it("#213: a top-level /prompt error (empty node_errors) is a FAILURE, not queued:true", async () => {
+    // ComfyUI split: a top-level rejection leaves node_errors empty. The panel's
+    // stale guard may still forward queued:true — the orchestrator must NOT trust it.
+    const reply: ToolResult = {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            queued: true,
+            error: {
+              type: "prompt_outputs_failed_validation",
+              message: "Prompt outputs failed validation",
+            },
+            node_errors: {},
+          }),
+        },
+      ],
+    };
+    const { ctx } = makeRunCtx(reply);
+    const res = await defByName("panel_run").handler({}, ctx);
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain("Prompt outputs failed validation");
+    expect(text).toContain("prompt_outputs_failed_validation");
+    // The success-only anti-poll guidance must NOT be appended to a rejection.
+    expect(text).not.toContain(QUEUED_NOTE);
+  });
+
+  it("#213: per-node node_errors are surfaced with node id + class_type", async () => {
+    const reply: ToolResult = {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            queued: false,
+            node_errors: {
+              "5": {
+                class_type: "LoadImage",
+                errors: [
+                  { message: "Custom validation failed", details: "Invalid image: missing.png" },
+                ],
+              },
+            },
+          }),
+        },
+      ],
+    };
+    const { ctx } = makeRunCtx(reply);
+    const res = await defByName("panel_run").handler({}, ctx);
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain("LoadImage");
+    expect(text).toContain("node 5");
+    expect(text).toContain("Invalid image: missing.png");
+    expect(text).not.toContain(QUEUED_NOTE);
+  });
+
+  it("#194: a root SaveImage run-to-node the panel ACCEPTS is queued success (not subgraph-rejected)", async () => {
+    const reply: ToolResult = {
+      content: [
+        { type: "text", text: JSON.stringify({ queued: true, batch_count: 1, to_node_id: 9 }) },
+      ],
+    };
+    const { ctx, calls } = makeRunCtx(reply);
+    const res = await defByName("panel_run").handler({ to_node_id: 9 }, ctx);
+    // Forwarded unchanged so the (fixed) panel can resolve the root output node.
+    expect(calls[0]).toMatchObject({ cmd: "graph_run", to_node_id: 9 });
+    expect(res.isError).toBeFalsy();
+    // Accepted -> the anti-poll queued guidance IS appended.
+    expect(textOf(res)).toContain(QUEUED_NOTE);
+  });
+
+  it("#194: a subgraph-rejection reply is surfaced cleanly WITHOUT the false success note", async () => {
+    const reply: ToolResult = {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            queued: false,
+            error:
+              "node 9 is not on the root graph — run-to-node targets a root-level output node",
+          }),
+        },
+      ],
+    };
+    const { ctx } = makeRunCtx(reply);
+    const res = await defByName("panel_run").handler({ to_node_id: 9 }, ctx);
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain("not on the root graph");
+    expect(text).not.toContain(QUEUED_NOTE);
+  });
+
+  it("#331: no queued-render guidance when no panel tab is connected", async () => {
+    const reply: ToolResult = {
+      content: [
+        { type: "text", text: 'Error: no connected tab with id "tmp:abc". Connected: none' },
+      ],
+      isError: true,
+    };
+    const { ctx } = makeRunCtx(reply);
+    const res = await defByName("panel_run").handler({ to_node_id: 25 }, ctx);
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain("no connected tab");
+    // The workflow was never queued — the automatic-delivery note must be absent.
+    expect(text).not.toContain(QUEUED_NOTE);
+  });
+
+  it("#248: a thrown app.queuePrompt surfaces the browser stack detail, no success note", async () => {
+    const stack =
+      "app.queuePrompt failed:\n" +
+      "TypeError: Cannot read properties of undefined (reading 'output')\n" +
+      "    at app.graphToPrompt (http://127.0.0.1:8188/extensions/tts_audio_suite/audio_analyzer_interface.js:102:24)";
+    const reply: ToolResult = {
+      content: [{ type: "text", text: `Error: ${stack}` }],
+      isError: true,
+    };
+    const { ctx } = makeRunCtx(reply);
+    const res = await defByName("panel_run").handler({}, ctx);
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    // The actionable browser location must survive verbatim.
+    expect(text).toContain("app.graphToPrompt");
+    expect(text).toContain("audio_analyzer_interface.js:102:24");
+    expect(text).not.toContain(QUEUED_NOTE);
+  });
+
+  it("a genuine queue (queued:true, no errors) still gets the anti-poll note", async () => {
+    const reply: ToolResult = {
+      content: [{ type: "text", text: JSON.stringify({ queued: true, batch_count: 1 }) }],
+    };
+    const { ctx } = makeRunCtx(reply);
+    const res = await defByName("panel_run").handler({}, ctx);
+    expect(res.isError).toBeFalsy();
+    expect(textOf(res)).toContain(QUEUED_NOTE);
+  });
+});
+
+describe("panel-tools: detectRunRejection helper", () => {
+  const { detectRunRejection } = __panelRunTestHooks;
+  const jsonReply = (obj: unknown): ToolResult => ({
+    content: [{ type: "text", text: JSON.stringify(obj) }],
+  });
+
+  it("returns null for a clean queued:true reply", () => {
+    expect(detectRunRejection(jsonReply({ queued: true, batch_count: 1 }))).toBeNull();
+  });
+
+  it("returns null for an unparseable non-error reply (no regression)", () => {
+    expect(detectRunRejection({ content: [{ type: "text", text: "plain ok" }] })).toBeNull();
+  });
+
+  it("flags a top-level error even alongside a stale queued:true", () => {
+    const rej = detectRunRejection(
+      jsonReply({ queued: true, error: { type: "missing_node_type", message: "boom" }, node_errors: {} }),
+    );
+    expect(rej?.isError).toBe(true);
+  });
+
+  it("passes an isError reply through verbatim", () => {
+    const err: ToolResult = { content: [{ type: "text", text: "Error: boom" }], isError: true };
+    expect(detectRunRejection(err)).toBe(err);
   });
 });
 
