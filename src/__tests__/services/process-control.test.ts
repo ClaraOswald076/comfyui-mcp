@@ -196,6 +196,32 @@ describe("process-control startup readiness", () => {
     expect(children[0].unref).toHaveBeenCalled();
   });
 
+  it("recognizes a QUOTED main.py script path and relaunches via the interpreter (#401 / #433)", async () => {
+    // A launcher can leave surrounding quotes on argv[0] ("C:\ComfyUI\main.py").
+    // The suffix test must strip them, else the quoted path fails the `.py` check,
+    // bypasses the resolver, and is spawned as the executable.
+    __processControlTestHooks.setLastProcessInfo({
+      pid: 0,
+      port: 8188,
+      argv: ['"C:\\ComfyUI\\main.py"', "--port", "8188"],
+      isDesktopApp: false,
+    });
+    const children = mockSpawnedChildren();
+    mockNoPortProcess();
+    mockFetchOk(true);
+
+    const result = await startComfyUI();
+
+    expect(result.started).toBe(true);
+    // Resolved via the Python interpreter, with the UNQUOTED script path.
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "/fake/ComfyUI/python_embeded/python.exe",
+      ["C:\\ComfyUI\\main.py", "--port", "8188"],
+      expect.objectContaining({ detached: true, shell: false }),
+    );
+    expect(children[0].unref).toHaveBeenCalled();
+  });
+
   it("anchors a RELATIVE script argv[0] to the ComfyUI root (portable launcher, #330)", async () => {
     // The standard Windows portable launcher runs `python ComfyUI\main.py` from
     // the portable ROOT, so sys.argv[0] is relative. Since we force cwd to the

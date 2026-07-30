@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { homedir, platform } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, resolve as pathResolve } from "node:path";
 import { promisify } from "node:util";
 import { config, getComfyUIBaseUrl, isRemoteMode } from "../config.js";
 import { getSystemStats } from "../comfyui/client.js";
@@ -319,32 +319,128 @@ async function probe(
   }
 }
 
-/** Resolve the python executable to probe, preferring a venv inside the workspace. */
-function pythonCandidates(workspacePath: string | undefined): string[] {
+/**
+ * Derive the ABSOLUTE directory that holds the running server's `main.py` from its
+ * `/system_stats` argv (Python's `sys.argv`, whose argv[0] is the script path). This
+ * is the LIVE running instance's install root — the source of truth for which python
+ * is actually running ComfyUI (#401 / PR #433 review). Robust against the argv shapes
+ * codex flagged: surrounding quotes are stripped; a RELATIVE `ComfyUI/main.py` or a
+ * bare `main.py` is resolved against the server's reported cwd WHEN AVAILABLE; and if
+ * the main.py path cannot be resolved to an absolute directory we return `undefined`
+ * (UNRESOLVED) rather than a bogus/relative root — callers must NOT then silently
+ * fall back to a persisted default and mark it "live".
+ */
+export function liveRootFromArgv(
+  argv: string[] | undefined,
+  cwd?: string,
+): string | undefined {
+  if (!Array.isArray(argv)) return undefined;
+  for (const rawArg of argv) {
+    if (typeof rawArg !== "string") continue;
+    // Strip surrounding quotes a launcher may leave on the path.
+    const a = rawArg.trim().replace(/^["']+/, "").replace(/["']+$/, "");
+    // Must actually END in main.py / main.pyw (boundary guards against notmain.py).
+    if (!/(^|[\\/])main\.pyw?$/i.test(a)) continue;
+    const dir = dirname(a);
+    if (dir === "." || dir === "") {
+      // Bare "main.py" — only resolvable via an absolute cwd.
+      return cwd && isAbsolute(cwd) ? cwd : undefined;
+    }
+    if (isAbsolute(dir)) return dir;
+    // Relative dir (e.g. "ComfyUI/main.py") — resolve against the server's cwd.
+    if (cwd && isAbsolute(cwd)) return pathResolve(cwd, dir);
+    return undefined; // cannot resolve to an absolute dir → UNRESOLVED
+  }
+  return undefined;
+}
+
+/** Platform interpreter candidates under a ComfyUI install root, most-preferred first. */
+function interpreterCandidates(root: string): string[] {
   const names = IS_WIN ? ["python.exe", "python"] : ["python3", "python"];
   const candidates: string[] = [];
-  if (workspacePath) {
-    const venvBin = IS_WIN
-      ? join(workspacePath, ".venv", "Scripts")
-      : join(workspacePath, ".venv", "bin");
-    for (const n of names) {
-      const p = join(venvBin, n);
-      if (existsSync(p)) candidates.push(p);
-    }
+  if (IS_WIN) {
+    candidates.push(join(root, "standalone-env", "python.exe"));
+    candidates.push(join(root, "python_embeded", "python.exe"));
+    candidates.push(join(root, "..", "python_embeded", "python.exe"));
   }
-  // Fall back to PATH-resolved interpreters
-  candidates.push(...names);
+  const venvBins = IS_WIN
+    ? [join(root, ".venv", "Scripts"), join(root, "venv", "Scripts")]
+    : [join(root, ".venv", "bin"), join(root, "venv", "bin")];
+  for (const bin of venvBins) for (const n of names) candidates.push(join(bin, n));
   return candidates;
 }
 
-async function probePython(
-  workspacePath: string | undefined,
-): Promise<{ executable: string; version: string } | undefined> {
-  for (const exe of pythonCandidates(workspacePath)) {
-    const version = await probe(exe, ["--version"]);
-    if (version) return { executable: exe, version: version.replace(/^Python\s+/i, "") };
+export interface ComfyuiPythonResolution {
+  /** The interpreter to probe. Absolute when verified; a bare PATH name as last resort. */
+  python: string | undefined;
+  /** The interpreter exists on disk under a known ComfyUI root (venv/embedded). */
+  verified: boolean;
+  /** That root is the LIVE running server's own install root — i.e. this is provably
+   *  the interpreter running ComfyUI. Only a `live` interpreter's negatives are
+   *  authoritative; anything else must be treated as unknown/untrusted (#401). */
+  live: boolean;
+  /** The resolved absolute live root, when one could be determined from argv. */
+  liveRoot?: string;
+}
+
+/**
+ * Resolve the python that ComfyUI actually runs on, LIVE-FIRST. The running server's
+ * argv-derived install root is tried BEFORE an explicit COMFYUI_PATH, which is tried
+ * before the saved default workspace (#418) — and the saved default is consulted ONLY
+ * when there is neither a live argv nor an explicit path to trust. Portable/standalone
+ * installs keep python under python_embeded / standalone-env (not just .venv), so all
+ * are checked. Falls back to a bare PATH name (`verified:false, live:false`) when no
+ * on-disk interpreter is found — a negative off THAT is untrustworthy (#401 / PR #433).
+ *
+ * REMOTE mode (`opts.remote`): the live interpreter is on the REMOTE host and cannot be
+ * probed locally, so a locally-existing argv path is NOT treated as `live` — otherwise a
+ * coincident local install would have its (version-matching) negatives mis-reported as
+ * authoritative for a server running elsewhere. In remote mode we do not probe the live
+ * root at all; callers degrade to honest-unknown / untrusted (#401 / PR #433 round 3).
+ */
+export function resolveComfyuiPython(
+  comfyuiPath: string | undefined,
+  statsArgv: string[] | undefined,
+  opts?: { cwd?: string; remote?: boolean },
+): ComfyuiPythonResolution {
+  const names = IS_WIN ? ["python.exe", "python"] : ["python3", "python"];
+  const remote = opts?.remote ?? false;
+  const liveRoot = liveRootFromArgv(statsArgv, opts?.cwd);
+
+  const rootsWithFlag: Array<{ root: string; live: boolean }> = [];
+  // Only a LOCAL live root is a probeable live interpreter. Skip it entirely in remote
+  // mode so we never probe a coincident local path as if it were the remote server's.
+  if (liveRoot && !remote) rootsWithFlag.push({ root: liveRoot, live: true });
+  if (comfyuiPath && comfyuiPath !== liveRoot) {
+    rootsWithFlag.push({ root: comfyuiPath, live: false });
   }
-  return undefined;
+  // Saved default only when we have nothing more trustworthy to go on (never remote).
+  if (!liveRoot && !comfyuiPath && !remote) {
+    const saved = resolveEffectiveComfyUIBase();
+    if (saved) rootsWithFlag.push({ root: saved, live: false });
+  }
+
+  for (const { root, live } of rootsWithFlag) {
+    for (const c of interpreterCandidates(root)) {
+      // Skip UNC paths — existsSync on a dead network share can block for seconds.
+      if (/^\\\\/.test(c)) continue;
+      try {
+        if (existsSync(c)) return { python: c, verified: true, live, liveRoot };
+      } catch {
+        // ignore and continue
+      }
+    }
+  }
+  return { python: names[0], verified: false, live: false, liveRoot };
+}
+
+/** True when two python version strings share the same major.minor (3.12.11 ~ 3.12.0). */
+function pythonVersionsAgree(a: string | undefined, b: string | undefined): boolean {
+  if (!a || !b) return false;
+  const mm = (v: string): string | undefined => v.replace(/^Python\s+/i, "").match(/^(\d+\.\d+)/)?.[1];
+  const ma = mm(a);
+  const mb = mm(b);
+  return !!ma && ma === mb;
 }
 
 async function probePipPackages(
@@ -434,6 +530,11 @@ export interface EnvironmentInfo {
   local: {
     workspace_path?: string;
     python?: { executable: string; version: string };
+    /** Whether the probed python is trusted to be the running ComfyUI's own
+     *  interpreter. False when a bare PATH python was used or its version
+     *  disagrees with the running instance — in that case `packages` is omitted
+     *  rather than reporting versions from the wrong environment (#401). */
+    python_probe_trusted?: boolean;
     git?: { rev?: string; branch?: string };
     comfyui_manager_version?: string;
     packages?: Record<string, string>;
@@ -460,6 +561,10 @@ export async function getEnvironment(): Promise<EnvironmentInfo> {
     reachable: false,
     api_target: apiTarget,
   };
+  // argv/cwd of the LIVE server (from /system_stats) drive live-first interpreter
+  // resolution below — captured here so a probe never targets the wrong python.
+  let statsArgv: string[] | undefined;
+  let statsCwd: string | undefined;
   try {
     const stats = await getSystemStats();
     running.reachable = true;
@@ -467,6 +572,9 @@ export async function getEnvironment(): Promise<EnvironmentInfo> {
     running.python_version = stats.system.python_version;
     running.embedded_python = stats.system.embedded_python;
     running.comfyui_version = stats.system.comfyui_version;
+    statsArgv = stats.system.argv;
+    // ComfyUI does not currently report cwd, but tolerate it if a future/build does.
+    statsCwd = (stats.system as { cwd?: string }).cwd;
     running.devices = (stats.devices ?? []).map((d) => ({
       name: d.name,
       type: d.type,
@@ -489,37 +597,97 @@ export async function getEnvironment(): Promise<EnvironmentInfo> {
   const local: EnvironmentInfo["local"] = {};
   const cfg = await readWorkspaceConfig();
   const workspacePath = config.comfyuiPath ?? cfg.defaultWorkspace;
-  if (!workspacePath) {
+
+  // LIVE-FIRST interpreter resolution — identical to resolveComfyuiPython used by
+  // the panel env block, so the two paths can never disagree (#401 / PR #433). The
+  // running server's argv root wins over an explicit COMFYUI_PATH, which wins over
+  // the saved default.
+  const remote = isRemoteMode();
+  const resolved = resolveComfyuiPython(workspacePath, statsArgv, { cwd: statsCwd, remote });
+
+  // The install root we can actually inspect on disk: an explicit/saved workspace,
+  // else the live server's own root (so we still report git/manager for a live
+  // server even when no workspace path is configured).
+  const localRoot = workspacePath ?? resolved.liveRoot;
+  if (!localRoot) {
     local.note =
       "No local ComfyUI path configured (COMFYUI_PATH unset, none auto-detected, " +
-      "and no saved default workspace). Local environment probes skipped; remote " +
-      "/system_stats used instead.";
+      "and no saved default workspace) and no live server main.py to locate one. " +
+      "Local environment probes skipped; remote /system_stats used instead.";
     return { running_instance: running, local };
   }
 
-  local.workspace_path = workspacePath;
+  local.workspace_path = localRoot;
   if (!config.comfyuiPath && cfg.defaultWorkspace) {
     local.note = `Using saved default workspace "${cfg.defaultWorkspace}" (COMFYUI_PATH not set).`;
   }
 
-  const py = await probePython(workspacePath);
-  if (py) {
-    local.python = py;
-    const pkgs = await probePipPackages(py.executable, KEY_PACKAGES);
-    if (Object.keys(pkgs).length > 0) local.packages = pkgs;
+  const version = resolved.python ? await probe(resolved.python, ["--version"]) : undefined;
+  if (resolved.python && version) {
+    const ver = version.replace(/^Python\s+/i, "");
+    local.python = { executable: resolved.python, version: ver };
+
+    // "Trusted" means the probed interpreter IS the one running ComfyUI, so its
+    // package list truly describes the live environment (#401). Order of certainty:
+    //   - REMOTE: the running server is elsewhere; NO local interpreter is its own,
+    //     so never trust a local probe (a coincident local path is not the server's).
+    //   - resolved.live: we resolved the interpreter from the live server's own
+    //     argv root — provably correct.
+    //   - server unreachable: nothing live to contradict, but only trust a REAL
+    //     workspace venv/embedded python — NOT a bare PATH fallback (which is not
+    //     provably the configured workspace's interpreter).
+    //   - live root unknown (reachable but argv gave no resolvable root): best we
+    //     can do is a version cross-check against the running instance.
+    //   - live root KNOWN but we're not on it (a different/saved workspace): the
+    //     probe is a DIFFERENT environment — untrusted, omit packages.
+    const runningPy = running.python_version;
+    let trusted: boolean;
+    if (remote) {
+      trusted = false;
+    } else if (resolved.live) {
+      trusted = true;
+    } else if (!running.reachable) {
+      trusted = resolved.verified;
+    } else if (!resolved.liveRoot) {
+      trusted = pythonVersionsAgree(ver, runningPy);
+    } else {
+      trusted = false;
+    }
+    local.python_probe_trusted = trusted;
+
+    if (trusted) {
+      const pkgs = await probePipPackages(resolved.python, KEY_PACKAGES);
+      if (Object.keys(pkgs).length > 0) local.packages = pkgs;
+    } else {
+      const detail = remote
+        ? "the running ComfyUI is REMOTE — a locally-probed interpreter is not the remote server's environment"
+        : resolved.liveRoot
+          ? `the probe interpreter is a different workspace than the running ComfyUI (it does not match the running ComfyUI python ${runningPy})`
+          : !running.reachable
+            ? "the server is unreachable and no workspace venv/embedded python was found (a bare PATH python is not authoritative)"
+            : `probed python ${ver} does not match the running ComfyUI python ${runningPy}`;
+      local.note = [
+        local.note,
+        `Package versions omitted: ${detail}, so reporting them would be a false ` +
+          `capability report (#401). Point COMFYUI_PATH at the install actually ` +
+          `running ComfyUI for an accurate report.`,
+      ]
+        .filter(Boolean)
+        .join(" ");
+    }
   } else {
     local.note = [
       local.note,
-      "Python interpreter not found on PATH or in workspace .venv.",
+      "Python interpreter not found on PATH or in the workspace venv/embedded python.",
     ]
       .filter(Boolean)
       .join(" ");
   }
 
-  const git = await probeGitRev(workspacePath);
+  const git = await probeGitRev(localRoot);
   if (git) local.git = git;
 
-  const managerVersion = await readManagerVersion(workspacePath);
+  const managerVersion = await readManagerVersion(localRoot);
   if (managerVersion) local.comfyui_manager_version = managerVersion;
 
   return { running_instance: running, local };
