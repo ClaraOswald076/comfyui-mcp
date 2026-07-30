@@ -54,10 +54,33 @@ export interface PanelTab {
   connected_at: string;
 }
 
+/** Shared per-send context that survives a re-dispatch (idempotent read retried
+ *  onto a fresh socket after a mid-command reconnect). Carries the caller's
+ *  resolve/reject, the original command, and an absolute deadline so retries are
+ *  always bounded. */
+type SendCtx = {
+  resolve: (v: unknown) => void;
+  reject: (e: Error) => void;
+  command: BridgeCommand;
+  timeoutMs: number;
+  tabId: string;
+  /** True for anything that could have a side effect on the panel/ComfyUI (e.g.
+   *  graph_run queues a real render). Mutating commands are NEVER auto-retried on
+   *  reconnect — the request was already written to the dead socket and may have
+   *  been applied, so a retry risks double execution. */
+  mutating: boolean;
+  /** Absolute ms after which even an idempotent read stops waiting for reconnect. */
+  deadline: number;
+};
+
 type Pending = {
   resolve: (v: unknown) => void;
   reject: (e: Error) => void;
   timer: ReturnType<typeof setTimeout>;
+  sock?: BridgeSocket;
+  /** Command name of the in-flight request (for actionable disconnect errors). */
+  cmd: string;
+  ctx: SendCtx;
 };
 
 interface Conn {
@@ -203,6 +226,26 @@ export class UiBridge {
   private missedFrames = new Map<string, Record<string, unknown>[]>();
   private static readonly MAX_MISSED_FRAMES = 100;
   private pending = new Map<string, Pending>();
+  /** In-flight IDEMPOTENT reads whose socket dropped mid-command, parked per tabId
+   *  waiting a bounded grace for that tab to reconnect so we can re-dispatch them
+   *  (resume) instead of hard-failing. Never holds mutating commands. */
+  private awaitingReconnect = new Map<string, Array<{ ctx: SendCtx; graceTimer: ReturnType<typeof setTimeout> }>>();
+  /** How long a dropped idempotent read waits for its tab to re-hello before we
+   *  declare the panel genuinely gone. Bounded so a caller never hangs. */
+  private static readonly RECONNECT_GRACE_MS = 4000;
+  /** Bridge commands with no side effect — safe to re-dispatch after a reconnect.
+   *  Everything else is treated as mutating (no auto-retry) so a render/edit is
+   *  never silently double-applied. */
+  private static readonly READONLY_CMDS = new Set<string>([
+    "graph_serialize",
+    "graph_outline",
+    "graph_get_errors",
+    "graph_get_subgraph",
+    "graph_prompt_director_audit",
+    "graph_query",
+    "civitai_results",
+    "get_todo",
+  ]);
   private portInUse = false;
   private bindRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -612,6 +655,9 @@ export class UiBridge {
         }
         // Deliver anything that finished while this tab was away.
         this.flushMailbox(tabId);
+        // Resume any idempotent reads that were dropped mid-command by this tab's
+        // previous socket (bounded reconnect grace) onto the fresh connection.
+        this.resumeAwaitingReconnect(tabId);
         this.onPanelMessage?.(msg as PanelEvent);
         return;
       }
@@ -740,12 +786,16 @@ export class UiBridge {
         );
       }
       if (wasPrimary) this.broadcastTabList(); // a desktop tab left — refresh pickers
-      // Reject any in-flight commands that were bound to this socket.
+      // An in-flight command's socket just died. Instead of hard-failing every one
+      // with a bare "disconnected" (which reads as a clean failure and invites a
+      // blind retry — double render for a run), hand each to the disconnect handler:
+      // idempotent reads wait a bounded grace for the tab to reconnect and resume;
+      // mutating commands surface an honest OUTCOME-UNKNOWN error.
       for (const [rid, p] of this.pending) {
-        if ((p as Pending & { sock?: BridgeSocket }).sock === sock) {
+        if (p.sock === sock) {
           clearTimeout(p.timer);
-          p.reject(new Error("panel tab disconnected mid-command"));
           this.pending.delete(rid);
+          this.handleMidCommandDisconnect(p);
         }
       }
     });
@@ -922,39 +972,163 @@ export class UiBridge {
       }
       return Promise.reject(new Error(`Panel tab ${conn.tabId.slice(0, 8)} is not open`));
     }
-    const rid = randomUUID();
     return new Promise((resolve, reject) => {
-      // Rewrite an old-panel "Unknown command" rejection into an actionable
-      // update-your-panel message (see makeUnknownCommandError). Applied to the
-      // reply-error path only; the happy path and genuine command errors are
-      // passed through untouched.
-      const rejectMapped = (err: Error) => {
-        const friendly = makeUnknownCommandError(err.message, conn.panelVersion);
-        reject(friendly ?? err);
-      };
-      const timer = setTimeout(() => {
-        this.pending.delete(rid);
-        reject(
-          new Error(
-            `Panel tab ${conn.tabId.slice(0, 8)} did not reply to "${cmd.cmd}" within ${timeoutMs} ms — the ComfyUI tab may be backgrounded or frozen`,
-          ),
-        );
-      }, timeoutMs);
-      const pending: Pending & { sock?: BridgeSocket } = {
+      const ctx: SendCtx = {
         resolve,
-        reject: rejectMapped,
-        timer,
-        sock: conn.sock,
+        reject,
+        command: cmd,
+        timeoutMs,
+        // Canonical id of the resolved connection (NOT the caller's possibly-prefix
+        // or migration-alias tabId) — the key the reconnect hello will use, so a
+        // parked read is found and resumed.
+        tabId: conn.tabId,
+        mutating: !UiBridge.READONLY_CMDS.has(cmd.cmd),
+        deadline: Date.now() + timeoutMs,
       };
-      this.pending.set(rid, pending);
-      try {
-        conn.sock.send(JSON.stringify({ rid, ...cmd }));
-      } catch (err) {
-        clearTimeout(timer);
-        this.pending.delete(rid);
-        reject(err instanceof Error ? err : new Error(String(err)));
-      }
+      this.dispatch(conn, ctx);
     });
+  }
+
+  /** Write one attempt of a command to a live socket and arm its reply timer.
+   *  Reused verbatim when an idempotent read is re-dispatched onto a fresh socket
+   *  after a mid-command reconnect (so resume runs the exact same path as a first
+   *  send). Rejections/resolutions go through the shared SendCtx. */
+  private dispatch(conn: Conn, ctx: SendCtx): void {
+    const cmd = ctx.command;
+    // Never let a re-dispatch (reconnect resume) extend the caller's original
+    // deadline — clamp the reply timeout to the time remaining.
+    const remaining = ctx.deadline - Date.now();
+    if (remaining <= 0) {
+      ctx.reject(
+        new Error(
+          `Panel tab ${conn.tabId.slice(0, 8)} did not reply to "${cmd.cmd}" within ${ctx.timeoutMs} ms — the ComfyUI tab may be backgrounded or frozen`,
+        ),
+      );
+      return;
+    }
+    const replyTimeoutMs = Math.min(ctx.timeoutMs, remaining);
+    const rid = randomUUID();
+    // Rewrite an old-panel "Unknown command" rejection into an actionable
+    // update-your-panel message (see makeUnknownCommandError). Applied to the
+    // reply-error path only; the happy path and genuine command errors are
+    // passed through untouched.
+    const rejectMapped = (err: Error) => {
+      const friendly = makeUnknownCommandError(err.message, conn.panelVersion);
+      ctx.reject(friendly ?? err);
+    };
+    const timer = setTimeout(() => {
+      this.pending.delete(rid);
+      ctx.reject(
+        new Error(
+          `Panel tab ${conn.tabId.slice(0, 8)} did not reply to "${cmd.cmd}" within ${ctx.timeoutMs} ms — the ComfyUI tab may be backgrounded or frozen`,
+        ),
+      );
+    }, replyTimeoutMs);
+    const pending: Pending = {
+      resolve: ctx.resolve,
+      reject: rejectMapped,
+      timer,
+      sock: conn.sock,
+      cmd: cmd.cmd,
+      ctx,
+    };
+    this.pending.set(rid, pending);
+    try {
+      conn.sock.send(JSON.stringify({ rid, ...cmd }));
+    } catch (err) {
+      clearTimeout(timer);
+      this.pending.delete(rid);
+      ctx.reject(err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+
+  /** A pending command's socket died before its reply arrived. Decide, WITHOUT
+   *  ever risking double execution, whether to wait for the tab to reconnect and
+   *  resume (idempotent reads) or surface an honest outcome-unknown/gone error. */
+  private handleMidCommandDisconnect(pend: Pending): void {
+    const { ctx, cmd } = pend;
+    const short = ctx.tabId.slice(0, 8);
+    // Idempotent read, still within its deadline → park it for a bounded grace and
+    // re-dispatch if the same tab re-hellos. Safe: re-running a read has no side
+    // effect, and it was in `pending` (un-acked), so no reply was lost.
+    if (!ctx.mutating && Date.now() < ctx.deadline) {
+      // A replacement socket for this tab is ALREADY live (a reload/supersede whose
+      // hello landed before this dead socket's close handler ran — so resume already
+      // fired and won't fire again). Re-dispatch straight onto it instead of parking
+      // and expiring as "gone". Safe: idempotent read, un-acked.
+      const live = this.conns.get(ctx.tabId);
+      if (live && live.sock !== pend.sock && live.sock.readyState === WebSocket.OPEN) {
+        logger.info(
+          `[ui-bridge] tab ${short} already reconnected — resuming "${cmd}" on the live socket`,
+        );
+        this.dispatch(live, ctx);
+        return;
+      }
+      const list = this.awaitingReconnect.get(ctx.tabId) ?? [];
+      const graceMs = Math.max(0, Math.min(UiBridge.RECONNECT_GRACE_MS, ctx.deadline - Date.now()));
+      const entry = {
+        ctx,
+        graceTimer: setTimeout(() => {
+          this.removeAwaiting(ctx.tabId, entry);
+          ctx.reject(
+            new Error(
+              `panel tab ${short} disconnected mid-command ("${cmd}") and did not reconnect within ${graceMs} ms — panel genuinely gone; retry once a tab is connected`,
+            ),
+          );
+        }, graceMs),
+      };
+      list.push(entry);
+      this.awaitingReconnect.set(ctx.tabId, list);
+      logger.info(
+        `[ui-bridge] tab ${short} dropped mid-command ("${cmd}") — awaiting reconnect up to ${graceMs} ms to resume (idempotent)`,
+      );
+      return;
+    }
+    // Mutating command (or read past its deadline): the request was ALREADY written
+    // to the now-dead socket, so the panel/ComfyUI MAY have applied it. Reporting a
+    // bare failure invites a blind retry that double-applies the action (e.g. a
+    // second render). Say the outcome is UNKNOWN so the caller verifies first.
+    if (ctx.mutating) {
+      ctx.reject(
+        new Error(
+          `panel tab ${short} disconnected mid-command ("${cmd}") — OUTCOME UNKNOWN: the command was already sent, so the panel may have applied it (for a run, ComfyUI may already be rendering). Verify before retrying (e.g. check get_queue / list_output_images) instead of re-issuing it blindly.`,
+        ),
+      );
+    } else {
+      ctx.reject(
+        new Error(
+          `panel tab ${short} disconnected mid-command ("${cmd}") — panel genuinely gone; retry once a tab is connected`,
+        ),
+      );
+    }
+  }
+
+  private removeAwaiting(
+    tabId: string,
+    entry: { ctx: SendCtx; graceTimer: ReturnType<typeof setTimeout> },
+  ): void {
+    const list = this.awaitingReconnect.get(tabId);
+    if (!list) return;
+    const i = list.indexOf(entry);
+    if (i >= 0) list.splice(i, 1);
+    if (list.length === 0) this.awaitingReconnect.delete(tabId);
+  }
+
+  /** A tab re-helloed: resume any idempotent reads parked for it on a mid-command
+   *  disconnect by re-dispatching them onto the fresh socket. */
+  private resumeAwaitingReconnect(tabId: string): void {
+    const list = this.awaitingReconnect.get(tabId);
+    if (!list || list.length === 0) return;
+    const conn = this.conns.get(tabId);
+    if (!conn) return;
+    this.awaitingReconnect.delete(tabId);
+    for (const entry of list) {
+      clearTimeout(entry.graceTimer);
+      logger.info(
+        `[ui-bridge] tab ${tabId.slice(0, 8)} reconnected — resuming "${entry.ctx.command.cmd}"`,
+      );
+      this.dispatch(conn, entry.ctx);
+    }
   }
 
   /** Push a fire-and-forget frame. Targeted when tabId given, else broadcast.
@@ -1071,6 +1245,13 @@ export class UiBridge {
       clearTimeout(p.timer);
       p.reject(new Error("bridge stopped"));
       this.pending.delete(rid);
+    }
+    for (const [tabId, list] of this.awaitingReconnect) {
+      for (const entry of list) {
+        clearTimeout(entry.graceTimer);
+        entry.ctx.reject(new Error("bridge stopped"));
+      }
+      this.awaitingReconnect.delete(tabId);
     }
     for (const conn of this.conns.values()) {
       try {

@@ -355,6 +355,70 @@ describe("UiBridge (multi-tab)", () => {
     await expect(promise).rejects.toThrow(/disconnected mid-command/);
   });
 
+  it("a MUTATING command dropped mid-command reports OUTCOME UNKNOWN, not a clean failure (#450)", async () => {
+    const a = await connectPanel("tab-aaaa-1111");
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    // graph_run queues a real render — it was already written to the socket before
+    // the drop, so the panel may have applied it. A blind retry = double render.
+    const promise = bridge.send({ cmd: "graph_run" }, { timeoutMs: 5000 });
+    a.close();
+    await expect(promise).rejects.toThrow(/OUTCOME UNKNOWN/);
+    await expect(promise).rejects.toThrow(/graph_run/);
+  });
+
+  it("an IDEMPOTENT read dropped mid-command RESUMES when the tab reconnects (#450)", async () => {
+    const a1 = await connectPanel("tab-aaaa-1111");
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    // No autoReply on a1 → the read stays in-flight (un-acked) when we drop it.
+    const promise = bridge.send({ cmd: "graph_get_errors" }, { timeoutMs: 5000 });
+    // Ensure the command reached the server (is pending) before dropping the socket.
+    await new Promise((r) => setTimeout(r, 50));
+    a1.close();
+    // Same tab reconnects within the grace window and answers the resumed read.
+    const a2 = await connectPanel("tab-aaaa-1111");
+    autoReply(a2, "A2");
+    await expect(promise).resolves.toMatchObject({ from: "A2", cmd: "graph_get_errors" });
+    a2.close();
+  });
+
+  it("resumes a read addressed by tab-id PREFIX after reconnect (canonical key) (#450)", async () => {
+    const a1 = await connectPanel("tab-aaaa-1111");
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    // Address by prefix — parking must key on the canonical resolved id, not "tab-aaaa".
+    const promise = bridge.send({ cmd: "graph_get_errors" }, { tabId: "tab-aaaa", timeoutMs: 5000 });
+    await new Promise((r) => setTimeout(r, 50));
+    a1.close();
+    const a2 = await connectPanel("tab-aaaa-1111");
+    autoReply(a2, "A2");
+    await expect(promise).resolves.toMatchObject({ from: "A2" });
+    a2.close();
+  });
+
+  it("does NOT extend the caller's deadline when a read resumes (#450)", async () => {
+    const a1 = await connectPanel("tab-aaaa-1111");
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    // Short deadline. Drop, reconnect with a tab that NEVER replies → must reject
+    // near the original 300ms deadline, not restart a fresh full timeout.
+    const started = Date.now();
+    const promise = bridge.send({ cmd: "graph_get_errors" }, { timeoutMs: 300 });
+    await new Promise((r) => setTimeout(r, 30));
+    a1.close();
+    const a2 = await connectPanel("tab-aaaa-1111"); // reconnects but never autoReplies
+    await expect(promise).rejects.toThrow(/did not reply|genuinely gone/);
+    expect(Date.now() - started).toBeLessThan(2000);
+    a2.close();
+  });
+
+  it("an idempotent read whose tab never returns fails as genuinely gone (#450)", async () => {
+    const a = await connectPanel("tab-aaaa-1111");
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    const promise = bridge.send({ cmd: "graph_get_errors" }, { timeoutMs: 5000 });
+    await new Promise((r) => setTimeout(r, 50));
+    a.close();
+    // No reconnect → after the bounded grace it rejects as genuinely gone.
+    await expect(promise).rejects.toThrow(/genuinely gone/);
+  }, 10000);
+
   it("fails fast with guidance when no tab is connected", async () => {
     await expect(bridge.send({ cmd: "x" })).rejects.toThrow(/no panel connected/);
   });
