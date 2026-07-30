@@ -254,7 +254,16 @@ function recordResumeDiagnostic(
   resumeDiagnostics.set(trayIdForUrl(url), { outcome, discardedBytes, at: Date.now() });
 }
 
-/** Read the last resume decision for a download's tray id (or undefined). */
+/** Read the last resume decision for a download's tray id (or undefined).
+ *
+ *  Keyed by tray id (URL hash) BY DESIGN, not per job/destination: the cache
+ *  coalesces every same-URL fetch into ONE `.partial` and ONE streamUrlToFile
+ *  call (downloadIntoCache's inflight map is keyed by the URL-derived cache
+ *  path), then hardlinks/copies that single file to each destination. So two
+ *  concurrent jobs for one URL with different destinations are two VIEWS of the
+ *  same physical download and share the same resume decision — reporting it on
+ *  both is accurate. Callers still gate on `at >= job.started_at` so a decision
+ *  from a PRIOR attempt for the same URL isn't attributed to a later job. */
 export function getResumeDiagnostic(trayId: string): ResumeDiagnostic | undefined {
   return resumeDiagnostics.get(trayId);
 }
