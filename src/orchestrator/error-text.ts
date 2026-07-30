@@ -59,17 +59,21 @@ export function promptText(value: unknown): string {
   if (typeof value === "object") {
     let text: unknown;
     let hasParts = false;
+    let readOk = true;
     try {
       text = (value as { text?: unknown }).text;
       const parts = (value as { parts?: unknown }).parts;
       hasParts = Array.isArray(parts) && parts.length > 0;
     } catch {
-      // throwing getter/proxy — serialize the whole value below
+      // throwing getter/proxy — property access is untrustworthy, so DON'T take
+      // the empty-`text` short-circuit below (a `.text` of "" with a throwing
+      // `.parts` would otherwise return ""). Fall through to serialize/fallback.
+      readOk = false;
     }
     // A non-empty text field is authoritative. An EMPTY text alongside `parts`
-    // must NOT win — that would drop the parts and yield an empty prompt; fall
-    // through to serialize the whole payload instead.
-    if (typeof text === "string" && (text || !hasParts)) return text;
+    // (or when the `.parts` read threw) must NOT win — that would drop content
+    // and yield an empty prompt; fall through to serialize the whole payload.
+    if (readOk && typeof text === "string" && (text || !hasParts)) return text;
     try {
       const json = JSON.stringify(value);
       if (typeof json === "string" && json && json !== "{}") return json;

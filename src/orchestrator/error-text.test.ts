@@ -105,4 +105,21 @@ describe("promptText (#175)", () => {
     }).not.toThrow();
     expect(out).not.toBe("[object Object]");
   });
+
+  it("never returns '' when text is empty but the parts read throws", () => {
+    const hostile = {
+      get text(): string {
+        return "";
+      },
+      get parts(): unknown {
+        throw new Error("parts exploded");
+      },
+    };
+    let out = "";
+    expect(() => {
+      out = promptText(hostile);
+    }).not.toThrow();
+    expect(out).not.toBe("");
+    expect(out).not.toBe("[object Object]");
+  });
 });
