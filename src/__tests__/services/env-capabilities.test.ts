@@ -199,6 +199,8 @@ describe("resolveComfyuiPython (#401)", () => {
     const res = resolveComfyuiPython(dir, undefined);
     expect(res.verified).toBe(true);
     expect(res.python).toBe(exe);
+    // No argv → this is NOT the live interpreter (just the pinned workspace's venv).
+    expect(res.live).toBe(false);
   });
 
   it("finds the embedded python of a portable install as VERIFIED (not just .venv)", async () => {
@@ -217,6 +219,7 @@ describe("resolveComfyuiPython (#401)", () => {
     // A directory with no interpreter under it — the wrong-python scenario.
     const res = resolveComfyuiPython(dir, undefined);
     expect(res.verified).toBe(false);
+    expect(res.live).toBe(false);
     expect(res.python).toBe(IS_WIN ? "python.exe" : "python3");
   });
 
@@ -243,25 +246,43 @@ describe("resolveComfyuiPython (#401)", () => {
       join(rootB, "main.py"),
     ]);
     expect(res.verified).toBe(true);
+    expect(res.live).toBe(true);
+    expect(res.liveRoot).toBe(rootB);
     expect(res.python).toBe(exeB); // B, not A
+  });
+
+  it("marks the pinned workspace UNTRUSTED (live:false) when the LIVE root has no on-disk venv", async () => {
+    // Live root B (from argv) has no interpreter on disk; only pinned A does. A must
+    // NOT be reported as the live interpreter — its negative would be a false report.
+    const binA = IS_WIN ? join(dir, "A", ".venv", "Scripts") : join(dir, "A", ".venv", "bin");
+    await mkdir(binA, { recursive: true });
+    const exeA = join(binA, IS_WIN ? "python.exe" : "python3");
+    await writeFile(exeA, "", "utf-8");
+    const rootB = join(dir, "B"); // live root, but no venv created under it
+
+    const res = resolveComfyuiPython(join(dir, "A"), [join(rootB, "main.py")]);
+    expect(res.python).toBe(exeA); // A is the only interpreter we can probe …
+    expect(res.verified).toBe(true);
+    expect(res.live).toBe(false); // … but it is NOT the live interpreter
+    expect(res.liveRoot).toBe(rootB); // live root was resolvable, just not populated
   });
 });
 
 describe("reconcileProbeState (#401 — no false 'not installed')", () => {
-  it("keeps 'not-installed' only when the interpreter is verified AND versions match", () => {
+  it("keeps 'not-installed' only when the interpreter is LIVE and versions match", () => {
     expect(
       reconcileProbeState("not-installed", {
-        verified: true,
+        live: true,
         runningPython: "3.12",
         probePython: "3.12",
       }),
     ).toBe("not-installed");
   });
 
-  it("degrades 'not-installed' to 'unknown' when the interpreter is UNVERIFIED", () => {
+  it("degrades 'not-installed' to 'unknown' when the interpreter is NOT the live one", () => {
     expect(
       reconcileProbeState("not-installed", {
-        verified: false,
+        live: false,
         runningPython: "3.12",
         probePython: "3.12",
       }),
@@ -269,10 +290,10 @@ describe("reconcileProbeState (#401 — no false 'not installed')", () => {
   });
 
   it("degrades 'not-installed' to 'unknown' when probe python DISAGREES with the running instance", () => {
-    // The exact issue: running ComfyUI is 3.12, but we probed a 3.11 PATH python.
+    // The exact issue: running ComfyUI is 3.12, but we probed a 3.11 python.
     expect(
       reconcileProbeState("not-installed", {
-        verified: true,
+        live: true,
         runningPython: "3.12",
         probePython: "3.11",
       }),
@@ -281,12 +302,12 @@ describe("reconcileProbeState (#401 — no false 'not installed')", () => {
 
   it("passes a positive 'installed' through untouched even from an untrusted interpreter", () => {
     expect(
-      reconcileProbeState("installed", { verified: false, runningPython: "3.12", probePython: "3.11" }),
+      reconcileProbeState("installed", { live: false, runningPython: "3.12", probePython: "3.11" }),
     ).toBe("installed");
   });
 
   it("treats undefined as 'unknown'", () => {
-    expect(reconcileProbeState(undefined, { verified: true })).toBe("unknown");
+    expect(reconcileProbeState(undefined, { live: true })).toBe("unknown");
   });
 });
 
