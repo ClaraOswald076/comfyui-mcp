@@ -25,8 +25,88 @@ export interface ComfyCliRunOptions {
   workspace?: string | null;
   where?: "local" | "cloud";
   timeoutMs?: number;
+  /**
+   * Idle (liveness) timeout in milliseconds. When set, the process is only
+   * killed if it produces NO stdout/stderr output for this long — each chunk
+   * of output (e.g. a downloader progress line) resets the clock. This lets a
+   * long-but-live download run to completion while still terminating a truly
+   * stalled one. Takes precedence over `timeoutMs` when both are provided.
+   */
+  idleTimeoutMs?: number;
   env?: NodeJS.ProcessEnv;
   cwd?: string;
+}
+
+/** Minimal shape of the child process we consume; keeps this testable. */
+export interface IdleTimeoutChild {
+  stdout: NodeJS.EventEmitter | null;
+  stderr: NodeJS.EventEmitter | null;
+  on(event: "error", listener: (error: Error) => void): unknown;
+  on(event: "close", listener: (code: number | null) => void): unknown;
+  kill(signal?: NodeJS.Signals): unknown;
+}
+
+export interface IdleTimeoutResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+  timedOut: boolean;
+}
+
+/**
+ * Await a spawned child process, killing it only after `idleTimeoutMs` elapses
+ * with no output on either stream. Any stdout/stderr chunk is treated as
+ * liveness and resets the idle timer. Exported for direct testing.
+ */
+export function awaitProcessWithIdleTimeout(
+  child: IdleTimeoutChild,
+  idleTimeoutMs: number,
+  timers: { setTimeout: typeof setTimeout; clearTimeout: typeof clearTimeout } = { setTimeout, clearTimeout },
+): Promise<IdleTimeoutResult> {
+  return new Promise<IdleTimeoutResult>((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    let settled = false;
+    let idleTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const clearIdle = () => {
+      if (idleTimer) {
+        timers.clearTimeout(idleTimer);
+        idleTimer = null;
+      }
+    };
+    const armIdle = () => {
+      clearIdle();
+      idleTimer = timers.setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGTERM");
+      }, idleTimeoutMs);
+    };
+
+    child.stdout?.on("data", (chunk: Buffer | string) => {
+      stdout += chunk.toString();
+      armIdle();
+    });
+    child.stderr?.on("data", (chunk: Buffer | string) => {
+      stderr += chunk.toString();
+      armIdle();
+    });
+    child.on("error", (error: Error) => {
+      if (settled) return;
+      settled = true;
+      clearIdle();
+      reject(error);
+    });
+    child.on("close", (code: number | null) => {
+      if (settled) return;
+      settled = true;
+      clearIdle();
+      resolve({ stdout, stderr, exitCode: timedOut ? 1 : code ?? 0, timedOut });
+    });
+
+    armIdle();
+  });
 }
 
 const MIN_COMFY_CLI_VERSION = [1, 11, 1] as const;
@@ -219,6 +299,41 @@ export async function runComfyCli<T = unknown>(args: readonly string[], options:
     return unsupportedVersionEnvelope<T>(args, options, detectedVersion);
   }
   const version = detectedVersion!;
+  if (options.idleTimeoutMs != null) {
+    try {
+      const child = childProcess.spawn(executable, buildArgs(args, options), {
+        windowsHide: true,
+        env: { ...process.env, PYTHONUTF8: "1", ...options.env },
+        cwd: options.cwd,
+      });
+      child.stdout?.setEncoding("utf8");
+      child.stderr?.setEncoding("utf8");
+      const result = await awaitProcessWithIdleTimeout(child, options.idleTimeoutMs);
+      if (result.timedOut) {
+        return {
+          schema: "envelope/1",
+          type: "envelope",
+          ok: false,
+          command: args.join(" "),
+          version,
+          where: options.where ?? null,
+          data: null,
+          error: {
+            code: "idle_timeout",
+            message:
+              `comfy-cli produced no output for ${Math.round(options.idleTimeoutMs / 1000)}s and was terminated as stalled.`,
+            hint: "The download appears stuck. Check network connectivity and the source URL, then retry.",
+            details: { stdout: result.stdout.trim(), stderr: result.stderr.trim() },
+          },
+        };
+      }
+      return normalizeComfyCliResult<T>(args, options, result, version);
+    } catch (error) {
+      const spawnError = error as Error & { code?: string };
+      if (spawnError.code === "ENOENT") throw error;
+      return normalizeComfyCliResult<T>(args, options, { stdout: "", stderr: spawnError.message, exitCode: 1 }, version);
+    }
+  }
   try {
     const result = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
       childProcess.execFile(

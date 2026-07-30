@@ -1,9 +1,11 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { EventEmitter } from "node:events";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   assertComfyCliOk,
+  awaitProcessWithIdleTimeout,
   isSupportedComfyCliVersion,
   normalizeComfyCliResult,
   parseComfyCliEnvelope,
@@ -103,6 +105,98 @@ describe("comfy-cli adapter", () => {
     expect(shouldUseComfyCli(undefined, false, "/bin/comfy", "1.11.1")).toBe(false);
     expect(shouldUseComfyCli(true, false, null, null)).toBe(true);
     expect(shouldUseComfyCli(false, true, "/bin/comfy", "1.11.1")).toBe(false);
+  });
+
+  it("treats download progress output as liveness and does NOT kill a long-but-live download", async () => {
+    vi.useFakeTimers();
+    try {
+      const stdout = new EventEmitter();
+      const stderr = new EventEmitter();
+      let killed = false;
+      const child = {
+        stdout,
+        stderr,
+        on(event: string, listener: (arg: unknown) => void) {
+          proc.on(event, listener);
+          return this;
+        },
+        kill() {
+          killed = true;
+          // A real SIGTERM ends the process; emit close so the promise settles.
+          proc.emit("close", null);
+          return true;
+        },
+      };
+      const proc = new EventEmitter();
+
+      const IDLE = 120_000;
+      const promise = awaitProcessWithIdleTimeout(child, IDLE);
+
+      // comfy-cli emits ONLY the "Start downloading" progress line, then keeps
+      // emitting progress every 90s (< idle window) across a 450s download —
+      // far longer than the old 60s hard wall-clock timeout.
+      stderr.emit("data", "Start downloading URL ... into E:\\ComfyUI\\models\\text_encoders\\model.safetensors\n");
+      for (let elapsed = 90_000; elapsed <= 450_000; elapsed += 90_000) {
+        await vi.advanceTimersByTimeAsync(90_000);
+        expect(killed).toBe(false); // never killed while progressing
+        stderr.emit("data", `progress ${elapsed / 1000}s\n`);
+      }
+      // Download finishes: emit the final JSON envelope on stdout, then close.
+      stdout.emit(
+        "data",
+        '{"schema":"envelope/1","type":"envelope","ok":true,"command":"model download","version":"1.12.0","where":"local","data":{"path":"model.safetensors"},"error":null}\n',
+      );
+      proc.emit("close", 0);
+
+      const result = await promise;
+      expect(killed).toBe(false);
+      expect(result.timedOut).toBe(false);
+      expect(result.exitCode).toBe(0);
+
+      const envelope = parseComfyCliEnvelope(result.stdout);
+      expect(envelope.ok).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still terminates a TRULY idle/stalled download after the idle window elapses", async () => {
+    vi.useFakeTimers();
+    try {
+      const stdout = new EventEmitter();
+      const stderr = new EventEmitter();
+      const proc = new EventEmitter();
+      let killed = false;
+      const child = {
+        stdout,
+        stderr,
+        on(event: string, listener: (arg: unknown) => void) {
+          proc.on(event, listener);
+          return this;
+        },
+        kill() {
+          killed = true;
+          proc.emit("close", null);
+          return true;
+        },
+      };
+
+      const IDLE = 120_000;
+      const promise = awaitProcessWithIdleTimeout(child, IDLE);
+
+      // Same progress-only stderr as the real bug report, then goes silent.
+      stderr.emit("data", "Start downloading URL ... into E:\\ComfyUI\\models\\text_encoders\\model.safetensors\n");
+      await vi.advanceTimersByTimeAsync(IDLE - 1);
+      expect(killed).toBe(false); // not yet
+      await vi.advanceTimersByTimeAsync(2);
+
+      const result = await promise;
+      expect(killed).toBe(true);
+      expect(result.timedOut).toBe(true);
+      expect(result.exitCode).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("rejects Windows command shims that execFile cannot launch directly", () => {
