@@ -15,7 +15,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { basename } from "node:path";
+import { basename, posix as posixPath } from "node:path";
 import { downloadModel } from "./model-resolver.js";
 import type { DownloadAuth } from "./download-auth.js";
 import { logger } from "../utils/logger.js";
@@ -58,26 +58,41 @@ export function downloadIdFor(url: string): string {
   return createHash("sha256").update(url).digest("hex").slice(0, 16);
 }
 
-/** Normalize a target subfolder to a canonical POSIX-ish form for id hashing:
- *  backslashes → forward slashes, collapsed, no leading/trailing slash. */
+/**
+ * Canonicalize a target subfolder the SAME way the write path does, so any two
+ * inputs that resolve to one on-disk directory hash to one id. The write path
+ * (resolveModelSubfolderPreferServer) does `resolve(modelsRoot, sub)` — which
+ * collapses "." and ".." — against a CONSTANT models root; the varying part is
+ * the relative remainder, so we resolve against a fixed sentinel root and take
+ * the relative form. Thus "loras" and "checkpoints/../loras" (both → <models>/
+ * loras on disk) produce the SAME id. Escapes ("../evil") keep their normalized
+ * form here; the write path rejects them regardless.
+ */
 function normalizeSubfolder(sub: string): string {
-  return sub.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/^\/+|\/+$/g, "");
+  const posixed = sub.replace(/\\/g, "/");
+  const resolved = posixPath.resolve("/__models_root__", posixed);
+  const rel = posixPath.relative("/__models_root__", resolved);
+  return rel;
 }
 
 /**
- * Resolve the on-disk filename EXACTLY as downloadModel does, so an omitted
- * filename and an explicit one that equals the URL-derived name map to the SAME
- * file (and thus the same job id) — otherwise two concurrent writers would race
- * one path. Mirrors model-resolver.downloadModel: explicit filename → its
- * basename; else the URL pathname basename; else "model.safetensors".
+ * Resolve the on-disk filename EXACTLY as downloadModel does (model-resolver.ts):
+ * an OMITTED filename derives from the URL pathname basename (→ "model.safetensors"
+ * fallback), while ANY DEFINED filename — including a blank string — is taken as
+ * `basename(filename)` verbatim (a blank one yields "", which downloadModel then
+ * REJECTS). Critically, a defined-but-blank filename is NOT coerced to "omitted":
+ * that would make a blank filename adopt the URL-derived job even though the write
+ * paths diverge (one errors, one succeeds).
  */
 function resolveDownloadFilename(url: string, filename?: string): string {
-  if (filename && filename.trim().length > 0) return basename(filename);
-  try {
-    return basename(new URL(url).pathname) || "model.safetensors";
-  } catch {
-    return "model.safetensors";
+  if (filename === undefined) {
+    try {
+      return basename(new URL(url).pathname) || "model.safetensors";
+    } catch {
+      return "model.safetensors";
+    }
   }
+  return basename(filename); // defined (incl. "") → mirror downloadModel's basename(rawFilename)
 }
 
 /**

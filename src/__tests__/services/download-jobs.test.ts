@@ -93,6 +93,28 @@ describe("download job registry", () => {
     expect(listDownloadJobs()).toHaveLength(2);
   });
 
+  it("collapses '..' in the subfolder so paths resolving to one dir share an id", () => {
+    // "loras" and "checkpoints/../loras" both resolve to <models>/loras on disk
+    // (resolveModelSubfolderPreferServer), so they must be ONE job — not two
+    // writers for one file.
+    const first = startDownloadJob(URL_A, "loras");
+    const second = startDownloadJob(URL_A, "checkpoints/../loras");
+    expect(second.job).toBe(first.job);
+    expect(second.job.id).toBe(first.job.id);
+    expect(hoisted.calls).toBe(1);
+    expect(listDownloadJobs()).toHaveLength(1);
+  });
+
+  it("does NOT treat a defined-but-blank filename as omitted", () => {
+    // downloadModel rejects a blank filename rather than deriving the URL name,
+    // so the id must NOT collapse blank into the omitted (URL-derived) job.
+    const blank = startDownloadJob(URL_A, "checkpoints", "");
+    const omitted = startDownloadJob(URL_A, "checkpoints");
+    expect(blank.job.id).not.toBe(omitted.job.id);
+    expect(hoisted.calls).toBe(2);
+    expect(listDownloadJobs()).toHaveLength(2);
+  });
+
   it("treats an omitted filename and the explicit URL-derived name as one job", () => {
     // URL basename is big.safetensors; passing it explicitly must resolve to the
     // SAME id so a repeat request adopts the in-flight job (one writer, one file).
