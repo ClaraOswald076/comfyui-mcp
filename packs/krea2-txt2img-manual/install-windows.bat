@@ -15,7 +15,6 @@ if not exist "%PY%" set "PY=python"
 echo using python: %PY%
 
 echo -------- custom nodes --------
-call :clone "ComfyUI-Manager" "https://github.com/ltdrdata/ComfyUI-Manager.git"
 call :clone "rgthree-comfy" "https://github.com/rgthree/rgthree-comfy"
 call :clone "ComfyUI-KJNodes" "https://github.com/kijai/ComfyUI-KJNodes"
 call :clone "ComfyUI-Krea2T-Enhancer" "https://github.com/capitan01R/ComfyUI-Krea2T-Enhancer"
