@@ -29,8 +29,18 @@ import {
   MODEL_SUBDIRS,
   type ModelType,
 } from "./model-resolver.js";
+import { startDownloadJob } from "./download-jobs.js";
+import { getSavedDefaultWorkspaceSync } from "./workspace-env.js";
 import { ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
+
+/** Grace window (ms) to await a manifest model download before handing back a
+ *  background job handle. Keeps apply_manifest under the MCP tools/call timeout
+ *  on large model packs (#362); small files still complete inline. */
+function manifestDownloadGraceMs(): number {
+  const raw = Number(process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 15_000;
+}
 
 const IS_WIN = platform() === "win32";
 const MAX_MANIFEST_BYTES = 1024 * 1024;
@@ -161,27 +171,61 @@ function validatePipPackageSpec(pkg: string): void {
   }
 }
 
-function installPipPackage(pkg: string, comfyuiPath: string): string {
-  validatePipPackageSpec(pkg);
-  const python = resolveWorkspacePython(comfyuiPath);
-  const useUv = commandExists("uv");
-  const cmd = useUv ? "uv" : python;
-  const args = useUv
-    ? ["pip", "install", "--python", python, pkg]
-    : ["-m", "pip", "install", pkg];
-
-  logger.info("Installing manifest Python package", {
-    package: pkg,
-    installer: useUv ? "uv" : "pip",
-  });
-
-  const out = execFileSync(cmd, args, {
+function runPythonPipInstall(python: string, pkg: string, comfyuiPath: string): string {
+  const out = execFileSync(python, ["-m", "pip", "install", pkg], {
     cwd: comfyuiPath,
     encoding: "utf-8",
     timeout: 600_000,
     stdio: ["ignore", "pipe", "pipe"],
   });
   return (out ?? "").trim();
+}
+
+/** uv refuses to install into an interpreter that is not a virtual environment
+ *  unless told to. A ComfyUI running from a system Python (no .venv) hits exactly
+ *  this — `uv pip install --python <sys python>` fails with "No virtual
+ *  environment found ... pass --system" (#377). Recognize that message so we can
+ *  fall back to the interpreter's own pip, which installs correctly with no venv. */
+function isUvNonVenvError(text: string): boolean {
+  return /No virtual environment found|not a virtual environment|pass `?--system|run `?uv venv/i.test(
+    text,
+  );
+}
+
+function installPipPackage(pkg: string, comfyuiPath: string): string {
+  validatePipPackageSpec(pkg);
+  const python = resolveWorkspacePython(comfyuiPath);
+  const useUv = commandExists("uv");
+
+  if (!useUv) {
+    logger.info("Installing manifest Python package", { package: pkg, installer: "pip" });
+    return runPythonPipInstall(python, pkg, comfyuiPath);
+  }
+
+  logger.info("Installing manifest Python package", { package: pkg, installer: "uv" });
+  try {
+    const out = execFileSync("uv", ["pip", "install", "--python", python, pkg], {
+      cwd: comfyuiPath,
+      encoding: "utf-8",
+      timeout: 600_000,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return (out ?? "").trim();
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException & { stdout?: Buffer | string; stderr?: Buffer | string };
+    const detail = `${e.stderr?.toString() ?? ""}\n${e.stdout?.toString() ?? ""}\n${e.message ?? ""}`;
+    if (isUvNonVenvError(detail)) {
+      // System-Python ComfyUI (no venv): uv can't use the interpreter directly.
+      // The interpreter's own pip installs into that exact environment, which is
+      // what we want (#377).
+      logger.info(
+        "uv rejected the non-venv ComfyUI interpreter; falling back to `python -m pip install`",
+        { package: pkg },
+      );
+      return runPythonPipInstall(python, pkg, comfyuiPath);
+    }
+    throw err;
+  }
 }
 
 function normalizeId(value: string): string {
@@ -506,6 +550,28 @@ export async function applyManifest(
   // pip/model handling remotely instead of touching the local install/disk.
   // custom_nodes and models can still be handled remotely through ComfyUI-Manager's
   // HTTP API, but pip/apt have no remote equivalent.
+  // #390: In LOCAL mode a saved default workspace (set via set_default_workspace,
+  // i.e. what get_environment resolves) is a valid local filesystem target even
+  // when COMFYUI_PATH is unset. Adopt it as the active local path so models
+  // download to the local disk and unregistered custom nodes can clone into
+  // custom_nodes — matching how model-resolver already treats the saved default
+  // as authoritative for local FS. Only when it exists AND looks like a ComfyUI
+  // install (has models/ or custom_nodes/), so a stale/garbage saved value isn't
+  // trusted. NOT done in remote/cloud mode (a remote target has no local FS).
+  if (!config.comfyuiPath && !isRemoteMode()) {
+    const saved = getSavedDefaultWorkspaceSync();
+    if (
+      saved &&
+      existsSync(saved) &&
+      (existsSync(join(saved, "models")) || existsSync(join(saved, "custom_nodes")))
+    ) {
+      logger.info(
+        "apply_manifest: adopting saved default workspace as the local ComfyUI path (COMFYUI_PATH unset)",
+        { path: saved },
+      );
+      config.comfyuiPath = saved;
+    }
+  }
   const comfyuiPath = config.comfyuiPath;
   const hasLocalFs = !isRemoteMode() && Boolean(comfyuiPath);
 
@@ -628,8 +694,42 @@ export async function applyManifest(
         results.push(report("model", item, "skipped", `Model already exists at ${existing}.`));
         continue;
       }
-      const saved = await downloadModel(model.url, target.targetSubfolder, target.filename);
-      results.push(report("model", item, "applied", `Model downloaded to ${saved}.`));
+      // #362: A large model pack can push the whole apply_manifest call past the
+      // MCP tools/call timeout (~300s) while it blocks on multi-GB downloads,
+      // leaving no resumable result. Hand each download to the background job
+      // registry (the same one download_model uses) and only await a short grace
+      // window: small files still land inline (reported "applied"), while a big
+      // download keeps streaming and is reported as started with a job id to poll
+      // via download_status — so the tool returns promptly and nothing is lost.
+      const { job, settled } = startDownloadJob(
+        model.url,
+        target.targetSubfolder,
+        target.filename,
+      );
+      let graceTimer: NodeJS.Timeout | undefined;
+      await Promise.race([
+        settled,
+        new Promise<void>((r) => {
+          graceTimer = setTimeout(r, manifestDownloadGraceMs());
+        }),
+      ]);
+      if (graceTimer) clearTimeout(graceTimer);
+      if (job.status === "error") {
+        results.push(report("model", item, "failed", job.error ?? "Model download failed."));
+      } else if (job.status === "done") {
+        results.push(report("model", item, "applied", `Model downloaded to ${job.path}.`));
+      } else {
+        results.push(
+          report(
+            "model",
+            item,
+            "applied",
+            `Model download STARTED in the background (job ${job.id}) and is still running — ` +
+              `this is NOT a failure. Poll download_status with this id; the file lands on its own. ` +
+              `Do not re-issue the download.`,
+          ),
+        );
+      }
     } catch (err) {
       results.push(
         report(
