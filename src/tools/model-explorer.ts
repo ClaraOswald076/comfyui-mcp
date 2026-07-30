@@ -19,6 +19,37 @@ const okText = (value: unknown) => ({
   content: [{ type: "text" as const, text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }],
 });
 
+// A 404 on a /model_explorer/* route has two possible causes: (1) the optional
+// `comfyui-model-explorer` custom node isn't installed, so the route itself does
+// not exist (the common case — the raw 404 that motivated #363); or (2) the node
+// IS installed but reports the requested model file as not found. HTTP status
+// alone can't distinguish them, so surface an actionable message covering BOTH
+// rather than leaking the bare 404 or over-claiming that the node is absent. A
+// `detail` string from the upstream body (when present) is appended as a hint.
+// Other statuses (500, 503, …) are real upstream errors and pass through.
+export function explorerHttpError(route: string, status: number, body?: string): Error {
+  if (status === 404) {
+    const hint = body && body.trim() ? ` Upstream detail: ${body.trim().slice(0, 200)}.` : "";
+    return new Error(
+      `GET /model_explorer/${route} returned HTTP 404. Most likely the optional ` +
+        `'comfyui-model-explorer' custom node is not installed on the connected ComfyUI ` +
+        `(install it via ComfyUI-Manager or install_custom_node, then restart). If that node ` +
+        `IS installed, the 404 instead means it could not find the requested model file — ` +
+        `check that 'category' (model folder) and 'name' (filename incl. .safetensors) are ` +
+        `correct and the file exists.${hint}`,
+    );
+  }
+  return new Error(`model_explorer ${route} HTTP ${status}`);
+}
+
+async function readBodyText(res: { text?: () => Promise<string> }): Promise<string | undefined> {
+  try {
+    return res.text ? await res.text() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function registerModelExplorerTools(server: McpServer): void {
   server.tool(
     "model_metadata_read",
@@ -38,7 +69,7 @@ export function registerModelExplorerTools(server: McpServer): void {
         const COMFY = comfyBase();
         const q = `category=${encodeURIComponent(args.category)}&name=${encodeURIComponent(args.name)}`;
         const dr = await fetch(`${COMFY}/model_explorer/detail?${q}`);
-        if (!dr.ok) return errorToToolResult(new Error(`model_explorer detail HTTP ${dr.status} (is ComfyUI running with the comfyui-model-explorer node?)`));
+        if (!dr.ok) return errorToToolResult(explorerHttpError("detail", dr.status, await readBodyText(dr)));
         const detail = (await dr.json()) as any;
         let tags = null;
         try {
@@ -119,7 +150,7 @@ export function registerModelExplorerTools(server: McpServer): void {
           `category=${encodeURIComponent(args.category)}&name=${encodeURIComponent(args.name)}` +
           (args.version_id ? `&version_id=${args.version_id}` : "");
         const r = await fetch(`${COMFY}/model_explorer/civitai?${q}`);
-        if (!r.ok) return errorToToolResult(new Error(`model_explorer civitai HTTP ${r.status}`));
+        if (!r.ok) return errorToToolResult(explorerHttpError("civitai", r.status, await readBodyText(r)));
         return okText(await r.json());
       } catch (err) {
         return errorToToolResult(err);
