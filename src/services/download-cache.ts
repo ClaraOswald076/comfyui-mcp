@@ -535,6 +535,7 @@ async function streamUrlToFile(
         diagKey,
         provenChange ? "declined:etag-changed" : "declined:unverifiable",
         resumeFromBytes,
+        removed,
       );
       const tail = removed
         ? "Removed the stale partial so a retry restarts cleanly."
@@ -652,7 +653,7 @@ async function streamUrlToFile(
   } else if (appendMode) {
     // A resume was actually taken (validated 206 append). Record it so
     // download_status can report the partial was reused, not discarded (#467).
-    recordResumeDiagnostic(diagKey, "resumed", 0);
+    recordResumeDiagnostic(diagKey, "resumed", 0, false);
   }
 
   const nodeStream = Readable.fromWeb(res.body as import("node:stream/web").ReadableStream);
@@ -798,6 +799,11 @@ async function downloadIntoCache(
           await downloadCacheFs.rm(target, { force: true }).catch(() => undefined);
         } else {
           await touch(target);
+          // Cache hit ⇒ no resume/discard happened this attempt. Clear any prior
+          // decision for this slot so download_status can't attribute an EARLIER
+          // attempt's decline to this fresh cache-hit job — the per-attempt reset
+          // that streamUrlToFile would do, but a hit never reaches it (#467).
+          clearResumeDiagnostic(resumeKey ?? trayIdForUrl(url));
           return target;
         }
       }

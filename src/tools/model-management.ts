@@ -232,11 +232,10 @@ export function registerModelManagementTools(server: McpServer): void {
                 ? `\n    failed: ${j.error}`
                 : `\n    still streaming — started ${Math.round((Date.now() - j.started_at) / 1000)}s ago`;
           // Surface a declined resume so the agent/user knows a pre-existing
-          // .partial was discarded and a full re-download is under way, and why
-          // — instead of it being silent (#467).
-          // Only THIS attempt's diagnostic can be present: startDownloadJob clears
-          // any earlier decision for the tray id when a fresh job starts (#467 P2),
-          // so a stale discard from an earlier attempt can't be misattributed here.
+          // .partial was discarded and why — instead of it being silent (#467).
+          // Only THIS attempt's decision can be present: the per-attempt reset in
+          // the physical-download path (and on a cache hit) clears any earlier
+          // decision for this slot, so a stale one can't be misattributed here.
           const diag = getResumeDiagnostic(j.resumeKey);
           let resumeNote = "";
           if (diag && diag.outcome !== "resumed") {
@@ -249,14 +248,17 @@ export function registerModelManagementTools(server: McpServer): void {
                   : diag.outcome === "declined:unverifiable"
                     ? "the resume crossed origins to a CDN that gave no content-addressed validator, so an unchanged upstream couldn't be proven"
                     : "the upstream file changed since the partial was written, so appending would corrupt it";
-            // The 206-refusal paths (etag-changed / unverifiable) error the job —
-            // a clean retry is needed; no-validator and full-response restart
-            // within the same stream. Report each honestly by job status.
+            // Honest about BOTH what happened to the partial and what's next.
+            // A 206 refusal whose removal failed (diag.discarded === false) must
+            // NOT claim the partial was discarded (#467).
+            const fate = diag.discarded
+              ? `discarded ${gb} GB of a prior .partial`
+              : `refused to append a ${gb} GB prior .partial but could NOT remove it (delete the .partial manually if a retry keeps failing)`;
             const next =
               j.status === "error"
                 ? "the resume was REJECTED for safety — re-issue download_model to restart cleanly"
                 : "re-downloading in full";
-            resumeNote = `\n    resume: ${diag.outcome} — discarded ${gb} GB of a prior .partial because ${why}; ${next}`;
+            resumeNote = `\n    resume: ${diag.outcome} — ${fate} because ${why}; ${next}`;
           }
           return `${head}${detail}${resumeNote}\n    from: ${j.url}`;
         });

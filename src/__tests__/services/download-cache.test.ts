@@ -834,6 +834,31 @@ describe("downloadModel cache", () => {
     expect(getResumeDiagnostic(trayIdForUrl(url))?.outcome).toBe("declined:no-validator");
   });
 
+  it("clears a stale resume diagnostic on a cache HIT so it isn't misattributed (#467)", async () => {
+    const { downloadWithCache, getResumeDiagnostic } = await import(
+      "../../services/download-cache.js"
+    );
+    const { recordResumeDiagnostic, trayIdForUrl } = await import(
+      "../../services/download-resume-diag.js"
+    );
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    await fsPromises.mkdir(comfyDir, { recursive: true });
+    const url = "https://example.com/models/cachehit-clear.safetensors";
+    const { createHash } = await import("node:crypto");
+    const hash = createHash("sha256").update(url).digest("hex").slice(0, 32);
+    // A COMPLETE cache entry → this download is a hit (no fetch, no streamUrlToFile).
+    await writeFile(join(cacheDir, `${hash}.safetensors`), "CACHED-BYTES");
+    // A stale decline left over from an EARLIER attempt for the same slot.
+    recordResumeDiagnostic(trayIdForUrl(url), "declined:no-validator", 999);
+    expect(getResumeDiagnostic(trayIdForUrl(url))?.outcome).toBe("declined:no-validator");
+
+    await downloadWithCache({ url, headers: {}, targetPath: join(comfyDir, "ch.safetensors") });
+
+    expect(fetchMock).not.toHaveBeenCalled(); // served from cache
+    // The cache hit performed no resume/discard, so the stale decision is cleared.
+    expect(getResumeDiagnostic(trayIdForUrl(url))).toBeUndefined();
+  });
+
   it("gives same-URL DIFFERENT-auth downloads DISTINCT resume-diagnostic slots (#467 P2)", async () => {
     const { resumeKeyFor, recordResumeDiagnostic, getResumeDiagnostic, trayIdForUrl } =
       await import("../../services/download-resume-diag.js");

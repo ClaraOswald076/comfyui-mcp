@@ -30,9 +30,15 @@ export type ResumeOutcome =
 
 export interface ResumeDiagnostic {
   outcome: ResumeOutcome;
-  /** Bytes of pre-existing `.partial` discarded on a declined resume (0 when the
+  /** Bytes of pre-existing `.partial` involved in a declined resume (0 when the
    *  resume was taken). */
   discardedBytes: number;
+  /** Whether the stale partial was CONFIRMED removed/truncated. True for the
+   *  in-stream restart declines (recorded only after a confirmed discard) and for
+   *  a 206 refusal whose removal was verified; false when a 206 refusal could NOT
+   *  remove the partial (a swallowed rm failure) — so download_status never claims
+   *  "discarded" when the bytes may still be on disk (#467). */
+  discarded: boolean;
   /** Epoch ms this decision was made. */
   at: number;
 }
@@ -65,15 +71,17 @@ export function recordResumeDiagnostic(
   key: string,
   outcome: ResumeOutcome,
   discardedBytes: number,
+  discarded = true,
 ): void {
-  resumeDiagnostics.set(key, { outcome, discardedBytes, at: Date.now() });
+  resumeDiagnostics.set(key, { outcome, discardedBytes, discarded, at: Date.now() });
 }
 
 /** Read the last resume decision for a download's resume key (or undefined).
  *
  *  Keyed by the resume key (see resumeKeyFor), matching DownloadJob.resumeKey.
- *  Only THIS attempt's decision is ever present: startDownloadJob clears the key
- *  when a fresh job starts (#467 P2), so a stale discard can't be misattributed.
+ *  Only THIS attempt's decision is ever present: the per-attempt reset runs where
+ *  a genuinely-new physical download begins (streamUrlToFile) and on a cache hit
+ *  (#467 P1-b/P2), so a stale decision can't be misattributed to a later attempt.
  *  Two concurrent same-URL jobs with DIFFERENT auth get DISTINCT keys (they are
  *  separate physical cache downloads); same-URL same-auth jobs to different
  *  destinations share ONE physical download and one key — accurately. */
@@ -81,13 +89,14 @@ export function getResumeDiagnostic(key: string): ResumeDiagnostic | undefined {
   return resumeDiagnostics.get(key);
 }
 
-/** Clear any prior resume decision for a tray id. Called when a NEW download job
- *  starts so a decision from an EARLIER attempt for the same URL can never be
- *  attributed to this one — a per-attempt reset that closes the timestamp-compare
- *  equality/rollback hole (#467 P2), robust to same-ms Date.now() and wall-clock
- *  rollback that a `diag.at >= started_at` check misses. */
-export function clearResumeDiagnostic(trayId: string): void {
-  resumeDiagnostics.delete(trayId);
+/** Clear any prior resume decision for a slot. Called where a genuinely-new
+ *  physical download begins (streamUrlToFile) and on a cache hit — NOT per job —
+ *  so a decision from an EARLIER attempt can never be attributed to a later one,
+ *  while a job that merely coalesces onto an in-flight download does not wipe the
+ *  active stream's decision (#467 P1-b/P2). Closes the timestamp-compare
+ *  equality/rollback hole a `diag.at >= started_at` check would miss. */
+export function clearResumeDiagnostic(key: string): void {
+  resumeDiagnostics.delete(key);
 }
 
 /** Test seam — the diagnostics map is process-global otherwise. */
