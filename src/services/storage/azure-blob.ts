@@ -1,4 +1,5 @@
 import { createReadStream, createWriteStream } from "node:fs";
+import { stat } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 import type {
   BlobClient,
@@ -145,6 +146,19 @@ export async function downloadAzureBlobToFile(url: string, targetPath: string): 
       });
     }
     await pipeline(response.readableStreamBody, createWriteStream(targetPath));
+    // #343 edge: verify the written size against the blob's authoritative
+    // contentLength so an early-ending stream can't be reported as a complete
+    // download (silent truncation).
+    const expected = typeof response.contentLength === "number" ? response.contentLength : 0;
+    if (expected > 0) {
+      const actual = (await stat(targetPath)).size;
+      if (actual < expected) {
+        throw new ModelError(
+          `Azure Blob download truncated: wrote ${actual} of ${expected} bytes — the stream ended early. Not complete; retry.`,
+          { url: redactUrlForLogs(url) },
+        );
+      }
+    }
   } catch (err) {
     if (err instanceof ModelError || err instanceof ValidationError) throw err;
     throw new ModelError("Azure Blob download failed", {
