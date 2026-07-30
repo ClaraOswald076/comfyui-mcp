@@ -1895,17 +1895,20 @@ describe("downloadModel model-payload validation (#473)", () => {
     await expect(stat(ct)).rejects.toThrow(); // stale sidecar cleared
   });
 
-  it("IGNORES a stale text/html .ct whose stamped size mismatches the cache file (size-guard, rm-independent)", async () => {
-    // Even if a stale sidecar SURVIVES on disk (its clearing rm failed), it must not
-    // reject a legitimate model: the size stamp no longer matches the cache bytes, so
-    // it is ignored. Pre-seed a real GGUF cache entry + a stale text/html sidecar
-    // stamped for a DIFFERENT size, then a cache-HIT .safetensors caller must succeed.
+  it("IGNORES a stale text/html .ct even at the SAME payload size (head fingerprint, rm-independent)", async () => {
+    // Even if a stale sidecar SURVIVES on disk (its clearing rm failed) AND the
+    // replacement model happens to have the EXACT same byte length as the prior HTML
+    // page, it must not reject the legitimate model: the payload fingerprint hashes the
+    // sniff HEAD, which differs between a binary model and an HTML page. Pre-seed a real
+    // GGUF cache entry + a stale text/html sidecar whose fingerprint (any prior bytes)
+    // won't match the GGUF head; a cache-HIT .safetensors caller must succeed.
     const url = "https://example.com/models/sizeguard"; // extensionless → shared key
     const hash = cacheHashFor(url);
     await mkdir(cacheDir, { recursive: true });
     const gguf = Buffer.concat([Buffer.from("GGUF"), Buffer.from([0x00, 0x01, 0x02, 0x03, 0x04])]);
-    await writeFile(join(cacheDir, hash), gguf); // valid cached model payload
-    await writeFile(join(cacheDir, `.${hash}.ct`), "text/html\n999999"); // stale, wrong size
+    await writeFile(join(cacheDir, hash), gguf); // valid cached model payload (9 bytes)
+    // Stale sidecar stamped for a DIFFERENT body of the SAME 9-byte length (html head).
+    await writeFile(join(cacheDir, `.${hash}.ct`), "text/html\n9:deadbeefdeadbeef");
     const out = await downloadModel(url, "loras", "sg.safetensors");
     expect((await stat(out)).size).toBe(gguf.length); // cache HIT, NOT rejected
   });

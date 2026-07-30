@@ -150,13 +150,15 @@ async function writeCacheContentType(cacheFilePath: string, contentType: string)
     return;
   }
   try {
-    // Stamp the payload SIZE alongside the Content-Type. On read we honor the type
-    // only when the stamped size still matches the cache file — so a stale sidecar
-    // left behind after a clean re-fill (different bytes ⇒ different size) is ignored
-    // and can NEVER reject a legitimate model, regardless of whether the clearing rm
-    // above succeeded (#473 — robust against the swallowed-delete false-positive).
-    const size = await fileSizeOrUndefined(cacheFilePath);
-    await writeFile(sidecar, `${contentType}\n${size ?? ""}`);
+    // Stamp a fingerprint of the payload (size + a hash of its sniff head) alongside
+    // the Content-Type. On read we honor the type only when that fingerprint still
+    // matches the cache file — so a stale sidecar left behind after a clean re-fill
+    // (different bytes ⇒ different head/size) is ignored and can NEVER reject a
+    // legitimate model, regardless of whether the clearing rm above succeeded, AND
+    // even in the astronomically-unlikely case where the replacement model has the
+    // exact same byte LENGTH as the prior page (the head hash still differs) (#473 —
+    // robust against the swallowed-delete false-positive).
+    await writeFile(sidecar, `${contentType}\n${await payloadFingerprint(cacheFilePath)}`);
   } catch (err) {
     // Best effort — reuse falls back to body-magic-only validation, which still
     // catches every well-formed HTML/JSON page (only a synthetic body that sniffs
@@ -179,16 +181,31 @@ async function readCacheContentType(cacheFilePath: string): Promise<string> {
   try {
     const raw = await readFile(cacheCtSidecar(cacheFilePath), "utf-8");
     const nl = raw.indexOf("\n");
-    if (nl < 0) return ""; // no size stamp (unexpected) → don't trust it
+    if (nl < 0) return ""; // no fingerprint (unexpected) → don't trust it
     const contentType = raw.slice(0, nl).trim();
-    const stampedSize = Number(raw.slice(nl + 1).trim());
-    if (!contentType || !Number.isFinite(stampedSize)) return "";
-    const currentSize = await fileSizeOrUndefined(cacheFilePath);
-    // Only honor the tag when it was stamped for the bytes currently on disk.
-    return currentSize !== undefined && currentSize === stampedSize ? contentType : "";
+    const stamped = raw.slice(nl + 1).trim();
+    if (!contentType || !stamped) return "";
+    const current = await payloadFingerprint(cacheFilePath);
+    // Only honor the tag when it was stamped for the bytes currently on disk. A
+    // mismatch (stale sidecar over re-filled bytes, or an unreadable head) yields "",
+    // falling back to body magic — this can only ADD safety, never reject a real model.
+    return stamped === current ? contentType : "";
   } catch {
     return "";
   }
+}
+
+/** A cheap content fingerprint of a cache file: its size plus a short hash of its
+ *  sniff head. Distinguishes a re-filled cache slot from the bytes a Content-Type
+ *  sidecar was written for — even at an identical byte length — without hashing a
+ *  multi-GB payload in full. "" when the head can't be read (caller treats a
+ *  mismatch as "don't trust the sidecar"). */
+async function payloadFingerprint(cacheFilePath: string): Promise<string> {
+  const size = await fileSizeOrUndefined(cacheFilePath);
+  const head = await readHead(cacheFilePath);
+  if (head === undefined) return "";
+  const headHash = createHash("sha256").update(head).digest("hex").slice(0, 16);
+  return `${size ?? ""}:${headHash}`;
 }
 
 /** On-disk size, or undefined when it can't be determined (fs layer stubbed in
