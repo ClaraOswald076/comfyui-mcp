@@ -143,6 +143,12 @@ export async function captionImage(opts: {
       type: string;
       subtype?: string;
       is_error?: boolean;
+      // Agent SDK 0.3.x contract: an ERROR result (SDKResultError, subtype
+      // `error_during_execution` etc.) carries its text in `errors: string[]`
+      // and has NO `result` field. Only a SUCCESS result (SDKResultSuccess)
+      // has `result: string`. Reading the wrong field is how the auth message
+      // was being lost (issue #438 codex round 1).
+      errors?: string[];
       result?: string;
       message?: { content?: Array<{ type: string; text?: string }> };
     };
@@ -153,10 +159,14 @@ export async function captionImage(opts: {
         .join("");
     } else if (m.type === "result" && (m.is_error || (m.subtype && m.subtype !== "success"))) {
       // The SDK reports a failed run (e.g. "Not logged in — Please run /login")
-      // as an error `result`, NOT a thrown exception — previously this was
-      // silently dropped and every image failed with the generic "empty
-      // caption" message. Surface it, and flag auth failures so the batch bails.
-      const detail = (m.result ?? "").trim() || `caption run failed (${m.subtype ?? "error"})`;
+      // as an error `result` message, NOT a thrown exception — previously this
+      // was silently dropped and every image failed with the generic "empty
+      // caption" message. Pull the text from `errors[]` (the error variant's
+      // field), and flag auth failures so the batch bails.
+      const detail =
+        (Array.isArray(m.errors) ? m.errors.join("; ") : "").trim() ||
+        (m.result ?? "").trim() ||
+        `caption run failed (${m.subtype ?? "error"})`;
       if (isAuthFailureText(detail)) {
         throw new CaptionAuthError(
           `Claude captioning is unavailable — the Claude Code session is not authenticated ` +

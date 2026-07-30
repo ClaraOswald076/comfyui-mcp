@@ -14,12 +14,14 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
     const mode = queryMode;
     return (async function* () {
       if (mode === "auth") {
-        // How the SDK reports a not-logged-in run: an error `result`, not a throw.
-        yield { type: "result", subtype: "error_during_execution", is_error: true, result: "Not logged in · Please run /login" };
+        // REAL Agent SDK 0.3.x error-result shape: SDKResultError carries text
+        // in `errors: string[]` and has NO `result` field. If the service reads
+        // `result` instead of `errors`, this test must fail.
+        yield { type: "result", subtype: "error_during_execution", is_error: true, errors: ["Not logged in · Please run /login"] };
         return;
       }
       if (mode === "transient" || mode === "counting-transient") {
-        yield { type: "result", subtype: "error_during_execution", is_error: true, result: "transient hiccup — try again" };
+        yield { type: "result", subtype: "error_during_execution", is_error: true, errors: ["transient hiccup — try again"] };
         return;
       }
       yield {
