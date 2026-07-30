@@ -1385,6 +1385,30 @@ async function downloadIntoCache(
       // No partial — fresh download.
     }
 
+    // #473 P1 — cleanup-INDEPENDENT poison guard. A prior attempt may have REJECTED
+    // this download as an HTML/JSON auth/error body and then been UNABLE to remove or
+    // truncate the leftover .partial (a denied rm AND a denied truncate). Re-inspect
+    // the partial's HEAD here, before deciding to resume: if it is itself a non-model
+    // (HTML/JSON) body for a binary-model destination, it is poison — NEVER resume
+    // onto it. Reset to a fresh download (resumeFromBytes = 0 ⇒ no Range ⇒ the "w"
+    // open truncates the poisoned bytes) and best-effort discard the sidecar, so the
+    // invariant "a rejected leftover can't be treated as resumable" holds even when
+    // both cleanup mechanisms failed. A legitimate in-progress partial sniffs as
+    // binary (null) and resumes normally.
+    if (resumeFromBytes > 0 && modelExt) {
+      const partialHead = await readHead(partial);
+      if (detectNonModelPayload(partialHead, "", modelExt)) {
+        logger.warn(
+          `Discarding a previously-rejected non-model (${resumeFromBytes}-byte) partial before ` +
+            `resume: its head is an HTML/JSON auth/error body, not a model — restarting from 0 so ` +
+            `the poisoned bytes can't be resumed onto (#473).`,
+          { url: logUrl, bytes: resumeFromBytes },
+        );
+        await discardRejectedPayload(partial, `${partial}.etag`, logUrl ?? redactUrlForLogs(url));
+        resumeFromBytes = 0;
+      }
+    }
+
     try {
       await streamUrlToFile(
         url,

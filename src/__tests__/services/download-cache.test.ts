@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -1721,5 +1721,34 @@ describe("downloadModel model-payload validation (#473)", () => {
     );
     const out = await downloadModel(url, "loras", "retry.safetensors");
     expect((await stat(out)).size).toBe(gguf.length);
+  });
+
+  it("does NOT resume onto a leftover REJECTED (HTML) partial even if cleanup earlier failed — re-inspects and restarts fresh (P1 worst-case)", async () => {
+    // Simulate the worst case: a prior rejection could NOT remove/truncate the
+    // poisoned partial, so both the HTML .partial AND a resume sidecar survive on
+    // disk. The next attempt must re-inspect the partial's head, refuse to resume onto
+    // the poison, and restart from 0 — regardless of whether cleanup ever succeeded.
+    const url = "https://example.com/models/leftover.safetensors";
+    const hash = cacheHashFor(url);
+    await mkdir(cacheDir, { recursive: true });
+    const partial = join(cacheDir, `.${hash}.safetensors.partial`);
+    await writeFile(partial, "<!DOCTYPE html><html><body>Sign in to download</body></html>");
+    await writeFile(`${partial}.etag`, '"deadbeef"'); // a validator that would enable If-Range
+    // A clean binary model is served now.
+    const gguf = Buffer.concat([Buffer.from("GGUF"), Buffer.from([0x00, 0x01, 0x02, 0x03, 0x04])]);
+    fetchMock.mockResolvedValueOnce(
+      new Response(gguf, {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "application/octet-stream" },
+      }),
+    );
+    const out = await downloadModel(url, "checkpoints", "leftover.safetensors");
+    expect((await stat(out)).size).toBe(gguf.length);
+    // The request must NOT have carried a Range header — proof we did not resume onto
+    // the poisoned prefix.
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    const sentHeaders = (init.headers ?? {}) as Record<string, string>;
+    expect(sentHeaders.Range).toBeUndefined();
   });
 });
