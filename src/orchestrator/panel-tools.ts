@@ -200,10 +200,76 @@ export const __panelToolsTestHooks = {
   setPanelRebootTiming(timing: PanelRebootTiming | null): void {
     panelRebootTimingOverride = timing;
   },
+  /** Zero out the post-drop retry settle so retry-once tests don't sleep. */
+  setRetrySettleMs(ms: number | null): void {
+    retrySettleMsOverride = ms;
+  },
+  isRetrySafeCmd,
+  isTransientReconnectError,
 };
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+// ── Post-reconnect retry-once for idempotent panel commands ──────────────────
+// A tool-triggered ComfyUI reboot (#278/#481), a panel_free_vram (#310), or a
+// Manager-backed call racing a post-restart reconnect (#332) can drop the panel
+// tab's transport the instant AFTER a command was dispatched — or replace the
+// tab under a BRAND-NEW socket/tab id with no migration alias, orphaning this
+// session. The bridge's own mid-command resume only helps when the SAME tab id
+// re-hellos; when the id changed, the in-flight command surfaces a bare
+// "no connected tab" / "disconnected mid-command … genuinely gone" / "Failed to
+// fetch" and the agent is told to hand-call panel_set_workflow_target(current).
+//
+// For commands that are SAFE to re-issue (idempotent reads, plus idempotent
+// UI-state writes like set_todo that fully REPLACE state), we transparently
+// rebind onto the now-live tab (ensureReachable) and retry ONCE after a short
+// settle. Mutating graph edits (add_node/connect/set_widget/…) are deliberately
+// EXCLUDED — re-issuing them could double-apply — so they keep surfacing the
+// bridge's honest OUTCOME-UNKNOWN error.
+const RETRY_SAFE_CMDS = new Set<string>([
+  // Idempotent reads (mirror UiBridge.READONLY_CMDS + list/status probes).
+  "graph_serialize",
+  "graph_outline",
+  "graph_get_errors",
+  "graph_get_subgraph",
+  "graph_prompt_director_audit",
+  "graph_query",
+  "get_todo",
+  "workflow_list",
+  "nodes_list",
+  "nodes_queue_status",
+  "node_queue_status",
+  // Idempotent full-replace UI state — re-sending the same list is a no-op (#481).
+  "set_todo",
+]);
+
+/** A command whose result is unchanged by being re-issued after a reconnect —
+ *  so it is safe to transparently retry once when the transport dropped. */
+function isRetrySafeCmd(cmd: Record<string, unknown>): boolean {
+  const name = typeof cmd.cmd === "string" ? cmd.cmd : "";
+  return RETRY_SAFE_CMDS.has(name);
+}
+
+/** True when an error is a TRANSIENT transport/reconnect drop (the tab went away
+ *  or was replaced), NOT a genuine command error or a live-but-frozen reply
+ *  timeout. Deliberately EXCLUDES "did not reply within N ms" (a backgrounded/
+ *  frozen tab — retrying just double-waits, #334) and "OUTCOME UNKNOWN" (a
+ *  mutating command that may already have applied). */
+function isTransientReconnectError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? "");
+  return /no connected tab|genuinely gone|is not open|Failed to fetch|Panel not reachable|ECONNRESET|socket hang up|premature close|other side closed|ECONNABORTED|EPIPE/i.test(
+    msg,
+  );
+}
+
+let retrySettleMsOverride: number | null = null;
+/** Short pause before the single post-drop retry, letting the replacement tab
+ *  finish its reconnect hello so ensureReachable can resolve it. Test-overridable. */
+function retrySettleMs(): number {
+  if (retrySettleMsOverride != null) return retrySettleMsOverride;
+  return Math.round(parsePositiveNumberEnv("COMFYUI_PANEL_RETRY_SETTLE_S", 0.4) * 1000);
 }
 
 interface PanelReadyResult {
@@ -409,6 +475,52 @@ async function openWorkflowWithVerify(path: string, ctx: PanelToolCtx): Promise<
   return res;
 }
 
+/** An open-workflow record as reported by `workflow_list` (path/filename/key). */
+interface OpenWorkflowRecord {
+  path?: string;
+  filename?: string;
+  key?: string;
+}
+
+/**
+ * Resolve a caller-supplied pin `path` (path / filename / key, any form) to the
+ * AUTHORITATIVE open-workflow record from a fresh `workflow_list` — the single
+ * source of truth for which tabs exist and their canonical `key` (#259). Returns:
+ *  - the matched record when the workflow IS open (so the pin can be canonicalized
+ *    to its stable key and bound to the exact frontend tab identity);
+ *  - `null` when workflow_list is unreachable/empty or carries no `workflows`
+ *    array (indeterminate — caller should fall back to the raw path, NOT fail);
+ *  - the sentinel `NOT_OPEN` when the list IS known but the target is absent, so
+ *    the caller can FAIL CLOSED instead of letting the panel silently route the
+ *    pin to some other open tab.
+ */
+const NOT_OPEN = Symbol("workflow-not-open");
+async function resolveOpenWorkflow(
+  ctx: PanelToolCtx,
+  path: string,
+): Promise<OpenWorkflowRecord | null | typeof NOT_OPEN> {
+  let parsed: Record<string, unknown> | null = null;
+  try {
+    parsed = parseToolResultJson(await ctx.call({ cmd: "workflow_list" }, 6000));
+  } catch {
+    return null; // transport error — indeterminate, don't fail the pin
+  }
+  if (!parsed) return null;
+  const rawList = (parsed as { workflows?: unknown }).workflows;
+  if (!Array.isArray(rawList) || rawList.length === 0) {
+    // No enumerable tab list (older panel / stub) — can't verify, don't fail closed.
+    return null;
+  }
+  for (const wf of rawList) {
+    if (activeMatchesTarget(wf, path)) return wf as OpenWorkflowRecord;
+  }
+  // The active object is authoritative too, in case it isn't mirrored in the array.
+  if (activeMatchesTarget((parsed as { active?: unknown }).active, path)) {
+    return (parsed as { active: OpenWorkflowRecord }).active;
+  }
+  return NOT_OPEN;
+}
+
 export const __openWorkflowTestHooks = {
   /** Inject fast open-verify timing so tests don't wait the real ~6s budget. */
   setOpenVerifyTiming(timing: OpenVerifyTiming | null): void {
@@ -416,6 +528,7 @@ export const __openWorkflowTestHooks = {
   },
   isAckTimeout,
   activeMatchesTarget,
+  resolveOpenWorkflow,
 };
 
 const slotRef = z.union([z.string(), z.number().int().min(0)]);
@@ -684,11 +797,14 @@ export function makePanelToolCtx(
   // CONSERVATIVE by construction (must not weaken multi-tab routing):
   //  - fires ONLY when the current tab is genuinely unreachable (canReach false);
   //    a healthy session — including a healthy MULTI-tab one — is never touched;
-  //  - uses the SAME resolveActiveTabId the explicit rebind uses, which THROWS on
-  //    ambiguity (2+ live tabs, no last-active) and when nothing is connected, so
-  //    an orphaned session is never silently hijacked onto an arbitrary tab —
-  //    the throw is swallowed and the command falls through to the bridge's clear
-  //    `no connected tab` / `Multiple panel tabs` error;
+  //  - STRICT-SINGLE: only silently rebinds when there is EXACTLY ONE connected
+  //    tab. With 2+ live tabs the bridge's no-tabId resolution would fall back to
+  //    `lastActiveTabId` — which can be an UNRELATED workflow (codex) — so the
+  //    silent path refuses to guess and instead lets the command surface the
+  //    bridge's clear `no connected tab` error. The user then re-binds with the
+  //    EXPLICIT panel_set_workflow_target({mode:"current"}) signal, which DOES
+  //    accept the last-active tab because it is a deliberate "use what's live now"
+  //    consent — silent auto-heal must be stricter than an explicit rebind;
   //  - PINNED sessions are left strict: a session pinned to a specific workflow
   //    keeps requiring the explicit rebind consent signal. Only "current"-mode
   //    (follow-the-active-tab) sessions self-heal, which is faithful to what that
@@ -699,6 +815,13 @@ export function makePanelToolCtx(
     if (typeof bridge.canReach !== "function") return; // lightweight test ctx
     if (bridge.canReach(ctx.tabId)) return;
     if (workflowTargets?.get(ctx.tabId)?.mode === "pinned") return; // stay strict
+    // Strict-single: never silently pick among multiple live tabs (would risk the
+    // real bridge's last-active fallback routing to an unrelated workflow). When
+    // the bridge can enumerate its tabs and there is more than one, do NOT rebind.
+    if (typeof bridge.tabs === "function") {
+      const live = bridge.tabs();
+      if (Array.isArray(live) && live.length > 1) return;
+    }
     try {
       rebindToActiveTab();
     } catch {
@@ -707,13 +830,44 @@ export function makePanelToolCtx(
     }
   };
 
+  const sendRouted = async (
+    cmd: Record<string, unknown>,
+    timeoutMs?: number,
+  ): Promise<unknown> => {
+    const target = workflowTargets?.get(ctx.tabId);
+    const routed = target ? withWorkflowTarget(cmd, target) : cmd;
+    return bridge.send(routed as { cmd: string }, { tabId: ctx.tabId, timeoutMs });
+  };
+
   const call = async (cmd: Record<string, unknown>, timeoutMs?: number): Promise<ToolResult> => {
     try {
       ensureReachable();
-      const target = workflowTargets?.get(ctx.tabId);
-      const routed = target ? withWorkflowTarget(cmd, target) : cmd;
-      return ok(await bridge.send(routed as { cmd: string }, { tabId: ctx.tabId, timeoutMs }));
+      return ok(await sendRouted(cmd, timeoutMs));
     } catch (err) {
+      // Post-reconnect retry-once: a reboot/free_vram/reconnect can drop the tab's
+      // transport (or replace it under a new tab id) the instant after we dispatch.
+      // For idempotent commands, settle briefly, rebind onto the now-live tab, and
+      // retry ONE time before surfacing an error (#278/#310/#332/#481). Mutating
+      // edits are excluded from RETRY_SAFE_CMDS, so they never double-apply.
+      if (isRetrySafeCmd(cmd) && isTransientReconnectError(err)) {
+        try {
+          await sleep(retrySettleMs());
+          ensureReachable(); // rebinds a current-mode session onto the reconnected tab
+          return ok(await sendRouted(cmd, timeoutMs));
+        } catch (err2) {
+          // The retry also failed — surface an actionable reconnecting status rather
+          // than a bare transport error (#332), while still failing honestly.
+          if (isTransientReconnectError(err2)) {
+            const name = typeof cmd.cmd === "string" ? cmd.cmd : "panel command";
+            return fail(
+              `${name} could not reach the ComfyUI panel — it is still reconnecting after a ` +
+                `restart/reload. Wait a moment and retry; if it persists, rebind with ` +
+                `panel_set_workflow_target({mode:"current"}). (${err2 instanceof Error ? err2.message : String(err2)})`,
+            );
+          }
+          return fail(err2);
+        }
+      }
       return fail(err);
     }
   };
@@ -792,7 +946,15 @@ async function resolveWorkflowInput(
   let reply: unknown;
   try {
     ctx.ensureReachable?.();
-    reply = await ctx.bridge.send({ cmd: "graph_serialize" } as { cmd: string }, {
+    // Route to the SAME authoritative target as ctx.call: when the session is
+    // pinned, inject the pinned workflow_path so the live-canvas capture serializes
+    // the PINNED workflow, not whatever tab is visible (codex — this direct send
+    // otherwise bypasses withWorkflowTarget and reads the wrong graph).
+    const target = ctx.workflowTarget?.get(ctx.tabId);
+    const cmd = target
+      ? withWorkflowTarget({ cmd: "graph_serialize" }, target)
+      : { cmd: "graph_serialize" };
+    reply = await ctx.bridge.send(cmd as { cmd: string }, {
       tabId: ctx.tabId,
       timeoutMs: 30000,
     });
@@ -1412,6 +1574,20 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // session is left untouched; an ambiguous multi-tab case surfaces a clear
         // error rather than guessing.
         if (ctx.rebindToActiveTab) {
+          // Strict-single: if this session's tab is orphaned AND 2+ tabs are live,
+          // do NOT guess (the bridge would fall back to last-active, possibly an
+          // unrelated tab) — surface a clear error so the user picks, honoring the
+          // documented "ambiguous multi-tab surfaces a clear error" promise (codex).
+          const orphaned =
+            typeof ctx.bridge.canReach === "function" && !ctx.bridge.canReach(ctx.tabId);
+          const live = typeof ctx.bridge.tabs === "function" ? ctx.bridge.tabs() : undefined;
+          if (orphaned && Array.isArray(live) && live.length > 1) {
+            return fail(
+              "This session's ComfyUI tab was replaced and multiple tabs are now open — " +
+                "can't safely pick one. Switch to the tab you want, then call " +
+                'panel_set_workflow_target({mode:"current"}) before panel_reload.',
+            );
+          }
           try {
             ctx.rebindToActiveTab();
           } catch (err) {
@@ -1984,7 +2160,34 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             return fail(err);
           }
         }
-        const target = ctx.workflowTarget.set(ctx.tabId, { mode, path, filename });
+        // PIN: bind to the EXACT open-workflow identity from the authoritative
+        // workflow_list, canonicalizing to its stable `key` and FAILING CLOSED when
+        // the requested workflow isn't actually open — instead of letting the panel
+        // silently route the pin to another tab (#259). Indeterminate lists (older
+        // panel / no `workflows` array) fall back to the raw path (unchanged).
+        let pinPath = path;
+        let pinFilename = filename;
+        if (mode === "pinned" && path) {
+          const resolved = await resolveOpenWorkflow(ctx, path);
+          if (resolved === NOT_OPEN) {
+            return fail(
+              `Cannot pin to "${path}" — it is not open in ComfyUI. Open it first ` +
+                `(panel_open_workflow) or pick an open workflow from panel_list_workflows, ` +
+                `then pin. (Refusing to pin to a workflow that isn't open so graph edits ` +
+                `never land on the wrong tab.)`,
+            );
+          }
+          if (resolved) {
+            // Canonicalize to the stable key so routing survives rename/reconnect.
+            pinPath = resolved.key ?? resolved.path ?? path;
+            pinFilename = filename ?? resolved.filename ?? resolved.path;
+          }
+        }
+        const target = ctx.workflowTarget.set(ctx.tabId, {
+          mode,
+          path: pinPath,
+          filename: pinFilename,
+        });
         ctx.bridge.push({ type: "workflow_target", target }, ctx.tabId);
         const hint =
           target.mode === "pinned"
@@ -2234,10 +2437,18 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       { padding: z.number().optional().describe("Margin around the graph in px (default 60).") },
       async (args: A, ctx) => {
         try {
-          const res = (await ctx.bridge.send(
+          ctx.ensureReachable?.();
+          // Route to the same authoritative target as ctx.call: a pinned session
+          // screenshots the PINNED workflow (via injected workflow_path), not just
+          // whatever tab is visible (codex — graph_* must carry the pin).
+          const target = ctx.workflowTarget?.get(ctx.tabId);
+          const cmd = withWorkflowTarget(
             { cmd: "graph_screenshot", padding: args.padding },
-            { tabId: ctx.tabId },
-          )) as {
+            target ?? { mode: "current" },
+          );
+          const res = (await ctx.bridge.send(cmd as { cmd: string }, {
+            tabId: ctx.tabId,
+          })) as {
             image?: string;
             mimeType?: string;
           };
