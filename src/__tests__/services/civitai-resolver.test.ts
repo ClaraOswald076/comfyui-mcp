@@ -207,6 +207,49 @@ describe("civitai request error surfacing (distinct failure modes)", () => {
     );
   });
 
+  it("an abort DURING the body read is classified as a timeout, NOT a non-JSON bot-gate", async () => {
+    // Headers arrived (2xx), then the connection aborts while draining the body.
+    const abortErr = Object.assign(new Error("The operation was aborted."), {
+      name: "AbortError",
+    });
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => {
+        throw abortErr;
+      },
+      text: async () => "",
+    } as unknown as Response);
+    await expect(resolveCivitaiModelVersion(1)).rejects.toThrow(/timed out/i);
+    // Distinctly NOT the non-JSON category.
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => {
+        throw abortErr;
+      },
+      text: async () => "",
+    } as unknown as Response);
+    await expect(resolveCivitaiModelVersion(1)).rejects.not.toThrow(/non-JSON/i);
+  });
+
+  it("a network failure DURING the body read is classified as unreachable, NOT non-JSON", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => {
+        throw new TypeError("terminated");
+      },
+      text: async () => "",
+    } as unknown as Response);
+    await expect(resolveCivitaiModelVersion(1)).rejects.toThrow(
+      /unreachable.*network error/i,
+    );
+  });
+
   it("applies a request timeout signal to every civitai fetch", async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ id: 1, files: [] }));
     await resolveCivitaiModelVersion(1);
@@ -665,9 +708,14 @@ describe("fetchCivitaiTopCreators", () => {
     expect(hits[1].thumbs_up).toBeUndefined();
   });
 
-  it("throws ModelError on a bot-gate 401", async () => {
+  it("bot-gate 401 reads as 'auth required', NOT 'your token is invalid' — the leaderboard sends no token even when one is configured", async () => {
+    config.civitaiApiToken = "a-valid-v1-token"; // configured, but NOT sent here
     fetchMock.mockResolvedValueOnce(jsonResponse({}, 401));
-    await expect(fetchCivitaiTopCreators()).rejects.toBeInstanceOf(ModelError);
+    const err = await fetchCivitaiTopCreators().catch((e) => e);
+    expect(err).toBeInstanceOf(ModelError);
+    // Must NOT blame the configured token, since this request never sent it.
+    expect(err.message).toMatch(/requires authentication.*set CIVITAI_API_TOKEN/i);
+    expect(err.message).not.toMatch(/invalid or expired/i);
   });
 
   it("fails FAST when CIVITAI_ENABLED=0 (kill-switch, #127)", async () => {
