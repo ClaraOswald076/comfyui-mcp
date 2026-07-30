@@ -201,6 +201,30 @@ describe("downloadModel cache", () => {
     await expect(readFile(target, "utf-8")).resolves.toBe("full body from server");
   });
 
+  it("REFUSES an UNSOLICITED partial 206 on a FRESH request — never finalizes a short prefix (#467 P0)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://example.com/models/unsolicited206.safetensors";
+    // Fresh request (no seeded partial → no Range sent). A misbehaving server/proxy
+    // answers with 206 bytes 0-1023/4096 and Content-Length 1024. Deriving the size
+    // from Content-Length (1024) instead of the Content-Range total (4096) would let
+    // a 1 KiB prefix be finalized into cache as the whole 4096-byte model.
+    fetchMock.mockResolvedValueOnce(
+      new Response("A".repeat(1024), {
+        status: 206,
+        statusText: "Partial Content",
+        headers: { "content-range": "bytes 0-1023/4096", "content-length": "1024" },
+      }),
+    );
+
+    await expect(
+      downloadModel(url, "checkpoints", "unsolicited206-out.safetensors"),
+    ).rejects.toThrow(/no Range|unsolicited|206/i);
+
+    // The short prefix must NOT have been renamed into the cache as a complete file.
+    const cached = await readdir(cacheDir).catch(() => [] as string[]);
+    expect(cached.some((f) => f.endsWith(".safetensors"))).toBe(false);
+  });
+
   it("rejects a truncated download (Content-Length exceeds bytes received) instead of reporting success (#343)", async () => {
     // Stream body yields only "short" (5 bytes) but the server claims 1000 —
     // pipeline() resolves on the early end, so without the size check this would

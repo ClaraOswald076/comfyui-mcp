@@ -585,6 +585,23 @@ async function streamUrlToFile(
     }
   }
 
+  // A 206 to a request we did NOT range (a FRESH download, or a no-validator
+  // decline — effectiveResume === 0, no Range sent) is UNSOLICITED and unsafe: its
+  // body is only a partial slice, but the "w"/Content-Length path below would
+  // finalize that short prefix as a complete file (e.g. `bytes 0-1023/4096` with
+  // Content-Length 1024 → a 1 KiB file renamed into cache as the whole 4096-byte
+  // model). Refuse it — a no-Range request must be answered with 200 (#467 P0).
+  if (res.status === 206 && effectiveResume === 0) {
+    await safeRm(targetPath);
+    if (resumable) await safeRm(validatorSidecar);
+    throw new ModelError(
+      `Download failed: the server returned "206 Partial Content" to a request that sent NO Range ` +
+        `header. An unsolicited partial response can't be finalized as a complete file (it would ` +
+        `silently truncate the model). Removed any partial; retry.`,
+      { url: logUrl, status: res.status },
+    );
+  }
+
   // Decide append vs truncate based on the response. We only append when we
   // actually asked for a range (effectiveResume > 0, i.e. we had a validator)
   // AND the server honoured it with a 206. Any other 2xx (typically 200) means
@@ -972,7 +989,11 @@ async function reserveExclusiveTemp(base: string, tag: string): Promise<string> 
  *  new name; copy-falling-back there is what truncates a stale hardlinked temp and
  *  poisons a cache inode, #467 P1-A) and NOT other errors (propagate). */
 function isHardlinkUnsupported(code: unknown): boolean {
-  return code === "EXDEV" || code === "EPERM" || code === "ENOSYS" || code === "EACCES";
+  // ONLY genuine "hardlinks aren't usable here" codes: cross-device (EXDEV), the FS
+  // doesn't support links (ENOSYS/EPERM — some Windows/network FS). NOT EACCES — an
+  // ACL denial is a real permission error that must propagate, not silently copy
+  // (#467 P2).
+  return code === "EXDEV" || code === "EPERM" || code === "ENOSYS";
 }
 
 /** Rename `tmp` over `targetPath`. On POSIX, rename atomically replaces an existing
