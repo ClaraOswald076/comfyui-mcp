@@ -107,6 +107,125 @@ export function rebootConfirmed(res: ToolResult): boolean {
   }
 }
 
+/**
+ * True when a comfy_reboot ToolResult is an ERROR whose text is the EXPECTED
+ * connection drop of a server going down (the reboot handler exits the instant it
+ * accepts the request, so the browser tab's socket dies before it can ack). This
+ * is the SUCCESS signal of a reboot, NOT a failure — the bridge surfaces it as a
+ * mid-command "OUTCOME UNKNOWN" / "disconnected" / "not open" / "did not reply"
+ * error. Distinguished from a genuine refusal, which comes back as a NON-error
+ * ToolResult carrying `rebooting:false` (handled by rebootConfirmed instead).
+ */
+export function rebootDropped(res: ToolResult): boolean {
+  if (!res?.isError) return false;
+  const text = res?.content?.find((c) => c.type === "text")?.text ?? "";
+  // Match ONLY signals that the command we JUST sent (comfy_reboot) died IN
+  // FLIGHT — i.e. the reboot was accepted and the origin went down before it
+  // could ack. The bridge's mutating-command mid-flight drop is the canonical
+  // one ("disconnected mid-command … OUTCOME UNKNOWN", ui-bridge.ts), plus raw
+  // socket resets. Deliberately NOT matched: pre-dispatch / generic errors like
+  // "is not open" (socket already closed BEFORE we sent — no reboot happened),
+  // "did not reply within N ms" (a live-but-frozen/backgrounded tab), and the
+  // idempotent-read "genuinely gone" grace expiry. Treating those as a reboot
+  // would risk a FALSE success (claiming a restart that never fired) once an
+  // unrelated tab reconnection makes readiness pass. Those return verbatim.
+  return /disconnected mid-command|OUTCOME UNKNOWN|ECONNRESET|socket hang up|premature close|other side closed|ECONNABORTED|EPIPE/i.test(
+    text,
+  );
+}
+
+interface PanelRebootTiming {
+  /** Grace pause after the reboot fires before probing (lets the origin go down). */
+  settleMs: number;
+  /** Total readiness budget — generous, a real restart can take 15–60s+. */
+  budgetMs: number;
+  /** Interval between readiness probes. */
+  intervalMs: number;
+  /** Per-probe timeout for the bridge readiness call. */
+  probeTimeoutMs: number;
+}
+
+let panelRebootTimingOverride: PanelRebootTiming | null = null;
+
+function parsePositiveNumberEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw == null || raw === "") return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function getPanelRebootTiming(): PanelRebootTiming {
+  if (panelRebootTimingOverride) return panelRebootTimingOverride;
+  return {
+    settleMs: Math.round(parsePositiveNumberEnv("COMFYUI_PANEL_REBOOT_SETTLE_S", 3) * 1000),
+    budgetMs: Math.round(parsePositiveNumberEnv("COMFYUI_PANEL_REBOOT_BUDGET_S", 120) * 1000),
+    intervalMs: Math.round(parsePositiveNumberEnv("COMFYUI_PANEL_REBOOT_INTERVAL_S", 2) * 1000),
+    probeTimeoutMs: Math.round(parsePositiveNumberEnv("COMFYUI_PANEL_REBOOT_PROBE_S", 5) * 1000),
+  };
+}
+
+/** The default generous readiness budget, in seconds — reported to callers. */
+export function panelRebootBudgetSeconds(): number {
+  return Math.round(getPanelRebootTiming().budgetMs / 1000);
+}
+
+export const __panelToolsTestHooks = {
+  /** Inject fast reboot-readiness timing so tests don't wait the real ~120s budget. */
+  setPanelRebootTiming(timing: PanelRebootTiming | null): void {
+    panelRebootTimingOverride = timing;
+  },
+};
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+interface PanelReadyResult {
+  ready: boolean;
+  waited_ms: number;
+  attempts: number;
+}
+
+/**
+ * Poll the panel bridge until ComfyUI is reachable again after a reboot. Each probe
+ * is a lightweight `nodes_queue_status` round-trip (via ctx.call, which never
+ * throws — it returns an isError ToolResult while the tab/backend is down and
+ * auto-heals onto the reconnected tab once it returns). Resolves ready:true on the
+ * first successful probe (with how long recovery took), or ready:false when the
+ * server never comes back within the bounded budget.
+ */
+async function waitForPanelReady(
+  ctx: PanelToolCtx,
+  timing: PanelRebootTiming,
+): Promise<PanelReadyResult> {
+  if (timing.settleMs > 0) await sleep(timing.settleMs);
+  const start = Date.now();
+  // Enforce an ABSOLUTE wall-clock deadline so the total wait honours budgetMs —
+  // NOT budgetMs/intervalMs iterations that each also burn a probe timeout + a
+  // sleep (which would overrun the advertised bound several-fold). Each probe and
+  // each inter-probe sleep is capped by the time remaining.
+  const deadline = start + timing.budgetMs;
+  // Clamp interval to a floor so a 0/tiny env value can't hot-loop unbounded —
+  // UNLESS a test override is active (tests inject small deterministic values).
+  const intervalMs = panelRebootTimingOverride
+    ? Math.max(1, timing.intervalMs)
+    : Math.max(250, timing.intervalMs);
+  let attempts = 0;
+  for (;;) {
+    const remaining = deadline - Date.now();
+    const probeTimeoutMs = Math.max(1, Math.min(timing.probeTimeoutMs, remaining));
+    const probe = await ctx.call({ cmd: "nodes_queue_status" }, probeTimeoutMs);
+    attempts++;
+    if (!probe.isError) {
+      return { ready: true, waited_ms: Date.now() - start, attempts };
+    }
+    const left = deadline - Date.now();
+    if (left <= 0) break;
+    await sleep(Math.min(intervalMs, left));
+  }
+  return { ready: false, waited_ms: Date.now() - start, attempts };
+}
+
 const slotRef = z.union([z.string(), z.number().int().min(0)]);
 
 // CivitAI browsing-level bitmask values: PG=1, PG-13=2, R=4, X=8, XXX=16.
@@ -2074,6 +2193,26 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           return ok("Cancelled — ComfyUI was not restarted.");
         }
         const res = await ctx.call({ cmd: "comfy_reboot", force: force === true }, 15000);
+
+        // Classify the reboot dispatch:
+        //  - CONFIRMED (rebooting:true): the panel acked before it went down.
+        //  - EXPECTED DROP: the reboot handler exits the instant it accepts the
+        //    request, so ComfyUI (and the tab it serves) goes down before it can
+        //    ack — the bridge surfaces that as a mid-command "OUTCOME UNKNOWN" /
+        //    disconnected error. That dropped connection IS the success signal of a
+        //    reboot, NOT a failure (#493, panel #222/#263/#266/#306/#307).
+        //  - REFUSAL: a busy-guard / Manager-forbidden / no-endpoint refusal comes
+        //    back as a NON-error ToolResult with `rebooting:false` — the server is
+        //    still up and was NOT restarted; return it verbatim and touch nothing.
+        const fired = rebootConfirmed(res);
+        const dropped = !fired && rebootDropped(res);
+        if (!fired && !dropped) {
+          // Genuine refusal (or an unrelated error) — do NOT poll or reset caches.
+          // Resetting on a refusal would close the shared client mid-generation
+          // (codex WS-3 finding #2).
+          return res;
+        }
+
         // A panel/Manager reboot restarts ComfyUI out-of-band from the MCP
         // process-control path, so the orchestrator's WebSocket client and its
         // memoized /object_info survive the restart and go stale: get_node_info
@@ -2081,17 +2220,35 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // placement (#353/#378/#394), and newly installed nodes stay invisible
         // (#357). The reboot is the triggering event — drop both caches so the
         // next call refetches against the fresh server.
-        //
-        // BUT `ctx.call` returns a ToolResult (it does NOT throw), and the panel
-        // replies `rebooting:false` when it REFUSES (busy guard, Manager forbids,
-        // no endpoint). Only invalidate on a CONFIRMED `rebooting:true` — resetting
-        // on a refusal would close the shared client mid-generation (codex WS-3
-        // finding #2).
-        if (rebootConfirmed(res)) {
-          resetClient();
-          resetObjectInfoCache();
+        resetClient();
+        resetObjectInfoCache();
+
+        // The reboot has FIRED. The connection drop is EXPECTED, not an error — do
+        // not surface it as a false timeout/failure. Instead poll readiness (a
+        // lightweight nodes_queue_status round-trip that auto-heals onto the
+        // reconnected tab) up to a generous bound and report SUCCESS once ComfyUI
+        // is reachable again, with how long recovery took. Only report FAILURE if
+        // it genuinely never comes back within the budget — a truly-dead server
+        // still fails honestly.
+        const timing = getPanelRebootTiming();
+        const recovery = await waitForPanelReady(ctx, timing);
+        if (!recovery.ready) {
+          return fail(
+            `Reboot was triggered but ComfyUI did not come back within ${Math.round(
+              timing.budgetMs / 1000,
+            )}s (${recovery.attempts} probes). Check the host — is ComfyUI-Manager restarting it? ` +
+              "Verify with panel_node_queue_status once a tab reconnects before retrying.",
+          );
         }
-        return res;
+        return ok({
+          rebooting: true,
+          ready: true,
+          recovered_ms: recovery.waited_ms,
+          probes: recovery.attempts,
+          note: `ComfyUI rebooted and came back ready in ${(recovery.waited_ms / 1000).toFixed(
+            1,
+          )}s${dropped ? " (connection dropped as expected while it went down)" : ""}.`,
+        });
       },
     ),
     def(
