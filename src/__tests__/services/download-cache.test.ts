@@ -933,6 +933,39 @@ describe("downloadModel cache", () => {
     expect(capB.box.d?.outcome).toBe("declined:no-validator");
   });
 
+  it("cloudPrincipalKey separates S3/Azure principals by EXPLICIT auth AND env creds (#467 P1-B)", async () => {
+    const { cloudPrincipalKey } = await import("../../services/storage/index.js");
+    const s3url = "s3://bucket/key.safetensors";
+    // Explicit different access keys → different principals.
+    const alice = cloudPrincipalKey(s3url, { s3: { access_key_id: "AK-ALICE", secret_access_key: "x" } });
+    const bob = cloudPrincipalKey(s3url, { s3: { access_key_id: "AK-BOB", secret_access_key: "x" } });
+    expect(alice).not.toBe(bob);
+    expect(alice).toBeTruthy();
+
+    // ENV-derived creds also participate (the cross-principal-leak fix): an
+    // env-authenticated principal must differ from anonymous.
+    const prev = process.env.AWS_ACCESS_KEY_ID;
+    process.env.AWS_ACCESS_KEY_ID = "AK-FROM-ENV";
+    const envKey = cloudPrincipalKey(s3url, {});
+    delete process.env.AWS_ACCESS_KEY_ID;
+    const anonKey = cloudPrincipalKey(s3url, {});
+    if (prev !== undefined) process.env.AWS_ACCESS_KEY_ID = prev;
+    expect(envKey).not.toBe(anonKey);
+
+    // Azure env connection-string participates too.
+    const azUrl = "https://acct.blob.core.windows.net/c/blob.bin";
+    const prevAz = process.env.AZURE_STORAGE_CONNECTION_STRING;
+    process.env.AZURE_STORAGE_CONNECTION_STRING = "AccountName=acct;AccountKey=KKK==";
+    const azEnv = cloudPrincipalKey(azUrl, {});
+    delete process.env.AZURE_STORAGE_CONNECTION_STRING;
+    const azAnon = cloudPrincipalKey(azUrl, {});
+    if (prevAz !== undefined) process.env.AZURE_STORAGE_CONNECTION_STRING = prevAz;
+    expect(azEnv).not.toBe(azAnon);
+
+    // A non-cloud URL contributes no cloud discriminator.
+    expect(cloudPrincipalKey("https://example.com/x.safetensors", {})).toBe("");
+  });
+
   it("materializes concurrent same-destination DIFFERENT-representation downloads without poisoning either cache entry (#467)", async () => {
     const { downloadWithCache } = await import("../../services/download-cache.js");
     await fsPromises.mkdir(cacheDir, { recursive: true });

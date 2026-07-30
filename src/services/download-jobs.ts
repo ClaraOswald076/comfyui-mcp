@@ -71,6 +71,18 @@ interface Entry {
 // is shared by all its keys.
 const jobs = new Map<string, Entry>();
 
+// Per-DESTINATION-PATH serialization chain (#467 P1-C). Two concurrent jobs for
+// the SAME on-disk destination with DIFFERENT auth are (correctly) distinct jobs
+// with distinct representations — but they both materialize to that ONE path, and
+// each runs post-download work (onComplete) against it. Running them concurrently
+// lets one job's writer replace the destination WHILE the other's onComplete reads
+// it — so Alice's callback could process Bob's bytes. We serialize by the auth-free
+// destination path so each job's download+materialize+onComplete sees ITS OWN bytes
+// uninterrupted; the final on-disk file is deterministically the last-started job's
+// (inherent: one path can hold one file). Keyed by the resolved targetPath (LOCAL
+// downloads only — the Manager writes server-side and has no local race).
+const destChains = new Map<string, Promise<void>>();
+
 /**
  * Point `key` at `entry`, ENTRY-SCOPED (#420 codex round 3, rule 2/3): never clobber
  * a row currently owned by a DIFFERENT, still-in-flight writer — that would orphan a
@@ -205,8 +217,10 @@ export async function startDownloadJob(
   // front, exactly as the write would reject it.
   const reqKey = requestDownloadKey(url, targetSubfolder, filename, auth);
   let destKey: string | undefined;
+  let destPath: string | undefined;
   if (!dispatchToManager) {
     const target = await resolveDownloadTarget(url, targetSubfolder, filename);
+    destPath = target.targetPath;
     // Fold auth into the destination key too (#467 P1-A): two concurrent calls to
     // the SAME on-disk destination with DIFFERENT auth are DIFFERENT downloads
     // (different representations) and must NOT dedup to one writer/one job.
@@ -268,14 +282,23 @@ export async function startDownloadJob(
     started_at: Date.now(),
   };
 
+  // Serialize behind any in-flight job writing the SAME destination path (#467
+  // P1-C) so this job's download+materialize+onComplete run without a concurrent
+  // different-auth writer swapping the destination out from under its callback.
+  const priorSameDest = destPath ? destChains.get(destPath) : undefined;
+
   // The promise is stored, never left dangling — an unhandled rejection here
   // would take down the process on a simple 404.
   // The physical download reports its resume decision straight onto THIS job — no
   // shared keyed map, so it can never be misattributed to another job (#467).
-  const settled = downloadModel(url, targetSubfolder, filename, auth, dispatchToManager, (d) => {
-    job.resume = d;
-  })
-    .then(async (path) => {
+  const settled = (async () => {
+    // Wait for the prior same-destination job to fully finish (never fail THIS job
+    // because that one errored — swallow its result).
+    if (priorSameDest) await priorSameDest.catch(() => undefined);
+    try {
+      const path = await downloadModel(url, targetSubfolder, filename, auth, dispatchToManager, (d) => {
+        job.resume = d;
+      });
       job.path = path;
       if (onComplete) {
         // Post-processing must not turn a landed file into a failed download —
@@ -291,12 +314,22 @@ export async function startDownloadJob(
       }
       job.status = "done";
       job.finished_at = Date.now();
-    })
-    .catch((err: unknown) => {
+    } catch (err: unknown) {
       job.status = "error";
       job.error = err instanceof Error ? err.message : String(err);
       job.finished_at = Date.now();
+    }
+  })();
+
+  // Make THIS job the tail of its destination's serialization chain, and prune the
+  // chain entry once it's the last one to settle (bounded map).
+  if (destPath) {
+    const key = destPath;
+    destChains.set(key, settled);
+    void settled.finally(() => {
+      if (destChains.get(key) === settled) destChains.delete(key);
     });
+  }
 
   // Index under EVERY key (deduped) so any of them adopts this one writer. Uses the
   // entry-scoped registerKey guard so a fresh registration can never overwrite a row
@@ -328,4 +361,5 @@ export function listDownloadJobs(): DownloadJob[] {
 /** Test seam — the registry is process-global otherwise. */
 export function resetDownloadJobs(): void {
   jobs.clear();
+  destChains.clear();
 }

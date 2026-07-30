@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { ValidationError } from "../../utils/errors.js";
 import { isAzureBlobUrl, downloadAzureBlobToFile, uploadAzureBlobFile } from "./azure-blob.js";
 import { uploadHfFile } from "./hf.js";
@@ -17,6 +18,40 @@ export type UploadDestination =
 
 export function supportsCloudDownload(url: string): boolean {
   return isS3Url(url) || isAzureBlobUrl(url);
+}
+
+/**
+ * A short, stable discriminator for the EFFECTIVE cloud principal/endpoint that
+ * WOULD serve `url` right now — the explicit `auth` MERGED with the same
+ * environment fallbacks the real downloaders use (s3.ts makeS3Client,
+ * azure-blob.ts blobServiceClientFromEnv). Folded into the download cache identity
+ * (#467 P1-B) so a cache entry populated under one principal/endpoint can NEVER be
+ * served later under different or absent credentials (cross-principal leak): if the
+ * effective principal changes, the cache identity changes → cache miss → re-fetch.
+ *
+ * Secrets are hashed here and never leave this module in the clear. Empty string
+ * for a non-cloud URL (the caller omits it from the identity).
+ */
+export function cloudPrincipalKey(url: string, auth: CloudStorageAuth = {}): string {
+  let raw: string | undefined;
+  if (isS3Url(url)) {
+    const s3 = auth.s3;
+    const endpoint = s3?.endpoint ?? process.env.AWS_S3_ENDPOINT ?? "";
+    const region = s3?.region ?? process.env.AWS_REGION ?? "";
+    const accessKeyId = s3?.access_key_id ?? process.env.AWS_ACCESS_KEY_ID ?? "";
+    const secretAccessKey = s3?.secret_access_key ?? process.env.AWS_SECRET_ACCESS_KEY ?? "";
+    const sessionToken = s3?.session_token ?? process.env.AWS_SESSION_TOKEN ?? "";
+    raw = `s3\n${endpoint}\n${region}\n${accessKeyId}\n${secretAccessKey}\n${sessionToken}`;
+  } else if (isAzureBlobUrl(url)) {
+    // Azure download uses env creds (connection string, else account+key), else
+    // anonymous. The blob host already encodes the account (part of `url`), so the
+    // principal here is purely the env credential material.
+    const conn = process.env.AZURE_STORAGE_CONNECTION_STRING ?? "";
+    const account = process.env.AZURE_STORAGE_ACCOUNT ?? "";
+    const key = process.env.AZURE_STORAGE_KEY ?? "";
+    raw = `azure\n${conn}\n${account}\n${key}`;
+  }
+  return raw ? createHash("sha256").update(raw).digest("hex").slice(0, 16) : "";
 }
 
 export async function downloadCloudUrlToFile(

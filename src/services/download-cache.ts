@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
-import { createWriteStream } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { createWriteStream, constants as fsConstants } from "node:fs";
 import {
   copyFile,
   link,
@@ -22,6 +22,7 @@ import { redactUrlForLogs } from "./download-auth.js";
 import { reportDownloadProgress, type DownloadProgress } from "./download-progress.js";
 import type { ResumeReporter } from "./download-resume-diag.js";
 import {
+  cloudPrincipalKey,
   downloadCloudUrlToFile,
   supportsCloudDownload,
   type CloudStorageAuth,
@@ -200,24 +201,16 @@ function representationKey(headers: Record<string, string>): string {
  *  out via LRU when COMFYUI_LRU_CACHE_SIZE_GB is set, else are inert on disk). */
 const CACHE_NS = "v2";
 
-/** Discriminator for cloud (S3/Azure) credentials/endpoint. `storageAuth` selects
- *  a different client/credentials (and can select a different endpoint/bucket) for
- *  a `s3://`/azure URL, but it travels SEPARATELY from the HTTP headers — so
- *  without folding it in, an authenticated cloud download could populate a cache
- *  entry later served to an unauthenticated caller, or two distinct-auth cloud
- *  jobs could coalesce onto one transfer (#467). */
-function cloudAuthKey(storageAuth?: CloudStorageAuth): string {
-  if (!storageAuth || Object.keys(storageAuth).length === 0) return "";
-  return createHash("sha256").update(JSON.stringify(storageAuth)).digest("hex").slice(0, 12);
-}
-
 function cacheIdentity(
   url: string,
   headers: Record<string, string>,
   storageAuth?: CloudStorageAuth,
 ): string {
   const repr = representationKey(headers);
-  const cloud = cloudAuthKey(storageAuth);
+  // The EFFECTIVE cloud principal (explicit storageAuth MERGED with env creds/
+  // endpoint/region), not just explicit storageAuth — so an env-authenticated cloud
+  // entry can't be served later under different/absent creds (#467 P1-B).
+  const cloud = supportsCloudDownload(url) ? cloudPrincipalKey(url, storageAuth) : "";
   // Namespaced for BOTH authed and unauthed so neither can collide with a legacy
   // bare-URL entry of unknown auth provenance (#467 P1-C). Representation-affecting
   // HTTP headers AND cloud credentials each add a line so different auth can never
@@ -944,45 +937,34 @@ async function downloadIntoCache(
   }
 }
 
-let materializeSeq = 0;
+/** A cryptographically-random, unguessable temp path next to `base`. NOT a
+ *  predictable pid+counter name (#467 P1-A): a predictable name can collide with a
+ *  temp left by a crashed attempt or a reused PID, and — if that leftover is still
+ *  hardlinked to a cache inode — a non-exclusive create would truncate it and
+ *  corrupt that cache entry. Random + exclusive-create makes a collision effectively
+ *  impossible AND detectable (EEXIST), so we never write over a pre-existing file. */
+function randomTempPath(base: string, tag: string): string {
+  return `${base}.${tag}-${randomBytes(12).toString("hex")}.tmp`;
+}
 
-async function materializeCacheFile(
-  cachePath: string,
-  targetPath: string,
-): Promise<"hardlink" | "copy"> {
-  if (resolve(cachePath) === resolve(targetPath)) return "hardlink";
+/** True for a hardlink error that means "hardlinks aren't usable here" — the ONLY
+ *  case where copy-fallback is legitimate. NOT EEXIST (a name collision — retry a
+ *  new name; copy-falling-back there is what truncates a stale hardlinked temp and
+ *  poisons a cache inode, #467 P1-A) and NOT other errors (propagate). */
+function isHardlinkUnsupported(code: unknown): boolean {
+  return code === "EXDEV" || code === "EPERM" || code === "ENOSYS" || code === "EACCES";
+}
 
-  // Materialize ATOMICALLY via a unique temp entry + rename, never by writing
-  // directly at targetPath (#467). Two jobs materializing DIFFERENT representations
-  // to the SAME on-disk path can race: if one linked targetPath to its cache inode
-  // and the other then copyFile()'d over that path, the copy would write THROUGH
-  // the hardlink INTO the first job's cache inode — poisoning that cache entry with
-  // the other representation's bytes. Building in a fresh temp (a hardlink to, or a
-  // copy of, our OWN cache inode) and renaming over targetPath keeps every cache
-  // inode read-only from here and makes the final swap atomic (last-writer-wins on
-  // the destination only, never on a cache entry).
-  const tmp = `${targetPath}.mat-${process.pid}-${materializeSeq++}.tmp`;
-  let mode: "hardlink" | "copy";
-  try {
-    await downloadCacheFs.link(cachePath, tmp);
-    mode = "hardlink";
-  } catch {
-    try {
-      await downloadCacheFs.copyFile(cachePath, tmp);
-    } catch (e) {
-      // A partial copy could linger — clean the temp before propagating.
-      await downloadCacheFs.rm(tmp, { force: true }).catch(() => undefined);
-      throw e;
-    }
-    mode = "copy";
-  }
+/** Rename `tmp` over `targetPath`, with a Windows EPERM-over-existing rm+retry.
+ *  The temp already holds the fully-materialized bytes, so the brief gap where the
+ *  DESTINATION is absent is safe (it's the destination, not a cache inode, and
+ *  last-writer-wins on it is the intended concurrent semantics). Cleans `tmp` if
+ *  the swap ultimately fails. */
+async function renameTempOverDestination(tmp: string, targetPath: string): Promise<void> {
   try {
     await downloadCacheFs.rename(tmp, targetPath);
+    return;
   } catch {
-    // Windows can EPERM when renaming OVER an existing (or hardlinked) target —
-    // remove it and retry. The temp already holds the fully-materialized bytes, so
-    // the brief gap where targetPath is absent is safe: it's the DESTINATION, not a
-    // cache inode, and last-writer-wins on it is the intended concurrent semantics.
     await downloadCacheFs.rm(targetPath, { force: true }).catch(() => undefined);
     try {
       await downloadCacheFs.rename(tmp, targetPath);
@@ -991,7 +973,53 @@ async function materializeCacheFile(
       throw err;
     }
   }
-  return mode;
+}
+
+const MATERIALIZE_TEMP_ATTEMPTS = 5;
+
+async function materializeCacheFile(
+  cachePath: string,
+  targetPath: string,
+): Promise<"hardlink" | "copy"> {
+  if (resolve(cachePath) === resolve(targetPath)) return "hardlink";
+
+  // Materialize ATOMICALLY into an UNGUESSABLE, EXCLUSIVELY-created temp, then
+  // rename over targetPath — never write directly at targetPath, and never reuse a
+  // possibly-stale temp name (#467 P1-A). Two jobs materializing DIFFERENT
+  // representations to the SAME path can race; building each in its own random temp
+  // (a hardlink to, or an EXCLUSIVE copy of, our OWN cache inode) keeps every cache
+  // inode read-only here and makes the final swap atomic (last-writer-wins on the
+  // destination only, never a cache entry).
+  for (let attempt = 1; ; attempt++) {
+    const tmp = randomTempPath(targetPath, "mat");
+    let mode: "hardlink" | "copy";
+    try {
+      await downloadCacheFs.link(cachePath, tmp);
+      mode = "hardlink";
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      // Name collision → pick a fresh random name (never copy-fall-back onto a
+      // possibly-stale, possibly-cache-hardlinked temp).
+      if (code === "EEXIST") {
+        if (attempt >= MATERIALIZE_TEMP_ATTEMPTS) throw err;
+        continue;
+      }
+      // Only fall back to copy when hardlinks genuinely aren't usable here.
+      if (!isHardlinkUnsupported(code)) throw err;
+      try {
+        // EXCLUSIVE copy: fail (EEXIST) rather than truncate a pre-existing file.
+        await downloadCacheFs.copyFile(cachePath, tmp, fsConstants.COPYFILE_EXCL);
+      } catch (e) {
+        const ecode = (e as NodeJS.ErrnoException)?.code;
+        await downloadCacheFs.rm(tmp, { force: true }).catch(() => undefined);
+        if (ecode === "EEXIST" && attempt < MATERIALIZE_TEMP_ATTEMPTS) continue;
+        throw e;
+      }
+      mode = "copy";
+    }
+    await renameTempOverDestination(tmp, targetPath);
+    return mode;
+  }
 }
 
 async function evictLruIfNeeded(): Promise<void> {
@@ -1063,13 +1091,15 @@ export async function downloadWithCache(
       url: logUrl,
       error: err instanceof Error ? err.message : String(err),
     });
-    // Write to a UNIQUE temp then rename over the destination — NEVER stream "w"
-    // directly at targetPath (#467). If a concurrent materialize already hardlinked
-    // targetPath to a cache inode, a direct "w" open would follow that hardlink and
-    // overwrite the OTHER representation's cache entry with these bytes (poison).
-    // A fresh temp is its own inode, and rename only swaps the directory entry — so
-    // cache inodes stay intact and a failed stream leaves the destination untouched.
-    const tmp = `${options.targetPath}.dl-${process.pid}-${materializeSeq++}.tmp`;
+    // Write to an UNGUESSABLE temp then rename over the destination — NEVER stream
+    // "w" directly at targetPath (#467). If a concurrent materialize already
+    // hardlinked targetPath to a cache inode, a direct "w" open would follow that
+    // hardlink and overwrite the OTHER representation's cache entry with these bytes
+    // (poison). A random fresh temp is its own inode, and rename only swaps the
+    // directory entry — so cache inodes stay intact and a failed stream leaves the
+    // destination untouched. Random (not pid+counter) so a stale/reused-PID temp
+    // can't be silently truncated (#467 P1-A).
+    const tmp = randomTempPath(options.targetPath, "dl");
     try {
       await downloadUrlToFile(
         options.url,
@@ -1079,14 +1109,7 @@ export async function downloadWithCache(
         options.storageAuth,
         options.progress,
       );
-      try {
-        await downloadCacheFs.rename(tmp, options.targetPath);
-      } catch {
-        // Windows can EPERM renaming over an existing/hardlinked target — remove it
-        // (breaking any cache hardlink WITHOUT writing through it) and retry.
-        await downloadCacheFs.rm(options.targetPath, { force: true }).catch(() => undefined);
-        await downloadCacheFs.rename(tmp, options.targetPath);
-      }
+      await renameTempOverDestination(tmp, options.targetPath);
     } catch (e) {
       await downloadCacheFs.rm(tmp, { force: true }).catch(() => undefined);
       throw e;
