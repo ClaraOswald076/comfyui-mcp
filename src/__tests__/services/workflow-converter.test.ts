@@ -401,4 +401,58 @@ describe("convertUiToApi — asset-combo fallback (issue #407)", () => {
     expect(workflow["54"].inputs.unet_name).toBe("flux-2-klein-9b.safetensors");
     expect(warnings.some((w) => /missing-asset/.test(w))).toBe(false);
   });
+
+  it("keeps the declared value for an EXTENSIONLESS asset combo (DiffusersLoader.model_path)", () => {
+    // DiffusersLoader lists extensionless directory names — no file extension to
+    // key off, so detection must fall back to the asset-widget-name allowlist.
+    const info = {
+      DiffusersLoader: {
+        input: {
+          required: {
+            model_path: [["installed-diffusers-dir", "another-dir"]],
+          },
+        },
+      },
+    } as never;
+    const ui = {
+      nodes: [
+        {
+          id: 1,
+          type: "DiffusersLoader",
+          mode: 0,
+          inputs: [],
+          outputs: [],
+          widgets_values: ["krea-turbo-diffusers"],
+        },
+      ],
+      links: [],
+    } as never;
+    const { workflow, warnings } = convertUiToApi(ui, info);
+    expect(workflow["1"].inputs.model_path).toBe("krea-turbo-diffusers");
+    expect(workflow["1"].inputs.model_path).not.toBe("installed-diffusers-dir");
+    expect(warnings.some((w) => /missing-asset/.test(w))).toBe(true);
+  });
+
+  it("keeps the declared value for a .pt2 checkpoint (extension coverage)", () => {
+    const info = {
+      CheckpointLoaderSimple: {
+        input: { required: { ckpt_name: [["installed.pt2", "other.pt2"]] } },
+      },
+    } as never;
+    const ui = {
+      nodes: [
+        {
+          id: 1,
+          type: "CheckpointLoaderSimple",
+          mode: 0,
+          inputs: [],
+          outputs: [],
+          widgets_values: ["not-installed.pt2"],
+        },
+      ],
+      links: [],
+    } as never;
+    const { workflow } = convertUiToApi(ui, info);
+    expect(workflow["1"].inputs.ckpt_name).toBe("not-installed.pt2");
+  });
 });

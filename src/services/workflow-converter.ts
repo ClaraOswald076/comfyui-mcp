@@ -91,11 +91,39 @@ function isPositionalWidgetSpec(spec: unknown): boolean {
  * to the first option is harmless.
  */
 const ASSET_FILE_RE =
-  /\.(safetensors|ckpt|pt|pth|bin|gguf|sft|onnx|vae|pkl|npz|safetensor)$/i;
+  /\.(safetensors|safetensor|sft|ckpt|pt|pt2|pth|bin|gguf|onnx|vae|pkl|npz|yaml)$/i;
 
 function looksLikeAssetFilename(value: unknown): boolean {
   return typeof value === "string" && ASSET_FILE_RE.test(value.trim());
 }
+
+/**
+ * Widget names that are ALWAYS server-side asset selectors, even when their
+ * options carry no file extension (e.g. DiffusersLoader.model_path lists
+ * extensionless directory names). Substituting a different entry here silently
+ * swaps the user's model, so these must never take the comboOpts[0] fallback.
+ * Deliberately excludes enum-shaped "_name" widgets (sampler_name, scheduler)
+ * whose first-option fallback is legitimate.
+ */
+const ASSET_WIDGET_NAMES = new Set([
+  "ckpt_name",
+  "unet_name",
+  "vae_name",
+  "lora_name",
+  "clip_name",
+  "clip_name1",
+  "clip_name2",
+  "clip_name3",
+  "clip_name4",
+  "control_net_name",
+  "controlnet_name",
+  "style_model_name",
+  "gligen_name",
+  "hypernetwork_name",
+  "clip_vision_name",
+  "model_path",
+  "diffusion_model",
+]);
 
 /**
  * Check if an input has control_after_generate in its spec config.
@@ -1247,6 +1275,7 @@ export function convertUiToApi(
         !comboOpts.includes(value as never)
       ) {
         const isAssetCombo =
+          ASSET_WIDGET_NAMES.has(name) ||
           looksLikeAssetFilename(value) ||
           comboOpts.some((opt) => looksLikeAssetFilename(opt));
         if (isAssetCombo) {
