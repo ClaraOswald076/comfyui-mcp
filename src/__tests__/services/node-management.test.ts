@@ -33,6 +33,9 @@ vi.mock("../../config.js", () => {
 
 // Mock child_process for the cm-cli subprocess paths.
 vi.mock("node:child_process", () => ({
+  // execFile is needed at module load: workspace-env (pulled in transitively via
+  // comfy-cli) calls promisify(execFile) at top level.
+  execFile: vi.fn(),
   execFileSync: vi.fn(),
   spawnSync: vi.fn(() => ({
     status: 0,

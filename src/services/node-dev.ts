@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { config } from "../config.js";
+import { resolveEffectiveComfyUIBase } from "./workspace-env.js";
 import {
   assertSafeRepoName,
   nonInteractiveGitEnv,
@@ -281,14 +281,23 @@ function assertNoWindowsHazards(raw: string): void {
 }
 
 export function customNodesRoot(): string {
-  if (!config.comfyuiPath) {
+  // Resolve the effective LOCAL ComfyUI base the same way every other
+  // filesystem-backed tool does: COMFYUI_PATH first, then the saved default
+  // workspace (set via set_default_workspace) when COMFYUI_PATH is unset. This
+  // is what get_environment / get_workspace already report, so custom-node
+  // source tools no longer reject a loopback session that has a saved default
+  // workspace as if it were remote (#506). Returns undefined only in remote
+  // mode or when no local install is known — then we refuse with a clear error.
+  const base = resolveEffectiveComfyUIBase();
+  if (!base) {
     throw new NodeDevError(
-      "This operation requires a local ComfyUI install, but config.comfyuiPath " +
-        "is not set (running in remote --comfyui-url mode). Set COMFYUI_PATH to " +
-        "your local ComfyUI directory to read, search, or edit custom-node source.",
+      "This operation requires a local ComfyUI install, but none is configured " +
+        "(COMFYUI_PATH is unset, no saved default workspace, or running in remote " +
+        "--comfyui-url mode). Set COMFYUI_PATH or a default workspace " +
+        "(set_default_workspace) to read, search, or edit custom-node source.",
     );
   }
-  return resolve(config.comfyuiPath, "custom_nodes");
+  return resolve(base, "custom_nodes");
 }
 
 function isEscape(root: string, candidate: string): boolean {

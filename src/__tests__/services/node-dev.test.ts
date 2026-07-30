@@ -17,8 +17,21 @@ vi.mock("../../config.js", () => {
   const config: { comfyuiPath: string | undefined; githubToken?: string } = {
     comfyuiPath: undefined,
   };
-  return { config, getComfyUIBaseUrl: () => "http://127.0.0.1:8188" };
+  return {
+    config,
+    getComfyUIBaseUrl: () => "http://127.0.0.1:8188",
+    isRemoteMode: () => false,
+  };
 });
+
+// Control the effective LOCAL base node-dev resolves through, so #506's
+// saved-default-workspace behavior is exercised without touching real user
+// config. resolveEffectiveComfyUIBase() prefers COMFYUI_PATH then the saved
+// default; the mock mirrors that: config.comfyuiPath first, else wsMock.saved.
+const wsMock = vi.hoisted(() => ({ saved: undefined as string | undefined }));
+vi.mock("../../services/workspace-env.js", () => ({
+  resolveEffectiveComfyUIBase: () => config.comfyuiPath ?? wsMock.saved,
+}));
 
 import { config } from "../../config.js";
 import {
@@ -80,6 +93,7 @@ beforeEach(() => {
   customNodes = join(workspace, "custom_nodes");
   mkdirSync(customNodes, { recursive: true });
   config.comfyuiPath = workspace;
+  wsMock.saved = undefined;
   delete process.env.COMFYUI_MCP_ALLOW_GIT_WRITES;
 });
 
@@ -150,9 +164,21 @@ describe("resolveInJail", () => {
     expect(() => resolveInJail("junction/loot.txt")).toThrow(NodeDevError);
   });
 
-  it("refuses when comfyuiPath is unset (remote mode)", () => {
+  it("refuses when no local install is configured (remote mode, no saved default)", () => {
     config.comfyuiPath = undefined;
+    wsMock.saved = undefined;
     expect(() => resolveInJail("MyPack")).toThrow(/local ComfyUI install/);
+  });
+
+  it("resolves against the saved default workspace when COMFYUI_PATH is unset (#506)", () => {
+    // No COMFYUI_PATH, but a saved default workspace is set — a loopback session
+    // must be treated as local, mirroring get_environment/get_workspace, instead
+    // of being rejected as remote.
+    config.comfyuiPath = undefined;
+    wsMock.saved = workspace;
+    mkdirSync(join(customNodes, "MyPack"), { recursive: true });
+    const { rel } = resolveInJail("MyPack");
+    expect(rel).toBe("MyPack");
   });
 });
 

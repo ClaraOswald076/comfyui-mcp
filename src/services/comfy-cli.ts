@@ -2,6 +2,19 @@ import * as childProcess from "node:child_process";
 import { existsSync } from "node:fs";
 import { delimiter, dirname, extname, join } from "node:path";
 import { config } from "../config.js";
+import { resolveEffectiveComfyUIBase } from "./workspace-env.js";
+
+/**
+ * The LOCAL ComfyUI workspace a comfy-cli invocation should target when the
+ * caller passed no explicit `workspace`. Prefers COMFYUI_PATH, then the saved
+ * default workspace (set via set_default_workspace) when COMFYUI_PATH is unset —
+ * so the workspace-venv `comfy` and `--workspace` routing keep working from the
+ * saved default without COMFYUI_PATH (#506/#403). Never returns a local path in
+ * remote mode (resolveEffectiveComfyUIBase already enforces that).
+ */
+function defaultWorkspace(): string | null {
+  return config.comfyuiPath ?? resolveEffectiveComfyUIBase() ?? null;
+}
 
 export interface ComfyCliError {
   code: string;
@@ -136,7 +149,7 @@ export function resolveComfyCliExecutable(options: { refresh?: boolean; workspac
     return existsSync(explicit) ? explicit : null;
   }
 
-  const workspace = options.workspace ?? config.comfyuiPath;
+  const workspace = options.workspace ?? defaultWorkspace();
   for (const candidate of workspaceCandidates(workspace)) {
     if (existsSync(candidate)) {
       return candidate;
@@ -157,7 +170,7 @@ export function resolveComfyCliExecutable(options: { refresh?: boolean; workspac
 
 function buildArgs(args: readonly string[], options: ComfyCliRunOptions): string[] {
   const result = ["--json"];
-  const workspace = options.workspace === undefined ? config.comfyuiPath : options.workspace;
+  const workspace = options.workspace === undefined ? defaultWorkspace() : options.workspace;
   if (workspace) result.push("--workspace", workspace);
   if (options.where) result.push("--where", options.where);
   result.push("--skip-prompt", ...args);
@@ -416,6 +429,18 @@ function getExecutableVersion(executable: string): string | null {
 export function getComfyCliVersion(options: { workspace?: string | null } = {}): string | null {
   const executable = resolveComfyCliExecutable({ workspace: options.workspace });
   return executable ? getExecutableVersion(executable) : null;
+}
+
+/**
+ * Whether a usable comfy-cli (found AND version-supported) is available for the
+ * given workspace. A found-but-unrecognized/too-old CLI is NOT usable — read-only
+ * tools treat that identically to "absent" so they can fall back to the connected
+ * server instead of surfacing `unsupported_version` (#487).
+ */
+export function isComfyCliUsable(options: { workspace?: string | null } = {}): boolean {
+  const executable = resolveComfyCliExecutable({ workspace: options.workspace });
+  if (!executable) return false;
+  return isSupportedComfyCliVersion(getExecutableVersion(executable));
 }
 
 export function isSupportedComfyCliVersion(version: string | null): boolean {

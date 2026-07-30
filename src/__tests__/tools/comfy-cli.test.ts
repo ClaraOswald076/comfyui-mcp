@@ -5,12 +5,14 @@ const mocks = vi.hoisted(() => ({
   run: vi.fn(),
   resolve: vi.fn(() => "/bin/comfy"),
   version: vi.fn(() => "1.11.1"),
+  usable: vi.fn(() => true),
 }));
 
 vi.mock("../../services/comfy-cli.js", () => ({
   runComfyCli: mocks.run,
   resolveComfyCliExecutable: mocks.resolve,
   getComfyCliVersion: mocks.version,
+  isComfyCliUsable: mocks.usable,
   assertComfyCliOk: (envelope: { ok: boolean }) => {
     if (!envelope.ok) throw new Error("failed");
     return envelope;
@@ -58,6 +60,8 @@ describe("comfy-cli MCP command construction", () => {
     mocks.resolve.mockReset();
     mocks.resolve.mockReturnValue("/bin/comfy");
     mocks.version.mockClear();
+    mocks.usable.mockReset();
+    mocks.usable.mockReturnValue(true);
     fallbackMocks.fallback.mockReset();
   });
 
@@ -90,6 +94,45 @@ describe("comfy-cli MCP command construction", () => {
       ["jobs", "wait", "a", "b", "--timeout", "30"],
       expect.objectContaining({ where: "cloud", timeoutMs: 40_000 }),
     );
+  });
+
+  it("accepts the documented singular promptId for jobs wait (#360)", async () => {
+    await handlers().get("comfy_cli_jobs")!({
+      action: "wait",
+      promptId: "p1",
+      timeoutSeconds: 20,
+      where: "local",
+    });
+    expect(mocks.run).toHaveBeenCalledWith(
+      ["jobs", "wait", "p1", "--timeout", "20"],
+      expect.objectContaining({ where: "local" }),
+    );
+  });
+
+  it("still rejects jobs wait with neither promptId, promptIds, nor all (#360)", async () => {
+    const result = await handlers().get("comfy_cli_jobs")!({ action: "wait", where: "local" });
+    expect(result.isError).toBe(true);
+    expect(mocks.run).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the live server for models listing when comfy-cli is present but an unsupported version (#487)", async () => {
+    // comfy-cli resolves to an executable, but its version is unrecognized/too
+    // old — read-only listing must fall back rather than surface unsupported_version.
+    mocks.resolve.mockReturnValue("/bin/comfy");
+    mocks.usable.mockReturnValue(false);
+    fallbackMocks.fallback.mockResolvedValue({
+      command: "models list-folder loras",
+      data: { folder: "loras", count: 1, files: ["x.safetensors"] },
+    });
+    const result = await handlers().get("comfy_cli_models")!({
+      action: "list-folder",
+      folder: "loras",
+      where: "local",
+    });
+    expect(mocks.run).not.toHaveBeenCalled();
+    expect(fallbackMocks.fallback).toHaveBeenCalledWith(expect.objectContaining({ action: "list-folder" }));
+    const parsed = JSON.parse((result.content[0] as { text: string }).text);
+    expect(parsed).toMatchObject({ ok: true, source: "local_models" });
   });
 
   it("constructs workflow validation and execution flags", async () => {
@@ -126,6 +169,7 @@ describe("comfy-cli MCP command construction", () => {
 
   it("falls back to the live server for local listing when comfy-cli is absent (#460)", async () => {
     mocks.resolve.mockReturnValue(undefined); // comfy-cli not on PATH
+    mocks.usable.mockReturnValue(false);
     fallbackMocks.fallback.mockResolvedValue({
       command: "models list-folders",
       data: { folders: ["checkpoints", "loras"] },
