@@ -246,23 +246,41 @@ async function touch(path: string): Promise<void> {
   await downloadCacheFs.utimes(path, now, now);
 }
 
-/** Read a persisted resume validator (ETag / Last-Modified) or null if absent.
- *  Best-effort: a missing/unreadable sidecar just means "resume without an
- *  If-Range guard" — never fatal. */
-async function readValidatorSidecar(path: string): Promise<string | null> {
+/** A parsed resume sidecar: the change-detection validator (ETag / X-Linked-Etag /
+ *  Last-Modified) and, when the first attempt knew it, the AUTHORITATIVE full-file
+ *  size. The size lets a later resume reject a 206 whose Content-Range total
+ *  DISAGREES with what the original response declared — a server that understates
+ *  the total on resume (e.g. `bytes 4-7/8` for a file first seen as 4096) can no
+ *  longer finalize a short prefix as complete (#467). */
+interface ResumeSidecar {
+  validator: string;
+  total?: number;
+}
+
+/** Read the resume sidecar (line 1 = validator, optional line 2 = total) or null.
+ *  Best-effort: a missing/unreadable sidecar just means "resume without an If-Range
+ *  guard" — never fatal. Backward compatible with pre-total single-line sidecars. */
+async function readValidatorSidecar(path: string): Promise<ResumeSidecar | null> {
   try {
-    const raw = (await readFile(path, "utf-8")).trim();
-    return raw.length > 0 ? raw : null;
+    const raw = await readFile(path, "utf-8");
+    const lines = raw.split("\n");
+    const validator = (lines[0] ?? "").trim();
+    if (validator.length === 0) return null;
+    const total = lines.length > 1 ? Number(lines[1].trim()) : NaN;
+    return Number.isFinite(total) && total > 0 ? { validator, total } : { validator };
   } catch {
     return null;
   }
 }
 
-/** Persist the resume validator next to a .partial. Best-effort — a failure
- *  here only costs us the change-detection guard on a later resume. */
-async function writeValidatorSidecar(path: string, value: string): Promise<void> {
+/** Persist the resume validator (+ authoritative total when known) next to a
+ *  .partial. Best-effort — a failure here only costs the change-detection guard on
+ *  a later resume. The validator is a single-line header value; the optional total
+ *  goes on line 2. */
+async function writeValidatorSidecar(path: string, value: string, total?: number): Promise<void> {
   try {
-    await writeFile(path, value, "utf-8");
+    const body = typeof total === "number" && total > 0 ? `${value}\n${total}` : value;
+    await writeFile(path, body, "utf-8");
   } catch {
     /* best effort */
   }
@@ -377,10 +395,14 @@ async function streamUrlToFile(
   // refuse the append ourselves if they differ (belt-and-braces on top of the
   // origin's If-Range: we never trust a CAS 206 whose upstream object changed).
   let priorValidator: string | null = null;
+  // The authoritative full-file size the ORIGINAL response declared (persisted in
+  // the sidecar), if known — a resume 206 whose Content-Range total DISAGREES with
+  // this is a server understating the size, and must be refused (#467).
+  let priorTotal: number | undefined;
   if (resumeFromBytes > 0) {
-    priorValidator = resumable
-      ? await readValidatorSidecar(validatorSidecar)
-      : null;
+    const sidecar = resumable ? await readValidatorSidecar(validatorSidecar) : null;
+    priorValidator = sidecar?.validator ?? null;
+    priorTotal = sidecar?.total;
     if (priorValidator) {
       currentHeaders = {
         ...currentHeaders,
@@ -594,10 +616,11 @@ async function streamUrlToFile(
   if (res.status === 206 && effectiveResume === 0) {
     await safeRm(targetPath);
     if (resumable) await safeRm(validatorSidecar);
+    const cleared = await partialConfirmedDiscarded(targetPath);
     throw new ModelError(
       `Download failed: the server returned "206 Partial Content" to a request that sent NO Range ` +
         `header. An unsolicited partial response can't be finalized as a complete file (it would ` +
-        `silently truncate the model). Removed any partial; retry.`,
+        `silently truncate the model). ${cleared ? "Removed any partial; retry." : "Could not remove the partial — delete it manually and retry."}`,
       { url: logUrl, status: res.status },
     );
   }
@@ -643,6 +666,21 @@ async function streamUrlToFile(
           `consistent Content-Range "bytes ${effectiveResume}-<end>/<total>" reaching the end of ` +
           `the file, but the server sent ${contentRange ? `"${contentRange}"` : "no Content-Range"}. ` +
           `Refusing to append (would corrupt or truncate the file). Removed the partial; retry.`,
+        { url: logUrl, status: res.status },
+      );
+    }
+    // Cross-check the 206's total against the AUTHORITATIVE size the ORIGINAL
+    // response declared (persisted in the sidecar). A server that understates the
+    // total on resume — e.g. `bytes 4-7/8` for a file first seen as 4096 — would
+    // otherwise let a short prefix finalize as "complete" (#467). Refuse the
+    // mismatch (also catches a partial we already have that exceeds the new total).
+    if (priorTotal !== undefined && total !== priorTotal) {
+      await safeRm(targetPath);
+      await safeRm(validatorSidecar);
+      throw new ModelError(
+        `Download resume rejected: the server now reports a total size of ${total} bytes, but the ` +
+          `original download recorded ${priorTotal}. The upstream size changed — appending would ` +
+          `corrupt or truncate the file. Removed the partial; retry.`,
         { url: logUrl, status: res.status },
       );
     }
@@ -712,9 +750,13 @@ async function streamUrlToFile(
     // The file is now confirmed truncated (we threw otherwise), so a new validator
     // can never pair with a stale prefix (#343). Prefer the final response's
     // validator; fall back to one captured off the redirect chain (HF Xet: the CAS
-    // 200 has none, but the resolve 302 carried X-Linked-Etag).
+    // 200 has none, but the resolve 302 carried X-Linked-Etag). Persist the
+    // AUTHORITATIVE full-file size (this restart response is a full 200, so its
+    // Content-Length IS the total) so a later resume can reject a 206 that
+    // understates it (#467).
     const validator = extractValidator(res) || redirectValidator;
-    if (validator) await writeValidatorSidecar(validatorSidecar, validator);
+    const fullTotal = Number(res.headers.get("content-length")) || undefined;
+    if (validator) await writeValidatorSidecar(validatorSidecar, validator, fullTotal);
   } else if (appendMode) {
     // A resume was actually taken (validated 206 append). Record it so
     // download_status can report the partial was reused, not discarded (#467).

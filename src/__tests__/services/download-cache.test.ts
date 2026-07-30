@@ -447,6 +447,32 @@ describe("downloadModel cache", () => {
     await expect(stat(partial)).rejects.toThrow();
   });
 
+  it("REFUSES a resume 206 whose total UNDERSTATES the size the original download recorded (#467)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://example.com/models/shrink.safetensors";
+    const { partial, sidecar } = await cachePaths(url);
+    await writeFile(partial, "AAAA"); // 4 bytes already downloaded
+    // Sidecar records the validator AND the authoritative total the ORIGINAL 200
+    // declared (4096). A resume 206 that claims a SMALLER total is a server
+    // understating the size — must be refused (would finalize a short prefix).
+    await writeFile(sidecar, '"etag-v1"\n4096');
+
+    // Internally-consistent but understated 206: bytes 4-7/8 (total 8 ≠ 4096).
+    fetchMock.mockResolvedValueOnce(
+      new Response("BBBB", {
+        status: 206,
+        statusText: "Partial Content",
+        headers: { "content-range": "bytes 4-7/8" },
+      }),
+    );
+
+    await expect(
+      downloadModel(url, "checkpoints", "shrink-out.safetensors"),
+    ).rejects.toThrow(/total size|reports a total|resume rejected/i);
+    // The stale partial + sidecar are removed so a retry restarts clean.
+    await expect(stat(partial)).rejects.toThrow();
+  });
+
   it("does NOT resume a validator-less partial — restarts cleanly instead of appending (#343 edge)", async () => {
     await fsPromises.mkdir(cacheDir, { recursive: true });
     const url = "https://example.com/models/novalidator.safetensors";
@@ -538,9 +564,10 @@ describe("downloadModel cache", () => {
     ).rejects.toThrow(/truncat/i);
 
     // Previously NO sidecar was written (final CAS 200 has no validator) so the
-    // partial could never resume. Now the redirect's X-Linked-Etag is captured.
+    // partial could never resume. Now the redirect's X-Linked-Etag is captured,
+    // plus the authoritative total on line 2 (#467).
     await expect(stat(partial)).resolves.toBeTruthy();
-    await expect(readFile(sidecar, "utf-8")).resolves.toBe('"xet-content-hash-v1"');
+    await expect(readFile(sidecar, "utf-8")).resolves.toBe('"xet-content-hash-v1"\n1000');
   });
 
   it("forwards Range across a cross-origin CAS redirect and APPENDS a 206 (HF Xet resume) (#467)", async () => {
@@ -750,9 +777,10 @@ describe("downloadModel cache", () => {
       downloadModel(url, "checkpoints", "sidecar-out.safetensors"),
     ).rejects.toThrow(/truncat/i);
 
-    // The validator was captured and PAIRS with the truncated partial bytes.
+    // The validator was captured and PAIRS with the truncated partial bytes, with
+    // the authoritative total (Content-Length 1000) on line 2 (#467).
     await expect(stat(partial)).resolves.toBeTruthy();
-    await expect(readFile(sidecar, "utf-8")).resolves.toBe('"captured-v9"');
+    await expect(readFile(sidecar, "utf-8")).resolves.toBe('"captured-v9"\n1000');
   });
 
   it("REJECTS + removes an OVERSIZED 206 that streams MORE than its Content-Range total (#467 P0-1)", async () => {
