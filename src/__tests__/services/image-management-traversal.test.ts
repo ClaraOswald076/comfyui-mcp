@@ -28,7 +28,7 @@ vi.mock("../../comfyui/client.js", () => ({
 }));
 
 import { getOutputImage, listOutputImages } from "../../services/image-management.js";
-import { ValidationError } from "../../utils/errors.js";
+import { ValidationError, ComfyUIError } from "../../utils/errors.js";
 
 beforeEach(() => {
   mockConfig.comfyuiPath = "/comfy";
@@ -151,6 +151,39 @@ describe("getOutputImage — path-traversal sanitisation (CWE-22)", () => {
       getOutputImage("hero.png", "output", "video/../.."),
     ).rejects.toBeInstanceOf(ValidationError);
     expect(fetchImageMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("getOutputImage — non-image /view payloads (issue #385)", () => {
+  // ComfyUI (or a proxy) can answer /view with a 200 whose body is a JSON/HTML
+  // error page or is empty — most often for a `type=input` ref that doesn't
+  // resolve to a real input file. The old code saved those bytes as a `.png`
+  // and returned a corrupt inline image, so the MCP client choked decoding it
+  // ("Unexpected end of JSON input"). It must now throw a structured not-found.
+
+  it("throws IMAGE_NOT_FOUND when /view returns a JSON error body for an input ref", async () => {
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from('{"error":"not found"}').toString("base64"),
+      mimeType: "application/json",
+    });
+    const err = await getOutputImage("06.png", "input", "qwen").catch((e) => e);
+    expect(err).toBeInstanceOf(ComfyUIError);
+    expect(err.code).toBe("IMAGE_NOT_FOUND");
+  });
+
+  it("throws IMAGE_NOT_FOUND when /view returns an empty body", async () => {
+    fetchImageMock.mockResolvedValue({ base64: "", mimeType: "image/png" });
+    await expect(
+      getOutputImage("06.png", "input", "qwen"),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("still resolves for a genuine image payload", async () => {
+    // (mock default is image/png with real bytes)
+    await expect(getOutputImage("06.png", "input", "qwen")).resolves.toMatchObject({
+      mimeType: "image/png",
+      filename: "06.png",
+    });
   });
 });
 

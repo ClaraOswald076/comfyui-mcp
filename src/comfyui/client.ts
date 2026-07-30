@@ -570,7 +570,17 @@ export async function fetchImage(
   const params = new URLSearchParams({ filename, type, subfolder });
   const res = await client.fetchApi(`/view?${params.toString()}`);
   if (!res.ok) {
-    throw new Error(`ComfyUI /view returned ${res.status} for "${filename}"`);
+    const where = subfolder ? `${type}/${subfolder}` : type;
+    throw new ComfyUIError(
+      `ComfyUI /view returned ${res.status} for "${filename}" (${where}). ` +
+        (res.status === 404
+          ? `No such file in the ComfyUI ${type} directory` +
+            (subfolder ? ` under subfolder "${subfolder}"` : "") +
+            `. Check the filename/subfolder (e.g. via list_output_images or get_history).`
+          : `The ComfyUI server rejected the request.`),
+      res.status === 404 ? "IMAGE_NOT_FOUND" : "VIEW_ERROR",
+      { status: res.status, filename, type, subfolder },
+    );
   }
   const contentType = res.headers.get("content-type") ?? "image/png";
   const mimeType = contentType.split(";")[0].trim();

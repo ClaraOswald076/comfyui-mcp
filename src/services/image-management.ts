@@ -2,7 +2,7 @@ import { readFile, copyFile, readdir, stat } from "node:fs/promises";
 import { join, basename, extname, relative, sep } from "node:path";
 import { config, isRemoteMode } from "../config.js";
 import { getHistory } from "../comfyui/client.js";
-import { ValidationError, ModelError } from "../utils/errors.js";
+import { ValidationError, ModelError, ComfyUIError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { resolveOutputDir, resolveInputDir } from "./output-dir.js";
 
@@ -455,6 +455,29 @@ export async function getOutputImage(
 ): Promise<{ base64: string; mimeType: string; filename: string }> {
   assertSafeViewRef(filename, subfolder);
   const result = await fetchImage(filename, type, subfolder);
+
+  // Guard against non-image /view payloads. ComfyUI (or a reverse proxy in
+  // front of it) can answer /view with a 200 whose body is actually a JSON or
+  // HTML error page, or an empty body — this happens most often for `type=input`
+  // refs, where the caller picked a filename/subfolder that doesn't resolve to a
+  // real input file. The old code saved those bytes verbatim as a `.png` and
+  // returned them as an inline image block, so the MCP client then choked trying
+  // to decode them ("Unexpected end of JSON input"). Fail loudly and structured
+  // instead, so get_image surfaces a clean not-found rather than a corrupt image.
+  const mime = result.mimeType.toLowerCase();
+  const isImage = mime.startsWith("image/");
+  if (!isImage || result.base64.length === 0) {
+    const where = subfolder ? `${type}/${subfolder}` : type;
+    throw new ComfyUIError(
+      `ComfyUI /view did not return an image for "${filename}" (${where}); ` +
+        `got ${result.base64.length === 0 ? "an empty response" : `content-type "${result.mimeType}"`}. ` +
+        `The file may not exist in the ComfyUI ${type} directory — ` +
+        `check the filename/subfolder (e.g. via list_output_images or get_history).`,
+      "IMAGE_NOT_FOUND",
+      { filename, type, subfolder, mimeType: result.mimeType },
+    );
+  }
+
   return { ...result, filename };
 }
 
