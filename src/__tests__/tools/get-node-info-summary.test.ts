@@ -6,8 +6,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 // whose enum dropdowns embed the entire local model list (100s of KB per node).
 
 const getObjectInfoMock = vi.fn();
+const resetObjectInfoCacheMock = vi.fn();
+const backfillObjectInfoMock = vi.fn(async (oi: unknown) => oi);
 vi.mock("../../comfyui/client.js", () => ({
   getObjectInfo: (...a: unknown[]) => getObjectInfoMock(...a),
+  resetObjectInfoCache: (...a: unknown[]) => resetObjectInfoCacheMock(...a),
+  backfillObjectInfo: (...a: unknown[]) => backfillObjectInfoMock(...a),
 }));
 
 import { registerWorkflowComposeTools, summarizeNodeDef } from "../../tools/workflow-compose.js";
@@ -53,6 +57,9 @@ const loaderDef: ComfyUINodeDef = {
 
 beforeEach(() => {
   getObjectInfoMock.mockReset();
+  resetObjectInfoCacheMock.mockReset();
+  backfillObjectInfoMock.mockReset();
+  backfillObjectInfoMock.mockImplementation(async (oi: unknown) => oi);
   getObjectInfoMock.mockResolvedValue({ CheckpointLoaderSimple: loaderDef });
 });
 
@@ -109,6 +116,52 @@ describe("get_node_info >20 matches (unchanged name-list behavior)", () => {
     expect(parsed.count).toBe(25);
     expect(parsed.nodes[0]).not.toHaveProperty("input_required");
     expect(parsed.hint).toMatch(/more specific/);
+  });
+});
+
+describe("get_node_info stale-cache refresh (#404)", () => {
+  it("refreshes the bulk snapshot once and finds a node the stale cache lacked", async () => {
+    // First read returns the STALE snapshot (pre-install, no DetectorForNSFW).
+    // After the tool invalidates the cache, the refetch returns the LIVE server's
+    // snapshot which registers the node.
+    const nsfwDef: ComfyUINodeDef = {
+      ...loaderDef,
+      name: "DetectorForNSFW",
+      display_name: "detector for the NSFW",
+    };
+    getObjectInfoMock
+      .mockResolvedValueOnce({ CheckpointLoaderSimple: loaderDef })
+      .mockResolvedValueOnce({
+        CheckpointLoaderSimple: loaderDef,
+        DetectorForNSFW: nsfwDef,
+      });
+
+    const handler = getHandler("get_node_info");
+    const res = await handler({ node_type: "DetectorForNSFW" });
+
+    expect(resetObjectInfoCacheMock).toHaveBeenCalledTimes(1);
+    expect(getObjectInfoMock).toHaveBeenCalledTimes(2);
+    const parsed = JSON.parse(res.content[0].text);
+    expect(parsed.count).toBe(1);
+    expect(parsed.nodes[0].name).toBe("DetectorForNSFW");
+    // Backfill is the last resort — never reached once the refresh found it.
+    expect(backfillObjectInfoMock).not.toHaveBeenCalled();
+  });
+
+  it("does not refresh when the first snapshot already matches", async () => {
+    const handler = getHandler("get_node_info");
+    const res = await handler({ node_type: "CheckpointLoader" });
+    expect(resetObjectInfoCacheMock).not.toHaveBeenCalled();
+    expect(getObjectInfoMock).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(res.content[0].text).count).toBe(1);
+  });
+
+  it("still reports missing when neither the refresh nor backfill finds it", async () => {
+    const handler = getHandler("get_node_info");
+    const res = await handler({ node_type: "TotallyAbsentNode" });
+    expect(resetObjectInfoCacheMock).toHaveBeenCalledTimes(1);
+    expect(backfillObjectInfoMock).toHaveBeenCalledTimes(1);
+    expect(res.content[0].text).toContain('No nodes found matching "TotallyAbsentNode"');
   });
 });
 

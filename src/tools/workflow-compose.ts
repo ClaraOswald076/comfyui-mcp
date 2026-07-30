@@ -7,7 +7,11 @@ import {
   TEMPLATE_NAMES,
   type ModifyOperation,
 } from "../services/workflow-composer.js";
-import { getObjectInfo, backfillObjectInfo } from "../comfyui/client.js";
+import {
+  getObjectInfo,
+  backfillObjectInfo,
+  resetObjectInfoCache,
+} from "../comfyui/client.js";
 import { errorToToolResult, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 
@@ -172,20 +176,33 @@ export function registerWorkflowComposeTools(server: McpServer): void {
         let entries = Object.entries(info);
         if (node_type) {
           const lower = node_type.toLowerCase();
-          entries = entries.filter(([name]) => name.toLowerCase().includes(lower));
+          const filterMatches = (oi: typeof info) =>
+            Object.entries(oi).filter(([name]) => name.toLowerCase().includes(lower));
+          entries = filterMatches(info);
 
-          // Some nodes register individually (`/object_info/<Type>` returns a
-          // schema) but are absent from the bulk `/object_info` payload — seen
-          // with controlnet_aux's DWPreprocessor and with V3-API packs like
-          // comfyui-qwenmultiangle whose nodes the live canvas and panel
-          // recognize but the bulk query omits (#357). When the substring
-          // filter finds nothing, try backfilling the exact type by its own
+          // A zero match often means our memoized bulk /object_info is STALE, not
+          // that the node is absent. The MCP invalidates the cache on its own
+          // managed restart, but a node installed + ComfyUI restarted out-of-band
+          // (Manager UI or the desktop app) never triggers that path, so a
+          // newly-registered node like `DetectorForNSFW` stays invisible even
+          // though the live server reports it (#404). Refresh the bulk snapshot
+          // ONCE against the live server and re-filter before concluding it's
+          // missing.
+          if (entries.length === 0) {
+            resetObjectInfoCache();
+            info = await getObjectInfo();
+            entries = filterMatches(info);
+          }
+
+          // Still nothing: some nodes register individually (`/object_info/<Type>`
+          // returns a schema) but are absent from the bulk `/object_info` payload
+          // — seen with controlnet_aux's DWPreprocessor and with V3-API packs like
+          // comfyui-qwenmultiangle whose nodes the live canvas and panel recognize
+          // but the bulk query omits (#357). Backfill the exact type by its own
           // endpoint before reporting it missing.
           if (entries.length === 0) {
             info = await backfillObjectInfo(info, [node_type]);
-            entries = Object.entries(info).filter(([name]) =>
-              name.toLowerCase().includes(lower),
-            );
+            entries = filterMatches(info);
           }
         }
 
