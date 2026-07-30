@@ -71,6 +71,7 @@ describe("download_model tool", () => {
       "x.safetensors",
       auth,
       false, // routing decision threaded through (local, #420 codex round 1)
+      expect.any(String), // resumeKey — representation-aware diagnostic slot (#467 P2)
     );
     expect(res.isError).toBeFalsy();
   });

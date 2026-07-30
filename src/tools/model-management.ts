@@ -237,7 +237,7 @@ export function registerModelManagementTools(server: McpServer): void {
           // Only THIS attempt's diagnostic can be present: startDownloadJob clears
           // any earlier decision for the tray id when a fresh job starts (#467 P2),
           // so a stale discard from an earlier attempt can't be misattributed here.
-          const diag = getResumeDiagnostic(j.trayId);
+          const diag = getResumeDiagnostic(j.resumeKey);
           let resumeNote = "";
           if (diag && diag.outcome !== "resumed") {
             const gb = (diag.discardedBytes / 1024 ** 3).toFixed(2);

@@ -234,6 +234,7 @@ describe("download_civitai_model", () => {
       "cool.safetensors",
       undefined,
       false, // routing decision threaded through (local, #420 codex round 1)
+      expect.any(String), // resumeKey — representation-aware diagnostic slot (#467 P2)
     );
     expect(res.isError).toBeFalsy();
     expect(res.content[0].text).toContain("Cool Model");
@@ -258,6 +259,7 @@ describe("download_civitai_model", () => {
       "v.safetensors",
       undefined,
       false, // routing decision threaded through (local, #420 codex round 1)
+      expect.any(String), // resumeKey — representation-aware diagnostic slot (#467 P2)
     );
     expect(res.isError).toBeFalsy();
   });
@@ -296,6 +298,7 @@ describe("download_civitai_model", () => {
       "custom.safetensors",
       undefined,
       false, // routing decision threaded through (local, #420 codex round 1)
+      expect.any(String), // resumeKey — representation-aware diagnostic slot (#467 P2)
     );
   });
 

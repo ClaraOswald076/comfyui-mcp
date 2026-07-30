@@ -747,6 +747,10 @@ export async function downloadModel(
    * evaluate the predicate themselves.
    */
   dispatchToManager?: boolean,
+  /** Representation-aware slot for the resume diagnostic, threaded from the job
+   *  so download_status reads THIS download's decision (#467 P2). Omitted by
+   *  direct callers, which fall back to the URL tray id. */
+  resumeKey?: string,
 ): Promise<string> {
   // Region flags (issue #127) applied at THE choke point every download path
   // funnels through (local disk AND the remote Manager dispatch below).
@@ -816,6 +820,7 @@ export async function downloadModel(
       logUrl,
       storageAuth: auth?.type === "s3" ? { s3: auth } : undefined,
       progress,
+      resumeKey,
     });
   } catch (err) {
     // Surface a failed row in the tray, then rethrow for the tool to report.

@@ -20,7 +20,7 @@ import { ModelError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { redactUrlForLogs } from "./download-auth.js";
 import { reportDownloadProgress, type DownloadProgress } from "./download-progress.js";
-import { recordResumeDiagnostic } from "./download-resume-diag.js";
+import { recordResumeDiagnostic, trayIdForUrl } from "./download-resume-diag.js";
 // Re-export the resume-diagnostic read/reset API so existing importers of
 // download-cache keep working; the registry itself now lives in a dep-light
 // module (download-resume-diag) to avoid pulling storage/* into consumers' mocks.
@@ -61,6 +61,19 @@ async function fileSizeOrUndefined(path: string): Promise<number | undefined> {
     return typeof st?.size === "number" ? st.size : undefined;
   } catch {
     return undefined;
+  }
+}
+
+/** POSITIVELY true only when `path` is confirmed discarded — it no longer exists
+ *  (stat throws ENOENT) or exists but is empty (size 0). A non-ENOENT stat error
+ *  (a transient fs hiccup) or a still-present non-empty file returns false, so a
+ *  swallowed removal failure is never mistaken for a completed discard (#467). */
+async function partialConfirmedDiscarded(path: string): Promise<boolean> {
+  try {
+    const st = await stat(path);
+    return typeof st?.size === "number" && st.size === 0;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code === "ENOENT";
   }
 }
 
@@ -143,6 +156,10 @@ export interface DownloadCacheOptions {
   logUrl?: string;
   storageAuth?: CloudStorageAuth;
   progress?: ProgressMeta;
+  /** Representation-aware slot the resume diagnostic is recorded under, so
+   *  download_status reads THIS download's decision even when a concurrent
+   *  same-URL/different-auth download exists (#467 P2). Defaults to the URL tray id. */
+  resumeKey?: string;
 }
 
 export interface DownloadCacheResult {
@@ -252,7 +269,13 @@ async function streamUrlToFile(
   resumeFromBytes = 0,
   progress?: ProgressMeta,
   resumable = false,
+  /** Stable key the resume diagnostic is recorded under — threaded from the job
+   *  so download_status reads the SAME slot (representation-aware, #467 P2).
+   *  Defaults to the URL tray id for internal/direct callers. */
+  resumeKey?: string,
 ): Promise<void> {
+  // The slot this download's resume decision is recorded under.
+  const diagKey = resumeKey ?? trayIdForUrl(url);
   if (supportsCloudDownload(url)) {
     await downloadCloudUrlToFile(url, targetPath, storageAuth);
     // #343 edge: the S3/Azure path bypasses the HTTP size gate below. The cloud
@@ -483,12 +506,16 @@ async function streamUrlToFile(
       // change; unprovenCrossOrigin alone (no validator to compare) is merely
       // UNVERIFIABLE — report each honestly rather than always "changed".
       const why = provenChange
-        ? "the resolve redirect now points at a DIFFERENT content-addressed object (X-Linked-Etag changed)"
+        ? "the upstream now reports a DIFFERENT content-addressed object (X-Linked-Etag changed" +
+          (finalValidator !== null && finalValidator !== priorValidator
+            ? " on the final response"
+            : " on a redirect hop") +
+          ")"
         : "the resume crossed origins to a CDN that returned no content-addressed validator, so an unchanged upstream can't be proven";
       await safeRm(targetPath);
       await safeRm(validatorSidecar);
       recordResumeDiagnostic(
-        url,
+        diagKey,
         provenChange ? "declined:etag-changed" : "declined:unverifiable",
         resumeFromBytes,
       );
@@ -567,9 +594,11 @@ async function streamUrlToFile(
     // stream-open failure would leave them permanently. Confirm, then report.
     await safeRm(validatorSidecar);
     await safeRm(targetPath);
-    const stillOnDisk = await fileSizeOrUndefined(targetPath);
-    const discardConfirmed =
-      resumeFromBytes > 0 && (stillOnDisk === undefined || stillOnDisk === 0);
+    // POSITIVELY confirm the partial is gone (ENOENT) or truncated to empty —
+    // NOT merely "stat returned no number", which fileSizeOrUndefined also emits
+    // on a stat hiccup. A swallowed rm failure + a stat hiccup must NOT read as a
+    // confirmed discard (#467 P1-1): only a real ENOENT or size 0 counts.
+    const discardConfirmed = resumeFromBytes > 0 && (await partialConfirmedDiscarded(targetPath));
     if (discardConfirmed && requestedResume) {
       // Asked to resume (had a validator, sent Range+If-Range) but got a full 200
       // — the upstream changed OR the host doesn't support range resume. Either
@@ -580,7 +609,7 @@ async function streamUrlToFile(
           `upstream file changed, or the host doesn't support resuming — so re-downloading in full.`,
         { url: logUrl, discardedBytes: resumeFromBytes },
       );
-      recordResumeDiagnostic(url, "declined:full-response", resumeFromBytes);
+      recordResumeDiagnostic(diagKey, "declined:full-response", resumeFromBytes);
     } else if (discardConfirmed && resumeDeclinedNoValidator) {
       // A partial existed but no sidecar validator did, so we never even sent a
       // Range — a safe resume couldn't be verified (common on HF's Xet/CAS CDN,
@@ -593,7 +622,7 @@ async function streamUrlToFile(
           `(#343). Future downloads capture the validator from the resolve redirect so they CAN resume.`,
         { url: logUrl, discardedBytes: resumeFromBytes },
       );
-      recordResumeDiagnostic(url, "declined:no-validator", resumeFromBytes);
+      recordResumeDiagnostic(diagKey, "declined:no-validator", resumeFromBytes);
     }
     // Prefer the final response's validator; fall back to one captured off the
     // redirect chain (HF Xet: the CAS 200 has none, but the resolve 302 carried
@@ -603,7 +632,7 @@ async function streamUrlToFile(
   } else if (appendMode) {
     // A resume was actually taken (validated 206 append). Record it so
     // download_status can report the partial was reused, not discarded (#467).
-    recordResumeDiagnostic(url, "resumed", 0);
+    recordResumeDiagnostic(diagKey, "resumed", 0);
   }
 
   const nodeStream = Readable.fromWeb(res.body as import("node:stream/web").ReadableStream);
@@ -724,6 +753,7 @@ async function downloadIntoCache(
   logUrl?: string,
   storageAuth: CloudStorageAuth = {},
   progress?: ProgressMeta,
+  resumeKey?: string,
 ): Promise<string> {
   // Header-aware identity (#467 P1-2): a same-URL download with a different
   // Authorization/Cookie/API-key gets its OWN cache file, partial and in-flight
@@ -784,6 +814,7 @@ async function downloadIntoCache(
         resumeFromBytes,
         progress,
         true, // resumable: cache partials use the .partial + If-Range resume handshake
+        resumeKey,
       );
       await downloadCacheFs.rename(partial, target);
       await touch(target);
@@ -885,6 +916,7 @@ export async function downloadWithCache(
       logUrl,
       options.storageAuth,
       options.progress,
+      options.resumeKey,
     );
     const materializedBy = await materializeCacheFile(cachePath, options.targetPath);
     await evictLruIfNeeded();

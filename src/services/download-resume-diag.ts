@@ -45,24 +45,40 @@ export function trayIdForUrl(url: string): string {
   return createHash("sha256").update(url).digest("hex").slice(0, 16);
 }
 
+/** The key a resume diagnostic is stored under. It is the tray id (URL hash)
+ *  PLUS a per-representation discriminator when the caller supplied auth — so two
+ *  CONCURRENT same-URL downloads carrying DIFFERENT auth (now separate physical
+ *  cache downloads, #467 P1-2) record and read DISTINCT diagnostics instead of
+ *  clobbering each other. No auth ⇒ bare tray id, so the common case (and the
+ *  panel tray key) is unchanged. `authIdentity` is any stable per-caller string
+ *  (e.g. JSON of the DownloadAuth); the exact value only needs to be identical
+ *  between the recorder (streamUrlToFile) and the reader (download_status), which
+ *  is guaranteed by computing it ONCE per job and threading it to both. */
+export function resumeKeyFor(url: string, authIdentity?: string): string {
+  const tray = trayIdForUrl(url);
+  if (!authIdentity) return tray;
+  const disc = createHash("sha256").update(authIdentity).digest("hex").slice(0, 8);
+  return `${tray}:${disc}`;
+}
+
 export function recordResumeDiagnostic(
-  url: string,
+  key: string,
   outcome: ResumeOutcome,
   discardedBytes: number,
 ): void {
-  resumeDiagnostics.set(trayIdForUrl(url), { outcome, discardedBytes, at: Date.now() });
+  resumeDiagnostics.set(key, { outcome, discardedBytes, at: Date.now() });
 }
 
-/** Read the last resume decision for a download's tray id (or undefined).
+/** Read the last resume decision for a download's resume key (or undefined).
  *
- *  Keyed by tray id (URL hash), matching DownloadJob.trayId. Only THIS attempt's
- *  decision is ever present: startDownloadJob clears any earlier decision for the
- *  tray id when a fresh job starts (#467 P2), so a stale discard can't be
- *  misattributed to a later job. Concurrent same-URL jobs to different
- *  destinations are views of ONE physical cache download (the cache coalesces by
- *  the URL+representation identity), so sharing the decision is accurate. */
-export function getResumeDiagnostic(trayId: string): ResumeDiagnostic | undefined {
-  return resumeDiagnostics.get(trayId);
+ *  Keyed by the resume key (see resumeKeyFor), matching DownloadJob.resumeKey.
+ *  Only THIS attempt's decision is ever present: startDownloadJob clears the key
+ *  when a fresh job starts (#467 P2), so a stale discard can't be misattributed.
+ *  Two concurrent same-URL jobs with DIFFERENT auth get DISTINCT keys (they are
+ *  separate physical cache downloads); same-URL same-auth jobs to different
+ *  destinations share ONE physical download and one key — accurately. */
+export function getResumeDiagnostic(key: string): ResumeDiagnostic | undefined {
+  return resumeDiagnostics.get(key);
 }
 
 /** Clear any prior resume decision for a tray id. Called when a NEW download job

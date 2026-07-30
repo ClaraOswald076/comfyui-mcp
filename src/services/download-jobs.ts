@@ -21,7 +21,7 @@ import {
   shouldDispatchDownloadToManager,
 } from "./model-resolver.js";
 import type { DownloadAuth } from "./download-auth.js";
-import { clearResumeDiagnostic } from "./download-resume-diag.js";
+import { clearResumeDiagnostic, resumeKeyFor } from "./download-resume-diag.js";
 import { logger } from "../utils/logger.js";
 
 export interface DownloadJob {
@@ -34,6 +34,11 @@ export interface DownloadJob {
    *  Kept separate from `id` so distinct-destination jobs still read their live
    *  byte progress from the tray. */
   trayId: string;
+  /** Slot the resume diagnostic is recorded/read under (#467 P2). Tray id when
+   *  unauthenticated, else tray id + an auth discriminator — so a concurrent
+   *  same-URL download with DIFFERENT auth (a separate physical cache download)
+   *  gets its OWN resume decision instead of clobbering this one. */
+  resumeKey: string;
   url: string;
   target_subfolder: string;
   filename?: string;
@@ -232,14 +237,21 @@ export async function startDownloadJob(
     }
   }
 
+  // Representation-aware diagnostic slot: same URL + different auth ⇒ different
+  // physical cache download ⇒ different resume decision (#467 P2). The auth param
+  // is the per-caller differentiator (config-global tokens are identical across
+  // concurrent calls, so they need not enter the key).
+  const resumeKey = resumeKeyFor(url, auth ? JSON.stringify(auth) : undefined);
+
   // A fresh attempt: clear any resume decision left by an EARLIER attempt for the
-  // same URL so download_status can only ever surface THIS attempt's outcome (a
+  // same slot so download_status can only ever surface THIS attempt's outcome (a
   // per-attempt reset — robust where a timestamp compare isn't; #467 P2).
-  clearResumeDiagnostic(trayId);
+  clearResumeDiagnostic(resumeKey);
 
   const job: DownloadJob = {
     id,
     trayId,
+    resumeKey,
     url,
     target_subfolder: targetSubfolder,
     filename,
@@ -249,7 +261,7 @@ export async function startDownloadJob(
 
   // The promise is stored, never left dangling — an unhandled rejection here
   // would take down the process on a simple 404.
-  const settled = downloadModel(url, targetSubfolder, filename, auth, dispatchToManager)
+  const settled = downloadModel(url, targetSubfolder, filename, auth, dispatchToManager, resumeKey)
     .then(async (path) => {
       job.path = path;
       if (onComplete) {

@@ -802,6 +802,24 @@ describe("downloadModel cache", () => {
     await expect(readFile(two, "utf-8")).resolves.toBe("SHARED-BYTES");
   });
 
+  it("gives same-URL DIFFERENT-auth downloads DISTINCT resume-diagnostic slots (#467 P2)", async () => {
+    const { resumeKeyFor, recordResumeDiagnostic, getResumeDiagnostic, trayIdForUrl } =
+      await import("../../services/download-resume-diag.js");
+    const url = "https://example.com/models/p2.safetensors";
+    const kAlice = resumeKeyFor(url, JSON.stringify({ type: "bearer", token: "alice" }));
+    const kBob = resumeKeyFor(url, JSON.stringify({ type: "bearer", token: "bob" }));
+    // Different auth → different slots; no auth → the bare tray id (compat).
+    expect(kAlice).not.toBe(kBob);
+    expect(resumeKeyFor(url)).toBe(trayIdForUrl(url));
+
+    // A concurrent resume for Bob must NOT clobber Alice's declined-discard record.
+    recordResumeDiagnostic(kAlice, "declined:no-validator", 12345);
+    recordResumeDiagnostic(kBob, "resumed", 0);
+    expect(getResumeDiagnostic(kAlice)?.outcome).toBe("declined:no-validator");
+    expect(getResumeDiagnostic(kAlice)?.discardedBytes).toBe(12345);
+    expect(getResumeDiagnostic(kBob)?.outcome).toBe("resumed");
+  });
+
   it("never serves a 0-byte cache entry as a hit — re-downloads instead (#343 edge)", async () => {
     await fsPromises.mkdir(cacheDir, { recursive: true });
     const url = "https://example.com/models/zerohit.safetensors";
