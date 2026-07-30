@@ -65,6 +65,21 @@ const CUSTOM_NODE_FRAME =
 const ANY_FRAME =
   /(?:File\s*["']([^"']+?\.py)["']?,?\s*line\s*(\d+))|([^\s"',()]+?\.py):(\d+)/gi;
 
+/**
+ * True when a crash-signature hit sits inside a Python "Exception ignored in:"
+ * block — an exception raised inside a __del__/weakref callback during garbage
+ * collection. CPython PRINTS these but SWALLOWS them: the process keeps running
+ * and subsequent prompts execute normally, so they must NOT be classified as a
+ * process crash. Uses a bounded look-back (1200 chars) that stops at a blank
+ * line, so it cannot reach into an unrelated earlier block.
+ */
+function isSwallowedDestructorHit(text: string, index: number): boolean {
+  const from = Math.max(0, index - 1200);
+  const before = text.slice(from, index);
+  const cut = before.lastIndexOf("\n\n");
+  return /Exception ignored in:/i.test(cut >= 0 ? before.slice(cut) : before);
+}
+
 /** Basename of a path with either separator (no node:path needed for a string). */
 function baseName(p: string): string {
   const parts = p.split(/[\\/]+/);
@@ -89,13 +104,13 @@ export function parseCrashBlock(text: string): CrashParseResult {
   let anchor = -1;
   let sawSignature = false;
   for (const re of CRASH_SIGNATURES) {
-    const idx = text.search(re);
-    // search() finds the first; walk to the LAST via a global clone.
+    // Walk EVERY match via a global clone and take the LAST hit that is NOT
+    // inside a swallowed "Exception ignored in:" destructor block.
     const g = new RegExp(re.source, re.flags.includes("g") ? re.flags : re.flags + "g");
     let m: RegExpExecArray | null;
-    let last = idx;
+    let last = -1;
     while ((m = g.exec(text)) !== null) {
-      last = m.index;
+      if (!isSwallowedDestructorHit(text, m.index)) last = m.index;
       if (m.index === g.lastIndex) g.lastIndex++; // avoid zero-width loop
     }
     if (last >= 0) {
