@@ -6,6 +6,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.11] - 2026-07-30
+
+### MCP
+
+#### Fixed
+- the codex run-finished callback serializes a structured final-commit payload to readable text instead of `[object Object]`, and no longer overwrites the already-streamed reply when the final commit is empty/malformed (falls back to the streamed text) (#421 #422) (#443)
+- Krea 2 packs no longer declare ComfyUI-Manager as a custom-node dependency, so apply_manifest stops cloning a duplicate ComfyUI-Manager on Desktop installs where it's already present (#441) (#445)
+
+
 ## [0.48.10] - 2026-07-30
 
 ### MCP
