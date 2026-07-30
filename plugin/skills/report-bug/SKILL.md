@@ -149,18 +149,25 @@ Then file it (no need to ask):
       --data @"$BODY_JSON_FILE"); then
     URL=$(printf '%s' "$RESP" | sed -n 's/.*"url"[: ]*"\([^"]*\)".*/\1/p')
     # 2) Only poll if the submit lacked a url AND we actually got a job_id.
+    #    Mirrors the TS: keep polling ONLY while the Worker reports a well-formed
+    #    queued/pending. On the FIRST hard failure — curl transport error /
+    #    timeout / non-2xx, or a status:"error" body — BREAK immediately (do NOT
+    #    continue); the fallback below then prints the prefilled link. Exhausting
+    #    the attempt ceiling with no url is also a fallback, never "filed".
     if [ -z "$URL" ]; then
       JOB_ID=$(printf '%s' "$RESP" | sed -n 's/.*"job_id"[: ]*"\([^"]*\)".*/\1/p')
       if [ -n "$JOB_ID" ]; then
         for i in 1 2 3 4 5; do
           sleep 1
-          # A poll curl failure (error/timeout/non-2xx) is NOT success — keep
-          # trying; if we exhaust the loop with no url we fall back below.
-          STAT=$(curl -fsS --max-time 10 "$WORKER_URL/status/$JOB_ID") || continue
-          # A done-with-error carries no url and must NOT be treated as filed.
+          # Hard transport failure → stop and fall back (do NOT keep polling).
+          STAT=$(curl -fsS --max-time 10 "$WORKER_URL/status/$JOB_ID") || break
+          # Server-side filing error → stop and fall back.
           printf '%s' "$STAT" | grep -q '"status":"error"' && break
           URL=$(printf '%s' "$STAT" | sed -n 's/.*"url"[: ]*"\([^"]*\)".*/\1/p')
           [ -n "$URL" ] && break
+          # Otherwise it's a well-formed queued/pending → keep polling until the
+          # ceiling. (A malformed body yields no url and no error marker, so it
+          # simply loops to the ceiling and then falls back — still never "filed".)
         done
       fi
     fi
