@@ -496,11 +496,16 @@ describe("downloadModel cache", () => {
     await writeFile(partial, "AAAA"); // 4 bytes already downloaded
     await writeFile(sidecar, '"xet-content-hash-v1"');
 
-    // Hop 1: resolve URL 302s cross-origin (If-Range unchanged → range honored).
+    // Hop 1: resolve URL 302s cross-origin, advertising the SAME content-addressed
+    // X-Linked-Etag as the partial — proving the object is unchanged, so the
+    // cross-origin 206 append is allowed (a cross-origin resume REQUIRES this).
     fetchMock.mockResolvedValueOnce(
       new Response(null, {
         status: 302,
-        headers: { location: "https://cas-bridge.xethub.hf.co/xet-bridge-us/obj?sig=abc" },
+        headers: {
+          location: "https://cas-bridge.xethub.hf.co/xet-bridge-us/obj?sig=abc",
+          "x-linked-etag": '"xet-content-hash-v1"',
+        },
       }),
     );
     // Hop 2: the CAS CDN honors the byte range and returns a 206.
@@ -559,6 +564,38 @@ describe("downloadModel cache", () => {
       downloadModel(url, "diffusion_models", "xet-changed-out.safetensors"),
     ).rejects.toThrow(/resume rejected/i);
     // Stale partial + sidecar removed so a retry restarts clean.
+    await expect(stat(partial)).rejects.toThrow();
+    await expect(stat(sidecar)).rejects.toThrow();
+    expect(getResumeDiagnostic(await trayIdFor(url))?.outcome).toBe("declined:etag-changed");
+  });
+
+  it("REFUSES a cross-origin CAS 206 whose redirect gives NO content-addressed validator (can't prove unchanged) (#467/#343)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://huggingface.co/org/repo/resolve/main/xet-unproven.safetensors";
+    const { partial, sidecar } = await cachePaths(url);
+    await writeFile(partial, "AAAA");
+    await writeFile(sidecar, '"xet-hash-v1"');
+
+    // Hop 1: resolve 302s cross-origin WITHOUT an X-Linked-Etag — we cannot prove
+    // the CAS object still matches the partial.
+    fetchMock.mockResolvedValueOnce(
+      new Response(null, {
+        status: 302,
+        headers: { location: "https://cas-bridge.xethub.hf.co/xet-bridge-us/obj?sig=x" },
+      }),
+    );
+    // Hop 2: CAS honors the stale Range and 206s — but we must NOT trust it.
+    fetchMock.mockResolvedValueOnce(
+      new Response("BBBB", {
+        status: 206,
+        statusText: "Partial Content",
+        headers: { "content-range": "bytes 4-7/8" },
+      }),
+    );
+
+    await expect(
+      downloadModel(url, "diffusion_models", "xet-unproven-out.safetensors"),
+    ).rejects.toThrow(/resume rejected/i);
     await expect(stat(partial)).rejects.toThrow();
     await expect(stat(sidecar)).rejects.toThrow();
     expect(getResumeDiagnostic(await trayIdFor(url))?.outcome).toBe("declined:etag-changed");

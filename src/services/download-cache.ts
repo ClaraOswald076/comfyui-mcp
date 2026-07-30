@@ -353,6 +353,12 @@ async function streamUrlToFile(
   // both as the sidecar fallback (so Xet downloads become resumable) AND as the
   // resume-time change check below (#467).
   let redirectValidator: string | null = null;
+  // Did the bytes ultimately come from a DIFFERENT origin than we requested (HF
+  // resolve → CAS CDN)? A cross-origin 206 can't lean on the requesting origin's
+  // If-Range — the CDN may honor a stale Range and 206 a CHANGED object — so a
+  // cross-origin resume append MUST independently prove the content is unchanged
+  // via the content-addressed X-Linked-Etag (#467/#343).
+  let crossOriginRedirect = false;
   let res: Response;
   for (let redirectCount = 0; ; redirectCount += 1) {
     res = await fetchOrThrow(
@@ -421,6 +427,7 @@ async function streamUrlToFile(
     const sameOrigin = new URL(nextUrl).origin === new URL(currentUrl).origin;
     currentUrl = nextUrl;
     if (!sameOrigin) {
+      crossOriginRedirect = true;
       const preserved: Record<string, string> = {};
       if (currentHeaders.Range) preserved.Range = currentHeaders.Range;
       if (currentHeaders["If-Range"]) preserved["If-Range"] = currentHeaders["If-Range"];
@@ -446,34 +453,37 @@ async function streamUrlToFile(
     throw new ModelError("Download response has no body", { url: logUrl });
   }
 
-  // #467/#343 belt-and-braces: if the resolve redirect now reports a DIFFERENT
-  // content-addressed object (X-Linked-Etag) than the partial was written
-  // against, the upstream file changed — and because the cross-origin CAS URL
-  // may honor our Range and return a 206 REGARDLESS of the origin's If-Range, we
-  // must refuse the append OURSELVES rather than trust the CDN. Content-addressed
-  // ⇒ an equal validator proves identical bytes; an unequal one proves change.
-  // Drop the partial + sidecar so a retry is a clean full download.
-  if (
-    requestedResume &&
-    priorValidator &&
-    redirectValidator &&
-    redirectValidator !== priorValidator
-  ) {
-    await safeRm(targetPath);
-    await safeRm(validatorSidecar);
-    recordResumeDiagnostic(url, "declined:etag-changed", resumeFromBytes);
-    logger.warn(
-      `Discarding a ${resumeFromBytes}-byte partial download and restarting from 0: the resolve ` +
-        `redirect now points at a DIFFERENT content-addressed object (X-Linked-Etag changed), so ` +
-        `the upstream file changed since the partial was written. Refusing to append even if the ` +
-        `CDN returns a 206 (would corrupt the file, #343). Removed the partial; retry.`,
-      { url: logUrl, discardedBytes: resumeFromBytes },
-    );
-    throw new ModelError(
-      "Download resume rejected: the upstream file changed (content-addressed validator no longer " +
-        "matches the partial). Removed the stale partial so a retry restarts cleanly.",
-      { url: logUrl },
-    );
+  // #467/#343 belt-and-braces on a 206 RESUME APPEND. A same-origin 206 is safe:
+  // the very server that evaluated our If-Range is the one serving the bytes, so
+  // a 206 already proves the resource is unchanged. A CROSS-ORIGIN 206 (HF resolve
+  // → CAS CDN) cannot lean on that — the CDN may honor a stale Range and 206 a
+  // CHANGED object regardless of the origin's If-Range — so we must independently
+  // prove the object is unchanged via the content-addressed X-Linked-Etag captured
+  // off the redirect: it MUST be present AND equal the validator the partial was
+  // written against. We also refuse any 206 whose redirect PROVES a change
+  // (X-Linked-Etag present but different), cross-origin or not. Only 206s are
+  // gated — a 200 is a full body and restarts cleanly through the branch below.
+  // On refusal, drop the partial + sidecar so a retry is a clean full download.
+  if (requestedResume && res.status === 206) {
+    const provenChange = redirectValidator !== null && redirectValidator !== priorValidator;
+    const unprovenCrossOrigin = crossOriginRedirect && redirectValidator !== priorValidator; // includes missing
+    if (provenChange || unprovenCrossOrigin) {
+      const why = provenChange
+        ? "the resolve redirect now points at a DIFFERENT content-addressed object (X-Linked-Etag changed)"
+        : "the resume crossed origins to a CDN that returned no content-addressed validator, so an unchanged upstream can't be proven";
+      await safeRm(targetPath);
+      await safeRm(validatorSidecar);
+      recordResumeDiagnostic(url, "declined:etag-changed", resumeFromBytes);
+      logger.warn(
+        `Discarding a ${resumeFromBytes}-byte partial download and restarting from 0: ${why}. ` +
+          `Refusing to append the 206 (would risk corrupting the file, #343). Removed the partial; retry.`,
+        { url: logUrl, discardedBytes: resumeFromBytes },
+      );
+      throw new ModelError(
+        `Download resume rejected: ${why}. Removed the stale partial so a retry restarts cleanly.`,
+        { url: logUrl },
+      );
+    }
   }
 
   // Decide append vs truncate based on the response. We only append when we
