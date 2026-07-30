@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { config, getComfyUIBaseUrl } from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
+import { resetObjectInfoCache } from "../comfyui/client.js";
 import { progressEnabled, reportDownloadProgress } from "./download-progress.js";
 import { assertComfyCliOk, runComfyCliSync } from "./comfy-cli.js";
 import { ComfyUIError, ProcessControlError, ValidationError } from "../utils/errors.js";
@@ -987,7 +988,28 @@ export interface InstallOptions {
   useCmCli?: boolean;
 }
 
-export async function installCustomNode(
+/**
+ * Installing/updating/reinstalling/repairing a pack changes which node classes
+ * this ComfyUI can register, so the orchestrator's memoized /object_info snapshot
+ * (getObjectInfo) is now stale — validate_workflow / diagnose_run / get_node_info
+ * would keep reporting the just-installed types as `missing_node_type` in their
+ * top-level summaries until some later reboot bumped the epoch (#444, the residual
+ * of the #235/#247/#352/#364 staleness cluster). Drop the cache the moment a
+ * mutation succeeds so the next read refetches the live registry. Applied via a
+ * single choke point (rather than at every early return) so every install branch —
+ * cm-cli, Manager HTTP, and the git clone fallback — is covered.
+ */
+async function withObjectInfoInvalidation<T>(op: () => Promise<T>): Promise<T> {
+  const result = await op();
+  resetObjectInfoCache();
+  return result;
+}
+
+export function installCustomNode(opts: InstallOptions): Promise<NodeOpResult> {
+  return withObjectInfoInvalidation(() => installCustomNodeImpl(opts));
+}
+
+async function installCustomNodeImpl(
   opts: InstallOptions,
 ): Promise<NodeOpResult> {
   const { id, version, mode = "remote", channel = "default" } = opts;
@@ -1121,7 +1143,11 @@ export interface UpdateOptions {
   useCmCli?: boolean;
 }
 
-export async function updateCustomNode(
+export function updateCustomNode(opts: UpdateOptions): Promise<NodeOpResult> {
+  return withObjectInfoInvalidation(() => updateCustomNodeImpl(opts));
+}
+
+async function updateCustomNodeImpl(
   opts: UpdateOptions,
 ): Promise<NodeOpResult> {
   const { id, mode = "remote", channel = "default" } = opts;
@@ -1187,7 +1213,11 @@ export interface ReinstallOptions {
   useCmCli?: boolean;
 }
 
-export async function reinstallCustomNode(
+export function reinstallCustomNode(opts: ReinstallOptions): Promise<NodeOpResult> {
+  return withObjectInfoInvalidation(() => reinstallCustomNodeImpl(opts));
+}
+
+async function reinstallCustomNodeImpl(
   opts: ReinstallOptions,
 ): Promise<NodeOpResult> {
   const { id, version, mode = "remote", channel = "default" } = opts;
@@ -1230,7 +1260,11 @@ export interface FixOptions {
   useCmCli?: boolean;
 }
 
-export async function fixCustomNode(opts: FixOptions): Promise<NodeOpResult> {
+export function fixCustomNode(opts: FixOptions): Promise<NodeOpResult> {
+  return withObjectInfoInvalidation(() => fixCustomNodeImpl(opts));
+}
+
+async function fixCustomNodeImpl(opts: FixOptions): Promise<NodeOpResult> {
   const { id, mode = "remote", channel = "default" } = opts;
   const all = id.trim().toLowerCase() === "all";
 
