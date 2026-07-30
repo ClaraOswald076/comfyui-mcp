@@ -12,7 +12,6 @@ import {
   type DownloadJob,
 } from "../services/download-jobs.js";
 import { readDownloadProgress } from "../services/download-progress.js";
-import { getResumeDiagnostic } from "../services/download-cache.js";
 import { errorToToolResult, ModelError } from "../utils/errors.js";
 
 /**
@@ -233,10 +232,9 @@ export function registerModelManagementTools(server: McpServer): void {
                 : `\n    still streaming — started ${Math.round((Date.now() - j.started_at) / 1000)}s ago`;
           // Surface a declined resume so the agent/user knows a pre-existing
           // .partial was discarded and why — instead of it being silent (#467).
-          // Only THIS attempt's decision can be present: the per-attempt reset in
-          // the physical-download path (and on a cache hit) clears any earlier
-          // decision for this slot, so a stale one can't be misattributed here.
-          const diag = getResumeDiagnostic(j.resumeKey);
+          // The decision is stored on THIS job by its own physical download, so it
+          // can never be a stale/other job's.
+          const diag = j.resume;
           let resumeNote = "";
           if (diag && diag.outcome !== "resumed") {
             const gb = (diag.discardedBytes / 1024 ** 3).toFixed(2);

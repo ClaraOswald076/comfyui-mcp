@@ -21,7 +21,7 @@ import {
   shouldDispatchDownloadToManager,
 } from "./model-resolver.js";
 import type { DownloadAuth } from "./download-auth.js";
-import { resumeKeyFor } from "./download-resume-diag.js";
+import type { ResumeDiagnostic } from "./download-resume-diag.js";
 import { logger } from "../utils/logger.js";
 
 export interface DownloadJob {
@@ -34,11 +34,12 @@ export interface DownloadJob {
    *  Kept separate from `id` so distinct-destination jobs still read their live
    *  byte progress from the tray. */
   trayId: string;
-  /** Slot the resume diagnostic is recorded/read under (#467 P2). Tray id when
-   *  unauthenticated, else tray id + an auth discriminator — so a concurrent
-   *  same-URL download with DIFFERENT auth (a separate physical cache download)
-   *  gets its OWN resume decision instead of clobbering this one. */
-  resumeKey: string;
+  /** This job's OWN resume decision (#467), reported by its physical download via
+   *  a callback and stored here — so download_status surfaces exactly this job's
+   *  outcome and never a stale/other job's. Absent when no resumable download ran
+   *  (Manager dispatch, cache hit, a job that coalesced onto another's stream, or
+   *  a failure before streaming). */
+  resume?: ResumeDiagnostic;
   url: string;
   target_subfolder: string;
   filename?: string;
@@ -237,19 +238,9 @@ export async function startDownloadJob(
     }
   }
 
-  // Representation-aware diagnostic slot: same URL + different auth ⇒ different
-  // physical cache download ⇒ different resume decision (#467 P2). The auth param
-  // is the per-caller differentiator (config-global tokens are identical across
-  // concurrent calls, so they need not enter the key). The per-attempt RESET of
-  // this slot happens where a genuinely-new physical download begins (inside
-  // streamUrlToFile), NOT here — clearing here would wipe an in-flight download's
-  // recorded decision when THIS job merely coalesces onto it (#467 P1-b).
-  const resumeKey = resumeKeyFor(url, auth ? JSON.stringify(auth) : undefined);
-
   const job: DownloadJob = {
     id,
     trayId,
-    resumeKey,
     url,
     target_subfolder: targetSubfolder,
     filename,
@@ -259,7 +250,11 @@ export async function startDownloadJob(
 
   // The promise is stored, never left dangling — an unhandled rejection here
   // would take down the process on a simple 404.
-  const settled = downloadModel(url, targetSubfolder, filename, auth, dispatchToManager, resumeKey)
+  // The physical download reports its resume decision straight onto THIS job — no
+  // shared keyed map, so it can never be misattributed to another job (#467).
+  const settled = downloadModel(url, targetSubfolder, filename, auth, dispatchToManager, (d) => {
+    job.resume = d;
+  })
     .then(async (path) => {
       job.path = path;
       if (onComplete) {

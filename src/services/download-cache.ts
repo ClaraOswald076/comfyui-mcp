@@ -20,21 +20,7 @@ import { ModelError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { redactUrlForLogs } from "./download-auth.js";
 import { reportDownloadProgress, type DownloadProgress } from "./download-progress.js";
-import {
-  clearResumeDiagnostic,
-  recordResumeDiagnostic,
-  trayIdForUrl,
-} from "./download-resume-diag.js";
-// Re-export the resume-diagnostic read/reset API so existing importers of
-// download-cache keep working; the registry itself now lives in a dep-light
-// module (download-resume-diag) to avoid pulling storage/* into consumers' mocks.
-export {
-  getResumeDiagnostic,
-  clearResumeDiagnostic,
-  resetResumeDiagnostics,
-  type ResumeOutcome,
-  type ResumeDiagnostic,
-} from "./download-resume-diag.js";
+import type { ResumeReporter } from "./download-resume-diag.js";
 import {
   downloadCloudUrlToFile,
   supportsCloudDownload,
@@ -160,10 +146,11 @@ export interface DownloadCacheOptions {
   logUrl?: string;
   storageAuth?: CloudStorageAuth;
   progress?: ProgressMeta;
-  /** Representation-aware slot the resume diagnostic is recorded under, so
-   *  download_status reads THIS download's decision even when a concurrent
-   *  same-URL/different-auth download exists (#467 P2). Defaults to the URL tray id. */
-  resumeKey?: string;
+  /** Sink for this download's resume decision, reported to the CALLER (the job)
+   *  so it stores the outcome on itself — never in a shared keyed map that could
+   *  misattribute it to another job (#467). Not called on a coalesced/cache-hit
+   *  path (no physical resume happened). */
+  onResume?: ResumeReporter;
 }
 
 export interface DownloadCacheResult {
@@ -274,16 +261,11 @@ async function streamUrlToFile(
   resumeFromBytes = 0,
   progress?: ProgressMeta,
   resumable = false,
-  /** Stable key the resume diagnostic is recorded under — threaded from the job
-   *  so download_status reads the SAME slot (representation-aware, #467 P2).
-   *  Defaults to the URL tray id for internal/direct callers. */
-  resumeKey?: string,
+  /** Sink for THIS physical download's resume decision, threaded from the job so
+   *  the outcome is stored on that job — never in a shared keyed map that could
+   *  misattribute it to another job (#467). Absent for internal/direct callers. */
+  onResume?: ResumeReporter,
 ): Promise<void> {
-  // The slot this download's resume decision is recorded under. The per-attempt
-  // RESET of this slot happens in downloadIntoCache (the single new-physical-
-  // download gate that also covers cache hits and the mkdir/fallback path),
-  // NOT here — see #467 P1-b/P2.
-  const diagKey = resumeKey ?? trayIdForUrl(url);
   if (supportsCloudDownload(url)) {
     await downloadCloudUrlToFile(url, targetPath, storageAuth);
     // #343 edge: the S3/Azure path bypasses the HTTP size gate below. The cloud
@@ -528,12 +510,11 @@ async function streamUrlToFile(
       await safeRm(targetPath);
       await safeRm(validatorSidecar);
       const removed = await partialConfirmedDiscarded(targetPath);
-      recordResumeDiagnostic(
-        diagKey,
-        provenChange ? "declined:etag-changed" : "declined:unverifiable",
-        resumeFromBytes,
-        removed,
-      );
+      onResume?.({
+        outcome: provenChange ? "declined:etag-changed" : "declined:unverifiable",
+        discardedBytes: resumeFromBytes,
+        discarded: removed,
+      });
       const tail = removed
         ? "Removed the stale partial so a retry restarts cleanly."
         : "Could not remove the stale partial — a retry may repeat this rejection; delete the .partial manually if so.";
@@ -627,7 +608,7 @@ async function streamUrlToFile(
           `upstream file changed, or the host doesn't support resuming — so re-downloading in full.`,
         { url: logUrl, discardedBytes: resumeFromBytes },
       );
-      recordResumeDiagnostic(diagKey, "declined:full-response", resumeFromBytes);
+      onResume?.({ outcome: "declined:full-response", discardedBytes: resumeFromBytes, discarded: true });
     } else if (discardConfirmed && resumeDeclinedNoValidator) {
       // A partial existed but no sidecar validator did, so we never even sent a
       // Range — a safe resume couldn't be verified (common on HF's Xet/CAS CDN,
@@ -640,7 +621,7 @@ async function streamUrlToFile(
           `(#343). Future downloads capture the validator from the resolve redirect so they CAN resume.`,
         { url: logUrl, discardedBytes: resumeFromBytes },
       );
-      recordResumeDiagnostic(diagKey, "declined:no-validator", resumeFromBytes);
+      onResume?.({ outcome: "declined:no-validator", discardedBytes: resumeFromBytes, discarded: true });
     }
     // Prefer the final response's validator; fall back to one captured off the
     // redirect chain (HF Xet: the CAS 200 has none, but the resolve 302 carried
@@ -650,7 +631,7 @@ async function streamUrlToFile(
   } else if (appendMode) {
     // A resume was actually taken (validated 206 append). Record it so
     // download_status can report the partial was reused, not discarded (#467).
-    recordResumeDiagnostic(diagKey, "resumed", 0, false);
+    onResume?.({ outcome: "resumed", discardedBytes: 0, discarded: false });
   }
 
   const nodeStream = Readable.fromWeb(res.body as import("node:stream/web").ReadableStream);
@@ -771,7 +752,7 @@ async function downloadIntoCache(
   logUrl?: string,
   storageAuth: CloudStorageAuth = {},
   progress?: ProgressMeta,
-  resumeKey?: string,
+  onResume?: ResumeReporter,
 ): Promise<string> {
   // Header-aware identity (#467 P1-2): a same-URL download with a different
   // Authorization/Cookie/API-key gets its OWN cache file, partial and in-flight
@@ -780,17 +761,13 @@ async function downloadIntoCache(
   const key = target;
 
   const existing = inflight.get(key);
+  // A job COALESCING onto an in-flight physical download gets no resume decision
+  // of its own — the decision is reported to the job that actually runs the
+  // stream (#467). This is inherent to the callback model: onResume is not passed
+  // to the shared promise, so a coalesced caller simply awaits the same result.
   if (existing) return existing;
 
   const promise = (async () => {
-    // Per-attempt reset (#467 P1-b/P2): a GENUINELY-NEW physical download for this
-    // slot clears any decision left by an EARLIER attempt, up front — BEFORE the
-    // mkdir/cache-hit/miss branches — so it also covers a cache hit (which never
-    // reaches streamUrlToFile) AND a cache-dir mkdir failure (which falls back to
-    // a direct download that records nothing). A job that merely COALESCES onto an
-    // in-flight download returned at `if (existing)` above, so it never runs this
-    // and can't wipe the active stream's recorded decision.
-    clearResumeDiagnostic(resumeKey ?? trayIdForUrl(url));
     await downloadCacheFs.mkdir(cacheDir(), { recursive: true });
 
     try {
@@ -804,8 +781,8 @@ async function downloadIntoCache(
           await downloadCacheFs.rm(target, { force: true }).catch(() => undefined);
         } else {
           await touch(target);
-          // Cache hit ⇒ no resume/discard this attempt; the slot was already
-          // cleared at the top of this promise body (#467).
+          // Cache hit ⇒ no resume/discard this attempt; onResume is never called,
+          // so the job's resume field stays empty (nothing to surface).
           return target;
         }
       }
@@ -842,7 +819,7 @@ async function downloadIntoCache(
         resumeFromBytes,
         progress,
         true, // resumable: cache partials use the .partial + If-Range resume handshake
-        resumeKey,
+        onResume,
       );
       await downloadCacheFs.rename(partial, target);
       await touch(target);
@@ -944,7 +921,7 @@ export async function downloadWithCache(
       logUrl,
       options.storageAuth,
       options.progress,
-      options.resumeKey,
+      options.onResume,
     );
     const materializedBy = await materializeCacheFile(cachePath, options.targetPath);
     await evictLruIfNeeded();

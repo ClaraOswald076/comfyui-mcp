@@ -11,6 +11,7 @@ import { ModelError, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { downloadWithCache } from "./download-cache.js";
 import { reportDownloadProgress } from "./download-progress.js";
+import type { ResumeReporter } from "./download-resume-diag.js";
 import { resolveModelsDir, parseModelsDirFromArgv } from "./output-dir.js";
 import {
   applyDownloadAuth,
@@ -747,10 +748,9 @@ export async function downloadModel(
    * evaluate the predicate themselves.
    */
   dispatchToManager?: boolean,
-  /** Representation-aware slot for the resume diagnostic, threaded from the job
-   *  so download_status reads THIS download's decision (#467 P2). Omitted by
-   *  direct callers, which fall back to the URL tray id. */
-  resumeKey?: string,
+  /** Sink for the resume decision, threaded from the job so the outcome is stored
+   *  on that job (#467). Omitted by direct callers (no job to report to). */
+  onResume?: ResumeReporter,
 ): Promise<string> {
   // Region flags (issue #127) applied at THE choke point every download path
   // funnels through (local disk AND the remote Manager dispatch below).
@@ -820,7 +820,7 @@ export async function downloadModel(
       logUrl,
       storageAuth: auth?.type === "s3" ? { s3: auth } : undefined,
       progress,
-      resumeKey,
+      onResume,
     });
   } catch (err) {
     // Surface a failed row in the tray, then rethrow for the tool to report.

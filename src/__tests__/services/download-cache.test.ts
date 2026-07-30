@@ -19,18 +19,16 @@ vi.mock("../../config.js", () => {
 });
 
 import { config } from "../../config.js";
-import {
-  downloadCacheFs,
-  getResumeDiagnostic,
-  resetResumeDiagnostics,
-} from "../../services/download-cache.js";
+import { downloadCacheFs } from "../../services/download-cache.js";
 import { downloadModel } from "../../services/model-resolver.js";
+import type { ResumeDiagnostic } from "../../services/download-resume-diag.js";
 
-/** Tray id for a URL — mirrors download-jobs' downloadIdFor / the cache's
- *  trayIdForUrl, so a test can look up the resume diagnostic (#467). */
-async function trayIdFor(url: string): Promise<string> {
-  const { createHash } = await import("node:crypto");
-  return createHash("sha256").update(url).digest("hex").slice(0, 16);
+/** Capture the resume decision a physical download reports (#467). The decision
+ *  is delivered to the CALLER via an onResume callback (no shared map), so a test
+ *  passes this box's `onResume` to downloadModel and reads `box.d` afterward. */
+function resumeCapture() {
+  const box: { d?: ResumeDiagnostic } = {};
+  return { box, onResume: (d: ResumeDiagnostic) => { box.d = d; } };
 }
 
 const fetchMock = vi.fn();
@@ -53,7 +51,6 @@ beforeEach(async () => {
   config.civitaiApiToken = undefined;
   vi.stubGlobal("fetch", fetchMock);
   fetchMock.mockReset();
-  resetResumeDiagnostics();
 });
 
 afterEach(async () => {
@@ -441,13 +438,16 @@ describe("downloadModel cache", () => {
 
     fetchMock.mockResolvedValueOnce(okResponse("FRESHFULLBODY"));
 
-    const target = await downloadModel(url, "checkpoints", "silentdiscard-out.safetensors");
+    const cap = resumeCapture();
+    const target = await downloadModel(
+      url, "checkpoints", "silentdiscard-out.safetensors", undefined, undefined, cap.onResume,
+    );
     await expect(readFile(target, "utf-8")).resolves.toBe("FRESHFULLBODY");
 
-    // The discard is no longer silent: a diagnostic records WHY and HOW MUCH.
-    const diag = getResumeDiagnostic(await trayIdFor(url));
-    expect(diag?.outcome).toBe("declined:no-validator");
-    expect(diag?.discardedBytes).toBe(21);
+    // The discard is no longer silent: the decision records WHY and HOW MUCH.
+    expect(cap.box.d?.outcome).toBe("declined:no-validator");
+    expect(cap.box.d?.discardedBytes).toBe(21);
+    expect(cap.box.d?.discarded).toBe(true);
   });
 
   it("persists a validator from the HF resolve REDIRECT (X-Linked-Etag) so a Xet partial becomes resumable (#467)", async () => {
@@ -517,7 +517,10 @@ describe("downloadModel cache", () => {
       }),
     );
 
-    const target = await downloadModel(url, "diffusion_models", "resume-xet-out.safetensors");
+    const cap = resumeCapture();
+    const target = await downloadModel(
+      url, "diffusion_models", "resume-xet-out.safetensors", undefined, undefined, cap.onResume,
+    );
 
     // Hop 1 (resolve) carried Range + If-Range...
     const [, firstInit] = fetchMock.mock.calls[0] as [string, { headers: Record<string, string> }];
@@ -530,7 +533,7 @@ describe("downloadModel cache", () => {
     expect(secondInit.headers.Range).toBe("bytes=4-");
     // The bytes were appended, not re-downloaded from 0.
     await expect(readFile(target, "utf-8")).resolves.toBe("AAAABBBB");
-    expect(getResumeDiagnostic(await trayIdFor(url))?.outcome).toBe("resumed");
+    expect(cap.box.d?.outcome).toBe("resumed");
   });
 
   it("REFUSES to append a CAS 206 when the redirect's content-addressed X-Linked-Etag changed, even if the CDN honors the Range (#467/#343)", async () => {
@@ -560,13 +563,15 @@ describe("downloadModel cache", () => {
     );
 
     // We must NOT splice new-object bytes onto the stale prefix — reject instead.
+    const cap = resumeCapture();
     await expect(
-      downloadModel(url, "diffusion_models", "xet-changed-out.safetensors"),
+      downloadModel(url, "diffusion_models", "xet-changed-out.safetensors", undefined, undefined, cap.onResume),
     ).rejects.toThrow(/resume rejected/i);
     // Stale partial + sidecar removed so a retry restarts clean.
     await expect(stat(partial)).rejects.toThrow();
     await expect(stat(sidecar)).rejects.toThrow();
-    expect(getResumeDiagnostic(await trayIdFor(url))?.outcome).toBe("declined:etag-changed");
+    expect(cap.box.d?.outcome).toBe("declined:etag-changed");
+    expect(cap.box.d?.discarded).toBe(true);
   });
 
   it("REFUSES a cross-origin CAS 206 whose redirect gives NO content-addressed validator (can't prove unchanged) (#467/#343)", async () => {
@@ -593,13 +598,14 @@ describe("downloadModel cache", () => {
       }),
     );
 
+    const cap = resumeCapture();
     await expect(
-      downloadModel(url, "diffusion_models", "xet-unproven-out.safetensors"),
+      downloadModel(url, "diffusion_models", "xet-unproven-out.safetensors", undefined, undefined, cap.onResume),
     ).rejects.toThrow(/resume rejected/i);
     await expect(stat(partial)).rejects.toThrow();
     await expect(stat(sidecar)).rejects.toThrow();
     // Unverifiable, not proven-changed: no validator was available to compare.
-    expect(getResumeDiagnostic(await trayIdFor(url))?.outcome).toBe("declined:unverifiable");
+    expect(cap.box.d?.outcome).toBe("declined:unverifiable");
   });
 
   it("REFUSES a resume 206 when a LATER redirect hop reports a changed X-Linked-Etag (multi-hop) (#467/#343)", async () => {
@@ -639,11 +645,12 @@ describe("downloadModel cache", () => {
       }),
     );
 
+    const cap = resumeCapture();
     await expect(
-      downloadModel(url, "diffusion_models", "multihop-out.safetensors"),
+      downloadModel(url, "diffusion_models", "multihop-out.safetensors", undefined, undefined, cap.onResume),
     ).rejects.toThrow(/resume rejected/i);
     await expect(stat(partial)).rejects.toThrow();
-    expect(getResumeDiagnostic(await trayIdFor(url))?.outcome).toBe("declined:etag-changed");
+    expect(cap.box.d?.outcome).toBe("declined:etag-changed");
   });
 
   it("declines + SURFACES a full-response resume (If-Range miss / no range support, 200) — safety preserved (#467/#343)", async () => {
@@ -656,13 +663,15 @@ describe("downloadModel cache", () => {
     // Upstream changed (or no range support) → server sends full 200, not a 206.
     fetchMock.mockResolvedValueOnce(okResponse("BRANDNEWBODY"));
 
-    const target = await downloadModel(url, "checkpoints", "changed-surfaced-out.safetensors");
+    const cap = resumeCapture();
+    const target = await downloadModel(
+      url, "checkpoints", "changed-surfaced-out.safetensors", undefined, undefined, cap.onResume,
+    );
     // Overwritten with the fresh body — safety preserved, no corrupt append.
     await expect(readFile(target, "utf-8")).resolves.toBe("BRANDNEWBODY");
 
-    const diag = getResumeDiagnostic(await trayIdFor(url));
-    expect(diag?.outcome).toBe("declined:full-response");
-    expect(diag?.discardedBytes).toBe(4);
+    expect(cap.box.d?.outcome).toBe("declined:full-response");
+    expect(cap.box.d?.discardedBytes).toBe(4);
   });
 
   it("persists the validator sidecar on a fresh write so a later resume can guard with If-Range (#343 edge)", async () => {
@@ -758,12 +767,13 @@ describe("downloadModel cache", () => {
       }),
     );
 
+    const cap = resumeCapture();
     await expect(
-      downloadModel(url, "diffusion_models", "finalconflict-out.safetensors"),
+      downloadModel(url, "diffusion_models", "finalconflict-out.safetensors", undefined, undefined, cap.onResume),
     ).rejects.toThrow(/resume rejected/i);
     await expect(stat(partial)).rejects.toThrow();
     await expect(stat(sidecar)).rejects.toThrow();
-    expect(getResumeDiagnostic(await trayIdFor(url))?.outcome).toBe("declined:etag-changed");
+    expect(cap.box.d?.outcome).toBe("declined:etag-changed");
   });
 
   it("does NOT coalesce same-URL downloads carrying DIFFERENT auth headers — each gets its own bytes (#467 P1-2)", async () => {
@@ -820,17 +830,14 @@ describe("downloadModel cache", () => {
     await expect(readFile(two, "utf-8")).resolves.toBe("SHARED-BYTES");
   });
 
-  it("preserves the physical download's resume diagnostic for a COALESCED same-key consumer (#467 P1-b)", async () => {
-    const { downloadWithCache, getResumeDiagnostic } = await import(
-      "../../services/download-cache.js"
-    );
-    const { trayIdForUrl } = await import("../../services/download-resume-diag.js");
+  it("reports the resume decision ONLY to the physical stream's caller; a COALESCED consumer gets none (#467 P1-b)", async () => {
+    const { downloadWithCache } = await import("../../services/download-cache.js");
     await fsPromises.mkdir(cacheDir, { recursive: true });
     await fsPromises.mkdir(comfyDir, { recursive: true });
     const url = "https://example.com/models/coalesce-diag.safetensors";
     const { createHash } = await import("node:crypto");
     const hash = createHash("sha256").update(url).digest("hex").slice(0, 32);
-    // Validator-less partial → the ONE physical download declines + records.
+    // Validator-less partial → the ONE physical download declines + reports.
     await writeFile(join(cacheDir, `.${hash}.safetensors.partial`), "OLDPARTIALBYTES");
 
     // A single, initially-pending fetch — both callers coalesce onto it.
@@ -841,24 +848,23 @@ describe("downloadModel cache", () => {
       }),
     );
 
-    const a = downloadWithCache({ url, headers: {}, targetPath: join(comfyDir, "a.safetensors") });
-    const b = downloadWithCache({ url, headers: {}, targetPath: join(comfyDir, "b.safetensors") });
+    const capA = resumeCapture();
+    const capB = resumeCapture();
+    const a = downloadWithCache({ url, headers: {}, targetPath: join(comfyDir, "a.safetensors"), onResume: capA.onResume });
+    const b = downloadWithCache({ url, headers: {}, targetPath: join(comfyDir, "b.safetensors"), onResume: capB.onResume });
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1)); // coalesced to ONE fetch
     release(okResponse("FRESHFULLBODY"));
     await Promise.all([a, b]);
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    // The coalesced second consumer must NOT have wiped the recorded decision.
-    expect(getResumeDiagnostic(trayIdForUrl(url))?.outcome).toBe("declined:no-validator");
+    // The stream's owner (A) got the decision; the coalesced consumer (B) got NONE
+    // — no shared map to clobber, and B is never misattributed A's decision.
+    expect(capA.box.d?.outcome).toBe("declined:no-validator");
+    expect(capB.box.d).toBeUndefined();
   });
 
-  it("clears a stale resume diagnostic on a cache HIT so it isn't misattributed (#467)", async () => {
-    const { downloadWithCache, getResumeDiagnostic } = await import(
-      "../../services/download-cache.js"
-    );
-    const { recordResumeDiagnostic, trayIdForUrl } = await import(
-      "../../services/download-resume-diag.js"
-    );
+  it("does NOT report a resume decision on a cache HIT (#467)", async () => {
+    const { downloadWithCache } = await import("../../services/download-cache.js");
     await fsPromises.mkdir(cacheDir, { recursive: true });
     await fsPromises.mkdir(comfyDir, { recursive: true });
     const url = "https://example.com/models/cachehit-clear.safetensors";
@@ -866,33 +872,39 @@ describe("downloadModel cache", () => {
     const hash = createHash("sha256").update(url).digest("hex").slice(0, 32);
     // A COMPLETE cache entry → this download is a hit (no fetch, no streamUrlToFile).
     await writeFile(join(cacheDir, `${hash}.safetensors`), "CACHED-BYTES");
-    // A stale decline left over from an EARLIER attempt for the same slot.
-    recordResumeDiagnostic(trayIdForUrl(url), "declined:no-validator", 999);
-    expect(getResumeDiagnostic(trayIdForUrl(url))?.outcome).toBe("declined:no-validator");
 
-    await downloadWithCache({ url, headers: {}, targetPath: join(comfyDir, "ch.safetensors") });
+    const cap = resumeCapture();
+    await downloadWithCache({ url, headers: {}, targetPath: join(comfyDir, "ch.safetensors"), onResume: cap.onResume });
 
     expect(fetchMock).not.toHaveBeenCalled(); // served from cache
-    // The cache hit performed no resume/discard, so the stale decision is cleared.
-    expect(getResumeDiagnostic(trayIdForUrl(url))).toBeUndefined();
+    // No resume/discard happened, so nothing is reported (can't be misattributed).
+    expect(cap.box.d).toBeUndefined();
   });
 
-  it("gives same-URL DIFFERENT-auth downloads DISTINCT resume-diagnostic slots (#467 P2)", async () => {
-    const { resumeKeyFor, recordResumeDiagnostic, getResumeDiagnostic, trayIdForUrl } =
-      await import("../../services/download-resume-diag.js");
+  it("reports same-URL DIFFERENT-auth downloads to their OWN callers (no cross-talk) (#467 P2)", async () => {
+    const { downloadWithCache } = await import("../../services/download-cache.js");
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    await fsPromises.mkdir(comfyDir, { recursive: true });
     const url = "https://example.com/models/p2.safetensors";
-    const kAlice = resumeKeyFor(url, JSON.stringify({ type: "bearer", token: "alice" }));
-    const kBob = resumeKeyFor(url, JSON.stringify({ type: "bearer", token: "bob" }));
-    // Different auth → different slots; no auth → the bare tray id (compat).
-    expect(kAlice).not.toBe(kBob);
-    expect(resumeKeyFor(url)).toBe(trayIdForUrl(url));
+    const { createHash } = await import("node:crypto");
+    // Alice and Bob use different auth → different physical cache identities, so
+    // each seeds its OWN validator-less partial and gets its OWN decision.
+    for (const who of ["alice", "bob"]) {
+      const repr = createHash("sha256").update(`authorization=Bearer ${who}`).digest("hex").slice(0, 12);
+      const id = createHash("sha256").update(`${url}\n${repr}`).digest("hex").slice(0, 32);
+      await writeFile(join(cacheDir, `.${id}.safetensors.partial`), `OLD-${who}`);
+    }
+    fetchMock.mockResolvedValueOnce(okResponse("ALICE-FRESH"));
+    fetchMock.mockResolvedValueOnce(okResponse("BOB-FRESH"));
 
-    // A concurrent resume for Bob must NOT clobber Alice's declined-discard record.
-    recordResumeDiagnostic(kAlice, "declined:no-validator", 12345);
-    recordResumeDiagnostic(kBob, "resumed", 0);
-    expect(getResumeDiagnostic(kAlice)?.outcome).toBe("declined:no-validator");
-    expect(getResumeDiagnostic(kAlice)?.discardedBytes).toBe(12345);
-    expect(getResumeDiagnostic(kBob)?.outcome).toBe("resumed");
+    const capA = resumeCapture();
+    const capB = resumeCapture();
+    await downloadWithCache({ url, headers: { Authorization: "Bearer alice" }, targetPath: join(comfyDir, "pa.safetensors"), onResume: capA.onResume });
+    await downloadWithCache({ url, headers: { Authorization: "Bearer bob" }, targetPath: join(comfyDir, "pb.safetensors"), onResume: capB.onResume });
+
+    // Each caller received its own decline — no shared key, no cross-talk.
+    expect(capA.box.d?.outcome).toBe("declined:no-validator");
+    expect(capB.box.d?.outcome).toBe("declined:no-validator");
   });
 
   it("never serves a 0-byte cache entry as a hit — re-downloads instead (#343 edge)", async () => {
