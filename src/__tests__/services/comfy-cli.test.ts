@@ -1,8 +1,20 @@
 import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+// Keep config.comfyuiPath deterministically unset so the saved-default-workspace
+// resolution path (#506/#403) is what's under test, not any real auto-detected
+// install on the host running the suite.
+vi.mock("../../config.js", () => ({ config: { comfyuiPath: undefined } }));
+
+// Control the saved default workspace resolveEffectiveComfyUIBase() returns.
+const wsMock = vi.hoisted(() => ({ base: undefined as string | undefined }));
+vi.mock("../../services/workspace-env.js", () => ({
+  resolveEffectiveComfyUIBase: () => wsMock.base,
+}));
+
 import {
   assertComfyCliOk,
   awaitProcessWithIdleTimeout,
@@ -19,6 +31,7 @@ const tempDirs: string[] = [];
 afterEach(() => {
   if (originalCliPath === undefined) delete process.env.COMFY_CLI_PATH;
   else process.env.COMFY_CLI_PATH = originalCliPath;
+  wsMock.base = undefined;
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -50,6 +63,20 @@ describe("comfy-cli adapter", () => {
     const executable = join(dir, process.platform === "win32" ? "comfy.exe" : "comfy");
     writeFileSync(executable, "");
     process.env.COMFY_CLI_PATH = executable;
+    expect(resolveComfyCliExecutable()).toBe(executable);
+  });
+
+  it("resolves the workspace-venv comfy-cli from the saved default workspace when COMFYUI_PATH is unset (#506/#403)", () => {
+    delete process.env.COMFY_CLI_PATH;
+    const workspace = mkdtempSync(join(tmpdir(), "comfy-cli-ws-"));
+    tempDirs.push(workspace);
+    const binDir = join(workspace, ".venv", process.platform === "win32" ? "Scripts" : "bin");
+    mkdirSync(binDir, { recursive: true });
+    const executable = join(binDir, process.platform === "win32" ? "comfy.exe" : "comfy");
+    writeFileSync(executable, "");
+    // No explicit workspace passed and COMFYUI_PATH unset — resolution must fall
+    // through to the saved default workspace's venv rather than only scanning PATH.
+    wsMock.base = workspace;
     expect(resolveComfyCliExecutable()).toBe(executable);
   });
 

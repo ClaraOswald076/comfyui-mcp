@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import {
   getComfyCliVersion,
+  isComfyCliUsable,
   resolveComfyCliExecutable,
   runComfyCli,
 } from "../services/comfy-cli.js";
@@ -77,8 +78,8 @@ export function registerComfyCliTools(server: McpServer): void {
     "List, inspect, wait for, watch, or cancel local or Comfy Cloud jobs through official comfy-cli. Local jobs include CLI-tracked async submissions plus the ComfyUI queue/history.",
     {
       action: z.enum(["list", "status", "wait", "watch", "cancel"]),
-      promptId: z.string().optional(),
-      promptIds: z.array(z.string()).optional(),
+      promptId: z.string().optional().describe("Single prompt id. Required for status/watch/cancel; accepted for wait (normalized into a one-element promptIds list)."),
+      promptIds: z.array(z.string()).optional().describe("Prompt ids to wait on. For wait, use this or promptId or all=true."),
       all: z.boolean().optional(),
       limit: z.number().int().min(1).max(100).optional(),
       timeoutSeconds: z.number().int().min(1).optional(),
@@ -93,9 +94,16 @@ export function registerComfyCliTools(server: McpServer): void {
           if (!args.promptId) throw new Error(`promptId is required for jobs ${args.action}`);
           command.push(args.promptId);
         } else if (args.action === "wait") {
+          // Accept the documented singular `promptId` by normalizing it into a
+          // one-element promptIds list before validation (#360).
+          const waitIds = args.promptIds?.length
+            ? args.promptIds
+            : args.promptId
+              ? [args.promptId]
+              : [];
           if (args.all) command.push("--all");
-          else if (args.promptIds?.length) command.push(...args.promptIds);
-          else throw new Error("promptIds or all=true is required for jobs wait");
+          else if (waitIds.length) command.push(...waitIds);
+          else throw new Error("promptId, promptIds, or all=true is required for jobs wait");
         }
         if (args.limit && args.action === "list") command.push("--limit", String(args.limit));
         if (args.timeoutSeconds && ["wait", "watch"].includes(args.action)) command.push("--timeout", String(args.timeoutSeconds));
@@ -132,7 +140,7 @@ export function registerComfyCliTools(server: McpServer): void {
           args.where !== "cloud" &&
           !args.objectInfoPath &&
           !args.workspace &&
-          !resolveComfyCliExecutable({ workspace: args.workspace })
+          !isComfyCliUsable({ workspace: args.workspace })
         ) {
           const results = await searchLiveObjectInfo(args.query, args.limit ?? 20);
           return textEnvelope({
@@ -241,12 +249,17 @@ export function registerComfyCliTools(server: McpServer): void {
         // server, so we don't substitute silently — we fall through and let
         // comfy-cli surface its clear not-found error for that workspace.
         // Mirrors the live /object_info fallback for comfy_cli_search_nodes.
+        // The fallback fires when comfy-cli is UNUSABLE — either absent OR a
+        // found-but-unrecognized/too-old version. An unsupported CLI otherwise
+        // returns `unsupported_version` without attempting the server (#487); the
+        // connected ComfyUI already reports its models via /models (through
+        // listLocalModels), so read-only listing works regardless of the CLI.
         const listAction = isLocalModelsListAction(args.action) ? args.action : undefined;
         if (
           listAction &&
           args.where !== "cloud" &&
           !args.workspace &&
-          !resolveComfyCliExecutable({ workspace: args.workspace })
+          !isComfyCliUsable({ workspace: args.workspace })
         ) {
           const { command, data } = await listLocalModelsFallback({ ...args, action: listAction });
           return textEnvelope({
