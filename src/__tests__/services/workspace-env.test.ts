@@ -25,6 +25,7 @@ const h = vi.hoisted(() => {
   return {
     mockConfig: { comfyuiPath: undefined as string | undefined, resolvedPort: 8188 },
     mockGetSystemStats: vi.fn(),
+    remoteMode: { value: false },
     execFileResponder: (() => new Error("not configured")) as (
       cmd: string,
       args: string[],
@@ -36,8 +37,8 @@ vi.mock("../../config.js", () => ({
   config: h.mockConfig,
   getComfyUIBaseUrl: () => "http://127.0.0.1:8188",
   getComfyUIAuthHeaders: () => ({}),
-  // resolveComfyuiPython → resolveEffectiveComfyUIBase consults isRemoteMode().
-  isRemoteMode: () => false,
+  // resolveComfyuiPython → resolveEffectiveComfyUIBase + getEnvironment consult this.
+  isRemoteMode: () => h.remoteMode.value,
 }));
 
 vi.mock("../../comfyui/client.js", () => ({
@@ -89,6 +90,7 @@ async function tmpDir(): Promise<string> {
 beforeEach(() => {
   mockConfig.comfyuiPath = undefined;
   mockConfig.resolvedPort = 8188;
+  h.remoteMode.value = false;
   mockGetSystemStats.mockReset();
   setExecFileResponder(() => new Error("not configured"));
   resetWorkspaceConfig();
@@ -329,10 +331,14 @@ describe("getEnvironment", () => {
     }
   });
 
-  it("captures the unreachable error and still returns local probes when path set", async () => {
+  it("captures the unreachable error and still returns local probes for a real workspace venv", async () => {
     const dir = await tmpDir();
     const install = join(dir, "ComfyUI");
     await mkdir(install, { recursive: true });
+    // A real workspace venv on disk → resolved.verified, so an unreachable server's
+    // packages are still reported (#401 round 3: only a VERIFIED interpreter is
+    // trusted when unreachable, never a bare PATH fallback).
+    await makeVenvPython(install);
     try {
       configureWorkspace({ configPath: join(dir, "workspace.json") });
       mockConfig.comfyuiPath = install;
@@ -560,6 +566,68 @@ describe("getEnvironment", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it("does NOT trust a bare PATH python when the server is unreachable (#401 / #433 round 3)", async () => {
+    const dir = await tmpDir();
+    const install = join(dir, "ComfyUI"); // configured, but NO venv on disk
+    await mkdir(install, { recursive: true });
+    try {
+      configureWorkspace({ configPath: join(dir, "workspace.json") });
+      mockConfig.comfyuiPath = install;
+      mockGetSystemStats.mockRejectedValueOnce(new Error("ECONNREFUSED"));
+      // A bare PATH python answers, but it is NOT provably the workspace's interpreter.
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version")) return { stdout: "Python 3.11.5\n" };
+        if (args.includes("pip")) return { stdout: "Name: torch\nVersion: 9.9.9\n" };
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.python?.version).toBe("3.11.5");
+      expect(env.local.python_probe_trusted).toBe(false);
+      expect(env.local.packages).toBeUndefined(); // bare PATH packages NOT surfaced
+      expect(env.local.note).toMatch(/#401/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("never trusts a coincident LOCAL interpreter for a REMOTE server (#401 / #433 round 3)", async () => {
+    const dir = await tmpDir();
+    const rootB = join(dir, "B"); // remote server's argv path — also exists LOCALLY
+    await mkdir(rootB, { recursive: true });
+    await makeVenvPython(rootB); // a coincident local venv on the same path
+    try {
+      configureWorkspace({ configPath: join(dir, "workspace.json") });
+      h.remoteMode.value = true; // running ComfyUI is REMOTE
+      mockConfig.comfyuiPath = undefined;
+      // Remote server answers /system_stats; its argv main.py path happens to exist
+      // locally, on the SAME python major.minor.
+      mockGetSystemStats.mockResolvedValueOnce({
+        system: {
+          os: "nt",
+          python_version: "3.12.11",
+          comfyui_version: "0.27.1",
+          argv: [join(rootB, "main.py")],
+        },
+        devices: [],
+      });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version")) return { stdout: "Python 3.12.11\n" };
+        if (args.includes("pip")) return { stdout: "Name: torch\nVersion: 9.9.9\n" };
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      // The local interpreter is NOT the remote server's — never trusted.
+      expect(env.local.python_probe_trusted).toBe(false);
+      expect(env.local.packages).toBeUndefined();
+      expect(env.local.note).toMatch(/REMOTE/i);
+      expect(env.local.note).toMatch(/#401/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("liveRootFromArgv (#401 / #433 — robust argv parsing)", () => {
@@ -616,6 +684,23 @@ describe("resolveComfyuiPython live-first (#401 / #433)", () => {
       expect(res.python).toBe(exeB);
       expect(res.live).toBe(true);
       expect(res.liveRoot).toBe(rootB);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("in REMOTE mode, a coincident local live path is NOT marked live and is not probed", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "comfyui-resolve-"));
+    try {
+      const rootB = join(dir, "B");
+      await mkdir(rootB, { recursive: true });
+      const exeB = await makeVenvPython(rootB);
+
+      const res = resolveComfyuiPython(undefined, [join(rootB, "main.py")], { remote: true });
+      // Live root is still reported for provenance, but it is NOT live/probed locally.
+      expect(res.live).toBe(false);
+      expect(res.python).not.toBe(exeB);
+      expect(res.python).toBe(IS_WIN ? "python.exe" : "python3");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

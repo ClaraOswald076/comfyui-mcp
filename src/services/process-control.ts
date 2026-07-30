@@ -516,7 +516,12 @@ function resolveLaunchCommand(
 ): { exe: string; args: string[] } | null {
   if (info.argv.length === 0) return null;
   const [first, ...rest] = info.argv;
-  const looksLikeScript = /\.pyw?$/i.test(first.trim());
+  // Strip surrounding quotes a launcher may leave on the script path BEFORE the
+  // suffix test — otherwise `"C:\…\main.py"` fails the `.py` check, bypasses the
+  // unified live-first resolver, and gets treated as the executable (#401 / PR #433
+  // round 3). Kept in sync with liveRootFromArgv's quote handling.
+  const firstUnquoted = first.trim().replace(/^["']+/, "").replace(/["']+$/, "");
+  const looksLikeScript = /\.pyw?$/i.test(firstUnquoted);
   if (looksLikeScript) {
     const python = findComfyuiPython(config.comfyuiPath ?? undefined, info.argv);
     if (!python) return null;
@@ -533,11 +538,11 @@ function resolveLaunchCommand(
     // rather than trusting the host `path` module (which mangles `C:\…` / `\`
     // paths on POSIX). The final join stays host-native to match comfyuiPath.
     const isWindowsAbsolute =
-      /^[a-zA-Z]:[\\/]/.test(first) || /^\\\\/.test(first);
-    const scriptBasename = first.split(/[\\/]/).pop() || first;
+      /^[a-zA-Z]:[\\/]/.test(firstUnquoted) || /^\\\\/.test(firstUnquoted);
+    const scriptBasename = firstUnquoted.split(/[\\/]/).pop() || firstUnquoted;
     const script =
-      isAbsolute(first) || isWindowsAbsolute || !config.comfyuiPath
-        ? first
+      isAbsolute(firstUnquoted) || isWindowsAbsolute || !config.comfyuiPath
+        ? firstUnquoted
         : join(config.comfyuiPath, scriptBasename);
     return { exe: python, args: [script, ...rest] };
   }

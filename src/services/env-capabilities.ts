@@ -512,9 +512,19 @@ export async function gatherEnvCapabilities(opts: GatherOptions): Promise<EnvCap
   }
 
   // --- triton + sageattention (resolve the LIVE python, import-probe, ~5s cap) ---
-  const { python, live } = resolveComfyuiPython(opts.comfyuiPath, statsArgv);
-  const tritonTimeout = opts.tritonTimeoutMs ?? 5000;
-  const ts = await withTimeout(probeTritonSage(python, tritonTimeout), tritonTimeout + 1000);
+  // In REMOTE mode the local python-import probe can't reach the server's host, and a
+  // coincident LOCAL path is NOT the remote interpreter — probing it risks BOTH a
+  // false negative and a false positive for the remote server. So skip the probe
+  // entirely and rely solely on the ComfyUI-log positive markers below (#401 round 3).
+  const remote = caps.location === "REMOTE";
+  let live = false;
+  let ts: { triton: TriState; sageattention: TriState; pythonVersion?: string } | undefined;
+  if (!remote) {
+    const resolved = resolveComfyuiPython(opts.comfyuiPath, statsArgv);
+    live = resolved.live;
+    const tritonTimeout = opts.tritonTimeoutMs ?? 5000;
+    ts = await withTimeout(probeTritonSage(resolved.python, tritonTimeout), tritonTimeout + 1000);
+  }
 
   // Only trust a definitive "not-installed" when we probed the LIVE running server's
   // OWN interpreter (#401). Otherwise it can be the WRONG python:
@@ -522,6 +532,7 @@ export async function gatherEnvCapabilities(opts: GatherOptions): Promise<EnvCap
   //   2. A different/persisted workspace that merely happens to have a venv — its
   //      negative would still be a false report about the running instance.
   //   3. Its major.minor disagrees with what /system_stats reports.
+  //   4. REMOTE mode — no local interpreter is the server's (probe skipped above).
   // In each case a "not-installed" is untrustworthy, so we degrade it to "unknown"
   // rather than emit a false negative that makes an agent disable working
   // acceleration. A positive ("installed") is still reported — it can't be a false
