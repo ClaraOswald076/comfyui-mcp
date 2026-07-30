@@ -92,6 +92,29 @@ export function resolveEffectiveComfyUIBase(): string | undefined {
   return getSavedDefaultWorkspaceSync();
 }
 
+/**
+ * The LIVE connected server's own install root, derived from its /system_stats
+ * launch argv (the `main.py` path — see liveRootFromArgv). This is the ComfyUI
+ * that is ACTUALLY running, so it is the source of truth for where a download /
+ * node install must land — even when COMFYUI_PATH is unset, OR points at a
+ * DIFFERENT, stale install than the connected one (#490/#463). Returns undefined
+ * in remote mode (the live root is a path on the REMOTE host, not usable as a
+ * local target), when the server is unreachable, or when argv yields no
+ * resolvable absolute root. Best-effort and NEVER throws.
+ */
+export async function resolveLiveComfyUIBase(): Promise<string | undefined> {
+  if (isRemoteMode()) return undefined;
+  try {
+    const stats = await getSystemStats();
+    return liveRootFromArgv(
+      stats.system?.argv,
+      (stats.system as { cwd?: string })?.cwd,
+    );
+  } catch {
+    return undefined;
+  }
+}
+
 async function readWorkspaceConfig(): Promise<WorkspaceConfig> {
   const path = workspaceConfigPath();
   if (!existsSync(path)) return {};
@@ -352,6 +375,31 @@ export function liveRootFromArgv(
     return undefined; // cannot resolve to an absolute dir → UNRESOLVED
   }
   return undefined;
+}
+
+/**
+ * Resolve the Python interpreter that ACTUALLY belongs to a ComfyUI install
+ * `root`, honoring EVERY layout ComfyUI ships with — portable Windows builds keep
+ * python under `standalone-env` / `python_embeded` (NOT just `.venv`/`venv`). Used
+ * by apply_manifest's pip installs and the cloned-node deps installer so those run
+ * under the install's OWN interpreter, not a bare system `python` that would
+ * contaminate the host env while reporting success (#463 codex review). Returns
+ * the first candidate present on disk, else a bare platform python name as a last
+ * resort. `undefined` root → bare python.
+ */
+export function resolveRootInterpreter(root: string | undefined): string {
+  const names = IS_WIN ? ["python.exe", "python"] : ["python3", "python"];
+  if (root) {
+    for (const c of interpreterCandidates(root)) {
+      if (/^\\\\/.test(c)) continue; // skip UNC (existsSync can block on dead shares)
+      try {
+        if (existsSync(c)) return c;
+      } catch {
+        // ignore and continue
+      }
+    }
+  }
+  return names[0];
 }
 
 /** Platform interpreter candidates under a ComfyUI install root, most-preferred first. */

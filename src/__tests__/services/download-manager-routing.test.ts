@@ -15,6 +15,14 @@ const hoisted = vi.hoisted(() => ({
   base: undefined as string | undefined,
   stats: undefined as unknown,
   statsThrows: false,
+  // Whether an argv-derived live root is present on THIS filesystem. A
+  // Docker/forwarded loopback server's container path is not host-local → false.
+  liveRootExists: true,
+}));
+
+// The live-root routing branch only streams local when the root exists locally.
+vi.mock("node:fs", () => ({
+  existsSync: () => hoisted.liveRootExists,
 }));
 
 // isRemoteMode is the first gate; keep every other real config export.
@@ -49,6 +57,7 @@ beforeEach(() => {
   hoisted.base = undefined;
   hoisted.stats = undefined;
   hoisted.statsThrows = false;
+  hoisted.liveRootExists = true;
 });
 
 describe("shouldDispatchDownloadToManager (#420 reconnect routing)", () => {
@@ -70,6 +79,29 @@ describe("shouldDispatchDownloadToManager (#420 reconnect routing)", () => {
     // to — hand the fetch to its Manager rather than failing.
     hoisted.base = undefined;
     hoisted.stats = { system: { argv: ["main.py", "--listen"] } };
+    expect(await shouldDispatchDownloadToManager()).toBe(true);
+  });
+
+  it("#463: no local base + reachable server whose ABSOLUTE main.py root is resolvable → streams local", async () => {
+    // A panel-connected local ComfyUI with no COMFYUI_PATH/default, launched with
+    // an absolute main.py path and NO --base-directory. Its own install root is
+    // derivable from argv (the same live-first root resolveModelsDir writes into),
+    // so stream locally into it instead of bouncing through the Manager (which
+    // would fail when Manager isn't installed).
+    hoisted.base = undefined;
+    hoisted.stats = {
+      system: { argv: ["python", "/opt/ComfyUI/main.py", "--listen"] },
+    };
+    expect(await shouldDispatchDownloadToManager()).toBe(false);
+  });
+
+  it("no local base + reachable server whose absolute main.py root is NOT present locally (Docker/forwarded) → Manager route", async () => {
+    // Container-side main.py path resolvable but not on the host FS — must NOT be
+    // treated as a local stream target (would create a bogus host dir); route the
+    // fetch through the connected Manager (server-side write) instead.
+    hoisted.base = undefined;
+    hoisted.liveRootExists = false;
+    hoisted.stats = { system: { argv: ["python", "/app/ComfyUI/main.py"] } };
     expect(await shouldDispatchDownloadToManager()).toBe(true);
   });
 

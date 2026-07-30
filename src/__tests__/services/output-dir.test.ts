@@ -1,8 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { isAbsolute, join, resolve } from "node:path";
 
+let remoteMode = false;
 vi.mock("../../config.js", () => ({
   config: { comfyuiPath: "/comfy" as string | undefined },
+  isRemoteMode: () => remoteMode,
+}));
+
+// resolveModelsDir only adopts an argv-derived live root when it EXISTS locally
+// (a Docker/forwarded server's container path must NOT be treated as host-local).
+// Control existence per test; default true so the live-root paths resolve.
+let liveRootExists = true;
+vi.mock("node:fs", () => ({
+  existsSync: () => liveRootExists,
 }));
 
 const getSystemStats = vi.fn();
@@ -13,10 +23,18 @@ vi.mock("../../comfyui/client.js", () => ({
 // resolveModelsDir's local fallback (COMFYUI_PATH → default workspace) is resolved
 // through the shared helper; back it by the mocked config + a settable default
 // workspace so tests can exercise the "no COMFYUI_PATH but a default workspace" path.
+// liveRootFromArgv is the REAL implementation (pure argv parsing) so the live-first
+// resolution (#490/#463) is exercised end to end, not stubbed away.
 let savedDefaultWorkspace: string | undefined;
-vi.mock("../../services/workspace-env.js", () => ({
-  resolveEffectiveComfyUIBase: () => config.comfyuiPath ?? savedDefaultWorkspace,
-}));
+vi.mock("../../services/workspace-env.js", async () => {
+  const actual = await vi.importActual<
+    typeof import("../../services/workspace-env.js")
+  >("../../services/workspace-env.js");
+  return {
+    resolveEffectiveComfyUIBase: () => config.comfyuiPath ?? savedDefaultWorkspace,
+    liveRootFromArgv: actual.liveRootFromArgv,
+  };
+});
 
 import {
   parseOutputDirFromArgv,
@@ -37,6 +55,8 @@ beforeEach(() => {
   getSystemStats.mockReset();
   (config as { comfyuiPath?: string }).comfyuiPath = "/comfy";
   savedDefaultWorkspace = undefined;
+  remoteMode = false;
+  liveRootExists = true;
 });
 
 afterEach(() => {
@@ -235,6 +255,52 @@ describe("models dir + extra-config argv parsing (#345/#346/#369)", () => {
 
   it("resolveModelsDir falls back to <COMFYUI_PATH>/models when unreachable", async () => {
     getSystemStats.mockRejectedValue(new Error("ECONNREFUSED"));
+    expect(await resolveModelsDir()).toBe(resolve("/comfy", "models"));
+  });
+
+  it("resolveModelsDir prefers the LIVE server's own main.py root over a stale COMFYUI_PATH when no --base-directory flag (#490)", async () => {
+    // Reproduces #490: the connected ComfyUI runs from a different install than
+    // the stale COMFYUI_PATH, and was NOT launched with --base-directory. The
+    // download must land in the LIVE install (its main.py root), not COMFYUI_PATH.
+    const liveRoot = resolve("/home/parn/repositories/wet/ComfyUI");
+    (config as { comfyuiPath?: string }).comfyuiPath = resolve("/home/parn/ComfyUI");
+    getSystemStats.mockResolvedValue({
+      system: { argv: ["python", join(liveRoot, "main.py"), "--listen"] },
+    });
+    const got = await resolveModelsDir();
+    expect(got).toBe(join(liveRoot, "models"));
+    expect(got).not.toBe(join(resolve("/home/parn/ComfyUI"), "models"));
+  });
+
+  it("resolveModelsDir resolves the live root when COMFYUI_PATH is unset and no default workspace (#463)", async () => {
+    (config as { comfyuiPath?: string }).comfyuiPath = undefined;
+    savedDefaultWorkspace = undefined;
+    const liveRoot = resolve("/opt/live/ComfyUI");
+    getSystemStats.mockResolvedValue({
+      system: { argv: ["python", join(liveRoot, "main.py")] },
+    });
+    expect(await resolveModelsDir()).toBe(join(liveRoot, "models"));
+  });
+
+  it("resolveModelsDir does NOT adopt an argv live root that isn't present locally (Docker/forwarded server) — falls back to COMFYUI_PATH", async () => {
+    // A loopback ComfyUI inside Docker reports a container-side main.py path that
+    // does not exist on the host; writing there would create a bogus host dir.
+    liveRootExists = false;
+    (config as { comfyuiPath?: string }).comfyuiPath = resolve("/host/ComfyUI");
+    getSystemStats.mockResolvedValue({
+      system: { argv: ["python", "/app/ComfyUI/main.py"] },
+    });
+    expect(await resolveModelsDir()).toBe(join(resolve("/host/ComfyUI"), "models"));
+  });
+
+  it("resolveModelsDir does NOT adopt the live argv root in remote mode (remote path isn't a local dir)", async () => {
+    remoteMode = true;
+    const liveRoot = resolve("/remote/host/ComfyUI");
+    getSystemStats.mockResolvedValue({
+      system: { argv: ["python", join(liveRoot, "main.py")] },
+    });
+    // Remote mode with a local COMFYUI_PATH: never uses the remote main.py path;
+    // falls back to the local COMFYUI_PATH/models.
     expect(await resolveModelsDir()).toBe(resolve("/comfy", "models"));
   });
 

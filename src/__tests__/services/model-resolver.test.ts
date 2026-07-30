@@ -1,4 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
+import { resolve } from "node:path";
 
 // Control config (comfyuiPath + tokens) per test.
 vi.mock("../../config.js", () => {
@@ -24,12 +25,16 @@ vi.mock("../../services/node-management.js", () => ({
 const mkdirMock = vi.fn();
 const rmMock = vi.fn();
 const statMock = vi.fn();
+const lstatMock = vi.fn();
+const realpathMock = vi.fn();
 vi.mock("node:fs/promises", () => ({
   copyFile: vi.fn(),
   link: vi.fn(),
+  lstat: (...a: unknown[]) => lstatMock(...a),
   mkdir: (...a: unknown[]) => mkdirMock(...a),
   readdir: vi.fn(),
   readFile: vi.fn(),
+  realpath: (...a: unknown[]) => realpathMock(...a),
   rename: vi.fn(),
   rm: (...a: unknown[]) => rmMock(...a),
   stat: (...a: unknown[]) => statMock(...a),
@@ -62,6 +67,9 @@ beforeEach(() => {
   mkdirMock.mockReset().mockResolvedValue(undefined);
   rmMock.mockReset().mockResolvedValue(undefined);
   statMock.mockReset().mockRejectedValue(new Error("missing"));
+  // Default: nothing in the path is a symlink (best-effort guard is inert).
+  lstatMock.mockReset().mockResolvedValue({ isSymbolicLink: () => false });
+  realpathMock.mockReset().mockImplementation((p: string) => Promise.resolve(p));
   installModelViaManagerMock.mockReset().mockResolvedValue({
     mechanism: "manager-http",
     message: "queued",
@@ -96,6 +104,62 @@ describe("downloadModel — filename path safety", () => {
       downloadModel("https://example.com/x", "checkpoints", ".."),
     ).rejects.toBeInstanceOf(ModelError);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects a destination whose ancestor is a symlink escaping the models dir, and never fetches (#490)", async () => {
+    // The write-target resolver must guard the ACTUAL destination: a symlinked
+    // subfolder that realpaths OUTSIDE models/ can't be used as a write root even
+    // though the path string stays within models/.
+    const escapeDir = resolve("/comfy/models/checkpoints");
+    lstatMock.mockImplementation((p: string) =>
+      Promise.resolve({ isSymbolicLink: () => p === escapeDir }),
+    );
+    realpathMock.mockImplementation((p: string) =>
+      Promise.resolve(p === escapeDir ? resolve("/tmp/outside") : p),
+    );
+
+    await expect(
+      downloadModel("https://example.com/x.safetensors", "checkpoints", "x.safetensors"),
+    ).rejects.toThrow(/symlink in the path escapes it|outside the models/i);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("allows a models ROOT that is itself a symlink/junction to another location", async () => {
+    // A ComfyUI install may legitimately junction its whole models dir onto
+    // another drive. The root canonicalizes elsewhere BY DESIGN — that must not
+    // be treated as an escape (only DESCENDANTS are checked, against the canonical
+    // root).
+    const modelsRoot = resolve("/comfy/models");
+    const realModelsRoot = resolve("/mnt/big/models");
+    lstatMock.mockImplementation((p: string) =>
+      Promise.resolve({ isSymbolicLink: () => p === modelsRoot }),
+    );
+    realpathMock.mockImplementation((p: string) =>
+      Promise.resolve(p === modelsRoot ? realModelsRoot : p),
+    );
+    const target = await resolveDownloadTarget(
+      "https://example.com/x.safetensors",
+      "checkpoints",
+      "x.safetensors",
+    );
+    expect(target.targetDir).toBe(resolve("/comfy/models/checkpoints"));
+  });
+
+  it("allows a symlinked subfolder that stays inside the models dir", async () => {
+    const linkDir = resolve("/comfy/models/checkpoints");
+    lstatMock.mockImplementation((p: string) =>
+      Promise.resolve({ isSymbolicLink: () => p === linkDir }),
+    );
+    // realpath resolves to another location STILL under models/ → allowed.
+    realpathMock.mockImplementation((p: string) =>
+      Promise.resolve(p === linkDir ? resolve("/comfy/models/_real_ckpts") : p),
+    );
+    const target = await resolveDownloadTarget(
+      "https://example.com/x.safetensors",
+      "checkpoints",
+      "x.safetensors",
+    );
+    expect(target.targetDir).toBe(resolve("/comfy/models/checkpoints"));
   });
 });
 

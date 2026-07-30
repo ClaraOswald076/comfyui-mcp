@@ -1,7 +1,8 @@
+import { existsSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
-import { config } from "../config.js";
+import { config, isRemoteMode } from "../config.js";
 import { getSystemStats } from "../comfyui/client.js";
-import { resolveEffectiveComfyUIBase } from "./workspace-env.js";
+import { resolveEffectiveComfyUIBase, liveRootFromArgv } from "./workspace-env.js";
 import { ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 
@@ -138,12 +139,47 @@ export function parseExtraModelPathsConfigsFromArgv(argv: string[] | undefined):
 export async function resolveModelsDir(): Promise<string> {
   try {
     const stats = await getSystemStats();
-    const fromArgv = parseModelsDirFromArgv(stats.system?.argv);
+    const argv = stats.system?.argv;
+    const fromArgv = parseModelsDirFromArgv(argv);
     if (fromArgv) {
       logger.debug("Resolved ComfyUI models directory from launch argv", {
         modelsDir: fromArgv,
       });
       return fromArgv;
+    }
+    // No explicit --base-directory/--models-directory flag: derive the models
+    // root from the LIVE connected server's OWN install root (its main.py path in
+    // argv). That is the ComfyUI actually running, so a download lands where it
+    // reads models — NOT in a stale/other COMFYUI_PATH that points at a different
+    // install (#490/#463). Skip in remote mode: the live root is a path on the
+    // remote host, not a local directory we can write to.
+    //
+    // LIMITATION: this needs an ABSOLUTE main.py in argv (or a server-reported
+    // cwd). A server launched as `python main.py` reports a bare/relative argv[0]
+    // and ComfyUI does not currently report cwd, so the root is UNRESOLVABLE — we
+    // then fall through to the COMFYUI_PATH/default below. That's the safe default
+    // (there is no information to do better); when COMFYUI_PATH is unset, the
+    // download instead routes through the connected server's Manager, which writes
+    // into the real install regardless (see shouldDispatchDownloadToManager).
+    if (!isRemoteMode()) {
+      const liveRoot = liveRootFromArgv(
+        argv,
+        (stats.system as { cwd?: string })?.cwd,
+      );
+      // Only adopt the live root when it ACTUALLY EXISTS on this filesystem. A
+      // loopback ComfyUI inside Docker / behind an SSH port-forward reports a
+      // container-side main.py path that is not the host's — writing there would
+      // create a bogus host dir the server never reads. When it isn't locally
+      // present we fall through to COMFYUI_PATH/default (and shouldDispatchDownload-
+      // ToManager routes the fetch through the server's Manager instead).
+      if (liveRoot && existsSync(liveRoot)) {
+        const dir = join(liveRoot, "models");
+        logger.debug(
+          "Resolved ComfyUI models directory from the live server's main.py root",
+          { modelsDir: dir },
+        );
+        return dir;
+      }
     }
   } catch (err) {
     logger.debug(

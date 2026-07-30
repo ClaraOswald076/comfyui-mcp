@@ -81,6 +81,8 @@ import {
   getEnvironment,
   liveRootFromArgv,
   resolveComfyuiPython,
+  resolveLiveComfyUIBase,
+  resolveRootInterpreter,
 } from "../../services/workspace-env.js";
 
 async function tmpDir(): Promise<string> {
@@ -666,6 +668,67 @@ describe("liveRootFromArgv (#401 / #433 — robust argv parsing)", () => {
   it("returns undefined for missing/empty argv", () => {
     expect(liveRootFromArgv(undefined)).toBeUndefined();
     expect(liveRootFromArgv([])).toBeUndefined();
+  });
+});
+
+describe("resolveRootInterpreter (portable + venv layouts)", () => {
+  it("finds the install's own .venv interpreter on disk", async () => {
+    const root = await tmpDir();
+    try {
+      const py = await makeVenvPython(root);
+      expect(resolveRootInterpreter(root)).toBe(py);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("prefers a portable python_embeded layout on Windows", async () => {
+    if (!IS_WIN) return; // python_embeded candidates are Windows-only
+    const root = await tmpDir();
+    try {
+      const embDir = join(root, "python_embeded");
+      await mkdir(embDir, { recursive: true });
+      const emb = join(embDir, "python.exe");
+      await writeFile(emb, "", "utf-8");
+      expect(resolveRootInterpreter(root)).toBe(emb);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to a bare platform python when nothing is on disk / root is undefined", async () => {
+    const root = await tmpDir();
+    try {
+      expect(resolveRootInterpreter(root)).toBe(IS_WIN ? "python.exe" : "python3");
+      expect(resolveRootInterpreter(undefined)).toBe(IS_WIN ? "python.exe" : "python3");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("resolveLiveComfyUIBase (#490 / #463 — live connected install root)", () => {
+  it("derives the live root from the running server's main.py argv", async () => {
+    const root = IS_WIN ? "C:\\live\\ComfyUI" : "/live/ComfyUI";
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: [join(root, "main.py"), "--listen"] },
+    });
+    expect(await resolveLiveComfyUIBase()).toBe(root);
+  });
+
+  it("returns undefined in remote mode (the live root is on the remote host)", async () => {
+    h.remoteMode.value = true;
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: [IS_WIN ? "C:\\remote\\main.py" : "/remote/main.py"] },
+    });
+    expect(await resolveLiveComfyUIBase()).toBeUndefined();
+    // Never even probes /system_stats when remote.
+    expect(mockGetSystemStats).not.toHaveBeenCalled();
+  });
+
+  it("returns undefined (never throws) when the server is unreachable", async () => {
+    mockGetSystemStats.mockRejectedValue(new Error("ECONNREFUSED"));
+    await expect(resolveLiveComfyUIBase()).resolves.toBeUndefined();
   });
 });
 
