@@ -240,6 +240,31 @@ describe("download job registry", () => {
     expect(hoisted.lastDispatchArg).toBe(false);
   });
 
+  it("#420 cross-call dedup: a Manager→local flip BETWEEN two calls still finds the one in-flight job", async () => {
+    // The registry index must be ROUTE-INDEPENDENT (#420 codex round 2). Two
+    // SEPARATE calls for the SAME request, with a reachability flip between them
+    // (call 1 → Manager, call 2 → local), used to compute DIFFERENT keys (remote
+    // tuple vs resolved local path) — so call 2 missed the in-flight entry and
+    // started a SECOND writer onto one file. With a stable request key, call 2
+    // adopts call 1.
+    hoisted.dispatchQueue.push(true, false);
+    const first = await startDownloadJob(URL_A, "loras");
+    const second = await startDownloadJob(URL_A, "loras");
+    expect(second.job).toBe(first.job); // same in-flight job, no duplicate
+    expect(hoisted.calls).toBe(1); // exactly ONE writer for the request
+    expect(listDownloadJobs()).toHaveLength(1); // one registry entry, not two
+  });
+
+  it("#420 cross-call dedup: a local→Manager flip BETWEEN two calls also finds the one job", async () => {
+    // The reverse flip direction must dedup too.
+    hoisted.dispatchQueue.push(false, true);
+    const first = await startDownloadJob(URL_A, "loras");
+    const second = await startDownloadJob(URL_A, "loras");
+    expect(second.job).toBe(first.job);
+    expect(hoisted.calls).toBe(1);
+    expect(listDownloadJobs()).toHaveLength(1);
+  });
+
   it("lists newest first", async () => {
     await startDownloadJob(URL_A, "checkpoints");
     await new Promise((r) => setTimeout(r, 2));
