@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.21] - 2026-07-30
+
+### Fixed
+- **SEVERE: `download_model` no longer saves an auth/error response body as a model file and reports success (#473).** A remote CivitAI (or any) download that returned an HTML login/auth page or a JSON error — often with a 200 status — was streamed verbatim into a `.safetensors`/`.ckpt`/model file and reported as a successful download, leaving a corrupt file in the models dir. Every finalize path (HTTP stream, cache-hit, coalesced, cloud, direct-fallback) now runs an authoritative content-type/magic-byte gate BEFORE materializing: HTML/JSON payloads are rejected with an actionable error (Content-Type authority for model destinations + body-magic that handles leading whitespace/control bytes), the cloud/direct path fails **closed** when the payload can't be sniffed, and a poisoned cache entry/partial can't be served on reuse (persisted Content-Type + rejected-marker + body re-sniff). Verified to NOT reject legitimate downloads (real safetensors/GGUF/pickle/ONNX/raw-bin stay binary; sidecar-less cached models still served). (#511)
+- **`panel_run` derives its verdict from ComfyUI's reply instead of a bare `queued` flag (#213, #194, #331, #248).** A rejected prompt (top-level error, or non-empty `node_errors`, even alongside a stale `queued:true`) is now surfaced as a FAILURE rather than a false `queued:true`; a root SaveImage run-to-node is accepted (not mis-rejected as a subgraph node); the "you'll be notified" note is only appended on a genuine queue (not when no tab is connected); and a thrown `app.queuePrompt` preserves its error detail. (#521)
+- **`get_workflow` returns the workflow JSON even when there are conversion warnings (#494); `get_image` is binary-safe (#483); `enqueue_workflow` surfaces ComfyUI's 400 validation details (#485).** (#520)
+
 ## [0.48.20] - 2026-07-30
 
 ### Fixed
