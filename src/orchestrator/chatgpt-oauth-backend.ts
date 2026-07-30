@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { logger } from "../utils/logger.js";
+import { errorText } from "./error-text.js";
 import type { AgentEvent, BackendStartOptions, ModelChoice, NeutralTurn } from "./agent-backend.js";
 import { CHATGPT_CAPABILITIES } from "./agent-backend.js";
 import { resolveOpenAICodexOAuth } from "../services/code-provider-auth.js";
@@ -46,7 +47,7 @@ type TurnMessage = {
 };
 
 function msgOf(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  return errorText(err);
 }
 
 /** Codex model slugs (gpt-5.x, codex-*) — not Claude panel ids. */

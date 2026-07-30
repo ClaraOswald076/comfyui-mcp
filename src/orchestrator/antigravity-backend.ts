@@ -72,6 +72,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { logger } from "../utils/logger.js";
+import { errorText, promptText } from "./error-text.js";
 import { buildAgentSpawnEnv } from "../services/panel-secrets.js";
 import {
   type AgentBackend,
@@ -84,7 +85,7 @@ import {
 import type { GeminiMcpServerSpec } from "./gemini-backend.js";
 
 function msgOf(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  return errorText(err);
 }
 
 /** Kill an entire process tree (identical posture to gemini/codex-backend):
@@ -564,11 +565,11 @@ export class AntigravityBackend implements AgentBackend {
     cwd: string,
     onActivity?: () => void,
   ): AsyncGenerator<AgentEvent> {
-    let text = turn.text;
+    let text = promptText(turn.text);
     if (this.needsSystemPreamble && this.deps.systemAppend) {
       text =
         `<system>\n${this.deps.systemAppend}\n</system>\n\n` +
-        `The user's first message follows.\n\n${turn.text}`;
+        `The user's first message follows.\n\n${text}`;
       this.needsSystemPreamble = false;
     }
     // Image refs: no documented -p image input — the refs are already named in

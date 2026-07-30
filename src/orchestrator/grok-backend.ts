@@ -63,6 +63,7 @@ import readline from "node:readline";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { logger } from "../utils/logger.js";
+import { errorText, promptText } from "./error-text.js";
 import { buildAgentSpawnEnv } from "../services/panel-secrets.js";
 import {
   type AgentBackend,
@@ -83,7 +84,7 @@ import { OAUTH_PROVIDERS, assertAllowedTokenHost, grokTokenFile, redactTokens } 
 import { OllamaBackend } from "./ollama-backend.js";
 
 function msgOf(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  return errorText(err);
 }
 
 /**
@@ -1028,11 +1029,11 @@ export class GrokBackend implements AgentBackend {
     // FIRST-TURN PERSONA: ACP session/new has no instructions field, so the panel
     // system prompt is prepended to the first turn's prompt as a clearly-marked
     // system/context preamble (later turns send plain text). Mirrors codex.
-    let turnText = turn.text;
+    let turnText = promptText(turn.text);
     if (this.needsSystemPreamble && this.deps.systemAppend) {
       turnText =
         `<system>\n${this.deps.systemAppend}\n</system>\n\n` +
-        `The user's first message follows.\n\n${turn.text}`;
+        `The user's first message follows.\n\n${turnText}`;
       this.needsSystemPreamble = false;
     }
 
