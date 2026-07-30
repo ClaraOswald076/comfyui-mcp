@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.16] - 2026-07-30
+
+### Fixed
+- **`panel_restart_comfyui` no longer reports a false timeout/failure after a reboot that actually succeeded (#493, #222, #263, #266, #306, #307).** The panel path sends `comfy_reboot` over the UI bridge; because the Manager reboot handler returns the moment it accepts the request, ComfyUI (and the tab it serves) drops before it can ack — and the bridge surfaced that expected drop as a mutating-command `OUTCOME UNKNOWN` failure, which the tool returned verbatim. It now classifies the `comfy_reboot` result (confirmed / expected-drop / refusal): on confirmed-or-drop it resets caches and polls readiness (`nodes_queue_status`, auto-healing onto the reconnected tab) up to a generous wall-clock budget, returning success with recovery timing; a genuine refusal is still returned verbatim, and a server that never comes back within the budget still reports a clear failure. The headless `restart_comfyui` path (#400/#476) is untouched. (#497)
+
 ## [0.48.15] - 2026-07-30
 
 ### Fixed
