@@ -988,9 +988,9 @@ async function renameTempOverDestination(tmp: string, targetPath: string): Promi
   } catch (err) {
     const code = (err as NodeJS.ErrnoException)?.code;
     // ONLY on Windows does rename fail because it can't replace an existing file
-    // (EPERM/EACCES/EEXIST) — only there do we remove-and-retry. On POSIX rename
-    // atomically replaces, so ANY error there is a real failure that must NOT
-    // destroy a valid existing destination: clean the temp and propagate.
+    // (EPERM/EACCES/EEXIST). On POSIX rename atomically replaces, so ANY error
+    // there is a real failure that must NOT destroy a valid destination: clean the
+    // temp and propagate.
     const windowsOverwrite =
       process.platform === "win32" &&
       (code === "EPERM" || code === "EACCES" || code === "EEXIST");
@@ -998,10 +998,23 @@ async function renameTempOverDestination(tmp: string, targetPath: string): Promi
       await downloadCacheFs.rm(tmp, { force: true }).catch(() => undefined);
       throw err;
     }
-    await downloadCacheFs.rm(targetPath, { force: true }).catch(() => undefined);
+    // Windows: move the existing destination ASIDE first, then swap the temp in.
+    // If the swap fails, RESTORE the backup — a valid destination must never be
+    // lost even when the retry itself errors (#467).
+    const backup = `${targetPath}.bak-${randomBytes(9).toString("hex")}.tmp`;
+    let backedUp = false;
+    try {
+      await downloadCacheFs.rename(targetPath, backup);
+      backedUp = true;
+    } catch {
+      /* destination may not exist — nothing to move aside */
+    }
     try {
       await downloadCacheFs.rename(tmp, targetPath);
+      if (backedUp) await downloadCacheFs.rm(backup, { force: true }).catch(() => undefined);
     } catch (e) {
+      // Swap failed — put the original destination back, drop our temp.
+      if (backedUp) await downloadCacheFs.rename(backup, targetPath).catch(() => undefined);
       await downloadCacheFs.rm(tmp, { force: true }).catch(() => undefined);
       throw e;
     }

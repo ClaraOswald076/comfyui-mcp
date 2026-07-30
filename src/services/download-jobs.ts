@@ -96,18 +96,33 @@ function normalizeLocalDestKey(key: string): string {
     : key;
 }
 
-/** The LOCAL serialization key: collapse symlinks/junctions via realpath on the
- *  parent dir (best-effort — the dir may not exist yet, so fall back to the lexical
- *  path), then case-normalize. Two aliased subfolders resolving to ONE physical file
- *  then share a chain (#467 P1-C). */
-async function localSerializeKey(targetPath: string): Promise<string> {
-  let realParent: string;
-  try {
-    realParent = await realpath(dirname(targetPath));
-  } catch {
-    realParent = dirname(targetPath);
+/** realpath the DEEPEST EXISTING ANCESTOR of `p` and re-append the not-yet-created
+ *  tail. `realpath(p)` alone fails (and falls back to the lexical path) whenever any
+ *  descendant is absent — but the writer mkdir's the tree later, so a symlink/
+ *  junction in the EXISTING prefix must still be collapsed (#467 P1-C). Walking up
+ *  to the deepest existing dir collapses that prefix regardless of the missing tail. */
+async function realpathDeepestExisting(p: string): Promise<string> {
+  const tail: string[] = [];
+  let current = p;
+  for (;;) {
+    try {
+      const real = await realpath(current);
+      return tail.length ? join(real, ...tail.reverse()) : real;
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) return p; // reached the root without resolving — give up
+      tail.push(basename(current));
+      current = parent;
+    }
   }
-  return normalizeLocalDestKey(join(realParent, basename(targetPath)));
+}
+
+/** The LOCAL serialization key: collapse symlinks/junctions in the destination path
+ *  (via the deepest existing ancestor), then case-normalize — so two aliased
+ *  subfolders resolving to ONE physical file share a chain (#467 P1-C). */
+async function localSerializeKey(targetPath: string): Promise<string> {
+  const real = await realpathDeepestExisting(targetPath);
+  return normalizeLocalDestKey(real);
 }
 
 /** The REMOTE serialization key. The Manager writes ONE server-side file per
@@ -125,11 +140,15 @@ function remoteSerializeKey(url: string, targetSubfolder: string, filename?: str
       name = url.split(/[/?#]/).filter(Boolean).pop();
     }
   }
+  // Mirror the Manager writer's trim() then separator-normalize so ` loras/sub `,
+  // `loras/sub`, and `loras//sub` all canonicalize to one key (#467 P1-C).
   const sub = String(targetSubfolder ?? "")
+    .trim()
     .split(/[/\\]+/)
+    .map((s) => s.trim())
     .filter(Boolean)
     .join("/");
-  return `remote:${sub}/${name || "model"}`.toLowerCase();
+  return `remote:${sub}/${(name || "model").trim()}`.toLowerCase();
 }
 
 /**

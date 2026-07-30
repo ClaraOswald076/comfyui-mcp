@@ -967,6 +967,17 @@ describe("downloadModel cache", () => {
     expect(cloudPrincipalKey(s3url, {})).toBe(cloudPrincipalKey(s3url, {}));
     expect(alice).toBe(cloudPrincipalKey(s3url, { s3: { access_key_id: "AK-ALICE", secret_access_key: "x" } }));
 
+    // SDK-level endpoint env vars change the EFFECTIVE endpoint even with explicit
+    // creds → must change the identity (#467 P1-B).
+    const explicit = { s3: { access_key_id: "AK", secret_access_key: "x" } };
+    const baseline = cloudPrincipalKey(s3url, explicit);
+    const prevEp = process.env.AWS_ENDPOINT_URL_S3;
+    process.env.AWS_ENDPOINT_URL_S3 = "https://minio.internal:9000";
+    const withEp = cloudPrincipalKey(s3url, explicit);
+    if (prevEp !== undefined) process.env.AWS_ENDPOINT_URL_S3 = prevEp;
+    else delete process.env.AWS_ENDPOINT_URL_S3;
+    expect(withEp).not.toBe(baseline);
+
     // A non-cloud URL contributes no cloud discriminator.
     expect(cloudPrincipalKey("https://example.com/x.safetensors", {})).toBe("");
   });
@@ -1074,6 +1085,42 @@ describe("downloadModel cache", () => {
     await expect(readFile(dest, "utf-8")).resolves.toBe("ORIGINAL-PRECIOUS-BYTES");
     const leftovers = (await readdir(comfyDir)).filter((f) => f.includes(".mat-") || f.includes(".dl-"));
     expect(leftovers).toHaveLength(0);
+    renameSpy.mockRestore();
+  });
+
+  it("preserves the existing destination when the Windows overwrite retry itself fails (#467)", async () => {
+    if (process.platform !== "win32") return; // the backup/restore path is Windows-only
+    const { downloadWithCache } = await import("../../services/download-cache.js");
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    await fsPromises.mkdir(comfyDir, { recursive: true });
+    const dest = join(comfyDir, "precious.safetensors");
+    await writeFile(dest, "ORIGINAL-PRECIOUS-BYTES");
+
+    // Force materialize to fail (link/copy) so the DIRECT fallback runs, then make
+    // the fallback's temp→dest swap EPERM (triggers the Windows backup dance) and
+    // its RETRY EIO (the retry itself fails) — the original dest must be restored.
+    const linkSpy = vi.spyOn(downloadCacheFs, "link").mockRejectedValue(Object.assign(new Error("EXDEV"), { code: "EXDEV" }));
+    const copySpy = vi.spyOn(downloadCacheFs, "copyFile").mockRejectedValue(Object.assign(new Error("EIO"), { code: "EIO" }));
+    let dlToDestAttempts = 0;
+    const renameSpy = vi.spyOn(downloadCacheFs, "rename").mockImplementation(async (from: string, to: string) => {
+      if (String(from).includes(".dl-") && to === dest) {
+        dlToDestAttempts += 1;
+        // First: EPERM (can't overwrite) → backup dance. Retry: EIO (retry fails).
+        throw Object.assign(new Error(dlToDestAttempts === 1 ? "EPERM" : "EIO"), { code: dlToDestAttempts === 1 ? "EPERM" : "EIO" });
+      }
+      return fsPromises.rename(from, to); // dest→backup and backup→dest restore run for real
+    });
+
+    const url = "https://example.com/models/winretry.safetensors";
+    fetchMock.mockImplementation(() => Promise.resolve(okResponse("NEW-BYTES")));
+
+    await expect(downloadWithCache({ url, headers: {}, targetPath: dest })).rejects.toThrow(/EIO/i);
+    // The original destination was RESTORED (never lost), despite the failed retry.
+    await expect(readFile(dest, "utf-8")).resolves.toBe("ORIGINAL-PRECIOUS-BYTES");
+    const leftovers = (await readdir(comfyDir)).filter((f) => /\.(dl|bak)-/.test(f));
+    expect(leftovers).toHaveLength(0);
+    linkSpy.mockRestore();
+    copySpy.mockRestore();
     renameSpy.mockRestore();
   });
 

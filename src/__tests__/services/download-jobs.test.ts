@@ -73,7 +73,10 @@ import {
   resetDownloadJobs,
   downloadIdFor,
 } from "../../services/download-jobs.js";
-import { downloadModel } from "../../services/model-resolver.js";
+import { downloadModel, resolveDownloadTarget } from "../../services/model-resolver.js";
+import { mkdtemp, mkdir, symlink, rm as fsRm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join as pathJoin } from "node:path";
 
 const URL_A = "https://huggingface.co/org/repo/resolve/main/big.safetensors";
 const URL_B = "https://huggingface.co/org/repo/resolve/main/other.safetensors";
@@ -398,6 +401,54 @@ describe("download job registry", () => {
       expect(hoisted.calls).toBe(2);
     } else {
       expect(hoisted.calls).toBe(2); // case-sensitive FS → genuinely different files
+    }
+  });
+
+  it("serializes REMOTE different-auth jobs whose subfolders canonicalize to one destination (#467 P1-C)", async () => {
+    hoisted.remote = true; // Manager dispatch — no local target resolution
+    // Same file+URL, subfolders that trim/normalize to the SAME remote destination,
+    // but DIFFERENT auth → distinct jobs that must be serialized (one server file).
+    const a = await startDownloadJob(URL_A, " loras/sub ", "m.safetensors", { type: "bearer", token: "alice" });
+    const b = await startDownloadJob(URL_A, "loras//sub", "m.safetensors", { type: "bearer", token: "bob" });
+    expect(b.job).not.toBe(a.job); // distinct (different auth)
+    expect(hoisted.calls).toBe(1); // serialized on the canonical remote destination
+    hoisted.resolvers[0].resolve("ok");
+    await a.settled;
+    await new Promise((r) => setTimeout(r, 0));
+    expect(hoisted.calls).toBe(2);
+  });
+
+  it("serializes different-auth jobs whose SYMLINKED subfolders resolve to one physical file (#467 P1-C)", async () => {
+    // Build base/real and base/alias -> base/real; the destination tail (sub/m)
+    // doesn't exist yet (the writer would mkdir it), exercising the deepest-existing
+    // -ancestor realpath collapse.
+    const base = await mkdtemp(pathJoin(tmpdir(), "djobs-symlink-"));
+    const realDir = pathJoin(base, "real");
+    const aliasDir = pathJoin(base, "alias");
+    await mkdir(realDir, { recursive: true });
+    try {
+      await symlink(realDir, aliasDir, "junction");
+    } catch {
+      await fsRm(base, { recursive: true, force: true });
+      return; // symlinks/junctions unsupported here — skip
+    }
+    try {
+      // Two distinct-auth jobs whose resolved targetPaths differ only by alias vs real.
+      vi.mocked(resolveDownloadTarget)
+        .mockResolvedValueOnce({ targetDir: pathJoin(aliasDir, "sub"), filename: "m.safetensors", targetPath: pathJoin(aliasDir, "sub", "m.safetensors") })
+        .mockResolvedValueOnce({ targetDir: pathJoin(realDir, "sub"), filename: "m.safetensors", targetPath: pathJoin(realDir, "sub", "m.safetensors") });
+
+      const a = await startDownloadJob(URL_A, "checkpoints", "m.safetensors", { type: "bearer", token: "alice" });
+      const b = await startDownloadJob(URL_A, "checkpoints", "m.safetensors", { type: "bearer", token: "bob" });
+      expect(b.job).not.toBe(a.job); // distinct (different auth + different lexical path)
+      // realpath collapses alias→real for the EXISTING prefix, so both share a chain.
+      expect(hoisted.calls).toBe(1);
+      hoisted.resolvers[0].resolve("ok");
+      await a.settled;
+      await new Promise((r) => setTimeout(r, 0));
+      expect(hoisted.calls).toBe(2);
+    } finally {
+      await fsRm(base, { recursive: true, force: true });
     }
   });
 
