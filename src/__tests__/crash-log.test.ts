@@ -93,6 +93,70 @@ ValueError: bad input
     expect(r.fingerprint).toBeUndefined();
   });
 
+  it("does NOT treat a swallowed 'Exception ignored in: __del__' block as a crash", () => {
+    // CPython prints but SWALLOWS exceptions raised in __del__/weakref callbacks
+    // during GC. The process keeps running (subsequent prompts succeed), so the
+    // native signature INSIDE this block must not trip the crash banner.
+    const swallowed = [
+      "2026-07-28 17:11:20 [INFO] got prompt",
+      "Exception ignored in: <function HostBuffer.__del__ at 0x0>",
+      "Traceback (most recent call last):",
+      '  File "~/.venv/Lib/site-packages/comfy_aimdo/host_buffer.py", line 129, in __del__',
+      "    lib.hostbuf_free(ptr)",
+      "OSError: exception: access violation writing 0x0000000000000024",
+      "2026-07-28 17:11:22 [INFO] Prompt executed in 7.18 seconds",
+      "2026-07-28 17:17:22 [INFO] got prompt",
+      "2026-07-28 17:17:30 [INFO] Prompt executed in 8.00 seconds",
+    ].join("\n");
+    const r = parseCrashBlock(swallowed);
+    expect(r.fatal).toBe(false);
+    expect(r.block).toBe("");
+    expect(r.fingerprint).toBeUndefined();
+  });
+
+  it("STILL flags a real native crash that appears after an earlier swallowed __del__ block", () => {
+    // A swallowed destructor block earlier in the tail must not suppress a genuine
+    // process crash that happens later.
+    const mixed = [
+      "Exception ignored in: <function HostBuffer.__del__ at 0x0>",
+      "Traceback (most recent call last):",
+      '  File "~/comfy_aimdo/host_buffer.py", line 129, in __del__',
+      "OSError: exception: access violation writing 0x24",
+      "2026-07-28 17:11:22 [INFO] Prompt executed in 7.18 seconds",
+      "",
+      "Windows fatal exception: access violation",
+      "",
+      "Current thread 0x00004abc (most recent call first):",
+      '  File "C:\\\\ComfyUI\\\\custom_nodes\\\\SomeNode\\\\nodes.py", line 42 in run',
+    ].join("\n");
+    const r = parseCrashBlock(mixed);
+    expect(r.fatal).toBe(true);
+    expect(r.culpritNode).toBe("SomeNode");
+    expect(r.culpritFrame).toBe("nodes.py:42");
+  });
+
+  it("flags a real crash after a swallowed block even with CRLF line endings", () => {
+    // Windows logs use CRLF. The blank-line boundary in the swallowed-block
+    // look-back must recognize "\r\n\r\n", or a genuine crash within 1200 chars
+    // of an earlier swallowed block gets wrongly filtered out.
+    const mixed = [
+      "Exception ignored in: <function HostBuffer.__del__ at 0x0>",
+      "Traceback (most recent call last):",
+      '  File "~/comfy_aimdo/host_buffer.py", line 129, in __del__',
+      "OSError: exception: access violation writing 0x24",
+      "[INFO] Prompt executed in 7.18 seconds",
+      "",
+      "Windows fatal exception: access violation",
+      "",
+      "Current thread 0x00004abc (most recent call first):",
+      '  File "C:\\\\ComfyUI\\\\custom_nodes\\\\SomeNode\\\\nodes.py", line 42 in run',
+    ].join("\r\n");
+    const r = parseCrashBlock(mixed);
+    expect(r.fatal).toBe(true);
+    expect(r.culpritNode).toBe("SomeNode");
+    expect(r.culpritFrame).toBe("nodes.py:42");
+  });
+
   it("fingerprints a crash stably so it can be deduped", () => {
     const a = parseCrashBlock(WAN_CRASH);
     const b = parseCrashBlock(WAN_CRASH + "\n[INFO] more log appended after restart\n");
