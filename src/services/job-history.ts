@@ -187,7 +187,9 @@ export function extractExecutionStats(
  *
  * Shapes in the wild: `{ text: ["hi"] }` (the common one), `{ text: "hi" }`, and
  * packs that use `string` instead of `text`. Non-string scalars are stringified;
- * empty strings are dropped so a node that emitted nothing stays absent.
+ * empty strings are PRESERVED — a ShowText node that legitimately emitted "" is a
+ * real (present-but-empty) output and must be reported, not silently dropped. A
+ * node with no `text`/`string` field at all still stays absent (nothing pushed).
  */
 export function extractTextOutputs(entry: HistoryEntry): TextOutput[] {
   const results: TextOutput[] = [];
@@ -202,11 +204,11 @@ export function extractTextOutputs(entry: HistoryEntry): TextOutput[] {
     for (const key of ["text", "string"] as const) {
       const value = record[key];
       if (typeof value === "string") {
-        if (value.length > 0) text.push(value);
+        text.push(value);
       } else if (Array.isArray(value)) {
         for (const item of value) {
           if (typeof item === "string") {
-            if (item.length > 0) text.push(item);
+            text.push(item);
           } else if (typeof item === "number" || typeof item === "boolean") {
             text.push(String(item));
           }

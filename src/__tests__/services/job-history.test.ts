@@ -73,9 +73,25 @@ describe("extractTextOutputs", () => {
     ]);
   });
 
-  it("stringifies non-string scalars and drops empty strings", () => {
+  it("stringifies non-string scalars and preserves empty strings", () => {
     const entry = outputsEntry({ "3": { text: ["", 42, true, "keep"] } });
-    expect(extractTextOutputs(entry)).toEqual([{ node_id: "3", text: ["42", "true", "keep"] }]);
+    expect(extractTextOutputs(entry)).toEqual([
+      { node_id: "3", text: ["", "42", "true", "keep"] },
+    ]);
+  });
+
+  it("reports a ShowText node that legitimately emitted an empty string (#373)", () => {
+    // { text: [""] } is a present-but-empty output, not an absent one — it must
+    // be reported so the agent sees the node ran and produced "".
+    expect(extractTextOutputs(outputsEntry({ "5": { text: [""] } }))).toEqual([
+      { node_id: "5", text: [""] },
+    ]);
+    expect(extractTextOutputs(outputsEntry({ "5": { text: "" } }))).toEqual([
+      { node_id: "5", text: [""] },
+    ]);
+    expect(analyzeHistoryEntry(outputsEntry({ "5": { text: [""] } })).text_outputs).toEqual([
+      { node_id: "5", text: [""] },
+    ]);
   });
 
   it("collects text from multiple nodes and ignores image-only nodes", () => {
@@ -93,7 +109,6 @@ describe("extractTextOutputs", () => {
   it("returns nothing for image-only, empty, or malformed outputs", () => {
     expect(extractTextOutputs(outputsEntry({ "5": { images: [] } }))).toEqual([]);
     expect(extractTextOutputs(outputsEntry({ "5": { text: [] } }))).toEqual([]);
-    expect(extractTextOutputs(outputsEntry({ "5": { text: [""] } }))).toEqual([]);
     expect(extractTextOutputs(outputsEntry({ "5": null as unknown as object }))).toEqual([]);
     expect(extractTextOutputs({ prompt: {}, status: {} } as unknown as HistoryEntry)).toEqual([]);
   });
