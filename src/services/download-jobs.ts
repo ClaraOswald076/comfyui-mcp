@@ -15,6 +15,8 @@
  */
 
 import { createHash } from "node:crypto";
+import { realpath } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import {
   downloadModel,
   resolveDownloadTarget,
@@ -77,20 +79,57 @@ const jobs = new Map<string, Entry>();
 // each runs post-download work (onComplete) against it. Running them concurrently
 // lets one job's writer replace the destination WHILE the other's onComplete reads
 // it — so Alice's callback could process Bob's bytes. We serialize by the auth-free
-// destination path so each job's download+materialize+onComplete sees ITS OWN bytes
+// destination so each job's download+materialize+onComplete sees ITS OWN bytes
 // uninterrupted; the final on-disk file is deterministically the last-started job's
-// (inherent: one path can hold one file). Keyed by the resolved targetPath (LOCAL
-// downloads only — the Manager writes server-side and has no local race).
+// (inherent: one path can hold one file). Keyed by the realpath-collapsed,
+// case-normalized LOCAL targetPath, OR a canonical remote:<subfolder>/<name> for
+// Manager-dispatched jobs (which write ONE server-side file per subfolder+name).
 const destChains = new Map<string, Promise<void>>();
 
-/** Canonicalize a destination key for the serialization chain. Case-insensitive
- *  filesystems (Windows always; macOS by default) alias `Checkpoints/m` and
- *  `checkpoints/m` to ONE physical file, so lower-case the key there to serialize
- *  those too (#467 P1-C). POSIX (Linux) is case-sensitive — leave it exact. */
-function normalizeDestKey(key: string): string {
+/** Canonicalize a LOCAL destination key for the serialization chain. Case-
+ *  insensitive filesystems (Windows always; macOS by default) alias `Checkpoints/m`
+ *  and `checkpoints/m` to ONE physical file, so lower-case the key there to
+ *  serialize those too (#467 P1-C). POSIX (Linux) is case-sensitive — leave exact. */
+function normalizeLocalDestKey(key: string): string {
   return process.platform === "win32" || process.platform === "darwin"
     ? key.toLowerCase()
     : key;
+}
+
+/** The LOCAL serialization key: collapse symlinks/junctions via realpath on the
+ *  parent dir (best-effort — the dir may not exist yet, so fall back to the lexical
+ *  path), then case-normalize. Two aliased subfolders resolving to ONE physical file
+ *  then share a chain (#467 P1-C). */
+async function localSerializeKey(targetPath: string): Promise<string> {
+  let realParent: string;
+  try {
+    realParent = await realpath(dirname(targetPath));
+  } catch {
+    realParent = dirname(targetPath);
+  }
+  return normalizeLocalDestKey(join(realParent, basename(targetPath)));
+}
+
+/** The REMOTE serialization key. The Manager writes ONE server-side file per
+ *  (subfolder, name); derive the name the way the resolve/Manager path does
+ *  (URL pathname basename when no explicit filename) and normalize separators so
+ *  `a//b` == `a/b` and query variants collapse. The remote host's case-sensitivity
+ *  is UNKNOWN here, so lower-case unconditionally — over-serializing is safe, under-
+ *  serializing (concurrent same-file writes) is not (#467 P1-C). */
+function remoteSerializeKey(url: string, targetSubfolder: string, filename?: string): string {
+  let name = filename;
+  if (!name) {
+    try {
+      name = basename(new URL(url).pathname);
+    } catch {
+      name = url.split(/[/?#]/).filter(Boolean).pop();
+    }
+  }
+  const sub = String(targetSubfolder ?? "")
+    .split(/[/\\]+/)
+    .filter(Boolean)
+    .join("/");
+  return `remote:${sub}/${name || "model"}`.toLowerCase();
 }
 
 /**
@@ -242,11 +281,9 @@ export async function startDownloadJob(
     // the SAME on-disk destination with DIFFERENT auth are DIFFERENT downloads
     // (different representations) and must NOT dedup to one writer/one job.
     destKey = downloadJobIdFor(`${target.targetPath}\n${authIdentity(auth)}`);
-    serializeKey = normalizeDestKey(target.targetPath);
+    serializeKey = await localSerializeKey(target.targetPath);
   } else {
-    const remoteName =
-      filename ?? (url.split(/[/?#]/).filter(Boolean).pop() ?? "model");
-    serializeKey = normalizeDestKey(`remote:${String(targetSubfolder ?? "").trim()}/${remoteName}`);
+    serializeKey = remoteSerializeKey(url, targetSubfolder, filename);
   }
   // The PUBLIC id (download_status handle): the destination key when we have one
   // (so distinct destinations are separately pollable), else the request key.

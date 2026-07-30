@@ -987,7 +987,14 @@ async function renameTempOverDestination(tmp: string, targetPath: string): Promi
     return;
   } catch (err) {
     const code = (err as NodeJS.ErrnoException)?.code;
-    if (code !== "EPERM" && code !== "EACCES" && code !== "EEXIST") {
+    // ONLY on Windows does rename fail because it can't replace an existing file
+    // (EPERM/EACCES/EEXIST) — only there do we remove-and-retry. On POSIX rename
+    // atomically replaces, so ANY error there is a real failure that must NOT
+    // destroy a valid existing destination: clean the temp and propagate.
+    const windowsOverwrite =
+      process.platform === "win32" &&
+      (code === "EPERM" || code === "EACCES" || code === "EEXIST");
+    if (!windowsOverwrite) {
       await downloadCacheFs.rm(tmp, { force: true }).catch(() => undefined);
       throw err;
     }

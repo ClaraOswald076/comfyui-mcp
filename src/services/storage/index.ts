@@ -42,7 +42,15 @@ export function cloudPrincipalKey(url: string, auth: CloudStorageAuth = {}): str
   let raw: string | undefined;
   if (isS3Url(url)) {
     const s3 = auth.s3;
-    const endpoint = s3?.endpoint ?? process.env.AWS_S3_ENDPOINT ?? "";
+    // makeS3Client sets config.endpoint = auth.endpoint ?? AWS_S3_ENDPOINT; when
+    // that's unset the AWS SDK still resolves an endpoint from AWS_ENDPOINT_URL_S3 /
+    // AWS_ENDPOINT_URL — fold ALL of them so changing the effective S3 service behind
+    // one s3:// URL never reuses the prior endpoint's cache entry (#467 P1-B).
+    const endpoint = [
+      s3?.endpoint ?? process.env.AWS_S3_ENDPOINT ?? "",
+      process.env.AWS_ENDPOINT_URL_S3 ?? "",
+      process.env.AWS_ENDPOINT_URL ?? "",
+    ].join("|");
     const region = s3?.region ?? process.env.AWS_REGION ?? "";
     const accessKeyId = s3?.access_key_id ?? process.env.AWS_ACCESS_KEY_ID ?? "";
     const secretAccessKey = s3?.secret_access_key ?? process.env.AWS_SECRET_ACCESS_KEY ?? "";
