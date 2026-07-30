@@ -17,6 +17,14 @@ vi.mock("../../services/comfy-cli.js", () => ({
   },
 }));
 
+const fallbackMocks = vi.hoisted(() => ({ fallback: vi.fn() }));
+vi.mock("../../services/local-models-fallback.js", async () => {
+  const actual = await vi.importActual<typeof import("../../services/local-models-fallback.js")>(
+    "../../services/local-models-fallback.js",
+  );
+  return { ...actual, listLocalModelsFallback: fallbackMocks.fallback };
+});
+
 import { registerComfyCliTools } from "../../tools/comfy-cli.js";
 
 type Handler = (args: Record<string, any>) => Promise<CallToolResult>;
@@ -47,8 +55,10 @@ describe("comfy-cli MCP command construction", () => {
   beforeEach(() => {
     mocks.run.mockReset();
     mocks.run.mockResolvedValue(envelope());
-    mocks.resolve.mockClear();
+    mocks.resolve.mockReset();
+    mocks.resolve.mockReturnValue("/bin/comfy");
     mocks.version.mockClear();
+    fallbackMocks.fallback.mockReset();
   });
 
   it("uses the same workspace for status path and version", async () => {
@@ -112,6 +122,33 @@ describe("comfy-cli MCP command construction", () => {
       ["model", "download", "--url", "https://example.com/m.safetensors", "--relative-path", "models/loras"],
       ["model", "remove", "--relative-path", "models/loras", "--model-names", "a.safetensors b.safetensors"],
     ]);
+  });
+
+  it("falls back to the live server for local listing when comfy-cli is absent (#460)", async () => {
+    mocks.resolve.mockReturnValue(undefined); // comfy-cli not on PATH
+    fallbackMocks.fallback.mockResolvedValue({
+      command: "models list-folders",
+      data: { folders: ["checkpoints", "loras"] },
+    });
+    const result = await handlers().get("comfy_cli_models")!({ action: "list-folders", where: "local" });
+    expect(mocks.run).not.toHaveBeenCalled();
+    expect(fallbackMocks.fallback).toHaveBeenCalledWith(expect.objectContaining({ action: "list-folders" }));
+    const parsed = JSON.parse((result.content[0] as { text: string }).text);
+    expect(parsed).toMatchObject({ ok: true, source: "local_models", data: { folders: ["checkpoints", "loras"] } });
+  });
+
+  it("does NOT fall back when a workspace is pinned — comfy-cli surfaces its own error", async () => {
+    mocks.resolve.mockReturnValue(undefined);
+    await handlers().get("comfy_cli_models")!({ action: "list-folders", where: "local", workspace: "/ws" });
+    expect(fallbackMocks.fallback).not.toHaveBeenCalled();
+    expect(mocks.run).toHaveBeenCalled();
+  });
+
+  it("does NOT fall back for mutation actions like download", async () => {
+    mocks.resolve.mockReturnValue(undefined);
+    await handlers().get("comfy_cli_models")!({ action: "download", url: "https://example.com/m.safetensors" });
+    expect(fallbackMocks.fallback).not.toHaveBeenCalled();
+    expect(mocks.run).toHaveBeenCalled();
   });
 
   it("keeps skill installation dry-run unless apply is explicit", async () => {
