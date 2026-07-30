@@ -119,15 +119,30 @@ export function downloadJobIdFor(targetPath: string): string {
  * locally-resolvable job is ALSO indexed under its destination key (below) so the
  * "two different URLs → one local destination → one writer" dedup still holds.
  */
+/** A stable per-request discriminator for the caller's auth/representation. The
+ *  JOB layer dedups BEFORE the header-aware cache layer is reached, and it is
+ *  otherwise auth-blind — so without this, two concurrent same-URL+same-dest
+ *  calls with DIFFERENT bearer/custom headers would adopt the FIRST job and the
+ *  second caller would get the first's bytes AND resume callback (#467 P1-A). The
+ *  `auth` param is the per-caller differentiator (config-global tokens are
+ *  identical across concurrent calls, so they need not enter the key). Two auth
+ *  encodings that transmit the SAME headers may still be split here — harmless:
+ *  they then coalesce correctly at the cache layer (same representation). */
+function authIdentity(auth?: DownloadAuth): string {
+  return auth ? createHash("sha256").update(JSON.stringify(auth)).digest("hex").slice(0, 12) : "";
+}
+
 function requestDownloadKey(
   url: string,
   targetSubfolder: string,
   filename?: string,
+  auth?: DownloadAuth,
 ): string {
   const canonical = JSON.stringify([
     url,
     String(targetSubfolder ?? "").trim(),
     filename ?? null,
+    authIdentity(auth),
   ]);
   return createHash("sha256").update(canonical).digest("hex").slice(0, 16);
 }
@@ -186,11 +201,14 @@ export async function startDownloadJob(
   // "two different URLs → same local destination → one writer" dedup (WS-4). An
   // invalid filename/subfolder is REJECTED here (by resolveDownloadTarget), up
   // front, exactly as the write would reject it.
-  const reqKey = requestDownloadKey(url, targetSubfolder, filename);
+  const reqKey = requestDownloadKey(url, targetSubfolder, filename, auth);
   let destKey: string | undefined;
   if (!dispatchToManager) {
     const target = await resolveDownloadTarget(url, targetSubfolder, filename);
-    destKey = downloadJobIdFor(target.targetPath);
+    // Fold auth into the destination key too (#467 P1-A): two concurrent calls to
+    // the SAME on-disk destination with DIFFERENT auth are DIFFERENT downloads
+    // (different representations) and must NOT dedup to one writer/one job.
+    destKey = downloadJobIdFor(`${target.targetPath}\n${authIdentity(auth)}`);
   }
   // The PUBLIC id (download_status handle): the destination key when we have one
   // (so distinct destinations are separately pollable), else the request key.

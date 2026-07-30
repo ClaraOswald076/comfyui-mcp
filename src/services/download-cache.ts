@@ -189,10 +189,22 @@ function representationKey(headers: Record<string, string>): string {
   return relevant ? createHash("sha256").update(relevant).digest("hex").slice(0, 12) : "";
 }
 
+/** Cache-identity namespace. Bumped when the identity SCHEME changes so entries
+ *  from an older scheme can never be served under the new one. Critically this
+ *  fixes a cross-auth leak (#467 P1-C): the PRE-header-aware code cached
+ *  header-authenticated downloads under the BARE URL, so without a namespace a
+ *  post-upgrade UNAUTHENTICATED caller (also bare-URL) could be served bytes that
+ *  were cached earlier under someone's auth. We can't tell a legacy entry's
+ *  provenance, so ALL new identities — authed AND unauthed — are prefixed, which
+ *  orphans every legacy `sha256(url)` entry (a one-time re-download; orphans age
+ *  out via LRU when COMFYUI_LRU_CACHE_SIZE_GB is set, else are inert on disk). */
+const CACHE_NS = "v2";
+
 function cacheIdentity(url: string, headers: Record<string, string>): string {
   const repr = representationKey(headers);
-  // Backward compatible: no auth headers ⇒ hash the bare URL exactly as before.
-  return repr ? `${url}\n${repr}` : url;
+  // Namespaced for BOTH authed and unauthed so neither can collide with a legacy
+  // bare-URL entry of unknown auth provenance (#467 P1-C).
+  return repr ? `${CACHE_NS}\n${url}\n${repr}` : `${CACHE_NS}\n${url}`;
 }
 
 function cachePathForUrl(url: string, headers: Record<string, string> = {}): string {
@@ -698,9 +710,24 @@ async function streamUrlToFile(
     } catch {
       actual = undefined;
     }
-    // Couldn't read a real size (e.g. the fs layer is stubbed in tests, or stat
-    // hiccuped) → can't verify, so don't block a download over a missing number.
-    if (actual === undefined) return;
+    // Couldn't read the written size. FAIL CLOSED when we have an authoritative
+    // expected total to check against (#467 P1-B): a transient stat failure must
+    // NOT let an early/oversized body be finalized (renamed into cache) as a
+    // success — that is exactly the silent-corruption class #343 guards. Keep the
+    // partial on disk (it may still be range-resumable) and error instead. Only
+    // when NO expected total is known (server sent no Content-Length/Content-Range)
+    // do we return — there is nothing to verify against, so a missing size can't
+    // prove corruption and mustn't block the download.
+    if (actual === undefined) {
+      if (expectedTotal > 0) {
+        throw new ModelError(
+          `Download could not be verified: expected ${expectedTotal} bytes but the written file size ` +
+            `couldn't be read — not finalizing (the file may be incomplete). Retry.`,
+          { url: logUrl },
+        );
+      }
+      return;
+    }
     if (actual === 0) {
       // Nothing landed — remove it (and its validator sidecar) so it can't
       // masquerade as a real file / poison a resume with a validator that has

@@ -325,4 +325,33 @@ describe("download job registry", () => {
     await startDownloadJob(URL_B, "loras");
     expect(listDownloadJobs()[0].url).toBe(URL_B);
   });
+
+  // #467 P1-A: the job layer dedups BEFORE the header-aware cache layer, so it must
+  // fold auth into its keys — otherwise two concurrent same-URL+same-dest calls with
+  // DIFFERENT auth adopt the first job and the second caller gets the first's bytes
+  // AND resume callback.
+  it("does NOT coalesce concurrent same-URL+same-dest jobs with DIFFERENT auth", async () => {
+    const a = await startDownloadJob(URL_A, "checkpoints", undefined, { type: "bearer", token: "alice" });
+    const b = await startDownloadJob(URL_A, "checkpoints", undefined, { type: "bearer", token: "bob" });
+    // Two separate in-flight writers/jobs — the second was NOT adopted.
+    expect(b.job).not.toBe(a.job);
+    expect(b.job.id).not.toBe(a.job.id);
+    expect(hoisted.calls).toBe(2);
+    expect(listDownloadJobs()).toHaveLength(2);
+  });
+
+  it("STILL coalesces concurrent same-URL+same-dest jobs with the SAME auth", async () => {
+    const a = await startDownloadJob(URL_A, "checkpoints", undefined, { type: "bearer", token: "same" });
+    const b = await startDownloadJob(URL_A, "checkpoints", undefined, { type: "bearer", token: "same" });
+    expect(b.job).toBe(a.job); // adopted the in-flight job (one writer)
+    expect(hoisted.calls).toBe(1);
+    expect(listDownloadJobs()).toHaveLength(1);
+  });
+
+  it("does NOT let an authenticated job adopt a concurrent UNauthenticated one (same dest)", async () => {
+    const pub = await startDownloadJob(URL_A, "checkpoints"); // no auth
+    const authed = await startDownloadJob(URL_A, "checkpoints", undefined, { type: "bearer", token: "x" });
+    expect(authed.job).not.toBe(pub.job);
+    expect(hoisted.calls).toBe(2);
+  });
 });

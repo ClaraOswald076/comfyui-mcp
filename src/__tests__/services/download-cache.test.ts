@@ -1,6 +1,7 @@
 import { mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -29,6 +30,24 @@ import type { ResumeDiagnostic } from "../../services/download-resume-diag.js";
 function resumeCapture() {
   const box: { d?: ResumeDiagnostic } = {};
   return { box, onResume: (d: ResumeDiagnostic) => { box.d = d; } };
+}
+
+/** Mirror of the impl's cache identity (download-cache.ts): the 32-hex cache-file
+ *  hash for a URL + optional request headers. Kept in lockstep with cacheIdentity
+ *  — namespaced (#467 P1-C) and header-aware (#467 P1-2). */
+function reprFor(headers: Record<string, string> = {}): string {
+  const keys = Object.keys(headers);
+  if (keys.length === 0) return "";
+  const joined = keys
+    .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
+    .map((k) => `${k.toLowerCase()}=${headers[k]}`)
+    .join("\n");
+  return createHash("sha256").update(joined).digest("hex").slice(0, 12);
+}
+function cacheHashFor(url: string, headers: Record<string, string> = {}): string {
+  const repr = reprFor(headers);
+  const identity = repr ? `v2\n${url}\n${repr}` : `v2\n${url}`;
+  return createHash("sha256").update(identity).digest("hex").slice(0, 32);
 }
 
 const fetchMock = vi.fn();
@@ -130,10 +149,8 @@ describe("downloadModel cache", () => {
   it("resumes from a leftover partial file using HTTP Range and appends a 206 response", async () => {
     await fsPromises.mkdir(cacheDir, { recursive: true });
     // Pre-seed the .partial that the cache deterministic-names.
-    // The cache key derives from sha256(url).slice(0,32) + the URL's pathname extension.
     const url = "https://example.com/models/resume.safetensors";
-    const { createHash } = await import("node:crypto");
-    const hash = createHash("sha256").update(url).digest("hex").slice(0, 32);
+    const hash = cacheHashFor(url);
     const partialPath = join(cacheDir, `.${hash}.safetensors.partial`);
     await writeFile(partialPath, "AAAA"); // 4 bytes of prior progress
     // A resume is only attempted when we hold the validator captured on the
@@ -165,8 +182,7 @@ describe("downloadModel cache", () => {
   it("overwrites the partial when the server replies 200 (Range unsupported)", async () => {
     await fsPromises.mkdir(cacheDir, { recursive: true });
     const url = "https://example.com/models/norange.safetensors";
-    const { createHash } = await import("node:crypto");
-    const hash = createHash("sha256").update(url).digest("hex").slice(0, 32);
+    const hash = cacheHashFor(url);
     const partialPath = join(cacheDir, `.${hash}.safetensors.partial`);
     await writeFile(partialPath, "STALE_PARTIAL_CONTENT");
     // With a validator present we send Range+If-Range; the server ignoring the
@@ -272,9 +288,8 @@ describe("downloadModel cache", () => {
   });
 
   // Deterministic cache paths for a URL (mirrors cachePathForUrl in the impl).
-  async function cachePaths(url: string) {
-    const { createHash } = await import("node:crypto");
-    const hash = createHash("sha256").update(url).digest("hex").slice(0, 32);
+  function cachePaths(url: string, headers: Record<string, string> = {}) {
+    const hash = cacheHashFor(url, headers);
     const target = join(cacheDir, `${hash}.safetensors`);
     const partial = join(cacheDir, `.${hash}.safetensors.partial`);
     return { hash, target, partial, sidecar: `${partial}.etag` };
@@ -850,8 +865,7 @@ describe("downloadModel cache", () => {
     await fsPromises.mkdir(cacheDir, { recursive: true });
     await fsPromises.mkdir(comfyDir, { recursive: true });
     const url = "https://example.com/models/coalesce-diag.safetensors";
-    const { createHash } = await import("node:crypto");
-    const hash = createHash("sha256").update(url).digest("hex").slice(0, 32);
+    const hash = cacheHashFor(url);
     // Validator-less partial → the ONE physical download declines + reports.
     await writeFile(join(cacheDir, `.${hash}.safetensors.partial`), "OLDPARTIALBYTES");
 
@@ -883,8 +897,7 @@ describe("downloadModel cache", () => {
     await fsPromises.mkdir(cacheDir, { recursive: true });
     await fsPromises.mkdir(comfyDir, { recursive: true });
     const url = "https://example.com/models/cachehit-clear.safetensors";
-    const { createHash } = await import("node:crypto");
-    const hash = createHash("sha256").update(url).digest("hex").slice(0, 32);
+    const hash = cacheHashFor(url);
     // A COMPLETE cache entry → this download is a hit (no fetch, no streamUrlToFile).
     await writeFile(join(cacheDir, `${hash}.safetensors`), "CACHED-BYTES");
 
@@ -901,12 +914,10 @@ describe("downloadModel cache", () => {
     await fsPromises.mkdir(cacheDir, { recursive: true });
     await fsPromises.mkdir(comfyDir, { recursive: true });
     const url = "https://example.com/models/p2.safetensors";
-    const { createHash } = await import("node:crypto");
     // Alice and Bob use different auth → different physical cache identities, so
     // each seeds its OWN validator-less partial and gets its OWN decision.
     for (const who of ["alice", "bob"]) {
-      const repr = createHash("sha256").update(`authorization=Bearer ${who}`).digest("hex").slice(0, 12);
-      const id = createHash("sha256").update(`${url}\n${repr}`).digest("hex").slice(0, 32);
+      const id = cacheHashFor(url, { Authorization: `Bearer ${who}` });
       await writeFile(join(cacheDir, `.${id}.safetensors.partial`), `OLD-${who}`);
     }
     fetchMock.mockResolvedValueOnce(okResponse("ALICE-FRESH"));
@@ -920,6 +931,26 @@ describe("downloadModel cache", () => {
     // Each caller received its own decline — no shared key, no cross-talk.
     expect(capA.box.d?.outcome).toBe("declined:no-validator");
     expect(capB.box.d?.outcome).toBe("declined:no-validator");
+  });
+
+  it("does NOT serve a LEGACY bare-URL cache entry to an unauthenticated caller — no cross-auth leak (#467 P1-C)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    await fsPromises.mkdir(comfyDir, { recursive: true });
+    const url = "https://example.com/models/legacy.safetensors";
+    // Simulate a PRE-upgrade entry cached under the bare-URL namespace (sha256(url),
+    // no "v2" prefix) — which the OLD code ALSO used for AUTHENTICATED downloads,
+    // so serving it to a new unauthenticated caller would leak auth-scoped bytes.
+    const legacyHash = createHash("sha256").update(url).digest("hex").slice(0, 32);
+    await writeFile(join(cacheDir, `${legacyHash}.safetensors`), "LEAKED-AUTHED-BYTES");
+
+    fetchMock.mockResolvedValueOnce(okResponse("FRESH-PUBLIC-BYTES"));
+    const { downloadWithCache } = await import("../../services/download-cache.js");
+    const out = join(comfyDir, "legacy-out.safetensors");
+    await downloadWithCache({ url, headers: {}, targetPath: out });
+
+    // The legacy entry is namespaced away → a fresh download happened, no leak.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await expect(readFile(out, "utf-8")).resolves.toBe("FRESH-PUBLIC-BYTES");
   });
 
   it("never serves a 0-byte cache entry as a hit — re-downloads instead (#343 edge)", async () => {
