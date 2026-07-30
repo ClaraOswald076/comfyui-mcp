@@ -353,6 +353,11 @@ async function streamUrlToFile(
   // both as the sidecar fallback (so Xet downloads become resumable) AND as the
   // resume-time change check below (#467).
   let redirectValidator: string | null = null;
+  // Set if ANY hop in the redirect chain reports a content-addressed X-Linked-Etag
+  // that DIFFERS from the validator the partial was written against — proof the
+  // upstream object changed, even if a later/earlier hop happens to match. Closes
+  // the multi-hop hole where only the first (or last) value is inspected (#467).
+  let sawChangedRedirectValidator = false;
   // Did the bytes ultimately come from a DIFFERENT origin than we requested (HF
   // resolve → CAS CDN)? A cross-origin 206 can't lean on the requesting origin's
   // If-Range — the CDN may honor a stale Range and 206 a CHANGED object — so a
@@ -373,7 +378,15 @@ async function streamUrlToFile(
     // object hash) on the 302; the final CAS 200 carries NO validator. Without
     // this, Xet downloads never persisted a sidecar and could never resume (#467).
     // ONLY X-Linked-Etag — a generic ETag on a 3xx is the pointer's, not the file's.
-    if (!redirectValidator) redirectValidator = res.headers.get("x-linked-etag");
+    // Keep the LAST value seen (nearest the final object) for the sidecar/match,
+    // AND flag if ANY hop's value contradicts the persisted validator on a resume.
+    const hopValidator = res.headers.get("x-linked-etag");
+    if (hopValidator) {
+      redirectValidator = hopValidator;
+      if (requestedResume && priorValidator && hopValidator !== priorValidator) {
+        sawChangedRedirectValidator = true;
+      }
+    }
 
     if (redirectCount >= MAX_HTTP_REDIRECTS) {
       throw new ModelError(
@@ -465,7 +478,9 @@ async function streamUrlToFile(
   // gated — a 200 is a full body and restarts cleanly through the branch below.
   // On refusal, drop the partial + sidecar so a retry is a clean full download.
   if (requestedResume && res.status === 206) {
-    const provenChange = redirectValidator !== null && redirectValidator !== priorValidator;
+    const provenChange =
+      sawChangedRedirectValidator ||
+      (redirectValidator !== null && redirectValidator !== priorValidator);
     const unprovenCrossOrigin = crossOriginRedirect && redirectValidator !== priorValidator; // includes missing
     if (provenChange || unprovenCrossOrigin) {
       const why = provenChange

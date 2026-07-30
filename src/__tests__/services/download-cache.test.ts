@@ -601,6 +601,50 @@ describe("downloadModel cache", () => {
     expect(getResumeDiagnostic(await trayIdFor(url))?.outcome).toBe("declined:etag-changed");
   });
 
+  it("REFUSES a resume 206 when a LATER redirect hop reports a changed X-Linked-Etag (multi-hop) (#467/#343)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://huggingface.co/org/repo/resolve/main/multihop.safetensors";
+    const { partial, sidecar } = await cachePaths(url);
+    await writeFile(partial, "AAAA");
+    await writeFile(sidecar, '"xet-hash-v1"');
+
+    // Hop 1: same-origin 302 whose X-Linked-Etag MATCHES the partial...
+    fetchMock.mockResolvedValueOnce(
+      new Response(null, {
+        status: 302,
+        headers: {
+          location: "https://huggingface.co/org/repo/resolve/main/multihop2",
+          "x-linked-etag": '"xet-hash-v1"',
+        },
+      }),
+    );
+    // Hop 2: a LATER cross-origin 302 that reports a DIFFERENT object — the file
+    // changed; an earlier match must not let this slip through.
+    fetchMock.mockResolvedValueOnce(
+      new Response(null, {
+        status: 302,
+        headers: {
+          location: "https://cas-bridge.xethub.hf.co/xet-bridge-us/obj?sig=z",
+          "x-linked-etag": '"xet-hash-v2-CHANGED"',
+        },
+      }),
+    );
+    // Hop 3: CAS 206 for the changed object.
+    fetchMock.mockResolvedValueOnce(
+      new Response("BBBB", {
+        status: 206,
+        statusText: "Partial Content",
+        headers: { "content-range": "bytes 4-7/8" },
+      }),
+    );
+
+    await expect(
+      downloadModel(url, "diffusion_models", "multihop-out.safetensors"),
+    ).rejects.toThrow(/resume rejected/i);
+    await expect(stat(partial)).rejects.toThrow();
+    expect(getResumeDiagnostic(await trayIdFor(url))?.outcome).toBe("declined:etag-changed");
+  });
+
   it("declines + SURFACES a changed-upstream resume (If-Range miss, 200) — safety preserved (#467/#343)", async () => {
     await fsPromises.mkdir(cacheDir, { recursive: true });
     const url = "https://example.com/models/changed-surfaced.safetensors";

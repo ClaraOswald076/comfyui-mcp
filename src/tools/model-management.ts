@@ -234,15 +234,25 @@ export function registerModelManagementTools(server: McpServer): void {
           // Surface a declined resume so the agent/user knows a pre-existing
           // .partial was discarded and a full re-download is under way, and why
           // — instead of it being silent (#467).
+          // Only surface a diagnostic from THIS attempt — the map is keyed by URL
+          // and persists across jobs, so a stale discard from an earlier attempt
+          // for the same URL must not be attributed to this one (#467).
           const diag = getResumeDiagnostic(j.trayId);
           let resumeNote = "";
-          if (diag && diag.outcome !== "resumed") {
+          if (diag && diag.outcome !== "resumed" && diag.at >= j.started_at) {
             const gb = (diag.discardedBytes / 1024 ** 3).toFixed(2);
             const why =
               diag.outcome === "declined:no-validator"
                 ? "the host sent no ETag/Last-Modified validator to verify a safe resume (common on Hugging Face's Xet/CAS CDN)"
-                : "the upstream file changed since the partial was written (If-Range miss), so appending would corrupt it";
-            resumeNote = `\n    resume: ${diag.outcome} — discarded ${gb} GB of a prior .partial and is re-downloading in full because ${why}`;
+                : "the upstream file changed since the partial was written, so appending would corrupt it";
+            // A declined:etag-changed via the 206-refusal path errors the job (a
+            // clean retry is needed); the no-validator and If-Range-miss paths
+            // restart within the same stream. Report each honestly.
+            const outcome =
+              j.status === "error"
+                ? `the resume was REJECTED — re-issue download_model to restart cleanly`
+                : `re-downloading in full`;
+            resumeNote = `\n    resume: ${diag.outcome} — discarded ${gb} GB of a prior .partial because ${why}; ${outcome}`;
           }
           return `${head}${detail}${resumeNote}\n    from: ${j.url}`;
         });
