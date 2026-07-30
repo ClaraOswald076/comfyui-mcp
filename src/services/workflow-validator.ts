@@ -17,6 +17,11 @@ export interface ValidationIssue {
   input?: string;
   /** The offending value (e.g. the model filename that isn't installed). */
   value?: string;
+  /** True only for issues sourced from graph-health heuristics (step 5). These are
+   *  rendered in the "Graph health" section and excluded from Errors/Warnings buckets
+   *  to avoid double-listing. Authoritative validator issues (which also carry `kind`)
+   *  are NOT tagged, so they are never masked from the Errors section. */
+  health?: boolean;
 }
 
 export interface ValidationResult {
@@ -188,6 +193,7 @@ export async function validateWorkflow(
         node_type: f.node_type ?? "",
         message: f.detail,
         kind: f.kind,
+        health: true,
       });
     }
   }
