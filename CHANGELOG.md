@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.18] - 2026-07-30
+
+### Fixed
+- **`panel_open_workflow` no longer false-fails a switch that actually succeeded (#215, #319, #496).** When the target tab is backgrounded/frozen or the workflow is already open, it may not ACK `workflow_open` within the window even though the switch genuinely happened. On an ack-timeout the tool now polls the authoritative active-workflow signal (a fresh `workflow_list` round-trip, bounded ~6s) and returns success (with a recovered note) if the target became active; a genuinely-failed open (e.g. no matching workflow) is an acked error, not a timeout, so it still fails clearly. Mirrors the #497 restart-readiness pattern. (#502)
+
 ## [0.48.17] - 2026-07-30
 
 ### Fixed
