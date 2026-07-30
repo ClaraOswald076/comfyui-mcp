@@ -19,6 +19,24 @@ const okText = (value: unknown) => ({
   content: [{ type: "text" as const, text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }],
 });
 
+// A 404 on any /model_explorer/* route means the optional `comfyui-model-explorer`
+// custom node isn't installed on the connected ComfyUI (the route simply doesn't
+// exist), NOT that the model file is missing. Surface that as an actionable
+// missing-capability message rather than leaking the raw upstream 404. Other
+// statuses (500, 503, …) are real upstream errors and pass through as before.
+export function explorerHttpError(route: string, status: number): Error {
+  if (status === 404) {
+    return new Error(
+      `The optional 'comfyui-model-explorer' custom node is not installed on the connected ComfyUI, ` +
+        `so embedded-metadata routes are unavailable (GET /model_explorer/${route} → HTTP 404). ` +
+        `Install it via ComfyUI-Manager (search "model explorer") or ` +
+        `install_custom_node, then restart ComfyUI. Note: the model file itself may be present — ` +
+        `only the metadata-reading node is missing.`,
+    );
+  }
+  return new Error(`model_explorer ${route} HTTP ${status}`);
+}
+
 export function registerModelExplorerTools(server: McpServer): void {
   server.tool(
     "model_metadata_read",
@@ -38,7 +56,7 @@ export function registerModelExplorerTools(server: McpServer): void {
         const COMFY = comfyBase();
         const q = `category=${encodeURIComponent(args.category)}&name=${encodeURIComponent(args.name)}`;
         const dr = await fetch(`${COMFY}/model_explorer/detail?${q}`);
-        if (!dr.ok) return errorToToolResult(new Error(`model_explorer detail HTTP ${dr.status} (is ComfyUI running with the comfyui-model-explorer node?)`));
+        if (!dr.ok) return errorToToolResult(explorerHttpError("detail", dr.status));
         const detail = (await dr.json()) as any;
         let tags = null;
         try {
@@ -119,7 +137,7 @@ export function registerModelExplorerTools(server: McpServer): void {
           `category=${encodeURIComponent(args.category)}&name=${encodeURIComponent(args.name)}` +
           (args.version_id ? `&version_id=${args.version_id}` : "");
         const r = await fetch(`${COMFY}/model_explorer/civitai?${q}`);
-        if (!r.ok) return errorToToolResult(new Error(`model_explorer civitai HTTP ${r.status}`));
+        if (!r.ok) return errorToToolResult(explorerHttpError("civitai", r.status));
         return okText(await r.json());
       } catch (err) {
         return errorToToolResult(err);
