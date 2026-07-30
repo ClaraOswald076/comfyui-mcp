@@ -49,6 +49,7 @@ vi.mock("../../services/env-capabilities.js", () => ({
 
 import {
   __processControlTestHooks,
+  parseListenerPidFromNetstat,
   restartComfyUI,
   startComfyUI,
   stopComfyUI,
@@ -446,6 +447,124 @@ describe("process-control restart relaunch preflight (#368/#370)", () => {
     expect(result.message).toMatch(/desktop/i);
     expect(mockSpawn).not.toHaveBeenCalled();
     expect(mockResetClient).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  });
+});
+
+describe("parseListenerPidFromNetstat — locale-independent port→PID (#449)", () => {
+  it("finds the owning PID from an English LISTENING line", () => {
+    const out = "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       6789";
+    expect(parseListenerPidFromNetstat(out, 8188)).toBe(6789);
+  });
+
+  it("finds the PID even when the state word is LOCALIZED (German 'ABHÖREN')", () => {
+    // The old detector piped through `findstr LISTENING`; on non-English Windows
+    // the state column is translated, so that filter matched nothing and a
+    // reachable ComfyUI looked like 'no process on port' (issue #449).
+    const out = [
+      "Aktive Verbindungen",
+      "",
+      "  Proto  Lokale Adresse     Remoteadresse      Status      PID",
+      "  TCP    0.0.0.0:8188       0.0.0.0:0          ABHÖREN     6789",
+    ].join("\n");
+    expect(parseListenerPidFromNetstat(out, 8188)).toBe(6789);
+  });
+
+  it("matches an IPv6 listener too", () => {
+    const out = "  TCP    [::]:8188   [::]:0   ABHÖREN   6789";
+    expect(parseListenerPidFromNetstat(out, 8188)).toBe(6789);
+  });
+
+  it("IGNORES an outbound/established connection whose REMOTE peer uses the port", () => {
+    // Local column is bound to an ephemeral port; only the foreign column shows
+    // :8188. Anchoring on the local column must skip this line.
+    const out = "  TCP    127.0.0.1:54210   127.0.0.1:8188   HERGESTELLT   4444";
+    expect(parseListenerPidFromNetstat(out, 8188)).toBeNull();
+  });
+
+  it("does not confuse a superset port (:81880 / :18188) with :8188", () => {
+    const out = [
+      "  TCP    0.0.0.0:81880   0.0.0.0:0   LISTENING   1111",
+      "  TCP    0.0.0.0:18188   0.0.0.0:0   LISTENING   2222",
+    ].join("\n");
+    expect(parseListenerPidFromNetstat(out, 8188)).toBeNull();
+  });
+});
+
+describe("findPidByPort resilience to localized netstat state (#449)", () => {
+  it("stop_comfyui finds the listener PID even on non-English Windows", async () => {
+    // Realistic German netstat -ano blob: state column is 'ABHÖREN', not
+    // 'LISTENING'. The mock emulates the actual shell pipeline — a chained
+    // `findstr LISTENING` (the OLD detector) would filter every line out,
+    // reproducing the false 'no process on port' failure. The current detector
+    // parses `netstat -ano` directly and must still map the port to PID 6789.
+    const GERMAN_BLOB = [
+      "Aktive Verbindungen",
+      "",
+      "  Proto  Lokale Adresse     Remoteadresse      Status      PID",
+      "  TCP    0.0.0.0:8188       0.0.0.0:0          ABHÖREN     6789",
+      "  TCP    [::]:8188          [::]:0             ABHÖREN     6789",
+      "  TCP    127.0.0.1:54210    127.0.0.1:8188     HERGESTELLT 4444",
+    ].join("\n");
+
+    let killed = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (cmd.includes("netstat")) {
+        if (killed) return ""; // port freed after kill → waitForPortFree resolves
+        // Emulate the shell: a chained `findstr LISTENING` filters by that word.
+        if (/findstr\s+LISTENING/i.test(cmd)) {
+          return GERMAN_BLOB.split("\n")
+            .filter((l) => l.includes("LISTENING"))
+            .join("\n");
+        }
+        return GERMAN_BLOB;
+      }
+      if (cmd.includes("lsof")) throw new Error("not listening");
+      return ""; // tasklist / powershell fallback / `if exist` → nothing
+    });
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: ["python", "main.py", "--port", "8188"] },
+    });
+
+    const result = await stopComfyUI();
+
+    expect(result.stopped).toBe(true);
+    expect(result.message).toContain("6789");
+    expect(
+      mockExecSync.mock.calls.some(([c]) => /taskkill/i.test(String(c))),
+    ).toBe(true);
+    expect(mockResetClient).toHaveBeenCalled();
+  });
+
+  it("restart reports a REACHABLE diagnostic (not 'no process') when the server answers but no PID maps", async () => {
+    // /system_stats answers (server reachable) but every port→PID lookup comes
+    // back empty. Liveness is the reachable server, so we must NOT claim the
+    // process is absent — and we must NOT take the server down (issue #449).
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (cmd.includes("lsof")) throw new Error("not listening");
+      return ""; // netstat, powershell, tasklist → nothing resolves a PID
+    });
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: ["python", "main.py", "--port", "8188"] },
+    });
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(false);
+    expect(result.started).toBe(false);
+    expect(result.message).toMatch(/reachable on port 8188/i);
+    expect(result.message).not.toMatch(/no comfyui process found/i);
+    // Server left untouched: no relaunch, no kill.
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(
+      mockExecSync.mock.calls.some(([c]) => /taskkill/i.test(String(c))),
+    ).toBe(false);
 
     killSpy.mockRestore();
   });
