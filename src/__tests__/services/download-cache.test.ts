@@ -1124,6 +1124,44 @@ describe("downloadModel cache", () => {
     renameSpy.mockRestore();
   });
 
+  it("PRESERVES the original at a named backup when even the Windows restore fails (never lost) (#467)", async () => {
+    if (process.platform !== "win32") return;
+    const { downloadWithCache } = await import("../../services/download-cache.js");
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    await fsPromises.mkdir(comfyDir, { recursive: true });
+    const dest = join(comfyDir, "precious2.safetensors");
+    await writeFile(dest, "ORIGINAL-PRECIOUS-BYTES");
+
+    const linkSpy = vi.spyOn(downloadCacheFs, "link").mockRejectedValue(Object.assign(new Error("EXDEV"), { code: "EXDEV" }));
+    const copySpy = vi.spyOn(downloadCacheFs, "copyFile").mockRejectedValue(Object.assign(new Error("EIO"), { code: "EIO" }));
+    let dlToDest = 0;
+    const renameSpy = vi.spyOn(downloadCacheFs, "rename").mockImplementation(async (from: string, to: string) => {
+      if (String(from).includes(".dl-") && to === dest) {
+        dlToDest += 1;
+        throw Object.assign(new Error(dlToDest === 1 ? "EPERM" : "EIO"), { code: dlToDest === 1 ? "EPERM" : "EIO" });
+      }
+      if (String(from).includes(".bak-") && to === dest) {
+        throw Object.assign(new Error("EIO: restore failed too"), { code: "EIO" }); // restore ALSO fails
+      }
+      return fsPromises.rename(from, to); // dest → .bak backup succeeds
+    });
+
+    const url = "https://example.com/models/winrestorefail.safetensors";
+    fetchMock.mockImplementation(() => Promise.resolve(okResponse("NEW-BYTES")));
+
+    // The error must NAME the backup so the file is recoverable (not silently lost).
+    await expect(downloadWithCache({ url, headers: {}, targetPath: dest })).rejects.toThrow(/PRESERVED at ".*\.bak-.*"/i);
+    // The original bytes still exist on disk under the backup name.
+    const baks = (await readdir(comfyDir)).filter((f) => f.includes(".bak-"));
+    expect(baks).toHaveLength(1);
+    await expect(readFile(join(comfyDir, baks[0]), "utf-8")).resolves.toBe("ORIGINAL-PRECIOUS-BYTES");
+    // No leftover .dl temp.
+    expect((await readdir(comfyDir)).some((f) => f.includes(".dl-"))).toBe(false);
+    linkSpy.mockRestore();
+    copySpy.mockRestore();
+    renameSpy.mockRestore();
+  });
+
   it("does NOT serve a LEGACY bare-URL cache entry to an unauthenticated caller — no cross-auth leak (#467 P1-C)", async () => {
     await fsPromises.mkdir(cacheDir, { recursive: true });
     await fsPromises.mkdir(comfyDir, { recursive: true });

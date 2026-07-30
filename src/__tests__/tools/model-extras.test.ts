@@ -23,6 +23,7 @@ vi.mock("node:fs/promises", () => ({
   link: vi.fn(),
   mkdir: vi.fn(),
   readdir: vi.fn(),
+  realpath: (p: string) => Promise.resolve(p), // identity — no symlinks in these tests
   rename: vi.fn(),
   rm: vi.fn(),
   stat: (...a: unknown[]) => statMock(...a),

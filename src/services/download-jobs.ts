@@ -108,7 +108,14 @@ async function realpathDeepestExisting(p: string): Promise<string> {
     try {
       const real = await realpath(current);
       return tail.length ? join(real, ...tail.reverse()) : real;
-    } catch {
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      // Only ABSENCE walks upward. An existing-but-unresolvable ancestor (EIO,
+      // EACCES, ELOOP, …) must NOT be treated as absent — walking past it would
+      // reconstruct the un-collapsed lexical ALIAS and defeat serialization (wrong-
+      // bytes race). Fail CLOSED: propagate so the job errors rather than risk it
+      // (#467). A transient error here is far rarer than the corruption it guards.
+      if (code !== "ENOENT" && code !== "ENOTDIR") throw err;
       const parent = dirname(current);
       if (parent === current) return p; // reached the root without resolving — give up
       tail.push(basename(current));

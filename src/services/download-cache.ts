@@ -977,20 +977,15 @@ function isHardlinkUnsupported(code: unknown): boolean {
 
 /** Rename `tmp` over `targetPath`. On POSIX, rename atomically replaces an existing
  *  destination. Windows can't rename OVER an existing file and returns EPERM/EACCES/
- *  EEXIST — ONLY then do we remove the destination and retry (the temp already holds
- *  the fully-materialized bytes, so the brief gap where the destination is absent is
- *  safe). Any OTHER rename error (ENOENT, EIO, EXDEV, …) must NOT destroy a valid
- *  existing destination (#467): clean our temp and propagate. */
+ *  EEXIST — ONLY then do we move the destination ASIDE and swap. Any OTHER rename
+ *  error (ENOENT, EIO, EXDEV, …) must NOT touch a valid existing destination (#467):
+ *  clean our temp and propagate. */
 async function renameTempOverDestination(tmp: string, targetPath: string): Promise<void> {
   try {
     await downloadCacheFs.rename(tmp, targetPath);
     return;
   } catch (err) {
     const code = (err as NodeJS.ErrnoException)?.code;
-    // ONLY on Windows does rename fail because it can't replace an existing file
-    // (EPERM/EACCES/EEXIST). On POSIX rename atomically replaces, so ANY error
-    // there is a real failure that must NOT destroy a valid destination: clean the
-    // temp and propagate.
     const windowsOverwrite =
       process.platform === "win32" &&
       (code === "EPERM" || code === "EACCES" || code === "EEXIST");
@@ -998,9 +993,10 @@ async function renameTempOverDestination(tmp: string, targetPath: string): Promi
       await downloadCacheFs.rm(tmp, { force: true }).catch(() => undefined);
       throw err;
     }
-    // Windows: move the existing destination ASIDE first, then swap the temp in.
-    // If the swap fails, RESTORE the backup — a valid destination must never be
-    // lost even when the retry itself errors (#467).
+    // Windows: move the existing destination ASIDE to a backup, then swap the temp
+    // in. On ANY swap failure, RESTORE the backup so a valid destination is never
+    // lost. If even the restore fails, the original is INTACT at `backup` — surface
+    // that path in the error so it's recoverable, never silently stranded (#467).
     const backup = `${targetPath}.bak-${randomBytes(9).toString("hex")}.tmp`;
     let backedUp = false;
     try {
@@ -1013,9 +1009,21 @@ async function renameTempOverDestination(tmp: string, targetPath: string): Promi
       await downloadCacheFs.rename(tmp, targetPath);
       if (backedUp) await downloadCacheFs.rm(backup, { force: true }).catch(() => undefined);
     } catch (e) {
-      // Swap failed — put the original destination back, drop our temp.
-      if (backedUp) await downloadCacheFs.rename(backup, targetPath).catch(() => undefined);
       await downloadCacheFs.rm(tmp, { force: true }).catch(() => undefined);
+      if (backedUp) {
+        const restored = await downloadCacheFs
+          .rename(backup, targetPath)
+          .then(() => true)
+          .catch(() => false);
+        if (!restored) {
+          throw new ModelError(
+            `Download could not be finalized and the destination could not be restored — your ` +
+              `previous file is PRESERVED at "${backup}"; move it back to "${targetPath}" manually. ` +
+              `Cause: ${e instanceof Error ? e.message : String(e)}`,
+            { url: targetPath },
+          );
+        }
+      }
       throw e;
     }
   }
