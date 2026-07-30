@@ -410,6 +410,60 @@ export async function resolveModelSubfolderPreferServer(
   return targetDir;
 }
 
+export interface ResolvedDownloadTarget {
+  /** Absolute resolved destination directory (server-preferred models dir + subfolder). */
+  targetDir: string;
+  /** Validated bare filename (basename, no separators). */
+  filename: string;
+  /** Absolute final path the file is written to: join(targetDir, filename). */
+  targetPath: string;
+}
+
+/**
+ * The SINGLE source of truth for a model download's final on-disk destination,
+ * shared by downloadModel (the writer) AND the background job registry (which
+ * keys jobs by this canonical `targetPath`, so any two requests that resolve to
+ * the SAME file are one writer, and invalid inputs are rejected up front exactly
+ * as the write would reject them). Extracted so the two can never drift.
+ *
+ * Resolution: server-preferred models dir + subfolder via
+ * resolveModelSubfolderPreferServer (which TRIMS the subfolder, collapses
+ * "."/"..", and containment-guards against escapes/absolute paths), then the
+ * filename rule — an OMITTED filename derives from the URL pathname basename
+ * (→ "model.safetensors" fallback); ANY DEFINED filename is taken as its
+ * basename and REJECTED if it contained a path separator, or is blank / "." /
+ * "..". Throws ModelError on an invalid subfolder or filename.
+ */
+export async function resolveDownloadTarget(
+  url: string,
+  targetSubfolder: string,
+  filename?: string,
+): Promise<ResolvedDownloadTarget> {
+  const targetDir = await resolveModelSubfolderPreferServer(targetSubfolder);
+  const rawFilename =
+    filename ?? (basename(new URL(url).pathname) || "model.safetensors");
+  const resolvedFilename = basename(rawFilename);
+  if (
+    resolvedFilename !== rawFilename ||
+    resolvedFilename === "" ||
+    resolvedFilename === "." ||
+    resolvedFilename === ".."
+  ) {
+    throw new ModelError(
+      "Invalid model filename: must be a plain filename without path separators or '..'.",
+      { filename: rawFilename },
+    );
+  }
+  const targetPath = join(targetDir, resolvedFilename);
+  if (!resolve(targetPath).startsWith(resolve(targetDir) + sep)) {
+    throw new ModelError(
+      "Refusing to write outside the target model directory.",
+      { filename: rawFilename },
+    );
+  }
+  return { targetDir, filename: resolvedFilename, targetPath };
+}
+
 /**
  * Resolve a relative-to-models path against a known root, keeping the result
  * strictly INSIDE that root. Rejects absolute inputs, "" / "." (the root
@@ -671,36 +725,14 @@ export async function downloadModel(
 
   // Root the destination at the LIVE server's models dir (its --base-directory),
   // not blindly at COMFYUI_PATH/models — otherwise a Desktop install downloads
-  // into a stale checkout the running server never reads (#346/#369).
-  const targetDir = await resolveModelSubfolderPreferServer(targetSubfolder);
+  // into a stale checkout the running server never reads (#346/#369). Resolution
+  // + filename validation go through the SHARED resolveDownloadTarget so the
+  // background job registry keys jobs by the exact same targetPath (no drift).
+  const { targetDir, targetPath, filename: resolvedFilename } =
+    await resolveDownloadTarget(url, targetSubfolder, filename);
 
   // Ensure target directory exists
   await mkdir(targetDir, { recursive: true });
-
-  const rawFilename =
-    filename ?? (basename(new URL(url).pathname) || "model.safetensors");
-  // Guard against path traversal: the filename must be a bare basename so it
-  // cannot escape targetDir via separators or "..".
-  const resolvedFilename = basename(rawFilename);
-  if (
-    resolvedFilename !== rawFilename ||
-    resolvedFilename === "" ||
-    resolvedFilename === "." ||
-    resolvedFilename === ".."
-  ) {
-    throw new ModelError(
-      "Invalid model filename: must be a plain filename without path separators or '..'.",
-      { filename: rawFilename },
-    );
-  }
-  const targetPath = join(targetDir, resolvedFilename);
-  // Defense-in-depth: confirm the resolved path stays inside targetDir.
-  if (!resolve(targetPath).startsWith(resolve(targetDir) + sep)) {
-    throw new ModelError(
-      "Refusing to write outside the target model directory.",
-      { filename: rawFilename },
-    );
-  }
 
   const request = applyDownloadAuth(url, auth);
   const headers: Record<string, string> = { ...request.headers };

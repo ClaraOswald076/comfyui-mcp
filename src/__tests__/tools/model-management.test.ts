@@ -10,6 +10,12 @@ vi.mock("../../services/model-resolver.js", async () => {
     ...actual,
     downloadModel: (...a: unknown[]) => downloadModelMock(...a),
     listLocalModels: (...a: unknown[]) => listLocalModelsMock(...a),
+    // startDownloadJob resolves the destination via this before streaming; stub
+    // it so the tool tests don't need a live server to compute a targetPath.
+    resolveDownloadTarget: async (url: string, sub: string, filename?: string) => {
+      const name = filename ?? String(url).split("/").pop() ?? "model.safetensors";
+      return { targetDir: `/m/${sub}`, filename: name, targetPath: `/m/${sub}/${name}` };
+    },
   };
 });
 

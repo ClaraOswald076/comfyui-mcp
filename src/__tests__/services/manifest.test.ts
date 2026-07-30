@@ -30,6 +30,7 @@ const listInstalledNodesMock = vi.hoisted(() => vi.fn());
 const downloadModelMock = vi.hoisted(() => vi.fn());
 const resolveExistingModelFileMock = vi.hoisted(() => vi.fn());
 const listLocalModelsMock = vi.hoisted(() => vi.fn());
+const savedWorkspaceMock = vi.hoisted(() => vi.fn(() => undefined as string | undefined));
 
 vi.mock("../../config.js", () => ({
   config: mockConfig,
@@ -79,6 +80,12 @@ vi.mock("../../services/model-resolver.js", () => ({
     "unet",
   ],
   downloadModel: (...a: unknown[]) => downloadModelMock(...a),
+  // startDownloadJob resolves the destination via this before streaming; stub it
+  // so a distinct targetPath is derived per (subfolder, filename) without a server.
+  resolveDownloadTarget: async (url: string, sub: string, filename?: string) => {
+    const name = filename ?? String(url).split("/").pop() ?? "model.safetensors";
+    return { targetDir: `/fake/ComfyUI/models/${sub}`, filename: name, targetPath: `/fake/ComfyUI/models/${sub}/${name}` };
+  },
   resolveExistingModelFile: (...a: unknown[]) => resolveExistingModelFileMock(...a),
   listLocalModels: (...a: unknown[]) => listLocalModelsMock(...a),
   // Faithful mirror of the real managerModelDestination (pure logic) so the
@@ -102,6 +109,10 @@ vi.mock("../../services/model-resolver.js", () => ({
     if (map[category]) return { type, save_path: "default" };
     return { type, save_path: category };
   },
+}));
+
+vi.mock("../../services/workspace-env.js", () => ({
+  getSavedDefaultWorkspaceSync: (...a: unknown[]) => savedWorkspaceMock(...(a as [])),
 }));
 
 vi.mock("../../utils/logger.js", () => ({
@@ -133,6 +144,7 @@ beforeEach(() => {
   // listing is empty). Individual tests override to simulate an existing model.
   resolveExistingModelFileMock.mockReset().mockRejectedValue(new Error("not found"));
   listLocalModelsMock.mockReset().mockResolvedValue([]);
+  savedWorkspaceMock.mockReset().mockReturnValue(undefined);
 });
 
 describe("loadManifestFile", () => {
@@ -198,7 +210,7 @@ describe("applyManifest", () => {
       },
     });
 
-    expect(result.summary).toEqual({ applied: 0, skipped: 3, failed: 0 });
+    expect(result.summary).toEqual({ applied: 0, skipped: 3, failed: 0, pending: 0 });
     expect(result.results.map((r) => r.status)).toEqual(["skipped", "skipped", "skipped"]);
     expect(installCustomNodeMock).not.toHaveBeenCalled();
     expect(downloadModelMock).not.toHaveBeenCalled();
@@ -221,15 +233,18 @@ describe("applyManifest", () => {
     });
 
     expect(result.success).toBe(false);
-    expect(result.summary).toEqual({ applied: 1, skipped: 0, failed: 1 });
+    expect(result.summary).toEqual({ applied: 1, skipped: 0, failed: 1, pending: 0 });
     expect(result.results).toMatchObject([
       { action: "custom_node", item: "bad-node", status: "failed" },
       { action: "model", item: "loras/model.safetensors", status: "applied" },
     ]);
+    // apply_manifest now routes local downloads through the background job
+    // registry (#362), which calls downloadModel with an optional auth arg.
     expect(downloadModelMock).toHaveBeenCalledWith(
       "https://example.com/model.safetensors",
       "loras",
       "model.safetensors",
+      undefined,
     );
   });
 
@@ -305,7 +320,7 @@ describe("applyManifest", () => {
       },
     });
 
-    expect(result.summary).toEqual({ applied: 0, skipped: 1, failed: 0 });
+    expect(result.summary).toEqual({ applied: 0, skipped: 1, failed: 0, pending: 0 });
     expect(result.results).toMatchObject([
       { action: "model", status: "skipped", item: "big.safetensors" },
     ]);
@@ -336,7 +351,7 @@ describe("applyManifest", () => {
       },
     });
 
-    expect(result.summary).toEqual({ applied: 0, skipped: 1, failed: 0 });
+    expect(result.summary).toEqual({ applied: 0, skipped: 1, failed: 0, pending: 0 });
     expect(result.results[0].status).toBe("skipped");
     expect(listLocalModelsMock).toHaveBeenCalledWith("checkpoints");
     expect(downloadModelMock).not.toHaveBeenCalled();
@@ -360,7 +375,7 @@ describe("applyManifest", () => {
       },
     });
 
-    expect(result.summary).toEqual({ applied: 0, skipped: 1, failed: 0 });
+    expect(result.summary).toEqual({ applied: 0, skipped: 1, failed: 0, pending: 0 });
     expect(result.results[0].status).toBe("skipped");
     expect(listLocalModelsMock).toHaveBeenCalledWith("checkpoints");
     expect(downloadModelMock).not.toHaveBeenCalled();
@@ -385,11 +400,12 @@ describe("applyManifest", () => {
       },
     });
 
-    expect(result.summary).toEqual({ applied: 1, skipped: 0, failed: 0 });
+    expect(result.summary).toEqual({ applied: 1, skipped: 0, failed: 0, pending: 0 });
     expect(downloadModelMock).toHaveBeenCalledWith(
       "https://example.com/model.safetensors",
       expect.stringMatching(/checkpoints[\\/]foo/),
       "model.safetensors",
+      undefined,
     );
   });
 
@@ -408,11 +424,12 @@ describe("applyManifest", () => {
       },
     });
 
-    expect(result.summary).toEqual({ applied: 1, skipped: 0, failed: 0 });
+    expect(result.summary).toEqual({ applied: 1, skipped: 0, failed: 0, pending: 0 });
     expect(downloadModelMock).toHaveBeenCalledWith(
       "https://example.com/new.safetensors",
       "loras",
       "new.safetensors",
+      undefined,
     );
   });
 
@@ -423,7 +440,7 @@ describe("applyManifest", () => {
       manifest: { pip: ["torch==2.4.0"] },
     });
 
-    expect(result.summary).toEqual({ applied: 1, skipped: 0, failed: 0 });
+    expect(result.summary).toEqual({ applied: 1, skipped: 0, failed: 0, pending: 0 });
     expect(execFileSyncMock).toHaveBeenCalledWith(
       detectCmd,
       detectArgs,
@@ -454,6 +471,108 @@ describe("applyManifest", () => {
       ["-m", "pip", "install", "numpy"],
       expect.objectContaining({ cwd: COMFY }),
     );
+  });
+
+  it("falls back to python -m pip when uv rejects a non-venv interpreter (#377)", async () => {
+    execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+      // uv is detected (probe succeeds), but `uv pip install` fails because the
+      // ComfyUI interpreter is a system Python, not a venv.
+      if (cmd === "uv" && args[0] === "pip") {
+        throw Object.assign(new Error("uv failed"), {
+          stderr:
+            "error: No virtual environment found for executable name python; " +
+            "run `uv venv` to create an environment, or pass `--system`",
+        });
+      }
+      return "ok";
+    });
+
+    const result = await applyManifest({ manifest: { pip: ["imageio-ffmpeg"] } });
+
+    expect(result.summary).toEqual({ applied: 1, skipped: 0, failed: 0, pending: 0 });
+    expect(execFileSyncMock).toHaveBeenCalledWith(
+      expect.stringMatching(/python/),
+      ["-m", "pip", "install", "imageio-ffmpeg"],
+      expect.objectContaining({ cwd: COMFY }),
+    );
+  });
+
+  it("adopts the saved default workspace as the local path when COMFYUI_PATH is unset (#390)", async () => {
+    mockConfig.comfyuiPath = undefined;
+    mockConfig.remote = false; // local loopback target, just no COMFYUI_PATH
+    savedWorkspaceMock.mockReturnValue("/saved/ComfyUI");
+    existsSyncMock.mockImplementation((p: unknown) => {
+      const s = String(p);
+      return (
+        s.includes("saved") &&
+        (s.endsWith("ComfyUI") || s.endsWith("models") || s.endsWith("custom_nodes"))
+      );
+    });
+
+    const result = await applyManifest({
+      manifest: {
+        models: [
+          { url: "https://example.com/m.safetensors", model_type: "loras", filename: "m.safetensors" },
+        ],
+      },
+    });
+
+    expect(result.summary).toMatchObject({ applied: 1, failed: 0 });
+    expect(downloadModelMock).toHaveBeenCalled();
+    // Call-scoped: the adopted path must NOT persist process-wide — it is
+    // restored so a later call re-reads/revalidates and other tabs aren't leaked.
+    expect(mockConfig.comfyuiPath).toBeUndefined();
+  });
+
+  it("hands a slow model download to a background job (pending, not applied) (#362)", async () => {
+    const prevGrace = process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS;
+    process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS = "0";
+    downloadModelMock.mockReturnValue(new Promise<string>(() => {}));
+
+    try {
+      const result = await applyManifest({
+        manifest: {
+          models: [
+            { url: "https://example.com/huge.safetensors", model_type: "checkpoints", filename: "huge.safetensors" },
+          ],
+        },
+      });
+      // A still-running download is PENDING, never counted as applied.
+      expect(result.summary).toMatchObject({ applied: 0, failed: 0, pending: 1 });
+      expect(result.results[0].status).toBe("pending");
+      expect(result.results[0].message).toMatch(/background|RUNNING/i);
+      // success reflects only that nothing FAILED (the apply isn't fully settled).
+      expect(result.success).toBe(true);
+    } finally {
+      if (prevGrace === undefined) delete process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS;
+      else process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS = prevGrace;
+    }
+  });
+
+  it("does not block on MANY slow downloads — enqueues all, one bounded grace (#362)", async () => {
+    const prevGrace = process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS;
+    process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS = "50";
+    // Every download hangs; a per-model grace would be 50ms * N. One batch-wide
+    // grace must cap total wait near a single window regardless of count.
+    downloadModelMock.mockReturnValue(new Promise<string>(() => {}));
+    const models = Array.from({ length: 20 }, (_, i) => ({
+      url: `https://example.com/m${i}.safetensors`,
+      model_type: "checkpoints" as const,
+      filename: `m${i}.safetensors`,
+    }));
+
+    try {
+      const started = Date.now();
+      const result = await applyManifest({ manifest: { models } });
+      const elapsed = Date.now() - started;
+      expect(result.summary).toMatchObject({ applied: 0, failed: 0, pending: 20 });
+      // All 20 enqueued up front; total wait bounded by one grace window, not 20×.
+      expect(downloadModelMock).toHaveBeenCalledTimes(20);
+      expect(elapsed).toBeLessThan(1000);
+    } finally {
+      if (prevGrace === undefined) delete process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS;
+      else process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS = prevGrace;
+    }
   });
 
   it.each([

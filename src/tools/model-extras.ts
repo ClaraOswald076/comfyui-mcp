@@ -454,7 +454,7 @@ export function registerModelExtrasTools(server: McpServer): void {
           return lines;
         };
 
-        const { job, settled } = startDownloadJob(
+        const { job, settled } = await startDownloadJob(
           resolved.downloadUrl,
           args.target_subfolder,
           filename,

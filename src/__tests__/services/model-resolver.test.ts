@@ -43,7 +43,7 @@ vi.mock("../../services/output-dir.js", () => ({
 }));
 
 import { config } from "../../config.js";
-import { downloadModel } from "../../services/model-resolver.js";
+import { downloadModel, resolveDownloadTarget } from "../../services/model-resolver.js";
 import { ModelError } from "../../utils/errors.js";
 import { logger } from "../../utils/logger.js";
 
@@ -440,5 +440,44 @@ describe("downloadModel — remote mode (Manager install-model dispatch)", () =>
       expect(out).toMatch(/WARNING/i);
       expect(out).toContain(auth.type);
     }
+  });
+});
+
+describe("resolveDownloadTarget (shared destination resolver)", () => {
+  const URL = "https://example.com/path/big.safetensors";
+
+  it("collapses '..' so paths landing in one dir resolve to one targetPath", async () => {
+    const a = await resolveDownloadTarget(URL, "loras", "m.safetensors");
+    const b = await resolveDownloadTarget(URL, "checkpoints/../loras", "m.safetensors");
+    expect(a.targetPath).toBe(b.targetPath);
+  });
+
+  it("trims the subfolder ('  loras  ' == 'loras')", async () => {
+    const a = await resolveDownloadTarget(URL, "  loras  ", "m.safetensors");
+    const b = await resolveDownloadTarget(URL, "loras", "m.safetensors");
+    expect(a.targetPath).toBe(b.targetPath);
+  });
+
+  it("identity is the destination, NOT the URL — different URLs, same targetPath", async () => {
+    const a = await resolveDownloadTarget("https://a.example/x/m.safetensors", "loras", "m.safetensors");
+    const b = await resolveDownloadTarget("https://b.example/y/m.safetensors", "loras", "m.safetensors");
+    expect(a.targetPath).toBe(b.targetPath);
+  });
+
+  it("an omitted filename derives from the URL basename", async () => {
+    const t = await resolveDownloadTarget(URL, "checkpoints");
+    expect(t.filename).toBe("big.safetensors");
+  });
+
+  it("rejects a path-ful filename (does NOT basename it into a collision)", async () => {
+    await expect(resolveDownloadTarget(URL, "loras", "dir/big.safetensors")).rejects.toThrow(ModelError);
+  });
+
+  it("rejects a defined-but-blank filename", async () => {
+    await expect(resolveDownloadTarget(URL, "loras", "")).rejects.toThrow(ModelError);
+  });
+
+  it("rejects a subfolder that escapes the models dir", async () => {
+    await expect(resolveDownloadTarget(URL, "../evil", "m.safetensors")).rejects.toThrow(ModelError);
   });
 });

@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+### MCP
+
+#### Fixed
+- comfy_cli_search_nodes falls back to the connected server's live /object_info when comfy-cli is absent (WS-4) (#354)
+- apply_manifest adopts a saved default workspace as the local FS target when COMFYUI_PATH is unset (WS-4) (#390)
+- apply_manifest pip install falls back to `python -m pip` when uv rejects a non-venv interpreter (WS-4) (#377)
+- apply_manifest hands slow model downloads to the background job registry to avoid the tools/call timeout (WS-4) (#362)
+
 ## [0.48.6] - 2026-07-29
 
 ### MCP

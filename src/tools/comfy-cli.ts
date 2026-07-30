@@ -5,6 +5,7 @@ import {
   resolveComfyCliExecutable,
   runComfyCli,
 } from "../services/comfy-cli.js";
+import { searchLiveObjectInfo } from "../services/object-info-search.js";
 import { errorToToolResult } from "../utils/errors.js";
 
 const whereSchema = z.enum(["local", "cloud"]).optional();
@@ -103,7 +104,7 @@ export function registerComfyCliTools(server: McpServer): void {
 
   server.tool(
     "comfy_cli_search_nodes",
-    "Fuzzy-search actual ComfyUI node classes by name, display name, or description using official `comfy nodes search`. This complements search_custom_nodes, which searches installable node packs. Works locally, in Comfy Cloud, or offline with object_info JSON.",
+    "Fuzzy-search actual ComfyUI node classes by name, display name, or description using official `comfy nodes search`. This complements search_custom_nodes, which searches installable node packs. Works locally, in Comfy Cloud, or offline with object_info JSON. When comfy-cli is not installed/on PATH and the target is the connected (local) server, it falls back to fuzzy-searching that server's live /object_info — so installed-node discovery works without the CLI.",
     {
       query: z.string().min(1),
       limit: z.number().int().min(1).max(100).optional(),
@@ -113,6 +114,36 @@ export function registerComfyCliTools(server: McpServer): void {
     },
     async (args) => {
       try {
+        // Live /object_info fallback (#354): when comfy-cli is absent and we are
+        // searching the connected local server (not Comfy Cloud, and not an
+        // explicit offline object_info file), query the running ComfyUI's
+        // /object_info directly instead of failing on the missing CLI.
+        // Honor an explicit `workspace`: /object_info comes from the CONNECTED
+        // server, which may be a DIFFERENT install than the one requested — so
+        // when a workspace is pinned we do NOT substitute it silently. Instead we
+        // fall through and let comfy-cli surface its clear not-found error for
+        // that workspace (install comfy-cli there, or drop `workspace` to search
+        // the connected server).
+        if (
+          args.where !== "cloud" &&
+          !args.objectInfoPath &&
+          !args.workspace &&
+          !resolveComfyCliExecutable({ workspace: args.workspace })
+        ) {
+          const results = await searchLiveObjectInfo(args.query, args.limit ?? 20);
+          return textEnvelope({
+            schema: "envelope/1",
+            type: "envelope",
+            ok: true,
+            command: `nodes search ${args.query}`,
+            version: "object_info-fallback",
+            where: "local",
+            source: "live_object_info",
+            note: "comfy-cli was not found; searched the connected ComfyUI's live /object_info instead.",
+            data: { count: results.length, results },
+            error: null,
+          });
+        }
         const command = ["nodes", "search", args.query];
         if (args.limit) command.push("--limit", String(args.limit));
         if (args.objectInfoPath) command.push("--input", args.objectInfoPath);

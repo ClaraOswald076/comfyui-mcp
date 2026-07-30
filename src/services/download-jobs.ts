@@ -15,14 +15,21 @@
  */
 
 import { createHash } from "node:crypto";
-import { downloadModel } from "./model-resolver.js";
+import { isRemoteMode } from "../config.js";
+import { downloadModel, resolveDownloadTarget } from "./model-resolver.js";
 import type { DownloadAuth } from "./download-auth.js";
 import { logger } from "../utils/logger.js";
 
 export interface DownloadJob {
-  /** Same id the panel tray uses — a hash of the source URL — so the agent and
-   *  the tray refer to one download by one name. */
+  /** DISTINCT public id, derived from URL AND destination, so the same URL
+   *  fetched to two different targets is two separately-pollable jobs
+   *  (download_status(id) resolves each independently). Also the registry key. */
   id: string;
+  /** The panel tray / progress-file id — a hash of the SOURCE URL only, matching
+   *  the row the streaming download writes (readDownloadProgress keys on this).
+   *  Kept separate from `id` so distinct-destination jobs still read their live
+   *  byte progress from the tray. */
+  trayId: string;
   url: string;
   target_subfolder: string;
   filename?: string;
@@ -46,20 +53,61 @@ interface Entry {
 
 const jobs = new Map<string, Entry>();
 
-/** The tray keys rows on a hash of the URL; match it so both agree. */
+/** The tray keys rows on a hash of the SOURCE URL; match it so both agree. */
 export function downloadIdFor(url: string): string {
   return createHash("sha256").update(url).digest("hex").slice(0, 16);
 }
 
 /**
- * Start a download, or adopt one already running for the same URL.
+ * The download's DISTINCT public id — a hash of the canonical resolved on-disk
+ * `targetPath` (from the shared resolveDownloadTarget), used as BOTH the registry
+ * key and `job.id`. Identity is the DESTINATION, not the URL: two requests that
+ * resolve to the SAME file are one job/one writer (even from different URLs);
+ * requests to different destinations are separately pollable via download_status.
+ */
+export function downloadJobIdFor(targetPath: string): string {
+  return createHash("sha256").update(targetPath).digest("hex").slice(0, 16);
+}
+
+/**
+ * REMOTE-mode id: there is NO local filesystem to resolve a targetPath from —
+ * downloadModel dispatches to the ComfyUI host's Manager, which decides the
+ * server-side destination. Key by a canonical, collision-safe JSON-encoded tuple
+ * of {url, trimmed subfolder, filename} so field boundaries are unambiguous and a
+ * repeated identical request still adopts the in-flight job. (We can't dedupe two
+ * DIFFERENT urls aimed at one server-side dest here — the server owns that.)
+ */
+function remoteDownloadJobIdFor(
+  url: string,
+  targetSubfolder: string,
+  filename?: string,
+): string {
+  const canonical = JSON.stringify([
+    url,
+    String(targetSubfolder ?? "").trim(),
+    filename ?? null,
+  ]);
+  return createHash("sha256").update(canonical).digest("hex").slice(0, 16);
+}
+
+/**
+ * Start a download, or adopt one already running for the same on-disk destination.
  *
  * The adoption case matters: the visible symptom of the old bug was "the agent
  * looks stuck", and the natural user response is to ask again. Without this,
  * the second ask starts a SECOND stream onto the same target path — two writers,
  * one file. Returning the in-flight job makes a repeated request harmless.
+ *
+ * Async because the destination is resolved by the SAME code the write uses
+ * (resolveDownloadTarget), so the job is keyed by the exact `targetPath` the file
+ * lands at — any two inputs resolving to one file are one job — and an INVALID
+ * input (blank / path-ful filename, escaping subfolder) is REJECTED here, up
+ * front, exactly as the download itself would reject it (never basename'd into a
+ * collision with a valid request). REMOTE mode still resolves a canonical
+ * server-side targetPath for identity even though the bytes are fetched by the
+ * Manager, so duplicate remote dispatches to one destination also dedupe.
  */
-export function startDownloadJob(
+export async function startDownloadJob(
   url: string,
   targetSubfolder: string,
   filename?: string,
@@ -67,16 +115,32 @@ export function startDownloadJob(
   /** Post-download work (sidecars, type checks). Its lines land on `job.notes`
    *  so they reach the user even when the download outlives the tool call. */
   onComplete?: (path: string) => Promise<string[]>,
-): Entry {
-  const id = downloadIdFor(url);
+): Promise<Entry> {
+  // Identity depends on mode. LOCAL: resolve the canonical on-disk destination
+  // with the SAME resolver the write uses (throws on an invalid filename/subfolder
+  // — surfaced immediately, matching downloadModel's own rejection — and keys by
+  // the exact targetPath so identity is the destination, not the URL). REMOTE:
+  // there is NO local filesystem — downloadModel short-circuits to the Manager
+  // dispatch, so resolving a local models dir would wrongly THROW (COMFYUI_PATH
+  // unset). Key by a canonical remote identity instead and let downloadModel take
+  // the Manager path.
+  const id = isRemoteMode()
+    ? remoteDownloadJobIdFor(url, targetSubfolder, filename)
+    : downloadJobIdFor((await resolveDownloadTarget(url, targetSubfolder, filename)).targetPath);
+  const trayId = downloadIdFor(url);
   const existing = jobs.get(id);
   if (existing && existing.job.status === "downloading") {
-    logger.info(`Download already in flight, adopting it: ${id}`, { url });
+    logger.info(`Download already in flight, adopting it: ${id}`, {
+      url,
+      target_subfolder: targetSubfolder,
+      filename,
+    });
     return existing;
   }
 
   const job: DownloadJob = {
     id,
+    trayId,
     url,
     target_subfolder: targetSubfolder,
     filename,
@@ -116,6 +180,8 @@ export function startDownloadJob(
 }
 
 export function getDownloadJob(id: string): DownloadJob | undefined {
+  // The registry is keyed by the distinct public id (URL+destination), so each
+  // destination resolves to its own job.
   return jobs.get(id)?.job;
 }
 

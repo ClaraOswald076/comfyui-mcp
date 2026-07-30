@@ -3,14 +3,44 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 const hoisted = vi.hoisted(() => ({
   resolvers: [] as Array<{ resolve: (p: string) => void; reject: (e: Error) => void; url: string }>,
   calls: 0,
+  remote: false,
+  resolveTargetCalls: 0,
 }));
 
+// isRemoteMode gates the identity branch in startDownloadJob. Keep every other
+// real config export (logger etc. depend on them); only the flag is controlled.
+vi.mock("../../config.js", async () => {
+  const actual = await vi.importActual<typeof import("../../config.js")>("../../config.js");
+  return { ...actual, isRemoteMode: () => hoisted.remote };
+});
+
+// startDownloadJob resolves the canonical destination with the SHARED
+// resolveDownloadTarget (so the job is keyed by the exact on-disk targetPath the
+// write lands at) and then streams via downloadModel. Mock both: the resolver
+// deterministically maps (url, subfolder, filename) → targetPath and REJECTS an
+// invalid filename exactly as the real one does, so these tests exercise
+// startDownloadJob's keying/adoption/rejection without a live server. The real
+// resolveDownloadTarget resolution semantics (trim, "..", url-not-in-identity,
+// blank/path-ful rejection) are covered against the real code in
+// model-resolver.test.ts.
 vi.mock("../../services/model-resolver.js", () => ({
   downloadModel: vi.fn((url: string) => {
     hoisted.calls += 1;
     return new Promise<string>((resolve, reject) => {
       hoisted.resolvers.push({ resolve, reject, url });
     });
+  }),
+  resolveDownloadTarget: vi.fn(async (url: string, sub: string, filename?: string) => {
+    hoisted.resolveTargetCalls += 1;
+    const s = String(sub ?? "").trim();
+    if (filename !== undefined) {
+      if (filename === "" || filename.includes("/") || filename.includes("\\")) {
+        throw new Error("Invalid model filename");
+      }
+      return { targetDir: `/M/${s}`, filename, targetPath: `/M/${s}/${filename}` };
+    }
+    const base = String(url).split("/").pop() || "model.safetensors";
+    return { targetDir: `/M/${s}`, filename: base, targetPath: `/M/${s}/${base}` };
   }),
 }));
 
@@ -29,42 +59,76 @@ describe("download job registry", () => {
   beforeEach(() => {
     hoisted.resolvers.length = 0;
     hoisted.calls = 0;
+    hoisted.remote = false;
+    hoisted.resolveTargetCalls = 0;
     resetDownloadJobs();
   });
 
-  it("reports a download as in flight rather than finished or failed", () => {
+  it("reports a download as in flight rather than finished or failed", async () => {
     // The bug being fixed: an unfinished download must never read as failure.
-    const { job } = startDownloadJob(URL_A, "checkpoints");
+    const { job } = await startDownloadJob(URL_A, "checkpoints");
     expect(job.status).toBe("downloading");
     expect(job.path).toBeUndefined();
     expect(job.error).toBeUndefined();
   });
 
-  it("uses the same id as the panel tray so both name one download", () => {
-    const { job } = startDownloadJob(URL_A, "checkpoints");
-    expect(job.id).toBe(downloadIdFor(URL_A));
+  it("exposes the URL-only tray id plus a destination-keyed job id", async () => {
+    const { job } = await startDownloadJob(URL_A, "checkpoints");
+    // trayId matches the panel tray / progress-file row (URL-only hash).
+    expect(job.trayId).toBe(downloadIdFor(URL_A));
+    // The public job id is keyed by the resolved destination, still 16 hex.
     expect(job.id).toHaveLength(16);
+    expect(getDownloadJob(job.id)?.trayId).toBe(job.trayId);
   });
 
-  it("adopts an in-flight download instead of starting a second copy", async () => {
-    // Asking twice is the natural response to "the agent looks stuck". Without
-    // adoption that means two streams writing one target path.
-    const first = startDownloadJob(URL_A, "checkpoints");
-    const second = startDownloadJob(URL_A, "checkpoints");
+  it("adopts an in-flight download to the same destination instead of a second copy", async () => {
+    const first = await startDownloadJob(URL_A, "checkpoints");
+    const second = await startDownloadJob(URL_A, "checkpoints");
     expect(hoisted.calls).toBe(1);
     expect(second.job).toBe(first.job);
     expect(listDownloadJobs()).toHaveLength(1);
   });
 
-  it("starts a genuinely different URL separately", () => {
-    startDownloadJob(URL_A, "checkpoints");
-    startDownloadJob(URL_B, "checkpoints");
+  it("starts a genuinely different destination separately", async () => {
+    await startDownloadJob(URL_A, "checkpoints"); // → /M/checkpoints/big.safetensors
+    await startDownloadJob(URL_B, "checkpoints"); // → /M/checkpoints/other.safetensors
     expect(hoisted.calls).toBe(2);
     expect(listDownloadJobs()).toHaveLength(2);
   });
 
+  it("keys by destination, not URL — different subfolder/filename → distinct pollable jobs", async () => {
+    const a = await startDownloadJob(URL_A, "checkpoints");
+    const b = await startDownloadJob(URL_A, "loras", "renamed.safetensors");
+    expect(hoisted.calls).toBe(2);
+    expect(listDownloadJobs()).toHaveLength(2);
+    // Distinct public ids (different destinations), shared URL-only trayId.
+    expect(a.job.id).not.toBe(b.job.id);
+    expect(a.job.trayId).toBe(b.job.trayId);
+    expect(getDownloadJob(a.job.id)).toBe(a.job);
+    expect(getDownloadJob(b.job.id)).toBe(b.job);
+  });
+
+  it("treats TWO different URLs writing the SAME destination as one job (one writer)", async () => {
+    // Identity is the resolved targetPath, NOT the URL — two URLs aimed at one
+    // file must serialize to a single writer, not race.
+    const first = await startDownloadJob(URL_A, "checkpoints", "model.safetensors");
+    const second = await startDownloadJob(URL_B, "checkpoints", "model.safetensors");
+    expect(second.job).toBe(first.job);
+    expect(second.job.id).toBe(first.job.id);
+    expect(hoisted.calls).toBe(1);
+    expect(listDownloadJobs()).toHaveLength(1);
+  });
+
+  it("rejects an invalid filename up front (as downloadModel would), not a silent merge", async () => {
+    await expect(startDownloadJob(URL_A, "checkpoints", "dir/x.safetensors")).rejects.toThrow();
+    await expect(startDownloadJob(URL_A, "checkpoints", "")).rejects.toThrow();
+    // Nothing was registered for the rejected inputs.
+    expect(listDownloadJobs()).toHaveLength(0);
+    expect(hoisted.calls).toBe(0);
+  });
+
   it("records the landed path on success", async () => {
-    const { job, settled } = startDownloadJob(URL_A, "checkpoints");
+    const { job, settled } = await startDownloadJob(URL_A, "checkpoints");
     hoisted.resolvers[0].resolve("C:/models/checkpoints/big.safetensors");
     await settled;
     expect(job.status).toBe("done");
@@ -74,7 +138,7 @@ describe("download job registry", () => {
 
   it("captures a failure without rejecting the stored promise", async () => {
     // An unhandled rejection here would kill the process over a 404.
-    const { job, settled } = startDownloadJob(URL_A, "checkpoints");
+    const { job, settled } = await startDownloadJob(URL_A, "checkpoints");
     hoisted.resolvers[0].reject(new Error("HTTP 404"));
     await expect(settled).resolves.toBeUndefined();
     expect(job.status).toBe("error");
@@ -82,19 +146,34 @@ describe("download job registry", () => {
   });
 
   it("allows a retry once a download has failed", async () => {
-    const first = startDownloadJob(URL_A, "checkpoints");
+    const first = await startDownloadJob(URL_A, "checkpoints");
     hoisted.resolvers[0].reject(new Error("network reset"));
     await first.settled;
     // Adoption must not pin a dead job forever — a retry has to start a new one.
-    startDownloadJob(URL_A, "checkpoints");
+    const retry = await startDownloadJob(URL_A, "checkpoints");
     expect(hoisted.calls).toBe(2);
-    expect(getDownloadJob(downloadIdFor(URL_A))?.status).toBe("downloading");
+    expect(getDownloadJob(retry.job.id)?.status).toBe("downloading");
+  });
+
+  it("in remote mode keys WITHOUT resolving a local target and dispatches to the Manager", async () => {
+    // Regression guard: the shared resolver throws when no local models dir exists
+    // (COMFYUI_PATH unset). Remote downloads go straight to the Manager, so
+    // startDownloadJob must NOT resolve a local targetPath in remote mode.
+    hoisted.remote = true;
+    const { job } = await startDownloadJob(URL_A, "checkpoints");
+    expect(job.status).toBe("downloading");
+    expect(hoisted.resolveTargetCalls).toBe(0); // no local resolution attempted
+    expect(hoisted.calls).toBe(1); // downloadModel invoked (takes the Manager path)
+    // A repeated identical remote request still adopts the in-flight job.
+    const again = await startDownloadJob(URL_A, "checkpoints");
+    expect(again.job).toBe(job);
+    expect(hoisted.calls).toBe(1);
   });
 
   it("lists newest first", async () => {
-    startDownloadJob(URL_A, "checkpoints");
+    await startDownloadJob(URL_A, "checkpoints");
     await new Promise((r) => setTimeout(r, 2));
-    startDownloadJob(URL_B, "loras");
+    await startDownloadJob(URL_B, "loras");
     expect(listDownloadJobs()[0].url).toBe(URL_B);
   });
 });
