@@ -100,30 +100,85 @@ let supervisorGaveUp = false;
 
 const IS_WIN = platform() === "win32";
 
+/**
+ * Parse a `netstat -ano` blob and return the PID that OWNS the socket bound to
+ * `port` on the LOCAL address column. Locale-independent by design (issue #449):
+ * we anchor on the local-address `:PORT` suffix rather than grepping the state
+ * word ("LISTENING"), which is TRANSLATED on non-English Windows (German
+ * "ABHÖREN", French "À L'ÉCOUTE", …). The old `findstr LISTENING` filter dropped
+ * every line on those systems, so a perfectly reachable ComfyUI looked like "no
+ * process on port". Anchoring on the local column also correctly IGNORES an
+ * outbound/established connection whose REMOTE peer happens to use `:PORT`.
+ *
+ * Exported for tests: this pure function is where the bug lived.
+ */
+export function parseListenerPidFromNetstat(
+  output: string,
+  port: number,
+): number | null {
+  const suffix = `:${port}`;
+  for (const raw of output.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    const parts = line.split(/\s+/);
+    // Expected columns: PROTO LOCAL FOREIGN STATE PID
+    if (parts.length < 5) continue;
+    if (parts[0].toUpperCase() !== "TCP") continue;
+    const local = parts[1];
+    const foreign = parts[2];
+    // The leading colon anchors the match: "…:8188" matches but "…:81880" and
+    // "…:18188" do not (their last chars aren't ":8188").
+    if (!local.endsWith(suffix)) continue;
+    // Require a LISTENING row without depending on the localized state word: a
+    // listener's foreign endpoint is always the wildcard port 0 (0.0.0.0:0 /
+    // [::]:0). This rejects an ESTABLISHED connection that merely bound its
+    // local side to :PORT — killing that would take down the wrong process
+    // (or none) when ComfyUI is actually down.
+    if (!foreign.endsWith(":0")) continue;
+    const pid = parseInt(parts[parts.length - 1], 10);
+    if (!Number.isNaN(pid) && pid > 0) return pid;
+  }
+  return null;
+}
+
 function findPidByPort(port: number): number | null {
-  try {
-    if (IS_WIN) {
-      // netstat -ano | findstr :PORT | findstr LISTENING
-      const out = execSync(
-        `netstat -ano | findstr :${port} | findstr LISTENING`,
-        { encoding: "utf-8", timeout: 5000 },
-      ).trim();
-      // Lines look like: TCP  0.0.0.0:8188  0.0.0.0:0  LISTENING  12345
-      for (const line of out.split("\n")) {
-        const parts = line.trim().split(/\s+/);
-        if (parts.length >= 5) {
-          const pid = parseInt(parts[parts.length - 1], 10);
-          if (!isNaN(pid) && pid > 0) return pid;
-        }
-      }
-    } else {
-      const out = execSync(`lsof -ti :${port}`, {
+  if (IS_WIN) {
+    // Parse `netstat -ano` ourselves instead of piping through
+    // `findstr LISTENING` — that state word is localized and made detection fail
+    // on non-English Windows even when ComfyUI was reachable (issue #449).
+    try {
+      const out = execSync(`netstat -ano -p TCP`, {
         encoding: "utf-8",
         timeout: 5000,
-      }).trim();
-      const pid = parseInt(out.split("\n")[0], 10);
-      if (!isNaN(pid) && pid > 0) return pid;
+      });
+      const pid = parseListenerPidFromNetstat(out, port);
+      if (pid) return pid;
+    } catch {
+      // netstat unavailable / failed — fall through to the PowerShell probe.
     }
+    // Fallback: Get-NetTCPConnection maps port→owning PID structurally, with no
+    // dependence on console locale or column layout. Belt-and-suspenders for the
+    // portable/embedded-Python launch shape reported in #449.
+    try {
+      const out = execSync(
+        `powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty OwningProcess"`,
+        { encoding: "utf-8", timeout: 8000 },
+      ).trim();
+      const pid = parseInt(out, 10);
+      if (!Number.isNaN(pid) && pid > 0) return pid;
+    } catch {
+      // PowerShell unavailable / nothing listening.
+    }
+    return null;
+  }
+
+  try {
+    const out = execSync(`lsof -ti :${port}`, {
+      encoding: "utf-8",
+      timeout: 5000,
+    }).trim();
+    const pid = parseInt(out.split("\n")[0], 10);
+    if (!isNaN(pid) && pid > 0) return pid;
   } catch {
     // Command failed — no process on that port
   }
@@ -637,24 +692,37 @@ function assessRelaunch(info: ProcessInfo): { ok: boolean; reason?: string } {
  * PID on the port, falling back to OS-level Desktop-app detection when the API
  * and port are unreachable. Returns null when nothing can be found.
  */
-async function acquireProcessInfo(): Promise<ProcessInfo | null> {
+async function acquireProcessInfo(): Promise<{
+  info: ProcessInfo | null;
+  diagnostic?: string;
+}> {
   try {
-    return await gatherProcessInfo();
-  } catch {
+    return { info: await gatherProcessInfo() };
+  } catch (err) {
+    // #449: the server answered /system_stats but we could not map its port to
+    // a PID. Do NOT fall through to killing a Desktop shell we can't confirm
+    // owns :PORT — surface the diagnostic and leave everything untouched.
+    if (err instanceof ProcessControlError && err.reachableButNoPid) {
+      return { info: null, diagnostic: err.message };
+    }
     const desktopPids = findDesktopAppPids();
     if (desktopPids.length > 0) {
       logger.info(
         `API unreachable but found Desktop app PIDs: ${desktopPids.join(", ")}`,
       );
       return {
-        pid: desktopPids[0],
-        port: config.resolvedPort,
-        argv: [],
-        isDesktopApp: true,
-        desktopExePath: findDesktopExeFromCommonPaths(),
+        info: {
+          pid: desktopPids[0],
+          port: config.resolvedPort,
+          argv: [],
+          isDesktopApp: true,
+          desktopExePath: findDesktopExeFromCommonPaths(),
+        },
       };
     }
-    return null;
+    // Genuinely down (not reachable, no Desktop shell): let callers use their
+    // existing friendly "no process" message.
+    return { info: null };
   }
 }
 
@@ -750,6 +818,20 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
   // 2. Find PID by port
   const pid = findPidByPort(port);
   if (!pid) {
+    // Liveness is the reachable SERVER, not only a local PID scan. If
+    // /system_stats just answered (argv populated) yet we still can't map the
+    // listening socket to a PID, say so precisely instead of claiming the
+    // process doesn't exist (issue #449).
+    if (argv.length > 0) {
+      const reachableErr = new ProcessControlError(
+        `ComfyUI is reachable on port ${port} but its listening process could not ` +
+          `be mapped to a local PID (port-owner lookup failed). The server was left ` +
+          `untouched. On a portable/embedded-Python install, restart it via its ` +
+          `launcher/console or trigger a ComfyUI-Manager reboot.`,
+      );
+      reachableErr.reachableButNoPid = true;
+      throw reachableErr;
+    }
     throw new ProcessControlError(
       `No process found listening on port ${port}. Is ComfyUI running?`,
     );
@@ -777,11 +859,19 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
 
   // Gather info before we kill it (or reuse the caller's pre-validated info so a
   // relaunch preflight in restartComfyUI is not discarded).
-  const info = preInfo ?? (await acquireProcessInfo());
+  let info = preInfo ?? null;
+  let acquireDiagnostic: string | undefined;
+  if (!info) {
+    const acquired = await acquireProcessInfo();
+    info = acquired.info;
+    acquireDiagnostic = acquired.diagnostic;
+  }
   if (!info) {
     return {
       stopped: false,
-      message: `No ComfyUI process found on port ${config.resolvedPort}. Is ComfyUI running?`,
+      message:
+        acquireDiagnostic ??
+        `No ComfyUI process found on port ${config.resolvedPort}. Is ComfyUI running?`,
       has_restart_info: false,
     };
   }
@@ -1121,12 +1211,14 @@ export async function restartComfyUI(): Promise<RestartResult> {
   // command can't be built/validated (stale COMFYUI_PATH, unknown Desktop exe),
   // refuse and leave the server up rather than take it down with no way back
   // (issues #368/#370).
-  const info = await acquireProcessInfo();
+  const { info, diagnostic } = await acquireProcessInfo();
   if (!info) {
     return {
       stopped: false,
       started: false,
-      message: `No ComfyUI process found on port ${config.resolvedPort} to restart. Is ComfyUI running?`,
+      message:
+        diagnostic ??
+        `No ComfyUI process found on port ${config.resolvedPort} to restart. Is ComfyUI running?`,
     };
   }
   const relaunch = assessRelaunch(info);

@@ -63,6 +63,13 @@ export class ModelError extends ComfyUIError {
 }
 
 export class ProcessControlError extends ComfyUIError {
+  /**
+   * Set when the ComfyUI server IS reachable (answered /system_stats) but its
+   * listening socket could not be mapped to a local PID — so callers surface a
+   * precise diagnostic instead of a flat "no process" message (issue #449).
+   */
+  reachableButNoPid?: boolean;
+
   constructor(message: string, details?: unknown) {
     super(message, "PROCESS_CONTROL_ERROR", details);
     this.name = "ProcessControlError";

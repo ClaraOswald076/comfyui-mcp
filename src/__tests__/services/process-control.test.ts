@@ -49,6 +49,7 @@ vi.mock("../../services/env-capabilities.js", () => ({
 
 import {
   __processControlTestHooks,
+  parseListenerPidFromNetstat,
   restartComfyUI,
   startComfyUI,
   stopComfyUI,
@@ -446,6 +447,178 @@ describe("process-control restart relaunch preflight (#368/#370)", () => {
     expect(result.message).toMatch(/desktop/i);
     expect(mockSpawn).not.toHaveBeenCalled();
     expect(mockResetClient).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  });
+});
+
+describe("parseListenerPidFromNetstat — locale-independent port→PID (#449)", () => {
+  it("finds the owning PID from an English LISTENING line", () => {
+    const out = "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       6789";
+    expect(parseListenerPidFromNetstat(out, 8188)).toBe(6789);
+  });
+
+  it("finds the PID even when the state word is LOCALIZED (German 'ABHÖREN')", () => {
+    // The old detector piped through `findstr LISTENING`; on non-English Windows
+    // the state column is translated, so that filter matched nothing and a
+    // reachable ComfyUI looked like 'no process on port' (issue #449).
+    const out = [
+      "Aktive Verbindungen",
+      "",
+      "  Proto  Lokale Adresse     Remoteadresse      Status      PID",
+      "  TCP    0.0.0.0:8188       0.0.0.0:0          ABHÖREN     6789",
+    ].join("\n");
+    expect(parseListenerPidFromNetstat(out, 8188)).toBe(6789);
+  });
+
+  it("matches an IPv6 listener too", () => {
+    const out = "  TCP    [::]:8188   [::]:0   ABHÖREN   6789";
+    expect(parseListenerPidFromNetstat(out, 8188)).toBe(6789);
+  });
+
+  it("IGNORES an outbound/established connection whose REMOTE peer uses the port", () => {
+    // Local column is bound to an ephemeral port; only the foreign column shows
+    // :8188. Anchoring on the local column must skip this line.
+    const out = "  TCP    127.0.0.1:54210   127.0.0.1:8188   HERGESTELLT   4444";
+    expect(parseListenerPidFromNetstat(out, 8188)).toBeNull();
+  });
+
+  it("does not confuse a superset port (:81880 / :18188) with :8188", () => {
+    const out = [
+      "  TCP    0.0.0.0:81880   0.0.0.0:0   LISTENING   1111",
+      "  TCP    0.0.0.0:18188   0.0.0.0:0   LISTENING   2222",
+    ].join("\n");
+    expect(parseListenerPidFromNetstat(out, 8188)).toBeNull();
+  });
+
+  it("rejects a non-listening row whose LOCAL side is bound to :8188 (foreign endpoint not :0)", () => {
+    // An established/outbound socket can have its LOCAL side on :8188 while the
+    // server is actually down. A listener always has foreign port 0; requiring
+    // that avoids returning (and killing) the wrong PID.
+    const out = "  TCP    127.0.0.1:8188   203.0.113.9:55123   HERGESTELLT   9999";
+    expect(parseListenerPidFromNetstat(out, 8188)).toBeNull();
+  });
+
+  it("still selects the LISTENING row when a live established connection is also present", () => {
+    const out = [
+      "  TCP    0.0.0.0:8188      0.0.0.0:0          ABHÖREN       6789",
+      "  TCP    127.0.0.1:8188    127.0.0.1:55123    HERGESTELLT   6789",
+    ].join("\n");
+    expect(parseListenerPidFromNetstat(out, 8188)).toBe(6789);
+  });
+});
+
+describe("findPidByPort resilience to localized netstat state (#449)", () => {
+  // IS_WIN is captured from os.platform() at module load, so this test exercises
+  // the Windows `netstat` branch only on Windows. On Ubuntu CI findPidByPort
+  // takes the `lsof` path and this wiring test is not meaningful — the pure
+  // parseListenerPidFromNetstat suite above covers the locale mechanism on every
+  // platform. (The reachable-diagnostic tests below are platform-agnostic: they
+  // resolve no PID on either branch.)
+  const winIt = process.platform === "win32" ? it : it.skip;
+  winIt("stop_comfyui finds the listener PID even on non-English Windows", async () => {
+    // Realistic German netstat -ano blob: state column is 'ABHÖREN', not
+    // 'LISTENING'. The mock emulates the actual shell pipeline — a chained
+    // `findstr LISTENING` (the OLD detector) would filter every line out,
+    // reproducing the false 'no process on port' failure. The current detector
+    // parses `netstat -ano` directly and must still map the port to PID 6789.
+    const GERMAN_BLOB = [
+      "Aktive Verbindungen",
+      "",
+      "  Proto  Lokale Adresse     Remoteadresse      Status      PID",
+      "  TCP    0.0.0.0:8188       0.0.0.0:0          ABHÖREN     6789",
+      "  TCP    [::]:8188          [::]:0             ABHÖREN     6789",
+      "  TCP    127.0.0.1:54210    127.0.0.1:8188     HERGESTELLT 4444",
+    ].join("\n");
+
+    let killed = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (cmd.includes("netstat")) {
+        if (killed) return ""; // port freed after kill → waitForPortFree resolves
+        // Emulate the shell: a chained `findstr LISTENING` filters by that word.
+        if (/findstr\s+LISTENING/i.test(cmd)) {
+          return GERMAN_BLOB.split("\n")
+            .filter((l) => l.includes("LISTENING"))
+            .join("\n");
+        }
+        return GERMAN_BLOB;
+      }
+      if (cmd.includes("lsof")) throw new Error("not listening");
+      return ""; // tasklist / powershell fallback / `if exist` → nothing
+    });
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: ["python", "main.py", "--port", "8188"] },
+    });
+
+    const result = await stopComfyUI();
+
+    expect(result.stopped).toBe(true);
+    expect(result.message).toContain("6789");
+    expect(
+      mockExecSync.mock.calls.some(([c]) => /taskkill/i.test(String(c))),
+    ).toBe(true);
+    expect(mockResetClient).toHaveBeenCalled();
+  });
+
+  it("restart reports a REACHABLE diagnostic (not 'no process') when the server answers but no PID maps", async () => {
+    // /system_stats answers (server reachable) but every port→PID lookup comes
+    // back empty. Liveness is the reachable server, so we must NOT claim the
+    // process is absent — and we must NOT take the server down (issue #449).
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (cmd.includes("lsof")) throw new Error("not listening");
+      return ""; // netstat, powershell, tasklist → nothing resolves a PID
+    });
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: ["python", "main.py", "--port", "8188"] },
+    });
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(false);
+    expect(result.started).toBe(false);
+    expect(result.message).toMatch(/reachable on port 8188/i);
+    expect(result.message).not.toMatch(/no comfyui process found/i);
+    // Server left untouched: no relaunch, no kill.
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(
+      mockExecSync.mock.calls.some(([c]) => /taskkill/i.test(String(c))),
+    ).toBe(false);
+
+    killSpy.mockRestore();
+  });
+
+  it("reachable-but-no-PID must NOT fall through to killing a Desktop shell (atomic-restart)", async () => {
+    // Server answers /system_stats but no port→PID maps, AND a Desktop shell
+    // (Comfy Desktop.exe) is present. We must NOT kill that shell — we can't
+    // confirm it owns :8188 — so leave everything untouched and diagnose.
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (cmd.includes("lsof")) throw new Error("not listening");
+      if (/tasklist/i.test(cmd)) {
+        // A Comfy Desktop shell IS running.
+        return '"Comfy Desktop.exe","4242","Console","1","206,248 K"';
+      }
+      return ""; // netstat / powershell resolve no listener PID
+    });
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: ["python", "main.py", "--port", "8188"] },
+    });
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(false);
+    expect(result.started).toBe(false);
+    expect(result.message).toMatch(/reachable on port 8188/i);
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(
+      mockExecSync.mock.calls.some(([c]) => /taskkill/i.test(String(c))),
+    ).toBe(false);
+    expect(killSpy).not.toHaveBeenCalled();
 
     killSpy.mockRestore();
   });
