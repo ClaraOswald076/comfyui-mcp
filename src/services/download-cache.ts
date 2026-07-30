@@ -184,17 +184,18 @@ function cacheSizeLimitBytes(): number {
 }
 
 /** Representation-affecting request headers, folded into the cache identity so a
- *  same-URL fetch carrying DIFFERENT auth (e.g. two users' Bearer tokens, or a
- *  Cookie/API-key that selects a user-scoped or gated representation) can NEVER
- *  share a cache entry / in-flight stream and install the wrong bytes (#467
- *  P1-2). Query-param auth already varies the URL itself (applyDownloadAuth folds
- *  it in), so this covers the header-auth case the URL can't. Volatile hop
- *  headers (Range/If-Range) are added later inside streamUrlToFile and are
- *  deliberately excluded — they must not fragment the cache. Empty ⇒ the key is
- *  the bare URL, so unauthenticated public downloads keep their existing paths. */
+ *  same-URL fetch carrying DIFFERENT auth/headers (two users' Bearer tokens, a
+ *  Cookie/API-key, or ANY custom header like `X-Custom-Auth` that selects a
+ *  user-scoped or gated representation) can NEVER share a cache entry / in-flight
+ *  stream and install the wrong bytes (#467 P1-2). Query-param auth already
+ *  varies the URL itself (applyDownloadAuth folds it in), so this covers the
+ *  header case the URL can't. Hashes EVERY caller-supplied header (an allowlist
+ *  would silently miss custom auth headers) — these are the request headers built
+ *  from the caller's auth/config, NOT the volatile hop headers (Range/If-Range),
+ *  which are added later inside streamUrlToFile and never reach here. Empty ⇒ the
+ *  key is the bare URL, so unauthenticated public downloads keep existing paths. */
 function representationKey(headers: Record<string, string>): string {
   const relevant = Object.keys(headers)
-    .filter((k) => /^(authorization|cookie|x-api-key|x-auth-token)$/i.test(k))
     .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
     .map((k) => `${k.toLowerCase()}=${headers[k]}`)
     .join("\n");
@@ -278,15 +279,11 @@ async function streamUrlToFile(
    *  Defaults to the URL tray id for internal/direct callers. */
   resumeKey?: string,
 ): Promise<void> {
-  // The slot this download's resume decision is recorded under.
+  // The slot this download's resume decision is recorded under. The per-attempt
+  // RESET of this slot happens in downloadIntoCache (the single new-physical-
+  // download gate that also covers cache hits and the mkdir/fallback path),
+  // NOT here — see #467 P1-b/P2.
   const diagKey = resumeKey ?? trayIdForUrl(url);
-  // Per-attempt reset (#467 P2): a GENUINELY-NEW physical download clears any
-  // decision left by an EARLIER attempt for this slot, then records its own
-  // below. This lives HERE — the single physical-download entry point — not in
-  // startDownloadJob, so a job that merely COALESCES onto an in-flight download
-  // (downloadIntoCache's inflight map) never runs it and therefore can't wipe the
-  // active stream's recorded decision (#467 P1-b).
-  if (resumable) clearResumeDiagnostic(diagKey);
   if (supportsCloudDownload(url)) {
     await downloadCloudUrlToFile(url, targetPath, storageAuth);
     // #343 edge: the S3/Azure path bypasses the HTTP size gate below. The cloud
@@ -786,6 +783,14 @@ async function downloadIntoCache(
   if (existing) return existing;
 
   const promise = (async () => {
+    // Per-attempt reset (#467 P1-b/P2): a GENUINELY-NEW physical download for this
+    // slot clears any decision left by an EARLIER attempt, up front — BEFORE the
+    // mkdir/cache-hit/miss branches — so it also covers a cache hit (which never
+    // reaches streamUrlToFile) AND a cache-dir mkdir failure (which falls back to
+    // a direct download that records nothing). A job that merely COALESCES onto an
+    // in-flight download returned at `if (existing)` above, so it never runs this
+    // and can't wipe the active stream's recorded decision.
+    clearResumeDiagnostic(resumeKey ?? trayIdForUrl(url));
     await downloadCacheFs.mkdir(cacheDir(), { recursive: true });
 
     try {
@@ -799,11 +804,8 @@ async function downloadIntoCache(
           await downloadCacheFs.rm(target, { force: true }).catch(() => undefined);
         } else {
           await touch(target);
-          // Cache hit ⇒ no resume/discard happened this attempt. Clear any prior
-          // decision for this slot so download_status can't attribute an EARLIER
-          // attempt's decline to this fresh cache-hit job — the per-attempt reset
-          // that streamUrlToFile would do, but a hit never reaches it (#467).
-          clearResumeDiagnostic(resumeKey ?? trayIdForUrl(url));
+          // Cache hit ⇒ no resume/discard this attempt; the slot was already
+          // cleared at the top of this promise body (#467).
           return target;
         }
       }

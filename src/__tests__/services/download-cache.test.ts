@@ -785,6 +785,24 @@ describe("downloadModel cache", () => {
     await expect(readFile(bob, "utf-8")).resolves.toBe("BOB-ONLY-BYTES");
   });
 
+  it("separates same-URL downloads by ANY custom auth header, not just known names (#467 P1-2)", async () => {
+    const { downloadWithCache } = await import("../../services/download-cache.js");
+    await fsPromises.mkdir(comfyDir, { recursive: true });
+    const url = "https://example.com/models/customhdr.safetensors";
+    // A NON-allowlisted custom auth header still selects a distinct representation.
+    fetchMock.mockResolvedValueOnce(okResponse("ALICE-CUSTOM"));
+    fetchMock.mockResolvedValueOnce(okResponse("BOB-CUSTOM"));
+
+    const alice = join(comfyDir, "ca.safetensors");
+    const bob = join(comfyDir, "cb.safetensors");
+    await downloadWithCache({ url, headers: { "X-Custom-Auth": "alice" }, targetPath: alice });
+    await downloadWithCache({ url, headers: { "X-Custom-Auth": "bob" }, targetPath: bob });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2); // NOT coalesced despite same URL
+    await expect(readFile(alice, "utf-8")).resolves.toBe("ALICE-CUSTOM");
+    await expect(readFile(bob, "utf-8")).resolves.toBe("BOB-CUSTOM");
+  });
+
   it("DOES cache/coalesce same-URL downloads with the SAME auth header (public dedup preserved) (#467 P1-2)", async () => {
     const { downloadWithCache } = await import("../../services/download-cache.js");
     await fsPromises.mkdir(comfyDir, { recursive: true });

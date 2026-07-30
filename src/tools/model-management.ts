@@ -256,7 +256,9 @@ export function registerModelManagementTools(server: McpServer): void {
               : `refused to append a ${gb} GB prior .partial but could NOT remove it (delete the .partial manually if a retry keeps failing)`;
             const next =
               j.status === "error"
-                ? "the resume was REJECTED for safety — re-issue download_model to restart cleanly"
+                ? diag.discarded
+                  ? "the resume was REJECTED for safety — re-issue download_model to restart cleanly"
+                  : "the resume was REJECTED for safety — re-issue download_model to retry"
                 : "re-downloading in full";
             resumeNote = `\n    resume: ${diag.outcome} — ${fate} because ${why}; ${next}`;
           }
