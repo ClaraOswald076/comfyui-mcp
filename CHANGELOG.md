@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.17] - 2026-07-30
+
+### Fixed
+- **`download_model` resume no longer silently discards a near-complete `.partial`, and HF Xet/CAS downloads resume safely (#467, #470).** When the Xet/CAS CDN omits `ETag`/`Last-Modified`, no resume validator was ever written, so a restart silently truncated and re-downloaded a multi-GB partial with no signal. Resume is now surfaced honestly via `download_status` (four outcomes: `declined:no-validator` / `declined:full-response` / `declined:etag-changed` / `declined:unverifiable`), and HF Xet partials resume by capturing the content-addressed `X-Linked-Etag` off the resolve 302 and preserving `Range`/`If-Range` across the cross-origin redirect (dropping `Authorization`). The #343 append invariant is hardened throughout: append happens only on a validated 206 with an exact, end-reaching `Content-Range`; a cross-origin 206 additionally requires a matching content-addressed validator; completion fails **closed** (rejects any size ≠ the authoritative total, derives a 206's total from `Content-Range` and a fresh 200's from `max(Content-Length, X-Linked-Size)`, and refuses an unsolicited 206 on a fresh request); materialize + direct-fallback build into a random `O_EXCL` temp and rename atomically (never writing through a destination hardlink into a cache inode); and the cache identity folds in per-request auth and the effective cloud principal so bytes are never served across an auth boundary. (#469)
+
 ## [0.48.16] - 2026-07-30
 
 ### Fixed
