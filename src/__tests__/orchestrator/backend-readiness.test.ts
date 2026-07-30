@@ -93,6 +93,53 @@ describe("backendReadiness", () => {
     expect(r.ready).toBe(true);
   });
 
+  it("gemini: CLI on PATH but no auth of any kind → not ready (#456)", () => {
+    const real = { g: process.env.GEMINI_API_KEY, gg: process.env.GOOGLE_API_KEY };
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.GOOGLE_API_KEY;
+    putOnPath(process.platform === "win32" ? "gemini.cmd" : "gemini");
+    const r = backendReadiness("gemini", { home: tmp });
+    expect(r.cli).toBe(true);
+    expect(r.auth).toBe(false);
+    expect(r.ready).toBe(false);
+    if (real.g === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = real.g;
+    if (real.gg === undefined) delete process.env.GOOGLE_API_KEY;
+    else process.env.GOOGLE_API_KEY = real.gg;
+  });
+
+  it("gemini: ready via GEMINI_API_KEY with no oauth_creds.json (#456)", () => {
+    const real = process.env.GEMINI_API_KEY;
+    putOnPath(process.platform === "win32" ? "gemini.cmd" : "gemini");
+    process.env.GEMINI_API_KEY = "AIza-test-key";
+    const r = backendReadiness("gemini", { home: tmp });
+    expect(r.cli).toBe(true);
+    expect(r.auth).toBe(true);
+    expect(r.ready).toBe(true);
+    if (real === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = real;
+  });
+
+  it("gemini: ready via settings.json gemini-api-key with no key in env (#456)", () => {
+    const real = { g: process.env.GEMINI_API_KEY, gg: process.env.GOOGLE_API_KEY };
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.GOOGLE_API_KEY;
+    putOnPath(process.platform === "win32" ? "gemini.cmd" : "gemini");
+    mkdirSync(join(tmp, ".gemini"), { recursive: true });
+    writeFileSync(
+      join(tmp, ".gemini", "settings.json"),
+      JSON.stringify({ security: { auth: { selectedType: "gemini-api-key" } } }),
+    );
+    const r = backendReadiness("gemini", { home: tmp });
+    expect(r.cli).toBe(true);
+    expect(r.auth).toBe(true);
+    expect(r.ready).toBe(true);
+    if (real.g === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = real.g;
+    if (real.gg === undefined) delete process.env.GOOGLE_API_KEY;
+    else process.env.GOOGLE_API_KEY = real.gg;
+  });
+
   it("chatgpt: ready when ~/.codex/auth.json exists (no CLI)", () => {
     mkdirSync(join(tmp, ".codex"), { recursive: true });
     writeFileSync(join(tmp, ".codex", "auth.json"), "{}");

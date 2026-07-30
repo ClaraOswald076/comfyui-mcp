@@ -9,7 +9,7 @@
 // which the panel then prefers (see comfyui-mcp-panel: applyReadiness on a
 // {type:"backends"} bridge frame).
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readOAuthStatus } from "../services/code-provider-auth.js";
@@ -93,6 +93,24 @@ function onPath(names: string[]): boolean {
     }
   }
   return false;
+}
+
+/** True if <geminiHome>/.gemini/settings.json selects API-key auth
+ *  (security.auth.selectedType === "gemini-api-key"). This is an
+ *  env-independent "configured for API key" signal (issue #456): the gemini CLI
+ *  writes it on `/auth` → "Gemini API key" and it persists across processes,
+ *  unlike GEMINI_API_KEY which the orchestrator only inherits if set before
+ *  launch. Never throws — a missing/corrupt file just means "no signal". */
+function geminiSettingsUsesApiKey(geminiHome: string): boolean {
+  try {
+    const raw = readFileSync(join(geminiHome, ".gemini", "settings.json"), "utf8");
+    const parsed = JSON.parse(raw) as {
+      security?: { auth?: { selectedType?: unknown } };
+    };
+    return parsed?.security?.auth?.selectedType === "gemini-api-key";
+  } catch {
+    return false;
+  }
 }
 
 function fileExists(...parts: string[]): boolean {
@@ -192,10 +210,24 @@ export function backendReadiness(
   }
   if (b === "gemini") {
     const cli = onPath(CLI_NAMES.gemini);
-    // The gemini CLI caches its Google OAuth at <home>/.gemini/oauth_creds.json
-    // (or GEMINI_CLI_HOME when set).
+    // API-key auth is a first-class gemini CLI mode and writes NO
+    // oauth_creds.json (issue #456). Mirror the kimi branch and accept ANY of:
+    //   1. GEMINI_API_KEY / GOOGLE_API_KEY in the orchestrator's env, or
+    //   2. Google OAuth cached at <home>/.gemini/oauth_creds.json (or
+    //      GEMINI_CLI_HOME when set), or
+    //   3. an env-independent "configured for API key" signal —
+    //      <home>/.gemini/settings.json with
+    //      security.auth.selectedType === "gemini-api-key". This lets a user
+    //      who authed with a key before ComfyUI launched (so the key isn't in
+    //      this process's env yet) still read as ready rather than "not signed
+    //      in"; a genuinely-bad/absent key surfaces via the connect ack's model
+    //      probe (degraded), same as every other key provider.
     const geminiHome = process.env.GEMINI_CLI_HOME || home;
-    const auth = fileExists(geminiHome, ".gemini", "oauth_creds.json");
+    const apiKey =
+      !!(process.env.GEMINI_API_KEY?.trim() || process.env.GOOGLE_API_KEY?.trim());
+    const oauth = fileExists(geminiHome, ".gemini", "oauth_creds.json");
+    const apiKeyConfigured = geminiSettingsUsesApiKey(geminiHome);
+    const auth = apiKey || oauth || apiKeyConfigured;
     return { backend: "gemini", cli, auth, ready: cli && auth };
   }
   if (b === "antigravity") {
