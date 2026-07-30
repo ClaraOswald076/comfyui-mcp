@@ -6,13 +6,20 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.7] - 2026-07-29
+
 ### MCP
 
+#### Added
+- report_issue: fix-then-file default plus an async Worker submit/poll client — filing returns a pollable job_id that resolves to the GitHub issue link, and the report-bug skill attempts a local fix before filing (#410)
+
 #### Fixed
-- comfy_cli_search_nodes falls back to the connected server's live /object_info when comfy-cli is absent (WS-4) (#354)
-- apply_manifest adopts a saved default workspace as the local FS target when COMFYUI_PATH is unset (WS-4) (#390)
-- apply_manifest pip install falls back to `python -m pip` when uv rejects a non-venv interpreter (WS-4) (#377)
-- apply_manifest hands slow model downloads to the background job registry to avoid the tools/call timeout (WS-4) (#362)
+- download_model and verify_custom_node adopt the saved default workspace (or the Manager route) when COMFYUI_PATH is unset, instead of hard-failing or misclassifying a local instance as remote (#415 #416 #386 #409) (#418)
+- route custom-node ops by Manager generation with a live /object_info fallback; comfy_cli_search_nodes falls back to the live server when comfy-cli is absent; apply_manifest adopts a saved default workspace, falls back to `python -m pip` for non-venv interpreters, and hands slow downloads to the background job registry (WS-4) (#354 #362 #377 #390 #408 #412)
+- chat serializes structured error/user payloads as readable text instead of `[object Object]` (WS-9) (#405)
+- invalidate stale objectInfo caches and node snapshots after a restart+edit so tools see the live graph (WS-3) (#402)
+- normalize preferred_models before the set_config change-guard to stop a heartbeat config-repush loop; civitai search now ensures the endpoint is reachable (#398)
+- reject truncated and 0-byte model downloads instead of leaving a corrupt file on disk (#343 #396)
 
 ## [0.48.6] - 2026-07-29
 
