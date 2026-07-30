@@ -2,22 +2,33 @@ import { describe, expect, it, beforeEach, vi } from "vitest";
 import { resolve } from "node:path";
 
 // Control config (comfyuiPath) per test. isRemoteMode is a controllable mock:
-// resolveComfyUIBase() consults it only when comfyuiPath is unset, to decide
-// whether a local default-workspace fallback is allowed (never in remote mode).
-vi.mock("../../config.js", () => ({
+// resolveEffectiveComfyUIBase() consults it only when comfyuiPath is unset, to
+// decide whether a local default-workspace fallback is allowed (never in remote
+// mode). Shared via vi.hoisted so the config.js and workspace-env.js mocks agree
+// (resolveEffectiveComfyUIBase now backs resolveComfyUIBase and must see the same
+// config + isRemoteMode + saved-workspace state the tests mutate).
+const h = vi.hoisted(() => ({
   config: {
     comfyuiPath: "/comfy" as string | undefined,
     huggingfaceToken: undefined as string | undefined,
     civitaiApiToken: undefined as string | undefined,
   },
-  isRemoteMode: vi.fn(() => false),
+  isRemoteMode: vi.fn<() => boolean>(() => false),
+  getSaved: vi.fn<() => string | undefined>(() => undefined),
+}));
+vi.mock("../../config.js", () => ({
+  config: h.config,
+  isRemoteMode: h.isRemoteMode,
 }));
 
 // Saved default workspace (set via set_default_workspace) — the local fallback
-// resolveComfyUIBase() uses when COMFYUI_PATH is unset and we're not remote.
-const getSavedDefaultWorkspaceSyncMock = vi.fn<() => string | undefined>();
+// resolveEffectiveComfyUIBase() uses when COMFYUI_PATH is unset and we're not
+// remote. The shared helper replicates the real resolution order here.
+const getSavedDefaultWorkspaceSyncMock = h.getSaved;
 vi.mock("../../services/workspace-env.js", () => ({
-  getSavedDefaultWorkspaceSync: () => getSavedDefaultWorkspaceSyncMock(),
+  getSavedDefaultWorkspaceSync: h.getSaved,
+  resolveEffectiveComfyUIBase: () =>
+    h.config.comfyuiPath ?? (h.isRemoteMode() ? undefined : h.getSaved()),
 }));
 
 // node:fs/promises is mocked so stat answers per-path from a fixture map.

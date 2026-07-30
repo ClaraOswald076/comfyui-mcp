@@ -1,6 +1,7 @@
 import { isAbsolute, join, resolve } from "node:path";
 import { config } from "../config.js";
 import { getSystemStats } from "../comfyui/client.js";
+import { resolveEffectiveComfyUIBase } from "./workspace-env.js";
 import { ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 
@@ -150,12 +151,19 @@ export async function resolveModelsDir(): Promise<string> {
       { error: err instanceof Error ? err.message : String(err) },
     );
   }
-  if (!config.comfyuiPath) {
-    throw new ValidationError(
-      "COMFYUI_PATH is not configured. Set the COMFYUI_PATH environment variable.",
-    );
-  }
-  return resolve(config.comfyuiPath, "models");
+  // No live-server base dir available. Fall back to the effective LOCAL base:
+  // COMFYUI_PATH, else the saved default workspace (set_default_workspace) when
+  // NOT in remote mode — so a download resolves to that install rather than
+  // hard-failing just because COMFYUI_PATH is unset (#415/#416). resolveModelsDir
+  // is only reached in local mode (remote downloads short-circuit to the Manager
+  // before any local-dir resolution), so the default workspace is a safe target.
+  const base = resolveEffectiveComfyUIBase();
+  if (base) return resolve(base, "models");
+  throw new ValidationError(
+    "No local ComfyUI models directory could be resolved. Set the COMFYUI_PATH " +
+      "environment variable, save a default workspace with set_default_workspace, " +
+      "or connect to a running ComfyUI so its models directory can be detected.",
+  );
 }
 
 /**
