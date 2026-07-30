@@ -60,6 +60,37 @@ async function getQuery() {
  *  utility call on the user's subscription). Override via COMFYUI_MCP_CAPTION_MODEL. */
 const CAPTION_MODEL = process.env.COMFYUI_MCP_CAPTION_MODEL?.trim() || "claude-haiku-4-5";
 
+/** A PERSISTENT failure that dooms every remaining image — a missing/invalid
+ *  Claude Code login, or a backend that can't run vision captioning at all.
+ *  captionDataset bails the batch on the first one instead of re-hitting the
+ *  same auth wall 32 times (issue #438: the panel backend was Codex, so every
+ *  image returned "Not logged in — Please run /login"). */
+export class CaptionAuthError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CaptionAuthError";
+  }
+}
+
+/** Does this SDK error text mean "no usable Claude Code credentials", i.e. a
+ *  failure that will repeat identically for every image? Matches the Agent
+ *  SDK's not-logged-in / invalid-key / auth phrasings. */
+function isAuthFailureText(text: string): boolean {
+  const t = text.toLowerCase();
+  return (
+    t.includes("not logged in") ||
+    t.includes("/login") ||
+    t.includes("please run /login") ||
+    t.includes("invalid api key") ||
+    t.includes("invalid x-api-key") ||
+    t.includes("authentication_error") ||
+    t.includes("authentication error") ||
+    t.includes("oauth token has expired") ||
+    t.includes("unauthorized") ||
+    (t.includes("credit balance") && t.includes("too low"))
+  );
+}
+
 function captionPrompt(opts: { guide?: string; trigger?: string }): string {
   const lines = [
     "Write ONE caption for this image for LoRA training. Rules:",
@@ -108,12 +139,32 @@ export async function captionImage(opts: {
   });
   let text = "";
   for await (const msg of q) {
-    const m = msg as { type: string; message?: { content?: Array<{ type: string; text?: string }> } };
+    const m = msg as {
+      type: string;
+      subtype?: string;
+      is_error?: boolean;
+      result?: string;
+      message?: { content?: Array<{ type: string; text?: string }> };
+    };
     if (m.type === "assistant" && m.message?.content) {
       text += m.message.content
         .filter((c) => c.type === "text")
         .map((c) => c.text ?? "")
         .join("");
+    } else if (m.type === "result" && (m.is_error || (m.subtype && m.subtype !== "success"))) {
+      // The SDK reports a failed run (e.g. "Not logged in — Please run /login")
+      // as an error `result`, NOT a thrown exception — previously this was
+      // silently dropped and every image failed with the generic "empty
+      // caption" message. Surface it, and flag auth failures so the batch bails.
+      const detail = (m.result ?? "").trim() || `caption run failed (${m.subtype ?? "error"})`;
+      if (isAuthFailureText(detail)) {
+        throw new CaptionAuthError(
+          `Claude captioning is unavailable — the Claude Code session is not authenticated ` +
+            `(SDK said: ${detail}). Run \`claude /login\`, or set ANTHROPIC_API_KEY, then retry. ` +
+            `Captioning always runs through Claude regardless of the panel's active backend.`,
+        );
+      }
+      throw new Error(detail);
     }
   }
   const caption = text.trim().replace(/^["']|["']$/g, "");
@@ -152,6 +203,18 @@ export async function captionDataset(
       await updateDataset(name, { setCaptions: { [it.file]: caption } });
       captioned++;
     } catch (err) {
+      // A PERSISTENT auth/credential failure dooms every remaining image — the
+      // whole batch runs on one Claude session (issue #438). Fail fast with an
+      // actionable error instead of iterating N files re-hitting the same wall.
+      // Per-file transient errors (bad image, empty caption, write conflict)
+      // still just get recorded and the loop continues.
+      if (
+        err instanceof CaptionAuthError ||
+        (err instanceof Error && isAuthFailureText(err.message))
+      ) {
+        const message = err instanceof CaptionAuthError ? err.message : (err as Error).message;
+        throw new CaptionAuthError(message);
+      }
       failed.push({ file: it.file, error: err instanceof Error ? err.message : String(err) });
     }
   }
