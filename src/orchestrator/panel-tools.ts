@@ -24,6 +24,7 @@
 // so parity is automatic — neither path reimplements a tool.
 
 import { z } from "zod";
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { extname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1081,6 +1082,174 @@ async function resolveWorkflowInput(
   return wf as Record<string, unknown>;
 }
 
+// ---- panel_ask surface + late-answer resilience (#300/#486) ----------------
+// panel_ask renders an interactive choice card in the panel and BLOCKS on the
+// user's pick. Two failure modes are handled here, localized to the ask path:
+//
+//  • #300 — NO INTERACTIVE SURFACE: when the only reachable client is canvas-less
+//    (a mobile mirror / remote/headless viewer, or an exec/headless run), the card
+//    can't render, so the ask would block for the whole deadline with no way to
+//    answer. We DETECT that up front (bridge.isHeadless on the tab the ask would
+//    target) and FAIL FAST with an actionable error telling the agent to ask in
+//    plain text or call panel_ask from an interactive tab — never an indefinite
+//    block.
+//
+//  • #486 — LATE-BUT-VALID ANSWER: the enclosing MCP `tools/call` has its own
+//    budget (~300s). A card wait longer than that guarantees the tool is killed
+//    before a slow user answers, DISCARDING a validated pick. We (a) CLAMP the card
+//    deadline safely under the MCP budget, and (b) after a card-reply timeout, poll
+//    the bridge's short-lived late-reply buffer for a bounded grace so an answer
+//    that validated slightly after the deadline is HONORED, not lost.
+
+interface AskTiming {
+  /** bridge.send reply timeout for the ask card — clamped under the MCP budget. */
+  deadlineMs: number;
+  /** How long to keep polling the late-reply buffer after a card-reply timeout. */
+  graceMs: number;
+  /** Interval between late-reply buffer polls. */
+  pollMs: number;
+}
+
+let askTimingOverride: AskTiming | null = null;
+
+// The enclosing MCP `tools/call` is killed at ~300s. The card deadline PLUS the
+// late-answer grace poll must finish UNDER that, or a slow-but-valid pick is lost
+// to the framework before we can honor it (#486). This is the HARD ceiling on the
+// total ask budget — applied even when env overrides ask for more, so a
+// misconfigured COMFYUI_PANEL_ASK_DEADLINE_S/GRACE_S can never recreate #486.
+const ASK_TOTAL_BUDGET_CAP_MS = 285_000;
+
+function getAskTiming(): AskTiming {
+  if (askTimingOverride) return askTimingOverride;
+  const pollMs = Math.round(parsePositiveNumberEnv("COMFYUI_PANEL_ASK_POLL_S", 0.5) * 1000);
+  // Defaults keep deadline + grace comfortably under the budget (240 + up to 45 =
+  // 285s). Env overrides are HARD-clamped: the deadline is capped first (leaving at
+  // least a 1s slice), then the grace gets only whatever budget remains, so
+  // deadline + grace is guaranteed ≤ ASK_TOTAL_BUDGET_CAP_MS regardless of input.
+  let deadlineMs = Math.round(parsePositiveNumberEnv("COMFYUI_PANEL_ASK_DEADLINE_S", 240) * 1000);
+  let graceMs = Math.round(parsePositiveNumberEnv("COMFYUI_PANEL_ASK_GRACE_S", 45) * 1000);
+  deadlineMs = Math.min(deadlineMs, ASK_TOTAL_BUDGET_CAP_MS - 1000);
+  graceMs = Math.min(graceMs, Math.max(0, ASK_TOTAL_BUDGET_CAP_MS - deadlineMs));
+  return { deadlineMs, graceMs, pollMs };
+}
+
+/** True when an error is the bridge's reply-TIMEOUT for a card (the tab never
+ *  replied within the window), NOT a genuine transport/command error. Only a
+ *  timeout warrants polling the late-reply buffer for a slow-but-valid answer. */
+function isReplyTimeoutError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? "");
+  return /did not reply to .* within \d+\s*ms|backgrounded or frozen/i.test(msg);
+}
+
+/**
+ * Actionable error string when THIS session has no interactive surface able to
+ * render an ask card (so the ask would block with no way to answer), or `null`
+ * when a card can render. Uses the bridge's `isHeadless` on the tab the ask would
+ * target (the current tab if reachable, else the resolved active tab). Defensive:
+ * an unknown/lightweight bridge, or an ambiguous active-tab resolution, returns
+ * null so the normal send path surfaces its own clear error instead.
+ */
+function askSurfaceError(ctx: PanelToolCtx): string | null {
+  const b = ctx.bridge as unknown as {
+    isHeadless?: (id: string) => boolean;
+    canReach?: (id: string) => boolean;
+    resolveActiveTabId?: () => string;
+  };
+  if (typeof b.isHeadless !== "function") return null; // lightweight/unknown bridge
+  let targetId = ctx.tabId;
+  if (typeof b.canReach === "function" && !b.canReach(targetId)) {
+    if (typeof b.resolveActiveTabId !== "function") return null;
+    try {
+      targetId = b.resolveActiveTabId();
+    } catch {
+      return null; // no single active tab — let the send path report it clearly
+    }
+  }
+  if (!b.isHeadless(targetId)) return null;
+  return (
+    "No interactive panel surface can render a choice card in this session — the " +
+    "connected client is canvas-less (a mobile mirror, a remote/headless viewer, or " +
+    "an exec/headless run), so panel_ask can't be answered here and would block. Ask " +
+    "the user directly in plain chat text, or invoke panel_ask from an interactive " +
+    "ComfyUI browser tab (not nested inside an exec/headless call)."
+  );
+}
+
+/** Poll the bridge's late-reply buffer for a validated ask answer that arrived
+ *  after the card-reply timeout, up to the grace budget. undefined if none. */
+async function pollLateAskReply(
+  bridge: PanelToolCtx["bridge"],
+  askId: string,
+  timing: AskTiming,
+): Promise<unknown | undefined> {
+  const take = (bridge as unknown as { takeLateAskReply?: (id: string) => unknown })
+    .takeLateAskReply;
+  if (typeof take !== "function") return undefined;
+  const deadline = Date.now() + timing.graceMs;
+  for (;;) {
+    const late = take.call(bridge, askId);
+    if (late !== undefined) return late;
+    const left = deadline - Date.now();
+    if (left <= 0) return undefined;
+    await sleep(Math.max(1, Math.min(timing.pollMs, left)));
+  }
+}
+
+/**
+ * Run a panel_ask: render the choice card and return the user's pick. Clamps the
+ * card deadline under the MCP tools/call budget and, on a reply-timeout, honors a
+ * late-but-valid answer from the bridge's late-reply buffer before failing (#486).
+ * Sent DIRECTLY over the bridge (like the confirm/consent cards) so a stable
+ * `ask_id` can key the late-reply buffer.
+ */
+async function askUserWithGrace(
+  ctx: PanelToolCtx,
+  ask: { question: string; options: unknown; header?: unknown; multi_select?: unknown },
+): Promise<ToolResult> {
+  const timing = getAskTiming();
+  const askId = randomUUID();
+  const cmd = {
+    cmd: "ask_user",
+    ask_id: askId,
+    question: ask.question,
+    options: ask.options,
+    header: ask.header,
+    multi_select: ask.multi_select,
+  };
+  try {
+    ctx.ensureReachable?.();
+    const reply = await ctx.bridge.send(cmd as unknown as { cmd: string }, {
+      tabId: ctx.tabId,
+      timeoutMs: timing.deadlineMs,
+    });
+    return ok(reply);
+  } catch (err) {
+    if (isReplyTimeoutError(err)) {
+      const late = await pollLateAskReply(ctx.bridge, askId, timing);
+      if (late !== undefined) return ok(late);
+      return fail(
+        "The question card was not answered in time (or no interactive panel surface " +
+          "rendered it — e.g. an exec/headless run), so nothing was selected. If you " +
+          "still need the decision, ask the user directly in plain chat text, or " +
+          "re-invoke panel_ask from an interactive ComfyUI tab.",
+      );
+    }
+    return fail(err);
+  }
+}
+
+export const __panelAskTestHooks = {
+  /** Inject fast ask timing so tests don't wait the real deadline/grace. */
+  setAskTiming(timing: AskTiming | null): void {
+    askTimingOverride = timing;
+  },
+  /** The env-derived (hard-clamped) ask timing, for the budget-cap test. */
+  getAskTiming,
+  ASK_TOTAL_BUDGET_CAP_MS,
+  askSurfaceError,
+  isReplyTimeoutError,
+};
+
 /** One shared tool definition: name, description, zod raw-shape schema, and a
  *  transport-agnostic handler that receives parsed args + the tab-bound context. */
 export interface PanelToolDef {
@@ -1945,7 +2114,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           )
           .describe("The full ordered checklist (replaces the current one). Empty array clears the tray."),
       },
-      async (args: A, ctx) => ctx.call({ cmd: "set_todo", items: args.items }, 5000),
+      // #322: a 5s ack deadline false-timed-out a responsive session whose tab was
+      // momentarily backgrounded. set_todo is a non-destructive, idempotent full-
+      // replace UI write (already in RETRY_SAFE_CMDS), so give it the same sane 15s
+      // bound as the other UI-state writes (workflow_save) instead of a tight 5s.
+      async (args: A, ctx) => ctx.call({ cmd: "set_todo", items: args.items }, 15000),
     ),
     def(
       "panel_open_civitai",
@@ -2203,18 +2376,21 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         header: z.string().optional().describe("Very short label/chip for the card (e.g. 'Sampler')."),
         multi_select: z.boolean().optional().describe("Allow selecting multiple options (default false)."),
       },
-      async (args: A, ctx) =>
-        ctx.call(
-          {
-            cmd: "ask_user",
-            question: args.question,
-            options: args.options,
-            header: args.header,
-            multi_select: args.multi_select,
-          },
-          // Human-in-the-loop: wait up to 10 minutes for a pick.
-          600000,
-        ),
+      async (args: A, ctx) => {
+        // #300: fail FAST with an actionable error when there is no interactive
+        // surface to render the card (a canvas-less/headless client, or an exec/
+        // headless run), rather than blocking with no way to answer.
+        const surfaceErr = askSurfaceError(ctx);
+        if (surfaceErr) return fail(surfaceErr);
+        // #486: clamp the card deadline under the MCP tools/call budget and honor a
+        // late-but-valid answer via the bridge's late-reply buffer.
+        return askUserWithGrace(ctx, {
+          question: args.question as string,
+          options: args.options,
+          header: args.header,
+          multi_select: args.multi_select,
+        });
+      },
     ),
     def(
       "panel_save_workflow",

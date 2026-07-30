@@ -226,6 +226,20 @@ export class UiBridge {
   private missedFrames = new Map<string, Record<string, unknown>[]>();
   private static readonly MAX_MISSED_FRAMES = 100;
   private pending = new Map<string, Pending>();
+  /** ask_user card sends (rid → {ask_id, ts}): lets a reply that validates AFTER
+   *  the reply timer fired (dropped from `pending`) still be buffered for the
+   *  caller, instead of being discarded as a "late reply for a timed-out command"
+   *  (#486). Timestamped so an abandoned mapping (timeout/disconnect/send-failure
+   *  whose late reply never arrives) is TTL-pruned rather than kept forever. */
+  private askRidToId = new Map<string, { askId: string; ts: number }>();
+  /** Buffered late-but-valid ask_user answers (ask_id → result), drained by the
+   *  caller via takeLateAskReply(). Bounded by a short TTL — a stale unclaimed
+   *  answer is pruned rather than kept forever. */
+  private lateAskReplies = new Map<string, { result: unknown; ts: number }>();
+  /** TTL for a buffered late ask answer / an unresolved rid→ask_id mapping. Long
+   *  enough to cover a slow human pick within the MCP tools/call budget, short
+   *  enough that abandoned entries don't accumulate. */
+  private static readonly LATE_ASK_TTL_MS = 5 * 60 * 1000;
   /** In-flight IDEMPOTENT reads whose socket dropped mid-command, parked per tabId
    *  waiting a bounded grace for that tab to reconnect so we can re-dispatch them
    *  (resume) instead of hard-failing. Never holds mutating commands. */
@@ -665,9 +679,24 @@ export class UiBridge {
       const rid = typeof msg.rid === "string" ? msg.rid : undefined;
       if (rid) {
         const p = this.pending.get(rid);
-        if (!p) return; // late reply for a timed-out command
+        if (!p) {
+          // Late reply for a timed-out command. If it was an ask_user card whose
+          // caller may still be within the MCP tools/call budget, BUFFER the
+          // validated answer keyed by its ask_id so the caller can retrieve it via
+          // takeLateAskReply() instead of losing it (#486). Everything else drops.
+          const entry = this.askRidToId.get(rid);
+          if (entry) {
+            this.askRidToId.delete(rid);
+            if (msg.ok) {
+              this.pruneLateAsk();
+              this.lateAskReplies.set(entry.askId, { result: msg.result, ts: Date.now() });
+            }
+          }
+          return;
+        }
         clearTimeout(p.timer);
         this.pending.delete(rid);
+        this.askRidToId.delete(rid);
         if (msg.ok) {
           p.resolve(msg.result);
         } else {
@@ -836,6 +865,43 @@ export class UiBridge {
     // offline, so a render finishing during a disconnect is byte-inlined (not a
     // bytes-less viewRef) and is renderable when the mailbox flushes to the phone.
     return this.conns.get(tabId)?.headless === true || this.headlessSeen.has(tabId);
+  }
+
+  /** Drop expired late-ask entries (buffered answers + unresolved rid mappings) so
+   *  an abandoned card never leaks memory. Cheap; called on each ask send/take. */
+  private pruneLateAsk(): void {
+    const now = Date.now();
+    for (const [id, e] of this.lateAskReplies) {
+      if (now - e.ts > UiBridge.LATE_ASK_TTL_MS) this.lateAskReplies.delete(id);
+    }
+    // TTL-prune abandoned rid→ask_id mappings (a card that timed out / dropped and
+    // whose late reply never came), so they don't linger past the window a caller
+    // could still claim them.
+    for (const [rid, e] of this.askRidToId) {
+      if (now - e.ts > UiBridge.LATE_ASK_TTL_MS) this.askRidToId.delete(rid);
+    }
+    // Belt-and-suspenders cardinality cap in case of a burst of asks within one TTL
+    // window — drop the oldest-inserted mappings so the map can never grow unbounded.
+    if (this.askRidToId.size > 256) {
+      const excess = this.askRidToId.size - 256;
+      let i = 0;
+      for (const rid of this.askRidToId.keys()) {
+        if (i++ >= excess) break;
+        this.askRidToId.delete(rid);
+      }
+    }
+  }
+
+  /** Retrieve (and remove) a late-but-valid ask_user answer buffered for `askId`
+   *  after the card-reply timeout, or undefined if none arrived. The panel_ask
+   *  handler polls this for a bounded grace so a slow-but-valid pick is honored
+   *  rather than discarded (#486). */
+  takeLateAskReply(askId: string): unknown | undefined {
+    this.pruneLateAsk();
+    const e = this.lateAskReplies.get(askId);
+    if (!e) return undefined;
+    this.lateAskReplies.delete(askId);
+    return e.result;
   }
 
   /** All currently connected tabs, most recent hello last. */
@@ -1008,6 +1074,14 @@ export class UiBridge {
     }
     const replyTimeoutMs = Math.min(ctx.timeoutMs, remaining);
     const rid = randomUUID();
+    // Track an ask_user card's stable ask_id against this attempt's rid so a reply
+    // that validates AFTER the reply timer fires (and drops out of `pending`) can
+    // still be buffered for the caller by rid, not discarded (#486 late answer).
+    const askId = (cmd as { ask_id?: unknown }).ask_id;
+    if (typeof askId === "string" && askId) {
+      this.pruneLateAsk();
+      this.askRidToId.set(rid, { askId, ts: Date.now() });
+    }
     // Rewrite an old-panel "Unknown command" rejection into an actionable
     // update-your-panel message (see makeUnknownCommandError). Applied to the
     // reply-error path only; the happy path and genuine command errors are

@@ -998,3 +998,51 @@ describe("UiBridge.send (graceful gate end-to-end)", () => {
     );
   });
 });
+
+// ── #486: a validated ask_user answer that lands AFTER the reply timeout must be
+// buffered (keyed by ask_id) so the caller can still retrieve it, not discarded.
+describe("UiBridge (late ask_user answer buffer — #486)", () => {
+  it("buffers a valid ask_user reply that arrives after the reply timeout", async () => {
+    const sock = await connectPanel("tab-ask", "wf");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-ask")).toBe(true));
+    // The panel validates a pick only AFTER the send's short reply timeout fires.
+    sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd === "ask_user") {
+        setTimeout(() => {
+          sock.send(JSON.stringify({ rid: msg.rid, ok: true, result: "Late Pick" }));
+        }, 80);
+      }
+    });
+
+    await expect(
+      bridge.send(
+        { cmd: "ask_user", ask_id: "ask-xyz", question: "?", options: [] },
+        { tabId: "tab-ask", timeoutMs: 30 },
+      ),
+    ).rejects.toThrow(/did not reply/i);
+
+    // The late-but-valid answer must be recoverable via the buffer, then drained.
+    await vi.waitFor(() => expect(bridge.takeLateAskReply("ask-xyz")).toBe("Late Pick"));
+    expect(bridge.takeLateAskReply("ask-xyz")).toBeUndefined(); // drained once
+  });
+
+  it("does not buffer a non-ask command's late reply (no ask_id → dropped)", async () => {
+    const sock = await connectPanel("tab-plain", "wf");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-plain")).toBe(true));
+    sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd === "graph_outline") {
+        setTimeout(() => {
+          sock.send(JSON.stringify({ rid: msg.rid, ok: true, result: { late: true } }));
+        }, 80);
+      }
+    });
+    await expect(
+      bridge.send({ cmd: "graph_outline" }, { tabId: "tab-plain", timeoutMs: 30 }),
+    ).rejects.toThrow(/did not reply|disconnected|gone/i);
+    // Give the late reply time to land; it must NOT be buffered under any ask id.
+    await new Promise((r) => setTimeout(r, 120));
+    expect(bridge.takeLateAskReply("tab-plain")).toBeUndefined();
+  });
+});

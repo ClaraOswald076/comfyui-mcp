@@ -7,7 +7,7 @@
 // panel JS executors implement), and that the McpServer HTTP path registers the
 // identical set.
 
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,6 +20,7 @@ import {
   __openWorkflowTestHooks,
   __panelToolsTestHooks,
   __panelRunTestHooks,
+  __panelAskTestHooks,
   type PanelToolCtx,
   type ToolResult,
 } from "../../orchestrator/panel-tools.js";
@@ -1689,5 +1690,161 @@ describe("panel_open_workflow: verify active state after ack-timeout (#215/#319/
     expect(res.isError).toBeFalsy();
     expect(res.content[0].text).toContain("opened");
     expect(listCalls).toBe(0);
+  });
+});
+
+describe("panel_ask surface + late-answer resilience (#300/#486) and set_todo bound (#322)", () => {
+  const REPLY_TIMEOUT_ERR = (cmd: string, ms: number) =>
+    new Error(
+      `Panel tab abcd1234 did not reply to "${cmd}" within ${ms} ms — the ComfyUI tab may be backgrounded or frozen`,
+    );
+
+  afterEach(() => {
+    // Reset the injected fast ask timing so other suites see the real defaults.
+    __panelAskTestHooks.setAskTiming(null);
+  });
+
+  function askText(res: ToolResult): string {
+    return (res.content[0] as { text: string }).text;
+  }
+
+  // #300 — NO INTERACTIVE SURFACE: a canvas-less/headless client (mobile mirror,
+  // remote viewer, or an exec/headless run) can't render the choice card, so the
+  // ask must FAIL FAST with an actionable error instead of blocking. We must never
+  // even dispatch ask_user in that case.
+  it("panel_ask fails FAST with an actionable error when no interactive surface can render the card (#300)", async () => {
+    const sent: Array<Record<string, unknown>> = [];
+    const bridge = {
+      send: async (cmd: Record<string, unknown>) => {
+        sent.push(cmd);
+        // Simulate the old hang: never resolve. If the handler awaited this the
+        // test would time out — so a passing test proves we short-circuited.
+        return new Promise<never>(() => {});
+      },
+      canReach: () => true,
+      isHeadless: () => true,
+      resolveActiveTabId: () => "abcd1234",
+      push: () => 1,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx: PanelToolCtx = { bridge, tabId: "abcd1234" } as unknown as PanelToolCtx;
+
+    const res = await defByName("panel_ask").handler(
+      { question: "Local or pod?", options: [{ label: "Local" }, { label: "Pod" }] },
+      ctx,
+    );
+    expect(res.isError).toBe(true);
+    expect(askText(res)).toMatch(/no interactive panel surface|plain chat|headless|exec/i);
+    // Never dispatched — no indefinite block on a surface that can't answer.
+    expect(sent.length).toBe(0);
+  });
+
+  // #486 — LATE-BUT-VALID ANSWER: the card-reply timer fired (bridge.send rejected
+  // with a reply-timeout), but the user validated a pick slightly late. The bridge
+  // buffered it; the handler must poll the buffer and HONOR the answer, not discard
+  // it as a timeout.
+  it("panel_ask honors a late-but-valid answer buffered after a reply timeout (#486)", async () => {
+    __panelAskTestHooks.setAskTiming({ deadlineMs: 5, graceMs: 500, pollMs: 2 });
+    let takes = 0;
+    const bridge = {
+      send: async (_cmd: Record<string, unknown>, opts?: { timeoutMs?: number }) => {
+        // The card timed out before the (slow) user answered.
+        throw REPLY_TIMEOUT_ERR("ask_user", opts?.timeoutMs ?? 0);
+      },
+      canReach: () => true,
+      isHeadless: () => false,
+      resolveActiveTabId: () => "abcd1234",
+      // The validated answer lands one poll later, after the send already rejected.
+      takeLateAskReply: (_askId: string) => {
+        takes += 1;
+        return takes >= 2 ? "Local GPU + Blender" : undefined;
+      },
+      push: () => 1,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx: PanelToolCtx = { bridge, tabId: "abcd1234" } as unknown as PanelToolCtx;
+
+    const res = await defByName("panel_ask").handler(
+      { question: "Which?", options: [{ label: "Local GPU + Blender" }, { label: "Cloud" }] },
+      ctx,
+    );
+    expect(res.isError).toBeFalsy();
+    expect(askText(res)).toBe("Local GPU + Blender");
+  });
+
+  // Codex gate: the clamp must be a HARD ceiling on deadline + grace, not just the
+  // default — a large env override must never be able to recreate #486.
+  it("hard-clamps deadline+grace under the MCP budget even with oversized env overrides (#486)", () => {
+    const prevD = process.env.COMFYUI_PANEL_ASK_DEADLINE_S;
+    const prevG = process.env.COMFYUI_PANEL_ASK_GRACE_S;
+    process.env.COMFYUI_PANEL_ASK_DEADLINE_S = "600"; // 600s
+    process.env.COMFYUI_PANEL_ASK_GRACE_S = "600"; // 600s
+    try {
+      const t = __panelAskTestHooks.getAskTiming();
+      expect(t.deadlineMs).toBeGreaterThan(0);
+      expect(t.deadlineMs + t.graceMs).toBeLessThanOrEqual(
+        __panelAskTestHooks.ASK_TOTAL_BUDGET_CAP_MS,
+      );
+      expect(t.deadlineMs + t.graceMs).toBeLessThan(300000);
+    } finally {
+      if (prevD === undefined) delete process.env.COMFYUI_PANEL_ASK_DEADLINE_S;
+      else process.env.COMFYUI_PANEL_ASK_DEADLINE_S = prevD;
+      if (prevG === undefined) delete process.env.COMFYUI_PANEL_ASK_GRACE_S;
+      else process.env.COMFYUI_PANEL_ASK_GRACE_S = prevG;
+    }
+  });
+
+  it("panel_ask clamps the card deadline under the ~300s MCP tools/call budget and returns the pick (#486)", async () => {
+    let forwardedTimeout = 0;
+    const bridge = {
+      send: async (_cmd: Record<string, unknown>, opts?: { timeoutMs?: number }) => {
+        forwardedTimeout = opts?.timeoutMs ?? 0;
+        return "Pod";
+      },
+      canReach: () => true,
+      isHeadless: () => false,
+      resolveActiveTabId: () => "abcd1234",
+      push: () => 1,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx: PanelToolCtx = { bridge, tabId: "abcd1234" } as unknown as PanelToolCtx;
+
+    const res = await defByName("panel_ask").handler(
+      { question: "Where?", options: [{ label: "Local" }, { label: "Pod" }] },
+      ctx,
+    );
+    expect(res.isError).toBeFalsy();
+    expect(askText(res)).toBe("Pod");
+    // Must NOT be the old 600000ms (which outlived the 300s MCP budget → lost answer).
+    expect(forwardedTimeout).toBeGreaterThan(0);
+    expect(forwardedTimeout).toBeLessThan(300000);
+  });
+
+  // #322 — set_todo must not false-timeout a responsive session. Model a tab that
+  // acks in ~8s (momentarily backgrounded): the OLD 5s bound would reject it; the
+  // handler must forward a sane bound (>=15s) so the ack succeeds.
+  it("panel_set_todo does NOT false-timeout a responsive (8s-ack) session — sane bound (#322)", async () => {
+    const RESPONSIVE_ACK_MS = 8000;
+    let forwardedTimeout = 0;
+    const sent: Array<Record<string, unknown>> = [];
+    const bridge = {
+      send: async (cmd: Record<string, unknown>, opts?: { timeoutMs?: number }) => {
+        forwardedTimeout = opts?.timeoutMs ?? 6000;
+        if (forwardedTimeout < RESPONSIVE_ACK_MS) {
+          throw REPLY_TIMEOUT_ERR("set_todo", forwardedTimeout);
+        }
+        sent.push(cmd);
+        return { ok: true };
+      },
+      canReach: () => true,
+      resolveActiveTabId: () => "abcd1234",
+      push: () => 1,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, "abcd1234");
+
+    const res = await defByName("panel_set_todo").handler(
+      { items: [{ text: "step one", status: "active" }] },
+      ctx,
+    );
+    expect(res.isError).toBeFalsy();
+    expect(forwardedTimeout).toBeGreaterThanOrEqual(15000);
+    expect(sent.at(-1)).toMatchObject({ cmd: "set_todo" });
   });
 });
