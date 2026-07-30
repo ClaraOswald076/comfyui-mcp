@@ -129,6 +129,92 @@ describe("resolveCivitaiModelVersion", () => {
   });
 });
 
+describe("civitai request error surfacing (distinct failure modes)", () => {
+  // Each failure mode must surface as a DISTINCT, actionable message — never a
+  // swallowed empty and never conflated with a neighbouring status (WS-6 #204).
+  it("401 without a token → 'requires authentication' (set the token)", async () => {
+    config.civitaiApiToken = undefined;
+    fetchMock.mockResolvedValueOnce(jsonResponse({}, 401));
+    await expect(resolveCivitaiModelVersion(1)).rejects.toThrow(
+      /requires authentication.*set CIVITAI_API_TOKEN/i,
+    );
+  });
+
+  it("401 WITH a token → 'token invalid or expired' (refresh it)", async () => {
+    config.civitaiApiToken = "stale-token";
+    fetchMock.mockResolvedValueOnce(jsonResponse({}, 401));
+    await expect(resolveCivitaiModelVersion(1)).rejects.toThrow(
+      /invalid or expired.*refresh CIVITAI_API_TOKEN/i,
+    );
+  });
+
+  it("403 → 'forbidden' (permission or region), distinct from 401", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({}, 403));
+    await expect(resolveCivitaiModelVersion(1)).rejects.toThrow(
+      /403 Forbidden.*permission.*region/i,
+    );
+  });
+
+  it("429 → 'rate-limited' (back off and retry), distinct from an upstream 5xx", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({}, 429));
+    await expect(resolveCivitaiModelVersion(1)).rejects.toThrow(
+      /rate-limited.*429.*retry/i,
+    );
+  });
+
+  it("5xx → 'upstream error' flagged transient", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({}, 503));
+    await expect(resolveCivitaiModelVersion(1)).rejects.toThrow(
+      /upstream error.*503.*transient/i,
+    );
+  });
+
+  it("our own timeout abort → distinct 'timed out' message (not a hang, not empty)", async () => {
+    const timeoutErr = Object.assign(new Error("The operation timed out."), {
+      name: "TimeoutError",
+    });
+    fetchMock.mockRejectedValueOnce(timeoutErr);
+    await expect(resolveCivitaiModelVersion(1)).rejects.toThrow(
+      /timed out.*unreachable/i,
+    );
+    await expect(
+      (async () => {
+        fetchMock.mockRejectedValueOnce(timeoutErr);
+        return resolveCivitaiModelVersion(1);
+      })(),
+    ).rejects.toBeInstanceOf(ModelError);
+  });
+
+  it("network failure (fetch rejects TypeError) → distinct 'unreachable' message", async () => {
+    fetchMock.mockRejectedValueOnce(new TypeError("fetch failed"));
+    await expect(resolveCivitaiModelVersion(1)).rejects.toThrow(
+      /unreachable.*network error/i,
+    );
+  });
+
+  it("2xx that is NOT JSON (bot-gate/interstitial) → distinct non-JSON error, not a garbage empty", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => {
+        throw new SyntaxError("Unexpected token < in JSON");
+      },
+      text: async () => "<html>Just a moment…</html>",
+    } as unknown as Response);
+    await expect(resolveCivitaiModelVersion(1)).rejects.toThrow(
+      /non-JSON response.*bot-gate|interstitial/i,
+    );
+  });
+
+  it("applies a request timeout signal to every civitai fetch", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ id: 1, files: [] }));
+    await resolveCivitaiModelVersion(1);
+    const opts = fetchMock.mock.calls[0][1] as { signal?: AbortSignal };
+    expect(opts.signal).toBeInstanceOf(AbortSignal);
+  });
+});
+
 describe("resolveCivitaiModel", () => {
   it("picks the first (latest) version by default", async () => {
     fetchMock.mockResolvedValueOnce(
@@ -432,6 +518,42 @@ describe("searchCivitaiModels", () => {
   it("rejects an empty query with no creator", async () => {
     await expect(searchCivitaiModels("  ")).rejects.toBeInstanceOf(ValidationError);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("creator + keyword: a FIRST-page failure THROWS (a broken scan must never read as empty)", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({}, 503));
+    await expect(
+      searchCivitaiModels("detail", { creator: "jed" }),
+    ).rejects.toThrow(/upstream error.*503/i);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("creator + keyword: a LATER-page failure surfaces partial hits + scanError (not a silent truncation)", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({
+          items: [{ id: 1, name: "Detail A", modelVersions: [] }],
+          metadata: { nextCursor: "p2" },
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse({}, 429)); // page 2 rate-limited
+    const { hits, scanned, scanCapped, scanError } = await searchCivitaiModels(
+      "detail",
+      { creator: "prolific" },
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(hits.map((h) => h.model_id)).toEqual([1]); // page-1 match retained
+    expect(scanned).toBe(1);
+    expect(scanCapped).toBe(true); // pages remained → result is not definitive
+    expect(scanError).toMatch(/rate-limited.*429/i); // the miss is attributable
+  });
+
+  it("creator + keyword: no scanError field on a clean full scan", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ items: [{ id: 1, name: "Detail A", modelVersions: [] }] }),
+    );
+    const result = await searchCivitaiModels("detail", { creator: "jed" });
+    expect(result.scanError).toBeUndefined();
   });
 });
 
