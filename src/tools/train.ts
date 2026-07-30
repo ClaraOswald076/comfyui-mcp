@@ -468,7 +468,7 @@ export function registerTrainTools(server: McpServer): void {
 
   server.tool(
     "train_caption_dataset",
-    "Caption a whole staged dataset (or a subset) with the user's own Claude subscription and WRITE the captions into its .txt files (one vision turn per image, sequential). Use after gathering images, before train_start. Per-file failures are reported without stopping the batch. Optional guide text steers all captions; optional trigger is prepended to each.",
+    "Caption a whole staged dataset (or a subset) with the user's own Claude subscription and WRITE the captions into its .txt files (one vision turn per image, sequential). Captioning ALWAYS runs through Claude (Agent SDK) regardless of the panel's active backend, so it needs a logged-in Claude Code session (or ANTHROPIC_API_KEY). Use after gathering images, before train_start. Per-file transient failures are reported without stopping the batch, but a persistent auth/credential failure stops immediately with an actionable error rather than failing every image. Optional guide text steers all captions; optional trigger is prepended to each.",
     {
       name: z.string().min(1).describe("Dataset name (from train_list_datasets)."),
       guide: z.string().optional().describe("Extra style guidance applied to every caption."),
