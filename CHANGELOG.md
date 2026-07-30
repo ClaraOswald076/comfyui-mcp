@@ -6,6 +6,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.9] - 2026-07-30
+
+### MCP
+
+#### Fixed
+- get_environment probes the ComfyUI venv/embedded python (resolved live-first from the running server's argv → COMFYUI_PATH → saved default workspace) instead of a bare PATH python, fixing false capability reports like "Triton: not installed"; remote/unreachable/ambiguous cases report an honest untrusted result rather than a confident wrong one (#401) (#433)
+
+
 ## [0.48.8] - 2026-07-30
 
 ### MCP
