@@ -424,7 +424,11 @@ describe("process-control restart relaunch preflight (#368/#370)", () => {
     killSpy.mockRestore();
   });
 
-  it("refuses to stop a Desktop app whose launcher exe cannot be located", async () => {
+  it("reboots a local Desktop app via ComfyUI-Manager instead of killing it (#400)", async () => {
+    // A Desktop install is Electron-supervised: killing it and re-spawning the
+    // exe leaves it down (stopped:true, started:false). It must reboot via the
+    // Manager HTTP endpoint and never be killed. The old behavior (refuse when
+    // the exe can't be located) no longer applies — the exe is irrelevant now.
     mockLivePortNoKill();
     mockGetSystemStats.mockResolvedValue({
       system: {
@@ -435,18 +439,33 @@ describe("process-control restart relaunch preflight (#368/#370)", () => {
         ],
       },
     });
-    // Nothing exists on disk — the Desktop exe cannot be located.
+    // Exe cannot be located on disk — under the old path this refused; now it
+    // is never consulted because we reboot via the Manager instead.
     mockExistsSync.mockImplementation(() => false);
+    __processControlTestHooks.setRemoteRebootTimingForTests({
+      settleMs: 0,
+      budgetMs: 1000,
+      intervalMs: 5,
+    });
+    const fetchMock = mockFetchOk(true); // reboot fires + /system_stats ready
     const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
 
     const result = await restartComfyUI();
 
-    expect(result.stopped).toBe(false);
-    expect(result.started).toBe(false);
-    expect(result.message).toMatch(/refusing to restart/i);
-    expect(result.message).toMatch(/desktop/i);
+    expect(result.stopped).toBe(true);
+    expect(result.started).toBe(true);
+    expect(result.message).toMatch(/rebooted via ComfyUI-Manager/i);
+    expect(result.message).toMatch(/Desktop\/supervised/i);
+    // Never killed / re-spawned.
     expect(mockSpawn).not.toHaveBeenCalled();
-    expect(mockResetClient).not.toHaveBeenCalled();
+    expect(killSpy).not.toHaveBeenCalled();
+    expect(
+      mockExecSync.mock.calls.some(([c]) => /taskkill/i.test(String(c))),
+    ).toBe(false);
+    // The Manager reboot endpoint was hit.
+    expect(
+      fetchMock.mock.calls.some(([u]) => String(u).includes("/manager/reboot")),
+    ).toBe(true);
 
     killSpy.mockRestore();
   });

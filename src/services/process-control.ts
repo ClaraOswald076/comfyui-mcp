@@ -1142,8 +1142,25 @@ function getRemoteRebootTiming(): RemoteRebootTiming {
   };
 }
 
-async function restartRemoteViaManager(): Promise<RestartResult> {
-  logger.info("Restarting remote ComfyUI via ComfyUI-Manager reboot...");
+/**
+ * Restart via a ComfyUI-Manager HTTP reboot instead of killing a process.
+ *
+ * Used for BOTH the remote target (--comfyui-url) AND a locally-installed
+ * ComfyUI **Desktop** instance. Desktop is Electron-supervised: killing its
+ * Python backend (or even the Electron shell) leaves it down with no reliable
+ * relaunch — spawning "Comfy Desktop.exe" does not deterministically bring the
+ * :PORT listener back, which is exactly issue #400 (stopped:true, started:false
+ * after 60 probes). The Manager `/v2/manager/reboot` handler asks the SAME
+ * supervisor that owns the process to cycle it, so it comes back the way it
+ * started. We therefore NEVER kill a Desktop instance; if the reboot can't be
+ * fired we refuse and leave the server running rather than take it down with no
+ * way back.
+ */
+async function restartViaManagerReboot(context: {
+  /** Human label for logs and the success message ("remote" | "Desktop"). */
+  label: string;
+}): Promise<RestartResult> {
+  logger.info(`Restarting ${context.label} ComfyUI via ComfyUI-Manager reboot...`);
 
   const reboot = await rebootViaManager();
   if (!reboot.rebooting) {
@@ -1194,7 +1211,7 @@ async function restartRemoteViaManager(): Promise<RestartResult> {
     readiness,
     message:
       `ComfyUI rebooted via ComfyUI-Manager and came back ready (${readiness.waited_ms}ms) — ` +
-      "remote/supervised restart.",
+      `${context.label}/supervised restart.`,
   };
 }
 
@@ -1202,7 +1219,7 @@ export async function restartComfyUI(): Promise<RestartResult> {
   if (isRemoteMode()) {
     // Remote target: can't process-control it, but a Manager HTTP reboot brings
     // back a self-supervised ComfyUI (e.g. the tunnelled Desktop app).
-    return restartRemoteViaManager();
+    return restartViaManagerReboot({ label: "remote" });
   }
   logger.info("Restarting ComfyUI...");
 
@@ -1221,6 +1238,16 @@ export async function restartComfyUI(): Promise<RestartResult> {
         `No ComfyUI process found on port ${config.resolvedPort} to restart. Is ComfyUI running?`,
     };
   }
+  // A locally-installed ComfyUI **Desktop** instance is Electron-supervised.
+  // Killing it (Python backend or Electron shell) and re-spawning the exe does
+  // not reliably bring the :PORT listener back (issue #400: stopped:true,
+  // started:false after 60 probes). Route it through the Manager reboot — the
+  // supervisor that owns the process cycles it — and NEVER kill it. Only
+  // self-spawned Python installs fall through to the kill+relaunch path below.
+  if (info.isDesktopApp) {
+    return restartViaManagerReboot({ label: "Desktop" });
+  }
+
   const relaunch = assessRelaunch(info);
   if (!relaunch.ok) {
     return {
