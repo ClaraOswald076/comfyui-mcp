@@ -3,6 +3,7 @@ import {
   extractTemplateSlots,
   templateGraphToApi,
   classifyWidget,
+  resolveTemplateFromIndex,
   FALLBACK_OBJECT_INFO,
 } from "../../tools/template-schema.js";
 import type { ObjectInfo, WorkflowJSON } from "../../comfyui/types.js";
@@ -238,5 +239,58 @@ describe("classifyWidget", () => {
     expect(classifyWidget("UNETLoader", "unet_name")).toBe("model");
     expect(classifyWidget("FluxGuidance", "guidance")).toBe("guidance");
     expect(classifyWidget("SaveImage", "filename_prefix")).toBe("other");
+  });
+});
+
+describe("resolveTemplateFromIndex (id/key alignment with list_workflow_templates)", () => {
+  // Mirrors what /api/workflow_templates returns: modules → arrays of names.
+  // Custom-node modules (ComfyUI-MVAdapter) list plain string names; the core
+  // comfyui-workflow-templates package lists objects with a `name` field.
+  const INDEX: Record<string, unknown> = {
+    "ComfyUI-MVAdapter": ["i2mv_sdxl_ldm_view_selector", "i2mv_sdxl_ldm_lora"],
+    "comfyui-workflow-templates": [{ name: "default", title: "Default" }, { name: "flux_dev" }],
+    "OtherPack": ["i2mv_sdxl_ldm_lora"], // same name, different module → ambiguous
+  };
+
+  it("resolves a bare custom-node template name that list_workflow_templates returned", () => {
+    const r = resolveTemplateFromIndex(INDEX, "i2mv_sdxl_ldm_view_selector");
+    expect(r).toEqual({ match: { module: "ComfyUI-MVAdapter", name: "i2mv_sdxl_ldm_view_selector" } });
+  });
+
+  it("resolves a core template whose index entry is an object with a name field", () => {
+    const r = resolveTemplateFromIndex(INDEX, "flux_dev");
+    expect(r).toEqual({ match: { module: "comfyui-workflow-templates", name: "flux_dev" } });
+  });
+
+  it("reports ambiguity when the same name exists in multiple modules", () => {
+    const r = resolveTemplateFromIndex(INDEX, "i2mv_sdxl_ldm_lora");
+    expect("error" in r && r.error).toBe("ambiguous");
+    if ("error" in r && r.error === "ambiguous") {
+      expect(r.candidates.map((c) => `${c.module}/${c.name}`).sort()).toEqual(
+        ["ComfyUI-MVAdapter/i2mv_sdxl_ldm_lora", "OtherPack/i2mv_sdxl_ldm_lora"],
+      );
+    }
+  });
+
+  it("accepts a source-qualified <module>/<name> id to disambiguate", () => {
+    const r = resolveTemplateFromIndex(INDEX, "ComfyUI-MVAdapter/i2mv_sdxl_ldm_lora");
+    expect(r).toEqual({ match: { module: "ComfyUI-MVAdapter", name: "i2mv_sdxl_ldm_lora" } });
+  });
+
+  it("does NOT flag a name duplicated WITHIN one module as ambiguous", () => {
+    // ComfyUI's index builder can list the same basename twice in one module.
+    const dupIndex: Record<string, unknown> = {
+      "ComfyUI-MVAdapter": ["i2mv_sdxl_ldm_lora", "i2mv_sdxl_ldm_lora"],
+    };
+    const r = resolveTemplateFromIndex(dupIndex, "i2mv_sdxl_ldm_lora");
+    expect(r).toEqual({ match: { module: "ComfyUI-MVAdapter", name: "i2mv_sdxl_ldm_lora" } });
+  });
+
+  it("returns not-found (with the full module/name catalog) for an unknown template", () => {
+    const r = resolveTemplateFromIndex(INDEX, "does_not_exist");
+    expect("error" in r && r.error).toBe("not-found");
+    if ("error" in r && r.error === "not-found") {
+      expect(r.all).toContain("ComfyUI-MVAdapter/i2mv_sdxl_ldm_view_selector");
+    }
   });
 });

@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { parse as parseYaml } from "yaml";
 import { errorToToolResult } from "../utils/errors.js";
-import { getComfyUIApiHost, getComfyUIProtocol } from "../config.js";
+import { getComfyUIBaseUrl, getComfyUIAuthHeaders } from "../config.js";
 import { checkWorkflowRuntime, extractWorkflowClassTypes } from "../services/api-nodes.js";
 
 // Optional, opt-in observability hook for the knowledge-parity smoke test: when
@@ -307,8 +307,12 @@ export function registerSkillsAccessTools(server: McpServer): void {
     async () => {
       try {
         traceToolCall("list_workflow_templates", {});
-        const base = `${getComfyUIProtocol()}://${getComfyUIApiHost()}`;
+        // Canonical base URL + auth headers — same connected-ComfyUI path
+        // get_template_schema uses, so a proxied/authed remote resolves
+        // consistently between listing and schema lookup.
+        const base = getComfyUIBaseUrl();
         const res = await fetch(`${base}/api/workflow_templates`, {
+          headers: getComfyUIAuthHeaders(),
           signal: AbortSignal.timeout(8000),
         });
         if (!res.ok) {
