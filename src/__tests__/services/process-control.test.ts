@@ -490,6 +490,22 @@ describe("parseListenerPidFromNetstat — locale-independent port→PID (#449)",
     ].join("\n");
     expect(parseListenerPidFromNetstat(out, 8188)).toBeNull();
   });
+
+  it("rejects a non-listening row whose LOCAL side is bound to :8188 (foreign endpoint not :0)", () => {
+    // An established/outbound socket can have its LOCAL side on :8188 while the
+    // server is actually down. A listener always has foreign port 0; requiring
+    // that avoids returning (and killing) the wrong PID.
+    const out = "  TCP    127.0.0.1:8188   203.0.113.9:55123   HERGESTELLT   9999";
+    expect(parseListenerPidFromNetstat(out, 8188)).toBeNull();
+  });
+
+  it("still selects the LISTENING row when a live established connection is also present", () => {
+    const out = [
+      "  TCP    0.0.0.0:8188      0.0.0.0:0          ABHÖREN       6789",
+      "  TCP    127.0.0.1:8188    127.0.0.1:55123    HERGESTELLT   6789",
+    ].join("\n");
+    expect(parseListenerPidFromNetstat(out, 8188)).toBe(6789);
+  });
 });
 
 describe("findPidByPort resilience to localized netstat state (#449)", () => {
@@ -565,6 +581,37 @@ describe("findPidByPort resilience to localized netstat state (#449)", () => {
     expect(
       mockExecSync.mock.calls.some(([c]) => /taskkill/i.test(String(c))),
     ).toBe(false);
+
+    killSpy.mockRestore();
+  });
+
+  it("reachable-but-no-PID must NOT fall through to killing a Desktop shell (atomic-restart)", async () => {
+    // Server answers /system_stats but no port→PID maps, AND a Desktop shell
+    // (Comfy Desktop.exe) is present. We must NOT kill that shell — we can't
+    // confirm it owns :8188 — so leave everything untouched and diagnose.
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (cmd.includes("lsof")) throw new Error("not listening");
+      if (/tasklist/i.test(cmd)) {
+        // A Comfy Desktop shell IS running.
+        return '"Comfy Desktop.exe","4242","Console","1","206,248 K"';
+      }
+      return ""; // netstat / powershell resolve no listener PID
+    });
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: ["python", "main.py", "--port", "8188"] },
+    });
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(false);
+    expect(result.started).toBe(false);
+    expect(result.message).toMatch(/reachable on port 8188/i);
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(
+      mockExecSync.mock.calls.some(([c]) => /taskkill/i.test(String(c))),
+    ).toBe(false);
+    expect(killSpy).not.toHaveBeenCalled();
 
     killSpy.mockRestore();
   });

@@ -121,13 +121,20 @@ export function parseListenerPidFromNetstat(
     const line = raw.trim();
     if (!line) continue;
     const parts = line.split(/\s+/);
-    // Expected columns: PROTO LOCAL FOREIGN [STATE] PID
-    if (parts.length < 4) continue;
+    // Expected columns: PROTO LOCAL FOREIGN STATE PID
+    if (parts.length < 5) continue;
     if (parts[0].toUpperCase() !== "TCP") continue;
     const local = parts[1];
+    const foreign = parts[2];
     // The leading colon anchors the match: "…:8188" matches but "…:81880" and
     // "…:18188" do not (their last chars aren't ":8188").
     if (!local.endsWith(suffix)) continue;
+    // Require a LISTENING row without depending on the localized state word: a
+    // listener's foreign endpoint is always the wildcard port 0 (0.0.0.0:0 /
+    // [::]:0). This rejects an ESTABLISHED connection that merely bound its
+    // local side to :PORT — killing that would take down the wrong process
+    // (or none) when ComfyUI is actually down.
+    if (!foreign.endsWith(":0")) continue;
     const pid = parseInt(parts[parts.length - 1], 10);
     if (!Number.isNaN(pid) && pid > 0) return pid;
   }
@@ -692,6 +699,12 @@ async function acquireProcessInfo(): Promise<{
   try {
     return { info: await gatherProcessInfo() };
   } catch (err) {
+    // #449: the server answered /system_stats but we could not map its port to
+    // a PID. Do NOT fall through to killing a Desktop shell we can't confirm
+    // owns :PORT — surface the diagnostic and leave everything untouched.
+    if (err instanceof ProcessControlError && err.reachableButNoPid) {
+      return { info: null, diagnostic: err.message };
+    }
     const desktopPids = findDesktopAppPids();
     if (desktopPids.length > 0) {
       logger.info(
@@ -707,15 +720,9 @@ async function acquireProcessInfo(): Promise<{
         },
       };
     }
-    // Surface the richer diagnostic ONLY for the "reachable but no PID" case
-    // (issue #449) — a server that clearly answered /system_stats must not be
-    // reported as "no process". For a genuinely-down server keep the existing
-    // friendly message the callers provide.
-    const diagnostic =
-      err instanceof ProcessControlError && err.reachableButNoPid
-        ? err.message
-        : undefined;
-    return { info: null, diagnostic };
+    // Genuinely down (not reachable, no Desktop shell): let callers use their
+    // existing friendly "no process" message.
+    return { info: null };
   }
 }
 
