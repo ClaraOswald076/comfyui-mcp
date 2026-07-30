@@ -265,6 +265,60 @@ describe("download job registry", () => {
     expect(listDownloadJobs()).toHaveLength(1);
   });
 
+  it("#420 rule 1: B adopts A's destination, then a B-repeat after a local→Manager flip still finds the ONE writer", async () => {
+    // A and B are DIFFERENT urls resolving to the SAME local destination. B adopts
+    // A by destination; the adoption must re-index B's request key onto A. Otherwise
+    // a later B-repeat whose route FLIPS to Manager (dropping the destination key)
+    // has only its request key, misses A, and starts a SECOND writer onto one file.
+    hoisted.dispatchQueue.push(false, false, true); // A local, B local (adopts A), B-repeat Manager
+    const a = await startDownloadJob(URL_A, "checkpoints", "m.safetensors");
+    const b = await startDownloadJob(URL_B, "checkpoints", "m.safetensors");
+    expect(b.job).toBe(a.job); // B adopts A by destination
+    const bAgain = await startDownloadJob(URL_B, "checkpoints", "m.safetensors");
+    expect(bAgain.job).toBe(a.job); // still the SAME writer, via B's re-indexed request key
+    expect(hoisted.calls).toBe(1); // ONE writer for one file — no double-write
+    expect(listDownloadJobs()).toHaveLength(1);
+  });
+
+  it("#420 rule 3: a FINISHED entry is not adopted and never shadows a live writer on the same destination", async () => {
+    // X finishes; a different-url request to the SAME destination starts a fresh
+    // writer Y; then repeating X's request must adopt the LIVE Y — not the dead X,
+    // and not a third writer.
+    const x = await startDownloadJob(URL_A, "checkpoints", "m.safetensors");
+    hoisted.resolvers[0].resolve("C:/models/checkpoints/m.safetensors");
+    await x.settled;
+    expect(x.job.status).toBe("done");
+
+    const y = await startDownloadJob(URL_B, "checkpoints", "m.safetensors"); // same dest, X done → new writer
+    expect(y.job).not.toBe(x.job);
+    expect(hoisted.calls).toBe(2);
+
+    const xAgain = await startDownloadJob(URL_A, "checkpoints", "m.safetensors"); // X's request repeats
+    expect(xAgain.job).toBe(y.job); // adopts the LIVE writer, not the finished X
+    expect(hoisted.calls).toBe(2); // no duplicate started
+    expect(listDownloadJobs()).toHaveLength(1); // finished X retired; only Y remains
+  });
+
+  it("#420 rule 2: retiring a superseded entry never deletes a live writer's index row", async () => {
+    // X (finished) is superseded by Y (live) on the same destination; subsequent
+    // same-destination requests must keep adopting the single live Y — its index
+    // rows are never deleted out from under it by a stale retire.
+    const x = await startDownloadJob(URL_A, "checkpoints", "m.safetensors");
+    hoisted.resolvers[0].resolve("C:/models/checkpoints/m.safetensors");
+    await x.settled;
+
+    const y = await startDownloadJob(URL_A, "checkpoints", "m.safetensors"); // retires X, starts Y
+    expect(y.job).not.toBe(x.job);
+    expect(y.job.status).toBe("downloading");
+
+    const viaB = await startDownloadJob(URL_B, "checkpoints", "m.safetensors");
+    const viaBAgain = await startDownloadJob(URL_B, "checkpoints", "m.safetensors");
+    expect(viaB.job).toBe(y.job);
+    expect(viaBAgain.job).toBe(y.job);
+    expect(hoisted.calls).toBe(2); // only X then Y ever wrote
+    expect(listDownloadJobs()).toHaveLength(1);
+  });
+
   it("lists newest first", async () => {
     await startDownloadJob(URL_A, "checkpoints");
     await new Promise((r) => setTimeout(r, 2));

@@ -64,6 +64,29 @@ interface Entry {
 // is shared by all its keys.
 const jobs = new Map<string, Entry>();
 
+/**
+ * Point `key` at `entry`, ENTRY-SCOPED (#420 codex round 3, rule 2/3): never clobber
+ * a row currently owned by a DIFFERENT, still-in-flight writer — that would orphan a
+ * live download's index. Records the key on the entry so it can be retired later.
+ */
+function registerKey(entry: Entry, key: string): void {
+  const cur = jobs.get(key);
+  if (cur && cur !== entry && cur.job.status === "downloading") return;
+  if (!entry.keys.includes(key)) entry.keys.push(key);
+  jobs.set(key, entry);
+}
+
+/**
+ * Retire a superseded (done/error) entry, ENTRY-SCOPED (#420 codex round 3, rule 2):
+ * only delete an index row that STILL points at THIS entry, so retiring an older job
+ * can never delete a key that has since been reassigned to a newer/live entry.
+ */
+function retireEntry(entry: Entry): void {
+  for (const key of entry.keys) {
+    if (jobs.get(key) === entry) jobs.delete(key);
+  }
+}
+
 /** The tray keys rows on a hash of the SOURCE URL; match it so both agree. */
 export function downloadIdFor(url: string): string {
   return createHash("sha256").update(url).digest("hex").slice(0, 16);
@@ -165,24 +188,47 @@ export async function startDownloadJob(
   // The PUBLIC id (download_status handle): the destination key when we have one
   // (so distinct destinations are separately pollable), else the request key.
   const id = destKey ?? reqKey;
-  // Lookup order: request key first (catches a route flip), then destination key
-  // (catches two-URLs-one-dest). Either hit adopts the same in-flight writer.
+  // This call's keys: the route-independent request key, plus the destination key
+  // when locally resolvable (two-URLs-one-dest dedup).
   const lookupKeys = destKey ? [reqKey, destKey] : [reqKey];
   const trayId = downloadIdFor(url);
 
-  const existing = lookupKeys.map((k) => jobs.get(k)).find((e) => e !== undefined);
-  if (existing && existing.job.status === "downloading") {
-    logger.info(`Download already in flight, adopting it: ${existing.job.id}`, {
+  // ADOPT ONLY AN IN-FLIGHT ENTRY (#420 codex round 3, rule 3): a FINISHED entry
+  // under any key is treated as absent — it must never shadow a currently-downloading
+  // writer reachable under another key, nor cause a retire that overwrites a live row.
+  // Scan every key and prefer an in-flight match.
+  let adopted: Entry | undefined;
+  for (const k of lookupKeys) {
+    const e = jobs.get(k);
+    if (e && e.job.status === "downloading") {
+      adopted = e;
+      break;
+    }
+  }
+  if (adopted) {
+    // Re-index THIS call's keys onto the adopted entry (#420 codex round 3, rule 1):
+    // when URL B adopts URL A's in-flight job by destination, B's request key must
+    // now point at the same entry too — otherwise a later repeat of B (especially
+    // after a local→Manager flip that drops the destination key) would miss it and
+    // start a second writer onto one file. Entry-scoped, so it can't steal a live row.
+    for (const k of lookupKeys) registerKey(adopted, k);
+    logger.info(`Download already in flight, adopting it: ${adopted.job.id}`, {
       url,
       target_subfolder: targetSubfolder,
       filename,
     });
-    return existing;
+    return adopted;
   }
-  // A superseded (done/error) entry under any of our keys is retired first, so its
-  // stale index rows can't shadow the new writer (retry-after-failure).
-  if (existing) {
-    for (const k of existing.keys) jobs.delete(k);
+  // No in-flight match. Retire any superseded (done/error) entries shadowing our keys
+  // — entry-scoped, so we only clear rows still pointing at that finished entry and
+  // never delete a row now owned by a different, live writer (rule 2).
+  const retired = new Set<Entry>();
+  for (const k of lookupKeys) {
+    const e = jobs.get(k);
+    if (e && !retired.has(e)) {
+      retireEntry(e);
+      retired.add(e);
+    }
   }
 
   const job: DownloadJob = {
@@ -221,10 +267,11 @@ export async function startDownloadJob(
       job.finished_at = Date.now();
     });
 
-  // Index under EVERY key (deduped) so any of them adopts this one writer.
-  const keys = [...new Set(lookupKeys)];
-  const entry: Entry = { job, settled, keys };
-  for (const k of keys) jobs.set(k, entry);
+  // Index under EVERY key (deduped) so any of them adopts this one writer. Uses the
+  // entry-scoped registerKey guard so a fresh registration can never overwrite a row
+  // still owned by a different, live writer (rule 3).
+  const entry: Entry = { job, settled, keys: [] };
+  for (const k of new Set(lookupKeys)) registerKey(entry, k);
   return entry;
 }
 
