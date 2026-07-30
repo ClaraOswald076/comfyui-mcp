@@ -1344,7 +1344,7 @@ describe("downloadModel model-payload validation (#473)", () => {
     // it can't be resumed/re-served. The `.rejected` poison MARKER is EXEMPT — it is a
     // small non-empty sentinel that exists precisely to block a later resume.
     for (const f of cached) {
-      if (f.endsWith(".rejected")) continue;
+      if (f.endsWith(".rejected") || f.endsWith(".ct")) continue; // intentional sentinels
       expect((await stat(join(cacheDir, f))).size).toBe(0);
     }
   }
@@ -1711,7 +1711,7 @@ describe("downloadModel model-payload validation (#473)", () => {
     const afterReject = await readdir(cacheDir).catch(() => [] as string[]);
     expect(afterReject.filter((f) => !f.startsWith("."))).toHaveLength(0);
     for (const f of afterReject) {
-      if (f.endsWith(".rejected")) continue; // poison marker is an intentional sentinel
+      if (f.endsWith(".rejected") || f.endsWith(".ct")) continue; // intentional sentinels
       expect((await stat(join(cacheDir, f))).size).toBe(0);
     }
     // Second attempt: a real binary model. It must NOT resume onto the poisoned
@@ -1833,5 +1833,30 @@ describe("downloadModel model-payload validation (#473)", () => {
         headers: { "content-type": "application/octet-stream" },
       }),
     );
+  });
+
+  it("rejects a Content-Type-only auth body on a later cache REUSE via the persisted Content-Type (#473 reuse gap)", async () => {
+    // The body is HTML but carries an embedded NUL, so BODY MAGIC classifies it binary
+    // — only the `text/html` Content-Type flags it. It is first cached through a
+    // NON-model destination (.json — unvalidated), then a `.safetensors` caller reuses
+    // the SAME url cache. The persisted `.ct` Content-Type sidecar must let the reuse
+    // gate reject it even though the live header is gone and the bytes sniff binary.
+    const url = "https://example.com/models/ct-reuse"; // extensionless → shared cache key
+    fetchMock.mockResolvedValueOnce(
+      new Response(Buffer.from("<html>\x00<body>Sign in</body></html>"), {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "text/html; charset=utf-8" },
+      }),
+    );
+    // Cold cache via a .json (non-model) destination — no model validation, but the
+    // Content-Type is persisted beside the cache file.
+    await downloadModel(url, "checkpoints", "sidecar-src.json");
+    // Reuse via a .safetensors destination → cache HIT → rejected by persisted CT.
+    await expect(
+      downloadModel(url, "loras", "reuse.safetensors"),
+    ).rejects.toThrow(/not a model file|model file/i);
+    const landed = await readdir(join(comfyDir, "models", "loras")).catch(() => [] as string[]);
+    expect(landed).toHaveLength(0);
   });
 });

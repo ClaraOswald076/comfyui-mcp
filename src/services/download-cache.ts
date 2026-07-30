@@ -14,7 +14,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, extname, join, resolve } from "node:path";
+import { basename, dirname, extname, join, resolve } from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { ModelError } from "../utils/errors.js";
@@ -110,6 +110,47 @@ async function writePoisonMarker(markerPath: string, logUrl: string): Promise<vo
       url: logUrl,
       error: err instanceof Error ? err.message : String(err),
     });
+  }
+}
+
+/** Path of the Content-Type sidecar beside a finalized CACHE file. A hidden dotfile
+ *  (so LRU/readdir scans skip it) that records the response Content-Type, letting a
+ *  later cache-HIT / coalesced caller re-run the #473 model-payload check WITH the
+ *  original Content-Type instead of only body magic — closing the reuse gap where a
+ *  Content-Type-only-flaggable body (its bytes don't sniff as text) could otherwise
+ *  finalize as a model on a subsequent request. */
+function cacheCtSidecar(cacheFilePath: string): string {
+  return join(dirname(cacheFilePath), `.${basename(cacheFilePath)}.ct`);
+}
+
+/** True when a Content-Type is one the #473 gate would reject for a binary-model
+ *  destination (an HTML page or a JSON document). Kept in lockstep with the
+ *  Content-Type belt in detectNonModelPayload. */
+function isRejectableContentType(contentType: string): boolean {
+  return (
+    /text\/html|application\/xhtml/i.test(contentType) || /(^|[/+])json\b/i.test(contentType)
+  );
+}
+
+/** Persist the Content-Type beside a finalized cache file — ONLY for the reject-worthy
+ *  shapes (text/html, application/json). Persisting every octet-stream/text-plain type
+ *  would add a useless sidecar per cache entry; only an HTML/JSON label can flag a body
+ *  that body-magic alone would miss on reuse, so that is the only type worth keeping. */
+async function writeCacheContentType(cacheFilePath: string, contentType: string): Promise<void> {
+  if (!contentType || !isRejectableContentType(contentType)) return;
+  try {
+    await writeFile(cacheCtSidecar(cacheFilePath), contentType);
+  } catch {
+    /* best effort — reuse simply falls back to body-magic-only validation */
+  }
+}
+
+/** Read the persisted Content-Type for a cache file, or "" when absent/unreadable. */
+async function readCacheContentType(cacheFilePath: string): Promise<string> {
+  try {
+    return (await readFile(cacheCtSidecar(cacheFilePath), "utf-8")).trim();
+  } catch {
+    return "";
   }
 }
 
@@ -726,7 +767,7 @@ async function streamUrlToFile(
    *  than finalized as a corrupt model under a false success (#473). Empty ⇒ no
    *  payload validation (unknown/non-model destination). */
   modelExt = "",
-): Promise<void> {
+): Promise<string> {
   if (supportsCloudDownload(url)) {
     // Cloud downloaders (S3/Azure) don't range-resume — they overwrite the target.
     // If a partial exists it's being discarded; surface that (#467) instead of a
@@ -782,7 +823,7 @@ async function streamUrlToFile(
       // best-effort skip, which let an unsniffable auth/error body get renamed in.
       failClosed: true,
     });
-    return;
+    return ""; // cloud (S3/Azure) has no HTTP Content-Type to persist
   }
 
   // Resumable downloads: when a partial file exists at targetPath we ask the
@@ -1290,11 +1331,17 @@ async function streamUrlToFile(
   // login page or `{"error":...}` would otherwise pass the size gate and finalize
   // as a corrupt model under a green success. Removes the bad partial + sidecar so
   // a retry starts clean, and surfaces an actionable (CivitAI-aware) error.
+  // The response Content-Type — used now for the stream-time check AND returned to
+  // the cache layer so it can persist it beside the cache file. A later cache-HIT /
+  // coalesced caller re-validates with contentType "" (the header is long gone), so
+  // without persisting it a body that only a Content-Type could flag (e.g. an
+  // HTML/JSON page whose bytes don't sniff as text) could slip through on reuse (#473).
+  const responseContentType = res.headers.get("content-type") || "";
   const assertModelPayload = (): Promise<void> =>
     assertModelPayloadOrThrow({
       targetPath,
       modelExt,
-      contentType: res.headers.get("content-type") || "",
+      contentType: responseContentType,
       url,
       logUrl,
       // Remove the rejected partial + its resume sidecar, and if removal fails,
@@ -1316,7 +1363,7 @@ async function streamUrlToFile(
     await assertModelPayload();
     // Complete: the validator sidecar is only needed to guard a resume, so drop it.
     if (resumable) await safeRm(validatorSidecar);
-    return;
+    return responseContentType;
   }
 
   // Tally bytes as they flow and report throughput to the panel tray.
@@ -1352,6 +1399,7 @@ async function streamUrlToFile(
     if (resumable) await safeRm(validatorSidecar);
     bytesPerSec = 0;
     emit("done", true);
+    return responseContentType;
   } catch (err) {
     emit("error", true);
     throw err;
@@ -1392,6 +1440,8 @@ async function downloadIntoCache(
         // materializing an empty file that reports success.
         if (info.size === 0) {
           await downloadCacheFs.rm(target, { force: true }).catch(() => undefined);
+          // Drop its stale Content-Type sidecar too — it now describes nothing.
+          await downloadCacheFs.rm(cacheCtSidecar(target), { force: true }).catch(() => undefined);
         } else {
           await touch(target);
           // Cache hit ⇒ no resume/discard this attempt; onResume is never called,
@@ -1472,7 +1522,7 @@ async function downloadIntoCache(
     }
 
     try {
-      await streamUrlToFile(
+      const contentType = await streamUrlToFile(
         url,
         partial,
         headers,
@@ -1486,6 +1536,9 @@ async function downloadIntoCache(
       );
       await downloadCacheFs.rename(partial, target);
       await touch(target);
+      // Persist the response Content-Type beside the cache file so a later cache-HIT /
+      // coalesced caller re-validates with it (#473 reuse gap).
+      await writeCacheContentType(target, contentType);
       // Clean any stale poison marker now that a CLEAN payload finalized under this
       // key — the partial is gone (renamed) and the bytes passed validation.
       await safeRm(rejectedMarker);
@@ -1687,6 +1740,8 @@ async function evictLruIfNeeded(): Promise<void> {
   files.sort((a, b) => a.time - b.time);
   for (const file of files) {
     await downloadCacheFs.rm(file.path, { force: true });
+    // Evict the Content-Type sidecar with its cache file so it can't outlive it.
+    await downloadCacheFs.rm(cacheCtSidecar(file.path), { force: true }).catch(() => undefined);
     total -= file.size;
     if (total <= limit) break;
   }
@@ -1735,23 +1790,30 @@ export async function downloadWithCache(
       modelExt,
     );
     // Validate the CACHE FILE itself before materializing it to this destination —
-    // this is the authoritative per-caller gate (#473). It covers three cases the
+    // this is the authoritative per-caller gate (#473). It covers four cases the
     // stream-time check can't: (1) a CACHE HIT that skipped streaming entirely,
     // (2) a COALESCED caller whose .safetensors destination consumed a stream that
-    // ran under a different (e.g. non-model) caller's modelExt, and (3) a legacy
-    // cache entry poisoned before this fix. Content-Type is gone by now, so this is
-    // a body-magic-bytes check; the stream-time pass already used Content-Type too.
+    // ran under a different (e.g. non-model) caller's modelExt, (3) a legacy cache
+    // entry poisoned before this fix, and (4) a body that ONLY the Content-Type could
+    // flag (its bytes don't sniff as text). The live Content-Type header is gone by
+    // now, so we recover it from the `.ct` sidecar persisted at download time —
+    // otherwise a Content-Type-only-flaggable body could finalize as a model on reuse.
+    const cachedContentType = await readCacheContentType(cachePath);
     await assertModelPayloadOrThrow({
       targetPath: cachePath,
       modelExt,
-      contentType: "",
+      contentType: cachedContentType,
       url: options.url,
       logUrl,
-      // Drop the poisoned cache entry so a retry re-downloads clean rather than
-      // re-serving the same bad bytes on every call. Truncate-to-0 fallback if rm
-      // fails (a 0-byte cache entry is treated as a miss), and log if even that
-      // fails, so a poisoned cache entry can't silently re-poison cache hits (#473 P1).
-      onReject: () => discardRejectedPayload(cachePath, undefined, logUrl),
+      // Drop the poisoned cache entry (+ its Content-Type sidecar) so a retry
+      // re-downloads clean rather than re-serving the same bad bytes on every call.
+      // Truncate-to-0 fallback if rm fails (a 0-byte cache entry is treated as a
+      // miss), and log if even that fails, so a poisoned cache entry can't silently
+      // re-poison cache hits (#473 P1).
+      onReject: async () => {
+        await discardRejectedPayload(cachePath, undefined, logUrl);
+        await safeRm(cacheCtSidecar(cachePath));
+      },
     });
     const materializedBy = await materializeCacheFile(cachePath, options.targetPath);
     await evictLruIfNeeded();
