@@ -1332,9 +1332,17 @@ describe("downloadModel model-payload validation (#473)", () => {
     const modelsDir = join(comfyDir, "models", subfolder);
     const landed = await readdir(modelsDir).catch(() => [] as string[]);
     expect(landed).toHaveLength(0);
-    // …and nothing left in the cache masquerading as a completed download.
+    // …and nothing re-servable left in the cache. NOTE: a CivitAI API download URL
+    // (…/api/download/models/<id>) is EXTENSIONLESS, so its cache file has no
+    // `.safetensors` suffix — an `endsWith(".safetensors")` check would miss a
+    // poisoned entry entirely. Assert instead that NO finalized cache entry remains
+    // (any non-dot file) and that any leftover artifact is a neutralized 0-byte file.
     const cached = await readdir(cacheDir).catch(() => [] as string[]);
-    expect(cached.some((f) => f.endsWith(".safetensors"))).toBe(false);
+    const finalized = cached.filter((f) => !f.startsWith("."));
+    expect(finalized).toHaveLength(0);
+    for (const f of cached) {
+      expect((await stat(join(cacheDir, f))).size).toBe(0);
+    }
   }
 
   it("rejects an HTML auth-challenge body saved as .safetensors (text/html)", async () => {
@@ -1537,5 +1545,147 @@ describe("downloadModel model-payload validation (#473)", () => {
       "model_index.json",
     );
     await expect(readFile(out, "utf-8")).resolves.toBe('{"scheduler":"ddim"}');
+  });
+
+  // --- codex re-review regressions (P0-1 / P0-2 / P1) -----------------------
+
+  it("rejects a valid HTML page whose only 'control' byte is a form-feed (P0-1, octet-stream)", async () => {
+    // FF (\f, 0x0C) is valid HTML whitespace. Before the fix the detector treated it
+    // as proof-of-binary and, with a mislabeled octet-stream Content-Type, let the
+    // login page finalize as a model. It must be rejected by BODY MAGIC alone.
+    await expectRejectedAndNoFile(
+      "https://example.com/models/ff.safetensors",
+      "checkpoints",
+      "ff.safetensors",
+      new Response("<html>\f<body>Sign in to download</body></html>", {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "application/octet-stream" },
+      }),
+    );
+  });
+
+  it("rejects a form-feed HTML page served as text/html (P0-1, content-type belt)", async () => {
+    await expectRejectedAndNoFile(
+      "https://civitai.com/api/download/models/3174878",
+      "loras",
+      "ff2.safetensors",
+      new Response("<html>\f<body>Sign in</body></html>", {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "text/html; charset=utf-8" },
+      }),
+    );
+  });
+
+  it("rejects a plausibly-sized auth page whose stray control byte breaks the text sniff (P0-1 belt)", async () => {
+    // The body carries a raw NUL (0x00) so it can't sniff as UTF-8 text, yet the
+    // server LABELS it text/html — the Content-Type belt must reject it regardless.
+    await expectRejectedAndNoFile(
+      "https://example.com/models/ctl.safetensors",
+      "checkpoints",
+      "ctl.safetensors",
+      new Response(Buffer.from("<html>\x00<body>Sign in</body></html>"), {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "text/html" },
+      }),
+    );
+  });
+
+  it("does NOT reject a raw .bin whose first 64 bytes are printable and START with '<' (P0-2 false-negative)", async () => {
+    // The classic false-negative: `<` + 63 printable chars (a full 64-byte sniff of
+    // pure ASCII) followed by real binary bytes. Looking at only ~64 bytes would
+    // classify it HTML and REJECT a legitimate download. The whole-window text
+    // requirement must see the trailing binary and ACCEPT it.
+    const body = Buffer.concat([
+      Buffer.from("<" + "A".repeat(63)),
+      Buffer.from([0x00, 0x80, 0xff]),
+    ]);
+    fetchMock.mockResolvedValueOnce(
+      new Response(body, {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "application/octet-stream" },
+      }),
+    );
+    const out = await downloadModel(
+      "https://example.com/models/printable-prefix.bin",
+      "checkpoints",
+      "printable-prefix.bin",
+    );
+    expect((await stat(out)).size).toBe(body.length);
+  });
+
+  it("rejects a UTF-16BE HTML auth page saved as .safetensors (P0-1 UTF-16 BE)", async () => {
+    // A big-endian UTF-16 auth page: BOM FE FF, then each code unit high-byte first.
+    const le = Buffer.from("<html><body>Sign in</body></html>", "utf16le");
+    const be = Buffer.alloc(le.length);
+    for (let k = 0; k < le.length; k += 2) {
+      be[k] = le[k + 1];
+      be[k + 1] = le[k];
+    }
+    const body = Buffer.concat([Buffer.from([0xfe, 0xff]), be]);
+    await expectRejectedAndNoFile(
+      "https://example.com/models/u16be.safetensors",
+      "checkpoints",
+      "u16be.safetensors",
+      new Response(body, {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "application/octet-stream" },
+      }),
+    );
+  });
+
+  it("rejects a UTF-16LE JSON error body saved as .safetensors (P0-1 UTF-16 JSON)", async () => {
+    const body = Buffer.concat([
+      Buffer.from([0xff, 0xfe]), // UTF-16LE BOM
+      Buffer.from('{"error":"Unauthorized"}', "utf16le"),
+    ]);
+    await expectRejectedAndNoFile(
+      "https://example.com/models/u16json.safetensors",
+      "checkpoints",
+      "u16json.safetensors",
+      new Response(body, {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "application/octet-stream" },
+      }),
+    );
+  });
+
+  it("leaves NO resumable poisoned partial after an HTML rejection — a retry restarts clean (P1)", async () => {
+    const url = "https://civitai.com/api/download/models/77777";
+    // First attempt: an HTML auth page carrying an ETag (which would normally seed a
+    // resume sidecar) — it must be rejected and its partial+sidecar discarded.
+    fetchMock.mockResolvedValueOnce(
+      new Response("<!DOCTYPE html><html><body>Sign in</body></html>", {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "text/html", etag: '"abc123"' },
+      }),
+    );
+    await expect(
+      downloadModel(url, "loras", "retry.safetensors"),
+    ).rejects.toThrow(/not a model file|model file/i);
+    // No non-dot cache file, and any leftover .partial/.etag is neutralized (0 bytes).
+    const afterReject = await readdir(cacheDir).catch(() => [] as string[]);
+    expect(afterReject.filter((f) => !f.startsWith("."))).toHaveLength(0);
+    for (const f of afterReject) {
+      expect((await stat(join(cacheDir, f))).size).toBe(0);
+    }
+    // Second attempt: a real binary model. It must NOT resume onto the poisoned
+    // prefix — it downloads clean and finalizes at the correct size.
+    const gguf = Buffer.concat([Buffer.from("GGUF"), Buffer.from([0x00, 0x01, 0x02, 0x03, 0x04])]);
+    fetchMock.mockResolvedValueOnce(
+      new Response(gguf, {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "application/octet-stream" },
+      }),
+    );
+    const out = await downloadModel(url, "loras", "retry.safetensors");
+    expect((await stat(out)).size).toBe(gguf.length);
   });
 });

@@ -44,6 +44,51 @@ async function safeRm(path: string): Promise<void> {
   }
 }
 
+/** Remove `path`, returning true iff it is confirmed gone. Unlike `safeRm` this
+ *  LOGS a removal failure (EPERM/EACCES/…) instead of swallowing it silently — a
+ *  left-behind rejected artifact (a poisoned partial / cache entry) must at least be
+ *  visible, since a later cache-hit or resume could otherwise re-hit it (#473 P1). */
+async function rmOrLog(path: string, logUrl: string): Promise<boolean> {
+  try {
+    await rm(path, { force: true });
+    return true;
+  } catch (err) {
+    logger.warn(
+      `Failed to remove a rejected download artifact "${path}" — a retry may re-hit it; ` +
+        `delete it manually if the same rejection repeats.`,
+      { url: logUrl, error: err instanceof Error ? err.message : String(err) },
+    );
+    return false;
+  }
+}
+
+/** Discard a payload that was REJECTED as a non-model (HTML/JSON auth/error) body.
+ *  Removes the file and its resume sidecar and, CRUCIALLY, if the file itself can't
+ *  be removed, NEUTRALIZES it by truncating to 0 bytes so a retry can neither resume
+ *  onto the poisoned prefix (a 0-byte partial is treated as fresh) nor serve it as a
+ *  cache hit (a 0-byte cache entry is treated as a miss). Surfaces a hard failure via
+ *  the log when it can neither remove nor truncate (#473 P1). */
+async function discardRejectedPayload(
+  path: string,
+  sidecarPath: string | undefined,
+  logUrl: string,
+): Promise<void> {
+  const removed = await rmOrLog(path, logUrl);
+  if (sidecarPath) await rmOrLog(sidecarPath, logUrl);
+  if (removed) return;
+  // Removal failed — neutralize the still-present poisoned bytes so a retry can't
+  // resume onto them or re-serve them as a cache hit.
+  try {
+    await writeFile(path, "");
+  } catch (err) {
+    logger.error(
+      `Could not remove OR truncate a rejected non-model payload "${path}"; a retry may re-serve ` +
+        `or resume it. Delete this file manually.`,
+      { url: logUrl, error: err instanceof Error ? err.message : String(err) },
+    );
+  }
+}
+
 /** On-disk size, or undefined when it can't be determined (fs layer stubbed in
  *  tests, or a stat hiccup) — callers must not block a download over a missing
  *  number, only over a number that proves corruption. */
@@ -120,7 +165,7 @@ async function readHead(path: string, n = PAYLOAD_SNIFF_BYTES): Promise<Buffer |
  *  or JSON error IS) rather than binary model bytes. This is a real UTF-8 validation,
  *  not "any high byte counts as text": each non-ASCII byte must be a well-formed
  *  UTF-8 lead followed by valid continuation bytes, and NUL / C0 control bytes
- *  (except tab/LF/CR) hard-fail. Random binary that happens to start with `<`/`{`/`[`
+ *  (except the text whitespace controls TAB/LF/VT/FF/CR) hard-fail. Random binary that happens to start with `<`/`{`/`[`
  *  almost immediately hits an invalid UTF-8 lead byte (0x80–0xC1 and 0xF5–0xFF — ~26%
  *  of all byte values) or a control byte, so it is correctly kept binary; a safetensors
  *  whose LE header length is 60 (0x3C='<') is followed by NUL padding and fails at once.
@@ -133,8 +178,12 @@ function looksLikeText(slice: Buffer): boolean {
   while (i < n) {
     const b = slice[i];
     if (b < 0x80) {
-      // ASCII: printable + tab/LF/CR only. NUL/other C0 controls ⇒ not text.
-      if (b === 0x09 || b === 0x0a || b === 0x0d || (b >= 0x20 && b <= 0x7e)) {
+      // ASCII: printable + the standard text whitespace controls TAB(0x09) LF(0x0a)
+      // VT(0x0b) FF(0x0c) CR(0x0d). A form-feed / vertical-tab is valid HTML/XML
+      // whitespace, so a real login page like `<html>\f<body>…` MUST still read as
+      // text (else it slips through as "binary" and finalizes as a model — #473
+      // P0-1). Any OTHER C0 control (NUL etc.) ⇒ not text.
+      if ((b >= 0x09 && b <= 0x0d) || (b >= 0x20 && b <= 0x7e)) {
         i += 1;
         continue;
       }
@@ -184,11 +233,14 @@ function classifyDecodedText(s: string): "html" | "json" | "binary" {
   while (j < s.length && (s[j] === " " || s[j] === "\t" || s[j] === "\n" || s[j] === "\r")) j += 1;
   if (j >= s.length) return "binary";
   const ch = s[j];
-  const rest = s.slice(j, j + 64);
+  // Require the WHOLE decoded run (not just the first 64 chars) to be clean text
+  // before declaring html/json: a binary payload that merely decoded to a leading
+  // `<`/`{` but then hits control/replacement chars must stay binary (#473 P0-2).
+  const rest = s.slice(j);
   const isText = (() => {
     for (const c of rest) {
       const cp = c.codePointAt(0)!;
-      if (cp === 0x09 || cp === 0x0a || cp === 0x0d) continue;
+      if (cp >= 0x09 && cp <= 0x0d) continue; // TAB/LF/VT/FF/CR — text whitespace
       if (cp < 0x20 || cp === 0xfffd) return false; // NUL/C0 control or replacement char
     }
     return true;
@@ -224,7 +276,13 @@ function classifyPayload(buf: Buffer): "html" | "json" | "binary" {
   }
   if (i >= buf.length) return "binary";
   const c = buf[i];
-  const rest = buf.subarray(i, Math.min(buf.length, i + 64));
+  // Require the WHOLE sniffed run — the entire remaining head, not just the first 64
+  // bytes — to read as valid text before declaring html/json. A raw binary whose head
+  // merely STARTS with `<`/`{`/`[` but turns to non-text bytes further in (e.g. a .bin
+  // that begins `<AAA…` then has NUL/high bytes) must be ACCEPTED as a model, not
+  // rejected on a one-byte lead over a tiny window (#473 P0-2). A genuine HTML/JSON
+  // auth page is text throughout the sniff window, so it still classifies correctly.
+  const rest = buf.subarray(i);
   if (c === 0x3c) return looksLikeText(rest) ? "html" : "binary"; // '<'
   if (c === 0x7b || c === 0x5b) return looksLikeText(rest) ? "json" : "binary"; // '{' or '['
   return "binary";
@@ -235,14 +293,18 @@ function classifyPayload(buf: Buffer): "html" | "json" | "binary" {
  *  offending kind, or null when the payload is an acceptable model binary (or the
  *  destination isn't a model-binary extension, so this validation doesn't apply).
  *
- *  Body shape is AUTHORITATIVE: an HTML page's leading `<` and a JSON error's leading
- *  `{`/`[` are present regardless of how the server labels the response, so body magic
- *  catches every realistic auth/error page. Content-Type is only a CORROBORATING
- *  signal, applied solely when the body is NOT identifiably binary — it must never
- *  override a genuinely-binary body, or a legitimate model served with a mislabeled
- *  `text/html`/`application/json` header would be wrongly rejected (a false-negative).
- *  (fetch() transparently decompresses gzip/br, so a compressed error page still
- *  sniffs as its decoded HTML/JSON here.) */
+ *  Two independent signals, EITHER of which rejects:
+ *   1. Body magic — an HTML page's leading `<` (over a whole-window text run) and a
+ *      JSON error's leading `{`/`[` are present regardless of how the server labels
+ *      the response, so body magic catches an auth/error page even when mislabeled
+ *      `application/octet-stream`. (fetch() transparently decompresses gzip/br, so a
+ *      compressed error page still sniffs as its decoded HTML/JSON here.)
+ *   2. Content-Type — a `text/html`/`application/xhtml` or `application/json` label
+ *      on a binary-model destination is itself proof of an auth/error document, so it
+ *      rejects EVEN when the body failed to sniff as text (a stray control byte, an
+ *      exotic charset, or a truncating proxy — #473 P0-1). Real model hosts never
+ *      label a weight file text/html or application/json, so this can't reject a
+ *      legitimate binary (whose Content-Type is octet-stream or similar). */
 function detectNonModelPayload(
   head: Buffer | undefined,
   contentType: string,
@@ -252,14 +314,17 @@ function detectNonModelPayload(
   const kind = head ? classifyPayload(head) : "binary";
   if (kind === "html") return "html";
   if (kind === "json") return "json";
-  // Body reads as opaque binary — a real model payload. A mislabeled Content-Type
-  // does NOT override that (avoids rejecting a legit binary). Content-Type only
-  // corroborates when we truly have no binary body evidence (an empty head — which
-  // the callers already treat as fail-closed before reaching here).
-  if (!head || head.length === 0) {
-    if (/text\/html|application\/xhtml/i.test(contentType)) return "html";
-    if (/(^|[/+])json\b/i.test(contentType)) return "json";
-  }
+  // Content-Type is AUTHORITATIVE for the two textual auth/error shapes. A server
+  // that LABELS a response `text/html`/`application/xhtml` or `application/json` for
+  // a binary-model destination is serving a login/auth or API-error document, never
+  // a weight file — so reject it EVEN when the body itself failed to sniff as text
+  // (a stray control byte, an exotic charset, or a truncating proxy could otherwise
+  // let a genuine HTML/JSON page slip through as "binary" — #473 P0-1). Real model
+  // hosts serve weights as application/octet-stream (or similar), never as text/html
+  // or application/json, so this can't reject a legitimate binary. (The body-magic
+  // checks above already caught the common octet-stream-mislabeled auth page.)
+  if (/text\/html|application\/xhtml/i.test(contentType)) return "html";
+  if (/(^|[/+])json\b/i.test(contentType)) return "json";
   return null;
 }
 
@@ -311,11 +376,13 @@ async function assertModelPayloadOrThrow(opts: {
   url: string;
   logUrl: string;
   onReject?: () => Promise<void>;
-  /** When true (the HTTP + cache-hit paths, where a real readable file was just
-   *  written), an unreadable/empty sniff head is treated as UNVERIFIED and REJECTED.
-   *  When false (the cloud S3/Azure path — a bonus check, and #473's vector is HTTP),
-   *  an unreadable head is a best-effort skip: the SDK's own Content-Length/0-byte
-   *  guards already ran, so we don't fail a cloud download we merely couldn't sniff. */
+  /** Defaults to TRUE for every finalize path (HTTP, cache-hit, cloud S3/Azure): an
+   *  unreadable/empty sniff head leaves the payload UNVERIFIED and is REJECTED —
+   *  cannot verify ⇒ do not finalize (#473 P0-3). (A genuinely 0-byte download is
+   *  already rejected upstream by assertComplete / the cache-hit 0-byte guard, so
+   *  fail-closed here only trips on a nonzero file we couldn't read.) The flag is kept
+   *  as a seam for callers/tests that need best-effort behavior, but no production
+   *  path passes false. */
   failClosed?: boolean;
 }): Promise<void> {
   const { targetPath, modelExt, contentType, url, logUrl, failClosed = true } = opts;
@@ -654,8 +721,13 @@ async function streamUrlToFile(
       contentType: "",
       url,
       logUrl,
-      onReject: () => safeRm(targetPath),
-      failClosed: false, // cloud is a best-effort bonus check; #473's vector is HTTP
+      onReject: () => discardRejectedPayload(targetPath, undefined, logUrl),
+      // FAIL CLOSED, same as the HTTP path: a cloud (S3/Azure) object can be an XML/
+      // HTML AccessDenied body saved under a `.safetensors` name, and if we CAN'T
+      // sniff the completed file (a transient open/read failure) we must NOT finalize
+      // it — cannot verify ⇒ do not finalize (#473 P0-3). Previously this was a
+      // best-effort skip, which let an unsniffable auth/error body get renamed in.
+      failClosed: true,
     });
     return;
   }
@@ -1172,10 +1244,12 @@ async function streamUrlToFile(
       contentType: res.headers.get("content-type") || "",
       url,
       logUrl,
-      onReject: async () => {
-        await safeRm(targetPath);
-        if (resumable) await safeRm(validatorSidecar);
-      },
+      // Remove the rejected partial + its resume sidecar, and if removal fails,
+      // NEUTRALIZE the partial (truncate to 0) so a retry can't resume onto the
+      // poisoned HTML/JSON prefix (#473 P1). safeRm alone would swallow an EPERM and
+      // leave a resumable poisoned partial behind.
+      onReject: () =>
+        discardRejectedPayload(targetPath, resumable ? validatorSidecar : undefined, logUrl),
     });
 
   // No progress wanted (internal/cache caller, or not under the panel) → straight pipe.
@@ -1565,8 +1639,10 @@ export async function downloadWithCache(
       url: options.url,
       logUrl,
       // Drop the poisoned cache entry so a retry re-downloads clean rather than
-      // re-serving the same bad bytes on every call.
-      onReject: () => safeRm(cachePath),
+      // re-serving the same bad bytes on every call. Truncate-to-0 fallback if rm
+      // fails (a 0-byte cache entry is treated as a miss), and log if even that
+      // fails, so a poisoned cache entry can't silently re-poison cache hits (#473 P1).
+      onReject: () => discardRejectedPayload(cachePath, undefined, logUrl),
     });
     const materializedBy = await materializeCacheFile(cachePath, options.targetPath);
     await evictLruIfNeeded();

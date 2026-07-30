@@ -351,6 +351,68 @@ describe("cloud storage downloads", () => {
       }),
     );
   });
+
+  // A handle whose read() yields `bytes` — used to control what #473's payload sniff sees.
+  function openHandleYielding(bytes: Buffer) {
+    return {
+      read: async (buf: Buffer, off: number, len: number, pos: number) => {
+        if (pos >= bytes.length) return { bytesRead: 0 };
+        const bytesRead = bytes.copy(buf, off, pos, Math.min(pos + len, bytes.length));
+        return { bytesRead };
+      },
+      close: async () => undefined,
+    };
+  }
+
+  it("fails CLOSED when a cloud payload cannot be sniffed (#473 P0-3)", async () => {
+    // S3 returns a nonzero object, but the completed file can't be opened to sniff it
+    // (a transient fs failure). Cannot verify ⇒ must NOT finalize — the cloud path
+    // used to fail OPEN here and could install an unsniffable auth/error body.
+    awsMocks.send.mockResolvedValueOnce({ Body: Readable.from("<html>login</html>") });
+    fsPromisesMocks.stat.mockResolvedValue({ size: 4096 });
+    fsPromisesMocks.open.mockRejectedValueOnce(
+      Object.assign(new Error("EACCES"), { code: "EACCES" }),
+    );
+    await expect(
+      downloadUrlToFile(
+        "s3://models/checkpoints/x.safetensors",
+        "/tmp/x.safetensors",
+        {},
+        undefined,
+        { s3: { type: "s3", access_key_id: "A", secret_access_key: "s", region: "us-east-1" } },
+      ),
+    ).rejects.toThrow(/could not be verified|not finalizing/i);
+  });
+
+  it("neutralizes a rejected cloud payload when removal fails (#473 P1)", async () => {
+    // S3 returns an HTML AccessDenied body saved under a .safetensors name; the sniff
+    // sees the HTML and rejects. If the unlink FAILS (EPERM), the impl must truncate
+    // the file to 0 bytes (writeFile(path,"")) so a retry can't re-serve/resume it,
+    // and must LOG the removal failure rather than swallow it.
+    awsMocks.send.mockResolvedValueOnce({ Body: Readable.from("<html>AccessDenied</html>") });
+    fsPromisesMocks.stat.mockResolvedValue({ size: 512 });
+    fsPromisesMocks.open.mockResolvedValueOnce(
+      openHandleYielding(Buffer.from("<html><body>AccessDenied</body></html>")),
+    );
+    fsPromisesMocks.rm.mockRejectedValue(Object.assign(new Error("EPERM"), { code: "EPERM" }));
+    fsPromisesMocks.writeFile.mockResolvedValue(undefined);
+    await expect(
+      downloadUrlToFile(
+        "s3://models/checkpoints/denied.safetensors",
+        "/tmp/denied.safetensors",
+        {},
+        undefined,
+        { s3: { type: "s3", access_key_id: "A", secret_access_key: "s", region: "us-east-1" } },
+      ),
+    ).rejects.toThrow(/not a model file|model file/i);
+    // Neutralized: truncated to 0 bytes.
+    expect(fsPromisesMocks.writeFile).toHaveBeenCalledWith("/tmp/denied.safetensors", "");
+    // Removal failure surfaced, not swallowed.
+    expect(loggerMocks.warn).toHaveBeenCalledWith(
+      expect.stringContaining("Failed to remove a rejected download artifact"),
+      expect.any(Object),
+    );
+  });
 });
 
 describe("cloud storage uploads", () => {
