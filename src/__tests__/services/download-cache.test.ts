@@ -195,6 +195,67 @@ describe("downloadModel cache", () => {
     expect(cached.some((f) => f.endsWith(".safetensors"))).toBe(false);
   });
 
+  it("follows a Hugging Face Xet/CAS cross-origin redirect and drops auth on the hop (#411)", async () => {
+    config.huggingfaceToken = "hf_secrettoken";
+    const hfUrl =
+      "https://huggingface.co/Aitrepreneur/FLX/resolve/main/krea2_turbo_mxfp8.safetensors";
+    // 1st hop: HF resolve URL 302s to the pre-signed Xet/CAS CDN (cross-origin).
+    fetchMock.mockResolvedValueOnce(
+      new Response(null, {
+        status: 302,
+        headers: { location: "https://cas-bridge.xethub.hf.co/xet-bridge-us/abc123?sig=xyz" },
+      }),
+    );
+    // 2nd hop: the CDN serves the bytes.
+    fetchMock.mockResolvedValueOnce(okResponse("xet model bytes"));
+
+    const target = await downloadModel(hfUrl, "diffusion_models", "krea.safetensors");
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // Hop 1 carried the HF bearer token...
+    const [, firstInit] = fetchMock.mock.calls[0] as [string, { headers: Record<string, string> }];
+    expect(firstInit.headers.Authorization).toBe("Bearer hf_secrettoken");
+    // ...but the cross-origin CAS hop must NOT (no token leak to the third-party CDN).
+    const [casUrl, secondInit] = fetchMock.mock.calls[1] as [
+      string,
+      { headers: Record<string, string> },
+    ];
+    expect(casUrl).toContain("cas-bridge.xethub.hf.co");
+    expect(secondInit.headers.Authorization).toBeUndefined();
+    await expect(readFile(target, "utf-8")).resolves.toBe("xet model bytes");
+  });
+
+  it("surfaces the underlying cause when fetch fails at the network layer instead of a bare 'fetch failed' (#411)", async () => {
+    // undici shape: TypeError("fetch failed") whose real reason is on .cause.
+    const netErr = new TypeError("fetch failed");
+    (netErr as { cause?: unknown }).cause = Object.assign(
+      new Error("getaddrinfo ENOTFOUND cas-bridge.xethub.hf.co"),
+      { code: "ENOTFOUND" },
+    );
+    fetchMock.mockRejectedValueOnce(netErr);
+
+    const p = downloadModel(
+      "https://huggingface.co/Aitrepreneur/FLX/resolve/main/krea2_turbo_mxfp8.safetensors",
+      "diffusion_models",
+      "krea.safetensors",
+    );
+    // Clear + actionable: names the real cause (ENOTFOUND) and the Xet/CAS host,
+    // not the generic "fetch failed".
+    await expect(p).rejects.toThrow(/network layer/i);
+    await expect(p).rejects.toThrow(/ENOTFOUND/);
+    await expect(p).rejects.toThrow(/Xet\/CAS/i);
+  });
+
+  it("gives a clear error for an unfollowable redirect (3xx with no Location) (#411)", async () => {
+    fetchMock.mockResolvedValueOnce(new Response(null, { status: 302 }));
+    const p = downloadModel(
+      "https://huggingface.co/some/repo/resolve/main/model.safetensors",
+      "diffusion_models",
+      "m.safetensors",
+    );
+    await expect(p).rejects.toThrow(/no.*Location header/i);
+  });
+
   it("evicts least-recently-used cache files when the optional limit is exceeded", async () => {
     process.env.COMFYUI_LRU_CACHE_SIZE_GB = String(12 / 1024 / 1024 / 1024);
     await fsPromises.mkdir(cacheDir, { recursive: true });
