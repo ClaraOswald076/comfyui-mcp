@@ -50,13 +50,22 @@ export function registerWorkflowValidateTools(server: McpServer): void {
 
         // Health findings are rendered in their own "### Graph health" section —
         // exclude them from the Errors/Warnings buckets to avoid double-listing.
-        const nonHealth = result.issues.filter((i) => !i.kind);
-        if (nonHealth.length === 0) {
-          lines.push("No issues found. The workflow is ready to execute.");
-        } else {
-          const errors = nonHealth.filter((i) => i.severity === "error");
-          const warnings = nonHealth.filter((i) => i.severity === "warning");
+        // NOTE: partition on `.health`, NOT `.kind`. Authoritative validator issues
+        // (missing_node_type / missing_model / value_not_in_list) also carry `kind`,
+        // so filtering by `!i.kind` (the old logic) masked real errors behind
+        // "No issues found" while the header still counted them (#342, #505).
+        const nonHealth = result.issues.filter((i) => !i.health);
+        const errors = nonHealth.filter((i) => i.severity === "error");
+        const warnings = nonHealth.filter((i) => i.severity === "warning");
 
+        if (errors.length === 0 && warnings.length === 0) {
+          // Verdict is DERIVED from the surfaced errors, never asserted independently.
+          lines.push(
+            result.valid
+              ? "No issues found. The workflow is ready to execute."
+              : "No errors were surfaced, but the workflow is NOT valid — see the header and graph-health section below.",
+          );
+        } else {
           if (errors.length > 0) {
             lines.push("### Errors");
             for (const issue of errors) {
