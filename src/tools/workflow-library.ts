@@ -109,17 +109,22 @@ export function registerWorkflowLibraryTools(server: McpServer): void {
           const objectInfo = await backfillObjectInfo(bulk, collectNodeTypes(raw));
           const { workflow, warnings } = convertUiToApi(raw, objectInfo);
 
-          const content: Array<{ type: "text"; text: string }> = [];
+          // Return the JSON workflow as the primary/first content block so
+          // consumers that read the first text result always receive the graph
+          // (not Markdown). Conversion warnings are appended as a separate
+          // trailing block and never replace or precede the JSON (#494).
+          const content: Array<{ type: "text"; text: string }> = [
+            {
+              type: "text",
+              text: JSON.stringify(workflow, null, 2),
+            },
+          ];
           if (warnings.length > 0) {
             content.push({
               type: "text",
               text: `**Conversion warnings (${warnings.length}):**\n${warnings.map((w) => `- ${w}`).join("\n")}`,
             });
           }
-          content.push({
-            type: "text",
-            text: JSON.stringify(workflow, null, 2),
-          });
           return { content };
         }
 
