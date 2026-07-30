@@ -355,6 +355,26 @@ describe("downloadModel cache", () => {
     ).rejects.toThrow(/resume rejected/i);
   });
 
+  it("accepts a 206 whose Content-Range uses a mixed-case range unit (RFC 9110 §14.1) (#343 edge)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://example.com/models/mixedcase.safetensors";
+    const { partial, sidecar } = await cachePaths(url);
+    await writeFile(partial, "AAAA");
+    await writeFile(sidecar, '"mc-etag"');
+
+    // "Bytes" (capital B) is a legitimate, case-insensitive range unit.
+    fetchMock.mockResolvedValueOnce(
+      new Response("BBBB", {
+        status: 206,
+        statusText: "Partial Content",
+        headers: { "content-range": "Bytes 4-7/8" },
+      }),
+    );
+
+    const target = await downloadModel(url, "checkpoints", "mixedcase-out.safetensors");
+    await expect(readFile(target, "utf-8")).resolves.toBe("AAAABBBB");
+  });
+
   it("refuses a SHORT 206 that does not run to the end of the file (RFC 9110 partial range) (#343 edge)", async () => {
     await fsPromises.mkdir(cacheDir, { recursive: true });
     const url = "https://example.com/models/short206.safetensors";

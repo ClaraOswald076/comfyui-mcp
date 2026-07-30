@@ -357,7 +357,8 @@ async function streamUrlToFile(
     // be appended at the wrong offset. Drop the partial + validator so a retry
     // starts clean rather than compounding the corruption.
     const contentRange = res.headers.get("content-range");
-    const m = contentRange ? /^bytes (\d+)-(\d+)\/(\d+)$/.exec(contentRange.trim()) : null;
+    // Range-unit name is case-insensitive (RFC 9110 §14.1) — accept "Bytes"/"BYTES".
+    const m = contentRange ? /^bytes (\d+)-(\d+)\/(\d+)$/i.exec(contentRange.trim()) : null;
     const start = m ? Number(m[1]) : NaN;
     const end = m ? Number(m[2]) : NaN;
     const total = m ? Number(m[3]) : NaN;
