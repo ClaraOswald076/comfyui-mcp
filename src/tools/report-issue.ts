@@ -1,60 +1,219 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
-// Safe-by-default issue reporting: returns a PREFILLED GitHub "new issue" URL
-// rather than auto-filing. No auth, no network, no surprise posts — the user
-// reviews and submits with one click. (A future opt-in could auto-file via gh
-// or a CF Worker; intentionally not the default.)
+// Issue reporting. For OUR repos (comfyui-mcp / comfyui-mcp-panel) this now
+// *files* the issue through the async intake Worker — submit → get a job_id →
+// poll /status/<job_id> for the created issue link. For third-party repos, or
+// when the Worker is unreachable, it falls back to a PREFILLED GitHub "new
+// issue" URL the user can review and submit in one click (no auth, no network).
 
 const DEFAULT_REPO = "artokun/comfyui-mcp";
+
+// Repos the intake Worker is allowed to file into (owner is fixed server-side).
+const OUR_OWNER = "artokun";
+const OUR_REPO_NAMES = new Set(["comfyui-mcp", "comfyui-mcp-panel"]);
+
+// Defaults mirror the report-bug SKILL. Both are overridable via env; the client
+// key is a soft anti-spam gate (not a real secret — the GitHub token is
+// server-side in the Worker).
+const DEFAULT_WORKER_URL = "https://comfyui-mcp-issue-worker.artokun.workers.dev";
+const DEFAULT_CLIENT_KEY = "9b6f2abf09b64006dc6e033f59d2dc8112e34d8347a923c2";
+
+export function normalizeRepo(input: string | undefined): string {
+  const repo = (input || DEFAULT_REPO)
+    .trim()
+    .replace(/^https?:\/\/github\.com\//i, "")
+    .replace(/\.git$/i, "")
+    .replace(/^\/+|\/+$/g, "");
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) {
+    throw new Error(`invalid repo "${repo}" — expected owner/name`);
+  }
+  return repo;
+}
+
+export function buildIssueUrl(repo: string, title: string, body: string, labels?: string[]): string {
+  const params = new URLSearchParams({ title, body });
+  if (labels?.length) params.set("labels", labels.join(","));
+  return `https://github.com/${repo}/issues/new?${params.toString()}`;
+}
+
+export function isOurRepo(repo: string): boolean {
+  const [owner, name] = repo.split("/");
+  return owner === OUR_OWNER && OUR_REPO_NAMES.has(name);
+}
+
+export interface WorkerFileResult {
+  status: "done" | "queued" | "error";
+  url?: string;
+  number?: number;
+  deduped?: boolean;
+  job_id?: string;
+  error?: string;
+}
+
+// Submit to the async intake Worker and poll /status/<job_id> a few times for
+// the created issue link. Injectable fetch/sleep for testing. Throws on network
+// failure or non-OK submit so the caller can fall back to a prefilled URL.
+export async function submitAndPoll(opts: {
+  workerUrl: string;
+  clientKey: string;
+  repoName: string;
+  title: string;
+  body: string;
+  labels?: string[];
+  fetchImpl?: typeof fetch;
+  sleep?: (ms: number) => Promise<void>;
+  maxPolls?: number;
+  pollDelayMs?: number;
+  timeoutMs?: number;
+}): Promise<WorkerFileResult> {
+  const doFetch = opts.fetchImpl ?? fetch;
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const maxPolls = opts.maxPolls ?? 5;
+  const pollDelayMs = opts.pollDelayMs ?? 1000;
+  const timeoutMs = opts.timeoutMs ?? 8000;
+
+  const withTimeout = async (fn: (signal: AbortSignal) => Promise<Response>): Promise<Response> => {
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), timeoutMs);
+    try {
+      return await fn(ac.signal);
+    } finally {
+      clearTimeout(t);
+    }
+  };
+
+  const submitRes = await withTimeout((signal) =>
+    doFetch(opts.workerUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Client-Key": opts.clientKey },
+      body: JSON.stringify({ repo: opts.repoName, title: opts.title, body: opts.body, labels: opts.labels }),
+      signal,
+    }),
+  );
+  if (!submitRes.ok) {
+    throw new Error(`worker submit failed: HTTP ${submitRes.status}`);
+  }
+  const submit = (await submitRes.json()) as WorkerFileResult;
+
+  // Fast path: the Worker already filed and returned the link inline.
+  if (submit.url) return { ...submit, status: submit.status ?? "done" };
+  const jobId = submit.job_id;
+  if (!jobId) {
+    // No job to poll and no url — treat as done-without-link (still accepted).
+    return submit;
+  }
+
+  // Poll /status/<job_id> until done/error or we run out of tries.
+  const base = opts.workerUrl.replace(/\/+$/, "");
+  let last: WorkerFileResult = { status: "queued", job_id: jobId };
+  for (let i = 0; i < maxPolls; i++) {
+    await sleep(pollDelayMs);
+    let statusRes: Response;
+    try {
+      statusRes = await withTimeout((signal) => doFetch(`${base}/status/${jobId}`, { signal }));
+    } catch {
+      continue; // transient — keep trying
+    }
+    if (!statusRes.ok) continue;
+    last = (await statusRes.json()) as WorkerFileResult;
+    last.job_id = jobId;
+    if (last.status === "done" || last.status === "error") break;
+  }
+  return last;
+}
 
 export function registerReportIssueTools(server: McpServer): void {
   server.tool(
     "report_issue",
-    "Build a ready-to-open GitHub issue link for a bug/problem you hit (ComfyUI, a workflow, a model, custom nodes, or comfyui-mcp itself). Returns a URL with the title and body prefilled — SHARE it with the user so they can review and submit it in one click. It does NOT auto-file. Use it when you encounter an error you can't resolve so the user can report it upstream. For panel-specific bugs pass repo='artokun/comfyui-mcp-panel'.",
+    "File or link a GitHub issue for a bug/problem you hit (ComfyUI, a workflow, a model, custom nodes, or comfyui-mcp itself). For OUR repos (artokun/comfyui-mcp, artokun/comfyui-mcp-panel) it FILES the issue via the intake Worker and returns the created issue link (no end-user GitHub auth needed); if the Worker is unreachable it falls back to a prefilled GitHub 'new issue' URL. For third-party repos it returns a prefilled URL to SHARE with the user (it does not auto-file). Pass repo='owner/name' for third-party projects. The filing is autonomous — surface the resulting link to the user only if they want it.",
     {
       title: z.string().min(1).describe("Short, specific issue title."),
       body: z
         .string()
         .min(1)
         .describe(
-          "Issue body: what happened, steps to reproduce, the exact error text, and environment (GPU/VRAM, ComfyUI version, OS) if known.",
+          "Issue body: what happened, steps to reproduce, the exact error text, and environment (GPU/VRAM, ComfyUI version, OS) if known. Scrub secrets first.",
         ),
       repo: z
         .string()
         .optional()
         .describe("owner/repo (default 'artokun/comfyui-mcp'; use 'artokun/comfyui-mcp-panel' for the sidebar panel)."),
       labels: z.array(z.string()).optional().describe("Optional GitHub label names to prefill."),
+      no_file: z
+        .boolean()
+        .optional()
+        .describe("Force the prefilled-URL path even for our repos (skip the Worker). Rarely needed."),
     },
     async (args) => {
       try {
-        const repo = (args.repo || DEFAULT_REPO)
-          .trim()
-          .replace(/^https?:\/\/github\.com\//i, "")
-          .replace(/\.git$/i, "")
-          .replace(/^\/+|\/+$/g, "");
-        if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) {
-          throw new Error(`invalid repo "${repo}" — expected owner/name`);
+        const repo = normalizeRepo(args.repo);
+        const prefilledUrl = buildIssueUrl(repo, args.title, args.body, args.labels);
+
+        // Third-party (or explicitly disabled): prefilled link only, as before.
+        if (!isOurRepo(repo) || args.no_file) {
+          return jsonResult({
+            url: prefilledUrl,
+            repo,
+            filed: false,
+            note: "Prefilled issue link (not auto-filed). Share it with the user to review and submit.",
+          });
         }
-        const params = new URLSearchParams({ title: args.title, body: args.body });
-        if (args.labels?.length) params.set("labels", args.labels.join(","));
-        const url = `https://github.com/${repo}/issues/new?${params.toString()}`;
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(
-                {
-                  url,
-                  repo,
-                  note: "Prefilled issue link (not auto-filed). Share it with the user to review and submit.",
-                },
-                null,
-                2,
-              ),
-            },
-          ],
-        };
+
+        // Our repo: file via the async intake Worker, poll for the link.
+        const workerUrl = process.env.COMFYUI_MCP_ISSUE_WORKER_URL || DEFAULT_WORKER_URL;
+        const clientKey = process.env.COMFYUI_MCP_ISSUE_CLIENT_KEY || DEFAULT_CLIENT_KEY;
+        const repoName = repo.split("/")[1];
+        try {
+          const result = await submitAndPoll({
+            workerUrl,
+            clientKey,
+            repoName,
+            title: args.title,
+            body: args.body,
+            labels: args.labels,
+          });
+          if (result.status === "done" && result.url) {
+            return jsonResult({
+              url: result.url,
+              number: result.number,
+              deduped: result.deduped,
+              repo,
+              filed: true,
+              job_id: result.job_id,
+              note: result.deduped
+                ? "Filed via intake Worker (matched an existing open issue). Share the link only if the user wants it."
+                : "Filed via intake Worker. Share the link only if the user wants it.",
+            });
+          }
+          if (result.status === "error") {
+            // Server-side filing failed — hand back the prefilled link.
+            return jsonResult({
+              url: prefilledUrl,
+              repo,
+              filed: false,
+              job_id: result.job_id,
+              note: `Intake Worker reported an error (${result.error || "unknown"}). Fallback: prefilled issue link for the user to submit.`,
+            });
+          }
+          // Still queued after polling — accepted, link not yet available.
+          return jsonResult({
+            url: prefilledUrl,
+            repo,
+            filed: true,
+            pending: true,
+            job_id: result.job_id,
+            note: "Report accepted by the intake Worker; filing is still in progress (poll /status/<job_id> later for the link). Prefilled link included as a fallback.",
+          });
+        } catch (workerErr) {
+          // Worker unreachable / rejected — fall back to the prefilled URL.
+          return jsonResult({
+            url: prefilledUrl,
+            repo,
+            filed: false,
+            note: `Intake Worker unreachable (${workerErr instanceof Error ? workerErr.message : String(workerErr)}). Fallback: prefilled issue link for the user to submit in one click.`,
+          });
+        }
       } catch (err) {
         return {
           content: [
@@ -65,4 +224,10 @@ export function registerReportIssueTools(server: McpServer): void {
       }
     },
   );
+}
+
+function jsonResult(obj: unknown) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(obj, null, 2) }],
+  };
 }
