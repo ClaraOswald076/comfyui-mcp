@@ -342,25 +342,43 @@ async function streamUrlToFile(
   // upstream file changed — so we overwrite and restart, which is correct.
   const appendMode = effectiveResume > 0 && res.status === 206;
 
+  // The authoritative full-file size, taken from a 206's Content-Range total.
+  // Used as the truncation target so a SHORT 206 (a server that satisfies only
+  // part of the requested range — RFC 9110 §15.3.7) can't slip through.
+  let rangeTotal: number | undefined;
   if (appendMode) {
-    // #343 edge: a 206 MUST prove it resumes from exactly the byte we asked for.
-    // Reject it unless the Content-Range parses AND its start equals our resume
-    // offset — a missing/malformed header, or a different start (misconfigured
-    // proxy/mirror), would otherwise make us append at the wrong offset and
-    // silently corrupt the file. Drop the partial + validator so the next
-    // attempt starts clean rather than compounding the corruption.
+    // #343 edge: a 206 MUST fully prove where it resumes AND how big the whole
+    // file is. Parse Content-Range strictly as `bytes <start>-<end>/<total>` and
+    // reject unless: start === our resume offset, end >= start, total is known
+    // and consistent (end === total-1, i.e. the range runs to the end of the
+    // representation). A missing/malformed/partial range (e.g. `bytes 4-7/1000`
+    // returning only 4 of the remaining bytes, or `bytes 4-3/3`, or unanchored
+    // garbage) would otherwise let a truncated file be finalized as complete or
+    // be appended at the wrong offset. Drop the partial + validator so a retry
+    // starts clean rather than compounding the corruption.
     const contentRange = res.headers.get("content-range");
-    const m = contentRange ? /bytes\s+(\d+)-\d+\/(?:\d+|\*)/i.exec(contentRange) : null;
-    if (!m || Number(m[1]) !== effectiveResume) {
+    const m = contentRange ? /^bytes (\d+)-(\d+)\/(\d+)$/.exec(contentRange.trim()) : null;
+    const start = m ? Number(m[1]) : NaN;
+    const end = m ? Number(m[2]) : NaN;
+    const total = m ? Number(m[3]) : NaN;
+    const valid =
+      m !== null &&
+      start === effectiveResume &&
+      end >= start &&
+      total > end &&
+      end === total - 1;
+    if (!valid) {
       await safeRm(targetPath);
       await safeRm(validatorSidecar);
       throw new ModelError(
-        `Download resume rejected: expected a 206 resuming at byte ${effectiveResume} but the ` +
-          `server's Content-Range was ${contentRange ? `"${contentRange}"` : "absent"}. Refusing ` +
-          `to append (would corrupt the file). Removed the partial; retry for a clean download.`,
+        `Download resume rejected: a 206 for byte ${effectiveResume}+ must carry a complete, ` +
+          `consistent Content-Range "bytes ${effectiveResume}-<end>/<total>" reaching the end of ` +
+          `the file, but the server sent ${contentRange ? `"${contentRange}"` : "no Content-Range"}. ` +
+          `Refusing to append (would corrupt or truncate the file). Removed the partial; retry.`,
         { url: logUrl, status: res.status },
       );
     }
+    rangeTotal = total;
   }
 
   const flags = appendMode ? "a" : "w";
@@ -381,10 +399,15 @@ async function streamUrlToFile(
   const nodeStream = Readable.fromWeb(res.body as import("node:stream/web").ReadableStream);
   const fileStream = createWriteStream(targetPath, { flags });
 
-  // Content-Length is the REMAINING bytes for a 206 resume, so add the bytes
-  // already on disk to get the true expected total.
+  // Truncation target = the true full-file size. For a validated 206 that is the
+  // Content-Range total (NOT content-length, which is only the remaining slice
+  // and would mask a short 206). For a 200 it is the Content-Length.
   const lengthHeader = Number(res.headers.get("content-length") || 0);
-  const expectedTotal = lengthHeader > 0 ? lengthHeader + (appendMode ? effectiveResume : 0) : 0;
+  const expectedTotal = appendMode
+    ? (rangeTotal ?? 0)
+    : lengthHeader > 0
+      ? lengthHeader
+      : 0;
 
   // A pipeline() can resolve on a stream that ended EARLY (server dropped the
   // connection, proxy cut it, disk edge case) — leaving a 0-byte or truncated

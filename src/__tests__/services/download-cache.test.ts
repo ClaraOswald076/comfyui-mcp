@@ -355,6 +355,30 @@ describe("downloadModel cache", () => {
     ).rejects.toThrow(/resume rejected/i);
   });
 
+  it("refuses a SHORT 206 that does not run to the end of the file (RFC 9110 partial range) (#343 edge)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://example.com/models/short206.safetensors";
+    const { partial, sidecar } = await cachePaths(url);
+    await writeFile(partial, "AAAA"); // resume offset = 4
+    await writeFile(sidecar, '"s2-etag"');
+
+    // 206 whose Content-Range says the file is 1000 bytes but only serves
+    // bytes 4-7 — appending 4 bytes and using content-length (4) as the target
+    // would finalize an 8-byte file as "complete" for a 1000-byte model.
+    fetchMock.mockResolvedValueOnce(
+      new Response("BBBB", {
+        status: 206,
+        statusText: "Partial Content",
+        headers: { "content-range": "bytes 4-7/1000" },
+      }),
+    );
+
+    await expect(
+      downloadModel(url, "checkpoints", "short206-out.safetensors"),
+    ).rejects.toThrow(/resume rejected/i);
+    await expect(stat(partial)).rejects.toThrow();
+  });
+
   it("does NOT resume a validator-less partial — restarts cleanly instead of appending (#343 edge)", async () => {
     await fsPromises.mkdir(cacheDir, { recursive: true });
     const url = "https://example.com/models/novalidator.safetensors";
