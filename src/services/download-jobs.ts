@@ -15,8 +15,11 @@
  */
 
 import { createHash } from "node:crypto";
-import { isRemoteMode } from "../config.js";
-import { downloadModel, resolveDownloadTarget } from "./model-resolver.js";
+import {
+  downloadModel,
+  resolveDownloadTarget,
+  shouldDispatchDownloadToManager,
+} from "./model-resolver.js";
 import type { DownloadAuth } from "./download-auth.js";
 import { logger } from "../utils/logger.js";
 
@@ -49,9 +52,40 @@ export interface DownloadJob {
 interface Entry {
   job: DownloadJob;
   settled: Promise<void>;
+  /** Every registry key this entry is indexed under (request key, and the
+   *  destination key when locally resolvable). Kept so a superseding job can
+   *  unregister ALL of a stale entry's keys — no orphaned index rows. */
+  keys: string[];
 }
 
+// The in-flight registry is indexed under MULTIPLE keys per job so dedup is
+// ROUTE-INDEPENDENT: a repeated request finds the in-flight job whether or not the
+// Manager↔local route flipped between calls (#420 codex round 2). One Entry object
+// is shared by all its keys.
 const jobs = new Map<string, Entry>();
+
+/**
+ * Point `key` at `entry`, ENTRY-SCOPED (#420 codex round 3, rule 2/3): never clobber
+ * a row currently owned by a DIFFERENT, still-in-flight writer — that would orphan a
+ * live download's index. Records the key on the entry so it can be retired later.
+ */
+function registerKey(entry: Entry, key: string): void {
+  const cur = jobs.get(key);
+  if (cur && cur !== entry && cur.job.status === "downloading") return;
+  if (!entry.keys.includes(key)) entry.keys.push(key);
+  jobs.set(key, entry);
+}
+
+/**
+ * Retire a superseded (done/error) entry, ENTRY-SCOPED (#420 codex round 3, rule 2):
+ * only delete an index row that STILL points at THIS entry, so retiring an older job
+ * can never delete a key that has since been reassigned to a newer/live entry.
+ */
+function retireEntry(entry: Entry): void {
+  for (const key of entry.keys) {
+    if (jobs.get(key) === entry) jobs.delete(key);
+  }
+}
 
 /** The tray keys rows on a hash of the SOURCE URL; match it so both agree. */
 export function downloadIdFor(url: string): string {
@@ -70,14 +104,15 @@ export function downloadJobIdFor(targetPath: string): string {
 }
 
 /**
- * REMOTE-mode id: there is NO local filesystem to resolve a targetPath from —
- * downloadModel dispatches to the ComfyUI host's Manager, which decides the
- * server-side destination. Key by a canonical, collision-safe JSON-encoded tuple
- * of {url, trimmed subfolder, filename} so field boundaries are unambiguous and a
- * repeated identical request still adopts the in-flight job. (We can't dedupe two
- * DIFFERENT urls aimed at one server-side dest here — the server owns that.)
+ * ROUTE-INDEPENDENT request key: a canonical, collision-safe JSON-encoded tuple of
+ * {url, trimmed subfolder, filename}. Derived ONLY from the request inputs — never
+ * from the resolved destination or the chosen route — so a repeated call for the
+ * SAME request adopts the in-flight job regardless of a Manager↔local reachability
+ * flip between calls (#420 codex round 2). Every job is indexed under this key; a
+ * locally-resolvable job is ALSO indexed under its destination key (below) so the
+ * "two different URLs → one local destination → one writer" dedup still holds.
  */
-function remoteDownloadJobIdFor(
+function requestDownloadKey(
   url: string,
   targetSubfolder: string,
   filename?: string,
@@ -123,19 +158,77 @@ export async function startDownloadJob(
   // there is NO local filesystem — downloadModel short-circuits to the Manager
   // dispatch, so resolving a local models dir would wrongly THROW (COMFYUI_PATH
   // unset). Key by a canonical remote identity instead and let downloadModel take
-  // the Manager path.
-  const id = isRemoteMode()
-    ? remoteDownloadJobIdFor(url, targetSubfolder, filename)
-    : downloadJobIdFor((await resolveDownloadTarget(url, targetSubfolder, filename)).targetPath);
+  // the Manager path. shouldDispatchDownloadToManager() also covers the #420
+  // reconnect case: a nominally-local session whose effective base was lost still
+  // routes through the connected Manager (and must NOT try to resolve a local
+  // targetPath, which would throw), keying by the same canonical remote identity.
+  //
+  // CRITICAL: evaluate the route EXACTLY ONCE and thread it into downloadModel
+  // below. The predicate awaits live /system_stats and reads mutable base config,
+  // so a reconnect/reachability flip between two evaluations would split the job —
+  // Manager-key + local-writer (or a duplicate job) for one request (#420 codex
+  // round 1). One decision keys the identity AND drives the writer.
+  const dispatchToManager = await shouldDispatchDownloadToManager();
+
+  // DEDUP INDEX (route-independent) vs WRITER ROUTE (the single decision above) are
+  // deliberately separated (#420 codex round 2). The in-flight lookup/registration
+  // is keyed by the REQUEST (url+subfolder+filename), which NEVER changes with the
+  // route — so two separate calls for one request with a Manager↔local flip between
+  // them still resolve to ONE job (no same-file double-write). When the request is
+  // locally resolvable we ALSO index the destination-path key, preserving the
+  // "two different URLs → same local destination → one writer" dedup (WS-4). An
+  // invalid filename/subfolder is REJECTED here (by resolveDownloadTarget), up
+  // front, exactly as the write would reject it.
+  const reqKey = requestDownloadKey(url, targetSubfolder, filename);
+  let destKey: string | undefined;
+  if (!dispatchToManager) {
+    const target = await resolveDownloadTarget(url, targetSubfolder, filename);
+    destKey = downloadJobIdFor(target.targetPath);
+  }
+  // The PUBLIC id (download_status handle): the destination key when we have one
+  // (so distinct destinations are separately pollable), else the request key.
+  const id = destKey ?? reqKey;
+  // This call's keys: the route-independent request key, plus the destination key
+  // when locally resolvable (two-URLs-one-dest dedup).
+  const lookupKeys = destKey ? [reqKey, destKey] : [reqKey];
   const trayId = downloadIdFor(url);
-  const existing = jobs.get(id);
-  if (existing && existing.job.status === "downloading") {
-    logger.info(`Download already in flight, adopting it: ${id}`, {
+
+  // ADOPT ONLY AN IN-FLIGHT ENTRY (#420 codex round 3, rule 3): a FINISHED entry
+  // under any key is treated as absent — it must never shadow a currently-downloading
+  // writer reachable under another key, nor cause a retire that overwrites a live row.
+  // Scan every key and prefer an in-flight match.
+  let adopted: Entry | undefined;
+  for (const k of lookupKeys) {
+    const e = jobs.get(k);
+    if (e && e.job.status === "downloading") {
+      adopted = e;
+      break;
+    }
+  }
+  if (adopted) {
+    // Re-index THIS call's keys onto the adopted entry (#420 codex round 3, rule 1):
+    // when URL B adopts URL A's in-flight job by destination, B's request key must
+    // now point at the same entry too — otherwise a later repeat of B (especially
+    // after a local→Manager flip that drops the destination key) would miss it and
+    // start a second writer onto one file. Entry-scoped, so it can't steal a live row.
+    for (const k of lookupKeys) registerKey(adopted, k);
+    logger.info(`Download already in flight, adopting it: ${adopted.job.id}`, {
       url,
       target_subfolder: targetSubfolder,
       filename,
     });
-    return existing;
+    return adopted;
+  }
+  // No in-flight match. Retire any superseded (done/error) entries shadowing our keys
+  // — entry-scoped, so we only clear rows still pointing at that finished entry and
+  // never delete a row now owned by a different, live writer (rule 2).
+  const retired = new Set<Entry>();
+  for (const k of lookupKeys) {
+    const e = jobs.get(k);
+    if (e && !retired.has(e)) {
+      retireEntry(e);
+      retired.add(e);
+    }
   }
 
   const job: DownloadJob = {
@@ -150,7 +243,7 @@ export async function startDownloadJob(
 
   // The promise is stored, never left dangling — an unhandled rejection here
   // would take down the process on a simple 404.
-  const settled = downloadModel(url, targetSubfolder, filename, auth)
+  const settled = downloadModel(url, targetSubfolder, filename, auth, dispatchToManager)
     .then(async (path) => {
       job.path = path;
       if (onComplete) {
@@ -174,21 +267,31 @@ export async function startDownloadJob(
       job.finished_at = Date.now();
     });
 
-  const entry: Entry = { job, settled };
-  jobs.set(id, entry);
+  // Index under EVERY key (deduped) so any of them adopts this one writer. Uses the
+  // entry-scoped registerKey guard so a fresh registration can never overwrite a row
+  // still owned by a different, live writer (rule 3).
+  const entry: Entry = { job, settled, keys: [] };
+  for (const k of new Set(lookupKeys)) registerKey(entry, k);
   return entry;
 }
 
 export function getDownloadJob(id: string): DownloadJob | undefined {
-  // The registry is keyed by the distinct public id (URL+destination), so each
-  // destination resolves to its own job.
+  // The registry indexes each job under its request key and (when local) its
+  // destination key; the public id is one of those, so a direct get resolves it.
   return jobs.get(id)?.job;
 }
 
 export function listDownloadJobs(): DownloadJob[] {
-  return [...jobs.values()]
-    .map((e) => e.job)
-    .sort((a, b) => b.started_at - a.started_at);
+  // One Entry is indexed under multiple keys — dedup by identity so a job appears
+  // once regardless of how many keys point at it.
+  const seen = new Set<Entry>();
+  const out: DownloadJob[] = [];
+  for (const e of jobs.values()) {
+    if (seen.has(e)) continue;
+    seen.add(e);
+    out.push(e.job);
+  }
+  return out.sort((a, b) => b.started_at - a.started_at);
 }
 
 /** Test seam — the registry is process-global otherwise. */

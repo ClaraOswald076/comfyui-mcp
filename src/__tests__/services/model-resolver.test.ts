@@ -443,6 +443,44 @@ describe("downloadModel — remote mode (Manager install-model dispatch)", () =>
   });
 });
 
+describe("downloadModel — threaded routing decision (#420 split-brain guard)", () => {
+  it("forces the Manager dispatch when dispatchToManager=true, even with a LOCAL config", async () => {
+    // config.comfyuiPath is set (local mode), so self-evaluation would stream to
+    // disk. Passing the job's already-decided route must WIN — the writer follows
+    // the decision the job id was keyed on, never a fresh evaluation.
+    config.comfyuiPath = "/comfy";
+    const out = await downloadModel(
+      "https://example.com/model.safetensors",
+      "checkpoints",
+      "model.safetensors",
+      undefined,
+      true, // dispatchToManager — decided upstream by startDownloadJob
+    );
+    expect(installModelViaManagerMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).not.toHaveBeenCalled(); // no local streaming
+    expect(out).toContain("ComfyUI-Manager");
+  });
+
+  it("forces local streaming when dispatchToManager=false, even in remote-like config", async () => {
+    // Even with comfyuiPath unset (self-eval would pick Manager), an explicit
+    // false route makes the writer take the local path (and here fail at fetch),
+    // proving the passed decision overrides self-evaluation both ways.
+    config.comfyuiPath = undefined;
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 500, statusText: "err" });
+    await expect(
+      downloadModel(
+        "https://example.com/model.safetensors",
+        "checkpoints",
+        "model.safetensors",
+        undefined,
+        false, // dispatchToManager=false → local writer
+      ),
+    ).rejects.toBeInstanceOf(ModelError);
+    expect(installModelViaManagerMock).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("resolveDownloadTarget (shared destination resolver)", () => {
   const URL = "https://example.com/path/big.safetensors";
 
