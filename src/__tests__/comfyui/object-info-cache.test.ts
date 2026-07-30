@@ -82,4 +82,25 @@ describe("getObjectInfo memoization", () => {
     await expect(getObjectInfo()).resolves.toEqual({ KSampler: {} });
     expect(getNodeDefs).toHaveBeenCalledTimes(2);
   });
+
+  it("does NOT commit a fetch that was in flight when a reset invalidated it (racy invalidation)", async () => {
+    // A fetch (returning the PRE-restart schema) is in flight when a restart
+    // fires resetObjectInfoCache(). Its late resolution must NOT repopulate the
+    // cache — a subsequent call must refetch and see the POST-restart schema.
+    let releaseOld!: (v: unknown) => void;
+    getNodeDefs.mockReturnValueOnce(new Promise((r) => (releaseOld = r)));
+    const inflight = getObjectInfo(); // starts under epoch N
+
+    // Restart happens mid-fetch.
+    resetObjectInfoCache(); // epoch N+1, abandons the in-flight slot
+
+    // The old fetch now resolves with the stale schema.
+    releaseOld({ OldNode: {} });
+    await expect(inflight).resolves.toEqual({ OldNode: {} }); // awaiter still served
+
+    // The stale result must NOT have poisoned the cache: the next call refetches.
+    getNodeDefs.mockResolvedValueOnce({ NewNode: {} });
+    await expect(getObjectInfo()).resolves.toEqual({ NewNode: {} });
+    expect(getNodeDefs).toHaveBeenCalledTimes(2);
+  });
 });

@@ -47,7 +47,12 @@ import { setComfyuiSecret, setAgentSecret, isAllowedAgentSecretKey } from "../se
 import { flattenUiWorkflow } from "../services/flatten-workflow.js";
 import { getNsfwConsent, setNsfwConsent } from "../services/panel-settings.js";
 import { QueueMonitor } from "../services/queue-monitor.js";
-import { getObjectInfo, backfillObjectInfo } from "../comfyui/client.js";
+import {
+  getObjectInfo,
+  backfillObjectInfo,
+  resetClient,
+  resetObjectInfoCache,
+} from "../comfyui/client.js";
 import { convertUiToApi, collectNodeTypes } from "../services/workflow-converter.js";
 import { sliceWorkflow } from "../services/workflow-slicer.js";
 import { validateA2UISpecServer } from "../services/a2ui-spec.js";
@@ -61,7 +66,7 @@ function isAffirmative(reply: unknown): boolean {
   );
 }
 
-type ToolResult = {
+export type ToolResult = {
   content: Array<
     | { type: "text"; text: string }
     | { type: "image"; data: string; mimeType: string }
@@ -80,6 +85,26 @@ function ok(value: unknown): ToolResult {
 function fail(err: unknown): ToolResult {
   const msg = err instanceof Error ? err.message : String(err);
   return { content: [{ type: "text", text: `Error: ${msg}` }], isError: true };
+}
+
+/**
+ * True only when a comfy_reboot ToolResult carries a CONFIRMED `rebooting:true`
+ * from the panel. `ctx.call` wraps the panel reply via ok() as JSON text and never
+ * throws, so a busy-guard/forbidden/no-endpoint refusal comes back as a normal
+ * ToolResult with `rebooting:false`. Gate cache invalidation on this so a refused
+ * restart never closes the shared client mid-generation. Defensive: any error
+ * flag or unparseable/absent field is treated as NOT confirmed.
+ */
+export function rebootConfirmed(res: ToolResult): boolean {
+  try {
+    if (res?.isError) return false;
+    const text = res?.content?.find((c) => c.type === "text")?.text;
+    if (typeof text !== "string") return false;
+    const parsed = JSON.parse(text) as { rebooting?: unknown };
+    return parsed?.rebooting === true;
+  } catch {
+    return false;
+  }
 }
 
 const slotRef = z.union([z.string(), z.number().int().min(0)]);
@@ -2048,7 +2073,25 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         ) {
           return ok("Cancelled — ComfyUI was not restarted.");
         }
-        return ctx.call({ cmd: "comfy_reboot", force: force === true }, 15000);
+        const res = await ctx.call({ cmd: "comfy_reboot", force: force === true }, 15000);
+        // A panel/Manager reboot restarts ComfyUI out-of-band from the MCP
+        // process-control path, so the orchestrator's WebSocket client and its
+        // memoized /object_info survive the restart and go stale: get_node_info
+        // then returns pre-restart schemas, model dropdowns, and required/optional
+        // placement (#353/#378/#394), and newly installed nodes stay invisible
+        // (#357). The reboot is the triggering event — drop both caches so the
+        // next call refetches against the fresh server.
+        //
+        // BUT `ctx.call` returns a ToolResult (it does NOT throw), and the panel
+        // replies `rebooting:false` when it REFUSES (busy guard, Manager forbids,
+        // no endpoint). Only invalidate on a CONFIRMED `rebooting:true` — resetting
+        // on a refusal would close the shared client mid-generation (codex WS-3
+        // finding #2).
+        if (rebootConfirmed(res)) {
+          resetClient();
+          resetObjectInfoCache();
+        }
+        return res;
       },
     ),
     def(

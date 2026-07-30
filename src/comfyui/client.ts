@@ -137,47 +137,69 @@ export async function getSystemStats(): Promise<SystemStats> {
 // Perf gap flagged by josephoibrahim/comfy-cozy (re-validate ~7 s → ~0.5 s).
 let objectInfoCache: ObjectInfo | null = null;
 let objectInfoInflight: Promise<ObjectInfo> | null = null;
+// Invalidation epoch. resetObjectInfoCache() bumps it; a fetch that STARTED under
+// an older epoch must not commit its result to the cache — otherwise a request
+// in flight when a restart invalidates the cache can resolve afterward and
+// repopulate it with the PRE-restart schema, and future callers would await that
+// stale value (codex WS-3 finding #1).
+let objectInfoEpoch = 0;
 
 export async function getObjectInfo(): Promise<ObjectInfo> {
   if (isCloudMode()) return cloudClient.getObjectInfo();
   if (objectInfoCache) return objectInfoCache;
   if (objectInfoInflight) return objectInfoInflight;
 
-  objectInfoInflight = (async () => {
+  const startEpoch = objectInfoEpoch;
+  // Commit to the shared cache ONLY if no invalidation happened while we were
+  // fetching. Awaiters of this promise still get the value (they asked before
+  // the reset), but the cache is not poisoned for callers that arrive after.
+  const commit = (info: ObjectInfo): ObjectInfo => {
+    if (objectInfoEpoch === startEpoch) objectInfoCache = info;
+    return info;
+  };
+
+  const inflight = (async () => {
+    // Capture the client this request runs on so the catch only resets THIS one.
+    const startClient = getClient();
     try {
-      const info = (await getClient().getNodeDefs()) as unknown as ObjectInfo;
-      objectInfoCache = info;
-      return info;
+      return commit((await startClient.getNodeDefs()) as unknown as ObjectInfo);
     } catch (err) {
       // A managed restart/reboot leaves the cached client bound to a socket that
       // was torn down, so the first call after it surfaces a bare "fetch failed"
       // (issue #376). Drop the stale client and retry once against a fresh one
       // before giving up — this is exactly the reconnect the caller expects.
+      // Only reset if OUR client is still current: a concurrent reset may have
+      // already installed a newer client we must not close.
       logger.warn("getObjectInfo failed; resetting client and retrying once", {
         error: err instanceof Error ? err.message : String(err),
       });
-      resetClient();
-      const info = (await getClient().getNodeDefs()) as unknown as ObjectInfo;
-      objectInfoCache = info;
-      return info;
+      resetClientIfCurrent(startClient);
+      return commit((await getClient().getNodeDefs()) as unknown as ObjectInfo);
     }
   })();
+  objectInfoInflight = inflight;
 
   try {
-    return await objectInfoInflight;
+    return await inflight;
   } finally {
-    objectInfoInflight = null;
+    // Only clear the shared slot if it's still ours — a concurrent reset may have
+    // already abandoned it and a newer fetch may have taken the slot.
+    if (objectInfoInflight === inflight) objectInfoInflight = null;
   }
 }
 
 /**
  * Drop the memoized /object_info so the next call refetches. Called after
  * ComfyUI restarts (node packs may have changed) and available for tools
- * that mutate the node set mid-session.
+ * that mutate the node set mid-session. Bumps the invalidation epoch and
+ * abandons any in-flight fetch so a fetch started before the reset can never
+ * commit a pre-restart result to the cache.
  */
 export function resetObjectInfoCache(): void {
   objectInfoCache = null;
-  logger.debug("object_info cache reset");
+  objectInfoInflight = null;
+  objectInfoEpoch++;
+  logger.debug("object_info cache reset", { epoch: objectInfoEpoch });
 }
 
 /**
@@ -361,6 +383,20 @@ export function resetClient(): void {
   }
 }
 
+/**
+ * Reset the singleton ONLY if it is still the client the caller was using. A
+ * failing request captures its client at start and passes it here in its catch;
+ * if a concurrent reset (resetObjectInfoCache abandons the in-flight slot) already
+ * spun up a NEW client in the meantime, we must not close that newer client + its
+ * fresh WebSocket out from under whoever created it (codex WS-3 round-2 finding).
+ * Returns true if it actually reset. A null argument never resets.
+ */
+export function resetClientIfCurrent(client: Client | null): boolean {
+  if (!client || clientInstance !== client) return false;
+  resetClient();
+  return true;
+}
+
 export function getComfyUIPath(): string | undefined {
   if (isCloudMode()) return cloudClient.getComfyUIPath();
   return config.comfyuiPath;
@@ -368,9 +404,34 @@ export function getComfyUIPath(): string | undefined {
 
 export async function getLogs(): Promise<string[]> {
   if (isCloudMode()) return cloudClient.getLogs();
-  const client = getClient();
-  const res = await client.fetchApi("/internal/logs");
-  const text = await res.text();
+
+  // A managed/panel restart or Manager reboot leaves the cached client bound to
+  // a socket that was torn down, so the first /internal/logs call after it
+  // surfaces a bare "fetch failed" (issue #399) — regardless of any keyword the
+  // caller passed, since filtering happens after this fetch. Mirror the
+  // getObjectInfo reset-and-retry: drop the stale client and retry once against
+  // a fresh one before giving up, and surface the underlying error if it still
+  // fails so callers see more than "fetch failed".
+  let text: string;
+  // Capture the client this request runs on so the catch only resets THIS one
+  // (not a newer client a concurrent reset may have installed).
+  const startClient = getClient();
+  try {
+    text = await startClient.fetchApi("/internal/logs").then((r) => r.text());
+  } catch (err) {
+    logger.warn("getLogs failed; resetting client and retrying once", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    resetClientIfCurrent(startClient);
+    try {
+      text = await getClient().fetchApi("/internal/logs").then((r) => r.text());
+    } catch (err2) {
+      const detail = err2 instanceof Error ? err2.message : String(err2);
+      throw new ConnectionError(
+        `Failed to fetch ComfyUI logs after reconnect retry: ${detail}`,
+      );
+    }
+  }
 
   // ComfyUI returns logs as a JSON-encoded string with \n separators,
   // or as raw text depending on version. Handle both.

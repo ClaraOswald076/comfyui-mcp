@@ -7,7 +7,7 @@ import {
   TEMPLATE_NAMES,
   type ModifyOperation,
 } from "../services/workflow-composer.js";
-import { getObjectInfo } from "../comfyui/client.js";
+import { getObjectInfo, backfillObjectInfo } from "../comfyui/client.js";
 import { errorToToolResult, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 
@@ -167,12 +167,26 @@ export function registerWorkflowComposeTools(server: McpServer): void {
     async ({ node_type, verbose }) => {
       try {
         logger.info("Getting node info", { filter: node_type, verbose });
-        const info = await getObjectInfo();
+        let info = await getObjectInfo();
 
         let entries = Object.entries(info);
         if (node_type) {
           const lower = node_type.toLowerCase();
           entries = entries.filter(([name]) => name.toLowerCase().includes(lower));
+
+          // Some nodes register individually (`/object_info/<Type>` returns a
+          // schema) but are absent from the bulk `/object_info` payload — seen
+          // with controlnet_aux's DWPreprocessor and with V3-API packs like
+          // comfyui-qwenmultiangle whose nodes the live canvas and panel
+          // recognize but the bulk query omits (#357). When the substring
+          // filter finds nothing, try backfilling the exact type by its own
+          // endpoint before reporting it missing.
+          if (entries.length === 0) {
+            info = await backfillObjectInfo(info, [node_type]);
+            entries = Object.entries(info).filter(([name]) =>
+              name.toLowerCase().includes(lower),
+            );
+          }
         }
 
         if (entries.length === 0) {
