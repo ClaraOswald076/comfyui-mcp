@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.19] - 2026-07-30
+
+### Fixed
+- **`validate_workflow` no longer contradicts itself or hides authoritative combo errors (#342, #505).** The renderer partitioned issues on `!i.kind`, which stripped the authoritative validator errors (`missing_node_type`, `missing_model`, `value_not_in_list` — all carry a `kind`) from the Errors section, so the tool printed "No issues found — ready to execute" while the header still counted them. Now only graph-health findings are tagged `health:true` and the render partitions on `!i.health`, so combo/model errors stay surfaced and the "ready to execute" verdict is derived from the actual validity — the header and body can never disagree. (#507)
+
 ## [0.48.18] - 2026-07-30
 
 ### Fixed
