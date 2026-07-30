@@ -8,6 +8,7 @@ import { comfyuiFetch } from "../comfyui/fetch.js";
 import { ProcessControlError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { findComfyuiPython } from "./env-capabilities.js";
+import { liveRootFromArgv, resolveEffectiveComfyUIBase } from "./workspace-env.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -566,6 +567,31 @@ function spawnFromProcessInfo(info: ProcessInfo): ChildProcess | null {
  * argv (main.py + flags) as its args. When argv[0] is already an interpreter
  * (e.g. a supervised child we spawned ourselves), we spawn it verbatim.
  */
+/**
+ * The ABSOLUTE ComfyUI dir (the one directly holding `main.py`) to anchor a
+ * RELATIVE sys.argv[0] against, resolved LIVE-FIRST and consistently with the
+ * canonical base download_model / the environment services already use (#476,
+ * #426). Order, most-trustworthy first:
+ *   1. the LIVE running server's own argv-derived install root (absolute argv[0]);
+ *   2. the canonical effective base — COMFYUI_PATH or the saved default workspace
+ *      — i.e. the exact absolute install download_model wrote into in the same
+ *      session (resolveEffectiveComfyUIBase);
+ *   3. config.comfyuiPath, when absolute, as a last resort.
+ * Returns undefined only when none is absolute; callers then fall back to the raw
+ * (possibly relative) argv and the refuse-safe preflight refuses a genuinely
+ * unresolvable install.
+ */
+function resolveScriptAnchor(argv: string[]): string | undefined {
+  const live = liveRootFromArgv(argv);
+  if (live && isAbsolute(live)) return live;
+  const base = resolveEffectiveComfyUIBase();
+  if (base && isAbsolute(base)) return base;
+  if (config.comfyuiPath && isAbsolute(config.comfyuiPath)) {
+    return config.comfyuiPath;
+  }
+  return undefined;
+}
+
 function resolveLaunchCommand(
   info: ProcessInfo,
 ): { exe: string; args: string[] } | null {
@@ -595,10 +621,21 @@ function resolveLaunchCommand(
     const isWindowsAbsolute =
       /^[a-zA-Z]:[\\/]/.test(firstUnquoted) || /^\\\\/.test(firstUnquoted);
     const scriptBasename = firstUnquoted.split(/[\\/]/).pop() || firstUnquoted;
+    // LIVE-FIRST anchor for a RELATIVE argv[0]: resolve the canonical ABSOLUTE
+    // ComfyUI dir the same way download_model / the env services do, so restart
+    // never refuses on a stale/relative COMFYUI_PATH while the reachable install
+    // lives elsewhere (#476, #426). config.comfyuiPath is only ONE input to that
+    // canonical base (which also honors the saved default workspace), so anchor
+    // to the base — not to config.comfyuiPath directly. When no absolute anchor
+    // exists we keep the raw (possibly relative) script and let assessRelaunch's
+    // refuse-safe preflight catch a truly unresolvable install.
+    const anchor = resolveScriptAnchor(info.argv);
     const script =
-      isAbsolute(firstUnquoted) || isWindowsAbsolute || !config.comfyuiPath
+      isAbsolute(firstUnquoted) || isWindowsAbsolute
         ? firstUnquoted
-        : join(config.comfyuiPath, scriptBasename);
+        : anchor
+          ? join(anchor, scriptBasename)
+          : firstUnquoted;
     return { exe: python, args: [script, ...rest] };
   }
   return { exe: first, args: rest };
@@ -676,13 +713,26 @@ function assessRelaunch(info: ProcessInfo): { ok: boolean; reason?: string } {
     };
   }
   const script = cmd.args[0];
-  if (script && /\.pyw?$/i.test(script) && looksLikePath(script) && !fileExists(script)) {
-    return {
-      ok: false,
-      reason:
-        `Resolved ComfyUI script does not exist on disk: ${script} — ` +
-        "COMFYUI_PATH may point at a stale/old install that has no runnable server.",
-    };
+  if (script && /\.pyw?$/i.test(script)) {
+    // We could only VALIDATE the script when it was resolved to an ABSOLUTE path
+    // (either argv[0] was absolute, or resolveScriptAnchor anchored a relative
+    // argv[0] to a canonical absolute install). A script still RELATIVE here means
+    // the live-first anchor produced nothing absolute — i.e. a truly unresolvable
+    // install (stale/relative COMFYUI_PATH, no saved workspace, no argv root). We
+    // cannot confirm it exists, so REFUSE rather than kill a reachable server we
+    // can't relaunch (#476/#426 refuse-safe; also covers a bare `main.py`).
+    const scriptIsAbsolute =
+      isAbsolute(script) ||
+      /^[a-zA-Z]:[\\/]/.test(script) ||
+      /^\\\\/.test(script);
+    if (!scriptIsAbsolute || !fileExists(script)) {
+      return {
+        ok: false,
+        reason:
+          `Resolved ComfyUI script does not exist on disk: ${script} — ` +
+          "COMFYUI_PATH may point at a stale/old install that has no runnable server.",
+      };
+    }
   }
   return { ok: true };
 }
