@@ -19,7 +19,7 @@ function textEnvelope(envelope: unknown) {
   };
 }
 
-async function call(args: string[], options: { workspace?: string; where?: "local" | "cloud"; timeoutMs?: number; cwd?: string }) {
+async function call(args: string[], options: { workspace?: string; where?: "local" | "cloud"; timeoutMs?: number; idleTimeoutMs?: number; cwd?: string }) {
   return textEnvelope(await runComfyCli(args, options));
 }
 
@@ -252,6 +252,13 @@ export function registerComfyCliTools(server: McpServer): void {
           command.push("--model-names", args.modelNames.join(" "));
         }
         if (args.limit && args.action !== "show" && args.action !== "list-folders") command.push("--limit", String(args.limit));
+        // A download can legitimately run for many minutes. Gate it on an IDLE
+        // (liveness) timeout so a still-progressing download is not killed —
+        // downloader progress output resets the clock — while a truly stalled
+        // one is still terminated. Other actions keep the fast hard timeout.
+        if (args.action === "download") {
+          return await call(command, { workspace: args.workspace, where: args.where, idleTimeoutMs: 120_000 });
+        }
         return await call(command, { workspace: args.workspace, where: args.where, timeoutMs: 60_000 });
       } catch (error) {
         return errorToToolResult(error);
