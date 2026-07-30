@@ -267,6 +267,19 @@ async function streamUrlToFile(
   onResume?: ResumeReporter,
 ): Promise<void> {
   if (supportsCloudDownload(url)) {
+    // Cloud downloaders (S3/Azure) don't range-resume — they open a "w" stream
+    // and overwrite the target. If a partial exists, it's being discarded; surface
+    // that (#467) instead of silently restarting, mirroring the HTTP no-validator
+    // case (the cloud object carries no ETag/Last-Modified resume validator here).
+    if (resumable && resumeFromBytes > 0) {
+      logger.warn(
+        `Discarding a ${resumeFromBytes}-byte partial download and restarting from 0: cloud ` +
+          `downloads (S3/Azure) don't support byte-range resume, so the partial is overwritten — ` +
+          `re-downloading in full.`,
+        { url: logUrl, discardedBytes: resumeFromBytes },
+      );
+      onResume?.({ outcome: "declined:no-validator", discardedBytes: resumeFromBytes, discarded: true });
+    }
     await downloadCloudUrlToFile(url, targetPath, storageAuth);
     // #343 edge: the S3/Azure path bypasses the HTTP size gate below. The cloud
     // downloaders verify their own Content-Length (truncation), but a stream
@@ -597,13 +610,22 @@ async function streamUrlToFile(
     // fails, we write NO validator (a retry sees no sidecar → safe restart) and
     // report nothing (the discard didn't actually happen).
     await safeRm(validatorSidecar);
-    let truncated = true;
+    // If we can't truncate the stale partial, FAIL rather than fall through to the
+    // "w" open below: a partial-truncate failure that the later "w" open then
+    // silently fixed would perform the discard WITHOUT reporting it (#467). By
+    // throwing here we guarantee the discard is either reported (truncation
+    // succeeded) or the download errors (never a silent discard). The sidecar was
+    // already removed, so a retry sees no validator → safe restart (#343).
     try {
       await writeFile(targetPath, "");
-    } catch {
-      truncated = false;
+    } catch (err) {
+      throw new ModelError(
+        `Download restart failed: could not truncate the stale ${resumeFromBytes}-byte partial to ` +
+          `re-download it. Removed its validator; retry (a fresh attempt restarts from 0).`,
+        { url: logUrl, cause: err instanceof Error ? err.message : String(err) },
+      );
     }
-    if (truncated && resumeFromBytes > 0 && requestedResume) {
+    if (resumeFromBytes > 0 && requestedResume) {
       // Asked to resume (had a validator, sent Range+If-Range) but got a full 200
       // — the upstream changed OR the host doesn't support range resume. The
       // partial is now truncated and the file is being re-downloaded in full.
@@ -614,7 +636,7 @@ async function streamUrlToFile(
         { url: logUrl, discardedBytes: resumeFromBytes },
       );
       onResume?.({ outcome: "declined:full-response", discardedBytes: resumeFromBytes, discarded: true });
-    } else if (truncated && resumeFromBytes > 0 && resumeDeclinedNoValidator) {
+    } else if (resumeFromBytes > 0 && resumeDeclinedNoValidator) {
       // A partial existed but no sidecar validator did, so we never even sent a
       // Range — a safe resume couldn't be verified (common on HF's Xet/CAS CDN,
       // which omits ETag/Last-Modified on the body). Truncated + re-download full.
@@ -628,14 +650,12 @@ async function streamUrlToFile(
       );
       onResume?.({ outcome: "declined:no-validator", discardedBytes: resumeFromBytes, discarded: true });
     }
-    // Persist the new validator ONLY once the file is confirmed truncated, so it
+    // The file is now confirmed truncated (we threw otherwise), so a new validator
     // can never pair with a stale prefix (#343). Prefer the final response's
     // validator; fall back to one captured off the redirect chain (HF Xet: the CAS
     // 200 has none, but the resolve 302 carried X-Linked-Etag).
-    if (truncated) {
-      const validator = extractValidator(res) || redirectValidator;
-      if (validator) await writeValidatorSidecar(validatorSidecar, validator);
-    }
+    const validator = extractValidator(res) || redirectValidator;
+    if (validator) await writeValidatorSidecar(validatorSidecar, validator);
   } else if (appendMode) {
     // A resume was actually taken (validated 206 append). Record it so
     // download_status can report the partial was reused, not discarded (#467).

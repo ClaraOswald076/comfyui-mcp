@@ -428,6 +428,21 @@ describe("downloadModel cache", () => {
     await expect(readFile(target, "utf-8")).resolves.toBe("FRESHFULLBODY");
   });
 
+  it("FAILS the download (never silently discards) when the stale partial can't be truncated on restart (#467/#343)", async () => {
+    await fsPromises.mkdir(cacheDir, { recursive: true });
+    const url = "https://example.com/models/untruncatable.safetensors";
+    const { partial } = await cachePaths(url);
+    // Make the partial path a DIRECTORY so writeFile(targetPath, "") (the explicit
+    // restart truncation) fails — we must throw, not fall through to a silent "w".
+    await fsPromises.mkdir(partial, { recursive: true });
+
+    fetchMock.mockResolvedValueOnce(okResponse("FRESHFULLBODY"));
+
+    await expect(
+      downloadModel(url, "checkpoints", "untruncatable-out.safetensors"),
+    ).rejects.toThrow(/restart failed|could not truncate/i);
+  });
+
   it("SURFACES a validator-less declined resume instead of silently discarding the partial (#467)", async () => {
     await fsPromises.mkdir(cacheDir, { recursive: true });
     const url = "https://example.com/models/silentdiscard.safetensors";
