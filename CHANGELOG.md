@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.15] - 2026-07-30
+
+### Fixed
+- **`restart_comfyui` relaunches a Desktop-managed ComfyUI via the Manager reboot endpoint instead of killing the Electron shell (#400).** A local Comfy **Desktop** instance was treated like a self-spawned one — killed and re-spawned via `Comfy Desktop.exe`, which never reliably brought the `:8188` Python backend back (`stopped:true, started:false`). `restartComfyUI` now branches on `isDesktopApp` before any kill: a Desktop-managed instance routes through `POST /v2/manager/reboot` and is never killed; if the reboot can't be fired (403/no endpoint) it refuses and leaves the server running. Self-spawned Python installs keep the kill+relaunch path. (#477)
+- **`restart_comfyui` uses live-first script resolution instead of refusing on a stale relative `COMFYUI_PATH` (#476, #426).** After `download_model` wrote successfully into the canonical absolute live install, restart could resolve the server script as a stale relative path (`ComfyUI/main.py`) and refuse — inconsistent with the path download just used. A new `resolveScriptAnchor` resolves live-first (`liveRootFromArgv` → saved-default workspace → configured path, first absolute wins) before anchoring a relative launcher script; the refuse-safe behavior is preserved for a genuinely unresolvable/missing install, and the #400 Desktop branch is untouched. (#479)
+
 ## [0.48.14] - 2026-07-30
 
 ### Fixed
