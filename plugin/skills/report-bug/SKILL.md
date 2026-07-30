@@ -128,12 +128,12 @@ Then file it (no need to ask):
 - **Default path (everyone):** POST the report to our intake Worker — no GitHub
   account needed:
 
-  The Worker files the issue **synchronously** and returns the link inline
-  (`{ ok, url, number, deduped?, job_id }`); the `job_id` + `/status/<job_id>`
-  poll is only a fallback for the rare case the submit didn't carry a `url`.
-  This shell snippet is the **manual / non-Claude fallback** and **requires
-  `jq`** for safe JSON parsing (Claude agents should use the `report_issue`
-  tool, which already implements this correctly).
+  The Worker files the issue **synchronously**: on success the POST response
+  ALWAYS carries the issue `url` inline (`{ ok:true, url, number, deduped?,
+  job_id }`), so the manual path is **one POST — no polling needed**. This shell
+  snippet is the **manual / non-Claude fallback** and **requires `jq`** for safe
+  JSON parsing (Claude agents should use the `report_issue` tool, which already
+  implements this correctly).
 
   ```bash
   # URL is baked in; override with $COMFYUI_MCP_ISSUE_WORKER_URL if set. The
@@ -143,64 +143,39 @@ Then file it (no need to ask):
   # token is server-side in the Worker). Override with $COMFYUI_MCP_ISSUE_CLIENT_KEY.
   CLIENT_KEY="${COMFYUI_MCP_ISSUE_CLIENT_KEY:-9b6f2abf09b64006dc6e033f59d2dc8112e34d8347a923c2}"
 
-  # A url counts as "filed" only if it's a real GitHub issue URL.
-  is_issue_url() { printf '%s' "$1" | grep -Eq '^https://github\.com/[^/]+/[^/]+/issues/[0-9]+$'; }
-
-  # 1) Submit. Write the JSON to a temp file first (the body has newlines/quotes).
+  # 1) Submit — ONE synchronous POST. Write the JSON to a temp file first (the
+  # body has newlines/quotes). --max-time bounds the request so a hung
+  # connection can't wedge us.
   # body: { "repo": "comfyui-mcp" | "comfyui-mcp-panel", "title", "body", "labels": ["via-panel"] }
-  # --max-time bounds the whole request so a hung connection can't wedge us.
   URL=""
   if RESP=$(curl -fsS --max-time 15 -X POST "$WORKER_URL" \
       -H "Content-Type: application/json" -H "X-Client-Key: $CLIENT_KEY" \
       --data @"$BODY_JSON_FILE"); then
-    # Parse with jq (NOT sed) — a regex can be fooled by an adversarial substring
-    # like `garbage "url":"..."`. jq failing (non-zero → not valid JSON) is
-    # terminal → fall through to the fallback with URL empty.
-    URL=$(printf '%s' "$RESP" | jq -r '.url // empty' 2>/dev/null || true)
-    # 2) Only poll if the submit lacked a url AND we actually got a job_id.
-    #    Mirrors the TS: keep polling ONLY while the Worker reports a well-formed
-    #    queued/pending. ANY hard failure (curl transport error/timeout/non-2xx,
-    #    invalid JSON, or a non-queued/pending status) BREAKs to the fallback.
-    if [ -z "$URL" ]; then
-      JOB_ID=$(printf '%s' "$RESP" | jq -r '.job_id // empty' 2>/dev/null || true)
-      if [ -n "$JOB_ID" ]; then
-        for i in 1 2 3 4 5; do
-          sleep 1
-          # Hard transport failure → stop and fall back (do NOT keep polling).
-          STAT=$(curl -fsS --max-time 10 "$WORKER_URL/status/$JOB_ID") || break
-          # Invalid JSON → terminal, break to fallback.
-          echo "$STAT" | jq -e . >/dev/null 2>&1 || break
-          # A real url → done, filed.
-          URL=$(printf '%s' "$STAT" | jq -r '.url // empty')
-          [ -n "$URL" ] && break
-          # No url yet: keep polling ONLY for a well-formed queued/pending.
-          # ANY other value — error, unknown, done-without-url — is terminal.
-          STATUS=$(printf '%s' "$STAT" | jq -r '.status // empty')
-          [ "$STATUS" = "queued" ] || [ "$STATUS" = "pending" ] || break
-        done
-      fi
-    fi
+    # Validate entirely inside jq (no grep — a piped grep can be bypassed by a
+    # multi-line body). Require ok==true AND a url matching the exact GitHub
+    # issue shape. Invalid JSON → jq exits non-zero → URL stays empty → fallback.
+    URL=$(printf '%s' "$RESP" | jq -r \
+      'select(.ok==true) | .url // empty | select(test("^https://github.com/[^/]+/[^/]+/issues/[0-9]+$"))' \
+      2>/dev/null || true)
   fi
-  # Only a real GitHub issue URL counts as filed; anything else → fallback.
-  is_issue_url "$URL" || URL=""
 
-  # 3) EXACTLY ONE outcome. A real issue link → print it. ANYTHING else (submit
-  # failure, poll failure/timeout, done-with-error, or exhausted with no url) →
-  # fall back to the report_issue prefilled URL. NEVER claim accepted/pending
-  # without a real link.
+  # 2) EXACTLY ONE outcome. A real issue url → print it. ANYTHING else —
+  # non-2xx / timeout / unreachable, ok!=true, status:"error", missing/invalid
+  # url, or invalid JSON — → prefilled report_issue fallback. Never "accepted".
   if [ -n "$URL" ]; then
     echo "filed: $URL"
   else
     echo "worker did not return an issue link — fall back to the report_issue tool for a prefilled GitHub link"
   fi
   ```
-  Mirror this in behavior: a real `url` (inline fast-path OR polled) is the only
-  "filed" outcome. Any submit failure (`401`/non-2xx/timeout/unreachable), any
-  poll failure, a `status:"error"`, or exhausting the poll with no `url` → fall
-  back to `report_issue` for a prefilled link the user submits in one click; do
-  **not** poll with an empty `JOB_ID` and do **not** tell the user it was
-  accepted without a real issue link. **Surface the link only if they want it** —
-  the filing is autonomous, so a one-line "filed #123" is enough (Step 7).
+  A real `url` from the POST is the only "filed" outcome. Any submit failure
+  (`401`/non-2xx/timeout/unreachable), `ok` not `true`, a `status:"error"` body,
+  a missing/invalid url, or invalid JSON → fall back to `report_issue` for a
+  prefilled link the user submits in one click; never tell the user it was
+  accepted without a real issue link. (A `GET /status/<job_id>` endpoint exists
+  to optionally re-fetch the link later, but it is NOT needed to file — don't
+  poll.) **Surface the link only if they want it** — the filing is autonomous,
+  so a one-line "filed #123" is enough (Step 7).
 - **Fallback** (no `gh`, no Worker URL): use the `report_issue` tool → a prefilled
   GitHub issue link the user can submit in one click.
 
