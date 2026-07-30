@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.14] - 2026-07-30
+
+### Fixed
+- **`missing_node_types` is recomputed after a custom-node install (#444).** The orchestrator memoizes `/object_info`; `validate_workflow`/`diagnose_run` derive the top-level `missing_node_types` from that snapshot. The cache was invalidated on reboot (the #235/#247/#352/#364 cluster) but not on a node install, so a just-installed type stayed listed as missing until a later reboot. A single `withObjectInfoInvalidation()` choke point now wraps `install`/`update`/`reinstall`/`fix` custom-node ops and resets the object-info cache on success (covering cm-cli, Manager HTTP, and git-clone fallback paths). (#471)
+- **`panel_run` tolerates a mid-command panel reconnect instead of hard-failing (#450).** The UI-bridge socket `close` handler rejected every in-flight command with a generic `panel tab disconnected mid-command` — a false failure for an already-queued `graph_run`, and one that invited a blind retry / double render. It now classifies the disconnect: idempotent reads are parked with a bounded, deadline-clamped grace and re-dispatched only if the tab re-hellos (transient reconnect resumes cleanly); every mutating command rejects with an actionable `OUTCOME UNKNOWN` message and is never auto-retried (at-most-once). (#472)
+
 ## [0.48.13] - 2026-07-30
 
 ### MCP
