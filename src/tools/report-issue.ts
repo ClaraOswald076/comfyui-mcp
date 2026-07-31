@@ -1,11 +1,14 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { detectInstallMode } from "../services/self-update.js";
 
-// Issue reporting. For OUR repos (comfyui-mcp / comfyui-mcp-panel) this now
-// *files* the issue through the async intake Worker — submit → get a job_id →
-// poll /status/<job_id> for the created issue link. For third-party repos, or
-// when the Worker is unreachable, it falls back to a PREFILLED GitHub "new
-// issue" URL the user can review and submit in one click (no auth, no network).
+// Issue reporting. For OUR repos (comfyui-mcp / comfyui-mcp-panel) this FILES the
+// issue through the async AI-triage Worker: submit (with the reporter's versions)
+// → get an instant version-ack + job_id → poll /status/<job_id> until the triage
+// agent CLOSEs the job, then surface its result (a new issue, a dedup, a reopen,
+// or an "already fixed — upgrade" answer with the fixing PR + version). For
+// third-party repos, or when the Worker is unreachable, it falls back to a
+// PREFILLED GitHub "new issue" URL the user can review and submit in one click.
 
 const DEFAULT_REPO = "artokun/comfyui-mcp";
 
@@ -44,18 +47,69 @@ export function isOurRepo(repo: string): boolean {
   return owner?.toLowerCase() === OUR_OWNER && OUR_REPO_NAMES.has(name?.toLowerCase());
 }
 
-export interface WorkerFileResult {
-  status: "done" | "queued" | "error";
+/** Reporter's installed versions, sent so the worker can version-match. */
+export interface ReporterVersions {
+  mcp?: string;
+  panel?: string;
+}
+
+/** The instant, mechanical version-ack the worker returns on submit. */
+export interface TriageAck {
+  job_id?: string;
+  versions?: unknown; // { mcp: {reporter,latest,up_to_date}, panel: {...} }
+  up_to_date?: boolean | null;
+  upgrade_hint?: string;
+}
+
+/** The triage agent's terminal result (from the CLOSED job payload). */
+export interface TriageResult {
   url?: string;
   number?: number;
   deduped?: boolean;
-  job_id?: string;
-  error?: string;
+  classification?: string;
+  action_taken?: string;
+  fixed_in_version?: string | null;
+  fix_pr_url?: string | null;
+  recommend_upgrade?: boolean;
+  agent_message?: string;
+  possible_duplicate?: boolean;
 }
 
-// Submit to the async intake Worker and poll /status/<job_id> a few times for
-// the created issue link. Injectable fetch/sleep for testing. Throws on network
-// failure or non-OK submit so the caller can fall back to a prefilled URL.
+/**
+ * Outcome of submitAndPoll:
+ *  - "closed": the triage agent finished — full result (issue link or upgrade
+ *    advice) + the version-ack.
+ *  - "unfiled": the job reached a TERMINAL state without producing an issue
+ *    (the worker's own triage AND its never-lose fallback both gave up). Nothing
+ *    was filed, so the caller SHOULD prefill a URL as the last resort — there is
+ *    no double-file risk.
+ *  - "pending": submit succeeded (we have the ack + a job_id) but the triage was
+ *    still running when the poll budget ran out. The worker WILL finish and
+ *    file/dedup autonomously, so the caller must NOT also prefill (that would
+ *    double-file) — it surfaces the ack + "still triaging".
+ * A SUBMIT failure (worker unreachable / non-OK) throws instead, so the caller
+ * falls back to a prefilled URL (there too, the worker never took the report).
+ */
+export type SubmitOutcome =
+  | { kind: "closed"; ack: TriageAck; result: TriageResult }
+  | { kind: "unfiled"; ack: TriageAck }
+  | { kind: "pending"; ack: TriageAck; job_id: string };
+
+interface StatusFrame {
+  state?: string; // PENDING | INVESTIGATING | CLOSED
+  status?: string; // legacy: queued | done | error
+  url?: string;
+  number?: number;
+  error?: string;
+  payload?: TriageResult & { issue?: { number?: number; url?: string; state?: string } };
+}
+
+/**
+ * Submit to the async AI-triage Worker and poll /status/<job_id> until the job
+ * CLOSEs or the budget runs out. Injectable fetch/sleep for testing.
+ * THROWS only on a submit failure (so the caller uses the prefilled fallback);
+ * a still-running job at the budget returns { kind: "pending" }.
+ */
 export async function submitAndPoll(opts: {
   workerUrl: string;
   clientKey: string;
@@ -63,21 +117,22 @@ export async function submitAndPoll(opts: {
   title: string;
   body: string;
   labels?: string[];
+  reporterVersions?: ReporterVersions;
   fetchImpl?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
   maxPolls?: number;
   pollDelayMs?: number;
   timeoutMs?: number;
-}): Promise<WorkerFileResult> {
+}): Promise<SubmitOutcome> {
   const doFetch = opts.fetchImpl ?? fetch;
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-  const maxPolls = opts.maxPolls ?? 5;
-  const pollDelayMs = opts.pollDelayMs ?? 1000;
-  const timeoutMs = opts.timeoutMs ?? 8000;
+  // AI triage runs ~30-120s; poll patiently but bounded. ~40 * 3s ≈ 2 min.
+  const maxPolls = opts.maxPolls ?? 40;
+  const pollDelayMs = opts.pollDelayMs ?? 3000;
+  const timeoutMs = opts.timeoutMs ?? 15000; // per-request cap (not the whole job)
 
   // Keep the abort active through BOTH the fetch AND the body parse — otherwise
-  // a hung `.json()` after headers arrive would never time out. The whole
-  // request+parse runs under one AbortController + a hard timeout.
+  // a hung `.json()` after headers arrive would never time out.
   const withTimeout = async <T>(fn: (signal: AbortSignal) => Promise<T>): Promise<T> => {
     const ac = new AbortController();
     const t = setTimeout(() => ac.abort(), timeoutMs);
@@ -88,50 +143,125 @@ export async function submitAndPoll(opts: {
     }
   };
 
-  const submit = await withTimeout(async (signal): Promise<WorkerFileResult> => {
+  const submit = await withTimeout(async (signal): Promise<StatusFrame & TriageAck> => {
     const r = await doFetch(opts.workerUrl, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-Client-Key": opts.clientKey },
-      body: JSON.stringify({ repo: opts.repoName, title: opts.title, body: opts.body, labels: opts.labels }),
+      headers: {
+        "Content-Type": "application/json",
+        "X-Client-Key": opts.clientKey,
+        // Opt into the async AI-triage contract. Absent this header the worker
+        // runs its legacy synchronous dumb-file path (old clients stay working).
+        "X-Triage-Async": "1",
+      },
+      body: JSON.stringify({
+        repo: opts.repoName,
+        title: opts.title,
+        body: opts.body,
+        labels: opts.labels,
+        reporter_versions: opts.reporterVersions ?? {},
+      }),
       signal,
     });
     if (!r.ok) throw new Error(`worker submit failed: HTTP ${r.status}`);
-    return (await r.json()) as WorkerFileResult;
+    return (await r.json()) as StatusFrame & TriageAck;
   });
 
-  // Common path: the Worker files synchronously and returns the link inline.
-  if (submit.url) return { ...submit, status: submit.status ?? "done" };
-  const jobId = submit.job_id;
-  if (!jobId) {
-    // No url AND no job to poll — nothing we can surface. Throw so the caller
-    // falls back to the prefilled link.
-    throw new Error("worker returned neither a url nor a job_id");
+  const ack: TriageAck = {
+    job_id: submit.job_id,
+    versions: submit.versions,
+    up_to_date: submit.up_to_date,
+    upgrade_hint: submit.upgrade_hint,
+  };
+
+  // A synchronous worker (legacy / very fast) may return the result inline.
+  if (isClosedFrame(submit)) {
+    const inline = frameToResult(submit);
+    return inline ? { kind: "closed", ack, result: inline } : { kind: "unfiled", ack };
   }
 
-  // Fallback poll (only if the submit somehow lacked a url): /status/<job_id>.
-  // A 200 "queued" is retried; ANY hard poll failure (transport error, timeout,
-  // non-OK HTTP, body-parse failure) or a "done" without a url, or exhausting
-  // the retries, THROWS — so the caller uses the prefilled-URL fallback rather
-  // than claiming success without a link.
+  const jobId = submit.job_id;
+  if (!jobId) throw new Error("worker returned neither a result nor a job_id");
+
   const base = opts.workerUrl.replace(/\/+$/, "");
   for (let i = 0; i < maxPolls; i++) {
     await sleep(pollDelayMs);
-    const parsed = await withTimeout(async (signal): Promise<WorkerFileResult> => {
-      const r = await doFetch(`${base}/status/${jobId}`, { signal });
-      if (!r.ok) throw new Error(`poll failed: HTTP ${r.status}`);
-      return (await r.json()) as WorkerFileResult;
-    });
-    if (parsed.status === "done" && parsed.url) return { ...parsed, job_id: jobId };
-    if (parsed.status === "error") throw new Error(`worker filing errored: ${parsed.error || "unknown"}`);
-    // else "queued" (or done-without-url) → keep polling
+    let parsed: StatusFrame;
+    try {
+      parsed = await withTimeout(async (signal): Promise<StatusFrame> => {
+        const r = await doFetch(`${base}/status/${jobId}`, {
+          signal,
+          headers: { "X-Client-Key": opts.clientKey },
+        });
+        if (!r.ok) throw new Error(`poll failed: HTTP ${r.status}`);
+        return (await r.json()) as StatusFrame;
+      });
+    } catch {
+      // A transient poll error does NOT mean the job failed — the worker keeps
+      // running. Keep polling; only a real terminal frame or the budget ends it.
+      continue;
+    }
+    if (isClosedFrame(parsed) || isTerminalError(parsed)) {
+      const result = frameToResult(parsed);
+      // Terminal WITH a usable issue/answer → closed; terminal WITHOUT one
+      // (unfiled_needs_manual / hard error) → the worker gave up filing, so the
+      // caller may safely prefill (nothing was written → no double-file).
+      return result ? { kind: "closed", ack, result } : { kind: "unfiled", ack };
+    }
+    // else PENDING / INVESTIGATING → keep polling
   }
-  throw new Error("worker filing did not complete before polling gave up");
+  // Still running at the budget: the worker will finish autonomously — do NOT
+  // prefill (that duplicates). Surface the ack + job id.
+  return { kind: "pending", ack, job_id: jobId };
+}
+
+/** A frame is TERMINAL (job finished) iff CLOSED, a legacy done, or a legacy
+ *  sync response that carries a url with no lifecycle field at all. */
+function isClosedFrame(frame: StatusFrame): boolean {
+  return (
+    frame.state === "CLOSED" ||
+    frame.status === "done" ||
+    (frame.state == null && frame.status == null && !!frame.url)
+  );
+}
+
+/** Flatten a terminal frame to a TriageResult, or null if it carries no usable
+ *  issue link / answer (→ the caller treats it as "unfiled"). */
+function frameToResult(frame: StatusFrame): TriageResult | null {
+  const p = frame.payload;
+  const issueUrl = p?.issue?.url ?? frame.url;
+  const issueNumber = p?.issue?.number ?? frame.number;
+  if (!issueUrl && !p?.agent_message) return null; // nothing useful to surface
+  return {
+    url: issueUrl,
+    number: issueNumber,
+    deduped: p?.deduped,
+    classification: p?.classification,
+    action_taken: p?.action_taken,
+    fixed_in_version: p?.fixed_in_version ?? null,
+    fix_pr_url: p?.fix_pr_url ?? null,
+    recommend_upgrade: p?.recommend_upgrade,
+    agent_message: p?.agent_message,
+    possible_duplicate: p?.possible_duplicate,
+  };
+}
+
+function isTerminalError(frame: StatusFrame): boolean {
+  return frame.status === "error" && !frame.url && !frame.payload;
+}
+
+/** The running comfyui-mcp version (best-effort; undefined if undetectable). */
+function detectMcpVersion(): string | undefined {
+  try {
+    return detectInstallMode().currentVersion ?? undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function registerReportIssueTools(server: McpServer): void {
   server.tool(
     "report_issue",
-    "File or link a GitHub issue for a bug/problem you hit (ComfyUI, a workflow, a model, custom nodes, or comfyui-mcp itself). For OUR repos (artokun/comfyui-mcp, artokun/comfyui-mcp-panel) it FILES the issue via the intake Worker and returns the created issue link (no end-user GitHub auth needed); if the Worker is unreachable it falls back to a prefilled GitHub 'new issue' URL. For third-party repos it returns a prefilled URL to SHARE with the user (it does not auto-file). Pass repo='owner/name' for third-party projects. The filing is autonomous — surface the resulting link to the user only if they want it.",
+    "File or triage a GitHub issue for a bug/problem you hit (ComfyUI, a workflow, a model, custom nodes, or comfyui-mcp/its panel). For OUR repos (artokun/comfyui-mcp, artokun/comfyui-mcp-panel) it sends the report to the AI triage worker, which searches existing OPEN and CLOSED issues, version-matches, and either files a new issue, adds context to an existing one, or — if the problem was already FIXED in a newer version than the user runs — answers with the fixing PR + fixed-in version and a recommendation to upgrade (no new issue). It returns that triage result plus an instant check of whether the user is on the latest versions. If the worker is unreachable it falls back to a prefilled GitHub 'new issue' URL. For third-party repos it returns a prefilled URL to SHARE (it does not auto-file). ALWAYS pass mcp_version and panel_version from the known environment (the env line in your context, e.g. 'mcp=… panel=…') so the worker can tell the user if simply upgrading fixes it — the single most common resolution. Surface the worker's agent_message / upgrade advice to the user.",
     {
       title: z.string().min(1).describe("Short, specific issue title."),
       body: z
@@ -145,6 +275,14 @@ export function registerReportIssueTools(server: McpServer): void {
         .optional()
         .describe("owner/repo (default 'artokun/comfyui-mcp'; use 'artokun/comfyui-mcp-panel' for the sidebar panel)."),
       labels: z.array(z.string()).optional().describe("Optional GitHub label names to prefill."),
+      mcp_version: z
+        .string()
+        .optional()
+        .describe("The running comfyui-mcp version (from the env line in your context). Auto-detected if omitted."),
+      panel_version: z
+        .string()
+        .optional()
+        .describe("The running comfyui-mcp-panel (sidebar) version, from the env line in your context, if known."),
       no_file: z
         .boolean()
         .optional()
@@ -165,45 +303,94 @@ export function registerReportIssueTools(server: McpServer): void {
           });
         }
 
-        // Our repo: file via the intake Worker (submit + poll for the link).
         const workerUrl = process.env.COMFYUI_MCP_ISSUE_WORKER_URL || DEFAULT_WORKER_URL;
         const clientKey = process.env.COMFYUI_MCP_ISSUE_CLIENT_KEY || DEFAULT_CLIENT_KEY;
         const timeoutEnv = Number(process.env.COMFYUI_MCP_ISSUE_TIMEOUT_MS);
         const timeoutMs = Number.isFinite(timeoutEnv) && timeoutEnv > 0 ? timeoutEnv : undefined;
+        const maxPollsEnv = Number(process.env.COMFYUI_MCP_ISSUE_MAX_POLLS);
+        const maxPolls = Number.isFinite(maxPollsEnv) && maxPollsEnv > 0 ? maxPollsEnv : undefined;
+        const pollMsEnv = Number(process.env.COMFYUI_MCP_ISSUE_POLL_MS);
+        const pollDelayMs = Number.isFinite(pollMsEnv) && pollMsEnv >= 0 ? pollMsEnv : undefined;
         const repoName = repo.split("/")[1];
+
+        const reporterVersions: ReporterVersions = {
+          mcp: args.mcp_version ?? detectMcpVersion(),
+          panel: args.panel_version ?? process.env.COMFYUI_MCP_PANEL_VERSION ?? undefined,
+        };
+
         try {
-          // submitAndPoll ONLY resolves with a done result carrying a real url;
-          // any failure (non-OK submit, transport/timeout, poll error/exhaustion)
-          // throws → we fall back to the prefilled link below.
-          const result = await submitAndPoll({
+          const outcome = await submitAndPoll({
             workerUrl,
             clientKey,
             repoName,
             title: args.title,
             body: args.body,
             labels: args.labels,
+            reporterVersions,
             timeoutMs,
+            maxPolls,
+            pollDelayMs,
           });
+
+          if (outcome.kind === "closed") {
+            const r = outcome.result;
+            return jsonResult({
+              filed: r.action_taken !== "advised_upgrade",
+              repo,
+              url: r.url,
+              number: r.number,
+              classification: r.classification,
+              action_taken: r.action_taken,
+              deduped: r.deduped,
+              fixed_in_version: r.fixed_in_version,
+              fix_pr_url: r.fix_pr_url,
+              recommend_upgrade: r.recommend_upgrade,
+              possible_duplicate: r.possible_duplicate,
+              versions: outcome.ack.versions,
+              up_to_date: outcome.ack.up_to_date,
+              upgrade_hint: outcome.ack.upgrade_hint,
+              // The one line to relay to the user.
+              agent_message: r.agent_message,
+              note: "Triaged by the AI issue worker. Relay agent_message (and the upgrade advice) to the user.",
+            });
+          }
+
+          // Terminal without an issue: the worker's triage AND its own fallback
+          // both gave up — nothing was filed, so a prefilled URL is the safe
+          // last resort (no double-file risk).
+          if (outcome.kind === "unfiled") {
+            return jsonResult({
+              url: prefilledUrl,
+              repo,
+              filed: false,
+              versions: outcome.ack.versions,
+              up_to_date: outcome.ack.up_to_date,
+              upgrade_hint: outcome.ack.upgrade_hint,
+              note: "The triage worker could not file this report. Fallback: prefilled issue link for the user to submit in one click.",
+            });
+          }
+
+          // Still triaging at the budget: the worker WILL finish + file/dedup on
+          // its own. Do NOT prefill (would double-file). Surface the version-ack.
           return jsonResult({
-            url: result.url,
-            number: result.number,
-            deduped: result.deduped,
+            filed: false,
+            pending: true,
             repo,
-            filed: true,
-            job_id: result.job_id,
-            note: result.deduped
-              ? "Filed via intake Worker (matched an existing open issue). Share the link only if the user wants it."
-              : "Filed via intake Worker. Share the link only if the user wants it.",
+            job_id: outcome.job_id,
+            versions: outcome.ack.versions,
+            up_to_date: outcome.ack.up_to_date,
+            upgrade_hint: outcome.ack.upgrade_hint,
+            agent_message: outcome.ack.upgrade_hint,
+            note: "The AI triage is still running; the worker will file or dedup this report autonomously. If the user is behind on versions (see upgrade_hint), suggest upgrading first — that often resolves it.",
           });
         } catch (workerErr) {
-          // ANY submit OR poll failure (non-OK, timeout, unreachable, parse
-          // stall, server error) → prefilled URL fallback. Never claim success
-          // without a real issue link.
+          // SUBMIT failed (worker unreachable / non-OK) → the worker never took
+          // the report, so a prefilled URL is safe (no double-file risk).
           return jsonResult({
             url: prefilledUrl,
             repo,
             filed: false,
-            note: `Could not file via the intake Worker (${workerErr instanceof Error ? workerErr.message : String(workerErr)}). Fallback: prefilled issue link for the user to submit in one click.`,
+            note: `Could not reach the AI triage worker (${workerErr instanceof Error ? workerErr.message : String(workerErr)}). Fallback: prefilled issue link for the user to submit in one click.`,
           });
         }
       } catch (err) {
