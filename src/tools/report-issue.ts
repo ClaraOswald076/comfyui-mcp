@@ -93,7 +93,10 @@ export interface TriageResult {
 export type SubmitOutcome =
   | { kind: "closed"; ack: TriageAck; result: TriageResult }
   | { kind: "unfiled"; ack: TriageAck }
-  | { kind: "pending"; ack: TriageAck; job_id: string };
+  // job_id is optional: an accepted (HTTP 2xx) submit whose body stalled or
+  // omitted a job_id still means the worker TOOK the report — we can't poll but
+  // must NOT prefill (that would double-file).
+  | { kind: "pending"; ack: TriageAck; job_id?: string };
 
 interface StatusFrame {
   state?: string; // PENDING | INVESTIGATING | CLOSED
@@ -143,28 +146,42 @@ export async function submitAndPoll(opts: {
     }
   };
 
-  const submit = await withTimeout(async (signal): Promise<StatusFrame & TriageAck> => {
-    const r = await doFetch(opts.workerUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Client-Key": opts.clientKey,
-        // Opt into the async AI-triage contract. Absent this header the worker
-        // runs its legacy synchronous dumb-file path (old clients stay working).
-        "X-Triage-Async": "1",
-      },
-      body: JSON.stringify({
-        repo: opts.repoName,
-        title: opts.title,
-        body: opts.body,
-        labels: opts.labels,
-        reporter_versions: opts.reporterVersions ?? {},
-      }),
-      signal,
+  // `accepted` flips true the instant the worker returns a 2xx — from that point
+  // the worker HAS the report and is filing autonomously, so a later body
+  // stall/parse failure must NOT throw into a prefill (that would double-file).
+  let accepted = false;
+  let submit: StatusFrame & TriageAck;
+  try {
+    submit = await withTimeout(async (signal): Promise<StatusFrame & TriageAck> => {
+      const r = await doFetch(opts.workerUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Client-Key": opts.clientKey,
+          // Opt into the async AI-triage contract. Absent this header the worker
+          // runs its legacy synchronous dumb-file path (old clients stay working).
+          "X-Triage-Async": "1",
+        },
+        body: JSON.stringify({
+          repo: opts.repoName,
+          title: opts.title,
+          body: opts.body,
+          labels: opts.labels,
+          reporter_versions: opts.reporterVersions ?? {},
+        }),
+        signal,
+      });
+      if (!r.ok) throw new Error(`worker submit failed: HTTP ${r.status}`);
+      accepted = true; // 2xx → the worker took the report
+      return (await r.json()) as StatusFrame & TriageAck;
     });
-    if (!r.ok) throw new Error(`worker submit failed: HTTP ${r.status}`);
-    return (await r.json()) as StatusFrame & TriageAck;
-  });
+  } catch (err) {
+    // A 2xx whose body stalled/was malformed: the worker still took it and is
+    // filing — surface pending (no job_id, no ack) so the caller does NOT
+    // prefill. A pre-2xx failure (network / non-OK) rethrows → caller prefills.
+    if (accepted) return { kind: "pending", ack: {} };
+    throw err;
+  }
 
   const ack: TriageAck = {
     job_id: submit.job_id,
@@ -180,7 +197,9 @@ export async function submitAndPoll(opts: {
   }
 
   const jobId = submit.job_id;
-  if (!jobId) throw new Error("worker returned neither a result nor a job_id");
+  // Accepted (2xx) but no job_id and no inline result → we can't poll, but the
+  // worker took it and is filing. Surface pending (never prefill → no double).
+  if (!jobId) return { kind: "pending", ack };
 
   const base = opts.workerUrl.replace(/\/+$/, "");
   for (let i = 0; i < maxPolls; i++) {
@@ -230,7 +249,13 @@ function frameToResult(frame: StatusFrame): TriageResult | null {
   const p = frame.payload;
   const issueUrl = p?.issue?.url ?? frame.url;
   const issueNumber = p?.issue?.number ?? frame.number;
-  if (!issueUrl && !p?.agent_message) return null; // nothing useful to surface
+  // "Usable" = there is a real issue link, OR it is the advise-upgrade answer
+  // (no created issue, but real fix guidance). A terminal frame WITHOUT either —
+  // e.g. unfiled_needs_manual, which still carries an agent_message — is NOT a
+  // success: return null so the caller treats it as "unfiled" and prefills. (Do
+  // NOT key this on agent_message; the worker sets one even on failure.)
+  const usable = !!issueUrl || p?.action_taken === "advised_upgrade";
+  if (!usable) return null;
   return {
     url: issueUrl,
     number: issueNumber,
@@ -307,10 +332,12 @@ export function registerReportIssueTools(server: McpServer): void {
         const clientKey = process.env.COMFYUI_MCP_ISSUE_CLIENT_KEY || DEFAULT_CLIENT_KEY;
         const timeoutEnv = Number(process.env.COMFYUI_MCP_ISSUE_TIMEOUT_MS);
         const timeoutMs = Number.isFinite(timeoutEnv) && timeoutEnv > 0 ? timeoutEnv : undefined;
-        const maxPollsEnv = Number(process.env.COMFYUI_MCP_ISSUE_MAX_POLLS);
-        const maxPolls = Number.isFinite(maxPollsEnv) && maxPollsEnv > 0 ? maxPollsEnv : undefined;
+        const maxPollsEnv = Math.floor(Number(process.env.COMFYUI_MCP_ISSUE_MAX_POLLS));
+        // Clamp to a sane ceiling so a mis-set env can't poll for hours.
+        const maxPolls = Number.isFinite(maxPollsEnv) && maxPollsEnv > 0 ? Math.min(maxPollsEnv, 200) : undefined;
         const pollMsEnv = Number(process.env.COMFYUI_MCP_ISSUE_POLL_MS);
-        const pollDelayMs = Number.isFinite(pollMsEnv) && pollMsEnv >= 0 ? pollMsEnv : undefined;
+        const pollDelayMs =
+          Number.isFinite(pollMsEnv) && pollMsEnv >= 0 ? Math.min(pollMsEnv, 60000) : undefined;
         const repoName = repo.split("/")[1];
 
         const reporterVersions: ReporterVersions = {
@@ -335,7 +362,10 @@ export function registerReportIssueTools(server: McpServer): void {
           if (outcome.kind === "closed") {
             const r = outcome.result;
             return jsonResult({
-              filed: r.action_taken !== "advised_upgrade",
+              // "filed" means a real issue was created/updated. advised_upgrade
+              // files nothing; and a closed result always has a url here (a
+              // no-url terminal is routed to "unfiled" above).
+              filed: !!r.url && r.action_taken !== "advised_upgrade",
               repo,
               url: r.url,
               number: r.number,

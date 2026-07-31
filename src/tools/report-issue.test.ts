@@ -165,6 +165,31 @@ describe("submitAndPoll — async triage contract", () => {
     ).rejects.toThrow(/401/);
   });
 
+  it("a 2xx submit whose body STALLS → pending (worker took it) — does NOT throw/prefill", async () => {
+    const fetchImpl = (async (_url: string, init: RequestInit) => ({
+      ok: true, // 2xx = accepted
+      json: () =>
+        new Promise((_resolve, reject) => {
+          init.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+        }),
+    })) as unknown as typeof fetch;
+    const out = await submitAndPoll({ workerUrl: "https://w", clientKey: "k", repoName: "comfyui-mcp", title: "t", body: "b", fetchImpl, sleep: noSleep, timeoutMs: 10 });
+    expect(out.kind).toBe("pending"); // NOT a throw → the tool won't prefill
+  });
+
+  it("a 2xx submit with no job_id and no inline result → pending (accepted, cannot poll, no prefill)", async () => {
+    const fetchImpl = (async () => res({ ok: true, versions: {}, up_to_date: true })) as unknown as typeof fetch;
+    const out = await submitAndPoll({ workerUrl: "https://w", clientKey: "k", repoName: "comfyui-mcp", title: "t", body: "b", fetchImpl, sleep: noSleep });
+    expect(out.kind).toBe("pending");
+  });
+
+  it("CLOSED unfiled_needs_manual (agent_message but NO issue) → unfiled (not a false success)", async () => {
+    const fetchImpl = (async () =>
+      res({ state: "CLOSED", payload: { action_taken: "unfiled_needs_manual", issue: null, agent_message: "filing failed" } })) as unknown as typeof fetch;
+    const out = await submitAndPoll({ workerUrl: "https://w", clientKey: "k", repoName: "comfyui-mcp", title: "t", body: "b", fetchImpl, sleep: noSleep });
+    expect(out.kind).toBe("unfiled"); // agent_message alone must NOT count as filed
+  });
+
   it("a terminal job ERROR without an issue → kind:unfiled (worker gave up, caller prefills)", async () => {
     const fetchImpl = (async (url: string) => {
       if (url === "https://w") return res({ job_id: "j3", state: "PENDING", status: "PENDING" });
@@ -197,17 +222,13 @@ describe("submitAndPoll — async triage contract", () => {
     expect(polls).toBe(3); // it kept trying
   });
 
-  it("timeout: a SUBMIT whose .json() stalls until the AbortController fires → throws", async () => {
-    const fetchImpl = (async (_url: string, init: RequestInit) => ({
-      ok: true,
-      json: () =>
-        new Promise((_resolve, reject) => {
-          init.signal?.addEventListener("abort", () => reject(new Error("aborted")));
-        }),
-    })) as unknown as typeof fetch;
+  it("a network failure BEFORE any 2xx (fetch rejects) → throws so the caller prefills", async () => {
+    const fetchImpl = (async () => {
+      throw new Error("ECONNREFUSED");
+    }) as unknown as typeof fetch;
     await expect(
-      submitAndPoll({ workerUrl: "https://w", clientKey: "k", repoName: "comfyui-mcp", title: "t", body: "b", fetchImpl, sleep: noSleep, timeoutMs: 10 }),
-    ).rejects.toThrow();
+      submitAndPoll({ workerUrl: "https://w", clientKey: "k", repoName: "comfyui-mcp", title: "t", body: "b", fetchImpl, sleep: noSleep }),
+    ).rejects.toThrow(/ECONNREFUSED/);
   });
 
   it("timeout: a POLL whose .json() stalls is transient → keeps polling → pending", async () => {
@@ -342,6 +363,33 @@ describe("report_issue tool (registered handler)", () => {
     expect(json.url).toContain("/issues/new");
   });
 
+  it("our repo, CLOSED unfiled_needs_manual (no issue) → prefilled fallback, not a lost report", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => res({ state: "CLOSED", payload: { action_taken: "unfiled_needs_manual", issue: null, agent_message: "filing failed" } })),
+    );
+    const { json } = await callTool({ title: "t", body: "b" });
+    expect(json).toMatchObject({ filed: false });
+    expect(json.url).toContain("/issues/new");
+  });
+
+  it("a huge MAX_POLLS env is clamped so a running job still returns pending promptly", async () => {
+    let polls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        if (!String(url).includes("/status/")) return res({ job_id: "jc", state: "PENDING", status: "PENDING" });
+        polls++;
+        return res({ state: "INVESTIGATING", status: "queued" });
+      }),
+    );
+    process.env.COMFYUI_MCP_ISSUE_MAX_POLLS = "1000000000"; // absurd
+    process.env.COMFYUI_MCP_ISSUE_POLL_MS = "0";
+    const { json } = await callTool({ title: "t", body: "b" });
+    expect(json).toMatchObject({ filed: false, pending: true });
+    expect(polls).toBeLessThanOrEqual(200); // clamped, not a billion
+  });
+
   it("mixed-case owner (Artokun/comfyui-mcp) is treated as OURS and hits the worker", async () => {
     const spy = vi.fn(async () =>
       res({ state: "CLOSED", payload: { action_taken: "created", issue: { number: 60, url: "https://github.com/Artokun/comfyui-mcp/issues/60" }, agent_message: "ok" }, url: "https://github.com/Artokun/comfyui-mcp/issues/60", number: 60 }),
@@ -352,14 +400,14 @@ describe("report_issue tool (registered handler)", () => {
     expect(json).toMatchObject({ filed: true, number: 60 });
   });
 
-  it("timeout regression (SUBMIT .json() stalls) → prefilled fallback", async () => {
+  it("SUBMIT 2xx then body stalls → pending (worker took it), NOT a prefill/double-file", async () => {
     process.env.COMFYUI_MCP_ISSUE_TIMEOUT_MS = "15";
     vi.stubGlobal(
       "fetch",
       vi.fn(
         async (_url: string, init: RequestInit) =>
           ({
-            ok: true,
+            ok: true, // 2xx = accepted
             json: () =>
               new Promise((_resolve, reject) => {
                 init.signal?.addEventListener("abort", () => reject(new Error("aborted")));
@@ -368,8 +416,8 @@ describe("report_issue tool (registered handler)", () => {
       ),
     );
     const { json } = await callTool({ title: "t", body: "b" });
-    expect(json).toMatchObject({ filed: false });
-    expect(json.url).toContain("/issues/new");
+    expect(json).toMatchObject({ filed: false, pending: true });
+    expect(String(json.url ?? "")).not.toContain("/issues/new"); // did NOT prefill
   });
 
   it("our repo, worker returns non-OK (500) → falls back to prefilled URL", async () => {
