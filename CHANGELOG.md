@@ -6,6 +6,33 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.22] - 2026-07-31
+
+### MCP
+
+#### Added
+- per-download cancellation + reconnect-adoptable download_status (#515, #529) (#577)
+- disk fallback for panel version when hello omits it (#575)
+- async AI-triage client — versions, upgrade advice, no double-file (#544)
+
+#### Fixed
+- honest bounded restart-confirm + correct ready-banner model (#360, #376) (#576)
+- tolerant default reply timeout for read ops (panel #357) (#574)
+- certify reboot readiness via a concurrent, post-write-gated boot-endpoint observer (#509) (#536)
+- strip [object Object] user-turn artifact + consume panel status base_path (#534, #296) (#573)
+- graph-capture fallback + correct dynamic-widget/Get-Set link mapping (#384, #361) (#522)
+- proactively gate a bridge command once proven unsupported (#236) (#564)
+- allow panel_set_widget to clear a widget to "" (#347) (#561)
+- list_local_models omits .gguf models via REST path (#526) (#549)
+- stale-bug cluster — secret-notice correlation, stall false-positive, load_workflow custom user-dir (#550)
+- TTL-bounded cache so out-of-band ComfyUI restart/install self-heals (#528) (#542)
+- report actual backend in ENVIRONMENT (#358); accurate list_workflow_templates description (#359) (#533)
+- ACE Step 1.5 fields (#501); lock native VAE/UNET loaders (#482); bundled-pack runtime (#464) (#519)
+- never silently substitute comboOpts[0] for a user-staged value + refresh stale loader dropdowns (#504, #499) (#517)
+- fail-fast when no interactive surface (#300); don't drop a late-but-valid answer (#486); saner set_todo deadline (#322) (#525)
+- live-first download target + poll Manager queue instead of 300s false timeout (#490, #463, #489) (#524)
+
+
 ## [0.48.21] - 2026-07-30
 
 ### Fixed
