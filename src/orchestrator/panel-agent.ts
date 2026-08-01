@@ -974,6 +974,13 @@ export class PanelAgent {
   // gate, busy/working indicator, anchor tracking, usage meter, onSay commit)
   // lives here; the backend already normalized the provider's native messages.
   private handleEvent(ev: AgentEvent): void {
+    // CLOSED GUARD (#570 P0a): once stopped, emit NOTHING. stop()/retire() set `closed`
+    // fire-and-forget, but the backend's `for await` loop may still yield one buffered
+    // event before it observes the flag — and forwarding it would fire onSession/onSay/
+    // onStream callbacks that the bridge's same-socket migration alias routes to the tab
+    // this agent was retired in favor of (a leak of the old workflow's reply/session into
+    // the switched-to one). Dropping the event is safe: a stopped agent's turn is over.
+    if (this.closed) return;
     // Any event means the turn is alive — reset the idle watchdog. The `result`
     // case below disarms it entirely (turn ended). Placed before the switch so it
     // covers every event type without per-case bumps.
@@ -1228,6 +1235,10 @@ export interface PanelAgentManagerOptions {
    * auto-restart), independent of whether the panel re-sends `hello.resume`.
    */
   sessionStore?: SessionStore;
+  /** #570 P0 — resolve the trusted workflow-identity uuid for a composite agent key, so a
+   *  persisted exact session is BOUND to the workflow it belongs to (detecting a saved
+   *  workflow overwritten in place: same tab id, new uuid). undefined when unknown. */
+  identityForKey?: (key: string) => string | undefined;
 }
 
 /** Owns one PanelAgent per tab id, spawned lazily on the tab's first message. */
@@ -1305,7 +1316,7 @@ export class PanelAgentManager {
       // Persist the session id to our durable store (resume-after-restart) BEFORE
       // forwarding it to the panel — so it's on disk the moment the SDK reports it.
       onSession: (id, sid, model) => {
-        this.opts.sessionStore?.set(id, sid);
+        this.opts.sessionStore?.set(id, sid, this.opts.identityForKey?.(id));
         this.opts.onSession?.(id, sid, model);
       },
       onTurnAnchor: this.opts.onTurnAnchor,
@@ -1356,6 +1367,16 @@ export class PanelAgentManager {
    *  the mobile mirror picker's "session attached" dot. */
   hasLiveAgent(key: string): boolean {
     return this.agents.has(key);
+  }
+
+  /** #570 P0 — true when this key holds ANY per-tab live/queued state that reset() would
+   *  tear down: a live agent, an armed pending resume, OR failed-start held mail (a backend
+   *  prepare failure drops the agent but PARKS its queued user messages here, with no
+   *  session). The identity boundary gates on this so an in-place workflow replacement is
+   *  torn down even in the spawn→first-session window or after a prepare failure — otherwise
+   *  the next message re-delivers the prior workflow's parked mail into the replacement. */
+  hasAnyState(key: string): boolean {
+    return this.agents.has(key) || this.pendingResume.has(key) || (this.heldMessages.get(key)?.length ?? 0) > 0;
   }
 
   /** Composite keys of every live agent. Used to deliver a download-completion
@@ -1665,7 +1686,11 @@ export class PanelAgentManager {
         this.pendingResume.delete(oldKey);
       }
       const persisted = this.opts.sessionStore?.get(oldKey);
-      if (persisted) this.opts.sessionStore?.set(newKey, persisted);
+      // Carry the identity binding across the tab-id migration (same workflow, so the
+      // uuid is unchanged) — read the OLD entry's binding, since tabStableIdentity for the
+      // new tab may not be populated yet at rebind time.
+      const persistedIdentity = this.opts.sessionStore?.identityOf(oldKey);
+      if (persisted) this.opts.sessionStore?.set(newKey, persisted, persistedIdentity);
       this.opts.sessionStore?.clear(oldKey);
       // Held mail from a failed start migrates too (issue #256) — it exists
       // precisely when NO live agent does, so it must move in the durable pass
@@ -1732,8 +1757,22 @@ export class PanelAgentManager {
       // override the session the orchestrator is actually holding. The store is
       // keyed per (tab, backend), so a provider switch finds no entry here and
       // correctly starts fresh (the panel replays the transcript to seed it).
-      const resume =
-        this.opts.sessionStore?.get(tabId) ?? this.pendingResume.get(tabId);
+      // #570 — the durable exact record wins ONLY when its OWNING identity matches this tab's
+      // current identity. A destination session collided-onto from another tab (the same wf:<path>
+      // or reused key) can carry a DIFFERENT owning identity than the tab connecting now; inheriting
+      // it would attach this tab to another tab's conversation. When the stored identity differs
+      // from the current one, IGNORE the durable record and fall back to the (validated) hint —
+      // this is the last-line guard behind the hello-handler choke point that resets such a record.
+      // Both-unknown (pre-`u` record or identity-less tab) fails OPEN, preserving prior behaviour.
+      const durable = this.opts.sessionStore?.get(tabId);
+      const durableIdentity = this.opts.sessionStore?.identityOf(tabId);
+      const currentIdentity = this.opts.identityForKey?.(tabId);
+      const durableOwnedByThisTab =
+        durable !== undefined &&
+        (durableIdentity === undefined ||
+          currentIdentity === undefined ||
+          durableIdentity === currentIdentity);
+      const resume = (durableOwnedByThisTab ? durable : undefined) ?? this.pendingResume.get(tabId);
       this.pendingResume.delete(tabId);
       agent = this.spawn(tabId, resume);
     }
@@ -1830,6 +1869,23 @@ export class PanelAgentManager {
       logger.info(`[panel-orchestrator] tab ${tabId.slice(0, 8)} reset — new session next message`);
       void agent.stop();
     }
+  }
+
+  /** Stop and UNBIND a tab's live agent WITHOUT touching its durable session — used
+   *  when the same browser socket switches to a DIFFERENT workflow (a validated uuid
+   *  change, #570 P0a). Unlike reset() — which CLEARS the durable session for a New
+   *  chat — this preserves sessionStore/pendingResume/held mail, so the retired
+   *  workflow resumes exactly where it left off when reopened, while its now-stopped
+   *  agent can no longer push frames that the bridge migration alias would leak into
+   *  the newly-targeted view. No-op when no live agent owns the key. */
+  retire(tabId: string): void {
+    const agent = this.agents.get(tabId);
+    if (!agent) return;
+    this.agents.delete(tabId);
+    void agent.stop();
+    logger.info(
+      `[panel-orchestrator] tab ${tabId.slice(0, 8)} retired (workflow switch on the same socket) — durable session preserved`,
+    );
   }
 
   async interrupt(tabId: string, opts: { requeueInFlight?: boolean } = {}): Promise<void> {

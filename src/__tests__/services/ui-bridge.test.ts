@@ -14,7 +14,41 @@ import {
   BRIDGE_DEFAULT_TIMEOUT_MS,
   BRIDGE_READ_DEFAULT_TIMEOUT_MS,
   BRIDGE_READONLY_CMDS,
+  isMutatingGraphCommand,
+  requiresWorkflowStampEnforcement,
 } from "../../services/ui-bridge.js";
+
+// #570 P0c — classifier that decides which commands must pass the enforcement+stamp gate.
+describe("requiresWorkflowStampEnforcement (#570 P0c)", () => {
+  it("gates every graph_* mutator, never a read", () => {
+    expect(requiresWorkflowStampEnforcement({ cmd: "graph_add_node" })).toBe(true);
+    expect(requiresWorkflowStampEnforcement({ cmd: "graph_set_widget" })).toBe(true);
+    expect(requiresWorkflowStampEnforcement({ cmd: "graph_clear" })).toBe(true);
+    expect(isMutatingGraphCommand("graph_get_state")).toBe(false);
+    expect(requiresWorkflowStampEnforcement({ cmd: "graph_get_state" })).toBe(false);
+    expect(requiresWorkflowStampEnforcement({ cmd: "graph_query" })).toBe(false);
+  });
+
+  it("gates ALL FOUR workflow mutators UNCONDITIONALLY (the server can't resolve a path selector)", () => {
+    // save/save_as ignore path; rename/close resolve a path against OPEN workflows, which the
+    // server can't evaluate — and an in-place replacement can make a once-non-active path resolve
+    // to the active workflow. So raw path can never prove non-active-ness: gate all four always.
+    for (const cmd of ["workflow_save", "workflow_save_as", "workflow_rename", "workflow_close"]) {
+      expect(requiresWorkflowStampEnforcement({ cmd })).toBe(true); // absent
+      expect(requiresWorkflowStampEnforcement({ cmd, path: "" } as never)).toBe(true); // empty
+      expect(requiresWorkflowStampEnforcement({ cmd, path: "   " } as never)).toBe(true); // whitespace
+      // Even a non-empty explicit path is gated on the server — the ENFORCING panel resolves the
+      // target precisely and exempts a genuinely non-active one client-side.
+      expect(requiresWorkflowStampEnforcement({ cmd, path: "workflows/other.json" } as never)).toBe(true);
+    }
+  });
+
+  it("does NOT gate navigation/creation or unrelated commands", () => {
+    expect(requiresWorkflowStampEnforcement({ cmd: "workflow_open", path: "x" })).toBe(false);
+    expect(requiresWorkflowStampEnforcement({ cmd: "workflow_new" })).toBe(false);
+    expect(requiresWorkflowStampEnforcement({ cmd: "show_media" })).toBe(false);
+  });
+});
 
 let bridge: UiBridge;
 let port: number;
@@ -64,7 +98,11 @@ function connectPanel(tabId?: string, title = "workflow-a"): Promise<WebSocket> 
     const sock = new WebSocket(`ws://127.0.0.1:${port}`);
     sock.on("open", () => {
       if (tabId) {
-        sock.send(JSON.stringify({ type: "hello", tab_id: tabId, title }));
+        // Current panels advertise stamp enforcement, so a mutating graph command is not gated
+        // (#570 P0c). Tests exercising the OLD-panel gate hello WITHOUT this flag explicitly.
+        sock.send(
+          JSON.stringify({ type: "hello", tab_id: tabId, title, enforces_workflow_stamp: true }),
+        );
       }
       resolve(sock);
     });
@@ -89,6 +127,10 @@ beforeEach(async () => {
   // a parallel test file on loaded CI, leaving whenReady() false (the #486/#619
   // Windows bind flake). startBridgeOnFreePort awaits `listening` internally.
   ({ bridge, port } = await startBridgeOnFreePort());
+  // #570 P0c — by default a tab has a trusted workflow identity (current panels always send a
+  // valid workflow_uuid), so mutating graph/workflow commands carry a stamp and pass the gate.
+  // Tests that exercise the NO-stamp / cross-workflow-switch cases override this resolver.
+  bridge.setTabWorkflowUuidResolver(() => "11111111-1111-4111-8111-111111111111");
 });
 
 afterEach(async () => {
@@ -255,6 +297,27 @@ describe("UiBridge (mailbox — offline render delivery)", () => {
     phone.close();
   });
 
+  it("dropQueuedDeliveries discards buffered frames so a replaced workflow gets nothing (#570 P0)", async () => {
+    // A prior workflow buffered a finished render for an offline tab.
+    const res = await bridge.send(
+      { cmd: "show_media", items: [{ filename: "A-private.png" }] },
+      { tabId: "wf:foo.json" },
+    );
+    expect(res).toMatchObject({ ok: true, mailboxed: true });
+    // The workflow at that path was overwritten in place → the orchestrator's identity
+    // reset drops the buffered deliveries (they belong to the PRIOR workflow).
+    bridge.dropQueuedDeliveries("wf:foo.json");
+    // The replacement reconnects under the SAME tab id → it must receive NOTHING buffered.
+    const got: Array<Record<string, unknown>> = [];
+    const tab = await connectPanel();
+    tab.on("message", (buf) => got.push(JSON.parse(buf.toString())));
+    tab.send(JSON.stringify({ type: "hello", tab_id: "wf:foo.json", title: "workflow-b" }));
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:foo.json")).toBe(true));
+    expect(got.find((m) => m.cmd === "show_media")).toBeUndefined();
+    expect(got.find((m) => m.type === "mailbox_flush")).toBeUndefined();
+    tab.close();
+  });
+
   it("does not mailbox interactive commands (only show_media)", async () => {
     await expect(
       bridge.send({ cmd: "graph_get_state" }, { tabId: "nobody" }),
@@ -267,6 +330,33 @@ describe("UiBridge (mailbox — offline render delivery)", () => {
     await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "nobody")).toBe(true));
     expect(got.find((m) => m.type === "mailbox_flush")).toBeUndefined();
     phone.close();
+  });
+});
+
+describe("UiBridge — revokeTabMigration fences a switched-away workflow's route (#570 P0a)", () => {
+  it("stops a stale panel_* call to the old id from resolving onto the new workflow", async () => {
+    // One socket hellos as workflow A, then re-hellos as a DIFFERENT workflow B (a
+    // same-socket switch) — the bridge installs the A→B migration alias.
+    const sock = await connectPanel("wf:A", "workflow-a");
+    autoReply(sock, "the-live-canvas");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:A")).toBe(true));
+    sock.send(JSON.stringify({ type: "hello", tab_id: "wf:B", title: "workflow-b" }));
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:B")).toBe(true));
+
+    // BEFORE the fence: a stale call addressed to the OLD id resolves THROUGH the alias
+    // to the live socket (now showing B) — the exact wrong-canvas mutation path.
+    const leaked = await bridge.send({ cmd: "graph_get_state" }, { tabId: "wf:A" });
+    expect(leaked).toMatchObject({ from: "the-live-canvas" });
+
+    // Fence it (what the orchestrator does on an unproven same-socket switch).
+    bridge.revokeTabMigration("wf:A");
+
+    // AFTER: the same stale call no longer routes to B — it fails to resolve instead of
+    // mutating the newly-selected canvas. B's own id still routes fine.
+    await expect(bridge.send({ cmd: "graph_get_state" }, { tabId: "wf:A" })).rejects.toThrow();
+    const direct = await bridge.send({ cmd: "graph_get_state" }, { tabId: "wf:B" });
+    expect(direct).toMatchObject({ from: "the-live-canvas" });
+    sock.close();
   });
 });
 
@@ -523,6 +613,43 @@ describe("UiBridge (multi-tab)", () => {
     autoReply(a2, "A2");
     await expect(promise).resolves.toMatchObject({ from: "A2", cmd: "graph_get_errors" });
     a2.close();
+  });
+
+  it("dropQueuedDeliveries CANCELS a parked read so it is NOT re-dispatched onto a replacement (#570 P0)", async () => {
+    const a1 = await connectPanel("wf:foo.json");
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    // Workflow A has an idempotent read in flight (no autoReply → un-acked).
+    const promise = bridge.send({ cmd: "graph_get_errors" }, { tabId: "wf:foo.json", timeoutMs: 5000 });
+    await new Promise((r) => setTimeout(r, 50));
+    a1.close(); // socket drops mid-command → parked in awaitingReconnect
+    await new Promise((r) => setTimeout(r, 20));
+    // The workflow at that path is overwritten in place → the orchestrator's identity reset
+    // cancels the tab's queued work, incl. the parked read (so it can't run against B).
+    bridge.dropQueuedDeliveries("wf:foo.json");
+    // The parked read is REJECTED (cancelled), not left to resume.
+    await expect(promise).rejects.toThrow(/replaced by a different workflow|cancelled/);
+    // The replacement B reconnects under the SAME tab id and answers nothing for A: the
+    // resume must NOT re-dispatch A's old read onto B.
+    const b = await connectPanel();
+    const seen: Array<Record<string, unknown>> = [];
+    b.on("message", (buf) => seen.push(JSON.parse(buf.toString())));
+    b.send(JSON.stringify({ type: "hello", tab_id: "wf:foo.json", title: "workflow-b" }));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(seen.find((m) => m.cmd === "graph_get_errors")).toBeUndefined();
+    b.close();
+  });
+
+  it("dropQueuedDeliveries REJECTS an in-flight command so its late reply can't resolve the prior call (#570 P0)", async () => {
+    const a = await connectPanel("wf:foo.json");
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    // A command is in flight on the live socket (no autoReply → pending, un-acked).
+    const promise = bridge.send({ cmd: "graph_get_state" }, { tabId: "wf:foo.json", timeoutMs: 5000 });
+    await new Promise((r) => setTimeout(r, 50));
+    // The workflow is replaced in place → the identity reset cancels in-flight work so a late
+    // reply can't resolve the PRIOR workflow's tool call.
+    bridge.dropQueuedDeliveries("wf:foo.json");
+    await expect(promise).rejects.toThrow(/replaced by a different workflow|cancelled/);
+    a.close();
   });
 
   it("resumes a read addressed by tab-id PREFIX after reconnect (canonical key) (#450)", async () => {
@@ -1108,6 +1235,227 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     await onPhone; // resolves, or the test times out (fan-out broke)
   });
 
+  it("DETACHES a mirror viewer on an UNPROVEN same-socket workflow switch (#570 P0)", async () => {
+    // A phone mirrors workflow A (old-id). The desktop switches to a DIFFERENT workflow on
+    // the SAME socket (new-id) — the hello handler optimistically moves the phone's
+    // subscription onto new-id BEFORE continuity is known. When the orchestrator classifies
+    // the switch as UNPROVEN it resets the tab via dropQueuedDeliveries (with the retired id
+    // AND the surviving id) — the phone must then receive NONE of workflow B's frames and its
+    // input must NOT target B: it silently followed A→B without ever attaching to B.
+    const desktop = await connectPanel("old-id", "G");
+    const phone = await connectHeadless("phone-7");
+    await settle();
+    const seen: Array<{ type?: string; tab_id?: string; text?: string }> = [];
+    bridge.onPanelMessage = (e) => seen.push(e as { type?: string; tab_id?: string; text?: string });
+    phone.send(JSON.stringify({ type: "attach_tab", cid: "a", target_tab_id: "old-id" }));
+    await nextFrame(phone, (m) => m.type === "tab_attached");
+
+    // Same-socket switch to a DIFFERENT workflow (subscription moves to new-id at hello).
+    desktop.send(JSON.stringify({ type: "hello", tab_id: "new-id", title: "B" }));
+    await settle();
+
+    // The orchestrator classified the switch as UNPROVEN and revokes the migration. This is
+    // the retire branch's SOLE call for the OLD id — it does NOT also sweep new-id (when B
+    // owns its own session, provenOwn is true and the destination sweep is skipped). The
+    // mirror detach must therefore ride revokeTabMigration itself (#570 P0a), NOT a manual
+    // destination sweep.
+    bridge.revokeTabMigration("old-id");
+
+    // Workflow B's activity must NOT reach the phone anymore.
+    let leaked = false;
+    phone.on("message", (buf) => {
+      const m = JSON.parse(buf.toString());
+      if (m.type === "say" && m.text === "workflow-B-secret") leaked = true;
+    });
+    bridge.push({ type: "say", text: "workflow-B-secret" }, "new-id");
+    bridge.push({ type: "say", text: "workflow-B-secret" }, "old-id"); // via migration alias too
+    await settle();
+    expect(leaked).toBe(false);
+
+    // The phone's input reverts to its OWN tab — it no longer drives workflow B.
+    phone.send(JSON.stringify({ type: "user_message", text: "still mine", context: {} }));
+    await settle();
+    const drove = seen.find((e) => e.type === "user_message" && e.text === "still mine");
+    expect(drove?.tab_id).toBe("phone-7");
+  });
+
+  it("STAMPS a dispatched command with the ORIGIN workflow uuid so the panel can fence a post-switch apply (#570 P0)", async () => {
+    // The orchestrator maps each tab to its trusted per-instance workflow uuid.
+    const uuidByTab: Record<string, string> = { "tmp:A": "uuid-A", "tmp:B": "uuid-B" };
+    bridge.setTabWorkflowUuidResolver((tabId) => uuidByTab[tabId]);
+
+    const desktop = await connectPanel("tmp:A", "A");
+    const frames: Array<Record<string, unknown>> = [];
+    desktop.on("message", (buf) => {
+      const m = JSON.parse(buf.toString());
+      if (m.rid && m.cmd) {
+        frames.push(m);
+        // Reply so send() resolves.
+        desktop.send(JSON.stringify({ rid: m.rid, ok: true, result: {} }));
+      }
+    });
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:A")).toBe(true));
+
+    // A command issued for workflow A carries A's uuid.
+    await bridge.send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "tmp:A" });
+    await vi.waitFor(() => expect(frames.find((f) => f.cmd === "graph_add_node")).toBeTruthy());
+    expect(frames.find((f) => f.cmd === "graph_add_node")?.workflow_uuid).toBe("uuid-A");
+
+    // Same socket switches to workflow B (migration alias tmp:A → tmp:B).
+    desktop.send(JSON.stringify({ type: "hello", tab_id: "tmp:B", title: "B", enforces_workflow_stamp: true }));
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:B")).toBe(true));
+
+    // A late command still ISSUED FOR A (its agent's tab id) must stamp A's uuid — even though
+    // it now resolves onto B's socket — so the panel (showing B) declines to apply it. Stamping
+    // B's uuid would let it cross-apply. The resolver reads the ORIGIN tab, so it stays uuid-A.
+    frames.length = 0;
+    await bridge.send({ cmd: "graph_add_node", node: "y" } as never, { tabId: "tmp:A" });
+    await vi.waitFor(() => expect(frames.find((f) => f.cmd === "graph_add_node")).toBeTruthy());
+    expect(frames.find((f) => f.cmd === "graph_add_node")?.workflow_uuid).toBe("uuid-A");
+    desktop.close();
+  });
+
+  it("workflow_uuid is BRIDGE-OWNED: a caller-supplied stamp is OVERRIDDEN by the trusted resolver value (#570 P0c)", async () => {
+    // A caller must not be able to forge the stamp to the destination workflow to sail past the
+    // panel fence after a switch. dispatch always overwrites workflow_uuid with the resolver value.
+    bridge.setTabWorkflowUuidResolver((tabId) => (tabId === "tmp:A" ? "uuid-A" : undefined));
+    const desktop = await connectPanel("tmp:A", "A");
+    const frames: Array<Record<string, unknown>> = [];
+    desktop.on("message", (buf) => {
+      const m = JSON.parse(buf.toString());
+      if (m.rid && m.cmd) {
+        frames.push(m);
+        desktop.send(JSON.stringify({ rid: m.rid, ok: true, result: {} }));
+      }
+    });
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:A")).toBe(true));
+    // Caller tries to smuggle a conflicting workflow_uuid (the would-be destination) in the cmd.
+    await bridge.send(
+      { cmd: "graph_add_node", node: "x", workflow_uuid: "uuid-FORGED-DESTINATION" } as never,
+      { tabId: "tmp:A" },
+    );
+    await vi.waitFor(() => expect(frames.find((f) => f.cmd === "graph_add_node")).toBeTruthy());
+    // The emitted frame carries the TRUSTED origin uuid, not the caller's forged value.
+    expect(frames.find((f) => f.cmd === "graph_add_node")?.workflow_uuid).toBe("uuid-A");
+    desktop.close();
+  });
+
+  it("REFUSES a mutation when the tab has no trusted workflow identity, even if the panel advertises enforcement (#570 P0c)", async () => {
+    // A panel that CLAIMS enforcement but has no resolvable workflow uuid: the frame would ship
+    // UNSTAMPED, so the panel's fence has nothing to compare and a stale mutation after a switch
+    // would run unfenced. No stamp ⇒ nothing to fence ⇒ refuse the mutation (codex). Reads pass.
+    bridge.setTabWorkflowUuidResolver(() => undefined);
+    const desktop = await connectPanel("tmp:none", "N"); // connectPanel advertises enforcement
+    const frames: Array<Record<string, unknown>> = [];
+    desktop.on("message", (buf) => {
+      const m = JSON.parse(buf.toString());
+      if (m.rid && m.cmd) {
+        frames.push(m);
+        desktop.send(JSON.stringify({ rid: m.rid, ok: true, result: {} }));
+      }
+    });
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:none")).toBe(true));
+    await expect(
+      bridge.send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "tmp:none" }),
+    ).rejects.toThrow(/no trusted identity|cannot be safely targeted/i);
+    // A READ still dispatches (unstamped is fine — reads have no side effect).
+    await bridge.send({ cmd: "graph_get_state" } as never, { tabId: "tmp:none" });
+    await vi.waitFor(() => expect(frames.find((f) => f.cmd === "graph_get_state")).toBeTruthy());
+    desktop.close();
+  });
+
+  it("REFUSES a mutation on a same-socket switch when the tab has no trusted uuid (no unstamped write to the replacement) (#570 P0c)", async () => {
+    // Codex regression: an enforcement-advertising panel with NO valid workflow uuid, then a
+    // same-socket workflow switch — a mutating command must NOT be dispatched (it would arrive at
+    // the replacement canvas UNSTAMPED, unfenceable).
+    bridge.setTabWorkflowUuidResolver(() => undefined);
+    const desktop = await connectPanel("tmp:sA", "A");
+    desktop.on("message", (buf) => {
+      const m = JSON.parse(buf.toString());
+      if (m.rid && m.cmd) desktop.send(JSON.stringify({ rid: m.rid, ok: true, result: {} }));
+    });
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:sA")).toBe(true));
+    // Same-socket switch to a different workflow.
+    desktop.send(JSON.stringify({ type: "hello", tab_id: "tmp:sB", title: "B", enforces_workflow_stamp: true }));
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:sB")).toBe(true));
+    // A late command issued for A resolves onto B's socket — with no trusted uuid it is refused,
+    // never written unstamped to B.
+    await expect(
+      bridge.send({ cmd: "graph_add_node", node: "y" } as never, { tabId: "tmp:sA" }),
+    ).rejects.toThrow(/no trusted identity|cannot be safely targeted/i);
+    desktop.close();
+  });
+
+  it("FAILS CLOSED: a MUTATING graph command is refused for an OLD panel that doesn't enforce the stamp; reads still work (#570 P0c)", async () => {
+    // An OLD panel hellos WITHOUT enforces_workflow_stamp — it would silently ignore the
+    // per-command workflow stamp and could apply a stale write to the wrong canvas.
+    const old = new WebSocket(`ws://127.0.0.1:${port}`);
+    await new Promise<void>((res, rej) => {
+      old.on("open", () => {
+        old.send(JSON.stringify({ type: "hello", tab_id: "tmp:old", title: "old" })); // no flag
+        res();
+      });
+      old.on("error", rej);
+    });
+    // Auto-reply so a NON-gated command could resolve (proving the gate, not a hang).
+    old.on("message", (buf) => {
+      const m = JSON.parse(buf.toString());
+      if (m.rid && m.cmd) old.send(JSON.stringify({ rid: m.rid, ok: true, result: {} }));
+    });
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:old")).toBe(true));
+
+    // A mutating graph command is refused BEFORE dispatch (never written to the socket).
+    await expect(
+      bridge.send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "tmp:old" }),
+    ).rejects.toThrow(/enforces per-command workflow targeting|update the ComfyUI-MCP panel/i);
+
+    // …but a READ-ONLY graph command still works (read-only graph access retained).
+    await expect(
+      bridge.send({ cmd: "graph_get_state" } as never, { tabId: "tmp:old" }),
+    ).resolves.toBeTruthy();
+
+    // A path-less ACTIVE-workflow mutator (workflow_close discards unsaved work) is ALSO
+    // refused — the class the graph_-only gate previously missed (#570 P0c, codex cycle 8).
+    await expect(
+      bridge.send({ cmd: "workflow_close", force: true } as never, { tabId: "tmp:old" }),
+    ).rejects.toThrow(/enforces per-command workflow targeting|update the ComfyUI-MCP panel/i);
+
+    // ALL FOUR workflow mutators are refused on a non-enforcing panel — regardless of path,
+    // including an EXPLICIT non-empty path. The server can't resolve the selector or prove it
+    // stays non-active (an in-place replacement can make a once-non-active path resolve to the
+    // active workflow), so it fails closed; an ENFORCING panel resolves the target client-side.
+    for (const cmd of [
+      { cmd: "workflow_close", path: "", force: true },
+      { cmd: "workflow_rename", path: "  ", name: "x" },
+      { cmd: "workflow_save" },
+      { cmd: "workflow_save_as", name: "y" },
+      { cmd: "workflow_close", path: "workflows/other.json", force: true }, // explicit path — still gated
+    ]) {
+      await expect(bridge.send(cmd as never, { tabId: "tmp:old" })).rejects.toThrow(
+        /enforces per-command workflow targeting|update the ComfyUI-MCP panel/i,
+      );
+    }
+    old.close();
+  });
+
+  it("ALLOWS active-workflow mutations (graph AND workflow_*) for a panel that DOES enforce the stamp (#570 P0c)", async () => {
+    const modern = await connectPanel("tmp:modern", "M"); // connectPanel advertises enforcement + has a resolver stamp
+    autoReply(modern, "modern");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:modern")).toBe(true));
+    // A graph mutator AND each workflow mutator all dispatch (enforcement + trusted stamp present).
+    for (const cmd of [
+      { cmd: "graph_add_node", node: "x" },
+      { cmd: "workflow_save" },
+      { cmd: "workflow_save_as", name: "y" },
+      { cmd: "workflow_close", force: true }, // path-less ⇒ active ⇒ gated, but enforcing panel passes
+    ]) {
+      await expect(bridge.send(cmd as never, { tabId: "tmp:modern" })).resolves.toMatchObject({
+        from: "modern",
+      });
+    }
+    modern.close();
+  });
+
   it("refuses a headless hello takeover of a desktop tab id (no drive-path hijack)", async () => {
     const desktop = await connectPanel("desktop-h", "G");
     autoReply(desktop, "desktop");
@@ -1643,7 +1991,17 @@ describe("UiBridge.send (graceful gate end-to-end)", () => {
   // the SPECIFIC cmd that was empirically proven unsupported is gated).
   it("does NOT gate a different, never-tried command after another command was proven unsupported", async () => {
     const sock = await connectPanel(undefined);
-    sock.send(JSON.stringify({ type: "hello", tab_id: "old-tab-3", title: "wf", panel_version: "0.6.8" }));
+    // Old VERSION (for the #236 too-old graph_query check) but a stamp-enforcing build, so the
+    // orthogonal P0c mutating-graph gate doesn't mask what this test asserts.
+    sock.send(
+      JSON.stringify({
+        type: "hello",
+        tab_id: "old-tab-3",
+        title: "wf",
+        panel_version: "0.6.8",
+        enforces_workflow_stamp: true,
+      }),
+    );
     sock.on("message", (buf) => {
       const msg = JSON.parse(buf.toString());
       if (!msg.rid || !msg.cmd) return;

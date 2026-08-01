@@ -21,7 +21,11 @@ import { logger } from "../utils/logger.js";
  *    when the tab id is STABLE across a reload (a SAVED workflow: `wf:<path>`).
  *  - `stable` — keyed by a caller-supplied identity that survives a panel reload
  *    even for an UNSAVED workflow, whose tab id is an ephemeral `tmp:<uuid>` that is
- *    REGENERATED every reload. Without this, an orchestrator restart that also
+ *    REGENERATED every reload. See {@link deriveStableKey}: keyed on the panel's
+ *    durable per-instance workflow uuid (globally unique — no cross-workflow
+ *    collision); absent a valid uuid the index is skipped entirely (fail closed —
+ *    never the collision-prone origin+title key). Without this, an orchestrator
+ *    restart that also
  *    reloads the panel brings the tab back under a never-stored `tmp:` id → store
  *    miss → fresh session → conversation gone. The stable index is the resume
  *    FALLBACK: `sessions` (exact tab id) always wins when present, so this never
@@ -45,12 +49,181 @@ interface Entry {
    *  under this (title-collision) key, so it can no longer be trusted to resume
    *  either. getStable refuses it; only clearStable (a NEW chat) revives the key. */
   p?: boolean;
+  /** EXACT index only: the trusted workflow-identity uuid this session belongs to, so a
+   *  SAVED tab whose file is OVERWRITTEN in place (same `wf:<path>` tab id, new uuid) can
+   *  be detected — the tab-id-keyed exact record would otherwise resume the PRIOR
+   *  workflow's chat. Durable, so the check survives an orchestrator restart (#570 P0). */
+  u?: string;
 }
 
 interface StoreFileV2 {
   v: 2;
   sessions: Record<string, Entry>;
   stable: Record<string, Entry>;
+}
+
+/**
+ * Derive the STABLE resume key for an UNSAVED-workflow tab (#570).
+ *
+ * #587 keyed this on `origin + title + backend` — the only identity thought to
+ * survive the tmp:<uuid> tab-id churn. But an unsaved workflow's title is the
+ * DEFAULT "Unsaved Workflow" (ComfyUI even re-derives the "(N)" suffix as tabs
+ * open/close), which is NOT unique: two DIFFERENT unsaved workflows collide on one
+ * key. #587 documented the resulting sequential-collision as an accepted limitation
+ * and pointed at a future per-instance id. That limitation is the #570 REOPEN: after
+ * a workflow reset the stable index served an UNRELATED earlier on-disk session for a
+ * turn (the wrong conversation), because a stale same-title sibling shared the key
+ * (the concurrent-collision poison guard can't catch a sequential/cross-restart one).
+ *
+ * The panel now advertises its durable, globally-unique per-instance workflow id
+ * (#186/#386 — minted with crypto.randomUUID, embedded in the graph's `extra` and so
+ * carried across a browser reload by ComfyUI's unsaved-workflow persistence; it is the
+ * very id that keys the durable chat transcript, which DID restore correctly in the
+ * report; and it is FORKED to a fresh uuid whenever a graph is cloned/imported, so
+ * two distinct instances never share it). Key on THAT: two distinct unsaved workflows
+ * can never share a uuid, so the cross-resume is structurally impossible, and the id
+ * survives the reload that regenerates the tmp: tab id. Backend partitions the key
+ * (per-provider sessions); the ComfyUI ORIGIN is folded in too so a uuid replayed from
+ * copied graph metadata onto a DIFFERENT instance can't bridge them. The identifier is
+ * validated against the crypto.randomUUID() shape before it is trusted.
+ *
+ * FAIL CLOSED (#570 reopen): when no VALID uuid is supplied — an older/pre-capability
+ * panel, or a malformed value — we return `undefined` and do NOT fall back to the
+ * origin+title key. That legacy key is the collision mechanism the reopen is about;
+ * reusing it would silently keep the wrong-resume alive for un-upgraded panels. Without
+ * a unique identity the orchestrator simply forgoes the disk fallback: the panel's own
+ * hello.resume still covers the common reload, and a miss starts fresh — a lost resume,
+ * never a wrong one.
+ *
+ * LEGACY RECORDS: a store written by #587 may hold old `tmp::<origin>::<title>::<backend>`
+ * stable entries. The new scheme NEVER produces or reads that key shape, so those records
+ * are inert and age out via GC. We deliberately do NOT migrate them onto a uuid identity:
+ * the legacy key is non-unique, so mapping it to a uuid would let a brand-new same-title
+ * workflow inherit an unrelated abandoned session — reintroducing the exact wrong-resume
+ * this fix removes. The upgrade cost is a lost (not wrong) resume for a pre-upgrade unsaved
+ * session whose panel also fails to send hello.resume — an accepted, bounded trade-off.
+ *
+ * The poison guard (see {@link SessionStore.setStable}) is unchanged and still matters:
+ * the SAME workflow opened in two live browser tabs shares one uuid, and two live tabs
+ * writing distinct sessions to it still poison the key rather than cross-resume.
+ */
+const WORKFLOW_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** The validated + canonicalized (origin, uuid) behind a stable key, or undefined when
+ *  either is missing/untrusted (fail closed). The origin MUST be the caller's
+ *  SERVER-OBSERVED (unspoofable) handshake origin — never the client-supplied
+ *  hello.comfyui_url — so a spoofed origin can't let a copied uuid derive another
+ *  instance's key. Shared by {@link deriveStableKey} (resume key) and
+ *  {@link deriveWorkflowIdentity} (the backend-independent identity used to tell a
+ *  same-socket tab-id MIGRATION of one workflow from a SWITCH to a different one). */
+export function workflowIdentityParts(opts: {
+  workflowUuid?: string | undefined;
+  origin?: string | undefined;
+}): { origin: string; uuid: string } | undefined {
+  const raw = typeof opts.workflowUuid === "string" ? opts.workflowUuid.trim() : "";
+  const uuid = WORKFLOW_UUID_RE.test(raw) ? raw.toLowerCase() : "";
+  if (!uuid) return undefined;
+  const origin =
+    typeof opts.origin === "string" ? opts.origin.trim().replace(/\/+$/, "").toLowerCase() : "";
+  if (!origin) return undefined;
+  return { origin, uuid };
+}
+
+export function deriveStableKey(opts: {
+  workflowUuid?: string | undefined;
+  origin?: string | undefined;
+  backend: string;
+}): string | undefined {
+  const p = workflowIdentityParts(opts);
+  if (!p) return undefined; // fail closed: no durable identity / no trusted origin
+  return `wfid::${p.origin}::${p.uuid}::${opts.backend}`;
+}
+
+/** Backend-INDEPENDENT workflow identity (origin+uuid), for distinguishing a
+ *  same-socket tab-id migration (same identity) from a workflow switch (different
+ *  identity). undefined when the identity can't be trusted (fail closed → treated as
+ *  "no proof of continuity", so a rebind is refused rather than risked). */
+export function deriveWorkflowIdentity(opts: {
+  workflowUuid?: string | undefined;
+  origin?: string | undefined;
+}): string | undefined {
+  const p = workflowIdentityParts(opts);
+  return p ? `${p.origin}::${p.uuid}` : undefined;
+}
+
+/** #570 — does the DESTINATION of a tab-id migration already hold state for a backend, so the
+ *  incoming tab would inherit/leak it? Covers EVERY kind of per-backend state that must be reset
+ *  before the source is rebound in: manager live/pending/held (`hasManagerState`), a dormant
+ *  durable session (`hasDurableSession`), OR a RENDER-HELD queue (`renderHeldCount` — the
+ *  orchestrator-level heldDuringGen, which manager.reset does NOT clear and which the source-held
+ *  re-key would otherwise APPEND to, flushing the superseded tab's queued message into the incoming
+ *  tab on render completion). Any of these ⇒ collision ⇒ reset + clear the destination's held. */
+export function destinationHasCollisionState(opts: {
+  hasManagerState: boolean;
+  hasDurableSession: boolean;
+  renderHeldCount: number;
+}): boolean {
+  return opts.hasManagerState || opts.hasDurableSession || opts.renderHeldCount > 0;
+}
+
+/** #570 — does a connected SIBLING tab own the session behind a candidate stable key? A stable key
+ *  encodes (workflow identity, backend), so a sibling owns it when its identity derives to the SAME
+ *  key for that backend AND it still RETAINS a session there. Ownership is a SET over every backend
+ *  the sibling has ever used, NOT its current provider: a provider switch RETIRES (preserves) the
+ *  old provider's session, so `siblingRetainsSession` (derived from the durable store OR live/held
+ *  state on that backend key) — not the sibling's current-backend mapping — is what proves
+ *  ownership. When true, a second honest tab must NOT arm/resume that key's session. */
+export function siblingOwnsStableKey(opts: {
+  siblingIdentity?: { origin: string; uuid: string } | undefined;
+  candidateKey: string;
+  candidateBackend: string;
+  siblingRetainsSession: boolean;
+}): boolean {
+  if (!opts.siblingIdentity || !opts.siblingRetainsSession) return false;
+  const k = deriveStableKey({
+    workflowUuid: opts.siblingIdentity.uuid,
+    origin: opts.siblingIdentity.origin,
+    backend: opts.candidateBackend,
+  });
+  return k !== undefined && k === opts.candidateKey;
+}
+
+/** #570 — may a panel-scoped `hello.resume` be ARMED? The EXACT tab-id session is unique to this
+ *  tab, so a hint matching it (`exactOwned`) is always this tab's own — arm it. The STABLE-key
+ *  session is SHARED by every tab of the same workflow identity (the same workflow open in two
+ *  live tabs), so a hint matching it (`stableOwned`) may arm ONLY when no OTHER connected tab holds
+ *  that stable key (`otherTabHoldsStableKey` false) — otherwise a concurrent sibling would attach
+ *  to and contend for the first tab's live conversation (a cross-tab leak). Fail closed: an
+ *  ambiguous stable-key hint is dropped (a fresh sibling is a mild miss; joining the live
+ *  conversation is not). */
+export function armableResume(opts: {
+  exactOwned: boolean;
+  stableOwned: boolean;
+  otherTabHoldsStableKey: boolean;
+}): boolean {
+  if (opts.exactOwned) return true;
+  return opts.stableOwned && !opts.otherTabHoldsStableKey;
+}
+
+/** #570 — per-backend teardown decision at the identity boundary. When a hello is NOT proven
+ *  for the SELECTED backend, each provider's state must be judged on its OWN merits rather than
+ *  globally reset off the selected backend: a DORMANT provider's session is KEPT (resumable)
+ *  only when the identity it belongs to PROVABLY matches this hello's workflow identity — its
+ *  DURABLE stored identity (Entry.u), or, for the CURRENT hello's backend only, the tab's
+ *  PRIOR-hello identity (covering the spawn→first-session live-agent window that has no durable
+ *  record yet). This is what makes an orchestrator restart + provider switch preserve the other
+ *  provider's SAME-workflow conversation instead of erasing it irreversibly. Returns true = KEEP,
+ *  false = reset. Fails closed: any absent/mismatched identity resets. */
+export function keepsBackendState(opts: {
+  storedIdentity?: string | undefined;
+  priorIdentity?: string | undefined;
+  isCurrentBackend: boolean;
+  helloIdentity?: string | undefined;
+}): boolean {
+  const bIdentity = opts.storedIdentity ?? (opts.isCurrentBackend ? opts.priorIdentity : undefined);
+  return (
+    bIdentity !== undefined && opts.helloIdentity !== undefined && bIdentity === opts.helloIdentity
+  );
 }
 
 export class SessionStore {
@@ -103,7 +276,7 @@ export class SessionStore {
             dirty = true;
             continue;
           }
-          const e = v as { s?: unknown; t?: unknown; o?: unknown; p?: unknown };
+          const e = v as { s?: unknown; t?: unknown; o?: unknown; p?: unknown; u?: unknown };
           if (typeof e.s !== "string") {
             dirty = true;
             continue;
@@ -124,6 +297,7 @@ export class SessionStore {
           const entry: Entry = { s: e.s, t };
           if (typeof e.o === "string") entry.o = e.o;
           if (e.p === true) entry.p = true;
+          if (typeof e.u === "string") entry.u = e.u;
           out[k] = entry;
         }
         return out;
@@ -175,15 +349,26 @@ export class SessionStore {
     return s;
   }
 
-  /** Record (and persist) a tab's current session id. No-op if unchanged. */
-  set(tabId: string, sessionId: string): void {
-    if (this.sessions[tabId]?.s === sessionId) {
-      // Same id — refresh the timestamp so an actively-used session never GCs out,
-      // but skip the disk write when the timestamp is already recent.
-      const existing = this.sessions[tabId];
-      if (existing && this.now() - existing.t < 60 * 60 * 1000) return;
+  /** The trusted workflow-identity uuid the exact session under this key belongs to
+   *  (#570 P0), or undefined. Lets the hello handler detect a SAVED workflow overwritten
+   *  in place (same tab id, new uuid) and clear the stale session. */
+  identityOf(tabId: string): string | undefined {
+    return this.sessions[tabId]?.u;
+  }
+
+  /** Record (and persist) a tab's current session id, bound to its trusted workflow
+   *  identity uuid (when known). No-op if BOTH the id and the identity are unchanged. */
+  set(tabId: string, sessionId: string, identityUuid?: string): void {
+    const u = typeof identityUuid === "string" && identityUuid ? identityUuid : undefined;
+    const existing = this.sessions[tabId];
+    if (existing?.s === sessionId && existing.u === u) {
+      // Same id AND identity — refresh the timestamp so an actively-used session never
+      // GCs out, but skip the disk write when the timestamp is already recent.
+      if (this.now() - existing.t < 60 * 60 * 1000) return;
     }
-    this.sessions[tabId] = { s: sessionId, t: this.now() };
+    const entry: Entry = { s: sessionId, t: this.now() };
+    if (u) entry.u = u;
+    this.sessions[tabId] = entry;
     this.flush();
   }
 

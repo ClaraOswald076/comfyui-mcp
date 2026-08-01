@@ -72,6 +72,11 @@ type SendCtx = {
   mutating: boolean;
   /** Absolute ms after which even an idempotent read stops waiting for reconnect. */
   deadline: number;
+  /** #570 — the trusted per-instance workflow uuid this command was ISSUED FOR (the
+   *  caller's intended tab), stamped onto the outgoing frame so the panel can refuse to
+   *  EXECUTE it against a DIFFERENT workflow it has since switched to. Undefined for a tab
+   *  with no established workflow identity (old panel / relay) → no client-side fence. */
+  workflowUuid?: string;
 };
 
 type Pending = {
@@ -109,6 +114,25 @@ interface Conn {
    *  dispatch + the reactive #236 path (which learns from a REAL rejection). Mirrors
    *  the unsupportedCmds "reset on every hello" philosophy for the version dimension. */
   panelVersionAdvertised: boolean;
+  /** #570 P0c — THIS panel build advertised (in its hello) that it enforces the per-command
+   *  workflow-instance stamp: it refuses to run ANY active-workflow op whose stamped
+   *  workflow_uuid does not match the active canvas — every graph_* command AND the four
+   *  active-workflow mutators (workflow_save / workflow_save_as / workflow_rename /
+   *  workflow_close). The panel fence sits in the command handler (activeWorkflowFenceApplies),
+   *  before every executor, so the guarantee spans all of them, not just graph commands. When
+   *  false (an OLD panel that would silently ignore the stamp), the send() preflight FAILS CLOSED
+   *  for those active-workflow mutations (see requiresWorkflowStampEnforcement) so a stale write
+   *  can't hit the wrong workflow — reads and path-targeted ops stay allowed. Re-read from every
+   *  hello (a reconnect may be a freshly updated build), never inherited.
+   *
+   *  SCOPE (deliberate): this is ACCIDENTAL version-skew protection — an HONEST old panel gets
+   *  read-only graph access until it updates, so a stale in-flight edit can't silently corrupt
+   *  the wrong workflow after a switch. It is NOT a security boundary: the flag is client-
+   *  asserted and the uuid is client-supplied, so a user who MODIFIES their own local panel can
+   *  trivially spoof both. That is a self-attack (their own workflow A leaking into their own
+   *  workflow B) crossing no privacy boundary, so attestation would buy nothing — #570's real
+   *  threat is ACCIDENTAL cross-workflow confusion for an honest user, which this closes. */
+  enforcesWorkflowStamp: boolean;
   /** Commands THIS connection has already proven it doesn't support, via a real
    *  "Unknown command" reply earlier in the session (#236). Once a cmd lands
    *  here, every later call is gated proactively — rejected before it ever
@@ -375,6 +399,44 @@ export const BRIDGE_READONLY_CMDS: ReadonlySet<string> = new Set<string>([
   "refresh_nodes",
 ]);
 
+/** #570 P0c — a graph command that WRITES the canvas (add/remove/connect/move/set_widget/
+ *  clear/load/…). Any `graph_*` command that is NOT in the read-only allowlist mutates, so
+ *  this stays correct as new graph mutators are added without having to enumerate them. */
+export function isMutatingGraphCommand(cmdName: string): boolean {
+  return cmdName.startsWith("graph_") && !BRIDGE_READONLY_CMDS.has(cmdName);
+}
+
+/** #570 P0c — the four workflow mutators. workflow_save / workflow_save_as ignore any path and
+ *  always target the active workflow; workflow_rename / workflow_close resolve a path selector
+ *  against the panel's OPEN workflows (`path ? openWorkflows.find(path) : activeWorkflow`), which
+ *  the SERVER cannot evaluate — and a path that names a non-active workflow NOW can name the
+ *  active one after an in-place replacement at that path. So the server cannot prove any of these
+ *  stays off the active canvas and gates all four (an enforcing panel resolves the target
+ *  precisely client-side; a non-enforcing panel fails closed — read-only for these ops). */
+const ACTIVE_WORKFLOW_MUTATORS = new Set<string>([
+  "workflow_save",
+  "workflow_save_as",
+  "workflow_rename",
+  "workflow_close",
+]);
+
+/** #570 P0c — commands that MUTATE the currently-active workflow/canvas and must therefore be
+ *  fenced to the workflow they were issued for. Fail closed for these unless the connected panel
+ *  enforces the per-command workflow stamp (`workflow_open`/`workflow_new` are navigation/creation
+ *  with their OWN explicit or new target — not active-content mutations — so they are excluded).
+ *
+ *  Decide by the COMMAND, not by a raw `path` string: the server cannot resolve a workflow path
+ *  selector to a specific open workflow, and an in-place replacement can make a once-non-active
+ *  path resolve to the active workflow — so raw path presence can never prove a rename/close
+ *  stays off the active canvas. Hence all four workflow mutators are gated unconditionally; the
+ *  ENFORCING panel's client-side fence (activeWorkflowFenceApplies) does the precise
+ *  resolved-target check that safely exempts a deterministically non-active target. */
+export function requiresWorkflowStampEnforcement(cmd: { cmd?: unknown }): boolean {
+  const name = typeof cmd.cmd === "string" ? cmd.cmd : "";
+  if (isMutatingGraphCommand(name)) return true;
+  return ACTIVE_WORKFLOW_MUTATORS.has(name);
+}
+
 /** Tight default reply timeout for a MUTATING command with no explicit timeout —
  *  fail fast so the agent isn't blocked on a stuck write. */
 export const BRIDGE_DEFAULT_TIMEOUT_MS = 6000;
@@ -530,6 +592,23 @@ export class UiBridge {
    *  to THIS tab's shared session instead of the viewer's own — that's what makes
    *  it remote control rather than a passive view. Cleared on detach/disconnect. */
   private mirrorViewers = new Map<BridgeSocket, string>();
+  /** #570 — injected by the orchestrator: the trusted per-instance workflow uuid this
+   *  tabId currently maps to (from tabStableIdentity). Used to STAMP each dispatched
+   *  command so the panel can refuse to execute it against a workflow it has since switched
+   *  to (the generation-bound-command leak: the server can't retract a frame already
+   *  delivered to the browser, but the browser can decline to APPLY a stale one). */
+  private resolveTabWorkflowUuid: ((tabId: string) => string | undefined) | null = null;
+  /** #570 P0a — records the mirror subscribers/viewers a same-socket re-hello OPTIMISTICALLY
+   *  moved from the retiring id to the new id, keyed by the RETIRING (from) id. The move
+   *  happens BEFORE the orchestrator can classify the switch as proven/unproven; if it turns
+   *  out UNPROVEN, revokeTabMigration(fromId) uses this to DETACH exactly those moved viewers
+   *  (reverting their input to their own session) and pull them back out of the destination's
+   *  subscriber set — so a phone mirroring workflow A never silently follows into B. Only the
+   *  MOVED sockets are undone, so B's OWN pre-existing viewers are untouched. */
+  private migratedMirror = new Map<
+    string,
+    { to: string; viewers: Set<BridgeSocket>; subs: Set<BridgeSocket> }
+  >();
   /** Injected by the orchestrator: does this tabId have a live agent session?
    *  (SessionStore/PanelAgentManager live there.) Flags desktopTabs() for the
    *  mobile mirror picker's green "session attached" dot. */
@@ -943,18 +1022,37 @@ export class UiBridge {
           migratedProvenSupported = this.conns.get(tabId)?.provenSupportedCmds;
           this.conns.delete(tabId);
           // Move mirror subscribers to the migrated tab id so viewers keep this
-          // tab's live feed across a same-socket re-hello.
+          // tab's live feed across a same-socket re-hello. #570 P0a — this is OPTIMISTIC
+          // (it happens before the orchestrator can classify the switch); record exactly
+          // which sockets we move so revokeTabMigration() can pull JUST these back out if
+          // the switch turns out to be to a DIFFERENT workflow (never depending on the
+          // destination's own session ownership to trigger the undo).
+          const movedViewers = new Set<BridgeSocket>();
+          const movedSubs = new Set<BridgeSocket>();
           const migSubs = this.subscribers.get(tabId);
           if (migSubs) {
             this.subscribers.delete(tabId);
             const dest = this.subscribers.get(msg.tab_id as string) ?? new Set<BridgeSocket>();
-            for (const s of migSubs) dest.add(s);
+            for (const s of migSubs) {
+              dest.add(s);
+              movedSubs.add(s);
+            }
             this.subscribers.set(msg.tab_id as string, dest);
           }
           // Re-point any viewers driving the OLD id at the new one so their input
           // keeps reaching this tab's session across the re-hello.
           for (const [s, drivenTab] of this.mirrorViewers) {
-            if (drivenTab === tabId) this.mirrorViewers.set(s, msg.tab_id as string);
+            if (drivenTab === tabId) {
+              this.mirrorViewers.set(s, msg.tab_id as string);
+              movedViewers.add(s);
+            }
+          }
+          if (movedViewers.size || movedSubs.size) {
+            this.migratedMirror.set(tabId, {
+              to: msg.tab_id as string,
+              viewers: movedViewers,
+              subs: movedSubs,
+            });
           }
         }
         tabId = msg.tab_id;
@@ -1007,6 +1105,10 @@ export class UiBridge {
           panelVersionAdvertised:
             typeof (msg as { panel_version?: unknown }).panel_version === "string" &&
             !!(msg as { panel_version?: string }).panel_version,
+          // #570 P0c — re-read from THIS hello, never inherited (a reconnect may be a newly
+          // updated build). Strict === true so any non-true / absent value is non-enforcing.
+          enforcesWorkflowStamp:
+            (msg as { enforces_workflow_stamp?: unknown }).enforces_workflow_stamp === true,
           // Fresh per hello — see the field's doc comment (#236).
           unsupportedCmds: new Set<string>(),
           // INHERITED across a reconnect (the panel code did not get older) so a command
@@ -1063,10 +1165,17 @@ export class UiBridge {
         } else {
           logger.debug(`[ui-bridge] tab ${tabId.slice(0, 8)} (re)hello`);
         }
-        // Replay anything this tab's agent produced while the tab had no live
-        // connection (its socket was re-helloed to another workflow). The panel
-        // swaps to this workflow's thread synchronously before these frames can be
-        // processed, so they render + record into the RIGHT conversation.
+        // #570 P0 — run the orchestrator's hello handler FIRST. Its identity-boundary reset
+        // can call dropQueuedDeliveries(tabId) on an UNPROVEN workflow transition (a saved
+        // workflow overwritten in place, reconnecting under the same wf:<path>), so the
+        // buffered items below — which belong to the PRIOR workflow — are NOT replayed into
+        // the replacement (a wrong-conversation/media delivery). For a PROVEN reconnect it
+        // drops nothing, so the replay/flush proceeds exactly as before, just after the ack.
+        this.onPanelMessage?.(msg as PanelEvent);
+        // Replay anything this tab's agent produced while the tab had no live connection
+        // (its socket was re-helloed to another workflow). The panel swaps to this
+        // workflow's thread synchronously, so they render + record into the RIGHT
+        // conversation (or nothing, if the reset above dropped them).
         const missed = this.missedFrames.get(tabId);
         if (missed?.length) {
           this.missedFrames.delete(tabId);
@@ -1084,7 +1193,6 @@ export class UiBridge {
         // Resume any idempotent reads that were dropped mid-command by this tab's
         // previous socket (bounded reconnect grace) onto the fresh connection.
         this.resumeAwaitingReconnect(tabId);
-        this.onPanelMessage?.(msg as PanelEvent);
         return;
       }
 
@@ -1212,6 +1320,12 @@ export class UiBridge {
       for (const [from, entry] of this.tabMigrations) {
         if (entry.sock === sock) this.tabMigrations.delete(from);
       }
+      // #570 P0a — prune recorded mirror-migration undo state referencing this dying tab
+      // (a proven-keep switch never calls revokeTabMigration, so its entry would otherwise
+      // linger). Keyed by / pointing at this tab id → inert once it's gone.
+      for (const [from, m] of this.migratedMirror) {
+        if (from === tabId || m.to === tabId) this.migratedMirror.delete(from);
+      }
       // Drop this socket from any mirror subscriptions (it was a viewer).
       for (const [tid, set] of this.subscribers) {
         if (set.delete(sock) && set.size === 0) this.subscribers.delete(tid);
@@ -1303,6 +1417,44 @@ export class UiBridge {
       return this.resolveTarget(tabId).serverOrigin;
     } catch {
       return undefined;
+    }
+  }
+
+  /** Fence a same-socket migration alias (#570 P0a): drop the `fromId → to` route and
+   *  every other entry that points at the SAME target (fromId's path-compressed chain),
+   *  so a RETIRED workflow's stale / in-flight panel_* calls addressed to fromId can no
+   *  longer resolve THROUGH the alias onto the newly-selected workflow's canvas. Called
+   *  when a same-socket re-hello is NOT a proven same-workflow continuation (a workflow
+   *  SWITCH). The new tab routes directly via its own live connection, so fencing the old
+   *  routes never affects it; a stale call to fromId simply fails to resolve (and its
+   *  now-stopped agent ignores the error) instead of mutating the wrong graph. */
+  revokeTabMigration(fromId: string): void {
+    const target = this.tabMigrations.get(fromId)?.to;
+    this.tabMigrations.delete(fromId);
+    if (target) {
+      for (const [from, entry] of this.tabMigrations) {
+        if (entry.to === target) this.tabMigrations.delete(from);
+      }
+    }
+    // #570 P0a — this migration was just REJECTED as a switch to a DIFFERENT workflow, so
+    // UNDO the optimistic mirror move: detach exactly the viewers/subscribers we moved onto
+    // the destination (never the destination's OWN viewers). Detached viewers revert to their
+    // own session; their input stops driving the destination. This runs UNCONDITIONALLY on the
+    // revoke — it does NOT depend on the destination having (or lacking) its own bound session,
+    // which is the gap that let a mirror follow A→B when B already owned an exact session.
+    const moved = this.migratedMirror.get(fromId);
+    if (moved) {
+      this.migratedMirror.delete(fromId);
+      const destSubs = this.subscribers.get(moved.to);
+      if (destSubs) {
+        for (const s of moved.subs) destSubs.delete(s);
+        if (destSubs.size === 0) this.subscribers.delete(moved.to);
+      }
+      for (const s of moved.viewers) {
+        // Only revert a viewer we moved that is STILL pointed at this destination (it may have
+        // since re-attached elsewhere, which we must not clobber).
+        if (this.mirrorViewers.get(s) === moved.to) this.mirrorViewers.delete(s);
+      }
     }
   }
 
@@ -1502,6 +1654,74 @@ export class UiBridge {
     );
   }
 
+  /** #570 P0 — COMPLETE per-tab bridge reset: cancel/clear EVERY per-tab QUEUE that would
+   *  otherwise deliver or re-dispatch the PRIOR workflow's work after an UNPROVEN identity
+   *  transition (a saved workflow overwritten in place, reconnecting under the same
+   *  wf:<path>). Enumerate every per-tabId delivery/dispatch structure so no future queue is
+   *  forgotten:
+   *   - missedFrames  — buffered say/session/stream frames (replayed on hello);
+   *   - mailbox       — finished-render show_media (flushed on hello);
+   *   - awaitingReconnect — idempotent reads parked on a mid-command drop, which
+   *     resumeAwaitingReconnect() would re-dispatch onto the REPLACEMENT tab's socket and
+   *     deliver its graph/data back into the PRIOR workflow's still-running tool call.
+   *   - mirror subscribers / viewers — a MIRROR channel is also a per-tab delivery path: a
+   *     phone attached to workflow A keeps receiving this tab's session/say frames and its
+   *     input is stamped for this tab. On a same-socket SWITCH the hello handler already
+   *     MOVED the old id's subscribers/viewers onto the NEW id BEFORE continuity could be
+   *     proven, so on an unproven transition a mirror viewer would silently follow A→B
+   *     without ever attaching to B (codex review). Detach viewers driving this tab (their
+   *     input reverts to their OWN session) and drop this tab's subscriber set (stop feeding
+   *     it B's frames); they can re-attach explicitly if they still want this view.
+   *  The remaining routing/lifecycle structures (conns, migration aliases) are intentionally
+   *  NOT touched here — the socket stays; only queued WORK and unproven mirror bindings are
+   *  dropped. Called by the orchestrator's identity-boundary reset (with the surviving id) and
+   *  the switch retire branch (with the retired id), and the bridge defers its on-hello
+   *  replay/flush/resume until AFTER onPanelMessage so this purge lands first. */
+  dropQueuedDeliveries(tabId: string): void {
+    this.missedFrames.delete(tabId);
+    this.mailbox.delete(tabId);
+    // MIRROR teardown (see above): a viewer must not auto-follow an unproven workflow switch.
+    for (const [s, drivenTab] of this.mirrorViewers) {
+      if (drivenTab === tabId) this.mirrorViewers.delete(s);
+    }
+    this.subscribers.delete(tabId);
+    const awaiting = this.awaitingReconnect.get(tabId);
+    if (awaiting) {
+      this.awaitingReconnect.delete(tabId);
+      for (const entry of awaiting) {
+        clearTimeout(entry.graceTimer);
+        try {
+          entry.ctx.reject(
+            new Error(
+              `panel tab ${tabId.slice(0, 8)} was replaced by a different workflow before its command ("${entry.ctx.command.cmd}") could resume — cancelled to avoid running it against the new workflow`,
+            ),
+          );
+        } catch {
+          // reject already settled — nothing to do
+        }
+      }
+    }
+    // In-flight command promises for this tab: a reply arriving AFTER the workflow was
+    // replaced must NOT resolve the PRIOR workflow's tool call (leaking the replacement's
+    // graph/data back into it). Reject + drop them. (The already-written command may still
+    // EXECUTE in the browser — that is the deferred generation-bound-command residual, which
+    // server-side cancellation cannot retract; this only fences the reply/data flow back.)
+    for (const [rid, p] of this.pending) {
+      if (p.ctx.tabId !== tabId) continue;
+      clearTimeout(p.timer);
+      this.pending.delete(rid);
+      try {
+        p.reject(
+          new Error(
+            `panel tab ${tabId.slice(0, 8)} was replaced by a different workflow — in-flight "${p.cmd}" cancelled so its reply can't resolve the prior workflow's call`,
+          ),
+        );
+      } catch {
+        // reject already settled — nothing to do
+      }
+    }
+  }
+
   /** Deliver any buffered render frames to a tab that just (re)connected, plus a
    *  `mailbox_flush` summary so the client can notify "N renders finished while
    *  you were away". Expired items (past TTL) are dropped. */
@@ -1586,6 +1806,46 @@ export class UiBridge {
     ) {
       return Promise.reject(buildPanelTooOldError(cmd.cmd, conn.panelVersion));
     }
+    // #570 P0c — FAIL CLOSED for a command that mutates the ACTIVE workflow/canvas (every
+    // graph_* mutator, plus path-less workflow_save/save_as/rename/close) when the resolved
+    // panel does NOT enforce the per-command workflow-instance stamp. Such a panel would
+    // silently IGNORE the stamp and could apply a command delivered AFTER a workflow switch to
+    // the wrong workflow — a delivered frame cannot be retracted, so fencing only the reply
+    // can't undo the mutation (workflow_close would discard the new workflow's unsaved work).
+    // Refusing to DISPATCH is the only server-side guarantee. Reads (outline, query, get_state,
+    // serialize, …) and path-targeted workflow ops stay allowed, so an old panel keeps
+    // read-only graph access with a clear "update to edit" error, never a silent wrong write.
+    //
+    // Require BOTH (codex): the panel must advertise enforcement AND the command must actually
+    // CARRY a trusted workflow-uuid stamp. Enforcement alone is not enough — if the tab has no
+    // resolvable identity (missing/malformed uuid, relay client), the frame ships UNSTAMPED and
+    // the panel's fence has nothing to compare, so a stale mutation after a switch would run
+    // unfenced despite the "enforces" claim. No stamp ⇒ nothing to fence ⇒ refuse the mutation.
+    //
+    // NOTE — this gate is ACCIDENTAL version-skew protection (honest old panel ⇒ read-only graph
+    // until updated), NOT a security boundary: the enforcement flag and the uuid are both client-
+    // supplied, so a user who modifies their OWN panel can spoof them — but that only leaks their
+    // own workflow into their own workflow (self-attack, no privacy boundary). See the
+    // enforcesWorkflowStamp field doc. Deliberately no attestation.
+    if (requiresWorkflowStampEnforcement(cmd)) {
+      const stamp = this.resolveTabWorkflowUuid?.(opts.tabId ?? conn.tabId);
+      const hasTrustedStamp = typeof stamp === "string" && stamp.length > 0;
+      if (!conn.enforcesWorkflowStamp || !hasTrustedStamp) {
+        const why = !conn.enforcesWorkflowStamp
+          ? `panel tab ${conn.tabId.slice(0, 8)} does not enforce per-command workflow targeting ` +
+            `(update the ComfyUI-MCP panel to edit the graph)`
+          : `this workflow has no trusted identity for the panel to fence the command against`;
+        return Promise.reject(
+          markDispatched(
+            new Error(
+              `"${cmd.cmd}" cannot be safely targeted to the active workflow: ${why}. Read-only graph ` +
+                `commands (graph_outline, graph_query, graph_get_state) still work.`,
+            ),
+            false,
+          ),
+        );
+      }
+    }
     if (conn.sock.readyState !== WebSocket.OPEN) {
       if (opts.tabId && UiBridge.isMailboxable(cmd)) {
         this.storeMailbox(opts.tabId, cmd);
@@ -1609,6 +1869,11 @@ export class UiBridge {
         tabId: conn.tabId,
         mutating: !UiBridge.READONLY_CMDS.has(cmd.cmd),
         deadline: Date.now() + timeoutMs,
+        // #570 — resolve from the CALLER'S intended tab (opts.tabId), NOT the canonical
+        // conn.tabId: after a same-socket switch the two differ, and we must stamp the
+        // workflow the command was ISSUED FOR (so the panel, now showing a different one,
+        // declines it) — never the workflow it happens to have landed on.
+        workflowUuid: this.resolveTabWorkflowUuid?.(opts.tabId ?? conn.tabId) ?? undefined,
       };
       this.dispatch(conn, ctx);
     });
@@ -1701,7 +1966,20 @@ export class UiBridge {
     };
     this.pending.set(rid, pending);
     try {
-      conn.sock.send(JSON.stringify({ rid, ...cmd }));
+      // #570 — stamp the intended workflow uuid so the panel refuses to APPLY this command
+      // if it has since switched to a different workflow (a frame already delivered to the
+      // browser cannot be retracted server-side; the client fences execution instead).
+      //
+      // workflow_uuid is BRIDGE-OWNED metadata, NEVER caller-settable (codex): a caller that
+      // could supply its own workflow_uuid would just set it to the DESTINATION workflow after a
+      // switch and sail past the panel fence. So ALWAYS overwrite with the trusted resolver value
+      // (ctx.workflowUuid), and STRIP any caller-supplied value entirely when we have no trusted
+      // one — an identity-less tab / old panel ships unstamped (mutations are already refused by
+      // the requiresWorkflowStampEnforcement gate above; reads execute, reply still server-fenced).
+      const frame: Record<string, unknown> = { rid, ...cmd };
+      if (ctx.workflowUuid) frame.workflow_uuid = ctx.workflowUuid;
+      else delete frame.workflow_uuid;
+      conn.sock.send(JSON.stringify(frame));
     } catch (err) {
       clearTimeout(timer);
       this.pending.delete(rid);
@@ -1824,6 +2102,12 @@ export class UiBridge {
    *  in the orchestrator). */
   setHasSessionPredicate(fn: (tabId: string) => boolean): void {
     this.hasSessionPredicate = fn;
+  }
+
+  /** #570 — inject the tabId → trusted workflow uuid resolver (tabStableIdentity lives in
+   *  the orchestrator). Enables the per-command workflow-instance stamp/fence. */
+  setTabWorkflowUuidResolver(fn: (tabId: string) => string | undefined): void {
+    this.resolveTabWorkflowUuid = fn;
   }
 
   /** The open DESKTOP tabs (non-headless primaries) for the mobile mirror picker. */
