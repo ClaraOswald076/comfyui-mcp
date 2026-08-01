@@ -6,8 +6,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.30] - 2026-08-01
+
 ### Fixed
 - **`panel_refresh_nodes` (and any newer bridge command) against an older panel now returns an actionable "update your panel to ≥X.Y.Z" error instead of the opaque `Unknown command "refresh_nodes"` (#619).** The #608 refresh executor shipped in panel 0.11.28; on a 0.11.20 panel the command was unrecognized, but because `refresh_nodes` wasn't in the min-version table it fell back to the 0.11.4 baseline — which a 0.11.20 panel exceeds — so the false-negative guard mistook it for "new enough" and leaked the raw dispatch error. `refresh_nodes` is now tabled at its true minimum (0.11.28), which both quotes the correct remedy version (naming the connected panel version) AND lets the proactive #392 gate reject the first call before dispatch. Class-wide: the "new enough" guard now trusts ONLY authoritative, command-specific minimums, so any UNTABLED command's `Unknown command` reply maps to an actionable "update the panel pack" message rather than a bare passthrough.
+
+### MCP
+
+#### Fixed
+- route set_todo/open_civitai to desktop canvas when session bound to a headless client (#624) (#625)
+- document panel_open_workflow stale-tab signal (#442 defect 2) (#618)
+
 
 ## [0.48.29] - 2026-08-01
 
