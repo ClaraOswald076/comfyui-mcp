@@ -413,6 +413,55 @@ function optPositiveNumber(v: unknown): boolean {
   return v === undefined || (typeof v === "number" && Number.isFinite(v) && v > 0);
 }
 
+function isFiniteNumber(v: unknown): boolean {
+  return typeof v === "number" && Number.isFinite(v);
+}
+
+/** ModelCostSchema: input/output/cacheRead/cacheWrite are REQUIRED Type.Number();
+ *  `tiers` is an optional array. A `cost: {}` (or a string rate) fails the schema
+ *  and pi throws the whole models.json away. */
+function optModelCost(v: unknown, required: boolean): boolean {
+  if (v === undefined) return true;
+  if (!isPlainObject(v)) return false;
+  for (const f of ["input", "output", "cacheRead", "cacheWrite"]) {
+    if (v[f] === undefined) {
+      // Required on ModelDefinition's cost, optional on a ModelOverride's.
+      if (required) return false;
+      continue;
+    }
+    if (!isFiniteNumber(v[f])) return false;
+  }
+  if (v.tiers !== undefined && (!Array.isArray(v.tiers) || !v.tiers.every(isPlainObject))) return false;
+  return true;
+}
+
+/** ThinkingLevelMapSchema: every level maps to a string or null. */
+function optThinkingLevelMap(v: unknown): boolean {
+  if (v === undefined) return true;
+  if (!isPlainObject(v)) return false;
+  return Object.values(v).every((x) => x === null || typeof x === "string");
+}
+
+/** ModelOverrideSchema — the same fields as a model definition, all optional and
+ *  with no `id`. */
+function modelOverrideValid(v: unknown): boolean {
+  if (!isPlainObject(v)) return false;
+  if (!optNonEmptyString(v.name)) return false;
+  if (!optBoolean(v.reasoning)) return false;
+  if (!optThinkingLevelMap(v.thinkingLevelMap)) return false;
+  if (!optModelInput(v.input)) return false;
+  if (!optModelCost(v.cost, false)) return false;
+  if (!optPositiveNumber(v.contextWindow) || !optPositiveNumber(v.maxTokens)) return false;
+  if (!optStringRecord(v.headers)) return false;
+  if (v.compat !== undefined && !isPlainObject(v.compat)) return false;
+  return true;
+}
+
+/** Type.Array(Type.Union([Literal"text", Literal"image"])). */
+function optModelInput(v: unknown): boolean {
+  return v === undefined || (Array.isArray(v) && v.every((x) => x === "text" || x === "image"));
+}
+
 function modelDefinitionValid(model: unknown): boolean {
   if (!isPlainObject(model)) return false;
   if (typeof model.id !== "string" || model.id.length === 0) return false;
@@ -421,14 +470,13 @@ function modelDefinitionValid(model: unknown): boolean {
   if (!optBoolean(model.reasoning)) return false;
   if (!optPositiveNumber(model.contextWindow) || !optPositiveNumber(model.maxTokens)) return false;
   if (!optStringRecord(model.headers)) return false;
-  if (
-    model.input !== undefined &&
-    (!Array.isArray(model.input) || !model.input.every((x) => x === "text" || x === "image"))
-  )
-    return false;
-  if (model.cost !== undefined && !isPlainObject(model.cost)) return false;
+  if (!optModelInput(model.input)) return false;
+  if (!optModelCost(model.cost, true)) return false;
+  if (!optThinkingLevelMap(model.thinkingLevelMap)) return false;
+  // ProviderCompatSchema is a union of three all-optional shapes; a shape check
+  // is the faithful limit without transcribing 24 fields whose only effect is
+  // wire-format tweaks.
   if (model.compat !== undefined && !isPlainObject(model.compat)) return false;
-  if (model.thinkingLevelMap !== undefined && !isPlainObject(model.thinkingLevelMap)) return false;
   return true;
 }
 
@@ -449,7 +497,10 @@ function providerEntryValid(entry: unknown): boolean {
   if (!optStringRecord(entry.headers)) return false;
   if (!optBoolean(entry.authHeader)) return false;
   if (entry.compat !== undefined && !isPlainObject(entry.compat)) return false;
-  if (entry.modelOverrides !== undefined && !isPlainObject(entry.modelOverrides)) return false;
+  if (entry.modelOverrides !== undefined) {
+    if (!isPlainObject(entry.modelOverrides)) return false;
+    if (!Object.values(entry.modelOverrides).every(modelOverrideValid)) return false;
+  }
   if (entry.models !== undefined && (!Array.isArray(entry.models) || !entry.models.every(modelDefinitionValid)))
     return false;
   return true;
@@ -513,7 +564,12 @@ export function piAgentDir(home: string, procEnv: NodeJS.ProcessEnv = process.en
   const override = procEnv.PI_CODING_AGENT_DIR;
   if (override) {
     if (override === "~") return home;
-    if (override.startsWith("~/") || override.startsWith("~\\")) return join(home, override.slice(2));
+    // pi expands `~\` only on Windows; on POSIX that string is a RELATIVE path
+    // (a directory literally named "~\cfg"), so expanding it here would green a
+    // config pi reads from somewhere else entirely.
+    const tildeSlash =
+      override.startsWith("~/") || (process.platform === "win32" && override.startsWith("~\\"));
+    if (tildeSlash) return join(home, override.slice(2));
     // A RELATIVE override resolves against pi's own cwd, which readiness cannot
     // know — so we cannot say whether a config lives there. Null (= don't read
     // file-backed credentials) rather than guessing against OUR cwd, which could

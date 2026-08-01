@@ -493,6 +493,10 @@ describe("models.json", () => {
       '{"id":"m","name":""}', // minLength 1
       '{"id":"m","headers":{"X":1}}', // Record<string,string>
       '{"id":"m","input":["video"]}', // "text" | "image"
+      '{"id":"m","cost":{}}', // ModelCost requires all four rates
+      '{"id":"m","cost":{"input":"free","output":1,"cacheRead":1,"cacheWrite":1}}',
+      '{"id":"m","thinkingLevelMap":{"low":3}}', // string | null
+      '{"id":"m","compat":"yes"}',
     ]) {
       writePiFile(tmp, "models.json", `{"providers":{${good},"p":{"apiKey":"x","models":[${bad}]}}}`);
       expect(piModelsJsonUsable(modelsPath(), bareEnv()), bad).toBe(false);
@@ -504,6 +508,23 @@ describe("models.json", () => {
       '{"providers":{"p":{"apiKey":"x","models":[{"id":"m","reasoning":true,"contextWindow":8192,"input":["text","image"],"headers":{"X":"1"}}]}}}',
     );
     expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(true);
+  });
+
+  it("a fully-specified cost/override block is accepted", () => {
+    writePiFile(
+      tmp,
+      "models.json",
+      '{"providers":{"p":{"apiKey":"x","models":[{"id":"m","cost":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0}}],' +
+        '"modelOverrides":{"m":{"reasoning":true,"thinkingLevelMap":{"low":"1k","off":null}}}}}}',
+    );
+    expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(true);
+    // …and a malformed override invalidates the file, like any other violation.
+    writePiFile(
+      tmp,
+      "models.json",
+      '{"providers":{"p":{"apiKey":"x","modelOverrides":{"m":{"reasoning":"yes"}}}}}',
+    );
+    expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(false);
   });
 
   it("UNDECLARED extra fields are left alone (pi declares no additionalProperties)", () => {
