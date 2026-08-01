@@ -374,43 +374,85 @@ export function piModelsJsonUsable(file: string, procEnv: NodeJS.ProcessEnv = pr
   }
 }
 
-/** The subset of pi's ProviderConfigSchema we can check cheaply: `apiKey` and
- *  `baseUrl` are non-empty strings when present, `oauth` is the literal
- *  "radius", `models` is an array. This is NOT full TypeBox validation — it
- *  only has to catch the violations that would make pi throw the file away
- *  while our detector called it a credential. Anything we can't check is left
- *  permissive so we never false-red a file pi accepts. */
+/*
+ * models.json schema validation, transcribed from pi's TypeBox schemas in
+ * packages/coding-agent/src/core/model-config.ts:
+ *
+ *   ModelsConfigSchema   { providers: Record<string, ProviderConfig> }
+ *   ProviderConfigSchema { name?, baseUrl?, apiKey?, api?: String{minLength:1},
+ *                          oauth?: Literal"radius", headers?: Record<string,string>,
+ *                          compat?, authHeader?: Boolean,
+ *                          models?: ModelDefinition[], modelOverrides?: Record<…> }
+ *   ModelDefinitionSchema{ id: String{minLength:1}, name?/api?/baseUrl?: String{minLength:1},
+ *                          reasoning?: Boolean, thinkingLevelMap?, input?: ("text"|"image")[],
+ *                          cost?, contextWindow?/maxTokens?: Number, headers?: Record<string,string>,
+ *                          compat? }
+ *
+ * This matters because pi validates the file as a UNIT and DISCARDS it whole on
+ * any violation — so one malformed provider means none of the file's credentials
+ * reach pi. Fields whose sub-schemas we have not transcribed (compat, cost,
+ * thinkingLevelMap, modelOverrides) are only shape-checked, and UNDECLARED extra
+ * keys are left alone because the schemas declare no additionalProperties
+ * restriction — being stricter than pi there would false-red a file it loads.
+ */
+function optNonEmptyString(v: unknown): boolean {
+  return v === undefined || (typeof v === "string" && v.length > 0);
+}
+
+function optBoolean(v: unknown): boolean {
+  return v === undefined || typeof v === "boolean";
+}
+
+/** Type.Record(Type.String(), Type.String()) — every value must be a string. */
+function optStringRecord(v: unknown): boolean {
+  return v === undefined || (isPlainObject(v) && Object.values(v).every((x) => typeof x === "string"));
+}
+
+/** Type.Number(), plus provider-composer's runtime `<= 0` rejection. */
+function optPositiveNumber(v: unknown): boolean {
+  return v === undefined || (typeof v === "number" && Number.isFinite(v) && v > 0);
+}
+
+function modelDefinitionValid(model: unknown): boolean {
+  if (!isPlainObject(model)) return false;
+  if (typeof model.id !== "string" || model.id.length === 0) return false;
+  if (!optNonEmptyString(model.name) || !optNonEmptyString(model.api) || !optNonEmptyString(model.baseUrl))
+    return false;
+  if (!optBoolean(model.reasoning)) return false;
+  if (!optPositiveNumber(model.contextWindow) || !optPositiveNumber(model.maxTokens)) return false;
+  if (!optStringRecord(model.headers)) return false;
+  if (
+    model.input !== undefined &&
+    (!Array.isArray(model.input) || !model.input.every((x) => x === "text" || x === "image"))
+  )
+    return false;
+  if (model.cost !== undefined && !isPlainObject(model.cost)) return false;
+  if (model.compat !== undefined && !isPlainObject(model.compat)) return false;
+  if (model.thinkingLevelMap !== undefined && !isPlainObject(model.thinkingLevelMap)) return false;
+  return true;
+}
+
 function providerEntryValid(entry: unknown): boolean {
   if (!isPlainObject(entry)) return false;
+  if (
+    !optNonEmptyString(entry.name) ||
+    !optNonEmptyString(entry.baseUrl) ||
+    !optNonEmptyString(entry.apiKey) ||
+    !optNonEmptyString(entry.api)
+  )
+    return false;
   if (entry.oauth !== undefined) {
     if (entry.oauth !== "radius") return false;
-    // provider-composer.ts throws `"baseUrl" is required when "oauth" is set`,
-    // which discards the file — so an oauth entry without one is not a credential.
+    // provider-composer.ts throws `"baseUrl" is required when "oauth" is set`.
     if (typeof entry.baseUrl !== "string" || entry.baseUrl.length === 0) return false;
   }
-  if (entry.models !== undefined) {
-    if (!Array.isArray(entry.models)) return false;
-    // Every model definition needs an id; a `{}` model is not a usable model and
-    // fails the schema, taking the whole file with it.
-    if (!entry.models.every((m) => isPlainObject(m) && typeof m.id === "string" && m.id.length > 0))
-      return false;
-  }
-  // Fields pi declares as `Type.String({minLength: 1})`: present means it must
-  // BE a non-empty string. A wrong TYPE (`apiKey: 1`) fails the schema just as
-  // hard as an empty one, and pi throws the whole file away either way.
-  for (const field of ["apiKey", "baseUrl", "name", "api"]) {
-    const v = entry[field];
-    if (v !== undefined && (typeof v !== "string" || v.length === 0)) return false;
-  }
-  // `headers` is a string->string map for pi; a non-string value fails the schema.
-  if (entry.headers !== undefined) {
-    if (!isPlainObject(entry.headers)) return false;
-    if (!Object.values(entry.headers).every((v) => typeof v === "string")) return false;
-  }
-  // Anything we have NOT enumerated: only reject an EMPTY string, which fails
-  // minLength 1 for every string field pi declares. Length, NOT trim — minLength
-  // 1 accepts `" "`, so trimming would false-red a config pi loads fine.
-  return Object.values(entry).every((v) => typeof v !== "string" || v.length > 0);
+  if (!optStringRecord(entry.headers)) return false;
+  if (!optBoolean(entry.authHeader)) return false;
+  if (entry.compat !== undefined && !isPlainObject(entry.compat)) return false;
+  if (entry.modelOverrides !== undefined && !isPlainObject(entry.modelOverrides)) return false;
+  if (entry.models !== undefined && (!Array.isArray(entry.models) || !entry.models.every(modelDefinitionValid)))
+    return false;
+  return true;
 }
 
 /** True only for an existing REGULAR file — a directory at a credentials path is
@@ -440,7 +482,9 @@ export function piVertexAdcUsable(home: string, procEnv: NodeJS.ProcessEnv = pro
   const project = procEnv.GOOGLE_CLOUD_PROJECT?.trim() || procEnv.GCLOUD_PROJECT?.trim();
   const location = procEnv.GOOGLE_CLOUD_LOCATION?.trim();
   if (!project || !location) return false;
-  const explicit = procEnv.GOOGLE_APPLICATION_CREDENTIALS?.trim();
+  // NOT trimmed: pi uses the literal value, so a space-padded path that
+  // resolves for us would not resolve for pi.
+  const explicit = procEnv.GOOGLE_APPLICATION_CREDENTIALS;
   if (explicit) {
     // Must point at a file that is actually there. A RELATIVE path resolves
     // against pi's cwd, which readiness cannot know — so it is unverifiable, and
@@ -465,7 +509,8 @@ export function piVertexAdcUsable(home: string, procEnv: NodeJS.ProcessEnv = pro
  * found the credentials fine.
  */
 export function piAgentDir(home: string, procEnv: NodeJS.ProcessEnv = process.env): string | null {
-  const override = procEnv.PI_CODING_AGENT_DIR?.trim();
+  // NOT trimmed, for the same reason as GOOGLE_APPLICATION_CREDENTIALS above.
+  const override = procEnv.PI_CODING_AGENT_DIR;
   if (override) {
     if (override === "~") return home;
     if (override.startsWith("~/") || override.startsWith("~\\")) return join(home, override.slice(2));
