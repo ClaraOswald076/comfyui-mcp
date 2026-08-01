@@ -597,6 +597,19 @@ describe("UiBridge (multi-tab)", () => {
     b.close();
   });
 
+  it("dropQueuedDeliveries REJECTS an in-flight command so its late reply can't resolve the prior call (#570 P0)", async () => {
+    const a = await connectPanel("wf:foo.json");
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    // A command is in flight on the live socket (no autoReply → pending, un-acked).
+    const promise = bridge.send({ cmd: "graph_get_state" }, { tabId: "wf:foo.json", timeoutMs: 5000 });
+    await new Promise((r) => setTimeout(r, 50));
+    // The workflow is replaced in place → the identity reset cancels in-flight work so a late
+    // reply can't resolve the PRIOR workflow's tool call.
+    bridge.dropQueuedDeliveries("wf:foo.json");
+    await expect(promise).rejects.toThrow(/replaced by a different workflow|cancelled/);
+    a.close();
+  });
+
   it("resumes a read addressed by tab-id PREFIX after reconnect (canonical key) (#450)", async () => {
     const a1 = await connectPanel("tab-aaaa-1111");
     await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));

@@ -1559,6 +1559,25 @@ export class UiBridge {
         }
       }
     }
+    // In-flight command promises for this tab: a reply arriving AFTER the workflow was
+    // replaced must NOT resolve the PRIOR workflow's tool call (leaking the replacement's
+    // graph/data back into it). Reject + drop them. (The already-written command may still
+    // EXECUTE in the browser — that is the deferred generation-bound-command residual, which
+    // server-side cancellation cannot retract; this only fences the reply/data flow back.)
+    for (const [rid, p] of this.pending) {
+      if (p.ctx.tabId !== tabId) continue;
+      clearTimeout(p.timer);
+      this.pending.delete(rid);
+      try {
+        p.reject(
+          new Error(
+            `panel tab ${tabId.slice(0, 8)} was replaced by a different workflow — in-flight "${p.cmd}" cancelled so its reply can't resolve the prior workflow's call`,
+          ),
+        );
+      } catch {
+        // reject already settled — nothing to do
+      }
+    }
   }
 
   /** Deliver any buffered render frames to a tab that just (re)connected, plus a
