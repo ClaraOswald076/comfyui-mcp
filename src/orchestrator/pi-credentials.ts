@@ -258,11 +258,24 @@ export function authRecordUsable(
   record: unknown,
   procEnv: NodeJS.ProcessEnv = process.env,
   nowMs: number = Date.now(),
+  provider?: string,
 ): boolean {
   if (!isPlainObject(record)) return false;
   const type = record.type;
   if (type === "api_key") {
-    return credentialValueUsable(record.key, isPlainObject(record.env) ? record.env : undefined, procEnv);
+    const entryEnv = isPlainObject(record.env) ? record.env : undefined;
+    if (!credentialValueUsable(record.key, entryEnv, procEnv)) return false;
+    // Companion config (cloudflare's account/gateway ids) may come from the
+    // record's own `env` block or the environment; without it pi's resolver
+    // returns undefined and the stored key is useless.
+    const required = provider ? PI_PROVIDER_ENV_REQUIRED[provider] : undefined;
+    if (required) {
+      return required.every((k) => {
+        const fromEntry = entryEnv?.[k];
+        return (typeof fromEntry === "string" && fromEntry.trim() !== "") || !!procEnv[k]?.trim();
+      });
+    }
+    return true;
   }
   if (type === "oauth") {
     // pi declares refresh + access + expires as all required, and that is what
@@ -299,7 +312,9 @@ export function piAuthJsonUsable(
   procEnv: NodeJS.ProcessEnv = process.env,
   nowMs: number = Date.now(),
 ): boolean {
-  return Object.values(piAuthRecords(file)).some((rec) => authRecordUsable(rec, procEnv, nowMs));
+  return Object.entries(piAuthRecords(file)).some(([provider, rec]) =>
+    authRecordUsable(rec, procEnv, nowMs, provider),
+  );
 }
 
 /** The parsed auth.json map, or `{}` when missing/corrupt. Used both for
@@ -380,11 +395,21 @@ function providerEntryValid(entry: unknown): boolean {
     if (!entry.models.every((m) => isPlainObject(m) && typeof m.id === "string" && m.id.length > 0))
       return false;
   }
-  // pi's schema declares its string fields with minLength 1, so an EMPTY string
-  // (`name: ""`, `baseUrl: ""`, …) fails validation and makes pi discard the
-  // whole file. Checked generically to cover the fields we haven't enumerated
-  // without reproducing the full TypeBox schema. Length, NOT trim: minLength 1
-  // accepts `" "`, so trimming here would false-red a config pi loads fine.
+  // Fields pi declares as `Type.String({minLength: 1})`: present means it must
+  // BE a non-empty string. A wrong TYPE (`apiKey: 1`) fails the schema just as
+  // hard as an empty one, and pi throws the whole file away either way.
+  for (const field of ["apiKey", "baseUrl", "name", "api"]) {
+    const v = entry[field];
+    if (v !== undefined && (typeof v !== "string" || v.length === 0)) return false;
+  }
+  // `headers` is a string->string map for pi; a non-string value fails the schema.
+  if (entry.headers !== undefined) {
+    if (!isPlainObject(entry.headers)) return false;
+    if (!Object.values(entry.headers).every((v) => typeof v === "string")) return false;
+  }
+  // Anything we have NOT enumerated: only reject an EMPTY string, which fails
+  // minLength 1 for every string field pi declares. Length, NOT trim — minLength
+  // 1 accepts `" "`, so trimming would false-red a config pi loads fine.
   return Object.values(entry).every((v) => typeof v !== "string" || v.length > 0);
 }
 
@@ -439,12 +464,17 @@ export function piVertexAdcUsable(home: string, procEnv: NodeJS.ProcessEnv = pro
  * who relocated their pi config was reading as "not signed in" while pi itself
  * found the credentials fine.
  */
-export function piAgentDir(home: string, procEnv: NodeJS.ProcessEnv = process.env): string {
+export function piAgentDir(home: string, procEnv: NodeJS.ProcessEnv = process.env): string | null {
   const override = procEnv.PI_CODING_AGENT_DIR?.trim();
   if (override) {
     if (override === "~") return home;
     if (override.startsWith("~/") || override.startsWith("~\\")) return join(home, override.slice(2));
-    return override;
+    // A RELATIVE override resolves against pi's own cwd, which readiness cannot
+    // know — so we cannot say whether a config lives there. Null (= don't read
+    // file-backed credentials) rather than guessing against OUR cwd, which could
+    // green a config pi will never see. Same stance as a relative
+    // GOOGLE_APPLICATION_CREDENTIALS.
+    return isAbsolute(override) ? override : null;
   }
   return join(home, ".pi", "agent");
 }
@@ -494,14 +524,18 @@ export function piCredentialPresent(
   nowMs: number = Date.now(),
 ): boolean {
   const agentDir = piAgentDir(home, procEnv);
-  const authFile = join(agentDir, "auth.json");
-  const stored = piAuthRecords(authFile);
-  if (Object.values(stored).some((rec) => authRecordUsable(rec, procEnv, nowMs))) return true;
+  // agentDir null = a relative PI_CODING_AGENT_DIR we cannot resolve; the
+  // file-backed sources are unreadable, but env/ADC still apply.
+  const stored = agentDir ? piAuthRecords(join(agentDir, "auth.json")) : {};
+  if (
+    Object.entries(stored).some(([provider, rec]) => authRecordUsable(rec, procEnv, nowMs, provider))
+  )
+    return true;
   if (piEnvCredentialPresent(stored, procEnv)) return true;
   // Vertex ADC is ambient credential too, so a stored google-vertex record owns
   // that provider and suppresses it (same rule as the env keys above).
   if (!providerHasStoredCredential(stored, "google-vertex") && piVertexAdcUsable(home, procEnv))
     return true;
-  if (piModelsJsonUsable(join(agentDir, "models.json"), procEnv)) return true;
+  if (agentDir && piModelsJsonUsable(join(agentDir, "models.json"), procEnv)) return true;
   return false;
 }
