@@ -2713,43 +2713,35 @@ export async function runPanelOrchestrator(): Promise<void> {
         // else the tab's identity from its PRIOR hello (captured before we overwrote it) —
         // which is how the no-durable-record live-agent window is covered.
         //
-        // FAIL CLOSED — state is kept ONLY when POSITIVELY PROVEN: BOTH the state's
-        // identity AND this hello's identity exist AND are equal. An IDENTITY-LESS re-hello
-        // (no trusted server origin / no valid uuid — a relay/old/non-browser client) can NOT
-        // prove continuity, so its state is torn down rather than risk continuing a replaced
-        // workflow's private conversation. A browser panel ALWAYS carries a trusted handshake
-        // origin, so it proves out and is never reset for lack of identity — only genuinely
-        // identity-less (non-browser) or pre-`u`/legacy clients pay the reset. (Disclosed
-        // trade-off: such a client loses conversation continuity across a reload/reconnect —
-        // a lost resume, never a cross-workflow leak.)
+        // INVERTED GATE (#570 P0): decide only whether to KEEP the tab's state, on POSITIVE
+        // identity proof — the state's identity AND this hello's identity both present AND
+        // equal (origin::uuid). When NOT positively proven (a workflow replaced in place, a
+        // cross-origin copied uuid, an unbound pre-`u`/legacy record, OR an identity-less
+        // client that can't prove continuity), tear down EVERYTHING for this tab id
+        // UNCONDITIONALLY — never gate the teardown on state-presence, because a channel we
+        // don't "see" here (a bridge-buffered frame/mailbox item with no manager state) still
+        // leaks. The teardown is idempotent (a no-op per empty channel) and covers the COMPLETE
+        // channel list so a future channel is swept automatically. This kills the whole
+        // "gate missed a channel" class (rebind / cold import / hello.resume / spawn-window /
+        // held-gen / bridge buffers were all the same bug). A browser panel always carries a
+        // trusted handshake origin so it proves out; only genuinely identity-less (non-browser)
+        // or pre-`u`/legacy clients pay a lost resume (never a cross-workflow leak).
         const helloIdentity = newIdentity ? `${newIdentity.origin}::${newIdentity.uuid}` : undefined;
         const stateIdentity =
           sessionStore.identityOf(key) ??
           (priorTabIdentity ? `${priorTabIdentity.origin}::${priorTabIdentity.uuid}` : undefined);
-        const heldGenKeys = [...heldDuringGen.keys()].filter((hk) => panelTabOf(hk) === panelTab);
-        // hasAnyState covers the live agent, an armed pending resume, AND failed-start held
-        // mail (a prepare failure parks queued messages with no agent/session) — so a reset
-        // fires even in the spawn→first-session window or after a prepare failure.
-        const hasState =
-          manager.hasAnyState(key) || sessionStore.get(key) !== undefined || heldGenKeys.length > 0;
         const provenOwn =
           stateIdentity !== undefined && helloIdentity !== undefined && stateIdentity === helloIdentity;
-        if (hasState && !provenOwn) {
-          // FULL session boundary. manager.reset() stops the mapped agent (whose backend
-          // still holds the PRIOR workflow's session), clears its pending resume + held
-          // mail, AND the durable exact session. Then cancel the render-held queue for
-          // this tab across ALL providers, or onRunEnd would flush A's private messages
-          // into the replacement B under the reused key. (The old workflow's own stable
-          // entry, keyed by ITS uuid, stays valid should it ever be restored.)
-          manager.reset(key);
-          for (const hk of heldGenKeys) heldDuringGen.delete(hk);
-          // Drop the bridge's buffered deliveries (missed frames + render mailbox) for this
-          // tab too — they belong to the PRIOR workflow; the bridge defers its on-hello
-          // replay until AFTER this handler so this purge lands first (#570 P0).
+        if (!provenOwn) {
+          // Tear down every channel for panelTab. manager.reset() stops the agent + clears
+          // pending resume + held mail + durable session, per provider; heldDuringGen is the
+          // render-held queue; dropQueuedDeliveries is the bridge's missed frames + mailbox
+          // (the bridge defers its on-hello replay until AFTER this handler so this lands first).
+          for (const b of KNOWN_BACKENDS) manager.reset(panelTab + AGENT_KEY_SEP + b);
+          for (const hk of [...heldDuringGen.keys()]) {
+            if (panelTabOf(hk) === panelTab) heldDuringGen.delete(hk);
+          }
           bridge.dropQueuedDeliveries(panelTab);
-          logger.info(
-            `[panel-orchestrator] tab ${panelTab.slice(0, 8)} per-tab state not provably this workflow's identity — reset the live agent + durable session + render-held queue + buffered deliveries`,
-          );
         }
       }
 
