@@ -5,15 +5,15 @@ import { dirname, join, isAbsolute, resolve } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { config, isRemoteMode } from "../config.js";
 import {
-  resolveServerExtraModelConfig,
   parseExtraModelPathsConfigsFromArgvRaw,
   type LiveServerSnapshot,
 } from "./output-dir.js";
 import {
   liveRootFromArgv,
+  liveScriptFromArgv,
   didLaunchLocalComfyUI,
+  getLiveServerSnapshot,
   resolveEffectiveComfyUIBase,
-  resolveLiveComfyUIBase,
 } from "./workspace-env.js";
 import { ValidationError } from "../utils/errors.js";
 
@@ -573,20 +573,22 @@ function isDesktopGeneratedConfig(path: string): boolean {
  * `/installs/B/main.py` makes ComfyUI read `/installs/B/extra_model_paths.yaml`, and
  * writing `/launcher/…` instead would be a silent no-op (codex round 6, P1a).
  *
- * Requiring the file to RESOLVE also proves the live root is reachable on THIS
- * filesystem. A server in a container/WSL/another machine reports a root we cannot see;
- * returning undefined there makes the caller refuse explicitly instead of creating a
- * lookalike tree locally and reporting success (codex round 6, P1b).
+ * It is the EXACT argv script that is resolved — not a sibling `main.py` picked by name —
+ * so a server running `main.pyw` next to an unrelated symlinked `main.py` still resolves
+ * to its own root (codex round 7). Requiring the file to RESOLVE also proves the live
+ * root is reachable on THIS filesystem: a server in a container/WSL/another machine
+ * reports a root we cannot see, and returning undefined there makes the caller refuse
+ * explicitly instead of creating a lookalike tree locally and reporting success.
  */
-function realLiveRoot(liveRoot: string): string | undefined {
-  for (const name of ["main.py", "main.pyw"]) {
-    try {
-      return dirname(realpathSync(join(liveRoot, name)));
-    } catch {
-      // not this name / not visible from here — try the next
-    }
+function realLiveRoot(scriptPath: string): string | undefined {
+  try {
+    const real = realpathSync(scriptPath);
+    // A DIRECTORY named main.py would realpath fine and prove nothing (codex round 7).
+    if (!statSync(real).isFile()) return undefined;
+    return dirname(real);
+  } catch {
+    return undefined; // not visible from here (container/WSL/another host), or gone
   }
-  return undefined;
 }
 
 /**
@@ -599,19 +601,20 @@ function realLiveRoot(liveRoot: string): string | undefined {
  * whole branch exists to stop.
  */
 function implicitLiveTarget(
-  reportedRoot: string,
+  scriptPath: string,
   opts: ExtraPathOptions,
 ): ResolvedTarget & { serverResolved: boolean } {
-  const liveRoot = realLiveRoot(reportedRoot);
+  const liveRoot = realLiveRoot(scriptPath);
   const seen = liveRoot ? statDir(liveRoot) : undefined;
   if (!liveRoot || !seen) {
     throw new ValidationError(
-      `UNRESOLVED: the running ComfyUI reports its install root as "${reportedRoot}", but its ` +
-        "main.py cannot be resolved from this process — the server is running on a filesystem " +
-        "this MCP cannot see (another machine, a container, or WSL), or it moved since launch. " +
-        "That is the file the server actually reads, so nothing was read or written; creating a " +
-        "lookalike config locally would be a silent no-op. Pass config_path explicitly to target " +
-        "a file you can reach.",
+      `UNRESOLVED: the running ComfyUI was launched from "${scriptPath}", which cannot be ` +
+        "resolved to a file from this process — the server is running on a filesystem this MCP " +
+        "cannot see (another machine, a container, or WSL), or it moved since launch. The " +
+        "extra_model_paths.yaml it reads sits next to that script, so nothing was read or " +
+        "written; creating a lookalike config locally would be a silent no-op. Pass config_path " +
+        "explicitly to target a file you can reach, or target: \"standalone\"/\"desktop\" to use " +
+        "the local heuristic deliberately.",
     );
   }
   const path = join(liveRoot, "extra_model_paths.yaml");
@@ -661,6 +664,15 @@ function implicitLiveTarget(
  * existence gate cannot catch that — `A` is real, just not the one in use — so the fix
  * has to be resolving from the live server rather than warning about a divergence.
  * Skipped in remote mode (the live root is a path on the remote host).
+ *
+ * Everything the live server contributes comes from ONE `/system_stats` snapshot, so the
+ * launch flags and the install root can never be read from two different server states.
+ * And when the server IS reachable but tells us nothing usable — a relative
+ * `--extra-model-paths-config` with no reported cwd, or an argv with no `main.py` — the
+ * answer is an explicit UNRESOLVED, never a quiet fall-through to the local heuristic:
+ * we would be guessing at a file the running server does not read, and "success" on that
+ * guess is exactly the silent no-op this branch exists to stop. `target`/`config_path`
+ * remain the deliberate escape hatch, and both short-circuit above this.
  */
 async function resolveTargetPathPreferServer(
   opts: ExtraPathOptions = {},
@@ -670,13 +682,43 @@ async function resolveTargetPathPreferServer(
     return { ...resolveTargetPath(opts), serverResolved: false };
   }
 
-  const serverConfig = await resolveServerExtraModelConfig();
-  if (!serverConfig) {
-    // No launch flag — fall back to the file the live server IMPLICITLY reads before
-    // any static/local heuristic. resolveLiveComfyUIBase is remote-safe and never throws.
-    const liveRoot = await resolveLiveComfyUIBase();
-    if (liveRoot) return implicitLiveTarget(liveRoot, opts);
+  const snapshot = await getLiveServerSnapshot(); // remote/unreachable → reachable:false
+  if (!snapshot.reachable) {
     return { ...resolveTargetPath(opts), serverResolved: false };
+  }
+
+  const rawFlags = parseExtraModelPathsConfigsFromArgvRaw(snapshot.argv);
+  if (rawFlags.length === 0) {
+    // No flag — ComfyUI auto-loads the yaml next to its own main.py.
+    const script = liveScriptFromArgv(snapshot.argv, snapshot.cwd);
+    if (script) return implicitLiveTarget(script, opts);
+    throw new ValidationError(
+      "UNRESOLVED: the running ComfyUI was not launched with --extra-model-paths-config and " +
+        "its launch argv does not reveal a main.py, so the extra_model_paths.yaml it reads " +
+        "cannot be located. Nothing was read or written — the local heuristic would just be a " +
+        'guess at a file this server may not read. Pass config_path explicitly, or target: ' +
+        '"standalone"/"desktop" to use the local heuristic deliberately.',
+    );
+  }
+
+  // ComfyUI resolves a launch flag with os.path.abspath, i.e. against the SERVER's cwd.
+  // A relative value with no reported server cwd is UNRESOLVABLE from here: anchoring it
+  // to this process's cwd/COMFYUI_PATH would target a same-named file in the wrong tree
+  // (the same rule #346 applies to --output-directory and #633 to authorization).
+  const rawFlag = rawFlags[0];
+  const serverConfig = isAbsolute(rawFlag)
+    ? resolve(rawFlag)
+    : snapshot.cwd && isAbsolute(snapshot.cwd)
+      ? resolve(snapshot.cwd, rawFlag)
+      : undefined;
+  if (!serverConfig) {
+    throw new ValidationError(
+      `UNRESOLVED: the running ComfyUI was launched with a RELATIVE --extra-model-paths-config ` +
+        `("${rawFlag}") and does not report its working directory, so the file it reads cannot ` +
+        "be located from this process. Resolving it here would point at a same-named file under " +
+        "this MCP's own directory and the edit would be a silent no-op. Nothing was read or " +
+        "written — pass config_path explicitly with the absolute path the server uses.",
+    );
   }
 
   const notes = [

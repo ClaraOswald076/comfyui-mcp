@@ -140,6 +140,31 @@ export async function resolveLiveComfyUIBase(): Promise<string | undefined> {
   }
 }
 
+/**
+ * ONE `/system_stats` snapshot for callers that need to derive several things from the
+ * SAME server state (the launch flags AND the install root), rather than issuing two
+ * calls that could straddle a restart — the same invariant `resolveModelsDirWithBases`
+ * keeps for the download destination. `reachable: false` covers remote mode (the server's
+ * paths are on another host) and any failure. Never throws.
+ */
+export async function getLiveServerSnapshot(): Promise<{
+  reachable: boolean;
+  argv?: string[];
+  cwd?: string;
+}> {
+  if (isRemoteMode()) return { reachable: false };
+  try {
+    const stats = await getSystemStats();
+    return {
+      reachable: true,
+      argv: stats.system?.argv,
+      cwd: (stats.system as { cwd?: string })?.cwd,
+    };
+  } catch {
+    return { reachable: false };
+  }
+}
+
 async function readWorkspaceConfig(): Promise<WorkspaceConfig> {
   const path = workspaceConfigPath();
   if (!existsSync(path)) return {};
@@ -382,6 +407,26 @@ export function liveRootFromArgv(
   argv: string[] | undefined,
   cwd?: string,
 ): string | undefined {
+  const script = liveScriptFromArgv(argv, cwd);
+  return script ? dirname(script) : undefined;
+}
+
+/**
+ * The same derivation as `liveRootFromArgv` but returning the `main.py` FILE itself
+ * rather than its directory — `dirname()` of this is exactly what `liveRootFromArgv`
+ * returns, which is why that function delegates here instead of duplicating the parse.
+ *
+ * The file path is what a caller needs to follow a SYMLINK: ComfyUI locates its implicit
+ * `extra_model_paths.yaml` next to `os.path.realpath(__file__)`, so a launcher that keeps
+ * `/launcher/main.py` symlinked to `/installs/B/main.py` reads `/installs/B/…`. Only the
+ * script path can be realpath'd; the directory cannot (the symlink is on the file).
+ * Callers that must not follow symlinks — notably the #633 authorization path, which is
+ * anchored to the lexical argv root — keep using `liveRootFromArgv`.
+ */
+export function liveScriptFromArgv(
+  argv: string[] | undefined,
+  cwd?: string,
+): string | undefined {
   if (!Array.isArray(argv)) return undefined;
   for (const rawArg of argv) {
     if (typeof rawArg !== "string") continue;
@@ -392,11 +437,11 @@ export function liveRootFromArgv(
     const dir = dirname(a);
     if (dir === "." || dir === "") {
       // Bare "main.py" — only resolvable via an absolute cwd.
-      return cwd && isAbsolute(cwd) ? cwd : undefined;
+      return cwd && isAbsolute(cwd) ? pathResolve(cwd, a) : undefined;
     }
-    if (isAbsolute(dir)) return dir;
+    if (isAbsolute(dir)) return a;
     // Relative dir (e.g. "ComfyUI/main.py") — resolve against the server's cwd.
-    if (cwd && isAbsolute(cwd)) return pathResolve(cwd, dir);
+    if (cwd && isAbsolute(cwd)) return pathResolve(cwd, a);
     return undefined; // cannot resolve to an absolute dir → UNRESOLVED
   }
   return undefined;

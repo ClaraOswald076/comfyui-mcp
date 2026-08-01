@@ -26,9 +26,7 @@ vi.mock("../../config.js", () => ({
   getComfyUIBaseUrl: () => "http://127.0.0.1:8188",
 }));
 
-vi.mock("../../services/output-dir.js", () => ({
-  resolveServerExtraModelConfig: vi.fn(async () => undefined),
-}));
+// The real argv parsers are used — server behavior is expressed as launch argv.
 
 const mockGetSystemStats = vi.hoisted(() =>
   vi.fn(async (): Promise<{ system?: { argv?: string[]; cwd?: string } }> => {
