@@ -2556,6 +2556,12 @@ export async function runPanelOrchestrator(): Promise<void> {
           // the newly-selected canvas (codex review) — it fails to route instead, and
           // the retired agent ignores the error.
           bridge.revokeTabMigration(migratedFrom);
+          // Complete bridge reset for the OLD id too: its pending in-flight commands, parked
+          // reads, and buffered deliveries must be cancelled — the identity-boundary block
+          // below runs for panelTab (the NEW id), so without this a reply to a command sent
+          // under migratedFrom would still resolve the retired workflow's tool call after the
+          // switch (#570 P0). The socket is unchanged, so only queued WORK is dropped.
+          bridge.dropQueuedDeliveries(migratedFrom);
           manager.retire(migratedFrom + AGENT_KEY_SEP + prevBackend);
           logger.info(
             `[panel-orchestrator] same-socket re-hello ${migratedFrom.slice(0, 12)} → ${panelTab.slice(0, 12)} without proven workflow continuity — old agent retired (NOT rebound); each workflow keeps its own conversation`,
