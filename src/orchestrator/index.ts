@@ -82,6 +82,7 @@ import { buildStartFailureNotice } from "./start-failure-notice.js";
 import { readyBannerText, bannerCorrection } from "./ready-banner.js";
 import { OAUTH_PROVIDERS } from "../services/oauth-flow.js";
 import { startPanelMcpHttpServer, type PanelMcpHttpServer } from "./panel-mcp-http.js";
+import { resolveHttpLaneComfyToolMode } from "./http-backend-tools.js";
 import { startPanelConsoleHttpServer, type PanelConsoleHttpServer } from "./panel-console-http.js";
 import type { AgentBackend } from "./agent-backend.js";
 import { readComfyuiCrashLog, formatCrashNote } from "../services/crash-log.js";
@@ -1573,6 +1574,10 @@ export async function runPanelOrchestrator(): Promise<void> {
   // Shared MCP server config for BOTH the Codex and Gemini backends — they take an
   // identical { transport } spec (the headless comfyui stdio MCP + the panel HTTP
   // MCP for this tab). Claude keeps its own in-process server set unchanged.
+  // #291: spawn comfyui COMPACT for these non-Claude HTTP backends so its ~250
+  // tools don't saturate the backend's tool budget and make codex silently drop
+  // the panel_* HTTP-MCP tools (overridable via COMFYUI_MCP_TOOL_MODE=full).
+  const httpLaneComfyToolMode = resolveHttpLaneComfyToolMode();
   const makeHttpBackendMcpServers = (tabId: string) => ({
     // Headless comfyui MCP (this build) over stdio — same as Claude.
     comfyui: {
@@ -1585,6 +1590,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       // withholds image pixels from the model.
       env: buildComfyuiMcpEnv({
         ...comfyuiBaseEnv(),
+        COMFYUI_MCP_TOOL_MODE: httpLaneComfyToolMode,
         ...(blindTabs.has(tabId) ? { COMFYUI_MCP_BLIND: "1" } : {}),
       }),
     },
