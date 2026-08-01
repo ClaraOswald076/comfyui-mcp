@@ -424,11 +424,6 @@ function managerQueuePrefixFor(api: ManagerApi): string {
   return api === "legacy" ? "/manager/queue" : "/v2/manager/queue";
 }
 
-/** Queue route prefix for the currently detected generation. */
-async function managerQueuePrefix(): Promise<string> {
-  return managerQueuePrefixFor(await detectManagerApi());
-}
-
 /** Appended to every legacy-Manager operation failure so users know they're on
  *  the partial feature set and how to get off it. */
 const MANAGER_UPGRADE_HINT =
@@ -568,15 +563,15 @@ export function setQueueTimingForTests(
  * Kick off the Manager queue worker and poll until it drains.
  * Returns the final queue status.
  *
- * Callers that just enqueued something pass the dialect they ACTUALLY enqueued
- * with: re-deriving the prefix from the cache here could start and poll a
- * different generation's queue than the one holding our task (a self-heal retry,
- * or a concurrent detection landing mid-operation), which reports a false failure
- * for work that is really running (#646). Only callers with nothing in flight
- * fall back to the currently detected dialect.
+ * `api` is REQUIRED and must be the dialect the caller ACTUALLY enqueued with.
+ * Re-deriving the prefix from the cache here could start and poll a different
+ * generation's queue than the one holding our task (after a self-heal retry, or
+ * when a concurrent detection lands mid-operation), reporting a false failure for
+ * work that is really running — and inviting a caller retry that double-executes
+ * it (#646).
  */
-async function runManagerQueue(api?: ManagerApi): Promise<QueueStatus> {
-  const prefix = api ? managerQueuePrefixFor(api) : await managerQueuePrefix();
+async function runManagerQueue(api: ManagerApi): Promise<QueueStatus> {
+  const prefix = managerQueuePrefixFor(api);
   // queue/start returns 200 (worker started) or 201 (already running) — both
   // are 2xx, so managerFetch accepts either. Same on both generations. Some
   // legacy 3.x builds expose start as GET-only, so negotiate POST→GET on a 405
