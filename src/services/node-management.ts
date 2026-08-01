@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
-import { config, getComfyUIBaseUrl, isLoopbackHost } from "../config.js";
+import { config, getComfyUIBaseUrl } from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
 import { resetObjectInfoCache } from "../comfyui/client.js";
 import { progressEnabled, reportDownloadProgress } from "./download-progress.js";
@@ -1369,116 +1369,10 @@ function isManagerSelfTarget(id: string): boolean {
 }
 
 /**
- * The on-disk ComfyUI-Manager git checkout that belongs to the CONNECTED ComfyUI,
- * or undefined when there is none we can honestly claim to be the same install.
- *
- * The loopback gate matters: `config.comfyuiPath` is a LOCAL filesystem path, so
- * when the connected Manager lives on another host (RunPod, a LAN box) pulling the
- * local checkout would update a DIFFERENT machine's Manager and report that as the
- * fix — a fabricated success. Only when the Manager we just talked to is on this
- * machine is the local checkout the same Manager.
+ * Actionable terminal error for a Manager build that does not register its own
+ * self-update route. This is the ONLY outcome of that case — see updateManagerSelf
+ * for why there is deliberately no local-git fallback.
  */
-function localManagerCheckoutDir(): string | undefined {
-  if (!config.comfyuiPath) return undefined;
-  let host: string | undefined;
-  try {
-    host = new URL(managerBaseUrl()).hostname;
-  } catch {
-    host = undefined;
-  }
-  if (!isLoopbackHost(host)) return undefined;
-  const customNodesRoot = resolve(config.comfyuiPath, "custom_nodes");
-  return ["ComfyUI-Manager", "comfyui-manager", "comfyui_manager"]
-    .map((d) => join(customNodesRoot, d))
-    .find((p) => existsSync(join(p, ".git")));
-}
-
-/** Current HEAD of a git checkout, or undefined when it can't be read. Used to
- *  PROVE whether a pull actually moved the checkout (never assume it did). */
-function gitHeadOf(dir: string): string | undefined {
-  try {
-    const out = execFileSync("git", ["-C", dir, "rev-parse", "HEAD"], {
-      cwd: dir,
-      encoding: "utf-8",
-      timeout: GIT_CLONE_TIMEOUT,
-      env: nonInteractiveGitEnv(),
-    });
-    const head = String(out).trim();
-    return head.length ? head : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * Directly git-pull the local custom_nodes/ComfyUI-Manager checkout — the LAST
- * RESORT for the one op a Manager build can refuse: updating the running Manager
- * itself (#424). Returns undefined when there is no usable local checkout (remote
- * ComfyUI, no comfyuiPath, or a pip comfyui_manager install with no custom_nodes
- * clone), so the caller can surface an actionable error instead. A
- * NodeManagementError from the git pull itself propagates.
- *
- * The result NEVER claims an update that didn't happen: HEAD is read before and
- * after the pull, and an unchanged (or unreadable) HEAD is reported as exactly
- * that. `git pull` exiting 0 on "Already up to date." is a no-op, not a fix.
- */
-function updateManagerSelfLocally(): NodeOpResult | undefined {
-  const dir = localManagerCheckoutDir();
-  if (!dir) return undefined;
-  const before = gitHeadOf(dir);
-  let out: string;
-  try {
-    out = String(
-      execFileSync("git", ["-C", dir, "pull", "--ff-only"], {
-        cwd: config.comfyuiPath,
-        encoding: "utf-8",
-        timeout: GIT_CLONE_TIMEOUT,
-        env: nonInteractiveGitEnv(),
-      }),
-    );
-  } catch (err) {
-    const e = err as NodeJS.ErrnoException & { stdout?: Buffer | string; stderr?: Buffer | string };
-    throw new NodeManagementError(
-      `git pull of the local ComfyUI-Manager checkout (${dir}) failed: ${e.message}. ` +
-        `Update it manually (git pull, or pip install -U comfyui_manager) then restart ComfyUI.`,
-      { stdout: e.stdout?.toString() ?? "", stderr: e.stderr?.toString() ?? "" },
-    );
-  }
-  const after = gitHeadOf(dir);
-  const details = { dir, before, after, output: out.trim() };
-  if (before === undefined || after === undefined) {
-    return {
-      mechanism: "git-clone",
-      message:
-        `Ran a git pull of the local ComfyUI-Manager checkout ${dir}, but its HEAD could ` +
-        `NOT be read before/after, so whether the Manager actually advanced is UNVERIFIED. ` +
-        `Check the checkout manually (git -C "${dir}" log -1), then restart ComfyUI.`,
-      details,
-    };
-  }
-  if (before === after) {
-    return {
-      mechanism: "git-clone",
-      message:
-        `ComfyUI-Manager at ${dir} is ALREADY UP TO DATE — the git pull changed NOTHING ` +
-        `(HEAD stayed at ${after.slice(0, 8)}). No update was performed, so a restart ` +
-        `would not change the Manager version. If you expected a newer Manager, the ` +
-        `checkout may track a pinned branch/tag, or the running Manager may be a ` +
-        `DIFFERENT install (e.g. the pip comfyui_manager package shadowing this clone).`,
-      details,
-    };
-  }
-  return {
-    mechanism: "git-clone",
-    message:
-      `Updated ComfyUI-Manager itself via a direct git pull of ${dir} ` +
-      `(${before.slice(0, 8)} → ${after.slice(0, 8)}). ` +
-      `RESTART ComfyUI to load the new Manager.`,
-    details,
-  };
-}
-
-/** Actionable terminal error when NOTHING can advance the Manager for us. */
 function managerSelfUpdateUnsupported(api: ManagerApi, cause?: unknown): NodeManagementError {
   const dialect =
     api === "legacy"
@@ -1488,11 +1382,14 @@ function managerSelfUpdateUnsupported(api: ManagerApi, cause?: unknown): NodeMan
         : "this Manager's queue API";
   return new NodeManagementError(
     `Updating ComfyUI-Manager ITSELF is not supported by ${dialect} on this build — ` +
-      `its self-update route answered HTTP 405 (the route is not registered), and no LOCAL ` +
-      `ComfyUI-Manager git checkout belonging to the connected ComfyUI was found to pull ` +
-      `directly. NOTHING WAS UPDATED. Update ComfyUI-Manager on the ComfyUI HOST instead: ` +
-      `git -C custom_nodes/ComfyUI-Manager pull, or (for the pip package) ` +
-      `pip install -U comfyui_manager — then restart ComfyUI. ` +
+      `its self-update route answered HTTP 405, i.e. the route is not registered. ` +
+      `NOTHING WAS UPDATED. Update ComfyUI-Manager on the ComfyUI HOST instead — for a ` +
+      `custom_nodes checkout: \`git -C custom_nodes/ComfyUI-Manager pull\`; for the pip ` +
+      `package: \`pip install -U comfyui_manager\` — then restart ComfyUI. ` +
+      `(comfyui-mcp will not git-pull a checkout on ITS OWN machine for you here: it cannot ` +
+      `prove that checkout is the one the connected server actually loaded — a loopback URL ` +
+      `can be a container or an SSH port-forward — and pulling the wrong copy would report a ` +
+      `fix that never reached your ComfyUI.) ` +
       `See https://comfyui-mcp.artokun.io/docs/troubleshooting`,
     cause instanceof NodeManagementError ? cause.details : undefined,
   );
@@ -1512,25 +1409,38 @@ function managerSelfUpdateUnsupported(api: ManagerApi, cause?: unknown): NodeMan
  * not from any per-pack refusal. So: route the self-update at the real endpoint
  * for the detected dialect first.
  *
- * Only when THAT route also answers 405 (genuinely unregistered on this build) do
- * we fall back — a direct git pull of the connected ComfyUI's own on-disk Manager
- * checkout, else an explicit "not supported, update it via X" error. We never
- * report success we didn't observe.
+ * When THAT route also answers 405 (genuinely unregistered on this build) the ONLY
+ * outcome is the explicit "not supported here, update it on the host via X" error.
+ *
+ * There is deliberately NO local-git fallback. The previous implementation pulled
+ * `config.comfyuiPath`'s custom_nodes/ComfyUI-Manager checkout, which is only ever
+ * correct if that checkout is the one the CONNECTED server actually loaded — and
+ * that cannot be established over HTTP. Successive review rounds killed one
+ * wrong-target hole after another (remote host; --force-remote over a forwarded
+ * loopback port; a second local instance on another port; finally a loopback
+ * container or SSH forward whose reported install root string coincides with a
+ * DIFFERENT host path — /system_stats argv reports a path in the SERVER's
+ * filesystem namespace, which we cannot compare to ours). Each hole ends the same
+ * way: git-pull a checkout the running Manager never loads, then report it as the
+ * fix. shouldDispatchDownloadToManager (model-resolver.ts) hits the same wall and
+ * settles for an existsSync probe only because ITS failure mode is a stray
+ * directory; here it would be a fabricated success, which this issue exists to
+ * eliminate. Refusing with the exact host-side command is always correct; guessing
+ * is not. (The primary path above is the real #424 fix — released Manager 3.x
+ * registers the route, so this branch is for builds that genuinely lack it.)
  */
 async function updateManagerSelf(id: string): Promise<NodeOpResult> {
   const api = await detectManagerApi();
   // ONLY the enqueue is inspected for the 405 signal. A 405 raised later, while
   // draining (e.g. `${prefix}/start`), says nothing about whether the update route
-  // exists, so it must propagate as itself rather than trigger the fallback
+  // exists, so it must propagate as itself rather than be reported as "unsupported"
   // (codex review) — hence enqueue and drain are called separately here.
   try {
     await enqueueManagerTask("update", { node_name: id });
   } catch (err) {
     if (errorStatus(err) !== 405) throw err;
-    // 405 = the update route is not registered on this build (#424). Fall back.
-    logger.debug("Manager self-update route 405 — falling back to a local git pull", { api });
-    const local = updateManagerSelfLocally();
-    if (local) return local;
+    // 405 = the update route is not registered on this build (#424).
+    logger.debug("Manager self-update route 405 — reporting unsupported", { api });
     throw managerSelfUpdateUnsupported(api, err);
   }
   const status = await runManagerQueue();
@@ -1569,8 +1479,8 @@ async function updateCustomNodeImpl(
   // Updating ComfyUI-Manager ITSELF is its own routing problem (#424): it has a
   // real endpoint on every dialect, but a build that doesn't register it answers
   // 405 (ComfyUI's catchall) and the in-panel 3.x→v4 upgrade path deadlocks.
-  // updateManagerSelf tries the right endpoint first and only then falls back to
-  // a local git pull / an explicit "not supported here" error.
+  // updateManagerSelf routes at the right endpoint for the detected dialect, and
+  // on a 405 there reports an explicit "not supported here, run X on the host".
   if (!all && isManagerSelfTarget(id)) return updateManagerSelf(id);
 
   let status: QueueStatus;
