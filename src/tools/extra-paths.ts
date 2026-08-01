@@ -15,7 +15,9 @@ const targetArgs = {
     .optional()
     .describe(
       "Config target: auto chooses Desktop config if it exists, otherwise standalone; " +
-        "standalone uses <COMFYUI_PATH>/extra_model_paths.yaml; desktop uses the OS app-data extra_models_config.yaml.",
+        "standalone uses <ComfyUI root>/extra_model_paths.yaml, where the root is COMFYUI_PATH " +
+        "(or an auto-detected install) and falls back to the saved default workspace; " +
+        "desktop uses the OS app-data extra_models_config.yaml.",
     ),
   config_path: z
     .string()
@@ -47,7 +49,8 @@ export function registerExtraPathsTools(server: McpServer): void {
   server.tool(
     "list_extra_paths",
     "View ComfyUI extra search-path config for standalone/manual installs and ComfyUI Desktop. " +
-      "Standalone uses <COMFYUI_PATH>/extra_model_paths.yaml; Desktop uses the OS app-data " +
+      "Standalone uses <ComfyUI root>/extra_model_paths.yaml — COMFYUI_PATH, else the saved " +
+      "default workspace (set_default_workspace); Desktop uses the OS app-data " +
       "extra_models_config.yaml. Reports generic categories, so model categories and custom_nodes " +
       "entries are both visible when present. Read-only.",
     targetArgs,

@@ -9,7 +9,11 @@ import {
   parseExtraModelPathsConfigsFromArgvRaw,
   type LiveServerSnapshot,
 } from "./output-dir.js";
-import { liveRootFromArgv, didLaunchLocalComfyUI } from "./workspace-env.js";
+import {
+  liveRootFromArgv,
+  didLaunchLocalComfyUI,
+  resolveEffectiveComfyUIBase,
+} from "./workspace-env.js";
 import { ValidationError } from "../utils/errors.js";
 
 export const EXTRA_PATH_TARGETS = ["auto", "standalone", "desktop"] as const;
@@ -73,20 +77,58 @@ function expandUser(s: string): string {
 const BARE_VAR = process.platform === "win32" ? /\$([\w-]+)/g : /\$(\w+)/g;
 const BARE_VAR_TEST = process.platform === "win32" ? /\$[\w-]+/ : /\$\w+/;
 
+/**
+ * Windows `%VAR%` expansion, as a SINGLE LEFT-TO-RIGHT PASS over the string — the same
+ * shape as CPython's `ntpath.expandvars`:
+ *   - `%%` is an ESCAPED literal `%` (emit one `%`, consume both);
+ *   - `%NAME%` (non-empty NAME with no `%` inside) substitutes `process.env[NAME]`, and
+ *     an UNDEFINED variable leaves the WHOLE token literal;
+ *   - anything else (including an unterminated trailing `%`) is emitted verbatim.
+ *
+ * Deliberately placeholder-free. The previous implementation protected `%%` by
+ * substituting a sentinel token and restoring it in a later pass; ANY sentinel is a
+ * legal path substring, so an input that literally contained it was silently rewritten
+ * to `%` — a wrong-destination corruption of the same class as the raw-NUL sentinel
+ * removed in 1ab84ce. A single pass never re-reads its own output, so no input can be
+ * confused for machinery.
+ */
+function expandPercentVars(s: string): string {
+  let out = "";
+  let i = 0;
+  while (i < s.length) {
+    if (s[i] !== "%") {
+      out += s[i];
+      i += 1;
+      continue;
+    }
+    if (s[i + 1] === "%") {
+      out += "%"; // escaped literal `%`
+      i += 2;
+      continue;
+    }
+    // NAME runs to the next `%`; the escape branch above already excluded an empty NAME.
+    const close = s.indexOf("%", i + 1);
+    if (close === -1) {
+      out += "%"; // unterminated — literal
+      i += 1;
+      continue;
+    }
+    const name = s.slice(i + 1, close);
+    const value = process.env[name];
+    // Undefined → keep the entire `%NAME%` token literal (ComfyUI/ntpath behavior).
+    out += value ?? s.slice(i, close + 1);
+    i = close + 1;
+  }
+  return out;
+}
+
 /** ComfyUI-style env expansion (os.path.expandvars): `${VAR}`/`$VAR` on all platforms,
  *  `%VAR%` on Windows with `%%` an ESCAPED literal `%`; an UNDEFINED variable is left
- *  literal. */
-function expandVars(s: string): string {
+ *  literal. Exported for unit tests. */
+export function expandVars(s: string): string {
   let r = s.replace(/\$\{([^}]+)\}/g, (m, n) => process.env[n] ?? m);
   r = r.replace(BARE_VAR, (m, n) => process.env[n] ?? m);
-  if (platform() === "win32") {
-    // Protect `%%` (escaped literal `%`) before %VAR% expansion, then restore it.
-    const PCT = "__CMCP_PCT_9f3a__";
-    r = r
-      .replace(/%%/g, PCT)
-      .replace(/%([^%]+)%/g, (m, n) => process.env[n] ?? m)
-      .replace(new RegExp(PCT, "g"), "%");
-  }
+  if (platform() === "win32") r = expandPercentVars(r);
   return r;
 }
 
@@ -195,34 +237,79 @@ function desktopConfigPath(): string {
   return join(root, "ComfyUI", "extra_models_config.yaml");
 }
 
-function standaloneConfigPath(): string {
-  if (!config.comfyuiPath) {
+/**
+ * The local ComfyUI root whose `extra_model_paths.yaml` a standalone/manual install
+ * uses. Delegates to `resolveEffectiveComfyUIBase()` — the SINGLE source of truth every
+ * other filesystem-backed tool (download_model, model lookups, verify_custom_node,
+ * get_environment) already uses — so this file can never disagree with them about where
+ * ComfyUI lives. That order is:
+ *
+ *   1. `config.comfyuiPath` — COMFYUI_PATH env or auto-detection (wins), then
+ *   2. the SAVED DEFAULT WORKSPACE (set_default_workspace), local mode only.
+ *
+ * Before #648 this read `config.comfyuiPath` DIRECTLY, so with COMFYUI_PATH unset
+ * `list_extra_paths` threw while `get_workspace`/`get_environment` happily reported the
+ * saved default workspace — the same install, two different answers.
+ *
+ * Throws (never guesses) when neither is available, INCLUDING remote mode, where
+ * `resolveEffectiveComfyUIBase()` deliberately refuses to hand back a local workspace:
+ * reporting some other root's model dirs as if they were the live server's is a
+ * wrong-destination hazard, so an explicit unresolved error is the only safe answer.
+ */
+function standaloneRoot(): { root: string; source: "comfyui-path" | "default-workspace" } {
+  const root = resolveEffectiveComfyUIBase();
+  if (!root) {
     throw new ValidationError(
-      "No local ComfyUI path is known. Set COMFYUI_PATH, set a default workspace, " +
-        "or pass config_path explicitly.",
+      "UNRESOLVED: no local ComfyUI path is known, so the standalone " +
+        "extra_model_paths.yaml cannot be located" +
+        (isRemoteMode()
+          ? " (a REMOTE ComfyUI is targeted, and a local workspace is not that server's " +
+            "config — reporting one would be wrong). Pass config_path explicitly, or set " +
+            "COMFYUI_PATH to the local install you want to inspect."
+          : ". Set COMFYUI_PATH, set a default workspace with set_default_workspace, " +
+            "or pass config_path explicitly.") +
+        " No extra paths are being reported — this is an unresolved lookup, not an empty config.",
     );
   }
-  return join(config.comfyuiPath, "extra_model_paths.yaml");
+  // config.comfyuiPath is what resolveEffectiveComfyUIBase prefers, so its presence
+  // (not a re-derivation) is what distinguishes the two sources.
+  return { root, source: config.comfyuiPath ? "comfyui-path" : "default-workspace" };
+}
+
+function standaloneConfigPath(): { path: string; notes: string[] } {
+  const { root, source } = standaloneRoot();
+  return {
+    path: join(root, "extra_model_paths.yaml"),
+    notes:
+      source === "default-workspace"
+        ? [
+            `Resolved from the saved default workspace (${root}) because COMFYUI_PATH is not set. ` +
+              `Set COMFYUI_PATH or use set_default_workspace to change which install this reports.`,
+          ]
+        : [],
+  };
 }
 
 function resolveTargetPath(opts: ExtraPathOptions = {}): {
   target: Exclude<ExtraPathTarget, "auto">;
   path: string;
+  notes: string[];
 } {
   if (opts.configPath) {
     return {
       target: opts.target === "desktop" ? "desktop" : "standalone",
       path: opts.configPath,
+      notes: [],
     };
   }
 
   const target = opts.target ?? "auto";
-  if (target === "desktop") return { target, path: desktopConfigPath() };
-  if (target === "standalone") return { target, path: standaloneConfigPath() };
+  if (target === "desktop") return { target, path: desktopConfigPath(), notes: [] };
+  if (target === "standalone") return { target, ...standaloneConfigPath() };
 
   const desktop = desktopConfigPath();
-  if (existsSync(desktop)) return { target: "desktop", path: desktop };
-  return { target: "standalone", path: standaloneConfigPath() };
+  if (existsSync(desktop)) return { target: "desktop", path: desktop, notes: [] };
+  return { target: "standalone", ...standaloneConfigPath() };
 }
 
 function splitPaths(value: unknown): string[] {
@@ -278,6 +365,7 @@ function summarize(
   path: string,
   raw: Record<string, unknown>,
   extraNotes: string[] = [],
+  serverResolved = false,
 ): ExtraPathsConfigInfo {
   const groups: ExtraPathGroup[] = [];
   for (const [name, value] of Object.entries(raw)) {
@@ -287,9 +375,10 @@ function summarize(
   const notes = [
     ...extraNotes,
     // The generic "which file" hint only applies to the static-heuristic path; a
-    // server-resolved config (extraNotes present) already states the real file,
-    // so skip it to avoid contradicting that.
-    ...(extraNotes.length > 0
+    // server-resolved config already states the real file, so skip it to avoid
+    // contradicting that. (Keyed on serverResolved, NOT on "any extra note": the
+    // static path can now also carry a note — the #648 default-workspace source.)
+    ...(serverResolved
       ? []
       : [
           target === "desktop"
@@ -325,15 +414,16 @@ async function resolveTargetPathPreferServer(opts: ExtraPathOptions = {}): Promi
   target: Exclude<ExtraPathTarget, "auto">;
   path: string;
   notes: string[];
+  serverResolved: boolean;
 }> {
   // Explicit config_path or an explicit non-auto target: honor the caller.
   if (opts.configPath || (opts.target && opts.target !== "auto")) {
-    return { ...resolveTargetPath(opts), notes: [] };
+    return { ...resolveTargetPath(opts), serverResolved: false };
   }
 
   const serverConfig = await resolveServerExtraModelConfig();
   if (!serverConfig) {
-    return { ...resolveTargetPath(opts), notes: [] };
+    return { ...resolveTargetPath(opts), serverResolved: false };
   }
 
   const notes = [
@@ -359,7 +449,12 @@ async function resolveTargetPathPreferServer(opts: ExtraPathOptions = {}): Promi
       "WARNING: this file is auto-generated by ComfyUI Desktop ('do not edit manually') and will be overwritten by the Desktop app. For a durable model path, place or symlink the models under the server's --base-directory models dir instead of editing this YAML.",
     );
   }
-  return { target: isDesktop ? "desktop" : "standalone", path: serverConfig, notes };
+  return {
+    target: isDesktop ? "desktop" : "standalone",
+    path: serverConfig,
+    notes,
+    serverResolved: true,
+  };
 }
 
 export async function listExtraPaths(
@@ -367,7 +462,7 @@ export async function listExtraPaths(
 ): Promise<ExtraPathsConfigInfo> {
   const resolved = await resolveTargetPathPreferServer(opts);
   const raw = await readConfigFile(resolved.path);
-  return summarize(resolved.target, resolved.path, raw, resolved.notes);
+  return summarize(resolved.target, resolved.path, raw, resolved.notes, resolved.serverResolved);
 }
 
 /** One model search directory contributed by extra_model_paths configuration. */
@@ -555,7 +650,7 @@ export async function addExtraPath(
     group[category] = paths.join("\n");
     await writeConfigFile(resolved.path, raw);
   }
-  const info = summarize(resolved.target, resolved.path, raw, resolved.notes);
+  const info = summarize(resolved.target, resolved.path, raw, resolved.notes, resolved.serverResolved);
   return {
     ...info,
     changed,
@@ -586,7 +681,7 @@ export async function removeExtraPath(
       await writeConfigFile(resolved.path, raw);
     }
   }
-  const info = summarize(resolved.target, resolved.path, raw, resolved.notes);
+  const info = summarize(resolved.target, resolved.path, raw, resolved.notes, resolved.serverResolved);
   return {
     ...info,
     changed,
