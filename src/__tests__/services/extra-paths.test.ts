@@ -654,9 +654,12 @@ describe("a reachable server with NO --extra-model-paths-config is still authori
     expect(result.groups[0].categories).toEqual([{ category: "vae", paths: ["E:/server"] }]);
   });
 
-  it("REFUSES a RELATIVE launch flag when the server reports no cwd", async () => {
-    // Anchoring it locally would target a same-named file in the wrong tree and the edit
-    // would be a silent no-op, so this must not resolve at all.
+  it("a RELATIVE launch flag with no reported cwd falls back to the ALWAYS-loaded root yaml", async () => {
+    // /system_stats does not report cwd on current ComfyUI, so `cd /opt/ComfyUI &&
+    // python main.py --extra-model-paths-config extra.yaml` is an ordinary launch. The
+    // flagged file cannot be located from here — but ComfyUI ALSO always auto-loads
+    // <root>/extra_model_paths.yaml, so that one is provably read and is safe to target.
+    // What must NOT happen is anchoring "cfg.yaml" to our own COMFYUI_PATH.
     const liveB = await trackTmp();
     const stale = await trackTmp();
     config.comfyuiPath = stale;
@@ -668,10 +671,28 @@ describe("a reachable server with NO --extra-model-paths-config is still authori
       },
     });
 
+    const result = await listExtraPaths();
+    expect(result.path).toBe(join(liveB, "extra_model_paths.yaml"));
+    expect(result.notes.some((n) => /ALWAYS auto-loads/i.test(n))).toBe(true);
+    // The unlocatable flagged file is disclosed, not silently omitted.
+    expect(result.notes.some((n) => /cfg\.yaml.*not listed here/s.test(n))).toBe(true);
+
+    const added = await addExtraPath({ category: "loras", path: "E:/loras" });
+    expect(added.path).toBe(join(liveB, "extra_model_paths.yaml"));
+    // Never resolved against OUR comfyuiPath.
+    expect(existsSync(join(stale, "cfg.yaml"))).toBe(false);
+    expect(existsSync(join(stale, "extra_model_paths.yaml"))).toBe(false);
+  });
+
+  it("REFUSES a RELATIVE flag only when there is no main.py either", async () => {
+    const stale = await trackTmp();
+    config.comfyuiPath = stale;
+    process.env.COMFYUI_PATH = stale;
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: ["python", "-m", "comfyui", "--extra-model-paths-config", "cfg.yaml"] },
+    });
+
     await expect(listExtraPaths()).rejects.toThrow(/UNRESOLVED.*RELATIVE/s);
-    await expect(
-      addExtraPath({ category: "loras", path: "E:/loras" }),
-    ).rejects.toThrow(/UNRESOLVED/);
     expect(existsSync(join(stale, "cfg.yaml"))).toBe(false);
   });
 

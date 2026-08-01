@@ -407,14 +407,32 @@ export function liveRootFromArgv(
   argv: string[] | undefined,
   cwd?: string,
 ): string | undefined {
-  const script = liveScriptFromArgv(argv, cwd);
-  return script ? dirname(script) : undefined;
+  // Deliberately NOT delegating to liveScriptFromArgv. This function feeds the #633
+  // download-authorization path, and dirname(scriptPath) normalizes two leaves that this
+  // body returns verbatim (a bare "main.py" returns `cwd` exactly; `C:\x\.\main.py`
+  // returns `C:\x\.`). The values are equivalent after resolve() — which every caller
+  // applies — but "equivalent" is not "identical", and this is not the function to take
+  // that risk in. The shared-behavior contract is pinned by a cross-check test instead.
+  if (!Array.isArray(argv)) return undefined;
+  for (const rawArg of argv) {
+    if (typeof rawArg !== "string") continue;
+    const a = rawArg.trim().replace(/^["']+/, "").replace(/["']+$/, "");
+    if (!/(^|[\\/])main\.pyw?$/i.test(a)) continue;
+    const dir = dirname(a);
+    if (dir === "." || dir === "") {
+      return cwd && isAbsolute(cwd) ? cwd : undefined;
+    }
+    if (isAbsolute(dir)) return dir;
+    if (cwd && isAbsolute(cwd)) return pathResolve(cwd, dir);
+    return undefined;
+  }
+  return undefined;
 }
 
 /**
  * The same derivation as `liveRootFromArgv` but returning the `main.py` FILE itself
- * rather than its directory — `dirname()` of this is exactly what `liveRootFromArgv`
- * returns, which is why that function delegates here instead of duplicating the parse.
+ * rather than its directory. `dirname()` of this equals `liveRootFromArgv`'s result after
+ * normalization (a cross-check test pins that for every argv shape).
  *
  * The file path is what a caller needs to follow a SYMLINK: ComfyUI locates its implicit
  * `extra_model_paths.yaml` next to `os.path.realpath(__file__)`, so a launcher that keeps

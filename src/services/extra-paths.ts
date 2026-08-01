@@ -603,6 +603,7 @@ function realLiveRoot(scriptPath: string): string | undefined {
 function implicitLiveTarget(
   scriptPath: string,
   opts: ExtraPathOptions,
+  unresolvableFlag?: string,
 ): ResolvedTarget & { serverResolved: boolean } {
   const liveRoot = realLiveRoot(scriptPath);
   const seen = liveRoot ? statDir(liveRoot) : undefined;
@@ -618,9 +619,14 @@ function implicitLiveTarget(
     );
   }
   const path = join(liveRoot, "extra_model_paths.yaml");
-  const notes = [
-    `Resolved from the RUNNING ComfyUI's own install root (${liveRoot}): it was launched with no --extra-model-paths-config, so this is the extra_model_paths.yaml it implicitly reads.`,
-  ];
+  const notes = unresolvableFlag
+    ? [
+        `Resolved to the RUNNING ComfyUI's own extra_model_paths.yaml (${path}). ComfyUI ALWAYS auto-loads this file from its install root, in addition to any --extra-model-paths-config, so edits here take effect on restart.`,
+        `NOTE: this server was also launched with a RELATIVE --extra-model-paths-config ("${unresolvableFlag}") and does not report its working directory, so THAT file cannot be located from this process and its entries are not listed here. Pass config_path with its absolute path to view or edit it.`,
+      ]
+    : [
+        `Resolved from the RUNNING ComfyUI's own install root (${liveRoot}): it was launched with no --extra-model-paths-config, so this is the extra_model_paths.yaml it implicitly reads.`,
+      ];
   // Divergence diagnostic only — a failing static guess (no COMFYUI_PATH, a vanished
   // saved workspace) must never break the real, live-anchored resolution.
   try {
@@ -712,12 +718,22 @@ async function resolveTargetPathPreferServer(
       ? resolve(snapshot.cwd, rawFlag)
       : undefined;
   if (!serverConfig) {
+    // The flagged file cannot be located — but ComfyUI ALWAYS auto-loads
+    // <its own root>/extra_model_paths.yaml as well as any --extra-model-paths-config, so
+    // that file is still PROVABLY read by this server. Target it (and say what is missing)
+    // instead of refusing: `/system_stats` does not report cwd on current ComfyUI, so a
+    // refusal here would break the ordinary
+    // `cd /opt/ComfyUI && python main.py --extra-model-paths-config extra.yaml` launch
+    // outright (codex round 8, P1). Only when NEITHER file can be located do we refuse.
+    const scriptForFallback = liveScriptFromArgv(snapshot.argv, snapshot.cwd);
+    if (scriptForFallback) return implicitLiveTarget(scriptForFallback, opts, rawFlag);
     throw new ValidationError(
       `UNRESOLVED: the running ComfyUI was launched with a RELATIVE --extra-model-paths-config ` +
-        `("${rawFlag}") and does not report its working directory, so the file it reads cannot ` +
-        "be located from this process. Resolving it here would point at a same-named file under " +
-        "this MCP's own directory and the edit would be a silent no-op. Nothing was read or " +
-        "written — pass config_path explicitly with the absolute path the server uses.",
+        `("${rawFlag}") and reports neither its working directory nor a main.py, so no file it ` +
+        "reads can be located from this process. Resolving the flag here would point at a " +
+        "same-named file under this MCP's own directory and the edit would be a silent no-op. " +
+        "Nothing was read or written — pass config_path explicitly with the absolute path the " +
+        "server uses.",
     );
   }
 

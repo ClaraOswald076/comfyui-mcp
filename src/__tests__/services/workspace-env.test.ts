@@ -1,7 +1,7 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, rm, readFile, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir, platform } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 const IS_WIN = platform() === "win32";
 /** Create a venv interpreter on disk under `root`, returning its absolute path. */
@@ -80,6 +80,7 @@ import {
   listWorkspaces,
   getEnvironment,
   liveRootFromArgv,
+  liveScriptFromArgv,
   resolveComfyuiPython,
   resolveLiveComfyUIBase,
   resolveRootInterpreter,
@@ -669,6 +670,56 @@ describe("liveRootFromArgv (#401 / #433 — robust argv parsing)", () => {
     expect(liveRootFromArgv(undefined)).toBeUndefined();
     expect(liveRootFromArgv([])).toBeUndefined();
   });
+});
+
+/**
+ * liveScriptFromArgv is the same parse returning the main.py FILE (needed to follow a
+ * symlink — ComfyUI reads the config next to os.path.realpath(__file__)). liveRootFromArgv
+ * feeds the #633 download-authorization path and is therefore NOT refactored to delegate,
+ * so this cross-check is what stops the two parses from drifting apart.
+ */
+describe("liveScriptFromArgv agrees with liveRootFromArgv on every argv shape", () => {
+  const winCwd = "C:\\here";
+  const nixCwd = "/here";
+  const cwd = IS_WIN ? winCwd : nixCwd;
+  const root = IS_WIN ? "C:\\Comfy\\ComfyUI" : "/opt/ComfyUI";
+  const rel = IS_WIN ? "ComfyUI\\main.py" : "ComfyUI/main.py";
+  const unnormalizedCwd = IS_WIN ? "C:\\x\\." : "/x/.";
+
+  const shapes: Array<[name: string, argv: string[] | undefined, cwd?: string]> = [
+    ["absolute main.py", [join(root, "main.py"), "--port", "8188"]],
+    ["quoted absolute main.py", [`"${join(root, "main.py")}"`]],
+    ["single-quoted main.py", [`'${join(root, "main.py")}'`]],
+    ["absolute main.pyw", [join(root, "main.pyw")]],
+    ["relative main.py with cwd", [rel], cwd],
+    ["relative main.py without cwd", [rel]],
+    ["bare main.py with cwd", ["main.py"], cwd],
+    ["bare main.py with UNNORMALIZED cwd", ["main.py"], unnormalizedCwd],
+    ["bare main.py without cwd", ["main.py"]],
+    ["unnormalized absolute", [IS_WIN ? "C:\\x\\.\\main.py" : "/x/./main.py"]],
+    ["several candidates (first wins)", [join(root, "main.py"), join(cwd, "main.py")]],
+    ["non-string entries", [42 as unknown as string, join(root, "main.py")]],
+    ["no main.py", ["python", "--port", "8188"]],
+    ["notmain.py boundary", [IS_WIN ? "C:\\x\\notmain.py" : "/x/notmain.py"]],
+    ["empty argv", []],
+    ["missing argv", undefined],
+  ];
+
+  for (const [name, argv, argCwd] of shapes) {
+    it(name, () => {
+      const root_ = liveRootFromArgv(argv, argCwd);
+      const script = liveScriptFromArgv(argv, argCwd);
+      if (root_ === undefined) {
+        expect(script).toBeUndefined();
+        return;
+      }
+      expect(script).toBeDefined();
+      // The script must be main.py[w] inside that root — equal after normalization, which
+      // is all any caller relies on (every one of them resolve()s the value).
+      expect(basename(script as string)).toMatch(/^main\.pyw?$/i);
+      expect(resolve(dirname(script as string))).toBe(resolve(root_));
+    });
+  }
 });
 
 describe("resolveRootInterpreter (portable + venv layouts)", () => {
