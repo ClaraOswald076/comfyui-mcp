@@ -27,6 +27,7 @@ const { buildPanelToolDefs, makePanelToolCtx, __panelToolsTestHooks, __openWorkf
   await import("../../orchestrator/panel-tools.js");
 import { getBootLocalComfyUIBaseUrl } from "../../config.js";
 import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
+import { markDispatched } from "../../services/ui-bridge.js";
 import type { PanelToolCtx, ToolResult } from "../../orchestrator/panel-tools.js";
 
 const BOOT_BASE = (getBootLocalComfyUIBaseUrl() ?? "http://127.0.0.1:8188").replace(/\/+$/, "");
@@ -52,7 +53,13 @@ function reconnectingBridge(initial: string[] = []) {
   const bridge = {
     send: async (cmd: Record<string, unknown>, opts?: { tabId?: string }) => {
       const id = opts?.tabId;
-      if (id && !live.has(id)) throw new Error(`no connected tab with id "${id}". Connected: none`);
+      if (id && !live.has(id)) {
+        // Mirror the REAL UiBridge.resolveTarget refusal: it rejects BEFORE any socket
+        // write, LISTS the actually-connected tabs (not "none" when others are live), and
+        // carries the authoritative typed dispatched:false flag the tool layer keys on.
+        const connected = [...live].map((t) => `${t.slice(0, 8)} ("${t}")`).join(", ") || "none";
+        throw markDispatched(new Error(`no connected tab with id "${id}". Connected: ${connected}`), false);
+      }
       sent.push({ cmd, tabId: id });
       // workflow_list answers the open-verify probe with `active` = the routed tab.
       if (cmd.cmd === "workflow_list") {
@@ -327,6 +334,82 @@ describe("headless-aware reconnect recovery (#400/#402)", () => {
     // ambiguous — it rebinds onto the sole canvas tab and dispatches.
     expect(textOf(res)).not.toMatch(/multiple tabs/i);
     expect(ctx.tabId).toBe("desktop-canvas");
+  });
+});
+
+describe("#442 defect 4: a MUTATING panel command names the rebind on a no-route refusal", () => {
+  it("panel_set_widget surfaces an actionable rebind hint (not the bare bridge error) when its tab is gone and the session is multi-tab", async () => {
+    // Two interactive tabs are live but NEITHER is this session's — the strict-single
+    // silent auto-heal (ensureReachable) refuses to guess, so the send fires into a dead
+    // binding and the bridge REFUSES BEFORE dispatch (typed dispatched:false). This is the
+    // exact condition a user hit ~6× with panel_set_widget while panel_list_workflows still
+    // answered (the two channels briefly disagree after a reconnect).
+    const { bridge, sent } = reconnectingBridge(["a-tab", "b-tab"]);
+    const ctx = makePanelToolCtx(bridge, "dead-tab", new WorkflowTargetStore());
+
+    const res = await defByName("panel_set_widget").handler(
+      { node_id: 7, widget: "steps", value: 20 },
+      ctx,
+    );
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    // Names the documented recovery call (parity with the retry-safe graph_get_errors path).
+    expect(text).toContain('panel_set_workflow_target({mode:"current"})');
+    // A pre-dispatch no-route refusal provably applied nothing — say so, and never retry it.
+    expect(text).toMatch(/Nothing was applied/i);
+    // The raw bridge cause is preserved (and, faithfully, lists the live tabs — not "none").
+    expect(text).toMatch(/no connected tab with id "dead-tab"/);
+    expect(sent.length).toBe(0); // the mutating write was NEVER dispatched (no double-apply)
+  });
+
+  it("does NOT mis-wrap a POST-dispatch executor failure that merely quotes 'no connected tab' as 'nothing applied'", async () => {
+    // A LIVE tab that ACCEPTS the command (it IS dispatched, pushed to `sent`) but whose
+    // executor rejects with a message quoting the routing phrase. Because the typed flag is
+    // absent (dispatchOutcomeOf === undefined, not false), the wrapper must NOT fire — the
+    // raw executor error surfaces and we never falsely claim nothing applied.
+    const live = new Set(["live-tab"]);
+    const sent: Array<{ cmd: Record<string, unknown> }> = [];
+    const bridge = {
+      send: async (cmd: Record<string, unknown>, opts?: { tabId?: string }) => {
+        if (opts?.tabId && !live.has(opts.tabId)) throw new Error("unexpected route");
+        sent.push({ cmd }); // the command WAS dispatched
+        // Executor reply ok:false becomes a plain Error (no dispatched symbol), text quotes
+        // the routing phrase to prove the wrapper keys on the TYPED flag, not the text.
+        throw new Error('graph_set_widget failed: internal reference to "no connected tab" in a stale cache');
+      },
+      push: () => 1,
+      canReach: (id: string) => live.has(id),
+      tabs: () => [...live].map((t) => ({ tab_id: t, title: t, connected_at: 0 })),
+      resolveActiveTabId: () => [...live][0],
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, "live-tab", new WorkflowTargetStore());
+
+    const res = await defByName("panel_set_widget").handler(
+      { node_id: 7, widget: "steps", value: 20 },
+      ctx,
+    );
+    expect(res.isError).toBe(true);
+    expect(sent.length).toBe(1); // it really was dispatched
+    const text = textOf(res);
+    expect(text).not.toMatch(/Nothing was applied/i); // never a false "nothing applied"
+    expect(text).toContain("stale cache"); // the raw executor error is surfaced as-is
+  });
+
+  it("still self-heals the common SINGLE-tab case (a sole reconnected tab) — set_widget succeeds silently", async () => {
+    // Only ONE interactive tab is live (under a new id after a reconnect). The strict-single
+    // auto-heal rebinds onto it BEFORE the send, so the ordinary case never even sees the
+    // error — the improved message is reserved for the genuinely ambiguous multi-tab case.
+    const { bridge, sent } = reconnectingBridge(["sole-tab"]);
+    const ctx = makePanelToolCtx(bridge, "dead-tab", new WorkflowTargetStore());
+
+    const res = await defByName("panel_set_widget").handler(
+      { node_id: 7, widget: "steps", value: 20 },
+      ctx,
+    );
+    expect(res.isError).toBeFalsy();
+    expect(ctx.tabId).toBe("sole-tab"); // rebound onto the sole live tab
+    expect(sent.at(-1)?.cmd).toMatchObject({ cmd: "graph_set_widget" });
+    expect(sent.at(-1)?.tabId).toBe("sole-tab");
   });
 });
 

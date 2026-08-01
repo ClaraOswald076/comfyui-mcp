@@ -1356,7 +1356,13 @@ export class UiBridge {
         this.storeMailbox(opts.tabId, cmd);
         return Promise.resolve({ ok: true, mailboxed: true });
       }
-      return Promise.reject(err instanceof Error ? err : new Error(String(err)));
+      // resolveTarget threw BEFORE any socket write — no tab could be routed to (no
+      // connected tab / ambiguous / multiple / not reachable), so nothing was
+      // transmitted. Tag the rejection with the AUTHORITATIVE typed flag
+      // dispatched:false so a caller classifies "nothing applied" categorically (reboot
+      // readiness; the mutating-command rebind hint, panel #442) — never by
+      // string-matching a message whose text a post-dispatch executor error could quote.
+      return Promise.reject(markDispatched(err instanceof Error ? err : new Error(String(err)), false));
     }
     // #236 — proactively gate a command this exact connection has already proven
     // unsupported (see Conn.unsupportedCmds), instead of dispatching it again just
@@ -1386,7 +1392,11 @@ export class UiBridge {
         this.storeMailbox(opts.tabId, cmd);
         return Promise.resolve({ ok: true, mailboxed: true });
       }
-      return Promise.reject(new Error(`Panel tab ${conn.tabId.slice(0, 8)} is not open`));
+      // The resolved socket is not OPEN — the command cannot be written, so nothing is
+      // dispatched. Typed dispatched:false, same as the resolveTarget refusal above.
+      return Promise.reject(
+        markDispatched(new Error(`Panel tab ${conn.tabId.slice(0, 8)} is not open`), false),
+      );
     }
     return new Promise((resolve, reject) => {
       const ctx: SendCtx = {
