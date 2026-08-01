@@ -4243,11 +4243,19 @@ export function createPanelMcpServer(
   const tools = defs.map((d) =>
     tool(d.name, d.description, d.schema, (args: Record<string, unknown>) => d.handler(args, ctx)),
   ) as unknown as SdkTool[];
-  return createSdkMcpServer({
+  const server = createSdkMcpServer({
     name: "comfyui-panel",
     version: "1.0.0",
     tools,
-  });
+  }) as McpSdkServerConfigWithInstance & { rebindTab?: (newTabId: string) => void };
+  // Re-point this server's bound tab after a panel tab-id migration (#568 Defect
+  // 1). ctx.tabId is read LIVE by every handler (and by call/confirm), so updating
+  // it in place moves ALL panel_* routing onto the migrated tab — no stale id that
+  // makes the tools throw `no connected tab`. PanelAgent.rebindTabId() calls this.
+  server.rebindTab = (newTabId: string) => {
+    ctx.tabId = newTabId;
+  };
+  return server;
 }
 
 /**

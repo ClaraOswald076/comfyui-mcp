@@ -1371,6 +1371,12 @@ export async function runPanelOrchestrator(): Promise<void> {
   // race) can label itself correctly instead of showing the pre-init default.
   const resolvedModelByTab = new Map<string, string>();
   const headlessTabs = new Set<string>(); // tabs with no ComfyUI canvas (mobile/remote) — deliver renders in-turn
+  // #570: for an UNSAVED workflow the panel tab id is an ephemeral tmp:<uuid>,
+  // regenerated on every reload, so the tab-keyed session store can't survive an
+  // orchestrator restart that also reloads the panel. Map each such tab to a STABLE
+  // resume key (origin + title + backend) computed at hello, so onSession can also
+  // persist under it and a reloaded tab can resume it. tmp: tabs only.
+  const tabStableKey = new Map<string, string>();
   const workflowTargets = new WorkflowTargetStore();
   // Monotonic per-tab sequence for set_workflow_target events. A pinned target is
   // validated asynchronously (resolvePinTarget queries workflow_list), so a later event
@@ -1894,6 +1900,11 @@ export async function runPanelOrchestrator(): Promise<void> {
     // Report the SDK session id so the panel can persist it and resume on reload.
     onSession: (key, sessionId, model) => {
       const panelTab = panelTabOf(key);
+      // #570: also persist under the tab's STABLE resume key (unsaved workflows),
+      // so a panel reload that regenerates the tmp:<uuid> can still resume this
+      // conversation. The manager already persisted under the exact tab key.
+      const skey = tabStableKey.get(panelTab);
+      if (skey) sessionStore.setStable(skey, sessionId, panelTab);
       bridge.push({ type: "session", session_id: sessionId }, panelTab);
       bridge.broadcastTabList(); // a session started/changed → refresh mirror pickers
       // #376: the ready banner was sent at hello with the PRE-init default model.
@@ -2491,6 +2502,7 @@ export async function runPanelOrchestrator(): Promise<void> {
         // pin can no longer write a stale target / emit a late ack that the bridge's
         // migration map would deliver to the new tab (codex race, tab-id migration edge).
         workflowTargetSeq.delete(migratedFrom);
+        tabStableKey.delete(migratedFrom); // recomputed for the new id below (#570)
       }
       // Blind content mode rides the hello (issue #90) so the FIRST agent spawn
       // already carries the right tool-server env. A CHANGE against a live
@@ -2534,6 +2546,53 @@ export async function runPanelOrchestrator(): Promise<void> {
       // orchestrator's own store stays authoritative on the actual spawn.
       const resume = typeof event.resume === "string" ? event.resume : undefined;
       if (resume && (!prev || prev === backend)) manager.setResume(key, resume);
+
+      // #570: an UNSAVED workflow's tab id is an ephemeral tmp:<uuid>, regenerated
+      // on every panel reload — so on an orchestrator restart that also reloads the
+      // panel, the tab returns under a never-stored id and forgets everything
+      // (neither our tab-keyed store nor the panel's tab-keyed hello.resume can hit).
+      // Anchor a STABLE resume key on what DOES survive that tab's reload — the
+      // ComfyUI origin + workflow title + backend — and seed it as a fallback.
+      // Saved workflows (wf:<path>) already key stably, so this is tmp:-only.
+      if (panelTab.startsWith("tmp:")) {
+        const origin =
+          (typeof helloUrl === "string" && helloUrl.trim() ? helloUrl.trim() : undefined) ??
+          bridge.tabOrigin(panelTab) ??
+          "";
+        const title = typeof event.title === "string" ? event.title : "";
+        const skey = `tmp::${origin}::${title}::${backend}`;
+        tabStableKey.set(panelTab, skey);
+        // Seed the resume fallback ONLY when the panel supplied none and no live
+        // agent owns the key. spawn() prefers the exact-tab store hit over this
+        // pendingResume, so the precise path is never overridden — this only
+        // rescues the churned tmp: id. setResume() no-ops if a live agent exists.
+        //
+        // COLLISION GUARD: origin+title+backend is NOT unique — two unsaved tabs
+        // with the same (default) title collide. Seed only when THIS tab is the sole
+        // connected holder of the key, so a fresh sibling tab can never resume
+        // another CONCURRENTLY-live unsaved tab's conversation (the cross-tab hijack
+        // the migration path also refuses; setStable poisons a key the moment two
+        // live tabs write distinct sessions to it). When ambiguous we surface fresh —
+        // a lost resume is a mild miss; resuming the WRONG conversation is not.
+        //
+        // The SEQUENTIAL same-title case (tab A closed, a later tab B opens with the
+        // same origin+title+backend) intentionally resumes A: by the only identity
+        // that survives a reload — the workflow identity the issue itself names as the
+        // key — B *is* the same workspace. This is bounded by the GC TTL (an abandoned
+        // session ages out) and always yields to the exact-tab store and the panel's
+        // own hello.resume. A truly-unique panel per-instance id (referenced in #568/
+        // #570's thread) would let us tighten even this — a clean future upgrade.
+        if (!resume && !manager.hasLiveAgent(key) && sessionStore.get(key) === undefined) {
+          let sameKeyTabs = 0;
+          for (const t of bridge.tabs()) {
+            if (tabStableKey.get(t.tab_id) === skey) sameKeyTabs += 1;
+          }
+          if (sameKeyTabs <= 1) {
+            const stableSid = sessionStore.getStable(skey);
+            if (stableSid) manager.setResume(key, stableSid);
+          }
+        }
+      }
 
       // Live model list for the picker; SDK slash commands are Claude-only.
       pushModels(panelTab);
@@ -3318,6 +3377,11 @@ export async function runPanelOrchestrator(): Promise<void> {
       // reset() is synchronous (map cleared now), so no concurrent send() can
       // spawn an agent before we report the cleared session.
       manager.reset(agentKeyFor(tabId));
+      // reset() clears the exact-tab store; the stable resume index (#570) is the
+      // manager's blind spot, so drop it here too — a deliberate NEW chat must not
+      // be resurrected by the unsaved-workflow fallback on the next reload.
+      const sk = tabStableKey.get(tabId);
+      if (sk) sessionStore.clearStable(sk);
       bridge.push({ type: "session", session_id: null }, tabId);
       bridge.push({ type: "ack", ok: true, kind: "new_session" }, tabId);
       bridge.broadcastTabList(); // session cleared → mirror pickers' green dot off
