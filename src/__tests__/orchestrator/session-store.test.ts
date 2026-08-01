@@ -6,7 +6,7 @@
 // brand-new orchestrator process reading what the previous one persisted.
 
 import { describe, expect, it, afterEach } from "vitest";
-import { rmSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionStore } from "../../orchestrator/session-store.js";
@@ -78,5 +78,127 @@ describe("SessionStore", () => {
         /* ignore */
       }
     }
+  });
+
+  it("reads a LEGACY flat file (Record<string,string>) and keeps resuming (#570 migration)", () => {
+    // A pre-#570 store on disk is a flat {tabId: sessionId} map. The new reader must
+    // migrate it in place so an upgrade never forgets a live session.
+    writeFileSync(FILE, JSON.stringify({ "wf:x::claude": "sess-legacy" }));
+    const store = new SessionStore(PORT);
+    expect(store.get("wf:x::claude")).toBe("sess-legacy");
+    // And a subsequent write persists the v2 structured format without losing it.
+    store.set("wf:y::claude", "sess-new");
+    const restarted = new SessionStore(PORT);
+    expect(restarted.get("wf:x::claude")).toBe("sess-legacy");
+    expect(restarted.get("wf:y::claude")).toBe("sess-new");
+  });
+
+  describe("stable resume key — unsaved workflows survive a reload (#570)", () => {
+    it("resumes by stable key when the ephemeral tab id changed", () => {
+      const first = new SessionStore(PORT);
+      // The unsaved tab's session, recorded under BOTH the (ephemeral) tab id and a
+      // STABLE key (origin+title+backend).
+      first.set("tmp:old-uuid::claude", "sess-unsaved");
+      first.setStable("tmp::http://127.0.0.1:8188::Unsaved Workflow (6)::claude", "sess-unsaved");
+
+      // Orchestrator restart + panel reload: the tab returns under a NEW tmp id, so
+      // the exact-tab lookup misses — but the stable key still hits.
+      const restarted = new SessionStore(PORT);
+      expect(restarted.get("tmp:new-uuid::claude")).toBeUndefined();
+      expect(
+        restarted.getStable("tmp::http://127.0.0.1:8188::Unsaved Workflow (6)::claude"),
+      ).toBe("sess-unsaved");
+    });
+
+    it("clearStable forgets the stable session (a deliberate NEW chat)", () => {
+      const store = new SessionStore(PORT);
+      store.setStable("skey", "sess-1");
+      store.clearStable("skey");
+      expect(store.getStable("skey")).toBeUndefined();
+      expect(new SessionStore(PORT).getStable("skey")).toBeUndefined();
+    });
+
+    it("SAME owner writing a new session (rewind/fork) is not a collision", () => {
+      const store = new SessionStore(PORT);
+      store.setStable("skey", "sess-1", "tmp:tabA");
+      store.setStable("skey", "sess-2", "tmp:tabA"); // same tab, forked session
+      expect(store.getStable("skey")).toBe("sess-2");
+    });
+
+    it("a reloaded tab writing the SAME session under a new owner just refreshes", () => {
+      const store = new SessionStore(PORT);
+      store.setStable("skey", "sess-1", "tmp:tabA");
+      store.setStable("skey", "sess-1", "tmp:tabA-reloaded"); // new tmp id, resumed session
+      expect(store.getStable("skey")).toBe("sess-1");
+    });
+
+    it("POISONS a title-collision so a sibling can't resume the wrong conversation", () => {
+      const store = new SessionStore(PORT);
+      // Two different unsaved tabs, same title -> same stable key, distinct sessions.
+      store.setStable("skey", "sess-A", "tmp:tabA");
+      store.setStable("skey", "sess-B", "tmp:tabB"); // collision
+      // Neither may resume it now — degrade to fresh, never resume the wrong one.
+      expect(store.getStable("skey")).toBeUndefined();
+      // Poison is durable and sticky (a later write doesn't un-poison it).
+      store.setStable("skey", "sess-C", "tmp:tabC");
+      expect(store.getStable("skey")).toBeUndefined();
+      expect(new SessionStore(PORT).getStable("skey")).toBeUndefined();
+      // Only an explicit NEW chat (clearStable) revives the key.
+      store.clearStable("skey");
+      store.setStable("skey", "sess-D", "tmp:tabD");
+      expect(store.getStable("skey")).toBe("sess-D");
+    });
+  });
+
+  it("clamps a corrupt FUTURE timestamp AND persists the clamp so it can't be immortal (#570 P3)", () => {
+    writeFileSync(
+      FILE,
+      JSON.stringify({
+        v: 2,
+        sessions: { "wf:x::claude": { s: "sess-future", t: 1e100 } },
+        stable: {},
+      }),
+    );
+    // Load clamps 1e100 → now AND re-flushes, so disk no longer holds the immortal
+    // value (otherwise every reload just re-clamps it and it never ages out).
+    const store = new SessionStore(PORT);
+    expect(store.get("wf:x::claude")).toBe("sess-future");
+    const onDisk = JSON.parse(readFileSync(FILE, "utf8")) as {
+      sessions: Record<string, { t: number }>;
+    };
+    const t = onDisk.sessions["wf:x::claude"].t;
+    expect(Number.isFinite(t)).toBe(true);
+    expect(t).toBeLessThanOrEqual(Date.now());
+  });
+
+  it("garbage-collects entries older than the TTL on load (#570 unbounded growth)", () => {
+    // Hand-craft a v2 file with one FRESH and one ANCIENT entry in each index.
+    const old = Date.now() - (SessionStore.GC_TTL_MS + 60_000);
+    const fresh = Date.now();
+    writeFileSync(
+      FILE,
+      JSON.stringify({
+        v: 2,
+        sessions: {
+          "e2e-stale::claude": { s: "sess-old", t: old },
+          "wf:live::claude": { s: "sess-live", t: fresh },
+        },
+        stable: {
+          "spike-stale": { s: "sess-old2", t: old },
+          "tmp::o::T::claude": { s: "sess-live2", t: fresh },
+        },
+      }),
+    );
+    const store = new SessionStore(PORT);
+    // Stale keys pruned; live keys kept.
+    expect(store.get("e2e-stale::claude")).toBeUndefined();
+    expect(store.get("wf:live::claude")).toBe("sess-live");
+    expect(store.getStable("spike-stale")).toBeUndefined();
+    expect(store.getStable("tmp::o::T::claude")).toBe("sess-live2");
+    // The prune is durable — a re-read of the just-written file has dropped them.
+    store.set("wf:another::claude", "x"); // forces a flush
+    const restarted = new SessionStore(PORT);
+    expect(restarted.get("e2e-stale::claude")).toBeUndefined();
+    expect(restarted.getStable("spike-stale")).toBeUndefined();
   });
 });

@@ -179,7 +179,12 @@ export interface PanelAgentDeps {
  * as user turns; the session never closes until `stop()`.
  */
 export class PanelAgent {
-  readonly tabId: string;
+  /** This agent's own (composite `tabId::backend`) key. MUTABLE only via
+   *  {@link rebindTabId}: a panel tab-id migration re-keys the manager's map, and
+   *  the agent must move WITH it or every `this.tabId` read (callbacks, bridge
+   *  pushes, sessionStore persistence, the bound panel MCP server) keeps addressing
+   *  the DEAD pre-migration tab (#568 Defect 1). */
+  tabId: string;
   private deps: PanelAgentDeps;
   /** The injected provider adapter (Claude today). PanelAgent owns the queue,
    *  turn-gate, rewind tracking and self-restart; the backend owns the SDK call,
@@ -251,6 +256,11 @@ export class PanelAgent {
    *  short fallback that opens the gate anyway if no result ever arrives, so an
    *  interrupt can never stop cold. */
   private interruptReleaseTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The turn number the pending interrupt-release fallback is guarding — the turn
+   *  an interrupt aborted. The fallback force-releases only while THIS turn is still
+   *  the one parked on the gate, so a stale timer can't cut a later, legit turn
+   *  short. Refreshed on every interrupt(). See armInterruptReleaseFallback(). */
+  private interruptGuardTurn = 0;
   /** Mutable so the model/effort picker can change them at runtime. */
   private model: string;
   private effort?: Effort;
@@ -300,6 +310,22 @@ export class PanelAgent {
 
   private short(): string {
     return this.tabId.slice(0, 8);
+  }
+
+  /** Re-point this agent onto a migrated tab id (#568 Defect 1). The manager's
+   *  rebindAgent() re-keys its map, but the agent ALSO carries its own tabId —
+   *  every callback (onTurn/onSay/onSession → sessionStore) fires with it, bridge
+   *  pushes route by it, and the bound panel MCP server resolves `panel_*` against
+   *  it. Left stale, the agent keeps addressing the DEAD pre-migration tab
+   *  (panel_* → "no connected tab"; pushes/persists land under an orphaned id).
+   *  Update the field AND the panel server's bound tab so nothing drifts.
+   *  `panelTabId` is the bare panel id (no ::backend) the panel server binds to. */
+  rebindTabId(newKey: string, panelTabId: string): void {
+    this.tabId = newKey;
+    const server = this.deps.panelServer as
+      | (McpSdkServerConfigWithInstance & { rebindTab?: (t: string) => void })
+      | undefined;
+    server?.rebindTab?.(panelTabId);
   }
 
   /** Queue a panel message and wake the streaming generator (the "channel in").
@@ -529,11 +555,6 @@ export class PanelAgent {
     // The aborted turn's result is EXPECTED (and error-subtyped on the Claude
     // SDK) — don't let the result case report it as a turn failure.
     this.interruptRequested = true;
-    // The turn that's in flight RIGHT NOW — the one we're aborting. Captured
-    // before the await so the release fallback below targets exactly this turn's
-    // gate (not a later one the channel may legitimately advance to if the
-    // aborted turn's result lands during the await).
-    const interruptedTurn = this.yieldedTurns;
     // Re-queue the interrupted turn ONLY for "send now" (requeueInFlight) — there
     // the user wants BOTH the interrupted message and the new one answered. A plain
     // Stop / Ctrl+C / Esc (requeueInFlight=false) must NOT re-queue, or it would
@@ -543,39 +564,57 @@ export class PanelAgent {
       // user sends next (which is appended after this interrupt is handled).
       this.queue.unshift({ text: interrupted.text, images: interrupted.images });
     }
+    // Track the turn this interrupt is aborting (the one holding the gate). The
+    // fallback only force-releases while THIS turn is still the one parked on the
+    // gate, so a stale timer left by an idle/settled interrupt can't cut a LATER,
+    // legit turn short. Updated on every interrupt (a storm keeps it pointed at the
+    // still-stuck turn); the coalesced timer keeps the earliest deadline.
+    this.interruptGuardTurn = this.yieldedTurns;
+    // Arm the fallback BEFORE the await, not in a `finally` after it: if
+    // backend.interrupt() itself hangs, a `finally`-armed net would never start and
+    // the gate would stay parked forever. Armed here, the timer runs regardless;
+    // a result that lands first calls completeTurn → clears it (no premature fire).
+    // Do NOT force the gate open synchronously — that fed the next batch (the
+    // re-queued turn + the "send now" message) into the backend before the aborted
+    // turn had settled, so the SDK took the message but started no turn on it (wedged
+    // until the idle watchdog). Let the aborted turn's `result` drive completeTurn()
+    // at the right moment; the fallback only fires if no result ever arrives.
+    this.armInterruptReleaseFallback();
     try {
       await this.backend.interrupt();
     } catch (err) {
       logger.debug(`[panel-agent ${this.short()}] interrupt: ${msgOf(err)}`);
-    } finally {
-      // Do NOT force the gate open here. Synchronously releasing it fed the next
-      // batch (the re-queued turn + the "send now" message) into Claude before the
-      // aborted turn had settled — the SDK took the message into the session but
-      // started no turn on it, so it sat wedged until the slow idle watchdog (or
-      // the user's next message) nudged it. Instead let the aborted turn's
-      // `result` event drive completeTurn() — that fires once the SDK has finished
-      // tearing the turn down and is ready for the next prompt, so the re-queued
-      // batch is fed at the right moment and answered immediately. The fallback
-      // guarantees we still advance if no result ever arrives.
-      this.armInterruptReleaseFallback(interruptedTurn);
     }
   }
 
   /** Bounded safety net for interrupt(): if the aborted turn's `result` (which
    *  opens the gate via completeTurn) hasn't arrived shortly, force the gate so an
-   *  interrupt can't stop cold. `guardTurn` is the interrupted turn's number —
-   *  we only force-release while THAT turn is still the one the gate waits on, so
-   *  a result that lands during the await (advancing the channel to a new, legit
-   *  in-flight turn) can't be wrongly cut short. Cancelled by completeTurn(). */
-  private armInterruptReleaseFallback(guardTurn: number): void {
-    if (this.interruptReleaseTimer) clearTimeout(this.interruptReleaseTimer);
+   *  interrupt can't stop cold. Cancelled by completeTurn()/releaseTurns().
+   *
+   *  ROBUST TO AN INTERRUPT STORM (#568 Defect 2). The old version did
+   *  `clearTimeout` + re-arm on EVERY interrupt, so a burst of "send now" landing
+   *  closer together than the window kept cancelling the pending net before it
+   *  could ever fire — the gate stayed shut and NO turn started again ("Interrupted."
+   *  with PENDING messages that no send-now flushes). The fix:
+   *   1. COALESCE — if a timer is already armed, keep it. The net set by the FIRST
+   *      interrupt of an unsettled burst is an ABSOLUTE ceiling that later interrupts
+   *      cannot postpone. completeTurn/releaseTurns clear it, so a burst that DOES
+   *      settle (a result lands) re-arms a fresh ceiling on the next interrupt.
+   *   2. GUARD by the tracked interrupted turn (`interruptGuardTurn`), NOT the bare
+   *      live gate. A stale timer left by an idle or already-settled interrupt must
+   *      not fire against a LATER legit turn that merely happens to be parked — only
+   *      release while the turn this interrupt aborted is still the one stuck. The
+   *      guard is refreshed on every interrupt, so a storm keeps it pointed at the
+   *      still-stuck turn while the coalesced deadline holds. */
+  private armInterruptReleaseFallback(): void {
+    if (this.interruptReleaseTimer) return; // coalesce — keep the earliest deadline
     this.interruptReleaseTimer = setTimeout(() => {
       this.interruptReleaseTimer = null;
       if (this.closed) return;
-      // Fire only if the SAME interrupted turn still hasn't completed (no result
-      // arrived). If a result landed, completedTurns has reached guardTurn (and
-      // completeTurn already cleared this timer), so this is a no-op.
-      if (this.completedTurns < guardTurn) {
+      // Fire only if the tracked interrupted turn still hasn't completed. A result
+      // would have called completeTurn → advanced completedTurns AND cleared this
+      // timer, so surviving to fire here means the gate is genuinely stuck on it.
+      if (this.completedTurns < this.interruptGuardTurn) {
         logger.debug(
           `[panel-agent ${this.short()}] interrupt: no result within ${INTERRUPT_RELEASE_FALLBACK_MS}ms — releasing the gate`,
         );
@@ -1624,6 +1663,12 @@ export class PanelAgentManager {
     }
     this.agents.delete(oldKey);
     this.agents.set(newKey, agent);
+    // The live agent must ADOPT the new id, not just be re-filed under it (#568
+    // Defect 1). A panel tab id never contains the "::" backend separator, so the
+    // segment before the LAST "::" is the bare panel tab the panel server binds to.
+    const sep = newKey.lastIndexOf("::");
+    const panelTabId = sep >= 0 ? newKey.slice(0, sep) : newKey;
+    agent.rebindTabId(newKey, panelTabId);
     // has()-based moves throughout (codex review): truthy checks dropped
     // legitimate null/undefined sentinels (e.g. restart-without-nudge, an
     // explicit effort-override clear).
