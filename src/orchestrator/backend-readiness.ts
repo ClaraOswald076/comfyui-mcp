@@ -70,18 +70,58 @@ const PI_PROVIDER_ENV_KEYS: readonly string[] = [
   "MINIMAX_API_KEY",
 ];
 
-/** True when pi has a VERIFIABLE provider credential: its auth file
- *  (~/.pi/agent/auth.json — API keys and `/login` subscriptions) exists, OR a
- *  non-stripped provider key is in env. This is the honest "ready" signal (pi's
- *  `--list-models` is not an auth probe), and the connect handler uses it too so
- *  a keyless pi is degraded up front instead of greeted green (#491 codex P1a).
- *  A credential we can't see (some other pi config) reads false here — we
- *  under-claim rather than false-greet. */
+/** True when a pi provider credential is detectable from ANY documented source.
+ *  pi's `--list-models` is NOT an auth probe, so this — not the CLI's presence —
+ *  is the honest "ready" signal, and the connect handler uses it too so a
+ *  credential-less pi is degraded up front instead of greeted green (#491 codex
+ *  P1a). Two rules (codex round 3):
+ *    - NEVER green on pure file EXISTENCE: ~/.pi/agent/auth.json is PARSED and
+ *      must carry a structurally-usable entry (an empty/corrupt file is not a
+ *      credential).
+ *    - Detect EVERY documented source so a working pi isn't falsely degraded:
+ *      a valid auth.json, a non-stripped provider env key, Google ADC
+ *      (GOOGLE_APPLICATION_CREDENTIALS — a file path, not stripped), or a
+ *      non-empty ~/.pi/agent/models.json (custom-provider creds).
+ *  Since a REAL usability check needs a turn, we err toward "ready" when any
+ *  credible source exists — false only when NONE is detectable. */
 export function piCredentialPresent(home: string = homedir()): boolean {
-  return (
-    fileExists(home, ".pi", "agent", "auth.json") ||
-    PI_PROVIDER_ENV_KEYS.some((k) => !!process.env[k]?.trim())
-  );
+  if (piAuthJsonUsable(join(home, ".pi", "agent", "auth.json"))) return true;
+  if (PI_PROVIDER_ENV_KEYS.some((k) => !!process.env[k]?.trim())) return true;
+  // Google Vertex ADC: a service-account key file path (NOT an API key, so not
+  // stripped by buildAgentSpawnEnv) — pi's Vertex provider authenticates with it.
+  if (process.env.GOOGLE_APPLICATION_CREDENTIALS?.trim()) return true;
+  if (piModelsJsonUsable(join(home, ".pi", "agent", "models.json"))) return true;
+  return false;
+}
+
+/** Parse ~/.pi/agent/auth.json and report whether it carries a usable credential
+ *  — an object with ≥1 entry whose value is a non-empty string OR a non-empty
+ *  object (an api_key/oauth record). An empty/`{}`/`{"anthropic":{}}`/corrupt
+ *  file returns false (never green on mere existence). Never throws. */
+function piAuthJsonUsable(file: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    return Object.values(parsed as Record<string, unknown>).some(
+      (v) =>
+        (typeof v === "string" && v.trim() !== "") ||
+        (!!v && typeof v === "object" && !Array.isArray(v) && Object.keys(v).length > 0),
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** A non-empty ~/.pi/agent/models.json (custom provider/model definitions, which
+ *  can carry provider credentials) counts as a credible source. Requires a
+ *  parseable non-empty object — not mere existence. Never throws. */
+function piModelsJsonUsable(file: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
+    return !!parsed && typeof parsed === "object" && !Array.isArray(parsed) && Object.keys(parsed).length > 0;
+  } catch {
+    return false;
+  }
 }
 
 /** Well-known Ollama install locations probed in addition to PATH (the Windows

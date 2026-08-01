@@ -181,7 +181,7 @@ describe("parsePiModels", () => {
 const PI_ENV_KEYS = [
   "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY", "OPENROUTER_API_KEY",
   "DEEPSEEK_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY", "ZAI_API_KEY",
-  "KIMI_API_KEY", "MINIMAX_API_KEY",
+  "KIMI_API_KEY", "MINIMAX_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS",
 ];
 function withNoPiEnvKeys<T>(fn: () => T): T {
   const saved: Record<string, string | undefined> = {};
@@ -217,19 +217,50 @@ describe("resolvePiBin / readiness", () => {
   });
 
   it("reads ready ONLY when a credential is verifiable — not on CLI presence alone (P1a)", () => {
-    // CLI present but NO credential → NOT ready (list-models isn't an auth probe).
     withNoPiEnvKeys(() => {
+      // CLI present but NO credential source → NOT ready (list-models isn't an
+      // auth probe).
       const r0 = backendReadiness("pi", { home: workDir });
       expect(r0.cli).toBe(true);
       expect(r0.auth).toBeNull(); // unknown, don't nag
       expect(r0.ready).toBe(false);
+
+      // An EMPTY / structurally-useless auth.json must NOT count (never green on
+      // mere file existence — P1a-a).
+      mkdirSync(join(workDir, ".pi", "agent"), { recursive: true });
+      writeFileSync(join(workDir, ".pi", "agent", "auth.json"), "{}");
+      expect(backendReadiness("pi", { home: workDir }).ready).toBe(false);
+      writeFileSync(join(workDir, ".pi", "agent", "auth.json"), '{"anthropic":{}}');
+      expect(backendReadiness("pi", { home: workDir }).ready).toBe(false);
+      writeFileSync(join(workDir, ".pi", "agent", "auth.json"), "{ not json");
+      expect(backendReadiness("pi", { home: workDir }).ready).toBe(false);
+
+      // A VALID auth.json entry → ready.
+      writeFileSync(
+        join(workDir, ".pi", "agent", "auth.json"),
+        '{"anthropic":{"type":"api_key","key":"sk-ant-x"}}',
+      );
+      const r1 = backendReadiness("pi", { home: workDir });
+      expect(r1.auth).toBe(true);
+      expect(r1.ready).toBe(true);
     });
-    // With ~/.pi/agent/auth.json present → ready.
-    mkdirSync(join(workDir, ".pi", "agent"), { recursive: true });
-    writeFileSync(join(workDir, ".pi", "agent", "auth.json"), '{"anthropic":{"type":"api_key","key":"x"}}');
-    const r1 = backendReadiness("pi", { home: workDir });
-    expect(r1.auth).toBe(true);
-    expect(r1.ready).toBe(true);
+  });
+
+  it("detects the broadened credential sources: env key, Google ADC, models.json (P1a-b)", () => {
+    withNoPiEnvKeys(() => {
+      // (1) a non-stripped provider env key.
+      process.env.OPENAI_API_KEY = "sk-x";
+      expect(backendReadiness("pi", { home: workDir }).ready).toBe(true);
+      delete process.env.OPENAI_API_KEY;
+      // (2) Google ADC — a file path, not an API key (not stripped).
+      process.env.GOOGLE_APPLICATION_CREDENTIALS = "/home/u/adc.json";
+      expect(backendReadiness("pi", { home: workDir }).ready).toBe(true);
+      delete process.env.GOOGLE_APPLICATION_CREDENTIALS;
+      // (3) a non-empty models.json (custom-provider creds).
+      mkdirSync(join(workDir, ".pi", "agent"), { recursive: true });
+      writeFileSync(join(workDir, ".pi", "agent", "models.json"), '{"my-vllm":{"baseUrl":"http://x/v1"}}');
+      expect(backendReadiness("pi", { home: workDir }).ready).toBe(true);
+    });
   });
 
   it("reports not-ready when the CLI is absent", () => {
@@ -314,6 +345,33 @@ describe("PiBackend turns", () => {
     const t1 = hoisted.spawns[0]!;
     expect(t1.args[t1.args.indexOf("--session") + 1]).toBe("sess-existing");
     expect(t1.args[t1.args.length - 1]).toBe("back"); // no persona preamble
+  });
+
+  it("re-asserts the capabilityNote on EVERY turn — fresh AND resume (P0a-resume)", async () => {
+    // The heavy systemAppend preamble is first-turn-only, but the capability note
+    // (pi has no ComfyUI tools) must reach resumed/long-running sessions too.
+    const NOTE = "PI-HAS-NO-COMFYUI-TOOLS";
+    // Fresh session, two turns: both must carry the note; the persona only turn 1.
+    hoisted.script.push(
+      { stdout: [header("s1"), delta("a"), END], exit: 0 },
+      { stdout: [header("s1"), delta("b"), END], exit: 0 },
+    );
+    const fresh = new PiBackend({ cwd: workDir, systemAppend: "PERSONA", capabilityNote: NOTE });
+    await collect(fresh.run({ channel: channelOf([{ text: "one" }, { text: "two" }]) }));
+    const f1 = hoisted.spawns[0]!.args.at(-1)!;
+    const f2 = hoisted.spawns[1]!.args.at(-1)!;
+    expect(f1).toContain("PERSONA");
+    expect(f1).toContain(NOTE);
+    expect(f2).not.toContain("PERSONA"); // heavy preamble suppressed after turn 1
+    expect(f2).toContain(NOTE); // but the note persists
+
+    // RESUMED session: no persona, but the note is still asserted.
+    hoisted.script.push({ stdout: [header("s2"), delta("c"), END], exit: 0 });
+    const resumed = new PiBackend({ cwd: workDir, systemAppend: "PERSONA", capabilityNote: NOTE });
+    await collect(resumed.run({ resume: "s-old", channel: channelOf([{ text: "back" }]) }));
+    const r1 = hoisted.spawns[2]!.args.at(-1)!;
+    expect(r1).not.toContain("PERSONA");
+    expect(r1).toContain(NOTE);
   });
 
   it("drops a bare claude id (no --model) but honors a provider-prefixed id", async () => {
