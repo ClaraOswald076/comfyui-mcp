@@ -6,8 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.27] - 2026-08-01
+
 ### Fixed
-- **A mutating panel command names the rebind recovery when it can't reach a tab (panel #442, defect 4).** `panel_set_widget` (and every other mutating `panel_*` edit deliberately excluded from the retry-safe set) surfaced the bare bridge error — `no connected tab … Connected: none` — with no recovery path, whereas a retry-safe read like `panel_get_errors` already names the rebind. That asymmetry made a brief post-reconnect read/edit-channel disagreement (a user hit it ~6× in a long multi-tab session, while `panel_list_workflows` kept answering) look like a dead agent. The bridge now tags a pre-dispatch routing refusal with its authoritative typed `dispatched:false` flag, so the tool layer wraps it — without retrying (no double-apply) — to state nothing was applied and name `panel_set_workflow_target({mode:"current"})`, preserving the raw cause. Keying on the typed flag (not error text) means a post-dispatch executor failure that merely quotes "no connected tab" is never mis-classified. The strict-single silent auto-heal still recovers the ordinary single-tab case untouched.
+- **`panel_update_node` stops surfacing a raw HTTP 405 against a `/v2`-served legacy Manager (panel #464).** A single-pack update POSTed to the unified `/v2/manager/queue/task`, which a bundled-3.x-under-`/v2` build leaves unregistered (405 from the frontend catchall); it now negotiates a 405 → the `/v2/manager/queue/batch` envelope and pins the corrected dialect only after the batch enqueue succeeds (so a proxy/WAF 405 on a genuine v4 host can't poison the cache). v4 unaffected.
+- **`panel_query_graph`/`graph_query` isn't falsely gated "too old" once the connection has already served it (panel #422).** The #392 proactive version-gate rejected the command on a re-hello advertising an undercutting version; a `provenSupportedCmds` set (recorded on success, inherited across reconnect + a same-socket `tmp:→wf:` migration, cleared on a genuine `Unknown command`) now vetoes the gate.
+- **A mutating `panel_*` edit refused before dispatch now names the rebind recovery instead of a bare error (panel #442, defect 4).** A pre-dispatch routing refusal is tagged with the typed `dispatched:false` flag, so the tool layer states nothing was applied — without retrying (no double-apply) — and points at `panel_set_workflow_target({mode:"current"})`; a post-dispatch executor error quoting the same phrase is never mis-classified.
 
 ## [0.48.26] - 2026-08-01
 
