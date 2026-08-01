@@ -41,10 +41,14 @@ function autoReply(sock: WebSocket, tag: string): void {
   });
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   port = 20000 + Math.floor(Math.random() * 20000);
   bridge = new UiBridge(port);
   bridge.start();
+  // Await the actual bound `listening` event before any test connects a client.
+  // start() binds asynchronously; without this, connectPanel() can race the bind
+  // and fail with ECONNREFUSED on loaded CI (ubuntu-latest) — the #486 flake.
+  expect(await bridge.whenReady()).toBe(true);
 });
 
 afterEach(async () => {
