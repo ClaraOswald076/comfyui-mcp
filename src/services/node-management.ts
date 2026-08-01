@@ -1588,15 +1588,20 @@ async function updateManagerSelf(id: string): Promise<NodeOpResult> {
   // be flatly wrong. Only a 405 that survives a re-probe — the route really is
   // unregistered on the live dialect — reaches the unsupported verdict.
   let used: ManagerApi;
+  // The verdict must name the dialect of the attempt that ACTUALLY 405'd — after a
+  // re-probe that can differ from the dialect detected on entry, and the message is
+  // dialect-specific ("the LEGACY 3.x queue API" vs the legacy-UI one).
+  let lastTried = api;
   try {
-    used = await enqueueWithDialectSelfHeal("update", (dialect, epoch) =>
-      enqueueManagerTask(dialect, "update", () => ({ node_name: id }), randomUUID(), epoch),
-    );
+    used = await enqueueWithDialectSelfHeal("update", (dialect, epoch) => {
+      lastTried = dialect;
+      return enqueueManagerTask(dialect, "update", () => ({ node_name: id }), randomUUID(), epoch);
+    });
   } catch (err) {
     if (errorStatus(err) !== 405) throw err;
     // 405 = the update route is not registered on this build (#424).
-    logger.debug("Manager self-update route 405 — reporting unsupported", { api });
-    throw managerSelfUpdateUnsupported(api, err);
+    logger.debug("Manager self-update route 405 — reporting unsupported", { api: lastTried });
+    throw managerSelfUpdateUnsupported(lastTried, err);
   }
   const status = await runManagerQueue(used);
   return {
