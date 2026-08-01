@@ -97,6 +97,18 @@ interface Conn {
    *  (see makeUnknownCommandError) — the panel gained these bridge commands in
    *  0.11.4, so older builds reject graph_* / ui_* with a raw dispatch error. */
   panelVersion?: string;
+  /** True only when THIS hello actually CARRIED a `panel_version` (not inherited from
+   *  a prior connection under the same tab id). `panelVersion` is deliberately
+   *  inherited across a reconnect that omits the field (line ~849) so the reactive
+   *  "update your panel" message can still quote a detected version — but that stale,
+   *  inherited value must NOT drive the PROACTIVE gate (#392): a reconnect may be a
+   *  freshly UPGRADED panel, so proactively blocking it on the old version — without
+   *  ever probing it — would strand a now-capable panel until yet another reconnect
+   *  (codex WS review). So proactive gating fires ONLY when the current connection
+   *  advertised its own version; an omitted-version reconnect falls through to normal
+   *  dispatch + the reactive #236 path (which learns from a REAL rejection). Mirrors
+   *  the unsupportedCmds "reset on every hello" philosophy for the version dimension. */
+  panelVersionAdvertised: boolean;
   /** Commands THIS connection has already proven it doesn't support, via a real
    *  "Unknown command" reply earlier in the session (#236). Once a cmd lands
    *  here, every later call is gated proactively — rejected before it ever
@@ -174,6 +186,27 @@ function panelSupportsCmd(cmd: string, panelVersion?: string): boolean {
   return compareSemver(panelVersion, minPanelVersionForCmd(cmd)) >= 0;
 }
 
+/** True when the panel's ADVERTISED version PARSEABLY PROVES it is too old to
+ *  support `cmd` — the mirror image of panelSupportsCmd, used to PROACTIVELY gate a
+ *  call BEFORE dispatch (#392) so the honest "update your panel" verdict fires on
+ *  the FIRST call, with no wasted round-trip to collect an "Unknown command" reply
+ *  (and even when a frozen old panel wouldn't cleanly reply at all).
+ *
+ *  Deliberately gates ONLY commands with an EXPLICIT, changelog-verified entry in
+ *  BRIDGE_CMD_MIN_PANEL_VERSION. A command NOT listed there falls back to the
+ *  inflated full-set baseline (0.11.4) which is WRONG as a proactive minimum for the
+ *  many bridge commands that shipped much earlier — using it here would FALSE-GATE a
+ *  capable 0.4.6–0.11.3 panel out of e.g. graph_get_errors. So an unlisted command is
+ *  NEVER proactively gated; it still learns unsupported reactively from a real
+ *  rejection (#236). Missing/unparseable version also returns false (can't prove it —
+ *  fall through to the reactive path, preserving fail-open). */
+export function panelVersionProvesUnsupported(cmd: string, panelVersion?: string): boolean {
+  const min = BRIDGE_CMD_MIN_PANEL_VERSION[cmd];
+  if (!min) return false;
+  if (!panelVersion || !SEMVER_RE.test(panelVersion.trim())) return false;
+  return compareSemver(panelVersion, min) < 0;
+}
+
 /** The actionable "update your panel" message for a command a connected panel has
  *  been discovered NOT to support. Shared by the reactive path (the panel's own
  *  "Unknown command" reply, mapped by makeUnknownCommandError) and the proactive
@@ -191,8 +224,10 @@ function buildPanelTooOldError(cmd: string, panelVersion?: string): Error {
 /**
  * A panel replies `{ ok: false, error: 'Unknown command "<cmd>"' }` when the
  * orchestrator dispatches a bridge command the (older) panel doesn't register —
- * graph_query, ui_render, graph_serialize, graph_view_nodes_in_viewport, etc. all
- * shipped in the panel at 0.11.4. Detect that raw dispatch error and rewrite it
+ * graph_query, ui_render, graph_serialize, graph_view_nodes_in_viewport, etc. are
+ * registered only from the panel version each was introduced in (see
+ * BRIDGE_CMD_MIN_PANEL_VERSION — NOT a blanket 0.11.4; graph_query shipped at 0.7.0,
+ * graph_outline at 0.4.6). Detect that raw dispatch error and rewrite it
  * into an actionable "update your panel" message instead of surfacing the opaque
  * internal command name to the agent/user. Returns null when `error` is anything
  * else (a genuine command failure), so the happy/normal-error path is untouched.
@@ -824,6 +859,12 @@ export class UiBridge {
             typeof (msg as { panel_version?: unknown }).panel_version === "string"
               ? ((msg as { panel_version?: string }).panel_version || undefined)
               : existing?.panelVersion,
+          // Did THIS hello carry its own version? Only then may proactive gating trust
+          // it (#392) — an omitted-version reconnect inherits panelVersion for messaging
+          // but must not be proactively blocked on it (see the field's doc comment).
+          panelVersionAdvertised:
+            typeof (msg as { panel_version?: unknown }).panel_version === "string" &&
+            !!(msg as { panel_version?: string }).panel_version,
           // Fresh per hello — see the field's doc comment (#236).
           unsupportedCmds: new Set<string>(),
           // window.location the browser was served from — the ComfyUI instance THIS
@@ -1290,6 +1331,20 @@ export class UiBridge {
     // on THIS connection (in dispatch()'s rejectMapped below), never inferred from
     // panelVersion alone.
     if (conn.unsupportedCmds.has(cmd.cmd)) {
+      return Promise.reject(buildPanelTooOldError(cmd.cmd, conn.panelVersion));
+    }
+    // #392 — PROACTIVELY gate a command whose changelog-verified minimum the panel's
+    // ADVERTISED version parseably undercuts (e.g. graph_query on a <0.7.0 panel), so
+    // the honest, correctly-versioned "update your panel" verdict fires on the FIRST
+    // call — no round-trip to collect an "Unknown command" reply, and it still works
+    // if a frozen old panel wouldn't reply. Conservative (panelVersionProvesUnsupported
+    // gates ONLY explicitly-listed commands against their true minimum, never the
+    // inflated fallback), so a capable panel is never falsely gated. Intentionally does
+    // NOT add to conn.unsupportedCmds — that learned set stays reserved for REAL
+    // rejections (#236), so nothing is permanently poisoned from version alone.
+    // Gated on panelVersionAdvertised so a stale version INHERITED across an
+    // omitted-version reconnect never blocks a possibly-upgraded panel unprobed.
+    if (conn.panelVersionAdvertised && panelVersionProvesUnsupported(cmd.cmd, conn.panelVersion)) {
       return Promise.reject(buildPanelTooOldError(cmd.cmd, conn.panelVersion));
     }
     if (conn.sock.readyState !== WebSocket.OPEN) {

@@ -3,6 +3,7 @@ import WebSocket, { WebSocketServer } from "ws";
 import {
   UiBridge,
   makeUnknownCommandError,
+  panelVersionProvesUnsupported,
   MIN_PANEL_VERSION_FOR_BRIDGE_COMMANDS,
   minPanelVersionForCmd,
   markDispatched,
@@ -1171,6 +1172,41 @@ describe("makeUnknownCommandError (old-panel version gate)", () => {
   });
 });
 
+describe("panelVersionProvesUnsupported (#392 proactive version gate)", () => {
+  it("is TRUE only for a listed command whose verified minimum the parseable version undercuts", () => {
+    // graph_query shipped at panel 0.7.0 (changelog-verified).
+    expect(panelVersionProvesUnsupported("graph_query", "0.6.8")).toBe(true);
+    expect(panelVersionProvesUnsupported("graph_query", "0.6.99")).toBe(true);
+    // At or above the minimum → supported → not proven-unsupported.
+    expect(panelVersionProvesUnsupported("graph_query", "0.7.0")).toBe(false);
+    expect(panelVersionProvesUnsupported("graph_query", "0.11.21")).toBe(false);
+  });
+
+  it("NEVER gates an unlisted command (would otherwise inherit the inflated 0.11.4 baseline and false-gate an early-but-capable panel)", () => {
+    // graph_get_errors / graph_set_widget / ui_render shipped long before 0.11.4 but
+    // are NOT in BRIDGE_CMD_MIN_PANEL_VERSION — proactively gating them off the
+    // fallback baseline would wrongly block a 0.4.6–0.11.3 panel that supports them.
+    expect(panelVersionProvesUnsupported("graph_get_errors", "0.6.8")).toBe(false);
+    expect(panelVersionProvesUnsupported("graph_set_widget", "0.9.0")).toBe(false);
+    expect(panelVersionProvesUnsupported("ui_render", "0.6.8")).toBe(false);
+  });
+
+  it("returns FALSE for a missing or unparseable version (can't prove it — fall through to the reactive path)", () => {
+    expect(panelVersionProvesUnsupported("graph_query", undefined)).toBe(false);
+    expect(panelVersionProvesUnsupported("graph_query", "")).toBe(false);
+    expect(panelVersionProvesUnsupported("graph_query", "dev")).toBe(false);
+    expect(panelVersionProvesUnsupported("graph_query", "nightly-2026")).toBe(false);
+  });
+
+  it("gates graph_serialize (0.8.2) and leaves graph_outline (0.4.6) effectively ungated for any modern panel", () => {
+    expect(panelVersionProvesUnsupported("graph_serialize", "0.8.1")).toBe(true);
+    expect(panelVersionProvesUnsupported("graph_serialize", "0.8.2")).toBe(false);
+    expect(panelVersionProvesUnsupported("graph_outline", "0.4.5")).toBe(true);
+    expect(panelVersionProvesUnsupported("graph_outline", "0.4.6")).toBe(false);
+    expect(panelVersionProvesUnsupported("graph_outline", "0.11.7")).toBe(false);
+  });
+});
+
 describe("UiBridge.send (graceful gate end-to-end)", () => {
   it("surfaces an actionable message (with panel version) when an old panel rejects a bridge command", async () => {
     const sock = await connectPanel(undefined);
@@ -1191,12 +1227,14 @@ describe("UiBridge.send (graceful gate end-to-end)", () => {
     );
   });
 
-  // #236 — the FIRST call to an unsupported command still round-trips to the
-  // panel (there's no way to know in advance), but every LATER call in the same
-  // session must be gated proactively: rejected with the same actionable message
-  // WITHOUT ever reaching the panel again. FAIL-before: the old code always
-  // re-dispatched and re-parsed the panel's raw "Unknown command" string on every
-  // single call.
+  // #236 — for a command with NO changelog-verified per-command minimum (so the
+  // advertised version can't PROVE it unsupported in advance — see the #392 proactive
+  // gate below), the FIRST call still round-trips to discover it's unsupported, and
+  // every LATER call in the same session is gated proactively: rejected with the same
+  // actionable message WITHOUT ever reaching the panel again. FAIL-before: the old
+  // code always re-dispatched and re-parsed the panel's raw "Unknown command" string
+  // on every single call. ui_render is used precisely because it is NOT in
+  // BRIDGE_CMD_MIN_PANEL_VERSION, so only the REACTIVE (#236) path can gate it.
   it("gates a REPEAT call to an already-proven-unsupported command without re-dispatching to the panel", async () => {
     const sock = await connectPanel(undefined);
     let dispatchCount = 0;
@@ -1210,18 +1248,44 @@ describe("UiBridge.send (graceful gate end-to-end)", () => {
     });
     await new Promise((r) => setTimeout(r, 50));
 
-    // First call: genuinely round-trips (the only way to discover it's unsupported).
-    await expect(bridge.send({ cmd: "graph_query" }, { tabId: "old-tab-2" })).rejects.toThrow(
-      /too old for "graph_query"/i,
+    // First call: genuinely round-trips (no per-command minimum to prove it unsupported).
+    await expect(bridge.send({ cmd: "ui_render" }, { tabId: "old-tab-2" })).rejects.toThrow(
+      /too old for "ui_render"/i,
     );
     expect(dispatchCount).toBe(1);
 
-    // Second call: gated proactively — same actionable message, but the panel
+    // Second call: gated proactively (learned) — same actionable message, but the panel
     // must NEVER see a second dispatch of this command.
-    await expect(bridge.send({ cmd: "graph_query" }, { tabId: "old-tab-2" })).rejects.toThrow(
-      /too old for "graph_query".*0\.6\.8.*update/is,
+    await expect(bridge.send({ cmd: "ui_render" }, { tabId: "old-tab-2" })).rejects.toThrow(
+      /too old for "ui_render".*0\.6\.8.*update/is,
     );
     expect(dispatchCount).toBe(1);
+  });
+
+  // #392 — a command WITH a changelog-verified minimum (graph_query → 0.7.0), on a
+  // panel whose ADVERTISED version parseably undercuts it (0.6.8), is gated PROACTIVELY
+  // on the VERY FIRST call: the panel must never see a dispatch at all, and the honest,
+  // correctly-versioned (≥0.7.0, NOT the inflated 0.11.4 baseline) verdict is returned
+  // immediately. FAIL-before (#392): the tool was exposed/dispatched, the panel rejected
+  // it at runtime, and only THEN was a verdict synthesized from the round-trip reply.
+  it("PROACTIVELY gates a listed command the advertised version proves too old — no dispatch on the first call (#392)", async () => {
+    const sock = await connectPanel(undefined);
+    let dispatchCount = 0;
+    sock.send(JSON.stringify({ type: "hello", tab_id: "old-tab-2b", title: "wf", panel_version: "0.6.8" }));
+    sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd) {
+        dispatchCount += 1;
+        sock.send(JSON.stringify({ rid: msg.rid, ok: false, error: `Unknown command "${msg.cmd}"` }));
+      }
+    });
+    await new Promise((r) => setTimeout(r, 50));
+
+    await expect(bridge.send({ cmd: "graph_query" }, { tabId: "old-tab-2b" })).rejects.toThrow(
+      /too old for "graph_query".*0\.7\.0.*update/is,
+    );
+    // The FIRST call is gated before dispatch — the panel is never asked.
+    expect(dispatchCount).toBe(0);
   });
 
   // A command that has NEVER been tried on this connection must never be
@@ -1280,6 +1344,43 @@ describe("UiBridge.send (graceful gate end-to-end)", () => {
 
     const res = await bridge.send({ cmd: "graph_query" }, { tabId: "old-tab-4" });
     expect(res).toEqual({ cmd: "graph_query" });
+  });
+
+  // #392 regression (codex WS review): panelVersion is INHERITED across a reconnect
+  // that OMITS panel_version (so the reactive message can still quote a detected
+  // version). That inherited, possibly-STALE version must NOT drive the proactive gate
+  // — a reconnect may be a freshly UPGRADED panel. An old 0.6.8 connection followed by
+  // a capable panel reconnecting under the same tab id WITHOUT re-advertising its
+  // version must have its FIRST graph_query DISPATCHED (and succeed), never gated
+  // unprobed. FAIL-before (had the gate keyed only on panelVersion): the inherited
+  // 0.6.8 would proactively reject graph_query forever until yet another reconnect.
+  it("does NOT proactively gate a reconnect that omits panel_version (inherited stale version must not block an upgraded panel) (#392)", async () => {
+    const sock1 = await connectPanel(undefined);
+    sock1.send(JSON.stringify({ type: "hello", tab_id: "reconn-tab", title: "wf", panel_version: "0.6.8" }));
+    await new Promise((r) => setTimeout(r, 50));
+    // First connection: advertised 0.6.8 → graph_query is proactively gated.
+    await expect(bridge.send({ cmd: "graph_query" }, { tabId: "reconn-tab" })).rejects.toThrow(
+      /too old for "graph_query"/i,
+    );
+
+    // Reconnect under the SAME tab id, this time WITHOUT panel_version, on a panel that
+    // DOES support graph_query. The version is inherited (0.6.8) for messaging only.
+    let dispatched = false;
+    const sock2 = await connectPanel(undefined);
+    sock2.send(JSON.stringify({ type: "hello", tab_id: "reconn-tab", title: "wf" }));
+    sock2.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd) {
+        dispatched = true;
+        sock2.send(JSON.stringify({ rid: msg.rid, ok: true, result: { cmd: msg.cmd } }));
+      }
+    });
+    await new Promise((r) => setTimeout(r, 50));
+
+    const res = await bridge.send({ cmd: "graph_query" }, { tabId: "reconn-tab" });
+    expect(res).toEqual({ cmd: "graph_query" });
+    // Proof it was actually PROBED, not answered from a stale proactive gate.
+    expect(dispatched).toBe(true);
   });
 
   // #352 FALSE NEGATIVE end-to-end: a NEW-ENOUGH panel (advertises 0.11.21, well
