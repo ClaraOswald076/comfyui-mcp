@@ -2653,7 +2653,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_run",
-      "Queue the workflow the user has OPEN — exactly like them pressing Queue Prompt (current widget values, the live graph they can see). On success it confirms the run was queued; if ComfyUI REFUSES the prompt (validation failure on either channel — per-node node_errors OR a top-level error like a missing node type) it returns a FAILURE with that rejection detail, never a false 'queued'. Pass to_node_id to RUN ONLY ONE BRANCH ('run to node'): ComfyUI renders just that output node plus everything upstream of it and SKIPS every other output branch — handy for previewing or debugging part of a big graph without rendering the whole thing. to_node_id MUST be an OUTPUT node (SaveImage, PreviewImage, SaveVideo, …) — pick the one at the END of the branch you want; nodes are tagged is_output:true in panel_query_graph's detail rows. Omit it to run the whole graph. Use this so the render runs on THEIR canvas and they see the result.",
+      "Queue the workflow the user has OPEN — exactly like them pressing Queue Prompt (current widget values, the live graph they can see). On success it confirms the run was queued; if ComfyUI REFUSES the prompt (validation failure on either channel — per-node node_errors OR a top-level error like a missing node type) it returns a FAILURE with that rejection detail, never a false 'queued'. Pass to_node_id to RUN ONLY ONE BRANCH ('run to node'): ComfyUI renders just that output node plus everything upstream of it and SKIPS every other output branch — handy for previewing or debugging part of a big graph without rendering the whole thing. to_node_id MUST be an OUTPUT node (SaveImage, PreviewImage, SaveVideo, …) — pick the one at the END of the branch you want; nodes are tagged is_output:true in panel_query_graph's detail rows. The output node may be NESTED inside a subgraph — just pass its id (resolved in the scope you're currently viewing, then anywhere in the workflow); the tool builds the nested execution path for you. Omit it to run the whole graph. Use this so the render runs on THEIR canvas and they see the result.",
       {
         batch_count: z
           .number()
@@ -2667,7 +2667,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           .int()
           .optional()
           .describe(
-            "Output node id to render UP TO (partial execution). Omit to run the whole graph. Must be an OUTPUT node — one with is_output:true in panel_query_graph's detail rows.",
+            "Output node id to render UP TO (partial execution). Omit to run the whole graph. Must be an OUTPUT node — one with is_output:true in panel_query_graph's detail rows. May be nested inside a subgraph (pass the node's own id).",
           ),
       },
       async (args: A, ctx) => {
@@ -3561,7 +3561,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         "• 'active' — normal: the node executes.\n" +
         "• 'bypass' — the node is SKIPPED and PASSES ITS INPUT THROUGH to its output (downstream still runs, just as if this node weren't there). Use to disable a single processing node (an upscaler, a LoRA, a detailer) while keeping the pipeline connected.\n" +
         "• 'mute' — the node AND everything DOWNSTREAM of it do NOT execute (no pass-through). Use to fully switch off a branch/output.\n" +
-        "CRITICAL — modes silently change what a render produces, so they are a top cause of 'wrong output'. A BYPASSED node contributes nothing of its own and a MUTED node kills its branch. Use this tool to ENABLE the path you actually want and DISABLE the one you don't — e.g. to drive a workflow from its Ideogram/JSON prompt builder you must set the manual-prompt node to 'bypass' and the JSON-builder path to 'active' (or vice-versa); likewise to pick one branch of an rgthree 'Fast Groups Bypasser'/Muter or a prompt-source switch. ALWAYS read modes first (panel_graph_outline marks [bypass]/[mute]; panel_query_graph detail rows carry mode): if the intended path is bypassed/muted, fix it HERE before running, and never assume a switch/route is already active. Undoable with Ctrl+Z.",
+        "CRITICAL — modes silently change what a render produces, so they are a top cause of 'wrong output'. A BYPASSED node contributes nothing of its own and a MUTED node kills its branch. Use this tool to ENABLE the path you actually want and DISABLE the one you don't — e.g. to drive a workflow from its Ideogram/JSON prompt builder you must set the manual-prompt node to 'bypass' and the JSON-builder path to 'active' (or vice-versa); likewise to pick one branch of an rgthree 'Fast Groups Bypasser'/Muter or a prompt-source switch. ALWAYS read modes first (panel_graph_outline marks [bypass]/[mute]; panel_query_graph detail rows carry mode): if the intended path is bypassed/muted, fix it HERE before running, and never assume a switch/route is already active. UNSAFE-BYPASS GUARD: bypassing a SUBGRAPH node whose boundary inputs are ordered differently from its outputs is REJECTED — ComfyUI forwards each output from the input at the SAME index, so e.g. an IMAGE output backed by a BBOX_DETECTOR input would silently feed the wrong type downstream. Re-order the boundary inputs or add an explicit ImpactSwitch to choose the passthrough; pass force:true only if you truly intend the positional forward. Undoable with Ctrl+Z.",
       {
         node_id: z.number().int().describe("Node id from panel_graph_outline / panel_query_graph."),
         mode: z
@@ -3569,9 +3569,15 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           .describe(
             "'active' = runs normally; 'bypass' = skipped, passes input through (downstream still runs); 'mute' = node and everything downstream do not execute.",
           ),
+        force: z
+          .boolean()
+          .optional()
+          .describe(
+            "Override the unsafe-bypass guard on a subgraph node (proceed with a positional boundary forward even when input/output types don't line up by index). Omit for normal safe behaviour.",
+          ),
       },
       async (args: A, ctx) =>
-        ctx.call({ cmd: "graph_set_node_mode", node_id: args.node_id, mode: args.mode }),
+        ctx.call({ cmd: "graph_set_node_mode", node_id: args.node_id, mode: args.mode, force: args.force }),
     ),
     def(
       "panel_set_node_color",
