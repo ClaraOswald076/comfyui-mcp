@@ -2541,7 +2541,22 @@ export async function runPanelOrchestrator(): Promise<void> {
           // Retire the old id's routing/prefs — do NOT carry them to a different
           // (or unprovable) workflow. The old workflow's durable session stays on disk
           // (retire() preserved it); its stable identity is dropped from the live maps.
-          heldDuringGen.delete(migratedFrom + AGENT_KEY_SEP + prevBackend);
+          // Messages the user QUEUED during the previous workflow's local render can't
+          // be delivered to it now (it's no longer the active socket) without leaking
+          // into THIS workflow via the bridge migration alias — so surface an explicit
+          // cancellation rather than silently dropping accepted work (codex review).
+          const retiredHeldKey = migratedFrom + AGENT_KEY_SEP + prevBackend;
+          const retiredHeld = heldDuringGen.get(retiredHeldKey);
+          if (retiredHeld && retiredHeld.length > 0) {
+            bridge.push(
+              {
+                type: "say",
+                text: `⚠️ ${retiredHeld.length} message(s) you queued during the previous workflow's render were cancelled by switching workflows before it finished. Re-send them in that workflow if you still need them.`,
+              },
+              panelTab,
+            );
+          }
+          heldDuringGen.delete(retiredHeldKey);
           tabBackends.delete(migratedFrom);
           headlessTabs.delete(migratedFrom);
           workflowTargets.clear(migratedFrom);
