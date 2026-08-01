@@ -6,6 +6,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.24] - 2026-08-01
+
+### MCP
+
+#### Fixed
+- **Proactively gate a panel bridge command when the panel's advertised version proves it too old (panel #392).** `panel_query_graph`/`graph_query` (etc.) are refused before dispatch with an honest, correctly-versioned message instead of being exposed and then failing at runtime — gated only on explicitly-listed commands and only when the connected panel actually advertised a too-old version (an omitted-version reconnect never blocks an upgraded panel).
+- **Context-meter denominator tracks the current model's window (#543)** — switching to a smaller-context model no longer leaves the denominator pinned to a stale larger window.
+- **`panel_run`'s queue-backlog warning no longer false-positives on self-queued jobs (#559)** — deliberately batching your own renders no longer warns about (and recommends destructively clearing) a backlog it created; the warning + destructive `clear_pending` recommendation are suppressed for your own in-flight batch.
+- **`panel_screenshot` annotates DOM-overlay nodes (#567)** — a MarkdownNote that renders empty on the LiteGraph canvas is now named in a result note (the faithful DOM composite is a separate panel-side change).
+
+
 ## [0.48.23] - 2026-08-01
 
 ### MCP
