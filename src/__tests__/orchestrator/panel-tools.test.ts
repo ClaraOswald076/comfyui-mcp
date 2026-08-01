@@ -203,24 +203,29 @@ describe("panel-tools: panel_set_node_mode (bypass/mute/active)", () => {
     expect(names).toContain("panel_set_node_mode");
   });
 
-  it("exposes a node_id + mode enum schema with exactly active/bypass/mute", () => {
+  it("exposes a node_id + mode enum schema (+ optional force) with exactly active/bypass/mute", () => {
     const def = defByName("panel_set_node_mode");
-    expect(Object.keys(def.schema).sort()).toEqual(["mode", "node_id"]);
+    expect(Object.keys(def.schema).sort()).toEqual(["force", "mode", "node_id"]);
     // The mode enum must match the executor contract EXACTLY.
     const mode = def.schema.mode as { options: string[] };
     expect([...mode.options].sort()).toEqual(["active", "bypass", "mute"]);
     // node_id rejects non-numbers (typed like the other per-node tools).
     const nodeId = def.schema.node_id as { safeParse: (v: unknown) => { success: boolean } };
     expect(nodeId.safeParse(7).success).toBe(true);
+    // force is an optional boolean (unsafe-bypass override, #409).
+    const force = def.schema.force as { safeParse: (v: unknown) => { success: boolean } };
+    expect(force.safeParse(true).success).toBe(true);
+    expect(force.safeParse(undefined).success).toBe(true);
   });
 
-  it("forwards graph_set_node_mode with node_id + mode", async () => {
+  it("forwards graph_set_node_mode with node_id + mode (+ force)", async () => {
     const { ctx, calls } = makeFakeCtx();
-    await defByName("panel_set_node_mode").handler({ node_id: 143, mode: "bypass" }, ctx);
+    await defByName("panel_set_node_mode").handler({ node_id: 143, mode: "bypass", force: true }, ctx);
     expect(calls[0]).toMatchObject({
       cmd: "graph_set_node_mode",
       node_id: 143,
       mode: "bypass",
+      force: true,
     });
   });
 });
