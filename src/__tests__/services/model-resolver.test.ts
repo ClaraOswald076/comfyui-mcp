@@ -620,6 +620,72 @@ describe("downloadModel — remote mode (Manager install-model dispatch)", () =>
     expect(out).not.toMatch(/AUTHENTICATION-GATED/i);
   });
 
+  it("does NOT leak the HF token to an attacker host whose URL merely CONTAINS 'huggingface.co' (#590 P0)", async () => {
+    config.huggingfaceToken = "hf-secret";
+    // unauth → auth page (would drive a flip IF a credential were derived); but the PARSED
+    // host is attacker.example, so no HF token is derived and no request carries it.
+    fetchMock.mockImplementation((_url: string, opts?: { headers?: Record<string, string> }) =>
+      Promise.resolve(opts?.headers?.Authorization ? binaryProbeResponse() : htmlProbeResponse()),
+    );
+    await downloadModel(
+      "https://attacker.example/m.safetensors?ref=huggingface.co",
+      "checkpoints",
+      "m.safetensors",
+    );
+    expect(installModelViaManagerMock).toHaveBeenCalledTimes(1); // never blocked
+    const leaked = fetchMock.mock.calls.some((c) =>
+      String((c[1] as { headers?: Record<string, string> } | undefined)?.headers?.Authorization ?? "").includes("hf-secret"),
+    );
+    expect(leaked).toBe(false);
+  });
+
+  it("attaches the HF token by PARSED host for a genuine huggingface.co gated URL and warns on the flip", async () => {
+    config.huggingfaceToken = "hf-secret";
+    fetchMock.mockImplementation((_url: string, opts?: { headers?: Record<string, string> }) =>
+      Promise.resolve(opts?.headers?.Authorization ? binaryProbeResponse() : htmlProbeResponse()),
+    );
+    const out = await downloadModel(
+      "https://huggingface.co/org/repo/resolve/main/m.safetensors",
+      "checkpoints",
+      "m.safetensors",
+    );
+    expect(installModelViaManagerMock).toHaveBeenCalledTimes(1);
+    expect(out).toMatch(/AUTHENTICATION-GATED/i);
+    const sentHf = fetchMock.mock.calls.some(
+      (c) => (c[1] as { headers?: Record<string, string> } | undefined)?.headers?.Authorization === "Bearer hf-secret",
+    );
+    expect(sentHf).toBe(true);
+  });
+
+  it("keeps the HF token flowing to an HF_ENDPOINT mirror (pre-rewrite wasHfUrl threaded) — #590 P1", async () => {
+    const prev = process.env.HF_ENDPOINT;
+    process.env.HF_ENDPOINT = "https://hf-mirror.example";
+    try {
+      config.huggingfaceToken = "hf-secret";
+      fetchMock.mockImplementation((_url: string, opts?: { headers?: Record<string, string> }) =>
+        Promise.resolve(opts?.headers?.Authorization ? binaryProbeResponse() : htmlProbeResponse()),
+      );
+      const out = await downloadModel(
+        "https://huggingface.co/org/repo/resolve/main/m.safetensors",
+        "checkpoints",
+        "m.safetensors",
+      );
+      expect(installModelViaManagerMock).toHaveBeenCalledTimes(1);
+      // The URL was rewritten to the mirror, yet the HF token still applies (threaded
+      // wasHfUrl) → the flip is detected and the auth-gated warning fires.
+      expect(out).toMatch(/AUTHENTICATION-GATED/i);
+      const sentToMirror = fetchMock.mock.calls.some(
+        (c) =>
+          String(c[0]).startsWith("https://hf-mirror.example") &&
+          (c[1] as { headers?: Record<string, string> } | undefined)?.headers?.Authorization === "Bearer hf-secret",
+      );
+      expect(sentToMirror).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.HF_ENDPOINT;
+      else process.env.HF_ENDPOINT = prev;
+    }
+  });
+
   it("does NOT probe a NON-model-binary destination (.zip) — dispatch proceeds, no warning", async () => {
     // A .zip is not a model-binary ext, so the probe short-circuits to inconclusive WITHOUT
     // fetching and the dispatch proceeds unchanged.

@@ -66,11 +66,68 @@ describe("probeRemoteModelPayload — #473 credential-flip gate", () => {
     expect(p.kind).toBe("json");
   });
 
-  it("verdict NON-MODEL when a bare 401 (no classifiable body) flips to a real model", async () => {
+  it("verdict INCONCLUSIVE for a bare 401 with NO html/json body (not a clear auth page — no cry wolf)", async () => {
+    // A bare status with no HTML/JSON body is not a CLEAR auth page, so even if the
+    // credentialed retry is a model we stay inconclusive (P2 — only warn on a clear page).
     flipMock(() => response(new Uint8Array([0x00, 0x11, 0x22]), 401, "application/octet-stream"), () => modelBinary());
     const p = await probeRemoteModelPayload("https://x/gated.safetensors", ".safetensors", undefined, { authHeaders: AUTH });
-    expect(p.verdict).toBe("non-model");
-    expect(p.kind).toBeUndefined();
+    expect(p.verdict).toBe("inconclusive");
+  });
+
+  it("verdict INCONCLUSIVE on a TRANSIENT 503 even if the credentialed retry is a model (no cry wolf)", async () => {
+    // P2: a public URL that momentarily 503s (even with an HTML maintenance page) then serves
+    // the model on retry must NOT fire the auth-gated warning. A 5xx is never a clear auth page.
+    let calls = 0;
+    fetchMock.mockImplementation((_url: string, opts?: { headers?: Record<string, string> }) => {
+      calls += 1;
+      return Promise.resolve(
+        opts?.headers?.Authorization ? modelBinary() : response("<!doctype html>maintenance</html>", 503, "text/html"),
+      );
+    });
+    const p = await probeRemoteModelPayload("https://x/m.safetensors", ".safetensors", undefined, { authHeaders: AUTH });
+    expect(p.verdict).toBe("inconclusive");
+    expect(calls).toBe(1); // transient unauth → NOT a clear auth page → no credentialed probe
+  });
+
+  it("verdict INCONCLUSIVE on a TRANSIENT 429 (rate limit) even if the credentialed retry is a model", async () => {
+    fetchMock.mockImplementation((_url: string, opts?: { headers?: Record<string, string> }) =>
+      Promise.resolve(opts?.headers?.Authorization ? modelBinary() : jsonErr(429)),
+    );
+    const p = await probeRemoteModelPayload("https://x/m.safetensors", ".safetensors", undefined, { authHeaders: AUTH });
+    expect(p.verdict).toBe("inconclusive");
+  });
+
+  it("CREDENTIAL SAFETY: strips ALL auth (Authorization + custom headers) on a cross-origin redirect", async () => {
+    // The credentialed flip probe must send auth ONLY to the original target host. When the
+    // origin 302s cross-origin, Authorization AND any custom header (e.g. X-API-Key) are
+    // dropped for the rest of the chain — only Range survives. Regression for a P0 leak.
+    const calls: Array<{ url: string; headers: Record<string, string> }> = [];
+    fetchMock.mockImplementation((u: string, opts?: { headers?: Record<string, string> }) => {
+      const headers = opts?.headers ?? {};
+      calls.push({ url: u, headers });
+      const authed = !!headers.Authorization || !!headers["X-API-Key"];
+      if (u === "https://origin.example/m.safetensors") {
+        // Unauthenticated → a clear auth page (drives the flip); authenticated → redirect off-origin.
+        return Promise.resolve(
+          authed
+            ? new Response("", { status: 302, headers: { location: "https://cdn.other.example/signed/m.safetensors" } })
+            : htmlPage(200),
+        );
+      }
+      return Promise.resolve(modelBinary()); // the cross-origin CDN serves the model
+    });
+    const authHeaders = { Authorization: "Bearer secret", "X-API-Key": "custom-key" };
+    const p = await probeRemoteModelPayload("https://origin.example/m.safetensors", ".safetensors", undefined, { authHeaders });
+    expect(p.verdict).toBe("non-model"); // flip confirmed via the authed redirect→model chain
+    // The cross-origin CDN hop must carry NO credential — only Range.
+    const cdnCall = calls.find((c) => c.url.startsWith("https://cdn.other.example/"));
+    expect(cdnCall).toBeDefined();
+    expect(cdnCall!.headers.Authorization).toBeUndefined();
+    expect(cdnCall!.headers["X-API-Key"]).toBeUndefined();
+    expect(cdnCall!.headers.Range).toMatch(/^bytes=0-\d+$/);
+    // …while the original-origin authed hop DID carry both.
+    const originAuthed = calls.find((c) => c.url === "https://origin.example/m.safetensors" && !!c.headers.Authorization);
+    expect(originAuthed!.headers["X-API-Key"]).toBe("custom-key");
   });
 
   it("verdict INCONCLUSIVE for a location interstitial that does NOT flip (WAF ignores the bearer)", async () => {
@@ -136,7 +193,7 @@ describe("probeRemoteModelPayload — #473 credential-flip gate", () => {
     expect(p.verdict).toBe("model");
     const opts = fetchMock.mock.calls[0][1] as { headers: Record<string, string>; redirect?: string };
     expect(opts.headers.Range).toMatch(/^bytes=0-\d+$/);
-    expect(opts.redirect).toBe("follow");
+    expect(opts.redirect).toBe("manual"); // manual redirects — never "follow" (credential safety)
   });
 
   it("TIMES OUT to inconclusive when the fetch stalls, even with a caller signal present (both signals apply)", async () => {

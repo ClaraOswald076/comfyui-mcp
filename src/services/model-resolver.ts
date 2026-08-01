@@ -800,11 +800,30 @@ export async function resolveExistingModelFile(
  * model proves the URL is authentication-gated (the exact bug — a local token Manager can
  * never receive). Returns `{}` when no credential applies (a public/anonymous URL).
  */
-function localAuthHeadersFor(url: string, auth?: DownloadAuth): Record<string, string> {
+function localAuthHeadersFor(
+  url: string,
+  auth: DownloadAuth | undefined,
+  /** Whether the ORIGINAL (pre-HF_ENDPOINT-rewrite) url was a huggingface.co url — threaded
+   *  from downloadModel so an HF_ENDPOINT mirror still gets the token (mirrors the local
+   *  streaming path; without it a rewritten url would parse to the mirror host and drop the
+   *  token → a false-negative). */
+  wasHfUrl: boolean,
+): Record<string, string> {
   const request = applyDownloadAuth(url, auth);
   const headers: Record<string, string> = { ...request.headers };
-  const wasHfUrl = /^https?:\/\/huggingface\.co([/?#]|$)/i.test(url);
-  if (!auth && config.huggingfaceToken && (wasHfUrl || url.includes("huggingface.co"))) {
+  // HF token: attach ONLY when the url's PARSED hostname is huggingface.co (or a subdomain),
+  // or the ORIGINAL url was a HF url that HF_ENDPOINT rewrote to a trusted mirror. NEVER a
+  // substring match — `https://attacker.example/x?ref=huggingface.co` must NOT receive the
+  // token (a credential-leak; the parsed host is attacker.example). isCivitaiUrl is already
+  // hostname-parsed, so the CivitAI branch is safe by construction.
+  let host = "";
+  try {
+    host = new URL(url).hostname.toLowerCase();
+  } catch {
+    /* unparseable url → no host-token injection */
+  }
+  const isHfHost = host === "huggingface.co" || host.endsWith(".huggingface.co");
+  if (!auth && config.huggingfaceToken && (wasHfUrl || isHfHost)) {
     headers["Authorization"] = `Bearer ${config.huggingfaceToken}`;
   } else if (!auth && config.civitaiApiToken && isCivitaiUrl(url)) {
     headers["Authorization"] = `Bearer ${config.civitaiApiToken}`;
@@ -824,6 +843,10 @@ async function downloadModelViaManagerRemote(
   filename?: string,
   auth?: DownloadAuth,
   signal?: AbortSignal,
+  /** Whether the ORIGINAL url (before any HF_ENDPOINT rewrite the caller applied) was a
+   *  huggingface.co url — threaded to the #473 flip probe's credential derivation so an
+   *  HF_ENDPOINT mirror still gets the HF token (matches the local streaming path). */
+  wasHfUrl = false,
 ): Promise<string> {
   // Cancelled before we dispatched — do not hand the fetch to the remote Manager at all.
   if (signal?.aborted) throw new DOMException("The download was cancelled.", "AbortError");
@@ -915,8 +938,9 @@ async function downloadModelViaManagerRemote(
   const probe = await probeRemoteModelPayload(dispatchUrl, modelExt, signal, {
     // The auth the LOCAL path would apply — used ONLY to prove auth-gating via a credential
     // flip; Manager can never receive these headers. Derived from `url` (pre-query-fold) so
-    // host detection (civitai/hf) matches the local streaming path.
-    authHeaders: localAuthHeadersFor(url, auth),
+    // host detection (civitai/hf) matches the local streaming path. `wasHfUrl` preserves the
+    // pre-HF_ENDPOINT-rewrite HF identity so a mirror still gets the token.
+    authHeaders: localAuthHeadersFor(url, auth, wasHfUrl),
   });
   if (signal?.aborted) throw new DOMException("The download was cancelled.", "AbortError");
   let authGateWarning = "";
@@ -1097,7 +1121,9 @@ export async function downloadModel(
   const routeToManager =
     dispatchToManager ?? (await shouldDispatchDownloadToManager());
   if (routeToManager) {
-    return downloadModelViaManagerRemote(url, targetSubfolder, filename, auth, signal);
+    // Thread the PRE-rewrite HF identity so the flip probe's credential derivation keeps the
+    // HF token flowing to an HF_ENDPOINT mirror (matches the local path below).
+    return downloadModelViaManagerRemote(url, targetSubfolder, filename, auth, signal, wasHfUrl);
   }
 
   // Root the destination at the LIVE server's models dir (its --base-directory),

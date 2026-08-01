@@ -600,8 +600,11 @@ async function readResponseHead(res: Response, n: number): Promise<Buffer | unde
       const { done, value } = await reader.read();
       if (done) break;
       if (value && value.length) {
-        chunks.push(Buffer.from(value));
-        total += value.length;
+        // Cap what we buffer to the sniff window: a server that ignores Range and streams
+        // a large first chunk must not make us hold it all in memory (we only need n bytes).
+        const take = value.length > n - total ? value.subarray(0, n - total) : value;
+        chunks.push(Buffer.from(take));
+        total += take.length;
       }
     }
   } catch {
@@ -624,43 +627,80 @@ interface PayloadSniff {
   isModelBinary: boolean;
 }
 
-/** One bounded, redirect-following, Range-limited probe fetch of `url`, classified with
- *  the SAME #473 classifier the local finalize gate uses. Never throws — a network
- *  error/timeout/abort yields `{ ok: false }`. */
+const PROBE_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+/** Parse an origin, or null when the URL is unparseable (treated as a DIFFERENT origin —
+ *  i.e. auth is stripped, the safe default). */
+function safeOrigin(u: string): string | null {
+  try {
+    return new URL(u).origin;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * One bounded, Range-limited probe of `url`, classified with the SAME #473 classifier the
+ * local finalize gate uses. Never throws — a network error/timeout/abort yields
+ * `{ ok: false }`. `signal` is the caller-composed abort+timeout (owned by the caller so a
+ * single budget bounds BOTH probes).
+ *
+ * CREDENTIAL SAFETY (do not regress): redirects are followed MANUALLY (never
+ * `redirect: "follow"`, which re-sends arbitrary custom auth headers like `X-API-Key`
+ * across origins). `authHeaders` — which can include ANY caller header — are sent ONLY to
+ * the ORIGINAL target origin; the FIRST time a redirect leaves that origin, ALL auth
+ * headers are dropped for the rest of the chain (only `Range` is retained), mirroring the
+ * local downloader. A caller credential is therefore never sent to any host but the one the
+ * caller addressed.
+ */
 async function sniffPayloadShape(
   url: string,
   modelExt: string,
   authHeaders: Record<string, string> | undefined,
-  signal?: AbortSignal,
+  signal: AbortSignal,
 ): Promise<PayloadSniff> {
-  // Compose the caller's abort AND a hard timeout MANUALLY (never rely on AbortSignal.any,
-  // which is unavailable on older runtimes): both must always apply, or a stalled probe
-  // could hang the dispatch. The timer is unref'd so it never keeps the process alive, and
-  // it is cleared in `finally` — it bounds the WHOLE probe (fetch + body head read), since
-  // an abort here cancels the response stream and unblocks a hung `reader.read()`.
-  const controller = new AbortController();
-  const onCallerAbort = (): void => controller.abort();
-  const timer = setTimeout(() => controller.abort(), REMOTE_PROBE_TIMEOUT_MS);
-  if (typeof (timer as { unref?: unknown }).unref === "function") timer.unref();
-  if (signal) {
-    if (signal.aborted) controller.abort();
-    else signal.addEventListener("abort", onCallerAbort, { once: true });
-  }
-  try {
+  const rangeHeader = { Range: `bytes=0-${PAYLOAD_SNIFF_BYTES - 1}` };
+  const hasAuth = !!authHeaders && Object.keys(authHeaders).length > 0;
+  const originalOrigin = safeOrigin(url);
+  let currentUrl = url;
+  let authStripped = false; // once we leave the original origin, never re-send auth
+  for (let hop = 0; hop <= MAX_HTTP_REDIRECTS; hop++) {
+    const sendAuth = hasAuth && !authStripped;
     let res: Response;
     try {
-      res = await fetch(url, {
-        // Mirror Manager's server-side fetch: follow redirects (CivitAI 302s to a signed
-        // CDN URL for a PUBLIC model). Range-limit to the sniff window so a multi-GB model
-        // is never pulled. The credentialed pass adds the auth headers the LOCAL path uses.
-        redirect: "follow",
-        headers: { Range: `bytes=0-${PAYLOAD_SNIFF_BYTES - 1}`, ...(authHeaders ?? {}) },
-        signal: controller.signal,
+      res = await fetch(currentUrl, {
+        // Manual redirects (see CREDENTIAL SAFETY above) — never "follow". Range-limit to
+        // the sniff window so a multi-GB model is never pulled.
+        redirect: "manual",
+        headers: sendAuth ? { ...rangeHeader, ...authHeaders } : rangeHeader,
+        signal,
       });
     } catch {
       return { ok: false, kind: null, isModelBinary: false };
     }
     if (!res || typeof res.status !== "number") return { ok: false, kind: null, isModelBinary: false };
+    const location =
+      typeof res.headers?.get === "function" ? res.headers.get("location") : null;
+    if (PROBE_REDIRECT_STATUSES.has(res.status) && location) {
+      // Drain the (usually empty) redirect body so the socket is released.
+      try {
+        await (res.body as ReadableStream | null | undefined)?.cancel?.();
+      } catch {
+        /* ignore */
+      }
+      let nextUrl: string;
+      try {
+        nextUrl = new URL(location, currentUrl).toString();
+      } catch {
+        return { ok: false, kind: null, isModelBinary: false };
+      }
+      // Cross-origin relative to the ORIGINAL target (or an unparseable next URL) → strip
+      // ALL auth for the remainder of the chain. Never send a caller credential elsewhere.
+      if (safeOrigin(nextUrl) !== originalOrigin) authStripped = true;
+      currentUrl = nextUrl;
+      continue;
+    }
+    // Terminal (non-redirect) response → classify its first bytes.
     const status = res.status;
     const contentType =
       (typeof res.headers?.get === "function" ? res.headers.get("content-type") : "") ?? "";
@@ -674,10 +714,9 @@ async function sniffPayloadShape(
     const isSuccess = status === 200 || status === 206;
     const isModelBinary = isSuccess && !kind && !!head && head.length > 0;
     return { ok: true, status, kind, isModelBinary };
-  } finally {
-    clearTimeout(timer);
-    if (signal) signal.removeEventListener("abort", onCallerAbort);
   }
+  // Redirect limit exceeded — treat as unresolvable (inconclusive).
+  return { ok: false, kind: null, isModelBinary: false };
 }
 
 /**
@@ -726,28 +765,52 @@ export async function probeRemoteModelPayload(
   if (!modelExt || !MODEL_BINARY_EXTS.has(modelExt.toLowerCase())) {
     return { verdict: "inconclusive" };
   }
-  // (1) Unauthenticated probe — what Manager will actually do.
-  const unauth = await sniffPayloadShape(url, modelExt, undefined, signal);
-  if (!unauth.ok) return { verdict: "inconclusive" };
-  if (unauth.isModelBinary) return { verdict: "model", status: unauth.status };
-
-  // (2) The unauthenticated fetch did NOT yield a clean model (auth page / 401 / non-2xx /
-  // empty). Only a credential FLIP proves this is auth-gating (IP-independent) rather than
-  // a location-specific interstitial. Try the same url WITH the local credential.
-  const authHeaders = opts?.authHeaders;
-  if (authHeaders && Object.keys(authHeaders).length > 0) {
-    const authed = await sniffPayloadShape(url, modelExt, authHeaders, signal);
-    if (authed.ok && authed.isModelBinary) {
-      // The credential turns the SAME url from non-model into a real model → AUTH-GATED,
-      // and the credential is what unlocks it. Manager, which can't carry it, will land the
-      // auth/error page. Block, reporting the UNAUTHENTICATED body shape (what Manager sees).
-      return { verdict: "non-model", kind: unauth.kind ?? undefined, status: unauth.status };
-    }
+  // ONE shared abort budget for BOTH probes (they run sequentially): compose the caller's
+  // abort with a single hard timeout MANUALLY (never AbortSignal.any — unavailable on older
+  // runtimes), so the TOTAL probe time is bounded by REMOTE_PROBE_TIMEOUT_MS, not 2x, and a
+  // stalled probe can never hang the dispatch. Unref'd (never keeps the process alive),
+  // cleared in `finally`.
+  const controller = new AbortController();
+  const onCallerAbort = (): void => controller.abort();
+  const timer = setTimeout(() => controller.abort(), REMOTE_PROBE_TIMEOUT_MS);
+  if (typeof (timer as { unref?: unknown }).unref === "function") timer.unref();
+  if (signal) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener("abort", onCallerAbort, { once: true });
   }
-  // (3) No credential, the credential didn't flip it, or a network error — we cannot prove
-  // auth-gating (could be a location interstitial, an invalid token, or a transient error),
-  // so NEVER hard-block. Dispatch proceeds under the existing "dispatched, not verified" note.
-  return { verdict: "inconclusive", status: unauth.status };
+  try {
+    // (1) Unauthenticated probe — what Manager will actually do.
+    const unauth = await sniffPayloadShape(url, modelExt, undefined, controller.signal);
+    if (!unauth.ok) return { verdict: "inconclusive" };
+    if (unauth.isModelBinary) return { verdict: "model", status: unauth.status };
+
+    // (2) The unauthenticated fetch did NOT yield a clean model. Only warn on a credential
+    // FLIP, and ONLY when the unauth response is a CLEAR auth page — an HTML/JSON body
+    // (`kind` set) on a NON-transient status. A transient 429/5xx (or an ambiguous empty /
+    // bare-status response) is NOT proof of gating: a public URL that momentarily 503s and
+    // then serves the model on the credentialed retry must NOT cry wolf. Those stay
+    // inconclusive.
+    const status = unauth.status ?? 0;
+    const transient = status === 429 || (status >= 500 && status <= 599);
+    const clearAuthPage = (unauth.kind === "html" || unauth.kind === "json") && !transient;
+    const authHeaders = opts?.authHeaders;
+    if (clearAuthPage && authHeaders && Object.keys(authHeaders).length > 0) {
+      const authed = await sniffPayloadShape(url, modelExt, authHeaders, controller.signal);
+      if (authed.ok && authed.isModelBinary) {
+        // The credential turns the SAME url from a clear auth page into a real model →
+        // AUTH-GATED, and the credential is what unlocks it. Manager, which can't carry it,
+        // will land the auth/error page. Report the UNAUTHENTICATED body shape (what Manager
+        // sees). This is a WARNING signal for the caller — never a refusal.
+        return { verdict: "non-model", kind: unauth.kind ?? undefined, status: unauth.status };
+      }
+    }
+    // (3) No clear auth page, no credential, no flip, or a network/transient outcome — we
+    // cannot prove auth-gating, so stay inconclusive (never warn, never block).
+    return { verdict: "inconclusive", status: unauth.status };
+  } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener("abort", onCallerAbort);
+  }
 }
 
 /** POSITIVELY true only when `path` is confirmed discarded — it no longer exists
