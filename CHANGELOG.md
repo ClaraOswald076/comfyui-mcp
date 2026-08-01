@@ -6,6 +6,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.26] - 2026-08-01
+
+### Fixed
+- **`panel_strip_workflow` live-capture fallback fires against a version-skewed panel, and `panel_list_workflows` paths load (panel #413, #414).** The #384 `graph_get_state` fallback was skipped because the bridge rewrites `unknown command` → `too old for "graph_serialize"`; it's now detected structurally via a typed `panelCmdUnsupported` tag (which also covers the new #392 proactive version-gate). And a `panel_list_workflows` key already prefixed `workflows/` was double-prefixed → 404; it now strips one leading prefix, with path-traversal / drive-letter / symlink-escape hardening.
+- **Codex (and other non-Claude backends) get the live `panel_*` graph tools again (panel #291).** ComfyUI's ~250 tools saturated Codex's tool budget and it silently dropped the `panel_*` tools; the non-Claude HTTP lane now spawns the comfyui MCP in **compact** mode (freeing budget), so `panel_*` are advertised and callable. Claude is unaffected; `COMFYUI_MCP_TOOL_MODE=full` opts out (comfyui tools then become `call_tool`-gated for those backends).
+
 ## [0.48.25] - 2026-08-01
 
 ### Added
