@@ -738,6 +738,63 @@ describe("a reachable server with NO --extra-model-paths-config is still authori
     expect(disclosure).toContain(join(liveB, "extra_model_paths.yaml"));
   });
 
+  it("resolves LATER relative flags against the server cwd, and never offers a raw one as a path", async () => {
+    const serverCwd = await trackTmp();
+    const liveB = await trackTmp();
+    const first = join(await trackTmp(), "one.yaml");
+    await writeFile(first, "a:\n  vae: E:/a\n", "utf-8");
+    await writeFile(join(serverCwd, "two.yaml"), "b:\n  vae: E:/b\n", "utf-8");
+    await writeFile(join(liveB, "main.py"), "# comfyui\n", "utf-8");
+    mockGetSystemStats.mockResolvedValue({
+      system: {
+        argv: [
+          "python",
+          join(liveB, "main.py"),
+          "--extra-model-paths-config",
+          first,
+          "--extra-model-paths-config",
+          "two.yaml",
+        ],
+        cwd: serverCwd,
+      },
+    });
+
+    const result = await listExtraPaths();
+    const disclosure = result.notes.find((n) => /ONE of several configs/i.test(n));
+    // The later relative flag is named by its SERVER-resolved absolute path…
+    expect(disclosure).toContain(join(serverCwd, "two.yaml"));
+    // …never as the bare "two.yaml" the user could paste into config_path.
+    expect(disclosure).not.toMatch(/reads two\.yaml|, two\.yaml/);
+  });
+
+  it("flags a later relative config as UNLOCATABLE when the server reports no cwd", async () => {
+    const liveB = await trackTmp();
+    const first = join(await trackTmp(), "one.yaml");
+    await writeFile(first, "a:\n  vae: E:/a\n", "utf-8");
+    await writeFile(join(liveB, "main.py"), "# comfyui\n", "utf-8");
+    mockGetSystemStats.mockResolvedValue({
+      system: {
+        argv: [
+          "python",
+          join(liveB, "main.py"),
+          "--extra-model-paths-config",
+          first,
+          "--extra-model-paths-config",
+          "two.yaml",
+        ],
+      },
+    });
+
+    const result = await listExtraPaths();
+    const unlocatable = result.notes.find((n) => /RELATIVE --extra-model-paths-config value/i.test(n));
+    expect(unlocatable).toBeDefined();
+    expect(unlocatable).toContain('"two.yaml"');
+    expect(unlocatable).toMatch(/not usable as config_path/i);
+    // It must NOT appear in the "also reads" list as if it were a real path.
+    const disclosure = result.notes.find((n) => /ONE of several configs/i.test(n));
+    if (disclosure) expect(disclosure).not.toContain("two.yaml");
+  });
+
   it("REFUSES a RELATIVE flag only when there is no main.py either", async () => {
     const stale = await trackTmp();
     config.comfyuiPath = stale;

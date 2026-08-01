@@ -243,6 +243,32 @@ describe("inferred root revalidation at the point of use", () => {
     expect(existsSync(join(launcher, "extra_model_paths.yaml"))).toBe(false);
   });
 
+  it("live root: the 'other configs' disclosure names the REAL root, not the launcher", async () => {
+    // With a symlinked main.py, ComfyUI loads <real>/extra_model_paths.yaml. The note
+    // tells the user to pass these to config_path, so naming the launcher spelling would
+    // itself become a wrong-destination write (codex round 10).
+    const launcher = await trackTmp();
+    const real = await trackTmp();
+    const flagged = join(await trackTmp(), "flag.yaml");
+    await writeFile(join(real, "main.py"), "# comfyui\n", "utf-8");
+    await writeFile(join(real, "extra_model_paths.yaml"), "r:\n  vae: E:/r\n", "utf-8");
+    await writeFile(join(launcher, "extra_model_paths.yaml"), "L:\n  vae: E:/L\n", "utf-8");
+    await writeFile(flagged, "f:\n  vae: E:/f\n", "utf-8");
+    script.realpath[join(launcher, "main.py")] = join(real, "main.py");
+    mockGetSystemStats.mockResolvedValue({
+      system: {
+        argv: ["python", join(launcher, "main.py"), "--extra-model-paths-config", flagged],
+      },
+    });
+
+    const result = await listExtraPaths();
+
+    expect(result.path).toBe(flagged);
+    const disclosure = result.notes.find((n) => /ONE of several configs/i.test(n));
+    expect(disclosure).toContain(join(real, "extra_model_paths.yaml"));
+    expect(disclosure).not.toContain(join(launcher, "extra_model_paths.yaml"));
+  });
+
   it("live root: it is GUARDED too — a replacement mid-call is refused", async () => {
     // The live root is derived from argv, so it gets the same point-of-use guard as any
     // other root this process derived (codex round 6, P1b).

@@ -699,7 +699,11 @@ async function resolveTargetPathPreferServer(
   // --extra-model-paths-config, which could name a same-spelled path on OUR disk — may be
   // written to in that state. Proven once, for every argv-derived branch below.
   const script = liveScriptFromArgv(snapshot.argv, snapshot.cwd);
-  if (script && !realLiveRoot(script)) {
+  // The REAL (symlink-resolved) install root, kept for every downstream use — notably the
+  // "other configs" disclosure, which must name the file ComfyUI actually loads
+  // (realpath(__file__) dir), not the launcher spelling (codex round 10).
+  const liveRoot = script ? realLiveRoot(script) : undefined;
+  if (script && !liveRoot) {
     throw new ValidationError(
       `UNRESOLVED: the running ComfyUI was launched from "${script}", which does not resolve to ` +
         "a file on this filesystem — the server is running in a container, WSL, or on another " +
@@ -727,12 +731,15 @@ async function resolveTargetPathPreferServer(
   // A relative value with no reported server cwd is UNRESOLVABLE from here: anchoring it
   // to this process's cwd/COMFYUI_PATH would target a same-named file in the wrong tree
   // (the same rule #346 applies to --output-directory and #633 to authorization).
+  const resolveFlagPath = (raw: string): string | undefined =>
+    isAbsolute(raw)
+      ? resolve(raw)
+      : snapshot.cwd && isAbsolute(snapshot.cwd)
+        ? resolve(snapshot.cwd, raw)
+        : undefined;
+
   const rawFlag = rawFlags[0];
-  const serverConfig = isAbsolute(rawFlag)
-    ? resolve(rawFlag)
-    : snapshot.cwd && isAbsolute(snapshot.cwd)
-      ? resolve(snapshot.cwd, rawFlag)
-      : undefined;
+  const serverConfig = resolveFlagPath(rawFlag);
   if (!serverConfig) {
     // The flagged file cannot be located — but ComfyUI ALSO loads
     // <its own root>/extra_model_paths.yaml whenever that file exists, IN ADDITION to
@@ -758,17 +765,30 @@ async function resolveTargetPathPreferServer(
   ];
   // This tool reports ONE file, but ComfyUI aggregates every --extra-model-paths-config
   // it was given PLUS <its root>/extra_model_paths.yaml when that exists. Naming the
-  // others keeps the result from reading as "all the server's extra paths" when it is
-  // one of several (codex round 9, P2a).
-  const alsoLoaded = [
-    ...rawFlags.slice(1),
-    ...(script && existsSync(join(dirname(script), "extra_model_paths.yaml"))
-      ? [join(dirname(script), "extra_model_paths.yaml")]
-      : []),
-  ];
+  // others keeps the result from reading as "all the server's extra paths" when it is one
+  // of several (codex round 9, P2a). Every name here is RESOLVED the same way the primary
+  // one is — the realpath'd install root, and remaining flags run through the server-cwd
+  // rule — because the note tells the user to pass these to config_path, so a wrong name
+  // would itself become a wrong-destination write (codex round 10, P1).
+  const alsoLoaded: string[] = [];
+  const unlocatable: string[] = [];
+  for (const raw of rawFlags.slice(1)) {
+    const resolved = resolveFlagPath(raw);
+    if (resolved) alsoLoaded.push(resolved);
+    else unlocatable.push(raw);
+  }
+  const implicitConfig = liveRoot ? join(liveRoot, "extra_model_paths.yaml") : undefined;
+  if (implicitConfig && implicitConfig !== serverConfig && existsSync(implicitConfig)) {
+    alsoLoaded.push(implicitConfig);
+  }
   if (alsoLoaded.length > 0) {
     notes.push(
       `NOTE: this is ONE of several configs the running ComfyUI loads — it also reads ${alsoLoaded.join(", ")}. Those entries are not listed here; pass config_path to view or edit each one.`,
+    );
+  }
+  if (unlocatable.length > 0) {
+    notes.push(
+      `NOTE: this server was also launched with RELATIVE --extra-model-paths-config value(s) (${unlocatable.map((v) => `"${v}"`).join(", ")}) and does not report its working directory, so those files resolve against the SERVER's own working directory and cannot be located from this process. They are not listed, and the raw values above are not usable as config_path — supply their absolute paths instead.`,
     );
   }
   // The static guess is only for a divergence diagnostic — never let it (e.g. a
