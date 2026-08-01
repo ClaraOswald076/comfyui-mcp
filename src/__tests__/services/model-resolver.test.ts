@@ -61,6 +61,40 @@ function headersOf(callIndex = 0): Record<string, string> {
   return opts.headers;
 }
 
+// #473 remote residual: the remote (Manager) dispatch path now PROBES the exact URL
+// Manager will fetch (unauthenticated) before dispatching, and refuses on a definitive
+// auth/error payload. These build the probe responses the mocked fetch returns.
+/** Non-text first bytes + octet-stream → classifier "binary" → probe verdict "model". */
+function binaryProbeResponse(): Response {
+  return new Response(new Uint8Array([0, 1, 2, 3, 0xff, 0x80, 0x12, 0x34]), {
+    status: 200,
+    headers: { "content-type": "application/octet-stream" },
+  });
+}
+/** An HTML login page (200) — the exact #473 poison shape → probe verdict "non-model". */
+function htmlProbeResponse(): Response {
+  return new Response("<!doctype html><html><body>Please log in</body></html>", {
+    status: 200,
+    headers: { "content-type": "text/html; charset=utf-8" },
+  });
+}
+/** A JSON auth error (401). */
+function jsonAuthProbeResponse(): Response {
+  return new Response(JSON.stringify({ error: "unauthorized" }), {
+    status: 401,
+    headers: { "content-type": "application/json" },
+  });
+}
+/** Flip-aware fetch: an UNAUTHENTICATED probe (no Authorization) gets `pageResp` (an
+ *  auth/error page — what Manager would land), a CREDENTIALED probe gets a real model.
+ *  This is the auth-gated shape the #473 gate must refuse. */
+function flipFetch(pageResp: () => Response): void {
+  fetchMock.mockImplementation((_url: string, opts?: { headers?: Record<string, string> }) => {
+    const authed = !!opts?.headers?.Authorization;
+    return Promise.resolve(authed ? binaryProbeResponse() : pageResp());
+  });
+}
+
 beforeEach(() => {
   vi.stubGlobal("fetch", fetchMock);
   fetchMock.mockReset();
@@ -238,6 +272,29 @@ describe("downloadModel — auth headers (token never in URL)", () => {
     expect(headersOf().Authorization).toBeUndefined();
   });
 
+  it("does NOT leak the HF token on the LOCAL path to an attacker host whose URL merely CONTAINS 'huggingface.co' (#590 P0)", async () => {
+    config.huggingfaceToken = "hf";
+    failingFetch();
+
+    await expect(
+      downloadModel("https://evil.example/m.safetensors?ref=huggingface.co", "checkpoints", "m.safetensors"),
+    ).rejects.toBeInstanceOf(ModelError);
+
+    // Parsed host is evil.example → NO token. A substring `includes` would have leaked it.
+    expect(headersOf().Authorization).toBeUndefined();
+  });
+
+  it("does NOT leak the HF token on the LOCAL path to a look-alike subdomain (huggingface.co.evil.com)", async () => {
+    config.huggingfaceToken = "hf";
+    failingFetch();
+
+    await expect(
+      downloadModel("https://huggingface.co.evil.com/m.safetensors", "checkpoints", "m.safetensors"),
+    ).rejects.toBeInstanceOf(ModelError);
+
+    expect(headersOf().Authorization).toBeUndefined();
+  });
+
   it("attaches a HuggingFace bearer header for huggingface.co", async () => {
     config.huggingfaceToken = "hf";
     failingFetch();
@@ -353,6 +410,10 @@ describe("downloadModel — auth headers (token never in URL)", () => {
 describe("downloadModel — remote mode (Manager install-model dispatch)", () => {
   beforeEach(() => {
     config.comfyuiPath = undefined; // remote mode
+    // #473: the remote dispatch probes the URL Manager will fetch first. Default to a
+    // benign binary payload → verdict "model" → dispatch proceeds, so the existing
+    // dispatch assertions hold; refusal tests below override to an auth/error payload.
+    fetchMock.mockResolvedValue(binaryProbeResponse());
   });
 
   it("dispatches a top-level download via installModelViaManager (no save_path) and never touches disk", async () => {
@@ -373,8 +434,10 @@ describe("downloadModel — remote mode (Manager install-model dispatch)", () =>
       save_path: "default",
       trayCategory: "checkpoints",
     });
-    // No local-disk work in remote mode.
-    expect(fetchMock).not.toHaveBeenCalled();
+    // The pre-dispatch probe fetched the URL Manager will fetch (#473), but NO local
+    // disk work happened — the probe is a network read, never a file write.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(String(fetchMock.mock.calls[0][0])).toBe("https://example.com/model.safetensors");
     expect(mkdirMock).not.toHaveBeenCalled();
     expect(out).toContain("checkpoints/model.safetensors");
     expect(out).toContain("ComfyUI-Manager");
@@ -507,6 +570,154 @@ describe("downloadModel — remote mode (Manager install-model dispatch)", () =>
       expect(out).toContain(auth.type);
     }
   });
+
+  // ── #473 remote residual: WARN LOUDLY (never block) when a credential flip proves the
+  //    URL is AUTH-GATED — so a dispatched auth page isn't mistaken for a real model, while
+  //    a legitimate download is NEVER refused (the host's fetch vantage may differ). ──
+  it("WARNS but still dispatches when the URL is auth-gated — an HTML page that flips with the token", async () => {
+    config.civitaiApiToken = "tok"; // the local token that Manager can't receive
+    flipFetch(htmlProbeResponse); // unauth → login HTML; with the token → real model
+    const out = await downloadModel(
+      "https://civitai.com/api/download/models/627113",
+      "loras",
+      "KNP.safetensors",
+    );
+    // NEVER blocks — the dispatch still happens (the host may succeed from its own vantage)…
+    expect(installModelViaManagerMock).toHaveBeenCalledTimes(1);
+    // …but a loud, specific warning is surfaced so the auth page isn't trusted as a model.
+    expect(out).toMatch(/AUTHENTICATION-GATED/i);
+    expect(out).toMatch(/CORRUPT model/i);
+  });
+
+  it("WARNS when an auth-gated URL returns a JSON error unauthenticated but flips with the token", async () => {
+    config.civitaiApiToken = "tok";
+    flipFetch(jsonAuthProbeResponse);
+    const out = await downloadModel(
+      "https://civitai.com/api/download/models/9",
+      "checkpoints",
+      "gated.safetensors",
+    );
+    expect(installModelViaManagerMock).toHaveBeenCalledTimes(1);
+    expect(out).toMatch(/AUTHENTICATION-GATED/i);
+  });
+
+  it("names the CivitAI host-token remediation in the auth-gated warning", async () => {
+    config.civitaiApiToken = "tok";
+    flipFetch(htmlProbeResponse);
+    const out = await downloadModel(
+      "https://civitai.com/api/download/models/1",
+      "loras",
+      "x.safetensors",
+    );
+    expect(out).toMatch(/CIVITAI_API_TOKEN on the ComfyUI HOST/i);
+  });
+
+  it("does NOT warn (no false alarm) on a location interstitial that does NOT flip with the token", async () => {
+    // The Codex vantage P0: a WAF/geo interstitial can reach the MCP as 200 HTML while the
+    // host gets a real model. It ignores the bearer, so BOTH probes return HTML → no flip →
+    // no auth-gated warning, and (as always) the dispatch proceeds.
+    config.civitaiApiToken = "tok";
+    fetchMock.mockResolvedValue(htmlProbeResponse()); // same page with or without auth
+    const out = await downloadModel("https://civitai.com/api/download/models/1", "loras", "x.safetensors");
+    expect(installModelViaManagerMock).toHaveBeenCalledTimes(1);
+    expect(out).not.toMatch(/AUTHENTICATION-GATED/i);
+  });
+
+  it("does NOT warn when an HTML page appears but NO credential is configured (can't prove auth-gating)", async () => {
+    config.civitaiApiToken = undefined;
+    fetchMock.mockResolvedValue(htmlProbeResponse());
+    const out = await downloadModel("https://civitai.com/api/download/models/1", "loras", "x.safetensors");
+    expect(installModelViaManagerMock).toHaveBeenCalledTimes(1);
+    expect(out).not.toMatch(/AUTHENTICATION-GATED/i);
+  });
+
+  it("dispatches normally (no warning) when the probe is INCONCLUSIVE (network error)", async () => {
+    fetchMock.mockRejectedValue(new Error("connreset"));
+    const out = await downloadModel(
+      "https://example.com/m.safetensors",
+      "checkpoints",
+      "m.safetensors",
+    );
+    expect(installModelViaManagerMock).toHaveBeenCalledTimes(1);
+    expect(out).toContain("ComfyUI-Manager");
+    expect(out).not.toMatch(/AUTHENTICATION-GATED/i);
+  });
+
+  it("does NOT leak the HF token to an attacker host whose URL merely CONTAINS 'huggingface.co' (#590 P0)", async () => {
+    config.huggingfaceToken = "hf-secret";
+    // unauth → auth page (would drive a flip IF a credential were derived); but the PARSED
+    // host is attacker.example, so no HF token is derived and no request carries it.
+    fetchMock.mockImplementation((_url: string, opts?: { headers?: Record<string, string> }) =>
+      Promise.resolve(opts?.headers?.Authorization ? binaryProbeResponse() : htmlProbeResponse()),
+    );
+    await downloadModel(
+      "https://attacker.example/m.safetensors?ref=huggingface.co",
+      "checkpoints",
+      "m.safetensors",
+    );
+    expect(installModelViaManagerMock).toHaveBeenCalledTimes(1); // never blocked
+    const leaked = fetchMock.mock.calls.some((c) =>
+      String((c[1] as { headers?: Record<string, string> } | undefined)?.headers?.Authorization ?? "").includes("hf-secret"),
+    );
+    expect(leaked).toBe(false);
+  });
+
+  it("attaches the HF token by PARSED host for a genuine huggingface.co gated URL and warns on the flip", async () => {
+    config.huggingfaceToken = "hf-secret";
+    fetchMock.mockImplementation((_url: string, opts?: { headers?: Record<string, string> }) =>
+      Promise.resolve(opts?.headers?.Authorization ? binaryProbeResponse() : htmlProbeResponse()),
+    );
+    const out = await downloadModel(
+      "https://huggingface.co/org/repo/resolve/main/m.safetensors",
+      "checkpoints",
+      "m.safetensors",
+    );
+    expect(installModelViaManagerMock).toHaveBeenCalledTimes(1);
+    expect(out).toMatch(/AUTHENTICATION-GATED/i);
+    const sentHf = fetchMock.mock.calls.some(
+      (c) => (c[1] as { headers?: Record<string, string> } | undefined)?.headers?.Authorization === "Bearer hf-secret",
+    );
+    expect(sentHf).toBe(true);
+  });
+
+  it("keeps the HF token flowing to an HF_ENDPOINT mirror (pre-rewrite wasHfUrl threaded) — #590 P1", async () => {
+    const prev = process.env.HF_ENDPOINT;
+    process.env.HF_ENDPOINT = "https://hf-mirror.example";
+    try {
+      config.huggingfaceToken = "hf-secret";
+      fetchMock.mockImplementation((_url: string, opts?: { headers?: Record<string, string> }) =>
+        Promise.resolve(opts?.headers?.Authorization ? binaryProbeResponse() : htmlProbeResponse()),
+      );
+      const out = await downloadModel(
+        "https://huggingface.co/org/repo/resolve/main/m.safetensors",
+        "checkpoints",
+        "m.safetensors",
+      );
+      expect(installModelViaManagerMock).toHaveBeenCalledTimes(1);
+      // The URL was rewritten to the mirror, yet the HF token still applies (threaded
+      // wasHfUrl) → the flip is detected and the auth-gated warning fires.
+      expect(out).toMatch(/AUTHENTICATION-GATED/i);
+      const sentToMirror = fetchMock.mock.calls.some(
+        (c) =>
+          String(c[0]).startsWith("https://hf-mirror.example") &&
+          (c[1] as { headers?: Record<string, string> } | undefined)?.headers?.Authorization === "Bearer hf-secret",
+      );
+      expect(sentToMirror).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.HF_ENDPOINT;
+      else process.env.HF_ENDPOINT = prev;
+    }
+  });
+
+  it("does NOT probe a NON-model-binary destination (.zip) — dispatch proceeds, no warning", async () => {
+    // A .zip is not a model-binary ext, so the probe short-circuits to inconclusive WITHOUT
+    // fetching and the dispatch proceeds unchanged.
+    fetchMock.mockResolvedValue(htmlProbeResponse());
+    const out = await downloadModel("https://example.com/pack.zip", "loras", "pack.zip");
+    expect(installModelViaManagerMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(out).not.toMatch(/AUTHENTICATION-GATED/i);
+  });
 });
 
 describe("downloadModel — threaded routing decision (#420 split-brain guard)", () => {
@@ -515,6 +726,7 @@ describe("downloadModel — threaded routing decision (#420 split-brain guard)",
     // disk. Passing the job's already-decided route must WIN — the writer follows
     // the decision the job id was keyed on, never a fresh evaluation.
     config.comfyuiPath = "/comfy";
+    fetchMock.mockResolvedValue(binaryProbeResponse()); // #473 pre-dispatch probe
     const out = await downloadModel(
       "https://example.com/model.safetensors",
       "checkpoints",
@@ -523,7 +735,10 @@ describe("downloadModel — threaded routing decision (#420 split-brain guard)",
       true, // dispatchToManager — decided upstream by startDownloadJob
     );
     expect(installModelViaManagerMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock).not.toHaveBeenCalled(); // no local streaming
+    // The one fetch is the pre-dispatch probe (a network read), NOT local streaming —
+    // no disk work happened in the Manager route.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(mkdirMock).not.toHaveBeenCalled();
     expect(out).toContain("ComfyUI-Manager");
   });
 

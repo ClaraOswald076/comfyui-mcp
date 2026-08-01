@@ -556,6 +556,263 @@ async function assertModelPayloadOrThrow(opts: {
   throw nonModelPayloadError(kind, url, logUrl);
 }
 
+/** Verdict from a pre-dispatch probe of what a server-side (ComfyUI-Manager) fetch
+ *  will land — see {@link probeRemoteModelPayload}. */
+export interface RemotePayloadProbe {
+  /** "non-model": a DEFINITIVE auth/error payload — the caller MUST refuse to dispatch.
+   *  "model": the first bytes look like real model binary — safe to dispatch.
+   *  "inconclusive": ANY uncertainty (network error/timeout, a non-auth error status,
+   *  an unsniffable body, or a non-model-binary destination) — the caller must NOT
+   *  refuse, so the probe can never block a download that might be legitimate. */
+  verdict: "non-model" | "model" | "inconclusive";
+  /** The offending shape when a body/Content-Type signal drove a "non-model" verdict.
+   *  Absent for a bare 401 with no classifiable body. */
+  kind?: "html" | "json";
+  /** The probe response status, when a response was received. */
+  status?: number;
+}
+
+/** Ceiling on the pre-dispatch probe. Kept short: it reads only the sniff window and a
+ *  hung probe must never wedge a download — on timeout it returns "inconclusive" and
+ *  the dispatch proceeds exactly as it does today. */
+const REMOTE_PROBE_TIMEOUT_MS = 12_000;
+
+/** Read up to `n` bytes from a fetch Response body, then cancel the stream so a
+ *  multi-GB file is NEVER drained by the probe. Returns the bytes read (may be shorter
+ *  than `n`), or undefined when there is no readable body. */
+async function readResponseHead(res: Response, n: number): Promise<Buffer | undefined> {
+  const body = res.body as ReadableStream<Uint8Array> | null | undefined;
+  if (!body || typeof body.getReader !== "function") {
+    // No stream (e.g. a minimal stubbed Response) — fall back to a bounded buffer read.
+    try {
+      const ab = await res.arrayBuffer();
+      const buf = Buffer.from(ab);
+      return buf.length ? buf.subarray(0, n) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  const reader = body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  try {
+    while (total < n) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value && value.length) {
+        // Cap what we buffer to the sniff window: a server that ignores Range and streams
+        // a large first chunk must not make us hold it all in memory (we only need n bytes).
+        const take = value.length > n - total ? value.subarray(0, n - total) : value;
+        chunks.push(Buffer.from(take));
+        total += take.length;
+      }
+    }
+  } catch {
+    // A partial read is fine — classification runs on whatever prefix we got.
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+  return total === 0 ? undefined : Buffer.concat(chunks).subarray(0, n);
+}
+
+/** The raw shape of one probe fetch — used to compare an unauthenticated fetch against
+ *  a credentialed one (the flip test). */
+interface PayloadSniff {
+  /** A response was received (the fetch itself did not throw/timeout). */
+  ok: boolean;
+  status?: number;
+  /** Body/Content-Type classification via the #473 classifier: an auth/error page shape. */
+  kind: "html" | "json" | null;
+  /** A SUCCESS (2xx) response whose first bytes are real model binary (not html/json). */
+  isModelBinary: boolean;
+}
+
+const PROBE_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+/** Parse an origin, or null when the URL is unparseable (treated as a DIFFERENT origin —
+ *  i.e. auth is stripped, the safe default). */
+function safeOrigin(u: string): string | null {
+  try {
+    return new URL(u).origin;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * One bounded, Range-limited probe of `url`, classified with the SAME #473 classifier the
+ * local finalize gate uses. Never throws — a network error/timeout/abort yields
+ * `{ ok: false }`. `signal` is the caller-composed abort+timeout (owned by the caller so a
+ * single budget bounds BOTH probes).
+ *
+ * CREDENTIAL SAFETY (do not regress): redirects are followed MANUALLY (never
+ * `redirect: "follow"`, which re-sends arbitrary custom auth headers like `X-API-Key`
+ * across origins). `authHeaders` — which can include ANY caller header — are sent ONLY to
+ * the ORIGINAL target origin; the FIRST time a redirect leaves that origin, ALL auth
+ * headers are dropped for the rest of the chain (only `Range` is retained), mirroring the
+ * local downloader. A caller credential is therefore never sent to any host but the one the
+ * caller addressed.
+ */
+async function sniffPayloadShape(
+  url: string,
+  modelExt: string,
+  authHeaders: Record<string, string> | undefined,
+  signal: AbortSignal,
+): Promise<PayloadSniff> {
+  const rangeHeader = { Range: `bytes=0-${PAYLOAD_SNIFF_BYTES - 1}` };
+  const hasAuth = !!authHeaders && Object.keys(authHeaders).length > 0;
+  const originalOrigin = safeOrigin(url);
+  let currentUrl = url;
+  let authStripped = false; // once we leave the original origin, never re-send auth
+  for (let hop = 0; hop <= MAX_HTTP_REDIRECTS; hop++) {
+    const sendAuth = hasAuth && !authStripped;
+    let res: Response;
+    try {
+      res = await fetch(currentUrl, {
+        // Manual redirects (see CREDENTIAL SAFETY above) — never "follow". Range-limit to
+        // the sniff window so a multi-GB model is never pulled.
+        redirect: "manual",
+        headers: sendAuth ? { ...rangeHeader, ...authHeaders } : rangeHeader,
+        signal,
+      });
+    } catch {
+      return { ok: false, kind: null, isModelBinary: false };
+    }
+    if (!res || typeof res.status !== "number") return { ok: false, kind: null, isModelBinary: false };
+    const location =
+      typeof res.headers?.get === "function" ? res.headers.get("location") : null;
+    if (PROBE_REDIRECT_STATUSES.has(res.status) && location) {
+      // Drain the (usually empty) redirect body so the socket is released.
+      try {
+        await (res.body as ReadableStream | null | undefined)?.cancel?.();
+      } catch {
+        /* ignore */
+      }
+      let nextUrl: string;
+      try {
+        nextUrl = new URL(location, currentUrl).toString();
+      } catch {
+        return { ok: false, kind: null, isModelBinary: false };
+      }
+      // Cross-origin relative to the ORIGINAL target (or an unparseable next URL) → strip
+      // ALL auth for the remainder of the chain. Never send a caller credential elsewhere.
+      if (safeOrigin(nextUrl) !== originalOrigin) authStripped = true;
+      currentUrl = nextUrl;
+      continue;
+    }
+    // Terminal (non-redirect) response → classify its first bytes.
+    const status = res.status;
+    const contentType =
+      (typeof res.headers?.get === "function" ? res.headers.get("content-type") : "") ?? "";
+    let head: Buffer | undefined;
+    try {
+      head = await readResponseHead(res, PAYLOAD_SNIFF_BYTES);
+    } catch {
+      head = undefined;
+    }
+    const kind = detectNonModelPayload(head, contentType, modelExt);
+    const isSuccess = status === 200 || status === 206;
+    const isModelBinary = isSuccess && !kind && !!head && head.length > 0;
+    return { ok: true, status, kind, isModelBinary };
+  }
+  // Redirect limit exceeded — treat as unresolvable (inconclusive).
+  return { ok: false, kind: null, isModelBinary: false };
+}
+
+/**
+ * PREDICT what a server-side ComfyUI-Manager fetch of `url` will land, WITHOUT
+ * downloading the whole file, so a REMOTE dispatch can fail loudly BEFORE Manager
+ * saves an auth/login/error page under a `.safetensors` name and reports success
+ * (#473 remote residual — the local finalize gate above can't run on the remote path,
+ * where the MCP never sees the bytes and has no way to sniff or delete the landed file).
+ *
+ * The MCP probes from a DIFFERENT network vantage than the ComfyUI host, so a raw
+ * "unauthenticated fetch returned HTML" is NOT proof the host would land HTML — a
+ * location-specific WAF/geo interstitial could hit the MCP while the host gets a real
+ * model. To avoid ever blocking a download that could succeed, this gate refuses ONLY on
+ * a signal that is provably AUTH-based and therefore IP-INDEPENDENT: a credential FLIP.
+ *
+ *   1. Probe UNAUTHENTICATED — exactly what Manager's server-side fetch does. If that
+ *      already returns real model binary, the URL is public → dispatch (verdict "model").
+ *   2. Otherwise (auth page / 401 / non-2xx / empty), fetch the SAME url WITH the
+ *      credential the LOCAL path would apply (`opts.authHeaders` — the CivitAI/HF token or
+ *      explicit auth that Manager can NEVER receive). If THAT returns real model binary,
+ *      the credential — not the vantage point — is what unlocks it: the URL is
+ *      AUTHENTICATION-GATED and Manager (tokenless) WILL land the auth/error page →
+ *      verdict "non-model" (block). This is exactly the reported bug (a local token that
+ *      is not forwarded to a remote Manager).
+ *   3. Any other outcome — no credential to test, the credential did not flip it (an
+ *      invalid token, or a location interstitial that ignores the header), or a network
+ *      error — is "inconclusive": we cannot PROVE auth-gating, so we never hard-block.
+ *
+ * Because a block requires the credential to flip the SAME url from non-model to model,
+ * it can never refuse a download that would have succeeded via Manager (a public model
+ * returns binary on the first, unauthenticated probe; a location interstitial does not
+ * flip on a bearer header). Not applicable to a non-model-binary destination (returns
+ * "inconclusive"), matching the local gate.
+ */
+export async function probeRemoteModelPayload(
+  url: string,
+  modelExt: string | undefined,
+  signal?: AbortSignal,
+  opts?: {
+    /** The auth HEADERS the LOCAL download path would apply for this url (explicit auth,
+     *  or the auto HF/CivitAI host-token). The flip test uses them to prove auth-gating;
+     *  Manager itself can never receive them. */
+    authHeaders?: Record<string, string>;
+  },
+): Promise<RemotePayloadProbe> {
+  if (!modelExt || !MODEL_BINARY_EXTS.has(modelExt.toLowerCase())) {
+    return { verdict: "inconclusive" };
+  }
+  // ONE shared abort budget for BOTH probes (they run sequentially): compose the caller's
+  // abort with a single hard timeout MANUALLY (never AbortSignal.any — unavailable on older
+  // runtimes), so the TOTAL probe time is bounded by REMOTE_PROBE_TIMEOUT_MS, not 2x, and a
+  // stalled probe can never hang the dispatch. Unref'd (never keeps the process alive),
+  // cleared in `finally`.
+  const controller = new AbortController();
+  const onCallerAbort = (): void => controller.abort();
+  const timer = setTimeout(() => controller.abort(), REMOTE_PROBE_TIMEOUT_MS);
+  if (typeof (timer as { unref?: unknown }).unref === "function") timer.unref();
+  if (signal) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener("abort", onCallerAbort, { once: true });
+  }
+  try {
+    // (1) Unauthenticated probe — what Manager will actually do.
+    const unauth = await sniffPayloadShape(url, modelExt, undefined, controller.signal);
+    if (!unauth.ok) return { verdict: "inconclusive" };
+    if (unauth.isModelBinary) return { verdict: "model", status: unauth.status };
+
+    // (2) The unauthenticated fetch did NOT yield a clean model. Only warn on a credential
+    // FLIP, and ONLY when the unauth response is a CLEAR auth page — an HTML/JSON body
+    // (`kind` set) on a NON-transient status. A transient 429/5xx (or an ambiguous empty /
+    // bare-status response) is NOT proof of gating: a public URL that momentarily 503s and
+    // then serves the model on the credentialed retry must NOT cry wolf. Those stay
+    // inconclusive.
+    const status = unauth.status ?? 0;
+    const transient = status === 429 || (status >= 500 && status <= 599);
+    const clearAuthPage = (unauth.kind === "html" || unauth.kind === "json") && !transient;
+    const authHeaders = opts?.authHeaders;
+    if (clearAuthPage && authHeaders && Object.keys(authHeaders).length > 0) {
+      const authed = await sniffPayloadShape(url, modelExt, authHeaders, controller.signal);
+      if (authed.ok && authed.isModelBinary) {
+        // The credential turns the SAME url from a clear auth page into a real model →
+        // AUTH-GATED, and the credential is what unlocks it. Manager, which can't carry it,
+        // will land the auth/error page. Report the UNAUTHENTICATED body shape (what Manager
+        // sees). This is a WARNING signal for the caller — never a refusal.
+        return { verdict: "non-model", kind: unauth.kind ?? undefined, status: unauth.status };
+      }
+    }
+    // (3) No clear auth page, no credential, no flip, or a network/transient outcome — we
+    // cannot prove auth-gating, so stay inconclusive (never warn, never block).
+    return { verdict: "inconclusive", status: unauth.status };
+  } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener("abort", onCallerAbort);
+  }
+}
+
 /** POSITIVELY true only when `path` is confirmed discarded — it no longer exists
  *  (stat throws ENOENT) or exists but is empty (size 0). A non-ENOENT stat error
  *  (a transient fs hiccup) or a still-present non-empty file returns false, so a

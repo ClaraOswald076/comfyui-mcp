@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, type Stats } from "node:fs";
 import { readdir, stat, mkdir, readFile, lstat, realpath } from "node:fs/promises";
-import { dirname, join, basename, resolve, relative, sep, isAbsolute } from "node:path";
+import { dirname, join, basename, resolve, relative, sep, isAbsolute, extname } from "node:path";
 import { config, isRemoteMode } from "../config.js";
 import { getClient, getSystemStats } from "../comfyui/client.js";
 import { getExtraModelRoots } from "./extra-paths.js";
@@ -9,7 +9,7 @@ import { resolveEffectiveComfyUIBase, liveRootFromArgv } from "./workspace-env.j
 import { installModelViaManager } from "./node-management.js";
 import { ModelError, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
-import { downloadWithCache } from "./download-cache.js";
+import { downloadWithCache, probeRemoteModelPayload } from "./download-cache.js";
 import { reportDownloadProgress } from "./download-progress.js";
 import type { ResumeReporter } from "./download-resume-diag.js";
 import { resolveModelsDir, parseModelsDirFromArgv } from "./output-dir.js";
@@ -467,6 +467,24 @@ function isCivitaiUrl(url: string): boolean {
   }
 }
 
+/**
+ * True when `url`'s PARSED hostname is huggingface.co (or a subdomain). The single
+ * authority for the "is this a Hugging Face host?" credential decision — used by BOTH the
+ * local streaming download and the #473 remote flip probe. NEVER a substring match:
+ * `https://attacker.example/m.safetensors?ref=huggingface.co` and
+ * `https://huggingface.co.evil.com/...` both parse to a non-HF host and get NO token
+ * (a substring `url.includes("huggingface.co")` would leak HF_TOKEN to them). An
+ * unparseable url is not HF (no token).
+ */
+function isHuggingFaceHost(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host === "huggingface.co" || host.endsWith(".huggingface.co");
+  } catch {
+    return false;
+  }
+}
+
 /** Network-restricted regions (issue #127): honor the de-facto HF_ENDPOINT
  *  mirror var (e.g. https://hf-mirror.com) by rewriting huggingface.co URLs at
  *  the API/download boundary. Only http(s) endpoints are accepted; anything
@@ -793,6 +811,37 @@ export async function resolveExistingModelFile(
 }
 
 /**
+ * The auth HEADERS the LOCAL download path would apply for `url` — explicit auth first,
+ * else the auto HuggingFace/CivitAI host-token injection. MIRRORS the header build in
+ * `downloadModel`'s local streaming path (kept in sync with it) and is used ONLY by the
+ * #473 remote flip probe: a credentialed fetch that turns a non-model response into a real
+ * model proves the URL is authentication-gated (the exact bug — a local token Manager can
+ * never receive). Returns `{}` when no credential applies (a public/anonymous URL).
+ */
+function localAuthHeadersFor(
+  url: string,
+  auth: DownloadAuth | undefined,
+  /** Whether the ORIGINAL (pre-HF_ENDPOINT-rewrite) url was a huggingface.co url — threaded
+   *  from downloadModel so an HF_ENDPOINT mirror still gets the token (mirrors the local
+   *  streaming path; without it a rewritten url would parse to the mirror host and drop the
+   *  token → a false-negative). */
+  wasHfUrl: boolean,
+): Record<string, string> {
+  const request = applyDownloadAuth(url, auth);
+  const headers: Record<string, string> = { ...request.headers };
+  // HF token: attach ONLY when the url's PARSED hostname is huggingface.co (or a subdomain),
+  // or the ORIGINAL url was a HF url that HF_ENDPOINT rewrote to a trusted mirror. NEVER a
+  // substring match (see isHuggingFaceHost). isCivitaiUrl is likewise hostname-parsed, so
+  // the CivitAI branch is safe by construction.
+  if (!auth && config.huggingfaceToken && (wasHfUrl || isHuggingFaceHost(url))) {
+    headers["Authorization"] = `Bearer ${config.huggingfaceToken}`;
+  } else if (!auth && config.civitaiApiToken && isCivitaiUrl(url)) {
+    headers["Authorization"] = `Bearer ${config.civitaiApiToken}`;
+  }
+  return headers;
+}
+
+/**
  * Remote-mode download: hand the file off to the connected ComfyUI host via
  * ComfyUI-Manager's `install-model` task. Validates the subfolder/filename with
  * the same guards as the local path (no traversal, bare filename) before
@@ -804,6 +853,10 @@ async function downloadModelViaManagerRemote(
   filename?: string,
   auth?: DownloadAuth,
   signal?: AbortSignal,
+  /** Whether the ORIGINAL url (before any HF_ENDPOINT rewrite the caller applied) was a
+   *  huggingface.co url — threaded to the #473 flip probe's credential derivation so an
+   *  HF_ENDPOINT mirror still gets the HF token (matches the local streaming path). */
+  wasHfUrl = false,
 ): Promise<string> {
   // Cancelled before we dispatched — do not hand the fetch to the remote Manager at all.
   if (signal?.aborted) throw new DOMException("The download was cancelled.", "AbortError");
@@ -871,6 +924,70 @@ async function downloadModelViaManagerRemote(
   );
 
   const sensitiveParams = auth?.type === "query" ? [auth.query_param] : undefined;
+
+  // #473 remote residual. The MCP cannot fully close this on the remote path: a server-side
+  // Manager fetch can't carry our auth headers, the MCP never sees the landed bytes, and
+  // there is no remote primitive to sniff, size, or delete the file afterward — so a
+  // login-gated URL makes Manager save an HTML/JSON auth page under the `.safetensors` name
+  // and report its queue task "done", a corrupt "model" under a false success. (The
+  // authoritative fix is a host-side authenticated transport — the MCP-to-panel streamed
+  // upload the issue scopes — tracked separately.)
+  //
+  // What the MCP CAN do here WITHOUT ever wrongly blocking a legitimate download: detect,
+  // with HIGH CONFIDENCE, that the URL is AUTHENTICATION-GATED and warn LOUDLY, so a
+  // dispatched auth/login page is never silently mistaken for a real model. Proof is a
+  // credential FLIP: an unauthenticated fetch (what Manager does) returns a non-model
+  // auth/error page, but the SAME url fetched WITH the credential the local path would
+  // apply (which Manager can NEVER receive) returns a real model — IP-independent evidence
+  // of token gating, the exact reported bug. We deliberately DO NOT refuse the dispatch:
+  // the ComfyUI host fetches from a DIFFERENT network vantage and could still succeed
+  // (e.g. an IP allowlist the MCP isn't on), so a hard refusal from the MCP's vantage
+  // could block a download that would actually work. A prominent warning that never blocks
+  // is the safe ceiling of what the MCP can assert remotely.
+  const modelExt = extname(resolvedFilename).toLowerCase();
+  const probe = await probeRemoteModelPayload(dispatchUrl, modelExt, signal, {
+    // The auth the LOCAL path would apply — used ONLY to prove auth-gating via a credential
+    // flip; Manager can never receive these headers. Derived from `url` (pre-query-fold) so
+    // host detection (civitai/hf) matches the local streaming path. `wasHfUrl` preserves the
+    // pre-HF_ENDPOINT-rewrite HF identity so a mirror still gets the token.
+    authHeaders: localAuthHeadersFor(url, auth, wasHfUrl),
+  });
+  if (signal?.aborted) throw new DOMException("The download was cancelled.", "AbortError");
+  let authGateWarning = "";
+  if (probe.verdict === "non-model") {
+    const what =
+      probe.kind === "html"
+        ? "an HTML page (a login/authentication or error page)"
+        : probe.kind === "json"
+          ? "a JSON document (an API error or auth challenge)"
+          : "an authentication/error response";
+    let host = "";
+    try {
+      host = new URL(dispatchUrl).hostname;
+    } catch {
+      /* host is only used to tailor the remediation hint */
+    }
+    const isCivitai = /(^|\.)civitai\.com$/i.test(host);
+    const remediation = isCivitai
+      ? `set CIVITAI_API_TOKEN on the ComfyUI HOST (the MCP's locally-configured token is ` +
+        `NOT forwarded to a remote ComfyUI-Manager), or download to a LOCAL ComfyUI where the ` +
+        `token is applied and the payload is validated on disk`
+      : `configure the credential on the ComfyUI host, or download to a LOCAL ComfyUI where the ` +
+        `credential is applied and the payload is validated on disk`;
+    authGateWarning =
+      ` WARNING: this URL is AUTHENTICATION-GATED — an unauthenticated fetch (exactly what ` +
+      `ComfyUI-Manager performs server-side, since it cannot carry the MCP's auth headers) ` +
+      `returns ${what}, while the SAME URL fetched WITH the configured credential returns a ` +
+      `real model. ComfyUI-Manager will therefore almost certainly save that auth/error page ` +
+      `under "${resolvedFilename}" as a CORRUPT model (it fails at load time, e.g. "header too ` +
+      `large" / "Expecting value") — do NOT treat it as a real model until verified. To ` +
+      `download it, ${remediation}.`;
+    logger.warn(
+      "Remote model dispatch is authentication-gated; ComfyUI-Manager will fetch it unauthenticated",
+      { url: redactUrlForLogs(dispatchUrl, sensitiveParams), filename: resolvedFilename },
+    );
+  }
+
   logger.info("Dispatching model install to remote ComfyUI via ComfyUI-Manager", {
     url: redactUrlForLogs(dispatchUrl, sensitiveParams),
     type: managerType,
@@ -896,7 +1013,7 @@ async function downloadModelViaManagerRemote(
   // "cancelled" (the tool message notes the server may still be fetching).
   if (signal?.aborted) throw new DOMException("The download was cancelled.", "AbortError");
 
-  return `${normalizedSubfolder}/${resolvedFilename} (dispatched to the remote ComfyUI via ComfyUI-Manager — download continues server-side; the file lists under /models when complete)${authWarning}`;
+  return `${normalizedSubfolder}/${resolvedFilename} (dispatched to the remote ComfyUI via ComfyUI-Manager — download continues server-side; the file lists under /models when complete)${authGateWarning}${authWarning}`;
 }
 
 /**
@@ -1014,7 +1131,9 @@ export async function downloadModel(
   const routeToManager =
     dispatchToManager ?? (await shouldDispatchDownloadToManager());
   if (routeToManager) {
-    return downloadModelViaManagerRemote(url, targetSubfolder, filename, auth, signal);
+    // Thread the PRE-rewrite HF identity so the flip probe's credential derivation keeps the
+    // HF token flowing to an HF_ENDPOINT mirror (matches the local path below).
+    return downloadModelViaManagerRemote(url, targetSubfolder, filename, auth, signal, wasHfUrl);
   }
 
   // Root the destination at the LIVE server's models dir (its --base-directory),
@@ -1030,9 +1149,12 @@ export async function downloadModel(
 
   const request = applyDownloadAuth(url, auth);
   const headers: Record<string, string> = { ...request.headers };
-  // wasHfUrl keeps the token flowing when HF_ENDPOINT rewrote the host to a
-  // mirror (mirrors proxy gated repos and accept the same Bearer token).
-  if (!auth && config.huggingfaceToken && (wasHfUrl || url.includes("huggingface.co"))) {
+  // HF token: attach ONLY when the url's PARSED hostname is huggingface.co (or a subdomain),
+  // or the ORIGINAL url was a HF url that HF_ENDPOINT rewrote to a trusted mirror (wasHfUrl).
+  // NEVER a substring match — `https://evil.example/m.safetensors?ref=huggingface.co` parses
+  // to evil.example and must get NO token (a credential-leak; the same parsed-host authority
+  // the remote flip probe uses).
+  if (!auth && config.huggingfaceToken && (wasHfUrl || isHuggingFaceHost(url))) {
     headers["Authorization"] = `Bearer ${config.huggingfaceToken}`;
   } else if (!auth && config.civitaiApiToken && isCivitaiUrl(url)) {
     // CivitAI auth travels as a request header (never in the URL/query) so the
