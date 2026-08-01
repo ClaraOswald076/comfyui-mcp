@@ -58,8 +58,13 @@ const {
   setQueueTimingForTests,
   resetManagerApiCacheForTests,
 } = await import("../../services/node-management.js");
-const { resetManagerApiCache, cacheManagerApi, getCachedManagerApi, managerApiEpoch } =
-  await import("../../services/manager-api-cache.js");
+const {
+  resetManagerApiCache,
+  cacheManagerApi,
+  getCachedManagerApi,
+  managerApiCacheStamp,
+  managerApiEpoch,
+} = await import("../../services/manager-api-cache.js");
 
 const BASE = "http://127.0.0.1:8188";
 
@@ -394,12 +399,28 @@ describe("#646 Manager API dialect cache invalidation", () => {
 
   it("drops a detection that completed across an invalidation (in-flight restart)", async () => {
     // Direct check of the epoch guard the async detection path relies on.
-    const startEpoch = managerApiEpoch();
+    const stamp = managerApiCacheStamp();
     resetManagerApiCache("comfyui restarted mid-detection");
-    cacheManagerApi(BASE, "v2-batch", startEpoch);
+    cacheManagerApi(BASE, "v2-batch", stamp);
     expect(getCachedManagerApi(BASE)).toBeUndefined();
     // A detection that started AFTER the reset still pins normally.
-    cacheManagerApi(BASE, "v2-batch", managerApiEpoch());
+    cacheManagerApi(BASE, "v2-batch", managerApiCacheStamp());
+    expect(getCachedManagerApi(BASE)).toBe("v2-batch");
+  });
+
+  it("a slower concurrent detection cannot overwrite a fresher verdict", async () => {
+    // Both probes start after the window lapsed, with NO reset involved (an
+    // out-of-band restart lands between them), so the epoch alone can't order
+    // them: probe A reads the OLD server, probe B reads the new one and commits
+    // first, then A resolves last.
+    const stampA = managerApiCacheStamp();
+    cacheManagerApi(BASE, "v2", managerApiCacheStamp()); // probe B, fresher
+    cacheManagerApi(BASE, "v2-batch", stampA); // probe A, stale, resolves last
+    expect(getCachedManagerApi(BASE)).toBe("v2");
+
+    // A verdict backed by a SUCCEEDED enqueue (the #464 demotion) is still
+    // allowed to supersede a probe-derived one — it guards on the epoch only.
+    cacheManagerApi(BASE, "v2-batch", { epoch: managerApiEpoch() });
     expect(getCachedManagerApi(BASE)).toBe("v2-batch");
   });
 

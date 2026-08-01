@@ -88,10 +88,33 @@ let cache: { base: string; api: ManagerApi; at: number } | null = null;
  */
 let epoch = 0;
 
-/** Current invalidation epoch — capture it before an async detection/operation
- *  and pass it back to the commit helpers so a concurrent reset wins. */
+/**
+ * Commit counter, bumped by every accepted cache write. A reset is not the only
+ * way a detection can be overtaken: after the TTL lapses, two operations can
+ * probe CONCURRENTLY, and if the slower probe (which read the PRE-restart server)
+ * resolves last it would overwrite the fresher verdict and re-pin the stale
+ * dialect for another window — with no reset involved, so the epoch alone
+ * wouldn't catch it. A detection therefore also refuses to commit when any other
+ * write landed while it was in flight; the fresher verdict stands and the loser
+ * simply returns its own value to its caller.
+ */
+let writes = 0;
+
+/** Current invalidation epoch — capture it before an async operation and pass it
+ *  back to the commit helpers so a concurrent RESET wins. */
 export function managerApiEpoch(): number {
   return epoch;
+}
+
+/** Full cache state stamp for a DETECTION: loses to a concurrent reset AND to a
+ *  concurrent detection that committed first. */
+export interface ManagerApiCacheStamp {
+  epoch: number;
+  writes: number;
+}
+
+export function managerApiCacheStamp(): ManagerApiCacheStamp {
+  return { epoch, writes };
 }
 
 /**
@@ -118,23 +141,34 @@ export function getCachedManagerApi(base: string): ManagerApi | undefined {
 }
 
 /**
- * Record a detected dialect. When `startEpoch` is supplied and no longer matches
- * the current epoch, the write is DROPPED: something invalidated the cache while
- * this detection was in flight (a restart), so its conclusion describes a server
- * that may no longer be there. The caller still gets the value it detected — it
- * simply isn't pinned for later callers.
+ * Record a detected dialect, subject to an optional `guard` captured before the
+ * work that produced it:
+ *   • `epoch` mismatch → something INVALIDATED the cache while this was in
+ *     flight (a restart), so the conclusion may describe a server that is gone.
+ *   • `writes` mismatch (detections only) → another probe already committed a
+ *     FRESHER verdict; ours is the older read and must not overwrite it.
+ * A dropped write is not an error: the caller still gets the value it derived,
+ * it simply isn't pinned for later callers.
  */
-export function cacheManagerApi(base: string, api: ManagerApi, startEpoch?: number): void {
-  if (startEpoch !== undefined && startEpoch !== epoch) {
-    logger.debug("Dropping Manager API dialect detected across an invalidation", {
-      base,
-      api,
-      startEpoch,
-      epoch,
-    });
-    return;
+export function cacheManagerApi(
+  base: string,
+  api: ManagerApi,
+  guard?: { epoch: number; writes?: number },
+): void {
+  if (guard) {
+    const reason =
+      guard.epoch !== epoch
+        ? "invalidated in flight"
+        : guard.writes !== undefined && guard.writes !== writes
+          ? "overtaken by a fresher detection"
+          : undefined;
+    if (reason) {
+      logger.debug("Dropping a Manager API dialect commit", { base, api, reason, guard, epoch, writes });
+      return;
+    }
   }
   cache = { base, api, at: monotonicNow() };
+  writes++;
 }
 
 /**

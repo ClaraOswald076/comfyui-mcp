@@ -10,6 +10,7 @@ import {
   type ManagerApi,
   cacheManagerApi,
   getCachedManagerApi,
+  managerApiCacheStamp,
   managerApiEpoch,
   resetManagerApiCache,
   setManagerApiCacheForTests,
@@ -292,7 +293,10 @@ export function resetManagerApiCacheForTests(api?: ManagerApi): void {
  * the OLD server and must not be pinned over the fresh invalidation (#646).
  */
 function demoteManagerApiToV2Batch(startEpoch: number): void {
-  cacheManagerApi(managerBaseUrl(), "v2-batch", startEpoch);
+  // Guarded on the invalidation epoch ONLY (not the write counter): this verdict
+  // is backed by an enqueue that actually SUCCEEDED, so it legitimately
+  // supersedes a probe-derived classification that landed during the operation.
+  cacheManagerApi(managerBaseUrl(), "v2-batch", { epoch: startEpoch });
 }
 
 /** A real queue/status payload — guards detection against servers that answer
@@ -366,14 +370,15 @@ async function detectManagerApi(): Promise<ManagerApi> {
   const base = managerBaseUrl();
   const cached = getCachedManagerApi(base);
   if (cached !== undefined) return cached;
-  // Capture the invalidation epoch BEFORE probing: if ComfyUI is restarted while
-  // these probes are in flight, the conclusion describes the pre-restart server
-  // and must not be pinned over that invalidation (#646).
-  const startEpoch = managerApiEpoch();
+  // Stamp the cache state BEFORE probing: if ComfyUI is restarted — or another
+  // probe commits a fresher verdict — while these probes are in flight, this
+  // conclusion describes a server that may be gone and must not be pinned over
+  // the newer state (#646).
+  const stamp = managerApiCacheStamp();
   const v2 = await managerFetch<QueueStatus>("/v2/manager/queue/status", { soft: true });
   if (looksLikeQueueStatus(v2)) {
     const api = await resolveV2SubDialect();
-    cacheManagerApi(base, api, startEpoch);
+    cacheManagerApi(base, api, stamp);
     return api;
   }
   const legacy = await managerFetch<QueueStatus>("/manager/queue/status", { soft: true });
@@ -398,11 +403,11 @@ async function detectManagerApi(): Promise<ManagerApi> {
       });
       if (looksLikeQueueStatus(v2Retry)) {
         const api = await resolveV2SubDialect();
-        cacheManagerApi(base, api, startEpoch);
+        cacheManagerApi(base, api, stamp);
         return api;
       }
     }
-    cacheManagerApi(base, "legacy", startEpoch);
+    cacheManagerApi(base, "legacy", stamp);
     return "legacy";
   }
   throw new NodeManagementError(
