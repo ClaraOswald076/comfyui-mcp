@@ -1424,13 +1424,21 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     old.close();
   });
 
-  it("ALLOWS a mutating graph command for a panel that DOES enforce the stamp (#570 P0c)", async () => {
-    const modern = await connectPanel("tmp:modern", "M"); // connectPanel advertises enforcement
+  it("ALLOWS active-workflow mutations (graph AND workflow_*) for a panel that DOES enforce the stamp (#570 P0c)", async () => {
+    const modern = await connectPanel("tmp:modern", "M"); // connectPanel advertises enforcement + has a resolver stamp
     autoReply(modern, "modern");
     await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:modern")).toBe(true));
-    await expect(
-      bridge.send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "tmp:modern" }),
-    ).resolves.toMatchObject({ from: "modern" });
+    // A graph mutator AND each workflow mutator all dispatch (enforcement + trusted stamp present).
+    for (const cmd of [
+      { cmd: "graph_add_node", node: "x" },
+      { cmd: "workflow_save" },
+      { cmd: "workflow_save_as", name: "y" },
+      { cmd: "workflow_close", force: true }, // path-less ⇒ active ⇒ gated, but enforcing panel passes
+    ]) {
+      await expect(bridge.send(cmd as never, { tabId: "tmp:modern" })).resolves.toMatchObject({
+        from: "modern",
+      });
+    }
     modern.close();
   });
 

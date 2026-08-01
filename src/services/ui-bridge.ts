@@ -115,11 +115,15 @@ interface Conn {
    *  the unsupportedCmds "reset on every hello" philosophy for the version dimension. */
   panelVersionAdvertised: boolean;
   /** #570 P0c — THIS panel build advertised (in its hello) that it enforces the per-command
-   *  workflow-instance stamp: it refuses to run a graph command whose stamped workflow_uuid
-   *  does not match the active canvas. When false (an OLD panel that would silently ignore the
-   *  stamp), the send() preflight FAILS CLOSED for MUTATING graph commands so a stale write
-   *  can't hit the wrong canvas — reads stay allowed. Re-read from every hello (a reconnect may
-   *  be a freshly updated build), never inherited.
+   *  workflow-instance stamp: it refuses to run ANY active-workflow op whose stamped
+   *  workflow_uuid does not match the active canvas — every graph_* command AND the four
+   *  active-workflow mutators (workflow_save / workflow_save_as / workflow_rename /
+   *  workflow_close). The panel fence sits in the command handler (activeWorkflowFenceApplies),
+   *  before every executor, so the guarantee spans all of them, not just graph commands. When
+   *  false (an OLD panel that would silently ignore the stamp), the send() preflight FAILS CLOSED
+   *  for those active-workflow mutations (see requiresWorkflowStampEnforcement) so a stale write
+   *  can't hit the wrong workflow — reads and path-targeted ops stay allowed. Re-read from every
+   *  hello (a reconnect may be a freshly updated build), never inherited.
    *
    *  SCOPE (deliberate): this is ACCIDENTAL version-skew protection — an HONEST old panel gets
    *  read-only graph access until it updates, so a stale in-flight edit can't silently corrupt
