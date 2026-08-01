@@ -312,6 +312,59 @@ function isRetrySafeCmd(cmd: Record<string, unknown>): boolean {
   return RETRY_SAFE_CMDS.has(name);
 }
 
+// Graph-EDIT mutations that CHANGE the user's canvas (undoable edits). These are
+// the #436 bug surface: a real side effect the bridge will NOT auto-retry, so —
+// unlike a read — such a command can be neither parked mid-command nor retried
+// once, and firing it into the post-restart "Connected: none" window fails with
+// "no connected tab". It must await a stable binding BEFORE dispatch.
+//
+// This is an EXPLICIT ALLOWLIST, deliberately NOT "everything not read-only":
+// several genuine reads/probes/views that flow through ctx.call are absent from
+// BRIDGE_READONLY_CMDS (e.g. graph_list_subgraphs, training_get_state,
+// graph_canvas, graph_screenshot), so an exclusion rule would wrongly make THOSE
+// wait out the reconnect budget. Under-inclusion here is at worst an unfixed edge
+// (a command keeps today's behavior); over-inclusion would regress a read — so we
+// list only commands that unambiguously mutate the graph. Keep in sync when new
+// graph-edit tools are added (mirrors the RETRY_SAFE_CMDS maintenance model).
+const MUTATING_GRAPH_EDIT_CMDS = new Set<string>([
+  "graph_add_node",
+  "graph_remove_node",
+  "graph_clear",
+  "graph_connect",
+  "graph_disconnect",
+  "graph_set_widget",
+  "graph_move_node",
+  "graph_resize_node",
+  "graph_set_title",
+  "graph_set_node_mode",
+  "graph_set_node_color",
+  "graph_set_node_collapsed",
+  "graph_update_node",
+  "graph_create_group",
+  "graph_edit_group",
+  "graph_remove_group",
+  "graph_move_group",
+  "graph_create_subgraph",
+  "graph_add_subgraph",
+  "graph_save_subgraph",
+  "graph_unpack_subgraph",
+  "graph_subgraph_group",
+  "graph_expose_subgraph_input",
+  "graph_expose_subgraph_output",
+  "graph_promote_widget",
+  "graph_move_rail",
+  "graph_paste_nodes",
+  "graph_auto_layout",
+  "graph_load",
+]);
+
+/** A MUTATING graph edit that must await a stable tab binding before dispatch so
+ *  it never fires into the post-restart "Connected: none" window (#436). */
+function isMutatingGraphCmd(cmd: Record<string, unknown>): boolean {
+  const name = typeof cmd.cmd === "string" ? cmd.cmd : "";
+  return MUTATING_GRAPH_EDIT_CMDS.has(name);
+}
+
 /** True when an error is a TRANSIENT transport/reconnect drop (the tab went away
  *  or was replaced), NOT a genuine command error or a live-but-frozen reply
  *  timeout. Deliberately EXCLUDES "did not reply within N ms" (a backgrounded/
@@ -1838,6 +1891,21 @@ export function makePanelToolCtx(
 
   const call = async (cmd: Record<string, unknown>, timeoutMs?: number): Promise<ToolResult> => {
     try {
+      // #436: a MUTATING graph edit must not fire into the "Connected: none"
+      // window a ComfyUI restart/reload opens. A read survives that window (it is
+      // parked mid-command and is retry-safe), but a mutating edit is NEITHER — so
+      // panel_graph_outline succeeds while the very next panel_add_node hits
+      // resolveTarget's momentarily-empty registry and fails with
+      // "no connected tab … Connected: none" (the flap). Await a stable binding
+      // BEFORE dispatch — nothing is sent during the wait, so there is no
+      // double-apply risk — exactly as workflow_open/save already do. This returns
+      // INSTANTLY for a healthy session and only waits in the zero-tab window; the
+      // read path (parking + retry-once below) is left exactly as-is. A wait that
+      // times out unreached still falls through to sendRouted, whose authoritative
+      // dispatched:false surfaces the actionable "nothing applied — rebind" message.
+      if (isMutatingGraphCmd(cmd)) {
+        await awaitReachable();
+      }
       ensureReachable();
       return ok(await sendRouted(cmd, timeoutMs));
     } catch (err) {
