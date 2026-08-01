@@ -1526,15 +1526,39 @@ export class UiBridge {
     );
   }
 
-  /** #570 P0 — DROP a tab's buffered deliveries (missed frames + render mailbox) without
-   *  sending them. Called by the orchestrator's identity-boundary reset on an UNPROVEN
-   *  workflow transition (a saved workflow overwritten in place, reconnecting under the same
-   *  wf:<path>): the buffered items belong to the PRIOR workflow, so replaying them into the
-   *  replacement would leak the prior conversation's say/session/stream + media. Runs BEFORE
-   *  the on-hello replay/flush (which is deferred until after onPanelMessage for this reason). */
+  /** #570 P0 — COMPLETE per-tab bridge reset: cancel/clear EVERY per-tab QUEUE that would
+   *  otherwise deliver or re-dispatch the PRIOR workflow's work after an UNPROVEN identity
+   *  transition (a saved workflow overwritten in place, reconnecting under the same
+   *  wf:<path>). Enumerate every per-tabId delivery/dispatch structure so no future queue is
+   *  forgotten:
+   *   - missedFrames  — buffered say/session/stream frames (replayed on hello);
+   *   - mailbox       — finished-render show_media (flushed on hello);
+   *   - awaitingReconnect — idempotent reads parked on a mid-command drop, which
+   *     resumeAwaitingReconnect() would re-dispatch onto the REPLACEMENT tab's socket and
+   *     deliver its graph/data back into the PRIOR workflow's still-running tool call.
+   *  Routing/lifecycle structures (conns, subscribers, migration aliases) are intentionally
+   *  NOT touched here — the socket stays; only queued WORK is dropped. Called by the
+   *  orchestrator's identity-boundary reset, and the bridge defers its on-hello
+   *  replay/flush/resume until AFTER onPanelMessage so this purge lands first. */
   dropQueuedDeliveries(tabId: string): void {
     this.missedFrames.delete(tabId);
     this.mailbox.delete(tabId);
+    const awaiting = this.awaitingReconnect.get(tabId);
+    if (awaiting) {
+      this.awaitingReconnect.delete(tabId);
+      for (const entry of awaiting) {
+        clearTimeout(entry.graceTimer);
+        try {
+          entry.ctx.reject(
+            new Error(
+              `panel tab ${tabId.slice(0, 8)} was replaced by a different workflow before its command ("${entry.ctx.command.cmd}") could resume — cancelled to avoid running it against the new workflow`,
+            ),
+          );
+        } catch {
+          // reject already settled — nothing to do
+        }
+      }
+    }
   }
 
   /** Deliver any buffered render frames to a tab that just (re)connected, plus a

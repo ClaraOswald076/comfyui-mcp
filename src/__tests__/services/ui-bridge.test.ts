@@ -573,6 +573,30 @@ describe("UiBridge (multi-tab)", () => {
     a2.close();
   });
 
+  it("dropQueuedDeliveries CANCELS a parked read so it is NOT re-dispatched onto a replacement (#570 P0)", async () => {
+    const a1 = await connectPanel("wf:foo.json");
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    // Workflow A has an idempotent read in flight (no autoReply → un-acked).
+    const promise = bridge.send({ cmd: "graph_get_errors" }, { tabId: "wf:foo.json", timeoutMs: 5000 });
+    await new Promise((r) => setTimeout(r, 50));
+    a1.close(); // socket drops mid-command → parked in awaitingReconnect
+    await new Promise((r) => setTimeout(r, 20));
+    // The workflow at that path is overwritten in place → the orchestrator's identity reset
+    // cancels the tab's queued work, incl. the parked read (so it can't run against B).
+    bridge.dropQueuedDeliveries("wf:foo.json");
+    // The parked read is REJECTED (cancelled), not left to resume.
+    await expect(promise).rejects.toThrow(/replaced by a different workflow|cancelled/);
+    // The replacement B reconnects under the SAME tab id and answers nothing for A: the
+    // resume must NOT re-dispatch A's old read onto B.
+    const b = await connectPanel();
+    const seen: Array<Record<string, unknown>> = [];
+    b.on("message", (buf) => seen.push(JSON.parse(buf.toString())));
+    b.send(JSON.stringify({ type: "hello", tab_id: "wf:foo.json", title: "workflow-b" }));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(seen.find((m) => m.cmd === "graph_get_errors")).toBeUndefined();
+    b.close();
+  });
+
   it("resumes a read addressed by tab-id PREFIX after reconnect (canonical key) (#450)", async () => {
     const a1 = await connectPanel("tab-aaaa-1111");
     await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
