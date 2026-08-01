@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { listRegisteredTools } from "../../tools/introspect.js";
@@ -40,6 +40,7 @@ const core = new Map<string, string>();
 const describeTool = (name: string): string => core.get(name) ?? panel.get(name) ?? "";
 
 const savedEnv: Record<string, string | undefined> = {};
+let workflowsDir: string | undefined;
 
 beforeAll(async () => {
   // Same isolation as registry-surface.test.ts: registerAllTools() ends by
@@ -49,16 +50,18 @@ beforeAll(async () => {
   for (const key of ["COMFYUI_WORKFLOWS_DIR", "COMFYUI_MCP_TOOL_MODE"]) {
     savedEnv[key] = process.env[key];
   }
-  process.env.COMFYUI_WORKFLOWS_DIR = await mkdtemp(join(tmpdir(), "comfyui-mcp-desc-"));
+  workflowsDir = await mkdtemp(join(tmpdir(), "comfyui-mcp-desc-"));
+  process.env.COMFYUI_WORKFLOWS_DIR = workflowsDir;
   delete process.env.COMFYUI_MCP_TOOL_MODE;
   for (const t of await listRegisteredTools()) core.set(t.name, t.description);
 });
 
-afterAll(() => {
+afterAll(async () => {
   for (const [key, value] of Object.entries(savedEnv)) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
+  if (workflowsDir) await rm(workflowsDir, { recursive: true, force: true });
 });
 
 /** The tools a model might reach for when asked to "look at the workflow". */
@@ -170,11 +173,13 @@ describe("graph-reading tool descriptions are distinguishable (#557)", () => {
   const NAMES_THE_CANVAS = /\bcanvas\b|currently viewing|\bopen graph\b|\blive graph\b/i;
   const OFFERS_TO_SHOW_IT =
     /\b(read|reads|show|shows|see|view|views|render|renders|display|describe|outline|dump|screenshot|look)\b/i;
-  // Wide enough to cover an opening PARAGRAPH, not just an opening sentence. At 140
-  // characters this selected exactly one tool while claiming whole-surface coverage:
-  // panel_screenshot's own "on the canvas" lands at character ~150. A ratchet that
-  // inspects one tool is not a ratchet, it is a green light.
-  const OPENING = 260;
+  // Wide enough to cover an opening PARAGRAPH, not an opening sentence. The window is
+  // the whole ballgame for a scan like this and it has been wrong twice: at 140 it
+  // selected a single tool while claiming whole-surface coverage, and at 260 it dropped
+  // panel_canvas the moment that description was reworded. Both times the test stayed
+  // GREEN, which is the failure mode — hence the non-vacuity guard below, which names
+  // the tools the window must still reach so shrinking it fails loudly instead.
+  const OPENING = 420;
 
   const claimants = (): string[] =>
     [...core, ...panel]
@@ -192,6 +197,8 @@ describe("graph-reading tool descriptions are distinguishable (#557)", () => {
       "panel_screenshot",
       "panel_view_nodes_in_viewport",
       "panel_find_nodes",
+      "panel_canvas",
+      "visualize_workflow",
     ]) {
       expect(inspected, `${known} must be inside the ratchet's window`).toContain(known);
     }
@@ -211,6 +218,7 @@ describe("graph-reading tool descriptions are distinguishable (#557)", () => {
     ["panel_run", "QUEUES the open workflow — the canvas is the input, not the output"],
     ["panel_get_workflow_target", "reads the agent's BINDING (current vs pinned), not the graph's contents"],
     ["panel_list_subgraphs", "lists library BLUEPRINTS; the canvas is only where you would drop one"],
+    ["panel_open_workflow", "SWITCHES the active tab; it mentions the canvas only to warn the tab may be stale"],
   ]);
 
   it("has no stale exemption (each exempted tool is still one the selector reaches)", () => {
