@@ -6,6 +6,7 @@ import {
   withPanelOpLock,
 } from "../services/panel-installer.js";
 import {
+  classifyPinWrite,
   evaluatePanelSync,
   performPanelSync,
   requiredPanelVersion,
@@ -97,50 +98,81 @@ export function registerInstallPanelTools(server: McpServer): void {
             );
           }
           // Serialized with panel mutations: a pin must not commit halfway
-          // through an in-flight install/update (see withPanelOpLock).
-          const pin = await withPanelOpLock(async () =>
-            setPanelVersionPin(target, reason),
-          );
+          // through an in-flight install/update (see withPanelOpLock). The
+          // RESOLVED state is read INSIDE the same critical section — reading it
+          // after releasing the lock let a concurrent pin/unpin land in between,
+          // so the response could describe a pin that was no longer the real one.
+          const { pin, resolved } = await withPanelOpLock(async () => {
+            const written = setPanelVersionPin(target, reason);
+            return { pin: written, resolved: getPanelPinState() };
+          });
+          // What actually governs is NOT necessarily what we just wrote:
+          // COMFYUI_MCP_PANEL_PIN takes precedence (so the saved pin can be inert,
+          // or the panel left unpinned outright by `=off`), and a concurrent write
+          // may have superseded ours. Reporting the write as protection without
+          // checking is the fabricated-success failure this feature exists to
+          // prevent, so each outcome is named distinctly.
+          const outcome = classifyPinWrite(resolved, pin.version);
+          // panelStatus is advisory here (it only supplies installedVersion for
+          // the message); the authoritative pin is `resolved`, captured above.
           const status = await panelStatus();
-          // The RESOLVED pin is what actually governs. A persisted pin is inert
-          // while COMFYUI_MCP_PANEL_PIN overrides it (notably `=off`), and
-          // telling the user they are protected when they are not is exactly the
-          // fabricated-success failure this feature exists to prevent.
-          const active = status.pin.pinned && status.pin.source === "settings";
           return json({
             action: "pin",
-            pin: status.pin,
-            active,
+            pin: resolved,
+            outcome,
+            /** Is the pin we just SAVED the one actually in force? */
+            active: outcome === "active",
             requestedVersion: pin.version,
             installedVersion: status.installedVersion,
             requiredPanelVersion: requiredPanelVersion(),
             // A pin records intent; it does NOT move the panel. Saying so
             // prevents "pinned to 0.11.20" being read as "now on 0.11.20".
-            note: active
-              ? `Pinned to ${pin.version}. This records intent only — it does NOT change ` +
-                `what is installed (currently ${status.installedVersion ?? "unknown"}). ` +
-                `install/update/reinstall/sync and the on-load auto-install will now ` +
-                `refuse until the pin is cleared with install_panel(action='unpin').`
-              : `WARNING — the pin was saved to disk but is NOT IN FORCE: the ` +
-                `${PANEL_PIN_ENV_VAR} environment variable overrides it (resolved state: ` +
-                `${describePanelPin(status.pin)}). You are NOT protected. Unset ` +
-                `${PANEL_PIN_ENV_VAR} in the environment / ~/.comfyui-mcp/.env and ` +
-                `restart the orchestrator for the saved pin to take effect.`,
+            note:
+              outcome === "active"
+                ? `Pinned to ${pin.version}. This records intent only — it does NOT change ` +
+                  `what is installed (currently ${status.installedVersion ?? "unknown"}). ` +
+                  `install/update/reinstall/sync and the on-load auto-install will now ` +
+                  `refuse until the pin is cleared with install_panel(action='unpin').`
+                : outcome === "env-overrides-with-pin"
+                  ? `Saved a pin at ${pin.version}, but it is NOT the pin in force: the ` +
+                    `${PANEL_PIN_ENV_VAR} environment variable takes precedence and the ` +
+                    `panel is ${describePanelPin(resolved)}. The panel IS protected — ` +
+                    `just at the env pin's version, not yours. Unset ${PANEL_PIN_ENV_VAR} ` +
+                    `and restart the orchestrator for the saved ${pin.version} to govern.`
+                  : outcome === "superseded"
+                    ? `Saved a pin at ${pin.version}, but another pin was written at the ` +
+                      `same time and won: the panel is ${describePanelPin(resolved)}. The ` +
+                      `panel IS pinned, just not at ${pin.version} — re-run the pin if you ` +
+                      `meant yours to stand.`
+                    : `WARNING — the pin was saved to disk but is NOT IN FORCE, and the ` +
+                      `panel is NOT protected: ${PANEL_PIN_ENV_VAR} is set to an explicit ` +
+                      `"no pin" value, which overrides the saved pin. ` +
+                      `install/update/reinstall/sync will still proceed. Unset ` +
+                      `${PANEL_PIN_ENV_VAR} in the environment / ~/.comfyui-mcp/.env and ` +
+                      `restart the orchestrator for the saved pin to take effect.`,
           });
         }
 
         if (action === "unpin") {
-          const removed = await withPanelOpLock(async () => clearPanelVersionPin());
-          const after = getPanelPinState();
+          // Same critical section as the pin path: the post-state is captured
+          // WITH the write, so a concurrent pin can't be misreported as ours.
+          const { removed, after } = await withPanelOpLock(async () => {
+            const gone = clearPanelVersionPin();
+            return { removed: gone, after: getPanelPinState() };
+          });
           return json({
             action: "unpin",
             removed: removed ?? null,
             pin: after,
             note: after.pinned
-              ? `The persisted pin was ${removed ? "removed" : "already absent"}, but a ` +
-                `pin is STILL in force via the ${PANEL_PIN_ENV_VAR} environment variable. ` +
-                `Unset ${PANEL_PIN_ENV_VAR} (or set it to 'off') in the environment / ` +
-                `~/.comfyui-mcp/.env and restart the orchestrator before syncing.`
+              ? after.source === "env"
+                ? `The persisted pin was ${removed ? "removed" : "already absent"}, but a ` +
+                  `pin is STILL in force via the ${PANEL_PIN_ENV_VAR} environment variable. ` +
+                  `Unset ${PANEL_PIN_ENV_VAR} (or set it to 'off') in the environment / ` +
+                  `~/.comfyui-mcp/.env and restart the orchestrator before syncing.`
+                : `The persisted pin was ${removed ? "removed" : "already absent"}, but the ` +
+                  `panel is pinned again: ${describePanelPin(after)}. Something wrote a new ` +
+                  `pin at the same time — re-run unpin if you still want it cleared.`
               : removed
                 ? `Pin removed (was ${removed.version}). install_panel(action='sync') can ` +
                   `now proceed.`

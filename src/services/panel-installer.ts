@@ -964,6 +964,14 @@ export interface PanelStatus {
    */
   shadows: PanelShadow[];
   /**
+   * #641 — the shadow scan could NOT be completed (custom_nodes was not
+   * enumerable). `shadows: []` then means "we did not find any" rather than
+   * "there are none", so callers must not read the empty array as an all-clear.
+   * Structural, not just prose in `note`: a consumer branching on
+   * `shadows.length` would otherwise treat an indeterminate scan as safe.
+   */
+  shadowInspectFailed?: boolean;
+  /**
    * The user's explicit version pin. While `pin.pinned` is true, install/update/
    * reinstall refuse and the on-load ensure skips — see the pin guard above.
    */
@@ -1031,6 +1039,7 @@ export async function panelStatus(
     isDevSymlink: detection.isDevSymlink,
     targetVersion: PANEL_VERSION,
     shadows,
+    shadowInspectFailed,
     pin,
     note: note + shadowNote + pinNote,
   };

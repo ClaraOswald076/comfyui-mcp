@@ -310,10 +310,17 @@ export function clearPanelVersionPin(): PanelVersionPin | undefined {
   const raw = settings.panelPin as unknown;
   // A malformed stored pin still gets removed; describe it as unreadable rather
   // than returning junk (or undefined, which callers render as "no pin existed").
-  const previous: PanelVersionPin =
+  // The version is validated too, not just the container: `{ version: null }`
+  // and `{ version: " " }` are OBJECTS, and returning them verbatim made unpin
+  // report "was null" / "was " for a pin that getPanelPinState called
+  // indeterminate — two parts of the system describing the same pin differently.
+  const rawVersion =
     raw && typeof raw === "object" && !Array.isArray(raw)
-      ? (raw as PanelVersionPin)
-      : { version: "(unreadable)" };
+      ? normalizePinVersion((raw as Partial<PanelVersionPin>).version)
+      : undefined;
+  const previous: PanelVersionPin = rawVersion
+    ? (raw as PanelVersionPin)
+    : { version: "(unreadable)" };
   delete settings.panelPin;
   write(settings);
   // Symmetrically verified: a "pin removed" we did not observe would leave the

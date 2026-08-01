@@ -16,6 +16,7 @@ vi.mock("../../config.js", () => ({
 }));
 
 import {
+  classifyPinWrite,
   evaluatePanelSync,
   performPanelSync,
   requiredPanelVersion,
@@ -59,6 +60,36 @@ describe("requiredPanelVersion", () => {
     // Derived from the orchestrator's own declared command minimums, so it can
     // never drift from the code that needs the newer panel.
     expect(requiredPanelVersion()).toBe(REQUIRED);
+  });
+});
+
+describe("classifyPinWrite — writing a pin is not the same as being pinned", () => {
+  it("reports 'active' only when the pin we saved is the one in force", () => {
+    expect(
+      classifyPinWrite({ pinned: true, version: "0.11.20", source: "settings" }, "0.11.20"),
+    ).toBe("active");
+  });
+
+  it("reports the env override when a DIFFERENT pin wins — still protected, not by ours", () => {
+    expect(
+      classifyPinWrite({ pinned: true, version: "0.9.9", source: "env" }, "0.11.20"),
+    ).toBe("env-overrides-with-pin");
+  });
+
+  it("reports 'superseded' when a concurrent write replaced our pin", () => {
+    // Ours is not the pin in force, so calling it active would describe a pin
+    // that isn't there.
+    expect(
+      classifyPinWrite({ pinned: true, version: "0.11.21", source: "settings" }, "0.11.20"),
+    ).toBe("superseded");
+  });
+
+  it("reports 'not-in-force' when COMFYUI_MCP_PANEL_PIN=off leaves nothing pinned", () => {
+    // The dangerous case: the write succeeded, so a naive tool would say
+    // "pinned" while update/sync remain allowed.
+    expect(classifyPinWrite({ pinned: false, source: "none" }, "0.11.20")).toBe(
+      "not-in-force",
+    );
   });
 });
 
@@ -223,6 +254,17 @@ describe("evaluatePanelSync — cases where we must not guess", () => {
     );
     expect(a.decision).toBe("blocked");
     expect(a.summary).toContain(".comfyui-agent-panel.bak-0.11.3");
+  });
+
+  it("a FAILED shadow scan → blocked, not a clear-to-sync empty array", () => {
+    // panelStatus reports `shadows: []` when it could not enumerate custom_nodes.
+    // Reading that as "no shadows" would sync onto an install we can't verify.
+    const a = evaluatePanelSync(
+      status({ installedVersion: "0.11.3", shadows: [], shadowInspectFailed: true }),
+      { requiredVersion: REQUIRED, orchestratorVersion: ORCH },
+    );
+    expect(a.decision).toBe("blocked");
+    expect(a.summary).toMatch(/could not enumerate/i);
   });
 
   it("a dev symlink → dev-install, never touched", () => {

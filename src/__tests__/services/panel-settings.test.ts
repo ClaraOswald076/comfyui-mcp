@@ -242,6 +242,21 @@ describe("panel version pin", () => {
     expect(getPanelPinState({})).toMatchObject({ pinned: true, indeterminate: true });
   });
 
+  it.each([
+    ["a null version", { version: null }],
+    ["a blank version", { version: "   " }],
+    ["a numeric version", { version: 11 }],
+    ["no version at all", { reason: "oops" }],
+  ])("clearing an object-shaped malformed pin (%s) reports it as unreadable", (_l, value) => {
+    // getPanelPinState calls these indeterminate; unpin must not then report
+    // "was null" / "was " — two parts of the system describing one pin differently.
+    mkdirSync(dirname(settingsPath), { recursive: true });
+    writeFileSync(settingsPath, JSON.stringify({ panelPin: value }));
+    expect(getPanelPinState({})).toMatchObject({ pinned: true, indeterminate: true });
+    expect(clearPanelVersionPin()?.version).toBe("(unreadable)");
+    expect(getPanelPinState({})).toEqual({ pinned: false, source: "none" });
+  });
+
   it("clearing removes a malformed FALSY pin instead of leaving the user stuck", () => {
     // `!previous` would have skipped the delete, leaving an indeterminate pin
     // in place forever while reporting "no pin was set".

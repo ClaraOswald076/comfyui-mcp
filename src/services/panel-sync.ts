@@ -73,6 +73,38 @@ export function requiredPanelVersion(): string {
   return best;
 }
 
+/**
+ * What a just-written persisted pin actually achieved. Writing the settings file
+ * is not the same as being pinned: `COMFYUI_MCP_PANEL_PIN` takes precedence, so
+ * the saved pin can be inert. Reporting the write as protection without checking
+ * would tell a user they are safe when they are not.
+ */
+export type PinWriteOutcome =
+  /** The pin we saved is the one in force. */
+  | "active"
+  /** An env pin wins: the panel IS pinned, but at the env pin's version. */
+  | "env-overrides-with-pin"
+  /** A concurrent write replaced ours: pinned from settings, at another version. */
+  | "superseded"
+  /** `COMFYUI_MCP_PANEL_PIN=off` (or similar): nothing is pinned at all. */
+  | "not-in-force";
+
+/**
+ * Classify what a pin WRITE achieved, given the pin state resolved immediately
+ * afterwards. `savedVersion` is required so a concurrent write that replaced
+ * ours is reported as `superseded` rather than as our pin being active — the
+ * response must describe the pin that is really in force, not the one we asked
+ * for.
+ */
+export function classifyPinWrite(
+  resolved: PanelPinState,
+  savedVersion: string,
+): PinWriteOutcome {
+  if (!resolved.pinned) return "not-in-force";
+  if (resolved.source === "env") return "env-overrides-with-pin";
+  return resolved.version === savedVersion ? "active" : "superseded";
+}
+
 export type PanelSyncDecision =
   /** Behind, nothing pinned, nothing ambiguous → sync is safe to run. */
   | "sync"
@@ -179,6 +211,23 @@ export function evaluatePanelSync(
         `Cannot determine whether the panel is version-pinned (${describePanelPin(pin)}), ` +
         `so nothing will be changed. Fix or remove the settings file, or set ` +
         `${PANEL_PIN_ENV_VAR}=off, then re-check.`,
+    };
+  }
+
+  // The shadow scan itself failed → `shadows: []` means "we didn't find any",
+  // NOT "there are none". Reading an empty array as an all-clear would let a
+  // served backup copy sit behind a "synced" claim, so an incomplete scan is
+  // blocked exactly like a found shadow.
+  if (status.shadowInspectFailed) {
+    return {
+      ...base,
+      decision: "blocked",
+      behind: false,
+      summary:
+        `Could not enumerate custom_nodes to check for shadow copies of the panel, so ` +
+        `it cannot be confirmed that the panel in the browser is the one on disk. NOT ` +
+        `syncing on an unverified install. Check custom_nodes is readable (a stray ` +
+        `".comfyui-agent-panel.bak-*" there would shadow the real panel), then re-check.`,
     };
   }
 

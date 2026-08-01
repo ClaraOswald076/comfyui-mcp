@@ -1260,6 +1260,31 @@ describe("panel version pin — the mutation choke point", () => {
     expect(s.pin).toMatchObject({ pinned: true, version: "0.11.3" });
     expect(s.note).toMatch(/unpin/i);
   });
+
+  it("panelStatus flags a FAILED shadow scan structurally, not just in the note", async () => {
+    // `shadows: []` from a scan that could not run means "we didn't find any",
+    // not "there are none". A consumer branching on shadows.length would read
+    // the empty array as an all-clear, so the uncertainty must be a field.
+    const dir = join(CUSTOM_NODES, "comfyui-mcp-panel");
+    const { deps } = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: ["comfyui-mcp-panel"],
+      files: { [join(dir, "pyproject.toml")]: pyproject(PANEL_REGISTRY_ID, "0.11.3") },
+    });
+    // Detection uses the fast path (direct pyproject read), so the panel still
+    // resolves; only the shadow enumeration fails.
+    const failing: PanelInstallerDeps = {
+      ...deps,
+      readdir: () => {
+        throw new Error("EACCES: permission denied, scandir");
+      },
+    };
+    const s = await panelStatus(failing);
+    expect(s.installed).toBe(true);
+    expect(s.shadows).toEqual([]);
+    expect(s.shadowInspectFailed).toBe(true);
+    expect(s.note).toMatch(/could not enumerate/i);
+  });
 });
 
 describe("panelStatus", () => {
