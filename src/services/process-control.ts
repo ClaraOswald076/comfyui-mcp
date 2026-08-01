@@ -1,5 +1,5 @@
 import { execSync, spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readlinkSync, statSync } from "node:fs";
 import { platform } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { getSystemStats, resetClient, resetObjectInfoCache } from "../comfyui/client.js";
@@ -20,6 +20,14 @@ interface ProcessInfo {
   argv: string[];
   isDesktopApp: boolean;
   desktopExePath?: string;
+  /**
+   * The live ComfyUI process's working directory, captured at gather-time while
+   * the process is still ALIVE (a known-good moment). Used to resolve a RELATIVE
+   * launch script (`python main.py`) to an absolute path so relaunch works
+   * regardless of the orchestrator's own cwd — and, crucially, still resolves
+   * after the stop kills the pid (when `/proc/<pid>/cwd` is gone) (#535).
+   */
+  liveCwd?: string;
 }
 
 interface StopResult {
@@ -549,7 +557,10 @@ function spawnFromProcessInfo(info: ProcessInfo): ChildProcess | null {
   return spawn(cmd.exe, cmd.args, {
     detached: true,
     stdio: "ignore",
-    cwd: config.comfyuiPath ?? undefined,
+    // Prefer the cwd the command resolved against (the live process cwd for a
+    // relative-script relaunch, #535); only then the configured install dir. A
+    // stale/nonexistent config.comfyuiPath as cwd would ENOENT the spawn.
+    cwd: cmd.cwd ?? config.comfyuiPath ?? undefined,
     shell: false,
     windowsHide: true,
   });
@@ -592,9 +603,33 @@ function resolveScriptAnchor(argv: string[]): string | undefined {
   return undefined;
 }
 
+/**
+ * The live process's own working directory — the most authoritative anchor for a
+ * RELATIVE launch script. A ComfyUI launched as `python main.py …` has argv[0] =
+ * `main.py` with no path root, an unset/stale COMFYUI_PATH gives no canonical base,
+ * and no absolute argv root exists — so every anchor in resolveScriptAnchor comes
+ * up empty and restart refuses, even though the reachable process's cwd points at a
+ * valid install containing main.py (#535). On Linux we read `/proc/<pid>/cwd`. This
+ * MUST be captured while the process is still alive (gatherProcessInfo) because the
+ * symlink vanishes the instant the pid is killed; other OSes have no cheap /proc
+ * equivalent and return undefined (the existing refuse-safe fallback still applies).
+ */
+let liveCwdResolverOverride: ((pid: number) => string | undefined) | null = null;
+
+function resolveLiveProcessCwd(pid: number): string | undefined {
+  if (liveCwdResolverOverride) return liveCwdResolverOverride(pid);
+  if (!pid || IS_WIN) return undefined;
+  try {
+    const cwd = readlinkSync(`/proc/${pid}/cwd`);
+    return cwd && isAbsolute(cwd) ? cwd : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function resolveLaunchCommand(
   info: ProcessInfo,
-): { exe: string; args: string[] } | null {
+): { exe: string; args: string[]; cwd?: string } | null {
   if (info.argv.length === 0) return null;
   const [first, ...rest] = info.argv;
   // Strip surrounding quotes a launcher may leave on the script path BEFORE the
@@ -630,13 +665,53 @@ function resolveLaunchCommand(
     // exists we keep the raw (possibly relative) script and let assessRelaunch's
     // refuse-safe preflight catch a truly unresolvable install.
     const anchor = resolveScriptAnchor(info.argv);
-    const script =
-      isAbsolute(firstUnquoted) || isWindowsAbsolute
-        ? firstUnquoted
+    const scriptIsAbsolute = isAbsolute(firstUnquoted) || isWindowsAbsolute;
+    // LIVE-CWD anchor (#535): before falling back to the canonical base, resolve a
+    // RELATIVE script against the running process's OWN cwd (captured live, so it
+    // survives the stop that kills the pid). Two hard requirements keep the stop
+    // refuse-safe and env-consistent:
+    //   1. Both the script AND the interpreter must be resolved from the SAME live
+    //      cwd — never pair a live-cwd script with a stale COMFYUI_PATH's python,
+    //      which would relaunch the live server under the wrong environment (codex
+    //      round-2 P1). So the interpreter is re-resolved with the live cwd as its
+    //      search root (finds that install's own venv/embedded python).
+    //   2. Both must be validated as REGULAR FILES (not just existsSync): a dir
+    //      named `main.py`, or a dir at the interpreter path, must NOT unlock a kill
+    //      we can't actually exec afterward (codex round-2 P1).
+    // Split into segments + re-join so a Windows `ComfyUI\main.py` normalizes to
+    // host-native separators on a POSIX host instead of a literal one-segment name.
+    const relSegments = firstUnquoted.split(/[\\/]/).filter(Boolean);
+    let liveCwdScript: string | undefined;
+    let liveCwdPython: string | undefined;
+    if (!scriptIsAbsolute && info.liveCwd && relSegments.length > 0) {
+      const candidateScript = join(info.liveCwd, ...relSegments);
+      const candidatePython = findComfyuiPython(info.liveCwd, info.argv);
+      const pythonIsAbsolute =
+        !!candidatePython &&
+        (isAbsolute(candidatePython) || /^[a-zA-Z]:[\\/]/.test(candidatePython));
+      if (
+        isRegularFile(candidateScript) &&
+        pythonIsAbsolute &&
+        isRegularFile(candidatePython)
+      ) {
+        liveCwdScript = candidateScript;
+        liveCwdPython = candidatePython;
+      }
+    }
+    const script = scriptIsAbsolute
+      ? firstUnquoted
+      : liveCwdScript
+        ? liveCwdScript
         : anchor
           ? join(anchor, scriptBasename)
           : firstUnquoted;
-    return { exe: python, args: [script, ...rest] };
+    // When the script was anchored to the LIVE cwd, use that install's OWN python
+    // and spawn FROM that cwd — never a stale/nonexistent config.comfyuiPath, which
+    // would ENOENT the spawn after the server was already killed (#535). Otherwise
+    // keep the existing interpreter + let the caller default cwd to comfyuiPath.
+    const exe = liveCwdScript ? liveCwdPython! : python;
+    const cwd = liveCwdScript ? info.liveCwd : undefined;
+    return { exe, args: [script, ...rest], cwd };
   }
   return { exe: first, args: rest };
 }
@@ -645,6 +720,22 @@ function fileExists(p: string | undefined): boolean {
   if (!p) return false;
   try {
     return existsSync(p);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Stricter than fileExists: the path must be a REGULAR FILE, not a directory.
+ * Used to unlock the atomic live-cwd relaunch (#535) — a directory named
+ * `main.py`, or a directory at the interpreter path, exists per existsSync yet
+ * cannot be exec'd, so validating it as a file keeps the stop refuse-safe. NOT a
+ * drop-in for fileExists elsewhere: a macOS `.app` bundle is a directory.
+ */
+function isRegularFile(p: string | undefined): boolean {
+  if (!p) return false;
+  try {
+    return statSync(p).isFile();
   } catch {
     return false;
   }
@@ -889,8 +980,18 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
 
   const desktop = isDesktopApp(argv);
   const desktopExe = desktop ? findDesktopExePath(argv) : undefined;
+  // Capture the live process cwd NOW, while the pid is guaranteed alive — the
+  // `/proc/<pid>/cwd` symlink is gone the instant a later stop kills it (#535).
+  const liveCwd = desktop ? undefined : resolveLiveProcessCwd(pid);
 
-  return { pid, port, argv, isDesktopApp: desktop, desktopExePath: desktopExe };
+  return {
+    pid,
+    port,
+    argv,
+    isDesktopApp: desktop,
+    desktopExePath: desktopExe,
+    liveCwd,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1400,6 +1501,12 @@ export const __processControlTestHooks = {
     supervisorWindowStartedAt = 0;
     supervisorGaveUp = false;
     remoteRebootTimingOverride = null;
+    liveCwdResolverOverride = null;
+  },
+  /** Inject a fake live-process-cwd resolver (#535) so tests can drive the
+   *  `/proc/<pid>/cwd` relative-script anchor without a real process/filesystem. */
+  setLiveCwdResolver(fn: ((pid: number) => string | undefined) | null): void {
+    liveCwdResolverOverride = fn;
   },
   setLastProcessInfo(info: ProcessInfo): void {
     lastProcessInfo = info;
