@@ -36,6 +36,11 @@ import { comfyuiFetch } from "../comfyui/fetch.js";
 interface MonitorState {
   connected: boolean;
   runningPromptId: string | null;
+  // Prompt ids of the PENDING (queued, not yet running) tasks, from GET /queue's
+  // queue_pending. Enables per-item self-attribution: a backlog is only the agent's
+  // own batch when the running job AND every pending job are ids we queued (#559).
+  // Best-effort (poll-derived); empty when the poll hasn't populated it.
+  pendingPromptIds: string[];
   currentNode: string | null;
   progressValue: number | null;
   progressMax: number | null;
@@ -78,6 +83,10 @@ export interface StallReport {
   /** More than one task in flight (running + pending) — a backlog the agent may
    *  not realize it created by re-queuing behind a slow job. */
   backlog: boolean;
+  /** True when the in-flight work is attributable to THIS session (a prompt id we
+   *  queued, or a very recent self-queue) — a deliberate batch, not a foreign or
+   *  stuck job. The backlog warning is suppressed in that case (#559). */
+  selfAttributed: boolean;
   runningPromptId: string | null;
   currentNode: string | null;
   /** running + pending, from ComfyUI's own queue_remaining. */
@@ -100,9 +109,18 @@ export interface QueueSnapshot {
   progressMax: number | null;
   /** The most recent completed run (sticky; null until one completes). */
   lastCompleted: CompletionEvent | null;
+  /** True when the in-flight work is attributable to THIS session (#559). */
+  selfAttributed: boolean;
 }
 
 const RECONNECT_MS = 5000;
+// How long after a self-queue (panel_run) the in-flight work is still treated as
+// this session's own batch when the running prompt id can't be matched directly
+// (e.g. the panel reply carried no prompt_id). A sweep of a dozen renders at tens
+// of seconds each drains well inside this, so a deliberate batch never trips the
+// backlog warning; a genuinely foreign job appearing long after our last queue
+// still surfaces (#559).
+const SELF_QUEUE_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 // /history tail entries fetched per poll. Wide enough that a realistic burst
 // of sub-second runs between 1 Hz polls stays inside the window; when a diff
 // still saturates it (every entry new), we log the potential gap instead of
@@ -130,6 +148,7 @@ class QueueMonitorImpl {
   private state: MonitorState = {
     connected: false,
     runningPromptId: null,
+    pendingPromptIds: [],
     currentNode: null,
     progressValue: null,
     progressMax: null,
@@ -158,6 +177,13 @@ class QueueMonitorImpl {
   private completedReported = new Set<string>();
   // Completions not yet drained by the broadcaster. Bounded.
   private pendingCompletions: CompletionEvent[] = [];
+  // ---- self-attribution for the backlog warning (#559) ----
+  // Prompt ids THIS orchestrator queued via panel_run, plus the ms timestamp of
+  // the most recent self-queue. A backlog made entirely of the agent's own recent
+  // jobs is an EXPECTED batch (a sweep/comparison), not evidence of a wedge, so it
+  // must not trigger the destructive "cancel_job clear_pending" remedy.
+  private selfQueuedIds = new Set<string>();
+  private lastSelfQueueTs: number | null = null;
 
   /** Open the watchdog WS to ComfyUI. Idempotent per-URL; best-effort (never
    *  throws). A retarget (new URL) or a prior stop() must re-open the socket:
@@ -180,6 +206,10 @@ class QueueMonitorImpl {
     this.completedReported.clear();
     this.pendingCompletions.length = 0;
     this.state.lastCompleted = null;
+    // Self-queued prompt ids belong to the OLD target — a fresh ComfyUI's jobs are
+    // foreign to us until we queue them, so drop the attribution (#559).
+    this.selfQueuedIds.clear();
+    this.lastSelfQueueTs = null;
     // Liveness heartbeats belong to the OLD target — reset so a fresh target's
     // stall clock doesn't inherit a stale "alive" (or a stale "dark") reading.
     this.state.lastFrameTs = null;
@@ -222,6 +252,62 @@ class QueueMonitorImpl {
   /** Is a generation currently in flight (edge-tracked)? */
   isBusy(): boolean {
     return this.busy;
+  }
+
+  /** Record a prompt THIS orchestrator just queued (panel_run), so the backlog
+   *  warning can tell the agent's own deliberate batch from a foreign or stuck
+   *  job (#559). `promptId` may be null when the panel reply carried none — the
+   *  timestamp alone still marks a recent self-queue. Never throws. */
+  markSelfQueued(promptId?: string | null): void {
+    this.lastSelfQueueTs = Date.now();
+    if (typeof promptId === "string" && promptId) {
+      this.selfQueuedIds.add(promptId);
+      // Bounded FIFO — Set iterates in insertion order, so drop the oldest.
+      while (this.selfQueuedIds.size > 200) {
+        const oldest = this.selfQueuedIds.values().next().value;
+        if (oldest === undefined) break;
+        this.selfQueuedIds.delete(oldest);
+      }
+    }
+  }
+
+  /** True when the ENTIRE in-flight queue is attributable to this session — i.e.
+   *  every visible prompt (the running one plus every pending one) is an id we
+   *  queued. That is the only safe basis for suppressing the backlog warning: a
+   *  single foreign job (running OR pending) means the queue is NOT purely our own
+   *  batch and the agent should still be told (#559).
+   *
+   *  Precise id-matching is used whenever we have ANY recorded self-queued id AND
+   *  there is at least one identifiable in-flight prompt. Only when we have no ids
+   *  to match against (the panel reply never carried a prompt_id) OR nothing is yet
+   *  identifiable do we fall back to the coarse "did we self-queue very recently"
+   *  heuristic — so a recent self-queue can NOT mask a job whose id we can see is
+   *  not ours. */
+  private isSelfAttributed(): boolean {
+    const inFlight: string[] = [];
+    if (this.state.runningPromptId) inFlight.push(this.state.runningPromptId);
+    inFlight.push(...this.state.pendingPromptIds);
+    const recentSelfQueue =
+      this.lastSelfQueueTs != null && Date.now() - this.lastSelfQueueTs < SELF_QUEUE_WINDOW_MS;
+
+    if (this.selfQueuedIds.size > 0 && inFlight.length > 0) {
+      // We receive a prompt id for every job we queue, so any VISIBLE in-flight id
+      // that isn't one of ours is definitively a foreign job → not our batch.
+      if (inFlight.some((id) => !this.selfQueuedIds.has(id))) return false;
+      // Every VISIBLE in-flight job is ours. The pending ids are poll-derived and can
+      // lag a rapid burst of queues, so queueRemaining (updated live by status frames)
+      // may exceed what we've captured. If the poll has fully accounted for the depth,
+      // the whole queue is provably ours; if some items aren't captured yet, only
+      // treat them as ours when we self-queued recently (the reported case — queuing a
+      // batch faster than the 1 Hz poll). A stale unseen item with NO recent self-queue
+      // is treated as possibly-foreign so the warning still fires.
+      const depth = Math.max(inFlight.length, Math.max(0, this.state.queueRemaining));
+      if (inFlight.length >= depth) return true;
+      return recentSelfQueue;
+    }
+    // No ids to match against (the panel never surfaced one) or nothing identifiable
+    // in flight yet → fall back to the coarse recent-self-queue timestamp.
+    return recentSelfQueue;
   }
 
   stop(): void {
@@ -354,6 +440,7 @@ class QueueMonitorImpl {
           // progress frames would otherwise never clear — drain it here.
           if (qr === 0) {
             if (this.state.runningPromptId !== null) this.clearRunning();
+            this.state.pendingPromptIds = []; // fully idle — no pending work
             this.emitEndIfIdle();
           }
         }
@@ -531,6 +618,11 @@ class QueueMonitorImpl {
     const running = Array.isArray(q.queue_running) ? q.queue_running : [];
     const pending = Array.isArray(q.queue_pending) ? q.queue_pending : [];
     this.state.queueRemaining = running.length + pending.length;
+    // queue_pending entries are [number, prompt_id, prompt, extra, outputs] too —
+    // record their ids for per-item self-attribution (#559).
+    this.state.pendingPromptIds = pending
+      .map((entry) => (Array.isArray(entry) && typeof entry[1] === "string" ? entry[1] : null))
+      .filter((id): id is string => id !== null);
     // queue_running entries are [number, prompt_id, prompt, extra, outputs] —
     // the ONLY place a passive observer learns WHICH prompt runs on 0.28.
     const first = running[0];
@@ -633,6 +725,7 @@ class QueueMonitorImpl {
       progressValue: this.state.progressValue,
       progressMax: this.state.progressMax,
       lastCompleted: this.state.lastCompleted,
+      selfAttributed: this.isSelfAttributed(),
     };
   }
 
@@ -671,6 +764,7 @@ class QueueMonitorImpl {
     return {
       stalled,
       backlog: queueDepth > 1,
+      selfAttributed: this.isSelfAttributed(),
       runningPromptId: this.state.runningPromptId,
       currentNode: this.state.currentNode,
       queueDepth,

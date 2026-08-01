@@ -1860,6 +1860,74 @@ function reconstructUiFromState(reply: unknown): Record<string, unknown> | null 
   return { nodes: uiNodes, links } as unknown as Record<string, unknown>;
 }
 
+/**
+ * Core ComfyUI node types whose PRIMARY content is drawn by a DOM OVERLAY widget
+ * positioned over the LiteGraph canvas — NOT painted onto the canvas itself. A
+ * canvas capture (panel_screenshot / graph_screenshot) therefore shows their body
+ * EMPTY even though the content is present in the graph. Flagging them in the tool
+ * result stops an agent from concluding the node is blank and "fixing" a
+ * non-existent problem (#567).
+ *
+ * Kept deliberately narrow (the confirmed reproducer) to avoid false positives.
+ * Custom DOM widgets contributed by node packs (preview/image/video/HTML widgets)
+ * are NOT enumerable from the orchestrator, and the faithful fix — compositing the
+ * live DOM overlay into the capture — is a browser/panel-side change. This
+ * annotation is the cheap, always-correct half that protects the agent's reasoning.
+ */
+const DOM_OVERLAY_NODE_TYPES = new Set<string>(["MarkdownNote"]);
+
+/** Best-effort: serialize the live graph and return the nodes whose content a
+ *  canvas capture misses (DOM-overlay widgets, per DOM_OVERLAY_NODE_TYPES). Never
+ *  throws and never rejects — returns [] on any failure so panel_screenshot still
+ *  returns its image; the note is a bonus, not a dependency. */
+async function domOverlayNodesInView(
+  ctx: PanelToolCtx,
+): Promise<Array<{ id: unknown; type: string }>> {
+  try {
+    const target = ctx.workflowTarget?.get(ctx.tabId);
+    const cmd = target
+      ? withWorkflowTarget({ cmd: "graph_serialize" }, target)
+      : { cmd: "graph_serialize" };
+    const reply = (await ctx.bridge.send(cmd as { cmd: string }, {
+      tabId: ctx.tabId,
+      timeoutMs: 5000,
+    })) as { nodes?: unknown[] } | null;
+    const nodes = reply?.nodes;
+    if (!Array.isArray(nodes)) return [];
+    const hits: Array<{ id: unknown; type: string }> = [];
+    for (const raw of nodes) {
+      const n = raw as { id?: unknown; type?: unknown };
+      if (typeof n?.type === "string" && DOM_OVERLAY_NODE_TYPES.has(n.type)) {
+        hits.push({ id: n.id, type: n.type });
+      }
+    }
+    return hits;
+  } catch {
+    return [];
+  }
+}
+
+/** Compose the "these nodes appear empty in the capture" note (#567), or "" when
+ *  no DOM-overlay nodes are in view. Exported for tests. */
+export function domOverlayScreenshotNote(nodes: Array<{ id: unknown; type: string }>): string {
+  if (!nodes.length) return "";
+  const list = nodes
+    .map((n) => `${n.type}${n.id != null ? ` #${n.id}` : ""}`)
+    .join(", ");
+  const ids = nodes
+    .map((n) => n.id)
+    .filter((id): id is number => typeof id === "number");
+  const readHint = ids.length
+    ? ` Read their text with panel_query_graph {ids:[${ids.join(", ")}], fields:'detail'}.`
+    : " Read their text with panel_query_graph (fields:'detail').";
+  return (
+    `note: this workflow contains ${nodes.length} node(s) (${list}) whose content is drawn by a ` +
+    `DOM overlay widget that a canvas capture like this screenshot cannot render — such a node shows ` +
+    `an EMPTY body in the PNG even though its content IS present in the graph.${readHint} If a node ` +
+    `looks blank here, do NOT treat it as missing content or "fix" it.`
+  );
+}
+
 async function resolveWorkflowInput(
   args: Record<string, unknown>,
   ctx: PanelToolCtx,
@@ -2688,17 +2756,43 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // gets the anti-poll note below.
         const rejection = detectRunRejection(res);
         if (rejection) return rejection;
+        // Attribute this genuine queue to ourselves so a later panel_run in the
+        // same batch recognizes the in-flight job as our own and doesn't false-warn
+        // (#559). The panel forwards ComfyUI's /prompt reply, which carries the
+        // prompt_id; when it doesn't, the timestamp still marks a recent self-queue.
+        const queuedId = ((): string | null => {
+          const parsed = parseToolResultJson(res);
+          const pid = parsed?.prompt_id;
+          return typeof pid === "string" && pid ? pid : null;
+        })();
+        QueueMonitor.markSelfQueued(queuedId);
         // Append anti-poll guidance: the agent should go idle after queuing so the
         // executed event auto-injects the output image, rather than busy-polling.
         const note =
           "\n\n[IMPORTANT] You will be notified automatically with the output image(s)/video when the render finishes — do NOT poll get_queue, get_history, or list_output_images. Just end your turn now and wait for the result to be delivered to you.";
+        // Backpressure note. A backlog is only alarming when it's a job we did NOT
+        // queue (possibly foreign/stuck). Deliberately batching renders — a sweep,
+        // a multi-variant comparison — is a NORMAL workflow, so a queue made of our
+        // own recent jobs is reported NEUTRALLY, never paired with the destructive
+        // clear_pending remedy that would wipe the user's whole batch (#559). A
+        // genuinely stalled render is caught by the turn-start stall notice, which
+        // does the staleness gating and keeps the interrupt guidance.
         let warn = "";
         if (pre.connected && pre.running) {
-          const morePending = pre.queueDepth > 1 ? ` plus ${pre.queueDepth - 1} already pending` : "";
-          warn =
-            `\n\n[QUEUE WARNING] A render is ALREADY RUNNING${pre.runningPromptId ? ` (prompt ${pre.runningPromptId})` : ""}${morePending} — ` +
-            `this new run is QUEUED BEHIND it and will not start until that finishes. If the running one looks stuck, do NOT keep queuing: ` +
-            `call cancel_job with clear_pending:true (it interrupts the running job AND drops pending), then escalate to restart_comfyui if it reports the job wedged.`;
+          const pending = Math.max(0, pre.queueDepth - 1);
+          const pendingTxt = pending > 0 ? ` + ${pending} pending` : "";
+          if (pre.selfAttributed) {
+            warn =
+              `\n\n[QUEUE] Queued behind your own in-flight render(s) (1 running${pendingTxt}). ` +
+              `This is normal when batching a sweep or comparison — they drain in order and nothing is stuck; ` +
+              `each result is delivered to you as it finishes. To drop a single pending item, use cancel_queued_job. ` +
+              `Only use cancel_job with clear_pending:true if a render is ACTUALLY wedged — it kills the running job AND your entire queue.`;
+          } else {
+            warn =
+              `\n\n[QUEUE] A render is already running${pre.runningPromptId ? ` (prompt ${pre.runningPromptId})` : ""}${pendingTxt}, ` +
+              `and the queue includes work this session didn't queue — your run is queued behind it. Inspect with get_queue before acting. ` +
+              `If the running job is genuinely stuck, cancel_job with clear_pending:true interrupts it AND drops pending, then escalate to restart_comfyui if it reports the job wedged.`;
+          }
         }
         if (res.content?.[0]?.type === "text") {
           return {
@@ -3616,7 +3710,18 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             mimeType?: string;
           };
           if (!res?.image) return fail("screenshot returned no image");
-          return { content: [{ type: "image", data: res.image, mimeType: res.mimeType ?? "image/png" }] };
+          const content: Array<
+            | { type: "image"; data: string; mimeType: string }
+            | { type: "text"; text: string }
+          > = [{ type: "image", data: res.image, mimeType: res.mimeType ?? "image/png" }];
+          // A canvas capture cannot show DOM-overlay widget content (MarkdownNote
+          // text renders as an empty body) — flag any such node in view so the
+          // agent doesn't read the blank body as missing content (#567). Best-effort:
+          // the note is skipped silently if the graph can't be serialized.
+          const overlayNodes = await domOverlayNodesInView(ctx);
+          const overlayNote = domOverlayScreenshotNote(overlayNodes);
+          if (overlayNote) content.push({ type: "text", text: overlayNote });
+          return { content };
         } catch (err) {
           return fail(err);
         }
