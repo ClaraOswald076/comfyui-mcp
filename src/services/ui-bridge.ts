@@ -119,7 +119,15 @@ interface Conn {
    *  does not match the active canvas. When false (an OLD panel that would silently ignore the
    *  stamp), the send() preflight FAILS CLOSED for MUTATING graph commands so a stale write
    *  can't hit the wrong canvas — reads stay allowed. Re-read from every hello (a reconnect may
-   *  be a freshly updated build), never inherited. */
+   *  be a freshly updated build), never inherited.
+   *
+   *  SCOPE (deliberate): this is ACCIDENTAL version-skew protection — an HONEST old panel gets
+   *  read-only graph access until it updates, so a stale in-flight edit can't silently corrupt
+   *  the wrong workflow after a switch. It is NOT a security boundary: the flag is client-
+   *  asserted and the uuid is client-supplied, so a user who MODIFIES their own local panel can
+   *  trivially spoof both. That is a self-attack (their own workflow A leaking into their own
+   *  workflow B) crossing no privacy boundary, so attestation would buy nothing — #570's real
+   *  threat is ACCIDENTAL cross-workflow confusion for an honest user, which this closes. */
   enforcesWorkflowStamp: boolean;
   /** Commands THIS connection has already proven it doesn't support, via a real
    *  "Unknown command" reply earlier in the session (#236). Once a cmd lands
@@ -394,27 +402,37 @@ export function isMutatingGraphCommand(cmdName: string): boolean {
   return cmdName.startsWith("graph_") && !BRIDGE_READONLY_CMDS.has(cmdName);
 }
 
-/** #570 P0c — the ACTIVE-workflow save/save_as/rename/close commands, but ONLY when they carry
- *  no explicit `path` (so they act on whatever workflow is CURRENTLY active). A stale one of
- *  these, delivered after the user switches workflows, would hit the NEW active workflow —
- *  workflow_close even discards its unsaved work. An explicit `path` names a DETERMINISTIC
- *  target, so it is not a switch-race victim and is left ungated. */
-const ACTIVE_WORKFLOW_MUTATORS = new Set<string>([
-  "workflow_save",
-  "workflow_save_as",
-  "workflow_rename",
-  "workflow_close",
-]);
+/** #570 P0c — workflow mutators that ALWAYS act on the active workflow: their panel executors
+ *  take only `{ name }` and ignore any `path`, so a `path` on them is meaningless and never
+ *  makes them deterministic. Always gated. */
+const ALWAYS_ACTIVE_WORKFLOW_MUTATORS = new Set<string>(["workflow_save", "workflow_save_as"]);
+
+/** #570 P0c — workflow mutators that target an EXPLICIT `path` when given a real one, else the
+ *  active workflow (`path ? target : activeWorkflow` in the panel). A stale one of these,
+ *  delivered after the user switches workflows, would hit the NEW active workflow —
+ *  workflow_close even discards its unsaved work — UNLESS it names a deterministic path. */
+const PATH_TARGETABLE_WORKFLOW_MUTATORS = new Set<string>(["workflow_rename", "workflow_close"]);
 
 /** #570 P0c — commands that MUTATE the currently-active workflow/canvas and must therefore be
- *  fenced to the workflow they were issued for. Fail closed for these unless the connected
- *  panel enforces the per-command workflow stamp (`workflow_open`/`workflow_new` are
- *  navigation/creation with deterministic or new targets — not active-content mutations — so
- *  they are excluded). Takes the full command so it can read the `path` discriminator. */
+ *  fenced to the workflow they were issued for. Fail closed for these unless the connected panel
+ *  enforces the per-command workflow stamp (`workflow_open`/`workflow_new` are navigation/creation
+ *  with deterministic or new targets — not active-content mutations — so they are excluded).
+ *
+ *  A `path` counts as an EXPLICIT deterministic target ONLY when it is a NON-EMPTY TRIMMED string.
+ *  The panel executors treat `path:""` / whitespace as falsy → the ACTIVE workflow (codex), and
+ *  the tool schemas allow `path:""`, so an empty/whitespace path is a switch-race victim and MUST
+ *  be gated — never let `path !== undefined` alone wave a mutation past the fence. Takes the full
+ *  command so it can read the `path` discriminator. */
 export function requiresWorkflowStampEnforcement(cmd: { cmd?: unknown; path?: unknown }): boolean {
   const name = typeof cmd.cmd === "string" ? cmd.cmd : "";
   if (isMutatingGraphCommand(name)) return true;
-  return ACTIVE_WORKFLOW_MUTATORS.has(name) && cmd.path === undefined;
+  if (ALWAYS_ACTIVE_WORKFLOW_MUTATORS.has(name)) return true;
+  if (PATH_TARGETABLE_WORKFLOW_MUTATORS.has(name)) {
+    const path = (cmd as { path?: unknown }).path;
+    const hasExplicitPath = typeof path === "string" && path.trim().length > 0;
+    return !hasExplicitPath; // absent / "" / whitespace ⇒ active workflow ⇒ must be gated
+  }
+  return false;
 }
 
 /** Tight default reply timeout for a MUTATING command with no explicit timeout —
@@ -1801,6 +1819,12 @@ export class UiBridge {
     // resolvable identity (missing/malformed uuid, relay client), the frame ships UNSTAMPED and
     // the panel's fence has nothing to compare, so a stale mutation after a switch would run
     // unfenced despite the "enforces" claim. No stamp ⇒ nothing to fence ⇒ refuse the mutation.
+    //
+    // NOTE — this gate is ACCIDENTAL version-skew protection (honest old panel ⇒ read-only graph
+    // until updated), NOT a security boundary: the enforcement flag and the uuid are both client-
+    // supplied, so a user who modifies their OWN panel can spoof them — but that only leaks their
+    // own workflow into their own workflow (self-attack, no privacy boundary). See the
+    // enforcesWorkflowStamp field doc. Deliberately no attestation.
     if (requiresWorkflowStampEnforcement(cmd)) {
       const stamp = this.resolveTabWorkflowUuid?.(opts.tabId ?? conn.tabId);
       const hasTrustedStamp = typeof stamp === "string" && stamp.length > 0;
