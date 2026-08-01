@@ -6,6 +6,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.25] - 2026-08-01
+
+### Added
+- **`panel_resize_node` sets a node's width/height on the live canvas (#530)** — so an unreadable Note/MarkdownNote can be resized (prefers `setSize()` so min-clamping nodes reflow, undo-enveloped). Also documents driving the LTXDirector timeline via `set_widget` (#314).
+
+### Fixed
+- **Remote CivitAI/Manager downloads warn when the URL is authentication-gated, and the auth-gate probe never leaks a credential (#473).** A model install dispatched to a remote ComfyUI-Manager (which fetches the URL server-side, unauthenticated) can land a login/HTML page as a `.safetensors`; the tool now runs a non-blocking credential-flip probe and surfaces a loud warning when the URL is provably auth-gated. The probe is credential-safe: HF/CivitAI tokens are gated on the **parsed hostname** (never a substring, so `evil.example?ref=huggingface.co` gets nothing) on both the remote-probe and local streaming paths, and all auth headers are stripped on the first cross-origin redirect hop. *(Hardened across a 3-round independent adversarial review that caught and closed three distinct credential-leak vectors.)*
+- **Panel tab binding recovers after a restart/reload (#400, #402, #474).** `panel_restart_comfyui` awaits the tab reconnect before returning (`ready` now means graph-tools-ready, not a tabless window); open/save await a stable binding pre-send and refuse rather than fire into a dead binding; the session reconnects on every soft-reload path (no more connected-chip/dead-bridge wedge).
+- **Nested-subgraph run + safe bypass (#411, #409).** `panel_run` can target an output node inside a nested subgraph (outermost-first `partial_execution_targets` path), and `panel_set_node_mode` refuses an unsafe positional bypass of a multi-input subgraph unless `force:true`.
+
 ## [0.48.24] - 2026-08-01
 
 ### MCP
