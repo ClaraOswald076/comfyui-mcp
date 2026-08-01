@@ -28,7 +28,7 @@ export function registerNodeDevTools(server: McpServer): void {
       "<COMFYUI_PATH>/custom_nodes/<pack>/ (read-only). Skips .git/, " +
       "__pycache__/ and node_modules/. Use this to orient before read_node_file / " +
       "search_node_packs when diagnosing or editing a pack you found via " +
-      "bisect_* or fix_custom_node. LOCAL-ONLY (requires COMFYUI_PATH); the pack " +
+      "bisect or fix_custom_node. LOCAL-ONLY (requires COMFYUI_PATH); the pack " +
       "name and every returned path are jailed to custom_nodes/.",
     {
       pack: z

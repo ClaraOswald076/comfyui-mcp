@@ -94,6 +94,11 @@ const SELF = new Set([
   "src/tools/vocabulary.ts",
   "scripts/check-tool-vocabulary.mts",
   "src/__tests__/tools/vocabulary.test.ts",
+  // Asserts, as FIXTURES, that the five retired bisect_* names are in DEAD_NAMES
+  // (0.49.0 slice 1). Like vocabulary.test.ts above, it necessarily spells the dead
+  // names it checks — they are data under assertion, not an instruction to a model
+  // to call anything. Exact path, never an __tests__/ glob (see the note above).
+  "src/__tests__/tools/node-bisect-tool.test.ts",
   // Generated FROM the ledger by scripts/export-vocabulary.mts, so it reproduces
   // the dead names as data for the panel to consume. Caught this gate out a second
   // time, in the same way as the first: green while untracked, red once committed.

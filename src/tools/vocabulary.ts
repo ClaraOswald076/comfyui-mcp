@@ -121,11 +121,7 @@ export const TOOL_NAMES = [
   "save_node_snapshot",
   "restore_node_snapshot",
   "list_node_snapshots",
-  "bisect_start",
-  "bisect_good",
-  "bisect_bad",
-  "bisect_reset",
-  "bisect_status",
+  "bisect",
   "install_custom_node",
   "update_custom_node",
   "reinstall_custom_node",
@@ -239,8 +235,10 @@ export type ToolName = (typeof TOOL_NAMES)[number];
  * Forgetting is a build failure, not a silent hole, and the baseline never needs
  * updating — it is history, not state.
  *
- * Read from docs/design/tool-surface.txt so there is exactly one copy of the 182
- * names, and so the file committed as the P0 evidence is load-bearing rather than
+ * Read from docs/design/tool-surface.txt so there is exactly one copy of the
+ * baseline names (183: the 182 frozen at 0.48.32 plus `bisect`, appended when the
+ * five bisect_* tools consolidated into it in 0.49.0), and so the file committed
+ * as the P0 evidence is load-bearing rather than
  * decorative.
  */
 const BASELINE_URL = new URL("../../docs/design/tool-surface.txt", import.meta.url);
@@ -258,7 +256,7 @@ const BASELINE_URL = new URL("../../docs/design/tool-surface.txt", import.meta.u
  * 200-line rename. APPENDING is legitimate — new tools join the baseline when they
  * ship — so the workflow is: append, update this hash, say why in the message.
  */
-export const BASELINE_SHA256 = "565ca62fff0ade4fbacc1d70500fd1fd567ed1c93ec48c01ab5a77b3ea045fba";
+export const BASELINE_SHA256 = "a3c60bfe90ec74024773c7dd9079ba4d17189b23918a00e09f5d4483350ede5a";
 
 /**
  * LAZY on purpose, and this is not a micro-optimisation.
@@ -332,7 +330,7 @@ export function panelBaselineIntegrity(): { ok: boolean; actual: string } {
  * to the surface. That is the ratchet: not that it cannot rise, but that it cannot
  * rise silently.
  */
-export const MAX_TOOLS = 182;
+export const MAX_TOOLS = 178;
 
 /** Where this is headed, for reference in review. A goal, not enforced. */
 export const TOOL_BUDGET_TARGET = 30;
@@ -400,6 +398,34 @@ export function deadNameRe(name: string): RegExp {
  * entry documents the two mentions in this repo that are correct.
  */
 export const DEAD_NAMES: readonly DeadName[] = [
+  // 0.49.0 slice 1: the five bisect_* tools folded into one action-parameterized
+  // `bisect` tool. Same state machine, same return shapes — only the surface
+  // changed, so every mention of the old names is now rot pointing at a 404.
+  {
+    name: "bisect_start",
+    since: "0.49.0",
+    replacement: 'bisect (action:"start")',
+  },
+  {
+    name: "bisect_good",
+    since: "0.49.0",
+    replacement: 'bisect (action:"good")',
+  },
+  {
+    name: "bisect_bad",
+    since: "0.49.0",
+    replacement: 'bisect (action:"bad")',
+  },
+  {
+    name: "bisect_reset",
+    since: "0.49.0",
+    replacement: 'bisect (action:"reset")',
+  },
+  {
+    name: "bisect_status",
+    since: "0.49.0",
+    replacement: 'bisect (action:"status")',
+  },
   {
     name: "panel_view_errored_nodes",
     since: "removed upstream before 0.48.0",
