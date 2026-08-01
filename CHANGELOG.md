@@ -6,6 +6,23 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.23] - 2026-08-01
+
+### MCP
+
+#### Fixed
+- **Session survives a tab-id migration and an interrupt storm (#568), and an unsaved workflow keeps its conversation across an orchestrator restart (#570).** `PanelAgent.tabId` is now updated on migration (no more `panel_*` → "no connected tab"), the interrupt-release fallback is coalesced/armed-before-await so a hammered "send now" can't wedge the agent, and session resume gains a stable `origin+title+backend` index (collision-poisoned) so a reloaded `tmp:<uuid>` tab rebinds its session.
+- **A pinned workflow target actually binds reads + edits, and fails at pin time if unbindable (#556, #571).** `panel_set_workflow_target(mode:"pinned")` no longer accepts a background pin it can't honor and then silently routes graph calls to the active canvas — it validates active-ness up front (tri-state) and fails loudly when a target can't be bound.
+- **Authoritative ComfyUI-Manager v3/v4 detection + GET/POST method negotiation + a v3→v4 recovery path (#551, #553, #555).** A 405 is no longer misread as "legacy v3" (it means wrong method/route for this version); `queue/start` negotiates POST→GET for GET-only v3 builds; arbitrary-URL installs blocked on v3 now surface a precise migration recovery.
+- **`panel_restart_comfyui` relaunches with an absolute launch command/path (#535)** — a relative `COMFYUI_PATH`/command captured from the live process cwd, so a reachable install is no longer refused after the working directory changes.
+- **`panel_graph_outline` version-gate false-negative fixed + description disambiguated (#352, #557).** A new-enough panel is no longer told it's "too old" (the gate is now per-command with the correct minimum, and no longer poisons the unsupported-command cache); the tool description no longer collides with `visualize_workflow` / `panel_query_graph`.
+- **`download_model` completion now emits an agent_event (#547), and `get_history` carries the media type with `get_image` returning a well-formed error (#554).**
+- **`panel_save_workflow` description states Save-As COPY semantics and drops "rename" (#579)** — reporting the outcome (`saved_as`/`copied_from`/`original_on_disk`/`first_save`) rather than a bare `{saved:true}`.
+
+#### Changed
+- Dropped the bundled Civitai MCP from the default agent config (native CivitAI tools cover it) (#539); `model_metadata_fetch_civitai` degrades gracefully when its optional dependency is absent (#541); corrected the flux-txt2img skill's Flux 2 Klein CLIPLoader (#545); fixed skill doc references and added SCAIL-2 character-replacement guidance (#552, #546).
+
+
 ## [0.48.22] - 2026-07-31
 
 ### MCP
