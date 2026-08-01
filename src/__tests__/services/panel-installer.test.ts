@@ -1269,6 +1269,40 @@ describe("panel version pin — the mutation choke point", () => {
     expect(s.note).toMatch(/unpin/i);
   });
 
+  it("honours an explicit target version instead of substituting nightly", async () => {
+    // A generic call that asked for a specific version is redirected here to get
+    // the verified path; substituting `nightly` would do something other than
+    // what the caller asked while still reporting success.
+    const dir = join(CUSTOM_NODES, "comfyui-mcp-panel");
+    const pyPath = join(dir, "pyproject.toml");
+    const { deps, reinstalls } = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: ["comfyui-mcp-panel"],
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.3") },
+      onReinstall: ({ files }) => {
+        files[pyPath] = pyproject(PANEL_REGISTRY_ID, "0.11.20");
+      },
+    });
+    const r = await runPanelAction("reinstall", deps, { version: "0.11.20" });
+    expect(reinstalls).toEqual([{ id: PANEL_REGISTRY_ID, version: "0.11.20" }]);
+    expect(r.installedVersion).toBe("0.11.20");
+  });
+
+  it("defaults to the nightly channel when no version is requested", async () => {
+    const dir = join(CUSTOM_NODES, "comfyui-mcp-panel");
+    const pyPath = join(dir, "pyproject.toml");
+    const { deps, reinstalls } = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: ["comfyui-mcp-panel"],
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.3") },
+      onReinstall: ({ files }) => {
+        files[pyPath] = pyproject(PANEL_REGISTRY_ID, "0.11.31");
+      },
+    });
+    await runPanelAction("reinstall", deps);
+    expect(reinstalls).toEqual([{ id: PANEL_REGISTRY_ID, version: PANEL_VERSION }]);
+  });
+
   it("panelStatus flags a FAILED shadow scan structurally, not just in the note", async () => {
     // `shadows: []` from a scan that could not run means "we didn't find any",
     // not "there are none". A consumer branching on shadows.length would read

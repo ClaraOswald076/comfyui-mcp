@@ -148,18 +148,25 @@ While it's set, everything that could move the panel refuses — not just
 `install_panel`. The panel is an ordinary custom node pack, so the generic node
 tools are a second door into the same operation, and they are guarded too:
 
-- `install_custom_node` / `update_custom_node` / `reinstall_custom_node` /
-  `fix_custom_node` targeting the panel by **any** spelling
-  (`comfyui-agent-panel`, `comfyui-mcp-panel`, or its git URL).
+- `install_custom_node` / `update_custom_node` / `reinstall_custom_node`
+  targeting the panel by **any** spelling — the registry id, the repo name, or a
+  git URL including ref-carrying forms like `…/comfyui-mcp-panel.git@v0.11.28`
+  and `…/comfyui-mcp-panel/tree/main`. These also **route through the verified
+  path** automatically, so the version they report is re-read from disk like
+  `sync`'s.
 - **`id="all"`, and `update_all`** — a bulk update moves the panel along with
   everything else. ComfyUI-Manager can't update everything-except-one-pack, so
   while pinned these refuse outright. If the user wants the rest updated, either
   unpin first or update the other packs individually by id. Say that plainly
   rather than quietly unpinning to make `all` work.
+- `fix_custom_node`, `panel_install_node` and `panel_update_node` **refuse** a
+  panel target outright — pinned or not. They report success as soon as the
+  ComfyUI-Manager queue drains, which proves nothing, and there's no verified
+  equivalent to route them into. Use `install_panel` instead; don't work around
+  the refusal.
 
-Reaching the panel through those generic tools also **routes through the verified
-path** automatically, so the version they report is re-read from disk like
-`sync`'s. Prefer `install_panel` anyway — it's the one with `status` and `sync`.
+Prefer `install_panel` throughout — it's the one with `status`, `sync` and the
+pin.
 
 ## When to run this at all
 

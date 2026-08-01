@@ -118,6 +118,20 @@ describe("generic node mutations cannot walk past the panel pin", () => {
     await expect(promise).rejects.toThrow(PanelPinnedError);
   });
 
+  it.each([
+    "https://github.com/artokun/comfyui-mcp-panel.git@v0.11.28",
+    "https://github.com/artokun/comfyui-mcp-panel/tree/main",
+    "https://gitlab.com/artokun/comfyui-mcp-panel/-/commit/abc1234",
+    "comfyui-agent-panel@nightly",
+  ])("REFUSES the ref-carrying git form %j while pinned", async (id) => {
+    // These are forms parseGitUrl accepts, so they really do reach the pack —
+    // but the first matcher compared the raw last path segment and let them all
+    // through, moving a pinned panel.
+    setPanelVersionPin("0.11.3");
+    await expect(installCustomNode({ id })).rejects.toThrow(PanelPinnedError);
+    expect(managerCalls).toEqual([]);
+  });
+
   it("an UNRELATED pack is untouched by the pin", async () => {
     setPanelVersionPin("0.11.3");
     // Reaches the Manager path (and fails there on the stubbed response, not on

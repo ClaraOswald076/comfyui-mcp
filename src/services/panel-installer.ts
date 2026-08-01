@@ -1242,22 +1242,40 @@ function finalizeUpdate(
   );
 }
 
+export interface PanelActionOptions {
+  /**
+   * Target version for install/reinstall, defaulting to the `nightly` channel.
+   *
+   * Exists so a caller that asked for a SPECIFIC version — e.g.
+   * `install_custom_node(id="comfyui-agent-panel", version="0.11.20")`, which is
+   * redirected here to get the verified path — actually gets the version it
+   * asked for. Redirecting and silently substituting `nightly` would do
+   * something other than what the caller requested while reporting success.
+   * (`update` has no version to honour; it always pulls the channel tip.)
+   */
+  version?: string;
+}
+
 /**
  * install/update/reinstall the panel. LOCAL-only and refuses dev symlinks.
- * Targets version "nightly". Caller must RESTART ComfyUI to load the change.
+ * Targets the "nightly" channel unless a version is given. Caller must RESTART
+ * ComfyUI to load the change.
  */
 export function runPanelAction(
   action: "install" | "update" | "reinstall",
   deps: PanelInstallerDeps = defaultDeps,
+  opts: PanelActionOptions = {},
 ): Promise<PanelActionResult> {
   // Serialized: never let two panel mutations interleave (see withPanelOpLock).
-  return withPanelOpLock(() => runPanelActionInner(action, deps));
+  return withPanelOpLock(() => runPanelActionInner(action, deps, opts));
 }
 
 async function runPanelActionInner(
   action: "install" | "update" | "reinstall",
   deps: PanelInstallerDeps,
+  opts: PanelActionOptions = {},
 ): Promise<PanelActionResult> {
+  const targetVersion = opts.version?.trim() || PANEL_VERSION;
   // P1b — truly LOCAL-only. Refuse in remote/cloud mode even when COMFYUI_PATH
   // is set: installCustomNode/reinstallCustomNode would queue Manager mutations
   // against the REMOTE host while our symlink guard inspected the LOCAL disk —
@@ -1337,8 +1355,8 @@ async function runPanelActionInner(
   assertNotPinned(action, deps);
   const result =
     action === "install"
-      ? await deps.install({ id: PANEL_REGISTRY_ID, version: PANEL_VERSION })
-      : await deps.reinstall({ id: PANEL_REGISTRY_ID, version: PANEL_VERSION });
+      ? await deps.install({ id: PANEL_REGISTRY_ID, version: targetVersion })
+      : await deps.reinstall({ id: PANEL_REGISTRY_ID, version: targetVersion });
 
   // #639 — VERIFY the pack afterward. installCustomNode verifies presence
   // downstream (#232), but reinstallCustomNode does NOT — it returns as soon as

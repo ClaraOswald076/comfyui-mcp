@@ -29,6 +29,7 @@ import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { extname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { comfyuiFetch } from "../comfyui/fetch.js";
+import { assertPanelNotTargetedUnverifiable } from "../services/panel-pin-guard.js";
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { parse as parseYaml } from "yaml";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
@@ -4826,11 +4827,17 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         channel: z.string().optional().describe("Manager channel (default 'default')."),
         mode: z.enum(["remote", "local", "cache"]).optional().describe("DB source (default 'remote')."),
       },
-      async (args: A, ctx) =>
-        ctx.call(
+      async (args: A, ctx) => {
+        // The panel pack is installable like any other, and this path has NO
+        // on-disk verification and never saw the version pin. Refuse both
+        // spellings (registry id and git URL) — see panel-pin-guard.
+        assertPanelNotTargetedUnverifiable("panel_install_node", args.id);
+        assertPanelNotTargetedUnverifiable("panel_install_node", args.repository);
+        return ctx.call(
           { cmd: "nodes_install", id: args.id, repository: args.repository, version: args.version, channel: args.channel, mode: args.mode },
           30000,
-        ),
+        );
+      },
     ),
     def(
       "panel_update_node",
@@ -4841,11 +4848,13 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         channel: z.string().optional().describe("Manager channel (default 'default')."),
         mode: z.enum(["remote", "local", "cache"]).optional().describe("DB source (default 'remote')."),
       },
-      async (args: A, ctx) =>
-        ctx.call(
+      async (args: A, ctx) => {
+        assertPanelNotTargetedUnverifiable("panel_update_node", args.id);
+        return ctx.call(
           { cmd: "graph_update_node", id: args.id, version: args.version, channel: args.channel, mode: args.mode },
           30000,
-        ),
+        );
+      },
     ),
     def(
       "panel_node_queue_status",

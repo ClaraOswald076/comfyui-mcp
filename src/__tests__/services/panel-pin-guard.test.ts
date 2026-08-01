@@ -50,12 +50,39 @@ describe("targetsPanelPack — every spelling of the panel is the panel", () => 
     expect(targetsPanelPack(id)).toBe(true);
   });
 
-  it.each(["comfyui-manager", "was-node-suite", "", "   ", "comfyui-panel-other"])(
-    "does not match unrelated id %j",
-    (id) => {
-      expect(targetsPanelPack(id)).toBe(false);
-    },
-  );
+  it.each([
+    // Every REF-CARRYING form parseGitUrl accepts. Naively taking the last path
+    // segment turned "...panel.git@v0.11.28" into itself and ".../tree/main"
+    // into "main", so both slipped past the matcher and moved a pinned panel.
+    "https://github.com/artokun/comfyui-mcp-panel.git@v0.11.28",
+    "https://github.com/artokun/comfyui-mcp-panel@nightly",
+    "comfyui-mcp-panel@0.11.20",
+    "https://github.com/artokun/comfyui-mcp-panel/tree/main",
+    "https://github.com/artokun/comfyui-mcp-panel/commit/abc1234",
+    "https://github.com/artokun/comfyui-mcp-panel/commits/main",
+    "https://github.com/artokun/comfyui-mcp-panel/releases/tag/v0.11.28",
+    "https://gitlab.com/artokun/comfyui-mcp-panel/-/tree/main",
+    "https://gitlab.com/artokun/comfyui-mcp-panel/-/commit/abc1234",
+    "https://bitbucket.org/artokun/comfyui-mcp-panel/src/main",
+    "git@github.com:artokun/comfyui-mcp-panel.git",
+    "https://github.com/artokun/comfyui-mcp-panel/",
+    "https://github.com/artokun/comfyui-mcp-panel.git?foo=1",
+    "artokun/comfyui-agent-panel", // "author/repo" form the panel tools accept
+  ])("matches the ref-carrying / URL form %j", (id) => {
+    expect(targetsPanelPack(id)).toBe(true);
+  });
+
+  it.each([
+    "comfyui-manager",
+    "was-node-suite",
+    "",
+    "   ",
+    "comfyui-panel-other",
+    "https://github.com/someone/comfyui-mcp-panel-fork",
+    "https://github.com/someone/other-pack/tree/comfyui-mcp-panel",
+  ])("does not match unrelated id %j", (id) => {
+    expect(targetsPanelPack(id)).toBe(false);
+  });
 
   it("separates an exact panel target from a bulk one (only the former can be redirected)", () => {
     expect(targetsPanelPackExactly("comfyui-agent-panel")).toBe(true);
@@ -176,6 +203,38 @@ describe("withPanelMutationLock — a FILE lock, so it holds across processes", 
     expect(result).toBe("inner ran");
   });
 
+  it("re-entrancy is ASYNC-CONTEXT-scoped, not process-global", async () => {
+    // The bug: a process-global "held" flag let an UNRELATED concurrent caller
+    // (a pin write) sail straight through while an update held the lock —
+    // landing in the exact window between the update's final pin check and its
+    // Manager call. Only work nested INSIDE the holder may skip the lock.
+    const order: string[] = [];
+    let releaseHolder: (() => void) | undefined;
+    const holderDone = new Promise<void>((r) => {
+      releaseHolder = r;
+    });
+
+    const holder = withPanelMutationLock(async () => {
+      order.push("holder:start");
+      // Nested-inside-the-holder: exempt, runs immediately.
+      await withPanelMutationLock(async () => order.push("nested"));
+      await holderDone;
+      order.push("holder:end");
+    });
+
+    // Started from OUTSIDE the holder's async context while it is held.
+    await new Promise((r) => setTimeout(r, 20));
+    const outsider = withPanelMutationLock(async () => order.push("outsider"));
+
+    await new Promise((r) => setTimeout(r, 20));
+    // The outsider must NOT have run yet — it is queued behind the holder.
+    expect(order).toEqual(["holder:start", "nested"]);
+
+    releaseHolder?.();
+    await Promise.all([holder, outsider]);
+    expect(order).toEqual(["holder:start", "nested", "holder:end", "outsider"]);
+  });
+
   it("times out rather than proceeding when another process holds the lock", async () => {
     // Simulate a live lock owned by someone else: a fresh lock file we never release.
     writeFileSync(panelLockPath(), JSON.stringify({ pid: 999999 }));
@@ -186,13 +245,82 @@ describe("withPanelMutationLock — a FILE lock, so it holds across processes", 
 
   it("reclaims a STALE lock so a crashed process cannot wedge pinning forever", async () => {
     const path = panelLockPath();
-    writeFileSync(path, JSON.stringify({ pid: 999999 }));
-    // Backdate well past the stale window.
+    // A pid that is old AND dead.
+    writeFileSync(path, JSON.stringify({ pid: 0x7fffffff }));
     const old = new Date(Date.now() - 60 * 60_000);
     const { utimesSync } = await import("node:fs");
     utimesSync(path, old, old);
     await expect(
       withPanelMutationLock(async () => "recovered", { timeoutMs: 1000 }),
     ).resolves.toBe("recovered");
+  });
+
+  it("does NOT reclaim an old lock whose owner is still ALIVE", async () => {
+    // Age alone let two waiters both judge a lock stale, and the slower one
+    // could then delete the FRESH lock the faster one had just taken — two
+    // mutations in flight, the exact thing the lock prevents. A live owner's
+    // lock must never read as stale, however old it looks.
+    const path = panelLockPath();
+    writeFileSync(path, JSON.stringify({ pid: process.pid })); // definitely alive
+    const old = new Date(Date.now() - 60 * 60_000);
+    const { utimesSync } = await import("node:fs");
+    utimesSync(path, old, old);
+    await expect(
+      withPanelMutationLock(async () => "should not run", { timeoutMs: 300 }),
+    ).rejects.toThrow(/Timed out/);
+  });
+
+  it("reclaims an old lock with unreadable content (nobody can claim it)", async () => {
+    const path = panelLockPath();
+    writeFileSync(path, "not json");
+    const old = new Date(Date.now() - 60 * 60_000);
+    const { utimesSync } = await import("node:fs");
+    utimesSync(path, old, old);
+    await expect(
+      withPanelMutationLock(async () => "recovered", { timeoutMs: 1000 }),
+    ).resolves.toBe("recovered");
+  });
+});
+
+describe("assertPanelNotTargetedUnverifiable — paths that cannot verify", () => {
+  it("refuses a panel target even when NOTHING is pinned", async () => {
+    // panel_install_node / panel_update_node / fix_custom_node report success
+    // straight off the Manager queue, which a stale Manager drains without doing
+    // any work. There is no verified redirect for them, so they refuse and name
+    // install_panel rather than move the panel unverifiably.
+    const { assertPanelNotTargetedUnverifiable } = await import(
+      "../../services/panel-pin-guard.js"
+    );
+    expect(() =>
+      assertPanelNotTargetedUnverifiable("panel_update_node", "comfyui-agent-panel"),
+    ).toThrow(/install_panel/);
+    expect(() =>
+      assertPanelNotTargetedUnverifiable(
+        "panel_install_node",
+        "https://github.com/artokun/comfyui-mcp-panel.git@v1",
+      ),
+    ).toThrow(/install_panel/);
+  });
+
+  it("reports the PIN first when one is set (the more specific reason)", async () => {
+    const { assertPanelNotTargetedUnverifiable } = await import(
+      "../../services/panel-pin-guard.js"
+    );
+    setPanelVersionPin("0.11.3");
+    expect(() =>
+      assertPanelNotTargetedUnverifiable("panel_update_node", "comfyui-agent-panel"),
+    ).toThrow(/pinned to 0\.11\.3/i);
+  });
+
+  it("leaves unrelated packs and absent ids alone", async () => {
+    const { assertPanelNotTargetedUnverifiable } = await import(
+      "../../services/panel-pin-guard.js"
+    );
+    expect(() =>
+      assertPanelNotTargetedUnverifiable("panel_update_node", "ComfyUI-WanVideoWrapper"),
+    ).not.toThrow();
+    expect(() =>
+      assertPanelNotTargetedUnverifiable("panel_install_node", undefined),
+    ).not.toThrow();
   });
 });
