@@ -406,37 +406,35 @@ export function isMutatingGraphCommand(cmdName: string): boolean {
   return cmdName.startsWith("graph_") && !BRIDGE_READONLY_CMDS.has(cmdName);
 }
 
-/** #570 P0c — workflow mutators that ALWAYS act on the active workflow: their panel executors
- *  take only `{ name }` and ignore any `path`, so a `path` on them is meaningless and never
- *  makes them deterministic. Always gated. */
-const ALWAYS_ACTIVE_WORKFLOW_MUTATORS = new Set<string>(["workflow_save", "workflow_save_as"]);
-
-/** #570 P0c — workflow mutators that target an EXPLICIT `path` when given a real one, else the
- *  active workflow (`path ? target : activeWorkflow` in the panel). A stale one of these,
- *  delivered after the user switches workflows, would hit the NEW active workflow —
- *  workflow_close even discards its unsaved work — UNLESS it names a deterministic path. */
-const PATH_TARGETABLE_WORKFLOW_MUTATORS = new Set<string>(["workflow_rename", "workflow_close"]);
+/** #570 P0c — the four workflow mutators. workflow_save / workflow_save_as ignore any path and
+ *  always target the active workflow; workflow_rename / workflow_close resolve a path selector
+ *  against the panel's OPEN workflows (`path ? openWorkflows.find(path) : activeWorkflow`), which
+ *  the SERVER cannot evaluate — and a path that names a non-active workflow NOW can name the
+ *  active one after an in-place replacement at that path. So the server cannot prove any of these
+ *  stays off the active canvas and gates all four (an enforcing panel resolves the target
+ *  precisely client-side; a non-enforcing panel fails closed — read-only for these ops). */
+const ACTIVE_WORKFLOW_MUTATORS = new Set<string>([
+  "workflow_save",
+  "workflow_save_as",
+  "workflow_rename",
+  "workflow_close",
+]);
 
 /** #570 P0c — commands that MUTATE the currently-active workflow/canvas and must therefore be
  *  fenced to the workflow they were issued for. Fail closed for these unless the connected panel
  *  enforces the per-command workflow stamp (`workflow_open`/`workflow_new` are navigation/creation
- *  with deterministic or new targets — not active-content mutations — so they are excluded).
+ *  with their OWN explicit or new target — not active-content mutations — so they are excluded).
  *
- *  A `path` counts as an EXPLICIT deterministic target ONLY when it is a NON-EMPTY TRIMMED string.
- *  The panel executors treat `path:""` / whitespace as falsy → the ACTIVE workflow (codex), and
- *  the tool schemas allow `path:""`, so an empty/whitespace path is a switch-race victim and MUST
- *  be gated — never let `path !== undefined` alone wave a mutation past the fence. Takes the full
- *  command so it can read the `path` discriminator. */
-export function requiresWorkflowStampEnforcement(cmd: { cmd?: unknown; path?: unknown }): boolean {
+ *  Decide by the COMMAND, not by a raw `path` string: the server cannot resolve a workflow path
+ *  selector to a specific open workflow, and an in-place replacement can make a once-non-active
+ *  path resolve to the active workflow — so raw path presence can never prove a rename/close
+ *  stays off the active canvas. Hence all four workflow mutators are gated unconditionally; the
+ *  ENFORCING panel's client-side fence (activeWorkflowFenceApplies) does the precise
+ *  resolved-target check that safely exempts a deterministically non-active target. */
+export function requiresWorkflowStampEnforcement(cmd: { cmd?: unknown }): boolean {
   const name = typeof cmd.cmd === "string" ? cmd.cmd : "";
   if (isMutatingGraphCommand(name)) return true;
-  if (ALWAYS_ACTIVE_WORKFLOW_MUTATORS.has(name)) return true;
-  if (PATH_TARGETABLE_WORKFLOW_MUTATORS.has(name)) {
-    const path = (cmd as { path?: unknown }).path;
-    const hasExplicitPath = typeof path === "string" && path.trim().length > 0;
-    return !hasExplicitPath; // absent / "" / whitespace ⇒ active workflow ⇒ must be gated
-  }
-  return false;
+  return ACTIVE_WORKFLOW_MUTATORS.has(name);
 }
 
 /** Tight default reply timeout for a MUTATING command with no explicit timeout —

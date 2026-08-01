@@ -29,25 +29,18 @@ describe("requiresWorkflowStampEnforcement (#570 P0c)", () => {
     expect(requiresWorkflowStampEnforcement({ cmd: "graph_query" })).toBe(false);
   });
 
-  it("gates workflow_save / workflow_save_as UNCONDITIONALLY (executors ignore path)", () => {
-    expect(requiresWorkflowStampEnforcement({ cmd: "workflow_save" })).toBe(true);
-    expect(requiresWorkflowStampEnforcement({ cmd: "workflow_save", path: "workflows/x.json" })).toBe(true);
-    expect(requiresWorkflowStampEnforcement({ cmd: "workflow_save_as" })).toBe(true);
-    expect(requiresWorkflowStampEnforcement({ cmd: "workflow_save_as", path: "x" })).toBe(true);
-  });
-
-  it("gates workflow_rename / workflow_close when the path is ABSENT, EMPTY, or WHITESPACE (all ⇒ active)", () => {
-    for (const cmd of ["workflow_rename", "workflow_close"]) {
+  it("gates ALL FOUR workflow mutators UNCONDITIONALLY (the server can't resolve a path selector)", () => {
+    // save/save_as ignore path; rename/close resolve a path against OPEN workflows, which the
+    // server can't evaluate — and an in-place replacement can make a once-non-active path resolve
+    // to the active workflow. So raw path can never prove non-active-ness: gate all four always.
+    for (const cmd of ["workflow_save", "workflow_save_as", "workflow_rename", "workflow_close"]) {
       expect(requiresWorkflowStampEnforcement({ cmd })).toBe(true); // absent
-      expect(requiresWorkflowStampEnforcement({ cmd, path: "" })).toBe(true); // empty ⇒ active (the bypass)
-      expect(requiresWorkflowStampEnforcement({ cmd, path: "   " })).toBe(true); // whitespace ⇒ active
-      expect(requiresWorkflowStampEnforcement({ cmd, path: 0 as never })).toBe(true); // non-string ⇒ active
+      expect(requiresWorkflowStampEnforcement({ cmd, path: "" } as never)).toBe(true); // empty
+      expect(requiresWorkflowStampEnforcement({ cmd, path: "   " } as never)).toBe(true); // whitespace
+      // Even a non-empty explicit path is gated on the server — the ENFORCING panel resolves the
+      // target precisely and exempts a genuinely non-active one client-side.
+      expect(requiresWorkflowStampEnforcement({ cmd, path: "workflows/other.json" } as never)).toBe(true);
     }
-  });
-
-  it("does NOT gate workflow_rename / workflow_close with an EXPLICIT non-empty path (deterministic target)", () => {
-    expect(requiresWorkflowStampEnforcement({ cmd: "workflow_close", path: "workflows/other.json" })).toBe(false);
-    expect(requiresWorkflowStampEnforcement({ cmd: "workflow_rename", path: "workflows/a.json" })).toBe(false);
   });
 
   it("does NOT gate navigation/creation or unrelated commands", () => {
@@ -1427,25 +1420,21 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
       bridge.send({ cmd: "workflow_close", force: true } as never, { tabId: "tmp:old" }),
     ).rejects.toThrow(/enforces per-command workflow targeting|update the ComfyUI-MCP panel/i);
 
-    // EMPTY / whitespace path is treated by the panel executor as the ACTIVE workflow, so it must
-    // ALSO be refused — a `path !== undefined` check would have waved these past the gate (the
-    // empty-path bypass). Covers close/rename (path:"") and save/save_as (ignore path entirely).
+    // ALL FOUR workflow mutators are refused on a non-enforcing panel — regardless of path,
+    // including an EXPLICIT non-empty path. The server can't resolve the selector or prove it
+    // stays non-active (an in-place replacement can make a once-non-active path resolve to the
+    // active workflow), so it fails closed; an ENFORCING panel resolves the target client-side.
     for (const cmd of [
       { cmd: "workflow_close", path: "", force: true },
       { cmd: "workflow_rename", path: "  ", name: "x" },
       { cmd: "workflow_save" },
       { cmd: "workflow_save_as", name: "y" },
+      { cmd: "workflow_close", path: "workflows/other.json", force: true }, // explicit path — still gated
     ]) {
       await expect(bridge.send(cmd as never, { tabId: "tmp:old" })).rejects.toThrow(
         /enforces per-command workflow targeting|update the ComfyUI-MCP panel/i,
       );
     }
-
-    // …but an EXPLICIT-path workflow op names a deterministic target (not a switch-race
-    // victim) and stays allowed even on an old panel.
-    await expect(
-      bridge.send({ cmd: "workflow_close", path: "workflows/other.json" } as never, { tabId: "tmp:old" }),
-    ).resolves.toBeTruthy();
     old.close();
   });
 
