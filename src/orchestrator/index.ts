@@ -2713,12 +2713,15 @@ export async function runPanelOrchestrator(): Promise<void> {
         // else the tab's identity from its PRIOR hello (captured before we overwrote it) —
         // which is how the no-durable-record live-agent window is covered.
         //
-        // "Both sides have NO identity" counts as PROVEN (no transition): an identity-less
-        // client (no trusted server origin — never had the uuid boundary) is not torn down
-        // on every hello, which would break its ongoing conversation. Closing the in-place
-        // overwrite for such clients is impossible without that breakage — a client-capability
-        // limitation, disclosed. A MODERN client whose record is unbound (pre-`u`/legacy) still
-        // resets: its hello carries an identity, so identity(state)=undefined ≠ identity(hello).
+        // FAIL CLOSED — state is kept ONLY when POSITIVELY PROVEN: BOTH the state's
+        // identity AND this hello's identity exist AND are equal. An IDENTITY-LESS re-hello
+        // (no trusted server origin / no valid uuid — a relay/old/non-browser client) can NOT
+        // prove continuity, so its state is torn down rather than risk continuing a replaced
+        // workflow's private conversation. A browser panel ALWAYS carries a trusted handshake
+        // origin, so it proves out and is never reset for lack of identity — only genuinely
+        // identity-less (non-browser) or pre-`u`/legacy clients pay the reset. (Disclosed
+        // trade-off: such a client loses conversation continuity across a reload/reconnect —
+        // a lost resume, never a cross-workflow leak.)
         const helloIdentity = newIdentity ? `${newIdentity.origin}::${newIdentity.uuid}` : undefined;
         const stateIdentity =
           sessionStore.identityOf(key) ??
@@ -2729,7 +2732,9 @@ export async function runPanelOrchestrator(): Promise<void> {
         // fires even in the spawn→first-session window or after a prepare failure.
         const hasState =
           manager.hasAnyState(key) || sessionStore.get(key) !== undefined || heldGenKeys.length > 0;
-        if (hasState && stateIdentity !== helloIdentity) {
+        const provenOwn =
+          stateIdentity !== undefined && helloIdentity !== undefined && stateIdentity === helloIdentity;
+        if (hasState && !provenOwn) {
           // FULL session boundary. manager.reset() stops the mapped agent (whose backend
           // still holds the PRIOR workflow's session), clears its pending resume + held
           // mail, AND the durable exact session. Then cancel the render-held queue for
