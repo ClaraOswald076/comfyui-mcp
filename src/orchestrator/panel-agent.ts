@@ -1369,6 +1369,16 @@ export class PanelAgentManager {
     return this.agents.has(key);
   }
 
+  /** #570 P0 — true when this key holds ANY per-tab live/queued state that reset() would
+   *  tear down: a live agent, an armed pending resume, OR failed-start held mail (a backend
+   *  prepare failure drops the agent but PARKS its queued user messages here, with no
+   *  session). The identity boundary gates on this so an in-place workflow replacement is
+   *  torn down even in the spawn→first-session window or after a prepare failure — otherwise
+   *  the next message re-delivers the prior workflow's parked mail into the replacement. */
+  hasAnyState(key: string): boolean {
+    return this.agents.has(key) || this.pendingResume.has(key) || (this.heldMessages.get(key)?.length ?? 0) > 0;
+  }
+
   /** Composite keys of every live agent. Used to deliver a download-completion
    *  event to the SINGLE live agent when a settled download row carries no tab
    *  stamp (a pre-fix row, or an in-process/mobile caller) — the orchestrator

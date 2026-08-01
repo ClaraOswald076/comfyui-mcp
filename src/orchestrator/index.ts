@@ -2720,8 +2720,11 @@ export async function runPanelOrchestrator(): Promise<void> {
           sessionStore.identityOf(key) ??
           (priorTabIdentity ? `${priorTabIdentity.origin}::${priorTabIdentity.uuid}` : undefined);
         const heldGenKeys = [...heldDuringGen.keys()].filter((hk) => panelTabOf(hk) === panelTab);
+        // hasAnyState covers the live agent, an armed pending resume, AND failed-start held
+        // mail (a prepare failure parks queued messages with no agent/session) — so a reset
+        // fires even in the spawn→first-session window or after a prepare failure.
         const hasState =
-          manager.hasLiveAgent(key) || sessionStore.get(key) !== undefined || heldGenKeys.length > 0;
+          manager.hasAnyState(key) || sessionStore.get(key) !== undefined || heldGenKeys.length > 0;
         if (hasState && stateIdentity !== helloIdentity) {
           // FULL session boundary. manager.reset() stops the mapped agent (whose backend
           // still holds the PRIOR workflow's session), clears its pending resume + held

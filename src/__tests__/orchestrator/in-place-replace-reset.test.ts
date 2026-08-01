@@ -149,4 +149,48 @@ describe("in-place workflow replacement resets the live session (#570 P0)", () =
     expect(manager.hasLiveAgent(key)).toBe(false);
     await manager.stopAll();
   });
+
+  it("P0: failed-start held mail counts as state (torn down on an identity transition)", async () => {
+    // A backend prepare() failure DROPS the agent but PARKS the queued user message in
+    // heldMessages (#256) — no live agent, no session. hasAnyState must still see it, so an
+    // in-place replacement resets it instead of re-delivering the prior workflow's message.
+    class RejectingBackend implements AgentBackend {
+      readonly id = "claude" as const;
+      readonly capabilities = CLAUDE_CAPABILITIES;
+      async prepare(): Promise<void> {
+        throw new Error("prepare rejected (bad key)");
+      }
+      async *run(): AsyncGenerator<AgentEvent> {
+        throw new Error("run must not be reached");
+      }
+      async interrupt(): Promise<void> {}
+      async listModels(): Promise<ModelChoice[]> {
+        return [];
+      }
+    }
+    const store = new SessionStore(PORT);
+    const manager = new PanelAgentManager({
+      mcpServers: {},
+      systemAppend: "",
+      model: "claude-test",
+      onSay: () => {},
+      onTurn: () => {},
+      onStartFailure: () => {},
+      onSession: () => {},
+      sessionStore: store,
+      makeBackend: () => new RejectingBackend(),
+      identityForKey: () => IDENTITY_A,
+    } as never);
+    const key = "wf:foo.json::claude";
+    manager.send(key, "A's private message queued behind a failed start");
+    // The start fails: no live agent, no durable session — but the message is PARKED.
+    await waitFor(() => manager.hasAnyState(key) && !manager.hasLiveAgent(key));
+    expect(store.get(key)).toBeUndefined();
+    expect(manager.hasAnyState(key)).toBe(true); // held mail is state
+    // The identity boundary (gated on hasAnyState) resets — the parked message is dropped,
+    // never re-delivered into the replacement workflow.
+    manager.reset(key);
+    expect(manager.hasAnyState(key)).toBe(false);
+    await manager.stopAll();
+  });
 });
