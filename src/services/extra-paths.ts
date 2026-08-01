@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir, platform } from "node:os";
 import { dirname, join, isAbsolute, resolve } from "node:path";
@@ -255,7 +255,28 @@ function desktopConfigPath(): string {
  * `resolveEffectiveComfyUIBase()` deliberately refuses to hand back a local workspace:
  * reporting some other root's model dirs as if they were the live server's is a
  * wrong-destination hazard, so an explicit unresolved error is the only safe answer.
+ *
+ * STALE-WORKSPACE GUARD (codex round 2, P1): a saved default workspace is a value the
+ * user persisted once and may never have revisited — the install can since have been
+ * moved, renamed or deleted. Widening the fallback to it therefore has to prove the
+ * directory is still THERE. Without that check `add_extra_path` would resolve to
+ * `<gone workspace>/extra_model_paths.yaml`, `writeConfigFile`'s recursive `mkdir` would
+ * MATERIALIZE the whole vanished tree, and the tool would report "Added … Restart
+ * ComfyUI" for a file no ComfyUI will ever read — a silent wrong-destination write.
+ * A missing/non-directory saved default is therefore an explicit error, for reads too:
+ * listing a phantom root as an empty config is exactly the authoritative-looking lie
+ * this issue is about. An explicit COMFYUI_PATH is NOT gated this way — that is the
+ * user directly naming a root, and its pre-#648 behavior (report `exists:false`,
+ * create on write) is deliberately left unchanged.
  */
+function isExistingDir(p: string): boolean {
+  try {
+    return statSync(p).isDirectory();
+  } catch {
+    return false; // missing, unreadable, or a dangling symlink
+  }
+}
+
 function standaloneRoot(): { root: string; source: "comfyui-path" | "default-workspace" } {
   const root = resolveEffectiveComfyUIBase();
   if (!root) {
@@ -273,7 +294,18 @@ function standaloneRoot(): { root: string; source: "comfyui-path" | "default-wor
   }
   // config.comfyuiPath is what resolveEffectiveComfyUIBase prefers, so its presence
   // (not a re-derivation) is what distinguishes the two sources.
-  return { root, source: config.comfyuiPath ? "comfyui-path" : "default-workspace" };
+  const source = config.comfyuiPath ? "comfyui-path" : "default-workspace";
+  if (source === "default-workspace" && !isExistingDir(root)) {
+    throw new ValidationError(
+      `UNRESOLVED: the saved default workspace "${root}" is not an existing directory, so it ` +
+        "cannot be used to locate extra_model_paths.yaml. The install was probably moved, " +
+        "renamed or deleted since set_default_workspace was last run. Nothing was read or " +
+        "written — refusing to create a config under a workspace that no longer exists, " +
+        "because no ComfyUI would ever read it. Re-run set_default_workspace with the current " +
+        "path, set COMFYUI_PATH, or pass config_path explicitly.",
+    );
+  }
+  return { root, source };
 }
 
 function standaloneConfigPath(): { path: string; notes: string[] } {
@@ -284,7 +316,10 @@ function standaloneConfigPath(): { path: string; notes: string[] } {
       source === "default-workspace"
         ? [
             `Resolved from the saved default workspace (${root}) because COMFYUI_PATH is not set. ` +
-              `Set COMFYUI_PATH or use set_default_workspace to change which install this reports.`,
+              `This was NOT confirmed against the running ComfyUI (its live ` +
+              `--extra-model-paths-config was not available), so if you have since switched ` +
+              `installs this may not be the file the running server reads — check get_workspace ` +
+              `and re-run set_default_workspace if it is stale.`,
           ]
         : [],
   };

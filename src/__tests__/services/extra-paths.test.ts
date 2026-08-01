@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -327,6 +328,54 @@ describe("standalone root precedence — saved default workspace (#648)", () => 
 
     await expect(listExtraPaths({ target: "standalone" })).rejects.toThrow(/UNRESOLVED/);
     await expect(listExtraPaths({ target: "standalone" })).rejects.toThrow(/REMOTE/);
+  });
+
+  it("REFUSES a saved default workspace that no longer exists (no phantom listing)", async () => {
+    const gone = join(await trackTmp(), "moved-away", "ComfyUI");
+    await saveDefaultWorkspace(gone);
+    config.comfyuiPath = undefined;
+
+    await expect(listExtraPaths({ target: "standalone" })).rejects.toThrow(/UNRESOLVED/);
+    await expect(listExtraPaths({ target: "standalone" })).rejects.toThrow(
+      /not an existing directory/i,
+    );
+  });
+
+  it("REFUSES to materialize a vanished saved workspace on add (wrong-destination write)", async () => {
+    const parent = await trackTmp();
+    const gone = join(parent, "moved-away", "ComfyUI");
+    await saveDefaultWorkspace(gone);
+    config.comfyuiPath = undefined;
+
+    await expect(
+      addExtraPath({ target: "standalone", category: "loras", path: "E:/loras" }),
+    ).rejects.toThrow(/UNRESOLVED/);
+    // The recursive mkdir in writeConfigFile must never have run.
+    expect(existsSync(join(parent, "moved-away"))).toBe(false);
+  });
+
+  it("REFUSES a saved default workspace that points at a FILE, not a directory", async () => {
+    const dir = await trackTmp();
+    const notADir = join(dir, "not-a-workspace.txt");
+    await writeFile(notADir, "i am a file\n", "utf-8");
+    await saveDefaultWorkspace(notADir);
+    config.comfyuiPath = undefined;
+
+    await expect(listExtraPaths({ target: "standalone" })).rejects.toThrow(
+      /not an existing directory/i,
+    );
+  });
+
+  it("a nonexistent COMFYUI_PATH is NOT gated (pre-#648 behavior preserved)", async () => {
+    // The stale guard covers only the saved default workspace: COMFYUI_PATH is the user
+    // directly naming a root, and it has always reported exists:false rather than erroring.
+    const gone = join(await trackTmp(), "no-such-install");
+    config.comfyuiPath = gone;
+
+    const result = await listExtraPaths({ target: "standalone" });
+    expect(result.path).toBe(join(gone, "extra_model_paths.yaml"));
+    expect(result.exists).toBe(false);
+    expect(result.groups).toEqual([]);
   });
 
   it("an explicit config_path is honored with no workspace lookup at all", async () => {
