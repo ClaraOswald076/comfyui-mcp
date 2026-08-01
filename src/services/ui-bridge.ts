@@ -1536,13 +1536,27 @@ export class UiBridge {
    *   - awaitingReconnect — idempotent reads parked on a mid-command drop, which
    *     resumeAwaitingReconnect() would re-dispatch onto the REPLACEMENT tab's socket and
    *     deliver its graph/data back into the PRIOR workflow's still-running tool call.
-   *  Routing/lifecycle structures (conns, subscribers, migration aliases) are intentionally
-   *  NOT touched here — the socket stays; only queued WORK is dropped. Called by the
-   *  orchestrator's identity-boundary reset, and the bridge defers its on-hello
+   *   - mirror subscribers / viewers — a MIRROR channel is also a per-tab delivery path: a
+   *     phone attached to workflow A keeps receiving this tab's session/say frames and its
+   *     input is stamped for this tab. On a same-socket SWITCH the hello handler already
+   *     MOVED the old id's subscribers/viewers onto the NEW id BEFORE continuity could be
+   *     proven, so on an unproven transition a mirror viewer would silently follow A→B
+   *     without ever attaching to B (codex review). Detach viewers driving this tab (their
+   *     input reverts to their OWN session) and drop this tab's subscriber set (stop feeding
+   *     it B's frames); they can re-attach explicitly if they still want this view.
+   *  The remaining routing/lifecycle structures (conns, migration aliases) are intentionally
+   *  NOT touched here — the socket stays; only queued WORK and unproven mirror bindings are
+   *  dropped. Called by the orchestrator's identity-boundary reset (with the surviving id) and
+   *  the switch retire branch (with the retired id), and the bridge defers its on-hello
    *  replay/flush/resume until AFTER onPanelMessage so this purge lands first. */
   dropQueuedDeliveries(tabId: string): void {
     this.missedFrames.delete(tabId);
     this.mailbox.delete(tabId);
+    // MIRROR teardown (see above): a viewer must not auto-follow an unproven workflow switch.
+    for (const [s, drivenTab] of this.mirrorViewers) {
+      if (drivenTab === tabId) this.mirrorViewers.delete(s);
+    }
+    this.subscribers.delete(tabId);
     const awaiting = this.awaitingReconnect.get(tabId);
     if (awaiting) {
       this.awaitingReconnect.delete(tabId);

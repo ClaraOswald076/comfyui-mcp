@@ -1193,6 +1193,47 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     await onPhone; // resolves, or the test times out (fan-out broke)
   });
 
+  it("DETACHES a mirror viewer on an UNPROVEN same-socket workflow switch (#570 P0)", async () => {
+    // A phone mirrors workflow A (old-id). The desktop switches to a DIFFERENT workflow on
+    // the SAME socket (new-id) — the hello handler optimistically moves the phone's
+    // subscription onto new-id BEFORE continuity is known. When the orchestrator classifies
+    // the switch as UNPROVEN it resets the tab via dropQueuedDeliveries (with the retired id
+    // AND the surviving id) — the phone must then receive NONE of workflow B's frames and its
+    // input must NOT target B: it silently followed A→B without ever attaching to B.
+    const desktop = await connectPanel("old-id", "G");
+    const phone = await connectHeadless("phone-7");
+    await settle();
+    const seen: Array<{ type?: string; tab_id?: string; text?: string }> = [];
+    bridge.onPanelMessage = (e) => seen.push(e as { type?: string; tab_id?: string; text?: string });
+    phone.send(JSON.stringify({ type: "attach_tab", cid: "a", target_tab_id: "old-id" }));
+    await nextFrame(phone, (m) => m.type === "tab_attached");
+
+    // Same-socket switch to a DIFFERENT workflow (subscription moves to new-id at hello).
+    desktop.send(JSON.stringify({ type: "hello", tab_id: "new-id", title: "B" }));
+    await settle();
+
+    // Orchestrator's unproven-transition reset: retired id then surviving id.
+    bridge.dropQueuedDeliveries("old-id");
+    bridge.dropQueuedDeliveries("new-id");
+
+    // Workflow B's activity must NOT reach the phone anymore.
+    let leaked = false;
+    phone.on("message", (buf) => {
+      const m = JSON.parse(buf.toString());
+      if (m.type === "say" && m.text === "workflow-B-secret") leaked = true;
+    });
+    bridge.push({ type: "say", text: "workflow-B-secret" }, "new-id");
+    bridge.push({ type: "say", text: "workflow-B-secret" }, "old-id"); // via migration alias too
+    await settle();
+    expect(leaked).toBe(false);
+
+    // The phone's input reverts to its OWN tab — it no longer drives workflow B.
+    phone.send(JSON.stringify({ type: "user_message", text: "still mine", context: {} }));
+    await settle();
+    const drove = seen.find((e) => e.type === "user_message" && e.text === "still mine");
+    expect(drove?.tab_id).toBe("phone-7");
+  });
+
   it("refuses a headless hello takeover of a desktop tab id (no drive-path hijack)", async () => {
     const desktop = await connectPanel("desktop-h", "G");
     autoReply(desktop, "desktop");
