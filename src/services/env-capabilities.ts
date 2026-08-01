@@ -70,6 +70,8 @@ interface SystemStatsLike {
     // Newer ComfyUI reports these; tolerated when absent.
     pytorch_version?: string;
     argv?: string[];
+    cwd?: string;
+    embedded_python?: boolean;
   };
   devices?: Array<{
     name?: string;
@@ -401,7 +403,7 @@ export function probeTritonSage(
  */
 export function reconcileProbeState(
   state: TriState | undefined,
-  opts: { live: boolean; runningPython?: string; probePython?: string },
+  opts: { proven: boolean; runningPython?: string; probePython?: string },
 ): TriState {
   const s = state ?? "unknown";
   const versionMismatch = !!(
@@ -409,7 +411,14 @@ export function reconcileProbeState(
     opts.probePython &&
     opts.runningPython !== opts.probePython
   );
-  const trustworthy = opts.live && !versionMismatch;
+  // `proven` (from resolveComfyuiPython) is the ONLY licence to state a negative: the
+  // sole interpreter under the install root the running server named in its own argv.
+  // Everything softer — a bare PATH fallback, a different workspace, a root INFERRED by
+  // anchoring a relative argv, or a root holding several candidate environments — is a
+  // guess about WHICH python ComfyUI runs, and a wrong guess is exactly what produced
+  // the false "Triton: not installed" that made an agent disable working acceleration
+  // (#401). Those degrade to "unknown"; positives always pass through untouched.
+  const trustworthy = opts.proven && !versionMismatch;
   return s === "not-installed" && !trustworthy ? "unknown" : s;
 }
 
@@ -573,9 +582,16 @@ export async function gatherEnvCapabilities(opts: GatherOptions): Promise<EnvCap
     : undefined;
 
   let statsArgv: string[] | undefined;
+  let statsCwd: string | undefined;
+  let statsEmbedded: boolean | undefined;
   if (stats) {
     applyStats(caps, stats);
     statsArgv = stats.system?.argv;
+    statsCwd = stats.system?.cwd;
+    statsEmbedded =
+      typeof stats.system?.embedded_python === "boolean"
+        ? stats.system.embedded_python
+        : undefined;
   }
 
   // --- ComfyUI-Manager API generation (v4 vs released 3.x) ---
@@ -592,11 +608,15 @@ export async function gatherEnvCapabilities(opts: GatherOptions): Promise<EnvCap
   // false negative and a false positive for the remote server. So skip the probe
   // entirely and rely solely on the ComfyUI-log positive markers below (#401 round 3).
   const remote = caps.location === "REMOTE";
-  let live = false;
+  let proven = false;
   let ts: { triton: TriState; sageattention: TriState; pythonVersion?: string } | undefined;
   if (!remote) {
-    const resolved = resolveComfyuiPython(opts.comfyuiPath, statsArgv);
-    live = resolved.live;
+    const resolved = resolveComfyuiPython(opts.comfyuiPath, statsArgv, {
+      cwd: statsCwd,
+      remote,
+      embeddedPython: statsEmbedded,
+    });
+    proven = resolved.proven;
     const tritonTimeout = opts.tritonTimeoutMs ?? 5000;
     ts = await withTimeout(probeTritonSage(resolved.python, tritonTimeout), tritonTimeout + 1000);
   }
@@ -608,13 +628,20 @@ export async function gatherEnvCapabilities(opts: GatherOptions): Promise<EnvCap
   //      negative would still be a false report about the running instance.
   //   3. Its major.minor disagrees with what /system_stats reports.
   //   4. REMOTE mode — no local interpreter is the server's (probe skipped above).
+  //   5. An ANCHORED live root — inferred by re-anchoring a RELATIVE argv main.py on a
+  //      configured base (the ComfyUI Desktop shape) rather than read off the server's
+  //      own absolute argv path.
+  //   6. An AMBIGUOUS root holding several candidate environments (e.g. an in-root
+  //      `.venv` beside a bundle's `python_embeded`), where which one ComfyUI runs is
+  //      a guess.
+  // resolveComfyuiPython folds 1/2/4/5/6 into its `proven` flag.
   // In each case a "not-installed" is untrustworthy, so we degrade it to "unknown"
   // rather than emit a false negative that makes an agent disable working
   // acceleration. A positive ("installed") is still reported — it can't be a false
   // negative, and the log-marker check below only ever reinforces a positive.
   const reconcile = (state: TriState | undefined): TriState =>
     reconcileProbeState(state, {
-      live,
+      proven,
       runningPython: caps.python,
       probePython: ts?.pythonVersion,
     });
