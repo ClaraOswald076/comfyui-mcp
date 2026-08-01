@@ -2,3 +2,13 @@
 # "installers up to date" check is stable.
 *.sh text eol=lf
 *.bat text eol=crlf
+
+# The 0.49.0 tool-surface ratchet SHA-256-pins these files' exact bytes
+# (BASELINE_SHA256 / PANEL_BASELINE_SHA256 in src/tools/vocabulary.ts, and the
+# vocab:export --check comparison). With core.autocrlf they would check out as
+# CRLF on Windows and hash differently than the LF form CI produces, breaking
+# the gate for Windows contributors. Force LF so the pinned bytes are identical
+# on every platform.
+docs/design/tool-surface.txt text eol=lf
+docs/design/panel-surface.txt text eol=lf
+docs/design/tool-vocabulary.json text eol=lf

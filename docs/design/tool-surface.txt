@@ -180,3 +180,4 @@ submit_batch
 get_batch_status
 get_batch_output
 wait_for_batch
+bisect

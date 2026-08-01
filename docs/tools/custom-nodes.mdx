@@ -4,7 +4,7 @@ description: "Discover, install, update, snapshot, bisect, scaffold, and publish
 icon: "puzzle"
 ---
 
-<Info>27 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
+<Info>23 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
 
 ## search_custom_nodes
 
@@ -372,30 +372,15 @@ List available custom-node snapshots known to ComfyUI-Manager (mirrors `comfy no
 
 ---
 
-## bisect_start
+## bisect
 
-Begin a binary-search (bisect) session over installed ComfyUI custom nodes to find which one causes a problem. Enables half the nodes and disables the rest for the first test round, then guide the search with bisect_good / bisect_bad. Prefers the ComfyUI-Manager HTTP API; falls back to toggling .disabled directory suffixes for local installs. A ComfyUI restart may be needed for changes to take effect.
+Binary-search (git-bisect style) over installed ComfyUI custom nodes to find which one causes a problem. A state machine driven by the `action` parameter: - action:"start" — Begin a session over all currently-enabled custom nodes. Enables half and disables the rest for the first test round, then guide the search with good/bad. Prefers the ComfyUI-Manager HTTP API; falls back to toggling .disabled directory suffixes for local installs. A ComfyUI restart may be needed for changes to take effect. - action:"good" — Mark the currently enabled set as GOOD (the problem is absent with this set). Narrows the search to the disabled candidates and enables the next subset. Resolves and reports the culprit when one node remains. - action:"bad" — Mark the currently enabled set as BAD (the problem is present with this set). Narrows the search to the enabled subset and enables the next subset. Resolves and reports the culprit when one node remains. - action:"reset" — Re-enable all custom nodes and clear the session. Use to abort a bisection or restore the installation after the search completes. - action:"status" — Report the current session state: status (idle/running/resolved), the remaining candidate node set, which nodes are enabled this round, and the identified culprit if resolved. All actions are argument-free; `action` is the only parameter. `good`/`bad` require a session already started with action:"start".
 
-<Note>This tool takes no parameters.</Note>
+### Parameters
 
-### Example
-
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
-
-```json
-{
-  "tool": "bisect_start",
-  "arguments": {}
-}
-```
-
----
-
-## bisect_good
-
-Mark the currently enabled set of custom nodes as GOOD (the problem is absent with this set). Narrows the bisection to the disabled candidates and enables the next subset to test. Resolves and reports the culprit when one node remains.
-
-<Note>This tool takes no parameters.</Note>
+<ParamField path="action" type="enum" required>
+  Which bisect operation to perform. "start" begins a session; "good"/"bad" narrow it (require a running session); "reset" clears it and re-enables everything; "status" reports state. No other arguments are needed for any action. Options: `start`, `good`, `bad`, `reset`, `status`.
+</ParamField>
 
 ### Example
 
@@ -403,65 +388,10 @@ Mark the currently enabled set of custom nodes as GOOD (the problem is absent wi
 
 ```json
 {
-  "tool": "bisect_good",
-  "arguments": {}
-}
-```
-
----
-
-## bisect_bad
-
-Mark the currently enabled set of custom nodes as BAD (the problem is present with this set). Narrows the bisection to the enabled subset and enables the next subset to test. Resolves and reports the culprit when one node remains.
-
-<Note>This tool takes no parameters.</Note>
-
-### Example
-
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
-
-```json
-{
-  "tool": "bisect_bad",
-  "arguments": {}
-}
-```
-
----
-
-## bisect_reset
-
-Re-enable all custom nodes and clear the current bisect session. Use this to abort a bisection or restore the installation after the search completes.
-
-<Note>This tool takes no parameters.</Note>
-
-### Example
-
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
-
-```json
-{
-  "tool": "bisect_reset",
-  "arguments": {}
-}
-```
-
----
-
-## bisect_status
-
-Report the current bisect session state: status (idle/running/resolved), the remaining candidate node set, which nodes are enabled this round, and the identified culprit if resolved.
-
-<Note>This tool takes no parameters.</Note>
-
-### Example
-
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
-
-```json
-{
-  "tool": "bisect_status",
-  "arguments": {}
+  "tool": "bisect",
+  "arguments": {
+    "action": "start"
+  }
 }
 ```
 
@@ -571,7 +501,7 @@ Publish a local custom-node pack to the public Comfy Registry (registry.comfy.or
 
 ## list_node_pack_files
 
-List the files in one installed custom-node pack under &lt;COMFYUI_PATH&gt;/custom_nodes/&lt;pack&gt;/ (read-only). Skips .git/, __pycache__/ and node_modules/. Use this to orient before read_node_file / search_node_packs when diagnosing or editing a pack you found via bisect_* or fix_custom_node. LOCAL-ONLY (requires COMFYUI_PATH); the pack name and every returned path are jailed to custom_nodes/.
+List the files in one installed custom-node pack under &lt;COMFYUI_PATH&gt;/custom_nodes/&lt;pack&gt;/ (read-only). Skips .git/, __pycache__/ and node_modules/. Use this to orient before read_node_file / search_node_packs when diagnosing or editing a pack you found via bisect or fix_custom_node. LOCAL-ONLY (requires COMFYUI_PATH); the pack name and every returned path are jailed to custom_nodes/.
 
 ### Parameters
 

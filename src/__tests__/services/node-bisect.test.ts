@@ -146,14 +146,14 @@ describe("bisectStart", () => {
 });
 
 describe("good/bad require a running session", () => {
-  it("bisect_good throws when idle", async () => {
+  it("bisectGood() throws when idle", async () => {
     const { controller } = makeController(["a", "b"]);
     await expect(bisectGood({ controller })).rejects.toThrow(
       /No bisect session is in progress/i,
     );
   });
 
-  it("bisect_bad throws when idle", async () => {
+  it("bisectBad() throws when idle", async () => {
     const { controller } = makeController(["a", "b"]);
     await expect(bisectBad({ controller })).rejects.toThrow(
       /No bisect session is in progress/i,

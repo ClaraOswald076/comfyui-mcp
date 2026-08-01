@@ -426,12 +426,12 @@ function describe(state: BisectState): string {
       : "Resolved: no candidate nodes remain (problem not attributable to a single node).";
   }
   if (state.status === "idle") {
-    return "No bisect session is active. Run bisect_start to begin.";
+    return 'No bisect session is active. Run bisect (action:"start") to begin.';
   }
   return (
     `Round in progress: ${state.range.length} candidate node(s) remain. ` +
     `${state.active.length} enabled this round, ${state.all.length - state.active.length} disabled. ` +
-    `Reproduce your problem now, then call bisect_good (problem gone) or bisect_bad (problem persists).`
+    `Reproduce your problem now, then call bisect (action:"good") if the problem is gone or bisect (action:"bad") if it persists.`
   );
 }
 
@@ -492,7 +492,7 @@ export async function bisectStart(deps?: BisectDeps): Promise<ApplyResult> {
 function requireRunning(): BisectState {
   if (!session || session.status !== "running") {
     throw new NodeBisectError(
-      "No bisect session is in progress. Run bisect_start first.",
+      'No bisect session is in progress. Run bisect (action:"start") first.',
     );
   }
   return session;
