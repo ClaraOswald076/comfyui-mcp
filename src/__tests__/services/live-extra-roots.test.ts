@@ -260,6 +260,46 @@ describe("getLiveExtraModelRoots — fail-closed authorization", () => {
     },
   );
 
+  winIt(
+    "%VAR% expands and %%VAR%% is an escaped literal % (percent-sentinel round-trips)",
+    async () => {
+      const liveRoot = await trackTmp();
+      const target = resolve("D:\\real");
+      process.env.CMCP_PCT_VAR = target;
+      markLocalComfyUILaunched();
+      try {
+        await writeFile(
+          join(liveRoot, "extra_model_paths.yaml"),
+          [
+            "expand:",
+            '  base_path: "%CMCP_PCT_VAR%"',
+            "  unet: unet",
+            "escaped:",
+            '  base_path: "%%CMCP_PCT_VAR%%"',
+            "  vae: vae",
+          ].join("\n"),
+          "utf-8",
+        );
+        const res = await getLiveExtraModelRoots(reachable(["python", join(liveRoot, "main.py")]));
+        // %VAR% expands to the env value…
+        expect(res.roots).toContainEqual({
+          category: "unet",
+          dir: resolve(target, "unet"),
+          group: "expand",
+        });
+        // …%%VAR%% is an ESCAPED literal `%CMCP_PCT_VAR%` (not the expanded value),
+        // proving the percent sentinel round-trips without leaking or over-expanding.
+        expect(res.roots).toContainEqual({
+          category: "vae",
+          dir: resolve(liveRoot, "%CMCP_PCT_VAR%", "vae"),
+          group: "escaped",
+        });
+      } finally {
+        delete process.env.CMCP_PCT_VAR;
+      }
+    },
+  );
+
   it("P1a: does NOT expand a $VAR in a per-category entry (ComfyUI leaves subpaths literal)", async () => {
     const liveRoot = await trackTmp();
     const baseAbs = resolve("/opt/base");
