@@ -32,6 +32,9 @@ const mockSpawn = vi.hoisted(() => vi.fn());
 const mockGetSystemStats = vi.hoisted(() => vi.fn());
 const mockResetClient = vi.hoisted(() => vi.fn());
 const mockExistsSync = vi.hoisted(() => vi.fn((_p: string) => true));
+// statSync backs isRegularFile (#535 regular-file validation). By default any path
+// that "exists" is a regular file; individual tests override to model a directory.
+const mockIsFile = vi.hoisted(() => vi.fn((_p: string) => true));
 const mockFindComfyuiPython = vi.hoisted(() => vi.fn());
 const mockResolveBase = vi.hoisted(() => vi.fn<[], string | undefined>());
 const mockLiveRootFromArgv = vi.hoisted(() =>
@@ -52,6 +55,17 @@ vi.mock("node:child_process", () => ({
 
 vi.mock("node:fs", () => ({
   existsSync: mockExistsSync,
+  // The live-cwd /proc reader is injected via setLiveCwdResolver in these tests;
+  // keep a throwing stub so any un-mocked call path stays refuse-safe (#535).
+  readlinkSync: vi.fn(() => {
+    throw new Error("no /proc in test");
+  }),
+  // isRegularFile(#535) calls statSync().isFile(); throw for non-existent paths so
+  // it returns false, mirroring existsSync, and honor per-test isFile overrides.
+  statSync: vi.fn((p: string) => {
+    if (!mockExistsSync(String(p))) throw new Error("ENOENT");
+    return { isFile: () => mockIsFile(String(p)) };
+  }),
 }));
 
 vi.mock("../../comfyui/client.js", () => ({
@@ -135,6 +149,8 @@ beforeEach(() => {
     const s = String(p);
     return s === ABS_MAIN || s === ABS_PYTHON;
   });
+  // Default: everything that exists is a regular file (tests override to model dirs).
+  mockIsFile.mockImplementation((_p: string) => true);
   // Running server exposes the RELATIVE portable-launcher script path.
   mockGetSystemStats.mockResolvedValue({
     system: { argv: ["ComfyUI\\main.py", "--port", "8188"] },
@@ -192,6 +208,190 @@ describe("restart_comfyui — live-first script resolution (#476, #426)", () => 
       system: { argv: ["main.py", "--port", "8188"] },
     });
     mockExistsSync.mockImplementation((p: string) => String(p) === ABS_PYTHON);
+    mockLivePortThenFree();
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(false);
+    expect(result.started).toBe(false);
+    expect(result.message).toMatch(/refusing to restart/i);
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(killSpy).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  });
+
+  it("RESTARTS a bare relative `main.py` by anchoring to the LIVE process cwd when no canonical base exists (#535)", async () => {
+    // #535: `python main.py …` with an unset/stale COMFYUI_PATH → no canonical
+    // base, no argv-derived live root — but the reachable process's cwd points at
+    // a valid install containing main.py. Resolve the relative script against that
+    // live cwd instead of refusing.
+    const LIVE_CWD = resolve("proc", "live_comfy");
+    const LIVE_MAIN = join(LIVE_CWD, "main.py");
+    mockResolveBase.mockReturnValue(undefined); // no canonical base
+    mockLiveRootFromArgv.mockReturnValue(undefined); // no argv root
+    mockGetSystemStats.mockResolvedValue({
+      system: {
+        argv: ["main.py", "--cache-none", "--output-directory", "/data/out"],
+      },
+    });
+    // The interpreter and the LIVE-cwd main.py exist; the bare "main.py" does not.
+    mockExistsSync.mockImplementation((p: string) => {
+      const s = String(p);
+      return s === ABS_PYTHON || s === LIVE_MAIN;
+    });
+    // The running process's cwd (captured live, survives the kill).
+    __processControlTestHooks.setLiveCwdResolver(() => LIVE_CWD);
+    mockLivePortThenFree();
+    const children: FakeChild[] = [];
+    mockSpawn.mockImplementation(() => {
+      const child = new FakeChild();
+      children.push(child);
+      return child;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true }) as Response),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    // It restarted (did NOT refuse), anchoring the relative script to the live cwd.
+    expect(result.message).not.toMatch(/refusing to restart/i);
+    expect(result.stopped).toBe(true);
+    expect(result.started).toBe(true);
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+    const [exe, args, opts] = mockSpawn.mock.calls[0];
+    expect(exe).toBe(ABS_PYTHON);
+    expect(args[0]).toBe(LIVE_MAIN);
+    // Spawn FROM the live cwd, not a stale/undefined config.comfyuiPath (#535 P1).
+    expect((opts as { cwd?: string }).cwd).toBe(LIVE_CWD);
+
+    killSpy.mockRestore();
+  });
+
+  it("pairs the live-cwd script with the live-cwd's OWN python, NOT a stale-but-existing COMFYUI_PATH python (#535)", async () => {
+    // Stale COMFYUI_PATH points at an OLD install that still exists on disk (its
+    // python resolves). The live server runs `python main.py` from a DIFFERENT
+    // cwd. The relaunch must use the LIVE cwd's script AND its OWN interpreter —
+    // never the old install's python (which would relaunch under the wrong env).
+    const LIVE_CWD = resolve("proc", "live_comfy");
+    const LIVE_MAIN = join(LIVE_CWD, "main.py");
+    const LIVE_PY = join(LIVE_CWD, "venv", "bin", "python");
+    const STALE_BASE = resolve("old_install");
+    const STALE_PY = join(STALE_BASE, "venv", "bin", "python");
+    mockConfig.comfyuiPath = STALE_BASE;
+    mockResolveBase.mockReturnValue(STALE_BASE);
+    mockLiveRootFromArgv.mockReturnValue(undefined);
+    // Interpreter resolution is root-aware: live cwd -> live python; else stale.
+    mockFindComfyuiPython.mockImplementation((root?: string) =>
+      root === LIVE_CWD ? LIVE_PY : STALE_PY,
+    );
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: ["main.py", "--port", "8188"] },
+    });
+    mockExistsSync.mockImplementation((p: string) => {
+      const s = String(p);
+      return s === LIVE_MAIN || s === LIVE_PY || s === STALE_PY;
+    });
+    __processControlTestHooks.setLiveCwdResolver(() => LIVE_CWD);
+    mockLivePortThenFree();
+    mockSpawn.mockImplementation(() => new FakeChild());
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true }) as Response),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.message).not.toMatch(/refusing to restart/i);
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+    const [exe, args, opts] = mockSpawn.mock.calls[0];
+    expect(exe).toBe(LIVE_PY); // live cwd's python, NOT STALE_PY
+    expect(args[0]).toBe(LIVE_MAIN);
+    expect((opts as { cwd?: string }).cwd).toBe(LIVE_CWD);
+
+    killSpy.mockRestore();
+  });
+
+  it("REFUSES when the live-cwd `main.py` is a DIRECTORY, not a regular file (#535 atomic invariant)", async () => {
+    // existsSync alone would accept a directory named main.py; the regular-file
+    // guard must reject it so the reachable server is not killed for an unrunnable
+    // relaunch. No canonical base, so it falls through to refuse-safe.
+    const LIVE_CWD = resolve("proc", "live_comfy");
+    const LIVE_MAIN = join(LIVE_CWD, "main.py");
+    const LIVE_PY = join(LIVE_CWD, "venv", "bin", "python");
+    mockResolveBase.mockReturnValue(undefined);
+    mockLiveRootFromArgv.mockReturnValue(undefined);
+    mockFindComfyuiPython.mockReturnValue(LIVE_PY);
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: ["main.py", "--port", "8188"] },
+    });
+    mockExistsSync.mockImplementation((p: string) => {
+      const s = String(p);
+      return s === LIVE_MAIN || s === LIVE_PY;
+    });
+    // main.py exists but is a DIRECTORY; the interpreter is a real file.
+    mockIsFile.mockImplementation((p: string) => String(p) !== LIVE_MAIN);
+    __processControlTestHooks.setLiveCwdResolver(() => LIVE_CWD);
+    mockLivePortThenFree();
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(false);
+    expect(result.started).toBe(false);
+    expect(result.message).toMatch(/refusing to restart/i);
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(killSpy).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  });
+
+  it("REFUSES a live-cwd relative script when the interpreter is only a BARE PATH fallback (never kill without a validated interpreter, #535/#368)", async () => {
+    // The live cwd holds main.py, but no venv/embedded python resolves — so the
+    // interpreter is a bare `python3`. Killing then spawning that could ENOENT or
+    // run the wrong environment; the refuse-safe gate must leave the server up.
+    const LIVE_CWD = resolve("proc", "live_comfy");
+    const LIVE_MAIN = join(LIVE_CWD, "main.py");
+    mockResolveBase.mockReturnValue(undefined);
+    mockLiveRootFromArgv.mockReturnValue(undefined);
+    mockFindComfyuiPython.mockReturnValue("python3"); // bare, unvalidated
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: ["main.py", "--port", "8188"] },
+    });
+    // main.py exists under the live cwd; no absolute interpreter exists on disk.
+    mockExistsSync.mockImplementation((p: string) => String(p) === LIVE_MAIN);
+    __processControlTestHooks.setLiveCwdResolver(() => LIVE_CWD);
+    mockLivePortThenFree();
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(false);
+    expect(result.started).toBe(false);
+    expect(result.message).toMatch(/refusing to restart/i);
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(killSpy).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  });
+
+  it("still REFUSES when the live cwd does NOT contain the relative script (guard falls through to refuse-safe)", async () => {
+    // A live cwd that does not hold main.py must NOT produce a bogus absolute
+    // path — the on-disk guard rejects it and, with no canonical base, we refuse.
+    const WRONG_CWD = resolve("proc", "not_comfy");
+    mockResolveBase.mockReturnValue(undefined);
+    mockLiveRootFromArgv.mockReturnValue(undefined);
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: ["main.py", "--port", "8188"] },
+    });
+    // Only the interpreter exists; join(WRONG_CWD, "main.py") does not.
+    mockExistsSync.mockImplementation((p: string) => String(p) === ABS_PYTHON);
+    __processControlTestHooks.setLiveCwdResolver(() => WRONG_CWD);
     mockLivePortThenFree();
     const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
 
