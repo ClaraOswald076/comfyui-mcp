@@ -285,7 +285,18 @@ function isExistingDir(p: string): boolean {
   }
 }
 
-type StandaloneRootSource = "comfyui-path-env" | "comfyui-path-detected" | "default-workspace";
+type StandaloneRootSource = "comfyui-path-env" | "comfyui-path-inferred" | "default-workspace";
+
+/** Same on-disk location? Normalized, and case-insensitive on Windows. */
+function samePath(a: string, b: string): boolean {
+  try {
+    const na = resolve(a);
+    const nb = resolve(b);
+    return process.platform === "win32" ? na.toLowerCase() === nb.toLowerCase() : na === nb;
+  } catch {
+    return false;
+  }
+}
 
 function standaloneRoot(): { root: string; source: StandaloneRootSource } {
   const root = resolveEffectiveComfyUIBase();
@@ -303,18 +314,24 @@ function standaloneRoot(): { root: string; source: StandaloneRootSource } {
     );
   }
   // config.comfyuiPath is what resolveEffectiveComfyUIBase prefers, so its presence (not
-  // a re-derivation) separates it from the saved default; process.env.COMFYUI_PATH then
-  // separates an EXPLICIT root from a startup auto-detection.
-  const source: StandaloneRootSource = config.comfyuiPath
-    ? process.env.COMFYUI_PATH
+  // a re-derivation) separates it from the saved default. Only a root that is LITERALLY
+  // what COMFYUI_PATH says is "explicit": config.ts also runs descendToNestedRoot(), so
+  // an env var naming a Desktop-installer WRAPPER yields `<wrapper>/ComfyUI` — a path
+  // this process INFERRED, which can vanish while the wrapper survives (codex round 4).
+  // Anything inferred is gated exactly like the saved default workspace.
+  const envPath = process.env.COMFYUI_PATH;
+  const source: StandaloneRootSource = !config.comfyuiPath
+    ? "default-workspace"
+    : envPath && samePath(config.comfyuiPath, envPath)
       ? "comfyui-path-env"
-      : "comfyui-path-detected"
-    : "default-workspace";
+      : "comfyui-path-inferred";
   if (source !== "comfyui-path-env" && !isExistingDir(root)) {
     const origin =
       source === "default-workspace"
-        ? 'the saved default workspace (set_default_workspace) — the install was probably moved, renamed or deleted since it was saved'
-        : "an auto-detected ComfyUI install — it has since been moved, renamed or deleted";
+        ? "the saved default workspace (set_default_workspace) — the install was probably moved, renamed or deleted since it was saved"
+        : "a ComfyUI root this process INFERRED rather than one you named literally " +
+          "(startup auto-detection, or a nested root descended from COMFYUI_PATH) — it has " +
+          "since been moved, renamed or deleted";
     throw new ValidationError(
       `UNRESOLVED: "${root}" is not an existing directory, so it cannot be used to locate ` +
         `extra_model_paths.yaml. That path came from ${origin}. Nothing was read or ` +

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 
 // isRemoteMode is consulted by resolveEffectiveComfyUIBase (the shared workspace
 // resolver extra-paths now delegates to for the standalone root, #648), so the config
@@ -52,9 +52,9 @@ const oldComfyuiPathEnv = process.env.COMFYUI_PATH;
 
 beforeEach(() => {
   config.comfyuiPath = undefined;
-  // Tests that set config.comfyuiPath model an EXPLICIT COMFYUI_PATH unless they say
-  // otherwise; process.env.COMFYUI_PATH is the env-vs-auto-detected discriminator.
-  process.env.COMFYUI_PATH = "explicit";
+  // process.env.COMFYUI_PATH is the explicit-vs-inferred discriminator: a test that
+  // means "the user named this root" sets it to the same path as config.comfyuiPath.
+  delete process.env.COMFYUI_PATH;
   dirs = [];
   mockResolveServerExtraModelConfig.mockResolvedValue(undefined);
   mockIsRemoteMode.mockReturnValue(false);
@@ -405,7 +405,34 @@ describe("standalone root precedence — saved default workspace (#648)", () => 
     delete process.env.COMFYUI_PATH; // → auto-detected
 
     await expect(listExtraPaths({ target: "standalone" })).rejects.toThrow(/UNRESOLVED/);
-    await expect(listExtraPaths({ target: "standalone" })).rejects.toThrow(/auto-detected/i);
+    await expect(listExtraPaths({ target: "standalone" })).rejects.toThrow(/INFERRED/);
+  });
+
+  it("a DESCENDED COMFYUI_PATH (nested root) that vanished IS gated (codex round 4)", async () => {
+    // config.ts's descendToNestedRoot turns a Desktop-installer wrapper named by
+    // COMFYUI_PATH into <wrapper>/ComfyUI. That nested root is inferred, not named, and
+    // can vanish while the wrapper survives — so it must NOT be recreated by mkdir -p.
+    const wrapper = await trackTmp();
+    const nested = join(wrapper, "ComfyUI");
+    process.env.COMFYUI_PATH = wrapper; // what the user set
+    config.comfyuiPath = nested; // what config.ts descended to; now gone
+
+    await expect(listExtraPaths({ target: "standalone" })).rejects.toThrow(/UNRESOLVED/);
+    await expect(
+      addExtraPath({ target: "standalone", category: "loras", path: "E:/loras" }),
+    ).rejects.toThrow(/UNRESOLVED/);
+    expect(existsSync(nested)).toBe(false);
+  });
+
+  it("an UN-descended COMFYUI_PATH is still explicit even with a trailing separator", async () => {
+    // Path comparison is normalized, so `D:\ComfyUI\` and `D:\ComfyUI` are the same root
+    // and the explicit (ungated) classification is not lost to cosmetics.
+    const gone = join(await trackTmp(), "no-such-install");
+    config.comfyuiPath = gone;
+    process.env.COMFYUI_PATH = `${gone}${sep}`;
+
+    const result = await listExtraPaths({ target: "standalone" });
+    expect(result.exists).toBe(false);
   });
 
   it("an explicit config_path is honored with no workspace lookup at all", async () => {
