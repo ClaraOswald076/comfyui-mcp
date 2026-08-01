@@ -6,6 +6,18 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.31] - 2026-08-01
+
+### MCP
+
+#### Added
+- panel_civitai_results returns inline sample images so the agent can SEE them (#623) (#628)
+
+#### Fixed
+- resolve local workspace via shared fallback when COMFYUI_PATH unset (#506) (#629)
+- drop superseded-attempt terminal events (panel#489) (#627)
+
+
 ## [0.48.30] - 2026-08-01
 
 ### Fixed
