@@ -3,8 +3,13 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir, platform } from "node:os";
 import { dirname, join, isAbsolute, resolve } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
-import { config } from "../config.js";
-import { resolveServerExtraModelConfig } from "./output-dir.js";
+import { config, isRemoteMode } from "../config.js";
+import {
+  resolveServerExtraModelConfig,
+  parseExtraModelPathsConfigsFromArgvRaw,
+  type LiveServerSnapshot,
+} from "./output-dir.js";
+import { liveRootFromArgv } from "./workspace-env.js";
 import { ValidationError } from "../utils/errors.js";
 
 export const EXTRA_PATH_TARGETS = ["auto", "standalone", "desktop"] as const;
@@ -302,6 +307,83 @@ export async function getExtraModelRoots(
     }
   }
   return roots;
+}
+
+/**
+ * The extra model roots the LIVE, running ComfyUI ACTUALLY registers — for the ONE
+ * purpose of AUTHORIZING a write into a symlinked download destination that escapes
+ * the primary models dir (#633). Authorization must be fail-closed and anchored to
+ * the running server, NEVER a stale/static local config the server does not load
+ * (codex P0d): a config the server no longer reads must not authorize an escaping
+ * symlink, and an unreachable server must authorize nothing.
+ *
+ * Takes the SINGLE live `/system_stats` snapshot the caller already used to resolve
+ * the models/base dirs — NOT its own stats call — so authorization roots can never
+ * come from a different server state than the code-root veto (codex inter-snapshot
+ * race). Trusted sources, all from that snapshot, so a stale local COMFYUI_PATH /
+ * default-workspace config can never authorize an escape:
+ *   - every ABSOLUTE `--extra-model-paths-config` file the server was LAUNCHED with
+ *     (raw argv values; a RELATIVE flag value is SKIPPED — it can't be resolved to
+ *     the live server's file from the MCP process, so trusting it would let a stale
+ *     local same-named config authorize; fail closed); and
+ *   - `<live main.py root>/extra_model_paths.yaml` — ComfyUI's auto-loaded default,
+ *     anchored to the server's OWN install root (its main.py dir from argv), NOT an
+ *     arbitrary base dir or the local workspace.
+ *
+ * Relative `base_path` / category paths are resolved against the CONFIG FILE's own
+ * directory, exactly as ComfyUI resolves them — never against the MCP process CWD —
+ * so a same-named/relative config in a stale workspace cannot misattribute a root.
+ *
+ * Returns `authoritative: false` (and no roots) whenever the server was unreachable,
+ * so the caller REFUSES every escaping symlink rather than authorize from a guess.
+ * Never throws.
+ */
+export async function getLiveExtraModelRoots(
+  snapshot: LiveServerSnapshot,
+): Promise<{ authoritative: boolean; roots: ExtraModelRoot[] }> {
+  if (!snapshot?.reachable) return { authoritative: false, roots: [] };
+  const argv = snapshot.argv;
+  const configPaths = new Set<string>();
+  // Launched flag files — ABSOLUTE values only (relative → fail closed, see docblock).
+  for (const raw of parseExtraModelPathsConfigsFromArgvRaw(argv)) {
+    if (isAbsolute(raw)) configPaths.add(resolve(raw));
+  }
+  // Auto-loaded default in the LIVE install root (its main.py dir). Skip in remote
+  // mode: the live root is a path on the remote host.
+  if (!isRemoteMode()) {
+    const liveRoot = liveRootFromArgv(argv, snapshot.cwd);
+    if (liveRoot) configPaths.add(resolve(liveRoot, "extra_model_paths.yaml"));
+  }
+
+  const roots: ExtraModelRoot[] = [];
+  for (const cfg of configPaths) {
+    if (!existsSync(cfg)) continue;
+    let raw: Record<string, unknown>;
+    try {
+      raw = parseConfig(await readFile(cfg, "utf-8"));
+    } catch {
+      continue; // unreadable/malformed — skip; never authorize from a bad file
+    }
+    // Match ComfyUI: relative entries resolve against the YAML file's OWN directory.
+    const cfgDir = dirname(resolve(cfg));
+    for (const [name, value] of Object.entries(raw)) {
+      const group = readGroup(value, name);
+      if (!group) continue;
+      const rawBase = group.base_path?.trim();
+      const base = rawBase
+        ? isAbsolute(rawBase)
+          ? resolve(rawBase)
+          : resolve(cfgDir, rawBase)
+        : undefined;
+      for (const category of group.categories) {
+        for (const p of category.paths) {
+          const dir = isAbsolute(p) ? resolve(p) : resolve(base ?? cfgDir, p);
+          roots.push({ category: category.category, dir, group: name });
+        }
+      }
+    }
+  }
+  return { authoritative: true, roots };
 }
 
 function ensureGroup(raw: Record<string, unknown>, name: string): Record<string, unknown> {

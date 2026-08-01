@@ -53,15 +53,17 @@ vi.mock("../../services/output-dir.js", () => ({
   resolveModelsDirWithBases: vi.fn(async () => ({
     modelsDir: "/comfy/models",
     baseDirs: [],
+    snapshot: { reachable: false },
   })),
 }));
 
-// The symlink-escape guard now consults registered extra_model_paths roots (#633).
-// Stub to none so these path-safety tests stay hermetic and an escaping symlink is
-// still refused (there is no registered root to land in). The #633 allowance is
-// covered by its own dedicated test file.
+// The symlink-escape guard consults registered extra_model_paths roots (#633).
+// Stub to none (and non-authoritative live roots) so these path-safety tests stay
+// hermetic and an escaping symlink is still refused (nothing authorizes an escape).
+// The #633 allowance + fail-closed authorization are covered in a dedicated file.
 vi.mock("../../services/extra-paths.js", () => ({
   getExtraModelRoots: vi.fn(async () => []),
+  getLiveExtraModelRoots: vi.fn(async () => ({ authoritative: false, roots: [] })),
 }));
 
 import { config } from "../../config.js";

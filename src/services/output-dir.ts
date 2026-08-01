@@ -22,6 +22,17 @@ import { logger } from "../utils/logger.js";
 // override the directory. Same class of fix as the doubled-COMFYUI_PATH bug.
 // ---------------------------------------------------------------------------
 
+/**
+ * A single `/system_stats` snapshot: the live server's launch argv and reported cwd,
+ * captured ONCE so every derivation (models dir, base dirs, authorized extra roots)
+ * reflects the SAME server state — never a mix of two calls that straddled a restart.
+ */
+export interface LiveServerSnapshot {
+  reachable: boolean;
+  argv?: string[];
+  cwd?: string;
+}
+
 /** Resolve a possibly-relative dir against a base (or COMFYUI_PATH, or cwd). */
 function resolveDir(value: string, base?: string): string {
   if (isAbsolute(value)) return resolve(value);
@@ -130,6 +141,24 @@ export function parseExtraModelPathsConfigsFromArgv(argv: string[] | undefined):
 }
 
 /**
+ * Like parseExtraModelPathsConfigsFromArgv but returns the RAW flag values WITHOUT
+ * resolving relatives. Security-critical for AUTHORIZATION (getLiveExtraModelRoots,
+ * #633): a RELATIVE `--extra-model-paths-config` value cannot be safely resolved to
+ * the live server's file from the MCP process — resolveDir() would anchor it to the
+ * local COMFYUI_PATH / MCP cwd, so a stale local same-named config could authorize
+ * an escape the running server never loads (codex P0d). The authorizing caller keeps
+ * only ABSOLUTE values and fails closed on relative ones.
+ */
+export function parseExtraModelPathsConfigsFromArgvRaw(argv: string[] | undefined): string[] {
+  if (!argv || argv.length === 0) return [];
+  const out: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    for (const v of multiFlagValues(argv, i, "--extra-model-paths-config")) out.push(v);
+  }
+  return out;
+}
+
+/**
  * Resolve the models directory the CONNECTED server actually reads from AND, from
  * the SAME `/system_stats` call, the candidate ComfyUI *base install* directories
  * (used by the download destination guard to locate `custom_nodes` code roots).
@@ -152,13 +181,22 @@ export function parseExtraModelPathsConfigsFromArgv(argv: string[] | undefined):
 export async function resolveModelsDirWithBases(): Promise<{
   modelsDir: string;
   baseDirs: string[];
+  /** The SAME /system_stats snapshot the models/base dirs were derived from — so a
+   *  downstream authorizer (getLiveExtraModelRoots, #633) uses ONE consistent
+   *  snapshot and can never mix roots from a server that changed between two calls
+   *  (codex inter-snapshot race). `reachable` is false when the server was down. */
+  snapshot: LiveServerSnapshot;
 }> {
   const baseDirs = new Set<string>();
   let modelsDir: string | undefined;
+  const snapshot: LiveServerSnapshot = { reachable: false };
   try {
     const stats = await getSystemStats();
     const argv = stats.system?.argv;
     const cwd = (stats.system as { cwd?: string })?.cwd;
+    snapshot.reachable = true;
+    snapshot.argv = argv;
+    snapshot.cwd = cwd;
     // Collect base-install dirs (LOCAL only) from the SAME call, regardless of how
     // the models dir resolves, so the code-root veto always has the real
     // --base-directory / live-root even when --models-directory diverges.
@@ -208,7 +246,7 @@ export async function resolveModelsDirWithBases(): Promise<{
           "or connect to a running ComfyUI so its models directory can be detected.",
       );
   }
-  return { modelsDir, baseDirs: [...baseDirs] };
+  return { modelsDir, baseDirs: [...baseDirs], snapshot };
 }
 
 /**
