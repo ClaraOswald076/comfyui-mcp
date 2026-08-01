@@ -99,10 +99,12 @@ describe("in-place workflow replacement resets the live session (#570 P0)", () =
   });
 
   it("#570: a backend switch RETIRES the prior provider (preserves its session) so switching back resumes", async () => {
-    // set_backend on the SAME workflow must NOT reset the old provider — that would clear its
-    // durable exact record, and a SAVED wf: workflow has no stable-key fallback, so switching
-    // back could never resume. retire() stops the live agent but keeps the identity-bound
-    // session, so a later switch-back continues the original conversation (codex round-trip).
+    // BOTH provider-switch protocols on the SAME workflow — the explicit set_backend event AND
+    // a re-hello that selects a different backend — now funnel to manager.retire(prevKey). They
+    // must NOT reset the old provider: that would clear its durable exact record, and a SAVED
+    // wf: workflow has no stable-key fallback, so switching back could never resume. retire()
+    // stops the live agent but keeps the identity-bound session, so a later switch-back
+    // continues the original conversation (codex round-trip). This pins that shared operation.
     const backend = new SessioningBackend();
     const store = new SessionStore(PORT);
     const manager = new PanelAgentManager({

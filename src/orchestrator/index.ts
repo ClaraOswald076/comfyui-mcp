@@ -2692,10 +2692,13 @@ export async function runPanelOrchestrator(): Promise<void> {
       }
       const prev = tabBackends.get(panelTab);
       if (prev && prev !== backend) {
-        // Provider switch: retire the previous provider's agent for this tab so it
-        // doesn't linger. The new provider starts a FRESH session (the panel
-        // replays the transcript as context on its first message to seed it).
-        manager.reset(panelTab + AGENT_KEY_SEP + prev);
+        // #570 — Provider switch via re-hello: RETIRE (not reset) the previous provider's
+        // agent so it stops lingering but its identity-bound durable session is PRESERVED. A
+        // provider switch stays on the SAME workflow, so reset() here would irreversibly lose
+        // the prior provider's conversation on an A→B→A re-hello switch (a SAVED wf: workflow
+        // has no stable-key fallback) — matching the set_backend path (codex). The NEW provider
+        // still starts fresh (the panel replays the transcript as context on its first message).
+        manager.retire(panelTab + AGENT_KEY_SEP + prev);
         bridge.broadcastTabList(); // live agent dropped on backend switch → refresh dot
       }
       tabBackends.set(panelTab, backend);
