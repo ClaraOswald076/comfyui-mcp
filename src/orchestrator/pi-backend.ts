@@ -115,7 +115,20 @@ function killProcessTree(pid: number | undefined): void {
  */
 export function resolvePiBin(home: string = homedir()): string | null {
   const override = process.env.COMFYUI_MCP_PI_PATH?.trim();
-  if (override) return override;
+  if (override) {
+    // Apply the SAME .cmd/.bat refusal as PATH discovery below — the override
+    // must NOT be an escape hatch around it. Node cannot shell-lessly spawn a
+    // .cmd/.bat, and we never spawn through a shell (the prompt is user data —
+    // shell-quoting it would be an injection risk). A shim override is ignored
+    // with a warning so the actionable "install pi/pi.exe" path fires.
+    if (/\.(cmd|bat)$/i.test(override)) {
+      logger.warn(
+        `[pi-backend] COMFYUI_MCP_PI_PATH points at a shell shim (${override}); Node cannot spawn a .cmd/.bat shell-lessly — ignoring it. Point COMFYUI_MCP_PI_PATH at the real pi/pi.exe.`,
+      );
+      return null;
+    }
+    return override;
+  }
   // A `.cmd`/`.bat` shim is deliberately NOT accepted for SPAWNING: Node refuses
   // shell-less `.cmd` spawns post-CVE-2024-27980, and we never spawn through a
   // shell (the prompt is user data — shell-quoting it would be an injection
@@ -292,14 +305,23 @@ export class PiBackend implements AgentBackend {
     const cwd = opts.cwd ?? this.deps.cwd ?? process.cwd();
 
     const resumeId = (opts.resume ?? opts.sessionId) || null;
+    // Guard against a legacy-persisted bogus sentinel (older builds emitted one
+    // before the header arrived); never resume from it.
     if (resumeId && resumeId !== PI_SESSION_SENTINEL) this.piSessionId = resumeId;
     this.needsSystemPreamble = !this.piSessionId && !!this.deps.systemAppend;
 
-    yield {
-      type: "session",
-      sessionId: this.piSessionId ?? PI_SESSION_SENTINEL,
-      ...(this.model ? { model: this.model } : {}),
-    };
+    // Report a session id ONLY when it is REAL: on resume we already hold the
+    // caller's id, so surface it up front; on a FRESH conversation we emit NO
+    // session event until pi's JSON header reveals the real uuid (runTurn pushes
+    // it then). This prevents a pre-header failure (spawn error, over-long
+    // prompt, early exit) from persisting a bogus "pending" id up the stack.
+    if (this.piSessionId) {
+      yield {
+        type: "session",
+        sessionId: this.piSessionId,
+        ...(this.model ? { model: this.model } : {}),
+      };
+    }
 
     for await (const turn of opts.channel) {
       yield* this.runTurn(turn, cwd, opts.onActivity);

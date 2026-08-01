@@ -85,7 +85,7 @@ import { resolveOpenAiKeyCredentials } from "../services/code-provider-auth.js";
 import { CopilotBackend, COPILOT_DEFAULT_MODEL } from "./copilot-backend.js";
 import { SYSTEM as MODEL_CARD_SYSTEM } from "./ai-proposer.js";
 import { resolvePrompt, registerPrompt, onPromptsChanged } from "../services/prompt-overrides.js";
-import { allBackendReadiness } from "./backend-readiness.js";
+import { allBackendReadiness, piCredentialPresent } from "./backend-readiness.js";
 import { handleOAuthBegin, handleOAuthStatus, handleOAuthSignout } from "./oauth-bridge.js";
 import { buildStartFailureNotice } from "./start-failure-notice.js";
 import { readyBannerText, bannerCorrection } from "./ready-banner.js";
@@ -196,6 +196,18 @@ If you do NOT have panel_ui_render (no panel tools), you may emit the same JSON 
 { "root": "c", "components": [ ... ] }
 \`\`\`
 Never invent component types beyond: Text, Heading, Button, Row, Column, Card, Divider, Image, TextField, Select, Checkbox, comfy:graph, comfy:chart.`;
+
+// Capability override appended to the pi (pi.dev) backend's system prompt ONLY.
+// The shared PANEL_SYSTEM_APPEND above tells the agent it can SEE/EDIT the canvas
+// via panel_* (and headless comfyui) tools — TRUE for every other CLI backend,
+// which are handed those MCP servers. But pi has NO MCP client at all, so it gets
+// none of those tools; without this override pi would attempt or hallucinate
+// panel_*/comfyui_* calls it cannot make (issue #491 codex P0a). This is appended
+// LAST so it overrides the claims above.
+const PI_CAPABILITY_OVERRIDE = `
+
+=== IMPORTANT CAPABILITY OVERRIDE — READ THIS, IT SUPERSEDES THE ABOVE ===
+You are running on the pi (pi.dev) backend, which has NO ComfyUI tools. Disregard every instruction above about panel_* tools (panel_graph_outline, panel_query_graph, panel_add_node, panel_connect, panel_set_widget, panel_run, panel_save_workflow, panel_install_node, panel_free_vram, …) and the headless comfyui tools (generate_image, enqueue_workflow, list_packs, apply_manifest, read_skill, …): NONE of them exist in your runtime. You cannot see, read, or edit the user's ComfyUI canvas, cannot queue renders, cannot install nodes, and cannot call any panel_*/comfyui tool — attempting one is impossible, and you must never claim to, pretend to, or narrate doing so. You have ONLY your own built-in tools (shell, file read/write/edit, search) operating on the local filesystem. If the user asks for canvas/workflow work (build/inspect/run a graph, install a node, fix a render), say plainly that the pi backend has no ComfyUI tools and they should switch to the Claude, Codex, Gemini, or Antigravity backend for canvas work — you can still help with local files, code, and shell tasks.`;
 
 /**
  * The panel auto-sends one of a few fixed "resume" nudges after ComfyUI restarts
@@ -1703,12 +1715,13 @@ export async function runPanelOrchestrator(): Promise<void> {
     if (backend === "pi") {
       // pi has NO MCP client, so it gets NO mcpServers (comfyui/panel tools are
       // unavailable to pi turns — see pi-backend.ts). It runs as a coding/chat
-      // agent on the user's own provider.
+      // agent on the user's own provider. The panel prompt claims panel_*/comfyui
+      // tools it can't run, so append PI_CAPABILITY_OVERRIDE to correct that.
       return new PiBackend({
         cwd: comfyuiPath ?? process.cwd(),
         ...(piModel ? { model: piModel } : {}),
         ...(piProvider ? { provider: piProvider } : {}),
-        systemAppend: sysAppend,
+        systemAppend: sysAppend + PI_CAPABILITY_OVERRIDE,
       });
     }
     if (backend === "grok") {
@@ -3074,6 +3087,26 @@ export async function runPanelOrchestrator(): Promise<void> {
         );
         bridge.push({ type: "ack", ok: false, kind: "degraded" }, panelTab);
         logger.warn(`[panel-orchestrator] tab ${panelTab.slice(0, 8)} connected (openrouter) but no API key — degraded ack`);
+        return;
+      }
+      // pi with no verifiable provider credential: `pi --list-models` prints the
+      // built-in catalog with NO key, so the model probe below would "succeed"
+      // and greet green-ready — then the first real turn fails. Degrade up front
+      // (mirrors the OpenRouter keyless guard) so pi is never falsely ready
+      // (#491 codex P1a).
+      if (isPi && !piCredentialPresent()) {
+        bridge.push(
+          {
+            type: "say",
+            text:
+              "⚠️ pi has no provider credential configured — the connection would greet ready and then fail on your first message. " +
+              "Configure a provider: set a provider API key (e.g. ANTHROPIC_API_KEY / OPENAI_API_KEY) and restart the orchestrator, " +
+              "or run `pi` once and `/login` (stored in ~/.pi/agent/auth.json), then Disconnect → Connect. https://pi.dev",
+          },
+          panelTab,
+        );
+        bridge.push({ type: "ack", ok: false, kind: "degraded" }, panelTab);
+        logger.warn(`[panel-orchestrator] tab ${panelTab.slice(0, 8)} connected (pi) but no verifiable provider credential — degraded ack`);
         return;
       }
       // Custom endpoint with no URL: don't dial a guess — degrade up front

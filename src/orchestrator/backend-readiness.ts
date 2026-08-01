@@ -70,6 +70,20 @@ const PI_PROVIDER_ENV_KEYS: readonly string[] = [
   "MINIMAX_API_KEY",
 ];
 
+/** True when pi has a VERIFIABLE provider credential: its auth file
+ *  (~/.pi/agent/auth.json — API keys and `/login` subscriptions) exists, OR a
+ *  non-stripped provider key is in env. This is the honest "ready" signal (pi's
+ *  `--list-models` is not an auth probe), and the connect handler uses it too so
+ *  a keyless pi is degraded up front instead of greeted green (#491 codex P1a).
+ *  A credential we can't see (some other pi config) reads false here — we
+ *  under-claim rather than false-greet. */
+export function piCredentialPresent(home: string = homedir()): boolean {
+  return (
+    fileExists(home, ".pi", "agent", "auth.json") ||
+    PI_PROVIDER_ENV_KEYS.some((k) => !!process.env[k]?.trim())
+  );
+}
+
 /** Well-known Ollama install locations probed in addition to PATH (the Windows
  *  installer adds PATH for NEW shells only — an orchestrator started from an
  *  older shell would false-flag "not installed"). */
@@ -275,16 +289,17 @@ export function backendReadiness(
   if (b === "pi") {
     // pi.dev CLI (`pi`, issue #491) — a multi-provider coding agent. Auth lives
     // in ~/.pi/agent/auth.json (API keys + `/login` subscriptions) or provider
-    // env vars. We can prove a definite login when auth.json exists OR a common
-    // provider key is set; otherwise auth is UNKNOWN (null, don't nag) when the
-    // CLI is present, since pi may be configured a way we can't cheaply see. The
-    // real failure surfaces via the first turn's actionable credential error.
+    // env vars. UNLIKE agy, `pi --list-models` is NOT an auth probe (it prints
+    // the built-in catalog with no key), so readiness must NOT key off the CLI
+    // alone — that would greet a keyless pi green-ready and then fail its first
+    // turn (issue #491 codex P1a). We report ready ONLY when a usable credential
+    // is verifiable (auth.json OR a non-stripped provider key in env); when the
+    // CLI is present but no credential is verifiable, auth is UNKNOWN (null) and
+    // ready is FALSE — the panel then shows "configure a provider", not green.
     const cli = !!resolvePiBin(home);
-    const authKnown =
-      fileExists(home, ".pi", "agent", "auth.json") ||
-      PI_PROVIDER_ENV_KEYS.some((k) => !!process.env[k]?.trim());
+    const authKnown = piCredentialPresent(home);
     const auth = authKnown ? true : cli ? null : false;
-    return { backend: "pi", cli, auth, ready: cli };
+    return { backend: "pi", cli, auth, ready: cli && authKnown };
   }
   if (b === "grok") {
     const cli = onPath(CLI_NAMES.grok);

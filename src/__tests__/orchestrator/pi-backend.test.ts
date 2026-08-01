@@ -9,7 +9,7 @@
 // invariant on failures, interrupt, tool-secret scoping, and `pi --list-models`
 // parsing.
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
@@ -175,13 +175,61 @@ describe("parsePiModels", () => {
   });
 });
 
+// Provider env keys pi's readiness treats as a verifiable credential — must be
+// cleared for deterministic "no credential" assertions (the dev machine may have
+// one set).
+const PI_ENV_KEYS = [
+  "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY", "OPENROUTER_API_KEY",
+  "DEEPSEEK_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY", "ZAI_API_KEY",
+  "KIMI_API_KEY", "MINIMAX_API_KEY",
+];
+function withNoPiEnvKeys<T>(fn: () => T): T {
+  const saved: Record<string, string | undefined> = {};
+  for (const k of PI_ENV_KEYS) {
+    saved[k] = process.env[k];
+    delete process.env[k];
+  }
+  try {
+    return fn();
+  } finally {
+    for (const k of PI_ENV_KEYS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k]!;
+    }
+  }
+}
+
 describe("resolvePiBin / readiness", () => {
-  it("honors the COMFYUI_MCP_PI_PATH override and reads ready when the CLI is present", () => {
+  it("honors the COMFYUI_MCP_PI_PATH override", () => {
     expect(resolvePiBin()).toBe(FAKE_BIN);
-    const r = backendReadiness("pi", { home: workDir });
-    expect(r.backend).toBe("pi");
-    expect(r.cli).toBe(true);
-    expect(r.ready).toBe(true); // ready keys off CLI presence (auth verified at connect)
+  });
+
+  it("REFUSES a .cmd/.bat override (Node can't shell-lessly spawn it) — P1c", () => {
+    const saved = process.env.COMFYUI_MCP_PI_PATH;
+    try {
+      process.env.COMFYUI_MCP_PI_PATH = "C:/tools/pi.cmd";
+      expect(resolvePiBin(workDir)).toBeNull();
+      process.env.COMFYUI_MCP_PI_PATH = "/usr/local/bin/pi.bat";
+      expect(resolvePiBin(workDir)).toBeNull();
+    } finally {
+      process.env.COMFYUI_MCP_PI_PATH = saved;
+    }
+  });
+
+  it("reads ready ONLY when a credential is verifiable — not on CLI presence alone (P1a)", () => {
+    // CLI present but NO credential → NOT ready (list-models isn't an auth probe).
+    withNoPiEnvKeys(() => {
+      const r0 = backendReadiness("pi", { home: workDir });
+      expect(r0.cli).toBe(true);
+      expect(r0.auth).toBeNull(); // unknown, don't nag
+      expect(r0.ready).toBe(false);
+    });
+    // With ~/.pi/agent/auth.json present → ready.
+    mkdirSync(join(workDir, ".pi", "agent"), { recursive: true });
+    writeFileSync(join(workDir, ".pi", "agent", "auth.json"), '{"anthropic":{"type":"api_key","key":"x"}}');
+    const r1 = backendReadiness("pi", { home: workDir });
+    expect(r1.auth).toBe(true);
+    expect(r1.ready).toBe(true);
   });
 
   it("reports not-ready when the CLI is absent", () => {
@@ -213,9 +261,11 @@ describe("PiBackend turns", () => {
       backend.run({ channel: channelOf([{ text: "hi" }, { text: "again" }]) }),
     );
 
-    // First a provisional session (sentinel), then the REAL id from the header.
-    expect(events[0]).toMatchObject({ type: "session", sessionId: "pi-pending", model: "openai/gpt-4o" });
-    expect(events.some((e) => e.type === "session" && (e as { sessionId: string }).sessionId === "sess-abc")).toBe(true);
+    // No provisional/sentinel session is ever emitted (P1b) — the FIRST session
+    // event carries the REAL id parsed from pi's JSON header.
+    expect(events.some((e) => e.type === "session" && (e as { sessionId: string }).sessionId === "pi-pending")).toBe(false);
+    const firstSession = events.find((e) => e.type === "session") as { sessionId: string; model?: string };
+    expect(firstSession).toMatchObject({ sessionId: "sess-abc", model: "openai/gpt-4o" });
     expect(events.filter((e) => e.type === "assistant").map((e) => (e as { text: string }).text)).toEqual([
       "Hello world",
       "Second",
@@ -332,6 +382,25 @@ describe("PiBackend turns", () => {
     expect(events.filter((e) => e.type === "result")).toEqual([
       { type: "result", ok: false, subtype: "error" },
     ]);
+  });
+
+  it("emits NO session event when a fresh turn fails before the JSON header (P1b)", async () => {
+    // A pre-header failure (spawn error, over-long prompt, early exit) must not
+    // persist a bogus session id — run() no longer emits a sentinel up front.
+    hoisted.script.push({ stdout: [], stderr: "boom", exit: 1 });
+    const backend = new PiBackend({ cwd: workDir });
+    const events = await collect(backend.run({ channel: channelOf([{ text: "hi" }]) }));
+    expect(events.some((e) => e.type === "session")).toBe(false);
+    expect(events.filter((e) => e.type === "result")).toEqual([
+      { type: "result", ok: false, subtype: "error" },
+    ]);
+  });
+
+  it("emits the resume session id up front (real id, so surfacing it is fine)", async () => {
+    hoisted.script.push({ stdout: [header("sess-r"), delta("ok"), END], exit: 0 });
+    const backend = new PiBackend({ cwd: workDir });
+    const events = await collect(backend.run({ resume: "sess-existing", channel: channelOf([{ text: "hi" }]) }));
+    expect(events[0]).toMatchObject({ type: "session", sessionId: "sess-existing" });
   });
 
   it("maps a credential-looking failure to provider-setup guidance", async () => {
