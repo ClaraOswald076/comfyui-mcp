@@ -195,7 +195,24 @@ export function defaultWorkflowDepsDeps(): WorkflowDepsDeps {
       await managerFetch("/manager/queue/reset", { method: "POST" });
     },
     startQueue: async () => {
-      await managerFetch("/manager/queue/start", { method: "POST" });
+      // Some legacy Manager 3.x builds expose /manager/queue/start as GET-only,
+      // returning HTTP 405 to our POST (#551). A 405 on a Manager route is a
+      // METHOD mismatch for this endpoint, not an unreachable Manager — retry the
+      // same path with GET before failing so GET-only builds still start. Guard
+      // the GET against ComfyUI's frontend catchall, which 200s an UNREGISTERED
+      // GET with a page of HTML: that HTML is NOT a real queue start (codex
+      // review), so treat it as the route not accepting our request.
+      try {
+        await managerFetch("/manager/queue/start", { method: "POST" });
+      } catch (err) {
+        if (err instanceof ComfyUIError && (err.details as { status?: number } | undefined)?.status === 405) {
+          const res = await managerFetch("/manager/queue/start", { method: "GET" });
+          const body = await res.text().catch(() => "");
+          if (/^\s*<(?:!doctype\b|html\b|!--)/i.test(body)) throw err;
+          return;
+        }
+        throw err;
+      }
     },
     queueStatus: async () => {
       const res = await managerFetch("/manager/queue/status");
