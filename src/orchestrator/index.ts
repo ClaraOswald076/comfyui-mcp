@@ -2626,19 +2626,22 @@ export async function runPanelOrchestrator(): Promise<void> {
           for (const b of KNOWN_BACKENDS) {
             const srcKey = migratedFrom + AGENT_KEY_SEP + b;
             const newKey = panelTab + AGENT_KEY_SEP + b;
-            // COLLISION: the destination id ALREADY has a LIVE agent — the same workflow was open
-            // in TWO tabs and the bridge just SUPERSEDED the destination tab's socket with THIS
-            // incoming one (same-kind takeover). The destination agent is now orphaned onto the
-            // incoming socket: its private chat/session frames route by newKey to the socket the
-            // incoming tab holds, rendering INTO the incoming tab (codex). Reset the superseded
-            // destination agent FIRST — its socket is already gone, so its conversation is a lost
-            // resume, never a leak — then rebind the incoming source into the freed id so the
-            // INCOMING tab keeps its OWN conversation (and its held mail follows correctly below).
-            if (manager.hasLiveAgent(newKey)) {
+            // COLLISION: the destination id already has state for this provider — the same
+            // workflow was open in (or previously occupied) TWO tabs, and the incoming socket is
+            // migrating onto the other's id. Reset the superseded destination's state for this
+            // backend BEFORE moving the source in, so the incoming tab can NEVER inherit it. Cover
+            // EVERY kind of destination state, not just a live agent (codex): a LIVE agent
+            // (orphaned onto the incoming socket → renders into it), a DORMANT durable session
+            // (rebindAgent PRESERVES it when the source has none → the incoming tab resumes the
+            // OTHER tab's conversation on a later provider switch), OR failed-start held mail
+            // (rebindAgent APPENDS it to the migrated source mail → delivered into the incoming
+            // tab). Its socket is already superseded, so its conversation is a lost resume — never
+            // a cross-tab leak. Then rebind the incoming source into the freed id.
+            if (manager.hasAnyState(newKey) || sessionStore.get(newKey) !== undefined) {
               destinationCollision = true;
               manager.reset(newKey);
               logger.warn(
-                `[panel-orchestrator] tab-id migration ${migratedFrom.slice(0, 12)} → ${panelTab.slice(0, 12)} (${b}): destination id already had a live agent (same workflow in two tabs) — reset the superseded destination so the incoming tab keeps its OWN conversation (no cross-tab leak)`,
+                `[panel-orchestrator] tab-id migration ${migratedFrom.slice(0, 12)} → ${panelTab.slice(0, 12)} (${b}): destination id already had state (same workflow in two tabs) — reset the superseded destination so the incoming tab can't inherit it (no cross-tab leak)`,
               );
             }
             if (manager.rebindAgent(srcKey, newKey)) {

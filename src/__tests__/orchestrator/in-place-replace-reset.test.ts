@@ -176,6 +176,42 @@ describe("in-place workflow replacement resets the live session (#570 P0)", () =
     await manager.stopAll();
   });
 
+  it("#570: a tab-id migration COLLISION resets a DORMANT destination session too — incoming tab can't inherit it", async () => {
+    // The destination id previously left a DORMANT provider session (no live agent). If the
+    // incoming source has no state on that provider, rebindAgent's moveDurable would PRESERVE the
+    // destination's session → the incoming tab resumes the OTHER tab's conversation on a later
+    // switch. The collision handling must reset the destination for ANY state (incl. a dormant
+    // durable session / held mail), not just a live agent.
+    const store = new SessionStore(PORT);
+    const manager = new PanelAgentManager({
+      mcpServers: {},
+      systemAppend: "",
+      model: "claude-test",
+      onSay: () => {},
+      onTurn: () => {},
+      onSession: () => {},
+      sessionStore: store,
+      makeBackend: () => new SessioningBackend(),
+      identityForKey: () => IDENTITY_A,
+    } as never);
+
+    const newKey = "wf:foo.json::claude"; // destination id, DORMANT Claude session (no live agent)
+    const srcKey = "tmp:A::claude"; // incoming tab, on Codex → NO Claude state
+    store.set(newKey, "sess-B-claude", IDENTITY_A);
+    expect(manager.hasLiveAgent(newKey)).toBe(false); // dormant — a live-agent-only check misses it
+
+    // The orchestrator's any-state collision reset (dormant durable session present) fires…
+    if (manager.hasAnyState(newKey) || store.get(newKey) !== undefined) manager.reset(newKey);
+    // …then rebinds the source (which has nothing on this provider — moveDurable moves nothing).
+    manager.rebindAgent(srcKey, newKey);
+
+    // B's dormant session is GONE — the incoming tab starts fresh on Claude, never inherits it.
+    expect(store.get(newKey)).toBeUndefined();
+    expect(new SessionStore(PORT).get(newKey)).toBeUndefined(); // durable
+
+    await manager.stopAll();
+  });
+
   it("#570: a backend switch RETIRES the prior provider (preserves its session) so switching back resumes", async () => {
     // BOTH provider-switch protocols on the SAME workflow — the explicit set_backend event AND
     // a re-hello that selects a different backend — now funnel to manager.retire(prevKey). They
