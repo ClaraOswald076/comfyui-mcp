@@ -60,6 +60,7 @@ async function waitFor(cond: () => boolean, timeoutMs = 3000): Promise<void> {
 }
 
 const UUID_A = "11111111-1111-4111-8111-111111111111";
+const IDENTITY_A = `http://127.0.0.1:8188::${UUID_A}`;
 
 describe("in-place workflow replacement resets the live session (#570 P0)", () => {
   it("binds the exact session to its identity uuid and reset() clears the live agent + session", async () => {
@@ -74,8 +75,8 @@ describe("in-place workflow replacement resets the live session (#570 P0)", () =
       onSession: () => {},
       sessionStore: store,
       makeBackend: () => backend,
-      // Mirrors index.ts: the tab's trusted workflow uuid for a composite key.
-      identityForKey: () => UUID_A,
+      // Mirrors index.ts: the tab's FULL trusted workflow identity (origin::uuid).
+      identityForKey: () => IDENTITY_A,
     } as never);
 
     const key = "wf:foo.json::claude";
@@ -83,7 +84,7 @@ describe("in-place workflow replacement resets the live session (#570 P0)", () =
     manager.send(key, "hello from workflow A");
     await waitFor(() => backend.turnTexts.length === 1);
     expect(store.get(key)).toBe("sess-A");
-    expect(store.identityOf(key)).toBe(UUID_A); // durable identity binding
+    expect(store.identityOf(key)).toBe(IDENTITY_A); // durable full-identity binding
     expect(manager.hasLiveAgent(key)).toBe(true);
 
     // The hello handler, on detecting boundUuid (UUID_A) !== the new hello's uuid, calls

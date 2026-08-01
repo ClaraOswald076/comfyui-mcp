@@ -2011,9 +2011,15 @@ export async function runPanelOrchestrator(): Promise<void> {
       requestSelfExit(`tab ${tabId.slice(0, 8)} ${reason}`);
     },
     sessionStore,
-    // #570 P0 — bind each persisted exact session to its tab's trusted workflow uuid,
-    // so a saved workflow overwritten in place (same tab id, new uuid) is detectable.
-    identityForKey: (k: string) => tabStableIdentity.get(panelTabOf(k))?.uuid,
+    // #570 P0 — bind each persisted exact session to its tab's FULL trusted workflow
+    // identity (server-observed origin + per-instance uuid), so a saved workflow
+    // overwritten in place (same tab id, new uuid) OR a copied uuid replayed from a
+    // DIFFERENT origin on the same bridge port is detectable. Canonical `origin::uuid`
+    // (equality-compared only, so the IPv6-`::` ambiguity is harmless).
+    identityForKey: (k: string) => {
+      const id = tabStableIdentity.get(panelTabOf(k));
+      return id ? `${id.origin}::${id.uuid}` : undefined;
+    },
   });
   // Let refreshEnvCapabilities() feed a freshly-gathered env block into agents
   // spawned after a ComfyUI restart/reconnect.
@@ -2699,20 +2705,22 @@ export async function runPanelOrchestrator(): Promise<void> {
         // onSession re-stamps `u`, so a bound modern client's saved workflow proves out and
         // is never reset. Runs BEFORE the resume-ownership check and spawn, so neither an
         // unowned hello.resume nor spawn's exact-store hit can resume a stale session.
-        const boundUuid = sessionStore.identityOf(key);
+        const boundIdentity = sessionStore.identityOf(key);
+        // The FULL canonical identity (origin+uuid) this hello proves — must equal the
+        // record's bound identity to keep it. Includes origin, so a copied uuid from a
+        // DIFFERENT origin on the same bridge port can't pass (codex).
+        const helloIdentity = newIdentity ? `${newIdentity.origin}::${newIdentity.uuid}` : undefined;
         const hasExact = sessionStore.get(key) !== undefined;
         const provenOwn =
-          hasExact && boundUuid !== undefined && newIdentity !== undefined && boundUuid === newIdentity.uuid;
+          hasExact && boundIdentity !== undefined && helloIdentity !== undefined && boundIdentity === helloIdentity;
         if (hasExact && !provenOwn) {
           // FULL session boundary — reset the LIVE agent too, not just the disk record.
           // manager.reset() stops the mapped agent (whose backend still holds the PRIOR
           // workflow's session), clears its pendingResume + held mail, AND the durable
-          // exact session. Without this, manager.send would reuse that live agent.
+          // exact session. Without this, manager.send would reuse that live agent. (The
+          // overwritten workflow's own stable entry, if any, is keyed by ITS uuid and
+          // stays valid should that workflow ever be restored — nothing to clear here.)
           manager.reset(key);
-          if (boundUuid && newIdentity) {
-            const staleStable = deriveStableKey({ workflowUuid: boundUuid, origin: newIdentity.origin, backend });
-            if (staleStable) sessionStore.clearStable(staleStable);
-          }
           logger.info(
             `[panel-orchestrator] tab ${panelTab.slice(0, 8)} exact session not provably this workflow's identity — reset the live agent and cleared the stale session`,
           );

@@ -306,6 +306,22 @@ describe("SessionStore", () => {
       expect(new SessionStore(PORT).get("wf:foo.json::claude")).toBeUndefined();
     });
 
+    it("CROSS-ORIGIN: the exact identity binding includes the origin (same uuid, different origin ≠ owned)", () => {
+      // The exact record binds the FULL canonical identity (origin::uuid), not just the
+      // uuid — so a copied/replayed uuid arriving from a DIFFERENT ComfyUI origin on the
+      // same bridge port under the same wf:<path> key does NOT prove ownership → reset.
+      const store = new SessionStore(PORT);
+      const boundA = `http://127.0.0.1:8188::${UUID_A}`;
+      store.set("wf:foo.json::claude", "sess-A", boundA);
+      expect(store.identityOf("wf:foo.json::claude")).toBe(boundA);
+      // Same uuid, DIFFERENT origin → the handler's `provenOwn` (boundIdentity ===
+      // helloIdentity) is false → the stale session is reset, not resumed.
+      const helloFromOtherOrigin = `http://127.0.0.1:8199::${UUID_A}`;
+      expect(store.identityOf("wf:foo.json::claude") === helloFromOtherOrigin).toBe(false);
+      // Same origin + same uuid → owned.
+      expect(store.identityOf("wf:foo.json::claude") === boundA).toBe(true);
+    });
+
     it("PRE-UPGRADE: an exact record with no identity binding reads back unbound (drives fail-closed reset)", () => {
       // A record written before the `u` field existed (a v2 {s,t} entry, or a migrated
       // legacy flat record) has a session but NO identity. identityOf() is undefined, so
