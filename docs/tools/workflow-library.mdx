@@ -27,7 +27,7 @@ List the filenames of workflows saved in the connected ComfyUI server's user lib
 
 ## get_workflow
 
-Load a saved workflow and return its raw JSON. Use analyze_workflow instead if you just need to understand the workflow — it returns a structured summary without flooding context with JSON. Use get_workflow only when you need the actual JSON for enqueue_workflow, modify_workflow, or save_workflow.
+Return the RAW JSON of a SAVED workflow FILE, named from the library — a file on disk, NOT the graph open on the user's canvas (that is panel_graph_outline). Use analyze_workflow instead if you just need to understand the workflow — it returns a structured summary without flooding context with JSON. Use get_workflow only when you need the actual JSON for enqueue_workflow, modify_workflow, or save_workflow.
 
 ### Parameters
 
@@ -181,7 +181,7 @@ Save a workflow JSON to the connected ComfyUI server's user library so it appear
 
 ## analyze_workflow
 
-Load a saved workflow and return a structured analysis — sections, node settings, connections, and data flow. Use this to understand any workflow before modifying or executing it. Returns a concise text summary (not raw JSON) optimized for AI reasoning. Prefer this over get_workflow unless you need the raw JSON for enqueue_workflow or modify_workflow.
+SUMMARIZE a SAVED workflow FILE named from the library — sections, node settings, connections, and data flow. It reads a file from the library, NOT the graph open on the user's canvas (that is panel_graph_outline). Use this to understand a saved workflow before modifying or executing it. Returns a concise text summary (not raw JSON) optimized for AI reasoning. Prefer this over get_workflow unless you need the raw JSON for enqueue_workflow or modify_workflow.
 
 ### Parameters
 

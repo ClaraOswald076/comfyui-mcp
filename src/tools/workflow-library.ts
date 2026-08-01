@@ -61,7 +61,7 @@ export function registerWorkflowLibraryTools(server: McpServer): void {
 
   server.tool(
     "get_workflow",
-    "Load a saved workflow and return its raw JSON. " +
+    "Return the RAW JSON of a SAVED workflow FILE, named from the library — a file on disk, NOT the graph open on the user's canvas (that is panel_graph_outline). " +
       "Use analyze_workflow instead if you just need to understand the workflow — it returns a structured summary without flooding context with JSON. " +
       "Use get_workflow only when you need the actual JSON for enqueue_workflow, modify_workflow, or save_workflow.",
     {
@@ -236,7 +236,8 @@ export function registerWorkflowLibraryTools(server: McpServer): void {
 
   server.tool(
     "query_workflow",
-    "QUERY a workflow file — filter, traverse, project, and aggregate over its nodes WITHOUT " +
+    "QUERY a SAVED workflow FILE (or JSON you pass in) — NOT the live canvas, which is " +
+      "panel_query_graph / panel_graph_outline. Filter, traverse, project, and aggregate over its nodes WITHOUT " +
       "dumping the whole JSON (the missing middle between analyze_workflow's fixed summary and " +
       "get_workflow's full dump; on 100+-node graphs this is the ONLY context-safe way to answer " +
       "questions like 'which KSamplers run cfg>7', 'what feeds node 42', 'count nodes by type'). " +
@@ -246,8 +247,7 @@ export function registerWorkflowLibraryTools(server: McpServer): void {
       "detail), `upstream_of`/`downstream_of` + `depth` (dependency traversal: upstream = what FEEDS " +
       "that node, downstream = what CONSUMES it; seed included at depth 0), `fields` ('compact' one " +
       "line per node [default], 'ids', or 'detail' JSON rows with widgets + wiring), `group_by:'type'` " +
-      "(counts only), `limit` (default 40). Output is TOKEN-BOUNDED with an explicit truncation marker. " +
-      "For the LIVE canvas use panel_query_graph instead. Read-only.",
+      "(counts only), `limit` (default 40). Output is TOKEN-BOUNDED with an explicit truncation marker. Read-only.",
     {
       path: z.string().optional().describe("Absolute server-side path to a workflow .json on disk."),
       filename: z
@@ -525,8 +525,9 @@ export function registerWorkflowLibraryTools(server: McpServer): void {
 
   server.tool(
     "analyze_workflow",
-    "Load a saved workflow and return a structured analysis — sections, node settings, connections, " +
-      "and data flow. Use this to understand any workflow before modifying or executing it. " +
+    "SUMMARIZE a SAVED workflow FILE named from the library — sections, node settings, connections, " +
+      "and data flow. It reads a file from the library, NOT the graph open on the user's canvas " +
+      "(that is panel_graph_outline). Use this to understand a saved workflow before modifying or executing it. " +
       "Returns a concise text summary (not raw JSON) optimized for AI reasoning. " +
       "Prefer this over get_workflow unless you need the raw JSON for enqueue_workflow or modify_workflow.",
     {
