@@ -31,7 +31,11 @@ export function readyBannerText(backend: string, label: string, customBaseUrl = 
     case "antigravity":
       return `🟢 comfyui-mcp agent ready — ${label} on your Google AI subscription via Antigravity CLI. Note: agy turns show final answers only (no live tool progress). Ask away.`;
     case "pi":
-      return `🟢 comfyui-mcp agent ready — ${label} via the pi CLI on your own provider. Note: pi has no ComfyUI tools (no MCP) — it works with its own coding tools on the local workspace, not the panel canvas. Ask away.`;
+      // Deliberately hedged: readiness for pi is a DISK check (a well-formed,
+      // present credential), never a proven-working one — a revoked key or a
+      // spent quota only shows up on the first real turn, so don't promise more
+      // than "we found a credential" (#491).
+      return `🟢 comfyui-mcp agent ready — ${label} via the pi CLI on your own provider credential (found on this machine; pi checks it on your first message). Note: pi has no ComfyUI tools (no MCP) — it works with its own coding tools on the local workspace, not the panel canvas. Ask away.`;
     case "grok":
       return `🟢 comfyui-mcp agent ready — ${label} on your Grok (xAI) account. Ask away.`;
     case "ollama":

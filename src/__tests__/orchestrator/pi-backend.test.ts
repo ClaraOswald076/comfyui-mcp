@@ -93,6 +93,7 @@ import {
   resolvePiBin,
 } from "../../orchestrator/pi-backend.js";
 import { backendReadiness } from "../../orchestrator/backend-readiness.js";
+import { PI_ENV_API_KEYS } from "../../orchestrator/pi-credentials.js";
 
 const FAKE_BIN = join(tmpdir(), "fake-pi", "pi.exe");
 
@@ -178,10 +179,15 @@ describe("parsePiModels", () => {
 // Provider env keys pi's readiness treats as a verifiable credential — must be
 // cleared for deterministic "no credential" assertions (the dev machine may have
 // one set).
+// Derived from pi's own env map so a newly-covered provider key can never leak
+// the developer's real environment into these assertions, plus the Google Vertex
+// ADC trio (a file path + project + location, not API keys).
 const PI_ENV_KEYS = [
-  "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY", "OPENROUTER_API_KEY",
-  "DEEPSEEK_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY", "ZAI_API_KEY",
-  "KIMI_API_KEY", "MINIMAX_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS",
+  ...PI_ENV_API_KEYS,
+  "GOOGLE_APPLICATION_CREDENTIALS",
+  "GOOGLE_CLOUD_PROJECT",
+  "GCLOUD_PROJECT",
+  "GOOGLE_CLOUD_LOCATION",
 ];
 function withNoPiEnvKeys<T>(fn: () => T): T {
   const saved: Record<string, string | undefined> = {};
@@ -246,19 +252,38 @@ describe("resolvePiBin / readiness", () => {
     });
   });
 
-  it("detects the broadened credential sources: env key, Google ADC, models.json (P1a-b)", () => {
+  // The per-source rules are exercised exhaustively in pi-credentials.test.ts;
+  // these assert that backendReadiness("pi") is actually wired to them.
+  it("detects the broadened credential sources: env key, Vertex ADC, models.json (P1a-b)", () => {
     withNoPiEnvKeys(() => {
-      // (1) a non-stripped provider env key.
-      process.env.OPENAI_API_KEY = "sk-x";
-      expect(backendReadiness("pi", { home: workDir }).ready).toBe(true);
-      delete process.env.OPENAI_API_KEY;
-      // (2) Google ADC — a file path, not an API key (not stripped).
-      process.env.GOOGLE_APPLICATION_CREDENTIALS = "/home/u/adc.json";
+      // (1) a non-stripped provider env key — including ones pi accepts that we
+      // used to miss entirely (cerebras/fireworks/together/anthropic-oauth).
+      for (const key of ["OPENAI_API_KEY", "CEREBRAS_API_KEY", "FIREWORKS_API_KEY", "TOGETHER_API_KEY", "ANTHROPIC_OAUTH_TOKEN"]) {
+        process.env[key] = "sk-x";
+        expect(backendReadiness("pi", { home: workDir }).ready, key).toBe(true);
+        delete process.env[key];
+      }
+      // (2) Google Vertex ADC — pi's ADC path needs an EXISTING credentials file
+      // plus project + location. A dangling path is not a credential.
+      const adc = join(workDir, "adc.json");
+      process.env.GOOGLE_CLOUD_PROJECT = "proj";
+      process.env.GOOGLE_CLOUD_LOCATION = "us-central1";
+      process.env.GOOGLE_APPLICATION_CREDENTIALS = join(workDir, "missing.json");
+      expect(backendReadiness("pi", { home: workDir }).ready).toBe(false);
+      writeFileSync(adc, "{}");
+      process.env.GOOGLE_APPLICATION_CREDENTIALS = adc;
       expect(backendReadiness("pi", { home: workDir }).ready).toBe(true);
       delete process.env.GOOGLE_APPLICATION_CREDENTIALS;
-      // (3) a non-empty models.json (custom-provider creds).
+      delete process.env.GOOGLE_CLOUD_PROJECT;
+      delete process.env.GOOGLE_CLOUD_LOCATION;
+      // (3) models.json: only a provider carrying its OWN credential counts —
+      // an endpoint with no key is loaded by pi but its models stay unavailable.
       mkdirSync(join(workDir, ".pi", "agent"), { recursive: true });
-      writeFileSync(join(workDir, ".pi", "agent", "models.json"), '{"my-vllm":{"baseUrl":"http://x/v1"}}');
+      const modelsJson = join(workDir, ".pi", "agent", "models.json");
+      writeFileSync(modelsJson, '{"providers":{"my-vllm":{"baseUrl":"http://x/v1"}}}');
+      expect(backendReadiness("pi", { home: workDir }).ready).toBe(false);
+      // …and JSONC is valid here, because pi strips comments before parsing it.
+      writeFileSync(modelsJson, '{\n  // local\n  "providers": { "my-vllm": { "apiKey": "sk-local", },\n  },\n}');
       expect(backendReadiness("pi", { home: workDir }).ready).toBe(true);
     });
   });

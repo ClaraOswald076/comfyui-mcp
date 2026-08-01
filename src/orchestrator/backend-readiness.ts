@@ -16,8 +16,14 @@ import { join } from "node:path";
 import { readOAuthStatus } from "../services/code-provider-auth.js";
 import { resolveAgyBin } from "./antigravity-backend.js";
 import { resolvePiBin } from "./pi-backend.js";
+// pi's credential detection is large enough (pi's whole env map + auth.json /
+// models.json / Vertex-ADC parsing) to live in its own module; re-exported below
+// so existing importers of `piCredentialPresent` are unaffected.
+import { piCredentialPresent } from "./pi-credentials.js";
 import type { OAuthStatusRecord } from "../services/panel-secrets.js";
 import { simpleKeyProvider } from "../services/openai-provider-registry.js";
+
+export { piCredentialPresent } from "./pi-credentials.js";
 
 export type BackendReadiness = {
   backend: string;
@@ -45,84 +51,6 @@ const CLI_NAMES: Record<string, string[]> = {
   lmstudio: ["lms", "lms.exe"],
   llamacpp: ["llama-server", "llama-server.exe"],
 };
-
-/** Common provider API-key env vars pi (issue #491) can authenticate with. A
- *  definite login is auth.json OR any of these; used only to UPGRADE pi's auth
- *  signal from "unknown" to "yes" (never to false-flag not-signed-in). Not
- *  exhaustive — pi supports many providers; these are the common coding ones.
- *  IMPORTANT: this list MUST only contain keys that actually REACH pi's spawn
- *  env. pi is spawned via buildAgentSpawnEnv() (no keep-list), which STRIPS the
- *  ComfyUI tool-only secrets — so GEMINI_API_KEY / GOOGLE_API_KEY are
- *  deliberately EXCLUDED: they never reach pi, and listing them would flag
- *  "authenticated" for a user whose only key is one pi never sees (its first
- *  turn would then fail). Google/HF providers for pi must go in
- *  ~/.pi/agent/auth.json instead (documented in pi-backend.ts). */
-const PI_PROVIDER_ENV_KEYS: readonly string[] = [
-  "ANTHROPIC_API_KEY",
-  "OPENAI_API_KEY",
-  "XAI_API_KEY",
-  "OPENROUTER_API_KEY",
-  "DEEPSEEK_API_KEY",
-  "GROQ_API_KEY",
-  "MISTRAL_API_KEY",
-  "ZAI_API_KEY",
-  "KIMI_API_KEY",
-  "MINIMAX_API_KEY",
-];
-
-/** True when a pi provider credential is detectable from ANY documented source.
- *  pi's `--list-models` is NOT an auth probe, so this — not the CLI's presence —
- *  is the honest "ready" signal, and the connect handler uses it too so a
- *  credential-less pi is degraded up front instead of greeted green (#491 codex
- *  P1a). Two rules (codex round 3):
- *    - NEVER green on pure file EXISTENCE: ~/.pi/agent/auth.json is PARSED and
- *      must carry a structurally-usable entry (an empty/corrupt file is not a
- *      credential).
- *    - Detect EVERY documented source so a working pi isn't falsely degraded:
- *      a valid auth.json, a non-stripped provider env key, Google ADC
- *      (GOOGLE_APPLICATION_CREDENTIALS — a file path, not stripped), or a
- *      non-empty ~/.pi/agent/models.json (custom-provider creds).
- *  Since a REAL usability check needs a turn, we err toward "ready" when any
- *  credible source exists — false only when NONE is detectable. */
-export function piCredentialPresent(home: string = homedir()): boolean {
-  if (piAuthJsonUsable(join(home, ".pi", "agent", "auth.json"))) return true;
-  if (PI_PROVIDER_ENV_KEYS.some((k) => !!process.env[k]?.trim())) return true;
-  // Google Vertex ADC: a service-account key file path (NOT an API key, so not
-  // stripped by buildAgentSpawnEnv) — pi's Vertex provider authenticates with it.
-  if (process.env.GOOGLE_APPLICATION_CREDENTIALS?.trim()) return true;
-  if (piModelsJsonUsable(join(home, ".pi", "agent", "models.json"))) return true;
-  return false;
-}
-
-/** Parse ~/.pi/agent/auth.json and report whether it carries a usable credential
- *  — an object with ≥1 entry whose value is a non-empty string OR a non-empty
- *  object (an api_key/oauth record). An empty/`{}`/`{"anthropic":{}}`/corrupt
- *  file returns false (never green on mere existence). Never throws. */
-function piAuthJsonUsable(file: string): boolean {
-  try {
-    const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
-    return Object.values(parsed as Record<string, unknown>).some(
-      (v) =>
-        (typeof v === "string" && v.trim() !== "") ||
-        (!!v && typeof v === "object" && !Array.isArray(v) && Object.keys(v).length > 0),
-    );
-  } catch {
-    return false;
-  }
-}
-
-/** A non-empty ~/.pi/agent/models.json (custom provider/model definitions, which
- *  can carry provider credentials) counts as a credible source. Requires a
- *  parseable non-empty object — not mere existence. Never throws. */
-function piModelsJsonUsable(file: string): boolean {
-  try {
-    const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
-    return !!parsed && typeof parsed === "object" && !Array.isArray(parsed) && Object.keys(parsed).length > 0;
-  } catch {
-    return false;
-  }
-}
 
 /** Well-known Ollama install locations probed in addition to PATH (the Windows
  *  installer adds PATH for NEW shells only — an orchestrator started from an
@@ -332,10 +260,17 @@ export function backendReadiness(
     // env vars. UNLIKE agy, `pi --list-models` is NOT an auth probe (it prints
     // the built-in catalog with no key), so readiness must NOT key off the CLI
     // alone — that would greet a keyless pi green-ready and then fail its first
-    // turn (issue #491 codex P1a). We report ready ONLY when a usable credential
-    // is verifiable (auth.json OR a non-stripped provider key in env); when the
-    // CLI is present but no credential is verifiable, auth is UNKNOWN (null) and
-    // ready is FALSE — the panel then shows "configure a provider", not green.
+    // turn (issue #491 codex P1a). We report ready ONLY when a WELL-FORMED,
+    // PRESENT credential is verifiable — see pi-credentials.ts, which mirrors
+    // pi's own resolution (its full provider env map minus the keys our spawn
+    // env strips, a parsed auth.json record that actually carries a key/token, a
+    // JSONC models.json provider with its own apiKey/oauth, or Google Vertex ADC
+    // with an existing credentials file plus project+location). When the CLI is
+    // present but no credential is verifiable, auth is UNKNOWN (null) and ready
+    // is FALSE — the panel then shows "configure a provider", not green.
+    // Residual (accepted, and the UI wording must not over-promise): a present
+    // but revoked/quota-exhausted key is indistinguishable from a good one here
+    // and still fails on the first turn.
     const cli = !!resolvePiBin(home);
     const authKnown = piCredentialPresent(home);
     const auth = authKnown ? true : cli ? null : false;

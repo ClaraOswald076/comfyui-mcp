@@ -29,8 +29,11 @@
 // tracked as follow-up, out of scope for #491's "include pi as an agent".)
 //
 // AUTH: pi resolves credentials from (1) `~/.pi/agent/auth.json` (API keys and
-// OAuth subscriptions written by `/login`), then (2) provider env vars
-// (ANTHROPIC_API_KEY, OPENAI_API_KEY, XAI_API_KEY, OPENROUTER_API_KEY, …). We
+// OAuth subscriptions written by `/login`), (2) provider env vars (pi's full map
+// is transcribed in pi-credentials.ts), (3) a `~/.pi/agent/models.json` custom
+// provider carrying its own apiKey/oauth, and (4) Google Vertex ADC. Detection
+// of all four — which is what drives readiness, since `--list-models` is not an
+// auth probe — lives in pi-credentials.ts. We
 // spawn with buildAgentSpawnEnv() (no keep-list): the ComfyUI TOOL secrets
 // (RunPod/CivitAI/RunComfy/Registry, and the Google/HF keys that panel-secrets
 // classifies as tool secrets) are stripped so an LLM-vendor process never sees a
