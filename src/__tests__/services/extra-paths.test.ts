@@ -48,9 +48,13 @@ async function tmpDir(): Promise<string> {
 
 let dirs: string[] = [];
 const oldAppData = process.env.APPDATA;
+const oldComfyuiPathEnv = process.env.COMFYUI_PATH;
 
 beforeEach(() => {
   config.comfyuiPath = undefined;
+  // Tests that set config.comfyuiPath model an EXPLICIT COMFYUI_PATH unless they say
+  // otherwise; process.env.COMFYUI_PATH is the env-vs-auto-detected discriminator.
+  process.env.COMFYUI_PATH = "explicit";
   dirs = [];
   mockResolveServerExtraModelConfig.mockResolvedValue(undefined);
   mockIsRemoteMode.mockReturnValue(false);
@@ -61,6 +65,8 @@ beforeEach(() => {
 
 afterEach(async () => {
   process.env.APPDATA = oldAppData;
+  if (oldComfyuiPathEnv === undefined) delete process.env.COMFYUI_PATH;
+  else process.env.COMFYUI_PATH = oldComfyuiPathEnv;
   config.comfyuiPath = undefined;
   resetWorkspaceConfig();
   await Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true })));
@@ -366,16 +372,40 @@ describe("standalone root precedence — saved default workspace (#648)", () => 
     );
   });
 
-  it("a nonexistent COMFYUI_PATH is NOT gated (pre-#648 behavior preserved)", async () => {
-    // The stale guard covers only the saved default workspace: COMFYUI_PATH is the user
-    // directly naming a root, and it has always reported exists:false rather than erroring.
+  it("REFUSES remove against a vanished saved workspace too (both mutation paths gated)", async () => {
+    const parent = await trackTmp();
+    const gone = join(parent, "moved-away", "ComfyUI");
+    await saveDefaultWorkspace(gone);
+    config.comfyuiPath = undefined;
+
+    await expect(
+      removeExtraPath({ target: "standalone", category: "loras", path: "E:/loras" }),
+    ).rejects.toThrow(/UNRESOLVED/);
+    expect(existsSync(join(parent, "moved-away"))).toBe(false);
+  });
+
+  it("a nonexistent EXPLICIT COMFYUI_PATH is NOT gated (pre-#648 behavior preserved)", async () => {
+    // The stale guard covers INFERRED roots only: an explicit COMFYUI_PATH env var is the
+    // user directly naming a root, and it has always reported exists:false, not errored.
     const gone = join(await trackTmp(), "no-such-install");
     config.comfyuiPath = gone;
+    process.env.COMFYUI_PATH = gone;
 
     const result = await listExtraPaths({ target: "standalone" });
     expect(result.path).toBe(join(gone, "extra_model_paths.yaml"));
     expect(result.exists).toBe(false);
     expect(result.groups).toEqual([]);
+  });
+
+  it("an AUTO-DETECTED comfyuiPath that vanished IS gated (not an explicit user directive)", async () => {
+    // config.comfyuiPath can come from startup auto-detection, which can go stale in a
+    // long-lived MCP process exactly like a saved workspace (codex round 3, P1b).
+    const gone = join(await trackTmp(), "no-such-install");
+    config.comfyuiPath = gone;
+    delete process.env.COMFYUI_PATH; // → auto-detected
+
+    await expect(listExtraPaths({ target: "standalone" })).rejects.toThrow(/UNRESOLVED/);
+    await expect(listExtraPaths({ target: "standalone" })).rejects.toThrow(/auto-detected/i);
   });
 
   it("an explicit config_path is honored with no workspace lookup at all", async () => {

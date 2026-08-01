@@ -256,18 +256,26 @@ function desktopConfigPath(): string {
  * reporting some other root's model dirs as if they were the live server's is a
  * wrong-destination hazard, so an explicit unresolved error is the only safe answer.
  *
- * STALE-WORKSPACE GUARD (codex round 2, P1): a saved default workspace is a value the
- * user persisted once and may never have revisited — the install can since have been
- * moved, renamed or deleted. Widening the fallback to it therefore has to prove the
- * directory is still THERE. Without that check `add_extra_path` would resolve to
- * `<gone workspace>/extra_model_paths.yaml`, `writeConfigFile`'s recursive `mkdir` would
- * MATERIALIZE the whole vanished tree, and the tool would report "Added … Restart
- * ComfyUI" for a file no ComfyUI will ever read — a silent wrong-destination write.
- * A missing/non-directory saved default is therefore an explicit error, for reads too:
- * listing a phantom root as an empty config is exactly the authoritative-looking lie
- * this issue is about. An explicit COMFYUI_PATH is NOT gated this way — that is the
- * user directly naming a root, and its pre-#648 behavior (report `exists:false`,
- * create on write) is deliberately left unchanged.
+ * STALE-ROOT GUARD (codex rounds 2-3, P1): an INFERRED root — a saved default workspace
+ * persisted once and maybe never revisited, or a startup AUTO-DETECTION that has since
+ * gone away — has to prove the directory is still THERE before it can be used. Without
+ * that check `add_extra_path` would resolve to `<gone root>/extra_model_paths.yaml`,
+ * `writeConfigFile`'s recursive `mkdir` would MATERIALIZE the whole vanished tree, and
+ * the tool would report "Added … Restart ComfyUI" for a file no ComfyUI will ever read —
+ * a silent wrong-destination write. A missing/non-directory inferred root is therefore
+ * an explicit error, for READS too: listing a phantom root as an empty config is exactly
+ * the authoritative-looking lie this issue is about.
+ *
+ * An EXPLICIT `COMFYUI_PATH` env var is deliberately NOT gated: that is the user
+ * directly naming a root, and its pre-#648 behavior (report `exists:false`, create the
+ * dir on write) is left unchanged. `process.env.COMFYUI_PATH` is the discriminator —
+ * the same one `getWorkspace()` uses to report `env` vs `auto-detected`.
+ *
+ * ACCEPTED residual (codex round 3 P2): `statSync` on a saved workspace that lives on a
+ * DISCONNECTED UNC share can block for seconds. Not special-cased, because failing
+ * closed on `\\server\share` would refuse a perfectly valid NAS install, and the very
+ * next steps (`existsSync`/`readFile` on the config file under that same share, which
+ * predate this guard) block identically — the guard adds no new class of exposure.
  */
 function isExistingDir(p: string): boolean {
   try {
@@ -277,7 +285,9 @@ function isExistingDir(p: string): boolean {
   }
 }
 
-function standaloneRoot(): { root: string; source: "comfyui-path" | "default-workspace" } {
+type StandaloneRootSource = "comfyui-path-env" | "comfyui-path-detected" | "default-workspace";
+
+function standaloneRoot(): { root: string; source: StandaloneRootSource } {
   const root = resolveEffectiveComfyUIBase();
   if (!root) {
     throw new ValidationError(
@@ -292,26 +302,47 @@ function standaloneRoot(): { root: string; source: "comfyui-path" | "default-wor
         " No extra paths are being reported — this is an unresolved lookup, not an empty config.",
     );
   }
-  // config.comfyuiPath is what resolveEffectiveComfyUIBase prefers, so its presence
-  // (not a re-derivation) is what distinguishes the two sources.
-  const source = config.comfyuiPath ? "comfyui-path" : "default-workspace";
-  if (source === "default-workspace" && !isExistingDir(root)) {
+  // config.comfyuiPath is what resolveEffectiveComfyUIBase prefers, so its presence (not
+  // a re-derivation) separates it from the saved default; process.env.COMFYUI_PATH then
+  // separates an EXPLICIT root from a startup auto-detection.
+  const source: StandaloneRootSource = config.comfyuiPath
+    ? process.env.COMFYUI_PATH
+      ? "comfyui-path-env"
+      : "comfyui-path-detected"
+    : "default-workspace";
+  if (source !== "comfyui-path-env" && !isExistingDir(root)) {
+    const origin =
+      source === "default-workspace"
+        ? 'the saved default workspace (set_default_workspace) — the install was probably moved, renamed or deleted since it was saved'
+        : "an auto-detected ComfyUI install — it has since been moved, renamed or deleted";
     throw new ValidationError(
-      `UNRESOLVED: the saved default workspace "${root}" is not an existing directory, so it ` +
-        "cannot be used to locate extra_model_paths.yaml. The install was probably moved, " +
-        "renamed or deleted since set_default_workspace was last run. Nothing was read or " +
-        "written — refusing to create a config under a workspace that no longer exists, " +
-        "because no ComfyUI would ever read it. Re-run set_default_workspace with the current " +
-        "path, set COMFYUI_PATH, or pass config_path explicitly.",
+      `UNRESOLVED: "${root}" is not an existing directory, so it cannot be used to locate ` +
+        `extra_model_paths.yaml. That path came from ${origin}. Nothing was read or ` +
+        "written — refusing to create a config under a root that does not exist, because no " +
+        "ComfyUI would ever read it. Re-run set_default_workspace with the current path, set " +
+        "COMFYUI_PATH, or pass config_path explicitly.",
     );
   }
   return { root, source };
 }
 
-function standaloneConfigPath(): { path: string; notes: string[] } {
+/** Whether writing this config may recursively CREATE missing parent directories. False
+ *  for an inferred root: it was just verified to exist, so a `mkdir -p` could only ever
+ *  fire because the root vanished between the check and the write — and it would then
+ *  resurrect the wrong destination instead of failing (codex round 3, P1a TOCTOU). With
+ *  it off, that race surfaces as an honest ENOENT. */
+interface ResolvedTarget {
+  target: Exclude<ExtraPathTarget, "auto">;
+  path: string;
+  notes: string[];
+  createParents: boolean;
+}
+
+function standaloneConfigPath(): { path: string; notes: string[]; createParents: boolean } {
   const { root, source } = standaloneRoot();
   return {
     path: join(root, "extra_model_paths.yaml"),
+    createParents: source === "comfyui-path-env",
     notes:
       source === "default-workspace"
         ? [
@@ -325,25 +356,26 @@ function standaloneConfigPath(): { path: string; notes: string[] } {
   };
 }
 
-function resolveTargetPath(opts: ExtraPathOptions = {}): {
-  target: Exclude<ExtraPathTarget, "auto">;
-  path: string;
-  notes: string[];
-} {
+function resolveTargetPath(opts: ExtraPathOptions = {}): ResolvedTarget {
   if (opts.configPath) {
     return {
       target: opts.target === "desktop" ? "desktop" : "standalone",
       path: opts.configPath,
       notes: [],
+      createParents: true, // the caller named this exact file
     };
   }
 
   const target = opts.target ?? "auto";
-  if (target === "desktop") return { target, path: desktopConfigPath(), notes: [] };
+  if (target === "desktop") {
+    return { target, path: desktopConfigPath(), notes: [], createParents: true };
+  }
   if (target === "standalone") return { target, ...standaloneConfigPath() };
 
   const desktop = desktopConfigPath();
-  if (existsSync(desktop)) return { target: "desktop", path: desktop, notes: [] };
+  if (existsSync(desktop)) {
+    return { target: "desktop", path: desktop, notes: [], createParents: true };
+  }
   return { target: "standalone", ...standaloneConfigPath() };
 }
 
@@ -445,12 +477,9 @@ function isDesktopGeneratedConfig(path: string): boolean {
  * target plus any warning notes to surface. Best-effort: falls back to the
  * static resolveTargetPath when the server is unreachable.
  */
-async function resolveTargetPathPreferServer(opts: ExtraPathOptions = {}): Promise<{
-  target: Exclude<ExtraPathTarget, "auto">;
-  path: string;
-  notes: string[];
-  serverResolved: boolean;
-}> {
+async function resolveTargetPathPreferServer(
+  opts: ExtraPathOptions = {},
+): Promise<ResolvedTarget & { serverResolved: boolean }> {
   // Explicit config_path or an explicit non-auto target: honor the caller.
   if (opts.configPath || (opts.target && opts.target !== "auto")) {
     return { ...resolveTargetPath(opts), serverResolved: false };
@@ -489,6 +518,8 @@ async function resolveTargetPathPreferServer(opts: ExtraPathOptions = {}): Promi
     path: serverConfig,
     notes,
     serverResolved: true,
+    // The live server told us this file, so its directory exists by construction.
+    createParents: true,
   };
 }
 
@@ -656,8 +687,15 @@ function ensureGroup(raw: Record<string, unknown>, name: string): Record<string,
   return group;
 }
 
-async function writeConfigFile(path: string, raw: Record<string, unknown>): Promise<void> {
-  await mkdir(dirname(path), { recursive: true });
+async function writeConfigFile(
+  path: string,
+  raw: Record<string, unknown>,
+  createParents: boolean,
+): Promise<void> {
+  // With createParents=false the root was already verified to exist, so skipping the
+  // `mkdir -p` costs nothing in the normal case and turns the check→write race into an
+  // honest ENOENT instead of silently RESURRECTING a vanished install and writing there.
+  if (createParents) await mkdir(dirname(path), { recursive: true });
   await writeFile(path, stringifyYaml(raw, { lineWidth: 0 }), "utf-8");
 }
 
@@ -683,7 +721,7 @@ export async function addExtraPath(
   if (changed) {
     paths.push(nextPath);
     group[category] = paths.join("\n");
-    await writeConfigFile(resolved.path, raw);
+    await writeConfigFile(resolved.path, raw, resolved.createParents);
   }
   const info = summarize(resolved.target, resolved.path, raw, resolved.notes, resolved.serverResolved);
   return {
@@ -713,7 +751,7 @@ export async function removeExtraPath(
     if (changed) {
       if (remaining.length > 0) obj[category] = remaining.join("\n");
       else delete obj[category];
-      await writeConfigFile(resolved.path, raw);
+      await writeConfigFile(resolved.path, raw, resolved.createParents);
     }
   }
   const info = summarize(resolved.target, resolved.path, raw, resolved.notes, resolved.serverResolved);
