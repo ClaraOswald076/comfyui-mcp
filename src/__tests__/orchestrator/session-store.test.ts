@@ -9,10 +9,13 @@ import { describe, expect, it, afterEach } from "vitest";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SessionStore } from "../../orchestrator/session-store.js";
+import { SessionStore, deriveStableKey } from "../../orchestrator/session-store.js";
 
 // A port unlikely to collide with a real run or another test.
 const PORT = 59187;
+// Two valid crypto.randomUUID()-shaped ids (deriveStableKey validates the format).
+const UUID_A = "11111111-1111-4111-8111-111111111111";
+const UUID_B = "22222222-2222-4222-8222-222222222222";
 const FILE = join(tmpdir(), `comfyui-mcp-panel-sessions-${PORT}.json`);
 
 afterEach(() => {
@@ -147,6 +150,128 @@ describe("SessionStore", () => {
       store.clearStable("skey");
       store.setStable("skey", "sess-D", "tmp:tabD");
       expect(store.getStable("skey")).toBe("sess-D");
+    });
+  });
+
+  // #570 REOPEN: #587 keyed the stable resume index on origin+title+backend. An
+  // unsaved workflow's title is the DEFAULT "Unsaved Workflow", so two DIFFERENT
+  // unsaved workflows collided on one key and a reset resumed an unrelated earlier
+  // on-disk session (the WRONG conversation) for a turn. deriveStableKey keys on the
+  // panel's durable, globally-unique per-instance uuid when advertised, so the two
+  // can never share a key — and the uuid survives the reload that churns the tmp: id.
+  describe("deriveStableKey — durable per-instance uuid retires the same-title collision (#570 reopen)", () => {
+    it("two DIFFERENT unsaved workflows sharing the default title get DIFFERENT keys", () => {
+      // The exact reopened scenario: same origin, same "Unsaved Workflow" title
+      // (title is no longer part of the key at all) — but distinct per-instance uuids.
+      const a = deriveStableKey({ workflowUuid: UUID_A, origin: "http://127.0.0.1:8188", backend: "claude" });
+      const b = deriveStableKey({ workflowUuid: UUID_B, origin: "http://127.0.0.1:8188", backend: "claude" });
+      expect(a).not.toBe(b);
+    });
+
+    it("the SAME instance keeps ONE key across a reload (churned tmp id / title suffix)", () => {
+      // Post-reload the tmp:<uuid> tab id and even the title's "(N)" suffix can
+      // change; only the embedded per-instance uuid is stable — and since the key no
+      // longer includes the title, the SAME uuid always yields the SAME resume key.
+      const before = deriveStableKey({ workflowUuid: UUID_A, origin: "http://127.0.0.1:8188", backend: "claude" });
+      const after = deriveStableKey({ workflowUuid: UUID_A, origin: "http://127.0.0.1:8188", backend: "claude" });
+      expect(after).toBe(before);
+    });
+
+    it("the uuid key partitions by backend (per-provider sessions)", () => {
+      const claude = deriveStableKey({ workflowUuid: UUID_A, origin: "o", backend: "claude" });
+      const codex = deriveStableKey({ workflowUuid: UUID_A, origin: "o", backend: "codex" });
+      expect(claude).not.toBe(codex);
+    });
+
+    it("the SAME uuid from a DIFFERENT origin can't cross-resume (copied graph metadata)", () => {
+      // The uuid is embedded in graph JSON that can be copied to another instance;
+      // folding the origin into the key stops a replayed uuid from bridging them.
+      const a = deriveStableKey({ workflowUuid: UUID_A, origin: "http://127.0.0.1:8188", backend: "claude" });
+      const b = deriveStableKey({ workflowUuid: UUID_A, origin: "http://127.0.0.1:8199", backend: "claude" });
+      expect(a).not.toBe(b);
+    });
+
+    it("FAIL CLOSED: no uuid (old panel) → undefined, never the collision-prone legacy key", () => {
+      // The whole reopen was the origin+title key; an un-upgraded panel that sends no
+      // uuid must NOT fall back to it. undefined = the orchestrator forgoes the disk
+      // fallback and starts fresh (a lost resume, never a wrong one).
+      expect(deriveStableKey({ origin: "http://127.0.0.1:8188", backend: "claude" })).toBeUndefined();
+      // Blank/whitespace and malformed identifiers are treated as absent too — a junk
+      // value never becomes an arbitrary session handle.
+      expect(deriveStableKey({ workflowUuid: "  ", origin: "o", backend: "claude" })).toBeUndefined();
+      expect(deriveStableKey({ workflowUuid: "not-a-uuid", origin: "o", backend: "claude" })).toBeUndefined();
+    });
+
+    it("FAIL CLOSED: a missing/blank origin (no trusted handshake origin) → undefined", () => {
+      // The origin must be the server-observed handshake origin; when the bridge can't
+      // supply one (relay/headless) we key on nothing rather than an untrusted value.
+      expect(deriveStableKey({ workflowUuid: UUID_A, backend: "claude" })).toBeUndefined();
+      expect(deriveStableKey({ workflowUuid: UUID_A, origin: "   ", backend: "claude" })).toBeUndefined();
+    });
+
+    it("canonicalizes the origin (case + trailing slash) so trivial variants share one key", () => {
+      const a = deriveStableKey({ workflowUuid: UUID_A, origin: "http://127.0.0.1:8188/", backend: "claude" });
+      const b = deriveStableKey({ workflowUuid: UUID_A, origin: "HTTP://127.0.0.1:8188", backend: "claude" });
+      expect(a).toBe(b);
+    });
+
+    it("END-TO-END: two same-title workflows no longer cross-resume through the store", () => {
+      const store = new SessionStore(PORT);
+      // Workflow A converses (session sess-A), stored under its uuid key.
+      const keyA = deriveStableKey({ workflowUuid: UUID_A, origin: "o", backend: "claude" })!;
+      store.setStable(keyA, "sess-A", "tmp:tabA");
+      // A DIFFERENT unsaved workflow B, same default title, opens after a restart.
+      const keyB = deriveStableKey({ workflowUuid: UUID_B, origin: "o", backend: "claude" })!;
+      // Under #587 (origin+title) keyA === keyB and B would resume A's sess-A. Now:
+      expect(store.getStable(keyB)).toBeUndefined(); // B never inherits A's chat
+      // And A itself still resumes across a fresh process (durable).
+      expect(new SessionStore(PORT).getStable(keyA)).toBe("sess-A");
+    });
+
+    it("IDENTITY REGRESSION: a fail-closed hello retires the prior session so a reset can't resurrect it", () => {
+      // Models the index.ts fail-closed branch (both the direct re-hello path AND the
+      // tab-id-migration carry-over path, which funnel to the same clearStable). A tab
+      // connected with a valid uuid and persisted session S under its key. It then
+      // re-hellos from an old/malformed panel (no uuid) → identity regression: the
+      // orchestrator clears S (via the carried-over prior key on a migration). This is
+      // what stops a later `new_session` (which can no longer resolve the key) from
+      // leaving S on disk for a subsequent valid-uuid hello to getStable() back —
+      // resurrecting a conversation the user reset. After the clear, even recomputing
+      // the SAME uuid key misses, so nothing is resurrected.
+      const store = new SessionStore(PORT);
+      const key = deriveStableKey({ workflowUuid: UUID_A, origin: "o", backend: "claude" })!;
+      store.setStable(key, "sess-S", "tmp:tabA");
+      expect(store.getStable(key)).toBe("sess-S");
+
+      // Fail-closed hello: deriveStableKey returns undefined; the branch clears `key`.
+      expect(deriveStableKey({ origin: "o", backend: "claude" })).toBeUndefined();
+      store.clearStable(key);
+
+      // Later valid-uuid hello recomputes the identical key — but it now misses, so the
+      // reset conversation is NOT resurrected. Durable across a fresh process too.
+      const recomputed = deriveStableKey({ workflowUuid: UUID_A, origin: "o", backend: "claude" })!;
+      expect(recomputed).toBe(key);
+      expect(store.getStable(recomputed)).toBeUndefined();
+      expect(new SessionStore(PORT).getStable(recomputed)).toBeUndefined();
+    });
+
+    it("BACKEND SWITCH: each provider's session stays under its OWN recomputed key (no cross-provider resume)", () => {
+      // Models the set_backend recompute. Same tab/workflow (one origin+uuid), used on
+      // backend A then switched to B without a reconnect. Because set_backend recomputes
+      // tabStableKey for the new backend, B's onSession persists under the B key — NOT
+      // the A key — so a later reconnect on A resumes A's session and a reconnect on B
+      // resumes B's, never each other's (the backend-isolation guarantee).
+      const store = new SessionStore(PORT);
+      const keyClaude = deriveStableKey({ workflowUuid: UUID_A, origin: "o", backend: "claude" })!;
+      const keyCodex = deriveStableKey({ workflowUuid: UUID_A, origin: "o", backend: "codex" })!;
+      expect(keyClaude).not.toBe(keyCodex);
+      store.setStable(keyClaude, "sess-claude", "tmp:tabA"); // on claude
+      // switch to codex → key recomputed → codex onSession writes under the codex key.
+      store.setStable(keyCodex, "sess-codex", "tmp:tabA");
+      // Neither leaked into the other; both resume correctly across a fresh process.
+      const restarted = new SessionStore(PORT);
+      expect(restarted.getStable(keyClaude)).toBe("sess-claude");
+      expect(restarted.getStable(keyCodex)).toBe("sess-codex");
     });
   });
 
