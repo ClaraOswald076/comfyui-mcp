@@ -6,6 +6,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.29] - 2026-08-01
+
+### MCP
+
+#### Fixed
+- layer the compact facade onto full mode so a stable call_tool survives panel reconnect (#616) (#620)
+- keep queryApiGraph token-bound so one blob can't starve the node you asked for (#609) (#617)
+- actionable no-panel guidance after a reconnect drop (panel #436, #442) (#615)
+- survive idle-user timeout on the adult-consent card (panel#390) (#610)
+
+
 ## [0.48.28] - 2026-08-01
 
 ### Fixed
