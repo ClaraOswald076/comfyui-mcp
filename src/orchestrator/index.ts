@@ -2614,12 +2614,24 @@ export async function runPanelOrchestrator(): Promise<void> {
           tabStableKey.delete(migratedFrom);
           tabStableIdentity.delete(migratedFrom);
         } else {
-          const prevKey = migratedFrom + AGENT_KEY_SEP + prevBackend;
-          const newKey = panelTab + AGENT_KEY_SEP + prevBackend;
-          if (manager.rebindAgent(prevKey, newKey)) {
-            logger.info(
-              `[panel-orchestrator] tab-id migration: ${migratedFrom.slice(0, 12)} → ${panelTab.slice(0, 12)} — agent rebound, conversation preserved`,
+          // #570 — migrate per-backend state for EVERY provider, not only the currently-selected
+          // one. A saved workflow can hold a DORMANT session on another backend (used Claude,
+          // switched to Codex, then a save/rename changed its wf: tab id while Codex was current):
+          // rebindAgent moves the exact durable session (+ pending resume + held mail) even when
+          // no live agent exists, so switching back to that provider later still resumes instead
+          // of orphaning the old composite key and starting fresh (codex). Only prevBackend can
+          // have a LIVE agent (a provider switch retires the others), so at most one rebind is a
+          // live-agent move; the rest are durable-only.
+          for (const b of KNOWN_BACKENDS) {
+            const reboundLive = manager.rebindAgent(
+              migratedFrom + AGENT_KEY_SEP + b,
+              panelTab + AGENT_KEY_SEP + b,
             );
+            if (reboundLive) {
+              logger.info(
+                `[panel-orchestrator] tab-id migration: ${migratedFrom.slice(0, 12)} → ${panelTab.slice(0, 12)} (${b}) — agent rebound, conversation preserved`,
+              );
+            }
           }
           // #570 — carry the PROVEN source identity forward as the tab's prior identity. The
           // rebound agent belongs to it (prevIdentity === newIdentity by sameWorkflow), but the

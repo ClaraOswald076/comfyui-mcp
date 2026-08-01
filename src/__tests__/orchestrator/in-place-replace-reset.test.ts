@@ -98,6 +98,45 @@ describe("in-place workflow replacement resets the live session (#570 P0)", () =
     await manager.stopAll();
   });
 
+  it("#570: a proven tab-id migration rebinds EVERY backend, so a dormant provider's session survives", async () => {
+    // Saved workflow A: Claude conversed (dormant after a switch to Codex), Codex is current, then
+    // a save/rename changes the wf: tab id. The migration must move the dormant Claude session to
+    // the new id too — not only the current (Codex) one — or switching back to Claude starts fresh.
+    const backend = new SessioningBackend();
+    const store = new SessionStore(PORT);
+    const manager = new PanelAgentManager({
+      mcpServers: {},
+      systemAppend: "",
+      model: "claude-test",
+      onSay: () => {},
+      onTurn: () => {},
+      onSession: () => {},
+      sessionStore: store,
+      makeBackend: () => backend,
+      identityForKey: () => IDENTITY_A,
+    } as never);
+
+    // Dormant Claude session + live-then-retired: model both providers having durable sessions
+    // under the OLD tab id (Claude dormant, Codex current) — bound to the same workflow identity.
+    store.set("wf:old.json::claude", "sess-claude", IDENTITY_A);
+    store.set("wf:old.json::codex", "sess-codex", IDENTITY_A);
+
+    // The proven migration loops over KNOWN_BACKENDS calling rebindAgent(old::b → new::b).
+    for (const b of ["claude", "codex"]) {
+      manager.rebindAgent(`wf:old.json::${b}`, `wf:new.json::${b}`);
+    }
+
+    // BOTH providers' sessions moved to the new id (dormant Claude included), old keys cleared.
+    expect(store.get("wf:new.json::claude")).toBe("sess-claude");
+    expect(store.get("wf:new.json::codex")).toBe("sess-codex");
+    expect(store.get("wf:old.json::claude")).toBeUndefined();
+    expect(store.get("wf:old.json::codex")).toBeUndefined();
+    // …and durably: switching back to Claude on the new id resumes its original conversation.
+    expect(new SessionStore(PORT).get("wf:new.json::claude")).toBe("sess-claude");
+
+    await manager.stopAll();
+  });
+
   it("#570: a backend switch RETIRES the prior provider (preserves its session) so switching back resumes", async () => {
     // BOTH provider-switch protocols on the SAME workflow — the explicit set_backend event AND
     // a re-hello that selects a different backend — now funnel to manager.retire(prevKey). They
