@@ -223,6 +223,43 @@ describe("getLiveExtraModelRoots — fail-closed authorization", () => {
     expect(res.roots).toEqual([]);
   });
 
+  // Windows drive-relative join: `os.path.join("D:\\base", "\\unet")` → `D:\\unet`
+  // (the `\unet` takes its DRIVE from base, not the MCP process's current drive).
+  const winIt = process.platform === "win32" ? it : it.skip;
+  winIt(
+    "joins a drive-relative category entry to base_path's DRIVE (D:\\base + \\unet → D:\\unet)",
+    async () => {
+      const liveRoot = await trackTmp();
+      await writeFile(
+        join(liveRoot, "extra_model_paths.yaml"),
+        ["grp:", "  base_path: D:\\base", "  unet: \\unet"].join("\n"),
+        "utf-8",
+      );
+      const res = await getLiveExtraModelRoots(reachable(["python", join(liveRoot, "main.py")]));
+      // Authorizes D:\unet (base's drive), NOT C:\unet (the MCP process drive).
+      expect(res.roots).toContainEqual({ category: "unet", dir: "D:\\unet", group: "grp" });
+      expect(res.roots).not.toContainEqual({ category: "unet", dir: resolve("\\unet"), group: "grp" });
+    },
+  );
+
+  winIt(
+    "joins a drive-relative entry to a UNC base_path's SHARE (\\\\srv\\share\\base + \\unet → \\\\srv\\share\\unet)",
+    async () => {
+      const liveRoot = await trackTmp();
+      await writeFile(
+        join(liveRoot, "extra_model_paths.yaml"),
+        ["grp:", "  base_path: \\\\srv\\share\\base", "  unet: \\unet"].join("\n"),
+        "utf-8",
+      );
+      const res = await getLiveExtraModelRoots(reachable(["python", join(liveRoot, "main.py")]));
+      expect(res.roots).toContainEqual({
+        category: "unet",
+        dir: "\\\\srv\\share\\unet",
+        group: "grp",
+      });
+    },
+  );
+
   it("P1a: does NOT expand a $VAR in a per-category entry (ComfyUI leaves subpaths literal)", async () => {
     const liveRoot = await trackTmp();
     const baseAbs = resolve("/opt/base");
