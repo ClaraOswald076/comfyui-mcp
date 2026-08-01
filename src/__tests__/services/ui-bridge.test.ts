@@ -1322,6 +1322,18 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     await expect(
       bridge.send({ cmd: "graph_get_state" } as never, { tabId: "tmp:old" }),
     ).resolves.toBeTruthy();
+
+    // A path-less ACTIVE-workflow mutator (workflow_close discards unsaved work) is ALSO
+    // refused — the class the graph_-only gate previously missed (#570 P0c, codex cycle 8).
+    await expect(
+      bridge.send({ cmd: "workflow_close", force: true } as never, { tabId: "tmp:old" }),
+    ).rejects.toThrow(/enforces per-command workflow targeting|update the ComfyUI-MCP panel/i);
+
+    // …but an EXPLICIT-path workflow op names a deterministic target (not a switch-race
+    // victim) and stays allowed even on an old panel.
+    await expect(
+      bridge.send({ cmd: "workflow_close", path: "workflows/other.json" } as never, { tabId: "tmp:old" }),
+    ).resolves.toBeTruthy();
     old.close();
   });
 

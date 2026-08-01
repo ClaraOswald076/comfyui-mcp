@@ -389,10 +389,32 @@ export const BRIDGE_READONLY_CMDS: ReadonlySet<string> = new Set<string>([
 
 /** #570 P0c — a graph command that WRITES the canvas (add/remove/connect/move/set_widget/
  *  clear/load/…). Any `graph_*` command that is NOT in the read-only allowlist mutates, so
- *  this stays correct as new graph mutators are added without having to enumerate them. Used
- *  to fail closed when the connected panel does not enforce the per-command workflow stamp. */
+ *  this stays correct as new graph mutators are added without having to enumerate them. */
 export function isMutatingGraphCommand(cmdName: string): boolean {
   return cmdName.startsWith("graph_") && !BRIDGE_READONLY_CMDS.has(cmdName);
+}
+
+/** #570 P0c — the ACTIVE-workflow save/save_as/rename/close commands, but ONLY when they carry
+ *  no explicit `path` (so they act on whatever workflow is CURRENTLY active). A stale one of
+ *  these, delivered after the user switches workflows, would hit the NEW active workflow —
+ *  workflow_close even discards its unsaved work. An explicit `path` names a DETERMINISTIC
+ *  target, so it is not a switch-race victim and is left ungated. */
+const ACTIVE_WORKFLOW_MUTATORS = new Set<string>([
+  "workflow_save",
+  "workflow_save_as",
+  "workflow_rename",
+  "workflow_close",
+]);
+
+/** #570 P0c — commands that MUTATE the currently-active workflow/canvas and must therefore be
+ *  fenced to the workflow they were issued for. Fail closed for these unless the connected
+ *  panel enforces the per-command workflow stamp (`workflow_open`/`workflow_new` are
+ *  navigation/creation with deterministic or new targets — not active-content mutations — so
+ *  they are excluded). Takes the full command so it can read the `path` discriminator. */
+export function requiresWorkflowStampEnforcement(cmd: { cmd?: unknown; path?: unknown }): boolean {
+  const name = typeof cmd.cmd === "string" ? cmd.cmd : "";
+  if (isMutatingGraphCommand(name)) return true;
+  return ACTIVE_WORKFLOW_MUTATORS.has(name) && cmd.path === undefined;
 }
 
 /** Tight default reply timeout for a MUTATING command with no explicit timeout —
@@ -1764,14 +1786,16 @@ export class UiBridge {
     ) {
       return Promise.reject(buildPanelTooOldError(cmd.cmd, conn.panelVersion));
     }
-    // #570 P0c — FAIL CLOSED for a MUTATING graph command when the resolved panel does NOT
-    // enforce the per-command workflow-instance stamp. Such a panel would silently IGNORE the
-    // stamp and could apply a command delivered AFTER a workflow switch to the wrong canvas —
-    // and a delivered frame cannot be retracted, so fencing only the reply can't undo the
-    // mutation. Refusing to DISPATCH it is the only server-side guarantee. Reads (outline,
-    // query, get_state, serialize, …) stay allowed, so an old panel keeps read-only graph
-    // access with a clear "update to edit" error rather than a silent wrong-canvas write.
-    if (isMutatingGraphCommand(cmd.cmd) && !conn.enforcesWorkflowStamp) {
+    // #570 P0c — FAIL CLOSED for a command that mutates the ACTIVE workflow/canvas (every
+    // graph_* mutator, plus path-less workflow_save/save_as/rename/close) when the resolved
+    // panel does NOT enforce the per-command workflow-instance stamp. Such a panel would
+    // silently IGNORE the stamp and could apply a command delivered AFTER a workflow switch to
+    // the wrong workflow — a delivered frame cannot be retracted, so fencing only the reply
+    // can't undo the mutation (workflow_close would discard the new workflow's unsaved work).
+    // Refusing to DISPATCH is the only server-side guarantee. Reads (outline, query, get_state,
+    // serialize, …) and path-targeted workflow ops stay allowed, so an old panel keeps
+    // read-only graph access with a clear "update to edit" error, never a silent wrong write.
+    if (requiresWorkflowStampEnforcement(cmd) && !conn.enforcesWorkflowStamp) {
       return Promise.reject(
         markDispatched(
           new Error(
