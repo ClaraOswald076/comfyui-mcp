@@ -121,11 +121,15 @@ function readRaw(): { settings: PanelSettings; unreadable: boolean } {
   if (!existsSync(p)) return { settings: {}, unreadable: false };
   try {
     const parsed = JSON.parse(readFileSync(p, "utf-8")) as unknown;
-    return parsed && typeof parsed === "object"
+    // Valid JSON but not a plain object (`null`, `"x"`, and CRUCIALLY `[]`):
+    // the file is present and structurally wrong, so a key's absence is not
+    // proven. An array is the nasty one — `typeof [] === "object"`, so an
+    // unguarded check would accept it, report "no pin" on a file we never
+    // understood, and then silently DROP a pin written to it (an expando
+    // property on an array does not survive JSON.stringify).
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
       ? { settings: parsed as PanelSettings, unreadable: false }
-      : // Valid JSON but not an object (e.g. `null`, `[]`, `"x"`): the file is
-        // present and structurally wrong, so a key's absence is not proven.
-        { settings: {}, unreadable: true };
+      : { settings: {}, unreadable: true };
   } catch (err) {
     logger.warn(`[panel-settings] could not parse ${p}: ${err instanceof Error ? err.message : String(err)}`);
     return { settings: {}, unreadable: true };
@@ -266,6 +270,19 @@ export function setPanelVersionPin(version: string, reason?: string): PanelVersi
   if (trimmedReason) pin.reason = trimmedReason;
   settings.panelPin = pin;
   write(settings);
+  // VERIFY the pin actually landed, by re-reading it. Telling a user "pinned"
+  // when nothing persisted is the same fabricated-success failure this whole
+  // feature exists to prevent — and it is the worse direction, because they
+  // would then believe they are protected. (Env is deliberately excluded here:
+  // we are confirming the FILE, not an override that would mask a failed write.)
+  const persisted = getPanelPinState({});
+  if (!persisted.pinned || persisted.version !== pin.version) {
+    throw new Error(
+      `Pin did NOT persist: after writing ${panelSettingsPath()} the stored pin reads ` +
+        `back as ${persisted.version ?? "absent/unreadable"} rather than ${pin.version}. ` +
+        `NOT reporting the panel as pinned. Check that file is writable and well-formed.`,
+    );
+  }
   return pin;
 }
 
@@ -281,6 +298,15 @@ export function clearPanelVersionPin(): PanelVersionPin | undefined {
   if (!previous) return undefined;
   delete settings.panelPin;
   write(settings);
+  // Symmetrically verified: a "pin removed" we did not observe would leave the
+  // user believing a sync can now proceed when it still cannot.
+  const persisted = getPanelPinState({});
+  if (persisted.pinned) {
+    throw new Error(
+      `Pin was NOT removed: ${panelSettingsPath()} still reads back as pinned after ` +
+        `the write. NOT reporting the pin as cleared.`,
+    );
+  }
   return previous;
 }
 

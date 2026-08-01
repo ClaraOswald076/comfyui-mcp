@@ -291,6 +291,29 @@ function readPinSafe(deps: PanelInstallerDeps): PanelPinState {
   }
 }
 
+/**
+ * Serializes every panel MUTATION in this process (the on-load ensure and each
+ * install/update/reinstall). Two overlapping panel ops would each read the
+ * other's half-applied disk state, and the #639 "did it move?" proof compares a
+ * pre-image against a post-image — interleave them and both comparisons are
+ * meaningless. One at a time makes each op's before/after its own.
+ *
+ * It also bounds the pin race: the final pin check (assertNotPinned, immediately
+ * before the Manager call) and the call itself sit inside this critical section,
+ * so a pin cannot be written by a concurrent op in between.
+ */
+let panelOpChain: Promise<unknown> = Promise.resolve();
+
+function withPanelOpLock<T>(fn: () => Promise<T>): Promise<T> {
+  // Chain off settled-or-rejected so one failed op never wedges the queue.
+  const run = panelOpChain.then(fn, fn);
+  panelOpChain = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
 /** The refusal a pin produces for a mutating action, with the way out. */
 function pinRefusalMessage(action: string, pin: PanelPinState): string {
   return (
@@ -303,6 +326,17 @@ function pinRefusalMessage(action: string, pin: PanelPinState): string {
       : ``) +
     `, then re-run the ${action}.`
   );
+}
+
+/**
+ * Throw if a pin is in force. Called BOTH on entry (fail fast with a good
+ * message before any work) and again immediately before the ComfyUI-Manager
+ * call inside the op lock — detection can take a while, and a pin set during
+ * that window must still be honoured.
+ */
+function assertNotPinned(action: string, deps: PanelInstallerDeps): void {
+  const pin = readPinSafe(deps);
+  if (pin.pinned) throw new PanelInstallError(pinRefusalMessage(action, pin));
 }
 
 // ---------------------------------------------------------------------------
@@ -810,6 +844,15 @@ async function ensureInner(deps: PanelInstallerDeps): Promise<EnsureResult> {
           "skipping auto-install to avoid a duplicate/unverified install.",
       };
     }
+    // Final pin check adjacent to the mutation (see runPanelActionInner): the
+    // reachability probe and detection above are not instantaneous.
+    const latePin = readPinSafe(deps);
+    if (latePin.pinned) {
+      return {
+        action: "skipped",
+        reason: `panel version pin in force — ${describePanelPin(latePin)}`,
+      };
+    }
     await deps.install({ id: PANEL_REGISTRY_ID, version: PANEL_VERSION });
     // #639 — VERIFY it actually landed (fresh re-read); never log "installed"
     // from the Manager result alone (a stale 3.x no-op drains the queue trivially).
@@ -878,7 +921,12 @@ export async function ensurePanelInstalled(
 ): Promise<EnsureResult> {
   const deps = opts.deps ?? defaultDeps;
   try {
-    return await withTimeout(ensureInner(deps), opts.timeoutMs ?? ENSURE_TIMEOUT_MS);
+    // Serialized with the explicit actions: the on-load ensure must not race an
+    // install_panel call the user fired at the same moment.
+    return await withTimeout(
+      withPanelOpLock(() => ensureInner(deps)),
+      opts.timeoutMs ?? ENSURE_TIMEOUT_MS,
+    );
   } catch (err) {
     logger.debug("panel: ensure failed", {
       err: err instanceof Error ? err.message : String(err),
@@ -1173,9 +1221,17 @@ function finalizeUpdate(
  * install/update/reinstall the panel. LOCAL-only and refuses dev symlinks.
  * Targets version "nightly". Caller must RESTART ComfyUI to load the change.
  */
-export async function runPanelAction(
+export function runPanelAction(
   action: "install" | "update" | "reinstall",
   deps: PanelInstallerDeps = defaultDeps,
+): Promise<PanelActionResult> {
+  // Serialized: never let two panel mutations interleave (see withPanelOpLock).
+  return withPanelOpLock(() => runPanelActionInner(action, deps));
+}
+
+async function runPanelActionInner(
+  action: "install" | "update" | "reinstall",
+  deps: PanelInstallerDeps,
 ): Promise<PanelActionResult> {
   // P1b — truly LOCAL-only. Refuse in remote/cloud mode even when COMFYUI_PATH
   // is set: installCustomNode/reinstallCustomNode would queue Manager mutations
@@ -1198,11 +1254,9 @@ export async function runPanelAction(
   // PIN GUARD — before any Manager mutation is queued. This is the single choke
   // point that makes "we never move a pinned user" true for every caller (the
   // sync skill, the panel, a hand-written install_panel call), not just the ones
-  // that remembered to check.
-  const pin = readPinSafe(deps);
-  if (pin.pinned) {
-    throw new PanelInstallError(pinRefusalMessage(action, pin));
-  }
+  // that remembered to check. It is re-checked once more immediately before the
+  // Manager call, since detection below is not instantaneous.
+  assertNotPinned(action, deps);
 
   const detection = await detectPanelInstall(deps);
   if (detection.isDevSymlink) {
@@ -1219,6 +1273,9 @@ export async function runPanelAction(
   const previousRev = detection.gitRev;
 
   if (action === "update") {
+    // Final pin check, inside the op lock and adjacent to the mutation: a pin
+    // set while detection was running must still be honoured.
+    assertNotPinned(action, deps);
     const result = await deps.update({ id: PANEL_REGISTRY_ID });
     // #639 — VERIFY the update actually advanced the pack. Re-read the installed
     // identity FRESH from disk (never trust Manager's queue-drained signal, nor
@@ -1251,7 +1308,8 @@ export async function runPanelAction(
     return finalizeUpdate(verdict, post, result);
   }
 
-  // install / reinstall.
+  // install / reinstall. Same final pin check as the update path above.
+  assertNotPinned(action, deps);
   const result =
     action === "install"
       ? await deps.install({ id: PANEL_REGISTRY_ID, version: PANEL_VERSION })

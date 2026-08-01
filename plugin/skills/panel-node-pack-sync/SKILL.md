@@ -1,8 +1,6 @@
 ---
 name: panel-node-pack-sync
 description: Keep the ComfyUI sidebar panel node-pack (comfyui-agent-panel) in step with the orchestrator after comfyui-mcp updates. Use this whenever the orchestrator was just updated (self_update, npm i -g comfyui-mcp, a new version in the ENVIRONMENT line), when a panel/bridge command fails in a way that smells like version drift ("panel is too old", a graph_/ui_ command the panel doesn't implement, a feature that works in the docs but not in the sidebar), or when the user asks to update/pin/unpin the panel. It checks the installed panel version against what THIS orchestrator build needs, RESPECTS an explicit version pin (warn-only, never move a pinned user), offers a clear way to unset the pin, runs the sync through the verified install_panel path, and reports the version RE-READ from disk. Never claim a sync that did not happen.
-globs:
-  - "**/pyproject.toml"
 ---
 
 # Keep the panel node-pack in sync with the orchestrator
@@ -58,7 +56,7 @@ pin, shadow copies, dev symlinks, remote/cloud mode, and unreadable versions.
 | `sync` | Behind, not pinned, nothing ambiguous. | Step 3 — sync it. |
 | `pinned-warn` | Behind, **but pinned**. | Step 4 — warn only. **Do not sync.** |
 | `blocked` | A shadow copy, or a pin we couldn't read. | Step 5 — get it unblocked first. |
-| `unknown` | The installed version isn't comparable (`nightly`, `dev`, unreadable). | Report it, don't guess. Offer a deliberate `install_panel(action='update')` and let the user decide. |
+| `unknown` | The installed version isn't comparable (`nightly`, `dev`, unreadable) **and nothing is pinned**. | Report it, don't guess. Offer a deliberate `install_panel(action='update')` and let the user decide. (If they *were* pinned you'd have got `pinned-warn` instead, so `unknown` never means "quietly ignore a pin".) |
 | `dev-install` | Symlinked dev checkout. | Tell them to `git pull` their own checkout. Change nothing. |
 | `not-applicable` | Remote/cloud, or no local ComfyUI. | Explain the panel is managed on the ComfyUI host. |
 
@@ -75,8 +73,13 @@ re-reads the pack from disk afterwards. Read the result:
 - `synced: true` → it really moved. Report **`verifiedVersion`** — that is the
   version observed on disk after the op, not the one we asked for. Then tell the
   user **ComfyUI must be RESTARTED** to load it (`restartRequired: true`); this
-  never auto-restarts. If `stillBehind: true`, the update applied but did *not*
-  close the gap — say that too, don't round it up to "you're current now".
+  never auto-restarts. Now read `stillBehind`, which is **tri-state**:
+  - `false` → the panel provably meets what the orchestrator needs. Done.
+  - `true` → the update applied but did **not** close the gap. Say so; do not
+    round it up to "you're current now".
+  - **`undefined`** → it landed, but the resulting version (e.g. `nightly`)
+    can't be compared, so whether the mismatch is fixed is **unknown**. Say
+    exactly that. `undefined` is not `false` — never report it as "you're fine".
 - `synced: false` → nothing was changed. `decision` says why (`pinned-warn`,
   `up-to-date`, `blocked`, …). This is a normal outcome, not a failure.
 - **The tool errored** → the sync FAILED. The error text names the cause

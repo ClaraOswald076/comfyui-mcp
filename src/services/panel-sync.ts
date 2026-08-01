@@ -125,7 +125,13 @@ export function evaluatePanelSync(
   const required = opts.requiredVersion ?? requiredPanelVersion();
   const orchestratorVersion =
     opts.orchestratorVersion ?? detectInstallMode().currentVersion ?? undefined;
-  const pin = status.pin ?? { pinned: false, source: "none" as const };
+  // A PanelStatus without a `pin` is a caller that predates the pin (or built
+  // the object by hand). Absence of the field is not evidence of absence of a
+  // pin, so it resolves to indeterminate-pinned, not to unpinned.
+  const pin: PanelPinState =
+    status.pin && typeof status.pin === "object"
+      ? status.pin
+      : { pinned: true, source: "settings", indeterminate: true };
 
   const base = {
     requiredPanelVersion: required,
@@ -216,16 +222,32 @@ export function evaluatePanelSync(
   }
 
   if (!isComparableVersion(status.installedVersion)) {
+    const cannotCompare =
+      `The panel is installed at ${status.dir ?? "custom_nodes"} but its version ` +
+      `(${status.installedVersion ?? "unreadable"}) is not a comparable version ` +
+      `number, so it cannot be compared against the ${required} this orchestrator ` +
+      `needs.`;
+    // A pin outranks "we can't tell". Reporting `unknown` here would send the
+    // agent off to suggest a deliberate update that the mutation guard is going
+    // to refuse anyway — and would skip the warning the user is owed.
+    if (pin.pinned) {
+      return {
+        ...base,
+        decision: "pinned-warn",
+        behind: false,
+        summary:
+          `${cannotCompare} You are also ${describePanelPin(pin)}, so nothing will ` +
+          `be changed either way. Clear the pin (install_panel(action='unpin')) ` +
+          `first if you want to move the panel at all.`,
+      };
+    }
     return {
       ...base,
       decision: "unknown",
       behind: false,
       summary:
-        `The panel is installed at ${status.dir ?? "custom_nodes"} but its version ` +
-        `(${status.installedVersion ?? "unreadable"}) is not a comparable version ` +
-        `number, so it cannot be compared against the ${required} this orchestrator ` +
-        `needs. NOT syncing on a guess — check the pack's pyproject.toml, or run ` +
-        `install_panel(action='update') deliberately.`,
+        `${cannotCompare} NOT syncing on a guess — check the pack's pyproject.toml, ` +
+        `or run install_panel(action='update') deliberately.`,
     };
   }
 
@@ -298,9 +320,15 @@ export interface PanelSyncResult {
   /** Highest panel version this orchestrator build needs. */
   requiredPanelVersion: string;
   /**
-   * True when the sync landed but the resulting version is STILL below what the
-   * orchestrator needs. The sync really happened, so `synced` is true — but the
-   * mismatch is not resolved and the user must be told so.
+   * TRI-STATE, and deliberately so.
+   *  - `true`  → the sync landed but the result is STILL below what the
+   *              orchestrator needs. The sync happened; the mismatch did not go
+   *              away, and the user must be told.
+   *  - `false` → the sync landed and the result PROVABLY meets the requirement.
+   *  - `undefined` → the sync landed but the resulting version is not a
+   *              comparable version number (e.g. "nightly"), so whether the
+   *              requirement is met is UNKNOWN. It must not collapse to `false`:
+   *              "we couldn't check" is not "you're fine".
    */
   stillBehind?: boolean;
   /** True when ComfyUI must be restarted to load what just landed. */
@@ -377,9 +405,21 @@ export async function performPanelSync(
     );
   }
 
-  const stillBehind =
-    isComparableVersion(after.installedVersion) &&
-    compareSemver(after.installedVersion, assessment.requiredPanelVersion) < 0;
+  // Tri-state: `undefined` when the landed version can't be compared at all.
+  const stillBehind = isComparableVersion(after.installedVersion)
+    ? compareSemver(after.installedVersion, assessment.requiredPanelVersion) < 0
+    : undefined;
+
+  const gapNote =
+    stillBehind === true
+      ? `NOTE: that is still below the ${assessment.requiredPanelVersion} this ` +
+        `orchestrator expects — the update applied but did not close the gap. `
+      : stillBehind === undefined
+        ? `NOTE: "${after.installedVersion}" is not a comparable version number, so ` +
+          `whether it meets the ${assessment.requiredPanelVersion} this orchestrator ` +
+          `expects could NOT be confirmed — the update applied, the version match did ` +
+          `not. `
+        : ``;
 
   return {
     synced: true,
@@ -393,10 +433,7 @@ export async function performPanelSync(
       `Panel synced: verified on disk as ${after.installedVersion}` +
       (result.previousVersion ? ` (was ${result.previousVersion})` : ``) +
       `. ` +
-      (stillBehind
-        ? `NOTE: that is still below the ${assessment.requiredPanelVersion} this ` +
-          `orchestrator expects — the update applied but did not close the gap. `
-        : ``) +
+      gapNote +
       `RESTART ComfyUI to load it.`,
   };
 }

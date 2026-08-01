@@ -215,6 +215,38 @@ describe("panel version pin", () => {
     });
   });
 
+  it.each(["[]", '["a"]', "null", '"x"', "42"])(
+    "valid JSON that isn't a plain object (%s) reads as PINNED-indeterminate",
+    (body) => {
+      // `[]` is the trap: typeof [] === "object", so a naive check accepts it,
+      // reports "no pin" on a file we never understood, AND silently drops any
+      // pin written to it (an array expando does not survive JSON.stringify).
+      mkdirSync(dirname(settingsPath), { recursive: true });
+      writeFileSync(settingsPath, body);
+      expect(getPanelPinState({})).toMatchObject({ pinned: true, indeterminate: true });
+    },
+  );
+
+  it("refuses to pin into a JSON-array settings file rather than silently dropping it", () => {
+    mkdirSync(dirname(settingsPath), { recursive: true });
+    writeFileSync(settingsPath, "[]");
+    expect(() => setPanelVersionPin("0.11.20")).toThrow(/could not be parsed/i);
+    // Never leaves the caller believing they are pinned when they are not.
+    expect(getPanelPinState({}).version).toBeUndefined();
+    expect(readFileSync(settingsPath, "utf-8")).toBe("[]");
+  });
+
+  it("only reports a pin after re-reading it back from disk", () => {
+    // The contract set/clear verify: a returned pin has been OBSERVED on disk,
+    // so "pinned" is never claimed from a write we didn't confirm.
+    const pin = setPanelVersionPin("0.11.20");
+    const onDisk = JSON.parse(readFileSync(settingsPath, "utf-8"));
+    expect(onDisk.panelPin.version).toBe(pin.version);
+
+    clearPanelVersionPin();
+    expect(JSON.parse(readFileSync(settingsPath, "utf-8")).panelPin).toBeUndefined();
+  });
+
   it("refuses to rewrite an unparseable settings file rather than clobber it", () => {
     mkdirSync(dirname(settingsPath), { recursive: true });
     writeFileSync(settingsPath, "{ not json");

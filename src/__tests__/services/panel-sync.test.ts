@@ -155,6 +155,27 @@ describe("evaluatePanelSync — a pin is honoured in every shape", () => {
     expect(a.decision).toBe("blocked");
     expect(a.decision).not.toBe("sync");
   });
+
+  it("a MISSING pin field is treated as pinned, never as unpinned", () => {
+    // A status built by a caller that predates the pin field: absence of the
+    // field is not evidence of absence of a pin.
+    const s = status({ installedVersion: "0.11.3" });
+    delete (s as Partial<PanelStatus>).pin;
+    const a = evaluatePanelSync(s, { requiredVersion: REQUIRED, orchestratorVersion: ORCH });
+    expect(a.decision).toBe("blocked");
+  });
+
+  it("a pin still WARNS when the installed version is uncomparable", () => {
+    // Must not fall through to `unknown`: that would skip the warning the user
+    // is owed and send the agent to try an update the guard will refuse.
+    const pin: PanelPinState = { pinned: true, version: "nightly", source: "settings" };
+    const a = evaluatePanelSync(status({ installedVersion: "nightly", pin }), {
+      requiredVersion: REQUIRED,
+      orchestratorVersion: ORCH,
+    });
+    expect(a.decision).toBe("pinned-warn");
+    expect(a.summary).toMatch(/pinned/i);
+  });
 });
 
 describe("evaluatePanelSync — cases where we must not guess", () => {
@@ -379,6 +400,56 @@ describe("performPanelSync", () => {
     expect(r.verifiedVersion).toBe("0.11.10");
     expect(r.stillBehind).toBe(true);
     expect(r.message).toMatch(/still below/i);
+  });
+
+  it("leaves stillBehind UNDEFINED when the landed version can't be compared", async () => {
+    // "nightly" landed: the sync really happened, but whether it meets the
+    // requirement is unknown. `undefined` must NOT collapse to false — that
+    // would read as "you're fine now" on a version we never checked.
+    const h = makeDeps({
+      installedVersion: "0.11.3",
+      onUpdate: (files) => {
+        files[join(PANEL_DIR, "pyproject.toml")] = pyproject("nightly");
+      },
+    });
+    const r = await performPanelSync({ deps: h.deps, ...RUN });
+    expect(r.synced).toBe(true);
+    expect(r.verifiedVersion).toBe("nightly");
+    expect(r.stillBehind).toBeUndefined();
+    expect(r.message).toMatch(/could NOT be confirmed/i);
+  });
+
+  it("serializes concurrent syncs instead of interleaving their before/after reads", async () => {
+    // Two overlapping ops would each read the other's half-applied state, and
+    // the #639 movement proof compares a pre-image to a post-image.
+    let inFlight = 0;
+    let maxConcurrent = 0;
+    let n = 0;
+    const h = makeDeps({
+      installedVersion: "0.11.3",
+      onUpdate: (files) => {
+        files[join(PANEL_DIR, "pyproject.toml")] = pyproject(`0.11.${30 + n++}`);
+      },
+    });
+    const deps: PanelInstallerDeps = {
+      ...h.deps,
+      update: async (o) => {
+        inFlight++;
+        maxConcurrent = Math.max(maxConcurrent, inFlight);
+        await new Promise((r) => setTimeout(r, 5));
+        const res = await h.deps.update(o);
+        inFlight--;
+        return res;
+      },
+    };
+    const results = await Promise.allSettled([
+      performPanelSync({ deps, ...RUN }),
+      performPanelSync({ deps, ...RUN }),
+    ]);
+    expect(maxConcurrent).toBe(1);
+    // The first moves the pack; the second sees no further movement and fails
+    // closed rather than claiming a second successful sync.
+    expect(results.filter((r) => r.status === "fulfilled").length).toBeGreaterThanOrEqual(1);
   });
 
   it("refuses to sync a dev symlink", async () => {
