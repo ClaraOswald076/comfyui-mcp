@@ -197,6 +197,18 @@ describe("auth.json records", () => {
     expect(piCredentialPresent(home, bareEnv({ XAI_API_KEY: "sk" }))).toBe(true);
   });
 
+  it("a `null` auth.json breaks pi's auth layer — nothing counts, not even an env key", () => {
+    // pi indexes the parsed value (`this.data[provider]`), which throws for null.
+    writePiFile(tmp, "auth.json", "null");
+    expect(piCredentialPresent(tmp, bareEnv({ OPENAI_API_KEY: "sk" }))).toBe(false);
+    // …but an array / string / number all index harmlessly to undefined for pi,
+    // so they must NOT suppress a working ambient key.
+    for (const body of ["[]", '"nope"', "42"]) {
+      writePiFile(tmp, "auth.json", body);
+      expect(piCredentialPresent(tmp, bareEnv({ OPENAI_API_KEY: "sk" })), body).toBe(true);
+    }
+  });
+
   it("a FALSY stored entry does not own the provider (pi gates on `if (stored)`)", () => {
     // pi falls back to the ambient key when the stored value is null, so
     // suppressing on mere key-presence would false-red a working install.
