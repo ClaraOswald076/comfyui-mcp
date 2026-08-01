@@ -8,6 +8,7 @@ import { comfyuiFetch } from "../comfyui/fetch.js";
 import { ProcessControlError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { findComfyuiPython } from "./env-capabilities.js";
+import { resetManagerApiCache } from "./manager-api-cache.js";
 import {
   liveRootFromArgv,
   resolveEffectiveComfyUIBase,
@@ -1052,9 +1053,14 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
   }
 
   // Reset the WebSocket client singleton + the memoized /object_info —
-  // a restart is exactly when the node set may have changed.
+  // a restart is exactly when the node set may have changed. The detected
+  // ComfyUI-Manager API dialect is live-derived the same way: the instance that
+  // comes back on this port can be a different Manager generation (a 3.x→4.x
+  // upgrade, or dropping --enable-manager-legacy-ui) at an unchanged URL, and a
+  // stale dialect misroutes every later Manager call (#646).
   resetClient();
   resetObjectInfoCache();
+  resetManagerApiCache("comfyui stopped");
 
   // Wait for port to actually free
   try {
@@ -1146,6 +1152,12 @@ export async function startComfyUI(): Promise<StartResult> {
     launched.once("exit", revokeEnvTrust);
     launched.once("error", revokeEnvTrust);
   }
+
+  // A NEW server instance is coming up on this port — whatever Manager dialect we
+  // classified belonged to whatever ran here before (start_comfyui is also
+  // reachable without a preceding stopComfyUI, e.g. after an external kill or a
+  // Manager upgrade), so re-probe rather than trust it (#646).
+  resetManagerApiCache("comfyui started");
 
   // Wait for API to become ready
   const startupResult = await Promise.race([
@@ -1418,10 +1430,12 @@ async function restartViaManagerReboot(context: {
     };
   }
 
-  // Back and ready — refresh the WS client singleton + memoized /object_info,
-  // since a reboot is exactly when the node set may have changed.
+  // Back and ready — refresh the WS client singleton + memoized /object_info +
+  // the detected Manager dialect, since a reboot is exactly when the node set
+  // and the Manager generation may have changed (#646).
   resetClient();
   resetObjectInfoCache();
+  resetManagerApiCache("comfyui rebooted via Manager");
 
   return {
     stopped: true,

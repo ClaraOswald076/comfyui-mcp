@@ -62,6 +62,7 @@ import {
 } from "../comfyui/client.js";
 import { convertUiToApi, collectNodeTypes } from "../services/workflow-converter.js";
 import { restartComfyUI } from "../services/process-control.js";
+import { resetManagerApiCache } from "../services/manager-api-cache.js";
 import {
   isRemoteMode,
   isCloudMode,
@@ -4975,6 +4976,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             // Manager-reboot / preflight no-op) is honestly couldn't-confirm (coordinator P1).
             resetClient();
             resetObjectInfoCache();
+            resetManagerApiCache("panel managed restart");
             // The observation window spans the ~40s blocking sync + a full cold-start
             // window. (Under a test timing override, use the injected budget instead so the
             // never-certify cases don't wait the real ~140s.)
@@ -5048,9 +5050,12 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         }
 
         // ACCEPTED. A reboot restarts ComfyUI out-of-band, so the orchestrator's cached WS
-        // client + /object_info go stale (#353/#357/#378/#394) — drop both caches.
+        // client + /object_info go stale (#353/#357/#378/#394) — drop both caches. The
+        // detected ComfyUI-Manager dialect is live-derived too and a reboot can bring back
+        // a different Manager generation on the same URL (#646), so drop that as well.
         resetClient();
         resetObjectInfoCache();
+        resetManagerApiCache("panel Manager reboot");
 
         // Observe recovery. There is exactly ONE sound proof that THIS ComfyUI instance
         // actually cycled: a directly OBSERVED down→up on the server-authorized, immutable,

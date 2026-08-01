@@ -1,0 +1,320 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// Regression for #646: detectManagerApi() cached the detected ComfyUI-Manager
+// wire dialect keyed ONLY by base URL, for the whole process lifetime. After the
+// user upgraded Manager 3.x → pip comfyui_manager 4.2.2 and restarted ComfyUI at
+// the SAME URL, every later Manager call kept speaking the PRE-restart dialect:
+// download_model routed through the v2-batch/legacy-UI path and failed with
+// "400 Bad Request for /v2/manager/queue/install_model … LEGACY-UI mode" against
+// a server that was demonstrably a normal Manager 4.2.2.
+//
+// Three self-healing mechanisms are asserted here:
+//   1. explicit invalidation on the restart lifecycle (resetManagerApiCache(),
+//      which process-control / the panel restart tools call alongside
+//      resetObjectInfoCache());
+//   2. a TTL backstop for an OUT-OF-BAND restart that no mcp tool observed
+//      (mirrors the /object_info TTL added for the same class of bug in #528);
+//   3. per-call self-heal — a pre-execution rejection re-probes ONCE and retries
+//      the enqueue only when the live dialect actually changed.
+
+// The TTL is read once at module load, so it must be set BEFORE the imports.
+process.env.COMFYUI_MCP_MANAGER_API_TTL_MS = "5000";
+
+vi.mock("../../config.js", () => {
+  const config = {
+    comfyuiPath: "/fake/comfy",
+    resolvedPort: 8188,
+    comfyuiHost: "127.0.0.1",
+    comfyuiSsl: false,
+    githubToken: undefined as string | undefined,
+  };
+  return {
+    config,
+    getComfyUIBaseUrl: () => "http://127.0.0.1:8188",
+    getComfyUIAuthHeaders: () => ({}),
+  };
+});
+
+// node-management pulls in comfy-cli → workspace-env, which calls
+// promisify(execFile) at module load; keep the subprocess surface inert.
+vi.mock("node:child_process", () => ({
+  execFile: vi.fn(),
+  execFileSync: vi.fn(),
+  spawnSync: vi.fn(() => ({ status: 0, stdout: "{}", stderr: "" })),
+}));
+vi.mock("node:fs", () => ({ existsSync: vi.fn(() => true) }));
+
+const { installModelViaManager, setQueueTimingForTests, resetManagerApiCacheForTests } =
+  await import("../../services/node-management.js");
+const { resetManagerApiCache, cacheManagerApi, getCachedManagerApi, managerApiEpoch } =
+  await import("../../services/manager-api-cache.js");
+
+const BASE = "http://127.0.0.1:8188";
+
+interface Call {
+  path: string;
+  method: string;
+  body: unknown;
+}
+
+/** Which Manager the (single, unchanging) URL is currently serving. */
+type Persona = "v2-batch" | "v4";
+
+const DRAINED = { total_count: 1, done_count: 1, in_progress_count: 0, is_processing: false };
+
+function jsonResponse(obj: unknown): Response {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+/**
+ * One ComfyUI at ONE URL whose Manager persona can be swapped mid-test — exactly
+ * what an in-place Manager upgrade + restart looks like from our side.
+ *
+ *   "v2-batch" = pip Manager in legacy-UI mode: is_legacy_manager_ui true, the
+ *                3.x routes (queue/batch, queue/install_model) answer, and the
+ *                unified task route does not exist.
+ *   "v4"       = normal pip Manager 4.2.2: is_legacy_manager_ui false, the
+ *                unified task route answers, and the 3.x-shaped install_model
+ *                body is rejected 400 by Pydantic validation (the #646 report),
+ *                while the unregistered batch route 405s via ComfyUI's catchall.
+ */
+function stubServer(opts: {
+  persona: () => Persona;
+  /** Gate resolution of the is_legacy_manager_ui probe (in-flight-race tests). */
+  legacyUiGate?: () => Promise<void>;
+  /** Override the response for the unified task route. */
+  taskStatus?: () => number;
+}) {
+  const calls: Call[] = [];
+  const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+    const method = init?.method ?? "GET";
+    const body = init?.body ? JSON.parse(init.body as string) : undefined;
+    const path = new URL(url).pathname;
+    calls.push({ path, method, body });
+
+    if (path === "/v2/manager/queue/status") return jsonResponse(DRAINED);
+    if (path === "/v2/manager/queue/start") return new Response("", { status: 200 });
+    if (path === "/v2/manager/is_legacy_manager_ui") {
+      if (opts.legacyUiGate) await opts.legacyUiGate();
+      return jsonResponse({ is_legacy_manager_ui: opts.persona() === "v2-batch" });
+    }
+
+    if (opts.persona() === "v2-batch") {
+      if (path === "/v2/manager/queue/install_model") return new Response("", { status: 200 });
+      if (path === "/v2/manager/queue/batch") return jsonResponse({ failed: [] });
+      // The unified task route does not exist on the bundled 3.x server.
+      if (path === "/v2/manager/queue/task") return new Response("405", { status: 405 });
+    } else {
+      if (path === "/v2/manager/queue/task") {
+        const status = opts.taskStatus?.() ?? 200;
+        return new Response(status === 200 ? "" : String(status), { status });
+      }
+      // v4 registers install_model but validates a ModelMetadata envelope — the
+      // 3.x-shaped body the v2-batch dialect sends is rejected 400 (#646).
+      if (path === "/v2/manager/queue/install_model") {
+        return new Response("400: Bad Request", { status: 400 });
+      }
+      if (path === "/v2/manager/queue/batch") return new Response("405", { status: 405 });
+    }
+    return new Response("", { status: 200 });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  return calls;
+}
+
+const countOf = (calls: Call[], path: string, method = "POST"): number =>
+  calls.filter((c) => c.path === path && c.method === method).length;
+/** Each completed detection probes is_legacy_manager_ui exactly once. */
+const detections = (calls: Call[]): number =>
+  calls.filter((c) => c.path === "/v2/manager/is_legacy_manager_ui").length;
+
+const downloadAModel = () =>
+  installModelViaManager({
+    name: "model.safetensors",
+    url: "https://huggingface.co/foo/model.safetensors",
+    filename: "model.safetensors",
+    type: "checkpoints",
+  });
+
+// A controllable clock: the TTL and the queue-drain loop both read Date.now(),
+// and real timers must keep working (the drain sleeps), so shift Date.now by an
+// offset instead of switching to fake timers.
+let clockOffset = 0;
+const realNow = Date.now;
+
+describe("#646 Manager API dialect cache invalidation", () => {
+  beforeEach(() => {
+    clockOffset = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => realNow() + clockOffset);
+    resetManagerApiCacheForTests();
+    setQueueTimingForTests({ pollIntervalMs: 1, startupGraceMs: 0, timeoutMs: 5000 });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("re-detects after a restart at the SAME url (explicit invalidation)", async () => {
+    let persona: Persona = "v2-batch";
+    const calls = stubServer({ persona: () => persona });
+
+    // 1. Legacy-UI Manager: the model install goes through the 3.x route.
+    await downloadAModel();
+    expect(countOf(calls, "/v2/manager/queue/install_model")).toBe(1);
+    expect(countOf(calls, "/v2/manager/queue/task")).toBe(0);
+
+    // 2. The user upgrades Manager and restarts ComfyUI on the SAME url. The
+    //    restart lifecycle (process-control / the panel restart tools) drops the
+    //    live-derived caches, the dialect among them.
+    persona = "v4";
+    resetManagerApiCache("comfyui restarted");
+
+    // 3. The next Manager call re-probes and speaks v4 — no stale legacy-UI
+    //    routing, no arbitrary-URL rejection.
+    await downloadAModel();
+    expect(countOf(calls, "/v2/manager/queue/task")).toBe(1);
+    // The stale 3.x route was NOT attempted again.
+    expect(countOf(calls, "/v2/manager/queue/install_model")).toBe(1);
+  });
+
+  it("serves the cached dialect within the freshness window (no per-call re-probe)", async () => {
+    const calls = stubServer({ persona: () => "v2-batch" });
+    await downloadAModel();
+    expect(detections(calls)).toBe(1);
+
+    clockOffset += 4_000; // still inside the 5 s window
+    await downloadAModel();
+    expect(detections(calls)).toBe(1);
+  });
+
+  it("re-detects once the TTL lapses (OUT-OF-BAND restart, no mcp tool involved)", async () => {
+    let persona: Persona = "v2-batch";
+    const calls = stubServer({ persona: () => persona });
+
+    await downloadAModel();
+    expect(countOf(calls, "/v2/manager/queue/install_model")).toBe(1);
+
+    // The user restarts ComfyUI themselves after upgrading Manager: nothing in
+    // this process observed it, so no explicit invalidation ever fires.
+    persona = "v4";
+    clockOffset += 6_000; // > the 5 s TTL
+
+    await downloadAModel();
+    // Re-probed and routed to the unified v4 envelope on the FIRST attempt —
+    // the stale 3.x route was never touched again.
+    expect(detections(calls)).toBe(2);
+    expect(countOf(calls, "/v2/manager/queue/task")).toBe(1);
+    expect(countOf(calls, "/v2/manager/queue/install_model")).toBe(1);
+  });
+
+  it("treats a backward clock jump as expired (a rollback can't extend the window)", async () => {
+    let persona: Persona = "v2-batch";
+    const calls = stubServer({ persona: () => persona });
+
+    await downloadAModel();
+    expect(detections(calls)).toBe(1);
+
+    persona = "v4";
+    clockOffset -= 3_600_000; // NTP step / VM snapshot restore, an hour backward
+
+    await downloadAModel();
+    // A raw Date.now() age would go negative and read "fresh" for an hour.
+    expect(detections(calls)).toBe(2);
+    expect(countOf(calls, "/v2/manager/queue/task")).toBe(1);
+  });
+
+  it("self-heals a stale entry: one re-detect, one retry, no duplicate enqueue", async () => {
+    let persona: Persona = "v2-batch";
+    const calls = stubServer({ persona: () => persona });
+
+    // Pin the legacy-UI dialect, then swap the server underneath it WITHOUT any
+    // restart signal and INSIDE the freshness window — the wedge from #646.
+    await downloadAModel();
+    persona = "v4";
+    calls.length = 0;
+
+    await expect(downloadAModel()).resolves.toMatchObject({ mechanism: "manager-http" });
+
+    // Attempt 1 spoke the stale dialect and was rejected 400 BEFORE anything was
+    // enqueued; one re-probe proved the dialect changed; attempt 2 succeeded.
+    expect(countOf(calls, "/v2/manager/queue/install_model")).toBe(1);
+    expect(detections(calls)).toBe(1);
+    // Exactly ONE task enqueued — the retry must not double-submit the install.
+    expect(countOf(calls, "/v2/manager/queue/task")).toBe(1);
+  });
+
+  it("does NOT re-detect or retry on an unrelated failure (403 security gating)", async () => {
+    const calls = stubServer({ persona: () => "v4", taskStatus: () => 403 });
+
+    await expect(downloadAModel()).rejects.toThrow(/403/);
+
+    // A 403 is a permission verdict from a route that exists — not a dialect
+    // signal. No re-probe storm, no retry of the mutation.
+    expect(detections(calls)).toBe(1);
+    expect(countOf(calls, "/v2/manager/queue/task")).toBe(1);
+  });
+
+  it("re-detects at most once on a genuine 400, and does NOT retry when the dialect is unchanged", async () => {
+    const calls = stubServer({ persona: () => "v4", taskStatus: () => 400 });
+
+    await expect(downloadAModel()).rejects.toThrow(/400/);
+
+    // The 400 could have been a stale dialect, so one re-probe is spent proving
+    // otherwise — but the dialect is unchanged, so the enqueue is NOT repeated
+    // and the caller's original error surfaces.
+    expect(detections(calls)).toBe(2);
+    expect(countOf(calls, "/v2/manager/queue/task")).toBe(1);
+
+    // The re-probe re-populated the cache, so a second failing call costs one
+    // more re-probe at most — it never degrades into per-call re-detection.
+    calls.length = 0;
+    await expect(downloadAModel()).rejects.toThrow(/400/);
+    expect(detections(calls)).toBe(1);
+  });
+
+  it("drops a detection that completed across an invalidation (in-flight restart)", async () => {
+    // Direct check of the epoch guard the async detection path relies on.
+    const startEpoch = managerApiEpoch();
+    resetManagerApiCache("comfyui restarted mid-detection");
+    cacheManagerApi(BASE, "v2-batch", startEpoch);
+    expect(getCachedManagerApi(BASE)).toBeUndefined();
+    // A detection that started AFTER the reset still pins normally.
+    cacheManagerApi(BASE, "v2-batch", managerApiEpoch());
+    expect(getCachedManagerApi(BASE)).toBe("v2-batch");
+  });
+
+  it("a restart during an in-flight detection does not re-pin the pre-restart dialect", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let gated = true;
+    const calls = stubServer({
+      persona: () => "v2-batch",
+      legacyUiGate: async () => {
+        if (gated) await gate;
+      },
+    });
+
+    // Park the detection mid-probe …
+    const inflight = downloadAModel();
+    while (!calls.some((c) => c.path === "/v2/manager/is_legacy_manager_ui")) {
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    // … then restart ComfyUI underneath it and let the probe answer.
+    resetManagerApiCache("comfyui restarted mid-detection");
+    gated = false;
+    release();
+    await inflight;
+
+    // The parked detection concluded AFTER the invalidation, so its verdict
+    // described a server that may no longer be there and must NOT be pinned over
+    // the reset. The very next detection inside this same operation (the queue
+    // drain resolves the route prefix) therefore has to probe again: two
+    // detections, not one. Without the epoch guard the stale verdict would have
+    // been re-pinned and the second detection served from cache.
+    expect(detections(calls)).toBe(2);
+  });
+});
