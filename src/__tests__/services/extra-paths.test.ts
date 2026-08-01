@@ -654,7 +654,7 @@ describe("a reachable server with NO --extra-model-paths-config is still authori
     expect(result.groups[0].categories).toEqual([{ category: "vae", paths: ["E:/server"] }]);
   });
 
-  it("a RELATIVE launch flag with no reported cwd falls back to the ALWAYS-loaded root yaml", async () => {
+  it("a RELATIVE launch flag with no reported cwd falls back to the root yaml the server also loads", async () => {
     // /system_stats does not report cwd on current ComfyUI, so `cd /opt/ComfyUI &&
     // python main.py --extra-model-paths-config extra.yaml` is an ordinary launch. The
     // flagged file cannot be located from here — but ComfyUI ALSO always auto-loads
@@ -673,7 +673,7 @@ describe("a reachable server with NO --extra-model-paths-config is still authori
 
     const result = await listExtraPaths();
     expect(result.path).toBe(join(liveB, "extra_model_paths.yaml"));
-    expect(result.notes.some((n) => /ALWAYS auto-loads/i.test(n))).toBe(true);
+    expect(result.notes.some((n) => /loads this file from its install root/i.test(n))).toBe(true);
     // The unlocatable flagged file is disclosed, not silently omitted.
     expect(result.notes.some((n) => /cfg\.yaml.*not listed here/s.test(n))).toBe(true);
 
@@ -682,6 +682,60 @@ describe("a reachable server with NO --extra-model-paths-config is still authori
     // Never resolved against OUR comfyuiPath.
     expect(existsSync(join(stale, "cfg.yaml"))).toBe(false);
     expect(existsSync(join(stale, "extra_model_paths.yaml"))).toBe(false);
+  });
+
+  it("REFUSES an ABSOLUTE flag too when the server's main.py is not on this filesystem", async () => {
+    // A container/WSL server behind a loopback port names files on ITS disk. A same-
+    // spelled absolute path here is a different file, so nothing argv-derived is usable.
+    const hostLookalike = join(await trackTmp(), "extra.yaml");
+    await writeFile(hostLookalike, "h:\n  vae: E:/host\n", "utf-8");
+    mockGetSystemStats.mockResolvedValue({
+      system: {
+        argv: [
+          "python",
+          "/not/mounted/here/main.py",
+          "--extra-model-paths-config",
+          hostLookalike,
+        ],
+      },
+    });
+
+    await expect(listExtraPaths()).rejects.toThrow(
+      /UNRESOLVED.*does not resolve to\s+a file on this filesystem/s,
+    );
+  });
+
+  it("discloses the OTHER configs the server also loads (one file is not all of them)", async () => {
+    // ComfyUI aggregates every --extra-model-paths-config plus <root>/extra_model_paths.yaml.
+    // The tool returns one file, so the others must be named rather than silently omitted.
+    const liveB = await trackTmp();
+    const cfgDir = await trackTmp();
+    const first = join(cfgDir, "one.yaml");
+    const second = join(cfgDir, "two.yaml");
+    await writeFile(first, "a:\n  vae: E:/a\n", "utf-8");
+    await writeFile(second, "b:\n  vae: E:/b\n", "utf-8");
+    await writeFile(join(liveB, "main.py"), "# comfyui\n", "utf-8");
+    await writeFile(join(liveB, "extra_model_paths.yaml"), "c:\n  vae: E:/c\n", "utf-8");
+    mockGetSystemStats.mockResolvedValue({
+      system: {
+        argv: [
+          "python",
+          join(liveB, "main.py"),
+          "--extra-model-paths-config",
+          first,
+          "--extra-model-paths-config",
+          second,
+        ],
+      },
+    });
+
+    const result = await listExtraPaths();
+
+    expect(result.path).toBe(first);
+    const disclosure = result.notes.find((n) => /ONE of several configs/i.test(n));
+    expect(disclosure).toBeDefined();
+    expect(disclosure).toContain(second);
+    expect(disclosure).toContain(join(liveB, "extra_model_paths.yaml"));
   });
 
   it("REFUSES a RELATIVE flag only when there is no main.py either", async () => {
@@ -731,7 +785,7 @@ describe("a reachable server with NO --extra-model-paths-config is still authori
     });
 
     await expect(listExtraPaths()).rejects.toThrow(
-      /UNRESOLVED.*cannot be\s+resolved to a file from this process/s,
+      /UNRESOLVED.*does not resolve to\s+a file on this filesystem/s,
     );
     // …and it did NOT quietly write into the saved workspace instead.
     await expect(

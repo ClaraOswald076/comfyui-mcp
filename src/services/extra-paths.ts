@@ -621,11 +621,11 @@ function implicitLiveTarget(
   const path = join(liveRoot, "extra_model_paths.yaml");
   const notes = unresolvableFlag
     ? [
-        `Resolved to the RUNNING ComfyUI's own extra_model_paths.yaml (${path}). ComfyUI ALWAYS auto-loads this file from its install root, in addition to any --extra-model-paths-config, so edits here take effect on restart.`,
+        `Resolved to the RUNNING ComfyUI's own extra_model_paths.yaml (${path}). ComfyUI loads this file from its install root whenever it exists, in addition to any --extra-model-paths-config — so edits here (including creating the file) take effect on the next restart.`,
         `NOTE: this server was also launched with a RELATIVE --extra-model-paths-config ("${unresolvableFlag}") and does not report its working directory, so THAT file cannot be located from this process and its entries are not listed here. Pass config_path with its absolute path to view or edit it.`,
       ]
     : [
-        `Resolved from the RUNNING ComfyUI's own install root (${liveRoot}): it was launched with no --extra-model-paths-config, so this is the extra_model_paths.yaml it implicitly reads.`,
+        `Resolved from the RUNNING ComfyUI's own install root (${liveRoot}): it was launched with no --extra-model-paths-config, so this is the extra_model_paths.yaml it loads from that root (creating the file makes the next restart load it).`,
       ];
   // Divergence diagnostic only — a failing static guess (no COMFYUI_PATH, a vanished
   // saved workspace) must never break the real, live-anchored resolution.
@@ -693,10 +693,26 @@ async function resolveTargetPathPreferServer(
     return { ...resolveTargetPath(opts), serverResolved: false };
   }
 
+  // LOCALITY PROOF (codex round 9, P2b): when argv names a main.py that does NOT resolve
+  // to a real file here, the server's filesystem is not ours (a container/WSL/remote host
+  // behind a loopback port). Nothing derived from its argv — including an ABSOLUTE
+  // --extra-model-paths-config, which could name a same-spelled path on OUR disk — may be
+  // written to in that state. Proven once, for every argv-derived branch below.
+  const script = liveScriptFromArgv(snapshot.argv, snapshot.cwd);
+  if (script && !realLiveRoot(script)) {
+    throw new ValidationError(
+      `UNRESOLVED: the running ComfyUI was launched from "${script}", which does not resolve to ` +
+        "a file on this filesystem — the server is running in a container, WSL, or on another " +
+        "host reached over the network. Its config paths name files on ITS disk, so a same-" +
+        "spelled path here would be a different file and the edit would be a silent no-op. " +
+        "Nothing was read or written — pass config_path explicitly with a file you can reach, " +
+        'or target: "standalone"/"desktop" to use the local heuristic deliberately.',
+    );
+  }
+
   const rawFlags = parseExtraModelPathsConfigsFromArgvRaw(snapshot.argv);
   if (rawFlags.length === 0) {
-    // No flag — ComfyUI auto-loads the yaml next to its own main.py.
-    const script = liveScriptFromArgv(snapshot.argv, snapshot.cwd);
+    // No flag — ComfyUI loads the yaml next to its own main.py when that file exists.
     if (script) return implicitLiveTarget(script, opts);
     throw new ValidationError(
       "UNRESOLVED: the running ComfyUI was not launched with --extra-model-paths-config and " +
@@ -718,15 +734,15 @@ async function resolveTargetPathPreferServer(
       ? resolve(snapshot.cwd, rawFlag)
       : undefined;
   if (!serverConfig) {
-    // The flagged file cannot be located — but ComfyUI ALWAYS auto-loads
-    // <its own root>/extra_model_paths.yaml as well as any --extra-model-paths-config, so
-    // that file is still PROVABLY read by this server. Target it (and say what is missing)
-    // instead of refusing: `/system_stats` does not report cwd on current ComfyUI, so a
-    // refusal here would break the ordinary
+    // The flagged file cannot be located — but ComfyUI ALSO loads
+    // <its own root>/extra_model_paths.yaml whenever that file exists, IN ADDITION to
+    // every --extra-model-paths-config, and creating it makes the next restart load it.
+    // So that file is a destination this server provably reads. Target it (and say what
+    // is missing) instead of refusing: `/system_stats` does not report cwd on current
+    // ComfyUI, so a refusal here would break the ordinary
     // `cd /opt/ComfyUI && python main.py --extra-model-paths-config extra.yaml` launch
     // outright (codex round 8, P1). Only when NEITHER file can be located do we refuse.
-    const scriptForFallback = liveScriptFromArgv(snapshot.argv, snapshot.cwd);
-    if (scriptForFallback) return implicitLiveTarget(scriptForFallback, opts, rawFlag);
+    if (script) return implicitLiveTarget(script, opts, rawFlag);
     throw new ValidationError(
       `UNRESOLVED: the running ComfyUI was launched with a RELATIVE --extra-model-paths-config ` +
         `("${rawFlag}") and reports neither its working directory nor a main.py, so no file it ` +
@@ -740,6 +756,21 @@ async function resolveTargetPathPreferServer(
   const notes = [
     `Resolved from the running ComfyUI's --extra-model-paths-config launch flag (the file the live server actually reads): ${serverConfig}`,
   ];
+  // This tool reports ONE file, but ComfyUI aggregates every --extra-model-paths-config
+  // it was given PLUS <its root>/extra_model_paths.yaml when that exists. Naming the
+  // others keeps the result from reading as "all the server's extra paths" when it is
+  // one of several (codex round 9, P2a).
+  const alsoLoaded = [
+    ...rawFlags.slice(1),
+    ...(script && existsSync(join(dirname(script), "extra_model_paths.yaml"))
+      ? [join(dirname(script), "extra_model_paths.yaml")]
+      : []),
+  ];
+  if (alsoLoaded.length > 0) {
+    notes.push(
+      `NOTE: this is ONE of several configs the running ComfyUI loads — it also reads ${alsoLoaded.join(", ")}. Those entries are not listed here; pass config_path to view or edit each one.`,
+    );
+  }
   // The static guess is only for a divergence diagnostic — never let it (e.g. a
   // missing COMFYUI_PATH for the standalone fallback) break the real resolution.
   try {
