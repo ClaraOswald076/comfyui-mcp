@@ -2623,13 +2623,28 @@ export async function runPanelOrchestrator(): Promise<void> {
           // have a LIVE agent (a provider switch retires the others), so at most one rebind is a
           // live-agent move; the rest are durable-only.
           for (const b of KNOWN_BACKENDS) {
-            const reboundLive = manager.rebindAgent(
-              migratedFrom + AGENT_KEY_SEP + b,
-              panelTab + AGENT_KEY_SEP + b,
-            );
+            const srcKey = migratedFrom + AGENT_KEY_SEP + b;
+            const reboundLive = manager.rebindAgent(srcKey, panelTab + AGENT_KEY_SEP + b);
             if (reboundLive) {
               logger.info(
                 `[panel-orchestrator] tab-id migration: ${migratedFrom.slice(0, 12)} → ${panelTab.slice(0, 12)} (${b}) — agent rebound, conversation preserved`,
+              );
+              continue;
+            }
+            // rebindAgent returned false. Two cases: (a) no live source agent — moveDurable ran,
+            // the durable session already followed the tab-id change; nothing more to do. (b)
+            // COLLISION — the destination key ALREADY has a live agent (the same workflow open in
+            // TWO tabs, one migrating onto the other's id), so rebind refused WITHOUT moving or
+            // stopping the source, which is STILL LIVE under the old id. Its callbacks/bridge
+            // frames would route through the proven old→new alias into the destination tab,
+            // leaking one tab's private chat/session into the other (codex). RETIRE the orphaned
+            // source agent so it stops emitting; its durable session stays under the old key (a
+            // lost resume — the destination tab's live conversation wins — never a leak).
+            if (manager.hasLiveAgent(srcKey)) {
+              manager.retire(srcKey);
+              bridge.dropQueuedDeliveries(srcKey); // cancel its in-flight commands / parked reads
+              logger.warn(
+                `[panel-orchestrator] tab-id migration ${migratedFrom.slice(0, 12)} → ${panelTab.slice(0, 12)} (${b}): destination already had a live agent — retired the colliding source agent (its conversation is orphaned; no cross-tab leak)`,
               );
             }
           }

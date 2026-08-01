@@ -137,6 +137,42 @@ describe("in-place workflow replacement resets the live session (#570 P0)", () =
     await manager.stopAll();
   });
 
+  it("#570: a tab-id migration COLLISION (destination already live) retires the source agent — no cross-tab leak", async () => {
+    // The same workflow open in TWO tabs; one migrates onto the other's id. rebindAgent refuses
+    // (destination already has a live agent) WITHOUT moving/stopping the source, which stays live
+    // under the old id and would leak its callbacks into the destination tab via the proven
+    // old→new alias. The orchestrator's collision handling retires the orphaned source agent.
+    const store = new SessionStore(PORT);
+    const manager = new PanelAgentManager({
+      mcpServers: {},
+      systemAppend: "",
+      model: "claude-test",
+      onSay: () => {},
+      onTurn: () => {},
+      onSession: () => {},
+      sessionStore: store,
+      makeBackend: () => new SessioningBackend(),
+      identityForKey: () => IDENTITY_A,
+    } as never);
+
+    const oldKey = "tmp:A::claude"; // source tab
+    const newKey = "wf:foo.json::claude"; // destination tab (already open, same workflow)
+    manager.send(newKey, "destination tab conversation");
+    manager.send(oldKey, "source tab conversation");
+    await waitFor(() => manager.hasLiveAgent(oldKey) && manager.hasLiveAgent(newKey));
+
+    // The migration loop: rebind collides (destination live) → false; source still live.
+    const rebound = manager.rebindAgent(oldKey, newKey);
+    expect(rebound).toBe(false); // collision — destination occupied
+    expect(manager.hasLiveAgent(oldKey)).toBe(true); // source NOT moved
+    // Orchestrator collision handling: retire the orphaned source so it stops emitting.
+    if (!rebound && manager.hasLiveAgent(oldKey)) manager.retire(oldKey);
+    expect(manager.hasLiveAgent(oldKey)).toBe(false); // source retired → no cross-tab leak
+    expect(manager.hasLiveAgent(newKey)).toBe(true); // destination conversation preserved
+
+    await manager.stopAll();
+  });
+
   it("#570: a backend switch RETIRES the prior provider (preserves its session) so switching back resumes", async () => {
     // BOTH provider-switch protocols on the SAME workflow — the explicit set_backend event AND
     // a re-hello that selects a different backend — now funnel to manager.retire(prevKey). They
