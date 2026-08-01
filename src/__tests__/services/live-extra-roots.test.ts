@@ -18,6 +18,10 @@ vi.mock("../../config.js", () => ({
 
 import { getLiveExtraModelRoots } from "../../services/extra-paths.js";
 import type { LiveServerSnapshot } from "../../services/output-dir.js";
+import {
+  markLocalComfyUILaunched,
+  resetLocalComfyUILaunchState,
+} from "../../services/workspace-env.js";
 
 let dirs: string[] = [];
 async function trackTmp(): Promise<string> {
@@ -33,8 +37,10 @@ const reachable = (argv: string[], cwd?: string): LiveServerSnapshot => ({
 
 beforeEach(() => {
   dirs = [];
+  resetLocalComfyUILaunchState(); // default: server NOT MCP-launched → env untrusted
 });
 afterEach(async () => {
+  resetLocalComfyUILaunchState();
   await Promise.all(dirs.map((d) => rm(d, { recursive: true, force: true })));
 });
 
@@ -130,10 +136,11 @@ describe("getLiveExtraModelRoots — fail-closed authorization", () => {
     });
   });
 
-  it("expands an env var in base_path (ComfyUI expandvars)", async () => {
+  it("expands an env var in base_path ONLY for a local MCP-launched server (env shared)", async () => {
     const liveRoot = await trackTmp();
     const target = resolve("/opt/models-root");
     process.env.CMCP_TEST_MODELS_ROOT = target;
+    markLocalComfyUILaunched(); // this MCP launched the local server → env trusted
     try {
       await writeFile(
         join(liveRoot, "extra_model_paths.yaml"),
@@ -148,6 +155,94 @@ describe("getLiveExtraModelRoots — fail-closed authorization", () => {
       });
     } finally {
       delete process.env.CMCP_TEST_MODELS_ROOT;
+    }
+  });
+
+  it("P1b: does NOT authorize a $VAR base_path when the server env is NOT trusted (not MCP-launched)", async () => {
+    const liveRoot = await trackTmp();
+    process.env.CMCP_TEST_MODELS_ROOT = resolve("/opt/models-root");
+    // NB: markLocalComfyUILaunched() is NOT called → env untrusted → fail closed.
+    try {
+      await writeFile(
+        join(liveRoot, "extra_model_paths.yaml"),
+        ["grp:", '  base_path: "${CMCP_TEST_MODELS_ROOT}"', "  loras: loras"].join("\n"),
+        "utf-8",
+      );
+      const res = await getLiveExtraModelRoots(reachable(["python", join(liveRoot, "main.py")]));
+      expect(res.authoritative).toBe(true);
+      expect(res.roots).toEqual([]); // the whole group is dropped (unresolvable base_path)
+    } finally {
+      delete process.env.CMCP_TEST_MODELS_ROOT;
+    }
+  });
+
+  it("P1a: authorizes the SAME literal path ComfyUI registers — expanduser THEN expandvars, base_path ONLY", async () => {
+    // base_path: $ROOT with ROOT=~/models. ComfyUI expands base_path expanduser FIRST
+    // (no ~ present) THEN expandvars → literal "~/models" (the leading ~ is NOT
+    // re-expanded), so it registers <cfgDir>/~/models — NOT <home>/models. Our
+    // authorization must match that literal path, not over-expand.
+    const liveRoot = await trackTmp();
+    process.env.CMCP_TEST_ROOT = "~/models";
+    markLocalComfyUILaunched();
+    try {
+      await writeFile(
+        join(liveRoot, "extra_model_paths.yaml"),
+        ["grp:", '  base_path: "$CMCP_TEST_ROOT"', "  unet: unet"].join("\n"),
+        "utf-8",
+      );
+      const res = await getLiveExtraModelRoots(reachable(["python", join(liveRoot, "main.py")]));
+      const cfgDir = liveRoot;
+      // The literal-~ path ComfyUI would register…
+      expect(res.roots).toContainEqual({
+        category: "unet",
+        dir: resolve(cfgDir, "~/models", "unet"),
+        group: "grp",
+      });
+      // …NOT the over-expanded home path (the old vars-then-user bug).
+      expect(res.roots).not.toContainEqual({
+        category: "unet",
+        dir: resolve(homedir(), "models", "unet"),
+        group: "grp",
+      });
+    } finally {
+      delete process.env.CMCP_TEST_ROOT;
+    }
+  });
+
+  it("P1b: treats a $DIGIT-style var as a token (Python \\w+ fidelity) → group dropped when untrusted", async () => {
+    // base_path: $9models. Python's expandvars accepts a digit-led name; if we didn't,
+    // an untrusted server's config would be mis-treated as a literal local path instead
+    // of failing closed. NOT MCP-launched → untrusted → the whole group is dropped.
+    const liveRoot = await trackTmp();
+    await writeFile(
+      join(liveRoot, "extra_model_paths.yaml"),
+      ["grp:", '  base_path: "$9models"', "  unet: unet"].join("\n"),
+      "utf-8",
+    );
+    const res = await getLiveExtraModelRoots(reachable(["python", join(liveRoot, "main.py")]));
+    expect(res.roots).toEqual([]);
+  });
+
+  it("P1a: does NOT expand a $VAR in a per-category entry (ComfyUI leaves subpaths literal)", async () => {
+    const liveRoot = await trackTmp();
+    const baseAbs = resolve("/opt/base");
+    process.env.CMCP_TEST_SUB = "should-not-expand";
+    markLocalComfyUILaunched();
+    try {
+      await writeFile(
+        join(liveRoot, "extra_model_paths.yaml"),
+        ["grp:", `  base_path: ${baseAbs}`, '  unet: "$CMCP_TEST_SUB"'].join("\n"),
+        "utf-8",
+      );
+      const res = await getLiveExtraModelRoots(reachable(["python", join(liveRoot, "main.py")]));
+      // The category entry stays LITERAL "$CMCP_TEST_SUB", resolved under base.
+      expect(res.roots).toContainEqual({
+        category: "unet",
+        dir: resolve(baseAbs, "$CMCP_TEST_SUB"),
+        group: "grp",
+      });
+    } finally {
+      delete process.env.CMCP_TEST_SUB;
     }
   });
 });

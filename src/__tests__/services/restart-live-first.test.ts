@@ -87,6 +87,9 @@ vi.mock("../../services/env-capabilities.js", () => ({
 vi.mock("../../services/workspace-env.js", () => ({
   resolveEffectiveComfyUIBase: mockResolveBase,
   liveRootFromArgv: mockLiveRootFromArgv,
+  // Launched-by-us env-trust flag (#633 P1b) — inert here; start/stop just toggle it.
+  markLocalComfyUILaunched: vi.fn(),
+  resetLocalComfyUILaunchState: vi.fn(),
 }));
 
 import {
