@@ -46,6 +46,13 @@ function ensurePanelOnLoad(): void {
         case "skipped":
           logger.debug("Panel auto-install: disabled via COMFYUI_MCP_PANEL_AUTOINSTALL.", res);
           break;
+        case "shadowed":
+          logger.warn(
+            "Panel auto-install: a SHADOW copy in custom_nodes may be served instead of the real panel (#641). " +
+              "Move the backup dir OUT of custom_nodes and hard-refresh the ComfyUI tab.",
+            res,
+          );
+          break;
         default:
           logger.debug("Panel auto-install: unavailable.", res);
       }
