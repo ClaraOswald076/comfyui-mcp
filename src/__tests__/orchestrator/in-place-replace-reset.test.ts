@@ -137,11 +137,11 @@ describe("in-place workflow replacement resets the live session (#570 P0)", () =
     await manager.stopAll();
   });
 
-  it("#570: a tab-id migration COLLISION (destination already live) retires the source agent — no cross-tab leak", async () => {
-    // The same workflow open in TWO tabs; one migrates onto the other's id. rebindAgent refuses
-    // (destination already has a live agent) WITHOUT moving/stopping the source, which stays live
-    // under the old id and would leak its callbacks into the destination tab via the proven
-    // old→new alias. The orchestrator's collision handling retires the orphaned source agent.
+  it("#570: a tab-id migration COLLISION resets the superseded destination then rebinds the source (no cross-tab leak)", async () => {
+    // The same workflow open in TWO tabs; the incoming socket migrates onto the other's id. The
+    // bridge has already SUPERSEDED the destination's socket, so its still-mapped agent would
+    // render into the incoming tab. Reset the superseded destination, THEN rebind the source into
+    // the freed id so the incoming tab keeps its OWN conversation.
     const store = new SessionStore(PORT);
     const manager = new PanelAgentManager({
       mcpServers: {},
@@ -155,20 +155,23 @@ describe("in-place workflow replacement resets the live session (#570 P0)", () =
       identityForKey: () => IDENTITY_A,
     } as never);
 
-    const oldKey = "tmp:A::claude"; // source tab
+    const oldKey = "tmp:A::claude"; // incoming/source tab
     const newKey = "wf:foo.json::claude"; // destination tab (already open, same workflow)
-    manager.send(newKey, "destination tab conversation");
-    manager.send(oldKey, "source tab conversation");
+    manager.send(newKey, "destination tab (B) conversation");
+    manager.send(oldKey, "incoming tab (A) conversation");
     await waitFor(() => manager.hasLiveAgent(oldKey) && manager.hasLiveAgent(newKey));
 
-    // The migration loop: rebind collides (destination live) → false; source still live.
-    const rebound = manager.rebindAgent(oldKey, newKey);
-    expect(rebound).toBe(false); // collision — destination occupied
-    expect(manager.hasLiveAgent(oldKey)).toBe(true); // source NOT moved
-    // Orchestrator collision handling: retire the orphaned source so it stops emitting.
-    if (!rebound && manager.hasLiveAgent(oldKey)) manager.retire(oldKey);
-    expect(manager.hasLiveAgent(oldKey)).toBe(false); // source retired → no cross-tab leak
-    expect(manager.hasLiveAgent(newKey)).toBe(true); // destination conversation preserved
+    // Without handling, rebind REFUSES (destination occupied) and the source stays stranded live
+    // under the old id — the leak precondition.
+    expect(manager.rebindAgent(oldKey, newKey)).toBe(false);
+    expect(manager.hasLiveAgent(oldKey)).toBe(true);
+
+    // Collision handling: reset the superseded destination (its agent is removed → it can no
+    // longer render into the incoming socket), THEN rebind the incoming source into the freed id.
+    manager.reset(newKey);
+    expect(manager.rebindAgent(oldKey, newKey)).toBe(true); // source takes the id
+    expect(manager.hasLiveAgent(newKey)).toBe(true); // incoming tab keeps its OWN (source) conversation
+    expect(manager.hasLiveAgent(oldKey)).toBe(false); // nothing stranded under the old id
 
     await manager.stopAll();
   });

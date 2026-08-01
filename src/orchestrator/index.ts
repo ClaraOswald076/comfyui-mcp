@@ -2622,32 +2622,38 @@ export async function runPanelOrchestrator(): Promise<void> {
           // of orphaning the old composite key and starting fresh (codex). Only prevBackend can
           // have a LIVE agent (a provider switch retires the others), so at most one rebind is a
           // live-agent move; the rest are durable-only.
+          let destinationCollision = false;
           for (const b of KNOWN_BACKENDS) {
             const srcKey = migratedFrom + AGENT_KEY_SEP + b;
-            const reboundLive = manager.rebindAgent(srcKey, panelTab + AGENT_KEY_SEP + b);
-            if (reboundLive) {
+            const newKey = panelTab + AGENT_KEY_SEP + b;
+            // COLLISION: the destination id ALREADY has a LIVE agent — the same workflow was open
+            // in TWO tabs and the bridge just SUPERSEDED the destination tab's socket with THIS
+            // incoming one (same-kind takeover). The destination agent is now orphaned onto the
+            // incoming socket: its private chat/session frames route by newKey to the socket the
+            // incoming tab holds, rendering INTO the incoming tab (codex). Reset the superseded
+            // destination agent FIRST — its socket is already gone, so its conversation is a lost
+            // resume, never a leak — then rebind the incoming source into the freed id so the
+            // INCOMING tab keeps its OWN conversation (and its held mail follows correctly below).
+            if (manager.hasLiveAgent(newKey)) {
+              destinationCollision = true;
+              manager.reset(newKey);
+              logger.warn(
+                `[panel-orchestrator] tab-id migration ${migratedFrom.slice(0, 12)} → ${panelTab.slice(0, 12)} (${b}): destination id already had a live agent (same workflow in two tabs) — reset the superseded destination so the incoming tab keeps its OWN conversation (no cross-tab leak)`,
+              );
+            }
+            if (manager.rebindAgent(srcKey, newKey)) {
               logger.info(
                 `[panel-orchestrator] tab-id migration: ${migratedFrom.slice(0, 12)} → ${panelTab.slice(0, 12)} (${b}) — agent rebound, conversation preserved`,
               );
-              continue;
-            }
-            // rebindAgent returned false. Two cases: (a) no live source agent — moveDurable ran,
-            // the durable session already followed the tab-id change; nothing more to do. (b)
-            // COLLISION — the destination key ALREADY has a live agent (the same workflow open in
-            // TWO tabs, one migrating onto the other's id), so rebind refused WITHOUT moving or
-            // stopping the source, which is STILL LIVE under the old id. Its callbacks/bridge
-            // frames would route through the proven old→new alias into the destination tab,
-            // leaking one tab's private chat/session into the other (codex). RETIRE the orphaned
-            // source agent so it stops emitting; its durable session stays under the old key (a
-            // lost resume — the destination tab's live conversation wins — never a leak).
-            if (manager.hasLiveAgent(srcKey)) {
-              manager.retire(srcKey);
-              bridge.dropQueuedDeliveries(srcKey); // cancel its in-flight commands / parked reads
-              logger.warn(
-                `[panel-orchestrator] tab-id migration ${migratedFrom.slice(0, 12)} → ${panelTab.slice(0, 12)} (${b}): destination already had a live agent — retired the colliding source agent (its conversation is orphaned; no cross-tab leak)`,
-              );
             }
           }
+          // On a collision the superseded destination tab (panelTab) may also have BRIDGE-buffered
+          // frames/renders (missedFrames/mailbox/pending) that the bridge would replay to the
+          // incoming socket right after this handler — leaking the destination's activity into the
+          // incoming tab. Drop them now (raw tab id). Only the destination's queues live under
+          // panelTab; the incoming source's in-flight work is under migratedFrom (its canonical id
+          // at send time) and is untouched, so the proven migration's own continuity is preserved.
+          if (destinationCollision) bridge.dropQueuedDeliveries(panelTab);
           // #570 — carry the PROVEN source identity forward as the tab's prior identity. The
           // rebound agent belongs to it (prevIdentity === newIdentity by sameWorkflow), but the
           // new tab id has no prior identity and the agent may have no durable record yet
