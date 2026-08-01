@@ -3202,11 +3202,16 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // Count only INTERACTIVE (canvas-owning) tabs for the ambiguity guard: one
           // desktop canvas alongside headless viewers is NOT ambiguous — rebindToActiveTab
           // binds the sole desktop tab. Only 2+ real canvas tabs are unpickable here.
-          const headless = ctx.bridge.isHeadless;
-          const interactive =
-            Array.isArray(live) && typeof headless === "function"
-              ? live.filter((t) => !headless(t.tab_id))
-              : live;
+          // Call isHeadless THROUGH the bridge (not an extracted reference): it is a
+          // plain method that reads `this.conns` — invoking a detached `const headless
+          // = ctx.bridge.isHeadless` loses `this`, so `this.conns` throws "Cannot read
+          // properties of undefined (reading 'conns')" and panel_reload fails outright
+          // (panel #478). Mirror the bound `isHeadlessTab` helper used elsewhere here.
+          const isHeadlessTab = (id: string): boolean =>
+            typeof ctx.bridge.isHeadless === "function" && ctx.bridge.isHeadless(id);
+          const interactive = Array.isArray(live)
+            ? live.filter((t) => !isHeadlessTab(t.tab_id))
+            : live;
           if (orphaned && Array.isArray(interactive) && interactive.length > 1) {
             return fail(
               "This session's ComfyUI tab was replaced and multiple tabs are now open — " +
@@ -3823,10 +3828,12 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             if (Array.isArray(live)) {
               // Count only INTERACTIVE (canvas-owning) tabs: a headless-only reconnect is
               // NOT a usable graph binding, so it defers (binds once a real canvas tab
-              // connects) rather than failing as if a tab were pickable.
-              const headless = ctx.bridge.isHeadless;
-              const interactive =
-                typeof headless === "function" ? live.filter((t) => !headless(t.tab_id)) : live;
+              // connects) rather than failing as if a tab were pickable. Call isHeadless
+              // THROUGH the bridge (it reads `this.conns`) — a detached reference would
+              // lose `this` and throw "reading 'conns'" (the same #478 unbound-method bug).
+              const isHeadlessTab = (id: string): boolean =>
+                typeof ctx.bridge.isHeadless === "function" && ctx.bridge.isHeadless(id);
+              const interactive = live.filter((t) => !isHeadlessTab(t.tab_id));
               noTabsConnected = interactive.length === 0;
             } else {
               // No tab enumeration — classify by the resolve error: only "nothing
