@@ -73,5 +73,9 @@ describe("get_image — binary-safe (#483)", () => {
     const text = out.content.map((c) => c.text ?? "").join("");
     expect(text).toContain("IMAGE_NOT_FOUND");
     expect(text).not.toContain("Unexpected end of JSON input");
+    // #554: the failure envelope must itself be WELL-FORMED JSON (a clean
+    // structured error), not free-form prose the caller then fails to parse.
+    const parsed = JSON.parse(text) as { error?: string };
+    expect(parsed.error).toBe("IMAGE_NOT_FOUND");
   });
 });

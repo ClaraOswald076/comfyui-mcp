@@ -46,6 +46,12 @@ export interface DownloadProgress {
    *  veto counts ONLY rows for the watched pod: a local download must not
    *  disable a pod's auto-stop, nor vice versa (#269). Absent on pre-fix rows. */
   target?: string;
+  /** The panel tab whose agent started this download (the writer's own
+   *  COMFYUI_MCP_TAB at write time — self-scoping, exactly like `target`), so the
+   *  orchestrator notifies EXACTLY that tab's agent when the download settles
+   *  instead of waking every tab (#547). Absent for non-panel/in-process callers
+   *  and pre-fix rows — the orchestrator then falls back to the single live agent. */
+  tab?: string;
 }
 
 const PROGRESS_DIR = process.env.COMFYUI_MCP_PROGRESS_DIR || "";
@@ -130,7 +136,11 @@ export function reportDownloadProgress(
     // Redacted — target URLs can carry userinfo (codex finding).
     const rawTarget = p.target ?? (process.env.COMFYUI_URL?.trim() || undefined);
     const target = rawTarget ? redactUrl(rawTarget) : undefined;
-    writeFileSync(fileFor(p.id, target), JSON.stringify({ ...p, target, updated: now }));
+    // Stamp the panel tab that started this download (the spawned MCP child's own
+    // COMFYUI_MCP_TAB) so the orchestrator can wake EXACTLY that tab's agent when
+    // the download settles (#547), the same self-scoping trick `target` uses.
+    const tab = p.tab ?? (process.env.COMFYUI_MCP_TAB?.trim() || undefined);
+    writeFileSync(fileFor(p.id, target), JSON.stringify({ ...p, target, tab, updated: now }));
   } catch {
     // best-effort — progress is cosmetic, never fail a download over it
   }

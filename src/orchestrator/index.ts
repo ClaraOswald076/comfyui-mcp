@@ -1836,6 +1836,10 @@ export async function runPanelOrchestrator(): Promise<void> {
         COMFYUI_URL: comfyuiUrl,
         // Where download_model writes live progress for the panel tray.
         COMFYUI_MCP_PROGRESS_DIR: progressDir,
+        // Self-scope this tab's downloads so the orchestrator can wake EXACTLY
+        // this tab's agent when a download settles (#547) — the child stamps its
+        // own COMFYUI_MCP_TAB into each progress row, mirroring COMFYUI_MCP_BLIND.
+        ...(panelTab ? { COMFYUI_MCP_TAB: panelTab } : {}),
         // Local mode → enables download_model, apply_manifest (installer packs),
         // and model scans so the agent installs the right way instead of curl.
         ...(comfyuiPath ? { COMFYUI_PATH: comfyuiPath } : forceRemoteEnv()),
@@ -3537,6 +3541,39 @@ export async function runPanelOrchestrator(): Promise<void> {
   // a downloading row that stops updating for 60s is treated as a dead writer.
   const DOWNLOAD_LINGER_MS = 8000;
   const downloadRemoveAt = new Map<string, number>();
+  // Download-completion agent events (#547). A finished render already wakes the
+  // agent (manager.injectEvent kind:"executed"); a finished DOWNLOAD had no
+  // equivalent, so a "download then use the model" task stalled until the user
+  // poked it. We observe the SAME first-terminal transition the tray-prune timer
+  // uses and inject a completion event to the tab's agent — but COALESCED: an
+  // apply_manifest that pulls many files would otherwise fire one turn per file,
+  // so completions accumulate per agent for a short window and flush as ONE event.
+  const DOWNLOAD_DONE_DEBOUNCE_MS = 1500;
+  // agentKey → { download identity → {name, terminal status} } accumulated since
+  // the last flush, plus the epoch-ms deadline (extended by each new completion)
+  // at which we emit. Keyed by download IDENTITY (row.id), not display name, so
+  // two distinct downloads sharing a filename in one batch don't overwrite each
+  // other and hide a failure (codex).
+  const downloadDonePending = new Map<
+    string,
+    { downloads: Map<string, { name: string; status: string }>; flushAt: number }
+  >();
+  // Resolve which agent to wake for a settled download row: the stamped tab's
+  // agent when it's still live; else the SINGLE live agent (pre-fix/in-process
+  // rows carry no tab, AND a tab-id migration/backend change can leave the
+  // stamped tab's key no longer resolving to the live agent — codex); else none —
+  // never fan out to unrelated tabs (#547).
+  const resolveDownloadAgentKey = (row: Record<string, unknown>): string | null => {
+    const tab = typeof row.tab === "string" ? row.tab.trim() : "";
+    if (tab) {
+      const key = agentKeyFor(tab);
+      if (manager.hasLiveAgent(key)) return key;
+      // Stamped tab's agent is gone (migration/backend switch) — fall through to
+      // the single-live-agent fallback rather than silently dropping the event.
+    }
+    const live = manager.liveKeys();
+    return live.length === 1 ? live[0] : null;
+  };
   /** Boolean URL probe with a timeout — readiness checks for pending pod connects. */
   const probeOk = async (url: string, timeoutMs = 8_000): Promise<boolean> => {
     const ctl = new AbortController();
@@ -3635,6 +3672,20 @@ export async function runPanelOrchestrator(): Promise<void> {
         const due = downloadRemoveAt.get(full);
         if (due == null) {
           downloadRemoveAt.set(full, now + DOWNLOAD_LINGER_MS); // start the linger
+          // FIRST terminal observation of this download (due was unset) — the
+          // exact once-per-download moment. Wake the tab's agent with the result
+          // (#547), coalesced via downloadDonePending so a many-file manifest is
+          // one turn, not N.
+          const key = resolveDownloadAgentKey(row);
+          if (key && manager.hasLiveAgent(key)) {
+            const bucket =
+              downloadDonePending.get(key) ??
+              { downloads: new Map<string, { name: string; status: string }>(), flushAt: 0 };
+            const idKey = String(row.id ?? full);
+            bucket.downloads.set(idKey, { name: String(row.name ?? row.id ?? "model"), status: String(status) });
+            bucket.flushAt = now + DOWNLOAD_DONE_DEBOUNCE_MS;
+            downloadDonePending.set(key, bucket);
+          }
         } else if (now >= due) {
           try { unlinkSync(full); } catch { /* already gone */ }
           downloadRemoveAt.delete(full);
@@ -3659,6 +3710,15 @@ export async function runPanelOrchestrator(): Promise<void> {
     if (snapshot !== lastDownloadSnapshot) {
       lastDownloadSnapshot = snapshot;
       bridge.push({ type: "download_progress", downloads }); // broadcast to all tabs
+    }
+    // Flush any download-completion buckets whose debounce window has elapsed —
+    // ONE agent event per tab per batch of settled downloads (#547). Runs every
+    // tick (700ms) so a flush always fires shortly after the last file settles.
+    for (const [key, bucket] of [...downloadDonePending]) {
+      if (now < bucket.flushAt) continue;
+      downloadDonePending.delete(key);
+      const settled = [...bucket.downloads.values()];
+      manager.injectEvent(key, { kind: "download_done", downloads: settled });
     }
     // MCP-child control channel (#269): runpod_* tools that ran in spawned
     // agent children ask the orchestrator to retarget / watch / unwatch /
