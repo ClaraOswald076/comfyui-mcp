@@ -6,6 +6,18 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.28] - 2026-08-01
+
+### Fixed
+- **`panel_reload` no longer crashes with `Cannot read properties of undefined (reading 'conns')` whenever a tab is connected (panel #478).** A regression from the 0.48.25 tab-binding work (#400/#402/#474): `panel_reload`'s multi-tab guard called `ctx.bridge.isHeadless` as an unbound reference, so `this.conns` threw and killed every reload with a live tab. Now called through the bridge receiver via a `typeof`-guarded helper (an identical second site in `panel_set_workflow_target`'s rebind path fixed too).
+- **`panel_set_widget` no longer false-times-out when a fresh `/object_info` takes >6s on a large install (#599).** The refresh-awaiting commands (set_widget / add_node) now get a bounded 30s ack budget instead of the bridge's 6s default, so a slow-but-valid frontend re-register isn't reported as a dead-tab timeout (a genuinely dead tab still fails).
+
+### Added
+- **`panel_refresh_nodes` — force a frontend node-def re-register so a just-staged input is immediately usable (#608).** `stage_output_as_input` registered the file server-side but the loader combos were built at page-load, so `LoadImage` couldn't see it (the Krea2→LTX/WAN chaining flow dead-ended); the new tool (which `stage_output_as_input` now points at) forces the refresh.
+
+### Internal
+- De-flaked the `ui-bridge #486` late-ask_user test (an ECONNREFUSED bind/connect race in the shared test harness — it await's `bridge.whenReady()` now), which had intermittently failed CI merges and a release publish.
+
 ## [0.48.27] - 2026-08-01
 
 ### Fixed
