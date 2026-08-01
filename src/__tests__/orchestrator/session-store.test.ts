@@ -504,6 +504,32 @@ describe("SessionStore", () => {
       ).toBe(false);
     });
 
+    it("PROVEN tab-id migration spawn window: a just-rebound agent with NO durable record is KEPT via the carried source identity", () => {
+      // A tmp:→wf: save/rename migration rebinds the agent to the new tab id. The new id has no
+      // prior identity and, in the spawn→first-session window, no durable record. The hello
+      // handler carries the PROVEN source identity (prevIdentity === newIdentity) forward as the
+      // tab's prior identity, so the ownership gate recognizes the rebound backend as owned and
+      // does NOT reset it (which would cancel its in-flight turn / drop its queued message).
+      expect(
+        keepsBackendState({
+          storedIdentity: undefined, // spawn window — no SessionStore entry yet
+          priorIdentity: HELLO, // carried proven source identity (prevIdentity === newIdentity)
+          isCurrentBackend: true, // migration keeps the same backend (tab-id-only change)
+          helloIdentity: HELLO,
+        }),
+      ).toBe(true);
+      // Without the carried identity (the bug: prior derived from the empty new tab id) it WOULD
+      // reset — proving the carry is load-bearing.
+      expect(
+        keepsBackendState({
+          storedIdentity: undefined,
+          priorIdentity: undefined,
+          isCurrentBackend: true,
+          helloIdentity: HELLO,
+        }),
+      ).toBe(false);
+    });
+
     it("END-TO-END: a persisted Claude session survives a restart + hello on Codex for the same workflow", () => {
       const store = new SessionStore(PORT);
       // Claude conversed on workflow A before the restart — persisted, bound to A's identity.

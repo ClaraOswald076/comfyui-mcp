@@ -2529,8 +2529,12 @@ export async function runPanelOrchestrator(): Promise<void> {
       // block / post-block overwrite of tabStableIdentity. For an IN-PLACE workflow
       // replacement (same tab id, new uuid) this is the identity the tab's still-LIVE agent
       // and queued work belong to — needed to reset them even before any durable session
-      // record exists (the spawn→first-session window).
-      const priorTabIdentity = tabStableIdentity.get(panelTab);
+      // record exists (the spawn→first-session window). For a PROVEN same-workflow tab-id
+      // migration (tmp:→wf: save/rename) it is REASSIGNED below to the proven source identity:
+      // the migrated tab id is brand new (no prior identity) and the rebound agent may still be
+      // in its spawn→first-session window (no durable record), so without this the ownership
+      // gate would reset the just-rebound agent and drop its queued turn (codex).
+      let priorTabIdentity = tabStableIdentity.get(panelTab);
 
       if (migratedFrom && migratedFrom !== panelTab) {
         const prevBackend = tabBackends.get(migratedFrom) ?? backend;
@@ -2617,6 +2621,13 @@ export async function runPanelOrchestrator(): Promise<void> {
               `[panel-orchestrator] tab-id migration: ${migratedFrom.slice(0, 12)} → ${panelTab.slice(0, 12)} — agent rebound, conversation preserved`,
             );
           }
+          // #570 — carry the PROVEN source identity forward as the tab's prior identity. The
+          // rebound agent belongs to it (prevIdentity === newIdentity by sameWorkflow), but the
+          // new tab id has no prior identity and the agent may have no durable record yet
+          // (spawn→first-session window), so the ownership gate below would otherwise treat it as
+          // unproven and reset the just-rebound agent, cancelling its in-flight turn and dropping
+          // its queued message. prevIdentity is guaranteed defined here (sameWorkflow requires it).
+          priorTabIdentity = prevIdentity;
           // Carry the old tab's runtime prefs to the new id regardless of whether
           // an agent was live (backend pick, headless flag, pinned workflow
           // target, held-during-render queue), then retire the old id.
