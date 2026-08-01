@@ -15,6 +15,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { readOAuthStatus } from "../services/code-provider-auth.js";
 import { resolveAgyBin } from "./antigravity-backend.js";
+import { resolvePiBin } from "./pi-backend.js";
 import type { OAuthStatusRecord } from "../services/panel-secrets.js";
 import { simpleKeyProvider } from "../services/openai-provider-registry.js";
 
@@ -39,10 +40,30 @@ const CLI_NAMES: Record<string, string[]> = {
   codex: ["codex", "codex.cmd", "codex.exe"],
   gemini: ["gemini", "gemini.cmd", "gemini.exe"],
   grok: ["grok", "grok.cmd", "grok.exe"],
+  pi: ["pi", "pi.cmd", "pi.exe"],
   ollama: ["ollama", "ollama.exe"],
   lmstudio: ["lms", "lms.exe"],
   llamacpp: ["llama-server", "llama-server.exe"],
 };
+
+/** Common provider API-key env vars pi (issue #491) can authenticate with. A
+ *  definite login is auth.json OR any of these; used only to UPGRADE pi's auth
+ *  signal from "unknown" to "yes" (never to false-flag not-signed-in). Not
+ *  exhaustive — pi supports many providers; these are the common coding ones. */
+const PI_PROVIDER_ENV_KEYS: readonly string[] = [
+  "ANTHROPIC_API_KEY",
+  "OPENAI_API_KEY",
+  "GEMINI_API_KEY",
+  "GOOGLE_API_KEY",
+  "XAI_API_KEY",
+  "OPENROUTER_API_KEY",
+  "DEEPSEEK_API_KEY",
+  "GROQ_API_KEY",
+  "MISTRAL_API_KEY",
+  "ZAI_API_KEY",
+  "KIMI_API_KEY",
+  "MINIMAX_API_KEY",
+];
 
 /** Well-known Ollama install locations probed in addition to PATH (the Windows
  *  installer adds PATH for NEW shells only — an orchestrator started from an
@@ -245,6 +266,20 @@ export function backendReadiness(
     // installers' well-known locations (%LOCALAPPDATA%\agy\bin, ~/.local/bin).
     const cli = !!resolveAgyBin(home);
     return { backend: "antigravity", cli, auth: cli ? null : false, ready: cli };
+  }
+  if (b === "pi") {
+    // pi.dev CLI (`pi`, issue #491) — a multi-provider coding agent. Auth lives
+    // in ~/.pi/agent/auth.json (API keys + `/login` subscriptions) or provider
+    // env vars. We can prove a definite login when auth.json exists OR a common
+    // provider key is set; otherwise auth is UNKNOWN (null, don't nag) when the
+    // CLI is present, since pi may be configured a way we can't cheaply see. The
+    // real failure surfaces via the first turn's actionable credential error.
+    const cli = !!resolvePiBin(home);
+    const authKnown =
+      fileExists(home, ".pi", "agent", "auth.json") ||
+      PI_PROVIDER_ENV_KEYS.some((k) => !!process.env[k]?.trim());
+    const auth = authKnown ? true : cli ? null : false;
+    return { backend: "pi", cli, auth, ready: cli };
   }
   if (b === "grok") {
     const cli = onPath(CLI_NAMES.grok);

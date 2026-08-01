@@ -487,6 +487,7 @@ export const BACKEND_LABELS: Record<string, string> = {
   chatgpt: "ChatGPT",
   gemini: "Gemini",
   antigravity: "Antigravity",
+  pi: "Pi",
   grok: "Grok",
   glm: "GLM",
   kimi: "Kimi",
