@@ -180,8 +180,10 @@ export async function updateComfyUICore(): Promise<UpdateCoreResult> {
     logger.warn(`No requirements.txt found at ${requirements}; skipping dependency install`);
   }
 
-  return {
-    updated: true,
+    return {
+      // Manager accepted/started a queue; it is not proof any pack (including
+      // the panel) moved on disk. Never fabricate completion from queue state.
+      updated: false,
     comfyui_path: comfyuiPath,
     package_manager: pm,
     steps,
@@ -212,8 +214,8 @@ export async function updateAllCustomNodes(): Promise<UpdateNodesResult> {
     queue_started: result.queueStarted,
     manager_response: result.managerResponse,
     message: result.queueStarted
-      ? "Queued updates for all custom nodes via ComfyUI-Manager and started the queue worker. " +
-        "Updates run asynchronously; a ComfyUI restart may be required afterward."
+        ? "Queued updates for all custom nodes via ComfyUI-Manager and started the queue worker. " +
+          "Completion is unverified; the sidebar panel may still change later."
       : "Queued updates for all custom nodes via ComfyUI-Manager. " +
         "Could not confirm the queue worker started — check ComfyUI-Manager.",
   };

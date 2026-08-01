@@ -1970,7 +1970,7 @@ async function updateCustomNodeImpl(
   return {
     mechanism: "manager-http",
     message: all
-      ? "Queued + updated all installed node packs via ComfyUI-Manager."
+      ? "Queued update_all with ComfyUI-Manager. Completion and the sidebar panel's on-disk version are not verified yet."
       : `Queued + updated "${id}" via ComfyUI-Manager.`,
     details: status,
   };

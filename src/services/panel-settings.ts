@@ -47,9 +47,57 @@ export interface AgentSettings {
   custom?: OllamaAgentConfig;
 }
 
+/**
+ * An EXPLICIT user pin holding the sidebar panel node-pack at one version.
+ *
+ * A pin is a promise: while it is set, nothing in this codebase may move the
+ * panel — not the auto-sync skill, not `install_panel(action='update')`, not the
+ * on-load auto-installer. The user cleared it or nothing happens. See
+ * `panel-sync.ts` for the decision logic that honours it.
+ */
+export interface PanelVersionPin {
+  /** The exact panel version the user pinned to, e.g. "0.11.20". */
+  version: string;
+  /** ISO timestamp of when the pin was set (absent for an env-var pin). */
+  pinnedAt?: string;
+  /** Optional free-text reason the user gave for pinning. */
+  reason?: string;
+}
+
+/**
+ * The resolved pin, including WHERE it came from — the caller must be able to
+ * tell the user how to clear it, and an env pin cannot be cleared by writing the
+ * settings file.
+ */
+export interface PanelPinState {
+  /** True when a pin is in force. Nothing may move the panel while true. */
+  pinned: boolean;
+  /** The pinned version (only when `pinned`). */
+  version?: string;
+  /** Where the active pin came from; "none" when unpinned. */
+  source: "env" | "settings" | "none";
+  pinnedAt?: string;
+  reason?: string;
+  /**
+   * The settings file EXISTS but could not be read/parsed, so we cannot PROVE
+   * the absence of a pin. Callers must treat this like a pin (refuse to move the
+   * panel) rather than as "unpinned" — silently moving a user off a pin we
+   * merely failed to read is exactly the failure this feature exists to prevent.
+   */
+  indeterminate?: boolean;
+}
+
+/** Env override for the pin (wins over the settings file, per env > .env > json). */
+export const PANEL_PIN_ENV_VAR = "COMFYUI_MCP_PANEL_PIN";
+
+/** Env values that explicitly assert "no pin", overriding a persisted one. */
+const PIN_ENV_OFF = new Set(["off", "none", "no", "0", "false", "unpinned"]);
+
 export interface PanelSettings {
   nsfwConsent?: NsfwConsent;
   agent?: AgentSettings;
+  /** Persisted explicit panel-version pin (see PanelVersionPin). */
+  panelPin?: PanelVersionPin;
 }
 
 /** Settings file path. Overridable for tests. */
@@ -60,16 +108,32 @@ export function panelSettingsPath(): string {
   );
 }
 
-function read(): PanelSettings {
+/**
+ * Read the settings file, reporting whether the read was CONCLUSIVE.
+ *
+ * `unreadable` is true only when the file exists but could not be read/parsed —
+ * i.e. `{}` here is NOT proof that a key is unset. Most callers don't care (a
+ * missing NSFW consent and an unreadable one both mean "not consented"), but the
+ * panel pin does: an unreadable file must not be reported as "no pin".
+ */
+function readRaw(): { settings: PanelSettings; unreadable: boolean } {
   const p = panelSettingsPath();
-  if (!existsSync(p)) return {};
+  if (!existsSync(p)) return { settings: {}, unreadable: false };
   try {
     const parsed = JSON.parse(readFileSync(p, "utf-8")) as unknown;
-    return parsed && typeof parsed === "object" ? (parsed as PanelSettings) : {};
+    return parsed && typeof parsed === "object"
+      ? { settings: parsed as PanelSettings, unreadable: false }
+      : // Valid JSON but not an object (e.g. `null`, `[]`, `"x"`): the file is
+        // present and structurally wrong, so a key's absence is not proven.
+        { settings: {}, unreadable: true };
   } catch (err) {
     logger.warn(`[panel-settings] could not parse ${p}: ${err instanceof Error ? err.message : String(err)}`);
-    return {};
+    return { settings: {}, unreadable: true };
   }
+}
+
+function read(): PanelSettings {
+  return readRaw().settings;
 }
 
 function write(settings: PanelSettings): void {
@@ -102,6 +166,122 @@ export function setNsfwConsent(allowed: boolean): NsfwConsent {
   settings.nsfwConsent = { allowed, decidedAt };
   write(settings);
   return settings.nsfwConsent;
+}
+
+// ---------------------------------------------------------------------------
+// Panel version pin
+// ---------------------------------------------------------------------------
+
+/** Normalize a pin version string; returns undefined for junk/blank. */
+function normalizePinVersion(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const v = raw.trim();
+  return v.length > 0 && v.length <= 64 ? v : undefined;
+}
+
+/**
+ * Resolve the ACTIVE panel-version pin.
+ *
+ * Precedence mirrors the rest of the project's config (env > `~/.comfyui-mcp/.env`
+ * > the JSON settings store): `~/.comfyui-mcp/.env` is loaded into `process.env`
+ * at boot, so a single `process.env` check covers both env layers.
+ * `COMFYUI_MCP_PANEL_PIN=off` (or none/no/0/false/unpinned) is an explicit
+ * "no pin" that overrides a persisted one — the env escape hatch when the
+ * settings file can't be edited.
+ *
+ * Never throws: a pin we cannot read is reported `indeterminate`, which callers
+ * MUST treat as pinned.
+ */
+export function getPanelPinState(env: NodeJS.ProcessEnv = process.env): PanelPinState {
+  const rawEnv = env[PANEL_PIN_ENV_VAR];
+  if (typeof rawEnv === "string" && rawEnv.trim().length > 0) {
+    const trimmed = rawEnv.trim();
+    if (PIN_ENV_OFF.has(trimmed.toLowerCase())) {
+      return { pinned: false, source: "none" };
+    }
+    const version = normalizePinVersion(trimmed);
+    if (version) return { pinned: true, version, source: "env" };
+    // Present but unusable — we cannot tell what the user meant, so we do NOT
+    // fall through to "unpinned".
+    return { pinned: true, source: "env", indeterminate: true };
+  }
+
+  const { settings, unreadable } = readRaw();
+  if (unreadable) return { pinned: true, source: "settings", indeterminate: true };
+
+  const raw = settings.panelPin as Partial<PanelVersionPin> | undefined;
+  if (!raw || typeof raw !== "object") return { pinned: false, source: "none" };
+  const version = normalizePinVersion(raw.version);
+  if (!version) {
+    // A `panelPin` key exists but its version is junk: something pinned this
+    // install, so refuse to move it rather than guessing it away.
+    return { pinned: true, source: "settings", indeterminate: true };
+  }
+  const state: PanelPinState = { pinned: true, version, source: "settings" };
+  if (typeof raw.pinnedAt === "string") state.pinnedAt = raw.pinnedAt;
+  if (typeof raw.reason === "string") state.reason = raw.reason;
+  return state;
+}
+
+/** Human-readable one-liner for a pin state, for messages the user reads. */
+export function describePanelPin(pin: PanelPinState): string {
+  if (!pin.pinned) return "not pinned";
+  if (pin.indeterminate) {
+    return pin.source === "env"
+      ? `pinned via ${PANEL_PIN_ENV_VAR}, but its value is unusable`
+      : `possibly pinned — ${panelSettingsPath()} could not be read`;
+  }
+  const where =
+    pin.source === "env" ? `${PANEL_PIN_ENV_VAR} env var` : panelSettingsPath();
+  return `pinned to ${pin.version} (via ${where})${pin.reason ? ` — ${pin.reason}` : ""}`;
+}
+
+function assertSettingsWritable(): PanelSettings {
+  const { settings, unreadable } = readRaw();
+  if (unreadable) {
+    throw new Error(
+      `Refusing to rewrite ${panelSettingsPath()}: it exists but could not be ` +
+        `parsed, so writing would silently discard whatever else is in it. Fix or ` +
+        `delete that file and retry (or set ${PANEL_PIN_ENV_VAR} in the environment, ` +
+        `which takes precedence).`,
+    );
+  }
+  return settings;
+}
+
+/**
+ * Persist an explicit pin. Throws on a blank version or an unparseable settings
+ * file (see assertSettingsWritable) — never silently drops the request.
+ */
+export function setPanelVersionPin(version: string, reason?: string): PanelVersionPin {
+  const normalized = normalizePinVersion(version);
+  if (!normalized) {
+    throw new Error(
+      "A panel version pin needs a non-empty version string (e.g. \"0.11.20\").",
+    );
+  }
+  const settings = assertSettingsWritable();
+  const pin: PanelVersionPin = { version: normalized, pinnedAt: new Date().toISOString() };
+  const trimmedReason = typeof reason === "string" ? reason.trim() : "";
+  if (trimmedReason) pin.reason = trimmedReason;
+  settings.panelPin = pin;
+  write(settings);
+  return pin;
+}
+
+/**
+ * Remove the persisted pin. Returns the pin that was removed, or undefined when
+ * there wasn't one. Does NOT (and cannot) clear an env-var pin — callers must
+ * report that separately so the user isn't told they're unpinned when they
+ * aren't.
+ */
+export function clearPanelVersionPin(): PanelVersionPin | undefined {
+  const settings = assertSettingsWritable();
+  const previous = settings.panelPin;
+  if (!previous) return undefined;
+  delete settings.panelPin;
+  write(settings);
+  return previous;
 }
 
 /** Persisted agent backend/model preferences ({} when never set). */

@@ -36,6 +36,12 @@ import {
   type NodeOpResult,
 } from "./node-management.js";
 import { getSystemStats } from "../comfyui/client.js";
+import {
+  describePanelPin,
+  getPanelPinState,
+  PANEL_PIN_ENV_VAR,
+  type PanelPinState,
+} from "./panel-settings.js";
 
 /** Comfy Registry id (also pyproject [project].name). Authoritative for detection. */
 export const PANEL_REGISTRY_ID = "comfyui-agent-panel";
@@ -112,6 +118,13 @@ export interface PanelInstallerDeps {
    * pyproject version string. Never throws.
    */
   gitRevision: (dir: string) => string | undefined;
+  /**
+   * The user's explicit panel-version pin, if any. While a pin is in force NO
+   * code path here may move the panel — install/update/reinstall refuse and the
+   * on-load ensure skips. Never throws (an unreadable pin reports
+   * `indeterminate`, which counts as pinned).
+   */
+  readPin: () => PanelPinState;
   /** Is the target ComfyUI reachable right now? Never throws. */
   isReachable: () => Promise<boolean>;
   install: (opts: { id: string; version?: string }) => Promise<NodeOpResult>;
@@ -236,6 +249,7 @@ export const defaultDeps: PanelInstallerDeps = {
   readdir: (p) => readdirSync(p),
   readFile: (p) => readFileSync(p, "utf-8"),
   gitRevision: (dir) => resolveGitRevision(dir),
+  readPin: () => getPanelPinState(),
   isReachable: async () => {
     try {
       await getSystemStats();
@@ -248,6 +262,48 @@ export const defaultDeps: PanelInstallerDeps = {
   update: (opts) => updateCustomNode(opts),
   reinstall: (opts) => reinstallCustomNode(opts),
 };
+
+// ---------------------------------------------------------------------------
+// Version pin
+//
+// A pin is the user's explicit "hold the panel here". Every mutating path in
+// this file consults it FIRST and refuses while it is in force — the on-load
+// ensure, install, update and reinstall alike. The escape hatch is to clear the
+// pin (install_panel(action='unpin'), or COMFYUI_MCP_PANEL_PIN=off), never for
+// us to decide the pin was probably fine to ignore.
+// ---------------------------------------------------------------------------
+
+/**
+ * Read the pin so that NO failure mode reads as "unpinned". A reader that throws
+ * is reported as an indeterminate pin, which counts as pinned: silently moving a
+ * user off a pin we merely failed to read is the exact bug this guards.
+ */
+function readPinSafe(deps: PanelInstallerDeps): PanelPinState {
+  try {
+    return deps.readPin();
+  } catch (err) {
+    logger.warn(
+      `[panel] could not read the panel version pin: ${
+        err instanceof Error ? err.message : String(err)
+      } — treating the panel as PINNED (refusing to move it).`,
+    );
+    return { pinned: true, source: "settings", indeterminate: true };
+  }
+}
+
+/** The refusal a pin produces for a mutating action, with the way out. */
+function pinRefusalMessage(action: string, pin: PanelPinState): string {
+  return (
+    `Refusing to ${action} the panel: it is ${describePanelPin(pin)}. ` +
+    `A pin is honoured even when a newer panel exists — clear it first with ` +
+    `install_panel(action='unpin')` +
+    (pin.source === "env"
+      ? ` (this pin comes from the ${PANEL_PIN_ENV_VAR} environment variable, so ` +
+        `it must be unset/changed in the environment — unpin cannot remove it)`
+      : ``) +
+    `, then re-run the ${action}.`
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Detection
@@ -720,6 +776,16 @@ async function ensureInner(deps: PanelInstallerDeps): Promise<EnsureResult> {
     return { action: "unavailable", reason: "ComfyUI is not reachable." };
   }
 
+  // An explicit pin outranks auto-install: installing the `nightly` channel over
+  // a pinned version is exactly the silent move the pin forbids. Skip and say so.
+  const pin = readPinSafe(deps);
+  if (pin.pinned) {
+    return {
+      action: "skipped",
+      reason: `panel version pin in force — ${describePanelPin(pin)}`,
+    };
+  }
+
   const detection = await detectPanelInstall(deps);
 
   if (detection.isDevSymlink) {
@@ -841,6 +907,11 @@ export interface PanelStatus {
    * non-empty, the SERVED panel may not match `installedVersion` on disk.
    */
   shadows: PanelShadow[];
+  /**
+   * The user's explicit version pin. While `pin.pinned` is true, install/update/
+   * reinstall refuse and the on-load ensure skips — see the pin guard above.
+   */
+  pin: PanelPinState;
   note: string;
 }
 
@@ -889,6 +960,13 @@ export async function panelStatus(
     }. Run install_panel(action='update') to pull the latest ${PANEL_VERSION}. Restart ComfyUI after updating.`;
   }
 
+  const pin = readPinSafe(deps);
+  const pinNote = pin.pinned
+    ? ` PIN: ${describePanelPin(pin)} — install/update/reinstall are refused ` +
+      `until it is cleared with install_panel(action='unpin')` +
+      (pin.source === "env" ? ` (env pins must be unset in the environment).` : `.`)
+    : "";
+
   return {
     applicable: detection.applicable,
     installed: detection.installed,
@@ -897,7 +975,8 @@ export async function panelStatus(
     isDevSymlink: detection.isDevSymlink,
     targetVersion: PANEL_VERSION,
     shadows,
-    note: note + shadowNote,
+    pin,
+    note: note + shadowNote + pinNote,
   };
 }
 
@@ -1114,6 +1193,15 @@ export async function runPanelAction(
       `Panel ${action} is local-only and requires a local ComfyUI install. ` +
         `Set COMFYUI_PATH (this is a no-op in remote/cloud mode).`,
     );
+  }
+
+  // PIN GUARD — before any Manager mutation is queued. This is the single choke
+  // point that makes "we never move a pinned user" true for every caller (the
+  // sync skill, the panel, a hand-written install_panel call), not just the ones
+  // that remembered to check.
+  const pin = readPinSafe(deps);
+  if (pin.pinned) {
+    throw new PanelInstallError(pinRefusalMessage(action, pin));
   }
 
   const detection = await detectPanelInstall(deps);

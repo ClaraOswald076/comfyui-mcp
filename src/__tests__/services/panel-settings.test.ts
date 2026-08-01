@@ -3,11 +3,16 @@ import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, writeFileSync
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
+  clearPanelVersionPin,
+  describePanelPin,
   getAgentSettings,
   getNsfwConsent,
+  getPanelPinState,
   normalizePreferredModels,
+  PANEL_PIN_ENV_VAR,
   setAgentSettings,
   setNsfwConsent,
+  setPanelVersionPin,
 } from "../../services/panel-settings.js";
 
 let dir: string;
@@ -132,5 +137,105 @@ describe("normalizePreferredModels (#393 loop guard)", () => {
     // persisted (already-normalized) list must be equal when nothing changed.
     setAgentSettings({ preferredModels: [" x ", "x", "y"] });
     expect(getAgentSettings().preferredModels).toEqual(normalizePreferredModels([" x ", "x", "y"]));
+  });
+});
+
+describe("panel version pin", () => {
+  afterEach(() => {
+    delete process.env[PANEL_PIN_ENV_VAR];
+  });
+
+  it("defaults to unpinned and reading does not create the file", () => {
+    expect(getPanelPinState({})).toEqual({ pinned: false, source: "none" });
+    expect(existsSync(settingsPath)).toBe(false);
+  });
+
+  it("persists a pin with a timestamp and reason, and survives a reload", () => {
+    const pin = setPanelVersionPin(" 0.11.20 ", "  waiting on a node-pack fix  ");
+    expect(pin.version).toBe("0.11.20");
+    expect(typeof pin.pinnedAt).toBe("string");
+    expect(pin.reason).toBe("waiting on a node-pack fix");
+
+    expect(getPanelPinState({})).toMatchObject({
+      pinned: true,
+      version: "0.11.20",
+      source: "settings",
+      reason: "waiting on a node-pack fix",
+    });
+  });
+
+  it("clearing returns the removed pin and leaves the state unpinned", () => {
+    setPanelVersionPin("0.11.20");
+    expect(clearPanelVersionPin()?.version).toBe("0.11.20");
+    expect(getPanelPinState({})).toEqual({ pinned: false, source: "none" });
+    // Second clear is a no-op, not an error.
+    expect(clearPanelVersionPin()).toBeUndefined();
+  });
+
+  it("clearing the pin leaves the rest of the settings intact", () => {
+    setNsfwConsent(true);
+    setPanelVersionPin("0.11.20");
+    clearPanelVersionPin();
+    expect(getNsfwConsent().allowed).toBe(true);
+  });
+
+  it("an env pin wins over the persisted one (env > .env > json)", () => {
+    setPanelVersionPin("0.11.20");
+    expect(getPanelPinState({ [PANEL_PIN_ENV_VAR]: "0.9.9" })).toMatchObject({
+      pinned: true,
+      version: "0.9.9",
+      source: "env",
+    });
+  });
+
+  it("an env 'off' explicitly overrides a persisted pin", () => {
+    setPanelVersionPin("0.11.20");
+    for (const off of ["off", "none", "0", "false", "UNPINNED"]) {
+      expect(getPanelPinState({ [PANEL_PIN_ENV_VAR]: off })).toEqual({
+        pinned: false,
+        source: "none",
+      });
+    }
+  });
+
+  it("a junk persisted pin reads as PINNED-indeterminate, never as unpinned", () => {
+    // A pin key we cannot make sense of is not proof the user did not pin.
+    mkdirSync(dirname(settingsPath), { recursive: true });
+    writeFileSync(settingsPath, JSON.stringify({ panelPin: { version: "   " } }));
+    expect(getPanelPinState({})).toMatchObject({ pinned: true, indeterminate: true });
+  });
+
+  it("an UNPARSEABLE settings file reads as PINNED-indeterminate", () => {
+    mkdirSync(dirname(settingsPath), { recursive: true });
+    writeFileSync(settingsPath, "{ not json");
+    expect(getPanelPinState({})).toMatchObject({
+      pinned: true,
+      indeterminate: true,
+      source: "settings",
+    });
+  });
+
+  it("refuses to rewrite an unparseable settings file rather than clobber it", () => {
+    mkdirSync(dirname(settingsPath), { recursive: true });
+    writeFileSync(settingsPath, "{ not json");
+    expect(() => setPanelVersionPin("0.11.20")).toThrow(/could not be parsed/i);
+    expect(() => clearPanelVersionPin()).toThrow(/could not be parsed/i);
+    // The user's file is untouched, so nothing was silently lost.
+    expect(readFileSync(settingsPath, "utf-8")).toBe("{ not json");
+  });
+
+  it("rejects a blank pin version instead of storing a meaningless pin", () => {
+    expect(() => setPanelVersionPin("   ")).toThrow(/non-empty version/i);
+    expect(getPanelPinState({})).toEqual({ pinned: false, source: "none" });
+  });
+
+  it("describePanelPin names the source so the user knows how to clear it", () => {
+    expect(describePanelPin({ pinned: false, source: "none" })).toBe("not pinned");
+    expect(describePanelPin({ pinned: true, version: "0.11.20", source: "env" })).toContain(
+      PANEL_PIN_ENV_VAR,
+    );
+    expect(
+      describePanelPin({ pinned: true, version: "0.11.20", source: "settings" }),
+    ).toContain("0.11.20");
   });
 });

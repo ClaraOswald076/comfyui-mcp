@@ -80,12 +80,18 @@ Update ALL installed custom nodes via the ComfyUI-Manager HTTP API (queues updat
 
 ## install_panel
 
-Install, update, reinstall, or report status of the ComfyUI sidebar panel ('comfyui-agent-panel' on the Comfy Registry; repo comfyui-mcp-panel) in the LOCAL ComfyUI's custom_nodes. Uses the same ComfyUI-Manager path as install_custom_node and always targets the 'nightly' (git-HEAD) channel. Local-only (no-op/refuses in remote/cloud mode) and NEVER modifies a dev install (a symlinked panel dir). After install/update/reinstall, ComfyUI must be RESTARTED to load the new/updated node — this tool does not auto-restart. The panel is also auto-installed-if-missing when the MCP server loads.
+Install, update, reinstall, sync, pin, or report status of the ComfyUI sidebar panel ('comfyui-agent-panel' on the Comfy Registry; repo comfyui-mcp-panel) in the LOCAL ComfyUI's custom_nodes. Uses the same ComfyUI-Manager path as install_custom_node and always targets the 'nightly' (git-HEAD) channel. Local-only (no-op/refuses in remote/cloud mode) and NEVER modifies a dev install (a symlinked panel dir). After install/update/reinstall/sync, ComfyUI must be RESTARTED to load the new/updated node — this tool does not auto-restart. The panel is also auto-installed-if-missing when the MCP server loads. A version PIN (action='pin') holds the panel where it is: while a pin is set, install/update/reinstall/sync and the auto-install all refuse, and 'sync' only warns that a newer panel exists.
 
 ### Parameters
 
 <ParamField path="action" type="enum" default="status">
-  status: report installed/version/dev-symlink (never errors). install: add the panel (nightly). update: pull the latest nightly. reinstall: uninstall + reinstall (nightly). install/update/reinstall refuse on a dev symlink and require a local COMFYUI_PATH. Options: `status`, `install`, `update`, `reinstall`.
+  status: report installed/version/dev-symlink/pin plus a sync assessment (never errors). sync: bring the panel up to what this orchestrator needs — no-ops when already current, WARNS ONLY when pinned, and reports the version re-read from disk afterwards. install: add the panel (nightly). update: pull the latest nightly. reinstall: uninstall + reinstall (nightly). pin: hold the panel at a version (requires `version`). unpin: clear the pin so a sync can proceed. install/update/reinstall/sync refuse on a dev symlink or an active pin, and require a local COMFYUI_PATH. Options: `status`, `install`, `update`, `reinstall`, `sync`, `pin`, `unpin`.
+</ParamField>
+<ParamField path="version" type="string">
+  action='pin' only: the panel version to hold at, e.g. '0.11.20'. Use the installedVersion from action='status' to pin where you already are.
+</ParamField>
+<ParamField path="reason" type="string">
+  action='pin' only: why the user is pinning (stored with the pin).
 </ParamField>
 
 ### Example

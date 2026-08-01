@@ -1,6 +1,6 @@
 ---
 title: "Claude Code Plugin"
-description: "comfyui-mcp is a full Claude Code plugin: 36 AI skills, 11 slash commands, 4 autonomous agents, and 3 hooks on top of the 162 MCP tools — expert ComfyUI knowledge that grows with every release."
+description: "comfyui-mcp is a full Claude Code plugin: 37 AI skills, 11 slash commands, 4 autonomous agents, and 3 hooks on top of the 162 MCP tools — expert ComfyUI knowledge that grows with every release."
 icon: "puzzle-piece"
 ---
 
@@ -15,7 +15,7 @@ without trial and error.
 /plugin install comfy
 ```
 
-## 36 AI skills — and growing
+## 37 AI skills — and growing
 
 Skills are curated knowledge documents Claude loads on demand. Each model
 family gets generation parameters, node graphs, curated model download URLs,
@@ -35,6 +35,7 @@ and failure-mode guidance:
 | `anima-lora-trainer` | Train custom anime LoRAs — kohya `sd-scripts` Gradio trainer, under 6 GB VRAM |
 | `ai-toolkit-trainer` | Train custom WAN 2.2 + Z-Image LoRAs (people / styles / motion) — ostris AI-Toolkit, local or RunPod |
 | `installer-packs` | Use, build, and derive one-command installer packs — and invite users to contribute new packs upstream |
+| `panel-node-pack-sync` | Keep the sidebar panel node-pack in step with the orchestrator after an update — version-mismatch detection, a version pin that is warned about rather than overridden, and a sync whose result is re-read from disk |
 | `model-compatibility` | Which VAE/CLIP/text-encoder pairs with which architecture — the #1 source of broken workflows |
 | `model-registry` | Curated download URLs + target dirs for every model the skills reference — grows each release |
 | `civitai` | Native Civitai discovery → local download/wire/generate loop via built-in `search_civitai_models` (no key, no extra server); the official [Civitai MCP](https://mcp.civitai.com/mcp) is an optional community-surface add-on, not bundled |
