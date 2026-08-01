@@ -77,9 +77,9 @@ re-reads the pack from disk afterwards. Read the result:
   - `false` → the panel provably meets what the orchestrator needs. Done.
   - `true` → the update applied but did **not** close the gap. Say so; do not
     round it up to "you're current now".
-  - **`undefined`** → it landed, but the resulting version (e.g. `nightly`)
-    can't be compared, so whether the mismatch is fixed is **unknown**. Say
-    exactly that. `undefined` is not `false` — never report it as "you're fine".
+  - **`null`** → it landed, but the resulting version (e.g. `nightly`) can't be
+    compared, so whether the mismatch is fixed is **unknown**. Say exactly that.
+    `null` is not `false` — never report it as "you're fine".
 - `synced: false` → nothing was changed. `decision` says why (`pinned-warn`,
   `up-to-date`, `blocked`, …). This is a normal outcome, not a failure.
 - **The tool errored** → the sync FAILED. The error text names the cause

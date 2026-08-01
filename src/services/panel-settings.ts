@@ -213,8 +213,17 @@ export function getPanelPinState(env: NodeJS.ProcessEnv = process.env): PanelPin
   const { settings, unreadable } = readRaw();
   if (unreadable) return { pinned: true, source: "settings", indeterminate: true };
 
+  // ONLY an absent key means unpinned. A key that is PRESENT but malformed
+  // (`null`, `false`, `0`, `"0.11.3"`, `[]`) is somebody's hand-edit that we
+  // failed to understand — reading it as "no pin" would move a user who
+  // believed they were pinned. Present-but-unreadable resolves to pinned.
+  if (!("panelPin" in settings) || settings.panelPin === undefined) {
+    return { pinned: false, source: "none" };
+  }
   const raw = settings.panelPin as Partial<PanelVersionPin> | undefined;
-  if (!raw || typeof raw !== "object") return { pinned: false, source: "none" };
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return { pinned: true, source: "settings", indeterminate: true };
+  }
   const version = normalizePinVersion(raw.version);
   if (!version) {
     // A `panelPin` key exists but its version is junk: something pinned this
@@ -294,8 +303,17 @@ export function setPanelVersionPin(version: string, reason?: string): PanelVersi
  */
 export function clearPanelVersionPin(): PanelVersionPin | undefined {
   const settings = assertSettingsWritable();
-  const previous = settings.panelPin;
-  if (!previous) return undefined;
+  // Keyed on PRESENCE, not truthiness: a malformed falsy pin (`null`, `false`,
+  // `0`) is an active indeterminate pin, so `!previous` would have refused to
+  // delete it and left the user permanently blocked with "no pin was set".
+  if (!("panelPin" in settings) || settings.panelPin === undefined) return undefined;
+  const raw = settings.panelPin as unknown;
+  // A malformed stored pin still gets removed; describe it as unreadable rather
+  // than returning junk (or undefined, which callers render as "no pin existed").
+  const previous: PanelVersionPin =
+    raw && typeof raw === "object" && !Array.isArray(raw)
+      ? (raw as PanelVersionPin)
+      : { version: "(unreadable)" };
   delete settings.panelPin;
   write(settings);
   // Symmetrically verified: a "pin removed" we did not observe would leave the

@@ -227,6 +227,32 @@ describe("panel version pin", () => {
     },
   );
 
+  it.each([
+    ["null", null],
+    ["false", false],
+    ["zero", 0],
+    ["a bare string", "0.11.3"],
+    ["an array", ["0.11.3"]],
+  ])("a PRESENT but malformed panelPin (%s) reads as pinned, not unpinned", (_label, value) => {
+    // Only an ABSENT key means unpinned. A present key we failed to understand
+    // is somebody's hand-edit — reading it as "no pin" moves a user who
+    // believed they were protected.
+    mkdirSync(dirname(settingsPath), { recursive: true });
+    writeFileSync(settingsPath, JSON.stringify({ panelPin: value }));
+    expect(getPanelPinState({})).toMatchObject({ pinned: true, indeterminate: true });
+  });
+
+  it("clearing removes a malformed FALSY pin instead of leaving the user stuck", () => {
+    // `!previous` would have skipped the delete, leaving an indeterminate pin
+    // in place forever while reporting "no pin was set".
+    mkdirSync(dirname(settingsPath), { recursive: true });
+    writeFileSync(settingsPath, JSON.stringify({ panelPin: null }));
+    expect(getPanelPinState({}).pinned).toBe(true);
+    const removed = clearPanelVersionPin();
+    expect(removed?.version).toBe("(unreadable)");
+    expect(getPanelPinState({})).toEqual({ pinned: false, source: "none" });
+  });
+
   it("refuses to pin into a JSON-array settings file rather than silently dropping it", () => {
     mkdirSync(dirname(settingsPath), { recursive: true });
     writeFileSync(settingsPath, "[]");

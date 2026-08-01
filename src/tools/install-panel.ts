@@ -3,6 +3,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   panelStatus,
   runPanelAction,
+  withPanelOpLock,
 } from "../services/panel-installer.js";
 import {
   evaluatePanelSync,
@@ -11,6 +12,7 @@ import {
 } from "../services/panel-sync.js";
 import {
   clearPanelVersionPin,
+  describePanelPin,
   getPanelPinState,
   PANEL_PIN_ENV_VAR,
   setPanelVersionPin,
@@ -94,26 +96,41 @@ export function registerInstallPanelTools(server: McpServer): void {
                 "where you are now.",
             );
           }
-          const pin = setPanelVersionPin(target, reason);
+          // Serialized with panel mutations: a pin must not commit halfway
+          // through an in-flight install/update (see withPanelOpLock).
+          const pin = await withPanelOpLock(async () =>
+            setPanelVersionPin(target, reason),
+          );
           const status = await panelStatus();
+          // The RESOLVED pin is what actually governs. A persisted pin is inert
+          // while COMFYUI_MCP_PANEL_PIN overrides it (notably `=off`), and
+          // telling the user they are protected when they are not is exactly the
+          // fabricated-success failure this feature exists to prevent.
+          const active = status.pin.pinned && status.pin.source === "settings";
           return json({
             action: "pin",
             pin: status.pin,
+            active,
             requestedVersion: pin.version,
             installedVersion: status.installedVersion,
             requiredPanelVersion: requiredPanelVersion(),
             // A pin records intent; it does NOT move the panel. Saying so
             // prevents "pinned to 0.11.20" being read as "now on 0.11.20".
-            note:
-              `Pinned to ${pin.version}. This records intent only — it does NOT change ` +
-              `what is installed (currently ${status.installedVersion ?? "unknown"}). ` +
-              `install/update/reinstall/sync and the on-load auto-install will now ` +
-              `refuse until the pin is cleared with install_panel(action='unpin').`,
+            note: active
+              ? `Pinned to ${pin.version}. This records intent only — it does NOT change ` +
+                `what is installed (currently ${status.installedVersion ?? "unknown"}). ` +
+                `install/update/reinstall/sync and the on-load auto-install will now ` +
+                `refuse until the pin is cleared with install_panel(action='unpin').`
+              : `WARNING — the pin was saved to disk but is NOT IN FORCE: the ` +
+                `${PANEL_PIN_ENV_VAR} environment variable overrides it (resolved state: ` +
+                `${describePanelPin(status.pin)}). You are NOT protected. Unset ` +
+                `${PANEL_PIN_ENV_VAR} in the environment / ~/.comfyui-mcp/.env and ` +
+                `restart the orchestrator for the saved pin to take effect.`,
           });
         }
 
         if (action === "unpin") {
-          const removed = clearPanelVersionPin();
+          const removed = await withPanelOpLock(async () => clearPanelVersionPin());
           const after = getPanelPinState();
           return json({
             action: "unpin",

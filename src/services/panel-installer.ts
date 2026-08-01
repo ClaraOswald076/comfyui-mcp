@@ -304,7 +304,15 @@ function readPinSafe(deps: PanelInstallerDeps): PanelPinState {
  */
 let panelOpChain: Promise<unknown> = Promise.resolve();
 
-function withPanelOpLock<T>(fn: () => Promise<T>): Promise<T> {
+/**
+ * Exported so PIN WRITES take the same lock. Without that, a pin could be
+ * committed after an in-flight update passed its final pin check but before the
+ * Manager actually touched disk — the update would then land on a
+ * now-pinned install and report success. Serializing both means a pin either
+ * lands before an op starts (and blocks it) or after it finishes (and blocks the
+ * next one); it never slices one in half.
+ */
+export function withPanelOpLock<T>(fn: () => Promise<T>): Promise<T> {
   // Chain off settled-or-rejected so one failed op never wedges the queue.
   const run = panelOpChain.then(fn, fn);
   panelOpChain = run.then(

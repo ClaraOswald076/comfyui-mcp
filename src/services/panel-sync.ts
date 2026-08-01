@@ -38,16 +38,19 @@ import {
 import {
   BRIDGE_CMD_MIN_PANEL_VERSION,
   MIN_PANEL_VERSION_FOR_BRIDGE_COMMANDS,
+  SEMVER_RE,
 } from "./ui-bridge.js";
 import { compareSemver, detectInstallMode } from "./self-update.js";
 
-/**
- * Strict semver screen. `compareSemver` returns 0 for anything it cannot parse,
- * so an unscreened "nightly" / "dev" / "" would compare EQUAL to the required
- * version and be reported as up to date — a silent wrong answer. Everything here
- * screens first and reports `unknown` rather than guessing.
+/*
+ * Version screening. `compareSemver` returns 0 for anything it cannot parse, so
+ * an unscreened "nightly" / "dev" / "" would compare EQUAL to the required
+ * version and be reported as up to date — a silent wrong answer. We reuse the
+ * project's CANONICAL strict SemVer 2.0.0 grammar (ui-bridge's SEMVER_RE) rather
+ * than a hand-rolled approximation: a looser local regex admitted `01.11.28`
+ * (leading zero) and `0.11.28+.` (empty build identifier), which compareSemver
+ * then read as satisfying 0.11.28.
  */
-const SEMVER_RE = /^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 
 function isComparableVersion(v: string | undefined): v is string {
   return typeof v === "string" && SEMVER_RE.test(v.trim());
@@ -320,17 +323,19 @@ export interface PanelSyncResult {
   /** Highest panel version this orchestrator build needs. */
   requiredPanelVersion: string;
   /**
-   * TRI-STATE, and deliberately so.
+   * TRI-STATE, and `null` rather than `undefined` ON PURPOSE: this object is
+   * JSON.stringify'd to the agent, and `undefined` keys are DROPPED — the
+   * "we couldn't check" state would vanish from the wire and read as absent.
    *  - `true`  → the sync landed but the result is STILL below what the
    *              orchestrator needs. The sync happened; the mismatch did not go
    *              away, and the user must be told.
    *  - `false` → the sync landed and the result PROVABLY meets the requirement.
-   *  - `undefined` → the sync landed but the resulting version is not a
-   *              comparable version number (e.g. "nightly"), so whether the
-   *              requirement is met is UNKNOWN. It must not collapse to `false`:
-   *              "we couldn't check" is not "you're fine".
+   *  - `null`  → the sync landed but the resulting version is not a comparable
+   *              version number (e.g. "nightly"), so whether the requirement is
+   *              met is UNKNOWN. It must not collapse to `false`: "we couldn't
+   *              check" is not "you're fine".
    */
-  stillBehind?: boolean;
+  stillBehind?: boolean | null;
   /** True when ComfyUI must be restarted to load what just landed. */
   restartRequired?: boolean;
   message: string;
@@ -405,16 +410,16 @@ export async function performPanelSync(
     );
   }
 
-  // Tri-state: `undefined` when the landed version can't be compared at all.
-  const stillBehind = isComparableVersion(after.installedVersion)
+  // Tri-state: `null` when the landed version can't be compared at all.
+  const stillBehind: boolean | null = isComparableVersion(after.installedVersion)
     ? compareSemver(after.installedVersion, assessment.requiredPanelVersion) < 0
-    : undefined;
+    : null;
 
   const gapNote =
     stillBehind === true
       ? `NOTE: that is still below the ${assessment.requiredPanelVersion} this ` +
         `orchestrator expects — the update applied but did not close the gap. `
-      : stillBehind === undefined
+      : stillBehind === null
         ? `NOTE: "${after.installedVersion}" is not a comparable version number, so ` +
           `whether it meets the ${assessment.requiredPanelVersion} this orchestrator ` +
           `expects could NOT be confirmed — the update applied, the version match did ` +

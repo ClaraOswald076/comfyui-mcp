@@ -188,7 +188,19 @@ describe("evaluatePanelSync — cases where we must not guess", () => {
     expect(a.behind).toBe(true);
   });
 
-  it.each(["nightly", "dev", "", "not-a-version"])(
+  it.each([
+    "nightly",
+    "dev",
+    "",
+    "not-a-version",
+    // Strict SemVer 2.0.0: a looser screen accepted these and compareSemver then
+    // read them as satisfying 0.11.28.
+    "01.11.28",
+    "0.11.28+.",
+    "0.11.28-",
+    "0.11.28.1",
+    "0.11.28abc",
+  ])(
     "an uncomparable installed version (%j) → unknown, not a silent up-to-date",
     (v) => {
       // compareSemver returns 0 for junk, so an unscreened compare would report
@@ -402,7 +414,7 @@ describe("performPanelSync", () => {
     expect(r.message).toMatch(/still below/i);
   });
 
-  it("leaves stillBehind UNDEFINED when the landed version can't be compared", async () => {
+  it("leaves stillBehind NULL when the landed version can't be compared", async () => {
     // "nightly" landed: the sync really happened, but whether it meets the
     // requirement is unknown. `undefined` must NOT collapse to false — that
     // would read as "you're fine now" on a version we never checked.
@@ -415,8 +427,11 @@ describe("performPanelSync", () => {
     const r = await performPanelSync({ deps: h.deps, ...RUN });
     expect(r.synced).toBe(true);
     expect(r.verifiedVersion).toBe("nightly");
-    expect(r.stillBehind).toBeUndefined();
+    expect(r.stillBehind).toBeNull();
     expect(r.message).toMatch(/could NOT be confirmed/i);
+    // `undefined` would be DROPPED by JSON.stringify on the way to the agent,
+    // so the unknown state must survive serialization as an explicit null.
+    expect(JSON.parse(JSON.stringify(r))).toHaveProperty("stillBehind", null);
   });
 
   it("serializes concurrent syncs instead of interleaving their before/after reads", async () => {
