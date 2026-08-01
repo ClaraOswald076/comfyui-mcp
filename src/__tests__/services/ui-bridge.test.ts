@@ -1128,6 +1128,15 @@ describe("defaultBridgeTimeoutMs — tolerant read timeout (#357)", () => {
     }
   });
 
+  it("classifies refresh_nodes as a READ so it is parked/resumed on reconnect and gets the tolerant default (#608)", () => {
+    // refresh_nodes only re-registers node defs + rebuilds combos (idempotent, no
+    // graph mutation). It MUST be a read so a mid-command socket drop parks and
+    // resumes it (not OUTCOME-UNKNOWN, which the orchestrator won't retry) and so a
+    // slow /object_info fetch on a large install isn't cut off at the tight 6s.
+    expect(BRIDGE_READONLY_CMDS.has("refresh_nodes")).toBe(true);
+    expect(defaultBridgeTimeoutMs("refresh_nodes")).toBe(BRIDGE_READ_DEFAULT_TIMEOUT_MS);
+  });
+
   it("graph_query is tolerant and STRICTLY longer than the old flat 6s default (#357)", () => {
     // The regression: graph_query used the flat 6000ms default and timed out while
     // Preview3D loaded a large FBX on a busy-but-alive main thread.

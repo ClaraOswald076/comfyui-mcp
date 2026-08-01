@@ -288,6 +288,18 @@ function sleep(ms: number): Promise<void> {
 // settle. Mutating graph edits (add_node/connect/set_widget/…) are deliberately
 // EXCLUDED — re-issuing them could double-apply — so they keep surfacing the
 // bridge's honest OUTCOME-UNKNOWN error.
+// #599: commands whose FRONTEND handler intentionally awaits a fresh /object_info
+// re-register before it can reply — the refresh-before-validate path in
+// graph_set_widget (#338/#458) and graph_add_node (#289/#458), and the explicit
+// forced node-def refresh in refresh_nodes (#608). On a large install with many
+// custom-node packs a legitimate /object_info fetch can take longer than the
+// bridge's 6000 ms DEFAULT ack window, so the panel replies late and the tool
+// returns a FALSE "tab did not reply" timeout even though the write is valid and
+// in progress. Give these a larger BOUNDED ack budget so a slow-but-valid refresh
+// is not mistaken for a dead tab — still capped (never Infinity) so a genuinely
+// frozen/backgrounded tab fails in bounded time instead of hanging forever.
+const OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS = 30_000;
+
 const RETRY_SAFE_CMDS = new Set<string>([
   // Idempotent reads (mirror UiBridge.READONLY_CMDS + list/status probes).
   "graph_serialize",
@@ -303,6 +315,10 @@ const RETRY_SAFE_CMDS = new Set<string>([
   "node_queue_status",
   // Idempotent full-replace UI state — re-sending the same list is a no-op (#481).
   "set_todo",
+  // #608: a forced /object_info re-register + combo refresh. Non-destructive and
+  // idempotent (re-running just re-fetches the current defs), so a dropped
+  // transport can safely re-issue it once.
+  "refresh_nodes",
 ]);
 
 /** A command whose result is unchanged by being re-issued after a reconnect —
@@ -2670,7 +2686,14 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         title: z.string().optional().describe("Optional custom node title."),
       },
       async (args: A, ctx) =>
-        ctx.call({ cmd: "graph_add_node", class_type: args.class_type, pos: args.pos, title: args.title }),
+        // #599: the frontend gates the add on a FRESH /object_info (assertAddNode-
+        // ResolvableRefreshing) so an uninstalled class can't be added as a
+        // placeholder — that fetch can outlast the 6000 ms default on a large
+        // install. Give it the bounded refresh ack budget.
+        ctx.call(
+          { cmd: "graph_add_node", class_type: args.class_type, pos: args.pos, title: args.title },
+          OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
+        ),
     ),
     def(
       "panel_remove_node",
@@ -2962,7 +2985,15 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             "panel_set_widget needs a `value`. To set an empty string, pass `clear: true` (some clients drop an empty-string `value`).",
           );
         }
-        return ctx.call({ cmd: "graph_set_widget", node_id: args.node_id, widget: args.widget, value });
+        // #599: the frontend runs refresh-before-validate here (pulls a fresh
+        // /object_info so a just-staged/-downloaded/-installed value is accepted on
+        // a single revalidation, #338/#458) — that authoritative fetch can outlast
+        // the 6000 ms default ack on a large install and return a FALSE timeout.
+        // Give the guarded write the bounded refresh ack budget.
+        return ctx.call(
+          { cmd: "graph_set_widget", node_id: args.node_id, widget: args.widget, value },
+          OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS,
+        );
       },
     ),
     def(
@@ -3133,6 +3164,16 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       "WHY IS THAT NODE RED / WHY DID THE RUN FAIL? The single error surface for the user's open tab: every errored node JOINED TO ITS CAUSE, which ComfyUI itself does not show — LiteGraph only paints a red outline and stores no reason, which is why users report \"red node, no error message\". Call this whenever the user mentions a red/highlighted/erroring node, a failed run, or \"required models are missing\" — instead of guessing from widget values. Each entry in `nodes[]` is the node's full detail summary plus `red_outline` and `reasons[]`, drawn from every source: `missing_model` (exact file, its models directory, the widget holding it, and a download URL when known), `missing_media` (a referenced input image/video that isn't on disk — the usual cause of a red LoadImage), `validation` (per-input errors from the last queue attempt: message, details, offending input), and `execution` (runtime failure with `exception_type`, e.g. PIL.UnidentifiedImageError). TWO THINGS THAT MAKE THIS ESSENTIAL: (1) missing model/media assets paint nodes red AS SOON AS THE WORKFLOW LOADS, long before any queue attempt — so the raw validation map is still EMPTY while the user is staring at red nodes; (2) a node that throws AT RUNTIME is never painted red at all, so it can't be spotted on the canvas — it appears here with red_outline:false. Also returns graph-level `missing_models`, `missing_media`, `missing_node_types` (or `missing_node_count`), plus the raw `node_errors` map and `last_execution_error` for reference. A ⚠️ GRAPH VALIDATION block is auto-injected at your turn start when this state changes; call this to re-check on demand (e.g. after you edit widgets/links). Read-only.",
       {},
       async (_args, ctx) => ctx.call({ cmd: "graph_get_errors" }),
+    ),
+    def(
+      "panel_refresh_nodes",
+      "Re-pull the live ComfyUI server's /object_info and rebuild every combo/loader option list in the user's open tab, so an asset that appeared server-side AFTER the tab loaded becomes SELECTABLE without a manual reload (the 'press R' step) or a restart. Use this right after stage_output_as_input (chaining a stage's output into a LoadImage / VHS_LoadVideo / LoadAudio loader — the returned filename won't be in the loader's dropdown until you refresh), after downloading a model / LoRA / VAE (a freshly downloaded file is otherwise 'not a valid option' in its loader), or after installing a node pack. Then panel_set_widget / panel_add_node will accept the new value. Non-destructive: it only re-registers node defs and refreshes combo option lists — it does NOT change your graph and is undo-neutral. Idempotent (safe to call repeatedly). Returns whether the refresh authoritatively fetched fresh defs.",
+      {},
+      async (_args, ctx) =>
+        // Same bounded ack budget as the refresh-before-validate writes (#599): a
+        // fresh /object_info on a large install routinely exceeds the 6000 ms
+        // default, and this command's WHOLE purpose is to await that fetch.
+        ctx.call({ cmd: "refresh_nodes" }, OBJECT_INFO_REFRESH_ACK_TIMEOUT_MS),
     ),
     def(
       "panel_reload",

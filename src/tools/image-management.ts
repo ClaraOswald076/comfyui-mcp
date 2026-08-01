@@ -234,7 +234,13 @@ export function registerImageManagementTools(server: McpServer): void {
                 `Input filename: ${staged.filename}\n` +
                 `subfolder: ${staged.subfolder || "(none)"}\n` +
                 `type: ${staged.type}\n\n` +
-                `Use "${staged.filename}" as ${loaderHint}.`,
+                `Use "${staged.filename}" as ${loaderHint}.\n\n` +
+                `NOTE: the open ComfyUI tab's loader dropdown was populated at page-load, ` +
+                `so this just-registered input is not in it yet — call panel_refresh_nodes ` +
+                `first (it re-pulls /object_info so the new file becomes selectable), THEN ` +
+                `panel_set_widget the loader's widget to "${staged.filename}". ` +
+                `(panel_set_widget also self-refreshes on a rejected value, so a single ` +
+                `retry after panel_refresh_nodes will always accept it.)`,
             },
           ],
         };
