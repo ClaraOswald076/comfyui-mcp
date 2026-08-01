@@ -114,6 +114,13 @@ interface Conn {
    *  dispatch + the reactive #236 path (which learns from a REAL rejection). Mirrors
    *  the unsupportedCmds "reset on every hello" philosophy for the version dimension. */
   panelVersionAdvertised: boolean;
+  /** #570 P0c — THIS panel build advertised (in its hello) that it enforces the per-command
+   *  workflow-instance stamp: it refuses to run a graph command whose stamped workflow_uuid
+   *  does not match the active canvas. When false (an OLD panel that would silently ignore the
+   *  stamp), the send() preflight FAILS CLOSED for MUTATING graph commands so a stale write
+   *  can't hit the wrong canvas — reads stay allowed. Re-read from every hello (a reconnect may
+   *  be a freshly updated build), never inherited. */
+  enforcesWorkflowStamp: boolean;
   /** Commands THIS connection has already proven it doesn't support, via a real
    *  "Unknown command" reply earlier in the session (#236). Once a cmd lands
    *  here, every later call is gated proactively — rejected before it ever
@@ -380,6 +387,14 @@ export const BRIDGE_READONLY_CMDS: ReadonlySet<string> = new Set<string>([
   "refresh_nodes",
 ]);
 
+/** #570 P0c — a graph command that WRITES the canvas (add/remove/connect/move/set_widget/
+ *  clear/load/…). Any `graph_*` command that is NOT in the read-only allowlist mutates, so
+ *  this stays correct as new graph mutators are added without having to enumerate them. Used
+ *  to fail closed when the connected panel does not enforce the per-command workflow stamp. */
+export function isMutatingGraphCommand(cmdName: string): boolean {
+  return cmdName.startsWith("graph_") && !BRIDGE_READONLY_CMDS.has(cmdName);
+}
+
 /** Tight default reply timeout for a MUTATING command with no explicit timeout —
  *  fail fast so the agent isn't blocked on a stuck write. */
 export const BRIDGE_DEFAULT_TIMEOUT_MS = 6000;
@@ -541,6 +556,17 @@ export class UiBridge {
    *  to (the generation-bound-command leak: the server can't retract a frame already
    *  delivered to the browser, but the browser can decline to APPLY a stale one). */
   private resolveTabWorkflowUuid: ((tabId: string) => string | undefined) | null = null;
+  /** #570 P0a — records the mirror subscribers/viewers a same-socket re-hello OPTIMISTICALLY
+   *  moved from the retiring id to the new id, keyed by the RETIRING (from) id. The move
+   *  happens BEFORE the orchestrator can classify the switch as proven/unproven; if it turns
+   *  out UNPROVEN, revokeTabMigration(fromId) uses this to DETACH exactly those moved viewers
+   *  (reverting their input to their own session) and pull them back out of the destination's
+   *  subscriber set — so a phone mirroring workflow A never silently follows into B. Only the
+   *  MOVED sockets are undone, so B's OWN pre-existing viewers are untouched. */
+  private migratedMirror = new Map<
+    string,
+    { to: string; viewers: Set<BridgeSocket>; subs: Set<BridgeSocket> }
+  >();
   /** Injected by the orchestrator: does this tabId have a live agent session?
    *  (SessionStore/PanelAgentManager live there.) Flags desktopTabs() for the
    *  mobile mirror picker's green "session attached" dot. */
@@ -954,18 +980,37 @@ export class UiBridge {
           migratedProvenSupported = this.conns.get(tabId)?.provenSupportedCmds;
           this.conns.delete(tabId);
           // Move mirror subscribers to the migrated tab id so viewers keep this
-          // tab's live feed across a same-socket re-hello.
+          // tab's live feed across a same-socket re-hello. #570 P0a — this is OPTIMISTIC
+          // (it happens before the orchestrator can classify the switch); record exactly
+          // which sockets we move so revokeTabMigration() can pull JUST these back out if
+          // the switch turns out to be to a DIFFERENT workflow (never depending on the
+          // destination's own session ownership to trigger the undo).
+          const movedViewers = new Set<BridgeSocket>();
+          const movedSubs = new Set<BridgeSocket>();
           const migSubs = this.subscribers.get(tabId);
           if (migSubs) {
             this.subscribers.delete(tabId);
             const dest = this.subscribers.get(msg.tab_id as string) ?? new Set<BridgeSocket>();
-            for (const s of migSubs) dest.add(s);
+            for (const s of migSubs) {
+              dest.add(s);
+              movedSubs.add(s);
+            }
             this.subscribers.set(msg.tab_id as string, dest);
           }
           // Re-point any viewers driving the OLD id at the new one so their input
           // keeps reaching this tab's session across the re-hello.
           for (const [s, drivenTab] of this.mirrorViewers) {
-            if (drivenTab === tabId) this.mirrorViewers.set(s, msg.tab_id as string);
+            if (drivenTab === tabId) {
+              this.mirrorViewers.set(s, msg.tab_id as string);
+              movedViewers.add(s);
+            }
+          }
+          if (movedViewers.size || movedSubs.size) {
+            this.migratedMirror.set(tabId, {
+              to: msg.tab_id as string,
+              viewers: movedViewers,
+              subs: movedSubs,
+            });
           }
         }
         tabId = msg.tab_id;
@@ -1018,6 +1063,10 @@ export class UiBridge {
           panelVersionAdvertised:
             typeof (msg as { panel_version?: unknown }).panel_version === "string" &&
             !!(msg as { panel_version?: string }).panel_version,
+          // #570 P0c — re-read from THIS hello, never inherited (a reconnect may be a newly
+          // updated build). Strict === true so any non-true / absent value is non-enforcing.
+          enforcesWorkflowStamp:
+            (msg as { enforces_workflow_stamp?: unknown }).enforces_workflow_stamp === true,
           // Fresh per hello — see the field's doc comment (#236).
           unsupportedCmds: new Set<string>(),
           // INHERITED across a reconnect (the panel code did not get older) so a command
@@ -1229,6 +1278,12 @@ export class UiBridge {
       for (const [from, entry] of this.tabMigrations) {
         if (entry.sock === sock) this.tabMigrations.delete(from);
       }
+      // #570 P0a — prune recorded mirror-migration undo state referencing this dying tab
+      // (a proven-keep switch never calls revokeTabMigration, so its entry would otherwise
+      // linger). Keyed by / pointing at this tab id → inert once it's gone.
+      for (const [from, m] of this.migratedMirror) {
+        if (from === tabId || m.to === tabId) this.migratedMirror.delete(from);
+      }
       // Drop this socket from any mirror subscriptions (it was a viewer).
       for (const [tid, set] of this.subscribers) {
         if (set.delete(sock) && set.size === 0) this.subscribers.delete(tid);
@@ -1337,6 +1392,26 @@ export class UiBridge {
     if (target) {
       for (const [from, entry] of this.tabMigrations) {
         if (entry.to === target) this.tabMigrations.delete(from);
+      }
+    }
+    // #570 P0a — this migration was just REJECTED as a switch to a DIFFERENT workflow, so
+    // UNDO the optimistic mirror move: detach exactly the viewers/subscribers we moved onto
+    // the destination (never the destination's OWN viewers). Detached viewers revert to their
+    // own session; their input stops driving the destination. This runs UNCONDITIONALLY on the
+    // revoke — it does NOT depend on the destination having (or lacking) its own bound session,
+    // which is the gap that let a mirror follow A→B when B already owned an exact session.
+    const moved = this.migratedMirror.get(fromId);
+    if (moved) {
+      this.migratedMirror.delete(fromId);
+      const destSubs = this.subscribers.get(moved.to);
+      if (destSubs) {
+        for (const s of moved.subs) destSubs.delete(s);
+        if (destSubs.size === 0) this.subscribers.delete(moved.to);
+      }
+      for (const s of moved.viewers) {
+        // Only revert a viewer we moved that is STILL pointed at this destination (it may have
+        // since re-attached elsewhere, which we must not clobber).
+        if (this.mirrorViewers.get(s) === moved.to) this.mirrorViewers.delete(s);
       }
     }
   }
@@ -1688,6 +1763,25 @@ export class UiBridge {
       panelVersionProvesUnsupported(cmd.cmd, conn.panelVersion)
     ) {
       return Promise.reject(buildPanelTooOldError(cmd.cmd, conn.panelVersion));
+    }
+    // #570 P0c — FAIL CLOSED for a MUTATING graph command when the resolved panel does NOT
+    // enforce the per-command workflow-instance stamp. Such a panel would silently IGNORE the
+    // stamp and could apply a command delivered AFTER a workflow switch to the wrong canvas —
+    // and a delivered frame cannot be retracted, so fencing only the reply can't undo the
+    // mutation. Refusing to DISPATCH it is the only server-side guarantee. Reads (outline,
+    // query, get_state, serialize, …) stay allowed, so an old panel keeps read-only graph
+    // access with a clear "update to edit" error rather than a silent wrong-canvas write.
+    if (isMutatingGraphCommand(cmd.cmd) && !conn.enforcesWorkflowStamp) {
+      return Promise.reject(
+        markDispatched(
+          new Error(
+            `"${cmd.cmd}" needs a panel that enforces per-command workflow targeting, but panel tab ` +
+              `${conn.tabId.slice(0, 8)} does not (update the ComfyUI-MCP panel to edit the graph). ` +
+              `Read-only graph commands (graph_outline, graph_query, graph_get_state) still work.`,
+          ),
+          false,
+        ),
+      );
     }
     if (conn.sock.readyState !== WebSocket.OPEN) {
       if (opts.tabId && UiBridge.isMailboxable(cmd)) {

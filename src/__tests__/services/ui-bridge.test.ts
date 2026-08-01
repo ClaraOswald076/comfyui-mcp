@@ -64,7 +64,11 @@ function connectPanel(tabId?: string, title = "workflow-a"): Promise<WebSocket> 
     const sock = new WebSocket(`ws://127.0.0.1:${port}`);
     sock.on("open", () => {
       if (tabId) {
-        sock.send(JSON.stringify({ type: "hello", tab_id: tabId, title }));
+        // Current panels advertise stamp enforcement, so a mutating graph command is not gated
+        // (#570 P0c). Tests exercising the OLD-panel gate hello WITHOUT this flag explicitly.
+        sock.send(
+          JSON.stringify({ type: "hello", tab_id: tabId, title, enforces_workflow_stamp: true }),
+        );
       }
       resolve(sock);
     });
@@ -1212,9 +1216,12 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     desktop.send(JSON.stringify({ type: "hello", tab_id: "new-id", title: "B" }));
     await settle();
 
-    // Orchestrator's unproven-transition reset: retired id then surviving id.
-    bridge.dropQueuedDeliveries("old-id");
-    bridge.dropQueuedDeliveries("new-id");
+    // The orchestrator classified the switch as UNPROVEN and revokes the migration. This is
+    // the retire branch's SOLE call for the OLD id — it does NOT also sweep new-id (when B
+    // owns its own session, provenOwn is true and the destination sweep is skipped). The
+    // mirror detach must therefore ride revokeTabMigration itself (#570 P0a), NOT a manual
+    // destination sweep.
+    bridge.revokeTabMigration("old-id");
 
     // Workflow B's activity must NOT reach the phone anymore.
     let leaked = false;
@@ -1257,7 +1264,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     expect(frames.find((f) => f.cmd === "graph_add_node")?.workflow_uuid).toBe("uuid-A");
 
     // Same socket switches to workflow B (migration alias tmp:A → tmp:B).
-    desktop.send(JSON.stringify({ type: "hello", tab_id: "tmp:B", title: "B" }));
+    desktop.send(JSON.stringify({ type: "hello", tab_id: "tmp:B", title: "B", enforces_workflow_stamp: true }));
     await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:B")).toBe(true));
 
     // A late command still ISSUED FOR A (its agent's tab id) must stamp A's uuid — even though
@@ -1286,6 +1293,46 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     await vi.waitFor(() => expect(frames.find((f) => f.cmd === "graph_add_node")).toBeTruthy());
     expect("workflow_uuid" in (frames.find((f) => f.cmd === "graph_add_node") as object)).toBe(false);
     desktop.close();
+  });
+
+  it("FAILS CLOSED: a MUTATING graph command is refused for an OLD panel that doesn't enforce the stamp; reads still work (#570 P0c)", async () => {
+    // An OLD panel hellos WITHOUT enforces_workflow_stamp — it would silently ignore the
+    // per-command workflow stamp and could apply a stale write to the wrong canvas.
+    const old = new WebSocket(`ws://127.0.0.1:${port}`);
+    await new Promise<void>((res, rej) => {
+      old.on("open", () => {
+        old.send(JSON.stringify({ type: "hello", tab_id: "tmp:old", title: "old" })); // no flag
+        res();
+      });
+      old.on("error", rej);
+    });
+    // Auto-reply so a NON-gated command could resolve (proving the gate, not a hang).
+    old.on("message", (buf) => {
+      const m = JSON.parse(buf.toString());
+      if (m.rid && m.cmd) old.send(JSON.stringify({ rid: m.rid, ok: true, result: {} }));
+    });
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:old")).toBe(true));
+
+    // A mutating graph command is refused BEFORE dispatch (never written to the socket).
+    await expect(
+      bridge.send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "tmp:old" }),
+    ).rejects.toThrow(/enforces per-command workflow targeting|update the ComfyUI-MCP panel/i);
+
+    // …but a READ-ONLY graph command still works (read-only graph access retained).
+    await expect(
+      bridge.send({ cmd: "graph_get_state" } as never, { tabId: "tmp:old" }),
+    ).resolves.toBeTruthy();
+    old.close();
+  });
+
+  it("ALLOWS a mutating graph command for a panel that DOES enforce the stamp (#570 P0c)", async () => {
+    const modern = await connectPanel("tmp:modern", "M"); // connectPanel advertises enforcement
+    autoReply(modern, "modern");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:modern")).toBe(true));
+    await expect(
+      bridge.send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "tmp:modern" }),
+    ).resolves.toMatchObject({ from: "modern" });
+    modern.close();
   });
 
   it("refuses a headless hello takeover of a desktop tab id (no drive-path hijack)", async () => {
@@ -1823,7 +1870,17 @@ describe("UiBridge.send (graceful gate end-to-end)", () => {
   // the SPECIFIC cmd that was empirically proven unsupported is gated).
   it("does NOT gate a different, never-tried command after another command was proven unsupported", async () => {
     const sock = await connectPanel(undefined);
-    sock.send(JSON.stringify({ type: "hello", tab_id: "old-tab-3", title: "wf", panel_version: "0.6.8" }));
+    // Old VERSION (for the #236 too-old graph_query check) but a stamp-enforcing build, so the
+    // orthogonal P0c mutating-graph gate doesn't mask what this test asserts.
+    sock.send(
+      JSON.stringify({
+        type: "hello",
+        tab_id: "old-tab-3",
+        title: "wf",
+        panel_version: "0.6.8",
+        enforces_workflow_stamp: true,
+      }),
+    );
     sock.on("message", (buf) => {
       const msg = JSON.parse(buf.toString());
       if (!msg.rid || !msg.cmd) return;
