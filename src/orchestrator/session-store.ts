@@ -151,6 +151,23 @@ export function deriveWorkflowIdentity(opts: {
   return p ? `${p.origin}::${p.uuid}` : undefined;
 }
 
+/** #570 — may a panel-scoped `hello.resume` be ARMED? The EXACT tab-id session is unique to this
+ *  tab, so a hint matching it (`exactOwned`) is always this tab's own — arm it. The STABLE-key
+ *  session is SHARED by every tab of the same workflow identity (the same workflow open in two
+ *  live tabs), so a hint matching it (`stableOwned`) may arm ONLY when no OTHER connected tab holds
+ *  that stable key (`otherTabHoldsStableKey` false) — otherwise a concurrent sibling would attach
+ *  to and contend for the first tab's live conversation (a cross-tab leak). Fail closed: an
+ *  ambiguous stable-key hint is dropped (a fresh sibling is a mild miss; joining the live
+ *  conversation is not). */
+export function armableResume(opts: {
+  exactOwned: boolean;
+  stableOwned: boolean;
+  otherTabHoldsStableKey: boolean;
+}): boolean {
+  if (opts.exactOwned) return true;
+  return opts.stableOwned && !opts.otherTabHoldsStableKey;
+}
+
 /** #570 — per-backend teardown decision at the identity boundary. When a hello is NOT proven
  *  for the SELECTED backend, each provider's state must be judged on its OWN merits rather than
  *  globally reset off the selected backend: a DORMANT provider's session is KEPT (resumable)

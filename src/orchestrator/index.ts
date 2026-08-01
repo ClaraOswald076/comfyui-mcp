@@ -23,6 +23,7 @@ import { detectInstallMode } from "../services/self-update.js";
 import { SelfRestarter } from "../services/self-restart.js";
 import {
   SessionStore,
+  armableResume,
   deriveStableKey,
   keepsBackendState,
   workflowIdentityParts,
@@ -2854,9 +2855,29 @@ export async function runPanelOrchestrator(): Promise<void> {
         const trustedStableKey = newIdentity
           ? deriveStableKey({ workflowUuid: newIdentity.uuid, origin: newIdentity.origin, backend })
           : undefined;
-        const owned =
-          sessionStore.get(key) === resumeHint ||
-          (trustedStableKey !== undefined && sessionStore.getStable(trustedStableKey) === resumeHint);
+        // The EXACT tab-id session is unique to THIS tab id, so a hello.resume that matches it is
+        // always this tab's own — safe to arm. The STABLE-key session is SHARED by every tab of
+        // the same workflow identity (the same workflow open in two live tabs), so a second tab's
+        // panel-scoped hello.resume matching it would attach that tab to — and contend for — the
+        // FIRST tab's live conversation (codex). Permit a stable-key resume ONLY when no OTHER
+        // connected tab already holds that stable key. This mirrors the seed-fallback collision
+        // guard below; without it the armed path bypassed it.
+        const exactOwned = sessionStore.get(key) === resumeHint;
+        const stableOwned =
+          trustedStableKey !== undefined && sessionStore.getStable(trustedStableKey) === resumeHint;
+        let otherTabHoldsStableKey = false;
+        if (stableOwned && !exactOwned && trustedStableKey !== undefined) {
+          for (const t of bridge.tabs()) {
+            if (t.tab_id !== panelTab && tabStableKey.get(t.tab_id) === trustedStableKey) {
+              otherTabHoldsStableKey = true; // a concurrently-live sibling holds it → don't cross-attach
+              logger.info(
+                `[panel-orchestrator] tab ${panelTab.slice(0, 8)} hello.resume ${resumeHint.slice(0, 8)} matches a stable key ANOTHER live tab holds — dropping (a concurrent sibling must start fresh, not join the live conversation)`,
+              );
+              break;
+            }
+          }
+        }
+        const owned = armableResume({ exactOwned, stableOwned, otherTabHoldsStableKey });
         if (owned) {
           armedResume = resumeHint;
           manager.setResume(key, resumeHint);

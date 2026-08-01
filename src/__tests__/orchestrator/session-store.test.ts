@@ -11,11 +11,32 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   SessionStore,
+  armableResume,
   deriveStableKey,
   deriveWorkflowIdentity,
   keepsBackendState,
   workflowIdentityParts,
 } from "../../orchestrator/session-store.js";
+
+// #570 — a panel-scoped hello.resume may arm from the SHARED stable key only when no OTHER live
+// tab holds it, so a concurrent sibling can't attach to the first tab's live conversation.
+describe("armableResume (#570 concurrent-tab guard)", () => {
+  it("arms an EXACT tab-id match unconditionally (unique to this tab)", () => {
+    expect(armableResume({ exactOwned: true, stableOwned: false, otherTabHoldsStableKey: false })).toBe(true);
+    // Exact ownership wins even if a sibling holds the stable key.
+    expect(armableResume({ exactOwned: true, stableOwned: true, otherTabHoldsStableKey: true })).toBe(true);
+  });
+
+  it("arms a STABLE-key match ONLY when no other live tab holds it", () => {
+    expect(armableResume({ exactOwned: false, stableOwned: true, otherTabHoldsStableKey: false })).toBe(true);
+    // The codex leak: a second live tab of the same identity sends the shared session id → DROP.
+    expect(armableResume({ exactOwned: false, stableOwned: true, otherTabHoldsStableKey: true })).toBe(false);
+  });
+
+  it("does NOT arm an unowned hint", () => {
+    expect(armableResume({ exactOwned: false, stableOwned: false, otherTabHoldsStableKey: false })).toBe(false);
+  });
+});
 
 // A port unlikely to collide with a real run or another test.
 const PORT = 59187;
