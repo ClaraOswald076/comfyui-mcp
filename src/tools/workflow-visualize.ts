@@ -158,7 +158,7 @@ export function registerWorkflowVisualizeTools(server: McpServer): void {
 
   server.tool(
     "visualize_workflow_hierarchical",
-    "SECTION a LARGE (20+ node) workflow JSON you PASS IN into a hierarchical Mermaid diagram — same required `workflow` argument as visualize_workflow, but grouped into sections instead of one flat chart. It does NOT read the user's live canvas: for 'show me what's on the canvas' use panel_graph_outline. " +
+    "SECTION a workflow JSON you PASS IN into a hierarchical Mermaid diagram — same required `workflow` argument as visualize_workflow, grouped into sections instead of one flat chart, which is what you want once a graph reaches ~20+ nodes. It does NOT read the user's live canvas: for 'show me what's on the canvas' use panel_graph_outline. " +
       "Detects logical sections using node categories from /object_info, resolves Get/Set virtual wires, " +
       "and produces either a compact overview (sections as summary nodes), a detailed view of one section, " +
       "or a text listing of all sections.",

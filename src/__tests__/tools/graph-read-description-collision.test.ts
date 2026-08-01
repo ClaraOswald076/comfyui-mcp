@@ -53,6 +53,7 @@ const FAMILY = [
   "panel_query_graph",
   "panel_find_nodes",
   "panel_view_nodes_in_viewport",
+  "panel_screenshot",
   "visualize_workflow",
   "visualize_workflow_hierarchical",
   "query_workflow",
@@ -138,6 +139,37 @@ describe("graph-reading tool descriptions are distinguishable (#557)", () => {
         expect(lead).toMatch(/pass in|saved|file|json/);
       });
     }
+  });
+
+  /**
+   * The ratchet, and the only part of this file that can catch a tool NOBODY has
+   * thought about yet. Everything above asserts over a hand-written FAMILY list,
+   * so a new tool that opens by offering to show the user their canvas is invisible
+   * to it — which is how panel_screenshot sat there as an untested competitor for
+   * the exact failing prompt while the list-based checks were all green.
+   *
+   * So: scan the WHOLE surface. Any tool whose OPENING both names the live canvas
+   * and offers to show/read it is claiming the query panel_graph_outline exists to
+   * answer, and must therefore hand the model back to panel_graph_outline somewhere
+   * in its description. Only panel_graph_outline itself is exempt.
+   */
+  it("lets no other tool on the surface open by claiming to show the live canvas", () => {
+    const NAMES_THE_CANVAS = /live canvas|on the canvas|currently viewing|current(ly)? open graph|the canvas the user/i;
+    const OFFERS_TO_SHOW_IT = /\b(read|reads|show|shows|see|view|render|renders|display|describe|outline|dump)\b/i;
+
+    const offenders: string[] = [];
+    for (const [name, description] of [...core, ...panel]) {
+      if (name === "panel_graph_outline") continue;
+      const opening = description.slice(0, 140);
+      if (!NAMES_THE_CANVAS.test(opening) || !OFFERS_TO_SHOW_IT.test(opening)) continue;
+      if (!description.includes("panel_graph_outline")) offenders.push(name);
+    }
+
+    expect(
+      offenders,
+      "these open by offering to show the live canvas but never point at panel_graph_outline, " +
+        "so a small model asked 'show me what's on the canvas' can land on them and nothing errors",
+    ).toEqual([]);
   });
 
   it("keeps the descriptions short enough for a small model to read", () => {

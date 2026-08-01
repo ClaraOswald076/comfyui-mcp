@@ -61,7 +61,8 @@ export function registerWorkflowLibraryTools(server: McpServer): void {
 
   server.tool(
     "get_workflow",
-    "Return the RAW JSON of a SAVED workflow FILE, named from the library — a file on disk, NOT the graph open on the user's canvas (that is panel_graph_outline). " +
+    "Return the full JSON of a SAVED workflow FILE, named from the library — a file on disk, NOT the graph open on the user's canvas (that is panel_graph_outline). " +
+      "Defaults to converted API format; pass format:'ui' for the raw on-disk UI JSON. " +
       "Use analyze_workflow instead if you just need to understand the workflow — it returns a structured summary without flooding context with JSON. " +
       "Use get_workflow only when you need the actual JSON for enqueue_workflow, modify_workflow, or save_workflow.",
     {
