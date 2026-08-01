@@ -82,6 +82,8 @@ function makeDeps(opts: {
     comfyuiPath: () => opts.comfyuiPath,
     env: () => opts.env ?? {},
     existsSync: (p) => p === CUSTOM_NODES || p in files,
+    // Files map holds regular files (pyproject, web assets) — CUSTOM_NODES is a dir.
+    probeFile: (p) => p in files,
     isSymlink: (p) => symlinks.has(p),
     isDirectory: (p) => !nonDirs.has(p),
     realPath: (p) => opts.realPaths?.[p],
@@ -264,6 +266,22 @@ describe("ensurePanelInstalled policy matrix", () => {
     expect(res.action).toBe("unavailable");
     expect(res.reason).toMatch(/enumerate|confirm the panel is missing/i);
     expect(h.installs).toEqual([]);
+  });
+
+  it("#641: on-load install NO-OPs but a served shadow exists → 'shadowed', not 'unavailable'", async () => {
+    const bak = ".comfyui-agent-panel.bak-0.11.28";
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: [bak],
+      files: {
+        // A served backup copy is present; the canonical install never lands.
+        [join(CUSTOM_NODES, bak, "web", "js", "comfyui-mcp-panel.js")]: "// old panel",
+      },
+      // No onInstall → Manager no-op, canonical dir never appears.
+    });
+    const res = await ensurePanelInstalled({ deps: h.deps });
+    expect(res.action).toBe("shadowed");
+    expect(res.reason).toMatch(/shadow/i);
   });
 
   it("#641: present WITH a shadow → 'shadowed' (surfaces the trap on load)", async () => {
@@ -726,6 +744,26 @@ describe("runPanelAction shadow detection (#641)", () => {
     await expect(runPanelAction("update", h.deps)).rejects.toThrow(bakName);
   });
 
+  it("#641: update advances the canonical version but a SERVED shadow (content, no pyproject) exists → NOT success", async () => {
+    const bak = ".comfyui-agent-panel-0.11.28.bak";
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: [bak],
+      files: {
+        [join(realDir, "pyproject.toml")]: pyproject(PANEL_REGISTRY_ID, "0.11.28"),
+        // Served shadow: web asset present, NO pyproject.
+        [join(CUSTOM_NODES, bak, "web", "js", "comfyui-mcp-panel.js")]: "// old panel",
+      },
+      updateDetails: { total_count: 1, done_count: 1, is_processing: false },
+      // The real dir genuinely advances on disk...
+      onUpdate: ({ files }) => {
+        files[join(realDir, "pyproject.toml")] = pyproject(PANEL_REGISTRY_ID, "0.11.32");
+      },
+    });
+    // ...but the served shadow means the browser may still load the old copy.
+    await expect(runPanelAction("update", h.deps)).rejects.toThrow(/shadow/i);
+  });
+
   it("update: shadow removed → success", async () => {
     const h = makeDeps({
       comfyuiPath: COMFY,
@@ -812,6 +850,107 @@ describe("findPanelShadows (#641)", () => {
     expect(findPanelShadows(realDir, deps).map((x) => x.name)).toContain(bak);
   });
 
+  it("#641(a): flags '.comfyui-agent-panel-0.11.28.bak' (marker LAST) with web assets, no pyproject", () => {
+    // The .bak marker is at the END of the remainder (rest = "-0.11.28.bak"),
+    // and there is no pyproject — both the broadened name heuristic and the
+    // CONTENT signal must catch it.
+    const bak = ".comfyui-agent-panel-0.11.28.bak";
+    const { deps } = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: [bak],
+      files: {
+        // The served web asset — the CONTENT signal.
+        [join(CUSTOM_NODES, bak, "web", "js", "comfyui-mcp-panel.js")]: "// panel",
+      },
+    });
+    expect(findPanelShadows(realDir, deps).map((x) => x.name)).toContain(bak);
+  });
+
+  it("#641(b): a served copy with UNREADABLE pyproject fails CLOSED (flagged, not omitted)", () => {
+    // Name is neither canonical nor backup-shaped, so ONLY the content signal +
+    // fail-closed behavior can catch it. pyproject exists but read throws.
+    const stray = "panel-restore-dir";
+    const pyPath = join(CUSTOM_NODES, stray, "pyproject.toml");
+    const { deps } = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: [stray],
+      files: {
+        [join(CUSTOM_NODES, stray, "web", "js", "comfyui-mcp-panel.js")]: "// panel",
+        [pyPath]: "corrupt",
+      },
+    });
+    deps.readFile = (p) => {
+      if (p === pyPath) throw new Error("EIO: pyproject unreadable");
+      return "";
+    };
+    const s = findPanelShadows(realDir, deps);
+    expect(s.map((x) => x.name)).toContain(stray);
+    // Identity couldn't be verified → version undefined (a POSSIBLE shadow).
+    expect(s.find((x) => x.name === stray)?.version).toBeUndefined();
+  });
+
+  it("#641(c): canonical-only (no other served copy) → no shadow", () => {
+    const { deps } = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: ["comfyui-mcp-panel"],
+      files: {
+        [join(realDir, "pyproject.toml")]: pyproject(PANEL_REGISTRY_ID, "0.11.32"),
+        [join(realDir, "web", "js", "comfyui-mcp-panel.js")]: "// panel",
+      },
+    });
+    expect(findPanelShadows(realDir, deps)).toEqual([]);
+  });
+
+  it("flags a NON-backup-named dir purely by served web content", () => {
+    const stray = "my-vendored-panel";
+    const { deps } = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: [stray],
+      files: {
+        [join(CUSTOM_NODES, stray, "web", "img", "comfyui-mcp-wordmark.svg")]: "<svg/>",
+      },
+    });
+    expect(findPanelShadows(realDir, deps).map((x) => x.name)).toContain(stray);
+  });
+
+  it("FAILS CLOSED when a content probe is INDETERMINATE (probeFile undefined)", () => {
+    const stray = "opaque-dir";
+    const marker = join(CUSTOM_NODES, stray, "web", "js", "comfyui-mcp-panel.js");
+    const { deps } = makeDeps({ comfyuiPath: COMFY, dirs: [stray] });
+    // Marker probe can't confirm absence (EACCES) → undefined, not false.
+    deps.probeFile = (p) => (p === marker ? undefined : false);
+    expect(findPanelShadows(realDir, deps).map((x) => x.name)).toContain(stray);
+  });
+
+  it("does NOT treat a DIRECTORY named like the asset as a served copy", () => {
+    // A dir 'comfyui-mcp-panel.js' (not a file) must NOT count as a served asset.
+    const stray = "unrelated-node";
+    const markerAsDir = join(CUSTOM_NODES, stray, "web", "js", "comfyui-mcp-panel.js");
+    const { deps } = makeDeps({ comfyuiPath: COMFY, dirs: [stray] });
+    deps.probeFile = (p) => (p === markerAsDir ? false : false); // exists but a dir → false
+    expect(findPanelShadows(realDir, deps)).toEqual([]);
+  });
+
+  it("exempts a backup-NAMED symlink alias that resolves to the canonical dir", () => {
+    // ".comfyui-agent-panel.bak" is a junction -> the canonical dir; realpath
+    // proves same physical dir → serves the SAME assets → NOT a shadow.
+    const alias = ".comfyui-agent-panel.bak";
+    const canonical = join(CUSTOM_NODES, "comfyui-mcp-panel");
+    const real = "/real/fs/comfyui-mcp-panel";
+    const { deps } = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: [alias],
+      files: {
+        [join(canonical, "pyproject.toml")]: pyproject(PANEL_REGISTRY_ID, "0.11.32"),
+      },
+      realPaths: {
+        [canonical]: real,
+        [join(CUSTOM_NODES, alias)]: real, // alias resolves to canonical
+      },
+    });
+    expect(findPanelShadows(canonical, deps)).toEqual([]);
+  });
+
   it("does NOT block on a regular FILE that merely shares a backup name", () => {
     const bak = ".comfyui-agent-panel.bak-0.11.28";
     const { deps } = makeDeps({
@@ -820,6 +959,44 @@ describe("findPanelShadows (#641)", () => {
       nonDirEntries: [bak], // it's a FILE, not a served extension dir
     });
     expect(findPanelShadows(realDir, deps)).toEqual([]);
+  });
+
+  it("FAILS CLOSED when directory classification is INDETERMINATE (stat error)", () => {
+    const bak = ".comfyui-agent-panel.bak-0.11.28";
+    const bakDir = join(CUSTOM_NODES, bak);
+    const { deps } = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: [bak],
+      files: { [join(bakDir, "pyproject.toml")]: pyproject(PANEL_REGISTRY_ID, "0.11.28") },
+    });
+    // Transient stat failure → undefined (can't confirm it's a file) → must NOT skip.
+    deps.isDirectory = (p) => (p === bakDir ? undefined : true);
+    expect(findPanelShadows(realDir, deps).map((x) => x.name)).toContain(bak);
+  });
+
+  it("flags a distinct case-variant serving copy when NO canonical is resolved", () => {
+    // canonicalDir undefined + a case-variant dir serving panel content: it must
+    // be content-checked (flagged), not exempted by a case-insensitive name.
+    const variant = "ComfyUI-MCP-Panel";
+    const { deps } = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: [variant],
+      files: {
+        [join(CUSTOM_NODES, variant, "web", "js", "comfyui-mcp-panel.js")]: "// panel",
+      },
+    });
+    expect(findPanelShadows(undefined, deps).map((x) => x.name)).toContain(variant);
+  });
+
+  it("still exempts the EXACT canonical name when no canonical is resolved", () => {
+    const { deps } = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: ["comfyui-mcp-panel"],
+      files: {
+        [join(realDir, "web", "js", "comfyui-mcp-panel.js")]: "// panel",
+      },
+    });
+    expect(findPanelShadows(undefined, deps)).toEqual([]);
   });
 
   it("does NOT flag an unrelated custom node", () => {
@@ -948,6 +1125,29 @@ describe("looksLikePanelBackupName (#641)", () => {
     expect(looksLikePanelBackupName("comfyui-agent-panel-copy")).toBe(true);
     expect(looksLikePanelBackupName(".comfyui-agent-panel~")).toBe(true);
     expect(looksLikePanelBackupName("comfyui-mcp-panel~")).toBe(true);
+    // Marker LAST (version between the name and the .bak token).
+    expect(looksLikePanelBackupName(".comfyui-agent-panel-0.11.28.bak")).toBe(true);
+    expect(looksLikePanelBackupName("comfyui-mcp-panel-2026.old")).toBe(true);
+  });
+
+  it("does NOT flag a same-prefixed but non-backup sibling ('-holder' contains 'old')", () => {
+    // 'old' appears as a substring of 'holder' but not as a boundary token.
+    expect(looksLikePanelBackupName("comfyui-agent-panel-holder")).toBe(false);
+    expect(looksLikePanelBackupName(".comfyui-agent-panel-holder")).toBe(false);
+  });
+
+  it("does NOT flag a backup of an unrelated SIBLING node", () => {
+    // These are backups of "comfyui-agent-panel-tools"/"...-holder", NOT the panel.
+    expect(looksLikePanelBackupName("comfyui-agent-panel-tools-old")).toBe(false);
+    expect(looksLikePanelBackupName("comfyui-agent-panel-holder-backup")).toBe(false);
+    expect(looksLikePanelBackupName(".comfyui-agent-panel-tools~")).toBe(false);
+    expect(looksLikePanelBackupName("comfyui-agent-panel-tools.bak")).toBe(false);
+  });
+
+  it("ALLOWS descriptive text AFTER the first backup marker", () => {
+    expect(looksLikePanelBackupName("comfyui-agent-panel-backup-2026-final")).toBe(true);
+    expect(looksLikePanelBackupName(".comfyui-agent-panel~snapshot")).toBe(true);
+    expect(looksLikePanelBackupName("comfyui-mcp-panel.bak.final")).toBe(true);
   });
 
   it("does NOT flag the canonical names or unrelated extensions", () => {

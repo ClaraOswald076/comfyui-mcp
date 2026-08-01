@@ -78,10 +78,25 @@ export interface PanelInstallerDeps {
   /** Process env (for the opt-out flag). */
   env: () => NodeJS.ProcessEnv;
   existsSync: (p: string) => boolean;
+  /**
+   * Tri-state REGULAR-FILE probe: true = a regular file exists at `p`, false =
+   * confirmed not-a-servable-file (ENOENT, ENOTDIR, or it exists but is a
+   * directory), undefined = could not determine (EACCES/EIO/…). Used to detect a
+   * served web asset — only a regular file is served, and unlike existsSync
+   * (which collapses every error to false), an indeterminate probe lets the
+   * shadow scan fail closed instead of silently omitting a served copy. Never
+   * throws.
+   */
+  probeFile: (p: string) => boolean | undefined;
   /** True when `p` is a symlink/junction (dev install). Never throws. */
   isSymlink: (p: string) => boolean;
-  /** True when `p` is a directory (following symlinks). Never throws. */
-  isDirectory: (p: string) => boolean;
+  /**
+   * Tri-state directory check (following symlinks): true = directory, false =
+   * CONFIRMED non-directory (a regular file), undefined = COULD NOT DETERMINE
+   * (stat error). Callers must only SKIP an entry on an explicit `false`; an
+   * undefined must be treated as a possible directory (fail closed). Never throws.
+   */
+  isDirectory: (p: string) => boolean | undefined;
   /**
    * Canonical physical path of `p` (resolves symlinks + the real on-disk case),
    * or undefined if it can't be resolved. Used to decide whether two entries are
@@ -184,6 +199,15 @@ export const defaultDeps: PanelInstallerDeps = {
   comfyuiPath: () => config.comfyuiPath,
   env: () => process.env,
   existsSync,
+  probeFile: (p) => {
+    try {
+      return statSync(p).isFile(); // true = regular file, false = exists but a dir
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException)?.code;
+      // ENOENT/ENOTDIR = confirmed no servable file here; else indeterminate.
+      return code === "ENOENT" || code === "ENOTDIR" ? false : undefined;
+    }
+  },
   isSymlink: (p) => {
     try {
       return lstatSync(p).isSymbolicLink();
@@ -196,7 +220,9 @@ export const defaultDeps: PanelInstallerDeps = {
       // statSync follows symlinks: a dir symlink IS web-served, so it counts.
       return statSync(p).isDirectory();
     } catch {
-      return false;
+      // Could not determine — return undefined so the caller fails closed rather
+      // than treating a served backup as a skippable "file".
+      return undefined;
     }
   },
   realPath: (p) => {
@@ -373,10 +399,14 @@ export interface PanelShadow {
   version?: string;
 }
 
-/** Canonical panel dir basenames — a legitimate install lives at one of these. */
-function isCanonicalPanelName(name: string): boolean {
-  const lower = name.toLowerCase();
-  return (FAST_PATH_DIRS as readonly string[]).some((n) => n === lower);
+/**
+ * EXACT (case-sensitive) canonical panel dir basename. Used only to avoid
+ * flagging the real install when no canonical dir was resolved; a case-VARIANT
+ * (e.g. "ComfyUI-MCP-Panel" on a case-sensitive volume) is NOT exempted here —
+ * it is content-checked like any other dir so a distinct serving copy is caught.
+ */
+function isExactCanonicalPanelName(name: string): boolean {
+  return (FAST_PATH_DIRS as readonly string[]).includes(name);
 }
 
 /**
@@ -405,13 +435,23 @@ function samePathCI(
 }
 
 /**
- * A dir NAME that looks like a leftover panel copy/backup — the shadowing trap
- * from #641. The name must START WITH a canonical panel base name (after an
+ * The remainder (after the canonical base) of a panel BACKUP name: only
+ * separators / digits / dots may precede the FIRST backup marker, which is
+ * either "~" or a whole-word backup keyword. Descriptive text AFTER the marker is
+ * allowed (e.g. "-backup-2026-final", "~snapshot"); a non-backup word BEFORE the
+ * marker ("-tools-old", "-holder-backup") means it is a backup of a DIFFERENT
+ * (sibling) node, not the panel, so it must NOT match.
+ */
+const PANEL_BACKUP_REST =
+  /^[._\-0-9]*(?:~|(?:bak|backup|old|copy|orig|save|prev|previous)(?![a-z]))/i;
+
+/**
+ * A dir NAME that looks like a leftover copy/backup OF THE PANEL — the shadowing
+ * trap from #641. The name must START WITH a canonical panel base name (after an
  * optional leading dot) and then be EITHER exactly that name while hidden (a
- * dot-prefixed copy of the real panel) OR followed by a backup/copy token.
- * Deliberately NARROW: an unrelated extension like "comfyui-agent-panel-tools"
- * (or a hidden ".comfyui-agent-panel-tools") must NOT match — those are caught
- * only by an exact pyproject `name` == comfyui-agent-panel test elsewhere.
+ * dot-prefixed copy of the real panel) OR a panel-backup suffix (see
+ * PANEL_BACKUP_REST). Copies that dropped their name are caught by the CONTENT
+ * signal instead.
  */
 export function looksLikePanelBackupName(name: string): boolean {
   const hidden = name.startsWith(".");
@@ -424,17 +464,47 @@ export function looksLikePanelBackupName(name: string): boolean {
   // Exactly a canonical name: a HIDDEN copy (".comfyui-agent-panel") shadows the
   // real panel; a plain "comfyui-agent-panel" IS the real install (not a backup).
   if (rest === "") return hidden;
-  // An editor "~" backup suffix (e.g. ".comfyui-agent-panel~") is a backup.
-  if (rest.includes("~") || name.includes("~")) return true;
-  // Otherwise the remainder must be a backup/copy suffix, not a different node.
-  return /^[._-](bak|backup|old|copy|orig|save|prev|previous)([._-]|\d|$)/i.test(rest);
+  return PANEL_BACKUP_REST.test(rest);
+}
+
+/**
+ * Web-extension asset paths ComfyUI serves for the panel. A custom_nodes dir that
+ * contains ANY of these is served as the panel's frontend (at /extensions/<dir>/…)
+ * and therefore shadows the canonical install regardless of its dir name or
+ * pyproject — this is the #641 CONTENT signal, spelling-independent.
+ */
+const PANEL_WEB_MARKERS = [
+  ["web", "js", "comfyui-mcp-panel.js"],
+  ["web", "img", "comfyui-mcp-wordmark.svg"],
+] as const;
+
+/**
+ * Tri-state: does `dir` serve the panel's web-extension assets? true = a marker
+ * is present, false = all markers CONFIRMED absent, undefined = a probe FAILED
+ * (indeterminate). Callers must treat undefined as a POSSIBLE shadow (fail
+ * closed), never as "no assets". Never throws.
+ */
+function servesPanelWebAssets(
+  dir: string,
+  deps: PanelInstallerDeps,
+): boolean | undefined {
+  let probeFailed = false;
+  for (const seg of PANEL_WEB_MARKERS) {
+    const r = deps.probeFile(join(dir, ...seg));
+    if (r === true) return true;
+    if (r === undefined) probeFailed = true; // indeterminate — can't confirm absent
+  }
+  return probeFailed ? undefined : false;
 }
 
 /**
  * Find panel-serving dirs under custom_nodes that would SHADOW the canonical
- * install — any dir (other than the true canonical) whose pyproject `name` is
- * the panel, OR whose basename is backup/copy-shaped (covers web-only backups
- * that dropped pyproject). LOCAL-only.
+ * install — any dir (other than the true canonical) that ComfyUI would SERVE as
+ * the panel's web extension. Detection is CONTENT-first (the dir serves the
+ * panel's web assets → spelling-independent), plus a cheap name heuristic and an
+ * exact pyproject-name match. FAILS CLOSED on uncertainty: a served copy whose
+ * pyproject is unreadable/absent is still flagged (as a possible shadow with no
+ * version), never silently omitted. LOCAL-only.
  *
  * THROWS if custom_nodes exists but cannot be enumerated: shadow inspection is
  * then INDETERMINATE and the ACTION paths must fail closed rather than assume
@@ -447,27 +517,44 @@ export function findPanelShadows(
   const comfyPath = deps.comfyuiPath();
   if (!deps.isLocalMode() || !comfyPath) return [];
   const customNodes = join(comfyPath, "custom_nodes");
-  if (!deps.existsSync(customNodes)) return [];
 
-  // Intentionally NOT swallowed — a failed enumeration is indeterminate, not
-  // proof of "no shadows". Callers decide how to handle it.
-  const entries = deps.readdir(customNodes);
+  // Enumerate custom_nodes. A missing dir (ENOENT) legitimately means "no
+  // shadows"; ANY other failure (EACCES/EIO/…) is INDETERMINATE — NOT swallowed,
+  // so the action paths fail closed rather than assume "no shadows".
+  let entries: string[];
+  try {
+    entries = deps.readdir(customNodes);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return [];
+    throw err;
+  }
 
   const shadows: PanelShadow[] = [];
   for (const name of entries) {
     const dir = join(customNodes, name);
-    // ComfyUI serves DIRECTORIES as web extensions — a regular file that happens
-    // to share the name is not served and must not block actions.
-    if (!deps.isDirectory(dir)) continue;
+    // ComfyUI serves DIRECTORIES as web extensions — a regular FILE that happens
+    // to share the name is not served and must not block actions. Skip ONLY on a
+    // CONFIRMED non-directory; an undefined (stat error) is indeterminate and
+    // must NOT omit a possible served backup → fail closed by continuing to check.
+    if (deps.isDirectory(dir) === false) continue;
+    // PHYSICAL IDENTITY FIRST: a symlink/junction/alias that resolves to the
+    // canonical dir serves the SAME (updated) assets → it is NOT a shadow, even
+    // if its NAME is backup-shaped (e.g. ".comfyui-agent-panel.bak" ->
+    // comfyui-mcp-panel). realpath-unavailable falls back to exact-string only.
+    if (samePathCI(dir, canonicalDir, deps)) continue;
+    // With no canonical resolved, don't flag a dir whose name is EXACTLY a
+    // canonical basename (it is most likely the real install). Case-variant or
+    // backup-shaped names are still content-checked below — never exempted here.
+    if (!canonicalDir && isExactCanonicalPanelName(name)) continue;
     const isBackup = looksLikePanelBackupName(name);
-    // Exempt the ONE true canonical install (physical identity). A backup-shaped
-    // name is NEVER exempted, even if it was (mis)selected as canonicalDir.
-    if (!isBackup && samePathCI(dir, canonicalDir, deps)) continue;
-    // With no canonical resolved, don't flag a canonically-NAMED dir (it is most
-    // likely the real install). Backup-shaped names are still flagged.
-    if (!isBackup && !canonicalDir && isCanonicalPanelName(name)) continue;
 
-    let isPanelCopy = isBackup;
+    // CONTENT signal: does this dir serve the panel's web assets? If so it is a
+    // shadow no matter how it is named or whether its pyproject is readable. An
+    // INDETERMINATE probe (undefined) is treated as a possible shadow (fail
+    // closed) — only a CONFIRMED-absent (false) clears the content signal.
+    const servesPanel = servesPanelWebAssets(dir, deps) !== false;
+
+    let isPanelCopy = isBackup || servesPanel;
     let version: string | undefined;
     const pyproject = join(dir, "pyproject.toml");
     if (deps.existsSync(pyproject)) {
@@ -477,8 +564,11 @@ export function findPanelShadows(
           isPanelCopy = true;
           version = parsed.version;
         }
+        // else: pyproject readable but a different name. If it still SERVES panel
+        // assets (isPanelCopy) it remains a shadow with an unknown panel version.
       } catch {
-        // ignore — rely on the backup-name heuristic
+        // FAIL CLOSED: unreadable pyproject does NOT clear a content/name signal.
+        // A served copy we cannot identify is a POSSIBLE shadow, not "no shadow".
       }
     }
     if (isPanelCopy) shadows.push({ name, version });
@@ -508,7 +598,10 @@ function assertNoPanelShadow(
   }
   if (shadows.length === 0) return;
   const names = shadows
-    .map((s) => `"${s.name}"${s.version ? ` (${s.version})` : ""}`)
+    .map(
+      (s) =>
+        `"${s.name}"${s.version ? ` (${s.version})` : " (identity could not be verified)"}`,
+    )
     .join(", ");
   throw new PanelInstallError(
     `Panel ${action} cannot be confirmed: a SHADOW copy of the panel exists in ` +
@@ -518,8 +611,9 @@ function assertNoPanelShadow(
       `sorts before "comfyui-agent-panel"), so the BROWSER may keep loading the old ` +
       `panel even though the real dir on disk is up to date (#641). NOT reporting ` +
       `success. Remove or MOVE the offending dir OUT of custom_nodes (e.g. to a temp ` +
-      `folder), then hard-refresh the ComfyUI tab. A backup belongs anywhere EXCEPT ` +
-      `under custom_nodes.`,
+      `folder) — or, if its identity could not be verified, make its pyproject.toml ` +
+      `readable so it can be identified — then hard-refresh the ComfyUI tab. A ` +
+      `backup belongs anywhere EXCEPT under custom_nodes.`,
   );
 }
 
@@ -654,7 +748,23 @@ async function ensureInner(deps: PanelInstallerDeps): Promise<EnsureResult> {
     // #639 — VERIFY it actually landed (fresh re-read); never log "installed"
     // from the Manager result alone (a stale 3.x no-op drains the queue trivially).
     const post = await detectPanelInstall(deps);
-    if (!post.installed || !post.version) {
+    const landed = post.installed && !!post.version;
+    // #641 — report a shadow FIRST: a served backup copy explains a wrong panel in
+    // the browser whether or not the canonical install landed this run.
+    const shadow = describePanelShadow(post.dir, deps);
+    if (shadow) {
+      return {
+        action: "shadowed",
+        reason: landed
+          ? `Installed ${PANEL_REGISTRY_ID} (${post.version}) but ${shadow}.`
+          : `Panel auto-install could not be verified on disk (likely a stale ` +
+            `ComfyUI-Manager no-op, #639/#424), AND ${shadow}`,
+        dir: post.dir,
+        installedVersion: post.version,
+        restartRequired: landed ? true : undefined,
+      };
+    }
+    if (!landed) {
       return {
         action: "unavailable",
         reason:
@@ -662,17 +772,6 @@ async function ensureInner(deps: PanelInstallerDeps): Promise<EnsureResult> {
           `reported the queue drained but the pack is not present. Likely a stale ` +
           `ComfyUI-Manager 3.x no-op (#639/#424). Install the panel from source or ` +
           `update ComfyUI-Manager, then restart ComfyUI.`,
-      };
-    }
-    // #641 — a shadow copy would make the browser load the wrong panel.
-    const shadow = describePanelShadow(post.dir, deps);
-    if (shadow) {
-      return {
-        action: "shadowed",
-        reason: `Installed ${PANEL_REGISTRY_ID} (${post.version}) but ${shadow}.`,
-        dir: post.dir,
-        installedVersion: post.version,
-        restartRequired: true,
       };
     }
     return {
@@ -1075,6 +1174,10 @@ export async function runPanelAction(
   // the Manager queue drains, which the stale 3.x no-op passes trivially. Re-read
   // fresh from disk here so BOTH paths fail closed rather than fabricate success.
   const post = await detectPanelInstall(deps);
+  // #641 — fail closed on a shadow FIRST: a served backup copy is the more
+  // actionable diagnostic (it explains a wrong panel in the browser) and is named
+  // with its specific remedy, even when the canonical install itself did not land.
+  assertNoPanelShadow(action, post.dir, deps);
   if (!post.installed || !post.version) {
     throw new PanelInstallError(
       `Panel ${action} did NOT land: the pack is ${
@@ -1086,8 +1189,6 @@ export async function runPanelAction(
         `or install the panel from source, then RESTART ComfyUI.`,
     );
   }
-  // #641 — fail closed if a shadow copy would win registration in the browser.
-  assertNoPanelShadow(action, post.dir, deps);
 
   // SUCCESS REQUIRES PROVEN CHANGE (mirrors the update path): the pack went from
   // ABSENT→present (fresh install landed), or its version/git-HEAD moved. Proven
