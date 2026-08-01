@@ -332,6 +332,14 @@ export const BRIDGE_READONLY_CMDS: ReadonlySet<string> = new Set<string>([
   "graph_query",
   "civitai_results",
   "get_todo",
+  // #608: a forced /object_info re-register + combo refresh. It has NO effect on
+  // graph content — it only re-registers node defs and rebuilds combo option lists
+  // (idempotent, undo-neutral) — so it is classified with the READS: it earns the
+  // tolerant read default timeout (a fresh /object_info on a large install can run
+  // many seconds), and on a mid-command socket drop it is PARKED and resumed on the
+  // tab's re-hello rather than surfacing a scary OUTCOME-UNKNOWN the orchestrator
+  // won't retry. Re-running it is always safe.
+  "refresh_nodes",
 ]);
 
 /** Tight default reply timeout for a MUTATING command with no explicit timeout —

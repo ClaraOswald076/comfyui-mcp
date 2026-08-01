@@ -30,11 +30,15 @@ type Forwarded = Record<string, unknown>;
 
 function makeFakeCtx(
   bridgeReply?: unknown,
-): { ctx: PanelToolCtx; calls: Forwarded[] } {
+): { ctx: PanelToolCtx; calls: Forwarded[]; timeouts: (number | undefined)[] } {
   const calls: Forwarded[] = [];
+  // Per-call ack timeout (ctx.call's 2nd arg), index-aligned with `calls`, so a
+  // test can assert the #599 refresh-ack budget the tool forwarded.
+  const timeouts: (number | undefined)[] = [];
   const ctx: PanelToolCtx = {
-    call: async (cmd) => {
+    call: async (cmd, timeoutMs) => {
       calls.push(cmd);
+      timeouts.push(timeoutMs);
       return { content: [{ type: "text", text: JSON.stringify(cmd) }] };
     },
     confirm: async () => "yes" as const,
@@ -49,7 +53,7 @@ function makeFakeCtx(
     } as unknown as PanelToolCtx["bridge"],
     tabId: "test-tab",
   };
-  return { ctx, calls };
+  return { ctx, calls, timeouts };
 }
 
 function defByName(name: string) {
@@ -194,6 +198,56 @@ describe("panel-tools: panel_set_widget (empty-string clear, issue #347)", () =>
     );
     expect(res.isError).toBe(true);
     expect(calls).toHaveLength(0);
+  });
+});
+
+describe("panel-tools: fresh /object_info ack timeout (#599)", () => {
+  // The refresh-before-validate FRONTEND handlers (graph_set_widget #338/#458,
+  // graph_add_node #289/#458) await an authoritative /object_info fetch before
+  // replying; on a large install that can outlast the bridge's 6000 ms default
+  // ack, returning a FALSE "tab did not reply" timeout. The tools must forward a
+  // larger BOUNDED ack budget so a slow-but-valid refresh isn't a false timeout.
+  const REFRESH_ACK_MS = 30_000;
+
+  it("panel_set_widget forwards graph_set_widget with the 30s refresh ack timeout, not the 6s default", async () => {
+    const { ctx, calls, timeouts } = makeFakeCtx();
+    await defByName("panel_set_widget").handler(
+      { node_id: 39, widget: "image", value: "staged_00001_.png" },
+      ctx,
+    );
+    expect(calls[0]).toMatchObject({ cmd: "graph_set_widget" });
+    expect(timeouts[0]).toBe(REFRESH_ACK_MS);
+  });
+
+  it("panel_add_node forwards graph_add_node with the 30s refresh ack timeout", async () => {
+    const { ctx, calls, timeouts } = makeFakeCtx();
+    await defByName("panel_add_node").handler(
+      { class_type: "LoadImage", pos: [0, 0] },
+      ctx,
+    );
+    expect(calls[0]).toMatchObject({ cmd: "graph_add_node", class_type: "LoadImage" });
+    expect(timeouts[0]).toBe(REFRESH_ACK_MS);
+  });
+
+  it("keeps the ack bounded (never Infinity) so a genuinely dead tab still fails", () => {
+    expect(Number.isFinite(REFRESH_ACK_MS)).toBe(true);
+    expect(REFRESH_ACK_MS).toBeLessThanOrEqual(60_000);
+  });
+});
+
+describe("panel-tools: panel_refresh_nodes (#608 — force a combo/object_info refresh)", () => {
+  it("forwards a bare refresh_nodes command (no graph mutation) with the refresh ack budget", async () => {
+    const { ctx, calls, timeouts } = makeFakeCtx();
+    await defByName("panel_refresh_nodes").handler({}, ctx);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toEqual({ cmd: "refresh_nodes" });
+    // Same 30s budget as the refresh-before-validate writes — this command's whole
+    // purpose is to await a fresh /object_info fetch.
+    expect(timeouts[0]).toBe(30_000);
+  });
+
+  it("takes no arguments (empty schema)", () => {
+    expect(Object.keys(defByName("panel_refresh_nodes").schema)).toEqual([]);
   });
 });
 

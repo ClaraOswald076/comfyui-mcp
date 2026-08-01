@@ -64,6 +64,18 @@ describe("withWorkflowTarget", () => {
     const out = withWorkflowTarget({ cmd: "graph_run" }, { mode: "current" });
     expect(out).toEqual({ cmd: "graph_run" });
   });
+
+  it("does NOT inject workflow_path on refresh_nodes even when pinned (#608 global refresh)", () => {
+    // panel_refresh_nodes forces a GLOBAL /object_info re-register that is not tied
+    // to any one graph; it is deliberately named `refresh_nodes` (not `graph_*`) so
+    // shouldInjectWorkflowPath excludes it — no workflow_path is added, so the
+    // frontend's pinned-target guard is skipped and the refresh runs regardless of
+    // which workflow the pinned session points at. This LOCKS that design: renaming
+    // it to a graph_* command (which WOULD inject a pin and trip the guard) must
+    // fail this test.
+    expect(shouldInjectWorkflowPath("refresh_nodes", {})).toBe(false);
+    expect(withWorkflowTarget({ cmd: "refresh_nodes" }, pinned)).toEqual({ cmd: "refresh_nodes" });
+  });
 });
 
 describe("shouldInjectWorkflowPath", () => {
