@@ -268,6 +268,19 @@ export function resetManagerApiCacheForTests(api?: ManagerApi): void {
   managerApiCache = api ? { base: managerBaseUrl(), api } : null;
 }
 
+/**
+ * Re-classify the cached Manager dialect to "v2-batch" after the unified
+ * /v2/manager/queue/task route answered 405 AND a batch retry then SUCCEEDED.
+ * The /v2 queue surface is real (it answered a status during detection), so the
+ * build is the bundled 3.x server under /v2 whose `is_legacy_manager_ui` probe
+ * didn't identify it (#464). Pin the corrected dialect so subsequent operations
+ * skip the dead task route. Caller must only invoke this once the batch enqueue
+ * has actually succeeded, so a transient/proxy 405 can't poison the cache.
+ */
+function demoteManagerApiToV2Batch(): void {
+  managerApiCache = { base: managerBaseUrl(), api: "v2-batch" };
+}
+
 /** A real queue/status payload — guards detection against servers that answer
  *  200 with HTML/junk for unknown GETs (SPA fallbacks, index catchalls). Accepts
  *  any of the queue-count fields the Manager reports: `total_count`/`is_processing`
@@ -573,59 +586,105 @@ async function queueManagerTask(
 ): Promise<QueueStatus> {
   const uiId = randomUUID();
   const api = await detectManagerApi();
-  if (api === "legacy") {
-    // Released Manager 3.x: per-operation routes + different body shapes
-    // (issue #116 — the unified /v2 task route 405s there).
-    const { path, body } = legacyTaskRequest(kind, params, uiId);
-    try {
-      await managerFetch(path, { method: "POST", body });
-    } catch (err) {
-      throw annotateLegacyError(err, kind);
+  if (api === "legacy") return runLegacyTask(kind, params, uiId);
+  if (api === "v2-batch") return runV2BatchTask(kind, params, uiId);
+  // v2 unified task envelope (normal-mode pip Manager v4).
+  try {
+    await managerFetch("/v2/manager/queue/task", {
+      method: "POST",
+      body: {
+        ui_id: uiId,
+        client_id: MANAGER_CLIENT_ID,
+        kind,
+        params: { ...params, ui_id: uiId },
+      },
+    });
+  } catch (err) {
+    if (errorStatus(err) === 405) {
+      // Detection chose the unified /v2 task dialect (the /v2 queue surface
+      // answered a real status during detectManagerApi), yet THIS build 405s a
+      // POST to /v2/manager/queue/task. That is the bundled 3.x server served
+      // under /v2 — a legacy-UI pip Manager whose `is_legacy_manager_ui` probe
+      // did NOT answer truthfully, so resolveV2SubDialect defaulted to "v2"
+      // (#464: panel_update_node → "Manager …/queue/task: HTTP 405" on a
+      // legacy-dialect Manager). A 405 on a Manager route is a method/route
+      // signal, never "unreachable" — mirror the queue/start POST→GET
+      // negotiation (#551/#586) by retrying via the v2-batch envelope instead
+      // of surfacing the raw 405.
+      logger.debug(
+        "Manager /v2/manager/queue/task 405 — retrying via the v2-batch envelope",
+        { kind },
+      );
+      const status = await runV2BatchTask(kind, params, uiId);
+      // Pin the corrected dialect ONLY after the batch enqueue actually
+      // succeeded, so a transient/proxy 405 on a genuine v4 host (task 405 but
+      // batch also unavailable) never poisons the cache: runV2BatchTask throws
+      // on a batch failure, leaving the cache as "v2" so the next op re-probes
+      // the unified task route (codex review).
+      demoteManagerApiToV2Batch();
+      return status;
     }
-    return runManagerQueue();
+    throw err;
   }
-  if (api === "v2-batch") {
-    // pip Manager in legacy-UI mode (issue #235): the /v2 prefix serves the
-    // BUNDLED 3.x server — no task route (POST there 405s via the frontend
-    // catchall). Mutations take 3.x body shapes, wrapped in the batch
-    // envelope {<op>: [body, ...]}; the batch runs its items synchronously
-    // and reports failures as {failed: [id, ...]}. install-model keeps its
-    // dedicated route (same path as v4, 3.x whitelist semantics).
-    const { path, body } = legacyTaskRequest(kind, params, uiId);
-    try {
-      if (kind === "install-model") {
-        await managerFetch("/v2/manager/queue/install_model", { method: "POST", body });
-      } else {
-        // legacyTaskRequest's path is "/manager/queue/<op>"; the batch key is
-        // that trailing op ("enable" maps to an install body → key "install").
-        const op = path.split("/").pop() as string;
-        const res = await managerFetch<{ failed?: unknown[] }>("/v2/manager/queue/batch", {
-          method: "POST",
-          body: { [op]: [body] },
-        });
-        const failed = Array.isArray(res?.failed) ? res.failed : [];
-        if (failed.length && (body.id === undefined || failed.includes(body.id))) {
-          throw new NodeManagementError(
-            `ComfyUI-Manager batch reported the ${op} of "${String(body.id ?? "?")}" as failed ` +
-              "(check the ComfyUI server log for the underlying error — security_level " +
-              "gating is a common cause).",
-          );
-        }
+  return runManagerQueue();
+}
+
+/**
+ * Enqueue one operation on the released Manager 3.x per-operation routes
+ * (issue #116 — the unified /v2 task route 405s there) and drain the queue.
+ */
+async function runLegacyTask(
+  kind: ManagerTaskKind,
+  params: Record<string, unknown>,
+  uiId: string,
+): Promise<QueueStatus> {
+  const { path, body } = legacyTaskRequest(kind, params, uiId);
+  try {
+    await managerFetch(path, { method: "POST", body });
+  } catch (err) {
+    throw annotateLegacyError(err, kind);
+  }
+  return runManagerQueue();
+}
+
+/**
+ * Enqueue one operation on the v2-batch dialect — pip Manager in legacy-UI mode
+ * (issue #235): the /v2 prefix serves the BUNDLED 3.x server, which has no
+ * unified task route (a POST there 405s via the frontend catchall). Mutations
+ * take 3.x body shapes wrapped in the batch envelope {<op>: [body, ...]}; the
+ * batch runs its items synchronously and reports failures as {failed: [id, ...]}.
+ * install-model keeps its dedicated route (same path as v4, 3.x whitelist
+ * semantics).
+ */
+async function runV2BatchTask(
+  kind: ManagerTaskKind,
+  params: Record<string, unknown>,
+  uiId: string,
+): Promise<QueueStatus> {
+  const { path, body } = legacyTaskRequest(kind, params, uiId);
+  try {
+    if (kind === "install-model") {
+      await managerFetch("/v2/manager/queue/install_model", { method: "POST", body });
+    } else {
+      // legacyTaskRequest's path is "/manager/queue/<op>"; the batch key is
+      // that trailing op ("enable" maps to an install body → key "install").
+      const op = path.split("/").pop() as string;
+      const res = await managerFetch<{ failed?: unknown[] }>("/v2/manager/queue/batch", {
+        method: "POST",
+        body: { [op]: [body] },
+      });
+      const failed = Array.isArray(res?.failed) ? res.failed : [];
+      if (failed.length && (body.id === undefined || failed.includes(body.id))) {
+        throw new NodeManagementError(
+          `ComfyUI-Manager batch reported the ${op} of "${String(body.id ?? "?")}" as failed ` +
+            "(check the ComfyUI server log for the underlying error — security_level " +
+            "gating is a common cause).",
+        );
       }
-    } catch (err) {
-      throw annotateLegacyError(err, kind, MANAGER_LEGACY_UI_HINT);
     }
-    return runManagerQueue();
+  } catch (err) {
+    throw annotateLegacyError(err, kind, MANAGER_LEGACY_UI_HINT);
   }
-  await managerFetch("/v2/manager/queue/task", {
-    method: "POST",
-    body: {
-      ui_id: uiId,
-      client_id: MANAGER_CLIENT_ID,
-      kind,
-      params: { ...params, ui_id: uiId },
-    },
-  });
   return runManagerQueue();
 }
 

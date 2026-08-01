@@ -1254,6 +1254,148 @@ describe("node-management service", () => {
     });
   });
 
+  // ── issue #464: unified /v2 task route 405s → negotiate to v2-batch ───────
+  // A build serves the bundled 3.x server under /v2 (queue/status answers), but
+  // its `is_legacy_manager_ui` probe does NOT identify it, so detection defaults
+  // to the "v2" unified dialect. A POST to /v2/manager/queue/task then 405s (the
+  // frontend catchall — the task route is unregistered), which used to surface
+  // as a raw "Manager …/queue/task: HTTP 405" from panel_update_node. The fix
+  // treats that 405 as a method/route signal (like the queue/start POST→GET
+  // negotiation) and downgrades to the v2-batch dialect, retrying via batch.
+  describe("v2 task 405 → v2-batch negotiation (issue #464)", () => {
+    /** Stub a build whose /v2 queue surface answers status but 405s the unified
+     *  task route, with `is_legacy_manager_ui` absent (catchall HTML). */
+    function stub464Fetch(opts: { failed?: unknown[] } = {}) {
+      const calls: Call[] = [];
+      const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+        const method = init?.method ?? "GET";
+        const body = init?.body ? JSON.parse(init.body as string) : undefined;
+        calls.push({ url, method, body });
+        const path = new URL(url).pathname;
+        if (path === "/v2/manager/queue/status") {
+          return jsonResponse({ total_count: 1, done_count: 1, in_progress_count: 0, is_processing: false });
+        }
+        // The `is_legacy_manager_ui` route is unregistered → catchall HTML, so
+        // resolveV2SubDialect can't detect legacy-UI and defaults to "v2".
+        if (path === "/v2/manager/is_legacy_manager_ui") {
+          return new Response("<!doctype html><html>frontend</html>", {
+            status: 200, headers: { "Content-Type": "text/html" },
+          });
+        }
+        if (path === "/v2/manager/queue/task") {
+          // The #464 signature: unified task route unregistered → catchall 405.
+          return new Response("405: Method Not Allowed", { status: 405 });
+        }
+        if (path === "/v2/manager/queue/batch" && method === "POST") {
+          return jsonResponse({ failed: opts.failed ?? [] });
+        }
+        if (path === "/v2/manager/queue/start" && method === "POST") {
+          return new Response("", { status: 200 });
+        }
+        return new Response("", { status: 200 });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      return { calls };
+    }
+
+    it("panel_update_node succeeds via batch when /v2 task 405s (no raw 405 surfaced)", async () => {
+      const { calls } = stub464Fetch();
+      const res = await updateCustomNode({ id: "my-pack" });
+      expect(res.mechanism).toBe("manager-http");
+      // Downgraded to the batch envelope with the 3.x update body …
+      const batch = calls.find((c) => c.url.includes("/v2/manager/queue/batch"));
+      expect(batch).toBeDefined();
+      const payload = batch!.body as Record<string, Array<Record<string, unknown>>>;
+      expect(Object.keys(payload)).toEqual(["update"]);
+      // … after first attempting the unified task route (proving the 405 path ran).
+      expect(calls.some((c) => new URL(c.url).pathname === "/v2/manager/queue/task")).toBe(true);
+      // and still drains the queue.
+      expect(calls.some((c) => c.url.endsWith("/v2/manager/queue/start"))).toBe(true);
+    });
+
+    it("caches the corrected v2-batch dialect (second op skips the dead task route)", async () => {
+      const { calls } = stub464Fetch();
+      await updateCustomNode({ id: "pack-a" });
+      const taskHitsAfterFirst = calls.filter(
+        (c) => new URL(c.url).pathname === "/v2/manager/queue/task",
+      ).length;
+      await updateCustomNode({ id: "pack-b" });
+      const taskHitsTotal = calls.filter(
+        (c) => new URL(c.url).pathname === "/v2/manager/queue/task",
+      ).length;
+      // The second update must NOT re-probe the 405 task route — the dialect is pinned.
+      expect(taskHitsTotal).toBe(taskHitsAfterFirst);
+      expect(calls.filter((c) => c.url.includes("/v2/manager/queue/batch")).length).toBe(2);
+    });
+
+    it("does NOT poison the cache when task 405s but batch also fails — next op re-probes /task", async () => {
+      // A proxy/WAF (or an unusual v4) could 405 /task while /v2 status works but
+      // /batch does not. The failed downgrade must NOT pin "v2-batch" for later
+      // ops. Here batch fails on the first attempt (500) then succeeds on the
+      // second: the second op must still hit /task first (proving the cache was
+      // never poisoned) before succeeding via batch.
+      const calls: Call[] = [];
+      let batchHits = 0;
+      const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+        const method = init?.method ?? "GET";
+        const body = init?.body ? JSON.parse(init.body as string) : undefined;
+        calls.push({ url, method, body });
+        const path = new URL(url).pathname;
+        if (path === "/v2/manager/queue/status") {
+          return jsonResponse({ total_count: 1, done_count: 1, in_progress_count: 0, is_processing: false });
+        }
+        if (path === "/v2/manager/is_legacy_manager_ui") {
+          return new Response("<!doctype html>", { status: 200, headers: { "Content-Type": "text/html" } });
+        }
+        if (path === "/v2/manager/queue/task") {
+          return new Response("405: Method Not Allowed", { status: 405 });
+        }
+        if (path === "/v2/manager/queue/batch" && method === "POST") {
+          batchHits++;
+          return batchHits === 1
+            ? new Response("500: Internal Server Error", { status: 500 })
+            : jsonResponse({ failed: [] });
+        }
+        if (path === "/v2/manager/queue/start" && method === "POST") return new Response("", { status: 200 });
+        return new Response("", { status: 200 });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      // First op: task 405 → batch 500 → throws; cache must stay "v2".
+      await expect(updateCustomNode({ id: "pack-a" })).rejects.toBeInstanceOf(NodeManagementError);
+      const taskAfterFirst = calls.filter((c) => new URL(c.url).pathname === "/v2/manager/queue/task").length;
+      expect(taskAfterFirst).toBeGreaterThan(0);
+      // Second op: because the cache was NOT poisoned, it re-probes /task before batch.
+      const res = await updateCustomNode({ id: "pack-b" });
+      expect(res.mechanism).toBe("manager-http");
+      const taskTotal = calls.filter((c) => new URL(c.url).pathname === "/v2/manager/queue/task").length;
+      expect(taskTotal).toBe(taskAfterFirst + 1);
+    });
+
+    it("leaves a genuine v4 host on the unified task route (405 fallback not triggered)", async () => {
+      const calls: Call[] = [];
+      const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+        const method = init?.method ?? "GET";
+        const body = init?.body ? JSON.parse(init.body as string) : undefined;
+        calls.push({ url, method, body });
+        const path = new URL(url).pathname;
+        if (path === "/v2/manager/queue/status") {
+          return jsonResponse({ total_count: 1, done_count: 1, in_progress_count: 0, pending_count: 0, is_processing: false });
+        }
+        if (path === "/v2/manager/is_legacy_manager_ui") return jsonResponse({ is_legacy_manager_ui: false });
+        if (path === "/v2/manager/queue/task") return new Response("", { status: 200 });
+        if (path === "/v2/manager/queue/start") return new Response("", { status: 200 });
+        return new Response("", { status: 200 });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      await updateCustomNode({ id: "my-pack" });
+      const task = calls.find((c) => new URL(c.url).pathname === "/v2/manager/queue/task");
+      expect(task).toBeDefined();
+      expect((task!.body as { kind?: string }).kind).toBe("update");
+      // Never downgraded to batch on a healthy v4 host.
+      expect(calls.some((c) => c.url.includes("/v2/manager/queue/batch"))).toBe(false);
+    });
+  });
+
   describe("Manager detection hardening (issue #235)", () => {
     it("a 200-HTML SPA fallback on the v2 status probe does NOT detect v2", async () => {
       const calls: Call[] = [];
