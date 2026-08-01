@@ -435,6 +435,86 @@ describe("standalone root precedence — saved default workspace (#648)", () => 
     expect(result.exists).toBe(false);
   });
 
+  // Matrix: root SOURCE x on-disk STATE x OPERATION. Each row sets up the source, then
+  // asserts every operation, so a regression in any single cell is caught (codex round 5).
+  type Source = "explicit-env" | "inferred-detected" | "inferred-descended" | "saved-default";
+
+  /** Point the resolver at `root` as `source`; returns the root. */
+  async function useRoot(source: Source, root: string): Promise<void> {
+    config.comfyuiPath = undefined;
+    delete process.env.COMFYUI_PATH;
+    if (source === "explicit-env") {
+      config.comfyuiPath = root;
+      process.env.COMFYUI_PATH = root;
+    } else if (source === "inferred-detected") {
+      config.comfyuiPath = root; // no env var → startup auto-detection
+    } else if (source === "inferred-descended") {
+      config.comfyuiPath = root; // config.ts descended COMFYUI_PATH to a nested root
+      process.env.COMFYUI_PATH = join(root, "..");
+    } else {
+      await saveDefaultWorkspace(root);
+    }
+  }
+
+  const inferred: Source[] = ["inferred-detected", "inferred-descended", "saved-default"];
+
+  for (const source of inferred) {
+    it(`${source}: a VANISHED root is refused by list, add and remove alike`, async () => {
+      const parent = await trackTmp();
+      const gone = join(parent, "wrapper", "ComfyUI");
+      await useRoot(source, gone);
+
+      await expect(listExtraPaths({ target: "standalone" })).rejects.toThrow(/UNRESOLVED/);
+      await expect(
+        addExtraPath({ target: "standalone", category: "loras", path: "E:/x" }),
+      ).rejects.toThrow(/UNRESOLVED/);
+      await expect(
+        removeExtraPath({ target: "standalone", category: "loras", path: "E:/x" }),
+      ).rejects.toThrow(/UNRESOLVED/);
+      expect(existsSync(join(parent, "wrapper"))).toBe(false);
+    });
+
+    it(`${source}: an EXISTING root round-trips list -> add -> remove`, async () => {
+      const root = await trackTmp();
+      await useRoot(source, root);
+
+      const added = await addExtraPath({
+        target: "standalone",
+        group: "shared",
+        category: "loras",
+        path: "E:/x",
+      });
+      expect(added.changed).toBe(true);
+      expect(added.path).toBe(join(root, "extra_model_paths.yaml"));
+
+      const listed = await listExtraPaths({ target: "standalone" });
+      expect(listed.groups[0].categories).toEqual([{ category: "loras", paths: ["E:/x"] }]);
+
+      const removed = await removeExtraPath({
+        target: "standalone",
+        group: "shared",
+        category: "loras",
+        path: "E:/x",
+      });
+      expect(removed.changed).toBe(true);
+    });
+  }
+
+  it("explicit-env: a VANISHED root is NOT refused, and add still creates it (pre-#648)", async () => {
+    // The deliberate asymmetry: an explicit COMFYUI_PATH is the user naming a root, so it
+    // keeps its pre-#648 create-on-write behavior. Pinned so it cannot drift silently.
+    const parent = await trackTmp();
+    const gone = join(parent, "wrapper", "ComfyUI");
+    await useRoot("explicit-env", gone);
+
+    const listed = await listExtraPaths({ target: "standalone" });
+    expect(listed.exists).toBe(false);
+
+    const added = await addExtraPath({ target: "standalone", category: "loras", path: "E:/x" });
+    expect(added.changed).toBe(true);
+    expect(existsSync(join(gone, "extra_model_paths.yaml"))).toBe(true);
+  });
+
   it("an explicit config_path is honored with no workspace lookup at all", async () => {
     const dir = await trackTmp();
     const explicit = join(dir, "custom.yaml");

@@ -287,7 +287,11 @@ function isExistingDir(p: string): boolean {
 
 type StandaloneRootSource = "comfyui-path-env" | "comfyui-path-inferred" | "default-workspace";
 
-/** Same on-disk location? Normalized, and case-insensitive on Windows. */
+/** Same NORMALIZED LEXICAL path? (`path.resolve` on both, case-folded on win32.) It does
+ *  NOT `realpath`, so 8.3 short names, a symlink vs its target, and UNC vs mapped-drive
+ *  spellings of one share compare FALSE. That is the safe direction: a false negative
+ *  demotes the root from "explicit" to "inferred", which only means it gets the existence
+ *  gate and no `mkdir -p` — over-refusal, never an unguarded write to a wrong root. */
 function samePath(a: string, b: string): boolean {
   try {
     const na = resolve(a);
