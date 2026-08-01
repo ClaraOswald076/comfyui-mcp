@@ -2743,8 +2743,12 @@ export async function runPanelOrchestrator(): Promise<void> {
           // entry, keyed by ITS uuid, stays valid should it ever be restored.)
           manager.reset(key);
           for (const hk of heldGenKeys) heldDuringGen.delete(hk);
+          // Drop the bridge's buffered deliveries (missed frames + render mailbox) for this
+          // tab too — they belong to the PRIOR workflow; the bridge defers its on-hello
+          // replay until AFTER this handler so this purge lands first (#570 P0).
+          bridge.dropQueuedDeliveries(panelTab);
           logger.info(
-            `[panel-orchestrator] tab ${panelTab.slice(0, 8)} per-tab state not provably this workflow's identity — reset the live agent + durable session + render-held queue`,
+            `[panel-orchestrator] tab ${panelTab.slice(0, 8)} per-tab state not provably this workflow's identity — reset the live agent + durable session + render-held queue + buffered deliveries`,
           );
         }
       }

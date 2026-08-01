@@ -1063,10 +1063,17 @@ export class UiBridge {
         } else {
           logger.debug(`[ui-bridge] tab ${tabId.slice(0, 8)} (re)hello`);
         }
-        // Replay anything this tab's agent produced while the tab had no live
-        // connection (its socket was re-helloed to another workflow). The panel
-        // swaps to this workflow's thread synchronously before these frames can be
-        // processed, so they render + record into the RIGHT conversation.
+        // #570 P0 — run the orchestrator's hello handler FIRST. Its identity-boundary reset
+        // can call dropQueuedDeliveries(tabId) on an UNPROVEN workflow transition (a saved
+        // workflow overwritten in place, reconnecting under the same wf:<path>), so the
+        // buffered items below — which belong to the PRIOR workflow — are NOT replayed into
+        // the replacement (a wrong-conversation/media delivery). For a PROVEN reconnect it
+        // drops nothing, so the replay/flush proceeds exactly as before, just after the ack.
+        this.onPanelMessage?.(msg as PanelEvent);
+        // Replay anything this tab's agent produced while the tab had no live connection
+        // (its socket was re-helloed to another workflow). The panel swaps to this
+        // workflow's thread synchronously, so they render + record into the RIGHT
+        // conversation (or nothing, if the reset above dropped them).
         const missed = this.missedFrames.get(tabId);
         if (missed?.length) {
           this.missedFrames.delete(tabId);
@@ -1084,7 +1091,6 @@ export class UiBridge {
         // Resume any idempotent reads that were dropped mid-command by this tab's
         // previous socket (bounded reconnect grace) onto the fresh connection.
         this.resumeAwaitingReconnect(tabId);
-        this.onPanelMessage?.(msg as PanelEvent);
         return;
       }
 
@@ -1518,6 +1524,17 @@ export class UiBridge {
     logger.info(
       `[ui-bridge] mailboxed "${cmd.cmd}" for offline tab ${tabId.slice(0, 8)} (${box.length} queued)`,
     );
+  }
+
+  /** #570 P0 — DROP a tab's buffered deliveries (missed frames + render mailbox) without
+   *  sending them. Called by the orchestrator's identity-boundary reset on an UNPROVEN
+   *  workflow transition (a saved workflow overwritten in place, reconnecting under the same
+   *  wf:<path>): the buffered items belong to the PRIOR workflow, so replaying them into the
+   *  replacement would leak the prior conversation's say/session/stream + media. Runs BEFORE
+   *  the on-hello replay/flush (which is deferred until after onPanelMessage for this reason). */
+  dropQueuedDeliveries(tabId: string): void {
+    this.missedFrames.delete(tabId);
+    this.mailbox.delete(tabId);
   }
 
   /** Deliver any buffered render frames to a tab that just (re)connected, plus a

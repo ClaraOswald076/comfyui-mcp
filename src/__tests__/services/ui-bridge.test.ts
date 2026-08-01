@@ -255,6 +255,27 @@ describe("UiBridge (mailbox — offline render delivery)", () => {
     phone.close();
   });
 
+  it("dropQueuedDeliveries discards buffered frames so a replaced workflow gets nothing (#570 P0)", async () => {
+    // A prior workflow buffered a finished render for an offline tab.
+    const res = await bridge.send(
+      { cmd: "show_media", items: [{ filename: "A-private.png" }] },
+      { tabId: "wf:foo.json" },
+    );
+    expect(res).toMatchObject({ ok: true, mailboxed: true });
+    // The workflow at that path was overwritten in place → the orchestrator's identity
+    // reset drops the buffered deliveries (they belong to the PRIOR workflow).
+    bridge.dropQueuedDeliveries("wf:foo.json");
+    // The replacement reconnects under the SAME tab id → it must receive NOTHING buffered.
+    const got: Array<Record<string, unknown>> = [];
+    const tab = await connectPanel();
+    tab.on("message", (buf) => got.push(JSON.parse(buf.toString())));
+    tab.send(JSON.stringify({ type: "hello", tab_id: "wf:foo.json", title: "workflow-b" }));
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:foo.json")).toBe(true));
+    expect(got.find((m) => m.cmd === "show_media")).toBeUndefined();
+    expect(got.find((m) => m.type === "mailbox_flush")).toBeUndefined();
+    tab.close();
+  });
+
   it("does not mailbox interactive commands (only show_media)", async () => {
     await expect(
       bridge.send({ cmd: "graph_get_state" }, { tabId: "nobody" }),
