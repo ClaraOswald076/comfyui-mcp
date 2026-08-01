@@ -185,6 +185,14 @@ describe("batch tools", () => {
       expect(missing.isError).toBe(true);
       expect(missing.content[0].text).toContain("requires `batch_id`");
     }
+    // …but the guard tests ABSENCE, not falsiness: an empty batch_id passed
+    // z.string() before this consolidation and reached loadBatch(), which rejects
+    // it with its own structured "expected the batch_<uuid> id" error. A `!id`
+    // guard would swallow that error path.
+    const blank = await batch({ action: "status", batch_id: "" });
+    expect(blank.isError).toBe(true);
+    expect(blank.content[0].text).toContain("batch_");
+    expect(blank.content[0].text).not.toContain("requires `batch_id`");
   });
 
   it("DURABILITY: batch_id persisted to disk and valid after a module reload (simulated restart)", async () => {

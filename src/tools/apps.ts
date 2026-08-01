@@ -163,6 +163,13 @@ export function registerAppsTools(server: McpServer): void {
         // app_id is required by four of the five actions but cannot be marked
         // required in a flat schema, so presence is enforced here with the same
         // "which field is missing" report the schema used to give.
+        //
+        // Falsiness rather than `=== undefined` is deliberate HERE (unlike the
+        // batch/snapshot guards, which must let a blank value reach the service's
+        // own structured validation): app_id and registry_url are still .uuid()
+        // and .url() at the schema boundary, which already reject "", and app_id
+        // is interpolated straight into a route — an empty one would silently
+        // address the COLLECTION endpoint instead of an app.
         const requireAppId = (action: string): string => {
           if (!args.app_id) {
             throw new ComfyUIError(

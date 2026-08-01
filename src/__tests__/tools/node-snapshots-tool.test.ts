@@ -112,6 +112,16 @@ describe("node_snapshot action dispatch", () => {
     for (const fn of Object.values(svc)) expect(fn).not.toHaveBeenCalled();
   });
 
+  // The presence guard must test for ABSENCE, not falsiness. `name: ""` passed
+  // z.string() before this consolidation and reached the service, which rejects
+  // blank names with its own structured error — a `!name` guard would silently
+  // replace that error path with generic text.
+  it('action:"restore" with an empty name still reaches the service', async () => {
+    const [{ handler }] = await register();
+    await handler({ action: "restore", name: "" });
+    expect(svc.restoreNodeSnapshot).toHaveBeenCalledWith("");
+  });
+
   // The list branch is the one that does NOT return JSON — it renders prose. That
   // formatting is behaviour a caller reads, so all three shapes are pinned.
   it('action:"list" renders the same text the old tool did', async () => {

@@ -32,8 +32,8 @@ The [Agent Panel](/panel) runs on frontier models beautifully — Claude,
 ChatGPT, Gemini all clear the hardest tasks. But a lot of people running
 ComfyUI have exactly one GPU, and it's busy rendering. The pitch of a **local**
 agent backend is: no account, no API key, no per-token cost, nothing leaves
-your machine. The problem is that small local models meet a 178-tool surface
-(113 MCP tools + 65 live-canvas `panel_*` tools) completely cold, and it
+your machine. The problem is that small local models meet the full tool surface
+(MCP tools plus the live-canvas `panel_*` tools) completely cold, and it
 shows — wrong tool families, malformed arguments, confident narration of
 things that never happened.
 
@@ -107,7 +107,7 @@ router envelope — **without the tool name inside it**. A syntactically shaped
 but semantically empty call, over and over.
 
 The root cause was a mismatch between training and deployment. Compact mode
-doesn't expose 178 tools to a small model directly; it exposes a tiny router
+doesn't expose the whole tool surface to a small model directly; it exposes a tiny router
 surface, and the model invokes everything through a `call_tool` envelope that
 names the underlying tool as an *argument*. The v1 training data, though, was
 written in **direct** tool-call format — `get_system_stats(...)`,

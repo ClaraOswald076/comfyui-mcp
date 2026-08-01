@@ -75,8 +75,14 @@ export function registerBatchTools(server: McpServer): void {
         // The three polling actions all key off batch_id, which the flat schema
         // cannot mark required. Same message the schema used to produce, so a
         // caller that omits it is told exactly what to add.
+        //
+        // ABSENCE only, never falsiness: `batch_id: ""` passed z.string() before
+        // and reached loadBatch(), which rejects it with a structured
+        // ValidationError naming the expected batch_<uuid> shape. A `!batch_id`
+        // guard would replace that with generic text. Only an OMITTED batch_id is
+        // the case the schema used to catch.
         const requireBatchId = (action: string): string => {
-          if (!args.batch_id) {
+          if (args.batch_id === undefined) {
             throw new Error(
               `batch action:"${action}" requires \`batch_id\` — the id returned by action:"submit".`,
             );

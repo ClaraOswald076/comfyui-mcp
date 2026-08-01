@@ -54,7 +54,12 @@ export function registerNodeSnapshotsTools(server: McpServer): void {
             };
           }
           case "restore": {
-            if (!args.name) {
+            // ABSENCE only, never falsiness. `name: ""` passed z.string() before
+            // and reached restoreNodeSnapshot(), which rejects blank names with a
+            // structured NODE_SNAPSHOT_ERROR; a `!name` guard would swallow that
+            // and answer with generic text instead. Only a genuinely OMITTED name
+            // is the case the schema used to catch.
+            if (args.name === undefined) {
               throw new Error(
                 'node_snapshot action:"restore" requires `name` — the snapshot to restore (as shown by action:"list").',
               );
