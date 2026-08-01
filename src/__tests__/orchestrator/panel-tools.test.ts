@@ -1185,6 +1185,83 @@ describe("panel-tools: post-reconnect retry-once (#278/#310/#332/#481)", () => {
     expect((res.content[0] as { text: string }).text).toMatch(/multiple tabs/i);
   });
 
+  // Regression (panel #478): panel_reload's ambiguity guard must invoke isHeadless
+  // THROUGH the bridge, not via a detached `const headless = ctx.bridge.isHeadless`.
+  // The real UiBridge.isHeadless is a plain method that reads `this.conns`; called
+  // unbound its `this` is undefined and it threw "Cannot read properties of undefined
+  // (reading 'conns')", so panel_reload failed outright instead of reloading. The fake
+  // bridges above never set `isHeadless`, so they skipped the filter and never caught
+  // this — this bridge mirrors the real one (method-form isHeadless over `this.conns`).
+  function methodIsHeadlessBridge(liveTabs: string[]) {
+    const sent: Array<{ cmd: Record<string, unknown>; tabId?: string }> = [];
+    const live = new Set(liveTabs);
+    const bridge = {
+      // `conns` + method-form isHeadless: extracting the method and calling it
+      // unbound (the #478 bug) throws on `this.conns`; calling it bound works.
+      conns: new Map<string, { headless?: boolean }>(liveTabs.map((t) => [t, {}])),
+      isHeadless(id: string): boolean {
+        return this.conns.get(id)?.headless === true;
+      },
+      send: async (cmd: Record<string, unknown>, opts?: { tabId?: string }) => {
+        const id = opts?.tabId;
+        if (id && !live.has(id)) throw new Error(`no connected tab with id "${id}". Connected: none`);
+        sent.push({ cmd, tabId: id });
+        return { ok: true, routedTo: id };
+      },
+      push: () => 1,
+      canReach: (id: string) => live.has(id),
+      tabs: () => liveTabs.map((t) => ({ tab_id: t, title: t, connected_at: 0 })),
+      // Mirror the real UiBridge: a sole tab resolves; 2+ throw the ambiguity error
+      // (so a rebind attempt lands in the recovery catch that also filters isHeadless).
+      resolveActiveTabId: () => {
+        if (liveTabs.length === 1) return liveTabs[0];
+        throw new Error("Multiple panel tabs are connected and none is last active — pass tab_id.");
+      },
+    } as unknown as PanelToolCtx["bridge"];
+    return { bridge, sent };
+  }
+
+  it("panel_reload does not crash on a method-form isHeadless bridge (#478 unbound `this.conns`)", async () => {
+    const store = new WorkflowTargetStore();
+    // Two live non-headless tabs + an orphaned session → the ambiguity guard runs the
+    // interactive-tab filter, which is exactly where the unbound isHeadless call sat.
+    const { bridge } = methodIsHeadlessBridge(["a-tab", "b-tab"]);
+    const ctx = makePanelToolCtx(bridge, "dead-session-tab", store);
+    const res = await defByName("panel_reload").handler({}, ctx);
+    // Must reach the clear multi-tab error, NOT throw "reading 'conns'".
+    expect(res.isError).toBe(true);
+    expect((res.content[0] as { text: string }).text).toMatch(/multiple tabs/i);
+    expect((res.content[0] as { text: string }).text).not.toMatch(/conns/i);
+  });
+
+  it("panel_reload rebinds+forwards on a method-form isHeadless bridge with one live tab (#478)", async () => {
+    const store = new WorkflowTargetStore();
+    // Single live tab: the filter still calls isHeadless (must not crash), the session
+    // rebinds onto it, and soft_reload is forwarded there.
+    const { bridge, sent } = methodIsHeadlessBridge(["only-live-tab"]);
+    const ctx = makePanelToolCtx(bridge, "orphaned-tab", store);
+    const res = await defByName("panel_reload").handler({}, ctx);
+    expect(res.isError).toBeUndefined();
+    expect(ctx.tabId).toBe("only-live-tab");
+    expect(sent.at(-1)).toMatchObject({
+      cmd: { cmd: "soft_reload", scope: "orchestrator" },
+      tabId: "only-live-tab",
+    });
+  });
+
+  it("panel_set_workflow_target recovery filters isHeadless bound, not detached (#478 sibling site)", async () => {
+    const store = new WorkflowTargetStore();
+    // Dead session + 2 ambiguous live non-headless tabs → rebindToActiveTab throws, and
+    // the catch's interactive-tab filter runs isHeadless. Detached, it threw "reading
+    // 'conns'"; bound, it counts 2 interactive tabs and returns the clear ambiguity error.
+    const { bridge } = methodIsHeadlessBridge(["a-tab", "b-tab"]);
+    const ctx = makePanelToolCtx(bridge, "dead-session-tab", store);
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    expect(res.isError).toBe(true);
+    expect((res.content[0] as { text: string }).text).not.toMatch(/conns/i);
+    expect((res.content[0] as { text: string }).text).toMatch(/multiple|last active|pass tab_id/i);
+  });
+
   it("a genuinely-gone tab (no reconnect) still fails clearly after the single retry", async () => {
     const store = new WorkflowTargetStore();
     // Nothing ever becomes live — retry can't rebind, so it must surface an error.
