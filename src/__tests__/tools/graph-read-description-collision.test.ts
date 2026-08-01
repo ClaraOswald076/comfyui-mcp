@@ -186,22 +186,49 @@ describe("graph-reading tool descriptions are distinguishable (#557)", () => {
       .filter(([, d]) => NAMES_THE_CANVAS.test(d.slice(0, OPENING)) && OFFERS_TO_SHOW_IT.test(d.slice(0, OPENING)))
       .map(([n]) => n);
 
-  it("actually inspects the tools that compete for the query (the ratchet is not vacuous)", () => {
-    // Guards the SELECTOR, not the surface. Narrow the regexes or the window and this
-    // fails loudly instead of quietly passing over an empty set — which is the failure
-    // mode of every scan-based test, and the one this file already shipped once.
-    const inspected = claimants();
-    for (const known of [
-      "panel_graph_outline",
-      "panel_query_graph",
-      "panel_screenshot",
-      "panel_view_nodes_in_viewport",
-      "panel_find_nodes",
-      "panel_canvas",
-      "visualize_workflow",
-    ]) {
-      expect(inspected, `${known} must be inside the ratchet's window`).toContain(known);
-    }
+  /**
+   * The EXACT set the selector reaches, written down.
+   *
+   * A "must contain these N" guard was the previous version and it was not enough:
+   * it pinned 7 of 18, so any of the other 11 could be reworded out of scope with
+   * every test still green — the same silent-shrink failure twice removed. An exact
+   * set means a tool ENTERING scope must be classified (exempt with a reason, or made
+   * to point at panel_graph_outline) and a tool LEAVING scope must be noticed.
+   *
+   * Yes, this fails when an unrelated description is reworded near these words. That
+   * is the intended cost: the failure is one line to re-sort, and the alternative is a
+   * scan that quietly stops scanning.
+   */
+  const EXPECTED_CLAIMANTS = [
+    "analyze_workflow",
+    "diagnose_run",
+    "panel_canvas",
+    "panel_enter_subgraph",
+    "panel_find_nodes",
+    "panel_get_subgraph",
+    "panel_get_workflow_target",
+    "panel_graph_outline",
+    "panel_list_subgraphs",
+    "panel_load_workflow",
+    "panel_open_workflow",
+    "panel_query_graph",
+    "panel_run",
+    "panel_screenshot",
+    "panel_strip_workflow",
+    "panel_view_nodes_in_viewport",
+    "query_workflow",
+    "visualize_workflow",
+    "visualize_workflow_hierarchical",
+  ];
+
+  it("reaches exactly the tools it is documented to reach (the ratchet is not vacuous)", () => {
+    expect(
+      [...claimants()].sort(),
+      "the set of descriptions that mention looking at the canvas changed. If a tool " +
+        "ENTERED, decide whether it competes for 'show me the canvas' — point it at " +
+        "panel_graph_outline, or exempt it in NOT_A_CANVAS_READ with a reason. If one LEFT, " +
+        "check it did not simply drift out of the window while still competing.",
+    ).toEqual([...EXPECTED_CLAIMANTS].sort());
   });
 
   /**
