@@ -6,6 +6,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.48.32] - 2026-08-01
+
+### MCP
+
+#### Added
+- add panel_set_property MCP tool (#488) (#634)
+
+#### Fixed
+- resume — X-Linked-Etag false-changed across hops deleted valid partial (#467) (#637)
+- bound the restart-confirmation card wait (panel #404) (#635)
+- never file/PR under an ambient gh account unprompted — Worker is the autonomous default (project identity); gh path requires account-awareness + explicit consent (#632)
+
+
 ## [0.48.31] - 2026-08-01
 
 ### MCP
