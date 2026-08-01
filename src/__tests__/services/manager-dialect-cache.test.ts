@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as perfHooks from "node:perf_hooks";
 
 // Regression for #646: detectManagerApi() cached the detected ComfyUI-Manager
 // wire dialect keyed ONLY by base URL, for the whole process lifetime. After the
@@ -159,16 +160,29 @@ const downloadAModel = () =>
     type: "checkpoints",
   });
 
-// A controllable clock: the TTL and the queue-drain loop both read Date.now(),
-// and real timers must keep working (the drain sleeps), so shift Date.now by an
-// offset instead of switching to fake timers.
-let clockOffset = 0;
+// Controllable clocks. The freshness window is measured on the MONOTONIC clock
+// (performance.now) while the queue-drain loop reads the wall clock (Date.now),
+// and real timers must keep working (the drain sleeps) — so shift both sources by
+// their own offset rather than switching to fake timers. Keeping them separate is
+// what lets a test step the WALL clock backward while real time keeps elapsing.
+let monotonicOffset = 0;
+let wallOffset = 0;
 const realNow = Date.now;
+const realPerfNow = perfHooks.performance.now.bind(perfHooks.performance);
+/** Real time passes (both clocks advance together). */
+const elapse = (ms: number): void => {
+  monotonicOffset += ms;
+  wallOffset += ms;
+};
 
 describe("#646 Manager API dialect cache invalidation", () => {
   beforeEach(() => {
-    clockOffset = 0;
-    vi.spyOn(Date, "now").mockImplementation(() => realNow() + clockOffset);
+    monotonicOffset = 0;
+    wallOffset = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => realNow() + wallOffset);
+    vi.spyOn(perfHooks.performance, "now").mockImplementation(
+      () => realPerfNow() + monotonicOffset,
+    );
     resetManagerApiCacheForTests();
     setQueueTimingForTests({ pollIntervalMs: 1, startupGraceMs: 0, timeoutMs: 5000 });
   });
@@ -211,7 +225,7 @@ describe("#646 Manager API dialect cache invalidation", () => {
     await downloadAModel();
     expect(detections(calls)).toBe(1);
 
-    clockOffset += 4_000; // still inside the 5 s window
+    elapse(4_000); // still inside the 5 s window
     await downloadAModel();
     expect(detections(calls)).toBe(1);
   });
@@ -226,7 +240,7 @@ describe("#646 Manager API dialect cache invalidation", () => {
     // The user restarts ComfyUI themselves after upgrading Manager: nothing in
     // this process observed it, so no explicit invalidation ever fires.
     persona = "v4";
-    clockOffset += 6_000; // > the 5 s TTL
+    elapse(6_000); // > the 5 s TTL
 
     await downloadAModel();
     // Re-probed and routed to the unified v4 envelope on the FIRST attempt —
@@ -236,20 +250,39 @@ describe("#646 Manager API dialect cache invalidation", () => {
     expect(countOf(calls, "/v2/manager/queue/install_model")).toBe(1);
   });
 
-  it("treats a backward clock jump as expired (a rollback can't extend the window)", async () => {
+  it("a backward wall-clock step neither extends nor resurrects the window", async () => {
     let persona: Persona = "v2-batch";
     const calls = stubServer({ persona: () => persona });
 
     await downloadAModel();
     expect(detections(calls)).toBe(1);
 
+    // The wall clock is stepped BACK an hour (NTP step / VM snapshot restore)
+    // while real time keeps running. Wall-clock arithmetic would read the age as
+    // hugely negative here and, worse, read it as ~0 ("fresh") again once wall
+    // time caught back up — so a Date.now()-based window could serve the
+    // pre-restart dialect for another full TTL after a real restart.
+    wallOffset -= 3_600_000;
     persona = "v4";
-    clockOffset -= 3_600_000; // NTP step / VM snapshot restore, an hour backward
 
+    // Only 4 s of REAL time has passed: still inside the window, still cached.
+    elapse(4_000);
+    expect(getCachedManagerApi(BASE)).toBe("v2-batch");
+
+    // Past the window in REAL time — expired regardless of where the wall clock
+    // sits, and the next call re-probes and speaks the live dialect.
+    elapse(2_000);
+    expect(getCachedManagerApi(BASE)).toBeUndefined();
     await downloadAModel();
-    // A raw Date.now() age would go negative and read "fresh" for an hour.
     expect(detections(calls)).toBe(2);
     expect(countOf(calls, "/v2/manager/queue/task")).toBe(1);
+
+    // And the wall clock catching back up cannot revive the (already re-stamped)
+    // entry: freshness never depends on wall-clock arithmetic.
+    wallOffset += 3_600_000;
+    expect(getCachedManagerApi(BASE)).toBe("v2");
+    elapse(6_000);
+    expect(getCachedManagerApi(BASE)).toBeUndefined();
   });
 
   it("self-heals a stale entry: one re-detect, one retry, no duplicate enqueue", async () => {

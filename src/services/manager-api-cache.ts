@@ -1,3 +1,4 @@
+import { performance } from "node:perf_hooks";
 import { logger } from "../utils/logger.js";
 
 // ---------------------------------------------------------------------------
@@ -65,6 +66,18 @@ const MANAGER_API_TTL_MS = (() => {
   return Number.isFinite(n) && n >= 0 ? n : 60_000;
 })();
 
+/**
+ * Elapsed-time source for the freshness window. MONOTONIC on purpose: a wall
+ * clock can be stepped in either direction (NTP correction, VM snapshot restore,
+ * a manual fix), and Date.now() arithmetic then misreports how much real time has
+ * passed — a backward step can make an already-expired entry read as fresh again
+ * once wall time catches back up to the stamp. performance.now() only ever moves
+ * forward, so the window always measures actual elapsed time.
+ */
+function monotonicNow(): number {
+  return performance.now();
+}
+
 let cache: { base: string; api: ManagerApi; at: number } | null = null;
 
 /**
@@ -86,15 +99,15 @@ export function managerApiEpoch(): number {
  * detected against a different base URL, or it has aged out of the freshness
  * window.
  *
- * A NEGATIVE age (the system clock stepped backward: NTP correction, VM
- * snapshot restore) counts as EXPIRED rather than fresh — otherwise a one-hour
- * rollback would silently extend a 60s TTL by an hour and keep a stale dialect
- * pinned well past the intended window (#528 review). The re-detect that follows
- * re-stamps `at` against the corrected clock, so normal caching resumes at once.
+ * Age is measured on the MONOTONIC clock (see monotonicNow), so stepping the
+ * system clock — in either direction — can neither extend the window nor
+ * resurrect an entry that has already aged out. The `age >= 0` check is kept as a
+ * defensive floor: a monotonic source cannot produce a negative age, and if one
+ * ever appeared the safe reading is EXPIRED, not fresh (#528 review).
  */
 export function getCachedManagerApi(base: string): ManagerApi | undefined {
   if (!cache || cache.base !== base) return undefined;
-  const age = Date.now() - cache.at;
+  const age = monotonicNow() - cache.at;
   if (age >= 0 && age < MANAGER_API_TTL_MS) return cache.api;
   logger.debug("Manager API dialect cache expired — re-probing", {
     base,
@@ -121,7 +134,7 @@ export function cacheManagerApi(base: string, api: ManagerApi, startEpoch?: numb
     });
     return;
   }
-  cache = { base, api, at: Date.now() };
+  cache = { base, api, at: monotonicNow() };
 }
 
 /**
