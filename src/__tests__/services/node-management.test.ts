@@ -28,6 +28,35 @@ vi.mock("../../config.js", () => {
     getComfyUIBaseUrl: () =>
       `${config.comfyuiSsl ? "https" : "http"}://${config.comfyuiHost}:${config.resolvedPort}`,
     getComfyUIAuthHeaders: () => ({}),
+    isLoopbackHost: (host: string | undefined) =>
+      !host || ["127.0.0.1", "::1", "localhost", "0.0.0.0", "::"].includes(host.toLowerCase().replace(/^\[|\]$/g, "")),
+    isForceRemoteFlagSet: () => remoteFlags.forceRemote,
+    isRemoteMode: () => remoteFlags.remoteMode,
+  };
+});
+
+// ── Scenario scaffolding for the Manager self-update tests (#424). The product
+// deliberately does NOT consult either of these: when the Manager's self-update
+// route 405s it refuses outright rather than git-pulling a checkout on THIS
+// machine, because no HTTP-observable signal can prove that checkout is the one
+// the connected server loaded. These knobs let the suite spell out each
+// wrong-target configuration a previous revision was fooled by, and assert that
+// every one of them still refuses and never shells out to git — so reintroducing
+// a "but this one looks local enough" pull fails the suite.
+
+/** --force-remote / remote-target classification (config mock reads these). */
+const remoteFlags = vi.hoisted(() => ({ forceRemote: false, remoteMode: false }));
+
+/** The LIVE server's own install root, as /system_stats argv would report it. */
+const liveRoot = vi.hoisted(() => ({ value: undefined as string | undefined }));
+
+vi.mock("../../services/workspace-env.js", async () => {
+  const actual = await vi.importActual<
+    typeof import("../../services/workspace-env.js")
+  >("../../services/workspace-env.js");
+  return {
+    ...actual,
+    resolveLiveComfyUIBase: async () => liveRoot.value,
   };
 });
 
@@ -155,6 +184,14 @@ describe("node-management service", () => {
     mockedExists.mockReturnValue(true);
     config.comfyuiPath = "/fake/comfy";
     config.githubToken = undefined;
+    remoteFlags.forceRemote = false;
+    remoteFlags.remoteMode = false;
+    // Default fixture: the LIVE server reports the SAME root as config.comfyuiPath.
+    // This grants NOTHING — it is inert scenario scaffolding. The self-update path
+    // does not consult it, and under exactly this state an enqueue 405 still refuses
+    // and never touches the checkout. It exists so the suite can prove that even the
+    // most local-looking configuration is refused, not to model permission.
+    liveRoot.value = "/fake/comfy";
     // Each test re-detects the Manager API generation against its own stub
     // (the v2 stubs answer /v2/manager/queue/status → detect "v2").
     resetManagerApiCacheForTests();
@@ -1022,7 +1059,9 @@ describe("node-management service", () => {
   describe("legacy Manager 3.x API", () => {
     /** Stub where every /v2 route 405s (like released Manager 3.41) and the
      *  legacy per-operation routes answer. */
-    function stubLegacyFetch(opts: { installedBody?: unknown } = {}) {
+    function stubLegacyFetch(
+      opts: { installedBody?: unknown; update405?: boolean; start405?: boolean } = {},
+    ) {
       const calls: Call[] = [];
       const fetchMock = vi.fn(
         async (url: string, init?: RequestInit): Promise<Response> => {
@@ -1031,6 +1070,16 @@ describe("node-management service", () => {
           calls.push({ url, method, body });
           const path = new URL(url).pathname;
           if (path.startsWith("/v2/")) {
+            return new Response("405: Method Not Allowed", { status: 405 });
+          }
+          // A build that does NOT register the per-operation update route: the
+          // ComfyUI frontend catchall answers the unregistered POST with 405.
+          if (opts.update405 && path === "/manager/queue/update" && method === "POST") {
+            return new Response("405: Method Not Allowed", { status: 405 });
+          }
+          // A queue-control 405 on BOTH methods (the POST→GET negotiation also
+          // fails) — a DRAIN failure, not an "operation route missing" signal.
+          if (opts.start405 && path === "/manager/queue/start") {
             return new Response("405: Method Not Allowed", { status: 405 });
           }
           if (path === "/manager/queue/status") {
@@ -1130,35 +1179,138 @@ describe("node-management service", () => {
       expect(probes.length).toBe(1);
     });
 
-    // ── #424: updating ComfyUI-Manager ITSELF on legacy 3.x can't go through the
-    // queue (it 405s the self-update route) → git-pull the local checkout instead.
-    it("update of comfyui-manager self falls back to a local git pull (never the queue)", async () => {
+    // ── #424: updating ComfyUI-Manager ITSELF. The released 3.x DOES support it
+    // through its ordinary per-operation route (POST /manager/queue/update with
+    // id=comfyui-manager — manager_core.unified_update has no self guard, and
+    // /manager/queue/update_all enqueues 'comfyui-manager' itself). The original
+    // 405 came from posting the v4-only …/queue/task envelope at a 3.x server.
+    // So the legacy self-update must ROUTE to the real endpoint, and only fall
+    // back when THAT endpoint is genuinely unregistered (405).
+    it("routes legacy self-update to POST /manager/queue/update (no git-pull bypass)", async () => {
       const { calls } = stubLegacyFetch();
-      mockedExists.mockReturnValue(true); // custom_nodes/ComfyUI-Manager/.git present
+      mockedExists.mockReturnValue(true); // a local checkout exists but must NOT be used
       mockedExec.mockReturnValue("Already up to date." as unknown as Buffer);
 
       const res = await updateCustomNode({ id: "comfyui-manager" });
 
-      expect(res.mechanism).toBe("git-clone");
-      // A git pull of the Manager checkout was run …
-      const pull = mockedExec.mock.calls.find(
-        ([bin, args]) =>
-          bin === "git" && Array.isArray(args) && args.includes("pull"),
-      );
-      expect(pull).toBeDefined();
-      // … and the Manager queue update route was NEVER touched.
-      expect(legacyCallTo(calls, "/manager/queue/update")).toBeUndefined();
+      expect(res.mechanism).toBe("manager-http");
+      const update = legacyCallTo(calls, "/manager/queue/update");
+      expect(update?.method).toBe("POST");
+      expect(update?.body).toMatchObject({ id: "comfyui-manager" });
+      // The v4-only unified task route (the #424 405 source) is never touched.
+      expect(legacyCallTo(calls, "/v2/manager/queue/task")).toBeUndefined();
+      // NOTHING was shelled out — the Manager's own API did the work. Asserted on
+      // the mock as a whole, not on an executable NAME: a check for the literal
+      // "git" would wave through execFileSync("git.exe", [...]) on Windows, which
+      // is exactly the platform this bug was reported on.
+      expect(mockedExec).not.toHaveBeenCalled();
+      // …and the result does NOT claim a verified update (a drained 3.x queue
+      // proves nothing) — it tells the user to restart and confirm.
+      expect(res.message).toMatch(/restart/i);
+      expect(res.message).not.toMatch(/^Updated /);
     });
 
-    it("update of Manager self with NO local checkout errors actionably (no queue call)", async () => {
+    it("third-party pack update is unchanged by the self-update routing", async () => {
       const { calls } = stubLegacyFetch();
-      mockedExists.mockReturnValue(false); // no on-disk ComfyUI-Manager checkout
-
-      await expect(updateCustomNode({ id: "ComfyUI-Manager" })).rejects.toThrow(
-        /pip install -U comfyui_manager|git pull/i,
-      );
-      expect(legacyCallTo(calls, "/manager/queue/update")).toBeUndefined();
+      mockedExists.mockReturnValue(true);
+      const res = await updateCustomNode({ id: "rgthree-comfy" });
+      expect(res.mechanism).toBe("manager-http");
+      expect(legacyCallTo(calls, "/manager/queue/update")?.body).toMatchObject({
+        id: "rgthree-comfy",
+      });
+      expect(res.message).toMatch(/Queued \+ updated "rgthree-comfy"/);
+      expect(mockedExec).not.toHaveBeenCalled();
     });
+
+    // ── When the update route is genuinely unregistered (405), the ONLY outcome
+    // is the explicit "not supported / NOTHING WAS UPDATED" error. There is no
+    // local-git fallback: comfyui-mcp cannot prove that a checkout on ITS machine
+    // is the one the connected server loaded (loopback can be a container or an
+    // SSH port-forward), and pulling the wrong copy would report a fix that never
+    // reached the user's ComfyUI. Each config below is a wrong-target trap that a
+    // previous revision fell into — all must refuse, and none may run git.
+    it.each([
+      [
+        "loopback host whose live root MATCHES comfyuiPath",
+        () => {
+          liveRoot.value = "/fake/comfy";
+        },
+      ],
+      [
+        "--force-remote over a forwarded loopback port (server is on another machine)",
+        () => {
+          remoteFlags.forceRemote = true;
+          liveRoot.value = "/fake/comfy";
+        },
+      ],
+      [
+        "a second local instance whose live root differs from comfyuiPath",
+        () => {
+          liveRoot.value = "/other/comfy";
+        },
+      ],
+      [
+        "a server that won't say where it lives (unreachable / argv-less)",
+        () => {
+          liveRoot.value = undefined;
+        },
+      ],
+      [
+        "a loopback CONTAINER reporting a root string that also exists on the host",
+        () => {
+          // Same path string, different filesystem namespace — indistinguishable
+          // over HTTP, which is exactly why no pull is attempted at all.
+          liveRoot.value = "/fake/comfy";
+          mockedExists.mockReturnValue(true);
+        },
+      ],
+    ])("self-update 405 refuses explicitly and shells out to NOTHING — %s", async (_name, setup) => {
+      const { calls } = stubLegacyFetch({ update405: true });
+      mockedExists.mockReturnValue(true); // a real-looking local checkout exists
+      setup();
+
+      await expect(updateCustomNode({ id: "comfyui-manager" })).rejects.toThrow(
+        /not supported by the LEGACY ComfyUI-Manager 3\.x queue API[\s\S]*NOTHING WAS UPDATED[\s\S]*pip install -U comfyui_manager/i,
+      );
+      // The real endpoint was still tried first — that's what proves it's a 405.
+      expect(legacyCallTo(calls, "/manager/queue/update")).toBeDefined();
+      // NO subprocess ran at all — not a pull, not a rev-parse probe, nothing.
+      // Asserted on the mock as a whole rather than on an executable NAME: a check
+      // for the literal "git" would wave through execFileSync("git.exe", [...]),
+      // which is valid on Windows — the very platform this bug was reported on —
+      // so a reintroduced fallback could pull the local checkout and still pass.
+      expect(mockedExec).not.toHaveBeenCalled();
+    });
+
+    it("self-update 405 on a REMOTE host also refuses (never touches a local clone)", async () => {
+      const original = config.comfyuiHost;
+      config.comfyuiHost = "10.0.0.5"; // remote ComfyUI; comfyuiPath is a LOCAL path
+      try {
+        stubLegacyFetch({ update405: true });
+        mockedExists.mockReturnValue(true); // a local clone exists — wrong machine
+        await expect(updateCustomNode({ id: "comfyui-manager" })).rejects.toThrow(
+          /NOTHING WAS UPDATED/,
+        );
+        expect(mockedExec).not.toHaveBeenCalled();
+      } finally {
+        config.comfyuiHost = original;
+      }
+    });
+
+    it("a queue/start 405 during the DRAIN is not reported as a missing update route", async () => {
+      // codex review: only the ENQUEUE 405 means "this build doesn't register the
+      // update route". A 405 from the queue-control route (start) is a drain
+      // failure and must surface as itself, NOT as the unsupported verdict.
+      stubLegacyFetch({ start405: true }); // update route answers 200; start 405s
+      mockedExists.mockReturnValue(true);
+
+      const err = await updateCustomNode({ id: "comfyui-manager" }).catch((e: Error) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).message).toMatch(/405/);
+      expect((err as Error).message).not.toMatch(/NOTHING WAS UPDATED/);
+      expect(mockedExec).not.toHaveBeenCalled();
+    });
+
   });
 
   // ── issue #235: pip Manager in legacy-UI mode = the "v2-batch" dialect ────
