@@ -78,6 +78,16 @@ vi.mock("node:fs", () => ({
   existsSync: vi.fn(() => true),
 }));
 
+// The mutation entry points now consult the panel version pin (panel-pin-guard),
+// because the panel is an ordinary node pack and `id="all"` would otherwise move
+// a pinned panel. This suite is not about pinning, and its `node:fs` mock is
+// deliberately partial — `existsSync` answers true for everything, so the pin
+// store would look present-but-unreadable and fail closed (correct in
+// production, a false positive here). Use the documented env escape hatch to say
+// plainly "no pin in this suite" rather than reshaping the fs mock, which
+// individual tests reconfigure for their own purposes.
+process.env.COMFYUI_MCP_PANEL_PIN = "off";
+
 import { join, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";

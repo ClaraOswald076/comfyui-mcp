@@ -198,15 +198,21 @@ function normalizePinVersion(raw: unknown): string | undefined {
  */
 export function getPanelPinState(env: NodeJS.ProcessEnv = process.env): PanelPinState {
   const rawEnv = env[PANEL_PIN_ENV_VAR];
-  if (typeof rawEnv === "string" && rawEnv.trim().length > 0) {
+  // PRESENCE, not truthiness-after-trim. A whitespace-only value ("   ") is a
+  // SET variable we cannot interpret; trimming first and falling through made it
+  // resolve `unpinned` and let the mutation proceed — the same present-but-
+  // unreadable fail-open as the settings file. An EMPTY value is treated as
+  // unset, which is the ordinary meaning of `FOO=` and of an unset dotenv key.
+  if (typeof rawEnv === "string" && rawEnv.length > 0) {
     const trimmed = rawEnv.trim();
     if (PIN_ENV_OFF.has(trimmed.toLowerCase())) {
+      // The explicit no-pin escape hatch, and the ONLY way an env value clears.
       return { pinned: false, source: "none" };
     }
     const version = normalizePinVersion(trimmed);
     if (version) return { pinned: true, version, source: "env" };
-    // Present but unusable — we cannot tell what the user meant, so we do NOT
-    // fall through to "unpinned".
+    // Present but unusable (whitespace-only, or junk) — we cannot tell what the
+    // user meant, so we do NOT fall through to "unpinned".
     return { pinned: true, source: "env", indeterminate: true };
   }
 

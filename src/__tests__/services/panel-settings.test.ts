@@ -188,6 +188,49 @@ describe("panel version pin", () => {
     });
   });
 
+  it.each(["   ", "\t", " \n "])(
+    "a WHITESPACE-ONLY env value (%j) reads as PINNED-indeterminate, never unpinned",
+    (value) => {
+      // The trap: trimming first made a SET variable look absent, so it fell
+      // through to the JSON store and resolved unpinned — the same
+      // present-but-unreadable fail-open as a corrupt settings file.
+      expect(getPanelPinState({ [PANEL_PIN_ENV_VAR]: value })).toMatchObject({
+        pinned: true,
+        source: "env",
+        indeterminate: true,
+      });
+    },
+  );
+
+  it.each(["not-a-version", "0.11", "??"])(
+    "a non-empty env value (%j) pins as given — the pin is a label, not a parsed version",
+    (value) => {
+      // Deliberate: pins are only ever compared for equality and shown to the
+      // user, never parsed. What matters is that a set value never resolves
+      // UNPINNED, whatever it says.
+      expect(getPanelPinState({ [PANEL_PIN_ENV_VAR]: value })).toMatchObject({
+        pinned: true,
+        source: "env",
+        version: value,
+      });
+    },
+  );
+
+  it("a whitespace-padded env pin still resolves to the trimmed version", () => {
+    expect(getPanelPinState({ [PANEL_PIN_ENV_VAR]: "  0.11.20  " })).toMatchObject({
+      pinned: true,
+      version: "0.11.20",
+      source: "env",
+    });
+  });
+
+  it("an EMPTY env value means unset, the ordinary meaning of FOO=", () => {
+    expect(getPanelPinState({ [PANEL_PIN_ENV_VAR]: "" })).toEqual({
+      pinned: false,
+      source: "none",
+    });
+  });
+
   it("an env 'off' explicitly overrides a persisted pin", () => {
     setPanelVersionPin("0.11.20");
     for (const off of ["off", "none", "0", "false", "UNPINNED"]) {

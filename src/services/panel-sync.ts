@@ -50,6 +50,14 @@ import { compareSemver, detectInstallMode } from "./self-update.js";
  * than a hand-rolled approximation: a looser local regex admitted `01.11.28`
  * (leading zero) and `0.11.28+.` (empty build identifier), which compareSemver
  * then read as satisfying 0.11.28.
+ *
+ * ONE DELIBERATE DEVIATION from the spec grammar: that regex allows an optional
+ * leading `v` (`v0.11.28`). We KEEP it rather than reject it. A `v`-prefixed
+ * version is unambiguous, `compareSemver` parses it correctly, and the panel's
+ * pyproject version is the source here — so rejecting it would call a perfectly
+ * meaningful version "unknown" and refuse a sync the user actually wants. The
+ * screen is about telling a real version from `nightly`/`dev`/garbage, and `v`
+ * does not blur that line.
  */
 
 function isComparableVersion(v: string | undefined): v is string {
@@ -456,6 +464,18 @@ export async function performPanelSync(
         `(${after.shadows.map((s) => `"${s.name}"`).join(", ")}) are still served from ` +
         `custom_nodes, so the browser may keep loading the OLD panel. NOT reporting a ` +
         `completed sync: move them out of custom_nodes and hard-refresh the ComfyUI tab.`,
+    );
+  }
+  // A shadow scan that could not RUN is not a clean scan. `shadows: []` from a
+  // failed enumeration would otherwise read as an all-clear here exactly as it
+  // did in the pre-mutation assessment — the same fail-open, one step later.
+  if (after.shadowInspectFailed) {
+    throw new Error(
+      `Panel ${action} applied on disk (now ${after.installedVersion}), but custom_nodes ` +
+        `could not be enumerated afterwards to check for shadow copies, so it cannot be ` +
+        `confirmed that the browser will load THIS panel rather than a stray ` +
+        `".comfyui-agent-panel.bak-*". NOT reporting a completed sync — re-run ` +
+        `install_panel(action='status') once custom_nodes is readable.`,
     );
   }
 

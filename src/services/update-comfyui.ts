@@ -7,6 +7,7 @@ import { resolveInstallInterpreter } from "./workspace-env.js";
 import { queueUpdateAllCustomNodes } from "./node-management.js";
 import { ProcessControlError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
+import { assertPanelPinAllows } from "./panel-pin-guard.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -206,6 +207,11 @@ export async function updateComfyUICore(): Promise<UpdateCoreResult> {
  * then POST <same prefix>/start to kick the worker.
  */
 export async function updateAllCustomNodes(): Promise<UpdateNodesResult> {
+  // PIN GUARD — "update everything" includes the sidebar panel pack, so this is
+  // one of the doors into a pinned panel that does NOT pass through
+  // install_panel/runPanelAction. See panel-pin-guard.ts.
+  assertPanelPinAllows("update", "all");
+
   const result = await queueUpdateAllCustomNodes();
 
   return {

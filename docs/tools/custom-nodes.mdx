@@ -64,7 +64,7 @@ Get full details for one ComfyUI custom node pack from the public ComfyUI Regist
 
 ## install_custom_node
 
-Install a ComfyUI custom node pack by registry id, git URL, or name. Local installs prefer official comfy-cli when available; remote or CLI-unavailable installs use the ComfyUI-Manager HTTP API. A ComfyUI restart may be required.
+Install a ComfyUI custom node pack by registry id, git URL, or name. Local installs prefer official comfy-cli when available; remote or CLI-unavailable installs use the ComfyUI-Manager HTTP API. A ComfyUI restart may be required. Targeting the comfyui-mcp sidebar panel pack ('comfyui-agent-panel' / 'comfyui-mcp-panel') is routed through the verified install_panel path (the version is re-read from disk afterwards) and is REFUSED while the panel is version-pinned.
 
 ### Parameters
 
@@ -107,7 +107,7 @@ Install a ComfyUI custom node pack by registry id, git URL, or name. Local insta
 
 ## update_custom_node
 
-Update an installed ComfyUI custom node pack, or pass 'all' to update every installed pack. Local operations prefer official comfy-cli; remote operations use Manager HTTP.
+Update an installed ComfyUI custom node pack, or pass 'all' to update every installed pack. Local operations prefer official comfy-cli; remote operations use Manager HTTP. Targeting the comfyui-mcp sidebar panel pack ('comfyui-agent-panel' / 'comfyui-mcp-panel') is routed through the verified install_panel path (the version is re-read from disk afterwards). While the panel is version-pinned, BOTH a direct panel target and 'all' are REFUSED — 'all' would move the pinned panel too; clear the pin with install_panel(action='unpin') or update other packs individually.
 
 ### Parameters
 
@@ -141,7 +141,7 @@ Update an installed ComfyUI custom node pack, or pass 'all' to update every inst
 
 ## reinstall_custom_node
 
-Reinstall a ComfyUI custom node pack. Local operations prefer official comfy-cli; remote operations use Manager HTTP. A ComfyUI restart may be required.
+Reinstall a ComfyUI custom node pack. Local operations prefer official comfy-cli; remote operations use Manager HTTP. A ComfyUI restart may be required. Targeting the comfyui-mcp sidebar panel pack ('comfyui-agent-panel' / 'comfyui-mcp-panel') is routed through the verified install_panel path (the version is re-read from disk afterwards) and is REFUSED while the panel is version-pinned.
 
 ### Parameters
 

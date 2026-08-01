@@ -12,6 +12,49 @@ import {
 } from "../services/node-management.js";
 import { errorToToolResult } from "../utils/errors.js";
 import { getComfyCliVersion, resolveComfyCliExecutable, shouldUseComfyCli } from "../services/comfy-cli.js";
+import { targetsPanelPackExactly } from "../services/panel-pin-guard.js";
+import { runPanelAction } from "../services/panel-installer.js";
+
+/**
+ * The sidebar panel pack is an ordinary custom node pack, so `install_custom_node`
+ * / `update_custom_node` / `reinstall_custom_node` can target it by id. The
+ * generic services report success straight off the ComfyUI-Manager queue result,
+ * which a stale Manager 3.x drains WITHOUT doing any work (#639) — and they know
+ * nothing about `.bak` shadow copies (#641). Reaching the panel through them
+ * would therefore reintroduce both bugs through a side door.
+ *
+ * So a call that names the panel is REDIRECTED into the verified path, which
+ * re-reads the pack from disk and fails closed unless it provably moved. (The pin
+ * is enforced deeper still, in the services themselves — see panel-pin-guard.ts —
+ * so bulk targets like "all" are covered even though they cannot be redirected.)
+ */
+async function runVerifiedPanelAction(
+  action: "install" | "update" | "reinstall",
+  id: string,
+) {
+  const result = await runPanelAction(action);
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(
+          {
+            ...result,
+            routedVia: "install_panel",
+            note:
+              `"${id}" is the comfyui-mcp sidebar panel pack, so this ${action} ran ` +
+              `through the verified panel path: the version above was RE-READ from ` +
+              `disk after the operation, and a Manager no-op or a shadow copy would ` +
+              `have failed instead of reporting success. Use install_panel directly ` +
+              `for status/sync/pin.`,
+          },
+          null,
+          2,
+        ),
+      },
+    ],
+  };
+}
 
 /** Graceful "not supported remotely" tool result (no isError), matching the
  *  degrade-don't-throw pattern list_local_models uses. */
@@ -71,7 +114,7 @@ function formatInstalledNodes(nodes: InstalledNode[]): string {
 export function registerNodeManagementTools(server: McpServer): void {
   server.tool(
     "install_custom_node",
-    "Install a ComfyUI custom node pack by registry id, git URL, or name. Local installs prefer official comfy-cli when available; remote or CLI-unavailable installs use the ComfyUI-Manager HTTP API. A ComfyUI restart may be required.",
+    "Install a ComfyUI custom node pack by registry id, git URL, or name. Local installs prefer official comfy-cli when available; remote or CLI-unavailable installs use the ComfyUI-Manager HTTP API. A ComfyUI restart may be required. Targeting the comfyui-mcp sidebar panel pack ('comfyui-agent-panel' / 'comfyui-mcp-panel') is routed through the verified install_panel path (the version is re-read from disk afterwards) and is REFUSED while the panel is version-pinned.",
     {
       id: z
         .string()
@@ -100,6 +143,9 @@ export function registerNodeManagementTools(server: McpServer): void {
     },
     async (args) => {
       try {
+        if (targetsPanelPackExactly(args.id)) {
+          return await runVerifiedPanelAction("install", args.id);
+        }
         const result = await installCustomNode({ ...args, useCmCli: preferLocalComfyCli(args.useCmCli) });
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
@@ -112,7 +158,7 @@ export function registerNodeManagementTools(server: McpServer): void {
 
   server.tool(
     "update_custom_node",
-    "Update an installed ComfyUI custom node pack, or pass 'all' to update every installed pack. Local operations prefer official comfy-cli; remote operations use Manager HTTP.",
+    "Update an installed ComfyUI custom node pack, or pass 'all' to update every installed pack. Local operations prefer official comfy-cli; remote operations use Manager HTTP. Targeting the comfyui-mcp sidebar panel pack ('comfyui-agent-panel' / 'comfyui-mcp-panel') is routed through the verified install_panel path (the version is re-read from disk afterwards). While the panel is version-pinned, BOTH a direct panel target and 'all' are REFUSED — 'all' would move the pinned panel too; clear the pin with install_panel(action='unpin') or update other packs individually.",
     {
       id: z
         .string()
@@ -123,6 +169,9 @@ export function registerNodeManagementTools(server: McpServer): void {
     },
     async (args) => {
       try {
+        if (targetsPanelPackExactly(args.id)) {
+          return await runVerifiedPanelAction("update", args.id);
+        }
         const result = await updateCustomNode({ ...args, useCmCli: preferLocalComfyCli(args.useCmCli) });
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
@@ -135,7 +184,7 @@ export function registerNodeManagementTools(server: McpServer): void {
 
   server.tool(
     "reinstall_custom_node",
-    "Reinstall a ComfyUI custom node pack. Local operations prefer official comfy-cli; remote operations use Manager HTTP. A ComfyUI restart may be required.",
+    "Reinstall a ComfyUI custom node pack. Local operations prefer official comfy-cli; remote operations use Manager HTTP. A ComfyUI restart may be required. Targeting the comfyui-mcp sidebar panel pack ('comfyui-agent-panel' / 'comfyui-mcp-panel') is routed through the verified install_panel path (the version is re-read from disk afterwards) and is REFUSED while the panel is version-pinned.",
     {
       id: z.string().describe("Registry id / module name to reinstall."),
       version: z
@@ -148,6 +197,9 @@ export function registerNodeManagementTools(server: McpServer): void {
     },
     async (args) => {
       try {
+        if (targetsPanelPackExactly(args.id)) {
+          return await runVerifiedPanelAction("reinstall", args.id);
+        }
         const result = await reinstallCustomNode({ ...args, useCmCli: preferLocalComfyCli(args.useCmCli) });
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],

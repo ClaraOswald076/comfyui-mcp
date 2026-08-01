@@ -20,6 +20,7 @@ import {
 export type { ManagerApi } from "./manager-api-cache.js";
 import { resolveInstallInterpreter } from "./workspace-env.js";
 import { assertComfyCliOk, runComfyCliSync } from "./comfy-cli.js";
+import { assertPanelPinAllows } from "./panel-pin-guard.js";
 import { ComfyUIError, ProcessControlError, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 
@@ -1615,7 +1616,17 @@ async function withObjectInfoInvalidation<T>(op: () => Promise<T>): Promise<T> {
   return result;
 }
 
-export function installCustomNode(opts: InstallOptions): Promise<NodeOpResult> {
+// NOTE on `async`: these wrappers are declared async purely so the PIN GUARD's
+// throw surfaces as a REJECTED PROMISE rather than a synchronous exception.
+// Callers rely on that — apply_manifest does `installCustomNode(...).then().catch()`
+// and documents that it never rejects, which a sync throw would walk straight past.
+
+export async function installCustomNode(opts: InstallOptions): Promise<NodeOpResult> {
+  // PIN GUARD (see panel-pin-guard.ts). The panel is an ordinary node pack, so
+  // these generic mutations are a second door into the same ComfyUI-Manager
+  // operation that install_panel drives. Guarding here — where the TARGET is
+  // known — covers every caller, including a bulk "all".
+  assertPanelPinAllows("install", opts.id);
   return withObjectInfoInvalidation(() => installCustomNodeImpl(opts));
 }
 
@@ -1926,7 +1937,10 @@ async function enqueueUpdateAll(
   return { used, response };
 }
 
-export function updateCustomNode(opts: UpdateOptions): Promise<NodeOpResult> {
+export async function updateCustomNode(opts: UpdateOptions): Promise<NodeOpResult> {
+  // PIN GUARD — covers id="comfyui-agent-panel", the repo-name and git-URL
+  // spellings, and id="all" (a bulk update moves the panel too).
+  assertPanelPinAllows("update", opts.id);
   return withObjectInfoInvalidation(() => updateCustomNodeImpl(opts));
 }
 
@@ -2033,7 +2047,8 @@ export interface ReinstallOptions {
   useCmCli?: boolean;
 }
 
-export function reinstallCustomNode(opts: ReinstallOptions): Promise<NodeOpResult> {
+export async function reinstallCustomNode(opts: ReinstallOptions): Promise<NodeOpResult> {
+  assertPanelPinAllows("reinstall", opts.id); // PIN GUARD
   return withObjectInfoInvalidation(() => reinstallCustomNodeImpl(opts));
 }
 
@@ -2085,7 +2100,10 @@ export interface FixOptions {
   useCmCli?: boolean;
 }
 
-export function fixCustomNode(opts: FixOptions): Promise<NodeOpResult> {
+export async function fixCustomNode(opts: FixOptions): Promise<NodeOpResult> {
+  // `fix` reinstalls the pack's dependencies and can pull the pack itself, and
+  // it accepts "all" — same door, same guard.
+  assertPanelPinAllows("fix", opts.id);
   return withObjectInfoInvalidation(() => fixCustomNodeImpl(opts));
 }
 

@@ -42,6 +42,7 @@ import {
   PANEL_PIN_ENV_VAR,
   type PanelPinState,
 } from "./panel-settings.js";
+import { withPanelMutationLock } from "./panel-pin-guard.js";
 
 /** Comfy Registry id (also pyproject [project].name). Authoritative for detection. */
 export const PANEL_REGISTRY_ID = "comfyui-agent-panel";
@@ -59,6 +60,11 @@ const FAST_PATH_DIRS = ["comfyui-mcp-panel", "comfyui-agent-panel"];
 
 /** Hard cap so the on-load ensure can never block startup. */
 const ENSURE_TIMEOUT_MS = 20_000;
+
+/** How long the fire-and-forget on-load ensure will wait for the panel op lock
+ *  before giving up (well inside ENSURE_TIMEOUT_MS, so a lock held by another
+ *  orchestrator process degrades to `unavailable` rather than a timeout). */
+const ENSURE_LOCK_WAIT_MS = 3_000;
 
 export class PanelInstallError extends Error {
   constructor(message: string) {
@@ -291,35 +297,34 @@ function readPinSafe(deps: PanelInstallerDeps): PanelPinState {
   }
 }
 
-/**
- * Serializes every panel MUTATION in this process (the on-load ensure and each
+/*
+ * Serializes every panel MUTATION (the on-load ensure and each
  * install/update/reinstall). Two overlapping panel ops would each read the
  * other's half-applied disk state, and the #639 "did it move?" proof compares a
  * pre-image against a post-image — interleave them and both comparisons are
  * meaningless. One at a time makes each op's before/after its own.
  *
- * It also bounds the pin race: the final pin check (assertNotPinned, immediately
+ * It also closes the pin race: the final pin check (assertNotPinned, immediately
  * before the Manager call) and the call itself sit inside this critical section,
- * so a pin cannot be written by a concurrent op in between.
+ * so a pin cannot be written in between — by this process OR another one.
  */
-let panelOpChain: Promise<unknown> = Promise.resolve();
-
 /**
  * Exported so PIN WRITES take the same lock. Without that, a pin could be
  * committed after an in-flight update passed its final pin check but before the
- * Manager actually touched disk — the update would then land on a
- * now-pinned install and report success. Serializing both means a pin either
- * lands before an op starts (and blocks it) or after it finishes (and blocks the
- * next one); it never slices one in half.
+ * Manager actually touched disk — the update would then land on a now-pinned
+ * install and report success. Serializing both means a pin either lands before
+ * an op starts (and blocks it) or after it finishes (and blocks the next one);
+ * it never slices one in half.
+ *
+ * The underlying lock is a FILE, not module state: running more than one
+ * orchestrator process (one per MCP client) is ordinary here, and two processes
+ * do not share a promise chain. See panel-pin-guard.ts.
  */
-export function withPanelOpLock<T>(fn: () => Promise<T>): Promise<T> {
-  // Chain off settled-or-rejected so one failed op never wedges the queue.
-  const run = panelOpChain.then(fn, fn);
-  panelOpChain = run.then(
-    () => undefined,
-    () => undefined,
-  );
-  return run;
+export function withPanelOpLock<T>(
+  fn: () => Promise<T>,
+  opts: { timeoutMs?: number } = {},
+): Promise<T> {
+  return withPanelMutationLock(fn, opts);
 }
 
 /** The refusal a pin produces for a mutating action, with the way out. */
@@ -930,9 +935,12 @@ export async function ensurePanelInstalled(
   const deps = opts.deps ?? defaultDeps;
   try {
     // Serialized with the explicit actions: the on-load ensure must not race an
-    // install_panel call the user fired at the same moment.
+    // install_panel call the user fired at the same moment. Its lock wait is
+    // SHORT — this is fire-and-forget at startup, so if another process holds
+    // the lock we give up quickly (returning `unavailable`) rather than eating
+    // the whole ensure budget waiting.
     return await withTimeout(
-      withPanelOpLock(() => ensureInner(deps)),
+      withPanelOpLock(() => ensureInner(deps), { timeoutMs: ENSURE_LOCK_WAIT_MS }),
       opts.timeoutMs ?? ENSURE_TIMEOUT_MS,
     );
   } catch (err) {

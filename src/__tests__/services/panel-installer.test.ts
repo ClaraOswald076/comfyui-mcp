@@ -3,6 +3,14 @@ import { join } from "node:path";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 
+// Panel mutations take a FILE lock (panel-pin-guard). Point it at a temp path so
+// the suite never touches ~/.comfyui-mcp, and so parallel vitest workers get
+// their own lock instead of serializing on one shared file.
+process.env.COMFYUI_MCP_PANEL_LOCK = join(
+  tmpdir(),
+  `cmcp-lock-installer-${process.pid}.lock`,
+);
+
 // Mock config so importing panel-installer doesn't trigger real port detection.
 // (We drive comfyuiPath via the injected deps, not the mocked config, but the
 // import graph still pulls config in.)

@@ -7,6 +7,14 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
+
+// Panel mutations take a FILE lock (panel-pin-guard) — keep it out of
+// ~/.comfyui-mcp and off other workers' lock file.
+process.env.COMFYUI_MCP_PANEL_LOCK = join(
+  tmpdir(),
+  `cmcp-lock-sync-${process.pid}.lock`,
+);
 
 // panel-installer pulls config in transitively; stub it so importing doesn't
 // trigger real port detection (mirrors panel-installer.test.ts).
@@ -507,6 +515,54 @@ describe("performPanelSync", () => {
     // The first moves the pack; the second sees no further movement and fails
     // closed rather than claiming a second successful sync.
     expect(results.filter((r) => r.status === "fulfilled").length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("FAILS LOUDLY when the FINAL post-sync shadow scan could not run", async () => {
+    // The mutation applied and runPanelAction's own shadow assertion passed, but
+    // custom_nodes became unreadable before performPanelSync's confirming scan.
+    // `shadows: []` from a scan that never ran is not an all-clear — reporting
+    // `synced: true` there is the same fail-open the pre-mutation assessment
+    // blocks, one step later.
+    //
+    // Self-calibrating rather than hardcoding a call index: phase 1 counts the
+    // readdir calls a clean sync makes, phase 2 replays it failing only the
+    // LAST one (necessarily the confirming scan). Survives refactors that add or
+    // remove intermediate reads.
+    const scenario = () => ({
+      installedVersion: "0.11.3",
+      onUpdate: (files: Record<string, string>) => {
+        files[join(PANEL_DIR, "pyproject.toml")] = pyproject("0.11.30");
+      },
+    });
+
+    let calls = 0;
+    const probe = makeDeps(scenario());
+    const counting: PanelInstallerDeps = {
+      ...probe.deps,
+      readdir: (p) => {
+        calls++;
+        return probe.deps.readdir(p);
+      },
+    };
+    await expect(performPanelSync({ deps: counting, ...RUN })).resolves.toMatchObject({
+      synced: true,
+    });
+    const total = calls;
+    expect(total).toBeGreaterThan(1);
+
+    let n = 0;
+    const h = makeDeps(scenario());
+    const failingLast: PanelInstallerDeps = {
+      ...h.deps,
+      readdir: (p) => {
+        n++;
+        if (n >= total) throw new Error("EACCES: permission denied, scandir");
+        return h.deps.readdir(p);
+      },
+    };
+    await expect(performPanelSync({ deps: failingLast, ...RUN })).rejects.toThrow(
+      /could not be enumerated|NOT reporting a completed sync/i,
+    );
   });
 
   it("refuses to sync a dev symlink", async () => {

@@ -142,8 +142,24 @@ install_panel(action='pin', version='<installedVersion from status>', reason='<w
 
 `version` is required — never invent one. Pass the `installedVersion` from
 Step 1 to pin them where they already are. A pin **records intent only**: it does
-not change what is installed. While it's set, `install`, `update`, `reinstall`,
-`sync`, and the on-load auto-install all refuse.
+not change what is installed.
+
+While it's set, everything that could move the panel refuses — not just
+`install_panel`. The panel is an ordinary custom node pack, so the generic node
+tools are a second door into the same operation, and they are guarded too:
+
+- `install_custom_node` / `update_custom_node` / `reinstall_custom_node` /
+  `fix_custom_node` targeting the panel by **any** spelling
+  (`comfyui-agent-panel`, `comfyui-mcp-panel`, or its git URL).
+- **`id="all"`, and `update_all`** — a bulk update moves the panel along with
+  everything else. ComfyUI-Manager can't update everything-except-one-pack, so
+  while pinned these refuse outright. If the user wants the rest updated, either
+  unpin first or update the other packs individually by id. Say that plainly
+  rather than quietly unpinning to make `all` work.
+
+Reaching the panel through those generic tools also **routes through the verified
+path** automatically, so the version they report is re-read from disk like
+`sync`'s. Prefer `install_panel` anyway — it's the one with `status` and `sync`.
 
 ## When to run this at all
 
