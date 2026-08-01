@@ -214,6 +214,18 @@ export function credentialValueUsable(
   return true;
 }
 
+/** Read `key` as pi would for a provider: the stored record's own `env` block
+ *  first (pi injects it), then the inherited process env. */
+function readScoped(
+  entryEnv: Record<string, unknown> | undefined,
+  procEnv: NodeJS.ProcessEnv,
+  key: string,
+): string | undefined {
+  const fromEntry = entryEnv?.[key];
+  if (typeof fromEntry === "string" && fromEntry !== "") return fromEntry;
+  return procEnv[key];
+}
+
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return !!v && typeof v === "object" && !Array.isArray(v);
 }
@@ -222,19 +234,21 @@ function nonEmptyString(v: unknown): boolean {
   return typeof v === "string" && v.trim() !== "";
 }
 
+/** pi refreshes any OAuth token with less than this much life left
+ *  (DEFAULT_OAUTH_MINIMUM_VALIDITY_MS in packages/ai/src/auth/resolve.ts). */
+const OAUTH_MINIMUM_VALIDITY_MS = 5 * 60 * 1000;
+
 /**
- * Is `expires` a timestamp still in the future?
+ * Is `expires` far enough in the future that pi can use the token as-is?
  *
- * pi's OAuthCredential carries `expires` as a number without documenting its
- * unit, and this codebase has already been bitten by the seconds-vs-milliseconds
- * ambiguity (see hasValidPanelOAuth). So accept the value as live if it is in the
- * future under EITHER reading — that way a genuinely live token is never
- * false-REDed, while a stale 1970-era value (the malformed case) is future under
- * neither and correctly reads dead.
+ * pi compares `expires` directly against `Date.now() + minimumValidityMs`, so it
+ * is MILLISECONDS — not seconds — and anything inside the five-minute window is
+ * treated as needing a refresh. That matters only for the access-only case
+ * below: with a `refresh` token pi just re-mints, so this is never consulted.
  */
-function expiresInFuture(expires: unknown, nowMs: number): boolean {
+function expiresUsableWithoutRefresh(expires: unknown, nowMs: number): boolean {
   if (typeof expires !== "number" || !Number.isFinite(expires)) return false;
-  return expires > nowMs || expires * 1000 > nowMs;
+  return expires > nowMs + OAUTH_MINIMUM_VALIDITY_MS;
 }
 
 /**
@@ -258,12 +272,23 @@ export function authRecordUsable(
   record: unknown,
   procEnv: NodeJS.ProcessEnv = process.env,
   nowMs: number = Date.now(),
-  provider?: string,
+  ctx: { provider?: string; home?: string } = {},
 ): boolean {
   if (!isPlainObject(record)) return false;
+  const provider = ctx.provider;
   const type = record.type;
   if (type === "api_key") {
     const entryEnv = isPlainObject(record.env) ? record.env : undefined;
+    // pi's Vertex `/login` writes `{type:"api_key", env:{GOOGLE_CLOUD_PROJECT, …}}`
+    // with NO `key`, and its resolver does `credential?.key ?? env(...)` then
+    // falls back to ADC. So a keyless vertex record IS a credential when the ADC
+    // trio resolves (from the record's own env first, then the process env) — it
+    // used to read as "not signed in" for a working Vertex login.
+    if (record.key === undefined && provider === "google-vertex") {
+      if (credentialValueUsable(readScoped(entryEnv, procEnv, "GOOGLE_CLOUD_API_KEY"), entryEnv, procEnv))
+        return true;
+      return piVertexAdcUsable(ctx.home ?? homedir(), procEnv, entryEnv);
+    }
     if (!credentialValueUsable(record.key, entryEnv, procEnv)) return false;
     // Companion config (cloudflare's account/gateway ids) may come from the
     // record's own `env` block or the environment; without it pi's resolver
@@ -284,11 +309,11 @@ export function authRecordUsable(
     // produce a live token:
     //   - a `refresh` token: pi re-mints access from it, so an EXPIRED record is
     //     still ready — refusing it would be a false "not signed in".
-    //   - otherwise an `access` token that has NOT expired yet. Access-only with
-    //     no refresh and a past (or absent) expiry cannot be renewed: pi sees it
-    //     as expired and tries to refresh with no refresh token.
+    //   - otherwise an `access` token with more than pi's five-minute minimum
+    //     validity left. Access-only inside that window (or past it) cannot be
+    //     renewed: pi decides it needs a refresh and has no refresh token.
     if (nonEmptyString(record.refresh)) return true;
-    return nonEmptyString(record.access) && expiresInFuture(record.expires, nowMs);
+    return nonEmptyString(record.access) && expiresUsableWithoutRefresh(record.expires, nowMs);
   }
   return false;
 }
@@ -313,7 +338,7 @@ export function piAuthJsonUsable(
   nowMs: number = Date.now(),
 ): boolean {
   return Object.entries(piAuthRecords(file)).some(([provider, rec]) =>
-    authRecordUsable(rec, procEnv, nowMs, provider),
+    authRecordUsable(rec, procEnv, nowMs, { provider }),
   );
 }
 
@@ -551,13 +576,20 @@ function isRegularFile(file: string): boolean {
  * GOOGLE_APPLICATION_CREDENTIALS pointing at a deleted key file used to green
  * pi), and project/location must be set.
  */
-export function piVertexAdcUsable(home: string, procEnv: NodeJS.ProcessEnv = process.env): boolean {
-  const project = procEnv.GOOGLE_CLOUD_PROJECT?.trim() || procEnv.GCLOUD_PROJECT?.trim();
-  const location = procEnv.GOOGLE_CLOUD_LOCATION?.trim();
+export function piVertexAdcUsable(
+  home: string,
+  procEnv: NodeJS.ProcessEnv = process.env,
+  entryEnv?: Record<string, unknown>,
+): boolean {
+  // A stored record's provider-scoped `env` block wins over the ambient env,
+  // because pi injects it for that provider.
+  const read = (k: string) => readScoped(entryEnv, procEnv, k);
+  const project = read("GOOGLE_CLOUD_PROJECT")?.trim() || read("GCLOUD_PROJECT")?.trim();
+  const location = read("GOOGLE_CLOUD_LOCATION")?.trim();
   if (!project || !location) return false;
   // NOT trimmed: pi uses the literal value, so a space-padded path that
   // resolves for us would not resolve for pi.
-  const explicit = procEnv.GOOGLE_APPLICATION_CREDENTIALS;
+  const explicit = read("GOOGLE_APPLICATION_CREDENTIALS");
   if (explicit) {
     // Must point at a file that is actually there. A RELATIVE path resolves
     // against pi's cwd, which readiness cannot know — so it is unverifiable, and
@@ -651,7 +683,9 @@ export function piCredentialPresent(
   // file-backed sources are unreadable, but env/ADC still apply.
   const stored = agentDir ? piAuthRecords(join(agentDir, "auth.json")) : {};
   if (
-    Object.entries(stored).some(([provider, rec]) => authRecordUsable(rec, procEnv, nowMs, provider))
+    Object.entries(stored).some(([provider, rec]) =>
+      authRecordUsable(rec, procEnv, nowMs, { provider, home }),
+    )
   )
     return true;
   if (piEnvCredentialPresent(stored, procEnv)) return true;
