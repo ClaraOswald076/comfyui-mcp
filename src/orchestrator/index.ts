@@ -2610,14 +2610,18 @@ export async function runPanelOrchestrator(): Promise<void> {
           // MOVE the pinned workflow target, don't discard it (codex review).
           const pinned = workflowTargets.get(migratedFrom);
           if (pinned.mode === "pinned") workflowTargets.set(panelTab, pinned);
-          // Re-key messages held during a render so the flush reaches the
-          // REBOUND agent instead of respawning one under the retired key.
-          const prevBackendForHeld = tabBackends.get(migratedFrom) ?? backend;
-          const heldOld = heldDuringGen.get(migratedFrom + AGENT_KEY_SEP + prevBackendForHeld);
-          if (heldOld?.length) {
-            const heldNewKey = panelTab + AGENT_KEY_SEP + prevBackendForHeld;
+          // Re-key messages held during a render so the flush reaches the REBOUND agent
+          // instead of respawning one under the retired key — for EVERY provider, not just
+          // the current one: a message queued while a LOCAL provider was active, then a
+          // provider switch, then this (proven same-workflow) migration, would otherwise
+          // stay under `migratedFrom::<old provider>` and onRunEnd would `manager.send` it
+          // on that retired tab/provider key (a deferred delivery under the wrong key).
+          for (const hk of [...heldDuringGen.keys()]) {
+            if (panelTabOf(hk) !== migratedFrom) continue;
+            const heldOld = heldDuringGen.get(hk)!;
+            const heldNewKey = panelTab + AGENT_KEY_SEP + backendOf(hk);
             heldDuringGen.set(heldNewKey, [...(heldDuringGen.get(heldNewKey) ?? []), ...heldOld]);
-            heldDuringGen.delete(migratedFrom + AGENT_KEY_SEP + prevBackendForHeld);
+            heldDuringGen.delete(hk);
           }
           tabBackends.delete(migratedFrom);
           headlessTabs.delete(migratedFrom);
