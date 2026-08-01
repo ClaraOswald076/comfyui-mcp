@@ -40,7 +40,7 @@ const CLI_NAMES: Record<string, string[]> = {
   codex: ["codex", "codex.cmd", "codex.exe"],
   gemini: ["gemini", "gemini.cmd", "gemini.exe"],
   grok: ["grok", "grok.cmd", "grok.exe"],
-  pi: ["pi", "pi.cmd", "pi.exe"],
+  pi: ["pi", "pi.exe"], // no .cmd — Node can't shell-lessly spawn it (see resolvePiBin)
   ollama: ["ollama", "ollama.exe"],
   lmstudio: ["lms", "lms.exe"],
   llamacpp: ["llama-server", "llama-server.exe"],
@@ -49,12 +49,17 @@ const CLI_NAMES: Record<string, string[]> = {
 /** Common provider API-key env vars pi (issue #491) can authenticate with. A
  *  definite login is auth.json OR any of these; used only to UPGRADE pi's auth
  *  signal from "unknown" to "yes" (never to false-flag not-signed-in). Not
- *  exhaustive — pi supports many providers; these are the common coding ones. */
+ *  exhaustive — pi supports many providers; these are the common coding ones.
+ *  IMPORTANT: this list MUST only contain keys that actually REACH pi's spawn
+ *  env. pi is spawned via buildAgentSpawnEnv() (no keep-list), which STRIPS the
+ *  ComfyUI tool-only secrets — so GEMINI_API_KEY / GOOGLE_API_KEY are
+ *  deliberately EXCLUDED: they never reach pi, and listing them would flag
+ *  "authenticated" for a user whose only key is one pi never sees (its first
+ *  turn would then fail). Google/HF providers for pi must go in
+ *  ~/.pi/agent/auth.json instead (documented in pi-backend.ts). */
 const PI_PROVIDER_ENV_KEYS: readonly string[] = [
   "ANTHROPIC_API_KEY",
   "OPENAI_API_KEY",
-  "GEMINI_API_KEY",
-  "GOOGLE_API_KEY",
   "XAI_API_KEY",
   "OPENROUTER_API_KEY",
   "DEEPSEEK_API_KEY",

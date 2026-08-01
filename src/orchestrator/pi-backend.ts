@@ -116,7 +116,12 @@ function killProcessTree(pid: number | undefined): void {
 export function resolvePiBin(home: string = homedir()): string | null {
   const override = process.env.COMFYUI_MCP_PI_PATH?.trim();
   if (override) return override;
-  const names = process.platform === "win32" ? ["pi.exe", "pi.cmd", "pi"] : ["pi"];
+  // A `.cmd`/`.bat` shim is deliberately NOT accepted for SPAWNING: Node refuses
+  // shell-less `.cmd` spawns post-CVE-2024-27980, and we never spawn through a
+  // shell (the prompt is user data — shell-quoting it would be an injection
+  // risk). The official installer ships a real `pi`/`pi.exe`; a .cmd-only install
+  // reads as "not found" here with actionable guidance (same stance as agy).
+  const names = process.platform === "win32" ? ["pi.exe", "pi"] : ["pi"];
   const sep = process.platform === "win32" ? ";" : ":";
   for (const dir of (process.env.PATH || "").split(sep).filter(Boolean)) {
     for (const name of names) {
@@ -153,10 +158,12 @@ export function parsePiDurationMs(s: string): number | null {
   return (Number(m[1] ?? 0) * 3600 + Number(m[2] ?? 0) * 60 + Number(m[3] ?? 0)) * 1000;
 }
 
-/** Strip ANSI escape sequences (pi's TUI heritage may color even table output). */
+/** Strip ANSI escape sequences (pi's TUI heritage may color even table output).
+ *  The ESC byte (\x1b) is part of the match — without it a colored token keeps
+ *  its leading control char and fails id validation. */
 function stripAnsi(s: string): string {
   // eslint-disable-next-line no-control-regex
-  return s.replace(/\[[0-9;?]*[ -/]*[@-~]/g, "");
+  return s.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
 }
 
 /**
@@ -299,12 +306,15 @@ export class PiBackend implements AgentBackend {
     }
   }
 
-  /** Whether `model` is usable for pi: our listModels ids are always
-   *  `provider/model`, so require a "/" (or an explicit provider set). A bare
-   *  claude-* id (the panel's Anthropic-side default leaking through opts.model)
-   *  is rejected so pi keeps its configured default. */
+  /** Whether `model` is usable for pi. The one thing we MUST reject is the
+   *  panel's Anthropic-side default (a bare `claude-*` id with no provider
+   *  prefix) leaking through opts.model — passing it to `pi --model` would fail
+   *  every turn (and setting `--provider` alongside it does NOT rescue it, so the
+   *  provider flag must NOT whitelist it). Everything else — our own
+   *  `provider/model` picker ids, or an explicit id the user configured — passes. */
   private acceptableModel(model: string): boolean {
-    return model.includes("/") || !!this.provider;
+    if (/^claude/i.test(model) && !model.includes("/")) return false;
+    return true;
   }
 
   /** Run ONE turn = one `pi --mode json` child. Parses the JSON-lines event
@@ -503,12 +513,14 @@ export class PiBackend implements AgentBackend {
     });
 
     let settled = false;
+    let exitFallback: ReturnType<typeof setTimeout> | null = null;
     const settle = (code: number | null, spawnErr?: Error) => {
       if (settled) return;
       settled = true;
       clearInterval(heartbeat);
       clearTimeout(ceiling);
       if (ceilingForce) clearTimeout(ceilingForce);
+      if (exitFallback) clearTimeout(exitFallback);
       if (this.child === child) this.child = null;
       // Flush any trailing buffered line (no final newline).
       if (lineBuf.trim()) consumeLines("\n");
@@ -550,10 +562,19 @@ export class PiBackend implements AgentBackend {
       finish();
     };
     child.on("error", (err) => settle(null, err));
-    child.on("exit", (code) => settle(code));
+    // Settle on 'close' (all stdio drained), NOT 'exit': Node permits stdout to
+    // still hold buffered data at 'exit', so settling there could drop a final
+    // JSONL line (the last delta or the session header). 'exit' only arms a short
+    // fallback in case a stray inherited pipe keeps stdout open past the process.
+    child.on("exit", (code) => {
+      if (settled || exitFallback) return;
+      exitFallback = setTimeout(() => settle(code), 2000);
+      exitFallback.unref?.();
+    });
+    child.on("close", (code) => settle(code));
 
     // An interrupt can arrive while spawn() is in flight — honor it now (after the
-    // exit/error listeners are attached, so the kill's exit event is observed).
+    // exit/close/error listeners are attached, so the kill's events are observed).
     if (this.interrupted) killProcessTree(child.pid);
 
     try {
@@ -641,7 +662,8 @@ export class PiBackend implements AgentBackend {
         clearTimeout(timer);
         reject(new Error(`Could not run \`pi --list-models\`: ${e.message}`));
       });
-      child.on("exit", (code) => {
+      // 'close' (stdio drained), not 'exit' — the full table must be captured.
+      child.on("close", (code) => {
         clearTimeout(timer);
         if (code === 0) {
           resolve(parsePiModels(out));
