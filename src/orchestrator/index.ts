@@ -2027,6 +2027,12 @@ export async function runPanelOrchestrator(): Promise<void> {
 
   // Flag the mobile mirror picker's "session attached" (green) dot from live agents.
   bridge.setHasSessionPredicate((tabId) => manager.hasLiveAgent(agentKeyFor(tabId)));
+  // #570 — stamp each dispatched command with the tab's trusted per-instance workflow uuid so
+  // the panel declines to APPLY a command it receives after switching to a different workflow
+  // (the generation-bound-command leak). Resolved from the CALLER's tab id: during the switch
+  // race the retiring tab still maps to its own uuid, so a late command stamps the ORIGIN
+  // workflow's uuid and the panel (now showing the new one) fails it closed.
+  bridge.setTabWorkflowUuidResolver((tabId) => tabStableIdentity.get(panelTabOf(tabId))?.uuid);
 
   // ── Local-agent VRAM pause during generation ────────────────────────────
   // On a single-GPU box the local Ollama chat model and ComfyUI fight for VRAM:

@@ -72,6 +72,11 @@ type SendCtx = {
   mutating: boolean;
   /** Absolute ms after which even an idempotent read stops waiting for reconnect. */
   deadline: number;
+  /** #570 — the trusted per-instance workflow uuid this command was ISSUED FOR (the
+   *  caller's intended tab), stamped onto the outgoing frame so the panel can refuse to
+   *  EXECUTE it against a DIFFERENT workflow it has since switched to. Undefined for a tab
+   *  with no established workflow identity (old panel / relay) → no client-side fence. */
+  workflowUuid?: string;
 };
 
 type Pending = {
@@ -530,6 +535,12 @@ export class UiBridge {
    *  to THIS tab's shared session instead of the viewer's own — that's what makes
    *  it remote control rather than a passive view. Cleared on detach/disconnect. */
   private mirrorViewers = new Map<BridgeSocket, string>();
+  /** #570 — injected by the orchestrator: the trusted per-instance workflow uuid this
+   *  tabId currently maps to (from tabStableIdentity). Used to STAMP each dispatched
+   *  command so the panel can refuse to execute it against a workflow it has since switched
+   *  to (the generation-bound-command leak: the server can't retract a frame already
+   *  delivered to the browser, but the browser can decline to APPLY a stale one). */
+  private resolveTabWorkflowUuid: ((tabId: string) => string | undefined) | null = null;
   /** Injected by the orchestrator: does this tabId have a live agent session?
    *  (SessionStore/PanelAgentManager live there.) Flags desktopTabs() for the
    *  mobile mirror picker's green "session attached" dot. */
@@ -1701,6 +1712,11 @@ export class UiBridge {
         tabId: conn.tabId,
         mutating: !UiBridge.READONLY_CMDS.has(cmd.cmd),
         deadline: Date.now() + timeoutMs,
+        // #570 — resolve from the CALLER'S intended tab (opts.tabId), NOT the canonical
+        // conn.tabId: after a same-socket switch the two differ, and we must stamp the
+        // workflow the command was ISSUED FOR (so the panel, now showing a different one,
+        // declines it) — never the workflow it happens to have landed on.
+        workflowUuid: this.resolveTabWorkflowUuid?.(opts.tabId ?? conn.tabId) ?? undefined,
       };
       this.dispatch(conn, ctx);
     });
@@ -1793,7 +1809,16 @@ export class UiBridge {
     };
     this.pending.set(rid, pending);
     try {
-      conn.sock.send(JSON.stringify({ rid, ...cmd }));
+      // #570 — stamp the intended workflow uuid so the panel refuses to APPLY this command
+      // if it has since switched to a different workflow (a frame already delivered to the
+      // browser cannot be retracted server-side; the client fences execution instead). Only
+      // when resolvable and not already present; an identity-less tab / old panel gets no
+      // stamp and executes as before (fail-open there, but the reply is still server-fenced).
+      const frame: Record<string, unknown> = { rid, ...cmd };
+      if (ctx.workflowUuid && frame.workflow_uuid === undefined) {
+        frame.workflow_uuid = ctx.workflowUuid;
+      }
+      conn.sock.send(JSON.stringify(frame));
     } catch (err) {
       clearTimeout(timer);
       this.pending.delete(rid);
@@ -1916,6 +1941,12 @@ export class UiBridge {
    *  in the orchestrator). */
   setHasSessionPredicate(fn: (tabId: string) => boolean): void {
     this.hasSessionPredicate = fn;
+  }
+
+  /** #570 — inject the tabId → trusted workflow uuid resolver (tabStableIdentity lives in
+   *  the orchestrator). Enables the per-command workflow-instance stamp/fence. */
+  setTabWorkflowUuidResolver(fn: (tabId: string) => string | undefined): void {
+    this.resolveTabWorkflowUuid = fn;
   }
 
   /** The open DESKTOP tabs (non-headless primaries) for the mobile mirror picker. */

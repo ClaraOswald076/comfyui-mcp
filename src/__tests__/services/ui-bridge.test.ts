@@ -1234,6 +1234,60 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     expect(drove?.tab_id).toBe("phone-7");
   });
 
+  it("STAMPS a dispatched command with the ORIGIN workflow uuid so the panel can fence a post-switch apply (#570 P0)", async () => {
+    // The orchestrator maps each tab to its trusted per-instance workflow uuid.
+    const uuidByTab: Record<string, string> = { "tmp:A": "uuid-A", "tmp:B": "uuid-B" };
+    bridge.setTabWorkflowUuidResolver((tabId) => uuidByTab[tabId]);
+
+    const desktop = await connectPanel("tmp:A", "A");
+    const frames: Array<Record<string, unknown>> = [];
+    desktop.on("message", (buf) => {
+      const m = JSON.parse(buf.toString());
+      if (m.rid && m.cmd) {
+        frames.push(m);
+        // Reply so send() resolves.
+        desktop.send(JSON.stringify({ rid: m.rid, ok: true, result: {} }));
+      }
+    });
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:A")).toBe(true));
+
+    // A command issued for workflow A carries A's uuid.
+    await bridge.send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "tmp:A" });
+    await vi.waitFor(() => expect(frames.find((f) => f.cmd === "graph_add_node")).toBeTruthy());
+    expect(frames.find((f) => f.cmd === "graph_add_node")?.workflow_uuid).toBe("uuid-A");
+
+    // Same socket switches to workflow B (migration alias tmp:A → tmp:B).
+    desktop.send(JSON.stringify({ type: "hello", tab_id: "tmp:B", title: "B" }));
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:B")).toBe(true));
+
+    // A late command still ISSUED FOR A (its agent's tab id) must stamp A's uuid — even though
+    // it now resolves onto B's socket — so the panel (showing B) declines to apply it. Stamping
+    // B's uuid would let it cross-apply. The resolver reads the ORIGIN tab, so it stays uuid-A.
+    frames.length = 0;
+    await bridge.send({ cmd: "graph_add_node", node: "y" } as never, { tabId: "tmp:A" });
+    await vi.waitFor(() => expect(frames.find((f) => f.cmd === "graph_add_node")).toBeTruthy());
+    expect(frames.find((f) => f.cmd === "graph_add_node")?.workflow_uuid).toBe("uuid-A");
+    desktop.close();
+  });
+
+  it("does NOT stamp a workflow uuid when the tab has no established identity (fail-open for old panels) (#570)", async () => {
+    bridge.setTabWorkflowUuidResolver(() => undefined);
+    const desktop = await connectPanel("tmp:none", "N");
+    const frames: Array<Record<string, unknown>> = [];
+    desktop.on("message", (buf) => {
+      const m = JSON.parse(buf.toString());
+      if (m.rid && m.cmd) {
+        frames.push(m);
+        desktop.send(JSON.stringify({ rid: m.rid, ok: true, result: {} }));
+      }
+    });
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:none")).toBe(true));
+    await bridge.send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "tmp:none" });
+    await vi.waitFor(() => expect(frames.find((f) => f.cmd === "graph_add_node")).toBeTruthy());
+    expect("workflow_uuid" in (frames.find((f) => f.cmd === "graph_add_node") as object)).toBe(false);
+    desktop.close();
+  });
+
   it("refuses a headless hello takeover of a desktop tab id (no drive-path hijack)", async () => {
     const desktop = await connectPanel("desktop-h", "G");
     autoReply(desktop, "desktop");
