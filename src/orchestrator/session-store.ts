@@ -151,6 +151,28 @@ export function deriveWorkflowIdentity(opts: {
   return p ? `${p.origin}::${p.uuid}` : undefined;
 }
 
+/** #570 — does a connected SIBLING tab own the session behind a candidate stable key? A stable key
+ *  encodes (workflow identity, backend), so a sibling owns it when its identity derives to the SAME
+ *  key for that backend AND it still RETAINS a session there. Ownership is a SET over every backend
+ *  the sibling has ever used, NOT its current provider: a provider switch RETIRES (preserves) the
+ *  old provider's session, so `siblingRetainsSession` (derived from the durable store OR live/held
+ *  state on that backend key) — not the sibling's current-backend mapping — is what proves
+ *  ownership. When true, a second honest tab must NOT arm/resume that key's session. */
+export function siblingOwnsStableKey(opts: {
+  siblingIdentity?: { origin: string; uuid: string } | undefined;
+  candidateKey: string;
+  candidateBackend: string;
+  siblingRetainsSession: boolean;
+}): boolean {
+  if (!opts.siblingIdentity || !opts.siblingRetainsSession) return false;
+  const k = deriveStableKey({
+    workflowUuid: opts.siblingIdentity.uuid,
+    origin: opts.siblingIdentity.origin,
+    backend: opts.candidateBackend,
+  });
+  return k !== undefined && k === opts.candidateKey;
+}
+
 /** #570 — may a panel-scoped `hello.resume` be ARMED? The EXACT tab-id session is unique to this
  *  tab, so a hint matching it (`exactOwned`) is always this tab's own — arm it. The STABLE-key
  *  session is SHARED by every tab of the same workflow identity (the same workflow open in two

@@ -15,8 +15,71 @@ import {
   deriveStableKey,
   deriveWorkflowIdentity,
   keepsBackendState,
+  siblingOwnsStableKey,
   workflowIdentityParts,
 } from "../../orchestrator/session-store.js";
+
+// #570 — a tab OWNS every backend key whose session it RETAINS (a provider switch preserves the
+// old provider's session), so a second honest tab must not resume a key a connected sibling still
+// owns — even after that sibling switched to a different provider. Ownership derives from the
+// retained-session state, NOT the sibling's current-backend mapping.
+describe("siblingOwnsStableKey (#570 owned-SET, not current-backend)", () => {
+  const ORIGIN = "http://127.0.0.1:8188";
+  const identity = { origin: ORIGIN, uuid: UUID_A };
+  const claudeKey = deriveStableKey({ workflowUuid: UUID_A, origin: ORIGIN, backend: "claude" })!;
+
+  it("A switched Claude→Codex but RETAINS its Claude session ⇒ still owns the Claude key (B must not resume it)", () => {
+    // Model A's retained state exactly as the handler derives it: the durable exact session
+    // survives the provider-switch retire.
+    const store = new SessionStore(PORT);
+    store.set("tmp:A::claude", "sess-A-claude", deriveWorkflowIdentity(identity));
+    store.setStable(claudeKey, "sess-A-claude", "tmp:A");
+    const retains = store.get("tmp:A::claude") !== undefined; // true — A retains Claude
+    expect(
+      siblingOwnsStableKey({
+        siblingIdentity: identity, // A's identity (its CURRENT backend is Codex — irrelevant)
+        candidateKey: claudeKey,
+        candidateBackend: "claude",
+        siblingRetainsSession: retains,
+      }),
+    ).toBe(true);
+  });
+
+  it("once A's Claude session is genuinely CLEARED, it no longer owns the key (B CAN resume)", () => {
+    const store = new SessionStore(PORT);
+    store.set("tmp:A::claude", "sess-A-claude", deriveWorkflowIdentity(identity));
+    store.clear("tmp:A::claude"); // genuine clear (new_session / real teardown)
+    const retains = store.get("tmp:A::claude") !== undefined; // false
+    expect(
+      siblingOwnsStableKey({
+        siblingIdentity: identity,
+        candidateKey: claudeKey,
+        candidateBackend: "claude",
+        siblingRetainsSession: retains,
+      }),
+    ).toBe(false);
+  });
+
+  it("a sibling with a DIFFERENT workflow identity never owns the key", () => {
+    expect(
+      siblingOwnsStableKey({
+        siblingIdentity: { origin: ORIGIN, uuid: UUID_B },
+        candidateKey: claudeKey,
+        candidateBackend: "claude",
+        siblingRetainsSession: true,
+      }),
+    ).toBe(false);
+  });
+
+  it("no identity / no retained session ⇒ not owned (fail open to a fresh resume)", () => {
+    expect(
+      siblingOwnsStableKey({ siblingIdentity: undefined, candidateKey: claudeKey, candidateBackend: "claude", siblingRetainsSession: true }),
+    ).toBe(false);
+    expect(
+      siblingOwnsStableKey({ siblingIdentity: identity, candidateKey: claudeKey, candidateBackend: "claude", siblingRetainsSession: false }),
+    ).toBe(false);
+  });
+});
 
 // #570 — a panel-scoped hello.resume may arm from the SHARED stable key only when no OTHER live
 // tab holds it, so a concurrent sibling can't attach to the first tab's live conversation.

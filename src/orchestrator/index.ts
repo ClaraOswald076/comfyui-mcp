@@ -26,6 +26,7 @@ import {
   armableResume,
   deriveStableKey,
   keepsBackendState,
+  siblingOwnsStableKey,
   workflowIdentityParts,
 } from "./session-store.js";
 import { listSessions, loadTranscript } from "./history.js";
@@ -2849,6 +2850,41 @@ export async function runPanelOrchestrator(): Promise<void> {
       // orchestrator-restart belt-and-suspenders case). Same-provider only. This binds
       // resume to identity: a persistent panel-global chat across workflows would be a
       // separate, separately-authorized feature, not this untrusted path.
+      // #570 — does any OTHER connected tab OWN the session behind `candidateKey`? A stable key
+      // encodes (workflow identity, backend); a sibling OWNS it when it has the SAME workflow
+      // identity AND a RETAINED session on that backend. Ownership is a SET, not a single
+      // current-backend mapping: a provider switch RETIRES (preserves) the old provider's session,
+      // so a tab keeps owning EVERY backend key whose session it still holds — its CURRENT provider
+      // is irrelevant. So derive ownership from the authoritative retained-session state
+      // (tabStableIdentity + the durable/live session), per sibling, per backend — the single
+      // tabStableKey (current-backend) mapping would MISS a retained old-backend session and let a
+      // second honest tab resume it (codex). `candidateBackend` is the backend `candidateKey` was
+      // derived for.
+      const connectedSiblingOwnsStableKey = (
+        candidateKey: string,
+        candidateBackend: string,
+      ): boolean => {
+        for (const t of bridge.tabs()) {
+          if (t.tab_id === panelTab) continue;
+          const siblingAgentKey = t.tab_id + AGENT_KEY_SEP + candidateBackend;
+          // A retained session lives in the durable store (survives a provider-switch retire) or
+          // in the manager's live/pending/held state (spawn window, failed-start mail).
+          const siblingRetainsSession =
+            sessionStore.get(siblingAgentKey) !== undefined || manager.hasAnyState(siblingAgentKey);
+          if (
+            siblingOwnsStableKey({
+              siblingIdentity: tabStableIdentity.get(t.tab_id),
+              candidateKey,
+              candidateBackend,
+              siblingRetainsSession,
+            })
+          ) {
+            return true;
+          }
+        }
+        return false;
+      };
+
       const resumeHint = typeof event.resume === "string" ? event.resume : undefined;
       let armedResume: string | undefined;
       if (resumeHint && (!prev || prev === backend)) {
@@ -2857,24 +2893,20 @@ export async function runPanelOrchestrator(): Promise<void> {
           : undefined;
         // The EXACT tab-id session is unique to THIS tab id, so a hello.resume that matches it is
         // always this tab's own — safe to arm. The STABLE-key session is SHARED by every tab of
-        // the same workflow identity (the same workflow open in two live tabs), so a second tab's
-        // panel-scoped hello.resume matching it would attach that tab to — and contend for — the
-        // FIRST tab's live conversation (codex). Permit a stable-key resume ONLY when no OTHER
-        // connected tab already holds that stable key. This mirrors the seed-fallback collision
-        // guard below; without it the armed path bypassed it.
+        // the same workflow identity, so a second tab's panel-scoped hello.resume matching it would
+        // attach that tab to — and contend for — a sibling's conversation (codex). Permit a
+        // stable-key resume ONLY when no OTHER connected tab OWNS that key's session (current OR
+        // retained on any backend). Mirrors the seed-fallback guard below.
         const exactOwned = sessionStore.get(key) === resumeHint;
         const stableOwned =
           trustedStableKey !== undefined && sessionStore.getStable(trustedStableKey) === resumeHint;
         let otherTabHoldsStableKey = false;
         if (stableOwned && !exactOwned && trustedStableKey !== undefined) {
-          for (const t of bridge.tabs()) {
-            if (t.tab_id !== panelTab && tabStableKey.get(t.tab_id) === trustedStableKey) {
-              otherTabHoldsStableKey = true; // a concurrently-live sibling holds it → don't cross-attach
-              logger.info(
-                `[panel-orchestrator] tab ${panelTab.slice(0, 8)} hello.resume ${resumeHint.slice(0, 8)} matches a stable key ANOTHER live tab holds — dropping (a concurrent sibling must start fresh, not join the live conversation)`,
-              );
-              break;
-            }
+          otherTabHoldsStableKey = connectedSiblingOwnsStableKey(trustedStableKey, backend);
+          if (otherTabHoldsStableKey) {
+            logger.info(
+              `[panel-orchestrator] tab ${panelTab.slice(0, 8)} hello.resume ${resumeHint.slice(0, 8)} matches a stable key ANOTHER connected tab owns (current or retained provider) — dropping (a sibling must start fresh, not join/steal the conversation)`,
+            );
           }
         }
         const owned = armableResume({ exactOwned, stableOwned, otherTabHoldsStableKey });
@@ -2915,17 +2947,14 @@ export async function runPanelOrchestrator(): Promise<void> {
           //
           // COLLISION GUARD: with the durable per-instance uuid the key is globally
           // unique, so the ONLY way two tabs share it is the SAME workflow open in two
-          // live browser tabs. Seed only when THIS tab is the sole connected holder of
-          // the key, so a fresh sibling can never resume another CONCURRENTLY-live
-          // tab's conversation (setStable also poisons the key the moment two live tabs
-          // write distinct sessions to it). When ambiguous we surface fresh — a lost
-          // resume is a mild miss; resuming the WRONG conversation is not.
+          // browser tabs. Seed only when NO OTHER connected tab OWNS the key's session —
+          // current OR retained on any backend — so a fresh sibling can never resume
+          // another tab's conversation (a provider switch RETAINS the old-backend session,
+          // so the owned-set check, not a current-backend mapping, is what catches it).
+          // When ambiguous we surface fresh — a lost resume is a mild miss; resuming the
+          // WRONG conversation is not.
           if (!armedResume && !manager.hasLiveAgent(key) && sessionStore.get(key) === undefined) {
-            let sameKeyTabs = 0;
-            for (const t of bridge.tabs()) {
-              if (tabStableKey.get(t.tab_id) === skey) sameKeyTabs += 1;
-            }
-            if (sameKeyTabs <= 1) {
+            if (!connectedSiblingOwnsStableKey(skey, backend)) {
               const stableSid = sessionStore.getStable(skey);
               if (stableSid) manager.setResume(key, stableSid);
             }
