@@ -59,7 +59,7 @@ function jsonText(data: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
 }
 
-/** Registry URLs apps_import may fetch from. This is a SERVER-side fetch, so
+/** Registry URLs action:"import" may fetch from. This is a SERVER-side fetch, so
  *  an open URL is an SSRF primitive (loopback/LAN, or a public URL redirecting
  *  into one) — the tool only talks to the default registry or origins the
  *  operator explicitly allowlists (comma-separated, for dev/staging). */
@@ -94,173 +94,188 @@ async function boundedJson(url: string): Promise<unknown> {
   return JSON.parse(new TextDecoder().decode(buf));
 }
 
+/**
+ * The five apps_* tools collapsed into one action-parameterized `apps` tool
+ * (0.49.0 surface consolidation, slice 2).
+ *
+ * SHAPE: a FLAT object with an `action` enum — deliberately NOT a
+ * z.discriminatedUnion, which the MCP SDK renders as a schema with ZERO visible
+ * parameters, hiding every input from the model.
+ *
+ * REQUIREDNESS: only `action` can be schema-required, since each action needs a
+ * different subset (list needs nothing, run_status needs app_id + prompt_id,
+ * import needs registry_url + app_id). Every VALUE constraint the old tools had —
+ * the uuid format on app_id, the URL format on registry_url, and the prompt_id
+ * character class that also blocks route traversal — is UNCHANGED at the zod
+ * layer; only presence moved into the handler, which reports the same missing
+ * field the schema used to. Each branch performs exactly what the old tool did.
+ */
 export function registerAppsTools(server: McpServer): void {
   server.tool(
-    "apps_list",
-    "List the micro-apps registered on this ComfyUI (panel Apps feature). Each entry is the app's " +
-      "manifest: id, name, description, appMode {inputs, outputs}, deps, hideWorkflow, published. " +
-      "Use apps_get for one app's full detail and apps_run to execute one. Read-only.",
-    {},
-    async () => {
-      try {
-        return jsonText(await appsFetch(""));
-      } catch (err) {
-        return errorToToolResult(err);
-      }
-    },
-  );
-
-  server.tool(
-    "apps_get",
-    "Get one micro-app's manifest + bundle facts (has_workflow/has_prompt/has_thumbnail) by id. " +
-      "The manifest's appMode.inputs is the app's run form: each input has nodeId, widget, label, " +
-      "kind (text|number|combo|toggle|image|model), optional choices and default. Read-only.",
+    "apps",
+    "Micro-apps on this ComfyUI (panel Apps feature): named workflows packaged for one-click runs. Driven by the `action` parameter:\n" +
+      '- action:"list" — List every registered app. Each entry is the app\'s manifest: id, name, description, appMode {inputs, outputs}, deps, hideWorkflow, published. No other parameters. Read-only.\n' +
+      '- action:"get" — One app\'s manifest + bundle facts (has_workflow/has_prompt/has_thumbnail) by `app_id`. The manifest\'s appMode.inputs is the app\'s run form: each input has nodeId, widget, label, kind (text|number|combo|toggle|image|model), optional choices and default. Read-only.\n' +
+      '- action:"run" — Run one app: patches `values` (keys \'<nodeId>.<widget>\', e.g. {"6.text": "a cat"}) into the app\'s stored prompt snapshot and queues it on ComfyUI. Returns the prompt_id — poll action:"run_status". Only pass values for inputs listed in appMode.inputs; omitted inputs keep their conversion-time defaults.\n' +
+      '- action:"run_status" — Check one run by `app_id` + `prompt_id`: status (pending|running|done|unknown) plus the run\'s outputs (image/video file refs under each output node, text outputs). Read-only.\n' +
+      '- action:"import" — Install an app from the public registry: fetches the registry bundle (manifest + prompt snapshot [+ workflow unless hidden]) and creates it locally. The registry id becomes the local id, so re-importing reports an id conflict (already installed). Deps (models/custom nodes) are NOT installed — report the manifest\'s deps to the user so they can install them before running.',
     {
-      app_id: z.string().uuid().describe("The app's uuid (from apps_list)."),
-    },
-    async (args) => {
-      try {
-        return jsonText(await appsFetch(`/${args.app_id}`));
-      } catch (err) {
-        return errorToToolResult(err);
-      }
-    },
-  );
-
-  server.tool(
-    "apps_run",
-    "Run a micro-app once: patches `values` (keys '<nodeId>.<widget>', e.g. {\"6.text\": \"a cat\"}) " +
-      "into the app's stored prompt snapshot and queues it on ComfyUI. Returns the prompt_id — poll " +
-      "apps_run_status for completion and outputs. Only pass values for inputs listed in the app's " +
-      "appMode.inputs; omitted inputs keep their conversion-time defaults.",
-    {
-      app_id: z.string().uuid().describe("The app's uuid (from apps_list)."),
+      action: z
+        .enum(["list", "get", "run", "run_status", "import"])
+        .describe(
+          'Which apps operation to perform. "list" takes no other parameters; "get"/"run" require `app_id`; "run_status" requires `app_id` + `prompt_id`; "import" requires `registry_url` + `app_id`.',
+        ),
+      app_id: z
+        .string()
+        .uuid()
+        .optional()
+        .describe(
+          'The app\'s uuid. REQUIRED for actions "get", "run", "run_status" (from action:"list") and "import" (the REGISTRY app\'s uuid, from the explore list).',
+        ),
       values: z
         .record(z.string(), z.any())
         .optional()
         .describe(
-          "Input overrides keyed '<nodeId>.<widget>' (e.g. {\"6.text\": \"a cat\", \"3.seed\": 42}). " +
+          "action:\"run\" — input overrides keyed '<nodeId>.<widget>' (e.g. {\"6.text\": \"a cat\", \"3.seed\": 42}). " +
             "Unknown keys fail loudly (the manifest drifted from the snapshot).",
         ),
-    },
-    async (args) => {
-      try {
-        return jsonText(
-          await appsFetch(`/${args.app_id}/run`, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ values: args.values || {} }),
-          }),
-        );
-      } catch (err) {
-        return errorToToolResult(err);
-      }
-    },
-  );
-
-  server.tool(
-    "apps_run_status",
-    "Check one app run by prompt_id (from apps_run): status (pending|running|done|unknown) plus the " +
-      "run's outputs (image/video file refs under each output node, text outputs). Read-only.",
-    {
-      app_id: z.string().uuid().describe("The app's uuid."),
       // ComfyUI prompt ids are uuids; constraining the shape also blocks
       // route traversal (a "prompt_id" like ../../system_stats would escape
       // the apps route when interpolated into the URL — codex finding).
       prompt_id: z
         .string()
         .regex(/^[0-9a-zA-Z-]{1,64}$/, "must be a ComfyUI prompt id (alphanumeric/dashes)")
-        .describe("The prompt_id returned by apps_run."),
-    },
-    async (args) => {
-      try {
-        // In-handler too (not just the zod boundary): any direct caller with a
-        // traversal-shaped id must never reach the URL builder.
-        if (!/^[0-9a-zA-Z-]{1,64}$/.test(args.prompt_id)) {
-          throw new ComfyUIError("invalid prompt_id", "APPS_BAD_PROMPT_ID");
-        }
-        return jsonText(await appsFetch(`/${args.app_id}/runs/${encodeURIComponent(args.prompt_id)}`));
-      } catch (err) {
-        return errorToToolResult(err);
-      }
-    },
-  );
-
-  server.tool(
-    "apps_import",
-    "Install an app from the public registry onto this ComfyUI: fetches the registry bundle " +
-      "(manifest + prompt snapshot [+ workflow unless hidden]) and creates it as a local app via the " +
-      "panel's Apps API. The registry id becomes the local id, so re-importing the same app reports " +
-      "an id conflict (already installed). Deps (models/custom nodes) are NOT installed — report the " +
-      "manifest's deps to the user so they can install them before running.",
-    {
+        .optional()
+        .describe('action:"run_status" — the prompt_id returned by action:"run". Required for that action.'),
       registry_url: z
         .string()
         .url()
+        .optional()
         .describe(
-          "Registry worker base URL. Must be the default public registry or an origin the operator " +
+          'action:"import" — registry worker base URL (required for that action). Must be the default public registry or an origin the operator ' +
             "allowlisted via COMFYUI_MCP_REGISTRY_URLS (the fetch is server-side — open URLs would be SSRF).",
         ),
-      app_id: z.string().uuid().describe("The registry app's uuid (from the explore list)."),
-      slug: z.string().optional().describe("The app's registry slug (recorded in local metadata)."),
-      version: z.number().int().optional().describe("The registry version (recorded in local metadata)."),
+      slug: z.string().optional().describe('action:"import" — the app\'s registry slug (recorded in local metadata).'),
+      version: z.number().int().optional().describe('action:"import" — the registry version (recorded in local metadata).'),
     },
     async (args) => {
       try {
-        const base = args.registry_url.replace(/\/+$/, "");
-        if (!allowedRegistryBases().includes(base)) {
-          throw new ComfyUIError(
-            `registry_url must be the default registry or an operator-allowlisted origin ` +
-              `(COMFYUI_MCP_REGISTRY_URLS); got ${base}`,
-            "APPS_IMPORT_BAD_URL",
-          );
-        }
-        const bundle = (await boundedJson(`${base}/v1/apps/${args.app_id}/bundle`)) as {
-          manifest?: Record<string, unknown>;
-          prompt?: unknown;
-          workflow?: unknown;
-        };
-        if (!bundle.manifest || !bundle.prompt) {
-          throw new ComfyUIError("registry bundle is missing manifest/prompt", "APPS_IMPORT_BAD_BUNDLE");
-        }
-        const manifest = {
-          ...bundle.manifest,
-          id: args.app_id,
-          source: { type: "registry", workflowUuid: null, registryId: args.app_id },
-          published: {
-            registryId: args.app_id,
-            slug: args.slug || null,
-            publishedVersion: args.version || null,
-          },
-        };
-        // Thumbnails live at a separate registry endpoint, not inside the JSON
-        // bundle — fetch and forward so the installed app keeps its card art.
-        let thumbnail_b64: string | undefined;
-        try {
-          const thumbRes = await fetch(`${base}/v1/apps/${args.app_id}/thumbnail`, {
-            redirect: "error",
-            signal: AbortSignal.timeout(15_000),
-          });
-          if (thumbRes.ok) {
-            const buf = await thumbRes.arrayBuffer();
-            if (buf.byteLength <= 5 * 1024 * 1024) {
-              thumbnail_b64 = Buffer.from(buf).toString("base64");
-            }
+        // app_id is required by four of the five actions but cannot be marked
+        // required in a flat schema, so presence is enforced here with the same
+        // "which field is missing" report the schema used to give.
+        const requireAppId = (action: string): string => {
+          if (!args.app_id) {
+            throw new ComfyUIError(
+              `apps action:"${action}" requires \`app_id\` (the app's uuid).`,
+              "APPS_MISSING_ARG",
+            );
           }
-        } catch {
-          /* no thumbnail — cosmetic only */
+          return args.app_id;
+        };
+
+        switch (args.action) {
+          case "list":
+            return jsonText(await appsFetch(""));
+
+          case "get":
+            return jsonText(await appsFetch(`/${requireAppId("get")}`));
+
+          case "run": {
+            const appId = requireAppId("run");
+            return jsonText(
+              await appsFetch(`/${appId}/run`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ values: args.values || {} }),
+              }),
+            );
+          }
+
+          case "run_status": {
+            const appId = requireAppId("run_status");
+            // In-handler too (not just the zod boundary): any direct caller with a
+            // traversal-shaped id must never reach the URL builder.
+            if (!args.prompt_id || !/^[0-9a-zA-Z-]{1,64}$/.test(args.prompt_id)) {
+              throw new ComfyUIError("invalid prompt_id", "APPS_BAD_PROMPT_ID");
+            }
+            return jsonText(
+              await appsFetch(`/${appId}/runs/${encodeURIComponent(args.prompt_id)}`),
+            );
+          }
+
+          case "import": {
+            const appId = requireAppId("import");
+            if (!args.registry_url) {
+              throw new ComfyUIError(
+                'apps action:"import" requires `registry_url` (the registry worker base URL).',
+                "APPS_MISSING_ARG",
+              );
+            }
+            const base = args.registry_url.replace(/\/+$/, "");
+            if (!allowedRegistryBases().includes(base)) {
+              throw new ComfyUIError(
+                `registry_url must be the default registry or an operator-allowlisted origin ` +
+                  `(COMFYUI_MCP_REGISTRY_URLS); got ${base}`,
+                "APPS_IMPORT_BAD_URL",
+              );
+            }
+            const bundle = (await boundedJson(`${base}/v1/apps/${appId}/bundle`)) as {
+              manifest?: Record<string, unknown>;
+              prompt?: unknown;
+              workflow?: unknown;
+            };
+            if (!bundle.manifest || !bundle.prompt) {
+              throw new ComfyUIError("registry bundle is missing manifest/prompt", "APPS_IMPORT_BAD_BUNDLE");
+            }
+            const manifest = {
+              ...bundle.manifest,
+              id: appId,
+              source: { type: "registry", workflowUuid: null, registryId: appId },
+              published: {
+                registryId: appId,
+                slug: args.slug || null,
+                publishedVersion: args.version || null,
+              },
+            };
+            // Thumbnails live at a separate registry endpoint, not inside the JSON
+            // bundle — fetch and forward so the installed app keeps its card art.
+            let thumbnail_b64: string | undefined;
+            try {
+              const thumbRes = await fetch(`${base}/v1/apps/${appId}/thumbnail`, {
+                redirect: "error",
+                signal: AbortSignal.timeout(15_000),
+              });
+              if (thumbRes.ok) {
+                const buf = await thumbRes.arrayBuffer();
+                if (buf.byteLength <= 5 * 1024 * 1024) {
+                  thumbnail_b64 = Buffer.from(buf).toString("base64");
+                }
+              }
+            } catch {
+              /* no thumbnail — cosmetic only */
+            }
+            const created = await appsFetch("", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({
+                manifest,
+                prompt: bundle.prompt,
+                ...(bundle.workflow ? { workflow: bundle.workflow } : {}),
+                ...(thumbnail_b64 ? { thumbnail_b64 } : {}),
+              }),
+            });
+            return jsonText({ ok: true, installed: created, deps: (bundle.manifest as { deps?: unknown }).deps || {} });
+          }
+
+          default: {
+            // Unreachable given the zod enum, but a clear runtime guard beats a
+            // silent undefined if the schema and switch ever drift apart.
+            const exhaustive: never = args.action;
+            throw new Error(
+              `Unknown apps action "${String(exhaustive)}". Expected one of: list, get, run, run_status, import.`,
+            );
+          }
         }
-        const created = await appsFetch("", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            manifest,
-            prompt: bundle.prompt,
-            ...(bundle.workflow ? { workflow: bundle.workflow } : {}),
-            ...(thumbnail_b64 ? { thumbnail_b64 } : {}),
-          }),
-        });
-        return jsonText({ ok: true, installed: created, deps: (bundle.manifest as { deps?: unknown }).deps || {} });
       } catch (err) {
         return errorToToolResult(err);
       }
