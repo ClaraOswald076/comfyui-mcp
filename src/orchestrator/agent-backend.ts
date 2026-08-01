@@ -15,6 +15,7 @@ export type BackendId =
   | "chatgpt"
   | "gemini"
   | "antigravity"
+  | "pi"
   | "grok"
   | "glm"
   | "kimi"
@@ -253,6 +254,27 @@ export const ANTIGRAVITY_CAPABILITIES: AgentCapabilities = {
   slashCommands: false,
   hooks: false,
   vision: false, // no documented image input in -p mode
+};
+
+/** Capability descriptor for the pi.dev CLI backend (`pi`, issue #491) — the
+ *  open-source multi-provider coding agent from earendil-works. Unlike agy, pi
+ *  exposes a DOCUMENTED machine-readable JSON-lines event stream (`--mode json`)
+ *  with real text deltas, per-tool events, and a resumable session id — so this
+ *  is a spawn-per-turn adapter that parses that stream. inProcessMcp is false and
+ *  there is NO config-MCP path either: pi has no MCP client at all (its tools are
+ *  built-ins + TS extensions), so a pi turn does NOT get the ComfyUI panel_* /
+ *  comfyui tools — a real limitation surfaced in the ready banner. vision=false
+ *  (no documented headless image input). Models come from `pi --list-models`. */
+export const PI_CAPABILITIES: AgentCapabilities = {
+  persistentChannel: true, // spawn-per-turn, continuity via `pi --session <id>`
+  streamingDeltas: true, // `--mode json` text_delta events
+  interruptMidTurn: true, // kill the in-flight child tree; next turn continues
+  forkAtAnchor: false, // whole-session resume only (no per-turn anchor wired)
+  inProcessMcp: false, // pi has no MCP client at all (built-in tools + extensions)
+  modelEnumeration: true, // `pi --list-models`
+  slashCommands: false,
+  hooks: false,
+  vision: false, // no documented headless image input
 };
 
 /** Capability descriptor for the Grok CLI ACP backend (xAI / Grok Build).

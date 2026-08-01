@@ -69,6 +69,7 @@ import {
 import { CodexBackend } from "./codex-backend.js";
 import { GeminiBackend, GEMINI_DEFAULT_MODEL } from "./gemini-backend.js";
 import { AntigravityBackend } from "./antigravity-backend.js";
+import { PiBackend } from "./pi-backend.js";
 import { GrokBackend, GROK_DEFAULT_MODEL } from "./grok-backend.js";
 import { OllamaBackend, OLLAMA_SYSTEM_PROMPT, type OllamaBackendDeps } from "./ollama-backend.js";
 import { ChatGptOAuthBackend, CHATGPT_DEFAULT_MODEL } from "./chatgpt-oauth-backend.js";
@@ -1219,6 +1220,12 @@ export async function runPanelOrchestrator(): Promise<void> {
   // Antigravity (`agy`, issue #262): no default on purpose — unset means the
   // account's own default model; the live catalog comes from `agy models`.
   const antigravityModel = process.env.COMFYUI_MCP_ANTIGRAVITY_MODEL;
+  // pi.dev (`pi`, issue #491): no default on purpose — unset means pi's own
+  // configured default provider/model. When set, COMFYUI_MCP_PI_MODEL accepts a
+  // bare model id or pi's "provider/model" form; COMFYUI_MCP_PI_PROVIDER pins the
+  // provider (--provider). The live catalog comes from `pi --list-models`.
+  const piModel = process.env.COMFYUI_MCP_PI_MODEL;
+  const piProvider = process.env.COMFYUI_MCP_PI_PROVIDER;
   const grokModel = process.env.COMFYUI_MCP_GROK_MODEL ?? GROK_DEFAULT_MODEL;
   // Ollama (local LLMs, issue #97): the model is a local tag applied PER
   // REQUEST — switching live is free. Default = OUR FINE-TUNE,
@@ -1360,6 +1367,7 @@ export async function runPanelOrchestrator(): Promise<void> {
     "chatgpt",
     "gemini",
     "antigravity",
+    "pi",
     "grok",
     // Simple api-key providers (glm/kimi/moonshot) come from the registry.
     ...OPENAI_KEY_PROVIDER_IDS,
@@ -1692,6 +1700,17 @@ export async function runPanelOrchestrator(): Promise<void> {
         mcpServers: makeHttpBackendMcpServers(panelTabId),
       });
     }
+    if (backend === "pi") {
+      // pi has NO MCP client, so it gets NO mcpServers (comfyui/panel tools are
+      // unavailable to pi turns — see pi-backend.ts). It runs as a coding/chat
+      // agent on the user's own provider.
+      return new PiBackend({
+        cwd: comfyuiPath ?? process.cwd(),
+        ...(piModel ? { model: piModel } : {}),
+        ...(piProvider ? { provider: piProvider } : {}),
+        systemAppend: sysAppend,
+      });
+    }
     if (backend === "grok") {
       return new GrokBackend({
         cwd: comfyuiPath ?? process.cwd(),
@@ -1828,6 +1847,12 @@ export async function runPanelOrchestrator(): Promise<void> {
             ? new AntigravityBackend({
                 cwd: comfyuiPath ?? process.cwd(),
                 ...(antigravityModel ? { model: antigravityModel } : {}),
+              })
+          : backend === "pi"
+            ? new PiBackend({
+                cwd: comfyuiPath ?? process.cwd(),
+                ...(piModel ? { model: piModel } : {}),
+                ...(piProvider ? { provider: piProvider } : {}),
               })
           : backend === "grok"
               ? new GrokBackend({ cwd: comfyuiPath ?? process.cwd(), model: grokModel })
@@ -2350,6 +2375,7 @@ export async function runPanelOrchestrator(): Promise<void> {
     if (backend === "codex") return codexModel;
     if (backend === "gemini") return geminiModel;
     if (backend === "antigravity") return antigravityModel;
+    if (backend === "pi") return piModel;
     if (backend === "grok") return grokModel;
     if (backend === "ollama") return ollamaModel;
     if (backend === "openrouter") return openrouterModel;
@@ -3019,6 +3045,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       const isCg = backend === "chatgpt";
       const isGm = backend === "gemini";
       const isAg = backend === "antigravity";
+      const isPi = backend === "pi";
       const isGk = backend === "grok";
       // glm/kimi/moonshot share one registry-driven ack (label + ready + degraded).
       const reg = openAiKeyProvider(backend);
@@ -3081,6 +3108,8 @@ export async function runPanelOrchestrator(): Promise<void> {
                 ? (geminiModel ?? (models[0] as { value?: string }).value ?? "Gemini")
                 : isAg
                   ? (antigravityModel ?? (models[0] as { value?: string }).value ?? "Antigravity")
+                : isPi
+                  ? (piModel ?? (models[0] as { value?: string }).value ?? "Pi")
                 : isGk
                   ? (grokModel ?? (models[0] as { value?: string }).value ?? "Grok")
                 : isOl
@@ -3158,6 +3187,8 @@ export async function runPanelOrchestrator(): Promise<void> {
                 ? "⚠️ The background agent isn't responding — the Gemini CLI couldn't start. Make sure the Gemini CLI is installed and signed in (run `gemini` once and complete the Google sign-in), then Disconnect → Connect to retry."
                 : isAg
                   ? "⚠️ The background agent isn't responding — the Antigravity CLI couldn't answer `agy models`. Install it from https://antigravity.google, run `agy` once and complete the Google Sign-In, then Disconnect → Connect to retry."
+                : isPi
+                  ? "⚠️ The background agent isn't responding — the pi CLI couldn't run `pi --list-models`. Install it from https://pi.dev (`curl -fsSL https://pi.dev/install.sh | sh`), configure a provider (set a provider API key or run `pi` once and `/login`), then Disconnect → Connect to retry."
                 : isGk
                   ? "⚠️ The background agent isn't responding — the Grok CLI couldn't start. Make sure Grok is installed and signed in (run `grok` once and complete the xAI sign-in), then Disconnect → Connect to retry."
                 : isOl

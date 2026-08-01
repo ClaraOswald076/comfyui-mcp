@@ -30,6 +30,8 @@ export function readyBannerText(backend: string, label: string, customBaseUrl = 
       return `🟢 comfyui-mcp agent ready — ${label} on your Google account (Gemini Code Assist). Ask away.`;
     case "antigravity":
       return `🟢 comfyui-mcp agent ready — ${label} on your Google AI subscription via Antigravity CLI. Note: agy turns show final answers only (no live tool progress). Ask away.`;
+    case "pi":
+      return `🟢 comfyui-mcp agent ready — ${label} via the pi CLI on your own provider. Note: pi has no ComfyUI tools (no MCP) — it works with its own coding tools on the local workspace, not the panel canvas. Ask away.`;
     case "grok":
       return `🟢 comfyui-mcp agent ready — ${label} on your Grok (xAI) account. Ask away.`;
     case "ollama":
