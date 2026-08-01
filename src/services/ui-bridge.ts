@@ -18,6 +18,7 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import { logger } from "../utils/logger.js";
+import { compareSemver } from "./self-update.js";
 
 export const DEFAULT_BRIDGE_PORT = 9101;
 
@@ -131,19 +132,59 @@ interface Conn {
 }
 
 /** Panel build that first implements the full graph_* / ui_* bridge command set.
- *  Reports of "Unknown command <x>" come from panels older than this. */
+ *  Used as the DEFAULT minimum for any bridge command not listed in
+ *  BRIDGE_CMD_MIN_PANEL_VERSION below. Individual commands shipped EARLIER than
+ *  this (see the map) and must quote their own, lower minimum. */
 export const MIN_PANEL_VERSION_FOR_BRIDGE_COMMANDS = "0.11.4";
+
+/** The panel version each bridge command was ACTUALLY introduced in (from the
+ *  comfyui-mcp-panel CHANGELOG). The old code quoted a single blanket 0.11.4 for
+ *  EVERY command, which is wrong for commands that shipped much earlier —
+ *  graph_outline has existed since panel 0.4.6, so a "too old — update to ≥0.11.4"
+ *  verdict for it is a false, inflated requirement (#352). Anything not listed
+ *  falls back to MIN_PANEL_VERSION_FOR_BRIDGE_COMMANDS (the full-set baseline). */
+export const BRIDGE_CMD_MIN_PANEL_VERSION: Readonly<Record<string, string>> = {
+  graph_outline: "0.4.6",
+  graph_find_nodes: "0.4.6",
+  graph_query: "0.7.0",
+  graph_serialize: "0.8.2",
+};
+
+/** The minimum panel version that supports `cmd`. */
+export function minPanelVersionForCmd(cmd: string): string {
+  return BRIDGE_CMD_MIN_PANEL_VERSION[cmd] ?? MIN_PANEL_VERSION_FOR_BRIDGE_COMMANDS;
+}
+
+/** A version string compareSemver can actually parse. compareSemver returns 0
+ *  BOTH for "equal" and for "unparseable", so callers that must distinguish an
+ *  unparseable input from a genuine tie (like panelSupportsCmd's `>= 0`) have to
+ *  screen the input first — otherwise `panel_version: "dev"` would compare as 0
+ *  and be mistaken for a match. */
+const SEMVER_RE = /^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?/;
+
+/** True when the panel ADVERTISED a PARSEABLE version (in its `hello`) that already
+ *  meets `cmd`'s real minimum — i.e. this panel is new enough to support the command,
+ *  so an "Unknown command" reply is NOT an age problem and must never be rewritten
+ *  into a "too old — update your panel" verdict (#352 false negative). Missing OR
+ *  unparseable panelVersion → we can't PROVE it's new enough, so treat as not-proven
+ *  (fall through to the honest too-old path, which quotes the correct minimum, and
+ *  keep the #236 learning path intact). */
+function panelSupportsCmd(cmd: string, panelVersion?: string): boolean {
+  if (!panelVersion || !SEMVER_RE.test(panelVersion.trim())) return false;
+  return compareSemver(panelVersion, minPanelVersionForCmd(cmd)) >= 0;
+}
 
 /** The actionable "update your panel" message for a command a connected panel has
  *  been discovered NOT to support. Shared by the reactive path (the panel's own
  *  "Unknown command" reply, mapped by makeUnknownCommandError) and the proactive
  *  gate (#236 — a command already known-unsupported for THIS connection, from an
- *  earlier call in the same session) so both produce the identical message. */
+ *  earlier call in the same session) so both produce the identical message. The
+ *  quoted minimum is COMMAND-SPECIFIC (#352) — not a blanket 0.11.4. */
 function buildPanelTooOldError(cmd: string, panelVersion?: string): Error {
   const detected = panelVersion ? ` (detected ${panelVersion})` : "";
   return new Error(
     `This ComfyUI-MCP panel is too old for "${cmd}"${detected} — update the ComfyUI-MCP panel ` +
-      `to ≥${MIN_PANEL_VERSION_FOR_BRIDGE_COMMANDS} (ComfyUI Manager → update comfyui-mcp panel), then reconnect.`,
+      `to ≥${minPanelVersionForCmd(cmd)} (ComfyUI Manager → update comfyui-mcp panel), then reconnect.`,
   );
 }
 
@@ -167,7 +208,15 @@ export function makeUnknownCommandError(
   // exactly this string. Case-insensitive, tolerant of straight or smart quotes.
   const m = /^unknown command\s*["“']?([\w.-]+)["”']?/i.exec(error.trim());
   if (!m) return null;
-  return buildPanelTooOldError(m[1], panelVersion);
+  const cmd = m[1];
+  // #352 FALSE-NEGATIVE GUARD: if the panel advertised a version that already
+  // meets this command's real minimum, the panel is NOT too old — an "Unknown
+  // command" reply here means something else (a genuinely retired/renamed command,
+  // or a transient), so do NOT rewrite it into a bogus "update your panel" verdict
+  // (which would also POISON the #236 unsupported-cmd gate against a capable panel).
+  // Return null so the raw error surfaces and the gate is never poisoned.
+  if (panelSupportsCmd(cmd, panelVersion)) return null;
+  return buildPanelTooOldError(cmd, panelVersion);
 }
 
 /**

@@ -4,6 +4,7 @@ import {
   UiBridge,
   makeUnknownCommandError,
   MIN_PANEL_VERSION_FOR_BRIDGE_COMMANDS,
+  minPanelVersionForCmd,
   markDispatched,
   dispatchOutcomeOf,
   defaultBridgeTimeoutMs,
@@ -1091,19 +1092,63 @@ describe("defaultBridgeTimeoutMs — tolerant read timeout (#357)", () => {
 
 describe("makeUnknownCommandError (old-panel version gate)", () => {
   it("rewrites an Unknown command reply into an actionable update message", () => {
-    const e = makeUnknownCommandError('Unknown command "graph_query"');
+    // ui_render is not in the per-command map, so it falls back to the blanket
+    // full-set baseline minimum.
+    const e = makeUnknownCommandError('Unknown command "ui_render"');
     expect(e).not.toBeNull();
-    expect(e?.message).toContain("graph_query");
+    expect(e?.message).toContain("ui_render");
     expect(e?.message).toContain(MIN_PANEL_VERSION_FOR_BRIDGE_COMMANDS);
     expect(e?.message.toLowerCase()).toContain("update");
     expect(e?.message.toLowerCase()).toContain("reconnect");
     // The opaque raw internal error must not leak through.
-    expect(e?.message).not.toBe('Unknown command "graph_query"');
+    expect(e?.message).not.toBe('Unknown command "ui_render"');
+  });
+
+  // #352 — the quoted minimum is COMMAND-SPECIFIC, not a blanket 0.11.4. The old
+  // code told users to update to ≥0.11.4 for graph_outline even though it has
+  // shipped since panel 0.4.6 — an inflated, wrong requirement.
+  it("quotes the command's OWN minimum panel version, not the blanket baseline", () => {
+    expect(minPanelVersionForCmd("graph_outline")).toBe("0.4.6");
+    const e = makeUnknownCommandError('Unknown command "graph_outline"');
+    expect(e?.message).toContain("0.4.6");
+    expect(e?.message).not.toContain(MIN_PANEL_VERSION_FOR_BRIDGE_COMMANDS);
   });
 
   it("includes the detected panel version when known", () => {
     const e = makeUnknownCommandError('Unknown command "ui_render"', "0.6.8");
     expect(e?.message).toContain("0.6.8");
+  });
+
+  // #352 FALSE-NEGATIVE boundary: a panel that ADVERTISES a version at/above the
+  // command's real minimum must NEVER be told it is "too old". An Unknown-command
+  // reply from a provably-new-enough panel is not an age problem, so it is NOT
+  // rewritten (returns null → the raw error surfaces, the #236 gate is not poisoned).
+  it("does NOT declare a new-enough panel too old (advertised version meets the minimum)", () => {
+    // graph_outline needs 0.4.6; a 0.11.21 panel is well past it.
+    expect(makeUnknownCommandError('Unknown command "graph_outline"', "0.11.21")).toBeNull();
+    // Exactly-at-the-boundary is new enough (>=), so also not rewritten.
+    expect(makeUnknownCommandError('Unknown command "graph_outline"', "0.4.6")).toBeNull();
+  });
+
+  // An UNPARSEABLE advertised version must NOT be mistaken for new-enough
+  // (compareSemver returns 0 both for "equal" and "unparseable"). Without the
+  // parse screen, `panel_version: "dev"` would compare as 0 (>= 0 → "supported")
+  // and wrongly leak the raw error / skip the #236 learning path.
+  it("treats an unparseable advertised version as NOT proven new enough (still too old)", () => {
+    for (const bad of ["dev", "unknown", "latest", ""]) {
+      const e = makeUnknownCommandError('Unknown command "graph_outline"', bad);
+      expect(e).not.toBeNull();
+      expect(e?.message.toLowerCase()).toContain("too old");
+    }
+  });
+
+  it("still declares a genuinely-too-old panel too old (advertised version below the minimum)", () => {
+    // One patch below graph_outline's 0.4.6 minimum → genuinely too old.
+    const e = makeUnknownCommandError('Unknown command "graph_outline"', "0.4.5");
+    expect(e).not.toBeNull();
+    expect(e?.message.toLowerCase()).toContain("too old");
+    expect(e?.message).toContain("0.4.5"); // detected version surfaced
+    expect(e?.message).toContain("0.4.6"); // correct minimum quoted
   });
 
   it("passes through a genuine command error (returns null)", () => {
@@ -1235,6 +1280,44 @@ describe("UiBridge.send (graceful gate end-to-end)", () => {
 
     const res = await bridge.send({ cmd: "graph_query" }, { tabId: "old-tab-4" });
     expect(res).toEqual({ cmd: "graph_query" });
+  });
+
+  // #352 FALSE NEGATIVE end-to-end: a NEW-ENOUGH panel (advertises 0.11.21, well
+  // past graph_outline's 0.4.6 minimum) that nonetheless replies "Unknown command
+  // graph_outline" must NOT be told it's too old, and — critically — must NOT be
+  // poisoned into the #236 proactive gate, so a later call still reaches the panel.
+  it("does NOT rewrite/gate an Unknown-command reply from a panel that ADVERTISES a new-enough version (#352)", async () => {
+    const sock = await connectPanel(undefined);
+    let dispatchCount = 0;
+    let replyUnknown = true;
+    sock.send(
+      JSON.stringify({ type: "hello", tab_id: "new-tab", title: "wf", panel_version: "0.11.21" }),
+    );
+    sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (!msg.rid || !msg.cmd) return;
+      dispatchCount += 1;
+      if (replyUnknown) {
+        sock.send(JSON.stringify({ rid: msg.rid, ok: false, error: `Unknown command "${msg.cmd}"` }));
+      } else {
+        sock.send(JSON.stringify({ rid: msg.rid, ok: true, result: { cmd: msg.cmd } }));
+      }
+    });
+    await new Promise((r) => setTimeout(r, 50));
+
+    // First call: the raw error surfaces (NOT a "too old — update your panel" verdict).
+    await expect(bridge.send({ cmd: "graph_outline" }, { tabId: "new-tab" })).rejects.toThrow(
+      /unknown command/i,
+    );
+    await expect(
+      bridge.send({ cmd: "graph_outline" }, { tabId: "new-tab" }),
+    ).rejects.not.toThrow(/too old/i);
+    expect(dispatchCount).toBe(2); // NOT gated — the panel was re-reached, not poisoned.
+
+    // Prove the gate was never poisoned: once the panel answers normally, it works.
+    replyUnknown = false;
+    const res = await bridge.send({ cmd: "graph_outline" }, { tabId: "new-tab" });
+    expect(res).toEqual({ cmd: "graph_outline" });
   });
 
   it("tags a POST-write reply-timeout as dispatched:true (frozen tab may still apply it — #509)", async () => {
