@@ -75,7 +75,6 @@ describe("pi provider env keys", () => {
       "MINIMAX_CN_API_KEY",
       "MOONSHOT_API_KEY",
       "OPENCODE_API_KEY",
-      "CLOUDFLARE_API_KEY",
       "XIAOMI_API_KEY",
       "QWEN_TOKEN_PLAN_API_KEY",
       "COPILOT_GITHUB_TOKEN",
@@ -158,6 +157,35 @@ describe("auth.json records", () => {
     expect(piCredentialPresent(home, bareEnv({ OPENAI_API_KEY: "sk" }))).toBe(false);
     // …but an unrelated provider's env key still counts.
     expect(piCredentialPresent(home, bareEnv({ XAI_API_KEY: "sk" }))).toBe(true);
+  });
+
+  it("a FALSY stored entry does not own the provider (pi gates on `if (stored)`)", () => {
+    // pi falls back to the ambient key when the stored value is null, so
+    // suppressing on mere key-presence would false-red a working install.
+    writePiFile(tmp, "auth.json", '{"openai":null}');
+    expect(piCredentialPresent(tmp, bareEnv({ OPENAI_API_KEY: "sk" }))).toBe(true);
+  });
+
+  it("a stored google-vertex record suppresses ambient ADC too", () => {
+    const keyFile = join(tmp, "sa.json");
+    writeFileSync(keyFile, "{}");
+    const adcEnv = {
+      GOOGLE_CLOUD_PROJECT: "p",
+      GOOGLE_CLOUD_LOCATION: "l",
+      GOOGLE_APPLICATION_CREDENTIALS: keyFile,
+    };
+    expect(piCredentialPresent(tmp, bareEnv(adcEnv))).toBe(true);
+    // A stored (but unusable) google-vertex record owns the provider, so pi
+    // never consults ADC for it.
+    writePiFile(tmp, "auth.json", '{"google-vertex":{"type":"api_key","key":""}}');
+    expect(piCredentialPresent(tmp, bareEnv(adcEnv))).toBe(false);
+  });
+
+  it("CLOUDFLARE_API_KEY alone is not a credential — the account id is required", () => {
+    expect(piCredentialPresent(tmp, bareEnv({ CLOUDFLARE_API_KEY: "k" }))).toBe(false);
+    expect(
+      piCredentialPresent(tmp, bareEnv({ CLOUDFLARE_API_KEY: "k", CLOUDFLARE_ACCOUNT_ID: "a" })),
+    ).toBe(true);
   });
 
   it("honours PI_CODING_AGENT_DIR (with ~ expansion)", () => {
@@ -375,18 +403,33 @@ describe("models.json", () => {
     expect(piModelsJsonUsable(modelsPath(), bareEnv({ MY_GW_KEY: "sk" }))).toBe(true);
   });
 
-  it("an `oauth` provider entry is a credential — but only pi's literal \"radius\"", () => {
-    writePiFile(tmp, "models.json", '{"providers":{"radius":{"oauth":"radius"}}}');
+  it("an `oauth` provider entry is a credential — but only pi's literal \"radius\" WITH a baseUrl", () => {
+    writePiFile(tmp, "models.json", '{"providers":{"radius":{"oauth":"radius","baseUrl":"https://r/v1"}}}');
     expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(true);
+    // provider-composer throws `"baseUrl" is required when "oauth" is set`.
+    writePiFile(tmp, "models.json", '{"providers":{"radius":{"oauth":"radius"}}}');
+    expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(false);
     // pi's schema is a literal; any other value makes pi reject the whole file.
     writePiFile(tmp, "models.json", '{"providers":{"x":{"oauth":"nope"}}}');
     expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(false);
   });
 
-  it("a BLANK string on any provider field invalidates the file (pi's minLength 1)", () => {
+  it("an EMPTY string on any provider field invalidates the file (pi's minLength 1)", () => {
     writePiFile(tmp, "models.json", '{"providers":{"good":{"apiKey":"sk"},"bad":{"name":""}}}');
     expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(false);
     writePiFile(tmp, "models.json", '{"providers":{"good":{"apiKey":"sk"},"ok":{"name":"Fine"}}}');
+    expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(true);
+    // minLength 1 accepts a SPACE — trimming here would false-red a config pi loads.
+    writePiFile(tmp, "models.json", '{"providers":{"good":{"apiKey":"sk"},"ok":{"name":" "}}}');
+    expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(true);
+  });
+
+  it("a model definition without a usable `id` invalidates the file", () => {
+    writePiFile(tmp, "models.json", '{"providers":{"p":{"apiKey":"sk","models":[{}]}}}');
+    expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(false);
+    writePiFile(tmp, "models.json", '{"providers":{"p":{"apiKey":"sk","models":[{"id":""}]}}}');
+    expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(false);
+    writePiFile(tmp, "models.json", '{"providers":{"p":{"apiKey":"sk","models":[{"id":"m"}]}}}');
     expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(true);
   });
 
