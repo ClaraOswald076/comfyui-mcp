@@ -13,6 +13,7 @@ import {
   SessionStore,
   deriveStableKey,
   deriveWorkflowIdentity,
+  keepsBackendState,
   workflowIdentityParts,
 } from "../../orchestrator/session-store.js";
 
@@ -439,5 +440,98 @@ describe("SessionStore", () => {
     const restarted = new SessionStore(PORT);
     expect(restarted.get("e2e-stale::claude")).toBeUndefined();
     expect(restarted.getStable("spike-stale")).toBeUndefined();
+  });
+
+  // #570 — per-backend teardown at the identity boundary. A cold-start hello on ONE provider
+  // must NOT erase a DIFFERENT provider's still-valid same-workflow session.
+  describe("keepsBackendState — provider-switch continuity survives a cold start (#570)", () => {
+    const HELLO = `http://127.0.0.1:8188::${UUID_A}`;
+
+    it("KEEPS a dormant provider whose DURABLE identity matches the hello workflow", () => {
+      // Claude has a persisted session bound to workflow A; this hello selected Codex after a
+      // restart (tabStableIdentity empty). Claude's session belongs to the SAME workflow → keep.
+      expect(
+        keepsBackendState({
+          storedIdentity: HELLO, // Claude's Entry.u
+          priorIdentity: undefined, // cold start
+          isCurrentBackend: false, // Claude is the DORMANT provider here
+          helloIdentity: HELLO,
+        }),
+      ).toBe(true);
+    });
+
+    it("RESETS a provider bound to a DIFFERENT workflow (in-place replacement)", () => {
+      const OTHER = `http://127.0.0.1:8188::${UUID_B}`;
+      expect(
+        keepsBackendState({
+          storedIdentity: OTHER,
+          priorIdentity: undefined,
+          isCurrentBackend: false,
+          helloIdentity: HELLO,
+        }),
+      ).toBe(false);
+    });
+
+    it("RESETS a provider with NO durable record unless it is the CURRENT backend with a matching prior identity", () => {
+      // Dormant, no session → reset (nothing proven).
+      expect(
+        keepsBackendState({ storedIdentity: undefined, isCurrentBackend: false, helloIdentity: HELLO }),
+      ).toBe(false);
+      // Current backend, spawn-window live agent (no durable record): the tab's prior-hello
+      // identity certifies it.
+      expect(
+        keepsBackendState({
+          storedIdentity: undefined,
+          priorIdentity: HELLO,
+          isCurrentBackend: true,
+          helloIdentity: HELLO,
+        }),
+      ).toBe(true);
+      // …but a dormant provider must NOT borrow the tab's prior identity.
+      expect(
+        keepsBackendState({
+          storedIdentity: undefined,
+          priorIdentity: HELLO,
+          isCurrentBackend: false,
+          helloIdentity: HELLO,
+        }),
+      ).toBe(false);
+    });
+
+    it("FAILS CLOSED when the hello carries no identity (identity-less client)", () => {
+      expect(
+        keepsBackendState({ storedIdentity: HELLO, isCurrentBackend: true, helloIdentity: undefined }),
+      ).toBe(false);
+    });
+
+    it("END-TO-END: a persisted Claude session survives a restart + hello on Codex for the same workflow", () => {
+      const store = new SessionStore(PORT);
+      // Claude conversed on workflow A before the restart — persisted, bound to A's identity.
+      store.set("tmp:tabW::claude", "sess-claude-A", HELLO);
+      // Cold start: tabStableIdentity empty; the first hello selects Codex for the SAME workflow.
+      // The per-backend loop keeps Claude (matching) and resets Codex (no record).
+      const backends = ["claude", "codex"] as const;
+      const helloBackend = "codex";
+      const kept: string[] = [];
+      for (const b of backends) {
+        const bKey = `tmp:tabW::${b}`;
+        if (
+          keepsBackendState({
+            storedIdentity: store.identityOf(bKey),
+            priorIdentity: undefined,
+            isCurrentBackend: b === helloBackend,
+            helloIdentity: HELLO,
+          })
+        ) {
+          kept.push(b);
+          continue;
+        }
+        store.clear(bKey); // models manager.reset()'s durable-session clear
+      }
+      expect(kept).toEqual(["claude"]);
+      // Switching back to Claude still resumes the pre-restart conversation.
+      expect(store.get("tmp:tabW::claude")).toBe("sess-claude-A");
+      expect(new SessionStore(PORT).get("tmp:tabW::claude")).toBe("sess-claude-A"); // durable
+    });
   });
 });

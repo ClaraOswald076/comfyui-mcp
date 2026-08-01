@@ -151,6 +151,27 @@ export function deriveWorkflowIdentity(opts: {
   return p ? `${p.origin}::${p.uuid}` : undefined;
 }
 
+/** #570 — per-backend teardown decision at the identity boundary. When a hello is NOT proven
+ *  for the SELECTED backend, each provider's state must be judged on its OWN merits rather than
+ *  globally reset off the selected backend: a DORMANT provider's session is KEPT (resumable)
+ *  only when the identity it belongs to PROVABLY matches this hello's workflow identity — its
+ *  DURABLE stored identity (Entry.u), or, for the CURRENT hello's backend only, the tab's
+ *  PRIOR-hello identity (covering the spawn→first-session live-agent window that has no durable
+ *  record yet). This is what makes an orchestrator restart + provider switch preserve the other
+ *  provider's SAME-workflow conversation instead of erasing it irreversibly. Returns true = KEEP,
+ *  false = reset. Fails closed: any absent/mismatched identity resets. */
+export function keepsBackendState(opts: {
+  storedIdentity?: string | undefined;
+  priorIdentity?: string | undefined;
+  isCurrentBackend: boolean;
+  helloIdentity?: string | undefined;
+}): boolean {
+  const bIdentity = opts.storedIdentity ?? (opts.isCurrentBackend ? opts.priorIdentity : undefined);
+  return (
+    bIdentity !== undefined && opts.helloIdentity !== undefined && bIdentity === opts.helloIdentity
+  );
+}
+
 export class SessionStore {
   /** Entries untouched for longer than this are pruned on load. Resumes are
    *  same-day / few-days in practice; three weeks is a generous ceiling that still

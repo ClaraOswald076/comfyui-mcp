@@ -21,7 +21,12 @@ import { setupSecureBridge, resolveComfyuiPathForTarget, type SecureBridge } fro
 import { startQuickTunnel } from "../services/tunnel.js";
 import { detectInstallMode } from "../services/self-update.js";
 import { SelfRestarter } from "../services/self-restart.js";
-import { SessionStore, deriveStableKey, workflowIdentityParts } from "./session-store.js";
+import {
+  SessionStore,
+  deriveStableKey,
+  keepsBackendState,
+  workflowIdentityParts,
+} from "./session-store.js";
 import { listSessions, loadTranscript } from "./history.js";
 import { uploadImageHttp, resetClient } from "../comfyui/client.js";
 import { logger } from "../utils/logger.js";
@@ -2739,19 +2744,42 @@ export async function runPanelOrchestrator(): Promise<void> {
         // trusted handshake origin so it proves out; only genuinely identity-less (non-browser)
         // or pre-`u`/legacy clients pay a lost resume (never a cross-workflow leak).
         const helloIdentity = newIdentity ? `${newIdentity.origin}::${newIdentity.uuid}` : undefined;
-        const stateIdentity =
-          sessionStore.identityOf(key) ??
-          (priorTabIdentity ? `${priorTabIdentity.origin}::${priorTabIdentity.uuid}` : undefined);
+        const priorTabIdentityStr = priorTabIdentity
+          ? `${priorTabIdentity.origin}::${priorTabIdentity.uuid}`
+          : undefined;
+        const stateIdentity = sessionStore.identityOf(key) ?? priorTabIdentityStr;
         const provenOwn =
           stateIdentity !== undefined && helloIdentity !== undefined && stateIdentity === helloIdentity;
         if (!provenOwn) {
-          // Tear down every channel for panelTab. manager.reset() stops the agent + clears
-          // pending resume + held mail + durable session, per provider; heldDuringGen is the
-          // render-held queue; dropQueuedDeliveries is the bridge's missed frames + mailbox
-          // (the bridge defers its on-hello replay until AFTER this handler so this lands first).
-          for (const b of KNOWN_BACKENDS) manager.reset(panelTab + AGENT_KEY_SEP + b);
-          for (const hk of [...heldDuringGen.keys()]) {
-            if (panelTabOf(hk) === panelTab) heldDuringGen.delete(hk);
+          // Tear down every channel for panelTab whose state is NOT provably this workflow's.
+          // manager.reset() stops the agent + clears pending resume + held mail + durable
+          // session, PER PROVIDER; heldDuringGen is the render-held queue; dropQueuedDeliveries
+          // is the bridge's missed frames + mailbox (the bridge defers its on-hello replay until
+          // AFTER this handler so this lands first).
+          //
+          // PER-BACKEND ownership (#570 — codex): the reset must be evaluated per provider, NOT
+          // globally off the SELECTED backend. After an orchestrator restart tabStableIdentity is
+          // empty, so if the workflow has a persisted Claude session but this first hello selects
+          // Codex, a global reset would ERASE Claude's still-valid same-workflow session
+          // (irreversible loss on a normal restart + provider switch). A DORMANT backend is KEPT
+          // when its DURABLE identity (Entry.u) matches this hello's workflow identity — provider-
+          // switch continuity for the SAME workflow survives cold start. The CURRENT backend
+          // additionally trusts the tab's PRIOR-hello identity so its spawn-window live agent
+          // (no durable record yet) is covered. Everything unmatched/unbound is torn down.
+          for (const b of KNOWN_BACKENDS) {
+            const bKey = panelTab + AGENT_KEY_SEP + b;
+            if (
+              keepsBackendState({
+                storedIdentity: sessionStore.identityOf(bKey),
+                priorIdentity: priorTabIdentityStr,
+                isCurrentBackend: b === backend,
+                helloIdentity,
+              })
+            ) {
+              continue; // same-workflow session on this provider — keep it resumable
+            }
+            manager.reset(bKey);
+            heldDuringGen.delete(bKey); // render-held work belonging to the torn-down provider
           }
           bridge.dropQueuedDeliveries(panelTab);
         }
