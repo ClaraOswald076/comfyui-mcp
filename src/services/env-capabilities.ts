@@ -445,6 +445,7 @@ export const BACKEND_LABELS: Record<string, string> = {
   glm: "GLM",
   kimi: "Kimi",
   moonshot: "Kimi K3 (Moonshot)",
+  minimax: "MiniMax",
   ollama: "Ollama",
   openrouter: "OpenRouter",
   copilot: "Copilot",
