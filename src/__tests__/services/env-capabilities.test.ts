@@ -128,6 +128,7 @@ describe("resolveBackends (#358 — report the ACTUAL backend, never a wrong spe
     expect(resolveBackends("gemini").backend).toBe("Gemini");
     expect(resolveBackends("ollama").backend).toBe("Ollama");
     expect(resolveBackends("copilot").backend).toBe("Copilot");
+    expect(resolveBackends("minimax").backend).toBe("MiniMax");
     expect(resolveBackends("claude").backend).toBe("Claude");
     // Case-insensitive.
     expect(resolveBackends("GROK").backend).toBe("Grok");
