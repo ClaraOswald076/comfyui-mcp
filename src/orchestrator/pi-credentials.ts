@@ -89,6 +89,18 @@ export const PI_PROVIDER_ENV_KEYS: Readonly<Record<string, readonly string[]>> =
   bedrock: ["AWS_BEARER_TOKEN_BEDROCK"],
 };
 
+/**
+ * Extra env vars a provider needs ALONGSIDE its key when authenticating purely
+ * from the environment. pi's cloudflare-auth.ts returns undefined unless both the
+ * key and the account id are present (plus the gateway id for the AI Gateway),
+ * so the key alone is not a credential. Only providers whose companion
+ * requirement is confirmed in pi's source are listed here.
+ */
+const PI_PROVIDER_ENV_REQUIRED: Readonly<Record<string, readonly string[]>> = {
+  "cloudflare-workers-ai": ["CLOUDFLARE_ACCOUNT_ID"],
+  "cloudflare-ai-gateway": ["CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_GATEWAY_ID"],
+};
+
 /** Flat view of every credential env var pi reads. */
 export const PI_ENV_API_KEYS: readonly string[] = Object.values(PI_PROVIDER_ENV_KEYS).flat();
 
@@ -355,14 +367,25 @@ export function piModelsJsonUsable(file: string, procEnv: NodeJS.ProcessEnv = pr
  *  permissive so we never false-red a file pi accepts. */
 function providerEntryValid(entry: unknown): boolean {
   if (!isPlainObject(entry)) return false;
-  if (entry.oauth !== undefined && entry.oauth !== "radius") return false;
-  if (entry.models !== undefined && (!Array.isArray(entry.models) || !entry.models.every(isPlainObject)))
-    return false;
-  // pi's schema declares its string fields with minLength 1, so ANY blank string
-  // (`name: ""`, `baseUrl: ""`, `apiKey: ""`, …) fails validation and makes pi
-  // discard the whole file. Checking the shape generically covers the fields we
-  // haven't enumerated without having to reproduce the full TypeBox schema.
-  return Object.values(entry).every((v) => typeof v !== "string" || v.trim() !== "");
+  if (entry.oauth !== undefined) {
+    if (entry.oauth !== "radius") return false;
+    // provider-composer.ts throws `"baseUrl" is required when "oauth" is set`,
+    // which discards the file — so an oauth entry without one is not a credential.
+    if (typeof entry.baseUrl !== "string" || entry.baseUrl.length === 0) return false;
+  }
+  if (entry.models !== undefined) {
+    if (!Array.isArray(entry.models)) return false;
+    // Every model definition needs an id; a `{}` model is not a usable model and
+    // fails the schema, taking the whole file with it.
+    if (!entry.models.every((m) => isPlainObject(m) && typeof m.id === "string" && m.id.length > 0))
+      return false;
+  }
+  // pi's schema declares its string fields with minLength 1, so an EMPTY string
+  // (`name: ""`, `baseUrl: ""`, …) fails validation and makes pi discard the
+  // whole file. Checked generically to cover the fields we haven't enumerated
+  // without reproducing the full TypeBox schema. Length, NOT trim: minLength 1
+  // accepts `" "`, so trimming here would false-red a config pi loads fine.
+  return Object.values(entry).every((v) => typeof v !== "string" || v.length > 0);
 }
 
 /** True only for an existing REGULAR file — a directory at a credentials path is
@@ -441,10 +464,22 @@ function piEnvCredentialPresent(
 ): boolean {
   const stripped = new Set<string>(TOOL_ONLY_SECRET_ENV_KEYS);
   for (const [provider, keys] of Object.entries(PI_PROVIDER_ENV_KEYS)) {
-    if (Object.prototype.hasOwnProperty.call(storedProviders, provider)) continue;
-    if (keys.some((k) => !stripped.has(k) && !!procEnv[k]?.trim())) return true;
+    if (providerHasStoredCredential(storedProviders, provider)) continue;
+    if (!keys.some((k) => !stripped.has(k) && !!procEnv[k]?.trim())) continue;
+    // Some providers need companion config alongside the key — without it pi's
+    // resolver returns undefined and the key is useless on its own.
+    const required = PI_PROVIDER_ENV_REQUIRED[provider];
+    if (required && !required.every((k) => !!procEnv[k]?.trim())) continue;
+    return true;
   }
   return false;
+}
+
+/** Does auth.json carry a stored credential for `provider`? pi's resolver gates
+ *  on `if (stored)`, so a null/false entry is NOT a stored credential and the
+ *  ambient env is still consulted — only a truthy record takes ownership. */
+function providerHasStoredCredential(storedProviders: Record<string, unknown>, provider: string): boolean {
+  return !!storedProviders[provider];
 }
 
 /**
@@ -463,7 +498,10 @@ export function piCredentialPresent(
   const stored = piAuthRecords(authFile);
   if (Object.values(stored).some((rec) => authRecordUsable(rec, procEnv, nowMs))) return true;
   if (piEnvCredentialPresent(stored, procEnv)) return true;
-  if (piVertexAdcUsable(home, procEnv)) return true;
+  // Vertex ADC is ambient credential too, so a stored google-vertex record owns
+  // that provider and suppresses it (same rule as the env keys above).
+  if (!providerHasStoredCredential(stored, "google-vertex") && piVertexAdcUsable(home, procEnv))
+    return true;
   if (piModelsJsonUsable(join(agentDir, "models.json"), procEnv)) return true;
   return false;
 }
