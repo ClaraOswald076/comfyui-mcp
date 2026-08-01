@@ -1795,17 +1795,30 @@ export class UiBridge {
     // Refusing to DISPATCH is the only server-side guarantee. Reads (outline, query, get_state,
     // serialize, …) and path-targeted workflow ops stay allowed, so an old panel keeps
     // read-only graph access with a clear "update to edit" error, never a silent wrong write.
-    if (requiresWorkflowStampEnforcement(cmd) && !conn.enforcesWorkflowStamp) {
-      return Promise.reject(
-        markDispatched(
-          new Error(
-            `"${cmd.cmd}" needs a panel that enforces per-command workflow targeting, but panel tab ` +
-              `${conn.tabId.slice(0, 8)} does not (update the ComfyUI-MCP panel to edit the graph). ` +
-              `Read-only graph commands (graph_outline, graph_query, graph_get_state) still work.`,
+    //
+    // Require BOTH (codex): the panel must advertise enforcement AND the command must actually
+    // CARRY a trusted workflow-uuid stamp. Enforcement alone is not enough — if the tab has no
+    // resolvable identity (missing/malformed uuid, relay client), the frame ships UNSTAMPED and
+    // the panel's fence has nothing to compare, so a stale mutation after a switch would run
+    // unfenced despite the "enforces" claim. No stamp ⇒ nothing to fence ⇒ refuse the mutation.
+    if (requiresWorkflowStampEnforcement(cmd)) {
+      const stamp = this.resolveTabWorkflowUuid?.(opts.tabId ?? conn.tabId);
+      const hasTrustedStamp = typeof stamp === "string" && stamp.length > 0;
+      if (!conn.enforcesWorkflowStamp || !hasTrustedStamp) {
+        const why = !conn.enforcesWorkflowStamp
+          ? `panel tab ${conn.tabId.slice(0, 8)} does not enforce per-command workflow targeting ` +
+            `(update the ComfyUI-MCP panel to edit the graph)`
+          : `this workflow has no trusted identity for the panel to fence the command against`;
+        return Promise.reject(
+          markDispatched(
+            new Error(
+              `"${cmd.cmd}" cannot be safely targeted to the active workflow: ${why}. Read-only graph ` +
+                `commands (graph_outline, graph_query, graph_get_state) still work.`,
+            ),
+            false,
           ),
-          false,
-        ),
-      );
+        );
+      }
     }
     if (conn.sock.readyState !== WebSocket.OPEN) {
       if (opts.tabId && UiBridge.isMailboxable(cmd)) {

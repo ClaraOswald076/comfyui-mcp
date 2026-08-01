@@ -93,6 +93,10 @@ beforeEach(async () => {
   // a parallel test file on loaded CI, leaving whenReady() false (the #486/#619
   // Windows bind flake). startBridgeOnFreePort awaits `listening` internally.
   ({ bridge, port } = await startBridgeOnFreePort());
+  // #570 P0c — by default a tab has a trusted workflow identity (current panels always send a
+  // valid workflow_uuid), so mutating graph/workflow commands carry a stamp and pass the gate.
+  // Tests that exercise the NO-stamp / cross-workflow-switch cases override this resolver.
+  bridge.setTabWorkflowUuidResolver(() => "11111111-1111-4111-8111-111111111111");
 });
 
 afterEach(async () => {
@@ -1277,9 +1281,12 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     desktop.close();
   });
 
-  it("does NOT stamp a workflow uuid when the tab has no established identity (fail-open for old panels) (#570)", async () => {
+  it("REFUSES a mutation when the tab has no trusted workflow identity, even if the panel advertises enforcement (#570 P0c)", async () => {
+    // A panel that CLAIMS enforcement but has no resolvable workflow uuid: the frame would ship
+    // UNSTAMPED, so the panel's fence has nothing to compare and a stale mutation after a switch
+    // would run unfenced. No stamp ⇒ nothing to fence ⇒ refuse the mutation (codex). Reads pass.
     bridge.setTabWorkflowUuidResolver(() => undefined);
-    const desktop = await connectPanel("tmp:none", "N");
+    const desktop = await connectPanel("tmp:none", "N"); // connectPanel advertises enforcement
     const frames: Array<Record<string, unknown>> = [];
     desktop.on("message", (buf) => {
       const m = JSON.parse(buf.toString());
@@ -1289,9 +1296,34 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
       }
     });
     await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:none")).toBe(true));
-    await bridge.send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "tmp:none" });
-    await vi.waitFor(() => expect(frames.find((f) => f.cmd === "graph_add_node")).toBeTruthy());
-    expect("workflow_uuid" in (frames.find((f) => f.cmd === "graph_add_node") as object)).toBe(false);
+    await expect(
+      bridge.send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "tmp:none" }),
+    ).rejects.toThrow(/no trusted identity|cannot be safely targeted/i);
+    // A READ still dispatches (unstamped is fine — reads have no side effect).
+    await bridge.send({ cmd: "graph_get_state" } as never, { tabId: "tmp:none" });
+    await vi.waitFor(() => expect(frames.find((f) => f.cmd === "graph_get_state")).toBeTruthy());
+    desktop.close();
+  });
+
+  it("REFUSES a mutation on a same-socket switch when the tab has no trusted uuid (no unstamped write to the replacement) (#570 P0c)", async () => {
+    // Codex regression: an enforcement-advertising panel with NO valid workflow uuid, then a
+    // same-socket workflow switch — a mutating command must NOT be dispatched (it would arrive at
+    // the replacement canvas UNSTAMPED, unfenceable).
+    bridge.setTabWorkflowUuidResolver(() => undefined);
+    const desktop = await connectPanel("tmp:sA", "A");
+    desktop.on("message", (buf) => {
+      const m = JSON.parse(buf.toString());
+      if (m.rid && m.cmd) desktop.send(JSON.stringify({ rid: m.rid, ok: true, result: {} }));
+    });
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:sA")).toBe(true));
+    // Same-socket switch to a different workflow.
+    desktop.send(JSON.stringify({ type: "hello", tab_id: "tmp:sB", title: "B", enforces_workflow_stamp: true }));
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:sB")).toBe(true));
+    // A late command issued for A resolves onto B's socket — with no trusted uuid it is refused,
+    // never written unstamped to B.
+    await expect(
+      bridge.send({ cmd: "graph_add_node", node: "y" } as never, { tabId: "tmp:sA" }),
+    ).rejects.toThrow(/no trusted identity|cannot be safely targeted/i);
     desktop.close();
   });
 
