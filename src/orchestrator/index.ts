@@ -2534,6 +2534,13 @@ export async function runPanelOrchestrator(): Promise<void> {
           prevIdentity.uuid === newIdentity.uuid &&
           prevIdentity.origin === newIdentity.origin;
         if (!sameWorkflow) {
+          // FENCE the bridge route FIRST: the bridge already installed a fromId→newId
+          // alias for this same-socket re-hello, and each panel MCP server stays bound
+          // to its original tab id. Revoke it before retiring so a stale / in-flight
+          // panel_* call from the old workflow can't resolve through the alias and mutate
+          // the newly-selected canvas (codex review) — it fails to route instead, and
+          // the retired agent ignores the error.
+          bridge.revokeTabMigration(migratedFrom);
           manager.retire(migratedFrom + AGENT_KEY_SEP + prevBackend);
           logger.info(
             `[panel-orchestrator] same-socket re-hello ${migratedFrom.slice(0, 12)} → ${panelTab.slice(0, 12)} without proven workflow continuity — old agent retired (NOT rebound); each workflow keeps its own conversation`,

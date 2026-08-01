@@ -270,6 +270,33 @@ describe("UiBridge (mailbox — offline render delivery)", () => {
   });
 });
 
+describe("UiBridge — revokeTabMigration fences a switched-away workflow's route (#570 P0a)", () => {
+  it("stops a stale panel_* call to the old id from resolving onto the new workflow", async () => {
+    // One socket hellos as workflow A, then re-hellos as a DIFFERENT workflow B (a
+    // same-socket switch) — the bridge installs the A→B migration alias.
+    const sock = await connectPanel("wf:A", "workflow-a");
+    autoReply(sock, "the-live-canvas");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:A")).toBe(true));
+    sock.send(JSON.stringify({ type: "hello", tab_id: "wf:B", title: "workflow-b" }));
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:B")).toBe(true));
+
+    // BEFORE the fence: a stale call addressed to the OLD id resolves THROUGH the alias
+    // to the live socket (now showing B) — the exact wrong-canvas mutation path.
+    const leaked = await bridge.send({ cmd: "graph_get_state" }, { tabId: "wf:A" });
+    expect(leaked).toMatchObject({ from: "the-live-canvas" });
+
+    // Fence it (what the orchestrator does on an unproven same-socket switch).
+    bridge.revokeTabMigration("wf:A");
+
+    // AFTER: the same stale call no longer routes to B — it fails to resolve instead of
+    // mutating the newly-selected canvas. B's own id still routes fine.
+    await expect(bridge.send({ cmd: "graph_get_state" }, { tabId: "wf:A" })).rejects.toThrow();
+    const direct = await bridge.send({ cmd: "graph_get_state" }, { tabId: "wf:B" });
+    expect(direct).toMatchObject({ from: "the-live-canvas" });
+    sock.close();
+  });
+});
+
 describe("UiBridge (typed dispatch outcome — panel #442 defect 4)", () => {
   // Reply to any command with an executor FAILURE (ok:false). Mirrors a panel-side
   // graph executor rejecting — the bridge turns it into a plain Error with NO typed

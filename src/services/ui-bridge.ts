@@ -1306,6 +1306,24 @@ export class UiBridge {
     }
   }
 
+  /** Fence a same-socket migration alias (#570 P0a): drop the `fromId → to` route and
+   *  every other entry that points at the SAME target (fromId's path-compressed chain),
+   *  so a RETIRED workflow's stale / in-flight panel_* calls addressed to fromId can no
+   *  longer resolve THROUGH the alias onto the newly-selected workflow's canvas. Called
+   *  when a same-socket re-hello is NOT a proven same-workflow continuation (a workflow
+   *  SWITCH). The new tab routes directly via its own live connection, so fencing the old
+   *  routes never affects it; a stale call to fromId simply fails to resolve (and its
+   *  now-stopped agent ignores the error) instead of mutating the wrong graph. */
+  revokeTabMigration(fromId: string): void {
+    const target = this.tabMigrations.get(fromId)?.to;
+    this.tabMigrations.delete(fromId);
+    if (target) {
+      for (const [from, entry] of this.tabMigrations) {
+        if (entry.to === target) this.tabMigrations.delete(from);
+      }
+    }
+  }
+
   /** SERVER-TRUSTED: true only when this tab's socket arrived on the token-less
    *  loopback primary listener (a browser on the orchestrator's OWN host), so its
    *  advertised loopback ComfyUI origin really is the orchestrator's local host and
