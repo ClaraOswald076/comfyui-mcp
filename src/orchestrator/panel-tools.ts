@@ -2791,7 +2791,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_set_widget",
-      "Set a widget value on a node in the user's open graph (steps, cfg, seed, ckpt_name, text prompts, …). Returns the previous and new value. Undoable with Ctrl+Z. To CLEAR a text widget to an empty string, pass `clear: true` (some MCP clients drop an empty-string `value` from the serialized payload, so `value: \"\"` may not arrive — `clear: true` always works).",
+      "Set a widget value on a node in the user's open graph (steps, cfg, seed, ckpt_name, text prompts, …). Returns the previous and new value. Undoable with Ctrl+Z. To CLEAR a text widget to an empty string, pass `clear: true` (some MCP clients drop an empty-string `value` from the serialized payload, so `value: \"\"` may not arrive — `clear: true` always works). For the LTXDirector timeline node (WhatDreamsCost CSGlide), set `timeline_data` with the FULL timeline JSON (segments + global_prompt) to drive its custom timeline UI — this re-syncs the editor and regenerates its derived `local_prompts`/`segment_lengths`/`guide_strength` widgets; setting those derived widgets directly is refused (they are silently reverted).",
       {
         node_id: z.number().int().describe("Node id from panel_graph_outline / panel_query_graph."),
         widget: z.string().describe("Widget name (e.g. 'steps', 'cfg', 'text')."),
@@ -2825,6 +2825,19 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         pos: xy().describe("New canvas [x, y] (two numbers)."),
       },
       async (args: A, ctx) => ctx.call({ cmd: "graph_move_node", node_id: args.node_id, pos: args.pos }),
+    ),
+    def(
+      "panel_resize_node",
+      "Resize a node to [width, height] (canvas px) on the user's open graph. Essential for Note / MarkdownNote nodes, which are created tiny (140×60) and are unreadable until enlarged — panel_move_node only repositions, it cannot resize. Uses the node's own setSize so DOM-widget nodes (MarkdownNote) and nodes that clamp to a computed minimum reflow correctly. Undoable with Ctrl+Z.",
+      {
+        node_id: z.number().int().describe("Node id from panel_graph_outline / panel_query_graph."),
+        size: z
+          .array(z.number())
+          .min(2)
+          .max(2)
+          .describe("New [width, height] in canvas px (both > 0)."),
+      },
+      async (args: A, ctx) => ctx.call({ cmd: "graph_resize_node", node_id: args.node_id, size: args.size }),
     ),
     def(
       "panel_auto_layout",
