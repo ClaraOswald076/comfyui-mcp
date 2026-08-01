@@ -191,6 +191,8 @@ const PI_ENV_KEYS = [
   // Scrubbed too so a developer's real roaming profile can never be consulted by
   // a probe here (belt-and-braces: the ADC check already needs project+location).
   "APPDATA",
+  // …and so a developer who relocated their own pi config can't leak it in.
+  "PI_CODING_AGENT_DIR",
 ];
 function withNoPiEnvKeys<T>(fn: () => T): T {
   const saved: Record<string, string | undefined> = {};
