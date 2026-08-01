@@ -99,6 +99,11 @@ const SELF = new Set([
   // names it checks — they are data under assertion, not an instruction to a model
   // to call anything. Exact path, never an __tests__/ glob (see the note above).
   "src/__tests__/tools/node-bisect-tool.test.ts",
+  // Same, for 0.49.0 slice 2: each asserts as FIXTURES that the names its tool
+  // replaced are in DEAD_NAMES (node_snapshot ← 3, batch ← 4, apps ← 5).
+  "src/__tests__/tools/node-snapshots-tool.test.ts",
+  "src/__tests__/tools/batches.test.ts",
+  "src/__tests__/tools/apps.test.ts",
   // Generated FROM the ledger by scripts/export-vocabulary.mts, so it reproduces
   // the dead names as data for the panel to consume. Caught this gate out a second
   // time, in the same way as the first: green while untracked, red once committed.

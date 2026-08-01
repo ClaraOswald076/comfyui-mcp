@@ -730,17 +730,15 @@ const CALL_TOOL_WHITELIST = new Set<string>([
   "runpod_unwatch",
   "runpod_deploy_link",
   // Micro-Apps (panel "Apps" feature): the canvas-less client's list/run/poll
-  // surface. Same risk posture as enqueue_workflow (already whitelisted): run
-  // queues a job the user explicitly tapped; list/get/status are read-only.
-  "apps_list",
-  "apps_get",
-  "apps_run",
-  "apps_run_status",
-  // Registry install (mobile Explore): the rig fetches the bundle from the
-  // public registry and imports it locally. Same risk as save_workflow +
-  // download_model (already whitelisted): writes a local app bundle, no
-  // model/system mutation. Deps install stays a separate consented action.
-  "apps_import",
+  // surface, plus registry install. One tool since 0.49.0 slice 2, so the
+  // whitelist can no longer distinguish the actions — the risk posture is judged
+  // over the whole tool. Run queues a job the user explicitly tapped (same as
+  // enqueue_workflow, already whitelisted); list/get/run_status are read-only;
+  // import (mobile Explore) has the rig fetch a bundle from the public registry
+  // and write it locally, the same risk as save_workflow + download_model
+  // (already whitelisted) — no model/system mutation, and deps install stays a
+  // separate consented action.
+  "apps",
   // App dependency side-panel (Explore/detail): the ✓/download panel reads what
   // an app needs vs what's installed and offers per-item fetches. Reads are safe
   // (missing-model detection + candidate resolution, node-pack presence); model

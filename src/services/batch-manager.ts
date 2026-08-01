@@ -90,7 +90,7 @@ async function persistBatch(record: BatchRecord): Promise<void> {
 export async function loadBatch(batchId: string): Promise<BatchRecord> {
   if (!BATCH_ID_RE.test(batchId)) {
     throw new ValidationError(
-      `Invalid batch_id "${batchId}" — expected the batch_<uuid> id returned by submit_batch.`,
+      `Invalid batch_id "${batchId}" — expected the batch_<uuid> id returned by batch action:"submit".`,
     );
   }
   let record: BatchRecord | undefined;
@@ -108,7 +108,7 @@ export async function loadBatch(batchId: string): Promise<BatchRecord> {
   }
   if (!record || !Array.isArray(record.prompt_ids)) {
     throw new ValidationError(
-      `Unknown batch_id "${batchId}". Batches persist across restarts in ${batchesDir()}; check the id returned by submit_batch.`,
+      `Unknown batch_id "${batchId}". Batches persist across restarts in ${batchesDir()}; check the id returned by batch action:"submit".`,
     );
   }
   return record;
@@ -136,7 +136,7 @@ export async function submitBatch(input: SubmitBatchInput): Promise<SubmitBatchR
     jobs = input.sweep.map((overrides) => applyOverrides(input.workflow!, overrides));
   } else {
     throw new ValidationError(
-      "submit_batch needs either `workflows` (non-empty array) or `workflow` + `sweep` (non-empty array of override sets).",
+      'batch action:"submit" needs either `workflows` (non-empty array) or `workflow` + `sweep` (non-empty array of override sets).',
     );
   }
 
@@ -157,7 +157,7 @@ export async function submitBatch(input: SubmitBatchInput): Promise<SubmitBatchR
 
   if (promptIds.length === 0) {
     throw new ValidationError(
-      `submit_batch: all ${jobs.length} enqueues failed. First error: ${errors[0]?.error ?? "unknown"}`,
+      `batch action:"submit": all ${jobs.length} enqueues failed. First error: ${errors[0]?.error ?? "unknown"}`,
     );
   }
 
@@ -262,7 +262,7 @@ export async function batchOutput(batchId: string): Promise<BatchOutputResult> {
 
 // ── wait ─────────────────────────────────────────────────────────────────────
 
-/** Absolute hard cap so wait_for_batch can never hang an agent turn. */
+/** Absolute hard cap so batch action:"wait" can never hang an agent turn. */
 export const WAIT_HARD_CAP_S = 600;
 const DEFAULT_WAIT_S = 300;
 const POLL_INTERVAL_MS = 2000;

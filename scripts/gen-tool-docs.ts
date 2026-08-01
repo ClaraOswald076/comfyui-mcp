@@ -101,7 +101,7 @@ const CATEGORIES: Array<{
       // get_template_schema is the lookup you make first to fill its overrides.
       "get_template_schema", "run_template",
       // Batch execution: submit many prompts under one batch_id, then poll/await it.
-      "submit_batch", "get_batch_status", "get_batch_output", "wait_for_batch",
+      "batch",
     ],
   },
   {
@@ -159,8 +159,7 @@ const CATEGORIES: Array<{
       "search_custom_nodes", "get_node_pack_details", "install_custom_node",
       "update_custom_node", "reinstall_custom_node", "fix_custom_node",
       "list_installed_nodes", "sync_node_dependencies", "extract_workflow_dependencies",
-      "install_workflow_dependencies", "save_node_snapshot", "restore_node_snapshot",
-      "list_node_snapshots", "bisect",
+      "install_workflow_dependencies", "node_snapshot", "bisect",
       "scaffold_custom_node", "verify_custom_node", "publish_custom_node",
       "list_node_pack_files", "read_node_file", "search_node_packs", "write_node_file",
       "apply_node_patch", "node_pack_git",
@@ -233,7 +232,7 @@ const CATEGORIES: Array<{
     slug: "apps",
     icon: "layout-grid",
     description: "List, inspect, and run the panel's micro-apps — named, one-click workflow apps with exposed inputs — for canvas-less clients (mobile).",
-    tools: ["apps_list", "apps_get", "apps_run", "apps_run_status", "apps_import"],
+    tools: ["apps"],
   },
   {
     group: "comfy-cli",

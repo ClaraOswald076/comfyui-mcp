@@ -118,9 +118,7 @@ export const TOOL_NAMES = [
   "generate_with_ip_adapter",
   "workflow_to_dsl",
   "dsl_to_workflow",
-  "save_node_snapshot",
-  "restore_node_snapshot",
-  "list_node_snapshots",
+  "node_snapshot",
   "bisect",
   "install_custom_node",
   "update_custom_node",
@@ -199,17 +197,10 @@ export const TOOL_NAMES = [
   "train_cancel",
   "train_build_image",
   "train_doctor",
-  "apps_list",
-  "apps_get",
-  "apps_run",
-  "apps_run_status",
-  "apps_import",
+  "apps",
   "get_template_schema",
   "run_template",
-  "submit_batch",
-  "get_batch_status",
-  "get_batch_output",
-  "wait_for_batch",
+  "batch",
 ] as const;
 
 /** A name that is actually registered today. A typo is a compile error. */
@@ -236,8 +227,9 @@ export type ToolName = (typeof TOOL_NAMES)[number];
  * updating — it is history, not state.
  *
  * Read from docs/design/tool-surface.txt so there is exactly one copy of the
- * baseline names (183: the 182 frozen at 0.48.32 plus `bisect`, appended when the
- * five bisect_* tools consolidated into it in 0.49.0), and so the file committed
+ * baseline names (186: the 182 frozen at 0.48.32 plus the four consolidated tools
+ * appended as they shipped — `bisect` in 0.49.0 slice 1, then `node_snapshot`,
+ * `apps` and `batch` in slice 2), and so the file committed
  * as the P0 evidence is load-bearing rather than
  * decorative.
  */
@@ -256,7 +248,7 @@ const BASELINE_URL = new URL("../../docs/design/tool-surface.txt", import.meta.u
  * 200-line rename. APPENDING is legitimate — new tools join the baseline when they
  * ship — so the workflow is: append, update this hash, say why in the message.
  */
-export const BASELINE_SHA256 = "a3c60bfe90ec74024773c7dd9079ba4d17189b23918a00e09f5d4483350ede5a";
+export const BASELINE_SHA256 = "15d7fd41b7cb543902a9d550101d3d29dda47fe10e62783fe7f4af9e8d27ced9";
 
 /**
  * LAZY on purpose, and this is not a micro-optimisation.
@@ -330,7 +322,7 @@ export function panelBaselineIntegrity(): { ok: boolean; actual: string } {
  * to the surface. That is the ratchet: not that it cannot rise, but that it cannot
  * rise silently.
  */
-export const MAX_TOOLS = 178;
+export const MAX_TOOLS = 169;
 
 /** Where this is headed, for reference in review. A goal, not enforced. */
 export const TOOL_BUDGET_TARGET = 30;
@@ -398,6 +390,71 @@ export function deadNameRe(name: string): RegExp {
  * entry documents the two mentions in this repo that are correct.
  */
 export const DEAD_NAMES: readonly DeadName[] = [
+  // 0.49.0 slice 2: three more families folded into action-parameterized tools —
+  // the three node-snapshot tools into `node_snapshot`, the four batch tools into
+  // `batch`, and the five apps_* tools into `apps`. Same services, same return
+  // shapes; only the surface changed, so every mention of the old names is now rot
+  // pointing at a 404.
+  {
+    name: "save_node_snapshot",
+    since: "0.49.0",
+    replacement: 'node_snapshot (action:"save")',
+  },
+  {
+    name: "restore_node_snapshot",
+    since: "0.49.0",
+    replacement: 'node_snapshot (action:"restore")',
+  },
+  {
+    name: "list_node_snapshots",
+    since: "0.49.0",
+    replacement: 'node_snapshot (action:"list")',
+  },
+  {
+    name: "submit_batch",
+    since: "0.49.0",
+    replacement: 'batch (action:"submit")',
+  },
+  {
+    name: "get_batch_status",
+    since: "0.49.0",
+    replacement: 'batch (action:"status")',
+  },
+  {
+    name: "get_batch_output",
+    since: "0.49.0",
+    replacement: 'batch (action:"output")',
+  },
+  {
+    name: "wait_for_batch",
+    since: "0.49.0",
+    replacement: 'batch (action:"wait")',
+  },
+  {
+    name: "apps_list",
+    since: "0.49.0",
+    replacement: 'apps (action:"list")',
+  },
+  {
+    name: "apps_get",
+    since: "0.49.0",
+    replacement: 'apps (action:"get")',
+  },
+  {
+    name: "apps_run",
+    since: "0.49.0",
+    replacement: 'apps (action:"run")',
+  },
+  {
+    name: "apps_run_status",
+    since: "0.49.0",
+    replacement: 'apps (action:"run_status")',
+  },
+  {
+    name: "apps_import",
+    since: "0.49.0",
+    replacement: 'apps (action:"import")',
+  },
   // 0.49.0 slice 1: the five bisect_* tools folded into one action-parameterized
   // `bisect` tool. Same state machine, same return shapes — only the surface
   // changed, so every mention of the old names is now rot pointing at a 404.

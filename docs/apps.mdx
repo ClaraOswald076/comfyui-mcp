@@ -38,8 +38,8 @@ right one, and it is the only interface a phone or an agent can drive at all.
 ## Requirements
 
 Apps are served by the **panel pack** (`comfyui-mcp-panel`), not by the MCP
-server alone. If the pack on your ComfyUI predates the feature, `apps_list`
-fails with an explicit *"the panel pack on this ComfyUI predates the Apps
+server alone. If the pack on your ComfyUI predates the feature, `apps` with
+`action:"list"` fails with an explicit *"the panel pack on this ComfyUI predates the Apps
 feature"* message — update the pack and restart ComfyUI.
 
 ## Converting a workflow into an app
@@ -119,32 +119,36 @@ custom-node pack on your rig because you tapped a card.
   design-only monetization phase — there is no paid-app behavior today.
 </Note>
 
-## The `apps_*` MCP tools
+## The `apps` MCP tool
 
-Five tools, all thin proxies over the panel's Apps API. They are the
-**canvas-less** surface: what the mobile app and a directly-driven agent use.
-All five are on the orchestrator's `call_tool` whitelist — `list`/`get`/`status`
+One tool with five actions, all thin proxies over the panel's Apps API. It is
+the **canvas-less** surface: what the mobile app and a directly-driven agent use.
+It is on the orchestrator's `call_tool` whitelist — `list`/`get`/`run_status`
 are read-only, and `run` carries the same risk posture as `enqueue_workflow`
 (it queues a job the user explicitly tapped).
 
-| Tool | Effect |
+| Action | Effect |
 |---|---|
-| `apps_list` | List every app registered on this ComfyUI — each entry is the full manifest plus `has_workflow` / `has_prompt` / `has_thumbnail`. No parameters. Read-only. |
-| `apps_get` | One app's manifest + bundle facts by id. `appMode.inputs` is the run form. Read-only. |
-| `apps_run` | Patch `values` into the snapshot and queue it. Returns `prompt_id`. |
-| `apps_run_status` | Poll one run by `prompt_id`: `status` plus the run's outputs (image/video file refs per output node, text outputs). Read-only. |
-| `apps_import` | Install an app from the public registry onto this ComfyUI. |
+| `action:"list"` | List every app registered on this ComfyUI — each entry is the full manifest plus `has_workflow` / `has_prompt` / `has_thumbnail`. No other parameters. Read-only. |
+| `action:"get"` | One app's manifest + bundle facts by id. `appMode.inputs` is the run form. Read-only. |
+| `action:"run"` | Patch `values` into the snapshot and queue it. Returns `prompt_id`. |
+| `action:"run_status"` | Poll one run by `prompt_id`: `status` plus the run's outputs (image/video file refs per output node, text outputs). Read-only. |
+| `action:"import"` | Install an app from the public registry onto this ComfyUI. |
 
 ### Parameters
 
-| Tool | Parameter | Type | Notes |
+`action` is the only schema-required parameter — each action needs a different
+subset, so the rest are optional in the schema and their presence is enforced by
+the handler, which names the field it is missing.
+
+| Action | Parameter | Type | Notes |
 |---|---|---|---|
-| `apps_get` | `app_id` | `string` (uuid), required | from `apps_list` |
-| `apps_run` | `app_id` | `string` (uuid), required | |
+| `get` | `app_id` | `string` (uuid), required | from `action:"list"` |
+| `run` | `app_id` | `string` (uuid), required | |
 | | `values` | `object`, optional | keys `"<nodeId>.<widget>"`; unknown keys fail loudly |
-| `apps_run_status` | `app_id` | `string` (uuid), required | |
+| `run_status` | `app_id` | `string` (uuid), required | |
 | | `prompt_id` | `string`, required | must match `^[0-9a-zA-Z-]{1,64}$` |
-| `apps_import` | `registry_url` | `string` (URL), required | must be the default registry or an allowlisted origin |
+| `import` | `registry_url` | `string` (URL), required | must be the default registry or an allowlisted origin |
 | | `app_id` | `string` (uuid), required | the **registry** app's uuid |
 | | `slug` | `string`, optional | recorded in local metadata |
 | | `version` | `integer`, optional | recorded in local metadata |
@@ -159,8 +163,8 @@ For the generated per-tool schema reference, see
 
 ### Importing from the registry
 
-`apps_import` fetches the registry bundle server-side and creates it as a local
-app. The **registry id becomes the local id**, so re-importing an app you
+`action:"import"` fetches the registry bundle server-side and creates it as a
+local app. The **registry id becomes the local id**, so re-importing an app you
 already have reports an id conflict rather than duplicating it. The thumbnail
 lives at a separate registry endpoint and is fetched and forwarded separately,
 so an installed app keeps its card art.
@@ -215,12 +219,12 @@ portable installs.
 The mobile app ships a real **Apps** tab — not a preview. It has two halves:
 
 - **My Apps** — the apps installed on your rig, listed over the bridge via
-  `apps_list`. Tapping one opens a generated run form, queues it with
-  `apps_run`, and polls `apps_run_status` every 2s (bounded at 30 minutes)
-  until the outputs render.
+  `action:"list"`. Tapping one opens a generated run form, queues it with
+  `action:"run"`, and polls `action:"run_status"` every 2s (bounded at 30
+  minutes) until the outputs render.
 - **Explore** — the public registry, hit **directly over HTTPS** from the phone
   (no bridge hop, so browsing works before you've paired). Installing goes the
-  other direction: the rig fetches the bundle itself via `apps_import`.
+  other direction: the rig fetches the bundle itself via `action:"import"`.
 
 This is the clearest thing the phone can do that chat cannot — run a real
 workflow, with real inputs, without a canvas anywhere in sight.
