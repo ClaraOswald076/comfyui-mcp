@@ -527,6 +527,21 @@ describe("models.json", () => {
       '{"providers":{"p":{"apiKey":"x","modelOverrides":{"m":{"reasoning":"yes"}}}}}',
     );
     expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(false);
+    // An OVERRIDE's contextWindow/maxTokens carry no positivity constraint (that
+    // is a ModelDefinition-only runtime check), so 0 is a config pi accepts.
+    writePiFile(
+      tmp,
+      "models.json",
+      '{"providers":{"p":{"apiKey":"x","modelOverrides":{"m":{"contextWindow":0}}}}}',
+    );
+    expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(true);
+    // An UNDECLARED thinkingLevelMap key is fine (no additionalProperties rule).
+    writePiFile(
+      tmp,
+      "models.json",
+      '{"providers":{"p":{"apiKey":"x","models":[{"id":"m","thinkingLevelMap":{"future":false}}]}}}',
+    );
+    expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(true);
   });
 
   it("bedrock is keyed by pi's provider id (amazon-bedrock) for stored ownership", () => {

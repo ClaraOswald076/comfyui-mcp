@@ -417,6 +417,13 @@ function isFiniteNumber(v: unknown): boolean {
   return typeof v === "number" && Number.isFinite(v);
 }
 
+/** Type.Number() with no positivity constraint — ModelOverride's contextWindow /
+ *  maxTokens, which provider-composer's `<= 0` check does NOT apply to (that
+ *  check is on ModelDefinition only), so 0 is a config pi accepts. */
+function optFiniteNumber(v: unknown): boolean {
+  return v === undefined || isFiniteNumber(v);
+}
+
 /** ModelCostSchema: input/output/cacheRead/cacheWrite are REQUIRED Type.Number();
  *  `tiers` is an optional array. A `cost: {}` (or a string rate) fails the schema
  *  and pi throws the whole models.json away. */
@@ -443,11 +450,18 @@ function costTierValid(tier: unknown): boolean {
   );
 }
 
-/** ThinkingLevelMapSchema: every level maps to a string or null. */
+/** ThinkingLevelMapSchema: each DECLARED level maps to a string or null. Only the
+ *  declared keys are checked — pi's object schemas set no additionalProperties
+ *  restriction, so an unknown key is fine and rejecting it would false-red. */
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
 function optThinkingLevelMap(v: unknown): boolean {
   if (v === undefined) return true;
   if (!isPlainObject(v)) return false;
-  return Object.values(v).every((x) => x === null || typeof x === "string");
+  return THINKING_LEVELS.every((lvl) => {
+    const x = v[lvl];
+    return x === undefined || x === null || typeof x === "string";
+  });
 }
 
 /** ModelOverrideSchema — the same fields as a model definition, all optional and
@@ -459,7 +473,7 @@ function modelOverrideValid(v: unknown): boolean {
   if (!optThinkingLevelMap(v.thinkingLevelMap)) return false;
   if (!optModelInput(v.input)) return false;
   if (!optModelCost(v.cost, false)) return false;
-  if (!optPositiveNumber(v.contextWindow) || !optPositiveNumber(v.maxTokens)) return false;
+  if (!optFiniteNumber(v.contextWindow) || !optFiniteNumber(v.maxTokens)) return false;
   if (!optStringRecord(v.headers)) return false;
   if (v.compat !== undefined && !isPlainObject(v.compat)) return false;
   return true;
