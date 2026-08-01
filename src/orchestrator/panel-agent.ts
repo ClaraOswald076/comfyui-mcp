@@ -359,7 +359,13 @@ export class PanelAgent {
    * reached the agent." Only meaningful when a session is live (the manager only
    * calls this for an existing agent, so we never spawn one just for an event).
    */
-  injectEvent(ev: { kind?: string; images?: ImageRef[]; error?: string; note?: string }): void {
+  injectEvent(ev: {
+    kind?: string;
+    images?: ImageRef[];
+    error?: string;
+    note?: string;
+    downloads?: Array<{ name: string; status: string }>;
+  }): void {
     let text: string | null = null;
     let images: ImageRef[] | undefined;
     if (ev.kind === "executed") {
@@ -392,6 +398,27 @@ export class PanelAgent {
       text =
         `[panel event] The user's workflow run just ERRORED: ${ev.error ?? "unknown error"}. ` +
         `If it relates to what you were doing, diagnose it (panel_get_errors has the details) and offer a fix.`;
+    } else if (ev.kind === "download_done") {
+      // A model download the agent kicked off (download_model / apply_manifest)
+      // just settled. Mirror the render-finished path so the agent is WOKEN with
+      // the result instead of having to poll download_status in sleep loops
+      // (#547). NON-urgent: queued like `executed`, not front-inserted — a landed
+      // download never interrupts a live turn. Coalesced upstream (one event per
+      // batch of settled downloads for this tab), so a multi-file pack install
+      // wakes the agent ONCE, not per file.
+      const dl = (ev.downloads ?? []).filter((d) => d && d.name);
+      if (dl.length === 0) return;
+      const done = dl.filter((d) => d.status === "done").map((d) => d.name);
+      const failed = dl.filter((d) => d.status !== "done").map((d) => d.name);
+      const parts: string[] = [];
+      if (done.length) parts.push(`finished: ${done.join(", ")}`);
+      if (failed.length) parts.push(`FAILED: ${failed.join(", ")}`);
+      const plural = dl.length > 1 ? "these downloads" : "it";
+      text =
+        `[panel event] Model download ${parts.join("; ")}. ` +
+        `If you were waiting on ${plural} to continue a task, proceed now — ` +
+        `call download_status for the exact landed path(s)${failed.length ? " or the error detail" : ""}. ` +
+        `Otherwise reply with ONE short sentence acknowledging it and no tool calls.`;
     }
     if (!text) return;
     this.busy = true;
@@ -1271,6 +1298,15 @@ export class PanelAgentManager {
     return this.agents.has(key);
   }
 
+  /** Composite keys of every live agent. Used to deliver a download-completion
+   *  event to the SINGLE live agent when a settled download row carries no tab
+   *  stamp (a pre-fix row, or an in-process/mobile caller) — the orchestrator
+   *  wakes it only when there is exactly one, never fanning out to unrelated
+   *  tabs (#547). */
+  liveKeys(): string[] {
+    return [...this.agents.keys()];
+  }
+
   /** Respawn every active tab's agent (resume + carry-over) so the live comfyui
    *  MCP subprocess is recreated with the updated env. Deferred to each tab's
    *  next idle so the turn that SAVED the secret finishes first (we never
@@ -1400,7 +1436,16 @@ export class PanelAgentManager {
 
   /** Feed a ComfyUI execution event to an EXISTING agent (no-op if none — we
    *  never spawn an agent just to react to an event). Returns whether delivered. */
-  injectEvent(tabId: string, ev: { kind?: string; images?: ImageRef[]; error?: string; note?: string }): boolean {
+  injectEvent(
+    tabId: string,
+    ev: {
+      kind?: string;
+      images?: ImageRef[];
+      error?: string;
+      note?: string;
+      downloads?: Array<{ name: string; status: string }>;
+    },
+  ): boolean {
     const agent = this.agents.get(tabId);
     if (!agent || agent.isStopped) return false; // best-effort; don't enqueue into a closed agent
     agent.injectEvent(ev);

@@ -36,6 +36,30 @@ describe("download target stamping (#269)", () => {
   });
 });
 
+describe("download tab stamping (#547)", () => {
+  it("stamps the row with the writer's COMFYUI_MCP_TAB so the orchestrator can wake that tab's agent", () => {
+    process.env.COMFYUI_MCP_TAB = "tab-abc123";
+    mod.reportDownloadProgress({ id: "t1", name: "m.safetensors", downloaded: 1, total: 2, bytes_per_sec: 1, status: "done" }, true);
+    const row = JSON.parse(readFileSync(join(dir, readdirSync(dir).find((f) => f.startsWith("t1-"))!), "utf-8"));
+    expect(row.tab).toBe("tab-abc123");
+    expect(row.status).toBe("done");
+  });
+
+  it("omits tab when no COMFYUI_MCP_TAB is set (non-panel / in-process caller)", () => {
+    delete process.env.COMFYUI_MCP_TAB;
+    mod.reportDownloadProgress({ id: "t2", name: "m.safetensors", downloaded: 1, total: 2, bytes_per_sec: 1, status: "done" }, true);
+    const row = JSON.parse(readFileSync(join(dir, readdirSync(dir).find((f) => f.startsWith("t2-"))!), "utf-8"));
+    expect(row.tab).toBeUndefined();
+  });
+
+  it("an explicit p.tab overrides the env stamp", () => {
+    process.env.COMFYUI_MCP_TAB = "env-tab";
+    mod.reportDownloadProgress({ id: "t3", name: "m", downloaded: 1, total: 2, bytes_per_sec: 1, status: "downloading", tab: "explicit-tab" }, true);
+    const row = JSON.parse(readFileSync(join(dir, readdirSync(dir).find((f) => f.startsWith("t3-"))!), "utf-8"));
+    expect(row.tab).toBe("explicit-tab");
+  });
+});
+
 describe("readDownloadProgress (target-scoped read, #290)", () => {
   it("reads back a row written under a remote COMFYUI_URL (target-scoped filename)", () => {
     // The writer scopes the filename by target; readDownloadProgress must find it

@@ -184,9 +184,18 @@ function formatHistoryEntry(
         const items = output[key];
         if (!Array.isArray(items)) continue;
         const fileList = (
-          items as Array<{ filename: string; subfolder?: string }>
+          items as Array<{ filename: string; subfolder?: string; type?: string }>
         )
-          .map((m) => (m.subfolder ? `${m.subfolder}/${m.filename}` : m.filename))
+          .map((m) => {
+            const path = m.subfolder ? `${m.subfolder}/${m.filename}` : m.filename;
+            // Carry each ref's ComfyUI directory TYPE (output/temp/input) so the
+            // caller passes the RIGHT `type` to get_image (#554): preview/compare
+            // nodes (e.g. PixaromaCompare) write to temp/, not output/, and
+            // get_image defaults to output — the old summary dropped the type, so
+            // the documented get_image(type:"output") call 404'd on a temp file.
+            const type = typeof m.type === "string" && m.type ? m.type : "output";
+            return `${path} (type=${type})`;
+          })
           .join(", ");
         if (fileList) expanded.push(`${key} → **${fileList}**`);
       }
