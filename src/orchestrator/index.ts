@@ -2552,18 +2552,25 @@ export async function runPanelOrchestrator(): Promise<void> {
           // be delivered to it now (it's no longer the active socket) without leaking
           // into THIS workflow via the bridge migration alias — so surface an explicit
           // cancellation rather than silently dropping accepted work (codex review).
-          const retiredHeldKey = migratedFrom + AGENT_KEY_SEP + prevBackend;
-          const retiredHeld = heldDuringGen.get(retiredHeldKey);
-          if (retiredHeld && retiredHeld.length > 0) {
+          // heldDuringGen is keyed by the COMPOSITE tab::backend, and the retired tab may
+          // hold queued work under MULTIPLE providers (queued on A, switched provider,
+          // then switched workflow) — sweep EVERY backend for migratedFrom, or the
+          // onRunEnd flush would later respawn stale work for the switched-away workflow.
+          let retiredHeldCount = 0;
+          for (const hk of [...heldDuringGen.keys()]) {
+            if (panelTabOf(hk) !== migratedFrom) continue;
+            retiredHeldCount += heldDuringGen.get(hk)?.length ?? 0;
+            heldDuringGen.delete(hk);
+          }
+          if (retiredHeldCount > 0) {
             bridge.push(
               {
                 type: "say",
-                text: `⚠️ ${retiredHeld.length} message(s) you queued during the previous workflow's render were cancelled by switching workflows before it finished. Re-send them in that workflow if you still need them.`,
+                text: `⚠️ ${retiredHeldCount} message(s) you queued during the previous workflow's render were cancelled by switching workflows before it finished. Re-send them in that workflow if you still need them.`,
               },
               panelTab,
             );
           }
-          heldDuringGen.delete(retiredHeldKey);
           tabBackends.delete(migratedFrom);
           headlessTabs.delete(migratedFrom);
           workflowTargets.clear(migratedFrom);
