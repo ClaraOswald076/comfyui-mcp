@@ -2681,32 +2681,40 @@ export async function runPanelOrchestrator(): Promise<void> {
       // hello's, the workflow was replaced — clear the stale exact session (and any stale
       // stable entry) so the new workflow starts fresh. Durable, so it holds across an
       // orchestrator restart too.
-      if (newIdentity) {
+      {
+        // FAIL CLOSED at the identity boundary (#570 P0): an existing EXACT session record
+        // is trusted (kept + resumable) ONLY when PROVEN to belong to THIS workflow — the
+        // record carries a durable identity uuid (Entry.u) AND this hello carries a valid
+        // trusted identity AND they MATCH. Anything else is reset:
+        //   • DIFFERENT bound uuid → a SAVED workflow OVERWRITTEN in place (same wf:<path>
+        //     tab id, new uuid);
+        //   • record with NO binding → a pre-`u` v2 {s,t} or migrated legacy record — can't
+        //     tell whether an in-place replacement already happened;
+        //   • no trusted identity on this hello (old/degraded panel, no server origin) →
+        //     unprovable, and the path-keyed record + an unowned global hello.resume would
+        //     otherwise cross-resume a replaced workflow.
+        // Resetting costs at most a lost resume (one-time on upgrade for a bound record;
+        // per-reload for an identity-less client's SAVED workflow — unsaved tabs churn their
+        // tmp: id so nothing is stored under the reloaded key). A wrong-resume is worse.
+        // onSession re-stamps `u`, so a bound modern client's saved workflow proves out and
+        // is never reset. Runs BEFORE the resume-ownership check and spawn, so neither an
+        // unowned hello.resume nor spawn's exact-store hit can resume a stale session.
         const boundUuid = sessionStore.identityOf(key);
         const hasExact = sessionStore.get(key) !== undefined;
-        // FAIL CLOSED at the identity boundary: reset the tab's session when the exact
-        // record can't be PROVEN to belong to THIS workflow —
-        //   • a DIFFERENT bound uuid → a saved workflow OVERWRITTEN in place; or
-        //   • an existing record with NO binding (a pre-`u` v2 {s,t} entry, or a migrated
-        //     legacy flat record) → untrusted, so we can't tell whether an in-place
-        //     replacement already happened. Resetting it costs at most a one-time
-        //     lost resume for a pre-upgrade SAVED-workflow chat; NOT resetting risks a
-        //     wrong-resume (the durable exact record and an unowned hello.resume both
-        //     point at it), which is strictly worse.
-        // onSession re-stamps `u` for the fresh session, so this fires at most once.
-        if (boundUuid ? boundUuid !== newIdentity.uuid : hasExact) {
+        const provenOwn =
+          hasExact && boundUuid !== undefined && newIdentity !== undefined && boundUuid === newIdentity.uuid;
+        if (hasExact && !provenOwn) {
           // FULL session boundary — reset the LIVE agent too, not just the disk record.
           // manager.reset() stops the mapped agent (whose backend still holds the PRIOR
-          // workflow's session), clears its pendingResume + held mail, AND clears the
-          // durable exact session. Without this, manager.send would reuse that live agent
-          // and answer with — or act on — the replaced workflow's context.
+          // workflow's session), clears its pendingResume + held mail, AND the durable
+          // exact session. Without this, manager.send would reuse that live agent.
           manager.reset(key);
-          if (boundUuid) {
+          if (boundUuid && newIdentity) {
             const staleStable = deriveStableKey({ workflowUuid: boundUuid, origin: newIdentity.origin, backend });
             if (staleStable) sessionStore.clearStable(staleStable);
           }
           logger.info(
-            `[panel-orchestrator] tab ${panelTab.slice(0, 8)} exact session not provably this workflow's (${boundUuid ? "identity uuid changed" : "no durable identity binding"}) — reset the live agent and cleared the stale session`,
+            `[panel-orchestrator] tab ${panelTab.slice(0, 8)} exact session not provably this workflow's identity — reset the live agent and cleared the stale session`,
           );
         }
       }
