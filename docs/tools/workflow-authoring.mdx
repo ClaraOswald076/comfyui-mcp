@@ -172,7 +172,7 @@ Convert the compact workflow DSL (see workflow_to_dsl) back into executable Comf
 
 ## visualize_workflow
 
-Convert workflow JSON you PASS IN (a JSON string or object) into a Mermaid flowchart diagram — this does NOT read the user's live canvas. To 'show me what's on the canvas' / read the CURRENTLY-OPEN graph, use panel_graph_outline instead. Returns mermaid syntax showing nodes grouped by category (loading, conditioning, sampling, image, output) with connections labeled by data type.
+DRAW a Mermaid flowchart DIAGRAM from workflow JSON you PASS IN (a JSON string or object). It requires that JSON as an argument and does NOT read the user's live canvas — for 'show me what's on the canvas' / the CURRENTLY-OPEN graph use panel_graph_outline instead. Returns mermaid diagram syntax: nodes grouped by category (loading, conditioning, sampling, image, output), connections labeled by data type.
 
 ### Parameters
 
@@ -203,7 +203,7 @@ Convert workflow JSON you PASS IN (a JSON string or object) into a Mermaid flowc
 
 ## visualize_workflow_hierarchical
 
-Visualize a large ComfyUI workflow as a hierarchical diagram. Detects logical sections using node categories from /object_info, resolves Get/Set virtual wires, and produces either a compact overview (sections as summary nodes), a detailed view of one section, or a text listing of all sections. Best for workflows with 20+ nodes.
+SECTION a workflow JSON you PASS IN into a hierarchical Mermaid diagram — same required `workflow` argument as visualize_workflow, grouped into sections instead of one flat chart, which is what you want once a graph reaches ~20+ nodes. It does NOT read the user's live canvas: for 'show me what's on the canvas' use panel_graph_outline. Detects logical sections using node categories from /object_info, resolves Get/Set virtual wires, and produces either a compact overview (sections as summary nodes), a detailed view of one section, or a text listing of all sections.
 
 ### Parameters
 
@@ -288,7 +288,7 @@ Read Prompt Director's latest sanitized RUNTIME state after its nodes execute. R
 
 ## query_workflow
 
-QUERY a workflow file — filter, traverse, project, and aggregate over its nodes WITHOUT dumping the whole JSON (the missing middle between analyze_workflow's fixed summary and get_workflow's full dump; on 100+-node graphs this is the ONLY context-safe way to answer questions like 'which KSamplers run cfg&gt;7', 'what feeds node 42', 'count nodes by type'). Provide exactly one of path/filename/graph, then combine: `types` (class_type contains any), `title` (contains), `where` widget predicates ANDed ('cfg&gt;7', 'steps&lt;=20', 'sampler_name=euler', 'text~sunset' — ops = != &gt;= &lt;= &gt; &lt; ~contains), `ids` (exact nodes — the way to read ONE node's detail), `upstream_of`/`downstream_of` + `depth` (dependency traversal: upstream = what FEEDS that node, downstream = what CONSUMES it; seed included at depth 0), `fields` ('compact' one line per node [default], 'ids', or 'detail' JSON rows with widgets + wiring), `group_by:'type'` (counts only), `limit` (default 40). Output is TOKEN-BOUNDED with an explicit truncation marker. For the LIVE canvas use panel_query_graph instead. Read-only.
+QUERY a SAVED workflow FILE (or JSON you pass in) — NOT the live canvas, which is panel_query_graph / panel_graph_outline. Filter, traverse, project, and aggregate over its nodes WITHOUT dumping the whole JSON (the missing middle between analyze_workflow's fixed summary and get_workflow's full dump; on 100+-node graphs this is the ONLY context-safe way to answer questions like 'which KSamplers run cfg&gt;7', 'what feeds node 42', 'count nodes by type'). Provide exactly one of path/filename/graph, then combine: `types` (class_type contains any), `title` (contains), `where` widget predicates ANDed ('cfg&gt;7', 'steps&lt;=20', 'sampler_name=euler', 'text~sunset' — ops = != &gt;= &lt;= &gt; &lt; ~contains), `ids` (exact nodes — the way to read ONE node's detail), `upstream_of`/`downstream_of` + `depth` (dependency traversal: upstream = what FEEDS that node, downstream = what CONSUMES it; seed included at depth 0), `fields` ('compact' one line per node [default], 'ids', or 'detail' JSON rows with widgets + wiring), `group_by:'type'` (counts only), `limit` (default 40). Output is TOKEN-BOUNDED with an explicit truncation marker. Read-only.
 
 ### Parameters
 

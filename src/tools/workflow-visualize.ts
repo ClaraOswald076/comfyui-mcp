@@ -37,7 +37,7 @@ function parseWorkflow(input: unknown): WorkflowJSON {
 export function registerWorkflowVisualizeTools(server: McpServer): void {
   server.tool(
     "visualize_workflow",
-    "Convert workflow JSON you PASS IN (a JSON string or object) into a Mermaid flowchart diagram — this does NOT read the user's live canvas. To 'show me what's on the canvas' / read the CURRENTLY-OPEN graph, use panel_graph_outline instead. Returns mermaid syntax showing nodes grouped by category (loading, conditioning, sampling, image, output) with connections labeled by data type.",
+    "DRAW a Mermaid flowchart DIAGRAM from workflow JSON you PASS IN (a JSON string or object). It requires that JSON as an argument and does NOT read the user's live canvas — for 'show me what's on the canvas' / the CURRENTLY-OPEN graph use panel_graph_outline instead. Returns mermaid diagram syntax: nodes grouped by category (loading, conditioning, sampling, image, output), connections labeled by data type.",
     {
       workflow: z
         .union([z.string(), z.record(z.string(), z.any())])
@@ -158,10 +158,10 @@ export function registerWorkflowVisualizeTools(server: McpServer): void {
 
   server.tool(
     "visualize_workflow_hierarchical",
-    "Visualize a large ComfyUI workflow as a hierarchical diagram. " +
+    "SECTION a workflow JSON you PASS IN into a hierarchical Mermaid diagram — same required `workflow` argument as visualize_workflow, grouped into sections instead of one flat chart, which is what you want once a graph reaches ~20+ nodes. It does NOT read the user's live canvas: for 'show me what's on the canvas' use panel_graph_outline. " +
       "Detects logical sections using node categories from /object_info, resolves Get/Set virtual wires, " +
       "and produces either a compact overview (sections as summary nodes), a detailed view of one section, " +
-      "or a text listing of all sections. Best for workflows with 20+ nodes.",
+      "or a text listing of all sections.",
     {
       view: z
         .enum(["overview", "detail", "list", "summary"])
