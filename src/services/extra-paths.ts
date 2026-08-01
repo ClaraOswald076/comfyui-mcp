@@ -601,20 +601,22 @@ function realLiveRoot(scriptPath: string): string | undefined {
  * whole branch exists to stop.
  */
 function implicitLiveTarget(
-  scriptPath: string,
+  liveRoot: string,
   opts: ExtraPathOptions,
   unresolvableFlag?: string,
 ): ResolvedTarget & { serverResolved: boolean } {
-  const liveRoot = realLiveRoot(scriptPath);
-  const seen = liveRoot ? statDir(liveRoot) : undefined;
-  if (!liveRoot || !seen) {
+  // `liveRoot` is the ALREADY-PROVEN realpath'd root the caller resolved once. It is
+  // deliberately not re-resolved here: two realpath() calls could disagree if the script
+  // symlink were retargeted between them, and the second answer would then be guarded and
+  // written while the first was the one reported/disclosed (codex round 11).
+  const seen = statDir(liveRoot);
+  if (!seen) {
     throw new ValidationError(
-      `UNRESOLVED: the running ComfyUI was launched from "${scriptPath}", which cannot be ` +
-        "resolved to a file from this process — the server is running on a filesystem this MCP " +
-        "cannot see (another machine, a container, or WSL), or it moved since launch. The " +
-        "extra_model_paths.yaml it reads sits next to that script, so nothing was read or " +
+      `UNRESOLVED: the running ComfyUI's install root "${liveRoot}" is no longer an existing ` +
+        "directory — it moved or was removed while this call was running. The " +
+        "extra_model_paths.yaml it reads sits in that directory, so nothing was read or " +
         "written; creating a lookalike config locally would be a silent no-op. Pass config_path " +
-        "explicitly to target a file you can reach, or target: \"standalone\"/\"desktop\" to use " +
+        'explicitly to target a file you can reach, or target: "standalone"/"desktop" to use ' +
         "the local heuristic deliberately.",
     );
   }
@@ -717,7 +719,7 @@ async function resolveTargetPathPreferServer(
   const rawFlags = parseExtraModelPathsConfigsFromArgvRaw(snapshot.argv);
   if (rawFlags.length === 0) {
     // No flag — ComfyUI loads the yaml next to its own main.py when that file exists.
-    if (script) return implicitLiveTarget(script, opts);
+    if (script && liveRoot) return implicitLiveTarget(liveRoot, opts);
     throw new ValidationError(
       "UNRESOLVED: the running ComfyUI was not launched with --extra-model-paths-config and " +
         "its launch argv does not reveal a main.py, so the extra_model_paths.yaml it reads " +
@@ -749,7 +751,7 @@ async function resolveTargetPathPreferServer(
     // ComfyUI, so a refusal here would break the ordinary
     // `cd /opt/ComfyUI && python main.py --extra-model-paths-config extra.yaml` launch
     // outright (codex round 8, P1). Only when NEITHER file can be located do we refuse.
-    if (script) return implicitLiveTarget(script, opts, rawFlag);
+    if (script && liveRoot) return implicitLiveTarget(liveRoot, opts, rawFlag);
     throw new ValidationError(
       `UNRESOLVED: the running ComfyUI was launched with a RELATIVE --extra-model-paths-config ` +
         `("${rawFlag}") and reports neither its working directory nor a main.py, so no file it ` +

@@ -49,6 +49,9 @@ const script = vi.hoisted(() => ({
   /** Scripted symlink resolution: realpathSync(key) → value. Models a symlinked main.py
    *  on every platform (Windows needs privileges to create a real one). */
   realpath: {} as Record<string, string>,
+  /** Per-path QUEUE of realpath answers, consumed before `realpath`. Used to prove the
+   *  live root is resolved exactly ONCE (a second answer must never be reached). */
+  realpathQueue: {} as Record<string, string[]>,
 }));
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -71,6 +74,8 @@ vi.mock("node:fs", async (importOriginal) => {
       return (actual.statSync as (...a: unknown[]) => unknown)(p, ...rest);
     }) as typeof actual.statSync,
     realpathSync: ((p: string, ...rest: unknown[]) => {
+      const queued = script.realpathQueue[String(p)];
+      if (queued && queued.length > 0) return queued.shift() as string;
       const mapped = script.realpath[String(p)];
       if (mapped !== undefined) return mapped;
       return (actual.realpathSync as (...a: unknown[]) => unknown)(p, ...rest);
@@ -116,6 +121,7 @@ beforeEach(() => {
   script.queue = [];
   script.consumed = 0;
   script.realpath = {};
+  script.realpathQueue = {};
 });
 
 afterEach(async () => {
@@ -123,6 +129,7 @@ afterEach(async () => {
   script.path = "";
   script.queue = [];
   script.realpath = {};
+  script.realpathQueue = {};
   await Promise.all(dirs.map((d) => rm(d, { recursive: true, force: true })));
 });
 
@@ -267,6 +274,31 @@ describe("inferred root revalidation at the point of use", () => {
     const disclosure = result.notes.find((n) => /ONE of several configs/i.test(n));
     expect(disclosure).toContain(join(real, "extra_model_paths.yaml"));
     expect(disclosure).not.toContain(join(launcher, "extra_model_paths.yaml"));
+  });
+
+  it("live root: the argv script is realpath'd EXACTLY ONCE (a retarget cannot switch roots)", async () => {
+    // Two realpath answers are queued. The proven root must be the FIRST one, and the
+    // second must never be consumed — otherwise a symlink retargeted between two
+    // resolutions could select a different root than the one reported and guarded.
+    const launcher = await trackTmp();
+    const realA = await trackTmp();
+    const realB = await trackTmp();
+    await writeFile(join(realA, "main.py"), "# comfyui\n", "utf-8");
+    await writeFile(join(realB, "main.py"), "# comfyui\n", "utf-8");
+    script.realpathQueue[join(launcher, "main.py")] = [
+      join(realA, "main.py"),
+      join(realB, "main.py"),
+    ];
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: ["python", join(launcher, "main.py")] },
+    });
+
+    const added = await addExtraPath({ category: "loras", path: "E:/loras" });
+
+    expect(added.path).toBe(join(realA, "extra_model_paths.yaml"));
+    expect(existsSync(join(realB, "extra_model_paths.yaml"))).toBe(false);
+    // The second queued answer was never reached.
+    expect(script.realpathQueue[join(launcher, "main.py")]).toHaveLength(1);
   });
 
   it("live root: it is GUARDED too — a replacement mid-call is refused", async () => {
