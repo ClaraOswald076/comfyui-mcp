@@ -1026,14 +1026,42 @@ interface OpenWorkflowRecord {
   path?: string;
   filename?: string;
   key?: string;
+  /** Per-instance routing id ("wf:<path>" saved / "tmp:<uuid>" unsaved). */
+  routing_key?: string;
+  /** Per-record authoritative "is the active canvas" flag from workflow_list. */
+  active?: boolean;
+}
+
+/**
+ * The matched open-workflow record PLUS whether it is the ACTIVE canvas. The panel
+ * has no way to read/mutate a NON-active workflow's graph (every graph executor runs
+ * against app.canvas.graph and fails closed on a workflow_path mismatch — panel
+ * #349/#186), so a pin can only be honored when its target is the workflow currently
+ * in view. `isActive` lets the caller reject an open-but-background pin AT PIN TIME
+ * instead of accepting it and surfacing a deferred "workflow mismatch" on the next
+ * graph call (#556/#571).
+ */
+interface ResolvedOpenWorkflow {
+  record: OpenWorkflowRecord;
+  /**
+   * TRI-STATE. `true` = the target IS the active canvas (pin honorable). `false` =
+   * the target is POSITIVELY KNOWN to be a background tab (reject at pin time). `undefined`
+   * = INDETERMINATE (the list carried no active signal — older/partial panel); the caller
+   * must stay LENIENT and pin anyway rather than fail closed (#556/#571 vs older-panel compat).
+   */
+  isActive?: boolean;
+  /** Human label for the workflow currently active (for a clear pin-time error). */
+  activeLabel?: string;
 }
 
 /**
  * Resolve a caller-supplied pin `path` (path / filename / key, any form) to the
  * AUTHORITATIVE open-workflow record from a fresh `workflow_list` — the single
- * source of truth for which tabs exist and their canonical `key` (#259). Returns:
- *  - the matched record when the workflow IS open (so the pin can be canonicalized
- *    to its stable key and bound to the exact frontend tab identity);
+ * source of truth for which tabs exist, their canonical `key`, and which one is
+ * ACTIVE (#259). Returns:
+ *  - a {record, isActive} pair when the workflow IS open (so the caller can
+ *    canonicalize the pin to its stable key AND reject a background target that the
+ *    panel could never route to — #556/#571);
  *  - `null` when workflow_list is unreachable/empty or carries no `workflows`
  *    array (indeterminate — caller should fall back to the raw path, NOT fail);
  *  - the sentinel `NOT_OPEN` when the list IS known but the target is absent, so
@@ -1044,7 +1072,7 @@ const NOT_OPEN = Symbol("workflow-not-open");
 async function resolveOpenWorkflow(
   ctx: PanelToolCtx,
   path: string,
-): Promise<OpenWorkflowRecord | null | typeof NOT_OPEN> {
+): Promise<ResolvedOpenWorkflow | null | typeof NOT_OPEN> {
   let parsed: Record<string, unknown> | null = null;
   try {
     parsed = parseToolResultJson(await ctx.call({ cmd: "workflow_list" }, 6000));
@@ -1057,14 +1085,152 @@ async function resolveOpenWorkflow(
     // No enumerable tab list (older panel / stub) — can't verify, don't fail closed.
     return null;
   }
-  for (const wf of rawList) {
-    if (activeMatchesTarget(wf, path)) return wf as OpenWorkflowRecord;
+  const activeObj = (parsed as { active?: unknown }).active;
+  const activeLabel = workflowRecordLabel(activeObj);
+
+  // A caller token (path / filename / key) can match MORE THAN ONE open record —
+  // e.g. two tabs share the filename "A.json" from different dirs, or two never-saved
+  // tabs. Selecting the wrong same-token record and then reading its `active` flag would
+  // misjudge active-ness (codex P1). So gather ALL matches and disambiguate toward the
+  // one that is actually the live canvas before deciding.
+  const matches = rawList.filter((wf) => activeMatchesTarget(wf, path)) as OpenWorkflowRecord[];
+  let rec: OpenWorkflowRecord | undefined;
+  if (matches.length === 1) {
+    rec = matches[0];
+  } else if (matches.length > 1) {
+    // Prefer an EXACT stable-identity (key/path) match to the caller token; then prefer
+    // the record that is the active canvas; otherwise leave it unresolved and let the
+    // active-object branch / NOT_OPEN handle it (never guess among ambiguous tabs).
+    const exact = matches.filter((m) => m.key === path || m.path === path);
+    const activePreferred = matches.filter((m) => m.active === true || recMatchesActive(m, activeObj));
+    rec = exact.length === 1 ? exact[0] : activePreferred.length === 1 ? activePreferred[0] : undefined;
+  }
+
+  if (rec) {
+    return { record: rec, isActive: computeIsActive(rec, activeObj), activeLabel };
   }
   // The active object is authoritative too, in case it isn't mirrored in the array.
-  if (activeMatchesTarget((parsed as { active?: unknown }).active, path)) {
-    return (parsed as { active: OpenWorkflowRecord }).active;
+  if (activeMatchesTarget(activeObj, path)) {
+    return { record: activeObj as OpenWorkflowRecord, isActive: true, activeLabel };
   }
   return NOT_OPEN;
+}
+
+/**
+ * Is `rec` the active canvas? TRI-STATE (#556/#571):
+ *  - the record's OWN `active` boolean is authoritative and immune to filename aliasing;
+ *  - else compare `rec` to the `active` object by STABLE identity (key/path/routing_key —
+ *    never filename alone, which can collide across tabs). This yields `true`/`false`
+ *    ONLY when the two share a COMPARABLE identity dimension;
+ *  - else (no per-record flag AND nothing comparable) → `undefined` (indeterminate): the
+ *    caller must stay lenient rather than fail a valid pin on an older/partial panel.
+ */
+function computeIsActive(rec: OpenWorkflowRecord, activeObj: unknown): boolean | undefined {
+  if (typeof rec.active === "boolean") return rec.active;
+  return identityVerdict(rec, activeObj);
+}
+
+/**
+ * Stable-identity (key/path/routing_key) verdict between a record and the active object.
+ * Returns `true` on a positive match, `false` only when the two expose a COMPARABLE field
+ * (both non-empty) that DISAGREES, and `undefined` when they share no comparable field at
+ * all (so the caller cannot conclude "background" — stay lenient). Filename is never used
+ * (it collides across tabs).
+ */
+function identityVerdict(rec: OpenWorkflowRecord, activeObj: unknown): boolean | undefined {
+  if (!activeObj || typeof activeObj !== "object") return undefined;
+  const a = activeObj as { path?: unknown; key?: unknown; routing_key?: unknown };
+  const r = rec as { path?: unknown; key?: unknown; routing_key?: unknown };
+  const nonEmpty = (v: unknown): v is string => typeof v === "string" && v.trim() !== "";
+  const pairs: Array<[unknown, unknown]> = [
+    [r.key, a.key],
+    [r.path, a.path],
+    [r.routing_key, a.routing_key],
+    [r.key, a.routing_key],
+    [r.routing_key, a.key],
+  ];
+  let comparable = false;
+  for (const [x, y] of pairs) {
+    if (nonEmpty(x) && nonEmpty(y)) {
+      comparable = true;
+      if (x === y) return true;
+    }
+  }
+  return comparable ? false : undefined;
+}
+
+/** Stable-identity match (positive only) — used to prefer the active record among matches. */
+function recMatchesActive(rec: OpenWorkflowRecord, activeObj: unknown): boolean {
+  return identityVerdict(rec, activeObj) === true;
+}
+
+/** Best-effort human label for a workflow_list record/active object. */
+function workflowRecordLabel(rec: unknown): string | undefined {
+  if (!rec || typeof rec !== "object") return undefined;
+  const r = rec as { filename?: unknown; title?: unknown; path?: unknown; key?: unknown };
+  for (const v of [r.filename, r.title, r.path, r.key]) {
+    if (typeof v === "string" && v.trim()) return v;
+  }
+  return undefined;
+}
+
+/** Outcome of validating + canonicalizing a pin target. */
+export type PinTargetResolution =
+  | { ok: true; pinPath: string; pinFilename?: string }
+  | { ok: false; error: string };
+
+/**
+ * Validate and canonicalize a pin `path` to a routable target, SHARED by every entry
+ * point that writes a pinned workflow target (the MCP tool AND the panel-driven
+ * set_workflow_target event) so none can bypass the guarantees:
+ *  - FAIL CLOSED when the workflow isn't open (#259) — never route the pin to another tab;
+ *  - FAIL AT PIN TIME when it is open but NOT the active canvas (#556/#571) — the panel can
+ *    only read/edit the in-view workflow (panel #349/#186), so a background pin would only
+ *    defer a "workflow mismatch"; reject it honestly and immediately;
+ *  - otherwise canonicalize to the stable `key` (survives rename/reconnect);
+ *  - INDETERMINATE lists (older/partial panel — no `workflows` array, or no comparable
+ *    active identity) stay LENIENT: pin the raw path rather than fail a valid pin.
+ */
+export async function resolvePinTarget(
+  ctx: PanelToolCtx,
+  path: string,
+  filename: string | undefined,
+): Promise<PinTargetResolution> {
+  const resolved = await resolveOpenWorkflow(ctx, path);
+  if (resolved === NOT_OPEN) {
+    return {
+      ok: false,
+      error:
+        `Cannot pin to "${path}" — it is not open in ComfyUI. Open it first ` +
+        `(panel_open_workflow) or pick an open workflow from panel_list_workflows, ` +
+        `then pin. (Refusing to pin to a workflow that isn't open so graph edits ` +
+        `never land on the wrong tab.)`,
+    };
+  }
+  if (resolved && resolved.isActive === false) {
+    const activeName = resolved.activeLabel ? ` (currently "${resolved.activeLabel}")` : "";
+    return {
+      ok: false,
+      error:
+        `Cannot pin to "${filename ?? path}" — it is open but not the active canvas${activeName}. ` +
+        `The panel can only read or edit the workflow that is currently in view, so a background ` +
+        `pin would fail on your next panel_* graph call. To work on it, switch to it first with ` +
+        `panel_open_workflow (that makes it the active canvas), then pin — or, if you meant to ` +
+        `edit the workflow already in view, pin that one instead. (Pinning does not switch the ` +
+        `user's view and cannot route edits to a background tab.)`,
+    };
+  }
+  if (resolved) {
+    // Canonicalize to the stable key so routing survives rename/reconnect.
+    const rec = resolved.record;
+    return {
+      ok: true,
+      pinPath: rec.key ?? rec.path ?? path,
+      pinFilename: filename ?? rec.filename ?? rec.path,
+    };
+  }
+  // Indeterminate list — stay lenient (older/partial panel).
+  return { ok: true, pinPath: path, pinFilename: filename };
 }
 
 export const __openWorkflowTestHooks = {
@@ -3121,7 +3287,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_get_workflow_target",
-      "Read which workflow this agent is bound to edit. mode 'current' means graph tools follow whatever tab the user is viewing; mode 'pinned' means edits go to the pinned workflow even if the user switched to another tab. Call this when unsure which workflow your panel_* edits will affect.",
+      "Read which workflow this agent is bound to edit. mode 'current' means graph tools follow whatever tab the user is viewing; mode 'pinned' means edits are bound to the pinned workflow (which was the active canvas at pin time) — if the user later switches to another tab, your next graph call FAILS LOUDLY rather than silently editing the wrong graph. Call this when unsure which workflow your panel_* edits will affect.",
       {},
       async (_args, ctx) => {
         const target = ctx.workflowTarget?.get(ctx.tabId) ?? { mode: "current" as const };
@@ -3130,7 +3296,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_set_workflow_target",
-      "Pin the agent to a specific open workflow tab, or release the pin to follow the user's current tab. Use pinned when the user asks you to work on workflow A while they browse workflow B — set mode:'pinned' and path from panel_list_workflows. Set mode:'current' (or omit path) to follow the active tab again. Does NOT switch what the user sees; it only routes your panel_* graph edits. mode:'current' is ALSO the explicit RECOVERY signal: if your panel_* calls started failing with `no connected tab` after ComfyUI reconnected, the panel reloaded, or the user switched to a different workflow FILE, call this with mode:'current' to rebind this session onto the tab that's live now.",
+      "Pin the agent to a specific open workflow tab (it must be the ACTIVE/in-view workflow at pin time), or release the pin to follow the user's current tab. The panel can only read or edit the workflow currently in view, so pinning to a background tab is REJECTED at pin time — to work on a different open workflow, switch to it first with panel_open_workflow (that makes it active), then pin. Pinning does NOT change the user's view; it binds your panel_* graph edits to that workflow and makes a later mismatch (e.g. the user switches away) fail loudly instead of silently editing the wrong graph. Set mode:'pinned' with path from panel_list_workflows; set mode:'current' (or omit path) to follow the active tab again. mode:'current' is ALSO the explicit RECOVERY signal: if your panel_* calls started failing with `no connected tab` after ComfyUI reconnected, the panel reloaded, or the user switched to a different workflow FILE, call this with mode:'current' to rebind this session onto the tab that's live now.",
       {
         mode: z
           .enum(["current", "pinned"])
@@ -3168,27 +3334,17 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           }
         }
         // PIN: bind to the EXACT open-workflow identity from the authoritative
-        // workflow_list, canonicalizing to its stable `key` and FAILING CLOSED when
-        // the requested workflow isn't actually open — instead of letting the panel
-        // silently route the pin to another tab (#259). Indeterminate lists (older
-        // panel / no `workflows` array) fall back to the raw path (unchanged).
+        // workflow_list, canonicalizing to its stable `key`, FAILING CLOSED when the
+        // requested workflow isn't open (#259), and FAILING AT PIN TIME when it is open
+        // but not the active canvas (#556/#571). Shared with the panel-driven event path
+        // so both entry points validate identically.
         let pinPath = path;
         let pinFilename = filename;
         if (mode === "pinned" && path) {
-          const resolved = await resolveOpenWorkflow(ctx, path);
-          if (resolved === NOT_OPEN) {
-            return fail(
-              `Cannot pin to "${path}" — it is not open in ComfyUI. Open it first ` +
-                `(panel_open_workflow) or pick an open workflow from panel_list_workflows, ` +
-                `then pin. (Refusing to pin to a workflow that isn't open so graph edits ` +
-                `never land on the wrong tab.)`,
-            );
-          }
-          if (resolved) {
-            // Canonicalize to the stable key so routing survives rename/reconnect.
-            pinPath = resolved.key ?? resolved.path ?? path;
-            pinFilename = filename ?? resolved.filename ?? resolved.path;
-          }
+          const res = await resolvePinTarget(ctx, path, filename);
+          if (!res.ok) return fail(res.error);
+          pinPath = res.pinPath;
+          pinFilename = res.pinFilename;
         }
         const target = ctx.workflowTarget.set(ctx.tabId, {
           mode,

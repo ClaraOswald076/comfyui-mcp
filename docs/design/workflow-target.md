@@ -11,7 +11,19 @@ The orchestrator keeps a per-`tab_id` **workflow target**:
 | mode | behavior |
 |------|----------|
 | `current` | Graph tools follow the user's active workflow tab (default) |
-| `pinned` | Graph tools include `workflow_path` on scoped commands |
+| `pinned` | Graph tools include `workflow_path` on scoped commands. The pin **must target the active canvas at pin time** — see the constraint below |
+
+### Active-canvas constraint (#556/#571)
+
+The panel has **no way to read or mutate a non-active workflow's graph**: every graph executor runs against `app.canvas.graph`, and the panel's pinned-target guard (#349/#186) **fails closed** with a "workflow mismatch" error whenever an injected `workflow_path` is not the workflow currently in view. Background editing of a non-active tab is therefore **not supported**.
+
+Consequently a pin is only honorable when its target is the active canvas. `panel_set_workflow_target` (and the panel-driven `set_workflow_target` event) **validate at pin time** via `resolvePinTarget` and:
+
+- **fail closed** if the workflow isn't open (#259),
+- **fail at pin time** if it is open but not the active canvas (#556/#571) — never accept-then-defer,
+- canonicalize an honorable pin to the workflow's stable `key`.
+
+The injected `workflow_path` then acts as a **guard**: if the user later switches away, the next graph command fails loudly instead of silently editing the wrong graph.
 
 ### Orchestrator API
 
@@ -31,14 +43,13 @@ Never injected on: `workflow_list`, `workflow_new`, `workflow_open`.
 
 ### Panel implementation (comfyui-mcp-panel)
 
-Each graph executor should:
+Graph executors run against the **active canvas** (`app.canvas.graph`); the panel cannot address a non-active workflow document. So each executor:
 
-1. Read optional `workflow_path` on the incoming `{ rid, cmd, … }` frame.
-2. Resolve the workflow document for that path (not only the active tab).
-3. Apply the mutation on that document's graph store.
-4. Optionally refresh UI if that workflow is visible; **do not** switch the user's active tab unless `workflow_open` is called.
+1. Reads optional `workflow_path` on the incoming `{ rid, cmd, … }` frame.
+2. Treats it as a **guard**: if `workflow_path` does not identify the active canvas, it **fails closed** with a retryable "workflow mismatch" error (#349/#186) — it never blindly mutates the active graph under a mismatched pin.
+3. Otherwise applies the mutation on the active canvas.
 
-Background edits on a non-active workflow should still persist and mark that tab modified.
+Because background editing is not possible, the orchestrator rejects a background pin **at pin time** (see the active-canvas constraint above) so the mismatch guard is only ever a last line of defense (e.g. the user switches tabs after a valid pin), not the normal failure path.
 
 ## Files
 

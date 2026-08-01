@@ -36,7 +36,7 @@ import {
   type UsageStatus,
 } from "./panel-agent.js";
 import { promptText } from "./error-text.js";
-import { createPanelMcpServer } from "./panel-tools.js";
+import { createPanelMcpServer, makePanelToolCtx, resolvePinTarget } from "./panel-tools.js";
 import {
   optionsAckFrame,
   optionsErrorAckFrame,
@@ -129,7 +129,7 @@ REPORT OUR OWN BUGS (we're in beta — bias HARD toward filing) — distinct fro
 
 WEDGED RENDER / OOM / VRAM PINNED — when a generation is stuck or hits CUDA out-of-memory, or a cancel didn't actually free GPU memory (models still resident, VRAM pinned, the next run still OOMs), call panel_free_vram to UNLOAD all models and free VRAM before retrying — it does NOT restart ComfyUI, so it's the cheap first move. Escalation ladder: cancel the run → panel_free_vram (unload + free) → retry; only as a LAST RESORT panel_restart_comfyui (which refuses mid-render and guards the running generation). Reach for panel_free_vram before a restart whenever a cancel left memory pinned.
 
-WORKFLOW TARGETING — by default your panel_* graph edits follow whichever workflow tab the user is currently viewing. If the user wants you to work on a DIFFERENT open workflow while they browse another tab, call panel_set_workflow_target(mode:"pinned", path:<from panel_list_workflows>) to pin edits to that workflow; panel_get_workflow_target shows the current binding. Set mode:"current" to follow the user's active tab again. Pinning does NOT switch what the user sees — it only routes your graph tools. When pinned, still use panel_open_workflow only when you intentionally want to switch the user's view.
+WORKFLOW TARGETING — by default your panel_* graph edits follow whichever workflow tab the user is currently viewing. The panel can only read or edit the workflow currently IN VIEW, so to work on a specific open workflow, make it the active canvas first with panel_open_workflow, then call panel_set_workflow_target(mode:"pinned", path:<from panel_list_workflows>) to bind your edits to it; panel_get_workflow_target shows the current binding. Pinning to a background (open but not active) workflow is REJECTED at pin time — it cannot route edits to a tab that isn't in view. A pin does NOT switch what the user sees; it binds your edits to that workflow so that if the user later switches away, your next graph call fails loudly instead of silently editing the wrong graph. Set mode:"current" to follow the user's active tab again.
 
 CRITICAL — never destroy the user's work. When they ask for a "new workflow", a "fresh canvas", or to "start over for a new project", call panel_new_workflow (it opens a NEW TAB and leaves their current workflow intact). NEVER use panel_clear for that — panel_clear wipes the CURRENTLY OPEN graph and is ONLY for an explicit "clear/reset this canvas". You can manage tabs with panel_list_workflows / panel_open_workflow / panel_rename_workflow / panel_close_workflow, and group nodes with panel_select_nodes / panel_create_subgraph. To label a node by its purpose, use panel_set_node_title. To read or edit nodes INSIDE a subgraph, call panel_enter_subgraph(node_id) first — then panel_query_graph / panel_graph_outline and the panel_* edit tools operate on the subgraph's inner nodes — and panel_exit_subgraph when you're done.
 
@@ -1372,6 +1372,13 @@ export async function runPanelOrchestrator(): Promise<void> {
   const resolvedModelByTab = new Map<string, string>();
   const headlessTabs = new Set<string>(); // tabs with no ComfyUI canvas (mobile/remote) — deliver renders in-turn
   const workflowTargets = new WorkflowTargetStore();
+  // Monotonic per-tab sequence for set_workflow_target events. A pinned target is
+  // validated asynchronously (resolvePinTarget queries workflow_list), so a later event
+  // (another pin, or a synchronous mode:"current") can arrive before the async pin
+  // commits. Each event bumps the tab's sequence; a pinned resolution only commits/acks if
+  // its captured sequence is still the latest — otherwise a stale pin would clobber the
+  // user's newer selection (codex race).
+  const workflowTargetSeq = new Map<string, number>();
   const backendForTab = (panelTabId: string): string =>
     tabBackends.get(panelTabId) ?? defaultBackend;
   const agentKeyFor = (panelTabId: string): string =>
@@ -2475,6 +2482,11 @@ export async function runPanelOrchestrator(): Promise<void> {
         tabBackends.delete(migratedFrom);
         headlessTabs.delete(migratedFrom);
         workflowTargets.clear(migratedFrom);
+        // Invalidate any in-flight set_workflow_target(pinned) resolution captured under
+        // the retired id: dropping its sequence makes isCurrent() false, so a late async
+        // pin can no longer write a stale target / emit a late ack that the bridge's
+        // migration map would deliver to the new tab (codex race, tab-id migration edge).
+        workflowTargetSeq.delete(migratedFrom);
       }
       // Blind content mode rides the hello (issue #90) so the FIRST agent spawn
       // already carries the right tool-server env. A CHANGE against a live
@@ -2775,12 +2787,56 @@ export async function runPanelOrchestrator(): Promise<void> {
         );
         return;
       }
-      const target = workflowTargets.set(panelTab, { mode, path, filename });
-      bridge.push({ type: "ack", ok: true, kind: "workflow_target", target }, panelTab);
-      bridge.push({ type: "workflow_target", target }, panelTab);
-      logger.info(
-        `[panel-orchestrator] tab ${panelTab.slice(0, 8)} workflow target → ${target.mode}${target.path ? ` (${target.path})` : ""}`,
-      );
+      // Every target event bumps the tab's sequence so a later selection always wins over
+      // an in-flight (async) pin resolution.
+      const seq = (workflowTargetSeq.get(panelTab) ?? 0) + 1;
+      workflowTargetSeq.set(panelTab, seq);
+      const isCurrent = () => workflowTargetSeq.get(panelTab) === seq;
+      const ackTarget = (t: ReturnType<typeof workflowTargets.set>) => {
+        bridge.push({ type: "ack", ok: true, kind: "workflow_target", target: t }, panelTab);
+        bridge.push({ type: "workflow_target", target: t }, panelTab);
+        logger.info(
+          `[panel-orchestrator] tab ${panelTab.slice(0, 8)} workflow target → ${t.mode}${t.path ? ` (${t.path})` : ""}`,
+        );
+      };
+      // A PINNED target must clear the SAME validation as the MCP tool
+      // (panel_set_workflow_target) — otherwise this panel-driven event path would be a
+      // bypass that re-admits #556/#571 (background pin) and #259 (not-open pin). Resolve
+      // async through the shared helper, failing at pin time before the store is written.
+      if (mode === "pinned") {
+        void (async () => {
+          const ctx = makePanelToolCtx(bridge, panelTab, workflowTargets);
+          const res = await resolvePinTarget(ctx, String(path), filename);
+          // Superseded by a newer target event while we were validating — drop silently
+          // (no write, no late ack) so the newer selection is never clobbered.
+          if (!isCurrent()) return;
+          if (!res.ok) {
+            bridge.push(
+              { type: "ack", ok: false, kind: "workflow_target", message: res.error },
+              panelTab,
+            );
+            return;
+          }
+          ackTarget(
+            workflowTargets.set(panelTab, { mode: "pinned", path: res.pinPath, filename: res.pinFilename }),
+          );
+        })().catch((err) => {
+          if (!isCurrent()) return;
+          bridge.push(
+            {
+              type: "ack",
+              ok: false,
+              kind: "workflow_target",
+              message: `Could not pin workflow: ${err instanceof Error ? err.message : String(err)}`,
+            },
+            panelTab,
+          );
+        });
+        return;
+      }
+      // mode === "current" — no target to validate; follow the active tab. Writes
+      // synchronously and is the latest sequence, so it wins over any in-flight pin.
+      ackTarget(workflowTargets.set(panelTab, { mode, path, filename }));
       return;
     }
 
