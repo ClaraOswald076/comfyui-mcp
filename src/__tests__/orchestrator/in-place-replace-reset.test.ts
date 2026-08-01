@@ -98,6 +98,43 @@ describe("in-place workflow replacement resets the live session (#570 P0)", () =
     await manager.stopAll();
   });
 
+  it("#570: a backend switch RETIRES the prior provider (preserves its session) so switching back resumes", async () => {
+    // set_backend on the SAME workflow must NOT reset the old provider — that would clear its
+    // durable exact record, and a SAVED wf: workflow has no stable-key fallback, so switching
+    // back could never resume. retire() stops the live agent but keeps the identity-bound
+    // session, so a later switch-back continues the original conversation (codex round-trip).
+    const backend = new SessioningBackend();
+    const store = new SessionStore(PORT);
+    const manager = new PanelAgentManager({
+      mcpServers: {},
+      systemAppend: "",
+      model: "claude-test",
+      onSay: () => {},
+      onTurn: () => {},
+      onSession: () => {},
+      sessionStore: store,
+      makeBackend: () => backend,
+      identityForKey: () => IDENTITY_A,
+    } as never);
+
+    const claudeKey = "wf:foo.json::claude"; // a SAVED workflow (no stable-key fallback)
+    manager.send(claudeKey, "hi from claude on workflow A");
+    await waitFor(() => backend.turnTexts.length === 1);
+    expect(store.get(claudeKey)).toBe("sess-A");
+    expect(manager.hasLiveAgent(claudeKey)).toBe(true);
+
+    // Provider switch A(claude) → B(codex): set_backend now RETIRES claude, not resets it.
+    manager.retire(claudeKey);
+    expect(manager.hasLiveAgent(claudeKey)).toBe(false); // live agent stopped (no double-run)
+    // …but the durable session is PRESERVED — this is what makes the switch-BACK resumable.
+    expect(store.get(claudeKey)).toBe("sess-A");
+    expect(store.identityOf(claudeKey)).toBe(IDENTITY_A);
+    // Durable across a fresh process too (a restart between switches).
+    expect(new SessionStore(PORT).get(claudeKey)).toBe("sess-A");
+
+    await manager.stopAll();
+  });
+
   it("P0a: a live agent in the spawn→first-session window (no durable record) is still torn down", async () => {
     // The prior workflow can have a LIVE agent BEFORE its first `session` event — so no
     // durable exact record exists yet. The identity-boundary reset gates on STATE

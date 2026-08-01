@@ -3085,7 +3085,14 @@ export async function runPanelOrchestrator(): Promise<void> {
       }
       const prev = tabBackends.get(panelTab) ?? defaultBackend;
       if (prev !== reqBackend) {
-        manager.reset(panelTab + AGENT_KEY_SEP + prev);
+        // #570 — RETIRE, never reset: a provider switch stays on the SAME workflow, so the old
+        // provider's session must be PRESERVED (stop its live agent, keep its durable exact
+        // record) — otherwise switching back can't resume it. A SAVED (wf:) workflow has NO
+        // stable-key fallback (stable keys are tmp:-only), so reset() here would irreversibly
+        // destroy its prior-provider conversation on a normal A→B→A switch (codex). retire()
+        // stops the agent (so it can't push into the new provider's view) while leaving the
+        // identity-bound session on disk, exactly as the same-socket workflow-switch path does.
+        manager.retire(panelTab + AGENT_KEY_SEP + prev);
         bridge.broadcastTabList(); // live agent dropped on backend switch → refresh dot
         // #570: the stable resume key ENCODES the backend. This switch never re-hellos,
         // so RECOMPUTE the key for the new provider from the tab's stored identity —
