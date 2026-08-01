@@ -42,6 +42,70 @@ export function explorerHttpError(route: string, status: number, body?: string):
   return new Error(`model_explorer ${route} HTTP ${status}`);
 }
 
+// #541: `model_metadata_fetch_civitai` proxies the OPTIONAL `comfyui-model-explorer`
+// node, which does a local SHA256 → CivitAI by-hash lookup. When that node isn't
+// installed the route 404s. Rather than hard-failing, degrade: if the caller gave a
+// `version_id` we can fetch the SAME data straight from CivitAI's public REST API
+// (no auth, no custom node, no hash) and return a normalized shape.
+export async function fetchCivitaiVersionDirect(
+  versionId: number,
+): Promise<Record<string, unknown> | null> {
+  try {
+    const res = await fetch(`https://civitai.com/api/v1/model-versions/${versionId}`);
+    if (!res || !res.ok) return null;
+    const v = (await res.json()) as any;
+    const modelId = v?.modelId ?? null;
+    const examplePrompts = Array.isArray(v?.images)
+      ? v.images
+          .map((im: any) => im?.meta?.prompt)
+          .filter((p: any) => typeof p === "string" && p.trim().length > 0)
+          .slice(0, 20)
+      : [];
+    return {
+      _source: "civitai-public-api",
+      _note: "Fetched directly from civitai.com (the optional comfyui-model-explorer node was unavailable). Version-endpoint fields only.",
+      source_url: modelId
+        ? `https://civitai.com/models/${modelId}?modelVersionId=${versionId}`
+        : `https://civitai.com/api/v1/model-versions/${versionId}`,
+      model_version_id: versionId,
+      model_id: modelId,
+      version_name: v?.name ?? null,
+      model_name: v?.model?.name ?? null,
+      model_type: v?.model?.type ?? null,
+      base_model: v?.baseModel ?? null,
+      nsfw: v?.model?.nsfw ?? null,
+      trainedWords: Array.isArray(v?.trainedWords) ? v.trainedWords : [],
+      description: v?.description ?? null,
+      example_prompts: examplePrompts,
+      download_url: v?.downloadUrl ?? null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Graceful "optional feature unavailable" message for the CivitAI enrichment tool
+// when the node route 404s (node absent OR node present but model not found). Points
+// at the dependency-free `version_id` path so the caller can recover without the node.
+export function civitaiFetchUnavailableError(body?: string, hadVersionId?: boolean): Error {
+  const hint = body && body.trim() ? ` Upstream detail: ${body.trim().slice(0, 200)}.` : "";
+  const recover = hadVersionId
+    ? `A version_id was supplied, but the direct fallback to CivitAI's public API ` +
+      `(https://civitai.com/api/v1/model-versions/<id>) also failed — that version may ` +
+      `not exist, or civitai.com was unreachable.`
+    : `To fetch metadata WITHOUT the node, pass 'version_id' (the CivitAI modelVersionId) — ` +
+      `this tool then reads it straight from CivitAI's public API (no node, no auth).`;
+  return new Error(
+    `model_metadata_fetch_civitai: CivitAI enrichment is unavailable. This is an OPTIONAL ` +
+      `feature that proxies the optional 'comfyui-model-explorer' custom node (its ` +
+      `/model_explorer/civitai route returned 404). Most likely the node is not installed — ` +
+      `install it via ComfyUI-Manager or install_custom_node and restart to enable automatic ` +
+      `by-hash lookup. If that node IS installed, the 404 instead means it could not find the ` +
+      `requested model file — check 'category' (model folder) and 'name' (filename incl. ` +
+      `.safetensors). ${recover}${hint}`,
+  );
+}
+
 async function readBodyText(res: { text?: () => Promise<string> }): Promise<string | undefined> {
   try {
     return res.text ? await res.text() : undefined;
@@ -137,7 +201,11 @@ export function registerModelExplorerTools(server: McpServer): void {
       "result as RAW input: distill the (often marketing-heavy) description, and MINE THE EXAMPLE PROMPTS for " +
       "the real trigger — the trigger is frequently ONLY in the sample prompts even when trainedWords is EMPTY " +
       "(e.g. every prompt starting with 'photo in the style of X' means X is the trigger). Adult models (civitai.red) " +
-      "resolve through this same API. Then clean it up and call model_metadata_propose.",
+      "resolve through this same API. Then clean it up and call model_metadata_propose. " +
+      "DEPENDENCY: automatic by-hash lookup uses the OPTIONAL 'comfyui-model-explorer' custom node. If that node " +
+      "isn't installed, pass 'version_id' (the CivitAI modelVersionId) and this tool degrades to CivitAI's public " +
+      "REST API directly — no node, no auth. Without both the node AND a version_id it returns a clear " +
+      "'optional feature unavailable' message rather than enriching.",
     {
       category: z.string().describe("ComfyUI model folder, e.g. 'loras'"),
       name: z.string().describe("model filename incl. .safetensors"),
@@ -146,12 +214,27 @@ export function registerModelExplorerTools(server: McpServer): void {
     async (args) => {
       try {
         const COMFY = comfyBase();
+        // A CivitAI modelVersionId is always a positive integer; treat anything
+        // else (incl. 0) as "not supplied" so the node query and the fallback
+        // agree on when we actually have an id.
+        const hasVersionId = typeof args.version_id === "number" && args.version_id > 0;
         const q =
           `category=${encodeURIComponent(args.category)}&name=${encodeURIComponent(args.name)}` +
-          (args.version_id ? `&version_id=${args.version_id}` : "");
+          (hasVersionId ? `&version_id=${args.version_id}` : "");
         const r = await fetch(`${COMFY}/model_explorer/civitai?${q}`);
-        if (!r.ok) return errorToToolResult(explorerHttpError("civitai", r.status, await readBodyText(r)));
-        return okText(await r.json());
+        if (r.ok) return okText(await r.json());
+        const body = await readBodyText(r);
+        // #541: the node route is unavailable. Degrade instead of hard-failing.
+        // With a version_id we can satisfy the request straight from CivitAI's
+        // public API (no node, no auth, no hash).
+        if (r.status === 404 && hasVersionId) {
+          const direct = await fetchCivitaiVersionDirect(args.version_id as number);
+          if (direct) return okText(direct);
+        }
+        if (r.status === 404) {
+          return errorToToolResult(civitaiFetchUnavailableError(body, hasVersionId));
+        }
+        return errorToToolResult(explorerHttpError("civitai", r.status, body));
       } catch (err) {
         return errorToToolResult(err);
       }

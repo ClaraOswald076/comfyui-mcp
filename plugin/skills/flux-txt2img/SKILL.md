@@ -30,7 +30,7 @@ Flux is a guidance-distilled diffusion model family from Black Forest Labs. It u
 | Component | Node | Model | Notes |
 |-----------|------|-------|-------|
 | **UNET** | `UNETLoader` | `bigLove_klein1.safetensors` | 17.3GB, Klein 9B variant |
-| **CLIP** | `CLIPLoader` (type=`flux`) | `qwen_3_8b_fp8mixed.safetensors` | Qwen3-8B in text_encoders/ (8.3GB) |
+| **CLIP** | `CLIPLoader` (type=`flux2`) | `qwen_3_8b_fp8mixed.safetensors` | Qwen3-8B in text_encoders/ (8.3GB). Use `flux2`, NOT `flux` — both exist in the enum and `flux` fails at the sampler |
 | **VAE** | `VAELoader` | `flux2-vae.safetensors` | Flux 2 specific VAE (321MB) |
 
 **Klein 9B vs Flux.1 Dev**: Klein uses Qwen3-8B text encoder (not T5XXL + CLIP-L). It has a different VAE (`flux2-vae.safetensors`). 9B distilled runs in 4 steps; 9B base needs ~50 steps at CFG 5.0. Fits in ~20GB VRAM with FP8.
@@ -195,11 +195,11 @@ Bad: "masterpiece, best quality, 1girl, cafe, paris"
 ```json
 {
   "1": { "class_type": "UNETLoader", "inputs": { "unet_name": "bigLove_klein1.safetensors", "weight_dtype": "default" }},
-  "2": { "class_type": "CLIPLoader", "inputs": { "clip_name": "qwen_3_8b_fp8mixed.safetensors", "type": "flux" }},
+  "2": { "class_type": "CLIPLoader", "inputs": { "clip_name": "qwen_3_8b_fp8mixed.safetensors", "type": "flux2" }},
   "3": { "class_type": "VAELoader", "inputs": { "vae_name": "flux2-vae.safetensors" }},
   "4": { "class_type": "CLIPTextEncode", "inputs": { "clip": ["2", 0], "text": "<prompt>" }},
   "5": { "class_type": "ConditioningZeroOut", "inputs": { "conditioning": ["4", 0] }},
-  "6": { "class_type": "EmptyLatentImage", "inputs": { "width": 1024, "height": 1024, "batch_size": 1 }},
+  "6": { "class_type": "EmptyFlux2LatentImage", "inputs": { "width": 1024, "height": 1024, "batch_size": 1 }},
   "7": { "class_type": "KSampler", "inputs": {
     "model": ["1", 0],
     "positive": ["4", 0],
@@ -212,7 +212,12 @@ Bad: "masterpiece, best quality, 1girl, cafe, paris"
 }
 ```
 
-**Klein note**: Uses single `CLIPLoader` (not DualCLIPLoader) with `type: "flux"` and the Qwen3-8B text encoder from `text_encoders/`. The CLIP loader path resolves from `models/text_encoders/`.
+**Klein note**: Uses single `CLIPLoader` (not DualCLIPLoader) with `type: "flux2"` and the Qwen3-8B text encoder from `text_encoders/`. The CLIP loader path resolves from `models/text_encoders/`.
+
+**Two Flux-2-specific gotchas** (both fail at the KSampler, not at the loader, so the error points at the wrong node):
+- `type` must be **`flux2`**, not `flux`. Both values exist in the CLIPLoader enum, so `flux` loads without complaint and then dies during sampling.
+- Use **`EmptyFlux2LatentImage`**, not `EmptyLatentImage` — Flux 2 uses a different latent channel count.
+- Klein **9B** pairs with the **Qwen3-8B** encoder (`qwen_3_8b*` from `Comfy-Org/vae-text-encorder-for-flux-klein-9b`). The similarly-named `qwen_3_4b` ships in the klein-**4b** repo and is for the 4B model. Mismatching them raises `mat1 and mat2 shapes cannot be multiplied (512x7680 and 12288x4096)` — 7680 = 2560x3 (4B hidden size) vs 12288 = 4096x3 (8B) — which reads as a confusing CLIP error rather than a wrong-file error.
 
 ## Complete Workflow: Flux.1 Dev + Turbo LoRA (4-Step)
 
