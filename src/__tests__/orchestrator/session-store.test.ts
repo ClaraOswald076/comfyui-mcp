@@ -260,6 +260,31 @@ describe("SessionStore", () => {
       expect(new SessionStore(PORT).getStable(recomputed)).toBeUndefined();
     });
 
+    it("RESUME OWNERSHIP: a session owned by workflow A's identity is NOT owned by workflow B (#570 P0)", () => {
+      // Models the hello-handler's untrusted-hello.resume guard. The panel's default
+      // panel-scoped chat keeps ONE global session id S and re-sends it as hello.resume
+      // for EVERY workflow. The orchestrator honors it ONLY when S is owned by the tab's
+      // trusted identity — its exact-tab store entry OR its trusted stable key. Workflow A
+      // owns S; a fresh/copied workflow B (a different uuid) does NOT, so B's hello.resume=S
+      // is rejected → no cross-workflow chat resume.
+      const store = new SessionStore(PORT);
+      const keyA = deriveStableKey({ workflowUuid: UUID_A, origin: "o", backend: "claude" })!;
+      store.setStable(keyA, "sess-S", "tmp:tabA"); // A converses; onSession persisted S
+      store.set("tmp:tabA::claude", "sess-S"); // and under A's exact key
+      const resume = "sess-S";
+
+      // A (same identity, e.g. a reload): OWNED via the stable key → honor.
+      const keyAReload = deriveStableKey({ workflowUuid: UUID_A, origin: "o", backend: "claude" })!;
+      expect(store.getStable(keyAReload) === resume).toBe(true);
+
+      // B (a different workflow that the panel re-hello'd with the same global S): the
+      // exact key differs (new tmp id) AND B's stable key doesn't hold S → NOT owned.
+      const keyB = deriveStableKey({ workflowUuid: UUID_B, origin: "o", backend: "claude" })!;
+      const bOwnsResume =
+        store.get("tmp:tabB::claude") === resume || store.getStable(keyB) === resume;
+      expect(bOwnsResume).toBe(false); // B's hello.resume=S is dropped, never cross-resumes A
+    });
+
     it("WORKFLOW IDENTITY: distinguishes a same-workflow migration from a workflow switch (#570 P0a)", () => {
       // deriveWorkflowIdentity is the backend-independent discriminator the hello
       // handler uses to decide whether a same-socket re-hello under a new tab id is a

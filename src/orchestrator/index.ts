@@ -2669,11 +2669,37 @@ export async function runPanelOrchestrator(): Promise<void> {
       else headlessTabs.delete(panelTab);
       const key = panelTab + AGENT_KEY_SEP + backend;
 
-      // Reload restore: the panel re-sends the last session id it saw. Honored
-      // only for a SAME-provider (re)connect — a switch always starts fresh. The
-      // orchestrator's own store stays authoritative on the actual spawn.
-      const resume = typeof event.resume === "string" ? event.resume : undefined;
-      if (resume && (!prev || prev === backend)) manager.setResume(key, resume);
+      // Reload restore: the panel re-sends the last session id it saw. HONOR IT ONLY
+      // when it names a session THIS tab's TRUSTED identity already OWNS (#570 P0) — its
+      // exact-tab store entry OR its trusted stable-key entry. The panel's DEFAULT
+      // panel-scoped chat keeps ONE global session id and re-sends it for EVERY workflow,
+      // so a fresh/copied workflow (paste/duplicate/new) would otherwise resume the
+      // PREVIOUS workflow's private conversation — the untrusted hello.resume bypasses the
+      // uuid boundary. An unowned/unrecognized resume is DROPPED (never armed), so it can
+      // NOT short-circuit the stable-key fallback below, which then decides by identity
+      // (fresh for a new workflow; the legit same-workflow session for a real reload —
+      // that session is stable-key-owned, so it is honored HERE too, including the
+      // orchestrator-restart belt-and-suspenders case). Same-provider only. This binds
+      // resume to identity: a persistent panel-global chat across workflows would be a
+      // separate, separately-authorized feature, not this untrusted path.
+      const resumeHint = typeof event.resume === "string" ? event.resume : undefined;
+      let armedResume: string | undefined;
+      if (resumeHint && (!prev || prev === backend)) {
+        const trustedStableKey = newIdentity
+          ? deriveStableKey({ workflowUuid: newIdentity.uuid, origin: newIdentity.origin, backend })
+          : undefined;
+        const owned =
+          sessionStore.get(key) === resumeHint ||
+          (trustedStableKey !== undefined && sessionStore.getStable(trustedStableKey) === resumeHint);
+        if (owned) {
+          armedResume = resumeHint;
+          manager.setResume(key, resumeHint);
+        } else {
+          logger.info(
+            `[panel-orchestrator] tab ${panelTab.slice(0, 8)} hello.resume ${resumeHint.slice(0, 8)} is not owned by this workflow's trusted identity — dropping (won't cross-resume another workflow's chat)`,
+          );
+        }
+      }
 
       // #570: an UNSAVED workflow's tab id is an ephemeral tmp:<uuid>, regenerated
       // on every panel reload — so on an orchestrator restart that also reloads the
@@ -2707,7 +2733,7 @@ export async function runPanelOrchestrator(): Promise<void> {
           // tab's conversation (setStable also poisons the key the moment two live tabs
           // write distinct sessions to it). When ambiguous we surface fresh — a lost
           // resume is a mild miss; resuming the WRONG conversation is not.
-          if (!resume && !manager.hasLiveAgent(key) && sessionStore.get(key) === undefined) {
+          if (!armedResume && !manager.hasLiveAgent(key) && sessionStore.get(key) === undefined) {
             let sameKeyTabs = 0;
             for (const t of bridge.tabs()) {
               if (tabStableKey.get(t.tab_id) === skey) sameKeyTabs += 1;
@@ -2875,7 +2901,10 @@ export async function runPanelOrchestrator(): Promise<void> {
               })();
             }
             // Greet only on a FRESH session (a resume/reconnect already has the thread).
-            if (!resume) {
+            // Keyed on the panel's raw hint (whether it BELIEVES it has a thread), not on
+            // whether we armed it — an unowned-and-dropped hint still means the panel is
+            // showing prior content, so a greeting atop it would be redundant.
+            if (!resumeHint) {
               // Prefer an ALREADY-resolved model if the SDK init raced ahead of this
               // greeting (#376) — otherwise the pre-init label. Remember what we
               // advertised so the onSession correction re-sends only on a real
