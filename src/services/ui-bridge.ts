@@ -1970,13 +1970,17 @@ export class UiBridge {
     try {
       // #570 — stamp the intended workflow uuid so the panel refuses to APPLY this command
       // if it has since switched to a different workflow (a frame already delivered to the
-      // browser cannot be retracted server-side; the client fences execution instead). Only
-      // when resolvable and not already present; an identity-less tab / old panel gets no
-      // stamp and executes as before (fail-open there, but the reply is still server-fenced).
+      // browser cannot be retracted server-side; the client fences execution instead).
+      //
+      // workflow_uuid is BRIDGE-OWNED metadata, NEVER caller-settable (codex): a caller that
+      // could supply its own workflow_uuid would just set it to the DESTINATION workflow after a
+      // switch and sail past the panel fence. So ALWAYS overwrite with the trusted resolver value
+      // (ctx.workflowUuid), and STRIP any caller-supplied value entirely when we have no trusted
+      // one — an identity-less tab / old panel ships unstamped (mutations are already refused by
+      // the requiresWorkflowStampEnforcement gate above; reads execute, reply still server-fenced).
       const frame: Record<string, unknown> = { rid, ...cmd };
-      if (ctx.workflowUuid && frame.workflow_uuid === undefined) {
-        frame.workflow_uuid = ctx.workflowUuid;
-      }
+      if (ctx.workflowUuid) frame.workflow_uuid = ctx.workflowUuid;
+      else delete frame.workflow_uuid;
       conn.sock.send(JSON.stringify(frame));
     } catch (err) {
       clearTimeout(timer);

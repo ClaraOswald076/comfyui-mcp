@@ -1322,6 +1322,31 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     desktop.close();
   });
 
+  it("workflow_uuid is BRIDGE-OWNED: a caller-supplied stamp is OVERRIDDEN by the trusted resolver value (#570 P0c)", async () => {
+    // A caller must not be able to forge the stamp to the destination workflow to sail past the
+    // panel fence after a switch. dispatch always overwrites workflow_uuid with the resolver value.
+    bridge.setTabWorkflowUuidResolver((tabId) => (tabId === "tmp:A" ? "uuid-A" : undefined));
+    const desktop = await connectPanel("tmp:A", "A");
+    const frames: Array<Record<string, unknown>> = [];
+    desktop.on("message", (buf) => {
+      const m = JSON.parse(buf.toString());
+      if (m.rid && m.cmd) {
+        frames.push(m);
+        desktop.send(JSON.stringify({ rid: m.rid, ok: true, result: {} }));
+      }
+    });
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:A")).toBe(true));
+    // Caller tries to smuggle a conflicting workflow_uuid (the would-be destination) in the cmd.
+    await bridge.send(
+      { cmd: "graph_add_node", node: "x", workflow_uuid: "uuid-FORGED-DESTINATION" } as never,
+      { tabId: "tmp:A" },
+    );
+    await vi.waitFor(() => expect(frames.find((f) => f.cmd === "graph_add_node")).toBeTruthy());
+    // The emitted frame carries the TRUSTED origin uuid, not the caller's forged value.
+    expect(frames.find((f) => f.cmd === "graph_add_node")?.workflow_uuid).toBe("uuid-A");
+    desktop.close();
+  });
+
   it("REFUSES a mutation when the tab has no trusted workflow identity, even if the panel advertises enforcement (#570 P0c)", async () => {
     // A panel that CLAIMS enforcement but has no resolvable workflow uuid: the frame would ship
     // UNSTAMPED, so the panel's fence has nothing to compare and a stale mutation after a switch
