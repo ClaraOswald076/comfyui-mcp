@@ -120,4 +120,27 @@ describe("shouldDispatchDownloadToManager (#420 reconnect routing)", () => {
     hoisted.statsThrows = true;
     expect(await shouldDispatchDownloadToManager()).toBe(false);
   });
+
+  it("routes to Manager for a RELATIVE --base-directory with no server cwd — EVEN with COMFYUI_PATH set", async () => {
+    // The server's real models dir is unknown (relative flag, no reported cwd); a
+    // local write to COMFYUI_PATH/models would be the WRONG place, so the server-side
+    // Manager fetch must win over the local base short-circuit (codex).
+    hoisted.base = "/home/me/ComfyUI";
+    hoisted.stats = { system: { argv: ["python", "main.py", "--base-directory", "data"] } };
+    expect(await shouldDispatchDownloadToManager()).toBe(true);
+  });
+
+  it("routes to Manager for a RELATIVE --models-directory with no server cwd (no local base)", async () => {
+    hoisted.base = undefined;
+    hoisted.stats = { system: { argv: ["python", "main.py", "--models-directory", "models2"] } };
+    expect(await shouldDispatchDownloadToManager()).toBe(true);
+  });
+
+  it("streams LOCAL for a relative flag that IS resolvable via the server cwd (base set)", async () => {
+    hoisted.base = "/home/me/ComfyUI";
+    hoisted.stats = {
+      system: { argv: ["python", "main.py", "--base-directory", "data"], cwd: "/srv/live" },
+    };
+    expect(await shouldDispatchDownloadToManager()).toBe(false);
+  });
 });

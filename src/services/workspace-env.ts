@@ -41,6 +41,31 @@ export function resetWorkspaceConfig(): void {
   configPathOverride = undefined;
 }
 
+// Whether THIS MCP process launched the connected LOCAL ComfyUI during this session
+// via a python `spawn` (which inherits process.env). When true, the running server
+// shares our environment, so it is safe to expand `$VAR`/`${VAR}`/`%VAR%` in its live
+// extra_model_paths config against process.env. A server we did NOT launch (separately
+// started, possibly with a DIFFERENT env, or a Desktop-app launch whose env we don't
+// share) must NOT have its config vars expanded against our env — that could authorize
+// a wrong-place download destination (#633 P1b). Set ONLY on the env-inheriting python
+// spawn path, cleared on stop; module-scoped, so it resets each MCP process lifetime.
+let localComfyUILaunchedByUs = false;
+
+/** Record that this MCP process spawned the local ComfyUI (env inherited). */
+export function markLocalComfyUILaunched(): void {
+  localComfyUILaunchedByUs = true;
+}
+
+/** Clear the launched-by-us flag (on stop, and a test seam). */
+export function resetLocalComfyUILaunchState(): void {
+  localComfyUILaunchedByUs = false;
+}
+
+/** True when this MCP process launched the connected local ComfyUI (shares our env). */
+export function didLaunchLocalComfyUI(): boolean {
+  return localComfyUILaunchedByUs;
+}
+
 function workspaceConfigPath(): string {
   return configPathOverride ?? defaultWorkspaceConfigPath();
 }

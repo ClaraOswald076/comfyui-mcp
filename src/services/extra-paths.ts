@@ -3,8 +3,13 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir, platform } from "node:os";
 import { dirname, join, isAbsolute, resolve } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
-import { config } from "../config.js";
-import { resolveServerExtraModelConfig } from "./output-dir.js";
+import { config, isRemoteMode } from "../config.js";
+import {
+  resolveServerExtraModelConfig,
+  parseExtraModelPathsConfigsFromArgvRaw,
+  type LiveServerSnapshot,
+} from "./output-dir.js";
+import { liveRootFromArgv, didLaunchLocalComfyUI } from "./workspace-env.js";
 import { ValidationError } from "../utils/errors.js";
 
 export const EXTRA_PATH_TARGETS = ["auto", "standalone", "desktop"] as const;
@@ -45,6 +50,112 @@ interface ExtraPathMutationOptions extends ExtraPathOptions {
   category: string;
   path: string;
   isDefault?: boolean;
+}
+
+/** ComfyUI-style `~` expansion (utils/extra_config.py applies expanduser FIRST).
+ *  ACCEPTED residuals (rare, user's own config on their own machine — maintainer
+ *  ruling, same class as the ntpath `$$`/single-quote edges): POSIX `~otheruser`
+ *  expansion and leading/trailing whitespace inside a quoted value are not modeled;
+ *  only the current user's `~`/`~/` (the form real configs use) is expanded. */
+function expandUser(s: string): string {
+  if (s === "~" || s.startsWith("~/") || s.startsWith("~\\")) {
+    return join(homedir(), s.slice(1));
+  }
+  return s;
+}
+
+// Bare `$NAME` grammar: posixpath uses `\w+`; Windows ntpath additionally admits `-`
+// in the name (so `$FOO-bar` is ONE var → usually undefined → left literal, matching
+// ComfyUI, instead of expanding `$FOO`). ACCEPTED deeper residuals (rare, trusted-mode
+// only, the user's OWN config on their OWN machine — maintainer ruling): the nt `$$`→`$`
+// escape and nt single-quote non-expansion are NOT modeled. `${...}` and simple
+// `$NAME`/`%NAME%` (the forms real configs use) are exact.
+const BARE_VAR = process.platform === "win32" ? /\$([\w-]+)/g : /\$(\w+)/g;
+const BARE_VAR_TEST = process.platform === "win32" ? /\$[\w-]+/ : /\$\w+/;
+
+/** ComfyUI-style env expansion (os.path.expandvars): `${VAR}`/`$VAR` on all platforms,
+ *  `%VAR%` on Windows with `%%` an ESCAPED literal `%`; an UNDEFINED variable is left
+ *  literal. */
+function expandVars(s: string): string {
+  let r = s.replace(/\$\{([^}]+)\}/g, (m, n) => process.env[n] ?? m);
+  r = r.replace(BARE_VAR, (m, n) => process.env[n] ?? m);
+  if (platform() === "win32") {
+    // Protect `%%` (escaped literal `%`) before %VAR% expansion, then restore it.
+    const PCT = "__CMCP_PCT_9f3a__";
+    r = r
+      .replace(/%%/g, PCT)
+      .replace(/%([^%]+)%/g, (m, n) => process.env[n] ?? m)
+      .replace(new RegExp(PCT, "g"), "%");
+  }
+  return r;
+}
+
+/** True when `s` still contains an env-var token expandVars would substitute. Kept
+ *  INCLUSIVE (matches the inner name even in an escaped `%%VAR%%`) so the untrusted
+ *  fail-closed drop errs toward refusing rather than authorizing a guess. */
+function hasEnvVarToken(s: string): boolean {
+  if (/\$\{[^}]+\}/.test(s) || BARE_VAR_TEST.test(s)) return true;
+  return platform() === "win32" && /%[^%]+%/.test(s);
+}
+
+/**
+ * Expand a live config `base_path` EXACTLY as ComfyUI does (utils/extra_config.py):
+ * expanduser FIRST, THEN expandvars, applied ONLY to base_path (per-category subpath
+ * entries are left LITERAL — ComfyUI never expands them). Mirroring the order + scope
+ * is a correctness requirement: authorizing a path ComfyUI would NOT register lets a
+ * symlink escape to a dir the server never scans (#633 P1a).
+ *
+ * P1b (fail-closed env): `$VAR`/`${VAR}`/`%VAR%` is expanded against process.env ONLY
+ * when the running server SHARES this process's environment (trustServerEnv — a local
+ * server this MCP launched, which inherited our env). Otherwise the server's real
+ * value is UNKNOWN, so a base_path that still needs an env var is UNRESOLVABLE and the
+ * caller drops the whole group rather than authorize a guessed-wrong destination.
+ * Returns undefined = unresolvable.
+ */
+function expandLiveBasePath(rawBase: string, trustServerEnv: boolean): string | undefined {
+  const afterUser = expandUser(rawBase);
+  if (hasEnvVarToken(afterUser)) {
+    if (!trustServerEnv) return undefined; // server env unknown → fail closed
+    return expandVars(afterUser);
+  }
+  return afterUser;
+}
+
+/**
+ * Join a category entry to a truthy `base_path` the way ComfyUI does — via
+ * `os.path.join(base, entry)`, for EVERY entry (never treating an absolute-LOOKING
+ * entry independently). The load-bearing case is Windows: `os.path.join("D:\\base",
+ * "\\unet")` is `D:\\unet` — a drive-RELATIVE `\unet` takes its drive from `base`, NOT
+ * the MCP process's current drive. Node's `path.join`/`resolve` would instead produce
+ * `C:\\unet` (the cwd drive), so a completely normal Windows config would authorize the
+ * WRONG DRIVE and the download would land where ComfyUI can't see it (#633). A fully
+ * absolute entry (drive+root, or UNC) still wins (matches os.path.join); a relative
+ * entry is base+entry.
+ */
+function joinCategoryEntryToBase(base: string, entry: string): string {
+  if (process.platform === "win32") {
+    const isUNC = /^[\\/]{2}/.test(entry);
+    const hasDrive = /^[a-zA-Z]:[\\/]/.test(entry);
+    const rootedNoDrive = !isUNC && !hasDrive && /^[\\/]/.test(entry);
+    // Extended-length / device-namespace bases (`\\?\…`, `\\.\…`) have an exotic
+    // splitdrive we deliberately do NOT model — ACCEPTED residual (maintainer ruling:
+    // essentially never a hand-written models base_path). Skip prefix extraction for
+    // them so we never mis-capture a wrong share; they fall through to the generic join.
+    const isDevicePath = /^[\\/]{2}[?.][\\/]/.test(base);
+    if (rootedNoDrive && !isDevicePath) {
+      // os.path.splitdrive-style prefix of base — a drive letter (`D:`) OR a UNC
+      // share (`\\server\share`). A drive-relative `\unet` takes that prefix, so a
+      // UNC base's share is preserved (`\\server\share\unet`), not the MCP drive.
+      const prefix =
+        /^([a-zA-Z]:)/.exec(base)?.[1] ??
+        /^([\\/]{2}[^\\/]+[\\/]+[^\\/]+)/.exec(base)?.[1];
+      if (prefix) return resolve(prefix + entry); // prefix from base, path from entry
+      // base itself is rooted-but-driveless — os.path.join then yields the entry on the
+      // current drive, which the fall-through resolve(entry) already produces.
+    }
+  }
+  // Everything else mirrors os.path.join: an absolute entry wins, else base + entry.
+  return isAbsolute(entry) ? resolve(entry) : resolve(base, entry);
 }
 
 const RESERVED_KEYS = new Set(["base_path", "is_default"]);
@@ -302,6 +413,107 @@ export async function getExtraModelRoots(
     }
   }
   return roots;
+}
+
+/**
+ * The extra model roots the LIVE, running ComfyUI ACTUALLY registers — for the ONE
+ * purpose of AUTHORIZING a write into a symlinked download destination that escapes
+ * the primary models dir (#633). Authorization must be fail-closed and anchored to
+ * the running server, NEVER a stale/static local config the server does not load
+ * (codex P0d): a config the server no longer reads must not authorize an escaping
+ * symlink, and an unreachable server must authorize nothing.
+ *
+ * Takes the SINGLE live `/system_stats` snapshot the caller already used to resolve
+ * the models/base dirs — NOT its own stats call — so authorization roots can never
+ * come from a different server state than the code-root veto (codex inter-snapshot
+ * race). Trusted sources, all from that snapshot, so a stale local COMFYUI_PATH /
+ * default-workspace config can never authorize an escape:
+ *   - every ABSOLUTE `--extra-model-paths-config` file the server was LAUNCHED with
+ *     (raw argv values; a RELATIVE flag value is SKIPPED — it can't be resolved to
+ *     the live server's file from the MCP process, so trusting it would let a stale
+ *     local same-named config authorize; fail closed); and
+ *   - `<live main.py root>/extra_model_paths.yaml` — ComfyUI's auto-loaded default,
+ *     anchored to the server's OWN install root (its main.py dir from argv), NOT an
+ *     arbitrary base dir or the local workspace.
+ *
+ * Relative `base_path` / category paths are resolved against the CONFIG FILE's own
+ * directory, exactly as ComfyUI resolves them — never against the MCP process CWD —
+ * so a same-named/relative config in a stale workspace cannot misattribute a root.
+ *
+ * Returns `authoritative: false` (and no roots) whenever the server was unreachable,
+ * so the caller REFUSES every escaping symlink rather than authorize from a guess.
+ * Never throws.
+ */
+export async function getLiveExtraModelRoots(
+  snapshot: LiveServerSnapshot,
+): Promise<{ authoritative: boolean; roots: ExtraModelRoot[] }> {
+  if (!snapshot?.reachable) return { authoritative: false, roots: [] };
+  const argv = snapshot.argv;
+  const configPaths = new Set<string>();
+  // Launched flag files — ABSOLUTE values only (relative → fail closed, see docblock).
+  for (const raw of parseExtraModelPathsConfigsFromArgvRaw(argv)) {
+    if (isAbsolute(raw)) configPaths.add(resolve(raw));
+  }
+  // Auto-loaded default in the LIVE install root (its main.py dir). Skip in remote
+  // mode: the live root is a path on the remote host.
+  if (!isRemoteMode()) {
+    const liveRoot = liveRootFromArgv(argv, snapshot.cwd);
+    if (liveRoot) configPaths.add(resolve(liveRoot, "extra_model_paths.yaml"));
+  }
+
+  // Whether it is safe to expand a config `$VAR`/`%VAR%` against process.env: ONLY a
+  // LOCAL server THIS MCP launched (which inherited our env) shares our environment;
+  // a separately-launched/remote server may have a different env, so its config vars
+  // must NOT be resolved against ours (#633 P1b).
+  const trustServerEnv = !isRemoteMode() && didLaunchLocalComfyUI();
+
+  const roots: ExtraModelRoot[] = [];
+  for (const cfg of configPaths) {
+    if (!existsSync(cfg)) continue;
+    let raw: Record<string, unknown>;
+    try {
+      // ACCEPTED (intentional, not a defect — maintainer ruling): this reads the config's
+      // CURRENT contents at download time, which may include a root the USER added AFTER
+      // ComfyUI started but before restarting it. Authorizing a download to a root the
+      // user just configured on their OWN machine is the desired behavior ("downloads go
+      // where the user wants"); it becomes visible to ComfyUI on its next restart.
+      raw = parseConfig(await readFile(cfg, "utf-8"));
+    } catch {
+      continue; // unreadable/malformed — skip; never authorize from a bad file
+    }
+    // Match ComfyUI: relative entries resolve against the YAML file's OWN directory.
+    const cfgDir = dirname(resolve(cfg));
+    for (const [name, value] of Object.entries(raw)) {
+      const group = readGroup(value, name);
+      if (!group) continue;
+      // ComfyUI expands `~`/env vars in base_path (expanduser THEN expandvars) BEFORE
+      // classifying absolute vs relative (utils/extra_config.py), so `base_path: ~/models`
+      // registers the real $HOME root (and a legit symlink into it is authorized). A
+      // base_path needing an env var we can't resolve against the server's env is
+      // UNRESOLVABLE → drop the whole group (fail-closed). Category subpath entries are
+      // left LITERAL, exactly as ComfyUI leaves them (#633 P1a/P1b).
+      let base: string | undefined;
+      if (group.base_path) {
+        const expanded = expandLiveBasePath(group.base_path.trim(), trustServerEnv);
+        if (expanded === undefined) continue; // unresolvable base_path → skip this group
+        base = isAbsolute(expanded) ? resolve(expanded) : resolve(cfgDir, expanded);
+      }
+      for (const category of group.categories) {
+        for (const p of category.paths) {
+          // With a base_path, EVERY entry is os.path.join'd to it (incl. the Windows
+          // drive-relative case) — never treated independently just because it looks
+          // absolute. Only with NO base_path is an absolute entry used on its own.
+          const dir = base
+            ? joinCategoryEntryToBase(base, p)
+            : isAbsolute(p)
+              ? resolve(p)
+              : resolve(cfgDir, p);
+          roots.push({ category: category.category, dir, group: name });
+        }
+      }
+    }
+  }
+  return { authoritative: true, roots };
 }
 
 function ensureGroup(raw: Record<string, unknown>, name: string): Record<string, unknown> {

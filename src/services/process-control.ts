@@ -8,7 +8,12 @@ import { comfyuiFetch } from "../comfyui/fetch.js";
 import { ProcessControlError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { findComfyuiPython } from "./env-capabilities.js";
-import { liveRootFromArgv, resolveEffectiveComfyUIBase } from "./workspace-env.js";
+import {
+  liveRootFromArgv,
+  resolveEffectiveComfyUIBase,
+  markLocalComfyUILaunched,
+  resetLocalComfyUILaunchState,
+} from "./workspace-env.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1007,6 +1012,9 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
   }
   logger.info("Stopping ComfyUI...");
   detachSupervisor();
+  // The server we may have launched is going away — clear the shares-our-env flag so
+  // a differently-launched successor doesn't inherit env-trust it shouldn't (#633 P1b).
+  resetLocalComfyUILaunchState();
 
   // Gather info before we kill it (or reuse the caller's pre-validated info so a
   // relaunch preflight in restartComfyUI is not discarded).
@@ -1123,6 +1131,21 @@ export async function startComfyUI(): Promise<StartResult> {
   launched.unref();
   lastProcessInfo = info;
   superviseChild(launched, info);
+  // A python `spawn` inherits our process.env, so this local server shares our
+  // environment — mark it so its live extra_model_paths $VAR references may be
+  // expanded against process.env (#633 P1b). A Desktop-app launch's env is NOT
+  // guaranteed to be ours, so it stays fail-closed (unmarked).
+  if (!info.isDesktopApp) {
+    markLocalComfyUILaunched();
+    // Revoke env-trust the instant OUR launched child goes away — on EXIT and on a
+    // failed spawn (ERROR): a successor server that later takes the port may have a
+    // DIFFERENT env, so it must NOT inherit our trust (#633 P1b stale-flag). Fail
+    // closed the moment we no longer own the process (`error` covers the spawn_error
+    // path where `exit` may not fire).
+    const revokeEnvTrust = (): void => resetLocalComfyUILaunchState();
+    launched.once("exit", revokeEnvTrust);
+    launched.once("error", revokeEnvTrust);
+  }
 
   // Wait for API to become ready
   const startupResult = await Promise.race([

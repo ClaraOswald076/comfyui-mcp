@@ -4,7 +4,7 @@ import { readdir, stat, mkdir, readFile, lstat, realpath } from "node:fs/promise
 import { dirname, join, basename, resolve, relative, sep, isAbsolute, extname } from "node:path";
 import { config, isRemoteMode } from "../config.js";
 import { getClient, getSystemStats } from "../comfyui/client.js";
-import { getExtraModelRoots } from "./extra-paths.js";
+import { getExtraModelRoots, getLiveExtraModelRoots } from "./extra-paths.js";
 import { resolveEffectiveComfyUIBase, liveRootFromArgv } from "./workspace-env.js";
 import { installModelViaManager } from "./node-management.js";
 import { ModelError, ValidationError } from "../utils/errors.js";
@@ -12,7 +12,13 @@ import { logger } from "../utils/logger.js";
 import { downloadWithCache, probeRemoteModelPayload } from "./download-cache.js";
 import { reportDownloadProgress } from "./download-progress.js";
 import type { ResumeReporter } from "./download-resume-diag.js";
-import { resolveModelsDir, parseModelsDirFromArgv } from "./output-dir.js";
+import {
+  resolveModelsDir,
+  resolveModelsDirWithBases,
+  parseModelsDirFromArgv,
+  hasUnresolvableRelativeModelDirFlag,
+  type LiveServerSnapshot,
+} from "./output-dir.js";
 import {
   applyDownloadAuth,
   redactUrlForLogs,
@@ -38,6 +44,20 @@ export const MODEL_SUBDIRS = [
 ] as const;
 
 export type ModelType = (typeof MODEL_SUBDIRS)[number];
+
+/**
+ * Registered extra_model_paths categories that are NOT model-weight folders and
+ * must NEVER be treated as a valid download destination — even when a symlink
+ * under models/ resolves into one (#633 symlink allowance). The critical entry is
+ * `custom_nodes`: ComfyUI IMPORTS Python from it at startup, so allowing a model
+ * download (arbitrary bare filename) to land there would turn a file fetch into
+ * arbitrary CODE execution. extra_model_paths configs routinely register
+ * `custom_nodes` alongside model folders (see extra-paths.ts), so the symlink
+ * allowance filters these out and honors only genuine model roots — a download can
+ * reach a model dir on another drive (the #633 intent) but never a code directory.
+ * Compared case-insensitively.
+ */
+const NON_MODEL_EXTRA_CATEGORIES = new Set(["custom_nodes"]);
 
 /**
  * Map our internal model category (a MODEL_SUBDIRS value, i.e. the literal
@@ -583,7 +603,12 @@ export async function resolveModelSubfolderPreferServer(
       `target_subfolder must be relative to models/, not absolute: ${raw}`,
     );
   }
-  const modelsRoot = resolve(await resolveModelsDir());
+  // ONE /system_stats call yields the models dir, the base-install dirs the
+  // code-root veto needs, AND the snapshot the escape-authorizer uses — so they can
+  // never disagree (a second stats call could straddle a server restart and combine
+  // model roots from server B with code bases from server A; #633 codex).
+  const { modelsDir, baseDirs, snapshot } = await resolveModelsDirWithBases();
+  const modelsRoot = resolve(modelsDir);
   const targetDir = resolve(modelsRoot, raw);
   if (targetDir !== modelsRoot && !targetDir.startsWith(modelsRoot + sep)) {
     throw new ModelError(`Refusing to write outside the models directory: ${raw}`);
@@ -595,50 +620,217 @@ export async function resolveModelSubfolderPreferServer(
   // guard belongs here — co-located with the resolution the write actually uses —
   // so it can never diverge from a caller's separate pre-validation (e.g.
   // apply_manifest resolving the root a second time; #490 codex review).
-  await assertNoEscapingSymlinkAncestor(modelsRoot, targetDir, raw);
+  await assertNoEscapingSymlinkAncestor(modelsRoot, targetDir, raw, baseDirs, snapshot);
   return targetDir;
 }
 
 /**
- * Reject when any EXISTING directory STRICTLY BETWEEN `root` and `target` (a
- * descendant of root, not root itself) is a symlink whose real location escapes
- * root. The models root ITSELF is intentionally NOT checked: a ComfyUI install
- * may legitimately symlink/junction its whole models dir onto another drive, so
- * the root canonicalizes elsewhere by design — that is allowed. Descendants are
- * compared against the CANONICAL root (realpath of root) so a subfolder that
- * resolves back inside the real models tree is fine, while one escaping it is
- * rejected. Best-effort: a not-yet-created segment is fine (the download mkdirs it
- * inside root); never throws for a missing path — only for a genuine escape.
+ * Enforce that a local model download can ONLY land where the running ComfyUI
+ * actually reads model WEIGHTS — never in a directory it imports Python from, and
+ * never in an arbitrary location a symlink redirects to. Applied to the resolved
+ * write target BEFORE any mkdir/write.
+ *
+ * Two canonical (realpath-collapsed) root sets are built from the running server's
+ * OWN configuration so they match by real on-disk location regardless of mounts:
+ *   • codeRoots (VETO, inclusive/over-veto) — the dirs ComfyUI IMPORTS PYTHON from
+ *     (`custom_nodes`): each base-install dir's `custom_nodes` (from the base dirs
+ *     the caller derived from the SAME /system_stats call), the models-root sibling,
+ *     and every `custom_nodes`-category extra root (live AND static). A download
+ *     must NEVER land inside one — that is arbitrary CODE execution, not a model
+ *     install — so this is checked by RESOLVED REAL PATH, not category label, and
+ *     it wins even when a model category also claims the same physical dir.
+ *   • modelRoots (ALLOW, fail-closed) — the extra MODEL dirs the LIVE server
+ *     authoritatively registers (getLiveExtraModelRoots). A symlink escaping the
+ *     primary models root is permitted ONLY into one of these (the #633 case:
+ *     `models/external_unet_download -> /Volumes/Render/00_AI/models/unet`). A
+ *     STALE/STATIC config never authorizes an escape, and an unreachable server
+ *     authorizes nothing (codex P0d) — so authorization is always anchored to what
+ *     the running server really loads.
+ *
+ * Hardening invariants (codex P0a/P0b):
+ *   - The PRIMARY models root itself is code-root-vetoed: if it canonicalizes into
+ *     a `custom_nodes` dir (e.g. `--models-directory <base>/custom_nodes`, or a
+ *     models junction into custom_nodes), EVERY write is refused — the primary root
+ *     is never blanket-exempt.
+ *   - A path segment that EXISTS as a symlink but whose target cannot be
+ *     canonicalized (dangling / circular / unreadable) is REJECTED — never treated
+ *     as an absent segment (which would let a later recursive mkdir FOLLOW the link
+ *     out of every root). Only a genuinely-absent segment (ENOENT/ENOTDIR from
+ *     lstat) is safe to skip; any other lstat error fails closed.
+ *
+ * ACCEPTED RESIDUAL (P0c — TOCTOU): this is a pathname-time check. The Node runtime
+ * has no `openat`/per-segment `O_NOFOLLOW` traversal, so a LOCAL process that can
+ * replace an accepted directory/symlink AFTER this check but BEFORE the writer's
+ * mkdir/rename could still redirect the write. This race is inherent to pathname
+ * validation and pre-exists the #633 allowance (it affects any accepted path,
+ * symlinked or not). It is ACCEPTED as a non-blocker: this runs on the user's OWN
+ * single-user machine, so a concurrently-racing local process is out of scope
+ * (maintainer ruling — "downloads should go where the user wants; it's their
+ * computer"). We deliberately do NOT reject symlinked/external destinations to
+ * defend against it — that would break the legitimate #633 external-drive use case.
+ * The refusals this guard DOES make are the ACCIDENTAL-corruption ones only: a
+ * dangling/unresolvable escape (P0a), a write into a code dir / custom_nodes (P0b),
+ * and an unauthorized/unresolvable root (P0d). Fully eliminating the race would
+ * require trusted directory-handle traversal (native support) and is out of scope.
  */
 async function assertNoEscapingSymlinkAncestor(
   root: string,
   target: string,
   label: string,
+  /** Candidate ComfyUI base-install dirs, derived by the CALLER from the SAME
+   *  /system_stats call that resolved the models dir (resolveModelsDirWithBases).
+   *  The code-root veto derives `<base>/custom_nodes` from these — threaded in
+   *  rather than re-fetched here so it can never disagree with the models dir a
+   *  divergent --models-directory produced (fail-open race; #633 codex round 4). */
+  baseInstallDirs: string[] = [],
+  /** The SAME /system_stats snapshot the models/base dirs came from — used to
+   *  AUTHORIZE an escaping symlink (getLiveExtraModelRoots), so authorization and
+   *  the code-root veto reflect ONE consistent server state (codex inter-snapshot
+   *  race). Default = unreachable → nothing is authorized (fail closed). */
+  liveSnapshot: LiveServerSnapshot = { reachable: false },
 ): Promise<void> {
   // Canonical root: if the models dir is itself a symlink/junction, resolve it so
   // descendants are checked against where it REALLY lives (not the lexical path).
+  // The ROOT itself must be inspected too (P0): a DANGLING primary `models` symlink
+  // would otherwise pass (realpath fails → treated as "not created") and the
+  // recursive write would follow it OUT of every root — a normal user's broken
+  // models symlink escaping. lstat the root FIRST: allow only a genuinely-absent
+  // (ENOENT) root; reject a symlinked root whose realpath fails; fail closed on any
+  // other lstat error.
   let realRoot: string;
   try {
-    realRoot = resolve(await realpath(root));
-  } catch {
-    realRoot = root; // root not yet created — lexical containment is all we can check.
+    const rootInfo = await lstat(root);
+    try {
+      realRoot = resolve(await realpath(root));
+    } catch {
+      if (rootInfo.isSymbolicLink()) {
+        throw new ModelError(
+          `Refusing to write through a models-directory symlink that cannot be resolved (dangling or circular): ${label}`,
+        );
+      }
+      // A non-symlink dir whose realpath raced away — treat as absent; the writer
+      // recreates it inside the lexical root.
+      realRoot = resolve(root);
+    }
+  } catch (err) {
+    if (err instanceof ModelError) throw err;
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      realRoot = resolve(root); // root not yet created — lexical containment only.
+    } else {
+      throw new ModelError(
+        `Refusing to resolve the models directory safely (${code ?? "unreadable"}): ${label}`,
+      );
+    }
   }
+  const canon = async (d: string): Promise<string> => {
+    try {
+      return resolve(await realpath(d));
+    } catch {
+      return resolve(d); // not yet created — compare lexically
+    }
+  };
+  const underAny = (real: string, roots: string[]): boolean =>
+    roots.some((r) => real === r || real.startsWith(r + sep));
+
+  // Build the CODE roots (veto) and MODEL roots (allow) EAGERLY — the code veto must
+  // also cover the primary root (P0b), so it can't be deferred to an escape.
+  const baseDirSet = new Set<string>([
+    dirname(realRoot),
+    ...baseInstallDirs.map((b) => resolve(b)),
+  ]);
+  const codeRoots: string[] = [];
+  for (const b of baseDirSet) codeRoots.push(await canon(join(b, "custom_nodes")));
+  const isCodeCategory = (cat: string): boolean =>
+    NON_MODEL_EXTRA_CATEGORIES.has(cat.trim().toLowerCase());
+  // Static extra roots contribute to the VETO only (over-veto is always safe): any
+  // custom_nodes dir the static config knows about is refused as a destination.
+  let staticExtra: Awaited<ReturnType<typeof getExtraModelRoots>> = [];
+  try {
+    staticExtra = await getExtraModelRoots();
+  } catch {
+    staticExtra = [];
+  }
+  for (const er of staticExtra) {
+    if (isCodeCategory(er.category)) codeRoots.push(await canon(er.dir));
+  }
+  // LIVE, server-authoritative roots: the ONLY source that may AUTHORIZE an escape
+  // (fail-closed, P0d). Self-derived from the live /system_stats snapshot (the
+  // launched --extra-model-paths-config files + the live install's own
+  // extra_model_paths.yaml) — NEVER a stale local workspace config. Their
+  // custom_nodes also feed the veto.
+  let live: Awaited<ReturnType<typeof getLiveExtraModelRoots>> = {
+    authoritative: false,
+    roots: [],
+  };
+  try {
+    live = await getLiveExtraModelRoots(liveSnapshot);
+  } catch {
+    live = { authoritative: false, roots: [] };
+  }
+  for (const er of live.roots) {
+    if (isCodeCategory(er.category)) codeRoots.push(await canon(er.dir));
+  }
+  const modelRoots: string[] = [];
+  if (live.authoritative) {
+    for (const er of live.roots) {
+      if (!isCodeCategory(er.category)) modelRoots.push(await canon(er.dir));
+    }
+  }
+
+  const isUnderCode = (real: string): boolean => underAny(real, codeRoots);
+  const isAllowedReal = (real: string): boolean =>
+    (real === realRoot || real.startsWith(realRoot + sep) || underAny(real, modelRoots)) &&
+    !isUnderCode(real);
+
+  // P0b: the PRIMARY models root must not itself resolve into a code directory
+  // (e.g. `--models-directory <base>/custom_nodes`, or a models junction into
+  // custom_nodes) — otherwise a plain download (no symlink) writes into a dir
+  // ComfyUI imports = RCE. Refuse ALL writes in that case.
+  if (isUnderCode(realRoot)) {
+    throw new ModelError(
+      `Refusing to write into a ComfyUI code directory (the models root resolves inside custom_nodes): ${label}`,
+    );
+  }
+
   // Walk descendants only: from target up to (but NOT including) root.
   let cursor = target;
   while (cursor !== root && cursor.startsWith(root + sep)) {
+    let info: Awaited<ReturnType<typeof lstat>>;
     try {
-      const info = await lstat(cursor);
-      if (info.isSymbolicLink()) {
-        const real = resolve(await realpath(cursor));
-        if (real !== realRoot && !real.startsWith(realRoot + sep)) {
-          throw new ModelError(
-            `Refusing to write outside the models directory (a symlink in the path escapes it): ${label}`,
-          );
-        }
-      }
+      info = await lstat(cursor);
     } catch (err) {
-      if (err instanceof ModelError) throw err;
-      // ENOENT / not yet created — safe; the writer will create it inside root.
+      const code = (err as NodeJS.ErrnoException)?.code;
+      // Only a GENUINELY-absent segment is safe to skip (the writer creates it
+      // inside root). Any other lstat failure (EACCES/EIO/ELOOP/…) fails closed —
+      // we must not proceed to mkdir past a segment we couldn't inspect (P0a).
+      if (code === "ENOENT" || code === "ENOTDIR") {
+        const parent = dirname(cursor);
+        if (parent === cursor) break;
+        cursor = parent;
+        continue;
+      }
+      throw new ModelError(
+        `Refusing to resolve the download path safely (${code ?? "unreadable segment"}): ${label}`,
+      );
+    }
+    if (info.isSymbolicLink()) {
+      let real: string;
+      try {
+        real = resolve(await realpath(cursor));
+      } catch {
+        // P0a: the segment IS a symlink but its target can't be canonicalized
+        // (dangling / circular / unreadable). Treating it as absent would let the
+        // recursive mkdir FOLLOW it OUT of every root. Reject — never proceed.
+        throw new ModelError(
+          `Refusing to write through a symlink that cannot be resolved (dangling or circular): ${label}`,
+        );
+      }
+      if (!isAllowedReal(real)) {
+        throw new ModelError(
+          `Refusing to write outside the models directory (a symlink in the path escapes every registered model root): ${label}`,
+        );
+      }
     }
     const parent = dirname(cursor);
     if (parent === cursor) break;
@@ -1065,11 +1257,22 @@ async function downloadModelViaManagerRemote(
  */
 export async function shouldDispatchDownloadToManager(): Promise<boolean> {
   if (isRemoteMode()) return true;
-  // A configured/auto-detected COMFYUI_PATH or saved default workspace → stream local.
-  if (resolveEffectiveComfyUIBase()) return false;
   try {
     const stats = await getSystemStats();
-    const argv = stats.system?.argv;
+    const argv = (stats as { system?: { argv?: string[] } })?.system?.argv;
+    const cwd = (stats as { system?: { cwd?: string } })?.system?.cwd;
+    // Ask the LIVE server FIRST. A server launched with a RELATIVE
+    // --base-directory/--models-directory that did NOT report its cwd has an UNKNOWN
+    // real models dir: any local guess (COMFYUI_PATH or the main.py root) would be
+    // the WRONG place it never reads (#346). Route such a download through the
+    // server's Manager (server-side write, lands correctly) rather than writing
+    // locally or hard-failing. This MUST win over the COMFYUI_PATH / main.py-root
+    // local short-circuits below (codex — it was previously skipped when a local
+    // base was configured).
+    if (hasUnresolvableRelativeModelDirFlag(argv, cwd)) return true;
+    // Resolvable. A configured/auto-detected COMFYUI_PATH or saved default workspace
+    // → stream local.
+    if (resolveEffectiveComfyUIBase()) return false;
     // Reachable server: stream locally when it exposes a base/models dir we can
     // write to (--base-directory/--models-directory) OR when we can derive its own
     // install root from argv (its main.py path) — the SAME live-first root the
@@ -1079,7 +1282,7 @@ export async function shouldDispatchDownloadToManager(): Promise<boolean> {
     // through the Manager (which then fails when Manager isn't installed). Only
     // dispatch to the Manager when NEITHER is discoverable (#420 reconnect with an
     // opaque/relative argv we can't resolve).
-    if (parseModelsDirFromArgv(argv)) return false;
+    if (parseModelsDirFromArgv(argv, cwd)) return false;
     // Derive the server's own install root from argv (its main.py). Only treat it
     // as a LOCAL stream target when that path ACTUALLY EXISTS on this filesystem:
     // a loopback ComfyUI inside Docker / behind an SSH port-forward reports a
@@ -1087,11 +1290,12 @@ export async function shouldDispatchDownloadToManager(): Promise<boolean> {
     // create a bogus host directory instead of reaching the server. When the root
     // isn't locally present, hand the fetch to the connected Manager (server-side
     // write), which lands in the real install regardless.
-    const liveRoot = liveRootFromArgv(argv, (stats.system as { cwd?: string })?.cwd);
+    const liveRoot = liveRootFromArgv(argv, cwd);
     if (liveRoot && existsSync(liveRoot)) return false;
     return true;
   } catch {
-    // No reachable server → nothing to dispatch to. Let the local resolver throw.
+    // No reachable server → nothing to dispatch to. A configured local base still
+    // streams local; otherwise let the local resolver surface its clear error.
     return false;
   }
 }

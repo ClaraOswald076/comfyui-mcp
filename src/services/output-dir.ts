@@ -22,6 +22,17 @@ import { logger } from "../utils/logger.js";
 // override the directory. Same class of fix as the doubled-COMFYUI_PATH bug.
 // ---------------------------------------------------------------------------
 
+/**
+ * A single `/system_stats` snapshot: the live server's launch argv and reported cwd,
+ * captured ONCE so every derivation (models dir, base dirs, authorized extra roots)
+ * reflects the SAME server state — never a mix of two calls that straddled a restart.
+ */
+export interface LiveServerSnapshot {
+  reachable: boolean;
+  argv?: string[];
+  cwd?: string;
+}
+
 /** Resolve a possibly-relative dir against a base (or COMFYUI_PATH, or cwd). */
 function resolveDir(value: string, base?: string): string {
   if (isAbsolute(value)) return resolve(value);
@@ -59,35 +70,78 @@ export function parseOutputDirFromArgv(argv: string[] | undefined): string | und
 }
 
 /**
- * Parse the running server's base directory (`--base-directory`) out of its
- * launch argv. This is the authoritative root ComfyUI derives models/, input/,
- * output/, and user/ from — on a Desktop install it commonly points at a drive
- * entirely different from COMFYUI_PATH (the code checkout). Returns undefined
- * when the flag is absent.
+ * Resolve a value from the server's launch flags the way ComfyUI does — via
+ * `os.path.abspath(...)`, i.e. relative to the SERVER PROCESS cwd, NOT the MCP
+ * process cwd / COMFYUI_PATH. An ABSOLUTE value is used as-is. A RELATIVE value
+ * needs the server's reported cwd; WITHOUT it we return undefined (UNRESOLVABLE)
+ * rather than guess a wrong MCP-relative path (which would land the download where
+ * the server never reads — the very #346 bug). Requires an ABSOLUTE serverCwd.
  */
-export function parseBaseDirFromArgv(argv: string[] | undefined): string | undefined {
+function resolveServerLaunchPath(value: string, serverCwd?: string): string | undefined {
+  if (isAbsolute(value)) return resolve(value);
+  if (serverCwd && isAbsolute(serverCwd)) return resolve(serverCwd, value);
+  return undefined; // relative value + no authoritative server cwd → unresolvable
+}
+
+/** Raw last value of a repeated single-value launch flag (no resolution). */
+function rawFlagValue(argv: string[] | undefined, flag: string): string | undefined {
   if (!argv || argv.length === 0) return undefined;
-  let baseDir: string | undefined;
-  for (let i = 0; i < argv.length; i++) {
-    baseDir = flagValue(argv, i, "--base-directory") ?? baseDir;
-  }
-  return baseDir ? resolveDir(baseDir) : undefined;
+  let v: string | undefined;
+  for (let i = 0; i < argv.length; i++) v = flagValue(argv, i, flag) ?? v;
+  return v;
+}
+
+/**
+ * True when the server's launch argv carries a RELATIVE `--base-directory` or
+ * `--models-directory` that we CANNOT resolve because it did not report an absolute
+ * cwd. Callers must then NOT guess a local destination (they'd write to the wrong
+ * place); route through the server / report live resolution unavailable instead.
+ */
+export function hasUnresolvableRelativeModelDirFlag(
+  argv: string[] | undefined,
+  serverCwd?: string,
+): boolean {
+  if (serverCwd && isAbsolute(serverCwd)) return false; // all relatives resolvable
+  const base = rawFlagValue(argv, "--base-directory");
+  const models = rawFlagValue(argv, "--models-directory");
+  return (
+    (models !== undefined && !isAbsolute(models)) ||
+    (base !== undefined && !isAbsolute(base))
+  );
+}
+
+/**
+ * Parse the running server's base directory (`--base-directory`) out of its
+ * launch argv, resolved against the SERVER cwd (ComfyUI uses os.path.abspath).
+ * This is the authoritative root ComfyUI derives models/, input/, output/, and
+ * user/ from — on a Desktop install it commonly points at a drive entirely
+ * different from COMFYUI_PATH. Returns undefined when the flag is absent OR when a
+ * relative value can't be resolved without the server cwd (UNRESOLVABLE).
+ */
+export function parseBaseDirFromArgv(
+  argv: string[] | undefined,
+  serverCwd?: string,
+): string | undefined {
+  const baseDir = rawFlagValue(argv, "--base-directory");
+  return baseDir !== undefined ? resolveServerLaunchPath(baseDir, serverCwd) : undefined;
 }
 
 /**
  * Parse the models directory the running server actually reads from. ComfyUI's
- * `--models-directory` overrides the models folder in `--base-directory`, so it
- * wins; otherwise the models root is `<base>/models`. Returns undefined when
- * neither flag is present.
+ * `--models-directory` overrides `<base>/models` and is resolved INDEPENDENTLY via
+ * os.path.abspath (relative to the SERVER cwd) — NOT relative to `--base-directory`
+ * (folder_paths.py). Otherwise the models root is `<base>/models`. Returns
+ * undefined when neither flag is present, or when a relative flag is unresolvable
+ * without the server cwd.
  */
-export function parseModelsDirFromArgv(argv: string[] | undefined): string | undefined {
-  if (!argv || argv.length === 0) return undefined;
-  const base = parseBaseDirFromArgv(argv);
-  let modelsDir: string | undefined;
-  for (let i = 0; i < argv.length; i++) {
-    modelsDir = flagValue(argv, i, "--models-directory") ?? modelsDir;
-  }
-  if (modelsDir) return resolveDir(modelsDir, base);
+export function parseModelsDirFromArgv(
+  argv: string[] | undefined,
+  serverCwd?: string,
+): string | undefined {
+  const modelsDir = rawFlagValue(argv, "--models-directory");
+  // --models-directory resolves on its OWN against the server cwd, not against base.
+  if (modelsDir !== undefined) return resolveServerLaunchPath(modelsDir, serverCwd);
+  const base = parseBaseDirFromArgv(argv, serverCwd);
   return base ? join(base, "models") : undefined;
 }
 
@@ -130,55 +184,90 @@ export function parseExtraModelPathsConfigsFromArgv(argv: string[] | undefined):
 }
 
 /**
- * Resolve the models directory the CONNECTED server actually reads from. Asks
- * the running ComfyUI (/system_stats argv → `--base-directory`) first; falls
- * back to `<COMFYUI_PATH>/models`. This is the source of truth for
- * download_model's destination so files land where the live server sees them
- * (issues #346/#369) rather than in a stale COMFYUI_PATH install.
+ * Like parseExtraModelPathsConfigsFromArgv but returns the RAW flag values WITHOUT
+ * resolving relatives. Security-critical for AUTHORIZATION (getLiveExtraModelRoots,
+ * #633): a RELATIVE `--extra-model-paths-config` value cannot be safely resolved to
+ * the live server's file from the MCP process — resolveDir() would anchor it to the
+ * local COMFYUI_PATH / MCP cwd, so a stale local same-named config could authorize
+ * an escape the running server never loads (codex P0d). The authorizing caller keeps
+ * only ABSOLUTE values and fails closed on relative ones.
  */
-export async function resolveModelsDir(): Promise<string> {
+export function parseExtraModelPathsConfigsFromArgvRaw(argv: string[] | undefined): string[] {
+  if (!argv || argv.length === 0) return [];
+  const out: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    for (const v of multiFlagValues(argv, i, "--extra-model-paths-config")) out.push(v);
+  }
+  return out;
+}
+
+/**
+ * Resolve the models directory the CONNECTED server actually reads from AND, from
+ * the SAME `/system_stats` call, the candidate ComfyUI *base install* directories
+ * (used by the download destination guard to locate `custom_nodes` code roots).
+ *
+ * Deriving both from ONE call is a security invariant, not just an optimization:
+ * a SECOND, separate stats call could fail AFTER the models dir was already
+ * resolved from a divergent `--models-directory`, leaving the guard without the
+ * real `--base-directory` code root and letting a relabeled extra-path alias of
+ * `custom_nodes` slip through (fail-open). One call means the models dir and the
+ * base dirs are always consistent — if the call fails, BOTH fall back together to
+ * the configured local base (no partial-information window).
+ *
+ * modelsDir: the running ComfyUI's models root (`--base-directory`/`--models-directory`
+ * → the live server's main.py root → `<COMFYUI_PATH>`/default workspace), issues
+ * #346/#369/#490/#463. baseDirs: the local install roots ComfyUI derives
+ * `custom_nodes` from — the argv `--base-directory`, the live main.py root, and the
+ * configured local base — collected only in LOCAL mode (the guard runs only
+ * locally; a remote server's argv paths are on the remote host).
+ */
+export async function resolveModelsDirWithBases(): Promise<{
+  modelsDir: string;
+  baseDirs: string[];
+  /** The SAME /system_stats snapshot the models/base dirs were derived from — so a
+   *  downstream authorizer (getLiveExtraModelRoots, #633) uses ONE consistent
+   *  snapshot and can never mix roots from a server that changed between two calls
+   *  (codex inter-snapshot race). `reachable` is false when the server was down. */
+  snapshot: LiveServerSnapshot;
+}> {
+  const baseDirs = new Set<string>();
+  let modelsDir: string | undefined;
+  const snapshot: LiveServerSnapshot = { reachable: false };
   try {
     const stats = await getSystemStats();
     const argv = stats.system?.argv;
-    const fromArgv = parseModelsDirFromArgv(argv);
+    const cwd = (stats.system as { cwd?: string })?.cwd;
+    snapshot.reachable = true;
+    snapshot.argv = argv;
+    snapshot.cwd = cwd;
+    // Collect base-install dirs (LOCAL only) from the SAME call, regardless of how
+    // the models dir resolves, so the code-root veto always has the real
+    // --base-directory / live-root even when --models-directory diverges.
+    if (!isRemoteMode()) {
+      const baseDir = parseBaseDirFromArgv(argv, cwd);
+      if (baseDir) baseDirs.add(resolve(baseDir));
+      const liveRoot = liveRootFromArgv(argv, cwd);
+      if (liveRoot) baseDirs.add(resolve(liveRoot));
+    }
+    const fromArgv = parseModelsDirFromArgv(argv, cwd);
     if (fromArgv) {
       logger.debug("Resolved ComfyUI models directory from launch argv", {
         modelsDir: fromArgv,
       });
-      return fromArgv;
-    }
-    // No explicit --base-directory/--models-directory flag: derive the models
-    // root from the LIVE connected server's OWN install root (its main.py path in
-    // argv). That is the ComfyUI actually running, so a download lands where it
-    // reads models — NOT in a stale/other COMFYUI_PATH that points at a different
-    // install (#490/#463). Skip in remote mode: the live root is a path on the
-    // remote host, not a local directory we can write to.
-    //
-    // LIMITATION: this needs an ABSOLUTE main.py in argv (or a server-reported
-    // cwd). A server launched as `python main.py` reports a bare/relative argv[0]
-    // and ComfyUI does not currently report cwd, so the root is UNRESOLVABLE — we
-    // then fall through to the COMFYUI_PATH/default below. That's the safe default
-    // (there is no information to do better); when COMFYUI_PATH is unset, the
-    // download instead routes through the connected server's Manager, which writes
-    // into the real install regardless (see shouldDispatchDownloadToManager).
-    if (!isRemoteMode()) {
-      const liveRoot = liveRootFromArgv(
-        argv,
-        (stats.system as { cwd?: string })?.cwd,
-      );
-      // Only adopt the live root when it ACTUALLY EXISTS on this filesystem. A
-      // loopback ComfyUI inside Docker / behind an SSH port-forward reports a
-      // container-side main.py path that is not the host's — writing there would
-      // create a bogus host dir the server never reads. When it isn't locally
-      // present we fall through to COMFYUI_PATH/default (and shouldDispatchDownload-
-      // ToManager routes the fetch through the server's Manager instead).
+      modelsDir = fromArgv;
+    } else if (!isRemoteMode()) {
+      // No explicit --base-directory/--models-directory flag: derive the models
+      // root from the LIVE connected server's OWN install root (its main.py path in
+      // argv). Only adopt it when it EXISTS locally (a Docker/forwarded server
+      // reports a container-side path that is not the host's) — else fall through
+      // to COMFYUI_PATH/default (#490/#463).
+      const liveRoot = liveRootFromArgv(argv, cwd);
       if (liveRoot && existsSync(liveRoot)) {
-        const dir = join(liveRoot, "models");
+        modelsDir = join(liveRoot, "models");
         logger.debug(
           "Resolved ComfyUI models directory from the live server's main.py root",
-          { modelsDir: dir },
+          { modelsDir },
         );
-        return dir;
       }
     }
   } catch (err) {
@@ -187,19 +276,50 @@ export async function resolveModelsDir(): Promise<string> {
       { error: err instanceof Error ? err.message : String(err) },
     );
   }
-  // No live-server base dir available. Fall back to the effective LOCAL base:
-  // COMFYUI_PATH, else the saved default workspace (set_default_workspace) when
-  // NOT in remote mode — so a download resolves to that install rather than
-  // hard-failing just because COMFYUI_PATH is unset (#415/#416). resolveModelsDir
-  // is only reached in local mode (remote downloads short-circuit to the Manager
-  // before any local-dir resolution), so the default workspace is a safe target.
+  // The running server specified a RELATIVE --base-directory/--models-directory but
+  // did not report its cwd, so its real models dir is UNKNOWN. Do NOT fall back to a
+  // guessed local path (COMFYUI_PATH/models is the wrong place the server never
+  // reads — #346). Fail loudly (outside the try so it propagates) so the caller
+  // routes through the server / surfaces the problem rather than writing wrong.
+  if (
+    !modelsDir &&
+    snapshot.reachable &&
+    !isRemoteMode() &&
+    hasUnresolvableRelativeModelDirFlag(snapshot.argv, snapshot.cwd)
+  ) {
+    throw new ValidationError(
+      "The connected ComfyUI was launched with a RELATIVE --base-directory/--models-directory " +
+        "and did not report its working directory, so its models directory cannot be resolved " +
+        "locally. A download can't be placed safely here — connect with an absolute --base-directory, " +
+        "or set COMFYUI_PATH to the server's install so the destination is unambiguous.",
+    );
+  }
+  // Effective LOCAL base: COMFYUI_PATH, else the saved default workspace when NOT
+  // remote (#415/#416). Always a code-root base candidate too.
   const base = resolveEffectiveComfyUIBase();
-  if (base) return resolve(base, "models");
-  throw new ValidationError(
-    "No local ComfyUI models directory could be resolved. Set the COMFYUI_PATH " +
-      "environment variable, save a default workspace with set_default_workspace, " +
-      "or connect to a running ComfyUI so its models directory can be detected.",
-  );
+  if (base) baseDirs.add(resolve(base));
+  if (!modelsDir) {
+    if (base) modelsDir = resolve(base, "models");
+    else
+      throw new ValidationError(
+        "No local ComfyUI models directory could be resolved. Set the COMFYUI_PATH " +
+          "environment variable, save a default workspace with set_default_workspace, " +
+          "or connect to a running ComfyUI so its models directory can be detected.",
+      );
+  }
+  return { modelsDir, baseDirs: [...baseDirs], snapshot };
+}
+
+/**
+ * Resolve the models directory the CONNECTED server actually reads from. Asks
+ * the running ComfyUI (/system_stats argv → `--base-directory`) first; falls
+ * back to `<COMFYUI_PATH>/models`. This is the source of truth for
+ * download_model's destination so files land where the live server sees them
+ * (issues #346/#369) rather than in a stale COMFYUI_PATH install. Delegates to
+ * resolveModelsDirWithBases so the two can never drift.
+ */
+export async function resolveModelsDir(): Promise<string> {
+  return (await resolveModelsDirWithBases()).modelsDir;
 }
 
 /**
