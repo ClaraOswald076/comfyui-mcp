@@ -3106,8 +3106,8 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_save_workflow",
-      "Save the user's open workflow PROGRAMMATICALLY — no Save/Rename dialog ever pops. A never-saved workflow is auto-named and persisted; pass `name` to give it (or rename it to) a specific name. Use this freely (e.g. after building a graph) — it won't interrupt the user.",
-      { name: z.string().optional().describe("Name to save/rename to (no .json needed). Omit to save in place / auto-name an unsaved workflow.") },
+      "Save the user's open workflow PROGRAMMATICALLY — no Save/Rename dialog ever pops. With no `name`: saves in place (or auto-names + persists a never-saved workflow). With `name`: if the workflow is ALREADY saved under a different name this is a SAVE-AS — it writes a NEW file and leaves the original untouched on disk (it NEVER renames/moves/destroys the original); for a never-saved workflow it is simply the first save. The result reports what happened: `saved_as`+`copied_from`+`original_on_disk` (a disk-verified check that the original file still exists) for a Save-As copy, or `first_save` for a brand-new workflow. Use this freely (e.g. after building a graph) — it won't interrupt the user.",
+      { name: z.string().optional().describe("Name for the workflow (no .json needed). If the workflow is already saved under a different name, this writes a NEW file (Save-As COPY) and leaves the original in place — it never renames/moves/destroys it. Omit to save in place / auto-name an unsaved workflow.") },
       async (args: A, ctx) =>
         args.name
           ? ctx.call({ cmd: "workflow_save_as", name: args.name }, 15000)
