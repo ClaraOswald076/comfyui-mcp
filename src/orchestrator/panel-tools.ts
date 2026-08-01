@@ -253,6 +253,10 @@ export const __panelToolsTestHooks = {
   setRetrySettleMs(ms: number | null): void {
     retrySettleMsOverride = ms;
   },
+  /** Inject fast reconnect-wait timing so #400/#402 tests don't wait the real ~20s. */
+  setReconnectWaitTiming(timing: { budgetMs: number; intervalMs: number } | null): void {
+    reconnectWaitTimingOverride = timing;
+  },
   isRetrySafeCmd,
   isTransientReconnectError,
   // #384 live-canvas capture fallback (defined later in the module).
@@ -326,6 +330,32 @@ let retrySettleMsOverride: number | null = null;
 function retrySettleMs(): number {
   if (retrySettleMsOverride != null) return retrySettleMsOverride;
   return Math.round(parsePositiveNumberEnv("COMFYUI_PANEL_RETRY_SETTLE_S", 0.4) * 1000);
+}
+
+interface ReconnectWaitTiming {
+  /** Total wall-clock budget to wait for a tab to (re)connect after a restart/reload. */
+  budgetMs: number;
+  /** Interval between canReach polls. */
+  intervalMs: number;
+}
+let reconnectWaitTimingOverride: ReconnectWaitTiming | null = null;
+/** Bounded wait for a browser tab to (re)connect after a full ComfyUI restart or a
+ *  soft-reload — the "Connected: none" window in which every panel_* call fires into
+ *  a dead binding (#400) or a mutating open/save returns OUTCOME UNKNOWN (#402). The
+ *  browser reconnects its own socket seconds-to-tens-of-seconds after ComfyUI comes
+ *  back, so the existing single ~400ms retry always loses the race. Test-overridable. */
+/** Hard ceiling on the reconnect wait so an oversized env value can never make a
+ *  tool block near/over the outer MCP tools/call deadline (~300s). */
+const RECONNECT_WAIT_MAX_MS = 60_000;
+function reconnectWaitTiming(): ReconnectWaitTiming {
+  if (reconnectWaitTimingOverride) return reconnectWaitTimingOverride;
+  return {
+    budgetMs: Math.min(
+      RECONNECT_WAIT_MAX_MS,
+      Math.round(parsePositiveNumberEnv("COMFYUI_PANEL_RECONNECT_WAIT_S", 20) * 1000),
+    ),
+    intervalMs: Math.round(parsePositiveNumberEnv("COMFYUI_PANEL_RECONNECT_POLL_S", 0.5) * 1000),
+  };
 }
 
 interface PanelReadyResult {
@@ -997,11 +1027,34 @@ async function waitForWorkflowActive(
  * the target became active despite the slow ack, otherwise the original timeout
  * failure. Never masks a genuine open-failure as success.
  */
+/** Terminal error for a MUTATING panel command when the pre-send reachability wait
+ *  gave up (no tab reconnected within budget / an ambiguous multi-tab session). We
+ *  must NOT dispatch — firing into a dead binding is exactly the OUTCOME-UNKNOWN /
+ *  double-apply risk the pre-send wait exists to prevent (codex). */
+function noReachableTabFail(cmd: string): ToolResult {
+  return fail(
+    `${cmd} — this session has no reachable panel tab yet (still reconnecting after a ` +
+      `restart/reload, or multiple tabs are open and none is this session's). Nothing was ` +
+      `sent. Retry in a moment, or rebind with panel_set_workflow_target({mode:"current"}).`,
+  );
+}
+
 async function openWorkflowWithVerify(path: string, ctx: PanelToolCtx): Promise<ToolResult> {
+  // #402: after a full ComfyUI restart the browser tab re-registers a few seconds
+  // later. Awaiting a stable binding BEFORE dispatching a mutating workflow_open
+  // (nothing is sent yet — no double-apply risk) means the command reaches a live
+  // tab instead of firing into the "Connected: none" window and coming back
+  // OUTCOME UNKNOWN. A healthy session returns from this instantly; if no tab
+  // reconnects within budget we REFUSE rather than dispatch into a dead binding.
+  if (ctx.awaitReachable && !(await ctx.awaitReachable())) {
+    return noReachableTabFail("workflow_open");
+  }
   const res = await ctx.call({ cmd: "workflow_open", path }, 15000);
   // Success, or a genuine acked error (missing file / real executor error) — the
-  // caller must see it as-is. Only a slow-ack TIMEOUT warrants verification.
-  if (!isAckTimeout(res)) return res;
+  // caller must see it as-is. A slow-ack TIMEOUT or a mid-command reconnect DROP
+  // ("OUTCOME UNKNOWN", #402) both warrant verification: re-reading the active
+  // workflow is idempotent, so we can turn an UNKNOWN into a definite outcome.
+  if (!isAckTimeout(res) && !isReconnectDrop(res)) return res;
 
   const timing = getOpenVerifyTiming();
   const verify = await waitForWorkflowActive(ctx, path, timing);
@@ -1011,14 +1064,28 @@ async function openWorkflowWithVerify(path: string, ctx: PanelToolCtx): Promise<
       recovered: true,
       note:
         `"${path}" is now the active workflow — the switch succeeded, but the tab was slow ` +
-        `to acknowledge (backgrounded/frozen or already open), so the initial ack timed out. ` +
+        `to acknowledge (backgrounded/frozen or already open) or briefly disconnected while ` +
+        `reconnecting after a restart, so the initial ack was inconclusive. ` +
         `Confirmed active via workflow_list after ${(verify.waited_ms / 1000).toFixed(1)}s ` +
         `(${verify.attempts} probe${verify.attempts === 1 ? "" : "s"}). Do NOT retry.`,
     });
   }
-  // The ack timed out AND the target never became active within the budget — this
-  // is a REAL failure. Return the original bridge timeout error unchanged.
+  // The ack was inconclusive AND the target never became active within the budget —
+  // this is a REAL failure. Return the original bridge error unchanged.
   return res;
+}
+
+/** True when a ToolResult is a MID-COMMAND reconnect drop ("disconnected
+ *  mid-command … OUTCOME UNKNOWN") — the command was written but the tab dropped
+ *  before a reply while reconnecting after a restart/reload (#402). Re-verifying an
+ *  idempotent workflow-state change is safe on this signal. */
+function isReconnectDrop(res: ToolResult): boolean {
+  if (!res?.isError) return false;
+  const text = res?.content?.find((c) => c.type === "text")?.text ?? "";
+  // A pre-write "NOT dispatched" send failure must NOT verify (nothing happened) —
+  // let it surface as-is; only a POST-write mid-command drop is re-verifiable.
+  if (/NOT dispatched/i.test(text)) return false;
+  return /disconnected mid-command|OUTCOME UNKNOWN/i.test(text);
 }
 
 /** An open-workflow record as reported by `workflow_list` (path/filename/key). */
@@ -1575,6 +1642,20 @@ export interface PanelToolCtx {
    * so lightweight test contexts can omit it.
    */
   ensureReachable?: () => void;
+  /**
+   * Bounded pre-send wait for a browser tab to (re)connect after a full ComfyUI
+   * restart or soft-reload, then rebind a current-mode session onto it. Resolves
+   * true once the session's tab is reachable (already, or after a tab reconnected
+   * and ensureReachable rebound onto it), false if the budget elapses with nothing
+   * connected. Returns immediately when the tab is already reachable (healthy
+   * session → zero overhead). Waits ONLY in the "Connected: none" window (zero live
+   * tabs): a multi-tab / strict-single situation is left to the existing synchronous
+   * ensureReachable so this never changes healthy multi-tab routing. Safe to await
+   * BEFORE a mutating command (nothing is dispatched), which is why it fixes
+   * open/save firing into a dead binding (#402) without any double-apply risk.
+   * Optional so lightweight test contexts can omit it.
+   */
+  awaitReachable?: (budgetMs?: number) => Promise<boolean>;
 }
 
 /** Build a tab-bound execution context shared by both transports. */
@@ -1618,22 +1699,86 @@ export function makePanelToolCtx(
   //    mode already means.
   // It routes through makePanelToolCtx only — bridge.resolveTarget itself is
   // untouched, so the dead-alias security invariant (ui-bridge.test.ts:459) holds.
+  // The tab ids ELIGIBLE to host a graph/workflow session: connected AND canvas-owning.
+  // A headless client (mobile mirror / remote / exec viewer — ui-bridge Conn.headless)
+  // is canvas-less and can never run graph tools, so it must never be a rebind target
+  // (codex). Returns null when the bridge can't enumerate tabs/headlessness (older or
+  // lightweight ctx) — callers then fall back to bridge.resolveActiveTabId (legacy).
+  const isHeadlessTab = (id: string): boolean =>
+    typeof bridge.isHeadless === "function" && bridge.isHeadless(id);
+  const interactiveTabIds = (): string[] | null => {
+    if (typeof bridge.tabs !== "function") return null;
+    const live = bridge.tabs();
+    if (!Array.isArray(live)) return null;
+    return live.filter((t) => !isHeadlessTab(t.tab_id)).map((t) => t.tab_id);
+  };
+
   const ensureReachable = (): void => {
     if (typeof bridge.canReach !== "function") return; // lightweight test ctx
-    if (bridge.canReach(ctx.tabId)) return;
+    if (bridge.canReach(ctx.tabId)) return; // healthy binding — leave untouched
     if (workflowTargets?.get(ctx.tabId)?.mode === "pinned") return; // stay strict
     // Strict-single: never silently pick among multiple live tabs (would risk the
-    // real bridge's last-active fallback routing to an unrelated workflow). When
-    // the bridge can enumerate its tabs and there is more than one, do NOT rebind.
-    if (typeof bridge.tabs === "function") {
-      const live = bridge.tabs();
+    // real bridge's last-active fallback routing to an unrelated workflow). Count only
+    // INTERACTIVE tabs — a lone canvas tab alongside headless viewers still binds, and
+    // a headless-only state is treated as "nothing bindable" (rebindToActiveTab throws).
+    const eligible = interactiveTabIds();
+    if (eligible) {
+      if (eligible.length > 1) return; // 2+ INTERACTIVE tabs → strict, don't guess
+    } else if (typeof bridge.tabs === "function") {
+      const live = bridge.tabs(); // legacy path (no headless info)
       if (Array.isArray(live) && live.length > 1) return;
     }
     try {
       rebindToActiveTab();
     } catch {
-      // Ambiguous (2+ tabs) or nothing connected — leave tabId as-is and let the
+      // Ambiguous (2+ tabs) or nothing bindable — leave tabId as-is and let the
       // command surface the bridge's own clear, tab-listing error.
+    }
+  };
+
+  // Bounded pre-send wait for a tab to (re)connect after a restart/reload — see
+  // PanelToolCtx.awaitReachable. Complements ensureReachable (which acts INSTANTLY
+  // on an already-present sole tab): this waits out the "Connected: none" window a
+  // fresh ComfyUI restart opens, in which the browser's own socket hasn't re-hello'd
+  // yet. Conservative by construction: returns at once for a healthy session, and
+  // only waits while ZERO tabs are connected (a 1+/multi-tab case is left untouched
+  // for the existing strict-single ensureReachable to resolve or refuse).
+  const awaitReachable = async (budgetMs?: number): Promise<boolean> => {
+    if (typeof bridge.canReach !== "function") return true; // lightweight test ctx
+    if (bridge.canReach(ctx.tabId)) return true; // healthy binding
+    // We can only meaningfully WAIT for a reconnect when the bridge can enumerate its
+    // live tabs. Without that (older/lightweight bridge), never loop — do a single
+    // synchronous heal and report reachability, exactly as before this primitive.
+    if (typeof bridge.tabs !== "function") {
+      ensureReachable();
+      return bridge.canReach(ctx.tabId);
+    }
+    const timing = reconnectWaitTiming();
+    // The configured reconnect budget is the intended MAX; an explicit budgetMs (e.g.
+    // a caller's remaining deadline) only ever TIGHTENS it — never extends the wait.
+    const budget = Math.max(0, budgetMs != null ? Math.min(budgetMs, timing.budgetMs) : timing.budgetMs);
+    const intervalMs = Math.max(1, timing.intervalMs);
+    const deadline = Date.now() + budget;
+    for (;;) {
+      // Only an INTERACTIVE (canvas-owning) tab is a valid graph/workflow binding — a
+      // headless viewer is canvas-less, so awaiting/rebinding onto one and reporting
+      // "ready" would route open/save at a client with no canvas (codex).
+      const interactive = interactiveTabIds() ?? [];
+      if (interactive.length > 0) {
+        // A canvas tab is present → the reconnect window is OVER. Try the strict-single
+        // synchronous heal (binds a sole reconnected tab). Then return IMMEDIATELY,
+        // bound or not: if we still can't reach ctx.tabId (2+ interactive tabs, or a
+        // pinned stale target ensureReachable leaves strict), waiting longer can't help —
+        // report now so open/save refuse promptly and panel_set_workflow_target proceeds
+        // to its explicit last-active rebind instead of stalling the whole budget (codex).
+        ensureReachable();
+        return bridge.canReach(ctx.tabId);
+      }
+      // ZERO interactive tabs — the genuine "Connected: none" post-restart window (a lone
+      // headless viewer counts as none). Keep waiting for a canvas tab to re-register.
+      const left = deadline - Date.now();
+      if (left <= 0) return bridge.canReach(ctx.tabId);
+      await sleep(Math.min(intervalMs, left));
     }
   };
 
@@ -1747,8 +1892,26 @@ export function makePanelToolCtx(
   // active tab can't be picked.
   const rebindToActiveTab = (): { previous: string; current: string; rebound: boolean } => {
     const previous = ctx.tabId;
+    // A healthy binding is left untouched (never disturb a live session). Recovery only
+    // fires for an orphaned/stale tab id.
     if (bridge.canReach(previous)) return { previous, current: previous, rebound: false };
-    const current = bridge.resolveActiveTabId(); // throws if no single active tab
+    // Pick the target tab EXCLUDING headless (canvas-less) viewers, which can't host a
+    // graph session (codex). Prefer the sole interactive tab; with 2+ interactive tabs
+    // fall back to the bridge's last-active resolution (the explicit-rebind "use what's
+    // live now" consent); with none, throw. A resolution that still lands on a headless
+    // tab is rejected as "nothing bindable" so no graph session is ever bound canvas-less.
+    const eligible = interactiveTabIds();
+    let current: string;
+    if (eligible) {
+      if (eligible.length === 1) current = eligible[0];
+      else if (eligible.length === 0) throw new Error("Panel not reachable: no panel connected");
+      else current = bridge.resolveActiveTabId(); // 2+ interactive → last-active (or throws)
+    } else {
+      current = bridge.resolveActiveTabId(); // legacy bridge (no headless info)
+    }
+    if (typeof bridge.isHeadless === "function" && bridge.isHeadless(current)) {
+      throw new Error("Panel not reachable: no panel connected");
+    }
     // Carry a pinned workflow target across to the new tab id so a pinned
     // session keeps its pin after self-healing.
     const pinned = workflowTargets?.get(previous);
@@ -1764,6 +1927,7 @@ export function makePanelToolCtx(
   ctx.confirm = confirm;
   ctx.rebindToActiveTab = rebindToActiveTab;
   ctx.ensureReachable = ensureReachable;
+  ctx.awaitReachable = awaitReachable;
   return ctx;
 }
 
@@ -2833,7 +2997,15 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           const orphaned =
             typeof ctx.bridge.canReach === "function" && !ctx.bridge.canReach(ctx.tabId);
           const live = typeof ctx.bridge.tabs === "function" ? ctx.bridge.tabs() : undefined;
-          if (orphaned && Array.isArray(live) && live.length > 1) {
+          // Count only INTERACTIVE (canvas-owning) tabs for the ambiguity guard: one
+          // desktop canvas alongside headless viewers is NOT ambiguous — rebindToActiveTab
+          // binds the sole desktop tab. Only 2+ real canvas tabs are unpickable here.
+          const headless = ctx.bridge.isHeadless;
+          const interactive =
+            Array.isArray(live) && typeof headless === "function"
+              ? live.filter((t) => !headless(t.tab_id))
+              : live;
+          if (orphaned && Array.isArray(interactive) && interactive.length > 1) {
             return fail(
               "This session's ComfyUI tab was replaced and multiple tabs are now open — " +
                 "can't safely pick one. Switch to the tab you want, then call " +
@@ -3368,10 +3540,20 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       "panel_save_workflow",
       "Save the user's open workflow PROGRAMMATICALLY — no Save/Rename dialog ever pops. With no `name`: saves in place (or auto-names + persists a never-saved workflow). With `name`: if the workflow is ALREADY saved under a different name this is a SAVE-AS — it writes a NEW file and leaves the original untouched on disk (it NEVER renames/moves/destroys the original); for a never-saved workflow it is simply the first save. The result reports what happened: `saved_as`+`copied_from`+`original_on_disk` (a disk-verified check that the original file still exists) for a Save-As copy, or `first_save` for a brand-new workflow. Use this freely (e.g. after building a graph) — it won't interrupt the user.",
       { name: z.string().optional().describe("Name for the workflow (no .json needed). If the workflow is already saved under a different name, this writes a NEW file (Save-As COPY) and leaves the original in place — it never renames/moves/destroys it. Omit to save in place / auto-name an unsaved workflow.") },
-      async (args: A, ctx) =>
-        args.name
+      async (args: A, ctx) => {
+        // #402: await a stable tab binding before dispatching the (mutating) save, so
+        // a save issued in the post-restart "Connected: none" window reaches a live
+        // tab instead of failing with a bare "Failed to fetch"/OUTCOME UNKNOWN. Pre-
+        // send only (nothing dispatched yet) → no risk of writing the file twice; and
+        // if no tab reconnects within budget we REFUSE rather than fire into a dead
+        // binding.
+        if (ctx.awaitReachable && !(await ctx.awaitReachable())) {
+          return noReachableTabFail(args.name ? "workflow_save_as" : "workflow_save");
+        }
+        return args.name
           ? ctx.call({ cmd: "workflow_save_as", name: args.name }, 15000)
-          : ctx.call({ cmd: "workflow_save" }, 15000),
+          : ctx.call({ cmd: "workflow_save" }, 15000);
+      },
     ),
     def(
       "panel_list_workflows",
@@ -3417,14 +3599,52 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // pin store, so subsequent panel_* calls route to the live tab. Surfaces a
         // clear error if a single active tab can't be determined.
         let rebindNote = "";
+        let deferredBind = false;
         if (mode === "current" && ctx.rebindToActiveTab) {
+          const before = ctx.tabId;
+          // Give an in-flight reconnect (a ComfyUI restart / panel reload still
+          // settling) a brief chance to bind immediately, since this IS the recovery
+          // signal the agent reaches for in exactly that window (#474). awaitReachable
+          // rebinds via ensureReachable when a tab is (re)connected.
+          if (ctx.awaitReachable) await ctx.awaitReachable();
           try {
-            const { previous, current, rebound } = ctx.rebindToActiveTab();
-            if (rebound) {
-              rebindNote = ` Rebound this session from tab ${previous.slice(0, 8)} onto the active tab ${current.slice(0, 8)}.`;
-            }
+            ctx.rebindToActiveTab(); // completes the rebind if awaitReachable didn't
           } catch (err) {
-            return fail(err);
+            // #474: with 2+ live tabs the rebind is AMBIGUOUS — fail so the user picks.
+            // But with ZERO tabs connected (the "Connected: none" window right after a
+            // restart/reload where the old tmp: tab is gone) the recovery call must NOT
+            // hard-fail: clear the stale binding and record the current-mode intent so
+            // the session binds onto the tab the moment one reconnects, instead of
+            // stranding the agent with no way to recover.
+            const live = typeof ctx.bridge.tabs === "function" ? ctx.bridge.tabs() : undefined;
+            let noTabsConnected: boolean;
+            if (Array.isArray(live)) {
+              // Count only INTERACTIVE (canvas-owning) tabs: a headless-only reconnect is
+              // NOT a usable graph binding, so it defers (binds once a real canvas tab
+              // connects) rather than failing as if a tab were pickable.
+              const headless = ctx.bridge.isHeadless;
+              const interactive =
+                typeof headless === "function" ? live.filter((t) => !headless(t.tab_id)) : live;
+              noTabsConnected = interactive.length === 0;
+            } else {
+              // No tab enumeration — classify by the resolve error: only "nothing
+              // connected" defers; an AMBIGUOUS multi-tab error must still fail so the
+              // user picks (never silently defer a routable-but-ambiguous session).
+              const msg = err instanceof Error ? err.message : String(err ?? "");
+              noTabsConnected =
+                /no panel connected|not reachable|connected:\s*none|no connected tab/i.test(msg) &&
+                !/multiple|last active|pass tab_id/i.test(msg);
+            }
+            if (!noTabsConnected) return fail(err);
+            deferredBind = true;
+            rebindNote =
+              " No panel tab is connected yet — cleared the stale binding; this session will " +
+              "follow (bind onto) the tab as soon as one reconnects. Retry your graph tool in a moment.";
+          }
+          // Detect the rebind regardless of whether awaitReachable or rebindToActiveTab
+          // performed it (either mutates ctx.tabId), so the note is never swallowed.
+          if (!deferredBind && ctx.tabId !== before) {
+            rebindNote = ` Rebound this session from tab ${before.slice(0, 8)} onto the active tab ${ctx.tabId.slice(0, 8)}.`;
           }
         }
         // PIN: bind to the EXACT open-workflow identity from the authoritative
@@ -3450,7 +3670,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           target.mode === "pinned"
             ? `Pinned to "${target.filename ?? target.path}". Graph tools will target that workflow without switching the user's view.`
             : "Following the user's current workflow tab.";
-        return ok({ ...target, note: hint + rebindNote });
+        return ok({ ...target, ...(deferredBind ? { deferred: true } : {}), note: hint + rebindNote });
       },
     ),
     def(
@@ -4153,18 +4373,37 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               : `The reboot command was sent but I could NOT confirm ComfyUI actually cycled within ${waited}s (it never went down — the panel may have merely disconnected/inferred a reboot without one). Verify with health_check / panel_node_queue_status; do NOT assume it restarted.`,
           });
         }
+        // #400: ComfyUI is healthy, but the panel's browser tab re-registers its own
+        // socket a moment later. If we return NOW, the very next graph tool in this turn
+        // hits "no connected tab … Connected: none" and the agent is told to hand-rebind.
+        // Wait (bounded, clamped to THIS handler's deadline) for the tab to reconnect and
+        // rebind this session onto it. `ready` reflects GRAPH-TOOL readiness (a bound tab),
+        // NOT just server health — a caller keying off `ready` must not be led into the
+        // Connected:none window (codex). `server_ready` carries the certified cycle either
+        // way. When ctx has no awaitReachable (older/lightweight ctx) tabBack is true, so
+        // the historical ready:true-on-healthy-restart contract is preserved.
+        const tabBack = ctx.awaitReachable
+          ? await ctx.awaitReachable(Math.max(0, overallDeadline - Date.now()))
+          : true;
         return ok({
           rebooting: true,
-          ready: true,
+          ready: tabBack, // graph tools are usable only once a panel tab is bound
+          server_ready: true, // ComfyUI itself cycled and is healthy
           confirmed_cycle: true, // we directly observed the down→up cycle on the boot endpoint
           recovered_ms: recovery.waited_ms,
           probes: recovery.attempts,
           saw_down: recovery.sawDown,
           via: recovery.via,
+          panel_tab_reconnected: tabBack,
           note:
             `ComfyUI restart accepted and it is healthy again in ${(recovery.waited_ms / 1000).toFixed(1)}s` +
             " (observed it go down then come back)" +
             (dropped ? "; connection dropped as expected while it went down" : "") +
+            (tabBack
+              ? "; the panel tab reconnected — graph tools are ready."
+              : "; ComfyUI is back but the panel tab has NOT reconnected yet (ready:false) — " +
+                'wait a moment then retry, or rebind with panel_set_workflow_target({mode:"current"}) ' +
+                "before issuing graph tools.") +
             ".",
         });
       },
