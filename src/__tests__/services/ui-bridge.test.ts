@@ -1383,6 +1383,129 @@ describe("UiBridge.send (graceful gate end-to-end)", () => {
     expect(dispatched).toBe(true);
   });
 
+  // #422 — DEMONSTRATED capability VETOES the proactive version gate. A panel that
+  // has ALREADY served graph_query in this connection must never be re-gated as
+  // "too old" just because a LATER re-hello (triggered by live graph edits) advertises
+  // a version that parseably undercuts the declared minimum. FAIL-before: the #392 gate
+  // read only the advertised version, so the second, undercutting hello flipped the gate
+  // closed and graph_query — which had just succeeded twice — started returning "too old".
+  it("does NOT re-gate a command the connection ALREADY served after an undercutting re-hello (#422)", async () => {
+    let dispatchCount = 0;
+    // First hello OMITS panel_version (browser-cached panel that predates advertising) —
+    // so the proactive gate is skipped and graph_query round-trips and SUCCEEDS.
+    const sock1 = await connectPanel(undefined);
+    sock1.send(JSON.stringify({ type: "hello", tab_id: "served-tab", title: "wf" }));
+    sock1.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd) {
+        dispatchCount += 1;
+        sock1.send(JSON.stringify({ rid: msg.rid, ok: true, result: { cmd: msg.cmd } }));
+      }
+    });
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Two successful graph_query calls — the panel demonstrably supports it.
+    expect(await bridge.send({ cmd: "graph_query" }, { tabId: "served-tab" })).toEqual({
+      cmd: "graph_query",
+    });
+    expect(await bridge.send({ cmd: "graph_query" }, { tabId: "served-tab" })).toEqual({
+      cmd: "graph_query",
+    });
+
+    // Graph edits trigger a re-hello under the SAME tab id, this time ADVERTISING a
+    // version (0.6.8) that parseably undercuts graph_query's 0.7.0 minimum. The panel
+    // code did not change — capability was proven — so the gate must NOT fire.
+    const sock2 = await connectPanel(undefined);
+    sock2.send(
+      JSON.stringify({ type: "hello", tab_id: "served-tab", title: "wf", panel_version: "0.6.8" }),
+    );
+    let redispatched = false;
+    sock2.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd) {
+        redispatched = true;
+        sock2.send(JSON.stringify({ rid: msg.rid, ok: true, result: { cmd: msg.cmd } }));
+      }
+    });
+    await new Promise((r) => setTimeout(r, 50));
+
+    const after = await bridge.send({ cmd: "graph_query" }, { tabId: "served-tab" });
+    expect(after).toEqual({ cmd: "graph_query" });
+    // Proof the veto worked by DISPATCHING, not by a stale gate rejecting it.
+    expect(redispatched).toBe(true);
+  });
+
+  // #422 — the proven veto must SURVIVE a same-socket tab-id MIGRATION (tmp:<uuid> →
+  // wf:<hash>), which is exactly what a workflow-tab switch / graph edit triggers. A
+  // command served under the pre-migration id, then an undercutting-version hello under
+  // the migrated id, must NOT be re-gated. FAIL-before: the migration deletes the old
+  // conn, so the new conn started with an empty proven set and the gate fired.
+  it("carries the proven veto across a same-socket tab-id migration (#422)", async () => {
+    const sock = await connectPanel(undefined);
+    // First hello under a tmp id, omitting panel_version → graph_query round-trips + succeeds.
+    sock.send(JSON.stringify({ type: "hello", tab_id: "tmp:mig-uuid", title: "wf" }));
+    sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd) {
+        sock.send(JSON.stringify({ rid: msg.rid, ok: true, result: { cmd: msg.cmd } }));
+      }
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(await bridge.send({ cmd: "graph_query" }, { tabId: "tmp:mig-uuid" })).toEqual({
+      cmd: "graph_query",
+    });
+
+    // SAME socket re-hellos under the migrated wf id, now advertising an undercutting
+    // version. The migration carries the proven veto, so graph_query still dispatches.
+    sock.send(
+      JSON.stringify({ type: "hello", tab_id: "wf:mig-hash", title: "wf", panel_version: "0.6.8" }),
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    expect(await bridge.send({ cmd: "graph_query" }, { tabId: "wf:mig-hash" })).toEqual({
+      cmd: "graph_query",
+    });
+  });
+
+  // #422 safety — the veto must NOT mask a genuine DOWNGRADE. If a reconnect reintroduces
+  // a build that truly lacks the command, its own "Unknown command" reply clears the
+  // proven-supported entry, and the reactive (#236) gate then blocks later calls.
+  it("still gates after a genuine downgrade replies Unknown command, clearing the proven veto (#422)", async () => {
+    const sock1 = await connectPanel(undefined);
+    sock1.send(JSON.stringify({ type: "hello", tab_id: "downgrade-tab", title: "wf" }));
+    sock1.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd) {
+        sock1.send(JSON.stringify({ rid: msg.rid, ok: true, result: { cmd: msg.cmd } }));
+      }
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(await bridge.send({ cmd: "graph_query" }, { tabId: "downgrade-tab" })).toEqual({
+      cmd: "graph_query",
+    });
+
+    // Reconnect: an OLDER build under the same tab id that rejects graph_query.
+    const sock2 = await connectPanel(undefined);
+    sock2.send(
+      JSON.stringify({ type: "hello", tab_id: "downgrade-tab", title: "wf", panel_version: "0.6.8" }),
+    );
+    sock2.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd) {
+        sock2.send(JSON.stringify({ rid: msg.rid, ok: false, error: `Unknown command "${msg.cmd}"` }));
+      }
+    });
+    await new Promise((r) => setTimeout(r, 50));
+
+    // The real rejection surfaces and clears the veto, so the connection now knows it's
+    // unsupported — a later call is gated (reactively learned).
+    await expect(bridge.send({ cmd: "graph_query" }, { tabId: "downgrade-tab" })).rejects.toThrow(
+      /too old for "graph_query"/i,
+    );
+    await expect(bridge.send({ cmd: "graph_query" }, { tabId: "downgrade-tab" })).rejects.toThrow(
+      /too old for "graph_query"/i,
+    );
+  });
+
   // #352 FALSE NEGATIVE end-to-end: a NEW-ENOUGH panel (advertises 0.11.21, well
   // past graph_outline's 0.4.6 minimum) that nonetheless replies "Unknown command
   // graph_outline" must NOT be told it's too old, and — critically — must NOT be

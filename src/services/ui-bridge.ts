@@ -121,6 +121,19 @@ interface Conn {
    *  Reset to empty on every hello (a reconnect may be a freshly updated panel
    *  build, so a stale unsupported-verdict must never carry over). */
   unsupportedCmds: Set<string>;
+  /** Commands THIS connection has already EXECUTED SUCCESSFULLY (a real, non-error
+   *  panel reply came back). Demonstrated capability is authoritative: it VETOES the
+   *  proactive #392 version gate, so a command the panel has actually served is never
+   *  later rejected as "too old" just because a subsequent re-hello advertised a
+   *  version that parseably undercuts the changelog-declared minimum (#422 — the panel
+   *  is unchanged; only the advertised-version state flipped). Unlike unsupportedCmds,
+   *  this is INHERITED across a reconnect under the same tab id (the panel code did not
+   *  get older) — and it is the SAFE polarity to inherit: if a genuine DOWNGRADE ever
+   *  reintroduces a command the new build lacks, that build's own "Unknown command"
+   *  reply re-populates unsupportedCmds (and clears this entry), and the unsupportedCmds
+   *  gate — checked BEFORE the version gate — wins. So a wrongly-inherited entry costs at
+   *  most one honest round-trip, never a fabricated success. */
+  provenSupportedCmds: Set<string>;
   /** The ComfyUI origin this tab's browser was served from (`comfyui_url` =
    *  window.location in its `hello`), if sent. Lets a tool bind an HTTP probe to the
    *  EXACT instance THIS tab fronts — not the process-global target, which a
@@ -232,6 +245,19 @@ function buildPanelTooOldError(cmd: string, panelVersion?: string): Error {
  * internal command name to the agent/user. Returns null when `error` is anything
  * else (a genuine command failure), so the happy/normal-error path is untouched.
  */
+/** The panel dispatcher's raw "Unknown command" reply shape (anchored, quote- and
+ *  case-tolerant). Shared by makeUnknownCommandError and isUnknownCommandReply so the
+ *  reactive rewrite and the #422 veto-revocation agree on exactly one definition. */
+const UNKNOWN_COMMAND_RE = /^unknown command\s*["“']?([\w.-]+)["”']?/i;
+
+/** True when `error` is the panel's own "Unknown command" dispatch reply — proof this
+ *  build does NOT implement the command, INDEPENDENT of any advertised-version guard
+ *  (#422). Used to revoke a stale proven-supported veto even when the version is new
+ *  enough to suppress the "too old" rewrite, so a genuine downgrade always re-gates. */
+export function isUnknownCommandReply(error: string): boolean {
+  return UNKNOWN_COMMAND_RE.test(String(error ?? "").trim());
+}
+
 export function makeUnknownCommandError(
   error: string,
   panelVersion?: string,
@@ -241,7 +267,7 @@ export function makeUnknownCommandError(
   // unrelated error that merely QUOTES an unknown-command phrase somewhere in its
   // text is never rewritten — only the panel dispatcher's own reply, which is
   // exactly this string. Case-insensitive, tolerant of straight or smart quotes.
-  const m = /^unknown command\s*["“']?([\w.-]+)["”']?/i.exec(error.trim());
+  const m = UNKNOWN_COMMAND_RE.exec(error.trim());
   if (!m) return null;
   const cmd = m[1];
   // #352 FALSE-NEGATIVE GUARD: if the panel advertised a version that already
@@ -760,6 +786,11 @@ export class UiBridge {
     // hellos is client-controlled, so a headless viewer could otherwise flip it to
     // `false` to pass the same-kind takeover check and seize a desktop tab's id.
     let socketHeadless: boolean | null = null;
+    // #422: capability proven under a PRE-MIGRATION tab id (tmp:<uuid> → wf:<hash>,
+    // same socket/panel) so the veto survives the id change. The retiring conn is
+    // deleted during migration below; without carrying this, a graph-edit-triggered
+    // migration + undercutting-version hello would reintroduce the false "too old" gate.
+    let migratedProvenSupported: Set<string> | undefined;
 
     sock.on("message", (buf: unknown) => {
       const raw = String(buf);
@@ -799,6 +830,9 @@ export class UiBridge {
           // Authoritative migration signal for the orchestrator (same-socket
           // re-hello — the ONLY safe rebind trigger; title matching is not).
           (msg as Record<string, unknown>).migrated_from = tabId;
+          // Carry the retiring conn's proven-supported veto to the migrated id (#422)
+          // — same socket/panel, so demonstrated capability must not be lost.
+          migratedProvenSupported = this.conns.get(tabId)?.provenSupportedCmds;
           this.conns.delete(tabId);
           // Move mirror subscribers to the migrated tab id so viewers keep this
           // tab's live feed across a same-socket re-hello.
@@ -867,6 +901,16 @@ export class UiBridge {
             !!(msg as { panel_version?: string }).panel_version,
           // Fresh per hello — see the field's doc comment (#236).
           unsupportedCmds: new Set<string>(),
+          // INHERITED across a reconnect (the panel code did not get older) so a command
+          // this connection already served is never re-gated as "too old" by a later
+          // undercutting advertised version (#422). Also carries a PRE-MIGRATION proven
+          // set (tmp:→wf: id change, same socket) so the veto survives the id migration.
+          // Safe polarity — see the field doc; a genuine downgrade re-proves via the
+          // Unknown-command reply which clears it.
+          provenSupportedCmds: new Set<string>([
+            ...(existing?.provenSupportedCmds ?? []),
+            ...(migratedProvenSupported ?? []),
+          ]),
           // window.location the browser was served from — the ComfyUI instance THIS
           // tab fronts. Preserved across a SAME-SOCKET re-hello that omits it, but
           // NEVER inherited by a DIFFERENT socket reusing this (possibly recurring
@@ -886,6 +930,12 @@ export class UiBridge {
           // Server-trusted provenance of THIS socket (not client-controlled).
           local,
         });
+        // CONSUME the migration carry-over exactly once: it belongs to THIS hello's
+        // conn only. Leaving it set would let a LATER same-socket re-hello rebuild the
+        // proven veto from the stale pre-migration set — even after a genuine
+        // Unknown-command reply cleared it — re-bypassing the undercut-version gate
+        // (codex round-8 P1).
+        migratedProvenSupported = undefined;
         if (incomingHeadless) this.headlessSeen.add(tabId);
         this.broadcastTabList(); // a tab connected/reconnected — refresh mirror pickers
         // Log a real connect ONCE per tab id. A reconnect/ping-pong loop (a new
@@ -946,6 +996,13 @@ export class UiBridge {
         this.pending.delete(rid);
         this.askRidToId.delete(rid);
         if (msg.ok) {
+          // #422 — the panel DEMONSTRABLY served this command. Record it on the LIVE
+          // connection (following a same-socket tmp:→wf: migration whose reply landed
+          // after the id change), so a later re-hello advertising an undercutting
+          // version can never re-gate it as "too old". Scoped to THIS reply's socket so
+          // an unrelated tab reusing the id can never be granted the veto.
+          const served = this.liveConnForTab(p.ctx.tabId, sock);
+          served?.provenSupportedCmds.add(p.cmd);
           p.resolve(msg.result);
         } else {
           p.reject(new Error(String(msg.error ?? "panel reported an error")));
@@ -1261,6 +1318,25 @@ export class UiBridge {
     );
   }
 
+  /** The LIVE connection for a (possibly RETIRED) canonical tab id, scoped to the SOCKET
+   *  that produced the reply. Returns the conn under `tabId` when it is STILL that exact
+   *  socket, else the socket-scoped migration target it was renamed to (tmp:→wf:). Used
+   *  by the #422 proven-supported bookkeeping so an in-flight reply that lands AFTER a
+   *  same-socket re-hello migration records/clears on the migrated connection — and NEVER
+   *  on an UNRELATED tab that reused the (recurring wf:<hash> / recycled tmp:) id on a
+   *  DIFFERENT socket, which the socket check rejects (codex round-4/7 P1). Returns
+   *  undefined when neither resolves for this socket. */
+  private liveConnForTab(tabId: string, sock: BridgeSocket): Conn | undefined {
+    const direct = this.conns.get(tabId);
+    if (direct && direct.sock === sock) return direct;
+    const migrated = this.tabMigrations.get(tabId);
+    if (migrated && migrated.sock === sock) {
+      const target = this.conns.get(migrated.to);
+      if (target && target.sock === sock) return target;
+    }
+    return undefined;
+  }
+
   /** Deliveries worth mailboxing when the target is offline (a finished render),
    *  vs. interactive canvas ops that should just fail. */
   private static isMailboxable(cmd: BridgeCommand): boolean {
@@ -1344,7 +1420,15 @@ export class UiBridge {
     // rejections (#236), so nothing is permanently poisoned from version alone.
     // Gated on panelVersionAdvertised so a stale version INHERITED across an
     // omitted-version reconnect never blocks a possibly-upgraded panel unprobed.
-    if (conn.panelVersionAdvertised && panelVersionProvesUnsupported(cmd.cmd, conn.panelVersion)) {
+    // And VETOED by demonstrated capability (#422): if this connection has already
+    // executed cmd successfully, the panel plainly supports it, so a later re-hello
+    // whose advertised version parseably undercuts the declared minimum must NOT
+    // regress it to "too old" — observed behaviour outranks an advertised version.
+    if (
+      conn.panelVersionAdvertised &&
+      !conn.provenSupportedCmds.has(cmd.cmd) &&
+      panelVersionProvesUnsupported(cmd.cmd, conn.panelVersion)
+    ) {
       return Promise.reject(buildPanelTooOldError(cmd.cmd, conn.panelVersion));
     }
     if (conn.sock.readyState !== WebSocket.OPEN) {
@@ -1404,12 +1488,26 @@ export class UiBridge {
     // passed through untouched.
     const rejectMapped = (err: Error) => {
       const friendly = makeUnknownCommandError(err.message, conn.panelVersion);
+      // Apply the learned verdict to the LIVE connection — following a same-socket
+      // migration whose reply landed after the tmp:→wf: id change — so neither the
+      // reactive #236 unsupported gate NOR the #422 proven veto is stranded on a
+      // deleted conn (codex round-4/6 P1). Scoped to the dispatch socket (conn.sock) so a
+      // reused id on a DIFFERENT socket is never touched; falls back to the captured conn.
+      const target = this.liveConnForTab(ctx.tabId, conn.sock) ?? conn;
       if (friendly) {
         // Learned, not assumed (#236) — this exact connection just proved it
         // doesn't support cmd.cmd, so every later call in this session is gated
         // proactively (see the `send()` preflight above) instead of round-
         // tripping to the panel again.
-        conn.unsupportedCmds.add(cmd.cmd);
+        target.unsupportedCmds.add(cmd.cmd);
+      }
+      // …and it can no longer be "proven supported" — a genuine downgrade that
+      // reintroduces the command clears the stale #422 veto so the gate re-applies.
+      // Keyed on the RAW Unknown-command shape (not `friendly`): a panel advertising a
+      // new-enough version suppresses the "too old" rewrite (friendly === null) yet its
+      // Unknown-command reply still disproves prior support, so the veto must clear here.
+      if (isUnknownCommandReply(err.message)) {
+        target.provenSupportedCmds.delete(cmd.cmd);
       }
       ctx.reject(friendly ?? err);
     };
