@@ -2,9 +2,13 @@
 // should edit. Without pinning, graph_* commands hit whatever workflow the user
 // is currently viewing — browsing another tab mid-conversation redirects edits.
 //
-// Pinning injects `workflow_path` on workflow-scoped bridge commands so the
-// panel can operate on a background workflow without switching the user's view.
-// The comfyui-mcp-panel pack must honor `workflow_path` on graph executors.
+// Pinning injects `workflow_path` on workflow-scoped bridge commands. The panel can
+// only read/edit the workflow currently IN VIEW (its graph executors run against the
+// active canvas and fail closed on a workflow_path mismatch — panel #349/#186), so a
+// pin must target the active canvas at pin time (enforced in panel_set_workflow_target)
+// and the injected `workflow_path` acts as a GUARD: if the user later switches away, the
+// next graph command fails loudly instead of silently editing the wrong graph. It does
+// NOT enable background editing of a non-active tab.
 
 export type WorkflowTargetMode = "current" | "pinned";
 

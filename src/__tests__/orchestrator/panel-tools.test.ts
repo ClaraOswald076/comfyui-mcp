@@ -853,6 +853,107 @@ describe("panel-tools: single authoritative pin resolution (#259 wrong-tab)", ()
     expect(store.get("test-tab")).toMatchObject({ mode: "current" });
   });
 
+  it("FAILS AT PIN TIME when the target is open but NOT the active canvas (#556) — no deferred mismatch", async () => {
+    const store = new WorkflowTargetStore();
+    // Two open tabs; the ACTIVE one is the Unsaved tab (workflows[1]). Pinning to the
+    // BACKGROUND WAN workflow must be rejected up front — the panel can only edit the
+    // in-view canvas, so accepting the pin would only defer a "workflow mismatch".
+    const wan = { path: "workflows/Wan/WAN 2.2 SVI I2V.json", filename: "WAN 2.2 SVI I2V.json", key: "wf-wan", active: false };
+    const unsaved = { path: null, filename: null, title: "Unsaved Workflow (2)", key: "tmp:uuid-active", active: true };
+    const { bridge } = listBridge([wan, unsaved], unsaved);
+    const ctx = makePanelToolCtx(bridge, "test-tab", store);
+    const res = await defByName("panel_set_workflow_target").handler(
+      { mode: "pinned", path: "workflows/Wan/WAN 2.2 SVI I2V.json" },
+      ctx,
+    );
+    expect(res.isError).toBe(true);
+    const text = (res.content[0] as { text: string }).text;
+    expect(text).toMatch(/not the active canvas/i);
+    expect(text).toMatch(/Unsaved Workflow \(2\)/); // names the workflow actually in view
+    expect(text).toMatch(/panel_open_workflow/); // actionable: switch to it first
+    // Nothing was pinned — the session stays on "current" (never a silent background pin).
+    expect(store.get("test-tab")).toMatchObject({ mode: "current" });
+  });
+
+  it("FAILS AT PIN TIME for an UNSAVED (persisted:false) background workflow (#571)", async () => {
+    const store = new WorkflowTargetStore();
+    // Workflow B is open but unsaved (persisted:false) and NOT active; A is active.
+    const a = { path: "workflows/A.json", filename: "A.json", key: "wf-a", active: true, persisted: true };
+    const b = { path: null, filename: null, title: "Unsaved Workflow", key: "tmp:uuid-b", active: false, persisted: false };
+    const { bridge } = listBridge([a, b], a);
+    const ctx = makePanelToolCtx(bridge, "test-tab", store);
+    const res = await defByName("panel_set_workflow_target").handler(
+      { mode: "pinned", path: "tmp:uuid-b" },
+      ctx,
+    );
+    expect(res.isError).toBe(true);
+    expect((res.content[0] as { text: string }).text).toMatch(/not the active canvas/i);
+    expect(store.get("test-tab")).toMatchObject({ mode: "current" });
+  });
+
+  it("PINS SUCCESSFULLY when the target IS the active canvas (positive control)", async () => {
+    const store = new WorkflowTargetStore();
+    const a = { path: "workflows/A.json", filename: "A.json", key: "wf-a", active: true };
+    const b = { path: "workflows/B.json", filename: "B.json", key: "wf-b", active: false };
+    const { bridge } = listBridge([a, b], a);
+    const ctx = makePanelToolCtx(bridge, "test-tab", store);
+    const res = await defByName("panel_set_workflow_target").handler(
+      { mode: "pinned", path: "workflows/A.json" },
+      ctx,
+    );
+    expect(res.isError).toBeFalsy();
+    expect(store.get("test-tab")).toMatchObject({ mode: "pinned", path: "wf-a" });
+  });
+
+  it("stays LENIENT (pins) when the list carries NO active signal — indeterminate, not background (#556 P1b)", async () => {
+    const store = new WorkflowTargetStore();
+    // Enumerable list but neither a usable active object NOR per-record `active` flags:
+    // active-ness is INDETERMINATE, so a valid pin must NOT be rejected (older/partial panel).
+    const x = { path: "workflows/x.json", filename: "x.json", key: "kx" };
+    const { bridge } = listBridge([x], {} as Record<string, unknown>);
+    const ctx = makePanelToolCtx(bridge, "test-tab", store);
+    const res = await defByName("panel_set_workflow_target").handler(
+      { mode: "pinned", path: "workflows/x.json" },
+      ctx,
+    );
+    expect(res.isError).toBeFalsy();
+    expect(store.get("test-tab")).toMatchObject({ mode: "pinned", path: "kx" });
+  });
+
+  it("stays LENIENT when record and active object share NO comparable identity field (indeterminate, not background)", async () => {
+    const store = new WorkflowTargetStore();
+    // Record exposes only path/filename (no key); active object exposes only a key.
+    // There is no comparable dimension, so active-ness is INDETERMINATE — a valid pin
+    // must NOT be rejected as "background" (would regress older/partial-panel compat).
+    const rec = { path: "workflows/y.json", filename: "y.json" };
+    const { bridge } = listBridge([rec], { key: "k-something-else" } as Record<string, unknown>);
+    const ctx = makePanelToolCtx(bridge, "test-tab", store);
+    const res = await defByName("panel_set_workflow_target").handler(
+      { mode: "pinned", path: "workflows/y.json" },
+      ctx,
+    );
+    expect(res.isError).toBeFalsy();
+    // No key to canonicalize to → pins the raw path (lenient).
+    expect(store.get("test-tab")).toMatchObject({ mode: "pinned", path: "workflows/y.json" });
+  });
+
+  it("duplicate filename across tabs: pins the ACTIVE same-name tab, not a background one (#556 P1a)", async () => {
+    const store = new WorkflowTargetStore();
+    // Two tabs share filename "dup.json" (different dirs). The ACTIVE one is dir2.
+    const bg = { path: "workflows/dir1/dup.json", filename: "dup.json", key: "k-bg", active: false };
+    const live = { path: "workflows/dir2/dup.json", filename: "dup.json", key: "k-live", active: true };
+    const { bridge } = listBridge([bg, live], live);
+    const ctx = makePanelToolCtx(bridge, "test-tab", store);
+    const res = await defByName("panel_set_workflow_target").handler(
+      { mode: "pinned", path: "dup.json" },
+      ctx,
+    );
+    // A filename-only token matches BOTH; the resolver disambiguates to the active
+    // record and pins it — never silently binds the background same-name tab.
+    expect(res.isError).toBeFalsy();
+    expect(store.get("test-tab")).toMatchObject({ mode: "pinned", path: "k-live" });
+  });
+
   it("live-canvas capture (graph_serialize) carries the pinned workflow_path, not the visible tab", async () => {
     const store = new WorkflowTargetStore();
     store.set("test-tab", { mode: "pinned", path: "wf-pinned-key" });
