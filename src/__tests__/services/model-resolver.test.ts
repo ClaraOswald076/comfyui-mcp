@@ -47,6 +47,21 @@ vi.mock("node:fs/promises", () => ({
 // dir so these path-safety tests stay hermetic (no real ComfyUI connection).
 vi.mock("../../services/output-dir.js", () => ({
   resolveModelsDir: vi.fn(async () => "/comfy/models"),
+  // The download resolver now derives the models dir AND the base-install dirs
+  // (for the code-root veto) from ONE call. No base dirs here → the symlink-escape
+  // guard falls back to the models-root sibling (#633 codex r4).
+  resolveModelsDirWithBases: vi.fn(async () => ({
+    modelsDir: "/comfy/models",
+    baseDirs: [],
+  })),
+}));
+
+// The symlink-escape guard now consults registered extra_model_paths roots (#633).
+// Stub to none so these path-safety tests stay hermetic and an escaping symlink is
+// still refused (there is no registered root to land in). The #633 allowance is
+// covered by its own dedicated test file.
+vi.mock("../../services/extra-paths.js", () => ({
+  getExtraModelRoots: vi.fn(async () => []),
 }));
 
 import { config } from "../../config.js";

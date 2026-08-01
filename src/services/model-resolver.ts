@@ -12,7 +12,7 @@ import { logger } from "../utils/logger.js";
 import { downloadWithCache, probeRemoteModelPayload } from "./download-cache.js";
 import { reportDownloadProgress } from "./download-progress.js";
 import type { ResumeReporter } from "./download-resume-diag.js";
-import { resolveModelsDir, parseModelsDirFromArgv } from "./output-dir.js";
+import { resolveModelsDir, resolveModelsDirWithBases, parseModelsDirFromArgv } from "./output-dir.js";
 import {
   applyDownloadAuth,
   redactUrlForLogs,
@@ -38,6 +38,20 @@ export const MODEL_SUBDIRS = [
 ] as const;
 
 export type ModelType = (typeof MODEL_SUBDIRS)[number];
+
+/**
+ * Registered extra_model_paths categories that are NOT model-weight folders and
+ * must NEVER be treated as a valid download destination — even when a symlink
+ * under models/ resolves into one (#633 symlink allowance). The critical entry is
+ * `custom_nodes`: ComfyUI IMPORTS Python from it at startup, so allowing a model
+ * download (arbitrary bare filename) to land there would turn a file fetch into
+ * arbitrary CODE execution. extra_model_paths configs routinely register
+ * `custom_nodes` alongside model folders (see extra-paths.ts), so the symlink
+ * allowance filters these out and honors only genuine model roots — a download can
+ * reach a model dir on another drive (the #633 intent) but never a code directory.
+ * Compared case-insensitively.
+ */
+const NON_MODEL_EXTRA_CATEGORIES = new Set(["custom_nodes"]);
 
 /**
  * Map our internal model category (a MODEL_SUBDIRS value, i.e. the literal
@@ -583,7 +597,12 @@ export async function resolveModelSubfolderPreferServer(
       `target_subfolder must be relative to models/, not absolute: ${raw}`,
     );
   }
-  const modelsRoot = resolve(await resolveModelsDir());
+  // ONE /system_stats call yields BOTH the models dir AND the base-install dirs the
+  // code-root veto needs — so they can never disagree (a second stats call could
+  // fail after a divergent --models-directory was chosen and drop the real
+  // --base-directory code root → fail-open; #633 codex round 4).
+  const { modelsDir, baseDirs } = await resolveModelsDirWithBases();
+  const modelsRoot = resolve(modelsDir);
   const targetDir = resolve(modelsRoot, raw);
   if (targetDir !== modelsRoot && !targetDir.startsWith(modelsRoot + sep)) {
     throw new ModelError(`Refusing to write outside the models directory: ${raw}`);
@@ -595,25 +614,42 @@ export async function resolveModelSubfolderPreferServer(
   // guard belongs here — co-located with the resolution the write actually uses —
   // so it can never diverge from a caller's separate pre-validation (e.g.
   // apply_manifest resolving the root a second time; #490 codex review).
-  await assertNoEscapingSymlinkAncestor(modelsRoot, targetDir, raw);
+  await assertNoEscapingSymlinkAncestor(modelsRoot, targetDir, raw, baseDirs);
   return targetDir;
 }
 
 /**
  * Reject when any EXISTING directory STRICTLY BETWEEN `root` and `target` (a
  * descendant of root, not root itself) is a symlink whose real location escapes
- * root. The models root ITSELF is intentionally NOT checked: a ComfyUI install
- * may legitimately symlink/junction its whole models dir onto another drive, so
- * the root canonicalizes elsewhere by design — that is allowed. Descendants are
- * compared against the CANONICAL root (realpath of root) so a subfolder that
- * resolves back inside the real models tree is fine, while one escaping it is
- * rejected. Best-effort: a not-yet-created segment is fine (the download mkdirs it
- * inside root); never throws for a missing path — only for a genuine escape.
+ * EVERY ComfyUI-registered model root. The models root ITSELF is intentionally
+ * NOT checked: a ComfyUI install may legitimately symlink/junction its whole
+ * models dir onto another drive, so the root canonicalizes elsewhere by design —
+ * that is allowed. Descendants are compared against the CANONICAL primary root
+ * (realpath of root) so a subfolder that resolves back inside the real models
+ * tree is fine.
+ *
+ * A symlink that escapes the PRIMARY root is STILL allowed when its real location
+ * lands inside a directory ComfyUI actually reads models from — i.e. a registered
+ * `extra_model_paths` root, often on another drive/mount (#633). The canonical
+ * example is `models/external_unet_download -> /Volumes/Render/00_AI/models/unet`
+ * where that target IS a live extra model path: ComfyUI serves models from there,
+ * so a download must be permitted to land there. Only an escape that reaches NONE
+ * of the registered roots (primary OR extra) is a genuine arbitrary-write and is
+ * rejected — the symlink allowance is scoped tightly to server-registered roots,
+ * so it can never become a write-anywhere hole. Best-effort: a not-yet-created
+ * segment is fine (the download mkdirs it inside a real root); never throws for a
+ * missing path — only for a genuine escape past every registered root.
  */
 async function assertNoEscapingSymlinkAncestor(
   root: string,
   target: string,
   label: string,
+  /** Candidate ComfyUI base-install dirs, derived by the CALLER from the SAME
+   *  /system_stats call that resolved the models dir (resolveModelsDirWithBases).
+   *  The code-root veto derives `<base>/custom_nodes` from these — threaded in
+   *  rather than re-fetched here so it can never disagree with the models dir a
+   *  divergent --models-directory produced (fail-open race; #633 codex round 4). */
+  baseInstallDirs: string[] = [],
 ): Promise<void> {
   // Canonical root: if the models dir is itself a symlink/junction, resolve it so
   // descendants are checked against where it REALLY lives (not the lexical path).
@@ -623,6 +659,67 @@ async function assertNoEscapingSymlinkAncestor(
   } catch {
     realRoot = root; // root not yet created — lexical containment is all we can check.
   }
+  // Registered roots, resolved LAZILY and ONLY on a genuine escape (the common
+  // no-escape case pays nothing) and memoized across the walk. Two CANONICAL
+  // (realpath-collapsed) sets are built from the SAME extra_model_paths the live
+  // server reads (extra-paths.getExtraModelRoots), so a symlinked/mounted root
+  // still matches by its real on-disk location:
+  //   • modelRoots — the extra MODEL dirs ComfyUI reads WEIGHTS from. A symlink
+  //     escaping the primary root into one of these is the legitimate #633 case.
+  //   • codeRoots — the dirs ComfyUI IMPORTS PYTHON from (custom_nodes): the base
+  //     install's `custom_nodes` (sibling of the canonical models root) plus every
+  //     extra root registered under a code category. A model download must NEVER
+  //     land inside one of these — that would be arbitrary CODE execution, not a
+  //     model install. This is checked by RESOLVED REAL PATH, not by category
+  //     LABEL, so a relabeled/aliased extra entry (e.g. `unet: <base>/custom_nodes`)
+  //     that physically points at a code dir is still refused (codex round 2).
+  // A malformed/unreadable config yields empty sets (getExtraModelRoots never
+  // throws), preserving the strict primary-root-only behavior.
+  let modelRoots: string[] | undefined;
+  let codeRoots: string[] | undefined;
+  const canon = async (d: string): Promise<string> => {
+    try {
+      return resolve(await realpath(d));
+    } catch {
+      return resolve(d); // not yet created — compare lexically
+    }
+  };
+  const ensureRoots = async (): Promise<void> => {
+    if (modelRoots !== undefined) return;
+    let extra: Awaited<ReturnType<typeof getExtraModelRoots>> = [];
+    try {
+      extra = await getExtraModelRoots();
+    } catch {
+      extra = [];
+    }
+    const isCodeCategory = (er: (typeof extra)[number]): boolean =>
+      NON_MODEL_EXTRA_CATEGORIES.has(er.category.trim().toLowerCase());
+    // Base install custom_nodes — the dirs ComfyUI loads core custom nodes from.
+    // Derived from the ACTUAL install base(s) the caller passed (from the same
+    // stats call as the models dir), NOT `dirname(modelsRoot)`: with
+    // `--models-directory` the models tree can live on a different drive than the
+    // base install, so the code dir is not a sibling of the models root (codex
+    // round 3/4). Union every base candidate's `custom_nodes` with the models-root
+    // sibling (standard `<base>/models` layout) as a belt-and-suspenders fallback.
+    const baseDirs = new Set<string>([dirname(realRoot), ...baseInstallDirs]);
+    const code: string[] = [];
+    for (const b of baseDirs) code.push(await canon(join(b, "custom_nodes")));
+    // Plus every extra root registered under a code category, by REAL path.
+    for (const er of extra) if (isCodeCategory(er)) code.push(await canon(er.dir));
+    codeRoots = code;
+    const models: string[] = [];
+    for (const er of extra) if (!isCodeCategory(er)) models.push(await canon(er.dir));
+    modelRoots = models;
+  };
+  const underAny = (real: string, roots: string[]): boolean =>
+    roots.some((r) => real === r || real.startsWith(r + sep));
+  // A symlink escaping the primary root is allowed ONLY when it lands in a registered
+  // MODEL root AND NOT in any code root (custom_nodes). The code-root veto wins even
+  // when a model category also claims the same physical dir.
+  const isAllowedRegisteredEscape = async (real: string): Promise<boolean> => {
+    await ensureRoots();
+    return underAny(real, modelRoots!) && !underAny(real, codeRoots!);
+  };
   // Walk descendants only: from target up to (but NOT including) root.
   let cursor = target;
   while (cursor !== root && cursor.startsWith(root + sep)) {
@@ -630,9 +727,13 @@ async function assertNoEscapingSymlinkAncestor(
       const info = await lstat(cursor);
       if (info.isSymbolicLink()) {
         const real = resolve(await realpath(cursor));
-        if (real !== realRoot && !real.startsWith(realRoot + sep)) {
+        // Under the PRIMARY models root → always safe (a code dir is a SIBLING of
+        // models, never under it). Otherwise the escape is allowed only into a
+        // registered MODEL root that is not a code root.
+        const underPrimary = real === realRoot || real.startsWith(realRoot + sep);
+        if (!underPrimary && !(await isAllowedRegisteredEscape(real))) {
           throw new ModelError(
-            `Refusing to write outside the models directory (a symlink in the path escapes it): ${label}`,
+            `Refusing to write outside the models directory (a symlink in the path escapes every registered model root): ${label}`,
           );
         }
       }
