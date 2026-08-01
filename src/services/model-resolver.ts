@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync, type Stats } from "node:fs";
 import { readdir, stat, mkdir, readFile, lstat, realpath } from "node:fs/promises";
 import { dirname, join, basename, resolve, relative, sep, isAbsolute, extname } from "node:path";
@@ -134,6 +134,31 @@ export interface LocalModel {
  * Never falls back to a local workspace in remote mode (that dir isn't the remote
  * target). Returns undefined when no usable local path exists.
  */
+/** A stable per-PROCESS tiebreak (0..999) folded into every attempt epoch so two
+ *  DIFFERENT processes that start an attempt in the very same millisecond still get
+ *  DISTINCT epochs (codex finding). Equal epochs would collide on the per-attempt
+ *  filename (a real clobber) AND defeat supersession (the predicate needs strictly
+ *  greater). Live processes on one host have distinct pids, but a random nonce avoids
+ *  even a pid-reuse tie; the space only needs to separate the rare same-URL,
+ *  same-target, same-ms double-start. */
+const ATTEMPT_TIEBREAK = randomBytes(2).readUInt16BE(0) % 1000;
+
+/** Strictly-monotonic attempt epoch (panel#489). Wall-clock milliseconds DOMINATE the
+ *  ordering (× 1000), so a retry — which starts later in real time — always outranks the
+ *  attempt it replaced, even across a reconnect respawn in a different process. The
+ *  low-order tiebreak makes concurrent same-ms attempts in different processes distinct
+ *  (no filename clobber, decisive supersession). Within THIS process the value never
+ *  repeats or goes backward — two same-ms retries (or a small local clock rollback) still
+ *  get increasing generations; a tie would let a stale FAILED slip through. (Cross-process
+ *  ordering still assumes the wall clock does not jump backward by more than a retry gap —
+ *  a severe NTP step is out of scope, as it is for any wall-clock generation.) */
+let lastAttemptEpoch = 0;
+function nextAttemptEpoch(): number {
+  const base = Date.now() * 1000 + ATTEMPT_TIEBREAK;
+  lastAttemptEpoch = Math.max(base, lastAttemptEpoch + 1);
+  return lastAttemptEpoch;
+}
+
 function resolveComfyUIBase(): string | undefined {
   return resolveEffectiveComfyUIBase();
 }
@@ -1171,7 +1196,15 @@ export async function downloadModel(
   // Stable id for the panel tray, keyed on the (pre-redirect) URL so resumes and
   // retries map to the same row. Name is the friendly file name.
   const progressId = createHash("sha256").update(request.url).digest("hex").slice(0, 16);
-  const progress = { id: progressId, name: resolvedFilename };
+  // Attempt generation/epoch (panel#489): the id is URL-derived (deterministic), so a
+  // retry of the SAME URL reuses it — attempt N and attempt N+1 are otherwise
+  // indistinguishable. Stamp this attempt's start epoch on every row it writes so the
+  // orchestrator can drop a LATE terminal (failed/done) row from a superseded attempt
+  // once a newer attempt for the same id is already progressing. nextAttemptEpoch()
+  // guarantees STRICT monotonicity within this process, so two same-millisecond retries
+  // never tie (a tie would leave neither able to supersede the other); across processes
+  // the wall clock orders a later spawn after an earlier one.
+  const progress = { id: progressId, name: resolvedFilename, attempt: nextAttemptEpoch() };
   // Tell the job the id the tray rows actually use, so status display + cancel
   // cleanup key on the SAME id even when auth/HF-endpoint rewrote the request URL.
   onTrayId?.(progressId);
