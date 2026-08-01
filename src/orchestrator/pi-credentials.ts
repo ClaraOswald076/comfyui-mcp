@@ -147,17 +147,19 @@ export function credentialValueUsable(
   // `!command` — unverifiable without executing it; err toward ready.
   if (value.startsWith("!")) return true;
   if (!value.includes("$")) return true;
-  // Every referenced var must resolve to something non-empty, from the entry's
-  // own `env` map (pi consults it first) or the process env.
+  // Every referenced var must resolve to something non-empty IN THE ENV PI WILL
+  // ACTUALLY SEE. Order matches pi: the entry's own `env` block first (pi injects
+  // it for the provider), then the inherited process env — but a var our spawn
+  // env STRIPS is never inherited, so `"key": "$GEMINI_API_KEY"` resolves for us
+  // and to nothing for pi. Treating it as present would be exactly the false
+  // green this whole module exists to prevent.
+  const stripped = new Set<string>(TOOL_ONLY_SECRET_ENV_KEYS);
   let resolvable = true;
   value.replace(ENV_REF, (_m, braced: string | undefined, bare: string | undefined) => {
     const name = braced ?? bare ?? "";
     const fromEntry = entryEnv?.[name];
-    const resolved =
-      typeof fromEntry === "string" && fromEntry.trim() !== ""
-        ? fromEntry
-        : procEnv[name];
-    if (!resolved || !String(resolved).trim()) resolvable = false;
+    if (typeof fromEntry === "string" && fromEntry.trim() !== "") return "";
+    if (stripped.has(name) || !procEnv[name]?.trim()) resolvable = false;
     return "";
   });
   return resolvable;
@@ -199,9 +201,18 @@ export function authRecordUsable(record: unknown, procEnv: NodeJS.ProcessEnv = p
     return credentialValueUsable(record.key, isPlainObject(record.env) ? record.env : undefined, procEnv);
   }
   if (type === "oauth") {
-    // Either token alone is enough to get pi a request: `access` is used
-    // directly, `refresh` mints a new one.
-    return nonEmptyString(record.access) || nonEmptyString(record.refresh);
+    // pi's OAuthCredential declares refresh + access + expires as ALL required,
+    // and that is what `/login` writes. We don't demand all three (that would
+    // false-red a partially-migrated record), but we do require something that
+    // can actually produce a live token:
+    //   - a `refresh` token: pi can always re-mint access, so ready regardless
+    //     of `expires` (an expired-but-refreshable record IS ready — refusing it
+    //     would be a false "not signed in").
+    //   - otherwise an `access` token is only credible alongside the numeric
+    //     `expires` that tells pi whether it is still live; access-only with no
+    //     expiry and no refresh cannot be renewed and is a malformed record.
+    if (nonEmptyString(record.refresh)) return true;
+    return nonEmptyString(record.access) && typeof record.expires === "number";
   }
   // Unknown/absent `type`: accept only if some recognised credential field
   // carries material, so `{}` and `{"type":"api_key"}` stay not-ready while a
@@ -260,14 +271,35 @@ export function piModelsJsonUsable(file: string, procEnv: NodeJS.ProcessEnv = pr
     if (!isPlainObject(parsed)) return false;
     const providers = parsed.providers;
     if (!isPlainObject(providers)) return false;
-    return Object.values(providers).some(
+    const entries = Object.values(providers);
+    // pi validates the WHOLE file against ModelsConfigSchema and DISCARDS it on
+    // any violation — so one malformed sibling provider means none of the file's
+    // credentials reach pi. Reproduce that all-or-nothing behaviour rather than
+    // greening off a single good-looking entry.
+    if (!entries.every((p) => providerEntryValid(p))) return false;
+    return entries.some(
       (p) =>
         isPlainObject(p) &&
-        (credentialValueUsable(p.apiKey, undefined, procEnv) || nonEmptyString(p.oauth)),
+        (credentialValueUsable(p.apiKey, undefined, procEnv) || p.oauth === "radius"),
     );
   } catch {
     return false;
   }
+}
+
+/** The subset of pi's ProviderConfigSchema we can check cheaply: `apiKey` and
+ *  `baseUrl` are non-empty strings when present, `oauth` is the literal
+ *  "radius", `models` is an array. This is NOT full TypeBox validation — it
+ *  only has to catch the violations that would make pi throw the file away
+ *  while our detector called it a credential. Anything we can't check is left
+ *  permissive so we never false-red a file pi accepts. */
+function providerEntryValid(entry: unknown): boolean {
+  if (!isPlainObject(entry)) return false;
+  if (entry.apiKey !== undefined && !nonEmptyString(entry.apiKey)) return false;
+  if (entry.oauth !== undefined && entry.oauth !== "radius") return false;
+  if (entry.baseUrl !== undefined && !nonEmptyString(entry.baseUrl)) return false;
+  if (entry.models !== undefined && !Array.isArray(entry.models)) return false;
+  return true;
 }
 
 function fileExistsSafe(file: string): boolean {
@@ -297,16 +329,17 @@ export function piVertexAdcUsable(home: string, procEnv: NodeJS.ProcessEnv = pro
   if (!project || !location) return false;
   const explicit = procEnv.GOOGLE_APPLICATION_CREDENTIALS?.trim();
   if (explicit) {
-    // A relative path is resolved against pi's cwd, which we don't control here;
-    // only absolute paths are checkable, so accept a relative one unverified
-    // rather than false-flag it.
-    return isAbsolute(explicit) ? fileExistsSafe(explicit) : true;
+    // Must point at a file that is actually there. A RELATIVE path resolves
+    // against pi's cwd, which readiness cannot know — so it is unverifiable, and
+    // "unverifiable" has to mean not-ready here or a dangling `missing.json`
+    // greens pi. gcloud always writes an absolute path, so this costs nothing
+    // real.
+    return isAbsolute(explicit) && fileExistsSafe(explicit);
   }
-  // gcloud's default ADC location. pi's fallback is the POSIX path; on Windows
-  // gcloud actually writes under %APPDATA%, so accept either.
-  if (fileExistsSafe(join(home, ".config", "gcloud", "application_default_credentials.json"))) return true;
-  const appData = procEnv.APPDATA;
-  return !!appData && fileExistsSafe(join(appData, "gcloud", "application_default_credentials.json"));
+  // gcloud's well-known ADC file — pi's fallback is this literal POSIX path, so
+  // we probe exactly that and no other location (a %APPDATA%\gcloud file would
+  // green a credential pi does not look for).
+  return fileExistsSafe(join(home, ".config", "gcloud", "application_default_credentials.json"));
 }
 
 /**

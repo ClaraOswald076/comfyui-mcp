@@ -188,6 +188,9 @@ const PI_ENV_KEYS = [
   "GOOGLE_CLOUD_PROJECT",
   "GCLOUD_PROJECT",
   "GOOGLE_CLOUD_LOCATION",
+  // Scrubbed too so a developer's real roaming profile can never be consulted by
+  // a probe here (belt-and-braces: the ADC check already needs project+location).
+  "APPDATA",
 ];
 function withNoPiEnvKeys<T>(fn: () => T): T {
   const saved: Record<string, string | undefined> = {};

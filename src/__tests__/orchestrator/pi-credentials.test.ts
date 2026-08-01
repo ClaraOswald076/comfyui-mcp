@@ -126,10 +126,23 @@ describe("auth.json records", () => {
     expect(authRecordUsable({})).toBe(false);
   });
 
-  it("oauth record needs at least one token", () => {
+  it("oauth record needs something that can produce a live token", () => {
     expect(authRecordUsable({ type: "oauth", access: "at", refresh: "rt", expires: 1 })).toBe(true);
+    // refresh alone: pi can always re-mint an access token.
     expect(authRecordUsable({ type: "oauth", refresh: "rt" })).toBe(true);
     expect(authRecordUsable({ type: "oauth", expires: 123 })).toBe(false);
+    // access alone with no expiry and no refresh cannot be renewed → malformed.
+    expect(authRecordUsable({ type: "oauth", access: "at" })).toBe(false);
+    expect(authRecordUsable({ type: "oauth", access: "at", expires: 999 })).toBe(true);
+  });
+
+  it("an env-interpolated key naming a STRIPPED var is NOT a credential", () => {
+    // GEMINI_API_KEY is a ComfyUI tool secret: buildAgentSpawnEnv() deletes it,
+    // so it resolves for US and to nothing for pi.
+    expect(credentialValueUsable("$GEMINI_API_KEY", undefined, bareEnv({ GEMINI_API_KEY: "k" }))).toBe(false);
+    expect(credentialValueUsable("$OPENAI_API_KEY", undefined, bareEnv({ OPENAI_API_KEY: "k" }))).toBe(true);
+    // …unless the record supplies it itself, which pi injects into pi's env.
+    expect(credentialValueUsable("$GEMINI_API_KEY", { GEMINI_API_KEY: "k" }, bareEnv())).toBe(true);
   });
 
   it("an EXPIRED oauth record with a refresh token is still ready (pi auto-refreshes)", () => {
@@ -217,6 +230,18 @@ describe("Google Vertex ADC", () => {
     ).toBe(false);
   });
 
+  it("a RELATIVE credentials path is NOT ready (unverifiable — pi's cwd is unknown here)", () => {
+    const env = bareEnv({ ...project, GOOGLE_APPLICATION_CREDENTIALS: "missing.json" });
+    expect(piVertexAdcUsable(tmp, env)).toBe(false);
+  });
+
+  it("a %APPDATA%\\gcloud ADC file does NOT count — pi only probes ~/.config/gcloud", () => {
+    const appData = join(tmp, "AppData", "Roaming");
+    mkdirSync(join(appData, "gcloud"), { recursive: true });
+    writeFileSync(join(appData, "gcloud", "application_default_credentials.json"), "{}");
+    expect(piVertexAdcUsable(tmp, bareEnv({ ...project, APPDATA: appData }))).toBe(false);
+  });
+
   it("GCLOUD_PROJECT is accepted as the project fallback", () => {
     const keyFile = join(tmp, "sa.json");
     writeFileSync(keyFile, "{}");
@@ -301,9 +326,37 @@ describe("models.json", () => {
     expect(piModelsJsonUsable(modelsPath(), bareEnv({ MY_GW_KEY: "sk" }))).toBe(true);
   });
 
-  it("an `oauth` provider entry is a credential", () => {
+  it("an `oauth` provider entry is a credential — but only pi's literal \"radius\"", () => {
     writePiFile(tmp, "models.json", '{"providers":{"radius":{"oauth":"radius"}}}');
     expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(true);
+    // pi's schema is a literal; any other value makes pi reject the whole file.
+    writePiFile(tmp, "models.json", '{"providers":{"x":{"oauth":"nope"}}}');
+    expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(false);
+  });
+
+  it("a MALFORMED sibling provider discards the whole file, as it does for pi", () => {
+    // pi validates models.json as a unit and throws it away on any violation, so
+    // the good provider's key never reaches pi either.
+    writePiFile(
+      tmp,
+      "models.json",
+      '{"providers":{"good":{"apiKey":"sk-a"},"bad":{"models":"not-an-array"}}}',
+    );
+    expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(false);
+    writePiFile(tmp, "models.json", '{"providers":{"good":{"apiKey":"sk-a"},"bad":{"apiKey":""}}}');
+    expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(false);
+    // …and the same file with the sibling fixed IS a credential.
+    writePiFile(
+      tmp,
+      "models.json",
+      '{"providers":{"good":{"apiKey":"sk-a"},"ok":{"baseUrl":"http://x/v1","models":[]}}}',
+    );
+    expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(true);
+  });
+
+  it("an apiKey naming a STRIPPED var does not green pi", () => {
+    writePiFile(tmp, "models.json", '{"providers":{"gw":{"apiKey":"$HF_TOKEN"}}}');
+    expect(piModelsJsonUsable(modelsPath(), bareEnv({ HF_TOKEN: "k" }))).toBe(false);
   });
 
   it("missing / corrupt models.json → not a credential", () => {
