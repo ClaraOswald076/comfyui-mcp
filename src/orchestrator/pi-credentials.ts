@@ -27,7 +27,7 @@
 // here — a user who hand-edits their own auth.json to lie is out of scope (this
 // is a local single-trust-domain project).
 
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { TOOL_ONLY_SECRET_ENV_KEYS } from "../services/panel-secrets.js";
@@ -45,48 +45,52 @@ import { TOOL_ONLY_SECRET_ENV_KEYS } from "../services/panel-secrets.js";
  * buildAgentSpawnEnv() strips. Keep this list a faithful copy of pi's map; do the
  * subtraction there, not by editing this array.
  */
-export const PI_ENV_API_KEYS: readonly string[] = [
-  // anthropic (special-cased in pi: three accepted vars, any one suffices)
-  "ANTHROPIC_API_KEY",
-  "ANTHROPIC_AUTH_TOKEN",
-  "ANTHROPIC_OAUTH_TOKEN",
-  // envMap, in pi's own order
-  "ANT_LING_API_KEY", // ant-ling
-  "QWEN_TOKEN_PLAN_API_KEY", // qwen-token-plan
-  "QWEN_TOKEN_PLAN_CN_API_KEY", // qwen-token-plan-cn
-  "OPENAI_API_KEY", // openai
-  "AZURE_OPENAI_API_KEY", // azure-openai-responses
-  "NVIDIA_API_KEY", // nvidia
-  "DEEPSEEK_API_KEY", // deepseek
-  "GEMINI_API_KEY", // google  (stripped before it reaches pi — see below)
-  "GOOGLE_CLOUD_API_KEY", // google-vertex (api-key mode)
-  "GROQ_API_KEY", // groq
-  "CEREBRAS_API_KEY", // cerebras
-  "XAI_API_KEY", // xai
-  "RADIUS_API_KEY", // radius
-  "OPENROUTER_API_KEY", // openrouter
-  "AI_GATEWAY_API_KEY", // vercel-ai-gateway
-  "ZAI_API_KEY", // zai
-  "ZAI_CODING_CN_API_KEY", // zai-coding-cn
-  "MISTRAL_API_KEY", // mistral
-  "MINIMAX_API_KEY", // minimax
-  "MINIMAX_CN_API_KEY", // minimax-cn
-  "MOONSHOT_API_KEY", // moonshotai / moonshotai-cn
-  "HF_TOKEN", // huggingface (stripped before it reaches pi — see below)
-  "FIREWORKS_API_KEY", // fireworks
-  "TOGETHER_API_KEY", // together
-  "OPENCODE_API_KEY", // opencode / opencode-go
-  "KIMI_API_KEY", // kimi-coding
-  "CLOUDFLARE_API_KEY", // cloudflare-workers-ai / cloudflare-ai-gateway
-  "XIAOMI_API_KEY", // xiaomi
-  "XIAOMI_TOKEN_PLAN_CN_API_KEY", // xiaomi-token-plan-cn
-  "XIAOMI_TOKEN_PLAN_AMS_API_KEY", // xiaomi-token-plan-ams
-  "XIAOMI_TOKEN_PLAN_SGP_API_KEY", // xiaomi-token-plan-sgp
-  "COPILOT_GITHUB_TOKEN", // github-copilot (special-cased in pi)
-  // Documented in packages/coding-agent/docs/providers.md (bedrock) but absent
-  // from `envMap`, which only covers api-key providers.
-  "AWS_BEARER_TOKEN_BEDROCK",
-];
+export const PI_PROVIDER_ENV_KEYS: Readonly<Record<string, readonly string[]>> = {
+  // anthropic is special-cased in pi: three accepted vars, any one suffices.
+  anthropic: ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN"],
+  // envMap, in pi's own order.
+  "ant-ling": ["ANT_LING_API_KEY"],
+  "qwen-token-plan": ["QWEN_TOKEN_PLAN_API_KEY"],
+  "qwen-token-plan-cn": ["QWEN_TOKEN_PLAN_CN_API_KEY"],
+  openai: ["OPENAI_API_KEY"],
+  "azure-openai-responses": ["AZURE_OPENAI_API_KEY"],
+  nvidia: ["NVIDIA_API_KEY"],
+  deepseek: ["DEEPSEEK_API_KEY"],
+  google: ["GEMINI_API_KEY"], // stripped before it reaches pi — see below
+  "google-vertex": ["GOOGLE_CLOUD_API_KEY"],
+  groq: ["GROQ_API_KEY"],
+  cerebras: ["CEREBRAS_API_KEY"],
+  xai: ["XAI_API_KEY"],
+  radius: ["RADIUS_API_KEY"],
+  openrouter: ["OPENROUTER_API_KEY"],
+  "vercel-ai-gateway": ["AI_GATEWAY_API_KEY"],
+  zai: ["ZAI_API_KEY"],
+  "zai-coding-cn": ["ZAI_CODING_CN_API_KEY"],
+  mistral: ["MISTRAL_API_KEY"],
+  minimax: ["MINIMAX_API_KEY"],
+  "minimax-cn": ["MINIMAX_CN_API_KEY"],
+  moonshotai: ["MOONSHOT_API_KEY"],
+  "moonshotai-cn": ["MOONSHOT_API_KEY"],
+  huggingface: ["HF_TOKEN"], // stripped before it reaches pi — see below
+  fireworks: ["FIREWORKS_API_KEY"],
+  together: ["TOGETHER_API_KEY"],
+  opencode: ["OPENCODE_API_KEY"],
+  "opencode-go": ["OPENCODE_API_KEY"],
+  "kimi-coding": ["KIMI_API_KEY"],
+  "cloudflare-workers-ai": ["CLOUDFLARE_API_KEY"],
+  "cloudflare-ai-gateway": ["CLOUDFLARE_API_KEY"],
+  xiaomi: ["XIAOMI_API_KEY"],
+  "xiaomi-token-plan-cn": ["XIAOMI_TOKEN_PLAN_CN_API_KEY"],
+  "xiaomi-token-plan-ams": ["XIAOMI_TOKEN_PLAN_AMS_API_KEY"],
+  "xiaomi-token-plan-sgp": ["XIAOMI_TOKEN_PLAN_SGP_API_KEY"],
+  "github-copilot": ["COPILOT_GITHUB_TOKEN"], // special-cased in pi
+  // Documented in packages/coding-agent/docs/providers.md but absent from
+  // `envMap`, which only covers the api-key providers.
+  bedrock: ["AWS_BEARER_TOKEN_BEDROCK"],
+};
+
+/** Flat view of every credential env var pi reads. */
+export const PI_ENV_API_KEYS: readonly string[] = Object.values(PI_PROVIDER_ENV_KEYS).flat();
 
 /**
  * The subset of `PI_ENV_API_KEYS` that actually SURVIVES into pi's spawn env.
@@ -119,8 +123,44 @@ export function stripJsonComments(input: string): string {
     .replace(/"(?:\\.|[^"\\])*"|,(\s*[}\]])/g, (m, tail) => tail ?? (m[0] === '"' ? m : ""));
 }
 
-/** Matches pi's `$VAR` / `${VAR}` interpolation tokens in a credential value. */
-const ENV_REF = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g;
+/** Valid env-var name per pi's resolver (`[A-Za-z_][A-Za-z0-9_]*`). */
+const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*/;
+
+/**
+ * Every env var a credential value interpolates, in pi's parse order.
+ *
+ * Hand-scanned rather than regex'd because pi's resolver has escapes: in a
+ * non-command value `$$` is a literal `$` and `$!` a literal `!`. A regex would
+ * read `"$$MY_KEY"` as a reference to MY_KEY when pi reads it as the literal
+ * string `$MY_KEY` — that mis-parse false-REDs a perfectly good key.
+ */
+function envRefsIn(value: string): string[] {
+  const names: string[] = [];
+  for (let i = 0; i < value.length; i++) {
+    if (value[i] !== "$") continue;
+    const next = value[i + 1];
+    if (next === "$" || next === "!") {
+      i++; // escaped literal — consume both, reference nothing
+      continue;
+    }
+    if (next === "{") {
+      const end = value.indexOf("}", i + 2);
+      if (end === -1) continue;
+      const name = value.slice(i + 2, end);
+      if (ENV_NAME.test(name) && ENV_NAME.exec(name)?.[0] === name) {
+        names.push(name);
+        i = end;
+      }
+      continue;
+    }
+    const m = ENV_NAME.exec(value.slice(i + 1));
+    if (m) {
+      names.push(m[0]);
+      i += m[0].length;
+    }
+  }
+  return names;
+}
 
 /**
  * Is a stored credential VALUE (auth.json `key`, models.json `apiKey`) plausibly
@@ -130,9 +170,10 @@ const ENV_REF = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g;
  *                      running it, and running a user command during a readiness
  *                      probe is not acceptable — so we accept it unverified.
  *   `$VAR` / `${VAR}` → interpolated from the entry's own `env` block first, then
- *                      the process env. If a referenced var is missing there is
- *                      nothing to resolve to, so this is NOT a credential.
- *   literal          → accepted as-is.
+ *                      the process env. pi resolves the WHOLE template to
+ *                      undefined if any referenced var is unset, so one missing
+ *                      var means this is not a credential.
+ *   literal          → accepted as-is (including `$$`/`$!` escapes).
  *
  * Empty / non-string / whitespace-only is never a credential.
  */
@@ -146,7 +187,6 @@ export function credentialValueUsable(
   if (!value) return false;
   // `!command` — unverifiable without executing it; err toward ready.
   if (value.startsWith("!")) return true;
-  if (!value.includes("$")) return true;
   // Every referenced var must resolve to something non-empty IN THE ENV PI WILL
   // ACTUALLY SEE. Order matches pi: the entry's own `env` block first (pi injects
   // it for the provider), then the inherited process env — but a var our spawn
@@ -154,21 +194,13 @@ export function credentialValueUsable(
   // and to nothing for pi. Treating it as present would be exactly the false
   // green this whole module exists to prevent.
   const stripped = new Set<string>(TOOL_ONLY_SECRET_ENV_KEYS);
-  let resolvable = true;
-  value.replace(ENV_REF, (_m, braced: string | undefined, bare: string | undefined) => {
-    const name = braced ?? bare ?? "";
+  for (const name of envRefsIn(value)) {
     const fromEntry = entryEnv?.[name];
-    if (typeof fromEntry === "string" && fromEntry.trim() !== "") return "";
-    if (stripped.has(name) || !procEnv[name]?.trim()) resolvable = false;
-    return "";
-  });
-  return resolvable;
+    if (typeof fromEntry === "string" && fromEntry.trim() !== "") continue;
+    if (stripped.has(name) || !procEnv[name]?.trim()) return false;
+  }
+  return true;
 }
-
-/** Field names that carry credential material on an auth.json record whose
- *  `type` we don't recognise (forward-compat with a pi that adds a new
- *  credential kind). A record with none of these is not a credential. */
-const CREDENTIAL_FIELDS = ["key", "access", "refresh", "token", "apiKey"] as const;
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return !!v && typeof v === "object" && !Array.isArray(v);
@@ -176,6 +208,21 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 
 function nonEmptyString(v: unknown): boolean {
   return typeof v === "string" && v.trim() !== "";
+}
+
+/**
+ * Is `expires` a timestamp still in the future?
+ *
+ * pi's OAuthCredential carries `expires` as a number without documenting its
+ * unit, and this codebase has already been bitten by the seconds-vs-milliseconds
+ * ambiguity (see hasValidPanelOAuth). So accept the value as live if it is in the
+ * future under EITHER reading — that way a genuinely live token is never
+ * false-REDed, while a stale 1970-era value (the malformed case) is future under
+ * neither and correctly reads dead.
+ */
+function expiresInFuture(expires: unknown, nowMs: number): boolean {
+  if (typeof expires !== "number" || !Number.isFinite(expires)) return false;
+  return expires > nowMs || expires * 1000 > nowMs;
 }
 
 /**
@@ -187,37 +234,38 @@ function nonEmptyString(v: unknown): boolean {
  *
  * Note `key` is OPTIONAL in pi's TYPE but mandatory in FACT — a `{"type":"api_key"}`
  * record resolves to no key and pi's first request goes out unauthenticated. That
- * record used to green this provider; it no longer does. Same for an oauth record
- * with neither token.
+ * record used to green this provider; it no longer does.
  *
- * `expires` is deliberately NOT enforced: pi auto-refreshes expired OAuth tokens
- * from `refresh` (docs/providers.md), so an expired-but-refreshable record is
- * genuinely ready and rejecting it would be a false "not signed in".
+ * An UNRECOGNISED `type` is not a credential either: pi's resolveProviderAuth
+ * dispatches only "oauth" and "api_key" and returns undefined for anything else
+ * (packages/ai/src/auth/resolve.ts) — and, because a stored credential owns the
+ * provider, it does not fall back to the env. So such a record is strictly worse
+ * than no record at all.
  */
-export function authRecordUsable(record: unknown, procEnv: NodeJS.ProcessEnv = process.env): boolean {
+export function authRecordUsable(
+  record: unknown,
+  procEnv: NodeJS.ProcessEnv = process.env,
+  nowMs: number = Date.now(),
+): boolean {
   if (!isPlainObject(record)) return false;
   const type = record.type;
   if (type === "api_key") {
     return credentialValueUsable(record.key, isPlainObject(record.env) ? record.env : undefined, procEnv);
   }
   if (type === "oauth") {
-    // pi's OAuthCredential declares refresh + access + expires as ALL required,
-    // and that is what `/login` writes. We don't demand all three (that would
-    // false-red a partially-migrated record), but we do require something that
-    // can actually produce a live token:
-    //   - a `refresh` token: pi can always re-mint access, so ready regardless
-    //     of `expires` (an expired-but-refreshable record IS ready — refusing it
-    //     would be a false "not signed in").
-    //   - otherwise an `access` token is only credible alongside the numeric
-    //     `expires` that tells pi whether it is still live; access-only with no
-    //     expiry and no refresh cannot be renewed and is a malformed record.
+    // pi declares refresh + access + expires as all required, and that is what
+    // `/login` writes. We don't demand all three (that would false-red a
+    // partially-migrated record), but we do require something that can actually
+    // produce a live token:
+    //   - a `refresh` token: pi re-mints access from it, so an EXPIRED record is
+    //     still ready — refusing it would be a false "not signed in".
+    //   - otherwise an `access` token that has NOT expired yet. Access-only with
+    //     no refresh and a past (or absent) expiry cannot be renewed: pi sees it
+    //     as expired and tries to refresh with no refresh token.
     if (nonEmptyString(record.refresh)) return true;
-    return nonEmptyString(record.access) && typeof record.expires === "number";
+    return nonEmptyString(record.access) && expiresInFuture(record.expires, nowMs);
   }
-  // Unknown/absent `type`: accept only if some recognised credential field
-  // carries material, so `{}` and `{"type":"api_key"}` stay not-ready while a
-  // future credential kind still reads as ready.
-  return CREDENTIAL_FIELDS.some((f) => nonEmptyString(record[f]));
+  return false;
 }
 
 function readFileOrNull(file: string): string | null {
@@ -234,15 +282,27 @@ function readFileOrNull(file: string): string | null {
  * the JSONC path it uses for models.json, so a commented auth.json is broken for
  * pi and must not green here. Never throws.
  */
-export function piAuthJsonUsable(file: string, procEnv: NodeJS.ProcessEnv = process.env): boolean {
+export function piAuthJsonUsable(
+  file: string,
+  procEnv: NodeJS.ProcessEnv = process.env,
+  nowMs: number = Date.now(),
+): boolean {
+  return Object.values(piAuthRecords(file)).some((rec) => authRecordUsable(rec, procEnv, nowMs));
+}
+
+/** The parsed auth.json map, or `{}` when missing/corrupt. Used both for
+ *  usability and to know WHICH providers have a stored record at all — pi's
+ *  resolver states "a stored credential owns the provider: ambient/env is
+ *  consulted only when nothing is stored", so a stored record suppresses that
+ *  provider's env keys whether or not it works. Never throws. */
+function piAuthRecords(file: string): Record<string, unknown> {
   const raw = readFileOrNull(file);
-  if (raw === null) return false;
+  if (raw === null) return {};
   try {
     const parsed: unknown = JSON.parse(raw);
-    if (!isPlainObject(parsed)) return false;
-    return Object.values(parsed).some((rec) => authRecordUsable(rec, procEnv));
+    return isPlainObject(parsed) ? parsed : {};
   } catch {
-    return false;
+    return {};
   }
 }
 
@@ -295,16 +355,21 @@ export function piModelsJsonUsable(file: string, procEnv: NodeJS.ProcessEnv = pr
  *  permissive so we never false-red a file pi accepts. */
 function providerEntryValid(entry: unknown): boolean {
   if (!isPlainObject(entry)) return false;
-  if (entry.apiKey !== undefined && !nonEmptyString(entry.apiKey)) return false;
   if (entry.oauth !== undefined && entry.oauth !== "radius") return false;
-  if (entry.baseUrl !== undefined && !nonEmptyString(entry.baseUrl)) return false;
-  if (entry.models !== undefined && !Array.isArray(entry.models)) return false;
-  return true;
+  if (entry.models !== undefined && (!Array.isArray(entry.models) || !entry.models.every(isPlainObject)))
+    return false;
+  // pi's schema declares its string fields with minLength 1, so ANY blank string
+  // (`name: ""`, `baseUrl: ""`, `apiKey: ""`, …) fails validation and makes pi
+  // discard the whole file. Checking the shape generically covers the fields we
+  // haven't enumerated without having to reproduce the full TypeBox schema.
+  return Object.values(entry).every((v) => typeof v !== "string" || v.trim() !== "");
 }
 
-function fileExistsSafe(file: string): boolean {
+/** True only for an existing REGULAR file — a directory at a credentials path is
+ *  not a credential (existsSync alone would say yes). Never throws. */
+function isRegularFile(file: string): boolean {
   try {
-    return existsSync(file);
+    return statSync(file).isFile();
   } catch {
     return false;
   }
@@ -334,12 +399,52 @@ export function piVertexAdcUsable(home: string, procEnv: NodeJS.ProcessEnv = pro
     // "unverifiable" has to mean not-ready here or a dangling `missing.json`
     // greens pi. gcloud always writes an absolute path, so this costs nothing
     // real.
-    return isAbsolute(explicit) && fileExistsSafe(explicit);
+    return isAbsolute(explicit) && isRegularFile(explicit);
   }
   // gcloud's well-known ADC file — pi's fallback is this literal POSIX path, so
   // we probe exactly that and no other location (a %APPDATA%\gcloud file would
   // green a credential pi does not look for).
-  return fileExistsSafe(join(home, ".config", "gcloud", "application_default_credentials.json"));
+  return isRegularFile(join(home, ".config", "gcloud", "application_default_credentials.json"));
+}
+
+/**
+ * pi's agent config directory — where auth.json and models.json live.
+ *
+ * pi resolves this as `PI_CODING_AGENT_DIR` (with `~` expansion) falling back to
+ * `<home>/.pi/agent` (packages/coding-agent/src/config.ts). The override is not a
+ * secret, so buildAgentSpawnEnv passes it straight through to pi — meaning a user
+ * who relocated their pi config was reading as "not signed in" while pi itself
+ * found the credentials fine.
+ */
+export function piAgentDir(home: string, procEnv: NodeJS.ProcessEnv = process.env): string {
+  const override = procEnv.PI_CODING_AGENT_DIR?.trim();
+  if (override) {
+    if (override === "~") return home;
+    if (override.startsWith("~/") || override.startsWith("~\\")) return join(home, override.slice(2));
+    return override;
+  }
+  return join(home, ".pi", "agent");
+}
+
+/**
+ * Is any provider authenticated purely by an env var?
+ *
+ * Per pi's resolver, "a stored credential owns the provider: ambient/env is
+ * consulted only when nothing is stored" — so a provider that HAS a record in
+ * auth.json never falls back to its env key. If we got here the stored record was
+ * not usable, which means that provider is dead and its env key must not green
+ * pi. Every OTHER provider's env keys still count.
+ */
+function piEnvCredentialPresent(
+  storedProviders: Record<string, unknown>,
+  procEnv: NodeJS.ProcessEnv,
+): boolean {
+  const stripped = new Set<string>(TOOL_ONLY_SECRET_ENV_KEYS);
+  for (const [provider, keys] of Object.entries(PI_PROVIDER_ENV_KEYS)) {
+    if (Object.prototype.hasOwnProperty.call(storedProviders, provider)) continue;
+    if (keys.some((k) => !stripped.has(k) && !!procEnv[k]?.trim())) return true;
+  }
+  return false;
 }
 
 /**
@@ -351,10 +456,14 @@ export function piVertexAdcUsable(home: string, procEnv: NodeJS.ProcessEnv = pro
 export function piCredentialPresent(
   home: string = homedir(),
   procEnv: NodeJS.ProcessEnv = process.env,
+  nowMs: number = Date.now(),
 ): boolean {
-  if (piAuthJsonUsable(join(home, ".pi", "agent", "auth.json"), procEnv)) return true;
-  if (piEnvKeysReachingPi().some((k) => !!procEnv[k]?.trim())) return true;
+  const agentDir = piAgentDir(home, procEnv);
+  const authFile = join(agentDir, "auth.json");
+  const stored = piAuthRecords(authFile);
+  if (Object.values(stored).some((rec) => authRecordUsable(rec, procEnv, nowMs))) return true;
+  if (piEnvCredentialPresent(stored, procEnv)) return true;
   if (piVertexAdcUsable(home, procEnv)) return true;
-  if (piModelsJsonUsable(join(home, ".pi", "agent", "models.json"), procEnv)) return true;
+  if (piModelsJsonUsable(join(agentDir, "models.json"), procEnv)) return true;
   return false;
 }

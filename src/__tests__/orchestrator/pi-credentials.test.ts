@@ -127,13 +127,46 @@ describe("auth.json records", () => {
   });
 
   it("oauth record needs something that can produce a live token", () => {
-    expect(authRecordUsable({ type: "oauth", access: "at", refresh: "rt", expires: 1 })).toBe(true);
-    // refresh alone: pi can always re-mint an access token.
-    expect(authRecordUsable({ type: "oauth", refresh: "rt" })).toBe(true);
-    expect(authRecordUsable({ type: "oauth", expires: 123 })).toBe(false);
-    // access alone with no expiry and no refresh cannot be renewed → malformed.
-    expect(authRecordUsable({ type: "oauth", access: "at" })).toBe(false);
-    expect(authRecordUsable({ type: "oauth", access: "at", expires: 999 })).toBe(true);
+    const now = 1_800_000_000_000;
+    const futureSec = Math.floor(now / 1000) + 3600;
+    expect(authRecordUsable({ type: "oauth", access: "at", refresh: "rt", expires: 1 }, bareEnv(), now)).toBe(true);
+    // refresh alone: pi can always re-mint an access token, even when expired.
+    expect(authRecordUsable({ type: "oauth", refresh: "rt" }, bareEnv(), now)).toBe(true);
+    expect(authRecordUsable({ type: "oauth", expires: futureSec }, bareEnv(), now)).toBe(false);
+    // access with no refresh and a PAST/absent expiry cannot be renewed: pi sees
+    // it as expired and tries to refresh with no refresh token.
+    expect(authRecordUsable({ type: "oauth", access: "at" }, bareEnv(), now)).toBe(false);
+    expect(authRecordUsable({ type: "oauth", access: "at", expires: 999 }, bareEnv(), now)).toBe(false);
+    // …a still-live access token is ready. Accepted in seconds OR milliseconds,
+    // since pi doesn't document the unit.
+    expect(authRecordUsable({ type: "oauth", access: "at", expires: futureSec }, bareEnv(), now)).toBe(true);
+    expect(authRecordUsable({ type: "oauth", access: "at", expires: now + 3600_000 }, bareEnv(), now)).toBe(true);
+  });
+
+  it("an UNRECOGNISED credential type is not a credential (and blocks env fallback)", () => {
+    // pi's resolveProviderAuth dispatches only "oauth"/"api_key" and returns
+    // undefined otherwise — and a stored credential owns the provider, so it
+    // does not fall back to the env either.
+    expect(authRecordUsable({ type: "future", key: "x" })).toBe(false);
+    expect(authRecordUsable({ key: "x" })).toBe(false);
+  });
+
+  it("a stored-but-unusable record suppresses that provider's env key", () => {
+    const home = tmp;
+    writePiFile(home, "auth.json", JSON.stringify({ openai: { type: "api_key" } }));
+    // pi will not consult OPENAI_API_KEY: the stored record owns `openai`.
+    expect(piCredentialPresent(home, bareEnv({ OPENAI_API_KEY: "sk" }))).toBe(false);
+    // …but an unrelated provider's env key still counts.
+    expect(piCredentialPresent(home, bareEnv({ XAI_API_KEY: "sk" }))).toBe(true);
+  });
+
+  it("honours PI_CODING_AGENT_DIR (with ~ expansion)", () => {
+    const alt = join(tmp, "alt-config");
+    mkdirSync(alt, { recursive: true });
+    writeFileSync(join(alt, "auth.json"), JSON.stringify({ openai: { type: "api_key", key: "sk" } }));
+    expect(piCredentialPresent(tmp, bareEnv())).toBe(false);
+    expect(piCredentialPresent(tmp, bareEnv({ PI_CODING_AGENT_DIR: alt }))).toBe(true);
+    expect(piCredentialPresent(tmp, bareEnv({ PI_CODING_AGENT_DIR: "~/alt-config" }))).toBe(true);
   });
 
   it("an env-interpolated key naming a STRIPPED var is NOT a credential", () => {
@@ -161,6 +194,16 @@ describe("auth.json records", () => {
 
   it("a `!command` key is accepted unverified (we never execute it to probe)", () => {
     expect(credentialValueUsable("!security find-generic-password -ws anthropic")).toBe(true);
+  });
+
+  it("pi's `$$` / `$!` escapes are literals, not references", () => {
+    // pi reads "$$MY_KEY" as the literal string "$MY_KEY"; treating it as a
+    // reference to an unset MY_KEY would false-red a working key.
+    expect(credentialValueUsable("$$MY_KEY", undefined, bareEnv())).toBe(true);
+    expect(credentialValueUsable("sk-$!literal", undefined, bareEnv())).toBe(true);
+    // …a real reference alongside an escape is still resolved.
+    expect(credentialValueUsable("$$literal-$REAL", undefined, bareEnv())).toBe(false);
+    expect(credentialValueUsable("$$literal-$REAL", undefined, bareEnv({ REAL: "x" }))).toBe(true);
   });
 
   it("a file with only malformed records does NOT green pi", () => {
@@ -240,6 +283,12 @@ describe("Google Vertex ADC", () => {
     mkdirSync(join(appData, "gcloud"), { recursive: true });
     writeFileSync(join(appData, "gcloud", "application_default_credentials.json"), "{}");
     expect(piVertexAdcUsable(tmp, bareEnv({ ...project, APPDATA: appData }))).toBe(false);
+  });
+
+  it("a DIRECTORY at the credentials path is not a credential", () => {
+    const dir = join(tmp, "not-a-file");
+    mkdirSync(dir, { recursive: true });
+    expect(piVertexAdcUsable(tmp, bareEnv({ ...project, GOOGLE_APPLICATION_CREDENTIALS: dir }))).toBe(false);
   });
 
   it("GCLOUD_PROJECT is accepted as the project fallback", () => {
@@ -332,6 +381,13 @@ describe("models.json", () => {
     // pi's schema is a literal; any other value makes pi reject the whole file.
     writePiFile(tmp, "models.json", '{"providers":{"x":{"oauth":"nope"}}}');
     expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(false);
+  });
+
+  it("a BLANK string on any provider field invalidates the file (pi's minLength 1)", () => {
+    writePiFile(tmp, "models.json", '{"providers":{"good":{"apiKey":"sk"},"bad":{"name":""}}}');
+    expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(false);
+    writePiFile(tmp, "models.json", '{"providers":{"good":{"apiKey":"sk"},"ok":{"name":"Fine"}}}');
+    expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(true);
   });
 
   it("a MALFORMED sibling provider discards the whole file, as it does for pi", () => {
