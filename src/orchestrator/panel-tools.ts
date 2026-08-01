@@ -34,7 +34,11 @@ import { parse as parseYaml } from "yaml";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { UiBridge } from "../services/ui-bridge.js";
-import { dispatchOutcomeOf, isPanelCmdUnsupportedError } from "../services/ui-bridge.js";
+import {
+  dispatchOutcomeOf,
+  isPanelCmdUnsupportedError,
+  isReplyTimeoutTagged,
+} from "../services/ui-bridge.js";
 import {
   type WorkflowTargetStore,
   withWorkflowTarget,
@@ -68,12 +72,63 @@ import { sliceWorkflow } from "../services/workflow-slicer.js";
 import { validateA2UISpecServer } from "../services/a2ui-spec.js";
 import type { UiWorkflow } from "../comfyui/types.js";
 
-/** Treat these as an affirmative answer to the adult-content consent card. */
+/** Treat these as an affirmative answer to a yes/no confirm card (destructive-op
+ *  gate). Deliberately BROAD/lenient — a false "no" only SKIPS a destructive op, so
+ *  erring toward "not yes" is safe. NEVER use this for the adult-consent gate: a
+ *  false positive there would enable adult content without genuine consent. Use
+ *  classifyConsentReply() for that. */
 function isAffirmative(reply: unknown): boolean {
   if (typeof reply !== "string") return false;
   return /^(yes|allow|allowed|true|on|ok(ay)?|sure|agree|confirm|enable|i'?m? ?18|18\+?|adult)/i.test(
     reply.trim(),
   );
+}
+
+// The exact option labels the adult-consent card presents. Single source of truth
+// shared by the card and its STRICT reply classifier so the gate matches on option
+// IDENTITY, never on a loose heuristic.
+const CONSENT_YES_LABEL = "Yes — I'm 18+ and it's legal in my region";
+const CONSENT_NO_LABEL = "No — keep it SFW";
+
+// STRICT, whole-string affirmatives/declines accepted from the card's free-text
+// ("Other") box in addition to the exact option labels. Anchored ^…$ so ONLY an
+// unambiguous token counts — unlike the broad isAffirmative() PREFIX match, a
+// free-text reply like "adult content is illegal here", "On second thought, no",
+// or "18 is the age but I decline" can NEVER be read as consent. Consent semantics
+// (18+ AND legal) really live in the affirmative BUTTON; these bare tokens are the
+// pragmatic fallback for a user who types instead of clicking.
+const CONSENT_STRICT_YES_RE = /^(yes|y|yep|yeah|i agree|i consent|agreed?|confirm(ed)?|enable)$/i;
+const CONSENT_STRICT_NO_RE = /^(no|n|nope|decline|declined|cancel|keep (it )?sfw|sfw)$/i;
+
+/**
+ * STRICT classification of an adult-consent card reply — the ONLY gate that may
+ * turn adult mode ON. Returns:
+ *   "grant"   → the EXACT affirmative option, or a strict whole-string yes token
+ *               → turn consent ON.
+ *   "decline" → the EXACT decline option, or a strict whole-string no token
+ *               → turn consent OFF.
+ *   "unclear" → anything else (free text, ambiguous, non-string) → change NOTHING
+ *               (never grants; never revokes a prior genuine grant).
+ * Never routes through isAffirmative() — a loose prefix match must not gate adult
+ * content.
+ */
+function classifyConsentReply(reply: unknown): "grant" | "decline" | "unclear" {
+  if (typeof reply !== "string") return "unclear";
+  // Exact OPTION IDENTITY: a button click echoes the card's label verbatim, so match
+  // it BYTE-FOR-BYTE — no .trim(). Trimming here would strip zero-width/BOM/line-
+  // separator characters (U+2028/U+2029/U+FEFF, \n) and let a near-label like
+  // " Yes — I'm 18+…﻿" pass as the exact affirmative, defeating the exact-identity
+  // invariant this classifier exists to hold.
+  if (reply === CONSENT_YES_LABEL) return "grant";
+  if (reply === CONSENT_NO_LABEL) return "decline";
+  // Free-text ("Other" box) fallback: a small set of unambiguous whole-string tokens.
+  // This path is DELIBERATELY loose — a user who types " yes " is consenting — so a
+  // minimal .trim() of surrounding whitespace is applied ONLY here, never to the
+  // exact-label comparison above.
+  const t = reply.trim();
+  if (CONSENT_STRICT_YES_RE.test(t)) return "grant";
+  if (CONSENT_STRICT_NO_RE.test(t)) return "decline";
+  return "unclear";
 }
 
 export type ToolResult = {
@@ -259,6 +314,10 @@ export const __panelToolsTestHooks = {
   },
   isRetrySafeCmd,
   isTransientReconnectError,
+  // Adult-consent classifier + its exact card labels (#390 gate tests).
+  classifyConsentReply,
+  CONSENT_YES_LABEL,
+  CONSENT_NO_LABEL,
   // #384 live-canvas capture fallback (defined later in the module).
   reconstructUiFromState: (reply: unknown) => reconstructUiFromState(reply),
   resolveWorkflowInput: (
@@ -2378,10 +2437,38 @@ function getAskTiming(): AskTiming {
 
 /** True when an error is the bridge's reply-TIMEOUT for a card (the tab never
  *  replied within the window), NOT a genuine transport/command error. Only a
- *  timeout warrants polling the late-reply buffer for a slow-but-valid answer. */
+ *  timeout warrants polling the late-reply buffer for a slow-but-valid answer.
+ *
+ *  Anchored (`^…$`) on the bridge's CANONICAL no-reply message — the WHOLE message
+ *  ui-bridge `dispatch()` emits: `Panel tab <id> did not reply to "<cmd>" within <N>
+ *  ms — the ComfyUI tab may be backgrounded or frozen`. Whole-message anchoring is
+ *  deliberate: a genuine transport error that merely WRAPS or embeds the phrase —
+ *  e.g. `relay failed: Panel tab abcd did not reply to "ask_user" within 500 ms;
+ *  reconnecting`, or `upstream service did not reply to us within 500 ms` — must NOT
+ *  be mis-handled as a recoverable card-reply timeout. It mirrors the same canonical
+ *  distinction the panel_open_workflow ack-timeout path draws. Crucial for the
+ *  consent gate: a real transport failure must reach fail(), never be quietly
+ *  reported as an unchanged-state success. */
 function isReplyTimeoutError(err: unknown): boolean {
+  // AUTHORITATIVE: the bridge tags every reply-timeout with a typed marker
+  // (markReplyTimeout). Keying on it makes the recoverable-timeout decision robust to
+  // ANY tab_id — including one containing spaces, which the text form below can't
+  // segment (ui-bridge accepts an arbitrary-string tab_id).
+  if (isReplyTimeoutTagged(err)) return true;
+  // FALLBACK (test-injected plain errors / any untagged error): an EXACT whole-message
+  // match of the bridge's canonical no-reply. Literal single space before "ms" (the
+  // bridge always emits "within <N> ms"), no `.trim()`, `^` at true start (no /m flag)
+  // and a HARD end-of-input `(?![\s\S])` — NOT `$`, which in JS also matches just
+  // before a final "\n" and would let `canonical + "\n"` slip through. The tab-id
+  // segment is `.+?` (lazy, bounded by the fixed ` did not reply to "` that follows —
+  // an ≤8-char id slice can't contain that 19-char delimiter) so a spaced tab_id still
+  // matches here too. So a prefixed/suffixed wrapper, whitespace/newline-wrapped text,
+  // or noncanonical spacing ("within 500ms") does NOT match and is surfaced as a real
+  // error. Case-sensitive: the message is a fixed literal template.
   const msg = err instanceof Error ? err.message : String(err ?? "");
-  return /did not reply to .* within \d+\s*ms|backgrounded or frozen/i.test(msg);
+  return /^Panel tab .+? did not reply to "[^"]*" within \d+ ms — the ComfyUI tab may be backgrounded or frozen(?![\s\S])/.test(
+    msg,
+  );
 }
 
 /**
@@ -3410,19 +3497,62 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // that lost its live binding (reconnect/reload/workflow-switch) throws a
           // false `no connected tab` here even though graph tools just worked.
           ctx.ensureReachable?.();
-          const reply = await ctx.bridge.send(
-            {
-              cmd: "ask_user",
-              question,
-              header: "18+ consent",
-              options: [
-                { label: "Yes — I'm 18+ and it's legal in my region", description: "Enable adult content for this session" },
-                { label: "No — keep it SFW", description: "Stay in safe-for-work mode" },
-              ],
-            },
-            { tabId: ctx.tabId, timeoutMs: 300000 },
-          );
-          const allowed = isAffirmative(reply);
+          // #390: the enclosing MCP `tools/call` is killed at ~300s. A hardcoded 300s
+          // card wait raced that budget with ZERO margin, so an idle user who never
+          // clicked blew the whole tool call as a transport timeout ("timed out
+          // awaiting tools/call after 300s") instead of resolving cleanly. CLAMP the
+          // card deadline under the budget (the same getAskTiming() ceiling panel_ask
+          // and confirm use) with a stable ask_id, and on a reply-timeout poll the
+          // bridge's late-reply buffer for a bounded grace so a slow-but-VALID pick is
+          // still honored. If the user is simply away, resolve cleanly with
+          // { nsfw_allowed:false, timed_out:true } WITHOUT touching consent — a timeout
+          // NEVER grants the gate; the persistent decision is unchanged and can be read
+          // back with panel_get_content_mode, or the user re-asked, on the next turn.
+          const timing = getAskTiming();
+          const askId = randomUUID();
+          const askCard = {
+            cmd: "ask_user",
+            ask_id: askId,
+            question,
+            header: "18+ consent",
+            options: [
+              { label: CONSENT_YES_LABEL, description: "Enable adult content for this session" },
+              { label: CONSENT_NO_LABEL, description: "Stay in safe-for-work mode" },
+            ],
+          } as { cmd: string };
+          let reply: unknown;
+          let timedOut = false;
+          try {
+            reply = await ctx.bridge.send(askCard, { tabId: ctx.tabId, timeoutMs: timing.deadlineMs });
+          } catch (err) {
+            // Only a card-reply TIMEOUT is recoverable here: poll the late buffer for a
+            // slow-but-valid answer. Any other error (no panel, transport failure)
+            // propagates to the outer catch → fail(), exactly as before.
+            if (!isReplyTimeoutError(err)) throw err;
+            timedOut = true;
+            reply = await pollLateAskReply(ctx.bridge, askId, timing);
+          }
+          // STRICT gate: adult mode turns ON only on the EXACT affirmative option (or a
+          // strict whole-string yes token) — never via the loose isAffirmative() prefix
+          // match, so a free-text late reply like "adult content is illegal here" or "On
+          // second thought, no" can't grant. An UNCLEAR reply (incl. a no-answer timeout,
+          // where reply is undefined) changes NOTHING: it neither grants nor revokes a
+          // prior genuine grant. Only an EXACT decline explicitly reverts to SFW.
+          const decision = classifyConsentReply(reply);
+          if (decision === "unclear") {
+            const current = getNsfwConsent();
+            return ok({
+              nsfw_allowed: current.allowed,
+              decided_at: current.decidedAt ?? null,
+              ...(timedOut ? { timed_out: true } : {}),
+              note: timedOut
+                ? "The 18+ consent card wasn't answered in time, so nothing changed — adult content stays gated by the existing state. " +
+                  "Ask again when the user is back, or read the current state with panel_get_content_mode."
+                : "The 18+ consent card wasn't answered with a clear yes/no, so nothing changed — the existing content-mode state is unchanged. " +
+                  "Ask again with a clear choice, or read the current state with panel_get_content_mode.",
+            });
+          }
+          const allowed = decision === "grant";
           const state = setNsfwConsent(allowed);
           return ok({
             nsfw_allowed: state.allowed,

@@ -11,7 +11,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { setNsfwConsent } from "../../services/panel-settings.js";
+import { getNsfwConsent, setNsfwConsent } from "../../services/panel-settings.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   buildPanelToolDefs,
@@ -25,6 +25,7 @@ import {
   type ToolResult,
 } from "../../orchestrator/panel-tools.js";
 import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
+import { markReplyTimeout } from "../../services/ui-bridge.js";
 
 type Forwarded = Record<string, unknown>;
 
@@ -1765,6 +1766,361 @@ describe("panel-tools: NSFW consent enforced server-side on CivitAI browsing lev
     );
     expect(res.isError).toBe(true);
     expect(calls).toHaveLength(0);
+  });
+});
+
+describe("panel-tools: adult-consent card survives an idle-user timeout (#390)", () => {
+  const origSettings = process.env.COMFYUI_MCP_PANEL_SETTINGS;
+  // The card's exact affirmative/decline option labels — the SAME source constants the
+  // classifier matches byte-for-byte, so tests can't drift from the real card.
+  const CONSENT_YES_LABEL = __panelToolsTestHooks.CONSENT_YES_LABEL;
+  const CONSENT_NO_LABEL = __panelToolsTestHooks.CONSENT_NO_LABEL;
+
+  beforeAll(() => {
+    // Isolate the persistent consent store to a throwaway file for this suite.
+    const dir = mkdtempSync(join(tmpdir(), "consent-390-"));
+    process.env.COMFYUI_MCP_PANEL_SETTINGS = join(dir, "panel-settings.json");
+  });
+  afterAll(() => {
+    if (origSettings === undefined) delete process.env.COMFYUI_MCP_PANEL_SETTINGS;
+    else process.env.COMFYUI_MCP_PANEL_SETTINGS = origSettings;
+  });
+  afterEach(() => {
+    // Restore the real ask timing so other suites see the production defaults.
+    __panelAskTestHooks.setAskTiming(null);
+  });
+
+  // A card-reply TIMEOUT the bridge surfaces when the tab never answered — the EXACT
+  // canonical whole-message ui-bridge emits, so isReplyTimeoutError treats it as
+  // recoverable (not a hard error). Must match the bridge form verbatim.
+  const replyTimeoutErr = (ms: number) =>
+    new Error(
+      `Panel tab abcd did not reply to "ask_user" within ${ms} ms — the ComfyUI tab may be backgrounded or frozen`,
+    );
+
+  function timeoutBridge(late?: () => unknown) {
+    let forwardedTimeout = 0;
+    let forwardedAskId: unknown;
+    const bridge = {
+      send: async (cmd: Record<string, unknown>, opts?: { timeoutMs?: number }) => {
+        forwardedTimeout = opts?.timeoutMs ?? 0;
+        forwardedAskId = (cmd as { ask_id?: unknown }).ask_id;
+        throw replyTimeoutErr(opts?.timeoutMs ?? 0);
+      },
+      canReach: () => true,
+      isHeadless: () => false,
+      resolveActiveTabId: () => "abcd",
+      push: () => 1,
+      takeLateAskReply: () => (late ? late() : undefined),
+    } as unknown as PanelToolCtx["bridge"];
+    return {
+      ctx: { bridge, tabId: "abcd", ensureReachable: () => {} } as unknown as PanelToolCtx,
+      get forwardedTimeout() {
+        return forwardedTimeout;
+      },
+      get forwardedAskId() {
+        return forwardedAskId;
+      },
+    };
+  }
+
+  function replyBridge(reply: unknown) {
+    return {
+      send: async () => reply,
+      canReach: () => true,
+      isHeadless: () => false,
+      resolveActiveTabId: () => "abcd",
+      push: () => 1,
+    } as unknown as PanelToolCtx["bridge"];
+  }
+
+  function parse(res: ToolResult): Record<string, unknown> {
+    return JSON.parse((res.content[0] as { text: string }).text);
+  }
+
+  it("an unanswered card resolves cleanly as { timed_out:true } WITHOUT granting consent", async () => {
+    setNsfwConsent(false);
+    __panelAskTestHooks.setAskTiming({ deadlineMs: 5, graceMs: 20, pollMs: 2 });
+    const h = timeoutBridge(); // no late reply ever arrives
+    const res = await defByName("panel_request_adult_consent").handler({}, h.ctx);
+    // Resolves cleanly — NOT a transport error (the whole point of #390).
+    expect(res.isError).toBeFalsy();
+    const out = parse(res);
+    expect(out.timed_out).toBe(true);
+    expect(out.nsfw_allowed).toBe(false);
+    // GATE PRESERVED: a timeout must NEVER auto-grant the persistent consent.
+    expect(getNsfwConsent().allowed).toBe(false);
+    // The card deadline was clamped under the ~300s MCP tools/call budget and a
+    // stable ask_id was sent so a late-but-valid answer could still be keyed.
+    expect(h.forwardedTimeout).toBeGreaterThan(0);
+    expect(h.forwardedTimeout).toBeLessThan(300000);
+    expect(typeof h.forwardedAskId).toBe("string");
+  });
+
+  it("honors a late-but-valid YES buffered after the reply timeout and grants consent", async () => {
+    setNsfwConsent(false);
+    __panelAskTestHooks.setAskTiming({ deadlineMs: 5, graceMs: 500, pollMs: 2 });
+    let takes = 0;
+    const h = timeoutBridge(() => {
+      takes += 1;
+      return takes >= 2 ? "Yes — I'm 18+ and it's legal in my region" : undefined;
+    });
+    const res = await defByName("panel_request_adult_consent").handler({}, h.ctx);
+    const out = parse(res);
+    expect(out.timed_out).toBeUndefined();
+    expect(out.nsfw_allowed).toBe(true);
+    expect(getNsfwConsent().allowed).toBe(true);
+  });
+
+  it("honors a late-but-valid NO buffered after the reply timeout and stays SFW", async () => {
+    setNsfwConsent(false);
+    __panelAskTestHooks.setAskTiming({ deadlineMs: 5, graceMs: 500, pollMs: 2 });
+    let takes = 0;
+    const h = timeoutBridge(() => {
+      takes += 1;
+      return takes >= 2 ? "No — keep it SFW" : undefined;
+    });
+    const res = await defByName("panel_request_adult_consent").handler({}, h.ctx);
+    const out = parse(res);
+    expect(out.nsfw_allowed).toBe(false);
+    expect(getNsfwConsent().allowed).toBe(false);
+  });
+
+  it("a fast YES grants and a fast NO keeps SFW — the gate is not weakened", async () => {
+    // Fast NO → stays SFW.
+    setNsfwConsent(false);
+    let ctx = { bridge: replyBridge("No — keep it SFW"), tabId: "abcd", ensureReachable: () => {} } as unknown as PanelToolCtx;
+    let out = parse(await defByName("panel_request_adult_consent").handler({}, ctx));
+    expect(out.nsfw_allowed).toBe(false);
+    expect(getNsfwConsent().allowed).toBe(false);
+
+    // Fast affirmative → grants (the only path that turns the gate ON).
+    ctx = {
+      bridge: replyBridge("Yes — I'm 18+ and it's legal in my region"),
+      tabId: "abcd",
+      ensureReachable: () => {},
+    } as unknown as PanelToolCtx;
+    out = parse(await defByName("panel_request_adult_consent").handler({}, ctx));
+    expect(out.nsfw_allowed).toBe(true);
+    expect(getNsfwConsent().allowed).toBe(true);
+  });
+
+  it("an idle timeout does NOT drop a previously GRANTED consent", async () => {
+    setNsfwConsent(true); // user consented earlier this session
+    __panelAskTestHooks.setAskTiming({ deadlineMs: 5, graceMs: 20, pollMs: 2 });
+    const h = timeoutBridge();
+    const out = parse(await defByName("panel_request_adult_consent").handler({}, h.ctx));
+    expect(out.timed_out).toBe(true);
+    // Reflects — and preserves — the surviving grant; the timeout wrote nothing.
+    expect(out.nsfw_allowed).toBe(true);
+    expect(getNsfwConsent().allowed).toBe(true);
+  });
+
+  // P0 (gate integrity): the card has a free-text "Other" box, so a LATE reply can
+  // be arbitrary user text. It must go through the STRICT consent classifier, NOT
+  // the broad isAffirmative() prefix match — a stray string that merely STARTS with
+  // "on…"/"adult…"/"18…" must NEVER grant adult mode.
+  it("a late FREE-TEXT reply that only loosely resembles yes does NOT grant (P0 regression)", async () => {
+    const strays = [
+      "On second thought, no",
+      "adult content is illegal here",
+      "18 is the age but I decline",
+      "enable? actually no",
+      "yes but only sfw please",
+    ];
+    for (const stray of strays) {
+      setNsfwConsent(false);
+      __panelAskTestHooks.setAskTiming({ deadlineMs: 5, graceMs: 500, pollMs: 2 });
+      let takes = 0;
+      const h = timeoutBridge(() => {
+        takes += 1;
+        return takes >= 2 ? stray : undefined;
+      });
+      const out = parse(await defByName("panel_request_adult_consent").handler({}, h.ctx));
+      expect(out.nsfw_allowed, `late reply "${stray}" must NOT grant`).toBe(false);
+      expect(getNsfwConsent().allowed, `late reply "${stray}" must NOT persist a grant`).toBe(false);
+    }
+  });
+
+  // P1: a stray/ambiguous LATE reply must not clobber a prior genuine grant — same
+  // "change nothing unless it's an EXACT yes/no" rule as the no-answer path.
+  it("a late ambiguous reply PRESERVES a prior genuine grant (does not revoke) (P1 regression)", async () => {
+    setNsfwConsent(true); // real prior consent
+    __panelAskTestHooks.setAskTiming({ deadlineMs: 5, graceMs: 500, pollMs: 2 });
+    let takes = 0;
+    const h = timeoutBridge(() => {
+      takes += 1;
+      return takes >= 2 ? "hmm let me think about it" : undefined;
+    });
+    const out = parse(await defByName("panel_request_adult_consent").handler({}, h.ctx));
+    expect(out.nsfw_allowed).toBe(true);
+    expect(getNsfwConsent().allowed).toBe(true);
+  });
+
+  // The same strict gate applies to an IMMEDIATE free-text reply (the pre-existing
+  // isAffirmative hole): "adult content is illegal here" must not enable adult mode.
+  it("an IMMEDIATE free-text reply resembling 'adult…' does NOT grant (strict gate)", async () => {
+    setNsfwConsent(false);
+    const ctx = {
+      bridge: replyBridge("adult content is illegal here"),
+      tabId: "abcd",
+      ensureReachable: () => {},
+    } as unknown as PanelToolCtx;
+    const out = parse(await defByName("panel_request_adult_consent").handler({}, ctx));
+    expect(out.nsfw_allowed).toBe(false);
+    expect(getNsfwConsent().allowed).toBe(false);
+  });
+
+  it("an EXACT decline explicitly reverts a prior grant to SFW", async () => {
+    setNsfwConsent(true);
+    const ctx = {
+      bridge: replyBridge(CONSENT_NO_LABEL),
+      tabId: "abcd",
+      ensureReachable: () => {},
+    } as unknown as PanelToolCtx;
+    const out = parse(await defByName("panel_request_adult_consent").handler({}, ctx));
+    expect(out.nsfw_allowed).toBe(false);
+    expect(getNsfwConsent().allowed).toBe(false);
+  });
+
+  it("a bare exact 'yes' typed in the Other box grants (strict whole-string token)", async () => {
+    setNsfwConsent(false);
+    const ctx = {
+      bridge: replyBridge("yes"),
+      tabId: "abcd",
+      ensureReachable: () => {},
+    } as unknown as PanelToolCtx;
+    const out = parse(await defByName("panel_request_adult_consent").handler({}, ctx));
+    expect(out.nsfw_allowed).toBe(true);
+    expect(getNsfwConsent().allowed).toBe(true);
+  });
+
+  it("a whitespace tolerant 'yes' token still grants (deliberately-loose free-text path)", async () => {
+    for (const token of [" yes ", "\n yes \n", "  Y  ", "i agree"]) {
+      setNsfwConsent(false);
+      const ctx = {
+        bridge: replyBridge(token),
+        tabId: "abcd",
+        ensureReachable: () => {},
+      } as unknown as PanelToolCtx;
+      const out = parse(await defByName("panel_request_adult_consent").handler({}, ctx));
+      expect(out.nsfw_allowed, `token ${JSON.stringify(token)} should grant`).toBe(true);
+      expect(getNsfwConsent().allowed).toBe(true);
+    }
+  });
+
+  // The exact-affirmative OPTION path is byte-exact — a near-label wrapped in
+  // zero-width / BOM / line-separator / whitespace chars (which .trim() would strip)
+  // must NOT be accepted as the affirmative option; it falls to the free-text token
+  // path, doesn't match a whole-string yes token, and stays "unclear" → no grant.
+  it("a BOM/whitespace-wrapped near-affirmative-LABEL does NOT grant (byte-exact identity)", async () => {
+    const nearLabels = [
+      ` ${CONSENT_YES_LABEL}`, // leading space
+      `${CONSENT_YES_LABEL}﻿`, // trailing BOM / zero-width no-break space
+      `${CONSENT_YES_LABEL} `, // trailing line separator
+      `\n ${CONSENT_YES_LABEL} \n`, // newline-wrapped
+    ];
+    for (const near of nearLabels) {
+      setNsfwConsent(false);
+      const ctx = {
+        bridge: replyBridge(near),
+        tabId: "abcd",
+        ensureReachable: () => {},
+      } as unknown as PanelToolCtx;
+      const out = parse(await defByName("panel_request_adult_consent").handler({}, ctx));
+      expect(out.nsfw_allowed, `near-label ${JSON.stringify(near)} must NOT grant`).toBe(false);
+      expect(getNsfwConsent().allowed).toBe(false);
+    }
+    // Sanity: the exact byte-for-byte label DOES grant.
+    setNsfwConsent(false);
+    const ctxExact = {
+      bridge: replyBridge(CONSENT_YES_LABEL),
+      tabId: "abcd",
+      ensureReachable: () => {},
+    } as unknown as PanelToolCtx;
+    const outExact = parse(await defByName("panel_request_adult_consent").handler({}, ctxExact));
+    expect(outExact.nsfw_allowed).toBe(true);
+  });
+
+  // A tab_id containing a space makes the canonical timeout message unsegmentable by a
+  // `\S+` regex; the bridge's TYPED reply-timeout marker keys the recoverable-timeout
+  // decision instead, so a genuine late reply for that round is still honored (not lost
+  // to fail()).
+  it("a TYPED reply-timeout with a spaced tab_id is recoverable — late YES is honored", async () => {
+    setNsfwConsent(false);
+    __panelAskTestHooks.setAskTiming({ deadlineMs: 5, graceMs: 500, pollMs: 2 });
+    let takes = 0;
+    const bridge = {
+      send: async () => {
+        // Canonical text with a SPACED tab id — but the decision keys on the marker.
+        throw markReplyTimeout(
+          new Error(
+            'Panel tab ab cd12 did not reply to "ask_user" within 500 ms — the ComfyUI tab may be backgrounded or frozen',
+          ),
+        );
+      },
+      canReach: () => true,
+      isHeadless: () => false,
+      resolveActiveTabId: () => "ab cd12",
+      push: () => 1,
+      takeLateAskReply: () => {
+        takes += 1;
+        return takes >= 2 ? CONSENT_YES_LABEL : undefined;
+      },
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = { bridge, tabId: "ab cd12", ensureReachable: () => {} } as unknown as PanelToolCtx;
+    const out = parse(await defByName("panel_request_adult_consent").handler({}, ctx));
+    expect(out.nsfw_allowed).toBe(true);
+    expect(getNsfwConsent().allowed).toBe(true);
+  });
+
+  // A genuine transport/executor error that merely mentions — or WRAPS — the reply
+  // phrase (NOT the canonical whole-message `Panel tab … did not reply to "…" within
+  // N ms — the ComfyUI tab may be backgrounded or frozen`) must NOT be treated as a
+  // recoverable card timeout. It must surface as a real error (fail), never a quiet
+  // "nothing changed" success that masks the failure. isReplyTimeoutError is anchored
+  // ^…$ to the whole canonical message, so a prefixed/suffixed wrapper won't match.
+  it("a non-timeout transport error surfaces as fail(), not a swallowed unchanged-state result", async () => {
+    const wrapped = [
+      // Bare phrase in an unrelated error.
+      "upstream service did not reply to us within 500 ms while loading",
+      // PREFIXED wrapper around the exact bridge phrase (the P1c trigger).
+      'relay failed: Panel tab abcd did not reply to "ask_user" within 500 ms; reconnecting',
+      // SUFFIXED wrapper (canonical phrase then extra trailing text).
+      'Panel tab abcd did not reply to "ask_user" within 500 ms — the ComfyUI tab may be backgrounded or frozen; socket closed',
+      // LEADING whitespace before canonical (fails the `^` start anchor).
+      '  Panel tab abcd did not reply to "ask_user" within 500 ms — the ComfyUI tab may be backgrounded or frozen',
+      // Canonical + a trailing newline ONLY: JS `$` matches just before a final "\n",
+      // so this specifically exercises the HARD end anchor (?![\s\S]) that rejects it.
+      'Panel tab abcd did not reply to "ask_user" within 500 ms — the ComfyUI tab may be backgrounded or frozen\n',
+      // NONCANONICAL spacing before "ms" — not the bridge's literal single space.
+      'Panel tab abcd did not reply to "ask_user" within 500ms — the ComfyUI tab may be backgrounded or frozen',
+      'Panel tab abcd did not reply to "ask_user" within 500\tms — the ComfyUI tab may be backgrounded or frozen',
+    ];
+    for (const message of wrapped) {
+      setNsfwConsent(false);
+      let polled = false;
+      const bridge = {
+        send: async () => {
+          throw new Error(message);
+        },
+        canReach: () => true,
+        isHeadless: () => false,
+        resolveActiveTabId: () => "abcd",
+        push: () => 1,
+        takeLateAskReply: () => {
+          polled = true;
+          return undefined;
+        },
+      } as unknown as PanelToolCtx["bridge"];
+      const ctx = { bridge, tabId: "abcd", ensureReachable: () => {} } as unknown as PanelToolCtx;
+      const res = await defByName("panel_request_adult_consent").handler({}, ctx);
+      expect(res.isError, `wrapped error "${message}" must fail(), not succeed`).toBe(true);
+      // Not misclassified as a card timeout, so the late-reply buffer was never polled.
+      expect(polled, `wrapped error "${message}" must NOT be polled as a timeout`).toBe(false);
+      // And the gate was never touched.
+      expect(getNsfwConsent().allowed).toBe(false);
+    }
   });
 });
 
