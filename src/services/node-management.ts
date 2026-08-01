@@ -9,11 +9,13 @@ import { progressEnabled, reportDownloadProgress } from "./download-progress.js"
 import {
   type ManagerApi,
   cacheManagerApi,
+  dialectRecheckSuppressed,
   getCachedManagerApi,
   managerApiCacheStamp,
   managerApiEpoch,
   resetManagerApiCache,
   setManagerApiCacheForTests,
+  suppressDialectRecheck,
 } from "./manager-api-cache.js";
 import { resolveRootInterpreter } from "./workspace-env.js";
 import { assertComfyCliOk, runComfyCliSync } from "./comfy-cli.js";
@@ -366,10 +368,73 @@ async function resolveV2SubDialect(): Promise<ManagerApi> {
     : "v2";
 }
 
+/**
+ * In-flight detection, shared by every caller that misses the cache for the same
+ * base under the same epoch. Without this, N operations arriving just after the
+ * window lapses each fire their own probe round — a thundering herd against a
+ * server that is often exactly the one that just restarted (#646 review).
+ *
+ * The EPOCH is part of the join key: a detection that started before an
+ * invalidation is probing the pre-restart server, so a caller arriving after the
+ * reset must start its own rather than inherit that reading.
+ */
+let detectInflight: { base: string; epoch: number; promise: Promise<ManagerApi> } | null = null;
+
+/** How many times a detection will re-probe when it is invalidated mid-probe
+ *  before giving the caller its latest reading anyway. A restart storm must not
+ *  spin here; three readings is far past any real restart. */
+const DETECT_INVALIDATION_RETRIES = 2;
+
 async function detectManagerApi(): Promise<ManagerApi> {
   const base = managerBaseUrl();
-  const cached = getCachedManagerApi(base);
-  if (cached !== undefined) return cached;
+  for (let attempt = 0; ; attempt++) {
+    const cached = getCachedManagerApi(base);
+    if (cached !== undefined) return cached;
+
+    const epochAtStart = managerApiEpoch();
+    let entry = detectInflight;
+    let created = false;
+    if (!(entry && entry.base === base && entry.epoch === epochAtStart)) {
+      entry = { base, epoch: epochAtStart, promise: probeManagerApi(base) };
+      detectInflight = entry;
+      created = true;
+    }
+    let api: ManagerApi;
+    try {
+      api = await entry.promise;
+    } finally {
+      // Only the caller that STARTED this probe clears the slot, and only if it
+      // is still ours — a joiner finishing early must not free the slot out from
+      // under a probe others could still share.
+      if (created && detectInflight === entry) detectInflight = null;
+    }
+
+    // The commit was already dropped if something invalidated the cache while we
+    // probed — but the VALUE is just as stale, and returning it would route the
+    // caller's mutation at the server that just went away (#646 review). Probe
+    // again against whatever is there now.
+    if (managerApiEpoch() === epochAtStart) return api;
+    if (attempt >= DETECT_INVALIDATION_RETRIES) {
+      // Every reading so far described a server that was already gone. Handing
+      // the last one back would send a mutation on a dialect we KNOW is stale, so
+      // refuse instead — nothing has been sent at this point, which makes this the
+      // one moment where failing is completely free.
+      throw new NodeManagementError(
+        "ComfyUI-Manager's API generation could not be determined: the connected ComfyUI kept " +
+          "being restarted (or retargeted) while comfyui-mcp was probing it, so every reading " +
+          "described a server that was already gone. NOTHING was sent to the Manager. Wait for " +
+          "ComfyUI to settle, then retry.",
+      );
+    }
+    logger.debug("Manager dialect detection invalidated mid-probe — re-probing", {
+      base,
+      dropped: api,
+      attempt,
+    });
+  }
+}
+
+async function probeManagerApi(base: string): Promise<ManagerApi> {
   // Stamp the cache state BEFORE probing: if ComfyUI is restarted — or another
   // probe commits a fresher verdict — while these probes are in flight, this
   // conclusion describes a server that may be gone and must not be pinned over
@@ -634,84 +699,209 @@ type ManagerTaskParams = Record<string, unknown> | ManagerParamsResolver;
 /**
  * Run ONE enqueue against the detected Manager dialect, healing a stale
  * classification (#646). `enqueue` must only ENQUEUE — never drain — because a
- * retry is sound only while nothing has been queued yet; it is handed the dialect
- * to speak and the invalidation epoch the operation started under, and is called
- * at most twice (never recursively, so the retry is structurally bounded to one).
+ * re-send is sound only while nothing has been queued yet; it is handed the
+ * dialect to speak and the invalidation epoch the operation started under.
+ *
+ * EVERY operation routed through here is a MUTATION (install, uninstall, update,
+ * fix, enable/disable, install-model, update_all, Manager self-update) and Manager
+ * has no idempotency key, so a re-sent request is a genuinely second operation.
+ * The enqueue is therefore re-sent ONLY when the failure PROVES nothing ran — a
+ * 404/405 route rejection — and only when a fresh probe shows the dialect really
+ * changed. It is called at most twice, never recursively.
+ *
+ * On an AMBIGUOUS failure that also indicates a dialect change (a 400: possibly a
+ * validation rejection, possibly a handler that already acted) the classification
+ * is still refreshed, but the operation is NOT re-sent — the caller gets an
+ * actionable error and decides. See AMBIGUOUS_MISMATCH_STATUSES.
  */
 async function enqueueWithDialectSelfHeal(
   label: string,
   enqueue: (api: ManagerApi, startEpoch: number) => Promise<ManagerApi | void>,
 ): Promise<ManagerApi> {
-  // Epoch snapshot for the whole operation: any dialect conclusion reached
-  // during it is only pinned if nothing invalidated the cache meanwhile.
-  const startEpoch = managerApiEpoch();
   const api = await detectManagerApi();
+  // Epoch snapshot taken AFTER detection, i.e. spanning exactly the enqueue whose
+  // outcome a conclusion would be based on. Taking it earlier would also cover the
+  // detection — and since a detection invalidated mid-probe now re-probes and
+  // returns a POST-restart dialect, that stale epoch would then veto a perfectly
+  // good conclusion drawn from it (the #464 v2→v2-batch demotion would never
+  // re-pin, leaving every later op to 405 on /queue/task first — #646 review).
+  const startEpoch = managerApiEpoch();
   try {
     return (await enqueue(api, startEpoch)) ?? api;
   } catch (err) {
     const fresh = await redetectAfterDialectMismatch(api, label, err);
     if (fresh === undefined) throw err;
-    // The live server speaks a DIFFERENT dialect than the one we routed with, and
-    // the failure was a pre-execution rejection (see redetectAfterDialectMismatch),
-    // so nothing was enqueued — re-enqueue ONCE in the correct dialect.
+    if (!ROUTE_MISMATCH_STATUSES.has(errorStatus(err) as number)) {
+      // The dialect DID change, but this failure doesn't prove the request went
+      // unexecuted, so re-sending it could run the mutation twice. Refuse, and
+      // hand the user everything needed to decide (#646 review).
+      throw dialectChangedError(label, api, fresh, err);
+    }
+    // A route-level rejection: no handler ran, so nothing was enqueued —
+    // re-enqueue ONCE in the dialect the live server actually speaks.
     return (await enqueue(fresh, managerApiEpoch())) ?? fresh;
   }
 }
 
 /**
- * Manager statuses that mean "your request was rejected BEFORE any work ran":
- *   404/405 — the route doesn't exist for this build (ComfyUI's frontend catchall
- *             answers an unregistered POST with 405, never 404), so no handler ran.
- *   400     — the handler exists but refused the body during validation, which is
- *             exactly what a v4 Manager does to a 3.x-shaped install_model payload
- *             (the #646 report: "400 Bad Request for /v2/manager/queue/install_model"
- *             while the live server was a normal Manager 4.2.2). Manager validates
- *             before enqueuing, so a 400 likewise means nothing was queued.
- * Everything else (403 security_level gating, 5xx, transport failures, queue-drain
- * timeouts) is NOT a dialect signal and must never trigger a re-probe or a retry.
+ * The classification was stale AND the failure can't be proven pre-execution, so
+ * the operation was deliberately not re-sent. Say exactly that: which dialect we
+ * spoke, which one the server actually speaks now, that the classification is
+ * already corrected, and that the previous attempt's effect is UNKNOWN — so the
+ * user verifies before reissuing rather than blindly repeating a mutation.
  */
-const DIALECT_MISMATCH_STATUSES = new Set([400, 404, 405]);
+function dialectChangedError(
+  label: string,
+  was: ManagerApi,
+  now: ManagerApi,
+  cause: unknown,
+): NodeManagementError {
+  const base = cause instanceof Error ? cause.message : String(cause);
+  return new NodeManagementError(
+    `${base}\nThe ComfyUI-Manager API dialect CHANGED under this connection: the request ` +
+      `was sent as "${was}", but the live server now answers as "${now}" (ComfyUI was ` +
+      `restarted with a different Manager generation at the same URL). comfyui-mcp has ` +
+      `re-detected the dialect, so the next call routes correctly. The "${label}" request ` +
+      `was NOT retried automatically: this failure does not prove the server left it ` +
+      `unexecuted, and Manager offers no idempotency key, so an automatic retry could run ` +
+      `it TWICE. VERIFY whether it took effect (list_installed_nodes / list_local_models, ` +
+      `or the ComfyUI server log), then reissue it if it did not.`,
+    cause instanceof NodeManagementError ? cause.details : undefined,
+  );
+}
+
+/**
+ * ROUTE-level rejections: the request never reached a handler, so the operation
+ * PROVABLY did not run and re-sending it cannot double-execute anything. On a
+ * Manager route this is exactly 404/405 — ComfyUI's frontend catchall answers an
+ * unregistered POST with 405 (never 404), and both mean "no such route on this
+ * build", never "the Manager is unreachable". These are the ONLY statuses that
+ * may trigger an automatic re-enqueue.
+ */
+const ROUTE_MISMATCH_STATUSES = new Set([404, 405]);
+
+/**
+ * A 400 is AMBIGUOUS. It can mean a stale dialect — a v4 Manager rejecting a
+ * 3.x-shaped install_model body is the #646 report itself — but it can equally
+ * come from a handler that already did the work and failed afterwards, or from a
+ * proxy on the response path. Manager exposes no idempotency key, so a re-sent
+ * mutation is a genuinely SECOND operation; there is no way to make that safe.
+ *
+ * So a 400 refreshes the CLASSIFICATION but never re-sends the request: if the
+ * re-probe shows the dialect really did change, the caller gets an actionable
+ * error naming both dialects and is left to decide whether to reissue. Refusing
+ * is always correct here; guessing is not.
+ *
+ * Everything else (403 security_level gating, 5xx, transport failures, queue-drain
+ * timeouts) is not a dialect signal at all and triggers neither.
+ */
+const AMBIGUOUS_MISMATCH_STATUSES = new Set([400]);
 
 /**
  * Decide whether a failed enqueue was the CACHED DIALECT being stale, and if so
- * return the dialect the live server actually speaks now.
+ * return the dialect the live server actually speaks now (undefined = no dialect
+ * news; the caller surfaces its original failure).
  *
  * A restart at the same URL can swap the Manager generation underneath a cached
  * classification (#646). The explicit restart-lifecycle invalidation and the TTL
  * cover the common paths; this is the per-call backstop so ONE stale entry heals
- * itself instead of failing every subsequent Manager operation.
+ * itself instead of failing every subsequent Manager operation. It only reports
+ * the change — whether the operation may be re-sent is the caller's decision,
+ * made from the STATUS (see ROUTE_MISMATCH_STATUSES vs AMBIGUOUS_*).
  *
- * Two guards keep this from looping or double-executing a mutation:
- *   • only pre-execution rejections (DIALECT_MISMATCH_STATUSES) qualify, so the
- *     failed attempt provably enqueued nothing;
- *   • the caller only retries when a FRESH probe reports a DIFFERENT dialect. A
- *     genuine 400 (bad params, a 3.x whitelist rejection) re-detects the same
- *     dialect → undefined → the original error surfaces, and the re-probe has
- *     already re-populated the cache, so a failing call costs at most one extra
- *     detection rather than re-probing on every subsequent call.
+ * Three guards keep this cheap and non-looping:
+ *   • only the two mismatch-capable status classes get here at all; 403/5xx and
+ *     transport failures never cost a probe;
+ *   • a verdict of "unchanged" (or an unreachable Manager) ARMS A COOLDOWN, so an
+ *     endpoint that fails the same way on every call cannot buy a probe per call —
+ *     without it, each re-check resets the entry the previous one repopulated;
+ *   • the cooldown is cleared by any resetManagerApiCache(), i.e. by every real
+ *     lifecycle event, so it can never delay reacting to an actual restart.
  */
+/**
+ * In-flight "reset + re-detect" transaction, shared per base URL. The re-check is
+ * NOT just a detection: it resets the cache first, which bumps the epoch — so
+ * without sharing, N concurrent failures would each reset (invalidating each
+ * other's in-flight probe, since the detector joins only on a matching epoch) and
+ * each run a full probe round. One transaction serves them all (#646 review).
+ */
+let recheckInflight: {
+  base: string;
+  promise: Promise<{ fresh: ManagerApi | undefined; epoch: number }>;
+} | null = null;
+
+async function sharedDialectRecheck(
+  base: string,
+  label: string,
+  status: number,
+  used: ManagerApi,
+): Promise<{ fresh: ManagerApi | undefined; epoch: number }> {
+  const joined = recheckInflight;
+  if (joined?.base === base) return joined.promise;
+
+  const run = async (): Promise<{ fresh: ManagerApi | undefined; epoch: number }> => {
+    resetManagerApiCache(`manager ${label} enqueue failed ${status} on the "${used}" dialect`);
+    const epoch = managerApiEpoch();
+    try {
+      return { fresh: await detectManagerApi(), epoch };
+    } catch {
+      // Manager isn't answering at all — that's not a dialect mismatch; the
+      // caller surfaces its own (more informative) failure. Don't re-probe on
+      // every subsequent call while it stays down, unless a lifecycle event has
+      // since told us something new.
+      if (managerApiEpoch() === epoch) {
+        suppressDialectRecheck(base, "manager unreachable during re-check");
+      }
+      return { fresh: undefined, epoch };
+    }
+  };
+
+  const entry = { base, promise: run() };
+  recheckInflight = entry;
+  try {
+    return await entry.promise;
+  } finally {
+    if (recheckInflight === entry) recheckInflight = null;
+  }
+}
+
 async function redetectAfterDialectMismatch(
   used: ManagerApi,
   label: string,
   err: unknown,
 ): Promise<ManagerApi | undefined> {
   const status = errorStatus(err);
-  if (status === undefined || !DIALECT_MISMATCH_STATUSES.has(status)) return undefined;
-  resetManagerApiCache(`manager ${label} enqueue failed ${status} on the "${used}" dialect`);
-  let fresh: ManagerApi;
-  try {
-    fresh = await detectManagerApi();
-  } catch {
-    // Manager isn't answering at all — that's not a dialect mismatch; surface the
-    // caller's original (more informative) failure.
+  if (
+    status === undefined ||
+    !(ROUTE_MISMATCH_STATUSES.has(status) || AMBIGUOUS_MISMATCH_STATUSES.has(status))
+  ) {
     return undefined;
   }
-  if (fresh === used) return undefined;
-  logger.info("Manager API dialect changed under a cached classification — retrying once", {
+  const base = managerBaseUrl();
+  if (dialectRecheckSuppressed(base)) {
+    logger.debug("Skipping Manager dialect re-check (cooldown)", { op: label, status });
+    return undefined;
+  }
+  const { fresh, epoch: epochAfterReset } = await sharedDialectRecheck(base, label, status, used);
+  if (fresh === undefined) return undefined;
+  if (fresh === used) {
+    // Nothing changed, so this failure was never about the dialect. Arm the
+    // cooldown — but only if no lifecycle event landed since the re-check began,
+    // otherwise a stale continuation would suppress re-checks against a server
+    // we now know nothing about (#646 review).
+    if (managerApiEpoch() === epochAfterReset) {
+      suppressDialectRecheck(base, `dialect confirmed unchanged ("${used}") after a ${status}`);
+    }
+    return undefined;
+  }
+  logger.info("Manager API dialect changed under a cached classification", {
     op: label,
     was: used,
     now: fresh,
     status,
+    // A route-level rejection proves nothing ran, so the caller re-sends once;
+    // anything else is refused rather than risking a double-execute.
+    resend: ROUTE_MISMATCH_STATUSES.has(status),
   });
   return fresh;
 }

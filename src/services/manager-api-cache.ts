@@ -118,6 +118,46 @@ export function managerApiCacheStamp(): ManagerApiCacheStamp {
   return { epoch, seq: ++seqCounter };
 }
 
+// ---------------------------------------------------------------------------
+// Negative-result cooldown for the per-call dialect re-check
+// ---------------------------------------------------------------------------
+
+/**
+ * When a Manager call fails with a status that COULD mean a stale dialect, the
+ * caller re-probes to find out. If the probe says the dialect is unchanged, the
+ * failure had nothing to do with the dialect — and an endpoint that keeps failing
+ * that way (a persistently-400ing route, a pack Manager always refuses) would
+ * otherwise buy a fresh probe on EVERY call, since each re-check resets the entry
+ * the previous one just repopulated.
+ *
+ * So a confirmed-unchanged (or unreachable) verdict arms a cooldown for that base
+ * URL: re-checks are suppressed until it lapses, capping the cost of a repeatedly
+ * failing operation at one probe per window instead of one per call. Any genuine
+ * new information — a restart, a stop, any resetManagerApiCache() — clears it, so
+ * the cooldown can never delay reacting to a real dialect change.
+ */
+let recheckCooldown: { base: string; until: number } | null = null;
+
+/** Is a dialect re-check for `base` still inside its cooldown window? */
+export function dialectRecheckSuppressed(base: string): boolean {
+  if (!recheckCooldown || recheckCooldown.base !== base) return false;
+  if (monotonicNow() >= recheckCooldown.until) {
+    recheckCooldown = null;
+    return false;
+  }
+  return true;
+}
+
+/** Arm the cooldown after a re-check that produced no new dialect. */
+export function suppressDialectRecheck(base: string, reason: string): void {
+  recheckCooldown = { base, until: monotonicNow() + MANAGER_API_TTL_MS };
+  logger.debug("Suppressing Manager dialect re-checks for this base", {
+    base,
+    reason,
+    for_ms: MANAGER_API_TTL_MS,
+  });
+}
+
 /**
  * The cached dialect for `base`, or undefined when there is none, it was
  * detected against a different base URL, or it has aged out of the freshness
@@ -195,6 +235,9 @@ export function cacheManagerApi(
 export function resetManagerApiCache(reason?: string): void {
   const was = cache?.api;
   cache = null;
+  // A reset is new information about the server, so the re-check cooldown (a
+  // "nothing changed" verdict about the PREVIOUS state) no longer applies.
+  recheckCooldown = null;
   epoch++;
   logger.debug("Manager API dialect cache reset", { reason, was, epoch });
 }

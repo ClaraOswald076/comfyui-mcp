@@ -131,8 +131,12 @@ function stubServer(opts: {
     if (path === "/v2/manager/queue/start") return new Response("", { status: 200 });
     if (path === "/v2/manager/queue/update_all") return new Response("", { status: 200 });
     if (path === "/v2/manager/is_legacy_manager_ui") {
+      // Read the persona BEFORE parking on the gate, so a gated probe answers
+      // with the reading it took when the request was issued — that is what makes
+      // "the server changed while a probe was in flight" testable.
+      const body = { is_legacy_manager_ui: opts.persona() === "v2-batch" };
       if (opts.legacyUiGate) await opts.legacyUiGate();
-      return jsonResponse({ is_legacy_manager_ui: opts.persona() === "v2-batch" });
+      return jsonResponse(body);
     }
 
     if (opts.persona() === "v2-batch") {
@@ -297,7 +301,7 @@ describe("#646 Manager API dialect cache invalidation", () => {
     expect(getCachedManagerApi(BASE)).toBeUndefined();
   });
 
-  it("self-heals a stale entry: one re-detect, one retry, no duplicate enqueue", async () => {
+  it("on a 400 it re-detects but REFUSES to re-send the mutation", async () => {
     let persona: Persona = "v2-batch";
     const calls = stubServer({ persona: () => persona });
 
@@ -307,14 +311,33 @@ describe("#646 Manager API dialect cache invalidation", () => {
     persona = "v4";
     calls.length = 0;
 
-    await expect(downloadAModel()).resolves.toMatchObject({ mechanism: "manager-http" });
+    // A 400 does NOT prove the server left the request unexecuted (it can come
+    // from a handler that already acted, or from a proxy on the response path),
+    // and Manager has no idempotency key — so the model install must NOT be
+    // re-sent, however confident we are that the dialect moved.
+    const err = (await downloadAModel().catch((e: unknown) => e)) as Error;
+    expect(err).toBeInstanceOf(Error);
+    // The refusal is actionable: it names the dialect we spoke and the one the
+    // server now answers as, says the classification is already corrected, and
+    // tells the user to verify before reissuing.
+    expect(err.message).toMatch(/dialect CHANGED/);
+    expect(err.message).toMatch(/"v2-batch"/);
+    expect(err.message).toMatch(/"v2"/);
+    expect(err.message).toMatch(/NOT retried automatically/);
+    expect(err.message).toMatch(/VERIFY/);
 
-    // Attempt 1 spoke the stale dialect and was rejected 400 BEFORE anything was
-    // enqueued; one re-probe proved the dialect changed; attempt 2 succeeded.
     expect(countOf(calls, "/v2/manager/queue/install_model")).toBe(1);
     expect(detections(calls)).toBe(1);
-    // Exactly ONE task enqueued — the retry must not double-submit the install.
+    // NOTHING was re-sent in the newly-detected dialect.
+    expect(countOf(calls, "/v2/manager/queue/task")).toBe(0);
+    // The queue was never started, so no half-run operation is left behind.
+    expect(countOf(calls, "/v2/manager/queue/start")).toBe(0);
+
+    // …and the reissue now routes correctly on the FIRST attempt.
+    calls.length = 0;
+    await expect(downloadAModel()).resolves.toMatchObject({ mechanism: "manager-http" });
     expect(countOf(calls, "/v2/manager/queue/task")).toBe(1);
+    expect(countOf(calls, "/v2/manager/queue/install_model")).toBe(0);
   });
 
   it("rebuilds a dialect-specific body on retry (git install), not just the route", async () => {
@@ -379,22 +402,190 @@ describe("#646 Manager API dialect cache invalidation", () => {
     expect(countOf(calls, "/v2/manager/queue/task")).toBe(1);
   });
 
-  it("re-detects at most once on a genuine 400, and does NOT retry when the dialect is unchanged", async () => {
+  it("a persistently-400ing endpoint cannot buy a probe per call (re-check cooldown)", async () => {
     const calls = stubServer({ persona: () => "v4", taskStatus: () => 400 });
 
     await expect(downloadAModel()).rejects.toThrow(/400/);
 
-    // The 400 could have been a stale dialect, so one re-probe is spent proving
-    // otherwise — but the dialect is unchanged, so the enqueue is NOT repeated
-    // and the caller's original error surfaces.
+    // The 400 could have been a stale dialect, so ONE re-probe is spent proving
+    // otherwise — the dialect is unchanged, so the enqueue is not repeated and the
+    // caller's original error surfaces unwrapped.
     expect(detections(calls)).toBe(2);
     expect(countOf(calls, "/v2/manager/queue/task")).toBe(1);
 
-    // The re-probe re-populated the cache, so a second failing call costs one
-    // more re-probe at most — it never degrades into per-call re-detection.
+    // Every subsequent identical failure is now free: the "unchanged" verdict
+    // armed a cooldown, so the cache is NOT reset-and-re-probed per call.
+    for (let i = 0; i < 3; i++) {
+      calls.length = 0;
+      await expect(downloadAModel()).rejects.toThrow(/400/);
+      expect(detections(calls)).toBe(0);
+      expect(countOf(calls, "/v2/manager/queue/task")).toBe(1);
+    }
+
+    // A real lifecycle event is new information and clears the cooldown, so the
+    // very next failure re-checks again rather than trusting the stale verdict.
+    resetManagerApiCache("comfyui restarted");
     calls.length = 0;
     await expect(downloadAModel()).rejects.toThrow(/400/);
+    expect(detections(calls)).toBe(2);
+  });
+
+  it("shares ONE detection between concurrent callers (no probe storm)", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let gated = true;
+    const calls = stubServer({
+      persona: () => "v4",
+      legacyUiGate: async () => {
+        if (gated) await gate;
+      },
+    });
+
+    // Five operations arrive together on a cold cache (exactly what happens just
+    // after the window lapses). They must not each fire their own probe round.
+    const ops = [downloadAModel(), downloadAModel(), downloadAModel(), downloadAModel(), downloadAModel()];
+    while (!calls.some((c) => c.path === "/v2/manager/is_legacy_manager_ui")) {
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    gated = false;
+    release();
+    await Promise.all(ops);
+
+    // One shared detection for all five …
     expect(detections(calls)).toBe(1);
+    // … and all five operations still went through.
+    expect(countOf(calls, "/v2/manager/queue/task")).toBe(5);
+  });
+
+  it("shares ONE reset+re-detect between concurrent failing calls", async () => {
+    const calls = stubServer({ persona: () => "v4", taskStatus: () => 400 });
+
+    // Warm the cache so the failures — not the cold start — drive the re-checks.
+    await expect(downloadAModel()).rejects.toThrow(/400/);
+    resetManagerApiCache("test: clear the cooldown armed by the warm-up");
+    calls.length = 0;
+
+    // Four operations fail concurrently with the ambiguous status. Each re-check
+    // RESETS the cache (bumping the epoch), so without a shared transaction they
+    // would invalidate each other's probe and run four full detection rounds.
+    const results = await Promise.allSettled([
+      downloadAModel(),
+      downloadAModel(),
+      downloadAModel(),
+      downloadAModel(),
+    ]);
+    expect(results.every((r) => r.status === "rejected")).toBe(true);
+
+    // One cold-start detection plus ONE shared re-check for all four.
+    expect(detections(calls)).toBe(2);
+    // Every operation attempted its own enqueue exactly once, and none was re-sent.
+    expect(countOf(calls, "/v2/manager/queue/task")).toBe(4);
+  });
+
+  it("does not enqueue with a reading taken before a restart landed mid-detection", async () => {
+    let persona: Persona = "v2-batch";
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let gated = true;
+    const calls = stubServer({
+      persona: () => persona,
+      legacyUiGate: async () => {
+        if (gated) await gate;
+      },
+    });
+
+    // A detection is parked holding the PRE-restart reading (legacy-UI) …
+    const inflight = downloadAModel();
+    while (!calls.some((c) => c.path === "/v2/manager/is_legacy_manager_ui")) {
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    // … while ComfyUI restarts with the upgraded Manager and the lifecycle fires.
+    persona = "v4";
+    resetManagerApiCache("comfyui restarted mid-detection");
+    gated = false;
+    release();
+    await expect(inflight).resolves.toMatchObject({ mechanism: "manager-http" });
+
+    // Dropping only the CACHE write is not enough: the parked reading must not be
+    // handed back to the caller either, or the mutation goes out on the dead
+    // dialect. The operation re-probed and enqueued on the live v4 route, and the
+    // stale 3.x route was never touched.
+    expect(countOf(calls, "/v2/manager/queue/task")).toBe(1);
+    expect(countOf(calls, "/v2/manager/queue/install_model")).toBe(0);
+  });
+
+  it("refuses to send anything when every detection is invalidated (restart storm)", async () => {
+    // ComfyUI is cycling: each probe is invalidated before it can answer, so every
+    // reading describes a server that is already gone. Handing the last one back
+    // would route a MUTATION on a dialect we know is stale — nothing has been sent
+    // yet at that point, so refusing costs nothing and is the only safe outcome.
+    const calls = stubServer({
+      persona: () => "v2-batch",
+      legacyUiGate: async () => {
+        resetManagerApiCache("comfyui restarted again");
+      },
+    });
+
+    await expect(downloadAModel()).rejects.toThrow(/kept being restarted[\s\S]*NOTHING was sent/i);
+
+    // It gave up after a bounded number of probes rather than spinning …
+    expect(detections(calls)).toBe(3);
+    // … and no enqueue was attempted on any dialect.
+    expect(countOf(calls, "/v2/manager/queue/install_model")).toBe(0);
+    expect(countOf(calls, "/v2/manager/queue/task")).toBe(0);
+    expect(countOf(calls, "/v2/manager/queue/start")).toBe(0);
+  });
+
+  it("still pins the #464 v2-batch demotion when a restart landed during detection", async () => {
+    // A build that serves the bundled 3.x server under /v2 but whose
+    // is_legacy_manager_ui probe does NOT identify it: detection says "v2", the
+    // unified task route 405s, and the batch fallback succeeds — that success is
+    // what pins "v2-batch" (#464). If the demotion is guarded on an epoch captured
+    // before DETECTION, a restart landing mid-probe vetoes it and every later op
+    // pays the dead /queue/task round trip again.
+    const calls: Call[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let gated = true;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+        const method = init?.method ?? "GET";
+        const body = init?.body ? JSON.parse(init.body as string) : undefined;
+        const path = new URL(url).pathname;
+        calls.push({ path, method, body });
+        if (path === "/v2/manager/queue/status") return jsonResponse(DRAINED);
+        if (path === "/v2/manager/is_legacy_manager_ui") {
+          if (gated) await gate;
+          // Unregistered → ComfyUI's SPA catchall, so the sub-dialect is unknown.
+          return new Response("<!doctype html><html>frontend</html>", {
+            status: 200,
+            headers: { "Content-Type": "text/html" },
+          });
+        }
+        if (path === "/v2/manager/queue/task") return new Response("405", { status: 405 });
+        if (path === "/v2/manager/queue/batch") return jsonResponse({ failed: [] });
+        return new Response("", { status: 200 });
+      }),
+    );
+
+    const inflight = updateCustomNode({ id: "pack-a" });
+    while (!calls.some((c) => c.path === "/v2/manager/is_legacy_manager_ui")) {
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    resetManagerApiCache("comfyui restarted mid-detection");
+    gated = false;
+    release();
+    await expect(inflight).resolves.toMatchObject({ mechanism: "manager-http" });
+
+    // The batch enqueue SUCCEEDED, so the corrected dialect must be pinned even
+    // though a reset landed while the detection was probing …
+    expect(getCachedManagerApi(BASE)).toBe("v2-batch");
+    // … and the next operation therefore skips the dead task route entirely.
+    calls.length = 0;
+    await updateCustomNode({ id: "pack-b" });
+    expect(countOf(calls, "/v2/manager/queue/task")).toBe(0);
+    expect(countOf(calls, "/v2/manager/queue/batch")).toBe(1);
   });
 
   it("drops a detection that completed across an invalidation (in-flight restart)", async () => {
@@ -465,12 +656,16 @@ describe("#646 Manager API dialect cache invalidation", () => {
     await inflight;
 
     // The parked detection concluded AFTER the invalidation, so its verdict
-    // described a server that may no longer be there and must NOT be pinned over
-    // the reset — it left the cache EMPTY. The next operation therefore probes
-    // again; without the epoch guard the stale verdict would have been re-pinned
-    // and this call served from cache with no probe at all.
+    // described a server that may no longer be there: it is neither pinned nor
+    // returned. The operation therefore probed a SECOND time before enqueueing —
+    // without the epoch guard the stale verdict would have been kept and one
+    // detection would have sufficed.
+    expect(detections(calls)).toBe(2);
+
+    // The second (post-reset) reading IS pinned, so the next call is served from
+    // cache rather than probing forever.
     calls.length = 0;
     await downloadAModel();
-    expect(detections(calls)).toBe(1);
+    expect(detections(calls)).toBe(0);
   });
 });
