@@ -9,6 +9,11 @@ import { ProcessControlError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { findComfyuiPython } from "./env-capabilities.js";
 import { resetManagerApiCache } from "./manager-api-cache.js";
+import { parseListenerPidFromNetstat, findPidByPort } from "./port-owner.js";
+import {
+  recordLaunchedInterpreter,
+  clearLaunchedInterpreter,
+} from "./live-interpreter.js";
 import {
   liveRootFromArgv,
   resolveEffectiveComfyUIBase,
@@ -115,90 +120,10 @@ let supervisorGaveUp = false;
 
 const IS_WIN = platform() === "win32";
 
-/**
- * Parse a `netstat -ano` blob and return the PID that OWNS the socket bound to
- * `port` on the LOCAL address column. Locale-independent by design (issue #449):
- * we anchor on the local-address `:PORT` suffix rather than grepping the state
- * word ("LISTENING"), which is TRANSLATED on non-English Windows (German
- * "ABHÖREN", French "À L'ÉCOUTE", …). The old `findstr LISTENING` filter dropped
- * every line on those systems, so a perfectly reachable ComfyUI looked like "no
- * process on port". Anchoring on the local column also correctly IGNORES an
- * outbound/established connection whose REMOTE peer happens to use `:PORT`.
- *
- * Exported for tests: this pure function is where the bug lived.
- */
-export function parseListenerPidFromNetstat(
-  output: string,
-  port: number,
-): number | null {
-  const suffix = `:${port}`;
-  for (const raw of output.split(/\r?\n/)) {
-    const line = raw.trim();
-    if (!line) continue;
-    const parts = line.split(/\s+/);
-    // Expected columns: PROTO LOCAL FOREIGN STATE PID
-    if (parts.length < 5) continue;
-    if (parts[0].toUpperCase() !== "TCP") continue;
-    const local = parts[1];
-    const foreign = parts[2];
-    // The leading colon anchors the match: "…:8188" matches but "…:81880" and
-    // "…:18188" do not (their last chars aren't ":8188").
-    if (!local.endsWith(suffix)) continue;
-    // Require a LISTENING row without depending on the localized state word: a
-    // listener's foreign endpoint is always the wildcard port 0 (0.0.0.0:0 /
-    // [::]:0). This rejects an ESTABLISHED connection that merely bound its
-    // local side to :PORT — killing that would take down the wrong process
-    // (or none) when ComfyUI is actually down.
-    if (!foreign.endsWith(":0")) continue;
-    const pid = parseInt(parts[parts.length - 1], 10);
-    if (!Number.isNaN(pid) && pid > 0) return pid;
-  }
-  return null;
-}
-
-function findPidByPort(port: number): number | null {
-  if (IS_WIN) {
-    // Parse `netstat -ano` ourselves instead of piping through
-    // `findstr LISTENING` — that state word is localized and made detection fail
-    // on non-English Windows even when ComfyUI was reachable (issue #449).
-    try {
-      const out = execSync(`netstat -ano -p TCP`, {
-        encoding: "utf-8",
-        timeout: 5000,
-      });
-      const pid = parseListenerPidFromNetstat(out, port);
-      if (pid) return pid;
-    } catch {
-      // netstat unavailable / failed — fall through to the PowerShell probe.
-    }
-    // Fallback: Get-NetTCPConnection maps port→owning PID structurally, with no
-    // dependence on console locale or column layout. Belt-and-suspenders for the
-    // portable/embedded-Python launch shape reported in #449.
-    try {
-      const out = execSync(
-        `powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty OwningProcess"`,
-        { encoding: "utf-8", timeout: 8000 },
-      ).trim();
-      const pid = parseInt(out, 10);
-      if (!Number.isNaN(pid) && pid > 0) return pid;
-    } catch {
-      // PowerShell unavailable / nothing listening.
-    }
-    return null;
-  }
-
-  try {
-    const out = execSync(`lsof -ti :${port}`, {
-      encoding: "utf-8",
-      timeout: 5000,
-    }).trim();
-    const pid = parseInt(out.split("\n")[0], 10);
-    if (!isNaN(pid) && pid > 0) return pid;
-  } catch {
-    // Command failed — no process on that port
-  }
-  return null;
-}
+// parseListenerPidFromNetstat / findPidByPort now live in port-owner.ts so the
+// live-interpreter resolver can use them without importing this module (which would
+// cycle through workspace-env). Re-exported here: this is still their public home.
+export { parseListenerPidFromNetstat, findPidByPort };
 
 /**
  * Find PIDs of the Desktop app's Electron shell — current branding
@@ -554,6 +479,9 @@ function adoptLaunchedChild(child: ChildProcess, interpreter: string | undefined
     if (recordedLaunchChild !== child) return;
     recordedLaunchChild = undefined;
     resetLocalComfyUILaunchState();
+    // Same fail-closed reasoning for the recorded interpreter: once our child is
+    // gone, a successor on that port may run a DIFFERENT python (#401).
+    clearLaunchedInterpreter();
   };
   child.once("exit", clearIfCurrent);
   child.once("error", clearIfCurrent);
@@ -573,19 +501,22 @@ function spawnFromProcessInfo(info: ProcessInfo): SpawnedComfyUI | null {
 
   const cmd = resolveLaunchCommand(info);
   if (!cmd) return null;
-  return {
-    child: spawn(cmd.exe, cmd.args, {
-      detached: true,
-      stdio: "ignore",
+  const child = spawn(cmd.exe, cmd.args, {
+    detached: true,
+    stdio: "ignore",
     // Prefer the cwd the command resolved against (the live process cwd for a
     // relative-script relaunch, #535); only then the configured install dir. A
     // stale/nonexistent config.comfyuiPath as cwd would ENOENT the spawn.
     cwd: cmd.cwd ?? config.comfyuiPath ?? undefined,
     shell: false,
-      windowsHide: true,
-    }),
-    interpreter: cmd.exe,
-  };
+    windowsHide: true,
+  });
+  // GROUND TRUTH for #401: we chose this interpreter, so we KNOW which python the
+  // server runs — no layout inference required. Keyed to the PID so it is discarded
+  // the moment a different process owns the port. (Desktop-app launches return
+  // above: that exe is a launcher, not an interpreter.)
+  if (child.pid) recordLaunchedInterpreter(child.pid, cmd.exe);
+  return { child, interpreter: cmd.exe };
 }
 
 /**
@@ -1038,8 +969,11 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
   detachSupervisor();
   // The server we may have launched is going away — clear the shares-our-env flag so
   // a differently-launched successor doesn't inherit env-trust it shouldn't (#633 P1b).
+  // Forget the recorded interpreter too: a stop was requested, so the launch record
+  // must not outlive the process it describes (#401).
   recordedLaunchChild = undefined;
   resetLocalComfyUILaunchState();
+  clearLaunchedInterpreter();
 
   // Gather info before we kill it (or reuse the caller's pre-validated info so a
   // relaunch preflight in restartComfyUI is not discarded).
@@ -1171,7 +1105,7 @@ export async function startComfyUI(): Promise<StartResult> {
     // failed spawn (ERROR): a successor server that later takes the port may have a
     // DIFFERENT env, so it must NOT inherit our trust (#633 P1b stale-flag). Fail
     // closed the moment we no longer own the process (`error` covers the spawn_error
-    // path where `exit` may not fire).
+    // path where `exit` may not fire). adoptLaunchedChild wires both handlers.
   }
 
   // A NEW server instance is coming up on this port — whatever Manager dialect we

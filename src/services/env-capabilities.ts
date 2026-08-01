@@ -21,7 +21,8 @@ import { join } from "node:path";
 import { comfyuiFetch } from "../comfyui/fetch.js";
 import { platform, release, totalmem, cpus } from "node:os";
 import { isForceRemoteFlagSet } from "../config.js";
-import { resolveComfyuiPython } from "./workspace-env.js";
+import { resolveComfyuiPython, pythonVersionsAgree } from "./workspace-env.js";
+import { resolveLiveInterpreter } from "./live-interpreter.js";
 import { parsePyproject } from "./node-authoring.js";
 
 // The interpreter resolver lives in workspace-env (which owns ComfyUI-base
@@ -184,6 +185,18 @@ async function probeManagerGeneration(
 /** Is the COMFYUI_URL host loopback? → LOCAL, else REMOTE. Unknown URL → LOCAL
  *  (the panel's overwhelming default; never block on an unparseable URL).
  *  --force-remote overrides this, keeping it in sync with isRemoteMode(). */
+/** The TCP port of a ComfyUI base URL (defaulting by scheme), or undefined. */
+function portFromUrl(url: string | undefined): number | undefined {
+  if (!url) return undefined;
+  try {
+    const u = new URL(url);
+    if (u.port) return Number(u.port);
+    return u.protocol === "https:" ? 443 : 80;
+  } catch {
+    return undefined;
+  }
+}
+
 function classifyLocation(url: string | undefined): "LOCAL" | "REMOTE" {
   if (!url) return "LOCAL";
   if (isForceRemoteFlagSet()) return "REMOTE";
@@ -336,12 +349,7 @@ export function findComfyuiPython(
 export function probeTritonSage(
   pythonExe: string | undefined,
   timeoutMs = 5000,
-): Promise<{
-  triton: TriState;
-  sageattention: TriState;
-  pythonVersion?: string;
-  torchVersion?: string;
-}> {
+): Promise<{ triton: TriState; sageattention: TriState; pythonVersion?: string }> {
   return new Promise((resolve) => {
     if (!pythonExe) {
       resolve({ triton: "unknown", sageattention: "unknown" });
@@ -352,20 +360,14 @@ export function probeTritonSage(
     // the interpreter's own major.minor so the caller can confirm we probed the
     // SAME python the running ComfyUI reports (#401 — a mismatch means we're
     // looking at the wrong environment and any negative is untrustworthy).
-    // Also report torch's version — read from package METADATA (never `import torch`,
-    // which would cost seconds) so the caller can tell a location-established
-    // interpreter whose CONTENTS contradict the running server from the real thing.
-    const code = [
-      "import importlib.util as u, sys",
-      "print('python', '%d.%d' % sys.version_info[:2])",
-      "try:",
-      "    from importlib.metadata import version as _v",
-      "    print('torch', _v('torch'))",
-      "except Exception:",
-      "    pass",
-      "print('triton', u.find_spec('triton') is not None)",
-      "print('sageattention', u.find_spec('sageattention') is not None)",
-    ].join("\n");
+    // Print the FULL `sys.version` banner (single line) — the same string
+    // /system_stats reports — so the caller can spot a build/compiler disagreement,
+    // not just a major.minor one (#401 review).
+    const code =
+      "import importlib.util as u,sys;" +
+      "print('python', ' '.join(sys.version.split()));" +
+      "print('triton', u.find_spec('triton') is not None);" +
+      "print('sageattention', u.find_spec('sageattention') is not None)";
     let done = false;
     const child = execFile(
       pythonExe,
@@ -385,16 +387,14 @@ export function probeTritonSage(
           if (!m) return "unknown";
           return m[1] === "True" ? "installed" : "not-installed";
         };
-        const pyMatch = out.match(/^python\s+(\d+\.\d+)/m);
-        const torchMatch = out.match(/^torch\s+(\S+)/m);
+        const pyMatch = out.match(/^python\s+(.+)$/m);
         // If python ran but errored AFTER printing partial output, still trust
         // whatever lines we got; missing lines stay "unknown".
         void err;
         resolve({
           triton: read("triton"),
           sageattention: read("sageattention"),
-          pythonVersion: pyMatch ? pyMatch[1] : undefined,
-          torchVersion: torchMatch ? torchMatch[1] : undefined,
+          pythonVersion: pyMatch ? pyMatch[1].trim() : undefined,
         });
       },
     );
@@ -420,36 +420,32 @@ export function probeTritonSage(
 export function reconcileProbeState(
   state: TriState | undefined,
   opts: {
-    proven: boolean;
+    /** We OBSERVED which interpreter the server runs (we launched it, or the OS told
+     *  us) — see live-interpreter.ts. Layout inference does NOT count. */
+    observed: boolean;
     runningPython?: string;
     probePython?: string;
-    runningTorch?: string;
-    probeTorch?: string;
   },
 ): TriState {
   const s = state ?? "unknown";
+  // Compares the FULL `sys.version` banner when both sides carry one (build date and
+  // compiler included), degrading to the dotted version at whatever precision both
+  // supply. A CONTRADICTION check only — cloned venvs report identical banners.
   const versionMismatch = !!(
     opts.runningPython &&
     opts.probePython &&
-    opts.runningPython !== opts.probePython
+    !pythonVersionsAgree(opts.runningPython, opts.probePython)
   );
-  // `proven` establishes WHERE the interpreter is, not that its CONTENTS are the
-  // running server's. A torch build that disagrees with what the server reports proves
-  // they are different environments no matter how right the location looked, so its
-  // negatives must not stand either.
-  const torchMismatch = !!(
-    opts.runningTorch &&
-    opts.probeTorch &&
-    opts.runningTorch.trim() !== opts.probeTorch.trim()
-  );
-  // `proven` (from resolveComfyuiPython) is the ONLY licence to state a negative: the
-  // sole interpreter under the install root the running server named in its own argv.
-  // Everything softer — a bare PATH fallback, a different workspace, a root INFERRED by
-  // anchoring a relative argv, or a root holding several candidate environments — is a
-  // guess about WHICH python ComfyUI runs, and a wrong guess is exactly what produced
-  // the false "Triton: not installed" that made an agent disable working acceleration
-  // (#401). Those degrade to "unknown"; positives always pass through untouched.
-  const trustworthy = opts.proven && !versionMismatch && !torchMismatch;
+  // Only an OBSERVED interpreter may state a negative. Nothing inferred from install
+  // layout qualifies, however plausible: a sole .venv under the server's own root, a
+  // matching python, a matching torch build — all of those are satisfied by a sibling
+  // environment that is not the one ComfyUI is running, and a wrong guess is exactly
+  // what produced the false "Triton: not installed" that made an agent strip working
+  // acceleration (#401). Everything else degrades to "unknown".
+  //
+  // The asymmetry is deliberate: positives ALWAYS pass through. A package we can see
+  // installed is really installed, whichever environment we happened to look at.
+  const trustworthy = opts.observed && !versionMismatch;
   return s === "not-installed" && !trustworthy ? "unknown" : s;
 }
 
@@ -538,6 +534,10 @@ export interface GatherOptions {
   mcpVersion?: string;
   /** Sidebar panel version, learned from the panel's `hello` frame. */
   panelVersion?: string;
+  /** Port the connected ComfyUI listens on — used to find the server PROCESS and read
+   *  the interpreter it is actually running (#401). Defaults to the port in
+   *  `comfyuiUrl`, which is the live target and may change at runtime. */
+  port?: number;
   /** Override probe timeouts (tests). */
   statsTimeoutMs?: number;
   tritonTimeoutMs?: number;
@@ -615,12 +615,14 @@ export async function gatherEnvCapabilities(opts: GatherOptions): Promise<EnvCap
   let statsArgv: string[] | undefined;
   let statsCwd: string | undefined;
   let statsEmbedded: boolean | undefined;
-  let statsTorchRaw: string | undefined;
+  // RAW sys.version banner — caps.python is truncated to major.minor for DISPLAY, so
+  // the contradiction check needs the untruncated string (#401 review).
+  let statsPythonRaw: string | undefined;
   if (stats) {
     applyStats(caps, stats);
     statsArgv = stats.system?.argv;
     statsCwd = stats.system?.cwd;
-    statsTorchRaw = stats.system?.pytorch_version?.trim() || undefined;
+    statsPythonRaw = stats.system?.python_version?.trim() || undefined;
     statsEmbedded =
       typeof stats.system?.embedded_python === "boolean"
         ? stats.system.embedded_python
@@ -641,46 +643,40 @@ export async function gatherEnvCapabilities(opts: GatherOptions): Promise<EnvCap
   // false negative and a false positive for the remote server. So skip the probe
   // entirely and rely solely on the ComfyUI-log positive markers below (#401 round 3).
   const remote = caps.location === "REMOTE";
-  let proven = false;
+  let observed = false;
   let ts: Awaited<ReturnType<typeof probeTritonSage>> | undefined;
   if (!remote) {
-    const resolved = resolveComfyuiPython(opts.comfyuiPath, statsArgv, {
-      cwd: statsCwd,
+    // GROUND TRUTH first (we launched it / the OS says so); otherwise probe the layout
+    // GUESS, whose positives are still real but whose negatives can never stand.
+    const live = resolveLiveInterpreter({
+      port: opts.port ?? portFromUrl(opts.comfyuiUrl) ?? 8188,
       remote,
-      embeddedPython: statsEmbedded,
     });
-    proven = resolved.proven;
+    observed = !!live;
+    const python =
+      live?.python ??
+      resolveComfyuiPython(opts.comfyuiPath, statsArgv, {
+        cwd: statsCwd,
+        remote,
+        embeddedPython: statsEmbedded,
+      }).python;
     const tritonTimeout = opts.tritonTimeoutMs ?? 5000;
-    ts = await withTimeout(probeTritonSage(resolved.python, tritonTimeout), tritonTimeout + 1000);
+    ts = await withTimeout(probeTritonSage(python, tritonTimeout), tritonTimeout + 1000);
   }
 
-  // Only trust a definitive "not-installed" when we probed the LIVE running server's
-  // OWN interpreter (#401). Otherwise it can be the WRONG python:
-  //   1. A bare PATH fallback (no on-disk venv/embedded interpreter found).
-  //   2. A different/persisted workspace that merely happens to have a venv — its
-  //      negative would still be a false report about the running instance.
-  //   3. Its major.minor disagrees with what /system_stats reports.
-  //   4. REMOTE mode — no local interpreter is the server's (probe skipped above).
-  //   5. An ANCHORED live root — inferred by re-anchoring a RELATIVE argv main.py on a
-  //      configured base (the ComfyUI Desktop shape) rather than read off the server's
-  //      own absolute argv path.
-  //   6. An AMBIGUOUS root holding several candidate environments (e.g. an in-root
-  //      `.venv` beside a bundle's `python_embeded`), where which one ComfyUI runs is
-  //      a guess.
-  // resolveComfyuiPython folds 1/2/4/5/6 into its `proven` flag.
-  // In each case a "not-installed" is untrustworthy, so we degrade it to "unknown"
-  // rather than emit a false negative that makes an agent disable working
-  // acceleration. A positive ("installed") is still reported — it can't be a false
+  // A definitive "not-installed" requires that we OBSERVED which interpreter the
+  // server runs (we launched it, or the OS told us) AND that it does not contradict
+  // the running instance's python. Everything else — a bare PATH fallback, a
+  // different workspace, a Desktop bundle whose layout we merely guessed at, or a
+  // REMOTE server we cannot observe at all — degrades to "unknown" rather than emit
+  // the false negative that made an agent disable working acceleration (#401).
+  // A positive ("installed") always passes through: it can't be a harmful false
   // negative, and the log-marker check below only ever reinforces a positive.
   const reconcile = (state: TriState | undefined): TriState =>
     reconcileProbeState(state, {
-      proven,
-      runningPython: caps.python,
+      observed,
+      runningPython: statsPythonRaw ?? caps.python,
       probePython: ts?.pythonVersion,
-      // RAW pytorch_version (caps.torch is cleaned of its +cuXXX build suffix, which is
-      // exactly the part that distinguishes two otherwise identical environments).
-      runningTorch: statsTorchRaw,
-      probeTorch: ts?.torchVersion,
     });
   caps.triton = reconcile(ts?.triton);
   caps.sageattention = reconcile(ts?.sageattention);
