@@ -97,4 +97,56 @@ describe("in-place workflow replacement resets the live session (#570 P0)", () =
 
     await manager.stopAll();
   });
+
+  it("P0a: a live agent in the spawn→first-session window (no durable record) is still torn down", async () => {
+    // The prior workflow can have a LIVE agent BEFORE its first `session` event — so no
+    // durable exact record exists yet. The identity-boundary reset gates on STATE
+    // (hasLiveAgent), not on a durable record, so this window is covered. Here we prove the
+    // precondition (live agent, no durable session) and that manager.reset tears it down.
+    class NoSessionBackend implements AgentBackend {
+      readonly id = "claude" as const;
+      readonly capabilities = CLAUDE_CAPABILITIES;
+      started = false;
+      release: (() => void) | null = null;
+      async *run(opts: BackendStartOptions): AsyncGenerator<AgentEvent> {
+        for await (const _turn of opts.channel) {
+          this.started = true;
+          // Hang the turn WITHOUT ever yielding a `session` event — the spawn→first-session
+          // window. (No `yield { type: "session" }`.)
+          await new Promise<void>((r) => {
+            this.release = r;
+          });
+        }
+      }
+      async interrupt(): Promise<void> {
+        this.release?.();
+      }
+      async listModels(): Promise<ModelChoice[]> {
+        return [];
+      }
+    }
+    const backend = new NoSessionBackend();
+    const store = new SessionStore(PORT);
+    const manager = new PanelAgentManager({
+      mcpServers: {},
+      systemAppend: "",
+      model: "claude-test",
+      onSay: () => {},
+      onTurn: () => {},
+      onSession: () => {},
+      sessionStore: store,
+      makeBackend: () => backend,
+      identityForKey: () => IDENTITY_A,
+    } as never);
+    const key = "wf:foo.json::claude";
+    manager.send(key, "hang without a session");
+    await waitFor(() => backend.started);
+    // The window: a LIVE agent, but NO durable session record yet.
+    expect(manager.hasLiveAgent(key)).toBe(true);
+    expect(store.get(key)).toBeUndefined();
+    // The identity-boundary branch (gated on hasLiveAgent, not the durable record) resets it.
+    manager.reset(key);
+    expect(manager.hasLiveAgent(key)).toBe(false);
+    await manager.stopAll();
+  });
 });

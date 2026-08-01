@@ -2514,6 +2514,12 @@ export async function runPanelOrchestrator(): Promise<void> {
           ? ((event as { workflow_uuid?: string }).workflow_uuid as string)
           : undefined;
       const newIdentity = workflowIdentityParts({ workflowUuid: helloUuid, origin: serverOrigin });
+      // #570 P0 — the tab's identity from its PRIOR hello, captured BEFORE the migration
+      // block / post-block overwrite of tabStableIdentity. For an IN-PLACE workflow
+      // replacement (same tab id, new uuid) this is the identity the tab's still-LIVE agent
+      // and queued work belong to — needed to reset them even before any durable session
+      // record exists (the spawn→first-session window).
+      const priorTabIdentity = tabStableIdentity.get(panelTab);
 
       if (migratedFrom && migratedFrom !== panelTab) {
         const prevBackend = tabBackends.get(migratedFrom) ?? backend;
@@ -2688,41 +2694,45 @@ export async function runPanelOrchestrator(): Promise<void> {
       // stable entry) so the new workflow starts fresh. Durable, so it holds across an
       // orchestrator restart too.
       {
-        // FAIL CLOSED at the identity boundary (#570 P0): an existing EXACT session record
-        // is trusted (kept + resumable) ONLY when PROVEN to belong to THIS workflow — the
-        // record carries a durable identity uuid (Entry.u) AND this hello carries a valid
-        // trusted identity AND they MATCH. Anything else is reset:
-        //   • DIFFERENT bound uuid → a SAVED workflow OVERWRITTEN in place (same wf:<path>
-        //     tab id, new uuid);
-        //   • record with NO binding → a pre-`u` v2 {s,t} or migrated legacy record — can't
-        //     tell whether an in-place replacement already happened;
-        //   • no trusted identity on this hello (old/degraded panel, no server origin) →
-        //     unprovable, and the path-keyed record + an unowned global hello.resume would
-        //     otherwise cross-resume a replaced workflow.
-        // Resetting costs at most a lost resume (one-time on upgrade for a bound record;
-        // per-reload for an identity-less client's SAVED workflow — unsaved tabs churn their
-        // tmp: id so nothing is stored under the reloaded key). A wrong-resume is worse.
-        // onSession re-stamps `u`, so a bound modern client's saved workflow proves out and
-        // is never reset. Runs BEFORE the resume-ownership check and spawn, so neither an
-        // unowned hello.resume nor spawn's exact-store hit can resume a stale session.
-        const boundIdentity = sessionStore.identityOf(key);
-        // The FULL canonical identity (origin+uuid) this hello proves — must equal the
-        // record's bound identity to keep it. Includes origin, so a copied uuid from a
-        // DIFFERENT origin on the same bridge port can't pass (codex).
+        // FAIL CLOSED at the identity boundary (#570 P0). ALL of a tab's per-tab state —
+        // the LIVE agent, its pending resume + held mail, the durable session, AND the
+        // external render-held queue (heldDuringGen) — is trusted (kept) ONLY when the
+        // identity it belongs to PROVABLY matches this hello's identity. Otherwise it is a
+        // workflow REPLACED in place (same tab id, new uuid), a degraded/unbound record, or
+        // a copied uuid from a different origin — TEAR IT ALL DOWN so the new workflow can't
+        // inherit the old one's private conversation.
+        //
+        // Gate on STATE, not on a durable record: a LIVE agent exists in the spawn→first-
+        // session window BEFORE any durable session is written (P0a), and render-held work
+        // can be queued with no session at all (P0b) — both would otherwise leak into the
+        // replacement. The identity the state belongs to is the durable binding (Entry.u),
+        // else the tab's identity from its PRIOR hello (captured before we overwrote it) —
+        // which is how the no-durable-record live-agent window is covered.
+        //
+        // "Both sides have NO identity" counts as PROVEN (no transition): an identity-less
+        // client (no trusted server origin — never had the uuid boundary) is not torn down
+        // on every hello, which would break its ongoing conversation. Closing the in-place
+        // overwrite for such clients is impossible without that breakage — a client-capability
+        // limitation, disclosed. A MODERN client whose record is unbound (pre-`u`/legacy) still
+        // resets: its hello carries an identity, so identity(state)=undefined ≠ identity(hello).
         const helloIdentity = newIdentity ? `${newIdentity.origin}::${newIdentity.uuid}` : undefined;
-        const hasExact = sessionStore.get(key) !== undefined;
-        const provenOwn =
-          hasExact && boundIdentity !== undefined && helloIdentity !== undefined && boundIdentity === helloIdentity;
-        if (hasExact && !provenOwn) {
-          // FULL session boundary — reset the LIVE agent too, not just the disk record.
-          // manager.reset() stops the mapped agent (whose backend still holds the PRIOR
-          // workflow's session), clears its pendingResume + held mail, AND the durable
-          // exact session. Without this, manager.send would reuse that live agent. (The
-          // overwritten workflow's own stable entry, if any, is keyed by ITS uuid and
-          // stays valid should that workflow ever be restored — nothing to clear here.)
+        const stateIdentity =
+          sessionStore.identityOf(key) ??
+          (priorTabIdentity ? `${priorTabIdentity.origin}::${priorTabIdentity.uuid}` : undefined);
+        const heldGenKeys = [...heldDuringGen.keys()].filter((hk) => panelTabOf(hk) === panelTab);
+        const hasState =
+          manager.hasLiveAgent(key) || sessionStore.get(key) !== undefined || heldGenKeys.length > 0;
+        if (hasState && stateIdentity !== helloIdentity) {
+          // FULL session boundary. manager.reset() stops the mapped agent (whose backend
+          // still holds the PRIOR workflow's session), clears its pending resume + held
+          // mail, AND the durable exact session. Then cancel the render-held queue for
+          // this tab across ALL providers, or onRunEnd would flush A's private messages
+          // into the replacement B under the reused key. (The old workflow's own stable
+          // entry, keyed by ITS uuid, stays valid should it ever be restored.)
           manager.reset(key);
+          for (const hk of heldGenKeys) heldDuringGen.delete(hk);
           logger.info(
-            `[panel-orchestrator] tab ${panelTab.slice(0, 8)} exact session not provably this workflow's identity — reset the live agent and cleared the stale session`,
+            `[panel-orchestrator] tab ${panelTab.slice(0, 8)} per-tab state not provably this workflow's identity — reset the live agent + durable session + render-held queue`,
           );
         }
       }
