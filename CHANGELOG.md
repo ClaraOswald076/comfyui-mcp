@@ -6,6 +6,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+### Fixed
+- **A mutating panel command names the rebind recovery when it can't reach a tab (panel #442, defect 4).** `panel_set_widget` (and every other mutating `panel_*` edit deliberately excluded from the retry-safe set) surfaced the bare bridge error — `no connected tab … Connected: none` — with no recovery path, whereas a retry-safe read like `panel_get_errors` already names the rebind. That asymmetry made a brief post-reconnect read/edit-channel disagreement (a user hit it ~6× in a long multi-tab session, while `panel_list_workflows` kept answering) look like a dead agent. The bridge now tags a pre-dispatch routing refusal with its authoritative typed `dispatched:false` flag, so the tool layer wraps it — without retrying (no double-apply) — to state nothing was applied and name `panel_set_workflow_target({mode:"current"})`, preserving the raw cause. Keying on the typed flag (not error text) means a post-dispatch executor failure that merely quotes "no connected tab" is never mis-classified. The strict-single silent auto-heal still recovers the ordinary single-tab case untouched.
+
 ## [0.48.26] - 2026-08-01
 
 ### Fixed

@@ -226,6 +226,74 @@ describe("UiBridge (mailbox — offline render delivery)", () => {
   });
 });
 
+describe("UiBridge (typed dispatch outcome — panel #442 defect 4)", () => {
+  // Reply to any command with an executor FAILURE (ok:false). Mirrors a panel-side
+  // graph executor rejecting — the bridge turns it into a plain Error with NO typed
+  // dispatch flag, so a caller must NOT treat it as a pre-dispatch "nothing applied".
+  function replyError(sock: WebSocket, errorText: string): void {
+    sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd) sock.send(JSON.stringify({ rid: msg.rid, ok: false, error: errorText }));
+    });
+  }
+
+  it("a resolveTarget refusal (no connected tab) rejects with dispatched:false", async () => {
+    // No panel connected; a non-mailboxable (interactive) command can't be routed.
+    let caught: unknown;
+    await bridge.send({ cmd: "graph_set_widget" }, { tabId: "ghost-tab" }).catch((e) => (caught = e));
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toMatch(/no connected tab with id "ghost-tab"/);
+    // THE contract the #442 wrapper keys on: this is provably pre-dispatch (nothing sent).
+    expect(dispatchOutcomeOf(caught)).toBe(false);
+  });
+
+  it("lists the actually-connected tabs (not 'none') when OTHER tabs are live — still dispatched:false", async () => {
+    const a = await connectPanel("tab-live-1111", "flux-workflow");
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    let caught: unknown;
+    await bridge.send({ cmd: "graph_set_widget" }, { tabId: "gone-tab" }).catch((e) => (caught = e));
+    // Faithful message: the routing error names the live tab, proving the multi-tab
+    // read/edit-channel disagreement (#442) — panel_list_workflows would still answer.
+    expect((caught as Error).message).toMatch(/Connected:.*flux-workflow/);
+    expect(dispatchOutcomeOf(caught)).toBe(false);
+    a.close();
+  });
+
+  it("a real executor ok:false failure carries NO typed flag (dispatchOutcomeOf === undefined)", async () => {
+    // The tab IS connected and DID receive the command — its executor merely failed, with
+    // an error string that even QUOTES the routing phrase. The wrapper must never treat
+    // this as "nothing applied": the flag is absent, not false.
+    const a = await connectPanel("tab-exec-1111");
+    replyError(a, 'graph_set_widget failed: stale ref to "no connected tab" in cache');
+    await vi.waitFor(() => expect(bridge.connected()).toBe(true));
+    let caught: unknown;
+    await bridge.send({ cmd: "graph_set_widget" }, { tabId: "tab-exec-1111" }).catch((e) => (caught = e));
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain("stale ref");
+    expect(dispatchOutcomeOf(caught)).toBeUndefined(); // NOT false — it WAS dispatched
+    a.close();
+  });
+
+  it("a mailboxable delivery to an offline tab RESOLVES (never a dispatched:false rejection)", async () => {
+    // The offline-render mailbox path returns a resolved value, so it never acquires a
+    // dispatch flag — the #442 wrapper only ever sees genuine rejections.
+    const res = await bridge.send(
+      { cmd: "show_media", items: [{ filename: "a.png" }] },
+      { tabId: "offline-phone-1" },
+    );
+    expect(res).toMatchObject({ ok: true, mailboxed: true });
+  });
+
+  it("a successfully-acked command resolves (no dispatch flag involved)", async () => {
+    const a = await connectPanel("tab-ok-1111");
+    autoReply(a, "A");
+    await vi.waitFor(() => expect(bridge.connected()).toBe(true));
+    const result = await bridge.send({ cmd: "graph_set_widget" }, { tabId: "tab-ok-1111" });
+    expect(result).toMatchObject({ from: "A" });
+    a.close();
+  });
+});
+
 describe("UiBridge (multi-tab)", () => {
   it("routes to the single connected tab without tab_id", async () => {
     const a = await connectPanel("tab-aaaa-1111");

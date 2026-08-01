@@ -1865,6 +1865,35 @@ export function makePanelToolCtx(
           return fail(err2);
         }
       }
+      // #442 defect 4: a MUTATING command (deliberately excluded from RETRY_SAFE_CMDS)
+      // that the bridge refused BEFORE any socket write surfaced the bare routing error
+      // ("no connected tab … Connected: none") with no recovery path — whereas a
+      // retry-safe read like graph_get_errors, via the branch above, names the rebind.
+      // That asymmetry made a brief post-reconnect read/edit-channel disagreement look
+      // like a dead agent (panel_list_workflows kept answering while panel_set_widget
+      // failed, in a multi-tab session the strict-single silent auto-heal won't touch).
+      // We must NOT retry the mutating command (double-apply risk), but the bridge's
+      // AUTHORITATIVE typed flag proves nothing was dispatched (dispatchOutcomeOf ===
+      // false) — so it is safe to state nothing was applied and name the rebind recovery,
+      // preserving the raw cause. Keying on the TYPED flag (not error text) means a
+      // POST-dispatch executor ok:false reply that merely quotes "no connected tab" is
+      // never mis-wrapped as "nothing applied".
+      if (dispatchOutcomeOf(err) === false) {
+        const name = typeof cmd.cmd === "string" ? cmd.cmd : "panel command";
+        // Neutral wording: a dispatched:false flag proves only that the command was NOT
+        // dispatched — it can be a routing refusal (the bound tab is gone / reconnecting),
+        // an ambiguous-or-multiple-tab resolver refusal (other tabs DO exist), or a socket
+        // write failure. All share the same TRUE facts (nothing applied) and the same
+        // recovery (rebind onto the tab that's live now); the raw cause carries the
+        // specifics. Do NOT overstate "disconnected", which is false for the ambiguity case.
+        return fail(
+          `${name} could not be dispatched to this session's panel tab — nothing was applied. ` +
+            `The tab may be disconnected, still reconnecting after a restart/reload, or the ` +
+            `session's binding is stale (e.g. another workflow tab is now active). Retry in a ` +
+            `moment, or rebind with panel_set_workflow_target({mode:"current"}) to follow the ` +
+            `tab that's live now. (${err instanceof Error ? err.message : String(err)})`,
+        );
+      }
       return fail(err);
     }
   };
