@@ -166,6 +166,22 @@ describe("auth.json records", () => {
     expect(piCredentialPresent(tmp, bareEnv({ OPENAI_API_KEY: "sk" }))).toBe(true);
   });
 
+  it("stored-record ownership follows JS truthiness", () => {
+    // `{}` and `[]` are TRUTHY in JS, so they DO own the provider (pi suppresses
+    // ambient auth); null/false/0 do not. The panel's Python mirror has to match
+    // this explicitly, since Python's own truthiness differs for `{}`/`[]`.
+    for (const [body, ready] of [
+      ['{"openai":{}}', false],
+      ['{"openai":[]}', false],
+      ['{"openai":null}', true],
+      ['{"openai":false}', true],
+      ['{"openai":0}', true],
+    ] as const) {
+      writePiFile(tmp, "auth.json", body);
+      expect(piCredentialPresent(tmp, bareEnv({ OPENAI_API_KEY: "sk" })), body).toBe(ready);
+    }
+  });
+
   it("a stored google-vertex record suppresses ambient ADC too", () => {
     const keyFile = join(tmp, "sa.json");
     writeFileSync(keyFile, "{}");
@@ -195,6 +211,28 @@ describe("auth.json records", () => {
     expect(piCredentialPresent(tmp, bareEnv())).toBe(false);
     expect(piCredentialPresent(tmp, bareEnv({ PI_CODING_AGENT_DIR: alt }))).toBe(true);
     expect(piCredentialPresent(tmp, bareEnv({ PI_CODING_AGENT_DIR: "~/alt-config" }))).toBe(true);
+    // A RELATIVE override resolves against PI's cwd, which we cannot know — so
+    // the file-backed sources are unreadable rather than probed against OUR cwd.
+    expect(piCredentialPresent(tmp, bareEnv({ PI_CODING_AGENT_DIR: "alt-config" }))).toBe(false);
+    // …env credentials are unaffected by an unresolvable config dir.
+    expect(
+      piCredentialPresent(tmp, bareEnv({ PI_CODING_AGENT_DIR: "alt-config", XAI_API_KEY: "sk" })),
+    ).toBe(true);
+  });
+
+  it("a stored cloudflare record still needs its account id", () => {
+    writePiFile(tmp, "auth.json", '{"cloudflare-workers-ai":{"type":"api_key","key":"k"}}');
+    expect(piCredentialPresent(tmp, bareEnv())).toBe(false);
+    // …supplied either by the record's own env block…
+    writePiFile(
+      tmp,
+      "auth.json",
+      '{"cloudflare-workers-ai":{"type":"api_key","key":"k","env":{"CLOUDFLARE_ACCOUNT_ID":"a"}}}',
+    );
+    expect(piCredentialPresent(tmp, bareEnv())).toBe(true);
+    // …or by the environment.
+    writePiFile(tmp, "auth.json", '{"cloudflare-workers-ai":{"type":"api_key","key":"k"}}');
+    expect(piCredentialPresent(tmp, bareEnv({ CLOUDFLARE_ACCOUNT_ID: "a" }))).toBe(true);
   });
 
   it("an env-interpolated key naming a STRIPPED var is NOT a credential", () => {
@@ -421,6 +459,17 @@ describe("models.json", () => {
     expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(true);
     // minLength 1 accepts a SPACE — trimming here would false-red a config pi loads.
     writePiFile(tmp, "models.json", '{"providers":{"good":{"apiKey":"sk"},"ok":{"name":" "}}}');
+    expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(true);
+  });
+
+  it("a WRONG-TYPED or bad-headers provider field invalidates the file", () => {
+    // pi's schema types these; a violation discards the file, so the sibling's
+    // good key never reaches pi either.
+    writePiFile(tmp, "models.json", '{"providers":{"good":{"apiKey":"x"},"bad":{"apiKey":1}}}');
+    expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(false);
+    writePiFile(tmp, "models.json", '{"providers":{"p":{"apiKey":"x","headers":{"X-T":1}}}}');
+    expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(false);
+    writePiFile(tmp, "models.json", '{"providers":{"p":{"apiKey":"x","headers":{"X-T":"1"}}}}');
     expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(true);
   });
 
