@@ -25,8 +25,8 @@
 
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { extname, isAbsolute, join, resolve } from "node:path";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { extname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { comfyuiFetch } from "../comfyui/fetch.js";
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
@@ -34,7 +34,7 @@ import { parse as parseYaml } from "yaml";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { UiBridge } from "../services/ui-bridge.js";
-import { dispatchOutcomeOf } from "../services/ui-bridge.js";
+import { dispatchOutcomeOf, isPanelCmdUnsupportedError } from "../services/ui-bridge.js";
 import {
   type WorkflowTargetStore,
   withWorkflowTarget,
@@ -1507,10 +1507,37 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
     | { kind: "refused"; detail: string } // non-404 HTTP error → error, no fallback
     | { kind: "absent"; detail: string } // 404 → local fallback allowed
     | { kind: "unreachable"; detail: string }; // transport failure → local fallback allowed
+  // #414: panel_list_workflows reports each workflow's userdata STORE KEY, which
+  // already carries the "workflows/" prefix (e.g. "workflows/Daily Anime.json").
+  // Feeding that exact value back here double-prefixed it to
+  // "workflows/workflows/Daily Anime.json" → a 404 → the local fallback missed too
+  // → "No workflow file at …", even though it is the documented list output. Strip
+  // one leading "workflows/" segment so the list key, a bare name, and a subfolder
+  // path all normalize to the same store-relative name. (A genuinely absolute path
+  // — including a Windows leading-slash path — was already handled and returned
+  // above, so it never reaches this relative-name normalization.)
+  const rel = p.replace(/^[\\/]+/, "").replace(/^workflows[\\/]+/i, "");
+  // Refuse traversal / drive-relative escapes (codex): a real workflow name is a
+  // plain relative path whose segments are filenames/subfolders. Stripping the
+  // "workflows/" prefix must never turn the input into something that ESCAPES the
+  // workflows root — both in the userdata key sent to the server and in the local
+  // resolve(dir, rel) fallback. Reject a ".." segment ("workflows/../secret.json")
+  // and a Windows DRIVE-RELATIVE segment ("C:..", "C:foo", which resolve()
+  // canonicalizes with drive semantics past a plain ".."-segment check). A colon
+  // ELSEWHERE is a legal POSIX filename char (e.g. "style:anime.json"), so match
+  // only a leading drive-letter form — not every colon. The realpath containment
+  // check below is the authoritative backstop for the local read regardless.
+  const relSegs = rel.split(/[\\/]+/);
+  if (relSegs.includes("..") || relSegs.some((s) => /^[A-Za-z]:/.test(s))) {
+    throw new Error(
+      `"${p}" is not a valid workflow name — pass a name relative to the ComfyUI ` +
+        `workflows folder (no "..", drive letters, or absolute paths), or an absolute path.`,
+    );
+  }
   let outcome: Outcome;
   try {
     const client = getClient();
-    const encoded = encodeURIComponent(`workflows/${p.replace(/^[\\/]+/, "")}`);
+    const encoded = encodeURIComponent(`workflows/${rel}`);
     const res = await client.fetchApi(`/api/userdata/${encoded}`);
     if (res.ok) {
       // Read the body as TEXT and classify HERE so a malformed 2xx surfaces its
@@ -1559,11 +1586,29 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
   // orchestrator's guessed local workflows dirs (best-effort; only meaningful on
   // a same-machine ComfyUI whose user-dir matches the default layout, or a file
   // staged straight to disk).
-  const localCandidates = [
-    ...comfyWorkflowsDirs().map((dir) => resolve(dir, p)),
-    resolve(process.cwd(), p), // orchestrator CWD as a last local resort
-  ];
-  const local = localCandidates.find((c) => existsSync(c) && statSync(c).isFile());
+  // Each candidate is the store-relative name resolved UNDER a base dir. Only the
+  // NORMALIZED `rel` is used (never the raw `workflows/…` key), so nothing nests a
+  // second workflows/ (codex P1/P2). Belt-and-suspenders containment: an existing
+  // candidate is only accepted if its REAL path (symlinks/junctions resolved)
+  // stays beneath the base's REAL path — so a link under the workflows dir that
+  // targets an external directory can't be read on the 404/unreachable fallback
+  // (codex). Canonicalizing BOTH sides keeps a legitimately-symlinked workflows
+  // dir working (its base resolves too), while blocking a per-file escape.
+  const realBaseUnder = (base: string, candidate: string): boolean => {
+    try {
+      const rb = realpathSync(base);
+      const rc = realpathSync(candidate);
+      return rc === rb || rc.startsWith(rb + sep);
+    } catch {
+      return false;
+    }
+  };
+  const localBases = [...comfyWorkflowsDirs(), process.cwd()];
+  const local = localBases
+    .map((dir) => ({ dir, path: resolve(dir, rel) }))
+    .filter(({ path }) => existsSync(path) && statSync(path).isFile())
+    .filter(({ dir, path }) => realBaseUnder(dir, path))
+    .map(({ path }) => path)[0];
   if (local) return readLocal(local);
 
   throw new Error(
@@ -2127,13 +2172,19 @@ async function resolveWorkflowInput(
       timeoutMs: 30000,
     });
   } catch (err) {
-    // #384: a panel too old to register graph_serialize (added at 0.11.4) still
-    // answers the back-compat `graph_get_state`. On an "Unknown command" rejection
-    // ONLY (a genuine transport/timeout error must surface as-is), fall back to it
-    // and reconstruct the graph so "strip the live canvas" works without a
-    // save-to-disk round trip.
+    // #384: a panel too old to register graph_serialize (added at 0.8.2) still
+    // answers the back-compat `graph_get_state`. On an unsupported-command
+    // rejection ONLY (a genuine transport/timeout error must surface as-is), fall
+    // back to it and reconstruct the graph so "strip the live canvas" works
+    // without a save-to-disk round trip.
+    // #413: the bridge REWRITES the panel's raw "Unknown command" into a "too old
+    // for graph_serialize" message (reactive) or throws it proactively (#236) —
+    // both stripped the literal "unknown command" text, so the old
+    // /unknown command/ regex here NEVER matched and the fallback was silently
+    // skipped, surfacing the actionable error even though graph_get_state would
+    // have worked. Detect the condition structurally instead.
     const msg = err instanceof Error ? err.message : String(err);
-    if (allowStateFallback && /unknown command/i.test(msg)) {
+    if (allowStateFallback && isPanelCmdUnsupportedError(err, "graph_serialize")) {
       try {
         const target = ctx.workflowTarget?.get(ctx.tabId);
         const stateCmd = target

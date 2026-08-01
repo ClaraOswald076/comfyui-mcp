@@ -238,3 +238,144 @@ describe("panel_load_workflow: userdata fallback for a custom --user-directory (
     }
   });
 });
+
+// #414 — panel_list_workflows reports each workflow's userdata STORE KEY, which
+// already carries the "workflows/" prefix (e.g. "workflows/Daily Anime.json").
+// Feeding that exact value back to a path-taking tool (panel_strip_workflow /
+// panel_load_workflow share readWorkflowFromPath) double-prefixed the userdata
+// key → 404 → local miss → "No workflow file at …". The resolver must normalize
+// a leading "workflows/" so the list key resolves to the SAME single-prefixed key.
+describe("readWorkflowFromPath: a list-style 'workflows/…' path is not double-prefixed (#414)", () => {
+  it("resolves the userdata key WITHOUT nesting a second workflows/ segment", async () => {
+    const graph = { nodes: [{ id: 1, type: "KSampler" }], links: [] };
+    fetchApi.mockResolvedValue({ ok: true, status: 200, text: async () => JSON.stringify(graph) });
+
+    const { ctx, calls } = makeCtx();
+    const res = await loadWorkflow().handler(
+      { path: "workflows/Daily Anime Portrait - Fast Preview.json" },
+      ctx,
+    );
+
+    expect(res.isError).toBeUndefined();
+    expect(fetchApi).toHaveBeenCalledWith(
+      `/api/userdata/${encodeURIComponent("workflows/Daily Anime Portrait - Fast Preview.json")}`,
+    );
+    // The pre-fix DOUBLED key must NEVER be requested.
+    expect(fetchApi).not.toHaveBeenCalledWith(
+      `/api/userdata/${encodeURIComponent("workflows/workflows/Daily Anime Portrait - Fast Preview.json")}`,
+    );
+    expect(calls).toHaveLength(1);
+    expect(calls[0].graph).toMatchObject(graph);
+  });
+
+  it("a bare name (no prefix) still resolves to the same single-prefixed key", async () => {
+    const graph = { nodes: [{ id: 2, type: "VAEDecode" }], links: [] };
+    fetchApi.mockResolvedValue({ ok: true, status: 200, text: async () => JSON.stringify(graph) });
+
+    const { ctx } = makeCtx();
+    await loadWorkflow().handler({ path: "Daily Anime Portrait - Fast Preview.json" }, ctx);
+    expect(fetchApi).toHaveBeenCalledWith(
+      `/api/userdata/${encodeURIComponent("workflows/Daily Anime Portrait - Fast Preview.json")}`,
+    );
+  });
+
+  it("a 'workflows/'-prefixed path falls back to local disk WITHOUT nesting workflows/", async () => {
+    const root = mkdtempSync(join(tmpdir(), "cmcp-userdir-"));
+    try {
+      const defaultDir = join(root, "user", "default", "workflows");
+      mkdirSync(defaultDir, { recursive: true });
+      const staged = { nodes: [{ id: 7, type: "PrefixedLocalNode" }], links: [] };
+      writeFileSync(join(defaultDir, "Foo.json"), JSON.stringify(staged), "utf8");
+      process.env.COMFYUI_PATH = root;
+
+      // Server 404s the name → local fallback. rel ("Foo.json") must join the
+      // workflows dir directly, not as workflows/workflows/Foo.json.
+      fetchApi.mockResolvedValue({ ok: false, status: 404, json: async () => ({}) });
+
+      const { ctx, calls } = makeCtx();
+      const res = await loadWorkflow().handler({ path: "workflows/Foo.json" }, ctx);
+
+      expect(res.isError).toBeUndefined();
+      expect(calls).toHaveLength(1);
+      expect(calls[0].graph).toMatchObject(staged);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// #414 hardening (codex) — normalizing the "workflows/" prefix must not let a
+// ".." segment escape the workflows root (e.g. "workflows/../secret.json" would
+// otherwise strip to "../secret.json"). Such a path is refused outright.
+describe("readWorkflowFromPath: refuses a '..' traversal segment (#414 hardening)", () => {
+  it("rejects a workflows/.. path without fetching or loading anything", async () => {
+    const { ctx, calls } = makeCtx();
+    const res = await loadWorkflow().handler({ path: "workflows/../secret.json" }, ctx);
+    expect(res.isError).toBe(true);
+    expect(fetchApi).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(0);
+    expect(JSON.stringify(res)).toMatch(/not a valid workflow name|\.\.|traversal/i);
+  });
+
+  it("still accepts a colon in a workflow NAME (legal POSIX filename, not a drive letter)", async () => {
+    // Regression guard: the drive-relative check must not reject a normal colon in
+    // a listed name like "workflows/style:anime.json".
+    const graph = { nodes: [{ id: 3, type: "SaveImage" }], links: [] };
+    fetchApi.mockResolvedValue({ ok: true, status: 200, text: async () => JSON.stringify(graph) });
+    const { ctx } = makeCtx();
+    const res = await loadWorkflow().handler({ path: "workflows/style:anime.json" }, ctx);
+    expect(res.isError).toBeUndefined();
+    expect(fetchApi).toHaveBeenCalledWith(
+      `/api/userdata/${encodeURIComponent("workflows/style:anime.json")}`,
+    );
+  });
+
+  it("rejects a Windows drive-relative traversal after the prefix is stripped", async () => {
+    // "workflows/C:../secret.json" strips to "C:../secret.json" — no exact ".."
+    // segment, but resolve() would canonicalize the embedded ".." and escape. The
+    // ":" (drive-letter) guard blocks it before any fetch/local read.
+    const { ctx, calls } = makeCtx();
+    const res = await loadWorkflow().handler({ path: "workflows/C:../secret.json" }, ctx);
+    expect(res.isError).toBe(true);
+    expect(fetchApi).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(0);
+    expect(JSON.stringify(res)).toMatch(/not a valid workflow name/i);
+  });
+
+  it("does NOT read a file via a symlink under the workflows dir that escapes the root", async () => {
+    // A lexically-clean name ("linked/secret.json") where `linked` is a symlink to
+    // an EXTERNAL dir would, without realpath containment, be read on the local
+    // fallback. The realpath check rejects it. (Skipped where the OS denies
+    // unprivileged symlink creation, e.g. stock Windows.)
+    const { symlinkSync } = await import("node:fs");
+    const root = mkdtempSync(join(tmpdir(), "cmcp-userdir-"));
+    const external = mkdtempSync(join(tmpdir(), "cmcp-external-"));
+    try {
+      const defaultDir = join(root, "user", "default", "workflows");
+      mkdirSync(defaultDir, { recursive: true });
+      writeFileSync(
+        join(external, "secret.json"),
+        JSON.stringify({ nodes: [{ id: 1, type: "SecretNode" }], links: [] }),
+        "utf8",
+      );
+      try {
+        symlinkSync(external, join(defaultDir, "linked"), "junction");
+      } catch {
+        return; // unprivileged symlink creation — skip on this platform
+      }
+      process.env.COMFYUI_PATH = root;
+      fetchApi.mockResolvedValue({ ok: false, status: 404, json: async () => ({}) });
+
+      const { ctx, calls } = makeCtx();
+      const res = await loadWorkflow().handler({ path: "linked/secret.json" }, ctx);
+
+      // The escaping file must NOT be loaded — surfaces the honest not-found error.
+      expect(calls).toHaveLength(0);
+      expect(res.isError).toBe(true);
+      expect(JSON.stringify(res)).toMatch(/No workflow file at|userdata/i);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(external, { recursive: true, force: true });
+    }
+  });
+});
