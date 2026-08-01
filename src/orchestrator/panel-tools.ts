@@ -3431,7 +3431,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_canvas",
-      "Control the user's canvas view: 'fit' frames the whole graph, 'center_on_node' jumps to a node (give node_id), 'pan' shifts by dx/dy, 'zoom' sets an absolute scale. View-only.",
+      "MOVE the user's viewport: 'fit' frames the whole graph, 'center_on_node' jumps to a node (give node_id), 'pan' shifts by dx/dy, 'zoom' sets an absolute scale. It changes what they are looking AT and returns nothing about the graph — to find out what is ON the canvas, use panel_graph_outline. View-only.",
       {
         action: z.enum(["fit", "center_on_node", "pan", "zoom"]),
         node_id: z.number().int().optional().describe("Required for center_on_node."),

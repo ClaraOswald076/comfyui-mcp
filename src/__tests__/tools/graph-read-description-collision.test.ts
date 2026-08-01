@@ -1,6 +1,8 @@
-import { describe, expect, it } from "vitest";
-import { registerWorkflowVisualizeTools } from "../../tools/workflow-visualize.js";
-import { registerWorkflowLibraryTools } from "../../tools/workflow-library.js";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { listRegisteredTools } from "../../tools/introspect.js";
 import { buildPanelToolDefs } from "../../orchestrator/panel-tools.js";
 
 /**
@@ -23,29 +25,41 @@ import { buildPanelToolDefs } from "../../orchestrator/panel-tools.js";
  * word canvas appears somewhere" passes on the exact wording that shipped the bug.
  */
 
-/** Capture (name, description) from server.tool(name, description, …) registrations. */
-function captureToolDescriptions(
-  register: (server: { tool: (...args: unknown[]) => void }) => void,
-): Map<string, string> {
-  const descriptions = new Map<string, string>();
-  register({
-    tool: (...args: unknown[]) => {
-      const [name, description] = args;
-      if (typeof name === "string" && typeof description === "string") {
-        descriptions.set(name, description);
-      }
-    },
-  });
-  return descriptions;
-}
-
-const core = new Map<string, string>([
-  ...captureToolDescriptions(registerWorkflowVisualizeTools as never),
-  ...captureToolDescriptions(registerWorkflowLibraryTools as never),
-]);
+/**
+ * The WHOLE surface, both halves of it.
+ *
+ * Core comes from listRegisteredTools() — the real registration pass read back
+ * through a real MCP client — rather than from the two register* functions that
+ * happen to hold today's suspects. Scoping the scan to a hand-picked pair of
+ * modules is the same mistake as scoping it to a hand-picked list of tools: it
+ * cannot see the tool nobody thought of, which is the only kind this catches.
+ */
 const panel = new Map(buildPanelToolDefs().map((d) => [d.name, d.description]));
+const core = new Map<string, string>();
 
 const describeTool = (name: string): string => core.get(name) ?? panel.get(name) ?? "";
+
+const savedEnv: Record<string, string | undefined> = {};
+
+beforeAll(async () => {
+  // Same isolation as registry-surface.test.ts: registerAllTools() ends by
+  // registering one tool per saved workflow file, and `compact` tool mode swaps
+  // the surface for 3 meta-tools. Either would make this a function of the
+  // developer's machine.
+  for (const key of ["COMFYUI_WORKFLOWS_DIR", "COMFYUI_MCP_TOOL_MODE"]) {
+    savedEnv[key] = process.env[key];
+  }
+  process.env.COMFYUI_WORKFLOWS_DIR = await mkdtemp(join(tmpdir(), "comfyui-mcp-desc-"));
+  delete process.env.COMFYUI_MCP_TOOL_MODE;
+  for (const t of await listRegisteredTools()) core.set(t.name, t.description);
+});
+
+afterAll(() => {
+  for (const [key, value] of Object.entries(savedEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+});
 
 /** The tools a model might reach for when asked to "look at the workflow". */
 const FAMILY = [
@@ -148,22 +162,72 @@ describe("graph-reading tool descriptions are distinguishable (#557)", () => {
    * to it — which is how panel_screenshot sat there as an untested competitor for
    * the exact failing prompt while the list-based checks were all green.
    *
-   * So: scan the WHOLE surface. Any tool whose OPENING both names the live canvas
-   * and offers to show/read it is claiming the query panel_graph_outline exists to
-   * answer, and must therefore hand the model back to panel_graph_outline somewhere
-   * in its description. Only panel_graph_outline itself is exempt.
+   * Any tool whose OPENING both names the canvas and offers to show or read it is
+   * claiming the question panel_graph_outline exists to answer, and must therefore
+   * hand the model back to panel_graph_outline somewhere in its description. Only
+   * panel_graph_outline itself is exempt.
    */
-  it("lets no other tool on the surface open by claiming to show the live canvas", () => {
-    const NAMES_THE_CANVAS = /live canvas|on the canvas|currently viewing|current(ly)? open graph|the canvas the user/i;
-    const OFFERS_TO_SHOW_IT = /\b(read|reads|show|shows|see|view|render|renders|display|describe|outline|dump)\b/i;
+  const NAMES_THE_CANVAS = /\bcanvas\b|currently viewing|\bopen graph\b|\blive graph\b/i;
+  const OFFERS_TO_SHOW_IT =
+    /\b(read|reads|show|shows|see|view|views|render|renders|display|describe|outline|dump|screenshot|look)\b/i;
+  // Wide enough to cover an opening PARAGRAPH, not just an opening sentence. At 140
+  // characters this selected exactly one tool while claiming whole-surface coverage:
+  // panel_screenshot's own "on the canvas" lands at character ~150. A ratchet that
+  // inspects one tool is not a ratchet, it is a green light.
+  const OPENING = 260;
 
-    const offenders: string[] = [];
-    for (const [name, description] of [...core, ...panel]) {
-      if (name === "panel_graph_outline") continue;
-      const opening = description.slice(0, 140);
-      if (!NAMES_THE_CANVAS.test(opening) || !OFFERS_TO_SHOW_IT.test(opening)) continue;
-      if (!description.includes("panel_graph_outline")) offenders.push(name);
+  const claimants = (): string[] =>
+    [...core, ...panel]
+      .filter(([, d]) => NAMES_THE_CANVAS.test(d.slice(0, OPENING)) && OFFERS_TO_SHOW_IT.test(d.slice(0, OPENING)))
+      .map(([n]) => n);
+
+  it("actually inspects the tools that compete for the query (the ratchet is not vacuous)", () => {
+    // Guards the SELECTOR, not the surface. Narrow the regexes or the window and this
+    // fails loudly instead of quietly passing over an empty set — which is the failure
+    // mode of every scan-based test, and the one this file already shipped once.
+    const inspected = claimants();
+    for (const known of [
+      "panel_graph_outline",
+      "panel_query_graph",
+      "panel_screenshot",
+      "panel_view_nodes_in_viewport",
+      "panel_find_nodes",
+    ]) {
+      expect(inspected, `${known} must be inside the ratchet's window`).toContain(known);
     }
+  });
+
+  /**
+   * Tools the selector reaches that are NOT competing to answer "what is on the
+   * canvas". Per-tool with a stated reason, never a widened regex: narrowing the
+   * selector to make these disappear would take real claimants with them, and the
+   * only cheap way to keep a scan honest is to make every exemption something a
+   * human had to write down and a reviewer had to read.
+   */
+  const NOT_A_CANVAS_READ = new Map<string, string>([
+    ["diagnose_run", "explains a FAILED RUN and says so — 'without needing a canvas' is why it matches"],
+    ["panel_strip_workflow", "TRANSFORMS a graph into a resolved form; the result is a conversion, not a view"],
+    ["panel_load_workflow", "WRITES the canvas (replaces the open graph); nothing about it answers a read"],
+    ["panel_run", "QUEUES the open workflow — the canvas is the input, not the output"],
+    ["panel_get_workflow_target", "reads the agent's BINDING (current vs pinned), not the graph's contents"],
+    ["panel_list_subgraphs", "lists library BLUEPRINTS; the canvas is only where you would drop one"],
+  ]);
+
+  it("has no stale exemption (each exempted tool is still one the selector reaches)", () => {
+    // An exemption for a tool the selector no longer selects is a permission nobody
+    // re-reviewed, sitting there to pre-approve whatever that name becomes next.
+    const inspected = new Set(claimants());
+    const stale = [...NOT_A_CANVAS_READ.keys()].filter((n) => !inspected.has(n));
+    expect(stale, "delete these exemptions — they no longer suppress anything").toEqual([]);
+  });
+
+  it("lets no other tool on the surface open by claiming to show the live canvas", () => {
+    const offenders = claimants().filter(
+      (name) =>
+        name !== "panel_graph_outline" &&
+        !NOT_A_CANVAS_READ.has(name) &&
+        !describeTool(name).includes("panel_graph_outline"),
+    );
 
     expect(
       offenders,
