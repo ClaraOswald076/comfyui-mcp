@@ -306,6 +306,29 @@ describe("SessionStore", () => {
       expect(new SessionStore(PORT).get("wf:foo.json::claude")).toBeUndefined();
     });
 
+    it("PRE-UPGRADE: an exact record with no identity binding reads back unbound (drives fail-closed reset)", () => {
+      // A record written before the `u` field existed (a v2 {s,t} entry, or a migrated
+      // legacy flat record) has a session but NO identity. identityOf() is undefined, so
+      // the hello handler treats it as untrusted (can't prove it's this workflow's) and
+      // resets — a one-time lost resume, never a wrong resume.
+      writeFileSync(
+        FILE,
+        JSON.stringify({
+          v: 2,
+          sessions: { "wf:foo.json::claude": { s: "sess-pre-upgrade", t: Date.now() } },
+          stable: {},
+        }),
+      );
+      const store = new SessionStore(PORT);
+      expect(store.get("wf:foo.json::claude")).toBe("sess-pre-upgrade"); // session present
+      expect(store.identityOf("wf:foo.json::claude")).toBeUndefined(); // but NOT identity-bound
+      // Legacy flat format (Record<string,string>) migrates likewise — no identity.
+      writeFileSync(FILE, JSON.stringify({ "wf:bar.json::claude": "sess-legacy" }));
+      const legacy = new SessionStore(PORT);
+      expect(legacy.get("wf:bar.json::claude")).toBe("sess-legacy");
+      expect(legacy.identityOf("wf:bar.json::claude")).toBeUndefined();
+    });
+
     it("WORKFLOW IDENTITY: distinguishes a same-workflow migration from a workflow switch (#570 P0a)", () => {
       // deriveWorkflowIdentity is the backend-independent discriminator the hello
       // handler uses to decide whether a same-socket re-hello under a new tab id is a
