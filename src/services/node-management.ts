@@ -601,13 +601,23 @@ async function runManagerQueue(): Promise<QueueStatus> {
  */
 async function queueManagerTask(
   kind: ManagerTaskKind,
-  params: Record<string, unknown>,
+  params: ManagerTaskParams,
 ): Promise<QueueStatus> {
+  // Normalize to a resolver so every attempt builds its body for the dialect it
+  // is about to speak — a few operations (git installs) have dialect-specific
+  // params, and a self-heal retry must rebuild them, not just re-route them.
+  const resolve: ManagerParamsResolver =
+    typeof params === "function" ? params : () => params;
   await enqueueWithDialectSelfHeal(kind, (api, epoch) =>
-    enqueueManagerTask(api, kind, params, randomUUID(), epoch),
+    enqueueManagerTask(api, kind, resolve, randomUUID(), epoch),
   );
   return runManagerQueue();
 }
+
+/** Params for a Manager task: a fixed body, or a resolver invoked with the
+ *  dialect the request is about to be sent in (for dialect-specific bodies). */
+type ManagerParamsResolver = (api: ManagerApi) => Record<string, unknown>;
+type ManagerTaskParams = Record<string, unknown> | ManagerParamsResolver;
 
 /**
  * Run ONE enqueue against the detected Manager dialect, healing a stale
@@ -703,12 +713,12 @@ async function redetectAfterDialectMismatch(
 async function enqueueManagerTask(
   api: ManagerApi,
   kind: ManagerTaskKind,
-  params: Record<string, unknown>,
+  resolveParams: ManagerParamsResolver,
   uiId: string,
   startEpoch: number,
 ): Promise<void> {
-  if (api === "legacy") return enqueueLegacyTask(kind, params, uiId);
-  if (api === "v2-batch") return enqueueV2BatchTask(kind, params, uiId);
+  if (api === "legacy") return enqueueLegacyTask(kind, resolveParams("legacy"), uiId);
+  if (api === "v2-batch") return enqueueV2BatchTask(kind, resolveParams("v2-batch"), uiId);
   // v2 unified task envelope (normal-mode pip Manager v4).
   try {
     await managerFetch("/v2/manager/queue/task", {
@@ -717,7 +727,7 @@ async function enqueueManagerTask(
         ui_id: uiId,
         client_id: MANAGER_CLIENT_ID,
         kind,
-        params: { ...params, ui_id: uiId },
+        params: { ...resolveParams("v2"), ui_id: uiId },
       },
     });
   } catch (err) {
@@ -736,7 +746,10 @@ async function enqueueManagerTask(
         "Manager /v2/manager/queue/task 405 — retrying via the v2-batch envelope",
         { kind },
       );
-      await enqueueV2BatchTask(kind, params, uiId);
+      // Rebuild the body for the dialect we are downgrading TO: this build runs
+      // the 3.x handlers under /v2, so a dialect-specific body (a git install)
+      // must be its 3.x shape, not the v2 one we just tried.
+      await enqueueV2BatchTask(kind, resolveParams("v2-batch"), uiId);
       // Pin the corrected dialect ONLY after the batch enqueue actually
       // succeeded, so a transient/proxy 405 on a genuine v4 host (task 405 but
       // batch also unavailable) never poisons the cache: enqueueV2BatchTask
@@ -1372,39 +1385,42 @@ async function installCustomNodeImpl(
 
   if (source === "git") {
     const repoName = gitCheckoutDir(gitId);
-    let status: QueueStatus;
-    if ((await detectManagerApi()) !== "v2") {
-      // 3.x SEMANTICS (both the custom-node Manager AND pip Manager in
-      // legacy-UI mode, whose /v2 batch runs the same 3.x handlers — codex
-      // review on #235): a REAL git URL installs natively via
-      // { version:'unknown', files:[url] }, cloning it as an unregistered
-      // pack. (Gated server-side by security_level + allow_git_url_install
-      // config — a rejection surfaces as a 403/404 from the queue route.)
-      status = await queueManagerTask("install", {
-        id: repoName,
-        version: "unknown",
-        selected_version: "unknown",
-        files: [gitId],
-        channel: opts.channel ?? "default",
-        mode: opts.mode ?? "cache",
-      });
-    } else {
-      // Manager v4: REGISTRY-FIRST, CLONE FALLBACK. The v4 backend resolves an
-      // install by the pack's REPO NAME / CNR id — NOT a full git URL
-      // (do_install splits `${id}@${selected_version}` and looks the result up
-      // in its DB; a full URL matches nothing and the queue silently marks the
-      // task "done"). So we mirror the frontend UI: id = repo name,
-      // selected_version = ref or "nightly" (the git-HEAD channel for unclaimed
-      // packs), channel "dev", mode "cache".
-      const selected = gitRef ?? "nightly";
-      status = await queueManagerTask("install", {
-        id: repoName,
-        version: selected,
-        selected_version: selected,
-        channel: opts.channel ?? "dev",
-        mode: opts.mode ?? "cache",
-      });
-    }
+    // A git install's PARAMS are dialect-specific, not just its route, so they
+    // are built per-attempt from the dialect actually being spoken. Precomputing
+    // them from the cached dialect would let a self-heal retry (#646) resend
+    // 3.x-shaped params to a v4 server (or the reverse) and install the wrong
+    // thing — the retry has to rebuild the body, not just re-route it.
+    const status = await queueManagerTask("install", (api) =>
+      api !== "v2"
+        ? // 3.x SEMANTICS (both the custom-node Manager AND pip Manager in
+          // legacy-UI mode, whose /v2 batch runs the same 3.x handlers — codex
+          // review on #235): a REAL git URL installs natively via
+          // { version:'unknown', files:[url] }, cloning it as an unregistered
+          // pack. (Gated server-side by security_level + allow_git_url_install
+          // config — a rejection surfaces as a 403/404 from the queue route.)
+          {
+            id: repoName,
+            version: "unknown",
+            selected_version: "unknown",
+            files: [gitId],
+            channel: opts.channel ?? "default",
+            mode: opts.mode ?? "cache",
+          }
+        : // Manager v4: REGISTRY-FIRST, CLONE FALLBACK. The v4 backend resolves
+          // an install by the pack's REPO NAME / CNR id — NOT a full git URL
+          // (do_install splits `${id}@${selected_version}` and looks the result
+          // up in its DB; a full URL matches nothing and the queue silently
+          // marks the task "done"). So we mirror the frontend UI: id = repo
+          // name, selected_version = ref or "nightly" (the git-HEAD channel for
+          // unclaimed packs), channel "dev", mode "cache".
+          {
+            id: repoName,
+            version: gitRef ?? "nightly",
+            selected_version: gitRef ?? "nightly",
+            channel: opts.channel ?? "dev",
+            mode: opts.mode ?? "cache",
+          },
+    );
 
     // VERIFY: /v2/customnode/installed reflects on-disk custom_nodes, so a
     // freshly-cloned pack shows up even before a reboot. If the Manager actually

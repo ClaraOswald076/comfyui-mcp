@@ -52,6 +52,7 @@ vi.mock("node:child_process", () => ({
 vi.mock("node:fs", () => ({ existsSync: vi.fn(() => true) }));
 
 const {
+  installCustomNode,
   installModelViaManager,
   updateCustomNode,
   setQueueTimingForTests,
@@ -105,6 +106,12 @@ function stubServer(opts: {
     const body = init?.body ? JSON.parse(init.body as string) : undefined;
     const path = new URL(url).pathname;
     calls.push({ path, method, body });
+
+    // The install VERIFY step: report the pack as present so installCustomNode
+    // never reaches its clone fallback.
+    if (path.startsWith("/v2/customnode/installed")) {
+      return jsonResponse({ "comfyui-foo": { ver: "1.0", cnr_id: "comfyui-foo", enabled: true } });
+    }
 
     if (opts.persona() === "legacy") {
       // The 3.x custom-node Manager: no /v2/* at all (ComfyUI's frontend catchall
@@ -303,6 +310,34 @@ describe("#646 Manager API dialect cache invalidation", () => {
     expect(detections(calls)).toBe(1);
     // Exactly ONE task enqueued — the retry must not double-submit the install.
     expect(countOf(calls, "/v2/manager/queue/task")).toBe(1);
+  });
+
+  it("rebuilds a dialect-specific body on retry (git install), not just the route", async () => {
+    let persona: Persona = "v2-batch";
+    const calls = stubServer({ persona: () => persona });
+
+    // Pin the legacy-UI dialect, then swap the server to a normal v4 underneath.
+    await downloadAModel();
+    persona = "v4";
+    calls.length = 0;
+
+    await installCustomNode({ id: "https://github.com/bar/comfyui-foo" });
+
+    // Attempt 1 spoke 3.x: a real git URL in `files`, version "unknown".
+    const batch = calls.find((c) => c.path === "/v2/manager/queue/batch");
+    expect(batch).toBeDefined();
+    const sent = (batch!.body as Record<string, Array<Record<string, unknown>>>).install[0];
+    expect(sent.files).toEqual(["https://github.com/bar/comfyui-foo"]);
+
+    // The retry must speak v4 SEMANTICS, not merely the v4 route: repo name +
+    // "nightly" and NO `files` (v4 resolves by registry id, so a 3.x body would
+    // silently install nothing).
+    const task = calls.find((c) => c.path === "/v2/manager/queue/task");
+    expect(task).toBeDefined();
+    const params = (task!.body as { params: Record<string, unknown> }).params;
+    expect(params.id).toBe("comfyui-foo");
+    expect(params.selected_version).toBe("nightly");
+    expect(params.files).toBeUndefined();
   });
 
   it("heals update_all too (its dedicated route bypasses queueManagerTask)", async () => {
