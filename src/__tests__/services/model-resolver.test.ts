@@ -272,6 +272,29 @@ describe("downloadModel — auth headers (token never in URL)", () => {
     expect(headersOf().Authorization).toBeUndefined();
   });
 
+  it("does NOT leak the HF token on the LOCAL path to an attacker host whose URL merely CONTAINS 'huggingface.co' (#590 P0)", async () => {
+    config.huggingfaceToken = "hf";
+    failingFetch();
+
+    await expect(
+      downloadModel("https://evil.example/m.safetensors?ref=huggingface.co", "checkpoints", "m.safetensors"),
+    ).rejects.toBeInstanceOf(ModelError);
+
+    // Parsed host is evil.example → NO token. A substring `includes` would have leaked it.
+    expect(headersOf().Authorization).toBeUndefined();
+  });
+
+  it("does NOT leak the HF token on the LOCAL path to a look-alike subdomain (huggingface.co.evil.com)", async () => {
+    config.huggingfaceToken = "hf";
+    failingFetch();
+
+    await expect(
+      downloadModel("https://huggingface.co.evil.com/m.safetensors", "checkpoints", "m.safetensors"),
+    ).rejects.toBeInstanceOf(ModelError);
+
+    expect(headersOf().Authorization).toBeUndefined();
+  });
+
   it("attaches a HuggingFace bearer header for huggingface.co", async () => {
     config.huggingfaceToken = "hf";
     failingFetch();

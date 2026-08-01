@@ -467,6 +467,24 @@ function isCivitaiUrl(url: string): boolean {
   }
 }
 
+/**
+ * True when `url`'s PARSED hostname is huggingface.co (or a subdomain). The single
+ * authority for the "is this a Hugging Face host?" credential decision — used by BOTH the
+ * local streaming download and the #473 remote flip probe. NEVER a substring match:
+ * `https://attacker.example/m.safetensors?ref=huggingface.co` and
+ * `https://huggingface.co.evil.com/...` both parse to a non-HF host and get NO token
+ * (a substring `url.includes("huggingface.co")` would leak HF_TOKEN to them). An
+ * unparseable url is not HF (no token).
+ */
+function isHuggingFaceHost(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host === "huggingface.co" || host.endsWith(".huggingface.co");
+  } catch {
+    return false;
+  }
+}
+
 /** Network-restricted regions (issue #127): honor the de-facto HF_ENDPOINT
  *  mirror var (e.g. https://hf-mirror.com) by rewriting huggingface.co URLs at
  *  the API/download boundary. Only http(s) endpoints are accepted; anything
@@ -813,17 +831,9 @@ function localAuthHeadersFor(
   const headers: Record<string, string> = { ...request.headers };
   // HF token: attach ONLY when the url's PARSED hostname is huggingface.co (or a subdomain),
   // or the ORIGINAL url was a HF url that HF_ENDPOINT rewrote to a trusted mirror. NEVER a
-  // substring match — `https://attacker.example/x?ref=huggingface.co` must NOT receive the
-  // token (a credential-leak; the parsed host is attacker.example). isCivitaiUrl is already
-  // hostname-parsed, so the CivitAI branch is safe by construction.
-  let host = "";
-  try {
-    host = new URL(url).hostname.toLowerCase();
-  } catch {
-    /* unparseable url → no host-token injection */
-  }
-  const isHfHost = host === "huggingface.co" || host.endsWith(".huggingface.co");
-  if (!auth && config.huggingfaceToken && (wasHfUrl || isHfHost)) {
+  // substring match (see isHuggingFaceHost). isCivitaiUrl is likewise hostname-parsed, so
+  // the CivitAI branch is safe by construction.
+  if (!auth && config.huggingfaceToken && (wasHfUrl || isHuggingFaceHost(url))) {
     headers["Authorization"] = `Bearer ${config.huggingfaceToken}`;
   } else if (!auth && config.civitaiApiToken && isCivitaiUrl(url)) {
     headers["Authorization"] = `Bearer ${config.civitaiApiToken}`;
@@ -1139,9 +1149,12 @@ export async function downloadModel(
 
   const request = applyDownloadAuth(url, auth);
   const headers: Record<string, string> = { ...request.headers };
-  // wasHfUrl keeps the token flowing when HF_ENDPOINT rewrote the host to a
-  // mirror (mirrors proxy gated repos and accept the same Bearer token).
-  if (!auth && config.huggingfaceToken && (wasHfUrl || url.includes("huggingface.co"))) {
+  // HF token: attach ONLY when the url's PARSED hostname is huggingface.co (or a subdomain),
+  // or the ORIGINAL url was a HF url that HF_ENDPOINT rewrote to a trusted mirror (wasHfUrl).
+  // NEVER a substring match — `https://evil.example/m.safetensors?ref=huggingface.co` parses
+  // to evil.example and must get NO token (a credential-leak; the same parsed-host authority
+  // the remote flip probe uses).
+  if (!auth && config.huggingfaceToken && (wasHfUrl || isHuggingFaceHost(url))) {
     headers["Authorization"] = `Bearer ${config.huggingfaceToken}`;
   } else if (!auth && config.civitaiApiToken && isCivitaiUrl(url)) {
     // CivitAI auth travels as a request header (never in the URL/query) so the
