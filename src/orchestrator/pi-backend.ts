@@ -226,8 +226,15 @@ export interface PiBackendDeps {
   /** Provider for turns (passed via --provider). Unset = pi's default. */
   provider?: string;
   /** Panel system prompt — prepended to the FIRST turn (pi headless has no
-   *  system-prompt flag we rely on). */
+   *  system-prompt flag we rely on). Suppressed on resume (the session already
+   *  carries it). */
   systemAppend?: string;
+  /** A short capability note re-asserted on EVERY turn (fresh AND resume) — pi's
+   *  correction that it has NO ComfyUI panel/comfyui tools. Unlike systemAppend
+   *  it is NOT suppressed on resume, so a resumed or long-running pi session (the
+   *  common path) is always told the truth about its capability (#491 codex
+   *  P0a-resume). Kept small so re-sending it every turn is cheap. */
+  capabilityNote?: string;
 }
 
 /** Sentinel session id used ONLY for the up-front session event of a FRESH
@@ -351,11 +358,22 @@ export class PiBackend implements AgentBackend {
     onActivity?: () => void,
   ): AsyncGenerator<AgentEvent> {
     let text = promptText(turn.text);
+    // System blocks, in order: the heavy panel preamble (FIRST fresh turn only)
+    // then the capability note (EVERY turn — fresh AND resume). The note comes
+    // LAST so, on the first turn, it overrides the preamble's panel_*-tools claim;
+    // on resumed/subsequent turns it is re-asserted alone, so a long-running or
+    // resumed pi session is never left believing it has ComfyUI tools it can't
+    // run (#491 codex P0a-resume).
+    const sysBlocks: string[] = [];
     if (this.needsSystemPreamble && this.deps.systemAppend) {
-      text =
-        `<system>\n${this.deps.systemAppend}\n</system>\n\n` +
-        `The user's first message follows.\n\n${text}`;
+      sysBlocks.push(this.deps.systemAppend);
       this.needsSystemPreamble = false;
+    }
+    if (this.deps.capabilityNote) sysBlocks.push(this.deps.capabilityNote);
+    if (sysBlocks.length) {
+      text =
+        `<system>\n${sysBlocks.join("\n\n")}\n</system>\n\n` +
+        `The user's message follows.\n\n${text}`;
     }
     // Image refs: no documented headless image input — the refs are already named
     // in the turn text (vision=false tells the panel up front).

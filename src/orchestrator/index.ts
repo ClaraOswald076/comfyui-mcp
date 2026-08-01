@@ -1716,12 +1716,15 @@ export async function runPanelOrchestrator(): Promise<void> {
       // pi has NO MCP client, so it gets NO mcpServers (comfyui/panel tools are
       // unavailable to pi turns — see pi-backend.ts). It runs as a coding/chat
       // agent on the user's own provider. The panel prompt claims panel_*/comfyui
-      // tools it can't run, so append PI_CAPABILITY_OVERRIDE to correct that.
+      // tools it can't run, so PI_CAPABILITY_OVERRIDE is passed as capabilityNote
+      // — re-asserted on EVERY turn (incl. resume), not folded into the
+      // first-turn-only systemAppend (#491 codex P0a-resume).
       return new PiBackend({
         cwd: comfyuiPath ?? process.cwd(),
         ...(piModel ? { model: piModel } : {}),
         ...(piProvider ? { provider: piProvider } : {}),
-        systemAppend: sysAppend + PI_CAPABILITY_OVERRIDE,
+        systemAppend: sysAppend,
+        capabilityNote: PI_CAPABILITY_OVERRIDE,
       });
     }
     if (backend === "grok") {
