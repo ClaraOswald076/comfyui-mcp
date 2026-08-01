@@ -1,5 +1,7 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { join } from "node:path";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 // Mock config so importing panel-installer doesn't trigger real port detection.
 // (We drive comfyuiPath via the injected deps, not the mocked config, but the
@@ -13,6 +15,12 @@ import {
   ensurePanelInstalled,
   panelStatus,
   runPanelAction,
+  classifyPanelUpdate,
+  resolveGitRevision,
+  looksLikeManagerNoOp,
+  findPanelShadows,
+  looksLikePanelBackupName,
+  readQueueCounts,
   PanelInstallError,
   PANEL_REGISTRY_ID,
   PANEL_VERSION,
@@ -40,11 +48,31 @@ function makeDeps(opts: {
   files?: Record<string, string>; // path -> pyproject contents
   dirs?: string[]; // custom_nodes subdir names
   symlinks?: string[]; // absolute dir paths that are symlinks
+  nonDirEntries?: string[]; // custom_nodes entries that are FILES, not dirs
+  realPaths?: Record<string, string>; // path -> canonical realpath (else undefined)
   reachable?: boolean;
+  /** Raw ComfyUI-Manager queue status the `update` mock returns as details. */
+  updateDetails?: unknown;
+  /** Queue status the `install`/`reinstall` mocks return as details. */
+  installDetails?: unknown;
+  reinstallDetails?: unknown;
+  /** Per-dir git-HEAD sha (absolute dir path -> sha). Read via gitRevision. */
+  revs?: Record<string, string>;
+  /**
+   * Side effect the `update` mock runs against the live `files`/`revs` maps to
+   * simulate what actually landed on disk (advance/remove pyproject or sha).
+   */
+  onUpdate?: (ctx: { files: Record<string, string>; revs: Record<string, string> }) => void;
+  /** Side effect the `install` mock runs to simulate the pack landing. */
+  onInstall?: (ctx: { files: Record<string, string>; revs: Record<string, string> }) => void;
+  /** Side effect the `reinstall` mock runs to simulate the pack landing. */
+  onReinstall?: (ctx: { files: Record<string, string>; revs: Record<string, string> }) => void;
 } = {}): Harness {
   const files = opts.files ?? {};
+  const revs = opts.revs ?? {};
   const dirs = opts.dirs ?? [];
   const symlinks = new Set(opts.symlinks ?? []);
+  const nonDirs = new Set((opts.nonDirEntries ?? []).map((n) => join(CUSTOM_NODES, n)));
   const installs: Harness["installs"] = [];
   const updates: Harness["updates"] = [];
   const reinstalls: Harness["reinstalls"] = [];
@@ -55,20 +83,32 @@ function makeDeps(opts: {
     env: () => opts.env ?? {},
     existsSync: (p) => p === CUSTOM_NODES || p in files,
     isSymlink: (p) => symlinks.has(p),
+    isDirectory: (p) => !nonDirs.has(p),
+    realPath: (p) => opts.realPaths?.[p],
     readdir: (p) => (p === CUSTOM_NODES ? dirs : []),
     readFile: (p) => files[p] ?? "",
+    gitRevision: (dir) => revs[dir],
     isReachable: async () => opts.reachable ?? true,
     install: async (o) => {
       installs.push(o);
-      return { mechanism: "manager-http", message: "installed" };
+      opts.onInstall?.({ files, revs });
+      return { mechanism: "manager-http", message: "installed", details: opts.installDetails };
     },
     update: async (o) => {
       updates.push(o);
-      return { mechanism: "manager-http", message: "updated" };
+      // Mutate the on-disk view BEFORE returning, so the post-update re-read in
+      // runPanelAction sees exactly what "landed" (or didn't).
+      opts.onUpdate?.({ files, revs });
+      return {
+        mechanism: "manager-http",
+        message: "updated",
+        details: opts.updateDetails,
+      };
     },
     reinstall: async (o) => {
       reinstalls.push(o);
-      return { mechanism: "manager-http", message: "reinstalled" };
+      opts.onReinstall?.({ files, revs });
+      return { mechanism: "manager-http", message: "reinstalled", details: opts.reinstallDetails };
     },
   };
   return { deps, installs, updates, reinstalls };
@@ -173,11 +213,73 @@ describe("detectPanelInstall", () => {
 
 describe("ensurePanelInstalled policy matrix", () => {
   it("missing → installs nightly (restart required)", async () => {
-    const h = makeDeps({ comfyuiPath: COMFY });
+    const dir = join(CUSTOM_NODES, "comfyui-mcp-panel");
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      // Simulate the pack landing so the new post-install verification passes.
+      onInstall: ({ files }) => {
+        files[join(dir, "pyproject.toml")] = pyproject(PANEL_REGISTRY_ID, "0.11.32");
+      },
+    });
     const res = await ensurePanelInstalled({ deps: h.deps });
     expect(res.action).toBe("installed");
     expect(res.restartRequired).toBe(true);
+    expect(res.installedVersion).toBe("0.11.32");
     expect(h.installs).toEqual([{ id: PANEL_REGISTRY_ID, version: PANEL_VERSION }]);
+  });
+
+  it("#639: missing → install does NOT land → unavailable (not fabricated 'installed')", async () => {
+    // No onInstall → Manager 'queued' but nothing on disk.
+    const h = makeDeps({ comfyuiPath: COMFY });
+    const res = await ensurePanelInstalled({ deps: h.deps });
+    expect(res.action).toBe("unavailable");
+    expect(res.reason).toMatch(/could not be verified|no-op/i);
+    expect(h.installs).toEqual([{ id: PANEL_REGISTRY_ID, version: PANEL_VERSION }]);
+  });
+
+  it("#641: missing → install lands but a shadow exists → 'shadowed', not 'installed'", async () => {
+    const dir = join(CUSTOM_NODES, "comfyui-mcp-panel");
+    const bak = ".comfyui-agent-panel.bak-0.11.28";
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: [bak],
+      files: { [join(CUSTOM_NODES, bak, "pyproject.toml")]: pyproject(PANEL_REGISTRY_ID, "0.11.28") },
+      onInstall: ({ files }) => {
+        files[join(dir, "pyproject.toml")] = pyproject(PANEL_REGISTRY_ID, "0.11.32");
+      },
+    });
+    const res = await ensurePanelInstalled({ deps: h.deps });
+    expect(res.action).toBe("shadowed");
+    expect(res.reason).toMatch(/shadow/i);
+  });
+
+  it("#639: unreliable pre-scan (readdir fails) → unavailable, does NOT auto-install blind", async () => {
+    // Panel exists in a non-fast-path dir; enumeration fails so detection can't
+    // see it. Auto-install must NOT run (would create a duplicate) nor fabricate.
+    const h = makeDeps({ comfyuiPath: COMFY });
+    h.deps.readdir = () => {
+      throw new Error("EACCES: scandir");
+    };
+    const res = await ensurePanelInstalled({ deps: h.deps });
+    expect(res.action).toBe("unavailable");
+    expect(res.reason).toMatch(/enumerate|confirm the panel is missing/i);
+    expect(h.installs).toEqual([]);
+  });
+
+  it("#641: present WITH a shadow → 'shadowed' (surfaces the trap on load)", async () => {
+    const dir = join(CUSTOM_NODES, "comfyui-mcp-panel");
+    const bak = ".comfyui-agent-panel.bak-0.11.28";
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: [bak],
+      files: {
+        [join(dir, "pyproject.toml")]: pyproject(PANEL_REGISTRY_ID, "0.11.32"),
+        [join(CUSTOM_NODES, bak, "pyproject.toml")]: pyproject(PANEL_REGISTRY_ID, "0.11.28"),
+      },
+    });
+    const res = await ensurePanelInstalled({ deps: h.deps });
+    expect(res.action).toBe("shadowed");
+    expect(h.installs).toEqual([]); // never re-installs a present panel
   });
 
   it("present → up-to-date (no churn on load, no install call)", async () => {
@@ -266,7 +368,14 @@ describe("ensurePanelInstalled policy matrix", () => {
 
 describe("runPanelAction", () => {
   it("install targets nightly and flags restart required", async () => {
-    const h = makeDeps({ comfyuiPath: COMFY });
+    const dir = join(CUSTOM_NODES, "comfyui-mcp-panel");
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      // Simulate the pack landing on disk so the post-op presence check passes.
+      onInstall: ({ files }) => {
+        files[join(dir, "pyproject.toml")] = pyproject(PANEL_REGISTRY_ID, "0.11.32");
+      },
+    });
     const r = await runPanelAction("install", h.deps);
     expect(r.action).toBe("install");
     expect(r.restartRequired).toBe(true);
@@ -274,22 +383,276 @@ describe("runPanelAction", () => {
     expect(h.installs).toEqual([{ id: PANEL_REGISTRY_ID, version: PANEL_VERSION }]);
   });
 
-  it("update calls updateCustomNode for the panel", async () => {
+  it("#639: install where the pack never lands → throws, not silent success", async () => {
+    // No onInstall → Manager "queued" but nothing on disk.
+    const h = makeDeps({ comfyuiPath: COMFY });
+    await expect(runPanelAction("install", h.deps)).rejects.toBeInstanceOf(
+      PanelInstallError,
+    );
+    expect(h.installs).toEqual([{ id: PANEL_REGISTRY_ID, version: PANEL_VERSION }]);
+  });
+
+  it("update calls updateCustomNode for the panel (version moves → success)", async () => {
     const dir = join(CUSTOM_NODES, "comfyui-mcp-panel");
+    const pyPath = join(dir, "pyproject.toml");
     const h = makeDeps({
       comfyuiPath: COMFY,
-      files: { [join(dir, "pyproject.toml")]: pyproject(PANEL_REGISTRY_ID) },
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.28") },
+      updateDetails: {
+        total_count: 1,
+        done_count: 1,
+        in_progress_count: 0,
+        pending_count: 0,
+        is_processing: false,
+      },
+      // Simulate the pack actually advancing on disk.
+      onUpdate: ({ files }) => {
+        files[pyPath] = pyproject(PANEL_REGISTRY_ID, "0.11.32");
+      },
     });
     const r = await runPanelAction("update", h.deps);
     expect(r.action).toBe("update");
     expect(h.updates).toEqual([{ id: PANEL_REGISTRY_ID }]);
+    expect(r.previousVersion).toBe("0.11.28");
+    expect(r.installedVersion).toBe("0.11.32");
+    expect(r.restartRequired).toBe(true);
+    expect(r.message).toMatch(/0\.11\.28.*0\.11\.32/);
   });
 
-  it("reinstall targets nightly", async () => {
-    const h = makeDeps({ comfyuiPath: COMFY });
+  it("#639: git-HEAD advances WITHOUT a version bump (nightly) → updated + restart", async () => {
+    const dir = join(CUSTOM_NODES, "comfyui-mcp-panel");
+    const pyPath = join(dir, "pyproject.toml");
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+      updateDetails: { total_count: 1, done_count: 1, is_processing: false },
+      // Version string stays, but the commit sha advances.
+      onUpdate: ({ revs }) => {
+        revs[dir] = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+      },
+    });
+    const r = await runPanelAction("update", h.deps);
+    expect(r.installedVersion).toBe("0.11.32");
+    expect(r.restartRequired).toBe(true);
+    expect(r.message).toMatch(/updated/i);
+  });
+
+  // #639 — the core silent-fabricate-success regression guard.
+  it("#639: Manager reports done but on-disk version UNCHANGED → throws, not success", async () => {
+    const dir = join(CUSTOM_NODES, "comfyui-mcp-panel");
+    const pyPath = join(dir, "pyproject.toml");
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.28") },
+      // Real installs are git checkouts — exercise that path with an UNCHANGED
+      // HEAD, which must NOT be mistaken for "already current".
+      revs: { [dir]: "dddddddddddddddddddddddddddddddddddddddd" },
+      // The exact stale-3.x no-op signature from the issue: total_count 0 yet
+      // done_count 2 — the queue "drains" trivially while nothing is enqueued.
+      updateDetails: {
+        total_count: 0,
+        done_count: 2,
+        in_progress_count: 0,
+        pending_count: 0,
+        is_processing: false,
+      },
+      // No onUpdate → nothing changes on disk.
+    });
+    await expect(runPanelAction("update", h.deps)).rejects.toBeInstanceOf(
+      PanelInstallError,
+    );
+    // The update was actually attempted (not short-circuited).
+    expect(h.updates).toEqual([{ id: PANEL_REGISTRY_ID }]);
+    // And the diagnostic names the stale-Manager cause + the still-installed version.
+    await expect(runPanelAction("update", h.deps)).rejects.toThrow(
+      /did NOT apply|stale ComfyUI-Manager|0\.11\.28/,
+    );
+  });
+
+  it("#639: unchanged version AND unchanged git-HEAD + coherent counts → fails closed (not success)", async () => {
+    // An unchanged LOCAL git-HEAD is NOT proof of being at the upstream tip — it
+    // only proves nothing was pulled, which is exactly the no-op. So even a git
+    // checkout with identical pre/post HEAD and coherent-looking counts must NOT
+    // report success.
+    const dir = join(CUSTOM_NODES, "comfyui-mcp-panel");
+    const pyPath = join(dir, "pyproject.toml");
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: "cccccccccccccccccccccccccccccccccccccccc" },
+      updateDetails: { total_count: 1, done_count: 1, is_processing: false },
+      // No onUpdate → version AND git-HEAD both unchanged.
+    });
+    await expect(runPanelAction("update", h.deps)).rejects.toBeInstanceOf(
+      PanelInstallError,
+    );
+    await expect(runPanelAction("update", h.deps)).rejects.toThrow(
+      /could not verify|did not change/i,
+    );
+  });
+
+  it("#639: version unchanged, NO git identity, 'coherent' counts → fails closed (not success)", async () => {
+    // Queue counts are queue-WIDE drain counters, NOT task-correlated, so
+    // coherent-looking counts alone must NOT be treated as proof of work.
+    const dir = join(CUSTOM_NODES, "comfyui-mcp-panel");
+    const pyPath = join(dir, "pyproject.toml");
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.28") },
+      // No revs → gitRevision returns undefined for the dir.
+      updateDetails: { total_count: 1, done_count: 1, is_processing: false },
+    });
+    await expect(runPanelAction("update", h.deps)).rejects.toBeInstanceOf(
+      PanelInstallError,
+    );
+    await expect(runPanelAction("update", h.deps)).rejects.toThrow(
+      /could not verify|did not change/i,
+    );
+  });
+
+  it("#639: post-update version UNREADABLE → fail-closed, not silent success", async () => {
+    const dir = join(CUSTOM_NODES, "comfyui-mcp-panel");
+    const pyPath = join(dir, "pyproject.toml");
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.28") },
+      updateDetails: {
+        total_count: 1,
+        done_count: 1,
+        in_progress_count: 0,
+        pending_count: 0,
+        is_processing: false,
+      },
+      // Simulate the pack dir becoming unreadable after the op (pyproject gone).
+      // NOTE: destructure `files` from the ctx wrapper so we mutate the real map.
+      onUpdate: ({ files }) => {
+        delete files[pyPath];
+      },
+    });
+    await expect(runPanelAction("update", h.deps)).rejects.toBeInstanceOf(
+      PanelInstallError,
+    );
+    await expect(runPanelAction("update", h.deps)).rejects.toThrow(
+      /could not verify|NOT reporting success/i,
+    );
+  });
+
+  it("reinstall targets nightly (verifies pack landed)", async () => {
+    const dir = join(CUSTOM_NODES, "comfyui-mcp-panel");
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      onReinstall: ({ files }) => {
+        files[join(dir, "pyproject.toml")] = pyproject(PANEL_REGISTRY_ID, "0.11.32");
+      },
+    });
     const r = await runPanelAction("reinstall", h.deps);
     expect(h.reinstalls).toEqual([{ id: PANEL_REGISTRY_ID, version: PANEL_VERSION }]);
     expect(r.message).toMatch(/RESTART ComfyUI/);
+    expect(r.installedVersion).toBe("0.11.32");
+  });
+
+  it("#639: reinstall where the pack never lands → throws, not silent success", async () => {
+    // reinstallCustomNode does NOT verify presence downstream (unlike install),
+    // so the panel-layer post-op check is what fails this closed.
+    const h = makeDeps({ comfyuiPath: COMFY });
+    await expect(runPanelAction("reinstall", h.deps)).rejects.toBeInstanceOf(
+      PanelInstallError,
+    );
+    expect(h.reinstalls).toEqual([{ id: PANEL_REGISTRY_ID, version: PANEL_VERSION }]);
+  });
+
+  it("#639: reinstall on a PRE-EXISTING panel + stale no-op counts → throws (present ≠ executed)", async () => {
+    const dir = join(CUSTOM_NODES, "comfyui-mcp-panel");
+    const pyPath = join(dir, "pyproject.toml");
+    // Panel already present; Manager reports the stale-3.x no-op (total 0/done 2)
+    // and never actually reinstalls. Presence alone must NOT be read as success.
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.28") },
+      reinstallDetails: { total_count: 0, done_count: 2, is_processing: false },
+    });
+    await expect(runPanelAction("reinstall", h.deps)).rejects.toThrow(
+      /did NOT execute|stale ComfyUI-Manager/,
+    );
+  });
+
+  it("#639: install on a PRE-EXISTING panel + stale no-op counts → throws (present ≠ executed)", async () => {
+    const dir = join(CUSTOM_NODES, "comfyui-mcp-panel");
+    const pyPath = join(dir, "pyproject.toml");
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.28") },
+      installDetails: { total_count: 0, done_count: 2, is_processing: false },
+    });
+    await expect(runPanelAction("install", h.deps)).rejects.toThrow(
+      /did NOT execute|stale ComfyUI-Manager/,
+    );
+  });
+
+  it("#639: reinstall that ACTUALLY moves the version SUCCEEDS despite stale queue-wide counts", async () => {
+    // Movement is proven on disk; the queue-wide { total:0, done:2 } must NOT
+    // veto a change the disk already proves.
+    const dir = join(CUSTOM_NODES, "comfyui-mcp-panel");
+    const pyPath = join(dir, "pyproject.toml");
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.28") },
+      reinstallDetails: { total_count: 0, done_count: 2, is_processing: false },
+      onReinstall: ({ files }) => {
+        files[pyPath] = pyproject(PANEL_REGISTRY_ID, "0.11.32");
+      },
+    });
+    const r = await runPanelAction("reinstall", h.deps);
+    expect(r.installedVersion).toBe("0.11.32");
+    expect(r.restartRequired).toBe(true);
+  });
+
+  it("#639: unreliable PRE-op scan must NOT be read as absent→present (no fabricated fresh install)", async () => {
+    // Panel already present in a NON-fast-path dir. The pre-op enumeration fails
+    // (transient), so detection can't see it; a no-op reinstall leaves it as-is.
+    // The reliability guard must refuse to infer a fresh install.
+    const weird = "weird-panel-dir";
+    const pyPath = join(CUSTOM_NODES, weird, "pyproject.toml");
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.28") },
+      reinstallDetails: { total_count: 1, done_count: 1, is_processing: false },
+    });
+    let calls = 0;
+    h.deps.readdir = (p) => {
+      calls += 1;
+      if (calls === 1) throw new Error("EAGAIN transient scandir failure");
+      return p === CUSTOM_NODES ? [weird] : [];
+    };
+    await expect(runPanelAction("reinstall", h.deps)).rejects.toBeInstanceOf(
+      PanelInstallError,
+    );
+  });
+
+  it("#639: pre-op pyproject READ failure (present-but-unreadable) → not absent→present", async () => {
+    // Pre-existing canonical panel whose FIRST pyproject read throws (transient),
+    // SECOND succeeds; Manager does a stale no-op. The read failure must make the
+    // pre-op absence inconclusive so the tool does NOT fabricate a fresh install.
+    const dir = join(CUSTOM_NODES, "comfyui-mcp-panel");
+    const pyPath = join(dir, "pyproject.toml");
+    const contents = pyproject(PANEL_REGISTRY_ID, "0.11.28");
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: contents },
+      reinstallDetails: { total_count: 1, done_count: 1, is_processing: false },
+    });
+    let reads = 0;
+    h.deps.readFile = (p) => {
+      if (p === pyPath) {
+        reads += 1;
+        if (reads === 1) throw new Error("EBUSY transient read failure");
+      }
+      return contents;
+    };
+    await expect(runPanelAction("reinstall", h.deps)).rejects.toBeInstanceOf(
+      PanelInstallError,
+    );
   });
 
   it("REFUSES on a dev symlink", async () => {
@@ -340,6 +703,269 @@ describe("runPanelAction", () => {
   });
 });
 
+describe("runPanelAction shadow detection (#641)", () => {
+  const realDir = join(CUSTOM_NODES, "comfyui-mcp-panel");
+  const bakName = ".comfyui-agent-panel.bak-0.11.28";
+  const bakDir = join(CUSTOM_NODES, bakName);
+
+  it("update: a .bak shadow present → throws shadow diagnostic even if version moved", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: [bakName],
+      files: {
+        [join(realDir, "pyproject.toml")]: pyproject(PANEL_REGISTRY_ID, "0.11.28"),
+        [join(bakDir, "pyproject.toml")]: pyproject(PANEL_REGISTRY_ID, "0.11.28"),
+      },
+      updateDetails: { total_count: 1, done_count: 1, is_processing: false },
+      // Real dir DOES advance on disk — but the shadow can still win in the browser.
+      onUpdate: ({ files }) => {
+        files[join(realDir, "pyproject.toml")] = pyproject(PANEL_REGISTRY_ID, "0.11.32");
+      },
+    });
+    await expect(runPanelAction("update", h.deps)).rejects.toThrow(/shadow/i);
+    await expect(runPanelAction("update", h.deps)).rejects.toThrow(bakName);
+  });
+
+  it("update: shadow removed → success", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [join(realDir, "pyproject.toml")]: pyproject(PANEL_REGISTRY_ID, "0.11.28") },
+      updateDetails: { total_count: 1, done_count: 1, is_processing: false },
+      onUpdate: ({ files }) => {
+        files[join(realDir, "pyproject.toml")] = pyproject(PANEL_REGISTRY_ID, "0.11.32");
+      },
+    });
+    const r = await runPanelAction("update", h.deps);
+    expect(r.installedVersion).toBe("0.11.32");
+    expect(r.message).toMatch(/updated/i);
+  });
+
+  it("install: a shadow present → throws shadow diagnostic, not success", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: [bakName],
+      files: { [join(bakDir, "pyproject.toml")]: pyproject(PANEL_REGISTRY_ID, "0.11.28") },
+      onInstall: ({ files }) => {
+        files[join(realDir, "pyproject.toml")] = pyproject(PANEL_REGISTRY_ID, "0.11.32");
+      },
+    });
+    await expect(runPanelAction("install", h.deps)).rejects.toThrow(/shadow/i);
+  });
+
+  it("update: a LONE .bak (no real dir) is not mistaken for canonical → still flagged", async () => {
+    // Only the backup exists. detectPanelInstall must NOT resolve it as the
+    // install, and the shadow check must still fire.
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: [bakName],
+      files: { [join(bakDir, "pyproject.toml")]: pyproject(PANEL_REGISTRY_ID, "0.11.28") },
+      updateDetails: { total_count: 1, done_count: 1, is_processing: false },
+    });
+    await expect(runPanelAction("update", h.deps)).rejects.toThrow(/shadow/i);
+  });
+
+  it("update: fails closed when custom_nodes cannot be enumerated (indeterminate)", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [join(realDir, "pyproject.toml")]: pyproject(PANEL_REGISTRY_ID, "0.11.28") },
+      updateDetails: { total_count: 1, done_count: 1, is_processing: false },
+      onUpdate: ({ files }) => {
+        files[join(realDir, "pyproject.toml")] = pyproject(PANEL_REGISTRY_ID, "0.11.32");
+      },
+    });
+    // ACL that denies directory enumeration but allows direct path access.
+    h.deps.readdir = () => {
+      throw new Error("EACCES: permission denied, scandir");
+    };
+    await expect(runPanelAction("update", h.deps)).rejects.toThrow(
+      /cannot be confirmed|inspect custom_nodes/i,
+    );
+  });
+});
+
+describe("findPanelShadows (#641)", () => {
+  const realDir = join(CUSTOM_NODES, "comfyui-mcp-panel");
+
+  it("flags a dot-prefixed .bak panel copy (pyproject name match)", () => {
+    const bak = ".comfyui-agent-panel.bak-0.11.28";
+    const { deps } = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: [bak],
+      files: {
+        [join(CUSTOM_NODES, bak, "pyproject.toml")]: pyproject(PANEL_REGISTRY_ID, "0.11.28"),
+      },
+    });
+    const s = findPanelShadows(realDir, deps);
+    expect(s.map((x) => x.name)).toContain(bak);
+    expect(s[0].version).toBe("0.11.28");
+  });
+
+  it("flags a web-only backup by dir name even without a panel pyproject", () => {
+    const bak = ".comfyui-mcp-panel.bak";
+    const { deps } = makeDeps({ comfyuiPath: COMFY, dirs: [bak] });
+    expect(findPanelShadows(realDir, deps).map((x) => x.name)).toContain(bak);
+  });
+
+  it("flags an editor '~' backup dir (web-only, no pyproject)", () => {
+    const bak = ".comfyui-agent-panel~";
+    const { deps } = makeDeps({ comfyuiPath: COMFY, dirs: [bak] });
+    expect(findPanelShadows(realDir, deps).map((x) => x.name)).toContain(bak);
+  });
+
+  it("does NOT block on a regular FILE that merely shares a backup name", () => {
+    const bak = ".comfyui-agent-panel.bak-0.11.28";
+    const { deps } = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: [bak],
+      nonDirEntries: [bak], // it's a FILE, not a served extension dir
+    });
+    expect(findPanelShadows(realDir, deps)).toEqual([]);
+  });
+
+  it("does NOT flag an unrelated custom node", () => {
+    const { deps } = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: ["some-other-node"],
+      files: {
+        [join(CUSTOM_NODES, "some-other-node", "pyproject.toml")]: pyproject("other-pack"),
+      },
+    });
+    expect(findPanelShadows(realDir, deps)).toEqual([]);
+  });
+
+  it("does NOT false-flag an unrelated panel-adjacent node (comfyui-agent-panel-tools)", () => {
+    const tools = "comfyui-agent-panel-tools";
+    const { deps } = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: [tools],
+      files: {
+        [join(CUSTOM_NODES, tools, "pyproject.toml")]: pyproject(tools, "1.0.0"),
+      },
+    });
+    expect(findPanelShadows(realDir, deps)).toEqual([]);
+  });
+
+  it("does NOT false-flag a HIDDEN unrelated node (.comfyui-agent-panel-tools)", () => {
+    const tools = ".comfyui-agent-panel-tools";
+    const { deps } = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: [tools],
+      files: {
+        [join(CUSTOM_NODES, tools, "pyproject.toml")]: pyproject(
+          "comfyui-agent-panel-tools",
+          "1.0.0",
+        ),
+      },
+    });
+    expect(findPanelShadows(realDir, deps)).toEqual([]);
+  });
+
+  it("does NOT flag the canonical dir itself", () => {
+    const { deps } = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: ["comfyui-mcp-panel"],
+      files: { [join(realDir, "pyproject.toml")]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+    });
+    expect(findPanelShadows(realDir, deps)).toEqual([]);
+  });
+
+  it("FAILS CLOSED (flags) a distinct-case dir when realpath is unavailable", () => {
+    // Without physical identity we cannot prove "ComfyUI-MCP-Panel" is the same
+    // dir as the canonical, so we must NOT case-fold it away — flag it.
+    const preserved = "ComfyUI-MCP-Panel";
+    const { deps } = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: [preserved],
+      files: {
+        [join(realDir, "pyproject.toml")]: pyproject(PANEL_REGISTRY_ID, "0.11.32"),
+        [join(CUSTOM_NODES, preserved, "pyproject.toml")]: pyproject(PANEL_REGISTRY_ID, "0.11.28"),
+      },
+      // No realPaths → realPath() returns undefined → fail closed.
+    });
+    expect(findPanelShadows(realDir, deps).map((x) => x.name)).toContain(preserved);
+  });
+
+  it("exempts a preserved-case canonical dir by PHYSICAL identity (same realpath)", () => {
+    const preserved = "ComfyUI-MCP-Panel";
+    const canonical = join(CUSTOM_NODES, "comfyui-mcp-panel");
+    const real = "/real/fs/comfyui-mcp-panel";
+    const { deps } = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: [preserved],
+      files: {
+        [join(canonical, "pyproject.toml")]: pyproject(PANEL_REGISTRY_ID, "0.11.32"),
+        [join(CUSTOM_NODES, preserved, "pyproject.toml")]: pyproject(PANEL_REGISTRY_ID, "0.11.32"),
+      },
+      // Both names resolve to the SAME physical dir (case-insensitive volume).
+      realPaths: {
+        [canonical]: real,
+        [join(CUSTOM_NODES, preserved)]: real,
+      },
+    });
+    expect(findPanelShadows(canonical, deps)).toEqual([]);
+  });
+
+  it("FLAGS a distinct-case coexisting dir (different realpath, case-sensitive volume)", () => {
+    const other = "ComfyUI-MCP-Panel";
+    const canonical = join(CUSTOM_NODES, "comfyui-mcp-panel");
+    const { deps } = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: [other],
+      files: {
+        [join(canonical, "pyproject.toml")]: pyproject(PANEL_REGISTRY_ID, "0.11.32"),
+        [join(CUSTOM_NODES, other, "pyproject.toml")]: pyproject(PANEL_REGISTRY_ID, "0.11.28"),
+      },
+      // Distinct physical dirs — must NOT be exempted.
+      realPaths: {
+        [canonical]: "/real/fs/comfyui-mcp-panel",
+        [join(CUSTOM_NODES, other)]: "/real/fs/ComfyUI-MCP-Panel",
+      },
+    });
+    expect(findPanelShadows(canonical, deps).map((x) => x.name)).toContain(other);
+  });
+
+  it("throws (indeterminate) when custom_nodes cannot be enumerated", () => {
+    const { deps } = makeDeps({ comfyuiPath: COMFY });
+    deps.readdir = () => {
+      throw new Error("EACCES");
+    };
+    expect(() => findPanelShadows(realDir, deps)).toThrow(/EACCES/);
+  });
+
+  it("returns [] in remote/cloud mode", () => {
+    const { deps } = makeDeps({ comfyuiPath: COMFY, local: false });
+    expect(findPanelShadows(undefined, deps)).toEqual([]);
+  });
+});
+
+describe("looksLikePanelBackupName (#641)", () => {
+  it("flags dot-prefixed and backup-token panel copies", () => {
+    expect(looksLikePanelBackupName(".comfyui-agent-panel.bak-0.11.28")).toBe(true);
+    expect(looksLikePanelBackupName(".comfyui-mcp-panel")).toBe(true);
+    expect(looksLikePanelBackupName("comfyui-agent-panel.bak")).toBe(true);
+    expect(looksLikePanelBackupName("comfyui-mcp-panel-backup")).toBe(true);
+    expect(looksLikePanelBackupName("comfyui-agent-panel.old")).toBe(true);
+    expect(looksLikePanelBackupName("comfyui-agent-panel-copy")).toBe(true);
+    expect(looksLikePanelBackupName(".comfyui-agent-panel~")).toBe(true);
+    expect(looksLikePanelBackupName("comfyui-mcp-panel~")).toBe(true);
+  });
+
+  it("does NOT flag the canonical names or unrelated extensions", () => {
+    expect(looksLikePanelBackupName("comfyui-mcp-panel")).toBe(false);
+    expect(looksLikePanelBackupName("comfyui-agent-panel")).toBe(false);
+    expect(looksLikePanelBackupName("comfyui-agent-panel-tools")).toBe(false);
+    // A HIDDEN unrelated panel-adjacent node must NOT be flagged by name alone.
+    expect(looksLikePanelBackupName(".comfyui-agent-panel-tools")).toBe(false);
+    expect(looksLikePanelBackupName("some-unrelated-node")).toBe(false);
+  });
+
+  it("flags a HIDDEN exact-name copy but not the plain canonical name", () => {
+    expect(looksLikePanelBackupName(".comfyui-agent-panel")).toBe(true);
+    expect(looksLikePanelBackupName(".comfyui-mcp-panel")).toBe(true);
+    expect(looksLikePanelBackupName("comfyui-agent-panel")).toBe(false);
+  });
+});
+
 describe("panelStatus", () => {
   it("never throws and reports not-applicable in remote/cloud mode", async () => {
     const { deps } = makeDeps({ comfyuiPath: undefined });
@@ -376,5 +1002,275 @@ describe("panelStatus", () => {
     expect(s.installed).toBe(false);
     expect(s.targetVersion).toBe(PANEL_VERSION);
     expect(s.note).toMatch(/install/i);
+  });
+
+  it("#641: reports a shadow copy in the note and shadows[] (never throws)", async () => {
+    const real = join(CUSTOM_NODES, "comfyui-mcp-panel");
+    const bak = ".comfyui-agent-panel.bak-0.11.28";
+    const { deps } = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: [bak],
+      files: {
+        [join(real, "pyproject.toml")]: pyproject(PANEL_REGISTRY_ID, "0.11.32"),
+        [join(CUSTOM_NODES, bak, "pyproject.toml")]: pyproject(PANEL_REGISTRY_ID, "0.11.28"),
+      },
+    });
+    const s = await panelStatus(deps);
+    expect(s.installed).toBe(true);
+    expect(s.installedVersion).toBe("0.11.32");
+    expect(s.shadows.map((x) => x.name)).toContain(bak);
+    expect(s.note).toMatch(/shadow/i);
+  });
+
+  it("has an empty shadows[] when there is no backup dir", async () => {
+    const real = join(CUSTOM_NODES, "comfyui-mcp-panel");
+    const { deps } = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [join(real, "pyproject.toml")]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+    });
+    const s = await panelStatus(deps);
+    expect(s.shadows).toEqual([]);
+  });
+});
+
+describe("classifyPanelUpdate (#639 verification core)", () => {
+  const coherent = {
+    total_count: 1,
+    done_count: 1,
+    in_progress_count: 0,
+    pending_count: 0,
+    is_processing: false,
+  };
+  // The stale 3.x no-op the issue reported verbatim.
+  const noOpCounts = {
+    total_count: 0,
+    done_count: 2,
+    in_progress_count: 0,
+    pending_count: 0,
+    is_processing: false,
+  };
+
+  it("version moved → updated", () => {
+    expect(
+      classifyPanelUpdate(
+        { previousVersion: "0.11.28", installedVersion: "0.11.32" },
+        coherent,
+      ).outcome,
+    ).toBe("updated");
+  });
+
+  it("git-HEAD moved (version unchanged) → updated", () => {
+    expect(
+      classifyPanelUpdate(
+        {
+          previousVersion: "0.11.32",
+          installedVersion: "0.11.32",
+          previousRev: "aaaa",
+          installedRev: "bbbb",
+        },
+        coherent,
+      ).outcome,
+    ).toBe("updated");
+  });
+
+  it("version unchanged + no-op counts (total 0 / done 2), no git → no-op", () => {
+    expect(
+      classifyPanelUpdate(
+        { previousVersion: "0.11.28", installedVersion: "0.11.28" },
+        noOpCounts,
+      ).outcome,
+    ).toBe("no-op");
+  });
+
+  it("version unchanged + done > total incoherence, no git → no-op", () => {
+    expect(
+      classifyPanelUpdate(
+        { previousVersion: "1.0.0", installedVersion: "1.0.0" },
+        { total_count: 1, done_count: 5 },
+      ).outcome,
+    ).toBe("no-op");
+  });
+
+  it("identical git-HEAD + no-op counts → no-op (unchanged HEAD is NOT proof of currency)", () => {
+    expect(
+      classifyPanelUpdate(
+        {
+          previousVersion: "0.11.28",
+          installedVersion: "0.11.28",
+          previousRev: "cccc",
+          installedRev: "cccc",
+        },
+        noOpCounts,
+      ).outcome,
+    ).toBe("no-op");
+  });
+
+  it("identical git-HEAD + coherent counts → unverified (never 'already-current')", () => {
+    expect(
+      classifyPanelUpdate(
+        {
+          previousVersion: "0.11.32",
+          installedVersion: "0.11.32",
+          previousRev: "cccc",
+          installedRev: "cccc",
+        },
+        coherent,
+      ).outcome,
+    ).toBe("unverified");
+  });
+
+  it("version unchanged + coherent counts but NO git identity → unverified (not success)", () => {
+    expect(
+      classifyPanelUpdate(
+        { previousVersion: "0.11.32", installedVersion: "0.11.32" },
+        coherent,
+      ).outcome,
+    ).toBe("unverified");
+  });
+
+  it("no post-update identity at all → unverified", () => {
+    expect(
+      classifyPanelUpdate({ previousVersion: "1.0.0" }, coherent).outcome,
+    ).toBe("unverified");
+  });
+
+  it("no pre-update baseline → unverified (can't prove a move)", () => {
+    expect(
+      classifyPanelUpdate({ installedVersion: "1.0.0" }, coherent).outcome,
+    ).toBe("unverified");
+  });
+
+  it("version unchanged + no queue evidence + no git → unverified (not success)", () => {
+    expect(
+      classifyPanelUpdate(
+        { previousVersion: "1.0.0", installedVersion: "1.0.0" },
+        undefined,
+      ).outcome,
+    ).toBe("unverified");
+    expect(
+      classifyPanelUpdate(
+        { previousVersion: "1.0.0", installedVersion: "1.0.0" },
+        "cm-cli text output",
+      ).outcome,
+    ).toBe("unverified");
+  });
+
+  it("looksLikeManagerNoOp flags total 0 and done>total, not coherent work", () => {
+    expect(looksLikeManagerNoOp({ total_count: 0, done_count: 2 })).toBe(true);
+    expect(looksLikeManagerNoOp({ total_count: 1, done_count: 5 })).toBe(true);
+    expect(looksLikeManagerNoOp({ total_count: 1, done_count: 1 })).toBe(false);
+    expect(looksLikeManagerNoOp({ total_count: 2, done_count: 2 })).toBe(false);
+    expect(looksLikeManagerNoOp(undefined)).toBe(false); // no counts → not a proven no-op
+    expect(looksLikeManagerNoOp("cm-cli text")).toBe(false);
+  });
+
+  it("readQueueCounts ignores non-object details", () => {
+    expect(readQueueCounts(undefined)).toEqual({});
+    expect(readQueueCounts("string")).toEqual({});
+    expect(readQueueCounts({ total_count: 3, done_count: 3 })).toMatchObject({
+      total: 3,
+      done: 3,
+    });
+  });
+});
+
+describe("resolveGitRevision (real fs)", () => {
+  const roots: string[] = [];
+  function newRepo(): string {
+    const root = mkdtempSync(join(tmpdir(), "panel-git-"));
+    roots.push(root);
+    mkdirSync(join(root, ".git"), { recursive: true });
+    return root;
+  }
+  afterAll(() => {
+    for (const r of roots) rmSync(r, { recursive: true, force: true });
+  });
+
+  const SHA = "0123456789abcdef0123456789abcdef01234567";
+
+  it("resolves a symbolic HEAD via a loose ref", () => {
+    const root = newRepo();
+    writeFileSync(join(root, ".git", "HEAD"), "ref: refs/heads/main\n");
+    mkdirSync(join(root, ".git", "refs", "heads"), { recursive: true });
+    writeFileSync(join(root, ".git", "refs", "heads", "main"), `${SHA}\n`);
+    expect(resolveGitRevision(root)).toBe(SHA);
+  });
+
+  it("resolves a symbolic HEAD via packed-refs when no loose ref exists", () => {
+    const root = newRepo();
+    writeFileSync(join(root, ".git", "HEAD"), "ref: refs/heads/nightly\n");
+    writeFileSync(
+      join(root, ".git", "packed-refs"),
+      `# pack-refs with: peeled fully-peeled sorted\n${SHA} refs/heads/nightly\n`,
+    );
+    expect(resolveGitRevision(root)).toBe(SHA);
+  });
+
+  it("resolves a detached HEAD (inline sha)", () => {
+    const root = newRepo();
+    writeFileSync(join(root, ".git", "HEAD"), `${SHA}\n`);
+    expect(resolveGitRevision(root)).toBe(SHA);
+  });
+
+  it("resolves a SHA-256 (64-char) object id", () => {
+    const sha256 = "a".repeat(64);
+    const root = newRepo();
+    writeFileSync(join(root, ".git", "HEAD"), "ref: refs/heads/main\n");
+    mkdirSync(join(root, ".git", "refs", "heads"), { recursive: true });
+    writeFileSync(join(root, ".git", "refs", "heads", "main"), `${sha256}\n`);
+    expect(resolveGitRevision(root)).toBe(sha256);
+  });
+
+  it("follows a .git FILE pointer (worktree/submodule layout)", () => {
+    const root = newRepo();
+    // Real git dir lives elsewhere; .git is a file pointing at it.
+    const realGit = mkdtempSync(join(tmpdir(), "panel-gitdir-"));
+    roots.push(realGit);
+    writeFileSync(join(realGit, "HEAD"), `${SHA}\n`);
+    // Overwrite .git as a FILE pointer (rm the dir first).
+    rmSync(join(root, ".git"), { recursive: true, force: true });
+    writeFileSync(join(root, ".git"), `gitdir: ${realGit}\n`);
+    expect(resolveGitRevision(root)).toBe(SHA);
+  });
+
+  it("resolves a linked worktree ref via commondir (shared refs)", () => {
+    const root = newRepo();
+    // Per-worktree gitdir holds HEAD + commondir; shared refs live in commondir.
+    writeFileSync(join(root, ".git", "HEAD"), "ref: refs/heads/main\n");
+    const common = mkdtempSync(join(tmpdir(), "panel-common-"));
+    roots.push(common);
+    writeFileSync(join(root, ".git", "commondir"), `${common}\n`);
+    mkdirSync(join(common, "refs", "heads"), { recursive: true });
+    writeFileSync(join(common, "refs", "heads", "main"), `${SHA}\n`);
+    expect(resolveGitRevision(root)).toBe(SHA);
+  });
+
+  it("returns undefined for a non-git dir (never throws)", () => {
+    const root = mkdtempSync(join(tmpdir(), "panel-nogit-"));
+    roots.push(root);
+    expect(resolveGitRevision(root)).toBeUndefined();
+  });
+
+  it("returns undefined for a NON-sha loose ref (transient/corrupt), never a fake sha", () => {
+    const root = newRepo();
+    writeFileSync(join(root, ".git", "HEAD"), "ref: refs/heads/main\n");
+    mkdirSync(join(root, ".git", "refs", "heads"), { recursive: true });
+    // Transient garbage / symbolic content — must NOT be treated as a commit sha.
+    writeFileSync(join(root, ".git", "refs", "heads", "main"), "ref: refs/heads/other\n");
+    expect(resolveGitRevision(root)).toBeUndefined();
+  });
+
+  it("returns undefined for a detached HEAD that isn't a sha", () => {
+    const root = newRepo();
+    writeFileSync(join(root, ".git", "HEAD"), "updating\n");
+    expect(resolveGitRevision(root)).toBeUndefined();
+  });
+
+  it("rejects an ABBREVIATED (truncated) hex id — only full 40/64 accepted", () => {
+    const root = newRepo();
+    writeFileSync(join(root, ".git", "HEAD"), "ref: refs/heads/main\n");
+    mkdirSync(join(root, ".git", "refs", "heads"), { recursive: true });
+    writeFileSync(join(root, ".git", "refs", "heads", "main"), "deadbee\n"); // 7 hex
+    expect(resolveGitRevision(root)).toBeUndefined();
   });
 });
