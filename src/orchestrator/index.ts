@@ -21,7 +21,7 @@ import { setupSecureBridge, resolveComfyuiPathForTarget, type SecureBridge } fro
 import { startQuickTunnel } from "../services/tunnel.js";
 import { detectInstallMode } from "../services/self-update.js";
 import { SelfRestarter } from "../services/self-restart.js";
-import { SessionStore, deriveStableKey } from "./session-store.js";
+import { SessionStore, deriveStableKey, workflowIdentityParts } from "./session-store.js";
 import { listSessions, loadTranscript } from "./history.js";
 import { uploadImageHttp, resetClient } from "../comfyui/client.js";
 import { logger } from "../utils/logger.js";
@@ -1383,11 +1383,14 @@ export async function runPanelOrchestrator(): Promise<void> {
   // resume key (wfid::origin::uuid::backend, see deriveStableKey) computed at hello, so
   // onSession can also persist under it and a reloaded tab can resume it. tmp: tabs only.
   const tabStableKey = new Map<string, string>();
-  // The backend-independent components (origin + per-instance uuid) behind each tab's
-  // stable key, so a provider switch via set_backend (which never re-hellos) can RECOMPUTE
-  // the key for the new backend. Without this the stale key would keep the old backend and
-  // the new provider's onSession would persist its session under it — a cross-provider
-  // wrong-resume on a later reconnect (#570). tmp: tabs with a valid uuid only.
+  // Each tab's TRUSTED, backend-independent workflow identity (server-observed origin +
+  // durable per-instance uuid). Two uses (#570): (1) the migration discriminator — tell a
+  // same-socket tab-id migration of ONE workflow (identity unchanged) from a SWITCH to a
+  // different workflow (identity changed), so we never rebind one workflow's agent onto
+  // another (P0a); (2) the set_backend recompute — a provider switch never re-hellos, so
+  // the stable key (which encodes the backend) is recomputed from this identity, else the
+  // new provider's onSession would persist under the old backend's key. Tracked for every
+  // tab with a valid identity; cleared when the identity is absent/untrusted.
   const tabStableIdentity = new Map<string, { origin: string; uuid: string }>();
   const workflowTargets = new WorkflowTargetStore();
   // Monotonic per-tab sequence for set_workflow_target events. A pinned target is
@@ -2492,61 +2495,106 @@ export async function runPanelOrchestrator(): Promise<void> {
         typeof (event as { migrated_from?: unknown }).migrated_from === "string"
           ? ((event as { migrated_from?: string }).migrated_from as string)
           : undefined;
+      // #570 P0a: compute this hello's TRUSTED, backend-independent workflow identity
+      // up front — the discriminator for the migration decision below AND (for tmp:
+      // tabs) the resume-key seed further down. serverOrigin is the unspoofable
+      // handshake origin; helloUuid is the panel's durable per-instance uuid.
+      const serverOrigin = bridge.tabServerOrigin(panelTab);
+      const helloUuid =
+        typeof (event as { workflow_uuid?: unknown }).workflow_uuid === "string"
+          ? ((event as { workflow_uuid?: string }).workflow_uuid as string)
+          : undefined;
+      const newIdentity = workflowIdentityParts({ workflowUuid: helloUuid, origin: serverOrigin });
+
       if (migratedFrom && migratedFrom !== panelTab) {
         const prevBackend = tabBackends.get(migratedFrom) ?? backend;
-        const prevKey = migratedFrom + AGENT_KEY_SEP + prevBackend;
-        const newKey = panelTab + AGENT_KEY_SEP + prevBackend;
-        if (manager.rebindAgent(prevKey, newKey)) {
+        const prevIdentity = tabStableIdentity.get(migratedFrom);
+        // The bridge stamps migrated_from on ANY same-socket re-hello under a new tab
+        // id — it sees SOCKET continuity, not WORKFLOW continuity. That covers a
+        // genuine tab-id migration of ONE workflow (tmp:→wf: save, rename, a panel
+        // id-scheme upgrade — the durable uuid is UNCHANGED) AND a SWITCH to a
+        // DIFFERENT workflow on the same browser tab (a DIFFERENT uuid). #570 P0a:
+        // blindly rebinding the old agent onto the new id handed the switched-to
+        // workflow the PREVIOUS one's conversation (setResume refuses the new tab's own
+        // resume while a rebound agent is live) and persisted it under the new key.
+        // Rebind ONLY when the trusted identity is UNCHANGED; on a validated DIFFERENT
+        // identity, treat it as a switch — retire the old agent (keeping its durable
+        // session for when it's reopened) and let the new workflow honor its OWN
+        // resume / stable key / fresh session.
+        const isWorkflowSwitch =
+          prevIdentity !== undefined &&
+          newIdentity !== undefined &&
+          (prevIdentity.uuid !== newIdentity.uuid || prevIdentity.origin !== newIdentity.origin);
+        if (isWorkflowSwitch) {
+          manager.retire(migratedFrom + AGENT_KEY_SEP + prevBackend);
           logger.info(
-            `[panel-orchestrator] tab-id migration: ${migratedFrom.slice(0, 12)} → ${panelTab.slice(0, 12)} — agent rebound, conversation preserved`,
+            `[panel-orchestrator] same-socket WORKFLOW SWITCH ${migratedFrom.slice(0, 12)} → ${panelTab.slice(0, 12)} — old agent retired (NOT rebound); each workflow keeps its own conversation`,
           );
-        }
-        // Carry the old tab's runtime prefs to the new id regardless of whether
-        // an agent was live (backend pick, headless flag, pinned workflow
-        // target, held-during-render queue), then retire the old id.
-        if (!tabBackends.has(panelTab) && tabBackends.has(migratedFrom)) {
-          tabBackends.set(panelTab, tabBackends.get(migratedFrom)!);
-        }
-        if (headlessTabs.has(migratedFrom)) headlessTabs.add(panelTab);
-        // MOVE the pinned workflow target, don't discard it (codex review).
-        const pinned = workflowTargets.get(migratedFrom);
-        if (pinned.mode === "pinned") workflowTargets.set(panelTab, pinned);
-        // Re-key messages held during a render so the flush reaches the
-        // REBOUND agent instead of respawning one under the retired key.
-        const prevBackendForHeld = tabBackends.get(migratedFrom) ?? backend;
-        const heldOld = heldDuringGen.get(migratedFrom + AGENT_KEY_SEP + prevBackendForHeld);
-        if (heldOld?.length) {
-          const heldNewKey = panelTab + AGENT_KEY_SEP + prevBackendForHeld;
-          heldDuringGen.set(heldNewKey, [...(heldDuringGen.get(heldNewKey) ?? []), ...heldOld]);
-          heldDuringGen.delete(migratedFrom + AGENT_KEY_SEP + prevBackendForHeld);
-        }
-        tabBackends.delete(migratedFrom);
-        headlessTabs.delete(migratedFrom);
-        workflowTargets.clear(migratedFrom);
-        // Invalidate any in-flight set_workflow_target(pinned) resolution captured under
-        // the retired id: dropping its sequence makes isCurrent() false, so a late async
-        // pin can no longer write a stale target / emit a late ack that the bridge's
-        // migration map would deliver to the new tab (codex race, tab-id migration edge).
-        workflowTargetSeq.delete(migratedFrom);
-        // #570: CARRY the stable-key mapping onto the new id — don't just drop it. For
-        // a still-unsaved (tmp:) target the seed block below OVERWRITES it when the
-        // replacement hello has a valid uuid, or the fail-closed branch uses it to
-        // RETIRE the persisted session when the replacement hello is degraded (no/
-        // malformed uuid) — without the carry-over a migration through a downgraded
-        // panel would strand a reset-resurrectable entry (a later new_session can't
-        // resolve the key to clear). For a SAVED (wf:) target the exact key owns resume,
-        // so the old unsaved stable session is retired outright.
-        const carriedStable = tabStableKey.get(migratedFrom);
-        const carriedIdentity = tabStableIdentity.get(migratedFrom);
-        tabStableKey.delete(migratedFrom);
-        tabStableIdentity.delete(migratedFrom);
-        if (carriedStable !== undefined) {
-          if (panelTab.startsWith("tmp:")) {
-            tabStableKey.set(panelTab, carriedStable);
-            if (carriedIdentity) tabStableIdentity.set(panelTab, carriedIdentity);
-          } else sessionStore.clearStable(carriedStable);
+          // Retire the old id's routing/prefs — do NOT carry them to a different
+          // workflow. The old workflow's durable session stays on disk (retire()
+          // preserved it); its stable identity is dropped from the live maps.
+          heldDuringGen.delete(migratedFrom + AGENT_KEY_SEP + prevBackend);
+          tabBackends.delete(migratedFrom);
+          headlessTabs.delete(migratedFrom);
+          workflowTargets.clear(migratedFrom);
+          workflowTargetSeq.delete(migratedFrom);
+          tabStableKey.delete(migratedFrom);
+          tabStableIdentity.delete(migratedFrom);
+        } else {
+          const prevKey = migratedFrom + AGENT_KEY_SEP + prevBackend;
+          const newKey = panelTab + AGENT_KEY_SEP + prevBackend;
+          if (manager.rebindAgent(prevKey, newKey)) {
+            logger.info(
+              `[panel-orchestrator] tab-id migration: ${migratedFrom.slice(0, 12)} → ${panelTab.slice(0, 12)} — agent rebound, conversation preserved`,
+            );
+          }
+          // Carry the old tab's runtime prefs to the new id regardless of whether
+          // an agent was live (backend pick, headless flag, pinned workflow
+          // target, held-during-render queue), then retire the old id.
+          if (!tabBackends.has(panelTab) && tabBackends.has(migratedFrom)) {
+            tabBackends.set(panelTab, tabBackends.get(migratedFrom)!);
+          }
+          if (headlessTabs.has(migratedFrom)) headlessTabs.add(panelTab);
+          // MOVE the pinned workflow target, don't discard it (codex review).
+          const pinned = workflowTargets.get(migratedFrom);
+          if (pinned.mode === "pinned") workflowTargets.set(panelTab, pinned);
+          // Re-key messages held during a render so the flush reaches the
+          // REBOUND agent instead of respawning one under the retired key.
+          const prevBackendForHeld = tabBackends.get(migratedFrom) ?? backend;
+          const heldOld = heldDuringGen.get(migratedFrom + AGENT_KEY_SEP + prevBackendForHeld);
+          if (heldOld?.length) {
+            const heldNewKey = panelTab + AGENT_KEY_SEP + prevBackendForHeld;
+            heldDuringGen.set(heldNewKey, [...(heldDuringGen.get(heldNewKey) ?? []), ...heldOld]);
+            heldDuringGen.delete(migratedFrom + AGENT_KEY_SEP + prevBackendForHeld);
+          }
+          tabBackends.delete(migratedFrom);
+          headlessTabs.delete(migratedFrom);
+          workflowTargets.clear(migratedFrom);
+          // Invalidate any in-flight set_workflow_target(pinned) resolution captured under
+          // the retired id: dropping its sequence makes isCurrent() false, so a late async
+          // pin can no longer write a stale target / emit a late ack that the bridge's
+          // migration map would deliver to the new tab (codex race, tab-id migration edge).
+          workflowTargetSeq.delete(migratedFrom);
+          // #570: CARRY the stable-key mapping onto the new id — same workflow (identity
+          // unchanged), so its resume must survive the tab-id change. For a still-unsaved
+          // (tmp:) target the seed block below OVERWRITES it (recomputed for the new
+          // backend); for a SAVED (wf:) target the exact key owns resume, so the old
+          // unsaved stable session is retired outright.
+          const carriedStable = tabStableKey.get(migratedFrom);
+          tabStableKey.delete(migratedFrom);
+          tabStableIdentity.delete(migratedFrom);
+          if (carriedStable !== undefined) {
+            if (panelTab.startsWith("tmp:")) tabStableKey.set(panelTab, carriedStable);
+            else sessionStore.clearStable(carriedStable);
+          }
         }
       }
+
+      // #570: record this tab's TRUSTED identity (every tab) for the migration
+      // discriminator above and the set_backend recompute below. Absent/untrusted →
+      // cleared (fail closed: no proof of continuity → a future migration won't rebind).
+      if (newIdentity) tabStableIdentity.set(panelTab, newIdentity);
+      else tabStableIdentity.delete(panelTab);
       // Blind content mode rides the hello (issue #90) so the FIRST agent spawn
       // already carries the right tool-server env. A CHANGE against a live
       // agent also respawns it (codex-review F2: the set_content_mode frame is
@@ -2600,29 +2648,16 @@ export async function runPanelOrchestrator(): Promise<void> {
       // than the collision-prone origin+title key. Saved workflows (wf:<path>) already
       // key stably, so this is tmp:-only.
       if (panelTab.startsWith("tmp:")) {
-        // TRUSTED origin only: the server-observed handshake origin (the browser sets
-        // it and blocks page JS from forging it), NOT the client-supplied
-        // hello.comfyui_url — otherwise a spoofed origin could let a copied uuid derive
-        // another instance's stable key. Undefined (relay/headless, no handshake
-        // origin) → deriveStableKey fails closed.
-        const origin = bridge.tabServerOrigin(panelTab);
         // #570 REOPEN: origin+title is NOT unique (unsaved tabs share the default
         // "Unsaved Workflow" title), so it cross-resumed an unrelated same-title
-        // workflow. deriveStableKey keys on the panel's durable per-instance uuid —
-        // two distinct unsaved workflows can never share it — and returns undefined
-        // when no valid uuid is advertised (old/pre-capability panel), so we skip the
-        // disk fallback entirely rather than reuse the buggy legacy key.
-        const workflowUuid =
-          typeof (event as { workflow_uuid?: unknown }).workflow_uuid === "string"
-            ? ((event as { workflow_uuid?: string }).workflow_uuid as string)
-            : undefined;
-        const skey = deriveStableKey({ workflowUuid, origin, backend });
-        if (skey && origin) {
+        // workflow. deriveStableKey keys on the panel's durable per-instance uuid +
+        // TRUSTED server-observed origin (newIdentity, computed above) — two distinct
+        // unsaved workflows can never share it — and yields undefined when no valid
+        // uuid / trusted origin, so we skip the disk fallback entirely rather than
+        // reuse the buggy legacy key. (tabStableIdentity is already set above.)
+        const skey = newIdentity ? deriveStableKey({ workflowUuid: helloUuid, origin: serverOrigin, backend }) : undefined;
+        if (skey) {
           tabStableKey.set(panelTab, skey);
-          // Remember the backend-independent identity so a later set_backend can
-          // recompute the key for the new provider (origin + workflowUuid are both
-          // valid here — skey was derived from them).
-          tabStableIdentity.set(panelTab, { origin, uuid: workflowUuid as string });
           // Seed the resume fallback ONLY when the panel supplied none and no live
           // agent owns the key. spawn() prefers the exact-tab store hit over this
           // pendingResume, so the precise path is never overridden — this only
@@ -2878,7 +2913,10 @@ export async function runPanelOrchestrator(): Promise<void> {
         // mapping and fail closed until the next hello re-establishes it. The prior
         // backend's own stable entry stays on disk (a legit per-provider session) and is
         // correctly re-derivable if the user switches back.
-        const ident = tabStableIdentity.get(panelTab);
+        // Only tmp: tabs carry a stable RESUME key (saved workflows key on the exact
+        // wf: path); tabStableIdentity is tracked for every tab (migration discriminator)
+        // so gate the recompute on tmp: to avoid seeding a stable key for a saved tab.
+        const ident = panelTab.startsWith("tmp:") ? tabStableIdentity.get(panelTab) : undefined;
         const reBackendKey = ident
           ? deriveStableKey({ workflowUuid: ident.uuid, origin: ident.origin, backend: reqBackend })
           : undefined;

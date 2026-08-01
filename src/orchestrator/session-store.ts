@@ -104,23 +104,46 @@ interface StoreFileV2 {
  */
 const WORKFLOW_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/** The validated + canonicalized (origin, uuid) behind a stable key, or undefined when
+ *  either is missing/untrusted (fail closed). The origin MUST be the caller's
+ *  SERVER-OBSERVED (unspoofable) handshake origin — never the client-supplied
+ *  hello.comfyui_url — so a spoofed origin can't let a copied uuid derive another
+ *  instance's key. Shared by {@link deriveStableKey} (resume key) and
+ *  {@link deriveWorkflowIdentity} (the backend-independent identity used to tell a
+ *  same-socket tab-id MIGRATION of one workflow from a SWITCH to a different one). */
+export function workflowIdentityParts(opts: {
+  workflowUuid?: string | undefined;
+  origin?: string | undefined;
+}): { origin: string; uuid: string } | undefined {
+  const raw = typeof opts.workflowUuid === "string" ? opts.workflowUuid.trim() : "";
+  const uuid = WORKFLOW_UUID_RE.test(raw) ? raw.toLowerCase() : "";
+  if (!uuid) return undefined;
+  const origin =
+    typeof opts.origin === "string" ? opts.origin.trim().replace(/\/+$/, "").toLowerCase() : "";
+  if (!origin) return undefined;
+  return { origin, uuid };
+}
+
 export function deriveStableKey(opts: {
   workflowUuid?: string | undefined;
   origin?: string | undefined;
   backend: string;
 }): string | undefined {
-  const raw = typeof opts.workflowUuid === "string" ? opts.workflowUuid.trim() : "";
-  const uuid = WORKFLOW_UUID_RE.test(raw) ? raw.toLowerCase() : "";
-  if (!uuid) return undefined; // fail closed: no durable identity → no stable resume
-  // The origin MUST be the caller's SERVER-OBSERVED (unspoofable) handshake origin —
-  // never the client-supplied hello.comfyui_url — so a spoofed origin can't let a
-  // copied uuid derive another instance's key. Canonicalized (lowercase, no trailing
-  // slash); absent → fail closed too (a relay/headless client with no handshake origin
-  // simply forgoes the disk fallback rather than keying on an untrusted value).
-  const origin =
-    typeof opts.origin === "string" ? opts.origin.trim().replace(/\/+$/, "").toLowerCase() : "";
-  if (!origin) return undefined;
-  return `wfid::${origin}::${uuid}::${opts.backend}`;
+  const p = workflowIdentityParts(opts);
+  if (!p) return undefined; // fail closed: no durable identity / no trusted origin
+  return `wfid::${p.origin}::${p.uuid}::${opts.backend}`;
+}
+
+/** Backend-INDEPENDENT workflow identity (origin+uuid), for distinguishing a
+ *  same-socket tab-id migration (same identity) from a workflow switch (different
+ *  identity). undefined when the identity can't be trusted (fail closed → treated as
+ *  "no proof of continuity", so a rebind is refused rather than risked). */
+export function deriveWorkflowIdentity(opts: {
+  workflowUuid?: string | undefined;
+  origin?: string | undefined;
+}): string | undefined {
+  const p = workflowIdentityParts(opts);
+  return p ? `${p.origin}::${p.uuid}` : undefined;
 }
 
 export class SessionStore {

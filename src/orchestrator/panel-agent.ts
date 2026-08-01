@@ -1832,6 +1832,23 @@ export class PanelAgentManager {
     }
   }
 
+  /** Stop and UNBIND a tab's live agent WITHOUT touching its durable session — used
+   *  when the same browser socket switches to a DIFFERENT workflow (a validated uuid
+   *  change, #570 P0a). Unlike reset() — which CLEARS the durable session for a New
+   *  chat — this preserves sessionStore/pendingResume/held mail, so the retired
+   *  workflow resumes exactly where it left off when reopened, while its now-stopped
+   *  agent can no longer push frames that the bridge migration alias would leak into
+   *  the newly-targeted view. No-op when no live agent owns the key. */
+  retire(tabId: string): void {
+    const agent = this.agents.get(tabId);
+    if (!agent) return;
+    this.agents.delete(tabId);
+    void agent.stop();
+    logger.info(
+      `[panel-orchestrator] tab ${tabId.slice(0, 8)} retired (workflow switch on the same socket) — durable session preserved`,
+    );
+  }
+
   async interrupt(tabId: string, opts: { requeueInFlight?: boolean } = {}): Promise<void> {
     await this.agents.get(tabId)?.interrupt(opts);
   }

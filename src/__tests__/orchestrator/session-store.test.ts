@@ -9,7 +9,12 @@ import { describe, expect, it, afterEach } from "vitest";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SessionStore, deriveStableKey } from "../../orchestrator/session-store.js";
+import {
+  SessionStore,
+  deriveStableKey,
+  deriveWorkflowIdentity,
+  workflowIdentityParts,
+} from "../../orchestrator/session-store.js";
 
 // A port unlikely to collide with a real run or another test.
 const PORT = 59187;
@@ -253,6 +258,30 @@ describe("SessionStore", () => {
       expect(recomputed).toBe(key);
       expect(store.getStable(recomputed)).toBeUndefined();
       expect(new SessionStore(PORT).getStable(recomputed)).toBeUndefined();
+    });
+
+    it("WORKFLOW IDENTITY: distinguishes a same-workflow migration from a workflow switch (#570 P0a)", () => {
+      // deriveWorkflowIdentity is the backend-independent discriminator the hello
+      // handler uses to decide whether a same-socket re-hello under a new tab id is a
+      // tab-id MIGRATION of one workflow (identity UNCHANGED → rebind the agent) or a
+      // SWITCH to a different workflow (identity CHANGED → retire, never rebind).
+      const a = deriveWorkflowIdentity({ workflowUuid: UUID_A, origin: "http://127.0.0.1:8188" });
+      const aAgain = deriveWorkflowIdentity({ workflowUuid: UUID_A, origin: "http://127.0.0.1:8188" });
+      const b = deriveWorkflowIdentity({ workflowUuid: UUID_B, origin: "http://127.0.0.1:8188" });
+      expect(a).toBeDefined();
+      expect(aAgain).toBe(a); // same workflow → migration (rebind is safe)
+      expect(b).not.toBe(a); // different workflow → switch (must NOT rebind)
+      // Backend-independent (a provider switch is not a workflow switch).
+      // Fails closed (undefined) without a valid uuid or trusted origin — so the
+      // migration decision treats "no proof of continuity" as "do not rebind".
+      expect(deriveWorkflowIdentity({ origin: "http://127.0.0.1:8188" })).toBeUndefined();
+      expect(deriveWorkflowIdentity({ workflowUuid: UUID_A })).toBeUndefined();
+      expect(deriveWorkflowIdentity({ workflowUuid: "not-a-uuid", origin: "o" })).toBeUndefined();
+      // Canonicalized parts match deriveStableKey's (case + trailing slash).
+      expect(workflowIdentityParts({ workflowUuid: UUID_A, origin: "HTTP://Host:8188/" })).toEqual({
+        origin: "http://host:8188",
+        uuid: UUID_A,
+      });
     });
 
     it("BACKEND SWITCH: each provider's session stays under its OWN recomputed key (no cross-provider resume)", () => {
