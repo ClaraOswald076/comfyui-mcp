@@ -23,12 +23,52 @@ jobs:
 
       - run: npm ci
       - run: npm run lint
-      - run: npm run build
+      - run: npm run build
       - run: npm test
 
       # The README advertises tool/skill/pack counts. They are derived from the
       # registry, not written by hand — this fails the build when prose drifts.
-      - run: node scripts/asset-counts.mjs --check
+      - run: node scripts/asset-counts.mjs --check
+
+      # ~250 tool names die during the 0.49.0 consolidation. The dangerous
+      # leftover isn't a stale changelog entry — it's a live hint string telling a
+      # model to call something that now 404s, which the model can't diagnose and
+      # the user experiences as a broken feature. Deliberately unconditional so it
+      # runs on every matrix leg: it is pure text analysis over `git ls-files`, and
+      # a path-separator or encoding difference is worth catching. (That only
+      # becomes real once the matrix actually varies the OS — comfyui-mcp-bi9.)
+      - run: npm run check:vocabulary
+
+      # docs/design/tool-vocabulary.json is what comfyui-mcp-panel VENDORS to
+      # validate its callTool("…") string literals. If the vocabulary changes here
+      # and the artefact does not, the panel keeps checking against the old surface
+      # and its buttons break at runtime with a tool-not-found — the failure mode
+      # this whole pairing exists to prevent. Stale artefact = red build.
+      - run: npm run vocab:export -- --check
+
+      # docs/tools/*.mdx is GENERATED from the live tool schemas, so a stale
+      # committed page is a silent lie: it documents a surface that no longer
+      # exists. Regenerating must therefore be a no-op. It was NOT a no-op when
+      # this check was added (five pages had drifted behind description edits),
+      # which is exactly why it exists.
+      # Ubuntu only: generation is OS-independent, and a CRLF checkout on Windows
+      # would produce a spurious whole-file diff. (Note: every matrix leg is
+      # currently Ubuntu anyway — see comfyui-mcp-bi9 — so this condition is
+      # correct in intent and a no-op in effect until that is fixed.)
+      - name: Tool Reference is current (docs:gen must be a no-op)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          # `git diff` does not see untracked files, so a NEWLY generated page that
+          # was never committed would pass invisibly — precisely the case this gate
+          # exists to catch, since adding a tool is what creates a new page.
+          # --intent-to-add registers untracked paths in the index (without staging
+          # content) so the diff reports them as additions.
+          npm run docs:gen
+          git add --intent-to-add -A docs/
+          if ! git diff --exit-code -- docs/; then
+            echo "::error::docs/ is stale or has an uncommitted generated page — run 'npm run docs:gen' and commit the result."
+            exit 1
+          fi
 
   pack-smoke:
     runs-on: ubuntu-latest

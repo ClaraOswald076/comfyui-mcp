@@ -273,4 +273,49 @@ describe("allBackendReadiness", () => {
     expect(() => allBackendReadiness(["claude", "codex", "gemini"])).not.toThrow();
     expect(typeof homedir()).toBe("string");
   });
+
+  // Regression: backend-readiness re-derived where kimi-code keeps credentials and
+  // looked only in the LEGACY ~/.kimi, while code-provider-auth resolved ~/.kimi-code.
+  // A user signed in with the current CLI therefore had working credentials everywhere
+  // except here — and the panel, which trusts this, told them they were not signed in
+  // and could switch away from Kimi. Both now call kimiCodeAuthCandidates().
+  describe("kimi oauth discovery", () => {
+    const clearEnv = () => {
+      for (const k of ["KIMI_API_KEY", "KIMI_CODE_HOME", "KIMI_SHARE_DIR"]) delete process.env[k];
+    };
+    const signIn = (home: string, dir: string) => {
+      mkdirSync(join(home, dir, "credentials"), { recursive: true });
+      writeFileSync(join(home, dir, "credentials", "kimi-code.json"), '{"access_token":"x"}');
+    };
+
+    beforeEach(clearEnv);
+    afterEach(clearEnv);
+
+    it("sees a sign-in from the CURRENT kimi-code CLI (~/.kimi-code)", () => {
+      const home = mkdtempSync(join(tmpdir(), "kimi-current-"));
+      signIn(home, ".kimi-code");
+      expect(backendReadiness("kimi", { home })).toMatchObject({ auth: true, ready: true });
+    });
+
+    it("still sees a sign-in from the legacy kimi-cli (~/.kimi)", () => {
+      const home = mkdtempSync(join(tmpdir(), "kimi-legacy-"));
+      signIn(home, ".kimi");
+      expect(backendReadiness("kimi", { home })).toMatchObject({ auth: true, ready: true });
+    });
+
+    it("reports not-signed-in when neither exists", () => {
+      const home = mkdtempSync(join(tmpdir(), "kimi-none-"));
+      expect(backendReadiness("kimi", { home })).toMatchObject({ auth: false, ready: false });
+    });
+
+    it("honours KIMI_CODE_HOME (current) and KIMI_SHARE_DIR (legacy)", () => {
+      for (const envVar of ["KIMI_CODE_HOME", "KIMI_SHARE_DIR"]) {
+        const home = mkdtempSync(join(tmpdir(), "kimi-env-"));
+        signIn(home, "custom");
+        process.env[envVar] = join(home, "custom");
+        expect(backendReadiness("kimi", { home }), envVar).toMatchObject({ auth: true });
+        delete process.env[envVar];
+      }
+    });
+  });
 });

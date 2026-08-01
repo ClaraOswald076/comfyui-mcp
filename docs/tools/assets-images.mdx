@@ -40,10 +40,10 @@ Fetch a generated image from ComfyUI and return it as an inline image. Works wit
 <ParamField path="filename" type="string" required>
   Output image filename, e.g. PulID_Klein_00001_.png
 </ParamField>
-<ParamField path="type" type="enum" required default="output">
+<ParamField path="type" type="enum" default="output">
   Image directory: output (default), input, or temp Options: `output`, `input`, `temp`.
 </ParamField>
-<ParamField path="subfolder" type="string" required default="">
+<ParamField path="subfolder" type="string" default="">
   Subfolder within the directory, if any
 </ParamField>
 <ParamField path="save_dir" type="string">
@@ -58,9 +58,7 @@ Fetch a generated image from ComfyUI and return it as an inline image. Works wit
 {
   "tool": "get_image",
   "arguments": {
-    "filename": "<filename>",
-    "type": "output",
-    "subfolder": "<subfolder>"
+    "filename": "<filename>"
   }
 }
 ```
@@ -228,7 +226,7 @@ Stage an EXISTING ComfyUI output (or temp/preview) as an INPUT so the next stage
 <ParamField path="subfolder" type="string">
   Subfolder the asset currently lives in, if any
 </ParamField>
-<ParamField path="type" type="enum" required default="output">
+<ParamField path="type" type="enum" default="output">
   Source directory the asset lives in: output (default) or temp (previews) Options: `output`, `temp`.
 </ParamField>
 <ParamField path="kind" type="enum">
@@ -246,8 +244,7 @@ Stage an EXISTING ComfyUI output (or temp/preview) as an INPUT so the next stage
 {
   "tool": "stage_output_as_input",
   "arguments": {
-    "filename": "<filename>",
-    "type": "output"
+    "filename": "<filename>"
   }
 }
 ```
@@ -380,6 +377,9 @@ List recently generated image AND video files from ComfyUI's output/ directory, 
 </ParamField>
 <ParamField path="pattern" type="string">
   Filter by filename pattern (case-insensitive substring match)
+</ParamField>
+<ParamField path="format" type="enum">
+  Response shape: markdown (default, human/agent-readable) or json (&#123;images:[&#123;filename,subfolder,kind,size,modified&#125;]&#125; — for app clients building pick grids). Options: `markdown`, `json`.
 </ParamField>
 
 ### Example

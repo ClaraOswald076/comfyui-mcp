@@ -95,9 +95,35 @@ function codexAuthPath(home = homedir()): string {
   return join(root, "auth.json");
 }
 
+/**
+ * Every place kimi-code may keep its device-code OAuth, most current first.
+ *
+ * EXPORTED because it must have exactly one implementation. It previously had two:
+ * this one, and an independent copy in orchestrator/backend-readiness.ts that still
+ * looked only in the legacy ~/.kimi. The result was a user signed in with the current
+ * CLI getting credentials resolved here and {auth:false, ready:false} reported there —
+ * so the panel told them they were not signed in and could switch away from Kimi.
+ * Divergence was the bug; one function is the fix.
+ *
+ * KIMI_CODE_HOME is the override the current CLI documents; KIMI_SHARE_DIR is the
+ * legacy name this codebase advertised. Both are honoured, current first, because
+ * dropping the old one would silently break anyone already setting it.
+ */
+export function kimiCodeAuthCandidates(home = homedir()): string[] {
+  const codeHome = process.env.KIMI_CODE_HOME?.trim();
+  const shareDir = process.env.KIMI_SHARE_DIR?.trim();
+  if (codeHome) return [join(codeHome, "credentials", "kimi-code.json")];
+  if (shareDir) return [join(shareDir, "credentials", "kimi-code.json")];
+  return [
+    join(home, ".kimi-code", "credentials", "kimi-code.json"), // kimi-code CLI (current)
+    join(home, ".kimi", "credentials", "kimi-code.json"), // legacy kimi-cli (`kimi migrate`)
+  ];
+}
+
 function kimiCodeAuthPath(home = homedir()): string {
-  const share = process.env.KIMI_SHARE_DIR || join(home, ".kimi");
-  return join(share, "credentials", "kimi-code.json");
+  const candidates = kimiCodeAuthCandidates(home);
+  // Falls back to the first candidate so a not-found error names the CURRENT path.
+  return candidates.find((p) => existsSync(p)) ?? candidates[0]!;
 }
 
 function grokAuthPath(home = homedir()): string {
@@ -537,8 +563,9 @@ export function resolveOpenAiKeyCredentials(id: string): { apiKey: string; baseU
 }
 
 /**
- * Resolve Kimi Code subscription OAuth from ~/.kimi/credentials/kimi-code.json.
- * Falls back to KIMI_API_KEY when set (pay-per-token / CI).
+ * Resolve Kimi Code subscription OAuth from ~/.kimi-code/credentials/kimi-code.json
+ * (legacy ~/.kimi honored as a fallback). Falls back to KIMI_API_KEY when set
+ * (pay-per-token / CI).
  */
 export async function resolveKimiCodeOAuth(
   deps: CodeProviderAuthDeps = {},
@@ -555,7 +582,7 @@ export async function resolveKimiCodeOAuth(
   const path = kimiCodeAuthPath(home);
   if (!existsSync(path)) {
     throw new ValidationError(
-      "Kimi Code OAuth requires ~/.kimi/credentials/kimi-code.json (from Kimi Code login) or KIMI_API_KEY.",
+      "Kimi Code OAuth requires ~/.kimi-code/credentials/kimi-code.json (run `kimi login`) or KIMI_API_KEY.",
     );
   }
 

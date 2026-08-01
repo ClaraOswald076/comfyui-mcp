@@ -16,7 +16,9 @@
     "scripts",
     "docker",
     "model-settings.json",
-    "model-settings.user.jsonc.example"
+    "model-settings.user.jsonc.example",
+    "docs/design/tool-surface.txt",
+    "docs/design/panel-surface.txt"
   ],
   "scripts": {
     "sync-agents": "node scripts/sync-agents.mjs",
@@ -34,6 +36,9 @@
     "smoke:panel": "npm run build && node scripts/panel-smoke.mjs",
     "lint": "tsc --noEmit",
     "docs:gen": "cross-env COMFYUI_URL=http://127.0.0.1:8188 tsx scripts/gen-tool-docs.ts",
+    "tools:dump": "cross-env COMFYUI_URL=http://127.0.0.1:8188 tsx scripts/tools-dump.mts",
+    "check:vocabulary": "tsx scripts/check-tool-vocabulary.mts",
+    "vocab:export": "tsx scripts/export-vocabulary.mts",
     "runpod:release": "node scripts/runpod-release.mjs",
     "runpod:release:major": "node scripts/runpod-release.mjs major",
     "packs:gen": "node scripts/gen-pack-installers.mjs",

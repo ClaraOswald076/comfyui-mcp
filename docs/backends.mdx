@@ -62,12 +62,20 @@ placeholder follows the active backend ("Ask Claude…" / "Ask Ollama…").
 - **Grok** — install the Grok CLI (xAI / Grok Build) and run `grok` once to
   sign in; the backend drives it in ACP mode. The panel also offers an
   in-panel OAuth sign-in row when Grok isn't ready.
-- **Kimi** — Kimi Code login (writes `~/.kimi/credentials/kimi-code.json`),
-  or set `KIMI_API_KEY` for pay-per-token/CI use. In-panel OAuth sign-in is
+- **Kimi (recommended)** — install the [Kimi Code CLI](https://moonshotai.github.io/kimi-code/)
+  and run `kimi login` (device-code flow); the backend reuses that login from
+  `~/.kimi-code/credentials/kimi-code.json` (the legacy `~/.kimi` path is still
+  read as a fallback). This uses your **Kimi Code subscription** and is the
+  preferred way to run Kimi — cheaper and higher-limit than the pay-per-token
+  Moonshot key below. Set `KIMI_API_KEY` instead only for CI / no-CLI use, or
+  `KIMI_CODE_HOME` to point at a non-default credentials dir (`KIMI_SHARE_DIR` is
+  still honoured for anyone who set the older name). In-panel OAuth sign-in is
   offered too.
 - **GLM** — set `ZAI_API_KEY` (Z.AI Coding Plan; `GLM_API_KEY` /
   `ZHIPUAI_API_KEY` also accepted). No CLI.
-- **Kimi K3 (Moonshot)** — set `MOONSHOT_API_KEY` from
+- **Kimi K3 (Moonshot)** — the **pay-per-token alternative** when you don't
+  have a Kimi Code subscription (prefer the **Kimi** route above if you do). Set
+  `MOONSHOT_API_KEY` from
   [platform.kimi.ai](https://platform.kimi.ai/console/api-keys). No CLI. This is
   the Moonshot **platform** key (default model `kimi-k3`, base
   `https://api.moonshot.ai/v1`) — distinct from the **Kimi** provider above,

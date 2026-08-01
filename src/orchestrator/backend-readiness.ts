@@ -10,6 +10,7 @@
 // {type:"backends"} bridge frame).
 
 import { existsSync, readFileSync } from "node:fs";
+import { kimiCodeAuthCandidates } from "../services/code-provider-auth.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readOAuthStatus } from "../services/code-provider-auth.js";
@@ -203,8 +204,12 @@ export function backendReadiness(
   }
   if (b === "kimi") {
     const apiKey = process.env.KIMI_API_KEY?.trim();
-    const kimiShare = process.env.KIMI_SHARE_DIR || join(home, ".kimi");
-    const oauth = fileExists(kimiShare, "credentials", "kimi-code.json");
+    // Asks the SAME resolver the auth path uses. This used to re-derive the location
+    // and looked only in the legacy ~/.kimi, so a user signed in with the current
+    // kimi-code CLI (~/.kimi-code) was reported {auth:false, ready:false} while their
+    // credentials resolved fine everywhere else — and the panel told them they were not
+    // signed in.
+    const oauth = kimiCodeAuthCandidates(home).some((p) => existsSync(p));
     const auth = !!apiKey || oauth;
     return { backend: "kimi", cli: true, auth, ready: auth };
   }

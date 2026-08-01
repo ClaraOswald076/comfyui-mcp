@@ -236,7 +236,7 @@ const HEADLESS_DIRECTIVE =
   "If the run FAILED — or the user asks why a render failed / what's missing — call diagnose_run FIRST, and do NOT use " +
   "get_history for that: diagnose_run returns everything get_history would (failed node + exception + traceback) PLUS the " +
   "missing models (exact file + the widget holding it) and missing node types that get_history omits, in one call. It is " +
-  "the canvas-less equivalent of the panel's \"why is this red?\", so also do NOT try panel_view_errored_nodes here.";
+  "the canvas-less equivalent of the panel's \"why is this red?\", so also do NOT try panel_get_errors here.";
 
 /** Live stall threshold (seconds) pushed from the panel setting via a `set_config`
  *  frame — applies WITHOUT a reconnect. null = not set, fall back to env then the
@@ -674,7 +674,7 @@ const CALL_TOOL_WHITELIST = new Set<string>([
   // never touches other pending jobs in a shared queue.
   "cancel_job",
   // "Why did my render fail?" for canvas-less clients. The panel answers this from
-  // live canvas state (panel_view_errored_nodes); a phone has no canvas, so it reads
+  // live canvas state (panel_get_errors); a phone has no canvas, so it reads
   // the same story server-side from history + re-validating the graph that ran.
   // Read-only.
   "diagnose_run",
