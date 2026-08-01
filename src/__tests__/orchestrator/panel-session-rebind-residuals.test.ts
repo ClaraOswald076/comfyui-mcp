@@ -503,3 +503,92 @@ describe("#400 panel_restart_comfyui awaits the tab reconnect before returning",
     expect(String(out.note)).toMatch(/has NOT reconnected|rebind/i);
   });
 });
+
+// #436 — the flap: after a restart a READ (panel_graph_outline) succeeds while the
+// very next WRITE (panel_add_node) fails "no connected tab … Connected: none". Root
+// cause: reads survive the "Connected: none" window (parked mid-command + retry-once)
+// but the live graph MUTATION tools dispatched via ctx.call with NO pre-send wait, so
+// they fired straight into the momentarily-empty tab registry. The fix gates every
+// mutating graph edit behind the same bounded awaitReachable() that open/save use —
+// centralized in ctx.call so no mutating tool can miss it — while leaving the read
+// path untouched.
+describe("#436 a MUTATING graph edit awaits the reconnect before dispatch", () => {
+  it("waits out the post-restart 0-tab window, then dispatches to the reconnected tab (no flap)", async () => {
+    const { bridge, live, sent } = reconnectingBridge([]); // Connected: none
+    const ctx = makePanelToolCtx(bridge, "wf:workflows/x.json", new WorkflowTargetStore());
+    setTimeout(() => live.add("reconnected-tab"), 40); // the browser re-hellos
+    const res = await defByName("panel_add_node").handler({ class_type: "KSampler" }, ctx);
+    expect(res.isError).toBeFalsy();
+    // The mutating edit was dispatched — and to the RECONNECTED tab, never fired into
+    // the dead "Connected: none" binding that produced the flap.
+    expect(sent.at(-1)?.cmd).toMatchObject({ cmd: "graph_add_node", class_type: "KSampler" });
+    expect(sent.at(-1)?.tabId).toBe("reconnected-tab");
+    expect(ctx.tabId).toBe("reconnected-tab"); // rebound onto the live tab
+  });
+
+  it("REFUSES with ZERO dispatch when nothing reconnects — never fires into the dead binding", async () => {
+    const { bridge, sent } = reconnectingBridge([]); // stays Connected: none
+    const ctx = makePanelToolCtx(bridge, "wf:workflows/x.json", new WorkflowTargetStore());
+    const res = await defByName("panel_add_node").handler({ class_type: "KSampler" }, ctx);
+    expect(res.isError).toBe(true);
+    expect(sent.length).toBe(0); // the mutating edit was NEVER dispatched
+  });
+
+  it("a HEALTHY session dispatches the edit immediately — no added latency", async () => {
+    __panelToolsTestHooks.setReconnectWaitTiming({ budgetMs: 5000, intervalMs: 50 });
+    const { bridge, sent } = reconnectingBridge(["live-tab"]);
+    const ctx = makePanelToolCtx(bridge, "live-tab", new WorkflowTargetStore());
+    const t0 = Date.now();
+    const res = await defByName("panel_add_node").handler({ class_type: "KSampler" }, ctx);
+    expect(res.isError).toBeFalsy();
+    expect(Date.now() - t0).toBeLessThan(1000); // did NOT wait the 5s budget
+    expect(sent.at(-1)?.tabId).toBe("live-tab");
+  });
+
+  it("panel_set_widget (also mutating) is gated too — waits then dispatches to the reconnected tab", async () => {
+    const { bridge, live, sent } = reconnectingBridge([]);
+    const ctx = makePanelToolCtx(bridge, "wf:workflows/x.json", new WorkflowTargetStore());
+    setTimeout(() => live.add("reconnected-tab"), 40);
+    const res = await defByName("panel_set_widget").handler(
+      { node_id: 3, widget: "seed", value: 42 },
+      ctx,
+    );
+    expect(res.isError).toBeFalsy();
+    expect(sent.at(-1)?.tabId).toBe("reconnected-tab");
+  });
+
+  it("does NOT gate an idempotent READ — graph_outline keeps its existing (non-waiting) path", async () => {
+    // A read is NOT a mutating graph edit, so the pre-wait must not apply; with a live
+    // tab it simply dispatches through its normal path.
+    const { bridge, sent } = reconnectingBridge(["live-tab"]);
+    const ctx = makePanelToolCtx(bridge, "live-tab", new WorkflowTargetStore());
+    const res = await defByName("panel_graph_outline").handler({}, ctx);
+    expect(res.isError).toBeFalsy();
+    expect(sent.at(-1)?.cmd).toMatchObject({ cmd: "graph_outline" });
+  });
+
+  // Codex-flagged: reads that are NOT in BRIDGE_READONLY_CMDS (so an exclusion rule
+  // would have wrongly gated them) must NOT wait out the reconnect budget. With a
+  // reconnect that never happens, a gated command would spin the whole budget; these
+  // reads must return promptly instead (their existing non-waiting behavior).
+  it("does NOT gate graph_list_subgraphs (a read absent from BRIDGE_READONLY_CMDS)", async () => {
+    __panelToolsTestHooks.setReconnectWaitTiming({ budgetMs: 5000, intervalMs: 50 });
+    const { bridge } = reconnectingBridge([]); // Connected: none, nothing reconnects
+    const ctx = makePanelToolCtx(bridge, "stale-tab", new WorkflowTargetStore());
+    const t0 = Date.now();
+    const res = await defByName("panel_list_subgraphs").handler({}, ctx);
+    // It fails (no tab) — but it must FAIL FAST, never spend the 5s budget waiting.
+    expect(res.isError).toBe(true);
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+
+  it("does NOT gate training_get_state (a read absent from BRIDGE_READONLY_CMDS)", async () => {
+    __panelToolsTestHooks.setReconnectWaitTiming({ budgetMs: 5000, intervalMs: 50 });
+    const { bridge } = reconnectingBridge([]);
+    const ctx = makePanelToolCtx(bridge, "stale-tab", new WorkflowTargetStore());
+    const t0 = Date.now();
+    const res = await defByName("panel_training_get_state").handler({}, ctx);
+    expect(res.isError).toBe(true);
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+});
