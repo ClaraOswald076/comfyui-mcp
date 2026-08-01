@@ -497,6 +497,8 @@ describe("models.json", () => {
       '{"id":"m","cost":{"input":"free","output":1,"cacheRead":1,"cacheWrite":1}}',
       '{"id":"m","thinkingLevelMap":{"low":3}}', // string | null
       '{"id":"m","compat":"yes"}',
+      '{"id":"m","cost":{"input":1,"output":1,"cacheRead":1,"cacheWrite":1,"tiers":[{}]}}',
+      '{"id":"m","name":null}', // Type.Optional rejects a PRESENT null
     ]) {
       writePiFile(tmp, "models.json", `{"providers":{${good},"p":{"apiKey":"x","models":[${bad}]}}}`);
       expect(piModelsJsonUsable(modelsPath(), bareEnv()), bad).toBe(false);
@@ -525,6 +527,14 @@ describe("models.json", () => {
       '{"providers":{"p":{"apiKey":"x","modelOverrides":{"m":{"reasoning":"yes"}}}}}',
     );
     expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(false);
+  });
+
+  it("bedrock is keyed by pi's provider id (amazon-bedrock) for stored ownership", () => {
+    // Getting the id wrong would mean a stored record never suppresses the
+    // ambient token it owns.
+    expect(piCredentialPresent(tmp, bareEnv({ AWS_BEARER_TOKEN_BEDROCK: "t" }))).toBe(true);
+    writePiFile(tmp, "auth.json", '{"amazon-bedrock":{"type":"api_key"}}');
+    expect(piCredentialPresent(tmp, bareEnv({ AWS_BEARER_TOKEN_BEDROCK: "t" }))).toBe(false);
   });
 
   it("UNDECLARED extra fields are left alone (pi declares no additionalProperties)", () => {
