@@ -13,6 +13,7 @@ import {
   liveRootFromArgv,
   didLaunchLocalComfyUI,
   resolveEffectiveComfyUIBase,
+  resolveLiveComfyUIBase,
 } from "./workspace-env.js";
 import { ValidationError } from "../utils/errors.js";
 
@@ -277,11 +278,73 @@ function desktopConfigPath(): string {
  * next steps (`existsSync`/`readFile` on the config file under that same share, which
  * predate this guard) block identically — the guard adds no new class of exposure.
  */
-function isExistingDir(p: string): boolean {
+/** Identity of a directory, when the filesystem reports a usable one. Windows leaves
+ *  `ino` 0 for directories on some volumes, so it is optional — absent identity degrades
+ *  to a plain existence check rather than refusing everything. */
+interface DirIdentity {
+  dev: number;
+  ino: number;
+}
+
+function statDir(p: string): { identity?: DirIdentity } | undefined {
   try {
-    return statSync(p).isDirectory();
+    const st = statSync(p);
+    if (!st.isDirectory()) return undefined;
+    return Number(st.ino) > 0 && Number(st.dev) > 0
+      ? { identity: { dev: Number(st.dev), ino: Number(st.ino) } }
+      : {};
   } catch {
-    return false; // missing, unreadable, or a dangling symlink
+    return undefined; // missing, unreadable, or a dangling symlink
+  }
+}
+
+/**
+ * A root whose existence was PROVEN during resolution and must still hold at every
+ * point of use. Resolution and I/O are separated by awaits, so a one-time gate is a
+ * TOCTOU check — the root can vanish (a read would then report a phantom EMPTY config,
+ * the exact authoritative-looking lie this issue is about) or be REPLACED by a different
+ * directory at the same pathname (a write would then land in the wrong tree and still
+ * report success). `assertRootIntact` is therefore called immediately before every read
+ * and again immediately before every write, and compares dev+ino when the filesystem
+ * supplies them so a same-path replacement is caught, not just a deletion.
+ *
+ * ACCEPTED residual: on a volume that reports no usable inode (some Windows directory
+ * cases) a replacement swapped in within the final microseconds before `writeFile` is
+ * indistinguishable from the original. Single-user local machine, and the window is now
+ * bounded by one syscall instead of the whole tool invocation.
+ */
+interface GuardedRoot {
+  path: string;
+  identity?: DirIdentity;
+  source: StandaloneRootSource;
+}
+
+function assertRootIntact(guard: GuardedRoot | undefined): void {
+  if (!guard) return;
+  const now = statDir(guard.path);
+  const origin =
+    guard.source === "default-workspace"
+      ? "the saved default workspace (set_default_workspace)"
+      : "a ComfyUI root this process INFERRED (auto-detection, or a nested root descended from COMFYUI_PATH)";
+  if (!now) {
+    throw new ValidationError(
+      `UNRESOLVED: "${guard.path}" is no longer an existing directory. It came from ${origin} ` +
+        "and disappeared while this call was running. Nothing was read or written — an empty " +
+        "result here would look like a config with no extra paths, which is not what is true. " +
+        "Re-run set_default_workspace with the current path, set COMFYUI_PATH, or pass " +
+        "config_path explicitly.",
+    );
+  }
+  if (
+    guard.identity &&
+    now.identity &&
+    (now.identity.dev !== guard.identity.dev || now.identity.ino !== guard.identity.ino)
+  ) {
+    throw new ValidationError(
+      `UNRESOLVED: "${guard.path}" was REPLACED by a different directory while this call was ` +
+        `running (it came from ${origin}). Nothing was read or written — continuing would ` +
+        "operate on a tree that is not the one this call resolved. Re-run the operation.",
+    );
   }
 }
 
@@ -302,7 +365,11 @@ function samePath(a: string, b: string): boolean {
   }
 }
 
-function standaloneRoot(): { root: string; source: StandaloneRootSource } {
+function standaloneRoot(): {
+  root: string;
+  source: StandaloneRootSource;
+  guard?: GuardedRoot;
+} {
   const root = resolveEffectiveComfyUIBase();
   if (!root) {
     throw new ValidationError(
@@ -329,7 +396,10 @@ function standaloneRoot(): { root: string; source: StandaloneRootSource } {
     : envPath && samePath(config.comfyuiPath, envPath)
       ? "comfyui-path-env"
       : "comfyui-path-inferred";
-  if (source !== "comfyui-path-env" && !isExistingDir(root)) {
+  if (source === "comfyui-path-env") return { root, source };
+
+  const seen = statDir(root);
+  if (!seen) {
     const origin =
       source === "default-workspace"
         ? "the saved default workspace (set_default_workspace) — the install was probably moved, renamed or deleted since it was saved"
@@ -344,7 +414,7 @@ function standaloneRoot(): { root: string; source: StandaloneRootSource } {
         "COMFYUI_PATH, or pass config_path explicitly.",
     );
   }
-  return { root, source };
+  return { root, source, guard: { path: root, identity: seen.identity, source } };
 }
 
 /** Whether writing this config may recursively CREATE missing parent directories. False
@@ -357,13 +427,16 @@ interface ResolvedTarget {
   path: string;
   notes: string[];
   createParents: boolean;
+  /** Set for an inferred root — re-proved before every read and every write. */
+  guard?: GuardedRoot;
 }
 
-function standaloneConfigPath(): { path: string; notes: string[]; createParents: boolean } {
-  const { root, source } = standaloneRoot();
+function standaloneConfigPath(): Omit<ResolvedTarget, "target"> {
+  const { root, source, guard } = standaloneRoot();
   return {
     path: join(root, "extra_model_paths.yaml"),
     createParents: source === "comfyui-path-env",
+    guard,
     notes:
       source === "default-workspace"
         ? [
@@ -488,6 +561,35 @@ function isDesktopGeneratedConfig(path: string): boolean {
 }
 
 /**
+ * The `<live root>/extra_model_paths.yaml` a reachable server implicitly reads when it
+ * was launched with no `--extra-model-paths-config`. No guard is attached: the root is
+ * the running server's own install dir, so it exists by construction, and `createParents`
+ * stays true (only the YAML itself may be missing).
+ */
+function implicitLiveTarget(
+  liveRoot: string,
+  opts: ExtraPathOptions,
+): ResolvedTarget & { serverResolved: boolean } {
+  const path = join(liveRoot, "extra_model_paths.yaml");
+  const notes = [
+    `Resolved from the RUNNING ComfyUI's own install root (${liveRoot}): it was launched with no --extra-model-paths-config, so this is the extra_model_paths.yaml it implicitly reads.`,
+  ];
+  // Divergence diagnostic only — a failing static guess (no COMFYUI_PATH, a vanished
+  // saved workspace) must never break the real, live-anchored resolution.
+  try {
+    const staticGuess = resolveTargetPath(opts);
+    if (resolve(staticGuess.path) !== resolve(path)) {
+      notes.push(
+        `NOTE: this differs from the path the static heuristic would have used (${staticGuess.path}) — e.g. a saved default workspace or COMFYUI_PATH pointing at a DIFFERENT install than the one running. Editing that other file would be a silent no-op: the running server does not read it. Pass config_path explicitly to target it anyway.`,
+      );
+    }
+  } catch {
+    // No static guess available — the live-resolved path stands on its own.
+  }
+  return { target: "standalone", path, notes, serverResolved: true, createParents: true };
+}
+
+/**
  * Resolve the target config path, PREFERRING the file the running server was
  * actually launched with (`--extra-model-paths-config`, read from /system_stats
  * argv) when the caller didn't pin an explicit target/config_path. On ComfyUI
@@ -497,6 +599,17 @@ function isDesktopGeneratedConfig(path: string): boolean {
  * no-op against a file the server never reads (issue #345). Returns the resolved
  * target plus any warning notes to surface. Best-effort: falls back to the
  * static resolveTargetPath when the server is unreachable.
+ *
+ * A server launched WITHOUT that flag still reads one: ComfyUI auto-loads
+ * `<its own main.py root>/extra_model_paths.yaml`. So when the flag is absent but the
+ * live root IS derivable from argv, that implicit file is used — it is what the running
+ * server reads, and a reachable server is authoritative about that. Without this step a
+ * saved default workspace `A` that merely EXISTS would take a successful write while the
+ * live server runs from `B` and reads `B/extra_model_paths.yaml`: the user is told
+ * "Added … Restart ComfyUI" and the path is simply not there afterwards. The stale-root
+ * existence gate cannot catch that — `A` is real, just not the one in use — so the fix
+ * has to be resolving from the live server rather than warning about a divergence.
+ * Skipped in remote mode (the live root is a path on the remote host).
  */
 async function resolveTargetPathPreferServer(
   opts: ExtraPathOptions = {},
@@ -508,6 +621,10 @@ async function resolveTargetPathPreferServer(
 
   const serverConfig = await resolveServerExtraModelConfig();
   if (!serverConfig) {
+    // No launch flag — fall back to the file the live server IMPLICITLY reads before
+    // any static/local heuristic. resolveLiveComfyUIBase is remote-safe and never throws.
+    const liveRoot = await resolveLiveComfyUIBase();
+    if (liveRoot) return implicitLiveTarget(liveRoot, opts);
     return { ...resolveTargetPath(opts), serverResolved: false };
   }
 
@@ -548,7 +665,12 @@ export async function listExtraPaths(
   opts: ExtraPathOptions = {},
 ): Promise<ExtraPathsConfigInfo> {
   const resolved = await resolveTargetPathPreferServer(opts);
+  // Point of use: an inferred root that vanished between resolution and this read must
+  // surface as UNRESOLVED, NOT as a normal empty config (readConfigFile maps a missing
+  // file to {}, which would look authoritative — the exact failure #648 is about).
+  assertRootIntact(resolved.guard);
   const raw = await readConfigFile(resolved.path);
+  assertRootIntact(resolved.guard);
   return summarize(resolved.target, resolved.path, raw, resolved.notes, resolved.serverResolved);
 }
 
@@ -712,7 +834,11 @@ async function writeConfigFile(
   path: string,
   raw: Record<string, unknown>,
   createParents: boolean,
+  guard?: GuardedRoot,
 ): Promise<void> {
+  // Last check before the bytes land: the guarded root must still be the SAME existing
+  // directory this call resolved (deleted → UNRESOLVED; replaced → UNRESOLVED).
+  assertRootIntact(guard);
   // With createParents=false the root was already verified to exist, so skipping the
   // `mkdir -p` costs nothing in the normal case and turns the check→write race into an
   // honest ENOENT instead of silently RESURRECTING a vanished install and writing there.
@@ -731,6 +857,7 @@ export async function addExtraPath(
     throw new ValidationError(`"${category}" is a reserved config key, not a path category.`);
   }
 
+  assertRootIntact(resolved.guard);
   const raw = await readConfigFile(resolved.path);
   const group = ensureGroup(raw, groupName);
   if (opts.isDefault !== undefined && group.is_default === undefined) {
@@ -742,7 +869,7 @@ export async function addExtraPath(
   if (changed) {
     paths.push(nextPath);
     group[category] = paths.join("\n");
-    await writeConfigFile(resolved.path, raw, resolved.createParents);
+    await writeConfigFile(resolved.path, raw, resolved.createParents, resolved.guard);
   }
   const info = summarize(resolved.target, resolved.path, raw, resolved.notes, resolved.serverResolved);
   return {
@@ -762,6 +889,7 @@ export async function removeExtraPath(
   const category = assertSafeKey(opts.category, "Category");
   const removePath = assertPathValue(opts.path);
 
+  assertRootIntact(resolved.guard);
   const raw = await readConfigFile(resolved.path);
   const group = raw[groupName];
   let changed = false;
@@ -772,7 +900,7 @@ export async function removeExtraPath(
     if (changed) {
       if (remaining.length > 0) obj[category] = remaining.join("\n");
       else delete obj[category];
-      await writeConfigFile(resolved.path, raw, resolved.createParents);
+      await writeConfigFile(resolved.path, raw, resolved.createParents, resolved.guard);
     }
   }
   const info = summarize(resolved.target, resolved.path, raw, resolved.notes, resolved.serverResolved);

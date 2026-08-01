@@ -24,6 +24,18 @@ vi.mock("../../services/output-dir.js", () => ({
   resolveServerExtraModelConfig: mockResolveServerExtraModelConfig,
 }));
 
+// A server launched with NO --extra-model-paths-config still implicitly reads
+// <its own main.py root>/extra_model_paths.yaml, so extra-paths now consults
+// resolveLiveComfyUIBase() (→ /system_stats argv) before any static heuristic. Default
+// to UNREACHABLE so unit tests never touch the network or a real local ComfyUI; a
+// dedicated describe overrides it.
+const mockGetSystemStats = vi.hoisted(() =>
+  vi.fn(async (): Promise<{ system?: { argv?: string[]; cwd?: string } }> => {
+    throw new Error("ComfyUI unreachable (test default)");
+  }),
+);
+vi.mock("../../comfyui/client.js", () => ({ getSystemStats: mockGetSystemStats }));
+
 // Pin the platform so the Desktop app-data path is deterministic across CI OSes:
 // the desktop tests drive it via APPDATA (the win32 branch). Without this, Linux
 // uses XDG_CONFIG_HOME/~/.config and macOS uses ~/Library, so the temp-dir
@@ -57,6 +69,7 @@ beforeEach(() => {
   delete process.env.COMFYUI_PATH;
   dirs = [];
   mockResolveServerExtraModelConfig.mockResolvedValue(undefined);
+  mockGetSystemStats.mockRejectedValue(new Error("ComfyUI unreachable (test default)"));
   mockIsRemoteMode.mockReturnValue(false);
   // Point the saved-default-workspace store at a path that does not exist, so the
   // default for every test is "no saved default" (never the developer's real one).
@@ -527,6 +540,117 @@ describe("standalone root precedence — saved default workspace (#648)", () => 
   });
 });
 
+describe("a reachable server with NO --extra-model-paths-config is still authoritative", () => {
+  /** Make /system_stats report a server running from `root`/main.py. */
+  function liveAt(root: string): void {
+    mockGetSystemStats.mockResolvedValue({ system: { argv: ["python", join(root, "main.py")] } });
+  }
+
+  it("prefers <live root>/extra_model_paths.yaml over an EXISTING saved workspace", async () => {
+    // The wrong-TREE case the existence gate cannot catch: workspace A is real, but the
+    // live server runs from B and implicitly reads B/extra_model_paths.yaml.
+    const workspaceA = await trackTmp();
+    const liveB = await trackTmp();
+    await writeFile(
+      join(workspaceA, "extra_model_paths.yaml"),
+      "stale:\n  checkpoints: E:/from-A\n",
+      "utf-8",
+    );
+    await writeFile(
+      join(liveB, "extra_model_paths.yaml"),
+      "live:\n  checkpoints: E:/from-B\n",
+      "utf-8",
+    );
+    await saveDefaultWorkspace(workspaceA);
+    config.comfyuiPath = undefined;
+    liveAt(liveB);
+
+    const result = await listExtraPaths(); // default auto target
+
+    expect(result.path).toBe(join(liveB, "extra_model_paths.yaml"));
+    expect(result.groups[0].categories).toEqual([
+      { category: "checkpoints", paths: ["E:/from-B"] },
+    ]);
+    expect(result.notes.some((n) => /RUNNING ComfyUI's own install root/i.test(n))).toBe(true);
+    expect(result.notes.some((n) => n.includes(workspaceA) && /silent no-op/i.test(n))).toBe(true);
+  });
+
+  it("add_extra_path WRITES into the live root, not the saved workspace", async () => {
+    const workspaceA = await trackTmp();
+    const liveB = await trackTmp();
+    await saveDefaultWorkspace(workspaceA);
+    config.comfyuiPath = undefined;
+    liveAt(liveB);
+
+    const added = await addExtraPath({ group: "shared", category: "loras", path: "E:/loras" });
+
+    expect(added.path).toBe(join(liveB, "extra_model_paths.yaml"));
+    expect(existsSync(join(liveB, "extra_model_paths.yaml"))).toBe(true);
+    expect(existsSync(join(workspaceA, "extra_model_paths.yaml"))).toBe(false);
+  });
+
+  it("also beats a COMFYUI_PATH pointing at a different install", async () => {
+    const stale = await trackTmp();
+    const liveB = await trackTmp();
+    config.comfyuiPath = stale;
+    process.env.COMFYUI_PATH = stale;
+    liveAt(liveB);
+
+    const result = await listExtraPaths();
+    expect(result.path).toBe(join(liveB, "extra_model_paths.yaml"));
+  });
+
+  it("does NOT override an explicit target or config_path", async () => {
+    const workspaceA = await trackTmp();
+    const liveB = await trackTmp();
+    await saveDefaultWorkspace(workspaceA);
+    config.comfyuiPath = undefined;
+    liveAt(liveB);
+
+    const pinned = await listExtraPaths({ target: "standalone" });
+    expect(pinned.path).toBe(join(workspaceA, "extra_model_paths.yaml"));
+
+    const explicit = join(await trackTmp(), "custom.yaml");
+    await writeFile(explicit, "g:\n  vae: E:/v\n", "utf-8");
+    const byPath = await listExtraPaths({ configPath: explicit });
+    expect(byPath.path).toBe(explicit);
+  });
+
+  it("the --extra-model-paths-config launch flag still wins over the implicit root", async () => {
+    const liveB = await trackTmp();
+    const flagged = join(await trackTmp(), "flagged.yaml");
+    await writeFile(flagged, "f:\n  vae: E:/flag\n", "utf-8");
+    liveAt(liveB);
+    mockResolveServerExtraModelConfig.mockResolvedValue(flagged);
+
+    const result = await listExtraPaths();
+    expect(result.path).toBe(flagged);
+  });
+
+  it("falls back to the static heuristic when the live root is not derivable", async () => {
+    const workspaceA = await trackTmp();
+    process.env.APPDATA = await trackTmp(); // no Desktop config → auto picks standalone
+    await saveDefaultWorkspace(workspaceA);
+    config.comfyuiPath = undefined;
+    // Reachable, but argv has no main.py → no resolvable live root.
+    mockGetSystemStats.mockResolvedValue({ system: { argv: ["python", "-c", "print(1)"] } });
+
+    const result = await listExtraPaths();
+    expect(result.path).toBe(join(workspaceA, "extra_model_paths.yaml"));
+  });
+
+  it("ignores the live root in REMOTE mode (it is a path on the remote host)", async () => {
+    const liveB = await trackTmp();
+    process.env.APPDATA = await trackTmp(); // no Desktop config to fall into
+    liveAt(liveB);
+    mockIsRemoteMode.mockReturnValue(true);
+    config.comfyuiPath = undefined;
+
+    // No local root is usable in remote mode → explicit UNRESOLVED, never the remote path.
+    await expect(listExtraPaths()).rejects.toThrow(/UNRESOLVED/);
+  });
+});
+
 describe("expandVars — single-pass %VAR% scanner (no placeholder round-trip)", () => {
   const VAR = "CMCP_EXPAND_TEST_VAR";
   const oldValue = process.env[VAR];
@@ -581,4 +705,84 @@ describe("expandVars — single-pass %VAR% scanner (no placeholder round-trip)",
     expect(expandVars(`$${VAR}`)).toBe("D:\\real");
     expect(expandVars("${CMCP_NOT_SET_ANYWHERE}")).toBe("${CMCP_NOT_SET_ANYWHERE}");
   });
+});
+
+/**
+ * Every base_path spelling whose RESOLUTION CHANGED when the two-pass sentinel expander
+ * was replaced by the single-pass CPython-shaped scanner, pinned so the next rewrite
+ * cannot drift. Established by exhaustively comparing old vs new over all strings of
+ * length <= 7 over {"%", defined var, undefined var, literal}: 3530 inputs differ, in
+ * 192 shapes, and EVERY ONE of them contains a doubled "%%" — a base_path with no "%%"
+ * is byte-identical under both.
+ *
+ * The rule that changed: the old code substituted a sentinel for EVERY "%%" in the
+ * string BEFORE any variable token was identified, so a "%%" that was really the closing
+ * "%" of one variable plus the opening "%" of the next was mis-consumed and everything
+ * after it drifted. The scanner decides positionally — "%%" is an escape only when the
+ * scan is AT a token boundary — which is what os.path.expandvars (ntpath) does, i.e.
+ * what the ComfyUI process that reads the file does.
+ */
+describe("expandVars — every %VAR% spelling whose resolution changed (pinned)", () => {
+  const A = "CMCP_XP_A";
+  const B = "CMCP_XP_B";
+  const Z = "CMCP_XP_UNDEFINED";
+  const VA = "D:\\models";
+  const VB = "E:\\extra";
+  const saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    for (const k of [A, B, Z]) saved[k] = process.env[k];
+    process.env[A] = VA;
+    process.env[B] = VB;
+    delete process.env[Z];
+  });
+  afterEach(() => {
+    for (const k of [A, B, Z]) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  });
+
+  // [spelling, old result (for the record), new result = CPython/ComfyUI]
+  const changed: Array<[input: string, old: string, expected: string]> = [
+    [`%${A}%%${B}%`, `%${A}%${B}%`, `${VA}${VB}`],
+    [`%${A}%%${Z}%`, `%${A}%${Z}%`, `${VA}%${Z}%`],
+    [`%${A}%%${A}%`, `%${A}%${A}%`, `${VA}${VA}`],
+    [`%${A}%%`, `%${A}%`, `${VA}%`],
+    [`%${A}%%%`, `%${A}%%`, `${VA}%`],
+    [`%${A}%%%${B}%`, `%${A}%%${B}%`, `${VA}%${B}%`],
+    [`%${A}%%%%${B}%`, `%${A}%%${B}%`, `${VA}%${VB}`],
+    [`%%%${A}%%`, `%%${A}%`, `%${VA}%`],
+    [`%%${A}%${B}%%`, `%${A}%${B}%`, `%${A}${VB}%`],
+    // The sentinel collision itself: a path literally containing the old placeholder.
+    ["__CMCP_PCT_9f3a__", "%", "__CMCP_PCT_9f3a__"],
+  ];
+
+  for (const [input, old, expected] of changed) {
+    it(`CHANGED ${JSON.stringify(input)}: was ${JSON.stringify(old)} -> now ${JSON.stringify(expected)}`, () => {
+      expect(expandVars(input)).toBe(expected);
+      expect(expandVars(input)).not.toBe(old);
+    });
+  }
+
+  // Spellings the rewrite did NOT change. Pinned so a future "simplification" cannot
+  // quietly move them either — these are the forms real configs actually use.
+  const unchanged: Array<[input: string, expected: string]> = [
+    ["%%", "%"],
+    [`%%${A}%%`, `%${A}%`],
+    [`%${A}%`, VA],
+    [`%${Z}%`, `%${Z}%`],
+    [`%${A}`, `%${A}`],
+    ["%%%", "%%"],
+    // The realistic "escaped percent inside a folder name" case — identical before/after.
+    ["D:\\100%%\\models", "D:\\100%\\models"],
+    ["D:\\100%\\models", "D:\\100%\\models"],
+    ["D:\\plain\\path", "D:\\plain\\path"],
+  ];
+
+  for (const [input, expected] of unchanged) {
+    it(`UNCHANGED ${JSON.stringify(input)} -> ${JSON.stringify(expected)}`, () => {
+      expect(expandVars(input)).toBe(expected);
+    });
+  }
 });
