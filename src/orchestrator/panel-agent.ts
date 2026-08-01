@@ -974,6 +974,13 @@ export class PanelAgent {
   // gate, busy/working indicator, anchor tracking, usage meter, onSay commit)
   // lives here; the backend already normalized the provider's native messages.
   private handleEvent(ev: AgentEvent): void {
+    // CLOSED GUARD (#570 P0a): once stopped, emit NOTHING. stop()/retire() set `closed`
+    // fire-and-forget, but the backend's `for await` loop may still yield one buffered
+    // event before it observes the flag — and forwarding it would fire onSession/onSay/
+    // onStream callbacks that the bridge's same-socket migration alias routes to the tab
+    // this agent was retired in favor of (a leak of the old workflow's reply/session into
+    // the switched-to one). Dropping the event is safe: a stopped agent's turn is over.
+    if (this.closed) return;
     // Any event means the turn is alive — reset the idle watchdog. The `result`
     // case below disarms it entirely (turn ended). Placed before the switch so it
     // covers every event type without per-case bumps.

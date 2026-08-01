@@ -2517,22 +2517,30 @@ export async function runPanelOrchestrator(): Promise<void> {
         // blindly rebinding the old agent onto the new id handed the switched-to
         // workflow the PREVIOUS one's conversation (setResume refuses the new tab's own
         // resume while a rebound agent is live) and persisted it under the new key.
-        // Rebind ONLY when the trusted identity is UNCHANGED; on a validated DIFFERENT
-        // identity, treat it as a switch — retire the old agent (keeping its durable
-        // session for when it's reopened) and let the new workflow honor its OWN
-        // resume / stable key / fresh session.
-        const isWorkflowSwitch =
+        //
+        // FAIL CLOSED: rebind ONLY when BOTH the prior and the new trusted identity
+        // exist AND are EQUAL (proven same workflow). Anything else — a different
+        // identity (a workflow switch), OR a missing/untrusted identity on either side
+        // (an old/degraded panel, a malformed hello) — is treated as a switch: RETIRE
+        // the old agent (keeping its durable session for when it's reopened) rather than
+        // risk rebinding a different workflow's conversation. A modern panel sends a
+        // stable uuid for every workflow, so all its legitimate migrations (save/rename)
+        // have equal identity and still rebind; only unprovable cases lose the rebind
+        // (a lost resume — hello.resume still covers the common reload — never a wrong
+        // one).
+        const sameWorkflow =
           prevIdentity !== undefined &&
           newIdentity !== undefined &&
-          (prevIdentity.uuid !== newIdentity.uuid || prevIdentity.origin !== newIdentity.origin);
-        if (isWorkflowSwitch) {
+          prevIdentity.uuid === newIdentity.uuid &&
+          prevIdentity.origin === newIdentity.origin;
+        if (!sameWorkflow) {
           manager.retire(migratedFrom + AGENT_KEY_SEP + prevBackend);
           logger.info(
-            `[panel-orchestrator] same-socket WORKFLOW SWITCH ${migratedFrom.slice(0, 12)} → ${panelTab.slice(0, 12)} — old agent retired (NOT rebound); each workflow keeps its own conversation`,
+            `[panel-orchestrator] same-socket re-hello ${migratedFrom.slice(0, 12)} → ${panelTab.slice(0, 12)} without proven workflow continuity — old agent retired (NOT rebound); each workflow keeps its own conversation`,
           );
           // Retire the old id's routing/prefs — do NOT carry them to a different
-          // workflow. The old workflow's durable session stays on disk (retire()
-          // preserved it); its stable identity is dropped from the live maps.
+          // (or unprovable) workflow. The old workflow's durable session stays on disk
+          // (retire() preserved it); its stable identity is dropped from the live maps.
           heldDuringGen.delete(migratedFrom + AGENT_KEY_SEP + prevBackend);
           tabBackends.delete(migratedFrom);
           headlessTabs.delete(migratedFrom);
