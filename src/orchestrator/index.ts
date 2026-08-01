@@ -2684,11 +2684,16 @@ export async function runPanelOrchestrator(): Promise<void> {
       if (newIdentity) {
         const boundUuid = sessionStore.identityOf(key);
         if (boundUuid && boundUuid !== newIdentity.uuid) {
-          sessionStore.clear(key);
+          // FULL session boundary — reset the LIVE agent too, not just the disk record.
+          // manager.reset() stops the mapped agent (whose backend still holds the PRIOR
+          // workflow's session), clears its pendingResume + held mail, AND clears the
+          // durable exact session. Without this, manager.send would reuse that live agent
+          // and answer with — or act on — the replaced workflow's context.
+          manager.reset(key);
           const staleStable = deriveStableKey({ workflowUuid: boundUuid, origin: newIdentity.origin, backend });
           if (staleStable) sessionStore.clearStable(staleStable);
           logger.info(
-            `[panel-orchestrator] tab ${panelTab.slice(0, 8)} workflow replaced in place (identity uuid changed) — cleared the prior workflow's stale session`,
+            `[panel-orchestrator] tab ${panelTab.slice(0, 8)} workflow replaced in place (identity uuid changed) — reset the live agent and cleared the prior workflow's stale session`,
           );
         }
       }
