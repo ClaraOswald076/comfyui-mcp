@@ -86,7 +86,7 @@ export const PI_PROVIDER_ENV_KEYS: Readonly<Record<string, readonly string[]>> =
   "github-copilot": ["COPILOT_GITHUB_TOKEN"], // special-cased in pi
   // Documented in packages/coding-agent/docs/providers.md but absent from
   // `envMap`, which only covers the api-key providers.
-  bedrock: ["AWS_BEARER_TOKEN_BEDROCK"],
+  "amazon-bedrock": ["AWS_BEARER_TOKEN_BEDROCK"],
 };
 
 /**
@@ -431,8 +431,16 @@ function optModelCost(v: unknown, required: boolean): boolean {
     }
     if (!isFiniteNumber(v[f])) return false;
   }
-  if (v.tiers !== undefined && (!Array.isArray(v.tiers) || !v.tiers.every(isPlainObject))) return false;
+  if (v.tiers !== undefined && (!Array.isArray(v.tiers) || !v.tiers.every(costTierValid))) return false;
   return true;
+}
+
+/** ModelCostTierSchema: inputTokensAbove + the four rates, all required numbers. */
+function costTierValid(tier: unknown): boolean {
+  if (!isPlainObject(tier)) return false;
+  return ["inputTokensAbove", "input", "output", "cacheRead", "cacheWrite"].every((f) =>
+    isFiniteNumber(tier[f]),
+  );
 }
 
 /** ThinkingLevelMapSchema: every level maps to a string or null. */
