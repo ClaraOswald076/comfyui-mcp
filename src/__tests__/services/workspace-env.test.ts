@@ -606,14 +606,13 @@ describe("getEnvironment", () => {
       expect(env.local.python?.version).toBe("3.11.7");
       expect(env.local.python_probe_trusted).toBe(false);
       expect(env.local.packages).toBeUndefined();
-      expect(env.local.note).toMatch(/does not match the running ComfyUI python/i);
       expect(env.local.note).toMatch(/#401/);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
   });
 
-  it("reports packages when a rootless running server is corroborated by an EXACT torch match", async () => {
+  it("never trusts a rootless running server, even on an EXACT python+torch match", async () => {
     const dir = await tmpDir();
     const install = join(dir, "ComfyUI");
     await mkdir(install, { recursive: true });
@@ -631,7 +630,9 @@ describe("getEnvironment", () => {
         },
         devices: [],
       });
-      // Same major.minor AND the exact torch the server reports → same environment.
+      // Same major.minor AND the exact torch the server reports — yet a stale
+      // COMFYUI_PATH aimed at a sibling install of the same build looks exactly like
+      // this. Fingerprints make it plausible, never correct: report nothing.
       setExecFileResponder((_cmd, args) => {
         if (args.includes("--version")) return { stdout: "Python 3.12.4\n" };
         if (args.includes("pip")) return { stdout: "Name: torch\nVersion: 2.5.0+cu124\n" };
@@ -639,8 +640,9 @@ describe("getEnvironment", () => {
       });
 
       const env = await getEnvironment();
-      expect(env.local.python_probe_trusted).toBe(true);
-      expect(env.local.packages?.torch).toBe("2.5.0+cu124");
+      expect(env.local.python_probe_trusted).toBe(false);
+      expect(env.local.packages).toBeUndefined();
+      expect(env.local.python_probe_reason).toMatch(/reported no install root/i);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -673,7 +675,7 @@ describe("getEnvironment", () => {
       const env = await getEnvironment();
       expect(env.local.python_probe_trusted).toBe(false);
       expect(env.local.packages).toBeUndefined();
-      expect(env.local.python_probe_reason).toMatch(/does not match the running ComfyUI torch/i);
+      expect(env.local.python_probe_reason).toMatch(/reported no install root/i);
       expect(env.local.note).toMatch(/#401/);
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -820,36 +822,131 @@ describe("getEnvironment", () => {
       });
 
       const env = await getEnvironment();
+      // SELECTION is fixed: the server's own venv, not the launcher's env.
       expect(env.local.python?.executable).toBe(rightExe);
       expect(env.local.python?.executable).not.toBe(wrongExe);
-      expect(env.local.python_probe_trusted).toBe(true);
-      expect(env.local.packages?.torch).toBe("2.9.0+cu128");
+      // AUTHORITY is not granted: the root was INFERRED from a relative argv, so no
+      // package list is attributed to the running server.
+      expect(env.local.python_probe_trusted).toBe(false);
+      expect(env.local.packages).toBeUndefined();
+      expect(env.local.python_probe_reason).toMatch(/INFERRED/);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
   });
 
-  it("degrades an anchored Desktop root to UNTRUSTED when its python contradicts the server", async () => {
+  it("never trusts an ANCHORED root even when python AND torch both agree (stale COMFYUI_PATH collision)", async () => {
+    // HIGH 1: the server runs bundle B's ComfyUI/.venv, but a stale COMFYUI_PATH points
+    // at a SECOND bundle A of the same shape. Both report the relative "ComfyUI/main.py"
+    // with no cwd, so A anchors exactly as cleanly as B would — and sibling Desktop
+    // installs routinely share a python AND a torch build, so both fingerprints agree.
+    // Nothing available can tell A from B, so this must cap out at unknown.
     const dir = await tmpDir();
-    const base = join(dir, "Desktop");
-    const server = join(base, "ComfyUI");
-    await mkdir(server, { recursive: true });
-    await writeFile(join(server, "main.py"), "", "utf-8");
-    await makeVenvPython(server);
+    const bundleA = join(dir, "A"); // stale COMFYUI_PATH
+    const serverA = join(bundleA, "ComfyUI");
+    await mkdir(serverA, { recursive: true });
+    await writeFile(join(serverA, "main.py"), "", "utf-8");
+    const exeA = await makeVenvPython(serverA);
+    // Bundle B is the one actually running; its path never reaches us (relative argv).
     try {
       configureWorkspace({ configPath: join(dir, "workspace.json") });
-      mockConfig.comfyuiPath = base;
+      mockConfig.comfyuiPath = bundleA;
       mockGetSystemStats.mockResolvedValueOnce({
         system: {
           os: "nt",
           python_version: "3.13.12",
           comfyui_version: "0.27.1",
+          embedded_python: false,
+          pytorch_version: "2.9.0+cu128",
           argv: [IS_WIN ? "ComfyUI\\main.py" : "ComfyUI/main.py"],
         },
         devices: [],
       });
-      // The anchored dir's interpreter is on a DIFFERENT python than the live server →
-      // we anchored onto the wrong install; report unknown rather than its packages.
+      // A agrees on BOTH fingerprints — and is still the wrong install.
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version")) return { stdout: "Python 3.13.12\n" };
+        if (args.includes("pip")) return { stdout: "Name: torch\nVersion: 2.9.0+cu128\n" };
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.python?.executable).toBe(exeA);
+      expect(env.local.python_probe_trusted).toBe(false);
+      expect(env.local.packages).toBeUndefined();
+      expect(env.local.python_probe_reason).toMatch(/INFERRED/);
+      expect(env.local.note).toMatch(/#401/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does NOT report packages from an OUTSIDE-the-root sibling python, even on matching fingerprints", async () => {
+    if (!IS_WIN) return; // ../python_embeded is a Windows-portable candidate
+    // HIGH 2, package-reporting half: the only interpreter we can find is the bundle's
+    // SIBLING python_embeded, outside the server's own install root. Absent an
+    // embedded_python self-report its location is a layout guess, and matching python
+    // and torch only make the guess plausible — the server may run an external venv.
+    const dir = await tmpDir();
+    const bundle = join(dir, "bundle");
+    const server = join(bundle, "ComfyUI");
+    await mkdir(server, { recursive: true });
+    await writeFile(join(server, "main.py"), "", "utf-8");
+    const embDir = join(bundle, "python_embeded");
+    await mkdir(embDir, { recursive: true });
+    const embExe = join(embDir, "python.exe");
+    await writeFile(embExe, "", "utf-8");
+    try {
+      configureWorkspace({ configPath: join(dir, "workspace.json") });
+      mockConfig.comfyuiPath = server;
+      mockGetSystemStats.mockResolvedValueOnce({
+        system: {
+          os: "nt",
+          python_version: "3.12.11",
+          comfyui_version: "0.27.1",
+          pytorch_version: "2.5.0+cu124",
+          // NOTE: no embedded_python — the server never told us it runs an embedded python.
+          argv: [join(server, "main.py")],
+        },
+        devices: [],
+      });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version")) return { stdout: "Python 3.12.4\n" };
+        if (args.includes("pip")) return { stdout: "Name: torch\nVersion: 2.5.0+cu124\n" };
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.python?.executable).toBe(embExe); // probed …
+      expect(env.local.python_probe_trusted).toBe(false); // … never reported from
+      expect(env.local.packages).toBeUndefined();
+      expect(env.local.python_probe_reason).toMatch(/OUTSIDE the running server's install root/i);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does NOT trust a PROVEN root whose interpreter contradicts the live python", async () => {
+    // HIGH 3: an absolute argv gives a certain LOCATION, but knowing where the
+    // interpreter is is not knowing that it is the one running. A 3.11 venv under a
+    // root whose server reports 3.13 is a contradiction and must lose to the server.
+    const dir = await tmpDir();
+    const root = join(dir, "ComfyUI");
+    await mkdir(root, { recursive: true });
+    await writeFile(join(root, "main.py"), "", "utf-8");
+    const exe = await makeVenvPython(root);
+    try {
+      configureWorkspace({ configPath: join(dir, "workspace.json") });
+      mockConfig.comfyuiPath = root;
+      mockGetSystemStats.mockResolvedValueOnce({
+        system: {
+          os: "nt",
+          python_version: "3.13.12",
+          comfyui_version: "0.27.1",
+          embedded_python: false,
+          argv: [join(root, "main.py")],
+        },
+        devices: [],
+      });
       setExecFileResponder((_cmd, args) => {
         if (args.includes("--version")) return { stdout: "Python 3.11.9\n" };
         if (args.includes("pip")) return { stdout: "Name: torch\nVersion: 9.9.9\n" };
@@ -857,45 +954,10 @@ describe("getEnvironment", () => {
       });
 
       const env = await getEnvironment();
+      expect(env.local.python?.executable).toBe(exe);
       expect(env.local.python_probe_trusted).toBe(false);
       expect(env.local.packages).toBeUndefined();
       expect(env.local.python_probe_reason).toMatch(/does not match the running ComfyUI python/i);
-    } finally {
-      await rm(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("degrades an anchored Desktop root to UNTRUSTED when its torch contradicts the server", async () => {
-    const dir = await tmpDir();
-    const base = join(dir, "Desktop");
-    const server = join(base, "ComfyUI");
-    await mkdir(server, { recursive: true });
-    await writeFile(join(server, "main.py"), "", "utf-8");
-    await makeVenvPython(server);
-    try {
-      configureWorkspace({ configPath: join(dir, "workspace.json") });
-      mockConfig.comfyuiPath = base;
-      mockGetSystemStats.mockResolvedValueOnce({
-        system: {
-          os: "nt",
-          python_version: "3.13.12",
-          comfyui_version: "0.27.1",
-          pytorch_version: "2.9.0+cu128",
-          argv: [IS_WIN ? "ComfyUI\\main.py" : "ComfyUI/main.py"],
-        },
-        devices: [],
-      });
-      // Same python, but a DIFFERENT torch → we anchored onto a look-alike bundle.
-      setExecFileResponder((_cmd, args) => {
-        if (args.includes("--version")) return { stdout: "Python 3.13.4\n" };
-        if (args.includes("pip")) return { stdout: "Name: torch\nVersion: 2.4.0\n" };
-        return new Error("nope");
-      });
-
-      const env = await getEnvironment();
-      expect(env.local.python_probe_trusted).toBe(false);
-      expect(env.local.packages).toBeUndefined();
-      expect(env.local.python_probe_reason).toMatch(/does not match the running ComfyUI torch/i);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

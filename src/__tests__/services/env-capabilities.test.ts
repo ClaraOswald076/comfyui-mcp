@@ -370,6 +370,45 @@ describe("resolveComfyuiPython (#401)", () => {
     expect(res.proven).toBe(false);
   });
 
+  it("refuses PROVEN for a PARENT-RELATIVE candidate when the server omits embedded_python", async () => {
+    if (!IS_WIN) return; // ../python_embeded is a Windows-portable candidate
+    // HIGH 2: argv gives the absolute root <bundle>/ComfyUI, but the only discoverable
+    // interpreter is the bundle's SIBLING python_embeded — outside that root by
+    // construction. With no embedded_python self-report, "the sibling dir has one" is a
+    // layout guess, so it must not confer authority (the server may run an external
+    // venv of the same major.minor entirely).
+    const bundle = join(dir, "bundle");
+    const server = join(bundle, "ComfyUI");
+    await mkdir(server, { recursive: true });
+    await writeFile(join(server, "main.py"), "", "utf-8");
+    const embDir = join(bundle, "python_embeded");
+    await mkdir(embDir, { recursive: true });
+    const embExe = join(embDir, "python.exe");
+    await writeFile(embExe, "", "utf-8");
+
+    const res = resolveComfyuiPython(bundle, [join(server, "main.py")]); // no hint
+    expect(res.python).toBe(embExe); // still the best candidate to PROBE …
+    expect(res.live).toBe(true);
+    expect(res.ambiguous).toBe(false);
+    expect(res.proven).toBe(false); // … but it cannot speak for the server
+    // Its negatives therefore degrade to unknown rather than "not installed".
+    expect(
+      reconcileProbeState("not-installed", {
+        proven: res.proven,
+        runningPython: "3.12",
+        probePython: "3.12",
+      }),
+    ).toBe("unknown");
+
+    // The same candidate IS authoritative once the server says it runs an embedded
+    // python — then the location is grounded in the server's own self-report.
+    const withHint = resolveComfyuiPython(bundle, [join(server, "main.py")], {
+      embeddedPython: true,
+    });
+    expect(withHint.python).toBe(embExe);
+    expect(withHint.proven).toBe(true);
+  });
+
   it("is PROVEN when the server's own argv root holds exactly one interpreter", async () => {
     const root = join(dir, "single");
     await mkdir(root, { recursive: true });
@@ -502,6 +541,39 @@ describe("reconcileProbeState (#401 — no false 'not installed')", () => {
 
   it("treats undefined as 'unknown'", () => {
     expect(reconcileProbeState(undefined, { proven: true })).toBe("unknown");
+  });
+
+  it("degrades a PROVEN interpreter's negative when its torch contradicts the running server", () => {
+    // `proven` establishes WHERE the interpreter is, not that its contents are the
+    // server's. A torch build that disagrees proves they are different environments,
+    // so "not installed" from it would be exactly the #401 false negative again.
+    expect(
+      reconcileProbeState("not-installed", {
+        proven: true,
+        runningPython: "3.13",
+        probePython: "3.13",
+        runningTorch: "2.9.0+cu128",
+        probeTorch: "2.4.0",
+      }),
+    ).toBe("unknown");
+    // Agreement (or an unreported torch, which contradicts nothing) keeps it.
+    expect(
+      reconcileProbeState("not-installed", {
+        proven: true,
+        runningPython: "3.13",
+        probePython: "3.13",
+        runningTorch: "2.9.0+cu128",
+        probeTorch: "2.9.0+cu128",
+      }),
+    ).toBe("not-installed");
+    expect(
+      reconcileProbeState("not-installed", {
+        proven: true,
+        runningPython: "3.13",
+        probePython: "3.13",
+        runningTorch: "2.9.0+cu128",
+      }),
+    ).toBe("not-installed");
   });
 
   it("never emits a definitive negative from an UNPROVEN interpreter (anchored/ambiguous)", () => {
