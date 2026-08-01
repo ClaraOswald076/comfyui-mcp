@@ -41,6 +41,7 @@ vi.mock("node:child_process", async (importOriginal) => {
       if (proc.exitCode === null) {
         proc.exitCode = 1;
         proc.emit("exit", 1, "SIGTERM");
+        proc.emit("close", 1, "SIGTERM"); // PiBackend settles on 'close', not 'exit'
       }
       return true;
     };
@@ -57,6 +58,7 @@ vi.mock("node:child_process", async (importOriginal) => {
           if (proc.exitCode === null) {
             proc.exitCode = step.exit ?? 0;
             proc.emit("exit", step.exit ?? 0, null);
+            proc.emit("close", step.exit ?? 0, null); // 'close' = stdio drained
           }
         }, 5);
       }
@@ -74,7 +76,9 @@ vi.mock("node:child_process", async (importOriginal) => {
         const proc = hoisted.procs.find((p) => p.pid === pid);
         if (proc && proc.exitCode === null) {
           proc.exitCode = 1;
-          (proc as { emit: (ev: string, ...a: unknown[]) => void }).emit("exit", null, "SIGKILL");
+          const emit = (proc as { emit: (ev: string, ...a: unknown[]) => void }).emit;
+          emit.call(proc, "exit", null, "SIGKILL");
+          emit.call(proc, "close", null, "SIGKILL");
         }
       }
       return { status: 0, stdout: "", stderr: "" };
@@ -123,7 +127,9 @@ beforeEach(() => {
     const proc = hoisted.procs.find((p) => p.pid === target);
     if (proc && proc.exitCode === null) {
       proc.exitCode = 1;
-      (proc as { emit: (ev: string, ...a: unknown[]) => void }).emit("exit", null, "SIGKILL");
+      const emit = (proc as { emit: (ev: string, ...a: unknown[]) => void }).emit;
+      emit.call(proc, "exit", null, "SIGKILL");
+      emit.call(proc, "close", null, "SIGKILL");
     }
     return true;
   }) as unknown as typeof process.kill);
@@ -151,8 +157,10 @@ describe("parsePiModels", () => {
     expect(models[0]!.label).toBe("claude-sonnet-4");
   });
 
-  it("strips ANSI and skips separator rules", () => {
-    const out = "[32manthropic[0m  claude-3-5-sonnet  200K\n────────  ──────  ──────\n";
+  it("strips real ANSI escapes and skips separator rules", () => {
+    // Real ANSI escapes include the ESC (\x1b) byte — the parser must strip the
+    // whole CSI sequence, not just the "[32m" tail (else the token keeps \x1b).
+    const out = "\x1b[32manthropic\x1b[0m  claude-3-5-sonnet  200K\n────────  ──────  ──────\n";
     expect(parsePiModels(out).map((m) => m.id)).toEqual(["anthropic/claude-3-5-sonnet"]);
   });
 
@@ -275,6 +283,17 @@ describe("PiBackend turns", () => {
     const backend = new PiBackend({ cwd: workDir, provider: "openai" });
     await collect(backend.run({ channel: channelOf([{ text: "q" }]) }));
     const t1 = hoisted.spawns[0]!;
+    expect(t1.args[t1.args.indexOf("--provider") + 1]).toBe("openai");
+  });
+
+  it("still drops a bare claude id EVEN when a provider is configured (no --model leak)", async () => {
+    // Regression: a set --provider must not whitelist the panel's bare claude
+    // default — `pi --provider openai --model claude-opus-5` would fail every turn.
+    hoisted.script.push({ stdout: [header("s"), delta("ok"), END], exit: 0 });
+    const backend = new PiBackend({ cwd: workDir, provider: "openai" });
+    await collect(backend.run({ model: "claude-opus-5", channel: channelOf([{ text: "q" }]) }));
+    const t1 = hoisted.spawns[0]!;
+    expect(t1.args).not.toContain("--model");
     expect(t1.args[t1.args.indexOf("--provider") + 1]).toBe("openai");
   });
 
