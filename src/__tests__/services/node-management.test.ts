@@ -186,8 +186,11 @@ describe("node-management service", () => {
     config.githubToken = undefined;
     remoteFlags.forceRemote = false;
     remoteFlags.remoteMode = false;
-    // Default: the LIVE server reports the SAME root as config.comfyuiPath, so the
-    // Manager self-update fallback is allowed to touch that checkout.
+    // Default fixture: the LIVE server reports the SAME root as config.comfyuiPath.
+    // This grants NOTHING — it is inert scenario scaffolding. The self-update path
+    // does not consult it, and under exactly this state an enqueue 405 still refuses
+    // and never touches the checkout. It exists so the suite can prove that even the
+    // most local-looking configuration is refused, not to model permission.
     liveRoot.value = "/fake/comfy";
     // Each test re-detects the Manager API generation against its own stub
     // (the v2 stubs answer /v2/manager/queue/status → detect "v2").
@@ -1196,12 +1199,11 @@ describe("node-management service", () => {
       expect(update?.body).toMatchObject({ id: "comfyui-manager" });
       // The v4-only unified task route (the #424 405 source) is never touched.
       expect(legacyCallTo(calls, "/v2/manager/queue/task")).toBeUndefined();
-      // No git pull happened — the Manager's own API did the work.
-      expect(
-        mockedExec.mock.calls.some(
-          ([bin, args]) => bin === "git" && Array.isArray(args) && args.includes("pull"),
-        ),
-      ).toBe(false);
+      // NOTHING was shelled out — the Manager's own API did the work. Asserted on
+      // the mock as a whole, not on an executable NAME: a check for the literal
+      // "git" would wave through execFileSync("git.exe", [...]) on Windows, which
+      // is exactly the platform this bug was reported on.
+      expect(mockedExec).not.toHaveBeenCalled();
       // …and the result does NOT claim a verified update (a drained 3.x queue
       // proves nothing) — it tells the user to restart and confirm.
       expect(res.message).toMatch(/restart/i);
@@ -1217,11 +1219,7 @@ describe("node-management service", () => {
         id: "rgthree-comfy",
       });
       expect(res.message).toMatch(/Queued \+ updated "rgthree-comfy"/);
-      expect(
-        mockedExec.mock.calls.some(
-          ([bin, args]) => bin === "git" && Array.isArray(args) && args.includes("pull"),
-        ),
-      ).toBe(false);
+      expect(mockedExec).not.toHaveBeenCalled();
     });
 
     // ── When the update route is genuinely unregistered (405), the ONLY outcome
@@ -1266,7 +1264,7 @@ describe("node-management service", () => {
           mockedExists.mockReturnValue(true);
         },
       ],
-    ])("self-update 405 refuses explicitly and never runs git — %s", async (_name, setup) => {
+    ])("self-update 405 refuses explicitly and shells out to NOTHING — %s", async (_name, setup) => {
       const { calls } = stubLegacyFetch({ update405: true });
       mockedExists.mockReturnValue(true); // a real-looking local checkout exists
       setup();
@@ -1276,8 +1274,12 @@ describe("node-management service", () => {
       );
       // The real endpoint was still tried first — that's what proves it's a 405.
       expect(legacyCallTo(calls, "/manager/queue/update")).toBeDefined();
-      // No git ran at all: not a pull, not even a rev-parse probe.
-      expect(mockedExec.mock.calls.some(([bin]) => bin === "git")).toBe(false);
+      // NO subprocess ran at all — not a pull, not a rev-parse probe, nothing.
+      // Asserted on the mock as a whole rather than on an executable NAME: a check
+      // for the literal "git" would wave through execFileSync("git.exe", [...]),
+      // which is valid on Windows — the very platform this bug was reported on —
+      // so a reintroduced fallback could pull the local checkout and still pass.
+      expect(mockedExec).not.toHaveBeenCalled();
     });
 
     it("self-update 405 on a REMOTE host also refuses (never touches a local clone)", async () => {
@@ -1289,7 +1291,7 @@ describe("node-management service", () => {
         await expect(updateCustomNode({ id: "comfyui-manager" })).rejects.toThrow(
           /NOTHING WAS UPDATED/,
         );
-        expect(mockedExec.mock.calls.some(([bin]) => bin === "git")).toBe(false);
+        expect(mockedExec).not.toHaveBeenCalled();
       } finally {
         config.comfyuiHost = original;
       }
@@ -1306,7 +1308,7 @@ describe("node-management service", () => {
       expect(err).toBeInstanceOf(Error);
       expect((err as Error).message).toMatch(/405/);
       expect((err as Error).message).not.toMatch(/NOTHING WAS UPDATED/);
-      expect(mockedExec.mock.calls.some(([bin]) => bin === "git")).toBe(false);
+      expect(mockedExec).not.toHaveBeenCalled();
     });
 
   });
