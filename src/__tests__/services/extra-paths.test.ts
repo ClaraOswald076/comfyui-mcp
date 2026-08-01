@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
@@ -57,6 +57,19 @@ import { configureWorkspace, resetWorkspaceConfig } from "../../services/workspa
 async function tmpDir(): Promise<string> {
   return mkdtemp(join(tmpdir(), "comfyui-extra-paths-"));
 }
+
+/** Can this machine create a file symlink? (Windows needs privileges/Developer Mode.) */
+const CAN_SYMLINK = (() => {
+  try {
+    const dir = mkdtempSync(join(tmpdir(), "comfyui-symlink-probe-"));
+    writeFileSync(join(dir, "t"), "t");
+    symlinkSync(join(dir, "t"), join(dir, "link"), "file");
+    rmSync(dir, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
+})();
 
 let dirs: string[] = [];
 const oldAppData = process.env.APPDATA;
@@ -541,8 +554,11 @@ describe("standalone root precedence — saved default workspace (#648)", () => 
 });
 
 describe("a reachable server with NO --extra-model-paths-config is still authoritative", () => {
-  /** Make /system_stats report a server running from `root`/main.py. */
-  function liveAt(root: string): void {
+  /** Make /system_stats report a server running from `root`/main.py, and put a real
+   *  main.py there — resolution now PROVES the live root by resolving that file, so a
+   *  root we cannot see is refused rather than fabricated. */
+  async function liveAt(root: string): Promise<void> {
+    await writeFile(join(root, "main.py"), "# comfyui\n", "utf-8");
     mockGetSystemStats.mockResolvedValue({ system: { argv: ["python", join(root, "main.py")] } });
   }
 
@@ -563,7 +579,7 @@ describe("a reachable server with NO --extra-model-paths-config is still authori
     );
     await saveDefaultWorkspace(workspaceA);
     config.comfyuiPath = undefined;
-    liveAt(liveB);
+    await liveAt(liveB);
 
     const result = await listExtraPaths(); // default auto target
 
@@ -580,7 +596,7 @@ describe("a reachable server with NO --extra-model-paths-config is still authori
     const liveB = await trackTmp();
     await saveDefaultWorkspace(workspaceA);
     config.comfyuiPath = undefined;
-    liveAt(liveB);
+    await liveAt(liveB);
 
     const added = await addExtraPath({ group: "shared", category: "loras", path: "E:/loras" });
 
@@ -594,7 +610,7 @@ describe("a reachable server with NO --extra-model-paths-config is still authori
     const liveB = await trackTmp();
     config.comfyuiPath = stale;
     process.env.COMFYUI_PATH = stale;
-    liveAt(liveB);
+    await liveAt(liveB);
 
     const result = await listExtraPaths();
     expect(result.path).toBe(join(liveB, "extra_model_paths.yaml"));
@@ -605,7 +621,7 @@ describe("a reachable server with NO --extra-model-paths-config is still authori
     const liveB = await trackTmp();
     await saveDefaultWorkspace(workspaceA);
     config.comfyuiPath = undefined;
-    liveAt(liveB);
+    await liveAt(liveB);
 
     const pinned = await listExtraPaths({ target: "standalone" });
     expect(pinned.path).toBe(join(workspaceA, "extra_model_paths.yaml"));
@@ -620,7 +636,7 @@ describe("a reachable server with NO --extra-model-paths-config is still authori
     const liveB = await trackTmp();
     const flagged = join(await trackTmp(), "flagged.yaml");
     await writeFile(flagged, "f:\n  vae: E:/flag\n", "utf-8");
-    liveAt(liveB);
+    await liveAt(liveB);
     mockResolveServerExtraModelConfig.mockResolvedValue(flagged);
 
     const result = await listExtraPaths();
@@ -639,10 +655,52 @@ describe("a reachable server with NO --extra-model-paths-config is still authori
     expect(result.path).toBe(join(workspaceA, "extra_model_paths.yaml"));
   });
 
+  it("REFUSES when the live root cannot be resolved from here (container/WSL/another host)", async () => {
+    // Reachable server reporting a root whose main.py we cannot see. Falling back to the
+    // saved workspace would be exactly the wrong-tree write this branch exists to stop.
+    const workspaceA = await trackTmp();
+    await saveDefaultWorkspace(workspaceA);
+    config.comfyuiPath = undefined;
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: ["python", join(await trackTmp(), "not-mounted", "main.py")] },
+    });
+
+    await expect(listExtraPaths()).rejects.toThrow(/UNRESOLVED.*cannot be resolved from this process/s);
+    // …and it did NOT quietly write into the saved workspace instead.
+    await expect(
+      addExtraPath({ category: "loras", path: "E:/loras" }),
+    ).rejects.toThrow(/UNRESOLVED/);
+    expect(existsSync(join(workspaceA, "extra_model_paths.yaml"))).toBe(false);
+  });
+
+  // Real symlinks need privileges/Developer Mode on Windows. Skipped rather than
+  // silently returning when unavailable, so it can never read as a vacuous pass;
+  // extra-paths-root-guard.test.ts proves the same realpath behavior on every platform
+  // by scripting realpathSync.
+  it.skipIf(!CAN_SYMLINK)(
+    "follows a SYMLINKED main.py to the real install root (ComfyUI uses realpath)",
+    async () => {
+      // ComfyUI locates the implicit config next to os.path.realpath(__file__), so a
+      // launcher dir that symlinks main.py must not receive the write.
+      const launcher = await trackTmp();
+      const real = await trackTmp();
+      await writeFile(join(real, "main.py"), "# comfyui\n", "utf-8");
+      symlinkSync(join(real, "main.py"), join(launcher, "main.py"), "file");
+      mockGetSystemStats.mockResolvedValue({
+        system: { argv: ["python", join(launcher, "main.py")] },
+      });
+      config.comfyuiPath = undefined;
+
+      const added = await addExtraPath({ category: "loras", path: "E:/loras" });
+      expect(added.path).toBe(join(real, "extra_model_paths.yaml"));
+      expect(existsSync(join(launcher, "extra_model_paths.yaml"))).toBe(false);
+    },
+  );
+
   it("ignores the live root in REMOTE mode (it is a path on the remote host)", async () => {
     const liveB = await trackTmp();
     process.env.APPDATA = await trackTmp(); // no Desktop config to fall into
-    liveAt(liveB);
+    await liveAt(liveB);
     mockIsRemoteMode.mockReturnValue(true);
     config.comfyuiPath = undefined;
 

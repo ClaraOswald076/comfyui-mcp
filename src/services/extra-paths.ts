@@ -1,4 +1,4 @@
-import { existsSync, statSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir, platform } from "node:os";
 import { dirname, join, isAbsolute, resolve } from "node:path";
@@ -313,19 +313,24 @@ function statDir(p: string): { identity?: DirIdentity } | undefined {
  * indistinguishable from the original. Single-user local machine, and the window is now
  * bounded by one syscall instead of the whole tool invocation.
  */
+type GuardedRootSource = StandaloneRootSource | "live-root";
+
 interface GuardedRoot {
   path: string;
   identity?: DirIdentity;
-  source: StandaloneRootSource;
+  source: GuardedRootSource;
+}
+
+function guardedRootOrigin(source: GuardedRootSource): string {
+  if (source === "default-workspace") return "the saved default workspace (set_default_workspace)";
+  if (source === "live-root") return "the running ComfyUI's own install root (from its launch argv)";
+  return "a ComfyUI root this process INFERRED (auto-detection, or a nested root descended from COMFYUI_PATH)";
 }
 
 function assertRootIntact(guard: GuardedRoot | undefined): void {
   if (!guard) return;
   const now = statDir(guard.path);
-  const origin =
-    guard.source === "default-workspace"
-      ? "the saved default workspace (set_default_workspace)"
-      : "a ComfyUI root this process INFERRED (auto-detection, or a nested root descended from COMFYUI_PATH)";
+  const origin = guardedRootOrigin(guard.source);
   if (!now) {
     throw new ValidationError(
       `UNRESOLVED: "${guard.path}" is no longer an existing directory. It came from ${origin} ` +
@@ -561,15 +566,54 @@ function isDesktopGeneratedConfig(path: string): boolean {
 }
 
 /**
+ * ComfyUI locates its implicit `extra_model_paths.yaml` next to `os.path.realpath(__file__)`
+ * — the SYMLINK TARGET of its `main.py`, not the spelling in argv. `liveRootFromArgv` is
+ * lexical (it is shared with the #633 authorization path and must not change), so this
+ * resolves the real directory here: a launcher that keeps `/launcher/main.py` symlinked to
+ * `/installs/B/main.py` makes ComfyUI read `/installs/B/extra_model_paths.yaml`, and
+ * writing `/launcher/…` instead would be a silent no-op (codex round 6, P1a).
+ *
+ * Requiring the file to RESOLVE also proves the live root is reachable on THIS
+ * filesystem. A server in a container/WSL/another machine reports a root we cannot see;
+ * returning undefined there makes the caller refuse explicitly instead of creating a
+ * lookalike tree locally and reporting success (codex round 6, P1b).
+ */
+function realLiveRoot(liveRoot: string): string | undefined {
+  for (const name of ["main.py", "main.pyw"]) {
+    try {
+      return dirname(realpathSync(join(liveRoot, name)));
+    } catch {
+      // not this name / not visible from here — try the next
+    }
+  }
+  return undefined;
+}
+
+/**
  * The `<live root>/extra_model_paths.yaml` a reachable server implicitly reads when it
- * was launched with no `--extra-model-paths-config`. No guard is attached: the root is
- * the running server's own install dir, so it exists by construction, and `createParents`
- * stays true (only the YAML itself may be missing).
+ * was launched with no `--extra-model-paths-config`. The root is proven (its `main.py`
+ * must resolve here) and then GUARDED and `createParents:false` like any other root this
+ * process derived rather than the user naming: a reported root can be stale (the server
+ * restarted elsewhere) or simply not ours to write to. Throws UNRESOLVED rather than
+ * falling back to a static guess — falling back is precisely the wrong-tree write this
+ * whole branch exists to stop.
  */
 function implicitLiveTarget(
-  liveRoot: string,
+  reportedRoot: string,
   opts: ExtraPathOptions,
 ): ResolvedTarget & { serverResolved: boolean } {
+  const liveRoot = realLiveRoot(reportedRoot);
+  const seen = liveRoot ? statDir(liveRoot) : undefined;
+  if (!liveRoot || !seen) {
+    throw new ValidationError(
+      `UNRESOLVED: the running ComfyUI reports its install root as "${reportedRoot}", but its ` +
+        "main.py cannot be resolved from this process — the server is running on a filesystem " +
+        "this MCP cannot see (another machine, a container, or WSL), or it moved since launch. " +
+        "That is the file the server actually reads, so nothing was read or written; creating a " +
+        "lookalike config locally would be a silent no-op. Pass config_path explicitly to target " +
+        "a file you can reach.",
+    );
+  }
   const path = join(liveRoot, "extra_model_paths.yaml");
   const notes = [
     `Resolved from the RUNNING ComfyUI's own install root (${liveRoot}): it was launched with no --extra-model-paths-config, so this is the extra_model_paths.yaml it implicitly reads.`,
@@ -586,7 +630,14 @@ function implicitLiveTarget(
   } catch {
     // No static guess available — the live-resolved path stands on its own.
   }
-  return { target: "standalone", path, notes, serverResolved: true, createParents: true };
+  return {
+    target: "standalone",
+    path,
+    notes,
+    serverResolved: true,
+    createParents: false, // the root is proven; only the YAML itself may be missing
+    guard: { path: liveRoot, identity: seen.identity, source: "live-root" },
+  };
 }
 
 /**
