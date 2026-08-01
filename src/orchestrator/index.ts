@@ -270,12 +270,17 @@ function formatQueueNote(rep: StallReport): string | null {
       `Do NOT queue another run on top.`
     );
   }
-  if (rep.backlog) {
+  // A plain backlog (depth > 1) is NOT evidence of a wedge — deliberately queuing
+  // a batch is a normal workflow. Suppress the note entirely when the in-flight
+  // work is this session's own recent jobs, and when it isn't, report it NEUTRALLY
+  // (no false "you likely queued behind a stuck job" diagnosis, no destructive
+  // clear_pending as the headline). A genuinely stalled job is handled above (#559).
+  if (rep.backlog && !rep.selfAttributed) {
     const pending = Math.max(0, rep.queueDepth - 1);
     return (
-      `⚠️ ComfyUI queue backlog: ${rep.queueDepth} tasks in flight (1 running + ${pending} pending). ` +
-      `You likely queued behind a slow/stuck job. Check get_queue; use cancel_job with clear_pending:true to ` +
-      `reset before re-queuing rather than stacking another run.`
+      `ℹ️ ComfyUI queue: ${rep.queueDepth} tasks in flight (1 running + ${pending} pending) that this session ` +
+      `didn't queue. This is only a problem if the running one is stuck — inspect with get_queue. ` +
+      `cancel_queued_job drops a single pending item; cancel_job with clear_pending:true resets everything.`
     );
   }
   return null;

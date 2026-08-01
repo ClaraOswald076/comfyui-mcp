@@ -282,6 +282,12 @@ export class PanelAgent {
   private lastUsage: Record<string, number> | null = null;
   /** Context window for the active model, cached from result.modelUsage. */
   private contextWindow = 0;
+  /** The model the IN-FLIGHT turn was dispatched with. A live setModel can change
+   *  this.model mid-turn (the outgoing turn still runs on the old model), so the
+   *  result event's contextWindow must only be cached when the turn's model still
+   *  matches the current one — otherwise a late old-model result would restore the
+   *  wrong denominator after a switch (#543). */
+  private turnModel: string | null = null;
   /** Last status pushed — re-sent on reconnect so the meter isn't blank. */
   lastStatus: UsageStatus | null = null;
   /** Set true when start()'s bounded self-restart loop GAVE UP (the session kept
@@ -484,6 +490,12 @@ export class PanelAgent {
   async setModel(model: string): Promise<void> {
     if (model === this.model) return;
     this.model = model;
+    // Drop the outgoing model's cached context window (#543). The new model may
+    // have a different (smaller) window; scoring the next turn against the old
+    // denominator would under-report fill. reportStatus omits contextPct while
+    // the cache is 0, so the panel holds its last reading until the next result
+    // event refreshes the window for the incoming model. `used` is still reported.
+    this.contextWindow = 0;
     try {
       // setModel is live: no session restart, the next turn uses it.
       await this.backend.setModel?.(model);
@@ -737,6 +749,9 @@ export class PanelAgent {
       this.errorSurfaced = false; // fresh turn → its failure (if any) is unreported
       this.interruptRequested = false; // a stale interrupt can't mute THIS turn's failure
       this.busy = true;
+      // Snapshot the model this turn runs on, so a live setModel mid-turn can't let
+      // the outgoing turn's result restore the wrong context window (#543).
+      this.turnModel = this.model;
       this.deps.onTurn?.(this.tabId, "working");
       // Arm the freeze watchdog AT DISPATCH: a turn that produces NO events at all
       // (the exact ROOT CAUSE B freeze — turn/start sent, no notifications ever
@@ -1062,8 +1077,14 @@ export class PanelAgent {
       }
       case "result": {
         // Cache the context window + cost from the result, then re-report using
-        // the last assistant usage (the true current context).
-        if (ev.contextWindow && ev.contextWindow > this.contextWindow) {
+        // the last assistant usage (the true current context). Track the LATEST
+        // reported window, not the max ever seen: the model can change mid-session
+        // (setModel is live) and a smaller-window model must shrink the denominator,
+        // otherwise the meter under-reports fill against a stale larger window (#543).
+        // Only cache when the turn's model still matches the current one — a result
+        // from a turn whose model was switched away mid-flight carries the OUTGOING
+        // model's window, which must NOT restore the denominator setModel cleared.
+        if (ev.contextWindow && this.turnModel === this.model) {
           this.contextWindow = ev.contextWindow;
         }
         if (this.lastUsage) this.reportStatus(this.lastUsage, ev.costUsd);
