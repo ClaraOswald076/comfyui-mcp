@@ -127,19 +127,57 @@ describe("auth.json records", () => {
 
   it("oauth record needs something that can produce a live token", () => {
     const now = 1_800_000_000_000;
-    const futureSec = Math.floor(now / 1000) + 3600;
     expect(authRecordUsable({ type: "oauth", access: "at", refresh: "rt", expires: 1 }, bareEnv(), now)).toBe(true);
     // refresh alone: pi can always re-mint an access token, even when expired.
     expect(authRecordUsable({ type: "oauth", refresh: "rt" }, bareEnv(), now)).toBe(true);
-    expect(authRecordUsable({ type: "oauth", expires: futureSec }, bareEnv(), now)).toBe(false);
+    expect(authRecordUsable({ type: "oauth", expires: now + 3600_000 }, bareEnv(), now)).toBe(false);
     // access with no refresh and a PAST/absent expiry cannot be renewed: pi sees
     // it as expired and tries to refresh with no refresh token.
     expect(authRecordUsable({ type: "oauth", access: "at" }, bareEnv(), now)).toBe(false);
     expect(authRecordUsable({ type: "oauth", access: "at", expires: 999 }, bareEnv(), now)).toBe(false);
-    // …a still-live access token is ready. Accepted in seconds OR milliseconds,
-    // since pi doesn't document the unit.
-    expect(authRecordUsable({ type: "oauth", access: "at", expires: futureSec }, bareEnv(), now)).toBe(true);
+    // `expires` is MILLISECONDS for pi, so a seconds-scaled value reads as long
+    // expired — which it is, as far as pi is concerned.
+    expect(
+      authRecordUsable({ type: "oauth", access: "at", expires: Math.floor(now / 1000) + 3600 }, bareEnv(), now),
+    ).toBe(false);
+    // pi refreshes anything inside its five-minute minimum-validity window, so
+    // access-only that close to expiry is NOT usable…
+    expect(authRecordUsable({ type: "oauth", access: "at", expires: now + 60_000 }, bareEnv(), now)).toBe(false);
+    // …but comfortably-live access alone is.
     expect(authRecordUsable({ type: "oauth", access: "at", expires: now + 3600_000 }, bareEnv(), now)).toBe(true);
+  });
+
+  it("a KEYLESS google-vertex record resolves through ADC (pi's /login writes one)", () => {
+    const keyFile = join(tmp, "sa.json");
+    writeFileSync(keyFile, "{}");
+    // pi's Vertex login writes {type:"api_key", env:{…}} with NO key, and its
+    // resolver falls back to ADC — this must NOT read as "not signed in".
+    writePiFile(
+      tmp,
+      "auth.json",
+      JSON.stringify({
+        "google-vertex": {
+          type: "api_key",
+          env: {
+            GOOGLE_CLOUD_PROJECT: "p",
+            GOOGLE_CLOUD_LOCATION: "l",
+            GOOGLE_APPLICATION_CREDENTIALS: keyFile,
+          },
+        },
+      }),
+    );
+    expect(piCredentialPresent(tmp, bareEnv())).toBe(true);
+    // …but only when the ADC trio actually resolves.
+    writePiFile(
+      tmp,
+      "auth.json",
+      JSON.stringify({ "google-vertex": { type: "api_key", env: { GOOGLE_CLOUD_PROJECT: "p" } } }),
+    );
+    expect(piCredentialPresent(tmp, bareEnv())).toBe(false);
+    // A keyless record is also satisfied by GOOGLE_CLOUD_API_KEY (pi does
+    // `credential?.key ?? env("GOOGLE_CLOUD_API_KEY")`).
+    writePiFile(tmp, "auth.json", JSON.stringify({ "google-vertex": { type: "api_key" } }));
+    expect(piCredentialPresent(tmp, bareEnv({ GOOGLE_CLOUD_API_KEY: "k" }))).toBe(true);
   });
 
   it("an UNRECOGNISED credential type is not a credential (and blocks env fallback)", () => {
