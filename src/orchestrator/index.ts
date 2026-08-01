@@ -2011,6 +2011,9 @@ export async function runPanelOrchestrator(): Promise<void> {
       requestSelfExit(`tab ${tabId.slice(0, 8)} ${reason}`);
     },
     sessionStore,
+    // #570 P0 — bind each persisted exact session to its tab's trusted workflow uuid,
+    // so a saved workflow overwritten in place (same tab id, new uuid) is detectable.
+    identityForKey: (k: string) => tabStableIdentity.get(panelTabOf(k))?.uuid,
   });
   // Let refreshEnvCapabilities() feed a freshly-gathered env block into agents
   // spawned after a ComfyUI restart/reconnect.
@@ -2668,6 +2671,27 @@ export async function runPanelOrchestrator(): Promise<void> {
       if ((event as { headless?: unknown }).headless === true) headlessTabs.add(panelTab);
       else headlessTabs.delete(panelTab);
       const key = panelTab + AGENT_KEY_SEP + backend;
+
+      // #570 P0 — IN-PLACE workflow replacement. The tab-id migration path (above) only
+      // fires when the tab id CHANGES. A SAVED workflow keeps its `wf:<path>` tab id when
+      // its file is OVERWRITTEN with a DIFFERENT workflow (new embedded uuid) — so the
+      // tab-id-keyed exact session record would resume the PRIOR workflow's chat (via
+      // spawn's exact-store hit AND an unowned hello.resume). Detect it by the DURABLE
+      // identity bound to the exact record: if it names a DIFFERENT trusted uuid than this
+      // hello's, the workflow was replaced — clear the stale exact session (and any stale
+      // stable entry) so the new workflow starts fresh. Durable, so it holds across an
+      // orchestrator restart too.
+      if (newIdentity) {
+        const boundUuid = sessionStore.identityOf(key);
+        if (boundUuid && boundUuid !== newIdentity.uuid) {
+          sessionStore.clear(key);
+          const staleStable = deriveStableKey({ workflowUuid: boundUuid, origin: newIdentity.origin, backend });
+          if (staleStable) sessionStore.clearStable(staleStable);
+          logger.info(
+            `[panel-orchestrator] tab ${panelTab.slice(0, 8)} workflow replaced in place (identity uuid changed) — cleared the prior workflow's stale session`,
+          );
+        }
+      }
 
       // Reload restore: the panel re-sends the last session id it saw. HONOR IT ONLY
       // when it names a session THIS tab's TRUSTED identity already OWNS (#570 P0) — its

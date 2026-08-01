@@ -1235,6 +1235,10 @@ export interface PanelAgentManagerOptions {
    * auto-restart), independent of whether the panel re-sends `hello.resume`.
    */
   sessionStore?: SessionStore;
+  /** #570 P0 — resolve the trusted workflow-identity uuid for a composite agent key, so a
+   *  persisted exact session is BOUND to the workflow it belongs to (detecting a saved
+   *  workflow overwritten in place: same tab id, new uuid). undefined when unknown. */
+  identityForKey?: (key: string) => string | undefined;
 }
 
 /** Owns one PanelAgent per tab id, spawned lazily on the tab's first message. */
@@ -1312,7 +1316,7 @@ export class PanelAgentManager {
       // Persist the session id to our durable store (resume-after-restart) BEFORE
       // forwarding it to the panel — so it's on disk the moment the SDK reports it.
       onSession: (id, sid, model) => {
-        this.opts.sessionStore?.set(id, sid);
+        this.opts.sessionStore?.set(id, sid, this.opts.identityForKey?.(id));
         this.opts.onSession?.(id, sid, model);
       },
       onTurnAnchor: this.opts.onTurnAnchor,
@@ -1672,7 +1676,11 @@ export class PanelAgentManager {
         this.pendingResume.delete(oldKey);
       }
       const persisted = this.opts.sessionStore?.get(oldKey);
-      if (persisted) this.opts.sessionStore?.set(newKey, persisted);
+      // Carry the identity binding across the tab-id migration (same workflow, so the
+      // uuid is unchanged) — read the OLD entry's binding, since tabStableIdentity for the
+      // new tab may not be populated yet at rebind time.
+      const persistedIdentity = this.opts.sessionStore?.identityOf(oldKey);
+      if (persisted) this.opts.sessionStore?.set(newKey, persisted, persistedIdentity);
       this.opts.sessionStore?.clear(oldKey);
       // Held mail from a failed start migrates too (issue #256) — it exists
       // precisely when NO live agent does, so it must move in the durable pass

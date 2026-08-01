@@ -49,6 +49,11 @@ interface Entry {
    *  under this (title-collision) key, so it can no longer be trusted to resume
    *  either. getStable refuses it; only clearStable (a NEW chat) revives the key. */
   p?: boolean;
+  /** EXACT index only: the trusted workflow-identity uuid this session belongs to, so a
+   *  SAVED tab whose file is OVERWRITTEN in place (same `wf:<path>` tab id, new uuid) can
+   *  be detected — the tab-id-keyed exact record would otherwise resume the PRIOR
+   *  workflow's chat. Durable, so the check survives an orchestrator restart (#570 P0). */
+  u?: string;
 }
 
 interface StoreFileV2 {
@@ -196,7 +201,7 @@ export class SessionStore {
             dirty = true;
             continue;
           }
-          const e = v as { s?: unknown; t?: unknown; o?: unknown; p?: unknown };
+          const e = v as { s?: unknown; t?: unknown; o?: unknown; p?: unknown; u?: unknown };
           if (typeof e.s !== "string") {
             dirty = true;
             continue;
@@ -217,6 +222,7 @@ export class SessionStore {
           const entry: Entry = { s: e.s, t };
           if (typeof e.o === "string") entry.o = e.o;
           if (e.p === true) entry.p = true;
+          if (typeof e.u === "string") entry.u = e.u;
           out[k] = entry;
         }
         return out;
@@ -268,15 +274,26 @@ export class SessionStore {
     return s;
   }
 
-  /** Record (and persist) a tab's current session id. No-op if unchanged. */
-  set(tabId: string, sessionId: string): void {
-    if (this.sessions[tabId]?.s === sessionId) {
-      // Same id — refresh the timestamp so an actively-used session never GCs out,
-      // but skip the disk write when the timestamp is already recent.
-      const existing = this.sessions[tabId];
-      if (existing && this.now() - existing.t < 60 * 60 * 1000) return;
+  /** The trusted workflow-identity uuid the exact session under this key belongs to
+   *  (#570 P0), or undefined. Lets the hello handler detect a SAVED workflow overwritten
+   *  in place (same tab id, new uuid) and clear the stale session. */
+  identityOf(tabId: string): string | undefined {
+    return this.sessions[tabId]?.u;
+  }
+
+  /** Record (and persist) a tab's current session id, bound to its trusted workflow
+   *  identity uuid (when known). No-op if BOTH the id and the identity are unchanged. */
+  set(tabId: string, sessionId: string, identityUuid?: string): void {
+    const u = typeof identityUuid === "string" && identityUuid ? identityUuid : undefined;
+    const existing = this.sessions[tabId];
+    if (existing?.s === sessionId && existing.u === u) {
+      // Same id AND identity — refresh the timestamp so an actively-used session never
+      // GCs out, but skip the disk write when the timestamp is already recent.
+      if (this.now() - existing.t < 60 * 60 * 1000) return;
     }
-    this.sessions[tabId] = { s: sessionId, t: this.now() };
+    const entry: Entry = { s: sessionId, t: this.now() };
+    if (u) entry.u = u;
+    this.sessions[tabId] = entry;
     this.flush();
   }
 

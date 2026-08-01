@@ -285,6 +285,27 @@ describe("SessionStore", () => {
       expect(bOwnsResume).toBe(false); // B's hello.resume=S is dropped, never cross-resumes A
     });
 
+    it("IN-PLACE REPLACE: the exact session is bound to a durable identity uuid (#570 P0)", () => {
+      // A SAVED workflow keeps its wf:<path> tab id when its file is overwritten with a
+      // DIFFERENT workflow. The exact record carries the trusted uuid it belongs to, so the
+      // hello handler can detect the change (boundUuid !== hello uuid) and clear the stale
+      // session — durable, so it survives an orchestrator restart.
+      const first = new SessionStore(PORT);
+      first.set("wf:foo.json::claude", "sess-A", UUID_A);
+      expect(first.get("wf:foo.json::claude")).toBe("sess-A");
+      expect(first.identityOf("wf:foo.json::claude")).toBe(UUID_A);
+
+      // Fresh process (restart): the binding is durable.
+      const restarted = new SessionStore(PORT);
+      expect(restarted.identityOf("wf:foo.json::claude")).toBe(UUID_A);
+      // The overwritten workflow B has a DIFFERENT uuid → the handler detects the mismatch
+      // (modeled here) and clears the stale session so B can't inherit A's chat.
+      expect(restarted.identityOf("wf:foo.json::claude") !== UUID_B).toBe(true);
+      restarted.clear("wf:foo.json::claude");
+      expect(restarted.get("wf:foo.json::claude")).toBeUndefined();
+      expect(new SessionStore(PORT).get("wf:foo.json::claude")).toBeUndefined();
+    });
+
     it("WORKFLOW IDENTITY: distinguishes a same-workflow migration from a workflow switch (#570 P0a)", () => {
       // deriveWorkflowIdentity is the backend-independent discriminator the hello
       // handler uses to decide whether a same-socket re-hello under a new tab id is a
