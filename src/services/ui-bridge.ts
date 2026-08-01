@@ -215,9 +215,43 @@ export function panelVersionProvesUnsupported(cmd: string, panelVersion?: string
  *  quoted minimum is COMMAND-SPECIFIC (#352) — not a blanket 0.11.4. */
 function buildPanelTooOldError(cmd: string, panelVersion?: string): Error {
   const detected = panelVersion ? ` (detected ${panelVersion})` : "";
-  return new Error(
+  const e = new Error(
     `This ComfyUI-MCP panel is too old for "${cmd}"${detected} — update the ComfyUI-MCP panel ` +
       `to ≥${minPanelVersionForCmd(cmd)} (ComfyUI Manager → update comfyui-mcp panel), then reconnect.`,
+  );
+  // STRUCTURED discriminator (#413): both the reactive rewrite and the #236
+  // proactive gate funnel through here, so tagging the error object lets callers
+  // detect an unsupported-command rejection WITHOUT string-matching a message
+  // that was already rewritten away from the panel's raw "Unknown command" text.
+  // panel_strip_workflow relies on this to still take its graph_get_state
+  // back-compat fallback (which was skipped when the message no longer contained
+  // "unknown command").
+  (e as PanelCmdUnsupportedError).panelCmdUnsupported = cmd;
+  return e;
+}
+
+/** An Error carrying the bridge command a connected panel was proven NOT to
+ *  support (too old / unknown command). Produced by buildPanelTooOldError. */
+export interface PanelCmdUnsupportedError extends Error {
+  panelCmdUnsupported: string;
+}
+
+/** True when `err` is (or plausibly is) an unsupported-command rejection for
+ *  `cmd` — either the STRUCTURED tag set by buildPanelTooOldError (authoritative),
+ *  or, as a belt-and-suspenders fallback for errors that never passed through the
+ *  rewrite, the raw panel "Unknown command" text or the rewritten "too old for"
+ *  message. Callers that carry a graceful fallback (e.g. panel_strip_workflow's
+ *  graph_get_state reconstruction, #384/#413) use this to decide whether to try
+ *  it. When `cmd` is given, a structured tag must match it. */
+export function isPanelCmdUnsupportedError(err: unknown, cmd?: string): boolean {
+  const tag = (err as Partial<PanelCmdUnsupportedError> | null | undefined)
+    ?.panelCmdUnsupported;
+  if (typeof tag === "string") return cmd == null || tag === cmd;
+  const msg = err instanceof Error ? err.message : String(err ?? "");
+  const cmdPat = cmd ? cmd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") : "[\\w.-]+";
+  return (
+    new RegExp(`unknown command\\s*["“']?${cmdPat}`, "i").test(msg) ||
+    new RegExp(`too old for\\s*["“']?${cmdPat}`, "i").test(msg)
   );
 }
 

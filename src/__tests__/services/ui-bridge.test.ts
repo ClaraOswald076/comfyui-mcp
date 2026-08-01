@@ -4,6 +4,7 @@ import {
   UiBridge,
   makeUnknownCommandError,
   panelVersionProvesUnsupported,
+  isPanelCmdUnsupportedError,
   MIN_PANEL_VERSION_FOR_BRIDGE_COMMANDS,
   minPanelVersionForCmd,
   markDispatched,
@@ -1204,6 +1205,51 @@ describe("panelVersionProvesUnsupported (#392 proactive version gate)", () => {
     expect(panelVersionProvesUnsupported("graph_outline", "0.4.5")).toBe(true);
     expect(panelVersionProvesUnsupported("graph_outline", "0.4.6")).toBe(false);
     expect(panelVersionProvesUnsupported("graph_outline", "0.11.7")).toBe(false);
+  });
+});
+
+// #413 — the bridge REWRITES a panel's raw "Unknown command graph_serialize" into
+// a "too old for graph_serialize" message (and throws the same, tagged, from the
+// #236 proactive gate). A caller with a back-compat fallback (panel_strip_workflow
+// → graph_get_state) needs to detect that condition WITHOUT string-matching the
+// literal "unknown command" text that was rewritten away. isPanelCmdUnsupportedError
+// reads the STRUCTURED tag buildPanelTooOldError attaches, with a message-regex
+// fallback for errors that never passed through the rewrite.
+describe("isPanelCmdUnsupportedError (#413 structured unsupported-command detection)", () => {
+  it("detects the STRUCTURED tag on a rewritten 'too old' error (the reactive path)", () => {
+    // makeUnknownCommandError funnels through buildPanelTooOldError, which tags
+    // the error with panelCmdUnsupported — even though the message no longer says
+    // "unknown command".
+    const e = makeUnknownCommandError('Unknown command "graph_serialize"');
+    expect(e).not.toBeNull();
+    expect(e?.message.toLowerCase()).not.toContain("unknown command");
+    expect(isPanelCmdUnsupportedError(e)).toBe(true);
+    expect(isPanelCmdUnsupportedError(e, "graph_serialize")).toBe(true);
+    // A tag for a DIFFERENT command must not match a specific query.
+    expect(isPanelCmdUnsupportedError(e, "graph_outline")).toBe(false);
+  });
+
+  it("matches the raw panel 'Unknown command' text (untagged fallback)", () => {
+    expect(isPanelCmdUnsupportedError(new Error('Unknown command "graph_serialize"'))).toBe(true);
+    expect(
+      isPanelCmdUnsupportedError(new Error('Unknown command "graph_serialize"'), "graph_serialize"),
+    ).toBe(true);
+    expect(
+      isPanelCmdUnsupportedError(new Error('Unknown command "graph_serialize"'), "graph_outline"),
+    ).toBe(false);
+  });
+
+  it("matches the rewritten 'too old for' text even without the tag", () => {
+    const raw = new Error('This ComfyUI-MCP panel is too old for "graph_serialize" — update…');
+    expect(isPanelCmdUnsupportedError(raw)).toBe(true);
+    expect(isPanelCmdUnsupportedError(raw, "graph_serialize")).toBe(true);
+  });
+
+  it("does NOT match a genuine transport/timeout error (fallback must not fire)", () => {
+    expect(isPanelCmdUnsupportedError(new Error("bridge ack timed out after 30000ms"))).toBe(false);
+    expect(isPanelCmdUnsupportedError(new Error("panel not reachable"))).toBe(false);
+    expect(isPanelCmdUnsupportedError(undefined)).toBe(false);
+    expect(isPanelCmdUnsupportedError(null)).toBe(false);
   });
 });
 

@@ -2277,4 +2277,72 @@ describe("panel_strip_workflow live-canvas fallback (issue #384)", () => {
     // never attempted the state fallback for a non-unknown-command failure
     expect(sent).not.toContain("graph_get_state");
   });
+
+  // #413 — the REAL bridge does NOT surface the raw "Unknown command" text: the
+  // reactive rewrite (makeUnknownCommandError) and the #236 proactive gate both
+  // throw a "too old for graph_serialize" error instead. The old
+  // /unknown command/ test here never matched that, so the graph_get_state
+  // fallback was silently SKIPPED and the actionable error surfaced even though
+  // the back-compat path would have worked. These assert the fallback now fires.
+  it("falls back to graph_get_state on the bridge's REWRITTEN 'too old' error (message-only)", async () => {
+    const sent: string[] = [];
+    const ctx = {
+      tabId: "t",
+      ensureReachable: () => {},
+      bridge: {
+        send: async (cmd: { cmd: string }) => {
+          sent.push(cmd.cmd);
+          if (cmd.cmd === "graph_serialize") {
+            // The bridge-rewritten message — note it no longer says "unknown command".
+            throw new Error(
+              'This ComfyUI-MCP panel is too old for "graph_serialize" (detected 0.7.0) — update the ComfyUI-MCP panel to ≥0.8.2, then reconnect.',
+            );
+          }
+          if (cmd.cmd === "graph_get_state") {
+            return {
+              nodes: [
+                { id: 1, type: "SaveImage", widgets: { filename_prefix: "out" }, inputs: [], outputs: [] },
+              ],
+            };
+          }
+          return {};
+        },
+      },
+    } as unknown as PanelToolCtx;
+    const wf = (await __panelToolsTestHooks.resolveWorkflowInput({}, ctx)) as {
+      nodes: Array<{ type: string }>;
+    };
+    expect(sent).toContain("graph_serialize");
+    expect(sent).toContain("graph_get_state");
+    expect(wf.nodes[0].type).toBe("SaveImage");
+  });
+
+  it("falls back on the STRUCTURED unsupported-command tag (the #236 proactive gate throws this)", async () => {
+    const sent: string[] = [];
+    const tagged = Object.assign(
+      new Error('This ComfyUI-MCP panel is too old for "graph_serialize" — update…'),
+      { panelCmdUnsupported: "graph_serialize" },
+    );
+    const ctx = {
+      tabId: "t",
+      ensureReachable: () => {},
+      bridge: {
+        send: async (cmd: { cmd: string }) => {
+          sent.push(cmd.cmd);
+          if (cmd.cmd === "graph_serialize") throw tagged;
+          if (cmd.cmd === "graph_get_state") {
+            return {
+              nodes: [{ id: 9, type: "PreviewImage", widgets: {}, inputs: [], outputs: [] }],
+            };
+          }
+          return {};
+        },
+      },
+    } as unknown as PanelToolCtx;
+    const wf = (await __panelToolsTestHooks.resolveWorkflowInput({}, ctx)) as {
+      nodes: Array<{ type: string }>;
+    };
+    expect(sent).toContain("graph_get_state");
+    expect(wf.nodes[0].type).toBe("PreviewImage");
+  });
 });
