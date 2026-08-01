@@ -603,22 +603,37 @@ async function queueManagerTask(
   kind: ManagerTaskKind,
   params: Record<string, unknown>,
 ): Promise<QueueStatus> {
+  await enqueueWithDialectSelfHeal(kind, (api, epoch) =>
+    enqueueManagerTask(api, kind, params, randomUUID(), epoch),
+  );
+  return runManagerQueue();
+}
+
+/**
+ * Run ONE enqueue against the detected Manager dialect, healing a stale
+ * classification (#646). `enqueue` must only ENQUEUE — never drain — because a
+ * retry is sound only while nothing has been queued yet; it is handed the dialect
+ * to speak and the invalidation epoch the operation started under, and is called
+ * at most twice (never recursively, so the retry is structurally bounded to one).
+ */
+async function enqueueWithDialectSelfHeal(
+  label: string,
+  enqueue: (api: ManagerApi, startEpoch: number) => Promise<void>,
+): Promise<void> {
   // Epoch snapshot for the whole operation: any dialect conclusion reached
-  // during it is only pinned if nothing invalidated the cache meanwhile (#646).
+  // during it is only pinned if nothing invalidated the cache meanwhile.
   const startEpoch = managerApiEpoch();
   const api = await detectManagerApi();
   try {
-    await enqueueManagerTask(api, kind, params, randomUUID(), startEpoch);
+    await enqueue(api, startEpoch);
   } catch (err) {
-    const fresh = await redetectAfterDialectMismatch(api, kind, err);
+    const fresh = await redetectAfterDialectMismatch(api, label, err);
     if (fresh === undefined) throw err;
     // The live server speaks a DIFFERENT dialect than the one we routed with, and
     // the failure was a pre-execution rejection (see redetectAfterDialectMismatch),
-    // so nothing was enqueued — re-enqueue ONCE in the correct dialect. This calls
-    // the dispatcher directly rather than recursing, so there is exactly one retry.
-    await enqueueManagerTask(fresh, kind, params, randomUUID(), managerApiEpoch());
+    // so nothing was enqueued — re-enqueue ONCE in the correct dialect.
+    await enqueue(fresh, managerApiEpoch());
   }
-  return runManagerQueue();
 }
 
 /**
@@ -655,12 +670,12 @@ const DIALECT_MISMATCH_STATUSES = new Set([400, 404, 405]);
  */
 async function redetectAfterDialectMismatch(
   used: ManagerApi,
-  kind: ManagerTaskKind,
+  label: string,
   err: unknown,
 ): Promise<ManagerApi | undefined> {
   const status = errorStatus(err);
   if (status === undefined || !DIALECT_MISMATCH_STATUSES.has(status)) return undefined;
-  resetManagerApiCache(`manager ${kind} enqueue failed ${status} on the "${used}" dialect`);
+  resetManagerApiCache(`manager ${label} enqueue failed ${status} on the "${used}" dialect`);
   let fresh: ManagerApi;
   try {
     fresh = await detectManagerApi();
@@ -671,7 +686,7 @@ async function redetectAfterDialectMismatch(
   }
   if (fresh === used) return undefined;
   logger.info("Manager API dialect changed under a cached classification — retrying once", {
-    kind,
+    op: label,
     was: used,
     now: fresh,
     status,
@@ -1538,27 +1553,33 @@ async function updateCustomNodeImpl(
 
   let status: QueueStatus;
   if (all) {
-    // update_all keeps its own dedicated route. The backend reads
-    // UpdateAllQueryParams from the QUERY STRING (manager_server.py), NOT the
-    // JSON body — a body-only request leaves mode defaulting to 'remote' and
-    // drops client_id/ui_id. Send them as URL query params.
-    const uiId = randomUUID();
-    if ((await detectManagerApi()) === "legacy") {
-      // 3.x reads {mode} from the JSON BODY (and ignores client_id/ui_id).
-      await managerFetch("/manager/queue/update_all", {
-        method: "POST",
-        body: { mode, ui_id: uiId },
-      });
-    } else {
-      const query = new URLSearchParams({
-        mode,
-        client_id: MANAGER_CLIENT_ID,
-        ui_id: uiId,
-      }).toString();
-      await managerFetch(`/v2/manager/queue/update_all?${query}`, {
-        method: "POST",
-      });
-    }
+    // update_all keeps its own dedicated route (so it does NOT go through
+    // queueManagerTask), but it is just as dialect-dependent — route it through
+    // the same enqueue-only self-heal so a stale classification can't wedge it
+    // either (#646). Enqueue here, drain once below.
+    await enqueueWithDialectSelfHeal("update-all", async (api) => {
+      // The v4 backend reads UpdateAllQueryParams from the QUERY STRING
+      // (manager_server.py), NOT the JSON body — a body-only request leaves mode
+      // defaulting to 'remote' and drops client_id/ui_id. Send them as URL query
+      // params. A fresh ui_id per attempt keeps the two attempts distinguishable.
+      const uiId = randomUUID();
+      if (api === "legacy") {
+        // 3.x reads {mode} from the JSON BODY (and ignores client_id/ui_id).
+        await managerFetch("/manager/queue/update_all", {
+          method: "POST",
+          body: { mode, ui_id: uiId },
+        });
+      } else {
+        const query = new URLSearchParams({
+          mode,
+          client_id: MANAGER_CLIENT_ID,
+          ui_id: uiId,
+        }).toString();
+        await managerFetch(`/v2/manager/queue/update_all?${query}`, {
+          method: "POST",
+        });
+      }
+    });
     status = await runManagerQueue();
   } else {
     // Single-pack update → unified task; UpdatePackParams uses node_name/node_ver.

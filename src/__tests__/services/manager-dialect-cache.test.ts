@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Regression for #646: detectManagerApi() cached the detected ComfyUI-Manager
 // wire dialect keyed ONLY by base URL, for the whole process lifetime. After the
@@ -18,6 +18,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 //      the enqueue only when the live dialect actually changed.
 
 // The TTL is read once at module load, so it must be set BEFORE the imports.
+// Stash the caller's value and restore it after the suite: the variable is
+// process-wide, and a worker that later loads another suite must not inherit it.
+const PRIOR_TTL_ENV = process.env.COMFYUI_MCP_MANAGER_API_TTL_MS;
 process.env.COMFYUI_MCP_MANAGER_API_TTL_MS = "5000";
 
 vi.mock("../../config.js", () => {
@@ -32,6 +35,9 @@ vi.mock("../../config.js", () => {
     config,
     getComfyUIBaseUrl: () => "http://127.0.0.1:8188",
     getComfyUIAuthHeaders: () => ({}),
+    // node-management's Manager self-update path (#424) imports this; the mock
+    // must provide it or the named import fails at load.
+    isLoopbackHost: (host?: string) => host === "127.0.0.1" || host === "localhost",
   };
 });
 
@@ -44,8 +50,12 @@ vi.mock("node:child_process", () => ({
 }));
 vi.mock("node:fs", () => ({ existsSync: vi.fn(() => true) }));
 
-const { installModelViaManager, setQueueTimingForTests, resetManagerApiCacheForTests } =
-  await import("../../services/node-management.js");
+const {
+  installModelViaManager,
+  updateCustomNode,
+  setQueueTimingForTests,
+  resetManagerApiCacheForTests,
+} = await import("../../services/node-management.js");
 const { resetManagerApiCache, cacheManagerApi, getCachedManagerApi, managerApiEpoch } =
   await import("../../services/manager-api-cache.js");
 
@@ -58,7 +68,7 @@ interface Call {
 }
 
 /** Which Manager the (single, unchanging) URL is currently serving. */
-type Persona = "v2-batch" | "v4";
+type Persona = "v2-batch" | "v4" | "legacy";
 
 const DRAINED = { total_count: 1, done_count: 1, in_progress_count: 0, is_processing: false };
 
@@ -95,8 +105,18 @@ function stubServer(opts: {
     const path = new URL(url).pathname;
     calls.push({ path, method, body });
 
+    if (opts.persona() === "legacy") {
+      // The 3.x custom-node Manager: no /v2/* at all (ComfyUI's frontend catchall
+      // 405s an unregistered POST), per-operation routes under /manager/*.
+      if (path === "/manager/queue/status") return jsonResponse(DRAINED);
+      if (path === "/manager/version") return new Response("V3.41", { status: 200 });
+      if (path.startsWith("/manager/queue/")) return new Response("", { status: 200 });
+      return new Response("404: Not Found", { status: 404 });
+    }
+
     if (path === "/v2/manager/queue/status") return jsonResponse(DRAINED);
     if (path === "/v2/manager/queue/start") return new Response("", { status: 200 });
+    if (path === "/v2/manager/queue/update_all") return new Response("", { status: 200 });
     if (path === "/v2/manager/is_legacy_manager_ui") {
       if (opts.legacyUiGate) await opts.legacyUiGate();
       return jsonResponse({ is_legacy_manager_ui: opts.persona() === "v2-batch" });
@@ -156,6 +176,11 @@ describe("#646 Manager API dialect cache invalidation", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+  });
+
+  afterAll(() => {
+    if (PRIOR_TTL_ENV === undefined) delete process.env.COMFYUI_MCP_MANAGER_API_TTL_MS;
+    else process.env.COMFYUI_MCP_MANAGER_API_TTL_MS = PRIOR_TTL_ENV;
   });
 
   it("re-detects after a restart at the SAME url (explicit invalidation)", async () => {
@@ -245,6 +270,29 @@ describe("#646 Manager API dialect cache invalidation", () => {
     expect(detections(calls)).toBe(1);
     // Exactly ONE task enqueued — the retry must not double-submit the install.
     expect(countOf(calls, "/v2/manager/queue/task")).toBe(1);
+  });
+
+  it("heals update_all too (its dedicated route bypasses queueManagerTask)", async () => {
+    let persona: Persona = "v4";
+    const calls = stubServer({ persona: () => persona });
+
+    await updateCustomNode({ id: "all" });
+    expect(countOf(calls, "/v2/manager/queue/update_all")).toBe(1);
+
+    // Same URL, now serving the 3.x custom-node Manager (a downgrade/rollback is
+    // the mirror of the reported upgrade), still inside the freshness window.
+    persona = "legacy";
+    calls.length = 0;
+
+    await expect(updateCustomNode({ id: "all" })).resolves.toMatchObject({
+      mechanism: "manager-http",
+    });
+    // One rejected attempt on the stale prefix, one retry on the live one …
+    expect(countOf(calls, "/v2/manager/queue/update_all")).toBe(1);
+    expect(countOf(calls, "/manager/queue/update_all")).toBe(1);
+    // … and the queue is started (drained) exactly once, on the live prefix.
+    expect(countOf(calls, "/manager/queue/start")).toBe(1);
+    expect(countOf(calls, "/v2/manager/queue/start")).toBe(0);
   });
 
   it("does NOT re-detect or retry on an unrelated failure (403 security gating)", async () => {
