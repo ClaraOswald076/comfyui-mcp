@@ -347,6 +347,21 @@ export function piAuthJsonUsable(
  *  resolver states "a stored credential owns the provider: ambient/env is
  *  consulted only when nothing is stored", so a stored record suppresses that
  *  provider's env keys whether or not it works. Never throws. */
+/** True only when auth.json parses to literal `null`. pi stores the parsed value
+ *  as-is and then indexes it (`this.data[provider]`), which THROWS for null — so
+ *  no provider resolves at all and even a good ambient env key cannot be used.
+ *  Deliberately narrow: `[]`, a string or a number all index harmlessly to
+ *  undefined for pi, so those must NOT suppress ambient credentials. */
+function piAuthStoreBroken(file: string): boolean {
+  const raw = readFileOrNull(file);
+  if (raw === null) return false;
+  try {
+    return JSON.parse(raw) === null;
+  } catch {
+    return false;
+  }
+}
+
 function piAuthRecords(file: string): Record<string, unknown> {
   const raw = readFileOrNull(file);
   if (raw === null) return {};
@@ -681,7 +696,11 @@ export function piCredentialPresent(
   const agentDir = piAgentDir(home, procEnv);
   // agentDir null = a relative PI_CODING_AGENT_DIR we cannot resolve; the
   // file-backed sources are unreadable, but env/ADC still apply.
-  const stored = agentDir ? piAuthRecords(join(agentDir, "auth.json")) : {};
+  const authFile = agentDir ? join(agentDir, "auth.json") : null;
+  // A `null` auth.json breaks pi's auth layer outright — nothing resolves, so no
+  // source counts, not even an otherwise-good env key.
+  if (authFile && piAuthStoreBroken(authFile)) return false;
+  const stored = authFile ? piAuthRecords(authFile) : {};
   if (
     Object.entries(stored).some(([provider, rec]) =>
       authRecordUsable(rec, procEnv, nowMs, { provider, home }),
