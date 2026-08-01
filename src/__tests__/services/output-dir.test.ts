@@ -46,7 +46,9 @@ import {
   parseBaseDirFromArgv,
   parseModelsDirFromArgv,
   parseExtraModelPathsConfigsFromArgv,
+  hasUnresolvableRelativeModelDirFlag,
   resolveModelsDir,
+  resolveModelsDirWithBases,
   resolveServerExtraModelConfig,
 } from "../../services/output-dir.js";
 import { config } from "../../config.js";
@@ -316,6 +318,60 @@ describe("models dir + extra-config argv parsing (#345/#346/#369)", () => {
     savedDefaultWorkspace = undefined;
     getSystemStats.mockRejectedValue(new Error("ECONNREFUSED"));
     await expect(resolveModelsDir()).rejects.toThrow(/set_default_workspace/);
+  });
+
+  it("resolves a RELATIVE --base-directory against the SERVER cwd, not the MCP cwd", () => {
+    const srvCwd = resolve("/srv/live");
+    expect(parseBaseDirFromArgv(["main.py", "--base-directory", "data"], srvCwd)).toBe(
+      join(srvCwd, "data"),
+    );
+  });
+
+  it("returns undefined for a relative --base-directory when no server cwd is available", () => {
+    expect(parseBaseDirFromArgv(["main.py", "--base-directory", "data"])).toBeUndefined();
+  });
+
+  it("resolves --models-directory INDEPENDENTLY (os.path.abspath), NOT under --base-directory", () => {
+    const srvCwd = resolve("/srv/live");
+    const got = parseModelsDirFromArgv(
+      ["main.py", "--base-directory", resolve("/srv/base"), "--models-directory", "models2"],
+      srvCwd,
+    );
+    // Relative --models-directory resolves against the server cwd, never joined onto base.
+    expect(got).toBe(join(srvCwd, "models2"));
+    expect(got).not.toBe(join(resolve("/srv/base"), "models2"));
+  });
+
+  it("returns undefined for a relative --models-directory without a server cwd", () => {
+    expect(parseModelsDirFromArgv(["main.py", "--models-directory", "models2"])).toBeUndefined();
+  });
+
+  it("hasUnresolvableRelativeModelDirFlag: true for a relative flag w/o cwd, false with cwd/absolute/none", () => {
+    expect(hasUnresolvableRelativeModelDirFlag(["main.py", "--base-directory", "data"])).toBe(true);
+    expect(hasUnresolvableRelativeModelDirFlag(["main.py", "--models-directory", "m"])).toBe(true);
+    expect(
+      hasUnresolvableRelativeModelDirFlag(["main.py", "--base-directory", "data"], resolve("/srv")),
+    ).toBe(false);
+    expect(
+      hasUnresolvableRelativeModelDirFlag(["main.py", "--base-directory", resolve("/abs")]),
+    ).toBe(false);
+    expect(hasUnresolvableRelativeModelDirFlag(["main.py"])).toBe(false);
+  });
+
+  it("resolveModelsDirWithBases THROWS (does not guess) when a relative flag is unresolvable", async () => {
+    getSystemStats.mockResolvedValue({
+      system: { argv: ["python", "main.py", "--base-directory", "data"] }, // relative, no cwd
+    });
+    await expect(resolveModelsDirWithBases()).rejects.toThrow(/relative --base-directory/i);
+  });
+
+  it("resolveModelsDirWithBases resolves against an absolute server cwd for a relative flag", async () => {
+    const srvCwd = resolve("/srv/live");
+    getSystemStats.mockResolvedValue({
+      system: { argv: ["python", "main.py", "--base-directory", "data"], cwd: srvCwd },
+    });
+    const { modelsDir } = await resolveModelsDirWithBases();
+    expect(modelsDir).toBe(join(srvCwd, "data", "models"));
   });
 
   it("resolveServerExtraModelConfig returns the server's config file, undefined when absent", async () => {

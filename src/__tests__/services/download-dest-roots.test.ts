@@ -363,6 +363,39 @@ describe("(c) P0a — dangling / uncanonicalizable symlink is REFUSED (never ski
   });
 });
 
+describe("(c) P0 — the PRIMARY models root itself is inspected (dangling/unreadable → refused)", () => {
+  it("REFUSES when the models root is a symlink whose target can't be resolved (dangling)", async () => {
+    getSystemStats.mockResolvedValue({ system: { argv: ["python", "main.py"] } });
+    const modelsRoot = resolve(COMFYUI_PATH, "models");
+    lstatMock.mockImplementation((p: string) =>
+      Promise.resolve({ isSymbolicLink: () => resolve(p) === modelsRoot }),
+    );
+    realpathMock.mockImplementation((p: string) => {
+      if (resolve(p) === modelsRoot) {
+        return Promise.reject(Object.assign(new Error("ENOENT"), { code: "ENOENT" }));
+      }
+      return Promise.resolve(resolve(p));
+    });
+    // A normal download; the ROOT models symlink is broken → escape must be refused,
+    // not passed through to the recursive write.
+    await expect(resolveModelSubfolderPreferServer("checkpoints")).rejects.toThrow(
+      /dangling or circular/i,
+    );
+  });
+
+  it("FAILS CLOSED on a non-ENOENT lstat error of the models root", async () => {
+    getSystemStats.mockResolvedValue({ system: { argv: ["python", "main.py"] } });
+    const modelsRoot = resolve(COMFYUI_PATH, "models");
+    lstatMock.mockImplementation((p: string) => {
+      if (resolve(p) === modelsRoot) {
+        return Promise.reject(Object.assign(new Error("EACCES"), { code: "EACCES" }));
+      }
+      return Promise.resolve({ isSymbolicLink: () => false });
+    });
+    await expect(resolveModelSubfolderPreferServer("checkpoints")).rejects.toBeInstanceOf(ModelError);
+  });
+});
+
 describe("(c) P0b — the PRIMARY models root itself must not be a code directory", () => {
   it("REFUSES all writes when --models-directory points the models root INTO custom_nodes", async () => {
     const serverBase = resolve("/C/Comfy");

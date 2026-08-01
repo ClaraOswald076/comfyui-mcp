@@ -16,6 +16,7 @@ import {
   resolveModelsDir,
   resolveModelsDirWithBases,
   parseModelsDirFromArgv,
+  hasUnresolvableRelativeModelDirFlag,
   type LiveServerSnapshot,
 } from "./output-dir.js";
 import {
@@ -690,11 +691,37 @@ async function assertNoEscapingSymlinkAncestor(
 ): Promise<void> {
   // Canonical root: if the models dir is itself a symlink/junction, resolve it so
   // descendants are checked against where it REALLY lives (not the lexical path).
+  // The ROOT itself must be inspected too (P0): a DANGLING primary `models` symlink
+  // would otherwise pass (realpath fails → treated as "not created") and the
+  // recursive write would follow it OUT of every root — a normal user's broken
+  // models symlink escaping. lstat the root FIRST: allow only a genuinely-absent
+  // (ENOENT) root; reject a symlinked root whose realpath fails; fail closed on any
+  // other lstat error.
   let realRoot: string;
   try {
-    realRoot = resolve(await realpath(root));
-  } catch {
-    realRoot = root; // root not yet created — lexical containment is all we can check.
+    const rootInfo = await lstat(root);
+    try {
+      realRoot = resolve(await realpath(root));
+    } catch {
+      if (rootInfo.isSymbolicLink()) {
+        throw new ModelError(
+          `Refusing to write through a models-directory symlink that cannot be resolved (dangling or circular): ${label}`,
+        );
+      }
+      // A non-symlink dir whose realpath raced away — treat as absent; the writer
+      // recreates it inside the lexical root.
+      realRoot = resolve(root);
+    }
+  } catch (err) {
+    if (err instanceof ModelError) throw err;
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      realRoot = resolve(root); // root not yet created — lexical containment only.
+    } else {
+      throw new ModelError(
+        `Refusing to resolve the models directory safely (${code ?? "unreadable"}): ${label}`,
+      );
+    }
   }
   const canon = async (d: string): Promise<string> => {
     try {
@@ -1230,11 +1257,22 @@ async function downloadModelViaManagerRemote(
  */
 export async function shouldDispatchDownloadToManager(): Promise<boolean> {
   if (isRemoteMode()) return true;
-  // A configured/auto-detected COMFYUI_PATH or saved default workspace → stream local.
-  if (resolveEffectiveComfyUIBase()) return false;
   try {
     const stats = await getSystemStats();
-    const argv = stats.system?.argv;
+    const argv = (stats as { system?: { argv?: string[] } })?.system?.argv;
+    const cwd = (stats as { system?: { cwd?: string } })?.system?.cwd;
+    // Ask the LIVE server FIRST. A server launched with a RELATIVE
+    // --base-directory/--models-directory that did NOT report its cwd has an UNKNOWN
+    // real models dir: any local guess (COMFYUI_PATH or the main.py root) would be
+    // the WRONG place it never reads (#346). Route such a download through the
+    // server's Manager (server-side write, lands correctly) rather than writing
+    // locally or hard-failing. This MUST win over the COMFYUI_PATH / main.py-root
+    // local short-circuits below (codex — it was previously skipped when a local
+    // base was configured).
+    if (hasUnresolvableRelativeModelDirFlag(argv, cwd)) return true;
+    // Resolvable. A configured/auto-detected COMFYUI_PATH or saved default workspace
+    // → stream local.
+    if (resolveEffectiveComfyUIBase()) return false;
     // Reachable server: stream locally when it exposes a base/models dir we can
     // write to (--base-directory/--models-directory) OR when we can derive its own
     // install root from argv (its main.py path) — the SAME live-first root the
@@ -1244,7 +1282,7 @@ export async function shouldDispatchDownloadToManager(): Promise<boolean> {
     // through the Manager (which then fails when Manager isn't installed). Only
     // dispatch to the Manager when NEITHER is discoverable (#420 reconnect with an
     // opaque/relative argv we can't resolve).
-    if (parseModelsDirFromArgv(argv)) return false;
+    if (parseModelsDirFromArgv(argv, cwd)) return false;
     // Derive the server's own install root from argv (its main.py). Only treat it
     // as a LOCAL stream target when that path ACTUALLY EXISTS on this filesystem:
     // a loopback ComfyUI inside Docker / behind an SSH port-forward reports a
@@ -1252,11 +1290,12 @@ export async function shouldDispatchDownloadToManager(): Promise<boolean> {
     // create a bogus host directory instead of reaching the server. When the root
     // isn't locally present, hand the fetch to the connected Manager (server-side
     // write), which lands in the real install regardless.
-    const liveRoot = liveRootFromArgv(argv, (stats.system as { cwd?: string })?.cwd);
+    const liveRoot = liveRootFromArgv(argv, cwd);
     if (liveRoot && existsSync(liveRoot)) return false;
     return true;
   } catch {
-    // No reachable server → nothing to dispatch to. Let the local resolver throw.
+    // No reachable server → nothing to dispatch to. A configured local base still
+    // streams local; otherwise let the local resolver surface its clear error.
     return false;
   }
 }

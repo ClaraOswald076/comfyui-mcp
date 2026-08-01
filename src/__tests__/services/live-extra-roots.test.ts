@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 // getLiveExtraModelRoots is the FAIL-CLOSED authorization primitive for #633: only a
@@ -113,5 +113,41 @@ describe("getLiveExtraModelRoots — fail-closed authorization", () => {
     const res = await getLiveExtraModelRoots(reachable(["python", "main.py"]));
     expect(res.authoritative).toBe(true);
     expect(res.roots).toEqual([]);
+  });
+
+  it("expands a base_path '~' to the home dir (ComfyUI expanduser) → ABSOLUTE, not <cfgDir>/~", async () => {
+    const liveRoot = await trackTmp();
+    await writeFile(
+      join(liveRoot, "extra_model_paths.yaml"),
+      ["grp:", '  base_path: "~/models"', "  unet: unet"].join("\n"),
+      "utf-8",
+    );
+    const res = await getLiveExtraModelRoots(reachable(["python", join(liveRoot, "main.py")]));
+    expect(res.roots).toContainEqual({
+      category: "unet",
+      dir: resolve(homedir(), "models", "unet"),
+      group: "grp",
+    });
+  });
+
+  it("expands an env var in base_path (ComfyUI expandvars)", async () => {
+    const liveRoot = await trackTmp();
+    const target = resolve("/opt/models-root");
+    process.env.CMCP_TEST_MODELS_ROOT = target;
+    try {
+      await writeFile(
+        join(liveRoot, "extra_model_paths.yaml"),
+        ["grp:", '  base_path: "${CMCP_TEST_MODELS_ROOT}"', "  loras: loras"].join("\n"),
+        "utf-8",
+      );
+      const res = await getLiveExtraModelRoots(reachable(["python", join(liveRoot, "main.py")]));
+      expect(res.roots).toContainEqual({
+        category: "loras",
+        dir: resolve(target, "loras"),
+        group: "grp",
+      });
+    } finally {
+      delete process.env.CMCP_TEST_MODELS_ROOT;
+    }
   });
 });

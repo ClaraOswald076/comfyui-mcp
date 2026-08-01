@@ -52,6 +52,28 @@ interface ExtraPathMutationOptions extends ExtraPathOptions {
   isDefault?: boolean;
 }
 
+/**
+ * Mirror ComfyUI's path expansion (utils/extra_config.py → os.path.expandvars then
+ * os.path.expanduser) so a live config's `base_path`/entries classify absolute-vs-
+ * relative the SAME way the running server does. Undefined variables are left intact
+ * (matching Python), so nothing collapses to a bogus root. `%VAR%` is expanded on
+ * Windows only (Python expandvars). Used ONLY for authorization resolution (#633).
+ */
+function expandUserAndVars(input: string): string {
+  let s = input;
+  // expandvars: ${VAR} and $VAR on all platforms; %VAR% additionally on Windows.
+  s = s.replace(/\$\{([^}]+)\}/g, (m, n) => process.env[n] ?? m);
+  s = s.replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (m, n) => process.env[n] ?? m);
+  if (platform() === "win32") {
+    s = s.replace(/%([^%]+)%/g, (m, n) => process.env[n] ?? m);
+  }
+  // expanduser: a leading `~` (bare or `~/`, `~\`) → the current user's home dir.
+  if (s === "~" || s.startsWith("~/") || s.startsWith("~\\")) {
+    s = join(homedir(), s.slice(1));
+  }
+  return s;
+}
+
 const RESERVED_KEYS = new Set(["base_path", "is_default"]);
 const SAFE_KEY_RE = /^[A-Za-z0-9_.-]+$/;
 const CONTROL_RE = /[\x00\r\n]/;
@@ -369,14 +391,19 @@ export async function getLiveExtraModelRoots(
     for (const [name, value] of Object.entries(raw)) {
       const group = readGroup(value, name);
       if (!group) continue;
-      const rawBase = group.base_path?.trim();
+      // ComfyUI expands `~` and env vars in base_path/entries BEFORE classifying
+      // absolute vs relative (utils/extra_config.py). Without this, `base_path: ~/models`
+      // would be treated as RELATIVE and mis-resolved to `<config-dir>/~/models`, so a
+      // legit symlink into the REAL registered $HOME root would be wrongly REFUSED.
+      const rawBase = group.base_path ? expandUserAndVars(group.base_path.trim()) : undefined;
       const base = rawBase
         ? isAbsolute(rawBase)
           ? resolve(rawBase)
           : resolve(cfgDir, rawBase)
         : undefined;
       for (const category of group.categories) {
-        for (const p of category.paths) {
+        for (const rawPath of category.paths) {
+          const p = expandUserAndVars(rawPath);
           const dir = isAbsolute(p) ? resolve(p) : resolve(base ?? cfgDir, p);
           roots.push({ category: category.category, dir, group: name });
         }
