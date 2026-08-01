@@ -84,7 +84,7 @@ Install, update, reinstall, or report status of the ComfyUI sidebar panel ('comf
 
 ### Parameters
 
-<ParamField path="action" type="enum" required default="status">
+<ParamField path="action" type="enum" default="status">
   status: report installed/version/dev-symlink (never errors). install: add the panel (nightly). update: pull the latest nightly. reinstall: uninstall + reinstall (nightly). install/update/reinstall refuse on a dev symlink and require a local COMFYUI_PATH. Options: `status`, `install`, `update`, `reinstall`.
 </ParamField>
 
@@ -95,9 +95,7 @@ Install, update, reinstall, or report status of the ComfyUI sidebar panel ('comf
 ```json
 {
   "tool": "install_panel",
-  "arguments": {
-    "action": "status"
-  }
+  "arguments": {}
 }
 ```
 
@@ -109,7 +107,7 @@ Check or apply a self-update of the comfyui-mcp npm package against the npm regi
 
 ### Parameters
 
-<ParamField path="action" type="enum" required default="status">
+<ParamField path="action" type="enum" default="status">
   status: report install mode + current vs latest version + dev-link note (never errors). update: update to the latest published version (refuses on a dev link; no-op when already up to date or for npx). Options: `status`, `update`.
 </ParamField>
 
@@ -120,9 +118,7 @@ Check or apply a self-update of the comfyui-mcp npm package against the npm regi
 ```json
 {
   "tool": "self_update",
-  "arguments": {
-    "action": "status"
-  }
+  "arguments": {}
 }
 ```
 
@@ -266,7 +262,7 @@ Configure ComfyUI-Manager settings, mirroring `comfy-cli manager` subcommands. M
 
 ## report_issue
 
-Build a ready-to-open GitHub issue link for a bug/problem you hit (ComfyUI, a workflow, a model, custom nodes, or comfyui-mcp itself). Returns a URL with the title and body prefilled — SHARE it with the user so they can review and submit it in one click. It does NOT auto-file. Use it when you encounter an error you can't resolve so the user can report it upstream. For panel-specific bugs pass repo='artokun/comfyui-mcp-panel'.
+File or triage a GitHub issue for a bug/problem you hit (ComfyUI, a workflow, a model, custom nodes, or comfyui-mcp/its panel). For OUR repos (artokun/comfyui-mcp, artokun/comfyui-mcp-panel) it sends the report to the AI triage worker, which searches existing OPEN and CLOSED issues, version-matches, and either files a new issue, adds context to an existing one, or — if the problem was already FIXED in a newer version than the user runs — answers with the fixing PR + fixed-in version and a recommendation to upgrade (no new issue). It returns that triage result plus an instant check of whether the user is on the latest versions. If the worker is unreachable it falls back to a prefilled GitHub 'new issue' URL. For third-party repos it returns a prefilled URL to SHARE (it does not auto-file). ALWAYS pass mcp_version and panel_version from the known environment (the env line in your context, e.g. 'mcp=… panel=…') so the worker can tell the user if simply upgrading fixes it — the single most common resolution. Surface the worker's agent_message / upgrade advice to the user.
 
 ### Parameters
 
@@ -274,13 +270,22 @@ Build a ready-to-open GitHub issue link for a bug/problem you hit (ComfyUI, a wo
   Short, specific issue title.
 </ParamField>
 <ParamField path="body" type="string" required>
-  Issue body: what happened, steps to reproduce, the exact error text, and environment (GPU/VRAM, ComfyUI version, OS) if known.
+  Issue body: what happened, steps to reproduce, the exact error text, and environment (GPU/VRAM, ComfyUI version, OS) if known. Scrub secrets first.
 </ParamField>
 <ParamField path="repo" type="string">
   owner/repo (default 'artokun/comfyui-mcp'; use 'artokun/comfyui-mcp-panel' for the sidebar panel).
 </ParamField>
 <ParamField path="labels" type="string[]">
   Optional GitHub label names to prefill.
+</ParamField>
+<ParamField path="mcp_version" type="string">
+  The running comfyui-mcp version (from the env line in your context). Auto-detected if omitted.
+</ParamField>
+<ParamField path="panel_version" type="string">
+  The running comfyui-mcp-panel (sidebar) version, from the env line in your context, if known.
+</ParamField>
+<ParamField path="no_file" type="boolean">
+  Force the prefilled-URL path even for our repos (skip the Worker). Rarely needed.
 </ParamField>
 
 ### Example

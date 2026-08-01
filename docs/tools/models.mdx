@@ -4,7 +4,7 @@ description: "Search (HuggingFace + CivitAI), download, list, and remove models;
 icon: "box"
 ---
 
-<Info>16 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
+<Info>18 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
 
 ## search_models
 
@@ -80,7 +80,7 @@ Search CivitAI by keyword for checkpoints, LoRAs, embeddings, VAEs, and ControlN
 
 ## search_civitai_creators
 
-Find CivitAI CREATORS — THE tool for 'who are the top creators on Civitai' and 'find creator &lt;name&gt;'. Read-only and network-only (no token or running ComfyUI required). Two modes: with NO query it returns the site's creator LEADERBOARD (civitai.com/leaderboard — rank, score, downloads, likes; pick a `board`: 'overall' [default], 'overall_90' [last 90 days], 'overall_nsfw' [mature], 'new_creators' [first model &lt;30 days ago]); with a `query` it searches usernames (public /api/v1/creators; partial match, returns model counts, NOT ranked). Each hit's username feeds search_civitai_models &#123;creator: &lt;username&gt;&#125; directly. Flow: search_civitai_creators → pick a creator → search_civitai_models &#123;creator, types?&#125; → download_civitai_model.
+Find CivitAI CREATORS — THE tool for 'who are the top creators on Civitai' and 'find creator &lt;name&gt;'. Read-only and network-only (no token or running ComfyUI required). Two modes: with NO query it returns the site's creator LEADERBOARD (civitai.com/leaderboard — rank, score, downloads, likes; pick a `board`: 'overall' [default], 'overall_90' [last 90 days], 'overall_nsfw' [mature], 'new_creators' [first model &lt;30 days ago]); with a `query` it searches usernames (public /api/v1/creators; partial match, returns model counts, NOT ranked). Each hit's username feeds search_civitai_models &#123;creator: &lt;username&gt;&#125; directly. Flow: search_civitai_creators → pick a creator → search_civitai_models &#123;creator, types?&#125; → download_civitai_model. SCOPE CAVEAT: the /api/v1/creators index only lists creators who have published MODELS. A creator who posts only images/videos (no models) legitimately returns 0 hits here — that is a gap in this endpoint, NOT proof the creator doesn't exist. For a media-only creator, browse their images via the panel CivitAI browser (panel_open_civitai &#123;creator&#125;) or the logged-in browser session instead.
 
 ### Parameters
 
@@ -222,6 +222,57 @@ List model files available to the connected ComfyUI, grouped by type. Read-only.
 {
   "tool": "list_local_models",
   "arguments": {}
+}
+```
+
+---
+
+## download_status
+
+Check on model downloads started by download_model. Reports each download's state (downloading / done / error / cancelled), its destination path once it lands, and byte progress when the panel progress channel is enabled. Use this after download_model reports a download is still running — that means the transfer is in flight, NOT that it failed. Survives a sidebar/tool-session reconnect: an in-flight download started in a previous session is still resolvable by its id (or by `url`), so you can confirm it's still running instead of starting a duplicate. Read-only.
+
+### Parameters
+
+<ParamField path="id" type="string">
+  Download id from download_model. Omit to list every tracked download (incl. in-flight ones from before a reconnect).
+</ParamField>
+<ParamField path="url" type="string">
+  Adopt an in-flight download by its source URL when you don't have the id (e.g. after a reconnect) — reports the matching job without starting a duplicate.
+</ParamField>
+
+### Example
+
+<Note>Example coming soon — the call below is a generated skeleton.</Note>
+
+```json
+{
+  "tool": "download_status",
+  "arguments": {}
+}
+```
+
+---
+
+## cancel_download
+
+Cancel ONE in-flight model download started by download_model / download_civitai_model, by its id (from download_status or the tool that started it). Aborts only that download's transfer — other downloads keep running. The partially-downloaded bytes are left on disk as a resumable .partial and are NEVER reported as a completed file, so nothing corrupt lands in your models directory; re-issuing the same download later resumes where it left off. Idempotent: cancelling an already-finished, failed, or already-cancelled download just reports its current state. Only downloads owned by the current server session can be aborted — a download started before a reconnect is reported but must be stopped from the panel download tray. NOTE: for a download dispatched to a REMOTE ComfyUI via ComfyUI-Manager (server-side fetch), the local job is marked cancelled but the host may keep fetching — there is no Manager API to stop it.
+
+### Parameters
+
+<ParamField path="id" type="string" required>
+  The download id to cancel (from download_model / download_civitai_model / download_status).
+</ParamField>
+
+### Example
+
+<Note>Example coming soon — the call below is a generated skeleton.</Note>
+
+```json
+{
+  "tool": "cancel_download",
+  "arguments": {
+    "id": "<id>"
+  }
 }
 ```
 
@@ -382,10 +433,10 @@ Free GPU VRAM by unloading cached models from ComfyUI. Use this between generati
 
 ### Parameters
 
-<ParamField path="unload_models" type="boolean" required default="true">
+<ParamField path="unload_models" type="boolean" default="true">
   Unload all cached models (default: true)
 </ParamField>
-<ParamField path="free_memory" type="boolean" required default="true">
+<ParamField path="free_memory" type="boolean" default="true">
   Free cached memory/intermediates (default: true)
 </ParamField>
 
@@ -396,10 +447,7 @@ Free GPU VRAM by unloading cached models from ComfyUI. Use this between generati
 ```json
 {
   "tool": "clear_vram",
-  "arguments": {
-    "unload_models": true,
-    "free_memory": true
-  }
+  "arguments": {}
 }
 ```
 
@@ -472,7 +520,7 @@ PROPOSE cleaned embedded metadata into the user's diff-review window (Model Expl
 
 ## model_metadata_fetch_civitai
 
-READ-ONLY: pull this model's data from Civitai (civitai.com) — the rich description, trainedWords, example prompts (with the prompt text used in the sample images), tags, nsfw flag, and source_url — WITHOUT writing anything. Call this when the embedded metadata is thin (empty model_card/prompt_director, no ss_tag_frequency) or to flesh out details before proposing. Treat the result as RAW input: distill the (often marketing-heavy) description, and MINE THE EXAMPLE PROMPTS for the real trigger — the trigger is frequently ONLY in the sample prompts even when trainedWords is EMPTY (e.g. every prompt starting with 'photo in the style of X' means X is the trigger). Adult models (civitai.red) resolve through this same API. Then clean it up and call model_metadata_propose.
+READ-ONLY: pull this model's data from Civitai (civitai.com) — the rich description, trainedWords, example prompts (with the prompt text used in the sample images), tags, nsfw flag, and source_url — WITHOUT writing anything. Call this when the embedded metadata is thin (empty model_card/prompt_director, no ss_tag_frequency) or to flesh out details before proposing. Treat the result as RAW input: distill the (often marketing-heavy) description, and MINE THE EXAMPLE PROMPTS for the real trigger — the trigger is frequently ONLY in the sample prompts even when trainedWords is EMPTY (e.g. every prompt starting with 'photo in the style of X' means X is the trigger). Adult models (civitai.red) resolve through this same API. Then clean it up and call model_metadata_propose. DEPENDENCY: automatic by-hash lookup uses the OPTIONAL 'comfyui-model-explorer' custom node. If that node isn't installed, pass 'version_id' (the CivitAI modelVersionId) and this tool degrades to CivitAI's public REST API directly — no node, no auth. Without both the node AND a version_id it returns a clear 'optional feature unavailable' message rather than enriching.
 
 ### Parameters
 

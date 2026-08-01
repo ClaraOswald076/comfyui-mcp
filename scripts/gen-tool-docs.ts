@@ -14,12 +14,13 @@ import {
   mkdirSync,
   writeFileSync,
   readFileSync,
+  readdirSync,
   existsSync,
   mkdtempSync,
   renameSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 // zod 4 ships JSON Schema conversion natively (z.toJSONSchema) — no zod-to-json-schema.
@@ -83,18 +84,24 @@ const CATEGORIES: Array<{
       "regenerate",
       "generate_audio",
       "generate_video",
+      "generate_3d",
     ],
   },
   {
     group: "Workflow Execution",
     slug: "workflow-execution",
     icon: "play",
-    description: "Enqueue workflows and inspect the queue, jobs, history, and system stats.",
+    description: "Enqueue workflows — one at a time, from a named template, or as a batch — and inspect the queue, jobs, history, and system stats.",
     tools: [
       "enqueue_workflow", "rerun_generation", "get_system_stats", "get_queue", "get_job_status",
       "get_queued_workflow", "move_queued_job", "edit_queued_job",
       "cancel_job", "cancel_queued_job", "clear_queue", "get_history", "get_logs",
       "health_check", "calculate", "diagnose_run",
+      // Template execution: run_template is an enqueue entrypoint, and
+      // get_template_schema is the lookup you make first to fill its overrides.
+      "get_template_schema", "run_template",
+      // Batch execution: submit many prompts under one batch_id, then poll/await it.
+      "submit_batch", "get_batch_status", "get_batch_output", "wait_for_batch",
     ],
   },
   {
@@ -137,6 +144,7 @@ const CATEGORIES: Array<{
     tools: [
       "search_models", "search_civitai_models", "search_civitai_creators",
       "download_model", "download_civitai_model", "resolve_missing_models", "list_local_models",
+      "download_status", "cancel_download",
       "remove_model", "list_extra_paths", "add_extra_path", "remove_extra_path",
       "get_embeddings", "clear_vram",
       "model_metadata_read", "model_metadata_propose", "model_metadata_fetch_civitai",
@@ -212,6 +220,12 @@ const CATEGORIES: Array<{
     tools: [
       "train_list_flows", "train_doctor", "train_build_image", "train_bootstrap",
       "train_prepare_dataset", "train_start", "train_status", "train_cancel",
+      // Dataset curation: stage/inspect/edit the images+captions a run consumes.
+      "train_list_datasets", "train_dataset_detail", "train_dataset_update",
+      "train_dataset_delete", "train_caption_image", "train_caption_dataset",
+      "train_file",
+      // Job introspection + cleanup.
+      "train_job_config", "train_preview_config", "train_delete_job",
     ],
   },
   {
@@ -321,8 +335,20 @@ function firstSentence(desc: string): string {
 }
 
 function renderTool(t: CapturedTool): string {
+  // `io: "input"` matches what the MCP SDK advertises to clients
+  // (sdk/server/zod-json-schema-compat.js defaults pipeStrategy to 'input').
+  //
+  // Omitting it meant OUTPUT semantics, under which a field with `.default()` is
+  // always present and therefore listed as required. So every defaulted parameter was
+  // documented as REQUIRED while the real tools/list schema said optional — 25
+  // parameters across 18 tools, e.g. comfy_cli_status.detail, declared
+  // `.optional().default("env")` and rendered `required default="env"`. A reader
+  // supplying every "required" field is doing needless work; a model reading it may
+  // refuse to call the tool without them. The docs-freshness gate stayed green
+  // throughout because it faithfully regenerated the same wrong answer.
   const json = z.toJSONSchema(z.object(t.shape), {
     reused: "inline",
+    io: "input",
   }) as unknown as JsonSchema;
   const props = json.properties ?? {};
   const required = new Set(json.required ?? []);
@@ -369,6 +395,12 @@ async function main() {
   mkdirSync(toolsDir, { recursive: true });
 
   const navPages: string[] = [];
+  // Pages are BUFFERED, not written as they are rendered, so the fatal checks
+  // below run before anything touches docs/. Writing inside the loop meant an
+  // unmapped-tool throw left the tree half-regenerated: some pages updated, some
+  // not, and a `git diff` that mixes the real change with debris from a failed
+  // run. Generation is now all-or-nothing with respect to those checks.
+  const pending: Array<{ path: string; content: string }> = [];
 
   for (const cat of CATEGORIES) {
     const present = cat.tools.filter((n) => byName.has(n));
@@ -386,37 +418,119 @@ async function main() {
     page.push("");
     for (const name of present) page.push(renderTool(byName.get(name)!));
 
-    writeFileSync(join(toolsDir, `${cat.slug}.mdx`), page.join("\n"));
+    pending.push({ path: join(toolsDir, `${cat.slug}.mdx`), content: page.join("\n") });
     navPages.push(`tools/${cat.slug}`);
   }
 
-  // Append hand-written reference pages to the nav and mark their tools as covered
-  // (so they don't trip the warning). Their .mdx is hand-maintained, never written.
+  // Append hand-written reference pages to the nav. Their .mdx is hand-maintained,
+  // never written here.
+  //
+  // Existence is checked BEFORE their tools count as covered. The old order marked
+  // them mapped unconditionally and only warned about a missing page, so every tool
+  // on a hand-written page that did not exist was exempted from the fatal check
+  // below while having no documentation at all — a hole shaped exactly like the one
+  // that check was added to close.
+  const missingHandWritten: string[] = [];
   for (const hw of HAND_WRITTEN_PAGES) {
-    hw.tools.forEach((n) => mapped.add(n));
     if (existsSync(join(toolsDir, `${hw.slug}.mdx`))) {
+      hw.tools.forEach((n) => mapped.add(n));
       navPages.push(`tools/${hw.slug}`);
     } else {
-      console.warn(`[gen-tool-docs] hand-written page missing: docs/tools/${hw.slug}.mdx`);
+      missingHandWritten.push(`docs/tools/${hw.slug}.mdx (${hw.tools.length} tool(s))`);
     }
   }
-
-  // Warn about any tool not assigned to a category.
-  const unmapped = captured.map((t) => t.name).filter((n) => !mapped.has(n));
-  if (unmapped.length > 0) {
-    console.warn(`[gen-tool-docs] WARNING: ${unmapped.length} tool(s) not in any category:`, unmapped.join(", "));
+  if (missingHandWritten.length > 0) {
+    throw new Error(
+      `[gen-tool-docs] ${missingHandWritten.length} hand-written page(s) are referenced by ` +
+        `HAND_WRITTEN_PAGES but do not exist, so their tools would be undocumented AND the nav ` +
+        `would link nowhere:\n  ${missingHandWritten.join("\n  ")}\n` +
+        `Create the page, or move those tools into a generated CATEGORIES entry.`,
+    );
   }
 
-  // Splice the generated "Tools" tab into docs.json (preserve everything else).
+  // FATAL, not a warning: an unmapped tool is silently absent from the published
+  // Tool Reference, and a warning in a passing build is a warning nobody reads —
+  // that is how 18 tools (all the batch/template tools and most of train_*) went
+  // undocumented. Failing here means adding a tool forces a docs decision, and
+  // during the 181 -> 29 consolidation it means a consolidated tool cannot land
+  // without its reference page.
+  //
+  // Do NOT "fix" a failure here by bulk-adding names to a category you haven't
+  // read — that recreates the warning with extra steps. Put the tool where a
+  // reader would look for it, or add it to HAND_WRITTEN_PAGES.
+  const unmapped = captured.map((t) => t.name).filter((n) => !mapped.has(n));
+  if (unmapped.length > 0) {
+    throw new Error(
+      `[gen-tool-docs] ${unmapped.length} tool(s) are not in any CATEGORIES entry or HAND_WRITTEN_PAGES, ` +
+        `so they would be missing from the Tool Reference:\n  ${unmapped.join("\n  ")}\n` +
+        `Assign each one in scripts/gen-tool-docs.ts.`,
+    );
+  }
+
+  // An .mdx in docs/tools/ that no longer belongs to any category or hand-written
+  // page is still PUBLISHED — it just falls out of the nav, so it documents a
+  // surface nobody can navigate to and nothing regenerates. Phase 5 restructures
+  // every category, which is exactly when orphans appear. Reported, never deleted:
+  // removing a file the author may have hand-written is not this script's call.
+  // Derived from the pages actually GENERATED this run, not from every declared
+  // CATEGORY. A category whose tools have all been removed hits the `continue`
+  // above, so no page is written for it — but listing it as "expected" anyway kept
+  // its now-stale page permanently exempt: still published, still unreachable from
+  // the nav, and never regenerated. Phase 5 empties categories wholesale, so this
+  // is the common case, not an edge one.
+  const expectedPages = new Set([
+    ...pending.map((w) => basename(w.path)),
+    ...HAND_WRITTEN_PAGES.map((h) => `${h.slug}.mdx`),
+  ]);
+  const orphans = readdirSync(toolsDir)
+    .filter((f) => f.endsWith(".mdx") && !expectedPages.has(f))
+    .sort();
+  if (orphans.length > 0) {
+    throw new Error(
+      `[gen-tool-docs] ${orphans.length} page(s) in docs/tools/ belong to no CATEGORIES entry ` +
+        `or HAND_WRITTEN_PAGES, so they are published but unreachable from the nav:\n  ` +
+        `${orphans.join("\n  ")}\n` +
+        `Delete them, or add the owning entry back to scripts/gen-tool-docs.ts.`,
+    );
+  }
+
+  // docs.json's SHAPE is validated before any page is written. Buffering the pages
+  // was only half the fix: the generator still wrote all 16 of them and then threw
+  // on a malformed navigation.tabs, leaving exactly the partial-regeneration debris
+  // the buffering was introduced to prevent.
+  let docsJson: { navigation?: { tabs?: unknown } } | undefined;
   if (existsSync(docsJsonPath)) {
-    const docsJson = JSON.parse(readFileSync(docsJsonPath, "utf-8"));
-    // Fail loudly rather than silently reshape navigation into something
-    // Mintlify can't read if the config schema ever changes.
-    if (docsJson.navigation && !Array.isArray(docsJson.navigation.tabs)) {
+    docsJson = JSON.parse(readFileSync(docsJsonPath, "utf-8"));
+    const tabsValue = docsJson!.navigation?.tabs;
+    if (docsJson!.navigation && !Array.isArray(tabsValue)) {
       throw new Error(
         "docs.json navigation.tabs is not an array — aborting so we don't corrupt the config.",
       );
     }
+    // Each ENTRY is validated too, not just the container. `{"tabs":[null]}` satisfied
+    // Array.isArray, so all 16 pages were written and the code then threw dereferencing
+    // `t.tab` — leaving exactly the partial-regeneration debris this pre-write check was
+    // introduced to prevent. A shape check that stops at the outer type is not a shape
+    // check.
+    if (Array.isArray(tabsValue)) {
+      const bad = tabsValue.findIndex(
+        (t) => !t || typeof t !== "object" || typeof (t as { tab?: unknown }).tab !== "string",
+      );
+      if (bad >= 0) {
+        throw new Error(
+          `docs.json navigation.tabs[${bad}] is not an object with a string "tab" — ` +
+            `aborting before any page is written.`,
+        );
+      }
+    }
+  }
+
+  // Every check passed — now the tree may change.
+  for (const { path, content } of pending) writeFileSync(path, content);
+
+  // Splice the generated "Tools" tab into docs.json (preserve everything else).
+  if (docsJson) {
+    // Shape already validated above, before any page was written.
     const tabs: Array<{ tab: string; groups?: unknown[] }> = docsJson.navigation?.tabs ?? [];
     const toolsTab = {
       tab: "Tool Reference",

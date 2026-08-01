@@ -108,8 +108,29 @@ describe("resolveKimiCodeOAuth", () => {
     expect(creds.baseUrl).toBe(__testing.KIMI_CODE_DEFAULT_BASE);
   });
 
+  it("resolves the kimi-code CLI dir (~/.kimi-code) over the legacy ~/.kimi", async () => {
+    // Regression: the port defaulted to the legacy kimi-cli path (~/.kimi); the
+    // current kimi-code CLI writes to ~/.kimi-code. The resolver must find the
+    // current dir first, and still fall back to the legacy dir when only it exists.
+    const write = async (dir: string, token: string) => {
+      const d = join(home, dir, "credentials");
+      await mkdir(d, { recursive: true });
+      await writeFile(
+        join(d, "kimi-code.json"),
+        JSON.stringify({ access_token: token, expires_at: Math.floor(Date.now() / 1000) + 3600 }),
+        "utf8",
+      );
+    };
+    // Legacy only → falls back.
+    await write(".kimi", "legacy-token");
+    expect((await resolveKimiCodeOAuth({ home })).accessToken).toBe("legacy-token");
+    // Current present → preferred over legacy.
+    await write(".kimi-code", "current-token");
+    expect((await resolveKimiCodeOAuth({ home })).accessToken).toBe("current-token");
+  });
+
   it("refreshes expired kimi-code.json tokens", async () => {
-    const credDir = join(home, ".kimi", "credentials");
+    const credDir = join(home, ".kimi-code", "credentials");
     await mkdir(credDir, { recursive: true });
     await writeFile(
       join(credDir, "kimi-code.json"),

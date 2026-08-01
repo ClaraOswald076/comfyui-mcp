@@ -15,7 +15,7 @@ Create a ready-to-run ComfyUI API-format workflow from a built-in template (txt2
 <ParamField path="template" type="enum" required>
   Template name: txt2img, img2img, upscale, or inpaint Options: `txt2img`, `img2img`, `upscale`, `inpaint`, `controlnet`, `ip_adapter`, `ace_step_15`, `stable_audio_3`, `remove_background`, `ltx_video`.
 </ParamField>
-<ParamField path="params" type="object" required default="[object Object]">
+<ParamField path="params" type="object" default="[object Object]">
   Template parameters; recognized keys depend on the template. txt2img: checkpoint, positive_prompt, negative_prompt, width, height, steps, cfg, seed, sampler_name, scheduler. img2img/inpaint add image_path (and mask_path for inpaint) and denoise. upscale adds upscale_model. Unknown keys are ignored; omitted keys use template defaults.
 </ParamField>
 
@@ -27,8 +27,7 @@ Create a ready-to-run ComfyUI API-format workflow from a built-in template (txt2
 {
   "tool": "create_workflow",
   "arguments": {
-    "template": "txt2img",
-    "params": "<params>"
+    "template": "txt2img"
   }
 }
 ```
@@ -73,7 +72,7 @@ Validate a ComfyUI workflow without executing it. Checks for missing node types,
 <ParamField path="workflow" type="string | object" required>
   ComfyUI workflow in API format (JSON string or object)
 </ParamField>
-<ParamField path="health" type="boolean" required default="true">
+<ParamField path="health" type="boolean" default="true">
   Include graph-health heuristics (disconnected nodes, duplicate model loads, orphaned branches, muted/bypassed nodes) as info/warning issues plus a structured health section. Never affects `valid`.
 </ParamField>
 
@@ -85,8 +84,7 @@ Validate a ComfyUI workflow without executing it. Checks for missing node types,
 {
   "tool": "validate_workflow",
   "arguments": {
-    "workflow": "<workflow>",
-    "health": true
+    "workflow": "<workflow>"
   }
 }
 ```
@@ -102,8 +100,11 @@ Query a running ComfyUI server's /object_info endpoint for installed node type d
 <ParamField path="node_type" type="string">
   Filter by node class_type name (case-insensitive substring match). Omit to list all available nodes.
 </ParamField>
-<ParamField path="verbose" type="boolean" required default="false">
+<ParamField path="verbose" type="boolean" default="false">
   If true, return the full raw /object_info definitions including enum dropdown values (model lists etc.) — can be hundreds of KB per Loader node, so only use it when you need the actual enum values (e.g. exact model filenames) and the filter matches few nodes. Default false: structural summary with enum value counts.
+</ParamField>
+<ParamField path="refresh" type="boolean" default="false">
+  If true, discard the memoized /object_info snapshot and refetch live from the connected server before answering. Use after the ComfyUI server was restarted EXTERNALLY (systemd/service manager) or new model files were added out-of-band — the cache is otherwise only invalidated by MCP-managed restarts, so loader dropdowns (model lists) would remain stale for the rest of the session (#499).
 </ParamField>
 
 ### Example
@@ -113,9 +114,7 @@ Query a running ComfyUI server's /object_info endpoint for installed node type d
 ```json
 {
   "tool": "get_node_info",
-  "arguments": {
-    "verbose": true
-  }
+  "arguments": {}
 }
 ```
 
@@ -173,17 +172,17 @@ Convert the compact workflow DSL (see workflow_to_dsl) back into executable Comf
 
 ## visualize_workflow
 
-Convert a ComfyUI workflow JSON into a Mermaid flowchart diagram. Returns mermaid syntax showing nodes grouped by category (loading, conditioning, sampling, image, output) with connections labeled by data type.
+Convert workflow JSON you PASS IN (a JSON string or object) into a Mermaid flowchart diagram — this does NOT read the user's live canvas. To 'show me what's on the canvas' / read the CURRENTLY-OPEN graph, use panel_graph_outline instead. Returns mermaid syntax showing nodes grouped by category (loading, conditioning, sampling, image, output) with connections labeled by data type.
 
 ### Parameters
 
 <ParamField path="workflow" type="string | object" required>
   ComfyUI workflow JSON (as a JSON string or object)
 </ParamField>
-<ParamField path="show_values" type="boolean" required default="true">
+<ParamField path="show_values" type="boolean" default="true">
   Include widget values (seed, steps, cfg, etc.) in node labels
 </ParamField>
-<ParamField path="direction" type="enum" required default="LR">
+<ParamField path="direction" type="enum" default="LR">
   Flowchart direction: LR (left-to-right) or TB (top-to-bottom) Options: `LR`, `TB`.
 </ParamField>
 
@@ -195,9 +194,7 @@ Convert a ComfyUI workflow JSON into a Mermaid flowchart diagram. Returns mermai
 {
   "tool": "visualize_workflow",
   "arguments": {
-    "workflow": "<workflow>",
-    "show_values": true,
-    "direction": "LR"
+    "workflow": "<workflow>"
   }
 }
 ```
@@ -210,7 +207,7 @@ Visualize a large ComfyUI workflow as a hierarchical diagram. Detects logical se
 
 ### Parameters
 
-<ParamField path="view" type="enum" required default="overview">
+<ParamField path="view" type="enum" default="overview">
   overview: compact diagram with sections as summary nodes; detail: full diagram for one section; list: text summary of all sections; summary: structured text optimized for AI ingestion with node IDs, key settings, virtual wires, and full connection graph Options: `overview`, `detail`, `list`, `summary`.
 </ParamField>
 <ParamField path="section" type="string">
@@ -219,7 +216,7 @@ Visualize a large ComfyUI workflow as a hierarchical diagram. Detects logical se
 <ParamField path="workflow" type="string | object" required>
   ComfyUI workflow in API format or UI format (auto-detected)
 </ParamField>
-<ParamField path="show_values" type="boolean" required default="true">
+<ParamField path="show_values" type="boolean" default="true">
   Include widget values in node labels (detail view only)
 </ParamField>
 <ParamField path="direction" type="enum">
@@ -234,9 +231,7 @@ Visualize a large ComfyUI workflow as a hierarchical diagram. Detects logical se
 {
   "tool": "visualize_workflow_hierarchical",
   "arguments": {
-    "view": "overview",
-    "workflow": "<workflow>",
-    "show_values": true
+    "workflow": "<workflow>"
   }
 }
 ```

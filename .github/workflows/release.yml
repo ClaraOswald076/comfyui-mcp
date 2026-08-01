@@ -25,6 +25,29 @@ jobs:
       - run: npm run build
       - run: npm test
 
+      # These three run in ci.yml on every PR, and used to be ABSENT here — so a
+      # tag could publish what a pull request would have blocked. `npm test` does
+      # not cover any of them: a commit with a correct registry but a stale
+      # model-facing tool name, or prose whose counts have drifted, passed the tests
+      # and shipped in dist/. A release path that enforces less than CI makes CI
+      # advisory.
+      - run: npm run check:vocabulary
+      - run: npm run vocab:export -- --check
+      - run: node scripts/asset-counts.mjs --check
+
+      # The fourth CI gate, missed when the other three were added here: change a
+      # tool's description or schema without regenerating its MDX page, tag that
+      # commit, and every other release step passes while PR CI would have rejected
+      # it — shipping a Tool Reference that documents a surface that no longer exists.
+      - name: Tool Reference is current (docs:gen must be a no-op)
+        run: |
+          npm run docs:gen
+          git add --intent-to-add -A docs/
+          if ! git diff --exit-code -- docs/; then
+            echo "::error::docs/ is stale — run 'npm run docs:gen' and commit before tagging."
+            exit 1
+          fi
+
       # Gate the publish on a real install of the packed tarball: catches a
       # broken postinstall / missing-file packaging regression (e.g. 0.17.0,
       # where the files allowlist dropped scripts/ but postinstall still ran
@@ -32,10 +55,85 @@ jobs:
       - name: Pack & install smoke
         run: node scripts/smoke-install.mjs
 
+      # `npm publish` takes its version from package.json, NOT from the tag, so a
+      # mismatch silently ships the wrong version under the right-looking release.
+      # Fail instead.
+      - name: Tag matches package.json version
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          pkg_version="$(node -p 'require("./package.json").version')"
+
+          # `${GITHUB_REF_NAME#v}` strips exactly ONE leading "v" and validates
+          # nothing, so several malformed tags used to sail through and be published
+          # under a version npm had silently rewritten:
+          #   vv1.0.0  -> "v1.0.0"  matched a package.json of "v1.0.0", npm published 1.0.0
+          #   v01.2.3  -> "01.2.3"  matched, npm published 1.2.3
+          #   v1.2.3-  and v-1.0.0  routed as prereleases, then npm rejected them
+          #   v        -> ""        classified as a final release before failing
+          # Anchor the whole thing to canonical SemVer instead. Build metadata is
+          # excluded from the grammar on purpose — see below.
+          if ! printf '%s' "$tag_version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))(\.((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)))*)?$'; then
+            echo "::error::tag ${GITHUB_REF_NAME} is not a canonical vMAJOR.MINOR.PATCH[-prerelease] tag (no leading zeros, no build metadata, exactly one leading v)"
+            exit 1
+          fi
+
+          # Build metadata is rejected outright, because a string match on it is a
+          # LIE about what ships: npm's publish path runs semver.clean(), which
+          # STRIPS build metadata, so tag v1.2.3+build.1 with a byte-identical
+          # package.json version publishes as plain 1.2.3. The guard below would
+          # pass while the tag no longer identifies the registry version. We never
+          # use build metadata, so refuse it rather than preserve a distinction npm
+          # discards. It also removes the only case where a '+' hyphen could be
+          # mistaken for the prerelease separator in the dist-tag step.
+          case "$tag_version" in
+            *+*)
+              echo "::error::build metadata is not supported in release tags (npm strips it via semver.clean, so the published version would not match the tag): ${GITHUB_REF_NAME}"
+              exit 1
+              ;;
+          esac
+
+          if [ "$tag_version" != "$pkg_version" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match package.json version ${pkg_version}"
+            exit 1
+          fi
+          echo "tag ${GITHUB_REF_NAME} == package.json ${pkg_version}"
+
+      # Which npm dist-tag this lands on is a SAFETY decision, not a formality:
+      # src/services/self-update.ts only ever moves users FORWARD (it gates on
+      # isNewer(latest, current)), so a bad `latest` cannot be walked back —
+      # already-updated users never return. Prereleases therefore publish to
+      # `next` and are promoted deliberately once soaked:
+      #   npm dist-tag add comfyui-mcp@X.Y.Z latest
+      # Detection is the semver rule: a hyphen after the numeric core means
+      # prerelease (v0.49.0-rc.1). Anything malformed also resolves to `next`,
+      # which is the fail-safe direction.
+      #
+      # The hyphen is tested against the version ONLY, not the whole ref, and
+      # build metadata is already rejected by the step above. Testing the raw ref
+      # for any '-' was wrong: SemVer permits hyphens INSIDE build metadata, so
+      # v0.49.0+build-1 is a FINAL release that would have been routed to `next`
+      # and marked prerelease on the GitHub Release.
+      - name: Resolve npm dist-tag
+        id: disttag
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if [[ "${version}" == *-* ]]; then
+            echo "value=next" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "${GITHUB_REF_NAME} is a prerelease -> npm dist-tag 'next'"
+          else
+            echo "value=latest" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "${GITHUB_REF_NAME} is a final release -> npm dist-tag 'latest'"
+          fi
+
       - name: Publish to npm
-        run: npm publish --provenance --access public
+        run: npm publish --provenance --access public --tag "${{ steps.disttag.outputs.value }}"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
         with:
           generate_release_notes: true
+          prerelease: ${{ steps.disttag.outputs.prerelease == 'true' }}

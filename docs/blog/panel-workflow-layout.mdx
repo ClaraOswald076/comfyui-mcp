@@ -34,6 +34,13 @@ agent got a camera and immediately admitted its own layout was a mess.
 > canvas). The `workflow-layout` skill turns them into a dependency-layered,
 > overlap-free auto-layout.
 
+<Note>
+  Since this post was published, the graph-read tool it describes has been replaced
+  by `panel_query_graph` (same data, token-bounded, with filtering and traversal)
+  and `panel_graph_outline` (a compact structural overview). The rest of the post
+  still applies.
+</Note>
+
 ## Stop laying out blind
 
 Everything starts with the read. The old `panel_get_graph` returned ids, types,

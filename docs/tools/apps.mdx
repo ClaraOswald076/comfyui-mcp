@@ -114,7 +114,7 @@ Install an app from the public registry onto this ComfyUI: fetches the registry 
 ### Parameters
 
 <ParamField path="registry_url" type="string" required>
-  Registry worker base URL, e.g. https://cmcp-apps-registry.example.workers.dev
+  Registry worker base URL. Must be the default public registry or an origin the operator allowlisted via COMFYUI_MCP_REGISTRY_URLS (the fetch is server-side — open URLs would be SSRF).
 </ParamField>
 <ParamField path="app_id" type="string" required>
   The registry app's uuid (from the explore list).
