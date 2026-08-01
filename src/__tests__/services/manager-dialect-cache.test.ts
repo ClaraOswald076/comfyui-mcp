@@ -408,19 +408,37 @@ describe("#646 Manager API dialect cache invalidation", () => {
     expect(getCachedManagerApi(BASE)).toBe("v2-batch");
   });
 
-  it("a slower concurrent detection cannot overwrite a fresher verdict", async () => {
-    // Both probes start after the window lapsed, with NO reset involved (an
-    // out-of-band restart lands between them), so the epoch alone can't order
-    // them: probe A reads the OLD server, probe B reads the new one and commits
-    // first, then A resolves last.
-    const stampA = managerApiCacheStamp();
-    cacheManagerApi(BASE, "v2", managerApiCacheStamp()); // probe B, fresher
-    cacheManagerApi(BASE, "v2-batch", stampA); // probe A, stale, resolves last
+  it("orders concurrent detections by START, so the newest reading wins either way", async () => {
+    // Both probes start after the window lapsed with NO reset involved (an
+    // out-of-band restart lands between them), so the epoch can't order them and
+    // completion order says nothing about which reading is newer. A starts first
+    // and reads the OLD server; B starts second and reads the NEW one.
+
+    // Case 1 — the newer probe finishes FIRST, the older resolves last.
+    let stampA = managerApiCacheStamp();
+    let stampB = managerApiCacheStamp();
+    cacheManagerApi(BASE, "v2", stampB);
+    cacheManagerApi(BASE, "v2-batch", stampA); // stale, must be dropped
     expect(getCachedManagerApi(BASE)).toBe("v2");
 
-    // A verdict backed by a SUCCEEDED enqueue (the #464 demotion) is still
-    // allowed to supersede a probe-derived one — it guards on the epoch only.
+    // Case 2 — the OLDER probe finishes first: its verdict lands, and the
+    // later-started probe must still be able to replace it (this is the order a
+    // write-counter guard gets wrong: it would drop the fresher reading).
+    resetManagerApiCache("test");
+    stampA = managerApiCacheStamp();
+    stampB = managerApiCacheStamp();
+    cacheManagerApi(BASE, "legacy", stampA);
+    expect(getCachedManagerApi(BASE)).toBe("legacy");
+    cacheManagerApi(BASE, "v2", stampB);
+    expect(getCachedManagerApi(BASE)).toBe("v2");
+
+    // A verdict backed by a SUCCEEDED enqueue (the #464 demotion) supersedes a
+    // probe-derived one — it guards on the epoch only …
     cacheManagerApi(BASE, "v2-batch", { epoch: managerApiEpoch() });
+    expect(getCachedManagerApi(BASE)).toBe("v2-batch");
+    // … and it takes a fresh ticket, so a detection that started BEFORE it can
+    // no longer clobber it.
+    cacheManagerApi(BASE, "legacy", stampA);
     expect(getCachedManagerApi(BASE)).toBe("v2-batch");
   });
 
@@ -448,10 +466,11 @@ describe("#646 Manager API dialect cache invalidation", () => {
 
     // The parked detection concluded AFTER the invalidation, so its verdict
     // described a server that may no longer be there and must NOT be pinned over
-    // the reset. The very next detection inside this same operation (the queue
-    // drain resolves the route prefix) therefore has to probe again: two
-    // detections, not one. Without the epoch guard the stale verdict would have
-    // been re-pinned and the second detection served from cache.
-    expect(detections(calls)).toBe(2);
+    // the reset — it left the cache EMPTY. The next operation therefore probes
+    // again; without the epoch guard the stale verdict would have been re-pinned
+    // and this call served from cache with no probe at all.
+    calls.length = 0;
+    await downloadAModel();
+    expect(detections(calls)).toBe(1);
   });
 });

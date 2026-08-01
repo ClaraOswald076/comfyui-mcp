@@ -418,10 +418,15 @@ async function detectManagerApi(): Promise<ManagerApi> {
   );
 }
 
-/** Queue route prefix for the detected generation ("v2-batch" serves
- *  status/start under the /v2 prefix too — only the mutation routes differ). */
+/** Queue route prefix for a dialect ("v2-batch" serves status/start under the
+ *  /v2 prefix too — only the mutation routes differ). */
+function managerQueuePrefixFor(api: ManagerApi): string {
+  return api === "legacy" ? "/manager/queue" : "/v2/manager/queue";
+}
+
+/** Queue route prefix for the currently detected generation. */
 async function managerQueuePrefix(): Promise<string> {
-  return (await detectManagerApi()) === "legacy" ? "/manager/queue" : "/v2/manager/queue";
+  return managerQueuePrefixFor(await detectManagerApi());
 }
 
 /** Appended to every legacy-Manager operation failure so users know they're on
@@ -562,9 +567,16 @@ export function setQueueTimingForTests(
 /**
  * Kick off the Manager queue worker and poll until it drains.
  * Returns the final queue status.
+ *
+ * Callers that just enqueued something pass the dialect they ACTUALLY enqueued
+ * with: re-deriving the prefix from the cache here could start and poll a
+ * different generation's queue than the one holding our task (a self-heal retry,
+ * or a concurrent detection landing mid-operation), which reports a false failure
+ * for work that is really running (#646). Only callers with nothing in flight
+ * fall back to the currently detected dialect.
  */
-async function runManagerQueue(): Promise<QueueStatus> {
-  const prefix = await managerQueuePrefix();
+async function runManagerQueue(api?: ManagerApi): Promise<QueueStatus> {
+  const prefix = api ? managerQueuePrefixFor(api) : await managerQueuePrefix();
   // queue/start returns 200 (worker started) or 201 (already running) — both
   // are 2xx, so managerFetch accepts either. Same on both generations. Some
   // legacy 3.x builds expose start as GET-only, so negotiate POST→GET on a 405
@@ -613,10 +625,10 @@ async function queueManagerTask(
   // params, and a self-heal retry must rebuild them, not just re-route them.
   const resolve: ManagerParamsResolver =
     typeof params === "function" ? params : () => params;
-  await enqueueWithDialectSelfHeal(kind, (api, epoch) =>
+  const used = await enqueueWithDialectSelfHeal(kind, (api, epoch) =>
     enqueueManagerTask(api, kind, resolve, randomUUID(), epoch),
   );
-  return runManagerQueue();
+  return runManagerQueue(used);
 }
 
 /** Params for a Manager task: a fixed body, or a resolver invoked with the
@@ -633,21 +645,21 @@ type ManagerTaskParams = Record<string, unknown> | ManagerParamsResolver;
  */
 async function enqueueWithDialectSelfHeal(
   label: string,
-  enqueue: (api: ManagerApi, startEpoch: number) => Promise<void>,
-): Promise<void> {
+  enqueue: (api: ManagerApi, startEpoch: number) => Promise<ManagerApi | void>,
+): Promise<ManagerApi> {
   // Epoch snapshot for the whole operation: any dialect conclusion reached
   // during it is only pinned if nothing invalidated the cache meanwhile.
   const startEpoch = managerApiEpoch();
   const api = await detectManagerApi();
   try {
-    await enqueue(api, startEpoch);
+    return (await enqueue(api, startEpoch)) ?? api;
   } catch (err) {
     const fresh = await redetectAfterDialectMismatch(api, label, err);
     if (fresh === undefined) throw err;
     // The live server speaks a DIFFERENT dialect than the one we routed with, and
     // the failure was a pre-execution rejection (see redetectAfterDialectMismatch),
     // so nothing was enqueued — re-enqueue ONCE in the correct dialect.
-    await enqueue(fresh, managerApiEpoch());
+    return (await enqueue(fresh, managerApiEpoch())) ?? fresh;
   }
 }
 
@@ -721,9 +733,15 @@ async function enqueueManagerTask(
   resolveParams: ManagerParamsResolver,
   uiId: string,
   startEpoch: number,
-): Promise<void> {
-  if (api === "legacy") return enqueueLegacyTask(kind, resolveParams("legacy"), uiId);
-  if (api === "v2-batch") return enqueueV2BatchTask(kind, resolveParams("v2-batch"), uiId);
+): Promise<ManagerApi> {
+  if (api === "legacy") {
+    await enqueueLegacyTask(kind, resolveParams("legacy"), uiId);
+    return "legacy";
+  }
+  if (api === "v2-batch") {
+    await enqueueV2BatchTask(kind, resolveParams("v2-batch"), uiId);
+    return "v2-batch";
+  }
   // v2 unified task envelope (normal-mode pip Manager v4).
   try {
     await managerFetch("/v2/manager/queue/task", {
@@ -761,10 +779,11 @@ async function enqueueManagerTask(
       // throws on a batch failure, leaving the cache as "v2" so the next op
       // re-probes the unified task route (codex review).
       demoteManagerApiToV2Batch(startEpoch);
-      return;
+      return "v2-batch";
     }
     throw err;
   }
+  return "v2";
 }
 
 /**
@@ -1578,7 +1597,7 @@ async function updateCustomNodeImpl(
     // queueManagerTask), but it is just as dialect-dependent — route it through
     // the same enqueue-only self-heal so a stale classification can't wedge it
     // either (#646). Enqueue here, drain once below.
-    await enqueueWithDialectSelfHeal("update-all", async (api) => {
+    const used = await enqueueWithDialectSelfHeal("update-all", async (api) => {
       // The v4 backend reads UpdateAllQueryParams from the QUERY STRING
       // (manager_server.py), NOT the JSON body — a body-only request leaves mode
       // defaulting to 'remote' and drops client_id/ui_id. Send them as URL query
@@ -1601,7 +1620,7 @@ async function updateCustomNodeImpl(
         });
       }
     });
-    status = await runManagerQueue();
+    status = await runManagerQueue(used);
   } else {
     // Single-pack update → unified task; UpdatePackParams uses node_name/node_ver.
     status = await queueManagerTask("update", { node_name: id });

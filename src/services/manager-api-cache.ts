@@ -89,16 +89,17 @@ let cache: { base: string; api: ManagerApi; at: number } | null = null;
 let epoch = 0;
 
 /**
- * Commit counter, bumped by every accepted cache write. A reset is not the only
- * way a detection can be overtaken: after the TTL lapses, two operations can
- * probe CONCURRENTLY, and if the slower probe (which read the PRE-restart server)
- * resolves last it would overwrite the fresher verdict and re-pin the stale
- * dialect for another window — with no reset involved, so the epoch alone
- * wouldn't catch it. A detection therefore also refuses to commit when any other
- * write landed while it was in flight; the fresher verdict stands and the loser
- * simply returns its own value to its caller.
+ * Ordering ticket for concurrent detections. A reset is not the only way a
+ * detection can be overtaken: once the TTL lapses, two operations can probe
+ * CONCURRENTLY, and if a restart lands between them the two probes read DIFFERENT
+ * servers. Completion order says nothing about which reading is newer, so writes
+ * are ordered by when the detection STARTED: each takes a ticket up front, and a
+ * commit is accepted only when no LATER-STARTED detection has already committed.
+ * The newest reading therefore always ends up pinned, whichever probe finishes
+ * first, and the loser simply returns its own value to its own caller.
  */
-let writes = 0;
+let seqCounter = 0;
+let lastCommittedSeq = 0;
 
 /** Current invalidation epoch — capture it before an async operation and pass it
  *  back to the commit helpers so a concurrent RESET wins. */
@@ -106,15 +107,15 @@ export function managerApiEpoch(): number {
   return epoch;
 }
 
-/** Full cache state stamp for a DETECTION: loses to a concurrent reset AND to a
- *  concurrent detection that committed first. */
+/** Ordering stamp for a DETECTION, taken BEFORE it probes. It loses to a
+ *  concurrent reset and to any later-started detection that already committed. */
 export interface ManagerApiCacheStamp {
   epoch: number;
-  writes: number;
+  seq: number;
 }
 
 export function managerApiCacheStamp(): ManagerApiCacheStamp {
-  return { epoch, writes };
+  return { epoch, seq: ++seqCounter };
 }
 
 /**
@@ -145,30 +146,43 @@ export function getCachedManagerApi(base: string): ManagerApi | undefined {
  * work that produced it:
  *   • `epoch` mismatch → something INVALIDATED the cache while this was in
  *     flight (a restart), so the conclusion may describe a server that is gone.
- *   • `writes` mismatch (detections only) → another probe already committed a
- *     FRESHER verdict; ours is the older read and must not overwrite it.
+ *   • `seq` older than the last accepted commit (detections only) → a
+ *     LATER-STARTED detection has already committed, so this is the older
+ *     reading and must not overwrite it.
+ * A guard WITHOUT a `seq` is a barrier write: it is not a probe reading but a
+ * conclusion proven by an operation that actually succeeded (the #464 v2-batch
+ * demotion), so it supersedes probe verdicts and takes a fresh ticket, which in
+ * turn keeps any still-in-flight older detection from clobbering it.
+ *
  * A dropped write is not an error: the caller still gets the value it derived,
  * it simply isn't pinned for later callers.
  */
 export function cacheManagerApi(
   base: string,
   api: ManagerApi,
-  guard?: { epoch: number; writes?: number },
+  guard?: { epoch: number; seq?: number },
 ): void {
   if (guard) {
     const reason =
       guard.epoch !== epoch
         ? "invalidated in flight"
-        : guard.writes !== undefined && guard.writes !== writes
-          ? "overtaken by a fresher detection"
+        : guard.seq !== undefined && guard.seq < lastCommittedSeq
+          ? "overtaken by a later-started detection"
           : undefined;
     if (reason) {
-      logger.debug("Dropping a Manager API dialect commit", { base, api, reason, guard, epoch, writes });
+      logger.debug("Dropping a Manager API dialect commit", {
+        base,
+        api,
+        reason,
+        guard,
+        epoch,
+        lastCommittedSeq,
+      });
       return;
     }
   }
   cache = { base, api, at: monotonicNow() };
-  writes++;
+  lastCommittedSeq = guard?.seq ?? ++seqCounter;
 }
 
 /**
