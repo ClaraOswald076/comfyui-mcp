@@ -2878,10 +2878,14 @@ export async function runPanelOrchestrator(): Promise<void> {
         for (const t of bridge.tabs()) {
           if (t.tab_id === panelTab) continue;
           const siblingAgentKey = t.tab_id + AGENT_KEY_SEP + candidateBackend;
-          // A retained session lives in the durable store (survives a provider-switch retire) or
-          // in the manager's live/pending/held state (spawn window, failed-start mail).
+          // A retained session lives in the durable store (survives a provider-switch retire), in
+          // the manager's live/pending/held state (spawn window, failed-start mail), OR in the
+          // orchestrator-level render-held queue (heldDuringGen) — the full durable/live/pending/
+          // held/render-held owned-set definition.
           const siblingRetainsSession =
-            sessionStore.get(siblingAgentKey) !== undefined || manager.hasAnyState(siblingAgentKey);
+            sessionStore.get(siblingAgentKey) !== undefined ||
+            manager.hasAnyState(siblingAgentKey) ||
+            (heldDuringGen.get(siblingAgentKey)?.length ?? 0) > 0;
           if (
             siblingOwnsStableKey({
               siblingIdentity: tabStableIdentity.get(t.tab_id),

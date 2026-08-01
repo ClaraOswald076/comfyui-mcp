@@ -1757,8 +1757,22 @@ export class PanelAgentManager {
       // override the session the orchestrator is actually holding. The store is
       // keyed per (tab, backend), so a provider switch finds no entry here and
       // correctly starts fresh (the panel replays the transcript to seed it).
-      const resume =
-        this.opts.sessionStore?.get(tabId) ?? this.pendingResume.get(tabId);
+      // #570 — the durable exact record wins ONLY when its OWNING identity matches this tab's
+      // current identity. A destination session collided-onto from another tab (the same wf:<path>
+      // or reused key) can carry a DIFFERENT owning identity than the tab connecting now; inheriting
+      // it would attach this tab to another tab's conversation. When the stored identity differs
+      // from the current one, IGNORE the durable record and fall back to the (validated) hint —
+      // this is the last-line guard behind the hello-handler choke point that resets such a record.
+      // Both-unknown (pre-`u` record or identity-less tab) fails OPEN, preserving prior behaviour.
+      const durable = this.opts.sessionStore?.get(tabId);
+      const durableIdentity = this.opts.sessionStore?.identityOf(tabId);
+      const currentIdentity = this.opts.identityForKey?.(tabId);
+      const durableOwnedByThisTab =
+        durable !== undefined &&
+        (durableIdentity === undefined ||
+          currentIdentity === undefined ||
+          durableIdentity === currentIdentity);
+      const resume = (durableOwnedByThisTab ? durable : undefined) ?? this.pendingResume.get(tabId);
       this.pendingResume.delete(tabId);
       agent = this.spawn(tabId, resume);
     }
