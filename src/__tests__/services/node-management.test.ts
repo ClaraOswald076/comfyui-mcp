@@ -1277,4 +1277,261 @@ describe("node-management service", () => {
       expect(calls.some((c) => c.url.endsWith("/manager/queue/status"))).toBe(true);
     });
   });
+
+  // ── Manager version-dialect cluster (#551 GET-only start, #553 v3→v4 recovery,
+  //    #555 authoritative v4 detection — a 405 is a method/route signal, never a
+  //    version signal) ─────────────────────────────────────────────────────────
+  describe("Manager 405 dialect cluster (#551 / #553 / #555)", () => {
+    const pathOf = (calls: Call[], p: string) =>
+      calls.filter((c) => new URL(c.url).pathname === p);
+
+    // ---- #551: legacy /manager/queue/start exposed GET-only ------------------
+    it("negotiates POST→GET when legacy /manager/queue/start is GET-only (#551)", async () => {
+      const calls: Call[] = [];
+      const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+        const method = init?.method ?? "GET";
+        const body = init?.body ? JSON.parse(init.body as string) : undefined;
+        calls.push({ url, method, body });
+        const path = new URL(url).pathname;
+        if (path.startsWith("/v2/")) return new Response("405: Method Not Allowed", { status: 405 });
+        if (path === "/manager/version") return new Response("V3.41", { status: 200 });
+        if (path === "/manager/queue/status") {
+          return jsonResponse({ total_count: 1, done_count: 1, in_progress_count: 0, is_processing: false });
+        }
+        if (path === "/manager/queue/start") {
+          // GET-only build: 405 to POST, 200 to GET (the #551 quirk).
+          return method === "POST"
+            ? new Response("405: Method Not Allowed", { status: 405 })
+            : new Response("", { status: 200 });
+        }
+        if (path === "/customnode/installed") {
+          return jsonResponse({ "comfyui-impact-pack": { ver: "1.0.0", cnr_id: "comfyui-impact-pack", enabled: true } });
+        }
+        return new Response("", { status: 200 });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      // Must SUCCEED (the install must not fail on the method mismatch).
+      const res = await installCustomNode({ id: "comfyui-impact-pack" });
+      expect(res.mechanism).toBe("manager-http");
+      const startCalls = pathOf(calls, "/manager/queue/start");
+      // POST was tried first, then re-negotiated as GET.
+      expect(startCalls.some((c) => c.method === "POST")).toBe(true);
+      expect(startCalls.some((c) => c.method === "GET")).toBe(true);
+    });
+
+    it("re-throws a non-405 error from queue/start unchanged (no blind GET retry)", async () => {
+      const calls: Call[] = [];
+      const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+        const method = init?.method ?? "GET";
+        calls.push({ url, method, body: undefined });
+        const path = new URL(url).pathname;
+        if (path.startsWith("/v2/")) return new Response("405", { status: 405 });
+        if (path === "/manager/version") return new Response("V3.41", { status: 200 });
+        if (path === "/manager/queue/status") {
+          return jsonResponse({ total_count: 1, done_count: 1, in_progress_count: 0, is_processing: false });
+        }
+        if (path === "/manager/queue/start") return new Response("boom", { status: 500 });
+        if (path === "/customnode/installed") {
+          return jsonResponse({ "p": { ver: "1", cnr_id: "p", enabled: true } });
+        }
+        return new Response("", { status: 200 });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      await expect(installCustomNode({ id: "p" })).rejects.toBeInstanceOf(NodeManagementError);
+      // A 500 must NOT be retried as GET (only a 405 method-mismatch is).
+      const startGets = pathOf(calls, "/manager/queue/start").filter((c) => c.method === "GET");
+      expect(startGets.length).toBe(0);
+    });
+
+    it("does NOT treat an HTML catchall GET as a successful queue start (codex P2)", async () => {
+      // The start path is UNREGISTERED for both methods: POST 405s, GET 200s with
+      // ComfyUI's SPA HTML page (the frontend catchall). That HTML must NOT be
+      // read as a real GET-only start — the original method error must surface.
+      const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+        const method = init?.method ?? "GET";
+        const path = new URL(url).pathname;
+        if (path.startsWith("/v2/")) return new Response("405", { status: 405 });
+        if (path === "/manager/version") return new Response("V3.41", { status: 200 });
+        if (path === "/manager/queue/status") {
+          return jsonResponse({ total_count: 1, done_count: 1, in_progress_count: 0, is_processing: false });
+        }
+        if (path === "/manager/queue/start") {
+          return method === "POST"
+            ? new Response("405: Method Not Allowed", { status: 405 })
+            : new Response("<!doctype html><html>frontend</html>", { status: 200, headers: { "Content-Type": "text/html" } });
+        }
+        if (path === "/customnode/installed") {
+          return jsonResponse({ "comfyui-impact-pack": { ver: "1.0.0", cnr_id: "comfyui-impact-pack", enabled: true } });
+        }
+        return new Response("", { status: 200 });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      // The install must FAIL rather than silently "succeed" on a catchall page.
+      await expect(installCustomNode({ id: "comfyui-impact-pack" })).rejects.toBeInstanceOf(NodeManagementError);
+    });
+
+    // ---- #555: authoritative v4 detection ------------------------------------
+    it("rescues a v4 host to v2 when /manager/queue/status also answers AND the v4 surface re-validates (#555)", async () => {
+      // A hybrid/transient shape: the FIRST /v2 queue-status probe missed (HTML
+      // catchall) and a bare /manager/queue/status answered — which alone made
+      // 0.48.21 conclude "legacy 3.x". The authoritative /v2/manager/version
+      // ("V4.x") overrides that, but ONLY after re-confirming the v4 queue surface
+      // actually validates (so we never route to a dead surface — codex P1).
+      const calls: Call[] = [];
+      let v2StatusHits = 0;
+      const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+        const method = init?.method ?? "GET";
+        calls.push({ url, method, body: undefined });
+        const path = new URL(url).pathname;
+        if (path === "/v2/manager/queue/status") {
+          v2StatusHits++;
+          // First probe misses (catchall); the re-probe after the version check
+          // validates → safe to speak v4.
+          return v2StatusHits === 1
+            ? new Response("<!doctype html>", { status: 200, headers: { "Content-Type": "text/html" } })
+            : jsonResponse({ total_count: 0, done_count: 0, in_progress_count: 0, pending_count: 0, is_processing: false });
+        }
+        if (path === "/manager/queue/status") return jsonResponse({ total_count: 0, done_count: 0, in_progress_count: 0, is_processing: false });
+        if (path === "/v2/manager/version") return new Response("V4.2.2", { status: 200 });
+        if (path === "/v2/manager/is_legacy_manager_ui") return jsonResponse({ is_legacy_manager_ui: false });
+        if (path.startsWith("/v2/customnode/installed")) return jsonResponse({});
+        if (path === "/customnode/installed") return jsonResponse({});
+        return new Response("", { status: 200 });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      await listInstalledNodes();
+      // Detected v2 → listed from the /v2 route, NOT the unprefixed legacy route.
+      expect(pathOf(calls, "/v2/customnode/installed").length).toBeGreaterThan(0);
+      expect(pathOf(calls, "/customnode/installed").length).toBe(0);
+    });
+
+    it("does NOT route to v2 when the version says v4 but the v4 queue surface never validates (codex P1)", async () => {
+      // version=V4 but /v2/manager/queue/status is persistently unreachable (HTML
+      // catchall). Routing to v2 would enqueue work we then can't poll → a false
+      // timeout and duplicate on retry. Must keep the WORKING legacy endpoint and
+      // NEVER post a v4 task/queue mutation.
+      const calls: Call[] = [];
+      const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+        const method = init?.method ?? "GET";
+        const body = init?.body ? JSON.parse(init.body as string) : undefined;
+        calls.push({ url, method, body });
+        const path = new URL(url).pathname;
+        if (path === "/v2/manager/queue/status") return new Response("<!doctype html>", { status: 200, headers: { "Content-Type": "text/html" } });
+        if (path === "/manager/queue/status") return jsonResponse({ total_count: 0, done_count: 0, in_progress_count: 0, is_processing: false });
+        if (path === "/v2/manager/version") return new Response("V4.2.2", { status: 200 });
+        if (path === "/customnode/installed") return jsonResponse({});
+        return new Response("", { status: 200 });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      await listInstalledNodes();
+      // Stayed legacy → listed from the unprefixed route; NEVER touched the v4 task
+      // route (no mutation posted to a dead surface).
+      expect(pathOf(calls, "/customnode/installed").length).toBeGreaterThan(0);
+      expect(pathOf(calls, "/v2/manager/queue/task").length).toBe(0);
+    });
+
+    it("recognizes a v4 queue-status shape carrying pending_count (#555)", async () => {
+      // A status payload with pending_count (v4-style) but the classic counters
+      // too must be accepted by the v2 probe rather than falling through.
+      const calls: Call[] = [];
+      const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+        calls.push({ url, method: init?.method ?? "GET", body: undefined });
+        const path = new URL(url).pathname;
+        if (path === "/v2/manager/queue/status") return jsonResponse({ done_count: 0, pending_count: 0, in_progress_count: 0 });
+        if (path === "/v2/manager/is_legacy_manager_ui") return jsonResponse({ is_legacy_manager_ui: false });
+        if (path.startsWith("/v2/customnode/installed")) return jsonResponse({});
+        return new Response("", { status: 200 });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      await listInstalledNodes();
+      expect(pathOf(calls, "/v2/customnode/installed").length).toBeGreaterThan(0);
+      // never fell through to the legacy probe
+      expect(pathOf(calls, "/manager/queue/status").length).toBe(0);
+    });
+
+    it("still classifies a genuine 3.x host as legacy (version endpoint reports V3)", async () => {
+      const calls: Call[] = [];
+      const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+        calls.push({ url, method: init?.method ?? "GET", body: undefined });
+        const path = new URL(url).pathname;
+        if (path.startsWith("/v2/")) return new Response("<!doctype html>", { status: 200, headers: { "Content-Type": "text/html" } });
+        if (path === "/manager/queue/status") return jsonResponse({ total_count: 0, done_count: 0, in_progress_count: 0, is_processing: false });
+        if (path === "/manager/version") return new Response("V3.41", { status: 200 });
+        if (path === "/customnode/installed") return jsonResponse({});
+        return new Response("", { status: 200 });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      await listInstalledNodes();
+      // Legacy → listed from the UNPREFIXED route.
+      expect(pathOf(calls, "/customnode/installed").length).toBeGreaterThan(0);
+      expect(pathOf(calls, "/v2/customnode/installed").length).toBe(0);
+    });
+
+    it("routes install-model on a genuine v4 host to the /v2 task envelope, never the bare legacy route, with no 'legacy 3.x' message (#555)", async () => {
+      const calls: Call[] = [];
+      const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+        const method = init?.method ?? "GET";
+        const body = init?.body ? JSON.parse(init.body as string) : undefined;
+        calls.push({ url, method, body });
+        const path = new URL(url).pathname;
+        if (path === "/v2/manager/queue/status") return jsonResponse({ total_count: 1, done_count: 1, in_progress_count: 0, pending_count: 0, is_processing: false });
+        if (path === "/v2/manager/is_legacy_manager_ui") return jsonResponse({ is_legacy_manager_ui: false });
+        if (path === "/v2/manager/queue/task") return new Response("", { status: 200 });
+        if (path === "/v2/manager/queue/start") return new Response("", { status: 200 });
+        return new Response("", { status: 200 });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const res = await installModelViaManager({
+        name: "m.safetensors",
+        url: "https://example.com/m.safetensors",
+        filename: "m.safetensors",
+        type: "checkpoints",
+      });
+      // Correct v4 route: the unified task envelope with kind=install-model.
+      const task = calls.find((c) => new URL(c.url).pathname === "/v2/manager/queue/task");
+      expect(task).toBeDefined();
+      expect((task!.body as { kind?: string }).kind).toBe("install-model");
+      // NEVER the bare legacy per-op route (the #555 symptom).
+      expect(pathOf(calls, "/manager/queue/install_model").length).toBe(0);
+      // and NO false "legacy 3.x" / upgrade nag on a v4 host.
+      expect(res.message).not.toMatch(/legacy/i);
+      expect(res.message).not.toMatch(/pip install -U comfyui_manager/i);
+    });
+
+    // ---- #553: actionable v3→v4 recovery on a legacy install-model failure ----
+    it("surfaces a precise v3→v4 migration recovery when a legacy 3.x model install fails (#553)", async () => {
+      const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+        const method = init?.method ?? "GET";
+        const path = new URL(url).pathname;
+        if (path.startsWith("/v2/")) return new Response("405", { status: 405 });
+        if (path === "/manager/version") return new Response("V3.41", { status: 200 });
+        if (path === "/manager/queue/status") {
+          return jsonResponse({ total_count: 0, done_count: 0, in_progress_count: 0, is_processing: false });
+        }
+        // Arbitrary-URL model install is whitelist-gated on 3.x → 500.
+        if (path === "/manager/queue/install_model" && method === "POST") {
+          return new Response("500: Internal Server Error", { status: 500 });
+        }
+        return new Response("", { status: 200 });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const err = await installModelViaManager({
+        name: "m.safetensors",
+        url: "https://example.com/m.safetensors",
+        filename: "m.safetensors",
+        type: "checkpoints",
+      }).catch((e) => e as Error);
+
+      expect(err).toBeInstanceOf(NodeManagementError);
+      const msg = (err as Error).message;
+      // Precise diagnosis …
+      expect(msg).toMatch(/REQUIRE Manager v4\+/i);
+      // … plus the actionable, numbered recovery path.
+      expect(msg).toMatch(/pip install -U comfyui_manager/i);
+      expect(msg).toMatch(/disable the old custom_nodes\/ComfyUI-Manager clone/i);
+      expect(msg).toMatch(/--enable-manager/i);
+    });
+  });
 });

@@ -184,6 +184,58 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** The HTTP status carried on a NodeManagementError from a non-2xx Manager
+ *  response (managerFetch stores { url, status, body } in `details`). */
+function errorStatus(err: unknown): number | undefined {
+  if (err instanceof NodeManagementError && err.details && typeof err.details === "object") {
+    const s = (err.details as { status?: unknown }).status;
+    return typeof s === "number" ? s : undefined;
+  }
+  return undefined;
+}
+
+/** Does a fetched body look like ComfyUI's SPA catchall page (an HTML document)
+ *  rather than a real Manager response? The frontend catchall answers an
+ *  UNREGISTERED GET path with 200 + a page of HTML, so a 200 alone is not proof a
+ *  route exists. A genuine queue-control GET returns an empty (or small non-HTML)
+ *  body. */
+function looksLikeHtml(body: unknown): boolean {
+  return typeof body === "string" && /^\s*<(?:!doctype\b|html\b|!--)/i.test(body);
+}
+
+/**
+ * POST to a Manager queue CONTROL route (e.g. `${prefix}/start`), negotiating the
+ * HTTP method on a 405.
+ *
+ * Some legacy Manager 3.x builds register `/manager/queue/start` (and peers) as
+ * GET-only, so our POST comes back HTTP 405 Method Not Allowed (#551). On a
+ * Manager route a 405 means "wrong method for THIS endpoint on THIS build" — NOT
+ * "the Manager is unreachable" and NOT "this is a different Manager generation".
+ * So retry the SAME path once with GET before giving up; a GET-only build then
+ * starts its queue instead of failing the whole install.
+ *
+ * The GET retry is itself guarded against ComfyUI's frontend catchall: an
+ * UNREGISTERED start path 405s the POST but 200s the GET with a page of HTML, and
+ * that HTML must NOT be mistaken for a successful queue start (codex review). If
+ * the GET yields a catchall HTML page, the route genuinely doesn't accept our
+ * request — surface the original method error. Any non-405 error, or a
+ * non-2xx GET, propagates unchanged.
+ */
+async function managerQueueControl(path: string): Promise<void> {
+  try {
+    await managerFetch(path, { method: "POST" });
+  } catch (err) {
+    if (errorStatus(err) === 405) {
+      // GET-only legacy build — negotiate the method rather than declare failure.
+      logger.debug("Manager queue control 405 on POST; retrying as GET", { path });
+      const body = await managerFetch<unknown>(path); // throws on a non-2xx GET
+      if (looksLikeHtml(body)) throw err; // catchall page — not a real GET-only start
+      return;
+    }
+    throw err;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Manager API generation detection (issue #116)
 //
@@ -217,14 +269,70 @@ export function resetManagerApiCacheForTests(api?: ManagerApi): void {
 }
 
 /** A real queue/status payload — guards detection against servers that answer
- *  200 with HTML/junk for unknown GETs (SPA fallbacks, index catchalls). */
+ *  200 with HTML/junk for unknown GETs (SPA fallbacks, index catchalls). Accepts
+ *  any of the queue-count fields the Manager reports: `total_count`/`is_processing`
+ *  (both generations) plus `pending_count` (the v4-style field, issue #555) — so a
+ *  v4 status shape is recognized authoritatively rather than falling through to a
+ *  legacy conclusion. HTML/SPA bodies carry none of these, so they still fail. */
 function looksLikeQueueStatus(s: unknown): boolean {
+  if (!s || typeof s !== "object") return false;
+  const q = s as QueueStatus;
   return (
-    !!s &&
-    typeof s === "object" &&
-    (typeof (s as QueueStatus).total_count === "number" ||
-      typeof (s as QueueStatus).is_processing === "boolean")
+    typeof q.total_count === "number" ||
+    typeof q.is_processing === "boolean" ||
+    typeof q.pending_count === "number" ||
+    typeof q.done_count === "number"
   );
+}
+
+/**
+ * Authoritative Manager MAJOR-version probe (issue #555). The two Manager
+ * generations expose their version string on DISJOINT paths and nowhere else:
+ *   • v4 (pip comfyui-manager) → GET /v2/manager/version   → text "V4.2.2"
+ *   • released 3.x             → GET /manager/version      → text "V3.41"
+ * (v4 registers NO bare /manager/version; 3.x registers NO /v2/* — verified
+ * against both upstream sources.) Both return a BARE version string, so this is
+ * an authoritative version signal that a 405/route-shape is NOT: a 405 means
+ * "wrong method for THIS endpoint", never "old Manager". Returns the major int,
+ * or undefined when neither answers with a plausible version string.
+ *
+ * The parse is deliberately strict (short, `V?<digits>.<digits>…`) so ComfyUI's
+ * SPA catchall — which 200s unknown GETs with a page of HTML — can never be
+ * mistaken for a version string.
+ */
+function parseManagerMajor(raw: unknown): number | undefined {
+  if (typeof raw !== "string") return undefined;
+  const t = raw.trim();
+  if (t.length === 0 || t.length > 16) return undefined; // reject HTML/SPA bodies
+  const m = t.match(/^v?(\d+)(?:\.\d+)*$/i);
+  return m ? Number(m[1]) : undefined;
+}
+
+async function probeManagerMajor(): Promise<number | undefined> {
+  // v4's /v2/manager/version is the strongest signal; check it first.
+  const v4 = parseManagerMajor(
+    await managerFetch<string>("/v2/manager/version", { soft: true }),
+  );
+  if (v4 !== undefined) return v4;
+  return parseManagerMajor(
+    await managerFetch<string>("/manager/version", { soft: true }),
+  );
+}
+
+/**
+ * Given that the /v2 queue surface answered, decide between the two pip-Manager
+ * (v4) dialects. Both normal-v4 and legacy-UI mode register
+ * GET /v2/manager/is_legacy_manager_ui and answer truthfully; a missing route
+ * (older pip) means the normal v4 server → unified task dialect.
+ */
+async function resolveV2SubDialect(): Promise<ManagerApi> {
+  const legacyUi = await managerFetch<{ is_legacy_manager_ui?: boolean }>(
+    "/v2/manager/is_legacy_manager_ui",
+    { soft: true },
+  );
+  return legacyUi && typeof legacyUi === "object" && legacyUi.is_legacy_manager_ui === true
+    ? "v2-batch"
+    : "v2";
 }
 
 async function detectManagerApi(): Promise<ManagerApi> {
@@ -232,23 +340,36 @@ async function detectManagerApi(): Promise<ManagerApi> {
   if (managerApiCache?.base === base) return managerApiCache.api;
   const v2 = await managerFetch<QueueStatus>("/v2/manager/queue/status", { soft: true });
   if (looksLikeQueueStatus(v2)) {
-    // Same /v2 surface, two servers: the pip package in legacy-UI mode swaps
-    // in its bundled 3.x server (no task route). Both register
-    // GET /v2/manager/is_legacy_manager_ui and answer truthfully; a missing
-    // route (older pip) means the normal v4 server → task dialect.
-    const legacyUi = await managerFetch<{ is_legacy_manager_ui?: boolean }>(
-      "/v2/manager/is_legacy_manager_ui",
-      { soft: true },
-    );
-    const api: ManagerApi =
-      legacyUi && typeof legacyUi === "object" && legacyUi.is_legacy_manager_ui === true
-        ? "v2-batch"
-        : "v2";
+    const api = await resolveV2SubDialect();
     managerApiCache = { base, api };
     return api;
   }
   const legacy = await managerFetch<QueueStatus>("/manager/queue/status", { soft: true });
   if (looksLikeQueueStatus(legacy)) {
+    // /manager/queue/status answering ALMOST always means the released 3.x
+    // custom-node Manager — but do NOT brand it "legacy 3.x" (and speak 3.x
+    // grammar, and tell the user to upgrade) on the route shape alone (#555). A
+    // v4 host reached only through a proxy/back-compat shim could also answer
+    // here; CONFIRM the generation with the authoritative version string first.
+    // A 405/route-shape is NEVER the version signal — /v2/manager/version ("V4.x")
+    // vs /manager/version ("V3.x") is.
+    const major = await probeManagerMajor();
+    if (major !== undefined && major >= 4) {
+      // Version says v4 — but only speak v4 if its queue surface ACTUALLY
+      // validates now (re-probe): routing to v2 when /v2/manager/queue/status is
+      // unreachable would enqueue work we then can't poll → a false timeout and a
+      // duplicate on retry (codex review). If the v4 surface still doesn't answer,
+      // keep the proven, WORKING legacy classification (we hold a validated
+      // /manager queue endpoint) rather than route to a dead v4 surface.
+      const v2Retry = await managerFetch<QueueStatus>("/v2/manager/queue/status", {
+        soft: true,
+      });
+      if (looksLikeQueueStatus(v2Retry)) {
+        const api = await resolveV2SubDialect();
+        managerApiCache = { base, api };
+        return api;
+      }
+    }
     managerApiCache = { base, api: "legacy" };
     return "legacy";
   }
@@ -271,9 +392,12 @@ async function managerQueuePrefix(): Promise<string> {
 const MANAGER_UPGRADE_HINT =
   "NOTE: this ComfyUI runs the LEGACY ComfyUI-Manager 3.x. comfyui-mcp is optimized " +
   "for Manager v4+ — on 3.x some operations degrade or are unavailable (notably " +
-  "arbitrary-URL model downloads, which 3.x whitelist-gates). Recommend upgrading: " +
-  "`pip install -U comfyui_manager` in the ComfyUI python env, then disable the old " +
-  "custom_nodes/ComfyUI-Manager clone and restart. " +
+  "arbitrary-URL model downloads, which 3.x whitelist-gates). RECOVERY — migrate to " +
+  "Manager v4 (one time, on the ComfyUI host): " +
+  "1) in ComfyUI's python env run `pip install -U comfyui_manager`; " +
+  "2) disable the old custom_nodes/ComfyUI-Manager clone so it no longer shadows the " +
+  "pip package (rename it to ComfyUI-Manager.disabled, or delete it); " +
+  "3) restart ComfyUI with --enable-manager, then retry the operation. " +
   "See https://comfyui-mcp.artokun.io/docs/troubleshooting";
 
 /** Appended to v2-batch (pip Manager in legacy-UI mode) failures. */
@@ -405,8 +529,10 @@ export function setQueueTimingForTests(
 async function runManagerQueue(): Promise<QueueStatus> {
   const prefix = await managerQueuePrefix();
   // queue/start returns 200 (worker started) or 201 (already running) — both
-  // are 2xx, so managerFetch accepts either. Same on both generations.
-  await managerFetch(`${prefix}/start`, { method: "POST" });
+  // are 2xx, so managerFetch accepts either. Same on both generations. Some
+  // legacy 3.x builds expose start as GET-only, so negotiate POST→GET on a 405
+  // (#551) rather than failing the queue on a method mismatch.
+  await managerQueueControl(`${prefix}/start`);
 
   const start = Date.now();
   let lastStatus: QueueStatus | undefined;
