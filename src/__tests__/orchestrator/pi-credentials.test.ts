@@ -462,6 +462,17 @@ describe("models.json", () => {
     expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(true);
   });
 
+  it("a space-padded credentials path is NOT resolved (pi uses the literal value)", () => {
+    const keyFile = join(tmp, "sa.json");
+    writeFileSync(keyFile, "{}");
+    const env = {
+      GOOGLE_CLOUD_PROJECT: "p",
+      GOOGLE_CLOUD_LOCATION: "l",
+      GOOGLE_APPLICATION_CREDENTIALS: `  ${keyFile}  `,
+    };
+    expect(piVertexAdcUsable(tmp, bareEnv(env))).toBe(false);
+  });
+
   it("a WRONG-TYPED or bad-headers provider field invalidates the file", () => {
     // pi's schema types these; a violation discards the file, so the sibling's
     // good key never reaches pi either.
@@ -470,6 +481,34 @@ describe("models.json", () => {
     writePiFile(tmp, "models.json", '{"providers":{"p":{"apiKey":"x","headers":{"X-T":1}}}}');
     expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(false);
     writePiFile(tmp, "models.json", '{"providers":{"p":{"apiKey":"x","headers":{"X-T":"1"}}}}');
+    expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(true);
+  });
+
+  it("a model definition violating pi's schema invalidates the file", () => {
+    const good = '"good":{"apiKey":"sk"}';
+    for (const bad of [
+      '{"id":"m","reasoning":"yes"}', // Type.Boolean
+      '{"id":"m","contextWindow":0}', // provider-composer rejects <= 0
+      '{"id":"m","maxTokens":-1}',
+      '{"id":"m","name":""}', // minLength 1
+      '{"id":"m","headers":{"X":1}}', // Record<string,string>
+      '{"id":"m","input":["video"]}', // "text" | "image"
+    ]) {
+      writePiFile(tmp, "models.json", `{"providers":{${good},"p":{"apiKey":"x","models":[${bad}]}}}`);
+      expect(piModelsJsonUsable(modelsPath(), bareEnv()), bad).toBe(false);
+    }
+    // A fully-valid definition loads.
+    writePiFile(
+      tmp,
+      "models.json",
+      '{"providers":{"p":{"apiKey":"x","models":[{"id":"m","reasoning":true,"contextWindow":8192,"input":["text","image"],"headers":{"X":"1"}}]}}}',
+    );
+    expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(true);
+  });
+
+  it("UNDECLARED extra fields are left alone (pi declares no additionalProperties)", () => {
+    // Being stricter than pi here would false-red a file it loads fine.
+    writePiFile(tmp, "models.json", '{"providers":{"p":{"apiKey":"x","note":"","future":{"a":1}}}}');
     expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(true);
   });
 
