@@ -25,6 +25,7 @@ import {
   SessionStore,
   armableResume,
   deriveStableKey,
+  destinationHasCollisionState,
   keepsBackendState,
   siblingOwnsStableKey,
   workflowIdentityParts,
@@ -2635,13 +2636,23 @@ export async function runPanelOrchestrator(): Promise<void> {
             // EVERY kind of destination state, not just a live agent (codex): a LIVE agent
             // (orphaned onto the incoming socket → renders into it), a DORMANT durable session
             // (rebindAgent PRESERVES it when the source has none → the incoming tab resumes the
-            // OTHER tab's conversation on a later provider switch), OR failed-start held mail
+            // OTHER tab's conversation on a later provider switch), failed-start held mail
             // (rebindAgent APPENDS it to the migrated source mail → delivered into the incoming
-            // tab). Its socket is already superseded, so its conversation is a lost resume — never
-            // a cross-tab leak. Then rebind the incoming source into the freed id.
-            if (manager.hasAnyState(newKey) || sessionStore.get(newKey) !== undefined) {
+            // tab), OR a RENDER-HELD queue (heldDuringGen — orchestrator-level, which manager.reset
+            // does NOT clear, and which the source-held re-key below would APPEND to → the
+            // superseded tab's queued message would flush into the incoming tab's agent/canvas on
+            // render completion). Its socket is already superseded, so its conversation is a lost
+            // resume — never a cross-tab leak. Then rebind the incoming source into the freed id.
+            if (
+              destinationHasCollisionState({
+                hasManagerState: manager.hasAnyState(newKey),
+                hasDurableSession: sessionStore.get(newKey) !== undefined,
+                renderHeldCount: heldDuringGen.get(newKey)?.length ?? 0,
+              })
+            ) {
               destinationCollision = true;
               manager.reset(newKey);
+              heldDuringGen.delete(newKey); // destination's render-held queue — clear BEFORE the source re-key appends to it
               logger.warn(
                 `[panel-orchestrator] tab-id migration ${migratedFrom.slice(0, 12)} → ${panelTab.slice(0, 12)} (${b}): destination id already had state (same workflow in two tabs) — reset the superseded destination so the incoming tab can't inherit it (no cross-tab leak)`,
               );

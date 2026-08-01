@@ -14,10 +14,36 @@ import {
   armableResume,
   deriveStableKey,
   deriveWorkflowIdentity,
+  destinationHasCollisionState,
   keepsBackendState,
   siblingOwnsStableKey,
   workflowIdentityParts,
 } from "../../orchestrator/session-store.js";
+
+// #570 — a tab-id migration destination collides when it holds ANY per-backend state, INCLUDING a
+// render-held (heldDuringGen) queue. Previously held-only destinations were missed → the source
+// re-key appended to the destination's held array → the superseded tab's message flushed into the
+// incoming tab on render completion. The predicate must treat a render-held queue as a collision.
+describe("destinationHasCollisionState (#570 render-held included)", () => {
+  it("treats a RENDER-HELD queue as collision state (the previously-missed case)", () => {
+    expect(
+      destinationHasCollisionState({ hasManagerState: false, hasDurableSession: false, renderHeldCount: 1 }),
+    ).toBe(true);
+  });
+  it("treats manager state or a durable session as collision state", () => {
+    expect(
+      destinationHasCollisionState({ hasManagerState: true, hasDurableSession: false, renderHeldCount: 0 }),
+    ).toBe(true);
+    expect(
+      destinationHasCollisionState({ hasManagerState: false, hasDurableSession: true, renderHeldCount: 0 }),
+    ).toBe(true);
+  });
+  it("no state of any kind ⇒ not a collision (a fresh destination id)", () => {
+    expect(
+      destinationHasCollisionState({ hasManagerState: false, hasDurableSession: false, renderHeldCount: 0 }),
+    ).toBe(false);
+  });
+});
 
 // #570 — a tab OWNS every backend key whose session it RETAINS (a provider switch preserves the
 // old provider's session), so a second honest tab must not resume a key a connected sibling still

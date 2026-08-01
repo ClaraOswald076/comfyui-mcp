@@ -151,6 +151,21 @@ export function deriveWorkflowIdentity(opts: {
   return p ? `${p.origin}::${p.uuid}` : undefined;
 }
 
+/** #570 — does the DESTINATION of a tab-id migration already hold state for a backend, so the
+ *  incoming tab would inherit/leak it? Covers EVERY kind of per-backend state that must be reset
+ *  before the source is rebound in: manager live/pending/held (`hasManagerState`), a dormant
+ *  durable session (`hasDurableSession`), OR a RENDER-HELD queue (`renderHeldCount` — the
+ *  orchestrator-level heldDuringGen, which manager.reset does NOT clear and which the source-held
+ *  re-key would otherwise APPEND to, flushing the superseded tab's queued message into the incoming
+ *  tab on render completion). Any of these ⇒ collision ⇒ reset + clear the destination's held. */
+export function destinationHasCollisionState(opts: {
+  hasManagerState: boolean;
+  hasDurableSession: boolean;
+  renderHeldCount: number;
+}): boolean {
+  return opts.hasManagerState || opts.hasDurableSession || opts.renderHeldCount > 0;
+}
+
 /** #570 — does a connected SIBLING tab own the session behind a candidate stable key? A stable key
  *  encodes (workflow identity, backend), so a sibling owns it when its identity derives to the SAME
  *  key for that backend AND it still RETAINS a session there. Ownership is a SET over every backend
