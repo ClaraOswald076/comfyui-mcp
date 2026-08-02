@@ -24,6 +24,10 @@ import * as perfHooks from "node:perf_hooks";
 const PRIOR_TTL_ENV = process.env.COMFYUI_MCP_MANAGER_API_TTL_MS;
 process.env.COMFYUI_MCP_MANAGER_API_TTL_MS = "5000";
 
+// Kept mutable to model the runtime target change that the panel applies while a
+// Manager operation is in flight. vi.hoisted makes it available to the mock factory.
+const target = vi.hoisted(() => ({ base: "http://127.0.0.1:8188" }));
+
 vi.mock("../../config.js", () => {
   const config = {
     comfyuiPath: "/fake/comfy",
@@ -34,7 +38,7 @@ vi.mock("../../config.js", () => {
   };
   return {
     config,
-    getComfyUIBaseUrl: () => "http://127.0.0.1:8188",
+    getComfyUIBaseUrl: () => target.base,
     getComfyUIAuthHeaders: () => ({}),
     // node-management's Manager self-update path (#424) imports this; the mock
     // must provide it or the named import fails at load.
@@ -69,6 +73,7 @@ const {
 const BASE = "http://127.0.0.1:8188";
 
 interface Call {
+  url: string;
   path: string;
   method: string;
   body: unknown;
@@ -99,26 +104,29 @@ function jsonResponse(obj: unknown): Response {
  *                while the unregistered batch route 405s via ComfyUI's catchall.
  */
 function stubServer(opts: {
-  persona: () => Persona;
+  persona: (url: string) => Persona;
   /** Gate resolution of the is_legacy_manager_ui probe (in-flight-race tests). */
   legacyUiGate?: () => Promise<void>;
   /** Override the response for the unified task route. */
-  taskStatus?: () => number;
+  taskStatus?: (url: string) => number;
+  /** Run after recording a request but before this fake Manager replies. */
+  onCall?: (url: string, path: string, method: string) => void | Promise<void>;
 }) {
   const calls: Call[] = [];
   const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
     const method = init?.method ?? "GET";
     const body = init?.body ? JSON.parse(init.body as string) : undefined;
     const path = new URL(url).pathname;
-    calls.push({ path, method, body });
+    calls.push({ url, path, method, body });
+    await opts.onCall?.(url, path, method);
 
     // The install VERIFY step: report the pack as present so installCustomNode
     // never reaches its clone fallback.
-    if (path.startsWith("/v2/customnode/installed")) {
+    if (path.startsWith("/v2/customnode/installed") || path.startsWith("/customnode/installed")) {
       return jsonResponse({ "comfyui-foo": { ver: "1.0", cnr_id: "comfyui-foo", enabled: true } });
     }
 
-    if (opts.persona() === "legacy") {
+    if (opts.persona(url) === "legacy") {
       // The 3.x custom-node Manager: no /v2/* at all (ComfyUI's frontend catchall
       // 405s an unregistered POST), per-operation routes under /manager/*.
       if (path === "/manager/queue/status") return jsonResponse(DRAINED);
@@ -134,19 +142,19 @@ function stubServer(opts: {
       // Read the persona BEFORE parking on the gate, so a gated probe answers
       // with the reading it took when the request was issued — that is what makes
       // "the server changed while a probe was in flight" testable.
-      const body = { is_legacy_manager_ui: opts.persona() === "v2-batch" };
+      const body = { is_legacy_manager_ui: opts.persona(url) === "v2-batch" };
       if (opts.legacyUiGate) await opts.legacyUiGate();
       return jsonResponse(body);
     }
 
-    if (opts.persona() === "v2-batch") {
+    if (opts.persona(url) === "v2-batch") {
       if (path === "/v2/manager/queue/install_model") return new Response("", { status: 200 });
       if (path === "/v2/manager/queue/batch") return jsonResponse({ failed: [] });
       // The unified task route does not exist on the bundled 3.x server.
       if (path === "/v2/manager/queue/task") return new Response("405", { status: 405 });
     } else {
       if (path === "/v2/manager/queue/task") {
-        const status = opts.taskStatus?.() ?? 200;
+        const status = opts.taskStatus?.(url) ?? 200;
         return new Response(status === 200 ? "" : String(status), { status });
       }
       // v4 registers install_model but validates a ModelMetadata envelope — the
@@ -193,6 +201,7 @@ const elapse = (ms: number): void => {
 
 describe("#646 Manager API dialect cache invalidation", () => {
   beforeEach(() => {
+    target.base = BASE;
     monotonicOffset = 0;
     wallOffset = 0;
     vi.spyOn(Date, "now").mockImplementation(() => realNow() + wallOffset);
@@ -389,6 +398,38 @@ describe("#646 Manager API dialect cache invalidation", () => {
     // … and the queue is started (drained) exactly once, on the live prefix.
     expect(countOf(calls, "/manager/queue/start")).toBe(1);
     expect(countOf(calls, "/v2/manager/queue/start")).toBe(0);
+  });
+
+  it("keeps a dialect self-heal retry and drain on its original target after retarget", async () => {
+    const targetA = BASE;
+    const targetB = "http://127.0.0.1:8282";
+    let retargeted = false;
+    const calls = stubServer({
+      // A is a legacy Manager even though its stale cache says v2; B is normal
+      // v4. Before the fix, the failed A request re-read the mutable target,
+      // detected B, then retried and drained B's queue instead of A's.
+      persona: (url) => (url.startsWith(targetA) ? "legacy" : "v4"),
+      onCall: (url, path) => {
+        if (!retargeted && url.startsWith(targetA) && path === "/v2/manager/queue/task") {
+          retargeted = true;
+          target.base = targetB;
+          resetManagerApiCache("panel retargeted while Manager request was in flight");
+        }
+      },
+    });
+    resetManagerApiCacheForTests("v2");
+
+    await expect(installCustomNode({ id: "comfyui-foo" })).resolves.toMatchObject({
+      mechanism: "manager-http",
+    });
+
+    // The mutation began at A, so its retry, queue start, and drain are all
+    // pinned to A. B is now the target for subsequent calls, but receives none
+    // from this already-started transaction.
+    expect(calls.filter((call) => call.url.startsWith(targetB))).toHaveLength(0);
+    expect(calls.some((call) => call.url.startsWith(targetA) && call.path === "/manager/queue/install")).toBe(true);
+    expect(calls.some((call) => call.url.startsWith(targetA) && call.path === "/manager/queue/start")).toBe(true);
+    expect(calls.some((call) => call.url.startsWith(targetA) && call.path.startsWith("/customnode/installed"))).toBe(true);
   });
 
   it("does NOT re-detect or retry on an unrelated failure (403 security gating)", async () => {
