@@ -33,8 +33,9 @@ import { startDownloadJob, type DownloadJob } from "./download-jobs.js";
 import { resolveModelsDir } from "./output-dir.js";
 import {
   getSavedDefaultWorkspaceSync,
+  resolveInstallInterpreter,
   resolveLiveComfyUIBase,
-  resolveRootInterpreter,
+  type InstallInterpreterResolution,
 } from "./workspace-env.js";
 import { ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
@@ -198,12 +199,8 @@ function commandExists(cmd: string): boolean {
   }
 }
 
-function resolveWorkspacePython(comfyuiPath: string): string {
-  if (process.env.COMFYUI_PYTHON) return process.env.COMFYUI_PYTHON;
-  // Honors .venv/venv AND portable Windows layouts (python_embeded/standalone-env)
-  // so a manifest pip install targets the install's OWN interpreter, never a bare
-  // system python that would contaminate the host env (#463 codex review).
-  return resolveRootInterpreter(comfyuiPath);
+async function resolveWorkspacePython(comfyuiPath: string): Promise<InstallInterpreterResolution> {
+  return resolveInstallInterpreter(comfyuiPath);
 }
 
 function validatePipPackageSpec(pkg: string): void {
@@ -239,14 +236,24 @@ function isUvNonVenvError(text: string): boolean {
   );
 }
 
-function installPipPackage(pkg: string, comfyuiPath: string): string {
+async function installPipPackage(
+  pkg: string,
+  comfyuiPath: string,
+): Promise<InstallInterpreterResolution> {
   validatePipPackageSpec(pkg);
-  const python = resolveWorkspacePython(comfyuiPath);
+  const resolved = await resolveWorkspacePython(comfyuiPath);
+  if (!resolved.python) {
+    throw new ValidationError(
+      `Refusing to install "${pkg}". ${resolved.reason} Set COMFYUI_PYTHON to the interpreter ComfyUI runs with, or restart ComfyUI through this MCP server and retry.`,
+    );
+  }
+  const python = resolved.python;
   const useUv = commandExists("uv");
 
   if (!useUv) {
     logger.info("Installing manifest Python package", { package: pkg, installer: "pip" });
-    return runPythonPipInstall(python, pkg, comfyuiPath);
+    runPythonPipInstall(python, pkg, comfyuiPath);
+    return resolved;
   }
 
   logger.info("Installing manifest Python package", { package: pkg, installer: "uv" });
@@ -257,7 +264,8 @@ function installPipPackage(pkg: string, comfyuiPath: string): string {
       timeout: 600_000,
       stdio: ["ignore", "pipe", "pipe"],
     });
-    return (out ?? "").trim();
+    void out;
+    return resolved;
   } catch (err) {
     const e = err as NodeJS.ErrnoException & { stdout?: Buffer | string; stderr?: Buffer | string };
     const detail = `${e.stderr?.toString() ?? ""}\n${e.stdout?.toString() ?? ""}\n${e.message ?? ""}`;
@@ -269,7 +277,8 @@ function installPipPackage(pkg: string, comfyuiPath: string): string {
         "uv rejected the non-venv ComfyUI interpreter; falling back to `python -m pip install`",
         { package: pkg },
       );
-      return runPythonPipInstall(python, pkg, comfyuiPath);
+      runPythonPipInstall(python, pkg, comfyuiPath);
+      return resolved;
     }
     throw err;
   }
@@ -704,8 +713,8 @@ async function applyManifestSections(
       continue;
     }
     try {
-      installPipPackage(pkg, comfyuiPath!);
-      results.push(report("pip", pkg, "applied", "Python package installed."));
+      const resolved = await installPipPackage(pkg, comfyuiPath!);
+      results.push(report("pip", pkg, "applied", `Python package installed. ${resolved.reason}`));
     } catch (err) {
       results.push(
         report(

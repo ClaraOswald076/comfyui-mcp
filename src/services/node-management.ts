@@ -17,7 +17,7 @@ import {
   setManagerApiCacheForTests,
   suppressDialectRecheck,
 } from "./manager-api-cache.js";
-import { resolveRootInterpreter } from "./workspace-env.js";
+import { resolveInstallInterpreter } from "./workspace-env.js";
 import { assertComfyCliOk, runComfyCliSync } from "./comfy-cli.js";
 import { ComfyUIError, ProcessControlError, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
@@ -1353,11 +1353,8 @@ function nodeInstalledMatches(
  * for an adopted workspace, corrupting/ missing the real ComfyUI environment while
  * the node is still reported installed (#463 codex review).
  */
-function resolveVenvPython(basePath?: string): string {
-  // Honors .venv/venv AND portable Windows layouts (python_embeded/standalone-env)
-  // via the shared resolver, so a cloned node's deps target the install's OWN
-  // interpreter rather than a bare system python (#463 codex review).
-  return resolveRootInterpreter(basePath ?? config.comfyuiPath);
+async function resolveVenvPython(basePath?: string) {
+  return resolveInstallInterpreter(basePath ?? config.comfyuiPath);
 }
 
 /**
@@ -1412,13 +1409,13 @@ export function assertSafeRepoName(repoName: string): void {
  * Dep failures DON'T fail the install (clone succeeded) — they're surfaced as
  * warnings. A clone failure throws NodeManagementError.
  */
-function cloneCustomNodeFallback(
+async function cloneCustomNodeFallback(
   gitId: string,
   repoName: string,
   gitRef: string | undefined,
   managerStatus: unknown,
   basePath?: string,
-): NodeOpResult {
+): Promise<NodeOpResult> {
   // basePath is the CALL-SCOPED local ComfyUI root (apply_manifest threads an
   // adopted saved-default/live root here WITHOUT mutating global config, so a
   // panel-connected local session with no COMFYUI_PATH can still clone an
@@ -1494,8 +1491,13 @@ function cloneCustomNodeFallback(
   const requirements = join(nodeDir, "requirements.txt");
   const installScript = join(nodeDir, "install.py");
   if (existsSync(requirements) || existsSync(installScript)) {
-    const python = resolveVenvPython(comfyuiBase);
-    if (existsSync(requirements)) {
+    const resolved = await resolveVenvPython(comfyuiBase);
+    if (!resolved.python) {
+      warnings.push(
+        `Python dependencies were NOT installed. ${resolved.reason} Set COMFYUI_PYTHON to the interpreter ComfyUI runs with, or restart ComfyUI through this MCP server and retry.`,
+      );
+    } else if (existsSync(requirements)) {
+      const python = resolved.python;
       try {
         execFileSync(python, ["-m", "pip", "install", "-r", requirements], {
           cwd: nodeDir,
@@ -1509,7 +1511,8 @@ function cloneCustomNodeFallback(
         );
       }
     }
-    if (existsSync(installScript)) {
+    if (resolved.python && existsSync(installScript)) {
+      const python = resolved.python;
       try {
         execFileSync(python, [installScript], {
           cwd: nodeDir,
@@ -1678,7 +1681,7 @@ async function installCustomNodeImpl(
         details: status,
       };
     }
-    return cloneCustomNodeFallback(gitId, repoName, gitRef, status, basePath);
+    return await cloneCustomNodeFallback(gitId, repoName, gitRef, status, basePath);
   }
 
   // Registry (plain CNR id). Keep the prior defaults channel "default" /

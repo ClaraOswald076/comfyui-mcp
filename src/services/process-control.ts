@@ -539,37 +539,53 @@ function rememberRestartAttempt(policy: RestartPolicy): boolean {
   return true;
 }
 
-function spawnFromProcessInfo(info: ProcessInfo): ChildProcess | null {
+interface SpawnedComfyUI {
+  child: ChildProcess;
+  /** Defined only for the Python process we directly execute, never Desktop's shell. */
+  interpreter?: string;
+}
+
+let recordedLaunchChild: ChildProcess | undefined;
+
+function adoptLaunchedChild(child: ChildProcess, interpreter: string | undefined): void {
+  recordedLaunchChild = child;
+  markLocalComfyUILaunched(interpreter);
+  const clearIfCurrent = (): void => {
+    if (recordedLaunchChild !== child) return;
+    recordedLaunchChild = undefined;
+    resetLocalComfyUILaunchState();
+  };
+  child.once("exit", clearIfCurrent);
+  child.once("error", clearIfCurrent);
+}
+
+function spawnFromProcessInfo(info: ProcessInfo): SpawnedComfyUI | null {
   if (info.isDesktopApp) {
     if (IS_WIN) {
       const exe = info.desktopExePath;
       if (!exe) return null;
-      return spawn(exe, [], {
-        detached: true,
-        stdio: "ignore",
-        shell: false,
-      });
+      return { child: spawn(exe, [], { detached: true, stdio: "ignore", shell: false }) };
     }
 
     const appPath = info.desktopExePath ?? "ComfyUI";
-    return spawn("open", ["-a", appPath], {
-      detached: true,
-      stdio: "ignore",
-    });
+    return { child: spawn("open", ["-a", appPath], { detached: true, stdio: "ignore" }) };
   }
 
   const cmd = resolveLaunchCommand(info);
   if (!cmd) return null;
-  return spawn(cmd.exe, cmd.args, {
-    detached: true,
-    stdio: "ignore",
+  return {
+    child: spawn(cmd.exe, cmd.args, {
+      detached: true,
+      stdio: "ignore",
     // Prefer the cwd the command resolved against (the live process cwd for a
     // relative-script relaunch, #535); only then the configured install dir. A
     // stale/nonexistent config.comfyuiPath as cwd would ENOENT the spawn.
     cwd: cmd.cwd ?? config.comfyuiPath ?? undefined,
     shell: false,
-    windowsHide: true,
-  });
+      windowsHide: true,
+    }),
+    interpreter: cmd.exe,
+  };
 }
 
 /**
@@ -918,8 +934,9 @@ function handleSupervisedChildStop(
     logger.warn("Could not auto-restart ComfyUI because launch info was incomplete");
     return;
   }
-  restarted.unref();
-  superviseChild(restarted, lastProcessInfo);
+  restarted.child.unref();
+  if (!lastProcessInfo.isDesktopApp) adoptLaunchedChild(restarted.child, restarted.interpreter);
+  superviseChild(restarted.child, lastProcessInfo);
 }
 
 function captureChildProcessError(
@@ -1021,6 +1038,7 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
   detachSupervisor();
   // The server we may have launched is going away — clear the shares-our-env flag so
   // a differently-launched successor doesn't inherit env-trust it shouldn't (#633 P1b).
+  recordedLaunchChild = undefined;
   resetLocalComfyUILaunchState();
 
   // Gather info before we kill it (or reuse the caller's pre-validated info so a
@@ -1139,24 +1157,21 @@ export async function startComfyUI(): Promise<StartResult> {
       auto_restart: supervisorResult(info),
     };
   }
-  const spawnError = captureChildProcessError(launched);
-  launched.unref();
+  const spawnError = captureChildProcessError(launched.child);
+  launched.child.unref();
   lastProcessInfo = info;
-  superviseChild(launched, info);
+  superviseChild(launched.child, info);
   // A python `spawn` inherits our process.env, so this local server shares our
   // environment — mark it so its live extra_model_paths $VAR references may be
   // expanded against process.env (#633 P1b). A Desktop-app launch's env is NOT
   // guaranteed to be ours, so it stays fail-closed (unmarked).
   if (!info.isDesktopApp) {
-    markLocalComfyUILaunched();
+    adoptLaunchedChild(launched.child, launched.interpreter);
     // Revoke env-trust the instant OUR launched child goes away — on EXIT and on a
     // failed spawn (ERROR): a successor server that later takes the port may have a
     // DIFFERENT env, so it must NOT inherit our trust (#633 P1b stale-flag). Fail
     // closed the moment we no longer own the process (`error` covers the spawn_error
     // path where `exit` may not fire).
-    const revokeEnvTrust = (): void => resetLocalComfyUILaunchState();
-    launched.once("exit", revokeEnvTrust);
-    launched.once("error", revokeEnvTrust);
   }
 
   // A NEW server instance is coming up on this port — whatever Manager dialect we

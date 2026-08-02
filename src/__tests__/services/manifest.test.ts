@@ -124,6 +124,11 @@ vi.mock("../../services/workspace-env.js", () => ({
   // Mirrors the real resolver enough for the pip tests: an install-root python.
   resolveRootInterpreter: (root: string | undefined) =>
     root ? `${root}/python` : "python",
+  resolveInstallInterpreter: async (root: string | undefined) => ({
+    python: root ? `${root}/python` : "python",
+    source: "unverified",
+    reason: "test interpreter",
+  }),
 }));
 
 // resolveLocalModelPath now roots local_path validation at the SAME live write
