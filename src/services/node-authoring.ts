@@ -252,9 +252,9 @@ function toClassName(slug: string): string {
  * Resolve the custom_nodes root, throwing a clear error when there is no local
  * install path to write into. Resolves the effective LOCAL ComfyUI base the same
  * way every other filesystem-backed tool does (node-dev, node-verify): COMFYUI_PATH
- * first, then the saved default workspace (set via set_default_workspace) when
+ * first, then the saved default workspace (set via workspace action:"set_default") when
  * COMFYUI_PATH is unset and we are not targeting a remote ComfyUI. This is what
- * get_environment / get_workspace already report, so scaffold/publish no longer
+ * get_environment / workspace action:"get" already report, so scaffold/publish no longer
  * reject a loopback session that has a saved default workspace as if it were remote
  * (#506). Returns undefined only in remote mode or when no local install is known —
  * then we refuse with a clear, actionable error.
@@ -266,7 +266,7 @@ function customNodesRoot(): string {
       "This operation needs a local ComfyUI install, but none is configured " +
         "(COMFYUI_PATH is unset, no saved default workspace, or running in remote " +
         "--comfyui-url mode). Set COMFYUI_PATH or a default workspace " +
-        "(set_default_workspace) to scaffold or publish custom nodes.",
+        "(workspace action:\"set_default\") to scaffold or publish custom nodes.",
     );
   }
   return join(base, "custom_nodes");

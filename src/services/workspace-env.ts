@@ -79,7 +79,7 @@ function workspaceConfigPath(): string {
 }
 
 /**
- * Synchronous read of the saved default workspace (set via set_default_workspace).
+ * Synchronous read of the saved default workspace (set via workspace action:"set_default").
  * Mirrors readWorkspaceConfig()'s validation but is sync, so sync filesystem-path
  * resolvers (e.g. model-resolver.getModelsRoot) can consult the saved default
  * workspace without going async — this is what lets local downloads / model
@@ -110,7 +110,7 @@ export function getSavedDefaultWorkspaceSync(): string | undefined {
  *
  *   1. config.comfyuiPath — COMFYUI_PATH env or auto-detection (wins).
  *   2. When NOT targeting a remote ComfyUI, the saved DEFAULT WORKSPACE
- *      (set via set_default_workspace) — this is what get_workspace /
+ *      (set via workspace action:"set_default") — this is what workspace action:"get" /
  *      get_environment already report, so local downloads / model lookups /
  *      node verification work without COMFYUI_PATH.
  *
@@ -270,7 +270,7 @@ export function detectComfyUIInstalls(): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// get_workspace — mirrors comfy-cli which
+// workspace action:"get" — mirrors comfy-cli which
 // ---------------------------------------------------------------------------
 
 export interface WorkspaceInfo {
@@ -303,7 +303,7 @@ export async function getWorkspace(): Promise<WorkspaceInfo> {
 }
 
 // ---------------------------------------------------------------------------
-// set_default_workspace — mirrors comfy-cli set-default
+// workspace action:"set_default" — mirrors comfy-cli set-default
 // ---------------------------------------------------------------------------
 
 export interface SetDefaultResult {
@@ -334,7 +334,7 @@ export async function setDefaultWorkspace(
 }
 
 // ---------------------------------------------------------------------------
-// list_workspaces — auto-detected installs + active + saved default
+// workspace action:"list" — auto-detected installs + active + saved default
 // ---------------------------------------------------------------------------
 
 export interface WorkspaceListEntry {
@@ -1040,7 +1040,7 @@ export async function getEnvironment(): Promise<EnvironmentInfo> {
   }
 
   // 2. Local probes — use the active path, else fall back to the saved default
-  //    workspace (set via set_default_workspace) so `env` still inspects a known
+  //    workspace (set via workspace action:"set_default") so `env` still inspects a known
   //    local install when COMFYUI_PATH isn't set.
   const local: EnvironmentInfo["local"] = {};
   const cfg = await readWorkspaceConfig();

@@ -57,7 +57,7 @@ export function registerExtraPathsTools(server: McpServer): void {
       "--extra-model-paths-config, else the extra_model_paths.yaml beside its main.py), falling " +
       "back to the local heuristic only when no server is reachable — <ComfyUI root>/" +
       "extra_model_paths.yaml (COMFYUI_PATH, else the saved default workspace from " +
-      "set_default_workspace) or the Desktop app-data extra_models_config.yaml. Reports generic " +
+      "workspace action:\"set_default\") or the Desktop app-data extra_models_config.yaml. Reports generic " +
       "categories, so model categories and custom_nodes entries are both visible when present. " +
       "Read-only.",
     targetArgs,

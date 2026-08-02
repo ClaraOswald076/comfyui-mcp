@@ -317,7 +317,7 @@ describe("models dir + extra-config argv parsing (#345/#346/#369)", () => {
     (config as { comfyuiPath?: string }).comfyuiPath = undefined;
     savedDefaultWorkspace = undefined;
     getSystemStats.mockRejectedValue(new Error("ECONNREFUSED"));
-    await expect(resolveModelsDir()).rejects.toThrow(/set_default_workspace/);
+    await expect(resolveModelsDir()).rejects.toThrow(/workspace \(action:"set_default"\)/);
   });
 
   it("resolves a RELATIVE --base-directory against the SERVER cwd, not the MCP cwd", () => {

@@ -113,6 +113,9 @@ const SELF = new Set([
   // Same, for 0.49.0 slice 5: asserts as FIXTURES that the three retired
   // model_metadata_* names are in DEAD_NAMES with `model_metadata` replacements.
   "src/__tests__/tools/model-explorer.test.ts",
+  // Same, for 0.49.0 slice 6: asserts as FIXTURES that the three retired
+  // workspace names are in DEAD_NAMES with `workspace` replacements.
+  "src/__tests__/tools/workspace-env.test.ts",
   // Same, for the #659 retired-name error: these pass dead names to call_tool /
   // the ollama dispatch as FIXTURES and assert the error quotes the ledger's
   // replacement — the names are call arguments under test, not live guidance.

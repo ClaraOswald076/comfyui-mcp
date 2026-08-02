@@ -149,8 +149,8 @@ export interface LocalModel {
  * Resolve the local ComfyUI base directory for filesystem operations. Prefers
  * COMFYUI_PATH / auto-detection (config.comfyuiPath); when that's unset and we're
  * NOT targeting a remote ComfyUI, falls back to the saved default workspace (set
- * via set_default_workspace) so local downloads and model lookups work without
- * COMFYUI_PATH — matching what get_environment / get_workspace already report.
+ * via workspace action:"set_default") so local downloads and model lookups work without
+ * COMFYUI_PATH — matching what get_environment / workspace action:"get" already report.
  * Never falls back to a local workspace in remote mode (that dir isn't the remote
  * target). Returns undefined when no usable local path exists.
  */
@@ -188,7 +188,7 @@ function getModelsRoot(): string {
   if (!base) {
     throw new ModelError(
       "No local ComfyUI path configured. Set the COMFYUI_PATH environment variable, " +
-        "or save a default workspace with set_default_workspace.",
+        "or save a default workspace with workspace (action:\"set_default\").",
     );
   }
   return join(base, "models");
@@ -955,7 +955,7 @@ export async function resolveExistingModelFile(
       "No local ComfyUI path configured. Locating/removing a local model operates on " +
         "the local filesystem and is unavailable when targeting a remote ComfyUI. " +
         "Set the COMFYUI_PATH environment variable, or save a default workspace with " +
-        "set_default_workspace.",
+        "workspace (action:\"set_default\").",
     );
   }
   const raw = (relativePath ?? "").trim();
