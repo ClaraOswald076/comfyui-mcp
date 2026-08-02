@@ -26,6 +26,7 @@ import { SelfRestarter } from "../services/self-restart.js";
 import {
   SessionStore,
   armableResume,
+  carryWorkflowCommandStamp,
   deriveStableKey,
   destinationHasCollisionState,
   keepsBackendState,
@@ -2796,7 +2797,11 @@ export async function runPanelOrchestrator(): Promise<void> {
           const carriedStable = tabStableKey.get(migratedFrom);
           tabStableKey.delete(migratedFrom);
           tabStableIdentity.delete(migratedFrom);
-          tabCommandWorkflowUuid.delete(migratedFrom);
+          // #436 — the command stamp is the ONE per-tab map that must NOT be retired
+          // here: carry it onto the old id (same uuid — sameWorkflow proved it). See
+          // carryWorkflowCommandStamp for why deleting it flapped sessions still
+          // bound to the pre-migration id into read-ok / write-refused.
+          carryWorkflowCommandStamp(tabCommandWorkflowUuid, migratedFrom, newIdentity!);
           if (carriedStable !== undefined) {
             if (panelTab.startsWith("tmp:")) tabStableKey.set(panelTab, carriedStable);
             else sessionStore.clearStable(carriedStable);

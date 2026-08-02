@@ -151,6 +151,33 @@ export function deriveWorkflowIdentity(opts: {
   return p ? `${p.origin}::${p.uuid}` : undefined;
 }
 
+/** #436 — on a PROVEN same-workflow tab-id migration (the hello handler has already
+ *  established prior uuid === new uuid), KEEP the per-tab command stamp resolvable
+ *  under the PRE-migration id, not only under the canonical new one. A session can
+ *  stay bound to the old id across the migration — a Codex HTTP MCP session's URL
+ *  names the spawn-time tab id and is never re-pointed (no rebindTab hook on that
+ *  transport) — and UiBridge.send resolves the trusted workflow-uuid stamp by the
+ *  CALLER's tab id. Deleting the old entry made every mutating command fail "no
+ *  trusted identity" while reads kept routing through the bridge's migration alias
+ *  (the #436 flap: panel_graph_outline succeeds, the next panel_add_node /
+ *  panel_set_widget is refused, and panel_set_workflow_target({mode:"current"})
+ *  reports success without repairing anything because canReach is true through the
+ *  alias). Only a manual browser refresh re-registered the tab under an id the
+ *  session could be rebound to.
+ *
+ *  Carrying is safe: the value is the SAME uuid by the proven-migration
+ *  precondition, so commands addressed to the old id stamp exactly what the panel
+ *  fences on; a later in-place replacement of the workflow keeps failing closed
+ *  (the panel refuses the stale uuid); and any hello registered under the old id
+ *  overwrites or clears the entry (fail closed). */
+export function carryWorkflowCommandStamp(
+  stamps: Map<string, string>,
+  migratedFrom: string,
+  identity: { uuid: string },
+): void {
+  stamps.set(migratedFrom, identity.uuid);
+}
+
 /** #570 — does the DESTINATION of a tab-id migration already hold state for a backend, so the
  *  incoming tab would inherit/leak it? Covers EVERY kind of per-backend state that must be reset
  *  before the source is rebound in: manager live/pending/held (`hasManagerState`), a dormant

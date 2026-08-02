@@ -17,6 +17,7 @@ import {
   isMutatingGraphCommand,
   requiresWorkflowStampEnforcement,
 } from "../../services/ui-bridge.js";
+import { carryWorkflowCommandStamp } from "../../orchestrator/session-store.js";
 
 // #570 P0c — classifier that decides which commands must pass the enforcement+stamp gate.
 describe("requiresWorkflowStampEnforcement (#570 P0c)", () => {
@@ -824,6 +825,91 @@ describe("UiBridge (multi-tab)", () => {
       expect(dispatchOutcomeOf(readErr)).toBe(false);
       expect(dispatchOutcomeOf(writeErr)).toBe(false);
       expect(readErr.message).toMatch(/no connected tab with id "wf:workflows\/x\.json"/);
+    });
+  });
+
+  // The trusted workflow-uuid stamp registry (orchestrator's tabCommandWorkflowUuid)
+  // is keyed by the CALLER's tab id, while command ROUTING resolves through the
+  // bridge's same-socket migration alias. A proven same-workflow migration (a save /
+  // rename, or a reconnect that re-registers the tab under a new id) used to retire
+  // the old id's stamp: a session still bound to the pre-migration id (a Codex HTTP
+  // MCP session is never re-pointed) kept reading through the alias while EVERY write
+  // was refused "no trusted identity" — and panel_set_workflow_target({mode:"current"})
+  // reported success without repairing anything (canReach is true through the alias).
+  // Only a browser refresh restored writes (#436 priority 3).
+  describe("the trusted stamp survives a proven same-workflow migration (#436.3)", () => {
+    it("a session bound to the pre-migration id keeps mutating once the stamp is carried", async () => {
+      // Wire the stamp registry exactly as the orchestrator does (caller-keyed map).
+      const stamps = new Map<string, string>();
+      bridge.setTabWorkflowUuidResolver((tabId) => stamps.get(tabId));
+      const UUID = "22222222-2222-4222-8222-222222222222";
+
+      const sock = await connectPanel();
+      const frames: Array<Record<string, unknown>> = [];
+      sock.on("message", (buf) => {
+        const m = JSON.parse(buf.toString());
+        if (m.rid && m.cmd) {
+          frames.push(m);
+          sock.send(JSON.stringify({ rid: m.rid, ok: true, result: { ok: true } }));
+        }
+      });
+
+      // 1) The panel connects on an UNSAVED tab with a trusted identity; the
+      //    hello handler records its stamp and an agent session binds to the id.
+      sock.send(
+        JSON.stringify({
+          type: "hello",
+          tab_id: "tmp:unsaved",
+          title: "Unsaved Workflow",
+          enforces_workflow_stamp: true,
+          enforces_workflow_stamp_at_write: true,
+          workflow_uuid: UUID,
+        }),
+      );
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+      stamps.set("tmp:unsaved", UUID);
+      const before = await bridge.send({ cmd: "graph_add_node" }, { tabId: "tmp:unsaved" });
+      expect(before).toMatchObject({ ok: true });
+      expect(frames.pop()?.workflow_uuid).toBe(UUID);
+
+      // 2) The user saves: the SAME socket re-hellos under the new wf: id — a
+      //    PROVEN same-workflow migration (identical uuid). Reads keep routing to
+      //    the live tab through the migration alias…
+      sock.send(
+        JSON.stringify({
+          type: "hello",
+          tab_id: "wf:saved.json",
+          title: "saved",
+          enforces_workflow_stamp: true,
+          enforces_workflow_stamp_at_write: true,
+          workflow_uuid: UUID,
+        }),
+      );
+      await vi.waitFor(() => {
+        expect(bridge.tabs()).toHaveLength(1);
+        expect(bridge.tabs()[0].tab_id).toBe("wf:saved.json");
+      });
+      stamps.set("wf:saved.json", UUID); // the hello handler records the new id's stamp
+
+      // …but when the migration RETIRES the old id's stamp (the pre-fix behavior),
+      // the still-bound session reads fine while EVERY write is refused — the flap.
+      // Pinned here so the gate keeps failing closed whenever no stamp resolves.
+      stamps.delete("tmp:unsaved");
+      const read = await bridge.send({ cmd: "graph_outline" }, { tabId: "tmp:unsaved" });
+      expect(read).toMatchObject({ ok: true }); // reads ride the alias
+      await expect(
+        bridge.send({ cmd: "graph_add_node" }, { tabId: "tmp:unsaved" }),
+      ).rejects.toThrow(/no trusted identity/);
+
+      // 3) The fix: the proven migration CARRIES the stamp (the exact call the
+      //    hello handler now makes) — the session writes again without a browser
+      //    refresh, stamped with the SAME trusted uuid the panel fences on.
+      carryWorkflowCommandStamp(stamps, "tmp:unsaved", { uuid: UUID });
+      const after = await bridge.send({ cmd: "graph_add_node" }, { tabId: "tmp:unsaved" });
+      expect(after).toMatchObject({ ok: true });
+      expect(frames.pop()?.workflow_uuid).toBe(UUID);
+
+      sock.close();
     });
   });
 

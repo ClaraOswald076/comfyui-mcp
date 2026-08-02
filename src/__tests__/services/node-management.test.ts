@@ -857,11 +857,47 @@ describe("node-management service", () => {
   // ---- update ------------------------------------------------------------
 
   describe("updateCustomNode", () => {
+    // Post-op presence verification (#730): a single-pack update re-queries
+    // /customnode/installed after the drain and fails unless the pack resolves
+    // SOMEWHERE, so success-path tests must report the pack as installed.
+    const installedMyPack = {
+      "my-pack": { ver: "1.0.0", cnr_id: "my-pack", enabled: true },
+    };
+
     it("updates a single pack via an update task", async () => {
-      const { calls } = stubFetch();
+      const { calls } = stubFetch({ installedBody: installedMyPack });
       await updateCustomNode({ id: "my-pack" });
       const { params } = taskOf(calls, "update");
       expect(params).toMatchObject({ node_name: "my-pack" });
+    });
+
+    it("fails truthfully for an id that resolves NOWHERE (#730: queue-drain is not proof)", async () => {
+      // Live evidence: the Manager drains "done" with total_count 0 for an
+      // unknown id, and update used to report "Queued + updated" anyway. The
+      // pack resolves nowhere post-op → hard failure, no success claim.
+      stubFetch({ installedBody: {} });
+      const err = await updateCustomNode({ id: "mcp-sweep-nonexistent-pack" }).catch(
+        (e: Error) => e,
+      );
+      expect(err).toBeInstanceOf(NodeManagementError);
+      expect((err as Error).message).toMatch(/not present afterward/);
+      expect((err as Error).message).not.toMatch(/updated/i);
+    });
+
+    it("still succeeds for an installed-but-not-in-registry (git-cloned) pack", async () => {
+      // The #730 gate must not break packs the registry does not know: they
+      // match the installed list by module/auxId spellings.
+      const { calls } = stubFetch({
+        installedBody: {
+          "some-git-node": { ver: "abc1234", aux_id: "user/some-git-node", enabled: true },
+        },
+      });
+      const res = await updateCustomNode({ id: "user/some-git-node" });
+      expect(res.mechanism).toBe("manager-http");
+      expect(res.message).toMatch(/Queued \+ updated/);
+      expect(taskOf(calls, "update").params).toMatchObject({
+        node_name: "user/some-git-node",
+      });
     });
 
     it("routes 'all' to /v2/manager/queue/update_all with QUERY params (not body)", async () => {
@@ -884,8 +920,15 @@ describe("node-management service", () => {
   // ---- reinstall ---------------------------------------------------------
 
   describe("reinstallCustomNode", () => {
+    // Same #730 post-op presence gate as update (reinstall is uninstall +
+    // install — for a nowhere-resolving id BOTH cycles no-op and both drains
+    // pass trivially), so the success path must report the pack as installed.
+    const installedMyPack = {
+      "my-pack": { ver: "1.0.0", cnr_id: "my-pack", enabled: true },
+    };
+
     it("models reinstall as an uninstall task followed by an install task", async () => {
-      const { calls } = stubFetch();
+      const { calls } = stubFetch({ installedBody: installedMyPack });
       await reinstallCustomNode({ id: "my-pack" });
       expect(taskOf(calls, "uninstall").params).toMatchObject({
         node_name: "my-pack",
@@ -894,6 +937,27 @@ describe("node-management service", () => {
         id: "my-pack",
         version: "latest",
       });
+    });
+
+    it("fails truthfully for an id that resolves NOWHERE (#730)", async () => {
+      stubFetch({ installedBody: {} });
+      const err = await reinstallCustomNode({ id: "mcp-sweep-nonexistent-pack" }).catch(
+        (e: Error) => e,
+      );
+      expect(err).toBeInstanceOf(NodeManagementError);
+      expect((err as Error).message).toMatch(/not present afterward/);
+      expect((err as Error).message).not.toMatch(/reinstalled/i);
+    });
+
+    it("still succeeds for an installed-but-not-in-registry (git-cloned) pack", async () => {
+      stubFetch({
+        installedBody: {
+          "some-git-node": { ver: "abc1234", aux_id: "user/some-git-node", enabled: true },
+        },
+      });
+      const res = await reinstallCustomNode({ id: "some-git-node" });
+      expect(res.mechanism).toBe("manager-http");
+      expect(res.message).toMatch(/Queued \+ reinstalled/);
     });
   });
 
@@ -1210,7 +1274,10 @@ describe("node-management service", () => {
     });
 
     it("routes update / fix to the per-operation legacy endpoints", async () => {
-      const { calls } = stubLegacyFetch();
+      const { calls } = stubLegacyFetch({
+        // #730: the single-pack update re-reads the installed list post-op.
+        installedBody: { "comfyui-foo": { ver: "1.0.0", cnr_id: "comfyui-foo", enabled: true } },
+      });
       await updateCustomNode({ id: "comfyui-foo" });
       await fixCustomNode({ id: "comfyui-foo" });
       expect(legacyCallTo(calls, "/manager/queue/update")?.body).toMatchObject({
@@ -1238,7 +1305,14 @@ describe("node-management service", () => {
     });
 
     it("caches detection per target (one probe, not one per operation)", async () => {
-      const { calls } = stubLegacyFetch();
+      const { calls } = stubLegacyFetch({
+        // #730: both packs must resolve post-op; the installed-list re-read
+        // reuses the cached detection, so it adds no probe.
+        installedBody: {
+          a: { ver: "1.0.0", enabled: true },
+          b: { ver: "1.0.0", enabled: true },
+        },
+      });
       await updateCustomNode({ id: "a" });
       await updateCustomNode({ id: "b" });
       const probes = calls.filter(
@@ -1279,7 +1353,10 @@ describe("node-management service", () => {
     });
 
     it("third-party pack update is unchanged by the self-update routing", async () => {
-      const { calls } = stubLegacyFetch();
+      const { calls } = stubLegacyFetch({
+        // #730: the pack must resolve on the post-op presence re-read.
+        installedBody: { "rgthree-comfy": { ver: "1.0.0", cnr_id: "rgthree-comfy", enabled: true } },
+      });
       mockedExists.mockReturnValue(true);
       const res = await updateCustomNode({ id: "rgthree-comfy" });
       expect(res.mechanism).toBe("manager-http");
@@ -1485,13 +1562,15 @@ describe("node-management service", () => {
   describe("v2 task 405 → v2-batch negotiation (issue #464)", () => {
     /** Stub a build whose /v2 queue surface answers status but 405s the unified
      *  task route, with `is_legacy_manager_ui` absent (catchall HTML). */
-    function stub464Fetch(opts: { failed?: unknown[] } = {}) {
+    function stub464Fetch(opts: { failed?: unknown[]; installedBody?: unknown } = {}) {
       const calls: Call[] = [];
       const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
         const method = init?.method ?? "GET";
         const body = init?.body ? JSON.parse(init.body as string) : undefined;
         calls.push({ url, method, body });
         const path = new URL(url).pathname;
+        // #730: single-pack updates re-read the installed list post-op.
+        if (path.startsWith("/v2/customnode/installed")) return jsonResponse(opts.installedBody ?? {});
         if (path === "/v2/manager/queue/status") {
           return jsonResponse({ total_count: 1, done_count: 1, in_progress_count: 0, is_processing: false });
         }
@@ -1519,7 +1598,9 @@ describe("node-management service", () => {
     }
 
     it("panel_update_node succeeds via batch when /v2 task 405s (no raw 405 surfaced)", async () => {
-      const { calls } = stub464Fetch();
+      const { calls } = stub464Fetch({
+        installedBody: { "my-pack": { ver: "1.0.0", cnr_id: "my-pack", enabled: true } },
+      });
       const res = await updateCustomNode({ id: "my-pack" });
       expect(res.mechanism).toBe("manager-http");
       // Downgraded to the batch envelope with the 3.x update body …
@@ -1534,7 +1615,12 @@ describe("node-management service", () => {
     });
 
     it("caches the corrected v2-batch dialect (second op skips the dead task route)", async () => {
-      const { calls } = stub464Fetch();
+      const { calls } = stub464Fetch({
+        installedBody: {
+          "pack-a": { ver: "1.0.0", enabled: true },
+          "pack-b": { ver: "1.0.0", enabled: true },
+        },
+      });
       await updateCustomNode({ id: "pack-a" });
       const taskHitsAfterFirst = calls.filter(
         (c) => new URL(c.url).pathname === "/v2/manager/queue/task",
@@ -1561,6 +1647,14 @@ describe("node-management service", () => {
         const body = init?.body ? JSON.parse(init.body as string) : undefined;
         calls.push({ url, method, body });
         const path = new URL(url).pathname;
+        // #730: the post-op presence re-read (pack-a's op fails at the batch,
+        // pack-b's succeeds and must resolve SOMEWHERE).
+        if (path.startsWith("/v2/customnode/installed")) {
+          return jsonResponse({
+            "pack-a": { ver: "1.0.0", enabled: true },
+            "pack-b": { ver: "1.0.0", enabled: true },
+          });
+        }
         if (path === "/v2/manager/queue/status") {
           return jsonResponse({ total_count: 1, done_count: 1, in_progress_count: 0, is_processing: false });
         }
@@ -1598,6 +1692,10 @@ describe("node-management service", () => {
         const body = init?.body ? JSON.parse(init.body as string) : undefined;
         calls.push({ url, method, body });
         const path = new URL(url).pathname;
+        // #730: the post-op presence re-read must find the pack.
+        if (path.startsWith("/v2/customnode/installed")) {
+          return jsonResponse({ "my-pack": { ver: "1.0.0", cnr_id: "my-pack", enabled: true } });
+        }
         if (path === "/v2/manager/queue/status") {
           return jsonResponse({ total_count: 1, done_count: 1, in_progress_count: 0, pending_count: 0, is_processing: false });
         }
