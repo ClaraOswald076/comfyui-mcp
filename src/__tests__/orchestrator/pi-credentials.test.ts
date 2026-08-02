@@ -232,7 +232,7 @@ describe("auth.json records", () => {
     }
   });
 
-  it("a stored google-vertex record suppresses ambient ADC too", () => {
+  it("a keyless stored google-vertex record falls through to ambient ADC", () => {
     const keyFile = join(tmp, "sa.json");
     writeFileSync(keyFile, "{}");
     const adcEnv = {
@@ -241,10 +241,10 @@ describe("auth.json records", () => {
       GOOGLE_APPLICATION_CREDENTIALS: keyFile,
     };
     expect(piCredentialPresent(tmp, bareEnv(adcEnv))).toBe(true);
-    // A stored (but unusable) google-vertex record owns the provider, so pi
-    // never consults ADC for it.
+    // pi's resolver checks `if (key)`; an empty stored key is keyless and must
+    // therefore use the valid ADC fallback rather than suppressing it.
     writePiFile(tmp, "auth.json", '{"google-vertex":{"type":"api_key","key":""}}');
-    expect(piCredentialPresent(tmp, bareEnv(adcEnv))).toBe(false);
+    expect(piCredentialPresent(tmp, bareEnv(adcEnv))).toBe(true);
   });
 
   it("CLOUDFLARE_API_KEY alone is not a credential — the account id is required", () => {

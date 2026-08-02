@@ -285,11 +285,11 @@ export function authRecordUsable(
       return credentialValueUsable(record.key, entryEnv, procEnv) || piBedrockCredentialUsable(entryEnv, procEnv);
     }
     // pi's Vertex `/login` writes `{type:"api_key", env:{GOOGLE_CLOUD_PROJECT, …}}`
-    // with NO `key`, and its resolver does `credential?.key ?? env(...)` then
+    // with a falsy `key`, and its resolver tests `if (key)` before falling
     // falls back to ADC. So a keyless vertex record IS a credential when the ADC
     // trio resolves (from the record's own env first, then the process env) — it
     // used to read as "not signed in" for a working Vertex login.
-    if (record.key === undefined && provider === "google-vertex") {
+    if (!record.key && provider === "google-vertex") {
       // google-vertex reads `credential.key ?? ctx.env(...)`: scoped `env` does
       // not supply GOOGLE_CLOUD_API_KEY, and only the process env is ambient.
       if (credentialValueUsable(procEnv.GOOGLE_CLOUD_API_KEY, undefined, procEnv))
