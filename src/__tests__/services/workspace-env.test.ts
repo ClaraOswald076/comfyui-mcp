@@ -130,15 +130,17 @@ describe("resolveInstallInterpreter (#651)", () => {
     }
   });
 
-  it("keeps the prior layout result when no server is reachable", async () => {
+  it("refuses when no server is reachable rather than installing into a layout guess", async () => {
     const root = await tmpDir();
     try {
-      const python = await makeVenvPython(root);
+      await makeVenvPython(root);
       mockGetSystemStats.mockRejectedValue(new Error("ECONNREFUSED"));
 
       const result = await resolveInstallInterpreter(root);
 
-      expect(result).toMatchObject({ python, source: "unverified" });
+      expect(result.source).toBe("undetermined");
+      expect(result.python).toBeUndefined();
+      expect(result.reason).toContain("Cannot verify the running server's interpreter");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -193,6 +195,54 @@ describe("resolveInstallInterpreter (#651)", () => {
       });
     } finally {
       resetLocalComfyUILaunchState();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses in remote mode: a local install would not affect the remote server", async () => {
+    const root = await tmpDir();
+    try {
+      await makeVenvPython(root);
+      h.remoteMode.value = true;
+
+      const result = await resolveInstallInterpreter(root);
+
+      expect(result.source).toBe("undetermined");
+      expect(result.python).toBeUndefined();
+      expect(result.reason).toContain("remote");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses when the running server does not report a resolvable main.py location", async () => {
+    const root = await tmpDir();
+    try {
+      await makeVenvPython(root);
+      mockGetSystemStats.mockResolvedValue({ system: { argv: ["--port", "8188"] } });
+
+      const result = await resolveInstallInterpreter(root);
+
+      expect(result.source).toBe("undetermined");
+      expect(result.python).toBeUndefined();
+      expect(result.reason).toContain("main.py");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("honors an explicit COMFYUI_PYTHON override even when nothing is reachable", async () => {
+    const root = await tmpDir();
+    try {
+      process.env.COMFYUI_PYTHON = "C:/explicit/python.exe";
+      mockGetSystemStats.mockRejectedValue(new Error("ECONNREFUSED"));
+
+      await expect(resolveInstallInterpreter(root)).resolves.toMatchObject({
+        python: "C:/explicit/python.exe",
+        source: "override",
+      });
+    } finally {
+      delete process.env.COMFYUI_PYTHON;
       await rm(root, { recursive: true, force: true });
     }
   });

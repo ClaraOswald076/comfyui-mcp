@@ -531,7 +531,7 @@ function pythonVersionsAgree(a: string | undefined, b: string | undefined): bool
 // Install interpreter resolution (#651)
 // ---------------------------------------------------------------------------
 
-export type InstallInterpreterSource = "override" | "launched" | "unverified" | "undetermined";
+export type InstallInterpreterSource = "override" | "launched" | "undetermined";
 
 export interface InstallInterpreterResolution {
   python?: string;
@@ -581,10 +581,12 @@ function targetsLiveInstall(serverRoot: string, requestedRoot: string | undefine
 /**
  * Resolve a package-install interpreter without claiming that a path-shaped guess is
  * the process that is currently serving ComfyUI.  A server that this MCP launched is
- * authoritative because we recorded its executable.  For a separately launched live
- * server, /system_stats has no sys.executable, so even a single discovered `.venv`
- * may be unrelated (for example, the server can be using system Python). Refuse rather
- * than create an invisible successful-looking install.
+ * authoritative because we recorded its executable; an explicit COMFYUI_PYTHON is the
+ * operator's own claim.  In every other case the live interpreter is UNOBSERVABLE —
+ * /system_stats has no sys.executable, so even a single discovered `.venv` may be
+ * unrelated (for example, the server can be using system Python).  FAIL CLOSED:
+ * refuse rather than report an install into a layout-guessed env as applied when the
+ * running server may not be able to import from it (#651).
  */
 export async function resolveInstallInterpreter(
   root: string | undefined,
@@ -594,19 +596,25 @@ export async function resolveInstallInterpreter(
     return { python: override, source: "override", reason: `Using "${override}" because COMFYUI_PYTHON is set.` };
   }
 
-  const fallback = resolveRootInterpreter(root);
-  const fallbackResult = (why: string): InstallInterpreterResolution => ({
-    python: fallback,
-    source: "unverified",
-    reason: `Using "${fallback}" selected by install layout; ${why}. It is not confirmed as the running server's interpreter.`,
+  const refuse = (reason: string): InstallInterpreterResolution => ({
+    source: "undetermined",
+    reason,
   });
-  if (isRemoteMode()) return fallbackResult("the connected ComfyUI is remote");
+  if (isRemoteMode()) {
+    return refuse(
+      "Cannot verify the running server's interpreter: the connected ComfyUI is remote, " +
+        "so a package installed locally would not affect it.",
+    );
+  }
 
   let system: { argv?: string[]; cwd?: string } | undefined;
   try {
     system = (await getSystemStats()).system as { argv?: string[]; cwd?: string };
   } catch {
-    return fallbackResult("no local running ComfyUI was reachable");
+    return refuse(
+      "Cannot verify the running server's interpreter: no local ComfyUI is reachable. " +
+        "Start ComfyUI or connect to it first.",
+    );
   }
   const serverRoot = liveRootForInstall(system?.argv, system?.cwd, root);
   const launched = getLaunchedLocalInterpreter();
@@ -617,21 +625,22 @@ export async function resolveInstallInterpreter(
       reason: `Using "${launched}", the exact interpreter this MCP server used to start the running ComfyUI.`,
     };
   }
-  if (!serverRoot) return fallbackResult("the running ComfyUI did not report a resolvable main.py location");
-  if (!targetsLiveInstall(serverRoot, root)) {
-    return {
-      source: "undetermined",
-      reason:
-        `Refusing to install: the running ComfyUI is a different install ("${serverRoot}") ` +
-        `than the requested path. Installing into the requested layout would not affect the live server.`,
-    };
+  if (!serverRoot) {
+    return refuse(
+      "Cannot verify the running server's interpreter: the running ComfyUI did not report " +
+        "a resolvable main.py location.",
+    );
   }
-  return {
-    source: "undetermined",
-    reason:
-      `Cannot determine which interpreter the running ComfyUI at "${serverRoot}" uses: ` +
-      `/system_stats does not expose sys.executable, so an interpreter discovered from its layout is unconfirmed.`,
-  };
+  if (!targetsLiveInstall(serverRoot, root)) {
+    return refuse(
+      `The running ComfyUI is a different install ("${serverRoot}") than the requested path; ` +
+        "installing into the requested layout would not affect the live server.",
+    );
+  }
+  return refuse(
+    `Cannot determine which interpreter the running ComfyUI at "${serverRoot}" uses: ` +
+      "/system_stats does not expose sys.executable, so an interpreter discovered from its layout is unconfirmed.",
+  );
 }
 
 async function probePipPackages(
