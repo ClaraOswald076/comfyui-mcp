@@ -186,6 +186,20 @@ export function evaluatePanelSync(
   };
   const orch = orchestratorVersion ? `comfyui-mcp ${orchestratorVersion}` : "this orchestrator";
 
+  // The skill PROMISES visible drift when a user sits on a pinned version —
+  // that warning is owed in every state, including the early-return ones
+  // (remote / dev install), not only on paths that could act.
+  const driftNote = (() => {
+    if (!pin.pinned || pin.indeterminate) return "";
+    if (!status.installedVersion || !isComparableVersion(status.installedVersion)) return "";
+    if (compareSemver(status.installedVersion, required) >= 0) return "";
+    return (
+      ` NOTE: the panel is ${describePanelPin(pin)} and BEHIND what ${orch} ` +
+        `expects (${status.installedVersion} < ${required}) — left untouched; ` +
+        `unpin with install_panel(action='unpin') to close the gap.`
+    );
+  })();
+
   if (!status.applicable) {
     return {
       ...base,
@@ -193,7 +207,8 @@ export function evaluatePanelSync(
       behind: false,
       summary:
         `Panel sync does not apply here: ${status.note || "no local ComfyUI is configured"}. ` +
-        `The panel pack is managed on the machine that runs ComfyUI.`,
+        `The panel pack is managed on the machine that runs ComfyUI.` +
+        driftNote,
     };
   }
 
@@ -207,7 +222,8 @@ export function evaluatePanelSync(
       behind: false,
       summary:
         `The panel at ${status.dir ?? "custom_nodes"} is a dev symlink — update it ` +
-        `through its own git checkout. Nothing here will modify it.`,
+        `through its own git checkout. Nothing here will modify it.` +
+        driftNote,
     };
   }
 
