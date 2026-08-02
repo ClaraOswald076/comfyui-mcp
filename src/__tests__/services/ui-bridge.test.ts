@@ -98,10 +98,17 @@ function connectPanel(tabId?: string, title = "workflow-a"): Promise<WebSocket> 
     const sock = new WebSocket(`ws://127.0.0.1:${port}`);
     sock.on("open", () => {
       if (tabId) {
-        // Current panels advertise stamp enforcement, so a mutating graph command is not gated
-        // (#570 P0c). Tests exercising the OLD-panel gate hello WITHOUT this flag explicitly.
+        // Current panels advertise both the dispatch and after-await write-boundary
+        // workflow-stamp checks, so a mutating graph command is not gated (#570/#718).
+        // Tests exercising an old-panel gate omit one of these flags explicitly.
         sock.send(
-          JSON.stringify({ type: "hello", tab_id: tabId, title, enforces_workflow_stamp: true }),
+          JSON.stringify({
+            type: "hello",
+            tab_id: tabId,
+            title,
+            enforces_workflow_stamp: true,
+            enforces_workflow_stamp_at_write: true,
+          }),
         );
       }
       resolve(sock);
@@ -1321,7 +1328,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     expect(frames.find((f) => f.cmd === "graph_add_node")?.workflow_uuid).toBe("uuid-A");
 
     // Same socket switches to workflow B (migration alias tmp:A → tmp:B).
-    desktop.send(JSON.stringify({ type: "hello", tab_id: "tmp:B", title: "B", enforces_workflow_stamp: true }));
+    desktop.send(JSON.stringify({ type: "hello", tab_id: "tmp:B", title: "B", enforces_workflow_stamp: true, enforces_workflow_stamp_at_write: true }));
     await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:B")).toBe(true));
 
     // A late command still ISSUED FOR A (its agent's tab id) must stamp A's uuid — even though
@@ -1449,7 +1456,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     });
     await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:sA")).toBe(true));
     // Same-socket switch to a different workflow.
-    desktop.send(JSON.stringify({ type: "hello", tab_id: "tmp:sB", title: "B", enforces_workflow_stamp: true }));
+    desktop.send(JSON.stringify({ type: "hello", tab_id: "tmp:sB", title: "B", enforces_workflow_stamp: true, enforces_workflow_stamp_at_write: true }));
     await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:sB")).toBe(true));
     // A late command issued for A resolves onto B's socket — with no trusted uuid it is refused,
     // never written unstamped to B.
@@ -1476,6 +1483,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
         tab_id: "tmp:capable",
         title: "no-stamp",
         enforces_workflow_stamp: true,
+        enforces_workflow_stamp_at_write: true,
       }),
     );
     await vi.waitFor(() => expect(bridge.tabCanMutateGraph("tmp:capable")).toBe(false));
@@ -1501,6 +1509,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
         tab_id: "wf:shared.json",
         title: "shared",
         enforces_workflow_stamp: true,
+        enforces_workflow_stamp_at_write: true,
         tab_session_id: "browser-tab-original",
       }),
     );
@@ -1518,6 +1527,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
             tab_id: "wf:shared.json",
             title: "same saved workflow, different browser tab",
             enforces_workflow_stamp: true,
+            enforces_workflow_stamp_at_write: true,
             tab_session_id: "browser-tab-other",
           }),
         );
@@ -1597,7 +1607,36 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "old-skew")).toBe(true));
     await expect(
       bridge.send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "old-skew" }),
-    ).rejects.toThrow(/detected panel 0\.11\.0.*requires panel 0\.11\.30\+.*install_panel\(action:'update'\).*restart ComfyUI.*rebinding cannot/i);
+    ).rejects.toThrow(/detected panel 0\.11\.0.*requires panel 0\.11\.35\+.*install_panel\(action:'update'\).*restart ComfyUI.*rebinding cannot/i);
+    old.close();
+  });
+
+  it("FAILS CLOSED when a panel has only the pre-await stamp fence (#718)", async () => {
+    const old = new WebSocket(`ws://127.0.0.1:${port}`);
+    await new Promise<void>((res, rej) => {
+      old.on("open", () => {
+        // 0.11.34 and earlier advertise the original dispatch-time fence, but
+        // graph_set_widget can await fresh metadata and write after a user switch.
+        old.send(
+          JSON.stringify({
+            type: "hello",
+            tab_id: "tmp:pre-write-fence",
+            title: "old widget fence",
+            panel_version: "0.11.34",
+            enforces_workflow_stamp: true,
+          }),
+        );
+        res();
+      });
+      old.on("error", rej);
+    });
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:pre-write-fence")).toBe(true));
+    expect(bridge.tabCanMutateGraph("tmp:pre-write-fence")).toBe(false);
+    await expect(
+      bridge.send({ cmd: "graph_set_widget", node_id: 7, widget: "steps", value: 30 } as never, {
+        tabId: "tmp:pre-write-fence",
+      }),
+    ).rejects.toThrow(/does not recheck workflow targeting at the graph write boundary.*0\.11\.35.*hard-refresh/i);
     old.close();
   });
 
@@ -2249,6 +2288,7 @@ describe("UiBridge.send (graceful gate end-to-end)", () => {
         title: "wf",
         panel_version: "0.6.8",
         enforces_workflow_stamp: true,
+        enforces_workflow_stamp_at_write: true,
       }),
     );
     sock.on("message", (buf) => {
