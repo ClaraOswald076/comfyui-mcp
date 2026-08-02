@@ -2529,7 +2529,7 @@ export async function runPanelOrchestrator(): Promise<void> {
             // outcome is actionable: synced => restart, pinned => unpin first,
             // blocked/unknown/dev => its truthful recovery guidance.
             if (sync.decision === "up-to-date" || sync.decision === "not-applicable") return;
-            bridge.push({ type: "say", text: `âš ï¸ ${sync.message}` }, panelTab);
+            bridge.push({ type: "say", text: `⚠️ ${sync.message}` }, panelTab);
             logger.info(
               `[panel-orchestrator] panel sync on hello for ${panelTab.slice(0, 8)}: ` +
                 `${sync.decision}${sync.synced ? ` (verified ${sync.verifiedVersion ?? "unknown"})` : ""}`,
@@ -2544,7 +2544,7 @@ export async function runPanelOrchestrator(): Promise<void> {
               {
                 type: "say",
                 text:
-                  `âš ï¸ Could not automatically sync the ComfyUI-MCP panel; no update was claimed. ` +
+                  `⚠️ Could not automatically sync the ComfyUI-MCP panel; no update was claimed. ` +
                   `Run install_panel(action:'status') to inspect it, then retry install_panel(action:'sync') if appropriate. (${detail})`,
               },
               panelTab,
