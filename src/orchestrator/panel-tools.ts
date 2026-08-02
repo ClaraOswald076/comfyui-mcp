@@ -3569,7 +3569,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_add_node",
-      "Add a node to the user's OPEN ComfyUI graph by class_type (e.g. 'KSampler', 'CheckpointLoaderSimple'). The user sees it appear live; Ctrl+Z undoes it. Returns the created node's id, slots, and default widget values.",
+      "Add a node to the user's OPEN ComfyUI graph by class_type (e.g. 'KSampler', 'CheckpointLoaderSimple'). The user sees it appear live; Ctrl+Z undoes it. Returns the created node's id, slots, and default widget values. Frontend-only virtual types are addable too: 'Note' and 'MarkdownNote' — the supported way to ANNOTATE a workflow with on-canvas instructions (add the node, then put the text in its 'text' widget via panel_set_widget) — plus 'Reroute' and 'PrimitiveNode'. These are LiteGraph-native and never appear in the backend node registry, so they legitimately bypass the backend class_type check.",
       {
         class_type: z.string().describe("Exact ComfyUI node class_type to create."),
         pos: xy()
