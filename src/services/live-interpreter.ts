@@ -197,8 +197,15 @@ export function readProcessArgv0(pid: number): string | undefined {
  * lack Triton) is never mistaken for the server's. The same applies to a
  * tunnel/container-side forwarder, and to a second instance whose argv differs.
  *
- * Substring matching absorbs the quoting the OS adds around paths containing
- * spaces; Windows comparison is case- and separator-insensitive.
+ * Substring matching would absorb the quoting the OS adds around paths containing
+ * spaces, but it also lets `main.py` match `proxy-main.py` and `8188` match
+ * `81880` — a wrapper or neighbouring server could then pass its own venv off as
+ * ComfyUI's. So matching is TOKEN-aware: the command line is split on whitespace,
+ * surrounding quotes stripped, and each argv token must either equal a command-line
+ * token exactly or match its final path segment (relative `main.py` vs absolute
+ * `C:/ComfyUI/main.py`). Multi-word argv values (paths with spaces) fall back to a
+ * full substring check, since they cannot be tokenised. Windows comparison is
+ * case- and separator-insensitive.
  */
 export function commandLineMatchesArgv(
   commandLine: string | undefined,
@@ -206,10 +213,17 @@ export function commandLineMatchesArgv(
 ): boolean {
   if (!commandLine || !Array.isArray(argv) || argv.length === 0) return false;
   const norm = (s: string): string => (IS_WIN ? s.toLowerCase().replace(/\\/g, "/") : s);
+  const stripQuotes = (s: string): string => s.replace(/^["']+|["']+$/g, "");
   const hay = norm(commandLine);
+  const hayTokens = commandLine.split(/\s+/).map((t) => norm(stripQuotes(t)));
   const tokens = argv.filter((t): t is string => typeof t === "string" && t.trim() !== "");
   if (tokens.length === 0) return false;
-  return tokens.every((t) => hay.includes(norm(t.trim())));
+  return tokens.every((t) => {
+    const n = norm(stripQuotes(t.trim()));
+    if (n === "") return true;
+    if (n.includes(" ")) return hay.includes(n);
+    return hayTokens.some((h) => h === n || h.endsWith("/" + n));
+  });
 }
 
 // ---------------------------------------------------------------------------
