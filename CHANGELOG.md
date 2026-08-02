@@ -6,6 +6,53 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.49.1] - 2026-08-02
+
+### MCP
+
+#### Added
+- epoch-first session_epoch frame on every hello (#694) (#713)
+- explicit retry identity (retry_of) for outcome-unknown mutations (#694) (#704)
+- add atomic node editor
+
+#### Fixed
+- un-mangle the double-encoded ⚠️ in the panel sync say texts
+- carry the trusted workflow stamp across proven tab-id migrations
+- update/reinstall require post-op presence proof (no queue-drain trust)
+- codex gate — spawn cwd must be an existing DIRECTORY, not merely exist
+- restart_comfyui spawns with an explicit absolute cwd (no more main.py ENOENT)
+- codex-gate r9 — malformed pending_count is unproven; dialect probe targets the op's own base
+- codex-gate r8 — strict required fields in the proven signature; at-tip result honesty
+- codex-gate r7 — pin the merged rev end-to-end; strict empty-queue signature
+- codex-gate r6 — refuse pulls that would silently overwrite ignored files
+- codex-gate r5 — dialect gate via proven-legacy probe, honest result message
+- 'at upstream tip' requires HEAD === @{upstream} proof
+- the fallback's pre-pull revision gate — never mutate on an unprovable no-op
+- an unreadable post-pull HEAD revision fails closed — never 'at tip'
+- prove the panel dir IS the worktree root before any fallback mutation
+- gate the #724 git fallback on a clean worktree and one bound directory
+- git pull --ff-only fallback when legacy Manager 3.x no-ops a panel update (#724)
+- refresh workflow stamp after open (#716)
+- require at-write workflow fencing (#718)
+- reconcile download tray after restart
+- structure Model Explorer 404s (#363)
+- report stale graph capability after restart
+- sync handshake capability floor (#712)
+- preserve unrelated work on panel pin (#715)
+- pin write cancels pending update_all / snapshot restore (#689) (#702)
+- sync panel skew when desktop tab connects (#710)
+- preserve flatten load failures (#707)
+- use saved workspace for panel management (#705)
+- preserve legacy color compatibility
+- keep edit schemas Codex-compatible
+- align legacy color validation
+- validate edits and preserve legacy commands
+- preserve line breaks in generated tool descriptions (review nit)
+- measure non-string widget values by their real serialization (review nit)
+- route describe facade through call_tool (#693)
+- unclassified versions are never vouched in SFW search (#664 gate)
+
+
 ## [0.49.0] - 2026-08-02
 
 ### Highlights for 0.49.0
