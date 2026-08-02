@@ -581,6 +581,25 @@ describe("UiBridge (multi-tab)", () => {
     a.close();
   });
 
+  it("exposes the exact request id only after a command frame is written", async () => {
+    const a = await connectPanel("tab-aaaa-1111");
+    let frameRid: string | undefined;
+    a.on("message", (buf) => {
+      const frame = JSON.parse(buf.toString());
+      if (frame.cmd === "x") {
+        frameRid = frame.rid;
+        a.send(JSON.stringify({ rid: frame.rid, ok: true, result: { ok: true } }));
+      }
+    });
+    await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));
+    const observed: string[] = [];
+    await expect(
+      bridge.send({ cmd: "x" }, { onDispatchedRid: (rid) => observed.push(rid) }),
+    ).resolves.toMatchObject({ ok: true });
+    expect(observed).toEqual([frameRid]);
+    a.close();
+  });
+
   it("rejects in-flight commands when the target tab disconnects", async () => {
     const a = await connectPanel("tab-aaaa-1111");
     await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(1));

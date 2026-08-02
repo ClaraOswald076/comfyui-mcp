@@ -932,19 +932,16 @@ async function observeRecovery(
   return { ready: false, waited_ms: Date.now() - start, attempts, sawDown };
 }
 
-// ---- workflow_open verify-after-timeout (#215/#319/#496) --------------------
+// ---- workflow_open verify-after-timeout (#215/#319/#496/#661) --------------
 // `panel_open_workflow` forwards `workflow_open` over the UI bridge and waits for
 // the tab to ACK. When the target tab is BACKGROUNDED/FROZEN, or the workflow is
 // already the active one, the tab can be slow to ack and the bridge surfaces a
 // `did not reply to "workflow_open" within N ms` TIMEOUT — yet the switch itself
 // genuinely happened (the executor ran; the ack just didn't make it back in the
-// window). Reporting that as a failure is a FALSE FAILURE: a follow-up
-// `workflow_list` shows the target IS the active tab, and it invites unsafe
-// retries. Mirroring the reboot-readiness pattern (observeRecovery / #497), on
-// an ack-timeout we do NOT immediately fail — we VERIFY the AUTHORITATIVE active
-// workflow by polling `workflow_list` (a fresh bridge round-trip, never a stale
-// cache) and return SUCCESS with a `recovered` note if the target became active,
-// only failing when it genuinely never did.
+// window). `workflow_list.active` is only a selector, however: after reconnect it
+// can name the target whether this open ran, failed, or never arrived. Recovery is
+// therefore allowed only when the panel's #514 `last_open` receipt correlates to
+// this bridge request's exact rid and says that it was applied.
 
 /**
  * True only when a ToolResult is the bridge's ACK-TIMEOUT for a command — i.e.
@@ -976,6 +973,10 @@ function parseToolResultJson(res: ToolResult): Record<string, unknown> | null {
   } catch {
     return null;
   }
+}
+
+function toolResultText(res: ToolResult): string {
+  return res?.content?.find((c) => c.type === "text")?.text ?? "workflow_open failed";
 }
 
 // ---- panel_civitai_results inline sample thumbnails (#623) -------------------
@@ -1233,11 +1234,9 @@ function stripJsonExt(s: unknown): string | null {
 }
 
 /**
- * Does the AUTHORITATIVE active workflow (the `active` object from a fresh
- * `workflow_list`) correspond to the `path` the caller asked to open? Mirrors the
- * panel executor's own matcher: exact path/filename/key, or filename/path with a
- * trailing `.json` stripped (callers pass any of those forms). Null-active (no
- * open workflow) never matches.
+ * Does a panel-reported workflow identity correspond to `path`? This is an
+ * additional wrong-workflow guard around an exact receipt rid; it is never used
+ * alone to prove an open command happened.
  */
 function activeMatchesTarget(active: unknown, path: string): boolean {
   if (!active || typeof active !== "object") return false;
@@ -1269,19 +1268,32 @@ function getOpenVerifyTiming(): OpenVerifyTiming {
 }
 
 interface OpenVerifyResult {
-  active: boolean;
+  receipt: "applied" | "not_applied" | "unknown" | "unsupported" | "missing";
+  error?: string;
   waited_ms: number;
   attempts: number;
 }
 
+/** Exact resolved-path check for an open receipt. A filename/basename is not a
+ * workflow identity: `other/foo.json` must never confirm `wanted/foo.json`. */
+function resolvedOpenPathMatches(receipt: Record<string, unknown>, path: string): boolean {
+  const resolved = receipt.resolved;
+  if (!resolved || typeof resolved !== "object") return false;
+  const actual = (resolved as Record<string, unknown>).path;
+  if (typeof actual !== "string") return false;
+  const normalize = (value: string) => value.replace(/\\/g, "/").replace(/^\.\/+/, "").replace(/\/+/g, "/");
+  return normalize(actual) === normalize(path);
+}
+
 /**
- * Poll `workflow_list` until the target `path` is the active workflow, or the
- * bounded budget elapses. Each probe is a fresh bridge round-trip via ctx.call
- * (never throws; returns the AUTHORITATIVE live active identity, not a cache).
+ * Poll `workflow_list` for the #514 `last_open` receipt for this exact bridge rid.
+ * Active workflow state is deliberately ignored as recovery proof. Older panels
+ * without receipt fields are identified promptly and remain undetermined.
  */
-async function waitForWorkflowActive(
+async function waitForOpenReceipt(
   ctx: PanelToolCtx,
   path: string,
+  rid: string,
   timing: OpenVerifyTiming,
 ): Promise<OpenVerifyResult> {
   const start = Date.now();
@@ -1296,23 +1308,50 @@ async function waitForWorkflowActive(
     const probe = await ctx.call({ cmd: "workflow_list" }, probeTimeoutMs);
     attempts++;
     const parsed = parseToolResultJson(probe);
-    if (parsed && activeMatchesTarget(parsed.active, path)) {
-      return { active: true, waited_ms: Date.now() - start, attempts };
+    if (parsed) {
+      // #514 always includes active_confirmed, including when last_open is null.
+      // Its absence identifies an older panel which cannot make recovery claims.
+      if (!("active_confirmed" in parsed) && !("last_open" in parsed)) {
+        return { receipt: "unsupported", waited_ms: Date.now() - start, attempts };
+      }
+      const lastOpen = parsed.last_open;
+      if (lastOpen && typeof lastOpen === "object") {
+        const receipt = lastOpen as Record<string, unknown>;
+        if (receipt.rid === rid && receipt.answers_only_command_rid === rid && receipt.cmd === "workflow_open") {
+          // The exact RID identifies this command. Keep a target check as an
+          // accidental wrong-workflow guard; active itself is never proof.
+          if (!resolvedOpenPathMatches(receipt, path)) {
+            return { receipt: "unknown", waited_ms: Date.now() - start, attempts };
+          }
+          if (receipt.applied === true) {
+            return { receipt: "applied", waited_ms: Date.now() - start, attempts };
+          }
+          if (receipt.applied === false) {
+            return {
+              receipt: "not_applied",
+              error: typeof receipt.error === "string" ? receipt.error : undefined,
+              waited_ms: Date.now() - start,
+              attempts,
+            };
+          }
+          return { receipt: "unknown", waited_ms: Date.now() - start, attempts };
+        }
+      }
     }
     const left = deadline - Date.now();
     if (left <= 0) break;
     await sleep(Math.min(intervalMs, left));
   }
-  return { active: false, waited_ms: Date.now() - start, attempts };
+  return { receipt: "missing", waited_ms: Date.now() - start, attempts };
 }
 
 /**
  * `panel_open_workflow` body, shared across transports. Forwards `workflow_open`
  * and returns its reply verbatim on success or on a GENUINE failure (a normal
  * error reply, e.g. "no workflow matching"). Only on an ACK-TIMEOUT does it
- * verify the authoritative active workflow: SUCCESS (with a `recovered` note) if
- * the target became active despite the slow ack, otherwise the original timeout
- * failure. Never masks a genuine open-failure as success.
+ * verify the exact panel-side receipt: SUCCESS (with a `recovered` note) only when
+ * that receipt confirms this request was applied. Missing, stale, or old-panel
+ * receipts remain undetermined rather than fabricating success.
  */
 /** Terminal error for a MUTATING panel command when the pre-send reachability wait
  *  gave up (no tab reconnected within budget / an ambiguous multi-tab session). We
@@ -1336,30 +1375,56 @@ async function openWorkflowWithVerify(path: string, ctx: PanelToolCtx): Promise<
   if (ctx.awaitReachable && !(await ctx.awaitReachable())) {
     return noReachableTabFail("workflow_open");
   }
-  const res = await ctx.call({ cmd: "workflow_open", path }, 15000);
+  let dispatchedRid: string | undefined;
+  const res = await ctx.call(
+    { cmd: "workflow_open", path },
+    15000,
+    (rid) => {
+      dispatchedRid = rid;
+    },
+  );
   // Success, or a genuine acked error (missing file / real executor error) — the
   // caller must see it as-is. A slow-ack TIMEOUT or a mid-command reconnect DROP
-  // ("OUTCOME UNKNOWN", #402) both warrant verification: re-reading the active
-  // workflow is idempotent, so we can turn an UNKNOWN into a definite outcome.
+  // ("OUTCOME UNKNOWN", #402) both warrant a receipt lookup, which can turn an
+  // unknown outcome into a definite one without inferring from active state.
   if (!isAckTimeout(res) && !isReconnectDrop(res)) return res;
 
+  if (!dispatchedRid) {
+    return fail(
+      `${toolResultText(res)}\n\nworkflow_open outcome is undetermined: the command may have been sent, but this ` +
+        `bridge/panel combination did not expose a request id for receipt correlation. Do not assume ` +
+        `the workflow was opened; inspect the current workflow before deciding whether to retry.`,
+    );
+  }
   const timing = getOpenVerifyTiming();
-  const verify = await waitForWorkflowActive(ctx, path, timing);
-  if (verify.active) {
+  const verify = await waitForOpenReceipt(ctx, path, dispatchedRid, timing);
+  if (verify.receipt === "applied") {
     return ok({
       opened: { path },
       recovered: true,
       note:
-        `"${path}" is now the active workflow — the switch succeeded, but the tab was slow ` +
-        `to acknowledge (backgrounded/frozen or already open) or briefly disconnected while ` +
-        `reconnecting after a restart, so the initial ack was inconclusive. ` +
-        `Confirmed active via workflow_list after ${(verify.waited_ms / 1000).toFixed(1)}s ` +
-        `(${verify.attempts} probe${verify.attempts === 1 ? "" : "s"}). Do NOT retry.`,
+        `"${path}" was confirmed applied by the panel's request-id-correlated open receipt after ` +
+        `${(verify.waited_ms / 1000).toFixed(1)}s (${verify.attempts} probe${verify.attempts === 1 ? "" : "s"}). ` +
+        `Do NOT retry.`,
     });
   }
-  // The ack was inconclusive AND the target never became active within the budget —
-  // this is a REAL failure. Return the original bridge error unchanged.
-  return res;
+  // The ack was inconclusive and the receipt did not prove application.
+  if (verify.receipt === "not_applied") {
+    return fail(
+      `workflow_open was confirmed not applied by the panel's request-id-correlated receipt` +
+        `${verify.error ? `: ${verify.error}` : "."} It is safe to retry.`,
+    );
+  }
+  const reason =
+    verify.receipt === "unsupported"
+      ? "this panel version does not provide request-id-correlated open receipts"
+      : verify.receipt === "unknown"
+        ? "the matching panel receipt did not confirm that the command was applied"
+        : "no request-id-correlated panel receipt was observed";
+  return fail(
+    `${toolResultText(res)}\n\nworkflow_open outcome is undetermined: ${reason}. ` +
+      `Do not assume the workflow was opened; inspect the current workflow before deciding whether to retry.`,
+  );
 }
 
 /** True when a ToolResult is a MID-COMMAND reconnect drop ("disconnected
@@ -1934,8 +1999,14 @@ export type ConfirmOutcome = "yes" | "no" | "timeout";
  * `confirm` / `bridge` and never knows which server invoked it.
  */
 export interface PanelToolCtx {
-  /** Forward a command to the panel and wrap the reply as a tool result. */
-  call: (cmd: Record<string, unknown>, timeoutMs?: number) => Promise<ToolResult>;
+  /** Forward a command to the panel and wrap the reply as a tool result. An
+   *  optional observer receives the bridge request id after the frame is written,
+   *  for commands that can later be proven only by a panel-side receipt. */
+  call: (
+    cmd: Record<string, unknown>,
+    timeoutMs?: number,
+    onDispatchedRid?: (rid: string) => void,
+  ) => Promise<ToolResult>;
   /** Human-in-the-loop yes/no confirm card. Tri-state (#360): "yes" on an explicit
    *  affirmative, "no" on a decline / no-panel / transport error, "timeout" when the
    *  user never answered in time. `timeoutMs` (optional, #536) caps the WHOLE confirm
@@ -2117,13 +2188,18 @@ export function makePanelToolCtx(
   const sendRouted = async (
     cmd: Record<string, unknown>,
     timeoutMs?: number,
+    onDispatchedRid?: (rid: string) => void,
   ): Promise<unknown> => {
     const target = workflowTargets?.get(ctx.tabId);
     const routed = target ? withWorkflowTarget(cmd, target) : cmd;
-    return bridge.send(routed as { cmd: string }, { tabId: ctx.tabId, timeoutMs });
+    return bridge.send(routed as { cmd: string }, { tabId: ctx.tabId, timeoutMs, onDispatchedRid });
   };
 
-  const call = async (cmd: Record<string, unknown>, timeoutMs?: number): Promise<ToolResult> => {
+  const call = async (
+    cmd: Record<string, unknown>,
+    timeoutMs?: number,
+    onDispatchedRid?: (rid: string) => void,
+  ): Promise<ToolResult> => {
     try {
       // #436: a MUTATING graph edit must not fire into the "Connected: none"
       // window a ComfyUI restart/reload opens. A read survives that window (it is
@@ -2141,7 +2217,7 @@ export function makePanelToolCtx(
         await awaitReachable();
       }
       ensureReachable();
-      return ok(await sendRouted(cmd, timeoutMs));
+      return ok(await sendRouted(cmd, timeoutMs, onDispatchedRid));
     } catch (err) {
       // Post-reconnect retry-once: a reboot/free_vram/reconnect can drop the tab's
       // transport (or replace it under a new tab id) the instant after we dispatch.
@@ -2152,7 +2228,7 @@ export function makePanelToolCtx(
         try {
           await sleep(retrySettleMs());
           ensureReachable(); // rebinds a current-mode session onto the reconnected tab
-          return ok(await sendRouted(cmd, timeoutMs));
+          return ok(await sendRouted(cmd, timeoutMs, onDispatchedRid));
         } catch (err2) {
           // The retry also failed — surface an actionable reconnecting status rather
           // than a bare transport error (#332), while still failing honestly.
