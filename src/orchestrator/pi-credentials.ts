@@ -604,13 +604,13 @@ export function piVertexAdcUsable(
   // Vertex uses nullish (not truthy) per-field fallback. An explicitly-empty
   // stored project/path therefore blocks the ambient value just as it does in
   // pi; treating it as `||` would false-green a broken stored record.
-  // google-vertex resolves these as a four-level nullish chain: stored primary,
-  // ambient primary, stored alias, then ambient alias. In particular, a stored
-  // empty GCLOUD_PROJECT must block an ambient alias rather than acting like an
-  // `||` fallback.
+  // google-vertex resolves the project as stored GOOGLE_CLOUD_PROJECT, ambient
+  // GOOGLE_CLOUD_PROJECT, then ambient GCLOUD_PROJECT. GCLOUD_PROJECT is never
+  // read from a stored auth record. In particular, an explicitly-empty stored
+  // primary still blocks both ambient fallbacks under nullish semantics.
   const project =
     readNullishScoped(entryEnv, procEnv, "GOOGLE_CLOUD_PROJECT") ??
-    readNullishScoped(entryEnv, procEnv, "GCLOUD_PROJECT");
+    procEnv.GCLOUD_PROJECT;
   const location = readNullishScoped(entryEnv, procEnv, "GOOGLE_CLOUD_LOCATION");
   if (!nonEmptyString(project) || !nonEmptyString(location)) return false;
   // NOT trimmed: pi uses the literal value, so a space-padded path that
@@ -690,9 +690,9 @@ function piBedrockCredentialUsable(
  * A bare model has no reliable static provider mapping, so it retains pi's
  * normal default-selection behaviour rather than guessing. */
 function configuredPiProvider(procEnv: NodeJS.ProcessEnv): string | undefined {
-  const explicit = procEnv.COMFYUI_MCP_PI_PROVIDER?.trim();
+  const explicit = procEnv.COMFYUI_MCP_PI_PROVIDER;
   if (explicit) return explicit;
-  const model = procEnv.COMFYUI_MCP_PI_MODEL?.trim();
+  const model = procEnv.COMFYUI_MCP_PI_MODEL;
   const slash = model?.indexOf("/") ?? -1;
   return slash > 0 ? model!.slice(0, slash) : undefined;
 }

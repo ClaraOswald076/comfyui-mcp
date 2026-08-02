@@ -442,18 +442,19 @@ describe("Google Vertex ADC", () => {
     expect(piVertexAdcUsable(tmp, env, { GOOGLE_CLOUD_LOCATION: "us-central1" })).toBe(true);
   });
 
-  it("uses the stored GCLOUD_PROJECT alias only after the primary project source is absent", () => {
+  it("ignores a stored GCLOUD_PROJECT alias and preserves the ambient alias", () => {
     const keyFile = join(tmp, "sa.json");
     writeFileSync(keyFile, "{}");
+    // Pi never reads the alias from a stored auth record.
     expect(
       piVertexAdcUsable(
         tmp,
         bareEnv({ GOOGLE_CLOUD_LOCATION: "us-central1", GOOGLE_APPLICATION_CREDENTIALS: keyFile }),
         { GCLOUD_PROJECT: "stored-alias" },
       ),
-    ).toBe(true);
-    // Stored alias is nullish-preferred over ambient alias. An explicit empty
-    // value therefore blocks the otherwise-working ambient alias.
+    ).toBe(false);
+    // A stored alias must neither satisfy readiness nor shadow the real ambient
+    // alias; only stored GOOGLE_CLOUD_PROJECT participates in the nullish chain.
     expect(
       piVertexAdcUsable(
         tmp,
@@ -464,7 +465,7 @@ describe("Google Vertex ADC", () => {
         }),
         { GCLOUD_PROJECT: "" },
       ),
-    ).toBe(false);
+    ).toBe(true);
   });
 
   it("gcloud's well-known ADC file counts when the env var is unset", () => {
@@ -753,6 +754,24 @@ describe("pi selected-provider readiness", () => {
         bareEnv({ COMFYUI_MCP_PI_PROVIDER: "anthropic", ANTHROPIC_API_KEY: "sk-ant" }),
       ),
     ).toBe(true);
+  });
+
+  it("keeps selected provider values raw, matching pi's CLI arguments", () => {
+    // Whitespace is part of the explicit --provider value; trimming it here
+    // would green anthropic even though pi receives a different provider name.
+    expect(
+      piCredentialPresent(
+        tmp,
+        bareEnv({ COMFYUI_MCP_PI_PROVIDER: " anthropic ", ANTHROPIC_API_KEY: "sk-ant" }),
+      ),
+    ).toBe(false);
+    // The model prefix is passed through just as literally.
+    expect(
+      piCredentialPresent(
+        tmp,
+        bareEnv({ COMFYUI_MCP_PI_MODEL: " anthropic /claude-sonnet", ANTHROPIC_API_KEY: "sk-ant" }),
+      ),
+    ).toBe(false);
   });
 
   it("accepts every Bedrock AWS credential-chain source, including a keyless stored profile", () => {
