@@ -4,6 +4,7 @@ import { config, getComfyUIBaseUrl } from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
 import { ComfyUIError, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
+import { detectManagerApi, managerApiPrefixFor } from "./node-management.js";
 
 /**
  * ComfyUI-Manager configuration, mirroring `comfy-cli manager` capabilities.
@@ -30,8 +31,9 @@ export class ManagerConfigError extends ComfyUIError {
 async function managerFetch(
   path: string,
   init?: RequestInit,
+  base = getComfyUIBaseUrl(),
 ): Promise<Response> {
-  const url = `${getComfyUIBaseUrl()}${path}`;
+  const url = `${base}${path}`;
   logger.debug("ComfyUI-Manager API request", { url, method: init?.method ?? "GET" });
   let res: Response;
   try {
@@ -105,14 +107,25 @@ async function setViaApi(
   postPath: string,
   value: string,
   getPath: string = postPath,
+  options: { v4Supported?: boolean } = {},
 ): Promise<string> {
-  await managerFetch(postPath, {
+  // Capture one target for both the mutation and its read-back.  A panel
+  // retarget must never make this call set A then report B's state (#670).
+  const base = getComfyUIBaseUrl();
+  const api = await detectManagerApi(base);
+  if (api !== "legacy" && options.v4Supported === false) {
+    throw new ManagerConfigError(
+      `ComfyUI-Manager v4 does not expose ${postPath}; this setting is only available on the legacy Manager API.`,
+    );
+  }
+  const prefix = managerApiPrefixFor(api);
+  await managerFetch(`${prefix}${postPath}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ value }),
-  });
+  }, base);
   // Read back the resulting state (these GET endpoints return text/plain).
-  const res = await managerFetch(getPath, { method: "GET" });
+  const res = await managerFetch(`${prefix}${getPath}`, { method: "GET" }, base);
   return (await res.text()).trim();
 }
 
@@ -120,7 +133,7 @@ export async function setPreviewMethod(
   value: string,
 ): Promise<ManagerConfigResult> {
   const v = assertOneOf(value, VALID_PREVIEW_METHODS, "preview method");
-  const state = await setViaApi("/manager/preview_method", v);
+  const state = await setViaApi("/manager/preview_method", v, undefined, { v4Supported: false });
   return {
     message: `Set ComfyUI-Manager preview method to "${v}".`,
     via: "api",
@@ -142,7 +155,7 @@ export async function setComponentPolicy(
   value: string,
 ): Promise<ManagerConfigResult> {
   const v = assertOneOf(value, VALID_COMPONENT_POLICIES, "component policy");
-  const state = await setViaApi("/manager/policy/component", v);
+  const state = await setViaApi("/manager/policy/component", v, undefined, { v4Supported: false });
   return {
     message: `Set ComfyUI-Manager component policy to "${v}".`,
     via: "api",
@@ -172,12 +185,15 @@ export async function setChannel(value: string): Promise<ManagerConfigResult> {
     throw new ValidationError("Channel name must be a non-empty string.");
   }
   const name = value.trim();
-  await managerFetch("/manager/channel_url_list", {
+  const base = getComfyUIBaseUrl();
+  const api = await detectManagerApi(base);
+  const path = `${managerApiPrefixFor(api)}/manager/channel_url_list`;
+  await managerFetch(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ value: name }),
-  });
-  const res = await managerFetch("/manager/channel_url_list", { method: "GET" });
+  }, base);
+  const res = await managerFetch(path, { method: "GET" }, base);
   const data = (await res.json()) as { selected?: string };
   const selected = data.selected ?? "custom";
   // Manager silently ignores unknown channel names, leaving selection unchanged.
@@ -199,7 +215,9 @@ export async function setChannel(value: string): Promise<ManagerConfigResult> {
  * `comfy-cli manager clear` (which clears reserved startup actions locally).
  */
 export async function resetQueue(): Promise<ManagerConfigResult> {
-  await managerFetch("/manager/queue/reset", { method: "POST" });
+  const base = getComfyUIBaseUrl();
+  const api = await detectManagerApi(base);
+  await managerFetch(`${managerApiPrefixFor(api)}/manager/queue/reset`, { method: "POST" }, base);
   return {
     message: "Reset the ComfyUI-Manager task queue (cleared pending actions).",
     via: "api",

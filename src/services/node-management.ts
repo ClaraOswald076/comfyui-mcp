@@ -17,6 +17,7 @@ import {
   setManagerApiCacheForTests,
   suppressDialectRecheck,
 } from "./manager-api-cache.js";
+export type { ManagerApi } from "./manager-api-cache.js";
 import { resolveInstallInterpreter } from "./workspace-env.js";
 import { assertComfyCliOk, runComfyCliSync } from "./comfy-cli.js";
 import { ComfyUIError, ProcessControlError, ValidationError } from "../utils/errors.js";
@@ -121,7 +122,7 @@ interface QueueStatus {
 }
 
 /** OperationType values accepted by /v2/manager/queue/task. */
-type ManagerTaskKind =
+export type ManagerTaskKind =
   | "install"
   | "uninstall"
   | "update"
@@ -391,7 +392,7 @@ let detectInflight: { base: string; epoch: number; promise: Promise<ManagerApi> 
  *  spin here; three readings is far past any real restart. */
 const DETECT_INVALIDATION_RETRIES = 2;
 
-async function detectManagerApi(base = managerBaseUrl()): Promise<ManagerApi> {
+export async function detectManagerApi(base = managerBaseUrl()): Promise<ManagerApi> {
   for (let attempt = 0; ; attempt++) {
     const cached = getCachedManagerApi(base);
     if (cached !== undefined) return cached;
@@ -493,6 +494,13 @@ async function probeManagerApi(base: string): Promise<ManagerApi> {
  *  /v2 prefix too — only the mutation routes differ). */
 function managerQueuePrefixFor(api: ManagerApi): string {
   return api === "legacy" ? "/manager/queue" : "/v2/manager/queue";
+}
+
+/** Prefix for non-queue Manager routes.  The two pip-Manager dialects both
+ * serve their custom-node/config surface under /v2; only the standalone 3.x
+ * Manager uses unprefixed paths. */
+export function managerApiPrefixFor(api: ManagerApi): string {
+  return api === "legacy" ? "" : "/v2";
 }
 
 /** Appended to every legacy-Manager operation failure so users know they're on
@@ -754,6 +762,36 @@ async function enqueueWithDialectSelfHeal(
     // re-enqueue ONCE in the dialect the live server actually speaks.
     return (await enqueue(fresh, managerApiEpoch())) ?? fresh;
   }
+}
+
+/**
+ * Enqueue a task without draining the Manager queue.  This is the small shared
+ * seam for tools that deliberately batch several mutations before starting the
+ * worker.  It retains the same cached-dialect self-heal as queueManagerTask:
+ * only a 404/405 route rejection is re-sent, never an ambiguous handler error.
+ */
+export async function enqueueManagerTaskForExternal(
+  kind: ManagerTaskKind,
+  params: Record<string, unknown> | ((api: ManagerApi) => Record<string, unknown>),
+  base = managerBaseUrl(),
+): Promise<ManagerApi> {
+  return enqueueWithDialectSelfHeal(
+    kind,
+    (api, epoch) => enqueueManagerTask(
+      api,
+      kind,
+      typeof params === "function" ? params : () => params,
+      randomUUID(),
+      base,
+      epoch,
+    ),
+    base,
+  );
+}
+
+/** Start the queue that received an externally enqueued task. */
+export async function startManagerQueueForExternal(api: ManagerApi, base = managerBaseUrl()): Promise<void> {
+  await managerQueueControl(`${managerQueuePrefixFor(api)}/start`, base);
 }
 
 /**

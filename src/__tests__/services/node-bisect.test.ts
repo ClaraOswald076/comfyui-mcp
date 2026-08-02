@@ -13,6 +13,7 @@ import {
   type BisectState,
   type NodeController,
 } from "../../services/node-bisect.js";
+import { resetManagerApiCacheForTests } from "../../services/node-management.js";
 
 // ---------------------------------------------------------------------------
 // In-memory controller — records enable/disable calls, no real side effects.
@@ -297,6 +298,7 @@ describe("bisectStatus", () => {
 describe("managerController (mocked fetch)", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    resetManagerApiCacheForTests("legacy");
   });
 
   it("lists nodes from /customnode/installed and starts a run when toggling", async () => {
@@ -357,6 +359,34 @@ describe("managerController (mocked fetch)", () => {
     await managerController.setEnabledStates([], []);
     expect(fetchMock).not.toHaveBeenCalled();
 
+    vi.unstubAllGlobals();
+  });
+
+  it("uses v4 task envelopes and /v2 queue start, never legacy mutation routes", async () => {
+    resetManagerApiCacheForTests("v2");
+    const { managerController } = await import("../../services/node-bisect.js");
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes("/v2/customnode/installed")) {
+        return new Response(JSON.stringify({
+          "a-node": { ver: "1.0", cnr_id: "a-cnr", enabled: true },
+          "b-node": { ver: "1.0", cnr_id: "b-cnr", enabled: true },
+        }), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await managerController.listNodes();
+    await managerController.setEnabledStates(["a-node"], ["b-node"]);
+
+    const urls = fetchMock.mock.calls.map((call) => call[0] as string);
+    expect(urls).toContain("http://127.0.0.1:8188/v2/manager/queue/task");
+    expect(urls).toContain("http://127.0.0.1:8188/v2/manager/queue/start");
+    expect(urls.some((url) => url.includes("/manager/queue/disable"))).toBe(false);
+    const taskBodies = fetchMock.mock.calls
+      .filter((call) => (call[0] as string).endsWith("/queue/task"))
+      .map((call) => JSON.parse((call[1] as RequestInit).body as string));
+    expect(taskBodies.map((body) => body.kind)).toEqual(["disable", "enable"]);
     vi.unstubAllGlobals();
   });
 
