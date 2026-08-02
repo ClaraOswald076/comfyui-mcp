@@ -2295,12 +2295,16 @@ export function makePanelToolCtx(
       // attempt's rid as the caller's retry token: re-issuing identical args plus
       // retry_of:"<rid>" lets the panel recognize and dedupe that exact mutation.
       // Pre-write refusals (dispatched:false, handled above) mint NO token — nothing
-      // was sent, so there is nothing to dedupe; reads never mint one (the
-      // requiresWorkflowStampEnforcement gate); a genuine executor ok:false error
-      // carries none (a definite outcome, surfaced as-is).
+      // was sent, so there is nothing to dedupe. Minting is gated BOTH ways: the
+      // bridge classifies the command as mutating (requiresWorkflowStampEnforcement)
+      // AND the command is one the retry map admits (RETRY_TOKEN_CMDS) — a
+      // read/view-only command outside BRIDGE_READONLY_CMDS (find_nodes, canvas,
+      // screenshot, list_subgraphs) can satisfy the first without the second, and
+      // it must never mint a token (a ledger answer for a read is a STALE outcome).
       if (
         dispatchedRid &&
         requiresWorkflowStampEnforcement(cmd) &&
+        RETRY_TOKEN_CMDS.has(typeof cmd.cmd === "string" ? cmd.cmd : "") &&
         (dispatchOutcomeOf(err) === true || isReplyTimeoutError(err))
       ) {
         const cause = err instanceof Error ? err.message : String(err);
@@ -3073,6 +3077,14 @@ export const RETRY_TOKEN_CMD_BY_TOOL: Readonly<Record<string, string>> = {
   panel_unpack_subgraph: "graph_unpack_subgraph",
   panel_update_node: "graph_update_node",
 };
+
+/** #694 — the bridge commands the retry map admits, for the mint gate: a
+ *  dispatched timeout/drop only mints a retry token when the command is in
+ *  this set (bridge classification alone would include read/view-only
+ *  commands that sit outside BRIDGE_READONLY_CMDS). */
+export const RETRY_TOKEN_CMDS: ReadonlySet<string> = new Set(
+  Object.values(RETRY_TOKEN_CMD_BY_TOOL).concat(["workflow_save_as"]),
+);
 
 /** #694 — augment one MUTATING tool def: accept retry_of and attach it, UNTOUCHED,
  *  to every mutating command the handler dispatches (per-command gated so a read
