@@ -509,24 +509,39 @@ export interface BridgeCommand {
 }
 
 /** Deterministic serialization for fingerprinting a logical command (#517),
- *  matching the frame's ACTUAL JSON wire semantics: an object key whose value
- *  JSON.stringify would OMIT (undefined / function / symbol) is dropped — it never
- *  reaches the panel, so it must not differentiate the fingerprint either — while
- *  an explicit `null` stays DISTINCT from a missing key (it IS on the wire, and a
- *  mutation carrying it is a different command that must never adopt the
- *  missing-key command's rid). Object keys sorted recursively, so two calls
- *  carrying identical args in a different key order still correlate. */
-function stableStringify(v: unknown): string {
+ *  matching the frame's ACTUAL JSON wire semantics:
+ *   - a value's own `toJSON()` is applied BEFORE serializing (Date → ISO string),
+ *     because that is what the wire frame carries — the raw object shell is NOT
+ *     (a Date serializes as `{}` there regardless of the instant, so two
+ *     mutations differing only in a Date field would collide on the fingerprint
+ *     while their frames differ, and the later, distinct command would adopt the
+ *     stale rid and be suppressed with the original's result — a lost action);
+ *   - an object key whose value JSON.stringify would OMIT (undefined / function /
+ *     symbol) is dropped — it never reaches the panel, so it must not
+ *     differentiate the fingerprint either — while an explicit `null` stays
+ *     DISTINCT from a missing key (it IS on the wire, and a mutation carrying it
+ *     is a different command that must never adopt the missing-key command's rid).
+ *  Object keys sorted recursively, so two calls carrying identical args in a
+ *  different key order still correlate. */
+function stableStringify(v: unknown, key = ""): string {
+  // JSON.stringify calls a value's toJSON(key) once per position before
+  // serializing it; substitute the result and canonicalize THAT instead.
+  if (v !== null && (typeof v === "object" || typeof v === "bigint")) {
+    const toJSON = (v as { toJSON?: unknown }).toJSON;
+    if (typeof toJSON === "function") {
+      v = (toJSON as (this: unknown, k: string) => unknown).call(v, key);
+    }
+  }
   if (v === null || typeof v !== "object") {
     // In an ARRAY position JSON serializes undefined/function/symbol as null.
     return JSON.stringify(v) ?? "null";
   }
-  if (Array.isArray(v)) return `[${v.map(stableStringify).join(",")}]`;
+  if (Array.isArray(v)) return `[${v.map((e, i) => stableStringify(e, String(i))).join(",")}]`;
   const o = v as Record<string, unknown>;
   return `{${Object.keys(o)
     .filter((k) => JSON.stringify(o[k]) !== undefined) // keys JSON would drop from the frame
     .sort()
-    .map((k) => `${JSON.stringify(k)}:${stableStringify(o[k])}`)
+    .map((k) => `${JSON.stringify(k)}:${stableStringify(o[k], k)}`)
     .join(",")}}`;
 }
 

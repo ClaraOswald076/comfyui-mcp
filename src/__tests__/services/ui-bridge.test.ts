@@ -2786,4 +2786,50 @@ describe("UiBridge (mutation retry dedupe — #517)", () => {
     await expect(retry).resolves.toMatchObject({ node_id: 8 });
     sock.close();
   });
+
+  // Gate finding (final round) — canonicalization must apply JSON.stringify's
+  // OWN toJSON semantics: a toJSON-bearing value (e.g. Date) fingerprints as the
+  // serialized form the wire frame carries, NOT the raw object shell (which for
+  // a Date is `{}` regardless of the instant — two different Dates would
+  // collide, and the later, distinct mutation would adopt the stale rid and be
+  // suppressed with the original's result).
+  it("toJSON-bearing values fingerprint as their serialized form: Date A ≠ Date B, identical instants correlate", async () => {
+    const sock = await connectPanel("tab-dedupe-11");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-dedupe-11")).toBe(true));
+    const frames = collectFrames(sock);
+    const DATE_A = new Date("2026-01-01T00:00:00.000Z");
+    const DATE_B = new Date("2026-02-02T00:00:00.000Z");
+    // Attempt with Date A times out and is recorded.
+    await expect(
+      bridge.send(
+        { cmd: "graph_add_node", type: "KSampler", stamp: DATE_A },
+        { tabId: "tab-dedupe-11", timeoutMs: 60 },
+      ),
+    ).rejects.toThrow(/did not reply/);
+    const ridA = frames[0].rid as string;
+    // The wire frame carried the ISO string — the fingerprint must hash THAT.
+    expect(frames[0].stamp).toBe("2026-01-01T00:00:00.000Z");
+    // A command differing ONLY in the toJSON-bearing field (Date B) is a
+    // DIFFERENT mutation: fresh rid, its own dispatch — never suppressed with
+    // A's outcome.
+    const retryB = bridge.send(
+      { cmd: "graph_add_node", type: "KSampler", stamp: DATE_B },
+      { tabId: "tab-dedupe-11", timeoutMs: 2000 },
+    );
+    await vi.waitFor(() => expect(frames).toHaveLength(2));
+    expect(frames[1].rid).not.toBe(ridA);
+    sock.send(JSON.stringify({ rid: frames[1].rid, ok: true, result: { node_id: 21 } }));
+    await expect(retryB).resolves.toMatchObject({ node_id: 21 });
+    // An IDENTICAL toJSON value (same instant, a different Date instance)
+    // produces the same serialized form → the retry correlates and adopts ridA.
+    const retryA = bridge.send(
+      { cmd: "graph_add_node", type: "KSampler", stamp: new Date("2026-01-01T00:00:00.000Z") },
+      { tabId: "tab-dedupe-11", timeoutMs: 2000 },
+    );
+    await vi.waitFor(() => expect(frames).toHaveLength(3));
+    expect(frames[2].rid).toBe(ridA);
+    sock.send(JSON.stringify({ rid: ridA, ok: true, result: { node_id: 20 } }));
+    await expect(retryA).resolves.toMatchObject({ node_id: 20 });
+    sock.close();
+  });
 });
