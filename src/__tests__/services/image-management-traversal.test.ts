@@ -607,6 +607,15 @@ describe("getOutputImage — video/audio media (issue #663)", () => {
     ).resolves.toMatchObject({ mimeType: "application/octet-stream" });
   });
 
+  it("rejects genuinely-declared audio/wav bytes requested as .mp4", async () => {
+    // mime↔sniff agrees (wav is wav), but the filename claims video — every
+    // claim must hold, or the save fabricates a corrupt asset.
+    fetchImageMock.mockResolvedValue({ base64: WAV_BASE64, mimeType: "audio/wav" });
+    await expect(
+      getOutputImage("clip_00001_.mp4", "output", "video", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
   it("resolves an m4a payload labeled audio/mp4 (audio-brand ftyp)", async () => {
     // .m4a is audio in an mp4 container — its ftyp major brand (M4A ) is the
     // audio/mp4 format, so it must not trip the cross-format guard.

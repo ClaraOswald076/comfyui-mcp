@@ -655,11 +655,17 @@ export async function getOutputImage(
   const isImage = mime.startsWith("image/");
   const sniffedFormat = allowMedia ? sniffMediaFormat(result.base64) : null;
   const ext = extname(filename).toLowerCase();
+  // The sniffed format must satisfy EVERY claim present: the declared
+  // content-type (exact subtype match), and the requested filename's
+  // extension whenever we can classify it — audio/wav bytes requested as
+  // clip.mp4 pass mime↔sniff yet would still land on disk as a corrupt .mp4.
+  const extOk =
+    !MEDIA_FORMAT_BY_EXTENSION[ext] || MEDIA_FORMAT_BY_EXTENSION[ext] === sniffedFormat;
   const isMedia =
     sniffedFormat !== null &&
-    (mime === "application/octet-stream"
-      ? (MEDIA_FORMAT_BY_EXTENSION[ext] ?? sniffedFormat) === sniffedFormat
-      : MEDIA_FORMAT_BY_MIME[mime] === sniffedFormat);
+    extOk &&
+    (mime === "application/octet-stream" ||
+      MEDIA_FORMAT_BY_MIME[mime] === sniffedFormat);
   if ((!isImage && !isMedia) || result.base64.length === 0) {
     const where = subfolder ? `${type}/${subfolder}` : type;
     throw new ComfyUIError(
