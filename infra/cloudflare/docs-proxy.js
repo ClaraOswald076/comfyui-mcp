@@ -34,12 +34,14 @@ export default {
       return fetch(proxied);
     }
 
-    // Docs-only host: anything that isn't the root redirect or /docs* is not
-    // served here. Return 404 rather than forwarding arbitrary paths and
-    // headers to whatever origin backs the DNS record.
-    return new Response("Not found", {
-      status: 404,
-      headers: { "content-type": "text/plain" },
-    });
+    // Internal links authored in the MDX pages are root-relative (e.g.
+    // /local-llms) — Mintlify prefixes its OWN generated links with /docs but
+    // NOT links written in page content, so those land here bare and used to
+    // 404 (and older deploys 522'd). Redirect them onto the docs prefix
+    // instead: every real page then resolves, and genuinely-nonexistent paths
+    // still 404 — just from Mintlify, where the 404 page is styled. 301: these
+    // are canonical content locations, not experiments.
+    const target = `https://${PUBLIC_HOST}/docs${url.pathname}${url.search}`;
+    return Response.redirect(target, 301);
   },
 };
