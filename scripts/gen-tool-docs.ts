@@ -145,7 +145,7 @@ const CATEGORIES: Array<{
       "download_status", "cancel_download",
       "remove_model", "list_extra_paths", "add_extra_path", "remove_extra_path",
       "get_embeddings", "clear_vram",
-      "model_metadata_read", "model_metadata_propose", "model_metadata_fetch_civitai",
+      "model_metadata",
     ],
   },
   {
