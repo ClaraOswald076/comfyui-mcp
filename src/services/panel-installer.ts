@@ -1053,6 +1053,24 @@ export async function panelStatus(
   };
 }
 
+/**
+ * Read the panel status for a caller-selected LOCAL ComfyUI root.
+ *
+ * `apply_manifest` may adopt a saved/default/live root for one call while
+ * `config.comfyuiPath` remains unset. Verifying through the ordinary default
+ * status in that case would inspect no directory (or a different one) and turn
+ * a Manager queue result into fabricated panel success. This narrow adapter
+ * keeps the status scan — including #641's served-shadow check — on the same
+ * root the manifest install targeted without mutating process-global config.
+ */
+export function panelStatusAt(comfyuiPath: string): Promise<PanelStatus> {
+  return panelStatus({
+    ...defaultDeps,
+    isLocalMode: () => true,
+    comfyuiPath: () => comfyuiPath,
+  });
+}
+
 export interface PanelActionResult {
   action: "install" | "update" | "reinstall";
   result: NodeOpResult;

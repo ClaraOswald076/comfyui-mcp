@@ -218,19 +218,20 @@ export async function updateAllCustomNodes(): Promise<UpdateNodesResult> {
   // serialize — which is exactly why the result below reports "queued", never
   // "updated".
   return withPanelPinGuard("update", "all", async () => {
-    const result = await queueUpdateAllCustomNodes();
-
-    // The Manager drains this queue AFTER we return — outside the lock, outside
-    // this process entirely — so a pin written from now on cannot stop it.
-    // Record a pending-op marker: a pin write while it is active gets WARNED
-    // that this update may still land (see panel-pin-guard.ts).
+    // Persist and VERIFY the warning marker BEFORE the remote request. Once the
+    // Manager has accepted update_all, a later pin cannot stop its worker; a
+    // marker write after that point could fail and leave the later pin claiming
+    // protection it cannot provide. If the request itself fails, retain this
+    // conservative marker: a transport failure cannot prove Manager did not
+    // accept the request.
     recordPanelPendingOp(
       "update-all",
-      `an update_all was queued via ComfyUI-Manager and updates EVERY installed ` +
-        `pack — the sidebar panel included — on the Manager's own schedule ` +
+      `an update_all request may have been handed to ComfyUI-Manager and can update EVERY ` +
+        `installed pack — the sidebar panel included — on the Manager's own schedule ` +
         `(usually seconds to minutes; a ComfyUI restart then loads the result)`,
       UPDATE_ALL_PENDING_MS,
     );
+    const result = await queueUpdateAllCustomNodes();
 
     return {
       // Queue acceptance is not proof a generic/bulk Manager update moved the

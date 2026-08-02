@@ -532,10 +532,19 @@ function readPanelPendingOpsFile(): { ops: PanelPendingOp[]; unreadable: boolean
 
 /**
  * Record that a panel-affecting operation was handed to ComfyUI-Manager and may
- * still land out-of-band. Replaces any prior marker of the same kind. Best
- * effort: the op has ALREADY been queued by the time this runs, so a write
- * failure must not misreport it as failed — it logs and the op's own result
- * stays truthful ("queued"/"requested").
+ * still land out-of-band. Replaces any prior marker of the same kind.
+ *
+ * Call this BEFORE handing the operation to ComfyUI-Manager. A mutation whose
+ * out-of-band window cannot be durably recorded must not start: otherwise a
+ * user can set a pin immediately afterwards and be told it protects a panel
+ * which the already-queued Manager operation is still free to move. The write
+ * is read back before returning, so a successful syscall alone is not treated
+ * as proof that the warning is durable.
+ *
+ * Once this succeeds, callers deliberately leave the marker in place even if
+ * their Manager request errors. A transport error cannot prove the remote
+ * Manager did not accept the request, and retaining a conservative warning is
+ * safer than letting a later pin claim clean protection.
  */
 export function recordPanelPendingOp(
   kind: "update-all" | "snapshot-restore",
@@ -553,15 +562,31 @@ export function recordPanelPendingOp(
     const path = panelPendingOpsPath();
     const prior = readPanelPendingOpsFile();
     if (prior.unreadable) throw new Error("existing pending-operation record is unreadable");
-    const { ops } = prior;
-    const kept = ops.filter((o) => o.kind !== kind);
+    const kept = prior.ops.filter((o) => o.kind !== kind);
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, JSON.stringify({ ops: [...kept, op] }, null, 2), "utf-8");
+
+    // Verify the exact replacement record, not merely that JSON still parses.
+    // A partial/redirected write that drops this operation would recreate the
+    // same false-protection window as a write failure.
+    const confirmed = readPanelPendingOpsFile();
+    if (
+      confirmed.unreadable ||
+      !confirmed.ops.some(
+        (candidate) =>
+          candidate.kind === op.kind &&
+          candidate.queuedAt === op.queuedAt &&
+          candidate.expiresAt === op.expiresAt &&
+          candidate.detail === op.detail,
+      )
+    ) {
+      throw new Error("pending-operation record did not survive a read-back verification");
+    }
   } catch (err) {
-    logger.warn(
-      `[panel] could not record the pending ${kind} marker: ${
+    throw new Error(
+      `Could not persist the pending ${kind} marker: ${
         err instanceof Error ? err.message : String(err)
-      } — a pin written before it lands will not be warned.`,
+      }. Refusing to start an operation that could move the panel after a later pin.`,
     );
   }
   return op;

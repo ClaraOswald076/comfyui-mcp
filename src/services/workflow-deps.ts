@@ -11,7 +11,7 @@ import {
   startManagerQueueForExternal,
   type ManagerApi,
 } from "./node-management.js";
-import { assertPanelPinAllows, targetsPanelPackExactly } from "./panel-pin-guard.js";
+import { targetsPanelPackExactly, withPanelPinGuard } from "./panel-pin-guard.js";
 import { runPanelActionInner, panelStatus, withPanelOpLock, defaultDeps } from "./panel-installer.js";
 
 /**
@@ -441,6 +441,25 @@ export async function installWorkflowDependencies(
     };
   }
 
+  // A dependency install can name the panel exactly like a generic node tool.
+  // Hold the shared guard across the entire queue transaction whenever that is
+  // true: a one-off assert here would reopen the same check-then-queue race the
+  // generic mutation services fixed. Non-panel workflows intentionally do not
+  // take this lock, so ordinary dependency installs do not contend with pins.
+  const panelTarget = analysis.missingPacks.find(targetsPanelPackExactly);
+  if (panelTarget) {
+    return withPanelPinGuard("install workflow dependencies including", panelTarget, () =>
+      installWorkflowDependenciesForAnalysis(analysis, deps),
+    );
+  }
+  return installWorkflowDependenciesForAnalysis(analysis, deps);
+}
+
+async function installWorkflowDependenciesForAnalysis(
+  analysis: ExtractDepsResult,
+  deps: WorkflowDepsDeps,
+): Promise<InstallDepsResult> {
+
   // Match missing packs to concrete Manager list entries for install payloads,
   // capturing the channel the list resolved against.
   const { channel = "default", packs, directInstall = false } = await deps.fetchManagerList();
@@ -483,13 +502,12 @@ export async function installWorkflowDependencies(
     installed.push(pack);
   }
 
-  // Resolve the panel targets: a pin REFUSES (the pin is checked before any
-  // Manager work is queued); local installs go through the verified panel
+  // Resolve the panel targets: the outer withPanelPinGuard keeps this whole
+  // transaction atomically pinned while any panel target is present; local installs go through the verified panel
   // path (runPanelAction re-reads the pack from disk and fails closed); on a
   // remote host no on-disk verification exists, so the pin check is the whole
   // guard and the pack joins the generic queue.
   for (const pack of panelTargets) {
-    assertPanelPinAllows("install", pack);
     if (!isLocalMode()) {
       toInstall.push({ id: pack, version: "latest" });
       panelNotes.push(

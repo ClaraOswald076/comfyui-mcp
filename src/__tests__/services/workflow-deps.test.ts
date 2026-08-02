@@ -1,4 +1,7 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   collectClassTypes,
   extractWorkflowDependencies,
@@ -8,6 +11,7 @@ import {
   defaultWorkflowDepsDeps,
 } from "../../services/workflow-deps.js";
 import { resetManagerApiCacheForTests } from "../../services/node-management.js";
+import { setPanelVersionPin } from "../../services/panel-settings.js";
 import type { WorkflowJSON, ObjectInfo, ComfyUINodeDef } from "../../comfyui/types.js";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -225,6 +229,34 @@ describe("extractWorkflowDependencies", () => {
 });
 
 describe("installWorkflowDependencies", () => {
+  it("refuses before queuing when a workflow dependency selects the pinned panel", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cmcp-workflow-deps-pin-"));
+    process.env.COMFYUI_MCP_PANEL_SETTINGS = join(dir, "panel-settings.json");
+    process.env.COMFYUI_MCP_PANEL_LOCK = join(dir, "panel-op.lock");
+    try {
+      setPanelVersionPin("0.11.3");
+      const deps = makeDeps({
+        fetchObjectInfo: vi.fn(async () => ({})),
+        fetchManagerMappings: vi.fn(async () => ({
+          "comfyui-agent-panel": [["PanelOnlyNode"], {}],
+        } as never)),
+      });
+      const panelWorkflow: WorkflowJSON = {
+        "1": { class_type: "PanelOnlyNode", inputs: {} },
+      };
+
+      await expect(installWorkflowDependencies(panelWorkflow, deps)).rejects.toThrow(/pinned/i);
+      // The guard wraps the transaction, so no Manager mutation starts.
+      expect(deps.fetchManagerList).not.toHaveBeenCalled();
+      expect(deps.resetQueue).not.toHaveBeenCalled();
+      expect(deps.queueInstall).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.COMFYUI_MCP_PANEL_SETTINGS;
+      delete process.env.COMFYUI_MCP_PANEL_LOCK;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("installs via ComfyUI-Manager regardless of any local path (server-side install)", async () => {
     // Installs run through the Manager HTTP queue on the connected instance, so
     // the absence of a local path must NOT block them.

@@ -59,7 +59,7 @@ vi.mock("../../services/workspace-env.js", () => ({
 }));
 
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -384,6 +384,25 @@ describe("updateAllCustomNodes", () => {
     expect(countOf(calls, "/manager/queue/update_all")).toBe(1);
     // The queue was never started, so no half-run operation is left behind.
     expect(countOf(calls, "/manager/queue/start")).toBe(0);
+  });
+
+  it("refuses before contacting Manager when the out-of-band pin-warning marker cannot persist", async () => {
+    // A marker written after queueing can fail, then a later pin would be
+    // reported as protective even though update_all can still land. Make its
+    // parent a regular file so the preflight record is indeterminate/unwritable.
+    const blocker = join(tmpdir(), `cmcp-pending-blocker-${process.pid}-${Date.now()}`);
+    writeFileSync(blocker, "not a directory");
+    const previous = process.env.COMFYUI_MCP_PANEL_PENDING;
+    process.env.COMFYUI_MCP_PANEL_PENDING = join(blocker, "pending.json");
+    try {
+      const calls = stubManager("legacy");
+      await expect(updateAllCustomNodes()).rejects.toThrow(/Could not persist the pending update-all marker/i);
+      expect(calls).toEqual([]);
+    } finally {
+      if (previous === undefined) delete process.env.COMFYUI_MCP_PANEL_PENDING;
+      else process.env.COMFYUI_MCP_PANEL_PENDING = previous;
+      rmSync(blocker, { force: true });
+    }
   });
 
   it("still succeeds (queue_started=false) if starting the queue fails", async () => {

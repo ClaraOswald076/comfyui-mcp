@@ -315,6 +315,20 @@ export async function restoreNodeSnapshot(
     // The Manager stores names without the .json suffix; tolerate either.
     const target = trimmed.endsWith(".json") ? trimmed.slice(0, -5) : trimmed;
 
+    // Persist and VERIFY the warning marker BEFORE requesting the deferred
+    // restore. A pin written after Manager receives the request cannot stop the
+    // next-restart apply; refusing when the marker cannot be made durable is the
+    // only way to avoid reporting such a pin as protective. Keep the marker on a
+    // request failure because a transport error cannot prove Manager did not
+    // receive it.
+    recordPanelPendingOp(
+      "snapshot-restore",
+      `a snapshot restore ("${target}") may have been requested and reverts EVERY pack to ` +
+        `its snapshot commit — the sidebar panel included — at the next ComfyUI ` +
+        `restart`,
+      SNAPSHOT_RESTORE_PENDING_MS,
+    );
+
     try {
       await managerFetch("/snapshot/restore", {
         method: "POST",
@@ -330,19 +344,6 @@ export async function restoreNodeSnapshot(
     }
 
     logger.info(`Requested restore of node snapshot "${target}"`);
-
-    // The Manager applies the restore at the NEXT ComfyUI restart — out of
-    // band, after the lock is gone — so a pin written before that restart
-    // cannot stop it. Record a pending-op marker: a pin write while it is
-    // active gets WARNED that this restore may still land (see
-    // panel-pin-guard.ts).
-    recordPanelPendingOp(
-      "snapshot-restore",
-      `a snapshot restore ("${target}") was requested and reverts EVERY pack to ` +
-        `its snapshot commit — the sidebar panel included — at the next ComfyUI ` +
-        `restart`,
-      SNAPSHOT_RESTORE_PENDING_MS,
-    );
 
     return {
       name: target,

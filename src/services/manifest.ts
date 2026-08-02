@@ -21,6 +21,8 @@ import {
   listInstalledNodes,
   type InstalledNode,
 } from "./node-management.js";
+import { targetsPanelPackExactly } from "./panel-pin-guard.js";
+import { panelStatusAt, type PanelStatus } from "./panel-installer.js";
 import {
   downloadModel,
   listLocalModels,
@@ -616,6 +618,27 @@ async function installedNodesOrEmpty(): Promise<InstalledNode[]> {
   }
 }
 
+/**
+ * The panel is a web extension, so a Manager-installed-list entry alone proves
+ * neither which version the browser will serve nor that a dot-prefixed .bak
+ * copy is not winning registration. Only a fresh on-disk status with a readable
+ * version and a clean, completed shadow scan is safe to report as applied.
+ */
+function panelServeVerificationFailure(status: PanelStatus): string | undefined {
+  if (!status.applicable) {
+    return "the target local ComfyUI root could not be inspected";
+  }
+  if (!status.installed) return "the panel is not present on disk";
+  if (!status.installedVersion) return "the panel version could not be read from disk";
+  if (status.shadowInspectFailed) {
+    return "custom_nodes could not be inspected for .bak shadow copies";
+  }
+  if (status.shadows.length > 0) {
+    return `a served shadow copy exists (${status.shadows.map((shadow) => shadow.name).join(", ")})`;
+  }
+  return undefined;
+}
+
 export async function applyManifest(
   opts: ApplyManifestOptions,
 ): Promise<ApplyManifestResult> {
@@ -754,7 +777,55 @@ async function applyManifestSections(
   const installedNodes = initialList === BUDGET_TIMEOUT ? [] : initialList;
   if (initialList === BUDGET_TIMEOUT) nodeBudgetSpent = true;
   for (const id of manifest.custom_nodes) {
-    if (nodeAlreadyInstalled(id, installedNodes)) {
+    const isPanelTarget = targetsPanelPackExactly(id);
+    if (isPanelTarget && !hasLocalFs) {
+      // A remote Manager list cannot establish what the browser serves, and
+      // this process cannot inspect the remote custom_nodes for #641 shadows.
+      // Do not start a mutation we could only report from an unverified queue.
+      results.push(
+        report(
+          "custom_node",
+          id,
+          "failed",
+          "Cannot verify the sidebar panel through apply_manifest against a remote/cloud ComfyUI. " +
+            "Install it on the ComfyUI host with install_panel, which re-reads the served panel version and checks for .bak shadow copies.",
+        ),
+      );
+      continue;
+    }
+
+    let prePanelStatus: PanelStatus | undefined;
+    if (isPanelTarget) {
+      // Use `comfyuiPath`, not config.comfyuiPath: this call may have adopted a
+      // saved/default/live root specifically for the manifest.
+      prePanelStatus = await panelStatusAt(comfyuiPath!);
+      const preFailure = panelServeVerificationFailure(prePanelStatus);
+      if (!preFailure) {
+        results.push(
+          report(
+            "custom_node",
+            id,
+            "skipped",
+            `Sidebar panel is already served from the target install (verified ${prePanelStatus.installedVersion}; no shadow copies).`,
+          ),
+        );
+        continue;
+      }
+      // A present/uninspectable panel must not be fed back through Manager: that
+      // can be a stale queue no-op or a duplicate beneath a served backup. Only
+      // a confirmed-missing panel is safe to ask Manager to install.
+      if (prePanelStatus.installed || prePanelStatus.shadowInspectFailed || prePanelStatus.shadows.length) {
+        results.push(
+          report(
+            "custom_node",
+            id,
+            "failed",
+            `Cannot safely apply the sidebar panel: ${preFailure}. NOT trusting the ComfyUI-Manager installed list; fix the local panel/shadow state, then retry.`,
+          ),
+        );
+        continue;
+      }
+    } else if (nodeAlreadyInstalled(id, installedNodes)) {
       results.push(report("custom_node", id, "skipped", "Custom node is already installed."));
       continue;
     }
@@ -802,6 +873,36 @@ async function applyManifestSections(
     // reboot) and confirm the node is actually present before reporting success.
     // Budget-bounded too: if the confirm can't complete in time we report pending
     // (conservative — the install itself already settled) rather than overrun.
+    if (isPanelTarget) {
+      const served = await raceDeadline(panelStatusAt(comfyuiPath!), nodeDeadline);
+      if (served === BUDGET_TIMEOUT) {
+        nodeBudgetSpent = true;
+        results.push(report("custom_node", id, "pending", pendingBudgetMessage(true)));
+        continue;
+      }
+      const servedFailure = panelServeVerificationFailure(served);
+      if (servedFailure) {
+        results.push(
+          report(
+            "custom_node",
+            id,
+            "failed",
+            `Panel Manager request settled, but the served panel could not be verified: ${servedFailure}. NOT reporting success.`,
+          ),
+        );
+      } else {
+        results.push(
+          report(
+            "custom_node",
+            id,
+            "applied",
+            `${outcome.res.message} Verified served panel ${served.installedVersion}; no shadow copies.`,
+          ),
+        );
+      }
+      continue;
+    }
+
     const verified = await raceDeadline(installedNodesOrEmpty(), nodeDeadline);
     if (verified === BUDGET_TIMEOUT) {
       nodeBudgetSpent = true;
