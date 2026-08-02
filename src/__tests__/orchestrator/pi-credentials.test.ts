@@ -221,7 +221,7 @@ describe("auth.json records", () => {
     // ambient auth); null/false/0 do not. The panel's Python mirror has to match
     // this explicitly, since Python's own truthiness differs for `{}`/`[]`.
     for (const [body, ready] of [
-      ['{"openai":{}}', false],
+      ['{"openai":{}}', true],
       ['{"openai":[]}', false],
       ['{"openai":null}', true],
       ['{"openai":false}', true],

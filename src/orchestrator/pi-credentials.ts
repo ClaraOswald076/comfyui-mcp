@@ -714,7 +714,17 @@ function piEnvCredentialPresent(
   const stripped = new Set<string>(TOOL_ONLY_SECRET_ENV_KEYS);
   for (const [provider, keys] of Object.entries(PI_PROVIDER_ENV_KEYS)) {
     if (onlyProvider && provider !== onlyProvider) continue;
-    if (providerHasStoredCredential(storedProviders, provider)) continue;
+    const stored = storedProviders[provider];
+    // Pi's ordinary api-key helper falls back to ctx.env when its stored key is
+    // absent, falsy, or cannot resolve. A record's mere existence must not hide
+    // that same provider's working ambient key.
+    const storedEnv = isPlainObject(stored) && isPlainObject(stored.env) ? stored.env : undefined;
+    const storedCanSupplyKey =
+      isPlainObject(stored) &&
+      stored.type === "api_key" &&
+      credentialValueUsable(stored.key, storedEnv, procEnv);
+    const storedIsOrdinaryApiKey = isPlainObject(stored) && stored.type === "api_key";
+    if (providerHasStoredCredential(storedProviders, provider) && (!storedIsOrdinaryApiKey || storedCanSupplyKey)) continue;
     if (!keys.some((k) => !stripped.has(k) && !!procEnv[k]?.trim())) continue;
     // Some providers need companion config alongside the key — without it pi's
     // resolver returns undefined and the key is useless on its own.
