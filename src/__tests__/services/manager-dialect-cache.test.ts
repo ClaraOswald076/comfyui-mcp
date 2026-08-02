@@ -60,6 +60,7 @@ const {
   installModelViaManager,
   reinstallCustomNode,
   updateCustomNode,
+  queueUpdateAllCustomNodes,
   setQueueTimingForTests,
   resetManagerApiCacheForTests,
 } = await import("../../services/node-management.js");
@@ -431,6 +432,40 @@ describe("#646 Manager API dialect cache invalidation", () => {
     expect(calls.some((call) => call.url.startsWith(targetA) && call.path === "/manager/queue/install")).toBe(true);
     expect(calls.some((call) => call.url.startsWith(targetA) && call.path === "/manager/queue/start")).toBe(true);
     expect(calls.some((call) => call.url.startsWith(targetA) && call.path.startsWith("/customnode/installed"))).toBe(true);
+  });
+
+  it("keeps the update_all tool's enqueue + start on its original target after retarget (#656)", async () => {
+    const targetA = BASE;
+    const targetB = "http://127.0.0.1:8282";
+    let retargeted = false;
+    const calls = stubServer({
+      // A serves the 3.x Manager even though the cache pinned v2; B is normal
+      // v4. The update_all tool (queueUpdateAllCustomNodes) pins ONE base for
+      // the whole operation, so the panel retarget must not redirect its
+      // self-heal retry or queue start to B.
+      persona: (url) => (url.startsWith(targetA) ? "legacy" : "v4"),
+      onCall: (url, path) => {
+        if (!retargeted && url.startsWith(targetA) && path === "/v2/manager/queue/update_all") {
+          retargeted = true;
+          target.base = targetB;
+          resetManagerApiCache("panel retargeted while Manager request was in flight");
+        }
+      },
+    });
+    resetManagerApiCacheForTests("v2");
+
+    await expect(queueUpdateAllCustomNodes()).resolves.toMatchObject({
+      endpoint: "/manager/queue/update_all",
+      queueStarted: true,
+    });
+
+    // The stale-dialect attempt, its self-heal retry, and the queue start are
+    // all pinned to A. B is now the target for subsequent calls, but receives
+    // nothing from this already-started operation.
+    expect(calls.filter((call) => call.url.startsWith(targetB))).toHaveLength(0);
+    expect(countOf(calls, "/v2/manager/queue/update_all")).toBe(1);
+    expect(countOf(calls, "/manager/queue/update_all")).toBe(1);
+    expect(countOf(calls, "/manager/queue/start")).toBe(1);
   });
 
   it("keeps BOTH halves of a reinstall on its original target after retarget", async () => {
