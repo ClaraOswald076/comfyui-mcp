@@ -1946,15 +1946,20 @@ async function reinstallCustomNodeImpl(
   }
 
   // The unified queue has no `reinstall` kind, so model it as uninstall + a
-  // fresh install of the same target. Each is its own drained queue cycle.
-  await queueManagerTask("uninstall", { node_name: id });
+  // fresh install of the same target. Each is its own drained queue cycle, but
+  // the TWO cycles are one logical operation and must share ONE pinned target:
+  // captured once, up front, so a panel retarget after the uninstall drains
+  // cannot send the install to a different ComfyUI — which would leave the
+  // user's server uninstalled while reporting success for another.
+  const base = managerBaseUrl();
+  await queueManagerTask("uninstall", { node_name: id }, base);
   const status = await queueManagerTask("install", {
     id,
     version: version ?? "latest",
     selected_version: version ?? "latest",
     channel,
     mode,
-  });
+  }, base);
   return {
     mechanism: "manager-http",
     message: `Queued + reinstalled "${id}" (uninstall + install) via ComfyUI-Manager. A restart may be required.`,
@@ -2144,11 +2149,17 @@ const REMOTE_LANDING_TIMEOUT_MS = 4 * 60 * 60 * 1000; // generous: multi-GB on s
  * if it never shows within the timeout. Fire-and-forget: the tool call returns
  * at dispatch; this keeps the tray honest afterwards. No-op outside the panel
  * (progress channel disabled).
+ *
+ * `base` is the ComfyUI the download was DISPATCHED to: the file lands there,
+ * so the poll must stay there even if the panel retargets mid-download —
+ * following the new target would watch a server the file never lands on and
+ * eventually report a false "error".
  */
 export function watchRemoteModelLanding(
   category: string,
   filename: string,
   url: string,
+  base = getComfyUIBaseUrl(),
 ): void {
   if (!progressEnabled()) return;
   const id = createHash("sha256").update(url).digest("hex").slice(0, 16);
@@ -2160,7 +2171,7 @@ export function watchRemoteModelLanding(
       let listed = false;
       try {
         const res = await comfyuiFetch(
-          `${getComfyUIBaseUrl()}/models/${encodeURIComponent(category)}`,
+          `${base}/models/${encodeURIComponent(category)}`,
         );
         if (res.ok) {
           const names = (await res.json()) as unknown;
@@ -2217,7 +2228,11 @@ export async function installModelViaManager(
     type: params.type,
     save_path,
   };
-  const status = await queueManagerTask("install-model", taskParams);
+  // One pinned target for the whole operation — the dispatch, its self-heal
+  // retry/drain, AND the landing watcher (the file lands on the server the task
+  // was dispatched to, so that is the only server worth polling).
+  const base = managerBaseUrl();
+  const status = await queueManagerTask("install-model", taskParams, base);
   // NOTE: the Manager queue reports the task "done" once it DRAINS, even when
   // the underlying OperationResult failed (e.g. a 404 download, or Manager's
   // security gate rejecting a network fetch) — and with an aria2 sidecar
@@ -2231,7 +2246,7 @@ export async function installModelViaManager(
   // in network_mode=personal_cloud (or loopback) with permissive security; a
   // stricter security_level rejects the server-side download.
   if (params.trayCategory) {
-    watchRemoteModelLanding(params.trayCategory, params.filename, params.url);
+    watchRemoteModelLanding(params.trayCategory, params.filename, params.url, base);
   }
   return {
     mechanism: "manager-http",

@@ -58,6 +58,7 @@ vi.mock("node:fs", () => ({ existsSync: vi.fn(() => true) }));
 const {
   installCustomNode,
   installModelViaManager,
+  reinstallCustomNode,
   updateCustomNode,
   setQueueTimingForTests,
   resetManagerApiCacheForTests,
@@ -430,6 +431,38 @@ describe("#646 Manager API dialect cache invalidation", () => {
     expect(calls.some((call) => call.url.startsWith(targetA) && call.path === "/manager/queue/install")).toBe(true);
     expect(calls.some((call) => call.url.startsWith(targetA) && call.path === "/manager/queue/start")).toBe(true);
     expect(calls.some((call) => call.url.startsWith(targetA) && call.path.startsWith("/customnode/installed"))).toBe(true);
+  });
+
+  it("keeps BOTH halves of a reinstall on its original target after retarget", async () => {
+    const targetA = BASE;
+    const targetB = "http://127.0.0.1:8282";
+    let retargeted = false;
+    const calls = stubServer({
+      persona: () => "v4",
+      // Retarget while the UNINSTALL half is draining. A reinstall is uninstall
+      // + install as two queue cycles; if each cycle pins its own target, the
+      // install half lands on B — leaving A uninstalled while reporting success.
+      onCall: (url, path, method) => {
+        if (!retargeted && url.startsWith(targetA) && path === "/v2/manager/queue/start" && method === "POST") {
+          retargeted = true;
+          target.base = targetB;
+          resetManagerApiCache("panel retargeted while Manager request was in flight");
+        }
+      },
+    });
+
+    await expect(reinstallCustomNode({ id: "comfyui-foo" })).resolves.toMatchObject({
+      mechanism: "manager-http",
+    });
+
+    // Nothing reached B: the install half re-used the target captured before the
+    // uninstall began, not the target selected mid-operation.
+    expect(calls.filter((call) => call.url.startsWith(targetB))).toHaveLength(0);
+    const kinds = calls
+      .filter((c) => c.url.startsWith(targetA) && c.path === "/v2/manager/queue/task" && c.method === "POST")
+      .map((c) => (c.body as { kind: string }).kind);
+    expect(kinds).toEqual(["uninstall", "install"]);
+    expect(countOf(calls, "/v2/manager/queue/start")).toBe(2);
   });
 
   it("does NOT re-detect or retry on an unrelated failure (403 security gating)", async () => {
