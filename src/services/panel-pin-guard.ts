@@ -385,14 +385,21 @@ export function withPanelMutationLock<T>(
   // happens to overlap it in this process.
   if (lockHolderContext.getStore()) return fn();
 
-  const run = (async () => {
+  // `run` is the chain's settle CALLBACK — deliberately a function, NOT an
+  // invoked IIFE (note: no trailing `()`). Passing an already-started promise
+  // to .then() would resolve callers immediately with the chain's value while
+  // the guarded work floated unfinished. Written without the `(async () =>
+  // {...})` grouping parens because that shape reads as an IIFE and has been
+  // mis-reviewed as one; the semantics were and are: callers resolve only
+  // after the guarded action AND the release complete.
+  const run = async (): Promise<T> => {
     const release = await acquireFileLock(opts.timeoutMs ?? DEFAULT_ACQUIRE_MS);
     try {
       return await lockHolderContext.run(true, fn);
     } finally {
       release();
     }
-  });
+  };
 
   const started = inProcessChain.then(run, run);
   inProcessChain = started.then(

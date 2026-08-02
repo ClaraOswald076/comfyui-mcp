@@ -280,6 +280,27 @@ describe("withPanelMutationLock — a FILE lock, so it holds across processes", 
       withPanelMutationLock(async () => "recovered", { timeoutMs: 1000 }),
     ).resolves.toBe("recovered");
   });
+
+  it("resolves with the action's OWN result, and only after its side effects finished", async () => {
+    // Regression coverage for the review claim that the chaining let callers
+    // resolve early (receiving undefined, racing the post-state). The caller
+    // must get the guarded action's completion value — and any code running
+    // after the returned promise resolves must observe the FINISHED
+    // post-state, including a following lock acquisition.
+    const order: string[] = [];
+    const result = await withPanelMutationLock(async () => {
+      await new Promise((r) => setTimeout(r, 30));
+      order.push("side effect committed");
+      return "the action result";
+    });
+    expect(result).toBe("the action result");
+    expect(order).toEqual(["side effect committed"]);
+
+    const observedByNextAcquisition = await withPanelMutationLock(async () =>
+      order.slice(),
+    );
+    expect(observedByNextAcquisition).toEqual(["side effect committed"]);
+  });
 });
 
 describe("assertPanelNotTargetedUnverifiable — paths that cannot verify", () => {
