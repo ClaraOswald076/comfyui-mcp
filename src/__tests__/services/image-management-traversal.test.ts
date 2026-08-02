@@ -583,6 +583,30 @@ describe("getOutputImage — video/audio media (issue #663)", () => {
     ).resolves.toMatchObject({ mimeType: "application/octet-stream" });
   });
 
+  it("rejects octet-stream WAV bytes requested as .mp4 (extension is the only claim)", async () => {
+    // Under the generic label the FILENAME is the last format claim: WAV bytes
+    // saved as clip.mp4 would be a corrupt asset with a fabricated success.
+    fetchImageMock.mockResolvedValue({
+      base64: WAV_BASE64,
+      mimeType: "application/octet-stream",
+    });
+    await expect(
+      getOutputImage("clip_00001_.mp4", "output", "video", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("passes octet-stream media whose extension is unmapped (fail-open for exotic assets)", async () => {
+    // An extension we can't classify declares nothing checkable — the bytes
+    // still proved themselves via the structural sniff, so they pass.
+    fetchImageMock.mockResolvedValue({
+      base64: MP4_BASE64,
+      mimeType: "application/octet-stream",
+    });
+    await expect(
+      getOutputImage("clip_00001_.m2ts", "output", "video", { allowMedia: true }),
+    ).resolves.toMatchObject({ mimeType: "application/octet-stream" });
+  });
+
   it("resolves an m4a payload labeled audio/mp4 (audio-brand ftyp)", async () => {
     // .m4a is audio in an mp4 container — its ftyp major brand (M4A ) is the
     // audio/mp4 format, so it must not trip the cross-format guard.

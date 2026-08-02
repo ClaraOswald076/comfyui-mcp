@@ -587,6 +587,31 @@ const MEDIA_FORMAT_BY_MIME: Record<string, MediaFormat> = {
 };
 
 /**
+ * Filename extension → the media format its payload must sniff as (#663).
+ * application/octet-stream declares nothing, so the requested FILENAME is the
+ * only remaining claim: a WAV body returned as "clip.mp4" would otherwise be
+ * saved under a video extension it isn't. Unlisted extensions declare nothing
+ * we can check and pass any valid media format (fail-open for exotic-but-real
+ * assets — the bytes still have to prove themselves via the structural sniff).
+ */
+const MEDIA_FORMAT_BY_EXTENSION: Record<string, MediaFormat> = {
+  ".mp4": "mp4-video",
+  ".mov": "mp4-video",
+  ".m4v": "mp4-video",
+  ".m4a": "mp4-audio",
+  ".m4b": "mp4-audio",
+  ".webm": "ebml",
+  ".mkv": "ebml",
+  ".avi": "avi",
+  ".wav": "wav",
+  ".mp3": "mpegaudio",
+  ".aac": "aac",
+  ".flac": "flac",
+  ".ogg": "ogg",
+  ".oga": "ogg",
+};
+
+/**
  * Fetch a generated image from ComfyUI via HTTP /view endpoint.
  * Does NOT require COMFYUI_PATH — works with remote ComfyUI instances.
  *
@@ -629,10 +654,12 @@ export async function getOutputImage(
   const mime = result.mimeType.toLowerCase();
   const isImage = mime.startsWith("image/");
   const sniffedFormat = allowMedia ? sniffMediaFormat(result.base64) : null;
+  const ext = extname(filename).toLowerCase();
   const isMedia =
     sniffedFormat !== null &&
-    (mime === "application/octet-stream" ||
-      MEDIA_FORMAT_BY_MIME[mime] === sniffedFormat);
+    (mime === "application/octet-stream"
+      ? (MEDIA_FORMAT_BY_EXTENSION[ext] ?? sniffedFormat) === sniffedFormat
+      : MEDIA_FORMAT_BY_MIME[mime] === sniffedFormat);
   if ((!isImage && !isMedia) || result.base64.length === 0) {
     const where = subfolder ? `${type}/${subfolder}` : type;
     throw new ComfyUIError(
