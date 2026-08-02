@@ -231,6 +231,17 @@ describe("#694 retry_of threading through the tool defs", () => {
     expect("retry_of" in calls[0]).toBe(false);
   });
 
+  it("explicitly read-only tools have NO retry_of in their schema or cmd bag (#694 gate)", async () => {
+    // panel_list_subgraphs is read-only ("Read-only." in its description): a retry
+    // token there would violate the reads-never-mint rule. It must be absent from
+    // the retry map — schema, handler, everything.
+    const def = defByName("panel_list_subgraphs");
+    expect(JSON.stringify(def.schema ?? {})).not.toContain("retry_of");
+    const { ctx, calls } = makeRecordingCtx();
+    await def.handler({}, ctx);
+    expect("retry_of" in calls[0]).toBe(false);
+  });
+
   it("panel_clear (confirm-gated, empty schema) accepts and forwards the token", async () => {
     const { ctx, calls } = makeRecordingCtx();
     await defByName("panel_clear").handler({ retry_of: "tok-clear" }, ctx);

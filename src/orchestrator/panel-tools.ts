@@ -3056,7 +3056,6 @@ export const RETRY_TOKEN_CMD_BY_TOOL: Readonly<Record<string, string>> = {
   panel_copy_nodes: "graph_copy_nodes",
   panel_paste_nodes: "graph_paste_nodes",
   panel_save_subgraph: "graph_save_subgraph",
-  panel_list_subgraphs: "graph_list_subgraphs",
   panel_add_subgraph: "graph_add_subgraph",
   panel_create_group: "graph_create_group",
   panel_move_group: "graph_move_group",
