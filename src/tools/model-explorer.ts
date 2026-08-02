@@ -256,7 +256,8 @@ export function registerModelExplorerTools(server: McpServer): void {
       "Call this FIRST when the user wants to improve/curate a model's embedded .safetensors metadata, so you " +
       "propose from real data. NOTE: this is the embedded-in-the-tensor metadata (model_card/prompt_director/" +
       "modelspec/ss_*) — NOT the separate lora_catalog. `category` = ComfyUI model folder ('loras','checkpoints'," +
-      "'vae',…); `name` = filename incl. .safetensors. DEPENDENCY: the curated read proxies the OPTIONAL " +
+      "'vae',…); `name` = filename incl. .safetensors — BOTH required for read/propose, e.g. " +
+      '{action:"read", category:"loras", name:"my_model.safetensors"}. DEPENDENCY: the curated read proxies the OPTIONAL ' +
       "'comfyui-model-explorer' custom node. When that node is absent but the model file is reachable on the " +
       "LOCAL filesystem, the tool does NOT hard-fail — it degrades to a structured 'model_explorer: unavailable' " +
       "result with local evidence (file stat, the download_civitai_model sidecar, and the raw embedded " +
