@@ -2305,8 +2305,7 @@ export function makePanelToolCtx(
         dispatchedRid &&
         requiresWorkflowStampEnforcement(cmd) &&
         RETRY_TOKEN_CMDS.has(typeof cmd.cmd === "string" ? cmd.cmd : "") &&
-        (dispatchOutcomeOf(err) === true ||
-          (isReplyTimeoutError(err) && dispatchOutcomeOf(err) !== false))
+        (dispatchOutcomeOf(err) === true || isReplyTimeoutTagged(err))
       ) {
         const cause = err instanceof Error ? err.message : String(err);
         return fail(
