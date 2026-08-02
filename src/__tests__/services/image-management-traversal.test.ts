@@ -270,6 +270,52 @@ describe("getOutputImage — video/audio media (issue #663)", () => {
     ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
   });
 
+  it("rejects a truncated 8-byte body that is only '....ftyp' (no box behind it)", async () => {
+    // The four bytes "ftyp" at offset 4 alone are not an MP4 — a valid ftyp
+    // box needs the major brand and minor version too (>= 16 bytes), so a
+    // truncated body must not sniff as media even labeled video/mp4.
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from([
+        0x00, 0x00, 0x00, 0x08, 0x66, 0x74, 0x79, 0x70, // ....ftyp
+      ]).toString("base64"),
+      mimeType: "video/mp4",
+    });
+    await expect(
+      getOutputImage("clip_00001_.mp4", "output", "video", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects an ftyp whose box size exceeds the actual body length", async () => {
+    // 16-byte body, but the box header claims 32 bytes — an inconsistent,
+    // fabricated header.
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from([
+        0x00, 0x00, 0x00, 0x20, 0x66, 0x74, 0x79, 0x70, // box claims 32 bytes
+        0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00, 0x02, 0x00, // isom....
+      ]).toString("base64"),
+      mimeType: "video/mp4",
+    });
+    await expect(
+      getOutputImage("clip_00001_.mp4", "output", "video", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("accepts a minimal 16-byte ftyp box (box size exactly covers the body)", async () => {
+    // Boundary of the box-size check: size == body length == 16, printable
+    // major brand, minor version present — the smallest well-formed ftyp.
+    const MINIMAL_MP4_BASE64 = Buffer.from([
+      0x00, 0x00, 0x00, 0x10, 0x66, 0x74, 0x79, 0x70, // box = 16 bytes
+      0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00, 0x00, 0x00, // isom, minor 0
+    ]).toString("base64");
+    fetchImageMock.mockResolvedValue({
+      base64: MINIMAL_MP4_BASE64,
+      mimeType: "video/mp4",
+    });
+    await expect(
+      getOutputImage("clip_00001_.mp4", "output", "video", { allowMedia: true }),
+    ).resolves.toMatchObject({ mimeType: "video/mp4" });
+  });
+
   it("resolves genuine MP4 bytes served as application/octet-stream (generic proxy label)", async () => {
     // ComfyUI itself reports video/mp4 (aiohttp mimetypes), but a proxy or a
     // signed URL hop can serve the same real bytes under the generic type —

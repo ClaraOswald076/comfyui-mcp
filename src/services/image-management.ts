@@ -447,18 +447,32 @@ function assertSafeViewRef(filename: string, subfolder: string): void {
 /**
  * Magic-byte sniff for the video/audio formats get_image can save (#663).
  * Every container ComfyUI's media nodes emit has a fixed leading signature:
- * MP4/MOV/M4V/M4A carry an "ftyp" box at offset 4, WebM/MKV start with the
- * EBML header, WAV/AVI are RIFF containers, FLAC/Ogg have ASCII magic, and
- * MP3/AAC start with an ID3 tag or an MPEG/ADTS frame sync. A textual junk
- * body (JSON/HTML error page) matches none of these.
+ * MP4/MOV/M4V/M4A open with a well-formed "ftyp" box, WebM/MKV start with
+ * the EBML header, WAV/AVI are RIFF containers, FLAC/Ogg have ASCII magic,
+ * and MP3/AAC start with an ID3 tag or an MPEG/ADTS frame sync. A textual
+ * junk body (JSON/HTML error page) matches none of these.
  */
 function sniffsAsMedia(base64: string): boolean {
   // 24 base64 chars decode to the first 18 bytes — the deepest signature
-  // below (the RIFF form type at bytes 8–11) fits comfortably.
+  // below (the ftyp minor version at bytes 12–15) fits comfortably.
   const head = Buffer.from(base64.slice(0, 24), "base64");
   const ascii = (start: number, end: number) =>
     head.subarray(start, end).toString("ascii");
-  if (head.length >= 8 && ascii(4, 8) === "ftyp") return true; // mp4/mov/m4v/m4a
+  if (head.length >= 16 && ascii(4, 8) === "ftyp") {
+    // mp4/mov/m4v/m4a — require a well-formed ftyp BOX, not just the four
+    // bytes "ftyp": the box size (big-endian uint32) must cover the header +
+    // major brand + minor version (>= 16) and not exceed the actual body
+    // length, and the major brand must be printable ASCII. An 8-byte
+    // truncated body ending in "ftyp" fails every one of these.
+    const boxSize = head.readUInt32BE(0);
+    const bodyLength =
+      Math.floor((base64.length * 3) / 4) -
+      (base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0);
+    const printableBrand = head
+      .subarray(8, 12)
+      .every((b) => b >= 0x20 && b <= 0x7e);
+    if (boxSize >= 16 && boxSize <= bodyLength && printableBrand) return true;
+  }
   if (head.length >= 4) {
     if (head.readUInt32BE(0) === 0x1a45dfa3) return true; // webm/mkv (EBML)
     if (ascii(0, 4) === "fLaC" || ascii(0, 4) === "OggS") return true; // flac/ogg
