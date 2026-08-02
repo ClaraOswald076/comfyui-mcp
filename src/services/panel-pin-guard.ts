@@ -469,6 +469,10 @@ export interface PanelPendingOp {
   /** What is pending: "update-all" | "snapshot-restore" (unknown kinds are
    *  tolerated when reading, so an older/newer record never reads as clear). */
   kind: string;
+  /** Unique record id (records written before ids existed fall back to
+   *  kind+queuedAt matching — which collides for two records minted in the
+   *  same millisecond, so a stale clear could take the live one with it). */
+  id?: string;
   /** When it was handed to ComfyUI-Manager (ISO). */
   queuedAt: string;
   /** When the warning lapses (ISO). After this the pin governs as usual — the
@@ -571,6 +575,7 @@ export function recordPanelPendingOp(
   const now = Date.now();
   const op: PanelPendingOp = {
     kind,
+    id: randomUUID(),
     queuedAt: new Date(now).toISOString(),
     expiresAt: new Date(now + ttlMs).toISOString(),
     detail,
@@ -630,8 +635,12 @@ export function recordPanelPendingOp(
  * about work this call did).
  */
 export function clearPanelPendingOp(op: PanelPendingOp): boolean {
+  // Identity by unique id when the record has one; only legacy records fall
+  // back to kind+queuedAt (collision-prone in the same millisecond).
   const matches = (candidate: PanelPendingOp): boolean =>
-    candidate.kind === op.kind && candidate.queuedAt === op.queuedAt;
+    op.id !== undefined
+      ? candidate.id === op.id
+      : candidate.kind === op.kind && candidate.queuedAt === op.queuedAt;
   try {
     const path = panelPendingOpsPath();
     const prior = readPanelPendingOpsFile();
