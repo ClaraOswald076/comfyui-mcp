@@ -198,9 +198,9 @@ async function readCivitaiSidecar(filePath: string): Promise<Record<string, unkn
 }
 
 /**
- * Build the local-fallback payload for a 404'd model_metadata action:"read". Returns
- * null whenever a local answer would be the WRONG answer, keeping the
- * actionable explorerHttpError instead:
+ * Build optional local evidence for a 404'd model_metadata action:"read".
+ * Returns null whenever a local answer would be the WRONG answer. The caller
+ * still returns a structured unavailable result without that evidence:
  *  - REMOTE mode: the model lives on the remote server's filesystem. An
  *    explicit COMFYUI_PATH on this MCP host still resolves (config.ts warns
  *    but honors it), so without this gate the fallback would return metadata
@@ -210,7 +210,7 @@ async function readCivitaiSidecar(filePath: string): Promise<Record<string, unkn
  *  - The resolver matched a DIRECTORY, not a regular file — it returns dir
  *    hits so callers can craft a precise "not a file" error, and a directory
  *    has no metadata evidence to fall back on.
- *  - No local file is reachable at all: the 404 likely IS "model not found".
+ *  - No local file is reachable at all: do not claim any file metadata.
  */
 async function localMetadataFallback(category: string, name: string) {
   try {
@@ -261,8 +261,8 @@ export function registerModelExplorerTools(server: McpServer): void {
       "'comfyui-model-explorer' custom node. When that node is absent but the model file is reachable on the " +
       "LOCAL filesystem, the tool does NOT hard-fail — it degrades to a structured 'model_explorer: unavailable' " +
       "result with local evidence (file stat, the download_civitai_model sidecar, and the raw embedded " +
-      "safetensors metadata). In remote mode without the node it returns an actionable error naming the " +
-      "missing node.\n" +
+       "safetensors metadata). Without local filesystem access, it still returns the same structured " +
+       "unavailable result, but without file evidence.\n" +
       '- action:"propose" — PROPOSE cleaned embedded metadata into the user\'s diff-review window. This does NOT write ' +
       "the file — the user sees your proposed fields vs current, edits/discusses, and their Confirm does the write. " +
       "Call whenever you have a proposal OR the user asks you to revise one; each call REPLACES the live proposal, " +
@@ -345,25 +345,23 @@ export function registerModelExplorerTools(server: McpServer): void {
             const dr = await fetch(`${COMFY}/model_explorer/detail?${q}`);
             if (!dr.ok) {
               const body = await readBodyText(dr);
-              // #363 (reopen): node absent but file present locally → structured
-              // missing-capability result with local metadata, NOT a raw isError.
+              // #363: make an absent optional route a structured unavailable
+              // result; include local evidence only when it is safe to resolve.
               if (dr.status === 404) {
                 const local = await localMetadataFallback(category, name);
-                if (local) {
-                  return okText({
+                return okText({
                     model_explorer: "unavailable",
                     reason:
                       "GET /model_explorer/detail returned HTTP 404 — most likely the optional " +
                       "'comfyui-model-explorer' custom node is not installed on the connected ComfyUI. " +
-                      "This is a LOCAL fallback, not the full curated read.",
+                      "If local evidence is unavailable, this does not confirm whether the node or requested file is absent.",
                     install:
                       "Install the node via ComfyUI-Manager or install_custom_node, restart ComfyUI, " +
                       'then re-call model_metadata action:"read" for the full curated view (classify, model_card, ' +
                       "prompt_director, modelspec, tag_frequency).",
-                    source: "local-fallback",
-                    ...local,
-                  });
-                }
+                    source: local ? "local-fallback" : "unavailable",
+                    ...(local ?? {}),
+                });
               }
               return errorToToolResult(explorerHttpError("detail", dr.status, body));
             }

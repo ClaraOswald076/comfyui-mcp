@@ -153,9 +153,12 @@ describe('action:"read" / action:"fetch_civitai" 404 handling', () => {
     fetchMock.mockResolvedValueOnce({ ok: false, status: 404, text: async () => "" });
     const res = await handler()({ action: "read", category: "checkpoints", name: "model.safetensors" });
 
-    expect(res.isError).toBe(true);
-    expect(text(res)).toContain("comfyui-model-explorer");
-    expect(text(res)).toContain("could not find the requested model file");
+    expect(res.isError).toBeFalsy();
+    const parsed = JSON.parse(text(res));
+    expect(parsed.model_explorer).toBe("unavailable");
+    expect(parsed.source).toBe("unavailable");
+    expect(parsed.reason).toContain("comfyui-model-explorer");
+    expect(parsed.file).toBeUndefined();
     // Must NOT be the old raw-status phrasing.
     expect(text(res)).not.toContain("detail HTTP 404 (is ComfyUI running");
   });
@@ -457,7 +460,7 @@ describe('action:"read" local fallback (#363 reopen)', () => {
     expect(parsed.civitai_sidecar.baseModel).toBe("SD 1.5");
   });
 
-  it("404 + model NOT resolvable locally (remote mode / missing file) → keeps the actionable error", async () => {
+  it("404 + model NOT resolvable locally → structured unavailable without local evidence", async () => {
     resolveExistingModelFileMock.mockRejectedValue(
       new Error("No local ComfyUI path configured."),
     );
@@ -465,12 +468,15 @@ describe('action:"read" local fallback (#363 reopen)', () => {
 
     const res = await handler()({ action: "read", category: "checkpoints", name: "ghost.safetensors" });
 
-    expect(res.isError).toBe(true);
-    expect(text(res)).toContain("comfyui-model-explorer");
-    expect(text(res)).toContain("could not find the requested model file");
+    expect(res.isError).toBeFalsy();
+    const parsed = JSON.parse(text(res));
+    expect(parsed.model_explorer).toBe("unavailable");
+    expect(parsed.source).toBe("unavailable");
+    expect(parsed.reason).toContain("comfyui-model-explorer");
+    expect(parsed.file).toBeUndefined();
   });
 
-  it("404 + REMOTE mode → local fallback skipped even when a host file resolves; keeps the actionable error", async () => {
+  it("404 + REMOTE mode → structured unavailable skips host filesystem evidence", async () => {
     remoteMode.value = true;
     const filePath = join(dir, "model.safetensors");
     await writeFile(
@@ -484,23 +490,26 @@ describe('action:"read" local fallback (#363 reopen)', () => {
 
     const res = await handler()({ action: "read", category: "checkpoints", name: "model.safetensors" });
 
-    expect(res.isError).toBe(true);
-    expect(text(res)).toContain("comfyui-model-explorer");
-    expect(text(res)).toContain("could not find the requested model file");
-    expect(text(res)).not.toContain("local-fallback");
+    expect(res.isError).toBeFalsy();
+    const parsed = JSON.parse(text(res));
+    expect(parsed.model_explorer).toBe("unavailable");
+    expect(parsed.source).toBe("unavailable");
+    expect(parsed.file).toBeUndefined();
     expect(resolveExistingModelFileMock).not.toHaveBeenCalled();
   });
 
-  it("404 + resolver hits a DIRECTORY → no success-shaped result; keeps the actionable error", async () => {
+  it("404 + resolver hits a DIRECTORY → structured unavailable has no file evidence", async () => {
     const subdir = await mkdtemp(join(dir, "not-a-file-")); // a real directory, not a model file
     resolveExistingModelFileMock.mockResolvedValue({ path: subdir, root: dir, info: await stat(subdir) });
     fetchMock.mockResolvedValueOnce({ ok: false, status: 404, text: async () => "" });
 
     const res = await handler()({ action: "read", category: "checkpoints", name: "model.safetensors" });
 
-    expect(res.isError).toBe(true);
-    expect(text(res)).toContain("comfyui-model-explorer");
-    expect(text(res)).not.toContain("local-fallback");
+    expect(res.isError).toBeFalsy();
+    const parsed = JSON.parse(text(res));
+    expect(parsed.model_explorer).toBe("unavailable");
+    expect(parsed.source).toBe("unavailable");
+    expect(parsed.file).toBeUndefined();
   });
 });
 
