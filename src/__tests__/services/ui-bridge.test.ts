@@ -1523,7 +1523,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "old-skew")).toBe(true));
     await expect(
       bridge.send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "old-skew" }),
-    ).rejects.toThrow(/detected panel 0\.11\.0.*requires panel 0\.11\.28\+.*install_panel\(action:'update'\).*restart ComfyUI.*rebinding cannot/i);
+    ).rejects.toThrow(/detected panel 0\.11\.0.*requires panel 0\.11\.30\+.*install_panel\(action:'update'\).*restart ComfyUI.*rebinding cannot/i);
     old.close();
   });
 

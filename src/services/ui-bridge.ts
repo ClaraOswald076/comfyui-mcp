@@ -216,6 +216,21 @@ export const BRIDGE_CMD_MIN_PANEL_VERSION: Readonly<Record<string, string>> = {
   graph_resize_node: "0.11.25",
 };
 
+/**
+ * The panel version each non-command bridge capability was ACTUALLY introduced
+ * in.  These belong beside the command minimums because the orchestrator uses
+ * their combined maximum for proactive sync advice.  Otherwise a capability
+ * gate can correctly refuse an old panel while install_panel incorrectly calls
+ * that same panel current (#708).
+ */
+export const BRIDGE_CAPABILITY_MIN_PANEL_VERSION: Readonly<Record<string, string>> = {
+  // #570 P0c — `enforces_workflow_stamp` first shipped in panel 0.11.30. A
+  // 0.11.29-or-older panel ignores a stamped active-workflow mutation, so the
+  // server must refuse that write rather than risk applying it after a tab
+  // switch.  It is a handshake capability, not a command, hence this table.
+  enforces_workflow_stamp: "0.11.30",
+};
+
 /** The minimum panel version that supports `cmd`. For a command WITH an
  *  authoritative BRIDGE_CMD_MIN_PANEL_VERSION entry this is its true introduction
  *  version; for anything else it is the 0.11.4 full-set baseline FLOOR — a lower
@@ -244,13 +259,16 @@ export const SEMVER_RE =
   /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/;
 
 /**
- * The highest panel version this MCP build needs across its bridge commands.
- * Keep this beside the command capability table so both proactive panel sync
- * and a bridge refusal report the same derived requirement.
+ * The highest panel version this MCP build needs across its bridge commands and
+ * handshake capabilities. Keep this beside both capability tables so proactive
+ * panel sync and a bridge refusal report the same derived requirement.
  */
 export function requiredPanelVersion(): string {
   let best = MIN_PANEL_VERSION_FOR_BRIDGE_COMMANDS;
-  for (const min of Object.values(BRIDGE_CMD_MIN_PANEL_VERSION)) {
+  for (const min of [
+    ...Object.values(BRIDGE_CMD_MIN_PANEL_VERSION),
+    ...Object.values(BRIDGE_CAPABILITY_MIN_PANEL_VERSION),
+  ]) {
     if (!SEMVER_RE.test(min.trim())) continue;
     if (!SEMVER_RE.test(best.trim()) || compareSemver(min, best) > 0) best = min;
   }
