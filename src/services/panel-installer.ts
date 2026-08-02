@@ -1424,6 +1424,24 @@ async function updateViaGitCheckoutFallback(opts: {
 }): Promise<PanelActionResult> {
   const { deps, dir, previousVersion, previousRev, result } = opts;
 
+  // PRE-PULL REVISION GATE — the post-Manager detection's HEAD must be
+  // readable before we mutate. An unreadable revision at this point means the
+  // no-op verdict itself is unprovable (a head-only Manager advance looks
+  // identical), so firing a pull would mutate on a false premise and then
+  // misreport git-applied work or a tip it cannot see (codex gate). Fail
+  // closed BEFORE any mutation, never pull.
+  const prePullRev = deps.gitRevision(dir);
+  if (!prePullRev) {
+    throw new PanelInstallError(
+      `Panel update did NOT apply: ComfyUI-Manager reported the queue drained ` +
+        `but the panel checkout's HEAD revision is unreadable at ${dir}, so ` +
+        `whether it updated (a nightly advance with no version bump) is ` +
+        `UNVERIFIABLE — the git fallback does not fire on an unprovable no-op. ` +
+        `Check the panel repo (git log) and ComfyUI-Manager on the host, then ` +
+        `re-check install_panel(action='status').`,
+    );
+  }
+
   // WORKTREE-ROOT GATE — `.git` proves metadata exists, not that this dir is
   // the checkout ROOT. A copied/stale gitdir would let status/pull mutate a
   // sibling repo and credit the panel with that repo's moved HEAD. Require the

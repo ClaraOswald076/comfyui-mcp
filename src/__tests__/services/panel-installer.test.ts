@@ -810,6 +810,24 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
     is_processing: false,
   };
 
+  it("git checkout with HEAD UNREADABLE after the Manager call → unverified, fallback does NOT fire", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: LEGACY_NOOP,
+      onUpdate: ({ revs }) => {
+        delete revs[dir]; // HEAD unreadable post-op — version alone can't prove nothing moved
+      },
+      onGitPull: () => "Updating d806619..675ace8\nFast-forward",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).not.toMatch(/already at the upstream tip/);
+    // The git fallback must NOT fire on a movement state it cannot prove.
+    expect(h.gitPulls).toEqual([]);
+  });
+
   it("legacy no-op + real git checkout + pull advances it → updated via the fallback (verified)", async () => {
     const h = makeDeps({
       comfyuiPath: COMFY,
