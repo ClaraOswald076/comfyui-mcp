@@ -243,9 +243,15 @@ export class ClaudeBackend implements AgentBackend {
   // the SDK's own result still arrives with subtype "success".
   private turnHasContent = false;
   private turnBlockReason: string | null = null;
-  // Set by interrupt(); consumed by the next result (mirrors PanelAgent's
-  // interruptRequested): an interrupted turn's empty result is the interrupt
-  // landing, not an empty-turn failure.
+  // A turn is ACTIVE from the moment its user batch is handed to the SDK (the
+  // prompt generator in run()) until its terminal result is consumed.
+  private turnActive = false;
+  // Set by interrupt() — but only while a turn is ACTIVE — and consumed by that
+  // turn's result (mirrors PanelAgent's interruptRequested): an interrupted
+  // turn's empty result is the interrupt landing, not an empty-turn failure.
+  // Strictly turn-scoped (#745 review): an idle/late interrupt() leaves NO state
+  // behind, and a newly submitted turn clears any stale mark, so neither can
+  // bless a LATER turn's genuinely-empty result/success.
   private interruptPending = false;
 
   constructor(deps: ClaudeBackendDeps) {
@@ -371,7 +377,14 @@ export class ClaudeBackend implements AgentBackend {
     // before it's read, so PanelAgent never deals in SDKUserMessage.
     async function* prompt(): AsyncGenerator<SDKUserMessage> {
       for await (const turn of opts.channel) {
-        yield await self.shapeTurn(turn);
+        const msg = await self.shapeTurn(turn);
+        // The batch is handed to the SDK: this turn is now in flight until its
+        // terminal result. A newly submitted turn also clears any stale
+        // interruptPending mark — an interrupt only ever blesses the result of
+        // the turn that was in flight when it landed (#745 review).
+        self.turnActive = true;
+        self.interruptPending = false;
+        yield msg;
       }
     }
     const q = query({ prompt: prompt(), options: this.buildOptions(opts) });
@@ -398,7 +411,9 @@ export class ClaudeBackend implements AgentBackend {
   }
 
   async interrupt(): Promise<void> {
-    this.interruptPending = true;
+    // Scope the empty-turn blessing to the turn actually in flight: an
+    // interrupt() with NO active turn leaves no state behind (#745 review).
+    if (this.turnActive) this.interruptPending = true;
     await this.q?.interrupt();
   }
 
@@ -429,10 +444,16 @@ export class ClaudeBackend implements AgentBackend {
     switch (message.type) {
       case "system":
         if (message.subtype === "init") {
-          // New session (or a restarted one): turn classification starts clean.
+          // New session (or a restarted one): STREAM-side turn classification
+          // starts clean (init is always the first in-stream message, so this
+          // can only precede the session's assistant/result messages).
+          // turnActive/interruptPending are NOT reset here: they are
+          // SUBMISSION-side state — the prompt drain can hand a turn to the SDK
+          // before this init is processed, and clearing here would unmark that
+          // genuinely in-flight turn (#745 review). A stale mark is cleared by
+          // the next prompt submission instead.
           this.turnHasContent = false;
           this.turnBlockReason = null;
-          this.interruptPending = false;
           yield {
             type: "session",
             sessionId: message.session_id,
@@ -568,6 +589,7 @@ export class ClaudeBackend implements AgentBackend {
         const wasInterrupted = this.interruptPending;
         this.turnHasContent = false;
         this.turnBlockReason = null;
+        this.turnActive = false;
         this.interruptPending = false;
         let ok = message.subtype === "success";
         if (ok && blockReason !== null) {
