@@ -1,8 +1,10 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { z } from "zod";
+import { readFileSync } from "node:fs";
 import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { DEAD_NAMES, TOOL_NAMES } from "../../tools/vocabulary.js";
 
 /**
@@ -517,5 +519,20 @@ describe("the three model_metadata_* names are retired", () => {
   it("no old name is still in the live ledger, and `model_metadata` is", () => {
     for (const name of old) expect(TOOL_NAMES as readonly string[]).not.toContain(name);
     expect(TOOL_NAMES as readonly string[]).toContain("model_metadata");
+  });
+});
+
+describe("model_metadata generated documentation", () => {
+  it("gives the read example the runtime-required category and name", () => {
+    const docs = readFileSync(
+      fileURLToPath(new URL("../../../docs/tools/models.mdx", import.meta.url)),
+      "utf8",
+    );
+    const start = docs.indexOf("## model_metadata");
+    const section = docs.slice(start, docs.indexOf("\n---", start));
+
+    expect(section).toContain('"action": "read"');
+    expect(section).toContain('"category": "loras"');
+    expect(section).toContain('"name": "my_model.safetensors"');
   });
 });
