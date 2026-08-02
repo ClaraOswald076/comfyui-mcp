@@ -55,6 +55,7 @@
               "configuration",
               "remote-connector",
               "cloud-deployment",
+              "docker",
               "self-hosted-relay",
               "concepts",
               "plugin",
