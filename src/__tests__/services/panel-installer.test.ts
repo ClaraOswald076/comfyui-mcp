@@ -95,6 +95,12 @@ function makeDeps(opts: {
    * THROWS — the persona has no working git fallback (git itself errors).
    */
   onGitPull?: (ctx: { files: Record<string, string>; revs: Record<string, string> }) => string;
+  /**
+   * `git status --porcelain` output the cleanliness-gate mock returns for the
+   * panel dir ("" = clean, the default). Anything non-empty is a dirty
+   * worktree and must refuse the fallback BEFORE any pull is attempted.
+   */
+  gitStatus?: string;
 } = {}): Harness {
   const files = opts.files ?? {};
   const revs = opts.revs ?? {};
@@ -119,6 +125,7 @@ function makeDeps(opts: {
     readdir: (p) => (p === CUSTOM_NODES ? dirs : []),
     readFile: (p) => files[p] ?? "",
     gitRevision: (dir) => revs[dir],
+    gitStatusPorcelain: () => opts.gitStatus ?? "",
     gitPullFfOnly: (dir) => {
       gitPulls.push(dir);
       if (opts.onGitPull) return opts.onGitPull({ files, revs });
@@ -887,6 +894,78 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
       /did NOT apply|stale ComfyUI-Manager/,
     );
     expect(h.gitPulls).toEqual([]);
+  });
+
+  it("dirty worktree → the fallback is REFUSED before any pull (never mutates a dirty checkout)", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: LEGACY_NOOP,
+      // A tracked file the fast-forward would NOT overlap — `git pull
+      // --ff-only` alone would silently carry it, so the porcelain gate must
+      // refuse first regardless of overlap.
+      gitStatus: " M web/js/comfyui-mcp-panel.js",
+      onGitPull: ({ files, revs }) => {
+        // Must NEVER run: the refusal happens before the pull.
+        files[pyPath] = pyproject(PANEL_REGISTRY_ID, "9.9.9");
+        revs[dir] = REV_B;
+        return "Updating aaaaaaaa..bbbbbbbb\nFast-forward";
+      },
+    });
+    await expect(runPanelAction("update", h.deps)).rejects.toBeInstanceOf(
+      PanelInstallError,
+    );
+    await expect(runPanelAction("update", h.deps)).rejects.toThrow(
+      /UNCOMMITTED|dirty checkout/i,
+    );
+    // The pull was never attempted and nothing moved on disk.
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("re-detection resolving a DIFFERENT panel dir → the fallback is REFUSED, never pulled there", async () => {
+    const ALT = join(CUSTOM_NODES, "comfyui-agent-panel");
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A }, // the git proof belongs to the ORIGINAL dir
+      updateDetails: LEGACY_NOOP,
+      onUpdate: ({ files }) => {
+        // The canonical checkout vanishes mid-op; re-detection lands on a
+        // DIFFERENT panel dir the pre-op proof says nothing about.
+        delete files[pyPath];
+        files[join(ALT, "pyproject.toml")] = pyproject(PANEL_REGISTRY_ID, "0.11.32");
+      },
+      onGitPull: () => "Updating aaaaaaaa..bbbbbbbb\nFast-forward", // must never run
+    });
+    await expect(runPanelAction("update", h.deps)).rejects.toThrow(
+      /not the checkout|REFUSED/i,
+    );
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("a dir flip appearing AFTER the fallback's pull → verification refuses (never claims the wrong checkout)", async () => {
+    const ALT = join(CUSTOM_NODES, "comfyui-agent-panel");
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: LEGACY_NOOP,
+      onGitPull: ({ files, revs }) => {
+        // The pull ran on the bound dir, but by verification time re-detection
+        // resolves a DIFFERENT dir — the before/after comparison would span
+        // two repos, so even a moved version must not be claimed.
+        revs[dir] = REV_B;
+        delete files[pyPath];
+        files[join(ALT, "pyproject.toml")] = pyproject(PANEL_REGISTRY_ID, "0.11.35");
+        return "Updating aaaaaaaa..bbbbbbbb\nFast-forward";
+      },
+    });
+    await expect(runPanelAction("update", h.deps)).rejects.toThrow(
+      /DIFFERENT panel dir|NOT reporting success/i,
+    );
+    // The pull happened on the BOUND dir; the refusal is at verification.
+    expect(h.gitPulls).toEqual([dir]);
   });
 
   it("a shadow left behind by the fallback's pull STILL fails closed (#641)", async () => {
