@@ -217,7 +217,7 @@ export async function verifyCustomNode(
     throw new ProcessControlError(
       "verify_custom_node is local-only: it restarts and inspects a local ComfyUI " +
         "install. It cannot verify a remote --comfyui-url target. Set the COMFYUI_PATH " +
-        "environment variable, or save a default workspace with set_default_workspace.",
+        "environment variable, or save a default workspace with workspace (action:\"set_default\").",
     );
   }
 

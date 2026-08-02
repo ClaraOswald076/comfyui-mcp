@@ -86,7 +86,7 @@ afterEach(async () => {
   await Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
-/** Persist a saved default workspace (as set_default_workspace would) and return it. */
+/** Persist a saved default workspace (as workspace action:"set_default" would) and return it. */
 async function saveDefaultWorkspace(workspace: string): Promise<void> {
   const dir = await trackTmp();
   const cfgPath = join(dir, "workspace.json");

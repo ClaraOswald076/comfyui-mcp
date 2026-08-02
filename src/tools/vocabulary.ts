@@ -128,9 +128,7 @@ export const TOOL_NAMES = [
   "list_extra_paths",
   "add_extra_path",
   "remove_extra_path",
-  "get_workspace",
-  "set_default_workspace",
-  "list_workspaces",
+  "workspace",
   "get_environment",
   "list_api_nodes",
   "get_api_node_schema",
@@ -211,10 +209,11 @@ export type ToolName = (typeof TOOL_NAMES)[number];
  * updating — it is history, not state.
  *
  * Read from docs/design/tool-surface.txt so there is exactly one copy of the
- * baseline names (189: the 182 frozen at 0.48.32 plus the seven consolidated tools
+ * baseline names (190: the 182 frozen at 0.48.32 plus the eight consolidated tools
  * appended as they shipped — `bisect` in 0.49.0 slice 1, then `node_snapshot`,
  * `apps` and `batch` in slice 2, then `comfy_cli` in slice 3, then `queue` in
- * slice 4, then `model_metadata` in slice 5), and so the file committed
+ * slice 4, then `model_metadata` in slice 5, then `workspace` in slice 6), and so
+ * the file committed
  * as the P0 evidence is load-bearing rather than
  * decorative.
  */
@@ -233,7 +232,7 @@ const BASELINE_URL = new URL("../../docs/design/tool-surface.txt", import.meta.u
  * 200-line rename. APPENDING is legitimate — new tools join the baseline when they
  * ship — so the workflow is: append, update this hash, say why in the message.
  */
-export const BASELINE_SHA256 = "a022d6ddff680234f7da1ba09f2fd3a0a827e99e07c18853726938afb25c94d0";
+export const BASELINE_SHA256 = "72f079e20cb20a02043338cc337c2afc6b5f683683ebe8148c4b0c9ac854c1cf";
 
 /**
  * LAZY on purpose, and this is not a micro-optimisation.
@@ -307,7 +306,7 @@ export function panelBaselineIntegrity(): { ok: boolean; actual: string } {
  * to the surface. That is the ratchet: not that it cannot rise, but that it cannot
  * rise silently.
  */
-export const MAX_TOOLS = 153;
+export const MAX_TOOLS = 151;
 
 /** Where this is headed, for reference in review. A goal, not enforced. */
 export const TOOL_BUDGET_TARGET = 30;
@@ -375,6 +374,25 @@ export function deadNameRe(name: string): RegExp {
  * entry documents the two mentions in this repo that are correct.
  */
 export const DEAD_NAMES: readonly DeadName[] = [
+  // 0.49.0 slice 6: the three workspace tools folded into one
+  // action-parameterized `workspace` tool. Same workspace-env services, same
+  // JSON return shapes — only the surface changed, so every mention of the old
+  // names is now rot pointing at a 404.
+  {
+    name: "get_workspace",
+    since: "0.49.0",
+    replacement: 'workspace (action:"get")',
+  },
+  {
+    name: "set_default_workspace",
+    since: "0.49.0",
+    replacement: 'workspace (action:"set_default")',
+  },
+  {
+    name: "list_workspaces",
+    since: "0.49.0",
+    replacement: 'workspace (action:"list")',
+  },
   // 0.49.0 slice 5: the three model-metadata tools folded into one
   // action-parameterized `model_metadata` tool. Same Model Explorer proxy routes,
   // same 404 degradations, same return shapes — only the surface changed, so

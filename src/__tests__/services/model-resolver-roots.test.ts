@@ -21,7 +21,7 @@ vi.mock("../../config.js", () => ({
   isRemoteMode: h.isRemoteMode,
 }));
 
-// Saved default workspace (set via set_default_workspace) — the local fallback
+// Saved default workspace (set via workspace action:"set_default") — the local fallback
 // resolveEffectiveComfyUIBase() uses when COMFYUI_PATH is unset and we're not
 // remote. The shared helper replicates the real resolution order here.
 const getSavedDefaultWorkspaceSyncMock = h.getSaved;
@@ -173,13 +173,13 @@ describe("resolveExistingModelFile — multi-root resolution", () => {
     expect(res.root).toBe(savedRoot);
   });
 
-  it("errors with set_default_workspace hint when unset and no saved workspace (local mode)", async () => {
+  it("errors with a workspace set_default hint when unset and no saved workspace (local mode)", async () => {
     config.comfyuiPath = undefined;
     vi.mocked(isRemoteMode).mockReturnValue(false);
     getSavedDefaultWorkspaceSyncMock.mockReturnValue(undefined);
     await expect(
       resolveExistingModelFile("loras/x.safetensors"),
-    ).rejects.toThrow(/set_default_workspace/);
+    ).rejects.toThrow(/workspace \(action:"set_default"\)/);
   });
 
   it("returns a directory match so callers can report 'not a file'", async () => {

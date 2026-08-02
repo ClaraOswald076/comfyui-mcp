@@ -7,7 +7,7 @@ import { resolveEffectiveComfyUIBase } from "./workspace-env.js";
 /**
  * The LOCAL ComfyUI workspace a comfy-cli invocation should target when the
  * caller passed no explicit `workspace`. Prefers COMFYUI_PATH, then the saved
- * default workspace (set via set_default_workspace) when COMFYUI_PATH is unset —
+ * default workspace (set via workspace action:"set_default") when COMFYUI_PATH is unset —
  * so the workspace-venv `comfy` and `--workspace` routing keep working from the
  * saved default without COMFYUI_PATH (#506/#403). Never returns a local path in
  * remote mode (resolveEffectiveComfyUIBase already enforces that).

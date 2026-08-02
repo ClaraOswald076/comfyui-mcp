@@ -303,7 +303,7 @@ export async function resolveModelsDirWithBases(): Promise<{
     else
       throw new ValidationError(
         "No local ComfyUI models directory could be resolved. Set the COMFYUI_PATH " +
-          "environment variable, save a default workspace with set_default_workspace, " +
+          "environment variable, save a default workspace with workspace (action:\"set_default\"), " +
           "or connect to a running ComfyUI so its models directory can be detected.",
       );
   }

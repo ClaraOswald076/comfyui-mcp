@@ -177,7 +177,7 @@ const CATEGORIES: Array<{
     description: "Install/update ComfyUI and the sidebar panel, self-update the MCP server, apply a setup manifest, manage workspaces, inspect the environment, configure ComfyUI-Manager, report issues.",
     tools: [
       "install_comfyui", "update_comfyui", "update_all", "install_panel", "self_update",
-      "apply_manifest", "get_workspace", "set_default_workspace", "list_workspaces",
+      "apply_manifest", "workspace",
       "get_environment", "configure_manager", "report_issue",
     ],
   },
@@ -323,6 +323,10 @@ const EXAMPLE_ARG_OVERRIDES: Readonly<Record<string, Readonly<Record<string, unk
     action: "read",
     category: "loras",
     name: "my_model.safetensors",
+  },
+  workspace: {
+    action: "set_default",
+    path: "/opt/ComfyUI",
   },
 };
 

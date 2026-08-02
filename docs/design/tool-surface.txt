@@ -187,3 +187,4 @@ batch
 comfy_cli
 queue
 model_metadata
+workspace

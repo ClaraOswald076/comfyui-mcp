@@ -426,7 +426,7 @@ describe("resolveInstallInterpreter (#651)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// set_default_workspace / get_workspace round-trip
+// workspace action:"set_default" / action:"get" round-trip
 // ---------------------------------------------------------------------------
 
 describe("setDefaultWorkspace + getWorkspace round-trip", () => {
@@ -445,7 +445,7 @@ describe("setDefaultWorkspace + getWorkspace round-trip", () => {
       const raw = JSON.parse(await readFile(cfgPath, "utf-8"));
       expect(raw.defaultWorkspace).toBe("/some/ComfyUI");
 
-      // get_workspace reads it back; no comfyuiPath so source is default-config
+      // getWorkspace() reads it back; no comfyuiPath so source is default-config
       const ws = await getWorkspace();
       expect(ws.default_workspace).toBe("/some/ComfyUI");
       expect(ws.workspace_path).toBe("/some/ComfyUI");
@@ -545,7 +545,7 @@ describe("setDefaultWorkspace + getWorkspace round-trip", () => {
 });
 
 // ---------------------------------------------------------------------------
-// list_workspaces
+// workspace action:"list"
 // ---------------------------------------------------------------------------
 
 describe("listWorkspaces", () => {

@@ -246,10 +246,10 @@ function desktopConfigPath(): string {
  * ComfyUI lives. That order is:
  *
  *   1. `config.comfyuiPath` — COMFYUI_PATH env or auto-detection (wins), then
- *   2. the SAVED DEFAULT WORKSPACE (set_default_workspace), local mode only.
+ *   2. the SAVED DEFAULT WORKSPACE (workspace action:"set_default"), local mode only.
  *
  * Before #648 this read `config.comfyuiPath` DIRECTLY, so with COMFYUI_PATH unset
- * `list_extra_paths` threw while `get_workspace`/`get_environment` happily reported the
+ * `list_extra_paths` threw while `workspace`/`get_environment` happily reported the
  * saved default workspace — the same install, two different answers.
  *
  * Throws (never guesses) when neither is available, INCLUDING remote mode, where
@@ -324,7 +324,7 @@ interface GuardedRoot {
 }
 
 function guardedRootOrigin(source: GuardedRootSource): string {
-  if (source === "default-workspace") return "the saved default workspace (set_default_workspace)";
+  if (source === "default-workspace") return "the saved default workspace (workspace action:\"set_default\")";
   if (source === "live-root") return "the running ComfyUI's own install root (from its launch argv)";
   return "a ComfyUI root this process INFERRED (auto-detection, or a nested root descended from COMFYUI_PATH)";
 }
@@ -338,7 +338,7 @@ function assertRootIntact(guard: GuardedRoot | undefined): void {
       `UNRESOLVED: "${guard.path}" is no longer an existing directory. It came from ${origin} ` +
         "and disappeared while this call was running. Nothing was read or written — an empty " +
         "result here would look like a config with no extra paths, which is not what is true. " +
-        "Re-run set_default_workspace with the current path, set COMFYUI_PATH, or pass " +
+        "Re-run workspace (action:\"set_default\") with the current path, set COMFYUI_PATH, or pass " +
         "config_path explicitly.",
     );
   }
@@ -386,7 +386,7 @@ function standaloneRoot(): {
           ? " (a REMOTE ComfyUI is targeted, and a local workspace is not that server's " +
             "config — reporting one would be wrong). Pass config_path explicitly, or set " +
             "COMFYUI_PATH to the local install you want to inspect."
-          : ". Set COMFYUI_PATH, set a default workspace with set_default_workspace, " +
+          : ". Set COMFYUI_PATH, set a default workspace with workspace (action:\"set_default\"), " +
             "or pass config_path explicitly.") +
         " No extra paths are being reported — this is an unresolved lookup, not an empty config.",
     );
@@ -409,7 +409,7 @@ function standaloneRoot(): {
   if (!seen) {
     const origin =
       source === "default-workspace"
-        ? "the saved default workspace (set_default_workspace) — the install was probably moved, renamed or deleted since it was saved"
+        ? "the saved default workspace (workspace action:\"set_default\") — the install was probably moved, renamed or deleted since it was saved"
         : "a ComfyUI root this process INFERRED rather than one you named literally " +
           "(startup auto-detection, or a nested root descended from COMFYUI_PATH) — it has " +
           "since been moved, renamed or deleted";
@@ -417,7 +417,7 @@ function standaloneRoot(): {
       `UNRESOLVED: "${root}" is not an existing directory, so it cannot be used to locate ` +
         `extra_model_paths.yaml. That path came from ${origin}. Nothing was read or ` +
         "written — refusing to create a config under a root that does not exist, because no " +
-        "ComfyUI would ever read it. Re-run set_default_workspace with the current path, set " +
+        "ComfyUI would ever read it. Re-run workspace (action:\"set_default\") with the current path, set " +
         "COMFYUI_PATH, or pass config_path explicitly.",
     );
   }
@@ -450,8 +450,8 @@ function standaloneConfigPath(): Omit<ResolvedTarget, "target"> {
             `Resolved from the saved default workspace (${root}) because COMFYUI_PATH is not set. ` +
               `This was NOT confirmed against the running ComfyUI (its live ` +
               `--extra-model-paths-config was not available), so if you have since switched ` +
-              `installs this may not be the file the running server reads — check get_workspace ` +
-              `and re-run set_default_workspace if it is stale.`,
+              `installs this may not be the file the running server reads — check workspace (action:"get") ` +
+              `and re-run workspace (action:"set_default") if it is stale.`,
           ]
         : [],
   };
