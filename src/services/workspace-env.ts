@@ -2,10 +2,11 @@ import { execFile } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { homedir, platform } from "node:os";
-import { dirname, isAbsolute, join, resolve as pathResolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve as pathResolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { config, getComfyUIBaseUrl, isRemoteMode } from "../config.js";
 import { getSystemStats } from "../comfyui/client.js";
+import { resolveLiveInterpreter } from "./live-interpreter.js";
 import { logger } from "../utils/logger.js";
 import { ValidationError } from "../utils/errors.js";
 
@@ -49,32 +50,28 @@ export function resetWorkspaceConfig(): void {
 // share) must NOT have its config vars expanded against our env — that could authorize
 // a wrong-place download destination (#633 P1b). Set ONLY on the env-inheriting python
 // spawn path, cleared on stop; module-scoped, so it resets each MCP process lifetime.
+//
+// This flag is ENV-TRUST ONLY. The interpreter we launched with is recorded in
+// live-interpreter.ts (recordLaunchedInterpreter) — the ONE launch record, trusted
+// only after PID + creation-time identity validation. A second, unvalidated record
+// here was the stale-record hazard: our child dies, another server takes the port
+// under the same install root, and pip/update work would have been directed into the
+// OLD interpreter while claiming to be exact (#401 re-gate).
 let localComfyUILaunchedByUs = false;
-// /system_stats intentionally does not expose sys.executable.  When this MCP
-// process starts ComfyUI, retain the executable we actually spawned: it is the
-// only non-inferred answer to where a package install belongs (#651).
-let localComfyUILaunchInterpreter: string | undefined;
 
 /** Record that this MCP process spawned the local ComfyUI (env inherited). */
-export function markLocalComfyUILaunched(interpreter?: string): void {
+export function markLocalComfyUILaunched(): void {
   localComfyUILaunchedByUs = true;
-  localComfyUILaunchInterpreter = interpreter?.trim() || undefined;
 }
 
 /** Clear the launched-by-us flag (on stop, and a test seam). */
 export function resetLocalComfyUILaunchState(): void {
   localComfyUILaunchedByUs = false;
-  localComfyUILaunchInterpreter = undefined;
 }
 
 /** True when this MCP process launched the connected local ComfyUI (shares our env). */
 export function didLaunchLocalComfyUI(): boolean {
   return localComfyUILaunchedByUs;
-}
-
-/** The exact interpreter this MCP process used to launch the live local server. */
-export function getLaunchedLocalInterpreter(): string | undefined {
-  return localComfyUILaunchedByUs ? localComfyUILaunchInterpreter : undefined;
 }
 
 function workspaceConfigPath(): string {
@@ -495,6 +492,25 @@ export function liveScriptFromArgv(
 }
 
 /**
+ * The RELATIVE directory of the running server's `main.py` (e.g. `"ComfyUI"` for
+ * `ComfyUI\main.py`, `"."` for a bare `main.py`). ComfyUI **Desktop** reports exactly
+ * this — a relative argv[0] with no `cwd` — so `liveRootFromArgv` cannot resolve a
+ * live root and interpreter resolution used to fall back to `COMFYUI_PATH` (the
+ * bundle root), picking the launcher's `standalone-env` python instead of the
+ * server's own `ComfyUI/.venv` (#401 recurrence). Callers anchor this against a
+ * configured base and confirm a `main.py` is really there. Shares the positional-only
+ * script extraction of `scriptTokenFromArgv` (#648 review). Returns `undefined` when
+ * argv has no main.py, or when its dir is already absolute (use `liveRootFromArgv`).
+ */
+export function liveRelDirFromArgv(argv: string[] | undefined): string | undefined {
+  const a = scriptTokenFromArgv(argv);
+  if (a === undefined) return undefined;
+  const dir = dirname(a);
+  if (isAbsolute(dir)) return undefined;
+  return dir === "" ? "." : dir;
+}
+
+/**
  * Resolve the Python interpreter that ACTUALLY belongs to a ComfyUI install
  * `root`, honoring EVERY layout ComfyUI ships with — portable Windows builds keep
  * python under `standalone-env` / `python_embeded` (NOT just `.venv`/`venv`). Used
@@ -507,112 +523,194 @@ export function liveScriptFromArgv(
 export function resolveRootInterpreter(root: string | undefined): string {
   const names = IS_WIN ? ["python.exe", "python"] : ["python3", "python"];
   if (root) {
-    for (const c of interpreterCandidates(root)) {
-      if (/^\\\\/.test(c)) continue; // skip UNC (existsSync can block on dead shares)
-      try {
-        if (existsSync(c)) return c;
-      } catch {
-        // ignore and continue
-      }
+    // Candidates directly under `root` ONLY — see interpreterCandidates: this is a
+    // mutating path (pip installs) with no live server to verify a nested guess.
+    for (const c of candidatesIn(root)) {
+      if (safeExists(c)) return c;
     }
   }
   return names[0];
 }
 
-/** Platform interpreter candidates under a ComfyUI install root, most-preferred first. */
-function interpreterCandidates(root: string): string[] {
+/** existsSync that never throws and never touches UNC paths (a dead network share
+ *  can block existsSync for seconds). */
+function safeExists(p: string): boolean {
+  if (/^\\\\/.test(p)) return false;
+  try {
+    return existsSync(p);
+  } catch {
+    return false;
+  }
+}
+
+/** Does this directory hold a ComfyUI entrypoint (`main.py`/`main.pyw`)? */
+function hasMainPy(dir: string): boolean {
+  return safeExists(join(dir, "main.py")) || safeExists(join(dir, "main.pyw"));
+}
+
+/**
+ * The server roots to search under a configured/derived base, MOST SPECIFIC first.
+ *
+ * ComfyUI Desktop (and the classic Windows portable bundle) nest the actual server
+ * one level down: `<base>/ComfyUI/main.py` with its own `<base>/ComfyUI/.venv`,
+ * while `<base>` itself holds the launcher's `standalone-env` python — a DIFFERENT
+ * interpreter whose site-packages the running server never imports. Picking `<base>`
+ * is what made `get_environment` report `standalone-env/python.exe` and made pip
+ * installs land where custom nodes couldn't see them (#401 recurrence). So when the
+ * nested dir actually contains a `main.py`, it IS the server root and wins.
+ */
+function serverRootsUnder(base: string): string[] {
+  // The base IS a server root already (its own main.py) — never let a nested checkout
+  // outrank it. Otherwise an exact argv-derived root with a stray `ComfyUI/` inside it
+  // would silently lose to that nested tree's interpreter.
+  if (hasMainPy(base)) return [base];
+  const nested = join(base, "ComfyUI");
+  return hasMainPy(nested) ? [nested, base] : [base];
+}
+
+/** Platform interpreter candidates sitting DIRECTLY under one root, most-preferred
+ *  first. This order is deliberately untouched by #401: it also decides which
+ *  interpreter `resolveRootInterpreter` hands to pip installs, and reshuffling it
+ *  would silently move installs between environments. Within a root the order is only
+ *  a preference, never authority — resolveComfyuiPython marks a root holding several
+ *  environments `ambiguous` and refuses to speak for it. */
+function candidatesIn(r: string): string[] {
   const names = IS_WIN ? ["python.exe", "python"] : ["python3", "python"];
   const candidates: string[] = [];
   if (IS_WIN) {
-    candidates.push(join(root, "standalone-env", "python.exe"));
-    candidates.push(join(root, "python_embeded", "python.exe"));
-    candidates.push(join(root, "..", "python_embeded", "python.exe"));
+    candidates.push(join(r, "standalone-env", "python.exe"));
+    candidates.push(join(r, "python_embeded", "python.exe"));
+    candidates.push(join(r, "..", "python_embeded", "python.exe"));
   }
   const venvBins = IS_WIN
-    ? [join(root, ".venv", "Scripts"), join(root, "venv", "Scripts")]
-    : [join(root, ".venv", "bin"), join(root, "venv", "bin")];
+    ? [join(r, ".venv", "Scripts"), join(r, "venv", "Scripts")]
+    : [join(r, ".venv", "bin"), join(r, "venv", "bin")];
   for (const bin of venvBins) for (const n of names) candidates.push(join(bin, n));
   return candidates;
 }
 
+/** Candidates for a configured base, following a NESTED server root when the base is
+ *  not one itself. Used only by resolveComfyuiPython — the live-aware reporting path,
+ *  which cross-checks whatever it picks against the running server. The install-side
+ *  `resolveRootInterpreter` deliberately does NOT follow the nesting: with no live
+ *  server to check against, preferring a nested `.venv` over the base's own
+ *  interpreter would be an unverifiable guess in a MUTATING path. */
+function interpreterCandidates(root: string): string[] {
+  return serverRootsUnder(root).flatMap(candidatesIn);
+}
+
+/** Is this candidate a portable "python_embeded" interpreter? ComfyUI's own
+ *  `/system_stats.system.embedded_python` is exactly this test applied to its
+ *  `sys.executable`, which makes it a cheap, decisive disambiguator between an
+ *  install's `.venv` and a bundle's embedded python. */
+function isEmbeddedCandidate(candidate: string): boolean {
+  return basename(dirname(candidate)).toLowerCase() === "python_embeded";
+}
+
+/**
+ * A BEST-GUESS interpreter, inferred from install layout.
+ *
+ * This is a GUESS and nothing more. It is fine for display and for probing (a
+ * package we can SEE is really installed somewhere), but it must NEVER back a
+ * negative or a "this is the server's environment" claim — that is what #401 was.
+ * Authority comes only from `resolveLiveInterpreter()` in live-interpreter.ts,
+ * which observes the actual process instead of guessing from directory layout.
+ */
 export interface ComfyuiPythonResolution {
   /** The interpreter to probe. Absolute when verified; a bare PATH name as last resort. */
   python: string | undefined;
   /** The interpreter exists on disk under a known ComfyUI root (venv/embedded). */
   verified: boolean;
-  /** That root is the LIVE running server's own install root — i.e. this is provably
-   *  the interpreter running ComfyUI. Only a `live` interpreter's negatives are
-   *  authoritative; anything else must be treated as unknown/untrusted (#401). */
-  live: boolean;
-  /** The resolved absolute live root, when one could be determined from argv. */
+  /** The live server's install root, when argv named one. Provenance only. */
   liveRoot?: string;
 }
 
 /**
- * Resolve the python that ComfyUI actually runs on, LIVE-FIRST. The running server's
- * argv-derived install root is tried BEFORE an explicit COMFYUI_PATH, which is tried
- * before the saved default workspace (#418) — and the saved default is consulted ONLY
- * when there is neither a live argv nor an explicit path to trust. Portable/standalone
- * installs keep python under python_embeded / standalone-env (not just .venv), so all
- * are checked. Falls back to a bare PATH name (`verified:false, live:false`) when no
- * on-disk interpreter is found — a negative off THAT is untrustworthy (#401 / PR #433).
+ * BEST-GUESS interpreter for an install, from layout. Tries the running server's
+ * argv-derived root first, then an explicit COMFYUI_PATH, then the saved default
+ * workspace (#418); a relative argv `main.py` (the ComfyUI Desktop shape) is
+ * re-anchored on those bases when a `main.py` is really there, which is what gets
+ * the probe onto the server's own `ComfyUI/.venv` instead of the bundle launcher's
+ * `standalone-env`. Portable/standalone installs keep python under python_embeded /
+ * standalone-env, so those are checked too. Falls back to a bare PATH name.
  *
- * REMOTE mode (`opts.remote`): the live interpreter is on the REMOTE host and cannot be
- * probed locally, so a locally-existing argv path is NOT treated as `live` — otherwise a
- * coincident local install would have its (version-matching) negatives mis-reported as
- * authoritative for a server running elsewhere. In remote mode we do not probe the live
- * root at all; callers degrade to honest-unknown / untrusted (#401 / PR #433 round 3).
+ * THIS IS A GUESS. It decides what to PROBE, never what to CLAIM: two cloned venvs
+ * under one root, a conda env we don't enumerate, or a server started with an
+ * interpreter from elsewhere all defeat layout reasoning, and no version or torch
+ * "fingerprint" repairs that. Authority belongs to resolveLiveInterpreter(), which
+ * observes the process. Callers must treat this result as unverified (#401).
  */
 export function resolveComfyuiPython(
   comfyuiPath: string | undefined,
   statsArgv: string[] | undefined,
-  opts?: { cwd?: string; remote?: boolean },
+  opts?: { cwd?: string; remote?: boolean; embeddedPython?: boolean },
 ): ComfyuiPythonResolution {
   const names = IS_WIN ? ["python.exe", "python"] : ["python3", "python"];
   const remote = opts?.remote ?? false;
-  const liveRoot = liveRootFromArgv(statsArgv, opts?.cwd);
+  const argvRoot = liveRootFromArgv(statsArgv, opts?.cwd);
 
-  const rootsWithFlag: Array<{ root: string; live: boolean }> = [];
-  // Only a LOCAL live root is a probeable live interpreter. Skip it entirely in remote
-  // mode so we never probe a coincident local path as if it were the remote server's.
-  if (liveRoot && !remote) rootsWithFlag.push({ root: liveRoot, live: true });
-  if (comfyuiPath && comfyuiPath !== liveRoot) {
-    rootsWithFlag.push({ root: comfyuiPath, live: false });
-  }
-  // Saved default only when we have nothing more trustworthy to go on (never remote).
-  if (!liveRoot && !comfyuiPath && !remote) {
+  // The on-disk bases we may inspect, most-trusted first: an explicit COMFYUI_PATH,
+  // else the saved default workspace (#418).
+  const bases: string[] = [];
+  if (comfyuiPath) bases.push(comfyuiPath);
+  else if (!argvRoot && !remote) {
     const saved = resolveEffectiveComfyUIBase();
-    if (saved) rootsWithFlag.push({ root: saved, live: false });
+    if (saved) bases.push(saved);
   }
 
-  for (const { root, live } of rootsWithFlag) {
-    for (const c of interpreterCandidates(root)) {
-      // Skip UNC paths — existsSync on a dead network share can block for seconds.
-      if (/^\\\\/.test(c)) continue;
-      try {
-        if (existsSync(c)) return { python: c, verified: true, live, liveRoot };
-      } catch {
-        // ignore and continue
+  // Re-anchor a RELATIVE argv `main.py` (ComfyUI Desktop reports `ComfyUI\main.py`
+  // with no cwd) onto each base, accepted only when a main.py is really on disk.
+  let anchoredRoot: string | undefined;
+  if (!argvRoot && !remote) {
+    const relDir = liveRelDirFromArgv(statsArgv);
+    if (relDir !== undefined) {
+      for (const base of bases) {
+        const candidate = pathResolve(base, relDir);
+        if (hasMainPy(candidate)) {
+          anchoredRoot = candidate;
+          break;
+        }
       }
     }
   }
-  return { python: names[0], verified: false, live: false, liveRoot };
-}
 
-/** True when two python version strings share the same major.minor (3.12.11 ~ 3.12.0). */
-function pythonVersionsAgree(a: string | undefined, b: string | undefined): boolean {
-  if (!a || !b) return false;
-  const mm = (v: string): string | undefined => v.replace(/^Python\s+/i, "").match(/^(\d+\.\d+)/)?.[1];
-  const ma = mm(a);
-  const mb = mm(b);
-  return !!ma && ma === mb;
+  const liveRoot = argvRoot ?? anchoredRoot;
+
+  const roots: string[] = [];
+  // Skip a live root entirely in remote mode — a coincident local path of the same
+  // name is not the remote server's install.
+  if (argvRoot && !remote) roots.push(argvRoot);
+  if (anchoredRoot) roots.push(anchoredRoot);
+  for (const base of bases) {
+    if (base === argvRoot || base === anchoredRoot) continue;
+    roots.push(base);
+  }
+
+  // The server's `embedded_python` self-report still ORDERS the guess (it says
+  // whether its interpreter lives in a `python_embeded` dir), which helps us probe
+  // the more likely candidate on a portable bundle. It does not confer authority.
+  const hint = opts?.embeddedPython;
+  for (const root of roots) {
+    const existing = interpreterCandidates(root).filter(safeExists);
+    if (existing.length === 0) continue;
+    const matching =
+      hint === undefined ? existing : existing.filter((c) => isEmbeddedCandidate(c) === hint);
+    const pool = matching.length > 0 ? matching : existing;
+    return { python: pool[0], verified: true, liveRoot };
+  }
+  return { python: names[0], verified: false, liveRoot };
 }
 
 // ---------------------------------------------------------------------------
 // Install interpreter resolution (#651)
 // ---------------------------------------------------------------------------
 
-export type InstallInterpreterSource = "override" | "launched" | "undetermined";
+/** Where an install interpreter answer came from. "launched" and "observed" are both
+ *  OBSERVED ground truth from live-interpreter.ts: "launched" is the child this MCP
+ *  spawned, re-validated per call by PID + creation time (never a bare launch mark —
+ *  a stale record refuses); "observed" is the OS process table corroborated against
+ *  the server's own argv. "override" is the operator's COMFYUI_PYTHON. */
+export type InstallInterpreterSource = "override" | "launched" | "observed" | "undetermined";
 
 export interface InstallInterpreterResolution {
   python?: string;
@@ -621,33 +719,51 @@ export interface InstallInterpreterResolution {
   reason: string;
 }
 
-function pathExists(path: string): boolean {
-  if (/^\\\\/.test(path)) return false;
-  try {
-    return existsSync(path);
-  } catch {
-    return false;
-  }
-}
-
-function hasMainPy(root: string): boolean {
-  return pathExists(join(root, "main.py")) || pathExists(join(root, "main.pyw"));
-}
-
 /** Desktop commonly reports `ComfyUI/main.py` without a cwd.  Anchor that only
- * against the install being modified, and only after confirming main.py exists. */
+ * against the install being modified, and only after confirming main.py exists.
+ * Shares the positional-only script extraction of `scriptTokenFromArgv` via
+ * `liveRelDirFromArgv` — a main.py-shaped flag VALUE is never the script (#648). */
 function liveRootForInstall(argv: string[] | undefined, cwd: string | undefined, root: string | undefined): string | undefined {
   const absolute = liveRootFromArgv(argv, cwd);
   if (absolute) return absolute;
-  if (!root || !Array.isArray(argv)) return undefined;
-  for (const raw of argv) {
-    if (typeof raw !== "string") continue;
-    const script = raw.trim().replace(/^["']+/, "").replace(/["']+$/, "");
-    if (!/(^|[\\/])main\.pyw?$/i.test(script) || isAbsolute(script)) continue;
-    const candidate = pathResolve(root, dirname(script));
-    if (hasMainPy(candidate)) return candidate;
-  }
+  if (!root) return undefined;
+  const relDir = liveRelDirFromArgv(argv);
+  if (relDir === undefined) return undefined;
+  const candidate = pathResolve(root, relDir);
+  if (hasMainPy(candidate)) return candidate;
   return undefined;
+}
+
+/**
+ * Do two python version strings describe the same interpreter?
+ *
+ * We probe `sys.version` — the SAME string `/system_stats` reports — so both sides
+ * carry the full banner ("3.13.12 (main, Feb 12 2026, 00:38:53) [MSC v.1944 64 bit
+ * (AMD64)]"). When both banners have build/compiler text we compare it too: a
+ * different build of the same version is a different interpreter. Otherwise we fall
+ * back to the full dotted version, at whatever precision both sides supply (so a
+ * bare "3.13" from an old probe never fails against "3.13.12").
+ *
+ * This is a CONTRADICTION check, never an identity check — two venvs cloned from one
+ * base interpreter report byte-identical banners, so agreement proves nothing. Only
+ * an OBSERVED interpreter (live-interpreter.ts) carries authority (#401).
+ */
+export function pythonVersionsAgree(a: string | undefined, b: string | undefined): boolean {
+  if (!a || !b) return false;
+  const norm = (v: string): string => v.replace(/^Python\s+/i, "").replace(/\s+/g, " ").trim();
+  const na = norm(a);
+  const nb = norm(b);
+  // Both carry build/compiler detail → compare the whole banner.
+  const detailed = (v: string): boolean => /[([]/.test(v);
+  if (detailed(na) && detailed(nb)) return na === nb;
+  const parts = (v: string): string[] =>
+    (v.match(/^(\d+(?:\.\d+)*)/)?.[1] ?? "").split(".").filter(Boolean);
+  const pa = parts(na);
+  const pb = parts(nb);
+  if (pa.length === 0 || pb.length === 0) return false;
+  const depth = Math.min(pa.length, pb.length);
+  for (let i = 0; i < depth; i++) if (pa[i] !== pb[i]) return false;
+  return true;
 }
 
 /** A bundle root may contain its actual server in `ComfyUI/`; do not confuse a
@@ -661,13 +777,18 @@ function targetsLiveInstall(serverRoot: string, requestedRoot: string | undefine
 
 /**
  * Resolve a package-install interpreter without claiming that a path-shaped guess is
- * the process that is currently serving ComfyUI.  A server that this MCP launched is
- * authoritative because we recorded its executable; an explicit COMFYUI_PYTHON is the
- * operator's own claim.  In every other case the live interpreter is UNOBSERVABLE —
- * /system_stats has no sys.executable, so even a single discovered `.venv` may be
- * unrelated (for example, the server can be using system Python).  FAIL CLOSED:
- * refuse rather than report an install into a layout-guessed env as applied when the
- * running server may not be able to import from it (#651).
+ * the process that is currently serving ComfyUI.  Success requires OBSERVED ground
+ * truth (#401): an explicit COMFYUI_PYTHON is the operator's own claim; a server this
+ * MCP launched is authoritative only while the process on the port is still that same
+ * child — PID *and* creation time, validated per-call by live-interpreter.ts tier 1,
+ * so a stale launch record (child dead, PID recycled, another server now on the same
+ * install root) is never trusted; and the OS process table is ground truth when the
+ * port owner's command line corroborates the server's own argv (tier 2).  In every
+ * other case the live interpreter is UNOBSERVABLE — /system_stats has no
+ * sys.executable, so even a single discovered `.venv` may be unrelated (for example,
+ * the server can be using system Python).  FAIL CLOSED: refuse rather than report an
+ * install into a layout-guessed env as applied when the running server may not be
+ * able to import from it (#651).
  */
 export async function resolveInstallInterpreter(
   root: string | undefined,
@@ -698,12 +819,29 @@ export async function resolveInstallInterpreter(
     );
   }
   const serverRoot = liveRootForInstall(system?.argv, system?.cwd, root);
-  const launched = getLaunchedLocalInterpreter();
-  if (launched && (!serverRoot || targetsLiveInstall(serverRoot, root))) {
+  // OBSERVED ground truth (#401): /system_stats cannot name the interpreter, but the
+  // OS can. resolveLiveInterpreter is the ONLY launch record this resolver trusts.
+  let statsHost: string | undefined;
+  try {
+    statsHost = new URL(getComfyUIBaseUrl()).hostname;
+  } catch {
+    /* unparseable target → no host filter */
+  }
+  const live = resolveLiveInterpreter({
+    port: config.resolvedPort,
+    host: statsHost,
+    remote: false,
+    serverArgv: system?.argv,
+  });
+  // A VALIDATED launched-by-us observation (tier 1) is authoritative whenever the
+  // live server is the requested install — or argv names no root to contradict it.
+  if (live?.source === "launched-by-us" && (!serverRoot || targetsLiveInstall(serverRoot, root))) {
     return {
-      python: launched,
+      python: live.python,
       source: "launched",
-      reason: `Using "${launched}", the exact interpreter this MCP server used to start the running ComfyUI.`,
+      reason:
+        `Using "${live.python}", the interpreter this MCP server launched the running ` +
+        `ComfyUI with (identity-confirmed for PID ${live.pid}).`,
     };
   }
   if (!serverRoot) {
@@ -717,6 +855,19 @@ export async function resolveInstallInterpreter(
       `The running ComfyUI is a different install ("${serverRoot}") than the requested path; ` +
         "installing into the requested layout would not affect the live server.",
     );
+  }
+  // A process-table observation (tier 2) is ground truth too, but only once the
+  // guards above have tied the live server to the requested install. This strictly
+  // ADDS a success source: when nothing observes the interpreter the install still
+  // refuses (#651 fail-closed).
+  if (live) {
+    return {
+      python: live.python,
+      source: "observed",
+      reason:
+        `Using "${live.python}", the interpreter the OS reports for the running ComfyUI ` +
+        `process (PID ${live.pid}), corroborated against the server's own argv.`,
+    };
   }
   return refuse(
     `Cannot determine which interpreter the running ComfyUI at "${serverRoot}" uses: ` +
@@ -799,6 +950,12 @@ export interface EnvironmentInfo {
     python_version?: string;
     embedded_python?: boolean;
     comfyui_version?: string;
+    /** torch version the RUNNING server reports (e.g. "2.11.0.dev20260123+cu130"). */
+    pytorch_version?: string;
+    /** ComfyUI's own label for how it was deployed, e.g. "local-desktop2-standalone".
+     *  Reported for context and used to explain WHY an interpreter could not be
+     *  observed; it identifies the LAYOUT, never which interpreter is running. */
+    deploy_environment?: string;
     devices?: Array<{
       name: string;
       type: string;
@@ -816,6 +973,13 @@ export interface EnvironmentInfo {
      *  disagrees with the running instance — in that case `packages` is omitted
      *  rather than reporting versions from the wrong environment (#401). */
     python_probe_trusted?: boolean;
+    /** HOW the interpreter was determined — "we know" vs "we're guessing" (#401):
+     *  `launched-by-us` / `process-table` are OBSERVATIONS and are authoritative;
+     *  `layout-guess` is inferred from directory layout and never is. */
+    python_probe_source?: "launched-by-us" | "process-table" | "layout-guess";
+    /** WHY the probe is (or isn't) trusted, in one sentence — so a reader can tell
+     *  "we couldn't determine it" apart from "we determined it's absent" (#401). */
+    python_probe_reason?: string;
     git?: { rev?: string; branch?: string };
     comfyui_manager_version?: string;
     packages?: Record<string, string>;
@@ -853,6 +1017,9 @@ export async function getEnvironment(): Promise<EnvironmentInfo> {
     running.python_version = stats.system.python_version;
     running.embedded_python = stats.system.embedded_python;
     running.comfyui_version = stats.system.comfyui_version;
+    running.pytorch_version = stats.system.pytorch_version;
+    running.deploy_environment = (stats.system as { deploy_environment?: string })
+      .deploy_environment;
     statsArgv = stats.system.argv;
     // ComfyUI does not currently report cwd, but tolerate it if a future/build does.
     statsCwd = (stats.system as { cwd?: string }).cwd;
@@ -884,7 +1051,27 @@ export async function getEnvironment(): Promise<EnvironmentInfo> {
   // running server's argv root wins over an explicit COMFYUI_PATH, which wins over
   // the saved default.
   const remote = isRemoteMode();
-  const resolved = resolveComfyuiPython(workspacePath, statsArgv, { cwd: statsCwd, remote });
+  // GROUND TRUTH — did we launch it, or can the OS tell us? (See live-interpreter.ts.)
+  // statsArgv is the server's OWN sys.argv: the process we find on the port must have
+  // a command line consistent with it, or it is not the server that answered us.
+  let statsHost: string | undefined;
+  try {
+    statsHost = new URL(apiTarget).hostname;
+  } catch {
+    /* unparseable target → no host filter */
+  }
+  const live = resolveLiveInterpreter({
+    port: config.resolvedPort,
+    host: statsHost,
+    remote,
+    serverArgv: statsArgv,
+  });
+  const resolved = resolveComfyuiPython(workspacePath, statsArgv, {
+    cwd: statsCwd,
+    remote,
+    // Orders the GUESS only (used when there is no ground truth to show instead).
+    embeddedPython: running.reachable ? running.embedded_python : undefined,
+  });
 
   // The install root we can actually inspect on disk: an explicit/saved workspace,
   // else the live server's own root (so we still report git/manager for a live
@@ -903,55 +1090,80 @@ export async function getEnvironment(): Promise<EnvironmentInfo> {
     local.note = `Using saved default workspace "${cfg.defaultWorkspace}" (COMFYUI_PATH not set).`;
   }
 
-  const version = resolved.python ? await probe(resolved.python, ["--version"]) : undefined;
-  if (resolved.python && version) {
-    const ver = version.replace(/^Python\s+/i, "");
-    local.python = { executable: resolved.python, version: ver };
+  // GROUND TRUTH first: the interpreter we LAUNCHED ComfyUI with, or the one the OS
+  // says the process on our port is running. Only these are observations; everything
+  // below is a layout guess (#401).
+  const groundTruth = live ?? undefined;
+  const probeExe = groundTruth?.python ?? resolved.python;
 
-    // "Trusted" means the probed interpreter IS the one running ComfyUI, so its
-    // package list truly describes the live environment (#401). Order of certainty:
-    //   - REMOTE: the running server is elsewhere; NO local interpreter is its own,
-    //     so never trust a local probe (a coincident local path is not the server's).
-    //   - resolved.live: we resolved the interpreter from the live server's own
-    //     argv root — provably correct.
-    //   - server unreachable: nothing live to contradict, but only trust a REAL
-    //     workspace venv/embedded python — NOT a bare PATH fallback (which is not
-    //     provably the configured workspace's interpreter).
-    //   - live root unknown (reachable but argv gave no resolvable root): best we
-    //     can do is a version cross-check against the running instance.
-    //   - live root KNOWN but we're not on it (a different/saved workspace): the
-    //     probe is a DIFFERENT environment — untrusted, omit packages.
+  // Read `sys.version` — byte-for-byte what /system_stats reports — so the
+  // contradiction check can compare build/compiler text, not just the number.
+  // `--version` is the fallback for an interpreter that can't run -c.
+  const version = probeExe
+    ? ((await probe(probeExe, ["-c", "import sys;print(sys.version)"])) ??
+      (await probe(probeExe, ["--version"])))
+    : undefined;
+  if (probeExe && version) {
+    const ver = version.replace(/^Python\s+/i, "").replace(/\s+/g, " ").trim();
+    // Display the plain number; keep the full banner for the comparison below.
+    const shortVer = ver.match(/^(\d+(?:\.\d+)*)/)?.[1] ?? ver;
+    local.python = { executable: probeExe, version: shortVer };
+
+    // THE TERMINATING RULE (#401). An interpreter is authoritative only when we
+    // OBSERVED it, never when we inferred it from install layout:
+    //   1. we launched the process and recorded the interpreter we used;
+    //   2. the OS process table reports argv[0] of the process on our port;
+    //   3. otherwise UNKNOWN — no package list, no "not installed", no trust.
+    // Everything that used to live here (sole-candidate-under-a-believed-root,
+    // python/torch "fingerprints", ambiguity corroboration) was inference dressed up
+    // as proof, and inference is what reported the wrong venv in the first place.
     const runningPy = running.python_version;
-    let trusted: boolean;
-    if (remote) {
-      trusted = false;
-    } else if (resolved.live) {
-      trusted = true;
-    } else if (!running.reachable) {
-      trusted = resolved.verified;
-    } else if (!resolved.liveRoot) {
-      trusted = pythonVersionsAgree(ver, runningPy);
-    } else {
-      trusted = false;
-    }
-    local.python_probe_trusted = trusted;
+    let trusted = false;
+    let reason: string;
 
-    if (trusted) {
-      const pkgs = await probePipPackages(resolved.python, KEY_PACKAGES);
+    if (remote) {
+      reason =
+        "the running ComfyUI is REMOTE — no local interpreter is the remote server's, " +
+        "and ComfyUI does not report its own sys.executable over HTTP";
+    } else if (!groundTruth) {
+      const deployed = running.deploy_environment
+        ? ` (ComfyUI reports deploy_environment "${running.deploy_environment}")`
+        : "";
+      reason =
+        `the interpreter shown is a BEST GUESS from install layout, not an observation: ` +
+        `we did not launch this ComfyUI and could not read the interpreter of the ` +
+        `process serving port ${config.resolvedPort} from the OS${deployed}. Package ` +
+        `versions are omitted rather than attributed to the wrong environment`;
+    } else if (!pythonVersionsAgree(ver, runningPy)) {
+      // We DID observe the interpreter, yet it disagrees with the running server.
+      // Something is off (a stale PID, a wrapper); report unknown, not a wrong list.
+      reason =
+        `the observed interpreter (${groundTruth.source}) reports python ${shortVer}, which ` +
+        `does not match the running ComfyUI python ${runningPy ?? "(unreported)"} — ` +
+        `refusing to attribute its packages to the server`;
+    } else {
+      trusted = true;
+      reason =
+        groundTruth.source === "launched-by-us"
+          ? `this MCP server launched ComfyUI (PID ${groundTruth.pid}) with this exact interpreter`
+          : `the OS reports PID ${groundTruth.pid} (serving port ${config.resolvedPort}) is running this interpreter`;
+    }
+
+    local.python_probe_trusted = trusted;
+    local.python_probe_source = groundTruth?.source ?? "layout-guess";
+    local.python_probe_reason = reason;
+
+    let pkgs: Record<string, string> | undefined;
+
+    if (trusted && probeExe) {
+      pkgs = await probePipPackages(probeExe, KEY_PACKAGES);
       if (Object.keys(pkgs).length > 0) local.packages = pkgs;
     } else {
-      const detail = remote
-        ? "the running ComfyUI is REMOTE — a locally-probed interpreter is not the remote server's environment"
-        : resolved.liveRoot
-          ? `the probe interpreter is a different workspace than the running ComfyUI (it does not match the running ComfyUI python ${runningPy})`
-          : !running.reachable
-            ? "the server is unreachable and no workspace venv/embedded python was found (a bare PATH python is not authoritative)"
-            : `probed python ${ver} does not match the running ComfyUI python ${runningPy}`;
       local.note = [
         local.note,
-        `Package versions omitted: ${detail}, so reporting them would be a false ` +
-          `capability report (#401). Point COMFYUI_PATH at the install actually ` +
-          `running ComfyUI for an accurate report.`,
+        `Package versions omitted: ${reason}, so reporting them would be a false ` +
+          `capability report (#401). Start ComfyUI through start_comfyui, or run it ` +
+          `locally where this process can read its command line, for an accurate report.`,
       ]
         .filter(Boolean)
         .join(" ");

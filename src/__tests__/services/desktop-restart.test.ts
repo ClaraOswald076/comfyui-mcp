@@ -74,7 +74,9 @@ beforeEach(() => {
     if (/netstat/i.test(cmd)) {
       return "  TCP    127.0.0.1:8188    0.0.0.0:0    LISTENING    4321\n";
     }
-    if (/lsof/i.test(cmd)) return "4321\n";
+    // findPidByPort probes with `lsof -nP -iTCP:PORT -sTCP:LISTEN -Fpn`, whose
+    // field output is p<pid> / n<addr:port> records — not the terse `-t` list.
+    if (/lsof/i.test(cmd)) return "p4321\nn127.0.0.1:8188\n";
     return "";
   });
   __processControlTestHooks.reset();

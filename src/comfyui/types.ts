@@ -56,6 +56,10 @@ export interface SystemStats {
     embedded_python: boolean;
     argv?: string[];
     comfyui_version?: string;
+    /** Reported by recent ComfyUI, e.g. "2.11.0.dev20260123+cu130". */
+    pytorch_version?: string;
+    /** Working directory of the running server, when a build reports it. */
+    cwd?: string;
   };
   devices: Array<{
     name: string;

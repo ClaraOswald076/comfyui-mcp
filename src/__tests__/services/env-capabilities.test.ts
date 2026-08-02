@@ -219,7 +219,10 @@ describe("applyStats", () => {
   });
 });
 
-describe("resolveComfyuiPython (#401)", () => {
+describe("resolveComfyuiPython — BEST-GUESS selection only (#401)", () => {
+  // This resolver decides what to PROBE. It deliberately reports no authority
+  // signals any more: which interpreter the server actually runs is answered by
+  // live-interpreter.ts (we launched it / the OS says so), never by layout.
   let dir: string;
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), "comfyui-py-"));
@@ -228,17 +231,19 @@ describe("resolveComfyuiPython (#401)", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  it("returns the on-disk venv interpreter as VERIFIED", async () => {
-    const venvBin = IS_WIN ? join(dir, ".venv", "Scripts") : join(dir, ".venv", "bin");
-    await mkdir(venvBin, { recursive: true });
-    const exe = join(venvBin, IS_WIN ? "python.exe" : "python3");
+  const mkVenvAt = async (root: string): Promise<string> => {
+    const bin = IS_WIN ? join(root, ".venv", "Scripts") : join(root, ".venv", "bin");
+    await mkdir(bin, { recursive: true });
+    const exe = join(bin, IS_WIN ? "python.exe" : "python3");
     await writeFile(exe, "", "utf-8");
+    return exe;
+  };
 
+  it("returns the on-disk venv interpreter as VERIFIED", async () => {
+    const exe = await mkVenvAt(dir);
     const res = resolveComfyuiPython(dir, undefined);
     expect(res.verified).toBe(true);
     expect(res.python).toBe(exe);
-    // No argv → this is NOT the live interpreter (just the pinned workspace's venv).
-    expect(res.live).toBe(false);
   });
 
   it("finds the embedded python of a portable install as VERIFIED (not just .venv)", async () => {
@@ -254,98 +259,154 @@ describe("resolveComfyuiPython (#401)", () => {
   });
 
   it("falls back to a bare PATH name as UNVERIFIED when no venv exists", () => {
-    // A directory with no interpreter under it — the wrong-python scenario.
     const res = resolveComfyuiPython(dir, undefined);
     expect(res.verified).toBe(false);
-    expect(res.live).toBe(false);
     expect(res.python).toBe(IS_WIN ? "python.exe" : "python3");
   });
 
-  it("prefers the LIVE running instance's argv root over a pinned/saved workspace (PR #433 review)", async () => {
-    // Both installs exist with a venv on the same Python major.minor, but only the
-    // LIVE server (root B, from argv main.py) has the package. If we resolved the
-    // pinned/saved root A first, A's negative would survive as a false 'not-installed'
-    // AND process-control could relaunch B's main.py with A's python. The live argv
-    // root must win.
-    const mkVenv = async (root: string): Promise<string> => {
-      const bin = IS_WIN ? join(root, ".venv", "Scripts") : join(root, ".venv", "bin");
-      await mkdir(bin, { recursive: true });
-      const exe = join(bin, IS_WIN ? "python.exe" : "python3");
-      await writeFile(exe, "", "utf-8");
-      return exe;
-    };
+  it("probes the LIVE running instance's argv root ahead of a pinned/saved workspace", async () => {
     const rootA = join(dir, "A"); // pinned COMFYUI_PATH / saved default
     const rootB = join(dir, "B"); // the LIVE running server
-    await mkVenv(rootA);
-    const exeB = await mkVenv(rootB);
+    await mkVenvAt(rootA);
+    const exeB = await mkVenvAt(rootB);
 
     const res = resolveComfyuiPython(rootA, [
       IS_WIN ? "python.exe" : "python3",
       join(rootB, "main.py"),
     ]);
-    expect(res.verified).toBe(true);
-    expect(res.live).toBe(true);
-    expect(res.liveRoot).toBe(rootB);
     expect(res.python).toBe(exeB); // B, not A
+    expect(res.liveRoot).toBe(rootB);
   });
 
-  it("marks the pinned workspace UNTRUSTED (live:false) when the LIVE root has no on-disk venv", async () => {
-    // Live root B (from argv) has no interpreter on disk; only pinned A does. A must
-    // NOT be reported as the live interpreter — its negative would be a false report.
-    const binA = IS_WIN ? join(dir, "A", ".venv", "Scripts") : join(dir, "A", ".venv", "bin");
-    await mkdir(binA, { recursive: true });
-    const exeA = join(binA, IS_WIN ? "python.exe" : "python3");
-    await writeFile(exeA, "", "utf-8");
+  it("falls back to the pinned workspace when the LIVE root has no on-disk venv", async () => {
+    const exeA = await mkVenvAt(join(dir, "A"));
     const rootB = join(dir, "B"); // live root, but no venv created under it
+    await mkdir(rootB, { recursive: true });
 
     const res = resolveComfyuiPython(join(dir, "A"), [join(rootB, "main.py")]);
-    expect(res.python).toBe(exeA); // A is the only interpreter we can probe …
+    expect(res.python).toBe(exeA);
+    expect(res.liveRoot).toBe(rootB); // live root resolvable, just not populated
+  });
+
+  it("anchors a RELATIVE argv main.py on the configured base and picks the SERVER's venv", async () => {
+    // ComfyUI Desktop reports argv[0] = "ComfyUI\main.py" with no cwd. Anchoring is
+    // what gets the PROBE onto the server's own venv instead of the bundle
+    // launcher's standalone-env — which is what lets a positive capability finding
+    // (e.g. Triton IS installed) be made at all.
+    const base = join(dir, "Desktop");
+    const server = join(base, "ComfyUI");
+    await mkdir(server, { recursive: true });
+    await writeFile(join(server, "main.py"), "", "utf-8");
+    const wrong = await mkVenvAt(base);
+    const right = await mkVenvAt(server);
+
+    const res = resolveComfyuiPython(base, [IS_WIN ? "ComfyUI\\main.py" : "ComfyUI/main.py"]);
+    expect(res.python).toBe(right);
+    expect(res.python).not.toBe(wrong);
+    expect(res.liveRoot).toBe(server);
+  });
+
+  it("prefers a nested ComfyUI/ server root over the bundle root even without argv", async () => {
+    const base = join(dir, "Bundle");
+    const server = join(base, "ComfyUI");
+    await mkdir(server, { recursive: true });
+    await writeFile(join(server, "main.py"), "", "utf-8");
+    await mkVenvAt(base);
+    const right = await mkVenvAt(server);
+
+    const res = resolveComfyuiPython(base, undefined);
+    expect(res.python).toBe(right);
     expect(res.verified).toBe(true);
-    expect(res.live).toBe(false); // … but it is NOT the live interpreter
-    expect(res.liveRoot).toBe(rootB); // live root was resolvable, just not populated
+  });
+
+  it("never lets a nested ComfyUI/ tree outrank a root that is itself the server root", async () => {
+    const rootX = join(dir, "X");
+    await mkdir(join(rootX, "ComfyUI"), { recursive: true });
+    await writeFile(join(rootX, "main.py"), "", "utf-8");
+    await writeFile(join(rootX, "ComfyUI", "main.py"), "", "utf-8");
+    const exeX = await mkVenvAt(rootX);
+    await mkVenvAt(join(rootX, "ComfyUI"));
+
+    const res = resolveComfyuiPython(undefined, [join(rootX, "main.py")]);
+    expect(res.python).toBe(exeX);
+  });
+
+  it("orders the guess with the server's embedded_python self-report", async () => {
+    if (!IS_WIN) return; // python_embeded is a Windows-portable layout
+    const bundle = join(dir, "portable");
+    const server = join(bundle, "ComfyUI");
+    await mkdir(server, { recursive: true });
+    await writeFile(join(server, "main.py"), "", "utf-8");
+    const venvExe = await mkVenvAt(server);
+    const embDir = join(bundle, "python_embeded");
+    await mkdir(embDir, { recursive: true });
+    const embExe = join(embDir, "python.exe");
+    await writeFile(embExe, "", "utf-8");
+    const argv = [join(server, "main.py")];
+
+    expect(resolveComfyuiPython(bundle, argv, { embeddedPython: true }).python).toBe(embExe);
+    expect(resolveComfyuiPython(bundle, argv, { embeddedPython: false }).python).toBe(venvExe);
+  });
+
+  it("refuses to anchor when the relative argv dir has no main.py on disk", async () => {
+    const base = join(dir, "Plain");
+    await mkdir(join(base, "ComfyUI"), { recursive: true }); // dir exists but NO main.py
+    const baseExe = await mkVenvAt(base);
+
+    const res = resolveComfyuiPython(base, [IS_WIN ? "ComfyUI\\main.py" : "ComfyUI/main.py"]);
+    expect(res.python).toBe(baseExe);
+    expect(res.liveRoot).toBeUndefined();
   });
 });
 
-describe("reconcileProbeState (#401 — no false 'not installed')", () => {
-  it("keeps 'not-installed' only when the interpreter is LIVE and versions match", () => {
+describe("reconcileProbeState (#401 — only an OBSERVED interpreter may say 'not installed')", () => {
+  it("keeps 'not-installed' when the interpreter was OBSERVED and versions agree", () => {
     expect(
       reconcileProbeState("not-installed", {
-        live: true,
+        observed: true,
         runningPython: "3.12",
         probePython: "3.12",
       }),
     ).toBe("not-installed");
   });
 
-  it("degrades 'not-installed' to 'unknown' when the interpreter is NOT the live one", () => {
+  it("degrades 'not-installed' to 'unknown' for a layout GUESS, however plausible", () => {
+    // This is the whole bug: a sole .venv under the server's own root, a matching
+    // python, a matching torch — all satisfied by an environment that is not the
+    // one ComfyUI is running. Without an observation, the negative cannot stand.
     expect(
       reconcileProbeState("not-installed", {
-        live: false,
+        observed: false,
         runningPython: "3.12",
         probePython: "3.12",
       }),
     ).toBe("unknown");
   });
 
-  it("degrades 'not-installed' to 'unknown' when probe python DISAGREES with the running instance", () => {
-    // The exact issue: running ComfyUI is 3.12, but we probed a 3.11 python.
+  it("degrades 'not-installed' when an observed probe DISAGREES with the running instance", () => {
     expect(
       reconcileProbeState("not-installed", {
-        live: true,
+        observed: true,
         runningPython: "3.12",
         probePython: "3.11",
       }),
     ).toBe("unknown");
   });
 
-  it("passes a positive 'installed' through untouched even from an untrusted interpreter", () => {
+  it("passes a positive 'installed' through untouched even from an unobserved interpreter", () => {
+    // The asymmetry that makes the fix usable: a package we can SEE installed is
+    // really installed, whichever environment we happened to look at.
     expect(
-      reconcileProbeState("installed", { live: false, runningPython: "3.12", probePython: "3.11" }),
+      reconcileProbeState("installed", {
+        observed: false,
+        runningPython: "3.12",
+        probePython: "3.11",
+      }),
     ).toBe("installed");
   });
 
   it("treats undefined as 'unknown'", () => {
-    expect(reconcileProbeState(undefined, { live: true })).toBe("unknown");
+    expect(reconcileProbeState(undefined, { observed: true })).toBe("unknown");
   });
 });
 
