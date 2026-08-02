@@ -699,7 +699,9 @@ async function resolveTargetPathPreferServer(
   // to a real file here, the server's filesystem is not ours (a container/WSL/remote host
   // behind a loopback port). Nothing derived from its argv — including an ABSOLUTE
   // --extra-model-paths-config, which could name a same-spelled path on OUR disk — may be
-  // written to in that state. Proven once, for every argv-derived branch below.
+  // written to in that state. Proven once, for every argv-derived branch below: a main.py
+  // present-but-unresolvable throws here; NO main.py at all leaves liveRoot undefined, and
+  // every branch below refuses on that before touching an argv-derived path.
   const script = liveScriptFromArgv(snapshot.argv, snapshot.cwd);
   // The REAL (symlink-resolved) install root, kept for every downstream use — notably the
   // "other configs" disclosure, which must name the file ComfyUI actually loads
@@ -759,6 +761,23 @@ async function resolveTargetPathPreferServer(
         "same-named file under this MCP's own directory and the edit would be a silent no-op. " +
         "Nothing was read or written — pass config_path explicitly with the absolute path the " +
         "server uses.",
+    );
+  }
+
+  // FAIL CLOSED on unproven locality: `serverConfig` is a path on the SERVER's filesystem,
+  // and only the locality proof above (its main.py resolving to a real file on THIS disk)
+  // shows that filesystem is ours. Reachable but main.py-less argv — a container, WSL, or
+  // remote host behind a loopback port spells paths on ITS disk the same way — leaves the
+  // flag's ABSOLUTE value pointing at a same-spelled file here that is a DIFFERENT tree;
+  // writing it would fabricate success and could corrupt that tree. Refuse instead.
+  if (!liveRoot) {
+    throw new ValidationError(
+      `UNRESOLVED: the running ComfyUI reports --extra-model-paths-config "${serverConfig}" ` +
+        "but its launch argv reveals no main.py that resolves to a file on this " +
+        "filesystem, so the server's file tree is not proven local — the path names a " +
+        "file on ITS disk and a same-spelled path here would be a different file. " +
+        "Nothing was read or written — pass config_path explicitly with a file you can " +
+        'reach, or target: "standalone"/"desktop" to use the local heuristic deliberately.',
     );
   }
 
