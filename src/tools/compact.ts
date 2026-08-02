@@ -112,48 +112,51 @@ export function registerCompactTools(
       return undefined as unknown as ReturnType<McpServer["tool"]>;
     }
   }) as McpServer["tool"];
+  const listToolsSchema = {
+    category: z
+      .string()
+      .optional()
+      .describe("Only list this category (as shown in the catalog headings)."),
+    search: z
+      .string()
+      .optional()
+      .describe("Case-insensitive substring filter over tool names and descriptions."),
+  };
+  const describeToolSchema = {
+    name: z.string().optional().describe("Exact tool name from list_tools."),
+    tool_name: z.string().optional().describe("Alias for name."),
+  };
+  const describeTool = (params: { name?: string; tool_name?: string }): CallToolResult => {
+    const name = params.name ?? params.tool_name;
+    if (!name) return errorText('Missing tool name. Call as: describe_tool {"name": "<tool>"}');
+    const tool = catalog.get(name);
+    if (!tool) return errorText(unknownToolMessage(catalog, name));
+    const schema = inputJsonSchema(tool);
+    const sections = [
+      `# ${tool.name}  (category: ${tool.category})`,
+      "",
+      tool.description,
+      "",
+      schema
+        ? `Parameters (JSON Schema):\n${JSON.stringify(schema, null, 1)}`
+        : "Parameters: none.",
+      "",
+      `Run it with: call_tool {"name": "${tool.name}", "args": ${schema ? "{...}" : "{}"}}`,
+    ];
+    return text(sections.join("\n"));
+  };
   register(
     "list_tools",
     "List every comfyui-mcp capability as a token-light catalog: tool names with one-line summaries, grouped by category. Start here. Then use describe_tool to get a tool's parameters and call_tool to run it.",
-    {
-      category: z
-        .string()
-        .optional()
-        .describe("Only list this category (as shown in the catalog headings)."),
-      search: z
-        .string()
-        .optional()
-        .describe("Case-insensitive substring filter over tool names and descriptions."),
-    },
+    listToolsSchema,
     async (args) => text(buildManifest(catalog, args)),
   );
 
   register(
     "describe_tool",
     "Get the full description and JSON Schema of one tool from the catalog. Always call this before the first call_tool of a tool you haven't used in this session.",
-    {
-      name: z.string().optional().describe("Exact tool name from list_tools."),
-      tool_name: z.string().optional().describe("Alias for name."),
-    },
-    async (params) => {
-      const name = params.name ?? params.tool_name;
-      if (!name) return errorText('Missing tool name. Call as: describe_tool {"name": "<tool>"}');
-      const tool = catalog.get(name);
-      if (!tool) return errorText(unknownToolMessage(catalog, name));
-      const schema = inputJsonSchema(tool);
-      const sections = [
-        `# ${tool.name}  (category: ${tool.category})`,
-        "",
-        tool.description,
-        "",
-        schema
-          ? `Parameters (JSON Schema):\n${JSON.stringify(schema, null, 1)}`
-          : "Parameters: none.",
-        "",
-        `Run it with: call_tool {"name": "${tool.name}", "args": ${schema ? "{...}" : "{}"}}`,
-      ];
-      return text(sections.join("\n"));
-    },
+    describeToolSchema,
+    async (params) => describeTool(params),
   );
 
   register(
@@ -180,7 +183,14 @@ export function registerCompactTools(
         return errorText('Missing tool name. Call as: call_tool {"name": "<tool>", "args": {...}}');
       }
       const tool = catalog.get(name);
-      if (!tool) return errorText(unknownToolMessage(catalog, name));
+      // #693 — a client can retain the stable call_tool binding while its direct
+      // describe_tool/list_tools bindings are stale after a reconnect. The manifest
+      // itself tells that client to describe a tool before calling it, so route those
+      // two facade control-plane operations through call_tool too. Do this ONLY when
+      // the catalog has no direct tool under the same name: in full mode a user
+      // workflow may legitimately claim a reserved name and win the direct registry.
+      const facadeMeta = !tool && (name === "list_tools" || name === "describe_tool") ? name : null;
+      if (!tool && !facadeMeta) return errorText(unknownToolMessage(catalog, name));
 
       const args = params.args ?? params.arguments;
       let rawArgs: Record<string, unknown> = {};
@@ -208,6 +218,21 @@ export function registerCompactTools(
         }
         rawArgs = args as Record<string, unknown>;
       }
+
+      if (facadeMeta === "list_tools") {
+        const parsed = z.object(listToolsSchema).safeParse(rawArgs);
+        if (!parsed.success) return errorText(`Invalid arguments for list_tools: ${parsed.error.message}`);
+        return text(buildManifest(catalog, parsed.data));
+      }
+      if (facadeMeta === "describe_tool") {
+        const parsed = z.object(describeToolSchema).safeParse(rawArgs);
+        if (!parsed.success) return errorText(`Invalid arguments for describe_tool: ${parsed.error.message}`);
+        return describeTool(parsed.data);
+      }
+
+      // The only catalog-less names above returned through facadeMeta, so the
+      // remaining branch always has a concrete application tool to validate.
+      if (!tool) return errorText(unknownToolMessage(catalog, name));
 
       const validated = z.object(tool.schema ?? {}).safeParse(rawArgs);
       if (!validated.success) {
