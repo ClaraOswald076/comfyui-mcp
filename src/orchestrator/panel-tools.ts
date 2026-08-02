@@ -1310,7 +1310,7 @@ async function waitForOpenReceipt(
           // The exact RID identifies this command. Keep a target check as an
           // accidental wrong-workflow guard; active itself is never proof.
           const target = receipt.resolved ?? receipt.requested;
-          if (!activeMatchesTarget(target, path) && receipt.requested !== path) {
+          if (!activeMatchesTarget(target, path)) {
             return { receipt: "unknown", waited_ms: Date.now() - start, attempts };
           }
           if (receipt.applied === true) {

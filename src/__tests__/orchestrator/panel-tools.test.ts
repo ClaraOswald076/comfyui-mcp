@@ -2734,6 +2734,24 @@ describe("panel_open_workflow: verify active state after ack-timeout (#215/#319/
     expect(res.content[0]?.type === "text" ? res.content[0].text : "").toMatch(/outcome is undetermined/i);
   });
 
+  it("does not recover when the matching RID resolves to a different workflow", async () => {
+    const { ctx } = makeVerifyCtx({
+      openReply: () => timeoutResult(),
+      listReplies: [{
+        active_confirmed: true,
+        last_open: {
+          rid: "open-rid-1", answers_only_command_rid: "open-rid-1", cmd: "workflow_open",
+          requested: TARGET,
+          resolved: { path: "other.json", filename: "other.json", routing_key: "wf:other.json" },
+          applied: true,
+        },
+      }],
+    });
+    const res = await defByName("panel_open_workflow").handler({ path: TARGET }, ctx);
+    expect(res.isError).toBe(true);
+    expect(res.content[0]?.type === "text" ? res.content[0].text : "").toMatch(/outcome is undetermined/i);
+  });
+
   it("a genuine acked open-failure (missing file) still fails clearly, unverified", async () => {
     let listCalls = 0;
     const ctx = {
