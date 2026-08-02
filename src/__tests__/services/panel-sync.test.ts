@@ -350,6 +350,14 @@ function makeDeps(opts: {
     readdir: (p) => (p === CUSTOM_NODES ? dirs : []),
     readFile: (p) => files[p] ?? "",
     gitRevision: () => undefined,
+    // The sync personas are never git checkouts (gitRevision → undefined), so
+    // the #724 fallback is never reached; if it ever is, fail the test loudly.
+    gitStatusPorcelain: () => {
+      throw new Error("git fallback must not run in this persona (not a git checkout)");
+    },
+    gitPullFfOnly: () => {
+      throw new Error("git fallback must not run in this persona (not a git checkout)");
+    },
     readPin: () => opts.pin ?? UNPINNED,
     isReachable: async () => true,
     install: async () => {

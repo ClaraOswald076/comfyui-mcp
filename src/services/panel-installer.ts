@@ -4,7 +4,10 @@
 //
 // Policy (decided by the user):
 //   - on load → install if MISSING (install-if-missing only, see ensurePanelInstalled).
-//   - explicit `update` action → pull the latest nightly on demand.
+//   - explicit `update` action → pull the latest nightly on demand. When
+//     ComfyUI-Manager provably no-ops the update (stale legacy 3.x, #724) and
+//     the panel dir is a real git checkout, fall back to a pinned `git merge --ff-only`
+//     on the panel repo, verified on disk by the same #639 machinery.
 //   - target version is always "nightly" (the registry git-HEAD channel) — there
 //     is no clean semver to diff, so we never churn an existing install on load.
 //
@@ -17,6 +20,7 @@
 //   - install/update/reinstall queue via ComfyUI-Manager; ComfyUI must be
 //     RESTARTED to load the new/updated node (we never auto-restart).
 
+import { execFileSync } from "node:child_process";
 import {
   existsSync,
   lstatSync,
@@ -33,6 +37,7 @@ import {
   installCustomNode,
   updateCustomNode,
   reinstallCustomNode,
+  nonInteractiveGitEnv,
   type NodeOpResult,
 } from "./node-management.js";
 import { getSystemStats } from "../comfyui/client.js";
@@ -126,12 +131,72 @@ export interface PanelInstallerDeps {
    */
   gitRevision: (dir: string) => string | undefined;
   /**
+   * `git status --porcelain` in the panel's checkout — the #724 fallback's
+   * cleanliness gate, checked BEFORE any pull: a fast-forward only refuses
+   * local edits it overlaps, so a dirty worktree (modified tracked files in
+   * untouched paths, staged changes, untracked files) must refuse the fallback
+   * outright — comfyui-mcp never mutates a dirty checkout. Returns the raw
+   * porcelain output (empty = clean). THROWS when git itself fails; callers
+   * treat that as "cannot prove clean", never as clean.
+   */
+  gitStatusPorcelain: (dir: string) => string;
+  /**
+   * `git fetch --quiet` — refreshes the tracked remote ref WITHOUT touching
+   * the worktree. The #724 fallback fetches ONCE, then pins every later
+   * check (the ignored-file collision proof) and the mutation itself to the
+   * fetched sha, so a remote commit landing mid-flight can never slip an
+   * uninspected change into the merge (codex gate: no double-fetch race).
+   * THROWS on any failure — "cannot prove currency" refuses.
+   */
+  gitFetch: (dir: string) => void;
+  /**
+   * `git merge --ff-only <rev>` in the panel's own checkout — the #724
+   * fallback's mutation, pinned to the EXACT upstream sha the caller fetched
+   * and inspected (never a second fetch). `--ff-only` can only fast-forward:
+   * it never merges, never rebases, and refuses a diverged checkout. Only
+   * ever called for a resolved git checkout whose worktree passed the
+   * gitStatusPorcelain cleanliness gate and the ignored-file collision
+   * proof against this same rev. Returns git's trimmed output. THROWS on
+   * any failure — a throw means "could not update", never "nothing to pull".
+   */
+  gitMergeFfOnly: (dir: string, rev: string) => string;
+  /**
+   * `git rev-parse --show-toplevel` — proves this dir IS the checkout root
+   * (not merely has git metadata) before any fallback mutation. THROWS on
+   * failure; callers refuse unless the resolved root is the panel dir.
+   */
+  gitWorktreeRoot: (dir: string) => string;
+  /**
+   * `git rev-parse @{upstream}` — the tracked remote's sha. THROWS when no
+   * upstream is configured; callers treat that as “cannot prove currency”.
+   */
+  gitUpstreamRev: (dir: string) => string;
+
+  /**
+   * Ignored local files a fast-forward to `upstreamRev` would SILENTLY
+   * OVERWRITE (git protects untracked files from checkout, but NOT ignored
+   * ones): the ignored untracked files intersected with the diff
+   * HEAD..upstreamRev. The rev MUST be the same pinned sha the caller then
+   * merges, so the proof covers the exact mutation (codex gate). The #724
+   * fallback refuses when this returns anything. THROWS when it cannot
+   * prove the intersection — "cannot prove" refuses.
+   */
+  gitIgnoredPullConflicts: (dir: string, upstreamRev: string) => string[];
+  /**
    * The user's explicit panel-version pin, if any. While a pin is in force NO
    * code path here may move the panel — install/update/reinstall refuse and the
    * on-load ensure skips. Never throws (an unreadable pin reports
    * `indeterminate`, which counts as pinned).
    */
   readPin: () => PanelPinState;
+  /**
+   * Detect the connected Manager's API dialect ("legacy" 3.x | "v2"/"v2-batch" v4).
+   * The #724 git fallback fires ONLY on "legacy": an empty-queue signature is
+   * indistinguishable from an outage/failed enqueue on other dialects, and a git
+   * mutation is only warranted on the PROVEN stale-3.x host (codex gate). Default
+   * is the real detectManagerApi; tests stub it.
+   */
+  detectManagerDialect?: ((base?: string) => Promise<"v2" | "v2-batch" | "legacy" | undefined>) | undefined;
   /** Is the target ComfyUI reachable right now? Never throws. */
   isReachable: () => Promise<boolean>;
   install: (opts: { id: string; version?: string }) => Promise<NodeOpResult>;
@@ -214,6 +279,125 @@ export function resolveGitRevision(dir: string): string | undefined {
   }
 }
 
+/** Hard cap on the #724 fallback git fetch/merge (a fetch + fast-forward). */
+const PANEL_GIT_PULL_TIMEOUT_MS = 180_000;
+
+/** `git status` is local metadata — a short cap is plenty. */
+const PANEL_GIT_STATUS_TIMEOUT_MS = 30_000;
+
+/**
+ * Run a read-or-mutate git command in the panel checkout, never prompting for
+ * credentials (nonInteractiveGitEnv). Returns trimmed stdout. THROWS a
+ * PanelInstallError with git's stderr on any failure — a clean exit is the
+ * only signal the command actually did its work.
+ */
+function runGit(dir: string, args: string[], timeoutMs: number): string {
+  try {
+    const out = execFileSync("git", args, {
+      cwd: dir,
+      encoding: "utf-8",
+      timeout: timeoutMs,
+      env: nonInteractiveGitEnv(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return (out ?? "").trim();
+  } catch (err) {
+    const e = err as {
+      stdout?: Buffer | string;
+      stderr?: Buffer | string;
+      message?: string;
+    };
+    const detail = [e.stdout, e.stderr]
+      .map((b) => (b == null ? "" : b.toString()))
+      .join("")
+      .trim();
+    throw new PanelInstallError(
+      `git ${args.join(" ")} in ${dir} failed: ${detail || e.message || "unknown error"}`,
+    );
+  }
+}
+
+/**
+ * `git status --porcelain` in the panel's checkout — the #724 fallback's
+ * CLEANLINESS gate. Empty output = clean; anything else (modified tracked
+ * files, staged changes, untracked files) means the fallback must REFUSE:
+ * `git pull --ff-only` only refuses local edits that OVERLAP the fast-forward,
+ * so edits in untouched paths would be silently carried through our mutation.
+ * THROWS when git itself fails, which callers must treat as "cannot prove
+ * clean" — never as clean.
+ */
+export function gitStatusPorcelain(dir: string): string {
+  return runGit(dir, ["status", "--porcelain"], PANEL_GIT_STATUS_TIMEOUT_MS);
+}
+
+/**
+ * `git fetch --quiet` — refresh the tracked remote ref without touching the
+ * worktree. THROWS a PanelInstallError with git's stderr on any failure.
+ */
+export function gitFetch(dir: string): void {
+  runGit(dir, ["fetch", "--quiet"], PANEL_GIT_PULL_TIMEOUT_MS);
+}
+
+/**
+ * `git merge --ff-only <rev>` in the panel's own checkout — the #724 fallback
+ * for hosts where ComfyUI-Manager provably no-ops updates (stale legacy 3.x).
+ * The rev is PINNED: the caller fetched once, proved no ignored-file
+ * collision against this exact sha, and only then merges it — a `git pull`
+ * would fetch AGAIN and could apply a newer, uninspected commit (codex gate).
+ * `--ff-only` can only fast-forward: it never merges, never rebases, and
+ * refuses a diverged checkout. Callers MUST gate it on gitStatusPorcelain
+ * first — a fast-forward does NOT refuse dirty paths it doesn't overlap, and
+ * comfyui-mcp never mutates a dirty checkout. THROWS a PanelInstallError with
+ * git's stderr on any failure.
+ */
+export function gitMergeFfOnly(dir: string, rev: string): string {
+  return runGit(dir, ["merge", "--ff-only", rev], PANEL_GIT_PULL_TIMEOUT_MS);
+}
+
+/**
+ * `git rev-parse --show-toplevel` for the #724 fallback: a `.git` pointer
+ * proves metadata exists, NOT that this directory is the worktree ROOT — a
+ * copied/stale gitdir could make status/pull mutate a sibling checkout while
+ * the report credits the panel repo (codex gate). THROWS on any failure;
+ * callers refuse unless the resolved root IS the panel dir.
+ */
+export function gitWorktreeRoot(dir: string): string {
+  return runGit(dir, ["rev-parse", "--show-toplevel"], PANEL_GIT_STATUS_TIMEOUT_MS).trim();
+}
+
+/** `git rev-parse @{upstream}` — the sha the checkout tracks. THROWS when no
+ *  upstream is configured; the "at upstream tip" claim requires this proof. */
+export function gitUpstreamRev(dir: string): string {
+  return runGit(dir, ["rev-parse", "@{upstream}"], PANEL_GIT_STATUS_TIMEOUT_MS).trim();
+}
+
+/**
+ * Ignored-file collision proof for the #724 fallback (codex gate): `git status
+ * --porcelain` omits ignored files, and a fast-forward does NOT protect them —
+ * when the remote newly tracks a path that is locally ignored, the merge
+ * silently overwrites the local file. Intersect the ignored untracked files
+ * with the diff HEAD..upstreamRev, where upstreamRev is the SAME pinned sha
+ * the caller then merges, so the proof covers the exact mutation. THROWS
+ * (PanelInstallError) when the proof cannot be computed — callers treat that
+ * as "cannot prove safe", never as safe.
+ */
+export function gitIgnoredPullConflicts(dir: string, upstreamRev: string): string[] {
+  const ignored = runGit(
+    dir,
+    ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+    PANEL_GIT_STATUS_TIMEOUT_MS,
+  )
+    .split("\0")
+    .filter(Boolean);
+  if (ignored.length === 0) return [];
+  const incoming = new Set(
+    runGit(dir, ["diff", "--name-only", "-z", "HEAD", upstreamRev], PANEL_GIT_STATUS_TIMEOUT_MS)
+      .split("\0")
+      .filter(Boolean),
+  );
+  return ignored.filter((f) => incoming.has(f));
+}
+
 export const defaultDeps: PanelInstallerDeps = {
   isLocalMode: () => isLocalMode(),
   // Keep panel management aligned with get_environment, downloads, and
@@ -259,6 +443,12 @@ export const defaultDeps: PanelInstallerDeps = {
   readdir: (p) => readdirSync(p),
   readFile: (p) => readFileSync(p, "utf-8"),
   gitRevision: (dir) => resolveGitRevision(dir),
+  gitStatusPorcelain: (dir) => gitStatusPorcelain(dir),
+  gitFetch: (dir) => gitFetch(dir),
+  gitMergeFfOnly: (dir, rev) => gitMergeFfOnly(dir, rev),
+  gitWorktreeRoot: (dir) => gitWorktreeRoot(dir),
+  gitUpstreamRev: (dir) => gitUpstreamRev(dir),
+  gitIgnoredPullConflicts: (dir, rev) => gitIgnoredPullConflicts(dir, rev),
   readPin: () => getPanelPinState(),
   isReachable: async () => {
     try {
@@ -1157,6 +1347,33 @@ export function looksLikeManagerNoOp(details: unknown): boolean {
   return nothingEnqueued || incoherent;
 }
 
+/**
+ * The PROVEN legacy-3.x empty-queue signature — the ONLY queue state that may
+ * authorize the #724 git fallback (codex gate). total_count, done_count,
+ * in_progress_count and is_processing are REQUIRED by the Manager's status
+ * contract (QueueStatus in node-management): each must be PRESENT and exactly
+ * 0/false — a missing field is unproven, never a default-safe zero. The one
+ * optional field, pending_count (absent on legacy 3.x), must be 0 when
+ * reported. The broader looksLikeManagerNoOp also matches incoherent counts
+ * (done > total), which is fine as a FAILURE diagnostic but must never
+ * authorize a git mutation: a partial, malformed, or contradictory response
+ * is not proof of the stale-3.x no-op.
+ */
+export function isProvenLegacyEmptyQueue(details: unknown): boolean {
+  const c = readQueueCounts(details);
+  if (!(c.total === 0 && c.done === 0 && c.inProgress === 0 && c.processing === false)) {
+    return false;
+  }
+  // pending_count is optional (absent on legacy 3.x) — but a REPORTED value
+  // must be a real numeric 0. A malformed one ("1", null, …) normalizes to
+  // undefined in readQueueCounts, which must read as UNPROVEN, not absent.
+  if (details && typeof details === "object" && "pending_count" in details) {
+    const p = (details as Record<string, unknown>).pending_count;
+    return typeof p === "number" && p === 0;
+  }
+  return true;
+}
+
 export type UpdateOutcome =
   | "updated" // version OR git-HEAD moved on disk → the update definitely applied.
   | "no-op" // nothing moved AND Manager shows the stale-3.x no-op signature.
@@ -1277,6 +1494,289 @@ function finalizeUpdate(
   );
 }
 
+/**
+ * The #724 fallback for the update path: ComfyUI-Manager provably no-op'd the
+ * update (the stale legacy-3.x signature), but the panel dir is a REAL git
+ * checkout — so update it without the Manager, exactly like the manual
+ * workaround from the issue (`git pull --ff-only` in the panel repo), then run
+ * the SAME #639 verification over the result (fresh on-disk re-read, #641
+ * shadow scan, proven movement) rather than trusting git's output text.
+ *
+ * Two refusals guard the pull itself:
+ *  - DIRTY WORKTREE: a fast-forward only refuses local edits it OVERLAPS, so
+ *    the checkout must be PROVEN clean (git status --porcelain) before we
+ *    mutate it. Anything else — or a cleanliness check that itself fails —
+ *    refuses the fallback rather than carry/clobber local state.
+ *  - DIRECTORY BINDING: `dir` is the checkout the pre-op git proof belongs to
+ *    (enforced by the caller). The post-pull verification must describe that
+ *    SAME directory; a re-detection landing elsewhere makes the pre/post
+ *    comparison meaningless and is refused.
+ *
+ * Success still REQUIRES proven movement on disk. The one new honest outcome
+ * is "already current": a pinned `git merge --ff-only` fast-forwarded to the fetched remote and
+ * found HEAD not behind — proof of currency the Manager queue counts could
+ * never give — so that reports "already up to date" (NOT "updated"; nothing
+ * changed, no restart needed). A failed pull throws with BOTH diagnostics; it
+ * never reads as "nothing to pull".
+ */
+async function updateViaGitCheckoutFallback(opts: {
+  deps: PanelInstallerDeps;
+  dir: string;
+  previousVersion?: string;
+  previousRev?: string;
+  result: NodeOpResult;
+}): Promise<PanelActionResult> {
+  const { deps, dir, previousVersion, previousRev, result } = opts;
+
+  // PRE-PULL REVISION GATE — the post-Manager detection's HEAD must be
+  // readable before we mutate. An unreadable revision at this point means the
+  // no-op verdict itself is unprovable (a head-only Manager advance looks
+  // identical), so firing a pull would mutate on a false premise and then
+  // misreport git-applied work or a tip it cannot see (codex gate). Fail
+  // closed BEFORE any mutation, never pull.
+  const prePullRev = deps.gitRevision(dir);
+  if (!prePullRev) {
+    throw new PanelInstallError(
+      `Panel update did NOT apply: ComfyUI-Manager reported the queue drained ` +
+        `but the panel checkout's HEAD revision is unreadable at ${dir}, so ` +
+        `whether it updated (a nightly advance with no version bump) is ` +
+        `UNVERIFIABLE — the git fallback does not fire on an unprovable no-op. ` +
+        `Check the panel repo (git log) and ComfyUI-Manager on the host, then ` +
+        `re-check install_panel(action='status').`,
+    );
+  }
+
+  // WORKTREE-ROOT GATE — `.git` proves metadata exists, not that this dir is
+  // the checkout ROOT. A copied/stale gitdir would let status/pull mutate a
+  // sibling repo and credit the panel with that repo's moved HEAD. Require the
+  // resolved toplevel to BE the panel dir (same path identity as the #641
+  // shadow code). Any failure here is "cannot prove", which refuses.
+  let worktreeRoot: string;
+  try {
+    worktreeRoot = deps.gitWorktreeRoot(dir);
+  } catch (err) {
+    throw new PanelInstallError(
+      `Panel update did NOT apply: ComfyUI-Manager never enqueued the update (the ` +
+        `stale legacy 3.x silent no-op, #639/#724), and the git fallback is ` +
+        `REFUSED: could not prove ${dir} is the panel repo's worktree root (git ` +
+        `rev-parse failed — ${err instanceof Error ? err.message : String(err)}). ` +
+        `Update the panel repo manually, then RESTART ComfyUI.`,
+    );
+  }
+  if (!samePathCI(worktreeRoot, dir, deps)) {
+    throw new PanelInstallError(
+      `Refusing the panel update git fallback: the git worktree root resolves to ` +
+        `${worktreeRoot}, NOT the panel directory ${dir} — status/pull would ` +
+        `mutate a DIFFERENT checkout than the one we verified (a copied or stale ` +
+        `gitdir pointer). Nothing was done; check how the panel dir's .git got ` +
+        `there, then update the correct repo manually and RESTART ComfyUI.`,
+    );
+  }
+
+  // CLEANLINESS GATE — never mutate a dirty checkout. A porcelain failure is
+  // "cannot prove clean", which refuses exactly like a dirty one.
+  let porcelain: string;
+  try {
+    porcelain = deps.gitStatusPorcelain(dir).trim();
+  } catch (err) {
+    throw new PanelInstallError(
+      `Panel update did NOT apply: ComfyUI-Manager never enqueued the update (the ` +
+        `stale legacy 3.x silent no-op, #639/#724), and the git fallback is ` +
+        `REFUSED: could not confirm the panel repo at ${dir} is clean (git ` +
+        `status failed — ${err instanceof Error ? err.message : String(err)}). ` +
+        `Update the panel repo manually (git pull in ${dir}), then RESTART ComfyUI.`,
+    );
+  }
+  if (porcelain !== "") {
+    throw new PanelInstallError(
+      `Refusing the panel update git fallback: the panel repo at ${dir} has ` +
+        `UNCOMMITTED changes or untracked files (git status --porcelain):\n` +
+        `${porcelain}\ncomfyui-mcp never mutates a dirty checkout — a ` +
+        `fast-forward could carry or clobber that local state. Commit, stash, or ` +
+        `discard the changes (or update the panel repo manually), then retry. ` +
+        `(ComfyUI-Manager also no-op'd this update — the stale legacy 3.x ` +
+        `signature, #639/#724 — so updating it on the host restores the Manager ` +
+        `path: git pull in custom_nodes/ComfyUI-Manager, or pip install -U ` +
+        `comfyui_manager.)`,
+    );
+  }
+
+  // PINNED FETCH — fetch ONCE, then bind every later proof and the mutation
+  // itself to the fetched upstream sha. A `git pull` would fetch a SECOND
+  // time; a commit landing between the two fetches could newly track an
+  // ignored local path and slip past the collision proof into the merge
+  // (codex gate). The rev we inspect is the rev we merge — no race.
+  let targetRev: string;
+  try {
+    deps.gitFetch(dir);
+    targetRev = deps.gitUpstreamRev(dir);
+  } catch (err) {
+    throw new PanelInstallError(
+      `Panel update did NOT apply: ComfyUI-Manager never enqueued the update (the ` +
+        `stale legacy 3.x silent no-op, #639/#724), and the git fallback is ` +
+        `REFUSED: could not fetch/resolve the upstream revision for ${dir} ` +
+        `(${err instanceof Error ? err.message : String(err)}). Update the ` +
+        `panel repo manually (git pull in ${dir}), then RESTART ComfyUI.`,
+    );
+  }
+
+  // IGNORED-FILE GATE — porcelain omits ignored files, but a fast-forward does
+  // NOT protect them: when the remote newly tracks a path that is locally
+  // ignored, the merge silently overwrites the local file (codex gate). Refuse
+  // on any proven collision against the PINNED rev; a proof failure also
+  // refuses (fail closed).
+  let ignoredConflicts: string[];
+  try {
+    ignoredConflicts = deps.gitIgnoredPullConflicts(dir, targetRev);
+  } catch (err) {
+    throw new PanelInstallError(
+      `Panel update did NOT apply: ComfyUI-Manager never enqueued the update (the ` +
+        `stale legacy 3.x silent no-op, #639/#724), and the git fallback is ` +
+        `REFUSED: could not prove the pull would not silently overwrite ignored ` +
+        `local files in ${dir} (${err instanceof Error ? err.message : String(err)}). ` +
+        `Update the panel repo manually (git pull in ${dir}), then RESTART ComfyUI.`,
+    );
+  }
+  if (ignoredConflicts.length > 0) {
+    const shown = ignoredConflicts.slice(0, 5).join(", ");
+    const more = ignoredConflicts.length > 5 ? ` (+${ignoredConflicts.length - 5} more)` : "";
+    throw new PanelInstallError(
+      `Refusing the panel update git fallback: ${ignoredConflicts.length} locally-IGNORED ` +
+        `file(s) in ${dir} would be SILENTLY OVERWRITTEN by the fast-forward ` +
+        `(git protects untracked files from checkout, but not ignored ones): ` +
+        `${shown}${more}. Move or delete them (or git add them), then retry — ` +
+        `or update the panel repo manually. (ComfyUI-Manager also no-op'd this ` +
+        `update — the stale legacy 3.x signature, #639/#724.)`,
+    );
+  }
+
+  let gitOutput: string;
+  try {
+    gitOutput = deps.gitMergeFfOnly(dir, targetRev);
+  } catch (err) {
+    // The Manager no-op'd AND the direct merge failed — name both, truthfully.
+    throw new PanelInstallError(
+      `Panel update did NOT apply: nothing changed on disk at ${dir} (installed ` +
+        `version still ${previousVersion ?? "unknown"}). ComfyUI-Manager never ` +
+        `enqueued the update (the stale legacy 3.x silent no-op, #639/#724), and ` +
+        `the direct git fallback on the panel repo failed too — ` +
+        `${err instanceof Error ? err.message : String(err)}. ` +
+        `Fix: update ComfyUI-Manager on the host (git pull in custom_nodes/` +
+        `ComfyUI-Manager, or pip install -U comfyui_manager) and retry, or update ` +
+        `the panel repo manually (git pull in ${dir}), then RESTART ComfyUI.`,
+    );
+  }
+
+  // The merge ran clean — VERIFY with the same machinery (#639/#641): re-read
+  // the installed identity FRESH from disk, fail closed on a shadow, require
+  // proven movement. Never infer success from git's output.
+  const post = await detectPanelInstall(deps);
+  if (!post.installed || !post.version) {
+    throw new PanelInstallError(
+      `Could not verify the panel update applied: the pack is ${
+        post.installed ? "present but its version is unreadable" : "not present"
+      } at ${dir} after the pinned fast-forward succeeded. NOT reporting success. ` +
+        `Re-check the pack and retry, then RESTART ComfyUI.`,
+    );
+  }
+  // DIRECTORY BINDING — the verification must describe the SAME checkout we
+  // pulled; a re-detection resolving a different dir means the pre/post
+  // identity comparison would span two repos. Refuse rather than claim either.
+  if (!post.dir || !samePathCI(dir, post.dir, deps)) {
+    throw new PanelInstallError(
+      `Could not verify the panel update applied: after the pinned fast-forward in ` +
+        `${dir}, re-detection resolved a DIFFERENT panel dir ` +
+        `(${post.dir ?? "none"}), so the before/after comparison would not ` +
+        `describe the checkout that was pulled. NOT reporting success — check ` +
+        `custom_nodes for duplicate or moved panel dirs, then re-check the ` +
+        `installed version.`,
+    );
+  }
+  assertNoPanelShadow("update", post.dir, deps);
+  // REVISION PROOF — after a pull, the checkout's HEAD must be READABLE. An
+  // unreadable rev is NOT "at tip": a pull that advanced HEAD without a
+  // version bump would otherwise fall through to "already up to date" with
+  // zero evidence either way (codex gate). Fail closed, never at-tip.
+  if (!post.gitRev) {
+    throw new PanelInstallError(
+      `Could not verify the panel update applied: the pinned fast-forward ran clean ` +
+        `in ${dir}, but the checkout's HEAD revision is unreadable afterward, ` +
+        `so whether it moved (a nightly advance with no version bump) is ` +
+        `UNVERIFIABLE. NOT reporting success and NOT reporting "already at ` +
+        `tip" — check the panel repo (git log), then re-check ` +
+        `install_panel(action='status').`,
+    );
+  }
+  const verdict = classifyPanelUpdate(
+    {
+      previousVersion,
+      installedVersion: post.version,
+      previousRev,
+      installedRev: post.gitRev,
+    },
+    result.details,
+  );
+  if (verdict.outcome === "updated") {
+    const from = verdict.previousVersion ?? verdict.previousRev?.slice(0, 8) ?? "?";
+    const to = verdict.installedVersion ?? verdict.installedRev?.slice(0, 8) ?? "?";
+    // The embedded result came from the Manager call that no-op'd — its own
+    // message may credit ComfyUI-Manager. The report must not contradict the
+    // git-fallback path that actually did the work (codex gate).
+    const fallbackMessage =
+      `Panel updated (${from} → ${to}) via a pinned git merge --ff-only on the panel repo ` +
+      `(${dir}), verified on disk: ComfyUI-Manager no-op'd the update (stale ` +
+      `legacy 3.x, #724), so the update was applied directly from git. RESTART ` +
+      `ComfyUI to load the updated panel node.`;
+    const honestResult = { ...result, message: fallbackMessage };
+    return {
+      action: "update",
+      result: honestResult,
+      restartRequired: true,
+      message: fallbackMessage,
+      previousVersion,
+      installedVersion: post.version,
+    };
+  }
+
+  // Nothing moved even though git pull exited clean. Before claiming “at the
+  // upstream tip”, PROVE it: HEAD must equal the tracked upstream sha — a
+  // locally-AHEAD checkout (committed local work) also exits pull cleanly and
+  // would otherwise be blessed as upstream currency (codex gate). No upstream
+  // configured or a mismatch → unverifiable, never “at tip”.
+  let upstreamRev: string | undefined;
+  try {
+    upstreamRev = deps.gitUpstreamRev(dir);
+  } catch {
+    upstreamRev = undefined;
+  }
+  if (!upstreamRev || upstreamRev !== post.gitRev) {
+    throw new PanelInstallError(
+      `Could not verify the panel is current: the pinned fast-forward ran clean in ` +
+        `${dir}, but ${!upstreamRev ? "no upstream is configured, so currency is UNPROVABLE" : `HEAD (${post.gitRev?.slice(0, 8)}) does not match the tracked upstream (${upstreamRev.slice(0, 8)}) — the checkout has committed local work upstream doesn't have`}. ` +
+        `NOT reporting "at upstream tip" and NOT reporting an update. Check the ` +
+        `panel repo (git status / git log), then re-check install_panel(action='status').`,
+    );
+  }
+  // HEAD === upstream: git FETCHED the remote and proved the checkout current.
+  // That is genuine proof of currency — report "already up to date" honestly
+  // (NOT "updated"; nothing changed, no restart). The embedded result came
+  // from the Manager call that no-op'd — override its message too, so the
+  // report never credits the Manager for a verification git did (codex gate).
+  const atTipMessage =
+    `Panel is already at the upstream tip (${post.version}) — ComfyUI-Manager ` +
+    `no-op'd the update (stale legacy 3.x, #724), but a pinned git merge ` +
+    `--ff-only on ${dir} verified the checkout is current (git: ` +
+    `${gitOutput || "no output"}). Nothing changed on disk; no restart needed.`;
+  return {
+    action: "update",
+    result: { ...result, message: atTipMessage },
+    restartRequired: false,
+    message: atTipMessage,
+    previousVersion,
+    installedVersion: post.version,
+  };
+}
+
 export interface PanelActionOptions {
   /**
    * Target version for install/reinstall, defaulting to the `nightly` channel.
@@ -1383,6 +1883,85 @@ export async function runPanelActionInner(
       },
       result.details,
     );
+    // #724 — the Manager PROVABLY no-op'd (the stale legacy-3.x signature), and
+    // the panel dir is a real git checkout (a pre-op HEAD resolved; a registry
+    // zip has no .git, and a dev symlink was refused above). The verified
+    // Manager path is a dead end on that host tier, so fall back to
+    // a pinned `git merge --ff-only` on the panel repo and verify THAT the same way
+    // instead of only surfacing the error.
+    if (verdict.outcome === "no-op" && previousRev && post.dir) {
+      // SIGNATURE GATE — only the PROVEN empty queue (total 0 AND done 0,
+      // nothing pending/in-progress, not processing) authorizes a git
+      // mutation. The broader no-op signature also matches incoherent counts
+      // (done > total): a malformed or contradictory response is a failure
+      // diagnostic, never proof of the stale-3.x state this fallback exists
+      // to repair (codex gate).
+      if (!isProvenLegacyEmptyQueue(result.details)) {
+        const c = readQueueCounts(result.details);
+        throw new PanelInstallError(
+          `Panel update did NOT apply: nothing changed on disk, and the Manager's ` +
+          `queue counts are NOT the proven legacy-3.x empty-queue signature ` +
+          `(need total 0 AND done 0 with nothing pending/in-progress; got ` +
+          `total=${c.total ?? "?"}, done=${c.done ?? "?"}, pending=${c.pending ?? "?"}, ` +
+          `in_progress=${c.inProgress ?? "?"}) — the git fallback does not fire on ` +
+          `an incoherent or partial signature. Update ComfyUI-Manager on the host ` +
+          `and retry, or update the panel repo manually (git pull in ${post.dir}), ` +
+          `then RESTART ComfyUI.`,
+        );
+      }
+      // DIALECT GATE — the empty-queue signature only MEANS "stale Manager 3.x"
+      // on a legacy host. On a v4 host (or with the dialect unproven) the same
+      // signature is an outage/failed enqueue, and a git mutation is not
+      // warranted (codex gate): report the unverified no-op instead of pulling.
+      // Probe the dialect of the SAME Manager the update call used — the
+      // base travels back on the result (a mid-op retarget must not let a
+      // v2-host outage read as 'legacy' from another endpoint, codex gate).
+      let dialect: string | undefined;
+      if (deps.detectManagerDialect) {
+        dialect = await deps.detectManagerDialect(result.managerBase);
+      } else {
+        try {
+          const { detectManagerApi } = await import("./node-management.js");
+          dialect = await detectManagerApi(result.managerBase);
+        } catch {
+          dialect = undefined;
+        }
+      }
+      if (dialect !== "legacy") {
+        throw new PanelInstallError(
+          `Panel update did NOT apply: nothing changed on disk, and the Manager's ` +
+            `API dialect here is ${dialect ?? "unproven"}, NOT the legacy 3.x whose ` +
+            `silent no-op this matches (#724) — so the git fallback does not fire ` +
+            `(an empty queue on this host is an outage or a failed enqueue, not the ` +
+            `stale-3.x signature). Update ComfyUI-Manager on the host and retry, or ` +
+            `update the panel repo manually (git pull in ${post.dir}), then RESTART ComfyUI.`,
+        );
+      }
+
+      // Bind the fallback to ONE directory: the git proof (previousRev) belongs
+      // to the ORIGINAL detection, so the pull and the post verification must
+      // target that same checkout. A re-detection that resolves a DIFFERENT
+      // panel dir means the two reads disagree about what "the panel" is —
+      // pulling there could mutate a repo we never proved, so refuse.
+      if (!detection.dir || !samePathCI(detection.dir, post.dir, deps)) {
+        throw new PanelInstallError(
+          `Panel update did NOT apply: ComfyUI-Manager never enqueued the update ` +
+            `(the stale legacy 3.x silent no-op, #639/#724), and the git fallback ` +
+            `is REFUSED: the panel dir re-detected after the Manager call ` +
+            `(${post.dir}) is not the checkout the pre-update git proof belongs ` +
+            `to (${detection.dir ?? "unresolved"}). Pulling it could mutate the ` +
+            `WRONG repo, so nothing was done. Check custom_nodes for duplicate ` +
+            `or moved panel dirs, then retry.`,
+        );
+      }
+      return updateViaGitCheckoutFallback({
+        deps,
+        dir: detection.dir,
+        previousVersion,
+        previousRev,
+        result,
+      });
+    }
     return finalizeUpdate(verdict, post, result);
   }
 

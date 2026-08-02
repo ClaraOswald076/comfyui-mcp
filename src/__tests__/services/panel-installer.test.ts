@@ -57,6 +57,8 @@ interface Harness {
   installs: Array<{ id: string; version?: string }>;
   updates: Array<{ id: string }>;
   reinstalls: Array<{ id: string; version?: string }>;
+  /** Dirs the #724 git-fallback mock was called on. */
+  gitPulls: string[];
 }
 
 function makeDeps(opts: {
@@ -87,6 +89,30 @@ function makeDeps(opts: {
   onInstall?: (ctx: { files: Record<string, string>; revs: Record<string, string> }) => void;
   /** Side effect the `reinstall` mock runs to simulate the pack landing. */
   onReinstall?: (ctx: { files: Record<string, string>; revs: Record<string, string> }) => void;
+  /**
+   * Side effect the #724 git-fallback mock (the pinned `merge --ff-only`) runs against
+   * the live `files`/`revs` maps, returning git's output. When omitted the mock
+   * THROWS — the persona has no working git fallback (git itself errors).
+   */
+  onGitPull?: (ctx: { files: Record<string, string>; revs: Record<string, string> }) => string;
+  /**
+   * `git status --porcelain` output the cleanliness-gate mock returns for the
+   * panel dir ("" = clean, the default). Anything non-empty is a dirty
+   * worktree and must refuse the fallback BEFORE any pull is attempted.
+   */
+  gitStatus?: string;
+  /** What gitWorktreeRoot returns (defaults to the dir itself = proven root). */
+  gitRoot?: string;
+  /** When set, gitWorktreeRoot throws this — the "cannot prove" refusal path. */
+  gitRootError?: string;
+  /** Upstream sha override (default: the dir's HEAD — HEAD === upstream). */
+  upstreamRev?: string;
+  /** When set, gitUpstreamRev throws "no upstream configured". */
+  noUpstream?: boolean;
+  /** Manager API dialect the probe reports ("unproven" -> undefined). Defaults to "legacy". */
+  dialect?: "v2" | "v2-batch" | "legacy" | "unproven";
+  /** Ignored-file collisions the fallback gate reports (default: none). */
+  ignoredConflicts?: string[];
 } = {}): Harness {
   const files = opts.files ?? {};
   const revs = opts.revs ?? {};
@@ -96,6 +122,7 @@ function makeDeps(opts: {
   const installs: Harness["installs"] = [];
   const updates: Harness["updates"] = [];
   const reinstalls: Harness["reinstalls"] = [];
+  const gitPulls: Harness["gitPulls"] = [];
 
   const deps: PanelInstallerDeps = {
     isLocalMode: () => opts.local ?? true,
@@ -110,6 +137,25 @@ function makeDeps(opts: {
     readdir: (p) => (p === CUSTOM_NODES ? dirs : []),
     readFile: (p) => files[p] ?? "",
     gitRevision: (dir) => revs[dir],
+    gitStatusPorcelain: () => opts.gitStatus ?? "",
+    gitWorktreeRoot: (dir) => {
+      if (opts.gitRootError) throw new Error(opts.gitRootError);
+      return opts.gitRoot ?? dir;
+    },
+    gitUpstreamRev: (dir) => {
+      if (opts.noUpstream) throw new Error("fatal: no upstream configured");
+      return opts.upstreamRev ?? revs[dir];
+    },
+    detectManagerDialect: async () =>
+      opts.dialect === "unproven" ? undefined : (opts.dialect ?? "legacy"),
+    gitIgnoredPullConflicts: () => opts.ignoredConflicts ?? [],
+    gitFetch: () => {},
+    // Records the pinned merge --ff-only call (the rev is the fetched upstream sha).
+    gitMergeFfOnly: (dir) => {
+      gitPulls.push(dir);
+      if (opts.onGitPull) return opts.onGitPull({ files, revs });
+      throw new Error("remote: Repository not found / no upstream (persona has no working git fallback)");
+    },
     // Default: NOT pinned. Pin behaviour has its own suite (panel-sync.test.ts);
     // injecting it here keeps every existing case hermetic from the developer's
     // real ~/.comfyui-mcp/panel-settings.json.
@@ -137,7 +183,7 @@ function makeDeps(opts: {
       return { mechanism: "manager-http", message: "reinstalled", details: opts.reinstallDetails };
     },
   };
-  return { deps, installs, updates, reinstalls };
+  return { deps, installs, updates, reinstalls, gitPulls };
 }
 
 describe("detectPanelInstall", () => {
@@ -763,6 +809,464 @@ describe("runPanelAction", () => {
     expect(h.installs).toEqual([]);
     expect(h.updates).toEqual([]);
     expect(h.reinstalls).toEqual([]);
+  });
+});
+
+describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
+  const dir = join(CUSTOM_NODES, "comfyui-mcp-panel");
+  const pyPath = join(dir, "pyproject.toml");
+  const REV_A = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const REV_B = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  // The exact queue signature from the #724 report: the legacy 3.x Manager
+  // accepted the update but never enqueued it (done 0 / total 0).
+  const LEGACY_NOOP = {
+    total_count: 0,
+    done_count: 0,
+    in_progress_count: 0,
+    pending_count: 0,
+    is_processing: false,
+  };
+
+  it("git checkout with HEAD UNREADABLE after the Manager call → unverified, fallback does NOT fire", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: LEGACY_NOOP,
+      onUpdate: ({ revs }) => {
+        delete revs[dir]; // HEAD unreadable post-op — version alone can't prove nothing moved
+      },
+      onGitPull: () => "Updating d806619..675ace8\nFast-forward",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).not.toMatch(/already at the upstream tip/);
+    // The git fallback must NOT fire on a movement state it cannot prove.
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("dialect v2 (Manager 4.x host) + empty queue -> fallback REFUSED, no pull (outage is not the 3.x signature)", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: LEGACY_NOOP,
+      dialect: "v2",
+      onGitPull: () => "Updating d806619..675ace8\nFast-forward",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).toMatch(/did NOT apply/);
+    expect(String(err?.message ?? err)).toMatch(/v2/);
+    // On a non-legacy host an empty queue is an outage/failed enqueue: no git mutation.
+    expect(h.updates).toEqual([{ id: PANEL_REGISTRY_ID }]);
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("dialect UNPROVEN + empty queue -> fallback REFUSED, no pull (fail closed)", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: LEGACY_NOOP,
+      dialect: "unproven",
+      onGitPull: () => "Updating d806619..675ace8\nFast-forward",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).toMatch(/did NOT apply|unproven/);
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("ignored local file collides with an incoming path -> fallback REFUSED before any pull (silent-overwrite guard)", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: LEGACY_NOOP,
+      ignoredConflicts: ["web/local-notes.txt"],
+      onGitPull: () => "Updating d806619..675ace8\nFast-forward",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).toMatch(/IGNORED|SILENTLY OVERWRITTEN|local-notes/);
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("incoherent queue signature (done>total) -> fallback REFUSED: not the proven empty queue, no merge", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: { total_count: 0, done_count: 2, in_progress_count: 0, pending_count: 0, is_processing: false },
+      onGitPull: () => "merge output",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).toMatch(/did NOT apply|empty-queue signature/);
+    // An incoherent signature is a diagnostic, never proof: no git mutation.
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("empty queue with pending work (total 0, pending 1) -> fallback REFUSED: not the proven signature", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: { total_count: 0, done_count: 0, in_progress_count: 0, pending_count: 1, is_processing: false },
+      onGitPull: () => "merge output",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).toMatch(/did NOT apply|empty-queue signature/);
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("partial signature (missing in_progress/is_processing fields) -> fallback REFUSED: unproven, no merge", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      // Only total/done reported — the required in_progress_count and
+      // is_processing fields are ABSENT, so pending work is not disproven.
+      updateDetails: { total_count: 0, done_count: 0 },
+      onGitPull: () => "merge output",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).toMatch(/did NOT apply|empty-queue signature/);
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("at-tip via the fallback: the embedded result message credits the git verification, not the no-op'd Manager", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: LEGACY_NOOP,
+      // Merge is a no-op (already current): HEAD stays, upstream === HEAD.
+      onGitPull: () => "Already up to date.",
+    });
+    const r = await runPanelAction("update", h.deps);
+    expect(r.restartRequired).toBe(false);
+    expect(r.message).toMatch(/already at the upstream tip/);
+    // The honest message must reach BOTH surfaces (codex gate).
+    expect(r.result.message).toBe(r.message);
+    expect(r.result.message).not.toMatch(/^updated$/);
+  });
+
+  it("malformed reported pending_count (\"1\") -> fallback REFUSED: reported-but-broken is unproven, no merge", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: { total_count: 0, done_count: 0, in_progress_count: 0, is_processing: false, pending_count: "1" },
+      onGitPull: () => "merge output",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).toMatch(/did NOT apply|empty-queue signature/);
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("null pending_count -> fallback REFUSED: malformed, no merge", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: { total_count: 0, done_count: 0, in_progress_count: 0, is_processing: false, pending_count: null },
+      onGitPull: () => "merge output",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).toMatch(/did NOT apply|empty-queue signature/);
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("legacy no-op + real git checkout + pull advances it → updated via the fallback (verified)", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: LEGACY_NOOP,
+      // No onUpdate — the Manager no-ops. The git fallback does the real work.
+      onGitPull: ({ files, revs }) => {
+        files[pyPath] = pyproject(PANEL_REGISTRY_ID, "0.11.35");
+        revs[dir] = REV_B;
+        return "Updating d806619..675ace8\nFast-forward";
+      },
+    });
+    const r = await runPanelAction("update", h.deps);
+    // The Manager path was tried first, then the fallback ran on the panel dir.
+    expect(h.updates).toEqual([{ id: PANEL_REGISTRY_ID }]);
+    expect(h.gitPulls).toEqual([dir]);
+    expect(r.action).toBe("update");
+    expect(r.previousVersion).toBe("0.11.32");
+    expect(r.installedVersion).toBe("0.11.35");
+    expect(r.restartRequired).toBe(true);
+    expect(r.message).toMatch(/git merge --ff-only/);
+    expect(r.message).toMatch(/RESTART ComfyUI/);
+  });
+
+  it("fallback moves git-HEAD only (nightly, no version bump) → updated", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: LEGACY_NOOP,
+      onGitPull: ({ revs }) => {
+        revs[dir] = REV_B; // commit advanced, version string unchanged
+        return "Updating aaaaaaaa..bbbbbbbb\nFast-forward";
+      },
+    });
+    const r = await runPanelAction("update", h.deps);
+    expect(h.gitPulls).toEqual([dir]);
+    expect(r.installedVersion).toBe("0.11.32");
+    expect(r.restartRequired).toBe(true);
+    expect(r.message).toMatch(/Panel updated/);
+  });
+
+  it("legacy no-op + git pull FAILS → throws truthfully (names BOTH failures), never claims updated", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: LEGACY_NOOP,
+      // No onGitPull → the fallback mock throws (no upstream / network down).
+    });
+    await expect(runPanelAction("update", h.deps)).rejects.toBeInstanceOf(
+      PanelInstallError,
+    );
+    expect(h.updates).toEqual([{ id: PANEL_REGISTRY_ID }]);
+    expect(h.gitPulls).toEqual([dir]);
+    await expect(runPanelAction("update", h.deps)).rejects.toThrow(
+      /did NOT apply|git fallback.*failed|0\.11\.32/,
+    );
+  });
+
+  it("worktree root ≠ panel dir (copied/stale gitdir) → fallback REFUSED, no pull attempted", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: LEGACY_NOOP,
+      gitRoot: join(CUSTOM_NODES, "some-sibling-repo"), // rev-parse resolves elsewhere
+      onGitPull: () => "Updating d806619..675ace8\nFast-forward",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).toMatch(/worktree root|DIFFERENT checkout|REFUSED/);
+    // The Manager was tried, but the fallback never fired a mutation anywhere.
+    expect(h.updates).toEqual([{ id: PANEL_REGISTRY_ID }]);
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("worktree root unprovable (rev-parse fails) → fallback REFUSED, no pull attempted", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: LEGACY_NOOP,
+      gitRootError: "fatal: not a git repository",
+      onGitPull: () => "Updating d806619..675ace8\nFast-forward",
+    });
+    await expect(runPanelAction("update", h.deps)).rejects.toBeInstanceOf(
+      PanelInstallError,
+    );
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("locally-AHEAD checkout (HEAD ≠ upstream): NOT 'at tip', throws unverifiable", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.35") },
+      revs: { [dir]: REV_A },
+      upstreamRev: REV_B, // user committed locally — upstream is behind
+      updateDetails: LEGACY_NOOP,
+      onGitPull: () => "Already up to date.",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).toMatch(/does not match the tracked upstream|UNPROVABLE|committed local work/);
+    expect(String(err?.message ?? err)).not.toMatch(/at the upstream tip/);
+  });
+
+  it("no upstream configured: currency UNPROVABLE, never 'at tip'", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.35") },
+      revs: { [dir]: REV_A },
+      noUpstream: true,
+      updateDetails: LEGACY_NOOP,
+      onGitPull: () => "Already up to date.",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).toMatch(/no upstream configured|fetch.resolve the upstream|UNPROVABLE/);
+  });
+
+  it("pull ran clean but post-pull HEAD revision is UNREADABLE → throws unverifiable, never 'at tip'", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: LEGACY_NOOP,
+      onGitPull: ({ revs }) => {
+        delete revs[dir]; // HEAD unreadable afterward — git metadata lost/corrupt
+        return "Updating d806619..675ace8\nFast-forward";
+      },
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).toMatch(/unreadable|UNVERIFIABLE/);
+    expect(String(err?.message ?? err)).not.toMatch(/already at the upstream tip/);
+  });
+
+  it("legacy no-op + pull finds nothing newer → honest 'already at tip' (NOT 'updated', no restart)", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.35") },
+      revs: { [dir]: REV_A },
+      updateDetails: LEGACY_NOOP,
+      // git fetched and found HEAD current — nothing changes on disk.
+      onGitPull: () => "Already up to date.",
+    });
+    const r = await runPanelAction("update", h.deps);
+    expect(h.gitPulls).toEqual([dir]);
+    expect(r.restartRequired).toBe(false);
+    expect(r.message).toMatch(/already at the upstream tip/);
+    expect(r.message).not.toMatch(/Panel updated/);
+    expect(r.installedVersion).toBe("0.11.35");
+  });
+
+  it("legacy no-op + NOT a git checkout (registry zip) → fallback NOT attempted, throws the #639 diagnostic", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      // No revs → no .git → a registry-managed install has no fallback path.
+      updateDetails: LEGACY_NOOP,
+    });
+    await expect(runPanelAction("update", h.deps)).rejects.toBeInstanceOf(
+      PanelInstallError,
+    );
+    await expect(runPanelAction("update", h.deps)).rejects.toThrow(
+      /did NOT apply|stale ComfyUI-Manager/,
+    );
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("dirty worktree → the fallback is REFUSED before any pull (never mutates a dirty checkout)", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: LEGACY_NOOP,
+      // A tracked file the fast-forward would NOT overlap — `git pull
+      // --ff-only` alone would silently carry it, so the porcelain gate must
+      // refuse first regardless of overlap.
+      gitStatus: " M web/js/comfyui-mcp-panel.js",
+      onGitPull: ({ files, revs }) => {
+        // Must NEVER run: the refusal happens before the pull.
+        files[pyPath] = pyproject(PANEL_REGISTRY_ID, "9.9.9");
+        revs[dir] = REV_B;
+        return "Updating aaaaaaaa..bbbbbbbb\nFast-forward";
+      },
+    });
+    await expect(runPanelAction("update", h.deps)).rejects.toBeInstanceOf(
+      PanelInstallError,
+    );
+    await expect(runPanelAction("update", h.deps)).rejects.toThrow(
+      /UNCOMMITTED|dirty checkout/i,
+    );
+    // The pull was never attempted and nothing moved on disk.
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("re-detection resolving a DIFFERENT panel dir → the fallback is REFUSED, never pulled there", async () => {
+    const ALT = join(CUSTOM_NODES, "comfyui-agent-panel");
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A }, // the git proof belongs to the ORIGINAL dir
+      updateDetails: LEGACY_NOOP,
+      onUpdate: ({ files }) => {
+        // The canonical checkout vanishes mid-op; re-detection lands on a
+        // DIFFERENT panel dir the pre-op proof says nothing about.
+        delete files[pyPath];
+        files[join(ALT, "pyproject.toml")] = pyproject(PANEL_REGISTRY_ID, "0.11.32");
+      },
+      onGitPull: () => "Updating aaaaaaaa..bbbbbbbb\nFast-forward", // must never run
+    });
+    await expect(runPanelAction("update", h.deps)).rejects.toThrow(
+      /not the checkout|REFUSED/i,
+    );
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("a dir flip appearing AFTER the fallback's pull → verification refuses (never claims the wrong checkout)", async () => {
+    const ALT = join(CUSTOM_NODES, "comfyui-agent-panel");
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: LEGACY_NOOP,
+      onGitPull: ({ files, revs }) => {
+        // The pull ran on the bound dir, but by verification time re-detection
+        // resolves a DIFFERENT dir — the before/after comparison would span
+        // two repos, so even a moved version must not be claimed.
+        revs[dir] = REV_B;
+        delete files[pyPath];
+        files[join(ALT, "pyproject.toml")] = pyproject(PANEL_REGISTRY_ID, "0.11.35");
+        return "Updating aaaaaaaa..bbbbbbbb\nFast-forward";
+      },
+    });
+    await expect(runPanelAction("update", h.deps)).rejects.toThrow(
+      /DIFFERENT panel dir|NOT reporting success/i,
+    );
+    // The pull happened on the BOUND dir; the refusal is at verification.
+    expect(h.gitPulls).toEqual([dir]);
+  });
+
+  it("a shadow left behind by the fallback's pull STILL fails closed (#641)", async () => {
+    const bak = ".comfyui-agent-panel.bak-0.11.28";
+    const dirs: string[] = [];
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      dirs,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: LEGACY_NOOP,
+      onGitPull: ({ files, revs }) => {
+        // The pull advances the checkout but leaves a backup dir under
+        // custom_nodes that would shadow the real panel in the browser.
+        revs[dir] = REV_B;
+        dirs.push(bak);
+        files[join(CUSTOM_NODES, bak, "pyproject.toml")] = pyproject(
+          PANEL_REGISTRY_ID,
+          "0.11.28",
+        );
+        return "Updating aaaaaaaa..bbbbbbbb\nFast-forward";
+      },
+    });
+    await expect(runPanelAction("update", h.deps)).rejects.toThrow(/shadow/i);
+    expect(h.gitPulls).toEqual([dir]);
+  });
+
+  it("a WORKING Manager (coherent counts, version moves) never touches the fallback", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: { total_count: 1, done_count: 1, is_processing: false },
+      onUpdate: ({ files, revs }) => {
+        files[pyPath] = pyproject(PANEL_REGISTRY_ID, "0.11.35");
+        revs[dir] = REV_B;
+      },
+    });
+    const r = await runPanelAction("update", h.deps);
+    expect(r.installedVersion).toBe("0.11.35");
+    expect(r.restartRequired).toBe(true);
+    expect(h.gitPulls).toEqual([]);
   });
 });
 
