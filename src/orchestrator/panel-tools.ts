@@ -2066,6 +2066,27 @@ export interface PanelToolCtx {
    * Optional so lightweight test contexts can omit it.
    */
   awaitReachable?: (budgetMs?: number) => Promise<boolean>;
+  /** Snapshot of the current panel registration. The browser-tab session id is
+   * separate from the workflow-derived routing tab id, which another browser
+   * tab may reuse for the same saved workflow. */
+  panelConnectionIdentity?: () => { generation: number; tabSessionId: string } | undefined;
+  /**
+   * Wait for a panel hello that is strictly newer than `before`, from the SAME
+   * browser-tab session that received the restart dispatch. This is distinct
+   * from awaitReachable: an old tab can still be reachable while ComfyUI is
+   * rebooting, and a different browser tab can reuse the same saved-workflow id.
+   */
+  awaitPostRestartReachable?: (
+    before: { generation: number; tabSessionId: string } | undefined,
+    budgetMs?: number,
+  ) => Promise<boolean>;
+  /**
+   * Whether the currently bound, live panel tab can safely perform active
+   * workflow graph mutations. A reconnect proves only transport reachability:
+   * the browser may still be serving a cached pre-workflow-stamp panel bundle.
+   * Optional only for lightweight legacy test contexts.
+   */
+  tabCanMutateGraph?: () => boolean;
 }
 
 /** Build a tab-bound execution context shared by both transports. */
@@ -2189,6 +2210,52 @@ export function makePanelToolCtx(
       const left = deadline - Date.now();
       if (left <= 0) return bridge.canReach(ctx.tabId);
       await sleep(Math.min(intervalMs, left));
+    }
+  };
+
+  const panelConnectionIdentity = (): { generation: number; tabSessionId: string } | undefined =>
+    typeof bridge.tabConnectionIdentity === "function"
+      ? bridge.tabConnectionIdentity(ctx.tabId)
+      : undefined;
+
+  // A restart report must NEVER count the panel socket that existed before the
+  // reboot command. Unlike awaitReachable(), which intentionally returns at once
+  // for a healthy binding, this waits for a strictly newer hello generation. The
+  // fresh hello can keep the same tab/socket id or arrive under a new one; in the
+  // latter case only rebind after the old target is gone, preserving strict
+  // multi-tab routing and never guessing away from a still-live pre-restart tab.
+  const awaitPostRestartReachable = async (
+    before: { generation: number; tabSessionId: string } | undefined,
+    budgetMs?: number,
+  ): Promise<boolean> => {
+    // The actual UiBridge exposes a tab-session binding. Preserve historical
+    // lightweight/mock-context behavior only when that capability does not exist
+    // at all; a real bridge missing the pre-dispatch identity fails closed.
+    if (typeof bridge.tabConnectionIdentity !== "function") return awaitReachable(budgetMs);
+    if (before == null) return false;
+    const timing = reconnectWaitTiming();
+    const budget = Math.max(0, budgetMs != null ? Math.min(budgetMs, timing.budgetMs) : timing.budgetMs);
+    const deadline = Date.now() + budget;
+    const isOriginalTabReconnected = (): boolean => {
+      const current = panelConnectionIdentity();
+      return (
+        current != null &&
+        current.generation > before.generation &&
+        current.tabSessionId === before.tabSessionId
+      );
+    };
+    for (;;) {
+      if (isOriginalTabReconnected()) return true;
+      // A new tab id cannot resolve through the retired binding. Once that binding is
+      // actually gone, the existing conservative rebind can follow the sole new tab.
+      if (!bridge.canReach(ctx.tabId)) {
+        const interactive = interactiveTabIds() ?? [];
+        if (interactive.length > 0) ensureReachable();
+        if (isOriginalTabReconnected()) return true;
+      }
+      const left = deadline - Date.now();
+      if (left <= 0) return false;
+      await sleep(Math.min(Math.max(1, timing.intervalMs), left));
     }
   };
 
@@ -2420,6 +2487,9 @@ export function makePanelToolCtx(
   ctx.rebindToActiveTab = rebindToActiveTab;
   ctx.ensureReachable = ensureReachable;
   ctx.awaitReachable = awaitReachable;
+  ctx.panelConnectionIdentity = panelConnectionIdentity;
+  ctx.awaitPostRestartReachable = awaitPostRestartReachable;
+  ctx.tabCanMutateGraph = () => bridge.tabCanMutateGraph(ctx.tabId);
   return ctx;
 }
 
@@ -5110,6 +5180,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // to (null unless the bound tab provably fronts our boot instance).
         ctx.ensureReachable?.();
         const boundTabId = ctx.tabId;
+        // Snapshot the exact browser-tab registration that is about to receive the
+        // reboot. A post-restart success must observe a strictly newer hello from
+        // this SAME browser tab; a different tab can reuse the same saved-workflow
+        // routing id while the original is still reconnecting.
+        const preRestartPanelIdentity = ctx.panelConnectionIdentity?.();
         const healthBase = captureRebootHealthBase(ctx);
         const timing = getPanelRebootTiming();
         const dispatchTimeout = Math.max(1, Math.min(15000, overallDeadline - Date.now()));
@@ -5300,16 +5375,45 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             // poll merely expired — neither terminal) DEFER to OUR OWN observed DOWN→UP.
             const recovery = await proofPromise;
             const observed = recovery.via === "observed-cycle";
+            // The legacy Manager path restarts ComfyUI out-of-band too. Server recovery alone
+            // is not graph-tool readiness: wait for the browser tab to reconnect, then verify
+            // the same workflow-stamp capability the bridge requires before it dispatches a
+            // mutation. Without this, updating the panel pack followed by a legacy restart can
+            // falsely report ready while the browser is still running stale panel JS (#709).
+            const tabBack = recovery.ready
+              ? ctx.awaitPostRestartReachable
+                ? await ctx.awaitPostRestartReachable(
+                    preRestartPanelIdentity,
+                    Math.max(0, overallDeadline - Date.now()),
+                  )
+                : ctx.awaitReachable
+                  ? await ctx.awaitReachable(Math.max(0, overallDeadline - Date.now()))
+                  : true
+              : false;
+            const graphToolsReady = tabBack && (ctx.tabCanMutateGraph ? ctx.tabCanMutateGraph() : true);
             return ok({
               rebooting: true,
-              ready: recovery.ready,
+              ready: graphToolsReady,
+              graph_tools_ready: graphToolsReady,
+              server_ready: recovery.ready,
+              panel_tab_reconnected: tabBack,
               confirmed_cycle: observed, // true = we directly observed the down→up cycle
               recovered_ms: recovery.waited_ms,
               probes: recovery.attempts,
               saw_down: recovery.sawDown,
               via: recovery.ready ? recovery.via : undefined,
               note:
-                "ComfyUI-Manager (legacy 3.x) had no reboot endpoint; ran the headless managed " +
+                recovery.ready && !graphToolsReady
+                  ? "ComfyUI-Manager (legacy 3.x) had no reboot endpoint; the headless managed restart " +
+                    `came back healthy in ${(recovery.waited_ms / 1000).toFixed(1)}s, but ` +
+                    (!tabBack
+                      ? "the panel tab has NOT reconnected yet (ready:false). Wait a moment then retry, or " +
+                        'rebind with panel_set_workflow_target({mode:"current"}) before issuing graph tools.'
+                      : "the panel tab reconnected but cannot safely run graph mutations (ready:false), usually " +
+                        "because it is still running a stale panel bundle. Hard-refresh the ComfyUI browser tab " +
+                        "(Ctrl+Shift+R) before issuing graph tools; if that does not restore it, update the panel " +
+                        "and open/reload a saved workflow with a stable identity.")
+                  : "ComfyUI-Manager (legacy 3.x) had no reboot endpoint; ran the headless managed " +
                 "restart (kill + relaunch) " +
                 (recovery.ready
                   ? `and it came back healthy in ${(recovery.waited_ms / 1000).toFixed(1)}s` +
@@ -5379,21 +5483,35 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               : `The reboot command was sent but I could NOT confirm ComfyUI actually cycled within ${waited}s (it never went down — the panel may have merely disconnected/inferred a reboot without one). Verify with health_check / panel_node_queue_status; do NOT assume it restarted.`,
           });
         }
-        // #400: ComfyUI is healthy, but the panel's browser tab re-registers its own
-        // socket a moment later. If we return NOW, the very next graph tool in this turn
+        // #400/#709: ComfyUI is healthy, but the panel's browser tab re-registers its own
+        // socket a moment later. The old socket can still be reachable after dispatch, so
+        // the generation waiter below requires a fresh hello before reporting readiness.
         // hits "no connected tab … Connected: none" and the agent is told to hand-rebind.
         // Wait (bounded, clamped to THIS handler's deadline) for the tab to reconnect and
         // rebind this session onto it. `ready` reflects GRAPH-TOOL readiness (a bound tab),
         // NOT just server health — a caller keying off `ready` must not be led into the
         // Connected:none window (codex). `server_ready` carries the certified cycle either
-        // way. When ctx has no awaitReachable (older/lightweight ctx) tabBack is true, so
-        // the historical ready:true-on-healthy-restart contract is preserved.
-        const tabBack = ctx.awaitReachable
-          ? await ctx.awaitReachable(Math.max(0, overallDeadline - Date.now()))
-          : true;
+        // way. A production PanelToolCtx supplies the generation waiter; an explicitly
+        // lightweight context retains the historical reachability-only test contract.
+        const tabBack = ctx.awaitPostRestartReachable
+          ? await ctx.awaitPostRestartReachable(
+              preRestartPanelIdentity,
+              Math.max(0, overallDeadline - Date.now()),
+            )
+          : ctx.awaitReachable
+            ? await ctx.awaitReachable(Math.max(0, overallDeadline - Date.now()))
+            : true;
+        // A recovered socket does NOT mean graph mutations are usable: an already-open
+        // browser tab can reconnect after ComfyUI restarts while still serving stale panel
+        // JS, which lacks the #570 workflow-stamp fence. Report the same capability the
+        // bridge enforces before dispatch so this success path never fabricates readiness.
+        // Old/lightweight contexts have no capability accessor, so preserve their historical
+        // contract rather than claiming a production tab passed a check it never ran.
+        const graphToolsReady = tabBack && (ctx.tabCanMutateGraph ? ctx.tabCanMutateGraph() : true);
         return ok({
           rebooting: true,
-          ready: tabBack, // graph tools are usable only once a panel tab is bound
+          ready: graphToolsReady, // graph tools require a bound AND workflow-stamp-capable tab
+          graph_tools_ready: graphToolsReady,
           server_ready: true, // ComfyUI itself cycled and is healthy
           confirmed_cycle: true, // we directly observed the down→up cycle on the boot endpoint
           recovered_ms: recovery.waited_ms,
@@ -5402,7 +5520,13 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           via: recovery.via,
           panel_tab_reconnected: tabBack,
           note:
-            `ComfyUI restart accepted and it is healthy again in ${(recovery.waited_ms / 1000).toFixed(1)}s` +
+            (tabBack && !graphToolsReady
+              ? `ComfyUI restart accepted and it is healthy again in ${(recovery.waited_ms / 1000).toFixed(1)}s` +
+                " (observed it go down then come back); the panel tab reconnected but cannot safely run " +
+                "graph mutations (ready:false), usually because it is still running a stale panel bundle. " +
+                "Hard-refresh the ComfyUI browser tab (Ctrl+Shift+R) before issuing graph tools; if that " +
+                "does not restore it, update the panel and open/reload a saved workflow with a stable identity"
+              : `ComfyUI restart accepted and it is healthy again in ${(recovery.waited_ms / 1000).toFixed(1)}s` +
             " (observed it go down then come back)" +
             (dropped ? "; connection dropped as expected while it went down" : "") +
             (tabBack
@@ -5410,7 +5534,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               : "; ComfyUI is back but the panel tab has NOT reconnected yet (ready:false) — " +
                 'wait a moment then retry, or rebind with panel_set_workflow_target({mode:"current"}) ' +
                 "before issuing graph tools.") +
-            ".",
+            "."),
         });
       },
     ),

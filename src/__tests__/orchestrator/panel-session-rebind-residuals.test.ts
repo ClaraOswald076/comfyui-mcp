@@ -468,6 +468,11 @@ describe("#400 panel_restart_comfyui awaits the tab reconnect before returning",
       tabOrigin: () => BOOT_BASE,
       tabServerOrigin: () => BOOT_BASE,
       tabIsLocal: () => true,
+      tabConnectionIdentity: (id: string) =>
+        live.has(id)
+          ? { generation: id === "reconnected-tab" ? 2 : 1, tabSessionId: "browser-tab-a" }
+          : undefined,
+      tabCanMutateGraph: () => true,
     } as unknown as PanelToolCtx["bridge"];
     const ctx = makePanelToolCtx(bridge, "bound-tab", new WorkflowTargetStore());
     ctx.confirm = async () => "yes" as const; // skip the human confirm card
@@ -478,6 +483,127 @@ describe("#400 panel_restart_comfyui awaits the tab reconnect before returning",
     expect(out.confirmed_cycle).toBe(true);
     expect(out.panel_tab_reconnected).toBe(true); // did not hand back a tabless window
     expect(ctx.tabId).toBe("reconnected-tab"); // rebound onto the reconnected tab
+  });
+
+  it("does not treat the pre-restart reachable tab as a post-restart reconnect (#709)", async () => {
+    __panelToolsTestHooks.setReconnectWaitTiming({ budgetMs: 60, intervalMs: 5 });
+    const seq = ["down", "healthy"];
+    let i = 0;
+    __panelToolsTestHooks.setHealthProbe(async () =>
+      seq[Math.min(i++, seq.length - 1)] as "down" | "healthy",
+    );
+
+    // The old websocket remains briefly reachable. It has not sent a new hello, so
+    // a restart result must not call it a reconnected, graph-ready panel.
+    const live = new Set<string>(["bound-tab"]);
+    const bridge = {
+      send: async () => ({ rebooting: true }),
+      push: () => 1,
+      canReach: (id: string) => live.has(id),
+      tabs: () => [...live].map((t) => ({ tab_id: t, title: t, connected_at: 0 })),
+      resolveActiveTabId: () => "bound-tab",
+      tabOrigin: () => BOOT_BASE,
+      tabServerOrigin: () => BOOT_BASE,
+      tabIsLocal: () => true,
+      tabConnectionIdentity: (id: string) =>
+        live.has(id) ? { generation: 1, tabSessionId: "browser-tab-a" } : undefined,
+      tabCanMutateGraph: () => true,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, "bound-tab", new WorkflowTargetStore());
+    ctx.confirm = async () => "yes" as const;
+
+    const out = parse(await defByName("panel_restart_comfyui").handler({ force: false }, ctx));
+    expect(out.server_ready).toBe(true);
+    expect(out.panel_tab_reconnected).toBe(false);
+    expect(out.graph_tools_ready).toBe(false);
+    expect(out.ready).toBe(false);
+  });
+
+  it("does not certify a different browser tab that reuses the rebooted workflow id (#709)", async () => {
+    __panelToolsTestHooks.setReconnectWaitTiming({ budgetMs: 60, intervalMs: 5 });
+    const seq = ["down", "healthy"];
+    let i = 0;
+    __panelToolsTestHooks.setHealthProbe(async () =>
+      seq[Math.min(i++, seq.length - 1)] as "down" | "healthy",
+    );
+
+    // The original browser tab receives the reboot. Before it reconnects, a
+    // different browser tab opens the same saved workflow, so it has the exact
+    // same routing tab id but a new hello generation and its own tab session id.
+    // Generation + tab id alone would fabricate ready:true here.
+    let generation = 1;
+    let tabSessionId = "browser-tab-original";
+    const bridge = {
+      send: async () => {
+        generation = 2;
+        tabSessionId = "browser-tab-other";
+        return { rebooting: true };
+      },
+      push: () => 1,
+      canReach: () => true,
+      tabs: () => [{ tab_id: "wf:shared.json", title: "shared", connected_at: 0 }],
+      resolveActiveTabId: () => "wf:shared.json",
+      tabOrigin: () => BOOT_BASE,
+      tabServerOrigin: () => BOOT_BASE,
+      tabIsLocal: () => true,
+      tabConnectionIdentity: () => ({ generation, tabSessionId }),
+      tabCanMutateGraph: () => true,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, "wf:shared.json", new WorkflowTargetStore());
+    ctx.confirm = async () => "yes" as const;
+
+    const out = parse(await defByName("panel_restart_comfyui").handler({ force: false }, ctx));
+    expect(out.server_ready).toBe(true);
+    expect(out.panel_tab_reconnected).toBe(false);
+    expect(out.graph_tools_ready).toBe(false);
+    expect(out.ready).toBe(false);
+  });
+
+  it("does not claim graph tools are ready when the reconnected tab has stale JS", async () => {
+    const seq = ["down", "healthy"];
+    let i = 0;
+    __panelToolsTestHooks.setHealthProbe(async () =>
+      seq[Math.min(i++, seq.length - 1)] as "down" | "healthy",
+    );
+
+    const live = new Set<string>(["bound-tab"]);
+    const bridge = {
+      send: async (cmd: Record<string, unknown>, opts?: { tabId?: string }) => {
+        if (cmd.cmd === "comfy_reboot") {
+          live.delete("bound-tab");
+          setTimeout(() => live.add("reconnected-tab"), 40);
+          return { rebooting: true };
+        }
+        const id = opts?.tabId;
+        if (id && !live.has(id)) throw new Error(`no connected tab with id "${id}". Connected: none`);
+        return { ok: true, routedTo: id };
+      },
+      push: () => 1,
+      canReach: (id: string) => live.has(id),
+      tabs: () => [...live].map((t) => ({ tab_id: t, title: t, connected_at: 0 })),
+      resolveActiveTabId: () => {
+        if (live.size === 1) return [...live][0];
+        throw new Error("Panel not reachable: no panel connected");
+      },
+      tabOrigin: () => BOOT_BASE,
+      tabServerOrigin: () => BOOT_BASE,
+      tabIsLocal: () => true,
+      tabConnectionIdentity: (id: string) =>
+        live.has(id)
+          ? { generation: id === "reconnected-tab" ? 2 : 1, tabSessionId: "browser-tab-a" }
+          : undefined,
+      tabCanMutateGraph: () => false, // stale pre-workflow-stamp browser bundle
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, "bound-tab", new WorkflowTargetStore());
+    ctx.confirm = async () => "yes" as const;
+
+    const out = parse(await defByName("panel_restart_comfyui").handler({ force: false }, ctx));
+    expect(out.server_ready).toBe(true);
+    expect(out.panel_tab_reconnected).toBe(true);
+    expect(out.graph_tools_ready).toBe(false);
+    expect(out.ready).toBe(false);
+    expect(String(out.note)).toMatch(/stale panel bundle|Hard-refresh.*Ctrl\+Shift\+R/i);
+    expect(String(out.note)).not.toMatch(/rebind with panel_set_workflow_target/i);
   });
 
   it("returns ready:false (server_ready:true) when the panel tab NEVER reconnects", async () => {
@@ -508,6 +634,9 @@ describe("#400 panel_restart_comfyui awaits the tab reconnect before returning",
       tabOrigin: () => BOOT_BASE,
       tabServerOrigin: () => BOOT_BASE,
       tabIsLocal: () => true,
+      tabConnectionIdentity: (id: string) =>
+        live.has(id) ? { generation: 1, tabSessionId: "browser-tab-a" } : undefined,
+      tabCanMutateGraph: () => true,
     } as unknown as PanelToolCtx["bridge"];
     const ctx = makePanelToolCtx(bridge, "bound-tab", new WorkflowTargetStore());
     ctx.confirm = async () => "yes" as const;

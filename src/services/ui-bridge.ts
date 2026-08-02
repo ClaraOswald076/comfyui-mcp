@@ -95,6 +95,16 @@ interface Conn {
   tabId: string;
   title: string;
   connectedAt: string;
+  /** Monotonic bridge-local hello generation. Every hello gets a new value, even
+   * on the same socket/tab id, so restart readiness can require a post-dispatch
+   * panel registration rather than mistaking the pre-restart socket for a reconnect. */
+  helloGeneration: number;
+  /** Browser-tab-scoped session identity supplied by current panel builds.
+   * Unlike `tabId`, which is commonly derived from a saved workflow path and
+   * can therefore recur in a second browser tab, this stays with one browser
+   * tab across a ComfyUI restart. It is used only as an accidental-routing
+   * correctness proof for restart readiness; absence fails that proof closed. */
+  tabSessionId?: string;
   /** Canvas-less client (mobile/remote pseudo-panel) — advertised in `hello`.
    *  Lets tools resolve media to inline bytes instead of a browser /view ref. */
   headless: boolean;
@@ -627,6 +637,8 @@ export class UiBridge {
    *  listener stays token-less so the local browser panel is unaffected. */
   private readonly extraServers: WebSocketServer[] = [];
   private conns = new Map<string, Conn>(); // tabId -> connection (canvas-owning primary)
+  /** Incremented for every accepted panel hello; never reused during this bridge lifetime. */
+  private nextHelloGeneration = 0;
   /** Mobile "mirror" viewers subscribed to a tab's live output (remote control):
    *  push()-path frames for a tabId fan out to these IN ADDITION to the primary,
    *  so a phone sees the desktop tab's agent activity/renders. They NEVER receive
@@ -1142,6 +1154,16 @@ export class UiBridge {
           tabId,
           title: typeof msg.title === "string" && msg.title ? msg.title : "untitled",
           connectedAt: existing?.connectedAt ?? new Date().toISOString(),
+          helloGeneration: ++this.nextHelloGeneration,
+          // #709: do not inherit across a different socket reusing a workflow
+          // tab id. The browser-tab identity must have arrived on THIS hello,
+          // otherwise it cannot prove that the tab receiving the reboot is the
+          // tab that came back afterwards.
+          tabSessionId:
+            typeof (msg as { tab_session_id?: unknown }).tab_session_id === "string" &&
+            (msg as { tab_session_id?: string }).tab_session_id?.trim()
+              ? (msg as { tab_session_id?: string }).tab_session_id!.trim()
+              : undefined,
           headless: incomingHeadless,
           panelVersion:
             typeof (msg as { panel_version?: unknown }).panel_version === "string"
@@ -1434,6 +1456,68 @@ export class UiBridge {
       return true;
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * Whether the live tab resolved for `tabId` can safely accept a mutation of
+   * its active workflow. This mirrors the two pre-dispatch conditions in
+   * {@link send}: the tab's CURRENT hello must advertise workflow-stamp
+   * enforcement, and the orchestrator must have a trusted workflow stamp to
+   * put on the command. A websocket reconnect alone proves neither (the browser
+   * can reconnect with a cached, pre-#570 panel bundle), so callers reporting
+   * graph-tool readiness must use this rather than `canReach` alone.
+   *
+   * This is an accidental-version-skew capability signal, not an attestation:
+   * like the send gate, it intentionally describes the local panel protocol
+   * needed to avoid an unfenced wrong-workflow write.
+   */
+  tabCanMutateGraph(tabId: string): boolean {
+    try {
+      const conn = this.resolveTarget(tabId);
+      const stamp = this.resolveTabWorkflowUuid?.(tabId);
+      return (
+        conn.sock.readyState === WebSocket.OPEN &&
+        conn.enforcesWorkflowStamp &&
+        typeof stamp === "string" &&
+        stamp.length > 0
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Monotonic registration generation for a currently OPEN panel connection.
+   * Restart readiness snapshots this immediately before dispatch, then requires
+   * a strictly newer hello before saying graph tools are back. Unknown, migrated
+   * aliases that no longer resolve, and closing sockets deliberately return
+   * undefined: none proves a usable post-restart panel binding.
+   */
+  tabConnectionGeneration(tabId: string): number | undefined {
+    try {
+      const conn = this.resolveTarget(tabId);
+      return conn.sock.readyState === WebSocket.OPEN ? conn.helloGeneration : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Restart-readiness binding for a live panel. A generation alone is not
+   * sufficient: another browser tab can open the same saved workflow and take
+   * over its recurring `tabId`. The tuple proves a newer hello from the SAME
+   * browser-tab session that received the restart dispatch. Old panels which do
+   * not advertise `tab_session_id` deliberately return undefined rather than
+   * fabricating graph-tool readiness.
+   */
+  tabConnectionIdentity(tabId: string): { generation: number; tabSessionId: string } | undefined {
+    try {
+      const conn = this.resolveTarget(tabId);
+      if (conn.sock.readyState !== WebSocket.OPEN || !conn.tabSessionId) return undefined;
+      return { generation: conn.helloGeneration, tabSessionId: conn.tabSessionId };
+    } catch {
+      return undefined;
     }
   }
 
