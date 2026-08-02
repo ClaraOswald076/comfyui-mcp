@@ -247,6 +247,22 @@ describe("auth.json records", () => {
     expect(piCredentialPresent(tmp, bareEnv(adcEnv))).toBe(true);
   });
 
+  it("does not treat OAuth as usable for an API-key-only provider", () => {
+    writePiFile(tmp, "auth.json", JSON.stringify({ openai: { type: "oauth", refresh: "r" } }));
+    expect(piCredentialPresent(tmp, bareEnv())).toBe(false);
+  });
+
+  it("does not fall back when pi's truthy stored template resolves to whitespace", () => {
+    writePiFile(
+      tmp,
+      "auth.json",
+      JSON.stringify({ openai: { type: "api_key", key: "$OPENAI_API_KEY", env: { OPENAI_API_KEY: "   " } } }),
+    );
+    // Pi resolves entry env with `||`: whitespace is truthy, wins over ambient,
+    // then fails authentication. Readiness must not skip that failed ownership.
+    expect(piCredentialPresent(tmp, bareEnv({ OPENAI_API_KEY: "sk-ambient" }))).toBe(false);
+  });
+
   it("CLOUDFLARE_API_KEY alone is not a credential — the account id is required", () => {
     expect(piCredentialPresent(tmp, bareEnv({ CLOUDFLARE_API_KEY: "k" }))).toBe(false);
     expect(

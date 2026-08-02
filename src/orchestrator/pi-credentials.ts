@@ -310,6 +310,9 @@ export function authRecordUsable(
     return true;
   }
   if (type === "oauth") {
+    // pi only dispatches OAuth records to providers that implement that flow.
+    // An OAuth-shaped record for an API-key-only provider is not a credential.
+    if (provider !== "anthropic") return false;
     // A refresh token lets pi re-mint access, so a partial migrated record with
     // one remains usable even when its stored access token is expired. Without
     // it, an access token needs to survive pi's five-minute refresh window.
@@ -719,10 +722,13 @@ function piEnvCredentialPresent(
     // absent, falsy, or cannot resolve. A record's mere existence must not hide
     // that same provider's working ambient key.
     const storedEnv = isPlainObject(stored) && isPlainObject(stored.env) ? stored.env : undefined;
+    const storedTemplateResolvesTruthy =
+      isPlainObject(stored) && typeof stored.key === "string" &&
+      envRefsIn(stored.key).every((name) => !!(storedEnv?.[name] || procEnv[name]));
     const storedCanSupplyKey =
       isPlainObject(stored) &&
       stored.type === "api_key" &&
-      credentialValueUsable(stored.key, storedEnv, procEnv);
+      (credentialValueUsable(stored.key, storedEnv, procEnv) || storedTemplateResolvesTruthy);
     const storedIsOrdinaryApiKey = isPlainObject(stored) && stored.type === "api_key";
     if (providerHasStoredCredential(storedProviders, provider) && (!storedIsOrdinaryApiKey || storedCanSupplyKey)) continue;
     if (!keys.some((k) => !stripped.has(k) && !!procEnv[k]?.trim())) continue;
