@@ -198,7 +198,9 @@ export function credentialValueUsable(
   const value = raw.trim();
   if (!value) return false;
   // `!command` — unverifiable without executing it; err toward ready.
-  if (value.startsWith("!")) return true;
+  // pi executes the text AFTER `!`; an empty command resolves to undefined, so
+  // it cannot authenticate. Do not let a lone `!` greet the user green.
+  if (value.startsWith("!")) return value.slice(1).trim() !== "";
   // Every referenced var must resolve to something non-empty IN THE ENV PI WILL
   // ACTUALLY SEE. Order matches pi: the entry's own `env` block first (pi injects
   // it for the provider), then the inherited process env — but a var our spawn
@@ -207,8 +209,15 @@ export function credentialValueUsable(
   // green this whole module exists to prevent.
   const stripped = new Set<string>(TOOL_ONLY_SECRET_ENV_KEYS);
   for (const name of envRefsIn(value)) {
-    const fromEntry = entryEnv?.[name];
-    if (typeof fromEntry === "string" && fromEntry.trim() !== "") continue;
+    const hasEntryValue = !!entryEnv && Object.prototype.hasOwnProperty.call(entryEnv, name);
+    if (hasEntryValue) {
+      const fromEntry = entryEnv![name];
+      // `resolveEnvConfigValue` uses `entryEnv[name] || process.env[name]`.
+      // Thus an empty entry falls through, but a whitespace-only entry OWNS the
+      // value and blocks a good inherited key. It is not a usable credential.
+      if (typeof fromEntry !== "string" || fromEntry.trim() === "") return false;
+      continue;
+    }
     if (stripped.has(name) || !procEnv[name]?.trim()) return false;
   }
   return true;
@@ -279,6 +288,11 @@ export function authRecordUsable(
   const type = record.type;
   if (type === "api_key") {
     const entryEnv = isPlainObject(record.env) ? record.env : undefined;
+    if (provider === "amazon-bedrock") {
+      // Bedrock is deliberately unlike ordinary api-key providers: its resolver
+      // falls through from a keyless stored record to AWS's credential chain.
+      return credentialValueUsable(record.key, entryEnv, procEnv) || piBedrockCredentialUsable(entryEnv, procEnv);
+    }
     // pi's Vertex `/login` writes `{type:"api_key", env:{GOOGLE_CLOUD_PROJECT, …}}`
     // with NO `key`, and its resolver does `credential?.key ?? env(...)` then
     // falls back to ADC. So a keyless vertex record IS a credential when the ADC
@@ -390,7 +404,11 @@ function piAuthRecords(file: string): Record<string, unknown> {
  *
  * Never throws.
  */
-export function piModelsJsonUsable(file: string, procEnv: NodeJS.ProcessEnv = process.env): boolean {
+export function piModelsJsonUsable(
+  file: string,
+  procEnv: NodeJS.ProcessEnv = process.env,
+  provider?: string,
+): boolean {
   const raw = readFileOrNull(file);
   if (raw === null) return false;
   try {
@@ -404,10 +422,10 @@ export function piModelsJsonUsable(file: string, procEnv: NodeJS.ProcessEnv = pr
     // credentials reach pi. Reproduce that all-or-nothing behaviour rather than
     // greening off a single good-looking entry.
     if (!entries.every((p) => providerEntryValid(p))) return false;
-    return entries.some(
-      (p) =>
-        isPlainObject(p) &&
-        (credentialValueUsable(p.apiKey, undefined, procEnv) || p.oauth === "radius"),
+    return Object.entries(providers).some(([id, p]) =>
+      (!provider || id === provider) &&
+      isPlainObject(p) &&
+      (credentialValueUsable(p.apiKey, undefined, procEnv) || p.oauth === "radius"),
     );
   } catch {
     return false;
@@ -650,6 +668,37 @@ export function piAgentDir(home: string, procEnv: NodeJS.ProcessEnv = process.en
 }
 
 /**
+ * The AWS sources accepted by pi's amazon-bedrock provider. Unlike ordinary
+ * provider records, a keyless Bedrock `api_key` record deliberately falls
+ * through to these sources (amazon-bedrock.ts): an explicit stored AWS_PROFILE,
+ * an ambient profile, static access-key pair, ECS task role, or web identity.
+ */
+function piBedrockCredentialUsable(
+  entryEnv: Record<string, unknown> | undefined,
+  procEnv: NodeJS.ProcessEnv,
+): boolean {
+  const read = (key: string) => readScoped(entryEnv, procEnv, key);
+  if (nonEmptyString(read("AWS_BEARER_TOKEN_BEDROCK"))) return true;
+  if (nonEmptyString(read("AWS_PROFILE"))) return true;
+  if (nonEmptyString(read("AWS_ACCESS_KEY_ID")) && nonEmptyString(read("AWS_SECRET_ACCESS_KEY"))) return true;
+  if (nonEmptyString(read("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"))) return true;
+  if (nonEmptyString(read("AWS_CONTAINER_CREDENTIALS_FULL_URI"))) return true;
+  return nonEmptyString(read("AWS_WEB_IDENTITY_TOKEN_FILE"));
+}
+
+/** The effective provider selected by the pi spawn flags. `--provider` wins;
+ * otherwise pi treats the prefix of `--model provider/model` as the provider.
+ * A bare model has no reliable static provider mapping, so it retains pi's
+ * normal default-selection behaviour rather than guessing. */
+function configuredPiProvider(procEnv: NodeJS.ProcessEnv): string | undefined {
+  const explicit = procEnv.COMFYUI_MCP_PI_PROVIDER?.trim();
+  if (explicit) return explicit;
+  const model = procEnv.COMFYUI_MCP_PI_MODEL?.trim();
+  const slash = model?.indexOf("/") ?? -1;
+  return slash > 0 ? model!.slice(0, slash) : undefined;
+}
+
+/**
  * Is any provider authenticated purely by an env var?
  *
  * Per pi's resolver, "a stored credential owns the provider: ambient/env is
@@ -661,9 +710,11 @@ export function piAgentDir(home: string, procEnv: NodeJS.ProcessEnv = process.en
 function piEnvCredentialPresent(
   storedProviders: Record<string, unknown>,
   procEnv: NodeJS.ProcessEnv,
+  onlyProvider?: string,
 ): boolean {
   const stripped = new Set<string>(TOOL_ONLY_SECRET_ENV_KEYS);
   for (const [provider, keys] of Object.entries(PI_PROVIDER_ENV_KEYS)) {
+    if (onlyProvider && provider !== onlyProvider) continue;
     if (providerHasStoredCredential(storedProviders, provider)) continue;
     if (!keys.some((k) => !stripped.has(k) && !!procEnv[k]?.trim())) continue;
     // Some providers need companion config alongside the key — without it pi's
@@ -701,9 +752,48 @@ export function piCredentialPresent(
   // source counts, not even an otherwise-good env key.
   if (authFile && piAuthStoreBroken(authFile)) return false;
   const stored = authFile ? piAuthRecords(authFile) : {};
+  const selectedProvider = configuredPiProvider(procEnv);
+  if (selectedProvider) {
+    const selected = stored[selectedProvider];
+    if (authRecordUsable(selected, procEnv, nowMs, { provider: selectedProvider, home })) return true;
+    // Bedrock's own resolver intentionally consults the AWS chain even with a
+    // keyless stored record; generic stored-record ownership does not apply.
+    if (
+      selectedProvider === "amazon-bedrock" &&
+      (!providerHasStoredCredential(stored, "amazon-bedrock") ||
+        (isPlainObject(selected) && selected.type === "api_key")) &&
+      piBedrockCredentialUsable(
+        isPlainObject(selected) && isPlainObject(selected.env) ? selected.env : undefined,
+        procEnv,
+      )
+    )
+      return true;
+    if (piEnvCredentialPresent(stored, procEnv, selectedProvider)) return true;
+    if (
+      selectedProvider === "google-vertex" &&
+      !providerHasStoredCredential(stored, "google-vertex") &&
+      piVertexAdcUsable(home, procEnv)
+    )
+      return true;
+    return !!agentDir && piModelsJsonUsable(join(agentDir, "models.json"), procEnv, selectedProvider);
+  }
   if (
     Object.entries(stored).some(([provider, rec]) =>
       authRecordUsable(rec, procEnv, nowMs, { provider, home }),
+    )
+  )
+    return true;
+  const bedrockStored = stored["amazon-bedrock"];
+  // The Bedrock resolver is the one exception to ordinary stored-record
+  // ownership: a valid api_key record with no `key` still falls through to the
+  // AWS chain. An unrecognised/non-api-key stored record remains dead, as pi's
+  // generic credential resolver never hands it to the provider.
+  if (
+    (!providerHasStoredCredential(stored, "amazon-bedrock") ||
+      (isPlainObject(bedrockStored) && bedrockStored.type === "api_key")) &&
+    piBedrockCredentialUsable(
+      isPlainObject(bedrockStored) && isPlainObject(bedrockStored.env) ? bedrockStored.env : undefined,
+      procEnv,
     )
   )
     return true;

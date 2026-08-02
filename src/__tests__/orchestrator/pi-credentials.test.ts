@@ -594,12 +594,14 @@ describe("models.json", () => {
     expect(piModelsJsonUsable(modelsPath(), bareEnv())).toBe(true);
   });
 
-  it("bedrock is keyed by pi's provider id (amazon-bedrock) for stored ownership", () => {
+  it("Bedrock uses pi's amazon-bedrock id and its keyless record falls through to AWS auth", () => {
     // Getting the id wrong would mean a stored record never suppresses the
     // ambient token it owns.
     expect(piCredentialPresent(tmp, bareEnv({ AWS_BEARER_TOKEN_BEDROCK: "t" }))).toBe(true);
     writePiFile(tmp, "auth.json", '{"amazon-bedrock":{"type":"api_key"}}');
-    expect(piCredentialPresent(tmp, bareEnv({ AWS_BEARER_TOKEN_BEDROCK: "t" }))).toBe(false);
+    // amazon-bedrock is the deliberate exception to generic stored ownership:
+    // its provider resolver consults bearer/AWS sources after a keyless record.
+    expect(piCredentialPresent(tmp, bareEnv({ AWS_BEARER_TOKEN_BEDROCK: "t" }))).toBe(true);
   });
 
   it("UNDECLARED extra fields are left alone (pi declares no additionalProperties)", () => {
@@ -679,5 +681,54 @@ describe("piCredentialPresent source precedence", () => {
   it("a home with an empty .pi tree and a bare env is NOT ready", () => {
     mkdirSync(join(tmp, ".pi", "agent"), { recursive: true });
     expect(piCredentialPresent(tmp, bareEnv())).toBe(false);
+  });
+});
+
+describe("pi selected-provider readiness", () => {
+  it("does not green a configured provider from an unrelated credential", () => {
+    expect(
+      piCredentialPresent(
+        tmp,
+        bareEnv({ COMFYUI_MCP_PI_PROVIDER: "anthropic", OPENAI_API_KEY: "sk-openai" }),
+      ),
+    ).toBe(false);
+    expect(
+      piCredentialPresent(
+        tmp,
+        bareEnv({ COMFYUI_MCP_PI_MODEL: "anthropic/claude-sonnet", OPENAI_API_KEY: "sk-openai" }),
+      ),
+    ).toBe(false);
+    expect(
+      piCredentialPresent(
+        tmp,
+        bareEnv({ COMFYUI_MCP_PI_PROVIDER: "anthropic", ANTHROPIC_API_KEY: "sk-ant" }),
+      ),
+    ).toBe(true);
+  });
+
+  it("accepts every Bedrock AWS credential-chain source, including a keyless stored profile", () => {
+    for (const env of [
+      { AWS_PROFILE: "dev" },
+      { AWS_ACCESS_KEY_ID: "id", AWS_SECRET_ACCESS_KEY: "secret" },
+      { AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: "/v2/credentials/id" },
+      { AWS_CONTAINER_CREDENTIALS_FULL_URI: "http://169.254.170.2/creds" },
+      { AWS_WEB_IDENTITY_TOKEN_FILE: "/var/run/token" },
+    ]) {
+      expect(piCredentialPresent(tmp, bareEnv({ COMFYUI_MCP_PI_PROVIDER: "amazon-bedrock", ...env }))).toBe(true);
+    }
+    writePiFile(
+      tmp,
+      "auth.json",
+      JSON.stringify({ "amazon-bedrock": { type: "api_key", env: { AWS_PROFILE: "work" } } }),
+    );
+    expect(piCredentialPresent(tmp, bareEnv({ COMFYUI_MCP_PI_PROVIDER: "amazon-bedrock" }))).toBe(true);
+  });
+
+  it("rejects a command with no command text and preserves whitespace entry-env ownership", () => {
+    expect(credentialValueUsable("!")).toBe(false);
+    expect(credentialValueUsable("!   ")).toBe(false);
+    expect(
+      credentialValueUsable("$OPENAI_API_KEY", { OPENAI_API_KEY: "   " }, { OPENAI_API_KEY: "sk-real" }),
+    ).toBe(false);
   });
 });
