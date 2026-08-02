@@ -151,6 +151,19 @@ describe("compact mode over a real MCP client/server pair", () => {
     expect(text).toContain('"required"');
   });
 
+  it("routes describe_tool through the stable call_tool facade when its direct binding is stale (#693)", async () => {
+    const client = await compactPair(fakeCatalog());
+    const res = (await client.callTool({
+      name: "call_tool",
+      arguments: { name: "describe_tool", args: { name: "gen_image" } },
+    })) as { isError?: boolean };
+    const text = textOf(res as never);
+    expect(res.isError).not.toBe(true);
+    expect(text).toContain("# gen_image");
+    expect(text).toContain("Long tail of details");
+    expect(text).toContain('"prompt"');
+  });
+
   it("call_tool dispatches to the underlying handler", async () => {
     const client = await compactPair(fakeCatalog());
     const res = await client.callTool({
