@@ -12,7 +12,7 @@ import {
   type ManagerApi,
 } from "./node-management.js";
 import { assertPanelPinAllows, targetsPanelPackExactly } from "./panel-pin-guard.js";
-import { runPanelAction } from "./panel-installer.js";
+import { runPanelAction, panelStatus } from "./panel-installer.js";
 
 /**
  * Workflow dependency analysis & installation.
@@ -497,6 +497,19 @@ export async function installWorkflowDependencies(
           `no on-disk verification exists there; the pin check above is the whole guard).`,
       );
     } else {
+      // Install only when MISSING: a deps install must never move an existing
+      // panel (runPanelAction("install") with no version defaults to nightly,
+      // which could replace a NEWER one). Moving panels is the sync skill's
+      // job, with its own pin/lock discipline.
+      const status = await panelStatus();
+      if (status.installed) {
+        panelNotes.push(
+          `"${pack}" is the sidebar panel pack: already installed ` +
+            `(${status.installedVersion ?? "version unreadable"}) — NOT touching it ` +
+            `(use the node-pack sync skill or install_panel to change versions).`,
+        );
+        continue;
+      }
       const result = await runPanelAction("install");
       panelNotes.push(
         `"${pack}" is the sidebar panel pack: installed via the verified panel path ` +
