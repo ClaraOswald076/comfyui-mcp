@@ -191,12 +191,16 @@ describe("process-control startup readiness", () => {
       ["C:\\ComfyUI\\main.py", "--port", "8188"],
       expect.objectContaining({
         detached: true,
-        cwd: "/fake/ComfyUI",
         shell: false,
         stdio: "ignore",
         windowsHide: true,
       }),
     );
+    // The spawn cwd is the ABSOLUTE anchor the script resolved against (#711):
+    // the live script's own install dir when the host parses the Windows argv
+    // path (win32), otherwise the configured install dir (POSIX fallback).
+    const spawnOpts = mockSpawn.mock.calls[0][2] as { cwd?: string };
+    expect(["C:\\ComfyUI", "/fake/ComfyUI"]).toContain(spawnOpts.cwd);
     expect(children[0].unref).toHaveBeenCalled();
   });
 
@@ -249,6 +253,25 @@ describe("process-control startup readiness", () => {
       [join("/fake/ComfyUI", "main.py"), "--port", "8188"],
       expect.objectContaining({ cwd: "/fake/ComfyUI", shell: false }),
     );
+  });
+
+  it("omits the spawn cwd when COMFYUI_PATH points at a nonexistent dir (#711)", async () => {
+    // A stale/nonexistent COMFYUI_PATH passed as the spawn cwd would ENOENT the
+    // relaunch. The fallback must omit cwd instead — the child then inherits
+    // this process's (existing) working directory.
+    mockConfig.comfyuiPath = "/stale/missing/ComfyUI";
+    mockExistsSync.mockImplementation(() => false);
+    setLaunchInfo();
+    mockSpawnedChildren();
+    mockNoPortProcess();
+    mockFetchOk(true);
+
+    const result = await startComfyUI();
+
+    expect(result.started).toBe(true);
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+    const opts = mockSpawn.mock.calls[0][2] as { cwd?: string };
+    expect(opts.cwd).toBeUndefined();
   });
 
   it("reports timeout instead of ready when bounded probes never succeed", async () => {

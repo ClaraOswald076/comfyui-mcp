@@ -12,7 +12,7 @@
 // client, and global fetch. No real process/port/network/filesystem is touched.
 
 import { EventEmitter } from "node:events";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 class FakeChild extends EventEmitter {
@@ -429,6 +429,106 @@ describe("restart_comfyui — live-first script resolution (#476, #426)", () => 
     expect(
       mockExecSync.mock.calls.some(([c]) => /taskkill/i.test(String(c))),
     ).toBe(false);
+
+    killSpy.mockRestore();
+  });
+});
+
+describe("restart_comfyui — explicit absolute spawn cwd, truthful refusal (#711)", () => {
+  it("spawns with the resolved install dir as an EXPLICIT absolute cwd when COMFYUI_PATH is unset", async () => {
+    // #711: the relaunch must not depend on a wrong/undefined working directory.
+    // COMFYUI_PATH is unset; the canonical absolute install comes from the saved
+    // default workspace (mockResolveBase). The spawn must run FROM that absolute
+    // install dir — previously cwd was left undefined and inherited whatever
+    // directory the MCP server happened to run in.
+    expect(isAbsolute(BASE)).toBe(true); // the anchor the test resolves against
+    mockLivePortThenFree();
+    mockSpawn.mockImplementation(() => new FakeChild());
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true }) as Response),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.message).not.toMatch(/refusing to restart/i);
+    expect(result.stopped).toBe(true);
+    expect(result.started).toBe(true);
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+    const [exe, args, opts] = mockSpawn.mock.calls[0];
+    expect(exe).toBe(ABS_PYTHON);
+    expect(args[0]).toBe(ABS_MAIN);
+    expect((opts as { cwd?: string }).cwd).toBe(BASE);
+
+    killSpy.mockRestore();
+  });
+
+  it("never spawns from a stale COMFYUI_PATH when the script anchored elsewhere — the anchor is the cwd", async () => {
+    // #711's residual ENOENT shape: COMFYUI_PATH points at a stale/nonexistent
+    // dir while the RUNNING server's script resolves against a DIFFERENT,
+    // existing install. Spawning with the stale dir as cwd would ENOENT after
+    // the server was already killed; the anchor must win as the spawn cwd.
+    const STALE_BASE = resolve("stale_missing_install");
+    const LIVE_BASE = resolve("proc", "live_comfy");
+    const LIVE_MAIN = join(LIVE_BASE, "main.py");
+    const LIVE_PY = join(LIVE_BASE, "venv", "bin", "python");
+    mockConfig.comfyuiPath = STALE_BASE;
+    mockResolveBase.mockReturnValue(STALE_BASE); // config.comfyuiPath is base input #1
+    mockLiveRootFromArgv.mockReturnValue(LIVE_BASE); // live server's own argv root
+    mockFindComfyuiPython.mockReturnValue(LIVE_PY);
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: [LIVE_MAIN, "--port", "8188"] },
+    });
+    // The LIVE install exists on disk; the stale COMFYUI_PATH does not.
+    mockExistsSync.mockImplementation((p: string) => {
+      const s = String(p);
+      return s === LIVE_MAIN || s === LIVE_PY;
+    });
+    mockLivePortThenFree();
+    mockSpawn.mockImplementation(() => new FakeChild());
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true }) as Response),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.message).not.toMatch(/refusing to restart/i);
+    expect(result.stopped).toBe(true);
+    expect(result.started).toBe(true);
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+    const [, args, opts] = mockSpawn.mock.calls[0];
+    expect(args[0]).toBe(LIVE_MAIN);
+    expect((opts as { cwd?: string }).cwd).toBe(LIVE_BASE);
+
+    killSpy.mockRestore();
+  });
+
+  it("REFUSES with a truthful actionable error (never an ENOENT) when no install can be located", async () => {
+    // cwd unset + nothing resolvable: bare relative main.py, no live root, no
+    // live cwd, no canonical base. The refusal must say WHERE to point the fix
+    // (COMFYUI_PATH or a default workspace) — not surface a raw spawn ENOENT —
+    // and the reachable server must be left running.
+    mockResolveBase.mockReturnValue(undefined);
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: ["main.py", "--port", "8188"] },
+    });
+    mockExistsSync.mockImplementation((p: string) => String(p) === ABS_PYTHON);
+    mockLivePortThenFree();
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(false);
+    expect(result.started).toBe(false);
+    expect(result.message).toMatch(/refusing to restart/i);
+    expect(result.message).toMatch(/could not locate the ComfyUI install/i);
+    expect(result.message).toMatch(/COMFYUI_PATH or a default workspace/i);
+    expect(result.message).not.toMatch(/ENOENT/i);
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(killSpy).not.toHaveBeenCalled();
 
     killSpy.mockRestore();
   });

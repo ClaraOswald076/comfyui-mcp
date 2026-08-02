@@ -505,10 +505,12 @@ function spawnFromProcessInfo(info: ProcessInfo): SpawnedComfyUI | null {
   const child = spawn(cmd.exe, cmd.args, {
     detached: true,
     stdio: "ignore",
-    // Prefer the cwd the command resolved against (the live process cwd for a
-    // relative-script relaunch, #535); only then the configured install dir. A
-    // stale/nonexistent config.comfyuiPath as cwd would ENOENT the spawn.
-    cwd: cmd.cwd ?? config.comfyuiPath ?? undefined,
+    // Prefer the cwd the command resolved against (the live process cwd or the
+    // absolute install anchor for a relaunch, #535/#711); only then the
+    // configured install dir — and only as an ABSOLUTE path that exists on disk.
+    // A stale/relative/nonexistent config.comfyuiPath as cwd would ENOENT the
+    // spawn (#711); omitting cwd inherits this process's (existing) working dir.
+    cwd: cmd.cwd ?? configuredInstallCwd(),
     shell: false,
     windowsHide: true,
   });
@@ -661,10 +663,14 @@ function resolveLaunchCommand(
           : firstUnquoted;
     // When the script was anchored to the LIVE cwd, use that install's OWN python
     // and spawn FROM that cwd — never a stale/nonexistent config.comfyuiPath, which
-    // would ENOENT the spawn after the server was already killed (#535). Otherwise
-    // keep the existing interpreter + let the caller default cwd to comfyuiPath.
+    // would ENOENT the spawn after the server was already killed (#535). An
+    // absolute / canonical-base script spawns from its OWN anchor dir the same way
+    // (#711): the anchor is the absolute install root the script was resolved
+    // against, so the relaunch never depends on a wrong/undefined working
+    // directory. Only an UNANCHORED relative script leaves cwd unset — the
+    // refuse-safe preflight (#476/#426) rejects that case before any stop.
     const exe = liveCwdScript ? liveCwdPython! : python;
-    const cwd = liveCwdScript ? info.liveCwd : undefined;
+    const cwd = liveCwdScript ? info.liveCwd : anchor;
     return { exe, args: [script, ...rest], cwd };
   }
   return { exe: first, args: rest };
@@ -677,6 +683,20 @@ function fileExists(p: string | undefined): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * config.comfyuiPath as a spawn cwd — only when it is an ABSOLUTE path that
+ * exists on disk. A stale, relative, or nonexistent COMFYUI_PATH passed as cwd
+ * would ENOENT the spawn after the server was already stopped (#711); callers
+ * then omit cwd and the child inherits this process's (existing) working dir.
+ */
+function configuredInstallCwd(): string | undefined {
+  return config.comfyuiPath &&
+    isAbsolute(config.comfyuiPath) &&
+    fileExists(config.comfyuiPath)
+    ? config.comfyuiPath
+    : undefined;
 }
 
 /**
@@ -775,7 +795,9 @@ function assessRelaunch(info: ProcessInfo): { ok: boolean; reason?: string } {
         ok: false,
         reason:
           `Resolved ComfyUI script does not exist on disk: ${script} — ` +
-          "COMFYUI_PATH may point at a stale/old install that has no runnable server.",
+          "could not locate the ComfyUI install; set COMFYUI_PATH or a default " +
+          "workspace (COMFYUI_PATH may point at a stale/old install that has no " +
+          "runnable server).",
       };
     }
   }
