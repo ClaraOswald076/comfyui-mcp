@@ -274,7 +274,7 @@ describe("a pin written MID-mutation cannot slice through it", () => {
     await expect(updateAllCustomNodes()).rejects.toThrow(PanelPinnedError);
   });
 
-  it("restore_node_snapshot REFUSES while pinned — the snapshot door", async () => {
+  it('node_snapshot(action:"restore") REFUSES while pinned — the snapshot door', async () => {
     setPanelVersionPin("0.11.3");
     await expect(restoreNodeSnapshot("prod")).rejects.toThrow(PanelPinnedError);
     expect(managerCalls).toEqual([]); // refused before any Manager request
