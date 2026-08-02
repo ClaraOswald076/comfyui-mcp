@@ -4,7 +4,7 @@ description: "Search (HuggingFace + CivitAI), download, list, and remove models;
 icon: "box"
 ---
 
-<Info>18 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
+<Info>16 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
 
 ## search_models
 
@@ -453,85 +453,32 @@ Free GPU VRAM by unloading cached models from ComfyUI. Use this between generati
 
 ---
 
-## model_metadata_read
+## model_metadata
 
-Read a model file's CURRENT embedded metadata + evidence, for curating it (Model Explorer). Returns classify (asset_type/base/precision/rank), the current model_card and prompt_director namespaces, read-only modelspec, top training tags (ss_tag_frequency), the Civitai description, and example prompts. Call this FIRST when the user wants to improve/curate a model's embedded .safetensors metadata, so you propose from real data. NOTE: this is the embedded-in-the-tensor metadata (model_card/prompt_director/modelspec/ss_*) — NOT the separate lora_catalog. `category` = ComfyUI model folder ('loras','checkpoints','vae',…); `name` = filename incl. .safetensors. DEPENDENCY: the curated read proxies the OPTIONAL 'comfyui-model-explorer' custom node. When that node is absent but the model file is reachable on the LOCAL filesystem, the tool does NOT hard-fail — it degrades to a structured 'model_explorer: unavailable' result with local evidence (file stat, the download_civitai_model sidecar, and the raw embedded safetensors metadata). In remote mode without the node it returns an actionable error naming the missing node.
-
-### Parameters
-
-<ParamField path="category" type="string" required>
-  ComfyUI model folder, e.g. 'loras'
-</ParamField>
-<ParamField path="name" type="string" required>
-  model filename incl. .safetensors
-</ParamField>
-
-### Example
-
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
-
-```json
-{
-  "tool": "model_metadata_read",
-  "arguments": {
-    "category": "<category>",
-    "name": "<name>"
-  }
-}
-```
-
----
-
-## model_metadata_propose
-
-PROPOSE cleaned embedded metadata into the user's diff-review window (Model Explorer). This does NOT write the file — the user sees your proposed fields vs current, edits/discusses, and their Confirm does the write. Call whenever you have a proposal OR the user asks you to revise one; each call REPLACES the live proposal, so send the FULL field set you're proposing. Include only fields you're confident about. Keys: display_name, description_clean, semantic_intent, prompt_guidance, preservation_guidance, trigger_tokens[] (EXACT tokens — never invent), activation_phrases[], negative_tokens[], tags[], compatible_families[], default_strength_model, default_strength_clip, strength_min, strength_max. NEVER write metadata directly.
+Curate a model file's embedded .safetensors metadata (Model Explorer). Driven by the `action` parameter:
+- action:"read" — Read a model file's CURRENT embedded metadata + evidence, for curating it. Returns classify (asset_type/base/precision/rank), the current model_card and prompt_director namespaces, read-only modelspec, top training tags (ss_tag_frequency), the Civitai description, and example prompts. Call this FIRST when the user wants to improve/curate a model's embedded .safetensors metadata, so you propose from real data. NOTE: this is the embedded-in-the-tensor metadata (model_card/prompt_director/modelspec/ss_*) — NOT the separate lora_catalog. `category` = ComfyUI model folder ('loras','checkpoints','vae',…); `name` = filename incl. .safetensors — BOTH required for read/propose, e.g. &#123;action:"read", category:"loras", name:"my_model.safetensors"&#125;. DEPENDENCY: the curated read proxies the OPTIONAL 'comfyui-model-explorer' custom node. When that node is absent but the model file is reachable on the LOCAL filesystem, the tool does NOT hard-fail — it degrades to a structured 'model_explorer: unavailable' result with local evidence (file stat, the download_civitai_model sidecar, and the raw embedded safetensors metadata). In remote mode without the node it returns an actionable error naming the missing node.
+- action:"propose" — PROPOSE cleaned embedded metadata into the user's diff-review window. This does NOT write the file — the user sees your proposed fields vs current, edits/discusses, and their Confirm does the write. Call whenever you have a proposal OR the user asks you to revise one; each call REPLACES the live proposal, so send the FULL field set you're proposing. Include only fields you're confident about. Keys: display_name, description_clean, semantic_intent, prompt_guidance, preservation_guidance, trigger_tokens[] (EXACT tokens — never invent), activation_phrases[], negative_tokens[], tags[], compatible_families[], default_strength_model, default_strength_clip, strength_min, strength_max. NEVER write metadata directly.
+- action:"fetch_civitai" — READ-ONLY: pull this model's data from Civitai (civitai.com) — the rich description, trainedWords, example prompts (with the prompt text used in the sample images), tags, nsfw flag, and source_url — WITHOUT writing anything. Call this when the embedded metadata is thin (empty model_card/prompt_director, no ss_tag_frequency) or to flesh out details before proposing. Treat the result as RAW input: distill the (often marketing-heavy) description, and MINE THE EXAMPLE PROMPTS for the real trigger — the trigger is frequently ONLY in the sample prompts even when trainedWords is EMPTY (e.g. every prompt starting with 'photo in the style of X' means X is the trigger). Adult models (civitai.red) resolve through this same API. Then clean it up and call action:"propose". DEPENDENCY: automatic by-hash lookup uses the OPTIONAL 'comfyui-model-explorer' custom node. If that node isn't installed, pass 'version_id' (the CivitAI modelVersionId) and this action degrades to CivitAI's public REST API directly — no node, no auth. Without both the node AND a version_id it returns a clear 'optional feature unavailable' message rather than enriching.
 
 ### Parameters
 
-<ParamField path="category" type="string" required>
-  —
+<ParamField path="action" type="enum" required>
+  Which metadata operation to perform. All three actions require `category` + `name`; "propose" also requires `fields` (optional `note`); "fetch_civitai" takes an optional `version_id`. Options: `read`, `propose`, `fetch_civitai`.
 </ParamField>
-<ParamField path="name" type="string" required>
-  —
+<ParamField path="category" type="string">
+  ComfyUI model folder, e.g. 'loras'. REQUIRED for all three actions.
 </ParamField>
-<ParamField path="fields" type="object" required>
-  Proposed field map (see description).
+<ParamField path="name" type="string">
+  model filename incl. .safetensors. REQUIRED for all three actions.
+</ParamField>
+<ParamField path="fields" type="object">
+  action:"propose" — REQUIRED proposed field map (see description).
 </ParamField>
 <ParamField path="note" type="string">
-  Optional one-line note about this revision.
-</ParamField>
-
-### Example
-
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
-
-```json
-{
-  "tool": "model_metadata_propose",
-  "arguments": {
-    "category": "<category>",
-    "name": "<name>",
-    "fields": "<fields>"
-  }
-}
-```
-
----
-
-## model_metadata_fetch_civitai
-
-READ-ONLY: pull this model's data from Civitai (civitai.com) — the rich description, trainedWords, example prompts (with the prompt text used in the sample images), tags, nsfw flag, and source_url — WITHOUT writing anything. Call this when the embedded metadata is thin (empty model_card/prompt_director, no ss_tag_frequency) or to flesh out details before proposing. Treat the result as RAW input: distill the (often marketing-heavy) description, and MINE THE EXAMPLE PROMPTS for the real trigger — the trigger is frequently ONLY in the sample prompts even when trainedWords is EMPTY (e.g. every prompt starting with 'photo in the style of X' means X is the trigger). Adult models (civitai.red) resolve through this same API. Then clean it up and call model_metadata_propose. DEPENDENCY: automatic by-hash lookup uses the OPTIONAL 'comfyui-model-explorer' custom node. If that node isn't installed, pass 'version_id' (the CivitAI modelVersionId) and this tool degrades to CivitAI's public REST API directly — no node, no auth. Without both the node AND a version_id it returns a clear 'optional feature unavailable' message rather than enriching.
-
-### Parameters
-
-<ParamField path="category" type="string" required>
-  ComfyUI model folder, e.g. 'loras'
-</ParamField>
-<ParamField path="name" type="string" required>
-  model filename incl. .safetensors
+  action:"propose" — optional one-line note about this revision.
 </ParamField>
 <ParamField path="version_id" type="integer">
-  Force a specific Civitai modelVersionId if hash lookup misses.
+  action:"fetch_civitai" — force a specific Civitai modelVersionId if hash lookup misses.
 </ParamField>
 
 ### Example
@@ -540,10 +487,11 @@ READ-ONLY: pull this model's data from Civitai (civitai.com) — the rich descri
 
 ```json
 {
-  "tool": "model_metadata_fetch_civitai",
+  "tool": "model_metadata",
   "arguments": {
-    "category": "<category>",
-    "name": "<name>"
+    "action": "read",
+    "category": "loras",
+    "name": "my_model.safetensors"
   }
 }
 ```

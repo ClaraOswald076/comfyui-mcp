@@ -145,7 +145,7 @@ const CATEGORIES: Array<{
       "download_status", "cancel_download",
       "remove_model", "list_extra_paths", "add_extra_path", "remove_extra_path",
       "get_embeddings", "clear_vram",
-      "model_metadata_read", "model_metadata_propose", "model_metadata_fetch_civitai",
+      "model_metadata",
     ],
   },
   {
@@ -313,7 +313,20 @@ function renderParam(name: string, schema: JsonSchema, required: boolean): strin
   return `<ParamField ${attrs.join(" ")}>\n  ${body.join(" ") || "—"}\n</ParamField>`;
 }
 
-function exampleArgs(jsonSchema: JsonSchema): Record<string, unknown> {
+// Most examples can be derived from JSON Schema required fields. Flat action
+// schemas deliberately keep action-specific required fields optional in that
+// schema (the MCP SDK does not render discriminated unions correctly), so they
+// need a complete, valid representative call here instead of an unusable
+// action-only skeleton.
+const EXAMPLE_ARG_OVERRIDES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
+  model_metadata: {
+    action: "read",
+    category: "loras",
+    name: "my_model.safetensors",
+  },
+};
+
+function exampleArgs(toolName: string, jsonSchema: JsonSchema): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   const props = jsonSchema.properties ?? {};
   const required = new Set(jsonSchema.required ?? []);
@@ -326,7 +339,7 @@ function exampleArgs(jsonSchema: JsonSchema): Record<string, unknown> {
     else if (s.type === "array") out[name] = [];
     else out[name] = `<${name}>`;
   }
-  return out;
+  return { ...out, ...EXAMPLE_ARG_OVERRIDES[toolName] };
 }
 
 function firstSentence(desc: string): string {
@@ -370,7 +383,7 @@ function renderTool(t: CapturedTool): string {
 
   lines.push("### Example", "");
   lines.push("<Note>Example coming soon — the call below is a generated skeleton.</Note>", "");
-  const args = exampleArgs(json);
+  const args = exampleArgs(t.name, json);
   lines.push("```json", JSON.stringify({ tool: t.name, arguments: args }, null, 2), "```", "");
   lines.push("---", "");
   return lines.join("\n");

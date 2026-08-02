@@ -1,7 +1,20 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
+import { z } from "zod";
+import { readFileSync } from "node:fs";
 import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { DEAD_NAMES, TOOL_NAMES } from "../../tools/vocabulary.js";
+
+/**
+ * The consolidated `model_metadata` tool (0.49.0 slice 5): the three
+ * model_metadata_* tools folded into one action-parameterized tool. Proves the
+ * consolidation did not change behaviour — every action runs the identical
+ * logic the old tool ran (same /model_explorer/* fetches, same 404
+ * degradations, same content blocks) — and that the flat-enum shape actually
+ * EXPOSES its parameters (the discriminated-union trap renders zero params).
+ */
 
 // --- Mocks (declared before importing the module under test) ---
 
@@ -30,19 +43,71 @@ type ToolHandler = (args: Record<string, unknown>) => Promise<{
   content: Array<{ type: string; text: string }>;
 }>;
 
-function makeServer() {
-  const handlers = new Map<string, ToolHandler>();
+interface Registered {
+  name: string;
+  shape: z.ZodRawShape;
+  handler: ToolHandler;
+}
+
+function registered(): Registered[] {
+  const tools: Registered[] = [];
   const server = {
-    tool: (name: string, _desc: string, _schema: unknown, handler: ToolHandler) => {
-      handlers.set(name, handler);
+    tool: (name: string, _desc: string, shape: z.ZodRawShape, handler: ToolHandler) => {
+      tools.push({ name, shape, handler });
     },
   };
   registerModelExplorerTools(server as never);
-  return {
-    read: handlers.get("model_metadata_read")!,
-    fetchCivitai: handlers.get("model_metadata_fetch_civitai")!,
-  };
+  return tools;
 }
+
+/** The whole model-metadata surface is now ONE tool (0.49.0 slice 5). */
+function handler(): ToolHandler {
+  const tools = registered();
+  expect(tools).toHaveLength(1);
+  expect(tools[0].name).toBe("model_metadata");
+  return tools[0].handler;
+}
+
+const text = (res: Awaited<ReturnType<ToolHandler>>) => res.content.map((c) => c.text).join(" ");
+
+describe("model_metadata registration", () => {
+  it("registers exactly one tool named `model_metadata` (3→1)", () => {
+    const tools = registered();
+    expect(tools).toHaveLength(1);
+    expect(tools[0].name).toBe("model_metadata");
+  });
+
+  // The whole reason for the flat-enum shape rule: a z.discriminatedUnion renders
+  // as ZERO parameters, hiding every input from the model.
+  it("exposes a visible flat `action` enum with every per-action parameter", () => {
+    const [{ shape }] = registered();
+    // io: "input" — the conversion options the MCP SDK itself uses
+    // (sdk/server/zod-json-schema-compat.js, asserted by docs-schema-parity.test.ts),
+    // so this is the schema a client is actually given.
+    const json = z.toJSONSchema(z.object(shape), { reused: "inline", io: "input" }) as {
+      properties?: Record<string, { enum?: string[] }>;
+      required?: string[];
+    };
+    expect(Object.keys(json.properties ?? {}).sort()).toEqual([
+      "action",
+      "category",
+      "fields",
+      "name",
+      "note",
+      "version_id",
+    ]);
+    expect(json.properties?.action.enum?.sort()).toEqual(["fetch_civitai", "propose", "read"]);
+    // Only `action` can be required — the rest are per-action, enforced in the handler.
+    expect(json.required).toEqual(["action"]);
+  });
+
+  it("an unknown action returns a clear error result", async () => {
+    const res = await handler()({ action: "bogus" });
+    expect(res.isError).toBe(true);
+    expect(text(res)).toMatch(/unknown model_metadata action/i);
+    expect(text(res)).toMatch(/fetch_civitai/);
+  });
+});
 
 describe("explorerHttpError", () => {
   it("turns a 404 into an actionable message covering BOTH causes (not a raw 404)", () => {
@@ -69,7 +134,7 @@ describe("explorerHttpError", () => {
   });
 });
 
-describe("model_metadata_read / fetch_civitai 404 handling", () => {
+describe('action:"read" / action:"fetch_civitai" 404 handling', () => {
   const fetchMock = vi.fn();
 
   beforeEach(() => {
@@ -84,34 +149,30 @@ describe("model_metadata_read / fetch_civitai 404 handling", () => {
     vi.unstubAllGlobals();
   });
 
-  it("model_metadata_read: 404 → actionable message, not a raw HTTP 404", async () => {
+  it('action:"read": 404 → actionable message, not a raw HTTP 404', async () => {
     fetchMock.mockResolvedValueOnce({ ok: false, status: 404, text: async () => "" });
-    const { read } = makeServer();
-    const res = await read({ category: "checkpoints", name: "model.safetensors" });
+    const res = await handler()({ action: "read", category: "checkpoints", name: "model.safetensors" });
 
     expect(res.isError).toBe(true);
-    const text = res.content[0].text;
-    expect(text).toContain("comfyui-model-explorer");
-    expect(text).toContain("could not find the requested model file");
+    expect(text(res)).toContain("comfyui-model-explorer");
+    expect(text(res)).toContain("could not find the requested model file");
     // Must NOT be the old raw-status phrasing.
-    expect(text).not.toContain("detail HTTP 404 (is ComfyUI running");
+    expect(text(res)).not.toContain("detail HTTP 404 (is ComfyUI running");
   });
 
-  it("model_metadata_fetch_civitai: 404 (no version_id) → optional-feature-unavailable message, points at version_id path", async () => {
+  it('action:"fetch_civitai": 404 (no version_id) → optional-feature-unavailable message, points at version_id path', async () => {
     fetchMock.mockResolvedValueOnce({ ok: false, status: 404, text: async () => "" });
-    const { fetchCivitai } = makeServer();
-    const res = await fetchCivitai({ category: "loras", name: "x.safetensors" });
+    const res = await handler()({ action: "fetch_civitai", category: "loras", name: "x.safetensors" });
 
     expect(res.isError).toBe(true);
-    const text = res.content[0].text;
-    expect(text).toContain("comfyui-model-explorer");
-    expect(text).toContain("OPTIONAL");
+    expect(text(res)).toContain("comfyui-model-explorer");
+    expect(text(res)).toContain("OPTIONAL");
     // Tells the caller how to recover without the node.
-    expect(text).toContain("version_id");
-    expect(text).not.toContain("civitai HTTP 404");
+    expect(text(res)).toContain("version_id");
+    expect(text(res)).not.toContain("civitai HTTP 404");
   });
 
-  it("model_metadata_fetch_civitai: 404 WITH version_id → degrades to CivitAI public API (no error)", async () => {
+  it('action:"fetch_civitai": 404 WITH version_id → degrades to CivitAI public API (no error)', async () => {
     fetchMock
       // node route 404s (node absent)
       .mockResolvedValueOnce({ ok: false, status: 404, text: async () => "" })
@@ -131,34 +192,40 @@ describe("model_metadata_read / fetch_civitai 404 handling", () => {
           images: [{ url: "u", meta: { prompt: "a dark fantasy castle" } }],
         }),
       });
-    const { fetchCivitai } = makeServer();
-    const res = await fetchCivitai({ category: "loras", name: "x.safetensors", version_id: 1567118 });
+    const res = await handler()({
+      action: "fetch_civitai",
+      category: "loras",
+      name: "x.safetensors",
+      version_id: 1567118,
+    });
 
     expect(res.isError).toBeFalsy();
-    const text = res.content[0].text;
-    expect(text).toContain("civitai-public-api");
-    expect(text).toContain("dark fantasy");
-    expect(text).toContain("a dark fantasy castle"); // mined example prompt
-    expect(text).toContain("1567118");
+    expect(text(res)).toContain("civitai-public-api");
+    expect(text(res)).toContain("dark fantasy");
+    expect(text(res)).toContain("a dark fantasy castle"); // mined example prompt
+    expect(text(res)).toContain("1567118");
     // The public API URL was used for the fallback.
     const calledUrls = fetchMock.mock.calls.map((c) => String(c[0]));
     expect(calledUrls.some((u) => u.includes("civitai.com/api/v1/model-versions/1567118"))).toBe(true);
   });
 
-  it("model_metadata_fetch_civitai: 404 WITH version_id but public API also fails → clear error noting the version lookup failed", async () => {
+  it('action:"fetch_civitai": 404 WITH version_id but public API also fails → clear error noting the version lookup failed', async () => {
     fetchMock
       .mockResolvedValueOnce({ ok: false, status: 404, text: async () => "" })
       .mockResolvedValueOnce({ ok: false, status: 404, text: async () => "" });
-    const { fetchCivitai } = makeServer();
-    const res = await fetchCivitai({ category: "loras", name: "x.safetensors", version_id: 999999999 });
+    const res = await handler()({
+      action: "fetch_civitai",
+      category: "loras",
+      name: "x.safetensors",
+      version_id: 999999999,
+    });
 
     expect(res.isError).toBe(true);
-    const text = res.content[0].text;
-    expect(text).toContain("comfyui-model-explorer");
-    expect(text).toContain("version_id was supplied");
+    expect(text(res)).toContain("comfyui-model-explorer");
+    expect(text(res)).toContain("version_id was supplied");
   });
 
-  it("model_metadata_read: still succeeds when the node is present", async () => {
+  it('action:"read": still succeeds when the node is present', async () => {
     fetchMock
       .mockResolvedValueOnce({
         ok: true,
@@ -166,11 +233,103 @@ describe("model_metadata_read / fetch_civitai 404 handling", () => {
         json: async () => ({ classify: { asset_type: "checkpoint" }, namespaces: {} }),
       })
       .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ candidates: [] }) });
-    const { read } = makeServer();
-    const res = await read({ category: "checkpoints", name: "model.safetensors" });
+    const res = await handler()({ action: "read", category: "checkpoints", name: "model.safetensors" });
 
     expect(res.isError).toBeFalsy();
-    expect(res.content[0].text).toContain("checkpoint");
+    expect(text(res)).toContain("checkpoint");
+  });
+});
+
+describe('action:"propose"', () => {
+  const fetchMock = vi.fn();
+
+  beforeEach(() => {
+    fetchMock.mockReset();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("POSTs the identical proposal body and returns the pushed envelope", async () => {
+    fetchMock.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ ok: true, seq: 7 }) });
+    const res = await handler()({
+      action: "propose",
+      category: "loras",
+      name: "x.safetensors",
+      fields: { display_name: "Dark Fantasy XL" },
+      note: "v2",
+    });
+
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, { method: string; body: string }];
+    expect(String(url)).toContain("/model_explorer/proposal");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body)).toEqual({
+      category: "loras",
+      name: "x.safetensors",
+      fields: { display_name: "Dark Fantasy XL" },
+      note: "v2",
+    });
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(text(res))).toEqual({
+      pushed: true,
+      seq: 7,
+      note: expect.stringContaining("review window"),
+    });
+  });
+
+  it("an upstream failure is an error result, as before", async () => {
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 500, json: async () => ({ ok: false, error: "boom" }) });
+    const res = await handler()({
+      action: "propose",
+      category: "loras",
+      name: "x.safetensors",
+      fields: { display_name: "X" },
+    });
+    expect(res.isError).toBe(true);
+    expect(text(res)).toContain("boom");
+  });
+});
+
+describe("per-action presence guards (the flat shape cannot schema-require these)", () => {
+  const fetchMock = vi.fn();
+
+  beforeEach(() => {
+    fetchMock.mockReset();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("category-less and name-less read/propose/fetch_civitai name the missing field and fetch nothing", async () => {
+    for (const action of ["read", "propose", "fetch_civitai"]) {
+      const noCategory = await handler()({ action });
+      expect(noCategory.isError).toBe(true);
+      expect(text(noCategory)).toContain(`action:"${action}" requires \`category\``);
+
+      const noName = await handler()({ action, category: "loras" });
+      expect(noName.isError).toBe(true);
+      expect(text(noName)).toContain(`action:"${action}" requires \`name\``);
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('action:"propose" without fields names it and fetches nothing', async () => {
+    const res = await handler()({ action: "propose", category: "loras", name: "x.safetensors" });
+    expect(res.isError).toBe(true);
+    expect(text(res)).toContain('action:"propose" requires `fields`');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  // The guard tests ABSENCE, not falsiness: an empty category/name passed
+  // z.string() before this consolidation and reached the upstream route, which
+  // answers with its own error. A `!category` guard would swallow that path.
+  it("explicitly empty category/name still reach the upstream route, as before", async () => {
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 404, text: async () => "" });
+    await handler()({ action: "read", category: "", name: "" });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(String(fetchMock.mock.calls[0][0])).toContain("/model_explorer/detail?category=&name=");
   });
 });
 
@@ -230,7 +389,7 @@ vi.mock("../../config.js", async () => {
   return { ...actual, isRemoteMode: () => remoteMode.value };
 });
 
-describe("model_metadata_read local fallback (#363 reopen)", () => {
+describe('action:"read" local fallback (#363 reopen)', () => {
   const fetchMock = vi.fn();
   let dir: string;
 
@@ -266,11 +425,10 @@ describe("model_metadata_read local fallback (#363 reopen)", () => {
     await stubLocalModel(filePath);
     fetchMock.mockResolvedValueOnce({ ok: false, status: 404, text: async () => "" });
 
-    const { read } = makeServer();
-    const res = await read({ category: "checkpoints", name: "model.safetensors" });
+    const res = await handler()({ action: "read", category: "checkpoints", name: "model.safetensors" });
 
     expect(res.isError).toBeFalsy();
-    const parsed = JSON.parse(res.content[0].text);
+    const parsed = JSON.parse(text(res));
     expect(parsed.model_explorer).toBe("unavailable");
     expect(parsed.source).toBe("local-fallback");
     expect(parsed.reason).toContain("comfyui-model-explorer");
@@ -280,7 +438,7 @@ describe("model_metadata_read local fallback (#363 reopen)", () => {
     expect(parsed.embedded_metadata["modelspec.architecture"]).toBe("stable-diffusion-xl-v1-base");
     expect(parsed.civitai_sidecar.trainedWords).toEqual(["dark fantasy"]);
     // Must NOT be the old raw-status phrasing.
-    expect(res.content[0].text).not.toContain("detail HTTP 404 (is ComfyUI running");
+    expect(text(res)).not.toContain("detail HTTP 404 (is ComfyUI running");
   });
 
   it("404 + non-safetensors file (.ckpt) → degrade result with sidecar but null embedded metadata", async () => {
@@ -290,11 +448,10 @@ describe("model_metadata_read local fallback (#363 reopen)", () => {
     await stubLocalModel(filePath);
     fetchMock.mockResolvedValueOnce({ ok: false, status: 404, text: async () => "" });
 
-    const { read } = makeServer();
-    const res = await read({ category: "checkpoints", name: "old.ckpt" });
+    const res = await handler()({ action: "read", category: "checkpoints", name: "old.ckpt" });
 
     expect(res.isError).toBeFalsy();
-    const parsed = JSON.parse(res.content[0].text);
+    const parsed = JSON.parse(text(res));
     expect(parsed.model_explorer).toBe("unavailable");
     expect(parsed.embedded_metadata).toBeNull();
     expect(parsed.civitai_sidecar.baseModel).toBe("SD 1.5");
@@ -306,13 +463,11 @@ describe("model_metadata_read local fallback (#363 reopen)", () => {
     );
     fetchMock.mockResolvedValueOnce({ ok: false, status: 404, text: async () => "" });
 
-    const { read } = makeServer();
-    const res = await read({ category: "checkpoints", name: "ghost.safetensors" });
+    const res = await handler()({ action: "read", category: "checkpoints", name: "ghost.safetensors" });
 
     expect(res.isError).toBe(true);
-    const text = res.content[0].text;
-    expect(text).toContain("comfyui-model-explorer");
-    expect(text).toContain("could not find the requested model file");
+    expect(text(res)).toContain("comfyui-model-explorer");
+    expect(text(res)).toContain("could not find the requested model file");
   });
 
   it("404 + REMOTE mode → local fallback skipped even when a host file resolves; keeps the actionable error", async () => {
@@ -327,14 +482,12 @@ describe("model_metadata_read local fallback (#363 reopen)", () => {
     await stubLocalModel(filePath);
     fetchMock.mockResolvedValueOnce({ ok: false, status: 404, text: async () => "" });
 
-    const { read } = makeServer();
-    const res = await read({ category: "checkpoints", name: "model.safetensors" });
+    const res = await handler()({ action: "read", category: "checkpoints", name: "model.safetensors" });
 
     expect(res.isError).toBe(true);
-    const text = res.content[0].text;
-    expect(text).toContain("comfyui-model-explorer");
-    expect(text).toContain("could not find the requested model file");
-    expect(text).not.toContain("local-fallback");
+    expect(text(res)).toContain("comfyui-model-explorer");
+    expect(text(res)).toContain("could not find the requested model file");
+    expect(text(res)).not.toContain("local-fallback");
     expect(resolveExistingModelFileMock).not.toHaveBeenCalled();
   });
 
@@ -343,12 +496,43 @@ describe("model_metadata_read local fallback (#363 reopen)", () => {
     resolveExistingModelFileMock.mockResolvedValue({ path: subdir, root: dir, info: await stat(subdir) });
     fetchMock.mockResolvedValueOnce({ ok: false, status: 404, text: async () => "" });
 
-    const { read } = makeServer();
-    const res = await read({ category: "checkpoints", name: "model.safetensors" });
+    const res = await handler()({ action: "read", category: "checkpoints", name: "model.safetensors" });
 
     expect(res.isError).toBe(true);
-    const text = res.content[0].text;
-    expect(text).toContain("comfyui-model-explorer");
-    expect(text).not.toContain("local-fallback");
+    expect(text(res)).toContain("comfyui-model-explorer");
+    expect(text(res)).not.toContain("local-fallback");
+  });
+});
+
+describe("the three model_metadata_* names are retired", () => {
+  const old = ["model_metadata_read", "model_metadata_propose", "model_metadata_fetch_civitai"];
+
+  it("each old name is in DEAD_NAMES with replacement `model_metadata`", () => {
+    for (const name of old) {
+      const entry = DEAD_NAMES.find((d) => d.name === name);
+      expect(entry, `${name} must be declared dead`).toBeDefined();
+      expect(entry!.since).toBe("0.49.0");
+      expect(entry!.replacement).toContain("model_metadata");
+    }
+  });
+
+  it("no old name is still in the live ledger, and `model_metadata` is", () => {
+    for (const name of old) expect(TOOL_NAMES as readonly string[]).not.toContain(name);
+    expect(TOOL_NAMES as readonly string[]).toContain("model_metadata");
+  });
+});
+
+describe("model_metadata generated documentation", () => {
+  it("gives the read example the runtime-required category and name", () => {
+    const docs = readFileSync(
+      fileURLToPath(new URL("../../../docs/tools/models.mdx", import.meta.url)),
+      "utf8",
+    );
+    const start = docs.indexOf("## model_metadata");
+    const section = docs.slice(start, docs.indexOf("\n---", start));
+
+    expect(section).toContain('"action": "read"');
+    expect(section).toContain('"category": "loras"');
+    expect(section).toContain('"name": "my_model.safetensors"');
   });
 });

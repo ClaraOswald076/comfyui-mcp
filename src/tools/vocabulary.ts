@@ -123,9 +123,7 @@ export const TOOL_NAMES = [
   "search_civitai_models",
   "search_civitai_creators",
   "download_civitai_model",
-  "model_metadata_read",
-  "model_metadata_propose",
-  "model_metadata_fetch_civitai",
+  "model_metadata",
   "prompt_director_inspect",
   "list_extra_paths",
   "add_extra_path",
@@ -213,10 +211,10 @@ export type ToolName = (typeof TOOL_NAMES)[number];
  * updating — it is history, not state.
  *
  * Read from docs/design/tool-surface.txt so there is exactly one copy of the
- * baseline names (188: the 182 frozen at 0.48.32 plus the six consolidated tools
+ * baseline names (189: the 182 frozen at 0.48.32 plus the seven consolidated tools
  * appended as they shipped — `bisect` in 0.49.0 slice 1, then `node_snapshot`,
  * `apps` and `batch` in slice 2, then `comfy_cli` in slice 3, then `queue` in
- * slice 4), and so the file committed
+ * slice 4, then `model_metadata` in slice 5), and so the file committed
  * as the P0 evidence is load-bearing rather than
  * decorative.
  */
@@ -235,7 +233,7 @@ const BASELINE_URL = new URL("../../docs/design/tool-surface.txt", import.meta.u
  * 200-line rename. APPENDING is legitimate — new tools join the baseline when they
  * ship — so the workflow is: append, update this hash, say why in the message.
  */
-export const BASELINE_SHA256 = "5f4e68f40ef0e589f8bda09e0e01c4c61a7610f4c2a47375f5b75bd2f7b4bb71";
+export const BASELINE_SHA256 = "a022d6ddff680234f7da1ba09f2fd3a0a827e99e07c18853726938afb25c94d0";
 
 /**
  * LAZY on purpose, and this is not a micro-optimisation.
@@ -309,7 +307,7 @@ export function panelBaselineIntegrity(): { ok: boolean; actual: string } {
  * to the surface. That is the ratchet: not that it cannot rise, but that it cannot
  * rise silently.
  */
-export const MAX_TOOLS = 155;
+export const MAX_TOOLS = 153;
 
 /** Where this is headed, for reference in review. A goal, not enforced. */
 export const TOOL_BUDGET_TARGET = 30;
@@ -377,6 +375,25 @@ export function deadNameRe(name: string): RegExp {
  * entry documents the two mentions in this repo that are correct.
  */
 export const DEAD_NAMES: readonly DeadName[] = [
+  // 0.49.0 slice 5: the three model-metadata tools folded into one
+  // action-parameterized `model_metadata` tool. Same Model Explorer proxy routes,
+  // same 404 degradations, same return shapes — only the surface changed, so
+  // every mention of the old names is now rot pointing at a 404.
+  {
+    name: "model_metadata_read",
+    since: "0.49.0",
+    replacement: 'model_metadata (action:"read")',
+  },
+  {
+    name: "model_metadata_propose",
+    since: "0.49.0",
+    replacement: 'model_metadata (action:"propose")',
+  },
+  {
+    name: "model_metadata_fetch_civitai",
+    since: "0.49.0",
+    replacement: 'model_metadata (action:"fetch_civitai")',
+  },
   // 0.49.0 slice 4: the eight queue/jobs tools folded into one action-parameterized
   // `queue` tool. Same queue-manager services, same return shapes (JSON for the
   // query actions, prose for the cancels) — only the surface changed, so every
