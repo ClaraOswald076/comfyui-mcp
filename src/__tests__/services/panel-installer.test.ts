@@ -111,6 +111,8 @@ function makeDeps(opts: {
   noUpstream?: boolean;
   /** Manager API dialect the probe reports ("unproven" -> undefined). Defaults to "legacy". */
   dialect?: "v2" | "v2-batch" | "legacy" | "unproven";
+  /** Ignored-file collisions the fallback gate reports (default: none). */
+  ignoredConflicts?: string[];
 } = {}): Harness {
   const files = opts.files ?? {};
   const revs = opts.revs ?? {};
@@ -146,6 +148,7 @@ function makeDeps(opts: {
     },
     detectManagerDialect: async () =>
       opts.dialect === "unproven" ? undefined : (opts.dialect ?? "legacy"),
+    gitIgnoredPullConflicts: () => opts.ignoredConflicts ?? [],
     gitPullFfOnly: (dir) => {
       gitPulls.push(dir);
       if (opts.onGitPull) return opts.onGitPull({ files, revs });
@@ -870,6 +873,21 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
     const err = await runPanelAction("update", h.deps).catch((e) => e);
     expect(err).toBeInstanceOf(PanelInstallError);
     expect(String(err?.message ?? err)).toMatch(/did NOT apply|unproven/);
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("ignored local file collides with an incoming path -> fallback REFUSED before any pull (silent-overwrite guard)", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: LEGACY_NOOP,
+      ignoredConflicts: ["web/local-notes.txt"],
+      onGitPull: () => "Updating d806619..675ace8\nFast-forward",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).toMatch(/IGNORED|SILENTLY OVERWRITTEN|local-notes/);
     expect(h.gitPulls).toEqual([]);
   });
 

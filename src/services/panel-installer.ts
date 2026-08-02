@@ -163,7 +163,14 @@ export interface PanelInstallerDeps {
    * upstream is configured; callers treat that as “cannot prove currency”.
    */
   gitUpstreamRev: (dir: string) => string;
+
   /**
+   * Ignored local files the pending fast-forward would SILENTLY OVERWRITE
+   * (git protects untracked files from checkout, but NOT ignored ones). The
+   * #724 fallback refuses when this returns anything. THROWS when it cannot
+   * prove the intersection (fetch/diff failure) — "cannot prove" refuses.
+   */
+  gitIgnoredPullConflicts: (dir: string) => string[];  /**
    * The user's explicit panel-version pin, if any. While a pin is in force NO
    * code path here may move the panel — install/update/reinstall refuse and the
    * on-load ensure skips. Never throws (an unreadable pin reports
@@ -343,6 +350,37 @@ export function gitUpstreamRev(dir: string): string {
   return runGit(dir, ["rev-parse", "@{upstream}"], PANEL_GIT_STATUS_TIMEOUT_MS).trim();
 }
 
+/**
+ * Ignored-file collision proof for the #724 fallback (codex gate): `git status
+ * --porcelain` omits ignored files, and `git pull --ff-only` does NOT refuse to
+ * overwrite an ignored local file when the remote newly tracks that path — the
+ * local data is silently replaced. Fetch, then intersect the ignored untracked
+ * files with the paths the fast-forward would touch; any overlap refuses the
+ * pull BEFORE it runs. THROWS (PanelInstallError) when the proof cannot be
+ * computed — callers treat that as "cannot prove safe", never as safe.
+ */
+export function gitIgnoredPullConflicts(dir: string): string[] {
+  runGit(dir, ["fetch", "--quiet"], PANEL_GIT_PULL_TIMEOUT_MS);
+  const ignored = runGit(
+    dir,
+    ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+    PANEL_GIT_STATUS_TIMEOUT_MS,
+  )
+    .split("\0")
+    .filter(Boolean);
+  if (ignored.length === 0) return [];
+  const incoming = new Set(
+    runGit(
+      dir,
+      ["diff", "--name-only", "-z", "HEAD", "@{upstream}"],
+      PANEL_GIT_STATUS_TIMEOUT_MS,
+    )
+      .split("\0")
+      .filter(Boolean),
+  );
+  return ignored.filter((f) => incoming.has(f));
+}
+
 export const defaultDeps: PanelInstallerDeps = {
   isLocalMode: () => isLocalMode(),
   // Keep panel management aligned with get_environment, downloads, and
@@ -392,6 +430,7 @@ export const defaultDeps: PanelInstallerDeps = {
   gitPullFfOnly: (dir) => gitPullFfOnly(dir),
   gitWorktreeRoot: (dir) => gitWorktreeRoot(dir),
   gitUpstreamRev: (dir) => gitUpstreamRev(dir),
+  gitIgnoredPullConflicts: (dir) => gitIgnoredPullConflicts(dir),
   readPin: () => getPanelPinState(),
   isReachable: async () => {
     try {
@@ -1514,6 +1553,35 @@ async function updateViaGitCheckoutFallback(opts: {
         `signature, #639/#724 — so updating it on the host restores the Manager ` +
         `path: git pull in custom_nodes/ComfyUI-Manager, or pip install -U ` +
         `comfyui_manager.)`,
+    );
+  }
+
+  // IGNORED-FILE GATE — porcelain omits ignored files, but a fast-forward does
+  // NOT protect them: when the remote newly tracks a path that is locally
+  // ignored, the pull silently overwrites the local file (codex gate). Refuse
+  // on any proven collision; a proof failure also refuses (fail closed).
+  let ignoredConflicts: string[];
+  try {
+    ignoredConflicts = deps.gitIgnoredPullConflicts(dir);
+  } catch (err) {
+    throw new PanelInstallError(
+      `Panel update did NOT apply: ComfyUI-Manager never enqueued the update (the ` +
+        `stale legacy 3.x silent no-op, #639/#724), and the git fallback is ` +
+        `REFUSED: could not prove the pull would not silently overwrite ignored ` +
+        `local files in ${dir} (${err instanceof Error ? err.message : String(err)}). ` +
+        `Update the panel repo manually (git pull in ${dir}), then RESTART ComfyUI.`,
+    );
+  }
+  if (ignoredConflicts.length > 0) {
+    const shown = ignoredConflicts.slice(0, 5).join(", ");
+    const more = ignoredConflicts.length > 5 ? ` (+${ignoredConflicts.length - 5} more)` : "";
+    throw new PanelInstallError(
+      `Refusing the panel update git fallback: ${ignoredConflicts.length} locally-IGNORED ` +
+        `file(s) in ${dir} would be SILENTLY OVERWRITTEN by the fast-forward ` +
+        `(git protects untracked files from checkout, but not ignored ones): ` +
+        `${shown}${more}. Move or delete them (or git add them), then retry — ` +
+        `or update the panel repo manually. (ComfyUI-Manager also no-op'd this ` +
+        `update — the stale legacy 3.x signature, #639/#724.)`,
     );
   }
 
