@@ -220,6 +220,16 @@ describe("parseSafetensorsEmbeddedMetadata", () => {
   });
 });
 
+// Remote mode must skip the local fallback entirely (the host's file tree is
+// NOT the remote server's); this flag flips isRemoteMode() per-test while
+// every other config export stays real. vi.mock/vi.hoisted are hoisted, so
+// this still applies before the module under test is imported.
+const remoteMode = vi.hoisted(() => ({ value: false }));
+vi.mock("../../config.js", async () => {
+  const actual = await vi.importActual<typeof import("../../config.js")>("../../config.js");
+  return { ...actual, isRemoteMode: () => remoteMode.value };
+});
+
 describe("model_metadata_read local fallback (#363 reopen)", () => {
   const fetchMock = vi.fn();
   let dir: string;
@@ -228,6 +238,7 @@ describe("model_metadata_read local fallback (#363 reopen)", () => {
     fetchMock.mockReset();
     vi.stubGlobal("fetch", fetchMock);
     resolveExistingModelFileMock.mockReset();
+    remoteMode.value = false;
     dir = await mkdtemp(join(tmpdir(), "model-explorer-363-"));
   });
   afterEach(async () => {
@@ -302,5 +313,42 @@ describe("model_metadata_read local fallback (#363 reopen)", () => {
     const text = res.content[0].text;
     expect(text).toContain("comfyui-model-explorer");
     expect(text).toContain("could not find the requested model file");
+  });
+
+  it("404 + REMOTE mode → local fallback skipped even when a host file resolves; keeps the actionable error", async () => {
+    remoteMode.value = true;
+    const filePath = join(dir, "model.safetensors");
+    await writeFile(
+      filePath,
+      makeSafetensorsBytes({ "modelspec.architecture": "stable-diffusion-xl-v1-base" }),
+    );
+    // The host's COMFYUI_PATH WOULD resolve this file — in remote mode that is
+    // the wrong machine's tree, so the resolver must not even be consulted.
+    await stubLocalModel(filePath);
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 404, text: async () => "" });
+
+    const { read } = makeServer();
+    const res = await read({ category: "checkpoints", name: "model.safetensors" });
+
+    expect(res.isError).toBe(true);
+    const text = res.content[0].text;
+    expect(text).toContain("comfyui-model-explorer");
+    expect(text).toContain("could not find the requested model file");
+    expect(text).not.toContain("local-fallback");
+    expect(resolveExistingModelFileMock).not.toHaveBeenCalled();
+  });
+
+  it("404 + resolver hits a DIRECTORY → no success-shaped result; keeps the actionable error", async () => {
+    const subdir = await mkdtemp(join(dir, "not-a-file-")); // a real directory, not a model file
+    resolveExistingModelFileMock.mockResolvedValue({ path: subdir, root: dir, info: await stat(subdir) });
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 404, text: async () => "" });
+
+    const { read } = makeServer();
+    const res = await read({ category: "checkpoints", name: "model.safetensors" });
+
+    expect(res.isError).toBe(true);
+    const text = res.content[0].text;
+    expect(text).toContain("comfyui-model-explorer");
+    expect(text).not.toContain("local-fallback");
   });
 });

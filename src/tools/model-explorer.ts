@@ -8,6 +8,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { open, readFile } from "node:fs/promises";
 import { errorToToolResult } from "../utils/errors.js";
+import { isRemoteMode } from "../config.js";
 import { resolveExistingModelFile } from "../services/model-resolver.js";
 
 function comfyBase(): string {
@@ -198,13 +199,24 @@ async function readCivitaiSidecar(filePath: string): Promise<Record<string, unkn
 
 /**
  * Build the local-fallback payload for a 404'd model_metadata_read. Returns
- * null when no local file is reachable — remote mode has no filesystem, and a
- * locally-missing file means the 404 likely IS "model not found", in which
- * case the actionable explorerHttpError remains the right answer.
+ * null whenever a local answer would be the WRONG answer, keeping the
+ * actionable explorerHttpError instead:
+ *  - REMOTE mode: the model lives on the remote server's filesystem. An
+ *    explicit COMFYUI_PATH on this MCP host still resolves (config.ts warns
+ *    but honors it), so without this gate the fallback would return metadata
+ *    from the HOST's unrelated file tree — wrong-machine data presented as
+ *    the answer. The fallback is only meaningful when server and MCP host
+ *    share a file tree.
+ *  - The resolver matched a DIRECTORY, not a regular file — it returns dir
+ *    hits so callers can craft a precise "not a file" error, and a directory
+ *    has no metadata evidence to fall back on.
+ *  - No local file is reachable at all: the 404 likely IS "model not found".
  */
 async function localMetadataFallback(category: string, name: string) {
   try {
+    if (isRemoteMode()) return null;
     const { path, info } = await resolveExistingModelFile(`${category}/${name}`);
+    if (!info.isFile()) return null;
     return {
       file: { path, size_bytes: info.size, modified: info.mtime.toISOString() },
       embedded_metadata: await readSafetensorsEmbeddedMetadata(path),
