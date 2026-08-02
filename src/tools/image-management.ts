@@ -20,6 +20,8 @@ export function registerImageManagementTools(server: McpServer): void {
   server.tool(
     "get_image",
     "Fetch a generated image from ComfyUI and return it as an inline image. " +
+      "Video/audio outputs (e.g. a VHS_VideoCombine .mp4) are saved to save_dir " +
+      "with their original extension instead of being rendered inline. " +
       "Works with remote ComfyUI instances — does not require COMFYUI_PATH. " +
       "Use get_history first to obtain the filename.",
     {
@@ -49,6 +51,7 @@ export function registerImageManagementTools(server: McpServer): void {
           args.filename,
           args.type ?? "output",
           args.subfolder ?? "",
+          { allowMedia: true },
         );
 
         // Save to local file
@@ -57,6 +60,18 @@ export function registerImageManagementTools(server: McpServer): void {
         const localFilename = basename(args.filename);
         const savePath = join(saveDir, localFilename);
         await writeFile(savePath, Buffer.from(base64, "base64"));
+
+        // Only images render inline; video/audio are save-to-disk only (#663).
+        if (!mimeType.toLowerCase().startsWith("image/")) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Saved to: ${savePath} (${mimeType}; not rendered inline)`,
+              },
+            ],
+          };
+        }
 
         return {
           content: [

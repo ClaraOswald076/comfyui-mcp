@@ -445,13 +445,205 @@ function assertSafeViewRef(filename: string, subfolder: string): void {
 }
 
 /**
+ * Media formats get_image can save, identified by magic-byte sniff (#663).
+ * Format — not just family — so a cross-format mislabel (MP3 bytes declared
+ * audio/wav) is rejected even when both byte streams are genuine media.
+ */
+type MediaFormat =
+  | "mp4-video"
+  | "mp4-audio"
+  | "ebml"
+  | "avi"
+  | "wav"
+  | "flac"
+  | "ogg"
+  | "mpegaudio"
+  | "aac";
+
+// EBML magic and MPEG/ADTS frame syncs are only 2–4 bytes — short enough for
+// a truncated error-prefix to satisfy them — so formats with no cheap local
+// structure to validate require a plausible minimum file size instead.
+const MIN_MEDIA_BYTES = 256;
+
+/**
+ * Magic-byte sniff for the video/audio formats get_image can save (#663).
+ * Returns the media FORMAT the payload proves itself to be, or null when it
+ * matches none of them. Each check validates STRUCTURE, not just a leading
+ * signature: MP4/MOV/M4V/M4A need a well-formed "ftyp" box, RIFF containers
+ * (WAV/AVI) a chunk size consistent with the delivered body, FLAC the
+ * mandatory STREAMINFO first block, Ogg a version-0 page header whose
+ * segment table fits inside the body, and ID3 a syncsafe tag size that fits.
+ * A textual junk body (JSON/HTML error page) or a truncated prefix matches
+ * none of these.
+ */
+function sniffMediaFormat(base64: string): MediaFormat | null {
+  // 40 base64 chars decode to the first 30 bytes — enough for the deepest
+  // header below (the 27-byte Ogg page header).
+  const head = Buffer.from(base64.slice(0, 40), "base64");
+  const bodyLength =
+    Math.floor((base64.length * 3) / 4) -
+    (base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0);
+  const ascii = (start: number, end: number) =>
+    head.subarray(start, end).toString("ascii");
+  if (head.length >= 16 && ascii(4, 8) === "ftyp") {
+    // mp4/mov/m4v/m4a — require a well-formed ftyp BOX, not just the four
+    // bytes "ftyp": the box size (big-endian uint32) must cover the header +
+    // major brand + minor version (>= 16) and not exceed the actual body
+    // length, and the major brand must be printable ASCII. An 8-byte
+    // truncated body ending in "ftyp" fails every one of these.
+    const boxSize = head.readUInt32BE(0);
+    const printableBrand = head
+      .subarray(8, 12)
+      .every((b) => b >= 0x20 && b <= 0x7e);
+    if (boxSize >= 16 && boxSize <= bodyLength && printableBrand) {
+      // M4A/M4B are audio-only brands (m4a audio in an mp4 container); the
+      // rest (isom/mp41/mp42/avc1/qt/M4V…) are video.
+      const brand = ascii(8, 12);
+      return brand === "M4A " || brand === "M4B " ? "mp4-audio" : "mp4-video";
+    }
+  }
+  if (head.length >= 4 && head.readUInt32BE(0) === 0x1a45dfa3) {
+    // webm/mkv — EBML magic is only 4 bytes; require a plausible file size.
+    if (bodyLength >= MIN_MEDIA_BYTES) return "ebml";
+  }
+  if (head.length >= 8 && ascii(0, 4) === "fLaC") {
+    // flac — the magic must be followed by the mandatory first metadata
+    // block: a STREAMINFO block header (type 0, length exactly 34).
+    if (
+      (head[4] & 0x7f) === 0 &&
+      head.readUIntBE(5, 3) === 34 &&
+      bodyLength >= 42
+    ) {
+      return "flac";
+    }
+  }
+  if (head.length >= 27 && ascii(0, 4) === "OggS") {
+    // ogg — the page version byte must be 0 and the segment table must fit
+    // inside the body (27-byte page header + page_segments bytes).
+    if (head[4] === 0 && 27 + head[26] <= bodyLength) return "ogg";
+  }
+  if (head.length >= 12 && ascii(0, 4) === "RIFF") {
+    // wav/avi — the RIFF chunk size (file size − 8) must be consistent with
+    // the body actually delivered: at least the 4-byte form type, and never
+    // claiming more bytes than we have (a truncated/fabricated prefix).
+    const riffSize = head.readUInt32LE(4);
+    if (riffSize >= 4 && riffSize + 8 <= bodyLength) {
+      const form = ascii(8, 12);
+      if (form === "WAVE") return "wav";
+      if (form === "AVI ") return "avi";
+    }
+  }
+  if (head.length >= 10 && ascii(0, 3) === "ID3") {
+    // mp3 with an ID3v2 tag — the 4 tag-size bytes must be syncsafe (7-bit)
+    // and the declared tag must fit inside the body; a bare "ID3" prefix
+    // fails both, and the floor rejects a tag with no audio behind it.
+    if (head.subarray(6, 10).every((b) => (b & 0x80) === 0)) {
+      const tagSize =
+        (head[6] << 21) | (head[7] << 14) | (head[8] << 7) | head[9];
+      if (tagSize + 10 <= bodyLength && bodyLength >= MIN_MEDIA_BYTES) {
+        return "mpegaudio";
+      }
+    }
+  }
+  if (head.length >= 2 && head[0] === 0xff && (head[1] & 0xe0) === 0xe0) {
+    // mp3 / aac frame sync — 2 bytes is an error-prefix-sized signature, so
+    // require a plausible file size. ADTS (aac) frames always have the MPEG
+    // layer bits 00; mp3/mp2 frames have them set.
+    if (bodyLength >= MIN_MEDIA_BYTES) {
+      return (head[1] & 0x06) === 0 ? "aac" : "mpegaudio";
+    }
+  }
+  return null;
+}
+
+/**
+ * Declared content-type → the media format its payload must sniff as (#663).
+ * Cross-format mislabels within a family (MP3 bytes labeled audio/wav) are
+ * rejected just like cross-family ones. Unlisted media types fail closed;
+ * application/octet-stream is handled separately and accepts any format.
+ */
+const MEDIA_FORMAT_BY_MIME: Record<string, MediaFormat> = {
+  "video/mp4": "mp4-video",
+  "video/quicktime": "mp4-video",
+  "video/x-m4v": "mp4-video",
+  "video/webm": "ebml",
+  "video/x-matroska": "ebml",
+  "video/x-msvideo": "avi",
+  "video/avi": "avi",
+  "video/msvideo": "avi",
+  "audio/wav": "wav",
+  "audio/x-wav": "wav",
+  "audio/wave": "wav",
+  "audio/vnd.wave": "wav",
+  "audio/mpeg": "mpegaudio",
+  "audio/mp3": "mpegaudio",
+  "audio/aac": "aac",
+  "audio/x-aac": "aac",
+  "audio/flac": "flac",
+  "audio/x-flac": "flac",
+  "audio/ogg": "ogg",
+  "audio/mp4": "mp4-audio",
+  "audio/x-m4a": "mp4-audio",
+};
+
+/**
+ * Filename extension → the media format its payload must sniff as (#663).
+ * application/octet-stream declares nothing, so the requested FILENAME is the
+ * only remaining claim: a WAV body returned as "clip.mp4" would otherwise be
+ * saved under a video extension it isn't. Unlisted extensions declare nothing
+ * we can check and pass any valid media format (fail-open for exotic-but-real
+ * assets — the bytes still have to prove themselves via the structural sniff).
+ */
+const MEDIA_FORMAT_BY_EXTENSION: Record<string, MediaFormat> = {
+  ".mp4": "mp4-video",
+  ".mov": "mp4-video",
+  ".m4v": "mp4-video",
+  ".m4a": "mp4-audio",
+  ".m4b": "mp4-audio",
+  ".webm": "ebml",
+  ".mkv": "ebml",
+  ".avi": "avi",
+  ".wav": "wav",
+  ".mp3": "mpegaudio",
+  ".aac": "aac",
+  ".flac": "flac",
+  ".ogg": "ogg",
+  ".oga": "ogg",
+};
+
+/** Image extensions claim a still image — never consistent with a sniffed
+ *  video/audio payload (an MP4 saved as clip.png is the same corruption). */
+const IMAGE_EXTENSIONS = new Set([
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".webp",
+  ".gif",
+  ".bmp",
+  ".tif",
+  ".tiff",
+  ".avif",
+]);
+
+/**
  * Fetch a generated image from ComfyUI via HTTP /view endpoint.
  * Does NOT require COMFYUI_PATH — works with remote ComfyUI instances.
+ *
+ * By default only image/* payloads are accepted. Pass `allowMedia: true` to
+ * also accept video/* and audio/* (e.g. a VHS_VideoCombine .mp4) so the caller
+ * can save them to disk — /view returns raw bytes for any media type. Media
+ * acceptance sniffs the payload's magic bytes instead of trusting the declared
+ * content-type, so a JSON/HTML error body mislabeled as video/mp4 is still
+ * rejected — and genuine media a proxy serves as application/octet-stream
+ * (ComfyUI itself reports video/mp4 via mimetypes) still passes. The sniffed
+ * media format must also match the declared subtype (MP3 bytes labeled
+ * audio/wav are rejected).
  */
 export async function getOutputImage(
   filename: string,
   type: "output" | "input" | "temp" = "output",
   subfolder = "",
+  { allowMedia = false }: { allowMedia?: boolean } = {},
 ): Promise<{ base64: string; mimeType: string; filename: string }> {
   assertSafeViewRef(filename, subfolder);
   const result = await fetchImage(filename, type, subfolder);
@@ -464,9 +656,32 @@ export async function getOutputImage(
   // returned them as an inline image block, so the MCP client then choked trying
   // to decode them ("Unexpected end of JSON input"). Fail loudly and structured
   // instead, so get_image surfaces a clean not-found rather than a corrupt image.
+  //
+  // Under allowMedia the same junk body can arrive labeled video/mp4 — the
+  // declared content-type alone is no proof, and get_image would save the junk
+  // bytes as a working .mp4. So media payloads must also SNIFF as media, and
+  // the sniffed FORMAT must match the declared subtype exactly: MP3 bytes
+  // labeled audio/wav are rejected even though both are audio, otherwise the
+  // asset is saved under a corrupt extension. The generic
+  // application/octet-stream label declares no format, so any genuine media
+  // signature passes.
   const mime = result.mimeType.toLowerCase();
   const isImage = mime.startsWith("image/");
-  if (!isImage || result.base64.length === 0) {
+  const sniffedFormat = allowMedia ? sniffMediaFormat(result.base64) : null;
+  const ext = extname(filename).toLowerCase();
+  // The sniffed format must satisfy EVERY claim present: the declared
+  // content-type (exact subtype match), and the requested filename's
+  // extension whenever we can classify it — audio/wav bytes requested as
+  // clip.mp4 pass mime↔sniff yet would still land on disk as a corrupt .mp4.
+  const extOk =
+    !IMAGE_EXTENSIONS.has(ext) &&
+    (!MEDIA_FORMAT_BY_EXTENSION[ext] || MEDIA_FORMAT_BY_EXTENSION[ext] === sniffedFormat);
+  const isMedia =
+    sniffedFormat !== null &&
+    extOk &&
+    (mime === "application/octet-stream" ||
+      MEDIA_FORMAT_BY_MIME[mime] === sniffedFormat);
+  if ((!isImage && !isMedia) || result.base64.length === 0) {
     const where = subfolder ? `${type}/${subfolder}` : type;
     throw new ComfyUIError(
       `ComfyUI /view did not return an image for "${filename}" (${where}); ` +

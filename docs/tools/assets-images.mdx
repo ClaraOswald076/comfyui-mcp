@@ -33,7 +33,7 @@ Fetch a registered asset's bytes and return them as an inline image so the agent
 
 ## get_image
 
-Fetch a generated image from ComfyUI and return it as an inline image. Works with remote ComfyUI instances — does not require COMFYUI_PATH. Use get_history first to obtain the filename.
+Fetch a generated image from ComfyUI and return it as an inline image. Video/audio outputs (e.g. a VHS_VideoCombine .mp4) are saved to save_dir with their original extension instead of being rendered inline. Works with remote ComfyUI instances — does not require COMFYUI_PATH. Use get_history first to obtain the filename.
 
 ### Parameters
 

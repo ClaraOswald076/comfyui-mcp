@@ -187,6 +187,469 @@ describe("getOutputImage — non-image /view payloads (issue #385)", () => {
   });
 });
 
+describe("getOutputImage — video/audio media (issue #663)", () => {
+  // /view returns raw bytes for any media type, and video nodes like
+  // VHS_VideoCombine legitimately produce .mp4 outputs that get_image must be
+  // able to save to disk. allowMedia opts the caller into video/*/audio/*
+  // payloads; the junk-body guards (empty / JSON / HTML) still apply — and the
+  // declared media content-type is only accepted when the payload actually
+  // sniffs as that media FORMAT (structural magic-byte checks, not just the
+  // leading signature).
+
+  // Realistic MP4 header: 24-byte ftyp box, isom major brand.
+  const MP4_BASE64 = Buffer.from([
+    0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, // ....ftyp
+    0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00, 0x02, 0x00, // isom....
+    0x69, 0x73, 0x6f, 0x6d, 0x69, 0x73, 0x6f, 0x32, // isomiso2
+  ]).toString("base64");
+  // WAV header: RIFF chunk whose declared size (8) is consistent with the
+  // 16-byte body (chunk size + 8 header bytes == body length).
+  const WAV_BASE64 = Buffer.from([
+    0x52, 0x49, 0x46, 0x46, 0x08, 0x00, 0x00, 0x00, // RIFF....
+    0x57, 0x41, 0x56, 0x45, 0x66, 0x6d, 0x74, 0x20, // WAVEfmt␠
+  ]).toString("base64");
+  // MP3 frame sync (0xFFFB = MPEG-1 Layer III) padded to a plausible file
+  // size — the sync alone is only 2 bytes, so size is the structure here.
+  const MP3_BASE64 = Buffer.from([0xff, 0xfb, ...new Array(254).fill(0)]).toString("base64");
+  // AAC: ADTS frame sync (MPEG layer bits 00), padded to a plausible size.
+  const AAC_BASE64 = Buffer.from([0xff, 0xf1, ...new Array(254).fill(0)]).toString("base64");
+  // WebM: EBML magic, padded to a plausible file size.
+  const WEBM_BASE64 = Buffer.from([0x1a, 0x45, 0xdf, 0xa3, ...new Array(252).fill(0)]).toString("base64");
+  // FLAC: magic + the mandatory first metadata block (a STREAMINFO block
+  // header: type 0, length exactly 34) — 42 bytes total.
+  const FLAC_BASE64 = Buffer.from([
+    0x66, 0x4c, 0x61, 0x43, 0x80, 0x00, 0x00, 0x22, // fLaC, STREAMINFO hdr
+    ...new Array(34).fill(0),
+  ]).toString("base64");
+  // Ogg: capture pattern + version-0 page header; 1 segment of size 0.
+  const OGG_BASE64 = Buffer.from([
+    0x4f, 0x67, 0x67, 0x53, 0x00, 0x02, // OggS, version 0, header type
+    ...new Array(20).fill(0), // granule/serial/seq/crc
+    0x01, 0x00, // 1 page segment, size 0
+  ]).toString("base64");
+  // m4a: 24-byte ftyp box with the audio-only M4A major brand.
+  const M4A_BASE64 = Buffer.from([
+    0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, // ....ftyp
+    0x4d, 0x34, 0x41, 0x20, 0x00, 0x00, 0x00, 0x00, // M4A␠....
+    0x4d, 0x34, 0x41, 0x20, 0x6d, 0x70, 0x34, 0x32, // M4A␠mp42
+  ]).toString("base64");
+
+  it("rejects a video/mp4 payload by default (inline callers stay image-only)", async () => {
+    // Genuine MP4 bytes — the rejection must come from the missing allowMedia
+    // opt-in, not from the payload sniff.
+    fetchImageMock.mockResolvedValue({
+      base64: MP4_BASE64,
+      mimeType: "video/mp4",
+    });
+    await expect(
+      getOutputImage("clip_00001_.mp4", "output", "video"),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("resolves a video/mp4 payload when allowMedia is set", async () => {
+    fetchImageMock.mockResolvedValue({ base64: MP4_BASE64, mimeType: "video/mp4" });
+    await expect(
+      getOutputImage("clip_00001_.mp4", "output", "video", { allowMedia: true }),
+    ).resolves.toMatchObject({
+      base64: MP4_BASE64,
+      mimeType: "video/mp4",
+      filename: "clip_00001_.mp4",
+    });
+  });
+
+  it("resolves an audio/wav payload when allowMedia is set", async () => {
+    fetchImageMock.mockResolvedValue({ base64: WAV_BASE64, mimeType: "audio/wav" });
+    await expect(
+      getOutputImage("audio_00001_.wav", "output", "", { allowMedia: true }),
+    ).resolves.toMatchObject({ mimeType: "audio/wav" });
+  });
+
+  it("still rejects a JSON error body even when allowMedia is set", async () => {
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from('{"error":"not found"}').toString("base64"),
+      mimeType: "application/json",
+    });
+    await expect(
+      getOutputImage("clip_00001_.mp4", "output", "video", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects a JSON error body MISLABELED as video/mp4 (declared type is no proof)", async () => {
+    // A proxy can answer /view with a 200 whose body is a JSON error page but
+    // whose content-type says video/mp4 — saving those bytes would fabricate a
+    // successful media save. The payload must sniff as media, not just declare it.
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from('{"error":"not found"}').toString("base64"),
+      mimeType: "video/mp4",
+    });
+    await expect(
+      getOutputImage("clip_00001_.mp4", "output", "video", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects an HTML error page mislabeled as video/mp4", async () => {
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from("<!DOCTYPE html><html><body>404</body></html>").toString("base64"),
+      mimeType: "video/mp4",
+    });
+    await expect(
+      getOutputImage("clip_00001_.mp4", "output", "video", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects a WAV body mislabeled as video/mp4 (cross-family mismatch)", async () => {
+    // Bytes AND label are both "media", but the families disagree — saving the
+    // WAV under the requested .mp4 would report a corrupt video as a success.
+    fetchImageMock.mockResolvedValue({ base64: WAV_BASE64, mimeType: "video/mp4" });
+    await expect(
+      getOutputImage("clip_00001_.mp4", "output", "video", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects an MP4 body mislabeled as audio/wav (cross-family mismatch)", async () => {
+    fetchImageMock.mockResolvedValue({ base64: MP4_BASE64, mimeType: "audio/wav" });
+    await expect(
+      getOutputImage("audio_00001_.wav", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  // ── Cross-FORMAT mislabels (#663 round 4): same family, wrong subtype ──
+
+  it("rejects MP3 bytes mislabeled as audio/wav (cross-format within a family)", async () => {
+    // Both are audio — but the sniffed format (MPEG sync) is not the declared
+    // subtype (wav), so this must not be saved/reported as a .wav.
+    fetchImageMock.mockResolvedValue({ base64: MP3_BASE64, mimeType: "audio/wav" });
+    await expect(
+      getOutputImage("audio_00001_.wav", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects WAV bytes mislabeled as audio/mpeg", async () => {
+    fetchImageMock.mockResolvedValue({ base64: WAV_BASE64, mimeType: "audio/mpeg" });
+    await expect(
+      getOutputImage("audio_00001_.mp3", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects WebM bytes mislabeled as video/mp4", async () => {
+    fetchImageMock.mockResolvedValue({ base64: WEBM_BASE64, mimeType: "video/mp4" });
+    await expect(
+      getOutputImage("clip_00001_.mp4", "output", "video", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects MP4 bytes mislabeled as video/webm", async () => {
+    fetchImageMock.mockResolvedValue({ base64: MP4_BASE64, mimeType: "video/webm" });
+    await expect(
+      getOutputImage("clip_00001_.webm", "output", "video", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects WAV bytes mislabeled as audio/ogg", async () => {
+    fetchImageMock.mockResolvedValue({ base64: WAV_BASE64, mimeType: "audio/ogg" });
+    await expect(
+      getOutputImage("audio_00001_.ogg", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects Ogg bytes mislabeled as audio/flac", async () => {
+    fetchImageMock.mockResolvedValue({ base64: OGG_BASE64, mimeType: "audio/flac" });
+    await expect(
+      getOutputImage("audio_00001_.flac", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects a video-brand MP4 mislabeled as audio/mp4", async () => {
+    // Same container family, wrong brand: isom is a VIDEO ftyp — audio/mp4
+    // requires an audio brand (M4A/M4B).
+    fetchImageMock.mockResolvedValue({ base64: MP4_BASE64, mimeType: "audio/mp4" });
+    await expect(
+      getOutputImage("audio_00001_.m4a", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects an m4a (audio-brand ftyp) mislabeled as video/mp4", async () => {
+    fetchImageMock.mockResolvedValue({ base64: M4A_BASE64, mimeType: "video/mp4" });
+    await expect(
+      getOutputImage("clip_00001_.mp4", "output", "video", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects MP3 bytes mislabeled as audio/aac (frame-sync formats are distinct)", async () => {
+    // ADTS frames have MPEG layer bits 00; mp3 frames have them set.
+    fetchImageMock.mockResolvedValue({ base64: MP3_BASE64, mimeType: "audio/aac" });
+    await expect(
+      getOutputImage("audio_00001_.aac", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  // ── Positive controls: declared subtype matches sniffed format ──
+
+  it("resolves MP3 bytes labeled audio/mpeg", async () => {
+    fetchImageMock.mockResolvedValue({ base64: MP3_BASE64, mimeType: "audio/mpeg" });
+    await expect(
+      getOutputImage("audio_00001_.mp3", "output", "", { allowMedia: true }),
+    ).resolves.toMatchObject({ mimeType: "audio/mpeg" });
+  });
+
+  it("resolves WebM bytes labeled video/webm", async () => {
+    fetchImageMock.mockResolvedValue({ base64: WEBM_BASE64, mimeType: "video/webm" });
+    await expect(
+      getOutputImage("clip_00001_.webm", "output", "video", { allowMedia: true }),
+    ).resolves.toMatchObject({ mimeType: "video/webm" });
+  });
+
+  it("resolves FLAC bytes labeled audio/flac (STREAMINFO structure)", async () => {
+    fetchImageMock.mockResolvedValue({ base64: FLAC_BASE64, mimeType: "audio/flac" });
+    await expect(
+      getOutputImage("audio_00001_.flac", "output", "", { allowMedia: true }),
+    ).resolves.toMatchObject({ mimeType: "audio/flac" });
+  });
+
+  it("resolves Ogg bytes labeled audio/ogg (page-header structure)", async () => {
+    fetchImageMock.mockResolvedValue({ base64: OGG_BASE64, mimeType: "audio/ogg" });
+    await expect(
+      getOutputImage("audio_00001_.ogg", "output", "", { allowMedia: true }),
+    ).resolves.toMatchObject({ mimeType: "audio/ogg" });
+  });
+
+  it("resolves AAC (ADTS sync) bytes labeled audio/aac", async () => {
+    fetchImageMock.mockResolvedValue({ base64: AAC_BASE64, mimeType: "audio/aac" });
+    await expect(
+      getOutputImage("audio_00001_.aac", "output", "", { allowMedia: true }),
+    ).resolves.toMatchObject({ mimeType: "audio/aac" });
+  });
+
+  // ── Truncated prefixes (#663 round 4): structure, not just signature ──
+
+  it("rejects a 2-byte MPEG sync prefix labeled audio/mpeg", async () => {
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from([0xff, 0xfb]).toString("base64"),
+      mimeType: "audio/mpeg",
+    });
+    await expect(
+      getOutputImage("audio_00001_.mp3", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects an undersized frame-sync body labeled audio/mpeg", async () => {
+    // 102 bytes — above the bare sync, still below a plausible media file.
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from([0xff, 0xfb, ...new Array(100).fill(0)]).toString("base64"),
+      mimeType: "audio/mpeg",
+    });
+    await expect(
+      getOutputImage("audio_00001_.mp3", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects a bare 3-byte 'ID3' prefix labeled audio/mpeg", async () => {
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from([0x49, 0x44, 0x33]).toString("base64"), // ID3
+      mimeType: "audio/mpeg",
+    });
+    await expect(
+      getOutputImage("audio_00001_.mp3", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects an ID3 header whose size bytes are not syncsafe", async () => {
+    // Full-size body, but a tag-size byte has the high bit set — malformed.
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from([
+        0x49, 0x44, 0x33, 0x04, 0x00, 0x00, 0x80, 0x00, 0x00, 0x10,
+        ...new Array(246).fill(0),
+      ]).toString("base64"),
+      mimeType: "audio/mpeg",
+    });
+    await expect(
+      getOutputImage("audio_00001_.mp3", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects a RIFF/WAVE header claiming more bytes than the body holds", async () => {
+    // Chunk size 36 but only 16 delivered — a truncated/fabricated prefix.
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from([
+        0x52, 0x49, 0x46, 0x46, 0x24, 0x00, 0x00, 0x00, // RIFF$...
+        0x57, 0x41, 0x56, 0x45, 0x66, 0x6d, 0x74, 0x20, // WAVEfmt␠
+      ]).toString("base64"),
+      mimeType: "audio/wav",
+    });
+    await expect(
+      getOutputImage("audio_00001_.wav", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects a bare 4-byte 'OggS' prefix labeled audio/ogg", async () => {
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from([0x4f, 0x67, 0x67, 0x53]).toString("base64"),
+      mimeType: "audio/ogg",
+    });
+    await expect(
+      getOutputImage("audio_00001_.ogg", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects a 'fLaC' magic with no STREAMINFO block labeled audio/flac", async () => {
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from([0x66, 0x4c, 0x61, 0x43, 0xff, 0xff, 0xff, 0xff]).toString("base64"),
+      mimeType: "audio/flac",
+    });
+    await expect(
+      getOutputImage("audio_00001_.flac", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects an undersized EBML prefix labeled video/webm", async () => {
+    // 4-byte EBML magic + 100 zero bytes — below the plausible-size floor.
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from([0x1a, 0x45, 0xdf, 0xa3, ...new Array(100).fill(0)]).toString("base64"),
+      mimeType: "video/webm",
+    });
+    await expect(
+      getOutputImage("clip_00001_.webm", "output", "video", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects a truncated 8-byte body that is only '....ftyp' (no box behind it)", async () => {
+    // The four bytes "ftyp" at offset 4 alone are not an MP4 — a valid ftyp
+    // box needs the major brand and minor version too (>= 16 bytes), so a
+    // truncated body must not sniff as media even labeled video/mp4.
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from([
+        0x00, 0x00, 0x00, 0x08, 0x66, 0x74, 0x79, 0x70, // ....ftyp
+      ]).toString("base64"),
+      mimeType: "video/mp4",
+    });
+    await expect(
+      getOutputImage("clip_00001_.mp4", "output", "video", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects an ftyp whose box size exceeds the actual body length", async () => {
+    // 16-byte body, but the box header claims 32 bytes — an inconsistent,
+    // fabricated header.
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from([
+        0x00, 0x00, 0x00, 0x20, 0x66, 0x74, 0x79, 0x70, // box claims 32 bytes
+        0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00, 0x02, 0x00, // isom....
+      ]).toString("base64"),
+      mimeType: "video/mp4",
+    });
+    await expect(
+      getOutputImage("clip_00001_.mp4", "output", "video", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("accepts a minimal 16-byte ftyp box (box size exactly covers the body)", async () => {
+    // Boundary of the box-size check: size == body length == 16, printable
+    // major brand, minor version present — the smallest well-formed ftyp.
+    const MINIMAL_MP4_BASE64 = Buffer.from([
+      0x00, 0x00, 0x00, 0x10, 0x66, 0x74, 0x79, 0x70, // box = 16 bytes
+      0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00, 0x00, 0x00, // isom, minor 0
+    ]).toString("base64");
+    fetchImageMock.mockResolvedValue({
+      base64: MINIMAL_MP4_BASE64,
+      mimeType: "video/mp4",
+    });
+    await expect(
+      getOutputImage("clip_00001_.mp4", "output", "video", { allowMedia: true }),
+    ).resolves.toMatchObject({ mimeType: "video/mp4" });
+  });
+
+  it("resolves genuine MP4 bytes served as application/octet-stream (generic proxy label)", async () => {
+    // ComfyUI itself reports video/mp4 (aiohttp mimetypes), but a proxy or a
+    // signed URL hop can serve the same real bytes under the generic type —
+    // the magic-byte sniff must still let them through.
+    fetchImageMock.mockResolvedValue({
+      base64: MP4_BASE64,
+      mimeType: "application/octet-stream",
+    });
+    await expect(
+      getOutputImage("clip_00001_.mp4", "output", "video", { allowMedia: true }),
+    ).resolves.toMatchObject({ mimeType: "application/octet-stream" });
+  });
+
+  it("resolves genuine WAV bytes served as application/octet-stream", async () => {
+    // The generic label declares no family, so any genuine media signature
+    // passes — video OR audio.
+    fetchImageMock.mockResolvedValue({
+      base64: WAV_BASE64,
+      mimeType: "application/octet-stream",
+    });
+    await expect(
+      getOutputImage("audio_00001_.wav", "output", "", { allowMedia: true }),
+    ).resolves.toMatchObject({ mimeType: "application/octet-stream" });
+  });
+
+  it("rejects octet-stream WAV bytes requested as .mp4 (extension is the only claim)", async () => {
+    // Under the generic label the FILENAME is the last format claim: WAV bytes
+    // saved as clip.mp4 would be a corrupt asset with a fabricated success.
+    fetchImageMock.mockResolvedValue({
+      base64: WAV_BASE64,
+      mimeType: "application/octet-stream",
+    });
+    await expect(
+      getOutputImage("clip_00001_.mp4", "output", "video", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("passes octet-stream media whose extension is unmapped (fail-open for exotic assets)", async () => {
+    // An extension we can't classify declares nothing checkable — the bytes
+    // still proved themselves via the structural sniff, so they pass.
+    fetchImageMock.mockResolvedValue({
+      base64: MP4_BASE64,
+      mimeType: "application/octet-stream",
+    });
+    await expect(
+      getOutputImage("clip_00001_.m2ts", "output", "video", { allowMedia: true }),
+    ).resolves.toMatchObject({ mimeType: "application/octet-stream" });
+  });
+
+  it("rejects genuinely-declared audio/wav bytes requested as .mp4", async () => {
+    // mime↔sniff agrees (wav is wav), but the filename claims video — every
+    // claim must hold, or the save fabricates a corrupt asset.
+    fetchImageMock.mockResolvedValue({ base64: WAV_BASE64, mimeType: "audio/wav" });
+    await expect(
+      getOutputImage("clip_00001_.mp4", "output", "video", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects video/mp4 bytes requested as .png (image extension claims a still)", async () => {
+    fetchImageMock.mockResolvedValue({ base64: MP4_BASE64, mimeType: "video/mp4" });
+    await expect(
+      getOutputImage("frame_00001_.png", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("resolves an m4a payload labeled audio/mp4 (audio-brand ftyp)", async () => {
+    // .m4a is audio in an mp4 container — its ftyp major brand (M4A ) is the
+    // audio/mp4 format, so it must not trip the cross-format guard.
+    fetchImageMock.mockResolvedValue({ base64: M4A_BASE64, mimeType: "audio/mp4" });
+    await expect(
+      getOutputImage("audio_00001_.m4a", "output", "", { allowMedia: true }),
+    ).resolves.toMatchObject({ mimeType: "audio/mp4" });
+  });
+
+  it("rejects a non-media body served as application/octet-stream", async () => {
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from('{"error":"not found"}').toString("base64"),
+      mimeType: "application/octet-stream",
+    });
+    await expect(
+      getOutputImage("clip_00001_.mp4", "output", "video", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("still rejects an empty body even when allowMedia is set", async () => {
+    fetchImageMock.mockResolvedValue({ base64: "", mimeType: "video/mp4" });
+    await expect(
+      getOutputImage("clip_00001_.mp4", "output", "video", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+});
+
 describe("listOutputImages — remote mode keyed off isRemoteMode (issue #2 regression)", () => {
   it("uses /history (not a local-FS scan) when remote even though COMFYUI_PATH is set", async () => {
     // A remote target coexists with an unrelated local COMFYUI_PATH. Scanning the
