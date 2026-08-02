@@ -1274,6 +1274,17 @@ interface OpenVerifyResult {
   attempts: number;
 }
 
+/** Exact resolved-path check for an open receipt. A filename/basename is not a
+ * workflow identity: `other/foo.json` must never confirm `wanted/foo.json`. */
+function resolvedOpenPathMatches(receipt: Record<string, unknown>, path: string): boolean {
+  const resolved = receipt.resolved;
+  if (!resolved || typeof resolved !== "object") return false;
+  const actual = (resolved as Record<string, unknown>).path;
+  if (typeof actual !== "string") return false;
+  const normalize = (value: string) => value.replace(/\\/g, "/").replace(/^\.\/+/, "").replace(/\/+/g, "/");
+  return normalize(actual) === normalize(path);
+}
+
 /**
  * Poll `workflow_list` for the #514 `last_open` receipt for this exact bridge rid.
  * Active workflow state is deliberately ignored as recovery proof. Older panels
@@ -1309,8 +1320,7 @@ async function waitForOpenReceipt(
         if (receipt.rid === rid && receipt.answers_only_command_rid === rid && receipt.cmd === "workflow_open") {
           // The exact RID identifies this command. Keep a target check as an
           // accidental wrong-workflow guard; active itself is never proof.
-          const target = receipt.resolved ?? receipt.requested;
-          if (!activeMatchesTarget(target, path)) {
+          if (!resolvedOpenPathMatches(receipt, path)) {
             return { receipt: "unknown", waited_ms: Date.now() - start, attempts };
           }
           if (receipt.applied === true) {
