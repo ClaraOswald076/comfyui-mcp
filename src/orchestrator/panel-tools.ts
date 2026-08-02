@@ -3038,6 +3038,7 @@ const RETRY_OF_ARG = {
  */
 export const RETRY_TOKEN_CMD_BY_TOOL: Readonly<Record<string, string>> = {
   panel_add_node: "graph_add_node",
+  panel_edit_node: "graph_edit_node",
   panel_remove_node: "graph_remove_node",
   panel_clear: "graph_clear",
   panel_flatten_workflow: "graph_load",
