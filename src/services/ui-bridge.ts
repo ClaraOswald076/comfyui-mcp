@@ -240,7 +240,7 @@ export function minPanelVersionForCmd(cmd: string): string {
  *  the screen and falls through to the conservative fail-closed path (reactive rewrite;
  *  never proactively gated), keeping panelSupportsCmd and panelVersionProvesUnsupported
  *  symmetric on garbage input (codex). */
-const SEMVER_RE =
+export const SEMVER_RE =
   /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/;
 
 /** True when the panel ADVERTISED a PARSEABLE version (in its `hello`) that already

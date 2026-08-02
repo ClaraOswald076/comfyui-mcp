@@ -345,6 +345,24 @@ describe("applyManifest", () => {
     });
   });
 
+  it("refuses a panel manifest when Manager and local loopback targets can differ", async () => {
+    // config.comfyuiPath can point at local instance A while the current Manager
+    // client targets B. A pre/post panel scan of A cannot validate a mutation of
+    // B, even if Manager's installed list says the panel is present there.
+    mockConfig.comfyuiPath = "/fake/ComfyUI-A";
+    listInstalledNodesMock.mockResolvedValueOnce([
+      { module: "comfyui-agent-panel", cnrId: "comfyui-agent-panel", enabled: true },
+    ]);
+
+    const result = await applyManifest({
+      manifest: { custom_nodes: ["comfyui-agent-panel"] },
+    });
+
+    expect(installCustomNodeMock).not.toHaveBeenCalled();
+    expect(result.summary).toMatchObject({ applied: 0, failed: 1 });
+    expect(result.results[0]?.message).toMatch(/cannot prove.*same instance/i);
+  });
+
   it("skips a model already present in an ALTERNATE model root (extra_model_paths)", async () => {
     // The computed target under <COMFYUI_PATH>/models does NOT exist (statMock
     // rejects by default), but the user already has the file under an extra root

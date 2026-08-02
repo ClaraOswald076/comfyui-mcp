@@ -21,6 +21,7 @@ import {
   listInstalledNodes,
   type InstalledNode,
 } from "./node-management.js";
+import { targetsPanelPackExactly } from "./panel-pin-guard.js";
 import {
   downloadModel,
   listLocalModels,
@@ -754,6 +755,25 @@ async function applyManifestSections(
   const installedNodes = initialList === BUDGET_TIMEOUT ? [] : initialList;
   if (initialList === BUDGET_TIMEOUT) nodeBudgetSpent = true;
   for (const id of manifest.custom_nodes) {
+    const isPanelTarget = targetsPanelPackExactly(id);
+    if (isPanelTarget) {
+      // `apply_manifest` has a Manager target but no authoritative association
+      // between that target and a local served-panel root. In particular,
+      // config.comfyuiPath may name loopback instance A while Manager targets B.
+      // Refuse rather than pre/post-scan A around a mutation of B, or report a
+      // Manager-installed-list entry as browser-visible success.
+      results.push(
+        report(
+          "custom_node",
+          id,
+          "failed",
+          "apply_manifest does not manage the sidebar panel because it cannot prove that its " +
+            "ComfyUI-Manager target and local served-panel filesystem are the same instance. " +
+            "Use install_panel on the selected ComfyUI host, which verifies the served version and .bak shadows.",
+        ),
+      );
+      continue;
+    }
     if (nodeAlreadyInstalled(id, installedNodes)) {
       results.push(report("custom_node", id, "skipped", "Custom node is already installed."));
       continue;

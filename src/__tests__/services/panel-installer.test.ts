@@ -3,6 +3,14 @@ import { join } from "node:path";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 
+// Panel mutations take a FILE lock (panel-pin-guard). Point it at a temp path so
+// the suite never touches ~/.comfyui-mcp, and so parallel vitest workers get
+// their own lock instead of serializing on one shared file.
+process.env.COMFYUI_MCP_PANEL_LOCK = join(
+  tmpdir(),
+  `cmcp-lock-installer-${process.pid}.lock`,
+);
+
 // Mock config so importing panel-installer doesn't trigger real port detection.
 // (We drive comfyuiPath via the injected deps, not the mocked config, but the
 // import graph still pulls config in.)
@@ -26,6 +34,7 @@ import {
   PANEL_VERSION,
   type PanelInstallerDeps,
 } from "../../services/panel-installer.js";
+import type { PanelPinState } from "../../services/panel-settings.js";
 
 const COMFY = "/fake/comfy";
 const CUSTOM_NODES = join(COMFY, "custom_nodes");
@@ -51,6 +60,8 @@ function makeDeps(opts: {
   nonDirEntries?: string[]; // custom_nodes entries that are FILES, not dirs
   realPaths?: Record<string, string>; // path -> canonical realpath (else undefined)
   reachable?: boolean;
+  /** Active panel-version pin the deps report (defaults to unpinned). */
+  pin?: PanelPinState;
   /** Raw ComfyUI-Manager queue status the `update` mock returns as details. */
   updateDetails?: unknown;
   /** Queue status the `install`/`reinstall` mocks return as details. */
@@ -90,6 +101,10 @@ function makeDeps(opts: {
     readdir: (p) => (p === CUSTOM_NODES ? dirs : []),
     readFile: (p) => files[p] ?? "",
     gitRevision: (dir) => revs[dir],
+    // Default: NOT pinned. Pin behaviour has its own suite (panel-sync.test.ts);
+    // injecting it here keeps every existing case hermetic from the developer's
+    // real ~/.comfyui-mcp/panel-settings.json.
+    readPin: () => opts.pin ?? { pinned: false, source: "none" as const },
     isReachable: async () => opts.reachable ?? true,
     install: async (o) => {
       installs.push(o);
@@ -1163,6 +1178,154 @@ describe("looksLikePanelBackupName (#641)", () => {
     expect(looksLikePanelBackupName(".comfyui-agent-panel")).toBe(true);
     expect(looksLikePanelBackupName(".comfyui-mcp-panel")).toBe(true);
     expect(looksLikePanelBackupName("comfyui-agent-panel")).toBe(false);
+  });
+});
+
+describe("panel version pin — the mutation choke point", () => {
+  const PINNED: PanelPinState = { pinned: true, version: "0.11.3", source: "settings" };
+
+  function pinnedInstall(pin: PanelPinState = PINNED) {
+    const dir = join(CUSTOM_NODES, "comfyui-mcp-panel");
+    return makeDeps({
+      comfyuiPath: COMFY,
+      dirs: ["comfyui-mcp-panel"],
+      files: { [join(dir, "pyproject.toml")]: pyproject(PANEL_REGISTRY_ID, "0.11.3") },
+      pin,
+    });
+  }
+
+  it.each(["install", "update", "reinstall"] as const)(
+    "%s refuses while a pin is in force, and queues NOTHING",
+    async (action) => {
+      const h = pinnedInstall();
+      await expect(runPanelAction(action, h.deps)).rejects.toThrow(PanelInstallError);
+      await expect(runPanelAction(action, h.deps)).rejects.toThrow(/pinned to 0\.11\.3/i);
+      // The guard runs BEFORE the ComfyUI-Manager call, so nothing was queued.
+      expect(h.installs).toEqual([]);
+      expect(h.updates).toEqual([]);
+      expect(h.reinstalls).toEqual([]);
+    },
+  );
+
+  it("an env pin refusal explains that unpin alone will not clear it", async () => {
+    const h = pinnedInstall({ pinned: true, version: "0.11.3", source: "env" });
+    await expect(runPanelAction("update", h.deps)).rejects.toThrow(
+      /COMFYUI_MCP_PANEL_PIN/,
+    );
+  });
+
+  it("an INDETERMINATE pin still refuses (unreadable is not unpinned)", async () => {
+    const h = pinnedInstall({ pinned: true, source: "settings", indeterminate: true });
+    await expect(runPanelAction("update", h.deps)).rejects.toThrow(PanelInstallError);
+    expect(h.updates).toEqual([]);
+  });
+
+  it("a readPin that THROWS is treated as pinned, not as unpinned", async () => {
+    const h = pinnedInstall();
+    const deps: PanelInstallerDeps = {
+      ...h.deps,
+      readPin: () => {
+        throw new Error("settings unreadable");
+      },
+    };
+    await expect(runPanelAction("update", deps)).rejects.toThrow(PanelInstallError);
+    expect(h.updates).toEqual([]);
+  });
+
+  it("the on-load auto-install SKIPS while pinned instead of installing nightly", async () => {
+    const { deps, installs } = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: [],
+      pin: PINNED,
+    });
+    const r = await ensurePanelInstalled({ deps });
+    expect(r.action).toBe("skipped");
+    expect(r.reason).toMatch(/pin/i);
+    expect(installs).toEqual([]);
+  });
+
+  it("once the pin is cleared the very same update proceeds and verifies", async () => {
+    const dir = join(CUSTOM_NODES, "comfyui-mcp-panel");
+    const pyPath = join(dir, "pyproject.toml");
+    const { deps, updates } = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: ["comfyui-mcp-panel"],
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.3") },
+      // pin omitted → unpinned
+      onUpdate: ({ files }) => {
+        files[pyPath] = pyproject(PANEL_REGISTRY_ID, "0.11.30");
+      },
+    });
+    const r = await runPanelAction("update", deps);
+    expect(updates).toHaveLength(1);
+    expect(r.previousVersion).toBe("0.11.3");
+    expect(r.installedVersion).toBe("0.11.30");
+  });
+
+  it("panelStatus reports the pin and says how to clear it", async () => {
+    const h = pinnedInstall();
+    const s = await panelStatus(h.deps);
+    expect(s.pin).toMatchObject({ pinned: true, version: "0.11.3" });
+    expect(s.note).toMatch(/unpin/i);
+  });
+
+  it("honours an explicit target version instead of substituting nightly", async () => {
+    // A generic call that asked for a specific version is redirected here to get
+    // the verified path; substituting `nightly` would do something other than
+    // what the caller asked while still reporting success.
+    const dir = join(CUSTOM_NODES, "comfyui-mcp-panel");
+    const pyPath = join(dir, "pyproject.toml");
+    const { deps, reinstalls } = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: ["comfyui-mcp-panel"],
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.3") },
+      onReinstall: ({ files }) => {
+        files[pyPath] = pyproject(PANEL_REGISTRY_ID, "0.11.20");
+      },
+    });
+    const r = await runPanelAction("reinstall", deps, { version: "0.11.20" });
+    expect(reinstalls).toEqual([{ id: PANEL_REGISTRY_ID, version: "0.11.20" }]);
+    expect(r.installedVersion).toBe("0.11.20");
+  });
+
+  it("defaults to the nightly channel when no version is requested", async () => {
+    const dir = join(CUSTOM_NODES, "comfyui-mcp-panel");
+    const pyPath = join(dir, "pyproject.toml");
+    const { deps, reinstalls } = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: ["comfyui-mcp-panel"],
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.3") },
+      onReinstall: ({ files }) => {
+        files[pyPath] = pyproject(PANEL_REGISTRY_ID, "0.11.31");
+      },
+    });
+    await runPanelAction("reinstall", deps);
+    expect(reinstalls).toEqual([{ id: PANEL_REGISTRY_ID, version: PANEL_VERSION }]);
+  });
+
+  it("panelStatus flags a FAILED shadow scan structurally, not just in the note", async () => {
+    // `shadows: []` from a scan that could not run means "we didn't find any",
+    // not "there are none". A consumer branching on shadows.length would read
+    // the empty array as an all-clear, so the uncertainty must be a field.
+    const dir = join(CUSTOM_NODES, "comfyui-mcp-panel");
+    const { deps } = makeDeps({
+      comfyuiPath: COMFY,
+      dirs: ["comfyui-mcp-panel"],
+      files: { [join(dir, "pyproject.toml")]: pyproject(PANEL_REGISTRY_ID, "0.11.3") },
+    });
+    // Detection uses the fast path (direct pyproject read), so the panel still
+    // resolves; only the shadow enumeration fails.
+    const failing: PanelInstallerDeps = {
+      ...deps,
+      readdir: () => {
+        throw new Error("EACCES: permission denied, scandir");
+      },
+    };
+    const s = await panelStatus(failing);
+    expect(s.installed).toBe(true);
+    expect(s.shadows).toEqual([]);
+    expect(s.shadowInspectFailed).toBe(true);
+    expect(s.note).toMatch(/could not enumerate/i);
   });
 });
 

@@ -8,10 +8,131 @@ import {
   fixCustomNode,
   listInstalledNodes,
   syncNodeDependencies,
+  parseGitUrl,
   type InstalledNode,
 } from "../services/node-management.js";
 import { errorToToolResult } from "../utils/errors.js";
 import { getComfyCliVersion, resolveComfyCliExecutable, shouldUseComfyCli } from "../services/comfy-cli.js";
+import {
+  assertPanelNotTargetedUnverifiable,
+  targetsPanelPackExactly,
+} from "../services/panel-pin-guard.js";
+import { runPanelAction } from "../services/panel-installer.js";
+import { SEMVER_RE } from "../services/ui-bridge.js";
+
+/**
+ * The sidebar panel pack is an ordinary custom node pack, so `install_custom_node`
+ * / `update_custom_node` / `reinstall_custom_node` can target it by id. The
+ * generic services report success straight off the ComfyUI-Manager queue result,
+ * which a stale Manager 3.x drains WITHOUT doing any work (#639) — and they know
+ * nothing about `.bak` shadow copies (#641). Reaching the panel through them
+ * would therefore reintroduce both bugs through a side door.
+ *
+ * So a call that names the panel is REDIRECTED into the verified path, which
+ * re-reads the pack from disk and fails closed unless it provably moved. (The pin
+ * is enforced deeper still, in the services themselves — see panel-pin-guard.ts —
+ * so bulk targets like "all" are covered even though they cannot be redirected.)
+ */
+/**
+ * Can the verified panel path honour this git ref as a registry version?
+ *
+ * The verified path installs from the Comfy Registry, so the only refs it can
+ * honour are the ones that ARE registry versions: the channel names, or a
+ * strict semver (ui-bridge's canonical grammar; a leading-"v" tag means the
+ * same version, and the registry spelling is the bare form). Anything else — a
+ * branch, a sha — would silently become something other than what was asked.
+ */
+function registryInstallableRef(ref: string): string | undefined {
+  if (ref === "nightly" || ref === "latest") return ref;
+  if (!SEMVER_RE.test(ref)) return undefined;
+  return ref.replace(/^v(?=\d)/, "");
+}
+
+async function runVerifiedPanelAction(
+  action: "install" | "update" | "reinstall",
+  id: string,
+  opts: { version?: string; ref?: string; source?: string } = {},
+) {
+  // Options the verified path cannot honour are REFUSED, not dropped. Silently
+  // ignoring a caller's `ref` and then reporting success would be doing
+  // something other than what was asked — a smaller cousin of the exact lie this
+  // whole feature guards against. (`version` IS honoured; it is threaded through.)
+  if (opts.ref || opts.source === "git") {
+    throw new Error(
+      `"${id}" is the comfyui-mcp sidebar panel pack, which is managed through the ` +
+        `verified panel path (it re-reads the pack from disk afterwards and fails ` +
+        `closed on a ComfyUI-Manager no-op or a shadow copy). That path installs from ` +
+        `the Comfy Registry, so a git \`ref\`/\`source: "git"\` cannot be honoured and ` +
+        `will NOT be silently ignored. Drop the git options to install it normally, ` +
+        `or manage a git checkout of the panel yourself (a symlinked dev install is ` +
+        `never touched by these tools).`,
+    );
+  }
+
+  // A ref EMBEDDED in the id itself ("...comfyui-mcp-panel.git@v0.11.28",
+  // ".../tree/v0.11.28") is just as much a requested version as the `version`
+  // option — and it used to DIE here: targetsPanelPackExactly matched the URL,
+  // the redirect threaded only `version`, and the user got NIGHTLY while the
+  // response implied success. Honour the refs the registry path can honour;
+  // refuse the rest, exactly like the git options above.
+  const embeddedRef = parseGitUrl(id).ref;
+  let version = opts.version;
+  if (embeddedRef) {
+    const registryVersion = registryInstallableRef(embeddedRef);
+    if (!registryVersion) {
+      throw new Error(
+        `"${id}" embeds git ref "${embeddedRef}", which the verified panel path ` +
+          `cannot honour: it installs the comfyui-mcp sidebar panel pack from the ` +
+          `Comfy Registry, where only a strict semver (e.g. v0.11.28), "nightly" or ` +
+          `"latest" names a version. Use a release tag, or pass \`version\` instead.`,
+      );
+    }
+    if (version && version !== registryVersion) {
+      throw new Error(
+        `Conflicting panel versions: the id embeds "@${embeddedRef}" but ` +
+          `\`version\` says "${version}". Pick one — this tool will not guess.`,
+      );
+    }
+    if (action === "update") {
+      throw new Error(
+        `"${id}" embeds git ref "${embeddedRef}", but update always pulls the ` +
+          `channel tip — a ref cannot be honoured. Use install/reinstall with the ` +
+          `ref to get a specific panel version.`,
+      );
+    }
+    version = registryVersion;
+  }
+
+  const result = await runPanelAction(action, undefined, { version });
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(
+          {
+            ...result,
+            routedVia: "install_panel",
+            note:
+              `"${id}" is the comfyui-mcp sidebar panel pack, so this ${action} ran ` +
+              `through the verified panel path: the version above was RE-READ from ` +
+              `disk after the operation, and a Manager no-op or a shadow copy would ` +
+              `have failed instead of reporting success. ` +
+              (version
+                ? embeddedRef
+                  ? `The ref embedded in the URL (@${embeddedRef}) was honoured as ` +
+                    `the target version (${version}). `
+                  : `Your requested version (${version}) was used as the target. `
+                : `It targets the 'nightly' channel. `) +
+              `The mode/channel/useCmCli options do not apply on this path. Use ` +
+              `install_panel directly for status/sync/pin.`,
+          },
+          null,
+          2,
+        ),
+      },
+    ],
+  };
+}
 
 /** Graceful "not supported remotely" tool result (no isError), matching the
  *  degrade-don't-throw pattern list_local_models uses. */
@@ -71,7 +192,7 @@ function formatInstalledNodes(nodes: InstalledNode[]): string {
 export function registerNodeManagementTools(server: McpServer): void {
   server.tool(
     "install_custom_node",
-    "Install a ComfyUI custom node pack by registry id, git URL, or name. Local installs prefer official comfy-cli when available; remote or CLI-unavailable installs use the ComfyUI-Manager HTTP API. A ComfyUI restart may be required.",
+    "Install a ComfyUI custom node pack by registry id, git URL, or name. Local installs prefer official comfy-cli when available; remote or CLI-unavailable installs use the ComfyUI-Manager HTTP API. A ComfyUI restart may be required. Targeting the comfyui-mcp sidebar panel pack ('comfyui-agent-panel' / 'comfyui-mcp-panel') is routed through the verified install_panel path (the version is re-read from disk afterwards) and is REFUSED while the panel is version-pinned.",
     {
       id: z
         .string()
@@ -100,6 +221,13 @@ export function registerNodeManagementTools(server: McpServer): void {
     },
     async (args) => {
       try {
+        if (targetsPanelPackExactly(args.id)) {
+          return await runVerifiedPanelAction("install", args.id, {
+            version: args.version,
+            ref: args.ref,
+            source: args.source,
+          });
+        }
         const result = await installCustomNode({ ...args, useCmCli: preferLocalComfyCli(args.useCmCli) });
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
@@ -112,7 +240,7 @@ export function registerNodeManagementTools(server: McpServer): void {
 
   server.tool(
     "update_custom_node",
-    "Update an installed ComfyUI custom node pack, or pass 'all' to update every installed pack. Local operations prefer official comfy-cli; remote operations use Manager HTTP.",
+    "Update an installed ComfyUI custom node pack, or pass 'all' to update every installed pack. Local operations prefer official comfy-cli; remote operations use Manager HTTP. Targeting the comfyui-mcp sidebar panel pack ('comfyui-agent-panel' / 'comfyui-mcp-panel') is routed through the verified install_panel path (the version is re-read from disk afterwards). While the panel is version-pinned, BOTH a direct panel target and 'all' are REFUSED — 'all' would move the pinned panel too; clear the pin with install_panel(action='unpin') or update other packs individually.",
     {
       id: z
         .string()
@@ -123,6 +251,9 @@ export function registerNodeManagementTools(server: McpServer): void {
     },
     async (args) => {
       try {
+        if (targetsPanelPackExactly(args.id)) {
+          return await runVerifiedPanelAction("update", args.id);
+        }
         const result = await updateCustomNode({ ...args, useCmCli: preferLocalComfyCli(args.useCmCli) });
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
@@ -135,7 +266,7 @@ export function registerNodeManagementTools(server: McpServer): void {
 
   server.tool(
     "reinstall_custom_node",
-    "Reinstall a ComfyUI custom node pack. Local operations prefer official comfy-cli; remote operations use Manager HTTP. A ComfyUI restart may be required.",
+    "Reinstall a ComfyUI custom node pack. Local operations prefer official comfy-cli; remote operations use Manager HTTP. A ComfyUI restart may be required. Targeting the comfyui-mcp sidebar panel pack ('comfyui-agent-panel' / 'comfyui-mcp-panel') is routed through the verified install_panel path (the version is re-read from disk afterwards) and is REFUSED while the panel is version-pinned.",
     {
       id: z.string().describe("Registry id / module name to reinstall."),
       version: z
@@ -148,6 +279,11 @@ export function registerNodeManagementTools(server: McpServer): void {
     },
     async (args) => {
       try {
+        if (targetsPanelPackExactly(args.id)) {
+          return await runVerifiedPanelAction("reinstall", args.id, {
+            version: args.version,
+          });
+        }
         const result = await reinstallCustomNode({ ...args, useCmCli: preferLocalComfyCli(args.useCmCli) });
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
@@ -160,7 +296,7 @@ export function registerNodeManagementTools(server: McpServer): void {
 
   server.tool(
     "fix_custom_node",
-    "Repair a ComfyUI custom node pack's install and Python dependencies, or pass 'all' to repair every pack. Local operations prefer official comfy-cli; remote single-pack repairs use Manager HTTP.",
+    "Repair a ComfyUI custom node pack's install and Python dependencies, or pass 'all' to repair every pack. Local operations prefer official comfy-cli; remote single-pack repairs use Manager HTTP. REFUSES the comfyui-mcp sidebar panel pack — 'fix' has no verified on-disk check, so use install_panel for the panel — and refuses 'all' while the panel is version-pinned.",
     {
       id: z
         .string()
@@ -182,6 +318,13 @@ export function registerNodeManagementTools(server: McpServer): void {
         );
       }
       try {
+        // `fix` has no verified equivalent (it reports success off the Manager
+        // queue, which proves nothing — #639), so a panel target is refused
+        // rather than redirected. Bulk "all" is handled by the pin guard inside
+        // the service.
+        if (targetsPanelPackExactly(args.id)) {
+          assertPanelNotTargetedUnverifiable("fix_custom_node", args.id);
+        }
         const result = await fixCustomNode({ ...args, useCmCli: preferLocalComfyCli(args.useCmCli) });
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],

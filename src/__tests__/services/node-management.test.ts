@@ -73,12 +73,35 @@ vi.mock("node:child_process", () => ({
   })),
 }));
 
-// Mock fs so resolveCmCliPath's existsSync check is controllable.
-vi.mock("node:fs", () => ({
+// Mock fs so resolveCmCliPath's existsSync check is controllable. Everything
+// else delegates to the REAL fs: panel-targeting mutations now take the panel
+// mutation lock (panel-pin-guard), which is a real file — a partial mock left
+// the lock's mkdir/open/write undefined and every id="all" op failed closed.
+vi.mock("node:fs", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:fs")>()),
   existsSync: vi.fn(() => true),
 }));
 
+// The panel mutation lock is a FILE (panel-pin-guard). Point it at a temp path
+// so the suite never touches ~/.comfyui-mcp, and so parallel vitest workers get
+// their own lock instead of serializing on one shared file.
+process.env.COMFYUI_MCP_PANEL_LOCK = join(
+  tmpdir(),
+  `cmcp-lock-nodemgmt-${process.pid}.lock`,
+);
+
+// The mutation entry points now consult the panel version pin (panel-pin-guard),
+// because the panel is an ordinary node pack and `id="all"` would otherwise move
+// a pinned panel. This suite is not about pinning, and its `node:fs` mock is
+// deliberately partial — `existsSync` answers true for everything, so the pin
+// store would look present-but-unreadable and fail closed (correct in
+// production, a false positive here). Use the documented env escape hatch to say
+// plainly "no pin in this suite" rather than reshaping the fs mock, which
+// individual tests reconfigure for their own purposes.
+process.env.COMFYUI_MCP_PANEL_PIN = "off";
+
 import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { config } from "../../config.js";

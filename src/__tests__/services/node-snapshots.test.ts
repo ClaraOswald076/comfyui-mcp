@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 // The product builds snapshot paths with node:path.join, so separators differ
 // per-platform. Mirror the exact construction here instead of hardcoding POSIX
@@ -31,7 +32,44 @@ const fsMocks = vi.hoisted(() => ({
   writeFileSync: vi.fn(),
 }));
 
-vi.mock("node:fs", () => fsMocks);
+// The three fsMocks stay per-test controllable; everything else delegates to
+// the REAL fs because restoreNodeSnapshot now takes the panel mutation lock
+// (panel-pin-guard), which is a real file — a partial mock left the lock's
+// open/write undefined and every restore failed closed.
+vi.mock("node:fs", async (importOriginal) => {
+  const real = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...real,
+    ...fsMocks,
+    // Pending-operation markers are deliberately read back before a deferred
+    // restore starts. Keep snapshot file writes mocked, but make this one marker
+    // write real so its durability check exercises the production contract.
+    writeFileSync: (...args: Parameters<typeof import("node:fs")["writeFileSync"]>) => {
+      fsMocks.writeFileSync(...args);
+      if (String(args[0]) === process.env.COMFYUI_MCP_PANEL_PENDING) {
+        return real.writeFileSync(...args);
+      }
+    },
+  };
+});
+
+// The panel mutation lock is a FILE (panel-pin-guard). Point it at a temp path
+// so the suite never touches ~/.comfyui-mcp, and so parallel vitest workers get
+// their own lock instead of serializing on one shared file.
+process.env.COMFYUI_MCP_PANEL_LOCK = join(
+  tmpdir(),
+  `cmcp-lock-snapshots-${process.pid}.lock`,
+);
+process.env.COMFYUI_MCP_PANEL_PENDING = join(
+  tmpdir(),
+  `cmcp-pending-snapshots-${process.pid}.json`,
+);
+
+// restoreNodeSnapshot now consults the panel version pin (a restore reverts
+// EVERY pack, panel included — same bulk door as update all). This suite is not
+// about pinning, so use the documented env escape hatch to say plainly "no pin
+// here" rather than reshaping the fs mocks the pin store reads through.
+process.env.COMFYUI_MCP_PANEL_PIN = "off";
 
 import {
   saveNodeSnapshot,
@@ -304,5 +342,21 @@ describe("restoreNodeSnapshot", () => {
     await expect(restoreNodeSnapshot("prod")).rejects.toBeInstanceOf(
       NodeSnapshotError,
     );
+  });
+
+  it("refuses before contacting Manager when the deferred-restore marker cannot persist", async () => {
+    // NUL is rejected by fs before a record can be read/written. The mutation
+    // must not run without the durable warning a later pin depends on.
+    const previous = process.env.COMFYUI_MCP_PANEL_PENDING;
+    process.env.COMFYUI_MCP_PANEL_PENDING = "\0";
+    try {
+      await expect(restoreNodeSnapshot("prod")).rejects.toThrow(
+        /Could not persist the pending snapshot-restore marker/i,
+      );
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      if (previous === undefined) delete process.env.COMFYUI_MCP_PANEL_PENDING;
+      else process.env.COMFYUI_MCP_PANEL_PENDING = previous;
+    }
   });
 });

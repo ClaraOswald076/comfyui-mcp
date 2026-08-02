@@ -36,6 +36,13 @@ import {
   type NodeOpResult,
 } from "./node-management.js";
 import { getSystemStats } from "../comfyui/client.js";
+import {
+  describePanelPin,
+  getPanelPinState,
+  PANEL_PIN_ENV_VAR,
+  type PanelPinState,
+} from "./panel-settings.js";
+import { withPanelMutationLock } from "./panel-pin-guard.js";
 
 /** Comfy Registry id (also pyproject [project].name). Authoritative for detection. */
 export const PANEL_REGISTRY_ID = "comfyui-agent-panel";
@@ -53,6 +60,11 @@ const FAST_PATH_DIRS = ["comfyui-mcp-panel", "comfyui-agent-panel"];
 
 /** Hard cap so the on-load ensure can never block startup. */
 const ENSURE_TIMEOUT_MS = 20_000;
+
+/** How long the fire-and-forget on-load ensure will wait for the panel op lock
+ *  before giving up (well inside ENSURE_TIMEOUT_MS, so a lock held by another
+ *  orchestrator process degrades to `unavailable` rather than a timeout). */
+const ENSURE_LOCK_WAIT_MS = 3_000;
 
 export class PanelInstallError extends Error {
   constructor(message: string) {
@@ -112,6 +124,13 @@ export interface PanelInstallerDeps {
    * pyproject version string. Never throws.
    */
   gitRevision: (dir: string) => string | undefined;
+  /**
+   * The user's explicit panel-version pin, if any. While a pin is in force NO
+   * code path here may move the panel — install/update/reinstall refuse and the
+   * on-load ensure skips. Never throws (an unreadable pin reports
+   * `indeterminate`, which counts as pinned).
+   */
+  readPin: () => PanelPinState;
   /** Is the target ComfyUI reachable right now? Never throws. */
   isReachable: () => Promise<boolean>;
   install: (opts: { id: string; version?: string }) => Promise<NodeOpResult>;
@@ -236,6 +255,7 @@ export const defaultDeps: PanelInstallerDeps = {
   readdir: (p) => readdirSync(p),
   readFile: (p) => readFileSync(p, "utf-8"),
   gitRevision: (dir) => resolveGitRevision(dir),
+  readPin: () => getPanelPinState(),
   isReachable: async () => {
     try {
       await getSystemStats();
@@ -248,6 +268,89 @@ export const defaultDeps: PanelInstallerDeps = {
   update: (opts) => updateCustomNode(opts),
   reinstall: (opts) => reinstallCustomNode(opts),
 };
+
+// ---------------------------------------------------------------------------
+// Version pin
+//
+// A pin is the user's explicit "hold the panel here". Every mutating path in
+// this file consults it FIRST and refuses while it is in force — the on-load
+// ensure, install, update and reinstall alike. The escape hatch is to clear the
+// pin (install_panel(action='unpin'), or COMFYUI_MCP_PANEL_PIN=off), never for
+// us to decide the pin was probably fine to ignore.
+// ---------------------------------------------------------------------------
+
+/**
+ * Read the pin so that NO failure mode reads as "unpinned". A reader that throws
+ * is reported as an indeterminate pin, which counts as pinned: silently moving a
+ * user off a pin we merely failed to read is the exact bug this guards.
+ */
+function readPinSafe(deps: PanelInstallerDeps): PanelPinState {
+  try {
+    return deps.readPin();
+  } catch (err) {
+    logger.warn(
+      `[panel] could not read the panel version pin: ${
+        err instanceof Error ? err.message : String(err)
+      } — treating the panel as PINNED (refusing to move it).`,
+    );
+    return { pinned: true, source: "settings", indeterminate: true };
+  }
+}
+
+/*
+ * Serializes every panel MUTATION (the on-load ensure and each
+ * install/update/reinstall). Two overlapping panel ops would each read the
+ * other's half-applied disk state, and the #639 "did it move?" proof compares a
+ * pre-image against a post-image — interleave them and both comparisons are
+ * meaningless. One at a time makes each op's before/after its own.
+ *
+ * It also closes the pin race: the final pin check (assertNotPinned, immediately
+ * before the Manager call) and the call itself sit inside this critical section,
+ * so a pin cannot be written in between — by this process OR another one.
+ */
+/**
+ * Exported so PIN WRITES take the same lock. Without that, a pin could be
+ * committed after an in-flight update passed its final pin check but before the
+ * Manager actually touched disk — the update would then land on a now-pinned
+ * install and report success. Serializing both means a pin either lands before
+ * an op starts (and blocks it) or after it finishes (and blocks the next one);
+ * it never slices one in half.
+ *
+ * The underlying lock is a FILE, not module state: running more than one
+ * orchestrator process (one per MCP client) is ordinary here, and two processes
+ * do not share a promise chain. See panel-pin-guard.ts.
+ */
+export function withPanelOpLock<T>(
+  fn: () => Promise<T>,
+  opts: { timeoutMs?: number } = {},
+): Promise<T> {
+  return withPanelMutationLock(fn, opts);
+}
+
+/** The refusal a pin produces for a mutating action, with the way out. */
+function pinRefusalMessage(action: string, pin: PanelPinState): string {
+  return (
+    `Refusing to ${action} the panel: it is ${describePanelPin(pin)}. ` +
+    `A pin is honoured even when a newer panel exists — clear it first with ` +
+    `install_panel(action='unpin')` +
+    (pin.source === "env"
+      ? ` (this pin comes from the ${PANEL_PIN_ENV_VAR} environment variable, so ` +
+        `it must be unset/changed in the environment — unpin cannot remove it)`
+      : ``) +
+    `, then re-run the ${action}.`
+  );
+}
+
+/**
+ * Throw if a pin is in force. Called BOTH on entry (fail fast with a good
+ * message before any work) and again immediately before the ComfyUI-Manager
+ * call inside the op lock — detection can take a while, and a pin set during
+ * that window must still be honoured.
+ */
+function assertNotPinned(action: string, deps: PanelInstallerDeps): void {
+  const pin = readPinSafe(deps);
+  if (pin.pinned) throw new PanelInstallError(pinRefusalMessage(action, pin));
+}
 
 // ---------------------------------------------------------------------------
 // Detection
@@ -720,6 +823,16 @@ async function ensureInner(deps: PanelInstallerDeps): Promise<EnsureResult> {
     return { action: "unavailable", reason: "ComfyUI is not reachable." };
   }
 
+  // An explicit pin outranks auto-install: installing the `nightly` channel over
+  // a pinned version is exactly the silent move the pin forbids. Skip and say so.
+  const pin = readPinSafe(deps);
+  if (pin.pinned) {
+    return {
+      action: "skipped",
+      reason: `panel version pin in force — ${describePanelPin(pin)}`,
+    };
+  }
+
   const detection = await detectPanelInstall(deps);
 
   if (detection.isDevSymlink) {
@@ -742,6 +855,15 @@ async function ensureInner(deps: PanelInstallerDeps): Promise<EnsureResult> {
         reason:
           "Could not enumerate custom_nodes to confirm the panel is missing; " +
           "skipping auto-install to avoid a duplicate/unverified install.",
+      };
+    }
+    // Final pin check adjacent to the mutation (see runPanelActionInner): the
+    // reachability probe and detection above are not instantaneous.
+    const latePin = readPinSafe(deps);
+    if (latePin.pinned) {
+      return {
+        action: "skipped",
+        reason: `panel version pin in force — ${describePanelPin(latePin)}`,
       };
     }
     await deps.install({ id: PANEL_REGISTRY_ID, version: PANEL_VERSION });
@@ -812,7 +934,15 @@ export async function ensurePanelInstalled(
 ): Promise<EnsureResult> {
   const deps = opts.deps ?? defaultDeps;
   try {
-    return await withTimeout(ensureInner(deps), opts.timeoutMs ?? ENSURE_TIMEOUT_MS);
+    // Serialized with the explicit actions: the on-load ensure must not race an
+    // install_panel call the user fired at the same moment. Its lock wait is
+    // SHORT — this is fire-and-forget at startup, so if another process holds
+    // the lock we give up quickly (returning `unavailable`) rather than eating
+    // the whole ensure budget waiting.
+    return await withTimeout(
+      withPanelOpLock(() => ensureInner(deps), { timeoutMs: ENSURE_LOCK_WAIT_MS }),
+      opts.timeoutMs ?? ENSURE_TIMEOUT_MS,
+    );
   } catch (err) {
     logger.debug("panel: ensure failed", {
       err: err instanceof Error ? err.message : String(err),
@@ -841,6 +971,26 @@ export interface PanelStatus {
    * non-empty, the SERVED panel may not match `installedVersion` on disk.
    */
   shadows: PanelShadow[];
+  /**
+   * #641 — the shadow scan could NOT be completed (custom_nodes was not
+   * enumerable). `shadows: []` then means "we did not find any" rather than
+   * "there are none", so callers must not read the empty array as an all-clear.
+   * Structural, not just prose in `note`: a consumer branching on
+   * `shadows.length` would otherwise treat an indeterminate scan as safe.
+   */
+  shadowInspectFailed?: boolean;
+  /**
+   * The user's explicit version pin. While `pin.pinned` is true, install/update/
+   * reinstall refuse and the on-load ensure skips — see the pin guard above.
+   */
+  pin: PanelPinState;
+  /**
+   * #639 — the custom_nodes enumeration itself FAILED, so `installed: false` is
+   * unreliable: a pre-existing panel may have been missed, and installing blind
+   * risks a duplicate (or clobbering a NEWER one). Consumers must not treat an
+   * unreliable "absent" as an install invitation.
+   */
+  scanReliable?: boolean;
   note: string;
 }
 
@@ -889,6 +1039,13 @@ export async function panelStatus(
     }. Run install_panel(action='update') to pull the latest ${PANEL_VERSION}. Restart ComfyUI after updating.`;
   }
 
+  const pin = readPinSafe(deps);
+  const pinNote = pin.pinned
+    ? ` PIN: ${describePanelPin(pin)} — install/update/reinstall are refused ` +
+      `until it is cleared with install_panel(action='unpin')` +
+      (pin.source === "env" ? ` (env pins must be unset in the environment).` : `.`)
+    : "";
+
   return {
     applicable: detection.applicable,
     installed: detection.installed,
@@ -897,8 +1054,29 @@ export async function panelStatus(
     isDevSymlink: detection.isDevSymlink,
     targetVersion: PANEL_VERSION,
     shadows,
-    note: note + shadowNote,
+    shadowInspectFailed,
+    scanReliable: detection.scanReliable,
+    pin,
+    note: note + shadowNote + pinNote,
   };
+}
+
+/**
+ * Read the panel status for a caller-selected LOCAL ComfyUI root.
+ *
+ * `apply_manifest` may adopt a saved/default/live root for one call while
+ * `config.comfyuiPath` remains unset. Verifying through the ordinary default
+ * status in that case would inspect no directory (or a different one) and turn
+ * a Manager queue result into fabricated panel success. This narrow adapter
+ * keeps the status scan — including #641's served-shadow check — on the same
+ * root the manifest install targeted without mutating process-global config.
+ */
+export function panelStatusAt(comfyuiPath: string): Promise<PanelStatus> {
+  return panelStatus({
+    ...defaultDeps,
+    isLocalMode: () => true,
+    comfyuiPath: () => comfyuiPath,
+  });
 }
 
 export interface PanelActionResult {
@@ -1090,14 +1268,40 @@ function finalizeUpdate(
   );
 }
 
+export interface PanelActionOptions {
+  /**
+   * Target version for install/reinstall, defaulting to the `nightly` channel.
+   *
+   * Exists so a caller that asked for a SPECIFIC version — e.g.
+   * `install_custom_node(id="comfyui-agent-panel", version="0.11.20")`, which is
+   * redirected here to get the verified path — actually gets the version it
+   * asked for. Redirecting and silently substituting `nightly` would do
+   * something other than what the caller requested while reporting success.
+   * (`update` has no version to honour; it always pulls the channel tip.)
+   */
+  version?: string;
+}
+
 /**
  * install/update/reinstall the panel. LOCAL-only and refuses dev symlinks.
- * Targets version "nightly". Caller must RESTART ComfyUI to load the change.
+ * Targets the "nightly" channel unless a version is given. Caller must RESTART
+ * ComfyUI to load the change.
  */
-export async function runPanelAction(
+export function runPanelAction(
   action: "install" | "update" | "reinstall",
   deps: PanelInstallerDeps = defaultDeps,
+  opts: PanelActionOptions = {},
 ): Promise<PanelActionResult> {
+  // Serialized: never let two panel mutations interleave (see withPanelOpLock).
+  return withPanelOpLock(() => runPanelActionInner(action, deps, opts));
+}
+
+export async function runPanelActionInner(
+  action: "install" | "update" | "reinstall",
+  deps: PanelInstallerDeps,
+  opts: PanelActionOptions = {},
+): Promise<PanelActionResult> {
+  const targetVersion = opts.version?.trim() || PANEL_VERSION;
   // P1b — truly LOCAL-only. Refuse in remote/cloud mode even when COMFYUI_PATH
   // is set: installCustomNode/reinstallCustomNode would queue Manager mutations
   // against the REMOTE host while our symlink guard inspected the LOCAL disk —
@@ -1116,6 +1320,13 @@ export async function runPanelAction(
     );
   }
 
+  // PIN GUARD — before any Manager mutation is queued. This is the single choke
+  // point that makes "we never move a pinned user" true for every caller (the
+  // sync skill, the panel, a hand-written install_panel call), not just the ones
+  // that remembered to check. It is re-checked once more immediately before the
+  // Manager call, since detection below is not instantaneous.
+  assertNotPinned(action, deps);
+
   const detection = await detectPanelInstall(deps);
   if (detection.isDevSymlink) {
     throw new PanelInstallError(
@@ -1131,6 +1342,9 @@ export async function runPanelAction(
   const previousRev = detection.gitRev;
 
   if (action === "update") {
+    // Final pin check, inside the op lock and adjacent to the mutation: a pin
+    // set while detection was running must still be honoured.
+    assertNotPinned(action, deps);
     const result = await deps.update({ id: PANEL_REGISTRY_ID });
     // #639 — VERIFY the update actually advanced the pack. Re-read the installed
     // identity FRESH from disk (never trust Manager's queue-drained signal, nor
@@ -1163,11 +1377,12 @@ export async function runPanelAction(
     return finalizeUpdate(verdict, post, result);
   }
 
-  // install / reinstall.
+  // install / reinstall. Same final pin check as the update path above.
+  assertNotPinned(action, deps);
   const result =
     action === "install"
-      ? await deps.install({ id: PANEL_REGISTRY_ID, version: PANEL_VERSION })
-      : await deps.reinstall({ id: PANEL_REGISTRY_ID, version: PANEL_VERSION });
+      ? await deps.install({ id: PANEL_REGISTRY_ID, version: targetVersion })
+      : await deps.reinstall({ id: PANEL_REGISTRY_ID, version: targetVersion });
 
   // #639 — VERIFY the pack afterward. installCustomNode verifies presence
   // downstream (#232), but reinstallCustomNode does NOT — it returns as soon as

@@ -7,6 +7,11 @@ import { resolveInstallInterpreter } from "./workspace-env.js";
 import { queueUpdateAllCustomNodes } from "./node-management.js";
 import { ProcessControlError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
+import {
+  recordPanelPendingOp,
+  UPDATE_ALL_PENDING_MS,
+  withPanelPinGuard,
+} from "./panel-pin-guard.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -204,18 +209,43 @@ export async function updateComfyUICore(): Promise<UpdateCoreResult> {
  * then POST <same prefix>/start to kick the worker.
  */
 export async function updateAllCustomNodes(): Promise<UpdateNodesResult> {
-  const result = await queueUpdateAllCustomNodes();
+  // PIN GUARD — "update everything" includes the sidebar panel pack, so this is
+  // one of the doors into a pinned panel that does NOT pass through
+  // install_panel/runPanelAction. See panel-pin-guard.ts. The pin check AND the
+  // queue/start calls run inside the panel mutation lock, so a pin cannot be
+  // written between them (the pin-write path takes the same lock). The Manager
+  // then drains the queue ASYNCHRONOUSLY — outside anything this process can
+  // serialize — which is exactly why the result below reports "queued", never
+  // "updated".
+  return withPanelPinGuard("update", "all", async () => {
+    // Persist and VERIFY the warning marker BEFORE the remote request. Once the
+    // Manager has accepted update_all, a later pin cannot stop its worker; a
+    // marker write after that point could fail and leave the later pin claiming
+    // protection it cannot provide. If the request itself fails, retain this
+    // conservative marker: a transport failure cannot prove Manager did not
+    // accept the request.
+    recordPanelPendingOp(
+      "update-all",
+      `an update_all request may have been handed to ComfyUI-Manager and can update EVERY ` +
+        `installed pack — the sidebar panel included — on the Manager's own schedule ` +
+        `(usually seconds to minutes; a ComfyUI restart then loads the result)`,
+      UPDATE_ALL_PENDING_MS,
+    );
+    const result = await queueUpdateAllCustomNodes();
 
-  return {
-    updated: true,
-    endpoint: result.endpoint,
-    queue_started: result.queueStarted,
-    manager_response: result.managerResponse,
-    message: result.queueStarted
-      ? "Queued updates for all custom nodes via ComfyUI-Manager and started the queue worker. " +
-        "Updates run asynchronously; a ComfyUI restart may be required afterward."
-      : "Queued updates for all custom nodes via ComfyUI-Manager. " +
-        "Could not confirm the queue worker started — check ComfyUI-Manager.",
-  };
+    return {
+      // Queue acceptance is not proof a generic/bulk Manager update moved the
+      // sidebar panel on disk; keep the result explicitly unverified.
+      updated: false,
+      endpoint: result.endpoint,
+      queue_started: result.queueStarted,
+      manager_response: result.managerResponse,
+      message: result.queueStarted
+        ? "Queued updates for all custom nodes via ComfyUI-Manager and started the queue worker. " +
+          "Completion is unverified; the sidebar panel may still change later."
+        : "Queued updates for all custom nodes via ComfyUI-Manager. " +
+          "Could not confirm the queue worker started — check ComfyUI-Manager.",
+    };
+  });
 }
 

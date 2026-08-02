@@ -11,6 +11,7 @@ import {
   startManagerQueueForExternal,
   type ManagerApi,
 } from "./node-management.js";
+import { targetsPanelPackExactly, withPanelPinGuard } from "./panel-pin-guard.js";
 
 /**
  * Workflow dependency analysis & installation.
@@ -439,6 +440,25 @@ export async function installWorkflowDependencies(
     };
   }
 
+  // A dependency install can name the panel exactly like a generic node tool.
+  // Hold the shared guard across the entire queue transaction whenever that is
+  // true: a one-off assert here would reopen the same check-then-queue race the
+  // generic mutation services fixed. Non-panel workflows intentionally do not
+  // take this lock, so ordinary dependency installs do not contend with pins.
+  const panelTarget = analysis.missingPacks.find(targetsPanelPackExactly);
+  if (panelTarget) {
+    return withPanelPinGuard("install workflow dependencies including", panelTarget, () =>
+      installWorkflowDependenciesForAnalysis(analysis, deps),
+    );
+  }
+  return installWorkflowDependenciesForAnalysis(analysis, deps);
+}
+
+async function installWorkflowDependenciesForAnalysis(
+  analysis: ExtractDepsResult,
+  deps: WorkflowDepsDeps,
+): Promise<InstallDepsResult> {
+
   // Match missing packs to concrete Manager list entries for install payloads,
   // capturing the channel the list resolved against.
   const { channel = "default", packs, directInstall = false } = await deps.fetchManagerList();
@@ -452,8 +472,19 @@ export async function installWorkflowDependencies(
   const toInstall: ManagerNodePack[] = [];
   const installed: string[] = [];
   const unresolved = [...analysis.unresolved];
-
+  // The sidebar panel pack NEVER goes through this transaction. The Manager
+  // target resolved for a workflow dependency may differ from the local root
+  // used to establish which panel the browser serves; accepting either one as
+  // proof would permit an unverified update or fabricate success. Keep it
+  // unresolved and require install_panel on the selected ComfyUI host instead.
+  const panelTargets: string[] = [];
+  const panelNotes: string[] = [];
   for (const pack of analysis.missingPacks) {
+    if (targetsPanelPackExactly(pack)) {
+      panelTargets.push(pack);
+      unresolved.push(pack);
+      continue;
+    }
     const entry = byKey.get(pack);
     if (!entry) {
       // Manager v4 removed the legacy getlist catalog endpoint. Its task API
@@ -469,6 +500,18 @@ export async function installWorkflowDependencies(
     }
     toInstall.push(entry);
     installed.push(pack);
+  }
+
+  // Even under the outer pin guard, this workflow transaction cannot bind its
+  // Manager target to a served-panel root. Do not re-add panel targets to the
+  // generic queue (especially in remote mode), and do not inspect/mutate the
+  // process-global panel root for a possibly different Manager target.
+  for (const pack of panelTargets) {
+    panelNotes.push(
+      `"${pack}" is the sidebar panel pack: workflow dependency installation does not queue or mutate it ` +
+        `because this Manager transaction cannot prove the same served-panel target. ` +
+        `Use install_panel on the selected ComfyUI host.`,
+    );
   }
 
   let queue: ManagerQueueStatus | undefined;
@@ -497,5 +540,6 @@ export async function installWorkflowDependencies(
     alreadyInstalled: analysis.requiredPacks.filter((p) => !missingSet.has(p)),
     unresolved: [...new Set(unresolved)].sort(),
     queue,
+    ...(panelNotes.length ? { panel_notes: panelNotes } : {}),
   };
 }

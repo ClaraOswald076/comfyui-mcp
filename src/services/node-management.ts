@@ -20,6 +20,7 @@ import {
 export type { ManagerApi } from "./manager-api-cache.js";
 import { resolveInstallInterpreter } from "./workspace-env.js";
 import { assertComfyCliOk, runComfyCliSync } from "./comfy-cli.js";
+import { withPanelPinGuard } from "./panel-pin-guard.js";
 import { ComfyUIError, ProcessControlError, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 
@@ -1615,8 +1616,20 @@ async function withObjectInfoInvalidation<T>(op: () => Promise<T>): Promise<T> {
   return result;
 }
 
-export function installCustomNode(opts: InstallOptions): Promise<NodeOpResult> {
-  return withObjectInfoInvalidation(() => installCustomNodeImpl(opts));
+// NOTE on `async`: these wrappers are declared async purely so the PIN GUARD's
+// throw surfaces as a REJECTED PROMISE rather than a synchronous exception.
+// Callers rely on that — apply_manifest does `installCustomNode(...).then().catch()`
+// and documents that it never rejects, which a sync throw would walk straight past.
+
+export async function installCustomNode(opts: InstallOptions): Promise<NodeOpResult> {
+  // PIN GUARD (see panel-pin-guard.ts). The panel is an ordinary node pack, so
+  // these generic mutations are a second door into the same ComfyUI-Manager
+  // operation that install_panel drives. Guarding here — where the TARGET is
+  // known — covers every caller, including a bulk "all". The check and the
+  // mutation are atomic under the panel mutation lock (withPanelPinGuard).
+  return withPanelPinGuard("install", opts.id, () =>
+    withObjectInfoInvalidation(() => installCustomNodeImpl(opts)),
+  );
 }
 
 async function installCustomNodeImpl(
@@ -1926,8 +1939,15 @@ async function enqueueUpdateAll(
   return { used, response };
 }
 
-export function updateCustomNode(opts: UpdateOptions): Promise<NodeOpResult> {
-  return withObjectInfoInvalidation(() => updateCustomNodeImpl(opts));
+export async function updateCustomNode(opts: UpdateOptions): Promise<NodeOpResult> {
+  // PIN GUARD — covers id="comfyui-agent-panel", the repo-name and git-URL
+  // spellings, and id="all" (a bulk update moves the panel too). The check and
+  // the mutation are atomic under the panel mutation lock: update_all waits on
+  // the Manager queue, and a pin written in that window must block the NEXT
+  // op, not land inside this one (withPanelPinGuard).
+  return withPanelPinGuard("update", opts.id, () =>
+    withObjectInfoInvalidation(() => updateCustomNodeImpl(opts)),
+  );
 }
 
 async function updateCustomNodeImpl(
@@ -1970,7 +1990,7 @@ async function updateCustomNodeImpl(
   return {
     mechanism: "manager-http",
     message: all
-      ? "Queued + updated all installed node packs via ComfyUI-Manager."
+      ? "Queued update_all with ComfyUI-Manager. Completion and the sidebar panel's on-disk version are not verified yet."
       : `Queued + updated "${id}" via ComfyUI-Manager.`,
     details: status,
   };
@@ -2033,8 +2053,12 @@ export interface ReinstallOptions {
   useCmCli?: boolean;
 }
 
-export function reinstallCustomNode(opts: ReinstallOptions): Promise<NodeOpResult> {
-  return withObjectInfoInvalidation(() => reinstallCustomNodeImpl(opts));
+export async function reinstallCustomNode(opts: ReinstallOptions): Promise<NodeOpResult> {
+  // PIN GUARD — same door as install/update, and check + mutation are likewise
+  // atomic under the panel mutation lock (withPanelPinGuard).
+  return withPanelPinGuard("reinstall", opts.id, () =>
+    withObjectInfoInvalidation(() => reinstallCustomNodeImpl(opts)),
+  );
 }
 
 async function reinstallCustomNodeImpl(
@@ -2085,8 +2109,12 @@ export interface FixOptions {
   useCmCli?: boolean;
 }
 
-export function fixCustomNode(opts: FixOptions): Promise<NodeOpResult> {
-  return withObjectInfoInvalidation(() => fixCustomNodeImpl(opts));
+export async function fixCustomNode(opts: FixOptions): Promise<NodeOpResult> {
+  // `fix` reinstalls the pack's dependencies and can pull the pack itself, and
+  // it accepts "all" — same door, same guard, same lock (withPanelPinGuard).
+  return withPanelPinGuard("fix", opts.id, () =>
+    withObjectInfoInvalidation(() => fixCustomNodeImpl(opts)),
+  );
 }
 
 async function fixCustomNodeImpl(opts: FixOptions): Promise<NodeOpResult> {
