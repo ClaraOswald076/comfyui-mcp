@@ -1384,6 +1384,12 @@ export async function runPanelOrchestrator(): Promise<void> {
   // new provider's onSession would persist under the old backend's key. Tracked for every
   // tab with a valid identity; cleared when the identity is absent/untrusted.
   const tabStableIdentity = new Map<string, { origin: string; uuid: string }>();
+  // The UUID stamped on the NEXT panel command. Normally this exactly mirrors
+  // tabStableIdentity from hello. #716 intentionally lets a successful explicit
+  // open/re-pin refresh only this command fence before the next hello arrives;
+  // session ownership remains hello-bound so a command reply can never silently
+  // retarget durable conversation state.
+  const tabCommandWorkflowUuid = new Map<string, string>();
   const workflowTargets = new WorkflowTargetStore();
   // Monotonic per-tab sequence for set_workflow_target events. A pinned target is
   // validated asynchronously (resolvePinTarget queries workflow_list), so a later event
@@ -2045,7 +2051,28 @@ export async function runPanelOrchestrator(): Promise<void> {
   // (the generation-bound-command leak). Resolved from the CALLER's tab id: during the switch
   // race the retiring tab still maps to its own uuid, so a late command stamps the ORIGIN
   // workflow's uuid and the panel (now showing the new one) fails it closed.
-  bridge.setTabWorkflowUuidResolver((tabId) => tabStableIdentity.get(panelTabOf(tabId))?.uuid);
+  bridge.setTabWorkflowUuidResolver(
+    (tabId) => tabCommandWorkflowUuid.get(panelTabOf(tabId)),
+    (tabId, workflowUuid) => {
+      // A command reply is useful only while its routed tab still exists, and
+      // only when its UUID has the same strict shape/origin binding as hello.
+      // Invalid/missing panel data leaves the old stamp in place, causing the
+      // existing fail-closed fence to reject a subsequent mutation.
+      try {
+        if (!bridge.canReach(tabId)) return false;
+      } catch {
+        return false;
+      }
+      const panelTab = panelTabOf(tabId);
+      const identity = workflowIdentityParts({
+        workflowUuid,
+        origin: bridge.tabServerOrigin(tabId),
+      });
+      if (!identity) return false;
+      tabCommandWorkflowUuid.set(panelTab, identity.uuid);
+      return true;
+    },
+  );
 
   // ── Local-agent VRAM pause during generation ────────────────────────────
   // On a single-GPU box the local Ollama chat model and ComfyUI fight for VRAM:
@@ -2668,6 +2695,7 @@ export async function runPanelOrchestrator(): Promise<void> {
           workflowTargetSeq.delete(migratedFrom);
           tabStableKey.delete(migratedFrom);
           tabStableIdentity.delete(migratedFrom);
+          tabCommandWorkflowUuid.delete(migratedFrom);
         } else {
           // #570 — migrate per-backend state for EVERY provider, not only the currently-selected
           // one. A saved workflow can hold a DORMANT session on another backend (used Claude,
@@ -2768,6 +2796,7 @@ export async function runPanelOrchestrator(): Promise<void> {
           const carriedStable = tabStableKey.get(migratedFrom);
           tabStableKey.delete(migratedFrom);
           tabStableIdentity.delete(migratedFrom);
+          tabCommandWorkflowUuid.delete(migratedFrom);
           if (carriedStable !== undefined) {
             if (panelTab.startsWith("tmp:")) tabStableKey.set(panelTab, carriedStable);
             else sessionStore.clearStable(carriedStable);
@@ -2778,8 +2807,13 @@ export async function runPanelOrchestrator(): Promise<void> {
       // #570: record this tab's TRUSTED identity (every tab) for the migration
       // discriminator above and the set_backend recompute below. Absent/untrusted →
       // cleared (fail closed: no proof of continuity → a future migration won't rebind).
-      if (newIdentity) tabStableIdentity.set(panelTab, newIdentity);
-      else tabStableIdentity.delete(panelTab);
+      if (newIdentity) {
+        tabStableIdentity.set(panelTab, newIdentity);
+        tabCommandWorkflowUuid.set(panelTab, newIdentity.uuid);
+      } else {
+        tabStableIdentity.delete(panelTab);
+        tabCommandWorkflowUuid.delete(panelTab);
+      }
       // Blind content mode rides the hello (issue #90) so the FIRST agent spawn
       // already carries the right tool-server env. A CHANGE against a live
       // agent also respawns it (codex-review F2: the set_content_mode frame is
@@ -3040,6 +3074,7 @@ export async function runPanelOrchestrator(): Promise<void> {
           if (prior) sessionStore.clearStable(prior);
           tabStableKey.delete(panelTab);
           tabStableIdentity.delete(panelTab);
+          tabCommandWorkflowUuid.delete(panelTab);
         }
       }
 

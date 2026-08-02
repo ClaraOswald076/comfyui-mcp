@@ -1252,6 +1252,30 @@ function activeMatchesTarget(active: unknown, path: string): boolean {
   return stripJsonExt(a.filename) === want || stripJsonExt(a.path) === want;
 }
 
+/**
+ * Exact saved-workflow identity for command-fence refreshes.  Unlike
+ * activeMatchesTarget(), this deliberately does NOT accept a filename/basename:
+ * a successful open of `workflows/a/foo.json` cannot safely adopt the UUID of
+ * an active `workflows/b/foo.json`.  The panel's saved workflow routing key is
+ * `wf:<canonical path>`, which is the only pathless fallback that is still an
+ * exact identity.
+ */
+function activeMatchesOpenRefreshTarget(active: unknown, path: string): boolean {
+  const targetIdentity = canonicalRequestedSavedIdentity(path);
+  return !!targetIdentity && canonicalSavedRecordIdentity(active) === targetIdentity;
+}
+
+/** Normalizes only syntax the panel's saved-path/routing identity normalizes. */
+function canonicalSavedWorkflowPath(value: unknown): string | null {
+  if (typeof value !== "string" || !value) return null;
+  const normalized = value.replace(/\\/g, "/").replace(/^\.\/+/, "").replace(/\/+/g, "/");
+  // `tmp:<uuid>` is a per-tab ephemeral routing handle, never a saved workflow
+  // path. `wf:<path>` is likewise a routing token, not a path; accepting either
+  // here could manufacture `wf:tmp:…` and refresh a durable command fence.
+  if (!normalized || /^(?:tmp:|wf:)/i.test(normalized)) return null;
+  return normalized;
+}
+
 interface OpenVerifyTiming {
   /** Total wall-clock budget to confirm the target became active. */
   budgetMs: number;
@@ -1275,8 +1299,74 @@ function getOpenVerifyTiming(): OpenVerifyTiming {
 interface OpenVerifyResult {
   receipt: "applied" | "not_applied" | "unknown" | "unsupported" | "missing";
   error?: string;
+  /**
+   * #716 — only populated when this exact open receipt is applied AND the
+   * currently-active workflow still matches its resolved target.  A late receipt
+   * for an older open must never refresh the command fence for a newer canvas.
+   */
+  workflowUuid?: string;
   waited_ms: number;
   attempts: number;
+}
+
+// Strict canonical RFC UUID for a command-fence refresh: lowercase only, an
+// assigned RFC version, and the RFC variant. Do not normalize this transport
+// value — an uppercase or malformed producer value must leave the prior fence.
+// Keep this check at the command-response boundary: a missing, malformed, or
+// old-panel response must leave the existing command fence intact, never turn
+// a graph mutation into an unstamped send.
+const WORKFLOW_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+function responseWorkflowUuid(value: unknown): string | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = (value as { workflow_uuid?: unknown }).workflow_uuid;
+  if (typeof raw !== "string") return undefined;
+  return WORKFLOW_UUID_RE.test(raw) ? raw : undefined;
+}
+
+/** Refresh only the bridge-owned command stamp, never caller data. */
+function refreshWorkflowUuid(ctx: PanelToolCtx, value: unknown): boolean {
+  const uuid = responseWorkflowUuid(value);
+  const refresh = (ctx.bridge as unknown as { refreshWorkflowUuid?: unknown }).refreshWorkflowUuid;
+  return uuid && typeof refresh === "function" ? refresh.call(ctx.bridge, ctx.tabId, uuid) : false;
+}
+
+/**
+ * A successful open reply belongs to that exact bridge request, but another
+ * navigation may have completed before the caller receives it. Re-read the
+ * active object and accept the returned UUID only while it still names this
+ * open's canonical target; otherwise leave the old stamp to fail closed.
+ */
+async function refreshOpenWorkflowUuid(
+  ctx: PanelToolCtx,
+  requestedPath: string,
+  openResult: ToolResult,
+): Promise<void> {
+  const parsedOpen = parseToolResultJson(openResult);
+  const opened = parsedOpen?.opened;
+  const openedPath =
+    opened && typeof opened === "object" && typeof (opened as { path?: unknown }).path === "string"
+      ? (opened as { path: string }).path
+      : undefined;
+  // The caller's original token is the fence target. A panel can resolve an
+  // alias/basename to a path, but that reply must never retroactively turn the
+  // alias into a UUID-refresh authorization. Require the reply to corroborate
+  // the original exact saved identity before consulting the live active record.
+  const requestedIdentity = canonicalRequestedSavedIdentity(requestedPath);
+  const openedIdentity = openedPath
+    ? canonicalSavedRecordIdentity({ path: openedPath, routing_key: parsedOpen?.routing_key })
+    : null;
+  if (!requestedIdentity || requestedIdentity !== openedIdentity) return;
+  try {
+    const list = parseToolResultJson(await ctx.call({ cmd: "workflow_list" }, 6000));
+    if (!list || !activeMatchesOpenRefreshTarget(list.active, requestedPath)) return;
+    // Prefer the just-read active UUID; use the command's correlated response as
+    // a compatibility fallback only after that same active-target confirmation.
+    refreshWorkflowUuid(ctx, list.active) || refreshWorkflowUuid(ctx, parseToolResultJson(openResult));
+  } catch {
+    // A failed read must not convert a confirmed open into a failure, nor should
+    // it clear the old stamp. The next mutation remains safely fenced.
+  }
 }
 
 /** Exact resolved-path check for an open receipt. A filename/basename is not a
@@ -1329,7 +1419,27 @@ async function waitForOpenReceipt(
             return { receipt: "unknown", waited_ms: Date.now() - start, attempts };
           }
           if (receipt.applied === true) {
-            return { receipt: "applied", waited_ms: Date.now() - start, attempts };
+            // A receipt proves this open applied, but a later user switch could
+            // have made another canvas active before this probe.  Refresh only
+            // when the current active object still names this exact target.
+            const active = parsed.active;
+            const resolved = receipt.resolved as Record<string, unknown>;
+            const resolvedPath = resolved.path as string;
+            // The receipt has already proved the command's exact resolved path.
+            // Still require its routing claim and the live active record to
+            // corroborate the ORIGINAL request identity before refreshing.
+            const requestedIdentity = canonicalRequestedSavedIdentity(path);
+            const resolvedIdentity = canonicalSavedRecordIdentity({
+              path: resolvedPath,
+              routing_key: resolved.routing_key,
+            });
+            const workflowUuid =
+              requestedIdentity &&
+              requestedIdentity === resolvedIdentity &&
+              activeMatchesOpenRefreshTarget(active, path)
+              ? responseWorkflowUuid(active)
+              : undefined;
+            return { receipt: "applied", workflowUuid, waited_ms: Date.now() - start, attempts };
           }
           if (receipt.applied === false) {
             return {
@@ -1392,7 +1502,13 @@ async function openWorkflowWithVerify(path: string, ctx: PanelToolCtx): Promise<
   // caller must see it as-is. A slow-ack TIMEOUT or a mid-command reconnect DROP
   // ("OUTCOME UNKNOWN", #402) both warrant a receipt lookup, which can turn an
   // unknown outcome into a definite one without inferring from active state.
-  if (!isAckTimeout(res) && !isReconnectDrop(res)) return res;
+  if (!isAckTimeout(res) && !isReconnectDrop(res)) {
+    // #716 — re-read the active record after this exact successful open before
+    // refreshing the next command's stamp. This prevents a late reply from an
+    // earlier open from overwriting the fence after another tab became active.
+    if (!res.isError) await refreshOpenWorkflowUuid(ctx, path, res);
+    return res;
+  }
 
   if (!dispatchedRid) {
     return fail(
@@ -1404,6 +1520,7 @@ async function openWorkflowWithVerify(path: string, ctx: PanelToolCtx): Promise<
   const timing = getOpenVerifyTiming();
   const verify = await waitForOpenReceipt(ctx, path, dispatchedRid, timing);
   if (verify.receipt === "applied") {
+    if (verify.workflowUuid) refreshWorkflowUuid(ctx, { workflow_uuid: verify.workflowUuid });
     return ok({
       opened: { path },
       recovered: true,
@@ -1476,6 +1593,8 @@ interface ResolvedOpenWorkflow {
   isActive?: boolean;
   /** Human label for the workflow currently active (for a clear pin-time error). */
   activeLabel?: string;
+  /** UUID from the same authoritative active workflow_list record, if valid. */
+  workflowUuid?: string;
 }
 
 /**
@@ -1531,11 +1650,33 @@ async function resolveOpenWorkflow(
   }
 
   if (rec) {
-    return { record: rec, isActive: computeIsActive(rec, activeObj), activeLabel };
+    const isActive = computeIsActive(rec, activeObj);
+    // Only the top-level active object is the panel's direct current-canvas
+    // report. An affirmatively-active per-record flag alone remains sufficient
+    // to route a legacy pin, but is NOT enough to replace a command identity:
+    // a stale/mixed list can say `rec.active:true` for A while top-level active
+    // (and its UUID) is B. Refresh only when both expose the same exact saved
+    // path/routing identity; aliases and routing tokens are deliberately
+    // irrelevant. The caller-path check happens in resolvePinTarget(), where
+    // the refreshed value is handed to the bridge-owned command fence.
+    const workflowUuid =
+      isActive === true &&
+      activeRecordMatchesExactSavedIdentity(rec, activeObj)
+        ? responseWorkflowUuid(activeObj)
+        : undefined;
+    return { record: rec, isActive, activeLabel, workflowUuid };
   }
   // The active object is authoritative too, in case it isn't mirrored in the array.
   if (activeMatchesTarget(activeObj, path)) {
-    return { record: activeObj as OpenWorkflowRecord, isActive: true, activeLabel };
+    return {
+      record: activeObj as OpenWorkflowRecord,
+      isActive: true,
+      activeLabel,
+      // The top-level active object was not corroborated by a selected entry in
+      // workflow_list. It may remain a compatibility-valid pin selector, but it
+      // is never a safe source for replacing a command fence.
+      workflowUuid: undefined,
+    };
   }
   return NOT_OPEN;
 }
@@ -1583,6 +1724,53 @@ function identityVerdict(rec: OpenWorkflowRecord, activeObj: unknown): boolean |
   return comparable ? false : undefined;
 }
 
+/**
+ * Exact saved-workflow identity required before an active-list UUID can refresh
+ * a command fence. `activeMatchesTarget()` and an item's `active:true` are
+ * intentionally alias/compatibility-friendly for pin resolution; neither can
+ * prove that the record carrying the pin and top-level `active` name the same
+ * saved canvas. Reject contradictory path/routing pairs and never fall back to
+ * filename, basename, or key aliases here.
+ */
+function activeRecordMatchesExactSavedIdentity(rec: OpenWorkflowRecord, activeObj: unknown): boolean {
+  if (!activeObj || typeof activeObj !== "object") return false;
+  const recordIdentity = canonicalSavedRecordIdentity(rec);
+  const activeIdentity = canonicalSavedRecordIdentity(activeObj);
+  return !!recordIdentity && recordIdentity === activeIdentity;
+}
+
+/** Canonical `wf:<path>` identity for a caller's literal saved-workflow path. */
+function canonicalRequestedSavedIdentity(path: unknown): string | null {
+  const canonicalPath = canonicalSavedWorkflowPath(path);
+  // A bare basename is an alias selector, not the canonical saved path the
+  // command fence must bind. It may still resolve a legacy pin, but must never
+  // authorize replacing its existing UUID stamp.
+  return canonicalPath && canonicalPath.includes("/") ? `wf:${canonicalPath}` : null;
+}
+
+/**
+ * Canonical `wf:<path>` identity, but only for a complete corroborating record.
+ * Command-fence replacement is stricter than pin routing: a same-path record
+ * with a missing/malformed route may be partial or replayed, and must not let a
+ * new UUID replace the existing fail-closed stamp.
+ */
+function canonicalSavedRecordIdentity(value: unknown): string | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as { path?: unknown; routing_key?: unknown };
+  const path = canonicalSavedWorkflowPath(record.path);
+  const routing = canonicalSavedWorkflowRoutingIdentity(record.routing_key);
+  // Both fields must be present and corroborate. A mixed, partial, or replayed
+  // snapshot is not a safe source of a command-fence replacement.
+  if (!path || !routing || routing !== `wf:${path}`) return null;
+  return routing;
+}
+
+function canonicalSavedWorkflowRoutingIdentity(value: unknown): string | null {
+  if (typeof value !== "string" || !value.startsWith("wf:")) return null;
+  const path = canonicalSavedWorkflowPath(value.slice(3));
+  return path ? `wf:${path}` : null;
+}
+
 /** Stable-identity match (positive only) — used to prefer the active record among matches. */
 function recMatchesActive(rec: OpenWorkflowRecord, activeObj: unknown): boolean {
   return identityVerdict(rec, activeObj) === true;
@@ -1600,7 +1788,7 @@ function workflowRecordLabel(rec: unknown): string | undefined {
 
 /** Outcome of validating + canonicalizing a pin target. */
 export type PinTargetResolution =
-  | { ok: true; pinPath: string; pinFilename?: string }
+  | { ok: true; pinPath: string; pinFilename?: string; workflowUuid?: string }
   | { ok: false; error: string };
 
 /**
@@ -1647,10 +1835,21 @@ export async function resolvePinTarget(
   if (resolved) {
     // Canonicalize to the stable key so routing survives rename/reconnect.
     const rec = resolved.record;
+    // `resolveOpenWorkflow()` establishes whether rec and top-level active are
+    // exact two-field peers. That is still insufficient to replace a command
+    // fence when the caller supplied a basename/key/routing alias: retain the
+    // legacy pin resolution, but adopt its UUID only for the caller's own exact
+    // canonical saved path.
+    const callerIdentity = canonicalRequestedSavedIdentity(path);
+    const workflowUuid =
+      callerIdentity && callerIdentity === canonicalSavedRecordIdentity(rec)
+        ? resolved.workflowUuid
+        : undefined;
     return {
       ok: true,
       pinPath: rec.key ?? rec.path ?? path,
       pinFilename: filename ?? rec.filename ?? rec.path,
+      workflowUuid,
     };
   }
   // Indeterminate list — stay lenient (older/partial panel).
@@ -1664,6 +1863,8 @@ export const __openWorkflowTestHooks = {
   },
   isAckTimeout,
   activeMatchesTarget,
+  activeMatchesOpenRefreshTarget,
+  activeRecordMatchesExactSavedIdentity,
   resolveOpenWorkflow,
 };
 
@@ -4700,17 +4901,26 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // so both entry points validate identically.
         let pinPath = path;
         let pinFilename = filename;
+        let pinnedWorkflowUuid: string | undefined;
         if (mode === "pinned" && path) {
           const res = await resolvePinTarget(ctx, path, filename);
           if (!res.ok) return fail(res.error);
           pinPath = res.pinPath;
           pinFilename = res.pinFilename;
+          pinnedWorkflowUuid = res.workflowUuid;
         }
         const target = ctx.workflowTarget.set(ctx.tabId, {
           mode,
           path: pinPath,
           filename: pinFilename,
         });
+        // #716 — a successful, positively-active re-pin is an explicit recovery
+        // boundary after reconnect/open. Its UUID came from the same fresh
+        // workflow_list result that validated the pin. Missing, malformed, or
+        // indeterminate values leave the old command stamp intact (fail closed).
+        if (mode === "pinned" && pinnedWorkflowUuid) {
+          refreshWorkflowUuid(ctx, { workflow_uuid: pinnedWorkflowUuid });
+        }
         ctx.bridge.push({ type: "workflow_target", target }, ctx.tabId);
         const hint =
           target.mode === "pinned"
