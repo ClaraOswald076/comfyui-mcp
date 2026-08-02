@@ -306,6 +306,11 @@ describe("auth.json records", () => {
     expect(credentialValueUsable("$MY_KEY", undefined, bareEnv())).toBe(false);
     expect(credentialValueUsable("${A}_${B}", undefined, bareEnv({ A: "x" }))).toBe(false);
     expect(credentialValueUsable("${A}_${B}", undefined, bareEnv({ A: "x", B: "y" }))).toBe(true);
+    // pi's resolver uses `entryEnv[name] || process.env[name]`, so an empty
+    // scoped value falls through to the inherited process value.
+    expect(
+      credentialValueUsable("$MY_KEY", { MY_KEY: "" }, bareEnv({ MY_KEY: "sk-from-process" })),
+    ).toBe(true);
   });
 
   it("a `!command` key is accepted unverified (we never execute it to probe)", () => {
@@ -416,6 +421,50 @@ describe("Google Vertex ADC", () => {
       GOOGLE_APPLICATION_CREDENTIALS: keyFile,
     });
     expect(piVertexAdcUsable(tmp, env)).toBe(true);
+  });
+
+  it("a stored empty Vertex field blocks the ambient value under pi's nullish merge", () => {
+    const keyFile = join(tmp, "sa.json");
+    writeFileSync(keyFile, "{}");
+    const env = bareEnv({ ...project, GOOGLE_APPLICATION_CREDENTIALS: keyFile });
+    expect(
+      piVertexAdcUsable(tmp, env, { GOOGLE_CLOUD_PROJECT: "", GOOGLE_CLOUD_LOCATION: "us-central1" }),
+    ).toBe(false);
+    expect(
+      piVertexAdcUsable(
+        tmp,
+        env,
+        { GOOGLE_CLOUD_PROJECT: "proj", GOOGLE_CLOUD_LOCATION: "us-central1", GOOGLE_APPLICATION_CREDENTIALS: "" },
+      ),
+    ).toBe(false);
+    // No stored value is nullish/absent and must fall through to the ambient
+    // source; pi also accepts GCLOUD_PROJECT as the final project alias.
+    expect(piVertexAdcUsable(tmp, env, { GOOGLE_CLOUD_LOCATION: "us-central1" })).toBe(true);
+  });
+
+  it("uses the stored GCLOUD_PROJECT alias only after the primary project source is absent", () => {
+    const keyFile = join(tmp, "sa.json");
+    writeFileSync(keyFile, "{}");
+    expect(
+      piVertexAdcUsable(
+        tmp,
+        bareEnv({ GOOGLE_CLOUD_LOCATION: "us-central1", GOOGLE_APPLICATION_CREDENTIALS: keyFile }),
+        { GCLOUD_PROJECT: "stored-alias" },
+      ),
+    ).toBe(true);
+    // Stored alias is nullish-preferred over ambient alias. An explicit empty
+    // value therefore blocks the otherwise-working ambient alias.
+    expect(
+      piVertexAdcUsable(
+        tmp,
+        bareEnv({
+          GCLOUD_PROJECT: "ambient-alias",
+          GOOGLE_CLOUD_LOCATION: "us-central1",
+          GOOGLE_APPLICATION_CREDENTIALS: keyFile,
+        }),
+        { GCLOUD_PROJECT: "" },
+      ),
+    ).toBe(false);
   });
 
   it("gcloud's well-known ADC file counts when the env var is unset", () => {
@@ -722,6 +771,43 @@ describe("pi selected-provider readiness", () => {
       JSON.stringify({ "amazon-bedrock": { type: "api_key", env: { AWS_PROFILE: "work" } } }),
     );
     expect(piCredentialPresent(tmp, bareEnv({ COMFYUI_MCP_PI_PROVIDER: "amazon-bedrock" }))).toBe(true);
+  });
+
+  it("uses stored Bedrock AWS_PROFILE only, with nullish precedence", () => {
+    // amazon-bedrock.ts reads every AWS source except AWS_PROFILE through
+    // ctx.env. Record-local bearer/static/ECS/IRSA values therefore cannot
+    // authenticate.
+    for (const env of [
+      { AWS_BEARER_TOKEN_BEDROCK: "stored-bearer" },
+      { AWS_ACCESS_KEY_ID: "stored-id", AWS_SECRET_ACCESS_KEY: "stored-secret" },
+      { AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: "/v2/credentials/id" },
+      { AWS_CONTAINER_CREDENTIALS_FULL_URI: "http://169.254.170.2/creds" },
+      { AWS_WEB_IDENTITY_TOKEN_FILE: "/var/run/token" },
+    ]) {
+      writePiFile(tmp, "auth.json", JSON.stringify({ "amazon-bedrock": { type: "api_key", env } }));
+      expect(piCredentialPresent(tmp, bareEnv({ COMFYUI_MCP_PI_PROVIDER: "amazon-bedrock" })), env).toBe(false);
+    }
+
+    writePiFile(
+      tmp,
+      "auth.json",
+      JSON.stringify({ "amazon-bedrock": { type: "api_key", env: { AWS_PROFILE: "stored-profile" } } }),
+    );
+    expect(piCredentialPresent(tmp, bareEnv({ COMFYUI_MCP_PI_PROVIDER: "amazon-bedrock" }))).toBe(true);
+
+    // An explicit empty profile is not absent: pi's `??` merge suppresses the
+    // ambient AWS_PROFILE (while other ambient chain sources may still apply).
+    writePiFile(
+      tmp,
+      "auth.json",
+      JSON.stringify({ "amazon-bedrock": { type: "api_key", env: { AWS_PROFILE: "" } } }),
+    );
+    expect(
+      piCredentialPresent(
+        tmp,
+        bareEnv({ COMFYUI_MCP_PI_PROVIDER: "amazon-bedrock", AWS_PROFILE: "ambient-profile" }),
+      ),
+    ).toBe(false);
   });
 
   it("rejects a command with no command text and preserves whitespace entry-env ownership", () => {

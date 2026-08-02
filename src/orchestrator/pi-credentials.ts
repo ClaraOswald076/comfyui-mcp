@@ -202,37 +202,36 @@ export function credentialValueUsable(
   // it cannot authenticate. Do not let a lone `!` greet the user green.
   if (value.startsWith("!")) return value.slice(1).trim() !== "";
   // Every referenced var must resolve to something non-empty IN THE ENV PI WILL
-  // ACTUALLY SEE. Order matches pi: the entry's own `env` block first (pi injects
-  // it for the provider), then the inherited process env — but a var our spawn
+  // ACTUALLY SEE. `resolveEnvConfigValue` uses the entry's own `env` block with
+  // `||` fallback to the inherited process env — but a var our spawn
   // env STRIPS is never inherited, so `"key": "$GEMINI_API_KEY"` resolves for us
   // and to nothing for pi. Treating it as present would be exactly the false
   // green this whole module exists to prevent.
   const stripped = new Set<string>(TOOL_ONLY_SECRET_ENV_KEYS);
   for (const name of envRefsIn(value)) {
-    const hasEntryValue = !!entryEnv && Object.prototype.hasOwnProperty.call(entryEnv, name);
-    if (hasEntryValue) {
-      const fromEntry = entryEnv![name];
-      // `resolveEnvConfigValue` uses `entryEnv[name] || process.env[name]`.
-      // Thus an empty entry falls through, but a whitespace-only entry OWNS the
-      // value and blocks a good inherited key. It is not a usable credential.
-      if (typeof fromEntry !== "string" || fromEntry.trim() === "") return false;
-      continue;
-    }
-    if (stripped.has(name) || !procEnv[name]?.trim()) return false;
+    const fromEntry = entryEnv?.[name];
+    // pi's resolver is exactly `entryEnv?.[name] || process.env[name]`. An
+    // empty entry therefore falls through to process.env; whitespace remains
+    // truthy, wins, and cannot authenticate.
+    const resolved = fromEntry || procEnv[name];
+    if (stripped.has(name) && !fromEntry) return false;
+    if (!nonEmptyString(resolved)) return false;
   }
   return true;
 }
 
-/** Read `key` as pi would for a provider: the stored record's own `env` block
- *  first (pi injects it), then the inherited process env. */
-function readScoped(
+/**
+ * Read a provider-scoped value with pi's `??` merge semantics.  A number of
+ * bespoke providers deliberately let an explicitly-empty stored setting block
+ * the ambient value; do not accidentally turn that into `||` fallback.
+ */
+function readNullishScoped(
   entryEnv: Record<string, unknown> | undefined,
   procEnv: NodeJS.ProcessEnv,
   key: string,
-): string | undefined {
+): unknown {
   const fromEntry = entryEnv?.[key];
-  if (typeof fromEntry === "string" && fromEntry !== "") return fromEntry;
-  return procEnv[key];
+  return fromEntry ?? procEnv[key];
 }
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -247,14 +246,6 @@ function nonEmptyString(v: unknown): boolean {
  *  (DEFAULT_OAUTH_MINIMUM_VALIDITY_MS in packages/ai/src/auth/resolve.ts). */
 const OAUTH_MINIMUM_VALIDITY_MS = 5 * 60 * 1000;
 
-/**
- * Is `expires` far enough in the future that pi can use the token as-is?
- *
- * pi compares `expires` directly against `Date.now() + minimumValidityMs`, so it
- * is MILLISECONDS — not seconds — and anything inside the five-minute window is
- * treated as needing a refresh. That matters only for the access-only case
- * below: with a `refresh` token pi just re-mints, so this is never consulted.
- */
 function expiresUsableWithoutRefresh(expires: unknown, nowMs: number): boolean {
   if (typeof expires !== "number" || !Number.isFinite(expires)) return false;
   return expires > nowMs + OAUTH_MINIMUM_VALIDITY_MS;
@@ -267,9 +258,9 @@ function expiresUsableWithoutRefresh(expires: unknown, nowMs: number): boolean {
  *   ApiKeyCredential { type: "api_key"; key?: string; env?: ProviderEnv }
  *   OAuthCredential  { type: "oauth"; refresh: string; access: string; expires: number }
  *
- * Note `key` is OPTIONAL in pi's TYPE but mandatory in FACT — a `{"type":"api_key"}`
- * record resolves to no key and pi's first request goes out unauthenticated. That
- * record used to green this provider; it no longer does.
+ * Note `key` is OPTIONAL in pi's TYPE. Whether a keyless api-key record is
+ * usable is provider-specific: Vertex and Bedrock deliberately support it,
+ * while ordinary key providers can fall back to their ambient key.
  *
  * An UNRECOGNISED `type` is not a credential either: pi's resolveProviderAuth
  * dispatches only "oauth" and "api_key" and returns undefined for anything else
@@ -299,7 +290,9 @@ export function authRecordUsable(
     // trio resolves (from the record's own env first, then the process env) — it
     // used to read as "not signed in" for a working Vertex login.
     if (record.key === undefined && provider === "google-vertex") {
-      if (credentialValueUsable(readScoped(entryEnv, procEnv, "GOOGLE_CLOUD_API_KEY"), entryEnv, procEnv))
+      // google-vertex reads `credential.key ?? ctx.env(...)`: scoped `env` does
+      // not supply GOOGLE_CLOUD_API_KEY, and only the process env is ambient.
+      if (credentialValueUsable(procEnv.GOOGLE_CLOUD_API_KEY, undefined, procEnv))
         return true;
       return piVertexAdcUsable(ctx.home ?? homedir(), procEnv, entryEnv);
     }
@@ -317,15 +310,9 @@ export function authRecordUsable(
     return true;
   }
   if (type === "oauth") {
-    // pi declares refresh + access + expires as all required, and that is what
-    // `/login` writes. We don't demand all three (that would false-red a
-    // partially-migrated record), but we do require something that can actually
-    // produce a live token:
-    //   - a `refresh` token: pi re-mints access from it, so an EXPIRED record is
-    //     still ready — refusing it would be a false "not signed in".
-    //   - otherwise an `access` token with more than pi's five-minute minimum
-    //     validity left. Access-only inside that window (or past it) cannot be
-    //     renewed: pi decides it needs a refresh and has no refresh token.
+    // A refresh token lets pi re-mint access, so a partial migrated record with
+    // one remains usable even when its stored access token is expired. Without
+    // it, an access token needs to survive pi's five-minute refresh window.
     if (nonEmptyString(record.refresh)) return true;
     return nonEmptyString(record.access) && expiresUsableWithoutRefresh(record.expires, nowMs);
   }
@@ -614,22 +601,28 @@ export function piVertexAdcUsable(
   procEnv: NodeJS.ProcessEnv = process.env,
   entryEnv?: Record<string, unknown>,
 ): boolean {
-  // A stored record's provider-scoped `env` block wins over the ambient env,
-  // because pi injects it for that provider.
-  const read = (k: string) => readScoped(entryEnv, procEnv, k);
-  const project = read("GOOGLE_CLOUD_PROJECT")?.trim() || read("GCLOUD_PROJECT")?.trim();
-  const location = read("GOOGLE_CLOUD_LOCATION")?.trim();
-  if (!project || !location) return false;
+  // Vertex uses nullish (not truthy) per-field fallback. An explicitly-empty
+  // stored project/path therefore blocks the ambient value just as it does in
+  // pi; treating it as `||` would false-green a broken stored record.
+  // google-vertex resolves these as a four-level nullish chain: stored primary,
+  // ambient primary, stored alias, then ambient alias. In particular, a stored
+  // empty GCLOUD_PROJECT must block an ambient alias rather than acting like an
+  // `||` fallback.
+  const project =
+    readNullishScoped(entryEnv, procEnv, "GOOGLE_CLOUD_PROJECT") ??
+    readNullishScoped(entryEnv, procEnv, "GCLOUD_PROJECT");
+  const location = readNullishScoped(entryEnv, procEnv, "GOOGLE_CLOUD_LOCATION");
+  if (!nonEmptyString(project) || !nonEmptyString(location)) return false;
   // NOT trimmed: pi uses the literal value, so a space-padded path that
   // resolves for us would not resolve for pi.
-  const explicit = read("GOOGLE_APPLICATION_CREDENTIALS");
-  if (explicit) {
+  const explicit = readNullishScoped(entryEnv, procEnv, "GOOGLE_APPLICATION_CREDENTIALS");
+  if (explicit !== undefined) {
     // Must point at a file that is actually there. A RELATIVE path resolves
     // against pi's cwd, which readiness cannot know — so it is unverifiable, and
     // "unverifiable" has to mean not-ready here or a dangling `missing.json`
     // greens pi. gcloud always writes an absolute path, so this costs nothing
     // real.
-    return isAbsolute(explicit) && isRegularFile(explicit);
+    return typeof explicit === "string" && isAbsolute(explicit) && isRegularFile(explicit);
   }
   // gcloud's well-known ADC file — pi's fallback is this literal POSIX path, so
   // we probe exactly that and no other location (a %APPDATA%\gcloud file would
@@ -672,18 +665,24 @@ export function piAgentDir(home: string, procEnv: NodeJS.ProcessEnv = process.en
  * provider records, a keyless Bedrock `api_key` record deliberately falls
  * through to these sources (amazon-bedrock.ts): an explicit stored AWS_PROFILE,
  * an ambient profile, static access-key pair, ECS task role, or web identity.
+ * Only the PROFILE comes from a stored `env` block. Every other AWS source is
+ * read from ctx.env (the ambient spawn environment).
  */
 function piBedrockCredentialUsable(
   entryEnv: Record<string, unknown> | undefined,
   procEnv: NodeJS.ProcessEnv,
 ): boolean {
-  const read = (key: string) => readScoped(entryEnv, procEnv, key);
-  if (nonEmptyString(read("AWS_BEARER_TOKEN_BEDROCK"))) return true;
-  if (nonEmptyString(read("AWS_PROFILE"))) return true;
-  if (nonEmptyString(read("AWS_ACCESS_KEY_ID")) && nonEmptyString(read("AWS_SECRET_ACCESS_KEY"))) return true;
-  if (nonEmptyString(read("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"))) return true;
-  if (nonEmptyString(read("AWS_CONTAINER_CREDENTIALS_FULL_URI"))) return true;
-  return nonEmptyString(read("AWS_WEB_IDENTITY_TOKEN_FILE"));
+  if (nonEmptyString(procEnv.AWS_BEARER_TOKEN_BEDROCK)) return true;
+  const storedProfile = entryEnv?.AWS_PROFILE;
+  // `credential.env?.AWS_PROFILE ?? ctx.env("AWS_PROFILE")`: an explicitly
+  // empty stored profile suppresses the ambient profile, but no stored property
+  // (or null) falls through to it.
+  const profile = storedProfile ?? procEnv.AWS_PROFILE;
+  if (nonEmptyString(profile)) return true;
+  if (nonEmptyString(procEnv.AWS_ACCESS_KEY_ID) && nonEmptyString(procEnv.AWS_SECRET_ACCESS_KEY)) return true;
+  if (nonEmptyString(procEnv.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI)) return true;
+  if (nonEmptyString(procEnv.AWS_CONTAINER_CREDENTIALS_FULL_URI)) return true;
+  return nonEmptyString(procEnv.AWS_WEB_IDENTITY_TOKEN_FILE);
 }
 
 /** The effective provider selected by the pi spawn flags. `--provider` wins;
