@@ -185,6 +185,16 @@ async function probeManagerGeneration(
 /** Is the COMFYUI_URL host loopback? → LOCAL, else REMOTE. Unknown URL → LOCAL
  *  (the panel's overwhelming default; never block on an unparseable URL).
  *  --force-remote overrides this, keeping it in sync with isRemoteMode(). */
+/** The host of a ComfyUI base URL, or undefined. */
+function hostFromUrl(url: string | undefined): string | undefined {
+  if (!url) return undefined;
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return undefined;
+  }
+}
+
 /** The TCP port of a ComfyUI base URL (defaulting by scheme), or undefined. */
 function portFromUrl(url: string | undefined): number | undefined {
   if (!url) return undefined;
@@ -650,7 +660,9 @@ export async function gatherEnvCapabilities(opts: GatherOptions): Promise<EnvCap
     // GUESS, whose positives are still real but whose negatives can never stand.
     const live = resolveLiveInterpreter({
       port: opts.port ?? portFromUrl(opts.comfyuiUrl) ?? 8188,
+      host: hostFromUrl(opts.comfyuiUrl),
       remote,
+      serverArgv: statsArgv,
     });
     observed = !!live;
     const python =

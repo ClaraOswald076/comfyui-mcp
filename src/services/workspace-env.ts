@@ -1016,7 +1016,20 @@ export async function getEnvironment(): Promise<EnvironmentInfo> {
   // the saved default.
   const remote = isRemoteMode();
   // GROUND TRUTH — did we launch it, or can the OS tell us? (See live-interpreter.ts.)
-  const live = resolveLiveInterpreter({ port: config.resolvedPort, remote });
+  // statsArgv is the server's OWN sys.argv: the process we find on the port must have
+  // a command line consistent with it, or it is not the server that answered us.
+  let statsHost: string | undefined;
+  try {
+    statsHost = new URL(apiTarget).hostname;
+  } catch {
+    /* unparseable target → no host filter */
+  }
+  const live = resolveLiveInterpreter({
+    port: config.resolvedPort,
+    host: statsHost,
+    remote,
+    serverArgv: statsArgv,
+  });
   const resolved = resolveComfyuiPython(workspacePath, statsArgv, {
     cwd: statsCwd,
     remote,

@@ -23,9 +23,40 @@ const IS_WIN = platform() === "win32";
  *
  * Exported for tests: this pure function is where the bug lived.
  */
+/** Loopback spellings that all denote "this machine". */
+const LOOPBACK = new Set(["127.0.0.1", "::1", "localhost"]);
+/** Bind addresses that accept connections for EVERY local address. */
+const WILDCARD = new Set(["0.0.0.0", "::", "*", ""]);
+
+/** Split "127.0.0.1:8188" / "[::1]:8188" / "*:8188" into address + port. */
+function splitEndpoint(endpoint: string): { address: string; port: string } {
+  const idx = endpoint.lastIndexOf(":");
+  if (idx < 0) return { address: endpoint, port: "" };
+  const address = endpoint.slice(0, idx).replace(/^\[|\]$/g, "");
+  return { address, port: endpoint.slice(idx + 1) };
+}
+
+/**
+ * Does a listener bound to `address` serve the host we are actually talking to?
+ *
+ * A wildcard bind serves every local address, so it always matches. Otherwise the
+ * addresses must agree, with the loopback spellings treated as equivalent. Binding
+ * the lookup to the HOST — not just the port number — keeps two instances on
+ * different loopback addresses from being confused for one another (#401 round 4).
+ */
+export function addressServesHost(address: string, wantHost?: string): boolean {
+  const a = address.toLowerCase();
+  if (WILDCARD.has(a)) return true;
+  if (!wantHost) return true;
+  const w = wantHost.toLowerCase().replace(/^\[|\]$/g, "");
+  if (a === w) return true;
+  return LOOPBACK.has(a) && LOOPBACK.has(w);
+}
+
 export function parseListenerPidFromNetstat(
   output: string,
   port: number,
+  host?: string,
 ): number | null {
   const suffix = `:${port}`;
   for (const raw of output.split(/\r?\n/)) {
@@ -46,13 +77,48 @@ export function parseListenerPidFromNetstat(
     // local side to :PORT — killing that would take down the wrong process
     // (or none) when ComfyUI is actually down.
     if (!foreign.endsWith(":0")) continue;
+    if (!addressServesHost(splitEndpoint(local).address, host)) continue;
     const pid = parseInt(parts[parts.length - 1], 10);
     if (!Number.isNaN(pid) && pid > 0) return pid;
   }
   return null;
 }
 
-export function findPidByPort(port: number): number | null {
+/**
+ * Parse `lsof -nP -iTCP:PORT -sTCP:LISTEN -Fpn` field output. Records look like
+ *   p1234
+ *   n127.0.0.1:8188
+ * so we can bind the match to the ADDRESS as well as the port, which the plain
+ * `-t` (terse) output cannot express.
+ */
+export function parseListenerPidFromLsof(
+  output: string,
+  port: number,
+  host?: string,
+): number | null {
+  let pid: number | null = null;
+  for (const raw of output.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line.startsWith("p")) {
+      const parsed = parseInt(line.slice(1), 10);
+      pid = !Number.isNaN(parsed) && parsed > 0 ? parsed : null;
+      continue;
+    }
+    if (line.startsWith("n") && pid !== null) {
+      const endpoint = line.slice(1);
+      // Ignore a peer-qualified name ("a->b"); listeners have no peer.
+      if (endpoint.includes("->")) continue;
+      const { address, port: p } = splitEndpoint(endpoint);
+      if (p !== String(port)) continue;
+      if (!addressServesHost(address, host)) continue;
+      return pid;
+    }
+  }
+  return null;
+}
+
+export function findPidByPort(port: number, host?: string): number | null {
   if (IS_WIN) {
     // Parse `netstat -ano` ourselves instead of piping through
     // `findstr LISTENING` — that state word is localized and made detection fail
@@ -62,21 +128,27 @@ export function findPidByPort(port: number): number | null {
         encoding: "utf-8",
         timeout: 5000,
       });
-      const pid = parseListenerPidFromNetstat(out, port);
+      const pid = parseListenerPidFromNetstat(out, port, host);
       if (pid) return pid;
     } catch {
       // netstat unavailable / failed — fall through to the PowerShell probe.
     }
     // Fallback: Get-NetTCPConnection maps port→owning PID structurally, with no
     // dependence on console locale or column layout. Belt-and-suspenders for the
-    // portable/embedded-Python launch shape reported in #449.
+    // portable/embedded-Python launch shape reported in #449. LocalAddress is
+    // selected too so the host filter still applies.
     try {
       const out = execSync(
-        `powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty OwningProcess"`,
+        `powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | ForEach-Object { \\"$($_.LocalAddress) $($_.OwningProcess)\\" }"`,
         { encoding: "utf-8", timeout: 8000 },
-      ).trim();
-      const pid = parseInt(out, 10);
-      if (!Number.isNaN(pid) && pid > 0) return pid;
+      );
+      for (const raw of out.split(/\r?\n/)) {
+        const [addr, pidText] = raw.trim().split(/\s+/);
+        if (!addr || !pidText) continue;
+        if (!addressServesHost(addr.replace(/^\[|\]$/g, ""), host)) continue;
+        const pid = parseInt(pidText, 10);
+        if (!Number.isNaN(pid) && pid > 0) return pid;
+      }
     } catch {
       // PowerShell unavailable / nothing listening.
     }
@@ -84,18 +156,18 @@ export function findPidByPort(port: number): number | null {
   }
 
   try {
-    // LISTENER-ONLY, and TCP only. A bare `lsof -ti :PORT` also matches processes
-    // merely CONNECTED to that port (and UDP), so it can return a client — e.g. a
-    // browser or our own fetch — instead of the ComfyUI server. That PID is used to
-    // kill the server AND (since #401) to read the interpreter the server runs, so a
-    // client's argv[0] must never be mistaken for it. Mirrors the Windows branch,
-    // which already required a listening row (foreign endpoint :0).
-    const out = execSync(`lsof -tiTCP:${port} -sTCP:LISTEN`, {
+    // LISTENER-ONLY, TCP only, and bound to the ADDRESS we actually talk to. A bare
+    // `lsof -ti :PORT` also matches processes merely CONNECTED to that port (and
+    // UDP), so it can return a client — a browser, or our own fetch — instead of the
+    // ComfyUI server. That PID is used to kill the server AND (since #401) to read
+    // the interpreter it runs, so a client must never be mistaken for it. `-Fpn`
+    // field output carries the bind address, which terse `-t` cannot express.
+    const out = execSync(`lsof -nP -iTCP:${port} -sTCP:LISTEN -Fpn`, {
       encoding: "utf-8",
       timeout: 5000,
-    }).trim();
-    const pid = parseInt(out.split("\n")[0], 10);
-    if (!isNaN(pid) && pid > 0) return pid;
+    });
+    const pid = parseListenerPidFromLsof(out, port, host);
+    if (pid) return pid;
   } catch {
     // Command failed — no process listening on that port
   }
