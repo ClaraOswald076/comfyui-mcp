@@ -12,7 +12,7 @@ import {
   type ManagerApi,
 } from "./node-management.js";
 import { assertPanelPinAllows, targetsPanelPackExactly } from "./panel-pin-guard.js";
-import { runPanelAction, panelStatus } from "./panel-installer.js";
+import { runPanelActionInner, panelStatus, withPanelOpLock, defaultDeps } from "./panel-installer.js";
 
 /**
  * Workflow dependency analysis & installation.
@@ -497,25 +497,26 @@ export async function installWorkflowDependencies(
           `no on-disk verification exists there; the pin check above is the whole guard).`,
       );
     } else {
-      // Install only when MISSING: a deps install must never move an existing
-      // panel (runPanelAction("install") with no version defaults to nightly,
-      // which could replace a NEWER one). Moving panels is the sync skill's
-      // job, with its own pin/lock discipline.
-      const status = await panelStatus();
-      if (status.installed) {
+      // Status check AND install inside the op lock: a panel landing between
+      // the check and the mutation would otherwise have nightly installed
+      // over it (codex gate). Same pattern as performPanelSync.
+      await withPanelOpLock(async () => {
+        const status = await panelStatus();
+        if (status.installed) {
+          panelNotes.push(
+            `"${pack}" is the sidebar panel pack: already installed ` +
+              `(${status.installedVersion ?? "version unreadable"}) — NOT touching it ` +
+              `(use the node-pack sync skill or install_panel to change versions).`,
+          );
+          return;
+        }
+        const result = await runPanelActionInner("install", defaultDeps);
         panelNotes.push(
-          `"${pack}" is the sidebar panel pack: already installed ` +
-            `(${status.installedVersion ?? "version unreadable"}) — NOT touching it ` +
-            `(use the node-pack sync skill or install_panel to change versions).`,
+          `"${pack}" is the sidebar panel pack: installed via the verified panel path ` +
+            `(${result.action}${result.installedVersion ? `, verified ${result.installedVersion}` : ""}). ` +
+            `RESTART ComfyUI to load it.`,
         );
-        continue;
-      }
-      const result = await runPanelAction("install");
-      panelNotes.push(
-        `"${pack}" is the sidebar panel pack: installed via the verified panel path ` +
-          `(${result.action}${result.installedVersion ? `, verified ${result.installedVersion}` : ""}). ` +
-          `RESTART ComfyUI to load it.`,
-      );
+      });
     }
   }
 
