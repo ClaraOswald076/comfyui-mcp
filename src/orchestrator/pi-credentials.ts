@@ -245,6 +245,12 @@ function nonEmptyString(v: unknown): boolean {
 /** pi refreshes any OAuth token with less than this much life left
  *  (DEFAULT_OAUTH_MINIMUM_VALIDITY_MS in packages/ai/src/auth/resolve.ts). */
 const OAUTH_MINIMUM_VALIDITY_MS = 5 * 60 * 1000;
+// Providers whose current pi resolver accepts auth.json OAuth credentials.
+// Radius OAuth is configured through models.json (`oauth: "radius"` + baseUrl),
+// not an auth.json OAuth record, so it is deliberately not listed here.
+const PI_OAUTH_AUTH_PROVIDERS = new Set([
+  "anthropic", "github-copilot", "kimi-coding", "openai-codex", "openrouter", "xai",
+]);
 
 function expiresUsableWithoutRefresh(expires: unknown, nowMs: number): boolean {
   if (typeof expires !== "number" || !Number.isFinite(expires)) return false;
@@ -312,7 +318,7 @@ export function authRecordUsable(
   if (type === "oauth") {
     // pi only dispatches OAuth records to providers that implement that flow.
     // An OAuth-shaped record for an API-key-only provider is not a credential.
-    if (provider !== "anthropic") return false;
+    if (provider !== undefined && !PI_OAUTH_AUTH_PROVIDERS.has(provider)) return false;
     // A refresh token lets pi re-mint access, so a partial migrated record with
     // one remains usable even when its stored access token is expired. Without
     // it, an access token needs to survive pi's five-minute refresh window.

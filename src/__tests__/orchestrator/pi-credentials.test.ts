@@ -252,6 +252,11 @@ describe("auth.json records", () => {
     expect(piCredentialPresent(tmp, bareEnv())).toBe(false);
   });
 
+  it("accepts OAuth for a non-Anthropic OAuth-capable provider", () => {
+    writePiFile(tmp, "auth.json", JSON.stringify({ xai: { type: "oauth", refresh: "r" } }));
+    expect(piCredentialPresent(tmp, bareEnv())).toBe(true);
+  });
+
   it("does not fall back when pi's truthy stored template resolves to whitespace", () => {
     writePiFile(
       tmp,
