@@ -686,17 +686,23 @@ function fileExists(p: string | undefined): boolean {
 }
 
 /**
- * config.comfyuiPath as a spawn cwd — only when it is an ABSOLUTE path that
- * exists on disk. A stale, relative, or nonexistent COMFYUI_PATH passed as cwd
- * would ENOENT the spawn after the server was already stopped (#711); callers
- * then omit cwd and the child inherits this process's (existing) working dir.
+ * config.comfyuiPath as a spawn cwd — only when it is an ABSOLUTE path to an
+ * existing DIRECTORY. A stale, relative, or nonexistent COMFYUI_PATH passed as
+ * cwd would ENOENT the spawn after the server was already stopped (#711), and
+ * a path that resolves to a regular FILE fails the same way (ENOTDIR) — both
+ * recreate the lost-server failure this guard exists to prevent (codex gate).
+ * Callers then omit cwd and the child inherits this process's (existing)
+ * working dir.
  */
 function configuredInstallCwd(): string | undefined {
-  return config.comfyuiPath &&
-    isAbsolute(config.comfyuiPath) &&
-    fileExists(config.comfyuiPath)
-    ? config.comfyuiPath
-    : undefined;
+  if (!config.comfyuiPath || !isAbsolute(config.comfyuiPath)) return undefined;
+  try {
+    return statSync(config.comfyuiPath).isDirectory()
+      ? config.comfyuiPath
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
