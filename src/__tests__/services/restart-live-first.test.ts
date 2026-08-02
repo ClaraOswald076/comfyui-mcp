@@ -126,7 +126,8 @@ function mockLivePortThenFree(): { killed: () => boolean } {
     }
     if (/lsof/i.test(cmd)) {
       if (killed) throw new Error("not listening");
-      return "4321";
+      // `lsof -nP -iTCP:PORT -sTCP:LISTEN -Fpn` field output: p<pid> / n<addr:port>.
+      return "p4321\nn127.0.0.1:8188\n";
     }
     return "";
   });

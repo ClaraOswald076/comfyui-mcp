@@ -317,7 +317,8 @@ describe("process-control crash supervision", () => {
         if (portCheckCalls === 3) {
           if (cmd.includes("netstat"))
             return "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
-          return "4321";
+          // `lsof -nP -iTCP:PORT -sTCP:LISTEN -Fpn` field output: p<pid> / n<addr:port>.
+          return "p4321\nn127.0.0.1:8188\n";
         }
         throw new Error("not listening");
       }
@@ -394,7 +395,8 @@ describe("process-control restart relaunch preflight (#368/#370)", () => {
     mockExecSync.mockImplementation((cmd: string) => {
       if (cmd.includes("netstat"))
         return "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
-      if (cmd.includes("lsof")) return "4321";
+      // `lsof -nP -iTCP:PORT -sTCP:LISTEN -Fpn` field output: p<pid> / n<addr:port>.
+      if (cmd.includes("lsof")) return "p4321\nn127.0.0.1:8188\n";
       // tasklist (desktop detection), taskkill, `if exist`, etc. → nothing found
       return "";
     });
