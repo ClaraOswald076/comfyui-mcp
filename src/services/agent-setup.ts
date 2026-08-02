@@ -58,7 +58,9 @@ export function defaultCompact(agent: AgentName): boolean {
 }
 
 function serverArgs(compact: boolean): string[] {
-  return compact ? ["-y", "comfyui-mcp", "--compact"] : ["-y", "comfyui-mcp"];
+  // Explicit on BOTH sides: bare `npx comfyui-mcp` means compact since #667,
+  // so a full-mode entry must pin --full to survive the default flip.
+  return compact ? ["-y", "comfyui-mcp", "--compact"] : ["-y", "comfyui-mcp", "--full"];
 }
 
 function buildEntry(agent: AgentName, compact: boolean, comfyuiUrl?: string): Record<string, unknown> {

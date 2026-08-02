@@ -29,10 +29,11 @@ models (below) generally keep tool calling and drop the rest.
 
 ## Compact tool mode
 
-The full surface is 169 tools with rich JSON schemas. Most non-Claude
-harnesses inject every registered schema straight into the model's context —
-fine for frontier models, fatal for a 4B local one. **Compact tool mode**
-registers exactly **three meta-tools** and keeps the real catalog behind them:
+The full surface is 169 tools with rich JSON schemas (~200 KB, roughly 50k
+tokens, per `tools/list`). Most non-Claude harnesses inject every registered
+schema straight into the model's context — fine for frontier models, fatal
+for a 4B local one. **Compact tool mode** registers exactly **three
+meta-tools** and keeps the real catalog behind them:
 
 | Meta-tool | What it does |
 | --- | --- |
@@ -47,7 +48,8 @@ string, common field aliases (`tool_name`, `arguments`) are accepted, and
 validation errors come back with the expected schema so the model can
 self-correct instead of dying on an opaque protocol error.
 
-Enable it with either (the flag wins):
+Compact is the **default** — no flags needed. The opt-ins below are only
+needed to force a mode explicitly (the flag wins over the env var):
 
 ```bash
 npx -y comfyui-mcp --compact
@@ -55,8 +57,10 @@ npx -y comfyui-mcp --compact
 COMFYUI_MCP_TOOL_MODE=compact npx -y comfyui-mcp
 ```
 
-`--full` / `--tool-mode full` (default) keeps the classic full-schema surface —
-nothing changes for Claude Code / Cursor / Claude Desktop users.
+`--full` / `--tool-mode full` / `COMFYUI_MCP_TOOL_MODE=full` opts back into
+the classic full-schema surface — right for frontier-model harnesses
+(Claude Code / Cursor / Claude Desktop) whose clients handle large tool
+lists well.
 
 ## One-command setup
 

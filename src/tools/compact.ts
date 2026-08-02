@@ -73,11 +73,13 @@ export function buildManifest(
 }
 
 /**
- * Compact tool mode (COMFYUI_MCP_TOOL_MODE=compact / --compact): registers
- * exactly three meta-tools backed by the captured catalog, instead of the full
- * ~200-tool surface. Built for small/local models (Hermes Agent, Ollama, any
- * MCP client on a non-frontier LLM) where 200 JSON schemas blow the context
- * budget — see issue #97.
+ * Compact tool mode — the DEFAULT registration (since #667; --full /
+ * COMFYUI_MCP_TOOL_MODE=full opts out): registers exactly three meta-tools
+ * backed by the captured catalog, instead of the full ~200-tool surface.
+ * Built for small/local models (Hermes Agent, Ollama, any MCP client on a
+ * non-frontier LLM) where 200 JSON schemas blow the context budget — see
+ * issue #97 — and the right default everywhere: the full surface costs a
+ * client ~200KB (~50k tokens) per tools/list.
  */
 export function registerCompactTools(
   server: McpServer,

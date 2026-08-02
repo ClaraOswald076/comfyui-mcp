@@ -669,10 +669,11 @@ doesn't work). Thinking and vision are strongly recommended — without
 thinking, multi-step tool chains degrade; without vision the agent can
 generate but can't see its own outputs.
 
-For small/local models, **compact tool mode** (`--compact` /
-`COMFYUI_MCP_TOOL_MODE=compact`) registers 3 meta-tools
+**Compact tool mode is the default**: the server registers 3 meta-tools
 (`list_tools` → `describe_tool` → `call_tool`) instead of the full ~200-schema
-surface, pulling schemas into context one tool at a time. **Run it locally
+surface (~200 KB / ~50k tokens per `tools/list`), pulling schemas into context
+one tool at a time. Frontier-model harnesses opt back into the full surface
+with `--full` / `COMFYUI_MCP_TOOL_MODE=full`. **Run it locally
 for free with our fine-tuned models**: `ollama pull artokun/gemma4-comfyui-mcp:e4b`
 (also `:e2b` for ~2 GB VRAM, `:12b` for ~8 GB) — Gemma 4 QLoRA-trained on 1,055
 server-verified trajectories over the full comfyui-mcp tool surface, and the
@@ -685,7 +686,7 @@ per-harness setup, troubleshooting:
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
 | `setup <agent>` | | | Write the comfyui entry into hermes / openclaw / copilot config, then exit |
-| `--compact` / `--tool-mode compact` | `COMFYUI_MCP_TOOL_MODE=compact` | `full` | Register 3 meta-tools instead of the full ~200-schema surface |
+| `--full` / `--tool-mode full` | `COMFYUI_MCP_TOOL_MODE=full` | `compact` | Opt into the full ~200-schema surface; the default compact mode registers 3 meta-tools instead |
 
 ### Other agents & local LLMs (Hermes, OpenClaw, Copilot CLI, Ollama)
 
@@ -705,10 +706,11 @@ doesn't work). Thinking and vision are strongly recommended — without
 thinking, multi-step tool chains degrade; without vision the agent can
 generate but can't see its own outputs.
 
-For small/local models, **compact tool mode** (`--compact` /
-`COMFYUI_MCP_TOOL_MODE=compact`) registers 3 meta-tools
+**Compact tool mode is the default**: the server registers 3 meta-tools
 (`list_tools` → `describe_tool` → `call_tool`) instead of the full ~200-schema
-surface, pulling schemas into context one tool at a time. **Run it locally
+surface (~200 KB / ~50k tokens per `tools/list`), pulling schemas into context
+one tool at a time. Frontier-model harnesses opt back into the full surface
+with `--full` / `COMFYUI_MCP_TOOL_MODE=full`. **Run it locally
 for free with our fine-tuned models**: `ollama pull artokun/gemma4-comfyui-mcp:e4b`
 (also `:e2b` for ~2 GB VRAM, `:12b` for ~8 GB) — Gemma 4 QLoRA-trained on 1,055
 server-verified trajectories over the full comfyui-mcp tool surface, and the
@@ -721,7 +723,7 @@ per-harness setup, troubleshooting:
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
 | `setup <agent>` | | | Write the comfyui entry into hermes / openclaw / copilot config, then exit |
-| `--compact` / `--tool-mode compact` | `COMFYUI_MCP_TOOL_MODE=compact` | `full` | Register 3 meta-tools instead of the full ~200-schema surface |
+| `--full` / `--tool-mode full` | `COMFYUI_MCP_TOOL_MODE=full` | `compact` | Opt into the full ~200-schema surface; the default compact mode registers 3 meta-tools instead |
 
 ### Remote ComfyUI
 

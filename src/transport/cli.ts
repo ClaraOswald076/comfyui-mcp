@@ -5,10 +5,12 @@ export type ToolMode = "full" | "compact";
 
 export interface CliOptions {
   transport: TransportMode;
-  /** --compact / --tool-mode compact / COMFYUI_MCP_TOOL_MODE=compact: register
-   *  only the list_tools/describe_tool/call_tool meta-tools instead of the full
-   *  ~200-schema surface — for small/local LLMs (Hermes Agent, Ollama). "full"
-   *  (default) keeps the existing behavior. */
+  /** --compact / --tool-mode compact / COMFYUI_MCP_TOOL_MODE=compact (DEFAULT,
+   *  #667): register only the list_tools/describe_tool/call_tool meta-tools
+   *  instead of the full ~200-schema surface — the full surface costs a client
+   *  ~200KB (~50k tokens) per tools/list, which harnesses that inject schemas
+   *  into context pay on every read. --full / COMFYUI_MCP_TOOL_MODE=full opts
+   *  back into the classic surface (frontier-model harnesses). */
   toolMode: ToolMode;
   host: string;
   port: number;
@@ -67,7 +69,7 @@ export function parseCliArgs(
   const args = argv.slice(2);
 
   let transport: TransportMode = env.MCP_TRANSPORT === "http" ? "http" : "stdio";
-  let toolMode: ToolMode = env.COMFYUI_MCP_TOOL_MODE === "compact" ? "compact" : "full";
+  let toolMode: ToolMode = env.COMFYUI_MCP_TOOL_MODE === "full" ? "full" : "compact";
   let host = env.MCP_HOST ?? DEFAULT_HOST;
   let port = env.MCP_PORT ? Number(env.MCP_PORT) : DEFAULT_PORT;
   let panelOrchestrator =
@@ -82,7 +84,8 @@ export function parseCliArgs(
   let comfyuiUrl: string | undefined;
   let setupAgent: string | undefined;
   let setupDryRun = false;
-  let toolModeExplicit = env.COMFYUI_MCP_TOOL_MODE === "compact";
+  let toolModeExplicit =
+    env.COMFYUI_MCP_TOOL_MODE === "compact" || env.COMFYUI_MCP_TOOL_MODE === "full";
 
   const valueOf = (current: string, inline: string, i: number): [string, number] => {
     if (current.includes("=")) return [current.slice(current.indexOf("=") + 1), i];
@@ -139,7 +142,7 @@ export function parseCliArgs(
       toolModeExplicit = true;
     } else if (a === "--tool-mode" || a.startsWith("--tool-mode=")) {
       const [v, ni] = valueOf(a, "--tool-mode", i);
-      toolMode = v === "compact" ? "compact" : "full";
+      toolMode = v === "full" ? "full" : "compact";
       toolModeExplicit = true;
       i = ni;
     } else if (a === "setup") {

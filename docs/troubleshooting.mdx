@@ -176,9 +176,10 @@ stdio mode (the default, what MCP clients use) needs none of this.
   arena; `:e4b` remains the sweet spot).
 - **gemma3 has no native tool calling in Ollama** — unsupported; use
   our fine-tune above, stock `gemma4` (e4b+), `qwen3`, or `llama3.1+`.
-- Make sure [compact tool mode](/local-llms) is on for small models
-  (`--compact`) — ~200 full schemas overflow small contexts and the model
-  starts hallucinating tool names.
+- Make sure [compact tool mode](/local-llms) is on for small models —
+  it's the default, so this only bites if you opted into `--full`: ~200 full
+  schemas overflow small contexts and the model starts hallucinating tool
+  names.
 - Cold model loads can take 30s+ before the first token — the panel's
   watchdog accounts for this, but a request that dies instantly usually
   means the model tag isn't pulled (`ollama pull <tag>`).
