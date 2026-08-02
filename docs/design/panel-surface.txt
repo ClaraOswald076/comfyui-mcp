@@ -19,6 +19,7 @@ panel_create_group
 panel_create_subgraph
 panel_disable_adult_mode
 panel_disconnect
+panel_edit_node
 panel_edit_group
 panel_enter_subgraph
 panel_exit_subgraph

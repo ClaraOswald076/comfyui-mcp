@@ -11,6 +11,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { z } from "zod";
 import { getNsfwConsent, setNsfwConsent } from "../../services/panel-settings.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
@@ -273,7 +274,7 @@ describe("panel-tools: panel_set_node_mode (bypass/mute/active)", () => {
     expect(force.safeParse(undefined).success).toBe(true);
   });
 
-  it("forwards graph_set_node_mode with node_id + mode (+ force)", async () => {
+  it("preserves graph_set_node_mode for panels that predate graph_edit_node", async () => {
     const { ctx, calls } = makeFakeCtx();
     await defByName("panel_set_node_mode").handler({ node_id: 143, mode: "bypass", force: true }, ctx);
     expect(calls[0]).toMatchObject({
@@ -282,6 +283,135 @@ describe("panel-tools: panel_set_node_mode (bypass/mute/active)", () => {
       mode: "bypass",
       force: true,
     });
+  });
+});
+
+describe("panel-tools: panel_edit_node (#572 presentation consolidation)", () => {
+  it("is the shared core editor while compatibility names remain registered", () => {
+    const names = buildPanelToolDefs().map((d) => d.name);
+    expect(names).toContain("panel_edit_node");
+    expect(names).toContain("panel_set_node_mode");
+    for (const compatibility of [
+      "panel_move_node",
+      "panel_resize_node",
+      "panel_set_node_title",
+      "panel_set_node_collapsed",
+      "panel_set_node_color",
+    ]) {
+      expect(names).toContain(compatibility);
+    }
+  });
+
+  it("uses a flat schema with guarded presentation fields", () => {
+    const def = defByName("panel_edit_node");
+    expect(Object.keys(def.schema).sort()).toEqual([
+      "bgcolor",
+      "collapsed",
+      "color",
+      "force",
+      "mode",
+      "node_id",
+      "node_ids",
+      "pinned",
+      "pos",
+      "preset",
+      "shape",
+      "size",
+      "title",
+    ]);
+    const color = def.schema.color as { safeParse: (v: unknown) => { success: boolean } };
+    const size = def.schema.size as { safeParse: (v: unknown) => { success: boolean } };
+    expect(color.safeParse("#abc").success).toBe(true);
+    expect(color.safeParse("#abcd").success).toBe(true);
+    expect(color.safeParse("#aabbcc").success).toBe(true);
+    expect(color.safeParse("#aabbccdd").success).toBe(true);
+    expect(color.safeParse("#12345").success).toBe(false);
+    expect(color.safeParse("#1234567").success).toBe(false);
+    expect(color.safeParse("rgb(1,2,3)").success).toBe(false);
+    expect(size.safeParse([120, 80]).success).toBe(true);
+    expect(size.safeParse([0, 80]).success).toBe(false);
+    expect(size.safeParse([120]).success).toBe(false);
+    expect(size.safeParse([120, 80, 60]).success).toBe(false);
+  });
+
+  it("forwards every supplied field to the single graph_edit_node bridge command", async () => {
+    const { ctx, calls } = makeFakeCtx();
+    await defByName("panel_edit_node").handler(
+      { node_ids: [7, 8], pos: [20, 30], size: [400, 200], title: "Loaders", color: "#336699", pinned: true, mode: "bypass", force: true },
+      ctx,
+    );
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      cmd: "graph_edit_node",
+      node_ids: [7, 8],
+      pos: [20, 30],
+      size: [400, 200],
+      title: "Loaders",
+      color: "#336699",
+      pinned: true,
+      mode: "bypass",
+      force: true,
+    });
+  });
+
+  it.each([
+    [{ pos: [1, 2] }, "exactly one of node_id or node_ids"],
+    [{ node_id: 7, node_ids: [8], pos: [1, 2] }, "exactly one of node_id or node_ids"],
+    [{ node_id: 7 }, "at least one editable field"],
+    [{ node_id: 7, preset: "red", color: "#112233" }, "preset cannot be combined"],
+  ])("rejects invalid cross-field input before dispatch: %o", async (args, expected) => {
+    const { ctx, calls } = makeFakeCtx();
+    const result = await defByName("panel_edit_node").handler(args, ctx);
+    expect(calls).toHaveLength(0);
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain(expected);
+  });
+
+  it.each([
+    ["panel_move_node", { node_id: 7, pos: [1, 2] }, "graph_move_node"],
+    ["panel_resize_node", { node_id: 7, size: [120, 80] }, "graph_resize_node"],
+    ["panel_set_node_title", { node_id: 7, title: "Title" }, "graph_set_title"],
+    ["panel_set_node_collapsed", { node_id: 7, collapsed: false }, "graph_set_node_collapsed"],
+    ["panel_set_node_color", { node_id: 7, color: "#112233" }, "graph_set_node_color"],
+  ])("keeps %s on its legacy bridge command for old panels", async (name, args, command) => {
+    const { ctx, calls } = makeFakeCtx();
+    await defByName(name).handler(args, ctx);
+    expect(calls[0]).toMatchObject({ cmd: command, node_id: 7 });
+  });
+
+  it("keeps the legacy title command on its 15s mutation timeout", async () => {
+    const { ctx, timeouts } = makeFakeCtx();
+    await defByName("panel_set_node_title").handler({ node_id: 7, title: "Title" }, ctx);
+    expect(timeouts[0]).toBe(15_000);
+  });
+
+  it("preserves CSS colors and preset-wins semantics on the legacy color wrapper", async () => {
+    const { ctx, calls } = makeFakeCtx();
+    await defByName("panel_set_node_color").handler({ node_id: 7, preset: "red", color: "orange", bgcolor: "rebeccapurple" }, ctx);
+    expect(calls).toEqual([
+      { cmd: "graph_set_node_color", node_id: 7, preset: "red", color: "orange", bgcolor: "rebeccapurple" },
+    ]);
+  });
+
+  it("keeps arbitrary CSS color strings and null clears valid for legacy callers", () => {
+    const color = defByName("panel_set_node_color").schema.color as { safeParse: (v: unknown) => { success: boolean } };
+    const preset = defByName("panel_set_node_color").schema.preset as { safeParse: (v: unknown) => { success: boolean } };
+    expect(color.safeParse("red").success).toBe(true);
+    expect(color.safeParse("rgb(1, 2, 3)").success).toBe(true);
+    expect(color.safeParse("#12345").success).toBe(true);
+    expect(color.safeParse(null).success).toBe(true);
+    expect(preset.safeParse(null).success).toBe(true);
+  });
+
+  it("exports editor and legacy resize sizes as Codex-compatible homogeneous arrays", () => {
+    for (const name of ["panel_edit_node", "panel_resize_node"]) {
+      const def = defByName(name);
+      const schema = z.toJSONSchema(z.object(def.schema), { reused: "inline", io: "input" }) as {
+        properties?: Record<string, { type?: string; minItems?: number; maxItems?: number; items?: { type?: string } }>;
+      };
+      const size = schema.properties?.size;
+      expect(size).toMatchObject({ type: "array", minItems: 2, maxItems: 2, items: { type: "number" } });
+    }
   });
 });
 

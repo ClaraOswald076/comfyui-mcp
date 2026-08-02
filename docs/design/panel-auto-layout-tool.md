@@ -6,11 +6,11 @@
 
 ## Motivation
 
-Agents fix layouts today with dozens of `panel_move_node` round-trips. The panel gains a `graph_auto_layout` bridge command (see paired RFC); this tool exposes it to the agent.
+Agents can make targeted layout adjustments with `panel_edit_node`; auto-layout avoids dozens of individual round-trips. The panel gains a `graph_auto_layout` bridge command (see paired RFC); this tool exposes it to the agent.
 
 ## Tool API
 
-Added to `buildPanelToolDefs()` in `src/orchestrator/panel-tools.ts`, right after `panel_move_node` (~line 631) — both transports (Claude in-process SDK server + Codex HTTP MCP) pick it up automatically:
+Added to `buildPanelToolDefs()` in `src/orchestrator/panel-tools.ts` — both transports (Claude in-process SDK server + Codex HTTP MCP) pick it up automatically:
 
 ```ts
 def(
@@ -39,7 +39,7 @@ Result/error shapes are defined by the paired RFC (`{applied, columns, moved[], 
 
 ## Gating
 
-Ships ungated, exactly like the other mutating panel tools today (`panel_move_node`, `panel_add_node`, …). Safety gates were closed as won't-do (issue #168; spec PR #172 closed, design archived under ROADMAP Theme G).
+Ships ungated, exactly like the other mutating panel tools today (`panel_edit_node`, `panel_add_node`, …). Safety gates were closed as won't-do (issue #168; spec PR #172 closed, design archived under ROADMAP Theme G).
 
 ## Implementation plan
 

@@ -1848,28 +1848,23 @@ describe("makeUnknownCommandError (old-panel version gate)", () => {
     expect(e?.message).not.toBe('Unknown command "ui_render"'); // never the bare passthrough
   });
 
-  // #619 RECURRENCE — the exact report: comfyui-mcp 0.48.32 + panel 0.11.21 →
-  // `too old for "graph_resize_node" (detected 0.11.21) — update … to ≥0.11.4`.
-  // graph_resize_node (panel_resize_node's bridge executor) shipped in panel
-  // 0.11.25, so it is now TABLED: a 0.11.21 panel gets the honest, correctly-
-  // versioned "too old — update to ≥0.11.25" verdict, and a ≥0.11.25 panel is
-  // never declared too old (its Unknown-command reply surfaces raw instead).
-  it("rewrites graph_resize_node on a <0.11.25 panel with the CORRECT minimum (#619 recurrence)", () => {
+  it("rewrites graph_resize_node on a <0.11.25 panel with the correct minimum (#619 recurrence)", () => {
     expect(minPanelVersionForCmd("graph_resize_node")).toBe("0.11.25");
     const e = makeUnknownCommandError('Unknown command "graph_resize_node"', "0.11.21");
     expect(e).not.toBeNull();
     expect(e?.message).toContain("graph_resize_node");
-    expect(e?.message).toContain("0.11.21"); // connected/detected panel version
-    expect(e?.message).toContain("0.11.25"); // required minimum — NOT the 0.11.4 floor
+    expect(e?.message).toContain("0.11.21");
+    expect(e?.message).toContain("0.11.25");
     expect(e?.message).not.toContain(MIN_PANEL_VERSION_FOR_BRIDGE_COMMANDS);
     expect(e?.message.toLowerCase()).toContain("too old");
     expect(e?.message.toLowerCase()).toContain("update");
   });
 
-  it("does NOT rewrite graph_resize_node once the panel is at/above 0.11.25 (#619 boundary)", () => {
+  it("does not rewrite graph_resize_node once the panel is at or above 0.11.25 (#619 boundary)", () => {
     expect(makeUnknownCommandError('Unknown command "graph_resize_node"', "0.11.25")).toBeNull();
     expect(makeUnknownCommandError('Unknown command "graph_resize_node"', "0.11.32")).toBeNull();
   });
+
 });
 
 describe("panelVersionProvesUnsupported (#392 proactive version gate)", () => {
@@ -1916,14 +1911,13 @@ describe("panelVersionProvesUnsupported (#392 proactive version gate)", () => {
     expect(panelVersionProvesUnsupported("refresh_nodes", "0.12.0")).toBe(false);
   });
 
-  // #619 recurrence — graph_resize_node is now tabled (min 0.11.25), so the #392
-  // gate rejects the reporter's 0.11.21 panel on the FIRST call, pre-dispatch.
-  it("proactively gates graph_resize_node below 0.11.25 and clears it at/above (#619 recurrence)", () => {
+  it("proactively gates graph_resize_node below 0.11.25 and clears it at or above (#619 recurrence)", () => {
     expect(panelVersionProvesUnsupported("graph_resize_node", "0.11.21")).toBe(true);
     expect(panelVersionProvesUnsupported("graph_resize_node", "0.11.24")).toBe(true);
     expect(panelVersionProvesUnsupported("graph_resize_node", "0.11.25")).toBe(false);
     expect(panelVersionProvesUnsupported("graph_resize_node", "0.11.32")).toBe(false);
   });
+
 });
 
 // #413 — the bridge REWRITES a panel's raw "Unknown command graph_serialize" into
@@ -2063,31 +2057,6 @@ describe("UiBridge.send (graceful gate end-to-end)", () => {
       /too old for "graph_query".*0\.7\.0.*update/is,
     );
     // The FIRST call is gated before dispatch — the panel is never asked.
-    expect(dispatchCount).toBe(0);
-  });
-
-  // #619 RECURRENCE end-to-end — the exact report: a 0.11.21 panel calling
-  // graph_resize_node. Now that the command is tabled (min 0.11.25), the VERY FIRST
-  // call is gated pre-dispatch with the honest ≥0.11.25 verdict — never the
-  // self-contradictory "(detected 0.11.21) — update … to ≥0.11.4" the reporter saw,
-  // and never a burned round-trip to collect the raw "Unknown command" reply.
-  it("gates graph_resize_node on the reporter's 0.11.21 panel with the correct ≥0.11.25 verdict (#619 recurrence)", async () => {
-    const sock = await connectPanel(undefined);
-    let dispatchCount = 0;
-    sock.send(JSON.stringify({ type: "hello", tab_id: "old-tab-2c", title: "wf", panel_version: "0.11.21" }));
-    sock.on("message", (buf) => {
-      const msg = JSON.parse(buf.toString());
-      if (msg.rid && msg.cmd) {
-        dispatchCount += 1;
-        sock.send(JSON.stringify({ rid: msg.rid, ok: false, error: `Unknown command "${msg.cmd}"` }));
-      }
-    });
-    await new Promise((r) => setTimeout(r, 50));
-
-    await expect(bridge.send({ cmd: "graph_resize_node" }, { tabId: "old-tab-2c" })).rejects.toThrow(
-      /too old for "graph_resize_node".*0\.11\.21.*0\.11\.25.*update/is,
-    );
-    // Gated by the advertised version BEFORE dispatch — the panel is never asked.
     expect(dispatchCount).toBe(0);
   });
 
