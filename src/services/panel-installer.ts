@@ -1270,7 +1270,7 @@ export function runPanelAction(
   return withPanelOpLock(() => runPanelActionInner(action, deps, opts));
 }
 
-async function runPanelActionInner(
+export async function runPanelActionInner(
   action: "install" | "update" | "reinstall",
   deps: PanelInstallerDeps,
   opts: PanelActionOptions = {},

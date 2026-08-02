@@ -26,6 +26,8 @@
 import {
   panelStatus,
   runPanelAction,
+  runPanelActionInner,
+  withPanelOpLock,
   defaultDeps,
   type PanelInstallerDeps,
   type PanelStatus,
@@ -425,89 +427,96 @@ export async function performPanelSync(
   opts: PerformSyncOptions = {},
 ): Promise<PanelSyncResult> {
   const deps = opts.deps ?? defaultDeps;
-  const before = await panelStatus(deps);
-  const assessment = evaluatePanelSync(before, {
-    orchestratorVersion: opts.orchestratorVersion,
-    requiredVersion: opts.requiredVersion,
-  });
+  // The status read, the DECISION, and the mutation all run inside the op
+  // lock: a decision made outside could go stale before the lock is acquired,
+  // and a newer panel installed in that gap would be blindly overwritten by
+  // the stale decision (codex gate). runPanelAction's own wrapper would lock
+  // only the mutation half, so this calls the inner action directly.
+  return withPanelOpLock(async () => {
+    const before = await panelStatus(deps);
+    const assessment = evaluatePanelSync(before, {
+      orchestratorVersion: opts.orchestratorVersion,
+      requiredVersion: opts.requiredVersion,
+    });
 
-  if (assessment.decision !== "sync") {
+    if (assessment.decision !== "sync") {
+      return {
+        synced: false,
+        decision: assessment.decision,
+        previousVersion: before.installedVersion,
+        requiredPanelVersion: assessment.requiredPanelVersion,
+        message: assessment.summary,
+      };
+    }
+
+    // `update` refreshes an existing pack; `install` is for a pack that isn't
+    // there. Both go through the same verified path and both fail closed.
+    const action = before.installed ? "update" : "install";
+    const result = await runPanelActionInner(action, deps);
+
+    // Re-read from disk. `runPanelAction` already proved movement, but the version
+    // we hand back to the user must be one we OBSERVED after the fact, not the one
+    // the installer intended or reported.
+    const after = await panelStatus(deps);
+    if (!after.installed || !after.installedVersion) {
+      throw new Error(
+        `Panel ${action} reported success, but re-reading the pack afterwards could ` +
+          `not confirm an installed version${after.dir ? ` at ${after.dir}` : ""}. NOT ` +
+          `reporting a completed sync. Check custom_nodes and re-run ` +
+          `install_panel(action='status').`,
+      );
+    }
+    if (after.shadows.length > 0) {
+      throw new Error(
+        `Panel ${action} applied on disk, but ${after.shadows.length} shadow copy/copies ` +
+          `(${after.shadows.map((s) => `"${s.name}"`).join(", ")}) are still served from ` +
+          `custom_nodes, so the browser may keep loading the OLD panel. NOT reporting a ` +
+          `completed sync: move them out of custom_nodes and hard-refresh the ComfyUI tab.`,
+      );
+    }
+    // A shadow scan that could not RUN is not a clean scan. `shadows: []` from a
+    // failed enumeration would otherwise read as an all-clear here exactly as it
+    // did in the pre-mutation assessment — the same fail-open, one step later.
+    if (after.shadowInspectFailed) {
+      throw new Error(
+        `Panel ${action} applied on disk (now ${after.installedVersion}), but custom_nodes ` +
+          `could not be enumerated afterwards to check for shadow copies, so it cannot be ` +
+          `confirmed that the browser will load THIS panel rather than a stray ` +
+          `".comfyui-agent-panel.bak-*". NOT reporting a completed sync — re-run ` +
+          `install_panel(action='status') once custom_nodes is readable.`,
+      );
+    }
+
+    // Tri-state: `null` when the landed version can't be compared at all.
+    const stillBehind: boolean | null = isComparableVersion(after.installedVersion)
+      ? compareSemver(after.installedVersion, assessment.requiredPanelVersion) < 0
+      : null;
+
+    const gapNote =
+      stillBehind === true
+        ? `NOTE: that is still below the ${assessment.requiredPanelVersion} this ` +
+          `orchestrator expects — the update applied but did not close the gap. `
+        : stillBehind === null
+          ? `NOTE: "${after.installedVersion}" is not a comparable version number, so ` +
+            `whether it meets the ${assessment.requiredPanelVersion} this orchestrator ` +
+            `expects could NOT be confirmed — the update applied, the version match did ` +
+            `not. `
+          : ``;
+
     return {
-      synced: false,
-      decision: assessment.decision,
-      previousVersion: before.installedVersion,
+      synced: true,
+      decision: "sync",
+      previousVersion: result.previousVersion ?? before.installedVersion,
+      verifiedVersion: after.installedVersion,
       requiredPanelVersion: assessment.requiredPanelVersion,
-      message: assessment.summary,
+      stillBehind,
+      restartRequired: true,
+      message:
+        `Panel synced: verified on disk as ${after.installedVersion}` +
+        (result.previousVersion ? ` (was ${result.previousVersion})` : ``) +
+        `. ` +
+        gapNote +
+        `RESTART ComfyUI to load it.`,
     };
-  }
-
-  // `update` refreshes an existing pack; `install` is for a pack that isn't
-  // there. Both go through the same verified path and both fail closed.
-  const action = before.installed ? "update" : "install";
-  const result = await runPanelAction(action, deps);
-
-  // Re-read from disk. `runPanelAction` already proved movement, but the version
-  // we hand back to the user must be one we OBSERVED after the fact, not the one
-  // the installer intended or reported.
-  const after = await panelStatus(deps);
-  if (!after.installed || !after.installedVersion) {
-    throw new Error(
-      `Panel ${action} reported success, but re-reading the pack afterwards could ` +
-        `not confirm an installed version${after.dir ? ` at ${after.dir}` : ""}. NOT ` +
-        `reporting a completed sync. Check custom_nodes and re-run ` +
-        `install_panel(action='status').`,
-    );
-  }
-  if (after.shadows.length > 0) {
-    throw new Error(
-      `Panel ${action} applied on disk, but ${after.shadows.length} shadow copy/copies ` +
-        `(${after.shadows.map((s) => `"${s.name}"`).join(", ")}) are still served from ` +
-        `custom_nodes, so the browser may keep loading the OLD panel. NOT reporting a ` +
-        `completed sync: move them out of custom_nodes and hard-refresh the ComfyUI tab.`,
-    );
-  }
-  // A shadow scan that could not RUN is not a clean scan. `shadows: []` from a
-  // failed enumeration would otherwise read as an all-clear here exactly as it
-  // did in the pre-mutation assessment — the same fail-open, one step later.
-  if (after.shadowInspectFailed) {
-    throw new Error(
-      `Panel ${action} applied on disk (now ${after.installedVersion}), but custom_nodes ` +
-        `could not be enumerated afterwards to check for shadow copies, so it cannot be ` +
-        `confirmed that the browser will load THIS panel rather than a stray ` +
-        `".comfyui-agent-panel.bak-*". NOT reporting a completed sync — re-run ` +
-        `install_panel(action='status') once custom_nodes is readable.`,
-    );
-  }
-
-  // Tri-state: `null` when the landed version can't be compared at all.
-  const stillBehind: boolean | null = isComparableVersion(after.installedVersion)
-    ? compareSemver(after.installedVersion, assessment.requiredPanelVersion) < 0
-    : null;
-
-  const gapNote =
-    stillBehind === true
-      ? `NOTE: that is still below the ${assessment.requiredPanelVersion} this ` +
-        `orchestrator expects — the update applied but did not close the gap. `
-      : stillBehind === null
-        ? `NOTE: "${after.installedVersion}" is not a comparable version number, so ` +
-          `whether it meets the ${assessment.requiredPanelVersion} this orchestrator ` +
-          `expects could NOT be confirmed — the update applied, the version match did ` +
-          `not. `
-        : ``;
-
-  return {
-    synced: true,
-    decision: "sync",
-    previousVersion: result.previousVersion ?? before.installedVersion,
-    verifiedVersion: after.installedVersion,
-    requiredPanelVersion: assessment.requiredPanelVersion,
-    stillBehind,
-    restartRequired: true,
-    message:
-      `Panel synced: verified on disk as ${after.installedVersion}` +
-      (result.previousVersion ? ` (was ${result.previousVersion})` : ``) +
-      `. ` +
-      gapNote +
-      `RESTART ComfyUI to load it.`,
-  };
+  });
 }
