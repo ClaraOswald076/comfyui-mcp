@@ -4,322 +4,106 @@ description: "Drive the official comfy-cli — managed server lifecycle, jobs, l
 icon: "terminal"
 ---
 
-<Info>8 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
+<Info>1 tool. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
 
-## comfy_cli_status
+## comfy_cli
 
-Inspect the official comfy-cli integration and selected ComfyUI environment. Uses `comfy which` or `comfy env` with the envelope/1 JSON contract. Call this before local CLI operations when workspace or server routing is uncertain.
-
-### Parameters
-
-<ParamField path="detail" type="enum" default="env">
-  Options: `version`, `which`, `env`, `discover`.
-</ParamField>
-<ParamField path="workspace" type="string">
-  Optional ComfyUI workspace override. Otherwise COMFYUI_PATH/auto-detection is used.
-</ParamField>
-
-### Example
-
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
-
-```json
-{
-  "tool": "comfy_cli_status",
-  "arguments": {}
-}
-```
-
----
-
-## comfy_cli_server
-
-Start, stop, or restart a local ComfyUI through official comfy-cli background process management. Restart performs `comfy stop` followed by `comfy launch --background`. Use comfy_cli_status(detail='env') to inspect the managed server.
+Drive the official comfy-cli (envelope/1 JSON contract) for the selected ComfyUI environment. The MCP resolves `comfy` from COMFY_CLI_PATH, PATH, or the selected workspace's .venv/venv. Driven by the `action` parameter: - action:"status" — Inspect the comfy-cli integration and selected environment (`comfy which` / `comfy env`); `detail` selects version/which/env/discover (default env). Call this before local CLI operations when workspace or server routing is uncertain. - action:"server_start" / "server_stop" / "server_restart" — Manage a local ComfyUI through comfy-cli background process management. Restart performs `comfy stop` followed by `comfy launch --background`; extra launch arguments go in `launchArgs`. - action:"jobs_list" — List local or Comfy Cloud jobs (`limit` optional). Local jobs include CLI-tracked async submissions plus the ComfyUI queue/history. - action:"jobs_status" / "jobs_watch" / "jobs_cancel" — Inspect, watch, or cancel one job; `promptId` required. - action:"jobs_wait" — Wait for jobs: one of `promptId`, `promptIds`, or all=true is required; `timeoutSeconds` optional. - action:"search_nodes" — Fuzzy-search actual ComfyUI node classes by name, display name, or description using `comfy nodes search`; `query` required. Complements search_custom_nodes, which searches installable node packs. Works locally, in Comfy Cloud, or offline with `objectInfoPath`. When comfy-cli is not installed/on PATH and the target is the connected (local) server, falls back to fuzzy-searching that server's live /object_info — so installed-node discovery works without the CLI. - action:"workflow_validate" — Validate an API/UI workflow file (class types, inputs, enums, edge wiring) without submission; `workflowPath` required. - action:"workflow_run" — Submit an API/UI workflow file (`workflowPath` required). Asynchronous by default; set wait=true to await outputs (`timeoutSeconds`). - action:"transfer_upload" — Upload input files (`files` required) for local ComfyUI or Comfy Cloud; overwrite=false passes --no-overwrite. - action:"transfer_download" — Download completed outputs for `promptId` (required); `outDir` and `urlOnly` optional. - action:"models_list_folders" / "models_list_folder" / "models_search" / "models_show" — Discover model folders/files locally or in Comfy Cloud (`folder` required for list_folder, `name` for show). When comfy-cli is not installed/on PATH and the target is the connected (local) server, these read-only listings fall back to that server's own local models (via /models) — so model discovery works without the CLI. - action:"models_download" — Download a model `url` (required) into the workspace (`relativePath`, default models/checkpoints). A download can run for many minutes and is gated on an idle-liveness timeout, so a progressing download is never killed. - action:"models_remove" — Remove workspace model files (`modelNames` required; `relativePath` optional). - action:"skills_list" / "skills_show" / "skills_validate" / "skills_install" / "skills_status" / "skills_uninstall" — Manage the official comfy-cli bundled agent skills (comfy, fragments, debug, relay, director). validate requires `path`; install/uninstall default to dry-run unless apply=true; scope="project" requires `projectDir`.
 
 ### Parameters
 
 <ParamField path="action" type="enum" required>
-  Options: `start`, `stop`, `restart`.
+  Which comfy-cli operation to perform. Families: status; server_* (lifecycle); jobs_* (list/status/wait/watch/cancel); search_nodes; workflow_* (validate/run); transfer_* (upload/download); models_* (list_folders/list_folder/search/show/download/remove); skills_* (list/show/validate/install/status/uninstall). Options: `status`, `server_start`, `server_stop`, `server_restart`, `jobs_list`, `jobs_status`, `jobs_wait`, `jobs_watch`, `jobs_cancel`, `search_nodes`, `workflow_validate`, `workflow_run`, `transfer_upload`, `transfer_download`, `models_list_folders`, `models_list_folder`, `models_search`, `models_show`, `models_download`, `models_remove`, `skills_list`, `skills_show`, `skills_validate`, `skills_install`, `skills_status`, `skills_uninstall`.
+</ParamField>
+<ParamField path="detail" type="enum" default="env">
+  action:"status" — which inspection to run. Options: `version`, `which`, `env`, `discover`.
 </ParamField>
 <ParamField path="workspace" type="string">
   Optional ComfyUI workspace override. Otherwise COMFYUI_PATH/auto-detection is used.
 </ParamField>
 <ParamField path="launchArgs" type="string[]">
-  Extra ComfyUI launch arguments, e.g. ['--listen','0.0.0.0','--port','8188'].
-</ParamField>
-
-### Example
-
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
-
-```json
-{
-  "tool": "comfy_cli_server",
-  "arguments": {
-    "action": "start"
-  }
-}
-```
-
----
-
-## comfy_cli_jobs
-
-List, inspect, wait for, watch, or cancel local or Comfy Cloud jobs through official comfy-cli. Local jobs include CLI-tracked async submissions plus the ComfyUI queue/history.
-
-### Parameters
-
-<ParamField path="action" type="enum" required>
-  Options: `list`, `status`, `wait`, `watch`, `cancel`.
+  actions "server_start"/"server_restart" — extra ComfyUI launch arguments, e.g. ['--listen','0.0.0.0','--port','8188'].
 </ParamField>
 <ParamField path="promptId" type="string">
-  Single prompt id. Required for status/watch/cancel; accepted for wait (normalized into a one-element promptIds list).
+  Single prompt id. Required for "jobs_status"/"jobs_watch"/"jobs_cancel" and "transfer_download"; accepted for "jobs_wait" (normalized into a one-element promptIds list).
 </ParamField>
 <ParamField path="promptIds" type="string[]">
-  Prompt ids to wait on. For wait, use this or promptId or all=true.
+  action:"jobs_wait" — prompt ids to wait on. Use this or promptId or all=true.
 </ParamField>
 <ParamField path="all" type="boolean">
-  —
+  action:"jobs_wait" — wait on every known job.
 </ParamField>
 <ParamField path="limit" type="integer">
-  —
+  Result cap for "jobs_list", "search_nodes" and the "models_*" listing/search actions.
 </ParamField>
 <ParamField path="timeoutSeconds" type="integer">
-  —
+  actions "jobs_wait"/"jobs_watch"/"workflow_run" — max seconds to wait.
 </ParamField>
 <ParamField path="where" type="enum">
-  Options: `local`, `cloud`.
+  Target for the jobs/search_nodes/workflow/transfer/models actions: "local" (default) or "cloud" (Comfy Cloud). Options: `local`, `cloud`.
 </ParamField>
-<ParamField path="workspace" type="string">
-  Optional ComfyUI workspace override. Otherwise COMFYUI_PATH/auto-detection is used.
-</ParamField>
-
-### Example
-
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
-
-```json
-{
-  "tool": "comfy_cli_jobs",
-  "arguments": {
-    "action": "list"
-  }
-}
-```
-
----
-
-## comfy_cli_search_nodes
-
-Fuzzy-search actual ComfyUI node classes by name, display name, or description using official `comfy nodes search`. This complements search_custom_nodes, which searches installable node packs. Works locally, in Comfy Cloud, or offline with object_info JSON. When comfy-cli is not installed/on PATH and the target is the connected (local) server, it falls back to fuzzy-searching that server's live /object_info — so installed-node discovery works without the CLI.
-
-### Parameters
-
-<ParamField path="query" type="string" required>
-  —
-</ParamField>
-<ParamField path="limit" type="integer">
-  —
+<ParamField path="query" type="string">
+  action:"search_nodes" — fuzzy search text. REQUIRED.
 </ParamField>
 <ParamField path="objectInfoPath" type="string">
-  —
+  action:"search_nodes" — offline object_info JSON file to search instead of a live target.
 </ParamField>
-<ParamField path="where" type="enum">
-  Options: `local`, `cloud`.
-</ParamField>
-<ParamField path="workspace" type="string">
-  Optional ComfyUI workspace override. Otherwise COMFYUI_PATH/auto-detection is used.
-</ParamField>
-
-### Example
-
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
-
-```json
-{
-  "tool": "comfy_cli_search_nodes",
-  "arguments": {
-    "query": "<query>"
-  }
-}
-```
-
----
-
-## comfy_cli_workflow
-
-Validate or run an API/UI workflow file using official comfy-cli. Validation checks class types, inputs, enums, and edge wiring without submission. Run submits asynchronously by default; set wait=true to await outputs.
-
-### Parameters
-
-<ParamField path="action" type="enum" required>
-  Options: `validate`, `run`.
-</ParamField>
-<ParamField path="workflowPath" type="string" required>
-  —
+<ParamField path="workflowPath" type="string">
+  actions "workflow_validate"/"workflow_run" — path to an API/UI workflow JSON file. REQUIRED.
 </ParamField>
 <ParamField path="wait" type="boolean">
-  —
-</ParamField>
-<ParamField path="timeoutSeconds" type="integer">
-  —
-</ParamField>
-<ParamField path="where" type="enum">
-  Options: `local`, `cloud`.
-</ParamField>
-<ParamField path="workspace" type="string">
-  Optional ComfyUI workspace override. Otherwise COMFYUI_PATH/auto-detection is used.
-</ParamField>
-
-### Example
-
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
-
-```json
-{
-  "tool": "comfy_cli_workflow",
-  "arguments": {
-    "action": "validate",
-    "workflowPath": "<workflowPath>"
-  }
-}
-```
-
----
-
-## comfy_cli_transfer
-
-Upload input files or download completed job outputs using official comfy-cli for local ComfyUI or Comfy Cloud.
-
-### Parameters
-
-<ParamField path="action" type="enum" required>
-  Options: `upload`, `download`.
+  action:"workflow_run" — await outputs instead of returning after submission.
 </ParamField>
 <ParamField path="files" type="string[]">
-  —
-</ParamField>
-<ParamField path="promptId" type="string">
-  —
+  action:"transfer_upload" — input files to upload. REQUIRED.
 </ParamField>
 <ParamField path="outDir" type="string">
-  —
+  action:"transfer_download" — output directory.
 </ParamField>
 <ParamField path="overwrite" type="boolean">
-  —
+  action:"transfer_upload" — set false to pass --no-overwrite.
 </ParamField>
 <ParamField path="urlOnly" type="boolean">
-  —
-</ParamField>
-<ParamField path="where" type="enum">
-  Options: `local`, `cloud`.
-</ParamField>
-<ParamField path="workspace" type="string">
-  Optional ComfyUI workspace override. Otherwise COMFYUI_PATH/auto-detection is used.
-</ParamField>
-
-### Example
-
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
-
-```json
-{
-  "tool": "comfy_cli_transfer",
-  "arguments": {
-    "action": "upload"
-  }
-}
-```
-
----
-
-## comfy_cli_models
-
-Discover model folders/files locally or in Comfy Cloud, download model URLs into a workspace, or remove workspace model files through official comfy-cli. When comfy-cli is not installed/on PATH and the target is the connected (local) server, the read-only listing actions (list-folders, list-folder, search, show) fall back to that server's own local models (via /models) — so model discovery works without the CLI.
-
-### Parameters
-
-<ParamField path="action" type="enum" required>
-  Options: `list-folders`, `list-folder`, `search`, `show`, `download`, `remove`.
+  action:"transfer_download" — print URLs instead of downloading files.
 </ParamField>
 <ParamField path="folder" type="string">
-  —
+  action:"models_list_folder" — the model folder to list. REQUIRED.
 </ParamField>
 <ParamField path="text" type="string">
-  —
+  action:"models_search" — search text.
 </ParamField>
 <ParamField path="type" type="string">
-  —
+  action:"models_search" — model type filter (checkpoint, lora, vae, …).
 </ParamField>
 <ParamField path="name" type="string">
-  —
+  actions "models_show"/"skills_show" — the model or skill name.
 </ParamField>
 <ParamField path="url" type="string">
-  —
+  action:"models_download" — model URL to download. REQUIRED.
 </ParamField>
 <ParamField path="relativePath" type="string">
-  Workspace-relative model directory (default models/checkpoints).
+  actions "models_download"/"models_remove" — workspace-relative model directory (default models/checkpoints).
 </ParamField>
 <ParamField path="modelNames" type="string[]">
-  Model filenames to remove.
-</ParamField>
-<ParamField path="limit" type="integer">
-  —
-</ParamField>
-<ParamField path="where" type="enum">
-  Options: `local`, `cloud`.
-</ParamField>
-<ParamField path="workspace" type="string">
-  Optional ComfyUI workspace override. Otherwise COMFYUI_PATH/auto-detection is used.
-</ParamField>
-
-### Example
-
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
-
-```json
-{
-  "tool": "comfy_cli_models",
-  "arguments": {
-    "action": "list-folders"
-  }
-}
-```
-
----
-
-## comfy_cli_skills
-
-List, show, validate, install, inspect, or uninstall the official comfy-cli bundled agent skills (comfy, fragments, debug, relay, director). Install/uninstall defaults to dry-run for safety unless apply=true.
-
-### Parameters
-
-<ParamField path="action" type="enum" required>
-  Options: `list`, `show`, `validate`, `install`, `status`, `uninstall`.
-</ParamField>
-<ParamField path="name" type="string">
-  —
+  action:"models_remove" — model filenames to remove. REQUIRED.
 </ParamField>
 <ParamField path="path" type="string">
-  —
+  action:"skills_validate" — path to the skill to validate. REQUIRED.
 </ParamField>
 <ParamField path="scope" type="enum">
-  Options: `user`, `project`.
+  actions "skills_install"/"skills_uninstall"/"skills_status" — install scope. Options: `user`, `project`.
 </ParamField>
 <ParamField path="projectDir" type="string">
   Working directory for project-scoped skill operations. Required when scope='project'.
 </ParamField>
 <ParamField path="targets" type="string[]">
-  —
+  actions "skills_install"/"skills_uninstall" — agent targets.
 </ParamField>
 <ParamField path="skills" type="string[]">
-  —
+  actions "skills_install"/"skills_uninstall" — skill names.
 </ParamField>
 <ParamField path="apply" type="boolean" default="false">
-  —
-</ParamField>
-<ParamField path="workspace" type="string">
-  Optional ComfyUI workspace override. Otherwise COMFYUI_PATH/auto-detection is used.
+  actions "skills_install"/"skills_uninstall" — actually mutate; default false = dry-run.
 </ParamField>
 
 ### Example
@@ -328,9 +112,9 @@ List, show, validate, install, inspect, or uninstall the official comfy-cli bund
 
 ```json
 {
-  "tool": "comfy_cli_skills",
+  "tool": "comfy_cli",
   "arguments": {
-    "action": "list"
+    "action": "status"
   }
 }
 ```

@@ -14,7 +14,7 @@ import { registerAllTools } from "../../tools/index.js";
  * counts as required.
  *
  * The result was 25 parameters across 18 tools documented as REQUIRED while the real
- * schema said optional (`comfy_cli_status.detail` is declared
+ * schema said optional (`comfy_cli.detail` is declared
  * `.optional().default("env")` and rendered `required default="env"`). A human
  * supplying every "required" field does needless work; a model reading it may refuse
  * to call the tool at all. And the docs-freshness gate stayed green the whole time,

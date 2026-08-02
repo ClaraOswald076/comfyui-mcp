@@ -239,10 +239,7 @@ const CATEGORIES: Array<{
     slug: "comfy-cli",
     icon: "terminal",
     description: "Drive the official comfy-cli — managed server lifecycle, jobs, loaded-node search, workflow validation/execution, uploads/downloads, model discovery, and official agent skills.",
-    tools: [
-      "comfy_cli_status", "comfy_cli_server", "comfy_cli_jobs", "comfy_cli_search_nodes",
-      "comfy_cli_workflow", "comfy_cli_transfer", "comfy_cli_models", "comfy_cli_skills",
-    ],
+    tools: ["comfy_cli"],
   },
 ];
 
@@ -340,7 +337,7 @@ function renderTool(t: CapturedTool): string {
   // Omitting it meant OUTPUT semantics, under which a field with `.default()` is
   // always present and therefore listed as required. So every defaulted parameter was
   // documented as REQUIRED while the real tools/list schema said optional — 25
-  // parameters across 18 tools, e.g. comfy_cli_status.detail, declared
+  // parameters across 18 tools, e.g. comfy_cli.detail, declared
   // `.optional().default("env")` and rendered `required default="env"`. A reader
   // supplying every "required" field is doing needless work; a model reading it may
   // refuse to call the tool without them. The docs-freshness gate stayed green

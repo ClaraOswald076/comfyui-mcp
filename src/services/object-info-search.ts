@@ -2,8 +2,9 @@ import { getObjectInfo } from "../comfyui/client.js";
 import type { ComfyUINodeDef, ObjectInfo } from "../comfyui/types.js";
 
 // ---------------------------------------------------------------------------
-// Live /object_info node search — the fallback for comfy_cli_search_nodes when
-// comfy-cli is not installed/on PATH (issue #354). The official `comfy nodes
+// Live /object_info node search — the fallback for comfy_cli
+// action:"search_nodes" when comfy-cli is not installed/on PATH (issue #354).
+// The official `comfy nodes
 // search` fuzzy-matches installed node CLASSES over name/display/description/
 // inputs/outputs; this reproduces that search directly against the connected
 // ComfyUI's /object_info so installed-node discovery keeps working in a
