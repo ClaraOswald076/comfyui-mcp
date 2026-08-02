@@ -666,6 +666,24 @@ describe("liveRootFromArgv (#401 / #433 — robust argv parsing)", () => {
     expect(liveRootFromArgv([IS_WIN ? "C:\\x\\notmain.py" : "/x/notmain.py"])).toBeUndefined();
   });
 
+  it("a main.py-shaped FLAG VALUE is never the launch script (#648 review)", () => {
+    const root = IS_WIN ? "C:\\Comfy\\ComfyUI" : "/opt/ComfyUI";
+    // A main-less `python -m comfyui …` launch whose --extra-model-paths-config value
+    // happens to END in main.py: accepting that value as the script would let the config
+    // path self-prove the server's locality and then be read/written as a host file.
+    expect(
+      liveRootFromArgv(["python", "-m", "comfyui", "--extra-model-paths-config", join(root, "main.py")]),
+    ).toBeUndefined();
+    // The --flag=value spelling is an option token too.
+    expect(
+      liveRootFromArgv(["python", "-m", "comfyui", `--extra-model-paths-config=${join(root, "main.py")}`]),
+    ).toBeUndefined();
+    // A main.py-shaped token AFTER any flag is an argument, not the positional script.
+    expect(liveRootFromArgv(["--port", "8188", join(root, "main.py")])).toBeUndefined();
+    // …but the interpreter name before the script stays tolerated (positional scan).
+    expect(liveRootFromArgv(["python", join(root, "main.py"), "--port", "8188"])).toBe(root);
+  });
+
   it("returns undefined for missing/empty argv", () => {
     expect(liveRootFromArgv(undefined)).toBeUndefined();
     expect(liveRootFromArgv([])).toBeUndefined();
@@ -674,9 +692,11 @@ describe("liveRootFromArgv (#401 / #433 — robust argv parsing)", () => {
 
 /**
  * liveScriptFromArgv is the same parse returning the main.py FILE (needed to follow a
- * symlink — ComfyUI reads the config next to os.path.realpath(__file__)). liveRootFromArgv
- * feeds the #633 download-authorization path and is therefore NOT refactored to delegate,
- * so this cross-check is what stops the two parses from drifting apart.
+ * symlink — ComfyUI reads the config next to os.path.realpath(__file__)). Both functions
+ * share the script-TOKEN extraction (scriptTokenFromArgv: a positional token before the
+ * first option, never a flag's value); liveRootFromArgv keeps its OWN return shaping for
+ * the #633 download-authorization path, so this cross-check is what stops the two return
+ * shapes from drifting apart.
  */
 describe("liveScriptFromArgv agrees with liveRootFromArgv on every argv shape", () => {
   const winCwd = "C:\\here";
@@ -701,6 +721,17 @@ describe("liveScriptFromArgv agrees with liveRootFromArgv on every argv shape", 
     ["non-string entries", [42 as unknown as string, join(root, "main.py")]],
     ["no main.py", ["python", "--port", "8188"]],
     ["notmain.py boundary", [IS_WIN ? "C:\\x\\notmain.py" : "/x/notmain.py"]],
+    // #648 review: a main.py-shaped token after an option is a flag VALUE / argument,
+    // never the launch script — on both functions.
+    [
+      "main.py only as a --extra-model-paths-config VALUE",
+      ["python", "-m", "comfyui", "--extra-model-paths-config", join(root, "main.py")],
+    ],
+    [
+      "main.py only as a --flag=value",
+      ["python", "-m", "comfyui", `--extra-model-paths-config=${join(root, "main.py")}`],
+    ],
+    ["main.py only AFTER the flags", ["--port", "8188", join(root, "main.py")]],
     ["empty argv", []],
     ["missing argv", undefined],
   ];

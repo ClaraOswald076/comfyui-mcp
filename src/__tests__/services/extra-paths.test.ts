@@ -731,6 +731,28 @@ describe("a reachable server with NO --extra-model-paths-config is still authori
     expect(await readFile(hostLookalike, "utf-8")).toBe("h:\n  vae: E:/host\n");
   });
 
+  it("REFUSES when the ONLY main.py in argv is a flag VALUE (no self-proven locality)", async () => {
+    // A main-less `python -m comfyui …` launch whose --extra-model-paths-config value
+    // happens to END in main.py — and that same-spelled file exists here. Accepting the
+    // config VALUE as the launch script would let it "prove" the server shares this
+    // filesystem, after which the tool would read and write that host file. The script
+    // token must be the positional launch argument, never a flag's value (#648 review).
+    const hostLookalike = join(await trackTmp(), "main.py");
+    await writeFile(hostLookalike, "h:\n  vae: E:/host\n", "utf-8");
+    mockGetSystemStats.mockResolvedValue({
+      system: {
+        argv: ["python", "-m", "comfyui", "--extra-model-paths-config", hostLookalike],
+      },
+    });
+
+    await expect(listExtraPaths()).rejects.toThrow(/UNRESOLVED.*not proven local/s);
+    // …and the write path refuses too, leaving the lookalike file byte-for-byte intact.
+    await expect(
+      addExtraPath({ category: "loras", path: "E:/loras" }),
+    ).rejects.toThrow(/UNRESOLVED/);
+    expect(await readFile(hostLookalike, "utf-8")).toBe("h:\n  vae: E:/host\n");
+  });
+
   it("discloses the OTHER configs the server also loads (one file is not all of them)", async () => {
     // ComfyUI aggregates every --extra-model-paths-config plus <root>/extra_model_paths.yaml.
     // The tool returns one file, so the others must be named rather than silently omitted.

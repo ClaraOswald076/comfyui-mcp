@@ -165,18 +165,35 @@ describe("inferred root revalidation at the point of use", () => {
   });
 
   it("add: a root REPLACED between the read and the write is refused, and nothing is written", async () => {
-    // #1 gate, #2 pre-read, #3 pre-write (replaced).
-    const workspace = await savedWorkspace([at(1), at(1), at(2)]);
+    // #1 gate, #2 pre-read, #3 post-read (fine — the add proceeds), #4 pre-write (replaced).
+    const workspace = await savedWorkspace([at(1), at(1), at(1), at(2)]);
 
     await expect(
       addExtraPath({ target: "standalone", category: "loras", path: "E:/loras" }),
     ).rejects.toThrow(/REPLACED by a different directory/);
     expect(existsSync(join(workspace, "extra_model_paths.yaml"))).toBe(false);
-    expect(script.consumed).toBe(3);
+    expect(script.consumed).toBe(4);
+  });
+
+  it("add: a NO-OP add under a root replaced DURING the read surfaces the guard, not stale data", async () => {
+    // The path is already present, so nothing is written — but the "already present"
+    // answer and the returned groups came from a tree that no longer exists at that
+    // pathname. The post-read guard must fire on the no-op path too (#648 review).
+    const workspace = await savedWorkspace([at(1), at(1), at(2)]);
+    await writeFile(
+      join(workspace, "extra_model_paths.yaml"),
+      "comfyui_mcp:\n  loras: E:/loras\n",
+      "utf-8",
+    );
+
+    await expect(
+      addExtraPath({ target: "standalone", category: "loras", path: "E:/loras" }),
+    ).rejects.toThrow(/REPLACED by a different directory/);
+    expect(script.consumed).toBe(3); // gate, pre-read, post-read — no write was reached
   });
 
   it("add: a root that DISAPPEARS between the read and the write is refused", async () => {
-    const workspace = await savedWorkspace([at(1), at(1), null]);
+    const workspace = await savedWorkspace([at(1), at(1), at(1), null]);
 
     await expect(
       addExtraPath({ target: "standalone", category: "loras", path: "E:/loras" }),
@@ -185,7 +202,7 @@ describe("inferred root revalidation at the point of use", () => {
   });
 
   it("remove: the same guard applies to the removal write path", async () => {
-    const workspace = await savedWorkspace([at(1), at(1), at(2)]);
+    const workspace = await savedWorkspace([at(1), at(1), at(1), at(2)]);
     await writeFile(
       join(workspace, "extra_model_paths.yaml"),
       "comfyui_mcp:\n  loras: E:/loras\n",
@@ -201,11 +218,26 @@ describe("inferred root revalidation at the point of use", () => {
     ).toContain("E:/loras");
   });
 
+  it("remove: a NO-OP remove under a root replaced DURING the read surfaces the guard too", async () => {
+    // "Was not present" computed from the PRIOR tree's data is equally stale (#648 review).
+    const workspace = await savedWorkspace([at(1), at(1), at(2)]);
+    await writeFile(
+      join(workspace, "extra_model_paths.yaml"),
+      "comfyui_mcp:\n  vae: E:/vae\n",
+      "utf-8",
+    );
+
+    await expect(
+      removeExtraPath({ target: "standalone", category: "loras", path: "E:/loras" }),
+    ).rejects.toThrow(/REPLACED by a different directory/);
+    expect(script.consumed).toBe(3); // gate, pre-read, post-read — no write was reached
+  });
+
   it("a stable root passes every revalidation and the operation succeeds", async () => {
-    // Exactly three scripted stats — gate, pre-read, pre-write — all the same inode.
-    // Asserting the queue is EXHAUSTED proves the guard ran on every one of them
+    // Exactly four scripted stats — gate, pre-read, post-read, pre-write — all the same
+    // inode. Asserting the queue is EXHAUSTED proves the guard ran on every one of them
     // (a missing call would leave an entry behind).
-    const workspace = await savedWorkspace([at(7), at(7), at(7)]);
+    const workspace = await savedWorkspace([at(7), at(7), at(7), at(7)]);
 
     const added = await addExtraPath({
       target: "standalone",
@@ -215,7 +247,7 @@ describe("inferred root revalidation at the point of use", () => {
     });
     expect(added.changed).toBe(true);
     expect(added.path).toBe(join(workspace, "extra_model_paths.yaml"));
-    expect(script.consumed).toBe(3);
+    expect(script.consumed).toBe(4);
     expect(script.queue).toHaveLength(0);
   });
 
@@ -223,12 +255,12 @@ describe("inferred root revalidation at the point of use", () => {
     // Some Windows volumes report no usable directory identity. The guard must then fall
     // back to plain existence rather than refusing everything it cannot fingerprint —
     // and must NOT read 0 !== 0 as a replacement.
-    const workspace = await savedWorkspace([at(0), at(0), at(0)]);
+    const workspace = await savedWorkspace([at(0), at(0), at(0), at(0)]);
 
     const added = await addExtraPath({ target: "standalone", category: "vae", path: "E:/vae" });
     expect(added.changed).toBe(true);
     expect(existsSync(join(workspace, "extra_model_paths.yaml"))).toBe(true);
-    expect(script.consumed).toBe(3);
+    expect(script.consumed).toBe(4);
   });
 
   it("live root: a SYMLINKED main.py resolves to the real install root (platform-independent)", async () => {
@@ -308,7 +340,7 @@ describe("inferred root revalidation at the point of use", () => {
     await writeFile(join(live, "main.py"), "# comfyui\n", "utf-8");
     mockGetSystemStats.mockResolvedValue({ system: { argv: ["python", join(live, "main.py")] } });
     script.path = live;
-    script.queue = [at(1), at(1), at(2)]; // gate, pre-read, pre-write (replaced)
+    script.queue = [at(1), at(1), at(1), at(2)]; // gate, pre-read, post-read, pre-write (replaced)
     script.consumed = 0;
 
     await expect(addExtraPath({ category: "loras", path: "E:/loras" })).rejects.toThrow(
@@ -320,7 +352,7 @@ describe("inferred root revalidation at the point of use", () => {
   it("a root whose identity only BECOMES available mid-call is not treated as replaced", async () => {
     // Gate saw no identity (0) but a later stat reports one: nothing proves a change, so
     // the operation must proceed rather than fail on an unprovable mismatch.
-    await savedWorkspace([at(0), at(9), at(9)]);
+    await savedWorkspace([at(0), at(9), at(9), at(9)]);
 
     const added = await addExtraPath({ target: "standalone", category: "vae", path: "E:/vae" });
     expect(added.changed).toBe(true);

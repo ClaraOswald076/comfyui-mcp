@@ -304,8 +304,10 @@ function statDir(p: string): { identity?: DirIdentity } | undefined {
  * TOCTOU check — the root can vanish (a read would then report a phantom EMPTY config,
  * the exact authoritative-looking lie this issue is about) or be REPLACED by a different
  * directory at the same pathname (a write would then land in the wrong tree and still
- * report success). `assertRootIntact` is therefore called immediately before every read
- * and again immediately before every write, and compares dev+ino when the filesystem
+ * report success). `assertRootIntact` is therefore called immediately before every read,
+ * again right AFTER it (a no-op add/remove returns the read's data, so a replacement
+ * during the read must fail there too, not only when a write follows), and again
+ * immediately before every write, and compares dev+ino when the filesystem
  * supplies them so a same-path replacement is caught, not just a deletion.
  *
  * ACCEPTED residual: on a volume that reports no usable inode (some Windows directory
@@ -1040,6 +1042,9 @@ export async function addExtraPath(
 
   assertRootIntact(resolved.guard);
   const raw = await readConfigFile(resolved.path);
+  // The no-op path ("already present") returns data from THIS read, so a root REPLACED
+  // during it must fail here too — not only when a write follows (#648 review).
+  assertRootIntact(resolved.guard);
   const group = ensureGroup(raw, groupName);
   if (opts.isDefault !== undefined && group.is_default === undefined) {
     group.is_default = opts.isDefault;
@@ -1072,6 +1077,9 @@ export async function removeExtraPath(
 
   assertRootIntact(resolved.guard);
   const raw = await readConfigFile(resolved.path);
+  // Same post-read gate as add: a no-op "was not present" built from a root REPLACED
+  // during the read would report the PRIOR tree's data as current (#648 review).
+  assertRootIntact(resolved.guard);
   const group = raw[groupName];
   let changed = false;
   if (group && typeof group === "object" && !Array.isArray(group)) {
