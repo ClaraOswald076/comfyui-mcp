@@ -38,6 +38,8 @@ interface CivitaiModelVersion {
   downloadUrl?: string;
   files?: CivitaiFile[];
   images?: CivitaiImage[];
+  /** Version-level maturity rating (newer API responses). */
+  nsfwLevel?: number;
   // Present on GET /model-versions/{id} (not on the nested versions of /models/{id}).
   model?: { name?: string; type?: string };
 }
@@ -534,11 +536,22 @@ export interface CivitaiSearchResult {
  */
 const MAX_SFW_NSFW_LEVEL = 2;
 
-/** True when every preview of this version is at/below PG-13 (or it has none). */
-function versionIsSfw(version: CivitaiModelVersion): boolean {
-  return (version.images ?? []).every(
-    (img) => (img.nsfwLevel ?? 1) <= MAX_SFW_NSFW_LEVEL,
-  );
+/**
+ * SFW classification of one version — "clean" requires POSITIVE evidence:
+ * a version-level rating at/below PG-13, or at least one preview image all of
+ * which are at/below PG-13. A version with NO rating and NO previews is
+ * UNCLASSIFIED, not clean: treating an empty `images` array as safe let SFW
+ * search vouch an explicit version's trigger words (#664 gate).
+ */
+function versionSfwClass(v: CivitaiModelVersion): "clean" | "explicit" | "unclassified" {
+  if (typeof v.nsfwLevel === "number") {
+    return v.nsfwLevel <= MAX_SFW_NSFW_LEVEL ? "clean" : "explicit";
+  }
+  const imgs = v.images ?? [];
+  if (imgs.length === 0) return "unclassified";
+  return imgs.every((img) => (img.nsfwLevel ?? 1) <= MAX_SFW_NSFW_LEVEL)
+    ? "clean"
+    : "explicit";
 }
 
 function toSearchHit(
@@ -548,10 +561,11 @@ function toSearchHit(
   const versions = m.modelVersions ?? [];
   // The API gates only the MODEL-level nsfw flag — a model flagged SFW can
   // still front a version with mature/explicit previews and adult trigger
-  // words (#664). In SFW mode prefer the newest version whose previews stay
-  // at/below PG-13; when none qualifies, keep the latest version for the
-  // download handoff but don't vouch for its trigger words.
-  const clean = opts.nsfw ? undefined : versions.find(versionIsSfw);
+  // words (#664). In SFW mode prefer the newest version PROVEN clean; an
+  // unclassified version (no rating, no previews) is never vouched, and when
+  // nothing is proven clean the latest version still goes out for the
+  // download handoff but its trigger words are omitted.
+  const clean = opts.nsfw ? undefined : versions.find((v) => versionSfwClass(v) === "clean");
   const v = clean ?? versions[0];
   const file = v ? pickFile(v) : undefined;
   const sizeKb = (file as { sizeKB?: number } | undefined)?.sizeKB;

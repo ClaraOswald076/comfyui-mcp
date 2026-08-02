@@ -327,6 +327,9 @@ describe("searchCivitaiModels", () => {
             baseModel: "Flux.1 D",
             trainedWords: ["Jeddtlv3"],
             files: [{ name: "flux-detailer.safetensors", primary: true, sizeKB: 300000 }],
+            // SFW mode vouches trained_words only for a PROVEN-clean version
+            // (#664 gate) — give the fixture explicit clean previews.
+            images: [{ url: "p1", nsfwLevel: 1 }],
           },
         ],
       },
@@ -404,6 +407,66 @@ describe("searchCivitaiModels", () => {
     expect(hits[0].version_id).toBe(1599906);
     expect(hits[0].version_name).toBe("v2");
     expect(hits[0].trained_words).toEqual(["subtle camera motion"]);
+  });
+
+  it("nsfw:false treats an image-less version as UNCLASSIFIED, never vouched (#664 gate)", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        items: [
+          {
+            id: 2,
+            name: "No Previews",
+            nsfw: false,
+            modelVersions: [
+              {
+                id: 200,
+                name: "v1",
+                trainedWords: ["unverified phrase"],
+                images: [], // no previews → unclassified, not "clean"
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    const { hits } = await searchCivitaiModels("no previews", { nsfw: false });
+    // Download handoff preserved…
+    expect(hits[0].version_id).toBe(200);
+    // …but an unverified version's words are never serialized in SFW mode.
+    expect(hits[0].trained_words).toBeUndefined();
+  });
+
+  it("nsfw:false uses the version-level nsfwLevel when present, previews or not (#664 gate)", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        items: [
+          {
+            id: 3,
+            name: "Rated Versions",
+            nsfw: false,
+            modelVersions: [
+              {
+                id: 301,
+                name: "v2 (latest, explicit rating)",
+                nsfwLevel: 8,
+                trainedWords: ["adult phrase"],
+                images: [],
+              },
+              {
+                id: 300,
+                name: "v1 (clean rating, no previews)",
+                nsfwLevel: 1,
+                trainedWords: ["safe phrase"],
+                images: [],
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    const { hits } = await searchCivitaiModels("rated", { nsfw: false });
+    expect(hits[0].version_id).toBe(300);
+    expect(hits[0].trained_words).toEqual(["safe phrase"]);
   });
 
   it("nsfw:false never serializes trained words when NO version is clean (#664)", async () => {
