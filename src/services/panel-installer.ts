@@ -984,6 +984,13 @@ export interface PanelStatus {
    * reinstall refuse and the on-load ensure skips — see the pin guard above.
    */
   pin: PanelPinState;
+  /**
+   * #639 — the custom_nodes enumeration itself FAILED, so `installed: false` is
+   * unreliable: a pre-existing panel may have been missed, and installing blind
+   * risks a duplicate (or clobbering a NEWER one). Consumers must not treat an
+   * unreliable "absent" as an install invitation.
+   */
+  scanReliable?: boolean;
   note: string;
 }
 
@@ -1048,6 +1055,7 @@ export async function panelStatus(
     targetVersion: PANEL_VERSION,
     shadows,
     shadowInspectFailed,
+    scanReliable: detection.scanReliable,
     pin,
     note: note + shadowNote + pinNote,
   };

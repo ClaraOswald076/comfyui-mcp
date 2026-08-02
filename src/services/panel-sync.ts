@@ -227,6 +227,22 @@ export function evaluatePanelSync(
     };
   }
 
+  // Can't prove the scan saw everything → "absent" is unreliable (#639). A
+  // sync that installs blind here could clobber a NEWER panel the enumeration
+  // simply missed, exactly the loss the installer's own unreliable-scan guard
+  // refuses. Can't-tell → don't touch.
+  if (status.scanReliable === false) {
+    return {
+      ...base,
+      decision: "blocked",
+      behind: false,
+      summary:
+        `custom_nodes could not be enumerated, so whether the panel is present is ` +
+        `UNRELIABLE — nothing will be changed (a blind install could clobber an ` +
+        `existing, possibly newer, panel). Re-run once custom_nodes is readable.`,
+    };
+  }
+
   // Can't prove there is no pin → behave as if there is one.
   if (pin.indeterminate) {
     return {
