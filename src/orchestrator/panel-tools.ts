@@ -2918,10 +2918,18 @@ async function resolveWorkflowInput(
         /* fall through to the actionable error below */
       }
     }
-    throw new Error(
-      `Couldn't capture the live canvas (${msg}). ` +
-        `An older panel version may not support graph_serialize — pass pack, path, or graph instead.`,
-    );
+    // #721: only blame an old panel when the error actually IS an
+    // unsupported-command rejection. Anything else (e.g. the panel's graph
+    // desync guard, whose remedy is rebinding/opening the workflow) already
+    // carries its own remedy in the message — appending the version hint
+    // there misdirects the agent to pack/path/graph instead.
+    if (isPanelCmdUnsupportedError(err, "graph_serialize")) {
+      throw new Error(
+        `Couldn't capture the live canvas (${msg}). ` +
+          `An older panel version may not support graph_serialize — pass pack, path, or graph instead.`,
+      );
+    }
+    throw new Error(`Couldn't capture the live canvas (${msg}).`);
   }
   const wf = (reply as { workflow?: unknown } | null)?.workflow;
   if (!wf || typeof wf !== "object") {
