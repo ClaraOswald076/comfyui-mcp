@@ -90,7 +90,7 @@ function makeDeps(opts: {
   /** Side effect the `reinstall` mock runs to simulate the pack landing. */
   onReinstall?: (ctx: { files: Record<string, string>; revs: Record<string, string> }) => void;
   /**
-   * Side effect the #724 git-fallback mock (`git pull --ff-only`) runs against
+   * Side effect the #724 git-fallback mock (the pinned `merge --ff-only`) runs against
    * the live `files`/`revs` maps, returning git's output. When omitted the mock
    * THROWS — the persona has no working git fallback (git itself errors).
    */
@@ -149,7 +149,9 @@ function makeDeps(opts: {
     detectManagerDialect: async () =>
       opts.dialect === "unproven" ? undefined : (opts.dialect ?? "legacy"),
     gitIgnoredPullConflicts: () => opts.ignoredConflicts ?? [],
-    gitPullFfOnly: (dir) => {
+    gitFetch: () => {},
+    // Records the pinned merge --ff-only call (the rev is the fetched upstream sha).
+    gitMergeFfOnly: (dir) => {
       gitPulls.push(dir);
       if (opts.onGitPull) return opts.onGitPull({ files, revs });
       throw new Error("remote: Repository not found / no upstream (persona has no working git fallback)");
@@ -891,6 +893,35 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
     expect(h.gitPulls).toEqual([]);
   });
 
+  it("incoherent queue signature (done>total) -> fallback REFUSED: not the proven empty queue, no merge", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: { total_count: 0, done_count: 2, in_progress_count: 0, pending_count: 0, is_processing: false },
+      onGitPull: () => "merge output",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).toMatch(/did NOT apply|empty-queue signature/);
+    // An incoherent signature is a diagnostic, never proof: no git mutation.
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("empty queue with pending work (total 0, pending 1) -> fallback REFUSED: not the proven signature", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: { total_count: 0, done_count: 0, in_progress_count: 0, pending_count: 1, is_processing: false },
+      onGitPull: () => "merge output",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).toMatch(/did NOT apply|empty-queue signature/);
+    expect(h.gitPulls).toEqual([]);
+  });
+
   it("legacy no-op + real git checkout + pull advances it → updated via the fallback (verified)", async () => {
     const h = makeDeps({
       comfyuiPath: COMFY,
@@ -912,7 +943,7 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
     expect(r.previousVersion).toBe("0.11.32");
     expect(r.installedVersion).toBe("0.11.35");
     expect(r.restartRequired).toBe(true);
-    expect(r.message).toMatch(/git pull --ff-only/);
+    expect(r.message).toMatch(/git merge --ff-only/);
     expect(r.message).toMatch(/RESTART ComfyUI/);
   });
 
@@ -1010,7 +1041,7 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
     });
     const err = await runPanelAction("update", h.deps).catch((e) => e);
     expect(err).toBeInstanceOf(PanelInstallError);
-    expect(String(err?.message ?? err)).toMatch(/no upstream is configured|UNPROVABLE/);
+    expect(String(err?.message ?? err)).toMatch(/no upstream configured|fetch.resolve the upstream|UNPROVABLE/);
   });
 
   it("pull ran clean but post-pull HEAD revision is UNREADABLE → throws unverifiable, never 'at tip'", async () => {
