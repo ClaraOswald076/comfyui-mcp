@@ -189,6 +189,23 @@ export function parseCliArgs(
 }
 
 /**
+ * Propagate an explicitly-chosen tool mode into the process environment so the
+ * panel orchestrator's spawned MCP children inherit it (#667). Children read
+ * the mode from the ENV (resolveHttpLaneComfyToolMode for the HTTP lane,
+ * comfyuiSpawnEnv for the Ollama family) — a bare --full/--compact flag
+ * otherwise never reaches them, so `--full --panel-orchestrator` silently ran
+ * compact downstream. A DEFAULTED mode is deliberately NOT exported: unset env
+ * is how children tell "user chose nothing" from "user chose compact", and
+ * unset resolves to the documented compact default on its own.
+ */
+export function exportExplicitToolMode(
+  cli: Pick<CliOptions, "toolMode" | "toolModeExplicit">,
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  if (cli.toolModeExplicit) env.COMFYUI_MCP_TOOL_MODE = cli.toolMode;
+}
+
+/**
  * Validate the `connect <comfyui-url>` positional before the orchestrator starts.
  * The URL is exported as COMFYUI_URL and used to drive a (possibly remote)
  * ComfyUI, so a bad value (e.g. `connect not-a-url`) must hard-fail instead of

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseCliArgs, validateConnectUrl } from "../../transport/cli.js";
+import { exportExplicitToolMode, parseCliArgs, validateConnectUrl } from "../../transport/cli.js";
 
 const base = ["node", "comfyui-mcp"];
 
@@ -167,6 +167,33 @@ describe("parseCliArgs", () => {
   it("explicit flags override env values", () => {
     const o = parseCliArgs([...base, "--port", "7000"], { MCP_PORT: "5000" });
     expect(o.port).toBe(7000);
+  });
+});
+
+describe("exportExplicitToolMode (#667)", () => {
+  // The panel orchestrator's spawned MCP children read the tool mode from the
+  // ENV, so an explicit CLI choice must be exported before they spawn —
+  // otherwise `--full --panel-orchestrator` silently ran compact downstream.
+  it("exports an explicit --full so orchestrator children spawn the full surface", () => {
+    const cli = parseCliArgs([...base, "--full", "--panel-orchestrator"], {});
+    const env: NodeJS.ProcessEnv = {};
+    exportExplicitToolMode(cli, env);
+    expect(env.COMFYUI_MCP_TOOL_MODE).toBe("full");
+  });
+
+  it("exports an explicit --compact (and an explicit env mode survives parsing)", () => {
+    const env: NodeJS.ProcessEnv = {};
+    exportExplicitToolMode(parseCliArgs([...base, "--compact"], {}), env);
+    expect(env.COMFYUI_MCP_TOOL_MODE).toBe("compact");
+    const env2: NodeJS.ProcessEnv = {};
+    exportExplicitToolMode(parseCliArgs(base, { COMFYUI_MCP_TOOL_MODE: "full" }), env2);
+    expect(env2.COMFYUI_MCP_TOOL_MODE).toBe("full");
+  });
+
+  it("leaves the env UNSET when the mode was only defaulted (children apply their documented default)", () => {
+    const env: NodeJS.ProcessEnv = {};
+    exportExplicitToolMode(parseCliArgs(base, {}), env);
+    expect("COMFYUI_MCP_TOOL_MODE" in env).toBe(false);
   });
 });
 

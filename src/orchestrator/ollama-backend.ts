@@ -55,8 +55,9 @@ export interface OllamaBackendDeps {
   apiKey?: string;
   comfyuiUrl?: string;
   /** Same spec shape the Codex/Gemini backends take: the headless comfyui stdio
-   *  MCP + the panel HTTP MCP. The comfyui spawn env is overridden with
-   *  COMFYUI_MCP_TOOL_MODE=compact so it exposes the 3 meta-tools directly. */
+   *  MCP + the panel HTTP MCP. The comfyui child spawns COMPACT by default (see
+   *  comfyuiSpawnEnv) — an explicit COMFYUI_MCP_TOOL_MODE in the spec or the
+   *  user's own env wins (#667). */
   mcpServers?: Record<string, GeminiMcpServerSpec>;
   /** Panel system prompt (persona), prepended to the system message. */
   systemAppend?: string;
@@ -73,6 +74,30 @@ export interface OllamaBackendDeps {
   connectToolClients?: () => Promise<{ comfyui?: McpToolClient; panel?: McpToolClient }>;
   /** Panel backend id when reusing this driver for GLM/Kimi/Ollama (default ollama). */
   backendId?: BackendId;
+}
+
+/**
+ * Spawn env for the headless comfyui MCP child (#667).
+ *
+ * Compact is the default on this path because the backend feeds the advertised
+ * tool defs straight into a small local model's context — the full ~200-schema
+ * list can fill most of a 16k num_ctx before the conversation starts, so the
+ * child must expose the 3 meta-tools unless the user asked otherwise.
+ *
+ * Precedence: an explicit COMFYUI_MCP_TOOL_MODE — the spec's (the
+ * orchestrator's resolved lane mode, see resolveHttpLaneComfyToolMode) or the
+ * user's own env — WINS; the compact default applies only when neither sets it.
+ */
+export function comfyuiSpawnEnv(
+  specEnv: Record<string, string> | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+) {
+  return {
+    ...env,
+    ...specEnv,
+    COMFYUI_MCP_TOOL_MODE:
+      specEnv?.COMFYUI_MCP_TOOL_MODE ?? env.COMFYUI_MCP_TOOL_MODE ?? "compact",
+  };
 }
 
 type ChatMessage = {
@@ -355,8 +380,7 @@ export class OllamaBackend implements AgentBackend {
               new StdioClientTransport({
                 command: spec.command,
                 args: spec.args ?? [],
-                // Compact mode: the subprocess itself exposes the 3 meta-tools.
-                env: { ...process.env, ...spec.env, COMFYUI_MCP_TOOL_MODE: "compact" },
+                env: comfyuiSpawnEnv(spec.env),
               }),
             );
             this.comfy = client as unknown as McpToolClient;
