@@ -1844,6 +1844,50 @@ async function updateManagerSelf(id: string): Promise<NodeOpResult> {
   };
 }
 
+/**
+ * ENQUEUE update_all on its dedicated route in the detected dialect, WITHOUT
+ * draining the queue. Shared by updateCustomNode({id:"all"}) (which drains) and
+ * the update_all tool's fire-and-forget path (queueUpdateAllCustomNodes), so
+ * both inherit dialect selection, cache invalidation, and the 404/405-only
+ * re-send discipline from enqueueWithDialectSelfHeal — a 400 re-detects but is
+ * never re-sent, so update_all can never run twice (#656).
+ *
+ * Returns the dialect the enqueue ACTUALLY spoke (so the caller starts/polls
+ * the queue holding the task) and the route's raw response body.
+ */
+async function enqueueUpdateAll(
+  mode: string,
+  base: string,
+): Promise<{ used: ManagerApi; response: unknown }> {
+  let response: unknown;
+  const used = await enqueueWithDialectSelfHeal("update-all", async (api) => {
+    // The v4 backend reads UpdateAllQueryParams from the QUERY STRING
+    // (manager_server.py), NOT the JSON body — a body-only request leaves mode
+    // defaulting to 'remote' and drops client_id/ui_id. Send them as URL query
+    // params. A fresh ui_id per attempt keeps the two attempts distinguishable.
+    const uiId = randomUUID();
+    if (api === "legacy") {
+      // 3.x reads {mode} from the JSON BODY (and ignores client_id/ui_id).
+      response = await managerFetch("/manager/queue/update_all", {
+        method: "POST",
+        body: { mode, ui_id: uiId },
+        base,
+      });
+    } else {
+      const query = new URLSearchParams({
+        mode,
+        client_id: MANAGER_CLIENT_ID,
+        ui_id: uiId,
+      }).toString();
+      response = await managerFetch(`/v2/manager/queue/update_all?${query}`, {
+        method: "POST",
+        base,
+      });
+    }
+  }, base);
+  return { used, response };
+}
+
 export function updateCustomNode(opts: UpdateOptions): Promise<NodeOpResult> {
   return withObjectInfoInvalidation(() => updateCustomNodeImpl(opts));
 }
@@ -1879,31 +1923,7 @@ async function updateCustomNodeImpl(
     // the same enqueue-only self-heal so a stale classification can't wedge it
     // either (#646). Enqueue here, drain once below.
     const base = managerBaseUrl();
-    const used = await enqueueWithDialectSelfHeal("update-all", async (api) => {
-      // The v4 backend reads UpdateAllQueryParams from the QUERY STRING
-      // (manager_server.py), NOT the JSON body — a body-only request leaves mode
-      // defaulting to 'remote' and drops client_id/ui_id. Send them as URL query
-      // params. A fresh ui_id per attempt keeps the two attempts distinguishable.
-      const uiId = randomUUID();
-      if (api === "legacy") {
-        // 3.x reads {mode} from the JSON BODY (and ignores client_id/ui_id).
-        await managerFetch("/manager/queue/update_all", {
-          method: "POST",
-          body: { mode, ui_id: uiId },
-          base,
-        });
-      } else {
-        const query = new URLSearchParams({
-          mode,
-          client_id: MANAGER_CLIENT_ID,
-          ui_id: uiId,
-        }).toString();
-        await managerFetch(`/v2/manager/queue/update_all?${query}`, {
-          method: "POST",
-          base,
-        });
-      }
-    }, base);
+    const { used } = await enqueueUpdateAll(mode, base);
     status = await runManagerQueue(used, base);
   } else {
     // Single-pack update → unified task; UpdatePackParams uses node_name/node_ver.
@@ -1916,6 +1936,51 @@ async function updateCustomNodeImpl(
       : `Queued + updated "${id}" via ComfyUI-Manager.`,
     details: status,
   };
+}
+
+/**
+ * Result of the update_all tool's fire-and-forget path (queueUpdateAllCustomNodes).
+ */
+export interface QueueUpdateAllResult {
+  /** The update_all route the enqueue actually used (dialect-dependent). */
+  endpoint: string;
+  /** Whether the queue worker was confirmed started. */
+  queueStarted: boolean;
+  /** Raw update_all response body, when the route produced one. */
+  managerResponse?: unknown;
+}
+
+/**
+ * The update_all MCP tool's path (#656): enqueue update_all in the DETECTED
+ * dialect and kick the queue worker, then return WITHOUT draining — the tool
+ * reports "queued + started" and the updates run asynchronously (unlike
+ * updateCustomNode({id:"all"}), which drains the queue). Routed through the
+ * same detectManagerApi + enqueue-with-self-heal machinery as every other
+ * Manager mutation, so it inherits dialect selection, cache invalidation, and
+ * the no-double-execute discipline rather than assuming the legacy 3.x route.
+ *
+ * No object_info invalidation here: the queued updates only take effect after
+ * a ComfyUI RESTART, and the restart lifecycle already drops that cache.
+ */
+export async function queueUpdateAllCustomNodes(): Promise<QueueUpdateAllResult> {
+  // One pinned target for the whole operation — detection, the enqueue, any
+  // self-heal retry, and the queue start all stay on the instance selected at
+  // invocation, even if the panel retargets mid-call.
+  const base = managerBaseUrl();
+  const { used, response } = await enqueueUpdateAll("remote", base);
+  const prefix = managerQueuePrefixFor(used);
+  let queueStarted = true;
+  try {
+    await managerQueueControl(`${prefix}/start`, base);
+  } catch (err) {
+    // The update_all IS queued — a start failure must not fail the whole call;
+    // report it so the user can kick the queue manually.
+    queueStarted = false;
+    logger.warn("Queued update_all but failed to start the queue worker", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  return { endpoint: `${prefix}/update_all`, queueStarted, managerResponse: response };
 }
 
 // ---------------------------------------------------------------------------

@@ -2,9 +2,9 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { platform } from "node:os";
-import { config, getComfyUIBaseUrl } from "../config.js";
-import { comfyuiFetch } from "../comfyui/fetch.js";
+import { config } from "../config.js";
 import { resolveInstallInterpreter } from "./workspace-env.js";
+import { queueUpdateAllCustomNodes } from "./node-management.js";
 import { ProcessControlError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 
@@ -121,51 +121,6 @@ function requireComfyUIPath(): string {
 }
 
 // ---------------------------------------------------------------------------
-// Manager HTTP client (local helper — no shared module)
-// ---------------------------------------------------------------------------
-
-function managerBaseUrl(): string {
-  return getComfyUIBaseUrl();
-}
-
-interface ManagerFetchResult {
-  ok: boolean;
-  status: number;
-  body: unknown;
-}
-
-async function managerFetch(
-  path: string,
-  init?: RequestInit,
-  timeoutMs = 30_000,
-): Promise<ManagerFetchResult> {
-  const url = `${managerBaseUrl()}${path}`;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await comfyuiFetch(url, { ...init, signal: controller.signal });
-    let body: unknown = null;
-    const text = await res.text();
-    if (text) {
-      try {
-        body = JSON.parse(text);
-      } catch {
-        body = text;
-      }
-    }
-    return { ok: res.ok, status: res.status, body };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    throw new ProcessControlError(
-      `Failed to reach ComfyUI-Manager at ${url}: ${msg}. ` +
-        "Is ComfyUI running with ComfyUI-Manager installed?",
-    );
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -236,45 +191,27 @@ export async function updateComfyUICore(): Promise<UpdateCoreResult> {
 
 /**
  * Update all installed custom nodes via the ComfyUI-Manager HTTP API.
- * Queues the update_all task then starts the queue worker.
+ * Queues the update_all task then starts the queue worker (fire-and-forget —
+ * the updates run asynchronously; unlike update_node with id "all", which
+ * drains the queue).
  *
- * Endpoints (confirmed against Comfy-Org/ComfyUI-Manager):
- *   POST /manager/queue/update_all   — queue update of all nodes
- *   POST /manager/queue/start        — start processing the queue
+ * Routed through the Manager dialect machinery in node-management.ts (#656),
+ * so the route follows the detected dialect instead of a hardcoded legacy
+ * assumption:
+ *   legacy 3.x:     POST /manager/queue/update_all      (mode in the JSON body)
+ *   v4 / v2-batch:  POST /v2/manager/queue/update_all   (mode/client_id/ui_id
+ *                                                      as query params)
+ * then POST <same prefix>/start to kick the worker.
  */
 export async function updateAllCustomNodes(): Promise<UpdateNodesResult> {
-  const endpoint = "/manager/queue/update_all";
-
-  const queued = await managerFetch(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ mode: "default" }),
-  });
-
-  if (!queued.ok) {
-    throw new ProcessControlError(
-      `ComfyUI-Manager returned ${queued.status} for ${endpoint}: ` +
-        `${typeof queued.body === "string" ? queued.body : JSON.stringify(queued.body)}`,
-    );
-  }
-
-  // Kick off the worker that drains the queue.
-  let queueStarted = false;
-  try {
-    const started = await managerFetch("/manager/queue/start", { method: "POST" });
-    queueStarted = started.ok;
-  } catch (err) {
-    logger.warn("Queued node updates but failed to start the queue worker", {
-      error: err instanceof Error ? err.message : String(err),
-    });
-  }
+  const result = await queueUpdateAllCustomNodes();
 
   return {
     updated: true,
-    endpoint,
-    queue_started: queueStarted,
-    manager_response: queued.body,
-    message: queueStarted
+    endpoint: result.endpoint,
+    queue_started: result.queueStarted,
+    manager_response: result.managerResponse,
+    message: result.queueStarted
       ? "Queued updates for all custom nodes via ComfyUI-Manager and started the queue worker. " +
         "Updates run asynchronously; a ComfyUI restart may be required afterward."
       : "Queued updates for all custom nodes via ComfyUI-Manager. " +

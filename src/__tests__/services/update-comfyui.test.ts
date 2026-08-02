@@ -6,16 +6,27 @@ import { describe, expect, it, beforeEach, vi, type Mock } from "vitest";
 // Created with vi.hoisted so it exists before the hoisted vi.mock factory runs.
 const mockConfig = vi.hoisted(() => ({
   comfyuiPath: "/fake/ComfyUI" as string | undefined,
+  resolvedPort: 8188,
+  comfyuiHost: "127.0.0.1",
+  comfyuiSsl: false,
+  githubToken: undefined as string | undefined,
 }));
 
 vi.mock("../../config.js", () => ({
   config: mockConfig,
   getComfyUIBaseUrl: () => "http://127.0.0.1:8188",
   getComfyUIAuthHeaders: () => ({}),
+  // node-management (the update_all dialect path, #656) transitively imports
+  // this; the mock must provide it or the named import fails at load.
+  isLoopbackHost: (host?: string) => host === "127.0.0.1" || host === "localhost",
 }));
 
+// node-management pulls in comfy-cli → workspace-env, which calls
+// promisify(execFile) at module load; keep the subprocess surface inert.
 vi.mock("node:child_process", () => ({
+  execFile: vi.fn(),
   execFileSync: vi.fn(),
+  spawnSync: vi.fn(() => ({ status: 0, stdout: "{}", stderr: "" })),
 }));
 
 vi.mock("node:fs", () => ({
@@ -40,25 +51,93 @@ import {
   updateComfyUICore,
   updateAllCustomNodes,
 } from "../../services/update-comfyui.js";
+import { resetManagerApiCacheForTests } from "../../services/node-management.js";
 
 const mockedExec = execFileSync as unknown as Mock;
 const mockedExists = existsSync as unknown as Mock;
 
-function mockFetchOnce(responses: Array<{ ok: boolean; status: number; body: unknown }>) {
-  let i = 0;
-  const fn = vi.fn(async () => {
-    const r = responses[Math.min(i, responses.length - 1)];
-    i++;
-    return {
-      ok: r.ok,
-      status: r.status,
-      text: async () =>
-        typeof r.body === "string" ? r.body : JSON.stringify(r.body),
-    } as unknown as Response;
+const BASE = "http://127.0.0.1:8188";
+
+interface Call {
+  url: string;
+  path: string;
+  method: string;
+  body: unknown;
+}
+
+/** Which Manager generation the (single) URL is serving. */
+type Persona = "legacy" | "v4" | "v2-batch";
+
+const DRAINED = { total_count: 1, done_count: 1, in_progress_count: 0, is_processing: false };
+
+function jsonResponse(obj: unknown): Response {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+/**
+ * One ComfyUI whose Manager answers the dialect-detection probes according to
+ * its persona, so updateAllCustomNodes exercises the SAME detectManagerApi
+ * path as the other Manager operations (#656):
+ *   "legacy"   = the 3.x custom-node Manager: no /v2/* at all, per-operation
+ *                routes under /manager/*.
+ *   "v4"       = normal pip Manager: the /v2 surface answers, is_legacy_manager_ui
+ *                false, and NO bare /manager/* (an unregistered POST there is
+ *                answered 405 by ComfyUI's frontend catchall — the misroute the
+ *                old hardcoded-legacy update_all hit).
+ *   "v2-batch" = pip Manager in legacy-UI mode: /v2 surface, is_legacy_manager_ui
+ *                true.
+ */
+function stubManager(
+  persona: Persona,
+  opts: { updateAllStatus?: number; failStart?: "error" } = {},
+) {
+  const calls: Call[] = [];
+  const fn = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+    const method = init?.method ?? "GET";
+    const body = init?.body ? JSON.parse(init.body as string) : undefined;
+    const path = new URL(url).pathname;
+    calls.push({ url, path, method, body });
+
+    if (persona === "legacy") {
+      if (path === "/manager/queue/status") return jsonResponse(DRAINED);
+      if (path === "/manager/version") return new Response("V3.41", { status: 200 });
+      if (path === "/manager/queue/update_all" && method === "POST") {
+        const status = opts.updateAllStatus ?? 200;
+        return new Response(status === 200 ? "" : String(status), { status });
+      }
+      if (path === "/manager/queue/start") {
+        if (opts.failStart === "error") throw new Error("connection reset");
+        return new Response("", { status: 200 });
+      }
+      // The 3.x custom-node Manager registers no /v2/* at all.
+      return new Response("404: Not Found", { status: 404 });
+    }
+
+    // pip comfyui_manager (v4 lineage): the /v2 surface answers.
+    if (path === "/v2/manager/queue/status") return jsonResponse(DRAINED);
+    if (path === "/v2/manager/is_legacy_manager_ui") {
+      return jsonResponse({ is_legacy_manager_ui: persona === "v2-batch" });
+    }
+    if (path === "/v2/manager/queue/update_all" && method === "POST") {
+      return new Response("", { status: 200 });
+    }
+    if (path === "/v2/manager/queue/start") {
+      if (opts.failStart === "error") throw new Error("connection reset");
+      return new Response("", { status: 200 });
+    }
+    // A v4 host registers NO bare /manager/* route.
+    if (path.startsWith("/manager/")) return new Response("405", { status: 405 });
+    return new Response("404: Not Found", { status: 404 });
   });
   vi.stubGlobal("fetch", fn);
-  return fn;
+  return calls;
 }
+
+const countOf = (calls: Call[], path: string, method = "POST"): number =>
+  calls.filter((c) => c.path === path && c.method === method).length;
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -70,6 +149,9 @@ beforeEach(() => {
     source: "launched",
     reason: "test interpreter",
   });
+  // The detected dialect is cached across calls — drop it so each test's
+  // persona is probed fresh.
+  resetManagerApiCacheForTests();
 });
 
 // --- updateComfyUICore --------------------------------------------------
@@ -224,51 +306,78 @@ describe("updateComfyUICore", () => {
 // --- updateAllCustomNodes ----------------------------------------------
 
 describe("updateAllCustomNodes", () => {
-  it("POSTs update_all then starts the queue", async () => {
-    const fetchFn = mockFetchOnce([
-      { ok: true, status: 200, body: { result: "queued" } },
-      { ok: true, status: 200, body: { started: true } },
-    ]);
+  it("on a legacy 3.x host: POSTs /manager/queue/update_all then starts the queue", async () => {
+    const calls = stubManager("legacy");
 
     const r = await updateAllCustomNodes();
     expect(r.updated).toBe(true);
     expect(r.endpoint).toBe("/manager/queue/update_all");
     expect(r.queue_started).toBe(true);
 
-    expect(fetchFn).toHaveBeenCalledTimes(2);
-    const [updateUrl, updateInit] = fetchFn.mock.calls[0];
-    expect(updateUrl).toBe("http://127.0.0.1:8188/manager/queue/update_all");
-    expect(updateInit.method).toBe("POST");
-    expect(JSON.parse(updateInit.body)).toEqual({ mode: "default" });
-
-    const [startUrl, startInit] = fetchFn.mock.calls[1];
-    expect(startUrl).toBe("http://127.0.0.1:8188/manager/queue/start");
-    expect(startInit.method).toBe("POST");
+    const update = calls.find((c) => c.path === "/manager/queue/update_all");
+    expect(update?.method).toBe("POST");
+    expect(update?.url).toBe(`${BASE}/manager/queue/update_all`);
+    // 3.x reads {mode} from the JSON body; no query string.
+    expect(update?.body).toMatchObject({ mode: "remote" });
+    expect(typeof (update?.body as { ui_id?: unknown }).ui_id).toBe("string");
+    expect(countOf(calls, "/manager/queue/start")).toBe(1);
   });
 
-  it("throws when Manager returns a non-OK status for update_all", async () => {
-    mockFetchOnce([{ ok: false, status: 404, body: "not found" }]);
-    await expect(updateAllCustomNodes()).rejects.toThrow(/returned 404/);
+  // #656: the old implementation hardcoded POST /manager/queue/update_all,
+  // which a v4 host answers 405 (ComfyUI's frontend catchall) — the tool must
+  // detect the dialect and speak v4 instead.
+  it("on a v4 host: detects the dialect and POSTs /v2/manager/queue/update_all (never the legacy route)", async () => {
+    const calls = stubManager("v4");
+
+    const r = await updateAllCustomNodes();
+    expect(r.updated).toBe(true);
+    expect(r.endpoint).toBe("/v2/manager/queue/update_all");
+    expect(r.queue_started).toBe(true);
+
+    // The hardcoded-legacy misroute was never attempted.
+    expect(countOf(calls, "/manager/queue/update_all")).toBe(0);
+    expect(countOf(calls, "/manager/queue/start")).toBe(0);
+
+    // v4 reads UpdateAllQueryParams from the QUERY string, not the body.
+    const update = calls.find((c) => c.path === "/v2/manager/queue/update_all");
+    expect(update?.method).toBe("POST");
+    const u = new URL(update!.url);
+    expect(u.searchParams.get("mode")).toBe("remote");
+    expect(u.searchParams.get("client_id")).toBe("comfyui-mcp");
+    expect(u.searchParams.get("ui_id")).toBeTruthy();
+    expect(update?.body).toBeUndefined();
+
+    expect(countOf(calls, "/v2/manager/queue/start")).toBe(1);
+  });
+
+  it("on a v2-batch host (pip Manager in legacy-UI mode): also routes at the /v2 update_all route", async () => {
+    const calls = stubManager("v2-batch");
+
+    const r = await updateAllCustomNodes();
+    expect(r.endpoint).toBe("/v2/manager/queue/update_all");
+    expect(countOf(calls, "/manager/queue/update_all")).toBe(0);
+    expect(countOf(calls, "/v2/manager/queue/update_all")).toBe(1);
+    expect(countOf(calls, "/v2/manager/queue/start")).toBe(1);
+  });
+
+  it("throws when Manager rejects update_all — and does NOT re-send the mutation", async () => {
+    // A 404 is a route-level rejection: the dialect self-heal re-probes, finds
+    // the dialect UNCHANGED (still legacy), and surfaces the original failure
+    // instead of retrying — update_all must never execute twice (#656 caution).
+    const calls = stubManager("legacy", { updateAllStatus: 404 });
+    await expect(updateAllCustomNodes()).rejects.toThrow(/ComfyUI-Manager API 404/);
+    expect(countOf(calls, "/manager/queue/update_all")).toBe(1);
+    // The queue was never started, so no half-run operation is left behind.
+    expect(countOf(calls, "/manager/queue/start")).toBe(0);
   });
 
   it("still succeeds (queue_started=false) if starting the queue fails", async () => {
-    let call = 0;
-    const fn = vi.fn(async () => {
-      call++;
-      if (call === 1) {
-        return {
-          ok: true,
-          status: 200,
-          text: async () => JSON.stringify({ result: "queued" }),
-        } as unknown as Response;
-      }
-      throw new Error("connection reset");
-    });
-    vi.stubGlobal("fetch", fn);
+    stubManager("legacy", { failStart: "error" });
 
     const r = await updateAllCustomNodes();
     expect(r.updated).toBe(true);
     expect(r.queue_started).toBe(false);
+    expect(r.message).toMatch(/Could not confirm the queue worker started/);
   });
 
   it("throws a clear error when ComfyUI-Manager is unreachable", async () => {
@@ -276,7 +385,7 @@ describe("updateAllCustomNodes", () => {
       throw new Error("ECONNREFUSED");
     });
     vi.stubGlobal("fetch", fn);
-    await expect(updateAllCustomNodes()).rejects.toThrow(/Failed to reach ComfyUI-Manager/);
+    await expect(updateAllCustomNodes()).rejects.toThrow(/queue API is not reachable/);
   });
 });
 
@@ -284,10 +393,7 @@ describe("updateAllCustomNodes", () => {
 
 describe("update_all is custom-nodes-only", () => {
   it("runs no git/pip core-update commands (mirrors comfy-cli `update all`)", async () => {
-    mockFetchOnce([
-      { ok: true, status: 200, body: { result: "queued" } },
-      { ok: true, status: 200, body: { started: true } },
-    ]);
+    stubManager("legacy");
     await updateAllCustomNodes();
     // update_all touches ONLY the ComfyUI-Manager HTTP API — it must never
     // git pull / pip install ComfyUI core.
