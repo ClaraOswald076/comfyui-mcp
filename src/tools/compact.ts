@@ -4,6 +4,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { errorToToolResult } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import type { CatalogedTool, ToolCatalog } from "./catalog.js";
+import { retiredToolMessage } from "./vocabulary.js";
 
 /** First sentence of a tool description, hard-capped so the manifest stays token-light. */
 export function summarize(description: string, maxLen = 160): string {
@@ -227,6 +228,11 @@ export function registerCompactTools(
 }
 
 function unknownToolMessage(catalog: ToolCatalog, name: string): string {
+  // A name in the retirement ledger gets a specific answer — which version
+  // removed it and what to call instead (#659). Exact matches only: partial
+  // names still get the fuzzy suggestions below.
+  const retired = retiredToolMessage(name);
+  if (retired) return retired;
   const needle = name.toLowerCase();
   const close = [...catalog.tools.keys()]
     .filter((n) => n.includes(needle) || needle.includes(n))

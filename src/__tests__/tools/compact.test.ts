@@ -198,6 +198,51 @@ describe("compact mode over a real MCP client/server pair", () => {
     expect(textOf(res as never)).toContain("gen_image");
   });
 
+  it("call_tool names the replacement for a RETIRED name (#659)", async () => {
+    const client = await compactPair(fakeCatalog());
+    const res = (await client.callTool({
+      name: "call_tool",
+      arguments: { name: "apps_list" },
+    })) as { isError?: boolean };
+    expect(res.isError).toBe(true);
+    const text = textOf(res as never);
+    expect(text).toContain("removed in 0.49.0");
+    expect(text).toContain('apps (action:"list")');
+    expect(text).not.toContain("Did you mean");
+  });
+
+  it("call_tool resolves a retired name through the mcp__<server>__ prefix (#659)", async () => {
+    const client = await compactPair(fakeCatalog());
+    const res = (await client.callTool({
+      name: "call_tool",
+      arguments: { name: "mcp__comfyui__apps_run" },
+    })) as { isError?: boolean };
+    expect(res.isError).toBe(true);
+    expect(textOf(res as never)).toContain('apps (action:"run")');
+  });
+
+  it("describe_tool gives a retired name the same specific error (#659)", async () => {
+    const client = await compactPair(fakeCatalog());
+    const res = (await client.callTool({
+      name: "describe_tool",
+      arguments: { name: "submit_batch" },
+    })) as { isError?: boolean };
+    expect(res.isError).toBe(true);
+    expect(textOf(res as never)).toContain('batch (action:"submit")');
+  });
+
+  it("a merely-similar name still gets the fuzzy path, not the retired error (#659)", async () => {
+    const client = await compactPair(fakeCatalog());
+    const res = (await client.callTool({
+      name: "call_tool",
+      arguments: { name: "apps_list_v2" },
+    })) as { isError?: boolean };
+    expect(res.isError).toBe(true);
+    const text = textOf(res as never);
+    expect(text).toContain("Unknown tool 'apps_list_v2'.");
+    expect(text).not.toContain("removed in");
+  });
+
   it("call_tool converts handler throws into isError results", async () => {
     const client = await compactPair(fakeCatalog());
     const res = (await client.callTool({

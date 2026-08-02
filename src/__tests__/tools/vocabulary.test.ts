@@ -7,6 +7,8 @@ import {
   TOOL_NAMES,
   baselineIntegrity,
   deadNameRe,
+  findDeadName,
+  retiredToolMessage,
 } from "../../tools/vocabulary.js";
 
 /**
@@ -133,5 +135,59 @@ describe("DEAD_NAMES ledger", () => {
       (d.allowedIn ?? []).filter((a) => !a.why.trim()).map((a) => `${d.name} → ${a.path}`),
     );
     expect(unjustified).toEqual([]);
+  });
+});
+
+/**
+ * The call_tool side of the ledger (#659): an EXACT retired name — bare or
+ * behind an mcp__<server>__ prefix — resolves to its entry so the caller can be
+ * told what replaced it, and nothing else does. The anchoring cases mirror
+ * deadNameRe's: the same names that must not match in prose must not resolve
+ * here either, or the fuzzy unknown-tool path would be shadowed for them.
+ */
+describe("findDeadName", () => {
+  it("resolves a bare retired name", () => {
+    expect(findDeadName("apps_list")?.replacement).toBe('apps (action:"list")');
+  });
+
+  it("resolves through an mcp__<server>__ prefix", () => {
+    expect(findDeadName("mcp__comfyui__apps_run")?.name).toBe("apps_run");
+  });
+
+  it("rejects a name embedded in a longer identifier", () => {
+    expect(findDeadName("my_apps_list")).toBeUndefined();
+    expect(findDeadName("retarget_image")).toBeUndefined();
+  });
+
+  it("rejects a retired name that is only a prefix of the called name", () => {
+    expect(findDeadName("apps_list_v2")).toBeUndefined();
+    expect(findDeadName("panel_get_graph_outline")).toBeUndefined();
+  });
+
+  it("rejects live and unknown names", () => {
+    expect(findDeadName("apps")).toBeUndefined();
+    expect(findDeadName("definitely_not_a_tool")).toBeUndefined();
+  });
+});
+
+describe("retiredToolMessage", () => {
+  it("quotes the removing version and the replacement", () => {
+    expect(retiredToolMessage("apps_run")).toBe(
+      `Unknown tool 'apps_run' — removed in 0.49.0. Call apps (action:"run") instead.`,
+    );
+  });
+
+  it("resolves the prefixed form to the same message", () => {
+    expect(retiredToolMessage("mcp__comfyui__apps_import")).toContain('Call apps (action:"import") instead.');
+  });
+
+  it("stays grammatical for a clause-shaped since (pre-baseline entries)", () => {
+    const message = retiredToolMessage("panel_get_graph");
+    expect(message).toContain("removed upstream before 0.48.0");
+    expect(message).not.toContain("removed in removed");
+  });
+
+  it("returns undefined for a genuinely unknown name", () => {
+    expect(retiredToolMessage("definitely_not_a_tool")).toBeUndefined();
   });
 });
