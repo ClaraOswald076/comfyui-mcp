@@ -520,6 +520,17 @@ async function installWorkflowDependenciesForAnalysis(
       // over it (codex gate). Same pattern as performPanelSync.
       await withPanelOpLock(async () => {
         const status = await panelStatus();
+        // An unreliable scan means "not installed" proves NOTHING — installing
+        // blind could clobber a newer panel the enumeration missed (#639, the
+        // same can't-tell-don't-touch rule sync now follows).
+        if (status.scanReliable === false) {
+          panelNotes.push(
+            `"${pack}" is the sidebar panel pack: custom_nodes could not be enumerated, ` +
+              `so whether it is installed is unknown — NOT installing blind (that could ` +
+              `clobber an existing, possibly newer, panel). Re-run once readable.`,
+          );
+          return;
+        }
         if (status.installed) {
           panelNotes.push(
             `"${pack}" is the sidebar panel pack: already installed ` +
