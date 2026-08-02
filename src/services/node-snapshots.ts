@@ -70,12 +70,18 @@ function managerBaseUrl(): string {
 /**
  * Fetch a ComfyUI-Manager endpoint. Throws NodeSnapshotError on non-2xx or
  * network failure so callers can route through errorToToolResult.
+ *
+ * `base` pins the target for this call (the ManagerFetchOptions.base
+ * convention): callers that record a pending-op marker must pass the SAME
+ * base they recorded, so marker and request can never name different servers
+ * (#689 round 3).
  */
 async function managerFetch(
   path: string,
   init?: RequestInit,
+  base = managerBaseUrl(),
 ): Promise<Response> {
-  const url = `${managerBaseUrl()}${path}`;
+  const url = `${base}${path}`;
   logger.debug("Manager API request", { url, method: init?.method ?? "GET" });
 
   let res: Response;
@@ -326,28 +332,38 @@ export async function restoreNodeSnapshot(
     // The Manager stores names without the .json suffix; tolerate either.
     const target = trimmed.endsWith(".json") ? trimmed.slice(0, -5) : trimmed;
 
+    // Pin the target ONCE and use it for BOTH the marker and the request: a
+    // retarget between the record and the POST must never leave the marker
+    // naming server A while the restore is scheduled on server B — a later
+    // pin-write cancellation trusts the marker's base (#689 round 3).
+    const base = managerBaseUrl();
+
     // Persist and VERIFY the warning marker BEFORE requesting the deferred
     // restore. A pin written after Manager receives the request cannot stop the
     // next-restart apply; refusing when the marker cannot be made durable is the
     // only way to avoid reporting such a pin as protective. Keep the marker on a
     // request failure because a transport error cannot prove Manager did not
-    // receive it. The base is recorded so a later pin-write cancellation report
-    // can name the host the restore was scheduled on (#689).
+    // receive it. The base is recorded so the pin-write cancellation path aims
+    // at the host the restore is actually scheduled on (#689).
     recordPanelPendingOp(
       "snapshot-restore",
       `a snapshot restore ("${target}") may have been requested and reverts EVERY pack to ` +
         `its snapshot commit — the sidebar panel included — at the next ComfyUI ` +
         `restart`,
       SNAPSHOT_RESTORE_PENDING_MS,
-      { base: managerBaseUrl() },
+      { base },
     );
 
     try {
-      await managerFetch("/snapshot/restore", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ target }),
-      });
+      await managerFetch(
+        "/snapshot/restore",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ target }),
+        },
+        base,
+      );
     } catch (err) {
       if (isSnapshotEndpointUnsupported(err)) {
         logger.info("Snapshot restore unsupported on this ComfyUI-Manager build");

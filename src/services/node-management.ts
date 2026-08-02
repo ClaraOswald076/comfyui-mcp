@@ -651,15 +651,48 @@ export interface ManagerQueueCounts {
 }
 
 /**
+ * Extract counts from a queue/status payload. Returns undefined when required
+ * fields are missing or the counts are incoherent (negative pending — the
+ * #639 stale-3.x signature), so callers report "could not verify" instead of
+ * guessing.
+ */
+function countsFromStatus(status: unknown): ManagerQueueCounts | undefined {
+  if (!status || typeof status !== "object") return undefined;
+  const s = status as QueueStatus;
+  const inProgress = typeof s.in_progress_count === "number" ? s.in_progress_count : undefined;
+  if (inProgress === undefined) return undefined;
+  let pending: number;
+  if (typeof s.pending_count === "number") {
+    pending = s.pending_count; // v4 reports it directly
+  } else {
+    // 3.x: total_count = done + in_progress + queued exactly.
+    if (typeof s.total_count !== "number" || typeof s.done_count !== "number") {
+      return undefined;
+    }
+    pending = s.total_count - s.done_count - inProgress;
+    if (pending < 0) return undefined; // incoherent counts — cannot verify anything
+  }
+  return {
+    pending,
+    inProgress,
+    processing: typeof s.is_processing === "boolean" ? s.is_processing : inProgress > 0,
+  };
+}
+
+/**
  * Read the Manager queue counts ONCE, in the detected dialect — the measuring
  * stick for the pin-write cancellation path (#689), which must report what a
  * queue reset actually dropped rather than claim the panel was saved.
  *
+ * These are SHARED, queue-wide counts: they can never say whether OUR task is
+ * among the pending ones (that needs fetchManagerClientQueueCounts /
+ * fetchManagerTaskHistoryEntry on v4).
+ *
  * Returns undefined whenever the state cannot be PROVEN: detection failed,
  * the status endpoint did not answer with queue counts, required fields are
- * missing, or the counts are incoherent (negative pending — the #639 stale-3.x
- * signature). The caller reports "could not verify" and keeps the pending-op
- * marker rather than guessing in either direction.
+ * missing, or the counts are incoherent. The caller reports "could not
+ * verify" and keeps the pending-op marker rather than guessing in either
+ * direction.
  */
 export async function fetchManagerQueueCounts(
   base = managerBaseUrl(),
@@ -674,26 +707,79 @@ export async function fetchManagerQueueCounts(
     base,
     soft: true,
   });
-  if (!status || typeof status !== "object") return undefined;
-  const inProgress =
-    typeof status.in_progress_count === "number" ? status.in_progress_count : undefined;
-  if (inProgress === undefined) return undefined;
-  let pending: number;
-  if (typeof status.pending_count === "number") {
-    pending = status.pending_count; // v4 reports it directly
-  } else {
-    // 3.x: total_count = done + in_progress + queued exactly.
-    if (typeof status.total_count !== "number" || typeof status.done_count !== "number") {
-      return undefined;
-    }
-    pending = status.total_count - status.done_count - inProgress;
-    if (pending < 0) return undefined; // incoherent counts — cannot verify anything
+  return countsFromStatus(status);
+}
+
+/**
+ * v4-only: queue counts for tasks THIS orchestrator enqueued (every enqueue
+ * carries client_id "comfyui-mcp"). This is what separates "the update_all is
+ * still queued" from "UNRELATED tasks are queued" on a shared Manager — the
+ * distinction a proven cancel needs (#689 round 3).
+ *
+ * Returns undefined on any non-v4 dialect: the 3.x and legacy-UI (v2-batch)
+ * status handlers IGNORE the client_id parameter and answer GLOBAL counts,
+ * which would impersonate our tasks. Also undefined when unreadable or
+ * incoherent.
+ */
+export async function fetchManagerClientQueueCounts(
+  base = managerBaseUrl(),
+): Promise<ManagerQueueCounts | undefined> {
+  let api: ManagerApi;
+  try {
+    api = await detectManagerApi(base);
+  } catch {
+    return undefined;
+  }
+  if (api !== "v2") return undefined;
+  const status = await managerFetch<QueueStatus>(
+    `/v2/manager/queue/status?client_id=${encodeURIComponent(MANAGER_CLIENT_ID)}`,
+    { base, soft: true },
+  );
+  return countsFromStatus(status);
+}
+
+export interface ManagerTaskHistoryEntry {
+  uiId: string;
+  kind?: string;
+  result?: string;
+}
+
+/**
+ * v4-only: look up ONE completed task in the Manager's queue history by exact
+ * ui_id (GET /v2/manager/queue/history?ui_id=…). Returns the entry when found,
+ * null when the Manager provably has NO such completed task ({}), and
+ * undefined when the answer cannot be trusted — non-v4 dialect (the legacy-UI
+ * history route knows only the file-based ?id= form, so it would not answer
+ * the question asked) or an unreadable response.
+ */
+export async function fetchManagerTaskHistoryEntry(
+  uiId: string,
+  base = managerBaseUrl(),
+): Promise<ManagerTaskHistoryEntry | null | undefined> {
+  let api: ManagerApi;
+  try {
+    api = await detectManagerApi(base);
+  } catch {
+    return undefined;
+  }
+  if (api !== "v2") return undefined;
+  const res = await managerFetch<{ history?: unknown }>(
+    `/v2/manager/queue/history?ui_id=${encodeURIComponent(uiId)}`,
+    { base, soft: true },
+  );
+  if (!res || typeof res !== "object" || !("history" in res)) return undefined;
+  const history = (res as { history: unknown }).history;
+  if (!history || typeof history !== "object" || Array.isArray(history)) return undefined;
+  const h = history as Record<string, unknown>;
+  if (typeof h.ui_id !== "string") {
+    // {"history": {}} is the provable "no such completed task". Anything else
+    // shaped wrong is not an answer we can act on.
+    return Object.keys(h).length === 0 ? null : undefined;
   }
   return {
-    pending,
-    inProgress,
-    processing:
-      typeof status.is_processing === "boolean" ? status.is_processing : inProgress > 0,
+    uiId: h.ui_id,
+    kind: typeof h.kind === "string" ? h.kind : undefined,
+    result: typeof h.result === "string" ? h.result : undefined,
   };
 }
 

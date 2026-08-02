@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { platform } from "node:os";
-import { config, getComfyUIBaseUrl } from "../config.js";
+import { config } from "../config.js";
 import { resolveInstallInterpreter } from "./workspace-env.js";
 import { queueUpdateAllCustomNodes } from "./node-management.js";
 import { ProcessControlError } from "../utils/errors.js";
@@ -225,24 +225,27 @@ export async function updateAllCustomNodes(): Promise<UpdateNodesResult> {
     // conservative marker: a transport failure cannot prove Manager did not
     // accept the request.
     //
-    // The marker carries the base URL it is about to be queued on, so the
-    // pin-write cancellation path (#689) can aim its queue reset at the
-    // ORIGINAL server even after a retarget.
+    // The marker starts BASE-UNKNOWN on purpose (#689 round 3): the base that
+    // matters is the one the ENQUEUE actually uses (captured inside
+    // queueUpdateAllCustomNodes), and guessing it here risks a retarget leaving
+    // the marker naming the WRONG server — which a later pin would reset and
+    // clear as "cancelled" while the update lands elsewhere. A base-unknown
+    // marker routes to the unverified/no-reset path instead.
     const detail =
       `an update_all request may have been handed to ComfyUI-Manager and can update EVERY ` +
       `installed pack — the sidebar panel included — on the Manager's own schedule ` +
       `(usually seconds to minutes; a ComfyUI restart then loads the result)`;
-    recordPanelPendingOp("update-all", detail, UPDATE_ALL_PENDING_MS, {
-      base: getComfyUIBaseUrl(),
-    });
+    recordPanelPendingOp("update-all", detail, UPDATE_ALL_PENDING_MS);
     const result = await queueUpdateAllCustomNodes();
 
     // Enrich the marker with what the ENQUEUE actually used: the base it
     // captured at invocation and the ui_id of the attempt that landed (a
-    // self-heal retry mints a fresh one). The ui_id lets a v4 host later
-    // answer "did the panel's task already run" via queue history. Best
-    // effort only — if the rewrite fails, the base-only marker above remains
-    // and cancellation still works; refusing now would punish a success.
+    // self-heal retry mints a fresh one). On v4 the ui_id identifies the
+    // update_all's per-pack tasks (each `${ui_id}_${pack}`) in the queue
+    // history, which is what makes a later pin's cancel PROVABLE (#689 round
+    // 3). If the rewrite fails, the marker stays base-unknown — never a stale
+    // base — so the pin-cancel path treats it as unverifiable and sends no
+    // blind reset. Refusing now would punish a success.
     try {
       recordPanelPendingOp("update-all", detail, UPDATE_ALL_PENDING_MS, {
         base: result.base,
@@ -251,7 +254,8 @@ export async function updateAllCustomNodes(): Promise<UpdateNodesResult> {
     } catch (err) {
       logger.warn(
         `[panel] update_all is queued, but the pending-op marker could not be ` +
-          `enriched with its ui_id (the base-only marker remains): ${
+          `enriched with its base/ui_id — it remains base-unknown, so a later ` +
+          `pin will report it as unverifiable rather than cancel blindly: ${
             err instanceof Error ? err.message : String(err)
           }`,
       );

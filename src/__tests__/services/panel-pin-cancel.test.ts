@@ -14,7 +14,14 @@
 // only); remote reports "cannot cancel — remote host" truthfully.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -66,6 +73,7 @@ import {
   resetManagerApiCacheForTests,
 } from "../../services/node-management.js";
 import { updateAllCustomNodes } from "../../services/update-comfyui.js";
+import { restoreNodeSnapshot } from "../../services/node-snapshots.js";
 import { registerInstallPanelTools } from "../../tools/install-panel.js";
 
 let dir: string;
@@ -133,23 +141,50 @@ interface QueueState {
   done: number;
 }
 
-/** A Manager v4 host whose queue state the test controls; POST reset wipes pending. */
-function v4Persona(state: QueueState, opts: { resetFails?: boolean } = {}) {
+interface V4PersonaOpts {
+  resetFails?: boolean;
+  /** Completed task ui_ids the Manager reports in its queue history. */
+  history?: Set<string>;
+  /** Counts for THIS orchestrator (the client_id=comfyui-mcp filter).
+   *  Defaults to the shared state object. */
+  mine?: QueueState;
+  /** Race injection run when the reset lands (e.g. dequeue a task first). */
+  onReset?: () => void;
+}
+
+/**
+ * A Manager v4 host whose queue state the test controls: shared counts,
+ * client-filtered counts (?client_id=comfyui-mcp), a queue-history lookup
+ * (?ui_id=), and a reset that wipes PENDING only (running survives).
+ */
+function v4Persona(state: QueueState, opts: V4PersonaOpts = {}) {
+  const mine = opts.mine ?? state;
+  const history = opts.history ?? new Set<string>();
   managerHandler = (url, init) => {
-    const path = new URL(url).pathname;
+    const u = new URL(url);
+    const path = u.pathname;
     const method = init?.method ?? "GET";
     if (path === "/v2/manager/queue/status" && method === "GET") {
+      const s = u.searchParams.get("client_id") === "comfyui-mcp" ? mine : state;
       return jsonRes({
-        total_count: state.done + state.inProgress + state.pending,
-        done_count: state.done,
-        in_progress_count: state.inProgress,
-        pending_count: state.pending,
-        is_processing: state.inProgress > 0,
+        total_count: s.done + s.inProgress + s.pending,
+        done_count: s.done,
+        in_progress_count: s.inProgress,
+        pending_count: s.pending,
+        is_processing: s.inProgress > 0,
       });
+    }
+    if (path === "/v2/manager/queue/history" && method === "GET") {
+      const uiId = u.searchParams.get("ui_id") ?? "";
+      return history.has(uiId)
+        ? jsonRes({ history: { ui_id: uiId, kind: "update", result: "done" } })
+        : jsonRes({ history: {} });
     }
     if (path === "/v2/manager/queue/reset" && method === "POST") {
       if (opts.resetFails) return new Response("boom", { status: 500 });
       state.pending = 0; // wipe_queue() clears PENDING only — running survives
+      mine.pending = 0;
+      opts.onReset?.();
       return new Response("", { status: 200 });
     }
     return new Response("not found", { status: 404 });
@@ -180,7 +215,7 @@ function legacyPersona(state: QueueState) {
   };
 }
 
-function recordUpdateAllMarker(extra: { base?: string } = { base: ORIG }) {
+function recordUpdateAllMarker(extra: { base?: string; uiId?: string } = { base: ORIG }) {
   return recordPanelPendingOp(
     "update-all",
     "an update_all request may have been handed to ComfyUI-Manager",
@@ -206,11 +241,16 @@ function cancelReports(report: Record<string, unknown>): CancellationReport[] {
 const resetPosts = () =>
   managerCalls.filter((c) => c.method === "POST" && c.url.includes("/manager/queue/reset"));
 
+const clientStatusGets = () => managerCalls.filter((c) => c.url.includes("client_id=comfyui-mcp"));
+
+const historyGets = () => managerCalls.filter((c) => c.url.includes("/manager/queue/history"));
+
 describe("pin write cancels a pending update_all (#689)", () => {
-  it("proven cancel: resets the queue ON THE MARKER'S SERVER, names the dropped counts, clears the marker", async () => {
-    recordUpdateAllMarker({ base: ORIG });
-    v4Persona({ pending: 2, inProgress: 0, done: 3 });
-    // Retarget AFTER the marker was recorded: the reset must still hit ORIG.
+  it("proven cancel (v4 + ui_id): resets ON THE MARKER'S SERVER after proving our tasks pending, names the counts, clears the marker", async () => {
+    recordUpdateAllMarker({ base: ORIG, uiId: "ui-1" });
+    // Shared queue has OTHER clients' work too — the report must name it.
+    v4Persona({ pending: 5, inProgress: 0, done: 3 }, { mine: { pending: 2, inProgress: 0, done: 1 } });
+    // Retarget AFTER the marker was recorded: everything must still hit ORIG.
     currentBase = "http://new:8188";
 
     const report = await writePin();
@@ -222,16 +262,23 @@ describe("pin write cancels a pending update_all (#689)", () => {
     // Every Manager call went to the marker's server — none to the new target.
     expect(managerCalls.length).toBeGreaterThan(0);
     expect(managerCalls.every((c) => c.url.startsWith(ORIG))).toBe(true);
+    // Proof came first: the panel's per-pack task ids were checked against the
+    // queue history, and OUR tasks were counted via the client filter — only
+    // then the reset.
+    expect(historyGets().some((c) => c.url.includes("ui_id=ui-1_comfyui-agent-panel"))).toBe(true);
+    expect(historyGets().some((c) => c.url.includes("ui_id=ui-1_comfyui-mcp-panel"))).toBe(true);
+    expect(clientStatusGets().length).toBeGreaterThanOrEqual(2); // before + after
     expect(resetPosts().map((c) => c.url)).toEqual([`${ORIG}/v2/manager/queue/reset`]);
 
-    // The report names the before/after pending counts — never "saved".
+    // The report names OUR dropped count AND the shared blast radius — never "saved".
     const [cancel] = cancelReports(report);
     expect(cancel.outcome).toBe("cancelled");
     expect(cancel.markerCleared).toBe(true);
     expect(cancel.pendingBefore).toBe(2);
     expect(cancel.pendingAfter).toBe(0);
     expect(cancel.inProgress).toBe(0);
-    expect(cancel.detail).toMatch(/dropped 2 pending task/);
+    expect(cancel.detail).toMatch(/dropped 2 of this orchestrator's pending task/);
+    expect(cancel.detail).toMatch(/Queue-wide pending went 5 → 0/);
 
     // Marker provably cleared; no residue warning in the note.
     expect(activePanelPendingOps()).toEqual([]);
@@ -240,23 +287,87 @@ describe("pin write cancels a pending update_all (#689)", () => {
     expect(report.note as string).toMatch(/Pending-op handling:/);
   });
 
-  it("base-less marker: best-effort reset on the current target, but UNVERIFIED — marker KEPT, never 'cancelled'", async () => {
+  it("shared pending from OTHER clients never triggers a reset — nothing of ours ⇒ already-drained", async () => {
+    // THE finding-1 case: our update_all already drained; only unrelated
+    // tasks are pending. A reset would clear THOSE (collateral) while
+    // claiming the panel was saved.
+    recordUpdateAllMarker({ base: ORIG, uiId: "ui-2" });
+    v4Persona({ pending: 5, inProgress: 1, done: 3 }, { mine: { pending: 0, inProgress: 0, done: 1 } });
+
+    const report = await writePin();
+
+    expect(resetPosts()).toHaveLength(0); // no collateral damage
+    const [cancel] = cancelReports(report);
+    expect(cancel.outcome).toBe("already-drained");
+    expect(cancel.markerCleared).toBe(true);
+    expect(cancel.detail).toMatch(/not pending, not running, and not in the Manager's/);
+    expect(activePanelPendingOps()).toEqual([]);
+  });
+
+  it("panel's task in the v4 queue history ⇒ already RAN — already-drained, NO reset", async () => {
+    recordUpdateAllMarker({ base: ORIG, uiId: "ui-9" });
+    v4Persona(
+      { pending: 4, inProgress: 0, done: 3 },
+      { mine: { pending: 2, inProgress: 0, done: 1 }, history: new Set(["ui-9_comfyui-agent-panel"]) },
+    );
+
+    const report = await writePin();
+
+    expect(resetPosts()).toHaveLength(0);
+    const [cancel] = cancelReports(report);
+    expect(cancel.outcome).toBe("already-drained");
+    expect(cancel.markerCleared).toBe(true);
+    expect(cancel.detail).toMatch(/queue history/);
+    expect(cancel.detail).toMatch(/already RAN/);
+    expect(cancel.detail).toMatch(/may ALREADY have been moved/);
+    expect(activePanelPendingOps()).toEqual([]);
+  });
+
+  it("v4 marker WITHOUT a ui_id: our pending work is ambiguous — NO reset, could-not-verify", async () => {
+    recordUpdateAllMarker({ base: ORIG }); // has base, no uiId
+    v4Persona({ pending: 3, inProgress: 0, done: 1 }, { mine: { pending: 2, inProgress: 0, done: 1 } });
+
+    const report = await writePin();
+
+    expect(clientStatusGets().length).toBe(1); // it looked…
+    expect(resetPosts()).toHaveLength(0); // …but could not prove, so no blind reset
+    const [cancel] = cancelReports(report);
+    expect(cancel.outcome).toBe("could-not-verify");
+    expect(cancel.markerCleared).toBe(false);
+    expect(cancel.detail).toMatch(/recorded no ui_id/);
+    expect(cancel.detail).toMatch(/NO reset was sent/);
+    expect(activePanelPendingOps()).toHaveLength(1);
+    expect(report.note as string).toMatch(/WARNING/);
+  });
+
+  it("v4 marker without a ui_id, nothing of ours in flight: already-drained", async () => {
+    recordUpdateAllMarker({ base: ORIG });
+    v4Persona({ pending: 4, inProgress: 0, done: 1 }, { mine: { pending: 0, inProgress: 0, done: 1 } });
+
+    const report = await writePin();
+
+    expect(resetPosts()).toHaveLength(0);
+    const [cancel] = cancelReports(report);
+    expect(cancel.outcome).toBe("already-drained");
+    expect(cancel.markerCleared).toBe(true);
+    expect(activePanelPendingOps()).toEqual([]);
+  });
+
+  it("base-less marker: NO blind reset even with pending work on the current target — UNVERIFIED, marker kept", async () => {
     recordUpdateAllMarker({}); // no base captured (older marker shape)
     v4Persona({ pending: 1, inProgress: 0, done: 0 });
 
     const report = await writePin();
 
-    // The reset IS attempted on the current target (the likely server)...
-    expect(resetPosts().map((c) => c.url)).toEqual([`${ORIG}/v2/manager/queue/reset`]);
-    // ...but it proves nothing about the real server, so no proven outcome is
-    // reported and the marker + warning stay.
+    // Round 3: a reset here could wipe an innocent server's queue, so none is
+    // sent at all — the outcome can never be proven from the wrong server.
+    expect(resetPosts()).toHaveLength(0);
     const [cancel] = cancelReports(report);
     expect(cancel.outcome).toBe("could-not-verify");
     expect(cancel.markerCleared).toBe(false);
     expect(cancel.detail).toMatch(/recorded NO server/);
-    expect(cancel.detail).toMatch(/UNVERIFIED/);
-    expect(cancel.detail).toMatch(/best-effort/);
-    expect(cancel.detail).not.toMatch(/cancelled the queued update_all/);
+    expect(cancel.detail).toMatch(/NO reset was sent/);
+    expect(cancel.detail).not.toMatch(/cancelled the queued update_all|best-effort/);
     expect(activePanelPendingOps()).toHaveLength(1);
     expect(report.pendingPanelOps).toHaveLength(1);
     expect(report.note as string).toMatch(/WARNING — a panel-affecting operation is still pending/);
@@ -278,7 +389,7 @@ describe("pin write cancels a pending update_all (#689)", () => {
   });
 
   it("reset failure: marker KEPT, warning preserved, nothing claimed", async () => {
-    recordUpdateAllMarker();
+    recordUpdateAllMarker({ base: ORIG, uiId: "ui-3" });
     v4Persona({ pending: 2, inProgress: 0, done: 3 }, { resetFails: true });
 
     const report = await writePin();
@@ -287,7 +398,7 @@ describe("pin write cancels a pending update_all (#689)", () => {
     const [cancel] = cancelReports(report);
     expect(cancel.outcome).toBe("could-not-verify");
     expect(cancel.markerCleared).toBe(false);
-    expect(cancel.detail).toMatch(/reset FAILED/);
+    expect(cancel.detail).toMatch(/queue reset on .* FAILED/);
     // The marker and today's warning survive.
     expect(activePanelPendingOps()).toHaveLength(1);
     expect(report.pendingPanelOps).toHaveLength(1);
@@ -310,8 +421,8 @@ describe("pin write cancels a pending update_all (#689)", () => {
   });
 
   it("in-flight (already dequeued): cannot cancel, NO reset sent, never 'saved'", async () => {
-    recordUpdateAllMarker();
-    v4Persona({ pending: 0, inProgress: 1, done: 3 });
+    recordUpdateAllMarker({ base: ORIG, uiId: "ui-4" });
+    v4Persona({ pending: 0, inProgress: 1, done: 3 }, { mine: { pending: 0, inProgress: 1, done: 1 } });
 
     const report = await writePin();
 
@@ -327,9 +438,13 @@ describe("pin write cancels a pending update_all (#689)", () => {
     expect(report.note as string).toMatch(/WARNING — a panel-affecting operation is still pending/);
   });
 
-  it("partial: pending dropped but a task is running — marker KEPT, both halves reported", async () => {
-    recordUpdateAllMarker();
-    v4Persona({ pending: 2, inProgress: 1, done: 3 });
+  it("partial: pending dropped but a task started running in the race — marker KEPT, both halves reported", async () => {
+    recordUpdateAllMarker({ base: ORIG, uiId: "ui-5" });
+    const mine: QueueState = { pending: 2, inProgress: 0, done: 1 };
+    v4Persona(
+      { pending: 2, inProgress: 0, done: 3 },
+      { mine, onReset: () => { mine.inProgress = 1; } }, // dequeued mid-reset
+    );
 
     const report = await writePin();
 
@@ -340,14 +455,14 @@ describe("pin write cancels a pending update_all (#689)", () => {
     expect(cancel.pendingBefore).toBe(2);
     expect(cancel.pendingAfter).toBe(0);
     expect(cancel.inProgress).toBe(1);
-    expect(cancel.detail).toMatch(/dropped 2 pending task/);
+    expect(cancel.detail).toMatch(/dropped 2 of this orchestrator's pending task/);
     expect(cancel.detail).toMatch(/already RUNNING and in-flight work cannot be cancelled/);
     expect(activePanelPendingOps()).toHaveLength(1);
     expect(report.note as string).toMatch(/WARNING/);
   });
 
-  it("already drained: nothing left to cancel — marker cleared, panel may ALREADY have moved", async () => {
-    recordUpdateAllMarker();
+  it("already drained (no trace of the panel's task): marker cleared, truthfully not a cancel", async () => {
+    recordUpdateAllMarker({ base: ORIG, uiId: "ui-6" });
     v4Persona({ pending: 0, inProgress: 0, done: 3 });
 
     const report = await writePin();
@@ -356,23 +471,37 @@ describe("pin write cancels a pending update_all (#689)", () => {
     const [cancel] = cancelReports(report);
     expect(cancel.outcome).toBe("already-drained");
     expect(cancel.markerCleared).toBe(true);
-    expect(cancel.detail).toMatch(/NOTHING left to cancel/);
-    expect(cancel.detail).toMatch(/may ALREADY have been moved/);
-    expect(cancel.detail).not.toMatch(/cancelled|dropped/);
+    expect(cancel.detail).toMatch(/NOTHING remains that can move the panel/);
+    expect(cancel.detail).not.toMatch(/cancelled the queued|dropped \d/);
     expect(activePanelPendingOps()).toEqual([]);
   });
 
-  it("legacy 3.x: pending derived by total−done−in_progress, reset on the unprefixed route", async () => {
-    recordUpdateAllMarker();
+  it("legacy 3.x: pending work can never be attributed — NO blind reset, could-not-verify", async () => {
+    recordUpdateAllMarker({ base: ORIG, uiId: "ui-7" }); // uiId is useless on 3.x
     legacyPersona({ pending: 2, inProgress: 0, done: 2 });
 
     const report = await writePin();
 
-    expect(resetPosts().map((c) => c.url)).toEqual([`${ORIG}/manager/queue/reset`]);
+    expect(resetPosts()).toHaveLength(0); // 3.x has no task history — never reset
     const [cancel] = cancelReports(report);
-    expect(cancel.outcome).toBe("cancelled");
-    expect(cancel.pendingBefore).toBe(2);
-    expect(cancel.pendingAfter).toBe(0);
+    expect(cancel.outcome).toBe("could-not-verify");
+    expect(cancel.markerCleared).toBe(false);
+    expect(cancel.pendingBefore).toBe(2); // still measured via total−done−in_progress
+    expect(cancel.detail).toMatch(/no task history/);
+    expect(cancel.detail).toMatch(/NO reset was sent/);
+    expect(activePanelPendingOps()).toHaveLength(1);
+  });
+
+  it("legacy 3.x, empty and idle: already-drained via the arithmetic counts", async () => {
+    recordUpdateAllMarker({ base: ORIG });
+    legacyPersona({ pending: 0, inProgress: 0, done: 3 });
+
+    const report = await writePin();
+
+    expect(resetPosts()).toHaveLength(0);
+    const [cancel] = cancelReports(report);
+    expect(cancel.outcome).toBe("already-drained");
+    expect(cancel.markerCleared).toBe(true);
     expect(activePanelPendingOps()).toEqual([]);
   });
 
@@ -557,6 +686,33 @@ describe("pin write cancels a deferred snapshot restore (#689)", () => {
   });
 });
 
+describe("the snapshot restore marker follows the POST's actual target (#689 round 3)", () => {
+  it("a mid-call retarget cannot split the marker and the restore POST across servers", async () => {
+    managerHandler = (url, init) => {
+      const path = new URL(url).pathname;
+      if (path === "/snapshot/restore" && init?.method === "POST") {
+        // Retarget DURING the call: anything resolving the base afterwards
+        // would get the new server — but the POST and its marker were pinned
+        // to the target captured at the start of the operation.
+        currentBase = "http://new:8188";
+        return new Response("", { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    };
+
+    const result = await restoreNodeSnapshot("prod");
+
+    expect(result.message).toMatch(/requested/i);
+    // The POST went to the target pinned at the start…
+    const posts = managerCalls.filter((c) => c.url.includes("/snapshot/restore"));
+    expect(posts.map((c) => c.url)).toEqual([`${ORIG}/snapshot/restore`]);
+    // …and the marker names THAT server, not the new one.
+    const ops = activePanelPendingOps();
+    expect(ops).toHaveLength(1);
+    expect(ops[0].base).toBe(ORIG);
+  });
+});
+
 describe("pin write with no pending markers", () => {
   it("makes NO Manager calls at all", async () => {
     const report = await writePin();
@@ -601,6 +757,88 @@ describe("the update_all marker captures base + ui_id at enqueue (#689)", () => 
     expect(ops[0].kind).toBe("update-all");
     expect(ops[0].base).toBe(ORIG);
     expect(ops[0].uiId).toBe(enqueuedUiId);
+  });
+
+  it("the marker is BASE-UNKNOWN until the enqueue proves the target — no stale base can survive (#689 round 3)", async () => {
+    let markerDuringEnqueue: { ops: Array<{ base?: string; uiId?: string }> } | undefined;
+    managerHandler = (url, init) => {
+      const u = new URL(url);
+      const method = init?.method ?? "GET";
+      if (u.pathname === "/v2/manager/queue/status" && method === "GET") {
+        return jsonRes({
+          total_count: 0,
+          done_count: 0,
+          in_progress_count: 0,
+          pending_count: 0,
+          is_processing: false,
+        });
+      }
+      if (u.pathname === "/v2/manager/queue/update_all" && method === "POST") {
+        // What the marker on disk says DURING the enqueue: it must not name a
+        // server yet — a retarget before this point could have made it stale.
+        markerDuringEnqueue = JSON.parse(
+          readFileSync(process.env.COMFYUI_MCP_PANEL_PENDING as string, "utf-8"),
+        ) as typeof markerDuringEnqueue;
+        return jsonRes({});
+      }
+      if (u.pathname === "/v2/manager/queue/start" && method === "POST") {
+        return new Response("", { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    };
+
+    await updateAllCustomNodes();
+
+    expect(markerDuringEnqueue?.ops).toHaveLength(1);
+    expect(markerDuringEnqueue?.ops[0].base).toBeUndefined();
+    expect(markerDuringEnqueue?.ops[0].uiId).toBeUndefined();
+    // …and after the enqueue it is enriched with the proven base + ui_id
+    // (asserted by the previous test).
+  });
+
+  it("enrichment failure never leaves a stale base — the marker reads as unverifiable (#689 round 3)", async () => {
+    managerHandler = (url, init) => {
+      const u = new URL(url);
+      const method = init?.method ?? "GET";
+      if (u.pathname === "/v2/manager/queue/status" && method === "GET") {
+        return jsonRes({
+          total_count: 0,
+          done_count: 0,
+          in_progress_count: 0,
+          pending_count: 0,
+          is_processing: false,
+        });
+      }
+      if (u.pathname === "/v2/manager/queue/update_all" && method === "POST") {
+        // Break the marker store between the initial record and the enrichment.
+        writeFileSync(process.env.COMFYUI_MCP_PANEL_PENDING as string, "{ not json");
+        return jsonRes({});
+      }
+      if (u.pathname === "/v2/manager/queue/start" && method === "POST") {
+        return new Response("", { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    };
+
+    // The update still reports "queued" (a marker problem must not punish a
+    // success)…
+    const result = await updateAllCustomNodes();
+    expect(result.message).toMatch(/[Qq]ueued/);
+    // …and the corrupt record reads as a synthetic UNKNOWN marker (fail
+    // closed) — never as a stale base the pin path could trust.
+    const ops = activePanelPendingOps();
+    expect(ops).toHaveLength(1);
+    expect(ops[0].kind).toBe("unknown");
+
+    // A pin afterwards cannot prove anything, sends NOTHING, and keeps the
+    // warning.
+    managerHandler = () => new Response("not found", { status: 404 });
+    const report = await writePin();
+    expect(resetPosts()).toHaveLength(0);
+    const [cancel] = cancelReports(report);
+    expect(cancel.outcome).toBe("cannot-cancel");
+    expect(cancel.markerCleared).toBe(false);
+    expect(report.note as string).toMatch(/WARNING/);
   });
 });
 
