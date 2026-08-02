@@ -209,6 +209,94 @@ describe("resolveInstallInterpreter (#651)", () => {
     }
   });
 
+  it("uses the OS-OBSERVED interpreter when the port owner corroborates the server argv (#401)", async () => {
+    const root = await tmpDir();
+    try {
+      await writeFile(join(root, "main.py"), "", "utf-8");
+      await makeVenvPython(root);
+      mockGetSystemStats.mockResolvedValue({ system: { argv: [join(root, "main.py")] } });
+      h.mockLiveInterpreter.mockReturnValue({
+        python: "D:/ComfyUI/.venv/Scripts/python.exe",
+        source: "process-table",
+        pid: 777,
+      });
+
+      await expect(resolveInstallInterpreter(root)).resolves.toMatchObject({
+        python: "D:/ComfyUI/.venv/Scripts/python.exe",
+        source: "observed",
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("maps an identity-confirmed launch record from the observation channel to source launched", async () => {
+    const root = await tmpDir();
+    try {
+      await writeFile(join(root, "main.py"), "", "utf-8");
+      await makeVenvPython(root);
+      mockGetSystemStats.mockResolvedValue({ system: { argv: [join(root, "main.py")] } });
+      h.mockLiveInterpreter.mockReturnValue({
+        python: "D:/ComfyUI/.venv/Scripts/python.exe",
+        source: "launched-by-us",
+        pid: 4242,
+      });
+
+      await expect(resolveInstallInterpreter(root)).resolves.toMatchObject({
+        python: "D:/ComfyUI/.venv/Scripts/python.exe",
+        source: "launched",
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not let an observation bypass the different-install refusal", async () => {
+    const parent = await tmpDir();
+    try {
+      const requested = join(parent, "requested");
+      const live = join(parent, "live");
+      await mkdir(live, { recursive: true });
+      await writeFile(join(live, "main.py"), "", "utf-8");
+      await makeVenvPython(requested);
+      mockGetSystemStats.mockResolvedValue({ system: { argv: [join(live, "main.py")] } });
+      h.mockLiveInterpreter.mockReturnValue({
+        python: "D:/elsewhere/python.exe",
+        source: "process-table",
+        pid: 777,
+      });
+
+      const result = await resolveInstallInterpreter(requested);
+
+      expect(result.source).toBe("undetermined");
+      expect(result).not.toHaveProperty("python");
+      expect(result.reason).toContain("different install");
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("does not let an observation bypass the no-resolvable-main.py refusal", async () => {
+    const root = await tmpDir();
+    try {
+      await makeVenvPython(root);
+      mockGetSystemStats.mockResolvedValue({ system: { argv: ["--port", "8188"] } });
+      h.mockLiveInterpreter.mockReturnValue({
+        python: "D:/elsewhere/python.exe",
+        source: "process-table",
+        pid: 777,
+      });
+
+      const result = await resolveInstallInterpreter(root);
+
+      expect(result.source).toBe("undetermined");
+      expect(result.python).toBeUndefined();
+      expect(result.reason).toContain("main.py");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("refuses in remote mode: a local install would not affect the remote server", async () => {
     const root = await tmpDir();
     try {

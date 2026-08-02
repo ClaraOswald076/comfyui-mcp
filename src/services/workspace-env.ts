@@ -709,7 +709,7 @@ export function resolveComfyuiPython(
 // Install interpreter resolution (#651)
 // ---------------------------------------------------------------------------
 
-export type InstallInterpreterSource = "override" | "launched" | "undetermined";
+export type InstallInterpreterSource = "override" | "launched" | "observed" | "undetermined";
 
 export interface InstallInterpreterResolution {
   python?: string;
@@ -778,11 +778,13 @@ function targetsLiveInstall(serverRoot: string, requestedRoot: string | undefine
  * Resolve a package-install interpreter without claiming that a path-shaped guess is
  * the process that is currently serving ComfyUI.  A server that this MCP launched is
  * authoritative because we recorded its executable; an explicit COMFYUI_PYTHON is the
- * operator's own claim.  In every other case the live interpreter is UNOBSERVABLE —
- * /system_stats has no sys.executable, so even a single discovered `.venv` may be
- * unrelated (for example, the server can be using system Python).  FAIL CLOSED:
- * refuse rather than report an install into a layout-guessed env as applied when the
- * running server may not be able to import from it (#651).
+ * operator's own claim; and the OS process table is ground truth when the port owner's
+ * command line corroborates the server's own argv (#401).  In every other case the
+ * live interpreter is UNOBSERVABLE — /system_stats has no sys.executable, so even a
+ * single discovered `.venv` may be unrelated (for example, the server can be using
+ * system Python).  FAIL CLOSED: refuse rather than report an install into a
+ * layout-guessed env as applied when the running server may not be able to import
+ * from it (#651).
  */
 export async function resolveInstallInterpreter(
   root: string | undefined,
@@ -832,6 +834,34 @@ export async function resolveInstallInterpreter(
       `The running ComfyUI is a different install ("${serverRoot}") than the requested path; ` +
         "installing into the requested layout would not affect the live server.",
     );
+  }
+  // OBSERVED ground truth (#401): /system_stats cannot name the interpreter, but the
+  // OS can — the process holding our port, its command line correlated against the
+  // server's OWN argv so a proxy or forwarder can never pass its env off as
+  // ComfyUI's. This strictly ADDS a success source: every refusal above still
+  // stands, and when nothing observes the interpreter the install still refuses
+  // (#651 fail-closed).
+  let statsHost: string | undefined;
+  try {
+    statsHost = new URL(getComfyUIBaseUrl()).hostname;
+  } catch {
+    /* unparseable target → no host filter */
+  }
+  const live = resolveLiveInterpreter({
+    port: config.resolvedPort,
+    host: statsHost,
+    remote: false,
+    serverArgv: system?.argv,
+  });
+  if (live) {
+    return {
+      python: live.python,
+      source: live.source === "launched-by-us" ? "launched" : "observed",
+      reason:
+        live.source === "launched-by-us"
+          ? `Using "${live.python}", the interpreter this MCP server launched the running ComfyUI with (identity-confirmed for PID ${live.pid}).`
+          : `Using "${live.python}", the interpreter the OS reports for the running ComfyUI process (PID ${live.pid}), corroborated against the server's own argv.`,
+    };
   }
   return refuse(
     `Cannot determine which interpreter the running ComfyUI at "${serverRoot}" uses: ` +
