@@ -1522,6 +1522,40 @@ export async function restartComfyUI(): Promise<RestartResult> {
   };
 }
 
+/**
+ * Refuse-safe preflight for an OUT-OF-BAND restart — one that stops ComfyUI
+ * WITHOUT going through our validated kill+relaunch (e.g. the panel's
+ * ComfyUI-Manager reboot, which asks the Manager to cycle the process and never
+ * consults our relaunch command). The same atomic-ish invariant as
+ * restartComfyUI applies (#368/#370): a stop must never happen before a
+ * relaunch is proven possible. On a Pinokio-style install (#742) the running
+ * server is externally supervised yet its relaunch is NOT provable from here
+ * (a relative `main.py` argv with no COMFYUI_PATH/workspace anchor and no live
+ * process cwd), and the supervisor does NOT re-launch after a plain Manager
+ * restart — so the reboot would kill ComfyUI permanently. Only the PROVEN
+ * dangerous shape refuses: a reachable, running, non-Desktop local instance
+ * whose relaunch command cannot be built/validated. Everything else returns
+ * ok:true and the caller proceeds exactly as before:
+ *   - remote mode (no local process to assess);
+ *   - nothing found / unreachable-but-unmapped (no proven running process —
+ *     #449 already punts those to a Manager reboot on purpose);
+ *   - a Desktop app (Electron-supervised — the Manager reboot IS its safe
+ *     restart path, #400);
+ *   - a validated relaunch (assessRelaunch, the #476/#426 machinery).
+ */
+export async function preflightLocalRestart(): Promise<{
+  ok: boolean;
+  reason?: string;
+}> {
+  if (isRemoteMode()) return { ok: true };
+  const { info } = await acquireProcessInfo();
+  if (!info) return { ok: true };
+  if (info.isDesktopApp) return { ok: true };
+  const relaunch = assessRelaunch(info);
+  if (relaunch.ok) return { ok: true };
+  return { ok: false, reason: relaunch.reason };
+}
+
 export const __processControlTestHooks = {
   reset(): void {
     detachSupervisor();

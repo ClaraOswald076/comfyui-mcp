@@ -59,6 +59,7 @@ vi.mock("../../services/env-capabilities.js", () => ({
 import {
   __processControlTestHooks,
   parseListenerPidFromNetstat,
+  preflightLocalRestart,
   restartComfyUI,
   startComfyUI,
   stopComfyUI,
@@ -695,6 +696,149 @@ describe("findPidByPort resilience to localized netstat state (#449)", () => {
       mockExecSync.mock.calls.some(([c]) => /taskkill/i.test(String(c))),
     ).toBe(false);
     expect(killSpy).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  });
+});
+
+describe("restart truthfulness + Pinokio-shaped refusal (#742)", () => {
+  // Same live-port wiring as the #368/#370 preflight suite: a live PID on the
+  // port (so the running instance is found) with every kill recorded, so a test
+  // can prove the server was NOT taken down.
+  function mockLivePortNoKill(): void {
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (cmd.includes("netstat"))
+        return "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
+      if (cmd.includes("lsof")) return "p4321\nn127.0.0.1:8188\n";
+      return ""; // tasklist / taskkill / `if exist` → nothing
+    });
+  }
+
+  // The #742 shape: a Pinokio-managed ComfyUI — externally supervised, launched
+  // as a RELATIVE `main.py`, with no COMFYUI_PATH anchor and no resolvable
+  // interpreter from here. A plain Manager restart kills it and the supervisor
+  // does NOT re-launch it, so any restart from us must refuse BEFORE a stop.
+  function mockPinokioShapedInstall(): void {
+    mockLivePortNoKill();
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: ["main.py", "--port", "8188"] },
+    });
+    mockConfig.comfyuiPath = undefined;
+    mockFindComfyuiPython.mockReturnValue(undefined);
+  }
+
+  it("preflightLocalRestart refuses a Pinokio-shaped install (no resolvable main.py/interpreter)", async () => {
+    mockPinokioShapedInstall();
+
+    const preflight = await preflightLocalRestart();
+
+    expect(preflight.ok).toBe(false);
+    expect(preflight.reason).toMatch(/could not build a relaunch command/i);
+  });
+
+  it("restartComfyUI refuses a Pinokio-shaped install BEFORE any stop (no kill, no spawn)", async () => {
+    mockPinokioShapedInstall();
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(false);
+    expect(result.started).toBe(false);
+    expect(result.message).toMatch(/refusing to restart/i);
+    expect(result.message).toMatch(/left running/i);
+    expect(result.message).not.toMatch(/cancel/i);
+    // Server left running: no kill, no relaunch spawn, no client reset.
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(mockResetClient).not.toHaveBeenCalled();
+    expect(
+      mockExecSync.mock.calls.some(([c]) => /taskkill/i.test(String(c))),
+    ).toBe(false);
+    expect(killSpy).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  });
+
+  it("preflightLocalRestart passes a resolvable local install", async () => {
+    mockLivePortNoKill();
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: ["/fake/ComfyUI/main.py", "--port", "8188"] },
+    });
+    // Default mocks: interpreter resolved, every path exists.
+
+    const preflight = await preflightLocalRestart();
+
+    expect(preflight.ok).toBe(true);
+  });
+
+  it("preflightLocalRestart passes a Desktop app (the Manager reboot IS its safe path, #400)", async () => {
+    mockLivePortNoKill();
+    mockGetSystemStats.mockResolvedValue({
+      system: {
+        argv: [
+          "C:\\Users\\x\\AppData\\Local\\Programs\\Comfy Desktop\\resources\\ComfyUI\\main.py",
+          "--port",
+          "8188",
+        ],
+      },
+    });
+    mockExistsSync.mockImplementation(() => false); // relaunch never consulted
+
+    const preflight = await preflightLocalRestart();
+
+    expect(preflight.ok).toBe(true);
+  });
+
+  it("preflightLocalRestart passes when no running process can be proven", async () => {
+    mockNoPortProcess();
+    mockGetSystemStats.mockRejectedValue(new Error("connection refused"));
+
+    const preflight = await preflightLocalRestart();
+
+    expect(preflight.ok).toBe(true);
+  });
+
+  it("stop succeeded but relaunch fails → truthful lost-server message, never 'cancelled' (#742)", async () => {
+    let killed = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill/i.test(String(cmd))) {
+        killed = true;
+        return "";
+      }
+      if (cmd.includes("netstat")) {
+        if (killed) return ""; // port freed after the kill
+        return "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
+      }
+      if (cmd.includes("lsof")) {
+        if (killed) throw new Error("not listening");
+        return "p4321\nn127.0.0.1:8188\n";
+      }
+      return ""; // tasklist / `sleep 1 && kill -9` / etc.
+    });
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: ["/fake/ComfyUI/main.py", "--port", "8188"] },
+    });
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => {
+      killed = true;
+      return true;
+    });
+    const children = mockSpawnedChildren();
+    // Readiness never resolves; the relaunch's spawn error short-circuits it.
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => undefined)));
+
+    const pending = restartComfyUI();
+    await vi.waitFor(() => expect(children.length).toBe(1), {
+      timeout: 10000,
+      interval: 20,
+    });
+    children[0].emit("error", spawnError());
+    const result = await pending;
+
+    // The stop DID happen — the report must say so truthfully.
+    expect(result.stopped).toBe(true);
+    expect(result.started).toBe(false);
+    expect(result.message).toMatch(/stopped but could not be started/i);
+    expect(result.message).not.toMatch(/cancel/i);
+    expect(result.spawn_error).toBeTruthy();
 
     killSpy.mockRestore();
   });

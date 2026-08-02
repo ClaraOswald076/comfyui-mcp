@@ -92,6 +92,9 @@ beforeEach(() => {
   hoisted.remoteMode.value = false;
   hoisted.restart.mockClear();
   hoisted.restart.mockResolvedValue({ stopped: true, started: true, ready: true, message: "restarted" });
+  // The #742 refuse-safe preflight passes by default here (the live one would
+  // probe real processes/ports); these tests exercise the post-dispatch paths.
+  __panelToolsTestHooks.setLocalRestartPreflight(async () => ({ ok: true }));
   __panelToolsTestHooks.setPanelRebootTiming({
     settleMs: 0,
     budgetMs: 50,
@@ -109,6 +112,7 @@ beforeEach(() => {
 afterEach(() => {
   __panelToolsTestHooks.setPanelRebootTiming(null);
   __panelToolsTestHooks.setHealthProbe(null);
+  __panelToolsTestHooks.setLocalRestartPreflight(null);
 });
 
 describe("rebootNoEndpoint classifier", () => {

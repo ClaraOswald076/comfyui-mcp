@@ -63,7 +63,7 @@ import {
   resetObjectInfoCache,
 } from "../comfyui/client.js";
 import { convertUiToApi, collectNodeTypes } from "../services/workflow-converter.js";
-import { restartComfyUI } from "../services/process-control.js";
+import { restartComfyUI, preflightLocalRestart } from "../services/process-control.js";
 import { resetManagerApiCache } from "../services/manager-api-cache.js";
 import {
   isRemoteMode,
@@ -308,6 +308,13 @@ export const __panelToolsTestHooks = {
       | null,
   ): void {
     healthProbeOverride = fn;
+  },
+  /** Inject a fake #742 restart preflight so reboot tests don't probe real
+   *  processes/ports. null restores the live preflightLocalRestart. */
+  setLocalRestartPreflight(
+    fn: (() => Promise<{ ok: boolean; reason?: string }>) | null,
+  ): void {
+    localRestartPreflightOverride = fn;
   },
   looksLikeSystemStats,
   probeComfyHealth,
@@ -805,6 +812,12 @@ function captureRebootHealthBase(ctx: PanelToolCtx): string | null {
 
 let healthProbeOverride:
   | ((base: string | null, timeoutMs: number) => Promise<boolean | ProbeStatus>)
+  | null = null;
+
+/** Test injection for the #742 refuse-safe restart preflight (the real one is
+ *  preflightLocalRestart in process-control). null → the live preflight. */
+let localRestartPreflightOverride:
+  | (() => Promise<{ ok: boolean; reason?: string }>)
   | null = null;
 
 /**
@@ -5340,7 +5353,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_restart_comfyui",
-      "Restart the user's ComfyUI server via the built-in Manager — needed to load newly installed/updated custom nodes. CALL THIS DIRECTLY when a restart is needed: it pops a confirm card and only restarts on a yes (don't ask separately first). ComfyUI and this agent go down briefly, then the panel auto-reconnects and you resume. ⚠️ BUSY GUARD: a restart ABORTS any in-progress or queued generation — if ComfyUI is generating, this tool REFUSES and tells you (it does NOT restart). When that happens, tell the user a render is running and WAIT for it (poll panel_node_queue_status), or pass force:true ONLY if the user explicitly confirms they want to kill the running generation. Best practice: before restarting after an install, check the queue is idle first. Only call when a restart is actually needed.",
+      "Restart the user's ComfyUI server via the built-in Manager — needed to load newly installed/updated custom nodes. CALL THIS DIRECTLY when a restart is needed: it pops a confirm card and only restarts on a yes (don't ask separately first). ComfyUI and this agent go down briefly, then the panel auto-reconnects and you resume. ⚠️ BUSY GUARD: a restart ABORTS any in-progress or queued generation — if ComfyUI is generating, this tool REFUSES and tells you (it does NOT restart). When that happens, tell the user a render is running and WAIT for it (poll panel_node_queue_status), or pass force:true ONLY if the user explicitly confirms they want to kill the running generation. Best practice: before restarting after an install, check the queue is idle first. Only call when a restart is actually needed. On an externally-managed install whose relaunch can't be proven from here (e.g. Pinokio), the restart is REFUSED before anything is stopped — restart from the launcher that owns the server instead.",
       { force: z.boolean().optional() },
       async ({ force }, ctx) => {
         // Whole-handler budget (#536): confirm + dispatch + readiness — INCLUDING
@@ -5389,6 +5402,41 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           );
         }
         if (decision !== "yes") {
+          // #742: NEVER claim "not restarted" while the server is actually DOWN.
+          // A decline reaches here when the user picked "No" — but ALSO when the
+          // confirm card could not be answered because the panel tab died WITH
+          // the server (confirm maps any non-timeout card error to "no"; e.g. a
+          // reboot accepted moments earlier in the same turn already stopped
+          // ComfyUI, and nothing re-launched it). Probe the same endpoint the
+          // reboot observer would use (falling back to the configured target,
+          // exactly what health_check probes) before making a state claim. Only
+          // a PROVEN-down endpoint (ECONNREFUSED — nothing is listening) flips
+          // the report; healthy/unknown keeps the plain cancel line so a genuine
+          // decline is never alarmist.
+          const cancelProbeBase = captureRebootHealthBase(ctx) ?? getComfyUIBaseUrl();
+          const cancelProbe = healthProbeOverride ?? probeComfyEndpoint;
+          let cancelStatus: ProbeStatus = "unknown";
+          try {
+            cancelStatus = normalizeProbe(
+              await cancelProbe(
+                cancelProbeBase,
+                Math.max(1, Math.min(3000, overallDeadline - Date.now())),
+              ),
+            );
+          } catch {
+            cancelStatus = "unknown";
+          }
+          if (cancelStatus === "down") {
+            return ok(
+              "⚠️ ComfyUI is DOWN — it was STOPPED and did not come back, so do NOT treat " +
+                "this as \"nothing happened\". The restart just declined was NOT what stopped " +
+                "it (nothing was dispatched after the decline), but a restart initiated " +
+                "earlier already took the server down and it never returned. Start ComfyUI " +
+                "manually from whatever launches it (e.g. Pinokio, the Desktop app, or your " +
+                "terminal), then reload the panel tab so it reconnects. restart_comfyui can " +
+                "attempt the relaunch for you when the install's launch path is resolvable.",
+            );
+          }
           return ok("Cancelled — ComfyUI was not restarted.");
         }
         // Heal an orphaned session onto the live tab FIRST, then bind the reboot dispatch
@@ -5404,6 +5452,37 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // routing id while the original is still reconnecting.
         const preRestartPanelIdentity = ctx.panelConnectionIdentity?.();
         const healthBase = captureRebootHealthBase(ctx);
+        // #742 REFUSE-SAFE PREFLIGHT: a Manager reboot stops ComfyUI OUT-OF-BAND —
+        // it never goes through our validated kill+relaunch — so before dispatching
+        // anything, the stop must be provable survivable (#368/#370: losing a restart
+        // is cheap, losing the server is not). On a Pinokio-style install (externally
+        // supervised; no main.py/interpreter resolvable from here) a plain Manager
+        // restart kills the process and the supervisor does NOT re-launch it — the
+        // exact #742 lost-server. When the reboot would target OUR local boot
+        // instance (the same instance binding the legacy fallback uses), prove a
+        // relaunch is possible FIRST and refuse BEFORE any stop when it isn't. Only
+        // the PROVEN-dangerous shape refuses (a reachable local non-Desktop process
+        // with an unbuildable/unvalidatable relaunch); every other shape — Desktop
+        // (Electron-supervised, #400), unverifiable, or remote — proceeds exactly as
+        // before.
+        if (healthBase != null && sameHttpBase(getComfyUIBaseUrl(), healthBase)) {
+          const preflight = await (localRestartPreflightOverride ?? preflightLocalRestart)();
+          if (!preflight.ok) {
+            return ok({
+              rebooting: false,
+              ready: false,
+              confirmed_cycle: false,
+              refused: true,
+              note:
+                `Refusing to restart ComfyUI: ${preflight.reason} This looks like an ` +
+                "externally-managed install (e.g. Pinokio): a restart from here would STOP " +
+                "ComfyUI and nothing would bring it back automatically, so it was refused " +
+                "BEFORE anything was stopped — ComfyUI is still running. Restart it from the " +
+                "launcher that owns it (e.g. Pinokio's own controls), or point COMFYUI_PATH " +
+                "at the live install so a relaunch can be proven and use restart_comfyui.",
+            });
+          }
+        }
         const timing = getPanelRebootTiming();
         const dispatchTimeout = Math.max(1, Math.min(15000, overallDeadline - Date.now()));
         // CONCURRENT OBSERVATION (coordinator): start probing the fixed boot endpoint NOW,

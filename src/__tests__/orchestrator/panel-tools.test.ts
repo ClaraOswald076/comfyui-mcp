@@ -3620,6 +3620,7 @@ describe("confirm-card timeout is honest, bounded, and late-answer-safe (#360)",
 
   afterEach(() => {
     __panelAskTestHooks.setAskTiming(null);
+    __panelToolsTestHooks.setHealthProbe(null);
   });
 
   // FAIL-BEFORE: the old confirm swallowed a card-reply timeout as `false`, so an
@@ -3651,6 +3652,9 @@ describe("confirm-card timeout is honest, bounded, and late-answer-safe (#360)",
   // The confirm card deadline must be CLAMPED under the ~300s MCP tools/call budget
   // (the old hardcoded 300000ms had zero margin and blew the transport).
   it("panel_restart_comfyui clamps the confirm-card deadline under the MCP budget", async () => {
+    // #742: the decline path probes the server before reporting — stub it healthy
+    // (a clean decline; no real loopback fetch in a unit test).
+    __panelToolsTestHooks.setHealthProbe(async () => true);
     let forwardedTimeout = Infinity;
     const bridge = {
       send: async (cmd: Record<string, unknown>, opts?: { timeoutMs?: number }) => {
@@ -3674,6 +3678,9 @@ describe("confirm-card timeout is honest, bounded, and late-answer-safe (#360)",
   it("panel_restart_comfyui bounds the confirm-card wait by RESTART_CONFIRM_TIMEOUT_MS (not the full ~255s budget)", async () => {
     // No ask-timing override → the REAL getAskTiming (240s) is in effect, so the forwarded
     // reply timeout reflects the handler's own confirm budget, not a test clamp.
+    // #742: the decline path probes the server before reporting — stub it healthy
+    // (a clean decline; no real loopback fetch in a unit test).
+    __panelToolsTestHooks.setHealthProbe(async () => true);
     let forwardedTimeout = Infinity;
     const bridge = {
       send: async (cmd: Record<string, unknown>, opts?: { timeoutMs?: number }) => {
