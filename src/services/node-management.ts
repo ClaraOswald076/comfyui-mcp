@@ -639,6 +639,155 @@ export function setQueueTimingForTests(
   Object.assign(queueTiming, overrides);
 }
 
+/** Queue counts for honest before/after reporting around a queue reset. */
+export interface ManagerQueueCounts {
+  /** Tasks still WAITING to run — v4's `pending_count` directly, else the 3.x
+   *  arithmetic total−done−in_progress (3.x defines total that way exactly). */
+  pending: number;
+  /** Tasks already dequeued by the worker — these a queue reset CANNOT stop. */
+  inProgress: number;
+  /** Manager's worker-alive flag (falls back to inProgress > 0 when absent). */
+  processing: boolean;
+}
+
+/**
+ * Extract counts from a queue/status payload. Returns undefined when required
+ * fields are missing or the counts are incoherent (negative pending — the
+ * #639 stale-3.x signature), so callers report "could not verify" instead of
+ * guessing.
+ */
+function countsFromStatus(status: unknown): ManagerQueueCounts | undefined {
+  if (!status || typeof status !== "object") return undefined;
+  const s = status as QueueStatus;
+  const inProgress = typeof s.in_progress_count === "number" ? s.in_progress_count : undefined;
+  if (inProgress === undefined) return undefined;
+  let pending: number;
+  if (typeof s.pending_count === "number") {
+    pending = s.pending_count; // v4 reports it directly
+  } else {
+    // 3.x: total_count = done + in_progress + queued exactly.
+    if (typeof s.total_count !== "number" || typeof s.done_count !== "number") {
+      return undefined;
+    }
+    pending = s.total_count - s.done_count - inProgress;
+    if (pending < 0) return undefined; // incoherent counts — cannot verify anything
+  }
+  return {
+    pending,
+    inProgress,
+    processing: typeof s.is_processing === "boolean" ? s.is_processing : inProgress > 0,
+  };
+}
+
+/**
+ * Read the Manager queue counts ONCE, in the detected dialect — the measuring
+ * stick for the pin-write cancellation path (#689), which must report what a
+ * queue reset actually dropped rather than claim the panel was saved.
+ *
+ * These are SHARED, queue-wide counts: they can never say whether OUR task is
+ * among the pending ones (that needs fetchManagerClientQueueCounts /
+ * fetchManagerTaskHistoryEntry on v4).
+ *
+ * Returns undefined whenever the state cannot be PROVEN: detection failed,
+ * the status endpoint did not answer with queue counts, required fields are
+ * missing, or the counts are incoherent. The caller reports "could not
+ * verify" and keeps the pending-op marker rather than guessing in either
+ * direction.
+ */
+export async function fetchManagerQueueCounts(
+  base = managerBaseUrl(),
+): Promise<ManagerQueueCounts | undefined> {
+  let api: ManagerApi;
+  try {
+    api = await detectManagerApi(base);
+  } catch {
+    return undefined;
+  }
+  const status = await managerFetch<QueueStatus>(`${managerQueuePrefixFor(api)}/status`, {
+    base,
+    soft: true,
+  });
+  return countsFromStatus(status);
+}
+
+/**
+ * v4-only: queue counts for tasks THIS orchestrator enqueued (every enqueue
+ * carries client_id "comfyui-mcp"). This is what separates "the update_all is
+ * still queued" from "UNRELATED tasks are queued" on a shared Manager — the
+ * distinction a proven cancel needs (#689 round 3).
+ *
+ * Returns undefined on any non-v4 dialect: the 3.x and legacy-UI (v2-batch)
+ * status handlers IGNORE the client_id parameter and answer GLOBAL counts,
+ * which would impersonate our tasks. Also undefined when unreadable or
+ * incoherent.
+ */
+export async function fetchManagerClientQueueCounts(
+  base = managerBaseUrl(),
+): Promise<ManagerQueueCounts | undefined> {
+  let api: ManagerApi;
+  try {
+    api = await detectManagerApi(base);
+  } catch {
+    return undefined;
+  }
+  if (api !== "v2") return undefined;
+  const status = await managerFetch<QueueStatus>(
+    `/v2/manager/queue/status?client_id=${encodeURIComponent(MANAGER_CLIENT_ID)}`,
+    { base, soft: true },
+  );
+  return countsFromStatus(status);
+}
+
+export interface ManagerTaskHistoryEntry {
+  uiId: string;
+  kind?: string;
+  result?: string;
+}
+
+/**
+ * v4-only: look up ONE completed task in the Manager's queue history by exact
+ * ui_id (GET /v2/manager/queue/history?ui_id=…). Returns the entry when found,
+ * null when the Manager provably has NO such completed task ({}), and
+ * undefined when the answer cannot be trusted — non-v4 dialect (the legacy-UI
+ * history route knows only the file-based ?id= form, so it would not answer
+ * the question asked) or an unreadable response.
+ */
+export async function fetchManagerTaskHistoryEntry(
+  uiId: string,
+  base = managerBaseUrl(),
+): Promise<ManagerTaskHistoryEntry | null | undefined> {
+  let api: ManagerApi;
+  try {
+    api = await detectManagerApi(base);
+  } catch {
+    return undefined;
+  }
+  if (api !== "v2") return undefined;
+  const res = await managerFetch<{ history?: unknown }>(
+    `/v2/manager/queue/history?ui_id=${encodeURIComponent(uiId)}`,
+    { base, soft: true },
+  );
+  if (!res || typeof res !== "object" || !("history" in res)) return undefined;
+  const history = (res as { history: unknown }).history;
+  if (!history || typeof history !== "object" || Array.isArray(history)) return undefined;
+  const h = history as Record<string, unknown>;
+  if (typeof h.ui_id !== "string") {
+    // {"history": {}} is the provable "no such completed task". Anything else
+    // shaped wrong is not an answer we can act on.
+    return Object.keys(h).length === 0 ? null : undefined;
+  }
+  // STRICT id check: an entry for a DIFFERENT task (a rewriting proxy, a
+  // Manager variant that ignores ui_id and answers with something else's
+  // history) must never prove anything about OUR task — least of all clear
+  // its marker as already-drained (#689 round 4).
+  if (h.ui_id !== uiId) return undefined;
+  return {
+    uiId: h.ui_id,
+    kind: typeof h.kind === "string" ? h.kind : undefined,
+    result: typeof h.result === "string" ? h.result : undefined,
+  };
+}
+
 /**
  * Kick off the Manager queue worker and poll until it drains.
  * Returns the final queue status.
@@ -1904,39 +2053,45 @@ async function updateManagerSelf(id: string): Promise<NodeOpResult> {
  * never re-sent, so update_all can never run twice (#656).
  *
  * Returns the dialect the enqueue ACTUALLY spoke (so the caller starts/polls
- * the queue holding the task) and the route's raw response body.
+ * the queue holding the task), the route's raw response body, and the ui_id
+ * of the attempt that LANDED (a self-heal retry mints a fresh one — only the
+ * last one's tasks exist, so only it correlates with v4 queue history, #689).
  */
 async function enqueueUpdateAll(
   mode: string,
   base: string,
-): Promise<{ used: ManagerApi; response: unknown }> {
+): Promise<{ used: ManagerApi; response: unknown; uiId: string }> {
   let response: unknown;
+  let uiId = "";
   const used = await enqueueWithDialectSelfHeal("update-all", async (api) => {
     // The v4 backend reads UpdateAllQueryParams from the QUERY STRING
     // (manager_server.py), NOT the JSON body — a body-only request leaves mode
     // defaulting to 'remote' and drops client_id/ui_id. Send them as URL query
     // params. A fresh ui_id per attempt keeps the two attempts distinguishable.
-    const uiId = randomUUID();
+    const attemptUiId = randomUUID();
     if (api === "legacy") {
       // 3.x reads {mode} from the JSON BODY (and ignores client_id/ui_id).
       response = await managerFetch("/manager/queue/update_all", {
         method: "POST",
-        body: { mode, ui_id: uiId },
+        body: { mode, ui_id: attemptUiId },
         base,
       });
     } else {
       const query = new URLSearchParams({
         mode,
         client_id: MANAGER_CLIENT_ID,
-        ui_id: uiId,
+        ui_id: attemptUiId,
       }).toString();
       response = await managerFetch(`/v2/manager/queue/update_all?${query}`, {
         method: "POST",
         base,
       });
     }
+    // Only reached when the enqueue did NOT throw — this attempt's id is the
+    // one whose tasks are actually on the queue.
+    uiId = attemptUiId;
   }, base);
-  return { used, response };
+  return { used, response, uiId };
 }
 
 export async function updateCustomNode(opts: UpdateOptions): Promise<NodeOpResult> {
@@ -2006,6 +2161,12 @@ export interface QueueUpdateAllResult {
   queueStarted: boolean;
   /** Raw update_all response body, when the route produced one. */
   managerResponse?: unknown;
+  /** The ComfyUI base the enqueue actually targeted (captured at invocation,
+   *  so a later cancel can aim at the same server — #689). */
+  base: string;
+  /** The ui_id of the enqueue attempt that landed; v4 derives each per-pack
+   *  task id as `${uiId}_${pack}`, so this correlates with queue history. */
+  uiId: string;
 }
 
 /**
@@ -2025,7 +2186,7 @@ export async function queueUpdateAllCustomNodes(): Promise<QueueUpdateAllResult>
   // self-heal retry, and the queue start all stay on the instance selected at
   // invocation, even if the panel retargets mid-call.
   const base = managerBaseUrl();
-  const { used, response } = await enqueueUpdateAll("remote", base);
+  const { used, response, uiId } = await enqueueUpdateAll("remote", base);
   const prefix = managerQueuePrefixFor(used);
   let queueStarted = true;
   try {
@@ -2038,7 +2199,13 @@ export async function queueUpdateAllCustomNodes(): Promise<QueueUpdateAllResult>
       error: err instanceof Error ? err.message : String(err),
     });
   }
-  return { endpoint: `${prefix}/update_all`, queueStarted, managerResponse: response };
+  return {
+    endpoint: `${prefix}/update_all`,
+    queueStarted,
+    managerResponse: response,
+    base,
+    uiId,
+  };
 }
 
 // ---------------------------------------------------------------------------

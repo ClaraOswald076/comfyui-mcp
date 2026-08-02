@@ -213,9 +213,20 @@ export async function setChannel(value: string): Promise<ManagerConfigResult> {
 /**
  * Reset the Manager task queue. This is the runtime, HTTP-reachable analog of
  * `comfy-cli manager clear` (which clears reserved startup actions locally).
+ *
+ * NOTE on blast radius: the reset drops EVERY pending task in the Manager
+ * queue (Manager has no per-task cancel), while a task already dequeued by
+ * the worker keeps running — callers reporting a cancel must say both halves.
+ *
+ * `base` pins the target for this call (the ManagerFetchOptions.base
+ * convention): the pin-write cancellation path (#689) passes the server its
+ * pending-op marker was recorded against, so the reset lands on the ORIGINAL
+ * ComfyUI even if the orchestrator has been retargeted since. Defaults to the
+ * current target.
  */
-export async function resetQueue(): Promise<ManagerConfigResult> {
-  const base = getComfyUIBaseUrl();
+export async function resetQueue(
+  base = getComfyUIBaseUrl(),
+): Promise<ManagerConfigResult> {
   const api = await detectManagerApi(base);
   await managerFetch(`${managerApiPrefixFor(api)}/manager/queue/reset`, { method: "POST" }, base);
   return {

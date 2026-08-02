@@ -224,14 +224,42 @@ export async function updateAllCustomNodes(): Promise<UpdateNodesResult> {
     // protection it cannot provide. If the request itself fails, retain this
     // conservative marker: a transport failure cannot prove Manager did not
     // accept the request.
-    recordPanelPendingOp(
-      "update-all",
+    //
+    // The marker starts BASE-UNKNOWN on purpose (#689 round 3): the base that
+    // matters is the one the ENQUEUE actually uses (captured inside
+    // queueUpdateAllCustomNodes), and guessing it here risks a retarget leaving
+    // the marker naming the WRONG server — which a later pin would reset and
+    // clear as "cancelled" while the update lands elsewhere. A base-unknown
+    // marker routes to the unverified/no-reset path instead.
+    const detail =
       `an update_all request may have been handed to ComfyUI-Manager and can update EVERY ` +
-        `installed pack — the sidebar panel included — on the Manager's own schedule ` +
-        `(usually seconds to minutes; a ComfyUI restart then loads the result)`,
-      UPDATE_ALL_PENDING_MS,
-    );
+      `installed pack — the sidebar panel included — on the Manager's own schedule ` +
+      `(usually seconds to minutes; a ComfyUI restart then loads the result)`;
+    recordPanelPendingOp("update-all", detail, UPDATE_ALL_PENDING_MS);
     const result = await queueUpdateAllCustomNodes();
+
+    // Enrich the marker with what the ENQUEUE actually used: the base it
+    // captured at invocation and the ui_id of the attempt that landed (a
+    // self-heal retry mints a fresh one). On v4 the ui_id identifies the
+    // update_all's per-pack tasks (each `${ui_id}_${pack}`) in the queue
+    // history, which is what makes a later pin's cancel PROVABLE (#689 round
+    // 3). If the rewrite fails, the marker stays base-unknown — never a stale
+    // base — so the pin-cancel path treats it as unverifiable and sends no
+    // blind reset. Refusing now would punish a success.
+    try {
+      recordPanelPendingOp("update-all", detail, UPDATE_ALL_PENDING_MS, {
+        base: result.base,
+        uiId: result.uiId,
+      });
+    } catch (err) {
+      logger.warn(
+        `[panel] update_all is queued, but the pending-op marker could not be ` +
+          `enriched with its base/ui_id — it remains base-unknown, so a later ` +
+          `pin will report it as unverifiable rather than cancel blindly: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+      );
+    }
 
     return {
       // Queue acceptance is not proof a generic/bulk Manager update moved the
