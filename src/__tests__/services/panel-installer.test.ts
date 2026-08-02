@@ -101,6 +101,10 @@ function makeDeps(opts: {
    * worktree and must refuse the fallback BEFORE any pull is attempted.
    */
   gitStatus?: string;
+  /** What gitWorktreeRoot returns (defaults to the dir itself = proven root). */
+  gitRoot?: string;
+  /** When set, gitWorktreeRoot throws this — the "cannot prove" refusal path. */
+  gitRootError?: string;
 } = {}): Harness {
   const files = opts.files ?? {};
   const revs = opts.revs ?? {};
@@ -126,6 +130,10 @@ function makeDeps(opts: {
     readFile: (p) => files[p] ?? "",
     gitRevision: (dir) => revs[dir],
     gitStatusPorcelain: () => opts.gitStatus ?? "",
+    gitWorktreeRoot: (dir) => {
+      if (opts.gitRootError) throw new Error(opts.gitRootError);
+      return opts.gitRoot ?? dir;
+    },
     gitPullFfOnly: (dir) => {
       gitPulls.push(dir);
       if (opts.onGitPull) return opts.onGitPull({ files, revs });
@@ -861,6 +869,38 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
     await expect(runPanelAction("update", h.deps)).rejects.toThrow(
       /did NOT apply|git fallback.*failed|0\.11\.32/,
     );
+  });
+
+  it("worktree root ≠ panel dir (copied/stale gitdir) → fallback REFUSED, no pull attempted", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: LEGACY_NOOP,
+      gitRoot: join(CUSTOM_NODES, "some-sibling-repo"), // rev-parse resolves elsewhere
+      onGitPull: () => "Updating d806619..675ace8\nFast-forward",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).toMatch(/worktree root|DIFFERENT checkout|REFUSED/);
+    // The Manager was tried, but the fallback never fired a mutation anywhere.
+    expect(h.updates).toEqual([{ id: PANEL_REGISTRY_ID }]);
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("worktree root unprovable (rev-parse fails) → fallback REFUSED, no pull attempted", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: LEGACY_NOOP,
+      gitRootError: "fatal: not a git repository",
+      onGitPull: () => "Updating d806619..675ace8\nFast-forward",
+    });
+    await expect(runPanelAction("update", h.deps)).rejects.toBeInstanceOf(
+      PanelInstallError,
+    );
+    expect(h.gitPulls).toEqual([]);
   });
 
   it("legacy no-op + pull finds nothing newer → honest 'already at tip' (NOT 'updated', no restart)", async () => {

@@ -153,6 +153,12 @@ export interface PanelInstallerDeps {
    */
   gitPullFfOnly: (dir: string) => string;
   /**
+   * `git rev-parse --show-toplevel` — proves this dir IS the checkout root
+   * (not merely has git metadata) before any fallback mutation. THROWS on
+   * failure; callers refuse unless the resolved root is the panel dir.
+   */
+  gitWorktreeRoot: (dir: string) => string;
+  /**
    * The user's explicit panel-version pin, if any. While a pin is in force NO
    * code path here may move the panel — install/update/reinstall refuse and the
    * on-load ensure skips. Never throws (an unreadable pin reports
@@ -307,6 +313,17 @@ export function gitPullFfOnly(dir: string): string {
   return runGit(dir, ["pull", "--ff-only"], PANEL_GIT_PULL_TIMEOUT_MS);
 }
 
+/**
+ * `git rev-parse --show-toplevel` for the #724 fallback: a `.git` pointer
+ * proves metadata exists, NOT that this directory is the worktree ROOT — a
+ * copied/stale gitdir could make status/pull mutate a sibling checkout while
+ * the report credits the panel repo (codex gate). THROWS on any failure;
+ * callers refuse unless the resolved root IS the panel dir.
+ */
+export function gitWorktreeRoot(dir: string): string {
+  return runGit(dir, ["rev-parse", "--show-toplevel"], PANEL_GIT_STATUS_TIMEOUT_MS).trim();
+}
+
 export const defaultDeps: PanelInstallerDeps = {
   isLocalMode: () => isLocalMode(),
   // Keep panel management aligned with get_environment, downloads, and
@@ -354,6 +371,7 @@ export const defaultDeps: PanelInstallerDeps = {
   gitRevision: (dir) => resolveGitRevision(dir),
   gitStatusPorcelain: (dir) => gitStatusPorcelain(dir),
   gitPullFfOnly: (dir) => gitPullFfOnly(dir),
+  gitWorktreeRoot: (dir) => gitWorktreeRoot(dir),
   readPin: () => getPanelPinState(),
   isReachable: async () => {
     try {
@@ -1405,6 +1423,33 @@ async function updateViaGitCheckoutFallback(opts: {
   result: NodeOpResult;
 }): Promise<PanelActionResult> {
   const { deps, dir, previousVersion, previousRev, result } = opts;
+
+  // WORKTREE-ROOT GATE — `.git` proves metadata exists, not that this dir is
+  // the checkout ROOT. A copied/stale gitdir would let status/pull mutate a
+  // sibling repo and credit the panel with that repo's moved HEAD. Require the
+  // resolved toplevel to BE the panel dir (same path identity as the #641
+  // shadow code). Any failure here is "cannot prove", which refuses.
+  let worktreeRoot: string;
+  try {
+    worktreeRoot = deps.gitWorktreeRoot(dir);
+  } catch (err) {
+    throw new PanelInstallError(
+      `Panel update did NOT apply: ComfyUI-Manager never enqueued the update (the ` +
+        `stale legacy 3.x silent no-op, #639/#724), and the git fallback is ` +
+        `REFUSED: could not prove ${dir} is the panel repo's worktree root (git ` +
+        `rev-parse failed — ${err instanceof Error ? err.message : String(err)}). ` +
+        `Update the panel repo manually, then RESTART ComfyUI.`,
+    );
+  }
+  if (!samePathCI(worktreeRoot, dir, deps)) {
+    throw new PanelInstallError(
+      `Refusing the panel update git fallback: the git worktree root resolves to ` +
+        `${worktreeRoot}, NOT the panel directory ${dir} — status/pull would ` +
+        `mutate a DIFFERENT checkout than the one we verified (a copied or stale ` +
+        `gitdir pointer). Nothing was done; check how the panel dir's .git got ` +
+        `there, then update the correct repo manually and RESTART ComfyUI.`,
+    );
+  }
 
   // CLEANLINESS GATE — never mutate a dirty checkout. A porcelain failure is
   // "cannot prove clean", which refuses exactly like a dirty one.
