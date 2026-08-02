@@ -205,6 +205,7 @@ describe("node-management service", () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    delete process.env.COMFYUI_PYTHON;
   });
 
   // ---- install -----------------------------------------------------------
@@ -534,6 +535,10 @@ describe("node-management service", () => {
         IS_WIN ? "python.exe" : "python",
       );
       const nodeDir = resolve(adopted, "custom_nodes", "comfyui-teskors-utils");
+      // The install resolver is fail-closed (#651): it only hands out an
+      // interpreter it can account for. Pin the explicit override so the deps
+      // install targets the adopted venv python.
+      process.env.COMFYUI_PYTHON = venvPy;
       const requirements = join(nodeDir, "requirements.txt");
       stubFetch({ installedBody: {} });
       let cloned = false;
@@ -565,6 +570,46 @@ describe("node-management service", () => {
       expect(pipCall).toBeDefined();
       // The deps install ran under the ADOPTED venv python, not bare "python".
       expect(pipCall![0]).toBe(venvPy);
+    });
+
+    it("warns and skips the deps install when the server's interpreter cannot be verified (#651)", async () => {
+      // No override, no launched record, no reachable live server → fail CLOSED:
+      // the clone still succeeds, but requirements are NOT installed into a guess.
+      config.comfyuiPath = undefined;
+      const adopted = "/adopted/ComfyUI";
+      const nodeDir = resolve(adopted, "custom_nodes", "comfyui-teskors-utils");
+      const requirements = join(nodeDir, "requirements.txt");
+      stubFetch({ installedBody: {} });
+      let cloned = false;
+      mockedExists.mockImplementation((p: unknown) => {
+        const s = String(p);
+        if (s === requirements) return true; // node ships requirements.txt
+        if (s.includes("install.py") || s.includes("cm-cli.py")) return false;
+        if (s.includes(".venv")) return false;
+        if (s.includes("comfyui-teskors-utils")) return cloned;
+        return false;
+      });
+      mockedExec.mockImplementation(((bin: string, args: string[]) => {
+        if (bin === "git" && args[0] === "clone") cloned = true;
+        return "";
+      }) as never);
+
+      const res = await installCustomNode({
+        id: "https://github.com/teskor-hub/comfyui-teskors-utils",
+        comfyuiPath: adopted,
+      });
+
+      expect(res.mechanism).toBe("git-clone");
+      // The deps install was REFUSED and the reason is surfaced in the message…
+      expect(res.message).toContain("Python dependencies were NOT installed");
+      // …and no pip subprocess ran against any interpreter.
+      const pipCall = mockedExec.mock.calls.find(
+        (c) =>
+          Array.isArray(c[1]) &&
+          (c[1] as string[]).includes("-r") &&
+          (c[1] as string[]).includes(requirements),
+      );
+      expect(pipCall).toBeUndefined();
     });
 
     it("full-clones (no --depth) and checks out an explicit ref on fallback", async () => {

@@ -34,6 +34,17 @@ const savedWorkspaceMock = vi.hoisted(() => vi.fn(() => undefined as string | un
 const liveComfyBaseMock = vi.hoisted(() =>
   vi.fn(async () => undefined as string | undefined),
 );
+// Overridable per-test: default mirrors a VERIFIED install-root interpreter (the
+// fail-closed resolver only returns a python it can account for, #651).
+const installInterpreterMock = vi.hoisted(() =>
+  vi.fn(
+    async (root: string | undefined): Promise<{ python?: string; source: string; reason: string }> => ({
+      python: root ? `${root}/python` : "python",
+      source: "launched",
+      reason: "test interpreter",
+    }),
+  ),
+);
 
 vi.mock("../../config.js", () => ({
   config: mockConfig,
@@ -124,6 +135,8 @@ vi.mock("../../services/workspace-env.js", () => ({
   // Mirrors the real resolver enough for the pip tests: an install-root python.
   resolveRootInterpreter: (root: string | undefined) =>
     root ? `${root}/python` : "python",
+  resolveInstallInterpreter: (...a: unknown[]) =>
+    installInterpreterMock(...(a as [string | undefined])),
 }));
 
 // resolveLocalModelPath now roots local_path validation at the SAME live write
@@ -168,6 +181,13 @@ beforeEach(() => {
   listLocalModelsMock.mockReset().mockResolvedValue([]);
   savedWorkspaceMock.mockReset().mockReturnValue(undefined);
   liveComfyBaseMock.mockReset().mockResolvedValue(undefined);
+  installInterpreterMock.mockReset().mockImplementation(
+    async (root: string | undefined) => ({
+      python: root ? `${root}/python` : "python",
+      source: "launched",
+      reason: "test interpreter",
+    }),
+  );
   modelsDirMock.mockReset().mockResolvedValue("/fake/ComfyUI/models");
 });
 
@@ -534,6 +554,29 @@ describe("applyManifest", () => {
       ["-m", "pip", "install", "imageio-ffmpeg"],
       expect.objectContaining({ cwd: COMFY }),
     );
+  });
+
+  it("reports pip as failed — never applied — when the server interpreter cannot be verified (#651)", async () => {
+    installInterpreterMock.mockResolvedValue({
+      source: "undetermined",
+      reason:
+        "Cannot verify the running server's interpreter: no local ComfyUI is reachable. " +
+        "Start ComfyUI or connect to it first.",
+    });
+
+    const result = await applyManifest({ manifest: { pip: ["omegaconf"] } });
+
+    expect(result.success).toBe(false);
+    expect(result.results).toMatchObject([
+      { action: "pip", item: "omegaconf", status: "failed" },
+    ]);
+    expect(result.results[0].message).toContain("Cannot verify the running server's interpreter");
+    // No pip/uv subprocess ran for the refused package.
+    expect(
+      execFileSyncMock.mock.calls.some(
+        (c) => Array.isArray(c[1]) && (c[1] as string[]).includes("omegaconf"),
+      ),
+    ).toBe(false);
   });
 
   it("adopts the saved default workspace as the local path when COMFYUI_PATH is unset (#390)", async () => {

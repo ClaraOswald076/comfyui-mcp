@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { platform } from "node:os";
 import { config, getComfyUIBaseUrl } from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
+import { resolveInstallInterpreter } from "./workspace-env.js";
 import { ProcessControlError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 
@@ -98,21 +99,6 @@ function detectPackageManager(comfyuiPath: string): "uv" | "pip" {
 }
 
 /**
- * Resolve the ComfyUI workspace's own Python interpreter — its `.venv`/`venv`
- * if present — so dependency installs target the workspace env, NOT the Python
- * running this MCP server. Falls back to PATH python when no venv exists.
- */
-function resolveWorkspacePython(comfyuiPath: string): string {
-  for (const venv of [".venv", "venv"]) {
-    const py = IS_WIN
-      ? join(comfyuiPath, venv, "Scripts", "python.exe")
-      : join(comfyuiPath, venv, "bin", "python");
-    if (existsSync(py)) return py;
-  }
-  return IS_WIN ? "python" : "python3";
-}
-
-/**
  * Resolve the ComfyUI install path or throw a clear error explaining that core
  * updates require a local install (not available in remote --comfyui-url mode).
  */
@@ -192,16 +178,33 @@ export async function updateComfyUICore(): Promise<UpdateCoreResult> {
   const pm = detectPackageManager(comfyuiPath);
   const steps: CommandResult[] = [];
 
+  // Resolve the requirements install's interpreter BEFORE `git pull` mutates the
+  // checkout: it must be the interpreter the RUNNING server imports from, never a
+  // configured-workspace venv/PATH guess the server may not see (#651). Fail
+  // closed when the live interpreter cannot be verified.
+  const requirements = join(comfyuiPath, "requirements.txt");
+  let venvPython: string | undefined;
+  let pythonReason = "";
+  if (existsSync(requirements)) {
+    const resolved = await resolveInstallInterpreter(comfyuiPath);
+    if (!resolved.python) {
+      throw new ProcessControlError(
+        `Cannot update ComfyUI core. ${resolved.reason} ` +
+          "Set COMFYUI_PYTHON to the interpreter ComfyUI runs with, or restart ComfyUI through this MCP server and retry.",
+      );
+    }
+    venvPython = resolved.python;
+    pythonReason = ` ${resolved.reason}`;
+  }
+
   // 1. git pull the core repo.
   steps.push(runCommand("git", ["pull"], comfyuiPath));
 
-  // 2. Reinstall requirements into the WORKSPACE venv (never this server's
-  //    Python). requirements.txt lives in the repo root.
-  const requirements = join(comfyuiPath, "requirements.txt");
-  if (existsSync(requirements)) {
-    const venvPython = resolveWorkspacePython(comfyuiPath);
+  // 2. Reinstall requirements into the resolved interpreter's env (never this
+  //    server's Python). requirements.txt lives in the repo root.
+  if (venvPython) {
     if (pm === "uv") {
-      // `--python` pins uv to the workspace venv rather than an ambient env.
+      // `--python` pins uv to the resolved interpreter rather than an ambient env.
       steps.push(
         runCommand(
           "uv",
@@ -227,7 +230,7 @@ export async function updateComfyUICore(): Promise<UpdateCoreResult> {
     comfyui_path: comfyuiPath,
     package_manager: pm,
     steps,
-    message: `ComfyUI core updated in ${comfyuiPath} using ${pm}.`,
+    message: `ComfyUI core updated in ${comfyuiPath} using ${pm}.${pythonReason}`,
   };
 }
 

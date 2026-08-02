@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { homedir, platform } from "node:os";
-import { dirname, isAbsolute, join, resolve as pathResolve } from "node:path";
+import { dirname, isAbsolute, join, resolve as pathResolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { config, getComfyUIBaseUrl, isRemoteMode } from "../config.js";
 import { getSystemStats } from "../comfyui/client.js";
@@ -50,20 +50,31 @@ export function resetWorkspaceConfig(): void {
 // a wrong-place download destination (#633 P1b). Set ONLY on the env-inheriting python
 // spawn path, cleared on stop; module-scoped, so it resets each MCP process lifetime.
 let localComfyUILaunchedByUs = false;
+// /system_stats intentionally does not expose sys.executable.  When this MCP
+// process starts ComfyUI, retain the executable we actually spawned: it is the
+// only non-inferred answer to where a package install belongs (#651).
+let localComfyUILaunchInterpreter: string | undefined;
 
 /** Record that this MCP process spawned the local ComfyUI (env inherited). */
-export function markLocalComfyUILaunched(): void {
+export function markLocalComfyUILaunched(interpreter?: string): void {
   localComfyUILaunchedByUs = true;
+  localComfyUILaunchInterpreter = interpreter?.trim() || undefined;
 }
 
 /** Clear the launched-by-us flag (on stop, and a test seam). */
 export function resetLocalComfyUILaunchState(): void {
   localComfyUILaunchedByUs = false;
+  localComfyUILaunchInterpreter = undefined;
 }
 
 /** True when this MCP process launched the connected local ComfyUI (shares our env). */
 export function didLaunchLocalComfyUI(): boolean {
   return localComfyUILaunchedByUs;
+}
+
+/** The exact interpreter this MCP process used to launch the live local server. */
+export function getLaunchedLocalInterpreter(): string | undefined {
+  return localComfyUILaunchedByUs ? localComfyUILaunchInterpreter : undefined;
 }
 
 function workspaceConfigPath(): string {
@@ -514,6 +525,122 @@ function pythonVersionsAgree(a: string | undefined, b: string | undefined): bool
   const ma = mm(a);
   const mb = mm(b);
   return !!ma && ma === mb;
+}
+
+// ---------------------------------------------------------------------------
+// Install interpreter resolution (#651)
+// ---------------------------------------------------------------------------
+
+export type InstallInterpreterSource = "override" | "launched" | "undetermined";
+
+export interface InstallInterpreterResolution {
+  python?: string;
+  source: InstallInterpreterSource;
+  /** An operator-facing explanation: mutation must never be a silent layout guess. */
+  reason: string;
+}
+
+function pathExists(path: string): boolean {
+  if (/^\\\\/.test(path)) return false;
+  try {
+    return existsSync(path);
+  } catch {
+    return false;
+  }
+}
+
+function hasMainPy(root: string): boolean {
+  return pathExists(join(root, "main.py")) || pathExists(join(root, "main.pyw"));
+}
+
+/** Desktop commonly reports `ComfyUI/main.py` without a cwd.  Anchor that only
+ * against the install being modified, and only after confirming main.py exists. */
+function liveRootForInstall(argv: string[] | undefined, cwd: string | undefined, root: string | undefined): string | undefined {
+  const absolute = liveRootFromArgv(argv, cwd);
+  if (absolute) return absolute;
+  if (!root || !Array.isArray(argv)) return undefined;
+  for (const raw of argv) {
+    if (typeof raw !== "string") continue;
+    const script = raw.trim().replace(/^["']+/, "").replace(/["']+$/, "");
+    if (!/(^|[\\/])main\.pyw?$/i.test(script) || isAbsolute(script)) continue;
+    const candidate = pathResolve(root, dirname(script));
+    if (hasMainPy(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+/** A bundle root may contain its actual server in `ComfyUI/`; do not confuse a
+ * nested independent checkout with that bundle layout. */
+function targetsLiveInstall(serverRoot: string, requestedRoot: string | undefined): boolean {
+  if (!requestedRoot) return true;
+  const server = pathResolve(serverRoot);
+  const requested = pathResolve(requestedRoot);
+  return server === requested || (server.startsWith(requested + sep) && !hasMainPy(requested));
+}
+
+/**
+ * Resolve a package-install interpreter without claiming that a path-shaped guess is
+ * the process that is currently serving ComfyUI.  A server that this MCP launched is
+ * authoritative because we recorded its executable; an explicit COMFYUI_PYTHON is the
+ * operator's own claim.  In every other case the live interpreter is UNOBSERVABLE —
+ * /system_stats has no sys.executable, so even a single discovered `.venv` may be
+ * unrelated (for example, the server can be using system Python).  FAIL CLOSED:
+ * refuse rather than report an install into a layout-guessed env as applied when the
+ * running server may not be able to import from it (#651).
+ */
+export async function resolveInstallInterpreter(
+  root: string | undefined,
+): Promise<InstallInterpreterResolution> {
+  const override = process.env.COMFYUI_PYTHON?.trim();
+  if (override) {
+    return { python: override, source: "override", reason: `Using "${override}" because COMFYUI_PYTHON is set.` };
+  }
+
+  const refuse = (reason: string): InstallInterpreterResolution => ({
+    source: "undetermined",
+    reason,
+  });
+  if (isRemoteMode()) {
+    return refuse(
+      "Cannot verify the running server's interpreter: the connected ComfyUI is remote, " +
+        "so a package installed locally would not affect it.",
+    );
+  }
+
+  let system: { argv?: string[]; cwd?: string } | undefined;
+  try {
+    system = (await getSystemStats()).system as { argv?: string[]; cwd?: string };
+  } catch {
+    return refuse(
+      "Cannot verify the running server's interpreter: no local ComfyUI is reachable. " +
+        "Start ComfyUI or connect to it first.",
+    );
+  }
+  const serverRoot = liveRootForInstall(system?.argv, system?.cwd, root);
+  const launched = getLaunchedLocalInterpreter();
+  if (launched && (!serverRoot || targetsLiveInstall(serverRoot, root))) {
+    return {
+      python: launched,
+      source: "launched",
+      reason: `Using "${launched}", the exact interpreter this MCP server used to start the running ComfyUI.`,
+    };
+  }
+  if (!serverRoot) {
+    return refuse(
+      "Cannot verify the running server's interpreter: the running ComfyUI did not report " +
+        "a resolvable main.py location.",
+    );
+  }
+  if (!targetsLiveInstall(serverRoot, root)) {
+    return refuse(
+      `The running ComfyUI is a different install ("${serverRoot}") than the requested path; ` +
+        "installing into the requested layout would not affect the live server.",
+    );
+  }
+  return refuse(
+    `Cannot determine which interpreter the running ComfyUI at "${serverRoot}" uses: ` +
+      "/system_stats does not expose sys.executable, so an interpreter discovered from its layout is unconfirmed.",
+  );
 }
 
 async function probePipPackages(

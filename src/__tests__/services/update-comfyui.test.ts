@@ -26,6 +26,14 @@ vi.mock("../../utils/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
+// The requirements install now resolves its interpreter through the shared
+// fail-closed live-interpreter resolver (#651) — stub it per-test.
+const mockResolveInstallInterpreter = vi.hoisted(() => vi.fn());
+
+vi.mock("../../services/workspace-env.js", () => ({
+  resolveInstallInterpreter: mockResolveInstallInterpreter,
+}));
+
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import {
@@ -56,6 +64,12 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.unstubAllGlobals();
   mockConfig.comfyuiPath = "/fake/ComfyUI";
+  // Default: the resolver has verified an interpreter; refusal tests override.
+  mockResolveInstallInterpreter.mockResolvedValue({
+    python: "/fake/ComfyUI/.venv/bin/python",
+    source: "launched",
+    reason: "test interpreter",
+  });
 });
 
 // --- updateComfyUICore --------------------------------------------------
@@ -110,8 +124,8 @@ describe("updateComfyUICore", () => {
     expect(r.package_manager).toBe("uv");
     const uvCall = mockedExec.mock.calls.find((c) => c[0] === "uv");
     expect(uvCall).toBeDefined();
-    // uv must be pinned to the workspace venv via --python (no venv exists in
-    // this mock, so it resolves to the PATH python fallback).
+    // uv must be pinned via --python to the interpreter the resolver verified
+    // (never an ambient env).
     expect(uvCall![1]).toEqual([
       "pip",
       "install",
@@ -163,6 +177,47 @@ describe("updateComfyUICore", () => {
       throw new Error("no uv");
     });
     await expect(updateComfyUICore()).rejects.toThrow(/Command failed: git pull/);
+  });
+
+  it("refuses before git pull when the running server's interpreter cannot be verified (#651)", async () => {
+    mockedExists.mockImplementation((p: string) => {
+      if (p === "/fake/ComfyUI") return true;
+      if (p.endsWith("requirements.txt")) return true;
+      return false;
+    });
+    mockedExec.mockImplementation((file: string) => {
+      if (file === "uv" || file === "uv.exe") throw new Error("uv not found");
+      return "ok";
+    });
+    mockResolveInstallInterpreter.mockResolvedValue({
+      source: "undetermined",
+      reason:
+        "Cannot verify the running server's interpreter: no local ComfyUI is reachable. " +
+        "Start ComfyUI or connect to it first.",
+    });
+
+    await expect(updateComfyUICore()).rejects.toThrow(/Cannot update ComfyUI core/);
+    await expect(updateComfyUICore()).rejects.toThrow(/Cannot verify the running server's interpreter/);
+    // Fail CLOSED means no mutation at all: git pull never ran.
+    expect(mockedExec.mock.calls.find((c) => c[0] === "git")).toBeUndefined();
+  });
+
+  it("still runs git pull alone when requirements.txt is absent, even if the interpreter is unverifiable", async () => {
+    mockedExists.mockImplementation((p: string) => p === "/fake/ComfyUI");
+    mockedExec.mockImplementation((file: string) => {
+      if (file === "uv" || file === "uv.exe") throw new Error("no uv");
+      return "ok";
+    });
+    mockResolveInstallInterpreter.mockResolvedValue({
+      source: "undetermined",
+      reason: "Cannot verify the running server's interpreter.",
+    });
+
+    const r = await updateComfyUICore();
+    expect(r.steps.length).toBe(1);
+    expect(r.steps[0].command).toContain("git pull");
+    // No requirements install was due, so the resolver was never consulted.
+    expect(mockResolveInstallInterpreter).not.toHaveBeenCalled();
   });
 });
 

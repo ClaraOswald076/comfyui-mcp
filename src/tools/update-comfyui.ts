@@ -8,7 +8,7 @@ import { errorToToolResult } from "../utils/errors.js";
 export function registerUpdateComfyUITools(server: McpServer): void {
   server.tool(
     "update_comfyui",
-    "Update the ComfyUI core install: runs `git pull` in the configured ComfyUI directory and reinstalls its Python requirements (auto-detecting uv vs pip). Requires a local install (COMFYUI_PATH); returns a clear error when targeting a remote instance via --comfyui-url.",
+    "Update the ComfyUI core install: runs `git pull` in the configured ComfyUI directory and reinstalls its Python requirements (auto-detecting uv vs pip). Requires a local install (COMFYUI_PATH); returns a clear error when targeting a remote instance via --comfyui-url. The requirements install targets the running server's own interpreter (recorded when this server launched ComfyUI, or an explicit COMFYUI_PYTHON); when that interpreter cannot be verified the update refuses rather than install into a guessed environment — start ComfyUI or connect first.",
     {},
     async () => {
       try {

@@ -74,6 +74,8 @@ function setExecFileResponder(
 
 import {
   configureWorkspace,
+  markLocalComfyUILaunched,
+  resetLocalComfyUILaunchState,
   resetWorkspaceConfig,
   getWorkspace,
   setDefaultWorkspace,
@@ -81,6 +83,7 @@ import {
   getEnvironment,
   liveRootFromArgv,
   resolveComfyuiPython,
+  resolveInstallInterpreter,
   resolveLiveComfyUIBase,
   resolveRootInterpreter,
 } from "../../services/workspace-env.js";
@@ -101,6 +104,148 @@ beforeEach(() => {
 
 afterEach(() => {
   resetWorkspaceConfig();
+  resetLocalComfyUILaunchState();
+});
+
+describe("resolveInstallInterpreter (#651)", () => {
+  it("refuses a live Desktop-style bundle with two possible environments", async () => {
+    const base = await tmpDir();
+    try {
+      const serverRoot = join(base, "ComfyUI");
+      await mkdir(serverRoot, { recursive: true });
+      await writeFile(join(serverRoot, "main.py"), "", "utf-8");
+      await makeVenvPython(base);
+      await makeVenvPython(serverRoot);
+      mockGetSystemStats.mockResolvedValue({
+        system: { argv: [join("ComfyUI", "main.py")] },
+      });
+
+      const result = await resolveInstallInterpreter(base);
+
+      expect(result.source).toBe("undetermined");
+      expect(result.python).toBeUndefined();
+      expect(result.reason).toContain("sys.executable");
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses when no server is reachable rather than installing into a layout guess", async () => {
+    const root = await tmpDir();
+    try {
+      await makeVenvPython(root);
+      mockGetSystemStats.mockRejectedValue(new Error("ECONNREFUSED"));
+
+      const result = await resolveInstallInterpreter(root);
+
+      expect(result.source).toBe("undetermined");
+      expect(result.python).toBeUndefined();
+      expect(result.reason).toContain("Cannot verify the running server's interpreter");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not treat a single discovered venv as the externally launched server", async () => {
+    const root = await tmpDir();
+    try {
+      await writeFile(join(root, "main.py"), "", "utf-8");
+      await makeVenvPython(root);
+      mockGetSystemStats.mockResolvedValue({ system: { argv: [join(root, "main.py")] } });
+
+      const result = await resolveInstallInterpreter(root);
+      expect(result.source).toBe("undetermined");
+      expect(result).not.toHaveProperty("python");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses rather than falling back to the requested path when live ComfyUI is another install", async () => {
+    const parent = await tmpDir();
+    try {
+      const requested = join(parent, "requested");
+      const live = join(parent, "live");
+      await mkdir(live, { recursive: true });
+      await writeFile(join(live, "main.py"), "", "utf-8");
+      await makeVenvPython(requested);
+      mockGetSystemStats.mockResolvedValue({ system: { argv: [join(live, "main.py")] } });
+
+      const result = await resolveInstallInterpreter(requested);
+
+      expect(result.source).toBe("undetermined");
+      expect(result).not.toHaveProperty("python");
+      expect(result.reason).toContain("different install");
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("uses the exact interpreter recorded when MCP launched the live server", async () => {
+    const root = await tmpDir();
+    try {
+      await writeFile(join(root, "main.py"), "", "utf-8");
+      await makeVenvPython(root);
+      mockGetSystemStats.mockResolvedValue({ system: { argv: [join(root, "main.py")] } });
+      markLocalComfyUILaunched("C:/ComfyUI/.venv/Scripts/python.exe");
+
+      await expect(resolveInstallInterpreter(root)).resolves.toMatchObject({
+        python: "C:/ComfyUI/.venv/Scripts/python.exe",
+        source: "launched",
+      });
+    } finally {
+      resetLocalComfyUILaunchState();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses in remote mode: a local install would not affect the remote server", async () => {
+    const root = await tmpDir();
+    try {
+      await makeVenvPython(root);
+      h.remoteMode.value = true;
+
+      const result = await resolveInstallInterpreter(root);
+
+      expect(result.source).toBe("undetermined");
+      expect(result.python).toBeUndefined();
+      expect(result.reason).toContain("remote");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses when the running server does not report a resolvable main.py location", async () => {
+    const root = await tmpDir();
+    try {
+      await makeVenvPython(root);
+      mockGetSystemStats.mockResolvedValue({ system: { argv: ["--port", "8188"] } });
+
+      const result = await resolveInstallInterpreter(root);
+
+      expect(result.source).toBe("undetermined");
+      expect(result.python).toBeUndefined();
+      expect(result.reason).toContain("main.py");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("honors an explicit COMFYUI_PYTHON override even when nothing is reachable", async () => {
+    const root = await tmpDir();
+    try {
+      process.env.COMFYUI_PYTHON = "C:/explicit/python.exe";
+      mockGetSystemStats.mockRejectedValue(new Error("ECONNREFUSED"));
+
+      await expect(resolveInstallInterpreter(root)).resolves.toMatchObject({
+        python: "C:/explicit/python.exe",
+        source: "override",
+      });
+    } finally {
+      delete process.env.COMFYUI_PYTHON;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
