@@ -1986,6 +1986,8 @@ const xy = () =>
   z.array(z.number()).min(2).max(2).describe("[x, y] (two numbers).");
 const rect = () =>
   z.array(z.number()).min(4).max(4).describe("[x, y, width, height] (four numbers).");
+const nodeSize = () =>
+  z.array(z.number().positive()).min(2).max(2).describe("[width, height] (two positive numbers).");
 
 /**
  * Outcome of a human-in-the-loop confirm card (#360). A tri-state so callers can
@@ -3483,7 +3485,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         node_id: z.number().int().optional().describe("One node id from panel_graph_outline / panel_query_graph. Provide this OR node_ids, not both."),
         node_ids: z.array(z.number().int()).min(1).optional().describe("Several node ids that receive the same presentation edit. Provide this OR node_id, not both."),
         pos: xy().optional().describe("New canvas [x, y]."),
-        size: z.tuple([z.number().positive(), z.number().positive()]).optional().describe("New [width, height] in canvas px. Uses the node's setSize so DOM-widget nodes reflow and minimum sizes are honored."),
+        size: nodeSize().optional().describe("New [width, height] in canvas px. Uses the node's setSize so DOM-widget nodes reflow and minimum sizes are honored."),
         title: z.string().optional().describe("New header title."),
         preset: z.enum(["red", "brown", "green", "blue", "pale_blue", "cyan", "purple", "yellow", "black"]).optional().describe("Named LiteGraph palette color (sets both title and body). Cannot be combined with color/bgcolor."),
         color: z.string().regex(NODE_COLOR_HEX).nullable().optional().describe("Title-bar color hex, or null to clear."),
@@ -3519,7 +3521,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     // is newer than several installed panels, while current panels adapt these
     // commands into the same atomic implementation.
     def("panel_move_node", "Compatibility wrapper for panel_edit_node(pos).", { node_id: z.number().int(), pos: xy() }, async (args: A, ctx) => ctx.call({ cmd: "graph_move_node", node_id: args.node_id, pos: args.pos })),
-    def("panel_resize_node", "Compatibility wrapper for panel_edit_node(size).", { node_id: z.number().int(), size: z.tuple([z.number().positive(), z.number().positive()]) }, async (args: A, ctx) => ctx.call({ cmd: "graph_resize_node", node_id: args.node_id, size: args.size })),
+    def("panel_resize_node", "Compatibility wrapper for panel_edit_node(size).", { node_id: z.number().int(), size: nodeSize() }, async (args: A, ctx) => ctx.call({ cmd: "graph_resize_node", node_id: args.node_id, size: args.size })),
     def(
       "panel_auto_layout",
       "Automatically arrange the user's open graph (or a subset of nodes) into a clean left-to-right / top-to-bottom / grid layout based on the real link topology. Group boxes move with their members and are re-fit. Use dry_run:true to preview proposed positions without touching the canvas. Undoable (one Ctrl+Z).",
@@ -4678,7 +4680,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       "panel_set_node_title",
       "Compatibility wrapper for panel_edit_node(title).",
       { node_id: z.number().int(), title: z.string() },
-      async (args: A, ctx) => ctx.call({ cmd: "graph_set_title", node_id: args.node_id, title: args.title }),
+      async (args: A, ctx) => ctx.call({ cmd: "graph_set_title", node_id: args.node_id, title: args.title }, 15000),
     ),
     def(
       "panel_set_node_collapsed",

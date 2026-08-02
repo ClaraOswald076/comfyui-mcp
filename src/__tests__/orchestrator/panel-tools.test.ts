@@ -11,6 +11,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { z } from "zod";
 import { getNsfwConsent, setNsfwConsent } from "../../services/panel-settings.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
@@ -329,6 +330,8 @@ describe("panel-tools: panel_edit_node (#572 presentation consolidation)", () =>
     expect(color.safeParse("rgb(1,2,3)").success).toBe(false);
     expect(size.safeParse([120, 80]).success).toBe(true);
     expect(size.safeParse([0, 80]).success).toBe(false);
+    expect(size.safeParse([120]).success).toBe(false);
+    expect(size.safeParse([120, 80, 60]).success).toBe(false);
   });
 
   it("forwards every supplied field to the single graph_edit_node bridge command", async () => {
@@ -376,6 +379,12 @@ describe("panel-tools: panel_edit_node (#572 presentation consolidation)", () =>
     expect(calls[0]).toMatchObject({ cmd: command, node_id: 7 });
   });
 
+  it("keeps the legacy title command on its 15s mutation timeout", async () => {
+    const { ctx, timeouts } = makeFakeCtx();
+    await defByName("panel_set_node_title").handler({ node_id: 7, title: "Title" }, ctx);
+    expect(timeouts[0]).toBe(15_000);
+  });
+
   it("applies the preset/color exclusion to the legacy color wrapper before dispatch", async () => {
     const { ctx, calls } = makeFakeCtx();
     const result = await defByName("panel_set_node_color").handler({ node_id: 7, preset: "red", color: "#112233" }, ctx);
@@ -390,6 +399,17 @@ describe("panel-tools: panel_edit_node (#572 presentation consolidation)", () =>
     expect(color.safeParse("#12345678").success).toBe(true);
     expect(color.safeParse("#12345").success).toBe(false);
     expect(color.safeParse("#1234567").success).toBe(false);
+  });
+
+  it("exports editor and legacy resize sizes as Codex-compatible homogeneous arrays", () => {
+    for (const name of ["panel_edit_node", "panel_resize_node"]) {
+      const def = defByName(name);
+      const schema = z.toJSONSchema(z.object(def.schema), { reused: "inline", io: "input" }) as {
+        properties?: Record<string, { type?: string; minItems?: number; maxItems?: number; items?: { type?: string } }>;
+      };
+      const size = schema.properties?.size;
+      expect(size).toMatchObject({ type: "array", minItems: 2, maxItems: 2, items: { type: "number" } });
+    }
   });
 });
 
