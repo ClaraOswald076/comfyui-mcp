@@ -1,6 +1,6 @@
 import type { WorkflowJSON, ObjectInfo } from "../comfyui/types.js";
 import { getObjectInfo } from "../comfyui/client.js";
-import { getComfyUIBaseUrl } from "../config.js";
+import { getComfyUIBaseUrl, isLocalMode } from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
 import { ComfyUIError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
@@ -11,6 +11,8 @@ import {
   startManagerQueueForExternal,
   type ManagerApi,
 } from "./node-management.js";
+import { assertPanelPinAllows, targetsPanelPackExactly } from "./panel-pin-guard.js";
+import { runPanelAction } from "./panel-installer.js";
 
 /**
  * Workflow dependency analysis & installation.
@@ -452,8 +454,18 @@ export async function installWorkflowDependencies(
   const toInstall: ManagerNodePack[] = [];
   const installed: string[] = [];
   const unresolved = [...analysis.unresolved];
-
+  // The sidebar panel pack NEVER goes through the generic Manager queue: that
+  // path has neither the pin guard nor on-disk verification (#639/#641 class),
+  // so a workflow naming it would silently move a pinned panel. Panel targets
+  // are peeled off here and handled by the verified path below.
+  const panelTargets: string[] = [];
+  const panelNotes: string[] = [];
   for (const pack of analysis.missingPacks) {
+    if (targetsPanelPackExactly(pack)) {
+      panelTargets.push(pack);
+      installed.push(pack);
+      continue;
+    }
     const entry = byKey.get(pack);
     if (!entry) {
       // Manager v4 removed the legacy getlist catalog endpoint. Its task API
@@ -469,6 +481,29 @@ export async function installWorkflowDependencies(
     }
     toInstall.push(entry);
     installed.push(pack);
+  }
+
+  // Resolve the panel targets: a pin REFUSES (the pin is checked before any
+  // Manager work is queued); local installs go through the verified panel
+  // path (runPanelAction re-reads the pack from disk and fails closed); on a
+  // remote host no on-disk verification exists, so the pin check is the whole
+  // guard and the pack joins the generic queue.
+  for (const pack of panelTargets) {
+    assertPanelPinAllows("install", pack);
+    if (!isLocalMode()) {
+      toInstall.push({ id: pack, version: "latest" });
+      panelNotes.push(
+        `"${pack}" is the sidebar panel pack: queued with the other packs (remote host — ` +
+          `no on-disk verification exists there; the pin check above is the whole guard).`,
+      );
+    } else {
+      const result = await runPanelAction("install");
+      panelNotes.push(
+        `"${pack}" is the sidebar panel pack: installed via the verified panel path ` +
+          `(${result.action}${result.installedVersion ? `, verified ${result.installedVersion}` : ""}). ` +
+          `RESTART ComfyUI to load it.`,
+      );
+    }
   }
 
   let queue: ManagerQueueStatus | undefined;
@@ -497,5 +532,6 @@ export async function installWorkflowDependencies(
     alreadyInstalled: analysis.requiredPacks.filter((p) => !missingSet.has(p)),
     unresolved: [...new Set(unresolved)].sort(),
     queue,
+    ...(panelNotes.length ? { panel_notes: panelNotes } : {}),
   };
 }
