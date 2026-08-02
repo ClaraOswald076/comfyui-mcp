@@ -2305,7 +2305,8 @@ export function makePanelToolCtx(
         dispatchedRid &&
         requiresWorkflowStampEnforcement(cmd) &&
         RETRY_TOKEN_CMDS.has(typeof cmd.cmd === "string" ? cmd.cmd : "") &&
-        (dispatchOutcomeOf(err) === true || isReplyTimeoutError(err))
+        (dispatchOutcomeOf(err) === true ||
+          (isReplyTimeoutError(err) && dispatchOutcomeOf(err) !== false))
       ) {
         const cause = err instanceof Error ? err.message : String(err);
         return fail(
@@ -4881,9 +4882,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // whatever tab is visible (codex — graph_* must carry the pin).
           const target = ctx.workflowTarget?.get(ctx.tabId);
           const cmd = withWorkflowTarget(
-            // #694: this handler sends DIRECTLY (bypasses ctx.call) so the
-            // withRetryToken wrapper can't attach the token — thread it here.
-            { cmd: "graph_screenshot", padding: args.padding, retry_of: args.retry_of },
+            // #694: panel_screenshot is view-only — OUTSIDE the retry map — so it
+            // never carries the token (a ledger answer for a read is a STALE
+            // outcome), and the withRetryToken wrapper can't reach this direct send.
+            { cmd: "graph_screenshot", padding: args.padding },
             target ?? { mode: "current" },
           );
           const res = (await ctx.bridge.send(cmd as { cmd: string }, {
