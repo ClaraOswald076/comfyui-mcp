@@ -273,11 +273,11 @@ describe("panel-tools: panel_set_node_mode (bypass/mute/active)", () => {
     expect(force.safeParse(undefined).success).toBe(true);
   });
 
-  it("forwards graph_edit_node with node_id + mode (+ force)", async () => {
+  it("preserves graph_set_node_mode for panels that predate graph_edit_node", async () => {
     const { ctx, calls } = makeFakeCtx();
     await defByName("panel_set_node_mode").handler({ node_id: 143, mode: "bypass", force: true }, ctx);
     expect(calls[0]).toMatchObject({
-      cmd: "graph_edit_node",
+      cmd: "graph_set_node_mode",
       node_id: 143,
       mode: "bypass",
       force: true,
@@ -344,6 +344,31 @@ describe("panel-tools: panel_edit_node (#572 presentation consolidation)", () =>
       mode: "bypass",
       force: true,
     });
+  });
+
+  it.each([
+    [{ pos: [1, 2] }, "exactly one of node_id or node_ids"],
+    [{ node_id: 7, node_ids: [8], pos: [1, 2] }, "exactly one of node_id or node_ids"],
+    [{ node_id: 7 }, "at least one editable field"],
+    [{ node_id: 7, preset: "red", color: "#112233" }, "preset cannot be combined"],
+  ])("rejects invalid cross-field input before dispatch: %o", async (args, expected) => {
+    const { ctx, calls } = makeFakeCtx();
+    const result = await defByName("panel_edit_node").handler(args, ctx);
+    expect(calls).toHaveLength(0);
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain(expected);
+  });
+
+  it.each([
+    ["panel_move_node", { node_id: 7, pos: [1, 2] }, "graph_move_node"],
+    ["panel_resize_node", { node_id: 7, size: [120, 80] }, "graph_resize_node"],
+    ["panel_set_node_title", { node_id: 7, title: "Title" }, "graph_set_title"],
+    ["panel_set_node_collapsed", { node_id: 7, collapsed: false }, "graph_set_node_collapsed"],
+    ["panel_set_node_color", { node_id: 7, color: "#112233" }, "graph_set_node_color"],
+  ])("keeps %s on its legacy bridge command for old panels", async (name, args, command) => {
+    const { ctx, calls } = makeFakeCtx();
+    await defByName(name).handler(args, ctx);
+    expect(calls[0]).toMatchObject({ cmd: command, node_id: 7 });
   });
 });
 

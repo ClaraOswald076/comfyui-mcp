@@ -1848,6 +1848,23 @@ describe("makeUnknownCommandError (old-panel version gate)", () => {
     expect(e?.message).not.toBe('Unknown command "ui_render"'); // never the bare passthrough
   });
 
+  it("rewrites graph_resize_node on a <0.11.25 panel with the correct minimum (#619 recurrence)", () => {
+    expect(minPanelVersionForCmd("graph_resize_node")).toBe("0.11.25");
+    const e = makeUnknownCommandError('Unknown command "graph_resize_node"', "0.11.21");
+    expect(e).not.toBeNull();
+    expect(e?.message).toContain("graph_resize_node");
+    expect(e?.message).toContain("0.11.21");
+    expect(e?.message).toContain("0.11.25");
+    expect(e?.message).not.toContain(MIN_PANEL_VERSION_FOR_BRIDGE_COMMANDS);
+    expect(e?.message.toLowerCase()).toContain("too old");
+    expect(e?.message.toLowerCase()).toContain("update");
+  });
+
+  it("does not rewrite graph_resize_node once the panel is at or above 0.11.25 (#619 boundary)", () => {
+    expect(makeUnknownCommandError('Unknown command "graph_resize_node"', "0.11.25")).toBeNull();
+    expect(makeUnknownCommandError('Unknown command "graph_resize_node"', "0.11.32")).toBeNull();
+  });
+
 });
 
 describe("panelVersionProvesUnsupported (#392 proactive version gate)", () => {
@@ -1892,6 +1909,13 @@ describe("panelVersionProvesUnsupported (#392 proactive version gate)", () => {
     expect(panelVersionProvesUnsupported("refresh_nodes", "0.11.27")).toBe(true);
     expect(panelVersionProvesUnsupported("refresh_nodes", "0.11.28")).toBe(false);
     expect(panelVersionProvesUnsupported("refresh_nodes", "0.12.0")).toBe(false);
+  });
+
+  it("proactively gates graph_resize_node below 0.11.25 and clears it at or above (#619 recurrence)", () => {
+    expect(panelVersionProvesUnsupported("graph_resize_node", "0.11.21")).toBe(true);
+    expect(panelVersionProvesUnsupported("graph_resize_node", "0.11.24")).toBe(true);
+    expect(panelVersionProvesUnsupported("graph_resize_node", "0.11.25")).toBe(false);
+    expect(panelVersionProvesUnsupported("graph_resize_node", "0.11.32")).toBe(false);
   });
 
 });
