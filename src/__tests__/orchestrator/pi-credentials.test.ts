@@ -188,11 +188,11 @@ describe("auth.json records", () => {
     expect(authRecordUsable({ key: "x" })).toBe(false);
   });
 
-  it("a stored-but-unusable record suppresses that provider's env key", () => {
+  it("an unusable stored api-key record falls through to that provider's env key", () => {
     const home = tmp;
     writePiFile(home, "auth.json", JSON.stringify({ openai: { type: "api_key" } }));
     // pi will not consult OPENAI_API_KEY: the stored record owns `openai`.
-    expect(piCredentialPresent(home, bareEnv({ OPENAI_API_KEY: "sk" }))).toBe(false);
+    expect(piCredentialPresent(home, bareEnv({ OPENAI_API_KEY: "sk" }))).toBe(true);
     // …but an unrelated provider's env key still counts.
     expect(piCredentialPresent(home, bareEnv({ XAI_API_KEY: "sk" }))).toBe(true);
   });
@@ -221,7 +221,7 @@ describe("auth.json records", () => {
     // ambient auth); null/false/0 do not. The panel's Python mirror has to match
     // this explicitly, since Python's own truthiness differs for `{}`/`[]`.
     for (const [body, ready] of [
-      ['{"openai":{}}', true],
+      ['{"openai":{}}', false],
       ['{"openai":[]}', false],
       ['{"openai":null}', true],
       ['{"openai":false}', true],
