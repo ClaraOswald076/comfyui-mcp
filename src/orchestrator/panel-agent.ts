@@ -221,10 +221,11 @@ export class PanelAgent {
   // IDLE timer (reset on every received event), NOT a hard turn cap: legit tool
   // work is slow but still streams progress/tool events, so only a TRUE stall
   // (no events at all for the whole window) trips it. On trip we surface a clear
-  // terminal error, advance the turn-gate (so the next queued batch runs), and
-  // best-effort interrupt the backend. Composes with the backend's own terminal
-  // result: completeTurn() is capped at yieldedTurns, so a late real result after
-  // a trip can't double-advance the gate.
+  // terminal error (the turn's ONE failure report) and route through the guarded
+  // interrupt() flow: the aborted turn's terminal result — or the bounded
+  // interrupt-release fallback if no result ever arrives — advances the turn-gate
+  // at the genuine turn end, so the next queued batch never runs ahead of the
+  // wedged turn settling (#728).
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   /** Guards against a trip firing twice / racing a real result for one turn. */
   private idleTripped = false;
@@ -934,10 +935,14 @@ export class PanelAgent {
   }
 
   /** The current turn produced NO events for the whole idle window → it's frozen.
-   *  Surface a clear error, clear the "working" indicator, advance the turn-gate
-   *  so the next queued batch can run, and best-effort interrupt the backend so a
-   *  wedged child stops. Idempotent per turn via idleTripped; completeTurn() is
-   *  capped at yieldedTurns so a late real result can't double-advance the gate. */
+   *  Surface a clear error, clear the "working" indicator, and interrupt via the
+   *  guarded interrupt() flow so the turn-gate opens only when the turn GENUINELY
+   *  ends (the aborted turn's terminal result, or the bounded interrupt-release
+   *  fallback if none arrives) — not synchronously here, which let the next queued
+   *  batch run before the wedged turn had settled. The stall warning is this turn's
+   *  ONE failure report: errorSurfaced + interruptRequested suppress the follow-up
+   *  interrupted result's "turn failed" line (#728). Idempotent per turn via
+   *  idleTripped. */
   private onTurnStalled(): void {
     if (this.closed || this.idleTripped || !this.busy) return;
     // A tool call in flight is legitimate work even with a silent app-server (an
@@ -952,21 +957,30 @@ export class PanelAgent {
     this.idleTripped = true;
     this.idleTimer = null;
     logger.error(
-      `[panel-agent ${this.short()}] turn stalled — no events for ${Math.round(TURN_IDLE_MS / 1000)}s; surfacing error and releasing the gate`,
+      `[panel-agent ${this.short()}] turn stalled — no events for ${Math.round(TURN_IDLE_MS / 1000)}s; surfacing error and interrupting`,
     );
+    // The stall warning below IS this turn's failure report — mark it surfaced so
+    // the backend's terminal `{ ok: false, subtype: "interrupted" }` result isn't
+    // painted as a SECOND, contradictory failure. (interrupt() also sets
+    // interruptRequested, so the result case treats that result as the interrupt
+    // landing, not a new failure.)
+    this.errorSurfaced = true;
+    this.busy = false;
+    // The stalled turn is abandoned + surfaced as an error — don't re-queue its
+    // text (a wedged message could otherwise loop on every interrupt, and it may
+    // already have performed tool side effects).
+    this.inFlight = null;
     this.deps.onSay(
       this.tabId,
       "⚠️ The agent stopped responding (the turn stalled with no activity). I've cleared it — please try again.",
     );
-    this.busy = false;
-    // The stalled turn is abandoned + surfaced as an error — don't re-queue its
-    // text (a wedged message could otherwise loop on every interrupt).
-    this.inFlight = null;
-    this.completeTurn(); // release the next queued batch instead of hanging
     this.deps.onTurn?.(this.tabId, "done");
-    // Best-effort: stop the wedged turn so the backend doesn't keep a dead child
-    // half-alive. The self-restart loop in start() recovers the session.
-    void this.backend.interrupt().catch(() => {});
+    // Do NOT completeTurn() here: the gate must stay held until the turn genuinely
+    // ends. interrupt() arms the bounded release fallback and stops the wedged
+    // backend; the aborted turn's `result` (or that fallback) releases the next
+    // queued batch at the right moment. The self-restart loop in start() recovers
+    // the session.
+    void this.interrupt();
   }
 
   // Handle a canonical AgentEvent from the backend. This is the provider-agnostic
