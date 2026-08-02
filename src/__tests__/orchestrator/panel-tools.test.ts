@@ -862,7 +862,6 @@ describe("panel-tools: panel_find_nodes (live-graph search)", () => {
       "mode",
       "output",
       "query",
-      "retry_of",
       "title",
       "type",
       "widget",
