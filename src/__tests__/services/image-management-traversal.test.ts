@@ -270,6 +270,22 @@ describe("getOutputImage — video/audio media (issue #663)", () => {
     ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
   });
 
+  it("rejects a WAV body mislabeled as video/mp4 (cross-family mismatch)", async () => {
+    // Bytes AND label are both "media", but the families disagree — saving the
+    // WAV under the requested .mp4 would report a corrupt video as a success.
+    fetchImageMock.mockResolvedValue({ base64: WAV_BASE64, mimeType: "video/mp4" });
+    await expect(
+      getOutputImage("clip_00001_.mp4", "output", "video", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects an MP4 body mislabeled as audio/wav (cross-family mismatch)", async () => {
+    fetchImageMock.mockResolvedValue({ base64: MP4_BASE64, mimeType: "audio/wav" });
+    await expect(
+      getOutputImage("audio_00001_.wav", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
   it("rejects a truncated 8-byte body that is only '....ftyp' (no box behind it)", async () => {
     // The four bytes "ftyp" at offset 4 alone are not an MP4 — a valid ftyp
     // box needs the major brand and minor version too (>= 16 bytes), so a
@@ -327,6 +343,32 @@ describe("getOutputImage — video/audio media (issue #663)", () => {
     await expect(
       getOutputImage("clip_00001_.mp4", "output", "video", { allowMedia: true }),
     ).resolves.toMatchObject({ mimeType: "application/octet-stream" });
+  });
+
+  it("resolves genuine WAV bytes served as application/octet-stream", async () => {
+    // The generic label declares no family, so any genuine media signature
+    // passes — video OR audio.
+    fetchImageMock.mockResolvedValue({
+      base64: WAV_BASE64,
+      mimeType: "application/octet-stream",
+    });
+    await expect(
+      getOutputImage("audio_00001_.wav", "output", "", { allowMedia: true }),
+    ).resolves.toMatchObject({ mimeType: "application/octet-stream" });
+  });
+
+  it("resolves an m4a payload labeled audio/mp4 (audio-brand ftyp)", async () => {
+    // .m4a is audio in an mp4 container — its ftyp major brand (M4A ) is an
+    // AUDIO signature, so it must not trip the cross-family guard.
+    const M4A_BASE64 = Buffer.from([
+      0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, // ....ftyp
+      0x4d, 0x34, 0x41, 0x20, 0x00, 0x00, 0x00, 0x00, // M4A␠....
+      0x4d, 0x34, 0x41, 0x20, 0x6d, 0x70, 0x34, 0x32, // M4A␠mp42
+    ]).toString("base64");
+    fetchImageMock.mockResolvedValue({ base64: M4A_BASE64, mimeType: "audio/mp4" });
+    await expect(
+      getOutputImage("audio_00001_.m4a", "output", "", { allowMedia: true }),
+    ).resolves.toMatchObject({ mimeType: "audio/mp4" });
   });
 
   it("rejects a non-media body served as application/octet-stream", async () => {

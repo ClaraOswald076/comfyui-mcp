@@ -444,15 +444,21 @@ function assertSafeViewRef(filename: string, subfolder: string): void {
   }
 }
 
+type MediaFamily = "video" | "audio";
+
 /**
  * Magic-byte sniff for the video/audio formats get_image can save (#663).
- * Every container ComfyUI's media nodes emit has a fixed leading signature:
- * MP4/MOV/M4V/M4A open with a well-formed "ftyp" box, WebM/MKV start with
- * the EBML header, WAV/AVI are RIFF containers, FLAC/Ogg have ASCII magic,
- * and MP3/AAC start with an ID3 tag or an MPEG/ADTS frame sync. A textual
- * junk body (JSON/HTML error page) matches none of these.
+ * Returns the media FAMILY the payload's leading signature belongs to, or
+ * null when it matches none of them. Every container ComfyUI's media nodes
+ * emit has a fixed leading signature: MP4/MOV/M4V/M4A open with a well-formed
+ * "ftyp" box, WebM/MKV start with the EBML header, WAV/AVI are RIFF
+ * containers, FLAC/Ogg have ASCII magic, and MP3/AAC start with an ID3 tag or
+ * an MPEG/ADTS frame sync. A textual junk body (JSON/HTML error page) matches
+ * none of these. The family lets the caller reject cross-family mislabels —
+ * a WAV body declared video/mp4, or an MP4 declared audio/wav — even though
+ * both byte streams are genuine media.
  */
-function sniffsAsMedia(base64: string): boolean {
+function sniffMediaFamily(base64: string): MediaFamily | null {
   // 24 base64 chars decode to the first 18 bytes — the deepest signature
   // below (the ftyp minor version at bytes 12–15) fits comfortably.
   const head = Buffer.from(base64.slice(0, 24), "base64");
@@ -471,21 +477,27 @@ function sniffsAsMedia(base64: string): boolean {
     const printableBrand = head
       .subarray(8, 12)
       .every((b) => b >= 0x20 && b <= 0x7e);
-    if (boxSize >= 16 && boxSize <= bodyLength && printableBrand) return true;
+    if (boxSize >= 16 && boxSize <= bodyLength && printableBrand) {
+      // M4A/M4B are audio-only brands (m4a audio in an mp4 container); the
+      // rest (isom/mp41/mp42/avc1/qt/M4V…) are video.
+      const brand = ascii(8, 12);
+      return brand === "M4A " || brand === "M4B " ? "audio" : "video";
+    }
   }
   if (head.length >= 4) {
-    if (head.readUInt32BE(0) === 0x1a45dfa3) return true; // webm/mkv (EBML)
-    if (ascii(0, 4) === "fLaC" || ascii(0, 4) === "OggS") return true; // flac/ogg
+    if (head.readUInt32BE(0) === 0x1a45dfa3) return "video"; // webm/mkv (EBML)
+    if (ascii(0, 4) === "fLaC" || ascii(0, 4) === "OggS") return "audio"; // flac/ogg
   }
   if (head.length >= 12 && ascii(0, 4) === "RIFF") {
     const form = ascii(8, 12);
-    if (form === "WAVE" || form === "AVI ") return true; // wav/avi
+    if (form === "WAVE") return "audio"; // wav
+    if (form === "AVI ") return "video"; // avi
   }
-  if (head.length >= 3 && ascii(0, 3) === "ID3") return true; // mp3 (tagged)
+  if (head.length >= 3 && ascii(0, 3) === "ID3") return "audio"; // mp3 (tagged)
   if (head.length >= 2 && head[0] === 0xff && (head[1] & 0xe0) === 0xe0) {
-    return true; // mp3 / aac frame sync
+    return "audio"; // mp3 / aac frame sync
   }
-  return false;
+  return null;
 }
 
 /**
@@ -498,7 +510,9 @@ function sniffsAsMedia(base64: string): boolean {
  * acceptance sniffs the payload's magic bytes instead of trusting the declared
  * content-type, so a JSON/HTML error body mislabeled as video/mp4 is still
  * rejected — and genuine media a proxy serves as application/octet-stream
- * (ComfyUI itself reports video/mp4 via mimetypes) still passes.
+ * (ComfyUI itself reports video/mp4 via mimetypes) still passes. The sniffed
+ * media family must also match the declared top-level type (a WAV labeled
+ * video/mp4 is rejected).
  */
 export async function getOutputImage(
   filename: string,
@@ -522,15 +536,26 @@ export async function getOutputImage(
   // declared content-type alone is no proof, and get_image would save the junk
   // bytes as a working .mp4. So media payloads must also SNIFF as media (magic
   // bytes), which doubles as acceptance for genuine media a proxy serves under
-  // the generic application/octet-stream type.
+  // the generic application/octet-stream type. The sniffed media FAMILY must
+  // also match the declared top-level type: video/* requires a video signature
+  // and audio/* an audio one, so a cross-family mismatch (WAV labeled
+  // video/mp4, MP4 labeled audio/wav) is rejected like other junk instead of
+  // being saved under a corrupt extension.
   const mime = result.mimeType.toLowerCase();
   const isImage = mime.startsWith("image/");
-  const isMedia =
+  const declaredFamily: MediaFamily | null = mime.startsWith("video/")
+    ? "video"
+    : mime.startsWith("audio/")
+      ? "audio"
+      : null;
+  const sniffedFamily =
     allowMedia &&
-    (mime.startsWith("video/") ||
-      mime.startsWith("audio/") ||
-      mime === "application/octet-stream") &&
-    sniffsAsMedia(result.base64);
+    (declaredFamily !== null || mime === "application/octet-stream")
+      ? sniffMediaFamily(result.base64)
+      : null;
+  const isMedia =
+    sniffedFamily !== null &&
+    (declaredFamily === null || sniffedFamily === declaredFamily);
   if ((!isImage && !isMedia) || result.base64.length === 0) {
     const where = subfolder ? `${type}/${subfolder}` : type;
     throw new ComfyUIError(
