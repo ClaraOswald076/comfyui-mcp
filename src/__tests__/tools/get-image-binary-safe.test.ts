@@ -86,7 +86,13 @@ describe("get_image — video/audio save-to-disk (#663)", () => {
   afterEach(() => vi.clearAllMocks());
 
   it("saves a video/mp4 asset to disk and returns text only (no inline image)", async () => {
-    const base64 = Buffer.from("fake-mp4-bytes").toString("base64");
+    // Realistic MP4 header (24-byte ftyp box, isom brand) — the service's
+    // magic-byte sniff accepts this shape; junk bytes would be rejected there.
+    const base64 = Buffer.from([
+      0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, // ....ftyp
+      0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00, 0x02, 0x00, // isom....
+      0x69, 0x73, 0x6f, 0x6d, 0x69, 0x73, 0x6f, 0x32, // isomiso2
+    ]).toString("base64");
     getOutputImageMock.mockResolvedValue({
       base64,
       mimeType: "video/mp4",
@@ -118,5 +124,32 @@ describe("get_image — video/audio save-to-disk (#663)", () => {
     const text = out.content.map((c) => c.text ?? "").join("");
     expect(text).toContain("I2V_HD_FaceLock_00036-audio.mp4");
     expect(text).toContain("video/mp4");
+  });
+
+  it("writes NOTHING to disk when the service rejects a mislabeled media body", async () => {
+    // A JSON/HTML error body mislabeled video/mp4 is rejected inside
+    // getOutputImage (magic-byte sniff, see image-management-traversal.test.ts).
+    // The tool must surface that structured error and must NOT save a
+    // fabricated .mp4 from the junk bytes.
+    getOutputImageMock.mockRejectedValue(
+      new ComfyUIError(
+        'ComfyUI /view did not return an image for "clip_00001_.mp4" (output/video); got content-type "video/mp4".',
+        "IMAGE_NOT_FOUND",
+      ),
+    );
+
+    const out = await getHandler("get_image")({
+      filename: "clip_00001_.mp4",
+      type: "output",
+      subfolder: "video",
+      save_dir: "/tmp/x",
+    });
+
+    expect(out.isError).toBe(true);
+    const parsed = JSON.parse(
+      out.content.map((c) => c.text ?? "").join(""),
+    ) as { error?: string };
+    expect(parsed.error).toBe("IMAGE_NOT_FOUND");
+    expect(vi.mocked(writeFile)).not.toHaveBeenCalled();
   });
 });

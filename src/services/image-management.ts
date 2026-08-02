@@ -445,12 +445,46 @@ function assertSafeViewRef(filename: string, subfolder: string): void {
 }
 
 /**
+ * Magic-byte sniff for the video/audio formats get_image can save (#663).
+ * Every container ComfyUI's media nodes emit has a fixed leading signature:
+ * MP4/MOV/M4V/M4A carry an "ftyp" box at offset 4, WebM/MKV start with the
+ * EBML header, WAV/AVI are RIFF containers, FLAC/Ogg have ASCII magic, and
+ * MP3/AAC start with an ID3 tag or an MPEG/ADTS frame sync. A textual junk
+ * body (JSON/HTML error page) matches none of these.
+ */
+function sniffsAsMedia(base64: string): boolean {
+  // 24 base64 chars decode to the first 18 bytes — the deepest signature
+  // below (the RIFF form type at bytes 8–11) fits comfortably.
+  const head = Buffer.from(base64.slice(0, 24), "base64");
+  const ascii = (start: number, end: number) =>
+    head.subarray(start, end).toString("ascii");
+  if (head.length >= 8 && ascii(4, 8) === "ftyp") return true; // mp4/mov/m4v/m4a
+  if (head.length >= 4) {
+    if (head.readUInt32BE(0) === 0x1a45dfa3) return true; // webm/mkv (EBML)
+    if (ascii(0, 4) === "fLaC" || ascii(0, 4) === "OggS") return true; // flac/ogg
+  }
+  if (head.length >= 12 && ascii(0, 4) === "RIFF") {
+    const form = ascii(8, 12);
+    if (form === "WAVE" || form === "AVI ") return true; // wav/avi
+  }
+  if (head.length >= 3 && ascii(0, 3) === "ID3") return true; // mp3 (tagged)
+  if (head.length >= 2 && head[0] === 0xff && (head[1] & 0xe0) === 0xe0) {
+    return true; // mp3 / aac frame sync
+  }
+  return false;
+}
+
+/**
  * Fetch a generated image from ComfyUI via HTTP /view endpoint.
  * Does NOT require COMFYUI_PATH — works with remote ComfyUI instances.
  *
  * By default only image/* payloads are accepted. Pass `allowMedia: true` to
  * also accept video/* and audio/* (e.g. a VHS_VideoCombine .mp4) so the caller
- * can save them to disk — /view returns raw bytes for any media type.
+ * can save them to disk — /view returns raw bytes for any media type. Media
+ * acceptance sniffs the payload's magic bytes instead of trusting the declared
+ * content-type, so a JSON/HTML error body mislabeled as video/mp4 is still
+ * rejected — and genuine media a proxy serves as application/octet-stream
+ * (ComfyUI itself reports video/mp4 via mimetypes) still passes.
  */
 export async function getOutputImage(
   filename: string,
@@ -469,10 +503,20 @@ export async function getOutputImage(
   // returned them as an inline image block, so the MCP client then choked trying
   // to decode them ("Unexpected end of JSON input"). Fail loudly and structured
   // instead, so get_image surfaces a clean not-found rather than a corrupt image.
+  //
+  // Under allowMedia the same junk body can arrive labeled video/mp4 — the
+  // declared content-type alone is no proof, and get_image would save the junk
+  // bytes as a working .mp4. So media payloads must also SNIFF as media (magic
+  // bytes), which doubles as acceptance for genuine media a proxy serves under
+  // the generic application/octet-stream type.
   const mime = result.mimeType.toLowerCase();
   const isImage = mime.startsWith("image/");
   const isMedia =
-    allowMedia && (mime.startsWith("video/") || mime.startsWith("audio/"));
+    allowMedia &&
+    (mime.startsWith("video/") ||
+      mime.startsWith("audio/") ||
+      mime === "application/octet-stream") &&
+    sniffsAsMedia(result.base64);
   if ((!isImage && !isMedia) || result.base64.length === 0) {
     const where = subfolder ? `${type}/${subfolder}` : type;
     throw new ComfyUIError(
