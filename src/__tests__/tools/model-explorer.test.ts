@@ -1,5 +1,29 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { registerModelExplorerTools, explorerHttpError } from "../../tools/model-explorer.js";
+import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+// --- Mocks (declared before importing the module under test) ---
+
+// The local-fallback path resolves the model on disk via this; stub it so the
+// tests don't depend on a configured COMFYUI_PATH / real models tree.
+const resolveExistingModelFileMock = vi.fn();
+vi.mock("../../services/model-resolver.js", async () => {
+  const actual = await vi.importActual<typeof import("../../services/model-resolver.js")>(
+    "../../services/model-resolver.js",
+  );
+  return {
+    ...actual,
+    resolveExistingModelFile: (...a: unknown[]) => resolveExistingModelFileMock(...a),
+  };
+});
+
+import {
+  registerModelExplorerTools,
+  explorerHttpError,
+  parseSafetensorsEmbeddedMetadata,
+  SAFETENSORS_HEADER_MAX_BYTES,
+} from "../../tools/model-explorer.js";
 
 type ToolHandler = (args: Record<string, unknown>) => Promise<{
   isError?: boolean;
@@ -51,6 +75,10 @@ describe("model_metadata_read / fetch_civitai 404 handling", () => {
   beforeEach(() => {
     fetchMock.mockReset();
     vi.stubGlobal("fetch", fetchMock);
+    // Default: nothing resolvable locally (remote-mode behavior) — the degrade
+    // tests override this with a real temp file.
+    resolveExistingModelFileMock.mockReset();
+    resolveExistingModelFileMock.mockRejectedValue(new Error("No local ComfyUI path configured (test default)"));
   });
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -143,5 +171,184 @@ describe("model_metadata_read / fetch_civitai 404 handling", () => {
 
     expect(res.isError).toBeFalsy();
     expect(res.content[0].text).toContain("checkpoint");
+  });
+});
+
+/** Build a real safetensors file body: 8-byte LE header length + header JSON
+ *  (+ a token tensor payload, which readers here must never touch). */
+function makeSafetensorsBytes(metadata: Record<string, string> | null): Buffer {
+  const header = {
+    "model.layers.0.weight": { dtype: "F16", shape: [2, 2], data_offsets: [0, 8] },
+    ...(metadata ? { __metadata__: metadata } : {}),
+  };
+  const json = Buffer.from(JSON.stringify(header), "utf8");
+  const len = Buffer.alloc(8);
+  len.writeBigUInt64LE(BigInt(json.length));
+  return Buffer.concat([len, json, Buffer.alloc(8)]);
+}
+
+describe("parseSafetensorsEmbeddedMetadata", () => {
+  it("extracts the __metadata__ map from a valid header", () => {
+    const buf = makeSafetensorsBytes({
+      "modelspec.architecture": "stable-diffusion-xl-v1-base",
+      ss_tag_frequency: "{}",
+    });
+    expect(parseSafetensorsEmbeddedMetadata(buf)).toEqual({
+      "modelspec.architecture": "stable-diffusion-xl-v1-base",
+      ss_tag_frequency: "{}",
+    });
+  });
+
+  it("returns null when the header carries no __metadata__", () => {
+    expect(parseSafetensorsEmbeddedMetadata(makeSafetensorsBytes(null))).toBeNull();
+  });
+
+  it("returns null for a buffer too short to hold the length prefix", () => {
+    expect(parseSafetensorsEmbeddedMetadata(Buffer.from("abc"))).toBeNull();
+  });
+
+  it("returns null when the declared header exceeds the safety cap", () => {
+    const buf = Buffer.alloc(8);
+    buf.writeBigUInt64LE(BigInt(SAFETENSORS_HEADER_MAX_BYTES + 1));
+    expect(parseSafetensorsEmbeddedMetadata(buf)).toBeNull();
+  });
+
+  it("returns null when the buffer is truncated inside the header JSON", () => {
+    const buf = makeSafetensorsBytes({ a: "b" });
+    // Cut past the 8-byte dummy payload into the header itself.
+    expect(parseSafetensorsEmbeddedMetadata(buf.subarray(0, buf.length - 10))).toBeNull();
+  });
+});
+
+// Remote mode must skip the local fallback entirely (the host's file tree is
+// NOT the remote server's); this flag flips isRemoteMode() per-test while
+// every other config export stays real. vi.mock/vi.hoisted are hoisted, so
+// this still applies before the module under test is imported.
+const remoteMode = vi.hoisted(() => ({ value: false }));
+vi.mock("../../config.js", async () => {
+  const actual = await vi.importActual<typeof import("../../config.js")>("../../config.js");
+  return { ...actual, isRemoteMode: () => remoteMode.value };
+});
+
+describe("model_metadata_read local fallback (#363 reopen)", () => {
+  const fetchMock = vi.fn();
+  let dir: string;
+
+  beforeEach(async () => {
+    fetchMock.mockReset();
+    vi.stubGlobal("fetch", fetchMock);
+    resolveExistingModelFileMock.mockReset();
+    remoteMode.value = false;
+    dir = await mkdtemp(join(tmpdir(), "model-explorer-363-"));
+  });
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  /** Point the resolver mock at a real temp file, the way the real resolver
+   *  would (absolute path + genuine fs.Stats). */
+  async function stubLocalModel(filePath: string) {
+    const info = await stat(filePath);
+    resolveExistingModelFileMock.mockResolvedValue({ path: filePath, root: dir, info });
+  }
+
+  it("404 + model present locally → structured 'unavailable' result with local metadata, NOT isError", async () => {
+    const filePath = join(dir, "model.safetensors");
+    await writeFile(
+      filePath,
+      makeSafetensorsBytes({ "modelspec.architecture": "stable-diffusion-xl-v1-base" }),
+    );
+    await writeFile(
+      `${filePath}.civitai.json`,
+      JSON.stringify({ trainedWords: ["dark fantasy"], baseModel: "SDXL 1.0" }),
+    );
+    await stubLocalModel(filePath);
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 404, text: async () => "" });
+
+    const { read } = makeServer();
+    const res = await read({ category: "checkpoints", name: "model.safetensors" });
+
+    expect(res.isError).toBeFalsy();
+    const parsed = JSON.parse(res.content[0].text);
+    expect(parsed.model_explorer).toBe("unavailable");
+    expect(parsed.source).toBe("local-fallback");
+    expect(parsed.reason).toContain("comfyui-model-explorer");
+    expect(parsed.install).toMatch(/ComfyUI-Manager|install_custom_node/);
+    expect(parsed.file.path).toBe(filePath);
+    expect(parsed.file.size_bytes).toBeGreaterThan(0);
+    expect(parsed.embedded_metadata["modelspec.architecture"]).toBe("stable-diffusion-xl-v1-base");
+    expect(parsed.civitai_sidecar.trainedWords).toEqual(["dark fantasy"]);
+    // Must NOT be the old raw-status phrasing.
+    expect(res.content[0].text).not.toContain("detail HTTP 404 (is ComfyUI running");
+  });
+
+  it("404 + non-safetensors file (.ckpt) → degrade result with sidecar but null embedded metadata", async () => {
+    const filePath = join(dir, "old.ckpt");
+    await writeFile(filePath, Buffer.from([0x80, 0x02, 0x7d])); // pickle magic-ish
+    await writeFile(`${filePath}.civitai.json`, JSON.stringify({ baseModel: "SD 1.5" }));
+    await stubLocalModel(filePath);
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 404, text: async () => "" });
+
+    const { read } = makeServer();
+    const res = await read({ category: "checkpoints", name: "old.ckpt" });
+
+    expect(res.isError).toBeFalsy();
+    const parsed = JSON.parse(res.content[0].text);
+    expect(parsed.model_explorer).toBe("unavailable");
+    expect(parsed.embedded_metadata).toBeNull();
+    expect(parsed.civitai_sidecar.baseModel).toBe("SD 1.5");
+  });
+
+  it("404 + model NOT resolvable locally (remote mode / missing file) → keeps the actionable error", async () => {
+    resolveExistingModelFileMock.mockRejectedValue(
+      new Error("No local ComfyUI path configured."),
+    );
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 404, text: async () => "" });
+
+    const { read } = makeServer();
+    const res = await read({ category: "checkpoints", name: "ghost.safetensors" });
+
+    expect(res.isError).toBe(true);
+    const text = res.content[0].text;
+    expect(text).toContain("comfyui-model-explorer");
+    expect(text).toContain("could not find the requested model file");
+  });
+
+  it("404 + REMOTE mode → local fallback skipped even when a host file resolves; keeps the actionable error", async () => {
+    remoteMode.value = true;
+    const filePath = join(dir, "model.safetensors");
+    await writeFile(
+      filePath,
+      makeSafetensorsBytes({ "modelspec.architecture": "stable-diffusion-xl-v1-base" }),
+    );
+    // The host's COMFYUI_PATH WOULD resolve this file — in remote mode that is
+    // the wrong machine's tree, so the resolver must not even be consulted.
+    await stubLocalModel(filePath);
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 404, text: async () => "" });
+
+    const { read } = makeServer();
+    const res = await read({ category: "checkpoints", name: "model.safetensors" });
+
+    expect(res.isError).toBe(true);
+    const text = res.content[0].text;
+    expect(text).toContain("comfyui-model-explorer");
+    expect(text).toContain("could not find the requested model file");
+    expect(text).not.toContain("local-fallback");
+    expect(resolveExistingModelFileMock).not.toHaveBeenCalled();
+  });
+
+  it("404 + resolver hits a DIRECTORY → no success-shaped result; keeps the actionable error", async () => {
+    const subdir = await mkdtemp(join(dir, "not-a-file-")); // a real directory, not a model file
+    resolveExistingModelFileMock.mockResolvedValue({ path: subdir, root: dir, info: await stat(subdir) });
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 404, text: async () => "" });
+
+    const { read } = makeServer();
+    const res = await read({ category: "checkpoints", name: "model.safetensors" });
+
+    expect(res.isError).toBe(true);
+    const text = res.content[0].text;
+    expect(text).toContain("comfyui-model-explorer");
+    expect(text).not.toContain("local-fallback");
   });
 });

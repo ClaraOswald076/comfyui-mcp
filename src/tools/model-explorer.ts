@@ -6,7 +6,10 @@
 // the write in the diff-review window, so there is intentionally no write tool here.
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { open, readFile } from "node:fs/promises";
 import { errorToToolResult } from "../utils/errors.js";
+import { isRemoteMode } from "../config.js";
+import { resolveExistingModelFile } from "../services/model-resolver.js";
 
 function comfyBase(): string {
   return (
@@ -114,6 +117,116 @@ async function readBodyText(res: { text?: () => Promise<string> }): Promise<stri
   }
 }
 
+// ---------------------------------------------------------------------------
+// #363 (reopen): local metadata fallback when the optional node is absent. A
+// 404 from /model_explorer/detail used to surface as a raw isError even for
+// models that exist locally — with no metadata at all. When the file is
+// reachable on the LOCAL filesystem, degrade instead: return a structured
+// missing-capability result carrying what comfyui-mcp can read WITHOUT the
+// node (file stat, the CivitAI sidecar, the safetensors embedded __metadata__).
+// ---------------------------------------------------------------------------
+
+/** Cap on the safetensors JSON header we'll buffer — far beyond any real
+ *  checkpoint/LoRA header (KBs–low MBs); guards against a corrupt/ hostile
+ *  length prefix making us allocate the file's whole size. */
+export const SAFETENSORS_HEADER_MAX_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Extract the embedded `__metadata__` map from a safetensors file prefix
+ * (8-byte little-endian header length + that many bytes of header JSON).
+ * Returns null for anything that isn't a well-formed, capped header — the
+ * fallback is best-effort and never throws.
+ */
+export function parseSafetensorsEmbeddedMetadata(buf: Buffer): Record<string, string> | null {
+  if (buf.length < 8) return null;
+  const headerLen = Number(buf.readBigUInt64LE(0));
+  if (!Number.isSafeInteger(headerLen) || headerLen <= 0 || headerLen > SAFETENSORS_HEADER_MAX_BYTES) {
+    return null;
+  }
+  if (buf.length < 8 + headerLen) return null;
+  try {
+    const header = JSON.parse(buf.toString("utf8", 8, 8 + headerLen)) as Record<string, unknown>;
+    const meta = header["__metadata__"];
+    if (!meta || typeof meta !== "object" || Array.isArray(meta)) return null;
+    return meta as Record<string, string>;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read JUST the safetensors header of a local file and return its embedded
+ * `__metadata__` (modelspec, ss_*, model_card/prompt_director blobs, …) — the
+ * same raw evidence the Model Explorer node namespaces into its curated view.
+ * Only the header bytes are touched, never the multi-GB tensor payload.
+ * Non-safetensors formats (.ckpt/.pt/.bin) have no such header → null.
+ */
+export async function readSafetensorsEmbeddedMetadata(
+  filePath: string,
+): Promise<Record<string, string> | null> {
+  if (!/\.safetensors$/i.test(filePath)) return null;
+  let fh: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    fh = await open(filePath, "r");
+    const lenBuf = Buffer.alloc(8);
+    if ((await fh.read(lenBuf, 0, 8, 0)).bytesRead < 8) return null;
+    const headerLen = Number(lenBuf.readBigUInt64LE(0));
+    if (!Number.isSafeInteger(headerLen) || headerLen <= 0 || headerLen > SAFETENSORS_HEADER_MAX_BYTES) {
+      return null;
+    }
+    const headerBuf = Buffer.alloc(headerLen);
+    if ((await fh.read(headerBuf, 0, headerLen, 8)).bytesRead < headerLen) return null;
+    return parseSafetensorsEmbeddedMetadata(Buffer.concat([lenBuf, headerBuf]));
+  } catch {
+    return null;
+  } finally {
+    await fh?.close().catch(() => undefined);
+  }
+}
+
+/** Best-effort read of the `<file>.civitai.json` sidecar written next to each
+ *  download_civitai_model install (trainedWords, baseModel, sourceUrl, …). */
+async function readCivitaiSidecar(filePath: string): Promise<Record<string, unknown> | null> {
+  try {
+    const parsed = JSON.parse(await readFile(`${filePath}.civitai.json`, "utf8")) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build the local-fallback payload for a 404'd model_metadata_read. Returns
+ * null whenever a local answer would be the WRONG answer, keeping the
+ * actionable explorerHttpError instead:
+ *  - REMOTE mode: the model lives on the remote server's filesystem. An
+ *    explicit COMFYUI_PATH on this MCP host still resolves (config.ts warns
+ *    but honors it), so without this gate the fallback would return metadata
+ *    from the HOST's unrelated file tree — wrong-machine data presented as
+ *    the answer. The fallback is only meaningful when server and MCP host
+ *    share a file tree.
+ *  - The resolver matched a DIRECTORY, not a regular file — it returns dir
+ *    hits so callers can craft a precise "not a file" error, and a directory
+ *    has no metadata evidence to fall back on.
+ *  - No local file is reachable at all: the 404 likely IS "model not found".
+ */
+async function localMetadataFallback(category: string, name: string) {
+  try {
+    if (isRemoteMode()) return null;
+    const { path, info } = await resolveExistingModelFile(`${category}/${name}`);
+    if (!info.isFile()) return null;
+    return {
+      file: { path, size_bytes: info.size, modified: info.mtime.toISOString() },
+      embedded_metadata: await readSafetensorsEmbeddedMetadata(path),
+      civitai_sidecar: await readCivitaiSidecar(path),
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function registerModelExplorerTools(server: McpServer): void {
   server.tool(
     "model_metadata_read",
@@ -123,7 +236,12 @@ export function registerModelExplorerTools(server: McpServer): void {
       "Call this FIRST when the user wants to improve/curate a model's embedded .safetensors metadata, so you " +
       "propose from real data. NOTE: this is the embedded-in-the-tensor metadata (model_card/prompt_director/" +
       "modelspec/ss_*) — NOT the separate lora_catalog. `category` = ComfyUI model folder ('loras','checkpoints'," +
-      "'vae',…); `name` = filename incl. .safetensors.",
+      "'vae',…); `name` = filename incl. .safetensors. DEPENDENCY: the curated read proxies the OPTIONAL " +
+      "'comfyui-model-explorer' custom node. When that node is absent but the model file is reachable on the " +
+      "LOCAL filesystem, the tool does NOT hard-fail — it degrades to a structured 'model_explorer: unavailable' " +
+      "result with local evidence (file stat, the download_civitai_model sidecar, and the raw embedded " +
+      "safetensors metadata). In remote mode without the node it returns an actionable error naming the " +
+      "missing node.",
     {
       category: z.string().describe("ComfyUI model folder, e.g. 'loras'"),
       name: z.string().describe("model filename incl. .safetensors"),
@@ -133,7 +251,30 @@ export function registerModelExplorerTools(server: McpServer): void {
         const COMFY = comfyBase();
         const q = `category=${encodeURIComponent(args.category)}&name=${encodeURIComponent(args.name)}`;
         const dr = await fetch(`${COMFY}/model_explorer/detail?${q}`);
-        if (!dr.ok) return errorToToolResult(explorerHttpError("detail", dr.status, await readBodyText(dr)));
+        if (!dr.ok) {
+          const body = await readBodyText(dr);
+          // #363 (reopen): node absent but file present locally → structured
+          // missing-capability result with local metadata, NOT a raw isError.
+          if (dr.status === 404) {
+            const local = await localMetadataFallback(args.category, args.name);
+            if (local) {
+              return okText({
+                model_explorer: "unavailable",
+                reason:
+                  "GET /model_explorer/detail returned HTTP 404 — most likely the optional " +
+                  "'comfyui-model-explorer' custom node is not installed on the connected ComfyUI. " +
+                  "This is a LOCAL fallback, not the full curated read.",
+                install:
+                  "Install the node via ComfyUI-Manager or install_custom_node, restart ComfyUI, " +
+                  "then re-call model_metadata_read for the full curated view (classify, model_card, " +
+                  "prompt_director, modelspec, tag_frequency).",
+                source: "local-fallback",
+                ...local,
+              });
+            }
+          }
+          return errorToToolResult(explorerHttpError("detail", dr.status, body));
+        }
         const detail = (await dr.json()) as any;
         let tags = null;
         try {
