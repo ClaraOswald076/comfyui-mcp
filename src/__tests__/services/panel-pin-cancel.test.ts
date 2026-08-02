@@ -240,16 +240,41 @@ describe("pin write cancels a pending update_all (#689)", () => {
     expect(report.note as string).toMatch(/Pending-op handling:/);
   });
 
-  it("falls back to the CURRENT target when the marker recorded no base — and says so", async () => {
+  it("base-less marker: best-effort reset on the current target, but UNVERIFIED — marker KEPT, never 'cancelled'", async () => {
     recordUpdateAllMarker({}); // no base captured (older marker shape)
     v4Persona({ pending: 1, inProgress: 0, done: 0 });
 
     const report = await writePin();
 
+    // The reset IS attempted on the current target (the likely server)...
     expect(resetPosts().map((c) => c.url)).toEqual([`${ORIG}/v2/manager/queue/reset`]);
+    // ...but it proves nothing about the real server, so no proven outcome is
+    // reported and the marker + warning stay.
     const [cancel] = cancelReports(report);
-    expect(cancel.outcome).toBe("cancelled");
-    expect(cancel.detail).toMatch(/recorded no server/);
+    expect(cancel.outcome).toBe("could-not-verify");
+    expect(cancel.markerCleared).toBe(false);
+    expect(cancel.detail).toMatch(/recorded NO server/);
+    expect(cancel.detail).toMatch(/UNVERIFIED/);
+    expect(cancel.detail).toMatch(/best-effort/);
+    expect(cancel.detail).not.toMatch(/cancelled the queued update_all/);
+    expect(activePanelPendingOps()).toHaveLength(1);
+    expect(report.pendingPanelOps).toHaveLength(1);
+    expect(report.note as string).toMatch(/WARNING — a panel-affecting operation is still pending/);
+  });
+
+  it("base-less marker with an idle current target: NO reset sent, still unverified, marker kept", async () => {
+    recordUpdateAllMarker({});
+    v4Persona({ pending: 0, inProgress: 0, done: 3 });
+
+    const report = await writePin();
+
+    expect(resetPosts()).toHaveLength(0);
+    const [cancel] = cancelReports(report);
+    expect(cancel.outcome).toBe("could-not-verify");
+    expect(cancel.markerCleared).toBe(false);
+    expect(cancel.detail).toMatch(/recorded NO server/);
+    expect(cancel.detail).toMatch(/proves NOTHING/);
+    expect(activePanelPendingOps()).toHaveLength(1);
   });
 
   it("reset failure: marker KEPT, warning preserved, nothing claimed", async () => {
@@ -440,6 +465,94 @@ describe("pin write cancels a deferred snapshot restore (#689)", () => {
     expect(activePanelPendingOps()).toHaveLength(1);
     expect(report.pendingPanelOps).toHaveLength(1);
     expect(report.note as string).toMatch(/WARNING — a panel-affecting operation is still pending/);
+    expect(managerCalls).toEqual([]);
+  });
+
+  it("marker recorded for a DIFFERENT server (remote→local retarget): cannot cancel from here, local file UNTOUCHED, marker kept", async () => {
+    const comfyRoot = join(dir, "ComfyUI");
+    config.comfyuiPath = comfyRoot;
+    const restoreFile = join(
+      comfyRoot,
+      "user",
+      "__manager",
+      "startup-scripts",
+      "restore-snapshot.json",
+    );
+    mkdirSync(dirname(restoreFile), { recursive: true });
+    writeFileSync(restoreFile, "{}");
+    // The restore was requested against a remote host; the orchestrator was
+    // then retargeted to this local install. Local evidence must never clear
+    // the remote marker.
+    recordPanelPendingOp(
+      "snapshot-restore",
+      'a snapshot restore ("prod") may have been requested',
+      SNAPSHOT_RESTORE_PENDING_MS,
+      { base: "http://other:8188" },
+    );
+
+    const report = await writePin();
+
+    const [cancel] = cancelReports(report);
+    expect(cancel.outcome).toBe("cannot-cancel");
+    expect(cancel.markerCleared).toBe(false);
+    expect(cancel.detail).toMatch(/cannot cancel from here/);
+    expect(cancel.detail).toContain("http://other:8188");
+    // The local file is NOT touched — deleting it would prove nothing about
+    // the remote host (and could cancel an unrelated LOCAL restore).
+    expect(existsSync(restoreFile)).toBe(true);
+    expect(activePanelPendingOps()).toHaveLength(1);
+    expect(report.pendingPanelOps).toHaveLength(1);
+    expect(report.note as string).toMatch(/WARNING/);
+    expect(managerCalls).toEqual([]);
+  });
+
+  it("base-less restore marker with a local restore file: best-effort delete, but UNVERIFIED — marker kept", async () => {
+    const comfyRoot = join(dir, "ComfyUI");
+    config.comfyuiPath = comfyRoot;
+    const restoreFile = join(
+      comfyRoot,
+      "user",
+      "__manager",
+      "startup-scripts",
+      "restore-snapshot.json",
+    );
+    mkdirSync(dirname(restoreFile), { recursive: true });
+    writeFileSync(restoreFile, "{}");
+    recordPanelPendingOp(
+      "snapshot-restore",
+      'a snapshot restore ("prod") may have been requested',
+      SNAPSHOT_RESTORE_PENDING_MS,
+    ); // no base — older marker shape
+
+    const report = await writePin();
+
+    // The local file WILL run at the next local restart, so deleting it is
+    // protective — but it proves nothing about which host the marker is for.
+    expect(existsSync(restoreFile)).toBe(false);
+    const [cancel] = cancelReports(report);
+    expect(cancel.outcome).toBe("could-not-verify");
+    expect(cancel.markerCleared).toBe(false);
+    expect(cancel.detail).toMatch(/UNVERIFIED/);
+    expect(cancel.detail).toMatch(/recorded no server/);
+    expect(activePanelPendingOps()).toHaveLength(1);
+    expect(managerCalls).toEqual([]);
+  });
+
+  it("base-less restore marker with NO local restore file: not provably drained — marker kept", async () => {
+    config.comfyuiPath = join(dir, "ComfyUI"); // nothing scheduled locally
+    recordPanelPendingOp(
+      "snapshot-restore",
+      'a snapshot restore ("prod") may have been requested',
+      SNAPSHOT_RESTORE_PENDING_MS,
+    ); // no base
+
+    const report = await writePin();
+
+    const [cancel] = cancelReports(report);
+    expect(cancel.outcome).toBe("could-not-verify");
+    expect(cancel.markerCleared).toBe(false);
+    expect(cancel.detail).toMatch(/recorded no server/);
+    expect(activePanelPendingOps()).toHaveLength(1);
     expect(managerCalls).toEqual([]);
   });
 });

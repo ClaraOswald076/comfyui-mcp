@@ -23,6 +23,12 @@
 //     longer pending (an empty, idle queue / a missing restore file cannot
 //     land later). Everything else — in-flight work, remote hosts, reset
 //     failures, unreadable state — keeps the marker and its warning.
+//   - A marker proves things ONLY about the server recorded in it. A marker
+//     with no recorded base, or whose base is not the current target, must
+//     NEVER be resolved on the current target's evidence: a queue reset or a
+//     local file deletion there may hit the WRONG ComfyUI while the original
+//     work still runs. Those paths act best-effort at most, report UNVERIFIED
+//     / cannot-cancel, and keep the marker.
 //   - A queue reset is BLUNT: it drops ALL pending Manager tasks, not just the
 //     update_all. The report says so.
 
@@ -91,15 +97,17 @@ function finalize(
 }
 
 async function cancelUpdateAll(op: PanelPendingOp): Promise<PanelPendingCancelReport> {
-  // Aim at the server the update_all was queued on. resetQueue re-resolves the
-  // current target when given no base — thread the marker's capture so a
-  // retarget between enqueue and pin can't send the reset to the WRONG ComfyUI
-  // (which would both miss the real queue and wipe an innocent one).
-  const base = op.base ?? getComfyUIBaseUrl();
-  const baseNote = op.base
-    ? ` on ${base}`
-    : ` on the CURRENT target ${base} (the marker recorded no server, so this ` +
-      `may not be the ComfyUI the update_all was queued on)`;
+  // A marker proves things only about the server RECORDED in it. Without a
+  // base (markers written before the capture existed), the current target may
+  // be a different ComfyUI entirely — its queue state says NOTHING about the
+  // server the update_all was queued on. Never a proven cancel from that.
+  if (!op.base) return cancelUpdateAllUnbased(op);
+
+  // Aim at the server the update_all was queued on: a retarget between
+  // enqueue and pin must not send the reset to the WRONG ComfyUI (which would
+  // both miss the real queue and wipe an innocent one).
+  const base = op.base;
+  const baseNote = ` on ${base}`;
 
   const before = await fetchManagerQueueCounts(base);
   if (!before) {
@@ -237,8 +245,160 @@ async function cancelUpdateAll(op: PanelPendingOp): Promise<PanelPendingCancelRe
   });
 }
 
+/**
+ * A base-less update-all marker (written before the base capture existed).
+ * The current target is the LIKELY server — retargets between enqueue and pin
+ * are the rare case — so a reset there is attempted as the only protective
+ * move available. But it is never PROOF: if the current target is not the
+ * ComfyUI the update_all was queued on, the reset wiped an innocent queue
+ * while the original update still runs. Every outcome here is therefore
+ * UNVERIFIED and keeps the marker and its warning.
+ */
+async function cancelUpdateAllUnbased(op: PanelPendingOp): Promise<PanelPendingCancelReport> {
+  const base = getComfyUIBaseUrl();
+  const before = await fetchManagerQueueCounts(base);
+  if (!before) {
+    return {
+      op,
+      outcome: "could-not-verify",
+      markerCleared: false,
+      detail:
+        `the marker recorded NO server, and the queue on the current target ` +
+        `${base} could not be read — the update_all may be queued on a ` +
+        `DIFFERENT ComfyUI. NOTHING was sent; the warning stands.`,
+    };
+  }
+
+  if (before.pending === 0) {
+    const state =
+      before.inProgress > 0 || before.processing
+        ? `has nothing pending but ${before.inProgress} task(s) running`
+        : `is empty and idle`;
+    return {
+      op,
+      outcome: "could-not-verify",
+      markerCleared: false,
+      detail:
+        `the marker recorded NO server. The current target ${base} ${state}, ` +
+        `which proves NOTHING about the ComfyUI the update_all was actually ` +
+        `queued on — no reset was sent. If ${base} is not that server, the ` +
+        `update may still land after this pin; the warning stands.`,
+      pendingBefore: 0,
+      inProgress: before.inProgress,
+    };
+  }
+
+  try {
+    await resetQueue(base);
+  } catch (err) {
+    return {
+      op,
+      outcome: "could-not-verify",
+      markerCleared: false,
+      detail:
+        `the marker recorded NO server, and a best-effort queue reset on the ` +
+        `current target ${base} FAILED: ${
+          err instanceof Error ? err.message : String(err)
+        }. The update_all may be queued on a different ComfyUI entirely; the ` +
+        `warning stands.`,
+      pendingBefore: before.pending,
+      inProgress: before.inProgress,
+    };
+  }
+
+  const after = await fetchManagerQueueCounts(base);
+  return {
+    op,
+    outcome: "could-not-verify",
+    markerCleared: false,
+    detail:
+      `the marker recorded NO server, so this is UNVERIFIED: a best-effort ` +
+      `queue reset on the current target ${base} ` +
+      (after
+        ? `dropped ${before.pending - after.pending} pending task(s) there. `
+        : `was sent (${before.pending} task(s) were pending), but the ` +
+          `post-reset state could not be read. `) +
+      `If ${base} is NOT the ComfyUI the update_all was queued on, the ` +
+      `original update is still queued there and may land after this pin — ` +
+      `the warning stands. Check install_panel(action='status') on the server ` +
+      `update_all was run against.`,
+    pendingBefore: before.pending,
+    pendingAfter: after?.pending,
+    inProgress: after?.inProgress ?? before.inProgress,
+  };
+}
+
 function cancelSnapshotRestore(op: PanelPendingOp): PanelPendingCancelReport {
+  // The deferred restore file lives on the host the restore was REQUESTED
+  // against. Local filesystem state proves things only about the CURRENT
+  // target: a marker recorded for a different server (e.g. before a
+  // remote→local retarget) must NEVER be cleared on local evidence — the
+  // remote restore is still scheduled whatever the local disk says.
+  const currentBase = getComfyUIBaseUrl();
+  if (op.base && op.base !== currentBase) {
+    return {
+      op,
+      outcome: "cannot-cancel",
+      markerCleared: false,
+      detail:
+        `cannot cancel from here — the deferred restore was scheduled on ` +
+        `${op.base}, but this orchestrator now targets ${currentBase}. The ` +
+        `restore file (<ComfyUI>/user/**/startup-scripts/restore-snapshot.json) ` +
+        `lives on ${op.base} and must be deleted THERE before its next ComfyUI ` +
+        `restart; the current target's local state says nothing about that ` +
+        `host. The warning stands.`,
+    };
+  }
+
   const result = cancelPendingSnapshotRestore();
+
+  // No recorded server: the local action is at best a guess about which host
+  // the restore was scheduled on. It is still applied (a local restore file
+  // WILL run at the next local restart, so deleting it is protective), but
+  // nothing here is PROOF — report UNVERIFIED and keep the marker.
+  if (!op.base) {
+    switch (result.outcome) {
+      case "cancelled":
+        return {
+          op,
+          outcome: "could-not-verify",
+          markerCleared: false,
+          detail:
+            `${result.detail} — HOWEVER the marker recorded no server, so this ` +
+            `is UNVERIFIED: if the restore was scheduled on a DIFFERENT (e.g. ` +
+            `remote) host, it is still scheduled there and will run at its next ` +
+            `restart. The warning stands.`,
+        };
+      case "not-scheduled":
+        return {
+          op,
+          outcome: "could-not-verify",
+          markerCleared: false,
+          detail:
+            `no deferred restore file exists on the current target, but the ` +
+            `marker recorded no server — the restore may be scheduled on a ` +
+            `DIFFERENT host and still run at its next ComfyUI restart. The ` +
+            `warning stands.`,
+        };
+      case "remote":
+        return {
+          op,
+          outcome: "cannot-cancel-remote",
+          markerCleared: false,
+          detail: result.detail,
+        };
+      case "failed":
+        return {
+          op,
+          outcome: "could-not-verify",
+          markerCleared: false,
+          detail: result.detail,
+        };
+    }
+  }
+
+  // The marker's base IS the current target — local evidence is about the
+  // right host, so outcomes are provable here.
   switch (result.outcome) {
     case "cancelled":
       return finalize(op, { outcome: "cancelled", detail: result.detail });
