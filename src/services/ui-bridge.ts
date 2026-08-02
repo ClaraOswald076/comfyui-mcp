@@ -243,6 +243,20 @@ export function minPanelVersionForCmd(cmd: string): string {
 export const SEMVER_RE =
   /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/;
 
+/**
+ * The highest panel version this MCP build needs across its bridge commands.
+ * Keep this beside the command capability table so both proactive panel sync
+ * and a bridge refusal report the same derived requirement.
+ */
+export function requiredPanelVersion(): string {
+  let best = MIN_PANEL_VERSION_FOR_BRIDGE_COMMANDS;
+  for (const min of Object.values(BRIDGE_CMD_MIN_PANEL_VERSION)) {
+    if (!SEMVER_RE.test(min.trim())) continue;
+    if (!SEMVER_RE.test(best.trim()) || compareSemver(min, best) > 0) best = min;
+  }
+  return best;
+}
+
 /** True when the panel ADVERTISED a PARSEABLE version (in its `hello`) that already
  *  meets `cmd`'s AUTHORITATIVE, command-specific minimum — i.e. this panel is provably
  *  new enough to support the command, so an "Unknown command" reply is NOT an age
@@ -664,8 +678,9 @@ export class UiBridge {
   private readonly mailbox = new Map<string, Array<{ cmd: BridgeCommand; ts: number }>>();
   private static readonly MAILBOX_MAX = 30;
   private static readonly MAILBOX_TTL_MS = 24 * 60 * 60 * 1000;
-  /** Tab ids that ever connected as a headless (mobile/remote) client — kept so
-   *  `isHeadless` stays true across a disconnect (see isHeadless). */
+  /** Tab ids whose most recent connected socket was headless. Retained across a
+   *  disconnect for mailbox/media routing, but cleared if a fresh desktop socket
+   *  later reuses the id (see isCurrentHeadless). */
   private readonly headlessSeen = new Set<string>();
   private seenTabs = new Set<string>(); // tabIds ever announced — dedup connect logs across reconnect churn
   /** True once a CANVAS-OWNING (non-headless) tab has helloed — i.e. a real ComfyUI
@@ -1179,13 +1194,21 @@ export class UiBridge {
         // Unknown-command reply cleared it — re-bypassing the undercut-version gate
         // (codex round-8 P1).
         migratedProvenSupported = undefined;
-        if (incomingHeadless) this.headlessSeen.add(tabId);
-        // A canvas-owning (non-headless) hello PROVES the comfyui-mcp-panel pack is
-        // installed and a real ComfyUI browser tab was open — the precondition for
-        // the "refresh the browser tab" guidance (#436.4). A headless mobile/remote
-        // pseudo-panel must NOT set this: if only a phone ever connected, there may be
-        // no desktop tab to refresh and no proof the sidebar pack is installed (codex).
-        else this.everConnectedDesktopTab = true;
+        if (incomingHeadless) {
+          this.headlessSeen.add(tabId);
+        } else {
+          // A different, fresh socket may legally reuse a disconnected tab id. Its
+          // first hello is authoritative for THIS live session, so do not let an
+          // old phone's sticky media classification hide a real desktop tab or
+          // suppress its panel-version repair.
+          this.headlessSeen.delete(tabId);
+          // A canvas-owning (non-headless) hello PROVES the comfyui-mcp-panel pack is
+          // installed and a real ComfyUI browser tab was open — the precondition for
+          // the "refresh the browser tab" guidance (#436.4). A headless mobile/remote
+          // pseudo-panel must NOT set this: if only a phone ever connected, there may be
+          // no desktop tab to refresh and no proof the sidebar pack is installed (codex).
+          this.everConnectedDesktopTab = true;
+        }
         this.broadcastTabList(); // a tab connected/reconnected — refresh mirror pickers
         // Log a real connect ONCE per tab id. A reconnect/ping-pong loop (a new
         // socket every couple seconds — e.g. two browser contexts sharing one tab
@@ -1511,6 +1534,15 @@ export class UiBridge {
     // offline, so a render finishing during a disconnect is byte-inlined (not a
     // bytes-less viewRef) and is renderable when the mailbox flushes to the phone.
     return this.conns.get(tabId)?.headless === true || this.headlessSeen.has(tabId);
+  }
+
+  /**
+   * The current live socket's first-hello-pinned kind. Unlike isHeadless(), this
+   * deliberately does not consult disconnected history: unattended operations
+   * such as panel auto-sync must act on the tab that is connected NOW.
+   */
+  isCurrentHeadless(tabId: string): boolean {
+    return this.conns.get(tabId)?.headless === true;
   }
 
   /** Drop expired late-ask entries (buffered answers + unresolved rid mappings) so
@@ -1866,7 +1898,9 @@ export class UiBridge {
       if (!conn.enforcesWorkflowStamp || !hasTrustedStamp) {
         const why = !conn.enforcesWorkflowStamp
           ? `panel tab ${conn.tabId.slice(0, 8)} does not enforce per-command workflow targeting ` +
-            `(update the ComfyUI-MCP panel to edit the graph)`
+            `(detected panel ${conn.panelVersion ?? "version unknown"}; this MCP requires panel ` +
+              `${requiredPanelVersion()}+). Run install_panel(action:'update') and restart ComfyUI; ` +
+              `rebinding cannot add the missing capability`
           : `this workflow has no trusted identity for the panel to fence the command against`;
         return Promise.reject(
           markDispatched(

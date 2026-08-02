@@ -1480,7 +1480,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     // A mutating graph command is refused BEFORE dispatch (never written to the socket).
     await expect(
       bridge.send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "tmp:old" }),
-    ).rejects.toThrow(/enforces per-command workflow targeting|update the ComfyUI-MCP panel/i);
+    ).rejects.toThrow(/enforce.*workflow targeting|install_panel\(action:'update'\)/i);
 
     // …but a READ-ONLY graph command still works (read-only graph access retained).
     await expect(
@@ -1491,7 +1491,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     // refused — the class the graph_-only gate previously missed (#570 P0c, codex cycle 8).
     await expect(
       bridge.send({ cmd: "workflow_close", force: true } as never, { tabId: "tmp:old" }),
-    ).rejects.toThrow(/enforces per-command workflow targeting|update the ComfyUI-MCP panel/i);
+    ).rejects.toThrow(/enforce.*workflow targeting|install_panel\(action:'update'\)/i);
 
     // ALL FOUR workflow mutators are refused on a non-enforcing panel — regardless of path,
     // including an EXPLICIT non-empty path. The server can't resolve the selector or prove it
@@ -1505,9 +1505,25 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
       { cmd: "workflow_close", path: "workflows/other.json", force: true }, // explicit path — still gated
     ]) {
       await expect(bridge.send(cmd as never, { tabId: "tmp:old" })).rejects.toThrow(
-        /enforces per-command workflow targeting|update the ComfyUI-MCP panel/i,
+        /enforce.*workflow targeting|install_panel\(action:'update'\)/i,
       );
     }
+    old.close();
+  });
+
+  it("names the versioned panel-sync remedy when stamp enforcement is absent (#706)", async () => {
+    const old = new WebSocket(`ws://127.0.0.1:${port}`);
+    await new Promise<void>((res, rej) => {
+      old.on("open", () => {
+        old.send(JSON.stringify({ type: "hello", tab_id: "old-skew", title: "wf", panel_version: "0.11.0" }));
+        res();
+      });
+      old.on("error", rej);
+    });
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "old-skew")).toBe(true));
+    await expect(
+      bridge.send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "old-skew" }),
+    ).rejects.toThrow(/detected panel 0\.11\.0.*requires panel 0\.11\.28\+.*install_panel\(action:'update'\).*restart ComfyUI.*rebinding cannot/i);
     old.close();
   });
 
@@ -1562,6 +1578,37 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
       tabId: "desktop-hf",
     })) as { from?: string };
     expect(res.from).toBe("desktop"); // forged flag ignored — takeover refused
+  });
+
+  it("keeps auto-sync eligibility on the current socket's pinned kind (#710 P1)", async () => {
+    const phone = await connectHeadless("phone-sync-pinned");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "phone-sync-pinned")).toBe(true));
+    // This is the exact classification the orchestrator must use after each hello.
+    expect(bridge.isCurrentHeadless("phone-sync-pinned")).toBe(true);
+
+    // A later hello cannot turn this socket into a desktop install/update target.
+    phone.send(JSON.stringify({ type: "hello", tab_id: "phone-sync-pinned", title: "phone" }));
+    await settle();
+    expect(bridge.isCurrentHeadless("phone-sync-pinned")).toBe(true);
+    phone.send(JSON.stringify({ type: "hello", tab_id: "phone-sync-pinned", title: "phone", headless: false }));
+    await settle();
+    expect(bridge.isCurrentHeadless("phone-sync-pinned")).toBe(true);
+
+    // The old mobile client is gone. A fresh desktop socket may reuse its id;
+    // stale headless history must not suppress this desktop's legitimate sync.
+    phone.close();
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "phone-sync-pinned")).toBe(false));
+    const desktop = await connectPanel("phone-sync-pinned", "G");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "phone-sync-pinned")).toBe(true));
+    expect(bridge.isCurrentHeadless("phone-sync-pinned")).toBe(false);
+    expect(bridge.isHeadless("phone-sync-pinned")).toBe(false);
+
+    // A first-hello desktop is likewise a legitimate sync target.
+    const separateDesktop = await connectPanel("desktop-sync-eligible", "G");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "desktop-sync-eligible")).toBe(true));
+    expect(bridge.isHeadless("desktop-sync-eligible")).toBe(false);
+    desktop.close();
+    separateDesktop.close();
   });
 
   it("re-attaching to another tab stops the first tab's fanout", async () => {
