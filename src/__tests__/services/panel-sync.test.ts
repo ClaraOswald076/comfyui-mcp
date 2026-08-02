@@ -38,7 +38,7 @@ import {
 import type { PanelPinState } from "../../services/panel-settings.js";
 import { BRIDGE_CAPABILITY_MIN_PANEL_VERSION } from "../../services/ui-bridge.js";
 
-const REQUIRED = "0.11.30";
+const REQUIRED = "0.11.35";
 const ORCH = "0.48.32";
 const UNPINNED: PanelPinState = { pinned: false, source: "none" };
 
@@ -69,7 +69,8 @@ describe("requiredPanelVersion", () => {
     // A capability gate is just as much a version requirement as a command
     // gate: otherwise install_panel can call the panel current while the bridge
     // refuses every active-workflow write (#708).
-    expect(BRIDGE_CAPABILITY_MIN_PANEL_VERSION.enforces_workflow_stamp).toBe(REQUIRED);
+    expect(BRIDGE_CAPABILITY_MIN_PANEL_VERSION.enforces_workflow_stamp).toBe("0.11.30");
+    expect(BRIDGE_CAPABILITY_MIN_PANEL_VERSION.enforces_workflow_stamp_at_write).toBe(REQUIRED);
     expect(requiredPanelVersion()).toBe(REQUIRED);
   });
 
@@ -377,7 +378,7 @@ describe("performPanelSync", () => {
     const h = makeDeps({
       installedVersion: "0.11.3",
       onUpdate: (files) => {
-        files[join(PANEL_DIR, "pyproject.toml")] = pyproject("0.11.30");
+        files[join(PANEL_DIR, "pyproject.toml")] = pyproject(REQUIRED);
       },
     });
     const r = await performPanelSync({ deps: h.deps, ...RUN });
@@ -385,7 +386,7 @@ describe("performPanelSync", () => {
     expect(r.synced).toBe(true);
     expect(r.previousVersion).toBe("0.11.3");
     // The reported version is the one observed on disk afterwards.
-    expect(r.verifiedVersion).toBe("0.11.30");
+    expect(r.verifiedVersion).toBe(REQUIRED);
     expect(r.restartRequired).toBe(true);
     expect(r.stillBehind).toBe(false);
   });
@@ -396,7 +397,7 @@ describe("performPanelSync", () => {
       pin: { pinned: true, version: "0.11.3", source: "settings" },
       onUpdate: (files) => {
         // If this ever runs the guard has failed.
-        files[join(PANEL_DIR, "pyproject.toml")] = pyproject("0.11.30");
+        files[join(PANEL_DIR, "pyproject.toml")] = pyproject(REQUIRED);
       },
     });
     const r = await performPanelSync({ deps: h.deps, ...RUN });
@@ -414,7 +415,7 @@ describe("performPanelSync", () => {
         installedVersion: "0.11.3",
         pin,
         onUpdate: (files) => {
-          files[join(PANEL_DIR, "pyproject.toml")] = pyproject("0.11.30");
+          files[join(PANEL_DIR, "pyproject.toml")] = pyproject(REQUIRED);
         },
       });
 
@@ -426,7 +427,7 @@ describe("performPanelSync", () => {
     const r = await performPanelSync({ deps: cleared.deps, ...RUN });
     expect(r.synced).toBe(true);
     expect(cleared.updates).toBe(1);
-    expect(r.verifiedVersion).toBe("0.11.30");
+    expect(r.verifiedVersion).toBe(REQUIRED);
   });
 
   it("no-ops without touching anything when already current", async () => {
@@ -546,7 +547,7 @@ describe("performPanelSync", () => {
     const scenario = () => ({
       installedVersion: "0.11.3",
       onUpdate: (files: Record<string, string>) => {
-        files[join(PANEL_DIR, "pyproject.toml")] = pyproject("0.11.30");
+        files[join(PANEL_DIR, "pyproject.toml")] = pyproject(REQUIRED);
       },
     });
 

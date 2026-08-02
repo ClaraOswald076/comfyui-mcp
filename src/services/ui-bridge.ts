@@ -144,6 +144,12 @@ interface Conn {
    *  workflow B) crossing no privacy boundary, so attestation would buy nothing — #570's real
    *  threat is ACCIDENTAL cross-workflow confusion for an honest user, which this closes. */
   enforcesWorkflowStamp: boolean;
+  /** True only when THIS hello advertises that the workflow stamp is checked at
+   * the actual mutation boundary after an async graph executor resumes (#718).
+   * The original dispatch-time fence alone is insufficient for graph_set_widget:
+   * its required fresh-backend query yields to the browser, allowing a workflow
+   * switch before it writes. Re-read per hello and fail closed if absent. */
+  enforcesWorkflowStampAtWrite: boolean;
   /** Commands THIS connection has already proven it doesn't support, via a real
    *  "Unknown command" reply earlier in the session (#236). Once a cmd lands
    *  here, every later call is gated proactively — rejected before it ever
@@ -234,11 +240,13 @@ export const BRIDGE_CMD_MIN_PANEL_VERSION: Readonly<Record<string, string>> = {
  * that same panel current (#708).
  */
 export const BRIDGE_CAPABILITY_MIN_PANEL_VERSION: Readonly<Record<string, string>> = {
-  // #570 P0c — `enforces_workflow_stamp` first shipped in panel 0.11.30. A
-  // 0.11.29-or-older panel ignores a stamped active-workflow mutation, so the
-  // server must refuse that write rather than risk applying it after a tab
-  // switch.  It is a handshake capability, not a command, hence this table.
+  // #570 P0c — `enforces_workflow_stamp` first shipped in panel 0.11.30. #718
+  // added the required after-await write-boundary recheck in 0.11.35: a panel
+  // that only fences before graph_set_widget's fresh /object_info await can
+  // still mutate a workflow the user switched to during that await. Both are
+  // handshake capabilities, not commands, hence this table.
   enforces_workflow_stamp: "0.11.30",
+  enforces_workflow_stamp_at_write: "0.11.35",
 };
 
 /** The minimum panel version that supports `cmd`. For a command WITH an
@@ -1197,6 +1205,8 @@ export class UiBridge {
           // updated build). Strict === true so any non-true / absent value is non-enforcing.
           enforcesWorkflowStamp:
             (msg as { enforces_workflow_stamp?: unknown }).enforces_workflow_stamp === true,
+          enforcesWorkflowStampAtWrite:
+            (msg as { enforces_workflow_stamp_at_write?: unknown }).enforces_workflow_stamp_at_write === true,
           // Fresh per hello — see the field's doc comment (#236).
           unsupportedCmds: new Set<string>(),
           // INHERITED across a reconnect (the panel code did not get older) so a command
@@ -1480,8 +1490,9 @@ export class UiBridge {
   /**
    * Whether the live tab resolved for `tabId` can safely accept a mutation of
    * its active workflow. This mirrors the two pre-dispatch conditions in
-   * {@link send}: the tab's CURRENT hello must advertise workflow-stamp
-   * enforcement, and the orchestrator must have a trusted workflow stamp to
+   * {@link send}: the tab's CURRENT hello must advertise both the dispatch-time
+   * workflow-stamp fence and its after-await write-boundary recheck, and the
+   * orchestrator must have a trusted workflow stamp to
    * put on the command. A websocket reconnect alone proves neither (the browser
    * can reconnect with a cached, pre-#570 panel bundle), so callers reporting
    * graph-tool readiness must use this rather than `canReach` alone.
@@ -1497,6 +1508,7 @@ export class UiBridge {
       return (
         conn.sock.readyState === WebSocket.OPEN &&
         conn.enforcesWorkflowStamp &&
+        conn.enforcesWorkflowStampAtWrite &&
         typeof stamp === "string" &&
         stamp.length > 0
       );
@@ -1983,8 +1995,9 @@ export class UiBridge {
     // serialize, …) and path-targeted workflow ops stay allowed, so an old panel keeps
     // read-only graph access with a clear "update to edit" error, never a silent wrong write.
     //
-    // Require BOTH (codex): the panel must advertise enforcement AND the command must actually
-    // CARRY a trusted workflow-uuid stamp. Enforcement alone is not enough — if the tab has no
+    // Require ALL THREE (codex): the panel must advertise the dispatch-time fence, the
+    // after-await write-boundary recheck, AND the command must actually CARRY a trusted
+    // workflow-uuid stamp. Either fence alone is not enough — if the tab has no
     // resolvable identity (missing/malformed uuid, relay client), the frame ships UNSTAMPED and
     // the panel's fence has nothing to compare, so a stale mutation after a switch would run
     // unfenced despite the "enforces" claim. No stamp ⇒ nothing to fence ⇒ refuse the mutation.
@@ -1997,12 +2010,17 @@ export class UiBridge {
     if (requiresWorkflowStampEnforcement(cmd)) {
       const stamp = this.resolveTabWorkflowUuid?.(opts.tabId ?? conn.tabId);
       const hasTrustedStamp = typeof stamp === "string" && stamp.length > 0;
-      if (!conn.enforcesWorkflowStamp || !hasTrustedStamp) {
+      if (!conn.enforcesWorkflowStamp || !conn.enforcesWorkflowStampAtWrite || !hasTrustedStamp) {
         const why = !conn.enforcesWorkflowStamp
           ? `panel tab ${conn.tabId.slice(0, 8)} does not enforce per-command workflow targeting ` +
             `(detected panel ${conn.panelVersion ?? "version unknown"}; this MCP requires panel ` +
               `${requiredPanelVersion()}+). Run install_panel(action:'update') and restart ComfyUI; ` +
               `rebinding cannot add the missing capability`
+          : !conn.enforcesWorkflowStampAtWrite
+            ? `panel tab ${conn.tabId.slice(0, 8)} does not recheck workflow targeting at the graph write ` +
+              `boundary after asynchronous work (detected panel ${conn.panelVersion ?? "version unknown"}; this MCP ` +
+                `requires panel ${requiredPanelVersion()}+). Run install_panel(action:'update'), restart ComfyUI, ` +
+                `then hard-refresh the ComfyUI browser tab; rebinding cannot add the missing capability`
           : `this workflow has no trusted identity for the panel to fence the command against`;
         return Promise.reject(
           markDispatched(
