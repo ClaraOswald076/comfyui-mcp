@@ -239,7 +239,8 @@ export function evaluatePanelSync(
       summary:
         `custom_nodes could not be enumerated, so whether the panel is present is ` +
         `UNRELIABLE — nothing will be changed (a blind install could clobber an ` +
-        `existing, possibly newer, panel). Re-run once custom_nodes is readable.`,
+        `existing, possibly newer, panel). Re-run once custom_nodes is readable.` +
+        driftNote,
     };
   }
 
@@ -269,7 +270,8 @@ export function evaluatePanelSync(
         `Could not enumerate custom_nodes to check for shadow copies of the panel, so ` +
         `it cannot be confirmed that the panel in the browser is the one on disk. NOT ` +
         `syncing on an unverified install. Check custom_nodes is readable (a stray ` +
-        `".comfyui-agent-panel.bak-*" there would shadow the real panel), then re-check.`,
+        `".comfyui-agent-panel.bak-*" there would shadow the real panel), then re-check.` +
+        driftNote,
     };
   }
 
@@ -286,7 +288,8 @@ export function evaluatePanelSync(
         `serves it too, and a dot-prefixed dir wins by sort order, so the browser may ` +
         `be loading it instead of the real panel — the installed version below cannot ` +
         `be trusted. Move the shadow copy OUT of custom_nodes and hard-refresh the ` +
-        `ComfyUI tab before syncing anything.`,
+        `ComfyUI tab before syncing anything.` +
+        driftNote,
     };
   }
 
