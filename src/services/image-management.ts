@@ -447,11 +447,16 @@ function assertSafeViewRef(filename: string, subfolder: string): void {
 /**
  * Fetch a generated image from ComfyUI via HTTP /view endpoint.
  * Does NOT require COMFYUI_PATH — works with remote ComfyUI instances.
+ *
+ * By default only image/* payloads are accepted. Pass `allowMedia: true` to
+ * also accept video/* and audio/* (e.g. a VHS_VideoCombine .mp4) so the caller
+ * can save them to disk — /view returns raw bytes for any media type.
  */
 export async function getOutputImage(
   filename: string,
   type: "output" | "input" | "temp" = "output",
   subfolder = "",
+  { allowMedia = false }: { allowMedia?: boolean } = {},
 ): Promise<{ base64: string; mimeType: string; filename: string }> {
   assertSafeViewRef(filename, subfolder);
   const result = await fetchImage(filename, type, subfolder);
@@ -466,7 +471,9 @@ export async function getOutputImage(
   // instead, so get_image surfaces a clean not-found rather than a corrupt image.
   const mime = result.mimeType.toLowerCase();
   const isImage = mime.startsWith("image/");
-  if (!isImage || result.base64.length === 0) {
+  const isMedia =
+    allowMedia && (mime.startsWith("video/") || mime.startsWith("audio/"));
+  if ((!isImage && !isMedia) || result.base64.length === 0) {
     const where = subfolder ? `${type}/${subfolder}` : type;
     throw new ComfyUIError(
       `ComfyUI /view did not return an image for "${filename}" (${where}); ` +

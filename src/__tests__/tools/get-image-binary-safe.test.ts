@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { ComfyUIError } from "../../utils/errors.js";
 
 // #483: get_image for a valid `type:"input"` image must return the binary
@@ -77,5 +79,44 @@ describe("get_image — binary-safe (#483)", () => {
     // structured error), not free-form prose the caller then fails to parse.
     const parsed = JSON.parse(text) as { error?: string };
     expect(parsed.error).toBe("IMAGE_NOT_FOUND");
+  });
+});
+
+describe("get_image — video/audio save-to-disk (#663)", () => {
+  afterEach(() => vi.clearAllMocks());
+
+  it("saves a video/mp4 asset to disk and returns text only (no inline image)", async () => {
+    const base64 = Buffer.from("fake-mp4-bytes").toString("base64");
+    getOutputImageMock.mockResolvedValue({
+      base64,
+      mimeType: "video/mp4",
+      filename: "I2V_HD_FaceLock_00036-audio.mp4",
+    });
+
+    const out = await getHandler("get_image")({
+      filename: "I2V_HD_FaceLock_00036-audio.mp4",
+      type: "output",
+      subfolder: "Eros",
+      save_dir: "/tmp/x",
+    });
+
+    expect(out.isError).toBeUndefined();
+    // The handler must opt into media payloads so the service doesn't reject
+    // the mp4 as IMAGE_NOT_FOUND.
+    expect(getOutputImageMock).toHaveBeenCalledWith(
+      "I2V_HD_FaceLock_00036-audio.mp4",
+      "output",
+      "Eros",
+      { allowMedia: true },
+    );
+    // Saved under the original filename/extension in the requested save_dir.
+    expect(vi.mocked(writeFile)).toHaveBeenCalledWith(
+      join("/tmp/x", "I2V_HD_FaceLock_00036-audio.mp4"),
+      Buffer.from(base64, "base64"),
+    );
+    expect(out.content.find((c) => c.type === "image")).toBeUndefined();
+    const text = out.content.map((c) => c.text ?? "").join("");
+    expect(text).toContain("I2V_HD_FaceLock_00036-audio.mp4");
+    expect(text).toContain("video/mp4");
   });
 });

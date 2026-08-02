@@ -187,6 +187,52 @@ describe("getOutputImage — non-image /view payloads (issue #385)", () => {
   });
 });
 
+describe("getOutputImage — video/audio media (issue #663)", () => {
+  // /view returns raw bytes for any media type, and video nodes like
+  // VHS_VideoCombine legitimately produce .mp4 outputs that get_image must be
+  // able to save to disk. allowMedia opts the caller into video/*/audio/*
+  // payloads; the junk-body guards (empty / JSON / HTML) still apply.
+
+  it("rejects a video/mp4 payload by default (inline callers stay image-only)", async () => {
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from("fake-mp4").toString("base64"),
+      mimeType: "video/mp4",
+    });
+    await expect(
+      getOutputImage("clip_00001_.mp4", "output", "video"),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("resolves a video/mp4 payload when allowMedia is set", async () => {
+    const base64 = Buffer.from("fake-mp4").toString("base64");
+    fetchImageMock.mockResolvedValue({ base64, mimeType: "video/mp4" });
+    await expect(
+      getOutputImage("clip_00001_.mp4", "output", "video", { allowMedia: true }),
+    ).resolves.toMatchObject({
+      base64,
+      mimeType: "video/mp4",
+      filename: "clip_00001_.mp4",
+    });
+  });
+
+  it("still rejects a JSON error body even when allowMedia is set", async () => {
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from('{"error":"not found"}').toString("base64"),
+      mimeType: "application/json",
+    });
+    await expect(
+      getOutputImage("clip_00001_.mp4", "output", "video", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("still rejects an empty body even when allowMedia is set", async () => {
+    fetchImageMock.mockResolvedValue({ base64: "", mimeType: "video/mp4" });
+    await expect(
+      getOutputImage("clip_00001_.mp4", "output", "video", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+});
+
 describe("listOutputImages — remote mode keyed off isRemoteMode (issue #2 regression)", () => {
   it("uses /history (not a local-FS scan) when remote even though COMFYUI_PATH is set", async () => {
     // A remote target coexists with an unrelated local COMFYUI_PATH. Scanning the
