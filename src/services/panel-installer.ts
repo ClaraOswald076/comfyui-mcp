@@ -159,6 +159,11 @@ export interface PanelInstallerDeps {
    */
   gitWorktreeRoot: (dir: string) => string;
   /**
+   * `git rev-parse @{upstream}` — the tracked remote's sha. THROWS when no
+   * upstream is configured; callers treat that as “cannot prove currency”.
+   */
+  gitUpstreamRev: (dir: string) => string;
+  /**
    * The user's explicit panel-version pin, if any. While a pin is in force NO
    * code path here may move the panel — install/update/reinstall refuse and the
    * on-load ensure skips. Never throws (an unreadable pin reports
@@ -324,6 +329,12 @@ export function gitWorktreeRoot(dir: string): string {
   return runGit(dir, ["rev-parse", "--show-toplevel"], PANEL_GIT_STATUS_TIMEOUT_MS).trim();
 }
 
+/** `git rev-parse @{upstream}` — the sha the checkout tracks. THROWS when no
+ *  upstream is configured; the "at upstream tip" claim requires this proof. */
+export function gitUpstreamRev(dir: string): string {
+  return runGit(dir, ["rev-parse", "@{upstream}"], PANEL_GIT_STATUS_TIMEOUT_MS).trim();
+}
+
 export const defaultDeps: PanelInstallerDeps = {
   isLocalMode: () => isLocalMode(),
   // Keep panel management aligned with get_environment, downloads, and
@@ -372,6 +383,7 @@ export const defaultDeps: PanelInstallerDeps = {
   gitStatusPorcelain: (dir) => gitStatusPorcelain(dir),
   gitPullFfOnly: (dir) => gitPullFfOnly(dir),
   gitWorktreeRoot: (dir) => gitWorktreeRoot(dir),
+  gitUpstreamRev: (dir) => gitUpstreamRev(dir),
   readPin: () => getPanelPinState(),
   isReachable: async () => {
     try {
@@ -1580,9 +1592,28 @@ async function updateViaGitCheckoutFallback(opts: {
     };
   }
 
-  // Nothing moved even though git pull exited clean: git FETCHED the remote and
-  // found HEAD already at its tip. That is genuine proof of currency — report
-  // "already up to date" honestly (NOT "updated"; nothing changed, no restart).
+  // Nothing moved even though git pull exited clean. Before claiming “at the
+  // upstream tip”, PROVE it: HEAD must equal the tracked upstream sha — a
+  // locally-AHEAD checkout (committed local work) also exits pull cleanly and
+  // would otherwise be blessed as upstream currency (codex gate). No upstream
+  // configured or a mismatch → unverifiable, never “at tip”.
+  let upstreamRev: string | undefined;
+  try {
+    upstreamRev = deps.gitUpstreamRev(dir);
+  } catch {
+    upstreamRev = undefined;
+  }
+  if (!upstreamRev || upstreamRev !== post.gitRev) {
+    throw new PanelInstallError(
+      `Could not verify the panel is current: git pull --ff-only ran clean in ` +
+        `${dir}, but ${!upstreamRev ? "no upstream is configured, so currency is UNPROVABLE" : `HEAD (${post.gitRev?.slice(0, 8)}) does not match the tracked upstream (${upstreamRev.slice(0, 8)}) — the checkout has committed local work upstream doesn't have`}. ` +
+        `NOT reporting "at upstream tip" and NOT reporting an update. Check the ` +
+        `panel repo (git status / git log), then re-check install_panel(action='status').`,
+    );
+  }
+  // HEAD === upstream: git FETCHED the remote and proved the checkout current.
+  // That is genuine proof of currency — report "already up to date" honestly
+  // (NOT "updated"; nothing changed, no restart).
   return {
     action: "update",
     result,

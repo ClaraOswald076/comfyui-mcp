@@ -105,6 +105,10 @@ function makeDeps(opts: {
   gitRoot?: string;
   /** When set, gitWorktreeRoot throws this — the "cannot prove" refusal path. */
   gitRootError?: string;
+  /** Upstream sha override (default: the dir's HEAD — HEAD === upstream). */
+  upstreamRev?: string;
+  /** When set, gitUpstreamRev throws "no upstream configured". */
+  noUpstream?: boolean;
 } = {}): Harness {
   const files = opts.files ?? {};
   const revs = opts.revs ?? {};
@@ -133,6 +137,10 @@ function makeDeps(opts: {
     gitWorktreeRoot: (dir) => {
       if (opts.gitRootError) throw new Error(opts.gitRootError);
       return opts.gitRoot ?? dir;
+    },
+    gitUpstreamRev: (dir) => {
+      if (opts.noUpstream) throw new Error("fatal: no upstream configured");
+      return opts.upstreamRev ?? revs[dir];
     },
     gitPullFfOnly: (dir) => {
       gitPulls.push(dir);
@@ -919,6 +927,35 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
       PanelInstallError,
     );
     expect(h.gitPulls).toEqual([]);
+  });
+
+  it("locally-AHEAD checkout (HEAD ≠ upstream): NOT 'at tip', throws unverifiable", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.35") },
+      revs: { [dir]: REV_A },
+      upstreamRev: REV_B, // user committed locally — upstream is behind
+      updateDetails: LEGACY_NOOP,
+      onGitPull: () => "Already up to date.",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).toMatch(/does not match the tracked upstream|UNPROVABLE|committed local work/);
+    expect(String(err?.message ?? err)).not.toMatch(/at the upstream tip/);
+  });
+
+  it("no upstream configured: currency UNPROVABLE, never 'at tip'", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.35") },
+      revs: { [dir]: REV_A },
+      noUpstream: true,
+      updateDetails: LEGACY_NOOP,
+      onGitPull: () => "Already up to date.",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).toMatch(/no upstream is configured|UNPROVABLE/);
   });
 
   it("pull ran clean but post-pull HEAD revision is UNREADABLE → throws unverifiable, never 'at tip'", async () => {
