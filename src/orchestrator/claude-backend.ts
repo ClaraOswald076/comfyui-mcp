@@ -236,6 +236,17 @@ export class ClaudeBackend implements AgentBackend {
   readonly capabilities = CLAUDE_CAPABILITIES;
   private deps: ClaudeBackendDeps;
   private q: Query | null = null;
+  // #740 turn-truthfulness state (reset on init and after every result): a turn
+  // that produced NO user-visible content must never be reported as a successful
+  // turn, and a blocking SDK informational message (prevent_continuation — e.g. a
+  // UserPromptSubmit hook denied the prompt) makes the turn a failure even when
+  // the SDK's own result still arrives with subtype "success".
+  private turnHasContent = false;
+  private turnBlockReason: string | null = null;
+  // Set by interrupt(); consumed by the next result (mirrors PanelAgent's
+  // interruptRequested): an interrupted turn's empty result is the interrupt
+  // landing, not an empty-turn failure.
+  private interruptPending = false;
 
   constructor(deps: ClaudeBackendDeps) {
     this.deps = deps;
@@ -387,6 +398,7 @@ export class ClaudeBackend implements AgentBackend {
   }
 
   async interrupt(): Promise<void> {
+    this.interruptPending = true;
     await this.q?.interrupt();
   }
 
@@ -417,6 +429,10 @@ export class ClaudeBackend implements AgentBackend {
     switch (message.type) {
       case "system":
         if (message.subtype === "init") {
+          // New session (or a restarted one): turn classification starts clean.
+          this.turnHasContent = false;
+          this.turnBlockReason = null;
+          this.interruptPending = false;
           yield {
             type: "session",
             sessionId: message.session_id,
@@ -432,6 +448,37 @@ export class ClaudeBackend implements AgentBackend {
           if (typeof t === "number") {
             yield { type: "thinking", tokens: t };
           }
+        } else if (message.subtype === "informational") {
+          // #740: SDK informational banners are host-rendered plaintext (hook
+          // feedback, status lines, slash-command notices) — never drop one the
+          // turn logic depends on. A BLOCKING one (prevent_continuation, e.g. a
+          // UserPromptSubmit hook denied the prompt) means execution stops here,
+          // yet the SDK still ends the turn with a result whose subtype is
+          // "success". Remember the reason so that result is classified as the
+          // failure it actually is, and surface the reason now so the user never
+          // watches a turn silently produce nothing.
+          const prevent =
+            message.prevent_continuation === true ||
+            (message as unknown as { preventContinuation?: unknown }).preventContinuation === true;
+          const content = typeof message.content === "string" ? message.content.trim() : "";
+          if (prevent) {
+            this.turnBlockReason = content || "blocked by a hook";
+            logger.warn(`[claude-backend] turn blocked: ${this.turnBlockReason}`);
+            yield {
+              type: "error",
+              message: content || "The turn was blocked before it could produce a reply.",
+            };
+          } else if (content) {
+            // Non-blocking notices don't affect turn classification — the panel
+            // doesn't render them, but keep them visible in the log.
+            logger.info(`[claude-backend] informational (${message.level ?? "info"}): ${content}`);
+          }
+        } else if (message.subtype === "local_command_output") {
+          // Slash-command output (/usage, /voice, …) IS the turn's visible
+          // payload, so the turn counts as having content and is not
+          // misclassified as an empty one. (The panel doesn't render these
+          // banners today — unchanged.)
+          this.turnHasContent = true;
         }
         break;
       case "stream_event": {
@@ -458,6 +505,9 @@ export class ClaudeBackend implements AgentBackend {
         break;
       }
       case "assistant": {
+        // An assistant message means the model actually responded this turn —
+        // the turn counts as having content (#740).
+        this.turnHasContent = true;
         // Remember this message's UUID — it's the rewind anchor for the turn.
         const auid = (message as unknown as { uuid?: string }).uuid;
         // Each assistant API response carries the CURRENT context size — report
@@ -508,9 +558,32 @@ export class ClaudeBackend implements AgentBackend {
             contextWindow = mu.contextWindow;
           }
         }
+        // #740: classify the result truthfully. The SDK reports subtype "success"
+        // even for a turn a blocking hook prevented from producing ANY output (the
+        // informational above), and for a turn that simply ended with no assistant
+        // message — the panel must never present either as a silent empty success.
+        // One result consumes the per-turn state; the next turn starts clean.
+        const blockReason = this.turnBlockReason;
+        const empty = !this.turnHasContent;
+        const wasInterrupted = this.interruptPending;
+        this.turnHasContent = false;
+        this.turnBlockReason = null;
+        this.interruptPending = false;
+        let ok = message.subtype === "success";
+        if (ok && blockReason !== null) {
+          // The blocking informational already yielded the visible error above.
+          ok = false;
+        } else if (ok && empty && !wasInterrupted) {
+          ok = false;
+          logger.warn("[claude-backend] result/success with no assistant content — reporting a failed turn (#740)");
+          yield {
+            type: "error",
+            message: "The model ended the turn without producing a reply.",
+          };
+        }
         yield {
           type: "result",
-          ok: message.subtype === "success",
+          ok,
           subtype: message.subtype,
           ...(contextWindow !== undefined ? { contextWindow } : {}),
           ...(typeof m.total_cost_usd === "number" ? { costUsd: m.total_cost_usd } : {}),
