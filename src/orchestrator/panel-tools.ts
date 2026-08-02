@@ -3021,18 +3021,18 @@ const RETRY_OF_ARG = {
  * timeout and the dispatched:true mid-command outcome) plus the four workflow
  * mutators (workflow_save / workflow_save_as / workflow_rename / workflow_close
  * — the requiresWorkflowStampEnforcement set). Navigation/creation
- * (workflow_open / workflow_new) and BRIDGE_READONLY_CMDS reads are excluded. A
- * few view/list commands (graph_find_nodes, graph_list_subgraphs,
- * graph_screenshot, graph_canvas, graph_select_nodes, graph_enter/exit_subgraph,
- * graph_copy_nodes) are reads in spirit but sit OUTSIDE BRIDGE_READONLY_CMDS, so
- * the bridge already classifies them as mutating and they accept the token too —
- * harmless: retry_of is optional and opaque, and deduping an idempotent read is
- * a no-op. EXPLICIT MAP, mirroring the RETRY_SAFE_CMDS / MUTATING_GRAPH_EDIT_CMDS
- * maintenance model — keep in sync when mutating tools are added. Exported for
- * the #694 surface-integrity test.
+ * (workflow_open / workflow_new), BRIDGE_READONLY_CMDS reads, and the tools whose
+ * descriptions declare them view/read-only (panel_find_nodes, panel_canvas,
+ * panel_screenshot, panel_list_subgraphs) are excluded: a read must never mint
+ * or carry a retry token — its retry could be answered from the ledger with a
+ * STALE outcome (codex gate). A few state-changing commands that sit OUTSIDE
+ * BRIDGE_READONLY_CMDS but are reads in spirit (graph_select_nodes,
+ * graph_enter/exit_subgraph, graph_copy_nodes) accept the token: they change UI
+ * state idempotently, so a deduped retry is a no-op. EXPLICIT MAP, mirroring the
+ * RETRY_SAFE_CMDS / MUTATING_GRAPH_EDIT_CMDS maintenance model — keep in sync
+ * when mutating tools are added. Exported for the #694 surface-integrity test.
  */
 export const RETRY_TOKEN_CMD_BY_TOOL: Readonly<Record<string, string>> = {
-  panel_find_nodes: "graph_find_nodes",
   panel_add_node: "graph_add_node",
   panel_remove_node: "graph_remove_node",
   panel_clear: "graph_clear",
@@ -3045,7 +3045,6 @@ export const RETRY_TOKEN_CMD_BY_TOOL: Readonly<Record<string, string>> = {
   panel_move_node: "graph_move_node",
   panel_resize_node: "graph_resize_node",
   panel_auto_layout: "graph_auto_layout",
-  panel_canvas: "graph_canvas",
   panel_run: "graph_run",
   panel_save_workflow: "workflow_save", // workflow_save_as when `name` is given
   panel_rename_workflow: "workflow_rename",
@@ -3065,7 +3064,6 @@ export const RETRY_TOKEN_CMD_BY_TOOL: Readonly<Record<string, string>> = {
   panel_set_node_collapsed: "graph_set_node_collapsed",
   panel_set_node_mode: "graph_set_node_mode",
   panel_set_node_color: "graph_set_node_color",
-  panel_screenshot: "graph_screenshot",
   panel_enter_subgraph: "graph_enter_subgraph",
   panel_exit_subgraph: "graph_exit_subgraph",
   panel_move_rail: "graph_move_rail",
