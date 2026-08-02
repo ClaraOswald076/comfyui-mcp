@@ -21,6 +21,7 @@ import {
   configureManager,
   MANAGER_CONFIG_ACTIONS,
 } from "../../services/manager-config.js";
+import { resetManagerApiCacheForTests } from "../../services/node-management.js";
 
 const mockedExistsSync = vi.mocked(existsSync);
 const mockedReadFileSync = vi.mocked(readFileSync);
@@ -45,6 +46,7 @@ function fetchSequence(responses: Array<Partial<Response> & { __text?: string; _
 describe("configureManager (HTTP API actions)", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    resetManagerApiCacheForTests("legacy");
     config.comfyuiPath = "/fake/ComfyUI";
   });
   afterEach(() => {
@@ -75,6 +77,33 @@ describe("configureManager (HTTP API actions)", () => {
     const res = await configureManager("set_db_mode", "remote");
     expect(f.mock.calls[0][0]).toBe("http://127.0.0.1:8188/manager/db_mode");
     expect(res.state).toBe("remote");
+  });
+
+  it("uses the v4-prefixed db_mode route instead of the legacy catchall", async () => {
+    resetManagerApiCacheForTests("v2");
+    const f = fetchSequence([{ ok: true }, { ok: true, __text: "remote" }]);
+    vi.stubGlobal("fetch", f);
+    await configureManager("set_db_mode", "remote");
+    expect(f.mock.calls.map((call) => call[0])).toEqual([
+      "http://127.0.0.1:8188/v2/manager/db_mode",
+      "http://127.0.0.1:8188/v2/manager/db_mode",
+    ]);
+  });
+
+  it("does not misroute legacy-only preview settings to v4", async () => {
+    resetManagerApiCacheForTests("v2");
+    const f = vi.fn();
+    vi.stubGlobal("fetch", f);
+    await expect(configureManager("set_preview_method", "taesd")).rejects.toThrow(/does not expose/i);
+    expect(f).not.toHaveBeenCalled();
+  });
+
+  it("does not misroute legacy-only preview settings to v2 batch mode", async () => {
+    resetManagerApiCacheForTests("v2-batch");
+    const f = vi.fn();
+    vi.stubGlobal("fetch", f);
+    await expect(configureManager("set_preview_method", "taesd")).rejects.toThrow(/does not expose/i);
+    expect(f).not.toHaveBeenCalled();
   });
 
   it("set_component_policy hits /manager/policy/component", async () => {
@@ -145,6 +174,7 @@ describe("configureManager (config.ini fallback actions)", () => {
     // previous test's leftover.
     vi.clearAllMocks();
     vi.restoreAllMocks();
+    resetManagerApiCacheForTests("legacy");
     config.comfyuiPath = "/fake/ComfyUI";
     // No HTTP fetch should be needed for these.
     vi.stubGlobal("fetch", vi.fn(async () => {
@@ -229,6 +259,7 @@ describe("configureManager (config.ini fallback actions)", () => {
 describe("configureManager validation", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    resetManagerApiCacheForTests("legacy");
     config.comfyuiPath = "/fake/ComfyUI";
     vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, status: 200, text: async () => "" }) as unknown as Response));
   });

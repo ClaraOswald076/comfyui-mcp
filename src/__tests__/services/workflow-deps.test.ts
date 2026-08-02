@@ -1,12 +1,16 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, afterEach } from "vitest";
 import {
   collectClassTypes,
   extractWorkflowDependencies,
   installWorkflowDependencies,
   type WorkflowDepsDeps,
   type ManagerNodePack,
+  defaultWorkflowDepsDeps,
 } from "../../services/workflow-deps.js";
+import { resetManagerApiCacheForTests } from "../../services/node-management.js";
 import type { WorkflowJSON, ObjectInfo, ComfyUINodeDef } from "../../comfyui/types.js";
+
+afterEach(() => vi.unstubAllGlobals());
 
 /** Build a minimal ObjectInfo node def with a given python_module. */
 function def(name: string, pythonModule: string): ComfyUINodeDef {
@@ -84,6 +88,18 @@ function makeDeps(overrides: Partial<WorkflowDepsDeps> = {}): WorkflowDepsDeps {
     ...overrides,
   };
 }
+
+describe("default WorkflowDeps Manager dialect routing", () => {
+  it("uses the v4-prefixed customnode mapping route", async () => {
+    resetManagerApiCacheForTests("v2");
+    const fetchMock = vi.fn(async () => new Response("{}", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await defaultWorkflowDepsDeps().fetchManagerMappings();
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://127.0.0.1:8188/v2/customnode/getmappings?mode=nickname",
+    );
+  });
+});
 
 describe("collectClassTypes", () => {
   it("returns distinct, sorted class_types", () => {

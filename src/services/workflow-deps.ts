@@ -4,6 +4,13 @@ import { getComfyUIBaseUrl } from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
 import { ComfyUIError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
+import {
+  detectManagerApi,
+  enqueueManagerTaskForExternal,
+  managerApiPrefixFor,
+  startManagerQueueForExternal,
+  type ManagerApi,
+} from "./node-management.js";
 
 /**
  * Workflow dependency analysis & installation.
@@ -107,7 +114,7 @@ export interface WorkflowDepsDeps {
    * in the Manager response) alongside pack metadata, so installs are queued
    * against the same channel the list came from.
    */
-  fetchManagerList: () => Promise<{ channel?: string; packs: ManagerNodePack[] }>;
+  fetchManagerList: () => Promise<{ channel?: string; packs: ManagerNodePack[]; directInstall?: boolean }>;
   /** POST a single pack install task to the Manager queue (against `channel`). */
   queueInstall: (pack: ManagerNodePack, channel: string) => Promise<void>;
   /** POST to reset the Manager queue (clears stale pending tasks before a run). */
@@ -127,8 +134,9 @@ const managerBase = (): string => getComfyUIBaseUrl();
 async function managerFetch(
   path: string,
   init?: RequestInit,
+  base = managerBase(),
 ): Promise<Response> {
-  const url = `${managerBase()}${path}`;
+  const url = `${base}${path}`;
   logger.debug("Manager API request", { url, method: init?.method ?? "GET" });
   let res: Response;
   try {
@@ -153,15 +161,28 @@ async function managerFetch(
 
 /** Default dependency wiring backed by live HTTP + the ComfyUI client. */
 export function defaultWorkflowDepsDeps(): WorkflowDepsDeps {
+  // installWorkflowDependencies invokes reset → N enqueues → start → status as
+  // one Manager transaction. Keep that entire sequence on the target selected
+  // by reset, including a dialect self-heal, so a panel retarget cannot split
+  // a queue across two ComfyUI instances (#670).
+  let queueOperation: { base: string; api?: ManagerApi } | undefined;
   return {
     fetchObjectInfo: () => getObjectInfo(),
     fetchManagerMappings: async () => {
-      const res = await managerFetch("/customnode/getmappings?mode=nickname");
+      const base = managerBase();
+      const api = await detectManagerApi(base);
+      const res = await managerFetch(`${managerApiPrefixFor(api)}/customnode/getmappings?mode=nickname`, undefined, base);
       return (await res.json()) as ManagerMappings;
     },
     fetchManagerList: async () => {
       // skip_update=true avoids slow per-pack git checks; we only need metadata.
-      const res = await managerFetch("/customnode/getlist?mode=cache&skip_update=true");
+      const base = managerBase();
+      const api = await detectManagerApi(base);
+      // v4 deliberately dropped getlist; its registry-first install task does
+      // not need the legacy catalog descriptor.  Keep the legacy list path for
+      // 3.x and let callers resolve against Manager mappings on v4.
+      if (api !== "legacy") return { packs: [], directInstall: true };
+      const res = await managerFetch("/customnode/getlist?mode=cache&skip_update=true", undefined, base);
       const data = (await res.json()) as ManagerListResponse | ManagerNodePack[];
       if (Array.isArray(data)) return { packs: data };
       const packs = data.node_packs ?? {};
@@ -175,10 +196,8 @@ export function defaultWorkflowDepsDeps(): WorkflowDepsDeps {
       // A plain/non-registry pack (git URL, no registry version) must route on
       // version === "unknown"; a registry pack installs its catalog version.
       const isUnknown = !pack.version || pack.version === "unknown";
-      await managerFetch("/manager/queue/install", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const base = queueOperation?.base ?? managerBase();
+      const used = await enqueueManagerTaskForExternal("install", {
           id: pack.id,
           version: isUnknown ? "unknown" : pack.version,
           selected_version:
@@ -188,13 +207,18 @@ export function defaultWorkflowDepsDeps(): WorkflowDepsDeps {
           channel: pack.channel ?? channel,
           mode: pack.mode ?? "cache",
           ui_id: pack.id ?? pack.title ?? pack.reference,
-        }),
-      });
+      }, base);
+      if (queueOperation) queueOperation.api = used;
     },
     resetQueue: async () => {
-      await managerFetch("/manager/queue/reset", { method: "POST" });
+      const base = managerBase();
+      const api = await detectManagerApi(base);
+      await managerFetch(`${managerApiPrefixFor(api)}/manager/queue/reset`, { method: "POST" }, base);
+      queueOperation = { base, api };
     },
     startQueue: async () => {
+      const base = queueOperation?.base ?? managerBase();
+      const api = queueOperation?.api ?? await detectManagerApi(base);
       // Some legacy Manager 3.x builds expose /manager/queue/start as GET-only,
       // returning HTTP 405 to our POST (#551). A 405 on a Manager route is a
       // METHOD mismatch for this endpoint, not an unreachable Manager — retry the
@@ -202,21 +226,17 @@ export function defaultWorkflowDepsDeps(): WorkflowDepsDeps {
       // the GET against ComfyUI's frontend catchall, which 200s an UNREGISTERED
       // GET with a page of HTML: that HTML is NOT a real queue start (codex
       // review), so treat it as the route not accepting our request.
-      try {
-        await managerFetch("/manager/queue/start", { method: "POST" });
-      } catch (err) {
-        if (err instanceof ComfyUIError && (err.details as { status?: number } | undefined)?.status === 405) {
-          const res = await managerFetch("/manager/queue/start", { method: "GET" });
-          const body = await res.text().catch(() => "");
-          if (/^\s*<(?:!doctype\b|html\b|!--)/i.test(body)) throw err;
-          return;
-        }
-        throw err;
-      }
+      await startManagerQueueForExternal(api, base);
     },
     queueStatus: async () => {
-      const res = await managerFetch("/manager/queue/status");
-      return (await res.json()) as ManagerQueueStatus;
+      const base = queueOperation?.base ?? managerBase();
+      const api = queueOperation?.api ?? await detectManagerApi(base);
+      try {
+        const res = await managerFetch(`${managerApiPrefixFor(api)}/manager/queue/status`, undefined, base);
+        return (await res.json()) as ManagerQueueStatus;
+      } finally {
+        queueOperation = undefined;
+      }
     },
   };
 }
@@ -421,7 +441,7 @@ export async function installWorkflowDependencies(
 
   // Match missing packs to concrete Manager list entries for install payloads,
   // capturing the channel the list resolved against.
-  const { channel = "default", packs } = await deps.fetchManagerList();
+  const { channel = "default", packs, directInstall = false } = await deps.fetchManagerList();
   const byKey = new Map<string, ManagerNodePack>();
   for (const p of packs) {
     for (const key of [p.id, p.title, p.reference]) {
@@ -436,6 +456,14 @@ export async function installWorkflowDependencies(
   for (const pack of analysis.missingPacks) {
     const entry = byKey.get(pack);
     if (!entry) {
+      // Manager v4 removed the legacy getlist catalog endpoint. Its task API
+      // resolves a registry/repository id directly, so an empty catalog is the
+      // v4 signal to enqueue that id rather than falsely claim it is unresolved.
+      if (directInstall) {
+        toInstall.push({ id: pack, version: "latest" });
+        installed.push(pack);
+        continue;
+      }
       unresolved.push(pack);
       continue;
     }
