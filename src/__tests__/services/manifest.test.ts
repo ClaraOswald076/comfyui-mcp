@@ -27,7 +27,6 @@ const execFileSyncMock = vi.hoisted(() => vi.fn());
 const installCustomNodeMock = vi.hoisted(() => vi.fn());
 const installModelViaManagerMock = vi.hoisted(() => vi.fn());
 const listInstalledNodesMock = vi.hoisted(() => vi.fn());
-const panelStatusAtMock = vi.hoisted(() => vi.fn());
 const downloadModelMock = vi.hoisted(() => vi.fn());
 const resolveExistingModelFileMock = vi.hoisted(() => vi.fn());
 const listLocalModelsMock = vi.hoisted(() => vi.fn());
@@ -74,10 +73,6 @@ vi.mock("../../services/node-management.js", () => ({
   installCustomNode: (...a: unknown[]) => installCustomNodeMock(...a),
   installModelViaManager: (...a: unknown[]) => installModelViaManagerMock(...a),
   listInstalledNodes: (...a: unknown[]) => listInstalledNodesMock(...a),
-}));
-
-vi.mock("../../services/panel-installer.js", () => ({
-  panelStatusAt: (...a: unknown[]) => panelStatusAtMock(...a),
 }));
 
 vi.mock("../../services/model-resolver.js", () => ({
@@ -179,16 +174,6 @@ beforeEach(() => {
     .mockReset()
     .mockResolvedValue({ mechanism: "manager-http", message: "queued model" });
   listInstalledNodesMock.mockReset().mockResolvedValue([]);
-  panelStatusAtMock.mockReset().mockResolvedValue({
-    applicable: true,
-    installed: false,
-    isDevSymlink: false,
-    targetVersion: "nightly",
-    shadows: [],
-    shadowInspectFailed: false,
-    pin: { pinned: false, source: "none" },
-    note: "Not installed.",
-  });
   downloadModelMock.mockReset().mockResolvedValue("/fake/ComfyUI/models/checkpoints/m.safetensors");
   // Default: the model is found in NO root (multi-root resolver rejects, HTTP
   // listing is empty). Individual tests override to simulate an existing model.
@@ -360,57 +345,14 @@ describe("applyManifest", () => {
     });
   });
 
-  it("does not report the panel applied when its actual served install has a .bak shadow", async () => {
-    // The Manager's installed-list is not sufficient for the browser extension:
-    // a dot-prefixed backup can sort first and serve an older panel instead.
-    panelStatusAtMock
-      .mockResolvedValueOnce({
-        applicable: true,
-        installed: false,
-        isDevSymlink: false,
-        targetVersion: "nightly",
-        shadows: [],
-        shadowInspectFailed: false,
-        pin: { pinned: false, source: "none" },
-        note: "Not installed.",
-      })
-      .mockResolvedValueOnce({
-        applicable: true,
-        installed: true,
-        installedVersion: "0.11.32",
-        isDevSymlink: false,
-        targetVersion: "nightly",
-        shadows: [{ name: ".comfyui-agent-panel.bak-0.11.28", version: "0.11.28" }],
-        shadowInspectFailed: false,
-        pin: { pinned: false, source: "none" },
-        note: "shadow copy present",
-      });
-
-    const result = await applyManifest({
-      manifest: { custom_nodes: ["comfyui-agent-panel"] },
-    });
-
-    expect(installCustomNodeMock).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "comfyui-agent-panel" }),
-    );
-    expect(result.summary).toMatchObject({ applied: 0, failed: 1 });
-    expect(result.results[0]?.message).toMatch(/served panel could not be verified.*shadow/i);
-  });
-
-  it("does not let a Manager installed-list skip an unverifiable existing panel", async () => {
+  it("refuses a panel manifest when Manager and local loopback targets can differ", async () => {
+    // config.comfyuiPath can point at local instance A while the current Manager
+    // client targets B. A pre/post panel scan of A cannot validate a mutation of
+    // B, even if Manager's installed list says the panel is present there.
+    mockConfig.comfyuiPath = "/fake/ComfyUI-A";
     listInstalledNodesMock.mockResolvedValueOnce([
       { module: "comfyui-agent-panel", cnrId: "comfyui-agent-panel", enabled: true },
     ]);
-    panelStatusAtMock.mockResolvedValueOnce({
-      applicable: true,
-      installed: true,
-      isDevSymlink: false,
-      targetVersion: "nightly",
-      shadows: [],
-      shadowInspectFailed: true,
-      pin: { pinned: false, source: "none" },
-      note: "could not enumerate custom_nodes",
-    });
 
     const result = await applyManifest({
       manifest: { custom_nodes: ["comfyui-agent-panel"] },
@@ -418,7 +360,7 @@ describe("applyManifest", () => {
 
     expect(installCustomNodeMock).not.toHaveBeenCalled();
     expect(result.summary).toMatchObject({ applied: 0, failed: 1 });
-    expect(result.results[0]?.message).toMatch(/not trusting the ComfyUI-Manager installed list/i);
+    expect(result.results[0]?.message).toMatch(/cannot prove.*same instance/i);
   });
 
   it("skips a model already present in an ALTERNATE model root (extra_model_paths)", async () => {

@@ -266,6 +266,28 @@ describe("installWorkflowDependencies", () => {
     expect(deps.queueInstall).toHaveBeenCalledTimes(1);
   });
 
+  it("never queues the panel through the generic direct-install/remote fallback", async () => {
+    const deps = makeDeps({
+      fetchObjectInfo: vi.fn(async () => ({})),
+      fetchManagerMappings: vi.fn(async () => ({
+        "comfyui-agent-panel": [["PanelOnlyNode"], {}],
+      } as never)),
+      fetchManagerList: vi.fn(async () => ({ directInstall: true, packs: [] })),
+    });
+    const panelWorkflow: WorkflowJSON = {
+      "1": { class_type: "PanelOnlyNode", inputs: {} },
+    };
+
+    const result = await installWorkflowDependencies(panelWorkflow, deps);
+
+    expect(result.installed).toEqual([]);
+    expect(result.unresolved).toEqual(["comfyui-agent-panel"]);
+    expect(result.panel_notes?.join(" ")).toMatch(/does not queue or mutate.*install_panel/i);
+    expect(deps.resetQueue).not.toHaveBeenCalled();
+    expect(deps.queueInstall).not.toHaveBeenCalled();
+    expect(deps.startQueue).not.toHaveBeenCalled();
+  });
+
   it("resets the queue, queues missing packs (with channel), then starts the worker", async () => {
     const deps = makeDeps();
     const order: string[] = [];

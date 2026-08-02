@@ -1,6 +1,6 @@
 import type { WorkflowJSON, ObjectInfo } from "../comfyui/types.js";
 import { getObjectInfo } from "../comfyui/client.js";
-import { getComfyUIBaseUrl, isLocalMode } from "../config.js";
+import { getComfyUIBaseUrl } from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
 import { ComfyUIError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
@@ -12,7 +12,6 @@ import {
   type ManagerApi,
 } from "./node-management.js";
 import { targetsPanelPackExactly, withPanelPinGuard } from "./panel-pin-guard.js";
-import { runPanelActionInner, panelStatus, withPanelOpLock, defaultDeps } from "./panel-installer.js";
 
 /**
  * Workflow dependency analysis & installation.
@@ -473,16 +472,17 @@ async function installWorkflowDependenciesForAnalysis(
   const toInstall: ManagerNodePack[] = [];
   const installed: string[] = [];
   const unresolved = [...analysis.unresolved];
-  // The sidebar panel pack NEVER goes through the generic Manager queue: that
-  // path has neither the pin guard nor on-disk verification (#639/#641 class),
-  // so a workflow naming it would silently move a pinned panel. Panel targets
-  // are peeled off here and handled by the verified path below.
+  // The sidebar panel pack NEVER goes through this transaction. The Manager
+  // target resolved for a workflow dependency may differ from the local root
+  // used to establish which panel the browser serves; accepting either one as
+  // proof would permit an unverified update or fabricate success. Keep it
+  // unresolved and require install_panel on the selected ComfyUI host instead.
   const panelTargets: string[] = [];
   const panelNotes: string[] = [];
   for (const pack of analysis.missingPacks) {
     if (targetsPanelPackExactly(pack)) {
       panelTargets.push(pack);
-      installed.push(pack);
+      unresolved.push(pack);
       continue;
     }
     const entry = byKey.get(pack);
@@ -502,51 +502,16 @@ async function installWorkflowDependenciesForAnalysis(
     installed.push(pack);
   }
 
-  // Resolve the panel targets: the outer withPanelPinGuard keeps this whole
-  // transaction atomically pinned while any panel target is present; local installs go through the verified panel
-  // path (runPanelAction re-reads the pack from disk and fails closed); on a
-  // remote host no on-disk verification exists, so the pin check is the whole
-  // guard and the pack joins the generic queue.
+  // Even under the outer pin guard, this workflow transaction cannot bind its
+  // Manager target to a served-panel root. Do not re-add panel targets to the
+  // generic queue (especially in remote mode), and do not inspect/mutate the
+  // process-global panel root for a possibly different Manager target.
   for (const pack of panelTargets) {
-    if (!isLocalMode()) {
-      toInstall.push({ id: pack, version: "latest" });
-      panelNotes.push(
-        `"${pack}" is the sidebar panel pack: queued with the other packs (remote host — ` +
-          `no on-disk verification exists there; the pin check above is the whole guard).`,
-      );
-    } else {
-      // Status check AND install inside the op lock: a panel landing between
-      // the check and the mutation would otherwise have nightly installed
-      // over it (codex gate). Same pattern as performPanelSync.
-      await withPanelOpLock(async () => {
-        const status = await panelStatus();
-        // An unreliable scan means "not installed" proves NOTHING — installing
-        // blind could clobber a newer panel the enumeration missed (#639, the
-        // same can't-tell-don't-touch rule sync now follows).
-        if (status.scanReliable === false) {
-          panelNotes.push(
-            `"${pack}" is the sidebar panel pack: custom_nodes could not be enumerated, ` +
-              `so whether it is installed is unknown — NOT installing blind (that could ` +
-              `clobber an existing, possibly newer, panel). Re-run once readable.`,
-          );
-          return;
-        }
-        if (status.installed) {
-          panelNotes.push(
-            `"${pack}" is the sidebar panel pack: already installed ` +
-              `(${status.installedVersion ?? "version unreadable"}) — NOT touching it ` +
-              `(use the node-pack sync skill or install_panel to change versions).`,
-          );
-          return;
-        }
-        const result = await runPanelActionInner("install", defaultDeps);
-        panelNotes.push(
-          `"${pack}" is the sidebar panel pack: installed via the verified panel path ` +
-            `(${result.action}${result.installedVersion ? `, verified ${result.installedVersion}` : ""}). ` +
-            `RESTART ComfyUI to load it.`,
-        );
-      });
-    }
+    panelNotes.push(
+      `"${pack}" is the sidebar panel pack: workflow dependency installation does not queue or mutate it ` +
+        `because this Manager transaction cannot prove the same served-panel target. ` +
+        `Use install_panel on the selected ComfyUI host.`,
+    );
   }
 
   let queue: ManagerQueueStatus | undefined;
