@@ -151,6 +151,31 @@ export async function resolveLiveComfyUIBase(): Promise<string | undefined> {
   }
 }
 
+/**
+ * ONE `/system_stats` snapshot for callers that need to derive several things from the
+ * SAME server state (the launch flags AND the install root), rather than issuing two
+ * calls that could straddle a restart — the same invariant `resolveModelsDirWithBases`
+ * keeps for the download destination. `reachable: false` covers remote mode (the server's
+ * paths are on another host) and any failure. Never throws.
+ */
+export async function getLiveServerSnapshot(): Promise<{
+  reachable: boolean;
+  argv?: string[];
+  cwd?: string;
+}> {
+  if (isRemoteMode()) return { reachable: false };
+  try {
+    const stats = await getSystemStats();
+    return {
+      reachable: true,
+      argv: stats.system?.argv,
+      cwd: (stats.system as { cwd?: string })?.cwd,
+    };
+  } catch {
+    return { reachable: false };
+  }
+}
+
 async function readWorkspaceConfig(): Promise<WorkspaceConfig> {
   const path = workspaceConfigPath();
   if (!existsSync(path)) return {};
@@ -379,38 +404,94 @@ async function probe(
 }
 
 /**
- * Derive the ABSOLUTE directory that holds the running server's `main.py` from its
- * `/system_stats` argv (Python's `sys.argv`, whose argv[0] is the script path). This
- * is the LIVE running instance's install root — the source of truth for which python
- * is actually running ComfyUI (#401 / PR #433 review). Robust against the argv shapes
- * codex flagged: surrounding quotes are stripped; a RELATIVE `ComfyUI/main.py` or a
- * bare `main.py` is resolved against the server's reported cwd WHEN AVAILABLE; and if
- * the main.py path cannot be resolved to an absolute directory we return `undefined`
- * (UNRESOLVED) rather than a bogus/relative root — callers must NOT then silently
- * fall back to a persisted default and mark it "live".
+ * The launch SCRIPT token of a server argv: a POSITIONAL argument — one appearing BEFORE
+ * the first `-`/`--` option token — that ends in `main.py`/`main.pyw`, with surrounding
+ * quotes stripped. Python's `sys.argv[0]` is the script, so a main.py-shaped token that
+ * appears only AFTER an option is that option's value or a later argument, never the
+ * launch script: on a main-less `python -m comfyui … --extra-model-paths-config
+ * /host/main.py` launch the CONFIG value would otherwise be accepted as the script and
+ * self-prove the server's locality, letting a same-spelled host file be read/written
+ * (#648 review). Returns the unquoted token, or undefined when argv has no positional
+ * script (scanning stops at the first option token).
  */
-export function liveRootFromArgv(
-  argv: string[] | undefined,
-  cwd?: string,
-): string | undefined {
+function scriptTokenFromArgv(argv: string[] | undefined): string | undefined {
   if (!Array.isArray(argv)) return undefined;
   for (const rawArg of argv) {
     if (typeof rawArg !== "string") continue;
     // Strip surrounding quotes a launcher may leave on the path.
     const a = rawArg.trim().replace(/^["']+/, "").replace(/["']+$/, "");
+    if (a.startsWith("-")) return undefined; // options begin — no positional script beyond
     // Must actually END in main.py / main.pyw (boundary guards against notmain.py).
-    if (!/(^|[\\/])main\.pyw?$/i.test(a)) continue;
-    const dir = dirname(a);
-    if (dir === "." || dir === "") {
-      // Bare "main.py" — only resolvable via an absolute cwd.
-      return cwd && isAbsolute(cwd) ? cwd : undefined;
-    }
-    if (isAbsolute(dir)) return dir;
-    // Relative dir (e.g. "ComfyUI/main.py") — resolve against the server's cwd.
-    if (cwd && isAbsolute(cwd)) return pathResolve(cwd, dir);
-    return undefined; // cannot resolve to an absolute dir → UNRESOLVED
+    if (/(^|[\\/])main\.pyw?$/i.test(a)) return a;
   }
   return undefined;
+}
+
+/**
+ * Derive the ABSOLUTE directory that holds the running server's `main.py` from its
+ * `/system_stats` argv (Python's `sys.argv`, whose argv[0] is the script path). This
+ * is the LIVE running instance's install root — the source of truth for which python
+ * is actually running ComfyUI (#401 / PR #433 review). Robust against the argv shapes
+ * codex flagged: surrounding quotes are stripped; only a POSITIONAL token before the
+ * first option counts as the script — never a flag's VALUE (scriptTokenFromArgv,
+ * #648 review); a RELATIVE `ComfyUI/main.py` or a bare `main.py` is resolved against
+ * the server's reported cwd WHEN AVAILABLE; and if the main.py path cannot be resolved
+ * to an absolute directory we return `undefined` (UNRESOLVED) rather than a
+ * bogus/relative root — callers must NOT then silently fall back to a persisted
+ * default and mark it "live".
+ */
+export function liveRootFromArgv(
+  argv: string[] | undefined,
+  cwd?: string,
+): string | undefined {
+  // Deliberately NOT delegating to liveScriptFromArgv. This function feeds the #633
+  // download-authorization path, and dirname(scriptPath) normalizes two leaves that this
+  // body returns verbatim (a bare "main.py" returns `cwd` exactly; `C:\x\.\main.py`
+  // returns `C:\x\.`). The values are equivalent after resolve() — which every caller
+  // applies — but "equivalent" is not "identical", and this is not the function to take
+  // that risk in. What the two functions SHARE is only the script-token extraction
+  // (scriptTokenFromArgv); the return shaping stays separate, pinned by a cross-check test.
+  const a = scriptTokenFromArgv(argv);
+  if (a === undefined) return undefined;
+  const dir = dirname(a);
+  if (dir === "." || dir === "") {
+    return cwd && isAbsolute(cwd) ? cwd : undefined;
+  }
+  if (isAbsolute(dir)) return dir;
+  if (cwd && isAbsolute(cwd)) return pathResolve(cwd, dir);
+  return undefined;
+}
+
+/**
+ * The same derivation as `liveRootFromArgv` but returning the `main.py` FILE itself
+ * rather than its directory. `dirname()` of this equals `liveRootFromArgv`'s result after
+ * normalization (a cross-check test pins that for every argv shape).
+ *
+ * The file path is what a caller needs to follow a SYMLINK: ComfyUI locates its implicit
+ * `extra_model_paths.yaml` next to `os.path.realpath(__file__)`, so a launcher that keeps
+ * `/launcher/main.py` symlinked to `/installs/B/main.py` reads `/installs/B/…`. Only the
+ * script path can be realpath'd; the directory cannot (the symlink is on the file).
+ * Callers that must not follow symlinks — notably the #633 authorization path, which is
+ * anchored to the lexical argv root — keep using `liveRootFromArgv`.
+ *
+ * Like `liveRootFromArgv`, only the POSITIONAL launch-script token counts (shared
+ * `scriptTokenFromArgv`) — a main.py-shaped flag VALUE is never the script (#648 review).
+ */
+export function liveScriptFromArgv(
+  argv: string[] | undefined,
+  cwd?: string,
+): string | undefined {
+  const a = scriptTokenFromArgv(argv);
+  if (a === undefined) return undefined;
+  const dir = dirname(a);
+  if (dir === "." || dir === "") {
+    // Bare "main.py" — only resolvable via an absolute cwd.
+    return cwd && isAbsolute(cwd) ? pathResolve(cwd, a) : undefined;
+  }
+  if (isAbsolute(dir)) return a;
+  // Relative dir (e.g. "ComfyUI/main.py") — resolve against the server's cwd.
+  if (cwd && isAbsolute(cwd)) return pathResolve(cwd, a);
+  return undefined; // cannot resolve to an absolute dir → UNRESOLVED
 }
 
 /**

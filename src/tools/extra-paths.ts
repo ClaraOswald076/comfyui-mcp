@@ -14,8 +14,14 @@ const targetArgs = {
   target: targetSchema
     .optional()
     .describe(
-      "Config target: auto chooses Desktop config if it exists, otherwise standalone; " +
-        "standalone uses <COMFYUI_PATH>/extra_model_paths.yaml; desktop uses the OS app-data extra_models_config.yaml.",
+      "Config target. auto (default) is LIVE-FIRST: the running ComfyUI's own " +
+        "--extra-model-paths-config, else the extra_model_paths.yaml next to its main.py; " +
+        "only when no server is reachable does it fall back to the Desktop config if one " +
+        "exists, otherwise standalone. standalone forces <ComfyUI root>/extra_model_paths.yaml, " +
+        "where the root is COMFYUI_PATH (or an auto-detected install) and falls back to the " +
+        "saved default workspace; desktop forces the OS app-data extra_models_config.yaml. " +
+        "Use standalone/desktop (or config_path) to deliberately target a file the running " +
+        "server does not read.",
     ),
   config_path: z
     .string()
@@ -47,9 +53,13 @@ export function registerExtraPathsTools(server: McpServer): void {
   server.tool(
     "list_extra_paths",
     "View ComfyUI extra search-path config for standalone/manual installs and ComfyUI Desktop. " +
-      "Standalone uses <COMFYUI_PATH>/extra_model_paths.yaml; Desktop uses the OS app-data " +
-      "extra_models_config.yaml. Reports generic categories, so model categories and custom_nodes " +
-      "entries are both visible when present. Read-only.",
+      "Resolves LIVE-FIRST: the file the running ComfyUI actually reads (its " +
+      "--extra-model-paths-config, else the extra_model_paths.yaml beside its main.py), falling " +
+      "back to the local heuristic only when no server is reachable — <ComfyUI root>/" +
+      "extra_model_paths.yaml (COMFYUI_PATH, else the saved default workspace from " +
+      "set_default_workspace) or the Desktop app-data extra_models_config.yaml. Reports generic " +
+      "categories, so model categories and custom_nodes entries are both visible when present. " +
+      "Read-only.",
     targetArgs,
     async (args) => {
       try {
