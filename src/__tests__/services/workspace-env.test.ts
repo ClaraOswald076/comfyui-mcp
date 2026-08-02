@@ -191,18 +191,27 @@ describe("resolveInstallInterpreter (#651)", () => {
     }
   });
 
-  it("uses the exact interpreter recorded when MCP launched the live server", async () => {
+  it("does NOT trust an unvalidated launch mark — a stale record must not direct installs (#401)", async () => {
+    // The old workspace-env launch record answered here with no process-identity
+    // proof: our child could be dead, its PID recycled, and another server now on
+    // the port under the SAME install root with a recreated/different venv — yet
+    // pip/update work would have been sent to the OLD interpreter while the result
+    // claimed to be exact. After unification the only launch record is
+    // live-interpreter.ts (PID + creation time), so when the observation channel
+    // cannot validate the process the resolver REFUSES — env-trust (#633) is not
+    // interpreter-identity.
     const root = await tmpDir();
     try {
       await writeFile(join(root, "main.py"), "", "utf-8");
       await makeVenvPython(root);
       mockGetSystemStats.mockResolvedValue({ system: { argv: [join(root, "main.py")] } });
-      markLocalComfyUILaunched("C:/ComfyUI/.venv/Scripts/python.exe");
+      markLocalComfyUILaunched(); // env-trust mark only — NOT an interpreter record
+      h.mockLiveInterpreter.mockReturnValue(undefined); // identity NOT confirmed
 
-      await expect(resolveInstallInterpreter(root)).resolves.toMatchObject({
-        python: "C:/ComfyUI/.venv/Scripts/python.exe",
-        source: "launched",
-      });
+      const result = await resolveInstallInterpreter(root);
+
+      expect(result.source).toBe("undetermined");
+      expect(result).not.toHaveProperty("python");
     } finally {
       resetLocalComfyUILaunchState();
       await rm(root, { recursive: true, force: true });
@@ -247,6 +256,76 @@ describe("resolveInstallInterpreter (#651)", () => {
         source: "launched",
       });
     } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("trusts a validated launched-by-us record even when argv names no resolvable main.py", async () => {
+    // We KNOW what we spawned: a PID + creation-time-validated launch record is
+    // authoritative without an argv-derived root to corroborate (#651 semantics,
+    // now carried by the validated channel).
+    const root = await tmpDir();
+    try {
+      await makeVenvPython(root);
+      mockGetSystemStats.mockResolvedValue({ system: { argv: ["--port", "8188"] } });
+      h.mockLiveInterpreter.mockReturnValue({
+        python: "D:/ComfyUI/.venv/Scripts/python.exe",
+        source: "launched-by-us",
+        pid: 4242,
+      });
+
+      await expect(resolveInstallInterpreter(root)).resolves.toMatchObject({
+        python: "D:/ComfyUI/.venv/Scripts/python.exe",
+        source: "launched",
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not let a validated launched-by-us record bypass the different-install refusal", async () => {
+    const parent = await tmpDir();
+    try {
+      const requested = join(parent, "requested");
+      const live = join(parent, "live");
+      await mkdir(live, { recursive: true });
+      await writeFile(join(live, "main.py"), "", "utf-8");
+      await makeVenvPython(requested);
+      mockGetSystemStats.mockResolvedValue({ system: { argv: [join(live, "main.py")] } });
+      h.mockLiveInterpreter.mockReturnValue({
+        python: "D:/elsewhere/python.exe",
+        source: "launched-by-us",
+        pid: 4242,
+      });
+
+      const result = await resolveInstallInterpreter(requested);
+
+      expect(result.source).toBe("undetermined");
+      expect(result).not.toHaveProperty("python");
+      expect(result.reason).toContain("different install");
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses in remote mode even when an observation is available (ladder order)", async () => {
+    const root = await tmpDir();
+    try {
+      await makeVenvPython(root);
+      h.remoteMode.value = true;
+      h.mockLiveInterpreter.mockReturnValue({
+        python: "D:/ComfyUI/.venv/Scripts/python.exe",
+        source: "launched-by-us",
+        pid: 4242,
+      });
+
+      const result = await resolveInstallInterpreter(root);
+
+      expect(result.source).toBe("undetermined");
+      expect(result.python).toBeUndefined();
+      expect(result.reason).toContain("remote");
+    } finally {
+      h.remoteMode.value = false;
       await rm(root, { recursive: true, force: true });
     }
   });

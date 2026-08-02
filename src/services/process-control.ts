@@ -466,15 +466,16 @@ function rememberRestartAttempt(policy: RestartPolicy): boolean {
 
 interface SpawnedComfyUI {
   child: ChildProcess;
-  /** Defined only for the Python process we directly execute, never Desktop's shell. */
-  interpreter?: string;
 }
 
 let recordedLaunchChild: ChildProcess | undefined;
 
-function adoptLaunchedChild(child: ChildProcess, interpreter: string | undefined): void {
+function adoptLaunchedChild(child: ChildProcess): void {
   recordedLaunchChild = child;
-  markLocalComfyUILaunched(interpreter);
+  // Env-trust ONLY (#633 P1b) — the launched interpreter itself is recorded by
+  // spawnFromProcessInfo via recordLaunchedInterpreter (live-interpreter.ts), the
+  // single launch record, and trusted only after PID + creation-time validation.
+  markLocalComfyUILaunched();
   const clearIfCurrent = (): void => {
     if (recordedLaunchChild !== child) return;
     recordedLaunchChild = undefined;
@@ -516,7 +517,7 @@ function spawnFromProcessInfo(info: ProcessInfo): SpawnedComfyUI | null {
   // the moment a different process owns the port. (Desktop-app launches return
   // above: that exe is a launcher, not an interpreter.)
   if (child.pid) recordLaunchedInterpreter(child.pid, cmd.exe);
-  return { child, interpreter: cmd.exe };
+  return { child };
 }
 
 /**
@@ -866,7 +867,7 @@ function handleSupervisedChildStop(
     return;
   }
   restarted.child.unref();
-  if (!lastProcessInfo.isDesktopApp) adoptLaunchedChild(restarted.child, restarted.interpreter);
+  if (!lastProcessInfo.isDesktopApp) adoptLaunchedChild(restarted.child);
   superviseChild(restarted.child, lastProcessInfo);
 }
 
@@ -1100,7 +1101,7 @@ export async function startComfyUI(): Promise<StartResult> {
   // expanded against process.env (#633 P1b). A Desktop-app launch's env is NOT
   // guaranteed to be ours, so it stays fail-closed (unmarked).
   if (!info.isDesktopApp) {
-    adoptLaunchedChild(launched.child, launched.interpreter);
+    adoptLaunchedChild(launched.child);
     // Revoke env-trust the instant OUR launched child goes away — on EXIT and on a
     // failed spawn (ERROR): a successor server that later takes the port may have a
     // DIFFERENT env, so it must NOT inherit our trust (#633 P1b stale-flag). Fail

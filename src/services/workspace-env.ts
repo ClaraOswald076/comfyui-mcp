@@ -50,32 +50,28 @@ export function resetWorkspaceConfig(): void {
 // share) must NOT have its config vars expanded against our env — that could authorize
 // a wrong-place download destination (#633 P1b). Set ONLY on the env-inheriting python
 // spawn path, cleared on stop; module-scoped, so it resets each MCP process lifetime.
+//
+// This flag is ENV-TRUST ONLY. The interpreter we launched with is recorded in
+// live-interpreter.ts (recordLaunchedInterpreter) — the ONE launch record, trusted
+// only after PID + creation-time identity validation. A second, unvalidated record
+// here was the stale-record hazard: our child dies, another server takes the port
+// under the same install root, and pip/update work would have been directed into the
+// OLD interpreter while claiming to be exact (#401 re-gate).
 let localComfyUILaunchedByUs = false;
-// /system_stats intentionally does not expose sys.executable.  When this MCP
-// process starts ComfyUI, retain the executable we actually spawned: it is the
-// only non-inferred answer to where a package install belongs (#651).
-let localComfyUILaunchInterpreter: string | undefined;
 
 /** Record that this MCP process spawned the local ComfyUI (env inherited). */
-export function markLocalComfyUILaunched(interpreter?: string): void {
+export function markLocalComfyUILaunched(): void {
   localComfyUILaunchedByUs = true;
-  localComfyUILaunchInterpreter = interpreter?.trim() || undefined;
 }
 
 /** Clear the launched-by-us flag (on stop, and a test seam). */
 export function resetLocalComfyUILaunchState(): void {
   localComfyUILaunchedByUs = false;
-  localComfyUILaunchInterpreter = undefined;
 }
 
 /** True when this MCP process launched the connected local ComfyUI (shares our env). */
 export function didLaunchLocalComfyUI(): boolean {
   return localComfyUILaunchedByUs;
-}
-
-/** The exact interpreter this MCP process used to launch the live local server. */
-export function getLaunchedLocalInterpreter(): string | undefined {
-  return localComfyUILaunchedByUs ? localComfyUILaunchInterpreter : undefined;
 }
 
 function workspaceConfigPath(): string {
@@ -709,6 +705,11 @@ export function resolveComfyuiPython(
 // Install interpreter resolution (#651)
 // ---------------------------------------------------------------------------
 
+/** Where an install interpreter answer came from. "launched" and "observed" are both
+ *  OBSERVED ground truth from live-interpreter.ts: "launched" is the child this MCP
+ *  spawned, re-validated per call by PID + creation time (never a bare launch mark —
+ *  a stale record refuses); "observed" is the OS process table corroborated against
+ *  the server's own argv. "override" is the operator's COMFYUI_PYTHON. */
 export type InstallInterpreterSource = "override" | "launched" | "observed" | "undetermined";
 
 export interface InstallInterpreterResolution {
@@ -776,15 +777,18 @@ function targetsLiveInstall(serverRoot: string, requestedRoot: string | undefine
 
 /**
  * Resolve a package-install interpreter without claiming that a path-shaped guess is
- * the process that is currently serving ComfyUI.  A server that this MCP launched is
- * authoritative because we recorded its executable; an explicit COMFYUI_PYTHON is the
- * operator's own claim; and the OS process table is ground truth when the port owner's
- * command line corroborates the server's own argv (#401).  In every other case the
- * live interpreter is UNOBSERVABLE — /system_stats has no sys.executable, so even a
- * single discovered `.venv` may be unrelated (for example, the server can be using
- * system Python).  FAIL CLOSED: refuse rather than report an install into a
- * layout-guessed env as applied when the running server may not be able to import
- * from it (#651).
+ * the process that is currently serving ComfyUI.  Success requires OBSERVED ground
+ * truth (#401): an explicit COMFYUI_PYTHON is the operator's own claim; a server this
+ * MCP launched is authoritative only while the process on the port is still that same
+ * child — PID *and* creation time, validated per-call by live-interpreter.ts tier 1,
+ * so a stale launch record (child dead, PID recycled, another server now on the same
+ * install root) is never trusted; and the OS process table is ground truth when the
+ * port owner's command line corroborates the server's own argv (tier 2).  In every
+ * other case the live interpreter is UNOBSERVABLE — /system_stats has no
+ * sys.executable, so even a single discovered `.venv` may be unrelated (for example,
+ * the server can be using system Python).  FAIL CLOSED: refuse rather than report an
+ * install into a layout-guessed env as applied when the running server may not be
+ * able to import from it (#651).
  */
 export async function resolveInstallInterpreter(
   root: string | undefined,
@@ -815,12 +819,29 @@ export async function resolveInstallInterpreter(
     );
   }
   const serverRoot = liveRootForInstall(system?.argv, system?.cwd, root);
-  const launched = getLaunchedLocalInterpreter();
-  if (launched && (!serverRoot || targetsLiveInstall(serverRoot, root))) {
+  // OBSERVED ground truth (#401): /system_stats cannot name the interpreter, but the
+  // OS can. resolveLiveInterpreter is the ONLY launch record this resolver trusts.
+  let statsHost: string | undefined;
+  try {
+    statsHost = new URL(getComfyUIBaseUrl()).hostname;
+  } catch {
+    /* unparseable target → no host filter */
+  }
+  const live = resolveLiveInterpreter({
+    port: config.resolvedPort,
+    host: statsHost,
+    remote: false,
+    serverArgv: system?.argv,
+  });
+  // A VALIDATED launched-by-us observation (tier 1) is authoritative whenever the
+  // live server is the requested install — or argv names no root to contradict it.
+  if (live?.source === "launched-by-us" && (!serverRoot || targetsLiveInstall(serverRoot, root))) {
     return {
-      python: launched,
+      python: live.python,
       source: "launched",
-      reason: `Using "${launched}", the exact interpreter this MCP server used to start the running ComfyUI.`,
+      reason:
+        `Using "${live.python}", the interpreter this MCP server launched the running ` +
+        `ComfyUI with (identity-confirmed for PID ${live.pid}).`,
     };
   }
   if (!serverRoot) {
@@ -835,32 +856,17 @@ export async function resolveInstallInterpreter(
         "installing into the requested layout would not affect the live server.",
     );
   }
-  // OBSERVED ground truth (#401): /system_stats cannot name the interpreter, but the
-  // OS can — the process holding our port, its command line correlated against the
-  // server's OWN argv so a proxy or forwarder can never pass its env off as
-  // ComfyUI's. This strictly ADDS a success source: every refusal above still
-  // stands, and when nothing observes the interpreter the install still refuses
-  // (#651 fail-closed).
-  let statsHost: string | undefined;
-  try {
-    statsHost = new URL(getComfyUIBaseUrl()).hostname;
-  } catch {
-    /* unparseable target → no host filter */
-  }
-  const live = resolveLiveInterpreter({
-    port: config.resolvedPort,
-    host: statsHost,
-    remote: false,
-    serverArgv: system?.argv,
-  });
+  // A process-table observation (tier 2) is ground truth too, but only once the
+  // guards above have tied the live server to the requested install. This strictly
+  // ADDS a success source: when nothing observes the interpreter the install still
+  // refuses (#651 fail-closed).
   if (live) {
     return {
       python: live.python,
-      source: live.source === "launched-by-us" ? "launched" : "observed",
+      source: "observed",
       reason:
-        live.source === "launched-by-us"
-          ? `Using "${live.python}", the interpreter this MCP server launched the running ComfyUI with (identity-confirmed for PID ${live.pid}).`
-          : `Using "${live.python}", the interpreter the OS reports for the running ComfyUI process (PID ${live.pid}), corroborated against the server's own argv.`,
+        `Using "${live.python}", the interpreter the OS reports for the running ComfyUI ` +
+        `process (PID ${live.pid}), corroborated against the server's own argv.`,
     };
   }
   return refuse(
