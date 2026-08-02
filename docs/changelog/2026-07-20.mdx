@@ -14,7 +14,7 @@ The **GPT-5.6 family** lands for ChatGPT/Codex users with the extended effort sc
 0.145 alpha pairing, pre-5.6 models are deprecated (the picker hides them whenever
 the account has the 5.6 family), and the ChatGPT-direct default is now
 `gpt-5.6-luna`, successor to the retired `gpt-5.4-mini` (#241, #244; panel 0.9.7
-extends the effort slider). [Full rundown on the blog](/blog/gpt-5-6-comfyui).
+extends the effort slider). [Full rundown on the blog](../blog/gpt-5-6-comfyui).
 
 ## Train a character LoRA by asking
 
@@ -25,7 +25,7 @@ inside a headless GPU Docker image, so training character LoRAs on **FLUX.1-dev*
 is an agent-orchestrated flow — config generation, a crash-safe job registry, live
 step/loss/sample progress, and a handoff that drops the finished `.safetensors`
 into `models/loras/` and catalogs it. Ships the `train-character-lora` skill;
-end-to-end proven on a 4090. [The story](/blog/lora-trainer-p1).
+end-to-end proven on a 4090. [The story](../blog/lora-trainer-p1).
 
 ## Blind mode: from prompt to mechanism
 
@@ -34,7 +34,7 @@ Now it **mechanically gates every image-returning tool** (#245): blind tabs spaw
 their tool server with `COMFYUI_MCP_BLIND=1`, and a single registration-boundary
 wrapper replaces image blocks with an honest "withheld" note — on both the full MCP
 surface and the compact router. Toggling Blind live respawns the tab's tool server
-at idle. [The full confession](/blog/blind-mode-privacy).
+at idle. [The full confession](../blog/blind-mode-privacy).
 
 ## Gemini, revived
 

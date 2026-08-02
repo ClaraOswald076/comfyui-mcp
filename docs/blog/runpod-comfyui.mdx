@@ -18,7 +18,7 @@ _July 21, 2026_
 
 Want to run ComfyUI on a cloud GPU without touching a terminal? With
 comfyui-mcp's **first-party RunPod connector** (≥ v0.44.0) you rent a GPU pod by
-the hour and drive it in natural language from the same [Agent Panel](/panel) you
+the hour and drive it in natural language from the same [Agent Panel](../panel) you
 already use locally. Ask the agent to deploy a pod, it boots **your** ComfyUI
 environment — your custom nodes, your LoRAs, your models — and you render on it.
 One tap flips back to your local rig when you're done. This guide covers the full
@@ -27,7 +27,7 @@ loop: deploy, manage, render, and stop without leaving the panel or your phone.
 ## Why rent a GPU for ComfyUI?
 
 Not everyone has a 24 GB card. Even if you do, some jobs want more: a WAN 2.2
-video batch, a big Flux upscale, or [a LoRA train](/blog/train-lora-runpod) that
+video batch, a big Flux upscale, or [a LoRA train](./train-lora-runpod) that
 would tie up your desktop for an hour. Renting a cloud GPU on
 [RunPod](https://runpod.io) gives you an RTX 5090 (or bigger) on demand, billed
 per hour, and hands it back when you stop.
@@ -72,7 +72,7 @@ The result is that the workflow you were editing locally renders **the same** on
 the pod. For the full picture of what persists across pod restarts (models,
 custom nodes, user settings all live on the network volume) and how the topology
 keeps your Claude/ChatGPT login on your own machine, see
-[Cloud deployment](/cloud-deployment).
+[Cloud deployment](../cloud-deployment).
 
 ## Honest host switching — you always know where a render runs
 
@@ -89,7 +89,7 @@ one-tap **Local ⇄ Pod** switch (`runpod_use_local`) moves you between them
 instantly. Point the pod at your canvas for the heavy job, flip back to local for
 quick iteration, and the pill tells you the truth the whole time. It's the same
 honest-target philosophy behind
-[panel-owned sessions](/blog/panel-owned-sessions) — the canvas target is explicit,
+[panel-owned sessions](./panel-owned-sessions) — the canvas target is explicit,
 never guessed.
 
 ## Cost control and idle auto-stop
@@ -118,12 +118,12 @@ Everything above works from a **panel control modal** on the desktop and a
 
 <CardGroup cols={2}>
 
-<Card title="Desktop panel modal" href="/panel">
+<Card title="Desktop panel modal" href="../panel">
   Host banner, live status card, pod dropdown by name, and Connect / Start / Stop
   / Use-Local buttons plus a confirm-armed Deploy — right in the ComfyUI sidebar.
 </Card>
 
-<Card title="Mobile control sheet" href="/mobile">
+<Card title="Mobile control sheet" href="../mobile">
   The same host banner, status card, pod picker, and one-tap controls in the
   companion app — kick off a cloud render from your couch, watch the meter, stop
   the pod when it's done.
@@ -155,7 +155,7 @@ you still get a working pod.
 
 ## How to run ComfyUI on RunPod
 
-1. **Install the [comfyui-mcp](/) plugin** and open the Agent Panel in ComfyUI.
+1. **Install the [comfyui-mcp](../) plugin** and open the Agent Panel in ComfyUI.
 2. **Set `RUNPOD_API_KEY` once** via the panel's **API-Keys card** — no CLI, no
    WSL fiddling. Secrets are stored server-side in `~/.comfyui-mcp/.env`.
 3. **(Optional) Set `RUNPOD_IDLE_STOP_MINUTES`** to your comfort window for the
@@ -178,7 +178,7 @@ environment, an honest pill that tells you where every render lands, and idle
 auto-stop so a forgotten pod doesn't drain your wallet. Set your
 `RUNPOD_API_KEY` once, then rent a GPU the same way you talk to your local one.
 
-Related reading: [Cloud deployment](/cloud-deployment) for the pod image and
-persistence model, [Remote / hosted connector](/remote-connector) for exposing
+Related reading: [Cloud deployment](../cloud-deployment) for the pod image and
+persistence model, [Remote / hosted connector](../remote-connector) for exposing
 comfyui-mcp itself to remote clients, and
-[ComfyUI on your phone](/blog/comfyui-mobile-app) for the mobile companion.
+[ComfyUI on your phone](./comfyui-mobile-app) for the mobile companion.

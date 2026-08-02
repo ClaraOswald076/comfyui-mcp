@@ -22,7 +22,7 @@ existing clip rather than regenerating it from scratch — by riding on the
 that holds your existing footage clean while it flow-matches new frames onto the
 end.
 
-This is the practical companion to the [WAN 2.2 deep-dive](/blog/wan-2.2-comfyui):
+This is the practical companion to the [WAN 2.2 deep-dive](./wan-2.2-comfyui):
 that post covers the base model and the hi/lo expert split; this one covers how to
 take a clip you've already made and **keep it going** without ghosting at the seam.
 Below: what temporal flowmatching actually is, the node graph, the models and LoRAs
@@ -344,15 +344,15 @@ A14B models that the **[`wan-longer-videos` pack](https://github.com/artokun/com
 already installs. So the path is:
 
 1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the
-   [Panel](/panel), and apply the `wan-longer-videos` pack — that lands the nodes
+   [Panel](../panel), and apply the `wan-longer-videos` pack — that lands the nodes
    and the shared T2V A14B stack. **Don't re-download the big models.**
 2. Grab the **two Pusa V1 LoRAs** from `Kijai/WanVideo_comfy/Pusa/` into
    `models/loras/`.
-3. Open the [Panel](/panel) and let the panel's agent load kijai's extension graph,
+3. Open the [Panel](../panel) and let the panel's agent load kijai's extension graph,
    re-point the model/VAE/LoRA dropdowns, set `merge_loras=false`, and tune the
    noise ramp for you — conversationally, with full undo and no extra API keys.
 
 That's the whole point of the project: expert ComfyUI setups that drive themselves
 from your own agent session. For the model underneath this whole pipeline, read the
-[WAN 2.2 deep-dive](/blog/wan-2.2-comfyui); for the natural next step, **extend
+[WAN 2.2 deep-dive](./wan-2.2-comfyui); for the natural next step, **extend
 first, then upscale**.

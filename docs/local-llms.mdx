@@ -179,7 +179,7 @@ ollama pull artokun/gemma4-comfyui-mcp:12b     # ~8 GB VRAM
 ollama pull artokun/gemma4-comfyui-mcp:e2b     # smallest — ~2 GB VRAM (see caveat)
 ```
 
-**Measured, not promised** — [LLM Arena](/arena) scores on the real 10-scenario
+**Measured, not promised** — [LLM Arena](./arena) scores on the real 10-scenario
 ladder (best of 3, every result verified against a live ComfyUI server, RTX 4090):
 
 | Tag | VRAM (q4) | Arena score | vs. stock |
@@ -277,7 +277,7 @@ of models through an identical task set against a *live* ComfyUI and verifies
 every outcome against the server, never the model's claims.
 
 Local-tier scores on the full 10-scenario ladder (RTX 4090, ComfyUI 0.27,
-temperature 0 — see the [Arena page](/arena) for the task ladder and the
+temperature 0 — see the [Arena page](./arena) for the task ladder and the
 all-tier leaderboard including frontier and hosted models):
 
 | Model | Size | Score /20 |
@@ -304,7 +304,7 @@ workflows yet can't visually critique results.
 
 ## The sidebar panel on a local model
 
-The [panel agent](/panel) gains an **Ollama backend** alongside Claude /
+The [panel agent](./panel) gains an **Ollama backend** alongside Claude /
 ChatGPT / Gemini: pick **Ollama (local)** in the backend picker and the
 orchestrator drives your live graph with a local model — no account, no API
 key, fully offline. The model sees the 6-tool router (the 3 compact comfyui
@@ -340,4 +340,4 @@ that agents without that knowledge layer can still find their way.
   not data — run the tool with call_tool").
 - **ComfyUI not reachable** — compact mode only changes tool *registration*;
   connection config is identical to every other setup (see
-  [Configuration](/configuration)).
+  [Configuration](./configuration)).

@@ -28,7 +28,7 @@ model, the instruction editor, the mask-based inpainter, and the
 Below: what each genuinely does best, how it stacks up against Flux and Ideogram,
 the VRAM you need, and the fastest way to get it running — a one-command install
 with [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the
-[sidebar Panel](/panel), instead of hand-downloading 40+ GB of weights and
+[sidebar Panel](../panel), instead of hand-downloading 40+ GB of weights and
 juggling two text encoders.
 
 > **TL;DR — one-command setup.** Install comfyui-mcp, apply the `qwen-image` pack
@@ -66,13 +66,13 @@ There's no single "best" — pick by the job:
 | Pick… | When you need… |
 |-------|----------------|
 | **Qwen-Image** | Multilingual **text rendering** (EN/中文/日本語/한국어), paragraph-level layouts, **instruction editing + inpainting**, Apache-2.0 commercial use, the WAN refine combo |
-| **Ideogram 4** | The best open-weight **typography + design layout** with structured JSON area-prompting (posters, logos, packaging) — see our [Ideogram 4 post](/blog/ideogram-4-comfyui) |
+| **Ideogram 4** | The best open-weight **typography + design layout** with structured JSON area-prompting (posters, logos, packaging) — see our [Ideogram 4 post](./ideogram-4-comfyui) |
 | **FLUX.2 / Kontext** | **Photorealism** as a mature default, and precise edits when you write very explicit prompts |
-| **ERNIE-Image** | Another Apache-2.0 option with strong CN/JP/EN text — see our [ERNIE-Image post](/blog/ernie-image-comfyui) |
+| **ERNIE-Image** | Another Apache-2.0 option with strong CN/JP/EN text — see our [ERNIE-Image post](./ernie-image-comfyui) |
 
 Where rivals win: **Ideogram 4** edges Qwen on pure typography and spatial layout
 control (it's purpose-built for it, and its English OCR accuracy leads the
-open-weight pack — details in [its post](/blog/ideogram-4-comfyui)); **Flux**
+open-weight pack — details in [its post](./ideogram-4-comfyui)); **Flux**
 remains the go-to for photoreal portraits and is the lighter download. Qwen's
 trump cards are **editing**, **multilingual text**, and a **truly permissive
 license**. Each of those models gets its own model-highlight post — Qwen earns
@@ -134,12 +134,12 @@ Then load the workflow:
 - **`qwen-image-edit`** ships `workflow.json` (instruction editing) and
   `workflow-inpainting.json` (manual-mask inpainting) — load whichever fits.
 
-Because both packs ship with the [plugin](/plugin), your **own Claude session can
-drive the live graph through the [Panel](/panel)** — load images, paint masks,
+Because both packs ship with the [plugin](../plugin), your **own Claude session can
+drive the live graph through the [Panel](../panel)** — load images, paint masks,
 wire nodes, tweak the edit instruction, and iterate conversationally, with full
 Ctrl+Z undo and no extra API keys. Every model URL in the packs is CI-validated
 for reachability and size, so a link never quietly rots
-([why that matters](/blog/installer-packs-that-cant-rot)).
+([why that matters](./installer-packs-that-cant-rot)).
 
 ## Qwen-Image-Edit: instruction editing that listens
 
@@ -304,14 +304,14 @@ English layouts.
 
 ## Get it running in one command
 
-1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](/panel) — the panel auto-starts a background agent on your Claude subscription (no API keys; sign in with `claude` once).
+1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — the panel auto-starts a background agent on your Claude subscription (no API keys; sign in with `claude` once).
 2. Apply the **[`qwen-image`](https://github.com/artokun/comfyui-mcp)** pack (20B
    T2I + WAN combo) and/or **`qwen-image-edit`** (instruction editing + mask
    inpainting) — nodes and models land in the right folders, validated.
-3. Open the [Panel](/panel) and let the panel's agent load images, paint masks,
+3. Open the [Panel](../panel) and let the panel's agent load images, paint masks,
    and wire the graph for you.
 
 That's the whole point of the project: expert ComfyUI setups that install in one
 step and drive themselves from your own agent session. **Next in the series:**
-[WAN Animate 2.2](/blog/wan-animate-comfyui) — replace or drive a character from a
+[WAN Animate 2.2](./wan-animate-comfyui) — replace or drive a character from a
 single reference image.

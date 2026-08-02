@@ -30,8 +30,8 @@ you ⇄ Claude Code ⇄ comfyui-mcp (--channels) ⇄ ws://127.0.0.1:9101 ⇄ pan
 
 The plugin ships `--channels` **on by default**, so `/plugin install comfy`
 wires the bridge and `panel_*` tools automatically. See
-[Sidebar Panel](/panel) and
-[Channels mode configuration](/configuration#channels--drive-the-comfyui-sidebar-panel-from-your-own-agent-session).
+[Sidebar Panel](../panel) and
+[Channels mode configuration](../configuration#channels--drive-the-comfyui-sidebar-panel-from-your-own-agent-session).
 
 ### The panel grew up — and shipped to the Comfy Registry
 
@@ -110,7 +110,7 @@ A new **`model-registry`** skill consolidates download URLs + target
 `models/` subdirs for every model the skills reference (Flux, WAN, LTX, Qwen,
 Z-Image, shared VAEs/text-encoders). The README, npm description, keywords, and
 GitHub topics were corrected to the real asset counts (88 tools / 16 skills),
-and a new [`/plugin`](/plugin) docs page documents the full
+and a new [`/plugin`](../plugin) docs page documents the full
 skill/command/agent/hook surface.
 
 ## Fixes
@@ -121,7 +121,7 @@ skill/command/agent/hook surface.
   polling worked. It now declares the capability and sends
   `notifications/claude/channel` with the expected `{ content, meta }` shape.
   (The fuller story — and how the panel later moved to an autonomous background
-  agent — is in [this post](/blog/panel-agent-subscription).)
+  agent — is in [this post](../blog/panel-agent-subscription).)
 - **`list_local_models` sees `extra_model_paths.yaml` redirects** and works
   against remote/cloud ComfyUI — it now queries ComfyUI's `/models/<dir>` REST
   endpoint first instead of only scanning `${COMFYUI_PATH}/models/`.

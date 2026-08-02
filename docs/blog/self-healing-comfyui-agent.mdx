@@ -28,7 +28,7 @@ catch it; the interpreter is already a corpse by the time anything is written to
 disk. The culprit, buried in ComfyUI's on-disk log, was an fp8 `merge_loras` path
 inside **ComfyUI-WanVideoWrapper**: `apply_lora` at `utils.py:338`.
 
-Here's the part that matters. The [Panel](/panel) agent — the autonomous
+Here's the part that matters. The [Panel](../panel) agent — the autonomous
 assistant living in the ComfyUI sidebar — **did not** shrug and say "ComfyUI
 restarted, want me to run it again?" It read the corpse, named the killer, and
 fixed it. This post is how that loop works, end to end, because every piece of it
@@ -211,5 +211,5 @@ were getting coffee the whole time.
 
 Run an autonomous agent that recovers from its own crashes: install
 [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and add the
-[Panel](/panel). Star the repo or file an idea at
+[Panel](../panel). Star the repo or file an idea at
 [artokun/comfyui-mcp](https://github.com/artokun/comfyui-mcp/issues).

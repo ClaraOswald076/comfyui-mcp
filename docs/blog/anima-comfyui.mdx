@@ -27,7 +27,7 @@ inpainting and ControlNet workflow, how to **train your own anime LoRA** on a
 6 GB card, how it stacks up against the SDXL-lineage giants, and the fastest path
 to running it — a one-command install with
 [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the
-[sidebar Panel](/panel), instead of hand-downloading a dozen files into five
+[sidebar Panel](../panel), instead of hand-downloading a dozen files into five
 folders.
 
 > **TL;DR — one-command setup.** Install comfyui-mcp, apply the `anima` pack
@@ -96,8 +96,8 @@ text encoder that understands sentences. If your bottleneck is a 6–8 GB card, 
 you want to fine-tune without renting a GPU, ANIMA is the easy call.
 
 For non-anime work, this series covers the other specialists: the open-weight
-text-and-layout champion in [our Ideogram 4 post](/blog/ideogram-4-comfyui), and
-the speed/low-VRAM generalist in [our Z-Image post](/blog/z-image-comfyui).
+text-and-layout champion in [our Ideogram 4 post](./ideogram-4-comfyui), and
+the speed/low-VRAM generalist in [our Z-Image post](./z-image-comfyui).
 
 ## System & VRAM requirements
 
@@ -148,12 +148,12 @@ apply_manifest --path packs/anima/manifest.yaml
 
 Run the generated installer from your **ComfyUI root** (the folder containing
 `custom_nodes/` and `models/`), restart ComfyUI, and load
-`packs/anima/workflow.json`. Because the pack ships with the [plugin](/plugin),
+`packs/anima/workflow.json`. Because the pack ships with the [plugin](../plugin),
 your **own Claude session can drive the live graph through the
-[Panel](/panel)** — add/wire nodes, set widgets, swap LoRAs, and iterate on
+[Panel](../panel)** — add/wire nodes, set widgets, swap LoRAs, and iterate on
 prompts conversationally, with full undo and no API keys. Every model URL in the
 pack is CI-validated for reachability and size, so a link never quietly rots
-([here's why that matters](/blog/installer-packs-that-cant-rot)).
+([here's why that matters](./installer-packs-that-cant-rot)).
 
 ## Anime inpainting (the Anima-LLLite workflow)
 
@@ -318,13 +318,13 @@ isn't tuned for photorealistic output.
 
 ## Get it running in one command
 
-1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](/panel) — the panel auto-starts a background agent on your Claude subscription (no API keys; sign in with `claude` once).
+1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — the panel auto-starts a background agent on your Claude subscription (no API keys; sign in with `claude` once).
 2. Apply the **`anima` pack** — nodes + every model land in the right folders,
    CI-validated, with the Anima-LLLite inpainting node included.
-3. Open the [Panel](/panel) and let the panel's agent wire the graph, swap
+3. Open the [Panel](../panel) and let the panel's agent wire the graph, swap
    LoRAs, and iterate on tag-plus-prose prompts for you.
 
 That's the whole point of the project: expert ComfyUI setups that install in one
 step and drive themselves from your own agent session. **Next in the series:**
-[LTX-2.3](/blog/ltx-2.3-comfyui) — the fast GGUF video model with synchronized
+[LTX-2.3](./ltx-2.3-comfyui) — the fast GGUF video model with synchronized
 audio and the LTX Director timeline.

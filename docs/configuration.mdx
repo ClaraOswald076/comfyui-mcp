@@ -100,7 +100,7 @@ error. Architecture and `cloud-client` dispatcher originally contributed by
 [@picoSols](https://github.com/picoSols).
 
 <Note>
-  **Comfy-Org ships [official agent tooling](https://docs.comfy.org/agent-tools)** — Comfy Cloud MCP (public beta) and the Comfy In-App Agent (private alpha), both maintained by the Comfy team and both running on Comfy Cloud. If you only target Comfy Cloud, that's likely the right choice; see [Local vs. Comfy Cloud](/local-vs-comfy-cloud). `comfyui-mcp`'s cloud-mode below is best when you want a single MCP across local / remote / cloud, or you need it today (it's MIT and shipping now).
+  **Comfy-Org ships [official agent tooling](https://docs.comfy.org/agent-tools)** — Comfy Cloud MCP (public beta) and the Comfy In-App Agent (private alpha), both maintained by the Comfy team and both running on Comfy Cloud. If you only target Comfy Cloud, that's likely the right choice; see [Local vs. Comfy Cloud](./local-vs-comfy-cloud). `comfyui-mcp`'s cloud-mode below is best when you want a single MCP across local / remote / cloud, or you need it today (it's MIT and shipping now).
 </Note>
 
 <ParamField path="COMFYUI_API_KEY" type="string">
@@ -189,7 +189,7 @@ driven by the **panel orchestrator** — a background process that owns a loopba
 WebSocket bridge and runs an autonomous Claude Agent SDK session per panel tab on
 your **Claude subscription** (no API keys). The panel pack auto-starts it on
 ComfyUI load, so you normally don't run anything by hand — see
-[Sidebar Panel](/panel). To run it yourself:
+[Sidebar Panel](./panel). To run it yourself:
 
 ```bash
 npx -y comfyui-mcp@latest connect
@@ -221,8 +221,8 @@ When `connect <url>` targets a **remote https** ComfyUI (e.g. a RunPod pod), the
 pod's HTTPS panel page can't open a plain `ws://127.0.0.1` socket to the bridge on
 your machine — browsers block it (mixed content / Private Network Access). The
 orchestrator automatically upgrades to a secure `wss://` tunnel so it works with
-no prompt, in any browser. See [Cloud deployment](/cloud-deployment) for the full
-walkthrough and [Self-hosted relay](/self-hosted-relay) for running your own
+no prompt, in any browser. See [Cloud deployment](./cloud-deployment) for the full
+walkthrough and [Self-hosted relay](./self-hosted-relay) for running your own
 tunnel infrastructure instead of the default cloudflared quick tunnel.
 
 <ParamField path="COMFYUI_MCP_INSECURE_BRIDGE" type="boolean" default="false">
@@ -234,7 +234,7 @@ tunnel infrastructure instead of the default cloudflared quick tunnel.
 <ParamField path="COMFYUI_MCP_TUNNEL_BACKEND" type="string" default="cloudflared">
   Which secure-bridge backend to use for a remote target: `cloudflared` (default
   — an ephemeral quick tunnel, zero setup) or `relay` (dial a
-  [self-hosted relay](/self-hosted-relay) you operate, for a stable domain and no
+  [self-hosted relay](./self-hosted-relay) you operate, for a stable domain and no
   third-party quick-tunnel dependency). Only takes effect when secure mode is
   active (remote https target, not `COMFYUI_MCP_INSECURE_BRIDGE`).
 </ParamField>

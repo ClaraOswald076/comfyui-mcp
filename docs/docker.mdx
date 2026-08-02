@@ -28,7 +28,7 @@ wherever your MCP client runs, reaching ComfyUI over plain HTTP via
   <Card title="Local npx + local ComfyUI" icon="laptop">
     The default. ComfyUI runs directly on your machine; the MCP client spawns
     `npx -y comfyui-mcp@latest`, which auto-detects the local install and its
-    port. No config needed. See [Installation](/installation).
+    port. No config needed. See [Installation](./installation).
   </Card>
   <Card title="Local npx + dockerized / remote ComfyUI" icon="docker">
     ComfyUI runs in a container (or on another host); the MCP client still
@@ -104,9 +104,9 @@ yours per its own docs; the example compose file has a commented sketch.
   `devices: [/dev/kfd, /dev/dri]`, `group_add: [video]`,
   `security_opt: [seccomp:unconfined]`.
 - `comfyui-mcp` itself has **no GPU/CUDA dependency** — ROCm hosts are fully
-  supported. The [Agent Panel](/panel) is a **ComfyUI extension**, not a
+  supported. The [Agent Panel](./panel) is a **ComfyUI extension**, not a
   service, and is optional when an external front end is your surface.
 - [`docker/runpod/`](https://github.com/artokun/comfyui-mcp/tree/main/docker/runpod)
   in this repo is a **CUDA-oriented RunPod cloud image** (see
-  [Cloud deployment](/cloud-deployment)), not a general-purpose ComfyUI image —
+  [Cloud deployment](./cloud-deployment)), not a general-purpose ComfyUI image —
   AMD users should not start there.

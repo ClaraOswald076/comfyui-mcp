@@ -13,7 +13,7 @@ build for your platform:
 </Note>
 
 The mobile app is a phone-native front end to the same agent that powers the
-[Sidebar Panel](/panel). It connects to the panel orchestrator's bridge, so
+[Sidebar Panel](./panel). It connects to the panel orchestrator's bridge, so
 everything the panel can do — generate images, run and inspect workflows, switch
 models — is available from your phone, with your desktop's ComfyUI doing the
 work.
@@ -23,8 +23,8 @@ work.
 The app talks to the agent host over the panel bridge, so you pair once and
 you're in:
 
-1. Install and run [comfyui-mcp](/quickstart) with the
-   [Agent Panel](/panel) on your desktop.
+1. Install and run [comfyui-mcp](./quickstart) with the
+   [Agent Panel](./panel) on your desktop.
 2. Open the panel in ComfyUI and show the **pairing QR**.
 3. In the mobile app, tap **Scan QR from panel** — or paste the bridge URL
    (`ws://…?token=…`) by hand.
@@ -35,8 +35,8 @@ host and token never leave your devices. The app also registers the
 
 <Note>
 Phone and desktop need a network path between them — the same LAN in the
-simple case, or a [secure relay](/self-hosted-relay) /
-[cloud deployment](/cloud-deployment) when the host isn't directly reachable.
+simple case, or a [secure relay](./self-hosted-relay) /
+[cloud deployment](./cloud-deployment) when the host isn't directly reachable.
 </Note>
 
 ## What's in the app
@@ -57,6 +57,6 @@ Beta feedback and bug reports are welcome on
 
 ## See also
 
-- [Sidebar Panel](/panel) — the in-ComfyUI agent the app pairs with
-- [Cloud deployment](/cloud-deployment) — drive a remote ComfyUI pod
-- [Self-hosted relay](/self-hosted-relay) — own the secure bridge path
+- [Sidebar Panel](./panel) — the in-ComfyUI agent the app pairs with
+- [Cloud deployment](./cloud-deployment) — drive a remote ComfyUI pod
+- [Self-hosted relay](./self-hosted-relay) — own the secure bridge path

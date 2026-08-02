@@ -19,14 +19,14 @@ actually afford. **WAN 2.2** refuses the trade. It's the Apache-2.0 model that
 brought a **Mixture-of-Experts** design to video diffusion — two 14B experts that
 hand off mid-denoise — and it runs **locally in ComfyUI**, no API key, no
 per-second cloud fee. This is the next entry in our model-highlight series after
-[Ideogram 4](/blog/ideogram-4-comfyui), and it earns its own spotlight: by most
+[Ideogram 4](./ideogram-4-comfyui), and it earns its own spotlight: by most
 open-weight measures, WAN 2.2 is the cinematic-motion king you can self-host today.
 
 Below: how the high-noise and low-noise experts actually work (the part everyone
 gets wrong), I2V vs T2V vs longer-video stitching, how it stacks up against
 LTX-2.3, the VRAM tiers from a 24 GB 4090 down to under 12 GB, and the fastest way
 to run it — a one-command install with
-[comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [sidebar Panel](/panel),
+[comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [sidebar Panel](../panel),
 instead of hand-downloading dozens of GB of GGUFs and wiring two samplers by hand.
 
 > **TL;DR — one-command setup.** Install comfyui-mcp, apply the
@@ -77,7 +77,7 @@ audio; WAN 2.2 wins cinematic motion and image-to-video fidelity**, and its MoE 
 FP8/GGUF path fits 16 GB cards where a dense model can't. ([WaveSpeed: LTX-2.3 vs WAN 2.2](https://wavespeed.ai/blog/posts/ltx-2-3-vs-wan-2-2-comparison-2026/), [Thunder Compute: WAN 2.2 in ComfyUI](https://www.thundercompute.com/blog/wan-2-2-comfyui-ai-video-model)) Treat the "18x faster" style figures as
 **vendor/blog benchmarks, not independently audited** — they vary wildly with
 resolution, steps, and hardware. Each rival gets its own post:
-[LTX-2.3](/blog/ltx-2.3-comfyui) and [WAN Animate](/blog/wan-animate-comfyui) are
+[LTX-2.3](./ltx-2.3-comfyui) and [WAN Animate](./wan-animate-comfyui) are
 elsewhere in the series.
 
 ## System & VRAM requirements
@@ -139,11 +139,11 @@ WAN2_2-ULTRA-MODELS-NODES_INSTALL.bat
 
 Then restart ComfyUI and load `packs/wan-longer-videos/workflow.json` (the first
 RIFE run auto-downloads `rife49.pth`). Because the pack ships with the
-[plugin](/plugin), your **own Claude session can drive the live graph through the
-[Panel](/panel)** — add/wire nodes, set the hi/lo split, swap LoRAs, and iterate on
+[plugin](../plugin), your **own Claude session can drive the live graph through the
+[Panel](../panel)** — add/wire nodes, set the hi/lo split, swap LoRAs, and iterate on
 prompts conversationally, with full Ctrl+Z undo and no extra API keys. Every model
 URL in the pack is CI-validated for reachability and size, so a link never quietly
-rots ([here's why that matters](/blog/installer-packs-that-cant-rot)).
+rots ([here's why that matters](./installer-packs-that-cant-rot)).
 
 ## How the high-noise and low-noise experts work
 
@@ -323,11 +323,11 @@ vendor/blog benchmarks, not independently audited.)
 
 ## Get it running in one command
 
-1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](/panel) — the panel auto-starts a background agent on your Claude subscription (no API keys; sign in with `claude` once).
+1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — the panel auto-starts a background agent on your Claude subscription (no API keys; sign in with `claude` once).
 2. Apply the **[`wan-longer-videos` pack](https://github.com/artokun/comfyui-mcp/tree/main/packs/wan-longer-videos)** — nodes + the four hi/lo GGUFs, encoder, VAE, LoRAs, and upscaler land in the right folders, validated. Pick your quant tier.
-3. Open the [Panel](/panel) and let the panel's agent set the hi/lo split, swap LoRAs, and stitch longer clips for you.
+3. Open the [Panel](../panel) and let the panel's agent set the hi/lo split, swap LoRAs, and stitch longer clips for you.
 
 That's the whole point of the project: expert ComfyUI setups that install in one
 step and drive themselves from your own agent session. **Next in the series:**
-[Qwen-Image & Qwen-Image-Edit](/blog/qwen-image-comfyui) — the local edit-anything
+[Qwen-Image & Qwen-Image-Edit](./qwen-image-comfyui) — the local edit-anything
 model, and the T2I base that powers WAN's refine combo.

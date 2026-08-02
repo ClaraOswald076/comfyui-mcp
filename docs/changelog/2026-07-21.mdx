@@ -26,17 +26,17 @@ a live card (GPU / VRAM / uptime / $·hr), and **idle auto-stop** shuts an idle 
 down for you — but only while you're actually rendering on it, so it never yanks a
 pod mid-session (`RUNPOD_IDLE_STOP_MINUTES`, default 15). RunPod serves ComfyUI on
 port 3000 by convention, and the connector targets 3000 for you.
-[The full walk-through](/blog/runpod-comfyui).
+[The full walk-through](../blog/runpod-comfyui).
 
 ## Train a LoRA on a rented GPU
 
-The [CLI LoRA trainer](/blog/lora-trainer-p1) gains a **dockerless native driver**
+The [CLI LoRA trainer](../blog/lora-trainer-p1) gains a **dockerless native driver**
 and an **SSH transport** that stands ai-toolkit up on a RunPod pod (#263): an
 idempotent bootstrap (clone@pin → venv → torch cu128 → requirements), a dataset
 rsynced up, live step/loss progress streamed back over ssh, and stop/liveness via
 pkill/pgrep — all behind the **same seven `train_*` tools and the same crash-safe
 job registry** as local training. FLUX.1-dev LoRA training no longer needs a
-24 GB card you own; borrow one for the hour the run takes. [The story](/blog/train-lora-runpod).
+24 GB card you own; borrow one for the hour the run takes. [The story](../blog/train-lora-runpod).
 
 ## Also new
 

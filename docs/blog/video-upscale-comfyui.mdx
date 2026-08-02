@@ -258,14 +258,14 @@ during the download.
 
 Cloning the SeedVR2 / FlashVSR / interpolation nodes and wiring a correct
 downscale → restore → interpolate → encode graph is exactly the busywork
-[comfyui-mcp](/) removes. From a Claude Code session with the plugin installed, ask
+[comfyui-mcp](../) removes. From a Claude Code session with the plugin installed, ask
 your agent to build the video-upscale pipeline — it installs the nodes
 (`ComfyUI-SeedVR2_VideoUpscaler`, `ComfyUI-Frame-Interpolation`,
 `ComfyUI-VideoHelperSuite`, optionally `ComfyUI-FlashVSR`), drops the right
 interpolation weights in place, and wires the graph in the correct order. SeedVR2 and
 FlashVSR weights auto-download on first run, so there's little to pre-fetch.
 
-Then drive the live graph from your own session via the [Panel](/panel) — downscale
+Then drive the live graph from your own session via the [Panel](../panel) — downscale
 factor, target resolution, batch size, and RIFE multiplier, tuned conversationally
 with no extra API keys.
 
