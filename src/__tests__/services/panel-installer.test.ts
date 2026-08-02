@@ -903,6 +903,23 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
     expect(h.gitPulls).toEqual([]);
   });
 
+  it("pull ran clean but post-pull HEAD revision is UNREADABLE → throws unverifiable, never 'at tip'", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: LEGACY_NOOP,
+      onGitPull: ({ revs }) => {
+        delete revs[dir]; // HEAD unreadable afterward — git metadata lost/corrupt
+        return "Updating d806619..675ace8\nFast-forward";
+      },
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).toMatch(/unreadable|UNVERIFIABLE/);
+    expect(String(err?.message ?? err)).not.toMatch(/already at the upstream tip/);
+  });
+
   it("legacy no-op + pull finds nothing newer → honest 'already at tip' (NOT 'updated', no restart)", async () => {
     const h = makeDeps({
       comfyuiPath: COMFY,

@@ -1522,6 +1522,20 @@ async function updateViaGitCheckoutFallback(opts: {
     );
   }
   assertNoPanelShadow("update", post.dir, deps);
+  // REVISION PROOF — after a pull, the checkout's HEAD must be READABLE. An
+  // unreadable rev is NOT "at tip": a pull that advanced HEAD without a
+  // version bump would otherwise fall through to "already up to date" with
+  // zero evidence either way (codex gate). Fail closed, never at-tip.
+  if (!post.gitRev) {
+    throw new PanelInstallError(
+      `Could not verify the panel update applied: git pull --ff-only ran clean ` +
+        `in ${dir}, but the checkout's HEAD revision is unreadable afterward, ` +
+        `so whether it moved (a nightly advance with no version bump) is ` +
+        `UNVERIFIABLE. NOT reporting success and NOT reporting "already at ` +
+        `tip" — check the panel repo (git log), then re-check ` +
+        `install_panel(action='status').`,
+    );
+  }
   const verdict = classifyPanelUpdate(
     {
       previousVersion,
