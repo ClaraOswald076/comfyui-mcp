@@ -237,6 +237,27 @@ describe("panel-tools: fresh /object_info ack timeout (#599)", () => {
   });
 });
 
+describe("panel-tools: panel_add_node frontend-only virtual types (#741)", () => {
+  // #741: Note/MarkdownNote/Reroute/PrimitiveNode are frontend-only virtual types —
+  // they exist only in LiteGraph, never in the backend /object_info. The MCP side
+  // must route them straight through to the panel (no class_type pre-validation),
+  // and the description must tell agents annotation is possible at all.
+  it("routes Note/MarkdownNote through to graph_add_node untouched", async () => {
+    for (const class_type of ["Note", "MarkdownNote", "Reroute", "PrimitiveNode"]) {
+      const { ctx, calls } = makeFakeCtx();
+      await defByName("panel_add_node").handler({ class_type, pos: [0, 0] }, ctx);
+      expect(calls[0]).toMatchObject({ cmd: "graph_add_node", class_type });
+    }
+  });
+
+  it("documents Note/MarkdownNote as the supported annotation path", () => {
+    const desc = defByName("panel_add_node").description;
+    expect(desc).toContain("Note");
+    expect(desc).toContain("MarkdownNote");
+    expect(desc).toMatch(/annotat/i);
+  });
+});
+
 describe("panel-tools: panel_refresh_nodes (#608 — force a combo/object_info refresh)", () => {
   it("forwards a bare refresh_nodes command (no graph mutation) with the refresh ack budget", async () => {
     const { ctx, calls, timeouts } = makeFakeCtx();
