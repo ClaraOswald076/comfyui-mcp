@@ -59,7 +59,10 @@ export function registerInstallPanelTools(server: McpServer): void {
             "(never errors). sync: bring the panel up to what this orchestrator " +
             "needs — no-ops when already current, WARNS ONLY when pinned, and " +
             "reports the version re-read from disk afterwards. install: add the " +
-            "panel (nightly). update: pull the latest nightly. reinstall: uninstall " +
+            "panel (nightly). update: pull the latest nightly — when ComfyUI-Manager " +
+            "provably no-ops the update (stale legacy 3.x) and the panel is a real " +
+            "git checkout, it is fast-forwarded directly via git pull --ff-only and " +
+            "verified on disk instead. reinstall: uninstall " +
             "+ reinstall (nightly). pin: hold the panel at a version (requires " +
             "`version`). unpin: clear the pin so a sync can proceed. " +
             "install/update/reinstall/sync refuse on a dev symlink or an active " +

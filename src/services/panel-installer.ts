@@ -4,7 +4,10 @@
 //
 // Policy (decided by the user):
 //   - on load → install if MISSING (install-if-missing only, see ensurePanelInstalled).
-//   - explicit `update` action → pull the latest nightly on demand.
+//   - explicit `update` action → pull the latest nightly on demand. When
+//     ComfyUI-Manager provably no-ops the update (stale legacy 3.x, #724) and
+//     the panel dir is a real git checkout, fall back to `git pull --ff-only`
+//     on the panel repo, verified on disk by the same #639 machinery.
 //   - target version is always "nightly" (the registry git-HEAD channel) — there
 //     is no clean semver to diff, so we never churn an existing install on load.
 //
@@ -17,6 +20,7 @@
 //   - install/update/reinstall queue via ComfyUI-Manager; ComfyUI must be
 //     RESTARTED to load the new/updated node (we never auto-restart).
 
+import { execFileSync } from "node:child_process";
 import {
   existsSync,
   lstatSync,
@@ -33,6 +37,7 @@ import {
   installCustomNode,
   updateCustomNode,
   reinstallCustomNode,
+  nonInteractiveGitEnv,
   type NodeOpResult,
 } from "./node-management.js";
 import { getSystemStats } from "../comfyui/client.js";
@@ -126,6 +131,17 @@ export interface PanelInstallerDeps {
    */
   gitRevision: (dir: string) => string | undefined;
   /**
+   * `git pull --ff-only` in the panel's own checkout — the #724 fallback used
+   * when ComfyUI-Manager provably no-op'd an update (the stale legacy-3.x
+   * signature) and the panel dir is a real git repo. Only ever called for a
+   * resolved git checkout (a registry zip has no .git, so it never reaches
+   * here; a dev symlink was already refused). Returns git's trimmed output for
+   * the diagnostic. THROWS on any failure (non-fast-forward, dirty tree, no
+   * upstream, network) — a throw means "could not update", never "nothing to
+   * pull"; only a clean exit proves the remote was checked.
+   */
+  gitPullFfOnly: (dir: string) => string;
+  /**
    * The user's explicit panel-version pin, if any. While a pin is in force NO
    * code path here may move the panel — install/update/reinstall refuse and the
    * on-load ensure skips. Never throws (an unreadable pin reports
@@ -214,6 +230,45 @@ export function resolveGitRevision(dir: string): string | undefined {
   }
 }
 
+/** Hard cap on the #724 fallback `git pull --ff-only` (a fetch + fast-forward). */
+const PANEL_GIT_PULL_TIMEOUT_MS = 180_000;
+
+/**
+ * `git pull --ff-only` in the panel's own checkout — the #724 fallback for
+ * hosts where ComfyUI-Manager provably no-ops updates (stale legacy 3.x). This
+ * is the exact manual workaround from the issue, automated behind the verified
+ * path. `--ff-only` can only fast-forward: it never merges, never rebases, and
+ * refuses rather than touch a dirty or diverged checkout, so it cannot clobber
+ * local state. Credentials never prompt (nonInteractiveGitEnv). Returns git's
+ * trimmed output. THROWS a PanelInstallError with git's stderr on any failure —
+ * a clean exit is the only signal that the remote was actually checked.
+ */
+export function gitPullFfOnly(dir: string): string {
+  try {
+    const out = execFileSync("git", ["pull", "--ff-only"], {
+      cwd: dir,
+      encoding: "utf-8",
+      timeout: PANEL_GIT_PULL_TIMEOUT_MS,
+      env: nonInteractiveGitEnv(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return (out ?? "").trim();
+  } catch (err) {
+    const e = err as {
+      stdout?: Buffer | string;
+      stderr?: Buffer | string;
+      message?: string;
+    };
+    const detail = [e.stdout, e.stderr]
+      .map((b) => (b == null ? "" : b.toString()))
+      .join("")
+      .trim();
+    throw new PanelInstallError(
+      `git pull --ff-only in ${dir} failed: ${detail || e.message || "unknown error"}`,
+    );
+  }
+}
+
 export const defaultDeps: PanelInstallerDeps = {
   isLocalMode: () => isLocalMode(),
   // Keep panel management aligned with get_environment, downloads, and
@@ -259,6 +314,7 @@ export const defaultDeps: PanelInstallerDeps = {
   readdir: (p) => readdirSync(p),
   readFile: (p) => readFileSync(p, "utf-8"),
   gitRevision: (dir) => resolveGitRevision(dir),
+  gitPullFfOnly: (dir) => gitPullFfOnly(dir),
   readPin: () => getPanelPinState(),
   isReachable: async () => {
     try {
@@ -1277,6 +1333,103 @@ function finalizeUpdate(
   );
 }
 
+/**
+ * The #724 fallback for the update path: ComfyUI-Manager provably no-op'd the
+ * update (the stale legacy-3.x signature), but the panel dir is a REAL git
+ * checkout — so update it without the Manager, exactly like the manual
+ * workaround from the issue (`git pull --ff-only` in the panel repo), then run
+ * the SAME #639 verification over the result (fresh on-disk re-read, #641
+ * shadow scan, proven movement) rather than trusting git's output text.
+ *
+ * Success still REQUIRES proven movement on disk. The one new honest outcome
+ * is "already current": a clean `git pull --ff-only` fetched the remote and
+ * found HEAD not behind — proof of currency the Manager queue counts could
+ * never give — so that reports "already up to date" (NOT "updated"; nothing
+ * changed, no restart needed). A failed pull throws with BOTH diagnostics; it
+ * never reads as "nothing to pull".
+ */
+async function updateViaGitCheckoutFallback(opts: {
+  deps: PanelInstallerDeps;
+  dir: string;
+  previousVersion?: string;
+  previousRev?: string;
+  result: NodeOpResult;
+}): Promise<PanelActionResult> {
+  const { deps, dir, previousVersion, previousRev, result } = opts;
+
+  let gitOutput: string;
+  try {
+    gitOutput = deps.gitPullFfOnly(dir);
+  } catch (err) {
+    // The Manager no-op'd AND the direct pull failed — name both, truthfully.
+    throw new PanelInstallError(
+      `Panel update did NOT apply: nothing changed on disk at ${dir} (installed ` +
+        `version still ${previousVersion ?? "unknown"}). ComfyUI-Manager never ` +
+        `enqueued the update (the stale legacy 3.x silent no-op, #639/#724), and ` +
+        `the direct git fallback on the panel repo failed too — ` +
+        `${err instanceof Error ? err.message : String(err)}. ` +
+        `Fix: update ComfyUI-Manager on the host (git pull in custom_nodes/` +
+        `ComfyUI-Manager, or pip install -U comfyui_manager) and retry, or update ` +
+        `the panel repo manually (git pull in ${dir}), then RESTART ComfyUI.`,
+    );
+  }
+
+  // The pull ran clean — VERIFY with the same machinery (#639/#641): re-read
+  // the installed identity FRESH from disk, fail closed on a shadow, require
+  // proven movement. Never infer success from git's output.
+  const post = await detectPanelInstall(deps);
+  assertNoPanelShadow("update", post.dir, deps);
+  if (!post.installed || !post.version) {
+    throw new PanelInstallError(
+      `Could not verify the panel update applied: the pack is ${
+        post.installed ? "present but its version is unreadable" : "not present"
+      } at ${dir} after git pull --ff-only succeeded. NOT reporting success. ` +
+        `Re-check the pack and retry, then RESTART ComfyUI.`,
+    );
+  }
+  const verdict = classifyPanelUpdate(
+    {
+      previousVersion,
+      installedVersion: post.version,
+      previousRev,
+      installedRev: post.gitRev,
+    },
+    result.details,
+  );
+  if (verdict.outcome === "updated") {
+    const from = verdict.previousVersion ?? verdict.previousRev?.slice(0, 8) ?? "?";
+    const to = verdict.installedVersion ?? verdict.installedRev?.slice(0, 8) ?? "?";
+    return {
+      action: "update",
+      result,
+      restartRequired: true,
+      message:
+        `Panel updated (${from} → ${to}) via git pull --ff-only on the panel repo ` +
+        `(${dir}), verified on disk: ComfyUI-Manager no-op'd the update (stale ` +
+        `legacy 3.x, #724), so the update was applied directly from git. RESTART ` +
+        `ComfyUI to load the updated panel node.`,
+      previousVersion,
+      installedVersion: post.version,
+    };
+  }
+
+  // Nothing moved even though git pull exited clean: git FETCHED the remote and
+  // found HEAD already at its tip. That is genuine proof of currency — report
+  // "already up to date" honestly (NOT "updated"; nothing changed, no restart).
+  return {
+    action: "update",
+    result,
+    restartRequired: false,
+    message:
+      `Panel is already at the upstream tip (${post.version}) — ComfyUI-Manager ` +
+      `no-op'd the update (stale legacy 3.x, #724), but a direct git pull ` +
+      `--ff-only on ${dir} verified the checkout is current (git: ` +
+      `${gitOutput || "no output"}). Nothing changed on disk; no restart needed.`,
+    previousVersion,
+    installedVersion: post.version,
+  };
+}
+
 export interface PanelActionOptions {
   /**
    * Target version for install/reinstall, defaulting to the `nightly` channel.
@@ -1383,6 +1536,21 @@ export async function runPanelActionInner(
       },
       result.details,
     );
+    // #724 — the Manager PROVABLY no-op'd (the stale legacy-3.x signature), and
+    // the panel dir is a real git checkout (a pre-op HEAD resolved; a registry
+    // zip has no .git, and a dev symlink was refused above). The verified
+    // Manager path is a dead end on that host tier, so fall back to
+    // `git pull --ff-only` on the panel repo and verify THAT the same way
+    // instead of only surfacing the error.
+    if (verdict.outcome === "no-op" && previousRev && post.dir) {
+      return updateViaGitCheckoutFallback({
+        deps,
+        dir: post.dir,
+        previousVersion,
+        previousRev,
+        result,
+      });
+    }
     return finalizeUpdate(verdict, post, result);
   }
 
