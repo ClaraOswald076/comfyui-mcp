@@ -15,8 +15,15 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { readOAuthStatus } from "../services/code-provider-auth.js";
 import { resolveAgyBin } from "./antigravity-backend.js";
+import { resolvePiBin } from "./pi-backend.js";
+// pi's credential detection is large enough (pi's whole env map + auth.json /
+// models.json / Vertex-ADC parsing) to live in its own module; re-exported below
+// so existing importers of `piCredentialPresent` are unaffected.
+import { piCredentialPresent } from "./pi-credentials.js";
 import type { OAuthStatusRecord } from "../services/panel-secrets.js";
 import { simpleKeyProvider } from "../services/openai-provider-registry.js";
+
+export { piCredentialPresent } from "./pi-credentials.js";
 
 export type BackendReadiness = {
   backend: string;
@@ -39,6 +46,7 @@ const CLI_NAMES: Record<string, string[]> = {
   codex: ["codex", "codex.cmd", "codex.exe"],
   gemini: ["gemini", "gemini.cmd", "gemini.exe"],
   grok: ["grok", "grok.cmd", "grok.exe"],
+  pi: ["pi", "pi.exe"], // no .cmd — Node can't shell-lessly spawn it (see resolvePiBin)
   ollama: ["ollama", "ollama.exe"],
   lmstudio: ["lms", "lms.exe"],
   llamacpp: ["llama-server", "llama-server.exe"],
@@ -245,6 +253,28 @@ export function backendReadiness(
     // installers' well-known locations (%LOCALAPPDATA%\agy\bin, ~/.local/bin).
     const cli = !!resolveAgyBin(home);
     return { backend: "antigravity", cli, auth: cli ? null : false, ready: cli };
+  }
+  if (b === "pi") {
+    // pi.dev CLI (`pi`, issue #491) — a multi-provider coding agent. Auth lives
+    // in ~/.pi/agent/auth.json (API keys + `/login` subscriptions) or provider
+    // env vars. UNLIKE agy, `pi --list-models` is NOT an auth probe (it prints
+    // the built-in catalog with no key), so readiness must NOT key off the CLI
+    // alone — that would greet a keyless pi green-ready and then fail its first
+    // turn (issue #491 codex P1a). We report ready ONLY when a WELL-FORMED,
+    // PRESENT credential is verifiable — see pi-credentials.ts, which mirrors
+    // pi's own resolution (its full provider env map minus the keys our spawn
+    // env strips, a parsed auth.json record that actually carries a key/token, a
+    // JSONC models.json provider with its own apiKey/oauth, or Google Vertex ADC
+    // with an existing credentials file plus project+location). When the CLI is
+    // present but no credential is verifiable, auth is UNKNOWN (null) and ready
+    // is FALSE — the panel then shows "configure a provider", not green.
+    // Residual (accepted, and the UI wording must not over-promise): a present
+    // but revoked/quota-exhausted key is indistinguishable from a good one here
+    // and still fails on the first turn.
+    const cli = !!resolvePiBin(home);
+    const authKnown = piCredentialPresent(home);
+    const auth = authKnown ? true : cli ? null : false;
+    return { backend: "pi", cli, auth, ready: cli && authKnown };
   }
   if (b === "grok") {
     const cli = onPath(CLI_NAMES.grok);
