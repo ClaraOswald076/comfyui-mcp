@@ -14,6 +14,7 @@ import { dirname, join } from "node:path";
 import {
   activePanelPendingOps,
   assertPanelPinAllows,
+  clearPanelPendingOp,
   PanelPinnedError,
   panelLockPath,
   panelPendingOpsPath,
@@ -348,5 +349,58 @@ describe("assertPanelNotTargetedUnverifiable — paths that cannot verify", () =
     expect(() =>
       assertPanelNotTargetedUnverifiable("panel_install_node", undefined),
     ).not.toThrow();
+  });
+});
+
+describe("pending-op markers — record, read, and clear (#689)", () => {
+  it("round-trips the optional base/uiId capture fields", () => {
+    const op = recordPanelPendingOp("update-all", "test marker", 60_000, {
+      base: "http://orig:8188",
+      uiId: "ui-123",
+    });
+    const active = activePanelPendingOps();
+    expect(active).toHaveLength(1);
+    expect(active[0].base).toBe("http://orig:8188");
+    expect(active[0].uiId).toBe("ui-123");
+    expect(active[0].queuedAt).toBe(op.queuedAt);
+  });
+
+  it("markers without the optional fields still read fine (older shape)", () => {
+    recordPanelPendingOp("update-all", "bare marker", 60_000);
+    const active = activePanelPendingOps();
+    expect(active).toHaveLength(1);
+    expect(active[0].base).toBeUndefined();
+    expect(active[0].uiId).toBeUndefined();
+  });
+
+  it("clearPanelPendingOp removes ONLY the exact record handed in", () => {
+    const first = recordPanelPendingOp("update-all", "first", 60_000);
+    // A newer marker of the same kind REPLACES the old one on record...
+    const second = recordPanelPendingOp("update-all", "second", 60_000);
+    expect(activePanelPendingOps().map((o) => o.detail)).toEqual(["second"]);
+
+    // ...so clearing the STALE one is a no-op that must not touch the new one.
+    expect(clearPanelPendingOp(first)).toBe(true);
+    expect(activePanelPendingOps().map((o) => o.detail)).toEqual(["second"]);
+
+    // Clearing the live one removes exactly it.
+    expect(clearPanelPendingOp(second)).toBe(true);
+    expect(activePanelPendingOps()).toEqual([]);
+  });
+
+  it("clearPanelPendingOp leaves other kinds alone", () => {
+    const update = recordPanelPendingOp("update-all", "u", 60_000);
+    recordPanelPendingOp("snapshot-restore", "s", 60_000);
+    expect(clearPanelPendingOp(update)).toBe(true);
+    expect(activePanelPendingOps().map((o) => o.kind)).toEqual(["snapshot-restore"]);
+  });
+
+  it("clearPanelPendingOp fails CLOSED on an unreadable marker file", () => {
+    const op = recordPanelPendingOp("update-all", "u", 60_000);
+    writeFileSync(panelPendingOpsPath(), "{ not json"); // corrupt it afterwards
+    expect(clearPanelPendingOp(op)).toBe(false);
+    // ...and the unreadable record still reads as a (synthetic) pending op.
+    expect(activePanelPendingOps()).toHaveLength(1);
+    expect(activePanelPendingOps()[0].kind).toBe("unknown");
   });
 });

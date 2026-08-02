@@ -452,13 +452,17 @@ export function withPanelPinGuard<T>(
 // lock cannot be held across that window (it would wedge pinning for minutes
 // to days), and no completion/apply path exists IN THIS PROCESS to re-check a
 // pin at — the Manager, not us, is the applying agent, which is exactly why
-// the window exists. What this process CAN keep truthful is the next pin
-// write: a pin set while one of these is pending must not leave the user
-// believing the panel cannot move. So each op records a marker here (with an
-// expiry), and the pin-write path warns while one is active. The lock-held
-// variants — update_custom_node(id="all"), which waits for the drain inside
-// the lock, and every install_panel mutation — need no marker: no pin can be
-// written inside their window at all.
+// the window exists. So each op records a marker here (with an expiry), and
+// the pin-write path reads it inside the pin's critical section.
+//
+// A pin written while a marker is active does NOT just warn (#689): it
+// attempts to CANCEL the pending work first (reset the Manager task queue /
+// delete the deferred-restore file), clears the marker only for what was
+// PROVABLY cancelled or proven no longer pending, and keeps the warning for
+// the residue — in-flight work, remote hosts, anything unverifiable. The
+// lock-held variants — update_custom_node(id="all"), which waits for the
+// drain inside the lock, and every install_panel mutation — need no marker:
+// no pin can be written inside their window at all.
 // ---------------------------------------------------------------------------
 
 export interface PanelPendingOp {
@@ -472,6 +476,16 @@ export interface PanelPendingOp {
   expiresAt: string;
   /** Human-facing explanation for the pin-write warning. */
   detail: string;
+  /** The ComfyUI base URL the op was handed to, captured at enqueue time. A
+   *  pin-write cancellation must target the ORIGINAL server even if the
+   *  orchestrator has since been retargeted; when absent (older markers) the
+   *  cancel falls back to the current target and says so in its report. */
+  base?: string;
+  /** update-all only: the ui_id of the enqueue attempt that actually landed
+   *  (v4 derives each per-pack task id as `${uiId}_${pack}`), so a v4 host can
+   *  later answer "did the panel's task already run" via
+   *  /v2/manager/queue/history?ui_id=…. */
+  uiId?: string;
 }
 
 /** update_all drains in minutes on the Manager's worker; an hour is far beyond
@@ -498,7 +512,9 @@ function isPanelPendingOp(value: unknown): value is PanelPendingOp {
     typeof op.kind === "string" &&
     typeof op.queuedAt === "string" &&
     typeof op.expiresAt === "string" &&
-    typeof op.detail === "string"
+    typeof op.detail === "string" &&
+    (op.base === undefined || typeof op.base === "string") &&
+    (op.uiId === undefined || typeof op.uiId === "string")
   );
 }
 
@@ -550,6 +566,7 @@ export function recordPanelPendingOp(
   kind: "update-all" | "snapshot-restore",
   detail: string,
   ttlMs: number,
+  extra: { base?: string; uiId?: string } = {},
 ): PanelPendingOp {
   const now = Date.now();
   const op: PanelPendingOp = {
@@ -557,6 +574,8 @@ export function recordPanelPendingOp(
     queuedAt: new Date(now).toISOString(),
     expiresAt: new Date(now + ttlMs).toISOString(),
     detail,
+    ...(extra.base ? { base: extra.base } : {}),
+    ...(extra.uiId ? { uiId: extra.uiId } : {}),
   };
   try {
     const path = panelPendingOpsPath();
@@ -577,7 +596,9 @@ export function recordPanelPendingOp(
           candidate.kind === op.kind &&
           candidate.queuedAt === op.queuedAt &&
           candidate.expiresAt === op.expiresAt &&
-          candidate.detail === op.detail,
+          candidate.detail === op.detail &&
+          candidate.base === op.base &&
+          candidate.uiId === op.uiId,
       )
     ) {
       throw new Error("pending-operation record did not survive a read-back verification");
@@ -590,6 +611,45 @@ export function recordPanelPendingOp(
     );
   }
   return op;
+}
+
+/**
+ * Remove a pending-op marker — ONLY the exact record handed in (matched by
+ * kind + queuedAt), so a NEWER marker of the same kind recorded after it is
+ * never silently dropped.
+ *
+ * Call this only for an op that was PROVABLY dealt with by the pin-write
+ * cancellation path (#689): cancelled before it could run, or proven to be no
+ * longer pending. Clearing anything else would let a later pin write report
+ * clean protection while queued work is still out there.
+ *
+ * Read-back verified like recordPanelPendingOp, and fails CLOSED: any read or
+ * write failure returns false and leaves the marker (and its warning) in
+ * place. Returns true when the exact record is gone afterwards — including
+ * when it was already absent (that is the goal state, not a success claim
+ * about work this call did).
+ */
+export function clearPanelPendingOp(op: PanelPendingOp): boolean {
+  const matches = (candidate: PanelPendingOp): boolean =>
+    candidate.kind === op.kind && candidate.queuedAt === op.queuedAt;
+  try {
+    const path = panelPendingOpsPath();
+    const prior = readPanelPendingOpsFile();
+    if (prior.unreadable) return false;
+    if (!prior.ops.some(matches)) return true; // already gone
+    const kept = prior.ops.filter((candidate) => !matches(candidate));
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify({ ops: kept }, null, 2), "utf-8");
+    const confirmed = readPanelPendingOpsFile();
+    return !confirmed.unreadable && !confirmed.ops.some(matches);
+  } catch (err) {
+    logger.warn(
+      `[panel] could not clear the pending ${op.kind} marker: ${
+        err instanceof Error ? err.message : String(err)
+      } — leaving it (and its warning) in place.`,
+    );
+    return false;
+  }
 }
 
 /**

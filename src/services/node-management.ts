@@ -639,6 +639,64 @@ export function setQueueTimingForTests(
   Object.assign(queueTiming, overrides);
 }
 
+/** Queue counts for honest before/after reporting around a queue reset. */
+export interface ManagerQueueCounts {
+  /** Tasks still WAITING to run — v4's `pending_count` directly, else the 3.x
+   *  arithmetic total−done−in_progress (3.x defines total that way exactly). */
+  pending: number;
+  /** Tasks already dequeued by the worker — these a queue reset CANNOT stop. */
+  inProgress: number;
+  /** Manager's worker-alive flag (falls back to inProgress > 0 when absent). */
+  processing: boolean;
+}
+
+/**
+ * Read the Manager queue counts ONCE, in the detected dialect — the measuring
+ * stick for the pin-write cancellation path (#689), which must report what a
+ * queue reset actually dropped rather than claim the panel was saved.
+ *
+ * Returns undefined whenever the state cannot be PROVEN: detection failed,
+ * the status endpoint did not answer with queue counts, required fields are
+ * missing, or the counts are incoherent (negative pending — the #639 stale-3.x
+ * signature). The caller reports "could not verify" and keeps the pending-op
+ * marker rather than guessing in either direction.
+ */
+export async function fetchManagerQueueCounts(
+  base = managerBaseUrl(),
+): Promise<ManagerQueueCounts | undefined> {
+  let api: ManagerApi;
+  try {
+    api = await detectManagerApi(base);
+  } catch {
+    return undefined;
+  }
+  const status = await managerFetch<QueueStatus>(`${managerQueuePrefixFor(api)}/status`, {
+    base,
+    soft: true,
+  });
+  if (!status || typeof status !== "object") return undefined;
+  const inProgress =
+    typeof status.in_progress_count === "number" ? status.in_progress_count : undefined;
+  if (inProgress === undefined) return undefined;
+  let pending: number;
+  if (typeof status.pending_count === "number") {
+    pending = status.pending_count; // v4 reports it directly
+  } else {
+    // 3.x: total_count = done + in_progress + queued exactly.
+    if (typeof status.total_count !== "number" || typeof status.done_count !== "number") {
+      return undefined;
+    }
+    pending = status.total_count - status.done_count - inProgress;
+    if (pending < 0) return undefined; // incoherent counts — cannot verify anything
+  }
+  return {
+    pending,
+    inProgress,
+    processing:
+      typeof status.is_processing === "boolean" ? status.is_processing : inProgress > 0,
+  };
+}
+
 /**
  * Kick off the Manager queue worker and poll until it drains.
  * Returns the final queue status.
@@ -1904,39 +1962,45 @@ async function updateManagerSelf(id: string): Promise<NodeOpResult> {
  * never re-sent, so update_all can never run twice (#656).
  *
  * Returns the dialect the enqueue ACTUALLY spoke (so the caller starts/polls
- * the queue holding the task) and the route's raw response body.
+ * the queue holding the task), the route's raw response body, and the ui_id
+ * of the attempt that LANDED (a self-heal retry mints a fresh one — only the
+ * last one's tasks exist, so only it correlates with v4 queue history, #689).
  */
 async function enqueueUpdateAll(
   mode: string,
   base: string,
-): Promise<{ used: ManagerApi; response: unknown }> {
+): Promise<{ used: ManagerApi; response: unknown; uiId: string }> {
   let response: unknown;
+  let uiId = "";
   const used = await enqueueWithDialectSelfHeal("update-all", async (api) => {
     // The v4 backend reads UpdateAllQueryParams from the QUERY STRING
     // (manager_server.py), NOT the JSON body — a body-only request leaves mode
     // defaulting to 'remote' and drops client_id/ui_id. Send them as URL query
     // params. A fresh ui_id per attempt keeps the two attempts distinguishable.
-    const uiId = randomUUID();
+    const attemptUiId = randomUUID();
     if (api === "legacy") {
       // 3.x reads {mode} from the JSON BODY (and ignores client_id/ui_id).
       response = await managerFetch("/manager/queue/update_all", {
         method: "POST",
-        body: { mode, ui_id: uiId },
+        body: { mode, ui_id: attemptUiId },
         base,
       });
     } else {
       const query = new URLSearchParams({
         mode,
         client_id: MANAGER_CLIENT_ID,
-        ui_id: uiId,
+        ui_id: attemptUiId,
       }).toString();
       response = await managerFetch(`/v2/manager/queue/update_all?${query}`, {
         method: "POST",
         base,
       });
     }
+    // Only reached when the enqueue did NOT throw — this attempt's id is the
+    // one whose tasks are actually on the queue.
+    uiId = attemptUiId;
   }, base);
-  return { used, response };
+  return { used, response, uiId };
 }
 
 export async function updateCustomNode(opts: UpdateOptions): Promise<NodeOpResult> {
@@ -2006,6 +2070,12 @@ export interface QueueUpdateAllResult {
   queueStarted: boolean;
   /** Raw update_all response body, when the route produced one. */
   managerResponse?: unknown;
+  /** The ComfyUI base the enqueue actually targeted (captured at invocation,
+   *  so a later cancel can aim at the same server — #689). */
+  base: string;
+  /** The ui_id of the enqueue attempt that landed; v4 derives each per-pack
+   *  task id as `${uiId}_${pack}`, so this correlates with queue history. */
+  uiId: string;
 }
 
 /**
@@ -2025,7 +2095,7 @@ export async function queueUpdateAllCustomNodes(): Promise<QueueUpdateAllResult>
   // self-heal retry, and the queue start all stay on the instance selected at
   // invocation, even if the panel retargets mid-call.
   const base = managerBaseUrl();
-  const { used, response } = await enqueueUpdateAll("remote", base);
+  const { used, response, uiId } = await enqueueUpdateAll("remote", base);
   const prefix = managerQueuePrefixFor(used);
   let queueStarted = true;
   try {
@@ -2038,7 +2108,13 @@ export async function queueUpdateAllCustomNodes(): Promise<QueueUpdateAllResult>
       error: err instanceof Error ? err.message : String(err),
     });
   }
-  return { endpoint: `${prefix}/update_all`, queueStarted, managerResponse: response };
+  return {
+    endpoint: `${prefix}/update_all`,
+    queueStarted,
+    managerResponse: response,
+    base,
+    uiId,
+  };
 }
 
 // ---------------------------------------------------------------------------

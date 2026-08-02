@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { platform } from "node:os";
-import { config } from "../config.js";
+import { config, getComfyUIBaseUrl } from "../config.js";
 import { resolveInstallInterpreter } from "./workspace-env.js";
 import { queueUpdateAllCustomNodes } from "./node-management.js";
 import { ProcessControlError } from "../utils/errors.js";
@@ -224,14 +224,38 @@ export async function updateAllCustomNodes(): Promise<UpdateNodesResult> {
     // protection it cannot provide. If the request itself fails, retain this
     // conservative marker: a transport failure cannot prove Manager did not
     // accept the request.
-    recordPanelPendingOp(
-      "update-all",
+    //
+    // The marker carries the base URL it is about to be queued on, so the
+    // pin-write cancellation path (#689) can aim its queue reset at the
+    // ORIGINAL server even after a retarget.
+    const detail =
       `an update_all request may have been handed to ComfyUI-Manager and can update EVERY ` +
-        `installed pack — the sidebar panel included — on the Manager's own schedule ` +
-        `(usually seconds to minutes; a ComfyUI restart then loads the result)`,
-      UPDATE_ALL_PENDING_MS,
-    );
+      `installed pack — the sidebar panel included — on the Manager's own schedule ` +
+      `(usually seconds to minutes; a ComfyUI restart then loads the result)`;
+    recordPanelPendingOp("update-all", detail, UPDATE_ALL_PENDING_MS, {
+      base: getComfyUIBaseUrl(),
+    });
     const result = await queueUpdateAllCustomNodes();
+
+    // Enrich the marker with what the ENQUEUE actually used: the base it
+    // captured at invocation and the ui_id of the attempt that landed (a
+    // self-heal retry mints a fresh one). The ui_id lets a v4 host later
+    // answer "did the panel's task already run" via queue history. Best
+    // effort only — if the rewrite fails, the base-only marker above remains
+    // and cancellation still works; refusing now would punish a success.
+    try {
+      recordPanelPendingOp("update-all", detail, UPDATE_ALL_PENDING_MS, {
+        base: result.base,
+        uiId: result.uiId,
+      });
+    } catch (err) {
+      logger.warn(
+        `[panel] update_all is queued, but the pending-op marker could not be ` +
+          `enriched with its ui_id (the base-only marker remains): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+      );
+    }
 
     return {
       // Queue acceptance is not proof a generic/bulk Manager update moved the

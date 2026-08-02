@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { config, getComfyUIBaseUrl } from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
@@ -101,15 +101,26 @@ async function managerFetch(
 }
 
 /**
+ * Candidate ComfyUI-Manager FILES directories under a local install, newest
+ * layout first. Mirrors manager_migration.get_manager_path() (user/__manager
+ * when ComfyUI has the system-user API, user/default/ComfyUI-Manager
+ * otherwise) plus the legacy git-clone layout, which keeps everything inside
+ * the extension dir.
+ */
+function managerFilesDirCandidates(comfyuiPath: string): string[] {
+  return [
+    join(comfyuiPath, "user", "__manager"),
+    join(comfyuiPath, "user", "default", "ComfyUI-Manager"),
+    join(comfyuiPath, "custom_nodes", "ComfyUI-Manager"),
+  ];
+}
+
+/**
  * Candidate ComfyUI-Manager snapshot directories under a local install,
- * newest layout first. Mirrors manager_migration.get_manager_path().
+ * newest layout first.
  */
 function snapshotDirCandidates(comfyuiPath: string): string[] {
-  return [
-    join(comfyuiPath, "user", "__manager", "snapshots"),
-    join(comfyuiPath, "user", "default", "ComfyUI-Manager", "snapshots"),
-    join(comfyuiPath, "custom_nodes", "ComfyUI-Manager", "snapshots"),
-  ];
+  return managerFilesDirCandidates(comfyuiPath).map((dir) => join(dir, "snapshots"));
 }
 
 /**
@@ -320,13 +331,15 @@ export async function restoreNodeSnapshot(
     // next-restart apply; refusing when the marker cannot be made durable is the
     // only way to avoid reporting such a pin as protective. Keep the marker on a
     // request failure because a transport error cannot prove Manager did not
-    // receive it.
+    // receive it. The base is recorded so a later pin-write cancellation report
+    // can name the host the restore was scheduled on (#689).
     recordPanelPendingOp(
       "snapshot-restore",
       `a snapshot restore ("${target}") may have been requested and reverts EVERY pack to ` +
         `its snapshot commit — the sidebar panel included — at the next ComfyUI ` +
         `restart`,
       SNAPSHOT_RESTORE_PENDING_MS,
+      { base: managerBaseUrl() },
     );
 
     try {
@@ -352,6 +365,113 @@ export async function restoreNodeSnapshot(
         `custom-node changes on the next ComfyUI restart.`,
     };
   });
+}
+
+/**
+ * The deferred-restore file Manager's POST /snapshot/restore leaves behind:
+ * nothing happens at request time beyond copying the chosen snapshot to
+ * `<manager files>/startup-scripts/restore-snapshot.json`, and
+ * prestartup_script.py applies it at the next ComfyUI start only
+ * `if os.path.exists(...)`, then deletes it. Deleting the file before that
+ * restart is therefore a PROVABLE cancel, and its absence proves nothing is
+ * scheduled. (Verified against Comfy-Org/ComfyUI-Manager main AND the
+ * manager-v4 pip package — both use the same path.)
+ */
+const RESTORE_SNAPSHOT_FILE = join("startup-scripts", "restore-snapshot.json");
+
+export interface CancelSnapshotRestoreResult {
+  outcome:
+    | "cancelled" // the deferred-restore file was found and is now gone
+    | "not-scheduled" // no deferred-restore file exists anywhere — nothing to cancel
+    | "remote" // no local install path: the file lives on the ComfyUI host
+    | "failed"; // a delete was attempted and failed
+  /** The restore file(s) deleted (outcome "cancelled"). */
+  deletedPaths: string[];
+  /** Every location checked (local mode only). */
+  checkedPaths: string[];
+  /** Human-facing explanation for the pin-write report. */
+  detail: string;
+}
+
+/**
+ * Cancel a DEFERRED snapshot restore by deleting Manager's deferred-restore
+ * file before the next ComfyUI restart consumes it (#689).
+ *
+ * Local installs only: in remote mode the file lives on the ComfyUI host,
+ * which this process cannot reach — reported truthfully as "cannot cancel",
+ * never as a cancel. Every candidate Manager files dir is checked (a stale
+ * copy in a legacy layout is deleted too: Manager's prestartup reads exactly
+ * one of these, and leaving any of them in place risks the restore running).
+ */
+export function cancelPendingSnapshotRestore(): CancelSnapshotRestoreResult {
+  if (!config.comfyuiPath) {
+    return {
+      outcome: "remote",
+      deletedPaths: [],
+      checkedPaths: [],
+      detail:
+        "cannot cancel — remote host: the deferred restore file " +
+        "(<ComfyUI>/user/**/startup-scripts/restore-snapshot.json) lives on the " +
+        "ComfyUI host and this orchestrator has no local install path to delete " +
+        "it through. Delete it on the host BEFORE the next ComfyUI restart, or " +
+        "the restore will run.",
+    };
+  }
+  const checkedPaths = managerFilesDirCandidates(config.comfyuiPath).map((dir) =>
+    join(dir, RESTORE_SNAPSHOT_FILE),
+  );
+  const found = checkedPaths.filter((p) => existsSync(p));
+  if (found.length === 0) {
+    return {
+      outcome: "not-scheduled",
+      deletedPaths: [],
+      checkedPaths,
+      detail:
+        "no deferred restore file exists in any ComfyUI-Manager files dir, so " +
+        "there was NOTHING left to cancel — the restore already ran at a ComfyUI " +
+        "restart (or was never scheduled). The panel may ALREADY have been " +
+        "reverted to its snapshot commit — check install_panel(action='status').",
+    };
+  }
+  const deletedPaths: string[] = [];
+  for (const p of found) {
+    try {
+      rmSync(p, { force: true });
+    } catch (err) {
+      return {
+        outcome: "failed",
+        deletedPaths,
+        checkedPaths,
+        detail:
+          `could not delete the deferred restore file at ${p}: ${
+            err instanceof Error ? err.message : String(err)
+          }. The restore may still run at the next ComfyUI restart — delete that ` +
+          `file on the ComfyUI host manually.`,
+      };
+    }
+    // Verify gone rather than trusting the syscall — the whole point is proof.
+    if (!existsSync(p)) deletedPaths.push(p);
+  }
+  if (deletedPaths.length !== found.length) {
+    const surviving = found.filter((p) => !deletedPaths.includes(p));
+    return {
+      outcome: "failed",
+      deletedPaths,
+      checkedPaths,
+      detail:
+        `the deferred restore file still exists after deletion was attempted ` +
+        `(${surviving.join(", ")}). The restore may still run at the next ` +
+        `ComfyUI restart — delete it on the ComfyUI host manually.`,
+    };
+  }
+  return {
+    outcome: "cancelled",
+    deletedPaths,
+    checkedPaths,
+    detail:
+      `deleted the deferred restore file (${deletedPaths.join(", ")}) — the ` +
+      `snapshot restore will NOT run at the next ComfyUI restart.`,
+  };
 }
 
 /**
