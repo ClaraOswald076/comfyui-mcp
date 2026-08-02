@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { OllamaBackend, isOllamaModel, type McpToolClient } from "../../orchestrator/ollama-backend.js";
+import { OllamaBackend, comfyuiSpawnEnv, isOllamaModel, type McpToolClient } from "../../orchestrator/ollama-backend.js";
 import type { AgentEvent, NeutralTurn } from "../../orchestrator/agent-backend.js";
 
 // ---------------------------------------------------------------------------
@@ -596,5 +596,33 @@ describe("inline image delivery (per-model vision, graceful degradation)", () =>
     await collect(backend, turnsOf({ text: "hello" }));
     const user = chatRequests[0].messages.find((m) => m.role === "user") as { images?: string[] };
     expect(user.images).toBeUndefined();
+  });
+});
+
+describe("comfyuiSpawnEnv (#667)", () => {
+  // The ollama path spawns the headless comfyui MCP COMPACT by default (small
+  // local models choke on the full ~200-schema list), but an EXPLICIT user
+  // choice must win over that default — the pre-#667 force overwrote even an
+  // explicit COMFYUI_MCP_TOOL_MODE=full.
+  it("an explicit COMFYUI_MCP_TOOL_MODE=full in the user env survives the ollama path", () => {
+    const env = comfyuiSpawnEnv(undefined, { COMFYUI_MCP_TOOL_MODE: "full", PATH: "/bin" });
+    expect(env.COMFYUI_MCP_TOOL_MODE).toBe("full");
+    expect(env.PATH).toBe("/bin");
+  });
+
+  it("an explicit COMFYUI_MCP_TOOL_MODE=compact in the user env is honored (not just defaulted)", () => {
+    const env = comfyuiSpawnEnv(undefined, { COMFYUI_MCP_TOOL_MODE: "compact" });
+    expect(env.COMFYUI_MCP_TOOL_MODE).toBe("compact");
+  });
+
+  it("the spec's resolved lane mode wins over an unset user env (orchestrator → child channel)", () => {
+    const env = comfyuiSpawnEnv({ COMFYUI_MCP_TOOL_MODE: "full", CIVITAI_API_TOKEN: "tok" }, {});
+    expect(env.COMFYUI_MCP_TOOL_MODE).toBe("full");
+    expect(env.CIVITAI_API_TOKEN).toBe("tok");
+  });
+
+  it("unset env AND no spec mode gets the documented compact default", () => {
+    const env = comfyuiSpawnEnv(undefined, {});
+    expect(env.COMFYUI_MCP_TOOL_MODE).toBe("compact");
   });
 });

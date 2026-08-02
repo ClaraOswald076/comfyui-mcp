@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseCliArgs, validateConnectUrl } from "../../transport/cli.js";
+import { exportExplicitToolMode, parseCliArgs, validateConnectUrl } from "../../transport/cli.js";
 
 const base = ["node", "comfyui-mcp"];
 
@@ -7,7 +7,7 @@ describe("parseCliArgs", () => {
   it("defaults to stdio on 127.0.0.1:9100 with no args/env", () => {
     expect(parseCliArgs(base, {})).toEqual({
       transport: "stdio",
-      toolMode: "full",
+      toolMode: "compact",
       toolModeExplicit: false,
       host: "127.0.0.1",
       port: 9100,
@@ -31,33 +31,42 @@ describe("parseCliArgs", () => {
 
   it("supports --port value and --host value", () => {
     const o = parseCliArgs([...base, "--http", "--host", "0.0.0.0", "--port", "8080"], {});
-    expect(o).toEqual({ transport: "http", toolMode: "full", toolModeExplicit: false, host: "0.0.0.0", port: 8080, panelOrchestrator: false, token: undefined, tunnel: false, allowUnauthenticated: false, insecureBridge: false, setupAgent: undefined, setupDryRun: false });
+    expect(o).toEqual({ transport: "http", toolMode: "compact", toolModeExplicit: false, host: "0.0.0.0", port: 8080, panelOrchestrator: false, token: undefined, tunnel: false, allowUnauthenticated: false, insecureBridge: false, setupAgent: undefined, setupDryRun: false });
   });
 
   it("supports --flag=value form", () => {
     const o = parseCliArgs([...base, "--transport=http", "--port=3000", "--host=0.0.0.0"], {});
-    expect(o).toEqual({ transport: "http", toolMode: "full", toolModeExplicit: false, host: "0.0.0.0", port: 3000, panelOrchestrator: false, token: undefined, tunnel: false, allowUnauthenticated: false, insecureBridge: false, setupAgent: undefined, setupDryRun: false });
+    expect(o).toEqual({ transport: "http", toolMode: "compact", toolModeExplicit: false, host: "0.0.0.0", port: 3000, panelOrchestrator: false, token: undefined, tunnel: false, allowUnauthenticated: false, insecureBridge: false, setupAgent: undefined, setupDryRun: false });
   });
 
   it("reads env defaults", () => {
     const o = parseCliArgs(base, { MCP_TRANSPORT: "http", MCP_HOST: "0.0.0.0", MCP_PORT: "5000" });
-    expect(o).toEqual({ transport: "http", toolMode: "full", toolModeExplicit: false, host: "0.0.0.0", port: 5000, panelOrchestrator: false, token: undefined, tunnel: false, allowUnauthenticated: false, insecureBridge: false, setupAgent: undefined, setupDryRun: false });
+    expect(o).toEqual({ transport: "http", toolMode: "compact", toolModeExplicit: false, host: "0.0.0.0", port: 5000, panelOrchestrator: false, token: undefined, tunnel: false, allowUnauthenticated: false, insecureBridge: false, setupAgent: undefined, setupDryRun: false });
   });
 
-  it("--compact / --tool-mode / COMFYUI_MCP_TOOL_MODE select the compact tool mode", () => {
-    expect(parseCliArgs(base, {}).toolMode).toBe("full");
+  it("compact is the DEFAULT tool mode; --full / COMFYUI_MCP_TOOL_MODE=full opts out (#667)", () => {
+    expect(parseCliArgs(base, {}).toolMode).toBe("compact");
     expect(parseCliArgs([...base, "--compact"], {}).toolMode).toBe("compact");
     expect(parseCliArgs([...base, "--tool-mode", "compact"], {}).toolMode).toBe("compact");
     expect(parseCliArgs([...base, "--tool-mode=compact"], {}).toolMode).toBe("compact");
     expect(parseCliArgs(base, { COMFYUI_MCP_TOOL_MODE: "compact" }).toolMode).toBe("compact");
-    // explicit --tool-mode full / --full overrides the env opt-in
+    // the full surface is still available, explicitly
+    expect(parseCliArgs([...base, "--full"], {}).toolMode).toBe("full");
+    expect(parseCliArgs([...base, "--tool-mode", "full"], {}).toolMode).toBe("full");
+    expect(parseCliArgs(base, { COMFYUI_MCP_TOOL_MODE: "full" }).toolMode).toBe("full");
+    // explicit CLI wins over env, in both directions
     expect(
       parseCliArgs([...base, "--tool-mode", "full"], { COMFYUI_MCP_TOOL_MODE: "compact" }).toolMode,
     ).toBe("full");
     expect(parseCliArgs([...base, "--full"], { COMFYUI_MCP_TOOL_MODE: "compact" }).toolMode).toBe("full");
-    // unknown values fall back to full
-    expect(parseCliArgs([...base, "--tool-mode", "bogus"], {}).toolMode).toBe("full");
-    expect(parseCliArgs(base, { COMFYUI_MCP_TOOL_MODE: "bogus" }).toolMode).toBe("full");
+    expect(parseCliArgs([...base, "--compact"], { COMFYUI_MCP_TOOL_MODE: "full" }).toolMode).toBe("compact");
+    // unknown values fall back to the compact default
+    expect(parseCliArgs([...base, "--tool-mode", "bogus"], {}).toolMode).toBe("compact");
+    expect(parseCliArgs(base, { COMFYUI_MCP_TOOL_MODE: "bogus" }).toolMode).toBe("compact");
+    // either explicit env mode counts as an explicit choice (for `setup`)
+    expect(parseCliArgs(base, { COMFYUI_MCP_TOOL_MODE: "compact" }).toolModeExplicit).toBe(true);
+    expect(parseCliArgs(base, { COMFYUI_MCP_TOOL_MODE: "full" }).toolModeExplicit).toBe(true);
+    expect(parseCliArgs(base, { COMFYUI_MCP_TOOL_MODE: "bogus" }).toolModeExplicit).toBe(false);
   });
 
   it("`setup <agent>` captures the agent, --dry-run, --comfyui-url, and explicit tool mode", () => {
@@ -158,6 +167,33 @@ describe("parseCliArgs", () => {
   it("explicit flags override env values", () => {
     const o = parseCliArgs([...base, "--port", "7000"], { MCP_PORT: "5000" });
     expect(o.port).toBe(7000);
+  });
+});
+
+describe("exportExplicitToolMode (#667)", () => {
+  // The panel orchestrator's spawned MCP children read the tool mode from the
+  // ENV, so an explicit CLI choice must be exported before they spawn —
+  // otherwise `--full --panel-orchestrator` silently ran compact downstream.
+  it("exports an explicit --full so orchestrator children spawn the full surface", () => {
+    const cli = parseCliArgs([...base, "--full", "--panel-orchestrator"], {});
+    const env: NodeJS.ProcessEnv = {};
+    exportExplicitToolMode(cli, env);
+    expect(env.COMFYUI_MCP_TOOL_MODE).toBe("full");
+  });
+
+  it("exports an explicit --compact (and an explicit env mode survives parsing)", () => {
+    const env: NodeJS.ProcessEnv = {};
+    exportExplicitToolMode(parseCliArgs([...base, "--compact"], {}), env);
+    expect(env.COMFYUI_MCP_TOOL_MODE).toBe("compact");
+    const env2: NodeJS.ProcessEnv = {};
+    exportExplicitToolMode(parseCliArgs(base, { COMFYUI_MCP_TOOL_MODE: "full" }), env2);
+    expect(env2.COMFYUI_MCP_TOOL_MODE).toBe("full");
+  });
+
+  it("leaves the env UNSET when the mode was only defaulted (children apply their documented default)", () => {
+    const env: NodeJS.ProcessEnv = {};
+    exportExplicitToolMode(parseCliArgs(base, {}), env);
+    expect("COMFYUI_MCP_TOOL_MODE" in env).toBe(false);
   });
 });
 

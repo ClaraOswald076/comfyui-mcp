@@ -3,7 +3,8 @@
     "command": "npx",
     "args": [
       "-y",
-      "comfyui-mcp"
+      "comfyui-mcp",
+      "--full"
     ],
     "env": {
       "CIVITAI_API_TOKEN": ""

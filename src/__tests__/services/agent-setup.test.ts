@@ -69,10 +69,12 @@ describe("setupAgent", () => {
     const res = await setupAgent({ agent: "copilot", configPath });
     expect(res.compact).toBe(false);
     const parsed = JSON.parse(await fs.readFile(configPath, "utf8"));
+    // --full is pinned explicitly: bare `npx comfyui-mcp` means compact since
+    // #667, so an unpinned entry would silently flip modes on upgrade.
     expect(parsed.mcpServers.comfyui).toEqual({
       type: "stdio",
       command: "npx",
-      args: ["-y", "comfyui-mcp"],
+      args: ["-y", "comfyui-mcp", "--full"],
       env: {},
       tools: ["*"],
     });
@@ -83,6 +85,7 @@ describe("setupAgent", () => {
     expect(JSON.parse(copilot.content).mcpServers.comfyui.args).toContain("--compact");
     const hermes = await setupAgent({ agent: "hermes", configPath: join(dir, "h.yaml"), compact: false });
     expect(hermes.content).not.toContain("--compact");
+    expect(hermes.content).toContain("--full");
   });
 
   it("is idempotent: running twice leaves one comfyui entry", async () => {
@@ -91,7 +94,7 @@ describe("setupAgent", () => {
     await setupAgent({ agent: "openclaw", configPath, compact: false });
     const parsed = JSON.parse(await fs.readFile(configPath, "utf8"));
     expect(Object.keys(parsed.mcpServers)).toEqual(["comfyui"]);
-    expect(parsed.mcpServers.comfyui.args).toEqual(["-y", "comfyui-mcp"]);
+    expect(parsed.mcpServers.comfyui.args).toEqual(["-y", "comfyui-mcp", "--full"]);
   });
 
   it("dry run returns content without touching disk", async () => {

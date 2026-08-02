@@ -11,7 +11,7 @@ import { collectToolCatalog, registerFullTools } from "./tools/index.js";
 import { registerCompactTools } from "./tools/compact.js";
 import { logger } from "./utils/logger.js";
 import { JobWatcher } from "./services/job-watcher.js";
-import { parseCliArgs, validateConnectUrl, type ToolMode } from "./transport/cli.js";
+import { parseCliArgs, validateConnectUrl, exportExplicitToolMode, type ToolMode } from "./transport/cli.js";
 import { startHttpServer } from "./transport/http.js";
 import { isLocalMode } from "./config.js";
 import { ensurePanelInstalled } from "./services/panel-installer.js";
@@ -96,7 +96,7 @@ function selfUpdateOnLoad(): void {
     .catch(() => {});
 }
 
-async function createConfiguredServer(toolMode: ToolMode = "full"): Promise<McpServer> {
+async function createConfiguredServer(toolMode: ToolMode = "compact"): Promise<McpServer> {
   const server = new McpServer(
     {
       name: "comfyui-mcp",
@@ -118,20 +118,25 @@ async function createConfiguredServer(toolMode: ToolMode = "full"): Promise<McpS
     },
   );
   if (toolMode === "compact") {
-    // Compact tool mode for small/local LLMs (Hermes Agent, Ollama — issue #97):
-    // capture the whole tool surface into a catalog and expose only the
-    // list_tools/describe_tool/call_tool meta-tools, keeping the client's
-    // context cost near-zero until a tool is actually needed.
+    // Compact tool mode (DEFAULT since #667): capture the whole tool surface
+    // into a catalog and expose only the list_tools/describe_tool/call_tool
+    // meta-tools, keeping the client's context cost near-zero until a tool is
+    // actually needed. Built for small/local LLMs (Hermes Agent, Ollama —
+    // issue #97), but the right default for every harness that injects
+    // tools/list into context: the full surface is ~200KB (~50k tokens) per
+    // read. --full / COMFYUI_MCP_TOOL_MODE=full opts back into the classic
+    // direct surface below.
     const catalog = await collectToolCatalog();
     registerCompactTools(server, catalog);
     logger.info(
       `Compact tool mode: ${catalog.tools.size} tools available via list_tools/describe_tool/call_tool`,
     );
   } else {
-    // Full direct surface PLUS the compact facade (list_tools/describe_tool/
-    // call_tool) as a stable reconnect escape hatch — see registerFullTools and
-    // issue #616. One atomic registration pass, completed before the transport
-    // connects below. Opt out of the facade with COMFYUI_MCP_NO_FACADE=1.
+    // Full direct surface (opt-in via --full) PLUS the compact facade
+    // (list_tools/describe_tool/call_tool) as a stable reconnect escape hatch —
+    // see registerFullTools and issue #616. One atomic registration pass,
+    // completed before the transport connects below. Opt out of the facade
+    // with COMFYUI_MCP_NO_FACADE=1.
     await registerFullTools(server);
   }
 
@@ -289,6 +294,10 @@ async function main() {
     // the pod's HTTPS panel can reach the bridge (a plain ws:// from https is
     // browser-blocked); --insecure-bridge forces the plain loopback bridge.
     if (cli.insecureBridge) process.env.COMFYUI_MCP_INSECURE_BRIDGE = "1";
+    // #667: an explicit --full/--compact must reach the orchestrator's spawned
+    // MCP children, which read the mode from the ENV — the flag alone never
+    // made it downstream, silently running compact when full was requested.
+    exportExplicitToolMode(cli);
     if (cli.comfyuiUrl) {
       // Hard-fail on a bad `connect <url>` instead of silently falling back to the
       // local ComfyUI (which would make the banner below lie about what it drives).
