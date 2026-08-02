@@ -321,6 +321,11 @@ describe("panel-tools: panel_edit_node (#572 presentation consolidation)", () =>
     const color = def.schema.color as { safeParse: (v: unknown) => { success: boolean } };
     const size = def.schema.size as { safeParse: (v: unknown) => { success: boolean } };
     expect(color.safeParse("#abc").success).toBe(true);
+    expect(color.safeParse("#abcd").success).toBe(true);
+    expect(color.safeParse("#aabbcc").success).toBe(true);
+    expect(color.safeParse("#aabbccdd").success).toBe(true);
+    expect(color.safeParse("#12345").success).toBe(false);
+    expect(color.safeParse("#1234567").success).toBe(false);
     expect(color.safeParse("rgb(1,2,3)").success).toBe(false);
     expect(size.safeParse([120, 80]).success).toBe(true);
     expect(size.safeParse([0, 80]).success).toBe(false);
@@ -369,6 +374,22 @@ describe("panel-tools: panel_edit_node (#572 presentation consolidation)", () =>
     const { ctx, calls } = makeFakeCtx();
     await defByName(name).handler(args, ctx);
     expect(calls[0]).toMatchObject({ cmd: command, node_id: 7 });
+  });
+
+  it("applies the preset/color exclusion to the legacy color wrapper before dispatch", async () => {
+    const { ctx, calls } = makeFakeCtx();
+    const result = await defByName("panel_set_node_color").handler({ node_id: 7, preset: "red", color: "#112233" }, ctx);
+    expect(calls).toHaveLength(0);
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain("preset cannot be combined");
+  });
+
+  it("uses the documented exact color lengths on the legacy color schema too", () => {
+    const color = defByName("panel_set_node_color").schema.color as { safeParse: (v: unknown) => { success: boolean } };
+    expect(color.safeParse("#123456").success).toBe(true);
+    expect(color.safeParse("#12345678").success).toBe(true);
+    expect(color.safeParse("#12345").success).toBe(false);
+    expect(color.safeParse("#1234567").success).toBe(false);
   });
 });
 

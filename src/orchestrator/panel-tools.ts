@@ -2945,6 +2945,7 @@ export interface PanelToolDef {
 }
 
 const PANEL_EDIT_NODE_FIELDS = ["pos", "size", "title", "preset", "color", "bgcolor", "shape", "collapsed", "pinned", "mode"] as const;
+const NODE_COLOR_HEX = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
 
 /** Cross-field rules that a flat ZodRawShape cannot express. Keep these at the
  * MCP boundary as well as in the panel executor: malformed direct tool calls
@@ -2957,6 +2958,13 @@ function validatePanelEditNodeArgs(args: Record<string, unknown>): string | null
   if (!PANEL_EDIT_NODE_FIELDS.some((field) => args[field] !== undefined)) return "panel_edit_node requires at least one editable field.";
   if (args.preset !== undefined && (args.color !== undefined || args.bgcolor !== undefined)) {
     return "panel_edit_node preset cannot be combined with color or bgcolor.";
+  }
+  return null;
+}
+
+function validatePanelColorArgs(args: Record<string, unknown>): string | null {
+  if (args.preset !== undefined && (args.color !== undefined || args.bgcolor !== undefined)) {
+    return "panel_set_node_color preset cannot be combined with color or bgcolor.";
   }
   return null;
 }
@@ -3478,8 +3486,8 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         size: z.tuple([z.number().positive(), z.number().positive()]).optional().describe("New [width, height] in canvas px. Uses the node's setSize so DOM-widget nodes reflow and minimum sizes are honored."),
         title: z.string().optional().describe("New header title."),
         preset: z.enum(["red", "brown", "green", "blue", "pale_blue", "cyan", "purple", "yellow", "black"]).optional().describe("Named LiteGraph palette color (sets both title and body). Cannot be combined with color/bgcolor."),
-        color: z.string().regex(/^#[0-9a-fA-F]{3,8}$/).nullable().optional().describe("Title-bar color hex, or null to clear."),
-        bgcolor: z.string().regex(/^#[0-9a-fA-F]{3,8}$/).nullable().optional().describe("Body color hex, or null to clear."),
+        color: z.string().regex(NODE_COLOR_HEX).nullable().optional().describe("Title-bar color hex, or null to clear."),
+        bgcolor: z.string().regex(NODE_COLOR_HEX).nullable().optional().describe("Body color hex, or null to clear."),
         shape: z.enum(["default", "box", "round", "card"]).optional().describe("Node outline shape; default restores the theme default."),
         collapsed: z.boolean().optional().describe("true collapses to a title chip; false expands."),
         pinned: z.boolean().optional().describe("Whether LiteGraph marks this node pinned for presentation/layout."),
@@ -4708,10 +4716,14 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       {
         node_id: z.number().int(),
         preset: z.enum(["red", "brown", "green", "blue", "pale_blue", "cyan", "purple", "yellow", "black"]).optional(),
-        color: z.string().regex(/^#[0-9a-fA-F]{3,8}$/).nullable().optional(),
-        bgcolor: z.string().regex(/^#[0-9a-fA-F]{3,8}$/).nullable().optional(),
+        color: z.string().regex(NODE_COLOR_HEX).nullable().optional(),
+        bgcolor: z.string().regex(NODE_COLOR_HEX).nullable().optional(),
       },
-      async (args: A, ctx) => ctx.call({ cmd: "graph_set_node_color", node_id: args.node_id, preset: args.preset, color: args.color, bgcolor: args.bgcolor }),
+      async (args: A, ctx) => {
+        const error = validatePanelColorArgs(args);
+        if (error) return fail(error);
+        return ctx.call({ cmd: "graph_set_node_color", node_id: args.node_id, preset: args.preset, color: args.color, bgcolor: args.bgcolor });
+      },
     ),
     def(
       "panel_screenshot",
