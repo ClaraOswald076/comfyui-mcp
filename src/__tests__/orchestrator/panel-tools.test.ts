@@ -2902,6 +2902,105 @@ describe("panel_open_workflow: verify active state after ack-timeout (#215/#319/
     expect(res.content[0]?.type === "text" ? res.content[0].text : "").toMatch(/outcome is undetermined/i);
   });
 
+  it("recovers an exact receipt but never refreshes from a different same-basename active workflow (#716 P1)", async () => {
+    const requested = "workflows/a/foo.json";
+    const refresh = vi.fn(() => true);
+    const { ctx } = makeVerifyCtx({
+      openReply: () => timeoutResult(),
+      listReplies: [{
+        active_confirmed: true,
+        active: {
+          path: "workflows/b/foo.json",
+          routing_key: "wf:workflows/b/foo.json",
+          workflow_uuid: "22222222-2222-4222-8222-222222222222",
+        },
+        last_open: {
+          rid: "open-rid-1", answers_only_command_rid: "open-rid-1", cmd: "workflow_open",
+          requested,
+          resolved: { path: requested, filename: "foo.json", routing_key: "wf:workflows/a/foo.json" },
+          applied: true,
+        },
+      }],
+    });
+    (ctx.bridge as unknown as { refreshWorkflowUuid: typeof refresh }).refreshWorkflowUuid = refresh;
+
+    const res = await defByName("panel_open_workflow").handler({ path: requested }, ctx);
+    expect(res.isError).toBeFalsy(); // The RID-correlated receipt still proves the open happened.
+    expect(refresh).not.toHaveBeenCalled(); // But B's valid UUID must never stamp the next A command.
+  });
+
+  it("recovers a matching receipt but never refreshes from an active path/routing contradiction (#716 P1)", async () => {
+    const requested = "workflows/a/foo.json";
+    const refresh = vi.fn(() => true);
+    const { ctx } = makeVerifyCtx({
+      openReply: () => timeoutResult(),
+      listReplies: [{
+        active_confirmed: true,
+        active: {
+          path: requested,
+          routing_key: "wf:workflows/b/foo.json",
+          workflow_uuid: "22222222-2222-4222-8222-222222222222",
+        },
+        last_open: {
+          rid: "open-rid-1", answers_only_command_rid: "open-rid-1", cmd: "workflow_open",
+          requested,
+          resolved: { path: requested, filename: "foo.json", routing_key: "wf:workflows/a/foo.json" },
+          applied: true,
+        },
+      }],
+    });
+    (ctx.bridge as unknown as { refreshWorkflowUuid: typeof refresh }).refreshWorkflowUuid = refresh;
+    const res = await defByName("panel_open_workflow").handler({ path: requested }, ctx);
+    expect(res.isError).toBeFalsy();
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it("never refreshes a receipt recovery for a temporary routing token (#716 P1)", async () => {
+    const requested = "tmp:ephemeral-tab";
+    const refresh = vi.fn(() => true);
+    const { ctx } = makeVerifyCtx({
+      openReply: () => timeoutResult(),
+      listReplies: [{
+        active_confirmed: true,
+        active: { path: requested, routing_key: "wf:tmp:ephemeral-tab", workflow_uuid: "22222222-2222-4222-8222-222222222222" },
+        last_open: {
+          rid: "open-rid-1", answers_only_command_rid: "open-rid-1", cmd: "workflow_open",
+          requested,
+          resolved: { path: requested, routing_key: "wf:tmp:ephemeral-tab" },
+          applied: true,
+        },
+      }],
+    });
+    (ctx.bridge as unknown as { refreshWorkflowUuid: typeof refresh }).refreshWorkflowUuid = refresh;
+    const res = await defByName("panel_open_workflow").handler({ path: requested }, ctx);
+    expect(res.isError).toBeFalsy();
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it("recovers a receipt but never refreshes from a partial or replayed active list record (#716 P1)", async () => {
+    const requested = "workflows/a/foo.json";
+    for (const routing_key of [undefined, "wf:workflows/replayed.json", "not-a-routing-key"]) {
+      const refresh = vi.fn(() => true);
+      const { ctx } = makeVerifyCtx({
+        openReply: () => timeoutResult(),
+        listReplies: [{
+          active_confirmed: true,
+          active: { path: requested, routing_key, workflow_uuid: "22222222-2222-4222-8222-222222222222" },
+          last_open: {
+            rid: "open-rid-1", answers_only_command_rid: "open-rid-1", cmd: "workflow_open",
+            requested,
+            resolved: { path: requested, filename: "foo.json", routing_key: "wf:workflows/a/foo.json" },
+            applied: true,
+          },
+        }],
+      });
+      (ctx.bridge as unknown as { refreshWorkflowUuid: typeof refresh }).refreshWorkflowUuid = refresh;
+      const res = await defByName("panel_open_workflow").handler({ path: requested }, ctx);
+      expect(res.isError).toBeFalsy();
+      expect(refresh).not.toHaveBeenCalled();
+    }
+  });
+
   it("a genuine acked open-failure (missing file) still fails clearly, unverified", async () => {
     let listCalls = 0;
     const ctx = {
@@ -2963,14 +3062,15 @@ describe("panel_open_workflow: verify active state after ack-timeout (#215/#319/
     expect(listCalls).toBe(0);
   });
 
-  it("normal fast success returns verbatim without polling workflow_list", async () => {
+  it("normal fast success returns verbatim and re-reads active identity before refreshing", async () => {
+    const exactTarget = "workflows/my-workflow.json";
     let listCalls = 0;
     const ctx = {
       call: async (cmd: Record<string, unknown>) => {
         if (cmd.cmd === "workflow_open") {
           return {
             content: [
-              { type: "text", text: JSON.stringify({ opened: { path: TARGET }, modified: false }) },
+              { type: "text", text: JSON.stringify({ opened: { path: exactTarget }, routing_key: "wf:workflows/my-workflow.json", modified: false }) },
             ],
           };
         }
@@ -2981,13 +3081,374 @@ describe("panel_open_workflow: verify active state after ack-timeout (#215/#319/
       bridge: {} as unknown as PanelToolCtx["bridge"],
       tabId: "test-tab",
     } as PanelToolCtx;
-    const res = (await defByName("panel_open_workflow").handler({ path: TARGET }, ctx)) as {
+    const res = (await defByName("panel_open_workflow").handler({ path: exactTarget }, ctx)) as {
       content: Array<{ text: string }>;
       isError?: boolean;
     };
     expect(res.isError).toBeFalsy();
     expect(res.content[0].text).toContain("opened");
-    expect(listCalls).toBe(0);
+    expect(listCalls).toBe(1);
+  });
+});
+
+describe("#716 workflow UUID refresh after reconnect/open/re-pin", () => {
+  const OLD_UUID = "11111111-1111-4111-8111-111111111111";
+  const LIVE_UUID = "22222222-2222-4222-8222-222222222222";
+  const TARGET = "workflows/reconnected.json";
+
+  it("refreshes the next command stamp from a successful panel_open_workflow response", async () => {
+    const refresh = vi.fn(() => true);
+    const ctx: PanelToolCtx = {
+      call: async (cmd) => {
+        if (cmd.cmd === "workflow_list") {
+          return {
+            content: [{ type: "text", text: JSON.stringify({ active: { path: TARGET, routing_key: "wf:workflows/reconnected.json", workflow_uuid: LIVE_UUID } }) }],
+          };
+        }
+        expect(cmd).toMatchObject({ cmd: "workflow_open", path: TARGET });
+        return {
+          content: [{ type: "text", text: JSON.stringify({ opened: { path: TARGET }, routing_key: "wf:workflows/reconnected.json", workflow_uuid: LIVE_UUID }) }],
+        };
+      },
+      confirm: async () => "yes" as const,
+      bridge: { refreshWorkflowUuid: refresh } as unknown as PanelToolCtx["bridge"],
+      tabId: "reconnected-tab",
+    };
+
+    const res = await defByName("panel_open_workflow").handler({ path: TARGET }, ctx);
+    expect(res.isError).toBeFalsy();
+    expect(refresh).toHaveBeenCalledExactlyOnceWith("reconnected-tab", LIVE_UUID.toLowerCase());
+  });
+
+  it("does not refresh fast success from a partial or replayed active list record (#716 P1)", async () => {
+    for (const routing_key of [undefined, "wf:workflows/replayed.json", "not-a-routing-key"]) {
+      const refresh = vi.fn(() => true);
+      const ctx: PanelToolCtx = {
+        call: async (cmd) =>
+          cmd.cmd === "workflow_list"
+            ? { content: [{ type: "text", text: JSON.stringify({ active: { path: TARGET, routing_key, workflow_uuid: LIVE_UUID } }) }] }
+            : { content: [{ type: "text", text: JSON.stringify({ opened: { path: TARGET }, routing_key: "wf:workflows/reconnected.json", workflow_uuid: LIVE_UUID }) }] },
+        confirm: async () => "yes" as const,
+        bridge: { refreshWorkflowUuid: refresh } as unknown as PanelToolCtx["bridge"],
+        tabId: "reconnected-tab",
+      };
+      const res = await defByName("panel_open_workflow").handler({ path: TARGET }, ctx);
+      expect(res.isError).toBeFalsy();
+      expect(refresh).not.toHaveBeenCalled();
+    }
+  });
+
+  it("does not refresh from an absent or noncanonical open UUID, preserving the old fail-closed stamp", async () => {
+    for (const workflow_uuid of [
+      undefined,
+      "not-a-uuid",
+      OLD_UUID + "-suffix",
+      "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".toUpperCase(),
+      "33333333-3333-0333-8333-333333333333", // invalid version
+      "44444444-4444-4444-7444-444444444444", // invalid variant
+    ]) {
+      const refresh = vi.fn(() => true);
+      const ctx: PanelToolCtx = {
+        call: async (cmd) =>
+          cmd.cmd === "workflow_list"
+            ? { content: [{ type: "text", text: JSON.stringify({ active: { path: TARGET } }) }] }
+            : { content: [{ type: "text", text: JSON.stringify({ opened: { path: TARGET }, workflow_uuid }) }] },
+        confirm: async () => "yes" as const,
+        bridge: { refreshWorkflowUuid: refresh } as unknown as PanelToolCtx["bridge"],
+        tabId: "reconnected-tab",
+      };
+      const res = await defByName("panel_open_workflow").handler({ path: TARGET }, ctx);
+      expect(res.isError).toBeFalsy();
+      expect(refresh).not.toHaveBeenCalled();
+    }
+  });
+
+  it("does not refresh from a late open reply once a newer navigation is active", async () => {
+    const refresh = vi.fn(() => true);
+    const ctx: PanelToolCtx = {
+      call: async (cmd) =>
+        cmd.cmd === "workflow_list"
+          ? { content: [{ type: "text", text: JSON.stringify({ active: { path: "workflows/newer.json", workflow_uuid: LIVE_UUID } }) }] }
+          : { content: [{ type: "text", text: JSON.stringify({ opened: { path: TARGET }, workflow_uuid: OLD_UUID }) }] },
+      confirm: async () => "yes" as const,
+      bridge: { refreshWorkflowUuid: refresh } as unknown as PanelToolCtx["bridge"],
+      tabId: "reconnected-tab",
+    };
+
+    const res = await defByName("panel_open_workflow").handler({ path: TARGET }, ctx);
+    expect(res.isError).toBeFalsy();
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it("does not refresh a successful open from a different same-basename active workflow (#716 P1)", async () => {
+    const requested = "workflows/a/foo.json";
+    const refresh = vi.fn(() => true);
+    const ctx: PanelToolCtx = {
+      call: async (cmd) =>
+        cmd.cmd === "workflow_list"
+          ? {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  active: {
+                    path: "workflows/b/foo.json",
+                    routing_key: "wf:workflows/b/foo.json",
+                    workflow_uuid: LIVE_UUID,
+                  },
+                }),
+              }],
+            }
+          : {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  opened: { path: requested },
+                  routing_key: "wf:workflows/a/foo.json",
+                  workflow_uuid: OLD_UUID,
+                }),
+              }],
+            },
+      confirm: async () => "yes" as const,
+      bridge: { refreshWorkflowUuid: refresh } as unknown as PanelToolCtx["bridge"],
+      tabId: "reconnected-tab",
+    };
+
+    const res = await defByName("panel_open_workflow").handler({ path: requested }, ctx);
+    expect(res.isError).toBeFalsy();
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it("does not promote an alias request to a reply-resolved path for fast-success refresh (#716 P1)", async () => {
+    const requested = "foo.json";
+    const resolved = "workflows/a/foo.json";
+    const refresh = vi.fn(() => true);
+    const ctx: PanelToolCtx = {
+      call: async (cmd) =>
+        cmd.cmd === "workflow_list"
+          ? { content: [{ type: "text", text: JSON.stringify({ active: { path: resolved, routing_key: "wf:workflows/a/foo.json", workflow_uuid: LIVE_UUID } }) }] }
+          : { content: [{ type: "text", text: JSON.stringify({ opened: { path: resolved }, routing_key: "wf:workflows/a/foo.json", workflow_uuid: LIVE_UUID }) }] },
+      confirm: async () => "yes" as const,
+      bridge: { refreshWorkflowUuid: refresh } as unknown as PanelToolCtx["bridge"],
+      tabId: "reconnected-tab",
+    };
+
+    const res = await defByName("panel_open_workflow").handler({ path: requested }, ctx);
+    expect(res.isError).toBeFalsy();
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it("does not refresh fast success from an active path/routing contradiction or temporary path (#716 P1)", async () => {
+    for (const { requested, active, opened } of [
+      {
+        requested: "workflows/a/foo.json",
+        active: { path: "workflows/a/foo.json", routing_key: "wf:workflows/b/foo.json", workflow_uuid: LIVE_UUID },
+        opened: { path: "workflows/a/foo.json", routing_key: "wf:workflows/a/foo.json", workflow_uuid: LIVE_UUID },
+      },
+      {
+        requested: "tmp:ephemeral-tab",
+        active: { path: "tmp:ephemeral-tab", routing_key: "wf:tmp:ephemeral-tab", workflow_uuid: LIVE_UUID },
+        opened: { path: "tmp:ephemeral-tab", routing_key: "wf:tmp:ephemeral-tab", workflow_uuid: LIVE_UUID },
+      },
+    ]) {
+      const refresh = vi.fn(() => true);
+      const ctx: PanelToolCtx = {
+        call: async (cmd) =>
+          cmd.cmd === "workflow_list"
+            ? { content: [{ type: "text", text: JSON.stringify({ active }) }] }
+            : { content: [{ type: "text", text: JSON.stringify({ opened, routing_key: opened.routing_key, workflow_uuid: opened.workflow_uuid }) }] },
+        confirm: async () => "yes" as const,
+        bridge: { refreshWorkflowUuid: refresh } as unknown as PanelToolCtx["bridge"],
+        tabId: "reconnected-tab",
+      };
+      const res = await defByName("panel_open_workflow").handler({ path: requested }, ctx);
+      expect(res.isError).toBeFalsy();
+      expect(refresh).not.toHaveBeenCalled();
+    }
+  });
+
+  it("re-pin refreshes only from the same fresh active workflow record, so the following run is fenced to it", async () => {
+    const refresh = vi.fn(() => true);
+    const store = new WorkflowTargetStore();
+    const sent: Array<Record<string, unknown>> = [];
+    const ctx: PanelToolCtx = {
+      call: async (cmd) => {
+        expect(cmd).toMatchObject({ cmd: "workflow_list" });
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              active_confirmed: true,
+              active: { path: TARGET, key: "wf:workflows/reconnected.json", routing_key: "wf:workflows/reconnected.json", workflow_uuid: LIVE_UUID },
+              workflows: [{ path: TARGET, key: "wf:workflows/reconnected.json", routing_key: "wf:workflows/reconnected.json", active: true, workflow_uuid: LIVE_UUID }],
+            }),
+          }],
+        };
+      },
+      confirm: async () => "yes" as const,
+      bridge: {
+        refreshWorkflowUuid: refresh,
+        push: (frame: Record<string, unknown>) => { sent.push(frame); return 1; },
+      } as unknown as PanelToolCtx["bridge"],
+      tabId: "reconnected-tab",
+      workflowTarget: store,
+    };
+
+    const pin = await defByName("panel_set_workflow_target").handler({ mode: "pinned", path: TARGET }, ctx);
+    expect(pin.isError).toBeFalsy();
+    expect(store.get("reconnected-tab")).toMatchObject({ mode: "pinned", path: "wf:workflows/reconnected.json" });
+    expect(refresh).toHaveBeenCalledExactlyOnceWith("reconnected-tab", LIVE_UUID.toLowerCase());
+    expect(sent).toHaveLength(1);
+  });
+
+  it("does not refresh a re-pin from an alias, routing token, temporary token, or malformed caller path (#716 P1)", async () => {
+    for (const callerPath of ["foo.json", "wf:workflows/reconnected.json", "tmp:ephemeral-tab", "not-a-canonical-path"]) {
+      const refresh = vi.fn(() => true);
+      const store = new WorkflowTargetStore();
+      const ctx: PanelToolCtx = {
+        call: async () => ({
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              active: { path: TARGET, routing_key: "wf:workflows/reconnected.json", workflow_uuid: LIVE_UUID },
+              workflows: [{
+                path: TARGET,
+                filename: "foo.json",
+                // Each caller form can resolve through legacy aliases; that must
+                // not give it authority to replace the command fence.
+                key: callerPath,
+                routing_key: "wf:workflows/reconnected.json",
+                active: true,
+              }],
+            }),
+          }],
+        }),
+        confirm: async () => "yes" as const,
+        bridge: { refreshWorkflowUuid: refresh, push: () => 1 } as unknown as PanelToolCtx["bridge"],
+        tabId: "reconnected-tab",
+        workflowTarget: store,
+      };
+      const pin = await defByName("panel_set_workflow_target").handler({ mode: "pinned", path: callerPath }, ctx);
+      expect(pin.isError).toBeFalsy();
+      expect(refresh).not.toHaveBeenCalled();
+    }
+  });
+
+  it("does not refresh a re-pin from a partial or replayed selected/list-active record (#716 P1)", async () => {
+    for (const routing_key of [undefined, "wf:workflows/replayed.json", "not-a-routing-key"]) {
+      const refresh = vi.fn(() => true);
+      const store = new WorkflowTargetStore();
+      const ctx: PanelToolCtx = {
+        call: async () => ({
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              active: { path: TARGET, routing_key, workflow_uuid: LIVE_UUID },
+              workflows: [{ path: TARGET, key: "wf:workflows/reconnected.json", routing_key, active: true }],
+            }),
+          }],
+        }),
+        confirm: async () => "yes" as const,
+        bridge: { refreshWorkflowUuid: refresh, push: () => 1 } as unknown as PanelToolCtx["bridge"],
+        tabId: "reconnected-tab",
+        workflowTarget: store,
+      };
+      const pin = await defByName("panel_set_workflow_target").handler({ mode: "pinned", path: TARGET }, ctx);
+      expect(pin.isError).toBeFalsy();
+      expect(refresh).not.toHaveBeenCalled();
+    }
+  });
+
+  it("does not refresh a re-pin from an alias-selected stale active:true record that contradicts top-level active (#716 P1)", async () => {
+    const refresh = vi.fn(() => true);
+    const store = new WorkflowTargetStore();
+    const requestedAlias = "foo.json";
+    const ctx: PanelToolCtx = {
+      call: async () => ({
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            // The list's item flag claims A is active, but the authoritative
+            // top-level active record says B. Their same basename must not let
+            // B's valid UUID replace the existing fail-closed command stamp.
+            active: {
+              path: "workflows/b/foo.json",
+              routing_key: "wf:workflows/b/foo.json",
+              workflow_uuid: LIVE_UUID,
+            },
+            workflows: [{
+              path: "workflows/a/foo.json",
+              filename: "foo.json",
+              key: "wf:workflows/a/foo.json",
+              routing_key: "wf:workflows/a/foo.json",
+              active: true,
+            }],
+          }),
+        }],
+      }),
+      confirm: async () => "yes" as const,
+      bridge: {
+        refreshWorkflowUuid: refresh,
+        push: () => 1,
+      } as unknown as PanelToolCtx["bridge"],
+      tabId: "reconnected-tab",
+      workflowTarget: store,
+    };
+
+    const pin = await defByName("panel_set_workflow_target").handler({ mode: "pinned", path: requestedAlias }, ctx);
+    expect(pin.isError).toBeFalsy(); // Preserve legacy pin resolution; only the fence refresh is unsafe.
+    expect(store.get("reconnected-tab")).toMatchObject({ mode: "pinned", path: "wf:workflows/a/foo.json" });
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it("does not refresh a top-level-active re-pin unless an exact list record corroborates it (#716 P1)", async () => {
+    const refresh = vi.fn(() => true);
+    const store = new WorkflowTargetStore();
+    const requested = "workflows/a/foo.json";
+    const ctx: PanelToolCtx = {
+      call: async () => ({
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            active: { path: requested, routing_key: "wf:workflows/a/foo.json", workflow_uuid: LIVE_UUID },
+            // The active object is absent from this enumerable list, so there
+            // is no selected record whose identity can corroborate its UUID.
+            workflows: [{ path: "workflows/other.json", routing_key: "wf:workflows/other.json", active: false }],
+          }),
+        }],
+      }),
+      confirm: async () => "yes" as const,
+      bridge: { refreshWorkflowUuid: refresh, push: () => 1 } as unknown as PanelToolCtx["bridge"],
+      tabId: "reconnected-tab",
+      workflowTarget: store,
+    };
+
+    const pin = await defByName("panel_set_workflow_target").handler({ mode: "pinned", path: requested }, ctx);
+    expect(pin.isError).toBeFalsy();
+    expect(store.get("reconnected-tab")).toMatchObject({ mode: "pinned", path: requested });
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it("does not refresh when a late/replayed workflow_list marks the requested target as background", async () => {
+    const refresh = vi.fn(() => true);
+    const ctx: PanelToolCtx = {
+      call: async () => ({
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            active: { path: "workflows/other.json", key: "wf:other", workflow_uuid: LIVE_UUID },
+            workflows: [{ path: TARGET, key: "wf:target", active: false, workflow_uuid: OLD_UUID }],
+          }),
+        }],
+      }),
+      confirm: async () => "yes" as const,
+      bridge: { refreshWorkflowUuid: refresh, push: () => 1 } as unknown as PanelToolCtx["bridge"],
+      tabId: "reconnected-tab",
+      workflowTarget: new WorkflowTargetStore(),
+    };
+
+    const pin = await defByName("panel_set_workflow_target").handler({ mode: "pinned", path: TARGET }, ctx);
+    expect(pin.isError).toBe(true);
+    expect(refresh).not.toHaveBeenCalled();
   });
 });
 

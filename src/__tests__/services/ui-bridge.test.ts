@@ -1341,6 +1341,44 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     desktop.close();
   });
 
+  it("#716 refreshes a later command stamp only through the orchestrator-owned validator", async () => {
+    const oldUuid = "11111111-1111-4111-8111-111111111111";
+    const liveUuid = "22222222-2222-4222-8222-222222222222";
+    const uuidByTab: Record<string, string> = { "wf:reconnected": oldUuid };
+    bridge.setTabWorkflowUuidResolver(
+      (tabId) => uuidByTab[tabId],
+      (tabId, uuid) => {
+        if (!/^[0-9a-f]{8}-/i.test(uuid)) return false;
+        uuidByTab[tabId] = uuid;
+        return true;
+      },
+    );
+    const desktop = await connectPanel("wf:reconnected", "R");
+    const frames: Array<Record<string, unknown>> = [];
+    desktop.on("message", (buf) => {
+      const m = JSON.parse(buf.toString());
+      if (m.rid && m.cmd) {
+        frames.push(m);
+        desktop.send(JSON.stringify({ rid: m.rid, ok: true, result: {} }));
+      }
+    });
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:reconnected")).toBe(true));
+
+    await bridge.send({ cmd: "graph_add_node", node: "before-open" } as never, { tabId: "wf:reconnected" });
+    expect(frames.at(-1)?.workflow_uuid).toBe(oldUuid);
+
+    // This is what the successful panel_open_workflow / active re-pin path calls.
+    expect(bridge.refreshWorkflowUuid("wf:reconnected", liveUuid)).toBe(true);
+    await bridge.send({ cmd: "graph_run" } as never, { tabId: "wf:reconnected" });
+    expect(frames.at(-1)?.workflow_uuid).toBe(liveUuid);
+
+    // A malformed/late response cannot erase or replace the established stamp.
+    expect(bridge.refreshWorkflowUuid("wf:reconnected", "not-a-uuid")).toBe(false);
+    await bridge.send({ cmd: "graph_add_node", node: "after-bad-reply" } as never, { tabId: "wf:reconnected" });
+    expect(frames.at(-1)?.workflow_uuid).toBe(liveUuid);
+    desktop.close();
+  });
+
   it("workflow_uuid is BRIDGE-OWNED: a caller-supplied stamp is OVERRIDDEN by the trusted resolver value (#570 P0c)", async () => {
     // A caller must not be able to forge the stamp to the destination workflow to sail past the
     // panel fence after a switch. dispatch always overwrites workflow_uuid with the resolver value.

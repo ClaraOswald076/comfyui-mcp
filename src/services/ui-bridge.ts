@@ -683,6 +683,13 @@ export class UiBridge {
    *  to (the generation-bound-command leak: the server can't retract a frame already
    *  delivered to the browser, but the browser can decline to APPLY a stale one). */
   private resolveTabWorkflowUuid: ((tabId: string) => string | undefined) | null = null;
+  /**
+   * #716 — an explicit workflow navigation can establish a newer command-stamp
+   * identity before the panel's next hello.  The orchestrator owns the value and
+   * validates it against the server-observed origin; the bridge merely gives a
+   * successful tab-bound command a narrow way to ask for that refresh.
+   */
+  private refreshTabWorkflowUuid: ((tabId: string, workflowUuid: string) => boolean) | null = null;
   /** #570 P0a — records the mirror subscribers/viewers a same-socket re-hello OPTIMISTICALLY
    *  moved from the retiring id to the new id, keyed by the RETIRING (from) id. The move
    *  happens BEFORE the orchestrator can classify the switch as proven/unproven; if it turns
@@ -2300,8 +2307,22 @@ export class UiBridge {
 
   /** #570 — inject the tabId → trusted workflow uuid resolver (tabStableIdentity lives in
    *  the orchestrator). Enables the per-command workflow-instance stamp/fence. */
-  setTabWorkflowUuidResolver(fn: (tabId: string) => string | undefined): void {
+  setTabWorkflowUuidResolver(
+    fn: (tabId: string) => string | undefined,
+    refresh?: (tabId: string, workflowUuid: string) => boolean,
+  ): void {
     this.resolveTabWorkflowUuid = fn;
+    this.refreshTabWorkflowUuid = refresh ?? null;
+  }
+
+  /**
+   * #716 — accept a command-stamp refresh only through the orchestrator's
+   * validator.  A panel-tool response is not allowed to write bridge state
+   * directly; missing/invalid values simply leave the existing fail-closed
+   * stamp in place.
+   */
+  refreshWorkflowUuid(tabId: string, workflowUuid: string): boolean {
+    return this.refreshTabWorkflowUuid?.(tabId, workflowUuid) ?? false;
   }
 
   /** The open DESKTOP tabs (non-headless primaries) for the mobile mirror picker. */
