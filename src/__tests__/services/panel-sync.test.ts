@@ -36,8 +36,9 @@ import {
   type PanelStatus,
 } from "../../services/panel-installer.js";
 import type { PanelPinState } from "../../services/panel-settings.js";
+import { BRIDGE_CAPABILITY_MIN_PANEL_VERSION } from "../../services/ui-bridge.js";
 
-const REQUIRED = "0.11.28";
+const REQUIRED = "0.11.30";
 const ORCH = "0.48.32";
 const UNPINNED: PanelPinState = { pinned: false, source: "none" };
 
@@ -64,10 +65,24 @@ function decide(over: Partial<PanelStatus>): PanelSyncDecision {
 }
 
 describe("requiredPanelVersion", () => {
-  it("is the maximum of the bridge baseline and every per-command minimum", () => {
-    // Derived from the orchestrator's own declared command minimums, so it can
-    // never drift from the code that needs the newer panel.
+  it("includes handshake capabilities as well as bridge-command minimums", () => {
+    // A capability gate is just as much a version requirement as a command
+    // gate: otherwise install_panel can call the panel current while the bridge
+    // refuses every active-workflow write (#708).
+    expect(BRIDGE_CAPABILITY_MIN_PANEL_VERSION.enforces_workflow_stamp).toBe(REQUIRED);
     expect(requiredPanelVersion()).toBe(REQUIRED);
+  });
+
+  it("marks a 0.11.28 panel behind without a caller-supplied requirement (#708)", () => {
+    // This is the status/auto-sync path. It must use the same derived floor as
+    // the bridge's stamp-enforcement refusal, rather than reporting the old
+    // 0.11.28 panel up-to-date.
+    const assessment = evaluatePanelSync(status({ installedVersion: "0.11.28" }), {
+      orchestratorVersion: ORCH,
+    });
+    expect(assessment.requiredPanelVersion).toBe(REQUIRED);
+    expect(assessment.decision).toBe("sync");
+    expect(assessment.behind).toBe(true);
   });
 });
 
