@@ -17,6 +17,7 @@ import {
   isMutatingGraphCommand,
   requiresWorkflowStampEnforcement,
 } from "../../services/ui-bridge.js";
+import { logger } from "../../utils/logger.js";
 
 // #570 P0c — classifier that decides which commands must pass the enforcement+stamp gate.
 describe("requiresWorkflowStampEnforcement (#570 P0c)", () => {
@@ -2401,5 +2402,195 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
     // Give the late reply time to land; it must NOT be buffered under any ask id.
     await new Promise((r) => setTimeout(r, 120));
     expect(bridge.takeLateAskReply("tab-plain")).toBeUndefined();
+  });
+});
+
+
+// #517 — the orchestrator half of the duplicate-mutation fix. The panel (PR #521)
+// dedupes inbound command frames purely by `rid`: a re-delivered rid is answered
+// with the ORIGINAL reply instead of re-executing. The bridge must therefore (a)
+// REUSE the original rid when a caller retries a mutation whose earlier attempt
+// ended ambiguously (reply-timeout / OUTCOME-UNKNOWN drop), and (b) never let a
+// late completion vanish — buffer it so the retry is answered truthfully.
+describe("UiBridge (mutation retry dedupe — #517)", () => {
+  /** Collect the command frames the bridge writes to this panel socket. */
+  function collectFrames(sock: WebSocket): Array<Record<string, unknown>> {
+    const frames: Array<Record<string, unknown>> = [];
+    sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd) frames.push(msg);
+    });
+    return frames;
+  }
+
+  it("a mutation retried after a reply-timeout REUSES the original rid, and resolves with the deduped reply", async () => {
+    const sock = await connectPanel("tab-dedupe-1");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-dedupe-1")).toBe(true));
+    const frames = collectFrames(sock);
+    // The tab never replies → the first attempt times out.
+    await expect(
+      bridge.send(
+        { cmd: "graph_add_node", type: "KSampler" },
+        { tabId: "tab-dedupe-1", timeoutMs: 60 },
+      ),
+    ).rejects.toThrow(/did not reply/);
+    expect(frames).toHaveLength(1);
+    const rid1 = frames[0].rid as string;
+    // The agent re-issues the SAME logical mutation: it must go out under the
+    // ORIGINAL rid — never a fresh one — so the panel ledger answers with the
+    // original reply instead of applying a second node.
+    const retry = bridge.send(
+      { cmd: "graph_add_node", type: "KSampler" },
+      { tabId: "tab-dedupe-1", timeoutMs: 2000 },
+    );
+    await vi.waitFor(() => expect(frames).toHaveLength(2));
+    expect(frames[1].rid).toBe(rid1);
+    // The (ledger-deduped) original reply resolves the retry truthfully.
+    sock.send(JSON.stringify({ rid: rid1, ok: true, result: { node_id: 5 } }));
+    await expect(retry).resolves.toMatchObject({ node_id: 5 });
+    // Once a reply reached a caller the ambiguity is resolved: a THIRD identical
+    // command is genuinely new and must mint a FRESH rid.
+    const third = bridge.send(
+      { cmd: "graph_add_node", type: "KSampler" },
+      { tabId: "tab-dedupe-1", timeoutMs: 2000 },
+    );
+    await vi.waitFor(() => expect(frames).toHaveLength(3));
+    expect(frames[2].rid).not.toBe(rid1);
+    sock.send(JSON.stringify({ rid: frames[2].rid, ok: true, result: { node_id: 6 } }));
+    await expect(third).resolves.toMatchObject({ node_id: 6 });
+    sock.close();
+  });
+
+  it("a late reply to a timed-out mutation is surfaced (log) and buffered — the retry is answered with NO re-dispatch", async () => {
+    const sock = await connectPanel("tab-dedupe-2");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-dedupe-2")).toBe(true));
+    const frames = collectFrames(sock);
+    const infoSpy = vi.spyOn(logger, "info");
+    await expect(
+      bridge.send(
+        { cmd: "graph_add_node", type: "KSampler" },
+        { tabId: "tab-dedupe-2", timeoutMs: 60 },
+      ),
+    ).rejects.toThrow(/did not reply/);
+    const rid1 = frames[0].rid as string;
+    // The panel DID apply it — the completion merely arrived after the caller was
+    // failed. It must not vanish: it is logged and buffered against the record.
+    sock.send(JSON.stringify({ rid: rid1, ok: true, result: { node_id: 7 } }));
+    await vi.waitFor(() =>
+      expect(
+        infoSpy.mock.calls.some(([m]) => String(m).includes('late reply for timed-out "graph_add_node"')),
+      ).toBe(true),
+    );
+    // The retry is answered with the truthful late outcome ("applied after
+    // timeout") WITHOUT any frame going back out — no second execution is possible.
+    await expect(
+      bridge.send(
+        { cmd: "graph_add_node", type: "KSampler" },
+        { tabId: "tab-dedupe-2", timeoutMs: 2000 },
+      ),
+    ).resolves.toMatchObject({ node_id: 7 });
+    expect(frames).toHaveLength(1);
+    sock.close();
+  });
+
+  it("a late ERROR reply for a timed-out mutation answers the retry with the same error, without re-executing", async () => {
+    const sock = await connectPanel("tab-dedupe-3");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-dedupe-3")).toBe(true));
+    const frames = collectFrames(sock);
+    await expect(
+      bridge.send(
+        { cmd: "graph_remove_node", node_id: 4 },
+        { tabId: "tab-dedupe-3", timeoutMs: 60 },
+      ),
+    ).rejects.toThrow(/did not reply/);
+    const rid1 = frames[0].rid as string;
+    sock.send(JSON.stringify({ rid: rid1, ok: false, error: "workflow instance mismatch" }));
+    await new Promise((r) => setTimeout(r, 50));
+    await expect(
+      bridge.send(
+        { cmd: "graph_remove_node", node_id: 4 },
+        { tabId: "tab-dedupe-3", timeoutMs: 2000 },
+      ),
+    ).rejects.toThrow(/workflow instance mismatch/);
+    expect(frames).toHaveLength(1);
+    sock.close();
+  });
+
+  it("genuinely new commands still get fresh rids (no correlation after a SUCCESS)", async () => {
+    const sock = await connectPanel("tab-dedupe-4");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-dedupe-4")).toBe(true));
+    autoReply(sock, "D4");
+    const frames = collectFrames(sock);
+    // Two identical mutations, the first one SUCCESSFUL — the second is a real,
+    // separate command (the agent may genuinely want two identical nodes).
+    await bridge.send({ cmd: "graph_add_node", type: "A" }, { tabId: "tab-dedupe-4" });
+    await bridge.send({ cmd: "graph_add_node", type: "A" }, { tabId: "tab-dedupe-4" });
+    expect(frames).toHaveLength(2);
+    expect(frames[0].rid).not.toBe(frames[1].rid);
+    sock.close();
+  });
+
+  it("a retry with DIFFERENT args does NOT correlate with the timed-out attempt", async () => {
+    const sock = await connectPanel("tab-dedupe-5");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-dedupe-5")).toBe(true));
+    const frames = collectFrames(sock);
+    await expect(
+      bridge.send({ cmd: "graph_add_node", type: "A" }, { tabId: "tab-dedupe-5", timeoutMs: 60 }),
+    ).rejects.toThrow(/did not reply/);
+    // Different args = a different logical command → fresh rid, dispatched anew.
+    const retry = bridge.send(
+      { cmd: "graph_add_node", type: "B" },
+      { tabId: "tab-dedupe-5", timeoutMs: 2000 },
+    );
+    await vi.waitFor(() => expect(frames).toHaveLength(2));
+    expect(frames[1].rid).not.toBe(frames[0].rid);
+    sock.send(JSON.stringify({ rid: frames[1].rid, ok: true, result: { node_id: 9 } }));
+    await expect(retry).resolves.toMatchObject({ node_id: 9 });
+    sock.close();
+  });
+
+  it("a mutation dropped mid-command (OUTCOME UNKNOWN) correlates its post-reconnect retry onto the original rid", async () => {
+    const a1 = await connectPanel("tab-dedupe-6");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-dedupe-6")).toBe(true));
+    const frames1 = collectFrames(a1);
+    const promise = bridge.send({ cmd: "graph_run" }, { tabId: "tab-dedupe-6", timeoutMs: 5000 });
+    await vi.waitFor(() => expect(frames1).toHaveLength(1));
+    const rid1 = frames1[0].rid as string;
+    a1.close();
+    await expect(promise).rejects.toThrow(/OUTCOME UNKNOWN/);
+    // The tab reconnects; the caller (told to verify, then retry) re-issues the
+    // SAME command — it must adopt the original rid so the panel ledger (which
+    // survives a socket supersede) can dedupe it.
+    const a2 = await connectPanel("tab-dedupe-6");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-dedupe-6")).toBe(true));
+    const frames2 = collectFrames(a2);
+    const retry = bridge.send({ cmd: "graph_run" }, { tabId: "tab-dedupe-6", timeoutMs: 2000 });
+    await vi.waitFor(() => expect(frames2).toHaveLength(1));
+    expect(frames2[0].rid).toBe(rid1);
+    a2.send(JSON.stringify({ rid: rid1, ok: true, result: { prompt_id: "p1" } }));
+    await expect(retry).resolves.toMatchObject({ prompt_id: "p1" });
+    a2.close();
+  });
+
+  it("the idempotent read-resume path is unchanged — it still resolves the caller, replaying the SAME rid", async () => {
+    const a1 = await connectPanel("tab-dedupe-7");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-dedupe-7")).toBe(true));
+    const frames1 = collectFrames(a1);
+    // No autoReply on a1 → the read stays in-flight (un-acked) when the socket drops.
+    const promise = bridge.send(
+      { cmd: "graph_get_errors" },
+      { tabId: "tab-dedupe-7", timeoutMs: 5000 },
+    );
+    await vi.waitFor(() => expect(frames1).toHaveLength(1));
+    a1.close();
+    // Same tab reconnects within the grace window → the parked read is resumed onto
+    // the fresh socket, as one replay of the SAME logical command (same rid).
+    const a2 = await connectPanel("tab-dedupe-7");
+    const frames2 = collectFrames(a2);
+    await vi.waitFor(() => expect(frames2.some((f) => f.cmd === "graph_get_errors")).toBe(true));
+    expect(frames2.find((f) => f.cmd === "graph_get_errors")?.rid).toBe(frames1[0].rid);
+    a2.send(JSON.stringify({ rid: frames1[0].rid, ok: true, result: { errors: [] } }));
+    await expect(promise).resolves.toMatchObject({ errors: [] });
+    a2.close();
   });
 });

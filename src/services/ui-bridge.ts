@@ -15,7 +15,7 @@
 // or `{ rid, ok: false, error }`. Frames WITHOUT a rid are panel-initiated
 // events (`hello`, `user_message`) and flow to `onPanelMessage`.
 
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import { logger } from "../utils/logger.js";
 import { compareSemver } from "./self-update.js";
@@ -77,6 +77,18 @@ type SendCtx = {
    *  EXECUTE it against a DIFFERENT workflow it has since switched to. Undefined for a tab
    *  with no established workflow identity (old panel / relay) → no client-side fence. */
   workflowUuid?: string;
+  /** #517 — the request id stamped on EVERY attempt frame of this logical command.
+   *  Minted once per send() — or ADOPTED from a prior attempt of the same logical
+   *  mutation that ended ambiguously (reply-timeout / outcome-unknown drop) — and
+   *  REUSED verbatim by every re-dispatch (reconnect resume), so the panel's rid
+   *  dedupe ledger (panel #521) answers a replay with the ORIGINAL reply instead of
+   *  re-executing it. Genuinely new commands always mint a fresh rid. */
+  rid: string;
+  /** #517 — canonical fingerprint of this logical command (canonical tabId + cmd
+   *  args), set only for MUTATING commands. Keys `timedOutMutations`, so a caller
+   *  retrying a mutation whose earlier attempt ended ambiguously can adopt the
+   *  original rid (or be answered from its buffered late reply). */
+  dedupeKey?: string;
 };
 
 type Pending = {
@@ -496,6 +508,19 @@ export interface BridgeCommand {
   [key: string]: unknown;
 }
 
+/** Deterministic serialization for fingerprinting a logical command (#517):
+ *  object keys sorted recursively, so two calls carrying identical args in a
+ *  different key order still correlate to the same fingerprint. */
+function stableStringify(v: unknown): string {
+  if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "null";
+  if (Array.isArray(v)) return `[${v.map(stableStringify).join(",")}]`;
+  const o = v as Record<string, unknown>;
+  return `{${Object.keys(o)
+    .sort()
+    .map((k) => `${JSON.stringify(k)}:${stableStringify(o[k])}`)
+    .join(",")}}`;
+}
+
 /** Normalize a WebSocket handshake `Origin` header into a canonical scheme://host:port
  *  string, or undefined when it is absent, the opaque literal `"null"` (a sandboxed /
  *  file:// / data: origin, which proves nothing), or unparseable. The browser sets this
@@ -697,6 +722,33 @@ export class UiBridge {
    *  enough to cover a slow human pick within the MCP tools/call budget, short
    *  enough that abandoned entries don't accumulate. */
   private static readonly LATE_ASK_TTL_MS = 5 * 60 * 1000;
+  /** #517 — recent AMBIGUOUS-outcome MUTATING dispatches (reply-timeout, or a
+   *  mid-command drop surfaced as OUTCOME UNKNOWN), keyed by the logical-command
+   *  fingerprint ({@link commandDedupeKey}). Lets a caller's RETRY of the same
+   *  mutation adopt the original rid — so the panel's rid dedupe ledger (panel
+   *  #521) answers it with the ORIGINAL reply instead of applying the mutation a
+   *  second time (duplicate nodes) — and holds the original's LATE reply, when one
+   *  arrives, so the retry can be answered truthfully with no re-dispatch at all.
+   *  Cleared as soon as any reply for the rid reaches a caller (the ambiguity is
+   *  resolved; a later identical command is genuinely new); TTL-pruned otherwise.
+   *  Eviction/expiry fails OPEN: an untracked retry just re-executes under a fresh
+   *  rid — exactly the pre-#517 behavior, never a new failure mode. */
+  private timedOutMutations = new Map<
+    string,
+    {
+      rid: string;
+      tabId: string;
+      cmd: string;
+      ts: number;
+      reply?: { ok: boolean; result?: unknown; error?: string };
+    }
+  >();
+  /** How long a timed-out mutation stays correlatable — long enough to cover an
+   *  agent's "see the timeout error → re-issue the same edit" turnaround. */
+  private static readonly TIMED_OUT_MUTATION_TTL_MS = 5 * 60 * 1000;
+  /** Cardinality cap (oldest-first eviction) so a flapping session can't grow the
+   *  ledger without limit. */
+  private static readonly TIMED_OUT_MUTATION_MAX = 64;
   /** In-flight IDEMPOTENT reads whose socket dropped mid-command, parked per tabId
    *  waiting a bounded grace for that tab to reconnect so we can re-dispatch them
    *  (resume) instead of hard-failing. Never holds mutating commands. */
@@ -1243,12 +1295,25 @@ export class UiBridge {
               this.pruneLateAsk();
               this.lateAskReplies.set(entry.askId, { result: msg.result, ts: Date.now() });
             }
+            return;
           }
+          // #517 — a late reply for a timed-out MUTATION must not vanish either:
+          // buffer it against the recorded dispatch so the caller's retry of the
+          // same logical command is answered with the true outcome (and so the
+          // completion is at least surfaced in the log when no retry ever comes).
+          if (this.bufferLateMutationReply(rid, msg)) return;
+          logger.debug(
+            `[ui-bridge] dropping a late reply for a timed-out/unknown rid (${rid.slice(0, 8)})`,
+          );
           return;
         }
         clearTimeout(p.timer);
         this.pending.delete(rid);
         this.askRidToId.delete(rid);
+        // #517 — a definitive reply is reaching a caller for this rid: any
+        // timed-out-mutation record for it is resolved, so a LATER identical
+        // command mints a fresh rid and executes as genuinely new.
+        this.clearTimedOutMutation(rid);
         if (msg.ok) {
           // #422 — the panel DEMONSTRABLY served this command. Record it on the LIVE
           // connection (following a same-socket tmp:→wf: migration whose reply landed
@@ -1549,6 +1614,89 @@ export class UiBridge {
     return e.result;
   }
 
+  /** #517 — canonical fingerprint of a logical command: the canonical tab id plus
+   *  the command with bridge-owned frame metadata (`rid`, `workflow_uuid` — both
+   *  stripped/overwritten at dispatch) excluded. Two sends of the same command with
+   *  identical args to the same tab produce the same key; any real difference (a
+   *  genuinely new command) produces a different one. Hashed so a command carrying
+   *  a large payload (e.g. an embedded workflow) doesn't turn into a giant map key. */
+  private commandDedupeKey(tabId: string, cmd: BridgeCommand): string {
+    const args: Record<string, unknown> = { ...cmd };
+    delete args.rid;
+    delete args.workflow_uuid;
+    return createHash("sha256").update(tabId).update("\n").update(stableStringify(args)).digest("hex");
+  }
+
+  /** Drop expired timed-out-mutation records and cap the ledger oldest-first. */
+  private pruneTimedOutMutations(): void {
+    const now = Date.now();
+    for (const [key, e] of this.timedOutMutations) {
+      if (now - e.ts > UiBridge.TIMED_OUT_MUTATION_TTL_MS) this.timedOutMutations.delete(key);
+    }
+    while (this.timedOutMutations.size > UiBridge.TIMED_OUT_MUTATION_MAX) {
+      const oldest = this.timedOutMutations.keys().next().value;
+      if (oldest === undefined) break;
+      this.timedOutMutations.delete(oldest);
+    }
+  }
+
+  /** #517 — record a MUTATING command whose outcome just became ambiguous (the
+   *  frame was written but no reply will reach the caller: a reply-timeout, or an
+   *  OUTCOME-UNKNOWN mid-command drop). The next send() of the SAME logical command
+   *  adopts this rid so the panel dedupes the replay (panel #521) — and so its late
+   *  reply, if one arrives, is buffered for that retry instead of vanishing. No-op
+   *  for reads (they have no dedupeKey): re-running a read is always safe. */
+  private recordTimedOutMutation(ctx: SendCtx): void {
+    if (!ctx.mutating || !ctx.dedupeKey) return;
+    this.pruneTimedOutMutations();
+    const prev = this.timedOutMutations.get(ctx.dedupeKey);
+    // Re-set (not just update) so a repeat record moves newest for eviction; a
+    // retry that adopted this rid and timed out AGAIN keeps the same rid/key.
+    this.timedOutMutations.delete(ctx.dedupeKey);
+    this.timedOutMutations.set(ctx.dedupeKey, {
+      rid: ctx.rid,
+      tabId: ctx.tabId,
+      cmd: ctx.command.cmd,
+      ts: Date.now(),
+      reply: prev?.rid === ctx.rid ? prev.reply : undefined,
+    });
+  }
+
+  /** #517 — a reply for `rid` is about to reach a caller: the ambiguity around any
+   *  timed-out attempt with this rid is resolved, so drop its record. A later
+   *  identical command must mint a FRESH rid and execute as genuinely new. */
+  private clearTimedOutMutation(rid: string): void {
+    for (const [key, e] of this.timedOutMutations) {
+      if (e.rid === rid) this.timedOutMutations.delete(key);
+    }
+  }
+
+  /** #517 — TRUTHFUL LATE COMPLETION: a reply arrived for a rid with no pending
+   *  waiter. If it belongs to a recorded timed-out mutation, BUFFER the outcome so
+   *  the caller's retry (same logical command, within the TTL) is answered with it
+   *  instead of blindly re-executing, and surface it in the log. Returns true when
+   *  the reply was claimed; false for anything else (dropped with a debug log by
+   *  the caller, exactly as before). */
+  private bufferLateMutationReply(rid: string, msg: Record<string, unknown>): boolean {
+    for (const [key, e] of this.timedOutMutations) {
+      if (e.rid !== rid) continue;
+      e.reply = msg.ok
+        ? { ok: true, result: msg.result }
+        : { ok: false, error: String(msg.error ?? "panel reported an error") };
+      e.ts = Date.now();
+      // LRU touch — a reply that just landed is by definition still relevant.
+      this.timedOutMutations.delete(key);
+      this.timedOutMutations.set(key, e);
+      logger.info(
+        `[ui-bridge] late reply for timed-out "${e.cmd}" arrived after the caller was failed ` +
+          `(tab ${e.tabId.slice(0, 8)}) — buffered so a retry of the same command is answered ` +
+          `truthfully instead of re-executing (#517)`,
+      );
+      return true;
+    }
+    return false;
+  }
+
   /** All currently connected tabs, most recent hello last. */
   tabs(): PanelTab[] {
     return Array.from(this.conns.values()).map((c) => ({
@@ -1712,6 +1860,12 @@ export class UiBridge {
   dropQueuedDeliveries(tabId: string): void {
     this.missedFrames.delete(tabId);
     this.mailbox.delete(tabId);
+    // #517 — purge timed-out-mutation records for this tab too: a retry must not
+    // adopt a rid (or be answered from a buffered late reply) that belongs to the
+    // PRIOR workflow's ambiguous dispatch.
+    for (const [key, e] of this.timedOutMutations) {
+      if (e.tabId === tabId) this.timedOutMutations.delete(key);
+    }
     // MIRROR teardown (see above): a viewer must not auto-follow an unproven workflow switch.
     for (const [s, drivenTab] of this.mirrorViewers) {
       if (drivenTab === tabId) this.mirrorViewers.delete(s);
@@ -1889,6 +2043,44 @@ export class UiBridge {
         markDispatched(new Error(`Panel tab ${conn.tabId.slice(0, 8)} is not open`), false),
       );
     }
+    // #517 — a caller RETRYING a mutation whose earlier attempt ended ambiguously
+    // (reply-timeout / OUTCOME-UNKNOWN drop) must not blindly re-execute under a
+    // fresh rid. Correlate it with the recorded dispatch: if the original's LATE
+    // reply already arrived, answer the retry from it directly — no frame is
+    // re-sent at all ("applied after timeout", exactly the panel #521 ledger's
+    // replay semantics, one hop earlier). Otherwise ADOPT the original rid so the
+    // panel's dedupe ledger answers the replay with the ORIGINAL reply instead of
+    // applying the mutation a second time. A genuinely new command (no record)
+    // mints a fresh rid as before.
+    const mutating = !UiBridge.READONLY_CMDS.has(cmd.cmd);
+    let dedupeKey: string | undefined;
+    let rid: string | undefined;
+    if (mutating) {
+      dedupeKey = this.commandDedupeKey(conn.tabId, cmd);
+      this.pruneTimedOutMutations();
+      const prior = this.timedOutMutations.get(dedupeKey);
+      if (prior?.reply) {
+        this.timedOutMutations.delete(dedupeKey);
+        logger.info(
+          `[ui-bridge] answering the retry of "${cmd.cmd}" (tab ${conn.tabId.slice(0, 8)}) with the ` +
+            `late reply of its original dispatch — applied after timeout, NOT re-executed (#517)`,
+        );
+        return prior.reply.ok
+          ? Promise.resolve(prior.reply.result)
+          : Promise.reject(new Error(prior.reply.error ?? "panel reported an error"));
+      }
+      if (prior) {
+        // LRU touch — the command is still being retried within the window.
+        this.timedOutMutations.delete(dedupeKey);
+        prior.ts = Date.now();
+        this.timedOutMutations.set(dedupeKey, prior);
+        rid = prior.rid;
+        logger.info(
+          `[ui-bridge] retry of timed-out "${cmd.cmd}" (tab ${conn.tabId.slice(0, 8)}) reuses the ` +
+            `original request id so the panel dedupes it instead of re-applying (#517)`,
+        );
+      }
+    }
     return new Promise((resolve, reject) => {
       const ctx: SendCtx = {
         resolve,
@@ -1899,13 +2091,15 @@ export class UiBridge {
         // or migration-alias tabId) — the key the reconnect hello will use, so a
         // parked read is found and resumed.
         tabId: conn.tabId,
-        mutating: !UiBridge.READONLY_CMDS.has(cmd.cmd),
+        mutating,
         deadline: Date.now() + timeoutMs,
         // #570 — resolve from the CALLER'S intended tab (opts.tabId), NOT the canonical
         // conn.tabId: after a same-socket switch the two differ, and we must stamp the
         // workflow the command was ISSUED FOR (so the panel, now showing a different one,
         // declines it) — never the workflow it happens to have landed on.
         workflowUuid: this.resolveTabWorkflowUuid?.(opts.tabId ?? conn.tabId) ?? undefined,
+        rid: rid ?? randomUUID(),
+        dedupeKey,
       };
       this.dispatch(conn, ctx);
     });
@@ -1914,7 +2108,10 @@ export class UiBridge {
   /** Write one attempt of a command to a live socket and arm its reply timer.
    *  Reused verbatim when an idempotent read is re-dispatched onto a fresh socket
    *  after a mid-command reconnect (so resume runs the exact same path as a first
-   *  send). Rejections/resolutions go through the shared SendCtx. */
+   *  send). Rejections/resolutions go through the shared SendCtx. Every attempt
+   *  carries the SAME `ctx.rid` (#517): a re-dispatch is a replay of one logical
+   *  command, and the panel's rid dedupe ledger (panel #521) answers a replay with
+   *  the ORIGINAL reply instead of re-executing it. */
   private dispatch(conn: Conn, ctx: SendCtx): void {
     const cmd = ctx.command;
     // Never let a re-dispatch (reconnect resume) extend the caller's original
@@ -1931,7 +2128,11 @@ export class UiBridge {
       return;
     }
     const replyTimeoutMs = Math.min(ctx.timeoutMs, remaining);
-    const rid = randomUUID();
+    // #517 — the rid is STABLE across attempts of this logical command (minted
+    // once in send(), reused on every re-dispatch). Only one attempt is ever in
+    // `pending` at a time: a resume/re-dispatch happens strictly after the prior
+    // attempt's entry was removed (reply timer fired or the socket died).
+    const rid = ctx.rid;
     // Track an ask_user card's stable ask_id against this attempt's rid so a reply
     // that validates AFTER the reply timer fires (and drops out of `pending`) can
     // still be buffered for the caller by rid, not discarded (#486 late answer).
@@ -1977,6 +2178,10 @@ export class UiBridge {
       // dispatched:true so a mutating caller (e.g. comfy_reboot readiness) treats it as an
       // accepted-but-unacked dispatch and verifies by observation, rather than mistaking a
       // genuinely-sent command for one that never went out (#509).
+      // #517 — and for a MUTATION, record the ambiguous outcome so a caller's retry
+      // of the same logical command adopts this rid (panel-ledger dedupe) and its
+      // late reply is buffered instead of vanishing.
+      this.recordTimedOutMutation(ctx);
       ctx.reject(
         markReplyTimeout(
           markDispatched(
@@ -2081,6 +2286,13 @@ export class UiBridge {
     // bare failure invites a blind retry that double-applies the action (e.g. a
     // second render). Say the outcome is UNKNOWN so the caller verifies first.
     if (ctx.mutating) {
+      // #517 — record the ambiguous outcome: if the caller DOES retry the same
+      // logical command (e.g. after verifying), the retry adopts this rid so the
+      // panel's dedupe ledger answers it with the original reply instead of
+      // applying the mutation a second time (the ledger survives a socket
+      // supersede; a full page reload wipes it and the retry fails open into the
+      // pre-#517 behavior).
+      this.recordTimedOutMutation(ctx);
       ctx.reject(
         markDispatched(
           new Error(
@@ -2254,6 +2466,7 @@ export class UiBridge {
       }
       this.awaitingReconnect.delete(tabId);
     }
+    this.timedOutMutations.clear();
     for (const conn of this.conns.values()) {
       try {
         conn.sock.close();
