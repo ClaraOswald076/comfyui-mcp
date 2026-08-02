@@ -193,7 +193,8 @@ describe("getOutputImage — video/audio media (issue #663)", () => {
   // able to save to disk. allowMedia opts the caller into video/*/audio/*
   // payloads; the junk-body guards (empty / JSON / HTML) still apply — and the
   // declared media content-type is only accepted when the payload actually
-  // sniffs as media (magic bytes).
+  // sniffs as that media FORMAT (structural magic-byte checks, not just the
+  // leading signature).
 
   // Realistic MP4 header: 24-byte ftyp box, isom major brand.
   const MP4_BASE64 = Buffer.from([
@@ -201,10 +202,36 @@ describe("getOutputImage — video/audio media (issue #663)", () => {
     0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00, 0x02, 0x00, // isom....
     0x69, 0x73, 0x6f, 0x6d, 0x69, 0x73, 0x6f, 0x32, // isomiso2
   ]).toString("base64");
-  // WAV header: RIFF chunk with WAVE form type.
+  // WAV header: RIFF chunk whose declared size (8) is consistent with the
+  // 16-byte body (chunk size + 8 header bytes == body length).
   const WAV_BASE64 = Buffer.from([
-    0x52, 0x49, 0x46, 0x46, 0x24, 0x00, 0x00, 0x00, // RIFF$...
+    0x52, 0x49, 0x46, 0x46, 0x08, 0x00, 0x00, 0x00, // RIFF....
     0x57, 0x41, 0x56, 0x45, 0x66, 0x6d, 0x74, 0x20, // WAVEfmt␠
+  ]).toString("base64");
+  // MP3 frame sync (0xFFFB = MPEG-1 Layer III) padded to a plausible file
+  // size — the sync alone is only 2 bytes, so size is the structure here.
+  const MP3_BASE64 = Buffer.from([0xff, 0xfb, ...new Array(254).fill(0)]).toString("base64");
+  // AAC: ADTS frame sync (MPEG layer bits 00), padded to a plausible size.
+  const AAC_BASE64 = Buffer.from([0xff, 0xf1, ...new Array(254).fill(0)]).toString("base64");
+  // WebM: EBML magic, padded to a plausible file size.
+  const WEBM_BASE64 = Buffer.from([0x1a, 0x45, 0xdf, 0xa3, ...new Array(252).fill(0)]).toString("base64");
+  // FLAC: magic + the mandatory first metadata block (a STREAMINFO block
+  // header: type 0, length exactly 34) — 42 bytes total.
+  const FLAC_BASE64 = Buffer.from([
+    0x66, 0x4c, 0x61, 0x43, 0x80, 0x00, 0x00, 0x22, // fLaC, STREAMINFO hdr
+    ...new Array(34).fill(0),
+  ]).toString("base64");
+  // Ogg: capture pattern + version-0 page header; 1 segment of size 0.
+  const OGG_BASE64 = Buffer.from([
+    0x4f, 0x67, 0x67, 0x53, 0x00, 0x02, // OggS, version 0, header type
+    ...new Array(20).fill(0), // granule/serial/seq/crc
+    0x01, 0x00, // 1 page segment, size 0
+  ]).toString("base64");
+  // m4a: 24-byte ftyp box with the audio-only M4A major brand.
+  const M4A_BASE64 = Buffer.from([
+    0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, // ....ftyp
+    0x4d, 0x34, 0x41, 0x20, 0x00, 0x00, 0x00, 0x00, // M4A␠....
+    0x4d, 0x34, 0x41, 0x20, 0x6d, 0x70, 0x34, 0x32, // M4A␠mp42
   ]).toString("base64");
 
   it("rejects a video/mp4 payload by default (inline callers stay image-only)", async () => {
@@ -286,6 +313,205 @@ describe("getOutputImage — video/audio media (issue #663)", () => {
     ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
   });
 
+  // ── Cross-FORMAT mislabels (#663 round 4): same family, wrong subtype ──
+
+  it("rejects MP3 bytes mislabeled as audio/wav (cross-format within a family)", async () => {
+    // Both are audio — but the sniffed format (MPEG sync) is not the declared
+    // subtype (wav), so this must not be saved/reported as a .wav.
+    fetchImageMock.mockResolvedValue({ base64: MP3_BASE64, mimeType: "audio/wav" });
+    await expect(
+      getOutputImage("audio_00001_.wav", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects WAV bytes mislabeled as audio/mpeg", async () => {
+    fetchImageMock.mockResolvedValue({ base64: WAV_BASE64, mimeType: "audio/mpeg" });
+    await expect(
+      getOutputImage("audio_00001_.mp3", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects WebM bytes mislabeled as video/mp4", async () => {
+    fetchImageMock.mockResolvedValue({ base64: WEBM_BASE64, mimeType: "video/mp4" });
+    await expect(
+      getOutputImage("clip_00001_.mp4", "output", "video", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects MP4 bytes mislabeled as video/webm", async () => {
+    fetchImageMock.mockResolvedValue({ base64: MP4_BASE64, mimeType: "video/webm" });
+    await expect(
+      getOutputImage("clip_00001_.webm", "output", "video", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects WAV bytes mislabeled as audio/ogg", async () => {
+    fetchImageMock.mockResolvedValue({ base64: WAV_BASE64, mimeType: "audio/ogg" });
+    await expect(
+      getOutputImage("audio_00001_.ogg", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects Ogg bytes mislabeled as audio/flac", async () => {
+    fetchImageMock.mockResolvedValue({ base64: OGG_BASE64, mimeType: "audio/flac" });
+    await expect(
+      getOutputImage("audio_00001_.flac", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects a video-brand MP4 mislabeled as audio/mp4", async () => {
+    // Same container family, wrong brand: isom is a VIDEO ftyp — audio/mp4
+    // requires an audio brand (M4A/M4B).
+    fetchImageMock.mockResolvedValue({ base64: MP4_BASE64, mimeType: "audio/mp4" });
+    await expect(
+      getOutputImage("audio_00001_.m4a", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects an m4a (audio-brand ftyp) mislabeled as video/mp4", async () => {
+    fetchImageMock.mockResolvedValue({ base64: M4A_BASE64, mimeType: "video/mp4" });
+    await expect(
+      getOutputImage("clip_00001_.mp4", "output", "video", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects MP3 bytes mislabeled as audio/aac (frame-sync formats are distinct)", async () => {
+    // ADTS frames have MPEG layer bits 00; mp3 frames have them set.
+    fetchImageMock.mockResolvedValue({ base64: MP3_BASE64, mimeType: "audio/aac" });
+    await expect(
+      getOutputImage("audio_00001_.aac", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  // ── Positive controls: declared subtype matches sniffed format ──
+
+  it("resolves MP3 bytes labeled audio/mpeg", async () => {
+    fetchImageMock.mockResolvedValue({ base64: MP3_BASE64, mimeType: "audio/mpeg" });
+    await expect(
+      getOutputImage("audio_00001_.mp3", "output", "", { allowMedia: true }),
+    ).resolves.toMatchObject({ mimeType: "audio/mpeg" });
+  });
+
+  it("resolves WebM bytes labeled video/webm", async () => {
+    fetchImageMock.mockResolvedValue({ base64: WEBM_BASE64, mimeType: "video/webm" });
+    await expect(
+      getOutputImage("clip_00001_.webm", "output", "video", { allowMedia: true }),
+    ).resolves.toMatchObject({ mimeType: "video/webm" });
+  });
+
+  it("resolves FLAC bytes labeled audio/flac (STREAMINFO structure)", async () => {
+    fetchImageMock.mockResolvedValue({ base64: FLAC_BASE64, mimeType: "audio/flac" });
+    await expect(
+      getOutputImage("audio_00001_.flac", "output", "", { allowMedia: true }),
+    ).resolves.toMatchObject({ mimeType: "audio/flac" });
+  });
+
+  it("resolves Ogg bytes labeled audio/ogg (page-header structure)", async () => {
+    fetchImageMock.mockResolvedValue({ base64: OGG_BASE64, mimeType: "audio/ogg" });
+    await expect(
+      getOutputImage("audio_00001_.ogg", "output", "", { allowMedia: true }),
+    ).resolves.toMatchObject({ mimeType: "audio/ogg" });
+  });
+
+  it("resolves AAC (ADTS sync) bytes labeled audio/aac", async () => {
+    fetchImageMock.mockResolvedValue({ base64: AAC_BASE64, mimeType: "audio/aac" });
+    await expect(
+      getOutputImage("audio_00001_.aac", "output", "", { allowMedia: true }),
+    ).resolves.toMatchObject({ mimeType: "audio/aac" });
+  });
+
+  // ── Truncated prefixes (#663 round 4): structure, not just signature ──
+
+  it("rejects a 2-byte MPEG sync prefix labeled audio/mpeg", async () => {
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from([0xff, 0xfb]).toString("base64"),
+      mimeType: "audio/mpeg",
+    });
+    await expect(
+      getOutputImage("audio_00001_.mp3", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects an undersized frame-sync body labeled audio/mpeg", async () => {
+    // 102 bytes — above the bare sync, still below a plausible media file.
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from([0xff, 0xfb, ...new Array(100).fill(0)]).toString("base64"),
+      mimeType: "audio/mpeg",
+    });
+    await expect(
+      getOutputImage("audio_00001_.mp3", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects a bare 3-byte 'ID3' prefix labeled audio/mpeg", async () => {
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from([0x49, 0x44, 0x33]).toString("base64"), // ID3
+      mimeType: "audio/mpeg",
+    });
+    await expect(
+      getOutputImage("audio_00001_.mp3", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects an ID3 header whose size bytes are not syncsafe", async () => {
+    // Full-size body, but a tag-size byte has the high bit set — malformed.
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from([
+        0x49, 0x44, 0x33, 0x04, 0x00, 0x00, 0x80, 0x00, 0x00, 0x10,
+        ...new Array(246).fill(0),
+      ]).toString("base64"),
+      mimeType: "audio/mpeg",
+    });
+    await expect(
+      getOutputImage("audio_00001_.mp3", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects a RIFF/WAVE header claiming more bytes than the body holds", async () => {
+    // Chunk size 36 but only 16 delivered — a truncated/fabricated prefix.
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from([
+        0x52, 0x49, 0x46, 0x46, 0x24, 0x00, 0x00, 0x00, // RIFF$...
+        0x57, 0x41, 0x56, 0x45, 0x66, 0x6d, 0x74, 0x20, // WAVEfmt␠
+      ]).toString("base64"),
+      mimeType: "audio/wav",
+    });
+    await expect(
+      getOutputImage("audio_00001_.wav", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects a bare 4-byte 'OggS' prefix labeled audio/ogg", async () => {
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from([0x4f, 0x67, 0x67, 0x53]).toString("base64"),
+      mimeType: "audio/ogg",
+    });
+    await expect(
+      getOutputImage("audio_00001_.ogg", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects a 'fLaC' magic with no STREAMINFO block labeled audio/flac", async () => {
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from([0x66, 0x4c, 0x61, 0x43, 0xff, 0xff, 0xff, 0xff]).toString("base64"),
+      mimeType: "audio/flac",
+    });
+    await expect(
+      getOutputImage("audio_00001_.flac", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
+  it("rejects an undersized EBML prefix labeled video/webm", async () => {
+    // 4-byte EBML magic + 100 zero bytes — below the plausible-size floor.
+    fetchImageMock.mockResolvedValue({
+      base64: Buffer.from([0x1a, 0x45, 0xdf, 0xa3, ...new Array(100).fill(0)]).toString("base64"),
+      mimeType: "video/webm",
+    });
+    await expect(
+      getOutputImage("clip_00001_.webm", "output", "video", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
   it("rejects a truncated 8-byte body that is only '....ftyp' (no box behind it)", async () => {
     // The four bytes "ftyp" at offset 4 alone are not an MP4 — a valid ftyp
     // box needs the major brand and minor version too (>= 16 bytes), so a
@@ -358,13 +584,8 @@ describe("getOutputImage — video/audio media (issue #663)", () => {
   });
 
   it("resolves an m4a payload labeled audio/mp4 (audio-brand ftyp)", async () => {
-    // .m4a is audio in an mp4 container — its ftyp major brand (M4A ) is an
-    // AUDIO signature, so it must not trip the cross-family guard.
-    const M4A_BASE64 = Buffer.from([
-      0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, // ....ftyp
-      0x4d, 0x34, 0x41, 0x20, 0x00, 0x00, 0x00, 0x00, // M4A␠....
-      0x4d, 0x34, 0x41, 0x20, 0x6d, 0x70, 0x34, 0x32, // M4A␠mp42
-    ]).toString("base64");
+    // .m4a is audio in an mp4 container — its ftyp major brand (M4A ) is the
+    // audio/mp4 format, so it must not trip the cross-format guard.
     fetchImageMock.mockResolvedValue({ base64: M4A_BASE64, mimeType: "audio/mp4" });
     await expect(
       getOutputImage("audio_00001_.m4a", "output", "", { allowMedia: true }),
