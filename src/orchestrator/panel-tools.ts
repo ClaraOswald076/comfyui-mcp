@@ -2964,13 +2964,6 @@ function validatePanelEditNodeArgs(args: Record<string, unknown>): string | null
   return null;
 }
 
-function validatePanelColorArgs(args: Record<string, unknown>): string | null {
-  if (args.preset !== undefined && (args.color !== undefined || args.bgcolor !== undefined)) {
-    return "panel_set_node_color preset cannot be combined with color or bgcolor.";
-  }
-  return null;
-}
-
 /**
  * The SINGLE source of truth for the panel_* tool surface. Both transports
  * register these exact definitions, so the Claude (in-process) and Codex (HTTP)
@@ -4714,18 +4707,14 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_set_node_color",
-      "Compatibility wrapper for panel_edit_node(preset/color/bgcolor).",
+      "Legacy color compatibility wrapper. Unlike panel_edit_node, color and bgcolor accept any CSS color string; when preset is supplied it wins over explicit colors, preserving the historical bridge behavior.",
       {
         node_id: z.number().int(),
-        preset: z.enum(["red", "brown", "green", "blue", "pale_blue", "cyan", "purple", "yellow", "black"]).optional(),
-        color: z.string().regex(NODE_COLOR_HEX).nullable().optional(),
-        bgcolor: z.string().regex(NODE_COLOR_HEX).nullable().optional(),
+        preset: z.enum(["red", "brown", "green", "blue", "pale_blue", "cyan", "purple", "yellow", "black"]).nullable().optional(),
+        color: z.string().nullable().optional(),
+        bgcolor: z.string().nullable().optional(),
       },
-      async (args: A, ctx) => {
-        const error = validatePanelColorArgs(args);
-        if (error) return fail(error);
-        return ctx.call({ cmd: "graph_set_node_color", node_id: args.node_id, preset: args.preset, color: args.color, bgcolor: args.bgcolor });
-      },
+      async (args: A, ctx) => ctx.call({ cmd: "graph_set_node_color", node_id: args.node_id, preset: args.preset, color: args.color, bgcolor: args.bgcolor }),
     ),
     def(
       "panel_screenshot",
