@@ -11,6 +11,7 @@ import {
   isLocalModelsListAction,
   listLocalModelsFallback,
 } from "../services/local-models-fallback.js";
+import { resetManagerApiCache } from "../services/manager-api-cache.js";
 import { errorToToolResult } from "../utils/errors.js";
 
 const whereSchema = z.enum(["local", "cloud"]).optional();
@@ -60,12 +61,20 @@ export function registerComfyCliTools(server: McpServer): void {
       try {
         const options = { workspace: args.workspace, timeoutMs: 120_000 };
         let stopped: Awaited<ReturnType<typeof runComfyCli>> | undefined;
-        if (args.action !== "start") stopped = await runComfyCli(["stop"], options);
+        if (args.action !== "start") {
+          stopped = await runComfyCli(["stop"], options);
+          // This is a ComfyUI lifecycle transition like any other: the instance
+          // that comes back on the same URL can be a different ComfyUI-Manager
+          // generation, so the detected dialect must not carry over (#646).
+          resetManagerApiCache("comfy-cli server stop");
+        }
         if (args.action === "stop") return textEnvelope(stopped);
         if (stopped && !stopped.ok) return textEnvelope(stopped);
         const launch = ["launch", "--background"];
         if (args.launchArgs?.length) launch.push("--", ...args.launchArgs);
         const started = await runComfyCli(launch, options);
+        // A launch may have replaced the server behind the same URL — re-probe.
+        resetManagerApiCache("comfy-cli server launch");
         return textEnvelope(args.action === "restart" ? { stopped, started } : started);
       } catch (error) {
         return errorToToolResult(error);

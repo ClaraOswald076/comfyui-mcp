@@ -6,6 +6,7 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSy
 import { homedir } from "node:os";
 import { isIP } from "node:net";
 import { parseComfyUIUrl, type ComfyUITarget } from "./transport/comfyui-url.js";
+import { resetManagerApiCache } from "./services/manager-api-cache.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -766,6 +767,13 @@ export function setComfyuiTarget(url: string): boolean {
   // from COMFYUI_URL, and a runtime retarget must not leave them pinning the
   // process-start host (codex finding).
   process.env.COMFYUI_URL = url;
+  // We are pointed at a DIFFERENT ComfyUI now, so the detected ComfyUI-Manager
+  // dialect describes the previous one. It is normally keyed by base URL and
+  // would simply miss — but a round trip (local → pod → local) can land back on
+  // an identical base string whose server was restarted meanwhile, which is
+  // exactly the stale-dialect case #646 is about. Drop it at the canonical
+  // retarget choke point rather than relying on the key.
+  resetManagerApiCache("comfyui target changed");
   // Tell the control panels where renders run now (local ⇄ pod).
   emitComfyuiTargetChanged();
   return true;
