@@ -454,13 +454,23 @@ async function cancelUpdateAllProvable(
     };
   }
   if (afterLookup || mineAfter.inProgress > 0 || mineAfter.processing) {
+    // A concurrent same-orchestrator enqueue can re-fill the queue between the
+    // pre- and post-reset reads, making mineAfter.pending >= mine.pending — a
+    // zero or negative "dropped" is NOT a provable drop, so claim it only when
+    // it is positive; otherwise say the count moved and nothing more.
+    const dropClaim =
+      dropped > 0
+        ? `dropped ${dropped} of this orchestrator's pending task(s) via a ` +
+          `queue reset on ${base} (${mine.pending} → ${mineAfter.pending}), BUT `
+        : `sent a queue reset on ${base} (this orchestrator's pending went ` +
+          `${mine.pending} → ${mineAfter.pending} — a concurrent enqueue may have ` +
+          `re-filled it, so what the reset dropped is UNPROVEN), BUT `;
     return {
       op,
       outcome: "partially-cancelled",
       markerCleared: false,
       detail:
-        `dropped ${dropped} of this orchestrator's pending task(s) via a ` +
-        `queue reset on ${base} (${mine.pending} → ${mineAfter.pending}), BUT ${
+        `${dropClaim}${
           afterLookup
             ? `the panel's task COMPLETED in the meantime (it is in the queue history)`
             : `${mineAfter.inProgress} task(s) were already RUNNING and in-flight work cannot be cancelled`

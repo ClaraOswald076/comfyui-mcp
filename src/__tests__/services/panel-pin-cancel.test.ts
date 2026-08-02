@@ -484,8 +484,38 @@ describe("pin write cancels a pending update_all (#689)", () => {
     expect(report.note as string).toMatch(/WARNING — a panel-affecting operation is still pending/);
   });
 
-  it("partial: the dropped count is DERIVED from before/after reads, never asserted", async () => {
-    recordUpdateAllMarker({ base: ORIG, uiId: "ui-5" });
+  it("partial with a concurrent RE-FILL (pending 2 → 3): drop UNPROVEN, never a 'dropped' claim", async () => {
+    recordUpdateAllMarker({ base: ORIG, uiId: "ui-5b" });
+    const mine: QueueState = { pending: 2, inProgress: 0, done: 1 };
+    v4Persona(
+      { pending: 2, inProgress: 0, done: 3 },
+      {
+        mine,
+        onReset: () => {
+          mine.inProgress = 1; // a task dequeued mid-reset…
+          mine.pending = 3; // …and a concurrent enqueue added MORE than was dropped
+        },
+      },
+    );
+
+    const report = await writePin();
+
+    expect(resetPosts()).toHaveLength(1);
+    const [cancel] = cancelReports(report);
+    expect(cancel.outcome).toBe("partially-cancelled");
+    expect(cancel.markerCleared).toBe(false);
+    expect(cancel.pendingBefore).toBe(2);
+    expect(cancel.pendingAfter).toBe(3);
+    // mineAfter.pending > mine.pending: a "dropped" count would be zero or
+    // negative, i.e. fabricated. The report names the movement and stops there.
+    expect(cancel.detail).not.toMatch(/dropped \d/);
+    expect(cancel.detail).toMatch(/UNPROVEN/);
+    expect(cancel.detail).toMatch(/2 → 3/);
+    expect(cancel.detail).toMatch(/RUNNING/);
+    expect(activePanelPendingOps()).toHaveLength(1);
+  });
+
+  it("partial: the dropped count is DERIVED from before/after reads, never asserted", async () => {    recordUpdateAllMarker({ base: ORIG, uiId: "ui-5" });
     const mine: QueueState = { pending: 2, inProgress: 0, done: 1 };
     v4Persona(
       { pending: 2, inProgress: 0, done: 3 },
