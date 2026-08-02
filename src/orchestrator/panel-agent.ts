@@ -935,14 +935,14 @@ export class PanelAgent {
   }
 
   /** The current turn produced NO events for the whole idle window → it's frozen.
-   *  Surface a clear error, clear the "working" indicator, and interrupt via the
+   *  Surface a clear error (unless this turn's failure was ALREADY reported — one
+   *  report per turn), clear the "working" indicator, and interrupt via the
    *  guarded interrupt() flow so the turn-gate opens only when the turn GENUINELY
    *  ends (the aborted turn's terminal result, or the bounded interrupt-release
    *  fallback if none arrives) — not synchronously here, which let the next queued
-   *  batch run before the wedged turn had settled. The stall warning is this turn's
-   *  ONE failure report: errorSurfaced + interruptRequested suppress the follow-up
-   *  interrupted result's "turn failed" line (#728). Idempotent per turn via
-   *  idleTripped. */
+   *  batch run before the wedged turn had settled. errorSurfaced +
+   *  interruptRequested suppress the follow-up interrupted result's "turn failed"
+   *  line (#728). Idempotent per turn via idleTripped. */
   private onTurnStalled(): void {
     if (this.closed || this.idleTripped || !this.busy) return;
     // A tool call in flight is legitimate work even with a silent app-server (an
@@ -956,24 +956,30 @@ export class PanelAgent {
     }
     this.idleTripped = true;
     this.idleTimer = null;
+    // ONE failure report per turn: if an `error` event already painted this turn's
+    // failure line (errorSurfaced), the stall warning would be a SECOND report for
+    // the same turn — suppress it (the log line below still records the stall).
+    // Otherwise the stall warning below IS this turn's failure report — mark it
+    // surfaced so the backend's terminal `{ ok: false, subtype: "interrupted" }`
+    // result (or a late `error` event) isn't painted as a second, contradictory
+    // failure. (interrupt() also sets interruptRequested, so the result case
+    // treats that result as the interrupt landing, not a new failure.)
+    const alreadyReported = this.errorSurfaced;
     logger.error(
-      `[panel-agent ${this.short()}] turn stalled — no events for ${Math.round(TURN_IDLE_MS / 1000)}s; surfacing error and interrupting`,
+      `[panel-agent ${this.short()}] turn stalled — no events for ${Math.round(TURN_IDLE_MS / 1000)}s; interrupting${alreadyReported ? " (failure already reported)" : " and surfacing error"}`,
     );
-    // The stall warning below IS this turn's failure report — mark it surfaced so
-    // the backend's terminal `{ ok: false, subtype: "interrupted" }` result isn't
-    // painted as a SECOND, contradictory failure. (interrupt() also sets
-    // interruptRequested, so the result case treats that result as the interrupt
-    // landing, not a new failure.)
     this.errorSurfaced = true;
     this.busy = false;
     // The stalled turn is abandoned + surfaced as an error — don't re-queue its
     // text (a wedged message could otherwise loop on every interrupt, and it may
     // already have performed tool side effects).
     this.inFlight = null;
-    this.deps.onSay(
-      this.tabId,
-      "⚠️ The agent stopped responding (the turn stalled with no activity). I've cleared it — please try again.",
-    );
+    if (!alreadyReported) {
+      this.deps.onSay(
+        this.tabId,
+        "⚠️ The agent stopped responding (the turn stalled with no activity). I've cleared it — please try again.",
+      );
+    }
     this.deps.onTurn?.(this.tabId, "done");
     // Do NOT completeTurn() here: the gate must stay held until the turn genuinely
     // ends. interrupt() arms the bounded release fallback and stops the wedged
@@ -1086,13 +1092,17 @@ export class PanelAgent {
         // `default` and the user watched a turn end in TOTAL silence — the
         // exact "three Hellos into the void" failure from the support thread.
         // Surface it as a visible chat line; the follow-up `result` event still
-        // advances the turn gate normally.
+        // advances the turn gate normally. ONE report per turn: if the failure
+        // was already surfaced (the stall watchdog's warning, or an earlier
+        // error event this turn), skip the chat line but still log it (#728).
         const detail = typeof ev.message === "string" && ev.message.trim() ? ev.message.trim() : "unknown error";
-        this.errorSurfaced = true;
-        this.deps.onSay(
-          this.tabId,
-          `⚠️ The ${this.model} turn failed: ${detail}\n\nNothing was lost — try again, switch models from the composer picker, or check the terminal running the orchestrator for more detail.`,
-        );
+        if (!this.errorSurfaced) {
+          this.errorSurfaced = true;
+          this.deps.onSay(
+            this.tabId,
+            `⚠️ The ${this.model} turn failed: ${detail}\n\nNothing was lost — try again, switch models from the composer picker, or check the terminal running the orchestrator for more detail.`,
+          );
+        }
         logger.warn(`[panel-agent ${this.short()}] backend error: ${detail}`);
         break;
       }

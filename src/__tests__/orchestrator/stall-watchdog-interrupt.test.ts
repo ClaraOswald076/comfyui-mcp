@@ -14,7 +14,9 @@
 // FIX: the watchdog marks the failure surfaced (errorSurfaced) and routes
 // through the guarded interrupt() flow — the aborted turn's terminal result (or
 // the bounded interrupt-release fallback if none arrives) opens the gate at the
-// genuine turn end.
+// genuine turn end. ONE report per turn, both directions: a stall after an
+// `error` event already painted the failure line suppresses the stall warning,
+// and a late `error` event after the stall warning suppresses the error line.
 //
 // TURN_IDLE_MS / INTERRUPT_RELEASE_FALLBACK_MS are read from the env at
 // panel-agent module load, so set SHORT windows BEFORE importing the module.
@@ -103,6 +105,15 @@ class HeldResultBackend implements AgentBackend {
     this.releaseResolvers.shift()?.();
   }
 
+  /** Emit an `error` event for the in-flight turn (test-controlled) — the way
+   *  codex/gemini/grok report a turn failure BEFORE their terminal result. The
+   *  error leaves the turn ACTIVE (no result), so the watchdog can still trip. */
+  emitError(message: string): void {
+    this.emitFn?.({ type: "error", message });
+  }
+
+  private emitFn: ((ev: AgentEvent) => void) | null = null;
+
   async *run(opts: BackendStartOptions): AsyncGenerator<AgentEvent> {
     const out: AgentEvent[] = [];
     let wakeOut: (() => void) | null = null;
@@ -146,6 +157,7 @@ class HeldResultBackend implements AgentBackend {
     })();
 
     emit({ type: "session", sessionId: "sess-held" });
+    this.emitFn = emit;
     try {
       while (!inputDone || out.length) {
         if (!out.length) {
@@ -270,5 +282,79 @@ describe("stall watchdog interrupt reports once and holds the turn gate (#728)",
     const warnings = says.filter((s) => s.includes("⚠️"));
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toMatch(/stopped responding/i);
+  });
+
+  it("error event first, result withheld → the watchdog does NOT paint a second report", async () => {
+    // The codex-gate finding on PR #746: handleEvent('error') paints the turn's
+    // failure line but leaves the turn ACTIVE; if the terminal result never
+    // arrives, the watchdog must NOT add its stall warning on top (one report
+    // per turn) — while still interrupting and releasing the gate via the
+    // guarded fallback.
+    const says: string[] = [];
+    const backend = new HeldResultBackend();
+    const agent = new PanelAgent("tab-728c", makeDeps(says) as never, backend);
+    void agent.start();
+
+    agent.send("first message");
+    await backend.waitStarted(1);
+    agent.send("second message queued behind the stall");
+
+    // The backend reports the turn's failure, then goes silent (no result).
+    backend.emitError("provider exploded");
+    await waitFor(() => says.some((s) => /turn failed/i.test(s)));
+
+    // The watchdog still trips on the silence (the error left the turn active)
+    // and interrupts the backend…
+    await waitFor(() => backend.interrupted >= 1);
+
+    // …the gate stays held until the bounded fallback opens it (no result ever
+    // arrives)…
+    await new Promise((r) => setTimeout(r, GATE_HELD_MS));
+    expect(backend.turns).toEqual(["first message"]);
+    await backend.waitStarted(2);
+    expect(backend.turns[1]).toContain("second message");
+
+    backend.releaseOnInterrupt = true; // let stop()'s interrupt unwind the pump
+    await agent.stop();
+
+    // …but the stall warning is SUPPRESSED: the error event was this turn's ONE
+    // failure report.
+    const warnings = says.filter((s) => s.includes("⚠️"));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/turn failed/i);
+    expect(says.join("\n")).not.toMatch(/stopped responding/i);
+  });
+
+  it("stall warning first, late error event for the same turn → the error line is suppressed", async () => {
+    // The symmetric order: the watchdog's stall warning already reported this
+    // turn's failure (errorSurfaced), so a late backend `error` event for the
+    // SAME turn must not paint a second line.
+    const says: string[] = [];
+    const backend = new HeldResultBackend();
+    const agent = new PanelAgent("tab-728d", makeDeps(says) as never, backend);
+    void agent.start();
+
+    agent.send("first message");
+    await backend.waitStarted(1);
+    agent.send("second message queued behind the stall");
+
+    // Watchdog trips first: stall warning painted, backend interrupted.
+    await waitFor(() => tripped(backend, says));
+
+    // A late `error` event arrives for the same (already-reported) turn, then
+    // the interrupted result settles the turn and opens the gate.
+    backend.emitError("late backend error");
+    backend.releaseTurn();
+    await backend.waitStarted(2);
+    expect(backend.turns[1]).toContain("second message");
+
+    backend.releaseOnInterrupt = true; // let stop()'s interrupt unwind the pump
+    await agent.stop();
+
+    // Exactly ONE report — the stall warning; the late error line is suppressed.
+    const warnings = says.filter((s) => s.includes("⚠️"));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/stopped responding/i);
+    expect(says.join("\n")).not.toMatch(/turn failed/i);
   });
 });
