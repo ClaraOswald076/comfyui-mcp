@@ -170,6 +170,14 @@ export interface PanelInstallerDeps {
    * `indeterminate`, which counts as pinned).
    */
   readPin: () => PanelPinState;
+  /**
+   * Detect the connected Manager's API dialect ("legacy" 3.x | "v2"/"v2-batch" v4).
+   * The #724 git fallback fires ONLY on "legacy": an empty-queue signature is
+   * indistinguishable from an outage/failed enqueue on other dialects, and a git
+   * mutation is only warranted on the PROVEN stale-3.x host (codex gate). Default
+   * is the real detectManagerApi; tests stub it.
+   */
+  detectManagerDialect?: (() => Promise<"v2" | "v2-batch" | "legacy" | undefined>) | undefined;
   /** Is the target ComfyUI reachable right now? Never throws. */
   isReachable: () => Promise<boolean>;
   install: (opts: { id: string; version?: string }) => Promise<NodeOpResult>;
@@ -1578,15 +1586,20 @@ async function updateViaGitCheckoutFallback(opts: {
   if (verdict.outcome === "updated") {
     const from = verdict.previousVersion ?? verdict.previousRev?.slice(0, 8) ?? "?";
     const to = verdict.installedVersion ?? verdict.installedRev?.slice(0, 8) ?? "?";
+    // The embedded result came from the Manager call that no-op'd — its own
+    // message may credit ComfyUI-Manager. The report must not contradict the
+    // git-fallback path that actually did the work (codex gate).
+    const fallbackMessage =
+      `Panel updated (${from} → ${to}) via git pull --ff-only on the panel repo ` +
+      `(${dir}), verified on disk: ComfyUI-Manager no-op'd the update (stale ` +
+      `legacy 3.x, #724), so the update was applied directly from git. RESTART ` +
+      `ComfyUI to load the updated panel node.`;
+    const honestResult = { ...result, message: fallbackMessage };
     return {
       action: "update",
-      result,
+      result: honestResult,
       restartRequired: true,
-      message:
-        `Panel updated (${from} → ${to}) via git pull --ff-only on the panel repo ` +
-        `(${dir}), verified on disk: ComfyUI-Manager no-op'd the update (stale ` +
-        `legacy 3.x, #724), so the update was applied directly from git. RESTART ` +
-        `ComfyUI to load the updated panel node.`,
+      message: fallbackMessage,
       previousVersion,
       installedVersion: post.version,
     };
@@ -1741,6 +1754,32 @@ export async function runPanelActionInner(
     // `git pull --ff-only` on the panel repo and verify THAT the same way
     // instead of only surfacing the error.
     if (verdict.outcome === "no-op" && previousRev && post.dir) {
+      // DIALECT GATE — the empty-queue signature only MEANS "stale Manager 3.x"
+      // on a legacy host. On a v4 host (or with the dialect unproven) the same
+      // signature is an outage/failed enqueue, and a git mutation is not
+      // warranted (codex gate): report the unverified no-op instead of pulling.
+      let dialect: string | undefined;
+      if (deps.detectManagerDialect) {
+        dialect = await deps.detectManagerDialect();
+      } else {
+        try {
+          const { detectManagerApi } = await import("./node-management.js");
+          dialect = await detectManagerApi();
+        } catch {
+          dialect = undefined;
+        }
+      }
+      if (dialect !== "legacy") {
+        throw new PanelInstallError(
+          `Panel update did NOT apply: nothing changed on disk, and the Manager's ` +
+            `API dialect here is ${dialect ?? "unproven"}, NOT the legacy 3.x whose ` +
+            `silent no-op this matches (#724) — so the git fallback does not fire ` +
+            `(an empty queue on this host is an outage or a failed enqueue, not the ` +
+            `stale-3.x signature). Update ComfyUI-Manager on the host and retry, or ` +
+            `update the panel repo manually (git pull in ${post.dir}), then RESTART ComfyUI.`,
+        );
+      }
+
       // Bind the fallback to ONE directory: the git proof (previousRev) belongs
       // to the ORIGINAL detection, so the pull and the post verification must
       // target that same checkout. A re-detection that resolves a DIFFERENT

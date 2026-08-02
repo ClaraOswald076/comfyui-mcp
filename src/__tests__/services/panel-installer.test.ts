@@ -109,6 +109,8 @@ function makeDeps(opts: {
   upstreamRev?: string;
   /** When set, gitUpstreamRev throws "no upstream configured". */
   noUpstream?: boolean;
+  /** Manager API dialect the probe reports ("unproven" -> undefined). Defaults to "legacy". */
+  dialect?: "v2" | "v2-batch" | "legacy" | "unproven";
 } = {}): Harness {
   const files = opts.files ?? {};
   const revs = opts.revs ?? {};
@@ -142,6 +144,8 @@ function makeDeps(opts: {
       if (opts.noUpstream) throw new Error("fatal: no upstream configured");
       return opts.upstreamRev ?? revs[dir];
     },
+    detectManagerDialect: async () =>
+      opts.dialect === "unproven" ? undefined : (opts.dialect ?? "legacy"),
     gitPullFfOnly: (dir) => {
       gitPulls.push(dir);
       if (opts.onGitPull) return opts.onGitPull({ files, revs });
@@ -833,6 +837,39 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
     expect(err).toBeInstanceOf(PanelInstallError);
     expect(String(err?.message ?? err)).not.toMatch(/already at the upstream tip/);
     // The git fallback must NOT fire on a movement state it cannot prove.
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("dialect v2 (Manager 4.x host) + empty queue -> fallback REFUSED, no pull (outage is not the 3.x signature)", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: LEGACY_NOOP,
+      dialect: "v2",
+      onGitPull: () => "Updating d806619..675ace8\nFast-forward",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).toMatch(/did NOT apply/);
+    expect(String(err?.message ?? err)).toMatch(/v2/);
+    // On a non-legacy host an empty queue is an outage/failed enqueue: no git mutation.
+    expect(h.updates).toEqual([{ id: PANEL_REGISTRY_ID }]);
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("dialect UNPROVEN + empty queue -> fallback REFUSED, no pull (fail closed)", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: LEGACY_NOOP,
+      dialect: "unproven",
+      onGitPull: () => "Updating d806619..675ace8\nFast-forward",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).toMatch(/did NOT apply|unproven/);
     expect(h.gitPulls).toEqual([]);
   });
 
