@@ -1,5 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as perfHooks from "node:perf_hooks";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 // Regression for #646: detectManagerApi() cached the detected ComfyUI-Manager
 // wire dialect keyed ONLY by base URL, for the whole process lifetime. After the
@@ -53,7 +55,29 @@ vi.mock("node:child_process", () => ({
   execFileSync: vi.fn(),
   spawnSync: vi.fn(() => ({ status: 0, stdout: "{}", stderr: "" })),
 }));
-vi.mock("node:fs", () => ({ existsSync: vi.fn(() => true) }));
+vi.mock("node:fs", async (importOriginal) => ({
+  // Keep the existsSync knob for resolveCmCliPath; delegate everything else to
+  // the REAL fs: panel-targeting mutations (id="all" below) now take the panel
+  // mutation lock (panel-pin-guard), which is a real file — a partial mock left
+  // the lock's mkdir/open/write undefined and every such op failed closed.
+  ...(await importOriginal<typeof import("node:fs")>()),
+  existsSync: vi.fn(() => true),
+}));
+
+// The panel mutation lock is a FILE (panel-pin-guard). Point it at a temp path
+// so the suite never touches ~/.comfyui-mcp, and so parallel vitest workers get
+// their own lock instead of serializing on one shared file.
+process.env.COMFYUI_MCP_PANEL_LOCK = join(
+  tmpdir(),
+  `cmcp-lock-dialectcache-${process.pid}.lock`,
+);
+
+// The id="all" mutations below consult the panel version pin before any Manager
+// traffic. This suite is not about pinning, and its existsSync knob answers
+// true for everything, so the pin store would look present-but-unreadable and
+// fail closed (correct in production, a false positive here). Use the
+// documented env escape hatch to say plainly "no pin in this suite".
+process.env.COMFYUI_MCP_PANEL_PIN = "off";
 
 const {
   installCustomNode,

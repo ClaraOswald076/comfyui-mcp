@@ -40,11 +40,38 @@ const managerCalls: string[] = [];
 // stub "{}" responses.
 let managerGate: Promise<void> | null = null;
 let managerFailAfterGate = false;
+// The update paths route through detectManagerApi (#656), and with the generic
+// "{}" answers detection THROWS — which is what most of these tests want (a
+// fast, definite failure right after the guard lets a call through). But the
+// update_all lock test needs the mutation to actually COMPLETE — enqueue +
+// worker start, no drain — so it opts into the stub answering the dialect
+// probes like a legacy 3.x Manager. (Never turn this on for a path that
+// DRAINS the Manager queue: the stub has no queue progression, so the drain
+// would hold the panel lock until the test times out, cascading into every
+// later lock-taking test.)
+let managerLegacyPersona = false;
 vi.mock("../../comfyui/fetch.js", () => ({
-  comfyuiFetch: vi.fn(async (path: string) => {
-    managerCalls.push(path);
+  comfyuiFetch: vi.fn(async (url: string) => {
+    managerCalls.push(url);
     if (managerGate) await managerGate;
     if (managerFailAfterGate) throw new Error("test: Manager went away");
+    if (managerLegacyPersona) {
+      const path = new URL(url, "http://stub.local").pathname;
+      if (path === "/manager/queue/status") {
+        return new Response(
+          JSON.stringify({
+            total_count: 1,
+            done_count: 1,
+            in_progress_count: 0,
+            is_processing: false,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (path === "/manager/version") {
+        return new Response("V3.41", { status: 200 });
+      }
+    }
     return new Response("{}", { status: 200 });
   }),
 }));
@@ -73,6 +100,7 @@ beforeEach(() => {
   managerCalls.length = 0;
   managerGate = null;
   managerFailAfterGate = false;
+  managerLegacyPersona = false;
   dir = mkdtempSync(join(tmpdir(), "cmcp-bypass-"));
   process.env.COMFYUI_MCP_PANEL_SETTINGS = join(dir, "panel-settings.json");
   process.env.COMFYUI_MCP_PANEL_LOCK = join(dir, "panel-op.lock");
@@ -212,6 +240,10 @@ describe("a pin written MID-mutation cannot slice through it", () => {
   });
 
   it("update_all holds the lock across queue + start, and still only reports 'queued'", async () => {
+    // update_all goes detectManagerApi → enqueueUpdateAll → queue/start with NO
+    // drain, so the stub can let it complete: answer the dialect probes like a
+    // legacy 3.x Manager (see the stub's comment).
+    managerLegacyPersona = true;
     let releaseManager!: () => void;
     managerGate = new Promise<void>((resolve) => {
       releaseManager = resolve;
