@@ -250,7 +250,9 @@ describe("searchNodePacks", () => {
     mkdirSync(pack, { recursive: true });
     writeFileSync(join(pack, "nodes.py"), "class FooNode:\n    pass\n");
     writeFileSync(join(pack, "bin.dat"), Buffer.from([0, 1, 2, 0, 70, 111, 111]));
-    const res = searchNodePacks({ query: "FooNode" });
+    // Force the builtin path regardless of whether rg exists on this host (#655).
+    const { deps } = makeDeps();
+    const res = searchNodePacks({ query: "FooNode" }, deps);
     expect(res.engine).toBe("builtin");
     expect(res.matches.length).toBe(1);
     // Default path "." searches the whole jail root, so file is root-relative.
