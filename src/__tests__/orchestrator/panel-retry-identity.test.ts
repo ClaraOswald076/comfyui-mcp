@@ -28,7 +28,7 @@ import {
   requiresWorkflowStampEnforcement,
   SESSION_EPOCH,
 } from "../../services/ui-bridge.js";
-import { buildModelsPushFrame, pushModelsFrame } from "../../orchestrator/index.js";
+import { buildModelsPushFrame, buildSessionEpochFrame, pushModelsFrame } from "../../orchestrator/index.js";
 
 const textOf = (res: ToolResult): string => (res.content[0] as { text: string }).text;
 
@@ -329,6 +329,10 @@ describe("#694 session epoch on the models push frame", () => {
 
   it("(h) SESSION_EPOCH is a per-process UUID", () => {
     expect(SESSION_EPOCH).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  });
+
+  it("(h) the epoch-first session frame carries the same per-process epoch", () => {
+    expect(buildSessionEpochFrame()).toEqual({ type: "session_epoch", epoch: SESSION_EPOCH });
   });
 
   it("(h) pushes an epoch handshake even when model discovery is empty", () => {

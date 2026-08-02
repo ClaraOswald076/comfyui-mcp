@@ -703,6 +703,15 @@ export function buildModelsPushFrame(
   return { type: "models", epoch: SESSION_EPOCH, models, current, backend };
 }
 
+/** #694 (epoch-first) — the tiny immediate frame a hello gets before any async
+ *  work: advances the session epoch without waiting for model discovery, so a
+ *  command arriving in the gap can never resolve retry_of against the prior
+ *  process's epoch. Exported (pure) for the shape test. Type is "session_epoch"
+ *  — NEVER "session": that frame name is taken (session_id lifecycle). */
+export function buildSessionEpochFrame(): Record<string, unknown> {
+  return { type: "session_epoch", epoch: SESSION_EPOCH };
+}
+
 /**
  * Send the model handshake even when discovery returned no choices. The models
  * frame is also the process-epoch handshake that scopes panel retry tokens, so
@@ -2430,6 +2439,14 @@ export async function runPanelOrchestrator(): Promise<void> {
     // tell the difference (and warn if no ack arrives).
     if (event.type === "hello" && event.tab_id) {
       const panelTab = event.tab_id;
+      // #694 (epoch-first) — restamp the session epoch IMMEDIATELY on hello,
+      // before any async work (model discovery, panel sync, retarget probe).
+      // The models frame carries the epoch too, but it awaits async discovery,
+      // so a command arriving in the gap could resolve retry_of against the
+      // PRIOR process's epoch/journal. This tiny "session_epoch" frame (NEVER
+      // "session" — that name is the session_id lifecycle frame) advances the
+      // epoch first thing; the panel stamps on any epoch-carrying frame.
+      bridge.push(buildSessionEpochFrame(), panelTab);
       // Learn the sidebar panel's version from its hello and, the first time we
       // see it (or when it changes on a panel update), refresh the env block so
       // the agent's ENVIRONMENT line carries the panel version — bug reports get
