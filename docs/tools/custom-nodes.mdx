@@ -307,7 +307,10 @@ Resolve and install the custom node packs a ComfyUI workflow requires via ComfyU
 
 ## node_snapshot
 
-Custom-node snapshots via ComfyUI-Manager (mirrors `comfy node save-snapshot` / `restore-snapshot`). Driven by the `action` parameter: - action:"list" — List the snapshots ComfyUI-Manager knows about. No other parameters. Read-only. - action:"save" — Save the current custom-node and version state. With no `name`, Manager assigns a timestamped snapshot (works against remote instances). Providing `name` writes a custom-named snapshot file, which requires a local ComfyUI install and is unavailable in remote (--comfyui-url) mode. - action:"restore" — Restore a previously saved snapshot by `name` (required). ComfyUI-Manager applies the custom-node changes on the next ComfyUI restart; use action:"list" to find available names.
+Custom-node snapshots via ComfyUI-Manager (mirrors `comfy node save-snapshot` / `restore-snapshot`). Driven by the `action` parameter:
+- action:"list" — List the snapshots ComfyUI-Manager knows about. No other parameters. Read-only.
+- action:"save" — Save the current custom-node and version state. With no `name`, Manager assigns a timestamped snapshot (works against remote instances). Providing `name` writes a custom-named snapshot file, which requires a local ComfyUI install and is unavailable in remote (--comfyui-url) mode.
+- action:"restore" — Restore a previously saved snapshot by `name` (required). ComfyUI-Manager applies the custom-node changes on the next ComfyUI restart; use action:"list" to find available names.
 
 ### Parameters
 
@@ -335,7 +338,13 @@ Custom-node snapshots via ComfyUI-Manager (mirrors `comfy node save-snapshot` / 
 
 ## bisect
 
-Binary-search (git-bisect style) over installed ComfyUI custom nodes to find which one causes a problem. A state machine driven by the `action` parameter: - action:"start" — Begin a session over all currently-enabled custom nodes. Enables half and disables the rest for the first test round, then guide the search with good/bad. Prefers the ComfyUI-Manager HTTP API; falls back to toggling .disabled directory suffixes for local installs. A ComfyUI restart may be needed for changes to take effect. - action:"good" — Mark the currently enabled set as GOOD (the problem is absent with this set). Narrows the search to the disabled candidates and enables the next subset. Resolves and reports the culprit when one node remains. - action:"bad" — Mark the currently enabled set as BAD (the problem is present with this set). Narrows the search to the enabled subset and enables the next subset. Resolves and reports the culprit when one node remains. - action:"reset" — Re-enable all custom nodes and clear the session. Use to abort a bisection or restore the installation after the search completes. - action:"status" — Report the current session state: status (idle/running/resolved), the remaining candidate node set, which nodes are enabled this round, and the identified culprit if resolved. All actions are argument-free; `action` is the only parameter. `good`/`bad` require a session already started with action:"start".
+Binary-search (git-bisect style) over installed ComfyUI custom nodes to find which one causes a problem. A state machine driven by the `action` parameter:
+- action:"start" — Begin a session over all currently-enabled custom nodes. Enables half and disables the rest for the first test round, then guide the search with good/bad. Prefers the ComfyUI-Manager HTTP API; falls back to toggling .disabled directory suffixes for local installs. A ComfyUI restart may be needed for changes to take effect.
+- action:"good" — Mark the currently enabled set as GOOD (the problem is absent with this set). Narrows the search to the disabled candidates and enables the next subset. Resolves and reports the culprit when one node remains.
+- action:"bad" — Mark the currently enabled set as BAD (the problem is present with this set). Narrows the search to the enabled subset and enables the next subset. Resolves and reports the culprit when one node remains.
+- action:"reset" — Re-enable all custom nodes and clear the session. Use to abort a bisection or restore the installation after the search completes.
+- action:"status" — Report the current session state: status (idle/running/resolved), the remaining candidate node set, which nodes are enabled this round, and the identified culprit if resolved.
+All actions are argument-free; `action` is the only parameter. `good`/`bad` require a session already started with action:"start".
 
 ### Parameters
 
