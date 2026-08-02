@@ -776,6 +776,11 @@ export async function fetchManagerTaskHistoryEntry(
     // shaped wrong is not an answer we can act on.
     return Object.keys(h).length === 0 ? null : undefined;
   }
+  // STRICT id check: an entry for a DIFFERENT task (a rewriting proxy, a
+  // Manager variant that ignores ui_id and answers with something else's
+  // history) must never prove anything about OUR task — least of all clear
+  // its marker as already-drained (#689 round 4).
+  if (h.ui_id !== uiId) return undefined;
   return {
     uiId: h.ui_id,
     kind: typeof h.kind === "string" ? h.kind : undefined,

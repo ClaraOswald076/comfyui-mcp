@@ -248,7 +248,9 @@ async function cancelUpdateAllNoUiId(
       inProgress: 0,
     });
   }
-  if (mine.pending === 0) {
+  // In-flight first, as in the ui_id path: running work cannot be cancelled
+  // regardless of what else is pending, and no reset may be sent into it.
+  if (mine.inProgress > 0 || mine.processing) {
     const busy =
       mine.inProgress > 0
         ? `${mine.inProgress} task(s) from this orchestrator are RUNNING`
@@ -258,12 +260,11 @@ async function cancelUpdateAllNoUiId(
       outcome: "already-running",
       markerCleared: false,
       detail:
-        `cannot cancel — nothing of this orchestrator's is pending on ${base}, ` +
-        `but ${busy}, and in-flight work cannot be cancelled (a queue reset ` +
-        `only drops PENDING work). The update_all may STILL move the panel ` +
-        `after this pin.`,
-      pendingBefore: 0,
-      pendingAfter: 0,
+        `cannot cancel — ${busy} on ${base} and the update_all's tasks may be ` +
+        `among them; in-flight work cannot be cancelled (a queue reset only ` +
+        `drops PENDING work). NO reset was sent. The update_all may STILL move ` +
+        `the panel after this pin.`,
+      pendingBefore: mine.pending,
       inProgress: mine.inProgress,
     };
   }
@@ -353,20 +354,10 @@ async function cancelUpdateAllProvable(
         `NOTHING was sent; the warning stands.`,
     };
   }
-  if (mine.pending === 0 && mine.inProgress === 0 && !mine.processing) {
-    return finalize(op, {
-      outcome: "already-drained",
-      detail:
-        `the panel's update task is not pending, not running, and not in the ` +
-        `Manager's (bounded) queue history on ${base} — it never ran or already ` +
-        `finished, and NOTHING remains that can move the panel. Check ` +
-        `install_panel(action='status').`,
-      pendingBefore: 0,
-      pendingAfter: 0,
-      inProgress: 0,
-    });
-  }
-  if (mine.pending === 0) {
+  // In-flight FIRST: a running task of ours may be the panel's update, and
+  // in-flight work cannot be cancelled — regardless of what else is pending.
+  // Checking pending first would send a reset into a live update (#689 round 4).
+  if (mine.inProgress > 0 || mine.processing) {
     const busy =
       mine.inProgress > 0
         ? `${mine.inProgress} task(s) from this orchestrator are RUNNING`
@@ -376,19 +367,32 @@ async function cancelUpdateAllProvable(
       outcome: "already-running",
       markerCleared: false,
       detail:
-        `cannot cancel — nothing of this orchestrator's is pending on ${base}, ` +
-        `but ${busy} and the panel's task may be among them; in-flight work ` +
-        `cannot be cancelled (a reset only drops PENDING work). NO reset was ` +
-        `sent. The update_all may STILL move the panel after this pin.`,
-      pendingBefore: 0,
-      pendingAfter: 0,
+        `cannot cancel — ${busy} on ${base} and the panel's task may be among ` +
+        `them; in-flight work cannot be cancelled (a queue reset only drops ` +
+        `PENDING work, so it would only wipe unrelated queued tasks). NO reset ` +
+        `was sent. The update_all may STILL move the panel after this pin.`,
+      pendingBefore: mine.pending,
       inProgress: mine.inProgress,
     };
   }
+  if (mine.pending === 0) {
+    return finalize(op, {
+      outcome: "already-drained",
+      detail:
+        `the panel's update task is not pending, not running, and not in the ` +
+        `Manager's (bounded) queue history on ${base} — it never ran or already ` +
+        `finished, so there was NOTHING left to cancel. The panel may ALREADY ` +
+        `have been moved — check install_panel(action='status').`,
+      pendingBefore: 0,
+      pendingAfter: 0,
+      inProgress: 0,
+    });
+  }
 
-  // 3. Our tasks are PROVABLY pending (the panel's, if enqueued, is among
-  //    them: it did not run and is not running). The reset is a targeted
-  //    cancel now — still queue-wide, so measure the blast radius too.
+  // 3. Our tasks are PROVABLY pending and NOTHING is running (the panel's, if
+  //    enqueued, is among them: it did not run and is not running). The reset
+  //    is a targeted cancel now — still queue-wide, so measure the blast
+  //    radius too.
   const shared = await fetchManagerQueueCounts(base);
   try {
     await resetQueue(base);
@@ -407,29 +411,32 @@ async function cancelUpdateAllProvable(
   }
 
   // 4. Prove the end state: the panel's task is gone from EVERYWHERE (a task
-  //    could have been dequeued or completed in the race).
+  //    could have been dequeued or completed in the race). A reset fired, so
+  //    every branch below names the shared-queue blast radius, and every
+  //    dropped count is DERIVED from before/after reads — never asserted.
   const mineAfter = await fetchManagerClientQueueCounts(base);
   const sharedAfter = await fetchManagerQueueCounts(base);
-  if (!mineAfter) {
-    return {
-      op,
-      outcome: "could-not-verify",
-      markerCleared: false,
-      detail:
-        `a queue reset was sent on ${base} (${mine.pending} of this ` +
-        `orchestrator's task(s) were pending), but the post-reset state could ` +
-        `not be read — what was dropped is UNVERIFIED. The update_all may ` +
-        `still be pending.`,
-      pendingBefore: mine.pending,
-      inProgress: mine.inProgress,
-    };
-  }
   const blast =
     shared && sharedAfter
       ? ` Queue-wide pending went ${shared.pending} → ${sharedAfter.pending} ` +
         `(the Manager queue is shared — unrelated queued work was dropped too).`
       : ` The Manager queue is shared, so unrelated queued work may have been ` +
         `dropped too.`;
+  if (!mineAfter) {
+    return {
+      op,
+      outcome: "could-not-verify",
+      markerCleared: false,
+      detail:
+        `a queue reset was sent on ${base} with ${mine.pending} of this ` +
+        `orchestrator's task(s) pending, but the post-reset state could not be ` +
+        `read — what was dropped is UNVERIFIED and nothing is claimed.${blast} ` +
+        `The update_all may still be pending.`,
+      pendingBefore: mine.pending,
+      inProgress: mine.inProgress,
+    };
+  }
+  const dropped = mine.pending - mineAfter.pending;
   const afterLookup = await panelTaskState(uiId, base);
   if (afterLookup === undefined) {
     return {
@@ -437,10 +444,10 @@ async function cancelUpdateAllProvable(
       outcome: "could-not-verify",
       markerCleared: false,
       detail:
-        `a queue reset was sent on ${base} and dropped ${mine.pending} of this ` +
-        `orchestrator's pending task(s), but the queue history could not be ` +
-        `re-read — whether the panel's task ran in the meantime is UNKNOWN.` +
-        `${blast} The warning stands.`,
+        `a queue reset was sent on ${base} (this orchestrator's pending tasks ` +
+        `went ${mine.pending} → ${mineAfter.pending}), but the queue history ` +
+        `could not be re-read — whether the panel's task ran in the meantime ` +
+        `is UNKNOWN.${blast} The warning stands.`,
       pendingBefore: mine.pending,
       pendingAfter: mineAfter.pending,
       inProgress: mineAfter.inProgress,
@@ -452,8 +459,8 @@ async function cancelUpdateAllProvable(
       outcome: "partially-cancelled",
       markerCleared: false,
       detail:
-        `dropped ${mine.pending} of this orchestrator's pending task(s) via a ` +
-        `queue reset on ${base}, BUT ${
+        `dropped ${dropped} of this orchestrator's pending task(s) via a ` +
+        `queue reset on ${base} (${mine.pending} → ${mineAfter.pending}), BUT ${
           afterLookup
             ? `the panel's task COMPLETED in the meantime (it is in the queue history)`
             : `${mineAfter.inProgress} task(s) were already RUNNING and in-flight work cannot be cancelled`
@@ -470,9 +477,9 @@ async function cancelUpdateAllProvable(
       markerCleared: false,
       detail:
         `a queue reset was sent on ${base}, but ${mineAfter.pending} of this ` +
-        `orchestrator's task(s) are STILL pending (concurrent enqueues can ` +
-        `re-fill the queue) — the update_all was not provably cancelled. The ` +
-        `warning stands.`,
+        `orchestrator's task(s) are STILL pending (was ${mine.pending}; ` +
+        `concurrent enqueues can re-fill the queue) — the update_all was not ` +
+        `provably cancelled.${blast} The warning stands.`,
       pendingBefore: mine.pending,
       pendingAfter: mineAfter.pending,
       inProgress: mineAfter.inProgress,
@@ -485,7 +492,7 @@ async function cancelUpdateAllProvable(
       `panel's update task is not in the queue history and, after a queue ` +
       `reset on ${base}, nothing from this orchestrator is pending or running ` +
       `— it was dropped (or never enqueued) and CANNOT run. The reset dropped ` +
-      `${mine.pending} of this orchestrator's pending task(s).${blast}`,
+      `${dropped} of this orchestrator's pending task(s).${blast}`,
     pendingBefore: mine.pending,
     pendingAfter: 0,
     inProgress: 0,

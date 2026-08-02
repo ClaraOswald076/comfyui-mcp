@@ -70,6 +70,7 @@ import {
 import { getPanelPinState, PANEL_PIN_ENV_VAR } from "../../services/panel-settings.js";
 import {
   fetchManagerQueueCounts,
+  fetchManagerTaskHistoryEntry,
   resetManagerApiCacheForTests,
 } from "../../services/node-management.js";
 import { updateAllCustomNodes } from "../../services/update-comfyui.js";
@@ -145,11 +146,16 @@ interface V4PersonaOpts {
   resetFails?: boolean;
   /** Completed task ui_ids the Manager reports in its queue history. */
   history?: Set<string>;
+  /** Override the history response entirely (e.g. a mismatched ui_id). */
+  historyResponder?: (uiId: string) => unknown;
   /** Counts for THIS orchestrator (the client_id=comfyui-mcp filter).
    *  Defaults to the shared state object. */
   mine?: QueueState;
   /** Race injection run when the reset lands (e.g. dequeue a task first). */
   onReset?: () => void;
+  /** After a reset fires, the client-filtered status 404s (post-reset state
+   *  unreadable). */
+  clientStatusFailsAfterReset?: boolean;
 }
 
 /**
@@ -160,12 +166,17 @@ interface V4PersonaOpts {
 function v4Persona(state: QueueState, opts: V4PersonaOpts = {}) {
   const mine = opts.mine ?? state;
   const history = opts.history ?? new Set<string>();
+  let resetDone = false;
   managerHandler = (url, init) => {
     const u = new URL(url);
     const path = u.pathname;
     const method = init?.method ?? "GET";
     if (path === "/v2/manager/queue/status" && method === "GET") {
-      const s = u.searchParams.get("client_id") === "comfyui-mcp" ? mine : state;
+      const isMine = u.searchParams.get("client_id") === "comfyui-mcp";
+      if (isMine && resetDone && opts.clientStatusFailsAfterReset) {
+        return new Response("gone", { status: 404 });
+      }
+      const s = isMine ? mine : state;
       return jsonRes({
         total_count: s.done + s.inProgress + s.pending,
         done_count: s.done,
@@ -176,12 +187,14 @@ function v4Persona(state: QueueState, opts: V4PersonaOpts = {}) {
     }
     if (path === "/v2/manager/queue/history" && method === "GET") {
       const uiId = u.searchParams.get("ui_id") ?? "";
+      if (opts.historyResponder) return jsonRes(opts.historyResponder(uiId));
       return history.has(uiId)
         ? jsonRes({ history: { ui_id: uiId, kind: "update", result: "done" } })
         : jsonRes({ history: {} });
     }
     if (path === "/v2/manager/queue/reset" && method === "POST") {
       if (opts.resetFails) return new Response("boom", { status: 500 });
+      resetDone = true;
       state.pending = 0; // wipe_queue() clears PENDING only — running survives
       mine.pending = 0;
       opts.onReset?.();
@@ -420,6 +433,39 @@ describe("pin write cancels a pending update_all (#689)", () => {
     expect(report.note as string).toMatch(/WARNING/);
   });
 
+  it("in-flight detected FIRST: our work running AND pending — already-running, NO reset sent", async () => {
+    // Round-4 finding: pending > 0 must not fall through to the reset path
+    // while a task of ours is in flight.
+    recordUpdateAllMarker({ base: ORIG, uiId: "ui-r1" });
+    v4Persona({ pending: 2, inProgress: 1, done: 1 }, { mine: { pending: 2, inProgress: 1, done: 1 } });
+
+    const report = await writePin();
+
+    expect(resetPosts()).toHaveLength(0);
+    const [cancel] = cancelReports(report);
+    expect(cancel.outcome).toBe("already-running");
+    expect(cancel.markerCleared).toBe(false);
+    expect(cancel.pendingBefore).toBe(2);
+    expect(cancel.inProgress).toBe(1);
+    expect(cancel.detail).toMatch(/cannot cancel/i);
+    expect(cancel.detail).toMatch(/RUNNING/);
+    expect(activePanelPendingOps()).toHaveLength(1);
+  });
+
+  it("v4 marker without a ui_id, our work running AND pending: already-running — NO reset", async () => {
+    recordUpdateAllMarker({ base: ORIG }); // no uiId
+    v4Persona({ pending: 2, inProgress: 1, done: 1 }, { mine: { pending: 2, inProgress: 1, done: 1 } });
+
+    const report = await writePin();
+
+    expect(resetPosts()).toHaveLength(0);
+    const [cancel] = cancelReports(report);
+    expect(cancel.outcome).toBe("already-running");
+    expect(cancel.markerCleared).toBe(false);
+    expect(cancel.inProgress).toBe(1);
+    expect(activePanelPendingOps()).toHaveLength(1);
+  });
+
   it("in-flight (already dequeued): cannot cancel, NO reset sent, never 'saved'", async () => {
     recordUpdateAllMarker({ base: ORIG, uiId: "ui-4" });
     v4Persona({ pending: 0, inProgress: 1, done: 3 }, { mine: { pending: 0, inProgress: 1, done: 1 } });
@@ -438,12 +484,18 @@ describe("pin write cancels a pending update_all (#689)", () => {
     expect(report.note as string).toMatch(/WARNING — a panel-affecting operation is still pending/);
   });
 
-  it("partial: pending dropped but a task started running in the race — marker KEPT, both halves reported", async () => {
+  it("partial: the dropped count is DERIVED from before/after reads, never asserted", async () => {
     recordUpdateAllMarker({ base: ORIG, uiId: "ui-5" });
     const mine: QueueState = { pending: 2, inProgress: 0, done: 1 };
     v4Persona(
       { pending: 2, inProgress: 0, done: 3 },
-      { mine, onReset: () => { mine.inProgress = 1; } }, // dequeued mid-reset
+      {
+        mine,
+        onReset: () => {
+          mine.inProgress = 1; // a task was dequeued mid-reset…
+          mine.pending = 1; // …and a concurrent enqueue re-filled one slot
+        },
+      },
     );
 
     const report = await writePin();
@@ -453,15 +505,56 @@ describe("pin write cancels a pending update_all (#689)", () => {
     expect(cancel.outcome).toBe("partially-cancelled");
     expect(cancel.markerCleared).toBe(false);
     expect(cancel.pendingBefore).toBe(2);
-    expect(cancel.pendingAfter).toBe(0);
+    expect(cancel.pendingAfter).toBe(1);
     expect(cancel.inProgress).toBe(1);
-    expect(cancel.detail).toMatch(/dropped 2 of this orchestrator's pending task/);
-    expect(cancel.detail).toMatch(/already RUNNING and in-flight work cannot be cancelled/);
+    // 2 → 1 is a drop of ONE: the report must not claim both were dropped.
+    expect(cancel.detail).toMatch(/dropped 1 of this orchestrator's pending task/);
+    expect(cancel.detail).toMatch(/\(2 → 1\)/);
+    expect(cancel.detail).not.toMatch(/dropped 2/);
+    expect(cancel.detail).toMatch(/Queue-wide pending went/);
     expect(activePanelPendingOps()).toHaveLength(1);
     expect(report.note as string).toMatch(/WARNING/);
   });
 
-  it("already drained (no trace of the panel's task): marker cleared, truthfully not a cancel", async () => {
+  it("post-reset state unreadable: UNVERIFIED claims NO drop and names the blast radius", async () => {
+    recordUpdateAllMarker({ base: ORIG, uiId: "ui-8" });
+    v4Persona({ pending: 2, inProgress: 0, done: 1 }, { clientStatusFailsAfterReset: true });
+
+    const report = await writePin();
+
+    expect(resetPosts()).toHaveLength(1); // the reset DID fire
+    const [cancel] = cancelReports(report);
+    expect(cancel.outcome).toBe("could-not-verify");
+    expect(cancel.markerCleared).toBe(false);
+    expect(cancel.detail).toMatch(/what was dropped is UNVERIFIED/);
+    expect(cancel.detail).toMatch(/Queue-wide pending went 2 → 0/);
+    expect(cancel.detail).not.toMatch(/dropped \d/); // no unmeasured claim
+    expect(activePanelPendingOps()).toHaveLength(1);
+  });
+
+  it("a history entry with a DIFFERENT ui_id proves nothing — could-not-verify, marker kept", async () => {
+    recordUpdateAllMarker({ base: ORIG, uiId: "ui-x" });
+    v4Persona(
+      { pending: 0, inProgress: 0, done: 1 },
+      {
+        // A proxy/variant answering with somebody else's history entry.
+        historyResponder: () => ({
+          history: { ui_id: "someone-elses-task", kind: "update", result: "done" },
+        }),
+      },
+    );
+
+    const report = await writePin();
+
+    expect(resetPosts()).toHaveLength(0);
+    const [cancel] = cancelReports(report);
+    expect(cancel.outcome).toBe("could-not-verify");
+    expect(cancel.markerCleared).toBe(false);
+    expect(cancel.detail).toMatch(/queue history on .* could not be read/);
+    expect(activePanelPendingOps()).toHaveLength(1);
+  });
+
+  it("already drained (no trace of the panel's task): marker cleared, truthfully not a cancel — and says the panel may ALREADY have moved", async () => {
     recordUpdateAllMarker({ base: ORIG, uiId: "ui-6" });
     v4Persona({ pending: 0, inProgress: 0, done: 3 });
 
@@ -471,7 +564,11 @@ describe("pin write cancels a pending update_all (#689)", () => {
     const [cancel] = cancelReports(report);
     expect(cancel.outcome).toBe("already-drained");
     expect(cancel.markerCleared).toBe(true);
-    expect(cancel.detail).toMatch(/NOTHING remains that can move the panel/);
+    expect(cancel.detail).toMatch(/NOTHING left to cancel/);
+    // Finding 4: "already finished" alone is not enough — the report must
+    // name the possibility that the update already landed.
+    expect(cancel.detail).toMatch(/may ALREADY have been moved/);
+    expect(cancel.detail).toMatch(/install_panel\(action='status'\)/);
     expect(cancel.detail).not.toMatch(/cancelled the queued|dropped \d/);
     expect(activePanelPendingOps()).toEqual([]);
   });
@@ -846,5 +943,30 @@ describe("fetchManagerQueueCounts", () => {
   it("returns undefined (could-not-verify) when the Manager is unreachable", async () => {
     managerHandler = () => new Response("not found", { status: 404 });
     await expect(fetchManagerQueueCounts(ORIG)).resolves.toBeUndefined();
+  });
+});
+
+describe("fetchManagerTaskHistoryEntry (#689 round 4)", () => {
+  it("returns the entry ONLY when the ui_id matches; {} is provably absent", async () => {
+    v4Persona(
+      { pending: 0, inProgress: 0, done: 0 },
+      { history: new Set(["ui-a_comfyui-agent-panel"]) },
+    );
+    await expect(
+      fetchManagerTaskHistoryEntry("ui-a_comfyui-agent-panel", ORIG),
+    ).resolves.toMatchObject({ uiId: "ui-a_comfyui-agent-panel", kind: "update" });
+    await expect(
+      fetchManagerTaskHistoryEntry("ui-b_comfyui-agent-panel", ORIG),
+    ).resolves.toBeNull();
+  });
+
+  it("a mismatched ui_id in the response is UNTRUSTED (undefined), never proof", async () => {
+    v4Persona(
+      { pending: 0, inProgress: 0, done: 0 },
+      { historyResponder: () => ({ history: { ui_id: "other-task", kind: "update" } }) },
+    );
+    await expect(
+      fetchManagerTaskHistoryEntry("ui-a_comfyui-agent-panel", ORIG),
+    ).resolves.toBeUndefined();
   });
 });
