@@ -728,6 +728,29 @@ export function pushModelsFrame(
   return bridge.push(buildModelsPushFrame(models, current, backend), panelTabId);
 }
 
+/**
+ * Keeps download-tray reconciliation state separate from the progress-file
+ * lifecycle. `record` only decides whether a changed snapshot needs a global
+ * broadcast; `forPanel` is the current (possibly empty) state sent to every
+ * hello/re-hello so a reconnect cannot retain rows from an old process.
+ */
+export class DownloadProgressSnapshots {
+  private lastSnapshot: string | null = null;
+  private rows: Array<Record<string, unknown>> = [];
+
+  record(rows: Array<Record<string, unknown>>): boolean {
+    const snapshot = JSON.stringify(rows);
+    if (snapshot === this.lastSnapshot) return false;
+    this.lastSnapshot = snapshot;
+    this.rows = rows;
+    return true;
+  }
+
+  forPanel(): Array<Record<string, unknown>> {
+    return this.rows;
+  }
+}
+
 export async function runPanelOrchestrator(): Promise<void> {
   // Crash guard: the orchestrator is a long-lived background process the user
   // can't see. A stray rejection (e.g. a fire-and-forget push to a tab that
@@ -835,6 +858,9 @@ export async function runPanelOrchestrator(): Promise<void> {
   const lockPort = Number(process.env.COMFYUI_MCP_BRIDGE_PORT) || 9180;
   const lockPath = orchLockPath(lockPort);
   const bridge = startUiBridge(lockPort, bridgeToken, bridgeHost);
+  // Starts empty intentionally: a newly connected panel must be able to clear
+  // rows left by an older process before this process sees any progress files.
+  const downloadSnapshots = new DownloadProgressSnapshots();
   // The LISTENER'S auth was fixed at construction: a null boot token means a
   // tokenless listener FOREVER — lazily provisioning a token later would
   // advertise a tunnel whose token is not enforced (codex finding). The lazy
@@ -3024,6 +3050,12 @@ export async function runPanelOrchestrator(): Promise<void> {
       pushReadiness(panelTab);
       if (backend === "claude") pushCommands(panelTab);
       bridge.push({ type: "workflow_target", target: workflowTargets.get(panelTab) }, panelTab);
+      // #717: panel tray rows belong to the bridge session, while progress files
+      // are process-private. Reconcile THIS hello/re-hello directly, including
+      // an empty snapshot, rather than waiting for an unrelated future change.
+      // This frame is state only: it does not create terminal rows or signal any
+      // download outcome.
+      bridge.push({ type: "download_progress", downloads: downloadSnapshots.forPanel() }, panelTab);
       // Seed this tab's live queue monitor right away: queue_status broadcasts
       // are change-only, so a tab connecting MID-render would otherwise wait for
       // the next state transition to learn a job is already running.
@@ -4252,7 +4284,6 @@ export async function runPanelOrchestrator(): Promise<void> {
   } catch {
     // no saved state
   }
-  let lastDownloadSnapshot = "[]";
   const pollDownloads = () => {
     let files: string[] = [];
     try {
@@ -4370,9 +4401,7 @@ export async function runPanelOrchestrator(): Promise<void> {
     // must not count as idle. Self-healing: a crashed writer's row ages out.
     downloadingRows = downloads.filter((d) => d.status === "downloading");
     downloads.sort((a, b) => String(a.name ?? "").localeCompare(String(b.name ?? "")));
-    const snapshot = JSON.stringify(downloads);
-    if (snapshot !== lastDownloadSnapshot) {
-      lastDownloadSnapshot = snapshot;
+    if (downloadSnapshots.record(downloads)) {
       bridge.push({ type: "download_progress", downloads }); // broadcast to all tabs
     }
     // Flush any download-completion buckets whose debounce window has elapsed —
