@@ -28,7 +28,7 @@ import {
   requiresWorkflowStampEnforcement,
   SESSION_EPOCH,
 } from "../../services/ui-bridge.js";
-import { buildModelsPushFrame } from "../../orchestrator/index.js";
+import { buildModelsPushFrame, pushModelsFrame } from "../../orchestrator/index.js";
 
 const textOf = (res: ToolResult): string => (res.content[0] as { text: string }).text;
 
@@ -314,5 +314,27 @@ describe("#694 session epoch on the models push frame", () => {
 
   it("(h) SESSION_EPOCH is a per-process UUID", () => {
     expect(SESSION_EPOCH).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  });
+
+  it("(h) pushes an epoch handshake even when model discovery is empty", () => {
+    const pushed: Array<{ frame: Record<string, unknown>; tabId: string | undefined }> = [];
+    pushModelsFrame(
+      {
+        push: (frame, tabId) => {
+          pushed.push({ frame, tabId });
+          return 1;
+        },
+      } as never,
+      "tab-empty",
+      [],
+      undefined,
+      "claude",
+    );
+    expect(pushed).toEqual([
+      {
+        frame: { type: "models", epoch: SESSION_EPOCH, models: [], current: undefined, backend: "claude" },
+        tabId: "tab-empty",
+      },
+    ]);
   });
 });
