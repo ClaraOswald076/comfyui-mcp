@@ -285,10 +285,20 @@ export function resolveLiveInterpreter(opts: ResolveOptions): LiveInterpreter | 
 
   // Tier 1 — the process we launched, confirmed by PID *and* start time.
   if (launchRecord && launchRecord.pid === pid && existsSync(launchRecord.python)) {
+    // macOS `ps lstart` is SECOND-resolution: a PID recycled within the same
+    // second compares equal. On that platform the timestamp alone is not an
+    // identity, so the observed command line must also corroborate the recorded
+    // interpreter; anywhere the stamp is sub-second (Linux ticks, Windows
+    // FileTime) equality already is proof.
+    const coarseStamp = platform() === "darwin";
+    const corroborated =
+      !coarseStamp ||
+      commandLineMatchesArgv(identity?.commandLine, [launchRecord.python]);
     if (
       launchRecord.startedAt &&
       identity?.startedAt &&
-      launchRecord.startedAt === identity.startedAt
+      launchRecord.startedAt === identity.startedAt &&
+      corroborated
     ) {
       return { python: launchRecord.python, source: "launched-by-us", pid };
     }
