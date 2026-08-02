@@ -1459,6 +1459,80 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     desktop.close();
   });
 
+  it("reports graph-mutation capability from the same enforcement and stamp conditions as dispatch (#709)", async () => {
+    const desktop = await connectPanel("tmp:capable", "capable");
+    await vi.waitFor(() => expect(bridge.tabCanMutateGraph("tmp:capable")).toBe(true));
+
+    // A same-tab re-hello from a stale browser bundle resets capability. It must not
+    // inherit the prior modern hello, because dispatch will refuse the unfenced write.
+    desktop.send(JSON.stringify({ type: "hello", tab_id: "tmp:capable", title: "stale" }));
+    await vi.waitFor(() => expect(bridge.tabCanMutateGraph("tmp:capable")).toBe(false));
+
+    // Enforcement without a trusted stamp is still not graph-mutation-ready.
+    bridge.setTabWorkflowUuidResolver(() => undefined);
+    desktop.send(
+      JSON.stringify({
+        type: "hello",
+        tab_id: "tmp:capable",
+        title: "no-stamp",
+        enforces_workflow_stamp: true,
+      }),
+    );
+    await vi.waitFor(() => expect(bridge.tabCanMutateGraph("tmp:capable")).toBe(false));
+    desktop.close();
+  });
+
+  it("does not report graph-mutation capability after the panel socket closes (#709)", async () => {
+    const desktop = await connectPanel("tmp:closing", "closing");
+    await vi.waitFor(() => expect(bridge.tabCanMutateGraph("tmp:closing")).toBe(true));
+
+    // Wait for the server-side connection to observe the close; neither readiness
+    // accessor may retain capability or a generation after its socket is gone.
+    desktop.close();
+    await vi.waitFor(() => expect(bridge.tabCanMutateGraph("tmp:closing")).toBe(false));
+    expect(bridge.tabConnectionGeneration("tmp:closing")).toBeUndefined();
+  });
+
+  it("keeps the browser-tab session identity per hello rather than inheriting it across a workflow-id takeover (#709)", async () => {
+    const original = await connectPanel("wf:shared.json", "shared");
+    original.send(
+      JSON.stringify({
+        type: "hello",
+        tab_id: "wf:shared.json",
+        title: "shared",
+        enforces_workflow_stamp: true,
+        tab_session_id: "browser-tab-original",
+      }),
+    );
+    await vi.waitFor(() =>
+      expect(bridge.tabConnectionIdentity("wf:shared.json")).toMatchObject({ tabSessionId: "browser-tab-original" }),
+    );
+    const before = bridge.tabConnectionIdentity("wf:shared.json");
+
+    const replacement = new WebSocket(`ws://127.0.0.1:${port}`);
+    await new Promise<void>((resolve, reject) => {
+      replacement.on("open", () => {
+        replacement.send(
+          JSON.stringify({
+            type: "hello",
+            tab_id: "wf:shared.json",
+            title: "same saved workflow, different browser tab",
+            enforces_workflow_stamp: true,
+            tab_session_id: "browser-tab-other",
+          }),
+        );
+        resolve();
+      });
+      replacement.on("error", reject);
+    });
+    await vi.waitFor(() =>
+      expect(bridge.tabConnectionIdentity("wf:shared.json")).toMatchObject({ tabSessionId: "browser-tab-other" }),
+    );
+    const after = bridge.tabConnectionIdentity("wf:shared.json");
+    expect(after?.generation).toBeGreaterThan(before?.generation ?? Number.MAX_SAFE_INTEGER);
+    replacement.close();
+  });
+
   it("FAILS CLOSED: a MUTATING graph command is refused for an OLD panel that doesn't enforce the stamp; reads still work (#570 P0c)", async () => {
     // An OLD panel hellos WITHOUT enforces_workflow_stamp — it would silently ignore the
     // per-command workflow stamp and could apply a stale write to the wrong canvas.

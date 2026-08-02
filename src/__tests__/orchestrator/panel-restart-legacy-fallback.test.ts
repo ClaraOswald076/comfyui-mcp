@@ -73,6 +73,9 @@ function makeCtx(
       tabIsLocal: () => frontsBoot,
     } as unknown as PanelToolCtx["bridge"],
     tabId: "t",
+    panelConnectionIdentity: () => ({ generation: 1, tabSessionId: "browser-tab-a" }),
+    awaitPostRestartReachable: async () => true,
+    tabCanMutateGraph: () => true,
   } as unknown as PanelToolCtx;
   return { ctx, calls };
 }
@@ -140,6 +143,36 @@ describe("panel_restart_comfyui — legacy no-endpoint fallback", () => {
     expect(out.via).toBe("observed-cycle");
     expect(String(out.note)).toMatch(/came back healthy/i);
     expect(res.isError).toBeFalsy();
+  });
+
+  it("does not claim graph tools are ready when the legacy restart reconnects a stale panel bundle (#709)", async () => {
+    const { ctx } = makeCtx(NO_ENDPOINT_REPLY);
+    ctx.awaitPostRestartReachable = async () => true;
+    ctx.tabCanMutateGraph = () => false; // stale pre-workflow-stamp browser bundle
+
+    const res = (await restartTool().handler({}, ctx)) as ToolResult;
+    const out = JSON.parse(res.content.find((c) => c.type === "text")!.text as string);
+    expect(out.server_ready).toBe(true);
+    expect(out.panel_tab_reconnected).toBe(true);
+    expect(out.graph_tools_ready).toBe(false);
+    expect(out.ready).toBe(false);
+    expect(String(out.note)).toMatch(/stale panel bundle|Hard-refresh.*Ctrl\+Shift\+R/i);
+    expect(String(out.note)).not.toMatch(/rebind with panel_set_workflow_target/i);
+  });
+
+  it("does not claim graph tools are ready when the legacy restart server recovers before its panel tab", async () => {
+    const { ctx } = makeCtx(NO_ENDPOINT_REPLY);
+    ctx.awaitReachable = async () => true; // the pre-restart tab is still reachable
+    ctx.awaitPostRestartReachable = async () => false;
+    ctx.tabCanMutateGraph = () => true;
+
+    const res = (await restartTool().handler({}, ctx)) as ToolResult;
+    const out = JSON.parse(res.content.find((c) => c.type === "text")!.text as string);
+    expect(out.server_ready).toBe(true);
+    expect(out.panel_tab_reconnected).toBe(false);
+    expect(out.graph_tools_ready).toBe(false);
+    expect(out.ready).toBe(false);
+    expect(String(out.note)).toMatch(/has NOT reconnected|rebind/i);
   });
 
   it("Desktop first-healthy (NO observed down) → couldn't-confirm (a no-op leaves the endpoint healthy)", async () => {
