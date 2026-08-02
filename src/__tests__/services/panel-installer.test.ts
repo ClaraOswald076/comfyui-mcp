@@ -955,6 +955,34 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
     expect(r.result.message).not.toMatch(/^updated$/);
   });
 
+  it("malformed reported pending_count (\"1\") -> fallback REFUSED: reported-but-broken is unproven, no merge", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: { total_count: 0, done_count: 0, in_progress_count: 0, is_processing: false, pending_count: "1" },
+      onGitPull: () => "merge output",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).toMatch(/did NOT apply|empty-queue signature/);
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("null pending_count -> fallback REFUSED: malformed, no merge", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: { total_count: 0, done_count: 0, in_progress_count: 0, is_processing: false, pending_count: null },
+      onGitPull: () => "merge output",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).toMatch(/did NOT apply|empty-queue signature/);
+    expect(h.gitPulls).toEqual([]);
+  });
+
   it("legacy no-op + real git checkout + pull advances it → updated via the fallback (verified)", async () => {
     const h = makeDeps({
       comfyuiPath: COMFY,

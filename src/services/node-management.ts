@@ -106,6 +106,12 @@ export interface NodeOpResult {
   message: string;
   /** Raw queue status (HTTP path) or subprocess output (cm-cli path). */
   details?: unknown;
+  /**
+   * The ComfyUI-Manager base the op targeted (manager-http path), captured at
+   * invocation — post-op verification (e.g. the #724 dialect probe) must aim
+   * at the SAME server even if the global target was retargeted in between.
+   */
+  managerBase?: string;
 }
 
 export interface ParsedGitUrl {
@@ -2130,17 +2136,21 @@ async function updateCustomNodeImpl(
   if (!all && isManagerSelfTarget(id)) return updateManagerSelf(id);
 
   let status: QueueStatus;
+  // Freeze the target BEFORE the first await (queueManagerTask does the same):
+  // a mid-op retarget must not split the enqueue and the post-op verification
+  // across two servers. The base travels back on the result so callers (the
+  // #724 panel fallback's dialect probe) verify against the SAME Manager.
+  const base = managerBaseUrl();
   if (all) {
     // update_all keeps its own dedicated route (so it does NOT go through
     // queueManagerTask), but it is just as dialect-dependent — route it through
     // the same enqueue-only self-heal so a stale classification can't wedge it
     // either (#646). Enqueue here, drain once below.
-    const base = managerBaseUrl();
     const { used } = await enqueueUpdateAll(mode, base);
     status = await runManagerQueue(used, base);
   } else {
     // Single-pack update → unified task; UpdatePackParams uses node_name/node_ver.
-    status = await queueManagerTask("update", { node_name: id });
+    status = await queueManagerTask("update", { node_name: id }, base);
   }
   return {
     mechanism: "manager-http",
@@ -2148,6 +2158,7 @@ async function updateCustomNodeImpl(
       ? "Queued update_all with ComfyUI-Manager. Completion and the sidebar panel's on-disk version are not verified yet."
       : `Queued + updated "${id}" via ComfyUI-Manager.`,
     details: status,
+    managerBase: base,
   };
 }
 

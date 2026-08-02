@@ -196,7 +196,7 @@ export interface PanelInstallerDeps {
    * mutation is only warranted on the PROVEN stale-3.x host (codex gate). Default
    * is the real detectManagerApi; tests stub it.
    */
-  detectManagerDialect?: (() => Promise<"v2" | "v2-batch" | "legacy" | undefined>) | undefined;
+  detectManagerDialect?: ((base?: string) => Promise<"v2" | "v2-batch" | "legacy" | undefined>) | undefined;
   /** Is the target ComfyUI reachable right now? Never throws. */
   isReachable: () => Promise<boolean>;
   install: (opts: { id: string; version?: string }) => Promise<NodeOpResult>;
@@ -1361,13 +1361,17 @@ export function looksLikeManagerNoOp(details: unknown): boolean {
  */
 export function isProvenLegacyEmptyQueue(details: unknown): boolean {
   const c = readQueueCounts(details);
-  return (
-    c.total === 0 &&
-    c.done === 0 &&
-    c.inProgress === 0 &&
-    c.processing === false &&
-    (c.pending ?? 0) === 0
-  );
+  if (!(c.total === 0 && c.done === 0 && c.inProgress === 0 && c.processing === false)) {
+    return false;
+  }
+  // pending_count is optional (absent on legacy 3.x) — but a REPORTED value
+  // must be a real numeric 0. A malformed one ("1", null, …) normalizes to
+  // undefined in readQueueCounts, which must read as UNPROVEN, not absent.
+  if (details && typeof details === "object" && "pending_count" in details) {
+    const p = (details as Record<string, unknown>).pending_count;
+    return typeof p === "number" && p === 0;
+  }
+  return true;
 }
 
 export type UpdateOutcome =
@@ -1909,13 +1913,16 @@ export async function runPanelActionInner(
       // on a legacy host. On a v4 host (or with the dialect unproven) the same
       // signature is an outage/failed enqueue, and a git mutation is not
       // warranted (codex gate): report the unverified no-op instead of pulling.
+      // Probe the dialect of the SAME Manager the update call used — the
+      // base travels back on the result (a mid-op retarget must not let a
+      // v2-host outage read as 'legacy' from another endpoint, codex gate).
       let dialect: string | undefined;
       if (deps.detectManagerDialect) {
-        dialect = await deps.detectManagerDialect();
+        dialect = await deps.detectManagerDialect(result.managerBase);
       } else {
         try {
           const { detectManagerApi } = await import("./node-management.js");
-          dialect = await detectManagerApi();
+          dialect = await detectManagerApi(result.managerBase);
         } catch {
           dialect = undefined;
         }
