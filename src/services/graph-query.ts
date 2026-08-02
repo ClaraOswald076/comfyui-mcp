@@ -78,13 +78,19 @@ const WIDGET_VALUE_CAP = 2048;
 
 /** Bound one widget value by its ESCAPED (JSON-serialized) size (#609), so the bound
  *  holds regardless of content — control chars and lone surrogates escape to 6 chars
- *  each, not 2. Small values pass through; else the longest head prefix whose encoding
- *  fits `cap`, with an honest marker naming how many raw chars were dropped. */
+ *  each, not 2. A non-string is measured by its REAL serialized form (the single
+ *  stringify below) — re-serializing that JSON text would double-count every escape
+ *  and type-change a fitting object/array into a truncated string (review nit).
+ *  Small values pass through; else the longest head prefix whose encoding fits `cap`,
+ *  with an honest marker naming how many raw chars were dropped. */
 function capWidgetValue(value: unknown, cap = WIDGET_VALUE_CAP): unknown {
   if (value == null) return value;
-  const s = typeof value === "string" ? value : (() => { try { return JSON.stringify(value); } catch { return String(value); } })();
+  const isString = typeof value === "string";
+  const s = isString ? value : (() => { try { return JSON.stringify(value); } catch { return String(value); } })();
   if (typeof s !== "string") return value;
-  if (JSON.stringify(s).length <= cap) return value;
+  // A string is emitted escaped (JSON.stringify(s)); a non-string's emission IS s.
+  const serializedSize = isString ? JSON.stringify(s).length : s.length;
+  if (serializedSize <= cap) return value;
   const target = Math.max(2, cap - 40);
   let lo = 0;
   let hi = s.length;
