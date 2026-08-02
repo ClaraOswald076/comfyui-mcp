@@ -1921,6 +1921,41 @@ async function installCustomNodeImpl(
   };
 }
 
+/**
+ * Post-op presence gate for update/reinstall (#730) — the same fail-closed
+ * check install got in #232, reusing the same helpers (listInstalledNodesAt +
+ * nodeInstalledMatches). A drained Manager queue proves NOTHING about whether
+ * work happened: for an id that resolves nowhere the enqueue is a silent no-op
+ * and the drain passes trivially (total_count 0 while done_count increments),
+ * which is how update/reinstall reported "Queued + updated/reinstalled" for
+ * packs that do not exist. So re-read the installed list afterward —
+ * /customnode/installed reflects the on-disk custom_nodes — and require the
+ * pack to resolve SOMEWHERE before claiming success.
+ *
+ * A pack that IS installed but not in the registry (git-cloned) still matches —
+ * nodeInstalledMatches covers the module/auxId spellings — so that path is
+ * unaffected; only an id that resolves NOWHERE fails.
+ */
+async function assertPackPresentAfterOp(
+  id: string,
+  op: "update" | "reinstall",
+  base: string,
+  status: QueueStatus,
+): Promise<void> {
+  const installed = await listInstalledNodesAt(base).catch(
+    () => [] as InstalledNode[],
+  );
+  if (!nodeInstalledMatches(id, installed)) {
+    throw new NodeManagementError(
+      `"${id}" was queued for ${op} but is not present afterward — it is not ` +
+        `installed locally and was not found in the ComfyUI-Manager registry, ` +
+        `so there was nothing to ${op}. Check the pack id (list_installed_nodes ` +
+        `shows what is actually installed).`,
+      status,
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // update
 // ---------------------------------------------------------------------------
@@ -2151,6 +2186,10 @@ async function updateCustomNodeImpl(
   } else {
     // Single-pack update → unified task; UpdatePackParams uses node_name/node_ver.
     status = await queueManagerTask("update", { node_name: id }, base);
+    // VERIFY (#730): the drain passes trivially for an id Manager never
+    // enqueued (total_count 0 — the "Queued + updated" lie in the issue).
+    // Require the pack to resolve SOMEWHERE post-op before claiming success.
+    await assertPackPresentAfterOp(id, "update", base, status);
   }
   return {
     mechanism: "manager-http",
@@ -2268,6 +2307,10 @@ async function reinstallCustomNodeImpl(
     channel,
     mode,
   }, base);
+  // VERIFY (#730): same queue-drain trust hole as update — for an id that
+  // resolves nowhere BOTH cycles no-op and both drains pass trivially. Require
+  // the pack to be present afterward before claiming a reinstall.
+  await assertPackPresentAfterOp(id, "reinstall", base, status);
   return {
     mechanism: "manager-http",
     message: `Queued + reinstalled "${id}" (uninstall + install) via ComfyUI-Manager. A restart may be required.`,

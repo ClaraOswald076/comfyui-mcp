@@ -687,6 +687,14 @@ describe("#646 Manager API dialect cache invalidation", () => {
         const body = init?.body ? JSON.parse(init.body as string) : undefined;
         const path = new URL(url).pathname;
         calls.push({ path, method, body });
+        // #730: single-pack updates re-read the installed list post-op — both
+        // packs must resolve for the ops to succeed.
+        if (path.startsWith("/v2/customnode/installed")) {
+          return jsonResponse({
+            "pack-a": { ver: "1.0.0", enabled: true },
+            "pack-b": { ver: "1.0.0", enabled: true },
+          });
+        }
         if (path === "/v2/manager/queue/status") return jsonResponse(DRAINED);
         if (path === "/v2/manager/is_legacy_manager_ui") {
           if (gated) await gate;

@@ -662,8 +662,9 @@ describe("runPanelAction", () => {
   });
 
   it("#639: reinstall where the pack never lands → throws, not silent success", async () => {
-    // reinstallCustomNode does NOT verify presence downstream (unlike install),
-    // so the panel-layer post-op check is what fails this closed.
+    // The panel-layer post-op check is what fails this closed (the generic
+    // reinstallCustomNode gained its own presence gate later, in #730 — but the
+    // deps here are injected, so this exercises the panel's own check).
     const h = makeDeps({ comfyuiPath: COMFY });
     await expect(runPanelAction("reinstall", h.deps)).rejects.toBeInstanceOf(
       PanelInstallError,
