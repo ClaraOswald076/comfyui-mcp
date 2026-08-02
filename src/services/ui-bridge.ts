@@ -532,6 +532,12 @@ function stableStringify(v: unknown, key = ""): string {
       v = (toJSON as (this: unknown, k: string) => unknown).call(v, key);
     }
   }
+  // Boxed primitives (new Number/String/Boolean) carry no enumerable keys, so
+  // the object branch below would fingerprint them all as {} while the wire
+  // writes the primitive — unwrap to the primitive first (#517 gate).
+  if (v instanceof Number || v instanceof String || v instanceof Boolean) {
+    v = v.valueOf();
+  }
   if (v === null || typeof v !== "object") {
     // In an ARRAY position JSON serializes undefined/function/symbol as null.
     return JSON.stringify(v) ?? "null";
