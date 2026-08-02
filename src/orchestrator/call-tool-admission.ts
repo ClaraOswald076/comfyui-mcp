@@ -1,0 +1,164 @@
+/**
+ * Admission for the orchestrator's direct tool channel (call_tool frames from a
+ * mobile/canvas-less client). Extracted from src/orchestrator/index.ts so the
+ * decision is a pure, unit-testable function — the dispatcher is a one-line
+ * call site.
+ */
+
+/** The direct tool channel: a mobile client can invoke these READ/DOWNLOAD backend
+ *  tools without an agent turn (structured nav data + rig downloads). The
+ *  bridge is already token-gated; this whitelist keeps call_tool to non-destructive
+ *  tools (no restart/remove/clear/install). */
+const CALL_TOOL_WHITELIST = new Set<string>([
+  "list_workflows",
+  "get_workflow",
+  "analyze_workflow",
+  "query_workflow",
+  "workflow_from_image",
+  "list_output_images",
+  "get_image",
+  "list_local_models",
+  // Read-only CivitAI lookups (creator-search feature): let a client browse
+  // models/creators through the rig without an agent turn.
+  "search_civitai_models",
+  "search_civitai_creators",
+  "download_civitai_model",
+  "download_model",
+  "enqueue_workflow",
+  // Persist a workflow to the ComfyUI library (mobile "pull workflow from a
+  // CivitAI example" → save_workflow). Writes a workflow file (auto-converts
+  // API-format graphs to canvas-openable UI format); overwrites same-filename,
+  // so the client generates a unique name. No model/system mutation.
+  "save_workflow",
+  // One-tap cancel of the RUNNING render (the mobile queue monitor's stop
+  // button). User-initiated and narrowly scoped: the client passes the
+  // prompt_id it saw in `queue_status`, and action:"cancel" only interrupts
+  // when the running job still matches — it can never kill a job that started
+  // after the tap, and (without clear_pending, which the mobile client never
+  // sends) it never touches other pending jobs in a shared queue. 0.49.0
+  // slice 4 folded the eight queue/jobs tools into this one name, so admission
+  // is ACTION-scoped below to exactly what its retired single-purpose
+  // predecessor entry covered — see CALL_TOOL_ACTION_WHITELIST.
+  "queue",
+  // "Why did my render fail?" for canvas-less clients. The panel answers this from
+  // live canvas state (panel_get_errors); a phone has no canvas, so it reads
+  // the same story server-side from history + re-validating the graph that ran.
+  // Read-only.
+  "diagnose_run",
+  // Read-only training surface: flow/model discovery + progress polling +
+  // docker/GPU/image preflight for the panel/mobile Training tab, and the
+  // dataset/job-config/file readers behind its Jobs/Datasets views.
+  "train_list_flows",
+  "train_status",
+  "train_doctor",
+  "train_list_datasets",
+  "train_dataset_detail",
+  "train_job_config",
+  "train_file",
+  "train_preview_config",
+  "train_dataset_update",
+  "train_dataset_delete",
+  "train_caption_image",
+  "train_caption_dataset",
+  "train_delete_job",
+  // User-initiated training ops (panel/mobile Training wizard): stage a dataset,
+  // launch a GPU-container training run, cancel one. All validation lives in the
+  // tools themselves (dataset checks, docker/image preflight, liveness-verified
+  // cancel); the whitelist only gates reachability.
+  "train_prepare_dataset",
+  "train_start",
+  "train_cancel",
+  // RunPod control panel (desktop + mobile): the one-tap pod lifecycle + the
+  // local⇄pod host switch. Read-only status/list/troubleshoot, the COST-SAVING
+  // actions (stop/use_local), connect (retarget only — a pod must already be
+  // RUNNING, so it neither spins nor keeps one billing), watch/unwatch, and the
+  // referral deploy link. Each tool validates its own pod state; the whitelist
+  // only gates reachability from a canvas-less client.
+  // NOTE: runpod_pod_create AND runpod_pod_start are deliberately EXCLUDED
+  // (#269/#278) — both put a pod into a BILLING state (create deploys; start
+  // RESUMES billing on a stopped pod). A confirmation-less mirrored/foreign tab
+  // must not be able to spend money, so both go through an agent turn / explicit
+  // UI action. stop is kept (it SAVES money).
+  "runpod_pod_status",
+  "runpod_list_pods",
+  "runpod_pod_stop",
+  "runpod_pod_connect",
+  "runpod_pod_troubleshoot",
+  "runpod_use_local",
+  "runpod_watch",
+  "runpod_unwatch",
+  "runpod_deploy_link",
+  // Micro-Apps (panel "Apps" feature): the canvas-less client's list/run/poll
+  // surface, plus registry install. One tool since 0.49.0 slice 2, so the
+  // whitelist can no longer distinguish the actions — the risk posture is judged
+  // over the whole tool. Run queues a job the user explicitly tapped (same as
+  // enqueue_workflow, already whitelisted); list/get/run_status are read-only;
+  // import (mobile Explore) has the rig fetch a bundle from the public registry
+  // and write it locally, the same risk as save_workflow + download_model
+  // (already whitelisted) — no model/system mutation, and deps install stays a
+  // separate consented action.
+  "apps",
+  // App dependency side-panel (Explore/detail): the ✓/download panel reads what
+  // an app needs vs what's installed and offers per-item fetches. Reads are safe
+  // (missing-model detection + candidate resolution, node-pack presence); model
+  // downloads reuse the already-whitelisted download_civitai_model/download_model.
+  // install_custom_node is a MUTATION that runs the pack's code on install —
+  // reachable for the panel's "install missing node" button, gated behind an
+  // explicit themed confirm client-side. (Revisit if a canvas-less/foreign tab
+  // must not be able to trigger a node install.)
+  "resolve_missing_models",
+  "extract_workflow_dependencies",
+  "list_installed_nodes",
+  "install_custom_node",
+]);
+
+/**
+ * ACTION-scoped admission, layered on top of the name whitelist.
+ *
+ * The whitelist predates the 0.49.0 consolidation, which folds tool FAMILIES
+ * into single action-parameterized names — and the call_tool dispatcher
+ * authorizes by tool NAME only, then forwards arbitrary action arguments.
+ * Whitelisting a consolidated name would therefore silently admit EVERY action
+ * the family folds, including ones the retired per-tool entry never covered. A
+ * tool listed here is admitted only when args.action names one of these
+ * actions; a tool NOT listed here keeps plain name-level admission (its
+ * whitelist entry was already judged over the whole tool).
+ *
+ * Wired ONLY where a slice's whitelist swap would otherwise broaden admission.
+ */
+const CALL_TOOL_ACTION_WHITELIST: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  // The `queue` entry above replaces the retired standalone cancel entry
+  // (0.49.0 slice 4), which admitted CANCEL semantics only: interrupt the
+  // running job, optionally prompt_id-matched, optionally with clear_pending —
+  // and that is exactly action:"cancel", clear_pending included (its
+  // wipe-all-pending effect the old entry already admitted). Every other
+  // action stays refused, because none was reachable before:
+  // move/edit/cancel_queued mutate pending
+  // jobs the old entry couldn't touch individually; clear drops pending while
+  // SPARING the running job, a combination the old entry could not express;
+  // and list/status/get_workflow, though read-only, were never whitelisted.
+  ["queue", new Set(["cancel"])],
+]);
+
+/**
+ * The admission decision for one call_tool frame: null when admitted,
+ * otherwise the refusal reason (pushed as the tool_result error and logged).
+ *
+ * The name-level refusal string is byte-identical to what the dispatcher
+ * produced before this extraction, so a client that was refused for a
+ * non-whitelisted tool sees no change.
+ */
+export function callToolAdmission(
+  tool: string,
+  args: Record<string, unknown>,
+): string | null {
+  if (!CALL_TOOL_WHITELIST.has(tool)) return `tool "${tool}" is not permitted`;
+  const actions = CALL_TOOL_ACTION_WHITELIST.get(tool);
+  if (actions !== undefined) {
+    const action = typeof args.action === "string" ? args.action : undefined;
+    if (action === undefined || !actions.has(action)) {
+      return `tool "${tool}" is not permitted for action "${action ?? "(missing)"}"`;
+    }
+  }
+  return null;
+}

@@ -44,6 +44,7 @@ import {
   type UsageStatus,
 } from "./panel-agent.js";
 import { promptText } from "./error-text.js";
+import { callToolAdmission } from "./call-tool-admission.js";
 import { createPanelMcpServer, makePanelToolCtx, resolvePinTarget } from "./panel-tools.js";
 import {
   optionsAckFrame,
@@ -181,11 +182,11 @@ INSPECT NODE MODES BEFORE YOU RUN. After loading a pack/template/workflow — an
 
 VERIFY THE OUTPUT MATCHES THE REQUEST. After a render completes, actually LOOK at the image/video the panel delivers and confirm it matches what was asked BEFORE you declare success or move to the next step. If it doesn't match, do NOT report progress — diagnose (wrong prompt path? a bypassed/muted builder or switch? wrong widget value?), fix it (often panel_set_node_mode or panel_set_widget), and rerun. Only claim something works once you've SEEN that it does — never report progress you haven't verified.
 
-AFTER PANEL_RUN — once you call panel_run to queue a render, you will be notified automatically with the output image(s)/video when it finishes. Do not poll get_queue, get_history, or list_output_images waiting for the result — just end your turn and the finished render will be delivered to you.
+AFTER PANEL_RUN — once you call panel_run to queue a render, you will be notified automatically with the output image(s)/video when it finishes. Do not poll queue (action:"list"), get_history, or list_output_images waiting for the result — just end your turn and the finished render will be delivered to you.
 
 DEBUG WRONG RENDERS BY INSPECTING INTERMEDIATE STEPS (run-to-node). When a final asset comes out WRONG — artifacts, wrong subject/pose/composition/color, blur, a ControlNet/IPAdapter/mask/LoRA not taking, a refiner or upscale stage degrading it — do NOT just re-roll the whole graph. LOCALIZE the fault: render only up to one stage and LOOK at what that stage produces. panel_run takes to_node_id to run ONE output branch (ComfyUI partial execution) — only that output node plus everything upstream of it renders, the rest is skipped, so it's fast and cheap, and the result is delivered to you automatically like any run. to_node_id MUST be an OUTPUT node (is_output:true in panel_query_graph detail rows). To inspect a point that ISN'T an output — a latent, a preprocessor/depth/pose map, a mask, an intermediate image — TAP it: add a PreviewImage on an IMAGE wire (or VAEDecode→PreviewImage on a LATENT, MaskToImage→PreviewImage on a MASK), panel_run(to_node_id=that preview), read the delivered image, then panel_remove_node the tap when done. Bisect upstream→downstream until you find the FIRST stage whose output is bad — that node (or its inputs/widgets) is what to fix, then run-to-node there again to confirm before a full run. For the full method (probe recipes, symptom→probe map) read the debug-render skill via read_skill. This is for renders that COMPLETE but look wrong; for runs that fail with an error/OOM/missing node, use the troubleshooting skill instead.
 
-CHAIN A STAGE'S OUTPUT INTO THE NEXT STAGE'S LOADER — when a multi-stage pipeline (e.g. Krea2 image → LTX video → WAN extend) needs one stage's OUTPUT fed into the next stage's loader (LoadImage / VHS_LoadVideo / LoadAudio), call stage_output_as_input with the output's { filename, subfolder?, type? } and drop the returned input filename into the loader's image/video/audio widget. (Or, for a file already on disk, upload_image / upload_video / upload_audio.) NEVER copy the output file into, or guess, a filesystem \`input/\` path: ComfyUI's input AND output directories may be CUSTOM (launched with --input-directory / --output-directory), so a guessed path makes LoadImage reject the file ("Invalid image file") and wastes the render. stage_output_as_input goes through the server API (/view → /upload/image), which resolves the real dirs correctly every time. VERIFY A VIDEO RENDER VIA THE FILESYSTEM, NOT /history — VHS_VideoCombine and similar video nodes write the .mp4 but frequently do NOT register an output in ComfyUI's /history (the prompt shows done with no output and no error), so do NOT conclude a clip "silently dropped" from get_history/get_job_status; confirm it with list_output_images (which now lists videos, each tagged kind:"video") by filename/prefix + fresh mtime, then chain it forward with stage_output_as_input.
+CHAIN A STAGE'S OUTPUT INTO THE NEXT STAGE'S LOADER — when a multi-stage pipeline (e.g. Krea2 image → LTX video → WAN extend) needs one stage's OUTPUT fed into the next stage's loader (LoadImage / VHS_LoadVideo / LoadAudio), call stage_output_as_input with the output's { filename, subfolder?, type? } and drop the returned input filename into the loader's image/video/audio widget. (Or, for a file already on disk, upload_image / upload_video / upload_audio.) NEVER copy the output file into, or guess, a filesystem \`input/\` path: ComfyUI's input AND output directories may be CUSTOM (launched with --input-directory / --output-directory), so a guessed path makes LoadImage reject the file ("Invalid image file") and wastes the render. stage_output_as_input goes through the server API (/view → /upload/image), which resolves the real dirs correctly every time. VERIFY A VIDEO RENDER VIA THE FILESYSTEM, NOT /history — VHS_VideoCombine and similar video nodes write the .mp4 but frequently do NOT register an output in ComfyUI's /history (the prompt shows done with no output and no error), so do NOT conclude a clip "silently dropped" from get_history or queue (action:"status"); confirm it with list_output_images (which now lists videos, each tagged kind:"video") by filename/prefix + fresh mtime, then chain it forward with stage_output_as_input.
 
 BYPASS COMPLETED STAGES BEFORE QUEUING THE NEXT ONE. When you build a multi-stage pipeline on one canvas (e.g. Krea2 → LTX → WAN), once a stage has RUN and you've captured/staged its output, BYPASS that stage's nodes with panel_set_node_mode(mode:"bypass") BEFORE you queue the next stage — so panel_run doesn't re-execute (and make the user pay for / wait on) work that's already done. Re-running the whole graph because an earlier stage was left active is a real, costly failure mode: explicitly bypass each finished stage and keep only the ACTIVE stage live. (This complements stage_output_as_input, which feeds the prior stage's output forward into the next stage's loader — bypass the producer, feed its captured output to the consumer.)
 
@@ -251,7 +252,7 @@ const HEADLESS_DIRECTIVE =
   "(panel_run, panel_query_graph, panel_set_widget, panel_add_node, …) are UNAVAILABLE here and will fail — " +
   "do everything through the comfyui MCP tools (generate_image, or create_workflow + enqueue_workflow). " +
   "There is NO panel to auto-deliver a finished render, so you MUST deliver the result YOURSELF IN THIS SAME TURN: " +
-  "enqueuing returns a prompt_id immediately, so wait for it with get_job_status(prompt_id) — poll it briefly until " +
+  "enqueuing returns a prompt_id immediately, so wait for it with queue (action:\"status\", prompt_id) — poll it briefly until " +
   "it reports completion (this is the ONE case where polling IS correct) — then fetch the output with get_history and " +
   "show it with panel_show_media. Do NOT end your turn expecting an automatic notification; none will arrive. " +
   "If the run FAILED — or the user asks why a render failed / what's missing — call diagnose_run FIRST, and do NOT use " +
@@ -287,7 +288,7 @@ function formatQueueNote(rep: StallReport): string | null {
       `⚠️ The current ComfyUI render appears STALLED: ` +
       `${rep.currentNode ? `node ${rep.currentNode} ` : ""}${rep.progress ? `(progress ${rep.progress}) ` : ""}` +
       `on prompt ${rep.runningPromptId ?? "?"} has not advanced for ~${secs}s. ComfyUI only checks interrupts ` +
-      `BETWEEN steps, so a stuck step can ignore cancel_job. If it's wedged: call cancel_job with ` +
+      `BETWEEN steps, so a stuck step can ignore a cancel. If it's wedged: call queue (action:"cancel") with ` +
       `clear_pending:true; if it reports the job still wedged, restart_comfyui / panel_restart_comfyui. ` +
       `Do NOT queue another run on top.`
     );
@@ -301,8 +302,8 @@ function formatQueueNote(rep: StallReport): string | null {
     const pending = Math.max(0, rep.queueDepth - 1);
     return (
       `ℹ️ ComfyUI queue: ${rep.queueDepth} tasks in flight (1 running + ${pending} pending) that this session ` +
-      `didn't queue. This is only a problem if the running one is stuck — inspect with get_queue. ` +
-      `cancel_queued_job drops a single pending item; cancel_job with clear_pending:true resets everything.`
+      `didn't queue. This is only a problem if the running one is stuck — inspect with queue (action:"list"). ` +
+      `queue (action:"cancel_queued") drops a single pending item; queue (action:"cancel") with clear_pending:true resets everything.`
     );
   }
   return null;
@@ -661,110 +662,6 @@ function isRemoteHttpsUrl(u: string): boolean {
     return false;
   }
 }
-
-/** The direct tool channel: a mobile client can invoke these READ/DOWNLOAD backend
- *  tools without an agent turn (structured nav data + rig-side downloads). The
- *  bridge is already token-gated; this whitelist keeps call_tool to non-destructive
- *  tools (no restart/remove/clear/install). */
-const CALL_TOOL_WHITELIST = new Set<string>([
-  "list_workflows",
-  "get_workflow",
-  "analyze_workflow",
-  "query_workflow",
-  "workflow_from_image",
-  "list_output_images",
-  "get_image",
-  "list_local_models",
-  // Read-only CivitAI lookups (creator-search feature): let a client browse
-  // models/creators through the rig without an agent turn.
-  "search_civitai_models",
-  "search_civitai_creators",
-  "download_civitai_model",
-  "download_model",
-  "enqueue_workflow",
-  // Persist a workflow to the ComfyUI library (mobile "pull workflow from a
-  // CivitAI example" → save_workflow). Writes a workflow file (auto-converts
-  // API-format graphs to canvas-openable UI format); overwrites same-filename,
-  // so the client generates a unique name. No model/system mutation.
-  "save_workflow",
-  // One-tap cancel of the RUNNING render (the mobile queue monitor's stop
-  // button). User-initiated and narrowly scoped: the client passes the
-  // prompt_id it saw in `queue_status`, and cancel_job only interrupts when the
-  // running job still matches — it can never kill a job that started after the
-  // tap, and (without clear_pending, which the mobile client never sends) it
-  // never touches other pending jobs in a shared queue.
-  "cancel_job",
-  // "Why did my render fail?" for canvas-less clients. The panel answers this from
-  // live canvas state (panel_get_errors); a phone has no canvas, so it reads
-  // the same story server-side from history + re-validating the graph that ran.
-  // Read-only.
-  "diagnose_run",
-  // Read-only training surface: flow/model discovery + progress polling +
-  // docker/GPU/image preflight for the panel/mobile Training tab, and the
-  // dataset/job-config/file readers behind its Jobs/Datasets views.
-  "train_list_flows",
-  "train_status",
-  "train_doctor",
-  "train_list_datasets",
-  "train_dataset_detail",
-  "train_job_config",
-  "train_file",
-  "train_preview_config",
-  "train_dataset_update",
-  "train_dataset_delete",
-  "train_caption_image",
-  "train_caption_dataset",
-  "train_delete_job",
-  // User-initiated training ops (panel/mobile Training wizard): stage a dataset,
-  // launch a GPU-container training run, cancel one. All validation lives in the
-  // tools themselves (dataset checks, docker/image preflight, liveness-verified
-  // cancel); the whitelist only gates reachability.
-  "train_prepare_dataset",
-  "train_start",
-  "train_cancel",
-  // RunPod control panel (desktop + mobile): the one-tap pod lifecycle + the
-  // local⇄pod host switch. Read-only status/list/troubleshoot, the COST-SAVING
-  // actions (stop/use_local), connect (retarget only — a pod must already be
-  // RUNNING, so it neither spins nor keeps one billing), watch/unwatch, and the
-  // referral deploy link. Each tool validates its own pod state; the whitelist
-  // only gates reachability from a canvas-less client.
-  // NOTE: runpod_pod_create AND runpod_pod_start are deliberately EXCLUDED
-  // (#269/#278) — both put a pod into a BILLING state (create deploys; start
-  // RESUMES billing on a stopped pod). A confirmation-less mirrored/foreign tab
-  // must not be able to spend money, so both go through an agent turn / explicit
-  // UI action. stop is kept (it SAVES money).
-  "runpod_pod_status",
-  "runpod_list_pods",
-  "runpod_pod_stop",
-  "runpod_pod_connect",
-  "runpod_pod_troubleshoot",
-  "runpod_use_local",
-  "runpod_watch",
-  "runpod_unwatch",
-  "runpod_deploy_link",
-  // Micro-Apps (panel "Apps" feature): the canvas-less client's list/run/poll
-  // surface, plus registry install. One tool since 0.49.0 slice 2, so the
-  // whitelist can no longer distinguish the actions — the risk posture is judged
-  // over the whole tool. Run queues a job the user explicitly tapped (same as
-  // enqueue_workflow, already whitelisted); list/get/run_status are read-only;
-  // import (mobile Explore) has the rig fetch a bundle from the public registry
-  // and write it locally, the same risk as save_workflow + download_model
-  // (already whitelisted) — no model/system mutation, and deps install stays a
-  // separate consented action.
-  "apps",
-  // App dependency side-panel (Explore/detail): the ✓/download panel reads what
-  // an app needs vs what's installed and offers per-item fetches. Reads are safe
-  // (missing-model detection + candidate resolution, node-pack presence); model
-  // downloads reuse the already-whitelisted download_civitai_model/download_model.
-  // install_custom_node is a MUTATION that runs the pack's code on install —
-  // reachable for the panel's "install missing node" button, gated behind an
-  // explicit themed confirm client-side. (Revisit if a canvas-less/foreign tab
-  // must not be able to trigger a node install.)
-  "resolve_missing_models",
-  "extract_workflow_dependencies",
-  "list_installed_nodes",
-  "install_custom_node",
-]);
 
 /** Lazily build ONE in-process MCP client wired to the full comfyui tool surface,
  *  reused across call_tool requests. Reuses the exact tool implementations (same
@@ -3621,9 +3518,12 @@ export async function runPanelOrchestrator(): Promise<void> {
       const toolArgs =
         ev.args && typeof ev.args === "object" ? (ev.args as Record<string, unknown>) : {};
       void (async () => {
-        if (!CALL_TOOL_WHITELIST.has(tool)) {
-          bridge.push({ type: "tool_result", cid, tool, ok: false, error: `tool "${tool}" is not permitted` }, tabId);
-          logger.warn(`[panel-orchestrator] call_tool rejected non-whitelisted "${tool}" (tab ${tabId.slice(0, 8)})`);
+        // Name-level whitelist plus, for consolidated tools, action-level scope
+        // (see call-tool-admission.ts). The name-refusal string is unchanged.
+        const denied = callToolAdmission(tool, toolArgs);
+        if (denied !== null) {
+          bridge.push({ type: "tool_result", cid, tool, ok: false, error: denied }, tabId);
+          logger.warn(`[panel-orchestrator] call_tool rejected: ${denied} (tab ${tabId.slice(0, 8)})`);
           return;
         }
         const client = await getCallToolClient();

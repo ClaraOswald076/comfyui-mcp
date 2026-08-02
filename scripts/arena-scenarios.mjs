@@ -41,7 +41,7 @@ export const SCENARIOS = [
     id: "queue",
     title: "Queue inspection",
     task: "How many jobs are currently running or pending in the ComfyUI queue? Answer with the numbers.",
-    primary: ["get_queue", "health_check", "get_system_stats"],
+    primary: ["queue", "health_check", "get_system_stats"],
     verify: async (_call, t) => /\d/.test(t.finalAnswer),
   },
   {
@@ -53,13 +53,13 @@ export const SCENARIOS = [
     primary: ["generate_image", "enqueue_workflow"],
     // right family but incomplete execution (built a workflow, never enqueued)
     partial: ["create_workflow", "dsl_to_workflow"],
-    followup: ["get_job_status", "get_history", "list_output_images", "view_image", "list_assets", "get_queue", "generation_stats"],
+    followup: ["queue", "get_history", "list_output_images", "view_image", "list_assets", "generation_stats"],
     verify: async (call, t) => {
       // ground truth: the prompt_id the model started must be done with outputs
       const ids = [...t.toolText.matchAll(/"prompt_id":\s*"([0-9a-f-]{8,})"/g)].map((m) => m[1]);
       if (!ids.length) return false;
       for (let attempt = 0; attempt < 30; attempt++) {
-        const status = await call("get_job_status", { prompt_id: ids[ids.length - 1] });
+        const status = await call("queue", { action: "status", prompt_id: ids[ids.length - 1] });
         if (/"done":\s*true/.test(status) && !/"error"/.test(status)) return true;
         if (/"error":/.test(status)) return false;
         await new Promise((r) => setTimeout(r, 2000));
@@ -114,7 +114,7 @@ export const SCENARIOS = [
       if (!sawFailure) return false;
       const ids = [...t.toolText.matchAll(/"prompt_id":\s*"([0-9a-f-]{8,})"/g)].map((m) => m[1]);
       for (const id of ids.reverse()) {
-        const status = await call("get_job_status", { prompt_id: id });
+        const status = await call("queue", { action: "status", prompt_id: id });
         if (/"done":\s*true/.test(status) && !/"error"/.test(status)) return true;
       }
       return false;
@@ -137,7 +137,7 @@ export const SCENARIOS = [
       if (ids.length < 2) return false;
       let done = 0;
       for (const id of ids) {
-        const status = await call("get_job_status", { prompt_id: id });
+        const status = await call("queue", { action: "status", prompt_id: id });
         if (/"done":\s*true/.test(status) && !/"error"/.test(status)) done++;
       }
       return done >= 2;

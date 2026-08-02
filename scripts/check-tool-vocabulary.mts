@@ -107,6 +107,9 @@ const SELF = new Set([
   // Same, for 0.49.0 slice 3: asserts as FIXTURES that the eight retired
   // comfy_cli_* names are in DEAD_NAMES with `comfy_cli` replacements.
   "src/__tests__/tools/comfy-cli.test.ts",
+  // Same, for 0.49.0 slice 4: asserts as FIXTURES that the eight retired
+  // queue/jobs names are in DEAD_NAMES with `queue` replacements.
+  "src/__tests__/tools/queue-management.test.ts",
   // Same, for the #659 retired-name error: these pass dead names to call_tool /
   // the ollama dispatch as FIXTURES and assert the error quotes the ledger's
   // replacement — the names are call arguments under test, not live guidance.

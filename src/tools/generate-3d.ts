@@ -16,7 +16,7 @@ export function registerGenerate3dTools(server: McpServer): void {
       "ComfyUI's hosted partner 3D nodes (Tripo, Meshy, Rodin, Hunyuan3D — auto-detected from the " +
       "server; these are paid API nodes needing a comfy.org API key/login on the server or COMFY_API_KEY here). " +
       "Builds and enqueues a minimal workflow and returns immediately with the prompt_id — poll " +
-      "get_job_status / get_history for the resulting model file (saved to ComfyUI's output directory). " +
+      "queue (action:\"status\") / get_history for the resulting model file (saved to ComfyUI's output directory). " +
       "For image mode, upload the image first with upload_image and pass its filename. " +
       "If the server has no 3D-capable API nodes, returns an actionable error naming local-pack alternatives.",
     {
@@ -78,7 +78,7 @@ export function registerGenerate3dTools(server: McpServer): void {
                   alternatives: result.alternatives,
                   notes: result.notes,
                   workflow: result.workflow,
-                  next: "Poll get_job_status / get_history with the prompt_id; the 3D model file is written to ComfyUI's output directory when the job completes.",
+                  next: "Poll queue (action:\"status\") / get_history with the prompt_id; the 3D model file is written to ComfyUI's output directory when the job completes.",
                 },
                 null,
                 2,

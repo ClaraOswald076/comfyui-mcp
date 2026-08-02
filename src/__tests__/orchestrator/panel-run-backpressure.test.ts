@@ -1,7 +1,7 @@
 // panel_run backpressure note (#559) + panel_screenshot DOM-overlay note (#567).
 //
 // #559: queuing a batch is normal. A queue made of the agent's OWN recent jobs must
-//       be reported NEUTRALLY, never as a "[QUEUE WARNING] … cancel_job
+//       be reported NEUTRALLY, never as a "[QUEUE WARNING] … cancel with
 //       clear_pending:true" that would wipe the whole batch. A job we did NOT queue
 //       still drives a (softened) warning.
 // #567: a canvas screenshot cannot show DOM-overlay widget content (MarkdownNote
@@ -98,7 +98,7 @@ describe("panel_run backpressure note (#559)", () => {
     expect(text).not.toContain("[QUEUE WARNING]");
     expect(text).not.toContain("ALREADY RUNNING");
     // clear_pending is only mentioned as a conditional last resort, never the headline.
-    expect(text).toContain("Only use cancel_job with clear_pending:true if a render is ACTUALLY wedged");
+    expect(text).toContain('Only use queue (action:"cancel") with clear_pending:true if a render is ACTUALLY wedged');
     // The successful queue registered p-batch-2 for the NEXT run's attribution.
     expect(qm.selfQueuedIds.has("p-batch-2")).toBe(true);
   });
@@ -113,7 +113,7 @@ describe("panel_run backpressure note (#559)", () => {
 
     expect(text).toContain("[QUEUE]");
     expect(text).toContain("didn't queue");
-    expect(text).toContain("get_queue"); // lead with inspection
+    expect(text).toContain('queue (action:"list")'); // lead with inspection
     expect(text).not.toContain("your own");
   });
 

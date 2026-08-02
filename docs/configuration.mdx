@@ -261,7 +261,8 @@ available, HTTP polling otherwise).
   Seconds between HTTP history polls while a job is being watched.
 </ParamField>
 <ParamField path="COMFYUI_MCP_INTERRUPT_S" type="number" default="30">
-  Cancel honor window (seconds) for `cancel_job`: how long to wait for an interrupt to
+  Cancel honor window (seconds) for `queue` (action:"cancel"): how long to wait for an
+  interrupt to
   actually stop the running job before escalating (to `/free`, then reporting the render
   WEDGED). ComfyUI only checks the interrupt flag between nodes/steps, so a multi-minute
   single step won't honor it immediately — this wait is what detects a true wedge.

@@ -51,13 +51,13 @@ The user wants to generate an image using ComfyUI. Their prompt is provided as t
    node "${CLAUDE_PLUGIN_ROOT}/scripts/monitor-progress.mjs" <prompt_id>
    ```
 
-   This connects to ComfyUI's WebSocket and prints real-time step progress (e.g., `step 3/14 (21%)`), then reports completion with output filenames. You do NOT need to poll `get_job_status` — the background task handles everything.
+   This connects to ComfyUI's WebSocket and prints real-time step progress (e.g., `step 3/14 (21%)`), then reports completion with output filenames. You do NOT need to poll `queue` (action:"status") — the background task handles everything.
 
    Continue the conversation while waiting. Check the background task output when notified it completed.
 
    If the job fails, the monitor prints error details (node, message). Use `get_history` for the full traceback if needed.
 
-   **Fallback**: If the background script is unavailable, use `get_job_status` to poll until `done` is true.
+   **Fallback**: If the background script is unavailable, use `queue` (action:"status") to poll until `done` is true.
 
 7. **Show the result.** Once the background monitor reports completion, use `list_output_images` (limit 1) to find the newest image. Read it with the Read tool to display it to the user.
 

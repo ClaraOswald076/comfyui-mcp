@@ -16,7 +16,7 @@ Works on **macOS**, **Linux**, and **Windows**. Auto-detects your ComfyUI instal
 
 **Stuck or have a question? [Join the Discord](https://discord.gg/cW9arBhzCu)** — help, model tips, and release announcements.
 
-**162 MCP tools** | **37 AI skills** (Flux · WAN · LTX 2.3 video · Qwen · Z-Image · Ideogram 4 · ERNIE · ANIMA · model registry · Civitai · node authoring · launch/perf flags) | **55 installer packs** | **11 slash commands** | **4 autonomous agents** | **3 hooks**
+**155 MCP tools** | **37 AI skills** (Flux · WAN · LTX 2.3 video · Qwen · Z-Image · Ideogram 4 · ERNIE · ANIMA · model registry · Civitai · node authoring · launch/perf flags) | **55 installer packs** | **11 slash commands** | **4 autonomous agents** | **3 hooks**
 
 The plugin ships **expert skills that grow with every release** — model-specific generation guides with curated download URLs, workflow recipes, troubleshooting, and custom-node authoring — so Claude knows the right sampler, CFG, resolution, and model files for each architecture without trial and error.
 
@@ -154,7 +154,7 @@ This package also ships as a **Claude Code plugin**, providing slash commands, s
 
 | Script | Description |
 |--------|-------------|
-| `monitor-progress.mjs` | **Progress monitor** — connects to ComfyUI's WebSocket for real-time step progress (e.g., `step 5/14 (36%)`). Run as a background Bash task after enqueuing workflows. Reports completion with output filenames, errors with node details. Replaces polling `get_job_status` in a loop. |
+| `monitor-progress.mjs` | **Progress monitor** — connects to ComfyUI's WebSocket for real-time step progress (e.g., `step 5/14 (36%)`). Run as a background Bash task after enqueuing workflows. Reports completion with output filenames, errors with node details. Replaces polling `queue` (action:"status") in a loop. |
 
 ---
 
@@ -248,7 +248,7 @@ for the port, the capability matrix, and the per-provider "clink" points, and th
 
 ## MCP Tools
 
-162 tools across workflow execution, generation, iteration, composition, models, and more:
+155 tools across workflow execution, generation, iteration, composition, models, and more:
 
 ### Image Generation (high-level)
 
@@ -286,12 +286,7 @@ for the port, the capability matrix, and the per-provider "clink" points, and th
 | Tool | Description |
 |------|-------------|
 | `enqueue_workflow` | Submit a workflow (API format JSON) — returns `prompt_id` immediately, non-blocking |
-| `get_job_status` | Check execution status of a job by prompt ID |
-| `get_queue` | View the current execution queue (running + pending) |
-| `get_queued_workflow` | Inspect the full workflow payload for one pending queue item |
-| `move_queued_job` | Move a pending job to the front/back by requeueing it with a new prompt ID |
-| `edit_queued_job` | Patch or replace a pending queued workflow and requeue it with a new prompt ID |
-| `cancel_job` | Interrupt the currently running job — escalates (interrupt → verify → `/free`) and reports WEDGED if it won't die; `clear_pending: true` also drops all pending jobs in the same call |
+| `queue` | One action-parameterized tool for the execution queue: `list` (running + pending), `status` (one job by prompt ID), `get_workflow` (a pending job's full payload), `move`/`edit` (requeue a pending job front/back, patched or replaced, with a new prompt ID), `cancel` (interrupt the running job — escalates interrupt → verify → `/free`, reports WEDGED if it won't die; `clear_pending: true` also drops all pending), `cancel_queued`, `clear` |
 | `get_system_stats` | Get system info — GPU, VRAM, Python version, OS |
 
 ### Workflow Visualization
@@ -621,7 +616,7 @@ npx -y comfyui-mcp@latest --comfyui-url http://localhost:8188 --force-remote
 | `COMFYUI_STARTUP_CHECK_INTERVAL_S` / `…_MAX_TRIES` | `1` / `20` | Readiness-probe interval + max tries when starting a local ComfyUI |
 | `COMFYUI_ALWAYS_RESTART` | `false` | Auto-restart a crashed local ComfyUI (bounded by `COMFYUI_RESTART_MAX_ATTEMPTS` / `COMFYUI_RESTART_WINDOW_S`) |
 | `COMFYUI_MCP_STALL_S` | `180` | Render-wedge watchdog: seconds a sampler step can re-emit the same progress before a STALL/BACKLOG note is prepended to the agent's next turn (clamped 15–3600s; live-tunable from the panel) |
-| `COMFYUI_MCP_INTERRUPT_S` | `30` | Seconds `cancel_job` waits for an interrupt to actually stop a job before escalating to `/free` and reporting it wedged |
+| `COMFYUI_MCP_INTERRUPT_S` | `30` | Seconds `queue` (action:"cancel") waits for an interrupt to actually stop a job before escalating to `/free` and reporting it wedged |
 | `LOG_LEVEL` | `info` | Logging verbosity: `debug`, `info`, `warn`, `error` |
 
 ### Transports

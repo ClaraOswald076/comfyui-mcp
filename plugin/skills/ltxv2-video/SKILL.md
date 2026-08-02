@@ -235,7 +235,7 @@ Connect the optional `latent` input for latent-aware shift scaling.
 > (and similar video nodes) write the .mp4 but frequently do **NOT** register the
 > output in ComfyUI's `/history` — the prompt shows done with an empty outputs map
 > and no error. Do **NOT** conclude the render "silently dropped" from
-> `get_history` / `get_job_status` alone. Confirm the file with
+> `get_history` / `queue` (action:"status") alone. Confirm the file with
 > **`list_output_images`** (it now lists videos too, with `kind: "video"`) — match
 > the `filename_prefix` (e.g. `ltxv2_…​.mp4`) and check the mtime is fresh — then
 > chain it into the next stage with `stage_output_as_input`.

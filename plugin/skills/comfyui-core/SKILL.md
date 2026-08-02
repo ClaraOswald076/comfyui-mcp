@@ -131,7 +131,7 @@ SetLatentNoiseMask (samples, mask) → LATENT → KSampler.latent_image
 
 1. `create_workflow` with template `"txt2img"` and your params
 2. `enqueue_workflow` with the returned JSON — returns `prompt_id` immediately
-3. Poll `get_job_status` with the `prompt_id` until `done` is true
+3. Poll `queue` (action:"status") with the `prompt_id` until `done` is true
 4. Use `list_output_images` (limit 1) to find the generated image, then `Read` to display it
 
 ### Inspect & Modify
@@ -200,27 +200,29 @@ The script connects to ComfyUI's WebSocket and reports:
 3. Continue conversation — results appear when jobs finish
 4. Use `list_output_images` or `Read` to display the generated images
 
-**Do NOT** poll `get_job_status` in a loop. The background monitor replaces polling entirely.
+**Do NOT** poll `queue` (action:"status") in a loop. The background monitor replaces polling entirely.
 
-**Fallback**: If the monitor script is unavailable, use `get_job_status` to poll until `done` is true.
+**Fallback**: If the monitor script is unavailable, use `queue` (action:"status") to poll until `done` is true.
 
 ### Queue Management
 
-- `get_queue` — shows running/pending job counts and prompt_ids
-- `get_job_status` — check if a specific prompt_id is running, pending, or done
-- `cancel_job` — interrupt a running job (pass optional `prompt_id` to target a specific one)
-- `cancel_queued_job` — remove a specific pending job from the queue by `prompt_id`
-- `clear_queue` — remove all pending jobs (does NOT stop the currently running job)
+One tool, `queue`, driven by its `action` parameter:
+
+- `queue` (action:"list") — shows running/pending job counts and prompt_ids
+- `queue` (action:"status") — check if a specific prompt_id is running, pending, or done
+- `queue` (action:"cancel") — interrupt a running job (pass optional `prompt_id` to target a specific one)
+- `queue` (action:"cancel_queued") — remove a specific pending job from the queue by `prompt_id`
+- `queue` (action:"clear") — remove all pending jobs (does NOT stop the currently running job)
 
 **When to use queue tools:**
-- To check status: `get_job_status` for a quick boolean check (prefer background monitor for ongoing tracking)
-- To abort: `cancel_job` stops what's running now; `cancel_queued_job` removes a pending one
-- To start fresh: `clear_queue` then optionally `cancel_job`
+- To check status: `queue` (action:"status") for a quick boolean check (prefer background monitor for ongoing tracking)
+- To abort: `queue` (action:"cancel") stops what's running now; `queue` (action:"cancel_queued") removes a pending one
+- To start fresh: `queue` (action:"clear") then optionally `queue` (action:"cancel")
 
 ### Monitoring & Recovery
 
 - `get_system_stats` — GPU, VRAM, Python version, OS details
-- `get_queue` — see running/pending jobs (also listed above under Queue Management)
+- `queue` (action:"list") — see running/pending jobs (also listed above under Queue Management)
 
 **When ComfyUI is unresponsive or crashed:**
 1. Try `get_system_stats` — if it fails, ComfyUI is down
@@ -230,7 +232,7 @@ The script connects to ComfyUI's WebSocket and reports:
 
 **When a job appears hung (monitor shows `[STALL]`):**
 1. Check `get_system_stats` — look at VRAM usage (OOM causes hangs)
-2. Try `cancel_job` to interrupt the stuck job
+2. Try `queue` (action:"cancel") to interrupt the stuck job
 3. If cancel fails, use `restart_comfyui` to force-restart
 4. Use `clear_vram` after restart to free GPU memory before retrying
 

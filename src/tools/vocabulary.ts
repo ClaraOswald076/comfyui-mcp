@@ -43,14 +43,7 @@ export const TOOL_NAMES = [
   "modify_workflow",
   "get_node_info",
   "validate_workflow",
-  "get_queue",
-  "get_queued_workflow",
-  "move_queued_job",
-  "edit_queued_job",
-  "get_job_status",
-  "cancel_job",
-  "cancel_queued_job",
-  "clear_queue",
+  "queue",
   "search_custom_nodes",
   "get_node_pack_details",
   "search_models",
@@ -220,9 +213,10 @@ export type ToolName = (typeof TOOL_NAMES)[number];
  * updating — it is history, not state.
  *
  * Read from docs/design/tool-surface.txt so there is exactly one copy of the
- * baseline names (187: the 182 frozen at 0.48.32 plus the five consolidated tools
+ * baseline names (188: the 182 frozen at 0.48.32 plus the six consolidated tools
  * appended as they shipped — `bisect` in 0.49.0 slice 1, then `node_snapshot`,
- * `apps` and `batch` in slice 2, then `comfy_cli` in slice 3), and so the file committed
+ * `apps` and `batch` in slice 2, then `comfy_cli` in slice 3, then `queue` in
+ * slice 4), and so the file committed
  * as the P0 evidence is load-bearing rather than
  * decorative.
  */
@@ -241,7 +235,7 @@ const BASELINE_URL = new URL("../../docs/design/tool-surface.txt", import.meta.u
  * 200-line rename. APPENDING is legitimate — new tools join the baseline when they
  * ship — so the workflow is: append, update this hash, say why in the message.
  */
-export const BASELINE_SHA256 = "9300588781163bec59fe1151511eecf3e11650c5527efaec388b9cec994849d3";
+export const BASELINE_SHA256 = "5f4e68f40ef0e589f8bda09e0e01c4c61a7610f4c2a47375f5b75bd2f7b4bb71";
 
 /**
  * LAZY on purpose, and this is not a micro-optimisation.
@@ -315,7 +309,7 @@ export function panelBaselineIntegrity(): { ok: boolean; actual: string } {
  * to the surface. That is the ratchet: not that it cannot rise, but that it cannot
  * rise silently.
  */
-export const MAX_TOOLS = 162;
+export const MAX_TOOLS = 155;
 
 /** Where this is headed, for reference in review. A goal, not enforced. */
 export const TOOL_BUDGET_TARGET = 30;
@@ -383,6 +377,81 @@ export function deadNameRe(name: string): RegExp {
  * entry documents the two mentions in this repo that are correct.
  */
 export const DEAD_NAMES: readonly DeadName[] = [
+  // 0.49.0 slice 4: the eight queue/jobs tools folded into one action-parameterized
+  // `queue` tool. Same queue-manager services, same return shapes (JSON for the
+  // query actions, prose for the cancels) — only the surface changed, so every
+  // mention of the old names is now rot pointing at a 404.
+  {
+    name: "get_queue",
+    since: "0.49.0",
+    replacement: 'queue (action:"list")',
+  },
+  {
+    name: "get_queued_workflow",
+    since: "0.49.0",
+    replacement: 'queue (action:"get_workflow")',
+  },
+  {
+    name: "move_queued_job",
+    since: "0.49.0",
+    replacement: 'queue (action:"move")',
+  },
+  {
+    name: "edit_queued_job",
+    since: "0.49.0",
+    replacement: 'queue (action:"edit")',
+  },
+  {
+    name: "get_job_status",
+    since: "0.49.0",
+    replacement: 'queue (action:"status")',
+  },
+  {
+    name: "cancel_job",
+    since: "0.49.0",
+    replacement: 'queue (action:"cancel")',
+    allowedIn: [
+      {
+        path: "docs/blog/comfyui-mcp-tdqs-case-study.mdx",
+        context: "our single weakest tool, `cancel_job`,",
+        why: "A DATED case study of a tool-description audit, narrating what the score was when the tool still had this name. Rewriting the score narrative to the new name would falsify the record of what was measured.",
+      },
+      {
+        path: "docs/blog/comfyui-mcp-tdqs-case-study.mdx",
+        context: "Here's `cancel_job`, our 3.1, before and after:",
+        why: "Same post, introducing a verbatim quote of the tool's description at audit time — the quote is the artifact under analysis.",
+      },
+      {
+        path: "docs/blog/comfyui-mcp-tdqs-case-study.mdx",
+        context: "Raising the floor — `cancel_job`,",
+        why: "Same post, past-tense recap of which tools were rewritten in that audit.",
+      },
+    ],
+  },
+  {
+    name: "cancel_queued_job",
+    since: "0.49.0",
+    replacement: 'queue (action:"cancel_queued")',
+    allowedIn: [
+      {
+        path: "docs/blog/comfyui-mcp-tdqs-case-study.mdx",
+        context: "use `cancel_queued_job` to remove one specific pending job",
+        why: "Inside a verbatim > quote of cancel_job's description AS WRITTEN at audit time — the before/after quote is the post's evidence, so editing it would misquote the artifact.",
+      },
+    ],
+  },
+  {
+    name: "clear_queue",
+    since: "0.49.0",
+    replacement: 'queue (action:"clear")',
+    allowedIn: [
+      {
+        path: "docs/blog/comfyui-mcp-tdqs-case-study.mdx",
+        context: "`clear_queue` to drop all pending jobs",
+        why: "Same verbatim quote of the audited description — a historical artifact in a dated post, not live guidance.",
+      },
+    ],
+  },
   // 0.49.0 slice 3: the eight comfy_cli_* tools folded into one action-parameterized
   // `comfy_cli` tool. Same services, same envelope/1 return shapes, same CLI command
   // construction — only the surface changed, so every mention of the old names is now

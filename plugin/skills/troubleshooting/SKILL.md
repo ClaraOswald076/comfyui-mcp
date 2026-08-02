@@ -455,7 +455,7 @@ The response includes:
 
 ```
 get_system_stats()    # GPU info, VRAM, Python/PyTorch versions
-get_queue()           # Running and pending jobs
+queue(action="list")  # Running and pending jobs
 get_logs(max_lines=50, keyword="error")  # Recent error logs
 ```
 
