@@ -1349,20 +1349,24 @@ export function looksLikeManagerNoOp(details: unknown): boolean {
 
 /**
  * The PROVEN legacy-3.x empty-queue signature — the ONLY queue state that may
- * authorize the #724 git fallback (codex gate): total 0 AND done 0, with no
- * pending/in-progress work and no active processing. The broader
- * looksLikeManagerNoOp also matches incoherent counts (done > total), which
- * is fine as a FAILURE diagnostic but must never authorize a git mutation:
- * a malformed or contradictory response is not proof of the stale-3.x no-op.
+ * authorize the #724 git fallback (codex gate). total_count, done_count,
+ * in_progress_count and is_processing are REQUIRED by the Manager's status
+ * contract (QueueStatus in node-management): each must be PRESENT and exactly
+ * 0/false — a missing field is unproven, never a default-safe zero. The one
+ * optional field, pending_count (absent on legacy 3.x), must be 0 when
+ * reported. The broader looksLikeManagerNoOp also matches incoherent counts
+ * (done > total), which is fine as a FAILURE diagnostic but must never
+ * authorize a git mutation: a partial, malformed, or contradictory response
+ * is not proof of the stale-3.x no-op.
  */
 export function isProvenLegacyEmptyQueue(details: unknown): boolean {
   const c = readQueueCounts(details);
   return (
     c.total === 0 &&
     c.done === 0 &&
-    (c.inProgress ?? 0) === 0 &&
-    (c.pending ?? 0) === 0 &&
-    c.processing !== true
+    c.inProgress === 0 &&
+    c.processing === false &&
+    (c.pending ?? 0) === 0
   );
 }
 
@@ -1751,16 +1755,19 @@ async function updateViaGitCheckoutFallback(opts: {
   }
   // HEAD === upstream: git FETCHED the remote and proved the checkout current.
   // That is genuine proof of currency — report "already up to date" honestly
-  // (NOT "updated"; nothing changed, no restart).
+  // (NOT "updated"; nothing changed, no restart). The embedded result came
+  // from the Manager call that no-op'd — override its message too, so the
+  // report never credits the Manager for a verification git did (codex gate).
+  const atTipMessage =
+    `Panel is already at the upstream tip (${post.version}) — ComfyUI-Manager ` +
+    `no-op'd the update (stale legacy 3.x, #724), but a pinned git merge ` +
+    `--ff-only on ${dir} verified the checkout is current (git: ` +
+    `${gitOutput || "no output"}). Nothing changed on disk; no restart needed.`;
   return {
     action: "update",
-    result,
+    result: { ...result, message: atTipMessage },
     restartRequired: false,
-    message:
-      `Panel is already at the upstream tip (${post.version}) — ComfyUI-Manager ` +
-      `no-op'd the update (stale legacy 3.x, #724), but a direct git pull ` +
-      `--ff-only on ${dir} verified the checkout is current (git: ` +
-      `${gitOutput || "no output"}). Nothing changed on disk; no restart needed.`,
+    message: atTipMessage,
     previousVersion,
     installedVersion: post.version,
   };

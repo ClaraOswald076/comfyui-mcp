@@ -922,6 +922,39 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
     expect(h.gitPulls).toEqual([]);
   });
 
+  it("partial signature (missing in_progress/is_processing fields) -> fallback REFUSED: unproven, no merge", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      // Only total/done reported — the required in_progress_count and
+      // is_processing fields are ABSENT, so pending work is not disproven.
+      updateDetails: { total_count: 0, done_count: 0 },
+      onGitPull: () => "merge output",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).toMatch(/did NOT apply|empty-queue signature/);
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("at-tip via the fallback: the embedded result message credits the git verification, not the no-op'd Manager", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: LEGACY_NOOP,
+      // Merge is a no-op (already current): HEAD stays, upstream === HEAD.
+      onGitPull: () => "Already up to date.",
+    });
+    const r = await runPanelAction("update", h.deps);
+    expect(r.restartRequired).toBe(false);
+    expect(r.message).toMatch(/already at the upstream tip/);
+    // The honest message must reach BOTH surfaces (codex gate).
+    expect(r.result.message).toBe(r.message);
+    expect(r.result.message).not.toMatch(/^updated$/);
+  });
+
   it("legacy no-op + real git checkout + pull advances it → updated via the fallback (verified)", async () => {
     const h = makeDeps({
       comfyuiPath: COMFY,
