@@ -10,56 +10,56 @@ quality, and what we learn shipping an MCP server people actually use.
 
 A chronological tour of the open image & video models you can run locally in
 ComfyUI — what each is best at, and how to set it up in one command with a
-comfyui-mcp pack and the [Panel](/panel). Oldest first, ending on the current
+comfyui-mcp pack and the [Panel](../panel). Oldest first, ending on the current
 open-weight champ, Ideogram 4.
 
 <CardGroup cols={2}>
 
-<Card title="WAN 2.2" href="/blog/wan-2.2-comfyui">
+<Card title="WAN 2.2" href="./wan-2.2-comfyui">
   The open-source video king — how the high/low-noise experts actually work,
   I2V/T2V, GGUF tiers, and longer videos.
 </Card>
 
-<Card title="Qwen-Image & Qwen-Image-Edit" href="/blog/qwen-image-comfyui">
+<Card title="Qwen-Image & Qwen-Image-Edit" href="./qwen-image-comfyui">
   20B text-to-image plus instruction editing and manual-mask inpainting, with a
   WAN 2.2 refine combo.
 </Card>
 
-<Card title="WAN Animate 2.2" href="/blog/wan-animate-comfyui">
+<Card title="WAN Animate 2.2" href="./wan-animate-comfyui">
   Drive a character with a reference video — v2v character & motion replace from
   a single image.
 </Card>
 
-<Card title="WAN Transparent Expressions" href="/blog/wan-transparent-comfyui">
+<Card title="WAN Transparent Expressions" href="./wan-transparent-comfyui">
   Alpha-channel character expression sprites (looping WebP/GIF) for SillyTavern
   and VTuber overlays.
 </Card>
 
-<Card title="Z-Image (Turbo & Base)" href="/blog/z-image-comfyui">
+<Card title="Z-Image (Turbo & Base)" href="./z-image-comfyui">
   6B, runs under 8 GB — the low-VRAM speed king. Turbo vs Base, ControlNet, and
   your own LoRAs.
 </Card>
 
-<Card title="ERNIE-Image" href="/blog/ernie-image-comfyui">
+<Card title="ERNIE-Image" href="./ernie-image-comfyui">
   Apache-2.0 text-to-image with razor-sharp multilingual text rendering, under
   8 GB VRAM.
 </Card>
 
-<Card title="ANIMA 1.0" href="/blog/anima-comfyui">
+<Card title="ANIMA 1.0" href="./anima-comfyui">
   A ~2B anime model that generates and trains under 6 GB — Danbooru tags plus
   natural language.
 </Card>
 
-<Card title="LTX-2.3" href="/blog/ltx-2.3-comfyui">
+<Card title="LTX-2.3" href="./ltx-2.3-comfyui">
   Fast GGUF video (T2V/I2V) and the LTX Director timeline editor inside ComfyUI.
 </Card>
 
-<Card title="Krea 2 Turbo" href="/blog/krea2-comfyui">
+<Card title="Krea 2 Turbo" href="./krea2-comfyui">
   Krea.ai's 12B open-weight text-to-image — 8-step turbo speed, Qwen3-VL
   prompting, and JSON area prompts.
 </Card>
 
-<Card title="Ideogram 4 — the finale" href="/blog/ideogram-4-comfyui">
+<Card title="Ideogram 4 — the finale" href="./ideogram-4-comfyui">
   The 9.3B open-weight king of readable in-image text and design layout, with
   JSON area prompting.
 </Card>
@@ -70,12 +70,12 @@ open-weight champ, Ideogram 4.
 
 <CardGroup cols={2}>
 
-<Card title="Upscaling video in ComfyUI" href="/blog/video-upscale-comfyui">
+<Card title="Upscaling video in ComfyUI" href="./video-upscale-comfyui">
   SeedVR2 & FlashVSR temporal restore, the downscale-first trick, the quick
   per-frame ESRGAN path, and RIFE/FILM interpolation (built into ComfyUI 0.26).
 </Card>
 
-<Card title="Extending video with Pusa" href="/blog/video-extend-pusa-comfyui">
+<Card title="Extending video with Pusa" href="./video-extend-pusa-comfyui">
   Pusa 2.2 temporal flowmatching on the WAN 2.2 stack — continue a clip instead
   of regenerating it, chain extensions, all on your own GPU.
 </Card>
@@ -86,7 +86,7 @@ open-weight champ, Ideogram 4.
 
 <Card
   title="ComfyUI on RunPod: rent a cloud GPU"
-  href="/blog/runpod-comfyui"
+  href="./runpod-comfyui"
 >
   A first-party RunPod connector: one-tap deploy of a pod that runs YOUR exact
   custom nodes and models, an honest local⇄pod host pill, live GPU/cost status,
@@ -96,7 +96,7 @@ open-weight champ, Ideogram 4.
 
 <Card
   title="Train a FLUX LoRA in the cloud on RunPod"
-  href="/blog/train-lora-runpod"
+  href="./train-lora-runpod"
 >
   No 24 GB card? Rent one. The LoRA trainer's new SSH transport stands ai-toolkit
   up on a RunPod pod and runs the same train_* flow on rented hardware — dataset
@@ -105,7 +105,7 @@ open-weight champ, Ideogram 4.
 
 <Card
   title="Train a character LoRA by asking"
-  href="/blog/lora-trainer-p1"
+  href="./lora-trainer-p1"
 >
   The panel agent drives ostris's ai-toolkit end to end through train_* tools —
   preflight, dataset staging, streamed progress, honest cancel — verified with a
@@ -114,7 +114,7 @@ open-weight champ, Ideogram 4.
 
 <Card
   title="Blind mode: a privacy promise the agent can't break"
-  href="/blog/blind-mode-privacy"
+  href="./blind-mode-privacy"
 >
   A user proved our "the agent never sees the image" toggle was leaky. The fix:
   enforcement at the tool-server boundary — one wrapper that withholds pixels
@@ -124,7 +124,7 @@ open-weight champ, Ideogram 4.
 
 <Card
   title="GPT-5.6 Sol, Terra, and Luna land in the ComfyUI panel"
-  href="/blog/gpt-5-6-comfyui"
+  href="./gpt-5-6-comfyui"
 >
   The new frontier family on your ChatGPT subscription — max and ultra efforts
   with per-model ceilings from the live catalog, account-aware deprecation that
@@ -134,7 +134,7 @@ open-weight champ, Ideogram 4.
 
 <Card
   title="Kimi K3: the biggest open-weight model ever now drives your ComfyUI canvas"
-  href="/blog/kimi-k3-comfyui"
+  href="./kimi-k3-comfyui"
 >
   Moonshot's 2.8T-parameter K3 — third on the intelligence boards, first on
   Frontend Code Arena, weights landing July 27 — became a first-class provider
@@ -144,7 +144,7 @@ open-weight champ, Ideogram 4.
 
 <Card
   title="The 405 that wasn't: three dialects of ComfyUI-Manager"
-  href="/blog/manager-405-dialects"
+  href="./manager-405-dialects"
 >
   A debugging war story in three acts: per-operation routes vs task envelopes vs
   a legacy UI hiding under /v2 — and the frontend catchall that turns every wrong
@@ -153,7 +153,7 @@ open-weight champ, Ideogram 4.
 
 <Card
   title="Your conversation now survives workflow switching"
-  href="/blog/panel-owned-sessions"
+  href="./panel-owned-sessions"
 >
   The conversation is the unit of continuity; the workflow is just the canvas
   target. How the orchestrator rebinds a live agent across workflow tabs — no
@@ -162,7 +162,7 @@ open-weight champ, Ideogram 4.
 
 <Card
   title="CivitAI inside ComfyUI: browse, like, and run without a download folder"
-  href="/blog/civitai-in-comfyui"
+  href="./civitai-in-comfyui"
 >
   A full CivitAI browser in the sidebar — lightbox with generation details,
   like/unlike with a synced likes collection, @creator search qualifiers, and
@@ -171,7 +171,7 @@ open-weight champ, Ideogram 4.
 
 <Card
   title="The render finished while you were making coffee: ComfyUI on your phone"
-  href="/blog/comfyui-mobile-app"
+  href="./comfyui-mobile-app"
 >
   The mobile companion (iOS + Android beta): same agent, same providers, CivitAI
   parity, one multi-purpose QR to pair — and tab-mirror remote control that lets
@@ -180,7 +180,7 @@ open-weight champ, Ideogram 4.
 
 <Card
   title="Flatten the spaghetti: making expert workflows readable"
-  href="/blog/flatten-workflows"
+  href="./flatten-workflows"
 >
   Get/Set buses, Reroutes, and use-everywhere broadcasts resolved to direct
   links IN PLACE — layout, groups, and widgets preserved — plus the
@@ -189,7 +189,7 @@ open-weight champ, Ideogram 4.
 
 <Card
   title="The orchestrator that never goes stale"
-  href="/blog/self-updating-orchestrator"
+  href="./self-updating-orchestrator"
 >
   Hourly npm self-update and dev-build self-restart, coalesced to fire only when
   every agent is idle and nothing is rendering — infrastructure that updates like
@@ -198,7 +198,7 @@ open-weight champ, Ideogram 4.
 
 <Card
   title="We fine-tuned Gemma 4 to drive ComfyUI — and built an arena to prove it"
-  href="/blog/gemma4-fine-tune-arena"
+  href="./gemma4-fine-tune-arena"
 >
   A gemma4 ladder (e2b/e4b/12b) trained on server-verified trajectories, scored
   by a best-of-3 arena of real ComfyUI tasks — including the regression we
@@ -208,7 +208,7 @@ open-weight champ, Ideogram 4.
 
 <Card
   title="Giving every backend eyes — and honesty when a model doesn't have them"
-  href="/blog/vision-per-model"
+  href="./vision-per-model"
 >
   Vision is a property of the model, not the provider. Always attempt image
   delivery, strip-and-retry once on rejection, and leave an in-history note so
@@ -217,7 +217,7 @@ open-weight champ, Ideogram 4.
 
 <Card
   title="Bring any LLM: free local models now drive ComfyUI"
-  href="/blog/local-llms-comfyui"
+  href="./local-llms-comfyui"
 >
   Ollama, LM Studio, llama.cpp, or any OpenAI-compatible endpoint — no account,
   no API key, fully offline. The compact tool router that makes ~200 tools fit a
@@ -227,7 +227,7 @@ open-weight champ, Ideogram 4.
 
 <Card
   title="Two brains, one canvas: ComfyUI on Claude or ChatGPT"
-  href="/blog/comfyui-agent-claude-or-chatgpt"
+  href="./comfyui-agent-claude-or-chatgpt"
 >
   The ComfyUI sidebar agent now runs on EITHER your Claude or your ChatGPT
   subscription — pick a provider, no API keys, full canvas-driving parity. How we
@@ -237,7 +237,7 @@ open-weight champ, Ideogram 4.
 
 <Card
   title="The self-healing ComfyUI agent: it fixes the node that crashed it"
-  href="/blog/self-healing-comfyui-agent"
+  href="./self-healing-comfyui-agent"
 >
   A Wan2.2 render hard-crashes ComfyUI at 99% with a native access violation. The
   agent reads the crash dump on reload, names the culprit node, and escalates —
@@ -247,7 +247,7 @@ open-weight champ, Ideogram 4.
 
 <Card
   title="The panel that talks back: an autonomous agent on your Claude subscription"
-  href="/blog/panel-agent-subscription"
+  href="./panel-agent-subscription"
 >
   Three tries to get the ComfyUI panel driven by a real background agent: channel
   pushes can't wake an idle session, the `--sdk-url` transport that did everything
@@ -258,7 +258,7 @@ open-weight champ, Ideogram 4.
 
 <Card
   title="Installer packs that can't rot: one manifest, every install"
-  href="/blog/installer-packs-that-cant-rot"
+  href="./installer-packs-that-cant-rot"
 >
   The community "1-click installer" .bat is great UX and a maintenance trap —
   Windows-only, duplicated in a separate .sh, full of model URLs that rot
@@ -269,7 +269,7 @@ open-weight champ, Ideogram 4.
 
 <Card
   title="From B to A: sharpening 70+ tool descriptions with TDQS"
-  href="/blog/comfyui-mcp-tdqs-case-study"
+  href="./comfyui-mcp-tdqs-case-study"
 >
   A case study using Glama's Tool Definition Quality Score to find and fix the one weak tool that
   was capping our whole server — plus five rules any MCP author can steal. _May 25, 2026_

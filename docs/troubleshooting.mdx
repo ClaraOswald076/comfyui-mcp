@@ -28,7 +28,7 @@ pip install -U comfyui_manager
 # then remove/disable the old custom_nodes/ComfyUI-Manager clone and restart
 ```
 
-The [RunPod image](/cloud-deployment) already ships Manager v4.
+The [RunPod image](./cloud-deployment) already ships Manager v4.
 
 **Note on `useCmCli: true`:** the cm-cli fallback runs Manager's CLI as a
 subprocess, so it needs the **local filesystem** — it can't work against a
@@ -168,7 +168,7 @@ stdio mode (the default, what MCP clients use) needs none of this.
 
 ## Local models: tool calls fail or the model "can't see" tools
 
-- **First move: use [our fine-tuned model](/local-llms#our-fine-tuned-local-models-free-recommended)** —
+- **First move: use [our fine-tuned model](./local-llms#our-fine-tuned-local-models-free-recommended)** —
   `ollama pull artokun/gemma4-comfyui-mcp:e4b` (the panel's Ollama default).
   It's Gemma 4 trained on the comfyui-mcp tool suite itself, which eliminates
   most "wrong tool / malformed args" failures out of the box (`:e2b` for
@@ -176,7 +176,7 @@ stdio mode (the default, what MCP clients use) needs none of this.
   arena; `:e4b` remains the sweet spot).
 - **gemma3 has no native tool calling in Ollama** — unsupported; use
   our fine-tune above, stock `gemma4` (e4b+), `qwen3`, or `llama3.1+`.
-- Make sure [compact tool mode](/local-llms) is on for small models —
+- Make sure [compact tool mode](./local-llms) is on for small models —
   it's the default, so this only bites if you opted into `--full`: ~200 full
   schemas overflow small contexts and the model starts hallucinating tool
   names.

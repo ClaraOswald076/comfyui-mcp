@@ -31,7 +31,7 @@ it, and the one import bug everyone hits.
 > `ltx-2.3-txt2vid` / `ltx-2.3-img2vid` pack (run the generated
 > `install-windows.bat` / `install-runpod.sh`, or
 > `apply_manifest --path packs/ltx-2.3-txt2vid/manifest.yaml`), then drive the
-> graph from your own Claude session via the [Panel](/panel).
+> graph from your own Claude session via the [Panel](../panel).
 > Jump to [Install](#install-ltx-2-3-in-comfyui).
 
 > **Update (June 19, 2026) — the render-verified sharp setup.** After actually
@@ -129,7 +129,7 @@ version:
 
 LTX-2.3's pitch is throughput and the audio track; WAN 2.2's is raw quality from its
 two-expert design. WAN 2.2 gets its own deep-dive on how the high/low-noise experts
-actually work — see [the WAN 2.2 post](/blog/wan-2.2-comfyui). For now: if you want
+actually work — see [the WAN 2.2 post](./wan-2.2-comfyui). For now: if you want
 fast local clips with sound, LTX-2.3; if you want to push motion quality and don't
 mind the cost, WAN 2.2.
 
@@ -193,9 +193,9 @@ Both packs ship a **render-verified `workflow.json`** built on the official
 two-stage template, so there's nothing to import — load it and generate. The
 installer clones each custom node **and resolves its `requirements.txt`** into the
 **ComfyUI venv** (the fix that ended a long tail of "node installed but doesn't
-load" failures — [details](/blog/installer-packs-that-cant-rot)). Because the pack
-ships with the [plugin](/plugin), your **own Claude session can drive the live
-graph through the [Panel](/panel)** — tweak prompts, swap the first-frame image,
+load" failures — [details](./installer-packs-that-cant-rot)). Because the pack
+ships with the [plugin](../plugin), your **own Claude session can drive the live
+graph through the [Panel](../panel)** — tweak prompts, swap the first-frame image,
 flip T2V↔I2V, and iterate conversationally with full undo and no extra API keys.
 Every model URL is CI-validated for reachability and size, so a link never quietly
 rots.
@@ -356,13 +356,13 @@ and the "sulphur" finetune is a separate third-party project with its own licens
 
 ## Get it running in one command
 
-1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](/panel) — the panel auto-starts a background agent on your Claude subscription (no API keys; sign in with `claude` once).
+1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — the panel auto-starts a background agent on your Claude subscription (no API keys; sign in with `claude` once).
 2. Apply the **`ltx-2.3` pack** — GGUF UNet, both VAEs, the Gemma encoder, text
    projection, upscaler, and LoRAs land in the right folders, validated.
-3. Run the bundled **kornia fix**, restart, then open the [Panel](/panel) and let
+3. Run the bundled **kornia fix**, restart, then open the [Panel](../panel) and let
    the panel's agent wire the GGUF graph and build prompts for you.
 
 That's the whole point of the project: expert ComfyUI setups that install in one
 step and drive themselves from your own agent session. **Next in the series:**
-[Ideogram 4](/blog/ideogram-4-comfyui) — the open-weight text-and-layout king, and
+[Ideogram 4](./ideogram-4-comfyui) — the open-weight text-and-layout king, and
 the finale of the model-highlight run.

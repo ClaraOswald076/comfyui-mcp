@@ -25,7 +25,7 @@ the whole thing **locally in ComfyUI**, no API, no per-second render fee.
 Below: what it's genuinely best at (with the paper's receipts), how it works under
 the hood, where it sits relative to **WAN VACE** and the rest of the WAN stack, the
 VRAM you need, and the fastest way to get it running — a one-command install with
-[comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [sidebar Panel](/panel),
+[comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [sidebar Panel](../panel),
 instead of hand-cloning six custom-node repos and chasing dtype errors.
 
 > **TL;DR — one-command setup.** Install comfyui-mcp, apply the `wan-animate` pack
@@ -82,8 +82,8 @@ There's no single "best" — pick by the job:
 |-------|----------------|
 | **WAN Animate 2.2** | **Character replace** in existing footage, or **motion/expression transfer** to a still — best identity + scene blending, Apache 2.0 |
 | **WAN VACE** | A **general** video edit framework — inpaint/outpaint/extend/reference, mix-and-match tasks |
-| **WAN 2.2 T2V** | Original video **from text** (dual hi/lo experts, lightning LoRAs) — see [the WAN 2.2 post](/blog/wan-2.2-comfyui) |
-| **LTX-2.3** | Fast, real-time-ish generation on lower VRAM — see [the LTX-2.3 post](/blog/ltx-2.3-comfyui) |
+| **WAN 2.2 T2V** | Original video **from text** (dual hi/lo experts, lightning LoRAs) — see [the WAN 2.2 post](./wan-2.2-comfyui) |
+| **LTX-2.3** | Fast, real-time-ish generation on lower VRAM — see [the LTX-2.3 post](./ltx-2.3-comfyui) |
 
 Where rivals win: VACE for breadth of edit types, T2V for from-scratch creation,
 LTX for raw speed. WAN Animate earns the spotlight for the one thing it's built
@@ -134,12 +134,12 @@ apply_manifest --path packs/wan-animate/manifest.yaml
 > woct0rdho SageAttention wheel, and drops the Python include/libs zip so Triton can
 > compile. Restart ComfyUI afterward, then load `workflow.json`.
 
-Because the pack ships with the [plugin](/plugin), your **own Claude session can
-drive the live graph through the [Panel](/panel)** — load the reference image,
+Because the pack ships with the [plugin](../plugin), your **own Claude session can
+drive the live graph through the [Panel](../panel)** — load the reference image,
 point at the driving video, pick the SeC vs. auto-mask path, set widgets, and
 iterate conversationally, with full Ctrl+Z undo and no extra API keys. Every model
 URL in the pack is CI-validated for reachability and size, so a link never quietly
-rots ([here's why that matters](/blog/installer-packs-that-cant-rot)).
+rots ([here's why that matters](./installer-packs-that-cant-rot)).
 
 ## How WAN Animate works
 
@@ -193,7 +193,7 @@ paper explicitly calls out VACE's instability on character tasks. So:
 
 If you're already running our WAN stack, note that the WAN 2.2 T2V pack also ships
 **VACE modules** for reference/pose/depth conditioning on text-to-video — see the
-[WAN 2.2 post](/blog/wan-2.2-comfyui) for that side.
+[WAN 2.2 post](./wan-2.2-comfyui) for that side.
 
 ## What to make with it
 
@@ -236,7 +236,7 @@ lighting and camera.
 
 **Do I need a reference video?** Yes — Animate is **video-to-video**. You bring a
 reference image (the character) *and* a driving video (the performance/footage).
-For text-to-video from scratch, use the [WAN 2.2 T2V](/blog/wan-2.2-comfyui) stack
+For text-to-video from scratch, use the [WAN 2.2 T2V](./wan-2.2-comfyui) stack
 instead.
 
 **Is it free / commercial-use OK?** Yes. The weights are **Apache 2.0** — the most
@@ -262,12 +262,12 @@ not a universal benchmark.
 
 ## Get it running in one command
 
-1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](/panel) — the panel auto-starts a background agent on your Claude subscription (no API keys; sign in with `claude` once).
+1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — the panel auto-starts a background agent on your Claude subscription (no API keys; sign in with `claude` once).
 2. Apply the **`wan-animate` pack** — nodes + models land in the right folders, validated.
 3. Run `install_triton_and_sageattention_auto.bat`, restart, and load `workflow.json`.
-4. Open the [Panel](/panel) and let the panel's agent load the image, point at the driving video, and iterate.
+4. Open the [Panel](../panel) and let the panel's agent load the image, point at the driving video, and iterate.
 
 That's the whole point of the project: expert ComfyUI setups that install in one
 step and drive themselves from your own agent session. **Next in the series:**
-[WAN Transparent Expressions](/blog/wan-transparent-comfyui) — looping,
+[WAN Transparent Expressions](./wan-transparent-comfyui) — looping,
 alpha-channel character sprites from WAN 2.2 I2V.

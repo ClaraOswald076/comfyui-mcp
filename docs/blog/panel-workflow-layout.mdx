@@ -14,7 +14,7 @@ keywords:
 
 _by [artokun](https://github.com/artokun) · June 19, 2026 · panel · agent · layout · dev-log_
 
-The [Panel](/panel) agent could already build ComfyUI graphs — add nodes, wire
+The [Panel](../panel) agent could already build ComfyUI graphs — add nodes, wire
 them, set widgets, run them. But it built them **blind**. It could move a node to
 `[x, y]`, yet the graph read didn't return node **sizes**, so it stacked tall
 nodes (a `WanVideo Sampler` is ~900px) on a fixed 320px pitch and they overlapped.
@@ -132,5 +132,5 @@ algorithm every time instead of improvising:
 
 Small primitives, one skill, and — crucially — a way for the agent to look at what
 it made. If you're driving ComfyUI from your own Claude session through the
-[Panel](/panel), it can now hand you a workflow that's actually laid out, not just
+[Panel](../panel), it can now hand you a workflow that's actually laid out, not just
 wired. Grab [comfyui-mcp](https://github.com/artokun/comfyui-mcp) to try it.

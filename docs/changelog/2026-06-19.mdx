@@ -5,7 +5,7 @@ description: "The ComfyUI Agent Panel gains live-streaming chat, SDK slash comma
 
 _June 19, 2026_
 
-**v0.15.0** is a big round on the [Agent Panel](/panel) — streaming, discoverable
+**v0.15.0** is a big round on the [Agent Panel](../panel) — streaming, discoverable
 commands, real recovery — plus converter and pack hardening underneath.
 
 ## The panel chat streams now
@@ -39,7 +39,7 @@ orchestrator — your unrelated shells and editors are never touched.
 
 The legacy interactive `--channels` mode (and the `panel_say` / `panel_inbox` /
 `panel_status` tools) is fully removed. The panel runs only on the autonomous
-[orchestrator](/configuration) on its dedicated bridge port **9180**, so nothing
+[orchestrator](../configuration) on its dedicated bridge port **9180**, so nothing
 can steal the panel's port anymore. The pack is now **ComfyUI Agent Panel**
 (`comfyui-agent-panel`) on the Comfy Registry.
 
@@ -63,7 +63,7 @@ can steal the panel's port anymore. The pack is now **ComfyUI Agent Panel**
   **LTX-2.3 rebuild**: `txt2vid` + `img2vid` now ship on the official Comfy-Org
   two-stage template (`LTXAVTextEncoderLoader` + gemma abliterated LoRA + dynamic
   distilled LoRA + ×2 upscale) — sharp 1280×704 with synced audio, replacing the
-  soft GGUF/DualCLIPLoader path. See the [LTX-2.3 post](/blog/ltx-2.3-comfyui).
+  soft GGUF/DualCLIPLoader path. See the [LTX-2.3 post](../blog/ltx-2.3-comfyui).
 - **Installers** now resolve each cloned node's **`requirements.txt`** into the
   **ComfyUI venv** (not system Python) — the root cause behind a long tail of
-  "installed but won't load" nodes. [Why it matters](/blog/installer-packs-that-cant-rot).
+  "installed but won't load" nodes. [Why it matters](../blog/installer-packs-that-cant-rot).

@@ -20,14 +20,14 @@ Short answer to the question everyone asks: **no, you don't need a 24GB card to
 train a FLUX LoRA anymore.** You rent one for the hour or two the run takes,
 train on it by asking the agent, and get the `.safetensors` back on your own
 machine. This is P4 — the cloud sequel to
-[the local LoRA trainer (P1)](/blog/lora-trainer-p1) — and it runs the exact same
+[the local LoRA trainer (P1)](./lora-trainer-p1) — and it runs the exact same
 `train_*` tools, just pointed at rented hardware.
 
 ## How much VRAM does FLUX LoRA training need?
 
 FLUX.1-dev LoRA training is greedy. Even with quantization on, a real character
 run wants roughly **24 GB of VRAM** — RTX 4090 class. That's the wall a lot of
-people hit the moment they read [P1](/blog/lora-trainer-p1): the flow is a
+people hit the moment they read [P1](./lora-trainer-p1): the flow is a
 conversation, the trainer is proven, the handoff is honest… and their local card
 is a 12 GB laptop GPU that can't fit the model. Training simply doesn't start.
 
@@ -44,8 +44,8 @@ sitting in `models/loras/` that loads on any GPU big enough to *infer* with it
 (far less than training needs).
 
 comfyui-mcp already knows how to talk to RunPod: it's the same pods the
-[RunPod connector](/blog/runpod-comfyui) uses for remote rendering, and the same
-`RUNPOD_API_KEY` you set once in the [panel](/panel)'s API-Keys card.
+[RunPod connector](./runpod-comfyui) uses for remote rendering, and the same
+`RUNPOD_API_KEY` you set once in the [panel](../panel)'s API-Keys card.
 P4 teaches the trainer to borrow that hardware for a training run.
 
 ## How the pod bootstrap works
@@ -122,13 +122,13 @@ The honest notes, because rented GPUs come with real trade-offs:
   it *finished*.
 - **Your dataset leaves your machine.** It goes up to the pod over rsync/ssh.
   That's inherent to renting someone else's GPU; if that's a dealbreaker for a
-  given dataset, [train it locally](/blog/lora-trainer-p1) instead.
+  given dataset, [train it locally](./lora-trainer-p1) instead.
 
 ## RunPod FLUX LoRA training setup
 
 1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the
-   [Panel](/panel). Set your `RUNPOD_API_KEY` **once** in the panel's API-Keys
-   card — the same key the [RunPod connector](/blog/runpod-comfyui) already uses.
+   [Panel](../panel). Set your `RUNPOD_API_KEY` **once** in the panel's API-Keys
+   card — the same key the [RunPod connector](./runpod-comfyui) already uses.
 2. Make sure an `HF_TOKEN` with FLUX.1-dev access is in the MCP server env
    (FLUX.1-dev is gated; the pod downloads it on the first run).
 3. Ask: *"train a character LoRA from these photos on a RunPod pod."* The agent
@@ -138,7 +138,7 @@ The honest notes, because rented GPUs come with real trade-offs:
    `models/loras/`.
 
 That's the whole pitch of P4: the local trainer from
-[P1](/blog/lora-trainer-p1) proved the flow; the cloud transport removes the one
+[P1](./lora-trainer-p1) proved the flow; the cloud transport removes the one
 requirement not everyone can meet. You no longer need to *own* a 24GB GPU to
 train a FLUX LoRA — you just need to borrow one for an hour.
 

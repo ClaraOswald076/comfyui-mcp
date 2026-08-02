@@ -18,7 +18,7 @@ with `@ref` pinning), and model downloads. Idempotent, with a per-item
 structured report so you can see exactly what was already installed, what
 just changed, and what failed.
 
-See [Install & environment tools](/tools/install-environment).
+See [Install & environment tools](../tools/install-environment).
 
 ### Custom-node authoring lifecycle
 
@@ -33,7 +33,7 @@ A complete write → test → publish loop, callable from your agent:
 - **`publish_custom_node`** — publish to the Comfy Registry via `comfy-cli`.
   Your `REGISTRY_ACCESS_TOKEN` is never logged.
 
-See [Custom-node tools](/tools/custom-nodes).
+See [Custom-node tools](../tools/custom-nodes).
 
 ### Cloud storage in and out
 
@@ -42,7 +42,7 @@ See [Custom-node tools](/tools/custom-nodes).
 - New **`upload_output`** pushes a generated image to S3, Azure, an HTTP
   endpoint, or Hugging Face and returns the URL(s).
 
-See [Models](/tools/models) and [Assets & images](/tools/assets-images).
+See [Models](../tools/models) and [Assets & images](../tools/assets-images).
 
 ### Server-side image conversion
 
@@ -51,7 +51,7 @@ output-dir path) to PNG, JPEG, or WebP via `sharp`. Returns inline base64
 plus an optional file write, and reports bytes saved — useful for trimming
 4 MB PNGs down to ~300 KB WebPs before they leave your machine.
 
-See [Assets & images](/tools/assets-images).
+See [Assets & images](../tools/assets-images).
 
 ### Node discovery agent
 
@@ -64,7 +64,7 @@ delegates deep dives to `comfy-explorer`.
 `source@version` (`COMFYUI_SKILL_CACHE_DIR`), so repeat analyses are
 instant. Pass `refresh` to bypass.
 
-See [Defaults, stats, and skills](/tools/defaults-stats-skills).
+See [Defaults, stats, and skills](../tools/defaults-stats-skills).
 
 ### Media uploads
 
@@ -72,7 +72,7 @@ See [Defaults, stats, and skills](/tools/defaults-stats-skills).
 ComfyUI's input directory so workflows can reference them as inputs —
 mirroring `upload_image` (closes #12).
 
-See [Assets & images](/tools/assets-images).
+See [Assets & images](../tools/assets-images).
 
 ### Hosted documentation
 
@@ -91,7 +91,7 @@ schema-generated from the source so it stays in lockstep with the server.
   (no more double-downloading the same checkpoint) and optional LRU eviction.
   Configure via `COMFYUI_DOWNLOAD_CACHE_DIR` and `COMFYUI_LRU_CACHE_SIZE_GB`.
 
-See [Models](/tools/models).
+See [Models](../tools/models).
 
 ### Custom-node install — pin to a ref
 
@@ -100,7 +100,7 @@ the URL (`https://github.com/user/repo@v1.2.0`), an explicit `ref` argument,
 or a `repo@ref` shorthand. Reproducible installs, no more "works on my
 machine" because `main` moved.
 
-See [Custom-node tools](/tools/custom-nodes).
+See [Custom-node tools](../tools/custom-nodes).
 
 ### Process supervision
 
@@ -112,7 +112,7 @@ See [Custom-node tools](/tools/custom-nodes).
   `COMFYUI_RESTART_WINDOW_S`) — recover from transient OOMs without spinning
   forever on a real bug.
 
-See [Process control](/tools/process-control).
+See [Process control](../tools/process-control).
 
 ### Better job error reporting
 
@@ -121,7 +121,7 @@ errors with the failing node ID and type, exception type/message, a
 truncated traceback, `current_inputs`, and an OOM flag — plus optional
 per-node and total execution timing. Fully additive.
 
-See [Workflow execution](/tools/workflow-execution).
+See [Workflow execution](../tools/workflow-execution).
 
 ### Plugin skills
 

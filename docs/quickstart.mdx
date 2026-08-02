@@ -9,7 +9,7 @@ icon: "rocket"
     Install [ComfyUI Desktop](https://www.comfy.org/download) or run it
     [from source](https://github.com/comfyanonymous/ComfyUI), and start it. ComfyUI MCP
     auto-detects a local install and its port (8188 / 8000). To target a remote instance,
-    see [Configuration](/configuration).
+    see [Configuration](./configuration).
   </Step>
 
   <Step title="Add the MCP server to Claude Code">
@@ -41,26 +41,26 @@ icon: "rocket"
 
     > Generate an image of a watercolor fox in a misty forest.
 
-    Under the hood this calls [`generate_image`](/tools/image-generation), which builds a
+    Under the hood this calls [`generate_image`](./tools/image-generation), which builds a
     txt2img workflow, auto-selects a checkpoint, enqueues it, and returns a `prompt_id`. The
     finished image arrives via the completion notification — view it with
-    [`view_image`](/tools/assets-images).
+    [`view_image`](./tools/assets-images).
   </Step>
 </Steps>
 
 ## Next steps
 
 <CardGroup cols={2}>
-  <Card title="Installation details" icon="download" href="/installation">
+  <Card title="Installation details" icon="download" href="./installation">
     Local vs. remote setups and `npm link` for development.
   </Card>
-  <Card title="Configuration" icon="gear" href="/configuration">
+  <Card title="Configuration" icon="gear" href="./configuration">
     All environment variables and the HTTP transport.
   </Card>
-  <Card title="How it works" icon="diagram-project" href="/concepts">
+  <Card title="How it works" icon="diagram-project" href="./concepts">
     The model behind the tools — and which ones need a local install.
   </Card>
-  <Card title="Browse the tools" icon="wrench" href="/tools/image-generation">
+  <Card title="Browse the tools" icon="wrench" href="./tools/image-generation">
     The full, schema-generated reference.
   </Card>
 </CardGroup>

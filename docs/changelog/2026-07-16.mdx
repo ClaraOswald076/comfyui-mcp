@@ -15,7 +15,7 @@ riding the existing QueueMonitor watchdog so browser-queued jobs are covered too
 Change-only and capped at 1 frame/sec (an idle rig broadcasts nothing), and each tab
 is seeded with the current state on `hello`, so a client connecting mid-render sees
 the running job immediately. This powers the
-[mobile app's](/blog/comfyui-mobile-app) live queue monitor.
+[mobile app's](../blog/comfyui-mobile-app) live queue monitor.
 
 **`cancel_job` joins the mobile whitelist** for one-tap cancel of the running render
 from the phone — narrowly scoped: the client passes the `prompt_id` it observed,
@@ -38,5 +38,5 @@ URL change and stale-socket handlers can't null a new connection.
 
 ## Docs
 
-A **[mobile app (beta)](/mobile)** page: Android (Firebase App Distribution) and iOS
+A **[mobile app (beta)](../mobile)** page: Android (Firebase App Distribution) and iOS
 (TestFlight) beta-tester links plus the pairing walkthrough, wired into the nav.

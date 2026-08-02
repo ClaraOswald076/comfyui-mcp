@@ -10,7 +10,7 @@ Don't have a local GPU — or want a bigger one on demand? Deploy ComfyUI to a
 
 <Note>
 The pod only serves **ComfyUI + Manager + the Agent Panel UI**. The agent's brain
-(the [panel orchestrator](/panel)) runs **locally on your machine** on your own
+(the [panel orchestrator](./panel)) runs **locally on your machine** on your own
 subscription — so a cloud pod never burns GPU-hours on the LLM, and no API key or
 agent login ever touches the box. See [Topology](#topology-where-the-agent-runs).
 </Note>
@@ -35,9 +35,9 @@ Then jump to [Connect from your machine](#connect-from-your-machine).
 ## Deploy & control it from the Agent Panel (v0.44+)
 
 Since **comfyui-mcp 0.44**, you don't have to touch the RunPod console or run a
-CLI command at all — the [Agent Panel](/panel) has a **RunPod control panel** that
+CLI command at all — the [Agent Panel](./panel) has a **RunPod control panel** that
 deploys, connects, monitors, and stops a pod for you, and the same control sheet
-ships in the [mobile app](/mobile).
+ships in the [mobile app](./mobile).
 
 1. **Set your key once.** In the panel's **API-Keys** card, paste your
    `RUNPOD_API_KEY`. It's stored server-side in `~/.comfyui-mcp/.env` — never in
@@ -78,7 +78,7 @@ template deploys (`RUNPOD_TEMPLATE_ID`) default it **off** — pass
 
 <Note>
 New to renting GPUs for ComfyUI? The blog walks the whole flow end to end:
-[Run ComfyUI on a rented cloud GPU](/blog/runpod-comfyui).
+[Run ComfyUI on a rented cloud GPU](./blog/runpod-comfyui).
 </Note>
 
 The rest of this page is the **manual / CLI path** — still fully supported, and
@@ -142,7 +142,7 @@ own path for the pod page to reach `ws://127.0.0.1:9180`).
 
 Want a **stable, self-hosted alternative** to the default Cloudflare quick tunnel
 — your own domain, no ephemeral hostname, full ownership of that hop — instead of
-either of the above? See [Self-hosted relay](/self-hosted-relay).
+either of the above? See [Self-hosted relay](./self-hosted-relay).
 
 ## Topology: where the agent runs
 
@@ -158,7 +158,7 @@ either of the above? See [Self-hosted relay](/self-hosted-relay).
 
 The pod deliberately ships **no Node.js agent, no Agent SDK, and no LLM client** —
 they'd burn GPU-hours for nothing. The reasoning loop lives on your machine; the
-pod is a pure ComfyUI backend. This is the same [remote-driving model](/panel) the
+pod is a pure ComfyUI backend. This is the same [remote-driving model](./panel) the
 local Agent Panel uses, just with ComfyUI on a cloud GPU instead of localhost.
 
 ## What persists (and what doesn't)
@@ -225,4 +225,4 @@ npx -y comfyui-mcp@latest connect https://your-comfyui.example.com
 ```
 
 For exposing **comfyui-mcp itself** as a hosted, authenticated MCP server (rather
-than deploying ComfyUI), see [Remote / hosted connector](/remote-connector).
+than deploying ComfyUI), see [Remote / hosted connector](./remote-connector).

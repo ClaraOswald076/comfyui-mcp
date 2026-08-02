@@ -4,7 +4,7 @@ description: "The panel agent runs on ANY LLM: Claude, ChatGPT, Gemini, Grok, Ki
 icon: "shuffle"
 ---
 
-The [sidebar panel](/panel) agent is **provider-agnostic**. Pick **Claude**,
+The [sidebar panel](./panel) agent is **provider-agnostic**. Pick **Claude**,
 **ChatGPT**, **Gemini**, or **Ollama (local)** and the matching agent runs in
 the background — subscriptions need no API key, and local models need no
 account at all. The Ollama backend also speaks **any OpenAI-compatible
@@ -12,7 +12,7 @@ endpoint** (OpenRouter, DeepSeek, GLM, MiMo, vLLM, LM Studio), so "bring your
 own model" covers everything from a free 4B on your own GPU to the frontier.
 All providers share the same live-canvas tools, the same model knowledge, the
 same one-shot workflow loads, the same cost guardrail. The
-[LLM Arena](/arena) scores any of them on real ComfyUI tasks.
+[LLM Arena](./arena) scores any of them on real ComfyUI tasks.
 
 ```
 panel (pick a provider) ⇄ loopback bridge ⇄ orchestrator (Claude · ChatGPT · Gemini · any LLM) ⇄ your graph
@@ -98,7 +98,7 @@ placeholder follows the active backend ("Ask Claude…" / "Ask Ollama…").
   `/v1` (vLLM, DeepSeek, Together, Azure, a remote llama-server) in Settings →
   Custom endpoint; add an API key there if the server needs one (masked input,
   stored 0600 by the orchestrator). See
-  [Local LLMs → Custom endpoint](/local-llms#custom-endpoint-any-openai-compatible-server).
+  [Local LLMs → Custom endpoint](./local-llms#custom-endpoint-any-openai-compatible-server).
 
 ### Connect-time readiness & onboarding
 
@@ -130,7 +130,7 @@ The orchestrator depends on a provider-neutral **`AgentBackend`** port
 |---|---|---|---|---|
 | Driver | Claude Agent SDK — persistent streaming session | `codex app-server` JSON-RPC | `gemini --acp` (Agent Client Protocol) | direct HTTP — Ollama `/api/chat` or any OpenAI-compatible `/v1/chat/completions`; the backend owns the whole agentic loop |
 | Auth | claude.ai OAuth | ChatGPT login | Google login | none (local) / bearer key (hosted) |
-| Live-canvas tools | in-process SDK MCP server | loopback streamable-HTTP MCP | loopback streamable-HTTP MCP | the [6-tool router](/local-llms) over the same loopback MCP |
+| Live-canvas tools | in-process SDK MCP server | loopback streamable-HTTP MCP | loopback streamable-HTTP MCP | the [6-tool router](./local-llms) over the same loopback MCP |
 | Headless `comfyui` MCP | in-process | config-declared stdio | config-declared stdio | compact-mode stdio subprocess behind the router |
 
 The `panel_*` tool definitions live in **one shared list**, registered onto
@@ -138,7 +138,7 @@ every path, so the live-canvas surface (including the destructive-confirm
 gating for `panel_clear` / `panel_restart_comfyui`) is identical across
 providers. Parity is automatic — no path reimplements a tool. The Ollama/any-LLM
 backend additionally wraps both tool surfaces behind six router tools so
-small models aren't drowned in schemas — see [Local LLMs & other agents](/local-llms).
+small models aren't drowned in schemas — see [Local LLMs & other agents](./local-llms).
 
 ## Capability matrix
 
@@ -177,12 +177,12 @@ Because only Claude can load native skills, the bundled expertise is
 published as MCP tools any backend can call — `list_skills`, `read_skill`,
 `list_packs`, `read_pack_workflow`, `list_workflow_templates` — plus the
 local-GPU-vs-paid-API guardrail (`check_workflow_runtime`) and one-shot
-`panel_load_workflow`. See [Skills, Packs & Runtime Cost](/tools/skills-knowledge).
+`panel_load_workflow`. See [Skills, Packs & Runtime Cost](./tools/skills-knowledge).
 
 ## See also
 
-- [Sidebar Panel](/panel) — the full panel UX
-- [Local LLMs & other agents](/local-llms) — the 6-tool router, model requirements, Hermes/OpenClaw/Copilot setup
-- [LLM Arena](/arena) — score YOUR model on real ComfyUI tasks
-- [Skills, Packs & Runtime Cost](/tools/skills-knowledge) — the parity + cost tools
+- [Sidebar Panel](./panel) — the full panel UX
+- [Local LLMs & other agents](./local-llms) — the 6-tool router, model requirements, Hermes/OpenClaw/Copilot setup
+- [LLM Arena](./arena) — score YOUR model on real ComfyUI tasks
+- [Skills, Packs & Runtime Cost](./tools/skills-knowledge) — the parity + cost tools
 - Design doc: [`docs/design/agent-backend-injection.md`](https://github.com/artokun/comfyui-mcp/blob/main/docs/design/agent-backend-injection.md)

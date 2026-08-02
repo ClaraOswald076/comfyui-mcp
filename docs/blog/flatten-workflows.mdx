@@ -28,7 +28,7 @@ opaque. Ask "what feeds this sampler's model input?" and the honest answer is: a
 `Get_MODEL` node, which matches a `Set_MODEL` node by string, which is fed by a
 Reroute, which… The graph you can *see* is not the graph that *runs*.
 
-The [Panel](/panel) agent kept hitting this wall. It can read the canvas, edit
+The [Panel](../panel) agent kept hitting this wall. It can read the canvas, edit
 nodes, run workflows — but reading an expert workflow meant re-implementing three
 custom-node packs' resolution rules in its head, every time, per input. So we
 built the resolution once, as tools. This post is the dev-log: three tools, one
@@ -191,6 +191,6 @@ spaghetti untangles itself — and it doesn't move your nodes doing it.
 ---
 
 Try it on the gnarliest workflow in your collection: install
-[comfyui-mcp](https://github.com/artokun/comfyui-mcp), add the [Panel](/panel),
+[comfyui-mcp](https://github.com/artokun/comfyui-mcp), add the [Panel](../panel),
 and ask the agent to flatten what's on your canvas. Star the repo or file an
 idea at [artokun/comfyui-mcp](https://github.com/artokun/comfyui-mcp/issues).

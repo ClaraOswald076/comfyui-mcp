@@ -87,13 +87,13 @@ These are good reasons. If several apply to you, stop reading and go use
 - **You want to use the LLM subscription you already have.** Your Claude or
   ChatGPT plan already covers the reasoning — no second meter for the agent.
 - **You want it free, or you want it offline.** Ollama, LM Studio, and llama.cpp
-  run with no account and no network. See [Local LLMs](/local-llms).
+  run with no account and no network. See [Local LLMs](./local-llms).
 - **Your install is the point.** Your custom nodes, your LoRAs, your checkpoint
-  collection. The agent [installs nodes and downloads models](/tools/models) into
+  collection. The agent [installs nodes and downloads models](./tools/models) into
   the install you actually use.
 - **You want to choose the model.** Different LLMs are better at different
-  things; the [LLM Arena](/arena) scores them on real ComfyUI tasks so you can
-  pick on evidence. See [Backends](/backends).
+  things; the [LLM Arena](./arena) scores them on real ComfyUI tasks so you can
+  pick on evidence. See [Backends](./backends).
 
 ## "Won't the official local MCP make this redundant?"
 
@@ -113,22 +113,22 @@ agent live inside ComfyUI and manage the install itself, that's the gap this
 project exists to fill.
 
 They also compose. This project can target Comfy Cloud too (set
-`COMFYUI_API_KEY` — see [Cloud deployment](/cloud-deployment)), so one config
+`COMFYUI_API_KEY` — see [Cloud deployment](./cloud-deployment)), so one config
 covers a local install, a LAN box, a VPS, and Comfy Cloud.
 
 ## Getting started
 
 <CardGroup cols={2}>
-  <Card title="Quickstart" icon="rocket" href="/quickstart">
+  <Card title="Quickstart" icon="rocket" href="./quickstart">
     MCP server running against your local ComfyUI in about a minute.
   </Card>
-  <Card title="Local LLMs" icon="microchip" href="/local-llms">
+  <Card title="Local LLMs" icon="microchip" href="./local-llms">
     Fully offline on Ollama, LM Studio, or llama.cpp — no account.
   </Card>
-  <Card title="Backends" icon="shuffle" href="/backends">
+  <Card title="Backends" icon="shuffle" href="./backends">
     Claude, ChatGPT, Gemini, Grok, Kimi, or any OpenAI-compatible endpoint.
   </Card>
-  <Card title="Agent Panel" icon="window" href="/panel">
+  <Card title="Agent Panel" icon="window" href="./panel">
     The sidebar agent that drives your live graph.
   </Card>
 </CardGroup>

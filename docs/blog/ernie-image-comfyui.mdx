@@ -25,7 +25,7 @@ per-image fee, no non-commercial clause hanging over your head.
 Below: what ERNIE-Image actually is (and the one thing people keep getting wrong
 about it), how it stacks up against Ideogram 4 and Z-Image, the VRAM you need, and
 the fastest way to get it running — a one-command install with
-[comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [sidebar Panel](/panel),
+[comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [sidebar Panel](../panel),
 instead of hand-downloading GGUFs and untangling a contaminated installer.
 
 > **TL;DR — one-command setup.** Install comfyui-mcp, apply the `ernie` pack
@@ -43,7 +43,7 @@ prompts into richer descriptions. ComfyUI added **day-0 support** in April 2026.
 
 **The license is the headline — and it's genuinely permissive.** ERNIE-Image ships
 under **Apache-2.0**, which allows commercial use, modification, and redistribution,
-full stop. That's a real difference from [Ideogram 4](/blog/ideogram-4-comfyui),
+full stop. That's a real difference from [Ideogram 4](./ideogram-4-comfyui),
 which is open *weight* but under a **Non-Commercial** agreement (commercial use
 needs a paid license). With ERNIE you can put it in a product on day one. No gated
 download drama, no "for research only" footnote.
@@ -62,11 +62,11 @@ There's no single "best" — pick by the job:
 | **ERNIE-Image** | **Truly permissive (Apache-2.0)** commercial use, **multilingual EN/CN/JP text**, posters/signage/manga layouts, runs **under 8 GB** |
 | **Ideogram 4** | **Area-prompting** with structured JSON bounding boxes, fine-grained poster/logo **layout control**, brand-color accuracy |
 | **Z-Image Turbo** | **Raw speed + low VRAM** general-purpose ideation (~2.5s), LoRA-training stability on the base |
-| **Qwen-Image** | A larger, popular dev model also strong on long text — see our [Qwen-Image post](/blog/qwen-image-comfyui) |
+| **Qwen-Image** | A larger, popular dev model also strong on long text — see our [Qwen-Image post](./qwen-image-comfyui) |
 
-Where rivals win: **[Ideogram 4](/blog/ideogram-4-comfyui)** gives you explicit
+Where rivals win: **[Ideogram 4](./ideogram-4-comfyui)** gives you explicit
 spatial control — draw bounding boxes, place text and objects by region — which
-ERNIE doesn't expose (you steer ERNIE with descriptive prose). **[Z-Image](/blog/z-image-comfyui)**
+ERNIE doesn't expose (you steer ERNIE with descriptive prose). **[Z-Image](./z-image-comfyui)**
 is the speed king for fast general ideation. But ERNIE wins decisively on the two
 axes that matter for production text work: a **permissive license** and **clean
 multilingual typography**. Each of those models gets its own post in this series —
@@ -134,11 +134,11 @@ packs/ernie/install-runpod.sh        # RunPod / Linux
 ```
 
 Then load `packs/ernie/workflow.json`. Because the pack ships with the
-[plugin](/plugin), your **own Claude session can drive the live graph through the
-[Panel](/panel)** — add/wire nodes, set widgets, and iterate on prompts
+[plugin](../plugin), your **own Claude session can drive the live graph through the
+[Panel](../panel)** — add/wire nodes, set widgets, and iterate on prompts
 conversationally, with full Ctrl+Z undo and no extra API keys. Every model URL in
 the pack is CI-validated for reachability and size, so a link never quietly rots
-([here's why that matters](/blog/installer-packs-that-cant-rot)).
+([here's why that matters](./installer-packs-that-cant-rot)).
 
 ## Why text and layout are its superpower
 
@@ -255,7 +255,7 @@ with a Ministral-3-3B text encoder and the Flux 2 VAE.
 **English, Chinese, and Japanese** cleanly thanks to a character-aware encoder
 trained on a large CJK corpus.
 
-**ERNIE-Image vs Z-Image — which should I use?** [Z-Image](/blog/z-image-comfyui)
+**ERNIE-Image vs Z-Image — which should I use?** [Z-Image](./z-image-comfyui)
 for the fastest general-purpose ideation; **ERNIE** when you need a permissive
 license plus precise multilingual text and structured layouts.
 
@@ -267,11 +267,11 @@ designed for layout-sensitive, multilingual text rendering, not as an afterthoug
 
 ## Get it running in one command
 
-1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](/panel) — the panel auto-starts a background agent on your Claude subscription (no API keys; sign in with `claude` once).
+1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — the panel auto-starts a background agent on your Claude subscription (no API keys; sign in with `claude` once).
 2. Apply the **`ernie` pack** — nodes + ERNIE-only models land in the right folders, validated, with the Z-Image cruft stripped out.
-3. Open the [Panel](/panel) and let the panel's agent write multilingual prompts and wire the graph for you.
+3. Open the [Panel](../panel) and let the panel's agent write multilingual prompts and wire the graph for you.
 
 That's the whole point of the project: expert ComfyUI setups that install in one
 step and drive themselves from your own agent session. **Next in the series:**
-[ANIMA 1.0](/blog/anima-comfyui) — the tiny anime model that generates and trains
+[ANIMA 1.0](./anima-comfyui) — the tiny anime model that generates and trains
 LoRAs under 6 GB.

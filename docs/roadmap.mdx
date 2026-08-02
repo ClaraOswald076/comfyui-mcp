@@ -49,15 +49,15 @@ Everything here works today and is covered by the docs.
 
 | Area | What you get |
 |---|---|
-| **Agent in ComfyUI** | The panel puts an agent beside your canvas — it reads the graph, edits nodes, runs workflows, and explains failures. See [Panel](/panel). |
-| **Bring your own model** | Claude, ChatGPT/Codex, Gemini, Antigravity, Grok, Kimi, GLM, Ollama, LM Studio, llama.cpp, OpenRouter, or a custom endpoint — one picker, one orchestrator. See [Backends](/backends). |
-| **Local models** | Fully local operation through Ollama / LM Studio / llama.cpp, including small models. See [Local LLMs](/local-llms). |
+| **Agent in ComfyUI** | The panel puts an agent beside your canvas — it reads the graph, edits nodes, runs workflows, and explains failures. See [Panel](./panel). |
+| **Bring your own model** | Claude, ChatGPT/Codex, Gemini, Antigravity, Grok, Kimi, GLM, Ollama, LM Studio, llama.cpp, OpenRouter, or a custom endpoint — one picker, one orchestrator. See [Backends](./backends). |
+| **Local models** | Fully local operation through Ollama / LM Studio / llama.cpp, including small models. See [Local LLMs](./local-llms). |
 | **Workflow authoring** | Build, patch, slice, validate and lock workflows from natural language; import from an image's metadata. |
 | **Models & custom nodes** | Search, install and repair node packs; find and download models — including working out which models a workflow is missing and which quantisation fits your VRAM. |
 | **Civitai browser** | Browse images, videos and models in-panel, filter by base model and creator, and pull a workflow straight onto the canvas. |
-| **Mobile app** | Chat to the agent, watch the queue, browse LoRAs, and mirror a desktop tab to drive your rig from your phone. See [Mobile](/mobile). |
-| **Apps (micro-apps)** | Turn a workflow into a one-click app with a real form: convert and publish in the panel, run it locally or on a pod, install others' apps from the public registry — and run the same apps from the phone's Apps tab or an agent via the `apps_*` tools. See [Apps](/apps). |
-| **Remote & cloud** | Point the panel at a remote ComfyUI, a self-hosted relay, or Comfy Cloud. See [Remote connector](/remote-connector). |
+| **Mobile app** | Chat to the agent, watch the queue, browse LoRAs, and mirror a desktop tab to drive your rig from your phone. See [Mobile](./mobile). |
+| **Apps (micro-apps)** | Turn a workflow into a one-click app with a real form: convert and publish in the panel, run it locally or on a pod, install others' apps from the public registry — and run the same apps from the phone's Apps tab or an agent via the `apps_*` tools. See [Apps](./apps). |
+| **Remote & cloud** | Point the panel at a remote ComfyUI, a self-hosted relay, or Comfy Cloud. See [Remote connector](./remote-connector). |
 | **RunPod pods** | Create, connect to and stop RunPod pods from the panel, with billing-safe defaults and an honest host indicator. |
 | **LoRA training (local)** | Character LoRAs on FLUX.1-dev, driven by the agent through `train_*` tools in a GPU Docker container — dataset in, `.safetensors` in `models/loras/` out. |
 
@@ -76,7 +76,7 @@ Queued and specified, not started. Ordered.
 
 | Item | Why it's here |
 |---|---|
-| **Honest previews in the mobile app** | The **Training** tab is still inert placeholder UI — six cards that read as a shipped feature and have already misled people into asking how far along it is. Either label it plainly or hide it — the cheapest fix on this list. (The **Apps** tab was the other half of this item and is now real; see [Apps](/apps).) |
+| **Honest previews in the mobile app** | The **Training** tab is still inert placeholder UI — six cards that read as a shipped feature and have already misled people into asking how far along it is. Either label it plainly or hide it — the cheapest fix on this list. (The **Apps** tab was the other half of this item and is now real; see [Apps](./apps).) |
 | **Mobile training** | Wire the mobile Training tab to the trainer that already works. The hard part is done; this is mostly plumbing, and it retires the item above. |
 | **Tablet layout** | Real, unglamorous responsive work. Worth doing once the screens above have something worth showing. |
 
@@ -139,7 +139,7 @@ product with a different trust model, and it isn't this one.
 
 The arc so far, for context on where the next items sit. This is deliberately
 coarse — for what changed in a specific release, see the
-[Changelog](/changelog).
+[Changelog](./changelog).
 
 <Note>
   Public releases begin at **v0.2.0**. There is no v0.0.1 or v0.1.x — the first

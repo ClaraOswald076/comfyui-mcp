@@ -28,7 +28,7 @@ model.** Here's both stories.
 
 ## Why fine-tune at all
 
-The [Agent Panel](/panel) runs on frontier models beautifully — Claude,
+The [Agent Panel](../panel) runs on frontier models beautifully — Claude,
 ChatGPT, Gemini all clear the hardest tasks. But a lot of people running
 ComfyUI have exactly one GPU, and it's busy rendering. The pitch of a **local**
 agent backend is: no account, no API key, no per-token cost, nothing leaves
@@ -60,7 +60,7 @@ you're about to read was cheap enough to actually run.
 ## The Arena: a judge that can't be charmed
 
 A fine-tune claim needs a measurement you'd trust from a stranger. The
-[LLM Arena](/arena) is a **10-scenario ladder** run over the same compact
+[LLM Arena](../arena) is a **10-scenario ladder** run over the same compact
 tool-router the panel and MCP clients use, so a score predicts real agent
 behavior. Every scenario is a real ComfyUI task, and every outcome is
 **verified against the ComfyUI server itself** — job history, the parameters
@@ -74,7 +74,7 @@ executed graph, a deliberate break-and-recover, provenance via `regenerate`),
 and a crucible of raw graph composition no template covers. PASS is 2,
 PARTIAL is 1, FAIL is 0, max **20**; ties break on nudges, then tool rounds,
 then wall time — a model that nails a task first-try outranks one that flailed
-to the same score. See the [Arena page](/arena) for the full task table, the
+to the same score. See the [Arena page](../arena) for the full task table, the
 all-tier leaderboard, and how to run *your* model through it with one command.
 
 Best-of-3 on an RTX 4090, here's where the ladder landed:
@@ -174,7 +174,7 @@ hosted market. Results land in `arena-results/` as JSON, full per-scenario
 transcripts, and a share-ready `arena-report.md`. If you run a model we
 haven't covered, post the report in a
 [GitHub discussion](https://github.com/artokun/comfyui-mcp/discussions) with
-your GPU and model tags — the leaderboard on the [Arena page](/arena) is
+your GPU and model tags — the leaderboard on the [Arena page](../arena) is
 built from exactly these runs.
 
 ## What the two builds bought each other
@@ -199,6 +199,6 @@ runs free, offline, on a model that has actually met your tools before.
 
 Run the ComfyUI agent on a free local model: install
 [comfyui-mcp](https://github.com/artokun/comfyui-mcp), pull
-`artokun/gemma4-comfyui-mcp:e4b`, and see [Local LLMs](/local-llms) for setup —
-or benchmark your own model on the [Arena](/arena). Star the repo or file an
+`artokun/gemma4-comfyui-mcp:e4b`, and see [Local LLMs](../local-llms) for setup —
+or benchmark your own model on the [Arena](../arena). Star the repo or file an
 idea at [artokun/comfyui-mcp](https://github.com/artokun/comfyui-mcp/issues).

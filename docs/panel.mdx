@@ -16,8 +16,8 @@ change — it works against your ComfyUI and replies right there. Pick a provide
 **Claude**, **ChatGPT**, **Gemini**, or **Ollama (local)** — and the matching
 agent runs in the background: subscriptions with **no API key**, local models
 with **no account at all** (and the Ollama backend reaches any hosted
-OpenAI-compatible endpoint too). See [Backends](/backends) for the matrix and
-the [LLM Arena](/arena) for how each model class actually performs.
+OpenAI-compatible endpoint too). See [Backends](./backends) for the matrix and
+the [LLM Arena](./arena) for how each model class actually performs.
 
 ```
 you ⇄ panel (pick a provider) ⇄ loopback bridge ⇄ panel orchestrator ⇄ background agent: Claude · ChatGPT · Gemini · any LLM
@@ -32,7 +32,7 @@ panel executes a **fixed allowlist** of graph commands (no arbitrary
 JavaScript).
 
 <Note>
-  New here: [Backends / providers](/backends) explains the picker, the provider-neutral
+  New here: [Backends / providers](./backends) explains the picker, the provider-neutral
   `AgentBackend` port, and the capability matrix (what's identical across Claude and
   ChatGPT, and the few things that differ).
 </Note>
@@ -73,7 +73,7 @@ above still applies, but the orchestrator needs to run **on your own machine**,
 not the remote box — turn on **Settings → General → "Use external/local
 orchestrator (advanced)"**, then click Connect. `connect <remote-url>` on your
 laptop handles the rest, including a secure tunnel back to the pod's HTTPS page.
-See [Cloud deployment](/cloud-deployment) for the full walkthrough.
+See [Cloud deployment](./cloud-deployment) for the full walkthrough.
 </Note>
 
 <Note>
@@ -82,7 +82,7 @@ See [Cloud deployment](/cloud-deployment) for the full walkthrough.
   appears only when **neither** provider is signed in. If your saved pick isn't usable
   the panel **auto-switches to a ready provider** (your saved preference is kept), and a
   not-ready provider's row offers a **"set up"** action that seeds the one-time
-  `claude` / `codex login` step. See [Backends → readiness & onboarding](/backends#connect-time-readiness--onboarding).
+  `claude` / `codex login` step. See [Backends → readiness & onboarding](./backends#connect-time-readiness--onboarding).
 </Note>
 
 ## What it can do
@@ -90,7 +90,7 @@ See [Cloud deployment](/cloud-deployment) for the full walkthrough.
 The agent (Claude *or* ChatGPT) loads comfyui-mcp's model skills (IDEOGRAM, WAN,
 LTX, Qwen, and more), so it already knows the models you run — Claude natively, and
 ChatGPT via the same knowledge exposed as MCP tools
-([knowledge parity](/tools/skills-knowledge)). It can generate images, video and
+([knowledge parity](./tools/skills-knowledge)). It can generate images, video and
 audio, inspect and manage your ComfyUI, and reason about your setup — then reply in
 the panel chat.
 
@@ -98,7 +98,7 @@ It can also **load a whole workflow or installer pack in one shot**
 (`panel_load_workflow pack:<name>`) and is **cost-aware**: bundled packs are
 local-GPU / free, and for an ad-hoc graph the agent checks the runtime
 (`check_workflow_runtime`) and **asks before spending paid API credits**. See
-[Skills, Packs & Runtime Cost](/tools/skills-knowledge).
+[Skills, Packs & Runtime Cost](./tools/skills-knowledge).
 
 ## Driving the live graph
 
@@ -106,7 +106,7 @@ The autonomous agent works your live ComfyUI through a **fixed allowlist** of
 `panel_*` commands — no arbitrary JavaScript. Every graph mutation goes through
 LiteGraph's change tracking, so each is undoable with **Ctrl+Z**. The same
 `panel_*` surface is exposed identically to both backends (in-process for Claude,
-over a loopback HTTP MCP for ChatGPT/Codex), so [parity](/backends) is automatic.
+over a loopback HTTP MCP for ChatGPT/Codex), so [parity](./backends) is automatic.
 
 ### Read
 
@@ -179,7 +179,7 @@ straight in.
 
 The agent discovers bundled expertise and checks runtime cost before spending
 credits (same tools on both backends — see
-[Skills, Packs & Runtime Cost](/tools/skills-knowledge)):
+[Skills, Packs & Runtime Cost](./tools/skills-knowledge)):
 
 | Tool | Effect |
 |---|---|
@@ -245,7 +245,7 @@ Two shortcuts cover the common cases:
   orchestrator via per-turn snapshots. **Conversation** rollback (forking the chat
   back to a past turn) is currently **Claude-only**; the ChatGPT/Codex backend
   resumes whole threads only, so the panel gates that scope off for it. See the
-  [capability matrix](/backends#capability-matrix).
+  [capability matrix](./backends#capability-matrix).
 </Note>
 
 ## Pending-message tray
@@ -302,7 +302,7 @@ stops blindly stacking jobs behind a wedged one). The threshold is the
 **Render stall warning (seconds)** setting under **Settings → Comfy MCP Agent →
 General** (default 180s, range 15–3600). It's sent on Connect and pushed **live** —
 changing it applies without a reconnect. See
-[Configuration → `COMFYUI_MCP_STALL_S`](/configuration#panel-orchestrator--the-bridge).
+[Configuration → `COMFYUI_MCP_STALL_S`](./configuration#panel-orchestrator--the-bridge).
 
 ## Background-tab reliability
 
@@ -323,8 +323,8 @@ lists your pods **by name**, Connect / Start / Stop / **Use Local**, and a
 confirm-armed **Deploy**. Set `RUNPOD_API_KEY` once in the API-Keys card and you
 can deploy, monitor, switch local⇄pod, and stop a cloud GPU without touching the
 RunPod console — the host pill always tells you where the next render runs. See
-[Cloud deployment](/cloud-deployment) and the blog
-[Run ComfyUI on a rented cloud GPU](/blog/runpod-comfyui).
+[Cloud deployment](./cloud-deployment) and the blog
+[Run ComfyUI on a rented cloud GPU](./blog/runpod-comfyui).
 
 ## CivitAI browser
 
@@ -332,15 +332,15 @@ The **Civitai** toolbar button opens a full CivitAI browser — images, videos,
 checkpoints, LoRAs and workflows with search, filters, and a fullscreen viewer.
 Pick a result to **share it with the agent**, **download it to your machine**, or
 **save an embedded workflow** to the canvas. The story:
-[CivitAI inside ComfyUI](/blog/civitai-in-comfyui).
+[CivitAI inside ComfyUI](./blog/civitai-in-comfyui).
 
 ## See also
 
-- [Mobile app (beta)](/mobile) — pair your phone with the panel and chat with the agent on the go
-- [Backends / providers](/backends) — Claude vs ChatGPT, the picker, capability parity
-- [Skills, Packs & Runtime Cost](/tools/skills-knowledge) — knowledge parity + the cost guardrail
-- [Bridge configuration](/configuration)
-- [Cloud deployment](/cloud-deployment) — drive the panel against a remote ComfyUI pod (RunPod, etc.)
-- [Self-hosted relay](/self-hosted-relay) — run your own tunnel infrastructure for the bridge
-- [The Claude Code plugin](/plugin) — model skills, slash commands, agents
+- [Mobile app (beta)](./mobile) — pair your phone with the panel and chat with the agent on the go
+- [Backends / providers](./backends) — Claude vs ChatGPT, the picker, capability parity
+- [Skills, Packs & Runtime Cost](./tools/skills-knowledge) — knowledge parity + the cost guardrail
+- [Bridge configuration](./configuration)
+- [Cloud deployment](./cloud-deployment) — drive the panel against a remote ComfyUI pod (RunPod, etc.)
+- [Self-hosted relay](./self-hosted-relay) — run your own tunnel infrastructure for the bridge
+- [The Claude Code plugin](./plugin) — model skills, slash commands, agents
 - [comfyui-mcp on GitHub](https://github.com/artokun/comfyui-mcp) · [comfyui-mcp-panel on GitHub](https://github.com/artokun/comfyui-mcp-panel)
