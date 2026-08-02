@@ -616,6 +616,13 @@ describe("getOutputImage — video/audio media (issue #663)", () => {
     ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
   });
 
+  it("rejects video/mp4 bytes requested as .png (image extension claims a still)", async () => {
+    fetchImageMock.mockResolvedValue({ base64: MP4_BASE64, mimeType: "video/mp4" });
+    await expect(
+      getOutputImage("frame_00001_.png", "output", "", { allowMedia: true }),
+    ).rejects.toMatchObject({ code: "IMAGE_NOT_FOUND" });
+  });
+
   it("resolves an m4a payload labeled audio/mp4 (audio-brand ftyp)", async () => {
     // .m4a is audio in an mp4 container — its ftyp major brand (M4A ) is the
     // audio/mp4 format, so it must not trip the cross-format guard.

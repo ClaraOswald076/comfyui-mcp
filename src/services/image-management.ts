@@ -611,6 +611,20 @@ const MEDIA_FORMAT_BY_EXTENSION: Record<string, MediaFormat> = {
   ".oga": "ogg",
 };
 
+/** Image extensions claim a still image — never consistent with a sniffed
+ *  video/audio payload (an MP4 saved as clip.png is the same corruption). */
+const IMAGE_EXTENSIONS = new Set([
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".webp",
+  ".gif",
+  ".bmp",
+  ".tif",
+  ".tiff",
+  ".avif",
+]);
+
 /**
  * Fetch a generated image from ComfyUI via HTTP /view endpoint.
  * Does NOT require COMFYUI_PATH — works with remote ComfyUI instances.
@@ -660,7 +674,8 @@ export async function getOutputImage(
   // extension whenever we can classify it — audio/wav bytes requested as
   // clip.mp4 pass mime↔sniff yet would still land on disk as a corrupt .mp4.
   const extOk =
-    !MEDIA_FORMAT_BY_EXTENSION[ext] || MEDIA_FORMAT_BY_EXTENSION[ext] === sniffedFormat;
+    !IMAGE_EXTENSIONS.has(ext) &&
+    (!MEDIA_FORMAT_BY_EXTENSION[ext] || MEDIA_FORMAT_BY_EXTENSION[ext] === sniffedFormat);
   const isMedia =
     sniffedFormat !== null &&
     extOk &&
