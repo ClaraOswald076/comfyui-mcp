@@ -7,7 +7,11 @@ import { resolveInstallInterpreter } from "./workspace-env.js";
 import { queueUpdateAllCustomNodes } from "./node-management.js";
 import { ProcessControlError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
-import { withPanelPinGuard } from "./panel-pin-guard.js";
+import {
+  recordPanelPendingOp,
+  UPDATE_ALL_PENDING_MS,
+  withPanelPinGuard,
+} from "./panel-pin-guard.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -217,6 +221,18 @@ export async function updateAllCustomNodes(): Promise<UpdateNodesResult> {
   // "updated".
   return withPanelPinGuard("update", "all", async () => {
     const result = await queueUpdateAllCustomNodes();
+
+    // The Manager drains this queue AFTER we return — outside the lock, outside
+    // this process entirely — so a pin written from now on cannot stop it.
+    // Record a pending-op marker: a pin write while it is active gets WARNED
+    // that this update may still land (see panel-pin-guard.ts).
+    recordPanelPendingOp(
+      "update-all",
+      `an update_all was queued via ComfyUI-Manager and updates EVERY installed ` +
+        `pack — the sidebar panel included — on the Manager's own schedule ` +
+        `(usually seconds to minutes; a ComfyUI restart then loads the result)`,
+      UPDATE_ALL_PENDING_MS,
+    );
 
     return {
       updated: true,

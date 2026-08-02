@@ -18,6 +18,7 @@ import {
   PANEL_PIN_ENV_VAR,
   setPanelVersionPin,
 } from "../services/panel-settings.js";
+import { activePanelPendingOps } from "../services/panel-pin-guard.js";
 import { errorToToolResult } from "../utils/errors.js";
 
 function json(value: unknown) {
@@ -102,9 +103,16 @@ export function registerInstallPanelTools(server: McpServer): void {
           // RESOLVED state is read INSIDE the same critical section — reading it
           // after releasing the lock let a concurrent pin/unpin land in between,
           // so the response could describe a pin that was no longer the real one.
-          const { pin, resolved } = await withPanelOpLock(async () => {
+          // The pending-op read is inside too: a marker recorded by an update_all
+          // or snapshot restore (both hold this lock while recording) must be
+          // seen by the very pin write that follows them.
+          const { pin, resolved, pending } = await withPanelOpLock(async () => {
             const written = setPanelVersionPin(target, reason);
-            return { pin: written, resolved: getPanelPinState() };
+            return {
+              pin: written,
+              resolved: getPanelPinState(),
+              pending: activePanelPendingOps(),
+            };
           });
           // What actually governs is NOT necessarily what we just wrote:
           // COMFYUI_MCP_PANEL_PIN takes precedence (so the saved pin can be inert,
@@ -113,6 +121,22 @@ export function registerInstallPanelTools(server: McpServer): void {
           // checking is the fabricated-success failure this feature exists to
           // prevent, so each outcome is named distinctly.
           const outcome = classifyPinWrite(resolved, pin.version);
+          // A pin cannot recall work ALREADY handed to ComfyUI-Manager (a queued
+          // update_all draining on the Manager's worker, or a snapshot restore
+          // deferred to the next ComfyUI restart). WARN rather than refuse: the
+          // pin is valid and governs every FUTURE operation — refusing it would
+          // leave the user LESS protected against the next sync, to punish them
+          // for a race they could not see. Truthful beats silent.
+          const pendingWarning = pending.length
+            ? ` WARNING — ${
+                pending.length === 1
+                  ? "a panel-affecting operation is"
+                  : `${pending.length} panel-affecting operations are`
+              } still pending and may move the panel AFTER this pin: ` +
+              `${pending.map((op) => op.detail).join("; ")}. The pin governs every ` +
+              `install/update/reinstall/sync from now on, but it cannot stop work ` +
+              `already queued — check install_panel(action='status') once it has landed.`
+            : "";
           // panelStatus is advisory here (it only supplies installedVersion for
           // the message); the authoritative pin is `resolved`, captured above.
           const status = await panelStatus();
@@ -125,6 +149,9 @@ export function registerInstallPanelTools(server: McpServer): void {
             requestedVersion: pin.version,
             installedVersion: status.installedVersion,
             requiredPanelVersion: requiredPanelVersion(),
+            /** Panel-affecting operations already handed to ComfyUI-Manager that
+             *  may still land out-of-band (absent when none are pending). */
+            pendingPanelOps: pending.length ? pending : undefined,
             // A pin records intent; it does NOT move the panel. Saying so
             // prevents "pinned to 0.11.20" being read as "now on 0.11.20".
             note:
@@ -132,24 +159,28 @@ export function registerInstallPanelTools(server: McpServer): void {
                 ? `Pinned to ${pin.version}. This records intent only — it does NOT change ` +
                   `what is installed (currently ${status.installedVersion ?? "unknown"}). ` +
                   `install/update/reinstall/sync and the on-load auto-install will now ` +
-                  `refuse until the pin is cleared with install_panel(action='unpin').`
+                  `refuse until the pin is cleared with install_panel(action='unpin').` +
+                  pendingWarning
                 : outcome === "env-overrides-with-pin"
                   ? `Saved a pin at ${pin.version}, but it is NOT the pin in force: the ` +
                     `${PANEL_PIN_ENV_VAR} environment variable takes precedence and the ` +
                     `panel is ${describePanelPin(resolved)}. The panel IS protected — ` +
                     `just at the env pin's version, not yours. Unset ${PANEL_PIN_ENV_VAR} ` +
-                    `and restart the orchestrator for the saved ${pin.version} to govern.`
+                    `and restart the orchestrator for the saved ${pin.version} to govern.` +
+                    pendingWarning
                   : outcome === "superseded"
                     ? `Saved a pin at ${pin.version}, but another pin was written at the ` +
                       `same time and won: the panel is ${describePanelPin(resolved)}. The ` +
                       `panel IS pinned, just not at ${pin.version} — re-run the pin if you ` +
-                      `meant yours to stand.`
+                      `meant yours to stand.` +
+                      pendingWarning
                     : `WARNING — the pin was saved to disk but is NOT IN FORCE, and the ` +
                       `panel is NOT protected: ${PANEL_PIN_ENV_VAR} is set to an explicit ` +
                       `"no pin" value, which overrides the saved pin. ` +
                       `install/update/reinstall/sync will still proceed. Unset ` +
                       `${PANEL_PIN_ENV_VAR} in the environment / ~/.comfyui-mcp/.env and ` +
-                      `restart the orchestrator for the saved pin to take effect.`,
+                      `restart the orchestrator for the saved pin to take effect.` +
+                      pendingWarning,
           });
         }
 

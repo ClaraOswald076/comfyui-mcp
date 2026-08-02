@@ -8,6 +8,7 @@ import {
   fixCustomNode,
   listInstalledNodes,
   syncNodeDependencies,
+  parseGitUrl,
   type InstalledNode,
 } from "../services/node-management.js";
 import { errorToToolResult } from "../utils/errors.js";
@@ -17,6 +18,7 @@ import {
   targetsPanelPackExactly,
 } from "../services/panel-pin-guard.js";
 import { runPanelAction } from "../services/panel-installer.js";
+import { SEMVER_RE } from "../services/ui-bridge.js";
 
 /**
  * The sidebar panel pack is an ordinary custom node pack, so `install_custom_node`
@@ -31,6 +33,21 @@ import { runPanelAction } from "../services/panel-installer.js";
  * is enforced deeper still, in the services themselves — see panel-pin-guard.ts —
  * so bulk targets like "all" are covered even though they cannot be redirected.)
  */
+/**
+ * Can the verified panel path honour this git ref as a registry version?
+ *
+ * The verified path installs from the Comfy Registry, so the only refs it can
+ * honour are the ones that ARE registry versions: the channel names, or a
+ * strict semver (ui-bridge's canonical grammar; a leading-"v" tag means the
+ * same version, and the registry spelling is the bare form). Anything else — a
+ * branch, a sha — would silently become something other than what was asked.
+ */
+function registryInstallableRef(ref: string): string | undefined {
+  if (ref === "nightly" || ref === "latest") return ref;
+  if (!SEMVER_RE.test(ref)) return undefined;
+  return ref.replace(/^v(?=\d)/, "");
+}
+
 async function runVerifiedPanelAction(
   action: "install" | "update" | "reinstall",
   id: string,
@@ -51,7 +68,42 @@ async function runVerifiedPanelAction(
         `never touched by these tools).`,
     );
   }
-  const result = await runPanelAction(action, undefined, { version: opts.version });
+
+  // A ref EMBEDDED in the id itself ("...comfyui-mcp-panel.git@v0.11.28",
+  // ".../tree/v0.11.28") is just as much a requested version as the `version`
+  // option — and it used to DIE here: targetsPanelPackExactly matched the URL,
+  // the redirect threaded only `version`, and the user got NIGHTLY while the
+  // response implied success. Honour the refs the registry path can honour;
+  // refuse the rest, exactly like the git options above.
+  const embeddedRef = parseGitUrl(id).ref;
+  let version = opts.version;
+  if (embeddedRef) {
+    const registryVersion = registryInstallableRef(embeddedRef);
+    if (!registryVersion) {
+      throw new Error(
+        `"${id}" embeds git ref "${embeddedRef}", which the verified panel path ` +
+          `cannot honour: it installs the comfyui-mcp sidebar panel pack from the ` +
+          `Comfy Registry, where only a strict semver (e.g. v0.11.28), "nightly" or ` +
+          `"latest" names a version. Use a release tag, or pass \`version\` instead.`,
+      );
+    }
+    if (version && version !== registryVersion) {
+      throw new Error(
+        `Conflicting panel versions: the id embeds "@${embeddedRef}" but ` +
+          `\`version\` says "${version}". Pick one — this tool will not guess.`,
+      );
+    }
+    if (action === "update") {
+      throw new Error(
+        `"${id}" embeds git ref "${embeddedRef}", but update always pulls the ` +
+          `channel tip — a ref cannot be honoured. Use install/reinstall with the ` +
+          `ref to get a specific panel version.`,
+      );
+    }
+    version = registryVersion;
+  }
+
+  const result = await runPanelAction(action, undefined, { version });
   return {
     content: [
       {
@@ -65,8 +117,11 @@ async function runVerifiedPanelAction(
               `through the verified panel path: the version above was RE-READ from ` +
               `disk after the operation, and a Manager no-op or a shadow copy would ` +
               `have failed instead of reporting success. ` +
-              (opts.version
-                ? `Your requested version (${opts.version}) was used as the target. `
+              (version
+                ? embeddedRef
+                  ? `The ref embedded in the URL (@${embeddedRef}) was honoured as ` +
+                    `the target version (${version}). `
+                  : `Your requested version (${version}) was used as the target. `
                 : `It targets the 'nightly' channel. `) +
               `The mode/channel/useCmCli options do not apply on this path. Use ` +
               `install_panel directly for status/sync/pin.`,

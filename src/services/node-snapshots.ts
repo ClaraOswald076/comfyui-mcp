@@ -2,7 +2,11 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { config, getComfyUIBaseUrl } from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
-import { withPanelPinGuard } from "./panel-pin-guard.js";
+import {
+  recordPanelPendingOp,
+  SNAPSHOT_RESTORE_PENDING_MS,
+  withPanelPinGuard,
+} from "./panel-pin-guard.js";
 import { NodeSnapshotError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 
@@ -326,6 +330,20 @@ export async function restoreNodeSnapshot(
     }
 
     logger.info(`Requested restore of node snapshot "${target}"`);
+
+    // The Manager applies the restore at the NEXT ComfyUI restart — out of
+    // band, after the lock is gone — so a pin written before that restart
+    // cannot stop it. Record a pending-op marker: a pin write while it is
+    // active gets WARNED that this restore may still land (see
+    // panel-pin-guard.ts).
+    recordPanelPendingOp(
+      "snapshot-restore",
+      `a snapshot restore ("${target}") was requested and reverts EVERY pack to ` +
+        `its snapshot commit — the sidebar panel included — at the next ComfyUI ` +
+        `restart`,
+      SNAPSHOT_RESTORE_PENDING_MS,
+    );
+
     return {
       name: target,
       message:

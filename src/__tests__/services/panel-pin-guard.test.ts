@@ -12,9 +12,12 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import {
+  activePanelPendingOps,
   assertPanelPinAllows,
   PanelPinnedError,
   panelLockPath,
+  panelPendingOpsPath,
+  recordPanelPendingOp,
   targetsPanelPack,
   targetsPanelPackExactly,
   withPanelMutationLock,
@@ -27,11 +30,13 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "cmcp-pinguard-"));
   process.env.COMFYUI_MCP_PANEL_SETTINGS = join(dir, "panel-settings.json");
   process.env.COMFYUI_MCP_PANEL_LOCK = join(dir, "panel-op.lock");
+  process.env.COMFYUI_MCP_PANEL_PENDING = join(dir, "panel-pending-ops.json");
 });
 
 afterEach(() => {
   delete process.env.COMFYUI_MCP_PANEL_SETTINGS;
   delete process.env.COMFYUI_MCP_PANEL_LOCK;
+  delete process.env.COMFYUI_MCP_PANEL_PENDING;
   delete process.env[PANEL_PIN_ENV_VAR];
   rmSync(dir, { recursive: true, force: true });
 });
@@ -243,7 +248,7 @@ describe("withPanelMutationLock — a FILE lock, so it holds across processes", 
     ).rejects.toThrow(/Timed out .* waiting for the panel operation lock/);
   });
 
-  it("reclaims a STALE lock so a crashed process cannot wedge pinning forever", async () => {
+  it("fails closed on a stale lock rather than racing a fresh replacement", async () => {
     const path = panelLockPath();
     // A pid that is old AND dead.
     writeFileSync(path, JSON.stringify({ pid: 0x7fffffff }));
@@ -251,8 +256,8 @@ describe("withPanelMutationLock — a FILE lock, so it holds across processes", 
     const { utimesSync } = await import("node:fs");
     utimesSync(path, old, old);
     await expect(
-      withPanelMutationLock(async () => "recovered", { timeoutMs: 1000 }),
-    ).resolves.toBe("recovered");
+      withPanelMutationLock(async () => "recovered", { timeoutMs: 300 }),
+    ).rejects.toThrow(/never auto-reclaimed/i);
   });
 
   it("does NOT reclaim an old lock whose owner is still ALIVE", async () => {
@@ -270,15 +275,15 @@ describe("withPanelMutationLock — a FILE lock, so it holds across processes", 
     ).rejects.toThrow(/Timed out/);
   });
 
-  it("reclaims an old lock with unreadable content (nobody can claim it)", async () => {
+  it("fails closed on an old unreadable lock", async () => {
     const path = panelLockPath();
     writeFileSync(path, "not json");
     const old = new Date(Date.now() - 60 * 60_000);
     const { utimesSync } = await import("node:fs");
     utimesSync(path, old, old);
     await expect(
-      withPanelMutationLock(async () => "recovered", { timeoutMs: 1000 }),
-    ).resolves.toBe("recovered");
+      withPanelMutationLock(async () => "recovered", { timeoutMs: 300 }),
+    ).rejects.toThrow(/never auto-reclaimed/i);
   });
 
   it("resolves with the action's OWN result, and only after its side effects finished", async () => {

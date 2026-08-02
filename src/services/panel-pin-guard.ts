@@ -31,6 +31,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  writeFileSync,
   writeSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -353,14 +354,18 @@ async function acquireFileLock(timeoutMs: number): Promise<() => void> {
         );
       }
       if (lockIsStale(path)) {
-        reclaimStaleLock(path);
-        continue;
+        // Never rename/delete after a stale observation: another process can
+        // replace this path with a fresh lock between the check and reclaim.
+        // Node lacks an atomic compare-and-rename, so failing closed is the
+        // only way to avoid stealing that new holder.
       }
       if (Date.now() >= deadline) {
         throw new Error(
           `Timed out after ${timeoutMs}ms waiting for the panel operation lock ` +
             `(${path}). Another panel install/update/pin is in progress — possibly in ` +
-            `another orchestrator process. Retry shortly.`,
+            `another orchestrator process. The lock is never auto-reclaimed because that could ` +
+            `steal a fresh holder after a stale observation. Retry shortly or recover a proven ` +
+            `abandoned lock explicitly.`,
         );
       }
       await sleep(POLL_MS);
@@ -436,4 +441,156 @@ export function withPanelPinGuard<T>(
     assertPanelPinAllows(action, id);
     return op();
   });
+}
+
+// ---------------------------------------------------------------------------
+// Pending panel-affecting operations
+//
+// Some panel-moving operations are handed to ComfyUI-Manager and then applied
+// OUT OF BAND: update_all drains on the Manager's own worker after we return,
+// and a snapshot restore is deferred to the next ComfyUI restart. The mutation
+// lock cannot be held across that window (it would wedge pinning for minutes
+// to days), and no completion/apply path exists IN THIS PROCESS to re-check a
+// pin at — the Manager, not us, is the applying agent, which is exactly why
+// the window exists. What this process CAN keep truthful is the next pin
+// write: a pin set while one of these is pending must not leave the user
+// believing the panel cannot move. So each op records a marker here (with an
+// expiry), and the pin-write path warns while one is active. The lock-held
+// variants — update_custom_node(id="all"), which waits for the drain inside
+// the lock, and every install_panel mutation — need no marker: no pin can be
+// written inside their window at all.
+// ---------------------------------------------------------------------------
+
+export interface PanelPendingOp {
+  /** What is pending: "update-all" | "snapshot-restore" (unknown kinds are
+   *  tolerated when reading, so an older/newer record never reads as clear). */
+  kind: string;
+  /** When it was handed to ComfyUI-Manager (ISO). */
+  queuedAt: string;
+  /** When the warning lapses (ISO). After this the pin governs as usual — the
+   *  pending op has either landed (the pin then holds FUTURE ops) or failed. */
+  expiresAt: string;
+  /** Human-facing explanation for the pin-write warning. */
+  detail: string;
+}
+
+/** update_all drains in minutes on the Manager's worker; an hour is far beyond
+ *  a legitimate drain, so reclaiming then cannot cut a live op short. */
+export const UPDATE_ALL_PENDING_MS = 60 * 60_000;
+
+/** A snapshot restore is applied at the next ComfyUI restart, which this
+ *  process cannot observe — that could be days away. The marker cannot outlive
+ *  restarts forever, so it expires after a week and says so in its detail. */
+export const SNAPSHOT_RESTORE_PENDING_MS = 7 * 24 * 60 * 60_000;
+
+/** Marker file path. Overridable so tests never touch the real home directory. */
+export function panelPendingOpsPath(): string {
+  return (
+    process.env.COMFYUI_MCP_PANEL_PENDING ||
+    join(homedir(), ".comfyui-mcp", "panel-pending-ops.json")
+  );
+}
+
+function isPanelPendingOp(value: unknown): value is PanelPendingOp {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const op = value as Record<string, unknown>;
+  return (
+    typeof op.kind === "string" &&
+    typeof op.queuedAt === "string" &&
+    typeof op.expiresAt === "string" &&
+    typeof op.detail === "string"
+  );
+}
+
+function readPanelPendingOpsFile(): { ops: PanelPendingOp[]; unreadable: boolean } {
+  const path = panelPendingOpsPath();
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch (err) {
+    // Only ENOENT proves there is no marker. Permission/I/O errors are
+    // indeterminate and must keep a later pin from claiming clean protection.
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+      return { ops: [], unreadable: false };
+    }
+    return { ops: [], unreadable: true };
+  }
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    const ops =
+      parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as { ops?: unknown }).ops
+        : undefined;
+    if (Array.isArray(ops) && ops.every(isPanelPendingOp)) {
+      return { ops, unreadable: false };
+    }
+  } catch {
+    // fall through
+  }
+  return { ops: [], unreadable: true };
+}
+
+/**
+ * Record that a panel-affecting operation was handed to ComfyUI-Manager and may
+ * still land out-of-band. Replaces any prior marker of the same kind. Best
+ * effort: the op has ALREADY been queued by the time this runs, so a write
+ * failure must not misreport it as failed — it logs and the op's own result
+ * stays truthful ("queued"/"requested").
+ */
+export function recordPanelPendingOp(
+  kind: "update-all" | "snapshot-restore",
+  detail: string,
+  ttlMs: number,
+): PanelPendingOp {
+  const now = Date.now();
+  const op: PanelPendingOp = {
+    kind,
+    queuedAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + ttlMs).toISOString(),
+    detail,
+  };
+  try {
+    const path = panelPendingOpsPath();
+    const prior = readPanelPendingOpsFile();
+    if (prior.unreadable) throw new Error("existing pending-operation record is unreadable");
+    const { ops } = prior;
+    const kept = ops.filter((o) => o.kind !== kind);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify({ ops: [...kept, op] }, null, 2), "utf-8");
+  } catch (err) {
+    logger.warn(
+      `[panel] could not record the pending ${kind} marker: ${
+        err instanceof Error ? err.message : String(err)
+      } — a pin written before it lands will not be warned.`,
+    );
+  }
+  return op;
+}
+
+/**
+ * The pending panel-affecting operations whose warning window is still open.
+ *
+ * Reads fail CLOSED, mirroring the pin store: a present-but-unreadable marker
+ * file means we cannot prove nothing is pending, so it yields a synthetic
+ * indeterminate op and the pin write still warns. Entries with an unparseable
+ * expiry are kept (indeterminate = still warn), never dropped.
+ */
+export function activePanelPendingOps(now: number = Date.now()): PanelPendingOp[] {
+  const { ops, unreadable } = readPanelPendingOpsFile();
+  if (unreadable) {
+    return [
+      {
+        kind: "unknown",
+        queuedAt: new Date(0).toISOString(),
+        expiresAt: new Date(0).toISOString(),
+        detail:
+          "the pending panel-operation record could not be read, so a queued " +
+          "update or deferred restore may still be outstanding",
+      },
+    ];
+  }
+  // Expiry is informational only. We have no completion signal for a Manager
+  // worker/deferred restore, so auto-expiry would falsely green a later pin.
+  void now;
+  return ops;
 }
