@@ -6,6 +6,129 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.49.0] - 2026-08-02
+
+### Highlights for 0.49.0
+
+**Tool-surface consolidation begins (BREAKING for removed names).** 0.49.0 starts folding families of single-purpose tools into action-parameterized ones: the five node-bisect tools → `node_bisect` (#644), node snapshots 3→1, batch 4→1, apps 5→1 (#658), and the eight `comfy_cli_*` tools → `comfy_cli` (#684) — **162 tools total, down from 182**. Every removed name is in the `DEAD_NAMES` ledger and calling it returns a specific retired-name error quoting the replacement (#679), never a bare "unknown tool". A CI vocabulary gate fails the build on any live reference to a retired name.
+
+**Compact tool surface by default (BREAKING).** New installs now default to the compact 3-meta-tool facade (`list_tools` / `call_tool` / `describe_tool`) — no more ~70k-token tool dumps into context (#667). Restore the full surface with `--full` or `COMFYUI_MCP_TOOL_MODE=full`; explicit choices propagate correctly to orchestrator children and the Ollama path (#682).
+
+**Interpreter ground truth, end to end.** `get_environment` no longer guesses which Python ComfyUI runs: it resolves the interpreter from observed process identity (PID + creation time for what we launched; command-line correlation against the server's own argv otherwise) and reports `unknown` instead of a confidently wrong answer — the false "Triton: not installed" that made an agent strip working acceleration is dead (#401/#650). Package installs and `update_comfyui` now target that same observed interpreter and **refuse** when it can't be verified, instead of landing in a sibling env the server can't import from (#651/#668).
+
+**Manager dialect cache that heals.** The ComfyUI-Manager 3.x/v4 dialect cache invalidates on restart-at-same-URL and on dialect-mismatch, retries pin to the original target (a mid-flight retarget can't redirect a queued op), and `update_all` goes through the same detection instead of a hardcoded legacy route (#646/#670, #656/#680). Remaining legacy-route bypasses are tracked in #681.
+
+**Node-pack auto-sync skill.** On orchestrator update the agent can now bring the panel pack in sync through the verified install path — with the pin contract: explicit pins are never auto-updated over, pinned-and-behind shows a visible drift warning in every state, and unpin/reset is one tool call away (#657). update_all / snapshot-restore / workflow-deps can no longer side-step the pin guard either.
+
+**Media saves that prove their bytes.** `get_image` saves valid MP4s (and other video/audio) to disk instead of rejecting them (#663) — with a full junk-body gate: declared type, magic-byte structure, format family, and filename extension must all agree, or the save refuses rather than write a corrupt asset.
+
+**Truthful bridge and downloads.** Bridge command retries after a timeout reuse the original rid and the panel dedupes by rid + payload fingerprint, so a retried mutation can't double-apply (#517/#683). Downloads resolve their destination from live config and join category entries correctly (#636). `install_panel` verifies the pack actually moved on disk and fails closed on shadow copies (#639/#641/#647).
+
+**Also:** MiniMax provider, `model_metadata_read` local fallback when the optional Model Explorer node is absent (#363), honest version-skew errors for untabled panel commands (#619), docker-compose example + stdio deployment docs (#660), `@comfyorg/sdk` added for upcoming Comfy API v2 work (#672), and the test suite runs green on machines with ripgrep installed (#655).
+
+### MCP
+
+#### Added
+- pinned drift warning in every state, incl. remote/dev-install
+- agent-driven panel node-pack sync on orchestrator update
+- add pi.dev as a first-class agent backend (#491)
+- add MiniMax as a first-class API-key provider (#355)
+- 0.49.0 guardrails (Phases 0-1) rebased onto 0.48.32 main
+
+#### Fixed
+- drift warning in blocked states; honest install reporting; scan-reliable manifest verify
+- refuse unbound panel mutations
+- an unreliable panel scan blocks the deps install too
+- carry scanReliable in PanelStatus; an unreliable scan blocks sync
+- keep pending and manifest panel checks honest
+- report generic bulk updates as unverified
+- fail closed on stale locks and pending operations
+- close two more pin-bypass doors + make the lock actually safe
+- close the generic-node-tool pin bypass + a real cross-process lock
+- close codex round 3 — honest pin-state reporting, blocked on an incomplete shadow scan
+- close codex round 2 — pin writes take the op lock, no inert-pin claim, strict semver
+- close 4 codex findings — array-settings fail-open, op race, tri-state stillBehind
+- scope OAuth readiness to capable providers
+- respect OAuth capability and stored template ownership
+- fall through unusable stored API keys
+- fall through empty Vertex key to ADC
+- mirror exact Vertex provider precedence
+- mirror current scoped credential precedence
+- scope readiness to selected provider
+- a `null` auth.json breaks pi's auth layer outright (codex round 13)
+- OAuth expiry is ms with a 5-min window; keyless Vertex records (codex round 12)
+- drop two over-strict schema checks (codex round 11)
+- bedrock provider id + cost tiers + present-null (codex round 10)
+- finish the schema transcription (cost/thinkingLevelMap/modelOverrides) — codex round 9
+- transcribe pi's models.json schema instead of approximating it (codex round 8)
+- relative config dir, stored-cloudflare companion, typed schema fields (codex round 7)
+- companion-config + schema precision (codex round 6)
+- match pi's resolver exactly — stored-owns-provider, escapes, agent dir (codex round 5)
+- close remaining false-green readiness paths (codex round 4)
+- readiness precision — match pi's real credential validation (#491)
+- provider-auth codex round 3 (P0a-resume + P1a two-sided)
+- provider-auth codex round 2 (P0a/P1a/P1b/P1c)
+- address codex review (stdout/close, ANSI, .cmd, false-auth, model)
+- require exact resolved path for open recovery
+- require resolved workflow identity for open recovery
+- require open receipt for timeout recovery
+- reuse the original rid on mutation retry + surface late completions (#517) (#683)
+- route remaining callers through detected dialect (#681)
+- probe the ComfyUI venv interpreter, never fabricate "not installed" (#401) (#650)
+- route update_all tool through detectManagerApi (#656) (#680)
+- honor the saved default workspace when COMFYUI_PATH is unset (#648) (#652)
+- retired-name error from the DEAD_NAMES ledger on call_tool (#659) (#679)
+- target the live ComfyUI interpreter (#668)
+- pin dialect retries to original target (#670)
+- disambiguate panel_graph_outline vs visualize_workflow vs panel_query_graph (#557) (#654)
+- route legacy ComfyUI-Manager self-update off the 405 path (#424) (#649)
+- #641 shadow detection — content-first + fail-closed hardening
+- verify the panel actually changed + detect shadow copies (#639, #641)
+- remove NUL-byte percent sentinel + normalize CRLF→LF (file integrity)
+- identity-guard the durable resume + include render-held in the owned-set (#570)
+- clear the superseded destination's render-held queue on a tab-id collision (#570 P0)
+- derive stable-key ownership from the full retained-session SET, not the current-backend mapping (#570 P0)
+- gate stable-key hello.resume by concurrent-tab ownership (#570 P0)
+- reset the superseded destination for ANY state (incl. dormant session) on a tab-id collision (#570 P0)
+- collision handling resets the SUPERSEDED destination (not the source) + clears its bridge buffers (#570 P0)
+- retire the source agent on a tab-id migration collision — no cross-tab leak (#570 P0)
+- rebind ALL backends on a proven tab-id migration, not just the current one (#570 P0)
+- carry the proven source identity across a tab-id migration so the rebound agent survives (#570 P0)
+- fence workflow mutators by RESOLVED TARGET, not raw path presence (#570 P0)
+- make workflow_uuid bridge-owned (non-overridable) at dispatch (#570 P0c)
+- close the empty-path bypass in the active-workflow mutation gate + document scope (#570 P0c)
+- require a trusted uuid stamp (not just the enforcement flag) to dispatch an active-workflow mutation (#570 P0c)
+- retire (not reset) the prior provider on a hello-driven backend switch too (#570 P0)
+- retire (not reset) the prior provider on an explicit backend switch (#570 P0)
+- per-backend identity teardown so a cold-start provider switch can't erase a same-workflow session (#570 P0)
+- extend the fail-closed gate to active-workflow mutators (workflow_close/save/…) (#570 P0c)
+- detach migrated mirror on unproven switch + fail closed for non-enforcing panels (#570 P0a/P0c)
+- stamp each command with its origin workflow uuid so the panel fences a post-switch apply (#570 P0)
+- detach mirror viewers on an unproven same-socket workflow switch (#570 P0)
+- cancel the OLD id's bridge queues on an unproven same-socket switch (#570 P0)
+- reject in-flight bridge commands for a replaced tab (#570 P0)
+- complete per-tab bridge reset — also cancel awaitingReconnect (#570 P0a)
+- invert the identity boundary — unconditional, complete teardown when unproven (#570 P0)
+- drop buffered deliveries before replay on an unproven identity transition (#570 P0)
+- fail closed at the identity boundary — reset unless POSITIVELY proven (#570 P0)
+- re-key held render queues for ALL providers on a proven migration (#570)
+- count failed-start held mail as per-tab state at the identity boundary (#570 P0)
+- tear down ALL per-tab state on an unproven identity transition (#570 P0a/P0b)
+- bind the exact session to the FULL identity (origin+uuid), not just uuid (#570 P0)
+- trust an exact session only when PROVEN to own the identity (incl. identity-less) (#570 P0)
+- fail closed on pre-upgrade exact records with no identity binding (#570 P0)
+- in-place replace resets the LIVE agent, not just disk state (#570 P0)
+- bind the exact session to a durable identity uuid; clear on in-place replace (#570 P0)
+- reject an unowned hello.resume — bind resume to trusted identity (#570 P0)
+- cancel render-queued work across ALL providers on a workflow switch (#570 P0a)
+- fence the old bridge route on an unproven same-socket switch (#570 P0a)
+- disclose (don't silently drop) render-queued messages on a workflow switch (#570 P0a)
+- fail closed on same-socket re-hello without proven identity + no post-retire leak (#570 P0a)
+- don't rebind one workflow's agent onto another on a same-socket switch (#570 P0a)
+- key unsaved-workflow resume on the panel's durable per-instance uuid (#570)
+- resolve destination from the LIVE server's models dir + allow symlinks into registered model roots (#346, #633)
+
+
 ## [0.48.32] - 2026-08-01
 
 ### MCP
