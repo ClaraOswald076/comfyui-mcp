@@ -2087,7 +2087,7 @@ export class UiBridge {
       ctx.reject(
         markDispatched(
           new Error(
-            `panel tab ${short} disconnected mid-command ("${cmd}") — OUTCOME UNKNOWN: the command was already sent, so the panel may have applied it (for a run, ComfyUI may already be rendering). Verify before retrying (e.g. check get_queue / list_output_images) instead of re-issuing it blindly.`,
+            `panel tab ${short} disconnected mid-command ("${cmd}") — OUTCOME UNKNOWN: the command was already sent, so the panel may have applied it (for a run, ComfyUI may already be rendering). Verify before retrying (e.g. check queue action:"list" / list_output_images) instead of re-issuing it blindly.`,
           ),
           true,
         ),

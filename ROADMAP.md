@@ -101,7 +101,7 @@ stateless-server / Salad-specific bits (replicas, deletion-cost, k8s proxy).
   (interval/max-tries) + a real readiness signal. Hardens `start/stop/restart_comfyui`. (`comfy.ts`)
 - **E4 — Rich errors + execution stats.** Surface ComfyUI `execution_error` (exception_type,
   traceback, current_inputs — e.g. OOM) and per-node timing in job results. Hardens
-  `get_job_status`/completion reporting. (`event-emitters.ts`)
+  `queue` (action:"status")/completion reporting. (`event-emitters.ts`)
 - **E7 — Custom-node ref-pinning.** Install a node pack pinned to a commit/branch/tag across
   GitHub/GitLab/Bitbucket URL formats. Hardens `install_custom_node` (reproducibility). (`git-url-parser.ts`)
 - **E11 — Unique output filenames.** Prefix a request id to output filenames to avoid collisions.

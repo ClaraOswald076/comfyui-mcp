@@ -18,7 +18,7 @@ import { logger } from "../utils/logger.js";
 export function registerWorkflowExecuteTools(server: McpServer): void {
   server.tool(
     "enqueue_workflow",
-    "Submit a ComfyUI workflow for execution and return immediately with the prompt_id and queue position. Does not wait for completion. Use get_job_status to check progress later, or get_history to retrieve results and images after completion.",
+    "Submit a ComfyUI workflow for execution and return immediately with the prompt_id and queue position. Does not wait for completion. Use queue (action:\"status\") to check progress later, or get_history to retrieve results and images after completion.",
     {
       workflow: z
         .record(z.string(), z.any())

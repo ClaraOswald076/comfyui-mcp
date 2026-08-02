@@ -162,7 +162,7 @@ The same self-healing instinct handles this, with three best-effort guards:
   and progress. When a step re-emits the same progress past a threshold
   (`COMFYUI_MCP_STALL_S`, default 180s — high, because video steps are legitimately
   slow), a one-line STALL/BACKLOG note is prepended to the agent's next turn.
-- **Escalating cancel.** `cancel_job` doesn't trust the interrupt. It interrupts, then
+- **Escalating cancel.** `queue` (action:"cancel") doesn't trust the interrupt. It interrupts, then
   **verifies** the job actually stopped (within `COMFYUI_MCP_INTERRUPT_S`, default 30s);
   if it didn't, it escalates to `/free`, and if it *still* won't die it reports the render
   WEDGED and points at `restart_comfyui`. `clear_pending` drops the queued backlog in the

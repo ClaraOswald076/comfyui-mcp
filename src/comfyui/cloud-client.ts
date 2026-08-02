@@ -145,14 +145,14 @@ export async function interrupt(promptId?: string): Promise<void> {
 
 export async function deleteQueueItem(_id: string): Promise<void> {
   throw new ComfyUIError(
-    "delete_queue_item is not supported in Comfy Cloud mode. Use cancel_job with a prompt_id.",
+    "delete_queue_item is not supported in Comfy Cloud mode. Use queue (action:\"cancel\") with a prompt_id.",
     "CLOUD_UNSUPPORTED",
   );
 }
 
 export async function clearQueue(): Promise<void> {
   throw new ComfyUIError(
-    "clear_queue is not supported in Comfy Cloud mode.",
+    "queue (action:\"clear\") is not supported in Comfy Cloud mode.",
     "CLOUD_UNSUPPORTED",
   );
 }

@@ -11,7 +11,7 @@
  *
  * This registry lets the tool hand back a handle instead of blocking forever,
  * mirroring the move generation already made from a blocking `run_workflow` to
- * `enqueue_workflow` + `get_job_status`.
+ * `enqueue_workflow` + polling job status (`queue` action:"status").
  */
 
 import { createHash } from "node:crypto";

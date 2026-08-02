@@ -53,7 +53,8 @@ blindly re-queuing behind a stuck render:
   progress; a step that stops advancing past the threshold
   ([`COMFYUI_MCP_STALL_S`](/configuration#panel-orchestrator--the-bridge), default 180s)
   prepends a one-line STALL/BACKLOG note to the agent's next turn.
-- **Escalating cancel** — `cancel_job` interrupts, **verifies** the job actually stopped
+- **Escalating cancel** — `queue` (action:"cancel") interrupts, **verifies** the job actually
+  stopped
   (within [`COMFYUI_MCP_INTERRUPT_S`](/configuration#job-watching), default 30s), then
   escalates to `/free` and reports the render WEDGED (suggesting `restart_comfyui`) if it
   still won't die; `clear_pending` drops all pending jobs in the same call.

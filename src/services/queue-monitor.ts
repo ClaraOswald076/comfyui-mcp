@@ -181,7 +181,7 @@ class QueueMonitorImpl {
   // Prompt ids THIS orchestrator queued via panel_run, plus the ms timestamp of
   // the most recent self-queue. A backlog made entirely of the agent's own recent
   // jobs is an EXPECTED batch (a sweep/comparison), not evidence of a wedge, so it
-  // must not trigger the destructive "cancel_job clear_pending" remedy.
+  // must not trigger the destructive cancel-with-clear_pending remedy.
   private selfQueuedIds = new Set<string>();
   private lastSelfQueueTs: number | null = null;
 

@@ -390,7 +390,7 @@ Generate a short video from a text prompt (text-to-video), or animate a start im
 
 ## generate_3d
 
-Generate a 3D model (glb/obj/fbx) from a text prompt or an input image, using the connected ComfyUI's hosted partner 3D nodes (Tripo, Meshy, Rodin, Hunyuan3D — auto-detected from the server; these are paid API nodes needing a comfy.org API key/login on the server or COMFY_API_KEY here). Builds and enqueues a minimal workflow and returns immediately with the prompt_id — poll get_job_status / get_history for the resulting model file (saved to ComfyUI's output directory). For image mode, upload the image first with upload_image and pass its filename. If the server has no 3D-capable API nodes, returns an actionable error naming local-pack alternatives.
+Generate a 3D model (glb/obj/fbx) from a text prompt or an input image, using the connected ComfyUI's hosted partner 3D nodes (Tripo, Meshy, Rodin, Hunyuan3D — auto-detected from the server; these are paid API nodes needing a comfy.org API key/login on the server or COMFY_API_KEY here). Builds and enqueues a minimal workflow and returns immediately with the prompt_id — poll queue (action:"status") / get_history for the resulting model file (saved to ComfyUI's output directory). For image mode, upload the image first with upload_image and pass its filename. If the server has no 3D-capable API nodes, returns an actionable error naming local-pack alternatives.
 
 ### Parameters
 

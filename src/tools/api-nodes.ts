@@ -69,7 +69,7 @@ export function registerApiNodesTools(server: McpServer): void {
 
   server.tool(
     "generate_with_api_node",
-    "Build a minimal single-node workflow that runs a chosen API/partner node with the provided inputs and enqueue it. Returns immediately with the prompt_id (use get_job_status / get_history for results). Do NOT pass auth credentials in inputs — the ComfyUI server injects those from its logged-in session. Use get_api_node_schema to discover valid inputs.",
+    "Build a minimal single-node workflow that runs a chosen API/partner node with the provided inputs and enqueue it. Returns immediately with the prompt_id (use queue (action:\"status\") / get_history for results). Do NOT pass auth credentials in inputs — the ComfyUI server injects those from its logged-in session. Use get_api_node_schema to discover valid inputs.",
     {
       class_type: z
         .string()

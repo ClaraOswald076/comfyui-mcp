@@ -56,7 +56,7 @@ The user wants to generate multiple images while sweeping across different param
 
    This monitors all jobs simultaneously via ComfyUI's WebSocket and reports step-by-step progress and completion for each. ComfyUI processes them sequentially from its queue. Continue the conversation while waiting.
 
-   **Fallback**: If the script is unavailable, poll `get_job_status` for each prompt_id until done.
+   **Fallback**: If the script is unavailable, poll `queue` (action:"status") for each prompt_id until done.
 
 8. **Present results.** After all runs complete, show a summary table:
    - Each row: parameter values used, status (success/error), output file

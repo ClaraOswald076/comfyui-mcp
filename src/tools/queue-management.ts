@@ -13,201 +13,168 @@ import {
 import type { WorkflowJSON } from "../comfyui/types.js";
 import { errorToToolResult } from "../utils/errors.js";
 
+/**
+ * The eight queue/jobs tools collapsed into one action-parameterized `queue`
+ * tool (0.49.0 surface consolidation, slice 4).
+ *
+ * SHAPE: a FLAT object with an `action` enum — deliberately NOT a
+ * z.discriminatedUnion, which the MCP SDK renders as a schema with ZERO visible
+ * parameters, hiding every input from the model.
+ *
+ * REQUIREDNESS: only `action` can be schema-required — `prompt_id` is required
+ * for status/get_workflow/move/edit/cancel_queued, optional for cancel, and
+ * meaningless for list/clear, and `position` is required for move but optional
+ * for edit. Every VALUE constraint the old tools had is unchanged at the zod
+ * layer; the handler enforces per-action presence and names the missing field —
+ * the one deliberate behavioural difference a flat enum permits. Each branch
+ * calls the same service function the old tool called, with the same arguments,
+ * and returns the identical content block (JSON for the query actions, the
+ * prose messages for cancel/cancel_queued/clear, isError on a wedged cancel).
+ */
 export function registerQueueManagementTools(server: McpServer): void {
   server.tool(
-    "get_queue",
-    "Get the current ComfyUI execution queue: the job running now plus all pending jobs, each with its prompt_id and position. Read-only; requires a reachable ComfyUI server (works against local or remote --comfyui-url). By default this omits queued workflow payloads to keep output small; set include_workflows:true when you need to inspect or edit the exact pending payload. Use this before cancel_job (running), cancel_queued_job/clear_queue (pending), move_queued_job, or edit_queued_job.",
+    "queue",
+    "Inspect and manage the ComfyUI execution queue. Driven by the `action` parameter:\n" +
+      '- action:"list" — The job running now plus all pending jobs, each with its prompt_id and position. Read-only; requires a reachable ComfyUI server (works against local or remote --comfyui-url). Omits queued workflow payloads by default to keep output small; set include_workflows:true when you need to inspect or edit the exact pending payload. Use this before action:"cancel" (running), action:"cancel_queued"/action:"clear" (pending), action:"move", or action:"edit".\n' +
+      '- action:"status" — Check ONE job by its prompt_id (the id returned by enqueue_workflow). Queries the connected ComfyUI server; requires it to be running. Returns JSON with running, pending, and done booleans, plus optional status_str, error details, and execution_stats from ComfyUI history once the job is done. Also returns text_outputs when the workflow contained text-preview nodes (Preview as Text, ShowText, …) — those produce no image file, so this is the ONLY way to read their result; report that text back to the user. Use action:"list" to see the whole queue at once, and get_history for full output filenames.\n' +
+      '- action:"get_workflow" — The full workflow payload for one PENDING queue item by prompt_id. Read-only. Does not work for the currently running job because ComfyUI cannot safely edit a job after execution starts.\n' +
+      '- action:"move" — Move a PENDING queue item to the front or back by removing it and re-enqueuing its saved workflow payload; `position` ("front"|"back") is required. The job receives a NEW prompt_id; the old prompt_id is removed. Running jobs cannot be moved.\n' +
+      '- action:"edit" — Edit a PENDING queue item by removing it and re-enqueuing an updated workflow. Provide either a complete replacement `workflow` or `node_inputs` patches keyed by node id; `position` selects where to requeue (default back). The job receives a NEW prompt_id; the old prompt_id is removed. Running jobs cannot be edited.\n' +
+      '- action:"cancel" — Stop the CURRENTLY RUNNING job ROBUSTLY. Sends an interrupt, then WAITS and verifies the job actually stopped — ComfyUI only honors interrupts BETWEEN steps, so a long single step (e.g. a high-res video sampler) can ignore a plain cancel. If the interrupt isn\'t honored it escalates to freeing VRAM (POST /free) and re-checks; if it STILL won\'t die it reports the job as WEDGED and tells you to restart_comfyui (an HTTP cancel cannot kill a stuck step). Set clear_pending:true to also drop ALL pending jobs in the same call — the correct "reset the queue" action, since cancelling alone leaves pending jobs that would run next. The partial result is discarded. With `prompt_id` given, only interrupts the running job when its prompt_id matches; omit to interrupt whatever is currently running. Use action:"cancel_queued" to remove one specific PENDING job instead.\n' +
+      '- action:"cancel_queued" — Remove one specific PENDING job from the queue by prompt_id. Does not affect running jobs.\n' +
+      '- action:"clear" — Clear ALL pending jobs from the queue. Does not affect the currently running job.',
     {
-      include_workflows: z
-        .boolean()
-        .optional()
-        .describe("Include each running/pending job's workflow payload and extra_data. Can be large."),
-    },
-    async (args) => {
-      try {
-        const summary = await getQueueSummary({ include_workflows: args.include_workflows });
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(summary, null, 2),
-            },
-          ],
-        };
-      } catch (err) {
-        return errorToToolResult(err);
-      }
-    },
-  );
-
-  server.tool(
-    "get_queued_workflow",
-    "Return the full workflow payload for one PENDING queue item by prompt_id. Read-only. This does not work for the currently running job because ComfyUI cannot safely edit a job after execution starts.",
-    {
-      prompt_id: z.string().describe("The prompt_id of a pending queue item."),
-    },
-    async (args) => {
-      try {
-        const item = await getQueuedWorkflow(args.prompt_id);
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify(item, null, 2) }],
-        };
-      } catch (err) {
-        return errorToToolResult(err);
-      }
-    },
-  );
-
-  server.tool(
-    "move_queued_job",
-    "Move a PENDING ComfyUI queue item to the front or back by removing it and re-enqueuing its saved workflow payload. The job receives a NEW prompt_id; the old prompt_id is removed. Running jobs cannot be moved.",
-    {
-      prompt_id: z.string().describe("The prompt_id of a pending queue item."),
-      position: z.enum(["front", "back"]).describe("Where to requeue the job."),
-    },
-    async (args) => {
-      try {
-        const result = await moveQueuedJob(args.prompt_id, args.position);
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
-        };
-      } catch (err) {
-        return errorToToolResult(err);
-      }
-    },
-  );
-
-  server.tool(
-    "edit_queued_job",
-    "Edit a PENDING ComfyUI queue item by removing it and re-enqueuing an updated workflow. Provide either a complete replacement workflow or node_inputs patches keyed by node id. The job receives a NEW prompt_id; the old prompt_id is removed. Running jobs cannot be edited.",
-    {
-      prompt_id: z.string().describe("The prompt_id of a pending queue item."),
-      workflow: z
-        .record(z.string(), z.any())
-        .optional()
-        .describe("Optional complete replacement API-format workflow. If omitted, the existing queued workflow is patched."),
-      node_inputs: z
-        .record(z.string(), z.record(z.string(), z.any()))
-        .optional()
-        .describe("Optional input patches keyed by node id, e.g. {\"3\":{\"steps\":30,\"cfg\":7}}."),
-      position: z
-        .enum(["front", "back"])
-        .optional()
-        .describe("Where to requeue the edited job. Defaults to back."),
-    },
-    async (args) => {
-      try {
-        const result = await editQueuedJob({
-          prompt_id: args.prompt_id,
-          workflow: args.workflow as WorkflowJSON | undefined,
-          node_inputs: args.node_inputs,
-          position: args.position,
-        });
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
-        };
-      } catch (err) {
-        return errorToToolResult(err);
-      }
-    },
-  );
-
-  server.tool(
-    "get_job_status",
-    "Check the status of ONE ComfyUI job by its prompt_id (the id returned by enqueue_workflow). Queries the connected ComfyUI server; requires it to be running. Returns JSON with running, pending, and done booleans, plus optional status_str, error details, and execution_stats from ComfyUI history once the job is done. Also returns text_outputs when the workflow contained text-preview nodes (Preview as Text, ShowText, …) — those produce no image file, so this is the ONLY way to read their result; report that text back to the user. Use get_queue to see the whole queue at once, and get_history for full output filenames.",
-    {
-      prompt_id: z.string().describe("The prompt ID returned by enqueue_workflow"),
-    },
-    async (args) => {
-      try {
-        const status = await getJobStatus(args.prompt_id);
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(status, null, 2),
-            },
-          ],
-        };
-      } catch (err) {
-        return errorToToolResult(err);
-      }
-    },
-  );
-
-  server.tool(
-    "cancel_job",
-    "Stop the CURRENTLY RUNNING ComfyUI job ROBUSTLY. Sends an interrupt, then WAITS and verifies the job actually stopped — ComfyUI only honors interrupts BETWEEN steps, so a long single step (e.g. a high-res video sampler) can ignore a plain cancel. If the interrupt isn't honored it escalates to freeing VRAM (POST /free) and re-checks; if it STILL won't die it reports the job as WEDGED and tells you to restart_comfyui (an HTTP cancel cannot kill a stuck step). Set clear_pending:true to also drop ALL pending jobs in the same call — the correct 'reset the queue' action, since cancelling alone leaves pending jobs that would run next. The partial result is discarded. Use cancel_queued_job to remove one specific PENDING job instead.",
-    {
+      action: z
+        .enum(["list", "status", "get_workflow", "move", "edit", "cancel", "cancel_queued", "clear"])
+        .describe(
+          'Which queue operation to perform. "list" and "clear" take no other parameters; "status", "get_workflow" and "cancel_queued" require `prompt_id`; "move" requires `prompt_id` + `position`; "edit" requires `prompt_id` (optional `workflow`/`node_inputs`/`position`); "cancel" takes an optional `prompt_id` and `clear_pending`.',
+        ),
       prompt_id: z
         .string()
         .optional()
         .describe(
-          "Optional. If given, only interrupts the running job when its prompt_id matches; omit to interrupt whatever is currently running.",
+          'The prompt_id of a job (the id returned by enqueue_workflow). REQUIRED for actions "status", "get_workflow", "move", "edit" and "cancel_queued" (a PENDING queue item for all but "status"). OPTIONAL for action:"cancel" — if given, only interrupts the running job when its prompt_id matches; omit to interrupt whatever is currently running.',
+        ),
+      include_workflows: z
+        .boolean()
+        .optional()
+        .describe(
+          'action:"list" — include each running/pending job\'s workflow payload and extra_data. Can be large.',
+        ),
+      position: z
+        .enum(["front", "back"])
+        .optional()
+        .describe(
+          'Where to requeue the job. REQUIRED for action:"move". OPTIONAL for action:"edit" — defaults to back.',
+        ),
+      workflow: z
+        .record(z.string(), z.any())
+        .optional()
+        .describe(
+          'action:"edit" — optional complete replacement API-format workflow. If omitted, the existing queued workflow is patched with `node_inputs`.',
+        ),
+      node_inputs: z
+        .record(z.string(), z.record(z.string(), z.any()))
+        .optional()
+        .describe(
+          'action:"edit" — optional input patches keyed by node id, e.g. {"3":{"steps":30,"cfg":7}}.',
         ),
       clear_pending: z
         .boolean()
         .optional()
         .describe(
-          "Also clear ALL pending jobs (recommended when resetting after a stuck/slow render, so a re-queue doesn't stack behind a backlog). Default false.",
+          'action:"cancel" — also clear ALL pending jobs (recommended when resetting after a stuck/slow render, so a re-queue doesn\'t stack behind a backlog). Default false.',
         ),
     },
     async (args) => {
       try {
-        const result = await cancelRunningJobEscalating({
-          prompt_id: args.prompt_id,
-          clear_pending: args.clear_pending,
+        const json = (value: unknown) => ({
+          content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }],
         });
-        return {
-          content: [{ type: "text" as const, text: result.message }],
-          ...(result.wedged ? { isError: true } : {}),
-        };
-      } catch (err) {
-        return errorToToolResult(err);
-      }
-    },
-  );
 
-  server.tool(
-    "cancel_queued_job",
-    "Remove a specific pending job from the ComfyUI queue by prompt_id. Does not affect running jobs.",
-    {
-      prompt_id: z
-        .string()
-        .describe("The prompt_id of the pending job to remove from the queue"),
-    },
-    async (args) => {
-      try {
-        await cancelQueuedJob(args.prompt_id);
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Queued job ${args.prompt_id} removed successfully.`,
-            },
-          ],
+        // prompt_id/position cannot be schema-required in a flat shape, so the
+        // handler enforces per-action presence and names the missing field — the
+        // same information the old per-tool schemas gave a caller.
+        //
+        // ABSENCE only, never falsiness: `prompt_id: ""` passed z.string() before
+        // this consolidation and reached the service, which answers with its own
+        // not-found/validation error. A `!prompt_id` guard would swallow that path
+        // and answer with generic text instead.
+        const requirePromptId = (action: string, what: string): string => {
+          if (args.prompt_id === undefined) {
+            throw new Error(`queue action:"${action}" requires \`prompt_id\` — ${what}.`);
+          }
+          return args.prompt_id;
         };
-      } catch (err) {
-        return errorToToolResult(err);
-      }
-    },
-  );
 
-  server.tool(
-    "clear_queue",
-    "Clear all pending jobs from the ComfyUI queue. Does not affect the currently running job.",
-    {},
-    async () => {
-      try {
-        await clearAllQueued();
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: "All pending queue items cleared successfully.",
-            },
-          ],
-        };
+        switch (args.action) {
+          case "list":
+            return json(await getQueueSummary({ include_workflows: args.include_workflows }));
+          case "status":
+            return json(await getJobStatus(requirePromptId("status", "the job to check")));
+          case "get_workflow":
+            return json(
+              await getQueuedWorkflow(
+                requirePromptId("get_workflow", "a PENDING queue item"),
+              ),
+            );
+          case "move": {
+            const promptId = requirePromptId("move", "a PENDING queue item to move");
+            if (args.position === undefined) {
+              throw new Error('queue action:"move" requires `position` — "front" or "back".');
+            }
+            return json(await moveQueuedJob(promptId, args.position));
+          }
+          case "edit":
+            return json(
+              await editQueuedJob({
+                prompt_id: requirePromptId("edit", "a PENDING queue item to edit"),
+                workflow: args.workflow as WorkflowJSON | undefined,
+                node_inputs: args.node_inputs,
+                position: args.position,
+              }),
+            );
+          case "cancel": {
+            const result = await cancelRunningJobEscalating({
+              prompt_id: args.prompt_id,
+              clear_pending: args.clear_pending,
+            });
+            return {
+              content: [{ type: "text" as const, text: result.message }],
+              ...(result.wedged ? { isError: true } : {}),
+            };
+          }
+          case "cancel_queued": {
+            const promptId = requirePromptId("cancel_queued", "the pending job to remove");
+            await cancelQueuedJob(promptId);
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `Queued job ${promptId} removed successfully.`,
+                },
+              ],
+            };
+          }
+          case "clear":
+            await clearAllQueued();
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: "All pending queue items cleared successfully.",
+                },
+              ],
+            };
+          default: {
+            // Unreachable given the zod enum, but a clear runtime guard beats a
+            // silent undefined if the schema and switch ever drift apart.
+            const exhaustive: never = args.action;
+            throw new Error(
+              `Unknown queue action "${String(exhaustive)}". Expected one of: list, status, get_workflow, move, edit, cancel, cancel_queued, clear.`,
+            );
+          }
+        }
       } catch (err) {
         return errorToToolResult(err);
       }

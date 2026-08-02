@@ -3577,7 +3577,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // Append anti-poll guidance: the agent should go idle after queuing so the
         // executed event auto-injects the output image, rather than busy-polling.
         const note =
-          "\n\n[IMPORTANT] You will be notified automatically with the output image(s)/video when the render finishes — do NOT poll get_queue, get_history, or list_output_images. Just end your turn now and wait for the result to be delivered to you.";
+          "\n\n[IMPORTANT] You will be notified automatically with the output image(s)/video when the render finishes — do NOT poll queue (action:\"list\"), get_history, or list_output_images. Just end your turn now and wait for the result to be delivered to you.";
         // Backpressure note. A backlog is only alarming when it's a job we did NOT
         // queue (possibly foreign/stuck). Deliberately batching renders — a sweep,
         // a multi-variant comparison — is a NORMAL workflow, so a queue made of our
@@ -3593,13 +3593,13 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             warn =
               `\n\n[QUEUE] Queued behind your own in-flight render(s) (1 running${pendingTxt}). ` +
               `This is normal when batching a sweep or comparison — they drain in order and nothing is stuck; ` +
-              `each result is delivered to you as it finishes. To drop a single pending item, use cancel_queued_job. ` +
-              `Only use cancel_job with clear_pending:true if a render is ACTUALLY wedged — it kills the running job AND your entire queue.`;
+              `each result is delivered to you as it finishes. To drop a single pending item, use queue (action:"cancel_queued"). ` +
+              `Only use queue (action:"cancel") with clear_pending:true if a render is ACTUALLY wedged — it kills the running job AND your entire queue.`;
           } else {
             warn =
               `\n\n[QUEUE] A render is already running${pre.runningPromptId ? ` (prompt ${pre.runningPromptId})` : ""}${pendingTxt}, ` +
-              `and the queue includes work this session didn't queue — your run is queued behind it. Inspect with get_queue before acting. ` +
-              `If the running job is genuinely stuck, cancel_job with clear_pending:true interrupts it AND drops pending, then escalate to restart_comfyui if it reports the job wedged.`;
+              `and the queue includes work this session didn't queue — your run is queued behind it. Inspect with queue (action:"list") before acting. ` +
+              `If the running job is genuinely stuck, queue (action:"cancel") with clear_pending:true interrupts it AND drops pending, then escalate to restart_comfyui if it reports the job wedged.`;
           }
         }
         if (res.content?.[0]?.type === "text") {

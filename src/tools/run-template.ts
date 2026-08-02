@@ -132,7 +132,7 @@ export function registerRunTemplateTools(server: McpServer): void {
         .number()
         .positive()
         .optional()
-        .describe("Max seconds to wait when wait:true (default 300). On timeout the job keeps running; poll get_job_status."),
+        .describe("Max seconds to wait when wait:true (default 300). On timeout the job keeps running; poll queue (action:\"status\")."),
       disable_random_seed: z
         .boolean()
         .optional()
@@ -186,9 +186,9 @@ export function registerRunTemplateTools(server: McpServer): void {
           };
         }
 
-        // 4. Minimal wait: poll get_job_status until done or timeout.
+        // 4. Minimal wait: poll the job-status service until done or timeout.
         //    (Kept deliberately simple — for a bare enqueue, call
-        //    enqueue_workflow and poll get_job_status yourself.)
+        //    enqueue_workflow and poll queue action:"status" yourself.)
         const timeoutMs = (args.timeout_s ?? 300) * 1000;
         const start = Date.now();
         for (;;) {
@@ -234,7 +234,7 @@ export function registerRunTemplateTools(server: McpServer): void {
                     {
                       ...base,
                       status: "timeout",
-                      message: `Job still ${status.running ? "running" : "pending"} after ${args.timeout_s ?? 300}s — it was NOT cancelled. Poll get_job_status("${result.prompt_id}") for completion.`,
+                      message: `Job still ${status.running ? "running" : "pending"} after ${args.timeout_s ?? 300}s — it was NOT cancelled. Poll queue (action:"status") with prompt_id "${result.prompt_id}" for completion.`,
                     },
                     null,
                     2,

@@ -93,9 +93,7 @@ const CATEGORIES: Array<{
     icon: "play",
     description: "Enqueue workflows — one at a time, from a named template, or as a batch — and inspect the queue, jobs, history, and system stats.",
     tools: [
-      "enqueue_workflow", "rerun_generation", "get_system_stats", "get_queue", "get_job_status",
-      "get_queued_workflow", "move_queued_job", "edit_queued_job",
-      "cancel_job", "cancel_queued_job", "clear_queue", "get_history", "get_logs",
+      "enqueue_workflow", "rerun_generation", "get_system_stats", "queue", "get_history", "get_logs",
       "health_check", "calculate", "diagnose_run",
       // Template execution: run_template is an enqueue entrypoint, and
       // get_template_schema is the lookup you make first to fill its overrides.

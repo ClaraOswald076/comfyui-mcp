@@ -434,7 +434,7 @@ export async function cancelRunningJobEscalating(opts: {
       `${
         opts.clear_pending
           ? `Pending jobs were cleared (${pending_cleared ?? 0}).`
-          : "Pending jobs were NOT cleared — pass clear_pending:true or call clear_queue."
+          : "Pending jobs were NOT cleared — pass clear_pending:true or call queue (action:\"clear\")."
       } Do NOT queue another run until this is gone.`,
   };
 }

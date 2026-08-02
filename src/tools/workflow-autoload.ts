@@ -38,7 +38,7 @@ export async function registerAutoloadedWorkflows(server: McpServer): Promise<vo
 
   // A tool name here comes from a FILENAME (slugify, src/services/workflow-autoload.ts),
   // so it is user-controlled and can collide. Before this guard, saving a workflow as
-  // `get_queue.json` made the SDK throw "Tool get_queue is already registered" and the
+  // `get_history.json` made the SDK throw "Tool get_history is already registered" and the
   // MCP server FAILED TO START — a user bricking their own install by naming a file,
   // with an error that names a tool rather than the file to rename.
   //
@@ -47,10 +47,10 @@ export async function registerAutoloadedWorkflows(server: McpServer): Promise<vo
   // `my_flow`).
   //
   // RETIRED names are reserved too, not just live ones. Otherwise the consolidation
-  // creates a worse failure than the one it removes: once `get_queue` is retired, a
-  // pre-existing get_queue.json stops being "skipped, name taken" and becomes a
+  // creates a worse failure than the one it removes: once a name is retired, a
+  // pre-existing <name>.json stops being "skipped, name taken" and becomes a
   // REGISTERED tool, so a model still holding the old name silently ENQUEUES the
-  // user's workflow instead of inspecting the queue. A 404 is recoverable; a wrong
+  // user's workflow instead of calling the replacement. A 404 is recoverable; a wrong
   // action that looks like it worked is not.
   const taken = new Set<string>([...TOOL_NAMES, ...DEAD_NAMES.map((d) => d.name)]);
 
@@ -74,7 +74,7 @@ export async function registerAutoloadedWorkflows(server: McpServer): Promise<vo
       `Enqueue the autoloaded ComfyUI workflow "${wf.toolName}" ` +
       `(loaded from ${basename(wf.filePath)}) for execution and return immediately ` +
       `with its prompt_id and queue position — it does NOT wait for the result; ` +
-      `poll get_job_status or get_history afterwards. Requires a running ComfyUI server. ` +
+      `poll queue (action:"status") or get_history afterwards. Requires a running ComfyUI server. ` +
       `Each parameter below substitutes a PARAM_* placeholder in the saved workflow, and ` +
       `all parameters are required. Params: ${paramSummary || "(none)"}`;
 

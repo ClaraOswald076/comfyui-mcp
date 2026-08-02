@@ -1,7 +1,7 @@
 // queue-monitor.self-attribution.test.ts — the backlog warning must tell the
 // agent's OWN deliberate batch from a foreign or stuck job (#559).
 //
-// BUG: panel_run's "[QUEUE WARNING] … cancel_job clear_pending:true" fired on ANY
+// BUG: panel_run's "[QUEUE WARNING] … cancel with clear_pending:true" fired on ANY
 // running job — so batching 11 renders (the normal way to run a comparison) made
 // every run after the first warn about a "backlog" it created, and recommended the
 // single most destructive action (kill the running render AND drop the queue).
