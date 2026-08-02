@@ -85,6 +85,14 @@ describe("commandLineMatchesArgv — correlate the process against the server's 
     expect(commandLineMatchesArgv("", COMFY_ARGV)).toBe(false);
   });
 
+  it("does NOT let an ABSOLUTE argv path anchor to a different instance's absolute path", () => {
+    // Two local installs, both with ComfyUI\main.py: an absolute argv[0] is an
+    // exact claim and must not suffix-match the other instance's root.
+    const argv = ["C:\\ComfyUI\\main.py", "--port", "8188"];
+    const otherInstance = "D:\\Other\\ComfyUI\\main.py --port 8188";
+    expect(commandLineMatchesArgv(otherInstance, argv)).toBe(false);
+  });
+
   it("tolerates the quoting the OS adds around paths containing spaces", () => {
     const argv = ["main.py", "--config", "/opt/my configs/models.yaml"];
     expect(commandLineMatchesArgv('/usr/bin/python3 main.py --config "/opt/my configs/models.yaml"', argv)).toBe(

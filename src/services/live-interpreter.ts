@@ -206,6 +206,12 @@ export function readProcessArgv0(pid: number): string | undefined {
  * `C:/ComfyUI/main.py`). Multi-word argv values (paths with spaces) fall back to a
  * full substring check, since they cannot be tokenised. Windows comparison is
  * case- and separator-insensitive.
+ *
+ * Residual, by design: a RELATIVE argv[0] (`ComfyUI\main.py`) can anchor to any
+ * instance whose command line ends the same way, so two local installs are
+ * indistinguishable here once one dies and the other grabs the port. Closing
+ * that needs the process's cwd, which the restart path already correlates —
+ * this correlation stays argument-only.
  */
 export function commandLineMatchesArgv(
   commandLine: string | undefined,
@@ -222,6 +228,12 @@ export function commandLineMatchesArgv(
     const n = norm(stripQuotes(t.trim()));
     if (n === "") return true;
     if (n.includes(" ")) return hay.includes(n);
+    // An ABSOLUTE argv path is an exact claim: it must equal a command-line
+    // token, or `C:\ComfyUI\main.py` would "match" a different instance at
+    // `D:\Other\ComfyUI\main.py`. Only a RELATIVE token (`main.py`) may anchor
+    // to a token's final path segment.
+    const absolute = n.startsWith("/") || /^[a-z]:\//.test(n);
+    if (absolute) return hayTokens.some((h) => h === n);
     return hayTokens.some((h) => h === n || h.endsWith("/" + n));
   });
 }
@@ -284,7 +296,16 @@ export function resolveLiveInterpreter(opts: ResolveOptions): LiveInterpreter | 
   }
 
   // Tier 1 — the process we launched, confirmed by PID *and* start time.
-  if (launchRecord && launchRecord.pid === pid && existsSync(launchRecord.python)) {
+  // The recorded interpreter must be ABSOLUTE: a bare `python` would be
+  // re-resolved against OUR cwd/PATH at probe time, not necessarily the
+  // interpreter the child actually spawned with — so a relative record fails
+  // closed to tier 2.
+  if (
+    launchRecord &&
+    launchRecord.pid === pid &&
+    isAbsolute(launchRecord.python) &&
+    existsSync(launchRecord.python)
+  ) {
     // macOS `ps lstart` is SECOND-resolution: a PID recycled within the same
     // second compares equal. On that platform the timestamp alone is not an
     // identity, so the observed command line must also corroborate the recorded
