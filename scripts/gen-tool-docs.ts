@@ -291,10 +291,16 @@ function typeLabel(s: JsonSchema): string {
 }
 
 function esc(text: string): string {
-  // Keep MDX happy: collapse whitespace and escape characters MDX would parse as
+  // Keep MDX happy: collapse INLINE whitespace per line but preserve line breaks —
+  // a newline-separated list in a tool description must stay a list in the docs,
+  // not render as one long paragraph — and escape characters MDX would parse as
   // JSX — angle brackets (e.g. "<COMFYUI_PATH>") and curly braces (expressions).
   const map: Record<string, string> = { "<": "&lt;", ">": "&gt;", "{": "&#123;", "}": "&#125;" };
-  return text.replace(/\s+/g, " ").replace(/[<>{}]/g, (m) => map[m]).trim();
+  return text
+    .split("\n")
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .join("\n")
+    .replace(/[<>{}]/g, (m) => map[m]);
 }
 
 function renderParam(name: string, schema: JsonSchema, required: boolean): string {

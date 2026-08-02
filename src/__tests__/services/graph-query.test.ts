@@ -203,6 +203,35 @@ describe("queryApiGraph", () => {
       expect(r.text.length).toBeLessThan(600 * 2);
     });
 
+    it("an escape-heavy OBJECT that fits keeps its type — measured by its real serialization (review nit)", () => {
+      // capWidgetValue re-serialized the ALREADY-serialized JSON text of a non-string
+      // to measure it, double-counting every escape: an array whose real size fits the
+      // per-value cap (2048) but whose double-escaped size exceeds it was type-changed
+      // into a truncated string. Measure once: it stays an array, unmarked.
+      const arr = Array.from({ length: 300 }, () => "ab");
+      const realSize = JSON.stringify(arr).length; // single stringify, as emitted
+      expect(realSize).toBeLessThanOrEqual(2048); // fits WIDGET_VALUE_CAP for real
+      expect(JSON.stringify(JSON.stringify(arr)).length).toBeGreaterThan(2048); // old mis-measure
+      const Gfit = { "1": { class_type: "Presets", inputs: { presets: arr } } };
+      const r = queryApiGraph(Gfit, { ids: [1], fields: "detail", max_chars: 6000 });
+      expect(r.shown).toBe(1);
+      const parsed = JSON.parse(r.text.split("\n")[1]);
+      expect(Array.isArray(parsed.widgets.presets)).toBe(true); // FAIL-BEFORE: was a string
+      expect(parsed.widgets.presets).toHaveLength(300);
+      expect(r.text).not.toContain("truncated)");
+    });
+
+    it("a genuinely oversize OBJECT still truncates with the per-value cap marker", () => {
+      // Real serialized size ≫ the cap: the value degrades to a truncated string of the
+      // JSON head, with the same marker semantics as an oversized string.
+      const arr = Array.from({ length: 5000 }, (_, i) => `item-${i}`);
+      const Gover = { "1": { class_type: "Presets", inputs: { presets: arr } } };
+      const r = queryApiGraph(Gover, { ids: [1], fields: "detail", max_chars: 6000 });
+      expect(r.shown).toBe(1);
+      expect(r.text).toContain("chars, truncated)");
+      expect(r.text.length).toBeLessThan(JSON.stringify(arr).length); // capped, not flooding
+    });
+
     it("detail bounds a fan-out node's downstream consumer list (#609)", () => {
       // A source feeding 500 consumers would otherwise emit a 500-id downstream array
       // in the protected first line. Cap it with a "+N more" tail.
