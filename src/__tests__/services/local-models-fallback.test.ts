@@ -30,7 +30,7 @@ import {
 
 const model = (name: string, type: string) => ({ name, path: `${type}/${name}`, size: 0, modified: "", type });
 
-describe("comfy_cli_models local fallback (#460)", () => {
+describe("comfy_cli models_* local fallback (#460)", () => {
   beforeEach(() => {
     mocks.listLocalModels.mockReset();
     mocks.getSystemStats.mockReset();

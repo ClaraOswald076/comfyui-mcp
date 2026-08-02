@@ -184,3 +184,4 @@ bisect
 node_snapshot
 apps
 batch
+comfy_cli

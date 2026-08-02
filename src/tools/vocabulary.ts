@@ -32,14 +32,7 @@ import { readFileSync } from "node:fs";
  * forward to the surface the consolidation actually starts from.
  */
 export const TOOL_NAMES = [
-  "comfy_cli_status",
-  "comfy_cli_server",
-  "comfy_cli_jobs",
-  "comfy_cli_search_nodes",
-  "comfy_cli_workflow",
-  "comfy_cli_transfer",
-  "comfy_cli_models",
-  "comfy_cli_skills",
+  "comfy_cli",
   "enqueue_workflow",
   "rerun_generation",
   "get_system_stats",
@@ -227,9 +220,9 @@ export type ToolName = (typeof TOOL_NAMES)[number];
  * updating — it is history, not state.
  *
  * Read from docs/design/tool-surface.txt so there is exactly one copy of the
- * baseline names (186: the 182 frozen at 0.48.32 plus the four consolidated tools
+ * baseline names (187: the 182 frozen at 0.48.32 plus the five consolidated tools
  * appended as they shipped — `bisect` in 0.49.0 slice 1, then `node_snapshot`,
- * `apps` and `batch` in slice 2), and so the file committed
+ * `apps` and `batch` in slice 2, then `comfy_cli` in slice 3), and so the file committed
  * as the P0 evidence is load-bearing rather than
  * decorative.
  */
@@ -248,7 +241,7 @@ const BASELINE_URL = new URL("../../docs/design/tool-surface.txt", import.meta.u
  * 200-line rename. APPENDING is legitimate — new tools join the baseline when they
  * ship — so the workflow is: append, update this hash, say why in the message.
  */
-export const BASELINE_SHA256 = "15d7fd41b7cb543902a9d550101d3d29dda47fe10e62783fe7f4af9e8d27ced9";
+export const BASELINE_SHA256 = "9300588781163bec59fe1151511eecf3e11650c5527efaec388b9cec994849d3";
 
 /**
  * LAZY on purpose, and this is not a micro-optimisation.
@@ -322,7 +315,7 @@ export function panelBaselineIntegrity(): { ok: boolean; actual: string } {
  * to the surface. That is the ratchet: not that it cannot rise, but that it cannot
  * rise silently.
  */
-export const MAX_TOOLS = 169;
+export const MAX_TOOLS = 162;
 
 /** Where this is headed, for reference in review. A goal, not enforced. */
 export const TOOL_BUDGET_TARGET = 30;
@@ -390,6 +383,51 @@ export function deadNameRe(name: string): RegExp {
  * entry documents the two mentions in this repo that are correct.
  */
 export const DEAD_NAMES: readonly DeadName[] = [
+  // 0.49.0 slice 3: the eight comfy_cli_* tools folded into one action-parameterized
+  // `comfy_cli` tool. Same services, same envelope/1 return shapes, same CLI command
+  // construction — only the surface changed, so every mention of the old names is now
+  // rot pointing at a 404. The replacements name the action family because each old
+  // tool covered several actions (comfy_cli_jobs alone was five).
+  {
+    name: "comfy_cli_status",
+    since: "0.49.0",
+    replacement: 'comfy_cli (action:"status")',
+  },
+  {
+    name: "comfy_cli_server",
+    since: "0.49.0",
+    replacement: 'comfy_cli (action:"server_start"|"server_stop"|"server_restart")',
+  },
+  {
+    name: "comfy_cli_jobs",
+    since: "0.49.0",
+    replacement: 'comfy_cli (action:"jobs_list"|"jobs_status"|"jobs_wait"|"jobs_watch"|"jobs_cancel")',
+  },
+  {
+    name: "comfy_cli_search_nodes",
+    since: "0.49.0",
+    replacement: 'comfy_cli (action:"search_nodes")',
+  },
+  {
+    name: "comfy_cli_workflow",
+    since: "0.49.0",
+    replacement: 'comfy_cli (action:"workflow_validate"|"workflow_run")',
+  },
+  {
+    name: "comfy_cli_transfer",
+    since: "0.49.0",
+    replacement: 'comfy_cli (action:"transfer_upload"|"transfer_download")',
+  },
+  {
+    name: "comfy_cli_models",
+    since: "0.49.0",
+    replacement: 'comfy_cli (action:"models_list_folders"|"models_list_folder"|"models_search"|"models_show"|"models_download"|"models_remove")',
+  },
+  {
+    name: "comfy_cli_skills",
+    since: "0.49.0",
+    replacement: 'comfy_cli (action:"skills_list"|"skills_show"|"skills_validate"|"skills_install"|"skills_status"|"skills_uninstall")',
+  },
   // 0.49.0 slice 2: three more families folded into action-parameterized tools —
   // the three node-snapshot tools into `node_snapshot`, the four batch tools into
   // `batch`, and the five apps_* tools into `apps`. Same services, same return

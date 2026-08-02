@@ -16,7 +16,7 @@ Works on **macOS**, **Linux**, and **Windows**. Auto-detects your ComfyUI instal
 
 **Stuck or have a question? [Join the Discord](https://discord.gg/cW9arBhzCu)** — help, model tips, and release announcements.
 
-**169 MCP tools** | **36 AI skills** (Flux · WAN · LTX 2.3 video · Qwen · Z-Image · Ideogram 4 · ERNIE · ANIMA · model registry · Civitai · node authoring · launch/perf flags) | **55 installer packs** | **11 slash commands** | **4 autonomous agents** | **3 hooks**
+**162 MCP tools** | **36 AI skills** (Flux · WAN · LTX 2.3 video · Qwen · Z-Image · Ideogram 4 · ERNIE · ANIMA · model registry · Civitai · node authoring · launch/perf flags) | **55 installer packs** | **11 slash commands** | **4 autonomous agents** | **3 hooks**
 
 The plugin ships **expert skills that grow with every release** — model-specific generation guides with curated download URLs, workflow recipes, troubleshooting, and custom-node authoring — so Claude knows the right sampler, CFG, resolution, and model files for each architecture without trial and error.
 
@@ -248,7 +248,7 @@ for the port, the capability matrix, and the per-provider "clink" points, and th
 
 ## MCP Tools
 
-169 tools across workflow execution, generation, iteration, composition, models, and more:
+162 tools across workflow execution, generation, iteration, composition, models, and more:
 
 ### Image Generation (high-level)
 
@@ -358,7 +358,7 @@ for the port, the capability matrix, and the per-provider "clink" points, and th
 | `search_custom_nodes` | Search the ComfyUI Registry for custom node packs by keyword |
 | `get_node_pack_details` | Get full details of a custom node pack (description, author, nodes, install info) |
 | `generate_node_skill` | Generate a Claude skill `.md` file from a Registry ID or GitHub URL |
-| `comfy_cli_search_nodes` | Search actual loaded node classes through official `comfy nodes search` |
+| `comfy_cli` | Search actual loaded node classes through official `comfy nodes search` (action:"search_nodes") |
 
 ### Official comfy-cli
 
@@ -366,13 +366,7 @@ Install [comfy-cli](https://docs.comfy.org/comfy-cli/getting-started#install-cli
 
 | Tool | Description |
 |------|-------------|
-| `comfy_cli_status` | Inspect version, selected workspace (`which`), environment, or the self-describing command surface |
-| `comfy_cli_server` | Start, stop, or restart a CLI-managed background ComfyUI |
-| `comfy_cli_jobs` | List, inspect, wait for, watch, or cancel local/cloud jobs |
-| `comfy_cli_workflow` | Validate or run workflow files through the official CLI |
-| `comfy_cli_transfer` | Upload inputs or download completed job outputs |
-| `comfy_cli_models` | Browse/search local or cloud models; download/remove workspace model files |
-| `comfy_cli_skills` | List/show/validate/install/status/uninstall official bundled agent skills |
+| `comfy_cli` | One action-parameterized tool for the whole official CLI: `status`, `server_start`/`server_stop`/`server_restart`, `jobs_list`/`jobs_status`/`jobs_wait`/`jobs_watch`/`jobs_cancel`, `search_nodes`, `workflow_validate`/`workflow_run`, `transfer_upload`/`transfer_download`, `models_*` (list/search/show/download/remove), `skills_*` (list/show/validate/install/status/uninstall) |
 
 ### Diagnostics
 

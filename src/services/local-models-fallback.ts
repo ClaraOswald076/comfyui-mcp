@@ -3,14 +3,15 @@ import { getSystemStats } from "../comfyui/client.js";
 import { config } from "../config.js";
 
 // ---------------------------------------------------------------------------
-// Local-model discovery fallback for comfy_cli_models (issue #460). The
-// read-only listing actions (list-folders, list-folder, search, show) don't
+// Local-model discovery fallback for the comfy_cli tool's models_* actions
+// (issue #460). The read-only listing actions (list-folders, list-folder,
+// search, show) don't
 // actually need the separate comfy-cli executable: the connected ComfyUI
 // already exposes what's installed via its /models REST endpoint (with a
 // COMFYUI_PATH filesystem scan behind it). This reproduces those actions
 // directly through the existing listLocalModels() path so model discovery
 // keeps working on a plain local install with no comfy-cli on PATH — mirroring
-// the live /object_info fallback for comfy_cli_search_nodes (#354).
+// the live /object_info fallback for comfy_cli action:"search_nodes" (#354).
 // ---------------------------------------------------------------------------
 
 /**
@@ -45,7 +46,7 @@ function resolveModelFolder(type: string): string {
   return TYPE_ALIASES[type.toLowerCase()] ?? type;
 }
 
-/** Read-only comfy_cli_models actions that can be served without comfy-cli. */
+/** Read-only comfy_cli models_* actions that can be served without comfy-cli. */
 export type LocalModelsListAction = "list-folders" | "list-folder" | "search" | "show";
 
 export function isLocalModelsListAction(action: string): action is LocalModelsListAction {
@@ -78,7 +79,7 @@ async function assertLocalSourceAvailable(): Promise<void> {
 }
 
 /**
- * Serve a read-only comfy_cli_models listing action from the connected
+ * Serve a read-only comfy_cli models_* listing action from the connected
  * ComfyUI's local models (via listLocalModels), for use when comfy-cli is
  * absent. Throws when a required argument is missing (mirrors the CLI path).
  */
