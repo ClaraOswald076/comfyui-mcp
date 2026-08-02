@@ -206,9 +206,21 @@ export const BRIDGE_CMD_MIN_PANEL_VERSION: Readonly<Record<string, string>> = {
   // "update your panel to ≥0.11.28" verdict. Listing it here also lets the #392
   // PROACTIVE gate reject the very first call on a <0.11.28 panel before dispatch.
   refresh_nodes: "0.11.28",
+  // #619 recurrence — panel_resize_node's bridge executor shipped in panel 0.11.25
+  // (panel CHANGELOG: "panel_resize_node resizes a node on the live canvas", #530).
+  // The reporter's 0.11.21 panel predates it, but untabled the command inherited the
+  // 0.11.4 baseline, producing the self-contradictory verdict `too old for
+  // "graph_resize_node" (detected 0.11.21) — update … to ≥0.11.4`. Tabled, it quotes
+  // the true minimum and the #392 proactive gate rejects the first call pre-dispatch.
+  graph_resize_node: "0.11.25",
 };
 
-/** The minimum panel version that supports `cmd`. */
+/** The minimum panel version that supports `cmd`. For a command WITH an
+ *  authoritative BRIDGE_CMD_MIN_PANEL_VERSION entry this is its true introduction
+ *  version; for anything else it is the 0.11.4 full-set baseline FLOOR — a lower
+ *  bound for the bridge command set as a whole, NOT proof of when (or whether)
+ *  this specific command shipped, so it must never be quoted to a user as the
+ *  command's requirement (see buildPanelTooOldError, #619). */
 export function minPanelVersionForCmd(cmd: string): string {
   return BRIDGE_CMD_MIN_PANEL_VERSION[cmd] ?? MIN_PANEL_VERSION_FOR_BRIDGE_COMMANDS;
 }
@@ -281,13 +293,30 @@ export function panelVersionProvesUnsupported(cmd: string, panelVersion?: string
  *  been discovered NOT to support. Shared by the reactive path (the panel's own
  *  "Unknown command" reply, mapped by makeUnknownCommandError) and the proactive
  *  gate (#236 — a command already known-unsupported for THIS connection, from an
- *  earlier call in the same session) so both produce the identical message. The
- *  quoted minimum is COMMAND-SPECIFIC (#352) — not a blanket 0.11.4. */
+ *  earlier call in the same session) so both produce the identical message.
+ *
+ *  A command WITH an authoritative table entry gets a "too old … update to ≥X"
+ *  verdict quoting its COMMAND-SPECIFIC minimum (#352) — not a blanket 0.11.4.
+ *  A command with NO table entry has no KNOWN real minimum: the 0.11.4 fallback
+ *  baseline is a floor for the full bridge set, NOT this command's introduction
+ *  version, so quoting it fabricates a requirement the connected panel may already
+ *  satisfy — #619's recurrence was exactly that self-contradiction (`too old for
+ *  "graph_resize_node" (detected 0.11.21) — update … to ≥0.11.4`). Every call that
+ *  reaches here for an untabled command carries a REAL "Unknown command" rejection
+ *  from THIS connection (reactive path or the #236 learned gate — the #392 version
+ *  gate only ever fires for tabled commands), so "this panel build does not
+ *  implement it" is an observed fact, and "update to the latest release" is the
+ *  only remedy guaranteed sufficient — never a fabricated, possibly-already-met
+ *  version number. */
 function buildPanelTooOldError(cmd: string, panelVersion?: string): Error {
   const detected = panelVersion ? ` (detected ${panelVersion})` : "";
+  const min = BRIDGE_CMD_MIN_PANEL_VERSION[cmd];
   const e = new Error(
-    `This ComfyUI-MCP panel is too old for "${cmd}"${detected} — update the ComfyUI-MCP panel ` +
-      `to ≥${minPanelVersionForCmd(cmd)} (ComfyUI Manager → update comfyui-mcp panel), then reconnect.`,
+    min
+      ? `This ComfyUI-MCP panel is too old for "${cmd}"${detected} — update the ComfyUI-MCP panel ` +
+          `to ≥${min} (ComfyUI Manager → update comfyui-mcp panel), then reconnect.`
+      : `This ComfyUI-MCP panel does not implement "${cmd}"${detected} — update the ComfyUI-MCP panel ` +
+          `to the latest release (ComfyUI Manager → update comfyui-mcp panel), then reconnect.`,
   );
   // STRUCTURED discriminator (#413): both the reactive rewrite and the #236
   // proactive gate funnel through here, so tagging the error object lets callers
@@ -309,10 +338,12 @@ export interface PanelCmdUnsupportedError extends Error {
 /** True when `err` is (or plausibly is) an unsupported-command rejection for
  *  `cmd` — either the STRUCTURED tag set by buildPanelTooOldError (authoritative),
  *  or, as a belt-and-suspenders fallback for errors that never passed through the
- *  rewrite, the raw panel "Unknown command" text or the rewritten "too old for"
- *  message. Callers that carry a graceful fallback (e.g. panel_strip_workflow's
- *  graph_get_state reconstruction, #384/#413) use this to decide whether to try
- *  it. When `cmd` is given, a structured tag must match it. */
+ *  rewrite (or lost the tag crossing an MCP boundary), the raw panel "Unknown
+ *  command" text or either rewritten phrasing ("too old for" for a tabled command,
+ *  "does not implement" for an untabled one — #619). Callers that carry a graceful
+ *  fallback (e.g. panel_strip_workflow's graph_get_state reconstruction,
+ *  #384/#413) use this to decide whether to try it. When `cmd` is given, a
+ *  structured tag must match it. */
 export function isPanelCmdUnsupportedError(err: unknown, cmd?: string): boolean {
   const tag = (err as Partial<PanelCmdUnsupportedError> | null | undefined)
     ?.panelCmdUnsupported;
@@ -321,7 +352,8 @@ export function isPanelCmdUnsupportedError(err: unknown, cmd?: string): boolean 
   const cmdPat = cmd ? cmd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") : "[\\w.-]+";
   return (
     new RegExp(`unknown command\\s*["“']?${cmdPat}`, "i").test(msg) ||
-    new RegExp(`too old for\\s*["“']?${cmdPat}`, "i").test(msg)
+    new RegExp(`too old for\\s*["“']?${cmdPat}`, "i").test(msg) ||
+    new RegExp(`does not implement\\s*["“']?${cmdPat}`, "i").test(msg)
   );
 }
 

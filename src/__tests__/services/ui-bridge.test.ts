@@ -1663,14 +1663,21 @@ describe("defaultBridgeTimeoutMs — tolerant read timeout (#357)", () => {
 
 describe("makeUnknownCommandError (old-panel version gate)", () => {
   it("rewrites an Unknown command reply into an actionable update message", () => {
-    // ui_render is not in the per-command map, so it falls back to the blanket
-    // full-set baseline minimum.
+    // ui_render is not in the per-command map, so there is NO known real minimum to
+    // quote — the message must name the observed fact (this panel build does not
+    // implement it) and the always-sufficient remedy (update to the latest release),
+    // never fabricate a version number (#619).
     const e = makeUnknownCommandError('Unknown command "ui_render"');
     expect(e).not.toBeNull();
     expect(e?.message).toContain("ui_render");
-    expect(e?.message).toContain(MIN_PANEL_VERSION_FOR_BRIDGE_COMMANDS);
+    expect(e?.message.toLowerCase()).toContain("does not implement");
     expect(e?.message.toLowerCase()).toContain("update");
+    expect(e?.message.toLowerCase()).toContain("latest release");
     expect(e?.message.toLowerCase()).toContain("reconnect");
+    // The 0.11.4 fallback baseline is a floor, not this command's minimum — quoting
+    // it would fabricate a requirement (#619).
+    expect(e?.message).not.toContain(MIN_PANEL_VERSION_FOR_BRIDGE_COMMANDS);
+    expect(e?.message.toLowerCase()).not.toContain("too old");
     // The opaque raw internal error must not leak through.
     expect(e?.message).not.toBe('Unknown command "ui_render"');
   });
@@ -1802,16 +1809,47 @@ describe("makeUnknownCommandError (old-panel version gate)", () => {
   // KNOWN real minimum, so the inflated 0.11.4 fallback baseline can never PROVE a
   // panel "new enough". An Unknown-command reply from such a command is authoritative
   // evidence the panel lacks it, so it maps to an actionable "update your panel"
-  // message (quoting the baseline floor) rather than a bare passthrough — even when the
-  // connected panel version parseably exceeds the fallback baseline.
+  // message rather than a bare passthrough — even when the connected panel version
+  // parseably exceeds the fallback baseline. The message must NOT quote the baseline
+  // as if it were the command's minimum: that produced the recurrence's
+  // self-contradictory `too old for "graph_resize_node" (detected 0.11.21) — update …
+  // to ≥0.11.4`.
   it("still rewrites an UNTABLED command to actionable even when the panel exceeds the fallback baseline (#619)", () => {
     // ui_render is not in BRIDGE_CMD_MIN_PANEL_VERSION; 0.11.21 > the 0.11.4 baseline.
     const e = makeUnknownCommandError('Unknown command "ui_render"', "0.11.21");
     expect(e).not.toBeNull();
     expect(e?.message).toContain("ui_render");
     expect(e?.message).toContain("0.11.21"); // connected version surfaced
+    expect(e?.message.toLowerCase()).toContain("does not implement");
     expect(e?.message.toLowerCase()).toContain("update");
+    expect(e?.message.toLowerCase()).toContain("latest release");
+    // Never the self-contradictory shape: a satisfied "minimum" is no requirement.
+    expect(e?.message.toLowerCase()).not.toContain("too old");
+    expect(e?.message).not.toContain(MIN_PANEL_VERSION_FOR_BRIDGE_COMMANDS);
     expect(e?.message).not.toBe('Unknown command "ui_render"'); // never the bare passthrough
+  });
+
+  // #619 RECURRENCE — the exact report: comfyui-mcp 0.48.32 + panel 0.11.21 →
+  // `too old for "graph_resize_node" (detected 0.11.21) — update … to ≥0.11.4`.
+  // graph_resize_node (panel_resize_node's bridge executor) shipped in panel
+  // 0.11.25, so it is now TABLED: a 0.11.21 panel gets the honest, correctly-
+  // versioned "too old — update to ≥0.11.25" verdict, and a ≥0.11.25 panel is
+  // never declared too old (its Unknown-command reply surfaces raw instead).
+  it("rewrites graph_resize_node on a <0.11.25 panel with the CORRECT minimum (#619 recurrence)", () => {
+    expect(minPanelVersionForCmd("graph_resize_node")).toBe("0.11.25");
+    const e = makeUnknownCommandError('Unknown command "graph_resize_node"', "0.11.21");
+    expect(e).not.toBeNull();
+    expect(e?.message).toContain("graph_resize_node");
+    expect(e?.message).toContain("0.11.21"); // connected/detected panel version
+    expect(e?.message).toContain("0.11.25"); // required minimum — NOT the 0.11.4 floor
+    expect(e?.message).not.toContain(MIN_PANEL_VERSION_FOR_BRIDGE_COMMANDS);
+    expect(e?.message.toLowerCase()).toContain("too old");
+    expect(e?.message.toLowerCase()).toContain("update");
+  });
+
+  it("does NOT rewrite graph_resize_node once the panel is at/above 0.11.25 (#619 boundary)", () => {
+    expect(makeUnknownCommandError('Unknown command "graph_resize_node"', "0.11.25")).toBeNull();
+    expect(makeUnknownCommandError('Unknown command "graph_resize_node"', "0.11.32")).toBeNull();
   });
 });
 
@@ -1858,6 +1896,15 @@ describe("panelVersionProvesUnsupported (#392 proactive version gate)", () => {
     expect(panelVersionProvesUnsupported("refresh_nodes", "0.11.28")).toBe(false);
     expect(panelVersionProvesUnsupported("refresh_nodes", "0.12.0")).toBe(false);
   });
+
+  // #619 recurrence — graph_resize_node is now tabled (min 0.11.25), so the #392
+  // gate rejects the reporter's 0.11.21 panel on the FIRST call, pre-dispatch.
+  it("proactively gates graph_resize_node below 0.11.25 and clears it at/above (#619 recurrence)", () => {
+    expect(panelVersionProvesUnsupported("graph_resize_node", "0.11.21")).toBe(true);
+    expect(panelVersionProvesUnsupported("graph_resize_node", "0.11.24")).toBe(true);
+    expect(panelVersionProvesUnsupported("graph_resize_node", "0.11.25")).toBe(false);
+    expect(panelVersionProvesUnsupported("graph_resize_node", "0.11.32")).toBe(false);
+  });
 });
 
 // #413 — the bridge REWRITES a panel's raw "Unknown command graph_serialize" into
@@ -1895,6 +1942,17 @@ describe("isPanelCmdUnsupportedError (#413 structured unsupported-command detect
     const raw = new Error('This ComfyUI-MCP panel is too old for "graph_serialize" — update…');
     expect(isPanelCmdUnsupportedError(raw)).toBe(true);
     expect(isPanelCmdUnsupportedError(raw, "graph_serialize")).toBe(true);
+  });
+
+  // #619 — the untabled-command rewrite says "does not implement" instead of
+  // "too old for"; the tagless fallback must recognize that phrasing too.
+  it("matches the rewritten 'does not implement' text even without the tag (#619)", () => {
+    const raw = new Error(
+      'This ComfyUI-MCP panel does not implement "ui_render" (detected 0.11.21) — update…',
+    );
+    expect(isPanelCmdUnsupportedError(raw)).toBe(true);
+    expect(isPanelCmdUnsupportedError(raw, "ui_render")).toBe(true);
+    expect(isPanelCmdUnsupportedError(raw, "graph_serialize")).toBe(false);
   });
 
   it("does NOT match a genuine transport/timeout error (fallback must not fire)", () => {
@@ -1947,15 +2005,18 @@ describe("UiBridge.send (graceful gate end-to-end)", () => {
     await new Promise((r) => setTimeout(r, 50));
 
     // First call: genuinely round-trips (no per-command minimum to prove it unsupported).
+    // ui_render is UNTABLED, so the rewrite names the observed fact ("does not
+    // implement") and the latest-release remedy rather than quoting a fabricated
+    // minimum (#619).
     await expect(bridge.send({ cmd: "ui_render" }, { tabId: "old-tab-2" })).rejects.toThrow(
-      /too old for "ui_render"/i,
+      /does not implement "ui_render"/i,
     );
     expect(dispatchCount).toBe(1);
 
     // Second call: gated proactively (learned) — same actionable message, but the panel
     // must NEVER see a second dispatch of this command.
     await expect(bridge.send({ cmd: "ui_render" }, { tabId: "old-tab-2" })).rejects.toThrow(
-      /too old for "ui_render".*0\.6\.8.*update/is,
+      /does not implement "ui_render".*0\.6\.8.*update/is,
     );
     expect(dispatchCount).toBe(1);
   });
@@ -1983,6 +2044,31 @@ describe("UiBridge.send (graceful gate end-to-end)", () => {
       /too old for "graph_query".*0\.7\.0.*update/is,
     );
     // The FIRST call is gated before dispatch — the panel is never asked.
+    expect(dispatchCount).toBe(0);
+  });
+
+  // #619 RECURRENCE end-to-end — the exact report: a 0.11.21 panel calling
+  // graph_resize_node. Now that the command is tabled (min 0.11.25), the VERY FIRST
+  // call is gated pre-dispatch with the honest ≥0.11.25 verdict — never the
+  // self-contradictory "(detected 0.11.21) — update … to ≥0.11.4" the reporter saw,
+  // and never a burned round-trip to collect the raw "Unknown command" reply.
+  it("gates graph_resize_node on the reporter's 0.11.21 panel with the correct ≥0.11.25 verdict (#619 recurrence)", async () => {
+    const sock = await connectPanel(undefined);
+    let dispatchCount = 0;
+    sock.send(JSON.stringify({ type: "hello", tab_id: "old-tab-2c", title: "wf", panel_version: "0.11.21" }));
+    sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd) {
+        dispatchCount += 1;
+        sock.send(JSON.stringify({ rid: msg.rid, ok: false, error: `Unknown command "${msg.cmd}"` }));
+      }
+    });
+    await new Promise((r) => setTimeout(r, 50));
+
+    await expect(bridge.send({ cmd: "graph_resize_node" }, { tabId: "old-tab-2c" })).rejects.toThrow(
+      /too old for "graph_resize_node".*0\.11\.21.*0\.11\.25.*update/is,
+    );
+    // Gated by the advertised version BEFORE dispatch — the panel is never asked.
     expect(dispatchCount).toBe(0);
   });
 
