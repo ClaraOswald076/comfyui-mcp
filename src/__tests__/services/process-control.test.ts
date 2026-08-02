@@ -31,8 +31,14 @@ vi.mock("node:child_process", () => ({
 // exist on disk. Default: everything exists; a test overrides for the stale-path
 // case.
 const mockExistsSync = vi.hoisted(() => vi.fn((_p: string) => true));
+// statSync drives the spawn-cwd DIRECTORY proof (codex gate: an existing
+// regular FILE at COMFYUI_PATH must not become the cwd). Default: a directory.
+const mockStatSync = vi.hoisted(() =>
+  vi.fn((_p: string) => ({ isDirectory: () => true })),
+);
 vi.mock("node:fs", () => ({
   existsSync: mockExistsSync,
+  statSync: mockStatSync,
 }));
 
 vi.mock("../../comfyui/client.js", () => ({
@@ -118,6 +124,7 @@ beforeEach(() => {
   mockConfig.comfyuiPath = "/fake/ComfyUI";
   mockFindComfyuiPython.mockReturnValue("/fake/ComfyUI/python_embeded/python.exe");
   mockExistsSync.mockImplementation(() => true);
+  mockStatSync.mockImplementation(() => ({ isDirectory: () => true }));
   __processControlTestHooks.reset();
 });
 
@@ -191,12 +198,16 @@ describe("process-control startup readiness", () => {
       ["C:\\ComfyUI\\main.py", "--port", "8188"],
       expect.objectContaining({
         detached: true,
-        cwd: "/fake/ComfyUI",
         shell: false,
         stdio: "ignore",
         windowsHide: true,
       }),
     );
+    // The spawn cwd is the ABSOLUTE anchor the script resolved against (#711):
+    // the live script's own install dir when the host parses the Windows argv
+    // path (win32), otherwise the configured install dir (POSIX fallback).
+    const spawnOpts = mockSpawn.mock.calls[0][2] as { cwd?: string };
+    expect(["C:\\ComfyUI", "/fake/ComfyUI"]).toContain(spawnOpts.cwd);
     expect(children[0].unref).toHaveBeenCalled();
   });
 
@@ -249,6 +260,47 @@ describe("process-control startup readiness", () => {
       [join("/fake/ComfyUI", "main.py"), "--port", "8188"],
       expect.objectContaining({ cwd: "/fake/ComfyUI", shell: false }),
     );
+  });
+
+  it("omits the spawn cwd when COMFYUI_PATH points at a nonexistent dir (#711)", async () => {
+    // A stale/nonexistent COMFYUI_PATH passed as the spawn cwd would ENOENT the
+    // relaunch. The fallback must omit cwd instead — the child then inherits
+    // this process's (existing) working directory.
+    mockConfig.comfyuiPath = "/stale/missing/ComfyUI";
+    mockExistsSync.mockImplementation(() => false);
+    mockStatSync.mockImplementation(() => {
+      throw new Error("ENOENT: no such file or directory");
+    });
+    setLaunchInfo();
+    mockSpawnedChildren();
+    mockNoPortProcess();
+    mockFetchOk(true);
+
+    const result = await startComfyUI();
+
+    expect(result.started).toBe(true);
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+    const opts = mockSpawn.mock.calls[0][2] as { cwd?: string };
+    expect(opts.cwd).toBeUndefined();
+  });
+
+  it("omits the spawn cwd when COMFYUI_PATH resolves to a regular FILE (codex gate)", async () => {
+    // An existing-but-not-a-directory COMFYUI_PATH passed as the spawn cwd
+    // fails ENOTDIR after the server was already stopped — the same
+    // lost-server failure class as #711. The fallback must omit cwd.
+    mockConfig.comfyuiPath = "/fake/ComfyUI/main.py";
+    mockStatSync.mockImplementation(() => ({ isDirectory: () => false }));
+    setLaunchInfo();
+    mockSpawnedChildren();
+    mockNoPortProcess();
+    mockFetchOk(true);
+
+    const result = await startComfyUI();
+
+    expect(result.started).toBe(true);
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+    const opts = mockSpawn.mock.calls[0][2] as { cwd?: string };
+    expect(opts.cwd).toBeUndefined();
   });
 
   it("reports timeout instead of ready when bounded probes never succeed", async () => {
