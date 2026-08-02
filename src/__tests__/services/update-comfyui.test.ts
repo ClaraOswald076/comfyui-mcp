@@ -325,7 +325,7 @@ describe("updateAllCustomNodes", () => {
     const calls = stubManager("legacy");
 
     const r = await updateAllCustomNodes();
-    expect(r.updated).toBe(true);
+    expect(r.updated).toBe(false);
     expect(r.endpoint).toBe("/manager/queue/update_all");
     expect(r.queue_started).toBe(true);
 
@@ -345,7 +345,7 @@ describe("updateAllCustomNodes", () => {
     const calls = stubManager("v4");
 
     const r = await updateAllCustomNodes();
-    expect(r.updated).toBe(true);
+    expect(r.updated).toBe(false);
     expect(r.endpoint).toBe("/v2/manager/queue/update_all");
     expect(r.queue_started).toBe(true);
 
@@ -390,7 +390,7 @@ describe("updateAllCustomNodes", () => {
     stubManager("legacy", { failStart: "error" });
 
     const r = await updateAllCustomNodes();
-    expect(r.updated).toBe(true);
+    expect(r.updated).toBe(false);
     expect(r.queue_started).toBe(false);
     expect(r.message).toMatch(/Could not confirm the queue worker started/);
   });
