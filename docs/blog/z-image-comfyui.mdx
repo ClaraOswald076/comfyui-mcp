@@ -30,8 +30,8 @@ fastest way to get it running: a one-command install with
 instead of hand-downloading GGUFs into the right folders.
 
 > **TL;DR — one-command setup.** Install comfyui-mcp, apply the
-> [`z-image-turbo`](/packs/z-image-turbo) pack (fast) or
-> [`z-image-base`](/packs/z-image-base) pack (trainable) — nodes + GGUF models land
+> [`z-image-turbo`](https://github.com/artokun/comfyui-mcp/tree/main/packs/z-image-turbo) pack (fast) or
+> [`z-image-base`](https://github.com/artokun/comfyui-mcp/tree/main/packs/z-image-base) pack (trainable) — nodes + GGUF models land
 > in the right folders, validated — and drive the graph from your own Claude session
 > through the [Panel](../panel). Jump to [Install](#install-z-image-in-comfyui).
 
@@ -123,7 +123,7 @@ packs/z-image-turbo/install-runpod.sh        # RunPod / Linux
 ```
 
 Want to compare trained LoRAs? Add the
-[`z-image-xy-plot`](/packs/z-image-xy-plot) pack. Run the generated installer from
+[`z-image-xy-plot`](https://github.com/artokun/comfyui-mcp/tree/main/packs/z-image-xy-plot) pack. Run the generated installer from
 your **ComfyUI root** (the folder containing `custom_nodes/` and `models/`), then
 restart ComfyUI (or use ComfyUI-Manager → *Install missing custom nodes*) and load
 `workflow.json`.
@@ -146,7 +146,7 @@ Z-Image ships in two flavors, and the difference is the whole story:
 | Steps | **~4–8** (sub-second on data-center GPUs) | **~30–50**, CFG 3–5 |
 | Negative prompt | Not effective (CFG baked in) | **Supported** at CFG > 1 |
 | Best at | Fast ideation, batch iteration | Diverse styles, finetuning, LoRA training |
-| Pick the pack | [`z-image-turbo`](/packs/z-image-turbo) | [`z-image-base`](/packs/z-image-base) |
+| Pick the pack | [`z-image-turbo`](https://github.com/artokun/comfyui-mcp/tree/main/packs/z-image-turbo) | [`z-image-base`](https://github.com/artokun/comfyui-mcp/tree/main/packs/z-image-base) |
 
 **Turbo** is the one you reach for first: ~4–8-step sampling, sub-second latency on
 beefy GPUs, ~2.3s for 1024px on a 4090. It's distilled, so it bakes CFG in — meaning
@@ -210,7 +210,7 @@ for Z-Image:
 
 **Train on Base, deploy anywhere.** Then drop the resulting `.safetensors` into
 `models/loras/` and compare your candidates side by side with the
-[`z-image-xy-plot`](/packs/z-image-xy-plot) pack — a utility workflow that renders a
+[`z-image-xy-plot`](https://github.com/artokun/comfyui-mcp/tree/main/packs/z-image-xy-plot) pack — a utility workflow that renders a
 labelled XY grid of multiple trained LoRAs (and/or checkpoints) at once. Bring your
 own LoRAs; that pack installs none.
 
@@ -298,8 +298,8 @@ published on the Aitrepreneur/FLX mirror — use Q5_K_S or Q8_0.
 ## Get it running in one command
 
 1. Install [comfyui-mcp](https://github.com/artokun/comfyui-mcp) and the [Panel](../panel) — the panel auto-starts a background agent on your Claude subscription (no API keys; sign in with `claude` once).
-2. Apply the [`z-image-turbo`](/packs/z-image-turbo) pack (fast) or
-   [`z-image-base`](/packs/z-image-base) pack (trainable) — nodes + GGUF models land
+2. Apply the [`z-image-turbo`](https://github.com/artokun/comfyui-mcp/tree/main/packs/z-image-turbo) pack (fast) or
+   [`z-image-base`](https://github.com/artokun/comfyui-mcp/tree/main/packs/z-image-base) pack (trainable) — nodes + GGUF models land
    in the right folders, validated.
 3. Open the [Panel](../panel) and let the panel's agent wire the ControlNet, swap
    quant tiers, and iterate on prompts for you.
