@@ -429,12 +429,8 @@ const MUTATING_GRAPH_EDIT_CMDS = new Set<string>([
   "graph_disconnect",
   "graph_set_widget",
   "graph_set_node_property",
-  "graph_move_node",
-  "graph_resize_node",
-  "graph_set_title",
+  "graph_edit_node",
   "graph_set_node_mode",
-  "graph_set_node_color",
-  "graph_set_node_collapsed",
   "graph_update_node",
   "graph_create_group",
   "graph_edit_group",
@@ -3449,27 +3445,45 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         ctx.call({ cmd: "graph_set_node_property", node_id: args.node_id, name: args.name, value: args.value }),
     ),
     def(
-      "panel_move_node",
-      "Move a node to a new canvas position [x, y] in the user's open graph. Undoable.",
+      "panel_edit_node",
+      "Atomically edit one node, or apply the same edit to several nodes. Pass exactly one of node_id or node_ids, plus at least one field. In one Ctrl+Z step you can move (pos), resize (size — including Note/MarkdownNote), retitle, recolor, change shape, collapse, pin, or set execution mode. Widget values, LiteGraph properties, links, and slot order stay on their dedicated tools. For a multi-node call, position/size/title/mode apply the same value to every target. Color fields accept #RGB, #RGBA, #RRGGBB, or #RRGGBBAA; null clears a color. Bypassing a subgraph retains panel_set_node_mode's unsafe-boundary guard; force:true is required to override it. Undoable with Ctrl+Z.",
       {
-        node_id: z.number().int().describe("Node id from panel_graph_outline / panel_query_graph."),
-        pos: xy().describe("New canvas [x, y] (two numbers)."),
+        node_id: z.number().int().optional().describe("One node id from panel_graph_outline / panel_query_graph. Provide this OR node_ids, not both."),
+        node_ids: z.array(z.number().int()).min(1).optional().describe("Several node ids that receive the same presentation edit. Provide this OR node_id, not both."),
+        pos: xy().optional().describe("New canvas [x, y]."),
+        size: z.tuple([z.number().positive(), z.number().positive()]).optional().describe("New [width, height] in canvas px. Uses the node's setSize so DOM-widget nodes reflow and minimum sizes are honored."),
+        title: z.string().optional().describe("New header title."),
+        preset: z.enum(["red", "brown", "green", "blue", "pale_blue", "cyan", "purple", "yellow", "black"]).optional().describe("Named LiteGraph palette color (sets both title and body). Cannot be combined with color/bgcolor."),
+        color: z.string().regex(/^#[0-9a-fA-F]{3,8}$/).nullable().optional().describe("Title-bar color hex, or null to clear."),
+        bgcolor: z.string().regex(/^#[0-9a-fA-F]{3,8}$/).nullable().optional().describe("Body color hex, or null to clear."),
+        shape: z.enum(["default", "box", "round", "card"]).optional().describe("Node outline shape; default restores the theme default."),
+        collapsed: z.boolean().optional().describe("true collapses to a title chip; false expands."),
+        pinned: z.boolean().optional().describe("Whether LiteGraph marks this node pinned for presentation/layout."),
+        mode: z.enum(["active", "bypass", "mute"]).optional().describe("Execution mode. Bypass/mute change what renders; inspect the graph first."),
+        force: z.boolean().optional().describe("Required only to bypass a subgraph whose positional I/O boundary mapping is unsafe."),
       },
-      async (args: A, ctx) => ctx.call({ cmd: "graph_move_node", node_id: args.node_id, pos: args.pos }),
+      async (args: A, ctx) =>
+        ctx.call({
+          cmd: "graph_edit_node",
+          node_id: args.node_id,
+          node_ids: args.node_ids,
+          pos: args.pos,
+          size: args.size,
+          title: args.title,
+          preset: args.preset,
+          color: args.color,
+          bgcolor: args.bgcolor,
+          shape: args.shape,
+          collapsed: args.collapsed,
+          pinned: args.pinned,
+          mode: args.mode,
+          force: args.force,
+        }),
     ),
-    def(
-      "panel_resize_node",
-      "Resize a node to [width, height] (canvas px) on the user's open graph. Essential for Note / MarkdownNote nodes, which are created tiny (140×60) and are unreadable until enlarged — panel_move_node only repositions, it cannot resize. Uses the node's own setSize so DOM-widget nodes (MarkdownNote) and nodes that clamp to a computed minimum reflow correctly. Undoable with Ctrl+Z.",
-      {
-        node_id: z.number().int().describe("Node id from panel_graph_outline / panel_query_graph."),
-        size: z
-          .array(z.number())
-          .min(2)
-          .max(2)
-          .describe("New [width, height] in canvas px (both > 0)."),
-      },
-      async (args: A, ctx) => ctx.call({ cmd: "graph_resize_node", node_id: args.node_id, size: args.size }),
-    ),
+    // Compatibility names remain through this migration slice. They deliberately
+    // share graph_edit_node so every path gets its single undo envelope and result.
+    def("panel_move_node", "Compatibility wrapper for panel_edit_node(pos).", { node_id: z.number().int(), pos: xy() }, async (args: A, ctx) => ctx.call({ cmd: "graph_edit_node", node_id: args.node_id, pos: args.pos })),
+    def("panel_resize_node", "Compatibility wrapper for panel_edit_node(size).", { node_id: z.number().int(), size: z.tuple([z.number().positive(), z.number().positive()]) }, async (args: A, ctx) => ctx.call({ cmd: "graph_edit_node", node_id: args.node_id, size: args.size })),
     def(
       "panel_auto_layout",
       "Automatically arrange the user's open graph (or a subset of nodes) into a clean left-to-right / top-to-bottom / grid layout based on the real link topology. Group boxes move with their members and are re-fit. Use dry_run:true to preview proposed positions without touching the canvas. Undoable (one Ctrl+Z).",
@@ -4626,22 +4640,15 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_set_node_title",
-      "Rename a node's TITLE (the label on its header) — e.g. to label a node by its purpose. Different from panel_set_widget (which changes a value). Undoable with Ctrl+Z.",
-      {
-        node_id: z.number().int().describe("Node id from panel_graph_outline / panel_query_graph."),
-        title: z.string().describe("New title text."),
-      },
-      async (args: A, ctx) => ctx.call({ cmd: "graph_set_title", node_id: args.node_id, title: args.title }, 15000),
+      "Compatibility wrapper for panel_edit_node(title).",
+      { node_id: z.number().int(), title: z.string() },
+      async (args: A, ctx) => ctx.call({ cmd: "graph_edit_node", node_id: args.node_id, title: args.title }),
     ),
     def(
       "panel_set_node_collapsed",
-      "Collapse (minimize) or expand a node on the user's open graph. Collapsed nodes shrink to just their title bar — handy for tidying loaders or rarely-touched nodes. Undoable.",
-      {
-        node_id: z.number().int().describe("Node id from panel_graph_outline / panel_query_graph."),
-        collapsed: z.boolean().optional().describe("true = collapse/minimize (default), false = expand."),
-      },
-      async (args: A, ctx) =>
-        ctx.call({ cmd: "graph_set_node_collapsed", node_id: args.node_id, collapsed: args.collapsed }),
+      "Compatibility wrapper for panel_edit_node(collapsed).",
+      { node_id: z.number().int(), collapsed: z.boolean().optional() },
+      async (args: A, ctx) => ctx.call({ cmd: "graph_edit_node", node_id: args.node_id, collapsed: args.collapsed ?? true }),
     ),
     def(
       "panel_set_node_mode",
@@ -4665,28 +4672,18 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           ),
       },
       async (args: A, ctx) =>
-        ctx.call({ cmd: "graph_set_node_mode", node_id: args.node_id, mode: args.mode, force: args.force }),
+        ctx.call({ cmd: "graph_edit_node", node_id: args.node_id, mode: args.mode, force: args.force }),
     ),
     def(
       "panel_set_node_color",
-      "Set a node's title-bar and/or body color on the user's open graph. Easiest: pass a `preset` from ComfyUI's palette (red, brown, green, blue, pale_blue, cyan, purple, yellow, black) for matched colors. Or set explicit `color` (title bar) and/or `bgcolor` (body) as hex like '#3f789e'. Pass null for a field to reset it to the theme default. Great for colour-coding stages. Undoable.",
+      "Compatibility wrapper for panel_edit_node(preset/color/bgcolor).",
       {
-        node_id: z.number().int().describe("Node id from panel_graph_outline / panel_query_graph."),
-        preset: z
-          .enum(["red", "brown", "green", "blue", "pale_blue", "cyan", "purple", "yellow", "black"])
-          .optional()
-          .describe("Named LiteGraph color preset (sets both title + body)."),
-        color: z.string().nullable().optional().describe("Title-bar color hex, or null to clear. Ignored if preset given."),
-        bgcolor: z.string().nullable().optional().describe("Body color hex, or null to clear. Ignored if preset given."),
+        node_id: z.number().int(),
+        preset: z.enum(["red", "brown", "green", "blue", "pale_blue", "cyan", "purple", "yellow", "black"]).optional(),
+        color: z.string().regex(/^#[0-9a-fA-F]{3,8}$/).nullable().optional(),
+        bgcolor: z.string().regex(/^#[0-9a-fA-F]{3,8}$/).nullable().optional(),
       },
-      async (args: A, ctx) =>
-        ctx.call({
-          cmd: "graph_set_node_color",
-          node_id: args.node_id,
-          preset: args.preset,
-          color: args.color,
-          bgcolor: args.bgcolor,
-        }),
+      async (args: A, ctx) => ctx.call({ cmd: "graph_edit_node", node_id: args.node_id, preset: args.preset, color: args.color, bgcolor: args.bgcolor }),
     ),
     def(
       "panel_screenshot",

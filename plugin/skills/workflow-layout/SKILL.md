@@ -17,10 +17,9 @@ real node sizes and rail positions first, then compute positions from them.
   - all **`groups`** (`id`, `title`, `color`, `bounding [x,y,w,h]`),
   - and — only when inside a subgraph — the **`rails`**: the `input` / `output` boundary
     node positions. Everything below is computed from these numbers.
-- `panel_move_node(node_id, [x,y])`, `panel_set_node_title(node_id, title)`,
-  `panel_set_node_collapsed(node_id, collapsed)` (minimize to title bar),
-  `panel_set_node_color(node_id, {preset|color|bgcolor})` (color-code stages —
-  presets: red/brown/green/blue/pale_blue/cyan/purple/yellow/black)
+- `panel_edit_node({node_id, pos?, size?, title?, collapsed?, preset?|color?|bgcolor?})`
+  atomically moves, resizes, retitles, collapses, or color-codes a node. Widget
+  values remain on their dedicated tool; execution mode is available as `mode` when needed.
 - **Groups** (colored boxes; nodes stay put): `panel_create_group` (pass `node_ids` to
   auto-wrap, or `bounds [x,y,w,h]`; `color` hex), `panel_move_group`, `panel_edit_group`,
   `panel_remove_group`.
@@ -115,7 +114,7 @@ nodes expanded — and consider `panel_promote_widget` to surface the one key wi
 
 1. `panel_query_graph {fields:'detail', limit:200, max_chars:60000}` — capture `pos`/`size`/`groups` (and `rails` inside each subgraph).
 2. Compute layers + overlap-free positions from the real sizes.
-3. `panel_move_node` for each (batch the moves — they apply in order).
+3. `panel_edit_node` for each node (or bulk only when the same presentation change is intended).
 4. Per subgraph: enter → lay out inner nodes → `panel_move_rail` both rails → exit.
 5. Optional: `panel_create_group` bands around the root columns (and `panel_remove_group`
    any stranded empty groups left behind by earlier edits).

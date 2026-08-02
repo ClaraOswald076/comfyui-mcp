@@ -207,13 +207,6 @@ export const BRIDGE_CMD_MIN_PANEL_VERSION: Readonly<Record<string, string>> = {
   // "update your panel to ≥0.11.28" verdict. Listing it here also lets the #392
   // PROACTIVE gate reject the very first call on a <0.11.28 panel before dispatch.
   refresh_nodes: "0.11.28",
-  // #619 recurrence — panel_resize_node's bridge executor shipped in panel 0.11.25
-  // (panel CHANGELOG: "panel_resize_node resizes a node on the live canvas", #530).
-  // The reporter's 0.11.21 panel predates it, but untabled the command inherited the
-  // 0.11.4 baseline, producing the self-contradictory verdict `too old for
-  // "graph_resize_node" (detected 0.11.21) — update … to ≥0.11.4`. Tabled, it quotes
-  // the true minimum and the #392 proactive gate rejects the first call pre-dispatch.
-  graph_resize_node: "0.11.25",
 };
 
 /** The minimum panel version that supports `cmd`. For a command WITH an

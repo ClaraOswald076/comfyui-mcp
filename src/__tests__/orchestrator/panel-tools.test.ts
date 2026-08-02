@@ -273,12 +273,74 @@ describe("panel-tools: panel_set_node_mode (bypass/mute/active)", () => {
     expect(force.safeParse(undefined).success).toBe(true);
   });
 
-  it("forwards graph_set_node_mode with node_id + mode (+ force)", async () => {
+  it("forwards graph_edit_node with node_id + mode (+ force)", async () => {
     const { ctx, calls } = makeFakeCtx();
     await defByName("panel_set_node_mode").handler({ node_id: 143, mode: "bypass", force: true }, ctx);
     expect(calls[0]).toMatchObject({
-      cmd: "graph_set_node_mode",
+      cmd: "graph_edit_node",
       node_id: 143,
+      mode: "bypass",
+      force: true,
+    });
+  });
+});
+
+describe("panel-tools: panel_edit_node (#572 presentation consolidation)", () => {
+  it("is the shared core editor while compatibility names remain registered", () => {
+    const names = buildPanelToolDefs().map((d) => d.name);
+    expect(names).toContain("panel_edit_node");
+    expect(names).toContain("panel_set_node_mode");
+    for (const compatibility of [
+      "panel_move_node",
+      "panel_resize_node",
+      "panel_set_node_title",
+      "panel_set_node_collapsed",
+      "panel_set_node_color",
+    ]) {
+      expect(names).toContain(compatibility);
+    }
+  });
+
+  it("uses a flat schema with guarded presentation fields", () => {
+    const def = defByName("panel_edit_node");
+    expect(Object.keys(def.schema).sort()).toEqual([
+      "bgcolor",
+      "collapsed",
+      "color",
+      "force",
+      "mode",
+      "node_id",
+      "node_ids",
+      "pinned",
+      "pos",
+      "preset",
+      "shape",
+      "size",
+      "title",
+    ]);
+    const color = def.schema.color as { safeParse: (v: unknown) => { success: boolean } };
+    const size = def.schema.size as { safeParse: (v: unknown) => { success: boolean } };
+    expect(color.safeParse("#abc").success).toBe(true);
+    expect(color.safeParse("rgb(1,2,3)").success).toBe(false);
+    expect(size.safeParse([120, 80]).success).toBe(true);
+    expect(size.safeParse([0, 80]).success).toBe(false);
+  });
+
+  it("forwards every supplied field to the single graph_edit_node bridge command", async () => {
+    const { ctx, calls } = makeFakeCtx();
+    await defByName("panel_edit_node").handler(
+      { node_ids: [7, 8], pos: [20, 30], size: [400, 200], title: "Loaders", color: "#336699", pinned: true, mode: "bypass", force: true },
+      ctx,
+    );
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      cmd: "graph_edit_node",
+      node_ids: [7, 8],
+      pos: [20, 30],
+      size: [400, 200],
+      title: "Loaders",
+      color: "#336699",
+      pinned: true,
       mode: "bypass",
       force: true,
     });
