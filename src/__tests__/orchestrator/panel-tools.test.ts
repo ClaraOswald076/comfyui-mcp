@@ -4009,4 +4009,62 @@ describe("panel_strip_workflow live-canvas fallback (issue #384)", () => {
     expect(sent).toContain("graph_get_state");
     expect(wf.nodes[0].type).toBe("PreviewImage");
   });
+
+  // #721 — the version hint ("an older panel may not support graph_serialize —
+  // pass pack, path, or graph instead") is only accurate for an actual
+  // unsupported-command rejection. Appending it to ANY capture failure
+  // misdiagnosed e.g. the panel's graph desync guard (whose remedy is
+  // rebinding/opening the workflow), sending the agent down the wrong path.
+  it("does NOT append the version hint to a desync-guard-style error (original message preserved)", async () => {
+    const sent: string[] = [];
+    const ctx = {
+      tabId: "t",
+      ensureReachable: () => {},
+      bridge: {
+        send: async (cmd: { cmd: string }) => {
+          sent.push(cmd.cmd);
+          // The panel's graph desync guard — NOT an unsupported-command
+          // rejection; its own message already carries the remedy.
+          throw new Error(
+            "live graph is out of sync with the active workflow — rebind or open the workflow in the panel, then retry",
+          );
+        },
+      },
+    } as unknown as PanelToolCtx;
+    const err = await __panelToolsTestHooks.resolveWorkflowInput({}, ctx).then(
+      () => {
+        throw new Error("expected resolveWorkflowInput to reject");
+      },
+      (e: unknown) => e as Error,
+    );
+    expect(err.message).toContain("live graph is out of sync with the active workflow");
+    expect(err.message).toContain("Couldn't capture the live canvas");
+    expect(err.message).not.toContain("may not support graph_serialize");
+    expect(err.message).not.toContain("pass pack, path, or graph");
+    // no graph_get_state fallback attempt for a non-unsupported failure
+    expect(sent).not.toContain("graph_get_state");
+  });
+
+  it("DOES append the version hint when the error IS an unsupported-command rejection", async () => {
+    const ctx = {
+      tabId: "t",
+      ensureReachable: () => {},
+      bridge: {
+        send: async (cmd: { cmd: string }) => {
+          // Every command unsupported — the graph_get_state fallback also
+          // fails, so the throw path is reached with the original
+          // unsupported-command error for graph_serialize.
+          throw new Error(`Unknown command "${cmd.cmd}"`);
+        },
+      },
+    } as unknown as PanelToolCtx;
+    const err = await __panelToolsTestHooks.resolveWorkflowInput({}, ctx).then(
+      () => {
+        throw new Error("expected resolveWorkflowInput to reject");
+      },
+      (e: unknown) => e as Error,
+    );
+    expect(err.message).toContain("may not support graph_serialize");
+    expect(err.message).toContain("pass pack, path, or graph");
+  });
 });
