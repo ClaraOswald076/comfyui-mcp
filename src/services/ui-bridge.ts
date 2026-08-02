@@ -2010,7 +2010,12 @@ export class UiBridge {
       // (ctx.workflowUuid), and STRIP any caller-supplied value entirely when we have no trusted
       // one — an identity-less tab / old panel ships unstamped (mutations are already refused by
       // the requiresWorkflowStampEnforcement gate above; reads execute, reply still server-fenced).
-      const frame: Record<string, unknown> = { rid, ...cmd };
+      // #694 hardening: mint the rid LAST so a caller-supplied cmd.rid can NEVER
+      // override it — the rid is BRIDGE-OWNED (reply correlation in `pending`,
+      // the onDispatchedRid observer, and the panel's retry_of dedupe token all
+      // key on it). Previously `{ rid, ...cmd }` let a caller cmd.rid clobber the
+      // minted rid, silently breaking reply correlation for that command.
+      const frame: Record<string, unknown> = { ...cmd, rid };
       if (ctx.workflowUuid) frame.workflow_uuid = ctx.workflowUuid;
       else delete frame.workflow_uuid;
       conn.sock.send(JSON.stringify(frame));
@@ -2289,6 +2294,15 @@ export function isLoopbackBindHost(host: string): boolean {
 
 // Module-level singleton (the last bridge started in this process).
 let bridgeInstance: UiBridge | null = null;
+
+/**
+ * #694 — SESSION EPOCH: one randomUUID minted per orchestrator PROCESS. Stamped
+ * ONLY on the `models` push frame (orchestrator pushModels) — never per-command —
+ * so the panel can scope its retry_of dedupe cache to the process that minted the
+ * rids those tokens name: a restarted orchestrator's tokens can never collide with
+ * a prior process's. Module-level so exactly one value exists per process.
+ */
+export const SESSION_EPOCH: string = randomUUID();
 
 export function startUiBridge(port?: number, token?: string | null, host?: string): UiBridge {
   if (!bridgeInstance) {

@@ -16,7 +16,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import readline from "node:readline";
-import { startUiBridge, isLoopbackBindHost, type UiBridge } from "../services/ui-bridge.js";
+import { startUiBridge, isLoopbackBindHost, SESSION_EPOCH, type UiBridge } from "../services/ui-bridge.js";
 import { setupSecureBridge, resolveComfyuiPathForTarget, type SecureBridge } from "../services/secure-bridge.js";
 import { startQuickTunnel } from "../services/tunnel.js";
 import { detectInstallMode } from "../services/self-update.js";
@@ -683,6 +683,22 @@ function getCallToolClient(): Promise<Client> {
     });
   }
   return callToolClientPromise;
+}
+
+/**
+ * #694 — the `models` push frame is the ONE frame stamped with the bridge's
+ * per-process SESSION_EPOCH (no per-command stamping): the panel scopes its
+ * retry_of dedupe cache to the process that minted the rids, so a restarted
+ * orchestrator's tokens never collide with a prior process's. Exported (pure)
+ * so the epoch-stability test can build two frames without booting the
+ * orchestrator.
+ */
+export function buildModelsPushFrame(
+  models: ModelInfo[],
+  current: string | undefined,
+  backend: string,
+): Record<string, unknown> {
+  return { type: "models", epoch: SESSION_EPOCH, models, current, backend };
 }
 
 export async function runPanelOrchestrator(): Promise<void> {
@@ -2314,12 +2330,11 @@ export async function runPanelOrchestrator(): Promise<void> {
           // previously the default was always reported, so a reconnecting
           // client's picker showed the wrong current model after a switch.
           bridge.push(
-            {
-              type: "models",
+            buildModelsPushFrame(
               models,
-              current: manager.modelOverrideFor(agentKeyFor(panelTabId)) ?? currentModelFor(backend),
+              manager.modelOverrideFor(agentKeyFor(panelTabId)) ?? currentModelFor(backend),
               backend,
-            },
+            ),
             panelTabId,
           );
         }
