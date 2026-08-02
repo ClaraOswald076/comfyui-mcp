@@ -1359,6 +1359,60 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     desktop.close();
   });
 
+  it("(d) forwards a caller-supplied retry_of to the wire UNTOUCHED, while rid stays a fresh bridge UUID (#694)", async () => {
+    // retry_of is OPAQUE caller data (the caller's explicit retry identity for a
+    // mutating command): the bridge must neither stamp over it nor strip it —
+    // contrast workflow_uuid above, which is bridge-owned and always overwritten.
+    const desktop = await connectPanel("tmp:A", "A");
+    const frames: Array<Record<string, unknown>> = [];
+    desktop.on("message", (buf) => {
+      const m = JSON.parse(buf.toString());
+      if (m.rid && m.cmd) {
+        frames.push(m);
+        desktop.send(JSON.stringify({ rid: m.rid, ok: true, result: {} }));
+      }
+    });
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:A")).toBe(true));
+    await bridge.send(
+      { cmd: "graph_add_node", node: "x", retry_of: "caller-retry-token-1" } as never,
+      { tabId: "tmp:A" },
+    );
+    await vi.waitFor(() => expect(frames.find((f) => f.cmd === "graph_add_node")).toBeTruthy());
+    const frame = frames.find((f) => f.cmd === "graph_add_node")!;
+    expect(frame.retry_of).toBe("caller-retry-token-1");
+    expect(frame.rid).not.toBe("caller-retry-token-1");
+    expect(String(frame.rid)).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    desktop.close();
+  });
+
+  it("(g) never lets a caller-supplied cmd.rid override the bridge-minted rid (#694 hardening)", async () => {
+    // `{ rid, ...cmd }` let a caller cmd.rid clobber the minted rid on the wire —
+    // silently breaking reply correlation, since `pending` is keyed on the MINTED
+    // rid and the panel echoes the WIRE rid back. `{ ...cmd, rid }` makes the
+    // bridge-owned rid always win; the send RESOLVING below proves correlation
+    // still works (the auto-reply answers the wire rid).
+    const desktop = await connectPanel("tmp:A", "A");
+    const frames: Array<Record<string, unknown>> = [];
+    desktop.on("message", (buf) => {
+      const m = JSON.parse(buf.toString());
+      if (m.rid && m.cmd) {
+        frames.push(m);
+        desktop.send(JSON.stringify({ rid: m.rid, ok: true, result: {} }));
+      }
+    });
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tmp:A")).toBe(true));
+    await expect(
+      bridge.send({ cmd: "graph_query", rid: "caller-forged-rid" } as never, {
+        tabId: "tmp:A",
+        timeoutMs: 5000,
+      }),
+    ).resolves.toBeTruthy();
+    const frame = frames.find((f) => f.cmd === "graph_query")!;
+    expect(frame.rid).not.toBe("caller-forged-rid");
+    expect(String(frame.rid)).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    desktop.close();
+  });
+
   it("REFUSES a mutation when the tab has no trusted workflow identity, even if the panel advertises enforcement (#570 P0c)", async () => {
     // A panel that CLAIMS enforcement but has no resolvable workflow uuid: the frame would ship
     // UNSTAMPED, so the panel's fence has nothing to compare and a stale mutation after a switch

@@ -16,7 +16,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import readline from "node:readline";
-import { startUiBridge, isLoopbackBindHost, type UiBridge } from "../services/ui-bridge.js";
+import { startUiBridge, isLoopbackBindHost, SESSION_EPOCH, type UiBridge } from "../services/ui-bridge.js";
 import { setupSecureBridge, resolveComfyuiPathForTarget, type SecureBridge } from "../services/secure-bridge.js";
 import { startQuickTunnel } from "../services/tunnel.js";
 import { detectInstallMode } from "../services/self-update.js";
@@ -683,6 +683,38 @@ function getCallToolClient(): Promise<Client> {
     });
   }
   return callToolClientPromise;
+}
+
+/**
+ * #694 — the `models` push frame is the ONE frame stamped with the bridge's
+ * per-process SESSION_EPOCH (no per-command stamping): the panel scopes its
+ * retry_of dedupe cache to the process that minted the rids, so a restarted
+ * orchestrator's tokens never collide with a prior process's. Exported (pure)
+ * so the epoch-stability test can build two frames without booting the
+ * orchestrator.
+ */
+export function buildModelsPushFrame(
+  models: ModelInfo[],
+  current: string | undefined,
+  backend: string,
+): Record<string, unknown> {
+  return { type: "models", epoch: SESSION_EPOCH, models, current, backend };
+}
+
+/**
+ * Send the model handshake even when discovery returned no choices. The models
+ * frame is also the process-epoch handshake that scopes panel retry tokens, so
+ * suppressing an empty catalog would leave a reconnecting panel on the prior
+ * process's epoch and allow stale tokens to resolve there.
+ */
+export function pushModelsFrame(
+  bridge: Pick<UiBridge, "push">,
+  panelTabId: string,
+  models: ModelInfo[],
+  current: string | undefined,
+  backend: string,
+): number {
+  return bridge.push(buildModelsPushFrame(models, current, backend), panelTabId);
 }
 
 export async function runPanelOrchestrator(): Promise<void> {
@@ -2305,24 +2337,21 @@ export async function runPanelOrchestrator(): Promise<void> {
     const backend = backendForTab(panelTabId);
     void ensureModels(backend)
       .then((models) => {
-        if (models.length) {
-          // `backend` rides on the models frame so the panel's picker reflects the
-          // provider THIS tab selected (single-port multi-provider). `current`
-          // reports the model this tab will ACTUALLY spawn with: the picker's
-          // per-tab override when one is set (set_options survives reconnects
-          // of the same tab id), else the backend's configured default —
-          // previously the default was always reported, so a reconnecting
-          // client's picker showed the wrong current model after a switch.
-          bridge.push(
-            {
-              type: "models",
-              models,
-              current: manager.modelOverrideFor(agentKeyFor(panelTabId)) ?? currentModelFor(backend),
-              backend,
-            },
-            panelTabId,
-          );
-        }
+        // `backend` rides on the models frame so the panel's picker reflects the
+        // provider THIS tab selected (single-port multi-provider). `current`
+        // reports the model this tab will ACTUALLY spawn with: the picker's
+        // per-tab override when one is set (set_options survives reconnects
+        // of the same tab id), else the backend's configured default —
+        // previously the default was always reported, so a reconnecting
+        // client's picker showed the wrong current model after a switch. Send
+        // even an empty list: the frame advances the #694 session epoch.
+        pushModelsFrame(
+          bridge,
+          panelTabId,
+          models,
+          manager.modelOverrideFor(agentKeyFor(panelTabId)) ?? currentModelFor(backend),
+          backend,
+        );
       })
       .catch(() => {
         /* probe already logged; panel keeps its fallback list */

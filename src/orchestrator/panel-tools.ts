@@ -39,6 +39,7 @@ import {
   dispatchOutcomeOf,
   isPanelCmdUnsupportedError,
   isReplyTimeoutTagged,
+  requiresWorkflowStampEnforcement,
 } from "../services/ui-bridge.js";
 import {
   type WorkflowTargetStore,
@@ -2206,6 +2207,15 @@ export function makePanelToolCtx(
     timeoutMs?: number,
     onDispatchedRid?: (rid: string) => void,
   ): Promise<ToolResult> => {
+    // #694: capture the rid of THIS call's dispatched attempt so an OUTCOME-UNKNOWN
+    // mutating failure can name it as the caller's explicit retry token (see the
+    // catch below). The bridge fires the observer post-write (per attempt); chain
+    // to any caller-supplied observer (workflow_open's receipt correlation).
+    let dispatchedRid: string | undefined;
+    const observeRid = (rid: string): void => {
+      dispatchedRid = rid;
+      onDispatchedRid?.(rid);
+    };
     try {
       // #436: a MUTATING graph edit must not fire into the "Connected: none"
       // window a ComfyUI restart/reload opens. A read survives that window (it is
@@ -2223,7 +2233,7 @@ export function makePanelToolCtx(
         await awaitReachable();
       }
       ensureReachable();
-      return ok(await sendRouted(cmd, timeoutMs, onDispatchedRid));
+      return ok(await sendRouted(cmd, timeoutMs, observeRid));
     } catch (err) {
       // Post-reconnect retry-once: a reboot/free_vram/reconnect can drop the tab's
       // transport (or replace it under a new tab id) the instant after we dispatch.
@@ -2234,7 +2244,7 @@ export function makePanelToolCtx(
         try {
           await sleep(retrySettleMs());
           ensureReachable(); // rebinds a current-mode session onto the reconnected tab
-          return ok(await sendRouted(cmd, timeoutMs, onDispatchedRid));
+          return ok(await sendRouted(cmd, timeoutMs, observeRid));
         } catch (err2) {
           // The retry also failed — surface an actionable reconnecting status rather
           // than a bare transport error (#332), while still failing honestly.
@@ -2276,6 +2286,30 @@ export function makePanelToolCtx(
             `session's binding is stale (e.g. another workflow tab is now active). Retry in a ` +
             `moment, or rebind with panel_set_workflow_target({mode:"current"}) to follow the ` +
             `tab that's live now. (${err instanceof Error ? err.message : String(err)})`,
+        );
+      }
+      // #694 — EXPLICIT caller retry identity. A MUTATING command whose outcome is
+      // UNKNOWN — a post-write reply timeout or a mid-command disconnect (the only
+      // two dispatched:true rejections the bridge mints) — may already have been
+      // applied by the panel, so a blind retry can double-apply. Name the dispatched
+      // attempt's rid as the caller's retry token: re-issuing identical args plus
+      // retry_of:"<rid>" lets the panel recognize and dedupe that exact mutation.
+      // Pre-write refusals (dispatched:false, handled above) mint NO token — nothing
+      // was sent, so there is nothing to dedupe. Minting is gated BOTH ways: the
+      // bridge classifies the command as mutating (requiresWorkflowStampEnforcement)
+      // AND the command is one the retry map admits (RETRY_TOKEN_CMDS) — a
+      // read/view-only command outside BRIDGE_READONLY_CMDS (find_nodes, canvas,
+      // screenshot, list_subgraphs) can satisfy the first without the second, and
+      // it must never mint a token (a ledger answer for a read is a STALE outcome).
+      if (
+        dispatchedRid &&
+        requiresWorkflowStampEnforcement(cmd) &&
+        RETRY_TOKEN_CMDS.has(typeof cmd.cmd === "string" ? cmd.cmd : "") &&
+        (dispatchOutcomeOf(err) === true || isReplyTimeoutTagged(err))
+      ) {
+        const cause = err instanceof Error ? err.message : String(err);
+        return fail(
+          `${cause}\n\nTo retry this exact mutation, re-issue identical args plus retry_of:"${dispatchedRid}"; otherwise call normally.`,
         );
       }
       return fail(err);
@@ -2965,6 +2999,125 @@ function validatePanelEditNodeArgs(args: Record<string, unknown>): string | null
 }
 
 /**
+ * #694 — `retry_of`: an EXPLICIT caller retry identity for MUTATING panel
+ * commands. When a mutating call fails OUTCOME-UNKNOWN (a post-write reply
+ * timeout or a mid-command disconnect), the error text names the dispatched
+ * attempt's rid and tells the caller to re-issue identical args plus
+ * retry_of:"<rid>"; the panel dedupes the retried mutation on that token so the
+ * retry can never double-apply. The token is OPAQUE caller data to the bridge —
+ * forwarded to the wire UNTOUCHED (contrast workflow_uuid, which is bridge-owned
+ * and always overwritten). Optional everywhere; never required.
+ */
+const RETRY_OF_ARG = {
+  retry_of: z
+    .string()
+    .optional()
+    .describe(
+      "Retry token (#694): pass the retry_of rid from a previous outcome-unknown failure of this identical call to retry that exact mutation; omit otherwise.",
+    ),
+} satisfies z.ZodRawShape;
+
+/**
+ * #694 — the MUTATING panel tools that accept retry_of, keyed to the bridge
+ * command each dispatches. Mirrors the #694 mutation surface EXACTLY: every
+ * graph_* command NOT in BRIDGE_READONLY_CMDS (isMutatingGraphCommand — the
+ * bridge's own fail-closed classification, which also arms the tight default
+ * timeout and the dispatched:true mid-command outcome) plus the four workflow
+ * mutators (workflow_save / workflow_save_as / workflow_rename / workflow_close
+ * — the requiresWorkflowStampEnforcement set). Navigation/creation
+ * (workflow_open / workflow_new), BRIDGE_READONLY_CMDS reads, and the tools whose
+ * descriptions declare them view/read-only (panel_find_nodes, panel_canvas,
+ * panel_screenshot, panel_list_subgraphs) are excluded: a read must never mint
+ * or carry a retry token — its retry could be answered from the ledger with a
+ * STALE outcome (codex gate). A few state-changing commands that sit OUTSIDE
+ * BRIDGE_READONLY_CMDS but are reads in spirit (graph_select_nodes,
+ * graph_enter/exit_subgraph, graph_copy_nodes) accept the token: they change UI
+ * state idempotently, so a deduped retry is a no-op. EXPLICIT MAP, mirroring the
+ * RETRY_SAFE_CMDS / MUTATING_GRAPH_EDIT_CMDS maintenance model — keep in sync
+ * when mutating tools are added. Exported for the #694 surface-integrity test.
+ */
+export const RETRY_TOKEN_CMD_BY_TOOL: Readonly<Record<string, string>> = {
+  panel_add_node: "graph_add_node",
+  panel_edit_node: "graph_edit_node",
+  panel_remove_node: "graph_remove_node",
+  panel_clear: "graph_clear",
+  panel_flatten_workflow: "graph_load",
+  panel_load_workflow: "graph_load",
+  panel_connect: "graph_connect",
+  panel_disconnect: "graph_disconnect",
+  panel_set_widget: "graph_set_widget",
+  panel_set_property: "graph_set_node_property",
+  panel_move_node: "graph_move_node",
+  panel_resize_node: "graph_resize_node",
+  panel_auto_layout: "graph_auto_layout",
+  panel_run: "graph_run",
+  panel_save_workflow: "workflow_save", // workflow_save_as when `name` is given
+  panel_rename_workflow: "workflow_rename",
+  panel_close_workflow: "workflow_close",
+  panel_select_nodes: "graph_select_nodes",
+  panel_create_subgraph: "graph_create_subgraph",
+  panel_subgraph_group: "graph_subgraph_group",
+  panel_copy_nodes: "graph_copy_nodes",
+  panel_paste_nodes: "graph_paste_nodes",
+  panel_save_subgraph: "graph_save_subgraph",
+  panel_add_subgraph: "graph_add_subgraph",
+  panel_create_group: "graph_create_group",
+  panel_move_group: "graph_move_group",
+  panel_edit_group: "graph_edit_group",
+  panel_remove_group: "graph_remove_group",
+  panel_set_node_title: "graph_set_title",
+  panel_set_node_collapsed: "graph_set_node_collapsed",
+  panel_set_node_mode: "graph_set_node_mode",
+  panel_set_node_color: "graph_set_node_color",
+  panel_enter_subgraph: "graph_enter_subgraph",
+  panel_exit_subgraph: "graph_exit_subgraph",
+  panel_move_rail: "graph_move_rail",
+  panel_promote_widget: "graph_promote_widget",
+  panel_expose_subgraph_output: "graph_expose_subgraph_output",
+  panel_expose_subgraph_input: "graph_expose_subgraph_input",
+  panel_unpack_subgraph: "graph_unpack_subgraph",
+  panel_update_node: "graph_update_node",
+};
+
+/** #694 — the bridge commands the retry map admits, for the mint gate: a
+ *  dispatched timeout/drop only mints a retry token when the command is in
+ *  this set (bridge classification alone would include read/view-only
+ *  commands that sit outside BRIDGE_READONLY_CMDS). */
+export const RETRY_TOKEN_CMDS: ReadonlySet<string> = new Set(
+  Object.values(RETRY_TOKEN_CMD_BY_TOOL).concat(["workflow_save_as"]),
+);
+
+/** #694 — augment one MUTATING tool def: accept retry_of and attach it, UNTOUCHED,
+ *  to every mutating command the handler dispatches (per-command gated so a read
+ *  probe inside the same handler — e.g. panel_flatten_workflow's live-canvas
+ *  graph_serialize — stays clean). `call` is overridden on a prototype-delegating
+ *  wrapper (Object.create(ctx)) so LIVE properties — e.g. ctx.tabId rebinding —
+ *  keep reading through to the real ctx; only `call` shadows. */
+function withRetryToken(d: PanelToolDef): PanelToolDef {
+  return {
+    ...d,
+    schema: { ...d.schema, ...RETRY_OF_ARG },
+    handler: (args: Record<string, unknown>, ctx: PanelToolCtx): Promise<ToolResult> => {
+      const retryOf =
+        typeof args.retry_of === "string" && args.retry_of !== "" ? args.retry_of : undefined;
+      if (!retryOf) return d.handler(args, ctx);
+      const wrapped = Object.create(ctx) as PanelToolCtx;
+      wrapped.call = (
+        cmd: Record<string, unknown>,
+        timeoutMs?: number,
+        onDispatchedRid?: (rid: string) => void,
+      ) =>
+        ctx.call(
+          requiresWorkflowStampEnforcement(cmd) ? { ...cmd, retry_of: retryOf } : cmd,
+          timeoutMs,
+          onDispatchedRid,
+        );
+      return d.handler(args, wrapped);
+    },
+  };
+}
+
+/**
  * The SINGLE source of truth for the panel_* tool surface. Both transports
  * register these exact definitions, so the Claude (in-process) and Codex (HTTP)
  * backends expose an identical panel toolset.
@@ -2982,7 +3135,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
   // the same shape), so handlers read fields off a loosely-typed bag.
   type A = Record<string, unknown>;
 
-  return [
+  const defs: PanelToolDef[] = [
     def(
       "panel_query_graph",
       "FILTER or TRAVERSE a SUBSET of the live canvas, for when you ALREADY KNOW what you're looking for. NOT for 'show me the canvas' or any whole-graph overview — call panel_graph_outline FIRST for that. NOT query_workflow (that queries a saved file or JSON you provide, not the live canvas). Filters, traverses, projects and aggregates over the workflow the user is CURRENTLY VIEWING without dumping the whole graph (replaces the old panel_get_graph full-JSON dump; output is TOKEN-BOUNDED with an explicit truncation marker, so a big graph can never flood your context). Combine: `types` (node type contains any), `title` (contains), `where` widget predicates ANDed ('cfg>7', 'steps<=20', 'sampler_name=euler', 'text~sunset' — ops = != >= <= > < ~contains), `ids` (exact nodes — THE way to read ONE node's exact slot/widget detail: {ids:[42], fields:'detail'}), `upstream_of`/`downstream_of` + `depth` (dependency traversal: upstream = what FEEDS that node, downstream = what CONSUMES it; seed at depth 0), `fields` ('compact' one line per node [default], 'ids', 'detail' = the full node summary with slots + connections + mode), `group_by:'type'` (counts only), `limit` (default 40). detail rows include each node's MODE — a 'bypass' node is skipped and a 'mute' node kills everything downstream, so check modes on the path you care about before running (fix with panel_set_node_mode). Every result also carries `groups` (id, title, member node_ids — groups are geometric, trust this list) and, when viewing a SUBGRAPH (after panel_enter_subgraph), `rails` (boundary rail ids/slots). Typical flow: panel_graph_outline to orient → panel_query_graph to pinpoint/inspect → edit. Read-only.",
@@ -4728,6 +4881,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // whatever tab is visible (codex — graph_* must carry the pin).
           const target = ctx.workflowTarget?.get(ctx.tabId);
           const cmd = withWorkflowTarget(
+            // #694: panel_screenshot is view-only — OUTSIDE the retry map — so it
+            // never carries the token (a ledger answer for a read is a STALE
+            // outcome), and the withRetryToken wrapper can't reach this direct send.
             { cmd: "graph_screenshot", padding: args.padding },
             target ?? { mode: "current" },
           );
@@ -5408,6 +5564,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       },
     ),
   ];
+  // #694: every MUTATING panel tool (RETRY_TOKEN_CMD_BY_TOOL) accepts the explicit
+  // retry token in its schema and forwards it, untouched, on its command frames.
+  return defs.map((d) => (d.name in RETRY_TOKEN_CMD_BY_TOOL ? withRetryToken(d) : d));
 }
 
 /**

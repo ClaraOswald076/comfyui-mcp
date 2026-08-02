@@ -261,7 +261,7 @@ describe("panel-tools: panel_set_node_mode (bypass/mute/active)", () => {
 
   it("exposes a node_id + mode enum schema (+ optional force) with exactly active/bypass/mute", () => {
     const def = defByName("panel_set_node_mode");
-    expect(Object.keys(def.schema).sort()).toEqual(["force", "mode", "node_id"]);
+    expect(Object.keys(def.schema).sort()).toEqual(["force", "mode", "node_id", "retry_of"]);
     // The mode enum must match the executor contract EXACTLY.
     const mode = def.schema.mode as { options: string[] };
     expect([...mode.options].sort()).toEqual(["active", "bypass", "mute"]);
@@ -315,6 +315,7 @@ describe("panel-tools: panel_edit_node (#572 presentation consolidation)", () =>
       "pinned",
       "pos",
       "preset",
+      "retry_of",
       "shape",
       "size",
       "title",
@@ -429,7 +430,7 @@ describe("panel-tools: subgraph I/O (expose rails + unpack)", () => {
 
   it("panel_expose_subgraph_output exposes from_node_id + from_output + name schema", () => {
     const def = defByName("panel_expose_subgraph_output");
-    expect(Object.keys(def.schema).sort()).toEqual(["from_node_id", "from_output", "name"]);
+    expect(Object.keys(def.schema).sort()).toEqual(["from_node_id", "from_output", "name", "retry_of"]);
     // from_node_id is an int like the other per-node tools.
     const fromNode = def.schema.from_node_id as { safeParse: (v: unknown) => { success: boolean } };
     expect(fromNode.safeParse(3).success).toBe(true);
@@ -456,7 +457,7 @@ describe("panel-tools: subgraph I/O (expose rails + unpack)", () => {
 
   it("panel_expose_subgraph_input exposes to_node_id + to_input + name schema", () => {
     const def = defByName("panel_expose_subgraph_input");
-    expect(Object.keys(def.schema).sort()).toEqual(["name", "to_input", "to_node_id"]);
+    expect(Object.keys(def.schema).sort()).toEqual(["name", "retry_of", "to_input", "to_node_id"]);
     const toNode = def.schema.to_node_id as { safeParse: (v: unknown) => { success: boolean } };
     expect(toNode.safeParse(3).success).toBe(true);
     expect(toNode.safeParse("x").success).toBe(false);
@@ -480,7 +481,7 @@ describe("panel-tools: subgraph I/O (expose rails + unpack)", () => {
 
   it("panel_unpack_subgraph exposes a single node_id int schema", () => {
     const def = defByName("panel_unpack_subgraph");
-    expect(Object.keys(def.schema)).toEqual(["node_id"]);
+    expect(Object.keys(def.schema)).toEqual(["node_id", "retry_of"]);
     const nodeId = def.schema.node_id as { safeParse: (v: unknown) => { success: boolean } };
     expect(nodeId.safeParse(12).success).toBe(true);
     expect(nodeId.safeParse(1.5).success).toBe(false);
@@ -572,7 +573,7 @@ describe("panel-tools: transport parity", () => {
 describe("panel-tools: panel_run (run-to-node partial execution)", () => {
   it("exposes a batch_count + optional to_node_id schema", () => {
     const def = defByName("panel_run");
-    expect(Object.keys(def.schema).sort()).toEqual(["batch_count", "to_node_id"]);
+    expect(Object.keys(def.schema).sort()).toEqual(["batch_count", "retry_of", "to_node_id"]);
     // to_node_id is an optional int — accepts a node id, rejects non-numbers,
     // and (being optional) accepts undefined for a normal full run.
     const toNode = def.schema.to_node_id as {
@@ -803,6 +804,7 @@ describe("panel-tools: panel_auto_layout (one-shot canvas arrange)", () => {
       "groups",
       "mode",
       "node_ids",
+      "retry_of",
       "spacing",
     ]);
     // mode enum must match the engine contract exactly.
@@ -921,7 +923,7 @@ describe("panel-tools: panel_subgraph_group (wrap a group into a subgraph)", () 
   it("is registered and takes a string|number group ref", () => {
     expect(buildPanelToolDefs().map((d) => d.name)).toContain("panel_subgraph_group");
     const def = defByName("panel_subgraph_group");
-    expect(Object.keys(def.schema)).toEqual(["group"]);
+    expect(Object.keys(def.schema)).toEqual(["group", "retry_of"]);
     const group = def.schema.group as { safeParse: (v: unknown) => { success: boolean } };
     expect(group.safeParse("REPLACEMENT MODE").success).toBe(true);
     expect(group.safeParse(3).success).toBe(true);
