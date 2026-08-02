@@ -2593,4 +2593,197 @@ describe("UiBridge (mutation retry dedupe — #517)", () => {
     await expect(promise).resolves.toMatchObject({ errors: [] });
     a2.close();
   });
+
+  // Gate finding 1 — the fingerprint must match the frame's ACTUAL JSON wire
+  // semantics: a key JSON drops (undefined value) is absent from the frame and
+  // must not differentiate the fingerprint, while an explicit null IS on the
+  // wire and must stay distinct (a different command, never an rid adoption).
+  it("fingerprint follows JSON wire semantics: undefined ≡ missing key, explicit null stays distinct", async () => {
+    const sock = await connectPanel("tab-dedupe-8");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-dedupe-8")).toBe(true));
+    const frames = collectFrames(sock);
+    // Attempt 1 carries an undefined-valued arg — JSON.stringify DROPS it from the
+    // frame, so the wire command is exactly {cmd, type}.
+    await expect(
+      bridge.send(
+        { cmd: "graph_add_node", type: "KSampler", extra: undefined },
+        { tabId: "tab-dedupe-8", timeoutMs: 60 },
+      ),
+    ).rejects.toThrow(/did not reply/);
+    const rid1 = frames[0].rid as string;
+    expect(frames[0]).not.toHaveProperty("extra"); // confirm the key never hit the wire
+    // The retry WITHOUT the key sends the SAME frame → it must correlate.
+    const retry = bridge.send(
+      { cmd: "graph_add_node", type: "KSampler" },
+      { tabId: "tab-dedupe-8", timeoutMs: 2000 },
+    );
+    await vi.waitFor(() => expect(frames).toHaveLength(2));
+    expect(frames[1].rid).toBe(rid1);
+    sock.send(JSON.stringify({ rid: rid1, ok: true, result: { node_id: 1 } }));
+    await expect(retry).resolves.toMatchObject({ node_id: 1 });
+    // Now an attempt whose arg is EXPLICITLY null times out — a DIFFERENT wire
+    // frame ({…, "extra":null}) than the missing-key command above.
+    await expect(
+      bridge.send(
+        { cmd: "graph_add_node", type: "KSampler", extra: null },
+        { tabId: "tab-dedupe-8", timeoutMs: 60 },
+      ),
+    ).rejects.toThrow(/did not reply/);
+    const ridNull = frames[2].rid as string;
+    // A missing-key retry must NOT adopt the null-command's rid (and vice versa
+    // would be just as wrong): distinct command → fresh rid → own dispatch.
+    const missingRetry = bridge.send(
+      { cmd: "graph_add_node", type: "KSampler" },
+      { tabId: "tab-dedupe-8", timeoutMs: 2000 },
+    );
+    await vi.waitFor(() => expect(frames).toHaveLength(4));
+    expect(frames[3].rid).not.toBe(ridNull);
+    sock.send(JSON.stringify({ rid: frames[3].rid, ok: true, result: { node_id: 2 } }));
+    await expect(missingRetry).resolves.toMatchObject({ node_id: 2 });
+    sock.close();
+  });
+
+  // Gate finding 2 — overlapping retries of one timed-out mutation must not
+  // overwrite each other's sole `pending` slot: the later one waits for the
+  // in-flight attempt's terminal state and shares it (never a wrong resolve).
+  it("overlapping retries of one timed-out mutation SHARE the in-flight attempt — one frame, both resolve", async () => {
+    const sock = await connectPanel("tab-dedupe-9");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-dedupe-9")).toBe(true));
+    const frames = collectFrames(sock);
+    const cmd = { cmd: "graph_add_node", type: "KSampler" };
+    await expect(
+      bridge.send(cmd, { tabId: "tab-dedupe-9", timeoutMs: 60 }),
+    ).rejects.toThrow(/did not reply/);
+    const rid1 = frames[0].rid as string;
+    // Retry A adopts rid1 and stays in flight; retry B arrives while A is pending.
+    const retryA = bridge.send(cmd, { tabId: "tab-dedupe-9", timeoutMs: 5000 });
+    await vi.waitFor(() => expect(frames).toHaveLength(2));
+    const retryB = bridge.send(cmd, { tabId: "tab-dedupe-9", timeoutMs: 5000 });
+    // B must NOT dispatch a concurrent frame with the same rid (which would
+    // overwrite A's pending entry) — it shares A's outcome instead.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(frames).toHaveLength(2);
+    // The panel's single (deduped) reply resolves BOTH callers with the true
+    // outcome — never a wrong or displaced resolve.
+    sock.send(JSON.stringify({ rid: rid1, ok: true, result: { node_id: 3 } }));
+    await expect(retryA).resolves.toMatchObject({ node_id: 3 });
+    await expect(retryB).resolves.toMatchObject({ node_id: 3 });
+    sock.close();
+  });
+
+  it("a retry joining an in-flight retry that TIMES OUT shares the timeout; the next retry still adopts the rid", async () => {
+    const sock = await connectPanel("tab-dedupe-9b");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-dedupe-9b")).toBe(true));
+    const frames = collectFrames(sock);
+    const cmd = { cmd: "graph_add_node", type: "KSampler" };
+    await expect(
+      bridge.send(cmd, { tabId: "tab-dedupe-9b", timeoutMs: 60 }),
+    ).rejects.toThrow(/did not reply/);
+    const rid1 = frames[0].rid as string;
+    const retryA = bridge.send(cmd, { tabId: "tab-dedupe-9b", timeoutMs: 80 });
+    await vi.waitFor(() => expect(frames).toHaveLength(2));
+    const retryB = bridge.send(cmd, { tabId: "tab-dedupe-9b", timeoutMs: 5000 }); // joins A
+    // A times out again; B shares that terminal state honestly (no frame of its
+    // own, no fabricated success).
+    await expect(retryA).rejects.toThrow(/did not reply/);
+    await expect(retryB).rejects.toThrow(/did not reply/);
+    expect(frames).toHaveLength(2);
+    // A's timeout re-recorded the ambiguous outcome → retry C adopts rid1 and
+    // dispatches once more.
+    const retryC = bridge.send(cmd, { tabId: "tab-dedupe-9b", timeoutMs: 2000 });
+    await vi.waitFor(() => expect(frames).toHaveLength(3));
+    expect(frames[2].rid).toBe(rid1);
+    sock.send(JSON.stringify({ rid: rid1, ok: true, result: { node_id: 4 } }));
+    await expect(retryC).resolves.toMatchObject({ node_id: 4 });
+    sock.close();
+  });
+
+  // Gate finding 3 — TTL/capacity eviction must skip a record whose adopted
+  // retry is still in flight, or a later identical retry could mint a fresh rid
+  // and re-apply after the original applied-but-unacknowledged.
+  it("capacity eviction skips a record whose adopted retry is still in flight", async () => {
+    const sock = await connectPanel("tab-dedupe-10");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-dedupe-10")).toBe(true));
+    const frames = collectFrames(sock);
+    const cmd = { cmd: "graph_add_node", type: "FloodTarget" };
+    await expect(
+      bridge.send(cmd, { tabId: "tab-dedupe-10", timeoutMs: 60 }),
+    ).rejects.toThrow(/did not reply/);
+    const rid1 = frames[0].rid as string;
+    // The adopted retry A goes in flight and STAYS pending through the flood.
+    const retryA = bridge.send(cmd, { tabId: "tab-dedupe-10", timeoutMs: 10000 });
+    await vi.waitFor(() => expect(frames).toHaveLength(2));
+    // Flood the ledger past its 64-record capacity with DISTINCT timed-out
+    // mutations — X's record is the oldest and would be evicted first if the
+    // in-flight skip didn't protect it.
+    for (let i = 0; i < 70; i++) {
+      await expect(
+        bridge.send(
+          { cmd: "graph_add_node", type: `Flood${i}` },
+          { tabId: "tab-dedupe-10", timeoutMs: 15 },
+        ),
+      ).rejects.toThrow(/did not reply/);
+    }
+    expect(frames).toHaveLength(72);
+    // A later identical retry arriving while A is still pending must find the
+    // record intact and JOIN A — not mint a fresh rid and dispatch a second
+    // application.
+    const retryB = bridge.send(cmd, { tabId: "tab-dedupe-10", timeoutMs: 5000 });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(frames).toHaveLength(72); // no fresh-rid dispatch
+    sock.send(JSON.stringify({ rid: rid1, ok: true, result: { node_id: 11 } }));
+    await expect(retryA).resolves.toMatchObject({ node_id: 11 });
+    await expect(retryB).resolves.toMatchObject({ node_id: 11 });
+    sock.close();
+  }, 20000);
+
+  // Gate finding 4 — a proven same-workflow tab-id migration (tmp:→wf:) changes
+  // conn.tabId; the fingerprint must follow the migration-aware workflow
+  // identity (#570 tabStableIdentity), so the retry still correlates.
+  it("a proven same-workflow tab-id migration still correlates the retry onto the original rid", async () => {
+    const WF = "22222222-2222-4222-8222-222222222222";
+    // Mimic the orchestrator's tabStableIdentity: keyed under the CURRENT tab id,
+    // re-keyed (old key deleted) on a proven migration, uuid stable throughout.
+    const identities = new Map<string, string>([["tab-mig-old", WF]]);
+    bridge.setTabWorkflowUuidResolver((id) => identities.get(id));
+    const sock = await connectPanel("tab-mig-old");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-mig-old")).toBe(true));
+    const frames = collectFrames(sock);
+    await expect(
+      bridge.send(
+        { cmd: "graph_add_node", type: "KSampler" },
+        { tabId: "tab-mig-old", timeoutMs: 60 },
+      ),
+    ).rejects.toThrow(/did not reply/);
+    const rid1 = frames[0].rid as string;
+    // Same socket re-hellos under the workflow's deterministic id — a PROVEN
+    // same-workflow migration; the identity store is re-keyed to the new id.
+    sock.send(
+      JSON.stringify({
+        type: "hello",
+        tab_id: "wf:migrated.json",
+        title: "wf",
+        enforces_workflow_stamp: true,
+      }),
+    );
+    identities.delete("tab-mig-old");
+    identities.set("wf:migrated.json", WF);
+    await vi.waitFor(() =>
+      expect(bridge.tabs().some((t) => t.tab_id === "wf:migrated.json")).toBe(true),
+    );
+    // The retry — addressed to the NEW canonical id, as a rebound session would
+    // issue it — must adopt the original rid even though conn.tabId changed
+    // underneath it: the fingerprint follows the workflow identity, which
+    // survived the migration. (The #570 stamp gate passes: the identity store
+    // serves the uuid under the new id.)
+    const retry = bridge.send(
+      { cmd: "graph_add_node", type: "KSampler" },
+      { tabId: "wf:migrated.json", timeoutMs: 2000 },
+    );
+    await vi.waitFor(() => expect(frames).toHaveLength(2));
+    expect(frames[1].rid).toBe(rid1);
+    sock.send(JSON.stringify({ rid: rid1, ok: true, result: { node_id: 8 } }));
+    await expect(retry).resolves.toMatchObject({ node_id: 8 });
+    sock.close();
+  });
 });

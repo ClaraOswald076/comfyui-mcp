@@ -508,14 +508,23 @@ export interface BridgeCommand {
   [key: string]: unknown;
 }
 
-/** Deterministic serialization for fingerprinting a logical command (#517):
- *  object keys sorted recursively, so two calls carrying identical args in a
- *  different key order still correlate to the same fingerprint. */
+/** Deterministic serialization for fingerprinting a logical command (#517),
+ *  matching the frame's ACTUAL JSON wire semantics: an object key whose value
+ *  JSON.stringify would OMIT (undefined / function / symbol) is dropped — it never
+ *  reaches the panel, so it must not differentiate the fingerprint either — while
+ *  an explicit `null` stays DISTINCT from a missing key (it IS on the wire, and a
+ *  mutation carrying it is a different command that must never adopt the
+ *  missing-key command's rid). Object keys sorted recursively, so two calls
+ *  carrying identical args in a different key order still correlate. */
 function stableStringify(v: unknown): string {
-  if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "null";
+  if (v === null || typeof v !== "object") {
+    // In an ARRAY position JSON serializes undefined/function/symbol as null.
+    return JSON.stringify(v) ?? "null";
+  }
   if (Array.isArray(v)) return `[${v.map(stableStringify).join(",")}]`;
   const o = v as Record<string, unknown>;
   return `{${Object.keys(o)
+    .filter((k) => JSON.stringify(o[k]) !== undefined) // keys JSON would drop from the frame
     .sort()
     .map((k) => `${JSON.stringify(k)}:${stableStringify(o[k])}`)
     .join(",")}}`;
@@ -749,6 +758,21 @@ export class UiBridge {
   /** Cardinality cap (oldest-first eviction) so a flapping session can't grow the
    *  ledger without limit. */
   private static readonly TIMED_OUT_MUTATION_MAX = 64;
+  /** #517 — dedupeKey → the promise of an ADOPTED retry that is currently IN
+   *  FLIGHT. `pending` is a single slot per rid, so a second retry of the same
+   *  timed-out mutation arriving while the first adopted retry is still pending
+   *  must NOT dispatch a concurrent frame with the same rid: it would overwrite
+   *  the live `pending` entry, and the displaced attempt's timer could then delete
+   *  (and re-record) the LIVE retry — a real panel reply landing on the wrong
+   *  caller. Instead the later retry SHARES this promise (waits for the first's
+   *  terminal state and mirrors it) — exactly the panel ledger's in-flight rule
+   *  (#521: a duplicate delivery awaits the first execution and shares its
+   *  reply). A key's presence also VETOES TTL/capacity eviction of the timed-out
+   *  record: evicting it would let a later identical retry mint a fresh rid and
+   *  re-apply after the original applied-but-unacknowledged. Entries are removed
+   *  when the tracked promise settles (every dispatch path settles it), so this
+   *  can't leak; cleared on stop(). */
+  private inFlightMutationRetries = new Map<string, Promise<unknown>>();
   /** In-flight IDEMPOTENT reads whose socket dropped mid-command, parked per tabId
    *  waiting a bounded grace for that tab to reconnect so we can re-dispatch them
    *  (resume) instead of hard-failing. Never holds mutating commands. */
@@ -1614,29 +1638,44 @@ export class UiBridge {
     return e.result;
   }
 
-  /** #517 — canonical fingerprint of a logical command: the canonical tab id plus
-   *  the command with bridge-owned frame metadata (`rid`, `workflow_uuid` — both
-   *  stripped/overwritten at dispatch) excluded. Two sends of the same command with
-   *  identical args to the same tab produce the same key; any real difference (a
-   *  genuinely new command) produces a different one. Hashed so a command carrying
-   *  a large payload (e.g. an embedded workflow) doesn't turn into a giant map key. */
-  private commandDedupeKey(tabId: string, cmd: BridgeCommand): string {
+  /** #517 — canonical fingerprint of a logical command: a stable tab/workflow
+   *  IDENTITY (the migration-aware trusted workflow uuid when one resolves,
+   *  else the canonical tab id) plus the command with bridge-owned frame metadata
+   *  (`rid`, `workflow_uuid` — both stripped/overwritten at dispatch) excluded.
+   *  Two sends of the same command with identical args to the same workflow
+   *  produce the same key — across a proven tab-id migration too; any real
+   *  difference (a genuinely new command, or a different workflow after an
+   *  unproven switch) produces a different one. Hashed so a command carrying a
+   *  large payload (e.g. an embedded workflow) doesn't turn into a giant map key. */
+  private commandDedupeKey(identity: string, cmd: BridgeCommand): string {
     const args: Record<string, unknown> = { ...cmd };
     delete args.rid;
     delete args.workflow_uuid;
-    return createHash("sha256").update(tabId).update("\n").update(stableStringify(args)).digest("hex");
+    return createHash("sha256").update(identity).update("\n").update(stableStringify(args)).digest("hex");
   }
 
-  /** Drop expired timed-out-mutation records and cap the ledger oldest-first. */
+  /** Drop expired timed-out-mutation records and cap the ledger oldest-first.
+   *  Both TTL and capacity eviction SKIP a record whose adopted retry is still in
+   *  flight (#517): evicting it would let a later identical retry mint a fresh rid
+   *  and re-apply after the original applied-but-unacknowledged — the panel
+   *  ledger's in-flight rule (#521), mirrored bridge-side. */
   private pruneTimedOutMutations(): void {
     const now = Date.now();
     for (const [key, e] of this.timedOutMutations) {
+      if (this.inFlightMutationRetries.has(key)) continue; // in flight — never evict
       if (now - e.ts > UiBridge.TIMED_OUT_MUTATION_TTL_MS) this.timedOutMutations.delete(key);
     }
     while (this.timedOutMutations.size > UiBridge.TIMED_OUT_MUTATION_MAX) {
-      const oldest = this.timedOutMutations.keys().next().value;
-      if (oldest === undefined) break;
-      this.timedOutMutations.delete(oldest);
+      let evicted = false;
+      for (const key of this.timedOutMutations.keys()) {
+        if (this.inFlightMutationRetries.has(key)) continue; // in flight — never evict
+        this.timedOutMutations.delete(key);
+        evicted = true;
+        break;
+      }
+      // Every record is in flight — let the ledger exceed the cap temporarily
+      // rather than drop one of them.
+      if (!evicted) break;
     }
   }
 
@@ -2056,7 +2095,19 @@ export class UiBridge {
     let dedupeKey: string | undefined;
     let rid: string | undefined;
     if (mutating) {
-      dedupeKey = this.commandDedupeKey(conn.tabId, cmd);
+      // #517 gate — fingerprint the tab by its MIGRATION-AWARE workflow identity,
+      // not the raw mutable tabId: a proven same-workflow tab-id migration
+      // (tmp:<uuid> → wf:<hash>) changes conn.tabId, and keying on it would strand
+      // the ambiguous record under the old id — the retry would mint a fresh rid
+      // and double-apply. The trusted per-instance workflow uuid (#570,
+      // tabStableIdentity) is re-keyed to the CURRENT canonical tab id on a proven
+      // migration and is stable for the workflow's lifetime, so resolving it via
+      // the RESOLVED conn's id (not the caller's possibly-retired opts.tabId)
+      // yields the same identity before and after the migration; on an unproven
+      // switch the uuid CHANGES, correctly breaking correlation. Fall back to the
+      // tabId only when no workflow identity resolves (old panel / relay).
+      const identity = this.resolveTabWorkflowUuid?.(conn.tabId) ?? conn.tabId;
+      dedupeKey = this.commandDedupeKey(identity, cmd);
       this.pruneTimedOutMutations();
       const prior = this.timedOutMutations.get(dedupeKey);
       if (prior?.reply) {
@@ -2070,6 +2121,20 @@ export class UiBridge {
           : Promise.reject(new Error(prior.reply.error ?? "panel reported an error"));
       }
       if (prior) {
+        // #517 gate — a retry is ALREADY in flight for this exact timed-out
+        // mutation. `pending` is a single slot per rid: dispatching a concurrent
+        // frame with the same rid would overwrite the live entry and let the
+        // displaced timer delete/re-record it (a real reply landing on the wrong
+        // caller). Wait for the in-flight attempt's terminal state and SHARE it —
+        // the panel ledger's in-flight rule (#521), one hop earlier.
+        const inFlight = this.inFlightMutationRetries.get(dedupeKey);
+        if (inFlight) {
+          logger.info(
+            `[ui-bridge] retry of timed-out "${cmd.cmd}" (tab ${conn.tabId.slice(0, 8)}) joins the ` +
+              `retry already in flight — sharing its outcome, not dispatching a concurrent duplicate (#517)`,
+          );
+          return inFlight;
+        }
         // LRU touch — the command is still being retried within the window.
         this.timedOutMutations.delete(dedupeKey);
         prior.ts = Date.now();
@@ -2081,7 +2146,7 @@ export class UiBridge {
         );
       }
     }
-    return new Promise((resolve, reject) => {
+    const attempt = new Promise((resolve, reject) => {
       const ctx: SendCtx = {
         resolve,
         reject,
@@ -2103,6 +2168,19 @@ export class UiBridge {
       };
       this.dispatch(conn, ctx);
     });
+    if (rid !== undefined && dedupeKey !== undefined) {
+      // Track the ADOPTED retry while it is in flight so an overlapping retry of
+      // the same mutation shares it (above) and TTL/capacity eviction skips its
+      // record. Removed on settlement — every dispatch path settles the promise.
+      this.inFlightMutationRetries.set(dedupeKey, attempt);
+      const settled = () => {
+        if (this.inFlightMutationRetries.get(dedupeKey) === attempt) {
+          this.inFlightMutationRetries.delete(dedupeKey);
+        }
+      };
+      attempt.then(settled, settled);
+    }
+    return attempt;
   }
 
   /** Write one attempt of a command to a live socket and arm its reply timer.
@@ -2129,9 +2207,12 @@ export class UiBridge {
     }
     const replyTimeoutMs = Math.min(ctx.timeoutMs, remaining);
     // #517 — the rid is STABLE across attempts of this logical command (minted
-    // once in send(), reused on every re-dispatch). Only one attempt is ever in
-    // `pending` at a time: a resume/re-dispatch happens strictly after the prior
-    // attempt's entry was removed (reply timer fired or the socket died).
+    // once in send(), reused on every re-dispatch). Only one attempt of a rid is
+    // ever in `pending` at a time: a resume/re-dispatch happens strictly after the
+    // prior attempt's entry was removed (reply timer fired or the socket died),
+    // and send() SERIALIZES overlapping retries of a timed-out mutation (the
+    // later one shares the in-flight attempt's outcome rather than dispatching a
+    // concurrent frame that would overwrite this slot).
     const rid = ctx.rid;
     // Track an ask_user card's stable ask_id against this attempt's rid so a reply
     // that validates AFTER the reply timer fires (and drops out of `pending`) can
@@ -2467,6 +2548,7 @@ export class UiBridge {
       this.awaitingReconnect.delete(tabId);
     }
     this.timedOutMutations.clear();
+    this.inFlightMutationRetries.clear();
     for (const conn of this.conns.values()) {
       try {
         conn.sock.close();
