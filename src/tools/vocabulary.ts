@@ -523,3 +523,42 @@ export const DEAD_NAMES: readonly DeadName[] = [
     ],
   },
 ];
+
+/**
+ * deadNameRe's contract anchored to the WHOLE string — it answers "is this
+ * exact name retired?", the question call_tool has to answer when a client
+ * invokes a name that no longer exists (#659), where deadNameRe answers "does
+ * this prose mention one?".
+ *
+ * The `mcp__<server>__` prefix rides along because that is the form names take
+ * in MCP clients that namespace tools, so `apps_list` and
+ * `mcp__comfyui__apps_list` resolve to the same entry. Anchoring is the safety
+ * property: a merely-similar name (`apps_list_v2`, `my_apps_list`) returns
+ * undefined and falls through to the fuzzy unknown-tool path, so a ledger entry
+ * can never shadow the suggestions for a partial name.
+ */
+export function findDeadName(name: string): DeadName | undefined {
+  return DEAD_NAMES.find((d) => {
+    const escaped = d.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`^(?:mcp__[A-Za-z0-9_]+__)?${escaped}$`).test(name);
+  });
+}
+
+/**
+ * The error a caller gets for invoking a RETIRED name: which version removed it
+ * and what to call instead, straight from the ledger — turning every
+ * consolidation from a silent break into a self-explaining one (#659). Undefined
+ * for names the ledger does not know, so callers fall through to their ordinary
+ * unknown-tool handling.
+ *
+ * `since` is usually a bare version ("0.49.0") but the pre-baseline entries carry
+ * a clause ("removed upstream before 0.48.0"), so only the version form is
+ * conjugated — "removed in ${since}" would mangle the clause into "removed in
+ * removed upstream before 0.48.0".
+ */
+export function retiredToolMessage(name: string): string | undefined {
+  const dead = findDeadName(name);
+  if (!dead) return undefined;
+  const removed = dead.since.startsWith("removed") ? dead.since : `removed in ${dead.since}`;
+  return `Unknown tool '${name}' — ${removed}. Call ${dead.replacement} instead.`;
+}

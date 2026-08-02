@@ -104,6 +104,11 @@ const SELF = new Set([
   "src/__tests__/tools/node-snapshots-tool.test.ts",
   "src/__tests__/tools/batches.test.ts",
   "src/__tests__/tools/apps.test.ts",
+  // Same, for the #659 retired-name error: these pass dead names to call_tool /
+  // the ollama dispatch as FIXTURES and assert the error quotes the ledger's
+  // replacement — the names are call arguments under test, not live guidance.
+  "src/__tests__/tools/compact.test.ts",
+  "src/__tests__/orchestrator/ollama-backend.test.ts",
   // Generated FROM the ledger by scripts/export-vocabulary.mts, so it reproduces
   // the dead names as data for the panel to consume. Caught this gate out a second
   // time, in the same way as the first: green while untracked, red once committed.

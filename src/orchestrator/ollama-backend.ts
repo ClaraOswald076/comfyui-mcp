@@ -29,6 +29,7 @@ import type { ImageRef } from "./panel-agent.js";
 import { OLLAMA_CAPABILITIES } from "./agent-backend.js";
 import type { GeminiMcpServerSpec } from "./gemini-backend.js";
 import { resolvePrompt } from "../services/prompt-overrides.js";
+import { retiredToolMessage } from "../tools/vocabulary.js";
 
 type McpToolInfo = { name: string; description?: string; inputSchema?: unknown };
 type McpCallResult = { isError?: boolean; content?: Array<{ type: string; text?: string }> };
@@ -512,6 +513,12 @@ export class OllamaBackend implements AgentBackend {
         const res = await this.comfy.callTool({ name: "call_tool", arguments: { name, args } });
         return { text: textOf(res), isError: !!res.isError };
       }
+      // Same retired-name courtesy as the compact server's call_tool (#659):
+      // with no call_tool meta to delegate to, this fallback is the last word
+      // the model gets, so a ledger name must name its replacement rather than
+      // drown in the full Available list.
+      const retired = retiredToolMessage(name);
+      if (retired) return { text: retired, isError: true };
       const known = [...this.comfyTools.map((t) => t.name), "panel_list_tools", "panel_describe_tool", "panel_call_tool"];
       return { text: `Unknown tool '${name}'. Available: ${known.join(", ")}.`, isError: true };
     } catch (err) {

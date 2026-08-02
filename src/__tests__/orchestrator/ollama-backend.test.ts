@@ -343,6 +343,25 @@ describe("OllamaBackend", () => {
     expect(events.filter((e) => e.type === "result")).toEqual([{ type: "result", ok: true, usage: expect.anything() }]);
   });
 
+  it("a retired comfy tool name gets the ledger's specific error, not the bare Available list (#659)", async () => {
+    // No call_tool meta on the comfy client, so the forgiving direct dispatch
+    // falls through to the backend's own unknown-tool fallback — the path that
+    // used to answer with the full Available list.
+    const { client } = fakeMcpClient([{ name: "get_queue", description: "x" }]);
+    const backend = new OllamaBackend({ model: "gemma4:e4b", connectToolClients: async () => ({ comfyui: client }) });
+    chatScript.push(
+      [{ message: { content: "", tool_calls: [{ function: { name: "apps_list", arguments: {} } }] }, done: true }],
+      [{ message: { content: "done" }, done: true }],
+    );
+
+    await collect(backend, turnsOf({ text: "list my apps" }));
+    const toolMsg = chatRequests[1].messages.find((m) => m.role === "tool");
+    const content = String(toolMsg?.content);
+    expect(content).toContain("removed in 0.49.0");
+    expect(content).toContain('apps (action:"list")');
+    expect(content).not.toContain("Available:");
+  });
+
   it("synthesizes panel meta-tools over the panel MCP client", async () => {
     const { client: comfy } = fakeMcpClient(COMFY_META);
     const { client: panel, callTool: panelCall } = fakeMcpClient([
