@@ -536,12 +536,30 @@ function stableStringify(v: unknown, key = ""): string {
     // In an ARRAY position JSON serializes undefined/function/symbol as null.
     return JSON.stringify(v) ?? "null";
   }
-  if (Array.isArray(v)) return `[${v.map((e, i) => stableStringify(e, String(i))).join(",")}]`;
+  if (Array.isArray(v)) {
+    // .map skips HOLES; the wire writes them as null. Array.from visits them
+    // (as undefined → "null" above), so [] and [<hole>] can never collide.
+    return `[${Array.from(v, (e, i) => stableStringify(e, String(i))).join(",")}]`;
+  }
   const o = v as Record<string, unknown>;
   return `{${Object.keys(o)
-    .filter((k) => JSON.stringify(o[k]) !== undefined) // keys JSON would drop from the frame
-    .sort()
-    .map((k) => `${JSON.stringify(k)}:${stableStringify(o[k], k)}`)
+    .map((k) => {
+      // Apply toJSON with THIS property key before testing omission: the frame
+      // does the same, so a key-sensitive toJSON can't make distinct wire
+      // commands fingerprint alike (#517 gate).
+      let val = o[k];
+      if (val !== null && (typeof val === "object" || typeof val === "bigint")) {
+        const toJSON = (val as { toJSON?: unknown }).toJSON;
+        if (typeof toJSON === "function") {
+          val = (toJSON as (this: unknown, k2: string) => unknown).call(val, k);
+        }
+      }
+      return [k, val] as const;
+    })
+    // JSON omits object properties whose value is undefined/function/symbol.
+    .filter(([, val]) => val !== undefined && typeof val !== "function" && typeof val !== "symbol")
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([k, val]) => `${JSON.stringify(k)}:${stableStringify(val, k)}`)
     .join(",")}}`;
 }
 
@@ -2126,7 +2144,11 @@ export class UiBridge {
       this.pruneTimedOutMutations();
       const prior = this.timedOutMutations.get(dedupeKey);
       if (prior?.reply) {
-        this.timedOutMutations.delete(dedupeKey);
+        // Do NOT delete the record here: a simultaneous identical retry arriving
+        // after a delete would find nothing, mint a fresh rid, and re-execute an
+        // already-applied mutation (#517 gate). The buffered reply stays
+        // answerable until TTL/capacity prunes it — every later identical retry
+        // inside the window learns the same truthful "applied after timeout".
         logger.info(
           `[ui-bridge] answering the retry of "${cmd.cmd}" (tab ${conn.tabId.slice(0, 8)}) with the ` +
             `late reply of its original dispatch — applied after timeout, NOT re-executed (#517)`,
@@ -2309,7 +2331,11 @@ export class UiBridge {
       // (ctx.workflowUuid), and STRIP any caller-supplied value entirely when we have no trusted
       // one — an identity-less tab / old panel ships unstamped (mutations are already refused by
       // the requiresWorkflowStampEnforcement gate above; reads execute, reply still server-fenced).
-      const frame: Record<string, unknown> = { rid, ...cmd };
+      // rid is BRIDGE-OWNED for the same reason workflow_uuid is (below): a
+      // caller-supplied rid on retry would replace the ledger/pending ctx.rid,
+      // bypass the panel's dedupe, and allow a double-apply (#517 gate). Spread
+      // first so the trusted rid always wins over anything cmd carries.
+      const frame: Record<string, unknown> = { ...cmd, rid };
       if (ctx.workflowUuid) frame.workflow_uuid = ctx.workflowUuid;
       else delete frame.workflow_uuid;
       conn.sock.send(JSON.stringify(frame));

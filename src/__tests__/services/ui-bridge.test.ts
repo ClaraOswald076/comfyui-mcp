@@ -2832,4 +2832,79 @@ describe("UiBridge (mutation retry dedupe — #517)", () => {
     await expect(retryA).resolves.toMatchObject({ node_id: 20 });
     sock.close();
   });
+
+  it("a sparse array NEVER collides with its dense prefix (holes are null on the wire)", async () => {
+    const sock = await connectPanel("tab-dedupe-12");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-dedupe-12")).toBe(true));
+    const frames = collectFrames(sock);
+    const sparse = [1, , 3]; // eslint-disable-line no-sparse-arrays
+    await expect(
+      bridge.send(
+        { cmd: "graph_add_node", type: "KSampler", inputs: sparse },
+        { tabId: "tab-dedupe-12", timeoutMs: 60 },
+      ),
+    ).rejects.toThrow(/did not reply/);
+    expect(JSON.parse(JSON.stringify({ inputs: sparse })).inputs).toEqual([1, null, 3]);
+    // [1] differs from [1, null, 3] on the wire — a dense-prefix retry must be
+    // a DIFFERENT command: fresh rid, its own dispatch.
+    const dense = bridge.send(
+      { cmd: "graph_add_node", type: "KSampler", inputs: [1] },
+      { tabId: "tab-dedupe-12", timeoutMs: 2000 },
+    );
+    await vi.waitFor(() => expect(frames).toHaveLength(2));
+    expect(frames[1].rid).not.toBe(frames[0].rid);
+    sock.send(JSON.stringify({ rid: frames[1].rid, ok: true, result: { node_id: 22 } }));
+    await expect(dense).resolves.toMatchObject({ node_id: 22 });
+    sock.close();
+  });
+
+  it("a caller-supplied rid can NEVER override the frame's rid (dedupe can't be bypassed)", async () => {
+    const sock = await connectPanel("tab-dedupe-13");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-dedupe-13")).toBe(true));
+    const frames = collectFrames(sock);
+    const send = bridge.send(
+      { cmd: "graph_add_node", type: "KSampler", rid: "caller-forged-rid" },
+      { tabId: "tab-dedupe-13", timeoutMs: 2000 },
+    );
+    await vi.waitFor(() => expect(frames).toHaveLength(1));
+    expect(frames[0].rid).not.toBe("caller-forged-rid");
+    sock.send(JSON.stringify({ rid: frames[0].rid, ok: true, result: { node_id: 23 } }));
+    await expect(send).resolves.toMatchObject({ node_id: 23 });
+    sock.close();
+  });
+
+  it("a consumed late reply keeps answering later identical retries (no re-dispatch)", async () => {
+    const sock = await connectPanel("tab-dedupe-14");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-dedupe-14")).toBe(true));
+    const frames = collectFrames(sock);
+    await expect(
+      bridge.send(
+        { cmd: "graph_add_node", type: "KSampler", seed: 7 },
+        { tabId: "tab-dedupe-14", timeoutMs: 60 },
+      ),
+    ).rejects.toThrow(/did not reply/);
+    const ridA = frames[0].rid as string;
+    // The original's late reply lands.
+    sock.send(JSON.stringify({ rid: ridA, ok: true, result: { node_id: 24 } }));
+    // Let the bridge's reply handler buffer it before any retry fires.
+    await new Promise((r) => setTimeout(r, 25));
+    expect(frames).toHaveLength(1); // nothing re-sent
+    // First retry: answered from the buffer, no new frame.
+    await expect(
+      bridge.send(
+        { cmd: "graph_add_node", type: "KSampler", seed: 7 },
+        { tabId: "tab-dedupe-14", timeoutMs: 2000 },
+      ),
+    ).resolves.toMatchObject({ node_id: 24 });
+    // Second identical retry: STILL answered from the buffer — a consumed
+    // record must never free a fresh dispatch of an already-applied mutation.
+    await expect(
+      bridge.send(
+        { cmd: "graph_add_node", type: "KSampler", seed: 7 },
+        { tabId: "tab-dedupe-14", timeoutMs: 2000 },
+      ),
+    ).resolves.toMatchObject({ node_id: 24 });
+    expect(frames).toHaveLength(1);
+    sock.close();
+  });
 });
