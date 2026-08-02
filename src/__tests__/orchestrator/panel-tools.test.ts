@@ -315,6 +315,7 @@ describe("panel-tools: panel_edit_node (#572 presentation consolidation)", () =>
       "pinned",
       "pos",
       "preset",
+      "retry_of",
       "shape",
       "size",
       "title",
