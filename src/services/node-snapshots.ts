@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { config, getComfyUIBaseUrl } from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
+import { withPanelPinGuard } from "./panel-pin-guard.js";
 import { NodeSnapshotError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 
@@ -298,30 +299,40 @@ export async function restoreNodeSnapshot(
     throw new NodeSnapshotError("Snapshot name is required to restore.");
   }
 
-  // The Manager stores names without the .json suffix; tolerate either.
-  const target = trimmed.endsWith(".json") ? trimmed.slice(0, -5) : trimmed;
+  // PIN GUARD. A snapshot records every pack's commit and restoring reverts them
+  // ALL, so this moves the sidebar panel exactly like an "update all" would —
+  // another door that never passes through install_panel. It is inherently bulk
+  // (there is no restore-everything-except-one-pack), so a pin refuses it
+  // outright and the message explains the two real options. The check and the
+  // restore request are atomic under the panel mutation lock (withPanelPinGuard);
+  // the Manager then applies the restore on its own schedule (the message below
+  // says "requested", never "restored").
+  return withPanelPinGuard("restore a node snapshot over", "all", async () => {
+    // The Manager stores names without the .json suffix; tolerate either.
+    const target = trimmed.endsWith(".json") ? trimmed.slice(0, -5) : trimmed;
 
-  try {
-    await managerFetch("/snapshot/restore", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ target }),
-    });
-  } catch (err) {
-    if (isSnapshotEndpointUnsupported(err)) {
-      logger.info("Snapshot restore unsupported on this ComfyUI-Manager build");
-      return { name: target, message: SNAPSHOTS_UNSUPPORTED_MESSAGE, unsupported: true };
+    try {
+      await managerFetch("/snapshot/restore", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ target }),
+      });
+    } catch (err) {
+      if (isSnapshotEndpointUnsupported(err)) {
+        logger.info("Snapshot restore unsupported on this ComfyUI-Manager build");
+        return { name: target, message: SNAPSHOTS_UNSUPPORTED_MESSAGE, unsupported: true };
+      }
+      throw err;
     }
-    throw err;
-  }
 
-  logger.info(`Requested restore of node snapshot "${target}"`);
-  return {
-    name: target,
-    message:
-      `Restore of snapshot "${target}" requested. ComfyUI-Manager applies ` +
-      `custom-node changes on the next ComfyUI restart.`,
-  };
+    logger.info(`Requested restore of node snapshot "${target}"`);
+    return {
+      name: target,
+      message:
+        `Restore of snapshot "${target}" requested. ComfyUI-Manager applies ` +
+        `custom-node changes on the next ComfyUI restart.`,
+    };
+  });
 }
 
 /**

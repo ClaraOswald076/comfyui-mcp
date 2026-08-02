@@ -7,7 +7,7 @@ import { resolveInstallInterpreter } from "./workspace-env.js";
 import { queueUpdateAllCustomNodes } from "./node-management.js";
 import { ProcessControlError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
-import { assertPanelPinAllows } from "./panel-pin-guard.js";
+import { withPanelPinGuard } from "./panel-pin-guard.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -209,21 +209,26 @@ export async function updateComfyUICore(): Promise<UpdateCoreResult> {
 export async function updateAllCustomNodes(): Promise<UpdateNodesResult> {
   // PIN GUARD — "update everything" includes the sidebar panel pack, so this is
   // one of the doors into a pinned panel that does NOT pass through
-  // install_panel/runPanelAction. See panel-pin-guard.ts.
-  assertPanelPinAllows("update", "all");
+  // install_panel/runPanelAction. See panel-pin-guard.ts. The pin check AND the
+  // queue/start calls run inside the panel mutation lock, so a pin cannot be
+  // written between them (the pin-write path takes the same lock). The Manager
+  // then drains the queue ASYNCHRONOUSLY — outside anything this process can
+  // serialize — which is exactly why the result below reports "queued", never
+  // "updated".
+  return withPanelPinGuard("update", "all", async () => {
+    const result = await queueUpdateAllCustomNodes();
 
-  const result = await queueUpdateAllCustomNodes();
-
-  return {
-    updated: true,
-    endpoint: result.endpoint,
-    queue_started: result.queueStarted,
-    manager_response: result.managerResponse,
-    message: result.queueStarted
+    return {
+      updated: true,
+      endpoint: result.endpoint,
+      queue_started: result.queueStarted,
+      manager_response: result.managerResponse,
+      message: result.queueStarted
         ? "Queued updates for all custom nodes via ComfyUI-Manager and started the queue worker. " +
-          "Completion is unverified; the sidebar panel may still change later."
-      : "Queued updates for all custom nodes via ComfyUI-Manager. " +
-        "Could not confirm the queue worker started — check ComfyUI-Manager.",
-  };
+          "Updates run asynchronously; a ComfyUI restart may be required afterward."
+        : "Queued updates for all custom nodes via ComfyUI-Manager. " +
+          "Could not confirm the queue worker started — check ComfyUI-Manager.",
+    };
+  });
 }
 

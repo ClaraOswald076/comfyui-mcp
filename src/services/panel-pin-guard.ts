@@ -401,3 +401,32 @@ export function withPanelMutationLock<T>(
   );
   return started;
 }
+
+/**
+ * Run a panel-moving mutation atomically with its pin check.
+ *
+ * assertPanelPinAllows alone is a TOCTOU race: the check passes, and THEN a pin
+ * can be written before/while the ComfyUI-Manager operation runs (an update_all
+ * drain takes seconds), so the update lands on a by-then-pinned panel. The pin
+ * WRITE path takes this same lock, so checking inside it and holding it across
+ * the whole mutation means a pin either lands before the op starts (and blocks
+ * it) or after it finishes (and blocks the next one) — never in the middle.
+ *
+ * Targets that cannot move the panel skip the lock entirely: there is no pin
+ * decision to make for them, and serializing every unrelated pack mutation
+ * behind panel ops would be pointless contention.
+ *
+ * Re-entrant via withPanelMutationLock: runPanelAction already holds the lock
+ * when it calls the guarded node-management mutations, so nesting is immediate.
+ */
+export function withPanelPinGuard<T>(
+  action: string,
+  id: string,
+  op: () => Promise<T>,
+): Promise<T> {
+  if (!targetsPanelPack(id)) return op();
+  return withPanelMutationLock(() => {
+    assertPanelPinAllows(action, id);
+    return op();
+  });
+}

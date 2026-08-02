@@ -33,9 +33,18 @@ vi.mock("../../config.js", () => {
 
 // Any Manager traffic at all means the guard let the mutation through.
 const managerCalls: string[] = [];
+// Test-controlled gates on the stubbed Manager. `managerGate` parks a call
+// mid-flight, so a mutation can be held BETWEEN its pin check and completion;
+// `managerFailAfterGate` then fails every later call fast, so the parked op
+// settles immediately instead of wandering the queue-dialect probes on the
+// stub "{}" responses.
+let managerGate: Promise<void> | null = null;
+let managerFailAfterGate = false;
 vi.mock("../../comfyui/fetch.js", () => ({
   comfyuiFetch: vi.fn(async (path: string) => {
     managerCalls.push(path);
+    if (managerGate) await managerGate;
+    if (managerFailAfterGate) throw new Error("test: Manager went away");
     return new Response("{}", { status: 200 });
   }),
 }));
@@ -47,13 +56,23 @@ import {
   updateCustomNode,
 } from "../../services/node-management.js";
 import { updateAllCustomNodes } from "../../services/update-comfyui.js";
-import { PanelPinnedError } from "../../services/panel-pin-guard.js";
-import { PANEL_PIN_ENV_VAR, setPanelVersionPin } from "../../services/panel-settings.js";
+import { restoreNodeSnapshot } from "../../services/node-snapshots.js";
+import {
+  PanelPinnedError,
+  withPanelMutationLock,
+} from "../../services/panel-pin-guard.js";
+import {
+  getPanelPinState,
+  PANEL_PIN_ENV_VAR,
+  setPanelVersionPin,
+} from "../../services/panel-settings.js";
 
 let dir: string;
 
 beforeEach(() => {
   managerCalls.length = 0;
+  managerGate = null;
+  managerFailAfterGate = false;
   dir = mkdtempSync(join(tmpdir(), "cmcp-bypass-"));
   process.env.COMFYUI_MCP_PANEL_SETTINGS = join(dir, "panel-settings.json");
   process.env.COMFYUI_MCP_PANEL_LOCK = join(dir, "panel-op.lock");
@@ -149,5 +168,83 @@ describe("generic node mutations cannot walk past the panel pin", () => {
     // No longer refused by the pin; it now reaches the Manager path.
     await updateCustomNode({ id: "all" }).catch(() => undefined);
     expect(managerCalls.length).toBeGreaterThan(0);
+  });
+});
+
+describe("a pin written MID-mutation cannot slice through it", () => {
+  it("a bulk update holds the mutation lock across check + act, so the pin write waits", async () => {
+    // Park the update BETWEEN its pin check and completion: the first Manager
+    // request only fires once the check has passed, so an observed request
+    // means the update is inside the critical window the race used to exploit.
+    let releaseManager!: () => void;
+    managerGate = new Promise<void>((resolve) => {
+      releaseManager = resolve;
+    });
+
+    const update = updateCustomNode({ id: "all" });
+    await vi.waitFor(() => expect(managerCalls.length).toBeGreaterThan(0));
+
+    // Commit a pin exactly the way install_panel(action='pin') does — through
+    // the shared mutation lock.
+    let pinCommitted = false;
+    const pinWrite = withPanelMutationLock(async () => {
+      setPanelVersionPin("0.11.3");
+      pinCommitted = true;
+    });
+
+    // Give the pin write every chance to run. It must NOT land: the update
+    // holds the lock across check + act, so a pin commits before an op starts
+    // (and blocks it) or after it finishes — never in the middle. Before the
+    // fix, the pin committed right here and the in-flight update went on to
+    // move a by-then-pinned panel.
+    await new Promise((r) => setTimeout(r, 250));
+    expect(pinCommitted).toBe(false);
+    expect(getPanelPinState().pinned).toBe(false);
+
+    // Let the update settle (the stub is not a real Manager — fail it fast so
+    // it ends immediately), then the pin commits and governs the NEXT op.
+    managerFailAfterGate = true;
+    releaseManager();
+    await update.catch(() => undefined);
+    await pinWrite;
+    expect(pinCommitted).toBe(true);
+    await expect(updateCustomNode({ id: "all" })).rejects.toThrow(PanelPinnedError);
+  });
+
+  it("update_all holds the lock across queue + start, and still only reports 'queued'", async () => {
+    let releaseManager!: () => void;
+    managerGate = new Promise<void>((resolve) => {
+      releaseManager = resolve;
+    });
+
+    const update = updateAllCustomNodes();
+    await vi.waitFor(() => expect(managerCalls.length).toBeGreaterThan(0));
+
+    let pinCommitted = false;
+    const pinWrite = withPanelMutationLock(async () => {
+      setPanelVersionPin("0.11.3");
+      pinCommitted = true;
+    });
+
+    await new Promise((r) => setTimeout(r, 250));
+    expect(pinCommitted).toBe(false);
+    expect(getPanelPinState().pinned).toBe(false);
+
+    // update_all is fire-and-forget by design: the lock covers the pin check +
+    // queue + worker start; the Manager-side drain afterwards is outside any
+    // process's control, which is exactly why the result must keep saying
+    // "queued" and never claim the updates landed.
+    releaseManager();
+    const result = await update;
+    await pinWrite;
+    expect(pinCommitted).toBe(true);
+    expect(result.message).toMatch(/[Qq]ueued/);
+    await expect(updateAllCustomNodes()).rejects.toThrow(PanelPinnedError);
+  });
+
+  it("restore_node_snapshot REFUSES while pinned — the snapshot door", async () => {
+    setPanelVersionPin("0.11.3");
+    await expect(restoreNodeSnapshot("prod")).rejects.toThrow(PanelPinnedError);
+    expect(managerCalls).toEqual([]); // refused before any Manager request
   });
 });

@@ -29,9 +29,22 @@ vi.mock("node:child_process", () => ({
   spawnSync: vi.fn(() => ({ status: 0, stdout: "{}", stderr: "" })),
 }));
 
-vi.mock("node:fs", () => ({
+vi.mock("node:fs", async (importOriginal) => ({
+  // existsSync stays mockable per-test; everything else delegates to the REAL
+  // fs because update_all now takes the panel mutation lock (panel-pin-guard),
+  // which is a real file — a partial mock left its mkdir/open/write undefined
+  // and every update_all failed closed.
+  ...(await importOriginal<typeof import("node:fs")>()),
   existsSync: vi.fn(),
 }));
+
+// The panel mutation lock is a FILE (panel-pin-guard). Point it at a temp path
+// so the suite never touches ~/.comfyui-mcp, and so parallel vitest workers get
+// their own lock instead of serializing on one shared file.
+process.env.COMFYUI_MCP_PANEL_LOCK = join(
+  tmpdir(),
+  `cmcp-lock-updatecomfyui-${process.pid}.lock`,
+);
 
 vi.mock("../../utils/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -47,6 +60,8 @@ vi.mock("../../services/workspace-env.js", () => ({
 
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import {
   updateComfyUICore,
   updateAllCustomNodes,

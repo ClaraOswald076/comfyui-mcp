@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 // The product builds snapshot paths with node:path.join, so separators differ
 // per-platform. Mirror the exact construction here instead of hardcoding POSIX
@@ -31,7 +32,28 @@ const fsMocks = vi.hoisted(() => ({
   writeFileSync: vi.fn(),
 }));
 
-vi.mock("node:fs", () => fsMocks);
+// The three fsMocks stay per-test controllable; everything else delegates to
+// the REAL fs because restoreNodeSnapshot now takes the panel mutation lock
+// (panel-pin-guard), which is a real file — a partial mock left the lock's
+// open/write undefined and every restore failed closed.
+vi.mock("node:fs", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:fs")>()),
+  ...fsMocks,
+}));
+
+// The panel mutation lock is a FILE (panel-pin-guard). Point it at a temp path
+// so the suite never touches ~/.comfyui-mcp, and so parallel vitest workers get
+// their own lock instead of serializing on one shared file.
+process.env.COMFYUI_MCP_PANEL_LOCK = join(
+  tmpdir(),
+  `cmcp-lock-snapshots-${process.pid}.lock`,
+);
+
+// restoreNodeSnapshot now consults the panel version pin (a restore reverts
+// EVERY pack, panel included — same bulk door as update all). This suite is not
+// about pinning, so use the documented env escape hatch to say plainly "no pin
+// here" rather than reshaping the fs mocks the pin store reads through.
+process.env.COMFYUI_MCP_PANEL_PIN = "off";
 
 import {
   saveNodeSnapshot,
