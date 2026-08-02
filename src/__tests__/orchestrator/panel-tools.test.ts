@@ -2626,14 +2626,22 @@ describe("panel_open_workflow: verify active state after ack-timeout (#215/#319/
   // workflow_list returns the next entry in `listReplies` (last one repeats).
   function makeVerifyCtx(opts: {
     openReply: () => unknown;
-    listReplies: Array<{ active: unknown }>;
+    listReplies: Array<Record<string, unknown>>;
+    rid?: string;
   }): { ctx: PanelToolCtx; cmds: string[] } {
     const cmds: string[] = [];
     let listIdx = 0;
     const ctx = {
-      call: async (cmd: Record<string, unknown>) => {
+      call: async (
+        cmd: Record<string, unknown>,
+        _timeoutMs?: number,
+        onDispatchedRid?: (rid: string) => void,
+      ) => {
         cmds.push(cmd.cmd as string);
-        if (cmd.cmd === "workflow_open") return opts.openReply();
+        if (cmd.cmd === "workflow_open") {
+          onDispatchedRid?.(opts.rid ?? "open-rid-1");
+          return opts.openReply();
+        }
         if (cmd.cmd === "workflow_list") {
           const reply = opts.listReplies[Math.min(listIdx, opts.listReplies.length - 1)];
           listIdx++;
@@ -2659,10 +2667,19 @@ describe("panel_open_workflow: verify active state after ack-timeout (#215/#319/
   it("ack-timeout BUT target becomes active ⇒ SUCCESS with a recovered note", async () => {
     const { ctx, cmds } = makeVerifyCtx({
       openReply: () => timeoutResult(),
-      // First list: some other tab is active; second: our target is active.
       listReplies: [
-        { active: { path: "other.json", filename: "other.json", key: "k-other" } },
-        { active: { path: TARGET, filename: TARGET, key: "k-mine" } },
+        {
+          active_confirmed: true,
+          active: { path: "other.json", filename: "other.json", key: "k-other" },
+          last_open: {
+            rid: "open-rid-1",
+            answers_only_command_rid: "open-rid-1",
+            cmd: "workflow_open",
+            requested: TARGET,
+            resolved: { path: TARGET, filename: TARGET, routing_key: "k-mine" },
+            applied: true,
+          },
+        },
       ],
     });
     const res = (await defByName("panel_open_workflow").handler({ path: TARGET }, ctx)) as {
@@ -2672,7 +2689,7 @@ describe("panel_open_workflow: verify active state after ack-timeout (#215/#319/
     expect(res.isError).toBeFalsy();
     const text = res.content[0].text;
     expect(text).toContain("recovered");
-    expect(text).toMatch(/active workflow/i);
+    expect(text).toMatch(/request-id-correlated open receipt/i);
     // It DID poll the authoritative active signal after the open timed out.
     expect(cmds[0]).toBe("workflow_open");
     expect(cmds).toContain("workflow_list");
@@ -2681,14 +2698,40 @@ describe("panel_open_workflow: verify active state after ack-timeout (#215/#319/
   it("ack-timeout AND target never becomes active ⇒ clear FAILURE (no false success)", async () => {
     const { ctx } = makeVerifyCtx({
       openReply: () => timeoutResult(),
-      listReplies: [{ active: { path: "other.json", filename: "other.json", key: "k-other" } }],
+      // Regression #661: active can already match after a reconnect even though
+      // this open request has no receipt. That is an undetermined outcome.
+      listReplies: [{ active: { path: TARGET, filename: TARGET, key: "k-mine" } }],
     });
     const res = (await defByName("panel_open_workflow").handler({ path: TARGET }, ctx)) as {
       content: Array<{ text: string }>;
       isError?: boolean;
     };
     expect(res.isError).toBe(true);
-    expect(res.content[0].text).toMatch(/did not reply/i);
+    expect(res.content[0].text).toMatch(/outcome is undetermined/i);
+    expect(res.content[0].text).not.toMatch(/recovered|Do NOT retry/i);
+  });
+
+  it("does not treat a stale receipt for the same active target as this request's success", async () => {
+    const { ctx } = makeVerifyCtx({
+      openReply: () => timeoutResult(),
+      listReplies: [
+        {
+          active_confirmed: true,
+          active: { path: TARGET, filename: TARGET, key: "k-mine" },
+          last_open: {
+            rid: "older-open-rid",
+            answers_only_command_rid: "older-open-rid",
+            cmd: "workflow_open",
+            requested: TARGET,
+            resolved: { path: TARGET, filename: TARGET, routing_key: "k-mine" },
+            applied: true,
+          },
+        },
+      ],
+    });
+    const res = await defByName("panel_open_workflow").handler({ path: TARGET }, ctx);
+    expect(res.isError).toBe(true);
+    expect(res.content[0]?.type === "text" ? res.content[0].text : "").toMatch(/outcome is undetermined/i);
   });
 
   it("a genuine acked open-failure (missing file) still fails clearly, unverified", async () => {

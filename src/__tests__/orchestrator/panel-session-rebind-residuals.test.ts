@@ -212,8 +212,12 @@ describe("#402 panel_open_workflow verifies a mid-command reconnect DROP (OUTCOM
     const live = new Set(["live-tab"]);
     let dropped = false;
     const bridge = {
-      send: async (cmd: Record<string, unknown>, opts?: { tabId?: string }) => {
+      send: async (
+        cmd: Record<string, unknown>,
+        opts?: { tabId?: string; onDispatchedRid?: (rid: string) => void },
+      ) => {
         if (cmd.cmd === "workflow_open") {
+          opts?.onDispatchedRid?.("open-rid-402");
           if (!dropped) {
             dropped = true;
             // The write landed but the socket died before a reply — the bridge's
@@ -224,8 +228,20 @@ describe("#402 panel_open_workflow verifies a mid-command reconnect DROP (OUTCOM
           }
         }
         if (cmd.cmd === "workflow_list") {
-          // After the drop, the switch is confirmed active by the authoritative list.
-          return { workflows: [{ key: "wf:workflows/x.json", active: true }], active: { path: "workflows/x.json" } };
+          // After the drop, only the exact request-id receipt confirms the open.
+          return {
+            workflows: [{ key: "wf:workflows/x.json", active: true }],
+            active: { path: "workflows/x.json" },
+            active_confirmed: true,
+            last_open: {
+              rid: "open-rid-402",
+              answers_only_command_rid: "open-rid-402",
+              cmd: "workflow_open",
+              requested: "workflows/x.json",
+              resolved: { path: "workflows/x.json", filename: "x.json", routing_key: "wf:workflows/x.json" },
+              applied: true,
+            },
+          };
         }
         return { ok: true, routedTo: opts?.tabId };
       },

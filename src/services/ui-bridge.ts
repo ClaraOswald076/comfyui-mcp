@@ -77,6 +77,7 @@ type SendCtx = {
    *  EXECUTE it against a DIFFERENT workflow it has since switched to. Undefined for a tab
    *  with no established workflow identity (old panel / relay) → no client-side fence. */
   workflowUuid?: string;
+  onDispatchedRid?: (rid: string) => void;
 };
 
 type Pending = {
@@ -1784,7 +1785,7 @@ export class UiBridge {
     }
   }
 
-  send(cmd: BridgeCommand, opts: { tabId?: string; timeoutMs?: number } = {}): Promise<unknown> {
+  send(cmd: BridgeCommand, opts: { tabId?: string; timeoutMs?: number; onDispatchedRid?: (rid: string) => void } = {}): Promise<unknown> {
     // #357: read (idempotent) ops get a more tolerant default so a busy-but-alive
     // panel main thread (e.g. Preview3D loading a large FBX) isn't declared frozen;
     // mutating ops keep the tight default. An explicit opts.timeoutMs always wins.
@@ -1906,6 +1907,7 @@ export class UiBridge {
         // workflow the command was ISSUED FOR (so the panel, now showing a different one,
         // declines it) — never the workflow it happens to have landed on.
         workflowUuid: this.resolveTabWorkflowUuid?.(opts.tabId ?? conn.tabId) ?? undefined,
+        onDispatchedRid: opts.onDispatchedRid,
       };
       this.dispatch(conn, ctx);
     });
@@ -2012,6 +2014,7 @@ export class UiBridge {
       if (ctx.workflowUuid) frame.workflow_uuid = ctx.workflowUuid;
       else delete frame.workflow_uuid;
       conn.sock.send(JSON.stringify(frame));
+      try { ctx.onDispatchedRid?.(rid); } catch { /* observer faults are non-fatal */ }
     } catch (err) {
       clearTimeout(timer);
       this.pending.delete(rid);
