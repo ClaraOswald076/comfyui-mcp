@@ -28,7 +28,6 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
-  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -273,52 +272,112 @@ function pidAlive(pid: unknown): boolean {
   }
 }
 
-/**
- * A lock is stale only when it is BOTH old AND owned by a dead process.
- *
- * The pid check is what makes reclaiming safe. Age alone let two waiters both
- * judge the same lock stale, and the slower one could then delete the FRESH
- * lock the faster one had just taken — putting two mutations in flight at once,
- * the exact thing the lock exists to prevent. A live holder's lock now never
- * reads as stale, so that interleaving cannot arise. (pid liveness is the right
- * test here precisely because this is a single-machine, local-first project.)
- */
-function lockIsStale(path: string): boolean {
+interface StaleLockSnapshot {
+  readonly raw: string;
+  readonly dev: number;
+  readonly ino: number;
+}
+
+function staleLockSnapshot(path: string): StaleLockSnapshot | undefined {
   try {
-    if (Date.now() - statSync(path).mtimeMs <= STALE_LOCK_MS) return false;
+    const before = statSync(path);
+    if (Date.now() - before.mtimeMs <= STALE_LOCK_MS) return undefined;
+    const raw = readFileSync(path, "utf-8");
+    const after = statSync(path);
+    if (
+      before.dev !== after.dev ||
+      before.ino !== after.ino ||
+      before.mtimeMs !== after.mtimeMs ||
+      before.size !== after.size
+    ) {
+      return undefined;
+    }
     let pid: unknown;
     try {
-      pid = (JSON.parse(readFileSync(path, "utf-8")) as { pid?: unknown })?.pid;
+      pid = (JSON.parse(raw) as { pid?: unknown })?.pid;
     } catch {
-      // We reclaim only a lock whose owner is demonstrably dead. Corrupt
-      // content cannot establish that proof, so preserve it for recovery.
-      return false;
+      return undefined;
     }
-    if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
-      // Missing, fractional, or otherwise malformed ownership is not a dead
-      // process identity. Failing closed keeps an ambiguous live lock safe.
-      return false;
-    }
-    return !pidAlive(pid);
+    if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return undefined;
+    return pidAlive(pid) ? undefined : { raw, dev: after.dev, ino: after.ino };
   } catch {
-    // Vanished between EEXIST and stat — the next create attempt will settle it.
-    return false;
+    return undefined;
   }
 }
 
-/**
- * Remove a lock judged stale, ATOMICALLY. Renaming first means only one waiter
- * can win the reclaim (the rest get ENOENT and simply retry); deleting the path
- * directly would let a straggler delete whatever now sits there.
- */
-function reclaimStaleLock(path: string): void {
-  const claim = `${path}.reclaim-${randomUUID()}`;
+/** A reclaim claim is only arbitration metadata, not the operation lock. A
+ * crashed claimant must therefore never leave future recovery wedged behind an
+ * incomplete record. */
+function reclaimClaimIsAbandoned(path: string): boolean {
   try {
-    renameSync(path, claim);
+    if (Date.now() - statSync(path).mtimeMs <= STALE_LOCK_MS) return false;
+    const record = JSON.parse(readFileSync(path, "utf-8")) as { pid?: unknown };
+    return !pidAlive(record.pid);
   } catch {
-    return; // someone else reclaimed it first — just retry the create
+    // This is safe for a claim (unlike the base lock): a writer whose old,
+    // partial claim is removed cannot pass the token ownership check below.
+    try {
+      return Date.now() - statSync(path).mtimeMs > STALE_LOCK_MS;
+    } catch {
+      return false;
+    }
   }
-  rmSync(claim, { force: true });
+}
+
+function reclaimBoundStaleLock(path: string, observed: StaleLockSnapshot): boolean {
+  const claim = `${path}.reclaim`;
+  const token = randomUUID();
+  let fd: number | undefined;
+  try {
+    // The claim has independent exclusive-create semantics. It binds this
+    // reclaimer to the observed stale snapshot before the base path moves.
+    fd = openSync(claim, "wx");
+    writeSync(fd, JSON.stringify({ pid: process.pid, token }));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "EEXIST" && reclaimClaimIsAbandoned(claim)) {
+      // The claim is coordination metadata, never the operation lock. Removing
+      // a dead claimant's record never removes or edits the base lock.
+      rmSync(claim, { force: true });
+    }
+    return false;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+
+  const ownsClaim = (): boolean => {
+    try {
+      const record = JSON.parse(readFileSync(claim, "utf-8")) as {
+        pid?: unknown;
+        token?: unknown;
+      };
+      return record.pid === process.pid && record.token === token;
+    } catch {
+      return false;
+    }
+  };
+  const releaseClaim = (): void => {
+    if (ownsClaim()) rmSync(claim, { force: true });
+  };
+
+  try {
+    if (!ownsClaim()) return false;
+    const current = staleLockSnapshot(path);
+    // A later fresh lock cannot satisfy the source file's exact identity and
+    // bytes, so this reclaimer cannot delete it.
+    if (
+      !current ||
+      current.dev !== observed.dev ||
+      current.ino !== observed.ino ||
+      current.raw !== observed.raw ||
+      !ownsClaim()
+    ) {
+      return false;
+    }
+    rmSync(path);
+    return true;
+  } finally {
+    releaseClaim();
+  }
 }
 
 async function acquireFileLock(timeoutMs: number): Promise<() => void> {
@@ -359,13 +418,12 @@ async function acquireFileLock(timeoutMs: number): Promise<() => void> {
           }. Refusing to mutate the panel without it.`,
         );
       }
-      if (lockIsStale(path)) {
+      const stale = staleLockSnapshot(path);
+      if (stale) {
         // Only a demonstrably abandoned lock gets here: old locks with a live
-        // owner (and all fresh locks) still wait. Claim it by renaming first,
-        // rather than deleting the contested name: exactly one reclaimer can
-        // win, and followers merely retry the exclusive create.
-        reclaimStaleLock(path);
-        continue;
+        // owner (and all fresh locks) still wait. The exclusive claim binds
+        // this reclaimer to its observed file before the base is removed.
+        if (reclaimBoundStaleLock(path, stale)) continue;
       }
       if (Date.now() >= deadline) {
         throw new Error(
