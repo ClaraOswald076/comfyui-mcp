@@ -537,6 +537,32 @@ describe("run completion across automatic goal continuation (#468)", () => {
     expect(journal.outstanding(tab)).toHaveLength(1); // returned, not lost
   });
 
+  it("an unmarked straggler RESULT never counts as carried, so it can't settle an unseen completion", async () => {
+    // #728 lets unmarked events past the dead-letter gate. On a marker-declaring
+    // backend such a result may belong to an abandoned turn and arrive while the
+    // replacement turn is still pre-submission — three of those must not walk the
+    // settle bound and retire a completion nobody ever received.
+    const silent = new MarkerBackend({ silentTurns: true });
+    const { journal, manager, arrive } = makeHarness(silent);
+    const tab = "tab-straggler-bound";
+
+    journal.openRun(PROMPT_A, { tabId: tab });
+    manager.send(tab, "go");
+    await waitFor(() => silent.turns.length >= 1);
+    silent.emit({ type: "result", ok: true, subtype: "success", turn: 1 });
+
+    arrive(tab, { kind: "executed", prompt_id: PROMPT_A, images: [{ filename: "unseen.png" }] });
+    await waitFor(() => silent.turns.length >= 2); // dispatched, no events for it
+
+    for (let i = 0; i < 4; i++) {
+      silent.emit({ type: "result", ok: false, subtype: "error_during_execution" }); // UNMARKED
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(journal.outstanding(tab)).toHaveLength(1); // never settled
+    expect(journal.outstanding(tab)[0].carriedReleases ?? 0).toBe(0);
+    expect(journal.ticketFor(PROMPT_A)?.settled).toBe(false);
+  });
+
   it("a turn the backend never RECEIVED is released UNCARRIED — it can't count toward the bound", async () => {
     // The token is attached at dispatch, but Claude resolves output images before
     // submitting the turn. Aborting in that window means the model never saw the

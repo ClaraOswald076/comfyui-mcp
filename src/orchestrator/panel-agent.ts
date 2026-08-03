@@ -1188,8 +1188,13 @@ export class PanelAgent {
       // replays them instead of the completion dying with the dead session
       // (#468). No-op after a clean result or the crash re-queue above.
       const strandedTokens = this.turnEventTokens;
+      const strandedWereReceived = this.turnProducedEvents;
       this.turnEventTokens = [];
-      this.releaseEventTokens(strandedTokens);
+      // Same rule again: a session that DID receive this turn (it emitted marked
+      // events) and then died without a terminal result is a bounded replay
+      // cycle — a session that kept dropping before receiving it is not, and
+      // must never count toward the settle bound.
+      this.releaseEventTokens(strandedTokens, { carried: strandedWereReceived });
       if (this.closed) break;
       // Session ended on its own — bound rapid failure loops so a persistently
       // broken SDK doesn't spin forever or black-hole each message.
@@ -1510,10 +1515,12 @@ export class PanelAgent {
             logger.warn(
               `[panel-agent ${this.short()}] an unmarked result cannot ack turn ${this.turnEventTokensMarker}'s run completion(s) — handing ${carried.length} back for replay (#468)`,
             );
-            // CARRIED: this turn ran and ended with the completion in it, so the
-            // agent read it — only the ack is unprovable. Bounded, so a backend
-            // that never stamps its results can't replay this forever.
-            this.releaseEventTokens(carried, { carried: true });
+            // CARRIED only with PROOF the backend received this turn — the same
+            // rule as every other release. An UNMARKED result bypasses the #728
+            // dead-letter gate, so it may be a straggler from an abandoned turn
+            // arriving while this one is still pre-submission; counting it would
+            // let three such stragglers settle a completion nobody ever saw.
+            this.releaseEventTokens(carried, { carried: this.turnProducedEvents });
           }
         }
         // Turn ended cleanly → disarm the freeze watchdog. (If it already tripped,
