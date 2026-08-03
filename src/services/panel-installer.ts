@@ -544,7 +544,22 @@ export const defaultDeps: PanelInstallerDeps = {
  * whether an on-disk read is worth recording. Carry the answer explicitly.
  */
 const REAL_DEPS = Symbol("panel-installer.realDeps");
-type MarkedDeps = PanelInstallerDeps & { [REAL_DEPS]?: true };
+/**
+ * The ComfyUI target generation as it stood when the base was FROZEN — captured
+ * before the live probe, so a retarget that completed during the freeze is
+ * still visible afterwards. Reading the generation at re-entry instead would
+ * miss exactly that: the orchestrator launches the panel sync and then
+ * retargets, so by the time the mutation begins the change has already landed
+ * and looks like the status quo.
+ */
+const PINNED_GENERATION = Symbol("panel-installer.pinnedGeneration");
+/** The base this dep set was frozen to — re-asserted before any mutation. */
+const PINNED_BASE = Symbol("panel-installer.pinnedBase");
+type MarkedDeps = PanelInstallerDeps & {
+  [REAL_DEPS]?: true;
+  [PINNED_GENERATION]?: number;
+  [PINNED_BASE]?: string;
+};
 
 /** Is this the production dep set (rather than an injected test one)? */
 function isRealDeps(deps: PanelInstallerDeps): boolean {
@@ -575,6 +590,17 @@ export async function pinPanelBase(
   opts: { force?: boolean } = {},
 ): Promise<PanelInstallerDeps> {
   const real = isRealDeps(deps);
+  // CAPTURE THE GENERATION FIRST, before the probe's await. The orchestrator
+  // launches the panel sync and THEN retargets, so a retarget can complete
+  // while we are freezing — and a generation read afterwards would record the
+  // new target as though it had always been the one we froze against, making
+  // the divergence invisible to every later check.
+  // ONCE FROZEN, STAY FROZEN. runPanelActionInner re-pins on entry, and if that
+  // re-pin re-read the generation it would erase the whole point: the retarget
+  // we are trying to detect happens BETWEEN performPanelSync's freeze and that
+  // re-entry, so a second capture would record the new target as the original
+  // one. An already-pinned dep set keeps its first answer.
+  const generation = pinnedGenerationOf(deps) ?? panelTargetGeneration();
   // Only probe the live server for the REAL deps. An injected dep set has
   // already declared where ComfyUI is; probing would be pointless and, in
   // tests, a network call nobody asked for.
@@ -582,7 +608,19 @@ export async function pinPanelBase(
   const base = deps.comfyuiPath();
   const pinned: MarkedDeps = { ...deps, comfyuiPath: () => base };
   if (real) pinned[REAL_DEPS] = true;
+  pinned[PINNED_GENERATION] = generation;
+  if (base !== undefined) pinned[PINNED_BASE] = base;
   return pinned;
+}
+
+/** The generation this dep set was frozen at, if it carries one. */
+function pinnedGenerationOf(deps: PanelInstallerDeps): number | undefined {
+  return (deps as MarkedDeps)[PINNED_GENERATION];
+}
+
+/** The base this dep set was frozen to, if it carries one. */
+function pinnedBaseOf(deps: PanelInstallerDeps): string | undefined {
+  return (deps as MarkedDeps)[PINNED_BASE];
 }
 
 // ---------------------------------------------------------------------------
@@ -1161,6 +1199,29 @@ async function ensureInner(deps: PanelInstallerDeps): Promise<EnsureResult> {
     };
   }
 
+  // REPAIR AN INTERRUPTED SWAP AT STARTUP. Replacing a directory takes two
+  // renames and cannot be made atomic, so a process kill or host crash between
+  // them leaves custom_nodes with NO panel and the working copy in
+  // custom_nodes_backup. Until this ran here, recovery required the user to
+  // know to invoke another panel mutation — an in-product dead end for the one
+  // failure that actually takes the panel away. This path runs on every load
+  // and already holds the op lock, so it is where the repair belongs.
+  const ensureBase = deps.comfyuiPath();
+  if (ensureBase) {
+    const repaired = reconcilePanelSwap(ensureBase, deps, { repair: true });
+    if (repaired.note) {
+      logger.warn(`[panel] on load:${repaired.note}`);
+    }
+    if (!repaired.ok) {
+      return {
+        action: "unavailable",
+        reason:
+          `A previous panel update was interrupted and could not be repaired ` +
+          `automatically.${repaired.note ?? ""}`,
+      };
+    }
+  }
+
   const detection = await detectPanelInstall(deps);
 
   if (detection.isDevSymlink) {
@@ -1363,6 +1424,45 @@ export interface PanelStatus {
    */
   absenceProven?: boolean;
   note: string;
+}
+
+/**
+ * Repair an interrupted panel swap, under the op lock. Safe to call from any
+ * read path that is NOT already holding the lock.
+ *
+ * A crash between the swap's two renames is the one failure mode that takes the
+ * panel AWAY rather than merely misreporting it: custom_nodes ends up with no
+ * panel at all, and without this the user could only recover by knowing to
+ * invoke another panel mutation, or by moving directories by hand. So the
+ * ordinary "what's going on?" call repairs it.
+ *
+ * The lock is what makes this safe from a read path — it cannot cut across
+ * another process's in-flight swap. It is taken only when a journal is actually
+ * present AND the canonical directory is missing (both cheap, lock-free checks),
+ * so the common case costs nothing; if the lock cannot be had quickly, the swap
+ * that wrote the journal is most likely still running, and we leave it alone.
+ *
+ * Never throws.
+ */
+export async function repairInterruptedPanelSwap(
+  deps: PanelInstallerDeps = defaultDeps,
+): Promise<string | undefined> {
+  try {
+    const pinned = await pinPanelBase(deps);
+    const base = pinned.comfyuiPath();
+    if (!base || !pinned.isLocalMode()) return undefined;
+    // Cheap pre-checks, no lock: is there anything to repair at all?
+    if (!pinned.existsSync(swapJournalPath(base))) return undefined;
+    return await withPanelOpLock(
+      async () => reconcilePanelSwap(base, pinned, { repair: true }).note,
+      { timeoutMs: ENSURE_LOCK_WAIT_MS },
+    );
+  } catch (err) {
+    logger.debug("panel: interrupted-swap repair skipped", {
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return undefined;
+  }
 }
 
 /** status action — never throws. */
@@ -1654,6 +1754,7 @@ export function isProvenLegacyEmptyQueue(details: unknown): boolean {
 
 export type UpdateOutcome =
   | "updated" // version OR git-HEAD moved on disk → the update definitely applied.
+  | "downgraded" // the version PROVABLY went backwards — applied, but not an update.
   | "no-op" // nothing moved AND Manager shows the stale-3.x no-op signature.
   | "unverified"; // nothing provably moved / can't read post identity — fail closed.
 
@@ -1705,6 +1806,22 @@ export function classifyPanelUpdate(
     return { ...base, outcome: "unverified" };
   }
 
+  // MOVED IS NOT THE SAME AS FORWARD. Direction is decided HERE, in the
+  // classifier, rather than at one of the call sites: this is the single place
+  // a version PAIR becomes a verdict, so a guard anywhere else covers only the
+  // branch it sits on. A Manager that resolves an older build and lands it
+  // would otherwise be classified "updated" and reported as
+  // "Panel updated (0.11.40 → 0.11.38)" — the user congratulated for being
+  // downgraded. Only a READABLE, COMPARABLE regression counts; `compareSemver`
+  // returns 0 for anything it cannot parse, so it is never trusted alone.
+  const comparableRegression =
+    !!previousVersion &&
+    !!installedVersion &&
+    SEMVER_RE.test(previousVersion.trim()) &&
+    SEMVER_RE.test(installedVersion.trim()) &&
+    compareSemver(installedVersion, previousVersion) < 0;
+  if (comparableRegression) return { ...base, outcome: "downgraded" };
+
   // Something moved on disk (version bump OR git-HEAD advance) → update applied.
   const versionMoved =
     !!previousVersion && !!installedVersion && installedVersion !== previousVersion;
@@ -1741,6 +1858,22 @@ function finalizeUpdate(
       previousVersion,
       installedVersion,
     };
+  }
+
+  // The pack moved BACKWARDS. It applied, so this is not a no-op — but it is
+  // certainly not an update, and reporting it as one would leave the user on an
+  // older panel than they started with, told they had just upgraded.
+  if (outcome === "downgraded") {
+    throw new PanelInstallError(
+      `Panel update did NOT go forward: the pack${dirNote} is now ` +
+        `${installedVersion ?? "unreadable"}, which is OLDER than the ` +
+        `${previousVersion ?? "unknown"} that was installed before. ComfyUI-Manager ` +
+        `resolved and applied an earlier build. NOT reporting this as an update — you ` +
+        `are now on an older panel than you started with. Update ComfyUI-Manager on ` +
+        `the host (git pull in custom_nodes/ComfyUI-Manager, or pip install -U ` +
+        `comfyui_manager) and retry, or reinstall the panel from source, then RESTART ` +
+        `ComfyUI.`,
+    );
   }
 
   // Nothing provably moved → NEVER report success. An unchanged local git-HEAD /
@@ -2028,6 +2161,17 @@ async function updateViaGitCheckoutFallback(opts: {
     },
     result.details,
   );
+  // A fast-forward can only advance HEAD, but the pyproject version it lands is
+  // whatever upstream committed — so a proven regression is still possible and
+  // must never fall through to the "already at upstream tip" report below.
+  if (verdict.outcome === "downgraded") {
+    throw new PanelInstallError(
+      `Panel update did NOT go forward: the pinned fast-forward in ${dir} left the pack ` +
+        `at ${post.version}, which is OLDER than the ${previousVersion ?? "unknown"} ` +
+        `installed before it. NOT reporting this as an update, and NOT reporting the ` +
+        `checkout as current — check the panel repo (git log) before restarting ComfyUI.`,
+    );
+  }
   if (verdict.outcome === "updated") {
     const from = verdict.previousVersion ?? verdict.previousRev?.slice(0, 8) ?? "?";
     const to = verdict.installedVersion ?? verdict.installedRev?.slice(0, 8) ?? "?";
@@ -2327,7 +2471,16 @@ function swapTreeIsCorroborated(deps: PanelInstallerDeps): boolean {
   // unparseable argv proves only that something answered on the URL; it does
   // not prove COMFYUI_PATH is the tree that server reads. Require a root the
   // running server actually named.
-  return isLiveDerivedBase(lastPanelBaseResolution());
+  const resolution = lastPanelBaseResolution();
+  if (!isLiveDerivedBase(resolution)) return false;
+  // AND IT MUST BE THE TREE WE FROZE. Asking only "is the CURRENT resolution
+  // live-derived?" answers a question about now, while the directory we are
+  // about to mutate was chosen earlier — so a retarget in between would let a
+  // live-derived answer about server B bless a mutation of server A's tree,
+  // which is precisely the wrong-tree swap this gate exists to stop. The two
+  // must be the same directory.
+  const frozen = pinnedBaseOf(deps) ?? deps.comfyuiPath();
+  return !!frozen && !!resolution?.base && samePathCI(frozen, resolution.base, deps);
 }
 
 async function updateViaRegistryZipReinstall(opts: {
@@ -2828,7 +2981,13 @@ export async function runPanelActionInner(
   // We cannot make the two captures atomic from here, but we can refuse to
   // report anything once they may have diverged: the generation is checked
   // immediately before the mutation and again before any success is returned.
-  const opGeneration = panelTargetGeneration();
+  //
+  // Use the generation captured when the base was FROZEN, not one read here.
+  // performPanelSync freezes the base and only then calls this function, and a
+  // retarget can land in between — by the time we re-enter, that change has
+  // already happened and reading the generation now would record it as the
+  // status quo, making the very divergence we are guarding against invisible.
+  const opGeneration = pinnedGenerationOf(deps) ?? panelTargetGeneration();
   const assertSameTarget = (stage: string): void => {
     if (panelTargetGeneration() === opGeneration) return;
     throw new PanelInstallError(
@@ -3094,6 +3253,14 @@ export async function runPanelActionInner(
       },
       result.details,
     );
+    // A PROVEN REGRESSION SHORT-CIRCUITS EVERYTHING. It must not fall through
+    // to the no-op/zip fallbacks: those would quietly re-install over the top
+    // and the user would never learn that ComfyUI-Manager had just moved them
+    // backwards. Surface it instead.
+    if (verdict.outcome === "downgraded") {
+      assertSameTarget("before reporting the update verdict");
+      return finalizeUpdate(verdict, post, result); // throws, honestly
+    }
     // #724 — the Manager PROVABLY no-op'd (the stale legacy-3.x signature), and
     // the panel dir is a real git checkout (a pre-op HEAD resolved; a registry
     // zip has no .git, and a dev symlink was refused above). The verified

@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   panelStatus,
+  repairInterruptedPanelSwap,
   runPanelAction,
   withPanelOpLock,
 } from "../services/panel-installer.js";
@@ -87,8 +88,18 @@ export function registerInstallPanelTools(server: McpServer): void {
     async ({ action, version, reason }) => {
       try {
         if (action === "status") {
+          // A crash between the swap's two renames leaves custom_nodes with NO
+          // panel. Repair it here — asking "what's going on?" is exactly when a
+          // user hits that state, and requiring them to know to run a MUTATION
+          // to get their panel back is not a recovery path. Takes the op lock
+          // itself and no-ops when there is nothing to repair.
+          const repaired = await repairInterruptedPanelSwap();
           const status = await panelStatus();
-          return json({ ...status, sync: evaluatePanelSync(status) });
+          return json({
+            ...status,
+            note: repaired ? `${status.note}${repaired}` : status.note,
+            sync: evaluatePanelSync(status),
+          });
         }
 
         if (action === "sync") {

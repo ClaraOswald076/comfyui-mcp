@@ -76,6 +76,7 @@ vi.mock("../../services/workspace-env.js", () => ({
 import {
   defaultDeps,
   PanelInstallError,
+  pinPanelBase,
   PANEL_REGISTRY_ID,
   runPanelActionInner,
   type PanelInstallerDeps,
@@ -545,6 +546,46 @@ describe("update no longer contradicts status on a registry-zip install (#771)",
     expect((err as Error).message).not.toMatch(/Panel updated/);
   });
 
+  it("the ORDINARY Manager path never reports a downgrade as an update", async () => {
+    // The direction check lives in classifyPanelUpdate, not on one branch: this
+    // is the path where the Manager SUCCEEDS and simply installs an older
+    // build, which a guard on the throws-path would never see.
+    writePanelPack(PANEL_DIR(), "0.11.40");
+    const h = makeDeps({ withoutSwapOps: true });
+    h.deps.update = async () => {
+      writePanelPack(PANEL_DIR(), "0.11.38"); // Manager resolves an older build
+      return { mechanism: "manager-http", message: "updated", details: {} };
+    };
+    const err = await runPanelActionInner("update", h.deps).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect((err as Error).message).toMatch(/did NOT go forward/);
+    expect((err as Error).message).toMatch(/OLDER/);
+    expect((err as Error).message).not.toMatch(/Panel updated/);
+  });
+
+  it("classifyPanelUpdate itself calls a regression 'downgraded', not 'updated'", async () => {
+    const { classifyPanelUpdate } = await import("../../services/panel-installer.js");
+    expect(
+      classifyPanelUpdate(
+        { previousVersion: "0.11.40", installedVersion: "0.11.38" },
+        {},
+      ).outcome,
+    ).toBe("downgraded");
+    // Forward is still an update, and an unparseable pair is never a regression.
+    expect(
+      classifyPanelUpdate(
+        { previousVersion: "0.11.38", installedVersion: "0.11.40" },
+        {},
+      ).outcome,
+    ).toBe("updated");
+    expect(
+      classifyPanelUpdate(
+        { previousVersion: "nightly", installedVersion: "dev" },
+        {},
+      ).outcome,
+    ).toBe("updated");
+  });
+
   it("an UNRELIABLE scan never propagates the Manager's absence claim", async () => {
     // A failed custom_nodes enumeration also yields installed:false. That is
     // "we could not look", not "it is not there", and accepting it would put
@@ -748,7 +789,49 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     expect(existsSync(join(root, ".comfyui-agent-panel.swap.json"))).toBe(false);
   });
 
-  it("a status read REPORTS an interrupted swap but does not repair it (it holds no lock)", async () => {
+  it("repairs an interrupted swap from a plain STATUS read — the panel comes back without a mutation", async () => {
+    // The crash-between-renames state leaves custom_nodes with NO panel. Asking
+    // "what's going on?" is exactly when a user hits it, and requiring them to
+    // know to run a MUTATION to get their panel back is not a recovery path.
+    const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1`);
+    writePanelPack(backupDir, "0.11.34");
+    writeFileSync(
+      join(root, ".comfyui-agent-panel.swap.json"),
+      JSON.stringify({
+        dir: PANEL_DIR(),
+        backupDir,
+        staging: "x",
+        startedAt: Date.now(),
+        previousVersion: "0.11.34",
+      }),
+    );
+    expect(existsSync(PANEL_DIR())).toBe(false); // no panel served
+
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
+
+    expect(note).toMatch(/RESTORED/);
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
+    expect(existsSync(join(root, ".comfyui-agent-panel.swap.json"))).toBe(false);
+  });
+
+  it("the on-load auto-install repairs an interrupted swap before doing anything else", async () => {
+    const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1`);
+    writePanelPack(backupDir, "0.11.34");
+    writeFileSync(
+      join(root, ".comfyui-agent-panel.swap.json"),
+      JSON.stringify({ dir: PANEL_DIR(), backupDir, staging: "x", startedAt: Date.now() }),
+    );
+    const { ensurePanelInstalled } = await import("../../services/panel-installer.js");
+    const result = await ensurePanelInstalled({ deps: makeDeps({}).deps });
+    // The panel is back, and the ensure did NOT install a second copy over it.
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
+    expect(result.action).not.toBe("installed");
+  });
+
+  it("a bare panelStatus still only REPORTS — it holds no lock, so it must not move directories", async () => {
     const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1`);
     writePanelPack(backupDir, "0.11.34");
     writeFileSync(
@@ -956,6 +1039,26 @@ describe("a wholesale replacement needs the RUNNING server to have chosen the tr
 
     // The next prime, against the settled target, answers properly.
     expect((await primePanelBase()).base).toBe(liveRoot);
+  });
+
+  it("a retarget that completes BEFORE the mutation is still detected (generation frozen at pin time)", async () => {
+    // The orchestrator launches performPanelSync and THEN retargets, so by the
+    // time runPanelActionInner is entered the change has already landed. A
+    // generation read at re-entry would record it as the status quo and see
+    // nothing wrong. The generation is therefore captured when the base is
+    // FROZEN, which is before that window opens.
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    const h = makeDeps({ cloneVersion: "0.11.38" });
+
+    const pinned = await pinPanelBase(h.deps);
+    generation.value++; // the retarget lands between the freeze and the mutation
+
+    const err = await runPanelActionInner("update", pinned).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect((err as Error).message).toMatch(/ABORTED/);
+    // Nothing was touched in the tree we froze.
+    expect(h.clones).toHaveLength(0);
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
   });
 
   it("a live-resolved base is corroborated", async () => {
