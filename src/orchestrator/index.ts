@@ -2515,18 +2515,23 @@ export async function runPanelOrchestrator(): Promise<void> {
       // bridge pins each CURRENT socket's kind on its FIRST hello, so query that
       // trusted session state rather than this raw (and replayable) hello's
       // `headless`. A headless mirror cannot load the desktop extension.
+      // #771/#784 — a hello means this tab (and possibly ComfyUI itself) just
+      // came back, and the retarget below may still change which server we are
+      // talking to. Any earlier on-disk reading could therefore describe a
+      // different install, so drop it SYNCHRONOUSLY here, before anything can
+      // read it again. During that gap a write refusal falls back to ordinary
+      // update guidance instead of certifying a stale reading as "your install
+      // is fine, just hard-refresh".
+      //
+      // UNCONDITIONAL, and deliberately outside the auto-sync branch below: a
+      // user who disabled auto-sync still gets write refusals, and a same-URL
+      // restart onto a different --base-directory would otherwise leave the
+      // previous tree's reading standing with nothing to replace it.
+      clearPanelDiskObservation();
       if (
         !bridge.isCurrentHeadless(panelTab) &&
         !isPanelAutoInstallDisabled()
       ) {
-        // #771/#784 — a hello means this tab (and possibly ComfyUI itself) just
-        // came back, and the retarget below may still change which server we are
-        // talking to. Any earlier on-disk reading could therefore describe a
-        // different install, so drop it SYNCHRONOUSLY here, before the async
-        // sync re-reads it. During that gap a write refusal falls back to
-        // ordinary update guidance instead of certifying a stale reading as
-        // "your install is fine, just hard-refresh".
-        clearPanelDiskObservation();
         void performPanelSync()
           .then((sync) => {
             // An already-current local panel needs no chat noise. Every other

@@ -1401,9 +1401,20 @@ export async function panelStatus(
     // tree the server actually serves, reported as missing, with an invitation
     // to install a second copy where nothing would load it. Say which tree was
     // scanned and that it is uncorroborated, rather than asserting absence.
+    //
+    // The same applies, more sharply, when the scan itself did not complete:
+    // `installed: false` from a failed enumeration is "we could not look", and
+    // inviting an install on that basis could clobber a panel the scan simply
+    // missed — the loss `scanReliable` was introduced to prevent.
     const uncorroborated =
       isRealDeps(deps) && !isLiveDerivedBase(baseResolution);
-    note = uncorroborated
+    note = detection.scanReliable === false
+      ? `Whether the panel is installed is UNKNOWN: ${comfyuiPath ?? "custom_nodes"}` +
+        `/custom_nodes could not be fully enumerated (or a candidate's pyproject.toml ` +
+        `could not be read), so this is NOT a proven absence and no install is ` +
+        `recommended — one could clobber a panel the scan missed. Make custom_nodes ` +
+        `readable, then re-check.`
+      : uncorroborated
       ? `No panel found in ${comfyuiPath ?? "custom_nodes"} — but this is the ` +
         `CONFIGURED path, and the running ComfyUI did not confirm it is the tree it ` +
         `serves from, so "not installed" is UNCORROBORATED. On a split install ` +
@@ -1438,7 +1449,7 @@ export async function panelStatus(
   // lock and is called from everywhere, so moving directories from it could cut
   // across another process's in-flight swap. The mutation paths do the repair.
   const swapNote = comfyuiPath
-    ? (reconcilePanelSwap(comfyuiPath, deps, { repair: false }) ?? "")
+    ? (reconcilePanelSwap(comfyuiPath, deps, { repair: false }).note ?? "")
     : "";
 
   const pin = readPinSafe(deps);
@@ -2072,25 +2083,40 @@ function swapJournalPath(comfyuiPath: string): string {
  * when it did something (or could not), else undefined. Never throws — a
  * journal we cannot read must not block panel management, only be reported.
  */
+interface SwapReconcileResult {
+  /**
+   * False ONLY when a broken swap was found and NOT put right. A mutation must
+   * not proceed past that: installing into the empty canonical path would look
+   * like success while the user's real panel stayed stranded in the backup dir,
+   * and the next reconcile — seeing a directory there again — would quietly
+   * delete the journal that recorded where it went.
+   */
+  ok: boolean;
+  /** Human-readable note, when there is something to say. */
+  note?: string;
+}
+
 function reconcilePanelSwap(
   comfyuiPath: string,
   deps: PanelInstallerDeps,
   opts: { repair: boolean },
-): string | undefined {
+): SwapReconcileResult {
   const journalPath = swapJournalPath(comfyuiPath);
-  if (!deps.existsSync(journalPath)) return undefined;
+  if (!deps.existsSync(journalPath)) return { ok: true };
 
   let journal: PanelSwapJournal;
   try {
     journal = JSON.parse(deps.readFile(journalPath)) as PanelSwapJournal;
     if (!journal?.dir || !journal?.backupDir) throw new Error("incomplete record");
   } catch (err) {
-    return (
-      ` NOTE: an interrupted panel swap is recorded at ${journalPath}, but the record ` +
-      `could not be read (${err instanceof Error ? err.message : String(err)}), so it ` +
-      `could not be repaired automatically. Check custom_nodes and custom_nodes_backup ` +
-      `for the panel, then delete that file.`
-    );
+    return {
+      ok: false,
+      note:
+        ` NOTE: an interrupted panel swap is recorded at ${journalPath}, but the record ` +
+        `could not be read (${err instanceof Error ? err.message : String(err)}), so it ` +
+        `could not be repaired automatically. Check custom_nodes and custom_nodes_backup ` +
+        `for the panel, then delete that file.`,
+    };
   }
 
   const remove = () => {
@@ -2104,7 +2130,7 @@ function reconcilePanelSwap(
   // The canonical dir is there: the swap either finished or was rolled back.
   if (deps.existsSync(journal.dir)) {
     remove();
-    return undefined;
+    return { ok: true };
   }
 
   // No panel in custom_nodes. This is the broken state — put back the copy that
@@ -2114,12 +2140,14 @@ function reconcilePanelSwap(
   // holds no lock, so repairing from there could move directories out from
   // under another process's in-flight swap. From a read it only reports.
   if (!opts.repair) {
-    return (
-      ` WARNING: a previous panel update was interrupted and custom_nodes has NO panel ` +
-      `at ${journal.dir}; the previous copy is at ${journal.backupDir}. Run ` +
-      `install_panel(action='update') to repair it automatically, or move it back ` +
-      `manually, then restart ComfyUI.`
-    );
+    return {
+      ok: false,
+      note:
+        ` WARNING: a previous panel update was interrupted and custom_nodes has NO panel ` +
+        `at ${journal.dir}; the previous copy is at ${journal.backupDir}. Run ` +
+        `install_panel(action='update') to repair it automatically, or move it back ` +
+        `manually, then restart ComfyUI.`,
+    };
   }
   if (deps.existsSync(journal.backupDir) && deps.rename) {
     try {
@@ -2129,28 +2157,34 @@ function reconcilePanelSwap(
         `[panel] repaired an interrupted panel update: restored ${journal.backupDir} ` +
           `to ${journal.dir}. RESTART ComfyUI, then retry the update.`,
       );
-      return (
-        ` NOTE: a previous panel update was interrupted partway through and left ` +
-        `custom_nodes with no panel. The previous copy` +
-        `${journal.previousVersion ? ` (${journal.previousVersion})` : ""} has been ` +
-        `RESTORED to ${journal.dir}. Restart ComfyUI, then retry the update.`
-      );
+      return {
+        ok: true,
+        note:
+          ` NOTE: a previous panel update was interrupted partway through and left ` +
+          `custom_nodes with no panel. The previous copy` +
+          `${journal.previousVersion ? ` (${journal.previousVersion})` : ""} has been ` +
+          `RESTORED to ${journal.dir}. Restart ComfyUI, then retry the update.`,
+      };
     } catch (err) {
-      return (
-        ` WARNING: a previous panel update was interrupted and custom_nodes has NO ` +
-        `panel. The previous copy is at ${journal.backupDir} but could not be moved ` +
-        `back automatically (${err instanceof Error ? err.message : String(err)}). ` +
-        `Move it to ${journal.dir} manually, then restart ComfyUI.`
-      );
+      return {
+        ok: false,
+        note:
+          ` WARNING: a previous panel update was interrupted and custom_nodes has NO ` +
+          `panel. The previous copy is at ${journal.backupDir} but could not be moved ` +
+          `back automatically (${err instanceof Error ? err.message : String(err)}). ` +
+          `Move it to ${journal.dir} manually, then restart ComfyUI.`,
+      };
     }
   }
 
-  return (
-    ` WARNING: a previous panel update was interrupted and custom_nodes has NO panel ` +
-    `at ${journal.dir}. The backup recorded at ${journal.backupDir} is not there ` +
-    `either — look in ${join(comfyuiPath, "custom_nodes_backup")} and move the panel ` +
-    `back, or reinstall it with install_panel(action='install').`
-  );
+  return {
+    ok: false,
+    note:
+      ` WARNING: a previous panel update was interrupted and custom_nodes has NO panel ` +
+      `at ${journal.dir}. The backup recorded at ${journal.backupDir} is not there ` +
+      `either — look in ${join(comfyuiPath, "custom_nodes_backup")} and move the panel ` +
+      `back, or reinstall it with install_panel(action='install').`,
+  };
 }
 
 /**
@@ -2640,10 +2674,21 @@ export async function runPanelActionInner(
   // installed" and this operation would happily install over the top of a broken
   // state. Both mutation entry points hold the panel op lock, so this is the
   // safe place to put it back.
-  const swapRepairNote = reconcilePanelSwap(comfyPath, deps, { repair: true });
-
-  if (swapRepairNote) {
-    logger.info(`[panel] before ${action}:${swapRepairNote}`);
+  const swapRepair = reconcilePanelSwap(comfyPath, deps, { repair: true });
+  if (!swapRepair.ok) {
+    // A broken swap we could NOT put right. Proceeding would install a fresh
+    // panel into the empty canonical path and report success while the user's
+    // real one stayed stranded in the backup dir — and the next reconcile,
+    // seeing a directory there again, would delete the journal that says where
+    // it went. Refuse until a human resolves it.
+    throw new PanelInstallError(
+      `Panel ${action} REFUSED: a previous panel update was interrupted and could not ` +
+        `be repaired automatically, so custom_nodes is in an unknown state and ` +
+        `${action}ing now could strand your existing panel.${swapRepair.note ?? ""}`,
+    );
+  }
+  if (swapRepair.note) {
+    logger.info(`[panel] before ${action}:${swapRepair.note}`);
   }
 
   const detection = await detectPanelInstall(deps);
@@ -2687,7 +2732,24 @@ export async function runPanelActionInner(
     try {
       result = await deps.update({ id: PANEL_REGISTRY_ID });
     } catch (err) {
-      if (!detection.installed) throw err;
+      // Propagate only when the DISK agrees the pack is absent — and only when
+      // that reading is trustworthy. A failed custom_nodes enumeration also
+      // yields `installed: false` (scanReliable === false), which is "we could
+      // not look", not "it is not there"; rethrowing the Manager's absence
+      // claim on that basis would put the #771 contradiction straight back.
+      if (!detection.installed) {
+        if (detection.scanReliable === false) {
+          throw new PanelInstallError(
+            `Panel update could not be attempted: ComfyUI-Manager reported an error ` +
+              `(${err instanceof Error ? err.message : String(err)}), and custom_nodes ` +
+              `could not be enumerated to check what is actually installed, so whether ` +
+              `the panel is present is UNKNOWN. NOT accepting "not installed" from a ` +
+              `scan that did not run. Make ${comfyPath}/custom_nodes readable, then ` +
+              `re-run install_panel(action='status').`,
+          );
+        }
+        throw err;
+      }
       managerFailure = err instanceof Error ? err.message : String(err);
       logger.warn(
         `[panel] ComfyUI-Manager could not update the panel (${managerFailure}) — the ` +
@@ -2698,10 +2760,51 @@ export async function runPanelActionInner(
     }
 
     if (!result) {
-      // The Manager path threw. `detection.installed` is proven true (checked
-      // above), so route straight to whichever direct path fits this install
-      // SHAPE — a fast-forward for a checkout, a verified reinstall for a
-      // registry zip. Both prove movement on disk before reporting anything.
+      // RE-READ BEFORE FALLING BACK. A thrown Manager error does not prove the
+      // Manager did nothing: its post-op presence check is the thing that
+      // failed, so the update itself may already have landed. Falling back on
+      // the PRE-call reading would then compare the fresh clone against a stale
+      // version and could swap a just-installed newer panel out for an older
+      // published one — a downgrade, reported as an update.
+      const afterManager = await detectPanelInstall(deps);
+      const managerMoved =
+        afterManager.installed &&
+        !!afterManager.version &&
+        ((!!previousVersion && afterManager.version !== previousVersion) ||
+          (!!previousRev && !!afterManager.gitRev && afterManager.gitRev !== previousRev));
+      if (managerMoved && afterManager.dir) {
+        // It DID work; only the reporting failed. Verify it the same way every
+        // other success is verified, then report the movement we observed.
+        assertNoPanelShadow("update", afterManager.dir, deps);
+        const moved =
+          `Panel updated (${previousVersion ?? "unknown"} → ${afterManager.version}), ` +
+          `verified on disk at ${afterManager.dir}. ComfyUI-Manager applied the update ` +
+          `but then errored while checking its own installed-pack list ` +
+          `(${managerFailure}) — that check reads the Manager's registry view, not the ` +
+          `disk, so it is wrong about this pack, not about the update. RESTART ComfyUI ` +
+          `to load it.`;
+        return {
+          action: "update",
+          result: {
+            mechanism: "manager-http",
+            message: moved,
+            details: { manager_error: managerFailure },
+          },
+          restartRequired: true,
+          message: moved,
+          previousVersion,
+          installedVersion: afterManager.version,
+        };
+      }
+      // Nothing moved. Continue with the FRESH reading, so the fallback's
+      // never-backwards check compares against what is on disk NOW.
+      const freshVersion = afterManager.installed ? afterManager.version : undefined;
+      const freshDir = afterManager.installed ? afterManager.dir : detection.dir;
+      const freshRev = afterManager.installed ? afterManager.gitRev : previousRev;
+
+      // Route to whichever direct path fits this install SHAPE — a fast-forward
+      // for a checkout, a verified reinstall for a registry zip. Both prove
+      // movement on disk before reporting anything.
       //
       // The Manager's RAW text is deliberately NOT quoted into what we report.
       // It is precisely the sentence we have just disproved ("it is not
@@ -2713,13 +2816,13 @@ export async function runPanelActionInner(
       const managerReason =
         `ComfyUI-Manager could not update the panel (it does not resolve ` +
         `"${PANEL_REGISTRY_ID}" in its own installed-pack list, though the pack IS ` +
-        `on disk at ${detection.dir ?? "custom_nodes"})`;
-      if (previousRev && detection.dir) {
+        `on disk at ${freshDir ?? "custom_nodes"})`;
+      if (freshRev && freshDir) {
         return updateViaGitCheckoutFallback({
           deps,
-          dir: detection.dir,
-          previousVersion,
-          previousRev,
+          dir: freshDir,
+          previousVersion: freshVersion,
+          previousRev: freshRev,
           // Synthesize the shape the fallback reports around; there is no real
           // Manager result because the Manager call failed.
           result: {
@@ -2729,14 +2832,14 @@ export async function runPanelActionInner(
           },
         });
       }
-      const swapOps = detection.dir ? resolveSwapOps(deps) : undefined;
-      if (detection.dir && swapOps) {
+      const swapOps = freshDir ? resolveSwapOps(deps) : undefined;
+      if (freshDir && swapOps) {
         return updateViaRegistryZipReinstall({
           deps,
           ops: swapOps,
-          dir: detection.dir,
+          dir: freshDir,
           comfyuiPath: comfyPath,
-          previousVersion,
+          previousVersion: freshVersion,
           // The raw Manager text rides along in `details` for diagnosis; the
           // message the fallback composes never quotes it.
           result: {
@@ -2749,8 +2852,8 @@ export async function runPanelActionInner(
       }
       throw new PanelInstallError(
         `Panel update did NOT apply: ${managerReason}. The panel IS installed` +
-          `${detection.dir ? ` at ${detection.dir}` : ""}` +
-          `${previousVersion ? ` (version ${previousVersion})` : ""} — whatever the ` +
+          `${freshDir ? ` at ${freshDir}` : ""}` +
+          `${freshVersion ? ` (version ${freshVersion})` : ""} — whatever the ` +
           `Manager's error says, that is what install_panel(action='status') reads ` +
           `off the disk — but no direct update path is available here (it is not a ` +
           `git checkout, so there is nothing to fast-forward). ` +

@@ -36,7 +36,10 @@ import {
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { logger } from "../utils/logger.js";
-import { describePanelManagementRedirect } from "./panel-recovery.js";
+import {
+  describePanelManagementRedirect,
+  panelRecoveryContext,
+} from "./panel-recovery.js";
 import {
   describePanelPin,
   getPanelPinState,
@@ -157,8 +160,22 @@ export function assertPanelPinAllows(action: string, id: string): void {
         `must be unset/changed in the environment — unpin cannot remove it)`
       : ``;
 
+  // #774/#784 — this refusal names install_panel(action='unpin') as the way
+  // out, and in a remote/cloud session that tool cannot act. A pin that can only
+  // be cleared by a tool the caller cannot reach is another dead end, so say
+  // where the pin actually lives when install_panel is not usable here. (An env
+  // pin already has its own instruction and needs no addition.)
+  const ctx = panelRecoveryContext();
+  const unreachableNote =
+    ctx.installPanelUsable || pin.source === "env"
+      ? ``
+      : ` NOTE: install_panel cannot act in this session, so the pin must be ` +
+        `cleared where the panel lives — remove the pin from the ComfyUI host's ` +
+        `~/.comfyui-mcp/panel-settings.json (or unset ${PANEL_PIN_ENV_VAR} there) ` +
+        `and restart the orchestrator on that host.`;
+
   throw new PanelPinnedError(
-    bulk
+    (bulk
       ? `Refusing to ${action} "${id}": that would also move the sidebar panel pack, ` +
         `which is ${describePanelPin(pin)}. ComfyUI-Manager cannot update ` +
         `everything-except-one-pack, so either clear the pin first with ` +
@@ -166,7 +183,8 @@ export function assertPanelPinAllows(action: string, id: string): void {
         `individually by id.`
       : `Refusing to ${action} the sidebar panel pack ("${id}"): it is ` +
         `${describePanelPin(pin)}. A pin is honoured even when a newer panel exists — ` +
-        `clear it first with install_panel(action='unpin')${envNote}, then re-run.`,
+        `clear it first with install_panel(action='unpin')${envNote}, then re-run.`) +
+      unreachableNote,
   );
 }
 

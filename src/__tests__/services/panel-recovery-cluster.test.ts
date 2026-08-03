@@ -470,6 +470,53 @@ describe("update no longer contradicts status on a registry-zip install (#771)",
     expect((err as Error).message).toMatch(/0\.11\.34/);
   });
 
+  it("re-reads after a swallowed Manager error — a Manager that DID work is not undone", async () => {
+    // The Manager's post-op check is what failed, not necessarily the update.
+    // Falling back on the pre-call reading would compare the clone against a
+    // stale version and could swap a just-installed 0.11.40 out for a published
+    // 0.11.38 — a downgrade, reported as an update.
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    const h = makeDeps({ cloneVersion: "0.11.38" });
+    h.deps.update = async () => {
+      // The update lands, then the presence check throws.
+      writePanelPack(PANEL_DIR(), "0.11.40");
+      throw new Error("is not installed locally and was not found in the registry");
+    };
+    const result = await runPanelActionInner("update", h.deps);
+    expect(result.installedVersion).toBe("0.11.40");
+    expect(h.clones).toHaveLength(0); // no swap — nothing needed replacing
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.40");
+  });
+
+  it("an UNRELIABLE scan never propagates the Manager's absence claim", async () => {
+    // A failed custom_nodes enumeration also yields installed:false. That is
+    // "we could not look", not "it is not there", and accepting it would put
+    // the #771 contradiction straight back.
+    const h = makeDeps({ updateThrows: "it is not installed locally" });
+    h.deps.readdir = () => {
+      throw new Error("EACCES: permission denied");
+    };
+    const err = await runPanelActionInner("update", h.deps).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    // The Manager's text may be QUOTED as an attributed report, but the verdict
+    // must be "unknown", never "absent".
+    expect((err as Error).message).toMatch(/UNKNOWN/);
+    expect((err as Error).message).toMatch(/ComfyUI-Manager reported an error/);
+    expect((err as Error).message).toMatch(/NOT accepting "not installed" from a scan that did not run/);
+  });
+
+  it("status reports an unreliable scan as UNKNOWN, never as 'Not installed'", async () => {
+    const h = makeDeps({ withoutSwapOps: true });
+    h.deps.readdir = () => {
+      throw new Error("EACCES: permission denied");
+    };
+    const { panelStatus } = await import("../../services/panel-installer.js");
+    const status = await panelStatus(h.deps);
+    expect(status.note).toMatch(/UNKNOWN/);
+    expect(status.note).not.toMatch(/Not installed\./);
+    expect(status.note).not.toMatch(/action='install'/);
+  });
+
   it("propagates the Manager error unchanged when the disk AGREES the pack is absent", async () => {
     const h = makeDeps({ updateThrows: "genuinely not installed anywhere" });
     const err = await runPanelActionInner("update", h.deps).catch((e: Error) => e);
@@ -637,6 +684,28 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     // process's in-flight swap.
     expect(existsSync(PANEL_DIR())).toBe(false);
     expect(existsSync(join(root, ".comfyui-agent-panel.swap.json"))).toBe(true);
+  });
+
+  it("REFUSES every mutation when an interrupted swap could NOT be repaired", async () => {
+    // Otherwise an install would drop a fresh panel into the empty canonical
+    // path, report success, and leave the user's real one stranded — after
+    // which the next reconcile, seeing a directory there, deletes the journal
+    // that recorded where it went.
+    writeFileSync(
+      join(root, ".comfyui-agent-panel.swap.json"),
+      JSON.stringify({
+        dir: PANEL_DIR(),
+        backupDir: join(root, "custom_nodes_backup", "gone"), // not there
+        staging: "x",
+        startedAt: Date.now(),
+      }),
+    );
+    const h = makeDeps({ cloneVersion: "0.11.38" });
+    const err = await runPanelActionInner("install", h.deps).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect((err as Error).message).toMatch(/REFUSED/);
+    expect((err as Error).message).toMatch(/interrupted/i);
+    expect(existsSync(PANEL_DIR())).toBe(false);
   });
 
   it("REFUSES the swap when the recovery journal cannot be written", async () => {
