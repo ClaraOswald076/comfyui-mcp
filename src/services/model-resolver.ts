@@ -706,6 +706,11 @@ async function categoriesUnder(modelsRoot: string): Promise<string[]> {
  * of files the live server has never heard of (codex gate, round 1 — the target
  * category alone made an empty-but-wrong destination look evidence-free).
  *
+ * Agreement means CONTAINMENT, not overlap (codex gate, round 5): a directory the
+ * server scans has ALL of its model files in that server's listing. A single shared
+ * filename proves nothing — two unrelated installs routinely hold the same popular
+ * checkpoint — so overlap alone must never suppress the refusal.
+ *
  * A SECOND contradiction is also fatal (codex gate, round 2): the candidate root
  * holds NO core model files at all while the live server lists some AND registers no
  * extra model roots. The server's models must physically live under ITS primary root,
@@ -742,10 +747,9 @@ async function assertDestinationVisibleToLiveServer(
   ];
 
   let probed = 0;
-  let conclusive = 0;
   let filesOnDisk = 0;
   let liveListed = 0;
-  let worst: { category: string; onDisk: number; live: number } | undefined;
+  let worst: { category: string; missing: string[]; onDisk: number; live: number } | undefined;
   for (const category of ordered) {
     if (probed >= DISAGREEMENT_PROBE_CATEGORIES) break;
     const onDisk = await coreModelFilesUnder(join(modelsRoot, category));
@@ -755,25 +759,31 @@ async function assertDestinationVisibleToLiveServer(
     filesOnDisk += onDisk.length;
     liveListed += listing.length;
     if (onDisk.length === 0) continue; // nothing to compare in this folder
-    // Basename comparison ON PURPOSE here: this decides whether to REFUSE, so
-    // over-matching errs toward allowing the download (a same-named file in a
-    // different subfolder still says "these two trees are related").
+    // CONTAINMENT, not overlap. If this directory really is one the server reads,
+    // it SCANS it — so EVERY core-extension file in it must appear in the listing.
+    // A merely-overlapping name proves nothing: two unrelated installs routinely
+    // share `sd_xl_base_1.0.safetensors`, and treating that as agreement let a
+    // download proceed into a stale tree (codex gate, round 5). Compared by
+    // basename so a file the server reports from a nested path still counts.
     const liveNames = new Set(listing.map((n) => basename(n)));
-    if (onDisk.some((n) => liveNames.has(n))) return; // agrees — this IS the live tree
-    conclusive += 1;
-    if (!worst) worst = { category, onDisk: onDisk.length, live: listing.length };
+    const missing = onDisk.filter((n) => !liveNames.has(n));
+    if (missing.length === 0) continue; // this folder is fully accounted for — agrees
+    if (!worst) {
+      worst = { category, missing, onDisk: onDisk.length, live: listing.length };
+    }
   }
 
-  if (conclusive > 0 && worst) {
+  if (worst) {
+    const sample = worst.missing.slice(0, 3).join(", ");
     throw new ModelError(
       `Refusing to download into "${modelsRoot}": the connected ComfyUI ` +
         `(${getComfyUIBaseUrl()}) does not read from it. Its "${worst.category}" folder holds ` +
-        `${worst.onDisk} model file(s) and the running server lists ${worst.live} for that ` +
-        "category — with NONE in common, so this is a DIFFERENT install than the one serving " +
-        "you. This destination came from local configuration (COMFYUI_PATH / the saved default " +
-        "workspace), not from the running server, which could not tell us its own install root. " +
-        "Point COMFYUI_PATH at the ComfyUI that is actually running, or launch it with an " +
-        "absolute --base-directory, then retry.",
+        `${worst.onDisk} model file(s), ${worst.missing.length} of which the running server does ` +
+        `NOT list (e.g. ${sample}) — if it scanned this directory it would see all of them, so ` +
+        "this is a DIFFERENT install than the one serving you. This destination came from local " +
+        "configuration (COMFYUI_PATH / the saved default workspace), not from the running server, " +
+        "which could not tell us its own install root. Point COMFYUI_PATH at the ComfyUI that is " +
+        "actually running, or launch it with an absolute --base-directory, then retry.",
     );
   }
 
@@ -834,6 +844,43 @@ export async function liveListingHasEntry(
   if (listing === undefined) return undefined;
   const wanted = listingEntryFor(targetSubfolder, filename);
   return listing.some((n) => normRel(n) === wanted);
+}
+
+/**
+ * Is `absPath` inside a directory tree the CONNECTED server actually reads models
+ * from — its primary models root, or a LIVE-registered extra model root (the #633
+ * external-drive shape)?
+ *
+ * `undefined` means UNKNOWN, not "no": the primary root itself could only be
+ * resolved from local configuration the running server never vouched for, so
+ * containment in it says nothing. Callers must treat unknown as unconfirmed, never
+ * as confirmation. Never throws.
+ */
+export async function isUnderLiveModelRoots(
+  absPath: string,
+): Promise<boolean | undefined> {
+  const p = resolve(absPath);
+  const under = (root: string): boolean => {
+    const r = resolve(root);
+    return p === r || p.startsWith(r + sep);
+  };
+  let dest: Awaited<ReturnType<typeof resolveModelsDirWithBases>>;
+  try {
+    dest = await resolveModelsDirWithBases();
+  } catch {
+    return undefined;
+  }
+  if (!isLiveAuthoritativeModelsDir(dest.source)) return undefined;
+  if (under(dest.modelsDir)) return true;
+  let extra: Awaited<ReturnType<typeof getLiveExtraModelRoots>>;
+  try {
+    extra = await getLiveExtraModelRoots(dest.snapshot);
+  } catch {
+    return undefined;
+  }
+  if (extra.roots.some((r) => under(r.dir))) return true;
+  // The live roots are known and this path is in none of them.
+  return extra.authoritative ? false : undefined;
 }
 
 export interface LandedModelVerification {
@@ -921,47 +968,15 @@ export async function verifyLandedModel(
   // same name in the LIVE tree would otherwise verify our write into a STALE tree
   // as a success (codex gate, round 3) — so a name that was already listed BEFORE
   // the download proves nothing there.
+  // Is the file inside a tree the RUNNING server actually reads? `true` makes the
+  // listing decisive; `false` means it demonstrably is not (a ComfyUI restart onto
+  // a DIFFERENT install between the write and this check produces exactly that —
+  // codex gate, round 4); `undefined` means only local configuration could answer,
+  // so a pre-existing listing entry proves nothing about OUR bytes.
   const landed = verifiedPath ?? resolve(targetPath);
-  const under = (root: string): boolean => {
-    const r = resolve(root);
-    return landed === r || landed.startsWith(r + sep);
-  };
-  let destinationIsLiveAuthoritative = false;
-  /** The server the file was landed for is NOT the server answering now, and the
-   *  file sits outside every tree that server reads. */
-  let outsideLiveRoots = false;
-  try {
-    const dest = await resolveModelsDirWithBases();
-    if (isLiveAuthoritativeModelsDir(dest.source)) {
-      if (under(dest.modelsDir)) {
-        destinationIsLiveAuthoritative = true;
-      } else {
-        // We KNOW the root the live server reads, and the landed file is not in it.
-        // Before calling that a wrong place, allow the legitimate #633 shape: a
-        // destination that (via a symlink) really lives in a registered EXTRA model
-        // root. Anything else is outside everything the running server reads —
-        // which is exactly what a ComfyUI restart onto a DIFFERENT install between
-        // the write and this check produces (codex gate, round 4).
-        let extra: Awaited<ReturnType<typeof getLiveExtraModelRoots>>;
-        try {
-          extra = await getLiveExtraModelRoots(dest.snapshot);
-        } catch {
-          extra = { authoritative: false, roots: [] };
-        }
-        const inExtra = extra.roots.some((r) => {
-          try {
-            return under(r.dir);
-          } catch {
-            return false;
-          }
-        });
-        outsideLiveRoots = !inExtra;
-      }
-    }
-  } catch {
-    destinationIsLiveAuthoritative = false;
-  }
-  if (outsideLiveRoots) {
+  const inLiveRoots = await isUnderLiveModelRoots(landed);
+  const destinationIsLiveAuthoritative = inLiveRoots === true;
+  if (inLiveRoots === false) {
     let liveRoot: string | undefined;
     try {
       liveRoot = await resolveModelsDir();

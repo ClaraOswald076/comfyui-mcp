@@ -26,6 +26,7 @@ import {
   downloadModel,
   listLocalModels,
   liveListingHasEntry,
+  isUnderLiveModelRoots,
   resolveExistingModelFile,
   managerModelDestination,
   MODEL_SUBDIRS,
@@ -908,17 +909,24 @@ async function applyManifestSections(
         // an old file in a STALE install would otherwise satisfy the manifest while
         // the live server has never seen it — the #369 failure, reached through the
         // existing-file shortcut instead of a download (codex gate, round 3).
-        const visible = await liveListingHasEntry(target.targetSubfolder, target.filename);
+        // Prefer the DECISIVE test when it is available: is the file we found
+        // physically inside a tree the running server reads? A name-only listing
+        // check cannot tell a stale `C:\Stale\...\x.safetensors` from the live
+        // server's own `D:\Live\...\x.safetensors` (codex gate, round 5).
+        const inLiveRoots = await isUnderLiveModelRoots(existing);
+        const visible =
+          inLiveRoots ?? (await liveListingHasEntry(target.targetSubfolder, target.filename));
         results.push(
           visible === false
             ? report(
                 "model",
                 item,
                 "failed",
-                `A file exists at ${existing}, but the connected ComfyUI does not list ` +
-                  `"${target.filename}" under "${target.targetSubfolder}" — it is in an install ` +
-                  "the running server does not read. Point COMFYUI_PATH at the ComfyUI that is " +
-                  "actually running, or launch it with an absolute --base-directory.",
+                `A file exists at ${existing}, but it is NOT in any directory the connected ` +
+                  `ComfyUI reads models from (it does not list "${target.filename}" under ` +
+                  `"${target.targetSubfolder}") — it belongs to an install the running server ` +
+                  "does not use. Point COMFYUI_PATH at the ComfyUI that is actually running, " +
+                  "or launch it with an absolute --base-directory.",
               )
             : visible === undefined
               ? // The server could not be asked, so "already exists" is an

@@ -41,6 +41,11 @@ const verifyLandedModelMock = vi.hoisted(() =>
 const liveListingHasEntryMock = vi.hoisted(() =>
   vi.fn(async (): Promise<boolean | undefined> => true),
 );
+/** #369: is an existing file physically inside a tree the live server reads?
+ *  Default UNKNOWN — only the listing fallback can answer in these tests. */
+const isUnderLiveModelRootsMock = vi.hoisted(() =>
+  vi.fn(async (): Promise<boolean | undefined> => undefined),
+);
 const resolveExistingModelFileMock = vi.hoisted(() => vi.fn());
 const listLocalModelsMock = vi.hoisted(() => vi.fn());
 const savedWorkspaceMock = vi.hoisted(() => vi.fn(() => undefined as string | undefined));
@@ -128,6 +133,9 @@ vi.mock("../../services/model-resolver.js", () => ({
   // The "already exists" shortcut confirms the file is one the LIVE server reads
   // before it counts as a skip (#369). Default: it is.
   liveListingHasEntry: (...a: unknown[]) => liveListingHasEntryMock(...(a as [string, string])),
+  // The decisive containment test. Default UNKNOWN (only local config could answer),
+  // so these tests exercise the listing-based fallback.
+  isUnderLiveModelRoots: (...a: unknown[]) => isUnderLiveModelRootsMock(...(a as [string])),
   // Faithful mirror of the real managerModelDestination (pure logic) so the
   // remote-model path resolves a Manager-valid { type, save_path }.
   managerModelDestination: (category: string, relPath?: string) => {
@@ -444,6 +452,35 @@ describe("applyManifest", () => {
     expect(result.summary).toMatchObject({ skipped: 0, failed: 1 });
     expect(result.results[0].message).toMatch(/does not list/);
     expect(downloadModelMock).not.toHaveBeenCalled();
+  });
+
+  it("FAILS a same-named existing file that is OUTSIDE every live model root (codex gate r5)", async () => {
+    // C:\Stale\...\big.safetensors exists locally AND the live server has its own
+    // D:\Live\...\big.safetensors, so a name-only listing check would call it a skip.
+    // The containment test is decisive and overrides it.
+    resolveExistingModelFileMock.mockResolvedValueOnce({
+      path: "C:/Stale/models/checkpoints/big.safetensors",
+      root: "C:/Stale/models",
+      info: { isFile: () => true },
+    });
+    // Decisive: the containment answer short-circuits the name-only listing check
+    // (which would have said "yes, the server lists big.safetensors" — its own copy).
+    isUnderLiveModelRootsMock.mockResolvedValueOnce(false);
+
+    const result = await applyManifest({
+      manifest: {
+        models: [
+          {
+            url: "https://example.com/big.safetensors",
+            model_type: "checkpoints",
+            filename: "big.safetensors",
+          },
+        ],
+      },
+    });
+
+    expect(result.summary).toMatchObject({ skipped: 0, failed: 1 });
+    expect(result.results[0].message).toMatch(/NOT in any directory/);
   });
 
   it("reports PENDING (never skipped) when the server cannot be asked about an existing file", async () => {

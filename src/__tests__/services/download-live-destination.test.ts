@@ -183,16 +183,25 @@ describe("pre-write: a destination the LIVE server does not read from is refused
     );
   });
 
-  it("ALLOWS when the live listing and the directory share a file (same tree)", async () => {
-    h.onDisk = { loras: ["shared.safetensors", "other.safetensors"] };
-    h.liveListings["loras"] = ["shared.safetensors", "more.safetensors"];
+  it("ALLOWS when the live server lists EVERY file the directory holds (it scans this tree)", async () => {
+    h.onDisk = { loras: ["a.safetensors", "b.safetensors"] };
+    h.liveListings["loras"] = ["a.safetensors", "b.safetensors", "from-an-extra-root.safetensors"];
     await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBe(
       resolve("/comfy/models/loras"),
     );
   });
 
-  it("ALLOWS when a SIBLING category agrees even though the target has no overlap yet", async () => {
-    // One shared file anywhere in the root proves this IS the live tree.
+  it("REFUSES on a merely OVERLAPPING filename — containment is required (codex gate r5)", async () => {
+    // Two unrelated installs routinely share a popular checkpoint. That shared name
+    // must NOT suppress the refusal when the rest of the tree is unknown to the server.
+    h.onDisk = { loras: ["sd_xl_base_1.0.safetensors", "only-here.safetensors"] };
+    h.liveListings["loras"] = ["sd_xl_base_1.0.safetensors", "live-only.safetensors"];
+    await expect(resolveModelSubfolderPreferServer("loras")).rejects.toThrow(
+      /DIFFERENT install/,
+    );
+  });
+
+  it("ALLOWS when a SIBLING category is fully accounted for and the target is empty", async () => {
     h.onDisk = { loras: [], checkpoints: ["shared.safetensors"] };
     h.liveListings["checkpoints"] = ["shared.safetensors"];
     await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBe(
