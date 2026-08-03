@@ -505,6 +505,24 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
   });
 
+  it("REFUSES when .git exists but its revision is UNREADABLE — cannot prove it is not a checkout", async () => {
+    // resolveGitRevision returns undefined for both "no .git" and "a .git that
+    // could not be read". Treating the second as the first would rename a
+    // developer's working repo out of custom_nodes and replace it.
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    mkdirSync(join(PANEL_DIR(), ".git"), { recursive: true }); // present but unreadable
+    const h = makeDeps({
+      updateThrows: "manager cannot resolve it",
+      cloneVersion: "0.11.38",
+      // no `revs` entry ⇒ gitRevision(dir) is undefined despite the .git
+    });
+    const err = await runPanelActionInner("update", h.deps).catch((e: Error) => e);
+    expect((err as Error).message).toMatch(/revision could not be read|may be\) a git checkout/);
+    expect(h.clones).toHaveLength(0);
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
+    expect(existsSync(join(root, "custom_nodes_backup"))).toBe(false);
+  });
+
   it("REFUSES a downgrade — never moves the user backwards", async () => {
     writePanelPack(PANEL_DIR(), "0.11.40");
     const h = makeDeps({ updateThrows: "manager cannot resolve it", cloneVersion: "0.11.38" });

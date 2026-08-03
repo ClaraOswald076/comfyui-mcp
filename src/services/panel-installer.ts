@@ -566,12 +566,13 @@ function isRealDeps(deps: PanelInstallerDeps): boolean {
  */
 export async function pinPanelBase(
   deps: PanelInstallerDeps,
+  opts: { force?: boolean } = {},
 ): Promise<PanelInstallerDeps> {
   const real = isRealDeps(deps);
   // Only probe the live server for the REAL deps. An injected dep set has
   // already declared where ComfyUI is; probing would be pointless and, in
   // tests, a network call nobody asked for.
-  if (real) await primePanelBase();
+  if (real) await primePanelBase({ force: opts.force });
   const base = deps.comfyuiPath();
   const pinned: MarkedDeps = { ...deps, comfyuiPath: () => base };
   if (real) pinned[REAL_DEPS] = true;
@@ -2198,15 +2199,31 @@ async function updateViaRegistryZipReinstall(opts: {
     );
   }
 
-  // NOT A GIT CHECKOUT. This is the whole precondition: a readable HEAD means
-  // #724's fast-forward applies and a wholesale replace would destroy work.
-  if (deps.gitRevision(dir)) {
+  // NOT A GIT CHECKOUT. This is the whole precondition: this path replaces the
+  // directory wholesale, which would discard a checkout's branch, remotes and
+  // any local commits.
+  //
+  // PROVE IT, do not infer it. `resolveGitRevision` returns undefined for BOTH
+  // "there is no .git" and "there is a .git but its HEAD/ref/pointer could not
+  // be read", so an unreadable or momentarily-malformed checkout looks exactly
+  // like a Registry zip. Treating the second as the first would rename a
+  // developer's working repo out of custom_nodes. So the absence of `.git`
+  // itself is the requirement, and an unresolvable revision beside a present
+  // `.git` is a refusal, not a licence.
+  const gitDir = join(dir, ".git");
+  if (deps.existsSync(gitDir)) {
+    const rev = deps.gitRevision(dir);
     throw new PanelInstallError(
       `Panel update did NOT apply (${managerReason}), and the reinstall-from-source ` +
-        `fallback is REFUSED: ${dir} IS a git checkout, so replacing it wholesale ` +
-        `would discard its branch, remotes and any local commits. The fast-forward ` +
-        `path handles a checkout; this one exists only for a Comfy Registry zip ` +
-        `install. Update the panel repo manually (git pull in ${dir}), then RESTART ComfyUI.`,
+        `fallback is REFUSED: ${dir} has a .git${
+          rev ? "" : " whose revision could not be read"
+        }, so it is${rev ? "" : " (or may be)"} a git checkout, and replacing it ` +
+        `wholesale would discard its branch, remotes and any local commits. The ` +
+        `fast-forward path handles a checkout; this one exists only for a Comfy ` +
+        `Registry zip install, which has no .git at all. Update the panel repo ` +
+        `manually (git pull in ${dir})${
+          rev ? "" : `, or repair its .git metadata first`
+        }, then RESTART ComfyUI.`,
     );
   }
 

@@ -22,6 +22,7 @@ import { judgeHelloRetarget, canonComfyuiTargetUrl } from "../services/hello-ret
 import { startQuickTunnel } from "../services/tunnel.js";
 import { detectInstallMode } from "../services/self-update.js";
 import { performPanelSync } from "../services/panel-sync.js";
+import { clearPanelDiskObservation } from "../services/panel-workspace.js";
 import { isPanelAutoInstallDisabled } from "../services/panel-installer.js";
 import { SelfRestarter } from "../services/self-restart.js";
 import {
@@ -2518,6 +2519,14 @@ export async function runPanelOrchestrator(): Promise<void> {
         !bridge.isCurrentHeadless(panelTab) &&
         !isPanelAutoInstallDisabled()
       ) {
+        // #771/#784 — a hello means this tab (and possibly ComfyUI itself) just
+        // came back, and the retarget below may still change which server we are
+        // talking to. Any earlier on-disk reading could therefore describe a
+        // different install, so drop it SYNCHRONOUSLY here, before the async
+        // sync re-reads it. During that gap a write refusal falls back to
+        // ordinary update guidance instead of certifying a stale reading as
+        // "your install is fine, just hard-refresh".
+        clearPanelDiskObservation();
         void performPanelSync()
           .then((sync) => {
             // An already-current local panel needs no chat noise. Every other

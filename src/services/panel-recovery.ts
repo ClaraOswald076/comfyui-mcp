@@ -69,24 +69,55 @@ export interface PanelRecoveryContext {
   comfyuiPath?: string;
 }
 
-/** Resolve the recovery context from the live deployment mode. */
+/**
+ * Resolve the recovery context from the live deployment mode.
+ *
+ * Deliberately tolerant of a mode helper that cannot be read: this function's
+ * only job is to compose an error message, and an error message must never be
+ * the thing that throws. An unreadable mode resolves to "local" — the branch
+ * that names install_panel AND carries the host-side commands, so the caller is
+ * still left with something to do either way.
+ */
 export function panelRecoveryContext(): PanelRecoveryContext {
-  if (!isLocalMode()) {
+  const local = (() => {
+    try {
+      return isLocalMode();
+    } catch {
+      return true;
+    }
+  })();
+  if (!local) {
     // Not local. `isRemoteMode()` distinguishes a non-loopback COMFYUI_URL from
     // Comfy Cloud (an API key), which get different host-side advice.
-    return {
-      installPanelUsable: false,
-      blocker: isRemoteMode() ? "remote" : "cloud",
-    };
+    const remote = (() => {
+      try {
+        return isRemoteMode();
+      } catch {
+        return true;
+      }
+    })();
+    return { installPanelUsable: false, blocker: remote ? "remote" : "cloud" };
   }
   // Local. Only a RESOLVED "there is no local ComfyUI" counts as a blocker —
   // an unprimed cache means we have not looked, not that there is nothing
   // there, and must not suppress the tool that would have fixed it.
-  const resolution = lastPanelBaseResolution();
+  const resolution = (() => {
+    try {
+      return lastPanelBaseResolution();
+    } catch {
+      return undefined;
+    }
+  })();
   if (resolution && !resolution.base) {
     return { installPanelUsable: false, blocker: "no-local-workspace" };
   }
-  return { installPanelUsable: true, comfyuiPath: panelBaseSync() };
+  let comfyuiPath: string | undefined;
+  try {
+    comfyuiPath = panelBaseSync();
+  } catch {
+    comfyuiPath = undefined; // the commands fall back to a <ComfyUI> placeholder
+  }
+  return { installPanelUsable: true, comfyuiPath };
 }
 
 function blockerPhrase(blocker: PanelRecoveryBlocker | undefined): string {

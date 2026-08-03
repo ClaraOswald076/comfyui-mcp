@@ -481,7 +481,13 @@ export async function performPanelSync(
     // directory. Pinning inside each callee is not enough: the live-base cache
     // has a short TTL and a Manager operation can outlive it, so two calls could
     // resolve different trees (see pinPanelBase).
-    const pinnedDeps = await pinPanelBase(deps);
+    // A sync is what the orchestrator runs on every panel HELLO, which is also
+    // the signal that ComfyUI may have just restarted — possibly with different
+    // launch flags, and therefore a different custom_nodes. Force a fresh
+    // resolution rather than serving a cached base that could describe the
+    // previous process. (pinPanelBase only probes for the REAL dep set; an
+    // injected one has already declared where ComfyUI is.)
+    const pinnedDeps = await pinPanelBase(deps, { force: true });
     const before = await panelStatus(pinnedDeps);
     const assessment = evaluatePanelSync(before, {
       orchestratorVersion: opts.orchestratorVersion,

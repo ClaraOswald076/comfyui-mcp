@@ -41,7 +41,11 @@
 
 import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { getComfyUIBaseUrl, isLocalMode } from "../config.js";
+import {
+  getComfyUIBaseUrl,
+  getComfyuiTargetGeneration,
+  isLocalMode,
+} from "../config.js";
 import { parsePyproject } from "./node-authoring.js";
 import { parseBaseDirFromArgv } from "./output-dir.js";
 import {
@@ -156,6 +160,27 @@ function targetKey(): string {
   }
 }
 
+/**
+ * The target GENERATION — config.ts bumps it on every successful retarget,
+ * INCLUDING a round trip back to the same URL, which a URL comparison cannot
+ * see. It is the only signal that catches the orchestrator's hello handler
+ * kicking off the panel sync BEFORE its retarget completes: an observation
+ * recorded in that window belongs to the outgoing target, and the generation
+ * moves underneath it.
+ *
+ * Defensive because a partially-mocked config (several test suites stub only
+ * the handful of exports they use) must not turn this into a crash. A constant
+ * fallback is safe: record and compare both see it, so it degrades to the URL
+ * check rather than to a wrong match.
+ */
+function targetGeneration(): number {
+  try {
+    return getComfyuiTargetGeneration();
+  } catch {
+    return -1;
+  }
+}
+
 function cachedResolution(): PanelBaseResolution | undefined {
   if (!cached) return undefined;
   if (cached.target !== targetKey()) return undefined;
@@ -168,8 +193,10 @@ function cachedResolution(): PanelBaseResolution | undefined {
  * operation, before the first `deps.comfyuiPath()`, so every read within that
  * operation agrees. Never throws.
  */
-export async function primePanelBase(): Promise<PanelBaseResolution> {
-  const fresh = cachedResolution();
+export async function primePanelBase(
+  opts: { force?: boolean } = {},
+): Promise<PanelBaseResolution> {
+  const fresh = opts.force ? undefined : cachedResolution();
   if (fresh) return fresh;
   let resolution: PanelBaseResolution;
   try {
@@ -253,6 +280,8 @@ export interface PanelDiskObservation {
   at: number;
   /** Which ComfyUI it describes. An observation does not survive a retarget. */
   target: string;
+  /** Target generation at record time — catches a same-URL retarget too. */
+  generation: number;
   /**
    * The resolved ComfyUI ROOT it describes. The URL alone is not enough: the
    * server can restart at the same address with a different `--base-directory`,
@@ -284,6 +313,7 @@ export function recordPanelDiskObservation(
     dir,
     at: Date.now(),
     target: targetKey(),
+    generation: targetGeneration(),
     base: base ?? panelBaseSync(),
   };
 }
@@ -305,6 +335,12 @@ export function clearPanelDiskObservation(): void {
 export function lastPanelDiskObservation(): PanelDiskObservation | undefined {
   if (!diskObservation) return undefined;
   if (diskObservation.target !== targetKey()) return undefined;
+  // A URL match is not enough. The orchestrator starts the panel sync and
+  // retargets in the same hello handler, so an observation can be recorded
+  // against the OUTGOING target and still share a URL with the incoming one;
+  // the generation moves on every retarget, including a round trip back to the
+  // same address, and catches exactly that.
+  if (diskObservation.generation !== targetGeneration()) return undefined;
   if (Date.now() - diskObservation.at > DISK_OBSERVATION_TTL_MS) return undefined;
   return diskObservation;
 }
