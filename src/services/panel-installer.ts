@@ -2146,6 +2146,33 @@ function resolveSwapOps(deps: PanelInstallerDeps): PanelSwapOps | undefined {
   return { clone: gitClonePanel, mkdirp, rename, removeDir, writeFile };
 }
 
+/**
+ * May we perform a WHOLESALE REPLACEMENT against this tree?
+ *
+ * The base resolution falls back to the configured path whenever
+ * `/system_stats` cannot be reached — and on a Comfy Desktop split install the
+ * configured path is exactly the tree the running server does NOT read (#766).
+ * A transient probe failure is indistinguishable from "there is no split", so
+ * the fallback can hand us a directory that holds a panel nobody is serving.
+ *
+ * For a READ that is acceptable (it is the best answer available, and it is
+ * labelled). For deleting a directory and moving another over it, it is not: we
+ * would replace a dormant copy, verify it happily, and report a verified update
+ * while the panel in the user's browser stayed exactly where it was. So this
+ * path requires the running server to have had a SAY in choosing the tree.
+ *
+ * `liveProbeFailed === false` with `source: "configured"` is fine — the server
+ * answered and its argv simply offered nothing better.
+ */
+function swapTreeIsCorroborated(deps: PanelInstallerDeps): boolean {
+  // An injected dep set declared its own base explicitly; there is no live
+  // server to corroborate it against and none is implied.
+  if (!isRealDeps(deps)) return true;
+  const resolution = lastPanelBaseResolution();
+  if (!resolution) return false;
+  return resolution.liveProbeFailed !== true;
+}
+
 async function updateViaRegistryZipReinstall(opts: {
   deps: PanelInstallerDeps;
   ops: PanelSwapOps;
@@ -2157,6 +2184,19 @@ async function updateViaRegistryZipReinstall(opts: {
   managerReason: string;
 }): Promise<PanelActionResult> {
   const { deps, ops, dir, comfyuiPath, previousVersion, result, managerReason } = opts;
+
+  // CORROBORATE THE TREE before replacing anything in it.
+  if (!swapTreeIsCorroborated(deps)) {
+    throw new PanelInstallError(
+      `Panel update did NOT apply (${managerReason}), and the reinstall-from-source ` +
+        `fallback is REFUSED: the running ComfyUI could not be reached, so ${comfyuiPath} ` +
+        `is the CONFIGURED path rather than a tree the live server confirmed it reads. ` +
+        `On a split install (Comfy Desktop's --base-directory, #766) those differ, and ` +
+        `replacing the panel here could update a copy nobody serves while the browser ` +
+        `keeps loading the real one — reported as a verified success. Start ComfyUI so ` +
+        `its install root can be confirmed, then retry. ${describePanelUpdateRecovery()}`,
+    );
+  }
 
   // NOT A GIT CHECKOUT. This is the whole precondition: a readable HEAD means
   // #724's fast-forward applies and a wholesale replace would destroy work.
@@ -2234,7 +2274,31 @@ async function updateViaRegistryZipReinstall(opts: {
     }
 
     // NEVER BACKWARDS, and never a pointless swap.
-    if (previousVersion && SEMVER_RE.test(previousVersion.trim()) && SEMVER_RE.test(stagedVersion.trim())) {
+    //
+    // BOTH versions must be strictly comparable before a WHOLESALE REPLACEMENT.
+    // Skipping the comparison when either side is unparseable would let a
+    // `dev`/`0.11.38.1` clone overwrite a working 0.11.40 and then report
+    // "Panel updated (0.11.40 → dev)" — an unproven downgrade of the live
+    // panel, dressed as success. `compareSemver` returns 0 for anything it
+    // cannot parse, so it cannot be trusted to catch this itself. No comparison
+    // ⇒ no replacement.
+    if (!SEMVER_RE.test(stagedVersion.trim())) {
+      throw new PanelInstallError(
+        `the freshly cloned panel reports version "${stagedVersion}", which is not a ` +
+          `comparable version number, so it cannot be shown to be NEWER than the ` +
+          `installed ${previousVersion ?? "(unreadable)"} — refusing to replace a ` +
+          `working panel with an unverifiable one`,
+      );
+    }
+    if (!previousVersion || !SEMVER_RE.test(previousVersion.trim())) {
+      throw new PanelInstallError(
+        `the installed panel's version (${previousVersion ?? "unreadable"}) is not a ` +
+          `comparable version number, so replacing it with the published ` +
+          `${stagedVersion} could silently move you BACKWARDS — refusing. Check the ` +
+          `pack's pyproject.toml at ${dir} first`,
+      );
+    }
+    {
       const delta = compareSemver(stagedVersion, previousVersion);
       if (delta < 0) {
         throw new PanelInstallError(
@@ -2520,20 +2584,26 @@ export async function runPanelActionInner(
     );
   }
 
-  // REPAIR AN INTERRUPTED SWAP FIRST. If a previous reinstall-from-source was
-  // killed between its two renames, custom_nodes has no panel right now and the
-  // working copy is sitting in custom_nodes_backup. Detection would read that as
-  // "not installed" and this operation would happily install over the top of a
-  // broken state. Both mutation entry points hold the panel op lock, so this is
-  // the safe place to put it back.
-  const swapRepairNote = reconcilePanelSwap(comfyPath, deps, { repair: true });
-
   // PIN GUARD — before any Manager mutation is queued. This is the single choke
   // point that makes "we never move a pinned user" true for every caller (the
   // sync skill, the panel, a hand-written install_panel call), not just the ones
   // that remembered to check. It is re-checked once more immediately before the
   // Manager call, since detection below is not instantaneous.
+  //
+  // It runs BEFORE the interrupted-swap repair below, which also moves
+  // directories. "Nothing here moves the panel while a pin is in force" has to
+  // mean every mutation, including a well-intentioned repair: a pinned user who
+  // was interrupted mid-update gets the broken state REPORTED (panelStatus says
+  // where the copy is), not silently rearranged.
   assertNotPinned(action, deps);
+
+  // REPAIR AN INTERRUPTED SWAP. If a previous reinstall-from-source was killed
+  // between its two renames, custom_nodes has no panel right now and the working
+  // copy is sitting in custom_nodes_backup. Detection would read that as "not
+  // installed" and this operation would happily install over the top of a broken
+  // state. Both mutation entry points hold the panel op lock, so this is the
+  // safe place to put it back.
+  const swapRepairNote = reconcilePanelSwap(comfyPath, deps, { repair: true });
 
   if (swapRepairNote) {
     logger.info(`[panel] before ${action}:${swapRepairNote}`);

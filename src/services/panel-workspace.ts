@@ -70,6 +70,15 @@ export interface PanelBaseResolution {
    * DISAGREES with `base` — the #766 signal, worth surfacing to the user.
    */
   overriddenConfiguredBase?: string;
+  /**
+   * True when `/system_stats` could not be reached, so the running server had
+   * NO say in this answer. It matters because the fallback is the configured
+   * path — and on a Comfy Desktop split install that is precisely the tree the
+   * server does NOT read (#766). A transient probe failure therefore looks
+   * identical to "there is no split", which is fine for a read but not for a
+   * destructive write: see the corroboration gate in panel-installer.
+   */
+  liveProbeFailed?: boolean;
 }
 
 /** Does this candidate root actually hold a custom_nodes directory? */
@@ -114,8 +123,9 @@ export async function resolvePanelBase(): Promise<PanelBaseResolution> {
     }
   }
 
-  if (configured) return { base: configured, source: "configured" };
-  return { source: "none" };
+  const liveProbeFailed = !snapshot.reachable;
+  if (configured) return { base: configured, source: "configured", liveProbeFailed };
+  return { source: "none", liveProbeFailed };
 }
 
 /*

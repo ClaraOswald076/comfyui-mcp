@@ -627,6 +627,79 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     expect(h.clones).toHaveLength(0);
     expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
   });
+
+  it("a PIN also blocks the interrupted-swap repair — no mutation means no mutation", async () => {
+    // The repair moves directories too. A pinned user who was interrupted gets
+    // the state reported, never silently rearranged.
+    const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1`);
+    writePanelPack(backupDir, "0.11.34");
+    writeFileSync(
+      join(root, ".comfyui-agent-panel.swap.json"),
+      JSON.stringify({ dir: PANEL_DIR(), backupDir, staging: "x", startedAt: Date.now() }),
+    );
+    const h = makeDeps({ cloneVersion: "0.11.38", updateThrows: "manager cannot resolve it" });
+    h.deps.readPin = () => ({ pinned: true, source: "settings" as const, version: "0.11.34" });
+    await expect(runPanelActionInner("update", h.deps)).rejects.toThrow();
+    expect(existsSync(PANEL_DIR())).toBe(false); // untouched, still where it was
+    expect(existsSync(backupDir)).toBe(true);
+  });
+
+  it("REFUSES an unparseable staged version — it cannot be shown to be newer", async () => {
+    // compareSemver returns 0 for anything it cannot parse, so skipping the
+    // comparison would let a `dev` clone overwrite a working release and report
+    // "Panel updated (0.11.40 → dev)".
+    writePanelPack(PANEL_DIR(), "0.11.40");
+    const h = makeDeps({ updateThrows: "manager cannot resolve it", cloneVersion: "dev" });
+    const err = await runPanelActionInner("update", h.deps).catch((e: Error) => e);
+    expect((err as Error).message).toMatch(/not a comparable version number/);
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.40");
+    expect(existsSync(join(root, "custom_nodes_backup"))).toBe(false);
+  });
+
+  it("REFUSES an unparseable INSTALLED version — replacing it could move you backwards", async () => {
+    writePanelPack(PANEL_DIR(), "nightly");
+    const h = makeDeps({ updateThrows: "manager cannot resolve it", cloneVersion: "0.11.38" });
+    const err = await runPanelActionInner("update", h.deps).catch((e: Error) => e);
+    expect((err as Error).message).toMatch(/not a comparable version number/);
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("nightly");
+  });
+});
+
+describe("a wholesale replacement needs the RUNNING server to have chosen the tree (#766)", () => {
+  it("an unreachable server marks the resolution UNCORROBORATED (what gates the swap)", async () => {
+    // The fallback to COMFYUI_PATH is fine for a read and is labelled as such,
+    // but on a Desktop split install it is the tree the server does NOT read.
+    // Replacing a panel there would update a copy nobody serves and report it as
+    // verified, so the destructive path refuses on this flag.
+    workspace.base = root;
+    workspace.reachable = false;
+    __resetPanelBaseCache();
+    const resolution = await primePanelBase();
+    expect(resolution.source).toBe("configured");
+    expect(resolution.liveProbeFailed).toBe(true);
+  });
+
+  it("a live-resolved base is corroborated", async () => {
+    const liveRoot = join(root, "live", "ComfyUI");
+    mkdirSync(join(liveRoot, "custom_nodes"), { recursive: true });
+    workspace.base = undefined;
+    workspace.reachable = true;
+    workspace.liveArgv = [`${liveRoot}/main.py`];
+    __resetPanelBaseCache();
+    const resolution = await primePanelBase();
+    expect(resolution.base).toBe(liveRoot);
+    expect(resolution.liveProbeFailed).toBeFalsy();
+  });
+
+  it("a reachable server that simply offers no better root is NOT flagged", async () => {
+    workspace.base = root;
+    workspace.reachable = true;
+    workspace.liveArgv = []; // reachable, but argv yields nothing usable
+    __resetPanelBaseCache();
+    const resolution = await primePanelBase();
+    expect(resolution.source).toBe("configured");
+    expect(resolution.liveProbeFailed).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
