@@ -26,6 +26,7 @@ import {
   downloadModel,
   listLocalModels,
   liveListingHasEntry,
+  liveListingHasBasename,
   isUnderLiveModelRoots,
   currentLiveModelsRoot,
   resolveExistingModelFile,
@@ -925,40 +926,76 @@ async function applyManifestSections(
             target.targetSubfolder.split(/[\\/]+/).filter(Boolean)[0],
           )
         ).inRoots;
-        const listed =
-          visible === undefined
-            ? await liveListingHasEntry(target.targetSubfolder, target.filename)
-            : undefined;
+        if (visible === false) {
+          results.push(
+            report(
+              "model",
+              item,
+              "failed",
+              `A file exists at ${existing}, but it is NOT in any directory the connected ` +
+                "ComfyUI reads models from — it belongs to an install the running server does " +
+                "not use. Point COMFYUI_PATH at the ComfyUI that is actually running, or " +
+                "launch it with an absolute --base-directory.",
+            ),
+          );
+          continue;
+        }
+        if (visible === undefined) {
+          // We could not establish that the running server reads from this path, so
+          // "already exists" is an UNVERIFIED claim. Report it as pending, never as
+          // a satisfied item (codex gate, rounds 4 and 8).
+          const listed = await liveListingHasEntry(target.targetSubfolder, target.filename);
+          results.push(
+            report(
+              "model",
+              item,
+              "pending",
+              `A file exists at ${existing}, but it could NOT be established that the ` +
+                "connected ComfyUI reads models from there (its install root could only be " +
+                "inferred from local configuration), so this is not confirmed as installed." +
+                (listed === true
+                  ? ` The server does list "${target.filename}" under "${target.targetSubfolder}", but that may be its OWN copy elsewhere.`
+                  : listed === false
+                    ? ` The server does NOT list "${target.filename}" under "${target.targetSubfolder}".`
+                    : "") +
+                " Check list_local_models.",
+            ),
+          );
+          continue;
+        }
+        // Containment can still be satisfied by a HOST path that merely shares its
+        // name with the server's — a container reporting `--models-directory /models`
+        // while this host has its own unrelated `/models` (codex gate, round 15). So
+        // a SKIP additionally requires the running server to really serve a file of
+        // that name in the category. Matched by BASENAME, because findExistingModel
+        // accepts a nested hit within the served category and an exact-path check
+        // would fail legitimate installs.
+        const servedByLive = await liveListingHasBasename(
+          target.targetSubfolder,
+          target.filename,
+        );
         results.push(
-          visible === false
-            ? report(
-                "model",
-                item,
-                "failed",
-                `A file exists at ${existing}, but it is NOT in any directory the connected ` +
-                  "ComfyUI reads models from — it belongs to an install the running server does " +
-                  "not use. Point COMFYUI_PATH at the ComfyUI that is actually running, or " +
-                  "launch it with an absolute --base-directory.",
-              )
-            : visible === undefined
-              ? // We could not establish that the running server reads from this
-                // path, so "already exists" is an UNVERIFIED claim. Report it as
-                // pending, never as a satisfied item (codex gate, rounds 4 and 8).
-                report(
+          servedByLive === true
+            ? report("model", item, "skipped", `Model already exists at ${existing}.`)
+            : servedByLive === false
+              ? report(
+                  "model",
+                  item,
+                  "failed",
+                  `A file exists at ${existing}, but the connected ComfyUI does not list ` +
+                    `"${target.filename}" under "${target.targetSubfolder}" at all — the models ` +
+                    "directory it reported is not the one this file is in (this happens when " +
+                    "ComfyUI runs in a container or behind a port-forward and its path also " +
+                    "exists on this host). Confirm with list_local_models.",
+                )
+              : report(
                   "model",
                   item,
                   "pending",
-                  `A file exists at ${existing}, but it could NOT be established that the ` +
-                    "connected ComfyUI reads models from there (its install root could only be " +
-                    "inferred from local configuration), so this is not confirmed as installed." +
-                    (listed === true
-                      ? ` The server does list "${target.filename}" under "${target.targetSubfolder}", but that may be its OWN copy elsewhere.`
-                      : listed === false
-                        ? ` The server does NOT list "${target.filename}" under "${target.targetSubfolder}".`
-                        : "") +
-                    " Check list_local_models.",
-                )
-              : report("model", item, "skipped", `Model already exists at ${existing}.`),
+                  `A file exists at ${existing}, but the connected ComfyUI could not be asked ` +
+                    `whether it serves "${target.filename}", so this is not confirmed as ` +
+                    "installed. Check list_local_models.",
+                ),
         );
         continue;
       }
@@ -1053,10 +1090,15 @@ async function applyManifestSections(
   for (const result of results) summary[result.status]++;
 
   return {
-    // A still-running (pending) download is not a failure; success reflects only
-    // that nothing FAILED. Pending items are reported separately so the caller
-    // knows the apply isn't fully settled and must poll download_status.
-    success: summary.failed === 0,
+    // `success` means the manifest is APPLIED AND VERIFIED — nothing failed AND
+    // nothing is still unsettled. A pending item is a real "not done": a transfer
+    // still running, a ComfyUI-Manager dispatch that was accepted but not verified
+    // as landed, or an existing file whose placement could not be established. All
+    // three used to fold into a `true` here, which is the same fabricate-success
+    // shape #369 is about, one level up (codex gate, round 15). Callers that only
+    // care about hard failures read `summary.failed`; the per-item results say
+    // exactly what is outstanding and how to confirm it.
+    success: summary.failed === 0 && summary.pending === 0,
     summary,
     results,
   };

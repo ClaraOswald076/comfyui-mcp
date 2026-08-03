@@ -45,6 +45,11 @@ const liveListingHasEntryMock = vi.hoisted(() =>
  *  a positive answer licenses an "already exists" SKIP. Default TRUE — these tests
  *  model the healthy local case; the unconfirmed/stale paths are asserted
  *  explicitly below. */
+/** #369: does the live server serve a file of this basename in the category?
+ *  Default TRUE — the healthy case these tests model. */
+const liveListingHasBasenameMock = vi.hoisted(() =>
+  vi.fn(async (): Promise<boolean | undefined> => true),
+);
 const isUnderLiveModelRootsMock = vi.hoisted(() =>
   vi.fn(async (): Promise<{ inRoots: boolean | undefined; liveRoot?: string }> => ({
     inRoots: true,
@@ -142,6 +147,10 @@ vi.mock("../../services/model-resolver.js", () => ({
   // The "already exists" shortcut confirms the file is one the LIVE server reads
   // before it counts as a skip (#369). Default: it is.
   liveListingHasEntry: (...a: unknown[]) => liveListingHasEntryMock(...(a as [string, string])),
+  // A skip additionally requires the live server to really serve a file of that
+  // BASENAME in the category (the container/host path-collision guard). Default yes.
+  liveListingHasBasename: (...a: unknown[]) =>
+    liveListingHasBasenameMock(...(a as [string, string])),
   // The decisive containment test. Default UNKNOWN (only local config could answer),
   // so these tests exercise the listing-based fallback.
   isUnderLiveModelRoots: (...a: unknown[]) => isUnderLiveModelRootsMock(...(a as [string])),
@@ -495,6 +504,35 @@ describe("applyManifest", () => {
     expect(result.results[0].message).toMatch(/NOT in any directory/);
   });
 
+  it("FAILS a contained file the live server does not serve at all (container/host collision; codex gate r15)", async () => {
+    // The container reports --models-directory /models; the HOST happens to have its
+    // own /models with this file. Containment passes, but the running server does not
+    // list the name anywhere in the category — so it is NOT installed for it.
+    resolveExistingModelFileMock.mockResolvedValueOnce({
+      path: "C:/models/checkpoints/big.safetensors",
+      root: "C:/models",
+      info: { isFile: () => true },
+    });
+    isUnderLiveModelRootsMock.mockResolvedValueOnce({ inRoots: true });
+    liveListingHasBasenameMock.mockResolvedValueOnce(false);
+
+    const result = await applyManifest({
+      manifest: {
+        models: [
+          {
+            url: "https://example.com/big.safetensors",
+            model_type: "checkpoints",
+            filename: "big.safetensors",
+          },
+        ],
+      },
+    });
+
+    expect(result.summary).toMatchObject({ skipped: 0, failed: 1 });
+    expect(result.results[0].message).toMatch(/does not list/);
+    expect(downloadModelMock).not.toHaveBeenCalled();
+  });
+
   it("reports PENDING (never skipped) when containment cannot be established — even if the server lists the NAME", async () => {
     // The stale tree and the live tree both hold `big.safetensors`. A name-only
     // listing hit must NOT promote an unconfirmed placement to "installed".
@@ -811,8 +849,11 @@ describe("applyManifest", () => {
       });
       expect(result.results[1].message).toMatch(/not started/i);
       expect(installCustomNodeMock).toHaveBeenCalledTimes(1);
-      // Pending is not a failure: success stays true (nothing FAILED).
-      expect(result.success).toBe(true);
+      // Pending is not a FAILURE, but it is not a settled success either: an
+      // unfinished apply must not report success (#369). `summary.failed` is the
+      // hard-failure signal.
+      expect(result.summary.failed).toBe(0);
+      expect(result.success).toBe(false);
     } finally {
       if (prevBudget === undefined) delete process.env.COMFYUI_MCP_MANIFEST_NODE_BUDGET_MS;
       else process.env.COMFYUI_MCP_MANIFEST_NODE_BUDGET_MS = prevBudget;
@@ -836,8 +877,9 @@ describe("applyManifest", () => {
       expect(result.summary).toMatchObject({ applied: 0, failed: 0, pending: 1 });
       expect(result.results[0].status).toBe("pending");
       expect(result.results[0].message).toMatch(/background|RUNNING/i);
-      // success reflects only that nothing FAILED (the apply isn't fully settled).
-      expect(result.success).toBe(true);
+      // The apply is not settled, so it is not a success — but nothing FAILED.
+      expect(result.summary.failed).toBe(0);
+      expect(result.success).toBe(false);
     } finally {
       if (prevGrace === undefined) delete process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS;
       else process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS = prevGrace;

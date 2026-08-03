@@ -900,6 +900,26 @@ export async function liveListingHasEntry(
 }
 
 /**
+ * Does the live server list a file with this BASENAME anywhere in the category?
+ *
+ * Deliberately looser than `liveListingHasEntry`: the manifest's existing-file
+ * lookup itself matches a basename anywhere in the served category (a `checkpoints`
+ * target satisfied by `checkpoints/sdxl/big.safetensors`), so confirming it with an
+ * exact-path check would FAIL legitimate nested installs. This is used only as an
+ * ADDITIONAL requirement on the skip path — it can rule a skip out, never in on its
+ * own. `undefined` = the server could not answer.
+ */
+export async function liveListingHasBasename(
+  category: string,
+  filename: string,
+): Promise<boolean | undefined> {
+  const listing = await liveCategoryListing(categoryOf(category));
+  if (listing === undefined) return undefined;
+  const wanted = basename(filename);
+  return listing.some((n) => basename(normRel(n)) === wanted);
+}
+
+/**
  * Is `absPath` inside a directory tree the CONNECTED server actually reads models
  * from — its primary models root, or a LIVE-registered extra model root (the #633
  * external-drive shape)?
