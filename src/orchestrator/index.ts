@@ -2962,6 +2962,7 @@ export async function runPanelOrchestrator(): Promise<void> {
         }
       }
       const prev = tabBackends.get(panelTab);
+      let providerSwitched = false;
       if (prev && prev !== backend) {
         // #570 — Provider switch via re-hello: RETIRE (not reset) the previous provider's
         // agent so it stops lingering but its identity-bound durable session is PRESERVED. A
@@ -2971,8 +2972,15 @@ export async function runPanelOrchestrator(): Promise<void> {
         // still starts fresh (the panel replays the transcript as context on its first message).
         manager.retire(panelTab + AGENT_KEY_SEP + prev);
         bridge.broadcastTabList(); // live agent dropped on backend switch → refresh dot
+        providerSwitched = true;
       }
       tabBackends.set(panelTab, backend);
+      // #468 — retire() handed back any run completion the OLD provider held, but
+      // the flush it triggered ran while agentKeyFor() still resolved the OLD
+      // backend, so it could only re-journal it. Re-address it now that the tab
+      // points at the NEW provider, so the completion reaches the conversation
+      // the user actually switched to instead of waiting for their next message.
+      if (providerSwitched) flushRunCompletions(panelTab);
       // A headless client (mobile/remote pseudo-panel, no browser canvas) advertises
       // itself in the hello frame so its agent gets the in-turn-delivery directive.
       if ((event as { headless?: unknown }).headless === true) headlessTabs.add(panelTab);
@@ -3480,6 +3488,12 @@ export async function runPanelOrchestrator(): Promise<void> {
         else tabStableKey.delete(panelTab);
       }
       tabBackends.set(panelTab, reqBackend);
+      // #468 — the retire() above handed back any run completion the outgoing
+      // provider's agent held, but that flush ran while agentKeyFor() still
+      // resolved the OLD backend. Re-address it now that the tab points at the
+      // new one, so the completion reaches the conversation the user switched to
+      // instead of sitting journaled until their next message.
+      if (prev !== reqBackend) flushRunCompletions(panelTab);
       // Leaving a LOCAL provider frees its VRAM (no other tab still on it) —
       // the point of switching to Claude/hosted is usually reclaiming the GPU.
       if (prev !== reqBackend) {
@@ -5144,6 +5158,11 @@ export async function runPanelOrchestrator(): Promise<void> {
       // the gate reads as the full "nothing queued or held" contract.)
       !manager.hasHeldMail() &&
       ![...heldDuringGen.values()].some((msgs) => msgs.length > 0) &&
+      // Undelivered run completions (#468) are in-memory like the held mail
+      // above, so teardown erases them too. A restart while one is journaled
+      // would silently drop the render result the agent was promised — exactly
+      // the failure this whole path exists to prevent. Wait for it to land.
+      !RunCompletions.hasOutstanding() &&
       !QueueMonitor.isBusy(),
     announce: (text) => void bridge.push({ type: "say", text }),
     teardown: teardownCore,

@@ -212,7 +212,14 @@ export class RunCompletionJournalImpl {
       // duplicate reply): reopen it rather than stacking a second ticket, so one
       // prompt id always means one run.
       existing.settled = false;
+      existing.tabId = meta.tabId;
       existing.queuedAt = Date.now();
+      // …and CLEAR the already-delivered memo for it. Reopening the ticket while
+      // the memo stood meant the reopened run's completion was suppressed as a
+      // duplicate of the PREVIOUS run's: `panel_run` promised automatic delivery
+      // and the journal then swallowed it. The memo only ever means "we already
+      // reported THIS run", which a genuine re-queue makes false.
+      this.delivered.delete(deliveredKey(meta.tabId, promptId));
       return true;
     }
     this.tickets.set(promptId, {
@@ -360,9 +367,19 @@ export class RunCompletionJournalImpl {
   private noteDropped(key: string): void {
     this.dropped.set(key, (this.dropped.get(key) ?? 0) + 1);
     while (this.dropped.size > MAX_DROPPED_KEYS) {
-      const oldest = this.dropped.keys().next().value;
-      if (oldest === undefined) break;
-      this.dropped.delete(oldest);
+      // Discard a counter for a tab that has NOTHING left to carry the
+      // disclosure out on first — its next delivery (if any) is hypothetical.
+      // Only if every tracked tab still has entries do we drop the oldest, and
+      // that one is logged at ERROR because the disclosure dies with it.
+      const victim =
+        [...this.dropped.keys()].find((k) => ![...this.entries.values()].some((e) => e.key === k)) ??
+        this.dropped.keys().next().value;
+      if (victim === undefined) break;
+      const lost = this.dropped.get(victim) ?? 0;
+      this.dropped.delete(victim);
+      logger.error(
+        `[run-completions] discarding the undelivered-completion count (${lost}) for tab ${victim.slice(0, 8)} — over ${MAX_DROPPED_KEYS} tabs are tracking one; that tab will not be told`,
+      );
     }
   }
 
@@ -422,6 +439,14 @@ export class RunCompletionJournalImpl {
   /** All still-unacked entries for a key (pending OR handed off) — diagnostics. */
   outstanding(key: string): JournalEntry[] {
     return [...this.entries.values()].filter((e) => e.key === key);
+  }
+
+  /** Is ANY completion still undelivered anywhere? The orchestrator's
+   *  self-restart gate reads this: the journal is in-memory, so restarting while
+   *  an entry is outstanding would silently drop a render result the agent was
+   *  promised. */
+  hasOutstanding(): boolean {
+    return this.entries.size > 0;
   }
 
   /** Record the outcome of a delivery attempt. `handedOff` true = an agent took

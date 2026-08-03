@@ -697,6 +697,33 @@ describe("run completion journal correlation (#468)", () => {
     expect(journal.outstanding("t")).toHaveLength(1);
   });
 
+  it("re-queuing the SAME prompt id clears the delivered memo, so its new completion lands", () => {
+    // openRun() documents that it REOPENS an existing ticket. Leaving the
+    // already-delivered memo behind made that a lie: panel_run promised
+    // automatic delivery and the journal then suppressed the completion as a
+    // duplicate of the PREVIOUS run's.
+    journal.openRun(PROMPT_A, { tabId: "t" });
+    const first = journal.record("t", { kind: "executed", prompt_id: PROMPT_A });
+    journal.deliverPending("t", () => true);
+    journal.ack(first!.token);
+    expect(journal.record("t", { kind: "executed", prompt_id: PROMPT_A })).toBeNull(); // memo holds
+
+    journal.openRun(PROMPT_A, { tabId: "t" }); // re-queued
+    const second = journal.record("t", { kind: "executed", prompt_id: PROMPT_A });
+    expect(second).not.toBeNull();
+    expect(second!.correlation.status).toBe("matched");
+  });
+
+  it("hasOutstanding reports any undelivered completion (the self-restart gate)", () => {
+    expect(journal.hasOutstanding()).toBe(false);
+    const entry = journal.record("t", { kind: "executed", prompt_id: PROMPT_A });
+    expect(journal.hasOutstanding()).toBe(true);
+    journal.deliverPending("t", () => true);
+    expect(journal.hasOutstanding()).toBe(true); // handed off is NOT delivered
+    journal.ack(entry!.token);
+    expect(journal.hasOutstanding()).toBe(false);
+  });
+
   it("only the entry's OWN run is settled on ack", () => {
     journal.openRun(PROMPT_A, { tabId: "t" });
     journal.openRun(PROMPT_B, { tabId: "t" });
