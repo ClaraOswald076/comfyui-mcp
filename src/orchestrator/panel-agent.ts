@@ -436,12 +436,26 @@ export class PanelAgent {
 
   /** Queue a panel message and wake the streaming generator (the "channel in").
    *  `images` are ComfyUI refs delivered inline as image blocks (vision). */
-  send(text: string, opts?: { title?: string; images?: ImageRef[]; mid?: string; eventTokens?: string[] }): void {
+  send(
+    text: string,
+    opts?: {
+      title?: string;
+      images?: ImageRef[];
+      mid?: string;
+      eventTokens?: string[];
+      /** Re-delivery of an injected panel event (#468). MUST be preserved by every
+       *  carry-over path: an item that loses this marker is a completion the
+       *  detach logic can no longer remove from held mail, so its text survives
+       *  after its token has been replayed elsewhere — one completion, two turns. */
+      completionOnly?: boolean;
+    },
+  ): void {
     if (opts?.title) this.title = opts.title;
     this.queue.push({
       text,
       images: opts?.images,
       mid: opts?.mid,
+      ...(opts?.completionOnly ? { completionOnly: true } : {}),
       ...(opts?.eventTokens?.length ? { eventTokens: [...opts.eventTokens] } : {}),
     });
     const wake = this.waiting;
@@ -1867,7 +1881,10 @@ export class PanelAgentManager {
         mid: item.mid,
         // #468 — carry the run-completion tokens over so the replacement agent
         // acks the completion it inherited (rather than the journal replaying it
-        // as a second copy).
+        // as a second copy), AND the completionOnly marker with them: an item
+        // that loses it can no longer be removed from held mail later, so its
+        // text would outlive its token.
+        ...(item.completionOnly ? { completionOnly: true } : {}),
         ...(item.eventTokens?.length ? { eventTokens: item.eventTokens } : {}),
       });
     }
@@ -1933,6 +1950,10 @@ export class PanelAgentManager {
         agent.send(item.text, {
           images: item.images,
           mid: item.mid,
+          // #468 — preserve the completionOnly marker across EVERY re-delivery.
+          // A second consecutive failed start would otherwise return this item to
+          // held mail unmarked, making its text un-removable by a later detach.
+          ...(item.completionOnly ? { completionOnly: true } : {}),
           ...(item.eventTokens?.length ? { eventTokens: item.eventTokens } : {}),
         });
       }

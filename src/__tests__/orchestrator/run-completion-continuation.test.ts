@@ -453,16 +453,18 @@ describe("run completion across automatic goal continuation (#468)", () => {
         return [];
       },
     };
-    // Fails the FIRST start (parking the queue in held mail), then works — so the
-    // held mail is genuinely re-delivered and we can count what the agent saw.
+    // Fails the first TWO starts (parking, re-delivering, then re-parking the
+    // queue in held mail), then works. Two consecutive failures matter: the
+    // re-delivery goes through send(), which must preserve the completionOnly
+    // marker or the second parking makes the completion's text un-removable.
     const healthy = new ContinuationBackend();
-    let firstStart = true;
+    let failuresLeft = 2;
     const flaky: AgentBackend = {
       id: "claude" as const,
       capabilities: CLAUDE_CAPABILITIES,
       async prepare() {
-        if (firstStart) {
-          firstStart = false;
+        if (failuresLeft > 0) {
+          failuresLeft -= 1;
           throw new Error("endpoint rejected the key (http 401)");
         }
       },
@@ -481,10 +483,16 @@ describe("run completion across automatic goal continuation (#468)", () => {
     await waitFor(() => journal.pending(tab).length === 0); // taken by the doomed agent
     await waitFor(() => manager.hasHeldMail(tab));
 
+    // A second start also fails: the held mail is re-delivered through send()
+    // and re-parked. The completionOnly marker must survive that round trip.
+    manager.send(tab, "try again");
+    await waitFor(() => manager.hasHeldMail(tab) && failuresLeft === 0);
+
     manager.retire(tab); // provider switch retires the failed key
     expect(journal.pending(tab)).toHaveLength(1); // its token came back
 
-    // Next start: held mail replays, and the journal replays the completion.
+    // Next start succeeds: held mail replays, and the journal replays the
+    // completion. The completion's text must appear exactly once.
     manager.send(tab, "hello again");
     await waitFor(() => healthy.turns.length >= 1);
     healthy.finishTurn();
