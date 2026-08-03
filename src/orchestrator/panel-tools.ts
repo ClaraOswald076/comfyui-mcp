@@ -70,6 +70,7 @@ import {
   clearRestartDispatch,
   getRestartDispatchRecord,
   RESTART_DISPATCH_CAUSATION_WINDOW_MS,
+  PROCESS_WIDE_RESTART_DISPATCH_TOKEN,
   __processControlTestHooks,
 } from "../services/process-control.js";
 import { resetManagerApiCache } from "../services/manager-api-cache.js";
@@ -5875,13 +5876,15 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               );
             }
             clearTimeout(restartTimer);
-            // #742 r5: the managed restart stopped the process — record the
-            // dispatch with THIS session holding the token (restartComfyUI also
-            // stamped its own process-wide record, which never grounds
-            // causation). Only a PROVEN stop is recorded; a refusal/timeout
+            // #742 r5/r6: the managed restart stopped the process — record the
+            // dispatch with THIS session holding the token, stamped with the
+            // BOUND-CONFIRMED base (this fallback only runs when the instance
+            // binding held, so healthBase is non-null here). restartComfyUI
+            // also stamped its own process-wide record, which never grounds
+            // causation. Only a PROVEN stop is recorded; a refusal/timeout
             // (restart undefined, or stopped!==true) records nothing.
             if (restart?.stopped === true) {
-              stampSessionRestartDispatch(ctx, healthBase ?? getComfyUIBaseUrl());
+              stampSessionRestartDispatch(ctx, healthBase);
             }
             // DEFINITIVE no-restart: a spawn failure, OR restartComfyUI refused before
             // stopping anything (no process found / unsafe relaunch → stopped:false &&
@@ -5965,11 +5968,22 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         resetClient();
         resetObjectInfoCache();
         resetManagerApiCache("panel Manager reboot");
-        // #742 r4/r5: record the ACTUAL dispatch (acceptance proven — a refusal never
-        // reaches here), holding the token on THIS session. A later decline-path
-        // DOWN report may name restart causation only against a record this
-        // session holds; it is cleared below if the restart is observed back.
-        stampSessionRestartDispatch(ctx, healthBase ?? getComfyUIBaseUrl());
+        // #742 r4/r5/r6: record the ACTUAL dispatch (acceptance proven — a refusal
+        // never reaches here). ONLY a BOUND-CONFIRMED target (the same binding
+        // the r1 causation scoping and the refuse-safe preflight use) may stamp a
+        // causation-capable record — held on THIS session with the BOUND base at
+        // stamp time, never the mutable configured one. An unbound/unconfirmable
+        // target (r6) stamps only the shared PROCESS-WIDE slot, which never
+        // grounds causation: the dispatch can't be proven to have hit the
+        // instance a later decline would probe, and a session that rebinds to
+        // the boot tab afterward can't claim it either (a re-targeted session
+        // can't prove the earlier dispatch hit its current instance — no claim
+        // is the truthful answer). It is cleared below if observed back.
+        if (healthBase != null && sameHttpBase(getComfyUIBaseUrl(), healthBase)) {
+          stampSessionRestartDispatch(ctx, healthBase);
+        } else {
+          recordRestartDispatch(getComfyUIBaseUrl(), PROCESS_WIDE_RESTART_DISPATCH_TOKEN);
+        }
 
         // Observe recovery. There is exactly ONE sound proof that THIS ComfyUI instance
         // actually cycled: a directly OBSERVED down→up on the server-authorized, immutable,

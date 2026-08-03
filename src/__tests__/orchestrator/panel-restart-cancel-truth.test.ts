@@ -22,7 +22,11 @@ const { buildPanelToolDefs, __panelToolsTestHooks } = await import(
   "../../orchestrator/panel-tools.js"
 );
 import { getBootLocalComfyUIBaseUrl } from "../../config.js";
-import { __processControlTestHooks } from "../../services/process-control.js";
+import {
+  __processControlTestHooks,
+  getRestartDispatchRecord,
+  PROCESS_WIDE_RESTART_DISPATCH_TOKEN,
+} from "../../services/process-control.js";
 import type { PanelToolCtx, ToolResult } from "../../orchestrator/panel-tools.js";
 
 // The orchestrator's immutable boot endpoint — what the decline-probe and the
@@ -38,22 +42,26 @@ function makeCtx(opts: {
   /** Whether the bound tab provably fronts our local boot instance (the gate
    *  for both the boot-endpoint probe and the #742 preflight). */
   frontsBoot?: boolean;
+  /** MUTABLE fronting — models a session that REBINDS mid-test: the bridge
+   *  getters read `fronts.current` at call time. Overrides frontsBoot. */
+  fronts?: { current: boolean };
   /** The comfy_reboot reply (default: an accepted `{rebooting: true}`). */
   rebootReply?: Record<string, unknown>;
 }): { ctx: PanelToolCtx; sends: Array<Record<string, unknown>> } {
   const sends: Array<Record<string, unknown>> = [];
   const frontsBoot = opts.frontsBoot ?? true;
   const rebootReply = opts.rebootReply ?? { rebooting: true };
+  const fronted = () => opts.fronts?.current ?? frontsBoot;
   const bridge = {
     send: async (cmd: Record<string, unknown>) => {
       sends.push(cmd);
       if (cmd.cmd === "comfy_reboot") return rebootReply;
       return {};
     },
-    tabOrigin: () => (frontsBoot ? BOOT_BASE : undefined),
+    tabOrigin: () => (fronted() ? BOOT_BASE : undefined),
     // The gate reads the SERVER-OBSERVED handshake origin, not the spoofable hello URL.
-    tabServerOrigin: () => (frontsBoot ? BOOT_BASE : undefined),
-    tabIsLocal: () => frontsBoot,
+    tabServerOrigin: () => (fronted() ? BOOT_BASE : undefined),
+    tabIsLocal: () => fronted(),
     canReach: () => true,
   } as unknown as PanelToolCtx["bridge"];
   const ctx = {
@@ -532,5 +540,56 @@ describe("panel_restart_comfyui — restart dispatch record (r4/r5)", () => {
     const recB = __panelToolsTestHooks.getSessionRestartDispatch(ctxB);
     expect(recB).not.toBeNull();
     expect(__panelToolsTestHooks.sameHttpBase(recB!.base, BOOT_BASE)).toBe(true);
+  });
+
+  it("an UNBOUND accepted reboot stamps NO causation-capable record (r6)", async () => {
+    // The reboot is accepted, but the target is unconfirmable (the tab does
+    // not provably front our boot instance) — it must NOT stamp a session-held
+    // record: the dispatch can't be proven to have hit the instance a later
+    // decline would probe. It lands only in the process-wide non-causation
+    // slot (documenting that a dispatch happened).
+    __panelToolsTestHooks.setHealthProbe(async () => "down");
+    const { ctx, sends } = makeCtx({ confirm: "yes", frontsBoot: false });
+
+    const out = parse(await restartTool().handler({}, ctx));
+
+    expect(out.rebooting).toBe(true); // accepted, honestly unconfirmable
+    expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(true);
+    // No causation-capable stamp on the session…
+    expect(__panelToolsTestHooks.getSessionRestartDispatch(ctx)).toBeNull();
+    // …only the shared process-wide (never-causation) slot knows of it.
+    expect(
+      getRestartDispatchRecord(PROCESS_WIDE_RESTART_DISPATCH_TOKEN),
+    ).not.toBeNull();
+  });
+
+  it("a session that REBINDS to the boot tab after an unbound reboot gets a causation-FREE decline (r6)", async () => {
+    // The accepted reboot happened while the session fronted an UNCONFIRMABLE
+    // target. The session then rebinds to the boot tab: even with a full-window
+    // down on the bound endpoint, the earlier reboot of (possibly) a DIFFERENT
+    // instance must not be blamed.
+    const fronts = { current: false }; // unbound at reboot time
+    const seq: Array<"down" | "healthy"> = ["down", "healthy"];
+    let i = 0;
+    __panelToolsTestHooks.setHealthProbe(async () => seq[Math.min(i++, seq.length - 1)]);
+    const { ctx, sends } = makeCtx({ confirm: "yes", fronts });
+
+    // 1. Accepted reboot while UNBOUND — dispatched, honestly unconfirmable.
+    const out1 = parse(await restartTool().handler({}, ctx));
+    expect(out1.rebooting).toBe(true);
+
+    // 2. The session REBINDS to the boot tab and a second card is declined.
+    fronts.current = true;
+    ctx.confirm = async () => "no" as const;
+    __panelToolsTestHooks.setHealthProbe(async () => "down"); // full-window refusal
+
+    const res2 = await restartTool().handler({}, ctx);
+    const t2 = text(res2);
+
+    expect(t2).toMatch(/ComfyUI is DOWN/i);
+    expect(t2).toMatch(/no restart was dispatched/i);
+    expect(t2).not.toMatch(/restart initiated earlier/i);
+    expect(t2).not.toMatch(/STOPPED and did not come back/i);
+    expect(sends.filter((c) => c.cmd === "comfy_reboot")).toHaveLength(1); // only the first
   });
 });
