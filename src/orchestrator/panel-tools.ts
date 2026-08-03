@@ -5669,13 +5669,6 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // server-authorized + immutable, bound to the exact host FAMILY the reboot goes
         // to (null unless the bound tab provably fronts our boot instance).
         ctx.ensureReachable?.();
-        const boundTabId = ctx.tabId;
-        // Snapshot the exact browser-tab registration that is about to receive the
-        // reboot. A post-restart success must observe a strictly newer hello from
-        // this SAME browser tab; a different tab can reuse the same saved-workflow
-        // routing id while the original is still reconnecting.
-        const preRestartPanelIdentity = ctx.panelConnectionIdentity?.();
-        const healthBase = captureRebootHealthBase(ctx);
         // #742 REFUSE-SAFE PREFLIGHT: a Manager reboot stops ComfyUI OUT-OF-BAND —
         // it never goes through our validated kill+relaunch — so before dispatching
         // anything, the stop must be provable survivable (#368/#370: losing a restart
@@ -5688,8 +5681,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // the PROVEN-dangerous shape refuses (a reachable local non-Desktop process
         // with an unbuildable/unvalidatable relaunch); every other shape — Desktop
         // (Electron-supervised, #400), unverifiable, or remote — proceeds exactly as
-        // before.
-        if (healthBase != null && sameHttpBase(getComfyUIBaseUrl(), healthBase)) {
+        // before. The binding for this DECISION is captured pre-await; nothing
+        // downstream may reuse it (r7).
+        const preflightHealthBase = captureRebootHealthBase(ctx);
+        if (preflightHealthBase != null && sameHttpBase(getComfyUIBaseUrl(), preflightHealthBase)) {
           const preflight = await (localRestartPreflightOverride ?? preflightLocalRestart)();
           if (!preflight.ok) {
             return ok({
@@ -5707,6 +5702,21 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             });
           }
         }
+        // r7: the preflight AWAIT sits between the binding capture and the dispatch,
+        // breaking the no-await invariant above — a tab/connection rebind during
+        // that await would make every pre-await capture stale (the dispatch would
+        // go to an unconfirmable/different target while the causation stamp, the
+        // recovery observer, and the legacy-fallback gate all read the STALE bound
+        // base). Re-heal and re-capture the tab id, panel identity, and health base
+        // AT THE DISPATCH POINT; everything below uses ONLY these fresh captures.
+        ctx.ensureReachable?.();
+        const boundTabId = ctx.tabId;
+        // Snapshot the exact browser-tab registration that is about to receive the
+        // reboot. A post-restart success must observe a strictly newer hello from
+        // this SAME browser tab; a different tab can reuse the same saved-workflow
+        // routing id while the original is still reconnecting.
+        const preRestartPanelIdentity = ctx.panelConnectionIdentity?.();
+        const healthBase = captureRebootHealthBase(ctx);
         const timing = getPanelRebootTiming();
         const dispatchTimeout = Math.max(1, Math.min(15000, overallDeadline - Date.now()));
         // CONCURRENT OBSERVATION (coordinator): start probing the fixed boot endpoint NOW,

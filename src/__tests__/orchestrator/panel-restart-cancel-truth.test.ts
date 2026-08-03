@@ -592,4 +592,29 @@ describe("panel_restart_comfyui — restart dispatch record (r4/r5)", () => {
     expect(t2).not.toMatch(/STOPPED and did not come back/i);
     expect(sends.filter((c) => c.cmd === "comfy_reboot")).toHaveLength(1); // only the first
   });
+
+  it("a rebind DURING the preflight await withholds the causation-capable stamp (r7)", async () => {
+    // Bound at the preflight DECISION, but the session rebinds to an
+    // unconfirmable target MID-AWAIT: the dispatch proceeds to the new target,
+    // yet the stamp must use the DISPATCH-POINT binding (unbound → process-wide
+    // non-causation slot only) — never the stale pre-await bound base.
+    const fronts = { current: true }; // bound when the preflight is decided…
+    __panelToolsTestHooks.setLocalRestartPreflight(async () => {
+      fronts.current = false; // …but a rebind lands DURING the preflight await
+      return { ok: true };
+    });
+    __panelToolsTestHooks.setHealthProbe(async () => "down");
+    const { ctx, sends } = makeCtx({ confirm: "yes", fronts });
+
+    const out = parse(await restartTool().handler({}, ctx));
+
+    // The dispatch still proceeded (to the new, unconfirmable target) and was
+    // accepted — honestly reported unconfirmable.
+    expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(true);
+    expect(out.rebooting).toBe(true);
+    // The causation-capable stamp is WITHHELD: no session-held record…
+    expect(__panelToolsTestHooks.getSessionRestartDispatch(ctx)).toBeNull();
+    // …only the shared process-wide (never-causation) slot knows of it.
+    expect(getRestartDispatchRecord(PROCESS_WIDE_RESTART_DISPATCH_TOKEN)).not.toBeNull();
+  });
 });
