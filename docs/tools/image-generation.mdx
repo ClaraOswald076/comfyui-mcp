@@ -6,9 +6,13 @@ icon: "image"
 
 <Info>7 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
 
+<Tip>**You don't type these calls.** Ask your agent for what you want in ordinary English — it chooses the tool and fills in the arguments. The JSON on this page is what it sends. New here? Start with [Using the tools](/using-tools).</Tip>
+
 ## generate_image
 
 Generate an image from a text prompt — the high-level entry point. Builds a txt2img workflow, filling any unspecified parameter from your configured defaults (set_defaults / COMFYUI_DEFAULT_* / config file), auto-selecting a local checkpoint when none is given. Returns the prompt_id immediately; the resulting asset_id arrives in the completion notification and can be passed to view_image or regenerate. For full control over the node graph, use create_workflow + enqueue_workflow instead.
+
+<Tip>**In plain terms:** The one-line way to get a picture. You do not need a workflow open, or any workflow at all — describe the image and this builds and runs a sensible graph for you. Everything except the prompt is optional and falls back to your saved defaults.</Tip>
 
 ### Parameters
 
@@ -46,18 +50,39 @@ Generate an image from a text prompt — the high-level entry point. Builds a tx
   Number of images to generate
 </ParamField>
 
-### Example
+### Examples
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** Make me a picture of a red fox in the snow.
 
 ```json
 {
   "tool": "generate_image",
   "arguments": {
-    "prompt": "<prompt>"
+    "prompt": "a red fox in deep snow, golden hour, sharp focus"
   }
 }
 ```
+
+**You get back:** The finished image, inline in the conversation, plus the seed and settings that produced it so you can ask for the same thing again.
+
+**You say:** Same fox, but widescreen, more detail, and keep it repeatable.
+
+```json
+{
+  "tool": "generate_image",
+  "arguments": {
+    "prompt": "a red fox in deep snow, golden hour, sharp focus",
+    "negative_prompt": "blurry, watermark, text",
+    "width": 1344,
+    "height": 768,
+    "steps": 30,
+    "cfg": 4.5,
+    "seed": 12345
+  }
+}
+```
+
+**You get back:** The same fields plus the image. Because `seed` was pinned, running this again with the same settings gives the same picture — that is how you iterate on one image instead of rolling a new one each time.
 
 ---
 
@@ -109,7 +134,7 @@ Generate an image conditioned by a ControlNet preprocessed image (pose skeleton,
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -174,7 +199,7 @@ Generate an image guided by a reference image's style/subject via IP-Adapter, pl
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -206,7 +231,7 @@ Re-enqueue the workflow that produced an existing asset, optionally applying par
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -315,7 +340,7 @@ Generate audio from a text prompt — supports ACE Step 1.5 and Stable Audio 3 m
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -375,16 +400,21 @@ Generate a short video from a text prompt (text-to-video), or animate a start im
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** Turn that fox picture into a short clip of it walking.
 
 ```json
 {
   "tool": "generate_video",
   "arguments": {
-    "prompt": "<prompt>"
+    "prompt": "a red fox walking through deep snow, camera slowly pushing in",
+    "seconds": 5,
+    "resolution": "832x480",
+    "fps": 16
   }
 }
 ```
+
+**You get back:** A path to the rendered video file plus the settings used. Video takes far longer than a still — minutes, not seconds — so the agent will usually tell you it has started and then report back.
 
 ---
 
@@ -415,7 +445,7 @@ Generate a 3D model (glb/obj/fbx) from a text prompt or an input image, using th
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {

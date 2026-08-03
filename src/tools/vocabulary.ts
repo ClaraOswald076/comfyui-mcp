@@ -382,6 +382,13 @@ export const DEAD_NAMES: readonly DeadName[] = [
     name: "get_workspace",
     since: "0.49.0",
     replacement: 'workspace (action:"get")',
+    allowedIn: [
+      {
+        path: "docs/using-tools.mdx",
+        context: "| `get_workspace` | `workspace` with `action: \"get\"` |",
+        why: "The old-name → new-form migration table on the human-facing tools guide. A community reader (#660-adjacent confusion) read the 0.49.0 consolidation as capability being REMOVED; the table exists to show the same behaviour under a new label, so the left column must spell the retired name. It is a mapping AWAY from the name, never an instruction to call it.",
+      },
+    ],
   },
   {
     name: "set_default_workspace",
@@ -420,6 +427,13 @@ export const DEAD_NAMES: readonly DeadName[] = [
     name: "get_queue",
     since: "0.49.0",
     replacement: 'queue (action:"list")',
+    allowedIn: [
+      {
+        path: "docs/using-tools.mdx",
+        context: "| `get_queue` | `queue` with `action: \"list\"` |",
+        why: "Same migration table as get_workspace above — the retired name appears only in the left column, mapped to its live replacement on the right.",
+      },
+    ],
   },
   {
     name: "get_queued_workflow",
@@ -591,6 +605,13 @@ export const DEAD_NAMES: readonly DeadName[] = [
     name: "apps_run_status",
     since: "0.49.0",
     replacement: 'apps (action:"run_status")',
+    allowedIn: [
+      {
+        path: "docs/using-tools.mdx",
+        context: "| `apps_run_status` | `apps` with `action: \"run_status\"` |",
+        why: "Same migration table as get_workspace above. Included as the third row because it is from a DIFFERENT consolidation slice, showing the reader that the pattern is general rather than one tool's quirk.",
+      },
+    ],
   },
   {
     name: "apps_import",

@@ -1,0 +1,228 @@
+---
+title: "Using the tools"
+description: "What the tools are, why you never call one yourself, and what to do when one says no. Written for people, not for engineers."
+icon: "hand-pointer"
+---
+
+The [Tool Reference](/tools/image-generation) lists everything this project can do, in the form the AI reads it. This page is the version for you.
+
+<Note>
+  Nothing here requires you to write code, type JSON, or learn an API. If you have
+  ever asked a person to "open my portrait workflow and bump the steps to 30",
+  you already know the interface.
+</Note>
+
+## A tool is a thing the agent can do, not a thing you type
+
+On its own, a chat model can only produce text. It can describe a workflow; it cannot open one.
+
+A **tool** is a specific, named action we hand the model so it can actually reach your ComfyUI — load a file, queue a render, install a node pack, look at the picture that came out. The model does not get to invent these. It gets a fixed menu, and each item on the menu says exactly what it needs.
+
+**You never pick from that menu.** You say what you want, in whatever words come naturally, and the agent chooses.
+
+| You say | It quietly runs |
+| --- | --- |
+| "What have I got saved?" | `list_workflows` |
+| "Open the portrait one and tell me what it does" | `list_workflows`, then `analyze_workflow` |
+| "Make me a red fox in the snow" | `generate_image` |
+| "Is it done yet?" | `queue` (the `list` job) |
+| "That failed and I don't understand why" | `diagnose_run` |
+| "Half the nodes are red" | `install_workflow_dependencies` |
+| "I'm out of disk space, what's big?" | `list_local_models` |
+
+Notice the second row: one sentence, two tools, in an order you did not have to know. That is the point of the whole arrangement. You are not expected to know that finding a file and reading a file are separate operations.
+
+<Tip>
+  You can be as vague as you like. "Something's broken" is a perfectly good
+  opening — the agent will start with `health_check` and narrow down. Being
+  specific gets you there faster, but it is never required.
+</Tip>
+
+### So what is all that JSON in the reference pages?
+
+Every tool page shows a block like this:
+
+```json
+{
+  "tool": "generate_image",
+  "arguments": {
+    "prompt": "a red fox in deep snow, golden hour, sharp focus",
+    "steps": 30
+  }
+}
+```
+
+That is a transcript of what the agent sent, not an instruction to you. You said "make me a red fox in the snow, and put a bit more detail into it"; that is what came out the other end.
+
+It is worth being able to read one, for two reasons: when you want to check the agent understood you, and when something goes wrong and you are describing it to someone else. It is not worth memorising.
+
+## Two places tools come from
+
+There are two surfaces, and they exist because they answer different questions.
+
+<CardGroup cols={2}>
+  <Card title="The sidebar panel" icon="window-maximize">
+    Lives **inside ComfyUI**, in the Agent tab. Its tools (`panel_*`) act on the
+    graph you are looking at right now — the actual canvas, with your unsaved
+    changes on it.
+  </Card>
+  <Card title="An outside client" icon="terminal">
+    Claude Desktop, Claude Code, an editor, your phone. Its tools act on the
+    **server**: files on disk, the job queue, models, node packs, the ComfyUI
+    process itself.
+  </Card>
+</CardGroup>
+
+The split is really about the word "this". When you say "add a LoRA to **this**", the panel knows what "this" is, because it can see your screen. An outside client cannot — it has to be told a filename.
+
+So the panel handles things like:
+
+- reading the graph in front of you (`panel_graph_outline`)
+- running it, exactly as if you had hit Queue Prompt yourself (`panel_run`)
+- wiring a node in, changing a widget, telling you why a node went red (`panel_add_node`, `panel_set_widget`, `panel_get_errors`)
+- loading a whole workflow onto the canvas, or saving what is there (`panel_load_workflow`, `panel_save_workflow`)
+
+And an outside client handles things like generating an image from scratch, managing models and node packs, working through saved files, and restarting ComfyUI.
+
+<Tip>
+  **If you are new, use the panel.** It is one install, it is right there next to
+  your graph, and it does not need a separate app. See
+  [the panel guide](/panel) to set it up. Add an outside client later, when you
+  want the agent involved in things that are not a canvas.
+</Tip>
+
+They are not rivals — the panel talks to the same server underneath, and a session can use both. Someone editing a graph on their desktop while a phone drives the same session is a supported thing, not a hack.
+
+## One tool, several jobs
+
+You will notice some tools take an `action`:
+
+```json
+{ "tool": "workspace", "arguments": { "action": "get" } }
+```
+
+This looks cryptic and is not. `workspace` is a topic — *which ComfyUI installation are we talking about* — and `action` says which question you are asking about that topic: read it, change the default, list what is available.
+
+It reads exactly like ordinary speech, where the verb and the object are separate words:
+
+| You say | Action |
+| --- | --- |
+| "Which ComfyUI am I using?" | `get` |
+| "Always use the one on my D drive" | `set_default` |
+| "What installations can you see?" | `list` |
+
+### Nothing was removed
+
+This shape is new-ish, and it is easy to read it as capability being cut. It isn't, and the confusion is worth heading off directly, because it has already come up.
+
+There used to be one tool per question — a separate name for reading a workspace, another for setting it, another for listing them. Those names are gone, and if you watch the tool count you will see it falling, sharply.
+
+What actually happened is that related tools were **merged**, not deleted:
+
+| The old name | The same thing today |
+| --- | --- |
+| `get_workspace` | `workspace` with `action: "get"` |
+| `get_queue` | `queue` with `action: "list"` |
+| `apps_run_status` | `apps` with `action: "run_status"` |
+
+Same code underneath, same behaviour, same answers. Only the label on the front changed.
+
+The reason is that the menu got long enough to hurt. Every tool's full description has to be handed to the model before it can choose, and past a certain size the choosing itself degrades — smaller models in particular start picking a plausible-looking neighbour instead of the right one. Fewer, broader tools with a clear `action` measurably fixes that. It also means the model spends its attention on your request instead of on reading a catalogue.
+
+You should not notice any of this. You never typed the old name either; you said "which ComfyUI am I on?", and that still works.
+
+<Note>
+  If some older guide or a model's own memory reaches for a name that no longer
+  exists, you get a specific error naming the replacement rather than a blank
+  "unknown tool" — for example: *removed in 0.49.0. Call workspace (action:"get")
+  instead.* The agent can usually correct itself and retry without you doing
+  anything.
+</Note>
+
+## When it says no
+
+A tool refusing is not usually a bug. Most refusals are a guard that fired because the call would have done something you did not ask for.
+
+### "It refused and I don't know why"
+
+You will see plain-language text rather than a stack trace — something naming what it would not do and what to do instead. Read it as the agent being careful, not stuck. Common honest refusals:
+
+- **It cannot tell which workflow you mean.** More than one tab is open, or the graph has no saved identity yet. Save it, or say which one.
+- **It would overwrite something.** Ask for a new filename and it will proceed.
+- **The thing genuinely is not there.** A model file, a node pack, a running server.
+
+If a refusal reads as nonsense rather than caution, that is worth reporting — ask the agent to file it, and it will attach your setup details for you.
+
+### "This panel is too old"
+
+The most common refusal with a real fix. It reads roughly like:
+
+> This ComfyUI-MCP panel is too old for *"…"* — update the ComfyUI-MCP panel, then reconnect.
+
+The sidebar panel and this server are separate pieces that ship separately, so one can lag the other. When the server asks for something the installed panel cannot do safely, it declines rather than guessing — an old panel that cannot confirm *which* workflow a command lands on could apply your edit to the wrong tab, so it is held to reads until it is updated.
+
+The fix is three steps, and **the third is the one people skip**:
+
+<Steps>
+  <Step title="Update the panel">
+    Ask the agent to update it (`install_panel` with `action: "update"`), or do it
+    from ComfyUI Manager, where it is listed as the comfyui-mcp panel.
+  </Step>
+  <Step title="Restart ComfyUI">
+    The update does not restart anything on its own. Ask the agent, or restart it
+    yourself.
+  </Step>
+  <Step title="Hard-refresh the ComfyUI browser tab">
+    **Ctrl+Shift+R** (**Cmd+Shift+R** on a Mac). Your browser has the old panel
+    code cached, and a restart alone will not shake it loose. Skip this and the
+    same message comes straight back, which is why it looks like the update
+    failed when it did not.
+  </Step>
+</Steps>
+
+### "No panel connected"
+
+Different problem, similar-looking message. This means the outside agent cannot find your ComfyUI browser tab. Nearly always it is one of:
+
+- ComfyUI is not open in a browser at all — open it and look at the Agent tab in the sidebar.
+- ComfyUI was just restarted, or you reloaded the tab. That drops the connection. **Reload the ComfyUI tab** and it comes straight back.
+- The panel is not installed yet. See [the panel guide](/panel).
+
+The message itself will tell you which — it distinguishes "never connected" from "connected earlier and dropped", and the second one is always just a reload.
+
+## If you run a small local model
+
+Handing the entire menu to a model costs a lot of reading before it says a word. On a large hosted model that is fine. On a small model running on your own machine it is often the difference between working and not.
+
+So by default the agent gets **three** tools instead of the full set: one to browse the catalogue, one to look up a single tool in detail, and one to run it. It fetches what it needs, when it needs it, rather than reading everything up front.
+
+You do not have to do anything to get this — it is the default. The controls exist if you want them:
+
+```bash
+# force the small three-tool mode
+npx -y comfyui-mcp --compact
+
+# or hand the model everything at once
+npx -y comfyui-mcp --full
+```
+
+Either can also be set with `COMFYUI_MCP_TOOL_MODE=compact` or `COMFYUI_MCP_TOOL_MODE=full`.
+
+The trade is a couple of extra round-trips before the first real action, in exchange for a model that has room left to think. Big models are usually happier with `--full`. See [local LLMs](/local-llms) for which models cope with which.
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install it and generate your first image.
+  </Card>
+  <Card title="The sidebar panel" icon="window-maximize" href="/panel">
+    The in-ComfyUI agent, and what it can do to your canvas.
+  </Card>
+  <Card title="Tool Reference" icon="book" href="/tools/image-generation">
+    Every tool, with worked examples of what a real call looks like.
+  </Card>
+  <Card title="Troubleshooting" icon="wrench" href="/troubleshooting">
+    When it is not a refusal and something is actually broken.
+  </Card>
+</CardGroup>

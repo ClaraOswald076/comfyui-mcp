@@ -25,6 +25,7 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 // zod 4 ships JSON Schema conversion natively (z.toJSONSchema) — no zod-to-json-schema.
 import { registerAllTools } from "../src/tools/index.js";
+import { TOOL_DOC_EXAMPLES, type ToolDocEntry } from "./tool-doc-examples.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, "..");
@@ -351,6 +352,116 @@ function firstSentence(desc: string): string {
   return (m ? m[0] : desc).trim();
 }
 
+/**
+ * Validate every curated example in scripts/tool-doc-examples.ts against the
+ * tool's REAL zod schema, and fail generation if any of them is wrong.
+ *
+ * This exists because a documented call that does not typecheck is worse than no
+ * example at all: a reader copies it, it 400s, and they conclude the tool is
+ * broken. Prose cannot be unit-tested, so this is where examples get tested.
+ *
+ * Three distinct failures, each caught deliberately:
+ *
+ * 1. A key for a tool that no longer exists. During the consolidation tools are
+ *    being renamed and folded together; an example still keyed by a retired name
+ *    must become a loud failure, not a silently-ignored map entry.
+ *
+ * 2. A field that is not in the schema. zod objects STRIP unknown keys by
+ *    default, so `safeParse` alone happily accepts `{"filenmae": "x"}` and
+ *    reports success — the misspelling would ship. Hence the explicit key check
+ *    against the JSON Schema's properties, before parsing.
+ *
+ * 3. A field with the wrong type or a missing required one. That is what
+ *    `safeParse` is for, run against the same shape the MCP SDK advertises.
+ */
+function validateExamples(byName: Map<string, CapturedTool>): void {
+  const problems: string[] = [];
+
+  for (const [toolName, entry] of Object.entries(TOOL_DOC_EXAMPLES)) {
+    const tool = byName.get(toolName);
+    if (!tool) {
+      problems.push(
+        `${toolName}: no such tool is registered — it was probably renamed or ` +
+          `consolidated. Update or remove its entry in scripts/tool-doc-examples.ts.`,
+      );
+      continue;
+    }
+    const schema = z.object(tool.shape);
+    const json = z.toJSONSchema(schema, { reused: "inline", io: "input" }) as unknown as JsonSchema;
+    const known = new Set(Object.keys(json.properties ?? {}));
+
+    entry.examples.forEach((ex, i) => {
+      const where = `${toolName} example #${i + 1} ("${ex.ask}")`;
+      const unknownKeys = Object.keys(ex.args).filter((k) => !known.has(k));
+      if (unknownKeys.length > 0) {
+        problems.push(
+          `${where}: field(s) ${unknownKeys.map((k) => `\`${k}\``).join(", ")} ` +
+            `do not exist on this tool. Known fields: ${[...known].join(", ") || "(none)"}.`,
+        );
+        // Still parse below: a typo'd key is stripped, so the parse would pass
+        // and hide any OTHER problem in the same example.
+      }
+      const parsed = schema.safeParse(ex.args);
+      if (!parsed.success) {
+        const detail = parsed.error.issues
+          .map((iss) => `${iss.path.join(".") || "(root)"}: ${iss.message}`)
+          .join("; ");
+        problems.push(`${where}: does not satisfy the tool's schema — ${detail}`);
+      }
+    });
+  }
+
+  if (problems.length > 0) {
+    throw new Error(
+      `[gen-tool-docs] ${problems.length} documented example(s) do not match the live tool ` +
+        `schemas:\n  ${problems.join("\n  ")}\n` +
+        `Fix the example in scripts/tool-doc-examples.ts — do NOT relax this check. ` +
+        `An example that does not typecheck will be copied by a reader and will fail.`,
+    );
+  }
+}
+
+/** Render the curated examples for one tool, or the generated skeleton if it has none. */
+function renderExamples(t: CapturedTool, json: JsonSchema, entry?: ToolDocEntry): string[] {
+  const lines: string[] = [];
+
+  if (!entry || entry.examples.length === 0) {
+    lines.push("### Example", "");
+    lines.push(
+      "<Note>No worked example yet — the call below is a skeleton generated from the " +
+        "required parameters. Real examples live in `scripts/tool-doc-examples.ts`; " +
+        "contributions welcome.</Note>",
+      "",
+    );
+    lines.push(
+      "```json",
+      JSON.stringify({ tool: t.name, arguments: exampleArgs(t.name, json) }, null, 2),
+      "```",
+      "",
+    );
+    return lines;
+  }
+
+  lines.push(entry.examples.length === 1 ? "### Example" : "### Examples", "");
+  for (const ex of entry.examples) {
+    // The ASK comes first on purpose. The audience for this page mostly does not
+    // type JSON at anything — they say a sentence to an agent and it makes the
+    // call. Leading with the sentence shows which request reaches this tool;
+    // leading with the JSON implies a calling convention they will never use.
+    lines.push(`**You say:** ${esc(ex.ask)}`, "");
+    lines.push(
+      "```json",
+      JSON.stringify({ tool: t.name, arguments: ex.args }, null, 2),
+      "```",
+      "",
+    );
+    if (ex.argsNote) lines.push(`<Note>${esc(ex.argsNote)}</Note>`, "");
+    lines.push(`**You get back:** ${esc(ex.returns)}`, "");
+    if (ex.caution) lines.push(`<Warning>${esc(ex.caution)}</Warning>`, "");
+  }
+  return lines;
+}
+
 function renderTool(t: CapturedTool): string {
   // `io: "input"` matches what the MCP SDK advertises to clients
   // (sdk/server/zod-json-schema-compat.js defaults pipeStrategy to 'input').
@@ -371,9 +482,20 @@ function renderTool(t: CapturedTool): string {
   const required = new Set(json.required ?? []);
   const paramNames = Object.keys(props);
 
+  const entry = TOOL_DOC_EXAMPLES[t.name];
+
   const lines: string[] = [];
   lines.push(`## ${t.name}`, "");
   lines.push(esc(t.description), "");
+
+  // The gloss is ADDITIVE. The description above is written for model dispatch —
+  // it disambiguates this tool from its neighbours in the terms a model needs,
+  // which is why it talks about context cost and about which tool NOT to pick.
+  // Rewriting it for readability measurably degrades tool choice (#557/#654), so
+  // a human-facing sentence goes here, next to it, instead of over it.
+  if (entry?.gloss) {
+    lines.push(`<Tip>**In plain terms:** ${esc(entry.gloss)}</Tip>`, "");
+  }
 
   if (paramNames.length > 0) {
     lines.push("### Parameters", "");
@@ -385,10 +507,7 @@ function renderTool(t: CapturedTool): string {
     lines.push("<Note>This tool takes no parameters.</Note>", "");
   }
 
-  lines.push("### Example", "");
-  lines.push("<Note>Example coming soon — the call below is a generated skeleton.</Note>", "");
-  const args = exampleArgs(t.name, json);
-  lines.push("```json", JSON.stringify({ tool: t.name, arguments: args }, null, 2), "```", "");
+  lines.push(...renderExamples(t, json, entry));
   lines.push("---", "");
   return lines.join("\n");
 }
@@ -408,6 +527,11 @@ async function main() {
   await registerAllTools(mockServer as never);
 
   const byName = new Map(captured.map((t) => [t.name, t]));
+
+  // Before ANY page is rendered — a bad example must abort the run, not be
+  // written into 16 files and then reported.
+  validateExamples(byName);
+
   const mapped = new Set<string>();
   mkdirSync(toolsDir, { recursive: true });
 
@@ -432,6 +556,16 @@ async function main() {
     page.push("---");
     page.push("");
     page.push(`<Info>${present.length} tool${present.length === 1 ? "" : "s"}. Generated from the live MCP tool schemas — do not edit by hand; run \`npm run docs:gen\`.</Info>`);
+    page.push("");
+    // Every page carries this. The JSON below is what the AGENT sends; readers
+    // arriving from a search result were being shown a calling convention they
+    // will never type, with nothing on the page to say so.
+    page.push(
+      "<Tip>**You don't type these calls.** Ask your agent for what you want in " +
+        "ordinary English — it chooses the tool and fills in the arguments. The JSON " +
+        "on this page is what it sends. New here? Start with " +
+        "[Using the tools](/using-tools).</Tip>",
+    );
     page.push("");
     for (const name of present) page.push(renderTool(byName.get(name)!));
 
