@@ -931,6 +931,33 @@ describe("a wholesale replacement needs the RUNNING server to have chosen the tr
     expect(evaluatePanelSync(status).summary).toMatch(/not a proven absence/);
   });
 
+  it("a retarget DURING the probe discards the answer — never stamps tree A with target B", async () => {
+    // The probe is a network round trip and the orchestrator can retarget
+    // during it. Labelling A's answer with B is worse than no answer: every
+    // downstream check compares against that label and would agree with itself
+    // all the way to a wrong-tree mutation reported as success.
+    const liveRoot = join(root, "live", "ComfyUI");
+    mkdirSync(join(liveRoot, "custom_nodes"), { recursive: true });
+    workspace.reachable = true;
+    workspace.liveArgv = [`${liveRoot}/main.py`];
+    __resetPanelBaseCache();
+
+    const realSnapshot = workspace.reachable;
+    // Retarget lands while /system_stats is in flight.
+    const resolution = await (async () => {
+      const p = primePanelBase();
+      generation.value++;
+      return p;
+    })();
+    expect(realSnapshot).toBe(true);
+    expect(resolution.source).toBe("none");
+    expect(resolution.base).toBeUndefined();
+    expect(lastPanelBaseResolution()).toBeUndefined();
+
+    // The next prime, against the settled target, answers properly.
+    expect((await primePanelBase()).base).toBe(liveRoot);
+  });
+
   it("a live-resolved base is corroborated", async () => {
     const liveRoot = join(root, "live", "ComfyUI");
     mkdirSync(join(liveRoot, "custom_nodes"), { recursive: true });

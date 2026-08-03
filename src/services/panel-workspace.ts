@@ -230,6 +230,19 @@ export async function primePanelBase(
 ): Promise<PanelBaseResolution> {
   const fresh = opts.force ? undefined : cachedResolution();
   if (fresh) return fresh;
+
+  // CAPTURE THE IDENTITY BEFORE THE AWAIT, never after.
+  //
+  // The probe is a network round trip, and the orchestrator can retarget during
+  // it — its hello handler starts the panel sync and then retargets. Stamping
+  // the result with values read AFTERWARDS would label tree A's answer with
+  // target B, which is worse than having no answer: every downstream check
+  // (the swap's corroboration, the stale-bundle proof, the mid-op generation
+  // guard) compares against that label and would agree with itself all the way
+  // to a wrong-tree mutation reported as success.
+  const atTarget = targetKey();
+  const atGeneration = targetGeneration();
+
   let resolution: PanelBaseResolution;
   try {
     resolution = await resolvePanelBase();
@@ -241,12 +254,17 @@ export async function primePanelBase(
       ? { base: configured, source: "configured" }
       : { source: "none" };
   }
-  cached = {
-    at: Date.now(),
-    target: targetKey(),
-    generation: targetGeneration(),
-    resolution,
-  };
+
+  // The target moved while we were asking. This answer describes the PREVIOUS
+  // ComfyUI, so it is not cached and not returned as a resolution anyone may
+  // act on — callers see "nothing resolved" and fail closed, and the next
+  // prime (against the settled target) answers properly.
+  if (targetKey() !== atTarget || targetGeneration() !== atGeneration) {
+    cached = undefined;
+    return { source: "none" };
+  }
+
+  cached = { at: Date.now(), target: atTarget, generation: atGeneration, resolution };
   return resolution;
 }
 
