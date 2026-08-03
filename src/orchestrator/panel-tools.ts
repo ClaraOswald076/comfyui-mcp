@@ -2235,6 +2235,10 @@ function httpStatusOfError(err: unknown): number | undefined {
 
 /** Drop the one leading "workflows/" segment, leaving a store-RELATIVE key.
  *
+ *  EXACTLY one separator is consumed (codex MAJOR). "workflows//foo.json" keeps
+ *  its second slash and stays "/foo.json" — collapsing runs of slashes would make
+ *  it an alias for the different key "foo.json".
+ *
  *  Nothing else is stripped. In particular a leading "/" is NOT removed (codex
  *  MAJOR): caller input can never reach here with one (that is an absolute path,
  *  handled earlier), so the only strings it would affect are LISTING entries —
@@ -2254,7 +2258,7 @@ function httpStatusOfError(err: unknown): number | undefined {
  *  stripping it would turn "WORKFLOWS/foo.json" into a request for the root
  *  "foo.json". */
 const stripLibraryPrefix = (key: string): string =>
-  key.replace(/^workflows\/+/, "");
+  key.replace(/^workflows\//, "");
 
 /** The form two userdata store keys are compared in when deciding they are the
  *  SAME NAME. Unicode normalization is the only equivalence applied: NFD "é" and

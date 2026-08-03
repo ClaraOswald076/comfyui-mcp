@@ -479,6 +479,25 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
     expect(JSON.stringify(res)).toMatch(/path separator/i);
   });
 
+  it("does NOT collapse a repeated slash after the workflows/ prefix", async () => {
+    // "workflows//foo.json" is the key "/foo.json" under the library, which is a
+    // different key from "foo.json". Collapsing the run of slashes would alias one
+    // onto the other (codex MAJOR).
+    routeMock(["foo.json"], {
+      "workflows/foo.json": { nodes: [{ id: 41, type: "BareNameNode" }], links: [] },
+    });
+
+    const { ctx, calls } = makeCtx();
+    const res = await loadWorkflow().handler({ path: "workflows//foo.json" }, ctx);
+
+    expect(res.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+    // The bare-name key exists and would have loaded had the slashes collapsed.
+    expect(fetchApi).not.toHaveBeenCalledWith(
+      `/api/userdata/${encodeURIComponent("workflows/foo.json")}`,
+    );
+  });
+
   it("does NOT fold a LEADING-SLASH listing entry onto the bare name", async () => {
     // "/name.json" and "name.json" are different store keys. Folding them in the
     // match let a match on the listed "/name.json" be RETRIED as
