@@ -9,6 +9,12 @@ import { comfyuiFetch } from "../comfyui/fetch.js";
 import { ProcessControlError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { findComfyuiPython } from "./env-capabilities.js";
+import {
+  readLiveProcessEnv,
+  resolveLaunchEnvironment,
+  type LaunchEnvInfo,
+  type LaunchEnvResolution,
+} from "./launcher-env.js";
 import { resetManagerApiCache } from "./manager-api-cache.js";
 import { parseListenerPidFromNetstat, findPidByPort } from "./port-owner.js";
 import {
@@ -40,6 +46,22 @@ interface ProcessInfo {
    * after the stop kills the pid (when `/proc/<pid>/cwd` is gone) (#535).
    */
   liveCwd?: string;
+  /**
+   * The live ComfyUI process's own ENVIRONMENT, captured at gather-time while the
+   * process is still ALIVE — the same known-good moment (and the same
+   * disappears-on-kill constraint) as `liveCwd`. This is the launch environment
+   * verbatim, so a relaunch reproduces it exactly instead of silently
+   * substituting the orchestrator's own environment (#776). Linux only; other
+   * platforms cannot read another process's environment block.
+   */
+  liveEnv?: NodeJS.ProcessEnv;
+  /**
+   * The resolved relaunch ENVIRONMENT decision (#776) — computed once by
+   * assessRelaunch (pre-stop, so a refusal happens before anything is killed) and
+   * reused verbatim by the spawn, so the process that comes back is launched into
+   * the same environment the preflight approved.
+   */
+  envPlan?: LaunchEnvResolution;
 }
 
 interface StopResult {
@@ -57,6 +79,8 @@ interface StartResult {
   readiness?: StartupReadinessResult;
   auto_restart?: SupervisorResult;
   spawn_error?: ChildProcessErrorDetails;
+  /** How the relaunch environment was resolved (#776). */
+  launch_env?: LaunchEnvInfo;
 }
 
 interface RestartResult {
@@ -67,6 +91,8 @@ interface RestartResult {
   readiness?: StartupReadinessResult;
   auto_restart?: SupervisorResult;
   spawn_error?: ChildProcessErrorDetails;
+  /** How the relaunch environment was resolved (#776). */
+  launch_env?: LaunchEnvInfo;
 }
 
 interface StartupReadinessResult {
@@ -431,6 +457,26 @@ function childProcessErrorDetails(err: unknown): ChildProcessErrorDetails {
   };
 }
 
+/** The launch-environment facts to report, once a plan has been resolved (#776). */
+function launchEnvInfo(info?: ProcessInfo): LaunchEnvInfo | undefined {
+  return info?.envPlan?.info;
+}
+
+/**
+ * The sentence appended to a start/restart message when the server had to be
+ * launched WITHOUT a launcher environment we could not rebuild (#776). Only
+ * reachable from the already-down path — the still-running path refuses instead.
+ */
+function launchEnvWarning(info?: ProcessInfo): string {
+  const plan = info?.envPlan;
+  if (!plan || plan.reproducible) return "";
+  return (
+    ` WARNING: ${plan.reason ?? plan.info.note}` +
+    ` It was launched with this process's environment instead, which may not be enough for it to come up. ` +
+    (plan.advice ?? "")
+  ).replace(/\s+$/, "");
+}
+
 function supervisorResult(info?: ProcessInfo): SupervisorResult {
   const policy = getRestartPolicy();
   return {
@@ -503,9 +549,25 @@ function spawnFromProcessInfo(info: ProcessInfo): SpawnedComfyUI | null {
 
   const cmd = resolveLaunchCommand(info);
   if (!cmd) return null;
+  // #776: the relaunch ENVIRONMENT is as load-bearing as the relaunch command.
+  // Resolve it here too (not only in assessRelaunch) so EVERY spawn site — the
+  // restart relaunch, a bare start_comfyui, and the crash supervisor — launches
+  // into the SAME environment the preflight approved.
+  //
+  // This site never REFUSES: reaching it means nothing is listening on the port,
+  // i.e. the server is already down, and leaving it down is the one outcome worse
+  // than a possibly-degraded launch (#776 cardinal rule). An irreproducible
+  // launcher environment is refused earlier, by assessRelaunch, while the server
+  // is still UP; here it only downgrades to "inherit + warn".
+  const envPlan = ensureLaunchEnvPlan(info, cmd);
   const child = spawn(cmd.exe, cmd.args, {
     detached: true,
     stdio: "ignore",
+    // Omitted (undefined) for a plain install → the child inherits this process's
+    // environment, exactly as before #776. Set only when we have a BETTER answer:
+    // the live process's own environment, or a launcher environment reconstructed
+    // from disk.
+    env: envPlan.env,
     // Prefer the cwd the command resolved against (the live process cwd or the
     // absolute install anchor for a relaunch, #535/#711); only then the
     // configured install dir — and only as an ABSOLUTE path that exists on disk.
@@ -572,6 +634,19 @@ function resolveScriptAnchor(argv: string[]): string | undefined {
  * equivalent and return undefined (the existing refuse-safe fallback still applies).
  */
 let liveCwdResolverOverride: ((pid: number) => string | undefined) | null = null;
+/**
+ * Injectable live-ENVIRONMENT reader (#776) — same rationale and lifetime as the
+ * live-cwd resolver above: it must run while the process is alive, and tests need
+ * to drive it without a real `/proc`.
+ */
+let liveEnvResolverOverride:
+  | ((pid: number) => NodeJS.ProcessEnv | undefined)
+  | null = null;
+
+function resolveLiveProcessEnv(pid: number): NodeJS.ProcessEnv | undefined {
+  if (liveEnvResolverOverride) return liveEnvResolverOverride(pid);
+  return readLiveProcessEnv(pid);
+}
 
 function resolveLiveProcessCwd(pid: number): string | undefined {
   if (liveCwdResolverOverride) return liveCwdResolverOverride(pid);
@@ -677,6 +752,27 @@ function resolveLaunchCommand(
   return { exe: first, args: rest };
 }
 
+/**
+ * Resolve (once) the ENVIRONMENT this instance must be relaunched into (#776),
+ * memoized on the ProcessInfo so the pre-stop preflight and the post-stop spawn
+ * can never disagree: whatever assessRelaunch approved is exactly what gets
+ * spawned. The paths handed to the resolver are the ones the relaunch actually
+ * uses (resolved script, interpreter, cwd) plus the raw argv[0], so a launcher
+ * layout is recognized whichever of them carries it.
+ */
+function ensureLaunchEnvPlan(
+  info: ProcessInfo,
+  cmd: { exe: string; args: string[]; cwd?: string },
+): LaunchEnvResolution {
+  if (info.envPlan) return info.envPlan;
+  const plan = resolveLaunchEnvironment({
+    paths: [cmd.args[0], cmd.exe, cmd.cwd, info.argv[0], info.liveCwd],
+    liveEnv: info.liveEnv,
+  });
+  info.envPlan = plan;
+  return plan;
+}
+
 function fileExists(p: string | undefined): boolean {
   if (!p) return false;
   try {
@@ -738,7 +834,20 @@ function looksLikePath(s: string): boolean {
  * `main.py` exist on disk — catching a stale COMFYUI_PATH that points at an
  * install with no runnable server.
  */
-function assessRelaunch(info: ProcessInfo): { ok: boolean; reason?: string } {
+function assessRelaunch(
+  info: ProcessInfo,
+  opts?: {
+    /**
+     * Also require that the launch ENVIRONMENT can be reproduced (#776). TRUE for
+     * our own kill+relaunch, which spawns a brand-new process and must therefore
+     * rebuild its environment. FALSE for an OUT-OF-BAND restart preflight (the
+     * panel's ComfyUI-Manager reboot): Manager re-execs the SAME process, which
+     * inherits its own environment, so the launcher environment is preserved for
+     * free and refusing on it would only cost the user a working restart.
+     */
+    requireReproducibleEnv?: boolean;
+  },
+): { ok: boolean; reason?: string; advice?: string } {
   if (info.isDesktopApp) {
     if (IS_WIN) {
       const exe = fileExists(info.desktopExePath)
@@ -805,6 +914,21 @@ function assessRelaunch(info: ProcessInfo): { ok: boolean; reason?: string } {
           "could not locate the ComfyUI install; set COMFYUI_PATH or a default " +
           "workspace (COMFYUI_PATH may point at a stale/old install that has no " +
           "runnable server).",
+      };
+    }
+  }
+  // #776: the command is only half the relaunch. A launcher (Stability Matrix,
+  // Pinokio) hands ComfyUI an environment we do NOT inherit — relaunching without
+  // it starts a process that dies during import and leaves the server DOWN. Decide
+  // it HERE, pre-stop, so an irreproducible environment refuses while the server is
+  // still running rather than after it has been killed.
+  if (opts?.requireReproducibleEnv) {
+    const envPlan = ensureLaunchEnvPlan(info, cmd);
+    if (!envPlan.reproducible) {
+      return {
+        ok: false,
+        reason: envPlan.reason ?? envPlan.info.note,
+        advice: envPlan.advice,
       };
     }
   }
@@ -973,6 +1097,10 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
   // Capture the live process cwd NOW, while the pid is guaranteed alive — the
   // `/proc/<pid>/cwd` symlink is gone the instant a later stop kills it (#535).
   const liveCwd = desktop ? undefined : resolveLiveProcessCwd(pid);
+  // Same live-only window for the ENVIRONMENT (#776): read it now, while the pid
+  // is guaranteed alive, so a relaunch can reproduce the launcher environment the
+  // server was actually started with instead of substituting the orchestrator's.
+  const liveEnv = desktop ? undefined : resolveLiveProcessEnv(pid);
 
   return {
     pid,
@@ -981,6 +1109,7 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
     isDesktopApp: desktop,
     desktopExePath: desktopExe,
     liveCwd,
+    liveEnv,
   };
 }
 
@@ -1157,29 +1286,45 @@ export async function startComfyUI(): Promise<StartResult> {
         `ComfyUI process failed to launch: ${startupResult.spawn_error.message}`,
       spawn_error: startupResult.spawn_error,
       auto_restart: supervisorResult(info),
+      launch_env: launchEnvInfo(info),
     };
   }
 
   const readiness = startupResult.readiness;
   if (!readiness.ready) {
+    const env = launchEnvInfo(info);
     return {
       started: false,
       ready: false,
       readiness,
+      // TRUTHFUL FAILURE (#776): the process was spawned but never answered, so
+      // ComfyUI is DOWN. Report that plainly — and name the environment it was
+      // launched into, which is the first thing to check when a relaunch of an
+      // otherwise-healthy install fails during import.
       message:
-        `ComfyUI process was launched but the API did not become ready after ${readiness.waited_ms}ms (${readiness.attempts}/${readiness.max_tries} probes). Check the ComfyUI logs.`,
+        `ComfyUI process was launched but the API did not become ready after ${readiness.waited_ms}ms (${readiness.attempts}/${readiness.max_tries} probes). Check the ComfyUI logs.` +
+        (env ? ` Launch environment: ${env.note}.` : "") +
+        launchEnvWarning(info),
       auto_restart: supervisorResult(info),
+      launch_env: env,
     };
   }
 
   const newPid = findPidByPort(port);
+  const env = launchEnvInfo(info);
   return {
     started: true,
     ready: true,
     readiness,
-    message: `ComfyUI started on port ${port}${newPid ? ` (PID ${newPid})` : ""}`,
+    message:
+      `ComfyUI started on port ${port}${newPid ? ` (PID ${newPid})` : ""}` +
+      // Say WHICH environment it came back in whenever that was not simply ours
+      // (#776) — the user needs to know a launcher environment was restored.
+      (env && env.source !== "inherited" ? ` — ${env.note}.` : "") +
+      launchEnvWarning(info),
     pid: newPid ?? undefined,
     auto_restart: supervisorResult(info),
+    launch_env: env,
   };
 }
 
@@ -1482,14 +1627,18 @@ export async function restartComfyUI(): Promise<RestartResult> {
     return restartViaManagerReboot({ label: "Desktop" });
   }
 
-  const relaunch = assessRelaunch(info);
+  // requireReproducibleEnv: this path KILLS the process and spawns a fresh one, so
+  // the launch ENVIRONMENT has to be rebuilt as well as the command (#776).
+  const relaunch = assessRelaunch(info, { requireReproducibleEnv: true });
   if (!relaunch.ok) {
     return {
       stopped: false,
       started: false,
       message:
         `Refusing to restart: ${relaunch.reason} ComfyUI was left running (not stopped) ` +
-        "so you don't lose the server. Fix the launch path (e.g. COMFYUI_PATH) and try again.",
+        "so you don't lose the server. " +
+        (relaunch.advice ??
+          "Fix the launch path (e.g. COMFYUI_PATH) and try again."),
     };
   }
 
@@ -1522,6 +1671,7 @@ export async function restartComfyUI(): Promise<RestartResult> {
       message: `ComfyUI was stopped but could not be started: ${startResult.message}`,
       auto_restart: startResult.auto_restart,
       spawn_error: startResult.spawn_error,
+      launch_env: startResult.launch_env,
     };
   }
 
@@ -1536,6 +1686,7 @@ export async function restartComfyUI(): Promise<RestartResult> {
     readiness: startResult.readiness,
     message: `ComfyUI restarted successfully. ${startResult.message}`,
     auto_restart: startResult.auto_restart,
+    launch_env: startResult.launch_env,
   };
 }
 
@@ -1633,6 +1784,11 @@ export async function preflightLocalRestart(): Promise<{
   const { info } = await acquireProcessInfo();
   if (!info) return { ok: true };
   if (info.isDesktopApp) return { ok: true };
+  // NOTE (#776): the launch-ENVIRONMENT check is deliberately NOT applied here.
+  // This preflight guards an OUT-OF-BAND ComfyUI-Manager reboot, which re-execs
+  // the SAME process — it inherits its own (launcher-supplied) environment, so a
+  // Stability Matrix / Pinokio environment survives that restart for free.
+  // Refusing on it would cost those users a restart path that actually works.
   const relaunch = assessRelaunch(info);
   if (relaunch.ok) return { ok: true };
   return { ok: false, reason: relaunch.reason };
@@ -1647,7 +1803,15 @@ export const __processControlTestHooks = {
     supervisorGaveUp = false;
     remoteRebootTimingOverride = null;
     liveCwdResolverOverride = null;
+    liveEnvResolverOverride = null;
     restartDispatchRecords.clear();
+  },
+  /** Inject a fake live-process-ENVIRONMENT reader (#776) so tests can drive the
+   *  `/proc/<pid>/environ` capture without a real process. */
+  setLiveEnvResolver(
+    fn: ((pid: number) => NodeJS.ProcessEnv | undefined) | null,
+  ): void {
+    liveEnvResolverOverride = fn;
   },
   /** Inject a fake live-process-cwd resolver (#535) so tests can drive the
    *  `/proc/<pid>/cwd` relative-script anchor without a real process/filesystem. */
