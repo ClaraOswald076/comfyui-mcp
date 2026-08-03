@@ -619,16 +619,20 @@ function classifyListenerOwnership(input: {
 }): ListenerOwnership {
   // A Desktop launch is undecidable BY DESIGN: we spawn the Electron shell (or
   // macOS `open`) and its child binds the port, so a pid mismatch proves nothing.
+  // A LAUNCH THAT NEVER HAPPENED is decisive on every path, Desktop included —
+  // these come FIRST so no later shortcut can soften them (codex gate). The spawn
+  // error is latched independently of the readiness race, and Node leaves `pid`
+  // undefined only when the spawn did not happen, so the two are the same fact
+  // arriving by different routes.
+  if (input.spawnFailed) return "not-ours";
+  if (input.child.pid == null) return "not-ours";
+  // A Desktop launch is undecidable BY DESIGN once it HAS started: we spawn the
+  // Electron shell (or macOS `open`, which exits immediately by design), and the
+  // process that binds the port is its child. Note this sits AFTER the
+  // never-launched checks but BEFORE `childExited`, because for Desktop a launcher
+  // exiting is normal rather than evidence of failure.
   if (input.isDesktopApp) return "unconfirmed";
   if (input.childExited) return "not-ours";
-  // The spawn FAILED — whatever is answering, we did not start it. Checked before
-  // anything else so a healthy listener that won the readiness race cannot launder
-  // a failed launch into an unconfirmed success (codex gate).
-  if (input.spawnFailed) return "not-ours";
-  // Node leaves `pid` undefined when the spawn did not happen at all. That is the
-  // same fact arriving by a different route (the `error` event may not have been
-  // delivered yet), so it gets the same verdict rather than "we cannot tell".
-  if (input.child.pid == null) return "not-ours";
 
   const alive = launchedChildStillRunning(input.child);
   // Definitively gone (ESRCH) — whatever is serving the port is not it, even

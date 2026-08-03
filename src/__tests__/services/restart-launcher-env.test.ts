@@ -1670,6 +1670,49 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
     killSpy.mockRestore();
   });
 
+  it("does NOT launder a failed DESKTOP launch either — the never-launched checks precede the Desktop shortcut", async () => {
+    // Desktop ownership is undecidable by design ONCE IT HAS STARTED (we spawn the
+    // shell; its child binds the port). But a launch that never happened is
+    // decisive on every path, so the Desktop shortcut must not sit in front of it.
+    __processControlTestHooks.setLastProcessInfo({
+      pid: 4321,
+      port: 8188,
+      argv: [],
+      isDesktopApp: true,
+      desktopExePath: join(resolve("Programs"), "Comfy Desktop", "Comfy Desktop.exe"),
+    });
+    const children = spawnCapturingChildren(null); // the spawn produced no process
+    let probed = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/netstat/i.test(cmd)) {
+        // Nothing listening at the pre-launch check; another launcher answers after.
+        return probed ? "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       7777" : "";
+      }
+      if (/lsof/i.test(cmd)) {
+        if (!probed) throw new Error("not listening");
+        return "p7777\nn127.0.0.1:8188\n";
+      }
+      return "";
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        probed = true;
+        setTimeout(() => children[0]?.emit("error", new Error("spawn ENOENT")), 50);
+        return { ok: true } as Response;
+      }),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await startComfyUI();
+
+    expect(result.listener_ownership).toBe("not-ours");
+    expect(result.started).toBe(false);
+    expect(result.message).not.toMatch(/^ComfyUI started/);
+
+    killSpy.mockRestore();
+  });
+
   it("says so plainly when listener ownership is UNDECIDABLE — without denying a restart that worked", async () => {
     // Unmappable port owner + a still-alive launched child. Reporting this as a
     // FAILED restart would mislabel every ordinary restart on hosts where the
