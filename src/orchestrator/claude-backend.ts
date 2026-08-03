@@ -435,12 +435,16 @@ export class ClaudeBackend implements AgentBackend {
     }
     const q = query({ prompt: prompt(), options: this.buildOptions(opts) });
     this.q = q;
-    // TURN MARKERS (#728): the SDK's input pump and output reader are independent
-    // streams, so the marker can't ride the input side — instead stamp output-side
-    // by turn boundary: the SDK ends every turn with a `result` message, so events
-    // between results belong to that turn. The count restarts with each run(),
-    // matching PanelAgent's per-dispatch mirror (Nth submitted turn = marker N).
-    let outTurn = 1;
+    // TURN MARKERS (#728 r4): stamp every event with the marker of the turn it
+    // BELONGS to, derived from the #745 per-turn trace FIFO (the SDK's input pump
+    // and output reader are independent streams, so the marker can't ride the
+    // input side, and a per-result counter lags behind once a turn's result goes
+    // missing). A result stamps with the trace it POPS (the oldest in-flight —
+    // its OWN turn, even when LATE); every other message stamps with the NEWEST
+    // in-flight trace (the turn currently producing output). markerBase re-zeroes
+    // the backend-wide trace ids per run (1 = this run's first turn), matching
+    // PanelAgent's per-dispatch mirror (Nth submitted turn = marker N).
+    const markerBase = this.lastResultTurnId;
     for await (const message of q) {
       // LIVENESS: every SDKMessage — including the ones route() doesn't translate
       // (tool-progress, rate-limit, etc.) — is a sign the session is alive, so
@@ -448,12 +452,22 @@ export class ClaudeBackend implements AgentBackend {
       // this is effectively a no-op for behavior here; it keeps the watchdog's
       // re-arm source uniform across both backends via the port.
       opts.onActivity?.();
+      // route()'s result case pops the OLDEST trace for classification — capture
+      // it BEFORE the generator is consumed so the stamp is the result's own turn.
+      const resultTurn = message.type === "result" ? this.turns[0]?.id : undefined;
+      const streamTurn = this.turns[this.turns.length - 1]?.id;
       for (const ev of this.route(message)) {
         // Session init arrives OUTSIDE any turn — leave it unstamped (an unmarked
-        // event is never dead-lettered). Everything else belongs to outTurn.
-        yield ev.type === "session" ? ev : { ...ev, turn: outTurn };
+        // event is never dead-lettered). A TRACELESS result (a stray from a dead
+        // session, which classification fails closed) is also left unstamped so
+        // its error and gate completion still reach the panel.
+        if (ev.type === "session") {
+          yield ev;
+          continue;
+        }
+        const id = message.type === "result" ? resultTurn : streamTurn;
+        yield id === undefined ? ev : { ...ev, turn: id - markerBase };
       }
-      if (message.type === "result") outTurn += 1;
     }
   }
 

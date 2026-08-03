@@ -1,0 +1,188 @@
+// #728 r4 — the Claude backend's turn markers must be TRUE turn attribution,
+// not a per-result output counter. The SDK's input pump and output reader are
+// independent streams, and a turn's result can go MISSING (the panel's
+// no-result fallback then releases the next turn) or arrive LATE — a counter
+// that increments per result lags behind the panel's per-dispatch mirror in
+// exactly those cases, stamping the NEXT turn's valid events with the abandoned
+// turn's marker so PanelAgent dead-letters them (the r3 result-only wedge,
+// Claude edition).
+//
+// The fix stamps from the #745 per-turn trace FIFO: a RESULT carries the trace
+// it pops (the oldest in-flight — its OWN turn, even when late); every other
+// message carries the NEWEST in-flight trace (the turn currently producing
+// output). Pattern follows claude-empty-turn.test.ts: the optional Agent SDK is
+// mocked, the backend is driven through run(), and the canonical AgentEvents
+// are collected and asserted on.
+
+import { describe, expect, it, beforeEach, vi } from "vitest";
+import type { AgentEvent } from "../../orchestrator/agent-backend.js";
+
+const hoisted = vi.hoisted(() => ({
+  /** A push-based async message source — stands in for the live SDK query stream. */
+  queue: new (class {
+    private buf: unknown[] = [];
+    private waiters: Array<() => void> = [];
+    private closed = false;
+    reset(): void {
+      this.buf = [];
+      this.closed = false;
+    }
+    push(m: unknown): void {
+      this.buf.push(m);
+      for (const w of this.waiters.splice(0)) w();
+    }
+    end(): void {
+      this.closed = true;
+      for (const w of this.waiters.splice(0)) w();
+    }
+    async *iterate(): AsyncGenerator<unknown> {
+      for (;;) {
+        while (this.buf.length) yield this.buf.shift();
+        if (this.closed) return;
+        await new Promise<void>((resolve) => this.waiters.push(resolve));
+      }
+    }
+  })(),
+  onInterrupt: null as null | (() => void),
+  /** User turns the mock SDK pulled from the prompt channel (proves submission). */
+  promptsSeen: 0,
+}));
+
+vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
+  query: (arg: { prompt?: AsyncIterable<unknown> }) => {
+    // The real SDK pulls user turns out of the prompt generator — drain it the
+    // same way so the backend's turn tracking sees every submitted turn.
+    void (async () => {
+      for await (const _ of arg.prompt ?? []) hoisted.promptsSeen += 1;
+    })();
+    const iter = hoisted.queue.iterate();
+    return Object.assign(iter, {
+      supportedModels: async () => [],
+      supportedCommands: async () => [],
+      interrupt: async () => {
+        hoisted.onInterrupt?.();
+      },
+      setModel: async () => {},
+    });
+  },
+}));
+
+beforeEach(() => {
+  hoisted.queue.reset();
+  hoisted.onInterrupt = null;
+  hoisted.promptsSeen = 0;
+});
+
+const INIT = {
+  type: "system",
+  subtype: "init",
+  session_id: "00000000-1111-2222-3333-444444444444",
+  model: "claude-test-1",
+  apiKeySource: "none",
+  skills: [],
+};
+
+const RESULT_SUCCESS = { type: "result", subtype: "success" };
+
+function assistantMsg(text: string) {
+  return {
+    type: "assistant",
+    message: { role: "assistant", id: "msg-1", content: [{ type: "text", text }] },
+    uuid: "a-1",
+    session_id: INIT.session_id,
+    parent_tool_use_id: null,
+  };
+}
+
+/** Start a live backend over a caller-controlled channel (for multi-turn flows). */
+async function startBackend(channelGen: AsyncGenerator<{ text: string }>) {
+  const { ClaudeBackend } = await import("../../orchestrator/claude-backend.js");
+  const backend = new ClaudeBackend({ mcpServers: {}, systemAppend: "" });
+  const events: AgentEvent[] = [];
+  const done = (async () => {
+    for await (const ev of backend.run({ channel: channelGen as never })) events.push(ev);
+  })();
+  return { backend, events, done };
+}
+
+const resultsOf = (events: AgentEvent[]) => events.filter((e) => e.type === "result");
+
+describe("Claude backend turn markers (#728 r4)", () => {
+  it("stamps a result with its OWN turn and stream events with the newest in-flight turn", async () => {
+    // A is interrupted mid-flight and produces NO result yet (the panel's
+    // no-result fallback has already released the gate); B is submitted. While
+    // A's result is still missing:
+    //   • B's valid stream event must stamp with B's marker (2) — a per-result
+    //     counter would stamp it 1 (A's), and PanelAgent would dead-letter B's
+    //     legitimate work;
+    //   • A's LATE result must stamp with A's own marker (1) → PanelAgent
+    //     dead-letters the abandoned turn's straggler;
+    //   • B's result-only terminal must stamp with B's own marker (2) →
+    //     PanelAgent completes B's gate (no wedge).
+    let releaseTurnB!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseTurnB = resolve;
+    });
+    async function* twoTurns() {
+      yield { text: "turn A" };
+      await gate;
+      yield { text: "turn B" };
+    }
+    const { backend, events, done } = await startBackend(twoTurns());
+    hoisted.queue.push(INIT);
+    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    await backend.interrupt(); // A interrupted mid-flight; no result arrives
+    releaseTurnB();
+    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(2));
+
+    // B's valid stream event WHILE A's result is still missing.
+    hoisted.queue.push(assistantMsg("B working"));
+    // A's LATE result (the interrupt landing)…
+    hoisted.queue.push(RESULT_SUCCESS);
+    // …then B's result-only terminal.
+    hoisted.queue.push(RESULT_SUCCESS);
+    hoisted.queue.end();
+    await done;
+
+    // Session init is never stamped (unmarked = never dead-lettered).
+    expect(events.find((e) => e.type === "session")?.turn).toBeUndefined();
+    // B's stream event is attributed to B, NOT to the still-open abandoned turn.
+    expect(events.find((e) => e.type === "assistant")).toMatchObject({ turn: 2 });
+    // Each terminal is stamped with its OWN turn, in submission order.
+    const results = resultsOf(events);
+    expect(results).toHaveLength(2);
+    expect(results[0]).toMatchObject({ turn: 1 }); // A's late terminal
+    expect(results[1]).toMatchObject({ turn: 2 }); // B's result-only terminal
+  });
+
+  it("stamps a normal two-turn flow 1, 1, 2, 2 (run-relative, matching the panel mirror)", async () => {
+    // Model the panel's turn gate: turn B is submitted only AFTER turn A's
+    // result (production ordering — the gate releases the next batch on the
+    // result), so each turn is the newest in-flight while it produces output.
+    let releaseTurnB!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseTurnB = resolve;
+    });
+    async function* twoTurns() {
+      yield { text: "turn A" };
+      await gate;
+      yield { text: "turn B" };
+    }
+    const { events, done } = await startBackend(twoTurns());
+    hoisted.queue.push(INIT);
+    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    hoisted.queue.push(assistantMsg("reply A"));
+    hoisted.queue.push(RESULT_SUCCESS);
+    releaseTurnB(); // the result opens the panel's gate → B is submitted
+    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(2));
+    hoisted.queue.push(assistantMsg("reply B"));
+    hoisted.queue.push(RESULT_SUCCESS);
+    hoisted.queue.end();
+    await done;
+
+    const stamped = events
+      .filter((e) => e.type === "assistant" || e.type === "result")
+      .map((e) => `${e.type}:${e.turn}`);
+    expect(stamped).toEqual(["assistant:1", "result:1", "assistant:2", "result:2"]);
+  });
+});
