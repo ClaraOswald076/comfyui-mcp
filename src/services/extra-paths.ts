@@ -992,10 +992,19 @@ export async function getLiveExtraModelRoots(
   // we never saw. A caller reasoning from a root's ABSENCE needs THIS, not
   // `authoritative` (codex gate, round 18).
   let exhaustive = true;
+  /** Configs the server was EXPLICITLY launched with. Their absence is meaningful;
+   *  the implicit default's absence is not (most installs have no
+   *  `extra_model_paths.yaml` at all). */
+  const explicitConfigs = new Set<string>();
   // Launched flag files — ABSOLUTE values only (relative → fail closed, see docblock).
   for (const raw of parseExtraModelPathsConfigsFromArgvRaw(argv)) {
-    if (isAbsolute(raw)) configPaths.add(resolve(raw));
-    else exhaustive = false; // a config we cannot locate may register anything
+    if (isAbsolute(raw)) {
+      const abs = resolve(raw);
+      configPaths.add(abs);
+      explicitConfigs.add(abs);
+    } else {
+      exhaustive = false; // a config we cannot locate may register anything
+    }
   }
   // Auto-loaded default in the LIVE install root (its main.py dir). Skip in remote
   // mode: the live root is a path on the remote host.
@@ -1018,7 +1027,15 @@ export async function getLiveExtraModelRoots(
 
   const roots: ExtraModelRoot[] = [];
   for (const cfg of configPaths) {
-    if (!existsSync(cfg)) continue;
+    if (!existsSync(cfg)) {
+      // A config the server was LAUNCHED with but that is no longer on disk (moved or
+      // deleted since startup) still governs the roots the running process holds in
+      // memory — its roots are UNKNOWN to us, not absent (codex gate, round 18). The
+      // implicit `<live root>/extra_model_paths.yaml` is different: most installs
+      // simply do not have one, so its absence is normal and proves nothing either way.
+      if (explicitConfigs.has(cfg)) exhaustive = false;
+      continue;
+    }
     let raw: Record<string, unknown>;
     try {
       // ACCEPTED (intentional, not a defect — maintainer ruling): this reads the config's

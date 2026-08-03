@@ -1283,6 +1283,22 @@ export async function verifyLandedModel(
 export async function resolveModelSubfolderPreferServer(
   targetSubfolder: string,
 ): Promise<string> {
+  return (await resolveModelSubfolderWithLiveRoot(targetSubfolder)).targetDir;
+}
+
+/**
+ * As `resolveModelSubfolderPreferServer`, but also returns the LIVE models root that
+ * THIS resolution used — when it was live-authoritative.
+ *
+ * The writer must bind its destination to the server the destination was computed
+ * for. Taking a separate observation afterwards leaves a window in which the server
+ * is replaced BETWEEN the resolution and the capture, so both later observations
+ * agree with each other while the target still points into the previous install
+ * (codex gate, round 18). Returning it from the same call closes that window.
+ */
+export async function resolveModelSubfolderWithLiveRoot(
+  targetSubfolder: string,
+): Promise<{ targetDir: string; liveRootAtResolve?: string }> {
   const raw = (targetSubfolder ?? "").trim();
   if (!raw) {
     throw new ModelError("target_subfolder is required (e.g. 'loras', 'checkpoints').");
@@ -1316,7 +1332,10 @@ export async function resolveModelSubfolderPreferServer(
   // so it can never diverge from a caller's separate pre-validation (e.g.
   // apply_manifest resolving the root a second time; #490 codex review).
   await assertNoEscapingSymlinkAncestor(modelsRoot, targetDir, raw, baseDirs, snapshot);
-  return targetDir;
+  return {
+    targetDir,
+    liveRootAtResolve: isLiveAuthoritativeModelsDir(source) ? modelsRoot : undefined,
+  };
 }
 
 /**
@@ -1541,6 +1560,10 @@ export interface ResolvedDownloadTarget {
   filename: string;
   /** Absolute final path the file is written to: join(targetDir, filename). */
   targetPath: string;
+  /** The LIVE models root THIS resolution used, when live-authoritative. The writer
+   *  binds to it so the bytes cannot start in a tree the server stopped reading
+   *  between the resolution and the write (codex gate, round 18). */
+  liveRootAtResolve?: string;
 }
 
 /**
@@ -1563,7 +1586,8 @@ export async function resolveDownloadTarget(
   targetSubfolder: string,
   filename?: string,
 ): Promise<ResolvedDownloadTarget> {
-  const targetDir = await resolveModelSubfolderPreferServer(targetSubfolder);
+  const { targetDir, liveRootAtResolve } =
+    await resolveModelSubfolderWithLiveRoot(targetSubfolder);
   const rawFilename =
     filename ?? (basename(new URL(url).pathname) || "model.safetensors");
   const resolvedFilename = basename(rawFilename);
@@ -1585,7 +1609,7 @@ export async function resolveDownloadTarget(
       { filename: rawFilename },
     );
   }
-  return { targetDir, filename: resolvedFilename, targetPath };
+  return { targetDir, filename: resolvedFilename, targetPath, liveRootAtResolve };
 }
 
 /**
@@ -2087,17 +2111,17 @@ export async function downloadModel(
     targetDir,
     targetPath,
     filename: resolvedFilename,
+    // BIND the destination to the server it was resolved for. Re-resolving is right,
+    // but the answer must not go stale between resolving it and writing: a ComfyUI
+    // replaced during the mkdir would otherwise take the bytes into the root the
+    // PREVIOUS server read. This root comes from the SAME resolution that produced
+    // targetPath — capturing it separately afterwards would leave a window in which
+    // the swap happens BEFORE the capture, so both later observations agree while the
+    // target still points into the old install (codex gate, round 18). Both roots
+    // must be live-authoritative to compare; when either is unknown there is nothing
+    // to bind, and the (already never-confirmed) non-authoritative path applies.
+    liveRootAtResolve: rootAtResolve,
   } = await resolveDownloadTarget(url, targetSubfolder, filename);
-
-  // BIND the destination to the server it was resolved for. Re-resolving is right,
-  // but the answer must not go stale between resolving it and writing: a ComfyUI
-  // replaced during the mkdir would otherwise take the bytes into the root the
-  // PREVIOUS server read (codex gate, round 18). A mid-stream swap cannot be
-  // prevented — but writing into a root we can no longer vouch for can be. Both
-  // observations must be live-authoritative to compare; when either is unknown
-  // there is nothing to bind and the (already never-confirmed) non-authoritative
-  // path applies.
-  const rootAtResolve = await currentLiveModelsRoot();
 
   // Ensure target directory exists
   await mkdir(targetDir, { recursive: true });

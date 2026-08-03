@@ -147,10 +147,11 @@ afterEach(() => {
 
 describe("downloadModel — the destination is BOUND to the server it was resolved for (#369)", () => {
   it("REFUSES to start when the live server changes between resolving and writing", async () => {
-    // Calls: (1) resolveDownloadTarget, (2) the root captured at resolve, (3) the
-    // root re-checked immediately before the first byte. A ComfyUI replaced during
-    // the mkdir must not take the bytes into the PREVIOUS server's tree.
-    liveRoots.queue = ["/comfy/models", "/comfy/models", "/other/models"];
+    // Calls: (1) resolveDownloadTarget — which now ALSO yields the root it bound to,
+    // so there is no separate capture to race — and (2) the root re-checked
+    // immediately before the first byte. A ComfyUI replaced during the mkdir must not
+    // take the bytes into the PREVIOUS server's tree.
+    liveRoots.queue = ["/comfy/models", "/other/models"];
 
     await expect(
       downloadModel("https://example.com/x.safetensors", "checkpoints", "x.safetensors"),
@@ -160,7 +161,7 @@ describe("downloadModel — the destination is BOUND to the server it was resolv
   });
 
   it("proceeds when the live server is the same one throughout", async () => {
-    liveRoots.queue = ["/comfy/models", "/comfy/models", "/comfy/models"];
+    liveRoots.queue = ["/comfy/models", "/comfy/models"];
     // Reaches the transfer (which this suite's fetch mock then governs) rather than
     // refusing — a stable server must never be mistaken for a swap.
     await downloadModel(
