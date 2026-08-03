@@ -57,6 +57,7 @@ import { compareSemver } from "./self-update.js";
 import { SEMVER_RE } from "./ui-bridge.js";
 import {
   clearPanelDiskObservation,
+  isLiveDerivedBase,
   lastPanelBaseResolution,
   panelBaseSync,
   primePanelBase,
@@ -1393,7 +1394,24 @@ export async function panelStatus(
   } else if (detection.isDevSymlink) {
     note = "dev install (symlink) — managed manually; install/update/reinstall are refused.";
   } else if (!detection.installed) {
-    note = `Not installed. Run install_panel(action='install') to add the panel (${PANEL_VERSION}). Restart ComfyUI afterwards.`;
+    // "Not installed" is a claim about a PARTICULAR tree, and it is only as
+    // good as our reason for believing that is the tree ComfyUI reads. When the
+    // base is merely the configured path — the running server never named it —
+    // this is exactly the #766 report: a perfectly good panel sitting in the
+    // tree the server actually serves, reported as missing, with an invitation
+    // to install a second copy where nothing would load it. Say which tree was
+    // scanned and that it is uncorroborated, rather than asserting absence.
+    const uncorroborated =
+      isRealDeps(deps) && !isLiveDerivedBase(baseResolution);
+    note = uncorroborated
+      ? `No panel found in ${comfyuiPath ?? "custom_nodes"} — but this is the ` +
+        `CONFIGURED path, and the running ComfyUI did not confirm it is the tree it ` +
+        `serves from, so "not installed" is UNCORROBORATED. On a split install ` +
+        `(Comfy Desktop's --base-directory, #766) the panel lives elsewhere and ` +
+        `installing here would land in a custom_nodes nothing loads. Start/reach ` +
+        `ComfyUI so its own install root can be read, or check get_environment's ` +
+        `local.workspace_path, before installing.`
+      : `Not installed. Run install_panel(action='install') to add the panel (${PANEL_VERSION}). Restart ComfyUI afterwards.`;
   } else {
     note = `Installed${
       detection.version ? ` (${detection.version})` : ""
@@ -2169,9 +2187,11 @@ function swapTreeIsCorroborated(deps: PanelInstallerDeps): boolean {
   // An injected dep set declared its own base explicitly; there is no live
   // server to corroborate it against and none is implied.
   if (!isRealDeps(deps)) return true;
-  const resolution = lastPanelBaseResolution();
-  if (!resolution) return false;
-  return resolution.liveProbeFailed !== true;
+  // REACHABLE IS NOT ENOUGH. A /system_stats response with absent or
+  // unparseable argv proves only that something answered on the URL; it does
+  // not prove COMFYUI_PATH is the tree that server reads. Require a root the
+  // running server actually named.
+  return isLiveDerivedBase(lastPanelBaseResolution());
 }
 
 async function updateViaRegistryZipReinstall(opts: {

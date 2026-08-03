@@ -85,6 +85,27 @@ export interface PanelBaseResolution {
   liveProbeFailed?: boolean;
 }
 
+/**
+ * Did the RUNNING SERVER actually choose this root?
+ *
+ * "Reachable" is not the same thing and must never stand in for it. A
+ * `/system_stats` response with absent or unparseable argv proves only that
+ * something answered — it says nothing about whether COMFYUI_PATH is the tree
+ * that server reads. On a Comfy Desktop split install those differ, so a
+ * configured base is a plausible READ but never authority for a destructive
+ * write, nor for certifying which panel the browser is loading.
+ *
+ * Only the two live-derived sources qualify.
+ */
+export function isLiveDerivedBase(
+  resolution: PanelBaseResolution | undefined,
+): boolean {
+  return (
+    resolution?.source === "live-base-directory" ||
+    resolution?.source === "live-argv-root"
+  );
+}
+
 /** Does this candidate root actually hold a custom_nodes directory? */
 function hasCustomNodes(base: string): boolean {
   try {
@@ -237,12 +258,20 @@ export function __resetPanelBaseCache(): void {
   diskObservation = undefined;
 }
 
-/** Test hook — seed a resolved base without probing a live server. */
-export function __setPanelBaseForTests(base: string | undefined): void {
+/**
+ * Test hook — seed a resolved base without probing a live server. Defaults to a
+ * LIVE-DERIVED source, because that is what an ordinary serving install
+ * produces and it is what the corroboration gates require; pass
+ * `source: "configured"` to exercise the uncorroborated branches.
+ */
+export function __setPanelBaseForTests(
+  base: string | undefined,
+  source: PanelBaseSource = "live-argv-root",
+): void {
   cached = {
     at: Date.now(),
     target: targetKey(),
-    resolution: base ? { base, source: "configured" } : { source: "none" },
+    resolution: base ? { base, source } : { source: "none" },
   };
 }
 
@@ -375,6 +404,11 @@ export function verifiedPanelDiskVersion(): string | undefined {
   if (!resolution?.base || !observed.base || resolution.base !== observed.base) {
     return undefined;
   }
+  // And the RUNNING SERVER must have chosen that tree. A configured fallback
+  // only proves something answered on the URL, not that COMFYUI_PATH is what it
+  // serves — and on a split install it is not. Certifying "your install is
+  // fine, hard-refresh" off a dormant copy is the exact wrong direction.
+  if (!isLiveDerivedBase(resolution)) return undefined;
   // And the pack must live UNDER that base — never a path left over from a tree
   // we are no longer looking at.
   if (!observed.dir.startsWith(resolution.base)) return undefined;

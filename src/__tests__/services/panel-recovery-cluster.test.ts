@@ -411,6 +411,21 @@ describe("disk-current but handshake-old is diagnosed as a stale tab, not a stal
     __setPanelBaseForTests(undefined);
     expect(verifiedPanelDiskVersion()).toBeUndefined();
   });
+
+  it("a merely CONFIGURED base yields no claim — reachable is not live-derived", () => {
+    // A /system_stats response with unusable argv proves something answered on
+    // the URL, not that COMFYUI_PATH is the tree it serves. On a split install
+    // it is not, and certifying "your install is fine" off a dormant copy is
+    // the wrong failure direction.
+    writePanelPack(PANEL_DIR(), "0.11.38");
+    __setPanelBaseForTests(root, "configured");
+    recordPanelDiskObservation("0.11.38", PANEL_DIR(), root);
+    expect(verifiedPanelDiskVersion()).toBeUndefined();
+    // The same reading through a live-derived base IS accepted.
+    __setPanelBaseForTests(root, "live-argv-root");
+    recordPanelDiskObservation("0.11.38", PANEL_DIR(), root);
+    expect(verifiedPanelDiskVersion()).toBe("0.11.38");
+  });
 });
 
 // ---------------------------------------------------------------------------
