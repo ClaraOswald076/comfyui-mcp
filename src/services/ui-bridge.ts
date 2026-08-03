@@ -18,7 +18,11 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import { logger } from "../utils/logger.js";
-import { describePanelUpdateRecovery } from "./panel-recovery.js";
+import {
+  describePanelUpdateRecovery,
+  type PanelBundleSkew,
+} from "./panel-recovery.js";
+import { lastPanelDiskObservation } from "./panel-workspace.js";
 import { compareSemver, detectInstallMode } from "./self-update.js";
 
 export const DEFAULT_BRIDGE_PORT = 9101;
@@ -292,6 +296,51 @@ export function requiredPanelVersion(): string {
     if (!SEMVER_RE.test(best.trim()) || compareSemver(min, best) > 0) best = min;
   }
   return best;
+}
+
+/**
+ * Is the INSTALL even the problem?
+ *
+ * A stale browser bundle and a stale install produce the SAME refusal — the tab
+ * advertises an old capability set either way — but they have opposite remedies,
+ * and telling a user to update an install that is already current is what makes
+ * the loop feel unfixable. Distinguishing them needs two facts observed at the
+ * same moment, and both already exist: the tab's advertised version arrives in
+ * its `hello`, and the orchestrator runs the panel sync on that SAME hello,
+ * which reads the installed version off disk (panelStatus records it).
+ *
+ * Returns a skew ONLY on positive proof, because the cost of a wrong answer is
+ * asymmetric: claiming "your install is fine, just refresh" to someone whose
+ * install is genuinely behind sends them straight back round the loop. So all of
+ * these must hold, and any unknown resolves to "no skew" (fall through to the
+ * ordinary update guidance):
+ *
+ *   - a RECENT on-disk observation exists (the sync ran; it is not a guess);
+ *   - its version PARSES and is >= the required floor — the install is provably
+ *     not the problem;
+ *   - the tab advertised NO version, or one that parses and is BELOW the floor.
+ *     A tab claiming the same current version yet missing the capability is some
+ *     other fault, not this one, and must not be given this diagnosis.
+ */
+function resolveStaleBundleSkew(panelVersion?: string): PanelBundleSkew | undefined {
+  const observed = lastPanelDiskObservation();
+  if (!observed) return undefined;
+  const required = requiredPanelVersion();
+  const disk = observed.version.trim();
+  if (!SEMVER_RE.test(disk) || !SEMVER_RE.test(required.trim())) return undefined;
+  if (compareSemver(disk, required) < 0) return undefined; // install really IS behind
+
+  const advertised = panelVersion?.trim();
+  if (advertised) {
+    // A version we cannot parse is not proof of an old tab.
+    if (!SEMVER_RE.test(advertised)) return undefined;
+    if (compareSemver(advertised, required) >= 0) return undefined;
+  }
+  return {
+    diskVersion: observed.version,
+    handshakeVersion: advertised || undefined,
+    requiredVersion: required,
+  };
 }
 
 /** True when the panel ADVERTISED a PARSEABLE version (in its `hello`) that already
@@ -2099,7 +2148,16 @@ export class UiBridge {
         // install_panel is a no-op, and on the embedded `panel_*` surface it is
         // not even present. describePanelUpdateRecovery names it only where it
         // works, and hands over concrete host-side commands everywhere else.
-        const recovery = describePanelUpdateRecovery();
+        //
+        // And FIRST it asks a different question: is the INSTALL even the
+        // problem? `resolveStaleBundleSkew` answers that from the version the
+        // panel sync read OFF DISK at this tab's own hello. When the pack on
+        // disk already clears the floor, no update of any kind helps and the
+        // remedy is a cache-bypassing reload of this tab.
+        const recovery = describePanelUpdateRecovery(
+          undefined,
+          resolveStaleBundleSkew(conn.panelVersion),
+        );
         const why = !conn.enforcesWorkflowStamp
           ? `panel tab ${conn.tabId} does not enforce per-command workflow targeting ` +
             `(detected panel ${conn.panelVersion ?? "version unknown"}; this MCP requires panel ` +

@@ -65,6 +65,30 @@ function isComparableVersion(v: string | undefined): v is string {
 }
 
 /**
+ * The one thing an `up-to-date` verdict was missing.
+ *
+ * "Nothing to do" is true and, to a user whose graph writes are being refused
+ * for a too-old panel, completely useless — it is the last step of the loop that
+ * made #771/#784 feel unfixable. The reason both can be true at once is that the
+ * write gate reads what the browser TAB advertised, and the panel's module URLs
+ * carry no cache-busting key: a tab holding the pre-0.11.35 copy of the file
+ * that builds the `hello` announces the old capability set while the pack on
+ * disk is current. So the honest completion of "nothing to do" is "…and if
+ * writes are still refused, the tab is the stale part".
+ *
+ * Phrased conditionally on purpose: this function cannot see the tab's
+ * handshake, so it must not assert that a skew IS happening. The bridge refusal
+ * (which sees both) makes the definite call. (Cache-busting itself is
+ * #584 / panel #596 and is not addressed here.)
+ */
+const STALE_BUNDLE_HINT =
+  ` If graph WRITES are still being refused for a too-old panel, the install is not ` +
+  `the problem — the open ComfyUI browser tab is running a CACHED older copy of the ` +
+  `panel's JavaScript, and the capability check reads what the tab announced. ` +
+  `Hard-refresh that tab with a cache-bypassing reload (Ctrl+Shift+R, or Cmd+Shift+R ` +
+  `on macOS); updating or reinstalling the pack will keep reporting nothing to do.`;
+
+/**
  * What a just-written persisted pin actually achieved. Writing the settings file
  * is not the same as being pinned: `COMFYUI_MCP_PANEL_PIN` takes precedence, so
  * the saved pin can be inert. Reporting the write as protection without checking
@@ -368,7 +392,7 @@ export function evaluatePanelSync(
       behind: false,
       summary:
         `Panel ${status.installedVersion} already meets what ${orch} needs ` +
-        `(${required}+). Nothing to do.`,
+        `(${required}+). Nothing to do.${STALE_BUNDLE_HINT}`,
     };
   }
 

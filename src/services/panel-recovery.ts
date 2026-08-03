@@ -135,6 +135,32 @@ export function manualPanelUpdateCommands(comfyuiPath?: string): string {
   );
 }
 
+/**
+ * The case where the INSTALL is fine and the BROWSER TAB is not.
+ *
+ * The panel's module URLs carry no version or cache-busting key, and the
+ * capability the write gate checks is advertised from exactly one served file
+ * (js/lib/session-rebind.js), which is also where the `hello` payload is built.
+ * A tab holding that file from before 0.11.35 therefore announces the OLD
+ * capability set — and an old or missing version — while the pack on disk is
+ * current. Verified on a live rig: an up-to-date panel does advertise both
+ * capabilities, and resource timing shows no versioned module URLs at all.
+ *
+ * Told to "run install_panel(action:'update')", such a user gets "nothing to
+ * update" — true, and completely useless, because nothing is wrong with their
+ * install. The fix is a cache-bypassing reload of the tab, and saying so is the
+ * whole remedy. (The cache-busting itself is #584 / panel #596 and is not
+ * addressed here; this only makes the diagnosis and the guidance correct.)
+ */
+export interface PanelBundleSkew {
+  /** Version READ FROM DISK, already proven to satisfy the requirement. */
+  diskVersion: string;
+  /** What the tab advertised in its hello; undefined when it carried none. */
+  handshakeVersion?: string;
+  /** The floor this orchestrator requires, for the message. */
+  requiredVersion: string;
+}
+
 /** The trailing "and then" every variant shares. */
 const RESTART_AND_REFRESH =
   `restart ComfyUI, then hard-refresh the ComfyUI browser tab (Ctrl+Shift+R) so it ` +
@@ -148,7 +174,28 @@ const RESTART_AND_REFRESH =
  */
 export function describePanelUpdateRecovery(
   ctx: PanelRecoveryContext = panelRecoveryContext(),
+  skew?: PanelBundleSkew,
 ): string {
+  // STALE BUNDLE FIRST. When the caller has PROVEN the pack on disk already
+  // satisfies the requirement, no update of any kind is the answer — not
+  // install_panel, not a host-side git pull. Sending this user to either is
+  // what makes the loop feel unfixable, so this branch outranks both.
+  if (skew) {
+    return (
+      `Do NOT update the panel — the pack ON DISK is already ${skew.diskVersion}, which ` +
+      `meets the ${skew.requiredVersion}+ this MCP requires. This BROWSER TAB is running ` +
+      `an older cached copy of the panel's JavaScript ` +
+      `(it advertised ${skew.handshakeVersion ? `${skew.handshakeVersion}` : "no version"}), ` +
+      `and the capability check reads what the TAB announced. The panel's module URLs ` +
+      `carry no cache-busting key, so an ordinary reload can serve the stale file again: ` +
+      `HARD-REFRESH this ComfyUI tab with a cache-bypassing reload (Ctrl+Shift+R, or ` +
+      `Cmd+Shift+R on macOS; if that does not take, open DevTools and use ` +
+      `right-click reload → "Empty Cache and Hard Reload"). Running ` +
+      `install_panel(action:'update') here will correctly report nothing to do — the ` +
+      `install is not the problem.`
+    );
+  }
+
   if (ctx.installPanelUsable) {
     return (
       `Run install_panel(action:'update') — or, if install_panel is not in this ` +

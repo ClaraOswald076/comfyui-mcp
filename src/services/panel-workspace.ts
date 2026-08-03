@@ -196,4 +196,65 @@ export function lastPanelBaseResolution(): PanelBaseResolution | undefined {
 /** Test hook — drop the cache so the next prime re-resolves. */
 export function __resetPanelBaseCache(): void {
   cached = undefined;
+  diskObservation = undefined;
+}
+
+// ---------------------------------------------------------------------------
+// What is actually ON DISK — so a stale BROWSER BUNDLE can be told apart from a
+// stale INSTALL.
+//
+// The panel's module URLs carry no version or cache-busting key, and the
+// capability advertisement lives in exactly one served file (js/lib/
+// session-rebind.js) which also builds the `hello` payload. So a browser tab
+// holding that file from before 0.11.35 sends an OLD capability set — and an
+// old or absent version — while the pack ON DISK is perfectly current. The
+// write gate then correctly refuses, the user runs install_panel(action:
+// 'update'), and it correctly finds nothing to do, because nothing is wrong
+// with the install. That is the loop that feels unfixable.
+//
+// The two facts needed to name it are already in hand and already collected at
+// the same moment: the orchestrator runs the panel sync on EVERY hello, which
+// reads the installed version off disk, while the same hello carries the tab's
+// advertised version. All that was missing was somewhere to put the first one
+// so the refusal builder can see it. This is that place.
+//
+// It is deliberately an OBSERVATION, not a claim: it records only what a real
+// on-disk read returned and when. A caller that finds it absent or stale must
+// fall back to the ordinary guidance rather than guess — telling a user their
+// install is fine when it is not would send them round the loop again.
+// ---------------------------------------------------------------------------
+
+export interface PanelDiskObservation {
+  /** Version read from the pack's pyproject.toml. */
+  version: string;
+  /** Where it was read from. */
+  dir?: string;
+  /** When (epoch ms). */
+  at: number;
+}
+
+/**
+ * How long an observation stays usable. Generous on purpose: the sync runs on
+ * every panel hello, so while a tab is connected this is at most one-hello old,
+ * and a refusal can only happen while a tab IS connected.
+ */
+const DISK_OBSERVATION_TTL_MS = 30 * 60_000;
+
+let diskObservation: PanelDiskObservation | undefined;
+
+/** Record a version READ FROM DISK. Called by panelStatus, never guessed. */
+export function recordPanelDiskObservation(version: string, dir?: string): void {
+  diskObservation = { version, dir, at: Date.now() };
+}
+
+/** Forget the on-disk observation — the pack is not there (or was removed). */
+export function clearPanelDiskObservation(): void {
+  diskObservation = undefined;
+}
+
+/** The last on-disk read, if one is recent enough to be worth acting on. */
+export function lastPanelDiskObservation(): PanelDiskObservation | undefined {
+  if (!diskObservation) return undefined;
+  if (Date.now() - diskObservation.at > DISK_OBSERVATION_TTL_MS) return undefined;
+  return diskObservation;
 }

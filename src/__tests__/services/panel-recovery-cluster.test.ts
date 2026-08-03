@@ -85,7 +85,9 @@ import {
 } from "../../services/panel-recovery.js";
 import {
   __resetPanelBaseCache,
+  lastPanelDiskObservation,
   primePanelBase,
+  recordPanelDiskObservation,
   resolvePanelBase,
 } from "../../services/panel-workspace.js";
 
@@ -284,6 +286,73 @@ describe("recovery guidance depends on the session, not on a hardcoded string", 
     expect(text).not.toMatch(/Use install_panel instead/);
     expect(text).toMatch(/cannot help here either/);
     expect(text).toContain(PANEL_REPO_URL);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 1b. A stale BROWSER BUNDLE is not a stale INSTALL
+//
+// Verified on a live rig: an up-to-date panel DOES advertise both capabilities,
+// the capability lives in js/lib/session-rebind.js (which also builds `hello`),
+// and the panel's module URLs carry no cache-busting key. So a tab holding that
+// one file from before 0.11.35 announces the old capability set while the pack
+// on disk is current — same refusal, opposite remedy.
+// ---------------------------------------------------------------------------
+
+describe("disk-current but handshake-old is diagnosed as a stale tab, not a stale install", () => {
+  const SKEW = { diskVersion: "0.11.38", requiredVersion: "0.11.35" };
+
+  it("tells the user to hard-refresh, and NOT to update anything", () => {
+    const text = describePanelUpdateRecovery(undefined, {
+      ...SKEW,
+      handshakeVersion: "0.11.34",
+    });
+    expect(text).toMatch(/Do NOT update the panel/);
+    expect(text).toMatch(/HARD-REFRESH/);
+    expect(text).toMatch(/Ctrl\+Shift\+R/);
+    expect(text).toMatch(/0\.11\.38/); // what is really on disk
+    expect(text).toMatch(/0\.11\.34/); // what the tab announced
+    // Crucially it does not send them round the loop again.
+    expect(text).not.toMatch(/Run install_panel\(action:'update'\)/);
+    expect(text).not.toContain(PANEL_REPO_URL);
+  });
+
+  it("handles the 'version unknown' handshake from #784", () => {
+    const text = describePanelUpdateRecovery(undefined, SKEW);
+    expect(text).toMatch(/advertised no version/);
+    expect(text).toMatch(/HARD-REFRESH/);
+  });
+
+  it("the skew branch outranks remote mode — no update helps either way", () => {
+    mode.local = false;
+    mode.remote = true;
+    __resetPanelBaseCache();
+    const text = describePanelUpdateRecovery(undefined, SKEW);
+    expect(text).toMatch(/Do NOT update the panel/);
+    expect(text).not.toMatch(/ON THE COMFYUI HOST/);
+  });
+
+  it("without a skew, the ordinary update guidance is unchanged", async () => {
+    await primePanelBase();
+    const text = describePanelUpdateRecovery(undefined, undefined);
+    expect(text).toMatch(/install_panel\(action:'update'\)/);
+    expect(text).not.toMatch(/Do NOT update the panel/);
+  });
+
+  it("panelStatus records the on-disk version so the bridge can see it", async () => {
+    writePanelPack(PANEL_DIR(), "0.11.38");
+    const { panelStatus } = await import("../../services/panel-installer.js");
+    await panelStatus();
+    const observed = lastPanelDiskObservation();
+    expect(observed?.version).toBe("0.11.38");
+    expect(observed?.dir).toBe(PANEL_DIR());
+  });
+
+  it("an ABSENT pack clears the observation — never a stale 'your install is fine'", async () => {
+    recordPanelDiskObservation("0.11.38", PANEL_DIR());
+    const { panelStatus } = await import("../../services/panel-installer.js");
+    await panelStatus(); // custom_nodes is empty in this fixture
+    expect(lastPanelDiskObservation()).toBeUndefined();
   });
 });
 

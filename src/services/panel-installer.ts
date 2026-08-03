@@ -55,9 +55,11 @@ import { describePanelUpdateRecovery, PANEL_REPO_URL } from "./panel-recovery.js
 import { compareSemver } from "./self-update.js";
 import { SEMVER_RE } from "./ui-bridge.js";
 import {
+  clearPanelDiskObservation,
   lastPanelBaseResolution,
   panelBaseSync,
   primePanelBase,
+  recordPanelDiskObservation,
   type PanelBaseSource,
 } from "./panel-workspace.js";
 
@@ -1358,6 +1360,20 @@ export async function panelStatus(
     note = `Installed${
       detection.version ? ` (${detection.version})` : ""
     }. Run install_panel(action='update') to pull the latest ${PANEL_VERSION}. Restart ComfyUI after updating.`;
+  }
+
+  // Record what we just READ OFF DISK, so the bridge's write-gate refusal can
+  // tell a stale browser BUNDLE from a stale INSTALL. The orchestrator runs the
+  // panel sync (and therefore this) on every panel hello, so the observation and
+  // the tab's advertised version describe the same moment. Only a real read is
+  // recorded; an absent or unreadable pack CLEARS it rather than leaving a stale
+  // "your install is fine" behind.
+  if (deps === defaultDeps) {
+    if (detection.applicable && detection.installed && detection.version) {
+      recordPanelDiskObservation(detection.version, detection.dir);
+    } else {
+      clearPanelDiskObservation();
+    }
   }
 
   const pin = readPinSafe(deps);
