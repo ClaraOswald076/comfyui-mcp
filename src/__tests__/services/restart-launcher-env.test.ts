@@ -727,13 +727,13 @@ describe("restart_comfyui — a PID is not a process identity (#776)", () => {
     killSpy.mockRestore();
   });
 
-  it("does NOT bind to a PID whose command line does not match the argv ComfyUI reported", async () => {
+  it("REFUSES outright when the OS says the port owner is running something other than the server that answered", async () => {
     // The gap a creation-time stamp alone cannot close: if the pid was recycled
     // BEFORE we ever read its stamp, every later re-read agrees with itself about
     // the WRONG process. The independent signal is the server's own /system_stats
-    // argv — an unrelated program on that number cannot match it. Same proof as
-    // above: this Pinokio install is only restartable via a live environment, so
-    // rejecting the binding must drop it back to the refusal.
+    // argv — an unrelated program on that number cannot match it. That is POSITIVE
+    // counter-evidence, so it must refuse on its own rather than merely decline to
+    // bind (which would leave a later transport hiccup free to wave it through).
     usePinokioInstall();
     __processControlTestHooks.setLiveEnvResolver(() => ({ NOT_COMFYUI: "1" }));
     __processControlTestHooks.setProcessIdentityResolver(() => ({
@@ -747,9 +747,90 @@ describe("restart_comfyui — a PID is not a process identity (#776)", () => {
     const result = await restartComfyUI();
 
     expect(result.stopped).toBe(false);
-    expect(result.message).toMatch(/refusing to restart/i);
-    expect(result.message).toMatch(/Pinokio/);
+    expect(result.started).toBe(false);
+    expect(result.message).toMatch(/not running the ComfyUI that answered/i);
+    expect(result.message).toMatch(/some-unrelated-daemon/);
     expect(mockSpawn).not.toHaveBeenCalled();
+    expect(killSpy).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  });
+
+  it("REFUSES on that mismatch EVEN IF the HTTP re-check then fails transiently", async () => {
+    // The combination that used to slip through: the command-line mismatch was
+    // downgraded to "no identity", the re-fetch errored so it proved nothing, and
+    // the pre-kill check then only re-verified the numeric PID's port ownership —
+    // killing the replacement using the previous server's argv and env plan.
+    usePinokioInstall();
+    let answers = 0;
+    mockGetSystemStats.mockImplementation(async () => {
+      answers++;
+      if (answers > 1) throw new Error("ECONNRESET");
+      return { system: { argv: [PINOKIO_MAIN, "--port", "8188"] } };
+    });
+    __processControlTestHooks.setProcessIdentityResolver(() => ({
+      startedAt: "t9",
+      commandLine: "/usr/bin/some-unrelated-daemon --serve",
+    }));
+    mockLivePortThenFree();
+    spawnCapturingChildren();
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(false);
+    expect(result.message).toMatch(/not running the ComfyUI that answered/i);
+    expect(killSpy).not.toHaveBeenCalled();
+    expect(
+      mockExecSync.mock.calls.some(([cmd]) => /taskkill/i.test(String(cmd))),
+    ).toBe(false);
+    expect(mockSpawn).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  });
+
+  it("re-checks identity for a DESKTOP answer too, so a substituted instance is never rebooted in its place", async () => {
+    // `isDesktopApp` is derived from the FIRST, possibly stale argv. Skipping the
+    // recheck there is how a Desktop answer from A gets a ComfyUI-Manager reboot
+    // fired at a non-Desktop B that took the port in the meantime.
+    const DESKTOP_MAIN = join(
+      resolve("AppData", "Local", "Programs", "@comfyorgcomfyui-electron"),
+      "resources",
+      "ComfyUI",
+      "main.py",
+    );
+    let answers = 0;
+    mockFindComfyuiPython.mockReturnValue(PLAIN_PY);
+    mockLiveRootFromArgv.mockReturnValue(PLAIN_BASE);
+    mockGetSystemStats.mockImplementation(async () => {
+      answers++;
+      // A = the Desktop app; B = an ordinary install that grabbed the port.
+      return {
+        system: {
+          argv:
+            answers <= 1
+              ? [DESKTOP_MAIN, "--port", "8188"]
+              : [PLAIN_MAIN, "--port", "8188"],
+        },
+      };
+    });
+    mockExistsSync.mockImplementation((p: string) => {
+      const s = String(p);
+      return s === PLAIN_MAIN || s === PLAIN_PY;
+    });
+    mockLivePortThenFree();
+    spawnCapturingChildren();
+    const rebootFetch = vi.fn(async () => ({ ok: true }) as Response);
+    vi.stubGlobal("fetch", rebootFetch);
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(false);
+    expect(result.started).toBe(false);
+    expect(result.message).toMatch(/changed while it was being identified/i);
+    // No Manager reboot was fired at the substituted instance, and nothing killed.
+    expect(rebootFetch).not.toHaveBeenCalled();
     expect(killSpy).not.toHaveBeenCalled();
 
     killSpy.mockRestore();

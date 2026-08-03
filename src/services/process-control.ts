@@ -915,21 +915,34 @@ function resolveProcessIdentity(pid: number): ProcessIdentity | undefined {
  * identity at all, and the caller falls back to evidence that refuses rather than
  * guesses.
  */
+type IdentityCorroboration =
+  /** The OS's view of the pid matches the server's own — safe to bind. */
+  | { kind: "confirmed"; identity: ProcessIdentity }
+  /**
+   * POSITIVE counter-evidence: the OS says that pid is running something OTHER
+   * than the ComfyUI that answered us. Never collapsed into "unknown" — that would
+   * let a later transport hiccup wave the substitution through (codex gate).
+   */
+  | { kind: "mismatch"; commandLine: string }
+  /** No readable evidence either way. Absence of proof, not proof of absence. */
+  | { kind: "unknown" };
+
 function resolveCorroboratedIdentity(
   pid: number,
   argv: string[],
-): ProcessIdentity | undefined {
-  if (argv.length === 0) return undefined;
+): IdentityCorroboration {
+  if (argv.length === 0) return { kind: "unknown" };
   const identity = resolveProcessIdentity(pid);
-  if (!identity?.startedAt) return undefined;
-  if (!commandLineMatchesArgv(identity.commandLine, argv)) {
+  if (!identity) return { kind: "unknown" };
+  if (identity.commandLine && !commandLineMatchesArgv(identity.commandLine, argv)) {
     logger.warn(
-      "Not binding to PID: the OS's command line for it does not match the argv ComfyUI reported",
-      { pid, commandLine: identity.commandLine ?? "(unavailable)" },
+      "PID mismatch: the OS's command line for the port owner does not match the argv ComfyUI reported",
+      { pid, commandLine: identity.commandLine },
     );
-    return undefined;
+    return { kind: "mismatch", commandLine: identity.commandLine };
   }
-  return identity;
+  if (!identity.startedAt) return { kind: "unknown" };
+  return { kind: "confirmed", identity };
 }
 
 /**
@@ -953,7 +966,8 @@ function captureVerifiedLiveEnv(
   if (!env) return undefined;
   // Re-verify with the SAME corroboration used to bind in the first place, so a
   // recycled pid cannot satisfy the re-check just by agreeing with itself.
-  const after = resolveCorroboratedIdentity(pid, argv)?.startedAt;
+  const recheck = resolveCorroboratedIdentity(pid, argv);
+  const after = recheck.kind === "confirmed" ? recheck.identity.startedAt : undefined;
   if (!after || after !== startedAt) {
     logger.warn(
       "Discarding the captured ComfyUI environment: the pid's identity changed while reading it",
@@ -998,27 +1012,27 @@ function processIdentityStillValid(
       };
     }
   }
-  if (info.startedAt) {
-    // Same corroboration as the binding: a changed creation time OR a command line
-    // that no longer matches the server's argv both mean this number is not the
-    // process we identified.
-    const now = resolveProcessIdentity(info.pid);
-    if (now?.startedAt && now.startedAt !== info.startedAt) {
-      return {
-        ok: false,
-        reason:
-          `PID ${info.pid} is no longer the ComfyUI process we identified (its creation time ` +
-          "changed), so the number has been reused by a different program and must not be killed",
-      };
-    }
-    if (now?.commandLine && !commandLineMatchesArgv(now.commandLine, info.argv)) {
-      return {
-        ok: false,
-        reason:
-          `PID ${info.pid} is running something other than the ComfyUI we identified ` +
-          `(its command line no longer matches that server's arguments), so it must not be killed`,
-      };
-    }
+  // Same corroboration as the binding. NOTE both checks are independent of whether
+  // a creation stamp was ever obtained: a command line that does not match the
+  // server's argv is POSITIVE evidence this pid is somebody else, and gating it
+  // behind `startedAt` would discard that evidence exactly when we have least of
+  // it (codex gate).
+  const now = resolveProcessIdentity(info.pid);
+  if (now?.commandLine && !commandLineMatchesArgv(now.commandLine, info.argv)) {
+    return {
+      ok: false,
+      reason:
+        `PID ${info.pid} is running something other than the ComfyUI we identified ` +
+        `(its command line does not match that server's arguments), so it must not be killed`,
+    };
+  }
+  if (info.startedAt && now?.startedAt && now.startedAt !== info.startedAt) {
+    return {
+      ok: false,
+      reason:
+        `PID ${info.pid} is no longer the ComfyUI process we identified (its creation time ` +
+        "changed), so the number has been reused by a different program and must not be killed",
+    };
   }
   return { ok: true };
 }
@@ -1532,9 +1546,27 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
   // The pid's IDENTITY (creation time), CORROBORATED against the argv the server
   // itself reported — so a pid recycled between the port lookup and this read is
   // never bound to, however self-consistent its own later re-reads would be.
-  const startedAt = desktop
-    ? undefined
-    : resolveCorroboratedIdentity(pid, argv)?.startedAt;
+  // POSITIVE counter-evidence refuses outright: if the OS says the process holding
+  // our port is running something other than the ComfyUI that just answered us,
+  // then the answer and the pid describe different processes, and everything built
+  // on that pairing — the environment we would reproduce, the argv we would
+  // relaunch, the process we would KILL — is about the wrong one. Applies whatever
+  // the argv looked like, Desktop included (codex gate).
+  const corroboration = resolveCorroboratedIdentity(pid, argv);
+  if (corroboration.kind === "mismatch") {
+    const err = new ProcessControlError(
+      `The process listening on port ${port} (PID ${pid}) is not running the ComfyUI that ` +
+        `answered /system_stats — the OS reports its command line as "${corroboration.commandLine}", ` +
+        `which does not match that server's launch arguments. Nothing was stopped: acting on this ` +
+        `pairing would control the wrong process. Re-run once the server has settled.`,
+    );
+    err.identityAmbiguous = true;
+    throw err;
+  }
+  const startedAt =
+    desktop || corroboration.kind !== "confirmed"
+      ? undefined
+      : corroboration.identity.startedAt;
 
   // BIND THE PID TO THE PROCESS THAT ANSWERED (coordinator gate P1(1)).
   //
@@ -1549,17 +1581,19 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
   // still own the port. A substitution by a differently-launched instance changes
   // the argv and is caught; a transport failure proves nothing and is not treated
   // as evidence either way.
-  if (!desktop) {
-    const recheck = await reconfirmAnsweringServer(argv, pid, port);
-    if (recheck === "changed") {
-      const err = new ProcessControlError(
-        `The ComfyUI answering on port ${port} changed while it was being identified ` +
-          `(a different instance now owns the port, or reports different launch ` +
-          `arguments). Nothing was stopped. Re-run once the server has settled.`,
-      );
-      err.identityAmbiguous = true;
-      throw err;
-    }
+  //
+  // Runs for DESKTOP too (codex gate): `desktop` is itself derived from the FIRST,
+  // possibly stale argv, so skipping the recheck there is how a Desktop answer from
+  // A gets a Manager reboot fired at a non-Desktop B that took the port.
+  const recheck = await reconfirmAnsweringServer(argv, pid, port);
+  if (recheck === "changed") {
+    const err = new ProcessControlError(
+      `The ComfyUI answering on port ${port} changed while it was being identified ` +
+        `(a different instance now owns the port, or reports different launch ` +
+        `arguments). Nothing was stopped. Re-run once the server has settled.`,
+    );
+    err.identityAmbiguous = true;
+    throw err;
   }
 
   // Bound to that identity - never adopted from a pid we cannot still prove.
