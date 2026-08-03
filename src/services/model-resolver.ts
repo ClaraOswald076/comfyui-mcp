@@ -909,13 +909,23 @@ export async function liveListingHasEntry(
  * containment in it says nothing. Callers must treat unknown as unconfirmed, never
  * as confirmation. Never throws.
  */
+export interface LiveRootMembership {
+  /** true = inside a tree the server reads; false = demonstrably not; undefined =
+   *  only local configuration could answer, so nothing is known. */
+  inRoots: boolean | undefined;
+  /** The live primary models root this answer was computed against, when it was
+   *  live-authoritative. Returned so a caller can STAMP the exact root it checked
+   *  rather than taking a second, possibly-later observation (codex gate, r12). */
+  liveRoot?: string;
+}
+
 export async function isUnderLiveModelRoots(
   absPath: string,
   /** The models CATEGORY the path belongs to. Live extra roots are category-scoped
    *  (`{ category, dir }`), so a `checkpoints` root must never vouch for a LoRA
    *  (codex gate, round 6). Omitted = consider every root. */
   category?: string,
-): Promise<boolean | undefined> {
+): Promise<LiveRootMembership> {
   /** Canonicalize so a junctioned/symlinked root is compared by where it REALLY
    *  lives. `C:\ComfyUI\models` being a junction to `D:\Models` is a legitimate,
    *  supported layout; a lexical-only compare would call a correctly-placed file
@@ -944,41 +954,48 @@ export async function isUnderLiveModelRoots(
   try {
     dest = await resolveModelsDirWithBases();
   } catch {
-    return undefined;
+    return { inRoots: undefined };
   }
-  if (!isLiveAuthoritativeModelsDir(dest.source)) return undefined;
+  if (!isLiveAuthoritativeModelsDir(dest.source)) return { inRoots: undefined };
+  const liveRoot = resolve(dest.modelsDir);
 
   // A negative answer is only honest when everything it rests on could actually be
   // canonicalized; otherwise say UNKNOWN rather than accuse a correct placement.
   let fullyCanonical = target.ok;
   const primary = await canon(dest.modelsDir);
   fullyCanonical = fullyCanonical && primary.ok;
-  if (under(primary)) return true;
+  if (under(primary)) return { inRoots: true, liveRoot };
 
   let extra: Awaited<ReturnType<typeof getLiveExtraModelRoots>>;
   try {
     extra = await getLiveExtraModelRoots(dest.snapshot);
   } catch {
-    return undefined;
+    return { inRoots: undefined, liveRoot };
   }
   const wantCat = (category ?? "").trim().toLowerCase();
   for (const r of extra.roots) {
     if (wantCat && String(r.category ?? "").trim().toLowerCase() !== wantCat) continue;
     const rc = await canon(r.dir);
     fullyCanonical = fullyCanonical && rc.ok;
-    if (under(rc)) return true;
+    if (under(rc)) return { inRoots: true, liveRoot };
   }
   // The live roots are known and this path is in none of them.
-  if (!extra.authoritative) return undefined;
-  return fullyCanonical ? false : undefined;
+  if (!extra.authoritative) return { inRoots: undefined, liveRoot };
+  return { inRoots: fullyCanonical ? false : undefined, liveRoot };
 }
 
-/** The models root the connected server reads RIGHT NOW, or undefined. Never throws.
- *  Stamped on a verdict so a later reader can tell whether the server it was made
- *  against is still the one connected. */
+/**
+ * The models root the connected server reads RIGHT NOW — and ONLY when that answer
+ * is LIVE-AUTHORITATIVE. A transient `/system_stats` outage makes the resolver fall
+ * back to COMFYUI_PATH, and reporting THAT as "what the server reads now" would
+ * downgrade a correctly verified download with a false "a DIFFERENT install"
+ * warning (codex gate, round 12). Unknown is the honest answer there. Never throws.
+ */
 export async function currentLiveModelsRoot(): Promise<string | undefined> {
   try {
-    return resolve(await resolveModelsDir());
+    const dest = await resolveModelsDirWithBases();
+    if (!isLiveAuthoritativeModelsDir(dest.source)) return undefined;
+    return resolve(dest.modelsDir);
   } catch {
     return undefined;
   }
@@ -1079,17 +1096,13 @@ export async function verifyLandedModel(
   // codex gate, round 4); `undefined` means only local configuration could answer,
   // so a pre-existing listing entry proves nothing about OUR bytes.
   const landed = verifiedPath ?? resolve(targetPath);
-  const inLiveRoots = await isUnderLiveModelRoots(landed, category);
-  const destinationIsLiveAuthoritative = inLiveRoots === true;
-  if (inLiveRoots === false) {
-    let liveRoot: string | undefined;
-    try {
-      liveRoot = await resolveModelsDir();
-    } catch {
-      liveRoot = undefined;
-    }
+  const membership = await isUnderLiveModelRoots(landed, category);
+  const destinationIsLiveAuthoritative = membership.inRoots === true;
+  if (membership.inRoots === false) {
+    const liveRoot = membership.liveRoot;
     return {
       verifiedPath,
+      verifiedAgainstRoot: liveRoot,
       liveVisible: "not-visible",
       note:
         `The file IS on disk at ${landed}, but that is OUTSIDE every directory the ` +
@@ -1113,11 +1126,13 @@ export async function verifyLandedModel(
         // two separate observations; a ComfyUI restart onto a DIFFERENT install
         // between them would otherwise let the NEW server's own same-named model
         // confirm OUR file, which that server cannot read (codex gate, round 11).
-        const stillInLiveRoots = await isUnderLiveModelRoots(landed, category);
-        if (stillInLiveRoots === false) {
+        const still = await isUnderLiveModelRoots(landed, category);
+        if (still.inRoots === false) {
           return {
             verifiedPath,
-            verifiedAgainstRoot: await currentLiveModelsRoot(),
+            // Stamp the root THIS check ran against — never a third, later
+            // observation, which could name yet another server (codex gate, r12).
+            verifiedAgainstRoot: still.liveRoot,
             liveVisible: "not-visible",
             note:
               `The file IS on disk at ${landed}, but the connected ComfyUI ` +
@@ -1129,7 +1144,10 @@ export async function verifyLandedModel(
         if (!ambiguous) {
           return {
             verifiedPath,
-            verifiedAgainstRoot: await currentLiveModelsRoot(),
+            // The root the POST-listing membership check just validated against —
+            // taking a fresh observation here could stamp a server that replaced it
+            // between the two awaits (codex gate, round 12).
+            verifiedAgainstRoot: still.liveRoot ?? membership.liveRoot,
             liveVisible: "visible",
           };
         }

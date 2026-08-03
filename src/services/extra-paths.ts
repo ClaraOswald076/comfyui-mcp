@@ -981,7 +981,13 @@ export async function getLiveExtraModelRoots(
   // Auto-loaded default in the LIVE install root (its main.py dir). Skip in remote
   // mode: the live root is a path on the remote host.
   if (!isRemoteMode()) {
-    const liveRoot = liveRootFromArgv(argv, snapshot.cwd);
+    // Prefer the root the caller already established through the ONE canonical
+    // resolver (OS-observed when argv is a relative `main.py` with no cwd). That is
+    // strictly stronger provenance than re-deriving it from argv here, and without
+    // it a portable/Desktop install's auto-loaded config is never found at all —
+    // which made a legitimate external model root look like "no extra roots"
+    // (codex gate, round 12). Falls back to the argv derivation.
+    const liveRoot = snapshot.liveRoot ?? liveRootFromArgv(argv, snapshot.cwd);
     if (liveRoot) configPaths.add(resolve(liveRoot, "extra_model_paths.yaml"));
   }
 

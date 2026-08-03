@@ -919,10 +919,12 @@ async function applyManifestSections(
         // OWN `D:\Live\...\x.safetensors`, so it may never promote an unconfirmed
         // answer to "installed" (codex gate, round 8) — it is reported as a
         // diagnostic on the pending item instead.
-        const visible = await isUnderLiveModelRoots(
-          existing,
-          target.targetSubfolder.split(/[\\/]+/).filter(Boolean)[0],
-        );
+        const visible = (
+          await isUnderLiveModelRoots(
+            existing,
+            target.targetSubfolder.split(/[\\/]+/).filter(Boolean)[0],
+          )
+        ).inRoots;
         const listed =
           visible === undefined
             ? await liveListingHasEntry(target.targetSubfolder, target.filename)

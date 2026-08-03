@@ -36,6 +36,13 @@ export interface LiveServerSnapshot {
   reachable: boolean;
   argv?: string[];
   cwd?: string;
+  /** The live server's install root as established by the ONE canonical resolver
+   *  (resolveLiveServerRoot) from THIS snapshot — including the OS-observed anchor
+   *  that argv alone cannot produce. Consumers that need
+   *  `<live root>/extra_model_paths.yaml` must use this rather than re-parsing argv,
+   *  or they miss the relative-`main.py` shape entirely (codex gate, round 12).
+   *  LOCAL mode only. */
+  liveRoot?: string;
 }
 
 /**
@@ -294,7 +301,13 @@ export async function resolveModelsDirWithBases(): Promise<{
     if (!isRemoteMode()) {
       const baseDir = parseBaseDirFromArgv(argv, cwd);
       if (baseDir) baseDirs.add(resolve(baseDir));
-      if (live.root) baseDirs.add(resolve(live.root));
+      if (live.root) {
+        baseDirs.add(resolve(live.root));
+        // Publish it on the snapshot so downstream consumers (the extra-model-root
+        // authorizer) use the SAME established root instead of re-deriving a weaker
+        // one from argv.
+        snapshot.liveRoot = resolve(live.root);
+      }
     }
     const fromArgv = parseModelsDirFromArgv(argv, cwd);
     if (fromArgv) {

@@ -46,7 +46,9 @@ const liveListingHasEntryMock = vi.hoisted(() =>
  *  model the healthy local case; the unconfirmed/stale paths are asserted
  *  explicitly below. */
 const isUnderLiveModelRootsMock = vi.hoisted(() =>
-  vi.fn(async (): Promise<boolean | undefined> => true),
+  vi.fn(async (): Promise<{ inRoots: boolean | undefined; liveRoot?: string }> => ({
+    inRoots: true,
+  })),
 );
 /** The models root the connected server reads NOW. Undefined = unknown, which never
  *  invalidates a verdict. */
@@ -445,7 +447,7 @@ describe("applyManifest", () => {
       root: "C:/stale/models",
       info: { isFile: () => true },
     });
-    isUnderLiveModelRootsMock.mockResolvedValueOnce(false);
+    isUnderLiveModelRootsMock.mockResolvedValueOnce({ inRoots: false });
 
     const result = await applyManifest({
       manifest: {
@@ -475,7 +477,7 @@ describe("applyManifest", () => {
     });
     // Decisive: the containment answer short-circuits the name-only listing check
     // (which would have said "yes, the server lists big.safetensors" — its own copy).
-    isUnderLiveModelRootsMock.mockResolvedValueOnce(false);
+    isUnderLiveModelRootsMock.mockResolvedValueOnce({ inRoots: false });
 
     const result = await applyManifest({
       manifest: {
@@ -501,7 +503,7 @@ describe("applyManifest", () => {
       root: "C:/comfy/models",
       info: { isFile: () => true },
     });
-    isUnderLiveModelRootsMock.mockResolvedValueOnce(undefined);
+    isUnderLiveModelRootsMock.mockResolvedValueOnce({ inRoots: undefined });
     liveListingHasEntryMock.mockResolvedValueOnce(true);
 
     const result = await applyManifest({

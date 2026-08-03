@@ -118,6 +118,7 @@ vi.mock("node:fs/promises", () => ({
 }));
 
 import {
+  currentLiveModelsRoot,
   resolveModelSubfolderPreferServer,
   verifyLandedModel,
 } from "../../services/model-resolver.js";
@@ -386,6 +387,22 @@ describe("pre-write: a destination the LIVE server does not read from is refused
   });
 });
 
+describe("currentLiveModelsRoot — only a LIVE-AUTHORITATIVE answer (#369)", () => {
+  it("returns the root when the models dir came from the running server", async () => {
+    h.modelsDirSource = "observed-root";
+    h.destModelsDir = "/live/ComfyUI/models";
+    await expect(currentLiveModelsRoot()).resolves.toBe(resolve("/live/ComfyUI/models"));
+  });
+
+  it("returns UNDEFINED when it fell back to local config (codex gate r12)", async () => {
+    // A transient /system_stats outage falls back to COMFYUI_PATH. Reporting that as
+    // "what the server reads now" would falsely downgrade a correct verdict.
+    h.modelsDirSource = "configured-base";
+    h.destModelsDir = "/comfy/models";
+    await expect(currentLiveModelsRoot()).resolves.toBeUndefined();
+  });
+});
+
 describe("post-write: the reported path is VERIFIED, not intended (#369)", () => {
   const target = resolve("/live/ComfyUI/models/loras/new.safetensors");
 
@@ -541,6 +558,33 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
     h.modelsDirSource = "observed-root";
     h.destModelsDir = "/live/ComfyUI/models";
     h.liveListings["loras"] = ["new.safetensors"];
+    const res = await verifyLandedModel(target, "loras", {
+      attempts: 1,
+      retryMs: 0,
+      listedBefore: false,
+    });
+    expect(res.liveVisible).toBe("visible");
+    expect(res.verifiedAgainstRoot).toBe(resolve("/live/ComfyUI/models"));
+  });
+
+  it("stamps the root the MEMBERSHIP check ran against, not a later observation (codex gate r12)", async () => {
+    // The membership re-check sees A; a THIRD observation would see B. The stamp
+    // must name A, or a later reader would think the verdict is current for B.
+    h.modelsDirSource = "observed-root";
+    h.destModelsDir = "/live/ComfyUI/models";
+    h.liveListings["loras"] = ["new.safetensors"];
+    let calls = 0;
+    resolveModelsDirWithBasesMock.mockImplementation(async () => {
+      calls += 1;
+      return {
+        // calls 1 and 2 are the membership checks (server A); anything later is B.
+        modelsDir: resolve(calls <= 2 ? "/live/ComfyUI/models" : "/serverB/models"),
+        baseDirs: [],
+        snapshot: { reachable: true, argv: h.snapshotArgv },
+        source: h.modelsDirSource,
+      };
+    });
+
     const res = await verifyLandedModel(target, "loras", {
       attempts: 1,
       retryMs: 0,
