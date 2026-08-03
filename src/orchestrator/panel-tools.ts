@@ -2241,9 +2241,15 @@ function httpStatusOfError(err: unknown): number | undefined {
  *  one — while on POSIX it is a perfectly legal LITERAL filename. Accepting the
  *  backslash spelling would silently rewrite a request for that literal file into
  *  a request for `workflows/foo.json`, i.e. a different graph. A caller who types
- *  the backslash form gets a refusal that names the close match instead. */
+ *  the backslash form gets a refusal that names the close match instead.
+ *
+ *  The match is also case-SENSITIVE (codex MAJOR). ComfyUI's store key is the
+ *  literal lowercase "workflows/"; a library that contains a subfolder named
+ *  "WORKFLOWS" is a real, different location on a case-sensitive host, and
+ *  stripping it would turn "WORKFLOWS/foo.json" into a request for the root
+ *  "foo.json". */
 const stripLibraryPrefix = (key: string): string =>
-  key.replace(/^\/+/, "").replace(/^workflows\/+/i, "");
+  key.replace(/^\/+/, "").replace(/^workflows\/+/, "");
 
 /** The form two userdata store keys are compared in when deciding they are the
  *  SAME NAME. Unicode normalization is the only equivalence applied: NFD "é" and
@@ -2483,15 +2489,20 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
   // key that just 404'd — and a uniquely listed workflow would be refused. Only a
   // missing "workflows/" prefix is added.
   const storeKeyForListed = (listedKey: string): string => {
-    const trimmed = listedKey.replace(/^[\\/]+/, "");
-    return /^workflows[\\/]/i.test(trimmed) ? trimmed : `workflows/${trimmed}`;
+    // Same strictness as stripLibraryPrefix: only the literal lowercase,
+    // forward-slash "workflows/" counts as an already-prefixed key. Anything else
+    // is part of the NAME and must stay under the library root.
+    const trimmed = listedKey.replace(/^\/+/, "");
+    return /^workflows\//.test(trimmed) ? trimmed : `workflows/${trimmed}`;
   };
 
   let listedButUnserved: string | null = null;
   let nearMisses: string[] = [];
+  let listingUnreadable = false;
   let resolvedKey = requestedKey;
   if (outcome.kind === "absent") {
     const rawListed = await listUserdataWorkflowKeys();
+    listingUnreadable = rawListed === null;
     // A listing entry is server-supplied data, so it gets the SAME escape guard as
     // caller input before it is echoed back as a request key. The split is
     // deliberately liberal about separators — that is a REJECTION rule, where being
@@ -2586,6 +2597,9 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
     // (#202). Refuse, naming exactly what was tried.
     throw new Error(
       `No workflow named "${p}" — it ${outcome.detail}.` +
+        (listingUnreadable
+          ? ` Its workflow listing could not be read either, so no close match could be checked.`
+          : "") +
         (listedButUnserved
           ? ` Its library DOES list "${listedButUnserved}", but the server would not serve that key —` +
             ` the file may have been removed or be unreadable on the ComfyUI machine.`

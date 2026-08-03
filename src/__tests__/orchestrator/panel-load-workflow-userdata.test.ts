@@ -479,6 +479,26 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
     expect(JSON.stringify(res)).toMatch(/path separator/i);
   });
 
+  it("does NOT treat a DIFFERENTLY-CASED workflows/ as the library prefix", async () => {
+    // "WORKFLOWS" can be a real subfolder inside the library on a case-sensitive
+    // host. Stripping it would turn "WORKFLOWS/foo.json" into a request for the
+    // root "foo.json" — a different file (codex MAJOR).
+    const nested = { nodes: [{ id: 21, type: "NestedNode" }], links: [] };
+    routeMock(["WORKFLOWS/foo.json"], {
+      "workflows/WORKFLOWS/foo.json": nested,
+      "workflows/foo.json": { nodes: [{ id: 22, type: "RootNode" }], links: [] },
+    });
+
+    const { ctx, calls } = makeCtx();
+    const res = await loadWorkflow().handler({ path: "WORKFLOWS/foo.json" }, ctx);
+
+    expect(res.isError).toBeUndefined();
+    expect(calls[0].graph).toMatchObject(nested); // the NESTED file, not the root one
+    expect(fetchApi).not.toHaveBeenCalledWith(
+      `/api/userdata/${encodeURIComponent("workflows/foo.json")}`,
+    );
+  });
+
   it("does NOT treat a BACKSLASH-spelled workflows/ prefix as the library prefix", async () => {
     // On POSIX "workflows\foo.json" is a legal LITERAL filename, not a prefixed
     // spelling of "foo.json". Stripping it would turn a request for that literal
@@ -636,6 +656,9 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
     // pass even if the near-miss lookup had been dropped entirely.
     expect(fetchApi).toHaveBeenCalledWith("/api/userdata?dir=workflows");
     expect(JSON.stringify(res)).toMatch(/list_workflows/);
+    // And the refusal admits the listing was unreadable rather than implying the
+    // library was fully checked.
+    expect(JSON.stringify(res)).toMatch(/listing could not be read/i);
   });
 });
 
