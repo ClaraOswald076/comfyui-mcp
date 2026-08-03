@@ -649,7 +649,12 @@ export async function liveCategoryListing(
   }
 }
 
-/** Model-extension basenames present under a category directory on disk. */
+/**
+ * Model files under a category directory, as CATEGORY-RELATIVE paths — the exact
+ * form ComfyUI's `/models/<category>` listing uses (`"sdxl/x.safetensors"`). Bare
+ * basenames would make `loras/a/shared.safetensors` look accounted for by a live
+ * `loras/b/shared.safetensors` from a different install (codex gate, round 9).
+ */
 async function coreModelFilesUnder(categoryDir: string): Promise<string[]> {
   let entries: string[] | undefined;
   try {
@@ -662,7 +667,7 @@ async function coreModelFilesUnder(categoryDir: string): Promise<string[]> {
   if (!Array.isArray(entries)) return [];
   return entries
     .filter((e) => typeof e === "string" && CORE_MODEL_EXTENSIONS.has(extname(e).toLowerCase()))
-    .map((e) => basename(e));
+    .map((e) => normRel(e));
 }
 
 /** How many populated categories of the candidate models root we cross-check.
@@ -742,25 +747,7 @@ async function assertDestinationVisibleToLiveServer(
   // folder happens to be empty.
   const target = categoryOf(targetSubfolder);
   const present = await categoriesUnder(modelsRoot);
-  // A models root with NO subdirectories at all gives the checks below nothing to
-  // work with — which is exactly the shape a container-side `--models-directory`
-  // takes on the host (the path simply does not exist here), and the target
-  // category alone may be empty on the live server too. Probe a few standard
-  // categories so "the server has models, this tree has none" can still be seen
-  // (codex gate, round 7). Cheap: only when the tree really is bare.
-  const bare = present.length === 0;
-  const fallback = bare ? [...MODEL_SUBDIRS] : [];
-  const ordered = [
-    ...(target ? [target] : []),
-    ...present.filter((c) => c !== target),
-    ...fallback.filter((c) => c !== target),
-  ];
-  // The per-call probe budget exists to keep a LARGE models tree cheap. A bare tree
-  // has no folders to enumerate, so the standard-category sweep IS the evidence —
-  // capping it at six would silently skip `text_encoders` and friends and let the
-  // write through (codex gate, round 8). At most ~15 cheap local listing calls, and
-  // only in this already-exceptional shape.
-  const probeBudget = bare ? ordered.length : DISAGREEMENT_PROBE_CATEGORIES;
+  const primary = [...(target ? [target] : []), ...present.filter((c) => c !== target)];
 
   let probed = 0;
   let filesOnDisk = 0;
@@ -769,28 +756,49 @@ async function assertDestinationVisibleToLiveServer(
    *  extra root would have to account for. */
   const unexplained = new Map<string, number>();
   let worst: { category: string; missing: string[]; onDisk: number; live: number } | undefined;
-  for (const category of ordered) {
-    if (probed >= probeBudget) break;
-    const onDisk = await coreModelFilesUnder(join(modelsRoot, category));
-    const listing = await liveCategoryListing(category);
-    if (listing === undefined) continue; // the server can't speak for it — no evidence
-    probed += 1;
-    filesOnDisk += onDisk.length;
-    liveListed += listing.length;
-    if (onDisk.length === 0 && listing.length > 0) unexplained.set(category, listing.length);
-    if (onDisk.length === 0) continue; // nothing to compare in this folder
-    // CONTAINMENT, not overlap. If this directory really is one the server reads,
-    // it SCANS it — so EVERY core-extension file in it must appear in the listing.
-    // A merely-overlapping name proves nothing: two unrelated installs routinely
-    // share `sd_xl_base_1.0.safetensors`, and treating that as agreement let a
-    // download proceed into a stale tree (codex gate, round 5). Compared by
-    // basename so a file the server reports from a nested path still counts.
-    const liveNames = new Set(listing.map((n) => basename(n)));
-    const missing = onDisk.filter((n) => !liveNames.has(n));
-    if (missing.length === 0) continue; // this folder is fully accounted for — agrees
-    if (!worst) {
+
+  const probe = async (categories: string[], budget: number): Promise<void> => {
+    for (const category of categories) {
+      if (worst) return;
+      if (probed >= budget) return;
+      const onDisk = await coreModelFilesUnder(join(modelsRoot, category));
+      const listing = await liveCategoryListing(category);
+      if (listing === undefined) continue; // the server can't speak for it — no evidence
+      probed += 1;
+      filesOnDisk += onDisk.length;
+      liveListed += listing.length;
+      if (onDisk.length === 0 && listing.length > 0) unexplained.set(category, listing.length);
+      if (onDisk.length === 0) continue; // nothing to compare in this folder
+      // CONTAINMENT, not overlap. If this directory really is one the server reads,
+      // it SCANS it — so EVERY core-extension file in it must appear in the listing.
+      // A merely-overlapping name proves nothing: two unrelated installs routinely
+      // share `sd_xl_base_1.0.safetensors`, and treating that as agreement let a
+      // download proceed into a stale tree (codex gate, round 5). Compared as
+      // CATEGORY-RELATIVE paths, so `a/shared.safetensors` is not accounted for by
+      // a live `b/shared.safetensors` (codex gate, round 9).
+      const liveNames = new Set(listing.map((n) => normRel(n)));
+      const missing = onDisk.filter((n) => !liveNames.has(n));
+      if (missing.length === 0) continue; // this folder is fully accounted for — agrees
       worst = { category, missing, onDisk: onDisk.length, live: listing.length };
+      return;
     }
+  };
+
+  // Pass 1 — the target category and whatever folders this tree actually has. The
+  // budget keeps a LARGE models tree cheap.
+  await probe(primary, DISAGREEMENT_PROBE_CATEGORIES);
+  // Pass 2 — if the candidate tree turned up NO model files at all, it has told us
+  // nothing, so sweep the standard categories UNCAPPED to find out whether the live
+  // server has models this tree does not (codex gate, rounds 7 and 8). Triggered by
+  // "no files", not merely "no folders": an otherwise-empty stale tree with a couple
+  // of empty category dirs is just as evidence-free (codex gate, round 9). At most a
+  // handful of extra cheap local listing calls, and only in this shape.
+  if (!worst && filesOnDisk === 0) {
+    const probedSet = new Set(primary);
+    await probe(
+      [...MODEL_SUBDIRS].filter((c) => !probedSet.has(c)),
+      Number.POSITIVE_INFINITY,
+    );
   }
 
   if (worst) {

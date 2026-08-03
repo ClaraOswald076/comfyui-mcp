@@ -523,6 +523,9 @@ export interface PersistedDownloadJob {
   live_visible?: "visible" | "not-visible" | "unknown" | "pending";
   /** The verification explanation, surfaced verbatim by download_status. */
   verify_note?: string;
+  /** Whether the post-landing on-disk stat succeeded. False = the file was NOT
+   *  found when checked, so no renderer may claim "verified on disk". */
+  disk_verified?: boolean;
   /** Epoch ms of this snapshot (set on write). */
   updated: number;
   /**

@@ -191,6 +191,29 @@ describe("pre-write: a destination the LIVE server does not read from is refused
     );
   });
 
+  it("REFUSES when a nested file matches only by BASENAME under a different subfolder (codex gate r9)", async () => {
+    // The stale tree holds loras/a/shared.safetensors; the live server lists only
+    // loras/b/shared.safetensors. Those are different files in different installs.
+    h.onDisk = { loras: ["a/shared.safetensors"] };
+    h.liveListings["loras"] = ["b/shared.safetensors"];
+    await expect(resolveModelSubfolderPreferServer("loras")).rejects.toThrow(
+      /DIFFERENT install/,
+    );
+  });
+
+  it("sweeps standard categories when the tree has FOLDERS but no model files (codex gate r9)", async () => {
+    // Not "bare" (an empty checkpoints/ exists), yet it still says nothing. The live
+    // server's only model is in text_encoders — ninth in the standard list.
+    h.onDisk = { loras: [], checkpoints: [] };
+    h.liveListings["loras"] = [];
+    h.liveListings["checkpoints"] = [];
+    h.liveListings["text_encoders"] = ["t5xxl.safetensors"];
+    h.liveExtraRoots = { authoritative: true, roots: [] };
+    await expect(resolveModelSubfolderPreferServer("loras")).rejects.toThrow(
+      /DIFFERENT install/,
+    );
+  });
+
   it("REFUSES on a merely OVERLAPPING filename — containment is required (codex gate r5)", async () => {
     // Two unrelated installs routinely share a popular checkpoint. That shared name
     // must NOT suppress the refusal when the rest of the tree is unknown to the server.

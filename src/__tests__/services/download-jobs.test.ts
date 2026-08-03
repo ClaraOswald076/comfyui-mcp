@@ -1435,6 +1435,18 @@ describe("download job registry", () => {
       expect(r.warning).toMatch(/reads elsewhere/);
     });
 
+    it("never claims 'verified on disk' when the post-landing stat failed (codex gate r9)", () => {
+      const r = describePlacement({
+        ...base,
+        live_visible: "unknown",
+        disk_verified: false,
+        verify_note: "the file could not be confirmed on disk",
+      });
+      expect(r.confirmed).toBe(false);
+      expect(r.pathQualifier).not.toContain("verified on disk");
+      expect(r.pathQualifier).toContain("NOT found on disk");
+    });
+
     it("never confirms a Manager dispatch, even if a verdict got attached", () => {
       const r = describePlacement({ ...base, viaManager: true, live_visible: "visible" });
       expect(r.confirmed).toBe(false);

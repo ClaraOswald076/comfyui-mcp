@@ -116,6 +116,10 @@ export interface DownloadJob {
   live_visible?: "visible" | "not-visible" | "unknown" | "pending";
   /** Why, for anything other than a plain "visible". Surfaced verbatim. */
   verify_note?: string;
+  /** Was the file CONFIRMED present on disk by the post-landing check? False when
+   *  the stat failed (deleted or unreadable between the rename and the check), in
+   *  which case no renderer may claim "verified on disk" for `job.path`. */
+  disk_verified?: boolean;
   /** A persisted in-flight record missed its owner heartbeat. It stays visible
    *  because this is not proof the physical transfer stopped (#761). */
   staleInflight?: boolean;
@@ -603,6 +607,10 @@ export async function startDownloadJob(
         try {
           const verdict = await verifyLandedModel(path, targetSubfolder, { listedBefore });
           if (verdict.verifiedPath) job.path = verdict.verifiedPath;
+          // No verifiedPath means the on-disk stat did NOT succeed — the file was
+          // removed or became unreadable between the rename and this check. Record
+          // that so no renderer claims "verified on disk" for the retained path.
+          job.disk_verified = !!verdict.verifiedPath;
           job.live_visible = verdict.liveVisible;
           job.verify_note = verdict.note;
         } catch (err) {
@@ -781,6 +789,7 @@ function persistJobRecord(job: DownloadJob): boolean {
     resume: job.resume,
     live_visible: job.live_visible,
     verify_note: job.verify_note,
+    disk_verified: job.disk_verified,
   });
 }
 
@@ -808,6 +817,7 @@ function jobFromPersisted(rec: PersistedDownloadJob): DownloadJob {
     resume: rec.resume as ResumeDiagnostic | undefined,
     live_visible: rec.live_visible,
     verify_note: rec.verify_note,
+    disk_verified: rec.disk_verified,
     staleInflight: rec.staleInflight,
     staleForMs: rec.staleForMs,
   };
@@ -857,6 +867,13 @@ export interface PlacementReport {
   warning?: string;
 }
 
+/** " (verified on disk)" only when the post-landing stat actually succeeded. A job
+ *  whose file vanished between the rename and the check keeps its path but must not
+ *  carry a disk-verification claim (codex gate, round 9). */
+function diskQualifier(job: DownloadJob): string {
+  return job.disk_verified === false ? " (NOT found on disk when checked)" : " (verified on disk)";
+}
+
 export function describePlacement(job: DownloadJob): PlacementReport {
   if (job.viaManager) {
     return {
@@ -883,7 +900,7 @@ export function describePlacement(job: DownloadJob): PlacementReport {
         confirmed: false,
         wrongPlace: true,
         pathLabel: "written to",
-        pathQualifier: " (verified on disk)",
+        pathQualifier: diskQualifier(job),
         warning:
           `NOT VISIBLE to the connected ComfyUI — ${job.verify_note ?? "the running server does not list this file."}`,
       };
@@ -892,7 +909,7 @@ export function describePlacement(job: DownloadJob): PlacementReport {
         confirmed: false,
         wrongPlace: false,
         pathLabel: "written to",
-        pathQualifier: " (verified on disk)",
+        pathQualifier: diskQualifier(job),
         warning:
           `visibility to the connected ComfyUI is UNCONFIRMED${job.verify_note ? ` — ${job.verify_note}` : ""}. Check list_local_models before relying on it.`,
       };
