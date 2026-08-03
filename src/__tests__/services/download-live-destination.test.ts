@@ -489,7 +489,7 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
       listedBefore: true,
     });
     expect(res.liveVisible).toBe("unknown");
-    expect(res.note).toMatch(/ALREADY listed that name/);
+    expect(res.note).toMatch(/already listed that name/i);
   });
 
   it("does NOT confirm a non-authoritative destination when the PRE-download listing was unavailable (codex gate r14)", async () => {
@@ -506,7 +506,12 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
     expect(res.note).toMatch(/could not be checked/);
   });
 
-  it("DOES confirm when the entry APPEARED because of this download", async () => {
+  it("NEVER confirms a non-authoritative destination, even when the entry appeared after the write (codex gate r17)", async () => {
+    // "It was not listed before, and it is now" looks like proof, but the server
+    // that answered BEFORE the write need not be the one answering after it — a
+    // replacement install holding its own same-named model reads identically. With
+    // no live-authoritative destination to tie the two observations together, the
+    // honest answer is unconfirmed.
     h.modelsDirSource = "configured-base";
     h.liveListings["loras"] = ["new.safetensors"];
     const res = await verifyLandedModel(target, "loras", {
@@ -514,7 +519,8 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
       retryMs: 0,
       listedBefore: false,
     });
-    expect(res.liveVisible).toBe("visible");
+    expect(res.liveVisible).toBe("unknown");
+    expect(res.note).toMatch(/cannot be tied to the file just written/);
   });
 
   it("DOES confirm a re-download into a LIVE-AUTHORITATIVE root even though the name pre-existed", async () => {

@@ -1468,6 +1468,16 @@ describe("download job registry", () => {
       expect(r.confirmed).toBe(true);
     });
 
+    it("treats differently-spelled Windows roots as the SAME install (codex gate r17)", () => {
+      // A false "DIFFERENT install" downgrade of a correct verdict is as harmful as
+      // a missed one: Windows paths are case-insensitive and mix separators.
+      const r = describePlacement(
+        { ...base, live_visible: "visible", verified_root: "C:\\ComfyUI\\models" },
+        { liveModelsDir: "c:/comfyui/models" },
+      );
+      expect(r.confirmed).toBe(process.platform === "win32");
+    });
+
     it("keeps a VISIBLE verdict when the current live root is UNKNOWN (no false alarm)", () => {
       const r = describePlacement(
         { ...base, live_visible: "visible", verified_root: "C:/A/models" },

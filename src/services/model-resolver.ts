@@ -1133,13 +1133,19 @@ export async function verifyLandedModel(
         "tree, or re-download now that the correct server is connected.",
     };
   }
-  // On a destination the running server never vouched for, the ONLY thing that makes
-  // a listing hit meaningful is that the entry APPEARED because of this write. That
-  // needs an explicit "it was not there before": an UNAVAILABLE pre-download listing
-  // (`undefined`) proves nothing and must be treated as ambiguous too, or a
-  // pre-existing same-named file in the live tree fabricates a verified success
-  // (codex gate, round 14).
-  const ambiguous = !destinationIsLiveAuthoritative && opts?.listedBefore !== false;
+  // A listing hit only PROVES something about the bytes we just wrote when the
+  // directory we wrote to is one the RUNNING server told us it reads. On any other
+  // destination the listing describes a tree we cannot tie to this write:
+  //   - the name may have been there all along (round 3);
+  //   - the pre-write listing may have been unavailable, so "it appeared" is not
+  //     established (round 14);
+  //   - the server answering AFTER the write may not even be the one that answered
+  //     BEFORE it, and its own same-named model then masquerades as ours (round 17).
+  // Each of those was a separate route to a fabricated success, and every fix that
+  // stopped short of this rule left another. So: a non-authoritative destination is
+  // reported HONESTLY as unconfirmed. It costs a noisier message on hosts where the
+  // live root cannot be pinned; it never refuses, never fails, and never lies.
+  const ambiguous = !destinationIsLiveAuthoritative;
 
   let sawListing = false;
   for (let i = 0; i < attempts; i++) {
@@ -1181,13 +1187,15 @@ export async function verifyLandedModel(
           liveVisible: "unknown",
           note:
             `The connected ComfyUI (${getComfyUIBaseUrl()}) lists "${wanted}" under "${category}", ` +
+            "but this destination came from local configuration rather than from the running " +
+            "server, so that listing cannot be tied to the file just written to " +
+            `${verifiedPath} — it may be the server's own copy elsewhere` +
             (opts?.listedBefore === true
-              ? "but it ALREADY listed that name before this download, "
-              : "but whether it listed that name BEFORE this download could not be checked, ") +
-            "and this destination came from local configuration rather than from the running " +
-            "server — so it cannot be confirmed that the file the server loads is the one just " +
-            `written to ${verifiedPath}. ` +
-            "Point COMFYUI_PATH at the ComfyUI that is actually running (or launch it with an " +
+              ? " (it already listed that name before this download)"
+              : opts?.listedBefore === undefined
+                ? " (whether it listed that name before this download could not be checked)"
+                : "") +
+            ". Point COMFYUI_PATH at the ComfyUI that is actually running (or launch it with an " +
             "absolute --base-directory) to get a definite answer.",
         };
       }

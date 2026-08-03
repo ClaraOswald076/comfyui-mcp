@@ -879,6 +879,19 @@ export interface PlacementReport {
 /** " (verified on disk)" only when the post-landing stat actually succeeded. A job
  *  whose file vanished between the rename and the check keeps its path but must not
  *  carry a disk-verification claim (codex gate, round 9). */
+/** Do two absolute root paths name the same directory? Windows paths are
+ *  case-insensitive and mix separators, so `C:\ComfyUI\models` and
+ *  `c:/comfyui/models` are the SAME install — comparing them raw produced a false
+ *  "a DIFFERENT install" downgrade of a correct verdict (codex gate, round 17). */
+function sameRoot(a: string | undefined, b: string | undefined): boolean {
+  if (!a || !b) return false;
+  const norm = (s: string): string => {
+    const slashed = s.replace(/\\/g, "/").replace(/\/+$/, "");
+    return process.platform === "win32" ? slashed.toLowerCase() : slashed;
+  };
+  return norm(a) === norm(b);
+}
+
 function diskQualifier(job: DownloadJob): string {
   return job.disk_verified === false ? " (NOT found on disk when checked)" : " (verified on disk)";
 }
@@ -895,7 +908,7 @@ export function describePlacement(
     !job.viaManager &&
     job.live_visible === "visible" &&
     ctx?.liveModelsDir &&
-    ctx.liveModelsDir !== job.verified_root
+    !sameRoot(ctx.liveModelsDir, job.verified_root)
   ) {
     // Covers BOTH stale shapes (codex gate, rounds 11 and 16):
     //  - the verdict names a DIFFERENT root than the server now reads; and
