@@ -259,6 +259,16 @@ export class PanelAgent {
    *  (#468). Acked when that turn's `result` lands; handed back to the journal
    *  when the turn is abandoned (stall watchdog) or the agent is stopped. */
   private turnEventTokens: string[] = [];
+  /** The turn marker `turnEventTokens` belongs to (#468). A completion is acked
+   *  only by the result of the turn that CARRIED it — see the `result` case. */
+  private turnEventTokensMarker = 0;
+  /** True once this run has seen ANY marker-stamped event, i.e. the backend
+   *  stamps turn markers (Claude does; Codex/Gemini don't). On a stamping
+   *  backend an UNMARKED result is a traceless straggler — possibly from an
+   *  abandoned earlier turn — so it must not ack the current turn's completion
+   *  tokens. On a non-stamping backend there is nothing to compare against, so
+   *  the pre-#468 tolerance applies unchanged. Reset per run. */
+  private sawTurnMarkers = false;
   /** True while a turn is in flight (working→done). Lets the manager defer a
    *  session-restarting option change (effort) until the turn finishes, instead
    *  of interrupting and silently dropping the in-flight reply. */
@@ -900,6 +910,15 @@ export class PanelAgent {
       // only when this turn's `result` lands (proof the agent actually read the
       // completion), not merely because it was spliced off the queue.
       const carriedTokens = batch.flatMap((it) => it.eventTokens ?? []);
+      // SAFETY NET: the previous turn ended without acking (no result at all, or
+      // only a traceless one the ack gate rejected). Its completions are about to
+      // be overwritten here, so hand them back first — the flush re-queues them
+      // into a LATER turn rather than letting them vanish at the handover.
+      if (this.turnEventTokens.length) {
+        const stale = this.turnEventTokens;
+        this.turnEventTokens = [];
+        this.releaseEventTokens(stale);
+      }
       this.turnEventTokens = carriedTokens;
       this.inFlight = {
         text,
@@ -910,6 +929,7 @@ export class PanelAgent {
       // Mirror the backend's turn-marker mint: the Nth turn yielded here is the
       // Nth turn the backend reads — its events carry marker N (#728 r3).
       this.currentTurnMarker += 1;
+      this.turnEventTokensMarker = this.currentTurnMarker;
       // Mark the turn in flight AT DISPATCH (not on the first event). Without this
       // the watchdog's `busy` guard would be false for the exact zero-event freeze
       // it's meant to catch, so onTurnStalled() would no-op. (handleEvent's later
@@ -986,6 +1006,10 @@ export class PanelAgent {
       this.turnWaiter = null;
       this.currentTurnMarker = 0;
       this.abandonedTurnMarker = 0;
+      // The #468 ack gate mirrors the marker reset: a fresh run re-learns whether
+      // this backend stamps, and no marker from the dead run can satisfy it.
+      this.turnEventTokensMarker = 0;
+      this.sawTurnMarkers = false;
       // Drop the prior session's last assistant UUID so a fork can't report a
       // stale (pre-fork) anchor for the first turn of the new session.
       this.lastAssistantUuid = null;
@@ -1215,6 +1239,10 @@ export class PanelAgent {
       );
       return;
     }
+    // Learn whether this backend stamps turn markers at all (#468 ack gate). Set
+    // from any surviving stamped event; a backend that never stamps leaves it
+    // false and keeps the pre-#468 ack behavior.
+    if (typeof ev.turn === "number") this.sawTurnMarkers = true;
     // Any event means the turn is alive — reset the idle watchdog. The `result`
     // case below disarms it entirely (turn ended). Placed before the switch so it
     // covers every event type without per-case bumps.
@@ -1341,7 +1369,19 @@ export class PanelAgent {
         // demonstrably reached the model's context. Ack them: the journal drops
         // them and settles their run tickets. This is the ONLY ack point; every
         // other exit from a turn hands the tokens back for replay.
-        if (this.turnEventTokens.length) {
+        //
+        // ACK GATE: only THIS turn's result may ack. On a marker-stamping
+        // backend an UNMARKED result is a traceless straggler (Claude emits one
+        // for a result it cannot match to a submitted turn) that the #728
+        // dead-letter deliberately lets through for gate liveness — it must not
+        // also retire a completion the CURRENT turn is carrying, or a turn that
+        // then stalls would have nothing left to hand back. A non-stamping
+        // backend has nothing to compare, so it keeps the previous behavior. The
+        // un-acked tokens are handed back at the next dispatch (see channel()).
+        const ackable =
+          !this.sawTurnMarkers ||
+          (typeof ev.turn === "number" && ev.turn === this.turnEventTokensMarker);
+        if (this.turnEventTokens.length && ackable) {
           const delivered = this.turnEventTokens;
           this.turnEventTokens = [];
           try {

@@ -88,6 +88,51 @@ class ContinuationBackend implements AgentBackend {
   }
 }
 
+/**
+ * A MARKER-STAMPING backend (like Claude): every turn's events carry the turn's
+ * marker, and the test drives the event stream by hand so a straggler from an
+ * abandoned turn can be injected at will.
+ */
+class MarkerBackend implements AgentBackend {
+  readonly id = "claude" as const;
+  readonly capabilities = CLAUDE_CAPABILITIES;
+  turns: string[] = [];
+  private sink: ((ev: AgentEvent) => void) | null = null;
+  private queued: AgentEvent[] = [];
+
+  async *run(opts: BackendStartOptions): AsyncGenerator<AgentEvent> {
+    let wake: (() => void) | null = null;
+    this.sink = (ev) => {
+      this.queued.push(ev);
+      const w = wake;
+      wake = null;
+      w?.();
+    };
+    void (async () => {
+      for await (const turn of opts.channel) {
+        this.turns.push((turn as { text?: string }).text ?? "");
+        // Mark the turn as producing SOME stamped output, so the agent learns
+        // this backend stamps markers (exactly what Claude does).
+        this.sink?.({ type: "assistant", text: "", turn: this.turns.length } as AgentEvent);
+      }
+    })();
+    for (;;) {
+      while (this.queued.length) yield this.queued.shift()!;
+      await new Promise<void>((resolve) => {
+        wake = resolve;
+      });
+    }
+  }
+
+  emit(ev: AgentEvent): void {
+    this.sink?.(ev);
+  }
+  async interrupt(): Promise<void> {}
+  async listModels(): Promise<ModelChoice[]> {
+    return [];
+  }
+}
+
 /** Wires a manager to a journal exactly as the orchestrator does (index.ts's
  *  flushRunCompletions / onEventDelivered / onEventUndelivered / onAgentReady),
  *  through the journal's own deliverPending so no delivery logic is duplicated. */
@@ -197,6 +242,34 @@ describe("run completion across automatic goal continuation (#468)", () => {
     await waitFor(() => backend.turns.length >= 3);
     expect(backend.turns[2]).toContain("kept_0001.png");
     expect(backend.turns[2]).toContain("RE-DELIVERED");
+  });
+
+  it("a traceless straggler result does NOT ack the current turn's completion", async () => {
+    // #728 lets an UNMARKED result through the dead-letter guard for gate
+    // liveness. On a marker-stamping backend that result may belong to an
+    // abandoned earlier turn, so it must not retire a completion the CURRENT
+    // turn is carrying — otherwise a turn that then stalls has nothing to
+    // hand back and the completion is gone.
+    const backend = new MarkerBackend();
+    const { journal, manager, arrive } = makeHarness(backend);
+    const tab = "tab-straggler";
+
+    journal.openRun(PROMPT_A, { tabId: tab });
+    manager.send(tab, "go");
+    await waitFor(() => backend.turns.length >= 1);
+    backend.emit({ type: "result", ok: true, subtype: "success", turn: 1 });
+
+    arrive(tab, { kind: "executed", prompt_id: PROMPT_A, images: [{ filename: "carried.png" }] });
+    await waitFor(() => backend.turns.length >= 2); // turn 2 carries the completion
+
+    // An unmarked straggler from the abandoned turn 1 arrives.
+    backend.emit({ type: "result", ok: false, subtype: "error_during_execution" });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(journal.outstanding(tab)).toHaveLength(1); // NOT acked
+
+    // Turn 2's own (marked) result is what acks it.
+    backend.emit({ type: "result", ok: true, subtype: "success", turn: 2 });
+    await waitFor(() => journal.outstanding(tab).length === 0);
   });
 
   it("reports an uncorrelatable completion as UNDETERMINED instead of swallowing it", async () => {
@@ -354,19 +427,21 @@ describe("run completion journal correlation (#468)", () => {
     expect(journal.correlate("tmp:draft", { prompt_id: PROMPT_A }).status).toBe("foreign");
   });
 
-  it("closeRuns drops the tab's tickets but KEEPS its arrived completions", () => {
+  it("closeRuns keeps the arrived completions but DOWNGRADES them to undetermined", () => {
     // New chat / switch to a historical session: the conversation that queued the
     // run is gone, so a render it queued must not be introduced to the
-    // replacement agent as "the run YOU queued".
+    // replacement agent as "the run YOU queued" — neither a future completion
+    // nor one already sitting undelivered in the journal.
     journal.openRun(PROMPT_A, { tabId: "t" });
     const arrived = journal.record("t", { kind: "executed", prompt_id: PROMPT_A });
+    expect(arrived?.correlation.status).toBe("matched");
     journal.closeRuns("t");
     expect(journal.ticketFor(PROMPT_A)).toBeUndefined();
     expect(journal.correlate("t", { prompt_id: PROMPT_A }).status).toBe("foreign");
-    // …but a completion that already arrived is still deliverable, with the
-    // verdict frozen at ITS arrival.
+    // Still deliverable — never swallowed — but no longer claimed as ours. A
+    // correlation may only ever weaken, never strengthen.
     expect(journal.pending("t")).toHaveLength(1);
-    expect(arrived?.correlation.status).toBe("matched");
+    expect(journal.pending("t")[0].correlation.status).toBe("foreign");
   });
 
   it("a completion re-sent AFTER its delivery was acked is suppressed, not delivered twice", () => {

@@ -423,6 +423,18 @@ export class RunCompletionJournalImpl {
     for (const [pid, ticket] of [...this.tickets]) {
       if (ticket.tabId === key) this.tickets.delete(pid);
     }
+    // Entries still undelivered were addressed to the conversation that just
+    // went away, so their `matched` verdict no longer holds for whoever receives
+    // them next: DOWNGRADE to foreign. This does not violate "correlated once at
+    // arrival" — a correlation may only ever get WEAKER (matched → foreign),
+    // never stronger, and only in response to an explicit "that conversation is
+    // gone" event. Without it a completion journaled before New chat would be
+    // replayed to the replacement agent as "the run YOU queued".
+    for (const entry of this.entries.values()) {
+      if (entry.key === key && entry.correlation.status === "matched") {
+        entry.correlation = { status: "foreign", promptId: entry.correlation.promptId };
+      }
+    }
   }
 
   /** Test/diagnostic helpers. */
