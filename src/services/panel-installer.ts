@@ -24,12 +24,15 @@ import { execFileSync } from "node:child_process";
 import {
   existsSync,
   lstatSync,
+  mkdirSync,
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
+  rmSync,
   statSync,
 } from "node:fs";
-import { basename, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { config, isLocalMode } from "../config.js";
 import { logger } from "../utils/logger.js";
 import { parsePyproject } from "./node-authoring.js";
@@ -48,7 +51,15 @@ import {
   type PanelPinState,
 } from "./panel-settings.js";
 import { withPanelMutationLock } from "./panel-pin-guard.js";
-import { resolveEffectiveComfyUIBase } from "./workspace-env.js";
+import { describePanelUpdateRecovery, PANEL_REPO_URL } from "./panel-recovery.js";
+import { compareSemver } from "./self-update.js";
+import { SEMVER_RE } from "./ui-bridge.js";
+import {
+  lastPanelBaseResolution,
+  panelBaseSync,
+  primePanelBase,
+  type PanelBaseSource,
+} from "./panel-workspace.js";
 
 /** Comfy Registry id (also pyproject [project].name). Authoritative for detection. */
 export const PANEL_REGISTRY_ID = "comfyui-agent-panel";
@@ -182,6 +193,27 @@ export interface PanelInstallerDeps {
    * prove the intersection — "cannot prove" refuses.
    */
   gitIgnoredPullConflicts: (dir: string, upstreamRev: string) => string[];
+  /**
+   * #771 — `git clone --depth 1 <panel repo> <destDir>`, for the REGISTRY-ZIP
+   * install shape. A panel installed from the Comfy Registry is an unpacked zip
+   * with NO `.git`, so the #724 fast-forward has nothing to fast-forward and the
+   * Manager cannot resolve it either. The only remaining honest remedy is to
+   * fetch a fresh copy and swap it in. THROWS on any failure — a partial clone
+   * must never be swapped over a working install.
+   *
+   * OPTIONAL, along with the three filesystem primitives below, and they are
+   * required as a SET: a caller that supplies only some of them would fail
+   * halfway through a swap. When any is absent the reinstall fallback is simply
+   * unavailable and the update reports the honest "could not update" error it
+   * reported before #771 — never a partial mutation.
+   */
+  gitClonePanel?: (destDir: string) => void;
+  /** Create a directory (and parents). THROWS on failure. */
+  mkdirp?: (p: string) => void;
+  /** Rename/move a path. THROWS on failure. Same-volume moves only. */
+  rename?: (from: string, to: string) => void;
+  /** Recursively remove a path; must NOT throw when it is already absent. */
+  removeDir?: (p: string) => void;
   /**
    * The user's explicit panel-version pin, if any. While a pin is in force NO
    * code path here may move the panel — install/update/reinstall refuse and the
@@ -361,6 +393,22 @@ export function gitMergeFfOnly(dir: string, rev: string): string {
  * the report credits the panel repo (codex gate). THROWS on any failure;
  * callers refuse unless the resolved root IS the panel dir.
  */
+/**
+ * #771 — shallow-clone the panel repo into `destDir`, which MUST NOT exist.
+ *
+ * Run from `destDir`'s PARENT rather than from destDir (which isn't there yet),
+ * and with `--end-of-options` so a path that begins with `-` can never be read
+ * as a git flag. The clone URL is our own compile-time constant, never caller
+ * input, so there is nothing to inject through it.
+ */
+export function gitClonePanel(destDir: string): void {
+  runGit(
+    dirname(destDir),
+    ["clone", "--depth", "1", "--end-of-options", PANEL_REPO_URL, destDir],
+    PANEL_GIT_PULL_TIMEOUT_MS,
+  );
+}
+
 export function gitWorktreeRoot(dir: string): string {
   return runGit(dir, ["rev-parse", "--show-toplevel"], PANEL_GIT_STATUS_TIMEOUT_MS).trim();
 }
@@ -400,10 +448,15 @@ export function gitIgnoredPullConflicts(dir: string, upstreamRev: string): strin
 
 export const defaultDeps: PanelInstallerDeps = {
   isLocalMode: () => isLocalMode(),
-  // Keep panel management aligned with get_environment, downloads, and
-  // comfy-cli: an explicit COMFYUI_PATH wins, then a saved default workspace
-  // is a valid local install when this target is not remote (#700).
-  comfyuiPath: () => resolveEffectiveComfyUIBase(),
+  // #766/#769 — LIVE-FIRST. The panel is not a file the user reads; it is a web
+  // extension the RUNNING ComfyUI serves to the browser tab, so the only
+  // custom_nodes that can matter is the one belonging to the server we are
+  // connected to. `panelBaseSync` prefers the live server's `--base-directory`
+  // (Comfy Desktop keeps custom_nodes there, NOT next to main.py — #766) and
+  // then its argv root (#769), falling back to the ordinary sync resolver —
+  // COMFYUI_PATH, then a saved default workspace (#700) — when the server is
+  // unreachable or its argv yields nothing. See panel-workspace.ts.
+  comfyuiPath: () => panelBaseSync(),
   env: () => process.env,
   existsSync,
   probeFile: (p) => {
@@ -449,6 +502,12 @@ export const defaultDeps: PanelInstallerDeps = {
   gitWorktreeRoot: (dir) => gitWorktreeRoot(dir),
   gitUpstreamRev: (dir) => gitUpstreamRev(dir),
   gitIgnoredPullConflicts: (dir, rev) => gitIgnoredPullConflicts(dir, rev),
+  gitClonePanel: (destDir) => gitClonePanel(destDir),
+  mkdirp: (p) => {
+    mkdirSync(p, { recursive: true });
+  },
+  rename: (from, to) => renameSync(from, to),
+  removeDir: (p) => rmSync(p, { recursive: true, force: true }),
   readPin: () => getPanelPinState(),
   isReachable: async () => {
     try {
@@ -462,6 +521,25 @@ export const defaultDeps: PanelInstallerDeps = {
   update: (opts) => updateCustomNode(opts),
   reinstall: (opts) => reinstallCustomNode(opts),
 };
+
+/**
+ * Resolve the LIVE ComfyUI base once, at the START of a panel operation, so
+ * every `deps.comfyuiPath()` inside it agrees (#766/#769).
+ *
+ * The resolution needs `/system_stats`, so it is async, while the dep is sync
+ * and is read from several places within one operation — detection, the shadow
+ * scan, the post-op re-read. If those could disagree, the "did the pack MOVE?"
+ * proof would be comparing two different directories, which is the one thing
+ * this file must never do.
+ *
+ * Only fires for the REAL deps. An injected dep set has already declared where
+ * ComfyUI is; probing a live server would be both pointless and, in tests,
+ * a network call nobody asked for.
+ */
+async function primeBaseFor(deps: PanelInstallerDeps): Promise<void> {
+  if (deps !== defaultDeps) return;
+  await primePanelBase();
+}
 
 // ---------------------------------------------------------------------------
 // Version pin
@@ -1190,6 +1268,15 @@ export interface PanelStatus {
    * unreliable "absent" as an install invitation.
    */
   scanReliable?: boolean;
+  /**
+   * The ComfyUI root this status is ABOUT — the custom_nodes parent that was
+   * actually scanned (#766/#769). Reported so an unexpected `installed: false`
+   * can be recognised as "you looked in the wrong tree" rather than "the panel
+   * is gone".
+   */
+  comfyuiPath?: string;
+  /** How `comfyuiPath` was chosen. See panel-workspace.ts. */
+  baseSource?: PanelBaseSource;
   note: string;
 }
 
@@ -1197,6 +1284,7 @@ export interface PanelStatus {
 export async function panelStatus(
   deps: PanelInstallerDeps = defaultDeps,
 ): Promise<PanelStatus> {
+  await primeBaseFor(deps);
   const detection = await detectPanelInstall(deps).catch(
     () =>
       ({ applicable: false, installed: false, isDevSymlink: false }) as PanelDetection,
@@ -1223,11 +1311,45 @@ export async function panelStatus(
         `them OUT of custom_nodes, then hard-refresh the ComfyUI tab.`
       : "";
 
+  // #766/#769 — say WHICH ComfyUI root this answer is about, and how it was
+  // chosen. Both issues were, at bottom, a status report about a directory the
+  // user did not think they were asking about; naming it makes that visible
+  // instead of leaving "installed: false" to be read as "the panel is missing".
+  const baseResolution = deps === defaultDeps ? lastPanelBaseResolution() : undefined;
+  const comfyuiPath = deps.comfyuiPath();
+  const baseSource: PanelBaseSource | undefined = baseResolution?.source;
+  const baseNote = (() => {
+    if (!baseResolution?.base) return "";
+    if (baseResolution.source === "live-base-directory") {
+      return (
+        ` Resolved against the RUNNING ComfyUI's --base-directory (${baseResolution.base})` +
+        (baseResolution.overriddenConfiguredBase
+          ? `, not the configured workspace ` +
+            `(${baseResolution.overriddenConfiguredBase}) — a Comfy Desktop-style split ` +
+            `install keeps custom_nodes under the base directory (#766).`
+          : `.`)
+      );
+    }
+    if (baseResolution.source === "live-argv-root") {
+      return (
+        ` Resolved from the RUNNING ComfyUI's own install root (${baseResolution.base})` +
+        (baseResolution.overriddenConfiguredBase
+          ? `, not the configured workspace (${baseResolution.overriddenConfiguredBase}).`
+          : ` — no COMFYUI_PATH or saved workspace was needed (#769).`)
+      );
+    }
+    return "";
+  })();
+
   let note: string;
   if (!detection.applicable) {
     note = !deps.isLocalMode()
-      ? "Remote/cloud mode — panel install is managed on the ComfyUI host, not from here."
-      : "Panel management is local-only; no local ComfyUI (COMFYUI_PATH) is configured.";
+      ? `Remote/cloud mode — panel install is managed on the ComfyUI host, not from ` +
+        `here. ${describePanelUpdateRecovery()}`
+      : `Panel management is local-only, and no local ComfyUI could be resolved — ` +
+        `neither COMFYUI_PATH, a saved default workspace, nor the running server's ` +
+        `own launch arguments yielded a root containing custom_nodes. Set ` +
+        `COMFYUI_PATH, or save a default workspace with workspace(action='set_default').`;
   } else if (detection.isDevSymlink) {
     note = "dev install (symlink) — managed manually; install/update/reinstall are refused.";
   } else if (!detection.installed) {
@@ -1255,8 +1377,10 @@ export async function panelStatus(
     shadows,
     shadowInspectFailed,
     scanReliable: detection.scanReliable,
+    comfyuiPath,
+    baseSource,
     pin,
-    note: note + shadowNote + pinNote,
+    note: note + baseNote + shadowNote + pinNote,
   };
 }
 
@@ -1777,6 +1901,293 @@ async function updateViaGitCheckoutFallback(opts: {
   };
 }
 
+/**
+ * The #771 fallback: the panel was installed from the COMFY REGISTRY as a zip.
+ *
+ * That install shape has no `.git`, which knocks out both existing update
+ * routes at once. ComfyUI-Manager cannot resolve it (its update queue drains
+ * having enqueued nothing), and the #724 fast-forward has nothing to
+ * fast-forward. The reporter of #771 was therefore hard-blocked: the write gate
+ * told them to run install_panel, and install_panel was the thing that could not
+ * work. This closes that loop by doing, under verification, exactly the manual
+ * sequence that unblocked them — clone the panel repo fresh and swap it in.
+ *
+ * Every guard from the git path applies here too, plus the ones a WHOLESALE
+ * REPLACEMENT needs that a fast-forward does not:
+ *
+ *  - NEVER ON A GIT CHECKOUT. A resolvable HEAD means the #724 fast-forward is
+ *    the right tool; replacing a real checkout would throw away the user's
+ *    branch, remotes and any local commits. This fallback is strictly for the
+ *    shape that has no other option.
+ *  - THE REPLACEMENT IS VALIDATED BEFORE ANYTHING MOVES. The clone must carry
+ *    the panel's own pyproject identity, a readable version, and the BUILT web
+ *    bundle ComfyUI actually serves. Swapping in a source tree with no
+ *    `web/js` would leave the browser with no panel at all — an "update" that
+ *    uninstalls.
+ *  - NEVER BACKWARDS. A staged version older than the installed one is refused
+ *    outright; equal versions report honestly as "already current" and do not
+ *    touch the disk.
+ *  - THE BACKUP LEAVES custom_nodes. ComfyUI serves every directory under
+ *    custom_nodes as a web extension, so parking the old copy beside the new one
+ *    would shadow it in the browser and make a real update look like a no-op
+ *    (#641). It goes to a sibling of custom_nodes instead.
+ *  - THE SWAP IS REVERSIBLE. If the new dir cannot be moved into place after the
+ *    old one is out, the old one is put back before throwing. The user never
+ *    ends up with no panel because we failed halfway.
+ *
+ * Success still requires PROVEN on-disk movement re-read afterwards (#639) and a
+ * clean shadow scan (#641) — the same discipline as every other path here.
+ */
+interface PanelSwapOps {
+  clone: (destDir: string) => void;
+  mkdirp: (p: string) => void;
+  rename: (from: string, to: string) => void;
+  removeDir: (p: string) => void;
+}
+
+/**
+ * The four primitives the swap needs, or undefined when the dep set does not
+ * carry all of them. Required as a SET: half a swap is worse than none, so a
+ * partial dep set disables the fallback entirely rather than starting work it
+ * cannot finish or undo.
+ */
+function resolveSwapOps(deps: PanelInstallerDeps): PanelSwapOps | undefined {
+  const { gitClonePanel, mkdirp, rename, removeDir } = deps;
+  if (!gitClonePanel || !mkdirp || !rename || !removeDir) return undefined;
+  return { clone: gitClonePanel, mkdirp, rename, removeDir };
+}
+
+async function updateViaRegistryZipReinstall(opts: {
+  deps: PanelInstallerDeps;
+  ops: PanelSwapOps;
+  dir: string;
+  comfyuiPath: string;
+  previousVersion?: string;
+  result?: NodeOpResult;
+  /** Why the Manager path could not do it — quoted in every message. */
+  managerReason: string;
+}): Promise<PanelActionResult> {
+  const { deps, ops, dir, comfyuiPath, previousVersion, result, managerReason } = opts;
+
+  // NOT A GIT CHECKOUT. This is the whole precondition: a readable HEAD means
+  // #724's fast-forward applies and a wholesale replace would destroy work.
+  if (deps.gitRevision(dir)) {
+    throw new PanelInstallError(
+      `Panel update did NOT apply (${managerReason}), and the reinstall-from-source ` +
+        `fallback is REFUSED: ${dir} IS a git checkout, so replacing it wholesale ` +
+        `would discard its branch, remotes and any local commits. The fast-forward ` +
+        `path handles a checkout; this one exists only for a Comfy Registry zip ` +
+        `install. Update the panel repo manually (git pull in ${dir}), then RESTART ComfyUI.`,
+    );
+  }
+
+  // Final pin check, adjacent to the mutation (same contract as every other
+  // path): a pin written while we were probing must still be honoured.
+  assertNotPinned("update", deps);
+
+  // A shadowing copy must be cleared FIRST. Replacing the canonical dir while a
+  // shadow is served would leave the browser on the old panel and make a
+  // genuinely-applied update look like it failed.
+  assertNoPanelShadow("update", dir, deps);
+
+  // Stage OUTSIDE custom_nodes (a sibling of it), for two reasons: a
+  // half-written clone inside custom_nodes would be served as a web extension
+  // and shadow the real panel, and ComfyUI would try to import it as a node
+  // pack. Same volume as the panel dir, so the swap is a rename, not a copy.
+  const staging = join(
+    comfyuiPath,
+    `.comfyui-agent-panel.staging-${process.pid}-${Date.now()}`,
+  );
+  if (deps.existsSync(staging)) {
+    throw new PanelInstallError(
+      `Panel update did NOT apply (${managerReason}), and the reinstall-from-source ` +
+        `fallback is REFUSED: the staging path ${staging} already exists. Remove it ` +
+        `and retry.`,
+    );
+  }
+
+  let stagedVersion: string | undefined;
+  try {
+    ops.clone(staging);
+
+    // VALIDATE THE REPLACEMENT BEFORE ANYTHING MOVES.
+    const stagedPyproject = join(staging, "pyproject.toml");
+    if (!deps.existsSync(stagedPyproject)) {
+      throw new PanelInstallError(
+        `the freshly cloned panel at ${staging} has no pyproject.toml, so it cannot ` +
+          `be identified as the panel pack`,
+      );
+    }
+    const parsed = parsePyproject(deps.readFile(stagedPyproject));
+    if (parsed.projectName !== PANEL_REGISTRY_ID) {
+      throw new PanelInstallError(
+        `the freshly cloned panel at ${staging} declares [project].name ` +
+          `"${parsed.projectName ?? "(none)"}", not "${PANEL_REGISTRY_ID}"`,
+      );
+    }
+    if (!parsed.version) {
+      throw new PanelInstallError(
+        `the freshly cloned panel at ${staging} has no readable version, so the ` +
+          `update could not be verified afterwards`,
+      );
+    }
+    stagedVersion = parsed.version;
+
+    // The BUILT bundle must be present. The panel ships prebuilt web assets, but
+    // if a clone ever landed without them, swapping it in would serve the
+    // browser nothing — an "update" that silently uninstalls the panel. An
+    // indeterminate probe is not a pass.
+    if (servesPanelWebAssets(staging, deps) !== true) {
+      throw new PanelInstallError(
+        `the freshly cloned panel at ${staging} does not carry the built web bundle ` +
+          `(web/js), so installing it would leave the ComfyUI tab with no panel at all`,
+      );
+    }
+
+    // NEVER BACKWARDS, and never a pointless swap.
+    if (previousVersion && SEMVER_RE.test(previousVersion.trim()) && SEMVER_RE.test(stagedVersion.trim())) {
+      const delta = compareSemver(stagedVersion, previousVersion);
+      if (delta < 0) {
+        throw new PanelInstallError(
+          `the published panel (${stagedVersion}) is OLDER than the one installed ` +
+            `(${previousVersion}) — refusing to move the panel backwards`,
+        );
+      }
+      if (delta === 0) {
+        // Honest non-mutation: the installed pack already matches upstream.
+        ops.removeDir(staging);
+        const atTip =
+          `Panel is already at the published version (${stagedVersion}) — ` +
+          `${managerReason}, and a fresh clone of the panel repo carries the SAME ` +
+          `version, so there is nothing to install. Nothing changed on disk; no ` +
+          `restart needed.`;
+        return {
+          action: "update",
+          result: result ?? {
+            mechanism: "git-clone",
+            message: atTip,
+            details: { staged_version: stagedVersion },
+          },
+          restartRequired: false,
+          message: atTip,
+          previousVersion,
+          installedVersion: previousVersion,
+        };
+      }
+    }
+  } catch (err) {
+    // Nothing has moved yet — clean up the staging dir and report truthfully.
+    ops.removeDir(staging);
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new PanelInstallError(
+      `Panel update did NOT apply: nothing was changed on disk at ${dir} (installed ` +
+        `version still ${previousVersion ?? "unknown"}). ${managerReason}, and the ` +
+        `reinstall-from-source fallback could not proceed — ${detail}. Fix: update ` +
+        `ComfyUI-Manager on the host (git pull in custom_nodes/ComfyUI-Manager, or ` +
+        `pip install -U comfyui_manager) and retry, or replace the panel manually ` +
+        `(clone ${PANEL_REPO_URL} and swap it in, keeping the old copy OUT of ` +
+        `custom_nodes), then RESTART ComfyUI.`,
+    );
+  }
+
+  // THE SWAP. Backup goes to a sibling of custom_nodes — never inside it (#641).
+  const backupRoot = join(comfyuiPath, "custom_nodes_backup");
+  const backupDir = join(
+    backupRoot,
+    `${basename(dir)}-${previousVersion ?? "unknown"}-${Date.now()}`,
+  );
+  try {
+    ops.mkdirp(backupRoot);
+    ops.rename(dir, backupDir);
+  } catch (err) {
+    ops.removeDir(staging);
+    throw new PanelInstallError(
+      `Panel update did NOT apply: nothing was changed on disk. ${managerReason}, and ` +
+        `the reinstall-from-source fallback could not move the existing panel out of ` +
+        `custom_nodes (${dir} → ${backupDir}: ` +
+        `${err instanceof Error ? err.message : String(err)}). The old panel is ` +
+        `untouched. Check permissions / that ComfyUI does not hold the directory ` +
+        `open (stop ComfyUI and retry).`,
+    );
+  }
+  try {
+    ops.rename(staging, dir);
+  } catch (err) {
+    // PUT IT BACK. A failure here must never leave the user with no panel.
+    let restored = true;
+    try {
+      ops.rename(backupDir, dir);
+    } catch {
+      restored = false;
+    }
+    ops.removeDir(staging);
+    throw new PanelInstallError(
+      `Panel update did NOT apply: ${managerReason}, and the reinstall-from-source ` +
+        `fallback failed while moving the new panel into place ` +
+        `(${staging} → ${dir}: ${err instanceof Error ? err.message : String(err)}). ` +
+        (restored
+          ? `The previous panel was RESTORED to ${dir} — nothing was lost.`
+          : `The previous panel could NOT be restored automatically: it is at ` +
+            `${backupDir}. Move it back to ${dir} manually before restarting ComfyUI.`),
+    );
+  }
+
+  // VERIFY — same machinery as every other path (#639/#641): re-read the
+  // installed identity FRESH from disk, fail closed on a shadow, and require
+  // proven movement. The version we report is the one we OBSERVED, never
+  // `stagedVersion` (what we intended to install).
+  const post = await detectPanelInstall(deps);
+  if (!post.installed || !post.version) {
+    throw new PanelInstallError(
+      `Panel reinstall-from-source moved the new pack into ${dir}, but re-reading it ` +
+        `afterwards found it ${post.installed ? "present with an unreadable version" : "absent"}. ` +
+        `NOT reporting success. The previous panel is at ${backupDir} — restore it ` +
+        `if the new one is broken, then RESTART ComfyUI.`,
+    );
+  }
+  if (!post.dir || !samePathCI(dir, post.dir, deps)) {
+    throw new PanelInstallError(
+      `Panel reinstall-from-source cannot be verified: after swapping ${dir}, ` +
+        `re-detection resolved a DIFFERENT panel dir (${post.dir ?? "none"}), so the ` +
+        `before/after comparison would not describe the directory that changed. NOT ` +
+        `reporting success — check custom_nodes for duplicate panel dirs. The ` +
+        `previous panel is at ${backupDir}.`,
+    );
+  }
+  assertNoPanelShadow("update", post.dir, deps);
+  if (previousVersion && post.version === previousVersion) {
+    throw new PanelInstallError(
+      `Panel reinstall-from-source did NOT change the installed version (still ` +
+        `${post.version}) at ${dir}, even though a fresh clone was swapped in. NOT ` +
+        `reporting an update — something is serving the old pack. The previous panel ` +
+        `is at ${backupDir}.`,
+    );
+  }
+
+  const message =
+    `Panel updated (${previousVersion ?? "unknown"} → ${post.version}) by reinstalling ` +
+    `from source, verified on disk at ${dir}: ${managerReason}, and the pack is a ` +
+    `Comfy Registry ZIP install with no .git, so neither ComfyUI-Manager nor a ` +
+    `fast-forward could move it (#771). A fresh clone of ${PANEL_REPO_URL} was ` +
+    `swapped in and the previous copy was moved OUT of custom_nodes to ${backupDir} ` +
+    `(leaving it beside the panel would shadow the new one in the browser). RESTART ` +
+    `ComfyUI to load the updated panel node, then hard-refresh the ComfyUI tab.`;
+  return {
+    action: "update",
+    result: result
+      ? { ...result, message }
+      : {
+          mechanism: "git-clone",
+          message,
+          details: { backup_dir: backupDir, installed_version: post.version },
+        },
+    restartRequired: true,
+    message,
+    previousVersion,
+    installedVersion: post.version,
+  };
+}
+
 export interface PanelActionOptions {
   /**
    * Target version for install/reinstall, defaulting to the `nightly` channel.
@@ -1811,6 +2222,10 @@ export async function runPanelActionInner(
   opts: PanelActionOptions = {},
 ): Promise<PanelActionResult> {
   const targetVersion = opts.version?.trim() || PANEL_VERSION;
+  // Resolve the LIVE ComfyUI base ONCE, before the first deps.comfyuiPath()
+  // read, so detection, the shadow scan and the post-op re-read all describe
+  // the same directory (#766/#769).
+  await primeBaseFor(deps);
   // P1b — truly LOCAL-only. Refuse in remote/cloud mode even when COMFYUI_PATH
   // is set: installCustomNode/reinstallCustomNode would queue Manager mutations
   // against the REMOTE host while our symlink guard inspected the LOCAL disk —
@@ -1822,10 +2237,17 @@ export async function runPanelActionInner(
         `the ComfyUI host itself.`,
     );
   }
-  if (!deps.comfyuiPath()) {
+  // Bind the base ONCE. Every later read in this operation — the registry-zip
+  // fallback's staging/backup paths especially — must be rooted at the SAME
+  // ComfyUI the detection scanned, never at a value re-resolved mid-flight.
+  const comfyPath = deps.comfyuiPath();
+  if (!comfyPath) {
     throw new PanelInstallError(
-      `Panel ${action} is local-only and requires a local ComfyUI install. ` +
-        `Set COMFYUI_PATH (this is a no-op in remote/cloud mode).`,
+      `Panel ${action} is local-only and requires a local ComfyUI install, and none ` +
+        `could be resolved — neither COMFYUI_PATH, a saved default workspace, nor ` +
+        `the running server's own launch arguments yielded a root containing ` +
+        `custom_nodes (#769). Set COMFYUI_PATH or save a default workspace with ` +
+        `workspace(action='set_default'). (This is a no-op in remote/cloud mode.)`,
     );
   }
 
@@ -1854,7 +2276,100 @@ export async function runPanelActionInner(
     // Final pin check, inside the op lock and adjacent to the mutation: a pin
     // set while detection was running must still be honoured.
     assertNotPinned(action, deps);
-    const result = await deps.update({ id: PANEL_REGISTRY_ID });
+
+    // #771 — STATUS AND UPDATE MUST NOT CONTRADICT EACH OTHER.
+    //
+    // `deps.update` is the GENERIC node-pack update. Its post-op presence gate
+    // (#730) resolves the pack through ComfyUI-Manager's installed/registry
+    // list, keyed on the registry id — a completely different question from the
+    // one `panelStatus` answers by scanning custom_nodes and reading
+    // pyproject.toml. For a Comfy Registry ZIP install those two disagree: the
+    // Manager list does not resolve `comfyui-agent-panel`, so the generic gate
+    // throws "…is not installed locally and was not found in the
+    // ComfyUI-Manager registry", asserting an absence it never checked on disk —
+    // about a pack `status` had just reported at a concrete dir and version.
+    //
+    // We hold the authoritative on-disk answer right here in `detection`. So a
+    // failure from the generic path is recorded as "ComfyUI-Manager could not
+    // update it" and we continue to the verified fallbacks. It is only allowed
+    // to propagate when the disk AGREES the pack is absent — then the message
+    // is true and there is genuinely nothing to update.
+    let result: NodeOpResult | undefined;
+    let managerFailure: string | undefined;
+    try {
+      result = await deps.update({ id: PANEL_REGISTRY_ID });
+    } catch (err) {
+      if (!detection.installed) throw err;
+      managerFailure = err instanceof Error ? err.message : String(err);
+      logger.warn(
+        `[panel] ComfyUI-Manager could not update the panel (${managerFailure}) — the ` +
+          `pack IS installed at ${detection.dir ?? "custom_nodes"}` +
+          `${detection.version ? ` (${detection.version})` : ""}, so falling back to a ` +
+          `direct, verified update (#771).`,
+      );
+    }
+
+    if (!result) {
+      // The Manager path threw. `detection.installed` is proven true (checked
+      // above), so route straight to whichever direct path fits this install
+      // SHAPE — a fast-forward for a checkout, a verified reinstall for a
+      // registry zip. Both prove movement on disk before reporting anything.
+      //
+      // The Manager's RAW text is deliberately NOT quoted into what we report.
+      // It is precisely the sentence we have just disproved ("it is not
+      // installed locally…"), and carrying it into a success message would
+      // reintroduce the contradiction one layer down — the user would read a
+      // verified update that still insists the pack does not exist. The raw
+      // text is logged above and travels in `details` for diagnosis; the
+      // human-facing summary states only what is true.
+      const managerReason =
+        `ComfyUI-Manager could not update the panel (it does not resolve ` +
+        `"${PANEL_REGISTRY_ID}" in its own installed-pack list, though the pack IS ` +
+        `on disk at ${detection.dir ?? "custom_nodes"})`;
+      if (previousRev && detection.dir) {
+        return updateViaGitCheckoutFallback({
+          deps,
+          dir: detection.dir,
+          previousVersion,
+          previousRev,
+          // Synthesize the shape the fallback reports around; there is no real
+          // Manager result because the Manager call failed.
+          result: {
+            mechanism: "manager-http",
+            message: managerReason,
+            details: { manager_error: managerFailure },
+          },
+        });
+      }
+      const swapOps = detection.dir ? resolveSwapOps(deps) : undefined;
+      if (detection.dir && swapOps) {
+        return updateViaRegistryZipReinstall({
+          deps,
+          ops: swapOps,
+          dir: detection.dir,
+          comfyuiPath: comfyPath,
+          previousVersion,
+          // The raw Manager text rides along in `details` for diagnosis; the
+          // message the fallback composes never quotes it.
+          result: {
+            mechanism: "manager-http",
+            message: managerReason,
+            details: { manager_error: managerFailure },
+          },
+          managerReason,
+        });
+      }
+      throw new PanelInstallError(
+        `Panel update did NOT apply: ${managerReason}. The panel IS installed` +
+          `${detection.dir ? ` at ${detection.dir}` : ""}` +
+          `${previousVersion ? ` (version ${previousVersion})` : ""} — whatever the ` +
+          `Manager's error says, that is what install_panel(action='status') reads ` +
+          `off the disk — but no direct update path is available here (it is not a ` +
+          `git checkout, so there is nothing to fast-forward). ` +
+          `${describePanelUpdateRecovery()} (ComfyUI-Manager reported: ${managerFailure})`,
+      );
+    }
+
     // #639 — VERIFY the update actually advanced the pack. Re-read the installed
     // identity FRESH from disk (never trust Manager's queue-drained signal, nor
     // any value captured before the op), then classify honestly.
@@ -1960,6 +2475,35 @@ export async function runPanelActionInner(
         previousVersion,
         previousRev,
         result,
+      });
+    }
+    // #771 — the same dead end, one install shape over. The Manager did nothing
+    // AND there is no `previousRev`, which for a pack that IS installed and is
+    // NOT a dev symlink (both established above) means precisely one thing: a
+    // Comfy Registry ZIP install with no `.git`. The fast-forward above cannot
+    // fire (nothing to fast-forward) and the Manager cannot resolve it, so
+    // without this branch the user is left with a hard version gate and no
+    // working remedy at all — which is the bug. Reinstall from source instead,
+    // under the same verification.
+    const zipSwapOps =
+      verdict.outcome !== "updated" &&
+      !previousRev &&
+      detection.installed &&
+      detection.dir &&
+      post.dir &&
+      samePathCI(detection.dir, post.dir, deps)
+        ? resolveSwapOps(deps)
+        : undefined;
+    if (zipSwapOps && detection.dir) {
+      return updateViaRegistryZipReinstall({
+        deps,
+        ops: zipSwapOps,
+        dir: detection.dir,
+        comfyuiPath: comfyPath,
+        previousVersion,
+        result,
+        managerReason:
+          `ComfyUI-Manager reported the queue drained without moving the pack on disk`,
       });
     }
     return finalizeUpdate(verdict, post, result);

@@ -62,7 +62,11 @@ export function registerInstallPanelTools(server: McpServer): void {
             "panel (nightly). update: pull the latest nightly — when ComfyUI-Manager " +
             "provably no-ops the update (stale legacy 3.x) and the panel is a real " +
             "git checkout, it is fast-forwarded directly via git pull --ff-only and " +
-            "verified on disk instead. reinstall: uninstall " +
+            "verified on disk instead; when the panel is a Comfy Registry ZIP " +
+            "install (no .git, so nothing to fast-forward and unresolvable by the " +
+            "Manager) a fresh clone is verified and swapped in, with the previous " +
+            "copy moved OUT of custom_nodes. Never reports success without re-reading " +
+            "the installed version from disk. reinstall: uninstall " +
             "+ reinstall (nightly). pin: hold the panel at a version (requires " +
             "`version`). unpin: clear the pin so a sync can proceed. " +
             "install/update/reinstall/sync refuse on a dev symlink or an active " +

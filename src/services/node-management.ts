@@ -1942,15 +1942,44 @@ async function assertPackPresentAfterOp(
   base: string,
   status: QueueStatus,
 ): Promise<void> {
-  const installed = await listInstalledNodesAt(base).catch(
-    () => [] as InstalledNode[],
-  );
+  // #771 — SAY WHAT WE ACTUALLY CHECKED. This gate consults ONE source: the
+  // Manager's own installed list. It never looks at the filesystem, so it is in
+  // no position to assert that a pack "is not installed locally" — and for the
+  // sidebar panel installed from the Comfy Registry as a zip, that assertion was
+  // flatly false while install_panel(action='status') was reporting the same
+  // pack at a concrete directory and version. Two tools, two answers, and the
+  // wrong one was the one that sounded certain.
+  //
+  // A LIST THAT COULD NOT BE READ IS NOT AN EMPTY LIST, either. Collapsing the
+  // failure to `[]` made an unreachable Manager indistinguishable from a
+  // genuinely absent pack. Both still REFUSE — the #730 contract is that an
+  // unverifiable op never reports success — but they now refuse with the reason
+  // that is actually true.
+  let installed: InstalledNode[] | undefined;
+  let listError: string | undefined;
+  try {
+    installed = await listInstalledNodesAt(base);
+  } catch (err) {
+    listError = err instanceof Error ? err.message : String(err);
+  }
+  if (!installed) {
+    throw new NodeManagementError(
+      `"${id}" was queued for ${op}, but whether it landed could NOT be verified: ` +
+        `ComfyUI-Manager's installed-pack list could not be read (${listError}). ` +
+        `NOT reporting success on an unverified ${op}. Check that ComfyUI-Manager ` +
+        `is reachable on the host, then retry.`,
+      status,
+    );
+  }
   if (!nodeInstalledMatches(id, installed)) {
     throw new NodeManagementError(
-      `"${id}" was queued for ${op} but is not present afterward — it is not ` +
-        `installed locally and was not found in the ComfyUI-Manager registry, ` +
-        `so there was nothing to ${op}. Check the pack id (list_installed_nodes ` +
-        `shows what is actually installed).`,
+      `"${id}" was queued for ${op} but is not present afterward in ` +
+        `ComfyUI-Manager's installed-pack list, so the ${op} resolved to nothing. NOTE: this ` +
+        `check reads ComfyUI-Manager's registry/installed list ONLY — it does not ` +
+        `inspect custom_nodes, so a pack that IS on disk but unknown to the Manager ` +
+        `(a Comfy Registry zip install, or a manual copy) reaches here too. Check ` +
+        `the pack id with list_installed_nodes, and for the sidebar panel use ` +
+        `install_panel(action='status'), which reads the directory itself.`,
       status,
     );
   }

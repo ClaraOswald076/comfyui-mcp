@@ -275,9 +275,25 @@ export function detectComfyUIInstalls(): string[] {
 
 export interface WorkspaceInfo {
   workspace_path?: string;
-  workspace_source: "env" | "auto-detected" | "default-config" | "none";
+  workspace_source:
+    | "env"
+    | "auto-detected"
+    | "default-config"
+    /**
+     * #769 — derived from the RUNNING ComfyUI's own launch argv, because
+     * nothing was configured. Not persisted: reported so `workspace(get)` stops
+     * contradicting `get_environment`, which has always surfaced this path.
+     */
+    | "live-server"
+    | "none";
   default_workspace?: string;
   api_target: string;
+  /**
+   * #769 — true when `workspace_path` came from the live server rather than
+   * configuration. Persist it with workspace(action='set_default') if you want
+   * it to survive a restart.
+   */
+  transient?: boolean;
 }
 
 export async function getWorkspace(): Promise<WorkspaceInfo> {
@@ -294,8 +310,27 @@ export async function getWorkspace(): Promise<WorkspaceInfo> {
     source = "none";
   }
 
+  const configuredPath = config.comfyuiPath ?? cfg.defaultWorkspace;
+  // #769 — `get_environment` has always reported the live server's own install
+  // root as the local workspace, resolved from the process it is talking to.
+  // Reporting "none" here for the SAME machine was a straight contradiction,
+  // and it sent users hunting for a misconfiguration that did not exist. Only
+  // fills a GAP: a configured workspace still wins and is never overridden.
+  if (!configuredPath) {
+    const liveRoot = await resolveLiveComfyUIBase();
+    if (liveRoot) {
+      return {
+        workspace_path: liveRoot,
+        workspace_source: "live-server",
+        default_workspace: cfg.defaultWorkspace,
+        api_target: apiTarget,
+        transient: true,
+      };
+    }
+  }
+
   return {
-    workspace_path: config.comfyuiPath ?? cfg.defaultWorkspace,
+    workspace_path: configuredPath,
     workspace_source: source,
     default_workspace: cfg.defaultWorkspace,
     api_target: apiTarget,
@@ -359,6 +394,12 @@ export async function listWorkspaces(): Promise<WorkspaceList> {
   const paths = new Set<string>(detected);
   if (config.comfyuiPath) paths.add(config.comfyuiPath);
   if (cfg.defaultWorkspace) paths.add(cfg.defaultWorkspace);
+  // #769 — the install we are ACTUALLY connected to belongs in the list, even
+  // when it sits somewhere `detectComfyUIInstalls`'s well-known-locations scan
+  // never looks. Returning an empty list for a machine with a running ComfyUI
+  // is the same contradiction `workspace(get)` had.
+  const liveRoot = await resolveLiveComfyUIBase();
+  if (liveRoot) paths.add(liveRoot);
 
   const workspaces: WorkspaceListEntry[] = [...paths].map((p) => ({
     path: p,

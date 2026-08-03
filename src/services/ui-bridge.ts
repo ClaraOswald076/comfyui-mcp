@@ -18,6 +18,7 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import { logger } from "../utils/logger.js";
+import { describePanelUpdateRecovery } from "./panel-recovery.js";
 import { compareSemver, detectInstallMode } from "./self-update.js";
 
 export const DEFAULT_BRIDGE_PORT = 9101;
@@ -2090,11 +2091,15 @@ export class UiBridge {
         // while the open browser tab keeps running a CACHED older bundle (a
         // restart reconnects the tab but never re-downloads the extension JS),
         // so the capability the hello advertises lags the version on disk.
-        const recovery =
-          `Run install_panel(action:'update'), restart ComfyUI, then hard-refresh the ` +
-          `ComfyUI browser tab (Ctrl+Shift+R) so it loads the updated bundle — a restart ` +
-          `alone leaves the tab running its cached old panel JS; rebinding cannot add the ` +
-          `missing capability`;
+        //
+        // #774/#784 — the recovery is resolved from THIS session's context, not
+        // hardcoded. This gate is hard by design (a wrong-workflow write cannot
+        // be retracted), which makes it doubly important that the one remedy it
+        // names is a remedy the caller can actually reach: in remote/cloud mode
+        // install_panel is a no-op, and on the embedded `panel_*` surface it is
+        // not even present. describePanelUpdateRecovery names it only where it
+        // works, and hands over concrete host-side commands everywhere else.
+        const recovery = describePanelUpdateRecovery();
         const why = !conn.enforcesWorkflowStamp
           ? `panel tab ${conn.tabId} does not enforce per-command workflow targeting ` +
             `(detected panel ${conn.panelVersion ?? "version unknown"}; this MCP requires panel ` +

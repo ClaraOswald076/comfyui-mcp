@@ -19,7 +19,8 @@
 // This module deliberately imports NOTHING from panel-installer or
 // node-management: panel-installer already imports node-management's mutations,
 // so a guard that reached back into either would create an import cycle. It
-// depends only on the pin store.
+// depends only on the pin store (and panel-recovery, which is itself a leaf over
+// config + panel-workspace and reaches back into neither).
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
@@ -35,6 +36,7 @@ import {
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { logger } from "../utils/logger.js";
+import { describePanelManagementRedirect } from "./panel-recovery.js";
 import {
   describePanelPin,
   getPanelPinState,
@@ -182,6 +184,13 @@ export function assertPanelPinAllows(action: string, id: string): void {
  * checked, they refuse and name the tool that does verify.
  *
  * The pin is reported FIRST when set, because that is the more specific reason.
+ *
+ * #774/#784 — the REDIRECT is resolved from the session context rather than
+ * hardcoded to "use install_panel". Pairing this refusal with a pointer at a
+ * tool that is a no-op here (remote/cloud) or absent here (the embedded
+ * `panel_*` surface) is what closed the loop into a deadlock: every door the
+ * user tried named another door that was also shut. Refusing remains correct —
+ * this path genuinely cannot verify the move — but the way out must be real.
  */
 export function assertPanelNotTargetedUnverifiable(
   toolName: string,
@@ -196,9 +205,7 @@ export function assertPanelNotTargetedUnverifiable(
       `path reports success as soon as the ComfyUI-Manager queue drains, which a ` +
       `stale Manager does WITHOUT doing any work (#639) and which cannot see a ` +
       `".bak" shadow copy shadowing the real panel (#641) — so it could tell you the ` +
-      `panel updated when it did not. Use install_panel instead: ` +
-      `install_panel(action='sync') brings the panel in line with this orchestrator ` +
-      `and re-reads the installed version from disk, and action='status' reports it.`,
+      `panel updated when it did not. ${describePanelManagementRedirect()}`,
   );
 }
 
