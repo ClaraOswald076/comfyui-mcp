@@ -241,24 +241,27 @@ describe("withPanelMutationLock — a FILE lock, so it holds across processes", 
     expect(order).toEqual(["holder:start", "nested", "holder:end", "outsider"]);
   });
 
-  it("times out rather than proceeding when another process holds the lock", async () => {
-    // Simulate a live lock owned by someone else: a fresh lock file we never release.
+  it("does NOT reclaim a fresh lock even when its recorded pid is dead", async () => {
+    // Age is a mandatory part of the proof. A just-created lock can still be
+    // in the small window before its writer has committed its pid record.
     writeFileSync(panelLockPath(), JSON.stringify({ pid: 999999 }));
     await expect(
       withPanelMutationLock(async () => "should not run", { timeoutMs: 300 }),
     ).rejects.toThrow(/Timed out .* waiting for the panel operation lock/);
+    expect(existsSync(panelLockPath())).toBe(true);
   });
 
-  it("fails closed on a stale lock rather than racing a fresh replacement", async () => {
+  it("reclaims a stale lock whose owner is demonstrably dead", async () => {
     const path = panelLockPath();
-    // A pid that is old AND dead.
+    // The age and dead-pid gates are both required before reclaim.
     writeFileSync(path, JSON.stringify({ pid: 0x7fffffff }));
     const old = new Date(Date.now() - 60 * 60_000);
     const { utimesSync } = await import("node:fs");
     utimesSync(path, old, old);
-    await expect(
-      withPanelMutationLock(async () => "recovered", { timeoutMs: 300 }),
-    ).rejects.toThrow(/never auto-reclaimed/i);
+    await expect(withPanelMutationLock(async () => "recovered", { timeoutMs: 300 })).resolves.toBe(
+      "recovered",
+    );
+    expect(existsSync(path)).toBe(false);
   });
 
   it("does NOT reclaim an old lock whose owner is still ALIVE", async () => {
@@ -274,6 +277,7 @@ describe("withPanelMutationLock — a FILE lock, so it holds across processes", 
     await expect(
       withPanelMutationLock(async () => "should not run", { timeoutMs: 300 }),
     ).rejects.toThrow(/Timed out/);
+    expect(existsSync(path)).toBe(true);
   });
 
   it("fails closed on an old unreadable lock", async () => {
@@ -284,7 +288,53 @@ describe("withPanelMutationLock — a FILE lock, so it holds across processes", 
     utimesSync(path, old, old);
     await expect(
       withPanelMutationLock(async () => "recovered", { timeoutMs: 300 }),
-    ).rejects.toThrow(/never auto-reclaimed/i);
+    ).rejects.toThrow(/Timed out/);
+    expect(existsSync(path)).toBe(true);
+  });
+
+  it("fails closed on an old lock without a valid pid", async () => {
+    const path = panelLockPath();
+    writeFileSync(path, JSON.stringify({ pid: "not-a-pid" }));
+    const old = new Date(Date.now() - 60 * 60_000);
+    const { utimesSync } = await import("node:fs");
+    utimesSync(path, old, old);
+    await expect(
+      withPanelMutationLock(async () => "should not run", { timeoutMs: 300 }),
+    ).rejects.toThrow(/Timed out/);
+    expect(existsSync(path)).toBe(true);
+  });
+
+  it("keeps a concurrent contender behind the action that reclaimed the stale lock", async () => {
+    // The successor must acquire through the same exclusive-create loop, not
+    // run alongside the action that just reclaimed the abandoned holder.
+    const path = panelLockPath();
+    writeFileSync(path, JSON.stringify({ pid: 0x7fffffff }));
+    const old = new Date(Date.now() - 60 * 60_000);
+    const { utimesSync } = await import("node:fs");
+    utimesSync(path, old, old);
+
+    const order: string[] = [];
+    let releaseFirst: (() => void) | undefined;
+    const firstMayFinish = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const first = withPanelMutationLock(async () => {
+      order.push("reclaimed holder started");
+      await firstMayFinish;
+      order.push("reclaimed holder finished");
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const second = withPanelMutationLock(async () => order.push("contender ran"));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(order).toEqual(["reclaimed holder started"]);
+
+    releaseFirst?.();
+    await Promise.all([first, second]);
+    expect(order).toEqual([
+      "reclaimed holder started",
+      "reclaimed holder finished",
+      "contender ran",
+    ]);
   });
 
   it("resolves with the action's OWN result, and only after its side effects finished", async () => {

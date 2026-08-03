@@ -290,8 +290,14 @@ function lockIsStale(path: string): boolean {
     try {
       pid = (JSON.parse(readFileSync(path, "utf-8")) as { pid?: unknown })?.pid;
     } catch {
-      // Unreadable/corrupt content on an already-old lock: nobody can claim it.
-      return true;
+      // We reclaim only a lock whose owner is demonstrably dead. Corrupt
+      // content cannot establish that proof, so preserve it for recovery.
+      return false;
+    }
+    if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
+      // Missing, fractional, or otherwise malformed ownership is not a dead
+      // process identity. Failing closed keeps an ambiguous live lock safe.
+      return false;
     }
     return !pidAlive(pid);
   } catch {
@@ -354,18 +360,20 @@ async function acquireFileLock(timeoutMs: number): Promise<() => void> {
         );
       }
       if (lockIsStale(path)) {
-        // Never rename/delete after a stale observation: another process can
-        // replace this path with a fresh lock between the check and reclaim.
-        // Node lacks an atomic compare-and-rename, so failing closed is the
-        // only way to avoid stealing that new holder.
+        // Only a demonstrably abandoned lock gets here: old locks with a live
+        // owner (and all fresh locks) still wait. Claim it by renaming first,
+        // rather than deleting the contested name: exactly one reclaimer can
+        // win, and followers merely retry the exclusive create.
+        reclaimStaleLock(path);
+        continue;
       }
       if (Date.now() >= deadline) {
         throw new Error(
           `Timed out after ${timeoutMs}ms waiting for the panel operation lock ` +
             `(${path}). Another panel install/update/pin is in progress — possibly in ` +
-            `another orchestrator process. The lock is never auto-reclaimed because that could ` +
-            `steal a fresh holder after a stale observation. Retry shortly or recover a proven ` +
-            `abandoned lock explicitly.`,
+            `another orchestrator process. Fresh locks, malformed locks, and locks owned by a ` +
+            `live process are never auto-reclaimed; a proven abandoned lock is reclaimed ` +
+            `automatically. Retry shortly.`,
         );
       }
       await sleep(POLL_MS);
