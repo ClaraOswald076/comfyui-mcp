@@ -227,6 +227,12 @@ export interface ClaudeBackendDeps {
   pluginPath?: string;
 }
 
+/** Bound on unresolved turn traces (wedged turns whose result never arrives).
+ *  Overflow evicts the oldest trace — and POISONS classification rather than
+ *  silently realigning it: the pop that crosses the evicted gap (and any
+ *  traceless result) fails closed as unverifiable, never ok:true (#745 r3). */
+const MAX_UNRESOLVED_TURNS = 16;
+
 /**
  * The Claude Agent SDK adapter. One instance per PanelAgent; it holds the live
  * `Query` for the current session and re-creates it on each `run()`.
@@ -251,7 +257,14 @@ export class ClaudeBackend implements AgentBackend {
   // interruptRequested: an interrupted turn's empty result is the interrupt
   // landing, not an empty-turn failure — and only the turn that was in flight
   // when interrupt() landed may be marked.
+  //
+  // FAIL CLOSED (#745 r3 review): classification must never produce ok:true
+  // without positive evidence. A normal successful turn ALWAYS has a trace, so
+  // a result whose trace is missing (stray from a dead session, or pushed off
+  // by the MAX_UNRESOLVED_TURNS bound) or whose id crosses an evicted-turn gap
+  // is UNVERIFIABLE → ok:false, never a forwarded success.
   private turnSeq = 0;
+  private lastResultTurnId = 0;
   private turns: Array<{
     id: number;
     hasContent: boolean;
@@ -379,11 +392,16 @@ export class ClaudeBackend implements AgentBackend {
     const query = await loadQuery();
     const self = this;
     // A (re)started session can never produce results for turns submitted to a
-    // PREVIOUS session — drop those dead traces. Done here, at run() entry
-    // (BEFORE the new query exists), rather than on system/init: the SDK's
-    // prompt drain legitimately pulls the first batch before init is processed,
-    // and an init-time clear would unmark that genuinely in-flight turn (#745).
+    // PREVIOUS session — drop those dead traces, advancing the result sequence
+    // past them so the new session's first result isn't falsely gap-poisoned
+    // (their stray late results then arrive TRACELESS and fail closed instead).
+    // Done here, at run() entry (BEFORE the new query exists), rather than on
+    // system/init: the SDK's prompt drain legitimately pulls the first batch
+    // before init is processed, and an init-time clear would unmark that
+    // genuinely in-flight turn (#745).
+    const deadThrough = this.turns[this.turns.length - 1]?.id;
     this.turns.length = 0;
+    if (deadThrough !== undefined) this.lastResultTurnId = deadThrough;
     // Wrap the neutral channel: shape each turn into the SDK's native form right
     // before it's read, so PanelAgent never deals in SDKUserMessage.
     async function* prompt(): AsyncGenerator<SDKUserMessage> {
@@ -392,12 +410,16 @@ export class ClaudeBackend implements AgentBackend {
         // The batch is handed to the SDK: stamp the turn's identity. Its trace
         // accrues this turn's content/block/interrupt flags until its terminal
         // result pops it (FIFO) for classification. Bounded: wedged turns whose
-        // result never arrives would otherwise grow the queue without limit —
-        // past the cap the oldest (long-superseded) trace is dropped.
+        // result never arrives would otherwise grow the queue without limit.
+        // Eviction is recorded via the id sequence — the pop that crosses the
+        // evicted gap fails closed as unverifiable (#745 r3), it does NOT
+        // silently realign classification onto the wrong turn.
         self.turns.push({ id: ++self.turnSeq, hasContent: false, blockReason: null, interrupted: false });
-        if (self.turns.length > 16) {
-          self.turns.shift();
-          logger.warn("[claude-backend] over 16 unresolved turns — dropped the oldest turn trace (#740)");
+        if (self.turns.length > MAX_UNRESOLVED_TURNS) {
+          const evicted = self.turns.shift();
+          logger.warn(
+            `[claude-backend] over ${MAX_UNRESOLVED_TURNS} unresolved turns — evicted turn ${evicted?.id}'s trace; its result will fail closed as unverifiable (#740)`,
+          );
         }
         yield msg;
       }
@@ -609,18 +631,37 @@ export class ClaudeBackend implements AgentBackend {
         // "success" even for a turn a blocking hook prevented from producing ANY
         // output, and for a turn that simply ended with no assistant message —
         // the panel must never present either as a silent empty success.
+        //
+        // FAIL CLOSED (#745 r3): ok:true requires positive evidence. A normal
+        // successful turn ALWAYS has a trace (stamped at submission), so a
+        // result that is TRACELESS (stray from a dead session, or pushed off by
+        // the MAX_UNRESOLVED_TURNS bound) or whose id crosses an EVICTED-turn
+        // gap is anomalous by construction — unverifiable, never a forwarded
+        // success. (The panel consumes every result as completion/done, so a
+        // pass-through would NOT be inert.)
         const trace = this.turns.shift() ?? null;
+        let unverifiable: string | null = null;
         if (!trace) {
-          // A result with no matching submission (e.g. a stray from a session
-          // that was restarted at run() entry): provenance unknown — pass it
-          // through by subtype rather than fabricating either outcome.
-          logger.warn("[claude-backend] result with no matching submitted turn — classifying by subtype only (#740)");
+          unverifiable = "The result could not be matched to any submitted turn";
+          logger.warn(`[claude-backend] ${unverifiable} — unverifiable, failing closed (#740)`);
+        } else if (trace.id !== this.lastResultTurnId + 1) {
+          unverifiable = "Turn bookkeeping overflowed, so the result cannot be matched to its turn";
+          logger.warn(
+            `[claude-backend] result crosses an evicted-turn gap (popped turn ${trace.id}, expected ${this.lastResultTurnId + 1}) — unverifiable, failing closed (#740)`,
+          );
         }
+        if (trace) this.lastResultTurnId = trace.id;
         let ok = message.subtype === "success";
-        if (ok && trace?.blockReason != null) {
+        if (ok && unverifiable !== null) {
+          ok = false;
+          yield {
+            type: "error",
+            message: `${unverifiable} — reporting the turn as unverifiable rather than a success.`,
+          };
+        } else if (ok && trace !== null && trace.blockReason !== null) {
           // The blocking informational already yielded the visible error above.
           ok = false;
-        } else if (ok && trace && !trace.hasContent && !trace.interrupted) {
+        } else if (ok && trace !== null && !trace.hasContent && !trace.interrupted) {
           ok = false;
           logger.warn("[claude-backend] result/success with no assistant content — reporting a failed turn (#740)");
           yield {

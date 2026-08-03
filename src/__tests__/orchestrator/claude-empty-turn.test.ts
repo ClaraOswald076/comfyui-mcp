@@ -163,16 +163,33 @@ describe("Claude backend #740 — blocking SDK informational messages", () => {
   });
 
   it("a blocking turn does not leak its failure into the NEXT turn", async () => {
-    const events = await runScript([
-      INIT,
-      informational({ prevent_continuation: true }),
-      RESULT_SUCCESS,
-      assistantMsg("recovered"),
-      RESULT_SUCCESS,
-    ]);
+    // Two REAL turns (turn identity: each needs its own submission + trace).
+    let releaseTurnB!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseTurnB = resolve;
+    });
+    async function* twoTurns() {
+      yield { text: "turn A" };
+      await gate;
+      yield { text: "turn B" };
+    }
+    const { events, done } = await startBackend(twoTurns());
+    hoisted.queue.push(INIT);
+    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    // Turn A is hook-blocked and fails…
+    hoisted.queue.push(informational({ prevent_continuation: true }));
+    hoisted.queue.push(RESULT_SUCCESS);
+    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(1));
+    expect(resultsOf(events)[0]).toMatchObject({ ok: false });
+    // …and turn B then recovers and classifies cleanly on its own flags.
+    releaseTurnB();
+    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(2));
+    hoisted.queue.push(assistantMsg("recovered"));
+    hoisted.queue.push(RESULT_SUCCESS);
+    hoisted.queue.end();
+    await done;
     const results = resultsOf(events);
     expect(results).toHaveLength(2);
-    expect(results[0]).toMatchObject({ ok: false });
     expect(results[1]).toMatchObject({ ok: true });
   });
 });
@@ -355,7 +372,7 @@ describe("Claude backend — interruptPending is strictly turn-scoped (#745 revi
     expect(errors[0].message).toContain("without producing a reply");
   });
 
-  it("an interrupt's blessing does not survive a session restart, and a stray result from the dead session is inert", async () => {
+  it("an interrupt's blessing does not survive a session restart, and a stray result from the dead session fails closed", async () => {
     const { ClaudeBackend } = await import("../../orchestrator/claude-backend.js");
     const backend = new ClaudeBackend({ mcpServers: {}, systemAppend: "" });
     // Session 1: turn A goes in flight and is interrupted; the session then
@@ -386,14 +403,57 @@ describe("Claude backend — interruptPending is strictly turn-scoped (#745 revi
     expect(resultsOf(events)[0]).toMatchObject({ ok: false });
     expect(errorsOf(events)).toHaveLength(1);
     // A STRAY late result from the dead session (no matching submitted turn)
-    // classifies by its subtype only — it must not fail, fail again, or consume
-    // anything belonging to session 2.
+    // must FAIL CLOSED — unverifiable, ok:false — never forwarded as a success
+    // that completes the current turn (#745 r3 review).
     hoisted.queue.push(RESULT_SUCCESS);
     hoisted.queue.end();
     await done2;
     const results = resultsOf(events);
     expect(results).toHaveLength(2);
-    expect(results[1]).toMatchObject({ ok: true });
-    expect(errorsOf(events)).toHaveLength(1); // still exactly the one from turn B
+    expect(results[1]).toMatchObject({ ok: false });
+    const errors = errorsOf(events);
+    expect(errors).toHaveLength(2); // turn B's synthetic error + the stray's unverifiable one
+    expect(errors[1].message).toMatch(/unverifiable/i);
+  });
+
+  it("a result/success with NO matching turn fails closed (unverifiable) instead of forwarding ok:true", async () => {
+    const { events, done } = await startBackend(channel());
+    hoisted.queue.push(INIT);
+    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    // One submission, TWO results: the second has no trace. A normal successful
+    // turn ALWAYS has a trace (stamped at submission), so traceless is
+    // anomalous by construction — it must not fabricate a success (#745 r3).
+    hoisted.queue.push(RESULT_SUCCESS);
+    hoisted.queue.push(RESULT_SUCCESS);
+    hoisted.queue.end();
+    await done;
+    const results = resultsOf(events);
+    expect(results).toHaveLength(2);
+    expect(results[0]).toMatchObject({ ok: false }); // genuinely empty turn
+    expect(results[1]).toMatchObject({ ok: false }); // traceless → unverifiable
+    const errors = errorsOf(events);
+    expect(errors).toHaveLength(2);
+    expect(errors[0].message).toContain("without producing a reply");
+    expect(errors[1].message).toMatch(/unverifiable/i);
+  });
+
+  it("overflow eviction poisons classification — NO result across an evicted-turn gap is fabricated as ok:true", async () => {
+    async function* seventeenTurns() {
+      for (let i = 1; i <= 17; i++) yield { text: `turn ${i}` };
+    }
+    const { events, done } = await startBackend(seventeenTurns());
+    hoisted.queue.push(INIT);
+    // The 17th submission overflows the 16-trace bound and evicts trace #1.
+    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(17));
+    // Every turn's result arrives late. Turn 1's result crosses the evicted
+    // gap (poisoned → unverifiable); turn 17's own result ends up traceless
+    // (fail closed). NOTHING may be forwarded as ok:true.
+    for (let i = 0; i < 17; i++) hoisted.queue.push(RESULT_SUCCESS);
+    hoisted.queue.end();
+    await done;
+    const results = resultsOf(events);
+    expect(results).toHaveLength(17);
+    expect(results.some((r) => r.type === "result" && r.ok === true)).toBe(false);
+    expect(errorsOf(events).some((e) => /unverifiable/i.test(e.message))).toBe(true);
   });
 });
