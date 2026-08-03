@@ -258,13 +258,18 @@ export class ClaudeBackend implements AgentBackend {
   // landing, not an empty-turn failure — and only the turn that was in flight
   // when interrupt() landed may be marked.
   //
-  // FAIL CLOSED (#745 r3 review): classification must never produce ok:true
+  // FAIL CLOSED (#745 r3/r4 review): classification must never produce ok:true
   // without positive evidence. A normal successful turn ALWAYS has a trace, so
   // a result whose trace is missing (stray from a dead session, or pushed off
   // by the MAX_UNRESOLVED_TURNS bound) or whose id crosses an evicted-turn gap
-  // is UNVERIFIABLE → ok:false, never a forwarded success.
+  // is UNVERIFIABLE → ok:false, never a forwarded success. The gap case is
+  // additionally STICKY: once a pop crosses an evicted-turn gap the FIFO
+  // alignment is unrecoverable (content accrued to a mismatched trace is not
+  // proof of ITS turn's success), so `classificationPoisoned` fails every later
+  // result in the session closed — cleared only by a genuine run() restart.
   private turnSeq = 0;
   private lastResultTurnId = 0;
+  private classificationPoisoned = false;
   private turns: Array<{
     id: number;
     hasContent: boolean;
@@ -395,13 +400,15 @@ export class ClaudeBackend implements AgentBackend {
     // PREVIOUS session — drop those dead traces, advancing the result sequence
     // past them so the new session's first result isn't falsely gap-poisoned
     // (their stray late results then arrive TRACELESS and fail closed instead).
-    // Done here, at run() entry (BEFORE the new query exists), rather than on
-    // system/init: the SDK's prompt drain legitimately pulls the first batch
-    // before init is processed, and an init-time clear would unmark that
-    // genuinely in-flight turn (#745).
+    // This genuine restart boundary is also the ONLY reset of the sticky
+    // classification poison (#745 r4). Done here, at run() entry (BEFORE the
+    // new query exists), rather than on system/init: the SDK's prompt drain
+    // legitimately pulls the first batch before init is processed, and an
+    // init-time clear would unmark that genuinely in-flight turn (#745).
     const deadThrough = this.turns[this.turns.length - 1]?.id;
     this.turns.length = 0;
     if (deadThrough !== undefined) this.lastResultTurnId = deadThrough;
+    this.classificationPoisoned = false;
     // Wrap the neutral channel: shape each turn into the SDK's native form right
     // before it's read, so PanelAgent never deals in SDKUserMessage.
     async function* prompt(): AsyncGenerator<SDKUserMessage> {
@@ -632,25 +639,35 @@ export class ClaudeBackend implements AgentBackend {
         // output, and for a turn that simply ended with no assistant message —
         // the panel must never present either as a silent empty success.
         //
-        // FAIL CLOSED (#745 r3): ok:true requires positive evidence. A normal
+        // FAIL CLOSED (#745 r3/r4): ok:true requires positive evidence. A normal
         // successful turn ALWAYS has a trace (stamped at submission), so a
         // result that is TRACELESS (stray from a dead session, or pushed off by
         // the MAX_UNRESOLVED_TURNS bound) or whose id crosses an EVICTED-turn
         // gap is anomalous by construction — unverifiable, never a forwarded
         // success. (The panel consumes every result as completion/done, so a
-        // pass-through would NOT be inert.)
+        // pass-through would NOT be inert.) The gap case is STICKY: alignment
+        // is unrecoverable once crossed, so the poison is terminal for the
+        // session — content evidence must not rescue it (it accrued to a
+        // mismatched trace, which is not proof of ITS turn's success).
         const trace = this.turns.shift() ?? null;
         let unverifiable: string | null = null;
-        if (!trace) {
+        if (this.classificationPoisoned) {
+          unverifiable = "Turn bookkeeping was poisoned by an earlier overflow — no result in this session can be verified";
+        } else if (!trace) {
           unverifiable = "The result could not be matched to any submitted turn";
           logger.warn(`[claude-backend] ${unverifiable} — unverifiable, failing closed (#740)`);
         } else if (trace.id !== this.lastResultTurnId + 1) {
+          // The pop crossed an evicted-turn gap → poison the session (do NOT
+          // advance lastResultTurnId to the wrong trace's id — alignment is
+          // unrecoverable, so resyncing would just hide the next mismatch).
+          this.classificationPoisoned = true;
           unverifiable = "Turn bookkeeping overflowed, so the result cannot be matched to its turn";
           logger.warn(
-            `[claude-backend] result crosses an evicted-turn gap (popped turn ${trace.id}, expected ${this.lastResultTurnId + 1}) — unverifiable, failing closed (#740)`,
+            `[claude-backend] result crosses an evicted-turn gap (popped turn ${trace.id}, expected ${this.lastResultTurnId + 1}) — unverifiable; classification poisoned for the rest of the session (#740)`,
           );
+        } else {
+          this.lastResultTurnId = trace.id;
         }
-        if (trace) this.lastResultTurnId = trace.id;
         let ok = message.subtype === "success";
         if (ok && unverifiable !== null) {
           ok = false;

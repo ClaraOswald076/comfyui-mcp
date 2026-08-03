@@ -456,4 +456,70 @@ describe("Claude backend — interruptPending is strictly turn-scoped (#745 revi
     expect(results.some((r) => r.type === "result" && r.ok === true)).toBe(false);
     expect(errorsOf(events).some((e) => /unverifiable/i.test(e.message))).toBe(true);
   });
+
+  it("an evicted-turn gap poisons the SESSION — later results never recover ok:true, content included", async () => {
+    async function* seventeenTurns() {
+      for (let i = 1; i <= 17; i++) yield { text: `turn ${i}` };
+    }
+    const { events, done } = await startBackend(seventeenTurns());
+    hoisted.queue.push(INIT);
+    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(17)); // 17th submission evicts trace #1
+    // Turn 1's late result crosses the evicted gap → FIFO alignment is
+    // UNRECOVERABLE → the session is poisoned terminally.
+    hoisted.queue.push(RESULT_SUCCESS);
+    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(1));
+    expect(resultsOf(events)[0]).toMatchObject({ ok: false });
+    // Content streaming in afterward accrues to a MISMATCHED trace — it is not
+    // proof of its own turn's success and must NOT rescue classification:
+    // every later result in this session fails closed too (#745 r4).
+    hoisted.queue.push(assistantMsg("late content from a mismatched turn"));
+    for (let i = 0; i < 16; i++) hoisted.queue.push(RESULT_SUCCESS);
+    hoisted.queue.end();
+    await done;
+    const results = resultsOf(events);
+    expect(results).toHaveLength(17);
+    expect(results.some((r) => r.type === "result" && r.ok === true)).toBe(false);
+    const errors = errorsOf(events);
+    expect(errors).toHaveLength(17);
+    expect(errors.every((e) => /unverifiable/i.test(e.message))).toBe(true);
+  });
+
+  it("a genuine run() restart clears the poison — the first new turn classifies normally", async () => {
+    const { ClaudeBackend } = await import("../../orchestrator/claude-backend.js");
+    const backend = new ClaudeBackend({ mcpServers: {}, systemAppend: "" });
+    // Session 1: overflow the trace bound and trip the gap → poisoned.
+    async function* seventeenTurns() {
+      for (let i = 1; i <= 17; i++) yield { text: `turn ${i}` };
+    }
+    const events1: AgentEvent[] = [];
+    const done1 = (async () => {
+      for await (const ev of backend.run({ channel: seventeenTurns() as never })) events1.push(ev);
+    })();
+    hoisted.queue.push(INIT);
+    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(17));
+    hoisted.queue.push(RESULT_SUCCESS); // crosses the evicted gap → poison
+    hoisted.queue.end();
+    await done1;
+    expect(resultsOf(events1)).toHaveLength(1);
+    expect(resultsOf(events1)[0]).toMatchObject({ ok: false });
+    // Session 2 (the self-restart loop re-calls run() on the same backend): the
+    // restart boundary is the ONLY poison reset — a normal successful turn must
+    // classify ok:true again.
+    hoisted.queue.reset();
+    hoisted.promptsSeen = 0;
+    const events: AgentEvent[] = [];
+    const done2 = (async () => {
+      for await (const ev of backend.run({ channel: channel() as never })) events.push(ev);
+    })();
+    hoisted.queue.push(INIT);
+    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    hoisted.queue.push(assistantMsg("hello again"));
+    hoisted.queue.push(RESULT_SUCCESS);
+    hoisted.queue.end();
+    await done2;
+    const results = resultsOf(events);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ ok: true });
+    expect(errorsOf(events)).toHaveLength(0);
+  });
 });
