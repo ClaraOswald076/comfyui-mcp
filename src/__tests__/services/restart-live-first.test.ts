@@ -218,6 +218,11 @@ describe("restart_comfyui — live-first script resolution (#476, #426)", () => 
     // It did NOT take the refuse-safe branch — it actually restarted.
     expect(result.message).not.toMatch(/refusing to restart/i);
     expect(result.stopped).toBe(true);
+    // Ownership is asserted explicitly: `started` is derived from it (#776), so
+    // pinning only `started` would report "false" without saying which evidence
+    // produced it. The port is free after the kill in this fixture, so the port
+    // owner is unmappable and ownership is honestly unconfirmed — never "not-ours".
+    expect(result.listener_ownership).toBe("unconfirmed");
     expect(result.started).toBe(true);
     expect(result.ready).toBe(true);
 
@@ -481,6 +486,8 @@ describe("restart_comfyui — explicit absolute spawn cwd, truthful refusal (#71
 
     expect(result.message).not.toMatch(/refusing to restart/i);
     expect(result.stopped).toBe(true);
+    // See the note above: pin the evidence, not just the flag derived from it.
+    expect(result.listener_ownership).toBe("unconfirmed");
     expect(result.started).toBe(true);
     expect(mockSpawn).toHaveBeenCalledTimes(1);
     const [exe, args, opts] = mockSpawn.mock.calls[0];
