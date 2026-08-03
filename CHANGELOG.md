@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+### MCP
+
+#### Fixed
+- `panel_add_node` documents the frontend-only virtual types (Note/MarkdownNote/Reroute/PrimitiveNode) as the supported way to annotate a workflow, so agents know annotation is possible at all (#741)
+
 ## [0.49.1] - 2026-08-02
 
 ### MCP
