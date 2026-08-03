@@ -50,6 +50,18 @@ Carried over from the 0.49.0 slices, plus the owner's additions for 0.50.0:
    re-vendors the regenerated vocabulary, `registry-surface.test.ts` pins it
    all.
 
+8. **Every slice ships the queue-slice test contract** (the pattern
+   `src/__tests__/tools/queue-management.test.ts` established in #699, now
+   required rather than exemplary): (a) a schema assertion that `action` is the
+   *only* schema-required field; (b) at least one dispatch test per action,
+   proving it reaches the same service call the retired tool made; (c) for every
+   per-action required field, a test that the missing-field error **names the
+   field** and calls nothing; (d) an unknown-action test. This is not optional
+   polish: the registration layer these slices rewrite is the thinnest-tested
+   layer in the repo (measured ~15% of handlers exercised pre-0.49), and the
+   consolidation moves handlers *mostly unchanged* — dispatch and
+   per-action-presence is exactly where the new bugs can live.
+
 ## The target surface: 32 tools
 
 ### Already shipped in 0.49.0 (8 — frozen, do not re-open)
@@ -182,6 +194,33 @@ registration order). Removals shift the tail of `tools/list` up — unavoidable
 and already accepted in 0.49.0 — but **surviving names never change their
 relative order**, which `registry-surface.test.ts` continues to pin.
 
+### Slice recipe (the rule-7/rule-8 checklist, in commit order)
+
+1. Consolidated tool: flat `z.enum` actions, per-action presence guards in the
+   handler (absence, not falsiness), each action calling the identical service
+   function its retired predecessor called.
+2. `TOOL_NAMES`: same-slot replacement for the survivor; delete the folded
+   names; `MAX_TOOLS` set to the new `TOOL_NAMES.length` (equality is asserted,
+   so a stale value fails).
+3. `DEAD_NAMES`: one entry per retired name,
+   `replacement: '<tool> (action:"…")'`.
+4. `docs/design/tool-surface.txt`: **append** any new tool name (`runpod`,
+   `node_pack`); never delete a line; bump `BASELINE_SHA256` (on mismatch the
+   gate prints the expected digest).
+5. Tests per rule 8.
+6. `scripts/gen-tool-docs.ts` CATEGORIES updated; `npm run docs:gen` until it
+   is a no-op (unmapped tools and orphaned pages are both fatal).
+7. `npm run vocab:export` (the artifact and its `vocabularyHash` change);
+   commit the regenerated `docs/design/tool-vocabulary.json`.
+8. Panel repo: re-vendor `vendor/tool-vocabulary.json` and run its gate — the
+   new dead names surface any panel-side prose that still recommends them.
+9. Prose sweep until `npm run check:vocabulary` is green over the whole tree —
+   the gate output *is* the sweep worklist.
+10. Full local gate run before the PR: lint, build, test, `check:vocabulary`,
+    `vocab:export -- --check`, `asset-counts --check`, docs no-op,
+    `smoke-install`. The release workflow enforces the same set, so a red gate
+    here is a red publish there.
+
 ## The flip: full becomes default, `--compact` becomes the opt-in
 
 **When:** the release that lands slice 16 (0.50.0), as its own final PR — not
@@ -211,8 +250,52 @@ directive, not before it.
   was built for (#97); keeping it costs 3 slots. The only visible change:
   full-mode `tools/list` shows 35 entries (32 direct + 3 facade), and
   `COMFYUI_MCP_NO_FACADE=1` remains the opt-out for purists.
+- **The flip PR must add an unknown-tool interceptor, or rule 6 silently
+  breaks at the worst possible moment.** Probed against 0.49.3 with an
+  in-memory client: a retired name called through the facade returns the #659
+  redirect ("removed in 0.49.0. Call batch (action:"submit") instead."), but the
+  same name called *directly* via `tools/call` returns the SDK's bare
+  `MCP error -32602: Tool <name> not found`. Today that asymmetry is invisible
+  because compact is the default and everything routes through `call_tool`.
+  After the flip, **direct is the default path** — so every stale skill,
+  script, and cached binding would get the bare 404, in the very release that
+  retires the highest-traffic names. The flip PR therefore intercepts unknown
+  `tools/call` names and answers with `retiredToolMessage(name)` before
+  falling through to method-not-found. A regression test pins both paths.
+- One accounting note, stated so nobody rediscovers it as a hole: the three
+  facade names live in no ledger or baseline — `TOOL_NAMES`,
+  `tool-surface.txt`, and `registry-surface.test.ts` all pin the *direct*
+  surface, and the facade rides on top unpinned. That is deliberate (the facade
+  is transport furniture, not vocabulary), but it means the served default
+  surface contains 3 tools no vocabulary gate sees. The flip PR's regression
+  test asserts the served count is exactly `MAX_TOOLS + 3`.
 - Docs ride the flip PR: README's "151 MCP tools" badge, the tool-mode docs
   page, and every "compact is the default" sentence invert in the same diff.
+
+## Release & rollback
+
+The reason slices can ship continuously while the flip cannot: **retirement is
+soft under the compact default.** While compact remains the default, a retired
+name still "resolves" — `call_tool` answers with the #659 redirect and the
+model self-corrects in one turn. So slices 7–15 ship as ordinary releases on
+`latest`, exactly as the 0.49.0 slices did, each independently green and each
+independently revertable-by-fix-forward.
+
+The flip is the one hard break, and it gets the prerelease channel built for
+exactly this in #447:
+
+- **Slice 16 + flip release as `0.50.0-rc.N` on the `next` dist-tag** first
+  (`npx comfyui-mcp@next` to soak). `latest` stays on the last pre-flip
+  release, so the auto-updater keeps existing users on the soft-retirement
+  world until promotion.
+- **Promotion is deliberate and effectively irreversible**:
+  `npm dist-tag add comfyui-mcp@0.50.0 latest`. Auto-update only moves forward
+  (`isNewer` gates at self-update.ts), so moving `latest` back does not recover
+  updated users — the release notes say so, and the escape hatch is version
+  pinning (`npx comfyui-mcp@0.49.x`).
+- **The last pre-flip line stays alive** as the fallback lane: a `release/0.49.x`
+  branch off the final pre-flip tag, so a critical fix can ship to the
+  compact-default world without dragging the flip along.
 
 ## What must NOT consolidate, and why
 
@@ -281,6 +364,19 @@ directive, not before it.
    have zero headroom: any future action forces a split or a cap exception.
    Acceptable — the cap exists to be enforced at review time, and these six are
    the natural ceiling of their domains.
+
+### Disposition
+
+The base plan stands as written: all seven items above ship as specified, and
+each fallback remains exercisable at its own slice's PR review without
+re-planning — the slice order was chosen so every controversial fold lands
+late, after the redirect contract has proven itself on seven cheaper families.
+One item gets an explicit checkpoint rather than a default: **`clear_vram`
+(item 2) is re-evaluated at slice 13 review** against redirect telemetry from
+slices 7–12 — mid-OOM, the redirect costs one extra model turn, and whether
+that is acceptable is an empirical question about how reliably models recover
+from the redirect in a single step, not a taste question. If they don't, take
+the fallback and ship 33.
 
 ## Appendix: traffic measurement
 
