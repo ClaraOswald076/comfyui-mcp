@@ -6,6 +6,8 @@ icon: "sliders"
 
 <Info>7 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
 
+<Tip>**You don't type these calls.** Ask your agent for what you want in ordinary English — it chooses the tool and fills in the arguments. The JSON on this page is what it sends. New here? Start with [Using the tools](/using-tools).</Tip>
+
 ## get_defaults
 
 Return the merged view of generation defaults with per-source attribution. Precedence (lowest → highest): config file → COMFYUI_DEFAULT_* env vars → runtime overrides via set_defaults. Per-call MCP tool args always win over these defaults when consumed by a workflow-construction tool.
@@ -14,7 +16,7 @@ Return the merged view of generation defaults with per-source attribution. Prece
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** What settings do you use when I don't say?
 
 ```json
 {
@@ -23,11 +25,15 @@ Return the merged view of generation defaults with per-source attribution. Prece
 }
 ```
 
+**You get back:** The current fallback size, steps, cfg, sampler and checkpoint, and where each came from.
+
 ---
 
 ## set_defaults
 
 Update generation defaults. By default updates the in-memory runtime layer (lost on restart). Pass persist=true to also write the change into the config file (~/.config/comfyui-mcp/config.json by default). Use this to avoid repeating common values like width, height, steps, cfg, sampler, checkpoint.
+
+<Tip>**In plain terms:** Stop repeating yourself. Set the values you always want once, and leave them out of every later request.</Tip>
 
 ### Parameters
 
@@ -40,16 +46,23 @@ Update generation defaults. By default updates the in-memory runtime layer (lost
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** Always use 1024 by 1024 and 30 steps, permanently.
 
 ```json
 {
   "tool": "set_defaults",
   "arguments": {
-    "values": "<values>"
+    "values": {
+      "width": 1024,
+      "height": 1024,
+      "steps": 30
+    },
+    "persist": true
   }
 }
 ```
+
+**You get back:** Confirmation of the new defaults. `persist: true` writes them to your config file so they survive a restart; without it they last only for this session.
 
 ---
 
@@ -68,7 +81,7 @@ Read the ComfyUI frontend's per-user UI settings (the Comfy.* ids the Settings p
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -94,7 +107,7 @@ Modify the ComfyUI user's persisted frontend UI setting by id. This writes Comfy
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -129,7 +142,7 @@ Recommend concrete, proven sampler/scheduler/steps/CFG (and denoise/shift/LoRA) 
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -152,7 +165,7 @@ Show statistics from this MCP server's local generation-history database (popula
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -181,7 +194,7 @@ Generate a Claude skill (SKILL.md) documenting a ComfyUI custom node pack: its n
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {

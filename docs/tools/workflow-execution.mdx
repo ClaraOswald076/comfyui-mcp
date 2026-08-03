@@ -6,9 +6,13 @@ icon: "play"
 
 <Info>12 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
 
+<Tip>**You don't type these calls.** Ask your agent for what you want in ordinary English — it chooses the tool and fills in the arguments. The JSON on this page is what it sends. New here? Start with [Using the tools](/using-tools).</Tip>
+
 ## enqueue_workflow
 
 Submit a ComfyUI workflow for execution and return immediately with the prompt_id and queue position. Does not wait for completion. Use queue (action:"status") to check progress later, or get_history to retrieve results and images after completion.
+
+<Tip>**In plain terms:** Runs a workflow that the agent is holding in the conversation — one it just built or loaded from a file. If you want to run the graph you are LOOKING at in ComfyUI, that is the panel's run tool instead, and if you just want a picture, use generate_image.</Tip>
 
 ### Parameters
 
@@ -21,16 +25,37 @@ Submit a ComfyUI workflow for execution and return immediately with the prompt_i
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** Run it.
 
 ```json
 {
   "tool": "enqueue_workflow",
   "arguments": {
-    "workflow": "<workflow>"
+    "workflow": {
+      "4": {
+        "class_type": "CheckpointLoaderSimple",
+        "inputs": {
+          "ckpt_name": "sd_xl_base_1.0.safetensors"
+        }
+      },
+      "9": {
+        "class_type": "SaveImage",
+        "inputs": {
+          "filename_prefix": "portrait",
+          "images": [
+            "8",
+            0
+          ]
+        }
+      }
+    }
   }
 }
 ```
+
+<Note>Shortened for readability — two nodes of a real API-format graph are shown. In practice the agent passes the whole thing: the graph it just loaded with get_workflow, or the one it built for you.</Note>
+
+**You get back:** A prompt_id straight away, then the finished images once the render completes.
 
 ---
 
@@ -52,7 +77,7 @@ Re-run the workflow behind a previous generation. Retrieves the prompt graph fro
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -71,7 +96,7 @@ Get system information from the connected ComfyUI server: GPU device(s), total/f
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** How much VRAM have I got left?
 
 ```json
 {
@@ -79,6 +104,8 @@ Get system information from the connected ComfyUI server: GPU device(s), total/f
   "arguments": {}
 }
 ```
+
+**You get back:** The GPU, its total and free VRAM, system RAM, and the ComfyUI and Python versions.
 
 ---
 
@@ -93,6 +120,8 @@ Inspect and manage the ComfyUI execution queue. Driven by the `action` parameter
 - action:"cancel" — Stop the CURRENTLY RUNNING job ROBUSTLY. Sends an interrupt, then WAITS and verifies the job actually stopped — ComfyUI only honors interrupts BETWEEN steps, so a long single step (e.g. a high-res video sampler) can ignore a plain cancel. If the interrupt isn't honored it escalates to freeing VRAM (POST /free) and re-checks; if it STILL won't die it reports the job as WEDGED and tells you to restart_comfyui (an HTTP cancel cannot kill a stuck step). Set clear_pending:true to also drop ALL pending jobs in the same call — the correct "reset the queue" action, since cancelling alone leaves pending jobs that would run next. The partial result is discarded. With `prompt_id` given, only interrupts the running job when its prompt_id matches; omit to interrupt whatever is currently running. Use action:"cancel_queued" to remove one specific PENDING job instead.
 - action:"cancel_queued" — Remove one specific PENDING job from the queue by prompt_id. Does not affect running jobs.
 - action:"clear" — Clear ALL pending jobs from the queue. Does not affect the currently running job.
+
+<Tip>**In plain terms:** One tool for everything to do with the job queue — see what is waiting, reorder it, cancel something. Which job it does is set by `action`. This is the shape most of the newer tools have; see [Using the tools](/using-tools) for why.</Tip>
 
 ### Parameters
 
@@ -118,9 +147,9 @@ Inspect and manage the ComfyUI execution queue. Driven by the `action` parameter
   action:"cancel" — also clear ALL pending jobs (recommended when resetting after a stuck/slow render, so a re-queue doesn't stack behind a backlog). Default false.
 </ParamField>
 
-### Example
+### Examples
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** What's still running?
 
 ```json
 {
@@ -130,6 +159,40 @@ Inspect and manage the ComfyUI execution queue. Driven by the `action` parameter
   }
 }
 ```
+
+**You get back:** The job currently rendering and everything queued behind it, each with its prompt_id — the receipt you use to ask about one job later.
+
+**You say:** Kill the one that's running, it's wrong.
+
+```json
+{
+  "tool": "queue",
+  "arguments": {
+    "action": "cancel",
+    "prompt_id": "8f3c1a02-6d4e-4b9a-9f21-77c0be5d1e44"
+  }
+}
+```
+
+**You get back:** Confirmation that the job was interrupted.
+
+<Warning>This stops work in progress and you do not get the partial result. If you share this ComfyUI with anyone else, make sure the job is yours.</Warning>
+
+**You say:** Clear the whole queue, I want to start over.
+
+```json
+{
+  "tool": "queue",
+  "arguments": {
+    "action": "clear",
+    "clear_pending": true
+  }
+}
+```
+
+**You get back:** Confirmation of how many jobs were dropped.
+
+<Warning>Destructive and not undoable — every waiting job is discarded, including any that someone else queued.</Warning>
 
 ---
 
@@ -145,14 +208,18 @@ Get execution history for a ComfyUI prompt: status, timing, cached nodes, and ou
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** Did that finish? What did it produce?
 
 ```json
 {
   "tool": "get_history",
-  "arguments": {}
+  "arguments": {
+    "prompt_id": "8f3c1a02-6d4e-4b9a-9f21-77c0be5d1e44"
+  }
 }
 ```
+
+**You get back:** That run's outcome and the files it wrote. Omit `prompt_id` to get recent runs instead of one specific one.
 
 ---
 
@@ -171,7 +238,7 @@ Get ComfyUI server runtime logs. Useful for debugging execution errors, model lo
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -186,6 +253,8 @@ Get ComfyUI server runtime logs. Useful for debugging execution errors, model lo
 
 Pre-flight diagnostic for the connected ComfyUI: one call that aggregates the signals an agent should check before dispatching a batch. Reports ComfyUI version/Python/PyTorch, GPU name + VRAM free/total, system RAM free, queue depth (running + pending), per-category /models populations (catches empty dropdowns from a misconfigured extra_model_paths.yaml), and recent errors from /internal/logs. Read-only — no mutation. Use this when a job fails for an unexpected reason, before a long batch run, or to confirm a remote ComfyUI is healthy. Originally contributed by github.com/joaolvivas.
 
+<Tip>**In plain terms:** The first thing to try when something is not working. It answers "is ComfyUI actually up, and can it see my models?" in one call.</Tip>
+
 ### Parameters
 
 <ParamField path="model_categories" type="string[]">
@@ -195,9 +264,9 @@ Pre-flight diagnostic for the connected ComfyUI: one call that aggregates the si
   How many recent error/traceback lines to include from /internal/logs (default 20, max 200).
 </ParamField>
 
-### Example
+### Examples
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** Is everything working?
 
 ```json
 {
@@ -205,6 +274,25 @@ Pre-flight diagnostic for the connected ComfyUI: one call that aggregates the si
   "arguments": {}
 }
 ```
+
+**You get back:** Whether the server is reachable, what it is running on, and whether the model folders have anything in them.
+
+**You say:** Check the setup, and tell me if any recent runs blew up.
+
+```json
+{
+  "tool": "health_check",
+  "arguments": {
+    "model_categories": [
+      "checkpoints",
+      "loras"
+    ],
+    "recent_errors": 5
+  }
+}
+```
+
+**You get back:** The same report, narrowed to the two model folders you asked about, with the last five errors from history attached.
 
 ---
 
@@ -238,7 +326,7 @@ spec="3 + 0*0.5\n3 + 1*0.5\n3 + 2*0.5\n3 + 3*0.5"
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -255,6 +343,8 @@ spec="3 + 0*0.5\n3 + 1*0.5\n3 + 2*0.5\n3 + 3*0.5"
 
 WHY DID MY RENDER FAIL / WHAT'S MISSING? Explains a failed run in ONE call, without needing a canvas — the headless counterpart to the panel's panel_get_errors ("why is this red?"), so mobile/remote sessions get the same answer. Returns: the failed node (id, type) with its `exception_type` + message and a trimmed traceback; **missing_models** (the exact model file that isn't installed and the widget holding it — feed the filename to search_civitai_models/download_model to fix it); **missing_node_types** (node classes this install lacks — feed to search_custom_nodes/install_custom_node); and any other per-input validation errors. Call this whenever a run fails, an enqueue is rejected, or the user asks what's missing — instead of guessing from raw logs. With no prompt_id it diagnoses the most recent FAILED run (falling back to the most recent run). Read-only.
 
+<Tip>**In plain terms:** For when a run failed and the error text does not mean anything to you. This reads the failure and tells you what to do about it.</Tip>
+
 ### Parameters
 
 <ParamField path="prompt_id" type="string">
@@ -263,14 +353,18 @@ WHY DID MY RENDER FAIL / WHAT'S MISSING? Explains a failed run in ONE call, with
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** That render failed and I don't understand the error.
 
 ```json
 {
   "tool": "diagnose_run",
-  "arguments": {}
+  "arguments": {
+    "prompt_id": "8f3c1a02-6d4e-4b9a-9f21-77c0be5d1e44"
+  }
 }
 ```
+
+**You get back:** A plain reading of what went wrong — a missing model, a bad connection, not enough VRAM — and the suggested fix. Omit `prompt_id` and it looks at the most recent failure.
 
 ---
 
@@ -286,16 +380,18 @@ Get a template's OVERRIDABLE run-time parameters (its 'slots') before running it
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** What can I change about the Flux template?
 
 ```json
 {
   "tool": "get_template_schema",
   "arguments": {
-    "template": "<template>"
+    "template": "flux_dev_full_text_to_image"
   }
 }
 ```
+
+**You get back:** The knobs that template exposes — prompt, size, steps, which model file — with their current values, so you know what to pass to run_template.
 
 ---
 
@@ -323,16 +419,22 @@ ONE-SHOT: run a named workflow template (a bundled pack from list_packs) with op
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** Run the Flux template with my prompt and wait for it.
 
 ```json
 {
   "tool": "run_template",
   "arguments": {
-    "template": "<template>"
+    "template": "flux_dev_full_text_to_image",
+    "overrides": {
+      "prompt": "a lighthouse in a storm, dramatic sky"
+    },
+    "wait": true
   }
 }
 ```
+
+**You get back:** With `wait: true`, the finished result in one go. Leave it off and you get a prompt_id immediately and check back later.
 
 ---
 
@@ -371,7 +473,7 @@ Batch ids are durable — they survive server restarts.
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {

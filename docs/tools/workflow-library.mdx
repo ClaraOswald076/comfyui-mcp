@@ -6,15 +6,19 @@ icon: "folder-open"
 
 <Info>10 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
 
+<Tip>**You don't type these calls.** Ask your agent for what you want in ordinary English — it chooses the tool and fills in the arguments. The JSON on this page is what it sends. New here? Start with [Using the tools](/using-tools).</Tip>
+
 ## list_workflows
 
 List the filenames of workflows saved in the connected ComfyUI server's user library (the same workflows visible in the ComfyUI web UI). Requires a running ComfyUI server. Takes no parameters. Returns a numbered list of .json filenames; pass a filename to get_workflow or analyze_workflow to load one. Returns "No saved workflows found." when the library is empty.
+
+<Tip>**In plain terms:** The saved workflow FILES in your ComfyUI — the same list you see in the ComfyUI sidebar. Usually the first call in any "open my…" request.</Tip>
 
 <Note>This tool takes no parameters.</Note>
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** What workflows have I got saved?
 
 ```json
 {
@@ -23,11 +27,15 @@ List the filenames of workflows saved in the connected ComfyUI server's user lib
 }
 ```
 
+**You get back:** A numbered list of .json filenames. Pick one and hand it to analyze_workflow or get_workflow.
+
 ---
 
 ## get_workflow
 
 Return the full JSON of a SAVED workflow FILE, named from the library — a file on disk, NOT the graph open on the user's canvas (that is panel_graph_outline). Defaults to converted API format; pass format:'ui' for the raw on-disk UI JSON. Use analyze_workflow instead if you just need to understand the workflow — it returns a structured summary without flooding context with JSON. Use get_workflow only when you need the actual JSON for enqueue_workflow, modify_workflow, or save_workflow.
+
+<Tip>**In plain terms:** Reads a saved FILE, not the graph currently open on your canvas. Ask for this when the agent needs the actual JSON to change or run; if you only want to know what a workflow does, analyze_workflow is the shorter answer.</Tip>
 
 ### Parameters
 
@@ -38,18 +46,34 @@ Return the full JSON of a SAVED workflow FILE, named from the library — a file
   Output format: 'api' (default, recommended) converts to compact API format with named inputs, connection references, and _meta.mode flags for muted/bypassed nodes. 'ui' returns the raw UI format with layout positions and links arrays. Options: `ui`, `api`.
 </ParamField>
 
-### Example
+### Examples
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** Open my portrait workflow so we can change the prompt.
 
 ```json
 {
   "tool": "get_workflow",
   "arguments": {
-    "filename": "<filename>"
+    "filename": "portrait-flux.json"
   }
 }
 ```
+
+**You get back:** The full workflow as runnable API-format JSON. This is a big response — it is meant for the agent to work on, not for you to read.
+
+**You say:** Give me the raw file exactly as ComfyUI saved it.
+
+```json
+{
+  "tool": "get_workflow",
+  "arguments": {
+    "filename": "portrait-flux.json",
+    "format": "ui"
+  }
+}
+```
+
+**You get back:** The on-disk UI format, including node positions and colours — what you want if the file is going to be loaded back into the canvas rather than executed.
 
 ---
 
@@ -71,7 +95,7 @@ Read (and optionally execute) a shared ComfyUI workflow from a URL. Fetches the 
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -105,7 +129,7 @@ Strip a workflow to a clean, flat API graph — resolving Get/Set buses, Reroute
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -137,7 +161,7 @@ Slice ONE pipeline out of a toggle-template workflow — the kind built with rgt
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -165,23 +189,48 @@ Save a workflow JSON to the connected ComfyUI server's user library so it appear
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** Save that as a new file so I don't lose the original.
 
 ```json
 {
   "tool": "save_workflow",
   "arguments": {
-    "filename": "<filename>",
-    "workflow": "<workflow>"
+    "filename": "portrait-flux-v2.json",
+    "workflow": {
+      "4": {
+        "class_type": "CheckpointLoaderSimple",
+        "inputs": {
+          "ckpt_name": "sd_xl_base_1.0.safetensors"
+        }
+      },
+      "9": {
+        "class_type": "SaveImage",
+        "inputs": {
+          "filename_prefix": "portrait",
+          "images": [
+            "8",
+            0
+          ]
+        }
+      }
+    }
   }
 }
 ```
+
+<Note>Shortened for readability — two nodes of a real API-format graph are shown. In practice the agent passes the whole thing: the graph it just loaded with get_workflow, or the one it built for you.</Note>
+
+**You get back:** Confirmation and the path it was written to.
+
+<Warning>Writing to a filename that already exists replaces that file. Ask for a new name — as above — when you want to keep the original.</Warning>
 
 ---
 
 ## analyze_workflow
 
 SUMMARIZE a SAVED workflow FILE named from the library — sections, node settings, connections, and data flow. It reads a file from the library, NOT the graph open on the user's canvas (that is panel_graph_outline). Use this to understand a saved workflow before modifying or executing it. Returns a concise text summary (not raw JSON) optimized for AI reasoning. Prefer this over get_workflow unless you need the raw JSON for enqueue_workflow or modify_workflow.
+
+<Tip>**In plain terms:** "Explain this workflow to me." Cheaper and far more readable than get_workflow when you just want to understand what a file does.</Tip>
 
 ### Parameters
 
@@ -195,18 +244,34 @@ SUMMARIZE a SAVED workflow FILE named from the library — sections, node settin
   Section name for detail view. Use view='list' first to see available section names.
 </ParamField>
 
-### Example
+### Examples
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** What does my portrait workflow actually do?
 
 ```json
 {
   "tool": "analyze_workflow",
   "arguments": {
-    "filename": "<filename>"
+    "filename": "portrait-flux.json"
   }
 }
 ```
+
+**You get back:** A short summary: the model it loads, the prompts, the sampler settings, and what it saves.
+
+**You say:** Is that workflow going to run, or is something missing?
+
+```json
+{
+  "tool": "analyze_workflow",
+  "arguments": {
+    "filename": "portrait-flux.json",
+    "view": "health"
+  }
+}
+```
+
+**You get back:** Problems only — missing models, unconnected inputs, nodes whose packs are not installed.
 
 ---
 
@@ -222,7 +287,7 @@ Extract embedded ComfyUI workflow metadata from a PNG file. ComfyUI stores the f
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -247,7 +312,7 @@ Capture a provenance lock for a saved workflow so it can be exactly reproduced l
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -272,7 +337,7 @@ Compare a saved workflow's lock file against the current state of the local inst
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
