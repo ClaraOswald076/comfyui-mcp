@@ -1379,11 +1379,17 @@ export async function startComfyUI(): Promise<StartResult> {
         ? undefined
         : newPid === ourPid;
   return {
-    started: true,
+    // `started` means "THIS call started the server". When the healthy listener is
+    // provably NOT the process we launched, we did not start it — programmatic
+    // callers must not read a failed relaunch as a success just because something
+    // answers (codex gate). `ready` stays TRUE because the server genuinely IS
+    // ready: claiming otherwise would be its own lie and would push callers into
+    // needless recovery.
+    started: listenerIsOurs !== false,
     ready: true,
     readiness,
     message:
-      `ComfyUI started on port ${port}${newPid ? ` (PID ${newPid})` : ""}` +
+      `ComfyUI ${listenerIsOurs === false ? "is ready" : "started"} on port ${port}${newPid ? ` (PID ${newPid})` : ""}` +
       // Say WHICH environment it came back in whenever that was not simply ours
       // (#776) — the user needs to know a launcher environment was restored.
       (env && env.source !== "inherited" ? ` — ${env.note}.` : "") +
@@ -1743,7 +1749,14 @@ export async function restartComfyUI(): Promise<RestartResult> {
       started: false,
       ready: startResult.ready,
       readiness: startResult.readiness,
-      message: `ComfyUI was stopped but could not be started: ${startResult.message}`,
+      // Two distinct failures share this branch, and they must NOT read alike: the
+      // server may be DOWN (our relaunch never answered), or UP but owned by
+      // somebody else (an external supervisor beat us to the port — our relaunch
+      // still failed). Saying "could not be started" about a healthy server would
+      // be as wrong as claiming success for it (codex gate).
+      message: startResult.ready
+        ? `ComfyUI is back up, but NOT as a result of this restart: ${startResult.message}`
+        : `ComfyUI was stopped but could not be started: ${startResult.message}`,
       auto_restart: startResult.auto_restart,
       spawn_error: startResult.spawn_error,
       launch_env: startResult.launch_env,
@@ -1760,14 +1773,10 @@ export async function restartComfyUI(): Promise<RestartResult> {
     started: true,
     ready: startResult.ready,
     readiness: startResult.readiness,
-    // Only claim a clean "restarted successfully" when the healthy listener is the
-    // process we launched (or we could not tell). When it provably is NOT ours, say
-    // the server is up but somebody ELSE brought it back (codex gate) — startResult's
-    // own message carries the PID detail.
-    message:
-      (startResult.listener_is_launched_process === false
-        ? "ComfyUI is back up, but NOT as a result of this restart. "
-        : "ComfyUI restarted successfully. ") + startResult.message,
+    // Reached only when startComfyUI reported started:true — i.e. the healthy
+    // listener is ours, or ownership was undecidable. A listener that is provably
+    // NOT ours returns started:false and is handled in the branch above.
+    message: `ComfyUI restarted successfully. ${startResult.message}`,
     auto_restart: startResult.auto_restart,
     launch_env: startResult.launch_env,
     listener_is_launched_process: startResult.listener_is_launched_process,

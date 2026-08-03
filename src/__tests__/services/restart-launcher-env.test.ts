@@ -611,9 +611,14 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
     const result = await restartComfyUI();
 
     expect(result.listener_is_launched_process).toBe(false);
+    // The STRUCTURED result must not read as a successful restart either: this
+    // call did not start the server. `ready` stays true — the server really is up.
+    expect(result.started).toBe(false);
+    expect(result.ready).toBe(true);
     expect(result.message).not.toMatch(/restarted successfully/i);
     expect(result.message).toMatch(/NOT as a result of this restart/i);
     expect(result.message).toMatch(/another launcher or supervisor owns it/i);
+    expect(result.message).not.toMatch(/could not be started/i);
 
     killSpy.mockRestore();
   });
@@ -653,6 +658,8 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
     const result = await restartComfyUI();
 
     expect(result.listener_is_launched_process).toBe(false);
+    expect(result.started).toBe(false);
+    expect(result.ready).toBe(true);
     expect(result.message).not.toMatch(/restarted successfully/i);
     expect(result.message).toMatch(/NOT as a result of this restart/i);
     expect(result.message).toMatch(/which exited: exit code 1/);
