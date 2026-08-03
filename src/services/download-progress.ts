@@ -526,6 +526,9 @@ export interface PersistedDownloadJob {
   /** Whether the post-landing on-disk stat succeeded. False = the file was NOT
    *  found when checked, so no renderer may claim "verified on disk". */
   disk_verified?: boolean;
+  /** The live models root the placement verdict was made against, so a reconnect can
+   *  tell a still-current verdict from one made against a DIFFERENT server. */
+  verified_root?: string;
   /** Epoch ms of this snapshot (set on write). */
   updated: number;
   /**

@@ -116,6 +116,10 @@ export interface DownloadJob {
   live_visible?: "visible" | "not-visible" | "unknown" | "pending";
   /** Why, for anything other than a plain "visible". Surfaced verbatim. */
   verify_note?: string;
+  /** The live models root the placement verdict was made against. When the
+   *  CONNECTED server later reads a DIFFERENT root, the verdict is STALE and must
+   *  not be re-asserted as current success (codex gate, round 11). */
+  verified_root?: string;
   /** Was the file CONFIRMED present on disk by the post-landing check? False when
    *  the stat failed (deleted or unreadable between the rename and the check), in
    *  which case no renderer may claim "verified on disk" for `job.path`. */
@@ -607,6 +611,7 @@ export async function startDownloadJob(
         try {
           const verdict = await verifyLandedModel(path, targetSubfolder, { listedBefore });
           if (verdict.verifiedPath) job.path = verdict.verifiedPath;
+          job.verified_root = verdict.verifiedAgainstRoot;
           // No verifiedPath means the on-disk stat did NOT succeed — the file was
           // removed or became unreadable between the rename and this check. Record
           // that so no renderer claims "verified on disk" for the retained path.
@@ -792,6 +797,7 @@ function persistJobRecord(job: DownloadJob): boolean {
     live_visible: job.live_visible,
     verify_note: job.verify_note,
     disk_verified: job.disk_verified,
+    verified_root: job.verified_root,
   });
 }
 
@@ -820,6 +826,7 @@ function jobFromPersisted(rec: PersistedDownloadJob): DownloadJob {
     live_visible: rec.live_visible,
     verify_note: rec.verify_note,
     disk_verified: rec.disk_verified,
+    verified_root: rec.verified_root,
     staleInflight: rec.staleInflight,
     staleForMs: rec.staleForMs,
   };
@@ -876,7 +883,33 @@ function diskQualifier(job: DownloadJob): string {
   return job.disk_verified === false ? " (NOT found on disk when checked)" : " (verified on disk)";
 }
 
-export function describePlacement(job: DownloadJob): PlacementReport {
+export function describePlacement(
+  job: DownloadJob,
+  /** The models root the CONNECTED server reads right now (currentLiveModelsRoot()).
+   *  When it differs from the root the verdict was made against, that verdict
+   *  describes a DIFFERENT ComfyUI and may not be re-asserted as current success —
+   *  the reconnect/replaced-server stale positive (codex gate, round 11). */
+  ctx?: { liveModelsDir?: string },
+): PlacementReport {
+  if (
+    !job.viaManager &&
+    job.live_visible === "visible" &&
+    job.verified_root &&
+    ctx?.liveModelsDir &&
+    ctx.liveModelsDir !== job.verified_root
+  ) {
+    return {
+      confirmed: false,
+      wrongPlace: false,
+      pathLabel: "written to",
+      pathQualifier: diskQualifier(job),
+      warning:
+        `this download was verified against a ComfyUI reading "${job.verified_root}", but the ` +
+        `connected server now reads "${ctx.liveModelsDir}" — a DIFFERENT install. The earlier ` +
+        "confirmation does not apply to it; check list_local_models against the server you are " +
+        "connected to now.",
+    };
+  }
   if (job.viaManager) {
     return {
       confirmed: false,

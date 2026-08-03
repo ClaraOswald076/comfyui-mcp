@@ -27,6 +27,7 @@ import {
   listLocalModels,
   liveListingHasEntry,
   isUnderLiveModelRoots,
+  currentLiveModelsRoot,
   resolveExistingModelFile,
   managerModelDestination,
   MODEL_SUBDIRS,
@@ -989,6 +990,9 @@ async function applyManifestSections(
       }),
     ]);
     if (graceTimer) clearTimeout(graceTimer);
+    // ONE resolution for the batch: a verdict made against a DIFFERENT ComfyUI than
+    // the one connected now must not be re-asserted as an apply (#369).
+    const liveRootNow = await currentLiveModelsRoot();
     for (const { item, job } of enqueued) {
       if (job.status === "error") {
         results.push(report("model", item, "failed", job.error ?? "Model download failed."));
@@ -996,7 +1000,7 @@ async function applyManifestSections(
         // "applied" must mean the running ComfyUI can actually load it (#369). Same
         // shared placement policy as download_model: an unconfirmed or demonstrably
         // wrong placement is reported as such, never as a clean apply.
-        const placement = describePlacement(job);
+        const placement = describePlacement(job, { liveModelsDir: liveRootNow });
         results.push(
           // "applied" must mean the running ComfyUI can actually load it (#369) —
           // that is the whole failure, just wearing a manifest's clothes. A

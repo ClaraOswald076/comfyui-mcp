@@ -48,6 +48,11 @@ const liveListingHasEntryMock = vi.hoisted(() =>
 const isUnderLiveModelRootsMock = vi.hoisted(() =>
   vi.fn(async (): Promise<boolean | undefined> => true),
 );
+/** The models root the connected server reads NOW. Undefined = unknown, which never
+ *  invalidates a verdict. */
+const currentLiveRootMock = vi.hoisted(() =>
+  vi.fn(async (): Promise<string | undefined> => undefined),
+);
 const resolveExistingModelFileMock = vi.hoisted(() => vi.fn());
 const listLocalModelsMock = vi.hoisted(() => vi.fn());
 const savedWorkspaceMock = vi.hoisted(() => vi.fn(() => undefined as string | undefined));
@@ -138,6 +143,9 @@ vi.mock("../../services/model-resolver.js", () => ({
   // The decisive containment test. Default UNKNOWN (only local config could answer),
   // so these tests exercise the listing-based fallback.
   isUnderLiveModelRoots: (...a: unknown[]) => isUnderLiveModelRootsMock(...(a as [string])),
+  // The models root the connected server reads NOW — compared against the root a
+  // verdict was made against, so a replaced server invalidates a stale positive.
+  currentLiveModelsRoot: async (): Promise<string | undefined> => currentLiveRootMock(),
   // Faithful mirror of the real managerModelDestination (pure logic) so the
   // remote-model path resolves a Manager-valid { type, save_path }.
   managerModelDestination: (category: string, relPath?: string) => {

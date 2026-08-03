@@ -6,6 +6,7 @@ import { isLocalMode, config } from "../config.js";
 import { logger } from "../utils/logger.js";
 import {
   resolveExistingModelFile,
+  currentLiveModelsRoot,
   MODEL_SUBDIRS,
 } from "../services/model-resolver.js";
 import { startDownloadJob, describePlacement } from "../services/download-jobs.js";
@@ -517,7 +518,9 @@ export function registerModelExtrasTools(server: McpServer): void {
         // ONE placement policy shared with download_model / download_status (#369):
         // "downloaded successfully" is licensed ONLY by a placement the connected
         // ComfyUI actually confirmed. Anything else is reported with its caveat.
-        const placement = describePlacement(job);
+        const placement = describePlacement(job, {
+          liveModelsDir: await currentLiveModelsRoot(),
+        });
         const lines = job.viaManager
           ? [
               "CivitAI model DISPATCHED to the remote ComfyUI via ComfyUI-Manager (server-side fetch):",

@@ -3,6 +3,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   searchHuggingFaceModels,
   listLocalModels,
+  currentLiveModelsRoot,
   MODEL_SUBDIRS,
 } from "../services/model-resolver.js";
 import {
@@ -160,7 +161,9 @@ export function registerModelManagementTools(server: McpServer): void {
           // ONE placement policy for every consumer (#369): only a file the running
           // ComfyUI actually lists may be called a success. A Manager dispatch, a
           // still-pending check and an inconclusive check are all unconfirmed.
-          const placement = describePlacement(job);
+          const placement = describePlacement(job, {
+            liveModelsDir: await currentLiveModelsRoot(),
+          });
           const text = job.viaManager
             ? `Download DISPATCHED to the remote ComfyUI via ComfyUI-Manager (server-side fetch):\n${job.path}\n\n` +
               `NOTE: ${placement.warning}`
@@ -265,6 +268,9 @@ export function registerModelManagementTools(server: McpServer): void {
           };
         }
 
+        // ONE resolution for the whole listing: a verdict made against a
+        // DIFFERENT ComfyUI than the one connected now must not be re-asserted (#369).
+        const liveModelsDir = await currentLiveModelsRoot();
         const lines = list.map((j) => {
           const p = readDownloadProgress(j.progressId ?? j.trayId);
           const bytes =
@@ -276,7 +282,8 @@ export function registerModelManagementTools(server: McpServer): void {
           const head = `- \`${j.id}\` **${j.status}**${bytes}`;
           // Same single placement policy the download_model renderer uses (#369):
           // a bare "landed at" is only ever printed for a CONFIRMED placement.
-          const placement = j.status === "done" ? describePlacement(j) : undefined;
+          const placement =
+            j.status === "done" ? describePlacement(j, { liveModelsDir }) : undefined;
           const detail =
             j.status === "done" && placement
               ? j.viaManager

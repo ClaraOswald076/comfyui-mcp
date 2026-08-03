@@ -73,14 +73,12 @@ vi.mock("../../services/extra-paths.js", () => ({
   getLiveExtraModelRoots: vi.fn(async () => h.liveExtraRoots),
 }));
 
+const resolveModelsDirWithBasesMock = vi.hoisted(() =>
+  vi.fn(async (): Promise<unknown> => undefined),
+);
 vi.mock("../../services/output-dir.js", () => ({
-  resolveModelsDir: vi.fn(async () => resolve("/live/ComfyUI/models")),
-  resolveModelsDirWithBases: vi.fn(async () => ({
-    modelsDir: resolve(h.destModelsDir),
-    baseDirs: [],
-    snapshot: { reachable: true, argv: h.snapshotArgv },
-    source: h.modelsDirSource,
-  })),
+  resolveModelsDir: vi.fn(async () => resolve(h.destModelsDir)),
+  resolveModelsDirWithBases: () => resolveModelsDirWithBasesMock(),
   parseModelsDirFromArgv: vi.fn(() => undefined),
   hasUnresolvableRelativeModelDirFlag: vi.fn(() => false),
   // Real behaviour (pure argv parsing): the "empty tree + no extra roots" refusal
@@ -138,6 +136,13 @@ beforeEach(() => {
   // Absolute argv main.py: the live install root resolves, so the server's
   // extra_model_paths config location is knowable.
   h.snapshotArgv = [resolve("/live/ComfyUI/main.py")];
+  resolveModelsDirWithBasesMock.mockReset();
+  resolveModelsDirWithBasesMock.mockImplementation(async () => ({
+    modelsDir: resolve(h.destModelsDir),
+    baseDirs: [],
+    snapshot: { reachable: true, argv: h.snapshotArgv },
+    source: h.modelsDirSource,
+  }));
   statMock.mockReset();
   realpathMock.mockReset();
   readdirMock.mockReset();
@@ -502,6 +507,47 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
     });
     expect(res.liveVisible).toBe("not-visible");
     expect(res.note).toMatch(/OUTSIDE every directory/);
+  });
+
+  it("re-checks membership AFTER the listing — a server swap mid-check is not a success (codex gate r11)", async () => {
+    // Server A is live for the membership check; B replaces it before the listing
+    // and lists its OWN same-named model. That must not confirm A's file.
+    h.modelsDirSource = "observed-root";
+    h.destModelsDir = "/live/ComfyUI/models"; // A: the landed file IS under this
+    h.liveExtraRoots = { authoritative: true, roots: [] };
+    h.liveListings["loras"] = ["new.safetensors"];
+    let calls = 0;
+    resolveModelsDirWithBasesMock.mockImplementation(async () => {
+      calls += 1;
+      return {
+        // 1st call (membership) = server A; 2nd (re-check after the listing) = B.
+        modelsDir: resolve(calls === 1 ? "/live/ComfyUI/models" : "/serverB/models"),
+        baseDirs: [],
+        snapshot: { reachable: true, argv: h.snapshotArgv },
+        source: h.modelsDirSource,
+      };
+    });
+
+    const res = await verifyLandedModel(target, "loras", {
+      attempts: 1,
+      retryMs: 0,
+      listedBefore: false,
+    });
+    expect(res.liveVisible).toBe("not-visible");
+    expect(res.note).toMatch(/changed while this was being checked/);
+  });
+
+  it("stamps the live root a VISIBLE verdict was made against", async () => {
+    h.modelsDirSource = "observed-root";
+    h.destModelsDir = "/live/ComfyUI/models";
+    h.liveListings["loras"] = ["new.safetensors"];
+    const res = await verifyLandedModel(target, "loras", {
+      attempts: 1,
+      retryMs: 0,
+      listedBefore: false,
+    });
+    expect(res.liveVisible).toBe("visible");
+    expect(res.verifiedAgainstRoot).toBe(resolve("/live/ComfyUI/models"));
   });
 
   it("still confirms a JUNCTIONED primary models root (codex gate r6 — no false failure)", async () => {

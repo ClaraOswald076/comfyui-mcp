@@ -1435,6 +1435,34 @@ describe("download job registry", () => {
       expect(r.warning).toMatch(/reads elsewhere/);
     });
 
+    it("downgrades a VISIBLE verdict made against a DIFFERENT server (codex gate r11)", () => {
+      // Server A verified the file; B replaced it on the same endpoint and reads
+      // another tree. A reconnect must not re-assert A's confirmation as current.
+      const r = describePlacement(
+        { ...base, live_visible: "visible", verified_root: "C:/A/models" },
+        { liveModelsDir: "D:/B/models" },
+      );
+      expect(r.confirmed).toBe(false);
+      expect(r.pathLabel).not.toBe("landed at");
+      expect(r.warning).toMatch(/DIFFERENT install/);
+    });
+
+    it("keeps a VISIBLE verdict when the connected server still reads the same root", () => {
+      const r = describePlacement(
+        { ...base, live_visible: "visible", verified_root: "C:/A/models" },
+        { liveModelsDir: "C:/A/models" },
+      );
+      expect(r.confirmed).toBe(true);
+    });
+
+    it("keeps a VISIBLE verdict when the current live root is UNKNOWN (no false alarm)", () => {
+      const r = describePlacement(
+        { ...base, live_visible: "visible", verified_root: "C:/A/models" },
+        {},
+      );
+      expect(r.confirmed).toBe(true);
+    });
+
     it("never claims 'verified on disk' when the post-landing stat failed (codex gate r9)", () => {
       const r = describePlacement({
         ...base,

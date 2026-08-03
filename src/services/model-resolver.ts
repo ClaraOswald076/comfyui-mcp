@@ -973,10 +973,25 @@ export async function isUnderLiveModelRoots(
   return fullyCanonical ? false : undefined;
 }
 
+/** The models root the connected server reads RIGHT NOW, or undefined. Never throws.
+ *  Stamped on a verdict so a later reader can tell whether the server it was made
+ *  against is still the one connected. */
+export async function currentLiveModelsRoot(): Promise<string | undefined> {
+  try {
+    return resolve(await resolveModelsDir());
+  } catch {
+    return undefined;
+  }
+}
+
 export interface LandedModelVerification {
   /** The path CONFIRMED to exist on disk after the download (symlinks resolved).
    *  This — never the intended path — is what callers report. */
   verifiedPath?: string;
+  /** The live models root this verdict was made against. A reader that finds the
+   *  CONNECTED server reading a different root must treat the verdict as stale
+   *  rather than re-assert it (codex gate, round 11). */
+  verifiedAgainstRoot?: string;
   /** Whether the CONNECTED ComfyUI actually lists the landed file. */
   liveVisible: "visible" | "not-visible" | "unknown";
   /** Why, for anything other than a plain "visible". */
@@ -1094,7 +1109,30 @@ export async function verifyLandedModel(
     if (listing !== undefined) {
       sawListing = true;
       if (listing.some((n) => normRel(n) === wanted)) {
-        if (!ambiguous) return { verifiedPath, liveVisible: "visible" };
+        // RE-CHECK membership AFTER the listing. The root check and the listing are
+        // two separate observations; a ComfyUI restart onto a DIFFERENT install
+        // between them would otherwise let the NEW server's own same-named model
+        // confirm OUR file, which that server cannot read (codex gate, round 11).
+        const stillInLiveRoots = await isUnderLiveModelRoots(landed, category);
+        if (stillInLiveRoots === false) {
+          return {
+            verifiedPath,
+            verifiedAgainstRoot: await currentLiveModelsRoot(),
+            liveVisible: "not-visible",
+            note:
+              `The file IS on disk at ${landed}, but the connected ComfyUI ` +
+              `(${getComfyUIBaseUrl()}) changed while this was being checked and no longer ` +
+              "reads from that location — the entry it lists is its OWN file of the same name. " +
+              "Re-download now that the correct server is connected.",
+          };
+        }
+        if (!ambiguous) {
+          return {
+            verifiedPath,
+            verifiedAgainstRoot: await currentLiveModelsRoot(),
+            liveVisible: "visible",
+          };
+        }
         return {
           verifiedPath,
           liveVisible: "unknown",
