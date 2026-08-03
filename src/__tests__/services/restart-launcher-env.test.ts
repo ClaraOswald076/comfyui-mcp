@@ -667,6 +667,44 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
     killSpy.mockRestore();
   });
 
+  it("says so plainly when listener ownership is UNDECIDABLE — without denying a restart that worked", async () => {
+    // Unmappable port owner + a still-alive launched child. Reporting this as a
+    // FAILED restart would mislabel every ordinary restart on hosts where the
+    // port-owner lookup is unavailable, so the result stays started:true and the
+    // uncertainty is stated instead of guessed either way.
+    usePlainInstall();
+    spawnCapturingChildren(999);
+    let killed = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill|pkill|\bkill\b/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (/netstat/i.test(cmd)) {
+        return killed ? "" : "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed) throw new Error("not listening");
+        return "p4321\nn127.0.0.1:8188\n";
+      }
+      return "";
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true }) as Response),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.started).toBe(true);
+    expect(result.ready).toBe(true);
+    expect(result.listener_is_launched_process).toBeUndefined();
+    expect(result.message).toMatch(/could not be confirmed as the process this call launched/i);
+
+    killSpy.mockRestore();
+  });
+
   it("names the launched process's EXIT when it dies before the API comes up", async () => {
     usePlainInstall();
     mockLivePortThenFree();

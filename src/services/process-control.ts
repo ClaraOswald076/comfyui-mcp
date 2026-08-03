@@ -1368,8 +1368,14 @@ export async function startComfyUI(): Promise<StartResult> {
   //     that is decisive even when the port owner cannot be mapped at all (the #449
   //     shape), which is precisely the "an external supervisor restored the API"
   //     case that must never be reported as our successful restart (codex gate).
-  //   • Otherwise it needs both pids; an unmappable port owner stays `undefined`
-  //     rather than asserting either way.
+  //   • Otherwise it needs both pids. An unmappable port owner (a real, supported
+  //     condition on some hosts — #449) stays `undefined`: we assert NEITHER way.
+  //     It deliberately does NOT become a failure — the child we launched is still
+  //     alive and the API is ready, so denying it would report every ordinary
+  //     restart as failed on any host where the port-owner lookup is unavailable,
+  //     which is a far worse (and far more common) lie than an unconfirmed
+  //     success. The undecidability is stated in the message AND in
+  //     `listener_is_launched_process`, so no caller has to infer it.
   const ourPid = launched.child.pid;
   const listenerIsOurs = info.isDesktopApp
     ? undefined
@@ -1378,6 +1384,9 @@ export async function startComfyUI(): Promise<StartResult> {
       : ourPid == null || newPid == null
         ? undefined
         : newPid === ourPid;
+  // Only the NON-Desktop undecidable case is worth calling out: for a Desktop
+  // launcher the pid relationship is indirect by design, not a gap in evidence.
+  const ownershipUnconfirmed = !info.isDesktopApp && listenerIsOurs === undefined;
   return {
     // `started` means "THIS call started the server". When the healthy listener is
     // provably NOT the process we launched, we did not start it — programmatic
@@ -1400,6 +1409,11 @@ export async function startComfyUI(): Promise<StartResult> {
         ? ` NOTE: the healthy server on port ${port}${newPid ? ` (PID ${newPid})` : ""} is NOT the process this call launched (PID ${
             ourPid ?? "unknown"
           }${launchedChildExit ? `, which exited: ${exitCause(launchedChildExit)}` : ""}) — another launcher or supervisor owns it, so this server was not started by us.`
+        : "") +
+      // Undecidable ownership is stated, never implied away: the caller learns that
+      // "our relaunch is the healthy server" is unconfirmed rather than proven.
+      (ownershipUnconfirmed
+        ? ` (Could not map the process owning port ${port}, so this could not be confirmed as the process this call launched — the launched process is alive and the API is ready.)`
         : "") +
       launchEnvWarning(info),
     pid: newPid ?? undefined,
