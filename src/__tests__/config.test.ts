@@ -409,4 +409,22 @@ describe("getLocalComfyuiUrl (#269 LAN fallback)", () => {
     expect(mod.setComfyuiTarget("not a url")).toBe(false);
     expect(mod.getComfyuiTargetGeneration()).toBe(g0 + 2);
   });
+
+  it("a synchronous target-change listener always observes target and generation in step (#742 r12)", async () => {
+    process.env.COMFYUI_URL = "http://127.0.0.1:8188";
+    const mod = await import("../config.js");
+    const seen: Array<{ url: string; generation: number }> = [];
+    mod.onComfyuiTargetChanged((url) => {
+      seen.push({ url, generation: mod.getComfyuiTargetGeneration() });
+    });
+    const g0 = mod.getComfyuiTargetGeneration();
+    expect(mod.setComfyuiTarget("http://192.168.1.50:8188")).toBe(true);
+    // The listener fired with the NEW target — it must have observed the NEW
+    // generation with it, never the pre-bump one (the contract: any observer
+    // of the new target value sees the new generation).
+    expect(seen).toHaveLength(1);
+    expect(seen[0].url).toBe("http://192.168.1.50:8188");
+    expect(seen[0].generation).toBe(g0 + 1);
+    expect(seen[0].generation).toBe(mod.getComfyuiTargetGeneration());
+  });
 });
