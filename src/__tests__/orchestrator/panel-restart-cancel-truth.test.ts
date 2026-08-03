@@ -812,4 +812,44 @@ describe("panel_restart_comfyui — restart dispatch record (r4/r5)", () => {
     // …only the shared process-wide (never-causation) slot knows of it.
     expect(getRestartDispatchRecord(PROCESS_WIDE_RESTART_DISPATCH_TOKEN)).not.toBeNull();
   });
+
+  it("a dispatch stamped DURING a decline probe survives the exoneration clear (r15)", async () => {
+    // A decline probe is in flight when a NEW accepted restart stamps a fresh
+    // token in the SAME session. The probe then returns healthy: the
+    // exoneration clear must be CLEAR-IF-SAME — it may retire the OLD token it
+    // validated, but never evict the NEWER dispatch's record.
+    const { ctx, sends } = makeCtx({ confirm: "no" });
+    __panelToolsTestHooks.seedSessionRestartDispatch(ctx, { at: Date.now(), base: BOOT_BASE }); // T1
+
+    let probed = 0;
+    __panelToolsTestHooks.setHealthProbe(async () => {
+      probed++;
+      if (probed === 1) {
+        // The concurrent accepted restart, mid-probe: stamps T2 (replacing T1)
+        // at acceptance; its own observer only ever sees "down" → never ready
+        // → no clear of its own.
+        ctx.confirm = async () => "yes" as const;
+        await restartTool().handler({}, ctx);
+        return "healthy";
+      }
+      return "down";
+    });
+
+    await restartTool().handler({}, ctx); // the decline: healthy → exoneration
+
+    // The NEWER dispatch's record SURVIVES the decline's exoneration clear…
+    const held = __panelToolsTestHooks.getSessionRestartDispatch(ctx);
+    expect(held).not.toBeNull();
+    expect(__panelToolsTestHooks.sameHttpBase(held!.base, BOOT_BASE)).toBe(true);
+    expect(sends.filter((c) => c.cmd === "comfy_reboot")).toHaveLength(1);
+
+    // …so a later full-window down correctly attributes to the newer dispatch.
+    ctx.confirm = async () => "no" as const;
+    __panelToolsTestHooks.setHealthProbe(async () => "down");
+    const res2 = await restartTool().handler({}, ctx);
+    const t2 = text(res2);
+    expect(t2).toMatch(/ComfyUI is DOWN/i);
+    expect(t2).toMatch(/STOPPED and did not come back/i);
+    expect(t2).toMatch(/restart initiated earlier/i);
+  });
 });

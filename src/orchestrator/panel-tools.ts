@@ -971,27 +971,37 @@ let declineProbeTimingOverride: {
 const sessionRestartDispatchTokens = new WeakMap<object, string>();
 
 /** Stamp a restart dispatch and hold its token on THIS session (replacing any
- *  record the session previously held — a session has at most one live one). */
-function stampSessionRestartDispatch(ctx: PanelToolCtx, base: string | null): void {
+ *  record the session previously held — a session has at most one live one).
+ *  Returns the held token so clears can be CLEAR-IF-SAME (r15). */
+function stampSessionRestartDispatch(ctx: PanelToolCtx, base: string | null): string {
   const prev = sessionRestartDispatchTokens.get(ctx);
   if (prev) clearRestartDispatch(prev);
-  sessionRestartDispatchTokens.set(ctx, recordRestartDispatch(base));
+  const token = recordRestartDispatch(base);
+  sessionRestartDispatchTokens.set(ctx, token);
+  return token;
+}
+
+/** The dispatch token THIS session currently holds, or undefined. */
+function sessionRestartDispatchToken(ctx: PanelToolCtx): string | undefined {
+  return sessionRestartDispatchTokens.get(ctx);
 }
 
 /** The restart-dispatch record THIS session holds, or null. */
 function sessionRestartDispatch(
   ctx: PanelToolCtx,
 ): { at: number; base: string | null } | null {
-  const held = sessionRestartDispatchTokens.get(ctx);
+  const held = sessionRestartDispatchToken(ctx);
   return held ? getRestartDispatchRecord(held) : null;
 }
 
-/** Clear ONLY this session's own dispatch record (observed-back). */
-function clearSessionRestartDispatch(ctx: PanelToolCtx): void {
-  const held = sessionRestartDispatchTokens.get(ctx);
-  if (!held) return;
+/** Clear ONLY when the session STILL holds `token` (r15): a newer dispatch
+ *  that landed since `token` was validated keeps its record — a
+ *  read-current-then-clear would evict the newer dispatch's record and make a
+ *  later persistent DOWN falsely report "no restart was dispatched". */
+function clearSessionRestartDispatchIfSame(ctx: PanelToolCtx, token: string): void {
+  if (sessionRestartDispatchTokens.get(ctx) !== token) return;
   sessionRestartDispatchTokens.delete(ctx);
-  clearRestartDispatch(held);
+  clearRestartDispatch(token);
 }
 
 /**
@@ -5595,6 +5605,13 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           const declineProbeBase = boundToRestartTarget
             ? declineBootBase
             : getComfyUIBaseUrl();
+          // r15: capture the session's held dispatch TOKEN before the probe
+          // awaits — the exoneration clear (r13) and the recovery claim (r14)
+          // must key on the token VALIDATED HERE, never whichever token is
+          // current after the awaits: a concurrent accepted restart stamping a
+          // fresh token mid-probe keeps its record (clear-if-same below), so a
+          // later persistent DOWN can still attribute to it.
+          const declineHeldToken = sessionRestartDispatchToken(ctx);
           const declineTiming = declineProbeTimingOverride ?? {
             windowMs: DECLINE_PROBE_WINDOW_MS,
             intervalMs: DECLINE_PROBE_INTERVAL_MS,
@@ -5607,6 +5624,12 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             declineTiming.probeTimeoutMs,
             overallDeadline,
           );
+          // The VALIDATED token's record (null when it was superseded by a
+          // newer stamp during the probe — the conservative outcome: neither
+          // claim nor clear keys on a record this probe didn't validate).
+          const declineHeldRecord = declineHeldToken
+            ? getRestartDispatchRecord(declineHeldToken)
+            : null;
           // r13: a HEALTHY/RECOVERED observation exonerates any dispatch THIS
           // session has on record — the restart explained itself, so its token
           // must never ground causation for a LATER, independent failure.
@@ -5617,14 +5640,17 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // r14: the record is captured BEFORE the clear — the recovery CLAIM
           // below ("a restart initiated earlier appears to have completed")
           // requires the token to have been present at this moment.
-          const heldBeforeProbeOutcome = sessionRestartDispatch(ctx);
+          // r15: CLEAR-IF-SAME — the clear fires only when the session still
+          // holds the SAME token validated before the probe; a newer dispatch
+          // stamped mid-probe keeps its record.
           if (outcome.status === "healthy" || outcome.status === "recovered") {
             if (
-              heldBeforeProbeOutcome != null &&
-              (heldBeforeProbeOutcome.base == null ||
-                sameHttpBase(heldBeforeProbeOutcome.base, declineProbeBase))
+              declineHeldToken != null &&
+              declineHeldRecord != null &&
+              (declineHeldRecord.base == null ||
+                sameHttpBase(declineHeldRecord.base, declineProbeBase))
             ) {
-              clearSessionRestartDispatch(ctx);
+              clearSessionRestartDispatchIfSame(ctx, declineHeldToken);
             }
           }
           if (outcome.status === "down") {
@@ -5684,10 +5710,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             // proves nothing about what caused the down: report the recovery
             // causation-free.
             const recoveryCausative =
-              heldBeforeProbeOutcome != null &&
-              Date.now() - heldBeforeProbeOutcome.at <= RESTART_DISPATCH_CAUSATION_WINDOW_MS &&
-              (heldBeforeProbeOutcome.base == null ||
-                sameHttpBase(heldBeforeProbeOutcome.base, declineBootBase));
+              declineHeldRecord != null &&
+              Date.now() - declineHeldRecord.at <= RESTART_DISPATCH_CAUSATION_WINDOW_MS &&
+              (declineHeldRecord.base == null ||
+                sameHttpBase(declineHeldRecord.base, declineBootBase));
             return ok(
               recoveryCausative
                 ? "Cancelled — no new restart was dispatched. Note: ComfyUI was briefly " +
@@ -5984,9 +6010,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             // binding held, so healthBase is non-null here). restartComfyUI
             // also stamped its own process-wide record, which never grounds
             // causation. Only a PROVEN stop is recorded; a refusal/timeout
-            // (restart undefined, or stopped!==true) records nothing.
+            // (restart undefined, or stopped!==true) records nothing. The
+            // token is kept so the recovery clear below is CLEAR-IF-SAME (r15).
+            let legacyDispatchToken: string | undefined;
             if (restart?.stopped === true) {
-              stampSessionRestartDispatch(ctx, healthBase);
+              legacyDispatchToken = stampSessionRestartDispatch(ctx, healthBase);
             }
             // DEFINITIVE no-restart: a spawn failure, OR restartComfyUI refused before
             // stopping anything (no process found / unsafe relaunch → stopped:false &&
@@ -6007,10 +6035,14 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             // Otherwise (the process WAS stopped/started, or restartComfyUI's own readiness
             // poll merely expired — neither terminal) DEFER to OUR OWN observed DOWN→UP.
             const recovery = await proofPromise;
-            // #742 r4/r5: the managed restart was observed back — clear THIS
-            // session's record (restartComfyUI also clears its own process-wide
-            // record on success; this covers only-observer-saw-it recoveries).
-            if (recovery.ready) clearSessionRestartDispatch(ctx);
+            // #742 r4/r5/r15: the managed restart was observed back — clear THIS
+            // session's record, CLEAR-IF-SAME: only when the session still holds
+            // the token THIS restart stamped (a concurrent dispatch's newer
+            // record survives). restartComfyUI also clears its own process-wide
+            // record on success; this covers only-observer-saw-it recoveries.
+            if (recovery.ready && legacyDispatchToken != null) {
+              clearSessionRestartDispatchIfSame(ctx, legacyDispatchToken);
+            }
             const observed = recovery.via === "observed-cycle";
             // The legacy Manager path restarts ComfyUI out-of-band too. Server recovery alone
             // is not graph-tool readiness: wait for the browser tab to reconnect, then verify
@@ -6080,9 +6112,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // instance a later decline would probe, and a session that rebinds to
         // the boot tab afterward can't claim it either (a re-targeted session
         // can't prove the earlier dispatch hit its current instance — no claim
-        // is the truthful answer). It is cleared below if observed back.
+        // is the truthful answer). It is cleared below if observed back —
+        // CLEAR-IF-SAME on the token stamped here (r15).
+        let acceptedDispatchToken: string | undefined;
         if (healthBase != null && sameHttpBase(getComfyUIBaseUrl(), healthBase)) {
-          stampSessionRestartDispatch(ctx, healthBase);
+          acceptedDispatchToken = stampSessionRestartDispatch(ctx, healthBase);
         } else {
           recordRestartDispatch(getComfyUIBaseUrl(), PROCESS_WIDE_RESTART_DISPATCH_TOKEN);
         }
@@ -6122,9 +6156,12 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // down→up, which the observer has been (and continues) watching for.
         gate.deadline = Math.min(Date.now() + timing.budgetMs, overallDeadline);
         const recovery = await recoveryPromise!;
-        // #742 r4/r5: the dispatched restart was observed back — clear THIS
-        // session's record (never another session's).
-        if (recovery.ready) clearSessionRestartDispatch(ctx);
+        // #742 r4/r5/r15: the dispatched restart was observed back — clear the
+        // record, CLEAR-IF-SAME: only when the session still holds the token
+        // THIS dispatch stamped (a concurrent dispatch's newer record survives).
+        if (recovery.ready && acceptedDispatchToken != null) {
+          clearSessionRestartDispatchIfSame(ctx, acceptedDispatchToken);
+        }
         if (!recovery.ready) {
           const waited = Math.round(recovery.waited_ms / 1000);
           return ok({
