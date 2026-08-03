@@ -2713,37 +2713,56 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
     }
   };
   /**
-   * Is `rel` the name the file on disk ACTUALLY has, segment for segment?
+   * Is `name` the name the file on disk ACTUALLY has, segment for segment? When it
+   * is not, report the on-disk spelling that came closest so the refusal can name
+   * it.
    *
-   * `resolve(dir, rel)` answers in the filesystem's terms, not the store's (codex
+   * `resolve(dir, name)` answers in the FILESYSTEM's terms, not the store's (codex
    * MAJOR). It collapses repeated separators, so "recipes//foo.json" — a distinct
    * key everywhere else in this resolver — silently opens recipes/foo.json; and on
    * a case-insensitive volume `foo.json` opens an on-disk `Foo.json`, the very
    * substitution the server path refuses. That left the two branches applying
-   * different rules to the same input depending only on whether ComfyUI happened
-   * to answer.
+   * different rules to the same input depending only on whether ComfyUI answered.
    *
    * Walking the directory entries restores one rule: every segment must appear
    * VERBATIM in its parent listing. An empty segment (from a repeated separator)
-   * can never match, and a case- or normalization-different on-disk name is
-   * refused exactly as it would be against the server.
+   * can never match, and a case- or normalization-different on-disk name is refused
+   * exactly as it would be against the server.
+   *
+   * The segmentation follows the PLATFORM, matching whatever `resolve()` just did
+   * (codex MAJOR). On Windows a backslash is a separator — and a file literally
+   * named `recipes\foo.json` cannot exist — so the folder reading is the only
+   * reading. On POSIX a backslash is an ordinary filename character, `resolve()`
+   * produces the LITERAL path, and this must too: splitting it there would bless a
+   * folder reading that the server-first rule never authorised, letting an
+   * unreachable server's `recipes/foo.json` stand in for a literal
+   * `recipes\foo.json` that may well exist.
    */
-  const localNameIsExact = (base: string, name: string): boolean => {
-    // Split on BOTH separators: Windows resolve() honours either, so the check has
-    // to see the same segmentation the read would.
-    const segs = name.split(/[\\/]/);
+  const platformSegments = (name: string): string[] =>
+    name.split(sep === "\\" ? /[\\/]/ : /\//);
+  const localSpelling = (
+    base: string,
+    name: string,
+  ): { exact: true } | { exact: false; onDisk?: string } => {
     let dir = base;
-    for (const seg of segs) {
+    const segs = platformSegments(name);
+    for (let i = 0; i < segs.length; i++) {
       let entries: string[];
       try {
         entries = readdirSync(dir);
       } catch {
-        return false;
+        return { exact: false };
       }
-      if (!entries.includes(seg)) return false;
-      dir = join(dir, seg);
+      if (entries.includes(segs[i])) {
+        dir = join(dir, segs[i]);
+        continue;
+      }
+      // Not spelled the way it was asked for. Name the entry it would have been, so
+      // the caller can retype it — reported only, never loaded.
+      const near = entries.find((e) => looseName(e) === looseName(segs[i]));
+      return { exact: false, onDisk: near ? join(dir, near, ...segs.slice(i + 1)) : undefined };
     }
-    return true;
+    return { exact: true };
   };
   // Spellings that exist on disk but are NOT what was asked for — reported so the
   // refusal is actionable, never loaded.
@@ -2752,9 +2771,10 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
     .map((dir) => ({ dir, path: resolve(dir, rel) }))
     .filter(({ path }) => existsSync(path) && statSync(path).isFile())
     .filter(({ dir, path }) => realBaseUnder(dir, path))
-    .filter(({ dir, path }) => {
-      if (localNameIsExact(dir, rel)) return true;
-      misspelled.push(path);
+    .filter(({ dir }) => {
+      const spelling = localSpelling(dir, rel);
+      if (spelling.exact) return true;
+      if (spelling.onDisk) misspelled.push(spelling.onDisk);
       return false;
     })
     .map(({ path }) => path);
@@ -2774,8 +2794,8 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
     `No workflow file at "${p}". It ${outcome.detail}, and it is not under the orchestrator's ` +
       `reconstructed workflows dir (${comfyWorkflowsDirs().join(" or ") || "COMFYUI_PATH not set"}).` +
       (misspelled.length
-        ? ` A file exists at ${misspelled.map((f) => `"${f}"`).join(", ")}, but its name on disk is` +
-          ` not spelled the way you asked (letter case, repeated separator, or Unicode` +
+        ? ` A file exists on disk as ${misspelled.map((f) => `"${f}"`).join(", ")}, which is` +
+          ` not how you spelled it (letter case, repeated separator, or Unicode` +
           ` normalization), and with ComfyUI unreachable there is no authority to confirm they are` +
           ` the same file — so it was NOT loaded. Retype the name exactly, or pass an absolute path.`
         : "") +

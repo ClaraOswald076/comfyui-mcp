@@ -17,7 +17,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 
 // Stub ONLY getClient so no real ComfyUI connection is attempted; every other
 // client export keeps its real implementation (panel-tools' module graph uses
@@ -420,7 +420,7 @@ describe("readWorkflowFromPath: a refusal is never mistaken for an unreachable s
       expect(calls).toHaveLength(0);
       if (caseInsensitiveVolume) {
         // The differently-cased file is NAMED so the caller can retype it.
-        expect(JSON.stringify(res)).toMatch(/not spelled the way you asked/i);
+        expect(JSON.stringify(res)).toMatch(/not how you spelled it/i);
       }
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -448,6 +448,39 @@ describe("readWorkflowFromPath: a refusal is never mistaken for an unreachable s
 
       expect(res.isError).toBe(true);
       expect(calls).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reads a backslash name the way the LOCAL platform would, or not at all", async () => {
+    // With no server there is no authority to disprove the literal reading, so the
+    // local branch may only apply the platform's own semantics (codex MAJOR):
+    //   - Windows: a file named "recipes\foo.json" cannot exist, so the folder
+    //     reading is the ONLY reading and resolve() is right to take it.
+    //   - POSIX: the backslash is an ordinary filename character, so resolve()
+    //     produces the LITERAL path; the folder reading was never authorised and
+    //     must not be substituted.
+    const root = mkdtempSync(join(tmpdir(), "cmcp-userdir-"));
+    try {
+      const nested = join(root, "user", "default", "workflows", "recipes");
+      mkdirSync(nested, { recursive: true });
+      const staged = { nodes: [{ id: 84, type: "PlatformSeparatorNode" }], links: [] };
+      writeFileSync(join(nested, "foo.json"), JSON.stringify(staged), "utf8");
+      process.env.COMFYUI_PATH = root;
+
+      fetchApi.mockRejectedValue(new Error("ECONNREFUSED"));
+
+      const { ctx, calls } = makeCtx();
+      const res = await loadWorkflow().handler({ path: "recipes\\foo.json" }, ctx);
+
+      if (sep === "\\") {
+        expect(res.isError).toBeUndefined();
+        expect(calls[0].graph).toMatchObject(staged);
+      } else {
+        expect(res.isError).toBe(true);
+        expect(calls).toHaveLength(0);
+      }
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
