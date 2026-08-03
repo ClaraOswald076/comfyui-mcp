@@ -43,6 +43,16 @@ const mockLiveRootFromArgv = vi.hoisted(() =>
   vi.fn<[string[], string?], string | undefined>(),
 );
 /** Contents served for `<Data>/settings.json`, or undefined for "no such file". */
+/** An error carrying an errno `code`, as the real fs/child_process produce. */
+const errno = vi.hoisted(
+  () =>
+    (code: string, message?: string): NodeJS.ErrnoException => {
+      const err = new Error(message ?? code) as NodeJS.ErrnoException;
+      err.code = code;
+      return err;
+    },
+);
+
 const mockSettingsJsonRef = vi.hoisted(() => ({
   value: undefined as string | undefined,
   /** The file exists on disk but reading it throws. */
@@ -71,13 +81,15 @@ vi.mock("node:fs", () => ({
   }),
   // Serves the launcher's own config file (launcherConfigMentions); everything
   // else — /proc reads — is absent, as on the reporter's platform.
+  // Errors carry a `code`, because the launcher-config classifier reads the FAILURE
+  // MODE: only ENOENT means "not there", everything else means "could not look".
   readFileSync: vi.fn((p: string) => {
     const s = String(p);
     if (/settings\.jsonc?$/i.test(s)) {
-      if (mockSettingsJsonRef.unreadable) throw new Error("EACCES");
+      if (mockSettingsJsonRef.unreadable) throw errno("EACCES", "permission denied");
       if (mockSettingsJsonRef.value !== undefined) return mockSettingsJsonRef.value;
     }
-    throw new Error("ENOENT");
+    throw errno("ENOENT", "no such file or directory");
   }),
   statSync: vi.fn((p: string) => {
     if (!mockExistsSync(String(p))) throw new Error("ENOENT");
@@ -154,6 +166,24 @@ const BENIGN_PINOKIO_PY = join(PINOKIO_BIN, "comfy", "venv", "bin", "python");
 
 const ORIGINAL_ENV = { ...process.env };
 
+/**
+ * `lsof` exiting 1 with no output — its convention for "ran fine, matched
+ * nothing". Distinct from a spawn failure (which carries a `code`), because the
+ * port probe must not read "I could not look" as "the port is free".
+ */
+function noListener(): Error {
+  const err = new Error("no listener") as Error & { status?: number };
+  err.status = 1;
+  return err;
+}
+
+/** A port probe that FAILS rather than reporting the port free. */
+function portProbeUnavailable(): NodeJS.ErrnoException {
+  const err = new Error("spawn lsof ENOENT") as NodeJS.ErrnoException;
+  err.code = "ENOENT";
+  return err;
+}
+
 /** Case-insensitive env lookup (Windows env blocks are case-insensitive). */
 function envGet(env: NodeJS.ProcessEnv, name: string): string | undefined {
   const wanted = name.toLowerCase();
@@ -177,7 +207,7 @@ function mockLivePortThenFree(): { killed: () => boolean } {
         : "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
     }
     if (/lsof/i.test(cmd)) {
-      if (killed) throw new Error("not listening");
+      if (killed) throw noListener();
       return "p4321\nn127.0.0.1:8188\n";
     }
     return "";
@@ -222,10 +252,13 @@ beforeEach(() => {
   // No live-process environment is readable by default (the Windows/macOS case,
   // and the #776 reporter's platform). Individual tests opt in.
   __processControlTestHooks.setLiveEnvResolver(() => undefined);
-  // Likewise no creation-time stamp by default — the shape on the platforms where
-  // the native read is deliberately skipped. Tests that exercise PID identity
-  // install their own resolver.
-  __processControlTestHooks.setProcessIdentityResolver(() => undefined);
+  // A readable creation stamp but no command line — the neutral shape. The stamp is
+  // required to close the identity bracket around /system_stats; leaving the command
+  // line out keeps the argv-corroboration check out of the way of tests that are not
+  // about it. Tests exercising PID identity install their own resolver.
+  __processControlTestHooks.setProcessIdentityResolver(() => ({
+    startedAt: "stable-stamp",
+  }));
   // Default lineage: the process on the port IS our child. Ownership tests
   // override this; every other test just needs the common case not to lie.
   __processControlTestHooks.setParentPidResolver(() => process.pid);
@@ -779,8 +812,9 @@ describe("restart_comfyui — a PID is not a process identity (#776)", () => {
       PATH: "/some/unrelated/process/path",
       NOT_COMFYUI: "1",
     }));
-    // lookup, then the re-verify after the env read sees a different process.
-    identitySequence(["t1", "t2"], PINOKIO_ARGV);
+    // The identity bracket around /system_stats closes cleanly (reads 1-3 agree);
+    // it is the re-verify AFTER the environment read that sees a different process.
+    identitySequence(["t1", "t1", "t1", "t2"], PINOKIO_ARGV);
     mockLivePortThenFree();
     spawnCapturingChildren();
     const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
@@ -924,7 +958,7 @@ describe("restart_comfyui — a PID is not a process identity (#776)", () => {
       }
       if (/lsof/i.test(cmd)) {
         netstatCalls++;
-        if (netstatCalls > IDENTIFY_LOOKUPS) throw new Error("not listening");
+        if (netstatCalls > IDENTIFY_LOOKUPS) throw noListener();
         return "p4321\nn127.0.0.1:8188\n";
       }
       return "";
@@ -951,7 +985,9 @@ describe("restart_comfyui — a PID is not a process identity (#776)", () => {
     // The stronger identity: the number is still listening, but it is not the
     // process we identified (#650's pid + creation-time identity).
     usePlainInstallForIdentity();
-    identitySequence(["t1", "t2"], PLAIN_ARGV); // lookup, then the pre-kill re-verify
+    // Identification (reads 1-3) is consistent; the PRE-KILL re-verify sees the
+    // number now belonging to a different process.
+    identitySequence(["t1", "t1", "t1", "t2"], PLAIN_ARGV);
     mockLivePortThenFree();
     spawnCapturingChildren();
     const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
@@ -1008,6 +1044,64 @@ describe("restart_comfyui — a PID is not a process identity (#776)", () => {
     killSpy.mockRestore();
   });
 
+  it("REFUSES when the SAME pid number is a different process at each end of the bracket", async () => {
+    // Pid equality across a window is exactly what pid REUSE defeats: A owns 4321,
+    // answers /system_stats, exits, and B inherits 4321 before the closing lookup.
+    // Comparing numbers alone closes the bracket; comparing IDENTITY does not.
+    usePlainInstallForIdentity();
+    identitySequence(["A-started", "B-started"], PLAIN_ARGV);
+    mockLivePortThenFree();
+    spawnCapturingChildren();
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(false);
+    expect(result.started).toBe(false);
+    expect(result.message).toMatch(/changed while ComfyUI was being identified/i);
+    expect(result.message).toMatch(/different process reusing that number/i);
+    expect(killSpy).not.toHaveBeenCalled();
+    expect(mockSpawn).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  });
+
+  it("does NOT treat an unreadable port probe as proof the killed process died", async () => {
+    // `findPidByPort` answers null both for "port is free" and for "the lookup
+    // failed". Spending the second as the first tears supervision down under a
+    // server that may still be running.
+    usePlainInstallForIdentity();
+    let killIssued = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill|pkill|\bkill\b/i.test(cmd)) {
+        killIssued = true;
+        return "";
+      }
+      // EVERY port probe — netstat, the Get-NetTCPConnection fallback, and lsof —
+      // stops working once the kill has been issued. Anything less would leave one
+      // probe running and legitimately reporting the port free.
+      if (/netstat|Get-NetTCPConnection|lsof/i.test(cmd)) {
+        if (killIssued) throw portProbeUnavailable();
+        return /lsof/i.test(cmd)
+          ? "p4321\nn127.0.0.1:8188\n"
+          : "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
+      }
+      return "";
+    });
+    spawnCapturingChildren();
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(false);
+    expect(result.message).toMatch(/could not be checked after the kill/i);
+    expect(result.message).toMatch(/no evidence PID 4321 actually died/i);
+    expect(result.message).toMatch(/nothing was torn down/i);
+    expect(mockSpawn).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  }, 30_000);
+
   it("REFUSES rather than binding an answer it could not bracket (port lookup unreadable on one side)", async () => {
     // The bracket must be REQUIRED, not best-effort: if the pre-call lookup comes
     // back empty there is no anchor, and A-answers-then-B-takes-the-port with
@@ -1025,7 +1119,7 @@ describe("restart_comfyui — a PID is not a process identity (#776)", () => {
       }
       if (/lsof/i.test(cmd)) {
         lookups++;
-        if (lookups % 2 === 1) throw new Error("not listening");
+        if (lookups % 2 === 1) throw noListener();
         return "p4321\nn127.0.0.1:8188\n";
       }
       return "";
@@ -1037,7 +1131,7 @@ describe("restart_comfyui — a PID is not a process identity (#776)", () => {
 
     expect(result.stopped).toBe(false);
     expect(result.started).toBe(false);
-    expect(result.message).toMatch(/could not be read on both sides/i);
+    expect(result.message).toMatch(/could not be observed on both sides/i);
     expect(killSpy).not.toHaveBeenCalled();
     expect(mockSpawn).not.toHaveBeenCalled();
 
@@ -1063,7 +1157,7 @@ describe("restart_comfyui — a PID is not a process identity (#776)", () => {
       }
       if (/lsof/i.test(cmd)) {
         lookups++;
-        if (lookups === 1 || lookups >= 100) throw new Error("not listening");
+        if (lookups === 1 || lookups >= 100) throw noListener();
         return "p4321\nn127.0.0.1:8188\n";
       }
       return "";
@@ -1077,7 +1171,7 @@ describe("restart_comfyui — a PID is not a process identity (#776)", () => {
 
     const result = await restartComfyUI();
 
-    expect(result.message).not.toMatch(/could not be read on both sides/i);
+    expect(result.message).not.toMatch(/could not be observed on both sides/i);
     expect(result.stopped).toBe(true);
     expect(result.started).toBe(true);
 
@@ -1293,7 +1387,7 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
           : "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
       }
       if (/lsof/i.test(cmd)) {
-        if (killed && !restarted) throw new Error("not listening");
+        if (killed && !restarted) throw noListener();
         return "p4321\nn127.0.0.1:8188\n";
       }
       return "";
@@ -1344,7 +1438,7 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
         return killed ? "" : "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
       }
       if (/lsof/i.test(cmd)) {
-        if (killed) throw new Error("not listening");
+        if (killed) throw noListener();
         return "p4321\nn127.0.0.1:8188\n";
       }
       return "";
@@ -1389,7 +1483,7 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
           : "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
       }
       if (/lsof/i.test(cmd)) {
-        if (killed && !relaunched) throw new Error("not listening");
+        if (killed && !relaunched) throw noListener();
         return "p4321\nn127.0.0.1:8188\n";
       }
       return "";
@@ -1436,7 +1530,7 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
           : "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
       }
       if (/lsof/i.test(cmd)) {
-        if (killed && !relaunched) throw new Error("not listening");
+        if (killed && !relaunched) throw noListener();
         return "p4321\nn127.0.0.1:8188\n";
       }
       return "";
@@ -1492,7 +1586,7 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
           : "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
       }
       if (/lsof/i.test(cmd)) {
-        if (killed && !relaunched) throw new Error("not listening");
+        if (killed && !relaunched) throw noListener();
         return "p4321\nn127.0.0.1:8188\n";
       }
       return "";
@@ -1564,7 +1658,7 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
           : `  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       ${relaunched ? 9999 : 4321}`;
       }
       if (/lsof/i.test(cmd)) {
-        if (killed && !relaunched) throw new Error("not listening");
+        if (killed && !relaunched) throw noListener();
         return `p${relaunched ? 9999 : 4321}\nn127.0.0.1:8188\n`;
       }
       return "";
@@ -1607,7 +1701,7 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
           : `  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       ${relaunched ? 9999 : 4321}`;
       }
       if (/lsof/i.test(cmd)) {
-        if (killed && !relaunched) throw new Error("not listening");
+        if (killed && !relaunched) throw noListener();
         return `p${relaunched ? 9999 : 4321}\nn127.0.0.1:8188\n`;
       }
       return "";
@@ -1664,7 +1758,7 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
           : "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       7777";
       }
       if (/lsof/i.test(cmd)) {
-        if (killed && !relaunched) throw new Error("not listening");
+        if (killed && !relaunched) throw noListener();
         return "p7777\nn127.0.0.1:8188\n";
       }
       return "";
@@ -1710,7 +1804,7 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
         return probed ? "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       7777" : "";
       }
       if (/lsof/i.test(cmd)) {
-        if (!probed) throw new Error("not listening");
+        if (!probed) throw noListener();
         return "p7777\nn127.0.0.1:8188\n";
       }
       return "";
@@ -1754,7 +1848,7 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
         return killed ? "" : "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
       }
       if (/lsof/i.test(cmd)) {
-        if (killed) throw new Error("not listening");
+        if (killed) throw noListener();
         return "p4321\nn127.0.0.1:8188\n";
       }
       return "";
@@ -1770,6 +1864,93 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
     expect(result.listener_ownership).toBe("unconfirmed");
     expect(result.started).toBe(true);
     expect(result.message).not.toMatch(/restarted successfully/i);
+
+    killSpy.mockRestore();
+  });
+
+  it("does NOT call a foreign listener ours when its argv is a strict SUBSET of what we launched", async () => {
+    // `commandLineMatchesArgv(haystack, tokens)` is a containment test, so a single
+    // call in one direction is a SUBSET check: a foreign server started with fewer
+    // flags would "match" ours and be promoted. Comparing both ways closes that.
+    usePlainInstall();
+    // Ours carries an extra flag; theirs is otherwise identical.
+    mockGetSystemStats.mockImplementation(async () => ({
+      system: { argv: [PLAIN_MAIN, "--port", "8188"] },
+    }));
+    servingArgvAfterRestart([PLAIN_MAIN]); // a strict subset of our launch argv
+    spawnCapturingChildren(4321);
+    let killed = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill|pkill|\bkill\b/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (/netstat/i.test(cmd)) {
+        return killed ? "" : "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed) throw noListener();
+        return "p4321\nn127.0.0.1:8188\n";
+      }
+      return "";
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true }) as Response),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    // The port owner is unmappable after the kill, so argv is the only signal —
+    // and a subset must read as DIFFERENT, not as a match.
+    expect(result.listener_ownership).toBe("not-ours");
+    expect(result.message).not.toMatch(/restarted successfully/i);
+
+    killSpy.mockRestore();
+  });
+
+  it("treats an EXHAUSTED lineage walk as 'do not know', never as a foreign process", async () => {
+    // A deep-but-legitimate wrapper chain runs out of hop budget. Running out of
+    // budget is not a negative answer, and reporting one would tell that user their
+    // own server is not theirs.
+    usePlainInstall();
+    servingArgvAfterRestart("unreachable"); // argv cannot rescue it either
+    spawnCapturingChildren(4321);
+    let killed = false;
+    let relaunched = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill|pkill|\bkill\b/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (/netstat/i.test(cmd)) {
+        return killed && !relaunched
+          ? ""
+          : `  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       ${relaunched ? 9999 : 4321}`;
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed && !relaunched) throw noListener();
+        return `p${relaunched ? 9999 : 4321}\nn127.0.0.1:8188\n`;
+      }
+      return "";
+    });
+    // An unbroken chain that never reaches us and never reaches init.
+    __processControlTestHooks.setParentPidResolver((pid) => pid + 1);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        relaunched = true;
+        return { ok: true } as Response;
+      }),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.listener_ownership).toBe("unconfirmed");
+    expect(result.started).toBe(true);
+    expect(result.message).not.toMatch(/NOT as a result of this restart/i);
 
     killSpy.mockRestore();
   });
@@ -1796,7 +1977,7 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
           : `  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       ${relaunched ? 9999 : 4321}`;
       }
       if (/lsof/i.test(cmd)) {
-        if (killed && !relaunched) throw new Error("not listening");
+        if (killed && !relaunched) throw noListener();
         return `p${relaunched ? 9999 : 4321}\nn127.0.0.1:8188\n`;
       }
       return "";
@@ -1842,7 +2023,7 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
         return killed ? "" : "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
       }
       if (/lsof/i.test(cmd)) {
-        if (killed) throw new Error("not listening");
+        if (killed) throw noListener();
         return "p4321\nn127.0.0.1:8188\n";
       }
       return "";
@@ -1916,7 +2097,7 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
           : "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       7777";
       }
       if (/lsof/i.test(cmd)) {
-        if (killed && netstatCalls++ === 0) throw new Error("not listening");
+        if (killed && netstatCalls++ === 0) throw noListener();
         return "p7777\nn127.0.0.1:8188\n";
       }
       return "";

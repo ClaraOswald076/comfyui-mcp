@@ -21,7 +21,11 @@ import {
   type LaunchEnvResolution,
 } from "./launcher-env.js";
 import { resetManagerApiCache } from "./manager-api-cache.js";
-import { parseListenerPidFromNetstat, findPidByPort } from "./port-owner.js";
+import {
+  parseListenerPidFromNetstat,
+  findPidByPort,
+  probePortOwner,
+} from "./port-owner.js";
 import {
   recordLaunchedInterpreter,
   clearLaunchedInterpreter,
@@ -376,14 +380,28 @@ function findDesktopExePath(argv: string[]): string | undefined {
   return undefined;
 }
 
+/**
+ * Wait until the port is OBSERVED free.
+ *
+ * "Observed" is the load-bearing word: `findPidByPort` returns null both when
+ * nothing is listening and when the lookup itself failed, and treating the second
+ * as the first would let a transient failure certify that a still-running server
+ * had gone (codex gate). So this polls the tri-state probe and returns only on a
+ * definite `free`; an `unknown` keeps waiting and, if that is all we ever get,
+ * surfaces as the timeout — a caller must not read it as success.
+ */
 async function waitForPortFree(port: number, timeoutMs = 15000): Promise<void> {
   const start = Date.now();
+  let lastUnknown: string | undefined;
   while (Date.now() - start < timeoutMs) {
-    if (findPidByPort(port) === null) return;
+    const probe = probePortOwner(port);
+    if (probe.state === "free") return;
+    if (probe.state === "unknown") lastUnknown = probe.reason;
     await sleep(500);
   }
   throw new ProcessControlError(
-    `Port ${port} still in use after ${timeoutMs / 1000}s`,
+    `Port ${port} still in use after ${timeoutMs / 1000}s` +
+      (lastUnknown ? ` (last port probe could not complete: ${lastUnknown})` : ""),
   );
 }
 
@@ -577,17 +595,21 @@ function readParentPid(pid: number): number | undefined {
  * Returns `undefined` the moment the chain becomes unreadable — not knowing is
  * never promoted to a claim in either direction.
  */
-function isOurDescendant(pid: number, maxHops = 4): boolean | undefined {
+function isOurDescendant(pid: number, maxHops = 8): boolean | undefined {
   let current = pid;
   for (let hop = 0; hop < maxHops; hop++) {
     if (current === process.pid) return true;
     const parent = readParentPid(current);
     if (parent == null) return undefined;
-    // pid 1 / 0 / self-parenting = we reached the top without finding ourselves.
+    // pid 1 / 0 / self-parenting = we reached the TOP of the tree without finding
+    // ourselves, which is a real negative answer.
     if (parent === current || parent <= 1) return false;
     current = parent;
   }
-  return false;
+  // Ran out of budget. That is "I did not finish looking", NOT "it is not ours" —
+  // a deep-but-legitimate wrapper chain must not be reported as a foreign server
+  // just because the walk was bounded (codex gate).
+  return undefined;
 }
 
 /**
@@ -637,9 +659,32 @@ function classifyListenerOwnership(input: {
    */
   const byArgv = (): "match" | "differ" | "unknown" => {
     if (!input.servingArgv?.length || !input.launchArgv?.length) return "unknown";
-    return commandLineMatchesArgv(input.launchArgv.join(" "), input.servingArgv)
-      ? "match"
-      : "differ";
+    // BOTH directions. `commandLineMatchesArgv(haystack, tokens)` only asks whether
+    // every token appears in the haystack, so a single call is a SUBSET test — and
+    // a foreign server whose argv is a strict subset of ours would "match", turning
+    // the deliberately non-promoting match into a false one (codex gate). Compare
+    // each way instead. The interpreter is dropped from our side because the server
+    // reports `sys.argv`, which never contains it.
+    // Path-like tokens are reduced to their final segment for the reverse check.
+    // We resolve the script to an ABSOLUTE path to launch it, while the server
+    // reports the (often RELATIVE) `sys.argv` it was handed — and
+    // commandLineMatchesArgv treats an absolute token as an exact claim by design
+    // (#401). Comparing them verbatim would make every portable-launcher install
+    // read as a different server. Flags are left alone, so a foreign SUBSET still
+    // fails on the missing ones.
+    const ourTokens = input.launchArgv
+      .slice(1)
+      .map((t) => (looksLikePath(t) ? t.split(/[\\/]/).pop() || t : t));
+    if (ourTokens.length === 0) return "unknown";
+    const servingContainsOurs = commandLineMatchesArgv(
+      input.servingArgv.join(" "),
+      ourTokens,
+    );
+    const oursContainsServing = commandLineMatchesArgv(
+      input.launchArgv.join(" "),
+      input.servingArgv,
+    );
+    return servingContainsOurs && oursContainsServing ? "match" : "differ";
   };
   // A Desktop launch is undecidable BY DESIGN: we spawn the Electron shell (or
   // macOS `open`) and its child binds the port, so a pid mismatch proves nothing.
@@ -1608,18 +1653,30 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
   // came back empty we have no anchor, and A-answers-then-B-takes-the-port with
   // identical argv would sail through every later self-consistent check. A single
   // flaky lookup is retried; a bracket we still cannot close refuses.
-  const safeFindPid = (): number | null => {
+  //
+  // Both ends of the bracket compare a full process IDENTITY, not a pid number:
+  // pid equality across a window is exactly what pid REUSE defeats (A owns 4321,
+  // answers, exits; B inherits 4321 before the closing lookup and the bracket would
+  // close on the number alone). So each end reads pid + creation time together, and
+  // an end whose stamp cannot be read is "did not observe", never "observed the
+  // same" (codex gate).
+  const observeOwner = (): { pid: number; startedAt: string } | null => {
+    let owner: number | null = null;
     try {
-      return findPidByPort(port);
+      owner = findPidByPort(port);
     } catch {
       return null;
     }
+    if (owner == null) return null;
+    const startedAt = resolveProcessIdentity(owner)?.startedAt;
+    return startedAt ? { pid: owner, startedAt } : null;
   };
+
   let argv: string[] = [];
   let pid: number | null = null;
   let bracketed = false;
   for (let attempt = 0; attempt < 2; attempt++) {
-    const ownerBefore = safeFindPid();
+    const before = observeOwner();
     try {
       const stats = await getSystemStats();
       argv = stats.system.argv ?? [];
@@ -1627,18 +1684,26 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
       argv = [];
       logger.warn("Could not fetch system_stats — will rely on PID detection");
     }
-    const ownerAfter = safeFindPid();
-    pid = ownerAfter ?? ownerBefore;
+    const after = observeOwner();
+    pid = after?.pid ?? before?.pid ?? null;
+    if (pid == null) {
+      try {
+        pid = findPidByPort(port);
+      } catch {
+        pid = null;
+      }
+    }
     // No answer to bind means there is nothing to mis-bind: the pid-only paths
     // below (including #449's reachable-but-unmapped) own that case.
     if (argv.length === 0) break;
-    if (ownerBefore != null && ownerAfter != null) {
-      if (ownerBefore !== ownerAfter) {
+    if (before && after) {
+      if (before.pid !== after.pid || before.startedAt !== after.startedAt) {
         const err = new ProcessControlError(
           `The process listening on port ${port} changed while ComfyUI was being identified ` +
-            `(PID ${ownerBefore} answered, PID ${ownerAfter} holds the port now). Nothing was ` +
-            `stopped: the launch arguments we hold describe the instance that has gone, not the ` +
-            `one running now. Re-run once the server has settled.`,
+            `(PID ${before.pid} answered; PID ${after.pid} holds the port now${
+              before.pid === after.pid ? ", and it is a different process reusing that number" : ""
+            }). Nothing was stopped: the launch arguments we hold describe the instance that has ` +
+            `gone, not the one running now. Re-run once the server has settled.`,
         );
         err.identityAmbiguous = true;
         throw err;
@@ -1646,14 +1711,14 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
       bracketed = true;
       break;
     }
-    // One side of the bracket was unreadable — retry once before giving up.
+    // One side of the bracket was unobservable — retry once before giving up.
   }
   if (argv.length > 0 && pid != null && !bracketed) {
     const err = new ProcessControlError(
-      `ComfyUI answered on port ${port}, but the process owning that port could not be read ` +
-        `on both sides of the request, so its answer cannot be tied to PID ${pid}. Nothing was ` +
-        `stopped: acting on an unverified pairing risks controlling the wrong process. Re-run, ` +
-        `or restart ComfyUI from the launcher that owns it.`,
+      `ComfyUI answered on port ${port}, but the identity of the process owning that port ` +
+        `could not be observed on both sides of the request, so its answer cannot be tied to ` +
+        `PID ${pid}. Nothing was stopped: acting on an unverified pairing risks controlling the ` +
+        `wrong process. Re-run, or restart ComfyUI from the launcher that owns it.`,
     );
     err.identityAmbiguous = true;
     throw err;
@@ -1857,39 +1922,41 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
   // wholesale — an ignored SIGTERM followed by a failed SIGKILL looks exactly like
   // success from here. The port is the observable that settles it: wait for it to
   // be released, and let the timeout DECIDE rather than merely warn.
-  let stillOurs = false;
+  let blockedReason: string | undefined;
   try {
     await waitForPortFree(info.port);
   } catch {
-    // Timed out. Distinguish "our target is still sitting there" (the kill did not
-    // work — the server is UP, so refusing is safe and correct) from "somebody else
-    // now holds the port" (our target did die; a successor took it).
-    let ownerNow: number | null = null;
-    try {
-      ownerNow = findPidByPort(info.port);
-    } catch {
-      ownerNow = null;
-    }
-    stillOurs = ownerNow === info.pid;
-    if (!stillOurs) {
+    // Timed out. Three outcomes, and they must NOT be conflated:
+    //   • still held by OUR target → the kill did not work; the server is UP, so
+    //     refusing is both safe and correct;
+    //   • held by somebody else → our target did die and a successor took the port;
+    //   • could not be determined → we have no proof the process died, and
+    //     "unknown" must never be spent as if it were proof.
+    const probe = probePortOwner(info.port);
+    if (probe.state === "owned" && probe.pid === info.pid) {
+      blockedReason =
+        `PID ${info.pid} still holds port ${info.port} after the kill was issued, so it is ` +
+        `still running`;
+    } else if (probe.state === "unknown") {
+      blockedReason =
+        `the port could not be checked after the kill (${probe.reason}), so there is no ` +
+        `evidence PID ${info.pid} actually died`;
+    } else {
       logger.warn(
         "Port did not free in time, but it is no longer held by the process we killed",
-        { pid: info.pid, owner: ownerNow ?? "(unmappable)" },
+        { pid: info.pid, owner: probe.state === "owned" ? probe.pid : "(free)" },
       );
     }
   }
-  if (stillOurs) {
+  if (blockedReason) {
     deliberateStop = false;
-    logger.warn("Stop aborted: the killed process still holds the port", {
-      pid: info.pid,
-      port: info.port,
-    });
+    logger.warn("Stop aborted before commit", { pid: info.pid, port: info.port, blockedReason });
     return {
       stopped: false,
       message:
-        `Could not stop ComfyUI: PID ${info.pid} still holds port ${info.port} after the kill ` +
-        `was issued, so it is still running. Nothing was torn down — its crash supervision ` +
-        `and launch record are untouched. Stop it from the launcher/console that owns it.`,
+        `Could not stop ComfyUI: ${blockedReason}. Nothing was torn down — its crash ` +
+        `supervision and launch record are untouched. Stop it from the launcher/console ` +
+        `that owns it.`,
       has_restart_info: false,
     };
   }

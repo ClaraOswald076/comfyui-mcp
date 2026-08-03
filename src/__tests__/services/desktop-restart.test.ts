@@ -80,6 +80,13 @@ beforeEach(() => {
     return "";
   });
   __processControlTestHooks.reset();
+  // The identity bracket around /system_stats (#776) runs for Desktop too — the
+  // Desktop classification is itself derived from that same possibly-stale argv, so
+  // it cannot be what decides whether to verify. It needs the port owner's creation
+  // time at both ends; model the ordinary host where that is readable.
+  __processControlTestHooks.setProcessIdentityResolver(() => ({
+    startedAt: "stable-stamp",
+  }));
 });
 
 describe("restartComfyUI — local Desktop (Manager reboot, never kill) [#400]", () => {

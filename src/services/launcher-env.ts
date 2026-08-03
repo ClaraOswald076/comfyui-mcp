@@ -225,15 +225,22 @@ function launcherConfigMentions(
     // a momentarily unreadable config would let a component be declared
     // "not installed", the restart proceed without it, and ComfyUI-Manager abort at
     // import — the original down-server bug, reached through the very rule meant to
-    // stop over-refusing. A config we cannot read tells us nothing, which is the
-    // ambiguous case (codex gate).
-    if (!pathExists(path)) continue;
+    // stop over-refusing.
+    //
+    // Which is why there is NO `existsSync` pre-screen here: `existsSync` answers
+    // FALSE for a path it cannot access, collapsing the two states before they can
+    // be told apart. Attempt the read and classify from the FAILURE MODE instead —
+    // only ENOENT/ENOTDIR mean "not there"; everything else means "could not look"
+    // (codex gate).
     try {
       const raw = readFileSync(path, "utf-8");
       // Config files here are a few KB; cap the scan so a pathological file
       // cannot cost anything meaningful.
       if (raw.slice(0, 512 * 1024).toLowerCase().includes(needle)) return "mentions";
-    } catch {
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR") continue;
+      // EACCES, EPERM, EISDIR, EBUSY, an unset code — all "we cannot look".
       sawUnreadable = true;
     }
   }

@@ -141,6 +141,13 @@ beforeEach(() => {
   // real. Individual tests re-spy this where they assert on killing.
   vi.spyOn(process, "kill").mockImplementation(() => true);
   __processControlTestHooks.reset();
+  // The identity bracket around /system_stats (#776) needs the port owner's process
+  // creation time at both ends — pid equality alone is what pid REUSE defeats. This
+  // module's child_process mock has no execFileSync, so the real reader cannot run;
+  // model the ordinary host where the stamp IS readable.
+  __processControlTestHooks.setProcessIdentityResolver(() => ({
+    startedAt: "stable-stamp",
+  }));
 });
 
 afterEach(() => {
