@@ -2947,6 +2947,30 @@ export async function runPanelActionInner(
         samePathCI(detection.dir, afterManager.dir, deps) &&
         ((!!previousVersion && afterManager.version !== previousVersion) ||
           (!!previousRev && !!afterManager.gitRev && afterManager.gitRev !== previousRev));
+      // MOVED IS NOT THE SAME AS FORWARD. The Manager can resolve the pack to
+      // an older build and land it, then throw its bad presence check — and a
+      // bare "the version changed" test would report that regression as an
+      // update, leaving the user quietly downgraded by a message congratulating
+      // them. A git-HEAD advance with an unchanged version is still a legitimate
+      // nightly move, so only a READABLE, COMPARABLE regression is caught here.
+      if (
+        managerMoved &&
+        !!previousVersion &&
+        !!afterManager.version &&
+        SEMVER_RE.test(previousVersion.trim()) &&
+        SEMVER_RE.test(afterManager.version.trim()) &&
+        compareSemver(afterManager.version, previousVersion) < 0
+      ) {
+        throw new PanelInstallError(
+          `Panel update did NOT go forward: ComfyUI-Manager replaced the pack at ` +
+            `${afterManager.dir ?? "custom_nodes"} with an OLDER version ` +
+            `(${previousVersion} → ${afterManager.version}) and then errored while ` +
+            `checking its own installed-pack list (${managerFailure}). NOT reporting ` +
+            `this as an update — you are now on an older panel than you started with. ` +
+            `Update ComfyUI-Manager on the host and retry, or restore the newer panel, ` +
+            `then RESTART ComfyUI.`,
+        );
+      }
       if (managerMoved && afterManager.dir) {
         // It DID work; only the reporting failed. Verify it the same way every
         // other success is verified, then report the movement we observed.

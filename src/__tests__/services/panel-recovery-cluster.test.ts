@@ -527,6 +527,24 @@ describe("update no longer contradicts status on a registry-zip install (#771)",
     expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.40");
   });
 
+  it("a Manager that moved the pack BACKWARDS is never reported as an update", async () => {
+    // "The version changed" is not "the version improved". A Manager that
+    // resolves an older build, lands it, and then throws its bad presence check
+    // would otherwise leave the user downgraded by a message congratulating
+    // them on an update.
+    writePanelPack(PANEL_DIR(), "0.11.40");
+    const h = makeDeps({ cloneVersion: "0.11.38" });
+    h.deps.update = async () => {
+      writePanelPack(PANEL_DIR(), "0.11.38"); // backwards
+      throw new Error("is not installed locally and was not found in the registry");
+    };
+    const err = await runPanelActionInner("update", h.deps).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect((err as Error).message).toMatch(/did NOT go forward/);
+    expect((err as Error).message).toMatch(/0\.11\.40 → 0\.11\.38/);
+    expect((err as Error).message).not.toMatch(/Panel updated/);
+  });
+
   it("an UNRELIABLE scan never propagates the Manager's absence claim", async () => {
     // A failed custom_nodes enumeration also yields installed:false. That is
     // "we could not look", not "it is not there", and accepting it would put
