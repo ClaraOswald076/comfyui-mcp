@@ -713,16 +713,15 @@ async function categoriesUnder(modelsRoot: string): Promise<string[]> {
  * filename proves nothing — two unrelated installs routinely hold the same popular
  * checkpoint — so overlap alone must never suppress the refusal.
  *
- * A SECOND contradiction is also fatal (codex gate, round 2): the candidate root
- * holds NO core model files at all while the live server lists some AND registers no
- * extra model roots. The server's models must physically live under ITS primary root,
- * so an empty candidate cannot be that root. This closes the "two portable bundles,
- * the stale one still empty" shape that `base-anchored` corroboration alone accepts.
+ * POSITIVE EVIDENCE ONLY. There is deliberately no "the live server lists models
+ * this tree cannot account for" rule: being unable to EXPLAIN the server's models is
+ * absence of evidence, not proof that this destination belongs to another install
+ * (maintainer ruling). Unaccountable is a proceed-unverified state — see the note at
+ * the end of the body.
  *
- * Fails OPEN on anything inconclusive — server unreachable, endpoint missing, a live
- * server that lists nothing (a fresh install downloading its first model), live extra
- * roots that could hold the server's models, or ANY overlap at all. It must never
- * block a legitimate download into a fresh or shared models tree.
+ * Fails OPEN on anything inconclusive — server unreachable, endpoint missing, an
+ * empty candidate directory, or full containment. It must never block a legitimate
+ * download into a fresh or shared models tree.
  */
 async function assertDestinationVisibleToLiveServer(
   modelsRoot: string,
