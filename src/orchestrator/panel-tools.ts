@@ -2645,8 +2645,9 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
           : "") +
         (nearMisses.length
           ? ` The library does list ${nearMisses.map((k) => `"${k}"`).join(", ")}, which differs only` +
-            ` in letter case or path separator — a DIFFERENT file on some filesystems, so it was NOT` +
-            ` substituted. Retype the name exactly if that is the one you meant.`
+            ` in letter case, path separator, or Unicode normalization — a DIFFERENT file on some` +
+            ` filesystems, so it was NOT substituted. Retype the name exactly if that is the one` +
+            ` you meant.`
           : "") +
         ` The connected ComfyUI is the authority on its own user directory (it may have been started` +
         ` with --user-directory), so the orchestrator will NOT guess at a local path that could be a` +
