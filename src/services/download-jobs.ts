@@ -616,7 +616,9 @@ export async function startDownloadJob(
         } catch (err) {
           // Verification is a REPORT, never a gate: the bytes are on disk either
           // way. Record that we could not confirm placement and carry on to the
-          // post-download hook — swallowing this must not skip onComplete.
+          // post-download hook — swallowing this must not skip onComplete. The
+          // on-disk check did not complete either, so nothing may claim it did.
+          job.disk_verified = false;
           job.live_visible = "unknown";
           job.verify_note = `Placement could not be verified: ${err instanceof Error ? err.message : String(err)}`;
         }

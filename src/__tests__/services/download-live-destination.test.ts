@@ -32,6 +32,10 @@ const h = vi.hoisted(() => ({
   modelsRootExists: true,
   /** The models root resolveModelsDirWithBases reports (the download destination). */
   destModelsDir: "/comfy/models",
+  /** The live server's argv in the snapshot. An ABSOLUTE main.py means its
+   *  extra_model_paths config location IS knowable, which is what lets the
+   *  "empty tree + no extra roots" refusal conclude anything at all. */
+  snapshotArgv: [] as string[],
 }));
 
 vi.mock("../../config.js", () => ({
@@ -74,11 +78,20 @@ vi.mock("../../services/output-dir.js", () => ({
   resolveModelsDirWithBases: vi.fn(async () => ({
     modelsDir: resolve(h.destModelsDir),
     baseDirs: [],
-    snapshot: { reachable: true, argv: ["ComfyUI\\main.py"] },
+    snapshot: { reachable: true, argv: h.snapshotArgv },
     source: h.modelsDirSource,
   })),
   parseModelsDirFromArgv: vi.fn(() => undefined),
   hasUnresolvableRelativeModelDirFlag: vi.fn(() => false),
+  // Real behaviour (pure argv parsing): the "empty tree + no extra roots" refusal
+  // only concludes anything when the server's config location is knowable.
+  parseExtraModelPathsConfigsFromArgvRaw: (argv?: string[]) => {
+    const out: string[] = [];
+    for (let i = 0; i < (argv?.length ?? 0); i++) {
+      if (argv![i] === "--extra-model-paths-config" && argv![i + 1]) out.push(argv![i + 1]);
+    }
+    return out;
+  },
   isLiveAuthoritativeModelsDir: (s: string) =>
     s === "argv-flag" || s === "live-root" || s === "observed-root",
 }));
@@ -122,6 +135,9 @@ beforeEach(() => {
   h.liveExtraRoots = { authoritative: false, roots: [] };
   h.modelsRootExists = true;
   h.destModelsDir = "/comfy/models";
+  // Absolute argv main.py: the live install root resolves, so the server's
+  // extra_model_paths config location is knowable.
+  h.snapshotArgv = [resolve("/live/ComfyUI/main.py")];
   statMock.mockReset();
   realpathMock.mockReset();
   readdirMock.mockReset();
@@ -280,6 +296,20 @@ describe("pre-write: a destination the LIVE server does not read from is refused
     };
     await expect(resolveModelSubfolderPreferServer("loras")).rejects.toThrow(
       /DIFFERENT install/,
+    );
+  });
+
+  it("does NOT refuse an empty tree when the server's extra-path config is UNKNOWABLE (codex gate r10)", async () => {
+    // Relative argv main.py, no cwd, no absolute --extra-model-paths-config: an
+    // empty live-extra-roots answer means "we could not look", not "there are none".
+    // Refusing here would break a legitimate "all my models live on another drive"
+    // install whose primary tree really is empty.
+    h.snapshotArgv = ["ComfyUI\\main.py"];
+    h.onDisk = { loras: [] };
+    h.liveListings["loras"] = ["live-only.safetensors"];
+    h.liveExtraRoots = { authoritative: true, roots: [] };
+    await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBe(
+      resolve("/comfy/models/loras"),
     );
   });
 

@@ -21,6 +21,7 @@ import {
   resolveModelsDirWithBases,
   parseModelsDirFromArgv,
   hasUnresolvableRelativeModelDirFlag,
+  parseExtraModelPathsConfigsFromArgvRaw,
   isLiveAuthoritativeModelsDir,
   type LiveServerSnapshot,
   type ModelsDirSource,
@@ -830,6 +831,18 @@ async function assertDestinationVisibleToLiveServer(
       return; // cannot rule extra roots out → no refusal
     }
     if (!live.authoritative) return;
+    // `authoritative: true` with NO roots does not mean "the server registers no
+    // extra model paths" — getLiveExtraModelRoots is deliberately fail-closed and
+    // skips a RELATIVE --extra-model-paths-config, and it can only find the
+    // auto-loaded default when the live main.py root resolved. In exactly the shape
+    // this refusal targets (relative argv, no cwd, no process observation) neither
+    // holds, so an empty list would be MISREAD as proof and would refuse a perfectly
+    // legitimate "my models live on another drive" install (codex gate, round 10).
+    // Only conclude "no extra roots" when we could actually have SEEN them.
+    const enumerable =
+      parseExtraModelPathsConfigsFromArgvRaw(snapshot.argv).some((v) => isAbsolute(v)) ||
+      liveRootFromArgv(snapshot.argv, snapshot.cwd) !== undefined;
+    if (!enumerable) return;
     const covered = new Set(
       live.roots.map((r) => String(r.category ?? "").trim().toLowerCase()),
     );
