@@ -367,14 +367,21 @@ describe("process-control crash supervision", () => {
     mockFetchOk(true);
 
     let portCheckCalls = 0;
+    let killIssued = false;
     mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill|pkill|\bkill\b/i.test(cmd)) {
+        killIssued = true;
+        return "";
+      }
       if (cmd.includes("netstat") || cmd.includes("lsof")) {
         portCheckCalls += 1;
-        // Call 3 is stop_comfyui's port→PID lookup; call 4 is the pre-kill
-        // identity re-check (#776) confirming that PID still owns the port — a
-        // process that vanished in between must NOT be killed. Calls 5+ model the
-        // port freeing after the kill so waitForPortFree returns immediately.
-        if (portCheckCalls === 3 || portCheckCalls === 4) {
+        // The first two lookups belong to start_comfyui (the already-running guard
+        // and the post-readiness PID). From then until the kill, the port is OWNED:
+        // stop_comfyui looks it up, re-confirms the server that answered still owns
+        // it, and re-checks the identity again immediately before killing (#776) —
+        // a count-based fixture would break every time that evidence chain grows.
+        // After the kill the port is free, so waitForPortFree returns at once.
+        if (portCheckCalls >= 3 && !killIssued) {
           if (cmd.includes("netstat"))
             return "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
           // `lsof -nP -iTCP:PORT -sTCP:LISTEN -Fpn` field output: p<pid> / n<addr:port>.

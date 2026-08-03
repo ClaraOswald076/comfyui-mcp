@@ -41,6 +41,8 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
+// NOTE: readFileSync is used both for `/proc/<pid>/environ` and for the launcher's
+// own config file (launcherConfigMentions).
 import { delimiter } from "node:path";
 
 // ---------------------------------------------------------------------------
@@ -70,6 +72,12 @@ export interface LaunchEnvInfo {
   reproducible: boolean;
   /** Directories prepended to PATH (empty/absent when nothing was injected). */
   path_additions?: string[];
+  /**
+   * Launcher components this install provably does NOT have, so nothing was
+   * injected for them. Named so a later "ffmpeg not found" from a node is
+   * traceable to a missing asset rather than to the restart.
+   */
+  not_installed?: string[];
   /** The recognized launcher, when one was recognized. */
   launcher?: string;
 }
@@ -100,10 +108,17 @@ export interface StabilityMatrixLayout {
   gitExe?: string;
   /** `<Data>/Assets/ffmpeg[/bin]` — absent when not on disk. */
   ffmpegDir?: string;
-  /** Whether `<Data>/Assets/ffmpeg` itself exists (drives the refusal wording:
-   *  "present but unreadable" vs "not there at all" — both irreproducible). */
-  ffmpegRootExists: boolean;
+  /**
+   * Per-component evidence, which decides REFUSE vs PROCEED-WITHOUT (see
+   * `componentVerdict`). "resolved" = we can inject it; "ambiguous" = something
+   * says this install has it but we cannot point at it; "not-installed" = no
+   * trace of it anywhere, so the launcher cannot be injecting it either.
+   */
+  git: ComponentEvidence;
+  ffmpeg: ComponentEvidence;
 }
+
+export type ComponentEvidence = "resolved" | "ambiguous" | "not-installed";
 
 // ---------------------------------------------------------------------------
 // Separator-agnostic path helpers
@@ -188,6 +203,44 @@ function dirOf(p: string): string | undefined {
  * path must NOT be mistaken for a Stability Matrix one, because that
  * misclassification would refuse a restart that works today.
  */
+/**
+ * Does the launcher's OWN configuration mention this component?
+ *
+ * The tie-breaker for "the component's directory is not on disk". That can mean
+ * the user never installed it — in which case the launcher injects nothing and we
+ * lose nothing by proceeding — or that it lives somewhere we do not know to look,
+ * in which case proceeding drops it. Stability Matrix records what it manages in
+ * `<Data>/settings.json`, so a mention there turns "absent" into "absent but
+ * expected", which is the ambiguous case that must refuse. Unreadable/missing
+ * config reads as "not mentioned": we never manufacture ambiguity.
+ */
+function launcherConfigMentions(dataRoot: string, needle: string): boolean {
+  for (const name of ["settings.json", "settings.jsonc"]) {
+    try {
+      const raw = readFileSync(joinPath(dataRoot, name), "utf-8");
+      // Config files here are a few KB; cap the scan so a pathological file
+      // cannot cost anything meaningful.
+      if (raw.slice(0, 512 * 1024).toLowerCase().includes(needle)) return true;
+    } catch {
+      // Missing or unreadable — not a mention.
+    }
+  }
+  return false;
+}
+
+function componentEvidence(
+  resolved: boolean,
+  rootExists: boolean,
+  dataRoot: string,
+  configNeedle: string,
+): ComponentEvidence {
+  if (resolved) return "resolved";
+  if (rootExists) return "ambiguous";
+  return launcherConfigMentions(dataRoot, configNeedle)
+    ? "ambiguous"
+    : "not-installed";
+}
+
 export function detectStabilityMatrix(
   paths: ReadonlyArray<string | undefined>,
 ): StabilityMatrixLayout | null {
@@ -223,7 +276,8 @@ export function detectStabilityMatrix(
         gitExe,
         gitDir: gitExe ? dirOf(gitExe) : undefined,
         ffmpegDir: ffmpegExe ? dirOf(ffmpegExe) : undefined,
-        ffmpegRootExists: hasFfmpegRoot,
+        git: componentEvidence(!!gitExe, hasGitRoot, dataRoot, "portablegit"),
+        ffmpeg: componentEvidence(!!ffmpegExe, hasFfmpegRoot, dataRoot, "ffmpeg"),
       };
     }
   }
@@ -435,35 +489,34 @@ export function resolveLaunchEnvironment(
   // 2. Stability Matrix — reconstruct exactly what it injects, from disk.
   const sm = detectStabilityMatrix(input.paths);
   if (sm) {
-    // PARTIAL reconstruction is NOT reconstruction. Detection above only fires when
-    // Stability Matrix tooling actually exists beside `Packages`, so this IS a
-    // launcher-owned install — and EVERY component it is known to inject must be
-    // resolvable before we may call the environment reproducible.
+    // PARTIAL reconstruction is NOT reconstruction — but "partial" has to mean
+    // something we would actually DROP, not merely something that isn't there.
+    // Each component is therefore classified by EVIDENCE:
     //
-    // Crucially, "the directory isn't there" does NOT license us to skip a
-    // component: from here we cannot tell "the user never installed FFmpeg" (so
-    // the launcher injects nothing) apart from "the assets live somewhere we do
-    // not know how to look" (so the launcher injects something we would drop). The
-    // #776 lesson is that dropping the second case costs the user their server, so
-    // an unresolvable component ALWAYS refuses (coordinator gate P1(1)) — the
-    // wording just distinguishes the two shapes for the human reading it.
-    const missing: string[] = [];
-    if (!sm.gitExe) {
-      missing.push(
+    //   ambiguous     — the component's own directory exists (or the launcher's
+    //                   config names it) but we cannot point at its binary. Then it
+    //                   plausibly IS injected and we would silently drop it, which
+    //                   is the #776 failure. REFUSE.
+    //   not-installed — no directory, no mention anywhere. The launcher has nothing
+    //                   to inject either, so relaunching without it is exactly what
+    //                   the launcher itself would do. PROCEED — and say which
+    //                   component was not injected, because a permanent inability to
+    //                   restart is not a safer resting place than a launch that
+    //                   works (coordinator gate P2(4)).
+    const ambiguous: string[] = [];
+    if (sm.git === "ambiguous") {
+      ambiguous.push(
         `its bundled Git (looked under "${joinPath(sm.dataRoot, "PortableGit")}") — ` +
           "without it ComfyUI-Manager aborts at import with \"Bad git executable\"",
       );
     }
-    if (!sm.ffmpegDir) {
-      const ffmpegRoot = joinPath(sm.dataRoot, "Assets", "ffmpeg");
-      missing.push(
-        sm.ffmpegRootExists
-          ? `its bundled FFmpeg (found "${ffmpegRoot}" but no ffmpeg binary inside it)`
-          : `its bundled FFmpeg ("${ffmpegRoot}" does not exist, so we cannot tell whether ` +
-            "this install has no FFmpeg or keeps it somewhere we do not know to look)",
+    if (sm.ffmpeg === "ambiguous") {
+      ambiguous.push(
+        `its bundled FFmpeg (looked under "${joinPath(sm.dataRoot, "Assets", "ffmpeg")}")`,
       );
     }
-    if (missing.length > 0) {
+    if (ambiguous.length > 0) {
+      const missing = ambiguous;
       return {
         reproducible: false,
         info: {
@@ -483,15 +536,28 @@ export function resolveLaunchEnvironment(
           "environment its packages expect.",
       };
     }
-    // Both components are guaranteed resolved here — anything less refused above.
-    const { env, added } = withPathAdditions(baseEnv, [sm.gitDir!, sm.ffmpegDir!]);
-    // GitPython (ComfyUI-Manager) resolves `git` through this variable first;
-    // Stability Matrix sets it, and without it Manager aborts at import with
-    // "Bad git executable" even when PATH is right (#776). Guaranteed present —
-    // a missing git refused above.
-    const gitKey =
-      findEnvKey(env, "GIT_PYTHON_GIT_EXECUTABLE") ?? "GIT_PYTHON_GIT_EXECUTABLE";
-    env[gitKey] = sm.gitExe!;
+    // Everything still unresolved here is provably NOT INSTALLED, so there is
+    // nothing to drop. Inject what exists.
+    const additions = [sm.gitDir, sm.ffmpegDir].filter(
+      (d): d is string => typeof d === "string" && d.length > 0,
+    );
+    const { env, added } = withPathAdditions(baseEnv, additions);
+    if (sm.gitExe) {
+      // GitPython (ComfyUI-Manager) resolves `git` through this variable first;
+      // Stability Matrix sets it, and without it Manager aborts at import with
+      // "Bad git executable" even when PATH is right (#776).
+      const gitKey =
+        findEnvKey(env, "GIT_PYTHON_GIT_EXECUTABLE") ?? "GIT_PYTHON_GIT_EXECUTABLE";
+      env[gitKey] = sm.gitExe;
+    }
+    const injected: string[] = [];
+    if (sm.gitDir) injected.push("PortableGit");
+    if (sm.ffmpegDir) injected.push("FFmpeg");
+    // Name what this install simply does not have, so a later "ffmpeg not found"
+    // from a node is immediately traceable rather than mysterious.
+    const notInstalled: string[] = [];
+    if (sm.git === "not-installed") notInstalled.push("PortableGit");
+    if (sm.ffmpeg === "not-installed") notInstalled.push("FFmpeg");
     return {
       reproducible: true,
       env,
@@ -500,10 +566,15 @@ export function resolveLaunchEnvironment(
         reproducible: true,
         launcher: "Stability Matrix",
         path_additions: added,
+        not_installed: notInstalled.length > 0 ? notInstalled : undefined,
         note:
           `Stability Matrix install detected (${sm.dataRoot}) — relaunched with its ` +
-          "PortableGit + FFmpeg on PATH and GIT_PYTHON_GIT_EXECUTABLE set, " +
-          "so ComfyUI-Manager and ffmpeg-dependent nodes keep working",
+          (injected.length > 0
+            ? `${injected.join(" + ")} on PATH${sm.gitExe ? " and GIT_PYTHON_GIT_EXECUTABLE set" : ""}`
+            : "environment") +
+          (notInstalled.length > 0
+            ? `; this install has no bundled ${notInstalled.join(" or ")} anywhere under its Data folder, so none was injected (nodes that need ${notInstalled.join("/")} may not work — install it from Stability Matrix if you need it)`
+            : ", so ComfyUI-Manager and ffmpeg-dependent nodes keep working"),
       },
     };
   }
