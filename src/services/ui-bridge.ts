@@ -721,6 +721,18 @@ export class UiBridge {
    *  listener stays token-less so the local browser panel is unaffected. */
   private readonly extraServers: WebSocketServer[] = [];
   private conns = new Map<string, Conn>(); // tabId -> connection (canvas-owning primary)
+  /**
+   * EVERY accepted socket, from the moment it is accepted — including the ones
+   * still ANONYMOUS because no `hello` has named a tab id yet.
+   *
+   * `conns` is keyed by tab id, so it cannot see an anonymous socket at all.
+   * `stop()` used to close only `conns` and then await `wss.close()`, which waits
+   * for every open socket: one anonymous connection (a browser that opened the
+   * WebSocket and never sent hello, or was mid-handshake at shutdown) would hang
+   * teardown forever. Tracking from accept is what makes stop() actually able to
+   * close what it is about to wait on.
+   */
+  private sockets = new Set<BridgeSocket>();
   /** Incremented for every accepted panel hello; never reused during this bridge lifetime. */
   private nextHelloGeneration = 0;
   /** Mobile "mirror" viewers subscribed to a tab's live output (remote control):
@@ -1117,6 +1129,11 @@ export class UiBridge {
    *   connections. Bound to the tab so the reboot self-probe can trust which page it fronts.
    */
   private handleConnection(sock: BridgeSocket, local = false, serverOrigin?: string): void {
+    // Track from ACCEPT, not from hello: an anonymous socket is still a socket,
+    // and stop() must be able to close it (see `sockets`). Removed on close so
+    // the set never outgrows the live connections.
+    this.sockets.add(sock);
+    sock.on("close", () => this.sockets.delete(sock));
     // The connection is anonymous until its hello frame names a tab id.
     let tabId: string | null = null;
     // A socket's KIND (canvas-owning panel vs headless viewer) is pinned on its
@@ -2519,6 +2536,17 @@ export class UiBridge {
       }
     }
     this.conns.clear();
+    // …and every socket that never got as far as a hello. `wss.close()` below
+    // waits on EVERY open socket, so closing only the tab-keyed ones left an
+    // anonymous connection able to hang teardown indefinitely.
+    for (const sock of this.sockets) {
+      try {
+        sock.close();
+      } catch {
+        // Already gone.
+      }
+    }
+    this.sockets.clear();
     for (const s of this.extraServers.splice(0)) {
       try {
         s.close();

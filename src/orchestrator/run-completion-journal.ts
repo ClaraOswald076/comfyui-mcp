@@ -83,6 +83,16 @@ export interface RunTicket {
   tabId: string;
   queuedAt: number;
   toNodeId?: number;
+  /**
+   * Generation of THIS ticket. Bumped whenever the id is opened again (a fresh
+   * ticket after the old one was evicted, or a reopen), so a completion can only
+   * ever settle the exact ticket generation it was correlated against.
+   *
+   * Without it, `ack()` resolved the ticket by prompt id alone: run A's late
+   * completion would settle whatever ticket that id maps to NOW — i.e. run B's —
+   * marking B answered by A's result.
+   */
+  seq: number;
   /** True once a completion for this exact prompt id was acked as delivered. */
   settled: boolean;
   /**
@@ -142,6 +152,9 @@ export interface JournalEntry {
    * the ticket, so the ambiguity does too.
    */
   ambiguousId?: boolean;
+  /** Generation of the ticket this entry was MATCHED against, if any. `ack()`
+   *  settles only that exact generation — see RunTicket.seq. */
+  ticketSeq?: number;
   /** Evicted-completion count this entry is carrying out on the tab's behalf, so
    *  the disclosure rides a real delivery instead of a side map that could be
    *  discarded before it is ever reported. */
@@ -233,6 +246,8 @@ export class RunCompletionJournalImpl {
    *  re-send is suppressed but a later genuinely-different render is not. */
   private idlessSeen = new Map<string, number>();
   private seq = 0;
+  /** Monotonic ticket-generation counter — see RunTicket.seq. */
+  private ticketSeq = 0;
   /** Pull a still-queued completion back off its agent (see setRevoker). */
   private revoke: ((key: string, token: string) => boolean) | null = null;
   /** Re-deliver a tab's pending completions (after a revoke re-arms one). */
@@ -290,6 +305,7 @@ export class RunCompletionJournalImpl {
       existing.settled = false;
       existing.tabId = meta.tabId;
       existing.queuedAt = Date.now();
+      existing.seq = ++this.ticketSeq; // a NEW generation of this id
       // The id no longer identifies ONE run. Every completion for it from here
       // on is unattributable (see RunTicket.reused) — reported UNDETERMINED, and
       // never suppressed as a duplicate of the other generation.
@@ -330,6 +346,7 @@ export class RunCompletionJournalImpl {
     this.tickets.set(promptId, {
       promptId,
       tabId: meta.tabId,
+      seq: ++this.ticketSeq,
       queuedAt: Date.now(),
       ...(typeof meta.toNodeId === "number" ? { toNodeId: meta.toNodeId } : {}),
       settled: false,
@@ -404,31 +421,35 @@ export class RunCompletionJournalImpl {
         );
         return null;
       }
-      // COALESCE is an optimisation that ASSUMES the prompt id identifies one
-      // run — which is exactly the assumption `reused` voids. Merging there is a
-      // LOSS: B's real completion would overwrite A's entry and be returned as
-      // it, while the turn already queued still holds A's text; A's ack then
-      // removes the sole entry and B is never delivered. So for a reused id, do
-      // not coalesce at all — B gets its own entry, flagged UNDETERMINED like
-      // every other ambiguous case. Duplicate over loss, the same rule the
-      // suppression checks above follow.
+      // COALESCE ONLY ONTO A `pending` ENTRY. This is the correctness rule, and
+      // it is deliberately a property of the TARGET'S OWN CURRENT STATE — not of
+      // any history that could be evicted out from under it.
+      //
+      // Once an entry is `handed_off` its text is committed to a turn that will
+      // ack and DELETE it. Merging a newer completion into it means the newer one
+      // is never delivered: the queued turn still holds the older text, and its
+      // ack removes the single shared entry. That is a loss, and it is reachable
+      // by several orderings of prompt-id reuse vs. ticket eviction — chasing
+      // those one at a time is how this defect kept coming back, because reuse
+      // DETECTION needs the old ticket, and the ticket is evictable.
+      //
+      // The same predicate already governs the id-less collapse, for the same
+      // reason. The `reused`/`ambiguousId` checks below are now an OPTIMISATION
+      // for better wording (an ambiguous run should read as UNDETERMINED rather
+      // than merge at all), never the thing correctness rests on.
       for (const entry of idReused ? [] : this.entries.values()) {
         if (
           entry.key === key &&
+          entry.state === "pending" && // never merge into text already committed to a turn
           !entry.superseded && // a re-queued run never merges into the old one's entry
-          // …and never merge into one that ARRIVED under a reused id. The ticket
-          // that made `idReused` true above is evictable, so after 64 later runs
-          // the incoming side can no longer tell — but the entry still can.
-          !entry.ambiguousId &&
+          !entry.ambiguousId && // nor into one that arrived under a reused id
           entry.correlation.status !== "unidentified" &&
           entry.correlation.promptId === correlation.promptId
         ) {
-          // Freshen the payload, but do NOT re-open a hand-off. The copy already
-          // sitting in an agent's queue cannot be recalled, so re-arming here
-          // would deliver the same completion twice (and the first ack would
-          // then drop the entry, leaving the second delivery untracked). If the
-          // hand-off fails, the release path re-arms it — that is the only way
-          // back to `pending`.
+          // Safe by the predicate above: this entry is still `pending`, so
+          // nothing of it has been committed to a turn. Freshening its payload
+          // replaces a copy nobody has seen — one delivery instead of two, with
+          // no possibility that an older text acks and deletes the newer news.
           entry.payload = payload;
           return entry;
         }
@@ -490,6 +511,11 @@ export class RunCompletionJournalImpl {
         : {}),
       // Freeze the ambiguity onto the entry — see JournalEntry.ambiguousId.
       ...(idReused ? { ambiguousId: true } : {}),
+      // …and the exact ticket GENERATION this matched, so its ack can never
+      // settle a later run that merely reuses the id (see RunTicket.seq).
+      ...(correlation.status === "matched"
+        ? { ticketSeq: this.tickets.get(correlation.promptId)?.seq }
+        : {}),
     };
     this.entries.set(entry.token, entry);
     this.trimEntries(key);
@@ -669,7 +695,11 @@ export class RunCompletionJournalImpl {
     }
     if (entry.correlation.status === "matched") {
       const ticket = this.tickets.get(entry.correlation.promptId);
-      if (ticket) ticket.settled = true;
+      // ONLY the exact ticket generation this entry was matched against. Looking
+      // the ticket up by prompt id alone let a late completion for run A settle
+      // whatever ticket that id maps to NOW — run B's — marking B answered by A's
+      // result. See RunTicket.seq.
+      if (ticket && ticket.seq === entry.ticketSeq) ticket.settled = true;
     }
   }
 

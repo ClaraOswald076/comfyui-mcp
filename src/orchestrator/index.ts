@@ -5259,14 +5259,40 @@ export async function runPanelOrchestrator(): Promise<void> {
   };
   /** The single in-flight teardown, so repeated signals queue behind it. */
   let teardownOnce: Promise<void> | null = null;
+  /** How long a REPEATED shutdown signal waits for the in-flight teardown before
+   *  forcing the exit. Long enough for a healthy teardown to finish, short enough
+   *  that a hung one can't make the process unkillable via SIGINT/SIGTERM. */
+  const FORCED_SHUTDOWN_GRACE_MS = 3000;
   const shutdown = async () => {
     // RE-ENTRANT SAFE (#468). teardownCore's `shuttingDown` flag makes a second
     // call return IMMEDIATELY, so a repeated SIGTERM used to race straight past
     // the in-flight teardown to process.exit() — skipping the undelivered-
     // completion disclosure the first one had not reached yet. Memoize the
     // teardown promise so every later signal AWAITS the first one instead.
+    const first = teardownOnce === null;
     teardownOnce ??= teardownCore();
-    await teardownOnce;
+    // …but BOUNDED. A repeated signal is a user asking harder, and awaiting an
+    // unbounded teardown would make the process unkillable through its handled
+    // signals if anything in it hangs. The first signal waits; a later one gives
+    // the in-flight teardown a short grace and then forces the exit. The
+    // completion disclosure is unaffected either way — it runs at the TOP of
+    // teardownCore, before anything that could block.
+    if (first) {
+      await teardownOnce;
+    } else {
+      await Promise.race([
+        teardownOnce,
+        new Promise<void>((resolve) => {
+          const t = setTimeout(() => {
+            logger.warn(
+              `[panel-orchestrator] shutdown did not finish within ${FORCED_SHUTDOWN_GRACE_MS}ms of a repeated signal — forcing exit`,
+            );
+            resolve();
+          }, FORCED_SHUTDOWN_GRACE_MS);
+          t.unref?.();
+        }),
+      ]);
+    }
     process.exit(0);
   };
   process.on("SIGINT", shutdown);

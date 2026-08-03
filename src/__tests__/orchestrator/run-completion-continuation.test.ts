@@ -756,15 +756,23 @@ describe("run completion journal correlation (#468)", () => {
     expect(journal.droppedFor("t")).toBe(1);
   });
 
-  it("a re-sent completion does NOT re-arm a hand-off (no duplicate delivery)", () => {
+  it("a re-sent completion never RE-ARMS the handed-off copy (it gets its own entry instead)", () => {
+    // The original hand-off must not be re-armed: its text is already in a turn,
+    // so re-arming would deliver that same text twice off one entry and leave the
+    // second delivery untracked. It gets a separate entry instead — the
+    // deliberate duplicate-over-loss trade, since merging into committed text is
+    // how a newer completion gets deleted by an older one's ack.
     journal.openRun(PROMPT_A, { tabId: "t" });
-    journal.record("t", { kind: "executed", prompt_id: PROMPT_A });
+    const first = journal.record("t", { kind: "executed", prompt_id: PROMPT_A });
     journal.deliverPending("t", () => true); // handed off, not yet acked
     expect(journal.pending("t")).toHaveLength(0);
-    // The panel re-sends the same completion — it must not queue a second copy.
-    journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "resend" });
-    expect(journal.pending("t")).toHaveLength(0);
-    expect(journal.outstanding("t")).toHaveLength(1);
+
+    const resend = journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "resend" });
+    expect(resend!.token).not.toBe(first!.token);
+    expect(journal.outstanding("t")).toHaveLength(2);
+    // …and the first entry is untouched: still handed off, still its own payload.
+    expect(journal.outstanding("t")[0].state).toBe("handed_off");
+    expect(journal.outstanding("t")[0].payload.note).toBeUndefined();
   });
 
   it("evicting a still-pending completion is COUNTED and reported on the next delivery", () => {
@@ -860,6 +868,46 @@ describe("run completion journal correlation (#468)", () => {
     journal.ack(late!.token);
     expect(journal.pending("t")).toHaveLength(1);
     expect(journal.pending("t")[0].payload.note).toBe("run B (real)");
+  });
+
+  it("NEVER coalesces onto a handed-off entry — the rule that closes every ordering", () => {
+    // The correctness rule is a property of the TARGET'S CURRENT STATE, so it
+    // holds with no knowledge of history: no reuse, no eviction, nothing marked.
+    // A handed-off entry's text is committed to a turn that will ack and delete
+    // it, so merging newer news into it loses that news.
+    journal.openRun(PROMPT_A, { tabId: "t" });
+    const first = journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "first" });
+    journal.deliverPending("t", () => true); // handed off, unread, unacked
+    expect(first!.ambiguousId).toBeUndefined(); // no marking involved at all
+
+    const second = journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "second" });
+    expect(second!.token).not.toBe(first!.token);
+
+    journal.ack(first!.token); // the queued turn ends
+    expect(journal.pending("t")).toHaveLength(1);
+    expect(journal.pending("t")[0].payload.note).toBe("second");
+  });
+
+  it("the eviction-BEFORE-reuse ordering cannot lose the new run either", () => {
+    // The ordering no marking scheme could cover: A's ticket is evicted BEFORE
+    // the id is reused, so B takes the fresh-ticket path and nothing anywhere
+    // knows the id is ambiguous. The `pending` predicate closes it regardless.
+    journal.openRun(PROMPT_A, { tabId: "t" });
+    const late = journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "run A (late)" });
+    journal.deliverPending("t", () => true); // handed off, unread
+
+    for (let i = 0; i < 80; i++) journal.openRun(`later-${i}`, { tabId: "t" }); // evict A's ticket
+    expect(journal.ticketFor(PROMPT_A)).toBeUndefined();
+
+    journal.openRun(PROMPT_A, { tabId: "t" }); // B reuses the id — a FRESH ticket
+    expect(journal.ticketFor(PROMPT_A)?.reused).toBeUndefined(); // nothing marked
+    const real = journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "run B (real)" });
+    expect(real!.token).not.toBe(late!.token);
+
+    journal.ack(late!.token);
+    expect(journal.pending("t")).toHaveLength(1);
+    expect(journal.pending("t")[0].payload.note).toBe("run B (real)");
+    expect(journal.ticketFor(PROMPT_A)?.settled).toBe(false); // B still outstanding
   });
 
   it("the no-coalesce rule survives the reused TICKET being evicted", () => {
