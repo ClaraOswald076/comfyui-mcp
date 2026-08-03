@@ -413,6 +413,35 @@ describe("readWorkflowFromPath: a refusal is never mistaken for an unreachable s
     }
   });
 
+  it("refuses a backslash name rather than letting Windows resolve() reinterpret it", async () => {
+    // The local fallback passes the store key straight to resolve(). On Windows
+    // that turns "recipes\foo.json" — one literal segment in the server's key
+    // space — into the folder path recipes/foo.json, so the two branches would
+    // open different files from the same input (codex MAJOR).
+    const root = mkdtempSync(join(tmpdir(), "cmcp-userdir-"));
+    try {
+      const nested = join(root, "user", "default", "workflows", "recipes");
+      mkdirSync(nested, { recursive: true });
+      writeFileSync(
+        join(nested, "foo.json"),
+        JSON.stringify({ nodes: [{ id: 1, type: "ReinterpretedNode" }], links: [] }),
+        "utf8",
+      );
+      process.env.COMFYUI_PATH = root;
+
+      fetchApi.mockRejectedValue(new Error("ECONNREFUSED"));
+
+      const { ctx, calls } = makeCtx();
+      const res = await loadWorkflow().handler({ path: "recipes\\foo.json" }, ctx);
+
+      expect(res.isError).toBe(true);
+      expect(calls).toHaveLength(0); // resolve() never got to reinterpret the name
+      expect(JSON.stringify(res)).toMatch(/forward slashes/i);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("refuses when an unreachable server leaves TWO different local candidates", async () => {
     // Both reconstructed layouts (user/default/workflows and user/workflows) hold a
     // DIFFERENT file of the same name. With no server to arbitrate, picking the
@@ -626,10 +655,10 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
     );
   });
 
-  it("does NOT treat a BACKSLASH-spelled workflows/ prefix as the library prefix", async () => {
-    // On POSIX "workflows\foo.json" is a legal LITERAL filename, not a prefixed
-    // spelling of "foo.json". Stripping it would turn a request for that literal
-    // file into a request for a different graph (codex MAJOR).
+  it("REFUSES a relative name containing a backslash, before any request", async () => {
+    // "workflows\foo.json" would mean a single literal segment to the server's
+    // "/"-keyed library and a folder separator to Windows resolve(). One input,
+    // two different files — so it is refused rather than read either way.
     routeMock(["foo.json"], {
       "workflows/foo.json": { nodes: [{ id: 1, type: "DifferentGraphNode" }], links: [] },
     });
@@ -639,12 +668,9 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
 
     expect(res.isError).toBe(true);
     expect(calls).toHaveLength(0);
-    // "workflows/foo.json" exists and would have loaded had the prefix been stripped.
-    expect(fetchApi).not.toHaveBeenCalledWith(
-      `/api/userdata/${encodeURIComponent("workflows/foo.json")}`,
-    );
-    // The close match is still surfaced so the caller can retype it.
-    expect(JSON.stringify(res)).toMatch(/path separator/i);
+    // Refused up front — "workflows/foo.json" exists and was never even asked for.
+    expect(fetchApi).not.toHaveBeenCalled();
+    expect(JSON.stringify(res)).toMatch(/forward slashes/i);
   });
 
   it("a retry that cannot be completed REFUSES — it does not reopen the local fallback", async () => {

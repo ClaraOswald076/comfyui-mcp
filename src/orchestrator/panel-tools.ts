@@ -2439,6 +2439,22 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
         `workflows folder (no "..", drive letters, or absolute paths), or an absolute path.`,
     );
   }
+  // A BACKSLASH in a relative name is refused outright (codex MAJOR), because the
+  // two branches below would disagree about what it means. The userdata key space
+  // is "/"-separated, so "recipes\foo.json" is sent to the server as a single
+  // literal segment — but Windows `resolve()` treats "\" as a separator, so the
+  // local fallback would happily open user/default/workflows/recipes/foo.json.
+  // One input, two different files. Since neither reading is authoritative, this
+  // refuses instead of picking: forward slashes are what the library actually uses,
+  // and a real Windows path belongs in the absolute-path branch.
+  if (rel.includes("\\")) {
+    throw new Error(
+      `"${p}" is not a valid workflow name — the ComfyUI workflow library separates ` +
+        `folders with "/", so a "\\" would mean a literal character to the server and a ` +
+        `folder separator to the local filesystem. Use forward slashes (e.g. ` +
+        `"recipes/name.json"), or pass an absolute path.`,
+    );
+  }
   // One userdata GET, classified. `key` is the STORE key (already "workflows/…").
   //
   // The request goes through userdataFetch, which returns the raw Response instead
