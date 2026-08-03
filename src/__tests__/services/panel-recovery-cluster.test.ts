@@ -617,6 +617,28 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     expect(existsSync(join(root, "custom_nodes_backup"))).toBe(false);
   });
 
+  it("REFUSES when the .git probe itself FAILS — absence is never inferred from an error", async () => {
+    // existsSync collapses EACCES to false, which would read as "there is no
+    // .git" and license replacing a real checkout. Only a confirmed absence
+    // counts.
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    const h = makeDeps({ updateThrows: "manager cannot resolve it", cloneVersion: "0.11.38" });
+    h.deps.probeFile = (p) => (p.endsWith(".git") ? undefined : true);
+    const err = await runPanelActionInner("update", h.deps).catch((e: Error) => e);
+    expect((err as Error).message).toMatch(/could NOT be determined/);
+    expect(h.clones).toHaveLength(0);
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
+  });
+
+  it("REFUSES a .git FILE (worktree/submodule pointer), not just a .git directory", async () => {
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    writeFileSync(join(PANEL_DIR(), ".git"), "gitdir: ../../.git/worktrees/panel\n");
+    const h = makeDeps({ updateThrows: "manager cannot resolve it", cloneVersion: "0.11.38" });
+    const err = await runPanelActionInner("update", h.deps).catch((e: Error) => e);
+    expect((err as Error).message).toMatch(/git checkout|has a \.git/);
+    expect(h.clones).toHaveLength(0);
+  });
+
   it("REFUSES a downgrade — never moves the user backwards", async () => {
     writePanelPack(PANEL_DIR(), "0.11.40");
     const h = makeDeps({ updateThrows: "manager cannot resolve it", cloneVersion: "0.11.38" });

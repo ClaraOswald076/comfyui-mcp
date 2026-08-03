@@ -1757,8 +1757,14 @@ async function updateViaGitCheckoutFallback(opts: {
   previousVersion?: string;
   previousRev?: string;
   result: NodeOpResult;
+  /**
+   * Refuse if the orchestrator retargeted mid-operation. This helper MUTATES a
+   * checkout and then reports the result, so both must belong to the ComfyUI the
+   * request was made for — see the note on runPanelActionInner's binding.
+   */
+  assertSameTarget: (stage: string) => void;
 }): Promise<PanelActionResult> {
-  const { deps, dir, previousVersion, previousRev, result } = opts;
+  const { deps, dir, previousVersion, previousRev, result, assertSameTarget } = opts;
 
   // PRE-PULL REVISION GATE — the post-Manager detection's HEAD must be
   // readable before we mutate. An unreadable revision at this point means the
@@ -1884,6 +1890,7 @@ async function updateViaGitCheckoutFallback(opts: {
 
   let gitOutput: string;
   try {
+    assertSameTarget("before fast-forwarding the panel checkout");
     gitOutput = deps.gitMergeFfOnly(dir, targetRev);
   } catch (err) {
     // The Manager no-op'd AND the direct merge failed — name both, truthfully.
@@ -1954,6 +1961,7 @@ async function updateViaGitCheckoutFallback(opts: {
     // The embedded result came from the Manager call that no-op'd — its own
     // message may credit ComfyUI-Manager. The report must not contradict the
     // git-fallback path that actually did the work (codex gate).
+    assertSameTarget("before reporting the fast-forward");
     const fallbackMessage =
       `Panel updated (${from} → ${to}) via a pinned git merge --ff-only on the panel repo ` +
       `(${dir}), verified on disk: ComfyUI-Manager no-op'd the update (stale ` +
@@ -1994,6 +2002,7 @@ async function updateViaGitCheckoutFallback(opts: {
   // (NOT "updated"; nothing changed, no restart). The embedded result came
   // from the Manager call that no-op'd — override its message too, so the
   // report never credits the Manager for a verification git did (codex gate).
+  assertSameTarget("before reporting the checkout as current");
   const atTipMessage =
     `Panel is already at the upstream tip (${post.version}) — ComfyUI-Manager ` +
     `no-op'd the update (stale legacy 3.x, #724), but a pinned git merge ` +
@@ -2296,8 +2305,33 @@ async function updateViaRegistryZipReinstall(opts: {
   // developer's working repo out of custom_nodes. So the absence of `.git`
   // itself is the requirement, and an unresolvable revision beside a present
   // `.git` is a refusal, not a licence.
+  // The probes are TRI-STATE on purpose. `existsSync` collapses every error to
+  // false, so an EACCES on `.git` would read as "there is no .git" and license
+  // the replacement of a real checkout — the very inference this guard exists to
+  // stop. `.git` is a directory in an ordinary clone and a FILE in a worktree or
+  // submodule, so both shapes are probed, and only a CONFIRMED absence of both
+  // (false, not undefined) counts as proof.
   const gitDir = join(dir, ".git");
-  if (deps.existsSync(gitDir)) {
+  // `probeFile` is the only dep here whose FALSE is a real determination
+  // (ENOENT/ENOTDIR, or "it is a directory"); `isDirectory` returns undefined
+  // for a missing path too, so it cannot express absence. Combining the two
+  // signals covers both shapes `.git` takes:
+  //   undefined                     → the probe FAILED → refuse, prove nothing
+  //   true                          → a regular file → worktree/submodule pointer
+  //   false + existsSync            → present but not a file → a .git DIRECTORY
+  //   false + !existsSync           → PROVEN absent → the zip shape, proceed
+  const gitProbe = deps.probeFile(gitDir);
+  if (gitProbe === undefined) {
+    throw new PanelInstallError(
+      `Panel update did NOT apply (${managerReason}), and the reinstall-from-source ` +
+        `fallback is REFUSED: whether ${gitDir} exists could NOT be determined, so it ` +
+        `cannot be PROVEN that ${dir} is not a git checkout. Replacing a checkout ` +
+        `wholesale would discard its branch, remotes and any local commits, and this ` +
+        `path never infers absence from a failed probe. Fix the permissions on ${dir} ` +
+        `and retry, or update the pack manually.`,
+    );
+  }
+  if (gitProbe === true || deps.existsSync(gitDir)) {
     const rev = deps.gitRevision(dir);
     throw new PanelInstallError(
       `Panel update did NOT apply (${managerReason}), and the reinstall-from-source ` +
@@ -2893,6 +2927,7 @@ export async function runPanelActionInner(
           dir: freshDir,
           previousVersion: freshVersion,
           previousRev: freshRev,
+          assertSameTarget,
           // Synthesize the shape the fallback reports around; there is no real
           // Manager result because the Manager call failed.
           result: {
@@ -3037,6 +3072,7 @@ export async function runPanelActionInner(
         previousVersion,
         previousRev,
         result,
+        assertSameTarget,
       });
     }
     // #771 — the same dead end, one install shape over. The Manager did nothing
