@@ -6,10 +6,23 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.49.2] - 2026-08-02
+
 ### MCP
 
 #### Fixed
-- `panel_add_node` documents the frontend-only virtual types (Note/MarkdownNote/Reroute/PrimitiveNode) as the supported way to annotate a workflow, so agents know annotation is possible at all (#741)
+- restart safety: a refuse-safe preflight now runs BEFORE any stop in the panel restart flow — an instance with no provable relaunch (Pinokio-style installs) is refused, never stopped; the preflight validates the immutable tab-fronted instance under a generation-stable target (a monotonic target generation detects mid-flight config/tab changes, including A→B→A retargets) (#742)
+- restart reporting: the decline path no longer asserts "not restarted" blind — a bounded full-window probe distinguishes a restarting server from a genuinely lost one, and causation claims ("a restart initiated earlier…") require a session-held, bound-confirmed, recent dispatch token with an identity-checked lifecycle (#742)
+- turn reliability: the stall watchdog reports exactly one failure per turn (either event order), holds the turn gate until the genuine turn end, and dead-letters straggler emissions from abandoned turns via backend-minted turn markers on every backend (#728)
+- Claude backend: blocking SDK informational messages (hook blocks) surface exactly one error instead of a silent "successful" empty turn; result classification is per-turn (submission-stamped traces, real success/error_* vocabulary); traceless, gap-crossing, or late results fail closed as unverifiable instead of fabricating success (#740)
+- `panel_add_node` documents the frontend-only virtual types (Note/MarkdownNote/Reroute/PrimitiveNode) as the supported way to annotate a workflow (#741)
+- bump sharp to >=0.35.0 (GHSA-f88m-g3jw-g9cj)
+
+### Docs
+- docs proxy worker 301s bare doc paths onto /docs/* (fixes broken internal links on the live site)
+- internal links converted to relative paths for the subpath deployment
+- /packs/* links repointed to their GitHub tree paths
+
 
 ## [0.49.1] - 2026-08-02
 
