@@ -648,6 +648,21 @@ export function isTargetingLocal(): boolean {
 // local and a RunPod pod — the UI must never lie about where a job runs.
 type ComfyuiTargetListener = (url: string, isLocal: boolean) => void;
 const comfyuiTargetListeners = new Set<ComfyuiTargetListener>();
+
+// ── Target generation (#742 r11) ─────────────────────────────────────────────
+// Monotonic epoch bumped on EVERY successful retarget. A final-state base
+// comparison (A vs A) cannot detect an intervening A→B→A mutation, so
+// consumers that read the mutable target across an await (e.g. the panel
+// restart's refuse-safe preflight) must instead require the GENERATION to be
+// unchanged after the await — any mutation, including a round trip back to
+// the same base, bumps it.
+let comfyuiTargetGeneration = 0;
+
+/** The current target generation — increments on every successful setComfyuiTarget. */
+export function getComfyuiTargetGeneration(): number {
+  return comfyuiTargetGeneration;
+}
+
 export function onComfyuiTargetChanged(cb: ComfyuiTargetListener): () => void {
   comfyuiTargetListeners.add(cb);
   return () => comfyuiTargetListeners.delete(cb);
@@ -776,6 +791,10 @@ export function setComfyuiTarget(url: string): boolean {
   resetManagerApiCache("comfyui target changed");
   // Tell the control panels where renders run now (local ⇄ pod).
   emitComfyuiTargetChanged();
+  // Bump the target generation LAST, on success only — every retarget (even an
+  // A→B→A round trip back to the same base) must be detectable by consumers
+  // holding a pre-await generation snapshot (#742 r11).
+  comfyuiTargetGeneration += 1;
   return true;
 }
 

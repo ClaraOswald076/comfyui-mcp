@@ -79,6 +79,7 @@ import {
   isCloudMode,
   getBootLocalComfyUIBaseUrl,
   getComfyUIBaseUrl,
+  getComfyuiTargetGeneration,
 } from "../config.js";
 import { sliceWorkflow } from "../services/workflow-slicer.js";
 import { validateA2UISpecServer } from "../services/a2ui-spec.js";
@@ -5685,10 +5686,12 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // downstream may reuse it (r7).
         const preflightHealthBase = captureRebootHealthBase(ctx);
         if (preflightHealthBase != null && sameHttpBase(getComfyUIBaseUrl(), preflightHealthBase)) {
-          // Snapshot the mutable config base AT THE DECISION (it equals the
-          // tab-fronted base right now, per the gate above) so a mid-await
-          // retarget is detectable afterward (r10).
-          const preflightConfigBase = getComfyUIBaseUrl();
+          // Snapshot the target GENERATION at the decision (r11): a final-state
+          // base comparison (A vs A) cannot detect an intervening A→B→A
+          // retarget, so stability is judged by the monotonic epoch bumped on
+          // EVERY retarget — any mutation, including a round trip back to the
+          // same base, is caught.
+          const preflightTargetGeneration = getComfyuiTargetGeneration();
           const preflight = await (localRestartPreflightOverride ?? preflightLocalRestart)();
           // r8/r9/r10: the preflight AWAIT makes the pre-decision captures
           // STALE — and the preflight itself reads MUTABLE config (target URL,
@@ -5703,7 +5706,8 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           const tabFrontsSameInstance =
             postPreflightHealthBase != null &&
             sameHttpBase(preflightHealthBase, postPreflightHealthBase);
-          const configStable = sameHttpBase(getComfyUIBaseUrl(), preflightConfigBase);
+          const configStable =
+            getComfyuiTargetGeneration() === preflightTargetGeneration;
           if (!configStable && tabFrontsSameInstance) {
             // r10: the target config moved MID-CHECK, so the preflight result
             // — pass OR fail — cannot vouch for the tab-fronted instance (a

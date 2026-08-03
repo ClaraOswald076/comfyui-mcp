@@ -394,4 +394,19 @@ describe("getLocalComfyuiUrl (#269 LAN fallback)", () => {
     const second = await import("../config.js");
     expect(second.getLocalComfyuiUrl()).toBe("http://127.0.0.1:8188");
   });
+
+  it("bumps the target generation on EVERY retarget — an A→B→A round trip is detectable (#742 r11)", async () => {
+    process.env.COMFYUI_URL = "http://127.0.0.1:8188";
+    const mod = await import("../config.js");
+    const g0 = mod.getComfyuiTargetGeneration();
+    // A → B → A: the final base equals the initial one, but the generation
+    // must have advanced twice — final-state equality can never prove stability.
+    expect(mod.setComfyuiTarget("http://192.168.1.50:8188")).toBe(true);
+    expect(mod.setComfyuiTarget("http://127.0.0.1:8188")).toBe(true);
+    expect(mod.getComfyuiTargetGeneration()).toBe(g0 + 2);
+    expect(mod.getComfyUIBaseUrl()).toBe("http://127.0.0.1:8188"); // base looks "unchanged"
+    // A rejected (malformed) retarget does NOT bump.
+    expect(mod.setComfyuiTarget("not a url")).toBe(false);
+    expect(mod.getComfyuiTargetGeneration()).toBe(g0 + 2);
+  });
 });

@@ -18,17 +18,20 @@ vi.mock("../../comfyui/client.js", () => ({
   resetObjectInfoCache: () => resetObjectInfoCache(),
 }));
 
-// r9: a MUTABLE runtime-config base, so a test can retarget getComfyUIBaseUrl()
-// mid-flight (config-only retarget) while the tab fronting stays put. null →
-// the real configured base.
+// r9/r10/r11: a MUTABLE runtime-config base AND target generation, so tests
+// can retarget getComfyUIBaseUrl() mid-flight (config-only retarget) while the
+// tab fronting stays put. null → the real configured base; the generation is
+// bumped by tests the way every real retarget bumps it.
 const hoistedConfig = vi.hoisted(() => ({
   configBase: { value: null as string | null },
+  generation: { value: 0 },
 }));
 vi.mock("../../config.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../config.js")>();
   return {
     ...actual,
     getComfyUIBaseUrl: () => hoistedConfig.configBase.value ?? actual.getComfyUIBaseUrl(),
+    getComfyuiTargetGeneration: () => hoistedConfig.generation.value,
   };
 });
 
@@ -123,6 +126,7 @@ beforeEach(() => {
   __processControlTestHooks.reset();
   // r9: real configured base unless a test retargets it mid-flight.
   hoistedConfig.configBase.value = null;
+  hoistedConfig.generation.value = 0;
 });
 
 afterEach(() => {
@@ -132,6 +136,7 @@ afterEach(() => {
   __panelToolsTestHooks.setDeclineProbeTiming(null);
   __processControlTestHooks.reset();
   hoistedConfig.configBase.value = null;
+  hoistedConfig.generation.value = 0;
 });
 
 describe("panel_restart_comfyui — decline truthfulness (#742)", () => {
@@ -514,6 +519,7 @@ describe("panel_restart_comfyui — Pinokio-style refuse-safe preflight (#742)",
     // stop/reboot, regardless of config shuffling mid-flight).
     __panelToolsTestHooks.setLocalRestartPreflight(async () => {
       hoistedConfig.configBase.value = "http://127.0.0.1:9999"; // config-only retarget mid-await
+      hoistedConfig.generation.value += 1; // every real retarget bumps the generation
       return {
         ok: false,
         reason:
@@ -543,7 +549,35 @@ describe("panel_restart_comfyui — Pinokio-style refuse-safe preflight (#742)",
     // UNPROVEN → refuse, never dispatch.
     __panelToolsTestHooks.setLocalRestartPreflight(async () => {
       hoistedConfig.configBase.value = "http://127.0.0.1:9999"; // retarget mid-await
+      hoistedConfig.generation.value += 1; // every real retarget bumps the generation
       return { ok: true }; // a pass — possibly for the WRONG install
+    });
+    __panelToolsTestHooks.setHealthProbe(async () => "down");
+    const { ctx, sends } = makeCtx({ confirm: "yes", frontsBoot: true });
+
+    const out = parse(await restartTool().handler({}, ctx));
+    const note = String(out.note ?? "");
+
+    expect(out.refused).toBe(true);
+    expect(note).toMatch(/Refusing to restart/i);
+    expect(note).toMatch(/still running/i);
+    expect(note).toMatch(/settle/i);
+    // CRITICAL: no stop/reboot is sent to the unproven tab-fronted instance.
+    expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
+  });
+
+  it("an A→B→A retarget during the preflight await is detected by the generation, not the final base (r11)", async () => {
+    // The config base RETURNS to its original value by the end of the await —
+    // a final-state comparison sees "unchanged" and would accept the safe pass
+    // for install B, then dispatch to the still-tab-fronted dangerous A. The
+    // generation was bumped TWICE, so the mutation is caught and the restart
+    // is refused.
+    __panelToolsTestHooks.setLocalRestartPreflight(async () => {
+      hoistedConfig.configBase.value = "http://127.0.0.1:9999"; // A → B
+      hoistedConfig.generation.value += 1;
+      hoistedConfig.configBase.value = null; // B → A (back to the original base)
+      hoistedConfig.generation.value += 1;
+      return { ok: true }; // a pass — for install B, not the tab-fronted A
     });
     __panelToolsTestHooks.setHealthProbe(async () => "down");
     const { ctx, sends } = makeCtx({ confirm: "yes", frontsBoot: true });
