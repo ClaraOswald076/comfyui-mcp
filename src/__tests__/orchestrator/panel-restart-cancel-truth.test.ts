@@ -22,10 +22,7 @@ const { buildPanelToolDefs, __panelToolsTestHooks } = await import(
   "../../orchestrator/panel-tools.js"
 );
 import { getBootLocalComfyUIBaseUrl } from "../../config.js";
-import {
-  __processControlTestHooks,
-  getLastRestartDispatch,
-} from "../../services/process-control.js";
+import { __processControlTestHooks } from "../../services/process-control.js";
 import type { PanelToolCtx, ToolResult } from "../../orchestrator/panel-tools.js";
 
 // The orchestrator's immutable boot endpoint — what the decline-probe and the
@@ -99,8 +96,9 @@ beforeEach(() => {
   // Default: the local relaunch preflight PASSES (the live preflightLocalRestart
   // would probe real processes/ports). The refusal tests override it.
   __panelToolsTestHooks.setLocalRestartPreflight(async () => ({ ok: true }));
-  // r4: no restart dispatch on record unless a test seeds one.
-  __processControlTestHooks.setLastRestartDispatch(null);
+  // r4/r5: no restart dispatch on record unless a test seeds one (also clears
+  // any record a prior test left behind).
+  __processControlTestHooks.reset();
 });
 
 afterEach(() => {
@@ -108,7 +106,7 @@ afterEach(() => {
   __panelToolsTestHooks.setHealthProbe(null);
   __panelToolsTestHooks.setLocalRestartPreflight(null);
   __panelToolsTestHooks.setDeclineProbeTiming(null);
-  __processControlTestHooks.setLastRestartDispatch(null);
+  __processControlTestHooks.reset();
 });
 
 describe("panel_restart_comfyui — decline truthfulness (#742)", () => {
@@ -123,8 +121,10 @@ describe("panel_restart_comfyui — decline truthfulness (#742)", () => {
       probes++;
       return "down";
     });
-    __processControlTestHooks.setLastRestartDispatch({ at: Date.now(), base: BOOT_BASE });
     const { ctx, sends } = makeCtx({ confirm: "no" });
+    // r4/r5: a restart dispatch IS on record HELD BY THIS SESSION, so the
+    // report names the causation.
+    __panelToolsTestHooks.seedSessionRestartDispatch(ctx, { at: Date.now(), base: BOOT_BASE });
 
     const res = await restartTool().handler({}, ctx);
     const t = text(res);
@@ -148,7 +148,6 @@ describe("panel_restart_comfyui — decline truthfulness (#742)", () => {
     // report must be causation-free — never blame a restart that isn't
     // provably on record.
     __panelToolsTestHooks.setHealthProbe(async () => "down");
-    __processControlTestHooks.setLastRestartDispatch(null);
     const { ctx, sends } = makeCtx({ confirm: "no" });
 
     const res = await restartTool().handler({}, ctx);
@@ -168,11 +167,11 @@ describe("panel_restart_comfyui — decline truthfulness (#742)", () => {
     // A dispatch older than the causation window can't explain the current
     // down state — the report stays causation-free.
     __panelToolsTestHooks.setHealthProbe(async () => "down");
-    __processControlTestHooks.setLastRestartDispatch({
+    const { ctx, sends } = makeCtx({ confirm: "no" });
+    __panelToolsTestHooks.seedSessionRestartDispatch(ctx, {
       at: Date.now() - 11 * 60_000, // beyond the 10-minute causation window
       base: BOOT_BASE,
     });
-    const { ctx, sends } = makeCtx({ confirm: "no" });
 
     const res = await restartTool().handler({}, ctx);
     const t = text(res);
@@ -189,11 +188,11 @@ describe("panel_restart_comfyui — decline truthfulness (#742)", () => {
     // The record must target the SAME instance the decline probed — a restart
     // of some other ComfyUI explains nothing here.
     __panelToolsTestHooks.setHealthProbe(async () => "down");
-    __processControlTestHooks.setLastRestartDispatch({
+    const { ctx, sends } = makeCtx({ confirm: "no" });
+    __panelToolsTestHooks.seedSessionRestartDispatch(ctx, {
       at: Date.now(),
       base: "http://127.0.0.1:9999",
     });
-    const { ctx, sends } = makeCtx({ confirm: "no" });
 
     const res = await restartTool().handler({}, ctx);
     const t = text(res);
@@ -204,6 +203,32 @@ describe("panel_restart_comfyui — decline truthfulness (#742)", () => {
     expect(t).not.toMatch(/restart initiated earlier/i);
     expect(t).not.toMatch(/STOPPED and did not come back/i);
     expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
+  });
+
+  it("a dispatch recorded by ANOTHER SESSION never grounds causation here (r5)", async () => {
+    // Two sessions (two ctx objects): session A dispatched the failed restart.
+    // Session B's decline over the SAME base must report causation-FREE…
+    __panelToolsTestHooks.setHealthProbe(async () => "down");
+    const { ctx: ctxA } = makeCtx({ confirm: "no" });
+    const { ctx: ctxB, sends: sendsB } = makeCtx({ confirm: "no" });
+    __panelToolsTestHooks.seedSessionRestartDispatch(ctxA, { at: Date.now(), base: BOOT_BASE });
+
+    const resB = await restartTool().handler({}, ctxB);
+    const tB = text(resB);
+
+    expect(tB).toMatch(/ComfyUI is DOWN/i);
+    expect(tB).toMatch(/no restart was dispatched/i);
+    expect(tB).not.toMatch(/restart initiated earlier/i);
+    expect(tB).not.toMatch(/STOPPED and did not come back/i);
+    expect(sendsB.some((c) => c.cmd === "comfy_reboot")).toBe(false);
+
+    // …while session A's OWN decline over the same base MAY name it.
+    const resA = await restartTool().handler({}, ctxA);
+    const tA = text(resA);
+
+    expect(tA).toMatch(/ComfyUI is DOWN/i);
+    expect(tA).toMatch(/STOPPED and did not come back/i);
+    expect(tA).toMatch(/restart initiated earlier/i);
   });
 
   it("a decline with the server down-then-HEALTHY inside the window does NOT declare a loss", async () => {
@@ -448,14 +473,14 @@ describe("panel_restart_comfyui — Pinokio-style refuse-safe preflight (#742)",
     expect(out.ready).toBe(true);
     expect(out.confirmed_cycle).toBe(true);
     expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(true);
-    // r4: the dispatch was recorded on acceptance AND cleared when the restart
-    // was observed back — a completed restart explains no later down state.
-    expect(getLastRestartDispatch()).toBeNull();
+    // r4/r5: the dispatch was recorded on acceptance AND cleared when the
+    // restart was observed back — a completed restart explains no later down.
+    expect(__panelToolsTestHooks.getSessionRestartDispatch(ctx)).toBeNull();
   });
 });
 
-describe("panel_restart_comfyui — restart dispatch record (r4)", () => {
-  it("an ACCEPTED reboot stamps the dispatch record (target base + time)", async () => {
+describe("panel_restart_comfyui — restart dispatch record (r4/r5)", () => {
+  it("an ACCEPTED reboot stamps the dispatch record HELD BY its session (target base + time)", async () => {
     // The reboot is accepted but never observed back — the record must stay
     // stamped so a later decline can name the causation.
     __panelToolsTestHooks.setHealthProbe(async () => "down");
@@ -465,7 +490,7 @@ describe("panel_restart_comfyui — restart dispatch record (r4)", () => {
     await restartTool().handler({}, ctx);
 
     expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(true);
-    const rec = getLastRestartDispatch();
+    const rec = __panelToolsTestHooks.getSessionRestartDispatch(ctx);
     expect(rec).not.toBeNull();
     expect(rec!.at).toBeGreaterThanOrEqual(before);
     expect(__panelToolsTestHooks.sameHttpBase(rec!.base, BOOT_BASE)).toBe(true);
@@ -483,6 +508,29 @@ describe("panel_restart_comfyui — restart dispatch record (r4)", () => {
 
     expect(out.rebooting).toBe(false);
     expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(true);
-    expect(getLastRestartDispatch()).toBeNull();
+    expect(__panelToolsTestHooks.getSessionRestartDispatch(ctx)).toBeNull();
+  });
+
+  it("session A's recovery clears ONLY its own record — session B's survives (r5)", async () => {
+    // B has a failed restart on record. A runs its own accepted reboot that
+    // recovers: A's record is stamped then cleared on recovery; B's record
+    // must be untouched.
+    __panelToolsTestHooks.setHealthProbe(async () => "down");
+    const { ctx: ctxB } = makeCtx({ confirm: "no" });
+    __panelToolsTestHooks.seedSessionRestartDispatch(ctxB, { at: Date.now(), base: BOOT_BASE });
+
+    const seq: Array<"down" | "healthy"> = ["down", "healthy"];
+    let i = 0;
+    __panelToolsTestHooks.setHealthProbe(async () => seq[Math.min(i++, seq.length - 1)]);
+    const { ctx: ctxA } = makeCtx({ confirm: "yes" });
+
+    const out = parse(await restartTool().handler({}, ctxA));
+
+    expect(out.ready).toBe(true); // A's restart recovered
+    expect(__panelToolsTestHooks.getSessionRestartDispatch(ctxA)).toBeNull(); // A's cleared
+    // B's record survives A's recovery.
+    const recB = __panelToolsTestHooks.getSessionRestartDispatch(ctxB);
+    expect(recB).not.toBeNull();
+    expect(__panelToolsTestHooks.sameHttpBase(recB!.base, BOOT_BASE)).toBe(true);
   });
 });

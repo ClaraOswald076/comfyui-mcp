@@ -68,7 +68,9 @@ import {
   preflightLocalRestart,
   recordRestartDispatch,
   clearRestartDispatch,
-  getLastRestartDispatch,
+  getRestartDispatchRecord,
+  RESTART_DISPATCH_CAUSATION_WINDOW_MS,
+  __processControlTestHooks,
 } from "../services/process-control.js";
 import { resetManagerApiCache } from "../services/manager-api-cache.js";
 import {
@@ -273,13 +275,9 @@ const RESTART_CONFIRM_TIMEOUT_MS = 90_000; // 90s
 const DECLINE_PROBE_WINDOW_MS = 6_000; // 6s total
 const DECLINE_PROBE_INTERVAL_MS = 2_000; // 2s between samples
 const DECLINE_PROBE_TIMEOUT_MS = 2_000; // per-sample probe ceiling
-
-// #742 r4: how long a RECORDED restart dispatch plausibly explains a down
-// server. The decline path's DOWN report may name restart causation only
-// against a dispatch on record within this window (and targeting the probed
-// instance); combined with clear-on-observed-recovery, an unrelated crash or
-// manual stop is never misreported as "a restart took it down".
-const RESTART_DISPATCH_CAUSATION_WINDOW_MS = 10 * 60_000; // 10 min
+// #742 r4/r5: the decline path may name restart causation only against a
+// dispatch RECORDED within RESTART_DISPATCH_CAUSATION_WINDOW_MS (imported from
+// process-control) whose token THIS session holds — see sessionRestartDispatch.
 
 function parsePositiveNumberEnv(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -350,6 +348,22 @@ export const __panelToolsTestHooks = {
   /** Direct access to the #742 decline recheck loop so its hard-deadline
    *  guarantee (codex gate r2) can be unit-tested with a custom deadline. */
   probeDeclineRecovery,
+  /** r5: the restart-dispatch record THIS session (ctx) holds, or null. */
+  getSessionRestartDispatch(
+    ctx: PanelToolCtx,
+  ): { at: number; base: string | null } | null {
+    return sessionRestartDispatch(ctx);
+  },
+  /** r5: seed a restart-dispatch record HELD BY this session (ctx) — with an
+   *  explicit `at` so fresh/stale shapes don't need a real restart. */
+  seedSessionRestartDispatch(
+    ctx: PanelToolCtx,
+    record: { at: number; base: string | null },
+  ): void {
+    const token = randomUUID();
+    __processControlTestHooks.setRestartDispatchRecord(token, record);
+    sessionRestartDispatchTokens.set(ctx, token);
+  },
   looksLikeSystemStats,
   probeComfyHealth,
   probeComfyEndpoint,
@@ -945,6 +959,38 @@ let declineProbeTimingOverride: {
   intervalMs: number;
   probeTimeoutMs: number;
 } | null = null;
+
+// #742 r5: restart-dispatch tokens held PER SESSION. Each MCP session gets its
+// own PanelToolCtx (one per connection — see the session factory in
+// panel-mcp-http), so keying by the ctx object scopes a dispatch record to the
+// session that dispatched it: session A's failed restart can never ground
+// causation for session B's decline, and A's recovery clears only A's record.
+// WeakMap → entries die with their session's ctx.
+const sessionRestartDispatchTokens = new WeakMap<object, string>();
+
+/** Stamp a restart dispatch and hold its token on THIS session (replacing any
+ *  record the session previously held — a session has at most one live one). */
+function stampSessionRestartDispatch(ctx: PanelToolCtx, base: string | null): void {
+  const prev = sessionRestartDispatchTokens.get(ctx);
+  if (prev) clearRestartDispatch(prev);
+  sessionRestartDispatchTokens.set(ctx, recordRestartDispatch(base));
+}
+
+/** The restart-dispatch record THIS session holds, or null. */
+function sessionRestartDispatch(
+  ctx: PanelToolCtx,
+): { at: number; base: string | null } | null {
+  const held = sessionRestartDispatchTokens.get(ctx);
+  return held ? getRestartDispatchRecord(held) : null;
+}
+
+/** Clear ONLY this session's own dispatch record (observed-back). */
+function clearSessionRestartDispatch(ctx: PanelToolCtx): void {
+  const held = sessionRestartDispatchTokens.get(ctx);
+  if (!held) return;
+  sessionRestartDispatchTokens.delete(ctx);
+  clearRestartDispatch(held);
+}
 
 /**
  * The concurrent-observation gate shared between the reboot handler and observeRecovery.
@@ -5564,10 +5610,13 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             if (boundToRestartTarget) {
               // r4: causation may be named ONLY against a RECORDED restart
               // dispatch — recent enough to plausibly be the cause, and
-              // targeting THIS instance. An unrelated crash / manual stop (no
-              // record, a stale record, or another instance's record) gets the
+              // targeting THIS instance. r5: the record must be one THIS
+              // SESSION dispatched (holds the token of) — another session's
+              // failed restart never grounds causation here. An unrelated
+              // crash / manual stop (no record, a stale record, another
+              // instance's record, or another session's record) gets the
               // causation-free report.
-              const dispatch = getLastRestartDispatch();
+              const dispatch = sessionRestartDispatch(ctx);
               const causative =
                 dispatch != null &&
                 Date.now() - dispatch.at <= RESTART_DISPATCH_CAUSATION_WINDOW_MS &&
@@ -5826,6 +5875,14 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               );
             }
             clearTimeout(restartTimer);
+            // #742 r5: the managed restart stopped the process — record the
+            // dispatch with THIS session holding the token (restartComfyUI also
+            // stamped its own process-wide record, which never grounds
+            // causation). Only a PROVEN stop is recorded; a refusal/timeout
+            // (restart undefined, or stopped!==true) records nothing.
+            if (restart?.stopped === true) {
+              stampSessionRestartDispatch(ctx, healthBase ?? getComfyUIBaseUrl());
+            }
             // DEFINITIVE no-restart: a spawn failure, OR restartComfyUI refused before
             // stopping anything (no process found / unsafe relaunch → stopped:false &&
             // started:false). The process was NOT cycled, so the still-healthy endpoint is
@@ -5845,10 +5902,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             // Otherwise (the process WAS stopped/started, or restartComfyUI's own readiness
             // poll merely expired — neither terminal) DEFER to OUR OWN observed DOWN→UP.
             const recovery = await proofPromise;
-            // #742 r4: the managed restart was observed back — clear the record
-            // (restartComfyUI also clears on its own success; this covers the
-            // case where only OUR observer saw the recovery).
-            if (recovery.ready) clearRestartDispatch();
+            // #742 r4/r5: the managed restart was observed back — clear THIS
+            // session's record (restartComfyUI also clears its own process-wide
+            // record on success; this covers only-observer-saw-it recoveries).
+            if (recovery.ready) clearSessionRestartDispatch(ctx);
             const observed = recovery.via === "observed-cycle";
             // The legacy Manager path restarts ComfyUI out-of-band too. Server recovery alone
             // is not graph-tool readiness: wait for the browser tab to reconnect, then verify
@@ -5908,10 +5965,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         resetClient();
         resetObjectInfoCache();
         resetManagerApiCache("panel Manager reboot");
-        // #742 r4: record the ACTUAL dispatch (acceptance proven — a refusal never
-        // reaches here). A later decline-path DOWN report may name restart causation
-        // only against this record; it is cleared below if the restart is observed back.
-        recordRestartDispatch(healthBase ?? getComfyUIBaseUrl());
+        // #742 r4/r5: record the ACTUAL dispatch (acceptance proven — a refusal never
+        // reaches here), holding the token on THIS session. A later decline-path
+        // DOWN report may name restart causation only against a record this
+        // session holds; it is cleared below if the restart is observed back.
+        stampSessionRestartDispatch(ctx, healthBase ?? getComfyUIBaseUrl());
 
         // Observe recovery. There is exactly ONE sound proof that THIS ComfyUI instance
         // actually cycled: a directly OBSERVED down→up on the server-authorized, immutable,
@@ -5948,9 +6006,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // down→up, which the observer has been (and continues) watching for.
         gate.deadline = Math.min(Date.now() + timing.budgetMs, overallDeadline);
         const recovery = await recoveryPromise!;
-        // #742 r4: the dispatched restart was observed back — clear the record so
-        // it explains no later down state.
-        if (recovery.ready) clearRestartDispatch();
+        // #742 r4/r5: the dispatched restart was observed back — clear THIS
+        // session's record (never another session's).
+        if (recovery.ready) clearSessionRestartDispatch(ctx);
         if (!recovery.ready) {
           const waited = Math.round(recovery.waited_ms / 1000);
           return ok({

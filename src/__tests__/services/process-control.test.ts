@@ -58,9 +58,11 @@ vi.mock("../../services/env-capabilities.js", () => ({
 
 import {
   __processControlTestHooks,
-  getLastRestartDispatch,
+  clearRestartDispatch,
+  getRestartDispatchRecord,
   parseListenerPidFromNetstat,
   preflightLocalRestart,
+  PROCESS_WIDE_RESTART_DISPATCH_TOKEN,
   restartComfyUI,
   startComfyUI,
   stopComfyUI,
@@ -840,9 +842,9 @@ describe("restart truthfulness + Pinokio-shaped refusal (#742)", () => {
     expect(result.message).toMatch(/stopped but could not be started/i);
     expect(result.message).not.toMatch(/cancel/i);
     expect(result.spawn_error).toBeTruthy();
-    // r4: the stop stamped the restart-dispatch record (never cleared — the
-    // relaunch failed), so a later decline may name the causation.
-    const rec = getLastRestartDispatch();
+    // r4/r5: the stop stamped the restart-dispatch record (process-wide slot;
+    // never cleared — the relaunch failed).
+    const rec = getRestartDispatchRecord(PROCESS_WIDE_RESTART_DISPATCH_TOKEN);
     expect(rec).not.toBeNull();
     expect(rec!.base).toBe("http://127.0.0.1:8188");
 
@@ -880,8 +882,9 @@ describe("restart truthfulness + Pinokio-shaped refusal (#742)", () => {
 
     expect(result.stopped).toBe(true);
     expect(result.started).toBe(true);
-    // Observed back → the record is cleared: this restart explains no later down.
-    expect(getLastRestartDispatch()).toBeNull();
+    // Observed back → OUR process-wide record is cleared: this restart
+    // explains no later down.
+    expect(getRestartDispatchRecord(PROCESS_WIDE_RESTART_DISPATCH_TOKEN)).toBeNull();
 
     killSpy.mockRestore();
   });
@@ -914,8 +917,30 @@ describe("restart truthfulness + Pinokio-shaped refusal (#742)", () => {
 
     expect(result.stopped).toBe(true);
     expect(result.started).toBe(false);
-    const rec = getLastRestartDispatch();
+    const rec = getRestartDispatchRecord(PROCESS_WIDE_RESTART_DISPATCH_TOKEN);
     expect(rec).not.toBeNull();
     expect(rec!.base).toBe("http://127.0.0.1:8188");
+  });
+
+  it("a recovery clear removes ONLY the dispatching session's record (r5)", () => {
+    // Two sessions' records coexist; clearing one's token must never touch the
+    // other's — A's recovery cannot clear B's record.
+    __processControlTestHooks.setRestartDispatchRecord("tok-a", {
+      at: Date.now(),
+      base: "http://127.0.0.1:8188",
+    });
+    __processControlTestHooks.setRestartDispatchRecord("tok-b", {
+      at: Date.now(),
+      base: "http://127.0.0.1:8188",
+    });
+
+    clearRestartDispatch("tok-a");
+    expect(getRestartDispatchRecord("tok-a")).toBeNull();
+    expect(getRestartDispatchRecord("tok-b")).not.toBeNull(); // B's survives
+
+    clearRestartDispatch("tok-b");
+    expect(getRestartDispatchRecord("tok-b")).toBeNull();
+    // Unknown token → no-op, never throws.
+    expect(() => clearRestartDispatch("tok-nope")).not.toThrow();
   });
 });
