@@ -812,13 +812,18 @@ describe("run completion journal correlation (#468)", () => {
     journal.ack(entry!.token);
     expect(journal.ticketFor(PROMPT_A)?.settled).toBe(true);
 
-    // Age the memo out with a flood of other acked completions.
-    for (let i = 0; i < 300; i++) {
+    // Flood with REAL runs (openRun + completion + ack), so the ticket map
+    // overflows too — the settled ticket is evicted preferentially, which is
+    // exactly the window where the proof used to disappear.
+    for (let i = 0; i < 200; i++) {
+      journal.openRun(`flood-${i}`, { tabId: "t" });
       const e = journal.record("t", { kind: "executed", prompt_id: `flood-${i}` });
       journal.deliverPending("t", () => true);
       journal.ack(e!.token);
     }
-    // The late resend is still recognised as already delivered.
+    // Its ticket is long gone (tickets are the smaller bound, and settled ones
+    // are evicted first) — the memo is what must outlive it.
+    expect(journal.ticketFor(PROMPT_A)).toBeUndefined();
     expect(journal.record("t", { kind: "executed", prompt_id: PROMPT_A })).toBeNull();
   });
 

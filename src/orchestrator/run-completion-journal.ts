@@ -133,8 +133,10 @@ const MAX_ENTRIES_PER_KEY = 32;
  *  that opens and abandons many tabs can't grow the journal without limit. */
 const MAX_ENTRIES_TOTAL = 96;
 /** (tab, run) pairs remembered as already delivered, to suppress a re-sent frame
- *  after its entry was acked and removed. */
-const MAX_DELIVERED_MEMO = 256;
+ *  after its entry was acked and removed. Comfortably larger than MAX_TICKETS so
+ *  it outlives the tickets that feed it; a resend later than THIS is delivered
+ *  again, but as `foreign` — flagged UNDETERMINED, never as the awaited run. */
+const MAX_DELIVERED_MEMO = 512;
 /** Tabs whose evicted-completion counter is retained. */
 const MAX_DROPPED_KEYS = 64;
 /** How many times a completion may be CARRIED BY A TURN THAT THEN ENDED without a
@@ -552,15 +554,7 @@ export class RunCompletionJournalImpl {
     // run's real completion.
     if (entry.superseded) return;
     if (entry.correlation.status !== "unidentified") {
-      // Remember (tab, run) so a later re-send of the same frame is suppressed
-      // rather than delivered a second time. Bounded FIFO — old ids age out; a
-      // re-send that late is not a real case.
-      this.delivered.add(deliveredKey(entry.key, entry.correlation.promptId));
-      while (this.delivered.size > MAX_DELIVERED_MEMO) {
-        const oldest = this.delivered.values().next().value;
-        if (oldest === undefined) break;
-        this.delivered.delete(oldest);
-      }
+      this.memoDelivered(entry.key, entry.correlation.promptId);
     } else if (entry.fingerprint) {
       // ID-LESS: memoize the CONTENT so a re-sent identical frame after the ack
       // doesn't produce a second turn. Windowed in record(), bounded here.
@@ -712,6 +706,19 @@ export class RunCompletionJournalImpl {
     }
   }
 
+  /** Remember (tab, run) as already reported, so a later re-send of the same
+   *  frame is suppressed rather than delivered a second time. Bounded FIFO; the
+   *  run TICKET's `settled` flag is the other record, and an evicted settled
+   *  ticket feeds this one so neither expires before the other. */
+  private memoDelivered(key: string, promptId: string): void {
+    this.delivered.add(deliveredKey(key, promptId));
+    while (this.delivered.size > MAX_DELIVERED_MEMO) {
+      const oldest = this.delivered.values().next().value;
+      if (oldest === undefined) break;
+      this.delivered.delete(oldest);
+    }
+  }
+
   /** Test/diagnostic helpers. */
   ticketFor(promptId: string): RunTicket | undefined {
     return this.tickets.get(promptId);
@@ -747,6 +754,10 @@ export class RunCompletionJournalImpl {
       }
       if (!victim) victim = this.tickets.keys().next().value ?? null;
       if (!victim) return;
+      // Evicting a SETTLED ticket does not lose the "already reported" proof:
+      // ack() writes it to the delivered memo at the same moment it sets
+      // `settled`, and MAX_DELIVERED_MEMO is deliberately far larger than
+      // MAX_TICKETS so the memo always outlives the ticket that mirrors it.
       this.tickets.delete(victim);
     }
   }
