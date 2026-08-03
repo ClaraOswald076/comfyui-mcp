@@ -91,6 +91,12 @@ interface StopResult {
   message: string;
   has_restart_info: boolean;
   auto_restart?: SupervisorResult;
+  /**
+   * Set when the stop was COMMITTED without being able to confirm the process
+   * actually exited (every port probe failed after the kill). Carried separately
+   * so a caller composing its own message cannot silently drop the caveat.
+   */
+  unverified_exit?: string;
 }
 
 interface StartResult {
@@ -1881,6 +1887,13 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
     argv: info.argv.join(" "),
   });
 
+  // Remember HOW to relaunch before doing anything irreversible. Saving this only
+  // after a committed stop meant that any later refusal — including one taken while
+  // the server may already be dead — left `start_comfyui` with no launch info to
+  // recover from (codex gate). It is only a record of what we observed; a start
+  // still re-validates and refuses to double-launch onto an occupied port.
+  lastProcessInfo = info;
+
   // Kill process tree (for Desktop app, kill the Electron shell too).
   //
   // A KILL THAT THREW IS NOT A COMMITTED STOP (coordinator gate P1(3)). `taskkill`
@@ -1923,24 +1936,36 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
   // success from here. The port is the observable that settles it: wait for it to
   // be released, and let the timeout DECIDE rather than merely warn.
   let blockedReason: string | undefined;
+  let unverified: string | undefined;
   try {
     await waitForPortFree(info.port);
   } catch {
     // Timed out. Three outcomes, and they must NOT be conflated:
-    //   • still held by OUR target → the kill did not work; the server is UP, so
-    //     refusing is both safe and correct;
-    //   • held by somebody else → our target did die and a successor took the port;
-    //   • could not be determined → we have no proof the process died, and
-    //     "unknown" must never be spent as if it were proof.
+    //   • still held by OUR target → the kill did not work, so the server is UP.
+    //     Refusing is safe AND correct: it costs a restart, never the server.
+    //   • held by somebody else → our target did die and a successor took the port.
+    //   • could not be determined → see below.
     const probe = probePortOwner(info.port);
     if (probe.state === "owned" && probe.pid === info.pid) {
       blockedReason =
         `PID ${info.pid} still holds port ${info.port} after the kill was issued, so it is ` +
         `still running`;
     } else if (probe.state === "unknown") {
-      blockedReason =
-        `the port could not be checked after the kill (${probe.reason}), so there is no ` +
-        `evidence PID ${info.pid} actually died`;
+      // We CANNOT tell whether the process died — and unlike every other
+      // uncertainty in this file, refusing here does not restore anything: the kill
+      // has already been issued. If it worked, refusing leaves the user's server
+      // dead AND unrelaunched, which is the one outcome this whole issue exists to
+      // prevent. So we commit and let the relaunch run; if the kill in fact failed,
+      // the old server is still serving and the relaunch simply finds the port
+      // taken (reported honestly as `not-ours`). Proceed — and say it is unverified.
+      unverified =
+        `the port could not be checked after the kill (${probe.reason}), so it is not ` +
+        `confirmed that PID ${info.pid} exited`;
+      logger.warn("Stop committed without port verification", {
+        pid: info.pid,
+        port: info.port,
+        reason: probe.reason,
+      });
     } else {
       logger.warn(
         "Port did not free in time, but it is no longer held by the process we killed",
@@ -1961,7 +1986,9 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
     };
   }
 
-  // COMMITTED — the process is provably gone. Only now may we drop supervision.
+  // COMMITTED — the process is gone, or (when `unverified`) the kill has been
+  // issued and we have chosen going forward over a refusal that could not restore
+  // anything. Only now may we drop supervision.
   detachSupervisor();
   // The server we may have launched is going away — clear the shares-our-env flag so
   // a differently-launched successor doesn't inherit env-trust it shouldn't (#633 P1b).
@@ -1971,9 +1998,6 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
   resetLocalComfyUILaunchState();
   clearLaunchedInterpreter();
   deliberateStop = false;
-
-  // Save for later start
-  lastProcessInfo = info;
 
   // Reset the WebSocket client singleton + the memoized /object_info —
   // a restart is exactly when the node set may have changed. The detected
@@ -1987,9 +2011,12 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
 
   return {
     stopped: true,
-    message: `ComfyUI (PID ${info.pid}) stopped on port ${info.port}`,
+    message:
+      `ComfyUI (PID ${info.pid}) stopped on port ${info.port}` +
+      (unverified ? ` — NOTE: ${unverified}; continuing so the server can be brought back.` : ""),
     has_restart_info: true,
     auto_restart: supervisorResult(info),
+    unverified_exit: unverified,
   };
 }
 
@@ -2563,6 +2590,14 @@ export async function restartComfyUI(): Promise<RestartResult> {
   // Brief pause to let OS fully release resources
   await sleep(1000);
 
+  // A caveat from the stop must survive into whatever we report: the stop can
+  // commit WITHOUT confirming the process exited (every port probe failed after
+  // the kill), and that is exactly the situation where a bare "restarted
+  // successfully" would overstate what we know.
+  const stopCaveat = stopResult.unverified_exit
+    ? ` NOTE from the stop: ${stopResult.unverified_exit}.`
+    : "";
+
   // Start
   const startResult = await startComfyUI();
   if (!startResult.started) {
@@ -2576,9 +2611,11 @@ export async function restartComfyUI(): Promise<RestartResult> {
       // somebody else (an external supervisor beat us to the port — our relaunch
       // still failed). Saying "could not be started" about a healthy server would
       // be as wrong as claiming success for it (codex gate).
-      message: startResult.ready
-        ? `ComfyUI is back up, but NOT as a result of this restart: ${startResult.message}`
-        : `ComfyUI was stopped but could not be started: ${startResult.message}`,
+      message:
+        (startResult.ready
+          ? `ComfyUI is back up, but NOT as a result of this restart: ${startResult.message}`
+          : `ComfyUI was stopped but could not be started: ${startResult.message}`) +
+        stopCaveat,
       auto_restart: startResult.auto_restart,
       spawn_error: startResult.spawn_error,
       launch_env: startResult.launch_env,
@@ -2608,7 +2645,9 @@ export async function restartComfyUI(): Promise<RestartResult> {
     message:
       (startResult.listener_ownership === "unconfirmed"
         ? "ComfyUI is up and ready after the restart, though this call's own process could not be confirmed as the one serving the port. "
-        : "ComfyUI restarted successfully. ") + startResult.message,
+        : "ComfyUI restarted successfully. ") +
+      startResult.message +
+      stopCaveat,
     auto_restart: startResult.auto_restart,
     launch_env: startResult.launch_env,
     listener_ownership: startResult.listener_ownership,

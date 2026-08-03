@@ -1066,10 +1066,12 @@ describe("restart_comfyui — a PID is not a process identity (#776)", () => {
     killSpy.mockRestore();
   });
 
-  it("does NOT treat an unreadable port probe as proof the killed process died", async () => {
-    // `findPidByPort` answers null both for "port is free" and for "the lookup
-    // failed". Spending the second as the first tears supervision down under a
-    // server that may still be running.
+  it("does NOT treat an unreadable port probe as proof the killed process died — but still brings the server back", async () => {
+    // Two mirror-image mistakes to avoid. Reading "the probe failed" as "the port is
+    // free" would tear supervision down under a live server. But REFUSING on it is
+    // worse: the kill has already been issued, so a refusal cannot restore anything
+    // and would leave a dead server unrelaunched — the cardinal failure. So the stop
+    // commits, says plainly that it is unverified, and the relaunch runs.
     usePlainInstallForIdentity();
     let killIssued = false;
     mockExecSync.mockImplementation((cmd: string) => {
@@ -1089,13 +1091,44 @@ describe("restart_comfyui — a PID is not a process identity (#776)", () => {
       return "";
     });
     spawnCapturingChildren();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true }) as Response),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    // The stop went through — refusing here could not have un-killed anything.
+    expect(result.stopped).toBe(true);
+    expect(result.message).toMatch(/could not be checked after the kill/i);
+    expect(result.message).toMatch(/not confirmed that PID 4321 exited/i);
+    // ...and, crucially, the relaunch was attempted rather than abandoned.
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+
+    killSpy.mockRestore();
+  }, 30_000);
+
+  it("still REFUSES when the probe can see that our target is the one holding the port", async () => {
+    // The determinable half of the same situation: the kill did not work and the
+    // server is provably still running. Here a refusal costs a restart, not a
+    // server — so nothing is torn down and no second instance is launched.
+    usePlainInstallForIdentity();
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill|pkill|\bkill\b/i.test(cmd)) return "";
+      if (/netstat/i.test(cmd)) {
+        return "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
+      }
+      if (/lsof/i.test(cmd)) return "p4321\nn127.0.0.1:8188\n";
+      return "";
+    });
+    spawnCapturingChildren();
     const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
 
     const result = await restartComfyUI();
 
     expect(result.stopped).toBe(false);
-    expect(result.message).toMatch(/could not be checked after the kill/i);
-    expect(result.message).toMatch(/no evidence PID 4321 actually died/i);
+    expect(result.message).toMatch(/still holds port 8188/i);
     expect(result.message).toMatch(/nothing was torn down/i);
     expect(mockSpawn).not.toHaveBeenCalled();
 
