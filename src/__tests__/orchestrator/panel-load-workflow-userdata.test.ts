@@ -1,12 +1,18 @@
-// panel_load_workflow — relative names resolve through the connected ComfyUI's
-// userdata API when the guessed local disk path misses (#202).
+// panel_load_workflow — relative names are resolved by the CONNECTED ComfyUI,
+// which is the only authority on its own `--user-directory` (panel #202).
 //
-// Root cause: comfyWorkflowsDirs() hardcodes COMFYUI_PATH/user/default/workflows
-// (and user/workflows), so a ComfyUI launched with a CUSTOM --user-directory
-// keeps its workflows somewhere the orchestrator can't guess — a relative
-// panel_load_workflow name then fell through to a "no workflow file" error even
-// though list_workflows/panel_open_workflow (which read the userdata API) could
-// see it. readWorkflowFromPath now falls back to that same userdata API.
+// Root cause: comfyWorkflowsDirs() RECONSTRUCTS COMFYUI_PATH/user/default/workflows
+// (and user/workflows), so a ComfyUI launched with a CUSTOM --user-directory keeps
+// its workflows somewhere the orchestrator cannot guess. A relative name either
+// failed outright — even though list_workflows/panel_open_workflow could see it —
+// or, worse, matched a same-named file under the reconstructed path and loaded a
+// DIFFERENT graph for the agent to edit.
+//
+// The resolver now asks the server first and, when the server answers, defers to
+// that answer completely: it refuses instead of falling back to a reconstructed
+// path, and refuses instead of picking between several candidates. Only a server
+// that gives NO answer at all (a statusless transport error) re-enables the
+// best-effort local read that keeps the default layout working.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -92,7 +98,7 @@ describe("panel_load_workflow: userdata fallback for a custom --user-directory (
     expect(res.isError).toBe(true);
     expect(calls).toHaveLength(0);
     const text = JSON.stringify(res);
-    expect(text).toMatch(/userdata library/i);
+    expect(text).toMatch(/workflow library/i);
     expect(text).toMatch(/panel_list_workflows/);
   });
 
@@ -190,33 +196,136 @@ describe("panel_load_workflow: userdata fallback for a custom --user-directory (
     }
   });
 
-  it("treats an EMPTY 200 body as absence and falls back to the local disk file", async () => {
+  it("treats an EMPTY 200 body as an AUTHORITATIVE absence and refuses (never the local file)", async () => {
     // ComfyUI's "200 + empty body = file does not exist" convention (some builds)
-    // must be an ABSENCE (local fallback), NOT a malformed error (#202).
+    // is an ABSENCE, not a malformed error — and an absence reported by the server
+    // is AUTHORITATIVE: it resolved the name under its own --user-directory. Any
+    // file still findable under the orchestrator's RECONSTRUCTED default-layout
+    // path is therefore a DIFFERENT file, so loading it is the wrong-graph hazard
+    // (#202). Refuse instead.
     const root = mkdtempSync(join(tmpdir(), "cmcp-userdir-"));
     try {
       const defaultDir = join(root, "user", "default", "workflows");
       mkdirSync(defaultDir, { recursive: true });
-      const staged = { nodes: [{ id: 5, type: "EmptyBodyFallbackNode" }], links: [] };
-      writeFileSync(join(defaultDir, "foo.json"), JSON.stringify(staged), "utf8");
+      const other = { nodes: [{ id: 5, type: "DifferentFileNode" }], links: [] };
+      writeFileSync(join(defaultDir, "foo.json"), JSON.stringify(other), "utf8");
       process.env.COMFYUI_PATH = root;
 
-      fetchApi.mockResolvedValue({ ok: true, status: 200, text: async () => "   " });
+      fetchApi.mockImplementation(async (route: string) =>
+        route.startsWith("/api/userdata?")
+          ? { ok: true, status: 200, json: async () => [] }
+          : { ok: true, status: 200, text: async () => "   " },
+      );
 
       const { ctx, calls } = makeCtx();
       const res = await loadWorkflow().handler({ path: "foo.json" }, ctx);
 
-      expect(res.isError).toBeUndefined();
-      expect(calls).toHaveLength(1);
-      expect(calls[0].graph).toMatchObject(staged); // local fallback loaded it
+      expect(res.isError).toBe(true);
+      expect(calls).toHaveLength(0); // the DIFFERENT local foo.json was never loaded
+      expect(JSON.stringify(res)).toMatch(/user directory|--user-directory/i);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  it("falls back to the local disk file when the server doesn't have the name (404)", async () => {
-    // A file staged straight to the default workflows dir, absent from the
-    // runtime userdata library → the local fallback still opens it.
+  it("REFUSES rather than loading a same-named local file when the server 404s the name (#202)", async () => {
+    // The core hazard: ComfyUI runs a custom --user-directory, so the guessed
+    // COMFYUI_PATH/user/default/workflows is the WRONG directory. A same-named
+    // file there is a different graph; loading it would hand the agent the wrong
+    // workflow to edit. The refusal must name what was tried.
+    const root = mkdtempSync(join(tmpdir(), "cmcp-userdir-"));
+    try {
+      const defaultDir = join(root, "user", "default", "workflows");
+      mkdirSync(defaultDir, { recursive: true });
+      const wrong = { nodes: [{ id: 7, type: "WrongDirNode" }], links: [] };
+      writeFileSync(join(defaultDir, "staged.json"), JSON.stringify(wrong), "utf8");
+      process.env.COMFYUI_PATH = root;
+
+      fetchApi.mockImplementation(async (route: string) =>
+        route.startsWith("/api/userdata?")
+          ? { ok: true, status: 200, json: async () => ["other.json"] }
+          : { ok: false, status: 404, json: async () => ({}) },
+      );
+
+      const { ctx, calls } = makeCtx();
+      const res = await loadWorkflow().handler({ path: "staged.json" }, ctx);
+
+      expect(res.isError).toBe(true);
+      expect(calls).toHaveLength(0);
+      const text = JSON.stringify(res);
+      expect(text).toMatch(/staged\.json/); // names what it tried
+      expect(text).toMatch(/panel_list_workflows/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// #202 — the connected ComfyUI's real fetch client (@stable-canvas/comfyui-client)
+// THROWS an HttpError {status} for every non-2xx; it never returns a non-ok
+// Response. Classifying only `res.status` therefore turned every 401/403/5xx into
+// "unreachable", which re-enabled the guessed-local-directory fallback for a
+// server that had REFUSED — the wrong-file path this resolver exists to close.
+describe("readWorkflowFromPath: HTTP status is recovered from a THROWN client error (#202)", () => {
+  class HttpError extends Error {
+    constructor(message: string, readonly status: number) {
+      super(message);
+    }
+  }
+
+  it("a THROWN 403 is a refusal — never a fallback to a colliding local file", async () => {
+    const root = mkdtempSync(join(tmpdir(), "cmcp-userdir-"));
+    try {
+      const defaultDir = join(root, "user", "default", "workflows");
+      mkdirSync(defaultDir, { recursive: true });
+      writeFileSync(
+        join(defaultDir, "foo.json"),
+        JSON.stringify({ nodes: [{ id: 1, type: "CollidingLocalNode" }], links: [] }),
+        "utf8",
+      );
+      process.env.COMFYUI_PATH = root;
+
+      fetchApi.mockRejectedValue(new HttpError("Endpoint Bad Request (403 Forbidden)", 403));
+
+      const { ctx, calls } = makeCtx();
+      const res = await loadWorkflow().handler({ path: "foo.json" }, ctx);
+
+      expect(res.isError).toBe(true);
+      expect(calls).toHaveLength(0); // the colliding local file was NOT loaded
+      expect(JSON.stringify(res)).toMatch(/HTTP 403/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("a THROWN 404 is an authoritative absence — refused, not silently substituted", async () => {
+    const root = mkdtempSync(join(tmpdir(), "cmcp-userdir-"));
+    try {
+      const defaultDir = join(root, "user", "default", "workflows");
+      mkdirSync(defaultDir, { recursive: true });
+      writeFileSync(
+        join(defaultDir, "foo.json"),
+        JSON.stringify({ nodes: [{ id: 1, type: "CollidingLocalNode" }], links: [] }),
+        "utf8",
+      );
+      process.env.COMFYUI_PATH = root;
+
+      fetchApi.mockRejectedValue(new HttpError("Endpoint Bad Request (404 Not Found)", 404));
+
+      const { ctx, calls } = makeCtx();
+      const res = await loadWorkflow().handler({ path: "foo.json" }, ctx);
+
+      expect(res.isError).toBe(true);
+      expect(calls).toHaveLength(0);
+      expect(JSON.stringify(res)).toMatch(/404/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("a statusless transport error still allows the reconstructed local dir (default layout)", async () => {
+    // No HTTP status at all → no authority to defer to → the pre-existing
+    // best-effort local read is preserved so the DEFAULT layout keeps working.
     const root = mkdtempSync(join(tmpdir(), "cmcp-userdir-"));
     try {
       const defaultDir = join(root, "user", "default", "workflows");
@@ -225,7 +334,7 @@ describe("panel_load_workflow: userdata fallback for a custom --user-directory (
       writeFileSync(join(defaultDir, "staged.json"), JSON.stringify(staged), "utf8");
       process.env.COMFYUI_PATH = root;
 
-      fetchApi.mockResolvedValue({ ok: false, status: 404, json: async () => ({}) });
+      fetchApi.mockRejectedValue(new Error("ECONNREFUSED"));
 
       const { ctx, calls } = makeCtx();
       const res = await loadWorkflow().handler({ path: "staged.json" }, ctx);
@@ -236,6 +345,111 @@ describe("panel_load_workflow: userdata fallback for a custom --user-directory (
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it("refuses when an unreachable server leaves TWO different local candidates", async () => {
+    // Both reconstructed layouts (user/default/workflows and user/workflows) hold a
+    // DIFFERENT file of the same name. With no server to arbitrate, picking the
+    // first is a coin flip over which graph the agent edits — refuse instead.
+    const root = mkdtempSync(join(tmpdir(), "cmcp-userdir-"));
+    try {
+      const a = join(root, "user", "default", "workflows");
+      const b = join(root, "user", "workflows");
+      mkdirSync(a, { recursive: true });
+      mkdirSync(b, { recursive: true });
+      writeFileSync(join(a, "dup.json"), JSON.stringify({ nodes: [{ id: 1, type: "A" }] }), "utf8");
+      writeFileSync(join(b, "dup.json"), JSON.stringify({ nodes: [{ id: 2, type: "B" }] }), "utf8");
+      process.env.COMFYUI_PATH = root;
+
+      fetchApi.mockRejectedValue(new Error("ECONNREFUSED"));
+
+      const { ctx, calls } = makeCtx();
+      const res = await loadWorkflow().handler({ path: "dup.json" }, ctx);
+
+      expect(res.isError).toBe(true);
+      expect(calls).toHaveLength(0);
+      expect(JSON.stringify(res)).toMatch(/ambiguous/i);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// #202 — a name that IS in the connected ComfyUI's library but whose bytes differ
+// (Unicode NFC/NFD, or letter case) used to 404 and die, even though
+// panel_list_workflows plainly showed it. The resolver asks the SERVER for its own
+// listing and retries the SERVER's exact key — it never reconstructs a path — and
+// refuses outright when more than one listed key could be meant.
+describe("readWorkflowFromPath: near-miss names resolve via the server's OWN listing (#202)", () => {
+  const routeMock = (listing: unknown[], files: Record<string, unknown>) =>
+    fetchApi.mockImplementation(async (route: string) => {
+      if (route.startsWith("/api/userdata?")) {
+        return { ok: true, status: 200, json: async () => listing };
+      }
+      const key = decodeURIComponent(route.replace("/api/userdata/", ""));
+      const hit = files[key];
+      if (hit === undefined) return { ok: false, status: 404, json: async () => ({}) };
+      return { ok: true, status: 200, text: async () => JSON.stringify(hit) };
+    });
+
+  it("resolves an NFD-typed name to the library's NFC key and loads THAT file", async () => {
+    // "cafe.json" with an acute accent: the library key is COMPOSED (NFC, U+00E9),
+    // the caller typed the DECOMPOSED form (NFD, "e" + U+0301). Byte-different,
+    // same file name. Written as escapes so no editor/formatter can re-normalize
+    // the literals and quietly void the test.
+    const nfc = "café.json";
+    const nfd = "café.json";
+    const graph = { nodes: [{ id: 1, type: "KSampler" }], links: [] };
+    routeMock([nfc], { [`workflows/${nfc}`]: graph });
+
+    const { ctx, calls } = makeCtx();
+    const res = await loadWorkflow().handler({ path: nfd }, ctx);
+
+    expect(res.isError).toBeUndefined();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].graph).toMatchObject(graph);
+    // It fetched the SERVER's key, not a locally reconstructed path.
+    expect(fetchApi).toHaveBeenCalledWith(`/api/userdata/${encodeURIComponent(`workflows/${nfc}`)}`);
+  });
+
+  it("REFUSES when two listed workflows differ only by case (ambiguous, no guess)", async () => {
+    routeMock(["Foo.json", "foo.json"], {});
+
+    const { ctx, calls } = makeCtx();
+    const res = await loadWorkflow().handler({ path: "FOO.json" }, ctx);
+
+    expect(res.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+    const text = JSON.stringify(res);
+    expect(text).toMatch(/ambiguous/i);
+    expect(text).toMatch(/Foo\.json/);
+    expect(text).toMatch(/foo\.json/);
+  });
+
+  it("says so when the library LISTS the name but will not serve it", async () => {
+    routeMock(["ghost.json"], {}); // listed, but every GET 404s
+
+    const { ctx, calls } = makeCtx();
+    const res = await loadWorkflow().handler({ path: "ghost.json" }, ctx);
+
+    expect(res.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+    expect(JSON.stringify(res)).toMatch(/DOES list/i);
+  });
+
+  it("an unreadable listing does not invent a match — it still refuses honestly", async () => {
+    fetchApi.mockImplementation(async (route: string) =>
+      route.startsWith("/api/userdata?")
+        ? { ok: false, status: 500, json: async () => ({}) }
+        : { ok: false, status: 404, json: async () => ({}) },
+    );
+
+    const { ctx, calls } = makeCtx();
+    const res = await loadWorkflow().handler({ path: "whatever.json" }, ctx);
+
+    expect(res.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+    expect(JSON.stringify(res)).toMatch(/panel_list_workflows/);
   });
 });
 
@@ -288,9 +502,10 @@ describe("readWorkflowFromPath: a list-style 'workflows/…' path is not double-
       writeFileSync(join(defaultDir, "Foo.json"), JSON.stringify(staged), "utf8");
       process.env.COMFYUI_PATH = root;
 
-      // Server 404s the name → local fallback. rel ("Foo.json") must join the
+      // Server unreachable (statusless transport error) → the local fallback is
+      // the only branch that still reads disk. rel ("Foo.json") must join the
       // workflows dir directly, not as workflows/workflows/Foo.json.
-      fetchApi.mockResolvedValue({ ok: false, status: 404, json: async () => ({}) });
+      fetchApi.mockRejectedValue(new Error("ECONNREFUSED"));
 
       const { ctx, calls } = makeCtx();
       const res = await loadWorkflow().handler({ path: "workflows/Foo.json" }, ctx);
@@ -364,7 +579,9 @@ describe("readWorkflowFromPath: refuses a '..' traversal segment (#414 hardening
         return; // unprivileged symlink creation — skip on this platform
       }
       process.env.COMFYUI_PATH = root;
-      fetchApi.mockResolvedValue({ ok: false, status: 404, json: async () => ({}) });
+      // Unreachable server → the local fallback is reached, so the realpath
+      // containment check is the thing actually under test here.
+      fetchApi.mockRejectedValue(new Error("ECONNREFUSED"));
 
       const { ctx, calls } = makeCtx();
       const res = await loadWorkflow().handler({ path: "linked/secret.json" }, ctx);
@@ -372,7 +589,7 @@ describe("readWorkflowFromPath: refuses a '..' traversal segment (#414 hardening
       // The escaping file must NOT be loaded — surfaces the honest not-found error.
       expect(calls).toHaveLength(0);
       expect(res.isError).toBe(true);
-      expect(JSON.stringify(res)).toMatch(/No workflow file at|userdata/i);
+      expect(JSON.stringify(res)).toMatch(/No workflow file at/i);
     } finally {
       rmSync(root, { recursive: true, force: true });
       rmSync(external, { recursive: true, force: true });

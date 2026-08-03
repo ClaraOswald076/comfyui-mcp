@@ -2187,7 +2187,21 @@ function readPackWorkflow(packName: string): Record<string, unknown> {
 // ComfyUI whose files the orchestrator can't see — use the inline `graph` option
 // for that.
 
-/** Candidate ComfyUI workflows directories (where the frontend saves/stages files). */
+/**
+ * Candidate ComfyUI workflows directories, RECONSTRUCTED from COMFYUI_PATH.
+ *
+ * These are GUESSES at the DEFAULT layout. ComfyUI's `--user-directory` moves the
+ * whole user tree somewhere unguessable, so a hit under one of these dirs is only
+ * ever the file the caller meant when the server happens to run the default
+ * layout. They are therefore a LAST resort, used only when the connected ComfyUI
+ * could not be asked at all (#202).
+ *
+ * `process.cwd()` is deliberately NOT in this list: resolving a library name
+ * against whatever directory the orchestrator happened to be launched from can
+ * only ever produce a file that is not the named library workflow — the
+ * load-the-wrong-graph hazard. Callers who mean a file outside the library pass
+ * an absolute path.
+ */
 function comfyWorkflowsDirs(): string[] {
   const base = process.env.COMFYUI_PATH;
   if (!base) return [];
@@ -2195,6 +2209,66 @@ function comfyWorkflowsDirs(): string[] {
     join(base, "user", "default", "workflows"),
     join(base, "user", "workflows"),
   ];
+}
+
+/**
+ * The HTTP status behind a failed `client.fetchApi` call, or undefined when the
+ * failure carried no status (a genuine transport error).
+ *
+ * WHY THIS EXISTS: `@stable-canvas/comfyui-client`'s `fetchApi` THROWS an
+ * `HttpError {status, json}` for every status outside 2xx/3xx — it never returns
+ * a non-ok Response. Code that only inspected `res.status` therefore classified
+ * EVERY 401/403/404/5xx as a transport failure, which silently enabled the
+ * guessed-local-directory fallback for a server that was reachable and had
+ * REFUSED. That is precisely how a different same-named workflow gets loaded
+ * (#202). The returned-non-ok shape is still handled by the caller for older
+ * clients and for tests that stub a plain Response.
+ *
+ * A 4xx/5xx whose body is not JSON makes the library's own `await res.json()`
+ * reject, so the status is genuinely unrecoverable there — those fall through to
+ * `undefined` (treated as "no authority", never as "the server said no").
+ */
+function httpStatusOfError(err: unknown): number | undefined {
+  const status = (err as { status?: unknown } | null | undefined)?.status;
+  return typeof status === "number" && Number.isFinite(status) ? status : undefined;
+}
+
+/** Compare two userdata store keys the way a filesystem does: one path-separator
+ *  flavour, one Unicode normal form. A name copied out of a listing (or typed on
+ *  a different OS) can carry the SAME characters in a different normalization —
+ *  NFD "é" vs NFC "é" are byte-different but the same file name, and a raw
+ *  byte comparison 404s on a workflow that visibly exists in the library. */
+const normalizeStoreKey = (key: string): string =>
+  key.replace(/\\/g, "/").replace(/^\/+/, "").replace(/^workflows\/+/i, "").normalize("NFC");
+
+/**
+ * The connected ComfyUI's OWN list of saved workflow store keys, or null when the
+ * listing could not be read. This is the same source panel_list_workflows /
+ * list_workflows report, so it reflects the server's runtime `--user-directory`
+ * — it is asked, never reconstructed. Used only to turn an authoritative
+ * "no such name" into either the server's EXACT key or an explicit refusal.
+ * Never throws: an unreadable listing simply means "no extra information".
+ */
+async function listUserdataWorkflowKeys(): Promise<string[] | null> {
+  try {
+    const res = await getClient().fetchApi("/api/userdata?dir=workflows");
+    if (!res.ok) return null;
+    const body: unknown = await res.json();
+    if (!Array.isArray(body)) return null;
+    // Tolerate both shapes ComfyUI builds return: bare strings, and richer
+    // entries ({path}/{name}) from full-info-style responses.
+    return body
+      .map((entry) => {
+        if (typeof entry === "string") return entry;
+        const rec = entry as { path?: unknown; name?: unknown } | null;
+        if (rec && typeof rec.path === "string") return rec.path;
+        if (rec && typeof rec.name === "string") return rec.name;
+        return null;
+      })
+      .filter((k): k is string => typeof k === "string" && k.length > 0);
+  } catch {
+    return null;
+  }
 }
 
 /** Validate a parsed value is a UI/litegraph workflow (a top-level `nodes`
@@ -2212,16 +2286,33 @@ function assertUiWorkflow(parsed: unknown, sourceLabel: string): Record<string, 
   return parsed as Record<string, unknown>;
 }
 
-/** Read + parse a UI workflow JSON by path. Resolves an ABSOLUTE path off the
- *  orchestrator's disk, or a RELATIVE name authoritatively through the CONNECTED
- *  ComfyUI's userdata API — which resolves under the server's RUNTIME
- *  `--user-directory` (custom or default), so the RIGHT file always wins and a
- *  stale same-named file under the guessed default dir can never shadow it
- *  (#202). Only when the server can't serve the name (404 / unreachable) does it
- *  fall back to the orchestrator's guessed local workflows dirs, so a
- *  disk-staged file still opens. Guards: must be .json and must parse to a UI
- *  workflow (a top-level `nodes` array). Fails loudly (never loads the wrong
- *  file) when the name resolves nowhere. */
+/**
+ * Read + parse a UI workflow JSON by path.
+ *
+ * An ABSOLUTE path is read off the orchestrator's own disk, unchanged.
+ *
+ * A RELATIVE name is resolved AUTHORITATIVELY by the CONNECTED ComfyUI's userdata
+ * API — the same source panel_list_workflows / panel_open_workflow read. That
+ * server resolves the name under its RUNTIME `--user-directory`, so a custom user
+ * directory just works and a same-named file under a reconstructed default-layout
+ * path can never shadow it (#202).
+ *
+ * The governing rule is that loading the WRONG graph is worse than loading none,
+ * so the resolver never guesses:
+ *   - server serves the file            → load it
+ *   - server refuses (401/403/5xx)      → error, no local fallback
+ *   - server says it has no such name   → retry the server's OWN exact key if the
+ *                                         listing has a single normalization/case
+ *                                         match, otherwise REFUSE (an absence from
+ *                                         the authority means any local hit is a
+ *                                         DIFFERENT file)
+ *   - name matches several library keys → REFUSE as ambiguous, naming them
+ *   - server unreachable (no answer)    → best-effort reconstructed local dirs,
+ *                                         and REFUSE if more than one file matches
+ *
+ * Guards: must be .json and must parse to a UI workflow (a top-level `nodes`
+ * array). Every failure names exactly what was tried.
+ */
 async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unknown>> {
   const p = (rawPath ?? "").trim();
   if (!p) throw new Error("Provide a non-empty `path` to a workflow .json file.");
@@ -2259,10 +2350,10 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
   // own honest error rather than silently loading a possibly-stale local file.
   type Outcome =
     | { kind: "found"; parsed: unknown }
-    | { kind: "malformed"; detail: string } // 2xx but bad JSON → error, no fallback
-    | { kind: "refused"; detail: string } // non-404 HTTP error → error, no fallback
-    | { kind: "absent"; detail: string } // 404 → local fallback allowed
-    | { kind: "unreachable"; detail: string }; // transport failure → local fallback allowed
+    | { kind: "malformed"; detail: string } // 2xx but bad JSON → error, no guessing
+    | { kind: "refused"; detail: string } // non-404 HTTP status → error, no guessing
+    | { kind: "absent"; detail: string } // server ANSWERED "no such name" → authoritative
+    | { kind: "unreachable"; detail: string }; // no answer at all → no authority
   // #414: panel_list_workflows reports each workflow's userdata STORE KEY, which
   // already carries the "workflows/" prefix (e.g. "workflows/Daily Anime.json").
   // Feeding that exact value back here double-prefixed it to
@@ -2290,36 +2381,87 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
         `workflows folder (no "..", drive letters, or absolute paths), or an absolute path.`,
     );
   }
-  let outcome: Outcome;
-  try {
-    const client = getClient();
-    const encoded = encodeURIComponent(`workflows/${rel}`);
-    const res = await client.fetchApi(`/api/userdata/${encoded}`);
-    if (res.ok) {
-      // Read the body as TEXT and classify HERE so a malformed 2xx surfaces its
-      // OWN error (no fallback), while ComfyUI's "200 + EMPTY body = file does
-      // not exist" convention (some builds; see parseWorkflowLock) is treated as
-      // an ABSENCE that DOES allow the local fallback — not a malformed error.
-      const body = (await res.text()).trim();
-      if (body === "") {
-        outcome = { kind: "absent", detail: "was not in the ComfyUI userdata library (empty 200 response)" };
-      } else {
+  // One userdata GET, classified. `key` is the STORE key (already "workflows/…").
+  // The status must be recovered from a THROWN HttpError as well as from a
+  // returned non-ok Response — see httpStatusOfError: the real client never
+  // returns a non-ok Response, so reading only `res.status` made every refusal
+  // look like a transport failure.
+  const fetchUserdataKey = async (key: string): Promise<Outcome> => {
+    try {
+      const client = getClient();
+      const res = await client.fetchApi(`/api/userdata/${encodeURIComponent(key)}`);
+      if (res.ok) {
+        // Read the body as TEXT and classify HERE so a malformed 2xx surfaces its
+        // OWN error, while ComfyUI's "200 + EMPTY body = file does not exist"
+        // convention (some builds; see parseWorkflowLock) is an ABSENCE — an
+        // authoritative "no such name", not a malformed file.
+        const body = (await res.text()).trim();
+        if (body === "") {
+          return { kind: "absent", detail: `is not in the connected ComfyUI's workflow library (empty 200 response for "${key}")` };
+        }
         try {
-          outcome = { kind: "found", parsed: JSON.parse(body) };
+          return { kind: "found", parsed: JSON.parse(body) };
         } catch (err) {
-          outcome = { kind: "malformed", detail: err instanceof Error ? err.message : String(err) };
+          return { kind: "malformed", detail: err instanceof Error ? err.message : String(err) };
         }
       }
-    } else if (res.status === 404) {
-      outcome = { kind: "absent", detail: "was not in the ComfyUI userdata library (HTTP 404)" };
-    } else {
-      outcome = { kind: "refused", detail: `ComfyUI userdata library returned HTTP ${res.status}` };
+      if (res.status === 404) {
+        return { kind: "absent", detail: `is not in the connected ComfyUI's workflow library (HTTP 404 for "${key}")` };
+      }
+      return { kind: "refused", detail: `ComfyUI userdata library returned HTTP ${res.status} for "${key}"` };
+    } catch (err) {
+      const status = httpStatusOfError(err);
+      if (status === 404) {
+        return { kind: "absent", detail: `is not in the connected ComfyUI's workflow library (HTTP 404 for "${key}")` };
+      }
+      if (status !== undefined) {
+        return { kind: "refused", detail: `ComfyUI userdata library returned HTTP ${status} for "${key}"` };
+      }
+      return {
+        kind: "unreachable",
+        detail: `the connected ComfyUI's workflow library could not be reached (${err instanceof Error ? err.message : String(err)})`,
+      };
     }
-  } catch (err) {
-    outcome = {
-      kind: "unreachable",
-      detail: `ComfyUI userdata library was unreachable (${err instanceof Error ? err.message : String(err)})`,
-    };
+  };
+
+  const requestedKey = `workflows/${rel}`;
+  let outcome = await fetchUserdataKey(requestedKey);
+
+  // The server ANSWERED "no such name". Before giving up, ask it for its OWN
+  // listing and look for the same name in a different Unicode normal form or
+  // letter case — a name pasted from a listing (or produced on another OS) can be
+  // byte-different yet denote the same file, which is how a workflow that
+  // panel_list_workflows plainly shows still 404s here. Only the SERVER's exact
+  // key is retried, so this resolves the name the connected ComfyUI itself
+  // reports — it never reconstructs a path. More than one match is AMBIGUOUS and
+  // is refused rather than guessed at.
+  let listedButUnserved: string | null = null;
+  if (outcome.kind === "absent") {
+    const listed = await listUserdataWorkflowKeys();
+    if (listed) {
+      const want = normalizeStoreKey(rel);
+      const exact = listed.filter((k) => normalizeStoreKey(k) === want);
+      const matches = exact.length
+        ? exact
+        : listed.filter((k) => normalizeStoreKey(k).toLowerCase() === want.toLowerCase());
+      if (matches.length > 1) {
+        throw new Error(
+          `"${p}" is ambiguous in the connected ComfyUI's workflow library — it matches ` +
+            `${matches.length} saved workflows (${matches.map((k) => `"${k}"`).join(", ")}). ` +
+            `Refusing to guess which one you meant: pass the exact name from panel_list_workflows, ` +
+            `or an absolute path.`,
+        );
+      }
+      if (matches.length === 1) {
+        if (normalizeStoreKey(matches[0]) !== rel.replace(/\\/g, "/")) {
+          outcome = await fetchUserdataKey(`workflows/${normalizeStoreKey(matches[0])}`);
+        }
+        // Still absent after retrying the server's OWN key: the library lists the
+        // name but will not serve it. Say so — that is a server-side condition the
+        // user must see, not a cue to go hunting for a local file.
+        if (outcome.kind === "absent") listedButUnserved = matches[0];
+      }
+    }
   }
 
   if (outcome.kind === "found") {
@@ -2331,25 +2473,44 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
   }
   if (outcome.kind === "refused") {
     // Server is reachable but did not serve the file — do NOT fall back to a
-    // possibly-stale local file; report the status honestly.
+    // possibly-different local file; report the status honestly.
     throw new Error(
       `Could not read "${p}" from the connected ComfyUI: ${outcome.detail}. ` +
         `Pass an absolute path, or a name shown by panel_list_workflows.`,
     );
   }
+  if (outcome.kind === "absent") {
+    // AUTHORITATIVE absence. The connected ComfyUI resolved the name under its own
+    // runtime `--user-directory` and said it has no such workflow — so any file the
+    // orchestrator could still find by RECONSTRUCTING a default-layout path is, by
+    // construction, a DIFFERENT file from the one the caller named. Loading it
+    // would hand the agent the wrong graph to edit, which is worse than failing
+    // (#202). Refuse, naming exactly what was tried.
+    throw new Error(
+      `No workflow named "${p}" — it ${outcome.detail}.` +
+        (listedButUnserved
+          ? ` Its library DOES list "${listedButUnserved}", but the server would not serve that key —` +
+            ` the file may have been removed or be unreadable on the ComfyUI machine.`
+          : "") +
+        ` The connected ComfyUI is the authority on its own user directory (it may have been started` +
+        ` with --user-directory), so the orchestrator will NOT guess at a local path that could be a` +
+        ` different file. Use a name exactly as shown by panel_list_workflows, or pass an absolute path.`,
+    );
+  }
 
-  // outcome.kind is "absent" (404) or "unreachable" — fall back to the
-  // orchestrator's guessed local workflows dirs (best-effort; only meaningful on
-  // a same-machine ComfyUI whose user-dir matches the default layout, or a file
-  // staged straight to disk).
+  // outcome.kind is "unreachable": the connected ComfyUI gave no answer at all, so
+  // there is no authority to defer to. Only here does the orchestrator fall back to
+  // the RECONSTRUCTED default-layout workflows dirs — best-effort, and only when
+  // the name resolves to exactly ONE file (two hits mean two different candidate
+  // graphs, which is refused rather than guessed at).
   // Each candidate is the store-relative name resolved UNDER a base dir. Only the
   // NORMALIZED `rel` is used (never the raw `workflows/…` key), so nothing nests a
   // second workflows/ (codex P1/P2). Belt-and-suspenders containment: an existing
   // candidate is only accepted if its REAL path (symlinks/junctions resolved)
   // stays beneath the base's REAL path — so a link under the workflows dir that
-  // targets an external directory can't be read on the 404/unreachable fallback
-  // (codex). Canonicalizing BOTH sides keeps a legitimately-symlinked workflows
-  // dir working (its base resolves too), while blocking a per-file escape.
+  // targets an external directory can't be read on the fallback (codex).
+  // Canonicalizing BOTH sides keeps a legitimately-symlinked workflows dir working
+  // (its base resolves too), while blocking a per-file escape.
   const realBaseUnder = (base: string, candidate: string): boolean => {
     try {
       const rb = realpathSync(base);
@@ -2359,17 +2520,26 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
       return false;
     }
   };
-  const localBases = [...comfyWorkflowsDirs(), process.cwd()];
-  const local = localBases
+  const hits = comfyWorkflowsDirs()
     .map((dir) => ({ dir, path: resolve(dir, rel) }))
     .filter(({ path }) => existsSync(path) && statSync(path).isFile())
     .filter(({ dir, path }) => realBaseUnder(dir, path))
-    .map(({ path }) => path)[0];
-  if (local) return readLocal(local);
+    .map(({ path }) => path);
+  // De-duplicate by REAL path: the two guessed layouts can be the same directory
+  // (a symlink/junction), which is one candidate, not an ambiguity.
+  const distinct = [...new Set(hits.map((h) => { try { return realpathSync(h); } catch { return h; } }))];
+  if (distinct.length > 1) {
+    throw new Error(
+      `"${p}" is ambiguous: the connected ComfyUI could not be reached, and the name matches ` +
+        `${distinct.length} different local files (${distinct.map((f) => `"${f}"`).join(", ")}). ` +
+        `Refusing to guess which one you meant — pass an absolute path.`,
+    );
+  }
+  if (distinct.length === 1) return readLocal(distinct[0]);
 
   throw new Error(
-    `No workflow file at "${p}". It ${outcome.detail}, and it is not under the orchestrator's workflows ` +
-      `dir (${comfyWorkflowsDirs().join(" or ") || "COMFYUI_PATH not set"}). ` +
+    `No workflow file at "${p}". It ${outcome.detail}, and it is not under the orchestrator's ` +
+      `reconstructed workflows dir (${comfyWorkflowsDirs().join(" or ") || "COMFYUI_PATH not set"}). ` +
       `Pass an absolute path, or a name shown by panel_list_workflows.`,
   );
 }
@@ -4004,7 +4174,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         path: z
           .string()
           .optional()
-          .describe("Path to a workflow .json on the ComfyUI machine's disk — absolute, or relative to the ComfyUI workflows folder (user/default/workflows). Read + parsed server-side and loaded onto the canvas (keeps a large JSON out of chat). Local ComfyUI only."),
+          .describe("Path to a workflow .json — an ABSOLUTE path on the ComfyUI machine's disk, or a name from panel_list_workflows, which is looked up in the connected ComfyUI's own workflow library (so a custom --user-directory resolves correctly). Read + parsed server-side and loaded onto the canvas (keeps a large JSON out of chat). A name the library does not have is REFUSED rather than guessed at from a local path."),
         graph: z
           .union([z.string(), z.record(z.string(), z.unknown())])
           .optional()
