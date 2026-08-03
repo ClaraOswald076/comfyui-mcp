@@ -522,4 +522,44 @@ describe("Claude backend — interruptPending is strictly turn-scoped (#745 revi
     expect(results[0]).toMatchObject({ ok: true });
     expect(errorsOf(events)).toHaveLength(0);
   });
+
+  it("a run() restart after a FULLY DRAINED poisoned session does not falsely re-poison the first new turn", async () => {
+    const { ClaudeBackend } = await import("../../orchestrator/claude-backend.js");
+    const backend = new ClaudeBackend({ mcpServers: {}, systemAppend: "" });
+    // Session 1: overflow, trip the gap (poisoned), then drain EVERY result so
+    // the trace FIFO ends EMPTY — no dead traces remain at the boundary.
+    async function* seventeenTurns() {
+      for (let i = 1; i <= 17; i++) yield { text: `turn ${i}` };
+    }
+    const events1: AgentEvent[] = [];
+    const done1 = (async () => {
+      for await (const ev of backend.run({ channel: seventeenTurns() as never })) events1.push(ev);
+    })();
+    hoisted.queue.push(INIT);
+    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(17));
+    for (let i = 0; i < 17; i++) hoisted.queue.push(RESULT_SUCCESS); // gap → poison → all fail closed; FIFO drains to empty
+    hoisted.queue.end();
+    await done1;
+    expect(resultsOf(events1)).toHaveLength(17);
+    expect(resultsOf(events1).some((r) => r.type === "result" && r.ok === true)).toBe(false);
+    // Session 2 (restart boundary): the result sequence must advance past the
+    // drained session's turn ids even with an EMPTY FIFO — otherwise the first
+    // new turn re-crosses the old gap and falsely re-poisons (#745 r5).
+    hoisted.queue.reset();
+    hoisted.promptsSeen = 0;
+    const events: AgentEvent[] = [];
+    const done2 = (async () => {
+      for await (const ev of backend.run({ channel: channel() as never })) events.push(ev);
+    })();
+    hoisted.queue.push(INIT);
+    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    hoisted.queue.push(assistantMsg("back to normal"));
+    hoisted.queue.push(RESULT_SUCCESS);
+    hoisted.queue.end();
+    await done2;
+    const results = resultsOf(events);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ ok: true });
+    expect(errorsOf(events)).toHaveLength(0);
+  });
 });

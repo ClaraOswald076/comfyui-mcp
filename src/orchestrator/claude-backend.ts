@@ -397,17 +397,19 @@ export class ClaudeBackend implements AgentBackend {
     const query = await loadQuery();
     const self = this;
     // A (re)started session can never produce results for turns submitted to a
-    // PREVIOUS session — drop those dead traces, advancing the result sequence
-    // past them so the new session's first result isn't falsely gap-poisoned
-    // (their stray late results then arrive TRACELESS and fail closed instead).
-    // This genuine restart boundary is also the ONLY reset of the sticky
-    // classification poison (#745 r4). Done here, at run() entry (BEFORE the
-    // new query exists), rather than on system/init: the SDK's prompt drain
+    // PREVIOUS session — drop any dead traces and advance the result sequence
+    // past EVERY turn stamped so far (turnSeq), whether or not traces remain:
+    // in a FULLY DRAINED (e.g. poisoned) session the FIFO is already empty, but
+    // the sequence must still move past the old ids or the new session's first
+    // result re-crosses the old gap and falsely re-poisons (#745 r5). Stray
+    // late results from the dead session then arrive TRACELESS and fail closed
+    // instead. This genuine restart boundary is also the ONLY reset of the
+    // sticky classification poison (#745 r4). Done here, at run() entry (BEFORE
+    // the new query exists), rather than on system/init: the SDK's prompt drain
     // legitimately pulls the first batch before init is processed, and an
     // init-time clear would unmark that genuinely in-flight turn (#745).
-    const deadThrough = this.turns[this.turns.length - 1]?.id;
     this.turns.length = 0;
-    if (deadThrough !== undefined) this.lastResultTurnId = deadThrough;
+    this.lastResultTurnId = this.turnSeq;
     this.classificationPoisoned = false;
     // Wrap the neutral channel: shape each turn into the SDK's native form right
     // before it's read, so PanelAgent never deals in SDKUserMessage.
