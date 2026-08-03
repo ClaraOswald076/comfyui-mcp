@@ -2233,8 +2233,13 @@ function httpStatusOfError(err: unknown): number | undefined {
   return typeof status === "number" && Number.isFinite(status) ? status : undefined;
 }
 
-/** Drop the leading slashes and the one leading "workflows/" segment, leaving a
- *  store-RELATIVE key.
+/** Drop the one leading "workflows/" segment, leaving a store-RELATIVE key.
+ *
+ *  Nothing else is stripped. In particular a leading "/" is NOT removed (codex
+ *  MAJOR): caller input can never reach here with one (that is an absolute path,
+ *  handled earlier), so the only strings it would affect are LISTING entries —
+ *  where "/name.json" and "name.json" are two different keys, and folding them
+ *  would let a match on one be fetched as the other.
  *
  *  Only the FORWARD-slash spelling counts as the library prefix (codex MAJOR).
  *  ComfyUI store keys are always "/"-separated, so `workflows\foo.json` was never
@@ -2249,7 +2254,7 @@ function httpStatusOfError(err: unknown): number | undefined {
  *  stripping it would turn "WORKFLOWS/foo.json" into a request for the root
  *  "foo.json". */
 const stripLibraryPrefix = (key: string): string =>
-  key.replace(/^\/+/, "").replace(/^workflows\/+/, "");
+  key.replace(/^workflows\/+/, "");
 
 /** The form two userdata store keys are compared in when deciding they are the
  *  SAME NAME. Unicode normalization is the only equivalence applied: NFD "é" and
@@ -2490,10 +2495,10 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
   // missing "workflows/" prefix is added.
   const storeKeyForListed = (listedKey: string): string => {
     // Same strictness as stripLibraryPrefix: only the literal lowercase,
-    // forward-slash "workflows/" counts as an already-prefixed key. Anything else
-    // is part of the NAME and must stay under the library root.
-    const trimmed = listedKey.replace(/^\/+/, "");
-    return /^workflows\//.test(trimmed) ? trimmed : `workflows/${trimmed}`;
+    // forward-slash "workflows/" counts as an already-prefixed key, and nothing
+    // else about the key is rewritten. Anything else is part of the NAME and must
+    // stay under the library root.
+    return /^workflows\//.test(listedKey) ? listedKey : `workflows/${listedKey}`;
   };
 
   let listedButUnserved: string | null = null;

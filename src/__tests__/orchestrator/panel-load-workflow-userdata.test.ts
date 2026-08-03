@@ -479,6 +479,27 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
     expect(JSON.stringify(res)).toMatch(/path separator/i);
   });
 
+  it("does NOT fold a LEADING-SLASH listing entry onto the bare name", async () => {
+    // "/name.json" and "name.json" are different store keys. Folding them in the
+    // match let a match on the listed "/name.json" be RETRIED as
+    // "workflows/name.json" — a key the server never listed (codex MAJOR).
+    const nfc = "caf\u00e9.json";
+    const nfd = "cafe\u0301.json";
+    routeMock([`/${nfc}`], {
+      [`workflows/${nfc}`]: { nodes: [{ id: 31, type: "UnlistedNode" }], links: [] },
+    });
+
+    const { ctx, calls } = makeCtx();
+    const res = await loadWorkflow().handler({ path: nfd }, ctx);
+
+    expect(res.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+    // The unlisted key exists and would have loaded had the slash been folded.
+    expect(fetchApi).not.toHaveBeenCalledWith(
+      `/api/userdata/${encodeURIComponent(`workflows/${nfc}`)}`,
+    );
+  });
+
   it("does NOT treat a DIFFERENTLY-CASED workflows/ as the library prefix", async () => {
     // "WORKFLOWS" can be a real subfolder inside the library on a case-sensitive
     // host. Stripping it would turn "WORKFLOWS/foo.json" into a request for the
@@ -556,11 +577,11 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
     }
   });
 
-  it("never echoes a traversal entry from a hostile listing back as a request key", async () => {
-    // Defense in depth. With exact (normalization-only) matching a listed key
-    // containing ".." can never equal a caller name that passed the traversal
-    // guard, so this filter is unreachable today — it exists so that any future
-    // loosening of the match cannot turn a server-supplied string into an escape.
+  it("holds the invariant that no request key ever carries a traversal segment", async () => {
+    // This asserts the INVARIANT, not one mechanism. Two things currently uphold
+    // it — the caller-side traversal guard and the listing filter — so the test
+    // cannot attribute a pass to either. It is here to fail if a future change
+    // lets a server-supplied string reach the request key.
     routeMock(["../../secret.json", "..\\secret.json"], {});
 
     const { ctx, calls } = makeCtx();
