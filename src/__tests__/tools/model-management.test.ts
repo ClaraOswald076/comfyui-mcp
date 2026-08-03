@@ -9,6 +9,8 @@ const verifyLandedModelMock = vi.fn(async (targetPath: string) => ({
   liveVisible: "unknown" as string,
   note: "no live server in this test",
 }));
+/** The models root the connected server reads NOW (stubbed; see the mock). */
+const currentLiveRootMock = vi.fn(async (): Promise<string | undefined> => undefined);
 vi.mock("../../services/model-resolver.js", async () => {
   const actual = await vi.importActual<typeof import("../../services/model-resolver.js")>(
     "../../services/model-resolver.js",
@@ -28,6 +30,10 @@ vi.mock("../../services/model-resolver.js", async () => {
     },
     verifyLandedModel: (...a: unknown[]) =>
       verifyLandedModelMock(...(a as [string, string])),
+    // The root the connected server reads NOW. Stub it: the real one probes the
+    // DEVELOPER's machine, and a resolvable root there would invalidate every
+    // verdict these tests assert. Undefined = unknown, which never downgrades.
+    currentLiveModelsRoot: async (): Promise<string | undefined> => currentLiveRootMock(),
   };
 });
 

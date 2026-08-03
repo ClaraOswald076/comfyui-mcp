@@ -894,20 +894,29 @@ export function describePlacement(
   if (
     !job.viaManager &&
     job.live_visible === "visible" &&
-    job.verified_root &&
     ctx?.liveModelsDir &&
     ctx.liveModelsDir !== job.verified_root
   ) {
+    // Covers BOTH stale shapes (codex gate, rounds 11 and 16):
+    //  - the verdict names a DIFFERENT root than the server now reads; and
+    //  - the verdict carries NO root at all (it was made against a destination only
+    //    local configuration could vouch for) while the connected server now HAS a
+    //    resolvable authoritative root. Neither may be re-asserted as current
+    //    success — the earlier confirmation was about another server.
     return {
       confirmed: false,
       wrongPlace: false,
       pathLabel: "written to",
       pathQualifier: diskQualifier(job),
-      warning:
-        `this download was verified against a ComfyUI reading "${job.verified_root}", but the ` +
-        `connected server now reads "${ctx.liveModelsDir}" — a DIFFERENT install. The earlier ` +
-        "confirmation does not apply to it; check list_local_models against the server you are " +
-        "connected to now.",
+      warning: job.verified_root
+        ? `this download was verified against a ComfyUI reading "${job.verified_root}", but the ` +
+          `connected server now reads "${ctx.liveModelsDir}" — a DIFFERENT install. The earlier ` +
+          "confirmation does not apply to it; check list_local_models against the server you are " +
+          "connected to now."
+        : "this download's placement was confirmed against a models directory that could only be " +
+          `inferred from local configuration, and the connected server now reports "${ctx.liveModelsDir}" ` +
+          "as the directory it reads. The earlier confirmation cannot be re-asserted for it; " +
+          "check list_local_models against the server you are connected to now.",
     };
   }
   if (job.viaManager) {

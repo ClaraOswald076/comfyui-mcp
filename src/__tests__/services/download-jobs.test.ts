@@ -1447,6 +1447,19 @@ describe("download job registry", () => {
       expect(r.warning).toMatch(/DIFFERENT install/);
     });
 
+    it("downgrades a VISIBLE verdict that carries NO root once one is knowable (codex gate r16)", () => {
+      // The verdict was made against a base-anchored destination (nothing
+      // authoritative to stamp). The connected server now reports a real root — the
+      // old confirmation was about a different server and cannot be re-asserted.
+      const r = describePlacement(
+        { ...base, live_visible: "visible" },
+        { liveModelsDir: "D:/B/models" },
+      );
+      expect(r.confirmed).toBe(false);
+      expect(r.pathLabel).not.toBe("landed at");
+      expect(r.warning).toMatch(/cannot be re-asserted/);
+    });
+
     it("keeps a VISIBLE verdict when the connected server still reads the same root", () => {
       const r = describePlacement(
         { ...base, live_visible: "visible", verified_root: "C:/A/models" },
