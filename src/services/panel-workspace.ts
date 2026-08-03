@@ -131,7 +131,7 @@ export async function resolvePanelBase(): Promise<PanelBaseResolution> {
  * serve the previous one's base — and it expires on a short TTL so a restarted
  * server with new launch flags is picked up without a retarget.
  */
-const PANEL_BASE_TTL_MS = 15_000;
+const PANEL_BASE_TTL_MS = 60_000;
 
 let cached:
   | { at: number; target: string; resolution: PanelBaseResolution }
@@ -200,6 +200,15 @@ export function __resetPanelBaseCache(): void {
   diskObservation = undefined;
 }
 
+/** Test hook — seed a resolved base without probing a live server. */
+export function __setPanelBaseForTests(base: string | undefined): void {
+  cached = {
+    at: Date.now(),
+    target: targetKey(),
+    resolution: base ? { base, source: "configured" } : { source: "none" },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // What is actually ON DISK — so a stale BROWSER BUNDLE can be told apart from a
 // stale INSTALL.
@@ -234,6 +243,12 @@ export interface PanelDiskObservation {
   at: number;
   /** Which ComfyUI it describes. An observation does not survive a retarget. */
   target: string;
+  /**
+   * The resolved ComfyUI ROOT it describes. The URL alone is not enough: the
+   * server can restart at the same address with a different `--base-directory`,
+   * which is a different custom_nodes and therefore a different panel.
+   */
+  base?: string;
 }
 
 /**
@@ -249,8 +264,18 @@ const PANEL_PROJECT_NAME = "comfyui-agent-panel";
 let diskObservation: PanelDiskObservation | undefined;
 
 /** Record a version READ FROM DISK. Called by panelStatus, never guessed. */
-export function recordPanelDiskObservation(version: string, dir?: string): void {
-  diskObservation = { version, dir, at: Date.now(), target: targetKey() };
+export function recordPanelDiskObservation(
+  version: string,
+  dir?: string,
+  base?: string,
+): void {
+  diskObservation = {
+    version,
+    dir,
+    at: Date.now(),
+    target: targetKey(),
+    base: base ?? panelBaseSync(),
+  };
 }
 
 /** Forget the on-disk observation — the pack is not there (or was removed). */
@@ -291,6 +316,23 @@ export function lastPanelDiskObservation(): PanelDiskObservation | undefined {
 export function verifiedPanelDiskVersion(): string | undefined {
   const observed = lastPanelDiskObservation();
   if (!observed?.dir) return undefined;
+
+  // The observation must still describe the tree the LIVE server is serving
+  // from. A restart at the same address with a different `--base-directory` is
+  // a different custom_nodes and therefore a different panel, and re-reading
+  // the OLD directory would then certify a version nobody is running. Only a
+  // FRESHLY resolved base counts: an expired cache falls back to the
+  // configured path, which is exactly the disagreement (#766) this whole change
+  // exists to fix, so it must not be accepted as a match. No fresh resolution ⇒
+  // no claim.
+  const resolution = cachedResolution();
+  if (!resolution?.base || !observed.base || resolution.base !== observed.base) {
+    return undefined;
+  }
+  // And the pack must live UNDER that base — never a path left over from a tree
+  // we are no longer looking at.
+  if (!observed.dir.startsWith(resolution.base)) return undefined;
+
   try {
     const raw = readFileSync(join(observed.dir, "pyproject.toml"), "utf-8");
     const parsed = parsePyproject(raw);

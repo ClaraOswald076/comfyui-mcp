@@ -22,7 +22,7 @@ import {
   describePanelUpdateRecovery,
   type PanelBundleSkew,
 } from "./panel-recovery.js";
-import { verifiedPanelDiskVersion } from "./panel-workspace.js";
+import { primePanelBase, verifiedPanelDiskVersion } from "./panel-workspace.js";
 import { compareSemver, detectInstallMode } from "./self-update.js";
 
 export const DEFAULT_BRIDGE_PORT = 9101;
@@ -330,7 +330,14 @@ export function requiredPanelVersion(): string {
  */
 function resolveStaleBundleSkew(panelVersion?: string): PanelBundleSkew | undefined {
   const disk = verifiedPanelDiskVersion()?.trim();
-  if (!disk) return undefined;
+  if (!disk) {
+    // Could not confirm — most often because the live-base resolution has gone
+    // stale and this refusal is the first thing to ask in a while. Refresh it in
+    // the background (never awaited; building an error message must not block on
+    // I/O) so a retry, which agents reliably make, can answer properly.
+    void primePanelBase().catch(() => {});
+    return undefined;
+  }
   const required = requiredPanelVersion();
   if (!SEMVER_RE.test(disk) || !SEMVER_RE.test(required.trim())) return undefined;
   if (compareSemver(disk, required) < 0) return undefined; // install really IS behind

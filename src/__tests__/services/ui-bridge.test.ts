@@ -20,6 +20,8 @@ import {
 } from "../../services/ui-bridge.js";
 import { carryWorkflowCommandStamp } from "../../orchestrator/session-store.js";
 import {
+  __resetPanelBaseCache,
+  __setPanelBaseForTests,
   clearPanelDiskObservation,
   recordPanelDiskObservation,
 } from "../../services/panel-workspace.js";
@@ -27,20 +29,29 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-/** A real on-disk panel pack, since the skew resolver re-reads the pyproject. */
-const tempPacks: string[] = [];
+/**
+ * A real on-disk panel pack under a resolved base. The skew resolver re-reads
+ * the pyproject AND requires the pack to sit under the currently-resolved
+ * ComfyUI root, so neither a fabricated path nor an unbound one proves anything.
+ */
+const tempRoots: string[] = [];
 function writeTempPanelPack(version: string): string {
-  const dir = join(mkdtempSync(join(tmpdir(), "cmcp-bundle-")), "comfyui-agent-panel");
+  const base = mkdtempSync(join(tmpdir(), "cmcp-bundle-"));
+  const dir = join(base, "custom_nodes", "comfyui-agent-panel");
   mkdirSync(dir, { recursive: true });
   writeFileSync(
     join(dir, "pyproject.toml"),
     `[project]\nname = "comfyui-agent-panel"\nversion = "${version}"\n`,
   );
-  tempPacks.push(dir);
+  tempRoots.push(base);
+  __setPanelBaseForTests(base);
+  recordPanelDiskObservation(version, dir, base);
   return dir;
 }
 afterEach(() => {
-  for (const d of tempPacks.splice(0)) rmSync(d, { recursive: true, force: true });
+  clearPanelDiskObservation();
+  __resetPanelBaseCache();
+  for (const d of tempRoots.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
 // #570 P0c — classifier that decides which commands must pass the enforcement+stamp gate.
@@ -1770,8 +1781,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     // A REAL pack on disk: the skew resolver re-reads the pyproject at the
     // moment of use rather than trusting the recorded version, so a fabricated
     // path would (correctly) prove nothing.
-    const packDir = writeTempPanelPack("0.11.38");
-    recordPanelDiskObservation("0.11.38", packDir);
+    writeTempPanelPack("0.11.38");
     try {
       const stale = new WebSocket(`ws://127.0.0.1:${port}`);
       await new Promise<void>((res, rej) => {
@@ -1806,8 +1816,7 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     // The guard on the branch above: a stale-install user must not be told their
     // install is fine. Only a disk version at or above the floor earns the
     // refresh diagnosis.
-    const packDir = writeTempPanelPack("0.11.20");
-    recordPanelDiskObservation("0.11.20", packDir);
+    writeTempPanelPack("0.11.20");
     try {
       const behind = new WebSocket(`ws://127.0.0.1:${port}`);
       await new Promise<void>((res, rej) => {

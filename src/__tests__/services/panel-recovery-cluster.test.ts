@@ -85,6 +85,7 @@ import {
 } from "../../services/panel-recovery.js";
 import {
   __resetPanelBaseCache,
+  __setPanelBaseForTests,
   lastPanelDiskObservation,
   primePanelBase,
   recordPanelDiskObservation,
@@ -221,6 +222,7 @@ function makeDeps(opts: {
         },
         rename: (from, to) => renameSync(from, to),
         removeDir: (p) => rmSync(p, { recursive: true, force: true }),
+        writeFile: (p, contents) => writeFileSync(p, contents, "utf-8"),
       };
   return h;
 }
@@ -362,7 +364,8 @@ describe("disk-current but handshake-old is diagnosed as a stale tab, not a stal
   // the version is re-read at the moment of use.
   it("the recorded version is re-read from disk, not replayed", async () => {
     writePanelPack(PANEL_DIR(), "0.11.38");
-    recordPanelDiskObservation("0.11.38", PANEL_DIR());
+    __setPanelBaseForTests(root);
+    recordPanelDiskObservation("0.11.38", PANEL_DIR(), root);
     expect(verifiedPanelDiskVersion()).toBe("0.11.38");
 
     // The pack is downgraded behind our back — the stale record must not stand.
@@ -372,7 +375,8 @@ describe("disk-current but handshake-old is diagnosed as a stale tab, not a stal
 
   it("a pack REMOVED after the observation yields no version at all", () => {
     writePanelPack(PANEL_DIR(), "0.11.38");
-    recordPanelDiskObservation("0.11.38", PANEL_DIR());
+    __setPanelBaseForTests(root);
+    recordPanelDiskObservation("0.11.38", PANEL_DIR(), root);
     rmSync(PANEL_DIR(), { recursive: true, force: true });
     expect(verifiedPanelDiskVersion()).toBeUndefined();
   });
@@ -383,7 +387,28 @@ describe("disk-current but handshake-old is diagnosed as a stale tab, not a stal
       join(PANEL_DIR(), "pyproject.toml"),
       `[project]\nname = "something-else"\nversion = "9.9.9"\n`,
     );
-    recordPanelDiskObservation("0.11.38", PANEL_DIR());
+    __setPanelBaseForTests(root);
+    recordPanelDiskObservation("0.11.38", PANEL_DIR(), root);
+    expect(verifiedPanelDiskVersion()).toBeUndefined();
+  });
+
+  it("an observation from ANOTHER ComfyUI tree is never replayed for this one", () => {
+    // A server restart at the same address with a different --base-directory is
+    // a different custom_nodes, so the old reading proves nothing about the new
+    // one. Being wrong here tells a behind user their install is fine.
+    const otherRoot = join(root, "other");
+    const otherPanel = join(otherRoot, "custom_nodes", PANEL_REGISTRY_ID);
+    writePanelPack(otherPanel, "0.11.38");
+    recordPanelDiskObservation("0.11.38", otherPanel, otherRoot);
+    // The live base now resolves elsewhere.
+    __setPanelBaseForTests(root);
+    expect(verifiedPanelDiskVersion()).toBeUndefined();
+  });
+
+  it("an UNRESOLVED base yields no claim — an expired cache is not a match", () => {
+    writePanelPack(PANEL_DIR(), "0.11.38");
+    recordPanelDiskObservation("0.11.38", PANEL_DIR(), root);
+    __setPanelBaseForTests(undefined);
     expect(verifiedPanelDiskVersion()).toBeUndefined();
   });
 });
@@ -532,6 +557,66 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     expect((err as Error).message).toMatch(/shadow/i);
     expect(h.clones).toHaveLength(0);
     expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
+  });
+
+  it("an INTERRUPTED swap is repaired on the next operation — never leaves the user with no panel", async () => {
+    // Replacing a directory takes two renames and cannot be made atomic, so a
+    // crash between them leaves custom_nodes empty and the working copy in
+    // custom_nodes_backup. The journal written before the first rename is what
+    // makes that recoverable.
+    const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1`);
+    writePanelPack(backupDir, "0.11.34");
+    expect(existsSync(PANEL_DIR())).toBe(false); // mid-swap: no panel served
+    writeFileSync(
+      join(root, ".comfyui-agent-panel.swap.json"),
+      JSON.stringify({
+        dir: PANEL_DIR(),
+        backupDir,
+        staging: join(root, ".comfyui-agent-panel.staging-dead"),
+        startedAt: Date.now(),
+        previousVersion: "0.11.34",
+      }),
+    );
+
+    const h = makeDeps({ cloneVersion: "0.11.38", updateThrows: "manager cannot resolve it" });
+    const result = await runPanelActionInner("update", h.deps);
+
+    // The working copy was put back first, then the update proceeded normally.
+    expect(result.previousVersion).toBe("0.11.34");
+    expect(result.installedVersion).toBe("0.11.38");
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.38");
+    // The spent journal is gone.
+    expect(existsSync(join(root, ".comfyui-agent-panel.swap.json"))).toBe(false);
+  });
+
+  it("a status read REPORTS an interrupted swap but does not repair it (it holds no lock)", async () => {
+    const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1`);
+    writePanelPack(backupDir, "0.11.34");
+    writeFileSync(
+      join(root, ".comfyui-agent-panel.swap.json"),
+      JSON.stringify({ dir: PANEL_DIR(), backupDir, staging: "x", startedAt: Date.now() }),
+    );
+    const { panelStatus } = await import("../../services/panel-installer.js");
+    const status = await panelStatus(makeDeps({ withoutSwapOps: true }).deps);
+    expect(status.note).toMatch(/interrupted/i);
+    expect(status.note).toContain(backupDir);
+    // Untouched — repairing from an unlocked read could cut across another
+    // process's in-flight swap.
+    expect(existsSync(PANEL_DIR())).toBe(false);
+    expect(existsSync(join(root, ".comfyui-agent-panel.swap.json"))).toBe(true);
+  });
+
+  it("REFUSES the swap when the recovery journal cannot be written", async () => {
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    const h = makeDeps({ cloneVersion: "0.11.38", updateThrows: "manager cannot resolve it" });
+    h.deps.writeFile = () => {
+      throw new Error("EACCES: read-only filesystem");
+    };
+    const err = await runPanelActionInner("update", h.deps).catch((e: Error) => e);
+    expect((err as Error).message).toMatch(/recovery journal/);
+    // An unrecoverable swap is worse than no swap: nothing moved.
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
+    expect(existsSync(join(root, "custom_nodes_backup", PANEL_REGISTRY_ID))).toBe(false);
   });
 
   it("REFUSES while the panel is version-pinned — a pin is a promise", async () => {

@@ -31,6 +31,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { config, isLocalMode } from "../config.js";
@@ -216,6 +217,11 @@ export interface PanelInstallerDeps {
   rename?: (from: string, to: string) => void;
   /** Recursively remove a path; must NOT throw when it is already absent. */
   removeDir?: (p: string) => void;
+  /**
+   * Write a small text file (the swap journal). THROWS on failure — an
+   * unrecorded swap is refused rather than performed unrecoverably.
+   */
+  writeFile?: (p: string, contents: string) => void;
   /**
    * The user's explicit panel-version pin, if any. While a pin is in force NO
    * code path here may move the panel — install/update/reinstall refuse and the
@@ -510,6 +516,7 @@ export const defaultDeps: PanelInstallerDeps = {
   },
   rename: (from, to) => renameSync(from, to),
   removeDir: (p) => rmSync(p, { recursive: true, force: true }),
+  writeFile: (p, contents) => writeFileSync(p, contents, "utf-8"),
   readPin: () => getPanelPinState(),
   isReachable: async () => {
     try {
@@ -1400,11 +1407,20 @@ export async function panelStatus(
   // "your install is fine" behind.
   if (isRealDeps(deps)) {
     if (detection.applicable && detection.installed && detection.version) {
-      recordPanelDiskObservation(detection.version, detection.dir);
+      // Bind the observation to the base that was actually scanned, so it can
+      // never be replayed as evidence about a different ComfyUI tree.
+      recordPanelDiskObservation(detection.version, detection.dir, comfyuiPath);
     } else {
       clearPanelDiskObservation();
     }
   }
+
+  // An interrupted swap is REPORTED here, never repaired: panelStatus holds no
+  // lock and is called from everywhere, so moving directories from it could cut
+  // across another process's in-flight swap. The mutation paths do the repair.
+  const swapNote = comfyuiPath
+    ? (reconcilePanelSwap(comfyuiPath, deps, { repair: false }) ?? "")
+    : "";
 
   const pin = readPinSafe(deps);
   const pinNote = pin.pinned
@@ -1426,7 +1442,7 @@ export async function panelStatus(
     comfyuiPath,
     baseSource,
     pin,
-    note: note + baseNote + shadowNote + pinNote,
+    note: note + baseNote + swapNote + shadowNote + pinNote,
   };
 }
 
@@ -1989,6 +2005,133 @@ interface PanelSwapOps {
   mkdirp: (p: string) => void;
   rename: (from: string, to: string) => void;
   removeDir: (p: string) => void;
+  writeFile: (p: string, contents: string) => void;
+}
+
+// ---------------------------------------------------------------------------
+// Swap journal — crash recovery for the one window that cannot be made atomic.
+//
+// Replacing a directory takes TWO renames (a rename onto a non-empty directory
+// fails), so there is an instant where the panel is out of custom_nodes and its
+// replacement is not yet in. A caught failure is handled inline — the backup is
+// moved straight back. A process kill or host crash in that instant is not
+// caught by anything, and would leave the user with NO panel in custom_nodes,
+// the working copy stranded in custom_nodes_backup, and nothing on disk saying
+// what happened or how to undo it.
+//
+// So the intent is written down BEFORE the first rename, to a file beside
+// custom_nodes (never inside it — ComfyUI serves everything in there). The next
+// panel operation reads it back and repairs.
+//
+// Reconciliation is deliberately timid. It restores ONLY when the canonical
+// directory is missing — the single state that is unambiguously a broken swap —
+// and it restores the copy that was already on disk and working, never the
+// staged one, whose validation may not have finished. Anything else it merely
+// reports. It runs under the panel op lock (both mutation entry points hold
+// it), so it cannot fire in the middle of another process's swap.
+// ---------------------------------------------------------------------------
+
+const PANEL_SWAP_JOURNAL = ".comfyui-agent-panel.swap.json";
+
+interface PanelSwapJournal {
+  /** Canonical panel dir the swap targets. */
+  dir: string;
+  /** Where the working copy was moved to. */
+  backupDir: string;
+  /** The validated clone waiting to move in. */
+  staging: string;
+  startedAt: number;
+  previousVersion?: string;
+}
+
+function swapJournalPath(comfyuiPath: string): string {
+  return join(comfyuiPath, PANEL_SWAP_JOURNAL);
+}
+
+/**
+ * Repair an interrupted swap, if one is recorded. Returns a human-readable note
+ * when it did something (or could not), else undefined. Never throws — a
+ * journal we cannot read must not block panel management, only be reported.
+ */
+function reconcilePanelSwap(
+  comfyuiPath: string,
+  deps: PanelInstallerDeps,
+  opts: { repair: boolean },
+): string | undefined {
+  const journalPath = swapJournalPath(comfyuiPath);
+  if (!deps.existsSync(journalPath)) return undefined;
+
+  let journal: PanelSwapJournal;
+  try {
+    journal = JSON.parse(deps.readFile(journalPath)) as PanelSwapJournal;
+    if (!journal?.dir || !journal?.backupDir) throw new Error("incomplete record");
+  } catch (err) {
+    return (
+      ` NOTE: an interrupted panel swap is recorded at ${journalPath}, but the record ` +
+      `could not be read (${err instanceof Error ? err.message : String(err)}), so it ` +
+      `could not be repaired automatically. Check custom_nodes and custom_nodes_backup ` +
+      `for the panel, then delete that file.`
+    );
+  }
+
+  const remove = () => {
+    try {
+      deps.removeDir?.(journalPath);
+    } catch {
+      // A stale journal is noise, not damage — the next reconcile re-reports it.
+    }
+  };
+
+  // The canonical dir is there: the swap either finished or was rolled back.
+  if (deps.existsSync(journal.dir)) {
+    remove();
+    return undefined;
+  }
+
+  // No panel in custom_nodes. This is the broken state — put back the copy that
+  // was known to work, never the staged one (its validation may not have run).
+  //
+  // REPAIR ONLY UNDER THE OP LOCK. panelStatus is called from many places and
+  // holds no lock, so repairing from there could move directories out from
+  // under another process's in-flight swap. From a read it only reports.
+  if (!opts.repair) {
+    return (
+      ` WARNING: a previous panel update was interrupted and custom_nodes has NO panel ` +
+      `at ${journal.dir}; the previous copy is at ${journal.backupDir}. Run ` +
+      `install_panel(action='update') to repair it automatically, or move it back ` +
+      `manually, then restart ComfyUI.`
+    );
+  }
+  if (deps.existsSync(journal.backupDir) && deps.rename) {
+    try {
+      deps.rename(journal.backupDir, journal.dir);
+      remove();
+      logger.warn(
+        `[panel] repaired an interrupted panel update: restored ${journal.backupDir} ` +
+          `to ${journal.dir}. RESTART ComfyUI, then retry the update.`,
+      );
+      return (
+        ` NOTE: a previous panel update was interrupted partway through and left ` +
+        `custom_nodes with no panel. The previous copy` +
+        `${journal.previousVersion ? ` (${journal.previousVersion})` : ""} has been ` +
+        `RESTORED to ${journal.dir}. Restart ComfyUI, then retry the update.`
+      );
+    } catch (err) {
+      return (
+        ` WARNING: a previous panel update was interrupted and custom_nodes has NO ` +
+        `panel. The previous copy is at ${journal.backupDir} but could not be moved ` +
+        `back automatically (${err instanceof Error ? err.message : String(err)}). ` +
+        `Move it to ${journal.dir} manually, then restart ComfyUI.`
+      );
+    }
+  }
+
+  return (
+    ` WARNING: a previous panel update was interrupted and custom_nodes has NO panel ` +
+    `at ${journal.dir}. The backup recorded at ${journal.backupDir} is not there ` +
+    `either — look in ${join(comfyuiPath, "custom_nodes_backup")} and move the panel ` +
+    `back, or reinstall it with install_panel(action='install').`
+  );
 }
 
 /**
@@ -1998,9 +2141,9 @@ interface PanelSwapOps {
  * cannot finish or undo.
  */
 function resolveSwapOps(deps: PanelInstallerDeps): PanelSwapOps | undefined {
-  const { gitClonePanel, mkdirp, rename, removeDir } = deps;
-  if (!gitClonePanel || !mkdirp || !rename || !removeDir) return undefined;
-  return { clone: gitClonePanel, mkdirp, rename, removeDir };
+  const { gitClonePanel, mkdirp, rename, removeDir, writeFile } = deps;
+  if (!gitClonePanel || !mkdirp || !rename || !removeDir || !writeFile) return undefined;
+  return { clone: gitClonePanel, mkdirp, rename, removeDir, writeFile };
 }
 
 async function updateViaRegistryZipReinstall(opts: {
@@ -2100,13 +2243,45 @@ async function updateViaRegistryZipReinstall(opts: {
         );
       }
       if (delta === 0) {
-        // Honest non-mutation: the installed pack already matches upstream.
+        // Honest non-mutation — but "already current" is still a CLAIM about the
+        // disk, and `previousVersion` was read before the Manager call and the
+        // clone. Re-read it now, exactly as the mutating paths do: a pack that
+        // was removed, moved or changed in that window must not be certified
+        // current off a stale value (#639 discipline applies to claims of
+        // currency, not only to claims of change).
+        const still = await detectPanelInstall(deps);
+        if (
+          !still.installed ||
+          !still.version ||
+          !still.dir ||
+          !samePathCI(dir, still.dir, deps) ||
+          still.version !== previousVersion
+        ) {
+          throw new PanelInstallError(
+            `Could not confirm the panel is current: a fresh clone carries ` +
+              `${stagedVersion}, but re-reading ${dir} afterwards found ` +
+              `${
+                !still.installed
+                  ? "no panel there"
+                  : !still.version
+                    ? "an unreadable version"
+                    : !still.dir || !samePathCI(dir, still.dir, deps)
+                      ? `the panel resolved at a different directory (${still.dir ?? "none"})`
+                      : `version ${still.version}, not the ${previousVersion} this ` +
+                        `check was based on`
+              }. NOT reporting "already up to date" on a stale reading. Re-run ` +
+              `install_panel(action='status').`,
+          );
+        }
+        // A shadow makes any statement about what the BROWSER loads untrue,
+        // including "you are already current".
+        assertNoPanelShadow("update", still.dir, deps);
         ops.removeDir(staging);
         const atTip =
-          `Panel is already at the published version (${stagedVersion}) — ` +
-          `${managerReason}, and a fresh clone of the panel repo carries the SAME ` +
-          `version, so there is nothing to install. Nothing changed on disk; no ` +
-          `restart needed.`;
+          `Panel is already at the published version (${still.version}, re-read from ` +
+          `${still.dir}) — ${managerReason}, and a fresh clone of the panel repo ` +
+          `carries the SAME version, so there is nothing to install. Nothing changed ` +
+          `on disk; no restart needed.`;
         return {
           action: "update",
           result: result ?? {
@@ -2117,7 +2292,7 @@ async function updateViaRegistryZipReinstall(opts: {
           restartRequired: false,
           message: atTip,
           previousVersion,
-          installedVersion: previousVersion,
+          installedVersion: still.version,
         };
       }
     }
@@ -2142,10 +2317,46 @@ async function updateViaRegistryZipReinstall(opts: {
     backupRoot,
     `${basename(dir)}-${previousVersion ?? "unknown"}-${Date.now()}`,
   );
+  // RECORD THE INTENT BEFORE THE FIRST RENAME. The two renames cannot be made
+  // atomic, so a crash between them would leave custom_nodes with no panel and
+  // nothing on disk explaining where it went. With the journal, the next panel
+  // operation puts the working copy back. Refuse the swap if we cannot write it
+  // — an unrecoverable swap is worse than no swap.
+  const journalPath = swapJournalPath(comfyuiPath);
   try {
     ops.mkdirp(backupRoot);
+    ops.writeFile(
+      journalPath,
+      JSON.stringify(
+        {
+          dir,
+          backupDir,
+          staging,
+          startedAt: Date.now(),
+          previousVersion,
+        } satisfies PanelSwapJournal,
+        null,
+        2,
+      ),
+    );
+  } catch (err) {
+    ops.removeDir(staging);
+    throw new PanelInstallError(
+      `Panel update did NOT apply: nothing was changed on disk. ${managerReason}, and ` +
+        `the reinstall-from-source fallback refused to start because it could not ` +
+        `record its recovery journal at ${journalPath} ` +
+        `(${err instanceof Error ? err.message : String(err)}). Replacing the panel ` +
+        `takes two moves, and without that record a crash between them would leave ` +
+        `custom_nodes with no panel and no way to undo it. Check permissions on ` +
+        `${comfyuiPath} and retry.`,
+    );
+  }
+
+  try {
     ops.rename(dir, backupDir);
   } catch (err) {
+    // Nothing moved, so the journal describes work that never began.
+    ops.removeDir(journalPath);
     ops.removeDir(staging);
     throw new PanelInstallError(
       `Panel update did NOT apply: nothing was changed on disk. ${managerReason}, and ` +
@@ -2167,6 +2378,9 @@ async function updateViaRegistryZipReinstall(opts: {
       restored = false;
     }
     ops.removeDir(staging);
+    // Restored ⇒ nothing left to repair. NOT restored ⇒ KEEP the journal so the
+    // next panel operation can finish the repair we could not.
+    if (restored) ops.removeDir(journalPath);
     throw new PanelInstallError(
       `Panel update did NOT apply: ${managerReason}, and the reinstall-from-source ` +
         `fallback failed while moving the new panel into place ` +
@@ -2177,6 +2391,13 @@ async function updateViaRegistryZipReinstall(opts: {
             `${backupDir}. Move it back to ${dir} manually before restarting ComfyUI.`),
     );
   }
+
+  // Both renames landed: there is a panel in custom_nodes again, so the
+  // crash-repair window is CLOSED and the journal must go before verification —
+  // a later throw here is an honest "could not verify", not a broken swap, and
+  // leaving the journal would make the next operation "repair" a directory that
+  // is already in place.
+  ops.removeDir(journalPath);
 
   // VERIFY — same machinery as every other path (#639/#641): re-read the
   // installed identity FRESH from disk, fail closed on a shadow, and require
@@ -2299,12 +2520,24 @@ export async function runPanelActionInner(
     );
   }
 
+  // REPAIR AN INTERRUPTED SWAP FIRST. If a previous reinstall-from-source was
+  // killed between its two renames, custom_nodes has no panel right now and the
+  // working copy is sitting in custom_nodes_backup. Detection would read that as
+  // "not installed" and this operation would happily install over the top of a
+  // broken state. Both mutation entry points hold the panel op lock, so this is
+  // the safe place to put it back.
+  const swapRepairNote = reconcilePanelSwap(comfyPath, deps, { repair: true });
+
   // PIN GUARD — before any Manager mutation is queued. This is the single choke
   // point that makes "we never move a pinned user" true for every caller (the
   // sync skill, the panel, a hand-written install_panel call), not just the ones
   // that remembered to check. It is re-checked once more immediately before the
   // Manager call, since detection below is not instantaneous.
   assertNotPinned(action, deps);
+
+  if (swapRepairNote) {
+    logger.info(`[panel] before ${action}:${swapRepairNote}`);
+  }
 
   const detection = await detectPanelInstall(deps);
   if (detection.isDevSymlink) {
