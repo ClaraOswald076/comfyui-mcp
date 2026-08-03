@@ -78,6 +78,10 @@ const INIT = {
 
 const RESULT_SUCCESS = { type: "result", subtype: "success" };
 
+/** The interrupt landing (#728 r5 contract: an interrupted turn ends with an
+ *  INTERRUPTED-subtype result). */
+const RESULT_INTERRUPTED = { type: "result", subtype: "interrupted" };
+
 function assistantMsg(text: string) {
   return {
     type: "assistant",
@@ -352,10 +356,13 @@ describe("Claude backend — interruptPending is strictly turn-scoped (#745 revi
     await backend.interrupt();
     releaseTurnB();
     await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(2));
-    // NOW turn A's late empty result/success arrives: it is the interrupt
-    // landing for A → ok:true, NO synthetic failure attributed to the turn in
-    // flight, and turn B's state untouched.
-    hoisted.queue.push(RESULT_SUCCESS);
+    // NOW turn A's late empty result arrives: it is the interrupt landing for
+    // A — subtype "interrupted" per the SDK contract (#728 r5: an interrupted
+    // turn ends with an INTERRUPTED-subtype result; a success-subtype result
+    // with a newer trace pending would instead correlate to the NEWER turn) →
+    // ok:true, NO synthetic failure attributed to the turn in flight, and turn
+    // B's state untouched.
+    hoisted.queue.push(RESULT_INTERRUPTED);
     await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(1));
     expect(resultsOf(events)[0]).toMatchObject({ ok: true });
     expect(errorsOf(events)).toHaveLength(0);

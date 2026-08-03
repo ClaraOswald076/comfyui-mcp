@@ -84,6 +84,10 @@ const INIT = {
 
 const RESULT_SUCCESS = { type: "result", subtype: "success" };
 
+/** The interrupt landing (#728 r5 contract: an interrupted turn ends with an
+ *  INTERRUPTED-subtype result). */
+const RESULT_INTERRUPTED = { type: "result", subtype: "interrupted" };
+
 function assistantMsg(text: string) {
   return {
     type: "assistant",
@@ -106,6 +110,8 @@ async function startBackend(channelGen: AsyncGenerator<{ text: string }>) {
 }
 
 const resultsOf = (events: AgentEvent[]) => events.filter((e) => e.type === "result");
+const errorsOf = (events: AgentEvent[]) =>
+  events.filter((e): e is Extract<AgentEvent, { type: "error" }> => e.type === "error");
 
 describe("Claude backend turn markers (#728 r4)", () => {
   it("stamps a result with its OWN turn and stream events with the newest in-flight turn", async () => {
@@ -137,8 +143,10 @@ describe("Claude backend turn markers (#728 r4)", () => {
 
     // B's valid stream event WHILE A's result is still missing.
     hoisted.queue.push(assistantMsg("B working"));
-    // A's LATE result (the interrupt landing)…
-    hoisted.queue.push(RESULT_SUCCESS);
+    // A's LATE result — the interrupt landing, subtype "interrupted" per the
+    // SDK contract (#728 r5; a success subtype here would correlate to the
+    // NEWER turn, not A)…
+    hoisted.queue.push(RESULT_INTERRUPTED);
     // …then B's result-only terminal.
     hoisted.queue.push(RESULT_SUCCESS);
     hoisted.queue.end();
@@ -184,5 +192,53 @@ describe("Claude backend turn markers (#728 r4)", () => {
       .filter((e) => e.type === "assistant" || e.type === "result")
       .map((e) => `${e.type}:${e.turn}`);
     expect(stamped).toEqual(["assistant:1", "result:1", "assistant:2", "result:2"]);
+  });
+
+  it("permanent loss: B's terminal classifies/stamps as B when A's result never arrives (#728 r5)", async () => {
+    // The r5 codex-gate finding: A is interrupted and its result NEVER arrives
+    // (permanent loss). The SDK contract is that an interrupted turn ends with
+    // an INTERRUPTED-subtype result, so B's success terminal can never be A's
+    // terminal — the oldest (interrupted) trace is skipped/parked and B's
+    // terminal pops/stamps B's OWN trace. (Blind FIFO would pop A's trace:
+    // B's terminal would be blessed by A's interrupt and stamped 1 — blessed
+    // AND dead-lettered by the panel: a permanent wedge.)
+    let releaseTurnB!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseTurnB = resolve;
+    });
+    async function* twoTurns() {
+      yield { text: "turn A" };
+      await gate;
+      yield { text: "turn B" };
+    }
+    const { backend, events, done } = await startBackend(twoTurns());
+    hoisted.queue.push(INIT);
+    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    await backend.interrupt(); // A interrupted mid-flight; its result NEVER comes
+    releaseTurnB();
+    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(2));
+
+    // B's result-only terminal (EMPTY turn) arrives FIRST — classified by B's
+    // OWN flags (ok:false + the synthetic empty-turn error, NOT A's interrupt
+    // blessing) and stamped with B's marker, so the panel completes B's gate.
+    hoisted.queue.push(RESULT_SUCCESS);
+    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(1));
+    expect(resultsOf(events)[0]).toMatchObject({ ok: false, turn: 2 });
+    const errors = errorsOf(events);
+    expect(errors).toHaveLength(1);
+    expect(errors[0].message).toContain("without producing a reply");
+    expect(errors[0]).toMatchObject({ turn: 2 });
+
+    // A's genuinely late INTERRUPTED landing then pops its own parked trace:
+    // blessed (ok:true — the interrupt landing, not a failure) and stamped with
+    // A's marker, so the panel dead-letters it as the abandoned turn's
+    // straggler. B's classification stays untouched.
+    hoisted.queue.push(RESULT_INTERRUPTED);
+    hoisted.queue.end();
+    await done;
+    const results = resultsOf(events);
+    expect(results).toHaveLength(2);
+    expect(results[1]).toMatchObject({ ok: true, turn: 1 });
+    expect(errorsOf(events)).toHaveLength(1); // still only B's synthetic error
   });
 });
