@@ -135,6 +135,64 @@ class SilentBackend implements AgentBackend {
   }
 }
 
+/** A Codex-shaped backend that accepts an explicit harness-stall notice and
+ * settles the existing turn. This models app-server `turn/steer`: the agent
+ * receives the true origin instead of a synthetic user-rejection result. */
+class SteerRecoveringBackend implements AgentBackend {
+  readonly id = "codex" as const;
+  readonly capabilities = CLAUDE_CAPABILITIES;
+  interrupted = 0;
+  notices: string[] = [];
+  private release: (() => void) | null = null;
+  async *run(opts: BackendStartOptions): AsyncGenerator<AgentEvent> {
+    yield { type: "session", sessionId: "sess-steer" };
+    for await (const _turn of opts.channel) {
+      void _turn;
+      await new Promise<void>((resolve) => {
+        this.release = resolve;
+      });
+      yield { type: "result", ok: true, subtype: "success" };
+    }
+  }
+  async recoverStalledTurn(notice: string): Promise<boolean> {
+    this.notices.push(notice);
+    this.release?.();
+    return true;
+  }
+  async interrupt(): Promise<void> {
+    this.interrupted += 1;
+  }
+  async listModels(): Promise<ModelChoice[]> {
+    return [];
+  }
+}
+
+/** The provider accepts the precise notice but never emits another event. The
+ * second watchdog window must retain the established interrupt escape hatch. */
+class SteerButStillFrozenBackend implements AgentBackend {
+  readonly id = "codex" as const;
+  readonly capabilities = CLAUDE_CAPABILITIES;
+  interrupted = 0;
+  notices: string[] = [];
+  async *run(opts: BackendStartOptions): AsyncGenerator<AgentEvent> {
+    yield { type: "session", sessionId: "sess-steer-frozen" };
+    for await (const _turn of opts.channel) {
+      void _turn;
+      await new Promise<void>(() => {});
+    }
+  }
+  async recoverStalledTurn(notice: string): Promise<boolean> {
+    this.notices.push(notice);
+    return true;
+  }
+  async interrupt(): Promise<void> {
+    this.interrupted += 1;
+  }
+  async listModels(): Promise<ModelChoice[]> {
+    return [];
+  }
+}
+
 function makeDeps(says: string[], turns: Array<"working" | "done">) {
   return {
     mcpServers: {},
@@ -189,6 +247,41 @@ describe("per-turn freeze watchdog liveness re-arm", () => {
     expect(says.join("\n")).toMatch(/stopped responding|stalled/i);
     expect(backend.interrupted).toBeGreaterThanOrEqual(1);
     expect(turns).toContain("done"); // gate released so the next batch can run
+    await agent.stop();
+  });
+
+  it("steers a stalled Codex turn with a non-user-cancel notice before legacy interrupt", async () => {
+    const says: string[] = [];
+    const turns: Array<"working" | "done"> = [];
+    const backend = new SteerRecoveringBackend();
+    const agent = new PanelAgent("tab-steer", makeDeps(says, turns) as never, backend);
+    void agent.start();
+    agent.send("the tool call will stall");
+
+    await new Promise((r) => setTimeout(r, IDLE_MS * 4));
+
+    expect(backend.notices).toHaveLength(1);
+    expect(backend.notices[0]).toMatch(/user did NOT reject or cancel/i);
+    expect(backend.notices[0]).toMatch(/safe to retry/i);
+    expect(backend.interrupted).toBe(0);
+    expect(says.join("\n")).toMatch(/you did NOT cancel/i);
+    expect(says.join("\n")).not.toMatch(/I've cleared it/i);
+    expect(turns).toContain("done");
+    await agent.stop();
+  });
+
+  it("falls back to the bounded legacy interrupt if a steered stalled turn stays silent", async () => {
+    const says: string[] = [];
+    const turns: Array<"working" | "done"> = [];
+    const backend = new SteerButStillFrozenBackend();
+    const agent = new PanelAgent("tab-steer-frozen", makeDeps(says, turns) as never, backend);
+    void agent.start();
+    agent.send("the tool call will remain frozen");
+
+    await new Promise((r) => setTimeout(r, IDLE_MS * 4));
+
+    expect(backend.notices).toHaveLength(1);
+    expect(backend.interrupted).toBeGreaterThanOrEqual(1);
     await agent.stop();
   });
 

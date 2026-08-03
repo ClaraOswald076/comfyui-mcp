@@ -56,6 +56,43 @@ function installActiveClient(backend: Backend, client: object): void {
 }
 
 describe("CodexBackend interrupt recovery", () => {
+  it("steers a watchdog stall as an explicit non-user-cancel notice", async () => {
+    const client = {
+      request: vi.fn().mockResolvedValue({}),
+      close: vi.fn().mockResolvedValue(undefined),
+    };
+    const backend = new CodexBackend();
+    installActiveClient(backend, client);
+
+    const notice = "The harness stalled; the user did NOT cancel this tool call.";
+    await expect(backend.recoverStalledTurn(notice)).resolves.toBe(true);
+    expect(client.request).toHaveBeenCalledWith("turn/steer", {
+      threadId: "thread-1",
+      expectedTurnId: "turn-1",
+      input: [{ type: "text", text: notice }],
+    });
+    expect(client.request).not.toHaveBeenCalledWith(
+      "turn/interrupt",
+      expect.anything(),
+    );
+  });
+
+  it("falls back cleanly when an older app-server rejects stalled-turn steering", async () => {
+    const client = {
+      request: vi.fn().mockRejectedValue(new Error("unknown method turn/steer")),
+      close: vi.fn().mockResolvedValue(undefined),
+    };
+    const backend = new CodexBackend();
+    installActiveClient(backend, client);
+
+    await expect(backend.recoverStalledTurn("harness stall")).resolves.toBe(false);
+    expect(client.request).toHaveBeenCalledWith("turn/steer", {
+      threadId: "thread-1",
+      expectedTurnId: "turn-1",
+      input: [{ type: "text", text: "harness stall" }],
+    });
+  });
+
   it("keeps the turn alive while app-server reports a retryable error", async () => {
     const onActivity = vi.fn();
     const client = {
