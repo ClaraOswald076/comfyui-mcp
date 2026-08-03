@@ -85,6 +85,19 @@ export interface RunTicket {
   toNodeId?: number;
   /** True once a completion for this exact prompt id was acked as delivered. */
   settled: boolean;
+  /**
+   * This prompt id was queued MORE THAN ONCE, so it no longer identifies a
+   * single run.
+   *
+   * Nothing on the wire distinguishes generation A's completion from
+   * generation B's — the panel sends only the id — so once an id is reused, ANY
+   * completion for it is genuinely unattributable. It is therefore correlated as
+   * `foreign` (UNDETERMINED) rather than confidently matched, and the
+   * already-delivered proofs are disabled for it: a resend may be delivered
+   * twice, but B's real completion can never be suppressed as A's duplicate, and
+   * A's late resend can never be presented as B's awaited result.
+   */
+  reused?: boolean;
 }
 
 export type EntryState =
@@ -232,6 +245,10 @@ export class RunCompletionJournalImpl {
       existing.settled = false;
       existing.tabId = meta.tabId;
       existing.queuedAt = Date.now();
+      // The id no longer identifies ONE run. Every completion for it from here
+      // on is unattributable (see RunTicket.reused) — reported UNDETERMINED, and
+      // never suppressed as a duplicate of the other generation.
+      existing.reused = true;
       // SUPERSEDE any entry still carrying the PREVIOUS run's completion for this
       // id. Without this, the new run's completion merges into an entry that is
       // already sitting in an agent queue holding the OLD completion's text: when
@@ -287,7 +304,10 @@ export class RunCompletionJournalImpl {
     const pid = typeof payload.prompt_id === "string" ? payload.prompt_id.trim() : "";
     if (!pid) return { status: "unidentified" };
     const ticket = this.tickets.get(pid);
-    return ticket && ticket.tabId === key
+    // A REUSED id proves nothing: the panel sends only the id, so a completion
+    // for it could belong to either generation. Report it as foreign — real, but
+    // UNDETERMINED — rather than claiming it is the run now outstanding.
+    return ticket && ticket.tabId === key && !ticket.reused
       ? { status: "matched", promptId: pid }
       : { status: "foreign", promptId: pid };
   }
@@ -319,9 +339,15 @@ export class RunCompletionJournalImpl {
       // can age it out and then re-deliver a very late resend; the ticket outlives
       // it for any run this session actually queued. Either one is proof.
       const settledTicket = this.tickets.get(correlation.promptId);
+      // Both proofs are DISABLED for a reused id: neither can tell which
+      // generation a completion belongs to, so suppressing on them could swallow
+      // the newer run's real result. A duplicate delivery (labelled UNDETERMINED)
+      // is the correct trade here.
+      const idReused = settledTicket?.reused === true && settledTicket.tabId === key;
       if (
-        this.delivered.has(deliveredKey(key, correlation.promptId)) ||
-        (settledTicket?.settled === true && settledTicket.tabId === key)
+        !idReused &&
+        (this.delivered.has(deliveredKey(key, correlation.promptId)) ||
+          (settledTicket?.settled === true && settledTicket.tabId === key))
       ) {
         logger.info(
           `[run-completions] ignoring a re-sent completion for ${describe(correlation)} — already delivered to tab ${key.slice(0, 8)}`,

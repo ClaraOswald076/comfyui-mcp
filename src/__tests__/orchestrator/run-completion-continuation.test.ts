@@ -513,21 +513,46 @@ describe("run completion across automatic goal continuation (#468)", () => {
     // watchdog) must return the completion it was carrying — but as a CARRIED
     // release, or an agent that keeps abandoning turns would be handed the same
     // completion on every turn forever.
-    const backend = new ContinuationBackend();
+    const backend = new MarkerBackend();
     const { journal, manager, arrive } = makeHarness(backend);
     const tab = "tab-rewind-carried";
 
     journal.openRun(PROMPT_A, { tabId: tab });
     manager.send(tab, "go");
     await waitFor(() => backend.turns.length >= 1);
-    backend.finishTurn();
+    backend.emit({ type: "result", ok: true, subtype: "success", turn: 1 });
 
     arrive(tab, { kind: "executed", prompt_id: PROMPT_A, images: [{ filename: "rewound.png" }] });
-    await waitFor(() => backend.turns.length >= 2); // turn 2 carries it
+    // MarkerBackend emits a stamped event per turn, so turn 2 is PROVEN received
+    // before the rewind — which is what makes the release carried.
+    await waitFor(() => backend.turns.length >= 2);
+    await waitFor(() => journal.outstanding(tab).length === 1);
 
     manager.rewind(tab, null); // abandons the in-flight turn
     await waitFor(() => (journal.outstanding(tab)[0]?.carriedReleases ?? 0) >= 1);
     expect(journal.outstanding(tab)).toHaveLength(1); // returned, not lost
+  });
+
+  it("a turn the backend never RECEIVED is released UNCARRIED — it can't count toward the bound", async () => {
+    // The token is attached at dispatch, but Claude resolves output images before
+    // submitting the turn. Aborting in that window means the model never saw the
+    // completion, so it must not count toward the settle bound.
+    const silent = new MarkerBackend({ silentTurns: true });
+    const { journal, manager, arrive } = makeHarness(silent);
+    const tab = "tab-unreceived";
+
+    journal.openRun(PROMPT_A, { tabId: tab });
+    manager.send(tab, "go");
+    await waitFor(() => silent.turns.length >= 1);
+    silent.emit({ type: "result", ok: true, subtype: "success", turn: 1 });
+
+    arrive(tab, { kind: "executed", prompt_id: PROMPT_A, images: [{ filename: "unseen.png" }] });
+    await waitFor(() => silent.turns.length >= 2); // dispatched, but NO events for it
+
+    manager.rewind(tab, null);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(journal.outstanding(tab)).toHaveLength(1); // returned…
+    expect(journal.outstanding(tab)[0].carriedReleases ?? 0).toBe(0); // …unbounded
   });
 
   it("a completion survives an agent whose self-restart loop GAVE UP", async () => {
@@ -726,21 +751,32 @@ describe("run completion journal correlation (#468)", () => {
     expect(journal.outstanding("t")).toHaveLength(1);
   });
 
-  it("re-queuing the SAME prompt id clears the delivered memo, so its new completion lands", () => {
-    // openRun() documents that it REOPENS an existing ticket. Leaving the
-    // already-delivered memo behind made that a lie: panel_run promised
-    // automatic delivery and the journal then suppressed the completion as a
-    // duplicate of the PREVIOUS run's.
+  it("a REUSED prompt id delivers every completion, as UNDETERMINED, suppressing none", () => {
+    // Nothing on the wire distinguishes generation A's completion from B's — the
+    // panel sends only the id. So once an id is queued twice it identifies no
+    // single run: suppressing on the delivered proofs could swallow B's real
+    // result, and claiming a match could present A's result as B's.
     journal.openRun(PROMPT_A, { tabId: "t" });
     const first = journal.record("t", { kind: "executed", prompt_id: PROMPT_A });
+    expect(first!.correlation.status).toBe("matched"); // not reused yet
     journal.deliverPending("t", () => true);
     journal.ack(first!.token);
     expect(journal.record("t", { kind: "executed", prompt_id: PROMPT_A })).toBeNull(); // memo holds
 
-    journal.openRun(PROMPT_A, { tabId: "t" }); // re-queued
+    journal.openRun(PROMPT_A, { tabId: "t" }); // ComfyUI reused the id
+    expect(journal.ticketFor(PROMPT_A)?.reused).toBe(true);
+
+    // Both a late resend of A and B's real completion are now delivered, each
+    // labelled UNDETERMINED. Neither is suppressed; neither claims to be "the
+    // run YOU queued".
     const second = journal.record("t", { kind: "executed", prompt_id: PROMPT_A });
     expect(second).not.toBeNull();
-    expect(second!.correlation.status).toBe("matched");
+    expect(second!.correlation.status).toBe("foreign");
+    journal.deliverPending("t", () => true);
+    journal.ack(second!.token);
+    const third = journal.record("t", { kind: "executed", prompt_id: PROMPT_A });
+    expect(third).not.toBeNull(); // NOT swallowed as a duplicate of the previous
+    expect(third!.correlation.status).toBe("foreign");
   });
 
   it("re-queuing a prompt id SUPERSEDES the old entry — the old result can't answer for the new run", () => {
@@ -769,10 +805,11 @@ describe("run completion journal correlation (#468)", () => {
     expect(journal.ticketFor(PROMPT_A)?.settled).toBe(false);
     expect(journal.pending("t")).toHaveLength(1); // run B still awaits delivery
 
-    // Run B's own delivery settles it.
+    // Run B's own completion is delivered too — as UNDETERMINED, because a
+    // reused id can no longer be attributed to one run.
     journal.deliverPending("t", () => true);
     journal.ack(fresh!.token);
-    expect(journal.ticketFor(PROMPT_A)?.settled).toBe(true);
+    expect(journal.outstanding("t")).toHaveLength(0);
   });
 
   it("an eviction disclosure rides a surviving entry, so it can't be discarded before it's told", () => {

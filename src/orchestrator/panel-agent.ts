@@ -285,6 +285,17 @@ export class PanelAgent {
   /** The turn marker `turnEventTokens` belongs to (#468). A completion is acked
    *  only by the result of the turn that CARRIED it — see the `result` case. */
   private turnEventTokensMarker = 0;
+  /**
+   * Has the backend produced ANY event for the turn currently in flight?
+   *
+   * This is what "carried" means for #468's bounded replay: the token is
+   * attached at DISPATCH, but the backend may not have consumed the yielded turn
+   * yet (Claude awaits output-image resolution before submitting it). Aborting
+   * in that window — a rewind, or the watchdog on a turn that produced nothing —
+   * means the completion never reached the model, so it must NOT count toward
+   * the settle bound. One event is proof of receipt. Reset at each dispatch.
+   */
+  private turnProducedEvents = false;
   /** True while a turn is in flight (working→done). Lets the manager defer a
    *  session-restarting option change (effort) until the turn finishes, instead
    *  of interrupting and silently dropping the in-flight reply. */
@@ -500,10 +511,11 @@ export class PanelAgent {
     // (#468).
     const rewoundTokens = this.turnEventTokens;
     this.turnEventTokens = [];
-    // CARRIED, for the same reason as the stall path: the turn was dispatched
-    // with the completion in it, and a rewind can repeat, so this release is
-    // bounded rather than an unbounded replay source.
-    this.releaseEventTokens(rewoundTokens, { carried: true });
+    // CARRIED only if the backend actually RECEIVED this turn. A rewind during
+    // the pre-submission window (Claude resolving output images) aborts a turn
+    // the model never saw, and counting that toward the settle bound could
+    // retire a completion nobody read.
+    this.releaseEventTokens(rewoundTokens, { carried: this.turnProducedEvents });
     // Break the current stream so start()'s loop re-enters and forks.
     void this.backend.interrupt().catch(() => {});
     const wake = this.waiting;
@@ -971,10 +983,9 @@ export class PanelAgent {
       if (this.turnEventTokens.length) {
         const stale = this.turnEventTokens;
         this.turnEventTokens = [];
-        // CARRIED: a turn genuinely dispatched with these and has now been
-        // superseded, so the agent read the text — this is the same unprovable-
-        // ack cycle as the result path and is bounded with it.
-        this.releaseEventTokens(stale, { carried: true });
+        // CARRIED only if that turn produced events (proof the backend received
+        // it) — the same rule as the result and abandon paths.
+        this.releaseEventTokens(stale, { carried: this.turnProducedEvents });
       }
       this.turnEventTokens = carriedTokens;
       this.inFlight = {
@@ -988,6 +999,7 @@ export class PanelAgent {
       // Nth turn the backend reads — its events carry marker N (#728 r3).
       this.currentTurnMarker += 1;
       this.turnEventTokensMarker = this.currentTurnMarker;
+      this.turnProducedEvents = false; // no proof of receipt yet (#468)
       // Mark the turn in flight AT DISPATCH (not on the first event). Without this
       // the watchdog's `busy` guard would be false for the exact zero-event freeze
       // it's meant to catch, so onTurnStalled() would no-op. (handleEvent's later
@@ -1254,11 +1266,13 @@ export class PanelAgent {
     // turn we just wrote off.
     const stalledTokens = this.turnEventTokens;
     this.turnEventTokens = [];
-    // CARRIED: the turn was DISPATCHED with the completion in it. The watchdog
-    // re-arms on every turn, so a backend that keeps freezing would otherwise
-    // replay the same completion forever — this release must count toward the
-    // MAX_CARRIED_RELEASES bound like the result path does.
-    this.releaseEventTokens(stalledTokens, { carried: true });
+    // CARRIED only if the backend produced at least one event for this turn —
+    // i.e. it demonstrably received the completion and then went silent. A turn
+    // that produced NOTHING never reached the model, so it must not count toward
+    // the settle bound (that freeze is bounded by the self-restart give-up
+    // machinery instead, which tears the agent down rather than quietly retiring
+    // a completion nobody saw).
+    this.releaseEventTokens(stalledTokens, { carried: this.turnProducedEvents });
     if (!alreadyReported) {
       this.deps.onSay(
         this.tabId,
@@ -1303,6 +1317,9 @@ export class PanelAgent {
       );
       return;
     }
+    // Proof the backend RECEIVED the in-flight turn (#468) — stragglers were
+    // already dead-lettered above, so anything reaching here belongs to it.
+    this.turnProducedEvents = true;
     // Any event means the turn is alive — reset the idle watchdog. The `result`
     // case below disarms it entirely (turn ended). Placed before the switch so it
     // covers every event type without per-case bumps.
