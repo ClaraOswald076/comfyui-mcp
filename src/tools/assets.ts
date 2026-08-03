@@ -77,12 +77,16 @@ export function registerAssetTools(server: McpServer): void {
               ? reconcileErr.message
               : String(reconcileErr);
           logger.warn("list_assets history reconcile failed", { error: message });
-          note = `Could not reconcile from ComfyUI history (${message}); showing watched-session assets only.`;
+          // Truthful degradation: previously reconciled records stay listed
+          // (they name real outputs) — the note must not claim watched-only.
+          note =
+            `Could not refresh from ComfyUI history (${message}); results may be stale — ` +
+            "they still include assets reconciled from history earlier, and very recent completions may be missing.";
         }
         const records = AssetRegistry.list({ limit: args.limit, since });
         if (records.length === 0 && note === undefined) {
           note =
-            "No assets found — nothing completed under this server's watch and no recent completed outputs in ComfyUI history. " +
+            "No assets found — nothing completed under this server's watch and no recent successfully completed outputs in ComfyUI history. " +
             "Use get_history to inspect past runs and get_image to fetch an output by filename.";
         }
         return {

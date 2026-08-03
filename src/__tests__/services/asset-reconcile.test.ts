@@ -38,12 +38,14 @@ interface EntryOpts {
   queue: number;
   promptId: string;
   filename?: string;
-  /** ms epoch for execution_start/execution_success (start = end - 5s). */
-  successTs?: number;
-  completed?: boolean;
-  withError?: boolean;
   graph?: unknown;
   outputs?: Record<string, unknown>;
+  /** Full status override; defaults to a completed success with
+   *  execution_start + execution_success messages at successTs. */
+  status?: Record<string, unknown>;
+  /** ms epoch for execution_start/execution_success (start = end - 5s).
+   *  Omit to produce a success entry with NO timestamp messages. */
+  successTs?: number;
 }
 
 function historyEntry(opts: EntryOpts) {
@@ -51,32 +53,25 @@ function historyEntry(opts: EntryOpts) {
     queue,
     promptId,
     filename = `${promptId}_00001_.png`,
-    successTs,
-    completed = true,
-    withError = false,
     graph = sampleGraph(),
-    outputs,
+    outputs = { "9": { images: [{ filename, subfolder: "", type: "output" }] } },
+    successTs,
   } = opts;
-  const messages: Array<[string, Record<string, unknown>]> = [];
-  if (successTs !== undefined) {
-    messages.push(["execution_start", { prompt_id: promptId, timestamp: successTs - 5000 }]);
-    messages.push([
-      withError ? "execution_error" : "execution_success",
-      withError
-        ? { prompt_id: promptId, timestamp: successTs, exception_message: "boom" }
-        : { prompt_id: promptId, timestamp: successTs },
-    ]);
-  }
+  const status = opts.status ?? {
+    status_str: "success",
+    completed: true,
+    messages:
+      successTs === undefined
+        ? []
+        : [
+            ["execution_start", { prompt_id: promptId, timestamp: successTs - 5000 }],
+            ["execution_success", { prompt_id: promptId, timestamp: successTs }],
+          ],
+  };
   return {
     prompt: [queue, promptId, graph, {}, []],
-    outputs: outputs ?? {
-      "9": { images: [{ filename, subfolder: "", type: "output" }] },
-    },
-    status: {
-      status_str: withError ? "error" : "success",
-      completed,
-      messages,
-    },
+    outputs,
+    status,
   };
 }
 
@@ -153,11 +148,18 @@ describe("reconcileAssetsFromHistory", () => {
     expect(all[0].createdAt).toBe(watchedTs);
   });
 
-  it("fabricates nothing: skips errored, incomplete, graph-less, and output-less entries", async () => {
+  it("fabricates nothing: skips incomplete, graph-less, and output-less entries", async () => {
     const ts = Date.now() - 1000;
     getHistoryMock.mockResolvedValue({
-      errored: historyEntry({ queue: 4, promptId: "errored", successTs: ts, withError: true }),
-      running: historyEntry({ queue: 3, promptId: "running", successTs: ts, completed: false }),
+      running: historyEntry({
+        queue: 3,
+        promptId: "running",
+        status: {
+          status_str: "success",
+          completed: false,
+          messages: [["execution_start", { prompt_id: "running", timestamp: ts }]],
+        },
+      }),
       nograph: historyEntry({ queue: 2, promptId: "nograph", successTs: ts, graph: {} }),
       nooutput: historyEntry({ queue: 1, promptId: "nooutput", successTs: ts, outputs: {} }),
     });
@@ -166,6 +168,84 @@ describe("reconcileAssetsFromHistory", () => {
 
     expect(result.registered).toBe(0);
     expect(AssetRegistry.list()).toHaveLength(0);
+  });
+
+  it("registers only entries whose history status AFFIRMATIVELY says success (codex P1)", async () => {
+    const ts = Date.now() - 1000;
+    getHistoryMock.mockResolvedValue({
+      // The codex P1 case: status_str "error" with NO messages — the
+      // notification builder would default this to "success".
+      "error-no-messages": historyEntry({
+        queue: 5,
+        promptId: "error-no-messages",
+        status: { status_str: "error", completed: true, messages: [] },
+      }),
+      // Error with the messages key missing entirely.
+      "error-messages-missing": historyEntry({
+        queue: 4,
+        promptId: "error-messages-missing",
+        status: { status_str: "error", completed: true },
+      }),
+      // Unknown status: completed but no status_str at all.
+      "status-unknown": historyEntry({
+        queue: 3,
+        promptId: "status-unknown",
+        status: { completed: true, messages: [] },
+      }),
+      // Contradictory: status_str says success but an execution_error
+      // message exists — fail toward NOT registering.
+      "status-contradictory": historyEntry({
+        queue: 2,
+        promptId: "status-contradictory",
+        status: {
+          status_str: "success",
+          completed: true,
+          messages: [
+            ["execution_error", { prompt_id: "status-contradictory", timestamp: ts, exception_message: "boom" }],
+          ],
+        },
+      }),
+      // Control: a genuine success DOES register, proving the scan continued.
+      good: historyEntry({ queue: 1, promptId: "good", successTs: ts }),
+    });
+
+    const result = await reconcileAssetsFromHistory();
+
+    expect(result.registered).toBe(1);
+    const all = AssetRegistry.list();
+    expect(all).toHaveLength(1);
+    expect(all[0].promptId).toBe("good");
+  });
+
+  it("skips entries with no real completion timestamp rather than fabricating one (codex P1)", async () => {
+    const ts = Date.now() - 1000;
+    getHistoryMock.mockResolvedValue({
+      // No messages at all — no execution_success timestamp anywhere.
+      timeless: historyEntry({ queue: 4, promptId: "timeless" }),
+      // Only execution_start: that is NOT completion time — using it would
+      // backdate a long render past the TTL/since boundary and hide it.
+      "start-only": historyEntry({
+        queue: 3,
+        promptId: "start-only",
+        status: {
+          status_str: "success",
+          completed: true,
+          messages: [["execution_start", { prompt_id: "start-only", timestamp: ts }]],
+        },
+      }),
+      // Bogus far-future timestamp — untrustworthy.
+      "future-ts": historyEntry({ queue: 2, promptId: "future-ts", successTs: Date.now() + 3_600_000 }),
+      // Control: properly timestamped success registers.
+      good: historyEntry({ queue: 1, promptId: "good", successTs: ts }),
+    });
+
+    const result = await reconcileAssetsFromHistory();
+
+    expect(result.registered).toBe(1);
+    const all = AssetRegistry.list();
+    expect(all).toHaveLength(1);
+    expect(all[0].promptId).toBe("good");
+    expect(all[0].createdAt).toBe(ts);
   });
 
   it("reconciles only the newest maxPrompts completed prompts, ordered by queue number", async () => {
@@ -179,8 +259,8 @@ describe("reconcileAssetsFromHistory", () => {
     const result = await reconcileAssetsFromHistory({ maxPrompts: 2 });
 
     expect(result).toEqual({ scanned: 2, registered: 2, skippedExisting: 0 });
-    const filenames = AssetRegistry.list().map((r) => r.promptId).sort();
-    expect(filenames).toEqual(["middle", "newest"]);
+    const promptIds = AssetRegistry.list().map((r) => r.promptId).sort();
+    expect(promptIds).toEqual(["middle", "newest"]);
   });
 
   it("normalizes epoch-seconds history timestamps to ms", async () => {
@@ -198,20 +278,6 @@ describe("reconcileAssetsFromHistory", () => {
 
     const [record] = AssetRegistry.list();
     expect(record.createdAt).toBe(successS * 1000);
-  });
-
-  it("falls back to now when history carries no usable timestamp", async () => {
-    getHistoryMock.mockResolvedValue({
-      "timeless-prompt": historyEntry({ queue: 1, promptId: "timeless-prompt" }),
-    });
-
-    const before = Date.now();
-    await reconcileAssetsFromHistory();
-    const after = Date.now();
-
-    const [record] = AssetRegistry.list();
-    expect(record.createdAt).toBeGreaterThanOrEqual(before);
-    expect(record.createdAt).toBeLessThanOrEqual(after);
   });
 
   it("registers entries older than the TTL but they read as expired (TTL stays authoritative)", async () => {

@@ -182,21 +182,64 @@ describe("list_assets (#751)", () => {
 
     expect(out.count).toBe(0);
     expect(out.assets).toEqual([]);
-    expect(out.note).toContain("no recent completed outputs in ComfyUI history");
+    expect(out.note).toContain("no recent successfully completed outputs in ComfyUI history");
     expect(out.note).toContain("get_history");
     expect(out.note).toContain("get_image");
   });
 
-  it("still returns watched assets (with a note) when the history fetch fails", async () => {
+  it("degrades truthfully when the history fetch fails: keeps all records, flags staleness", async () => {
     registerWatched("watched-prompt", "watched_00001_.png");
+    // A record reconciled from history on an earlier, successful call.
+    AssetRegistry.register({
+      promptId: "reconciled-prompt",
+      workflow: sampleGraph(),
+      source: "history-reconcile",
+      outputs: [
+        {
+          node_id: "9",
+          images: [
+            {
+              filename: "reconciled_00001_.png",
+              subfolder: "",
+              type: "output",
+              url: "http://127.0.0.1:8188/view?filename=reconciled_00001_.png&subfolder=&type=output",
+            },
+          ],
+        },
+      ],
+    });
     getHistoryMock.mockRejectedValue(new Error("connection refused"));
 
     const out = await callListAssets();
 
-    expect(out.count).toBe(1);
-    expect(out.assets[0]).toMatchObject({ filename: "watched_00001_.png", source: "watched" });
-    expect(out.note).toContain("Could not reconcile from ComfyUI history");
-    expect(out.note).toContain("watched-session assets only");
+    // Both records stay listed — but the note must SAY the result includes
+    // previously reconciled assets and may be stale, never "watched-only".
+    expect(out.count).toBe(2);
+    const sources = new Map(out.assets.map((a) => [a.filename, a.source]));
+    expect(sources.get("watched_00001_.png")).toBe("watched");
+    expect(sources.get("reconciled_00001_.png")).toBe("history-reconcile");
+    expect(out.note).toContain("Could not refresh from ComfyUI history");
+    expect(out.note).toContain("may be stale");
+    expect(out.note).not.toContain("watched-session assets only");
+  });
+
+  it("excludes error-status history entries even when their messages are missing (codex P1)", async () => {
+    // completed:true + status_str:"error" + image outputs + NO messages: the
+    // completion-notification builder would default this to "success", so
+    // eligibility must come from the history entry's own status fields.
+    getHistoryMock.mockResolvedValue({
+      "errored-prompt": {
+        prompt: [7, "errored-prompt", sampleGraph(), {}, []],
+        outputs: { "9": { images: [{ filename: "err_00001_.png", subfolder: "", type: "output" }] } },
+        status: { status_str: "error", completed: true, messages: [] },
+      },
+    });
+
+    const out = await callListAssets();
+
+    expect(out.count).toBe(0);
+    expect(out.assets).toEqual([]);
+    expect(out.note).toContain("no recent successfully completed outputs in ComfyUI history");
   });
 
   it("respects the limit argument across reconciled assets", async () => {

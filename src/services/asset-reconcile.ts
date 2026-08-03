@@ -19,10 +19,15 @@ import { logger } from "../utils/logger.js";
  * get_asset_metadata keep working) and the run's real completion time as
  * createdAt (so ordering, `since` filters, and TTL expiry stay truthful).
  *
- * Nothing is fabricated: only entries that are completed, successful, carry a
- * usable prompt graph, and list real image outputs are registered. Entries
- * older than the registry TTL register but read as expired immediately — the
- * TTL stays the single source of truth for record lifetime.
+ * Nothing is fabricated: an entry registers only when its history status
+ * affirmatively says success (status_str === "success" AND no error/interrupt
+ * message — missing, unknown, or contradictory status fails toward NOT
+ * registering), it carries a usable prompt graph, it lists real image outputs,
+ * and it has a real execution_success timestamp for createdAt (execution_start
+ * is not completion time, and "now" would silently misorder — untimed entries
+ * are skipped, not guessed). Entries older than the registry TTL register but
+ * read as expired immediately — the TTL stays the single source of truth for
+ * record lifetime.
  */
 
 export interface ReconcileResult {
@@ -51,13 +56,16 @@ function normalizeEpochMs(ts: unknown): number | undefined {
   return undefined;
 }
 
-/** The run's real completion time (ms epoch), or undefined when history has no
- *  usable timestamp — the caller then falls back to "now". */
+/** The run's real completion time (ms epoch), taken ONLY from the
+ *  execution_success message — the one truthful completion timestamp.
+ *  execution_start is deliberately not a fallback: it is start time, and using
+ *  it would backdate a long render past the TTL / a `since` boundary and hide
+ *  it. Returns undefined when history carries no trustworthy value. */
 function completionTimeMs(entry: HistoryEntry, now: number): number | undefined {
-  const messages = normalizeHistoryMessages(entry);
-  const success = messages.find((m) => m[0] === "execution_success");
-  const start = messages.find((m) => m[0] === "execution_start");
-  const ms = normalizeEpochMs((success ?? start)?.[1]?.timestamp);
+  const success = normalizeHistoryMessages(entry).find(
+    (m) => m[0] === "execution_success",
+  );
+  const ms = normalizeEpochMs(success?.[1]?.timestamp);
   // Implausibly far in the future (clock skew, non-epoch value) — untrustworthy.
   if (ms === undefined || ms > now + 60_000) return undefined;
   return ms;
@@ -80,8 +88,18 @@ export async function reconcileAssetsFromHistory(opts: {
   let skippedExisting = 0;
 
   for (const [promptId, entry] of completed) {
-    // Parse exactly like the watched path does — same status derivation, same
-    // output extraction, same URL building.
+    // Eligibility keys on the HISTORY entry's own status fields, not the
+    // notification builder's default: buildCompletionNotification assumes
+    // success unless it finds a well-formed execution_error/interrupted
+    // message, which would admit a status_str:"error" entry whose messages
+    // are missing or malformed. Anything short of an affirmative success
+    // fails toward NOT registering.
+    if (entry.status?.status_str !== "success") continue;
+
+    // Parse outputs exactly like the watched path does — same extraction and
+    // URL building. The notification's message-derived status acts as a veto:
+    // a contradictory execution_error/interrupted message rejects the entry
+    // even when status_str says success.
     const notification = buildCompletionNotification(promptId, entry, now());
     if (notification.status !== "success" || notification.outputs.length === 0) {
       continue;
@@ -90,6 +108,17 @@ export async function reconcileAssetsFromHistory(opts: {
     // rely on; without it there is nothing truthful to register.
     const workflow = extractWorkflowGraph(entry);
     if (!workflow) continue;
+
+    // createdAt must be the run's REAL completion time — an entry without a
+    // trustworthy execution_success timestamp is skipped rather than guessed
+    // (see completionTimeMs).
+    const createdAt = completionTimeMs(entry, now());
+    if (createdAt === undefined) {
+      logger.debug("Skipping history entry with no usable completion timestamp", {
+        prompt_id: promptId,
+      });
+      continue;
+    }
 
     const fresh = notification.outputs
       .map((output) => ({
@@ -107,7 +136,6 @@ export async function reconcileAssetsFromHistory(opts: {
       .filter((output) => output.images.length > 0);
     if (fresh.length === 0) continue;
 
-    const createdAt = completionTimeMs(entry, now()) ?? now();
     const records = AssetRegistry.register({
       promptId,
       workflow,
