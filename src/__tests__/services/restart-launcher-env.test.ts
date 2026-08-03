@@ -1164,7 +1164,11 @@ describe("restart_comfyui — a PID is not a process identity (#776)", () => {
 
     expect(result.stopped).toBe(false);
     expect(result.started).toBe(false);
-    expect(result.message).toMatch(/could not be observed on both sides/i);
+    // The refusal names the MISSING CAPABILITY and a remedy, rather than leaving
+    // the user to guess why a restart declined on their host.
+    expect(result.message).toMatch(/could not be tied to PID/i);
+    expect(result.message).toMatch(/no usable port-owner lookup|creation time/i);
+    expect(result.message).toMatch(/restart ComfyUI from the launcher|install the missing tool/i);
     expect(killSpy).not.toHaveBeenCalled();
     expect(mockSpawn).not.toHaveBeenCalled();
 
@@ -1204,7 +1208,7 @@ describe("restart_comfyui — a PID is not a process identity (#776)", () => {
 
     const result = await restartComfyUI();
 
-    expect(result.message).not.toMatch(/could not be observed on both sides/i);
+    expect(result.message).not.toMatch(/could not be tied to PID/i);
     expect(result.stopped).toBe(true);
     expect(result.started).toBe(true);
 

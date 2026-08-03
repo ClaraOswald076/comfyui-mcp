@@ -1674,16 +1674,33 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
   // close on the number alone). So each end reads pid + creation time together, and
   // an end whose stamp cannot be read is "did not observe", never "observed the
   // same" (codex gate).
+  //
+  // `missing` records WHICH capability was unavailable, so a refusal can name it
+  // rather than leaving the user to guess. This is a real, if narrow, platform
+  // limitation: a host that cannot report process creation times cannot have its
+  // restart verified, and we would rather say so than kill on an unverified pairing.
+  let missingCapability: string | undefined;
   const observeOwner = (): { pid: number; startedAt: string } | null => {
     let owner: number | null = null;
     try {
       owner = findPidByPort(port);
     } catch {
+      owner = null;
+    }
+    if (owner == null) {
+      missingCapability =
+        `the process listening on port ${port} could not be identified (no usable ` +
+        `port-owner lookup — on Linux this needs \`lsof\`, on Windows \`netstat\`/PowerShell)`;
       return null;
     }
-    if (owner == null) return null;
     const startedAt = resolveProcessIdentity(owner)?.startedAt;
-    return startedAt ? { pid: owner, startedAt } : null;
+    if (!startedAt) {
+      missingCapability =
+        `the creation time of PID ${owner} could not be read, so that number cannot be ` +
+        `tied to a specific process (this host does not expose process start times to us)`;
+      return null;
+    }
+    return { pid: owner, startedAt };
   };
 
   let argv: string[] = [];
@@ -1729,10 +1746,11 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
   }
   if (argv.length > 0 && pid != null && !bracketed) {
     const err = new ProcessControlError(
-      `ComfyUI answered on port ${port}, but the identity of the process owning that port ` +
-        `could not be observed on both sides of the request, so its answer cannot be tied to ` +
-        `PID ${pid}. Nothing was stopped: acting on an unverified pairing risks controlling the ` +
-        `wrong process. Re-run, or restart ComfyUI from the launcher that owns it.`,
+      `ComfyUI answered on port ${port}, but its answer could not be tied to PID ${pid}: ` +
+        `${missingCapability ?? "the port owner's identity could not be observed on both sides of the request"}. ` +
+        `Nothing was stopped — killing a process we cannot identify risks taking down the wrong ` +
+        `one. Restart ComfyUI from the launcher that owns it, or install the missing tool ` +
+        `(\`lsof\` on Linux) and try again.`,
     );
     err.identityAmbiguous = true;
     throw err;
