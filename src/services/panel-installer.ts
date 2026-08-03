@@ -22,9 +22,12 @@
 
 import { execFileSync } from "node:child_process";
 import {
+  closeSync,
   existsSync,
+  fsyncSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
   realpathSync,
@@ -522,7 +525,33 @@ export const defaultDeps: PanelInstallerDeps = {
   },
   rename: (from, to) => renameSync(from, to),
   removeDir: (p) => rmSync(p, { recursive: true, force: true }),
-  writeFile: (p, contents) => writeFileSync(p, contents, "utf-8"),
+  // DURABLE, because this is a crash-recovery record and a crash is exactly
+  // when it has to exist. A buffered write can be lost or reordered against the
+  // rename that immediately follows it, which would leave no canonical panel
+  // AND no record of where the backup went — the one outcome the journal is
+  // there to prevent. Write, fsync the file, then fsync the containing
+  // directory so the new entry itself is durable (a no-op on platforms that
+  // refuse it, which is not a failure).
+  writeFile: (p, contents) => {
+    const fd = openSync(p, "w");
+    try {
+      writeFileSync(fd, contents, "utf-8");
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    try {
+      const dirFd = openSync(dirname(p), "r");
+      try {
+        fsyncSync(dirFd);
+      } finally {
+        closeSync(dirFd);
+      }
+    } catch {
+      // Directory fsync is unsupported on some platforms (notably Windows).
+      // The file's own fsync still ordered it before the rename.
+    }
+  },
   readPin: () => getPanelPinState(),
   isReachable: async () => {
     try {
@@ -635,7 +664,7 @@ function pinnedBaseOf(deps: PanelInstallerDeps): string | undefined {
  * A dep set with no pinned generation was never frozen (a direct call with
  * injected deps), so there is nothing to compare and nothing to refuse.
  */
-function assertPinnedTarget(
+export function assertPinnedTarget(
   deps: PanelInstallerDeps,
   action: string,
   stage: string,

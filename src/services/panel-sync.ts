@@ -24,6 +24,7 @@
 //     copy) resolves to "don't touch it", never to "probably fine".
 
 import {
+  assertPinnedTarget,
   panelStatus,
   pinPanelBase,
   runPanelAction,
@@ -596,6 +597,12 @@ export async function performPanelSync(
             `not. `
           : ``;
 
+    // The action checked the frozen target before IT returned, but this
+    // function then does another awaited status read and publishes its own
+    // success — which the orchestrator pushes straight into the panel chat. A
+    // retarget in that last gap would announce a verified sync of tree A to a
+    // tab that now belongs to B. Re-assert before the claim leaves here.
+    assertPinnedTarget(pinnedDeps, "sync", "before reporting a completed sync");
     return {
       synced: true,
       decision: "sync",

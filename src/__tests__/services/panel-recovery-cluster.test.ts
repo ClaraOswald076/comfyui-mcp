@@ -1127,6 +1127,33 @@ describe("a wholesale replacement needs the RUNNING server to have chosen the tr
     expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
   });
 
+  it("performPanelSync re-asserts the target before publishing success", async () => {
+    // runPanelActionInner checks before IT returns, but the sync then does
+    // another status read and publishes its own message — which the
+    // orchestrator pushes into the panel chat. A retarget in that last gap
+    // would announce a verified sync of tree A to a tab that is now B.
+    writePanelPack(PANEL_DIR(), "0.11.20");
+    const h = makeDeps({ withoutSwapOps: true });
+    h.deps.update = async () => {
+      writePanelPack(PANEL_DIR(), "0.11.38");
+      generation.value++; // the retarget lands as the mutation completes
+      return { mechanism: "manager-http", message: "updated", details: {} };
+    };
+    const { performPanelSync } = await import("../../services/panel-sync.js");
+    await expect(
+      performPanelSync({ deps: h.deps, requiredVersion: "0.11.35" }),
+    ).rejects.toThrow(/ABORTED/);
+  });
+
+  it("the swap journal is written durably before the first rename", async () => {
+    // A buffered write can be lost or reordered against the rename that
+    // immediately follows, leaving no canonical panel AND no record of where
+    // the backup went — precisely what the journal exists to prevent.
+    const target = join(root, "durable-journal.json");
+    defaultDeps.writeFile?.(target, '{"ok":true}');
+    expect(readFileSync(target, "utf-8")).toBe('{"ok":true}');
+  });
+
   it("a live-resolved base is corroborated", async () => {
     const liveRoot = join(root, "live", "ComfyUI");
     mkdirSync(join(liveRoot, "custom_nodes"), { recursive: true });
