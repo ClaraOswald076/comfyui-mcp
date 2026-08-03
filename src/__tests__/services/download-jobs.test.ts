@@ -94,6 +94,14 @@ vi.mock("../../services/model-resolver.js", () => ({
     const base = String(url).split("/").pop() || "model.safetensors";
     return { targetDir: `/M/${s}`, filename: base, targetPath: `/M/${s}/${base}` };
   }),
+  // #369 post-landing verification. These tests have no filesystem/server, so the
+  // stub reports the honest "could not check" verdict and echoes the path back —
+  // the real verification semantics live in model-resolver.test.ts.
+  verifyLandedModel: vi.fn(async (targetPath: string) => ({
+    verifiedPath: targetPath,
+    liveVisible: "unknown" as const,
+    note: "no live server in this test",
+  })),
 }));
 
 import {
@@ -104,6 +112,7 @@ import {
   cancelDownloadJob,
   resetDownloadJobs,
   downloadIdFor,
+  describePlacement,
 } from "../../services/download-jobs.js";
 import { setProgressDir, PERSIST_OWNER } from "../../services/download-progress.js";
 import * as progressModule from "../../services/download-progress.js";
@@ -1376,6 +1385,132 @@ describe("download job registry", () => {
         setProgressDir("");
         await fsRm(dir, { recursive: true, force: true });
       }
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // describePlacement — the ONE policy every tool renders a finished job with.
+  // Exactly one state licenses "success" (#369).
+  // -------------------------------------------------------------------------
+  describe("describePlacement (#369)", () => {
+    const base = {
+      id: "j",
+      trayId: "t",
+      url: "https://example.com/m.safetensors",
+      target_subfolder: "checkpoints",
+      status: "done" as const,
+      path: "/m/checkpoints/m.safetensors",
+      started_at: 0,
+    };
+
+    it("confirms a file the connected ComfyUI listed, when the reader re-establishes the root", () => {
+      const r = describePlacement(
+        { ...base, live_visible: "visible", verified_root: "C:/A/models" },
+        { liveModelsDir: "C:/A/models" },
+      );
+      expect(r.confirmed).toBe(true);
+      expect(r.wrongPlace).toBe(false);
+      expect(r.warning).toBeUndefined();
+    });
+
+    it("treats an ABSENT verdict (pre-fix persisted record) as unconfirmed, never success", () => {
+      const r = describePlacement(base);
+      expect(r.confirmed).toBe(false);
+      expect(r.wrongPlace).toBe(false);
+      expect(r.warning).toMatch(/NOT been confirmed yet/);
+    });
+
+    it("treats a PENDING verdict as unconfirmed", () => {
+      const r = describePlacement({ ...base, live_visible: "pending" });
+      expect(r.confirmed).toBe(false);
+      expect(r.warning).toMatch(/NOT been confirmed yet/);
+    });
+
+    it("flags a NOT-VISIBLE verdict as the wrong place and surfaces its note", () => {
+      const r = describePlacement({
+        ...base,
+        live_visible: "not-visible",
+        verify_note: "the running server reads elsewhere",
+      });
+      expect(r.confirmed).toBe(false);
+      expect(r.wrongPlace).toBe(true);
+      expect(r.warning).toMatch(/NOT VISIBLE/);
+      expect(r.warning).toMatch(/reads elsewhere/);
+    });
+
+    it("downgrades a VISIBLE verdict made against a DIFFERENT server (codex gate r11)", () => {
+      // Server A verified the file; B replaced it on the same endpoint and reads
+      // another tree. A reconnect must not re-assert A's confirmation as current.
+      const r = describePlacement(
+        { ...base, live_visible: "visible", verified_root: "C:/A/models" },
+        { liveModelsDir: "D:/B/models" },
+      );
+      expect(r.confirmed).toBe(false);
+      expect(r.pathLabel).not.toBe("landed at");
+      expect(r.warning).toMatch(/DIFFERENT install/);
+    });
+
+    it("downgrades a VISIBLE verdict that carries NO root once one is knowable (codex gate r16)", () => {
+      // The verdict was made against a base-anchored destination (nothing
+      // authoritative to stamp). The connected server now reports a real root — the
+      // old confirmation was about a different server and cannot be re-asserted.
+      const r = describePlacement(
+        { ...base, live_visible: "visible" },
+        { liveModelsDir: "D:/B/models" },
+      );
+      expect(r.confirmed).toBe(false);
+      expect(r.pathLabel).not.toBe("landed at");
+      expect(r.warning).toMatch(/cannot be re-asserted/);
+    });
+
+    it("keeps a VISIBLE verdict when the connected server still reads the same root", () => {
+      const r = describePlacement(
+        { ...base, live_visible: "visible", verified_root: "C:/A/models" },
+        { liveModelsDir: "C:/A/models" },
+      );
+      expect(r.confirmed).toBe(true);
+    });
+
+    it("treats differently-spelled Windows roots as the SAME install (codex gate r17)", () => {
+      // A false "DIFFERENT install" downgrade of a correct verdict is as harmful as
+      // a missed one: Windows paths are case-insensitive and mix separators.
+      const r = describePlacement(
+        { ...base, live_visible: "visible", verified_root: "C:\\ComfyUI\\models" },
+        { liveModelsDir: "c:/comfyui/models" },
+      );
+      expect(r.confirmed).toBe(process.platform === "win32");
+    });
+
+    it("does NOT re-assert a VISIBLE verdict with NO current observation (codex gate r18)", () => {
+      // The probe transiently failed, so nothing verified that the server answering
+      // NOW can read this file. A MISSING observation is "cannot confirm", never
+      // "no contradiction" — the inversion that let a replaced server render as
+      // success. Only a reader that re-establishes the verdict may confirm it.
+      const r = describePlacement(
+        { ...base, live_visible: "visible", verified_root: "C:/A/models" },
+        {},
+      );
+      expect(r.confirmed).toBe(false);
+      expect(r.pathLabel).not.toBe("landed at");
+      expect(r.warning).toMatch(/could not be asked just now/);
+    });
+
+    it("never claims 'verified on disk' when the post-landing stat failed (codex gate r9)", () => {
+      const r = describePlacement({
+        ...base,
+        live_visible: "unknown",
+        disk_verified: false,
+        verify_note: "the file could not be confirmed on disk",
+      });
+      expect(r.confirmed).toBe(false);
+      expect(r.pathQualifier).not.toContain("verified on disk");
+      expect(r.pathQualifier).toContain("NOT found on disk");
+    });
+
+    it("never confirms a Manager dispatch, even if a verdict got attached", () => {
+      const r = describePlacement({ ...base, viaManager: true, live_visible: "visible" });
+      expect(r.confirmed).toBe(false);
+      expect(r.warning).toMatch(/NOT verified as landed/);
     });
   });
 });

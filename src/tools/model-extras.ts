@@ -6,9 +6,10 @@ import { isLocalMode, config } from "../config.js";
 import { logger } from "../utils/logger.js";
 import {
   resolveExistingModelFile,
+  currentLiveModelsRoot,
   MODEL_SUBDIRS,
 } from "../services/model-resolver.js";
-import { startDownloadJob } from "../services/download-jobs.js";
+import { startDownloadJob, describePlacement } from "../services/download-jobs.js";
 
 /** Mirrors download_model's grace window — see download-jobs.ts. CivitAI
  *  checkpoints are routinely multi-GB, so this is the path that actually
@@ -514,16 +515,35 @@ export function registerModelExtrasTools(server: McpServer): void {
         }
 
         const savedPath = job.path!;
+        // ONE placement policy shared with download_model / download_status (#369):
+        // "downloaded successfully" is licensed ONLY by a placement the connected
+        // ComfyUI actually confirmed. Anything else is reported with its caveat.
+        const placement = describePlacement(job, {
+          liveModelsDir: await currentLiveModelsRoot(),
+        });
         const lines = job.viaManager
           ? [
               "CivitAI model DISPATCHED to the remote ComfyUI via ComfyUI-Manager (server-side fetch):",
               `  ${savedPath}`,
-              "  NOTE: the dispatch was ACCEPTED, NOT verified as landed — ComfyUI-Manager reports its queue task 'done' even on failure. Confirm with list_local_models before relying on it.",
+              `  NOTE: ${placement.warning}`,
             ]
-          : [
-              "CivitAI model downloaded successfully:",
-              `  ${savedPath}`,
-            ];
+          : placement.confirmed
+            ? [
+                `CivitAI model downloaded successfully${placement.pathQualifier}:`,
+                `  ${savedPath}`,
+              ]
+            : placement.wrongPlace
+              ? [
+                  "CivitAI download finished, but the model is NOT usable by the connected ComfyUI.",
+                  `  ${placement.pathLabel}${placement.pathQualifier}: ${savedPath}`,
+                  `  ${placement.warning}`,
+                  "  Do NOT tell the user the model is ready — it is not visible to the server that would load it.",
+                ]
+              : [
+                  `CivitAI model ${placement.pathLabel}${placement.pathQualifier}:`,
+                  `  ${savedPath}`,
+                  `  NOTE: ${placement.warning}`,
+                ];
         if (resolved.modelName) lines.push(`  Model: ${resolved.modelName}`);
         lines.push(`  Version id: ${resolved.versionId}`);
         lines.push(...(job.notes ?? []));

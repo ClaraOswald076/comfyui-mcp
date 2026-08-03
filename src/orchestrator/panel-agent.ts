@@ -458,13 +458,20 @@ export class PanelAgent {
       const done = dl.filter((d) => d.status === "done").map((d) => d.name);
       const failed = dl.filter((d) => d.status !== "done").map((d) => d.name);
       const parts: string[] = [];
-      if (done.length) parts.push(`finished: ${done.join(", ")}`);
+      // This event is raised by the TRANSFER, which finishes BEFORE the placement
+      // check against the connected ComfyUI does. Saying "finished" here would be a
+      // bare success claim during that window (#369) — a model can land in an
+      // install the running server never reads — so the wording says only what the
+      // event actually proves and points at download_status for the verdict.
+      if (done.length) parts.push(`transfer completed: ${done.join(", ")}`);
       if (failed.length) parts.push(`FAILED: ${failed.join(", ")}`);
       const plural = dl.length > 1 ? "these downloads" : "it";
       text =
         `[panel event] Model download ${parts.join("; ")}. ` +
-        `If you were waiting on ${plural} to continue a task, proceed now — ` +
-        `call download_status for the exact landed path(s)${failed.length ? " or the error detail" : ""}. ` +
+        `The bytes finished transferring; whether the connected ComfyUI can actually LOAD ` +
+        `${plural} is confirmed separately. If you were waiting on ${plural} to continue a task, ` +
+        `call download_status FIRST for the verified path and placement verdict${failed.length ? " or the error detail" : ""} — ` +
+        `do not tell the user a model is ready until download_status confirms it. ` +
         `Otherwise reply with ONE short sentence acknowledging it and no tool calls.`;
     }
     if (!text) return;

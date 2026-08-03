@@ -26,6 +26,13 @@ vi.mock("../../comfyui/client.js", () => ({
 // liveRootFromArgv is the REAL implementation (pure argv parsing) so the live-first
 // resolution (#490/#463) is exercised end to end, not stubbed away.
 let savedDefaultWorkspace: string | undefined;
+// #369: the models dir is now resolved through the ONE canonical live-root resolver
+// (argv first, then the OS-observed live process). Back it with the REAL argv parsing
+// plus a CONTROLLABLE observed-process anchor and base-entrypoint probe, so the
+// live-vs-stale selection is exercised end to end without a unit test shelling out to
+// the OS process table.
+let observedLiveRoot: string | undefined;
+let baseHasEntrypoint = false;
 vi.mock("../../services/workspace-env.js", async () => {
   const actual = await vi.importActual<
     typeof import("../../services/workspace-env.js")
@@ -33,6 +40,21 @@ vi.mock("../../services/workspace-env.js", async () => {
   return {
     resolveEffectiveComfyUIBase: () => config.comfyuiPath ?? savedDefaultWorkspace,
     liveRootFromArgv: actual.liveRootFromArgv,
+    hasComfyUIEntrypoint: () => baseHasEntrypoint,
+    resolveLiveServerRoot: (argv?: string[], cwd?: string) => {
+      const relDir = actual.liveRelDirFromArgv(argv);
+      const fromArgv = actual.liveRootFromArgv(argv, cwd);
+      if (fromArgv) return { root: fromArgv, source: "argv", relDir };
+      if (observedLiveRoot) {
+        return {
+          root: observedLiveRoot,
+          source: "observed-process",
+          relDir,
+          observedPython: resolve("/live/python_embeded/python.exe"),
+        };
+      }
+      return { source: "unresolved", relDir };
+    },
   };
 });
 
@@ -59,6 +81,8 @@ beforeEach(() => {
   savedDefaultWorkspace = undefined;
   remoteMode = false;
   liveRootExists = true;
+  observedLiveRoot = undefined;
+  baseHasEntrypoint = false;
 });
 
 afterEach(() => {
@@ -258,6 +282,79 @@ describe("models dir + extra-config argv parsing (#345/#346/#369)", () => {
   it("resolveModelsDir falls back to <COMFYUI_PATH>/models when unreachable", async () => {
     getSystemStats.mockRejectedValue(new Error("ECONNREFUSED"));
     expect(await resolveModelsDir()).toBe(resolve("/comfy", "models"));
+  });
+
+  // -------------------------------------------------------------------------
+  // #369 — a RELATIVE argv `main.py` with no server cwd (ComfyUI Desktop and the
+  // Windows portable bundle both report exactly this). argv alone cannot resolve
+  // the live root, and falling through to COMFYUI_PATH is what wrote 4.88 GB into
+  // a second, stale install and then reported it as a success.
+  // -------------------------------------------------------------------------
+  describe("#369 relative argv main.py with no server cwd", () => {
+    const RELATIVE_ARGV = [join("ComfyUI", "main.py"), "--windows-standalone-build"];
+
+    it("the LIVE server wins over a disagreeing COMFYUI_PATH when the OS observes the process", async () => {
+      const liveRoot = resolve("/portable2/ComfyUI");
+      (config as { comfyuiPath?: string }).comfyuiPath = resolve("/Documents/ComfyUI");
+      observedLiveRoot = liveRoot; // process table identified the running ComfyUI
+      getSystemStats.mockResolvedValue({ system: { argv: RELATIVE_ARGV } });
+
+      const { modelsDir, source } = await resolveModelsDirWithBases();
+      expect(modelsDir).toBe(join(liveRoot, "models"));
+      expect(source).toBe("observed-root");
+      // The exact stale destination from the reopened report.
+      expect(modelsDir).not.toBe(join(resolve("/Documents/ComfyUI"), "models"));
+    });
+
+    it("REFUSES when the live root is unpinnable and COMFYUI_PATH is a different install", async () => {
+      (config as { comfyuiPath?: string }).comfyuiPath = resolve("/Documents/ComfyUI");
+      observedLiveRoot = undefined; // process table told us nothing
+      baseHasEntrypoint = false; // <COMFYUI_PATH>/ComfyUI/main.py does not exist
+      getSystemStats.mockResolvedValue({ system: { argv: RELATIVE_ARGV } });
+
+      // The refusal must NAME each thing it could not determine, not just fail.
+      await expect(resolveModelsDirWithBases()).rejects.toThrow(
+        /could not be determined/i,
+      );
+      const err = await resolveModelsDirWithBases().catch((e: Error) => e);
+      const msg = (err as Error).message;
+      expect(msg).toMatch(/RELATIVE path/);
+      expect(msg).toMatch(/did NOT report a working directory/);
+      expect(msg).toMatch(/OS process table/);
+      expect(msg).toMatch(/DIFFERENT install/);
+      expect(msg).toMatch(/Refusing to write to a guessed directory/);
+    });
+
+    it("accepts the configured base only when it CORROBORATES the reported main.py", async () => {
+      (config as { comfyuiPath?: string }).comfyuiPath = resolve("/bundle");
+      observedLiveRoot = undefined;
+      baseHasEntrypoint = true; // <base>/ComfyUI/main.py really exists
+      getSystemStats.mockResolvedValue({ system: { argv: RELATIVE_ARGV } });
+
+      const { modelsDir, source } = await resolveModelsDirWithBases();
+      expect(modelsDir).toBe(join(resolve("/bundle"), "ComfyUI", "models"));
+      expect(source).toBe("base-anchored");
+    });
+
+    it("an UNREACHABLE server still falls back to <COMFYUI_PATH>/models (no regression)", async () => {
+      (config as { comfyuiPath?: string }).comfyuiPath = resolve("/Documents/ComfyUI");
+      getSystemStats.mockRejectedValue(new Error("ECONNREFUSED"));
+
+      const { modelsDir, source } = await resolveModelsDirWithBases();
+      expect(modelsDir).toBe(join(resolve("/Documents/ComfyUI"), "models"));
+      expect(source).toBe("configured-base");
+    });
+
+    it("a reachable server whose argv names NO main.py keeps the old fallback", async () => {
+      // `python -m comfyui` — nothing relative was claimed, so there is no live root
+      // to contradict COMFYUI_PATH and no reason to start refusing.
+      (config as { comfyuiPath?: string }).comfyuiPath = resolve("/comfy");
+      getSystemStats.mockResolvedValue({ system: { argv: ["--listen"] } });
+
+      const { modelsDir, source } = await resolveModelsDirWithBases();
+      expect(modelsDir).toBe(join(resolve("/comfy"), "models"));
+      expect(source).toBe("configured-base");
+    });
   });
 
   it("resolveModelsDir prefers the LIVE server's own main.py root over a stale COMFYUI_PATH when no --base-directory flag (#490)", async () => {

@@ -516,6 +516,19 @@ export interface PersistedDownloadJob {
    *  check can distinguish them. Absent on pre-fix records. */
   owner?: string;
   resume?: unknown;
+  /** Post-landing live-server verification (#369): whether the CONNECTED ComfyUI
+   *  actually lists the landed file, so a reconnecting session still sees the
+   *  "downloaded but invisible to the running server" warning instead of a bare
+   *  "done". Absent on pre-fix records. */
+  live_visible?: "visible" | "not-visible" | "unknown" | "pending";
+  /** The verification explanation, surfaced verbatim by download_status. */
+  verify_note?: string;
+  /** Whether the post-landing on-disk stat succeeded. False = the file was NOT
+   *  found when checked, so no renderer may claim "verified on disk". */
+  disk_verified?: boolean;
+  /** The live models root the placement verdict was made against, so a reconnect can
+   *  tell a still-current verdict from one made against a DIFFERENT server. */
+  verified_root?: string;
   /** Epoch ms of this snapshot (set on write). */
   updated: number;
   /**

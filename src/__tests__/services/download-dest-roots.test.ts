@@ -78,6 +78,21 @@ vi.mock("../../services/workspace-env.js", async () => {
     resolveEffectiveComfyUIBase: () =>
       h.config.comfyuiPath ?? (h.isRemoteMode ? undefined : h.config.comfyuiPath),
     liveRootFromArgv: actual.liveRootFromArgv,
+    // #369: the models dir resolves through the ONE canonical live-root resolver.
+    // These tests are about the destination GUARD, not about process observation,
+    // so back it with the real argv parsing only (no OS process-table probe). The
+    // configured base IS the live install here (it holds the `main.py` the server
+    // reported), so the corroborated base-anchored fallback applies — the guard
+    // scenarios below are unchanged by #369's refusal path.
+    hasComfyUIEntrypoint: () => true,
+    resolveLiveServerRoot: (argv?: string[], cwd?: string) => {
+      const root = actual.liveRootFromArgv(argv, cwd);
+      return {
+        root,
+        source: root ? "argv" : "unresolved",
+        relDir: actual.liveRelDirFromArgv(argv),
+      };
+    },
   };
 });
 
