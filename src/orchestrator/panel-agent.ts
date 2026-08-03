@@ -499,6 +499,7 @@ export class PanelAgent {
       prompt_id?: string;
       run_correlation?: "matched" | "foreign" | "unidentified";
       replayed?: boolean;
+      dropped_completions?: number;
     },
     opts?: { eventToken?: string },
   ): boolean {
@@ -523,6 +524,11 @@ export class PanelAgent {
         // agent reads it as "this landed late", not as a second render.
         (ev.replayed
           ? `(RE-DELIVERED — this completion could not be handed to you when it arrived.) `
+          : ``) +
+        // An eviction dropped older completions for this tab — say so rather than
+        // let them disappear (#468). The agent must treat those runs as unknown.
+        (typeof ev.dropped_completions === "number" && ev.dropped_completions > 0
+          ? `⚠️ ${ev.dropped_completions} EARLIER completion(s) for this tab could not be delivered and were dropped — treat the outcome of those runs as UNDETERMINED and check get_history if you were waiting on one. `
           : ``) +
         runIdentityPreamble(ev) +
         (note
@@ -1796,6 +1802,7 @@ export class PanelAgentManager {
       prompt_id?: string;
       run_correlation?: "matched" | "foreign" | "unidentified";
       replayed?: boolean;
+      dropped_completions?: number;
     },
     opts?: { eventToken?: string },
   ): boolean {
@@ -2131,6 +2138,20 @@ export class PanelAgentManager {
     return { model: this.modelFor(tabId), effort: this.effortFor(tabId), restarted, deferred };
   }
 
+  /** Hand back every run-completion token sitting in a key's HELD mail (#468), so
+   *  discarding that mail can never strand a completion in the journal's
+   *  handed-off state (which `deliverPending` skips). Safe to call before any
+   *  heldMessages drop; a no-op when there is none. */
+  private releaseHeldTokens(key: string): void {
+    const tokens = (this.heldMessages.get(key) ?? []).flatMap((it) => it.eventTokens ?? []);
+    if (!tokens.length) return;
+    try {
+      this.opts.onEventUndelivered?.(key, tokens);
+    } catch (err) {
+      logger.warn(`[panel-orchestrator] tab ${key.slice(0, 8)} releasing held completion tokens: ${msgOf(err)}`);
+    }
+  }
+
   /** Forget a tab's agent so the next message starts a brand-new session. The
    *  map mutation is synchronous and the old agent is stopped fire-and-forget,
    *  so the caller (e.g. resume_session) can set a new pendingResume right after
@@ -2146,7 +2167,12 @@ export class PanelAgentManager {
     this.opts.sessionStore?.clear(tabId);
     this.pendingEffortRestart.delete(tabId); // a reset supersedes any deferred restart
     this.pendingMcpRestart.delete(tabId);
-    this.heldMessages.delete(tabId); // a reset is an explicit fresh start — drop held mail
+    // A reset is an explicit fresh start — drop held mail. But a run completion
+    // riding in that mail is NEWS, not conversation, and its journal entry is
+    // still marked handed-off; hand its tokens back or the completion would be
+    // stranded in a state nothing ever flushes again (#468).
+    this.releaseHeldTokens(tabId);
+    this.heldMessages.delete(tabId);
     // Drop this key's picker override so a provider switch (which reset()s the old
     // key) can't carry the old provider's model/effort into the new backend's spawn.
     this.modelByKey.delete(tabId);

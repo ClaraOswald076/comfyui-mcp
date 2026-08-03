@@ -2787,11 +2787,6 @@ export async function runPanelOrchestrator(): Promise<void> {
           // have a LIVE agent (a provider switch retires the others), so at most one rebind is a
           // live-agent move; the rest are durable-only.
           let destinationCollision = false;
-          // #468 — PROVEN same workflow, new tab id: the journal is keyed by
-          // panel tab, so one move re-addresses every undelivered completion for
-          // every provider. Re-addressing only — never broadening: entries for
-          // other tabs are untouched, and their frozen correlation is unchanged.
-          RunCompletions.moveKey(migratedFrom, panelTab);
           for (const b of KNOWN_BACKENDS) {
             const srcKey = migratedFrom + AGENT_KEY_SEP + b;
             const newKey = panelTab + AGENT_KEY_SEP + b;
@@ -2836,6 +2831,20 @@ export async function runPanelOrchestrator(): Promise<void> {
           // panelTab; the incoming source's in-flight work is under migratedFrom (its canonical id
           // at send time) and is untouched, so the proven migration's own continuity is preserved.
           if (destinationCollision) bridge.dropQueuedDeliveries(panelTab);
+          // #468 — same ordering for the run-completion journal, and for the same
+          // reason. FIRST forget the superseded destination's completions + run
+          // tickets (its conversation is a lost resume; delivering its renders to
+          // the incoming tab would be exactly the cross-run misattribution the
+          // journal exists to prevent), THEN re-address the incoming tab's own
+          // ones onto the new id. The order matters: moveKey first would make the
+          // migrated entries indistinguishable from the destination's and forget
+          // would take both.
+          if (destinationCollision) RunCompletions.forget(panelTab);
+          RunCompletions.moveKey(migratedFrom, panelTab);
+          // rebindAgent MOVES the agent rather than spawning one, so onAgentReady
+          // never fires for the new id — flush explicitly or the re-addressed
+          // entries would sit pending until some unrelated later trigger.
+          flushRunCompletions(panelTab);
           // #570 — carry the PROVEN source identity forward as the tab's prior identity. The
           // rebound agent belongs to it (prevIdentity === newIdentity by sameWorkflow), but the
           // new tab id has no prior identity and the agent may have no durable record yet

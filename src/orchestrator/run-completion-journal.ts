@@ -107,8 +107,11 @@ export interface JournalEntry {
 /** Runs tracked at once. Ample for any real batch; bounded so a long session
  *  can't grow the map without limit. */
 const MAX_TICKETS = 64;
-/** Undelivered completions held per agent key. */
-const MAX_ENTRIES_PER_KEY = 16;
+/** Undelivered completions held per panel tab. */
+const MAX_ENTRIES_PER_KEY = 32;
+/** Undelivered completions held across ALL tabs — a global ceiling so a session
+ *  that opens and abandons many tabs can't grow the journal without limit. */
+const MAX_ENTRIES_TOTAL = 96;
 
 export class RunCompletionJournalImpl {
   /** prompt id → ticket. Keyed globally: ComfyUI prompt ids are UUIDs, so an
@@ -145,14 +148,23 @@ export class RunCompletionJournalImpl {
     return true;
   }
 
-  /** Classify a completion against the open runs. EXACT prompt-id equality only:
-   *  there is deliberately no "the newest outstanding run" fallback, because
-   *  attributing a completion to the wrong run is worse than not attributing it
-   *  at all. */
-  correlate(payload: CompletionPayload): RunCorrelation {
+  /**
+   * Classify a completion that arrived for panel tab `key` against the open runs.
+   *
+   * TWO conditions, both required: EXACT prompt-id equality AND the ticket must
+   * belong to THIS panel tab. There is deliberately no "the newest outstanding
+   * run" fallback and no cross-tab match, because attributing a completion to
+   * the wrong run — or to a different workflow's agent — is worse than not
+   * attributing it at all. A run whose ticket belongs to another tab reads as
+   * `foreign`, i.e. UNDETERMINED, which is the honest answer.
+   */
+  correlate(key: string, payload: CompletionPayload): RunCorrelation {
     const pid = typeof payload.prompt_id === "string" ? payload.prompt_id.trim() : "";
     if (!pid) return { status: "unidentified" };
-    return this.tickets.has(pid) ? { status: "matched", promptId: pid } : { status: "foreign", promptId: pid };
+    const ticket = this.tickets.get(pid);
+    return ticket && ticket.tabId === key
+      ? { status: "matched", promptId: pid }
+      : { status: "foreign", promptId: pid };
   }
 
   /**
@@ -165,7 +177,7 @@ export class RunCompletionJournalImpl {
    * entry (bounded by MAX_ENTRIES_PER_KEY).
    */
   record(key: string, payload: CompletionPayload): JournalEntry {
-    const correlation = this.correlate(payload);
+    const correlation = this.correlate(key, payload);
     if (correlation.status !== "unidentified") {
       for (const entry of this.entries.values()) {
         if (
@@ -173,10 +185,13 @@ export class RunCompletionJournalImpl {
           entry.correlation.status !== "unidentified" &&
           entry.correlation.promptId === correlation.promptId
         ) {
+          // Freshen the payload, but do NOT re-open a hand-off. The copy already
+          // sitting in an agent's queue cannot be recalled, so re-arming here
+          // would deliver the same completion twice (and the first ack would
+          // then drop the entry, leaving the second delivery untracked). If the
+          // hand-off fails, the release path re-arms it — that is the only way
+          // back to `pending`.
           entry.payload = payload;
-          // Re-open it for delivery: a re-send is the panel telling us the
-          // outcome again, and the previous hand-off is not proven consumed.
-          if (entry.state === "handed_off") entry.state = "pending";
           return entry;
         }
       }
@@ -194,6 +209,10 @@ export class RunCompletionJournalImpl {
     this.trimEntries(key);
     return entry;
   }
+
+  /** Completions this tab lost to an eviction and has not yet been told about.
+   *  Surfaced on the next delivery so a dropped completion is never silent. */
+  private dropped = new Map<string, number>();
 
   /** Entries awaiting a delivery attempt for this key, in arrival order. */
   pending(key: string): JournalEntry[] {
@@ -223,6 +242,10 @@ export class RunCompletionJournalImpl {
   ): { delivered: number; blockedOn: JournalEntry | null } {
     let delivered = 0;
     for (const entry of this.pending(key)) {
+      // Any completion this tab lost to an eviction rides out on the next one
+      // that DOES get through, so an evicted completion is reported rather than
+      // silently forgotten.
+      const lost = this.dropped.get(key) ?? 0;
       const payload: CompletionPayload = {
         ...entry.payload,
         run_correlation: entry.correlation.status,
@@ -232,10 +255,12 @@ export class RunCompletionJournalImpl {
         // Second and later attempts ARE re-deliveries — say so, so the agent
         // reads a replay as "this landed late", not as another render.
         ...(entry.attempts > 0 ? { replayed: true } : {}),
+        ...(lost > 0 ? { dropped_completions: lost } : {}),
       };
       const handedOff = inject(payload, entry.token);
       this.noteAttempt(entry.token, handedOff);
       if (!handedOff) return { delivered, blockedOn: entry };
+      if (lost > 0) this.dropped.delete(key);
       delivered += 1;
     }
     return { delivered, blockedOn: null };
@@ -275,18 +300,32 @@ export class RunCompletionJournalImpl {
     entry.state = "pending";
   }
 
-  /** Move every entry addressed to `from` onto `to` — a panel tab-id migration
-   *  re-keys the agent, and its undelivered completions must move WITH it. This
-   *  re-addresses, it never broadens: entries for other keys are untouched. */
+  /** Move every entry AND every open run ticket from `from` onto `to` — a panel
+   *  tab-id migration re-keys the agent, and both must move WITH it or a later
+   *  completion for a run queued under the old id reads as foreign. This
+   *  re-addresses, it never broadens: other tabs' state is untouched. */
   moveKey(from: string, to: string): void {
     if (from === to) return;
     for (const entry of this.entries.values()) {
       if (entry.key === from) entry.key = to;
     }
+    for (const ticket of this.tickets.values()) {
+      if (ticket.tabId === from) ticket.tabId = to;
+    }
   }
 
-  /** Drop everything addressed to a key that will never come back (tab closed).
-   *  Logs any completion that dies unacked — a loss must never be silent. */
+  /**
+   * Drop everything belonging to a tab that will never come back — a closed tab,
+   * or the workflow being switched AWAY from.
+   *
+   * Tickets go too, not just entries: a run queued under the old workflow that
+   * finishes AFTER the switch would otherwise still `correlate` as matched (the
+   * ticket map is global) and be delivered to the NEW workflow's agent as "the
+   * run YOU queued". Forgetting the ticket makes that completion read as
+   * foreign — i.e. UNDETERMINED — which is the honest answer.
+   *
+   * Logs every completion that dies unacked; a loss must never be silent.
+   */
   forget(key: string): void {
     for (const [token, entry] of [...this.entries]) {
       if (entry.key !== key) continue;
@@ -295,6 +334,10 @@ export class RunCompletionJournalImpl {
         `[run-completions] dropping an undelivered completion for ${describe(entry.correlation)} — its tab (${key.slice(0, 8)}) is gone`,
       );
     }
+    for (const [pid, ticket] of [...this.tickets]) {
+      if (ticket.tabId === key) this.tickets.delete(pid);
+    }
+    this.dropped.delete(key);
   }
 
   /** Test/diagnostic helpers. */
@@ -304,7 +347,11 @@ export class RunCompletionJournalImpl {
   reset(): void {
     this.tickets.clear();
     this.entries.clear();
+    this.dropped.clear();
     this.seq = 0;
+  }
+  droppedFor(key: string): number {
+    return this.dropped.get(key) ?? 0;
   }
 
   private trimTickets(): void {
@@ -325,16 +372,43 @@ export class RunCompletionJournalImpl {
     }
   }
 
+  /**
+   * Enforce the per-tab and global ceilings.
+   *
+   * EVICTION ORDER matters: an entry already HANDED OFF is sitting in a live
+   * agent's queue and will most likely be read, so it is the cheapest thing to
+   * forget; a still-PENDING entry has reached nobody, so evicting one is a real
+   * loss. Pending entries are therefore evicted last, logged at ERROR, and
+   * COUNTED — the count rides out on the next completion that does get through
+   * (`dropped_completions`), so the agent is told those runs are undetermined
+   * instead of the loss being silent.
+   */
   private trimEntries(key: string): void {
-    const mine = [...this.entries.values()].filter((e) => e.key === key);
-    while (mine.length > MAX_ENTRIES_PER_KEY) {
-      const victim = mine.shift();
-      if (!victim) return;
-      this.entries.delete(victim.token);
-      logger.error(
-        `[run-completions] journal for tab ${key.slice(0, 8)} exceeded ${MAX_ENTRIES_PER_KEY} undelivered completions — dropped the oldest (${describe(victim.correlation)})`,
-      );
-    }
+    const evict = (scope: (e: JournalEntry) => boolean, limit: number, label: string): void => {
+      let mine = [...this.entries.values()].filter(scope);
+      while (mine.length > limit) {
+        const victim =
+          mine.find((e) => e.state === "handed_off") ?? mine[0];
+        this.entries.delete(victim.token);
+        mine = mine.filter((e) => e !== victim);
+        if (victim.state === "pending") {
+          this.dropped.set(victim.key, (this.dropped.get(victim.key) ?? 0) + 1);
+          logger.error(
+            `[run-completions] ${label} — dropped an UNDELIVERED completion for ${describe(victim.correlation)}; the next delivery will report it as undetermined`,
+          );
+        } else {
+          logger.warn(
+            `[run-completions] ${label} — forgot an already-handed-off completion for ${describe(victim.correlation)}`,
+          );
+        }
+      }
+    };
+    evict(
+      (e) => e.key === key,
+      MAX_ENTRIES_PER_KEY,
+      `journal for tab ${key.slice(0, 8)} exceeded ${MAX_ENTRIES_PER_KEY} undelivered completions`,
+    );
+    evict(() => true, MAX_ENTRIES_TOTAL, `journal exceeded ${MAX_ENTRIES_TOTAL} undelivered completions overall`);
   }
 }
 

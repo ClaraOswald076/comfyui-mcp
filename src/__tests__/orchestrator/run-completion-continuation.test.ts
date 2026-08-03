@@ -247,6 +247,42 @@ describe("run completion across automatic goal continuation (#468)", () => {
     expect(journal.ticketFor(PROMPT_A)?.settled).toBe(false); // our run is still open
   });
 
+  it("a completion parked in HELD mail survives a reset that discards that mail", async () => {
+    // A failed start parks the agent's whole queue — including an injected
+    // completion — in heldMessages. `reset()` (New chat / resume_session) throws
+    // that mail away; the completion must come BACK to the journal, not be left
+    // stranded in a hand-off state nothing ever flushes again.
+    const doomed: AgentBackend = {
+      id: "claude" as const,
+      capabilities: CLAUDE_CAPABILITIES,
+      async prepare() {
+        throw new Error("endpoint rejected the key (http 401)");
+      },
+      // eslint-disable-next-line require-yield
+      async *run(): AsyncGenerator<AgentEvent> {
+        throw new Error("never runs");
+      },
+      async interrupt() {},
+      async listModels() {
+        return [];
+      },
+    };
+    const { journal, manager, arrive } = makeHarness(doomed);
+    const tab = "tab-heldmail";
+
+    journal.openRun(PROMPT_A, { tabId: tab });
+    manager.send(tab, "go"); // spawns an agent whose prepare() rejects
+    arrive(tab, { kind: "executed", prompt_id: PROMPT_A, images: [{ filename: "held.png" }] });
+    // Taken onto the doomed agent's queue…
+    await waitFor(() => journal.pending(tab).length === 0);
+    // …then parked in held mail when the start failed.
+    await waitFor(() => manager.hasHeldMail(tab));
+
+    manager.reset(tab); // New chat — held mail is discarded
+    expect(journal.pending(tab)).toHaveLength(1); // handed back, replayable
+    expect(journal.outstanding(tab)).toHaveLength(1);
+  });
+
   it("a replayed completion never satisfies a DIFFERENT run", async () => {
     const backend = new ContinuationBackend();
     const { journal, manager, arrive } = makeHarness(backend);
@@ -283,17 +319,68 @@ describe("run completion journal correlation (#468)", () => {
 
   it("correlates ONLY by exact prompt id — there is no most-recent-run fallback", () => {
     journal.openRun(PROMPT_A, { tabId: "t" });
-    expect(journal.correlate({ prompt_id: PROMPT_A })).toEqual({
+    expect(journal.correlate("t", { prompt_id: PROMPT_A })).toEqual({
       status: "matched",
       promptId: PROMPT_A,
     });
-    expect(journal.correlate({ prompt_id: PROMPT_B })).toEqual({
+    expect(journal.correlate("t", { prompt_id: PROMPT_B })).toEqual({
       status: "foreign",
       promptId: PROMPT_B,
     });
-    expect(journal.correlate({})).toEqual({ status: "unidentified" });
+    expect(journal.correlate("t", {})).toEqual({ status: "unidentified" });
     // A near-miss id is foreign, never "close enough".
-    expect(journal.correlate({ prompt_id: `${PROMPT_A}x` }).status).toBe("foreign");
+    expect(journal.correlate("t", { prompt_id: `${PROMPT_A}x` }).status).toBe("foreign");
+  });
+
+  it("a run queued on ANOTHER tab never matches — cross-tab is foreign, not matched", () => {
+    journal.openRun(PROMPT_A, { tabId: "wf:one" });
+    expect(journal.correlate("wf:one", { prompt_id: PROMPT_A }).status).toBe("matched");
+    // The same run finishing after the browser tab switched to a different
+    // workflow must NOT be presented to the new workflow's agent as its own.
+    expect(journal.correlate("wf:two", { prompt_id: PROMPT_A }).status).toBe("foreign");
+  });
+
+  it("forget drops the tab's RUN TICKETS too, so a late completion reads as undetermined", () => {
+    journal.openRun(PROMPT_A, { tabId: "wf:one" });
+    journal.forget("wf:one");
+    expect(journal.ticketFor(PROMPT_A)).toBeUndefined();
+    expect(journal.correlate("wf:one", { prompt_id: PROMPT_A }).status).toBe("foreign");
+  });
+
+  it("moveKey carries the run tickets, so a migrated tab's own run still matches", () => {
+    journal.openRun(PROMPT_A, { tabId: "tmp:draft" });
+    journal.moveKey("tmp:draft", "wf:saved.json");
+    expect(journal.correlate("wf:saved.json", { prompt_id: PROMPT_A }).status).toBe("matched");
+    expect(journal.correlate("tmp:draft", { prompt_id: PROMPT_A }).status).toBe("foreign");
+  });
+
+  it("a re-sent completion does NOT re-arm a hand-off (no duplicate delivery)", () => {
+    journal.openRun(PROMPT_A, { tabId: "t" });
+    journal.record("t", { kind: "executed", prompt_id: PROMPT_A });
+    journal.deliverPending("t", () => true); // handed off, not yet acked
+    expect(journal.pending("t")).toHaveLength(0);
+    // The panel re-sends the same completion — it must not queue a second copy.
+    journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "resend" });
+    expect(journal.pending("t")).toHaveLength(0);
+    expect(journal.outstanding("t")).toHaveLength(1);
+  });
+
+  it("evicting a still-pending completion is COUNTED and reported on the next delivery", () => {
+    // Fill past the per-tab ceiling with completions nothing can deliver.
+    for (let i = 0; i < 40; i++) {
+      journal.record("t", { kind: "executed", prompt_id: `p-${i}` });
+    }
+    const lost = journal.droppedFor("t");
+    expect(lost).toBeGreaterThan(0);
+    const seen: CompletionPayload[] = [];
+    journal.deliverPending("t", (p) => {
+      seen.push(p);
+      return true;
+    });
+    expect(seen[0].dropped_completions).toBe(lost);
+    // Reported once, then cleared — later deliveries don't re-report it.
+    expect(journal.droppedFor("t")).toBe(0);
+    expect(seen[1]?.dropped_completions).toBeUndefined();
   });
 
   it("freezes the correlation at arrival — a run opened later can never claim it", () => {
