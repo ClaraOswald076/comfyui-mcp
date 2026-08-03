@@ -2555,23 +2555,36 @@ export async function runPanelOrchestrator(): Promise<void> {
       // current target reads dead too — the ComfyUI restart window — the live
       // tab's hello is trusted instead, so the reconnect correction back to a
       // LOCAL target can never be vetoed into keeping a stale REMOTE one (#756).
-      // RunPod proxies still skip the probe (booting pods answer late — readiness
-      // is the connector's job).
+      // TRUST: hello.comfyui_url is page-JS-writable, so every apply path is
+      // gated on the SERVER-OBSERVED handshake origin (tabServerOrigin — the
+      // browser sets it, page JS can't forge it; #509's trusted source, codex
+      // gate). Only a corroborated claim gets the no-probe shortcuts and the
+      // both-dead recovery; an uncorroborated claim must earn its retarget by
+      // answering its probe, and a dead one fails closed. RunPod proxies still
+      // skip the probe for corroborated claims (booting pods answer late —
+      // readiness is the connector's job).
       const helloUrl = (event as { comfyui_url?: unknown }).comfyui_url;
       void (async () => {
         const verdict = await judgeHelloRetarget({
           helloUrl,
           currentUrl: comfyuiUrl,
+          observedOrigin: bridge.tabServerOrigin(panelTab),
           probe: (u) => probeOk(u, 3_000),
         });
         if (!verdict.apply) {
-          logger.warn(`[panel-orchestrator] ignoring hello retarget to unreachable ${verdict.base} (stale tab on a dead instance?) — keeping ${comfyuiUrl}`);
+          logger.warn(
+            verdict.reason === "vetoed-untrusted"
+              ? `[panel-orchestrator] refusing hello retarget to ${verdict.base}: the tab's handshake origin does not ` +
+                `corroborate the claimed URL and the claimed instance is unreachable — NOT retargeting on an ` +
+                `unverifiable claim (keeping ${comfyuiUrl})`
+              : `[panel-orchestrator] ignoring hello retarget to unreachable ${verdict.base} (stale tab on a dead instance?) — keeping ${comfyuiUrl}`,
+          );
           return;
         }
         if (verdict.reason === "current-also-unreachable") {
           logger.info(
             `[panel-orchestrator] hello target ${verdict.base} and current target ${comfyuiUrl} are BOTH unreachable ` +
-              `(ComfyUI restart window?) — trusting the live tab's hello rather than pinning a stale target (#756)`,
+              `(ComfyUI restart window?) — trusting the live tab's origin-corroborated hello rather than pinning a stale target (#756)`,
           );
         }
         applyComfyuiUrl(helloUrl);
