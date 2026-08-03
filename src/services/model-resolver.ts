@@ -748,12 +748,19 @@ async function assertDestinationVisibleToLiveServer(
   // category alone may be empty on the live server too. Probe a few standard
   // categories so "the server has models, this tree has none" can still be seen
   // (codex gate, round 7). Cheap: only when the tree really is bare.
-  const fallback = present.length === 0 ? [...MODEL_SUBDIRS] : [];
+  const bare = present.length === 0;
+  const fallback = bare ? [...MODEL_SUBDIRS] : [];
   const ordered = [
     ...(target ? [target] : []),
     ...present.filter((c) => c !== target),
     ...fallback.filter((c) => c !== target),
   ];
+  // The per-call probe budget exists to keep a LARGE models tree cheap. A bare tree
+  // has no folders to enumerate, so the standard-category sweep IS the evidence —
+  // capping it at six would silently skip `text_encoders` and friends and let the
+  // write through (codex gate, round 8). At most ~15 cheap local listing calls, and
+  // only in this already-exceptional shape.
+  const probeBudget = bare ? ordered.length : DISAGREEMENT_PROBE_CATEGORIES;
 
   let probed = 0;
   let filesOnDisk = 0;
@@ -763,7 +770,7 @@ async function assertDestinationVisibleToLiveServer(
   const unexplained = new Map<string, number>();
   let worst: { category: string; missing: string[]; onDisk: number; live: number } | undefined;
   for (const category of ordered) {
-    if (probed >= DISAGREEMENT_PROBE_CATEGORIES) break;
+    if (probed >= probeBudget) break;
     const onDisk = await coreModelFilesUnder(join(modelsRoot, category));
     const listing = await liveCategoryListing(category);
     if (listing === undefined) continue; // the server can't speak for it — no evidence

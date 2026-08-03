@@ -41,10 +41,12 @@ const verifyLandedModelMock = vi.hoisted(() =>
 const liveListingHasEntryMock = vi.hoisted(() =>
   vi.fn(async (): Promise<boolean | undefined> => true),
 );
-/** #369: is an existing file physically inside a tree the live server reads?
- *  Default UNKNOWN — only the listing fallback can answer in these tests. */
+/** #369: is an existing file physically inside a tree the live server reads? Only
+ *  a positive answer licenses an "already exists" SKIP. Default TRUE — these tests
+ *  model the healthy local case; the unconfirmed/stale paths are asserted
+ *  explicitly below. */
 const isUnderLiveModelRootsMock = vi.hoisted(() =>
-  vi.fn(async (): Promise<boolean | undefined> => undefined),
+  vi.fn(async (): Promise<boolean | undefined> => true),
 );
 const resolveExistingModelFileMock = vi.hoisted(() => vi.fn());
 const listLocalModelsMock = vi.hoisted(() => vi.fn());
@@ -429,13 +431,13 @@ describe("applyManifest", () => {
   });
 
   // #369 — "already exists" is a claim about a path the RUNNING server may not read.
-  it("FAILS an existing file the connected ComfyUI does not list (stale install)", async () => {
+  it("FAILS an existing file that is not in any tree the connected ComfyUI reads", async () => {
     resolveExistingModelFileMock.mockResolvedValueOnce({
       path: "C:/stale/models/checkpoints/big.safetensors",
       root: "C:/stale/models",
       info: { isFile: () => true },
     });
-    liveListingHasEntryMock.mockResolvedValueOnce(false);
+    isUnderLiveModelRootsMock.mockResolvedValueOnce(false);
 
     const result = await applyManifest({
       manifest: {
@@ -450,7 +452,7 @@ describe("applyManifest", () => {
     });
 
     expect(result.summary).toMatchObject({ skipped: 0, failed: 1 });
-    expect(result.results[0].message).toMatch(/does not list/);
+    expect(result.results[0].message).toMatch(/NOT in any directory/);
     expect(downloadModelMock).not.toHaveBeenCalled();
   });
 
@@ -483,13 +485,16 @@ describe("applyManifest", () => {
     expect(result.results[0].message).toMatch(/NOT in any directory/);
   });
 
-  it("reports PENDING (never skipped) when the server cannot be asked about an existing file", async () => {
+  it("reports PENDING (never skipped) when containment cannot be established — even if the server lists the NAME", async () => {
+    // The stale tree and the live tree both hold `big.safetensors`. A name-only
+    // listing hit must NOT promote an unconfirmed placement to "installed".
     resolveExistingModelFileMock.mockResolvedValueOnce({
       path: "C:/comfy/models/checkpoints/big.safetensors",
       root: "C:/comfy/models",
       info: { isFile: () => true },
     });
-    liveListingHasEntryMock.mockResolvedValueOnce(undefined);
+    isUnderLiveModelRootsMock.mockResolvedValueOnce(undefined);
+    liveListingHasEntryMock.mockResolvedValueOnce(true);
 
     const result = await applyManifest({
       manifest: {
@@ -504,7 +509,8 @@ describe("applyManifest", () => {
     });
 
     expect(result.summary).toMatchObject({ skipped: 0, failed: 0, pending: 1 });
-    expect(result.results[0].message).toMatch(/NOT confirmed as installed/);
+    expect(result.results[0].message).toMatch(/not confirmed as installed/);
+    expect(result.results[0].message).toMatch(/may be its OWN copy elsewhere/);
   });
 
   it("skips a CATEGORY-ROOT target found by filename anywhere in the served category", async () => {

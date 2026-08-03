@@ -913,12 +913,19 @@ async function applyManifestSections(
         // physically inside a tree the running server reads? A name-only listing
         // check cannot tell a stale `C:\Stale\...\x.safetensors` from the live
         // server's own `D:\Live\...\x.safetensors` (codex gate, round 5).
-        const inLiveRoots = await isUnderLiveModelRoots(
+        // ONLY a positive containment result licenses the skip. A name-only listing
+        // hit cannot tell a stale `C:\Stale\...\x.safetensors` from the live server's
+        // OWN `D:\Live\...\x.safetensors`, so it may never promote an unconfirmed
+        // answer to "installed" (codex gate, round 8) — it is reported as a
+        // diagnostic on the pending item instead.
+        const visible = await isUnderLiveModelRoots(
           existing,
           target.targetSubfolder.split(/[\\/]+/).filter(Boolean)[0],
         );
-        const visible =
-          inLiveRoots ?? (await liveListingHasEntry(target.targetSubfolder, target.filename));
+        const listed =
+          visible === undefined
+            ? await liveListingHasEntry(target.targetSubfolder, target.filename)
+            : undefined;
         results.push(
           visible === false
             ? report(
@@ -926,22 +933,27 @@ async function applyManifestSections(
                 item,
                 "failed",
                 `A file exists at ${existing}, but it is NOT in any directory the connected ` +
-                  `ComfyUI reads models from (it does not list "${target.filename}" under ` +
-                  `"${target.targetSubfolder}") — it belongs to an install the running server ` +
-                  "does not use. Point COMFYUI_PATH at the ComfyUI that is actually running, " +
-                  "or launch it with an absolute --base-directory.",
+                  "ComfyUI reads models from — it belongs to an install the running server does " +
+                  "not use. Point COMFYUI_PATH at the ComfyUI that is actually running, or " +
+                  "launch it with an absolute --base-directory.",
               )
             : visible === undefined
-              ? // The server could not be asked, so "already exists" is an
-                // UNVERIFIED claim about a path it may not read (codex gate,
-                // round 4). Report it as pending, never as a satisfied item.
+              ? // We could not establish that the running server reads from this
+                // path, so "already exists" is an UNVERIFIED claim. Report it as
+                // pending, never as a satisfied item (codex gate, rounds 4 and 8).
                 report(
                   "model",
                   item,
                   "pending",
-                  `A file exists at ${existing}, but the connected ComfyUI could not be asked ` +
-                    `whether it reads from there (its "${target.targetSubfolder}" listing was ` +
-                    "unavailable), so this is NOT confirmed as installed. Check list_local_models.",
+                  `A file exists at ${existing}, but it could NOT be established that the ` +
+                    "connected ComfyUI reads models from there (its install root could only be " +
+                    "inferred from local configuration), so this is not confirmed as installed." +
+                    (listed === true
+                      ? ` The server does list "${target.filename}" under "${target.targetSubfolder}", but that may be its OWN copy elsewhere.`
+                      : listed === false
+                        ? ` The server does NOT list "${target.filename}" under "${target.targetSubfolder}".`
+                        : "") +
+                    " Check list_local_models.",
                 )
               : report("model", item, "skipped", `Model already exists at ${existing}.`),
         );
