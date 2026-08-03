@@ -737,13 +737,25 @@ describe("run completion journal correlation (#468)", () => {
     expect(journal.pending("t")[0].correlation.status).toBe("foreign");
   });
 
-  it("a completion re-sent AFTER its delivery was acked is suppressed, not delivered twice", () => {
+  it("a completion re-sent AFTER its delivery was acked is FLAGGED, never suppressed", () => {
+    // "Already delivered" is a LABEL, not a veto. Every proof it could rest on
+    // (the memo, the ticket's settled flag, the ticket itself) is bounded, so
+    // suppressing on one turns into a silent loss the moment it expires at the
+    // wrong time — which is exactly how this defect kept coming back.
     journal.openRun(PROMPT_A, { tabId: "t" });
     const entry = journal.record("t", { kind: "executed", prompt_id: PROMPT_A });
     journal.deliverPending("t", () => true);
     journal.ack(entry!.token); // the carrying turn ended — entry is gone
-    expect(journal.record("t", { kind: "executed", prompt_id: PROMPT_A })).toBeNull();
-    expect(journal.pending("t")).toHaveLength(0);
+    const resend = journal.record("t", { kind: "executed", prompt_id: PROMPT_A });
+    expect(resend.possibleRepeat).toBe(true);
+    expect(journal.pending("t")).toHaveLength(1);
+    // …and the flag reaches the agent, so it can decline to double-count it.
+    const seen: CompletionPayload[] = [];
+    journal.deliverPending("t", (p) => {
+      seen.push(p);
+      return true;
+    });
+    expect(seen[0].possible_repeat).toBe(true);
   });
 
   it("evicting a HANDED-OFF completion is counted too — a hand-off is not proof of consumption", () => {
@@ -829,7 +841,7 @@ describe("run completion journal correlation (#468)", () => {
     expect(first!.correlation.status).toBe("matched"); // not reused yet
     journal.deliverPending("t", () => true);
     journal.ack(first!.token);
-    expect(journal.record("t", { kind: "executed", prompt_id: PROMPT_A })).toBeNull(); // memo holds
+    expect(journal.record("t", { kind: "executed", prompt_id: PROMPT_A }).possibleRepeat).toBe(true);
 
     journal.openRun(PROMPT_A, { tabId: "t" }); // ComfyUI reused the id
     expect(journal.ticketFor(PROMPT_A)?.reused).toBe(true);
@@ -1009,6 +1021,39 @@ describe("run completion journal correlation (#468)", () => {
     expect(real!.payload.note).toBe("run B");
   });
 
+  it("even with ALL history expired, a resend can't suppress the run that reused its id", () => {
+    // The last ordering: A is acked, then enough later runs expire BOTH its
+    // ticket (64) and its delivered memo (512), so nothing remembers the id at
+    // all. B then queues it and looks, correctly, like a fresh identity.
+    // A's late resend is now indistinguishable from B's completion — and that is
+    // fine, because "already delivered" no longer VETOES anything. Whatever
+    // arrives is delivered; the worst case is a flagged duplicate, never a loss.
+    journal.openRun(PROMPT_A, { tabId: "t" });
+    const a = journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "run A" });
+    journal.deliverPending("t", () => true);
+    journal.ack(a.token);
+
+    for (let i = 0; i < 600; i++) {
+      journal.openRun(`later-${i}`, { tabId: "t" });
+      const e = journal.record("t", { kind: "executed", prompt_id: `later-${i}` });
+      journal.deliverPending("t", () => true);
+      journal.ack(e.token);
+    }
+    expect(journal.ticketFor(PROMPT_A)).toBeUndefined(); // all history expired
+
+    journal.openRun(PROMPT_A, { tabId: "t" }); // B — looks fresh, and is treated so
+    const resend = journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "A resend" });
+    journal.deliverPending("t", () => true);
+    journal.ack(resend.token); // the resend settles the ticket it matched
+
+    // B's REAL completion still lands. Under the old suppress-on-proof rule this
+    // was the loss: B's own settled flag swallowed it.
+    const real = journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "run B" });
+    expect(real.payload.note).toBe("run B");
+    expect(real.possibleRepeat).toBe(true); // …flagged, so it isn't double-counted
+    expect(journal.pending("t")).toHaveLength(1);
+  });
+
   it("the no-coalesce rule survives the reused TICKET being evicted", () => {
     // Tickets are the smallest bound (64) and evictable. If ambiguity were read
     // only from the live ticket, 64 later runs would make the incoming side
@@ -1116,15 +1161,16 @@ describe("run completion journal correlation (#468)", () => {
     expect(seen[0].dropped_completions).toBe(lost);
   });
 
-  it("a resend is suppressed for as long as the run's IDENTITY survives, then reported as undetermined", () => {
-    // Suppression is keyed by ticket GENERATION, so it lasts exactly as long as
-    // the identity that makes "we already reported THIS run" a true statement.
+  it("a resend is FLAGGED while the run's IDENTITY survives, and merely undetermined after", () => {
+    // The repeat FLAG is keyed by ticket generation, so it lasts exactly as long
+    // as the identity that makes "we already reported THIS run" a true statement.
+    // Either way the completion is delivered — only the labelling changes.
     journal.openRun(PROMPT_A, { tabId: "t" });
     const entry = journal.record("t", { kind: "executed", prompt_id: PROMPT_A });
     journal.deliverPending("t", () => true);
     journal.ack(entry!.token);
     expect(journal.ticketFor(PROMPT_A)?.settled).toBe(true);
-    expect(journal.record("t", { kind: "executed", prompt_id: PROMPT_A })).toBeNull(); // resend: suppressed
+    expect(journal.record("t", { kind: "executed", prompt_id: PROMPT_A }).possibleRepeat).toBe(true);
 
     // Flood with REAL runs so the ticket map overflows and this run's identity
     // is evicted. Past that point the journal genuinely cannot tell a resend
@@ -1435,8 +1481,10 @@ describe("run completion journal correlation (#468)", () => {
     journal.moveKey("tmp:draft", "wf:saved.json");
     expect(journal.droppedFor("wf:saved.json")).toBe(lost);
     expect(journal.droppedFor("tmp:draft")).toBe(0);
-    // The re-send is still suppressed under the NEW id.
-    expect(journal.record("wf:saved.json", { kind: "executed", prompt_id: PROMPT_A })).toBeNull();
+    // The re-send is still RECOGNISED under the NEW id (flagged, not suppressed).
+    expect(
+      journal.record("wf:saved.json", { kind: "executed", prompt_id: PROMPT_A }).possibleRepeat,
+    ).toBe(true);
   });
 
   it("moveKey re-addresses a tab's entries without touching anyone else's", () => {

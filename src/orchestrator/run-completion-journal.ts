@@ -446,9 +446,13 @@ export class RunCompletionJournalImpl {
    *    re-sent frame producing two turns (the agent double-reporting, or acting
    *    twice on one output), while a later genuinely different render — or the
    *    same content long afterwards — is still delivered.
-   * Returns null when the completion is a suppressed duplicate.
+   * NEVER returns null: a completion is always journaled and always delivered.
+   * The most this does is COLLAPSE onto a twin that nobody has seen yet, or FLAG
+   * one as a possible repeat. Suppression was the source of every loss this file
+   * kept re-growing, because each proof it rested on is bounded and any expiry at
+   * the wrong moment turned a new run's result into a discarded "duplicate".
    */
-  record(key: string, payload: CompletionPayload): JournalEntry | null {
+  record(key: string, payload: CompletionPayload): JournalEntry {
     const correlation = this.correlate(key, payload);
     let idlessRepeat = false;
     /** This id already stands for more than one run (see RunTicket.reused). */
@@ -459,6 +463,8 @@ export class RunCompletionJournalImpl {
     /** Ticket generation this completion belongs to — the run identity (0 = no
      *  ticket, i.e. a run this tab never queued). */
     let gen = 0;
+    /** A completion for this run was already delivered. A LABEL, not a veto. */
+    let alreadyDelivered = false;
     if (correlation.status !== "unidentified") {
       // Already DELIVERED once (its carrying turn ended, so the entry is gone).
       // A panel that re-sends the frame must not produce a second delivery — the
@@ -489,15 +495,30 @@ export class RunCompletionJournalImpl {
       // Both cases fall back to the standing rule: duplicate over loss, each
       // delivered on its own and labelled UNDETERMINED.
       idUnprovable = idReused || gen === 0;
+      // ALREADY-DELIVERED IS A LABEL, NEVER A VETO.
+      //
+      // This used to `return null` — suppressing the completion outright — and
+      // that single decision produced defect after defect, because every proof it
+      // rested on (the memo, the ticket's `settled` flag, the ticket's very
+      // existence) is BOUNDED. Whenever one expired at the wrong moment, a
+      // genuinely new run's completion was mistaken for an old one's resend and
+      // swallowed: exactly the failure this whole file exists to prevent, and the
+      // one the project's rules call worse than a duplicate.
+      //
+      // So the journal now NEVER suppresses an identified completion. It delivers
+      // it FLAGGED as a possible repeat and lets the agent — which can read the
+      // prompt id, see the outputs, and call get_history — decide. No expiry can
+      // turn that into a loss, and the honest failure mode is a second turn
+      // saying "this may be the same render", not silence.
       if (
         !idUnprovable &&
         (this.delivered.has(deliveredKey(key, correlation.promptId, gen)) ||
           (settledTicket?.settled === true && settledTicket.tabId === key))
       ) {
         logger.info(
-          `[run-completions] ignoring a re-sent completion for ${describe(correlation)} — already delivered to tab ${key.slice(0, 8)}`,
+          `[run-completions] a completion for ${describe(correlation)} was already delivered to tab ${key.slice(0, 8)} — forwarding this one FLAGGED as a possible repeat (never suppressed)`,
         );
-        return null;
+        alreadyDelivered = true;
       }
       // COALESCE ONLY ONTO A `pending` ENTRY. This is the correctness rule, and
       // it is deliberately a property of the TARGET'S OWN CURRENT STATE — not of
@@ -592,8 +613,11 @@ export class RunCompletionJournalImpl {
       attempts: 0,
       state: "pending",
       ...(correlation.status === "unidentified"
-        ? { fingerprint: idlessFingerprint(key, payload), ...(idlessRepeat ? { possibleRepeat: true } : {}) }
+        ? { fingerprint: idlessFingerprint(key, payload) }
         : {}),
+      // One flag, both paths: an identified run whose completion was already
+      // delivered, or an id-less one whose content matches a recent delivery.
+      ...(idlessRepeat || alreadyDelivered ? { possibleRepeat: true } : {}),
       // Freeze the ambiguity onto the entry — see JournalEntry.ambiguousId.
       ...(idUnprovable ? { ambiguousId: true } : {}),
       // …and the GENERATION this completion belongs to, for EVERY identified
