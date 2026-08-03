@@ -2787,6 +2787,22 @@ export async function runPanelOrchestrator(): Promise<void> {
           // have a LIVE agent (a provider switch retires the others), so at most one rebind is a
           // live-agent move; the rest are durable-only.
           let destinationCollision = false;
+          // #468 — the journal purge must happen BEFORE the loop, not after it.
+          // manager.reset() inside the loop hands back any run-completion tokens
+          // parked in that provider's held mail, and the hand-back callback
+          // flushes immediately — into whatever agent currently owns panelTab,
+          // which on a collision is the SUPERSEDED destination tab's agent on a
+          // different provider. Purging first means there is nothing to hand
+          // back. Read-only pre-pass over the same predicate the loop uses, so
+          // the two can't disagree about what counts as a collision.
+          const destinationHadState = [...KNOWN_BACKENDS].some((b) =>
+            destinationHasCollisionState({
+              hasManagerState: manager.hasAnyState(panelTab + AGENT_KEY_SEP + b),
+              hasDurableSession: sessionStore.get(panelTab + AGENT_KEY_SEP + b) !== undefined,
+              renderHeldCount: heldDuringGen.get(panelTab + AGENT_KEY_SEP + b)?.length ?? 0,
+            }),
+          );
+          if (destinationHadState) RunCompletions.forget(panelTab);
           for (const b of KNOWN_BACKENDS) {
             const srcKey = migratedFrom + AGENT_KEY_SEP + b;
             const newKey = panelTab + AGENT_KEY_SEP + b;
@@ -2831,15 +2847,9 @@ export async function runPanelOrchestrator(): Promise<void> {
           // panelTab; the incoming source's in-flight work is under migratedFrom (its canonical id
           // at send time) and is untouched, so the proven migration's own continuity is preserved.
           if (destinationCollision) bridge.dropQueuedDeliveries(panelTab);
-          // #468 — same ordering for the run-completion journal, and for the same
-          // reason. FIRST forget the superseded destination's completions + run
-          // tickets (its conversation is a lost resume; delivering its renders to
-          // the incoming tab would be exactly the cross-run misattribution the
-          // journal exists to prevent), THEN re-address the incoming tab's own
-          // ones onto the new id. The order matters: moveKey first would make the
-          // migrated entries indistinguishable from the destination's and forget
-          // would take both.
-          if (destinationCollision) RunCompletions.forget(panelTab);
+          // #468 — the superseded destination's journal state was already purged
+          // above (before anything could hand tokens back); now re-address the
+          // INCOMING tab's own completions + run tickets onto the new id.
           RunCompletions.moveKey(migratedFrom, panelTab);
           // rebindAgent MOVES the agent rather than spawning one, so onAgentReady
           // never fires for the new id — flush explicitly or the re-addressed
@@ -3030,6 +3040,13 @@ export async function runPanelOrchestrator(): Promise<void> {
             heldDuringGen.delete(bKey); // render-held work belonging to the torn-down provider
           }
           bridge.dropQueuedDeliveries(panelTab);
+          // #468 — this tab id is no longer provably serving the workflow that
+          // queued its outstanding runs (replaced in place). Close those tickets
+          // so a late completion is reported to whoever holds the tab now as
+          // UNDETERMINED instead of "the run YOU queued". Journal ENTRIES are
+          // kept: a completion that already arrived is still real news and is
+          // still delivered — just no longer as this conversation's own.
+          RunCompletions.closeRuns(panelTab);
         }
       }
 
@@ -3990,11 +4007,14 @@ export async function runPanelOrchestrator(): Promise<void> {
       // path — nothing is waiting on them the way a render is.
       if (ev.kind === "executed") {
         // Journal the BLIND-STRIPPED copy: a replay must not resurrect pixels
-        // the blind gate removed on arrival.
+        // the blind gate removed on arrival. `null` = the panel re-sent a
+        // completion this tab was already given; suppressed, never duplicated.
         const entry = RunCompletions.record(event.tab_id, evForTab as CompletionPayload);
-        logger.info(
-          `[panel-orchestrator] tab ${event.tab_id.slice(0, 8)} run completion for ${describeCorrelation(entry.correlation)}`,
-        );
+        if (entry) {
+          logger.info(
+            `[panel-orchestrator] tab ${event.tab_id.slice(0, 8)} run completion for ${describeCorrelation(entry.correlation)}`,
+          );
+        }
         flushRunCompletions(event.tab_id);
         return;
       }
@@ -4038,6 +4058,12 @@ export async function runPanelOrchestrator(): Promise<void> {
       // reset() is synchronous (map cleared now), so no concurrent send() can
       // spawn an agent before we report the cleared session.
       manager.reset(agentKeyFor(tabId));
+      // #468 — the conversation that queued this tab's outstanding renders is
+      // gone. Close its run tickets so a render it queued, finishing after the
+      // New chat, is reported to the replacement agent as UNDETERMINED rather
+      // than as "the run YOU queued". Already-arrived completions keep the
+      // verdict frozen at their arrival and are still delivered.
+      RunCompletions.closeRuns(tabId);
       // reset() clears the exact-tab store; the stable resume index (#570) is the
       // manager's blind spot, so drop it here too — a deliberate NEW chat must not
       // be resurrected by the unsaved-workflow fallback on the next reload.
@@ -4082,6 +4108,10 @@ export async function runPanelOrchestrator(): Promise<void> {
       const sid = typeof event.session_id === "string" ? event.session_id : undefined;
       const key = agentKeyFor(tabId);
       manager.reset(key);
+      // #468 — same as New chat: the conversation being replaced owns the open
+      // runs, so a completion landing after the switch is UNDETERMINED, not the
+      // historical session's own render.
+      RunCompletions.closeRuns(tabId);
       if (sid) manager.setResume(key, sid);
       bridge.push({ type: "ack", ok: true, kind: "resume_session" }, tabId);
       bridge.broadcastTabList(); // live agent dropped → refresh mirror pickers

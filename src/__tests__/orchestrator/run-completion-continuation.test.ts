@@ -354,6 +354,40 @@ describe("run completion journal correlation (#468)", () => {
     expect(journal.correlate("tmp:draft", { prompt_id: PROMPT_A }).status).toBe("foreign");
   });
 
+  it("closeRuns drops the tab's tickets but KEEPS its arrived completions", () => {
+    // New chat / switch to a historical session: the conversation that queued the
+    // run is gone, so a render it queued must not be introduced to the
+    // replacement agent as "the run YOU queued".
+    journal.openRun(PROMPT_A, { tabId: "t" });
+    const arrived = journal.record("t", { kind: "executed", prompt_id: PROMPT_A });
+    journal.closeRuns("t");
+    expect(journal.ticketFor(PROMPT_A)).toBeUndefined();
+    expect(journal.correlate("t", { prompt_id: PROMPT_A }).status).toBe("foreign");
+    // …but a completion that already arrived is still deliverable, with the
+    // verdict frozen at ITS arrival.
+    expect(journal.pending("t")).toHaveLength(1);
+    expect(arrived?.correlation.status).toBe("matched");
+  });
+
+  it("a completion re-sent AFTER its delivery was acked is suppressed, not delivered twice", () => {
+    journal.openRun(PROMPT_A, { tabId: "t" });
+    const entry = journal.record("t", { kind: "executed", prompt_id: PROMPT_A });
+    journal.deliverPending("t", () => true);
+    journal.ack(entry!.token); // the carrying turn ended — entry is gone
+    expect(journal.record("t", { kind: "executed", prompt_id: PROMPT_A })).toBeNull();
+    expect(journal.pending("t")).toHaveLength(0);
+  });
+
+  it("evicting a HANDED-OFF completion is counted too — a hand-off is not proof of consumption", () => {
+    for (let i = 0; i < 32; i++) journal.record("t", { kind: "executed", prompt_id: `h-${i}` });
+    journal.deliverPending("t", () => true); // all handed off, none acked
+    expect(journal.droppedFor("t")).toBe(0);
+    // One more arrival pushes the oldest handed-off entry out. If its agent dies
+    // before reading it, `release` would have nothing to re-arm — so it counts.
+    journal.record("t", { kind: "executed", prompt_id: "h-overflow" });
+    expect(journal.droppedFor("t")).toBe(1);
+  });
+
   it("a re-sent completion does NOT re-arm a hand-off (no duplicate delivery)", () => {
     journal.openRun(PROMPT_A, { tabId: "t" });
     journal.record("t", { kind: "executed", prompt_id: PROMPT_A });

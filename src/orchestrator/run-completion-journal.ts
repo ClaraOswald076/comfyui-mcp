@@ -75,9 +75,11 @@ export interface CompletionPayload {
 /** A run `panel_run` queued and is waiting on. */
 export interface RunTicket {
   promptId: string;
-  /** Panel tab the run was queued from (diagnostics only — correlation is by
-   *  prompt id, which ComfyUI makes globally unique, so a ctx.tabId rebind
-   *  between queue and completion cannot break the match). */
+  /** Panel tab the run was queued from. Part of the MATCH: a completion is only
+   *  "the run YOU queued" for the tab that queued it, so a workflow switch or a
+   *  cross-tab completion reads as foreign instead of being misattributed. A
+   *  proven tab-id migration moves it (moveKey) so the tab's own runs still
+   *  match. */
   tabId: string;
   queuedAt: number;
   toNodeId?: number;
@@ -112,6 +114,17 @@ const MAX_ENTRIES_PER_KEY = 32;
 /** Undelivered completions held across ALL tabs — a global ceiling so a session
  *  that opens and abandons many tabs can't grow the journal without limit. */
 const MAX_ENTRIES_TOTAL = 96;
+/** (tab, run) pairs remembered as already delivered, to suppress a re-sent frame
+ *  after its entry was acked and removed. */
+const MAX_DELIVERED_MEMO = 256;
+/** Tabs whose evicted-completion counter is retained. */
+const MAX_DROPPED_KEYS = 64;
+
+/** Memo key for an already-delivered (tab, run). "|" separates them; a ComfyUI
+ *  prompt id is a fixed-format UUID, so the pair can't alias another. */
+function deliveredKey(key: string, promptId: string): string {
+  return `${key}|${promptId}`;
+}
 
 export class RunCompletionJournalImpl {
   /** prompt id → ticket. Keyed globally: ComfyUI prompt ids are UUIDs, so an
@@ -120,6 +133,10 @@ export class RunCompletionJournalImpl {
   private tickets = new Map<string, RunTicket>();
   /** token → entry (insertion-ordered, which is also delivery order). */
   private entries = new Map<string, JournalEntry>();
+  /** (tab, run) pairs whose completion was ACKED — a bounded FIFO memo so a
+   *  panel that re-sends the frame after the entry was removed can't produce a
+   *  second delivery. */
+  private delivered = new Set<string>();
   private seq = 0;
 
   /** `panel_run` queued a render. Returns false when ComfyUI/the panel gave us
@@ -176,9 +193,18 @@ export class RunCompletionJournalImpl {
    * unidentified completion has nothing to dedupe on, so it is always a new
    * entry (bounded by MAX_ENTRIES_PER_KEY).
    */
-  record(key: string, payload: CompletionPayload): JournalEntry {
+  record(key: string, payload: CompletionPayload): JournalEntry | null {
     const correlation = this.correlate(key, payload);
     if (correlation.status !== "unidentified") {
+      // Already DELIVERED once (its carrying turn ended, so the entry is gone).
+      // A panel that re-sends the frame must not produce a second delivery — the
+      // dedupe below can't see an entry that no longer exists.
+      if (this.delivered.has(deliveredKey(key, correlation.promptId))) {
+        logger.info(
+          `[run-completions] ignoring a re-sent completion for ${describe(correlation)} — already delivered to tab ${key.slice(0, 8)}`,
+        );
+        return null;
+      }
       for (const entry of this.entries.values()) {
         if (
           entry.key === key &&
@@ -213,6 +239,18 @@ export class RunCompletionJournalImpl {
   /** Completions this tab lost to an eviction and has not yet been told about.
    *  Surfaced on the next delivery so a dropped completion is never silent. */
   private dropped = new Map<string, number>();
+
+  /** Count a lost completion for a tab, bounding the map so a churn of one-off
+   *  tabs can't grow it forever (the oldest unreported count is discarded — it
+   *  was already logged at ERROR when it happened). */
+  private noteDropped(key: string): void {
+    this.dropped.set(key, (this.dropped.get(key) ?? 0) + 1);
+    while (this.dropped.size > MAX_DROPPED_KEYS) {
+      const oldest = this.dropped.keys().next().value;
+      if (oldest === undefined) break;
+      this.dropped.delete(oldest);
+    }
+  }
 
   /** Entries awaiting a delivery attempt for this key, in arrival order. */
   pending(key: string): JournalEntry[] {
@@ -286,6 +324,17 @@ export class RunCompletionJournalImpl {
     const entry = this.entries.get(token);
     if (!entry) return;
     this.entries.delete(token);
+    if (entry.correlation.status !== "unidentified") {
+      // Remember (tab, run) so a later re-send of the same frame is suppressed
+      // rather than delivered a second time. Bounded FIFO — old ids age out; a
+      // re-send that late is not a real case.
+      this.delivered.add(deliveredKey(entry.key, entry.correlation.promptId));
+      while (this.delivered.size > MAX_DELIVERED_MEMO) {
+        const oldest = this.delivered.values().next().value;
+        if (oldest === undefined) break;
+        this.delivered.delete(oldest);
+      }
+    }
     if (entry.correlation.status === "matched") {
       const ticket = this.tickets.get(entry.correlation.promptId);
       if (ticket) ticket.settled = true;
@@ -340,6 +389,24 @@ export class RunCompletionJournalImpl {
     this.dropped.delete(key);
   }
 
+  /**
+   * The CONVERSATION that queued this tab's outstanding runs is gone — New chat,
+   * a switch to a historical session, or a workflow replaced in place.
+   *
+   * Drop the tab's run TICKETS but keep its journal entries. A render queued by
+   * the old conversation is still real and its completion is still delivered;
+   * it just can no longer be introduced to the replacement agent as "the run YOU
+   * queued" — it correlates as foreign, i.e. UNDETERMINED. Entries that already
+   * arrived keep the verdict frozen at THEIR arrival, so a completion the old
+   * conversation was owed is still reported to it correctly if it is still
+   * deliverable.
+   */
+  closeRuns(key: string): void {
+    for (const [pid, ticket] of [...this.tickets]) {
+      if (ticket.tabId === key) this.tickets.delete(pid);
+    }
+  }
+
   /** Test/diagnostic helpers. */
   ticketFor(promptId: string): RunTicket | undefined {
     return this.tickets.get(promptId);
@@ -348,6 +415,7 @@ export class RunCompletionJournalImpl {
     this.tickets.clear();
     this.entries.clear();
     this.dropped.clear();
+    this.delivered.clear();
     this.seq = 0;
   }
   droppedFor(key: string): number {
@@ -387,20 +455,18 @@ export class RunCompletionJournalImpl {
     const evict = (scope: (e: JournalEntry) => boolean, limit: number, label: string): void => {
       let mine = [...this.entries.values()].filter(scope);
       while (mine.length > limit) {
-        const victim =
-          mine.find((e) => e.state === "handed_off") ?? mine[0];
+        // Prefer an already-handed-off entry: it is at least sitting in a live
+        // agent's queue, so it is the likeliest to land anyway. But a hand-off is
+        // explicitly NOT proof of consumption, so an evicted hand-off is counted
+        // and reported exactly like an evicted pending one — evicting it removes
+        // our ability to replay it if that agent dies first.
+        const victim = mine.find((e) => e.state === "handed_off") ?? mine[0];
         this.entries.delete(victim.token);
         mine = mine.filter((e) => e !== victim);
-        if (victim.state === "pending") {
-          this.dropped.set(victim.key, (this.dropped.get(victim.key) ?? 0) + 1);
-          logger.error(
-            `[run-completions] ${label} — dropped an UNDELIVERED completion for ${describe(victim.correlation)}; the next delivery will report it as undetermined`,
-          );
-        } else {
-          logger.warn(
-            `[run-completions] ${label} — forgot an already-handed-off completion for ${describe(victim.correlation)}`,
-          );
-        }
+        this.noteDropped(victim.key);
+        logger.error(
+          `[run-completions] ${label} — dropped a ${victim.state === "pending" ? "still-undelivered" : "handed-off-but-unconfirmed"} completion for ${describe(victim.correlation)}; the next delivery will report it as undetermined`,
+        );
       }
     };
     evict(
