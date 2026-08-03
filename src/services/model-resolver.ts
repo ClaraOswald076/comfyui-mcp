@@ -639,15 +639,41 @@ export async function liveCategoryListing(
 
 /** Model-extension basenames present under a category directory on disk. */
 async function coreModelFilesUnder(categoryDir: string): Promise<string[]> {
-  let entries: string[];
+  let entries: string[] | undefined;
   try {
     entries = await readdir(categoryDir, { recursive: true });
   } catch {
     return [];
   }
+  // Not just tidiness: this feeds a REFUSAL, so an unreadable/odd listing must
+  // become "no evidence", never a crash inside the download path.
+  if (!Array.isArray(entries)) return [];
   return entries
-    .filter((e) => CORE_MODEL_EXTENSIONS.has(extname(e).toLowerCase()))
+    .filter((e) => typeof e === "string" && CORE_MODEL_EXTENSIONS.has(extname(e).toLowerCase()))
     .map((e) => basename(e));
+}
+
+/** How many populated categories of the candidate models root we cross-check.
+ *  Bounded so a large models tree costs a handful of cheap HTTP calls, not one
+ *  per folder. */
+const DISAGREEMENT_PROBE_CATEGORIES = 6;
+
+/** Immediate subdirectories of the candidate models root, in a stable order. */
+async function categoriesUnder(modelsRoot: string): Promise<string[]> {
+  try {
+    const entries = await readdir(modelsRoot, { withFileTypes: true });
+    if (!Array.isArray(entries)) return [];
+    const names: string[] = [];
+    for (const e of entries) {
+      const entry = e as { name?: unknown; isDirectory?: unknown } | null;
+      if (!entry || typeof entry.isDirectory !== "function") continue;
+      if (typeof entry.name !== "string") continue;
+      if ((entry.isDirectory as () => boolean)()) names.push(entry.name);
+    }
+    return names.sort();
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -656,16 +682,21 @@ async function coreModelFilesUnder(categoryDir: string): Promise<string[]> {
  * Runs ONLY when the models root came from LOCAL CONFIGURATION that the running
  * server never vouched for (`configured-base` / `base-anchored`) — a live-resolved
  * root is already authoritative and needs no second opinion. The test is a pure
- * disagreement check against the server's own `/models/<category>` listing: if the
- * candidate category directory holds core-extension model files and the live server
- * lists NONE of them, that directory is not part of its search path. That is the
- * #369 signature exactly (3 files on disk, 24 unrelated files in the live listing),
- * and catching it BEFORE the transfer saves the user the multi-GB download that
- * would otherwise be reported as a success and then be invisible.
+ * disagreement check against the server's own `/models/<category>` listing: if a
+ * category directory in the candidate root holds core-extension model files and the
+ * live server lists NONE of them, that root is not part of its search path. That is
+ * the #369 signature exactly (3 files on disk, 24 unrelated files in the live
+ * listing), and catching it BEFORE the transfer saves the user the multi-GB download
+ * that would otherwise be reported as a success and then be invisible.
  *
- * Fails OPEN on anything inconclusive (server unreachable, endpoint missing, empty
- * candidate dir, any overlap at all) — this must never block a legitimate download
- * into a fresh or shared models tree.
+ * The evidence is gathered ROOT-WIDE, not just from the target category: a stale
+ * install commonly has an EMPTY `diffusion_models/` while its `checkpoints/` is full
+ * of files the live server has never heard of (codex gate, round 1 — the target
+ * category alone made an empty-but-wrong destination look evidence-free).
+ *
+ * Fails OPEN on anything inconclusive — server unreachable, endpoint missing, an
+ * entirely empty models tree, or ANY overlap at all. It must never block a legitimate
+ * download into a fresh or shared models tree.
  */
 async function assertDestinationVisibleToLiveServer(
   modelsRoot: string,
@@ -675,23 +706,42 @@ async function assertDestinationVisibleToLiveServer(
 ): Promise<void> {
   if (isLiveAuthoritativeModelsDir(source)) return;
   if (!snapshot.reachable || isRemoteMode()) return;
-  const category = categoryOf(targetSubfolder);
-  if (!category) return;
-  const listing = await liveCategoryListing(category);
-  if (listing === undefined) return; // inconclusive — no evidence either way
-  const onDisk = await coreModelFilesUnder(join(modelsRoot, category));
-  if (onDisk.length === 0) return; // nothing to compare — no evidence
-  const liveNames = new Set(listing.map((n) => basename(n)));
-  if (onDisk.some((n) => liveNames.has(n))) return; // agrees — same tree
+
+  // The target category first (it is the one that matters), then the rest of the
+  // root — so a populated sibling can still expose a wrong install when the target
+  // folder happens to be empty.
+  const target = categoryOf(targetSubfolder);
+  const ordered = [
+    ...(target ? [target] : []),
+    ...(await categoriesUnder(modelsRoot)).filter((c) => c !== target),
+  ];
+
+  let probed = 0;
+  let conclusive = 0;
+  let worst: { category: string; onDisk: number; live: number } | undefined;
+  for (const category of ordered) {
+    if (probed >= DISAGREEMENT_PROBE_CATEGORIES) break;
+    const onDisk = await coreModelFilesUnder(join(modelsRoot, category));
+    if (onDisk.length === 0) continue; // nothing to compare in this folder
+    const listing = await liveCategoryListing(category);
+    if (listing === undefined) continue; // the server can't speak for it — no evidence
+    probed += 1;
+    const liveNames = new Set(listing.map((n) => basename(n)));
+    if (onDisk.some((n) => liveNames.has(n))) return; // agrees — this IS the live tree
+    conclusive += 1;
+    if (!worst) worst = { category, onDisk: onDisk.length, live: listing.length };
+  }
+  if (conclusive === 0 || !worst) return; // no evidence either way — allow
+
   throw new ModelError(
-    `Refusing to download into "${join(modelsRoot, category)}": the connected ComfyUI ` +
-      `(${getComfyUIBaseUrl()}) does not read from it. That directory already holds ` +
-      `${onDisk.length} model file(s) and the running server lists ${listing.length} for ` +
-      `"${category}" — with NONE in common, so it is a DIFFERENT install than the one ` +
-      "serving you. This destination came from local configuration (COMFYUI_PATH / the " +
-      "saved default workspace), not from the running server, which could not tell us its " +
-      "own install root. Point COMFYUI_PATH at the ComfyUI that is actually running, or " +
-      "launch it with an absolute --base-directory, then retry.",
+    `Refusing to download into "${modelsRoot}": the connected ComfyUI ` +
+      `(${getComfyUIBaseUrl()}) does not read from it. Its "${worst.category}" folder holds ` +
+      `${worst.onDisk} model file(s) and the running server lists ${worst.live} for that ` +
+      "category — with NONE in common, so this is a DIFFERENT install than the one serving " +
+      "you. This destination came from local configuration (COMFYUI_PATH / the saved default " +
+      "workspace), not from the running server, which could not tell us its own install root. " +
+      "Point COMFYUI_PATH at the ComfyUI that is actually running, or launch it with an " +
+      "absolute --base-directory, then retry.",
   );
 }
 

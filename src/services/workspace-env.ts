@@ -561,26 +561,17 @@ function anchorRelDirOnInterpreter(python: string, relDir: string): string | und
 }
 
 /**
- * Very-short memo for the process-table observation. `resolveLiveInterpreter`
- * shells out (netstat/WMI on Windows, lsof on POSIX) SYNCHRONOUSLY, and one
- * download resolves its destination two or three times (job keying, then the
- * writer), so an uncached probe would block the event loop repeatedly for a
- * single request. The window is deliberately tiny: a ComfyUI restart onto the
- * same port with an identical relative argv must not be answered from a previous
- * instance's observation for any humanly-noticeable time. Keyed on the argv we
- * correlate against AND the port, so a different server never reads this entry.
+ * The interpreter the OS reports for the ComfyUI on our port.
+ *
+ * DELIBERATELY NOT CACHED. `resolveLiveInterpreter` shells out (netstat/WMI on
+ * Windows, lsof on POSIX), so memoizing it is tempting — but this answer decides
+ * WHERE A DOWNLOAD IS WRITTEN. A cache keyed on port+argv cannot tell a restarted
+ * server apart from the one it replaced (a relaunch of ComfyUI reports the same
+ * relative `ComfyUI\main.py` on the same port), so any reuse window is a window in
+ * which a download can be written into the PREVIOUS install — the exact failure
+ * #369 is about (codex gate, round 1). Each resolution re-observes the process
+ * that is live right now; correctness here outranks a few hundred milliseconds.
  */
-const OBSERVED_PYTHON_TTL_MS = 5_000;
-let observedPythonMemo:
-  | { key: string; python: string | undefined; at: number }
-  | undefined;
-
-/** Reset the observation memo (tests, and any explicit server lifecycle change). */
-export function resetLiveServerRootCache(): void {
-  observedPythonMemo = undefined;
-}
-
-/** The interpreter the OS reports for the ComfyUI on our port, memoized briefly. */
 function observeLivePython(argv: string[] | undefined): string | undefined {
   let statsHost: string | undefined;
   try {
@@ -588,28 +579,16 @@ function observeLivePython(argv: string[] | undefined): string | undefined {
   } catch {
     /* unparseable target → no host filter */
   }
-  const key = `${config.resolvedPort}|${statsHost ?? ""}|${(argv ?? []).join("␉")}`;
-  const now = Date.now();
-  if (
-    observedPythonMemo &&
-    observedPythonMemo.key === key &&
-    now - observedPythonMemo.at < OBSERVED_PYTHON_TTL_MS
-  ) {
-    return observedPythonMemo.python;
-  }
-  let python: string | undefined;
   try {
-    python = resolveLiveInterpreter({
+    return resolveLiveInterpreter({
       port: config.resolvedPort,
       host: statsHost,
       remote: false,
       serverArgv: argv,
     })?.python;
   } catch {
-    python = undefined;
+    return undefined;
   }
-  observedPythonMemo = { key, python, at: now };
-  return python;
 }
 
 /**

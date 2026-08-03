@@ -21,8 +21,8 @@ const h = vi.hoisted(() => ({
   baseUrl: "http://127.0.0.1:8188",
   /** Per-category listing the LIVE server answers with; undefined → 404. */
   liveListings: {} as Record<string, string[] | undefined>,
-  /** Files the candidate category directory holds on disk. */
-  onDisk: [] as string[],
+  /** The candidate models root on disk: category folder → files it contains. */
+  onDisk: {} as Record<string, string[]>,
   modelsDirSource: "configured-base" as string,
   fetchCalls: [] as string[],
 }));
@@ -105,13 +105,23 @@ beforeEach(() => {
   h.comfyuiPath = "/comfy";
   h.remote = false;
   h.liveListings = {};
-  h.onDisk = [];
+  h.onDisk = {};
   h.modelsDirSource = "configured-base";
   h.fetchCalls = [];
   statMock.mockReset();
   realpathMock.mockReset();
   readdirMock.mockReset();
-  readdirMock.mockImplementation(async () => h.onDisk);
+  // Model the candidate models root: `withFileTypes` enumerates its category
+  // folders, a plain recursive read lists that category's files.
+  readdirMock.mockImplementation(
+    async (dir: string, opts?: { withFileTypes?: boolean }) => {
+      if (opts?.withFileTypes) {
+        return Object.keys(h.onDisk).map((name) => ({ name, isDirectory: () => true }));
+      }
+      const category = String(dir).split(/[\\/]/).filter(Boolean).pop() ?? "";
+      return h.onDisk[category] ?? [];
+    },
+  );
   realpathMock.mockImplementation(async (p: string) => p);
   statMock.mockResolvedValue({ isFile: () => true, size: 10 });
 });
@@ -120,7 +130,13 @@ describe("pre-write: a destination the LIVE server does not read from is refused
   it("REFUSES a locally-configured root whose contents the live server does not list", async () => {
     // The exact reported shape: the stale install holds a handful of models and
     // the running server lists a completely different set for that category.
-    h.onDisk = ["stale-a.safetensors", "stale-b.safetensors", "stale-c.safetensors"];
+    h.onDisk = {
+      diffusion_models: [
+        "stale-a.safetensors",
+        "stale-b.safetensors",
+        "stale-c.safetensors",
+      ],
+    };
     h.liveListings["diffusion_models"] = Array.from(
       { length: 24 },
       (_, i) => `live-${i}.safetensors`,
@@ -138,24 +154,48 @@ describe("pre-write: a destination the LIVE server does not read from is refused
     expect(msg).toMatch(/127\.0\.0\.1:8188/);
   });
 
+  it("REFUSES on a POPULATED SIBLING when the target category is empty (codex gate)", async () => {
+    // The stale install has never held a diffusion model, so the target folder is
+    // empty and says nothing — but its checkpoints/ betrays the wrong install.
+    h.onDisk = {
+      diffusion_models: [],
+      checkpoints: ["stale-ckpt.safetensors"],
+    };
+    h.liveListings["diffusion_models"] = ["live-unet.safetensors"];
+    h.liveListings["checkpoints"] = ["live-ckpt.safetensors"];
+
+    await expect(resolveModelSubfolderPreferServer("diffusion_models")).rejects.toThrow(
+      /DIFFERENT install/,
+    );
+  });
+
   it("ALLOWS when the live listing and the directory share a file (same tree)", async () => {
-    h.onDisk = ["shared.safetensors", "other.safetensors"];
+    h.onDisk = { loras: ["shared.safetensors", "other.safetensors"] };
     h.liveListings["loras"] = ["shared.safetensors", "more.safetensors"];
     await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBe(
       resolve("/comfy/models/loras"),
     );
   });
 
-  it("ALLOWS an empty candidate directory — absence of files is not evidence", async () => {
-    h.onDisk = [];
+  it("ALLOWS when a SIBLING category agrees even though the target has no overlap yet", async () => {
+    // One shared file anywhere in the root proves this IS the live tree.
+    h.onDisk = { loras: [], checkpoints: ["shared.safetensors"] };
+    h.liveListings["checkpoints"] = ["shared.safetensors"];
+    await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBe(
+      resolve("/comfy/models/loras"),
+    );
+  });
+
+  it("ALLOWS an entirely empty models tree — absence of files is not evidence", async () => {
+    h.onDisk = { loras: [] };
     h.liveListings["loras"] = ["live-only.safetensors"];
     await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBe(
       resolve("/comfy/models/loras"),
     );
   });
 
-  it("ALLOWS when the server cannot answer for the category (inconclusive, fails open)", async () => {
-    h.onDisk = ["a.safetensors"];
+  it("ALLOWS when the server cannot answer for any category (inconclusive, fails open)", async () => {
+    h.onDisk = { loras: ["a.safetensors"] };
     h.liveListings = {}; // every /models/<cat> 404s
     await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBe(
       resolve("/comfy/models/loras"),
@@ -164,7 +204,7 @@ describe("pre-write: a destination the LIVE server does not read from is refused
 
   it("does NOT second-guess a LIVE-AUTHORITATIVE root — no listing call at all", async () => {
     h.modelsDirSource = "observed-root";
-    h.onDisk = ["stale.safetensors"];
+    h.onDisk = { loras: ["stale.safetensors"] };
     h.liveListings["loras"] = ["completely-different.safetensors"];
     await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBe(
       resolve("/comfy/models/loras"),
@@ -173,7 +213,7 @@ describe("pre-write: a destination the LIVE server does not read from is refused
   });
 
   it("ignores non-core extensions on disk (a .gguf-only dir is not evidence of disagreement)", async () => {
-    h.onDisk = ["weights.gguf"];
+    h.onDisk = { diffusion_models: ["weights.gguf"] };
     h.liveListings["diffusion_models"] = ["a.safetensors"];
     await expect(
       resolveModelSubfolderPreferServer("diffusion_models"),

@@ -100,10 +100,19 @@ export interface DownloadJob {
    * only honestly "done" if the bytes are on disk AND the connected ComfyUI reads
    * from where they landed — reporting the INTENDED path is what let a 4.88 GB
    * model be announced as a success from a stale install the server never read.
-   * "visible" = the server lists the file; "not-visible" = it does not (the file
-   * exists but is unusable there); "unknown" = it could not be checked.
+   *
+   * "visible"     = the server lists the file — the ONLY value that licenses the
+   *                 word "successfully".
+   * "not-visible" = it does not (the file exists but is unusable there).
+   * "unknown"     = the check ran and could not conclude.
+   * "pending"     = the file has landed but the check has not finished yet. Set
+   *                 SYNCHRONOUSLY with `done`, so there is no window in which a
+   *                 renderer sees a completed job with no verification field and
+   *                 mistakes that for success (codex gate, round 1).
+   * undefined     = a pre-fix persisted record, or a Manager dispatch. Treated
+   *                 exactly like "pending" by every renderer: unconfirmed.
    */
-  live_visible?: "visible" | "not-visible" | "unknown";
+  live_visible?: "visible" | "not-visible" | "unknown" | "pending";
   /** Why, for anything other than a plain "visible". Surfaced verbatim. */
   verify_note?: string;
   /** A persisted in-flight record missed its owner heartbeat. It stays visible
@@ -527,6 +536,12 @@ export async function startDownloadJob(
     job.path = landedPath;
     job.status = "done";
     job.finished_at = Date.now();
+    // A LOCAL landing is not yet a verified placement. Mark it PENDING in the SAME
+    // synchronous step that publishes "done" (and in the same persisted record), so
+    // no reader — this session's tool call inside its grace window, or another
+    // session reading the record — can ever see a completed local download with no
+    // verification field and render it as confirmed success (#369, codex gate).
+    if (!dispatchToManager) job.live_visible = "pending";
     persistJobRecord(job);
   };
   const settled = (async () => {
@@ -803,6 +818,79 @@ function hasAmbiguousForeignSibling(id: string, localTrayId: string): boolean {
       rec.status === "downloading" &&
       now - (rec.updated ?? 0) < PERSISTED_INFLIGHT_STALE_MS,
   );
+}
+
+/**
+ * What we ACTUALLY know about where a completed download landed (#369).
+ *
+ * This is THE single placement policy — every tool that renders a finished job
+ * (`download_model`, `download_status`, `download_civitai_model`, `apply_manifest`)
+ * must go through it, or the wording drifts and one of them starts claiming a
+ * success nobody verified. That is precisely how a 4.88 GB model in a stale install
+ * came back as "downloaded successfully".
+ *
+ * `confirmed` is true for EXACTLY ONE state: the connected ComfyUI listed the file.
+ * A Manager dispatch, a still-pending check, an inconclusive check, and a pre-fix
+ * persisted record are all UNCONFIRMED — never successes.
+ */
+export interface PlacementReport {
+  /** True only when the running ComfyUI actually listed the landed file. */
+  confirmed: boolean;
+  /** True when the file exists on disk but the live server will NOT read it. */
+  wrongPlace: boolean;
+  /** Parenthetical for the path line, e.g. "(verified on disk, and the connected …)". */
+  pathQualifier: string;
+  /** The explanatory line to surface when `confirmed` is false. */
+  warning?: string;
+}
+
+export function describePlacement(job: DownloadJob): PlacementReport {
+  if (job.viaManager) {
+    return {
+      confirmed: false,
+      wrongPlace: false,
+      pathQualifier: "",
+      warning:
+        "the dispatch was ACCEPTED, NOT verified as landed — ComfyUI-Manager reports its queue " +
+        "task 'done' even on failure, so this does not guarantee the file is present. Confirm " +
+        "with list_local_models before relying on it.",
+    };
+  }
+  switch (job.live_visible) {
+    case "visible":
+      return {
+        confirmed: true,
+        wrongPlace: false,
+        pathQualifier: " (verified on disk, and the connected ComfyUI lists it)",
+      };
+    case "not-visible":
+      return {
+        confirmed: false,
+        wrongPlace: true,
+        pathQualifier: " (verified on disk)",
+        warning:
+          `NOT VISIBLE to the connected ComfyUI — ${job.verify_note ?? "the running server does not list this file."}`,
+      };
+    case "unknown":
+      return {
+        confirmed: false,
+        wrongPlace: false,
+        pathQualifier: " (verified on disk)",
+        warning:
+          `visibility to the connected ComfyUI is UNCONFIRMED${job.verify_note ? ` — ${job.verify_note}` : ""}. Check list_local_models before relying on it.`,
+      };
+    default:
+      // "pending" and undefined (pre-fix record) alike: the file landed, the check
+      // has not concluded. Never rendered as a confirmed success.
+      return {
+        confirmed: false,
+        wrongPlace: false,
+        pathQualifier: "",
+        warning:
+          "placement has NOT been confirmed yet — the check against the connected ComfyUI has " +
+          "not completed. Re-check with download_status, or confirm with list_local_models.",
+      };
+  }
 }
 
 export function getDownloadJob(id: string): DownloadJob | undefined {

@@ -520,7 +520,7 @@ export interface PersistedDownloadJob {
    *  actually lists the landed file, so a reconnecting session still sees the
    *  "downloaded but invisible to the running server" warning instead of a bare
    *  "done". Absent on pre-fix records. */
-  live_visible?: "visible" | "not-visible" | "unknown";
+  live_visible?: "visible" | "not-visible" | "unknown" | "pending";
   /** The verification explanation, surfaced verbatim by download_status. */
   verify_note?: string;
   /** Epoch ms of this snapshot (set on write). */

@@ -94,7 +94,6 @@ import {
   resolveInstallInterpreter,
   resolveLiveComfyUIBase,
   resolveLiveServerRoot,
-  resetLiveServerRootCache,
   resolveRootInterpreter,
 } from "../../services/workspace-env.js";
 
@@ -111,7 +110,6 @@ beforeEach(() => {
   mockGetSystemStats.mockReset();
   setExecFileResponder(() => new Error("not configured"));
   resetWorkspaceConfig();
-  resetLiveServerRootCache();
   delete process.env.COMFYUI_PATH;
 });
 

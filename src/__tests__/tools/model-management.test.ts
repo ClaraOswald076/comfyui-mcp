@@ -156,7 +156,43 @@ describe("download_model tool", () => {
 
     const text = res.content[0].text;
     expect(text).not.toContain("downloaded successfully");
-    expect(text).toContain("could NOT be confirmed");
+    expect(text).toContain("UNCONFIRMED");
+  });
+
+  it("never claims success while the visibility check is still PENDING (#369 grace-window race)", async () => {
+    // The file lands (commitDone marks it `pending`) but the tool's grace window
+    // expires before verification concludes. A pending verdict must read as
+    // unconfirmed, never as "the connected ComfyUI lists it". A distinct filename
+    // keeps this job's (deliberately unresolved) destination chain to itself.
+    const prevGrace = process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS;
+    process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS = "20";
+    let releaseVerify: (() => void) | undefined;
+    downloadModelMock.mockResolvedValueOnce("/m/checkpoints/pending.safetensors");
+    verifyLandedModelMock.mockImplementationOnce(
+      () =>
+        new Promise((r) => {
+          releaseVerify = () =>
+            r({ verifiedPath: "/m/checkpoints/pending.safetensors", liveVisible: "visible" });
+        }),
+    );
+
+    try {
+      const { downloadModel } = makeServer();
+      const res = await downloadModel({
+        url: "https://example.com/pending.safetensors",
+        target_subfolder: "checkpoints",
+        filename: "pending.safetensors",
+      });
+
+      const text = res.content[0].text;
+      expect(text).not.toContain("downloaded successfully");
+      expect(text).not.toContain("lists it");
+      expect(text).toContain("NOT been confirmed yet");
+    } finally {
+      releaseVerify?.();
+      if (prevGrace === undefined) delete process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS;
+      else process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS = prevGrace;
+    }
   });
 });
 

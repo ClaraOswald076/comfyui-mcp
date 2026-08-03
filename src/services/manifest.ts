@@ -30,7 +30,7 @@ import {
   MODEL_SUBDIRS,
   type ModelType,
 } from "./model-resolver.js";
-import { startDownloadJob, type DownloadJob } from "./download-jobs.js";
+import { startDownloadJob, describePlacement, type DownloadJob } from "./download-jobs.js";
 import { resolveModelsDir } from "./output-dir.js";
 import {
   getSavedDefaultWorkspaceSync,
@@ -926,7 +926,31 @@ async function applyManifestSections(
       if (job.status === "error") {
         results.push(report("model", item, "failed", job.error ?? "Model download failed."));
       } else if (job.status === "done") {
-        results.push(report("model", item, "applied", `Model downloaded to ${job.path}.`));
+        // "applied" must mean the running ComfyUI can actually load it (#369). Same
+        // shared placement policy as download_model: an unconfirmed or demonstrably
+        // wrong placement is reported as such, never as a clean apply.
+        const placement = describePlacement(job);
+        results.push(
+          // A download the running ComfyUI demonstrably cannot read is NOT an apply —
+          // that is the #369 failure, just wearing a manifest's clothes. An
+          // unconfirmed placement stays "applied" (the transfer really did finish, and
+          // "pending" here means "still downloading"), but the message never omits the
+          // caveat, so nothing downstream can read it as verified.
+          placement.wrongPlace
+            ? report(
+                "model",
+                item,
+                "failed",
+                `Model downloaded to ${job.path}, but it is NOT usable by the connected ComfyUI: ${placement.warning}`,
+              )
+            : report(
+                "model",
+                item,
+                "applied",
+                `Model downloaded to ${job.path}${placement.pathQualifier}.` +
+                  (placement.confirmed ? "" : ` NOTE: ${placement.warning}`),
+              ),
+        );
       } else {
         results.push(
           report(

@@ -112,6 +112,7 @@ import {
   cancelDownloadJob,
   resetDownloadJobs,
   downloadIdFor,
+  describePlacement,
 } from "../../services/download-jobs.js";
 import { setProgressDir, PERSIST_OWNER } from "../../services/download-progress.js";
 import * as progressModule from "../../services/download-progress.js";
@@ -1384,6 +1385,60 @@ describe("download job registry", () => {
         setProgressDir("");
         await fsRm(dir, { recursive: true, force: true });
       }
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // describePlacement — the ONE policy every tool renders a finished job with.
+  // Exactly one state licenses "success" (#369).
+  // -------------------------------------------------------------------------
+  describe("describePlacement (#369)", () => {
+    const base = {
+      id: "j",
+      trayId: "t",
+      url: "https://example.com/m.safetensors",
+      target_subfolder: "checkpoints",
+      status: "done" as const,
+      path: "/m/checkpoints/m.safetensors",
+      started_at: 0,
+    };
+
+    it("confirms ONLY a file the connected ComfyUI listed", () => {
+      const r = describePlacement({ ...base, live_visible: "visible" });
+      expect(r.confirmed).toBe(true);
+      expect(r.wrongPlace).toBe(false);
+      expect(r.warning).toBeUndefined();
+    });
+
+    it("treats an ABSENT verdict (pre-fix persisted record) as unconfirmed, never success", () => {
+      const r = describePlacement(base);
+      expect(r.confirmed).toBe(false);
+      expect(r.wrongPlace).toBe(false);
+      expect(r.warning).toMatch(/NOT been confirmed yet/);
+    });
+
+    it("treats a PENDING verdict as unconfirmed", () => {
+      const r = describePlacement({ ...base, live_visible: "pending" });
+      expect(r.confirmed).toBe(false);
+      expect(r.warning).toMatch(/NOT been confirmed yet/);
+    });
+
+    it("flags a NOT-VISIBLE verdict as the wrong place and surfaces its note", () => {
+      const r = describePlacement({
+        ...base,
+        live_visible: "not-visible",
+        verify_note: "the running server reads elsewhere",
+      });
+      expect(r.confirmed).toBe(false);
+      expect(r.wrongPlace).toBe(true);
+      expect(r.warning).toMatch(/NOT VISIBLE/);
+      expect(r.warning).toMatch(/reads elsewhere/);
+    });
+
+    it("never confirms a Manager dispatch, even if a verdict got attached", () => {
+      const r = describePlacement({ ...base, viaManager: true, live_visible: "visible" });
+      expect(r.confirmed).toBe(false);
+      expect(r.warning).toMatch(/NOT verified as landed/);
     });
   });
 });
