@@ -194,6 +194,10 @@ function targetKey(): string {
  * fallback is safe: record and compare both see it, so it degrades to the URL
  * check rather than to a wrong match.
  */
+export function panelTargetGeneration(): number {
+  return targetGeneration();
+}
+
 function targetGeneration(): number {
   try {
     return getComfyuiTargetGeneration();

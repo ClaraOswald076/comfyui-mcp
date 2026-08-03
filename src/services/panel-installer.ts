@@ -60,6 +60,7 @@ import {
   isLiveDerivedBase,
   lastPanelBaseResolution,
   panelBaseSync,
+  panelTargetGeneration,
   primePanelBase,
   recordPanelDiskObservation,
   type PanelBaseSource,
@@ -1443,7 +1444,15 @@ export async function panelStatus(
   // recorded; an absent or unreadable pack CLEARS it rather than leaving a stale
   // "your install is fine" behind.
   if (isRealDeps(deps)) {
-    if (detection.applicable && detection.installed && detection.version) {
+    // A SHADOW DISQUALIFIES THE READING. The observation exists to answer one
+    // question — "is the panel the browser loads already current?" — and a
+    // served copy in custom_nodes means the browser is loading something OTHER
+    // than the canonical pack whose version we just read (#641). Telling that
+    // user "your install is fine, just hard-refresh" is doubly wrong: the
+    // refresh re-loads the shadow. An indeterminate scan counts as a shadow,
+    // because `shadows: []` from an enumeration that failed is not an all-clear.
+    const shadowClean = !shadowInspectFailed && shadows.length === 0;
+    if (detection.applicable && detection.installed && detection.version && shadowClean) {
       // Bind the observation to the base that was actually scanned, so it can
       // never be replayed as evidence about a different ComfyUI tree.
       recordPanelDiskObservation(detection.version, detection.dir, comfyuiPath);
@@ -2244,8 +2253,24 @@ async function updateViaRegistryZipReinstall(opts: {
   result?: NodeOpResult;
   /** Why the Manager path could not do it — quoted in every message. */
   managerReason: string;
+  /**
+   * Refuse if the orchestrator retargeted mid-operation. Checked immediately
+   * before the irreversible part and again before any success is reported: this
+   * path MOVES directories, so acting on a target that has since changed could
+   * replace the wrong machine's panel.
+   */
+  assertSameTarget: (stage: string) => void;
 }): Promise<PanelActionResult> {
-  const { deps, ops, dir, comfyuiPath, previousVersion, result, managerReason } = opts;
+  const {
+    deps,
+    ops,
+    dir,
+    comfyuiPath,
+    previousVersion,
+    result,
+    managerReason,
+    assertSameTarget,
+  } = opts;
 
   // CORROBORATE THE TREE before replacing anything in it.
   if (!swapTreeIsCorroborated(deps)) {
@@ -2418,6 +2443,7 @@ async function updateViaRegistryZipReinstall(opts: {
         // A shadow makes any statement about what the BROWSER loads untrue,
         // including "you are already current".
         assertNoPanelShadow("update", still.dir, deps);
+        assertSameTarget("before reporting the panel as current");
         ops.removeDir(staging);
         const atTip =
           `Panel is already at the published version (${still.version}, re-read from ` +
@@ -2465,6 +2491,7 @@ async function updateViaRegistryZipReinstall(opts: {
   // operation puts the working copy back. Refuse the swap if we cannot write it
   // — an unrecoverable swap is worse than no swap.
   const journalPath = swapJournalPath(comfyuiPath);
+  assertSameTarget("before replacing the panel directory");
   try {
     ops.mkdirp(backupRoot);
     ops.writeFile(
@@ -2573,6 +2600,7 @@ async function updateViaRegistryZipReinstall(opts: {
     );
   }
 
+  assertSameTarget("before reporting the reinstall");
   const message =
     `Panel updated (${previousVersion ?? "unknown"} → ${post.version}) by reinstalling ` +
     `from source, verified on disk at ${dir}: ${managerReason}, and the pack is a ` +
@@ -2681,6 +2709,31 @@ export async function runPanelActionInner(
   // installed" and this operation would happily install over the top of a broken
   // state. Both mutation entry points hold the panel op lock, so this is the
   // safe place to put it back.
+  // BIND THE OPERATION TO ONE TARGET.
+  //
+  // This function freezes a LOCAL filesystem base, but the ComfyUI-Manager
+  // mutation it delegates to captures the HTTP target independently, at its own
+  // call time. A retarget landing between the two would dispatch Manager work to
+  // one server and then verify — or clone-swap — the other server's tree, and
+  // report the second's result for the first's request. The orchestrator makes
+  // this reachable in practice: it starts the panel sync on a hello and
+  // retargets in the same handler.
+  //
+  // We cannot make the two captures atomic from here, but we can refuse to
+  // report anything once they may have diverged: the generation is checked
+  // immediately before the mutation and again before any success is returned.
+  const opGeneration = panelTargetGeneration();
+  const assertSameTarget = (stage: string): void => {
+    if (panelTargetGeneration() === opGeneration) return;
+    throw new PanelInstallError(
+      `Panel ${action} ABORTED ${stage}: the ComfyUI this orchestrator targets changed ` +
+        `while the operation was in flight, so the local directory it was working in ` +
+        `(${comfyPath}) and the server the ComfyUI-Manager request went to may no ` +
+        `longer be the same install. NOT reporting a result that could describe the ` +
+        `wrong one. Re-run install_panel(action='status'), then retry.`,
+    );
+  };
+
   const swapRepair = reconcilePanelSwap(comfyPath, deps, { repair: true });
   if (!swapRepair.ok) {
     // A broken swap we could NOT put right. Proceeding would install a fresh
@@ -2734,6 +2787,7 @@ export async function runPanelActionInner(
     // update it" and we continue to the verified fallbacks. It is only allowed
     // to propagate when the disk AGREES the pack is absent — then the message
     // is true and there is genuinely nothing to update.
+    assertSameTarget("before the ComfyUI-Manager update");
     let result: NodeOpResult | undefined;
     let managerFailure: string | undefined;
     try {
@@ -2777,12 +2831,21 @@ export async function runPanelActionInner(
       const managerMoved =
         afterManager.installed &&
         !!afterManager.version &&
+        // SAME PHYSICAL DIRECTORY, like every other movement proof here. A
+        // before/after comparison that spans two directories is not evidence of
+        // an update: if the panel re-resolved from A to B, the "previous"
+        // version is A's and the "installed" version is B's, and crediting the
+        // difference to the Manager would invent an update that never happened.
+        !!detection.dir &&
+        !!afterManager.dir &&
+        samePathCI(detection.dir, afterManager.dir, deps) &&
         ((!!previousVersion && afterManager.version !== previousVersion) ||
           (!!previousRev && !!afterManager.gitRev && afterManager.gitRev !== previousRev));
       if (managerMoved && afterManager.dir) {
         // It DID work; only the reporting failed. Verify it the same way every
         // other success is verified, then report the movement we observed.
         assertNoPanelShadow("update", afterManager.dir, deps);
+        assertSameTarget("before reporting a verified update");
         const moved =
           `Panel updated (${previousVersion ?? "unknown"} → ${afterManager.version}), ` +
           `verified on disk at ${afterManager.dir}. ComfyUI-Manager applied the update ` +
@@ -2847,6 +2910,7 @@ export async function runPanelActionInner(
           dir: freshDir,
           comfyuiPath: comfyPath,
           previousVersion: freshVersion,
+          assertSameTarget,
           // The raw Manager text rides along in `details` for diagnosis; the
           // message the fallback composes never quotes it.
           result: {
@@ -3000,15 +3064,18 @@ export async function runPanelActionInner(
         comfyuiPath: comfyPath,
         previousVersion,
         result,
+        assertSameTarget,
         managerReason:
           `ComfyUI-Manager reported the queue drained without moving the pack on disk`,
       });
     }
+    assertSameTarget("before reporting the update verdict");
     return finalizeUpdate(verdict, post, result);
   }
 
   // install / reinstall. Same final pin check as the update path above.
   assertNotPinned(action, deps);
+  assertSameTarget("before the ComfyUI-Manager install");
   const result =
     action === "install"
       ? await deps.install({ id: PANEL_REGISTRY_ID, version: targetVersion })
@@ -3080,6 +3147,7 @@ export async function runPanelActionInner(
     );
   }
 
+  assertSameTarget("before reporting the install");
   return {
     action,
     result,

@@ -166,12 +166,19 @@ export function assertPanelPinAllows(action: string, id: string): void {
   // cannot act at all. So the LEAD instruction switches with the session rather
   // than being appended to. An env pin already carries its own instruction (unset
   // the variable), which is host-side either way and needs no substitution.
-  const usable = panelRecoveryContext().installPanelUsable || pin.source === "env";
+  const usable = panelRecoveryContext().installPanelUsable;
   const clearIt = usable
     ? `clear the pin with install_panel(action='unpin')${envNote}`
-    : `clear the pin ON THE COMFYUI HOST — install_panel cannot act in this ` +
-      `session, so remove it from that machine's ~/.comfyui-mcp/panel-settings.json ` +
-      `(or unset ${PANEL_PIN_ENV_VAR} there) and restart the orchestrator running there`;
+    : pin.source === "env"
+      ? // An env pin is not cleared by any tool anywhere, so naming one would be
+        // noise on top of a dead end — say plainly where the variable lives.
+        `clear the pin ON THE COMFYUI HOST: unset ${PANEL_PIN_ENV_VAR} in that ` +
+        `machine's environment (or ~/.comfyui-mcp/.env) and restart the ` +
+        `orchestrator running there`
+      : `clear the pin ON THE COMFYUI HOST — install_panel cannot act in this ` +
+        `session, so remove it from that machine's ` +
+        `~/.comfyui-mcp/panel-settings.json and restart the orchestrator ` +
+        `running there`;
 
   throw new PanelPinnedError(
     bulk

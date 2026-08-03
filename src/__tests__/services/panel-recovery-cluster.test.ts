@@ -385,6 +385,34 @@ describe("disk-current but handshake-old is diagnosed as a stale tab, not a stal
     expect(verifiedPanelDiskVersion()).toBeUndefined();
   });
 
+  it("a SHADOW copy disqualifies the reading — a hard refresh would reload the shadow", async () => {
+    // The observation answers "is the panel the browser loads already current?".
+    // A served copy in custom_nodes means the browser is loading something other
+    // than the canonical pack whose version we read, so "your install is fine,
+    // just hard-refresh" is doubly wrong — the refresh re-loads the shadow.
+    writePanelPack(PANEL_DIR(), "0.11.38");
+    writePanelPack(join(root, "custom_nodes", ".comfyui-agent-panel.bak-0.11.30"), "0.11.30");
+    const { panelStatus } = await import("../../services/panel-installer.js");
+    await panelStatus();
+    expect(lastPanelDiskObservation()).toBeUndefined();
+  });
+
+  it("an INDETERMINATE shadow scan also disqualifies it — [] from a failed scan is not an all-clear", async () => {
+    writePanelPack(PANEL_DIR(), "0.11.38");
+    recordPanelDiskObservation("0.11.38", PANEL_DIR(), root);
+    const h = makeDeps({ withoutSwapOps: true });
+    // Detection uses the fast-path names, so it still resolves the panel; the
+    // shadow enumeration is what fails.
+    let calls = 0;
+    h.deps.readdir = () => {
+      if (calls++ === 0) return [PANEL_REGISTRY_ID];
+      throw new Error("EACCES: permission denied");
+    };
+    const { panelStatus } = await import("../../services/panel-installer.js");
+    const status = await panelStatus(h.deps);
+    expect(status.shadowInspectFailed).toBe(true);
+  });
+
   it("a dir that is no longer the PANEL yields no version", () => {
     mkdirSync(PANEL_DIR(), { recursive: true });
     writeFileSync(
@@ -801,6 +829,24 @@ describe("a wholesale replacement needs the RUNNING server to have chosen the tr
 
     generation.value++; // a retarget landed
     expect(lastPanelBaseResolution()).toBeUndefined();
+  });
+
+  it("ABORTS when the ComfyUI target changes mid-operation", async () => {
+    // The local filesystem base is frozen here, but the ComfyUI-Manager
+    // mutation captures its HTTP target independently. A retarget between the
+    // two would dispatch work to one server and verify the other's tree. We
+    // cannot make those captures atomic, but we can refuse to report a result
+    // that might describe the wrong install.
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    const h = makeDeps({ cloneVersion: "0.11.38" });
+    h.deps.update = async () => {
+      generation.value++; // a retarget landed while the Manager was working
+      return { mechanism: "manager-http", message: "updated", details: {} };
+    };
+    const err = await runPanelActionInner("update", h.deps).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect((err as Error).message).toMatch(/ABORTED/);
+    expect((err as Error).message).toMatch(/target.*changed|changed while the operation/i);
   });
 
   it("an UNREADABLE custom_nodes is not a proven absence", async () => {
