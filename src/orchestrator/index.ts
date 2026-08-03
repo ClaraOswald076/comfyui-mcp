@@ -2086,6 +2086,16 @@ export async function runPanelOrchestrator(): Promise<void> {
   // spawned after a ComfyUI restart/reconnect.
   liveManager = manager;
 
+  // #468 — let the journal pull a still-unread completion back off an agent's
+  // queue when it has to WEAKEN that completion's correlation (a reused prompt
+  // id, a replaced conversation). The wording is baked in at queue time, so
+  // without this the stale copy would still reach the agent claiming to be the
+  // run it queued. Only ever removes an injected `completionOnly` item.
+  RunCompletions.setRevoker(
+    (panelTabId, token) => manager.revokeEvent(agentKeyFor(panelTabId), token),
+    (panelTabId) => flushRunCompletions(panelTabId),
+  );
+
   /**
    * Deliver every journaled run completion for a panel tab (#468).
    *

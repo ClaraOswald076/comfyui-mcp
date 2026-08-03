@@ -222,6 +222,40 @@ export class RunCompletionJournalImpl {
    *  re-send is suppressed but a later genuinely-different render is not. */
   private idlessSeen = new Map<string, number>();
   private seq = 0;
+  /** Pull a still-queued completion back off its agent (see setRevoker). */
+  private revoke: ((key: string, token: string) => boolean) | null = null;
+  /** Re-deliver a tab's pending completions (after a revoke re-arms one). */
+  private reflush: ((key: string) => void) | null = null;
+
+  /**
+   * Wire the "unsend" hook (#468).
+   *
+   * A completion's WORDING is materialized when it is queued into an agent, so a
+   * correlation the journal later has to WEAKEN — a prompt id reused, a
+   * conversation replaced — would still reach the agent claiming "this is the run
+   * YOU queued". This lets the journal pull the stale copy back (only while it is
+   * still unread) and re-deliver the honest, downgraded version. Returns whether
+   * the item was actually removed.
+   */
+  setRevoker(revoke: (key: string, token: string) => boolean, reflush?: (key: string) => void): void {
+    this.revoke = revoke;
+    this.reflush = reflush ?? null;
+  }
+
+  /** Re-arm an entry whose correlation just weakened, if its already-queued copy
+   *  can still be pulled back. Once the carrying turn has started the text is in
+   *  the model's context and cannot be recalled — nothing to do but leave it. */
+  private reissueAfterDowngrade(entry: JournalEntry): void {
+    if (entry.state !== "handed_off") return;
+    if (!this.revoke?.(entry.key, entry.token)) return;
+    entry.state = "pending";
+    logger.info(
+      `[run-completions] pulled a queued completion back after its correlation weakened — re-delivering it as ${describe(entry.correlation)}`,
+    );
+    // Re-queue it immediately with the honest wording; a revoked entry left
+    // merely `pending` would wait for some unrelated later flush.
+    this.reflush?.(entry.key);
+  }
 
   /** `panel_run` queued a render. Returns false when ComfyUI/the panel gave us
    *  no prompt id — the caller MUST then tell the agent its completion cannot be
@@ -275,6 +309,9 @@ export class RunCompletionJournalImpl {
           logger.warn(
             `[run-completions] prompt ${promptId} was queued again while its previous completion was still undelivered — the older entry is superseded (and reported as undetermined) so it can no longer answer for the new run`,
           );
+          // Its already-queued copy still SAYS "the run YOU queued". Pull it back
+          // if it hasn't been read yet and re-deliver the downgraded wording.
+          this.reissueAfterDowngrade(entry);
         }
       }
       return true;
@@ -730,6 +767,9 @@ export class RunCompletionJournalImpl {
     for (const entry of this.entries.values()) {
       if (entry.key === key && entry.correlation.status === "matched") {
         entry.correlation = { status: "foreign", promptId: entry.correlation.promptId };
+        // Same as the reused-id downgrade: the queued copy still claims to be the
+        // run this (now-replaced) conversation queued. Recall it if we still can.
+        this.reissueAfterDowngrade(entry);
       }
     }
   }

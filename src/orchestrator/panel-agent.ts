@@ -523,6 +523,26 @@ export class PanelAgent {
     wake?.();
   }
 
+  /**
+   * Pull a still-queued INJECTED COMPLETION back off the queue by its journal
+   * token (#468). Returns true only if it was found and removed — false once the
+   * turn carrying it has started, where the text is already in the model's
+   * context and cannot be recalled.
+   *
+   * Needed because the event's wording is materialized when it is queued: if the
+   * journal later has to WEAKEN that completion's correlation (a prompt id
+   * reused, a conversation replaced), the already-queued copy would still claim
+   * "this is the run YOU queued". Revoking lets the journal re-deliver the
+   * downgraded, honest version instead. Only `completionOnly` items are eligible,
+   * so no user message is ever removed.
+   */
+  revokeEvent(token: string): boolean {
+    const i = this.queue.findIndex((item) => item.completionOnly && item.eventTokens?.includes(token));
+    if (i < 0) return false;
+    this.queue.splice(i, 1);
+    return true;
+  }
+
   /** Drop a still-queued message (the user cancelled/edited it before the agent
    *  got to it). Returns true if it was found and removed; false if it was
    *  already dequeued (the turn started — too late to cancel). */
@@ -1317,9 +1337,20 @@ export class PanelAgent {
       );
       return;
     }
-    // Proof the backend RECEIVED the in-flight turn (#468) — stragglers were
-    // already dead-lettered above, so anything reaching here belongs to it.
-    this.turnProducedEvents = true;
+    // Proof the backend RECEIVED the in-flight turn (#468). On a backend that
+    // DECLARES turn markers, only an event stamped with THIS turn counts: #728
+    // deliberately lets UNMARKED events past the dead-letter guard for gate
+    // liveness, and Claude emits an unmarked terminal for a result it cannot
+    // match to any submitted turn — a stale one of those, arriving while the new
+    // turn is still pre-submission, would otherwise "prove" a receipt that never
+    // happened and let the settle bound retire a completion nobody saw.
+    if (this.backend.capabilities.turnMarkers === true) {
+      if (typeof ev.turn === "number" && ev.turn === this.currentTurnMarker) {
+        this.turnProducedEvents = true;
+      }
+    } else {
+      this.turnProducedEvents = true; // nothing to compare against
+    }
     // Any event means the turn is alive — reset the idle watchdog. The `result`
     // case below disarms it entirely (turn ended). Placed before the switch so it
     // covers every event type without per-case bumps.
@@ -1950,6 +1981,15 @@ export class PanelAgentManager {
     const agent = this.agents.get(tabId);
     if (!agent || agent.isStopped) return false; // best-effort; don't enqueue into a closed agent
     return agent.injectEvent(ev, opts);
+  }
+
+  /** Pull a still-queued injected completion back off a tab's agent by journal
+   *  token (#468), so a weakened correlation can be re-delivered honestly.
+   *  False when there is no such agent or the turn carrying it already started. */
+  revokeEvent(tabId: string, token: string): boolean {
+    const agent = this.agents.get(tabId);
+    if (!agent || agent.isStopped) return false;
+    return agent.revokeEvent(token);
   }
 
   /** Push a ComfyUI execution error to a tab's agent — interrupt the live turn

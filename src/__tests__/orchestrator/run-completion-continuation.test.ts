@@ -154,6 +154,10 @@ function makeHarness(backend: AgentBackend) {
     journal.deliverPending(tab, (payload, token) =>
       manager.injectEvent(tab, payload, { eventToken: token }),
     );
+  journal.setRevoker(
+    (key, token) => manager.revokeEvent(key, token),
+    (key) => void flush(key),
+  );
   const manager = new PanelAgentManager({
     mcpServers: {},
     systemAppend: "",
@@ -587,6 +591,36 @@ describe("run completion across automatic goal continuation (#468)", () => {
     await waitFor(() => manager.hasHeldMail(tab), 5000);
     expect(journal.outstanding(tab)).toHaveLength(1);
     expect(journal.ticketFor(PROMPT_A)?.settled).toBe(false);
+  });
+
+  it("a queued completion whose id is then REUSED is pulled back and re-worded", async () => {
+    // The wording is baked in when the event is queued. If the completion is
+    // still sitting unread and its correlation then weakens (ComfyUI reused the
+    // prompt id), the stale copy would otherwise reach the agent still claiming
+    // "the run YOU queued" — letting it read run A's output as run B's result.
+    const backend = new ContinuationBackend();
+    const { journal, manager, arrive } = makeHarness(backend);
+    const tab = "tab-reissue";
+
+    journal.openRun(PROMPT_A, { tabId: tab });
+    manager.send(tab, "go");
+    await waitFor(() => backend.turns.length >= 1); // turn 1 is HELD open
+
+    // A's completion lands while the agent is busy → queued, unread.
+    arrive(tab, { kind: "executed", prompt_id: PROMPT_A, images: [{ filename: "runA.png" }] });
+    expect(journal.outstanding(tab)[0].state).toBe("handed_off");
+
+    // ComfyUI reuses the id for run B while A's copy is still unread: the stale
+    // copy is pulled back off the queue and immediately re-queued, re-worded.
+    journal.openRun(PROMPT_A, { tabId: tab });
+    expect(journal.outstanding(tab)).toHaveLength(1); // one copy, not two
+
+    backend.finishTurn();
+    await waitFor(() => backend.turns.length >= 2);
+    const text = backend.turns[1];
+    expect(text).toContain("runA.png"); // still delivered — never swallowed
+    expect(text).not.toContain("This is the run YOU queued");
+    expect(text).toContain("UNDETERMINED");
   });
 
   it("a replayed completion never satisfies a DIFFERENT run", async () => {
