@@ -2212,25 +2212,27 @@ function comfyWorkflowsDirs(): string[] {
 }
 
 /**
- * The HTTP status behind a failed `client.fetchApi` call, or undefined when the
- * failure carried no status (a genuine transport error).
+ * Issue ONE userdata GET and hand back the raw Response.
  *
- * WHY THIS EXISTS: `@stable-canvas/comfyui-client`'s `fetchApi` THROWS an
- * `HttpError {status, json}` for every status outside 2xx/3xx — it never returns
- * a non-ok Response. Code that only inspected `res.status` therefore classified
- * EVERY 401/403/404/5xx as a transport failure, which silently enabled the
- * guessed-local-directory fallback for a server that was reachable and had
- * REFUSED. That is precisely how a different same-named workflow gets loaded
- * (#202). The returned-non-ok shape is still handled by the caller for older
- * clients and for tests that stub a plain Response.
+ * This deliberately bypasses the client's own `fetchApi` (codex/gate MAJOR).
+ * `fetchApi` throws for every non-2xx AND calls `response.json()` while building
+ * that error — so a refusal with a non-JSON body (a `403 text/plain` from a proxy,
+ * an HTML 502) rejects with a STATUSLESS SyntaxError. There is then no way to tell
+ * "the server refused" from "the server was never reached", and the resolver's
+ * local fallback would re-open for a server that had explicitly refused, loading a
+ * different graph (#202).
  *
- * A 4xx/5xx whose body is not JSON makes the library's own `await res.json()`
- * reject, so the status is genuinely unrecoverable there — those fall through to
- * `undefined` (treated as "no authority", never as "the server said no").
+ * Building the request from the client's own `apiURL` + `apiHeaders` keeps every
+ * transport concern identical (host, ssl, base path, clientId, Comfy-User, the
+ * injected COMFYUI_AUTH_* fetch) while making the outcome unambiguous:
+ *   - a returned Response  = the server ANSWERED; classify by status, decode later
+ *   - a thrown error       = no Response exists, so the request never got one
+ * Nothing here reads a body, so a body that cannot be decoded can never be
+ * mistaken for a transport failure.
  */
-function httpStatusOfError(err: unknown): number | undefined {
-  const status = (err as { status?: unknown } | null | undefined)?.status;
-  return typeof status === "number" && Number.isFinite(status) ? status : undefined;
+async function userdataFetch(route: string): Promise<Response> {
+  const client = getClient();
+  return await client.fetch(client.apiURL(route), { headers: client.apiHeaders() });
 }
 
 /** Drop the one leading "workflows/" segment, leaving a store-RELATIVE key.
@@ -2284,19 +2286,29 @@ const looseStoreKey = (key: string): string =>
  * The connected ComfyUI's OWN list of saved workflow store keys, or null when the
  * listing could not be read. This is the same source list_workflows reports (the
  * SAVED library, not the open tabs), so it reflects the server's runtime
- * `--user-directory`
- * — it is asked, never reconstructed. Used only to turn an authoritative
- * "no such name" into either the server's EXACT key or an explicit refusal.
- * Never throws: an unreadable listing simply means "no extra information".
+ * `--user-directory` — it is asked, never reconstructed. Used only to turn an
+ * authoritative "no such name" into either the server's EXACT key or an explicit
+ * refusal. Never throws: an unreadable listing simply means "no extra
+ * information", and the refusal says the listing could not be read.
+ *
+ * `recurse=true` is VERIFIED against the installed ComfyUI (0.29.2): a workflow in
+ * a SUBFOLDER is absent from the plain listing and present as "sub/name.json"
+ * under recurse, while root entries stay bare. Without it, a nested name that
+ * differs only by Unicode normalization has no listing entry to match and is
+ * refused. The parameter is safe on builds that do not implement it — an unknown
+ * query arg is ignored and the flat list comes back, which is exactly the
+ * pre-existing behaviour (over-refusal of nested near-misses, never a wrong file),
+ * so this needs no version gate.
  */
 async function listUserdataWorkflowKeys(): Promise<string[] | null> {
   try {
-    const res = await getClient().fetchApi("/api/userdata?dir=workflows");
+    const res = await userdataFetch("/api/userdata?dir=workflows&recurse=true");
     if (!res.ok) return null;
     const body: unknown = await res.json();
     if (!Array.isArray(body)) return null;
-    // Tolerate both shapes ComfyUI builds return: bare strings, and richer
-    // entries ({path}/{name}) from full-info-style responses.
+    // Tolerate both shapes ComfyUI builds return: bare strings (the default on
+    // 0.29.2), and {path} objects (what full_info=true emits, in case a build
+    // returns that shape by default).
     return body
       .map((entry) => {
         if (typeof entry === "string") return entry;
@@ -2348,8 +2360,13 @@ function assertUiWorkflow(parsed: unknown, sourceLabel: string): Record<string, 
  *                                         REFUSE — an absence from the authority
  *                                         means any local hit is a DIFFERENT file
  *   - name matches several library keys → REFUSE as ambiguous, naming them
- *   - server unreachable (no answer)    → best-effort reconstructed local dirs,
+ *   - NO HTTP RESPONSE AT ALL           → best-effort reconstructed local dirs,
  *                                         and REFUSE if more than one file matches
+ *
+ * That last line is the only branch that guesses, and it is deliberately narrow: a
+ * reply that ARRIVED but could not be decoded is a refusal, not an absence of
+ * authority. See userdataFetch for why the request bypasses the client's
+ * throw-on-non-2xx wrapper to make that distinction sound.
  *
  * Guards: must be .json and must parse to a UI workflow (a top-level `nodes`
  * array). Every failure names exactly what was tried.
@@ -2423,61 +2440,57 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
     );
   }
   // One userdata GET, classified. `key` is the STORE key (already "workflows/…").
-  // The status must be recovered from a THROWN HttpError as well as from a
-  // returned non-ok Response — see httpStatusOfError: the real client never
-  // returns a non-ok Response, so reading only `res.status` made every refusal
-  // look like a transport failure.
+  //
+  // The request goes through userdataFetch, which returns the raw Response instead
+  // of the client's throw-on-non-2xx wrapper. That is what makes this split sound
+  // (gate MAJOR): the ONLY way to land in the catch is for no Response to exist at
+  // all, so "the server refused with a body we could not decode" can never be
+  // mistaken for "the server was never reached" and re-open the local fallback.
   const fetchUserdataKey = async (key: string): Promise<Outcome> => {
+    let res: Response;
     try {
-      const client = getClient();
-      const res = await client.fetchApi(`/api/userdata/${encodeURIComponent(key)}`);
-      if (res.ok) {
-        // Read the body as TEXT and classify HERE so a malformed 2xx surfaces its
-        // OWN error, while ComfyUI's "200 + EMPTY body = file does not exist"
-        // convention (some builds; see parseWorkflowLock) is an ABSENCE — an
-        // authoritative "no such name", not a malformed file.
-        //
-        // The body read gets its OWN try/catch (codex MAJOR): a stream that aborts
-        // MID-BODY would otherwise fall out to the outer catch as a statusless
-        // error and be classified "unreachable", re-opening the reconstructed
-        // local fallback for a server that had in fact ANSWERED — the wrong-file
-        // path again. The server answered, so this is a refusal, not an absence.
-        let body: string;
-        try {
-          body = (await res.text()).trim();
-        } catch (err) {
-          return {
-            kind: "refused",
-            detail:
-              `ComfyUI answered ${res.status} for "${key}" but the response body could not be read ` +
-              `(${err instanceof Error ? err.message : String(err)})`,
-          };
-        }
-        if (body === "") {
-          return { kind: "absent", detail: `is not in the connected ComfyUI's workflow library (empty 200 response for "${key}")` };
-        }
-        try {
-          return { kind: "found", parsed: JSON.parse(body) };
-        } catch (err) {
-          return { kind: "malformed", detail: err instanceof Error ? err.message : String(err) };
-        }
-      }
-      if (res.status === 404) {
-        return { kind: "absent", detail: `is not in the connected ComfyUI's workflow library (HTTP 404 for "${key}")` };
-      }
-      return { kind: "refused", detail: `ComfyUI userdata library returned HTTP ${res.status} for "${key}"` };
+      res = await userdataFetch(`/api/userdata/${encodeURIComponent(key)}`);
     } catch (err) {
-      const status = httpStatusOfError(err);
-      if (status === 404) {
-        return { kind: "absent", detail: `is not in the connected ComfyUI's workflow library (HTTP 404 for "${key}")` };
-      }
-      if (status !== undefined) {
-        return { kind: "refused", detail: `ComfyUI userdata library returned HTTP ${status} for "${key}"` };
-      }
+      // No Response object exists — the request never received an answer
+      // (connection refused, DNS, TLS, timeout), or no client could be built at
+      // all. This is the ONLY outcome that leaves the orchestrator without an
+      // authority to defer to.
       return {
         kind: "unreachable",
         detail: `the connected ComfyUI's workflow library could not be reached (${err instanceof Error ? err.message : String(err)})`,
       };
+    }
+    // From here the server ANSWERED. Every remaining outcome is authoritative, and
+    // none of them may fall back to a reconstructed local path.
+    if (!res.ok) {
+      if (res.status === 404) {
+        return { kind: "absent", detail: `is not in the connected ComfyUI's workflow library (HTTP 404 for "${key}")` };
+      }
+      return { kind: "refused", detail: `ComfyUI userdata library returned HTTP ${res.status} for "${key}"` };
+    }
+    // Read the body as TEXT and classify HERE so a malformed 2xx surfaces its OWN
+    // error, while ComfyUI's "200 + EMPTY body = file does not exist" convention
+    // (some builds; see parseWorkflowLock) is an ABSENCE — an authoritative "no
+    // such name", not a malformed file. A body that cannot be read is a REFUSAL:
+    // the server answered, we simply could not decode it.
+    let body: string;
+    try {
+      body = (await res.text()).trim();
+    } catch (err) {
+      return {
+        kind: "refused",
+        detail:
+          `ComfyUI answered ${res.status} for "${key}" but the response body could not be read ` +
+          `(${err instanceof Error ? err.message : String(err)})`,
+      };
+    }
+    if (body === "") {
+      return { kind: "absent", detail: `is not in the connected ComfyUI's workflow library (empty 200 response for "${key}")` };
+    }
+    try {
+      return { kind: "found", parsed: JSON.parse(body) };
+    } catch (err) {
+      return { kind: "malformed", detail: err instanceof Error ? err.message : String(err) };
     }
   };
 

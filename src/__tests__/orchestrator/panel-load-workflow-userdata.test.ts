@@ -11,8 +11,9 @@
 // The resolver now asks the server first and, when the server answers, defers to
 // that answer completely: it refuses instead of falling back to a reconstructed
 // path, and refuses instead of picking between several candidates. Only a server
-// that gives NO answer at all (a statusless transport error) re-enables the
-// best-effort local read that keeps the default layout working.
+// that gives NO answer at all re-enables the best-effort local read that keeps the
+// default layout working — and "no answer" means no HTTP Response object exists,
+// not merely a reply we could not decode.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -21,12 +22,28 @@ import { join } from "node:path";
 // Stub ONLY getClient so no real ComfyUI connection is attempted; every other
 // client export keeps its real implementation (panel-tools' module graph uses
 // several of them at import time).
+//
+// The resolver builds its request from the client's `apiURL` + `apiHeaders` and
+// calls `fetch` directly, rather than the throw-on-non-2xx `fetchApi` wrapper —
+// that is what lets it tell a refusal apart from an unreachable server. `apiURL`
+// is the identity here so assertions keep naming the plain route, and the mock
+// `fetch` records only the URL so single-argument assertions stay readable; the
+// init object is captured separately in `fetchInit` for the one test that checks
+// the client's headers are still applied.
 const fetchApi = vi.fn();
+const fetchInit = vi.fn();
 vi.mock("../../comfyui/client.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../comfyui/client.js")>();
   return {
     ...actual,
-    getClient: () => ({ fetchApi: (...a: unknown[]) => fetchApi(...a) }),
+    getClient: () => ({
+      apiURL: (route: string) => route,
+      apiHeaders: () => ({ "Comfy-User": "default", Accept: "*/*" }),
+      fetch: (url: string, init?: unknown) => {
+        fetchInit(init);
+        return fetchApi(url);
+      },
+    }),
   };
 });
 
@@ -57,6 +74,7 @@ function loadWorkflow() {
 let savedComfyPath: string | undefined;
 beforeEach(() => {
   fetchApi.mockReset();
+  fetchInit.mockReset();
   savedComfyPath = process.env.COMFYUI_PATH;
   // No local COMFYUI_PATH → the guessed workflows dirs are empty, so a relative
   // name misses on disk and MUST fall through to the userdata API.
@@ -261,19 +279,21 @@ describe("panel_load_workflow: userdata fallback for a custom --user-directory (
   });
 });
 
-// #202 — the connected ComfyUI's real fetch client (@stable-canvas/comfyui-client)
-// THROWS an HttpError {status} for every non-2xx; it never returns a non-ok
-// Response. Classifying only `res.status` therefore turned every 401/403/5xx into
-// "unreachable", which re-enabled the guessed-local-directory fallback for a
-// server that had REFUSED — the wrong-file path this resolver exists to close.
-describe("readWorkflowFromPath: HTTP status is recovered from a THROWN client error (#202)", () => {
-  class HttpError extends Error {
-    constructor(message: string, readonly status: number) {
-      super(message);
-    }
-  }
-
-  it("a THROWN 403 is a refusal — never a fallback to a colliding local file", async () => {
+// #202 (gate MAJOR) — the client's own `fetchApi` throws for every non-2xx AND
+// calls `response.json()` while building that error, so a refusal with a NON-JSON
+// body (a `403 text/plain` from a proxy, an HTML 502) rejected with a STATUSLESS
+// SyntaxError. Classifying that as "unreachable" re-opened the guessed-local-dir
+// fallback for a server that had explicitly REFUSED, and loaded a different graph.
+//
+// The resolver now issues the request itself and keeps the raw Response, so the
+// split is categorical: a Response means the server answered (classify by status,
+// whatever the body turns out to be), and a throw means no Response exists at all.
+describe("readWorkflowFromPath: a refusal is never mistaken for an unreachable server (#202)", () => {
+  /** A workflows dir holding a DIFFERENT graph of the same name — the file that
+   *  must never be substituted when the server refuses. */
+  const withCollidingLocalFile = async (
+    run: (path: string) => Promise<void>,
+  ): Promise<void> => {
     const root = mkdtempSync(join(tmpdir(), "cmcp-userdir-"));
     try {
       const defaultDir = join(root, "user", "default", "workflows");
@@ -284,43 +304,89 @@ describe("readWorkflowFromPath: HTTP status is recovered from a THROWN client er
         "utf8",
       );
       process.env.COMFYUI_PATH = root;
+      await run("foo.json");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  };
 
-      fetchApi.mockRejectedValue(new HttpError("Endpoint Bad Request (403 Forbidden)", 403));
+  it("a 403 whose body is NOT JSON refuses — the resolver never parses the error body", async () => {
+    // The exact reported shape: a plain-text 403. Both decoders throw, proving the
+    // classification never depends on reading the body of a refusal.
+    await withCollidingLocalFile(async (path) => {
+      fetchApi.mockResolvedValue({
+        ok: false,
+        status: 403,
+        json: async () => {
+          throw new SyntaxError("Unexpected token 'F', \"Forbidden\" is not valid JSON");
+        },
+        text: async () => {
+          throw new SyntaxError("body already consumed");
+        },
+      });
 
       const { ctx, calls } = makeCtx();
-      const res = await loadWorkflow().handler({ path: "foo.json" }, ctx);
+      const res = await loadWorkflow().handler({ path }, ctx);
 
       expect(res.isError).toBe(true);
       expect(calls).toHaveLength(0); // the colliding local file was NOT loaded
       expect(JSON.stringify(res)).toMatch(/HTTP 403/);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
+      // Classified as a refusal, NOT as an unreachable server.
+      expect(JSON.stringify(res)).not.toMatch(/could not be reached/i);
+    });
   });
 
-  it("a THROWN 404 is an authoritative absence — refused, not silently substituted", async () => {
-    const root = mkdtempSync(join(tmpdir(), "cmcp-userdir-"));
-    try {
-      const defaultDir = join(root, "user", "default", "workflows");
-      mkdirSync(defaultDir, { recursive: true });
-      writeFileSync(
-        join(defaultDir, "foo.json"),
-        JSON.stringify({ nodes: [{ id: 1, type: "CollidingLocalNode" }], links: [] }),
-        "utf8",
-      );
-      process.env.COMFYUI_PATH = root;
-
-      fetchApi.mockRejectedValue(new HttpError("Endpoint Bad Request (404 Not Found)", 404));
+  it("a 500 with an HTML body refuses rather than substituting the local file", async () => {
+    await withCollidingLocalFile(async (path) => {
+      fetchApi.mockResolvedValue({
+        ok: false,
+        status: 502,
+        json: async () => {
+          throw new SyntaxError("Unexpected token '<'");
+        },
+      });
 
       const { ctx, calls } = makeCtx();
-      const res = await loadWorkflow().handler({ path: "foo.json" }, ctx);
+      const res = await loadWorkflow().handler({ path }, ctx);
+
+      expect(res.isError).toBe(true);
+      expect(calls).toHaveLength(0);
+      expect(JSON.stringify(res)).toMatch(/HTTP 502/);
+    });
+  });
+
+  it("a 404 Response is an authoritative absence — refused, not silently substituted", async () => {
+    await withCollidingLocalFile(async (path) => {
+      fetchApi.mockImplementation(async (route: string) =>
+        route.startsWith("/api/userdata?")
+          ? { ok: true, status: 200, json: async () => [] }
+          : { ok: false, status: 404, json: async () => ({}) },
+      );
+
+      const { ctx, calls } = makeCtx();
+      const res = await loadWorkflow().handler({ path }, ctx);
 
       expect(res.isError).toBe(true);
       expect(calls).toHaveLength(0);
       expect(JSON.stringify(res)).toMatch(/404/);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
+    });
+  });
+
+  it("applies the client's own request headers", async () => {
+    // The direct fetch must not drop what fetchApi used to add (Comfy-User, Accept,
+    // and the injected COMFYUI_AUTH_* handling that lives in the client's fetch).
+    fetchApi.mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ nodes: [], links: [] }),
+    });
+
+    const { ctx } = makeCtx();
+    await loadWorkflow().handler({ path: "headers.json" }, ctx);
+
+    expect(fetchInit).toHaveBeenCalledWith(
+      expect.objectContaining({ headers: expect.objectContaining({ "Comfy-User": "default" }) }),
+    );
   });
 
   it("a statusless transport error still allows the reconstructed local dir (default layout)", async () => {
@@ -477,6 +543,27 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
     );
     // But it IS named as a near miss so the user can retype it.
     expect(JSON.stringify(res)).toMatch(/path separator/i);
+  });
+
+  it("resolves a normalization near-miss for a workflow in a SUBFOLDER", async () => {
+    // The listing is requested with recurse=true, which is VERIFIED against the
+    // installed ComfyUI (0.29.2): a nested workflow is absent from the plain
+    // listing and present as "sub/name.json" under recurse. Without it a nested
+    // NFD/NFC near-miss had no listing entry to match and was refused.
+    const nfc = "caf\u00e9.json";
+    const nfd = "cafe\u0301.json";
+    const graph = { nodes: [{ id: 51, type: "NestedRecipeNode" }], links: [] };
+    routeMock([`recipes/${nfc}`], { [`workflows/recipes/${nfc}`]: graph });
+
+    const { ctx, calls } = makeCtx();
+    const res = await loadWorkflow().handler({ path: `recipes/${nfd}` }, ctx);
+
+    expect(res.isError).toBeUndefined();
+    expect(calls[0].graph).toMatchObject(graph);
+    expect(fetchApi).toHaveBeenCalledWith("/api/userdata?dir=workflows&recurse=true");
+    expect(fetchApi).toHaveBeenCalledWith(
+      `/api/userdata/${encodeURIComponent(`workflows/recipes/${nfc}`)}`,
+    );
   });
 
   it("does NOT collapse a repeated slash after the workflows/ prefix", async () => {
@@ -696,7 +783,7 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
     expect(calls).toHaveLength(0);
     // The listing WAS consulted (and its 500 swallowed) — otherwise this test would
     // pass even if the near-miss lookup had been dropped entirely.
-    expect(fetchApi).toHaveBeenCalledWith("/api/userdata?dir=workflows");
+    expect(fetchApi).toHaveBeenCalledWith("/api/userdata?dir=workflows&recurse=true");
     expect(JSON.stringify(res)).toMatch(/list_workflows/);
     // And the refusal admits the listing was unreadable rather than implying the
     // library was fully checked.
