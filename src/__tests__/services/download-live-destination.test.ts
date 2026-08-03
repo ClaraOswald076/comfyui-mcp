@@ -223,16 +223,16 @@ describe("pre-write: a destination the LIVE server does not read from is refused
     );
   });
 
-  it("sweeps standard categories when the tree has FOLDERS but no model files (codex gate r9)", async () => {
-    // Not "bare" (an empty checkpoints/ exists), yet it still says nothing. The live
-    // server's only model is in text_encoders — ninth in the standard list.
+  it("PROCEEDS when the tree has FOLDERS but no model files to contradict anything", async () => {
+    // Nothing on disk here can contradict the server, and the fact that its models
+    // live somewhere we cannot see is not evidence about THIS directory.
     h.onDisk = { loras: [], checkpoints: [] };
     h.liveListings["loras"] = [];
     h.liveListings["checkpoints"] = [];
     h.liveListings["text_encoders"] = ["t5xxl.safetensors"];
     h.liveExtraRoots = { authoritative: true, exhaustive: true, roots: [] };
-    await expect(resolveModelSubfolderPreferServer("loras")).rejects.toThrow(
-      /DIFFERENT install/,
+    await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBe(
+      resolve("/comfy/models/loras"),
     );
   });
 
@@ -254,95 +254,41 @@ describe("pre-write: a destination the LIVE server does not read from is refused
     );
   });
 
-  it("ALLOWS an empty tree when a live EXTRA ROOT could be holding the server's models", async () => {
-    h.onDisk = { loras: [] };
-    h.liveListings["loras"] = ["live-only.safetensors"];
-    h.liveExtraRoots = { authoritative: true, exhaustive: true, roots: [{ category: "loras", dir: "/E/models/loras" }] };
+  // There is deliberately NO "the server lists models this tree cannot account for"
+  // refusal. Not being able to EXPLAIN the server's models is absence of evidence,
+  // not proof of a different install: the roots may come from a config we cannot
+  // read, one deleted after the server loaded it, or a shape nobody enumerated.
+  // Every tightening of that rule produced another false refusal of a legitimate
+  // setup, so an unaccountable tree PROCEEDS and the post-write check reports
+  // honestly (maintainer ruling).
+  it("PROCEEDS on an empty tree whose live models cannot be accounted for", async () => {
+    h.onDisk = { loras: [], checkpoints: [] };
+    h.liveListings["loras"] = ["a.safetensors", "b.safetensors"];
+    h.liveListings["checkpoints"] = ["c.safetensors"];
+    h.liveExtraRoots = { authoritative: true, exhaustive: true, roots: [] };
     await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBe(
       resolve("/comfy/models/loras"),
     );
   });
 
-  it("ALLOWS an empty tree when extra-root authorization is INCONCLUSIVE (fails open)", async () => {
+  it("PROCEEDS when a config was deleted AFTER the server loaded its roots", async () => {
+    // The running process still holds `E:\\Models\\loras`; its YAML is gone, so the
+    // roots are unknowable. The old rule called this "a DIFFERENT install" and
+    // blocked the user from downloading into a perfectly valid primary tree.
     h.onDisk = { loras: [] };
     h.liveListings["loras"] = ["live-only.safetensors"];
-    h.liveExtraRoots = { authoritative: false, exhaustive: false, roots: [] }; // cannot rule extra roots out
+    h.liveExtraRoots = { authoritative: true, exhaustive: true, roots: [] };
     await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBe(
       resolve("/comfy/models/loras"),
     );
   });
 
-  it("ALLOWS an empty tree when the live server also has nothing (a fresh install's first model)", async () => {
+  it("PROCEEDS on a brand-new models tree (a fresh install's first model)", async () => {
     h.onDisk = { loras: [] };
     h.liveListings["loras"] = [];
     h.liveExtraRoots = { authoritative: true, exhaustive: true, roots: [] };
     await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBe(
       resolve("/comfy/models/loras"),
-    );
-  });
-
-  it("ALLOWS an empty tree when a CATEGORY-MATCHING extra root explains every gap", async () => {
-    h.onDisk = { loras: [] };
-    h.liveListings["loras"] = ["live-only.safetensors"];
-    h.liveExtraRoots = {
-      authoritative: true,
-      roots: [{ category: "loras", dir: "/E/models/loras" }],
-    };
-    await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBe(
-      resolve("/comfy/models/loras"),
-    );
-  });
-
-  it("REFUSES an empty tree when the only extra root is for a DIFFERENT category (codex gate r6)", async () => {
-    h.onDisk = { loras: [] };
-    h.liveListings["loras"] = ["live-only.safetensors"];
-    h.liveExtraRoots = {
-      authoritative: true,
-      exhaustive: true,
-      roots: [{ category: "checkpoints", dir: "/E/models/checkpoints" }],
-    };
-    await expect(resolveModelSubfolderPreferServer("loras")).rejects.toThrow(
-      /DIFFERENT install/,
-    );
-  });
-
-  it("does NOT refuse an empty tree when the root set is not EXHAUSTIVE (codex gate r18)", async () => {
-    // The server legitimately keeps its LoRAs on an external drive, configured by an
-    // absolute YAML whose base_path needs a server-only env var. The helper DROPS
-    // that group and still reports authoritative — reading it as "registers nothing"
-    // would refuse this user's downloads outright.
-    h.onDisk = { loras: [] };
-    h.liveListings["loras"] = ["live-only.safetensors"];
-    h.liveExtraRoots = { authoritative: true, exhaustive: false, roots: [] };
-    await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBe(
-      resolve("/comfy/models/loras"),
-    );
-  });
-
-  it("does NOT refuse an empty tree when the server's extra-path config is UNKNOWABLE (codex gate r10)", async () => {
-    // Relative argv main.py, no cwd, no absolute --extra-model-paths-config: an
-    // empty live-extra-roots answer means "we could not look", not "there are none".
-    // Refusing here would break a legitimate "all my models live on another drive"
-    // install whose primary tree really is empty.
-    h.snapshotArgv = ["ComfyUI\\main.py"];
-    h.onDisk = { loras: [] };
-    h.liveListings["loras"] = ["live-only.safetensors"];
-    h.liveExtraRoots = { authoritative: true, exhaustive: true, roots: [] };
-    await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBe(
-      resolve("/comfy/models/loras"),
-    );
-  });
-
-  it("REFUSES an EMPTY tree when the live server loads models and registers no extra roots (codex gate r2)", async () => {
-    // Two portable bundles of the same shape; the stale one is still empty, so the
-    // per-category overlap test finds nothing to compare. But the server it is NOT
-    // serving demonstrably reads models from somewhere this tree does not contain.
-    h.onDisk = { loras: [], checkpoints: [] };
-    h.liveListings["loras"] = ["a.safetensors", "b.safetensors"];
-    h.liveListings["checkpoints"] = ["c.safetensors"];
-    h.liveExtraRoots = { authoritative: true, exhaustive: true, roots: [] };
-    await expect(resolveModelSubfolderPreferServer("loras")).rejects.toThrow(
-      /DIFFERENT install/,
     );
   });
 
@@ -364,32 +310,17 @@ describe("pre-write: a destination the LIVE server does not read from is refused
     expect(h.fetchCalls).toEqual([]);
   });
 
-  it("finds evidence in OTHER categories when the models root has no subdirectories at all (codex gate r7)", async () => {
-    // The container-side --models-directory does not exist on the host, so there are
-    // no category folders to enumerate and the TARGET category is empty on the live
-    // server too. Probing standard categories still exposes the mismatch.
-    h.modelsDirSource = "argv-flag";
-    h.modelsRootExists = false;
-    h.onDisk = {}; // no subdirectories at all
-    h.liveListings["loras"] = []; // the target category really is empty upstream
-    h.liveListings["checkpoints"] = ["a.safetensors", "b.safetensors"];
-    h.liveExtraRoots = { authoritative: true, exhaustive: true, roots: [] };
-    await expect(resolveModelSubfolderPreferServer("loras")).rejects.toThrow(
-      /DIFFERENT install/,
-    );
-  });
-
-  it("DOES check a live-resolved root that does NOT exist locally (container path; codex gate r3)", async () => {
-    // A loopback ComfyUI inside Docker reports its CONTAINER-side --models-directory.
-    // Writing that path on the host silently creates a directory nobody reads.
+  it("PROCEEDS on a container-side models root that does not exist here (post-write reports it)", async () => {
+    // A loopback ComfyUI inside Docker reports its CONTAINER-side --models-directory,
+    // which does not exist on the host. There is nothing on disk to contradict it, so
+    // this is unaccountable, NOT proof of a different install — the write goes ahead
+    // and verifyLandedModel reports not-visible afterwards.
     h.modelsDirSource = "argv-flag";
     h.modelsRootExists = false;
     h.onDisk = {}; // nothing on the host at that path
     h.liveListings["loras"] = ["a.safetensors", "b.safetensors"];
     h.liveExtraRoots = { authoritative: true, exhaustive: true, roots: [] };
-    await expect(resolveModelSubfolderPreferServer("loras")).rejects.toThrow(
-      /DIFFERENT install/,
-    );
+    await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBeTruthy();
   });
 
   it("ignores non-core extensions on disk (a .gguf-only dir is not evidence of disagreement)", async () => {

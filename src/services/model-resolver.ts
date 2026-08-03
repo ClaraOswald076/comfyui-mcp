@@ -6,11 +6,7 @@ import { dirname, join, basename, resolve, relative, sep, isAbsolute, extname } 
 import { config, getComfyUIBaseUrl, isRemoteMode } from "../config.js";
 import { getClient, getSystemStats } from "../comfyui/client.js";
 import { getExtraModelRoots, getLiveExtraModelRoots } from "./extra-paths.js";
-import {
-  resolveEffectiveComfyUIBase,
-  liveRootFromArgv,
-  resolveLiveServerRoot,
-} from "./workspace-env.js";
+import { resolveEffectiveComfyUIBase, resolveLiveServerRoot } from "./workspace-env.js";
 import { installModelViaManager } from "./node-management.js";
 import { ModelError, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
@@ -22,7 +18,6 @@ import {
   resolveModelsDirWithBases,
   parseModelsDirFromArgv,
   hasUnresolvableRelativeModelDirFlag,
-  parseExtraModelPathsConfigsFromArgvRaw,
   isLiveAuthoritativeModelsDir,
   type LiveServerSnapshot,
   type ModelsDirSource,
@@ -752,55 +747,27 @@ async function assertDestinationVisibleToLiveServer(
   const primary = [...(target ? [target] : []), ...present.filter((c) => c !== target)];
 
   let probed = 0;
-  let filesOnDisk = 0;
-  let liveListed = 0;
-  /** Categories where the server HAS models but this tree holds none — the ones an
-   *  extra root would have to account for. */
-  const unexplained = new Map<string, number>();
   let worst: { category: string; missing: string[]; onDisk: number; live: number } | undefined;
 
-  const probe = async (categories: string[], budget: number): Promise<void> => {
-    for (const category of categories) {
-      if (worst) return;
-      if (probed >= budget) return;
-      const onDisk = await coreModelFilesUnder(join(modelsRoot, category));
-      const listing = await liveCategoryListing(category);
-      if (listing === undefined) continue; // the server can't speak for it — no evidence
-      probed += 1;
-      filesOnDisk += onDisk.length;
-      liveListed += listing.length;
-      if (onDisk.length === 0 && listing.length > 0) unexplained.set(category, listing.length);
-      if (onDisk.length === 0) continue; // nothing to compare in this folder
-      // CONTAINMENT, not overlap. If this directory really is one the server reads,
-      // it SCANS it — so EVERY core-extension file in it must appear in the listing.
-      // A merely-overlapping name proves nothing: two unrelated installs routinely
-      // share `sd_xl_base_1.0.safetensors`, and treating that as agreement let a
-      // download proceed into a stale tree (codex gate, round 5). Compared as
-      // CATEGORY-RELATIVE paths, so `a/shared.safetensors` is not accounted for by
-      // a live `b/shared.safetensors` (codex gate, round 9).
-      const liveNames = new Set(listing.map((n) => normRel(n)));
-      const missing = onDisk.filter((n) => !liveNames.has(n));
-      if (missing.length === 0) continue; // this folder is fully accounted for — agrees
-      worst = { category, missing, onDisk: onDisk.length, live: listing.length };
-      return;
-    }
-  };
-
-  // Pass 1 — the target category and whatever folders this tree actually has. The
-  // budget keeps a LARGE models tree cheap.
-  await probe(primary, DISAGREEMENT_PROBE_CATEGORIES);
-  // Pass 2 — if the candidate tree turned up NO model files at all, it has told us
-  // nothing, so sweep the standard categories UNCAPPED to find out whether the live
-  // server has models this tree does not (codex gate, rounds 7 and 8). Triggered by
-  // "no files", not merely "no folders": an otherwise-empty stale tree with a couple
-  // of empty category dirs is just as evidence-free (codex gate, round 9). At most a
-  // handful of extra cheap local listing calls, and only in this shape.
-  if (!worst && filesOnDisk === 0) {
-    const probedSet = new Set(primary);
-    await probe(
-      [...MODEL_SUBDIRS].filter((c) => !probedSet.has(c)),
-      Number.POSITIVE_INFINITY,
-    );
+  for (const category of primary) {
+    if (probed >= DISAGREEMENT_PROBE_CATEGORIES) break;
+    const onDisk = await coreModelFilesUnder(join(modelsRoot, category));
+    if (onDisk.length === 0) continue; // nothing here to contradict anything
+    const listing = await liveCategoryListing(category);
+    if (listing === undefined) continue; // the server can't speak for it — no evidence
+    probed += 1;
+    // CONTAINMENT, not overlap. If this directory really is one the server reads, it
+    // SCANS it — so EVERY core-extension file in it must appear in the listing. A
+    // merely-overlapping name proves nothing: two unrelated installs routinely share
+    // `sd_xl_base_1.0.safetensors`, and treating that as agreement let a download
+    // proceed into a stale tree (codex gate, round 5). Compared as CATEGORY-RELATIVE
+    // paths, so `a/shared.safetensors` is not accounted for by a live
+    // `b/shared.safetensors` (codex gate, round 9).
+    const liveNames = new Set(listing.map((n) => normRel(n)));
+    const missing = onDisk.filter((n) => !liveNames.has(n));
+    if (missing.length === 0) continue; // this folder is fully accounted for — agrees
+    worst = { category, missing, onDisk: onDisk.length, live: listing.length };
+    break;
   }
 
   if (worst) {
@@ -817,56 +784,16 @@ async function assertDestinationVisibleToLiveServer(
     );
   }
 
-  // Empty candidate tree vs a server that demonstrably HAS models. Only fatal when
-  // the live server registers no extra model root that could be holding them —
-  // otherwise a legitimate "all my models live on another drive" setup would be
-  // refused. Extra roots are CATEGORY-SCOPED, so a `checkpoints` root does not
-  // explain missing `loras` (codex gate, round 6). Authorization is fail-closed
-  // elsewhere; here a non-authoritative answer means "we cannot rule extra roots
-  // out", so we ALLOW.
-  if (filesOnDisk === 0 && liveListed > 0) {
-    let live: Awaited<ReturnType<typeof getLiveExtraModelRoots>>;
-    try {
-      live = await getLiveExtraModelRoots(snapshot);
-    } catch {
-      return; // cannot rule extra roots out → no refusal
-    }
-    // This branch reasons from the ABSENCE of an extra root, which needs EXHAUSTIVE,
-    // not `authoritative`. They are different claims: the helper still reports
-    // authoritative when it skipped a relative config flag, could not read a config
-    // file, or DROPPED a group whose base_path needed a server-only env var. Reading
-    // authoritative here refused a legitimate external-drive install outright (codex
-    // gate, round 18) — the exact outcome the base-anchored ruling exists to prevent.
-    if (!live.authoritative || !live.exhaustive) return;
-    // Even exhaustive enumeration is only meaningful if we could have LOCATED the
-    // server's configs at all: with a relative argv, no cwd and no process
-    // observation there is nothing to enumerate, so an empty list is not proof
-    // (codex gate, round 10).
-    const enumerable =
-      parseExtraModelPathsConfigsFromArgvRaw(snapshot.argv).some((v) => isAbsolute(v)) ||
-      liveRootFromArgv(snapshot.argv, snapshot.cwd) !== undefined;
-    if (!enumerable) return;
-    const covered = new Set(
-      live.roots.map((r) => String(r.category ?? "").trim().toLowerCase()),
-    );
-    // Some category the server serves has NO extra root that could supply it, and
-    // this tree does not supply it either. If every unexplained category IS covered
-    // by an extra root, the tree is plausibly just a bare primary root — allow.
-    const stillUnexplained = [...unexplained.keys()].filter(
-      (c) => !covered.has(c.toLowerCase()),
-    );
-    if (stillUnexplained.length === 0) return;
-    throw new ModelError(
-      `Refusing to download into "${modelsRoot}": the connected ComfyUI ` +
-        `(${getComfyUIBaseUrl()}) lists ${liveListed} model file(s) it can load, but this ` +
-        "directory tree contains none of them and the running server registers no extra model " +
-        "paths that could hold them — so this is a DIFFERENT install than the one serving you. " +
-        "This destination came from local configuration (COMFYUI_PATH / the saved default " +
-        "workspace), not from the running server, which could not tell us its own install root. " +
-        "Point COMFYUI_PATH at the ComfyUI that is actually running, or launch it with an " +
-        "absolute --base-directory, then retry.",
-    );
-  }
+  // NOTE — there is deliberately NO 'the server lists models this tree does not contain'
+  // refusal. That inference is itself absence of evidence: not being able to ACCOUNT
+  // for the server's models is not proof the destination belongs to a different
+  // install. The roots could be registered by a config we cannot read, one deleted
+  // after the server loaded it, or a path shape nobody has enumerated yet — and each
+  // time that rule was tightened it produced another FALSE REFUSAL of a legitimate
+  // setup (an external drive, a moved YAML). Per the maintainer ruling, unaccountable
+  // is a PROCEED-UNVERIFIED state, not a refusal: the download goes through and the
+  // post-write check reports honestly. This guard refuses only on POSITIVE evidence —
+  // files sitting in this tree that the running server demonstrably does not read.
 }
 
 /** Normalize a listing entry / relative path for comparison (ComfyUI reports
