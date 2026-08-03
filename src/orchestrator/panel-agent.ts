@@ -173,6 +173,28 @@ export interface QueueItem {
   mid?: string;
   /** Run-completion journal tokens this item is carrying (#468). */
   eventTokens?: string[];
+  /** True when this item is NOTHING BUT an injected panel event — its whole text
+   *  is the event, so removing it removes the event and loses no user message.
+   *  A re-queued turn restores the original items rather than one merged item
+   *  (see PanelAgent.inFlight), so this stays accurate across an interrupt or a
+   *  crash re-queue. */
+  completionOnly?: boolean;
+}
+
+/** The turn currently in flight, captured at dispatch so an interrupt or a
+ *  mid-turn crash can re-queue it. */
+export interface InFlightTurn {
+  text: string;
+  images?: ImageRef[];
+  /** Run-completion journal tokens this turn is carrying (#468). */
+  eventTokens?: string[];
+  /** The ORIGINAL queue items this turn was built from. A re-queue restores
+   *  THESE, not one merged item, so an injected run completion stays its own
+   *  `completionOnly` item instead of being welded into a user turn's text
+   *  (#468). Without that, held mail could retain a completion's TEXT after its
+   *  token had been handed back and replayed elsewhere — one completion, two
+   *  agent turns, the second indistinguishable from a real one. */
+  items: QueueItem[];
 }
 
 export interface PanelAgentDeps {
@@ -255,7 +277,7 @@ export class PanelAgent {
    *  new message, instead of dropping the work the agent was mid-reply on. Cleared
    *  on a clean turn result (nothing to re-queue) and on stall/rewind (abandoned on
    *  purpose). Null whenever no turn is in flight. */
-  private inFlight: { text: string; images?: ImageRef[]; eventTokens?: string[] } | null = null;
+  private inFlight: InFlightTurn | null = null;
   /** Run-completion journal tokens carried by the turn currently in flight
    *  (#468). Acked when that turn's `result` lands; handed back to the journal
    *  when the turn is abandoned (stall watchdog) or the agent is stopped. */
@@ -430,6 +452,15 @@ export class PanelAgent {
   /** Hand a set of run-completion journal tokens back as UNDELIVERED (#468), so
    *  the journal re-arms them for replay instead of letting them die with this
    *  agent / this abandoned turn. Never throws into the caller's path. */
+  /** Capture-and-clear the in-flight turn in one step. Also the read that
+   *  survives control-flow narrowing (channel() assigns `inFlight` from another
+   *  function, so a direct read after a `= null` looks like `never` to TS). */
+  private takeInFlight(): InFlightTurn | null {
+    const turn = this.inFlight;
+    this.inFlight = null;
+    return turn;
+  }
+
   private releaseEventTokens(tokens: string[] | undefined, opts: { carried?: boolean } = {}): void {
     if (!tokens?.length) return;
     try {
@@ -591,6 +622,7 @@ export class PanelAgent {
     this.queue.push({
       text,
       images,
+      completionOnly: true, // the whole item IS the event — safe to drop wholesale
       ...(opts?.eventToken ? { eventTokens: [opts.eventToken] } : {}),
     });
     const wake = this.waiting;
@@ -719,12 +751,11 @@ export class PanelAgent {
     this.turnEventTokens = [];
     if (interrupted && opts.requeueInFlight) {
       // Front of the queue: the interrupted work is addressed before whatever the
-      // user sends next (which is appended after this interrupt is handled).
-      this.queue.unshift({
-        text: interrupted.text,
-        images: interrupted.images,
-        ...(interruptedTokens.length ? { eventTokens: interruptedTokens } : {}),
-      });
+      // user sends next (which is appended after this interrupt is handled). The
+      // ORIGINAL items go back (not one merged item) — the next splice re-joins
+      // them into the same text, while an injected completion stays a separate
+      // `completionOnly` item that a later detach can remove cleanly (#468).
+      this.queue.unshift(...interrupted.items);
     } else {
       this.releaseEventTokens(interruptedTokens);
     }
@@ -928,6 +959,7 @@ export class PanelAgent {
         text,
         ...(images.length ? { images } : {}),
         ...(carriedTokens.length ? { eventTokens: carriedTokens } : {}),
+        items: batch,
       };
       this.yieldedTurns += 1; // this batch is turn N
       // Mirror the backend's turn-marker mint: the Nth turn yielded here is the
@@ -1074,14 +1106,17 @@ export class PanelAgent {
         // in-flight message so the restarted/fresh session actually re-runs it.
         // Idempotent enough: a duplicate render beats a lost request, and the
         // quickRestarts give-up guard still bounds a message that crash-loops.
-        if (this.inFlight) {
-          const interrupted = this.inFlight;
-          this.inFlight = null;
-          // Its run-completion tokens (#468) ride the re-queued item, so they are
-          // acked when the RE-RUN turn ends — not left dangling on a turn whose
-          // session died.
+        // Read through takeInFlight(): channel() assigns this.inFlight from
+        // another function, which control-flow analysis can't see, so a direct
+        // read here is narrowed to `null` by the `= null` at the top of the loop.
+        const interrupted = this.takeInFlight();
+        if (interrupted) {
+          // Its run-completion tokens (#468) ride the re-queued items, so they
+          // are acked when the RE-RUN turn ends — not left dangling on a turn
+          // whose session died. The ORIGINAL items go back, so a completion
+          // stays its own `completionOnly` item (never welded into user text).
           this.turnEventTokens = [];
-          this.queue.unshift(interrupted);
+          this.queue.unshift(...interrupted.items);
           logger.warn(
             `[panel-agent ${this.short()}] crash mid-turn — re-queued the interrupted message so it isn't lost`,
           );
@@ -2239,22 +2274,49 @@ export class PanelAgentManager {
     return agent;
   }
 
-  /** Strip the run-completion tokens out of a key's HELD mail and hand them back
-   *  to the journal (#468). The mail itself is untouched — only ownership of the
-   *  completion moves — so a preserved (retire) or discarded (reset) queue can
-   *  never take a completion down with it. No-op when there is none. */
-  // NOTE: every teardown release below is UNCARRIED (the default) — nobody read
-  // those completions, so they must not count toward the journal's bounded
-  // replay cycle. Only a turn that ran and ended is `carried`.
+  /**
+   * Hand a key's HELD-MAIL run completions back to the journal (#468).
+   *
+   * The completion must leave held mail ENTIRELY, not just lose its token.
+   * Stripping the token alone left the event's TEXT sitting in preserved mail:
+   * `retire()` keeps that mail, so switching Claude→Codex handed the journal's
+   * token to Codex (delivered, correctly) and then switching BACK to Claude
+   * re-delivered the retained text as an ordinary user message — no token, no
+   * `possible_repeat` flag, indistinguishable from a real second completion.
+   * Preservation semantics are for the user's own mail; a completion whose token
+   * has moved on is not that.
+   *
+   * Dropping the item is safe precisely because an injected event is always its
+   * own `completionOnly` item — a re-queued turn restores the original items
+   * rather than one merged blob — so no user message is ever removed with it.
+   *
+   * Every release here is UNCARRIED (the default): nobody read these, so they
+   * must not count toward the journal's bounded replay cycle. Only a turn that
+   * ran and ended is `carried`.
+   */
   private detachHeldCompletions(key: string, reason: string): void {
     const held = this.heldMessages.get(key);
     if (!held?.length) return;
     const tokens: string[] = [];
+    const keep: QueueItem[] = [];
     for (const item of held) {
-      if (!item.eventTokens?.length) continue;
+      if (!item.eventTokens?.length) {
+        keep.push(item);
+        continue;
+      }
       tokens.push(...item.eventTokens);
       delete item.eventTokens; // the journal owns it now — never ack it twice
+      if (item.completionOnly) continue; // …and the event's text goes with it
+      // Defensive: a token on a non-completionOnly item would mean the item
+      // carries user text too, so it must survive — but then its embedded event
+      // text could be re-delivered untracked. Construction prevents this; log
+      // loudly if it ever happens rather than silently allowing a phantom.
+      logger.error(
+        `[panel-orchestrator] tab ${key.slice(0, 8)} ${reason}: held item carried a completion token but is not completionOnly — keeping its text (#468)`,
+      );
+      keep.push(item);
     }
+    if (keep.length !== held.length) this.heldMessages.set(key, keep);
     if (!tokens.length) return;
     logger.warn(
       `[panel-orchestrator] tab ${key.slice(0, 8)} ${reason}: ${tokens.length} run completion(s) were parked in held mail — returned to the journal for replay (#468)`,

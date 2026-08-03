@@ -292,12 +292,17 @@ export class RunCompletionJournalImpl {
     } else {
       const print = idlessFingerprint(key, payload);
       const now = Date.now();
-      // COLLAPSE only onto a still-journaled, undelivered twin from the same
-      // re-send burst. Safe: neither copy has reached anyone, so one delivery
-      // instead of two cannot lose news the agent already has.
+      // COLLAPSE only onto a twin that is STILL PENDING — not yet handed to any
+      // agent. That is the whole safety argument: neither copy has reached
+      // anyone, so one delivery instead of two cannot lose news the agent
+      // already has. `handed_off` does NOT qualify: that copy is sitting unread
+      // in a busy agent's queue and will be acked when its turn ends, so merging
+      // a second real render into it would delete the second render outright —
+      // the exact silent swallow this design splits to avoid.
       for (const entry of this.entries.values()) {
         if (
           entry.key === key &&
+          entry.state === "pending" &&
           entry.correlation.status === "unidentified" &&
           entry.fingerprint === print &&
           now - entry.arrivedAt < IDLESS_COLLAPSE_MS
@@ -306,14 +311,23 @@ export class RunCompletionJournalImpl {
           return entry;
         }
       }
+      // An identical twin that is already handed off (or delivered) falls
+      // through to a NEW entry below, flagged `possible_repeat` — never merged.
+      const twinInFlight = [...this.entries.values()].some(
+        (e) =>
+          e.key === key &&
+          e.state === "handed_off" &&
+          e.correlation.status === "unidentified" &&
+          e.fingerprint === print,
+      );
       // Already DELIVERED an identical id-less completion recently. Deliberately
       // NOT suppressed: identical content is not proof of identity, and swallowing
       // a second real render is a silent loss. Deliver it flagged instead.
       const seenAt = this.idlessSeen.get(print);
       const repeatHint = seenAt !== undefined && now - seenAt < IDLESS_REPEAT_HINT_MS;
       if (seenAt !== undefined && !repeatHint) this.idlessSeen.delete(print); // stale
-      idlessRepeat = repeatHint;
-      if (repeatHint) {
+      idlessRepeat = repeatHint || twinInFlight;
+      if (idlessRepeat) {
         logger.info(
           `[run-completions] tab ${key.slice(0, 8)}: an id-less completion with identical content was already delivered — forwarding it FLAGGED as a possible repeat (never suppressed: content is not identity)`,
         );

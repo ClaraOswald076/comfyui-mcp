@@ -432,6 +432,71 @@ describe("run completion across automatic goal continuation (#468)", () => {
     expect(journal.outstanding(tab)).toHaveLength(1);
   });
 
+  it("retire() removes the completion from held mail, not just its token", async () => {
+    // retire() PRESERVES held mail on purpose. Stripping only the token left the
+    // event's TEXT in that mail: switching Claude→Codex handed the journal token
+    // to Codex (delivered, correctly), and switching BACK to Claude re-delivered
+    // the retained text as an ordinary user message — no token, no flag,
+    // indistinguishable from a real second completion.
+    const doomed: AgentBackend = {
+      id: "claude" as const,
+      capabilities: CLAUDE_CAPABILITIES,
+      async prepare() {
+        throw new Error("endpoint rejected the key (http 401)");
+      },
+      // eslint-disable-next-line require-yield
+      async *run(): AsyncGenerator<AgentEvent> {
+        throw new Error("never runs");
+      },
+      async interrupt() {},
+      async listModels() {
+        return [];
+      },
+    };
+    // Fails the FIRST start (parking the queue in held mail), then works — so the
+    // held mail is genuinely re-delivered and we can count what the agent saw.
+    const healthy = new ContinuationBackend();
+    let firstStart = true;
+    const flaky: AgentBackend = {
+      id: "claude" as const,
+      capabilities: CLAUDE_CAPABILITIES,
+      async prepare() {
+        if (firstStart) {
+          firstStart = false;
+          throw new Error("endpoint rejected the key (http 401)");
+        }
+      },
+      run: (o) => healthy.run(o),
+      async interrupt() {},
+      async listModels() {
+        return [];
+      },
+    };
+    const { journal, manager, arrive } = makeHarness(flaky);
+    const tab = "tab-retire-textleak";
+
+    journal.openRun(PROMPT_A, { tabId: tab });
+    manager.send(tab, "keep me"); // an ordinary user message must SURVIVE
+    arrive(tab, { kind: "executed", prompt_id: PROMPT_A, images: [{ filename: "leak.png" }] });
+    await waitFor(() => journal.pending(tab).length === 0); // taken by the doomed agent
+    await waitFor(() => manager.hasHeldMail(tab));
+
+    manager.retire(tab); // provider switch retires the failed key
+    expect(journal.pending(tab)).toHaveLength(1); // its token came back
+
+    // Next start: held mail replays, and the journal replays the completion.
+    manager.send(tab, "hello again");
+    await waitFor(() => healthy.turns.length >= 1);
+    healthy.finishTurn();
+    await new Promise((r) => setTimeout(r, 30));
+
+    const all = healthy.turns.join("\n");
+    expect(all).toContain("keep me"); // the user's message survived
+    // …and the completion appears EXACTLY ONCE. Stripping only the token left a
+    // second, token-less copy of this text behind in the preserved mail.
+    expect(all.split("leak.png").length - 1).toBe(1);
+  });
+
   it("a completion survives an agent whose self-restart loop GAVE UP", async () => {
     // The give-up branch of settle() only unmapped the agent — its still-unread
     // queue died with it, leaving the journal entry `handed_off`, a state
@@ -718,6 +783,28 @@ describe("run completion journal correlation (#468)", () => {
       journal.record("t", { kind: "executed", images: [{ filename: "other_0002.png" }] }),
     ).not.toBeNull();
     expect(journal.pending("t")).toHaveLength(2);
+  });
+
+  it("an ID-LESS twin is NEVER merged into an entry that is already handed off", () => {
+    // The collapse is only safe while BOTH copies are undelivered. A
+    // `handed_off` entry is sitting unread in a busy agent's queue and will be
+    // acked when its turn ends — merging a second real render into it would
+    // delete the second render outright, with no flag. That is a silent swallow,
+    // the exact hazard the design splits to avoid.
+    const payload = { kind: "executed", images: [{ filename: "ComfyUI_temp_00001_.png" }] };
+    const first = journal.record("t", { ...payload });
+    journal.deliverPending("t", () => true); // handed off, still unread + unacked
+    expect(journal.pending("t")).toHaveLength(0);
+
+    const second = journal.record("t", { ...payload });
+    expect(second).not.toBeNull();
+    expect(second!.token).not.toBe(first!.token); // its OWN entry
+    expect(second!.possibleRepeat).toBe(true); // …and flagged
+    expect(journal.pending("t")).toHaveLength(1);
+
+    // Acking the first must not take the second with it.
+    journal.ack(first!.token);
+    expect(journal.outstanding("t")).toHaveLength(1);
   });
 
   it("an ID-LESS completion matching an ALREADY-DELIVERED one is FLAGGED, never swallowed", () => {
