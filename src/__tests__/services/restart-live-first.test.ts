@@ -15,6 +15,20 @@ import { EventEmitter } from "node:events";
 import { isAbsolute, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+/**
+ * `lsof` exiting 1 with no output — its convention for "ran fine, matched
+ * nothing", which the port probe reads as definite evidence the port is free.
+ * A bare `Error` carries neither an exit status nor an errno, so it means
+ * "I could not look" instead, and a caller waiting for the port to be released
+ * would wait out its whole budget. That difference is invisible on Windows (the
+ * netstat branch never reaches lsof) and hangs the suite on POSIX (#776).
+ */
+function noListener(): Error {
+  const err = new Error("no listener") as Error & { status?: number };
+  err.status = 1;
+  return err;
+}
+
 class FakeChild extends EventEmitter {
   unref = vi.fn();
   /**
@@ -131,7 +145,7 @@ function mockLivePortThenFree(): { killed: () => boolean } {
         : "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
     }
     if (/lsof/i.test(cmd)) {
-      if (killed) throw new Error("not listening");
+      if (killed) throw noListener();
       // `lsof -nP -iTCP:PORT -sTCP:LISTEN -Fpn` field output: p<pid> / n<addr:port>.
       return "p4321\nn127.0.0.1:8188\n";
     }

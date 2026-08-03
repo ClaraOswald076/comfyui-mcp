@@ -68,6 +68,20 @@ import {
   stopComfyUI,
 } from "../../services/process-control.js";
 
+/**
+ * `lsof` exiting 1 with no output — its convention for "ran fine, matched
+ * nothing", which the port probe reads as definite evidence the port is free.
+ * A bare `Error` carries neither an exit status nor an errno, so it means
+ * "I could not look" instead, and a caller waiting for the port to be released
+ * would wait out its whole budget. That difference is invisible on Windows (the
+ * netstat branch never reaches lsof) and hangs the suite on POSIX (#776).
+ */
+function noListener(): Error {
+  const err = new Error("no listener") as Error & { status?: number };
+  err.status = 1;
+  return err;
+}
+
 class FakeChild extends EventEmitter {
   unref = vi.fn();
   /**
@@ -101,7 +115,7 @@ function mockSpawnedChildren(): FakeChild[] {
 
 function mockNoPortProcess(): void {
   mockExecSync.mockImplementation((cmd: string) => {
-    if (cmd.includes("lsof")) throw new Error("not listening");
+    if (cmd.includes("lsof")) throw noListener();
     return "";
   });
 }
@@ -405,7 +419,7 @@ describe("process-control crash supervision", () => {
           // `lsof -nP -iTCP:PORT -sTCP:LISTEN -Fpn` field output: p<pid> / n<addr:port>.
           return "p4321\nn127.0.0.1:8188\n";
         }
-        throw new Error("not listening");
+        throw noListener();
       }
       return "";
     });
@@ -656,7 +670,7 @@ describe("findPidByPort resilience to localized netstat state (#449)", () => {
         }
         return GERMAN_BLOB;
       }
-      if (cmd.includes("lsof")) throw new Error("not listening");
+      if (cmd.includes("lsof")) throw noListener();
       return ""; // tasklist / powershell fallback / `if exist` → nothing
     });
     mockGetSystemStats.mockResolvedValue({
@@ -678,7 +692,7 @@ describe("findPidByPort resilience to localized netstat state (#449)", () => {
     // back empty. Liveness is the reachable server, so we must NOT claim the
     // process is absent — and we must NOT take the server down (issue #449).
     mockExecSync.mockImplementation((cmd: string) => {
-      if (cmd.includes("lsof")) throw new Error("not listening");
+      if (cmd.includes("lsof")) throw noListener();
       return ""; // netstat, powershell, tasklist → nothing resolves a PID
     });
     mockGetSystemStats.mockResolvedValue({
@@ -706,7 +720,7 @@ describe("findPidByPort resilience to localized netstat state (#449)", () => {
     // (Comfy Desktop.exe) is present. We must NOT kill that shell — we can't
     // confirm it owns :8188 — so leave everything untouched and diagnose.
     mockExecSync.mockImplementation((cmd: string) => {
-      if (cmd.includes("lsof")) throw new Error("not listening");
+      if (cmd.includes("lsof")) throw noListener();
       if (/tasklist/i.test(cmd)) {
         // A Comfy Desktop shell IS running.
         return '"Comfy Desktop.exe","4242","Console","1","206,248 K"';
@@ -841,7 +855,7 @@ describe("restart truthfulness + Pinokio-shaped refusal (#742)", () => {
         return "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
       }
       if (cmd.includes("lsof")) {
-        if (killed) throw new Error("not listening");
+        if (killed) throw noListener();
         return "p4321\nn127.0.0.1:8188\n";
       }
       return ""; // tasklist / `sleep 1 && kill -9` / etc.
@@ -892,7 +906,7 @@ describe("restart truthfulness + Pinokio-shaped refusal (#742)", () => {
         return "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
       }
       if (cmd.includes("lsof")) {
-        if (killed) throw new Error("not listening");
+        if (killed) throw noListener();
         return "p4321\nn127.0.0.1:8188\n";
       }
       return ""; // tasklist / `sleep 1 && kill -9` / etc.
