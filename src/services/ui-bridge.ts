@@ -367,12 +367,20 @@ export function panelVersionProvesUnsupported(cmd: string, panelVersion?: string
  *  minimum table, so both versions belong in the error. The MCP version is
  *  resolved once per process (it cannot change without a restart); callers may
  *  pass `mcpVersion` explicitly (tests). */
-let cachedMcpVersion: string | undefined;
+// The resolution result is cached BOTH ways — an unavailable version (or a
+// throwing detectInstallMode) resolves to null ONCE, never re-probed per error
+// (codex gate: undefined would conflate 'not yet resolved' with 'unavailable'
+// and re-run detectInstallMode on every error on those installs).
+let cachedMcpVersion: string | null | undefined;
 function mcpServerVersion(): string | undefined {
   if (cachedMcpVersion === undefined) {
-    cachedMcpVersion = detectInstallMode().currentVersion;
+    try {
+      cachedMcpVersion = detectInstallMode().currentVersion ?? null;
+    } catch {
+      cachedMcpVersion = null;
+    }
   }
-  return cachedMcpVersion;
+  return cachedMcpVersion ?? undefined;
 }
 
 function buildPanelTooOldError(
