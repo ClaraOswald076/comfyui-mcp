@@ -108,7 +108,7 @@ import {
 import { setProgressDir, PERSIST_OWNER } from "../../services/download-progress.js";
 import * as progressModule from "../../services/download-progress.js";
 import { downloadModel, resolveDownloadTarget } from "../../services/model-resolver.js";
-import { mkdtemp, mkdir, symlink, writeFile, rm as fsRm } from "node:fs/promises";
+import { mkdtemp, mkdir, symlink, writeFile, readFile, rm as fsRm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join as pathJoin } from "node:path";
 
@@ -1080,23 +1080,54 @@ describe("download job registry", () => {
       }
     });
 
-    it("reaps a DEAD (crashed-writer) in-flight record so it is not reported as still streaming", async () => {
+    it("keeps a heartbeat-stale in-flight record visible without deleting its persisted state (#761)", async () => {
       const dir = await mkdtemp(pathJoin(tmpdir(), "djobs-persist-"));
       setProgressDir(dir);
       try {
-        // A crashed session left a stale in-flight record (heartbeat stopped long ago).
+        // A reconnect can interrupt the owner's heartbeat while its HTTP transfer and
+        // .partial continue. A status read must not erase the only record for it.
+        const id = "stalejobxxxxxxxx1";
+        const owner = "reconnecting-session";
         await writeForeignJobRecord(dir, {
-          id: "deadjobxxxxxxxx1",
-          trayId: "deadtrayxxxxxxx1",
-          progressId: "dead-prog",
+          id,
+          trayId: downloadIdFor(URL_A),
+          progressId: "stale-prog",
           url: URL_A,
-          owner: "crashedsession",
-          ageMs: 10 * 60 * 1000,
+          owner,
+          ageMs: 5 * 60 * 1000,
         });
-        // It must NOT be resolvable/listed as a live download (it's dead, not streaming).
-        expect(getDownloadJob("deadjobxxxxxxxx1")).toBeUndefined();
-        expect(listDownloadJobs().some((j) => j.id === "deadjobxxxxxxxx1")).toBe(false);
-        expect(findDownloadJob({ url: URL_A })).toBeUndefined();
+        const listed = listDownloadJobs().find((j) => j.id === id);
+        expect(listed).toMatchObject({ status: "downloading", staleInflight: true });
+        expect(listed?.staleForMs).toBeGreaterThan(60_000);
+        // The control file survives the read; a later owner heartbeat can refresh it.
+        await expect(readFile(pathJoin(dir, `control-job-${id}-${owner}.json`), "utf8")).resolves.toContain(id);
+        // URL status can still surface the stale record, but the independent
+        // start/adoption and ambiguity paths retain their short freshness checks.
+        expect(findDownloadJob({ url: URL_A })).toMatchObject({ id, staleInflight: true });
+      } finally {
+        setProgressDir("");
+        await fsRm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("reaps terminal persisted records after the bounded TTL", async () => {
+      const dir = await mkdtemp(pathJoin(tmpdir(), "djobs-persist-"));
+      setProgressDir(dir);
+      try {
+        const id = "expiredterminal0001";
+        const owner = "old-session";
+        await writeForeignJobRecord(dir, {
+          id,
+          trayId: "expiredtray00001",
+          progressId: "expired-prog",
+          url: URL_A,
+          owner,
+          status: "done",
+          path: "/M/checkpoints/old.safetensors",
+          ageMs: 7 * 60 * 60 * 1000,
+        });
+        expect(listDownloadJobs().some((j) => j.id === id)).toBe(false);
+        await expect(readFile(pathJoin(dir, `control-job-${id}-${owner}.json`), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
       } finally {
         setProgressDir("");
         await fsRm(dir, { recursive: true, force: true });

@@ -23,6 +23,10 @@ vi.mock("../../services/model-resolver.js", async () => {
 });
 
 import { registerModelManagementTools } from "../../tools/model-management.js";
+import { setProgressDir } from "../../services/download-progress.js";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 type ToolHandler = (args: Record<string, unknown>) => Promise<{
   isError?: boolean;
@@ -39,6 +43,7 @@ function makeServer() {
   registerModelManagementTools(server as never);
   return {
     downloadModel: handlers.get("download_model")!,
+    downloadStatus: handlers.get("download_status")!,
     listLocalModels: handlers.get("list_local_models")!,
   };
 }
@@ -77,6 +82,42 @@ describe("download_model tool", () => {
       expect.any(Function), // onLanded callback — commits done synchronously at the destination rename (#515)
     );
     expect(res.isError).toBeFalsy();
+  });
+});
+
+describe("download_status tool", () => {
+  it("keeps a heartbeat-stale persisted transfer visible without prompting a concurrent reissue (#761)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "model-management-status-"));
+    setProgressDir(dir);
+    try {
+      const id = "status-stale-job";
+      await writeFile(
+        join(dir, `control-job-${id}-other-session.json`),
+        JSON.stringify({
+          id,
+          trayId: "status-stale-tray",
+          progressId: "status-stale-progress",
+          url: "https://example.com/large.safetensors",
+          target_subfolder: "checkpoints",
+          status: "downloading",
+          started_at: Date.now() - 10 * 60 * 1000,
+          owner: "other-session",
+          updated: Date.now() - 5 * 60 * 1000,
+        }),
+      );
+
+      const { downloadStatus } = makeServer();
+      const res = await downloadStatus({});
+      const text = res.content[0].text;
+      expect(text).toContain(id);
+      expect(text).toContain("heartbeat stale for");
+      expect(text).toContain("Do NOT re-issue download_model while this warning remains");
+      expect(text).toContain("only after confirming the .partial has stopped growing");
+      expect(text).toContain("Do not report this download as failed or missing.");
+    } finally {
+      setProgressDir("");
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 

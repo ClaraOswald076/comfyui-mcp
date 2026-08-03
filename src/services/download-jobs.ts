@@ -94,6 +94,11 @@ export interface DownloadJob {
    *  download outlives its tool call they have to survive somewhere the agent
    *  can still read them, or handing back a handle would silently drop them. */
   notes?: string[];
+  /** A persisted in-flight record missed its owner heartbeat. It stays visible
+   *  because this is not proof the physical transfer stopped (#761). */
+  staleInflight?: boolean;
+  /** Age of the missing persisted heartbeat, used only for status diagnostics. */
+  staleForMs?: number;
 }
 
 interface Entry {
@@ -116,11 +121,10 @@ interface Entry {
 /** How often an in-flight job re-persists its record (liveness heartbeat). Must stay
  *  comfortably below PERSISTED_INFLIGHT_STALE_MS so a live download is always fresh. */
 const HEARTBEAT_MS = 15_000;
-/** Cap on heartbeat retries of a transiently-failing TERMINAL persist. Chosen so the
- *  total window (attempts × HEARTBEAT_MS) exceeds PERSISTED_INFLIGHT_STALE_MS — by then
- *  the last-successful (in-flight) record has already aged out via the stale reap, so
- *  giving up can't leave a fresh, adoptable record. Prevents a permanently-unwritable
- *  progress store from keeping a COMPLETED job's interval doing filesystem work forever. */
+/** Cap on heartbeat retries of a transiently-failing TERMINAL persist. Once this
+ *  bounded retry window ends the completed job stops touching the filesystem; its
+ *  last in-flight snapshot remains non-adoptable after the freshness window and is
+ *  reaped only by the long persisted-record retention bound (#761). */
 const TERMINAL_PERSIST_MAX_ATTEMPTS = 6; // 6 × 15s = 90s > 60s stale window
 
 // The in-flight registry is indexed under MULTIPLE keys per job so dedup is
@@ -591,8 +595,9 @@ export async function startDownloadJob(
       // outcome (#529) instead of a forever-"downloading" record. If this atomic
       // replace transiently fails (rare), the heartbeat below KEEPS retrying until the
       // terminal state is durable — so a done/cancelled job can't linger as a
-      // fresh-and-adoptable "downloading" record (beyond the stale reap that already
-      // bounds it). Only once the terminal record is durable does the heartbeat stop.
+      // fresh-and-adoptable "downloading" record. The freshness window excludes it from
+      // adoption immediately; long retention later bounds the persisted record. Only once
+      // the terminal record is durable does the heartbeat stop.
       if (persistJobRecord(job) && heartbeat) clearInterval(heartbeat);
     }
   })();
@@ -631,8 +636,8 @@ export async function startDownloadJob(
       const durable = persistJobRecord(job);
       if (job.status !== "downloading") {
         // Stop the interval once the terminal state is durable, OR the retry budget is
-        // spent (by which point the stale record is already reaped), OR persistence went
-        // inactive — never let a completed job's interval do filesystem work forever.
+        // spent (after which the snapshot is non-adoptable), OR persistence went inactive
+        // — never let a completed job's interval do filesystem work forever.
         if (
           (durable ||
             ++terminalPersistAttempts >= TERMINAL_PERSIST_MAX_ATTEMPTS ||
@@ -741,6 +746,8 @@ function jobFromPersisted(rec: PersistedDownloadJob): DownloadJob {
     reqKey: rec.req_key,
     viaManager: rec.via_manager,
     resume: rec.resume as ResumeDiagnostic | undefined,
+    staleInflight: rec.staleInflight,
+    staleForMs: rec.staleForMs,
   };
 }
 
@@ -748,7 +755,7 @@ function jobFromPersisted(rec: PersistedDownloadJob): DownloadJob {
  *  DIFFERENT trayId — a distinct concurrent physical download in ANOTHER session (two
  *  distinct URLs resolving to the same dest+auth). The id alone can't disambiguate, so
  *  a by-id lookup/cancel must decline rather than silently act on the local one.
- *  Excludes this process's own records (same owner) and stale/dead ones (heartbeat). */
+ *  Excludes this process's own records (same owner) and heartbeat-stale ones. */
 function hasAmbiguousForeignSibling(id: string, localTrayId: string): boolean {
   const now = Date.now();
   return listPersistedDownloadJobs().some(
@@ -831,9 +838,9 @@ export function findDownloadJob(query: { url?: string; destKey?: string }): Down
     }
   }
   for (const rec of listPersistedDownloadJobs()) {
-    // Only FRESH in-flight records count as live candidates — a stale/dead record
-    // (crashed session, never reaped) must not inflate the ambiguity count and force a
-    // false "no download" (matching the persisted helpers' fresh-in-flight rule).
+    // Only FRESH in-flight records count as live candidates — a heartbeat-stale record
+    // may still stream, but must not inflate the ambiguity count and force a false
+    // "no download" (matching the persisted helpers' fresh-in-flight rule).
     if (rec.status !== "downloading" || now - (rec.updated ?? 0) >= PERSISTED_INFLIGHT_STALE_MS) {
       continue;
     }

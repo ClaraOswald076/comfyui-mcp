@@ -274,6 +274,10 @@ export function registerModelManagementTools(server: McpServer): void {
                     // restored) — surface it so the user can recover, not mask it.
                     (j.error ? `\n    IMPORTANT: ${j.error}` : "")
                   : `\n    still streaming — started ${Math.round((Date.now() - j.started_at) / 1000)}s ago`;
+          const staleNote =
+            j.status === "downloading" && j.staleInflight
+              ? `\n    NOTE: heartbeat stale for ${Math.round((j.staleForMs ?? 0) / 1000)}s. The owning session may have reconnected, and the transfer may still be running. Do NOT re-issue download_model while this warning remains: the original owner may still be writing the same .partial. Wait and check download_status again; only after confirming the .partial has stopped growing should you decide on recovery. Do not report this download as failed or missing.`
+              : "";
           // Surface a declined resume so the agent/user knows a pre-existing
           // .partial was discarded and why — instead of it being silent (#467).
           // The decision is stored on THIS job by its own physical download, so it
@@ -304,7 +308,7 @@ export function registerModelManagementTools(server: McpServer): void {
                 : "re-downloading in full";
             resumeNote = `\n    resume: ${diag.outcome} — ${fate} because ${why}; ${next}`;
           }
-          return `${head}${detail}${resumeNote}\n    from: ${j.url}`;
+          return `${head}${detail}${staleNote}${resumeNote}\n    from: ${j.url}`;
         });
 
         return { content: [{ type: "text", text: `## Downloads\n\n${lines.join("\n")}` }] };
