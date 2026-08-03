@@ -18,6 +18,20 @@ vi.mock("../../comfyui/client.js", () => ({
   resetObjectInfoCache: () => resetObjectInfoCache(),
 }));
 
+// r9: a MUTABLE runtime-config base, so a test can retarget getComfyUIBaseUrl()
+// mid-flight (config-only retarget) while the tab fronting stays put. null →
+// the real configured base.
+const hoistedConfig = vi.hoisted(() => ({
+  configBase: { value: null as string | null },
+}));
+vi.mock("../../config.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../config.js")>();
+  return {
+    ...actual,
+    getComfyUIBaseUrl: () => hoistedConfig.configBase.value ?? actual.getComfyUIBaseUrl(),
+  };
+});
+
 const { buildPanelToolDefs, __panelToolsTestHooks } = await import(
   "../../orchestrator/panel-tools.js"
 );
@@ -107,6 +121,8 @@ beforeEach(() => {
   // r4/r5: no restart dispatch on record unless a test seeds one (also clears
   // any record a prior test left behind).
   __processControlTestHooks.reset();
+  // r9: real configured base unless a test retargets it mid-flight.
+  hoistedConfig.configBase.value = null;
 });
 
 afterEach(() => {
@@ -115,6 +131,7 @@ afterEach(() => {
   __panelToolsTestHooks.setLocalRestartPreflight(null);
   __panelToolsTestHooks.setDeclineProbeTiming(null);
   __processControlTestHooks.reset();
+  hoistedConfig.configBase.value = null;
 });
 
 describe("panel_restart_comfyui — decline truthfulness (#742)", () => {
@@ -486,6 +503,36 @@ describe("panel_restart_comfyui — Pinokio-style refuse-safe preflight (#742)",
     expect(out.rebooting).toBe(true);
     expect(note).toMatch(/can't confirm/i);
     expect(__panelToolsTestHooks.getSessionRestartDispatch(ctx)).toBeNull();
+  });
+
+  it("a CONFIG-ONLY retarget mid-await still REFUSES the proven-dangerous boot instance (r9)", async () => {
+    // The tab fronts the boot instance THROUGHOUT; only the MUTABLE runtime
+    // config moves during the preflight await. The failed preflight already
+    // PROVED that instance unrelaunchable — the proof follows the instance the
+    // tab fronts, not the mutable config — so the reboot must be REFUSED and
+    // never dispatched (an instance proven unrelaunchable is NEVER sent a
+    // stop/reboot, regardless of config shuffling mid-flight).
+    __panelToolsTestHooks.setLocalRestartPreflight(async () => {
+      hoistedConfig.configBase.value = "http://127.0.0.1:9999"; // config-only retarget mid-await
+      return {
+        ok: false,
+        reason:
+          "Resolved ComfyUI script does not exist on disk: main.py — could not " +
+          "locate the ComfyUI install.",
+      };
+    });
+    __panelToolsTestHooks.setHealthProbe(async () => "down");
+    const { ctx, sends } = makeCtx({ confirm: "yes", frontsBoot: true });
+
+    const out = parse(await restartTool().handler({}, ctx));
+    const note = String(out.note ?? "");
+
+    expect(out.refused).toBe(true);
+    expect(note).toMatch(/Refusing to restart/i);
+    expect(note).toMatch(/still running/i);
+    // CRITICAL: the reboot was NEVER dispatched — the proven-dangerous
+    // instance was not stopped.
+    expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
   });
 
   it("does NOT consult the preflight when the tab doesn't provably front our boot instance", async () => {

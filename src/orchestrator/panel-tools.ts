@@ -5690,20 +5690,24 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             // r8: the preflight AWAIT makes the pre-decision binding STALE — a
             // rebind/retarget during it would let this refusal's "ComfyUI is
             // still running" describe a target that was never validated.
-            // Re-heal and re-capture BEFORE composing anything. The bound
-            // target is always THIS orchestrator's boot instance, so "changed"
-            // can only mean now-UNBOUND (unconfirmable): nothing was stopped
-            // (the preflight never stops anything), so fall through and let
-            // the dispatch path treat the unbound target honestly (r6/r7:
-            // dispatched-unconfirmed, process-wide-only stamp) rather than
-            // issuing a stale-target refusal.
+            // Re-heal and re-capture BEFORE composing anything.
+            // r9: the danger proof follows the INSTANCE the tab fronts, NOT the
+            // mutable runtime config — a config-only retarget mid-await must
+            // not wash out the proof that the tab-fronted boot instance is
+            // unrelaunchable. When the tab STILL fronts that same instance the
+            // failed preflight just proved dangerous, the proof is still valid
+            // and the refusal stands: an instance proven unrelaunchable is
+            // NEVER sent a stop/reboot, regardless of config/tab shuffling
+            // mid-flight. Only a genuinely different, unconfirmable target
+            // falls through to the honest-unconfirmed dispatch (nothing was
+            // ever proved dangerous for it — and nothing was ever stopped,
+            // the preflight never stops anything).
             ctx.ensureReachable?.();
             const refusalHealthBase = captureRebootHealthBase(ctx);
-            const stillBound =
+            const sameProvenDangerousInstance =
               refusalHealthBase != null &&
-              sameHttpBase(getComfyUIBaseUrl(), refusalHealthBase) &&
               sameHttpBase(preflightHealthBase, refusalHealthBase);
-            if (stillBound) {
+            if (sameProvenDangerousInstance) {
               return ok({
                 rebooting: false,
                 ready: false,
@@ -5718,8 +5722,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                   "at the live install so a relaunch can be proven and use restart_comfyui.",
               });
             }
-            // Binding changed mid-await → fall through to the dispatch path
-            // (re-captured again below, r7); no refusal is composed here.
+            // Genuinely different / unconfirmable target → fall through to the
+            // dispatch path (re-captured again below, r7); no refusal is
+            // composed here.
           }
         }
         // r7: the preflight AWAIT sits between the binding capture and the dispatch,
