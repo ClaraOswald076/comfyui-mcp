@@ -540,19 +540,66 @@ export interface LiveServerRootResolution {
 const OBSERVED_ROOT_MAX_ASCENT = 5;
 
 /**
+ * Directory names that make an interpreter part of an INSTALL rather than merely
+ * somewhere above it: the env dirs ComfyUI's supported layouts keep python in.
+ * Compared case-insensitively (Windows).
+ */
+const ENV_DIR_NAMES = new Set([
+  "python_embeded",
+  "python_embedded",
+  "standalone-env",
+  ".venv",
+  "venv",
+  "env",
+  "scripts",
+  "bin",
+]);
+
+/**
+ * Is `python` positioned INSIDE the install rooted at `root`, anchored from `base`?
+ *
+ * Two accepted shapes, and nothing else:
+ *  1. the interpreter lives under `root` itself (`<root>/.venv/Scripts/python.exe`);
+ *  2. it sits in a sibling ENV directory of the bundle `base` that `root` was
+ *     anchored on (`<bundle>/python_embeded/python.exe` + `<bundle>/ComfyUI/main.py`),
+ *     with EVERY segment between `base` and the interpreter being an env dir.
+ *
+ * Without this test the ascent is unsound (codex gate, round 3): a server started
+ * with a SYSTEM python (`C:\Python311\python.exe`) has ancestors that are not its
+ * install at all, so walking up to `C:\` and finding a stale `C:\ComfyUI\main.py`
+ * would confidently name the WRONG install as live — reintroducing the very bug.
+ */
+function interpreterBelongsToInstall(python: string, base: string, root: string): boolean {
+  const py = pathResolve(python);
+  const pyDir = dirname(py);
+  const within = (parent: string, child: string): boolean => {
+    const p = pathResolve(parent);
+    const c = pathResolve(child);
+    return c === p || c.startsWith(p.endsWith(sep) ? p : p + sep);
+  };
+  if (within(root, py)) return true;
+  if (!within(base, py)) return false;
+  const rel = pyDir.slice(pathResolve(base).length).split(sep).filter(Boolean);
+  if (rel.length === 0) return true; // interpreter sits directly in the bundle root
+  return rel.every((seg) => ENV_DIR_NAMES.has(seg.toLowerCase()));
+}
+
+/**
  * Anchor a RELATIVE `main.py` dir on the interpreter the OS says the live ComfyUI
- * process is running. The interpreter path is an OBSERVATION of the running
- * process, so its ancestors ARE the live install tree: walking up from it and
- * accepting the first ancestor under which `<ancestor>/<relDir>/main.py` really
- * exists reconstructs the root the server itself would have reported had it told
- * us its cwd. Returns undefined when nothing on that (bounded) path holds a main.py.
+ * process is running. Walk up from the interpreter and accept the first ancestor
+ * under which `<ancestor>/<relDir>/main.py` really exists — but ONLY when the
+ * interpreter is positioned inside that install (interpreterBelongsToInstall), so
+ * an unrelated `main.py` further up the filesystem can never be adopted. Returns
+ * undefined when nothing on the bounded path qualifies.
  */
 function anchorRelDirOnInterpreter(python: string, relDir: string): string | undefined {
   if (!isAbsolute(python)) return undefined;
   let dir = dirname(pathResolve(python));
   for (let i = 0; i < OBSERVED_ROOT_MAX_ASCENT; i++) {
     const candidate = pathResolve(dir, relDir);
-    if (hasMainPy(candidate)) return candidate;
+    if (hasMainPy(candidate) && interpreterBelongsToInstall(python, dir, candidate)) {
+      return candidate;
+    }
     const parent = dirname(dir);
     if (parent === dir) break;
     dir = parent;

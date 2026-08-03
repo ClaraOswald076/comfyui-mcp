@@ -19,6 +19,7 @@ import { realpath } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import {
   downloadModel,
+  liveListingHasEntry,
   resolveDownloadTarget,
   shouldDispatchDownloadToManager,
   verifyLandedModel,
@@ -382,8 +383,17 @@ export async function startDownloadJob(
   // too (the local callback race is inherently local, but this keeps the server
   // write single-writer and the last-started result deterministic).
   let serializeKey: string;
+  /** Did the live server ALREADY list this exact entry before we started? Captured
+   *  HERE, before any bytes are written, so the post-landing check can tell "the
+   *  server sees it BECAUSE we wrote it" from "it already knew that name" (#369). */
+  let listedBefore: boolean | undefined;
   if (!dispatchToManager) {
     const target = await resolveDownloadTarget(url, targetSubfolder, filename);
+    try {
+      listedBefore = await liveListingHasEntry(targetSubfolder, target.filename);
+    } catch {
+      listedBefore = undefined; // unknowable → the check stays conservative
+    }
     // Fold auth into the destination key too (#467 P1-A): two concurrent calls to
     // the SAME on-disk destination with DIFFERENT auth are DIFFERENT downloads
     // (different representations) and must NOT dedup to one writer/one job.
@@ -591,7 +601,7 @@ export async function startDownloadJob(
       // and the catch below keeps `done`.
       if (!dispatchToManager && (job.status as DownloadJob["status"]) === "done") {
         try {
-          const verdict = await verifyLandedModel(path, targetSubfolder);
+          const verdict = await verifyLandedModel(path, targetSubfolder, { listedBefore });
           if (verdict.verifiedPath) job.path = verdict.verifiedPath;
           job.live_visible = verdict.liveVisible;
           job.verify_note = verdict.note;

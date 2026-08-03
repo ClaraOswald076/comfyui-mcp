@@ -28,6 +28,10 @@ const h = vi.hoisted(() => ({
   /** What getLiveExtraModelRoots reports — only an AUTHORITATIVE, EMPTY answer can
    *  rule out "the server's models live on another drive". */
   liveExtraRoots: { authoritative: false, roots: [] as unknown[] },
+  /** Does the resolved models root exist on THIS filesystem? */
+  modelsRootExists: true,
+  /** The models root resolveModelsDirWithBases reports (the download destination). */
+  destModelsDir: "/comfy/models",
 }));
 
 vi.mock("../../config.js", () => ({
@@ -68,7 +72,7 @@ vi.mock("../../services/extra-paths.js", () => ({
 vi.mock("../../services/output-dir.js", () => ({
   resolveModelsDir: vi.fn(async () => resolve("/live/ComfyUI/models")),
   resolveModelsDirWithBases: vi.fn(async () => ({
-    modelsDir: resolve("/comfy/models"),
+    modelsDir: resolve(h.destModelsDir),
     baseDirs: [],
     snapshot: { reachable: true, argv: ["ComfyUI\\main.py"] },
     source: h.modelsDirSource,
@@ -78,6 +82,10 @@ vi.mock("../../services/output-dir.js", () => ({
   isLiveAuthoritativeModelsDir: (s: string) =>
     s === "argv-flag" || s === "live-root" || s === "observed-root",
 }));
+
+// A live-resolved models root is exempt from the pre-write check ONLY when it
+// exists on this filesystem (a container-side path does not). Default true.
+vi.mock("node:fs", () => ({ existsSync: () => h.modelsRootExists }));
 
 const statMock = vi.fn();
 const realpathMock = vi.fn();
@@ -112,6 +120,8 @@ beforeEach(() => {
   h.modelsDirSource = "configured-base";
   h.fetchCalls = [];
   h.liveExtraRoots = { authoritative: false, roots: [] };
+  h.modelsRootExists = true;
+  h.destModelsDir = "/comfy/models";
   statMock.mockReset();
   realpathMock.mockReset();
   readdirMock.mockReset();
@@ -238,7 +248,7 @@ describe("pre-write: a destination the LIVE server does not read from is refused
     );
   });
 
-  it("does NOT second-guess a LIVE-AUTHORITATIVE root — no listing call at all", async () => {
+  it("does NOT second-guess a LIVE-AUTHORITATIVE root that exists locally — no listing call", async () => {
     h.modelsDirSource = "observed-root";
     h.onDisk = { loras: ["stale.safetensors"] };
     h.liveListings["loras"] = ["completely-different.safetensors"];
@@ -246,6 +256,19 @@ describe("pre-write: a destination the LIVE server does not read from is refused
       resolve("/comfy/models/loras"),
     );
     expect(h.fetchCalls).toEqual([]);
+  });
+
+  it("DOES check a live-resolved root that does NOT exist locally (container path; codex gate r3)", async () => {
+    // A loopback ComfyUI inside Docker reports its CONTAINER-side --models-directory.
+    // Writing that path on the host silently creates a directory nobody reads.
+    h.modelsDirSource = "argv-flag";
+    h.modelsRootExists = false;
+    h.onDisk = {}; // nothing on the host at that path
+    h.liveListings["loras"] = ["a.safetensors", "b.safetensors"];
+    h.liveExtraRoots = { authoritative: true, roots: [] };
+    await expect(resolveModelSubfolderPreferServer("loras")).rejects.toThrow(
+      /DIFFERENT install/,
+    );
   });
 
   it("ignores non-core extensions on disk (a .gguf-only dir is not evidence of disagreement)", async () => {
@@ -322,6 +345,45 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
     const res = await verifyLandedModel(target, "loras/a", { attempts: 1, retryMs: 0 });
     expect(res.liveVisible).toBe("not-visible");
     expect(res.note).toMatch(/a\/new\.safetensors/);
+  });
+
+  it("does NOT confirm a non-authoritative destination whose name the server ALREADY listed (codex gate r3)", async () => {
+    // Both trees hold `loras/new.safetensors`. The write went into the LOCALLY
+    // CONFIGURED tree; the server listing that name proves nothing about our bytes.
+    h.modelsDirSource = "configured-base";
+    h.liveListings["loras"] = ["new.safetensors"];
+    const res = await verifyLandedModel(target, "loras", {
+      attempts: 1,
+      retryMs: 0,
+      listedBefore: true,
+    });
+    expect(res.liveVisible).toBe("unknown");
+    expect(res.note).toMatch(/ALREADY listed that name/);
+  });
+
+  it("DOES confirm when the entry APPEARED because of this download", async () => {
+    h.modelsDirSource = "configured-base";
+    h.liveListings["loras"] = ["new.safetensors"];
+    const res = await verifyLandedModel(target, "loras", {
+      attempts: 1,
+      retryMs: 0,
+      listedBefore: false,
+    });
+    expect(res.liveVisible).toBe("visible");
+  });
+
+  it("DOES confirm a re-download into a LIVE-AUTHORITATIVE root even though the name pre-existed", async () => {
+    // Repairing/replacing an existing model in the server's own tree must stay a
+    // clean success — the ambiguity only exists for locally-configured roots.
+    h.modelsDirSource = "observed-root";
+    h.destModelsDir = "/live/ComfyUI/models"; // the tree `target` lives in
+    h.liveListings["loras"] = ["new.safetensors"];
+    const res = await verifyLandedModel(target, "loras", {
+      attempts: 1,
+      retryMs: 0,
+      listedBefore: true,
+    });
+    expect(res.liveVisible).toBe("visible");
   });
 
   it("normalizes OS-native separators in the live listing", async () => {

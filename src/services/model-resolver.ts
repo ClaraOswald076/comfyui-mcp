@@ -723,7 +723,13 @@ async function assertDestinationVisibleToLiveServer(
   source: ModelsDirSource,
   snapshot: LiveServerSnapshot,
 ): Promise<void> {
-  if (isLiveAuthoritativeModelsDir(source)) return;
+  // A live-resolved root that EXISTS on this filesystem is authoritative and needs
+  // no second opinion. A live-resolved root that does NOT exist locally is a
+  // different animal: a loopback ComfyUI inside Docker / behind an SSH forward
+  // reports its CONTAINER-side `--models-directory`, and writing that path here
+  // silently creates a host directory the server never reads (codex gate, round 3).
+  // The check below is cheap and fails open, so run it for that case too.
+  if (isLiveAuthoritativeModelsDir(source) && existsSync(modelsRoot)) return;
   if (!snapshot.reachable || isRemoteMode()) return;
 
   // The target category first (it is the one that matters), then the rest of the
@@ -797,6 +803,39 @@ async function assertDestinationVisibleToLiveServer(
   }
 }
 
+/** Normalize a listing entry / relative path for comparison (ComfyUI reports
+ *  OS-native separators). */
+function normRel(s: string): string {
+  return s.replace(/\\/g, "/").replace(/^\.?\//, "");
+}
+
+/** The category-relative entry a file at `<models>/<targetSubfolder>/<filename>`
+ *  would appear as in ComfyUI's `/models/<category>` listing. */
+function listingEntryFor(targetSubfolder: string, filename: string): string {
+  const rest = subfolderRemainder(targetSubfolder);
+  return normRel(rest ? `${rest}/${filename}` : filename);
+}
+
+/**
+ * Was this exact entry ALREADY in the live server's listing before we wrote?
+ *
+ * Captured BEFORE the transfer so the post-write check can tell "the server now
+ * sees the file BECAUSE we wrote it" from "the server already had a file of that
+ * name somewhere else". Without that distinction a download into a stale tree that
+ * happens to share a filename with the live install verifies as `visible` and is
+ * reported as a success (codex gate, round 3). `undefined` = the server could not
+ * answer, so nothing is known either way.
+ */
+export async function liveListingHasEntry(
+  targetSubfolder: string,
+  filename: string,
+): Promise<boolean | undefined> {
+  const listing = await liveCategoryListing(categoryOf(targetSubfolder));
+  if (listing === undefined) return undefined;
+  const wanted = listingEntryFor(targetSubfolder, filename);
+  return listing.some((n) => normRel(n) === wanted);
+}
+
 export interface LandedModelVerification {
   /** The path CONFIRMED to exist on disk after the download (symlinks resolved).
    *  This — never the intended path — is what callers report. */
@@ -828,7 +867,13 @@ const LIVE_VISIBILITY_RETRY_MS = 1000;
 export async function verifyLandedModel(
   targetPath: string,
   targetSubfolder: string,
-  opts?: { attempts?: number; retryMs?: number },
+  opts?: {
+    attempts?: number;
+    retryMs?: number;
+    /** Whether the live server ALREADY listed this exact entry BEFORE the download
+     *  (liveListingHasEntry, captured by the job before it started). */
+    listedBefore?: boolean;
+  },
 ): Promise<LandedModelVerification> {
   let verifiedPath: string | undefined;
   try {
@@ -866,24 +911,54 @@ export async function verifyLandedModel(
   // LIVE tree happens to hold an unrelated `loras/b/foo.safetensors` — a direct
   // false success (codex gate, round 2). Separators are normalized because ComfyUI
   // reports OS-native ones.
-  const norm = (s: string): string => s.replace(/\\/g, "/").replace(/^\.?\//, "");
-  const wantedRel = norm(join(subfolderRemainder(targetSubfolder), basename(targetPath)));
+  const wanted = listingEntryFor(targetSubfolder, basename(targetPath));
   const attempts = opts?.attempts ?? LIVE_VISIBILITY_ATTEMPTS;
   const retryMs = opts?.retryMs ?? LIVE_VISIBILITY_RETRY_MS;
+
+  // Is the directory we wrote into one the RUNNING server told us about? Only then
+  // does "the server lists this name" prove that the bytes we just wrote are the
+  // ones it will load. On a locally-configured root a pre-existing entry of the
+  // same name in the LIVE tree would otherwise verify our write into a STALE tree
+  // as a success (codex gate, round 3) — so a name that was already listed BEFORE
+  // the download proves nothing there.
+  let destinationIsLiveAuthoritative = false;
+  try {
+    const dest = await resolveModelsDirWithBases();
+    const root = resolve(dest.modelsDir);
+    const p = verifiedPath ?? resolve(targetPath);
+    destinationIsLiveAuthoritative =
+      isLiveAuthoritativeModelsDir(dest.source) &&
+      (p === root || p.startsWith(root + sep));
+  } catch {
+    destinationIsLiveAuthoritative = false;
+  }
+  const ambiguous =
+    !destinationIsLiveAuthoritative && opts?.listedBefore === true;
+
   let sawListing = false;
   for (let i = 0; i < attempts; i++) {
     const listing = await liveCategoryListing(category);
     if (listing !== undefined) {
       sawListing = true;
-      if (listing.some((n) => norm(n) === wantedRel)) {
-        return { verifiedPath, liveVisible: "visible" };
+      if (listing.some((n) => normRel(n) === wanted)) {
+        if (!ambiguous) return { verifiedPath, liveVisible: "visible" };
+        return {
+          verifiedPath,
+          liveVisible: "unknown",
+          note:
+            `The connected ComfyUI (${getComfyUIBaseUrl()}) lists "${wanted}" under "${category}", ` +
+            "but it ALREADY listed that name before this download, and this destination came from " +
+            "local configuration rather than from the running server — so it cannot be confirmed " +
+            `that the file the server loads is the one just written to ${verifiedPath}. ` +
+            "Point COMFYUI_PATH at the ComfyUI that is actually running (or launch it with an " +
+            "absolute --base-directory) to get a definite answer.",
+        };
       }
     }
     if (i < attempts - 1 && retryMs > 0) {
       await new Promise((r) => setTimeout(r, retryMs));
     }
   }
-  const wanted = wantedRel;
   if (!sawListing) {
     return {
       verifiedPath,

@@ -36,6 +36,11 @@ const verifyLandedModelMock = vi.hoisted(() =>
     liveVisible: "visible" as const,
   })),
 );
+/** #369: does the connected ComfyUI already list this entry? Default yes, so an
+ *  existing file still counts as a legitimate skip. */
+const liveListingHasEntryMock = vi.hoisted(() =>
+  vi.fn(async (): Promise<boolean | undefined> => true),
+);
 const resolveExistingModelFileMock = vi.hoisted(() => vi.fn());
 const listLocalModelsMock = vi.hoisted(() => vi.fn());
 const savedWorkspaceMock = vi.hoisted(() => vi.fn(() => undefined as string | undefined));
@@ -120,6 +125,9 @@ vi.mock("../../services/model-resolver.js", () => ({
   // the unconfirmed/wrong-place renderings are covered in download-jobs.test.ts
   // and download-live-destination.test.ts.
   verifyLandedModel: (...a: unknown[]) => verifyLandedModelMock(...(a as [string, string])),
+  // The "already exists" shortcut confirms the file is one the LIVE server reads
+  // before it counts as a skip (#369). Default: it is.
+  liveListingHasEntry: (...a: unknown[]) => liveListingHasEntryMock(...(a as [string, string])),
   // Faithful mirror of the real managerModelDestination (pure logic) so the
   // remote-model path resolves a Manager-valid { type, save_path }.
   managerModelDestination: (category: string, relPath?: string) => {

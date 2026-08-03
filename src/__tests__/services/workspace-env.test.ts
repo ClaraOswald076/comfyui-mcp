@@ -1331,6 +1331,30 @@ describe("resolveLiveServerRoot (#369)", () => {
     expect(res.relDir).toBe("ComfyUI");
   });
 
+  it("never adopts an unrelated install above a SYSTEM interpreter (codex gate r3)", async () => {
+    const dir = await tmpDir();
+    try {
+      // `C:\Python311\python.exe` runs `ComfyUI\main.py` from a cwd it never reports,
+      // and an UNRELATED `<dir>/ComfyUI/main.py` happens to sit beside the python.
+      // Walking up must NOT adopt it: nothing ties that install to the interpreter.
+      const stale = join(dir, "ComfyUI");
+      await mkdir(stale, { recursive: true });
+      await writeFile(join(stale, "main.py"), "", "utf-8");
+      const sysDir = join(dir, "Python311");
+      await mkdir(sysDir, { recursive: true });
+      const python = join(sysDir, IS_WIN ? "python.exe" : "python3");
+      await writeFile(python, "", "utf-8");
+
+      const res = resolveLiveServerRoot(["ComfyUI\\main.py"], undefined, {
+        observedPython: python,
+      });
+      expect(res.source).toBe("unresolved");
+      expect(res.root).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("stays UNRESOLVED when the observed interpreter is not inside an install tree", async () => {
     const dir = await tmpDir();
     try {

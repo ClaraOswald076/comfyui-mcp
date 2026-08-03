@@ -25,6 +25,7 @@ import { targetsPanelPackExactly } from "./panel-pin-guard.js";
 import {
   downloadModel,
   listLocalModels,
+  liveListingHasEntry,
   resolveExistingModelFile,
   managerModelDestination,
   MODEL_SUBDIRS,
@@ -902,7 +903,33 @@ async function applyManifestSections(
       const target = await resolveLocalModelPath(model);
       const existing = await findExistingModel(target);
       if (existing) {
-        results.push(report("model", item, "skipped", `Model already exists at ${existing}.`));
+        // "Already exists" is only a legitimate SKIP if the running ComfyUI can
+        // actually load it. On a locally-configured (non-live-resolved) models root
+        // an old file in a STALE install would otherwise satisfy the manifest while
+        // the live server has never seen it — the #369 failure, reached through the
+        // existing-file shortcut instead of a download (codex gate, round 3).
+        const visible = await liveListingHasEntry(target.targetSubfolder, target.filename);
+        results.push(
+          visible === false
+            ? report(
+                "model",
+                item,
+                "failed",
+                `A file exists at ${existing}, but the connected ComfyUI does not list ` +
+                  `"${target.filename}" under "${target.targetSubfolder}" — it is in an install ` +
+                  "the running server does not read. Point COMFYUI_PATH at the ComfyUI that is " +
+                  "actually running, or launch it with an absolute --base-directory.",
+              )
+            : report(
+                "model",
+                item,
+                "skipped",
+                `Model already exists at ${existing}.` +
+                  (visible === undefined
+                    ? " NOTE: the connected ComfyUI could not be asked whether it reads from there."
+                    : ""),
+              ),
+        );
         continue;
       }
       const { job, settled } = await startDownloadJob(
