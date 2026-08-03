@@ -361,6 +361,21 @@ export class RunCompletionJournalImpl {
     for (const ticket of this.tickets.values()) {
       if (ticket.tabId === from) ticket.tabId = to;
     }
+    // ALL per-tab state moves, not just the visible two. Leaving the delivered
+    // memo behind would let a post-migration re-send be delivered a SECOND time
+    // (its settled ticket moved, so it still correlates as matched); leaving the
+    // eviction counter behind would silently swallow the "these runs are
+    // undetermined" disclosure it exists to carry.
+    for (const memo of [...this.delivered]) {
+      if (!memo.startsWith(`${from}|`)) continue;
+      this.delivered.delete(memo);
+      this.delivered.add(`${to}|${memo.slice(from.length + 1)}`);
+    }
+    const lost = this.dropped.get(from);
+    if (lost !== undefined) {
+      this.dropped.delete(from);
+      this.dropped.set(to, (this.dropped.get(to) ?? 0) + lost);
+    }
   }
 
   /**
@@ -387,6 +402,9 @@ export class RunCompletionJournalImpl {
       if (ticket.tabId === key) this.tickets.delete(pid);
     }
     this.dropped.delete(key);
+    for (const memo of [...this.delivered]) {
+      if (memo.startsWith(`${key}|`)) this.delivered.delete(memo);
+    }
   }
 
   /**

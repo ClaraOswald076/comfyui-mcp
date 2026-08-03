@@ -482,6 +482,25 @@ describe("run completion journal correlation (#468)", () => {
     expect(seen).toEqual([PROMPT_A]);
   });
 
+  it("moveKey carries the delivered memo and the eviction counter, not just the entries", () => {
+    // A tmp: → wf: save/rename migration must move ALL per-tab state, or a
+    // post-migration re-send is delivered twice and an eviction disclosure is
+    // silently dropped.
+    journal.openRun(PROMPT_A, { tabId: "tmp:draft" });
+    const entry = journal.record("tmp:draft", { kind: "executed", prompt_id: PROMPT_A });
+    journal.deliverPending("tmp:draft", () => true);
+    journal.ack(entry!.token);
+    for (let i = 0; i < 40; i++) journal.record("tmp:draft", { kind: "executed", prompt_id: `d-${i}` });
+    const lost = journal.droppedFor("tmp:draft");
+    expect(lost).toBeGreaterThan(0);
+
+    journal.moveKey("tmp:draft", "wf:saved.json");
+    expect(journal.droppedFor("wf:saved.json")).toBe(lost);
+    expect(journal.droppedFor("tmp:draft")).toBe(0);
+    // The re-send is still suppressed under the NEW id.
+    expect(journal.record("wf:saved.json", { kind: "executed", prompt_id: PROMPT_A })).toBeNull();
+  });
+
   it("moveKey re-addresses a tab's entries without touching anyone else's", () => {
     journal.openRun(PROMPT_A, { tabId: "old" });
     journal.record("old", { kind: "executed", prompt_id: PROMPT_A });
