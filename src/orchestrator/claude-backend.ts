@@ -691,25 +691,17 @@ export class ClaudeBackend implements AgentBackend {
         // is unrecoverable once crossed, so the poison is terminal for the
         // session — content evidence must not rescue it (it accrued to a
         // mismatched trace, which is not proof of ITS turn's success).
-        // SUBTYPE-AWARE correlation (#728 r5/r6): an interrupted turn ends with
-        // an INTERRUPTED-subtype result, so a result with any OTHER subtype can
-        // never be an interrupted trace's terminal. If the oldest trace is
-        // marked interrupted and this result is NOT, that turn's result is
-        // permanently LOST (the panel's fallback released the next turn long
-        // ago) and this result belongs to a NEWER turn — skip (park) the
-        // interrupted trace(s) and pop the first non-interrupted one, for
-        // classification AND for the turn-marker stamp (otherwise the new turn's
-        // terminal stamps with the abandoned turn's marker and PanelAgent
-        // dead-letters it — a permanent wedge).
-        //
-        // An INTERRUPTED-subtype landing does not skip — but it does NOT blindly
-        // pop the oldest trace either (r6): a parked trace's result was already
-        // declared lost, so a fresh landing belongs to the oldest UNPARKED
-        // interrupted trace (a NEWER turn interrupted after the park — blindly
-        // popping parked A would stamp C's real terminal with A's marker and
-        // wedge C). Only when no unparked candidate remains is it the parked
-        // trace's own late landing. Each trace lands at most once: a landed
-        // park moves to consumedInterrupted, so a SECOND landing for the same
+        // An INTERRUPTED-subtype landing does not skip — and it is not blindly
+        // the oldest trace either (r6/r7). The SDK processes turns
+        // SEQUENTIALLY and the panel's turn gate only ever submits a newer turn
+        // after the older turn's result was written off, so with SEVERAL
+        // unconsumed interrupted traces pending the landing belongs to the
+        // NEWEST of them — the older interrupted turns' results are provably
+        // LOST and are written off (parked) here too, uniformly with the r5
+        // skip. With exactly ONE candidate the landing is simply its own (the
+        // normal in-order case, or a parked trace's late landing). Each trace
+        // lands at most once: candidates are unconsumed (landed parks move to
+        // consumedInterrupted on the pop), so a SECOND landing for the same
         // turn finds no candidate and fails closed (traceless) below.
         const resultSubtype: string = message.subtype;
         const interruptedLanding = resultSubtype === "interrupted";
@@ -722,16 +714,23 @@ export class ClaudeBackend implements AgentBackend {
           }
           trace = traceIndex === 0 ? (this.turns.shift() ?? null) : (this.turns.splice(traceIndex, 1)[0] ?? null);
         } else {
-          let idx = this.turns.findIndex((t) => t.interrupted && !this.parkedInterrupted.has(t.id));
-          if (idx < 0) {
-            idx = this.turns.findIndex(
-              (t) =>
-                t.interrupted &&
-                this.parkedInterrupted.has(t.id) &&
-                !this.consumedInterrupted.has(t.id),
-            );
+          let idx = -1;
+          for (let i = this.turns.length - 1; i >= 0; i--) {
+            if (this.turns[i].interrupted && !this.consumedInterrupted.has(this.turns[i].id)) {
+              idx = i; // newest unconsumed interrupted trace
+              break;
+            }
           }
-          trace = idx >= 0 ? (this.turns.splice(idx, 1)[0] ?? null) : null;
+          if (idx >= 0) {
+            // Write off every OTHER unconsumed interrupted trace older than the
+            // landing's turn — their results are provably lost (above).
+            for (let i = 0; i < idx; i++) {
+              if (this.turns[i].interrupted && !this.consumedInterrupted.has(this.turns[i].id)) {
+                this.parkedInterrupted.add(this.turns[i].id);
+              }
+            }
+            trace = this.turns.splice(idx, 1)[0] ?? null;
+          }
         }
         let unverifiable: string | null = null;
         if (this.classificationPoisoned) {
