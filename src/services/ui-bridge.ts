@@ -18,7 +18,7 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import { logger } from "../utils/logger.js";
-import { compareSemver } from "./self-update.js";
+import { compareSemver, detectInstallMode } from "./self-update.js";
 
 export const DEFAULT_BRIDGE_PORT = 9101;
 
@@ -358,9 +358,33 @@ export function panelVersionProvesUnsupported(cmd: string, panelVersion?: string
  *  gate only ever fires for tabled commands), so "this panel build does not
  *  implement it" is an observed fact, and "update to the latest release" is the
  *  only remedy guaranteed sufficient — never a fabricated, possibly-already-met
- *  version number. */
-function buildPanelTooOldError(cmd: string, panelVersion?: string): Error {
-  const detected = panelVersion ? ` (detected ${panelVersion})` : "";
+ *  version number.
+ *
+ *  The "(detected …)" parenthetical names BOTH sides of the skew (#422): the
+ *  detected PANEL build (when known) AND the detecting MCP server build. A
+ *  "stale panel version" report is only actionable when the reader can see which
+ *  MCP build made the verdict — an outdated orchestrator can hold an outdated
+ *  minimum table, so both versions belong in the error. The MCP version is
+ *  resolved once per process (it cannot change without a restart); callers may
+ *  pass `mcpVersion` explicitly (tests). */
+let cachedMcpVersion: string | undefined;
+function mcpServerVersion(): string | undefined {
+  if (cachedMcpVersion === undefined) {
+    cachedMcpVersion = detectInstallMode().currentVersion;
+  }
+  return cachedMcpVersion;
+}
+
+function buildPanelTooOldError(
+  cmd: string,
+  panelVersion?: string,
+  mcpVersion: string | undefined = mcpServerVersion(),
+): Error {
+  const detected = panelVersion
+    ? ` (detected panel ${panelVersion}${mcpVersion ? `, mcp ${mcpVersion}` : ""})`
+    : mcpVersion
+      ? ` (detected mcp ${mcpVersion})`
+      : "";
   const min = BRIDGE_CMD_MIN_PANEL_VERSION[cmd];
   const e = new Error(
     min
@@ -435,6 +459,7 @@ export function isUnknownCommandReply(error: string): boolean {
 export function makeUnknownCommandError(
   error: string,
   panelVersion?: string,
+  mcpVersion?: string,
 ): Error | null {
   // Match the panel's exact shape: `Unknown command "graph_query"` (quotes
   // optional/variable). ANCHORED at the start of the (trimmed) message so an
@@ -451,7 +476,7 @@ export function makeUnknownCommandError(
   // (which would also POISON the #236 unsupported-cmd gate against a capable panel).
   // Return null so the raw error surfaces and the gate is never poisoned.
   if (panelSupportsCmd(cmd, panelVersion)) return null;
-  return buildPanelTooOldError(cmd, panelVersion);
+  return buildPanelTooOldError(cmd, panelVersion, mcpVersion);
 }
 
 /**

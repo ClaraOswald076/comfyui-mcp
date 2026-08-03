@@ -2054,6 +2054,24 @@ describe("makeUnknownCommandError (old-panel version gate)", () => {
     expect(e?.message).toContain("0.6.8");
   });
 
+  // #422 — the error must name BOTH sides of the skew: the detected PANEL build
+  // AND the detecting MCP server build ("return the detected MCP + panel versions
+  // in the error"), so a "stale panel version" report shows which orchestrator
+  // build (and thus which minimum table) produced the verdict.
+  it("includes the detected MCP server version alongside the panel version (#422)", () => {
+    const e = makeUnknownCommandError('Unknown command "graph_query"', "0.6.8", "0.48.27");
+    expect(e?.message).toContain("detected panel 0.6.8");
+    expect(e?.message).toContain("mcp 0.48.27");
+  });
+
+  // …and when the caller does not supply it, the running server's own version is
+  // resolved (from this package's package.json) — never silently dropped.
+  it("self-resolves the running MCP server version when not supplied (#422)", () => {
+    const e = makeUnknownCommandError('Unknown command "graph_query"', "0.6.8");
+    expect(e?.message).toContain("detected panel 0.6.8");
+    expect(e?.message).toMatch(/, mcp \d+\.\d+\.\d+/);
+  });
+
   // #352 FALSE-NEGATIVE boundary: a panel that ADVERTISES a version at/above the
   // command's real minimum must NEVER be told it is "too old". An Unknown-command
   // reply from a provably-new-enough panel is not an age problem, so it is NOT
@@ -2396,6 +2414,73 @@ describe("UiBridge.send (graceful gate end-to-end)", () => {
     );
     // The FIRST call is gated before dispatch — the panel is never asked.
     expect(dispatchCount).toBe(0);
+  });
+
+  // #422 — the gate's verdict names BOTH detected versions: the panel build that
+  // undercuts the minimum AND the running MCP server build making the verdict, so
+  // a "stale panel version" report is actionable without guessing which side is old.
+  it("proactive-gate verdict quotes the detected panel AND mcp versions (#422)", async () => {
+    const sock = await connectPanel(undefined);
+    sock.send(JSON.stringify({ type: "hello", tab_id: "skew-tab", title: "wf", panel_version: "0.6.8" }));
+    sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd) {
+        sock.send(JSON.stringify({ rid: msg.rid, ok: true, result: { cmd: msg.cmd } }));
+      }
+    });
+    await new Promise((r) => setTimeout(r, 50));
+
+    await expect(bridge.send({ cmd: "graph_query" }, { tabId: "skew-tab" })).rejects.toThrow(
+      /too old for "graph_query" \(detected panel 0\.6\.8, mcp \d+\.\d+\.\d+\)/i,
+    );
+  });
+
+  // #422 — a reconnect/hello at a NEWER version must update the REPORTED version:
+  // the detected-version the gate quotes is re-read from every hello, so after the
+  // refresh nothing ever quotes the stale pre-reconnect build. FAIL-before (the
+  // original report): a later verdict quoted a version state the tab had long since
+  // re-helloed past.
+  it("quotes the REFRESHED panel version after a reconnect at a newer build — never the stale one (#422)", async () => {
+    const sock1 = await connectPanel(undefined);
+    sock1.send(JSON.stringify({ type: "hello", tab_id: "refresh-tab", title: "wf", panel_version: "0.6.8" }));
+    await new Promise((r) => setTimeout(r, 50));
+    // 0.6.8 undercuts graph_query's 0.7.0 minimum → gated, quoting 0.6.8.
+    await expect(bridge.send({ cmd: "graph_query" }, { tabId: "refresh-tab" })).rejects.toThrow(
+      /detected panel 0\.6\.8/i,
+    );
+
+    // The tab reloads at a NEWER build (0.7.0) under the same tab id. graph_query
+    // now meets its minimum and must dispatch; a command with a HIGHER minimum
+    // (refresh_nodes → 0.11.28) is still gated — but quotes the NEW 0.7.0, not the
+    // stale 0.6.8 the first connection advertised.
+    const sock2 = await connectPanel(undefined);
+    const dispatched: string[] = [];
+    sock2.send(JSON.stringify({ type: "hello", tab_id: "refresh-tab", title: "wf", panel_version: "0.7.0" }));
+    sock2.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd) {
+        dispatched.push(msg.cmd);
+        sock2.send(JSON.stringify({ rid: msg.rid, ok: true, result: { cmd: msg.cmd } }));
+      }
+    });
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(await bridge.send({ cmd: "graph_query" }, { tabId: "refresh-tab" })).toEqual({
+      cmd: "graph_query",
+    });
+    expect(dispatched).toContain("graph_query");
+    const gated = await bridge
+      .send({ cmd: "refresh_nodes" }, { tabId: "refresh-tab" })
+      .then(
+        () => {
+          throw new Error("refresh_nodes should have been gated, not dispatched");
+        },
+        (e: Error) => e,
+      );
+    expect(gated.message).toMatch(
+      /too old for "refresh_nodes" \(detected panel 0\.7\.0, mcp \d+\.\d+\.\d+\).*≥0\.11\.28/is,
+    );
+    expect(gated.message).not.toContain("0.6.8");
   });
 
   // A command that has NEVER been tried on this connection must never be
