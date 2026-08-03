@@ -185,11 +185,17 @@ function mockLivePortThenFree(): { killed: () => boolean } {
   return { killed: () => killed };
 }
 
-function spawnCapturingChildren(pid?: number): FakeChild[] {
+/**
+ * Model a spawn. The default pid matches the pid the port fixtures report, since
+ * Node only leaves `pid` undefined when the spawn FAILED — a successful launch
+ * always has one, and modelling it as absent would model a failure.
+ * Pass `null` to model that failure explicitly.
+ */
+function spawnCapturingChildren(pid: number | null = 4321): FakeChild[] {
   const children: FakeChild[] = [];
   mockSpawn.mockImplementation(() => {
     const child = new FakeChild();
-    child.pid = pid;
+    child.pid = pid ?? undefined;
     children.push(child);
     return child;
   });
@@ -1613,6 +1619,53 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
 
     expect(result.listener_ownership).toBe("ours");
     expect(result.message).toMatch(/restarted successfully/i);
+
+    killSpy.mockRestore();
+  });
+
+  it("does NOT launder a FAILED spawn into an unconfirmed success when someone else answers first", async () => {
+    // The spawn fails asynchronously and the child never gets a pid, but another
+    // launcher's server answers readiness before the `error` event wins the race.
+    // "We could not tell whose listener that is" would be a lie: we know our launch
+    // never happened.
+    usePlainInstall();
+    const children = spawnCapturingChildren(null);
+    let killed = false;
+    let relaunched = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill|pkill|\bkill\b/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (/netstat/i.test(cmd)) {
+        return killed && !relaunched
+          ? ""
+          : "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       7777";
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed && !relaunched) throw new Error("not listening");
+        return "p7777\nn127.0.0.1:8188\n";
+      }
+      return "";
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        relaunched = true;
+        // Readiness WINS the race — the spawn error lands later, so ownership must
+        // be decided from the missing pid alone.
+        setTimeout(() => children[0]?.emit("error", new Error("spawn EACCES")), 50);
+        return { ok: true } as Response;
+      }),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.listener_ownership).toBe("not-ours");
+    expect(result.started).toBe(false);
+    expect(result.message).not.toMatch(/restarted successfully/i);
+    expect(result.message).not.toMatch(/up and ready after the restart/i);
 
     killSpy.mockRestore();
   });

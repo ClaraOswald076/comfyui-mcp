@@ -70,6 +70,12 @@ import {
 
 class FakeChild extends EventEmitter {
   unref = vi.fn();
+  /**
+   * Node only leaves `pid` undefined when the spawn FAILED, so a fake that models
+   * a successful launch must carry one — 4321, matching the pid the port fixtures
+   * below report (#776 listener-ownership).
+   */
+  pid: number | undefined = 4321;
 }
 
 const ORIGINAL_ENV = { ...process.env };
@@ -129,6 +135,11 @@ beforeEach(() => {
   mockFindComfyuiPython.mockReturnValue("/fake/ComfyUI/python_embeded/python.exe");
   mockExistsSync.mockImplementation(() => true);
   mockStatSync.mockImplementation(() => ({ isDirectory: () => true }));
+  // The listener-ownership check (#776) probes the spawned child's liveness with a
+  // signal-0 `process.kill`. These fakes model a LIVE child, so the probe must say
+  // so rather than reaching the real OS and getting ESRCH for a pid that was never
+  // real. Individual tests re-spy this where they assert on killing.
+  vi.spyOn(process, "kill").mockImplementation(() => true);
   __processControlTestHooks.reset();
 });
 

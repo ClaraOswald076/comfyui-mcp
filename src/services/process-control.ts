@@ -607,6 +607,12 @@ function classifyListenerOwnership(input: {
   isDesktopApp: boolean;
   /** The child's `exit` event has already been delivered. */
   childExited: boolean;
+  /**
+   * The child's `error` event has been delivered — the spawn FAILED. Latched
+   * independently of the readiness race, because a healthy listener answering
+   * first must not hide the fact that our launch never happened.
+   */
+  spawnFailed: boolean;
   child: ChildProcess;
   launchArgv?: string[];
   portOwnerPid: number | null;
@@ -615,6 +621,14 @@ function classifyListenerOwnership(input: {
   // macOS `open`) and its child binds the port, so a pid mismatch proves nothing.
   if (input.isDesktopApp) return "unconfirmed";
   if (input.childExited) return "not-ours";
+  // The spawn FAILED — whatever is answering, we did not start it. Checked before
+  // anything else so a healthy listener that won the readiness race cannot launder
+  // a failed launch into an unconfirmed success (codex gate).
+  if (input.spawnFailed) return "not-ours";
+  // Node leaves `pid` undefined when the spawn did not happen at all. That is the
+  // same fact arriving by a different route (the `error` event may not have been
+  // delivered yet), so it gets the same verdict rather than "we cannot tell".
+  if (input.child.pid == null) return "not-ours";
 
   const alive = launchedChildStillRunning(input.child);
   // Definitively gone (ESRCH) — whatever is serving the port is not it, even
@@ -1942,6 +1956,14 @@ export async function startComfyUI(): Promise<StartResult> {
   launched.child.once("exit", (code, signal) => {
     launchedChildExit = { code, signal };
   });
+  // Latched SEPARATELY from the readiness race below: if another launcher's server
+  // answers first, the race resolves on readiness and the spawn failure would never
+  // be consulted — leaving a launch that never happened reported as an unconfirmed
+  // success (codex gate).
+  let launchedSpawnFailed = false;
+  launched.child.once("error", () => {
+    launchedSpawnFailed = true;
+  });
   launched.child.unref();
   lastProcessInfo = info;
   superviseChild(launched.child, info);
@@ -1978,7 +2000,9 @@ export async function startComfyUI(): Promise<StartResult> {
       spawn_error: startupResult.spawn_error,
       auto_restart: supervisorResult(info),
       launch_env: launchEnvInfo(info),
-      listener_ownership: "unconfirmed",
+      // The spawn failed outright: whatever may be serving that port, it is
+      // certainly not something this call started.
+      listener_ownership: "not-ours",
     };
   }
 
@@ -2028,6 +2052,7 @@ export async function startComfyUI(): Promise<StartResult> {
   const ownership: ListenerOwnership = classifyListenerOwnership({
     isDesktopApp: info.isDesktopApp,
     childExited: launchedChildExit != null,
+    spawnFailed: launchedSpawnFailed,
     child: launched.child,
     launchArgv: launched.launchArgv,
     portOwnerPid: newPid,

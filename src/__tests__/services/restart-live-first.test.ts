@@ -17,6 +17,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 class FakeChild extends EventEmitter {
   unref = vi.fn();
+  /**
+   * Node only leaves `pid` undefined when the spawn FAILED, so a fake that models
+   * a successful launch must carry one — 4321, matching the pid the port fixtures
+   * below report (#776 listener-ownership).
+   */
+  pid: number | undefined = 4321;
 }
 
 const mockConfig = vi.hoisted(() => ({
