@@ -2395,7 +2395,23 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
         // OWN error, while ComfyUI's "200 + EMPTY body = file does not exist"
         // convention (some builds; see parseWorkflowLock) is an ABSENCE — an
         // authoritative "no such name", not a malformed file.
-        const body = (await res.text()).trim();
+        //
+        // The body read gets its OWN try/catch (codex MAJOR): a stream that aborts
+        // MID-BODY would otherwise fall out to the outer catch as a statusless
+        // error and be classified "unreachable", re-opening the reconstructed
+        // local fallback for a server that had in fact ANSWERED — the wrong-file
+        // path again. The server answered, so this is a refusal, not an absence.
+        let body: string;
+        try {
+          body = (await res.text()).trim();
+        } catch (err) {
+          return {
+            kind: "refused",
+            detail:
+              `ComfyUI answered ${res.status} for "${key}" but the response body could not be read ` +
+              `(${err instanceof Error ? err.message : String(err)})`,
+          };
+        }
         if (body === "") {
           return { kind: "absent", detail: `is not in the connected ComfyUI's workflow library (empty 200 response for "${key}")` };
         }
@@ -2436,14 +2452,23 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
   // reports — it never reconstructs a path. More than one match is AMBIGUOUS and
   // is refused rather than guessed at.
   let listedButUnserved: string | null = null;
+  let caseNearMisses: string[] = [];
   if (outcome.kind === "absent") {
     const listed = await listUserdataWorkflowKeys();
     if (listed) {
       const want = normalizeStoreKey(rel);
-      const exact = listed.filter((k) => normalizeStoreKey(k) === want);
-      const matches = exact.length
-        ? exact
-        : listed.filter((k) => normalizeStoreKey(k).toLowerCase() === want.toLowerCase());
+      // The ONLY accepted equivalence is Unicode normalization. NFC "é" and NFD
+      // "e"+U+0301 are the SAME character sequence written two ways — the same
+      // name, not a similar one — so retrying the server's form of it resolves
+      // the caller's name rather than substituting another.
+      //
+      // Letter case is deliberately NOT an accepted equivalence (codex MAJOR).
+      // On a case-insensitive filesystem the server's first GET already succeeds,
+      // so case never reaches here; on a case-sensitive one "Foo.json" and
+      // "foo.json" are two DIFFERENT files, and silently serving the other one is
+      // exactly the wrong-graph substitution this resolver must not make. A
+      // case-only near miss is instead NAMED in the refusal below.
+      const matches = listed.filter((k) => normalizeStoreKey(k) === want);
       if (matches.length > 1) {
         throw new Error(
           `"${p}" is ambiguous in the connected ComfyUI's workflow library — it matches ` +
@@ -2460,6 +2485,10 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
         // name but will not serve it. Say so — that is a server-side condition the
         // user must see, not a cue to go hunting for a local file.
         if (outcome.kind === "absent") listedButUnserved = matches[0];
+      } else {
+        caseNearMisses = listed.filter(
+          (k) => normalizeStoreKey(k).toLowerCase() === want.toLowerCase(),
+        );
       }
     }
   }
@@ -2491,6 +2520,11 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
         (listedButUnserved
           ? ` Its library DOES list "${listedButUnserved}", but the server would not serve that key —` +
             ` the file may have been removed or be unreadable on the ComfyUI machine.`
+          : "") +
+        (caseNearMisses.length
+          ? ` The library does list ${caseNearMisses.map((k) => `"${k}"`).join(", ")}, which differs` +
+            ` only in letter case — a different file on a case-sensitive filesystem, so it was NOT` +
+            ` substituted. Retype the name exactly if that is the one you meant.`
           : "") +
         ` The connected ComfyUI is the authority on its own user directory (it may have been started` +
         ` with --user-directory), so the orchestrator will NOT guess at a local path that could be a` +

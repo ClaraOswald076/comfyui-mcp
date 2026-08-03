@@ -376,10 +376,15 @@ describe("readWorkflowFromPath: HTTP status is recovered from a THROWN client er
 });
 
 // #202 — a name that IS in the connected ComfyUI's library but whose bytes differ
-// (Unicode NFC/NFD, or letter case) used to 404 and die, even though
-// panel_list_workflows plainly showed it. The resolver asks the SERVER for its own
-// listing and retries the SERVER's exact key — it never reconstructs a path — and
-// refuses outright when more than one listed key could be meant.
+// by Unicode normalization used to 404 and die, even though panel_list_workflows
+// plainly showed it. The resolver asks the SERVER for its own listing and retries
+// the SERVER's exact key — it never reconstructs a path — and refuses outright
+// when more than one listed key normalizes to the requested name.
+//
+// Normalization is the ONLY accepted equivalence: NFC/NFD are two spellings of the
+// same character sequence. Letter case is NOT — on a case-sensitive filesystem
+// "Foo.json" and "foo.json" are different files, so a case-only near miss is named
+// in the refusal and never substituted.
 describe("readWorkflowFromPath: near-miss names resolve via the server's OWN listing (#202)", () => {
   const routeMock = (listing: unknown[], files: Record<string, unknown>) =>
     fetchApi.mockImplementation(async (route: string) => {
@@ -397,8 +402,8 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
     // the caller typed the DECOMPOSED form (NFD, "e" + U+0301). Byte-different,
     // same file name. Written as escapes so no editor/formatter can re-normalize
     // the literals and quietly void the test.
-    const nfc = "café.json";
-    const nfd = "café.json";
+    const nfc = "caf\u00e9.json";
+    const nfd = "cafe\u0301.json";
     const graph = { nodes: [{ id: 1, type: "KSampler" }], links: [] };
     routeMock([nfc], { [`workflows/${nfc}`]: graph });
 
@@ -412,8 +417,26 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
     expect(fetchApi).toHaveBeenCalledWith(`/api/userdata/${encodeURIComponent(`workflows/${nfc}`)}`);
   });
 
-  it("REFUSES when two listed workflows differ only by case (ambiguous, no guess)", async () => {
-    routeMock(["Foo.json", "foo.json"], {});
+  it("REFUSES when two listed keys NORMALIZE to the requested name (ambiguous, no guess)", async () => {
+    // Two library keys, one NFC and one NFD, both spelling the same name. A
+    // case-sensitive store can hold both; picking either would be a coin flip over
+    // which graph the agent edits.
+    const nfc = "caf\u00e9.json";
+    const nfd = "cafe\u0301.json";
+    routeMock([nfc, nfd], {});
+
+    const { ctx, calls } = makeCtx();
+    const res = await loadWorkflow().handler({ path: nfd }, ctx);
+
+    expect(res.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+    expect(JSON.stringify(res)).toMatch(/ambiguous/i);
+  });
+
+  it("NEVER substitutes a case-only near miss — it names it and refuses", async () => {
+    // "FOO.json" is not in the library; "Foo.json" is a DIFFERENT file on a
+    // case-sensitive filesystem. Loading it would be the wrong graph.
+    routeMock(["Foo.json"], { "workflows/Foo.json": { nodes: [{ id: 1, type: "WrongCaseNode" }] } });
 
     const { ctx, calls } = makeCtx();
     const res = await loadWorkflow().handler({ path: "FOO.json" }, ctx);
@@ -421,9 +444,33 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
     expect(res.isError).toBe(true);
     expect(calls).toHaveLength(0);
     const text = JSON.stringify(res);
-    expect(text).toMatch(/ambiguous/i);
+    expect(text).toMatch(/letter case/i);
     expect(text).toMatch(/Foo\.json/);
-    expect(text).toMatch(/foo\.json/);
+    // The differently-cased key was never fetched.
+    expect(fetchApi).not.toHaveBeenCalledWith(
+      `/api/userdata/${encodeURIComponent("workflows/Foo.json")}`,
+    );
+  });
+
+  it("an NFC-exact match still wins when a case-variant sibling exists", async () => {
+    // The caller's name matches "café.json" character-for-character once
+    // normalized; "CAFÉ.json" differs in case and is a different name. The exact
+    // match is not a guess, so it resolves — and the case sibling is not fetched.
+    const nfc = "caf\u00e9.json";
+    const nfd = "cafe\u0301.json";
+    const upper = "CAF\u00c9.json";
+    const graph = { nodes: [{ id: 4, type: "ExactMatchNode" }], links: [] };
+    routeMock([upper, nfc], { [`workflows/${nfc}`]: graph });
+
+    const { ctx, calls } = makeCtx();
+    const res = await loadWorkflow().handler({ path: nfd }, ctx);
+
+    expect(res.isError).toBeUndefined();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].graph).toMatchObject(graph);
+    expect(fetchApi).not.toHaveBeenCalledWith(
+      `/api/userdata/${encodeURIComponent(`workflows/${upper}`)}`,
+    );
   });
 
   it("says so when the library LISTS the name but will not serve it", async () => {
@@ -449,7 +496,47 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
 
     expect(res.isError).toBe(true);
     expect(calls).toHaveLength(0);
+    // The listing WAS consulted (and its 500 swallowed) — otherwise this test would
+    // pass even if the near-miss lookup had been dropped entirely.
+    expect(fetchApi).toHaveBeenCalledWith("/api/userdata?dir=workflows");
     expect(JSON.stringify(res)).toMatch(/panel_list_workflows/);
+  });
+});
+
+// #202 (codex MAJOR) — a 2xx whose BODY read aborts is still an answer from the
+// server. Letting that fall out as a statusless error classified it "unreachable"
+// and re-opened the reconstructed-local-dir fallback, so a mid-body network drop
+// could load a colliding local file.
+describe("readWorkflowFromPath: a 2xx with an unreadable body is a refusal, not a fallback (#202)", () => {
+  it("does not load a colliding local file when the response body fails mid-read", async () => {
+    const root = mkdtempSync(join(tmpdir(), "cmcp-userdir-"));
+    try {
+      const defaultDir = join(root, "user", "default", "workflows");
+      mkdirSync(defaultDir, { recursive: true });
+      writeFileSync(
+        join(defaultDir, "foo.json"),
+        JSON.stringify({ nodes: [{ id: 1, type: "CollidingLocalNode" }], links: [] }),
+        "utf8",
+      );
+      process.env.COMFYUI_PATH = root;
+
+      fetchApi.mockResolvedValue({
+        ok: true,
+        status: 200,
+        text: async () => {
+          throw new Error("terminated");
+        },
+      });
+
+      const { ctx, calls } = makeCtx();
+      const res = await loadWorkflow().handler({ path: "foo.json" }, ctx);
+
+      expect(res.isError).toBe(true);
+      expect(calls).toHaveLength(0); // the colliding local file was NOT loaded
+      expect(JSON.stringify(res)).toMatch(/body could not be read/i);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
