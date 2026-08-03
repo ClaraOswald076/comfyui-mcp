@@ -2235,53 +2235,59 @@ async function userdataFetch(route: string): Promise<Response> {
   return await client.fetch(client.apiURL(route), { headers: client.apiHeaders() });
 }
 
-/** Drop the one leading "workflows/" segment, leaving a store-RELATIVE key.
+/**
+ * Drop the one leading "workflows/" segment from CALLER input, leaving a key that
+ * is relative to the workflow store root.
  *
- *  EXACTLY one separator is consumed (codex MAJOR). "workflows//foo.json" keeps
- *  its second slash and stays "/foo.json" — collapsing runs of slashes would make
- *  it an alias for the different key "foo.json".
+ * This exists only because panel_list_workflows reports store keys that already
+ * carry the prefix (#414), so a caller may legitimately paste either spelling. It
+ * is applied EXACTLY ONCE, to the caller's `path`, and NEVER to an entry from the
+ * server's listing — those are already store-relative and stripping them again is
+ * what let a nested folder named `workflows` impersonate the store root (gate
+ * MAJOR); see matchName.
  *
- *  Nothing else is stripped. In particular a leading "/" is NOT removed (codex
- *  MAJOR): caller input can never reach here with one (that is an absolute path,
- *  handled earlier), so the only strings it would affect are LISTING entries —
- *  where "/name.json" and "name.json" are two different keys, and folding them
- *  would let a match on one be fetched as the other.
+ * Exactly one separator is consumed (codex MAJOR). "workflows//foo.json" keeps its
+ * second slash and stays "/foo.json" — collapsing runs of slashes would make it an
+ * alias for the different key "foo.json". A leading "/" is not removed either;
+ * caller input can never reach here with one (that is an absolute path, handled
+ * earlier).
  *
- *  Only the FORWARD-slash spelling counts as the library prefix (codex MAJOR).
- *  ComfyUI store keys are always "/"-separated, so `workflows\foo.json` was never
- *  one — while on POSIX it is a perfectly legal LITERAL filename. Accepting the
- *  backslash spelling would silently rewrite a request for that literal file into
- *  a request for `workflows/foo.json`, i.e. a different graph. A caller who types
- *  the backslash form gets a refusal that names the close match instead.
- *
- *  The match is also case-SENSITIVE (codex MAJOR). ComfyUI's store key is the
- *  literal lowercase "workflows/"; a library that contains a subfolder named
- *  "WORKFLOWS" is a real, different location on a case-sensitive host, and
- *  stripping it would turn "WORKFLOWS/foo.json" into a request for the root
- *  "foo.json". */
-const stripLibraryPrefix = (key: string): string =>
-  key.replace(/^workflows\//, "");
+ * Only the literal lowercase FORWARD-slash spelling counts (codex MAJOR). ComfyUI
+ * store keys are always "/"-separated and lowercase here, so `workflowsoo.json`
+ * and `WORKFLOWS/foo.json` are ordinary names — a real subfolder on a
+ * case-sensitive host, or a legal literal filename on POSIX — and stripping either
+ * would rewrite a request into one for a different graph.
+ */
+const stripLibraryPrefix = (key: string): string => key.replace(/^workflows\//, "");
 
-/** The form two userdata store keys are compared in when deciding they are the
- *  SAME NAME. Unicode normalization is the only equivalence applied: NFD "é" and
- *  NFC "é" are one character sequence written two ways, so a name pasted from a
- *  listing (or produced on another OS) can be byte-different yet denote the same
- *  file, and a raw byte comparison 404s on a workflow that visibly exists.
+/**
+ * The form two store-relative names are compared in when deciding they are the
+ * SAME NAME. Unicode normalization is the only equivalence applied: NFD "é" and
+ * NFC "é" are one character sequence written two ways, so a name pasted from a
+ * listing (or produced on another OS) can be byte-different yet denote the same
+ * file, and a raw byte comparison 404s on a workflow that visibly exists.
  *
- *  Path separators are deliberately NOT folded (codex MAJOR): on POSIX a file
- *  literally named `dir\foo.json` is a DIFFERENT file from `dir/foo.json`, so
- *  treating `\` as `/` here would let a request for one resolve to the other. Case
- *  is not folded either, for the same reason. Both of those are instead reported
- *  as near misses in the refusal. */
-const matchStoreKey = (key: string): string => stripLibraryPrefix(key).normalize("NFC");
+ * Nothing is STRIPPED here, which is what keeps request depth matched to entry
+ * depth (gate MAJOR). A recursive listing reports the root file "x.json" bare and
+ * the nested file workflows/workflows/x.json as "workflows/x.json"; stripping a
+ * prefix from the entry made those two collide, so a bare request could match the
+ * nested entry and then fetch the DIFFERENT root file. Compared verbatim, a
+ * depth-0 request can only ever match a depth-0 entry, and a request naming a
+ * subfolder matches only that exact path.
+ *
+ * Path separators are deliberately NOT folded (codex MAJOR): on POSIX a file
+ * literally named `diroo.json` is a DIFFERENT file from `dir/foo.json`. Case is
+ * not folded either, for the same reason. Both are reported as near misses instead.
+ */
+const matchName = (name: string): string => name.normalize("NFC");
 
 /** The looser form used ONLY to describe a near miss in an error message — never
  *  to select a file to load. Folds the equivalences that hold on some filesystems
- *  and not others: separator flavour (including a backslash-spelled library
- *  prefix) and letter case. */
-const looseStoreKey = (key: string): string =>
-  stripLibraryPrefix(key.replace(/\\/g, "/")).normalize("NFC").toLowerCase();
-
+ *  and not others: separator flavour, letter case and normalization. Like matchName
+ *  it strips nothing, so it cannot report a nested entry as a near miss for a root
+ *  name. */
+const looseName = (name: string): string =>
+  name.replace(/\\/g, "/").normalize("NFC").toLowerCase();
 /**
  * The connected ComfyUI's OWN list of saved workflow store keys, or null when the
  * listing could not be read. This is the same source list_workflows reports (the
@@ -2439,22 +2445,6 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
         `workflows folder (no "..", drive letters, or absolute paths), or an absolute path.`,
     );
   }
-  // A BACKSLASH in a relative name is refused outright (codex MAJOR), because the
-  // two branches below would disagree about what it means. The userdata key space
-  // is "/"-separated, so "recipes\foo.json" is sent to the server as a single
-  // literal segment — but Windows `resolve()` treats "\" as a separator, so the
-  // local fallback would happily open user/default/workflows/recipes/foo.json.
-  // One input, two different files. Since neither reading is authoritative, this
-  // refuses instead of picking: forward slashes are what the library actually uses,
-  // and a real Windows path belongs in the absolute-path branch.
-  if (rel.includes("\\")) {
-    throw new Error(
-      `"${p}" is not a valid workflow name — the ComfyUI workflow library separates ` +
-        `folders with "/", so a "\\" would mean a literal character to the server and a ` +
-        `folder separator to the local filesystem. Use forward slashes (e.g. ` +
-        `"recipes/name.json"), or pass an absolute path.`,
-    );
-  }
   // One userdata GET, classified. `key` is the STORE key (already "workflows/…").
   //
   // The request goes through userdataFetch, which returns the raw Response instead
@@ -2512,33 +2502,81 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
 
   const requestedKey = `workflows/${rel}`;
   let outcome = await fetchUserdataKey(requestedKey);
+  let resolvedKey = requestedKey;
+  // Every store key this call asked for, in order, so a refusal can name them all.
+  const attempted: string[] = [requestedKey];
 
-  // The server ANSWERED "no such name". Before giving up, ask it for its OWN
-  // listing and look for the same name in a different Unicode normal form or
-  // letter case — a name pasted from a listing (or produced on another OS) can be
-  // byte-different yet denote the same file, which is how a workflow that
-  // list_workflows plainly shows still 404s here. Only the SERVER's exact
-  // key is retried, so this resolves the name the connected ComfyUI itself
-  // reports — it never reconstructs a path. More than one match is AMBIGUOUS and
-  // is refused rather than guessed at.
-  // Turn a RAW key from the server's listing into the store key to request. The
-  // server's own bytes are preserved (codex MAJOR): re-deriving the key through
-  // normalizeStoreKey would NFC-normalize it, so a library that stores the
-  // DECOMPOSED spelling would be re-asked with the COMPOSED one — i.e. the exact
-  // key that just 404'd — and a uniquely listed workflow would be refused. Only a
-  // missing "workflows/" prefix is added.
-  const storeKeyForListed = (listedKey: string): string => {
-    // Same strictness as stripLibraryPrefix: only the literal lowercase,
-    // forward-slash "workflows/" counts as an already-prefixed key, and nothing
-    // else about the key is rewritten. Anything else is part of the NAME and must
-    // stay under the library root.
-    return /^workflows\//.test(listedKey) ? listedKey : `workflows/${listedKey}`;
+  /** Re-ask the server under a different spelling of the SAME name, without letting
+   *  the follow-up weaken what the server already told us. Returns true when the
+   *  retry settled the outcome (i.e. produced something other than another
+   *  authoritative absence). */
+  const reask = async (key: string, onUnreachable: (detail: string) => string): Promise<boolean> => {
+    attempted.push(key);
+    const retry = await fetchUserdataKey(key);
+    if (retry.kind === "unreachable") {
+      // The server ALREADY answered. A transport blip on the follow-up does not
+      // un-answer that (codex MAJOR): letting it become "unreachable" would re-open
+      // the reconstructed-local-dir fallback after the authority had spoken.
+      outcome = { kind: "refused", detail: onUnreachable(retry.detail) };
+      return true;
+    }
+    outcome = retry;
+    if (retry.kind !== "absent") {
+      // Remember which key was actually read, so a malformed / non-UI file names the
+      // file that was consulted rather than the caller's spelling.
+      resolvedKey = key;
+      return true;
+    }
+    return false;
   };
+
+  // SEPARATOR SPELLING, asked SERVER-FIRST (gate MEDIUM). The store key space is
+  // "/"-separated, so a backslash in the name is ONE literal character to the server
+  // — and on POSIX that is a legal filename — so the literal spelling must be asked
+  // for FIRST. Only once the server has authoritatively said it has no such file is
+  // the Windows-style reading tried, and both attempts are named in any refusal.
+  //
+  // That keeps a Windows caller's "recipes\name.json" working: it used to resolve
+  // through the local fallback, so refusing it outright was a regression on a path
+  // that worked, for panel_strip_workflow as much as panel_load_workflow. And it
+  // never substitutes a file while the literally-named one might still exist,
+  // because the literal key is disproved by the authority before the retry happens.
+  let matchRel = rel;
+  if (outcome.kind === "absent" && rel.includes("\\")) {
+    const slashRel = rel.replace(/\\/g, "/");
+    const slashKey = `workflows/${slashRel}`;
+    if (slashKey !== requestedKey) {
+      const settled = await reask(
+        slashKey,
+        (d) => `"${rel}" is not in the library, and re-reading it as "${slashRel}" failed: ${d}`,
+      );
+      // Absent under BOTH spellings: the literal reading is disproved, so the
+      // forward-slash reading is the only one left for the listing lookup below.
+      if (!settled) matchRel = slashRel;
+    }
+  }
+
+  // The server ANSWERED "no such name". Before giving up, ask it for its OWN listing
+  // and look for the same name in a different Unicode normal form — a name pasted
+  // from a listing (or produced on another OS) can be byte-different yet denote the
+  // same file, which is how a workflow that list_workflows plainly shows still 404s
+  // here. Only the SERVER's own entry is retried, so this resolves the name the
+  // connected ComfyUI itself reports; it never reconstructs a path. More than one
+  // match is AMBIGUOUS and is refused rather than guessed at.
+  //
+  // Listing entries are store-RELATIVE and carry NO prefix — verified on 0.29.2,
+  // where root files come back bare and nested ones as "sub/name.json" — so the
+  // store key is simply the entry under the library root, and nothing about the
+  // entry is rewritten (gate MAJOR). Stripping a "workflows/" prefix from an entry
+  // was how a subfolder literally named `workflows` came to impersonate the store
+  // root: its file lists as "workflows/x.json", which stripped to "x.json" and
+  // collided with the ROOT file of that name, so a bare request matched the nested
+  // entry and then fetched the different root file.
+  const storeKeyForListed = (listedKey: string): string => `workflows/${listedKey}`;
 
   let listedButUnserved: string | null = null;
   let nearMisses: string[] = [];
   let listingUnreadable = false;
-  let resolvedKey = requestedKey;
   if (outcome.kind === "absent") {
     const rawListed = await listUserdataWorkflowKeys();
     listingUnreadable = rawListed === null;
@@ -2547,23 +2585,18 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
     // deliberately liberal about separators — that is a REJECTION rule, where being
     // over-inclusive can only refuse more, never resolve to another file.
     const listed = rawListed?.filter((k) => {
-      const segs = stripLibraryPrefix(k.replace(/\\/g, "/")).split("/");
+      const segs = k.split(/[\\/]+/);
       return !segs.includes("..") && !segs.some((s) => /^[A-Za-z]:/.test(s));
     });
     if (listed) {
-      const want = matchStoreKey(rel);
-      // The ONLY accepted equivalence is Unicode normalization. NFC "é" and NFD
-      // "e"+U+0301 are the SAME character sequence written two ways — the same
-      // name, not a similar one — so retrying the server's form of it resolves
-      // the caller's name rather than substituting another.
-      //
-      // Letter case is deliberately NOT an accepted equivalence (codex MAJOR).
-      // On a case-insensitive filesystem the server's first GET already succeeds,
-      // so case never reaches here; on a case-sensitive one "Foo.json" and
-      // "foo.json" are two DIFFERENT files, and silently serving the other one is
-      // exactly the wrong-graph substitution this resolver must not make. A
-      // case-only near miss is instead NAMED in the refusal below.
-      const matches = listed.filter((k) => matchStoreKey(k) === want);
+      // Compared VERBATIM apart from Unicode normalization, which is what keeps
+      // request depth matched to entry depth: a name with no separator can only
+      // equal a depth-0 entry, and a name that includes a subfolder can only equal
+      // that exact path. Letter case and separator flavour are deliberately not
+      // folded — on a case-sensitive host "Foo.json" and "foo.json" are two
+      // different files — so those are NAMED as near misses below, never served.
+      const want = matchName(matchRel);
+      const matches = listed.filter((k) => matchName(k) === want);
       if (matches.length > 1) {
         throw new Error(
           `"${p}" is ambiguous in the connected ComfyUI's workflow library — it matches ` +
@@ -2574,34 +2607,23 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
       }
       if (matches.length === 1) {
         const retryKey = storeKeyForListed(matches[0]);
-        // Only re-ask when the server's spelling actually differs from what was
-        // already sent — otherwise this would repeat the request that just failed.
-        if (retryKey !== requestedKey) {
-          const retry = await fetchUserdataKey(retryKey);
-          if (retry.kind === "unreachable") {
-            // The server ALREADY answered — a 404 plus a readable listing. A
-            // transport blip on the follow-up does not un-answer that (codex
-            // MAJOR): letting it become "unreachable" would re-open the
-            // reconstructed-local-dir fallback after the authority had spoken.
-            outcome = {
-              kind: "refused",
-              detail: `the library lists "${matches[0]}", but re-reading it failed: ${retry.detail}`,
-            };
-          } else {
-            outcome = retry;
-            // Remember which key was actually read, so a malformed / non-UI file
-            // names the file that was consulted rather than the caller's spelling.
-            if (retry.kind !== "absent") resolvedKey = retryKey;
-          }
+        // Only re-ask when the server's spelling actually differs from every key
+        // already sent — otherwise this repeats a request that just failed.
+        if (!attempted.includes(retryKey)) {
+          await reask(
+            retryKey,
+            (d) => `the library lists "${matches[0]}", but re-reading it failed: ${d}`,
+          );
         }
-        // Still absent after retrying the server's OWN key: the library lists the
+        // Still absent after retrying the server's OWN entry: the library lists the
         // name but will not serve it. Say so — that is a server-side condition the
         // user must see, not a cue to go hunting for a local file.
         if (outcome.kind === "absent") listedButUnserved = matches[0];
       } else {
-        // Reported only. A key that differs by separator flavour or letter case is
-        // a DIFFERENT file on some filesystems, so it is never substituted.
-        nearMisses = listed.filter((k) => looseStoreKey(k) === looseStoreKey(rel));
+        // Reported only. A key that differs by separator flavour, letter case or
+        // normalization is a DIFFERENT file on some filesystems, so it is never
+        // substituted.
+        nearMisses = listed.filter((k) => looseName(k) === looseName(matchRel));
       }
     }
   }
@@ -2636,6 +2658,9 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
     // (#202). Refuse, naming exactly what was tried.
     throw new Error(
       `No workflow named "${p}" — it ${outcome.detail}.` +
+        (attempted.length > 1
+          ? ` Asked for ${attempted.map((k) => `"${k}"`).join(" and then ")}.`
+          : "") +
         (listingUnreadable
           ? ` Its workflow listing could not be read either, so no close match could be checked.`
           : "") +

@@ -413,34 +413,42 @@ describe("readWorkflowFromPath: a refusal is never mistaken for an unreachable s
     }
   });
 
-  it("refuses a backslash name rather than letting Windows resolve() reinterpret it", async () => {
-    // The local fallback passes the store key straight to resolve(). On Windows
-    // that turns "recipes\foo.json" — one literal segment in the server's key
-    // space — into the folder path recipes/foo.json, so the two branches would
-    // open different files from the same input (codex MAJOR).
+  it("does NOT consult a local file when a backslash name is absent under BOTH spellings", async () => {
+    // A backslash name is asked for literally first (the server's key space is
+    // "/"-separated, and on POSIX a backslash is a legal filename character), then
+    // as the Windows-style folder path. Once the server has answered "no" to both,
+    // it has spoken — the colliding local file is never consulted, and the refusal
+    // names both keys it tried.
     const root = mkdtempSync(join(tmpdir(), "cmcp-userdir-"));
     try {
       const nested = join(root, "user", "default", "workflows", "recipes");
       mkdirSync(nested, { recursive: true });
       writeFileSync(
         join(nested, "foo.json"),
-        JSON.stringify({ nodes: [{ id: 1, type: "ReinterpretedNode" }], links: [] }),
+        JSON.stringify({ nodes: [{ id: 1, type: "LocalRecipeNode" }], links: [] }),
         "utf8",
       );
       process.env.COMFYUI_PATH = root;
 
-      fetchApi.mockRejectedValue(new Error("ECONNREFUSED"));
+      fetchApi.mockImplementation(async (route: string) =>
+        route.startsWith("/api/userdata?")
+          ? { ok: true, status: 200, json: async () => [] }
+          : { ok: false, status: 404, json: async () => ({}) },
+      );
 
       const { ctx, calls } = makeCtx();
       const res = await loadWorkflow().handler({ path: "recipes\\foo.json" }, ctx);
 
       expect(res.isError).toBe(true);
-      expect(calls).toHaveLength(0); // resolve() never got to reinterpret the name
-      expect(JSON.stringify(res)).toMatch(/forward slashes/i);
+      expect(calls).toHaveLength(0); // the local recipes/foo.json was NOT loaded
+      const text = JSON.stringify(res);
+      expect(text).toMatch(/recipes\\\\foo\.json/); // the literal spelling
+      expect(text).toMatch(/recipes\/foo\.json/); // and the normalized one
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
 
   it("refuses when an unreachable server leaves TWO different local candidates", async () => {
     // Both reconstructed layouts (user/default/workflows and user/workflows) hold a
@@ -531,27 +539,53 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
     expect(fetchApi).toHaveBeenCalledWith(`/api/userdata/${encodeURIComponent(`workflows/${nfd}`)}`);
   });
 
-  it("uses the server's key verbatim when the listing already carries the workflows/ prefix", async () => {
-    // Some listings report the FULL store key. The caller's spelling must miss
-    // first (otherwise the listing branch is never entered), and the retry must
-    // then send the listed key without nesting a second workflows/ segment.
+  it("a nested folder named `workflows` can NOT satisfy a request for a ROOT file", async () => {
+    // The recursive listing reports the file workflows/workflows/name.json as the
+    // entry "workflows/name.json" — textually identical to what a root entry would
+    // look like if entries carried the library prefix. Stripping that prefix from
+    // an entry made the nested file collide with the ROOT file of the same name, so
+    // a bare request matched the nested entry and then fetched the DIFFERENT root
+    // file (gate MAJOR). Entries are store-relative and are compared verbatim, so
+    // depth is preserved and this must refuse.
     const nfc = "caf\u00e9.json";
     const nfd = "cafe\u0301.json";
-    const graph = { nodes: [{ id: 11, type: "PrefixedListingNode" }], links: [] };
-    routeMock([`workflows/${nfc}`], { [`workflows/${nfc}`]: graph });
+    routeMock([`workflows/${nfc}`], {
+      // The ROOT file exists and is servable — it is exactly what must not be sent.
+      [`workflows/${nfc}`]: { nodes: [{ id: 61, type: "RootFileNode" }], links: [] },
+    });
 
     const { ctx, calls } = makeCtx();
     const res = await loadWorkflow().handler({ path: nfd }, ctx);
 
+    expect(res.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+    // The root file's key was requested ONCE (the caller's own NFD spelling missed);
+    // the nested entry must never have been turned into a request for it.
+    expect(fetchApi).not.toHaveBeenCalledWith(
+      `/api/userdata/${encodeURIComponent(`workflows/${nfc}`)}`,
+    );
+  });
+
+  it("resolves an EXPLICIT request for a file inside a nested `workflows` folder", async () => {
+    // The flip side: asking for it by its real depth works, and the store key nests
+    // the folder rather than collapsing it.
+    const nfc = "caf\u00e9.json";
+    const nfd = "cafe\u0301.json";
+    const graph = { nodes: [{ id: 62, type: "NestedWorkflowsFolderNode" }], links: [] };
+    routeMock([`workflows/${nfc}`], { [`workflows/workflows/${nfc}`]: graph });
+
+    const { ctx, calls } = makeCtx();
+    // One "workflows/" is the library prefix a caller may paste (#414); the second
+    // is the real subfolder.
+    const res = await loadWorkflow().handler({ path: `workflows/workflows/${nfd}` }, ctx);
+
     expect(res.isError).toBeUndefined();
     expect(calls[0].graph).toMatchObject(graph);
-    // The listing branch WAS used: the caller's spelling 404'd, the listed key served.
-    expect(fetchApi).toHaveBeenCalledWith(`/api/userdata/${encodeURIComponent(`workflows/${nfd}`)}`);
-    expect(fetchApi).toHaveBeenCalledWith(`/api/userdata/${encodeURIComponent(`workflows/${nfc}`)}`);
-    expect(fetchApi).not.toHaveBeenCalledWith(
+    expect(fetchApi).toHaveBeenCalledWith(
       `/api/userdata/${encodeURIComponent(`workflows/workflows/${nfc}`)}`,
     );
   });
+
 
   it("does NOT treat a backslash as a path separator when matching (POSIX aliasing)", async () => {
     // On POSIX a file literally named "dir\\foo.json" is a DIFFERENT file from
@@ -655,23 +689,47 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
     );
   });
 
-  it("REFUSES a relative name containing a backslash, before any request", async () => {
-    // "workflows\foo.json" would mean a single literal segment to the server's
-    // "/"-keyed library and a folder separator to Windows resolve(). One input,
-    // two different files — so it is refused rather than read either way.
-    routeMock(["foo.json"], {
-      "workflows/foo.json": { nodes: [{ id: 1, type: "DifferentGraphNode" }], links: [] },
+  it("asks for a backslash name LITERALLY first, then as a folder path", async () => {
+    // On POSIX "recipes\name.json" is a legal single filename, so the literal key
+    // must be asked for before the Windows-style reading — the server is the
+    // authority on which of the two exists. Only after it disproves the literal one
+    // is the folder path tried, so nothing is substituted while the literally-named
+    // file might still exist (gate MEDIUM).
+    const graph = { nodes: [{ id: 71, type: "WindowsPathNode" }], links: [] };
+    routeMock(["recipes/foo.json"], { "workflows/recipes/foo.json": graph });
+
+    const { ctx, calls } = makeCtx();
+    const res = await loadWorkflow().handler({ path: "recipes\\foo.json" }, ctx);
+
+    expect(res.isError).toBeUndefined();
+    expect(calls[0].graph).toMatchObject(graph);
+    const keys = fetchApi.mock.calls
+      .map((c: unknown[]) => String(c[0]))
+      .filter((u: string) => u.startsWith("/api/userdata/"))
+      .map((u: string) => decodeURIComponent(u.replace("/api/userdata/", "")));
+    expect(keys[0]).toBe("workflows/recipes\\foo.json"); // literal first
+    expect(keys[1]).toBe("workflows/recipes/foo.json"); // folder path second
+  });
+
+  it("prefers a LITERAL backslash filename over the folder-path reading", async () => {
+    // Both exist on the server. The literally-named one is what was asked for, so
+    // it wins and the folder path is never requested.
+    const literal = { nodes: [{ id: 72, type: "LiteralBackslashNode" }], links: [] };
+    routeMock(["recipes\\foo.json", "recipes/foo.json"], {
+      "workflows/recipes\\foo.json": literal,
+      "workflows/recipes/foo.json": { nodes: [{ id: 73, type: "FolderPathNode" }], links: [] },
     });
 
     const { ctx, calls } = makeCtx();
-    const res = await loadWorkflow().handler({ path: "workflows\\foo.json" }, ctx);
+    const res = await loadWorkflow().handler({ path: "recipes\\foo.json" }, ctx);
 
-    expect(res.isError).toBe(true);
-    expect(calls).toHaveLength(0);
-    // Refused up front — "workflows/foo.json" exists and was never even asked for.
-    expect(fetchApi).not.toHaveBeenCalled();
-    expect(JSON.stringify(res)).toMatch(/forward slashes/i);
+    expect(res.isError).toBeUndefined();
+    expect(calls[0].graph).toMatchObject(literal);
+    expect(fetchApi).not.toHaveBeenCalledWith(
+      `/api/userdata/${encodeURIComponent("workflows/recipes/foo.json")}`,
+    );
   });
+
 
   it("a retry that cannot be completed REFUSES — it does not reopen the local fallback", async () => {
     // The server already answered (404 + a readable listing). A transport failure
