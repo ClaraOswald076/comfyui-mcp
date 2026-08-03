@@ -671,9 +671,13 @@ describe("run completion journal correlation (#468)", () => {
       return true;
     });
     expect(seen[0].dropped_completions).toBe(lost);
-    // Reported once, then cleared — later deliveries don't re-report it.
-    expect(journal.droppedFor("t")).toBe(0);
+    // Carried by the entry it rode out on, so only THAT one reports it…
     expect(seen[1]?.dropped_completions).toBeUndefined();
+    // …and it is spent only when that entry's carrying turn ends (a hand-off is
+    // not consumption — see the replay test below).
+    expect(journal.droppedFor("t")).toBe(lost);
+    journal.ack(journal.outstanding("t")[0].token);
+    expect(journal.droppedFor("t")).toBe(0);
   });
 
   it("freezes the correlation at arrival — a run opened later can never claim it", () => {
@@ -730,6 +734,11 @@ describe("run completion journal correlation (#468)", () => {
     expect(fresh!.token).not.toBe(old!.token); // its OWN entry, not a merge
     expect(journal.pending("t")).toHaveLength(1);
 
+    // …and it is DOWNGRADED: it may still be delivered (it is a real result) but
+    // never as "the run YOU queued", which would present run A's output as the
+    // awaited outcome of run B.
+    expect(old!.correlation.status).toBe("foreign");
+
     // The old entry's turn ends: it must NOT settle the reopened ticket, and must
     // NOT memoize the id as delivered (which would suppress run B's completion).
     journal.ack(old!.token);
@@ -767,6 +776,37 @@ describe("run completion journal correlation (#468)", () => {
       return true;
     });
     expect(seen[0].dropped_completions).toBe(lost);
+  });
+
+  it("an eviction disclosure survives a hand-off that is never consumed", () => {
+    // A hand-off is not consumption. If the agent holding the warning is stopped
+    // before its turn runs, the replay must carry the warning again — clearing it
+    // at hand-off left the eviction permanently undisclosed.
+    journal.record("t", { kind: "executed", prompt_id: "keeper" });
+    for (let i = 0; i < 40; i++) journal.record("t", { kind: "executed", prompt_id: `e-${i}` });
+    const lost = journal.droppedFor("t");
+    expect(lost).toBeGreaterThan(0);
+
+    const first: CompletionPayload[] = [];
+    journal.deliverPending("t", (p) => {
+      first.push(p);
+      return true;
+    });
+    expect(first[0].dropped_completions).toBe(lost);
+
+    // The agent died before reading it → released → replayed.
+    for (const e of journal.outstanding("t")) journal.release(e.token);
+    const again: CompletionPayload[] = [];
+    journal.deliverPending("t", (p) => {
+      again.push(p);
+      return true;
+    });
+    expect(again[0].dropped_completions).toBe(lost); // still disclosed
+
+    // Only the carrying turn ENDING spends it.
+    const carrier = journal.outstanding("t")[0];
+    journal.ack(carrier.token);
+    expect(journal.droppedFor("t")).toBe(0);
   });
 
   it("hasOutstanding reports any undelivered completion (the self-restart gate)", () => {

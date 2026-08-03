@@ -236,8 +236,17 @@ export class RunCompletionJournalImpl {
           !entry.superseded
         ) {
           entry.superseded = true;
+          // DOWNGRADE it too (matched → foreign, the same one-way weakening
+          // closeRuns uses). Marking it superseded stops it settling the reopened
+          // ticket, but it would still have been DELIVERED saying "this is the run
+          // YOU queued" — presenting the OLD result as the newly queued run's
+          // awaited outcome. It is a real completion, so it is still delivered;
+          // it just can no longer claim to be the run now outstanding.
+          if (entry.correlation.status === "matched") {
+            entry.correlation = { status: "foreign", promptId: entry.correlation.promptId };
+          }
           logger.warn(
-            `[run-completions] prompt ${promptId} was queued again while its previous completion was still undelivered — the older entry is superseded and can no longer answer for the new run`,
+            `[run-completions] prompt ${promptId} was queued again while its previous completion was still undelivered — the older entry is superseded (and reported as undetermined) so it can no longer answer for the new run`,
           );
         }
       }
@@ -472,8 +481,12 @@ export class RunCompletionJournalImpl {
       this.noteAttempt(entry.token, handedOff);
       if (!handedOff) return { delivered, blockedOn: entry };
       if (lost > 0) {
+        // CONSOLIDATE onto the entry; do NOT consider the disclosure spent yet.
+        // A hand-off is not consumption: if this agent is stopped before its turn
+        // runs, the entry is released and replayed, and the warning must go with
+        // it. Only `ack()` — the turn that carried it having ended — clears it.
+        entry.disclose = lost;
         this.dropped.delete(key);
-        delete entry.disclose;
       }
       delivered += 1;
     }
@@ -514,6 +527,10 @@ export class RunCompletionJournalImpl {
     const entry = this.entries.get(token);
     if (!entry) return;
     this.entries.delete(token);
+    // The turn that carried it ended, so any eviction disclosure it was carrying
+    // has now actually reached the agent — only here is it spent. (An entry
+    // evicted while still holding one passes it on; see trimEntries.)
+    delete entry.disclose;
     // A SUPERSEDED entry belongs to a run whose prompt id was queued again. It
     // was still delivered (its text reached the agent), but it must not settle
     // the REOPENED ticket — that would present the old result as the new run's —

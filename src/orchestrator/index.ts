@@ -2105,17 +2105,28 @@ export async function runPanelOrchestrator(): Promise<void> {
    * silently evaporates. Best-effort and never throws — this runs on the way out.
    */
   function reportLostCompletionsOnExit(): void {
+    const byTab = new Map<string, string[]>();
     try {
-      const byTab = new Map<string, string[]>();
       for (const entry of RunCompletions.allOutstanding()) {
         const list = byTab.get(entry.key) ?? [];
         list.push(describeCorrelation(entry.correlation));
         byTab.set(entry.key, list);
       }
+    } catch {
+      return; // nothing readable — nothing to report
+    }
+    // LOG FIRST, unconditionally. The chat push below can only reach a CONNECTED
+    // tab (an offline one's frame lands in the bridge's missedFrames buffer, which
+    // dies with the process moments later), and `bridge` may not even exist yet on
+    // a very early fatal. The log is the record that always survives — it is what
+    // a user or maintainer has after the respawn.
+    for (const [panelTab, runs] of byTab) {
+      logger.error(
+        `[panel-orchestrator] tab ${panelTab.slice(0, 8)} — self-exit with ${runs.length} undelivered run completion(s), outcome UNDETERMINED: ${runs.join("; ")}`,
+      );
+    }
+    try {
       for (const [panelTab, runs] of byTab) {
-        logger.error(
-          `[panel-orchestrator] tab ${panelTab.slice(0, 8)} — self-exit with ${runs.length} undelivered run completion(s): ${runs.join("; ")}`,
-        );
         bridge.push(
           {
             type: "say",
@@ -2129,7 +2140,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       }
     } catch (err) {
       logger.warn(
-        `[panel-orchestrator] could not report lost completions on exit: ${err instanceof Error ? err.message : String(err)}`,
+        `[panel-orchestrator] could not push the lost-completion notice (the log above is the record): ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
