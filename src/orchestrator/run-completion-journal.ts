@@ -299,6 +299,38 @@ export class RunCompletionJournalImpl {
     this.reflush?.(entry.key);
   }
 
+  /**
+   * A NEW run has taken over `promptId`, so every completion already journaled
+   * under it belongs to an OLDER run. Retire them: superseded (so they can never
+   * be merged into, settle a ticket, or memoize a delivery), downgraded from
+   * `matched` to `foreign` (so they stop claiming to be the run now outstanding),
+   * and re-issued if their queued copy can still be pulled back and re-worded.
+   *
+   * Runs on BOTH openRun paths — a reopen AND a fresh ticket after the old one
+   * was evicted. Only doing it on the reopen left the eviction ordering able to
+   * present an older run's result as the newly queued one's.
+   */
+  private retireOlderEntriesFor(promptId: string): void {
+    for (const entry of this.entries.values()) {
+      if (
+        entry.correlation.status === "unidentified" ||
+        entry.correlation.promptId !== promptId ||
+        entry.superseded
+      ) {
+        continue;
+      }
+      entry.superseded = true;
+      if (entry.correlation.status === "matched") {
+        entry.correlation = { status: "foreign", promptId: entry.correlation.promptId };
+      }
+      logger.warn(
+        `[run-completions] prompt ${promptId} was queued again while an earlier completion for it was still undelivered — the older entry is superseded (and reported as undetermined) so it can no longer answer for the new run`,
+      );
+      entry.ambiguousId = true; // the id now stands for more than one run
+      this.reissueAfterDowngrade(entry);
+    }
+  }
+
   /** `panel_run` queued a render. Returns false when ComfyUI/the panel gave us
    *  no prompt id — the caller MUST then tell the agent its completion cannot be
    *  correlated rather than promising a notification it may not be able to
@@ -323,37 +355,7 @@ export class RunCompletionJournalImpl {
       // on is unattributable (see RunTicket.reused) — reported UNDETERMINED, and
       // never suppressed as a duplicate of the other generation.
       existing.reused = true;
-      // SUPERSEDE any entry still carrying the PREVIOUS run's completion for this
-      // id. Without this, the new run's completion merges into an entry that is
-      // already sitting in an agent queue holding the OLD completion's text: when
-      // that turn ends, ack() removes the shared entry and settles the REOPENED
-      // ticket — the old result is presented as the new run's, and the new run's
-      // real completion is never delivered. A superseded entry is skipped by the
-      // dedupe scan and can no longer settle a ticket or memoize a delivery.
-      for (const entry of this.entries.values()) {
-        if (
-          entry.correlation.status !== "unidentified" &&
-          entry.correlation.promptId === promptId &&
-          !entry.superseded
-        ) {
-          entry.superseded = true;
-          // DOWNGRADE it too (matched → foreign, the same one-way weakening
-          // closeRuns uses). Marking it superseded stops it settling the reopened
-          // ticket, but it would still have been DELIVERED saying "this is the run
-          // YOU queued" — presenting the OLD result as the newly queued run's
-          // awaited outcome. It is a real completion, so it is still delivered;
-          // it just can no longer claim to be the run now outstanding.
-          if (entry.correlation.status === "matched") {
-            entry.correlation = { status: "foreign", promptId: entry.correlation.promptId };
-          }
-          logger.warn(
-            `[run-completions] prompt ${promptId} was queued again while its previous completion was still undelivered — the older entry is superseded (and reported as undetermined) so it can no longer answer for the new run`,
-          );
-          // Its already-queued copy still SAYS "the run YOU queued". Pull it back
-          // if it hasn't been read yet and re-deliver the downgraded wording.
-          this.reissueAfterDowngrade(entry);
-        }
-      }
+      this.retireOlderEntriesFor(promptId);
       return true;
     }
     this.tickets.set(promptId, {
@@ -364,6 +366,11 @@ export class RunCompletionJournalImpl {
       ...(typeof meta.toNodeId === "number" ? { toNodeId: meta.toNodeId } : {}),
       settled: false,
     });
+    // …and on THIS branch too. A fresh ticket after the old one was evicted is
+    // still a NEW run for an id that already has journaled completions: without
+    // this, an older `matched` entry survives untouched and goes on telling the
+    // agent "this is the run YOU queued" for the id now outstanding.
+    this.retireOlderEntriesFor(promptId);
     this.trimTickets();
     return true;
   }
@@ -410,6 +417,9 @@ export class RunCompletionJournalImpl {
     let idlessRepeat = false;
     /** This id already stands for more than one run (see RunTicket.reused). */
     let idReused = false;
+    /** No provable identity for this completion — see the `unprovable` note in
+     *  the identified branch. Never merged into, never suppressed. */
+    let idUnprovable = false;
     /** Ticket generation this completion belongs to — the run identity (0 = no
      *  ticket, i.e. a run this tab never queued). */
     let gen = 0;
@@ -432,8 +442,19 @@ export class RunCompletionJournalImpl {
       // ticket after the old one was evicted): different generation, different
       // key, no match.
       gen = this.generationOf(key, correlation.promptId);
+      // UNPROVABLE identity — no dedupe of any kind is safe:
+      //  • `reused`: the id stands for more than one run (see RunTicket.reused).
+      //  • gen 0: this tab never ticketed the id, so there is NO generation to
+      //    tell one such completion from another. Every foreign completion would
+      //    share the key `(tab, id, 0)`, which is a bucket, not an identity —
+      //    two genuinely different external renders that reuse a prompt id (a
+      //    ComfyUI restart does exactly that) would merge, and the second would
+      //    be suppressed outright after the first was acked.
+      // Both cases fall back to the standing rule: duplicate over loss, each
+      // delivered on its own and labelled UNDETERMINED.
+      idUnprovable = idReused || gen === 0;
       if (
-        !idReused &&
+        !idUnprovable &&
         (this.delivered.has(deliveredKey(key, correlation.promptId, gen)) ||
           (settledTicket?.settled === true && settledTicket.tabId === key))
       ) {
@@ -464,7 +485,7 @@ export class RunCompletionJournalImpl {
       // still a DIFFERENT run: overwriting its payload would drop that run's
       // result and leave the survivor stamped with the wrong generation, so its
       // ack could settle neither. Same-state AND same-identity.
-      for (const entry of idReused ? [] : this.entries.values()) {
+      for (const entry of idUnprovable ? [] : this.entries.values()) {
         if (
           entry.key === key &&
           entry.state === "pending" && // never merge into text already committed to a turn
@@ -538,7 +559,7 @@ export class RunCompletionJournalImpl {
         ? { fingerprint: idlessFingerprint(key, payload), ...(idlessRepeat ? { possibleRepeat: true } : {}) }
         : {}),
       // Freeze the ambiguity onto the entry — see JournalEntry.ambiguousId.
-      ...(idReused ? { ambiguousId: true } : {}),
+      ...(idUnprovable ? { ambiguousId: true } : {}),
       // …and the GENERATION this completion belongs to, for EVERY identified
       // entry (not just matched ones): it is what keeps its ack, its memo and any
       // future merge bound to this run rather than to whatever the id means later.
@@ -707,7 +728,12 @@ export class RunCompletionJournalImpl {
       // THAN ONE run is meaningless on its face, and a future caller that opens a
       // ticket without going through openRun would inherit the trap.
       const ticket = this.tickets.get(entry.correlation.promptId);
-      if (!(ticket?.reused === true && ticket.tabId === entry.key)) {
+      // Only a REAL generation is a proof. Generation 0 means this tab never
+      // ticketed the id, so `(tab, id, 0)` is a bucket shared by every foreign
+      // completion for it — memoizing there would let one external render's
+      // delivery suppress a different one that happens to reuse the id.
+      const provable = (entry.ticketSeq ?? 0) > 0;
+      if (provable && !(ticket?.reused === true && ticket.tabId === entry.key)) {
         // Memoize against THIS entry's own generation, never the id's current
         // meaning: an older run's ack must not write a proof that then suppresses
         // the newer run which reused the id (or got a fresh ticket after the old

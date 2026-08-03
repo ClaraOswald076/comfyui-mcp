@@ -946,6 +946,41 @@ describe("run completion journal correlation (#468)", () => {
     expect(b!.payload.note).toBe("run B");
   });
 
+  it("a FRESH ticket after eviction also retires the older run's queued completion", () => {
+    // The retire/downgrade pass used to run only on the reopen path. After an
+    // eviction the same id takes the fresh-ticket path, so an older `matched`
+    // entry survived untouched and went on telling the agent "this is the run
+    // YOU queued" — letting run A's output be acted on as run B's.
+    journal.openRun(PROMPT_A, { tabId: "t" });
+    const a = journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "run A" });
+    expect(a!.correlation.status).toBe("matched");
+
+    for (let i = 0; i < 80; i++) journal.openRun(`later-${i}`, { tabId: "t" }); // evict A's ticket
+    expect(journal.ticketFor(PROMPT_A)).toBeUndefined();
+
+    journal.openRun(PROMPT_A, { tabId: "t" }); // B takes the FRESH-ticket path
+    expect(a!.correlation.status).toBe("foreign"); // A downgraded…
+    expect(a!.superseded).toBe(true); // …and retired
+  });
+
+  it("two foreign completions sharing a prompt id are BOTH delivered", () => {
+    // Generation 0 means "this tab never queued that id", so it is a bucket
+    // shared by every foreign completion — not an identity. Two genuinely
+    // different external renders that reuse a prompt id (a ComfyUI restart does
+    // exactly that) must not merge, and the second must not be suppressed after
+    // the first is acked.
+    const first = journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "external 1" });
+    expect(first!.correlation.status).toBe("foreign");
+    const second = journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "external 2" });
+    expect(second!.token).not.toBe(first!.token); // never merged
+    expect(journal.pending("t")).toHaveLength(2);
+
+    journal.deliverPending("t", () => true);
+    journal.ack(first!.token);
+    const third = journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "external 3" });
+    expect(third).not.toBeNull(); // never suppressed by the first's ack
+  });
+
   it("the no-coalesce rule survives the reused TICKET being evicted", () => {
     // Tickets are the smallest bound (64) and evictable. If ambiguity were read
     // only from the live ticket, 64 later runs would make the incoming side
