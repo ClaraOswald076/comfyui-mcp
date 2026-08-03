@@ -749,6 +749,9 @@ async function assertDestinationVisibleToLiveServer(
   let probed = 0;
   let filesOnDisk = 0;
   let liveListed = 0;
+  /** Categories where the server HAS models but this tree holds none — the ones an
+   *  extra root would have to account for. */
+  const unexplained = new Map<string, number>();
   let worst: { category: string; missing: string[]; onDisk: number; live: number } | undefined;
   for (const category of ordered) {
     if (probed >= DISAGREEMENT_PROBE_CATEGORIES) break;
@@ -758,6 +761,7 @@ async function assertDestinationVisibleToLiveServer(
     probed += 1;
     filesOnDisk += onDisk.length;
     liveListed += listing.length;
+    if (onDisk.length === 0 && listing.length > 0) unexplained.set(category, listing.length);
     if (onDisk.length === 0) continue; // nothing to compare in this folder
     // CONTAINMENT, not overlap. If this directory really is one the server reads,
     // it SCANS it — so EVERY core-extension file in it must appear in the listing.
@@ -788,10 +792,12 @@ async function assertDestinationVisibleToLiveServer(
   }
 
   // Empty candidate tree vs a server that demonstrably HAS models. Only fatal when
-  // the live server registers no extra model roots that could be holding them —
+  // the live server registers no extra model root that could be holding them —
   // otherwise a legitimate "all my models live on another drive" setup would be
-  // refused. Authorization is fail-closed elsewhere; here a non-authoritative answer
-  // means "we cannot rule extra roots out", so we ALLOW.
+  // refused. Extra roots are CATEGORY-SCOPED, so a `checkpoints` root does not
+  // explain missing `loras` (codex gate, round 6). Authorization is fail-closed
+  // elsewhere; here a non-authoritative answer means "we cannot rule extra roots
+  // out", so we ALLOW.
   if (filesOnDisk === 0 && liveListed > 0) {
     let live: Awaited<ReturnType<typeof getLiveExtraModelRoots>>;
     try {
@@ -799,7 +805,17 @@ async function assertDestinationVisibleToLiveServer(
     } catch {
       return; // cannot rule extra roots out → no refusal
     }
-    if (!live.authoritative || live.roots.length > 0) return;
+    if (!live.authoritative) return;
+    const covered = new Set(
+      live.roots.map((r) => String(r.category ?? "").trim().toLowerCase()),
+    );
+    // Some category the server serves has NO extra root that could supply it, and
+    // this tree does not supply it either. If every unexplained category IS covered
+    // by an extra root, the tree is plausibly just a bare primary root — allow.
+    const stillUnexplained = [...unexplained.keys()].filter(
+      (c) => !covered.has(c.toLowerCase()),
+    );
+    if (stillUnexplained.length === 0) return;
     throw new ModelError(
       `Refusing to download into "${modelsRoot}": the connected ComfyUI ` +
         `(${getComfyUIBaseUrl()}) lists ${liveListed} model file(s) it can load, but this ` +
@@ -858,12 +874,35 @@ export async function liveListingHasEntry(
  */
 export async function isUnderLiveModelRoots(
   absPath: string,
+  /** The models CATEGORY the path belongs to. Live extra roots are category-scoped
+   *  (`{ category, dir }`), so a `checkpoints` root must never vouch for a LoRA
+   *  (codex gate, round 6). Omitted = consider every root. */
+  category?: string,
 ): Promise<boolean | undefined> {
-  const p = resolve(absPath);
-  const under = (root: string): boolean => {
-    const r = resolve(root);
-    return p === r || p.startsWith(r + sep);
+  /** Canonicalize so a junctioned/symlinked root is compared by where it REALLY
+   *  lives. `C:\ComfyUI\models` being a junction to `D:\Models` is a legitimate,
+   *  supported layout; a lexical-only compare would call a correctly-placed file
+   *  "outside the live roots" and fabricate a failure (codex gate, round 6). */
+  const canon = async (p: string): Promise<{ real: string; lex: string; ok: boolean }> => {
+    const lex = resolve(p);
+    try {
+      return { real: resolve(await realpath(p)), lex, ok: true };
+    } catch {
+      return { real: lex, lex, ok: false }; // not created yet / unreadable
+    }
   };
+  const target = await canon(absPath);
+  const under = (root: { real: string; lex: string }): boolean => {
+    const hit = (r: string, t: string): boolean => t === r || t.startsWith(r + sep);
+    // Either canonical form matching is enough — only ONE side may be resolvable.
+    return (
+      hit(root.real, target.real) ||
+      hit(root.lex, target.lex) ||
+      hit(root.real, target.lex) ||
+      hit(root.lex, target.real)
+    );
+  };
+
   let dest: Awaited<ReturnType<typeof resolveModelsDirWithBases>>;
   try {
     dest = await resolveModelsDirWithBases();
@@ -871,16 +910,30 @@ export async function isUnderLiveModelRoots(
     return undefined;
   }
   if (!isLiveAuthoritativeModelsDir(dest.source)) return undefined;
-  if (under(dest.modelsDir)) return true;
+
+  // A negative answer is only honest when everything it rests on could actually be
+  // canonicalized; otherwise say UNKNOWN rather than accuse a correct placement.
+  let fullyCanonical = target.ok;
+  const primary = await canon(dest.modelsDir);
+  fullyCanonical = fullyCanonical && primary.ok;
+  if (under(primary)) return true;
+
   let extra: Awaited<ReturnType<typeof getLiveExtraModelRoots>>;
   try {
     extra = await getLiveExtraModelRoots(dest.snapshot);
   } catch {
     return undefined;
   }
-  if (extra.roots.some((r) => under(r.dir))) return true;
+  const wantCat = (category ?? "").trim().toLowerCase();
+  for (const r of extra.roots) {
+    if (wantCat && String(r.category ?? "").trim().toLowerCase() !== wantCat) continue;
+    const rc = await canon(r.dir);
+    fullyCanonical = fullyCanonical && rc.ok;
+    if (under(rc)) return true;
+  }
   // The live roots are known and this path is in none of them.
-  return extra.authoritative ? false : undefined;
+  if (!extra.authoritative) return undefined;
+  return fullyCanonical ? false : undefined;
 }
 
 export interface LandedModelVerification {
@@ -974,7 +1027,7 @@ export async function verifyLandedModel(
   // codex gate, round 4); `undefined` means only local configuration could answer,
   // so a pre-existing listing entry proves nothing about OUR bytes.
   const landed = verifiedPath ?? resolve(targetPath);
-  const inLiveRoots = await isUnderLiveModelRoots(landed);
+  const inLiveRoots = await isUnderLiveModelRoots(landed, category);
   const destinationIsLiveAuthoritative = inLiveRoots === true;
   if (inLiveRoots === false) {
     let liveRoot: string | undefined;

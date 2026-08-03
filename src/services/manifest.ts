@@ -913,7 +913,10 @@ async function applyManifestSections(
         // physically inside a tree the running server reads? A name-only listing
         // check cannot tell a stale `C:\Stale\...\x.safetensors` from the live
         // server's own `D:\Live\...\x.safetensors` (codex gate, round 5).
-        const inLiveRoots = await isUnderLiveModelRoots(existing);
+        const inLiveRoots = await isUnderLiveModelRoots(
+          existing,
+          target.targetSubfolder.split(/[\\/]+/).filter(Boolean)[0],
+        );
         const visible =
           inLiveRoots ?? (await liveListingHasEntry(target.targetSubfolder, target.filename));
         results.push(

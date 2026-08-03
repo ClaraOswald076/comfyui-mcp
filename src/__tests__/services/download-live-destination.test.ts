@@ -236,6 +236,30 @@ describe("pre-write: a destination the LIVE server does not read from is refused
     );
   });
 
+  it("ALLOWS an empty tree when a CATEGORY-MATCHING extra root explains every gap", async () => {
+    h.onDisk = { loras: [] };
+    h.liveListings["loras"] = ["live-only.safetensors"];
+    h.liveExtraRoots = {
+      authoritative: true,
+      roots: [{ category: "loras", dir: "/E/models/loras" }],
+    };
+    await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBe(
+      resolve("/comfy/models/loras"),
+    );
+  });
+
+  it("REFUSES an empty tree when the only extra root is for a DIFFERENT category (codex gate r6)", async () => {
+    h.onDisk = { loras: [] };
+    h.liveListings["loras"] = ["live-only.safetensors"];
+    h.liveExtraRoots = {
+      authoritative: true,
+      roots: [{ category: "checkpoints", dir: "/E/models/checkpoints" }],
+    };
+    await expect(resolveModelSubfolderPreferServer("loras")).rejects.toThrow(
+      /DIFFERENT install/,
+    );
+  });
+
   it("REFUSES an EMPTY tree when the live server loads models and registers no extra roots (codex gate r2)", async () => {
     // Two portable bundles of the same shape; the stale one is still empty, so the
     // per-category overlap test finds nothing to compare. But the server it is NOT
@@ -412,11 +436,59 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
     expect(res.note).toMatch(/OUTSIDE every directory/);
   });
 
+  it("still confirms a JUNCTIONED primary models root (codex gate r6 — no false failure)", async () => {
+    // `C:\ComfyUI\models` is a junction to `D:\Models`. The landed file realpaths
+    // outside the lexical root; a lexical-only compare would call a correctly
+    // placed, server-readable file "outside the live roots".
+    const real = resolve("/D/Models/loras/new.safetensors");
+    realpathMock.mockImplementation(async (p: string) => {
+      const s = String(p);
+      if (s === target) return real;
+      if (resolve(s) === resolve("/comfy/models")) return resolve("/D/Models");
+      return resolve(s);
+    });
+    h.modelsDirSource = "observed-root";
+    h.destModelsDir = "/comfy/models";
+    h.liveExtraRoots = { authoritative: true, roots: [] };
+    h.liveListings["loras"] = ["new.safetensors"];
+    const res = await verifyLandedModel(target, "loras", {
+      attempts: 1,
+      retryMs: 0,
+      listedBefore: false,
+    });
+    expect(res.liveVisible).toBe("visible");
+    expect(res.verifiedPath).toBe(real);
+  });
+
+  it("does NOT let a CHECKPOINTS extra root vouch for a LORA (codex gate r6)", async () => {
+    // Live extra roots are category-scoped; a registered `checkpoints` root says
+    // nothing about where the server reads loras from.
+    const external = resolve("/E/Shared/loras/new.safetensors");
+    realpathMock.mockImplementation(async (p: string) =>
+      String(p) === target ? external : resolve(String(p)),
+    );
+    h.modelsDirSource = "observed-root";
+    h.destModelsDir = "/serverB/models";
+    h.liveExtraRoots = {
+      authoritative: true,
+      roots: [{ category: "checkpoints", dir: resolve("/E/Shared") }],
+    };
+    h.liveListings["loras"] = ["new.safetensors"];
+    const res = await verifyLandedModel(target, "loras", {
+      attempts: 1,
+      retryMs: 0,
+      listedBefore: false,
+    });
+    expect(res.liveVisible).toBe("not-visible");
+  });
+
   it("still confirms a #633 destination that really lives in a registered EXTRA root", async () => {
     // A symlinked models/<link> resolving onto another drive is legitimate: the
     // landed realpath is outside the primary root but inside a live extra root.
     const external = resolve("/E/render/models/loras/new.safetensors");
-    realpathMock.mockImplementation(async () => external);
+    realpathMock.mockImplementation(async (p: string) =>
+      String(p) === target ? external : resolve(String(p)),
+    );
     h.modelsDirSource = "observed-root";
     h.destModelsDir = "/serverB/models";
     h.liveExtraRoots = {
