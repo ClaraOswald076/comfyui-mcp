@@ -214,7 +214,11 @@ describe("download_status tool", () => {
 
     const res = await downloadStatus({});
     const text = res.content[0].text;
-    expect(text).toContain("landed at (verified on disk): /stale/models/checkpoints/x.safetensors");
+    // "landed at" is reserved for a CONFIRMED placement — an unusable file must not
+    // borrow the settled-sounding phrase. (The listing also renders other tests'
+    // jobs, so this is asserted against THIS job's line.)
+    expect(text).not.toMatch(/landed at[^\n]*\/stale\//);
+    expect(text).toContain("written to (verified on disk): /stale/models/checkpoints/x.safetensors");
     expect(text).toContain("WARNING: NOT VISIBLE to the connected ComfyUI");
     expect(text).toContain("the running server reads /live/ComfyUI/models instead");
   });

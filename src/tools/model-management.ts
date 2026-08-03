@@ -171,10 +171,10 @@ export function registerModelManagementTools(server: McpServer): void {
                   // read from there, so calling this "downloaded successfully" is the exact
                   // fabricate-success failure of #369.
                   `Download finished, but the model is NOT usable by the connected ComfyUI.\n\n` +
-                  `Landed${placement.pathQualifier} at:\n${job.path}\n\n` +
+                  `${placement.pathLabel}${placement.pathQualifier}:\n${job.path}\n\n` +
                   `${placement.warning}\n\n` +
                   `Do NOT tell the user the model is ready — it is not visible to the server that would load it.`
-                : `Model downloaded to${placement.pathQualifier}:\n${job.path}\n\n` +
+                : `Model ${placement.pathLabel}${placement.pathQualifier}:\n${job.path}\n\n` +
                   `NOTE: ${placement.warning}`;
           return {
             content: [{ type: "text", text }],
@@ -282,8 +282,8 @@ export function registerModelManagementTools(server: McpServer): void {
               ? j.viaManager
                 ? `\n    dispatched to the remote ComfyUI via ComfyUI-Manager (server-side fetch): ${j.path}\n    NOTE: ${placement.warning}`
                 : placement.confirmed
-                  ? `\n    landed at${placement.pathQualifier}: ${j.path}`
-                  : `\n    landed at${placement.pathQualifier}: ${j.path}\n    ${placement.wrongPlace ? "WARNING" : "NOTE"}: ${placement.warning}`
+                  ? `\n    ${placement.pathLabel}${placement.pathQualifier}: ${j.path}`
+                  : `\n    ${placement.pathLabel}${placement.pathQualifier}: ${j.path}\n    ${placement.wrongPlace ? "WARNING" : "NOTE"}: ${placement.warning}`
               : j.status === "error"
                 ? `\n    failed: ${j.error}`
                 : j.status === "cancelled"

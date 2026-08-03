@@ -532,12 +532,12 @@ export function registerModelExtrasTools(server: McpServer): void {
             : placement.wrongPlace
               ? [
                   "CivitAI download finished, but the model is NOT usable by the connected ComfyUI.",
-                  `  landed${placement.pathQualifier} at: ${savedPath}`,
+                  `  ${placement.pathLabel}${placement.pathQualifier}: ${savedPath}`,
                   `  ${placement.warning}`,
                   "  Do NOT tell the user the model is ready — it is not visible to the server that would load it.",
                 ]
               : [
-                  `CivitAI model downloaded to${placement.pathQualifier}:`,
+                  `CivitAI model ${placement.pathLabel}${placement.pathQualifier}:`,
                   `  ${savedPath}`,
                   `  NOTE: ${placement.warning}`,
                 ];

@@ -25,6 +25,9 @@ const h = vi.hoisted(() => ({
   onDisk: {} as Record<string, string[]>,
   modelsDirSource: "configured-base" as string,
   fetchCalls: [] as string[],
+  /** What getLiveExtraModelRoots reports — only an AUTHORITATIVE, EMPTY answer can
+   *  rule out "the server's models live on another drive". */
+  liveExtraRoots: { authoritative: false, roots: [] as unknown[] },
 }));
 
 vi.mock("../../config.js", () => ({
@@ -59,7 +62,7 @@ vi.mock("../../services/node-management.js", () => ({
 
 vi.mock("../../services/extra-paths.js", () => ({
   getExtraModelRoots: vi.fn(async () => []),
-  getLiveExtraModelRoots: vi.fn(async () => ({ authoritative: false, roots: [] })),
+  getLiveExtraModelRoots: vi.fn(async () => h.liveExtraRoots),
 }));
 
 vi.mock("../../services/output-dir.js", () => ({
@@ -108,6 +111,7 @@ beforeEach(() => {
   h.onDisk = {};
   h.modelsDirSource = "configured-base";
   h.fetchCalls = [];
+  h.liveExtraRoots = { authoritative: false, roots: [] };
   statMock.mockReset();
   realpathMock.mockReset();
   readdirMock.mockReset();
@@ -186,11 +190,43 @@ describe("pre-write: a destination the LIVE server does not read from is refused
     );
   });
 
-  it("ALLOWS an entirely empty models tree — absence of files is not evidence", async () => {
+  it("ALLOWS an empty tree when a live EXTRA ROOT could be holding the server's models", async () => {
     h.onDisk = { loras: [] };
     h.liveListings["loras"] = ["live-only.safetensors"];
+    h.liveExtraRoots = { authoritative: true, roots: [{ category: "loras", dir: "/E/models/loras" }] };
     await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBe(
       resolve("/comfy/models/loras"),
+    );
+  });
+
+  it("ALLOWS an empty tree when extra-root authorization is INCONCLUSIVE (fails open)", async () => {
+    h.onDisk = { loras: [] };
+    h.liveListings["loras"] = ["live-only.safetensors"];
+    h.liveExtraRoots = { authoritative: false, roots: [] }; // cannot rule extra roots out
+    await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBe(
+      resolve("/comfy/models/loras"),
+    );
+  });
+
+  it("ALLOWS an empty tree when the live server also has nothing (a fresh install's first model)", async () => {
+    h.onDisk = { loras: [] };
+    h.liveListings["loras"] = [];
+    h.liveExtraRoots = { authoritative: true, roots: [] };
+    await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBe(
+      resolve("/comfy/models/loras"),
+    );
+  });
+
+  it("REFUSES an EMPTY tree when the live server loads models and registers no extra roots (codex gate r2)", async () => {
+    // Two portable bundles of the same shape; the stale one is still empty, so the
+    // per-category overlap test finds nothing to compare. But the server it is NOT
+    // serving demonstrably reads models from somewhere this tree does not contain.
+    h.onDisk = { loras: [], checkpoints: [] };
+    h.liveListings["loras"] = ["a.safetensors", "b.safetensors"];
+    h.liveListings["checkpoints"] = ["c.safetensors"];
+    h.liveExtraRoots = { authoritative: true, roots: [] };
+    await expect(resolveModelSubfolderPreferServer("loras")).rejects.toThrow(
+      /DIFFERENT install/,
     );
   });
 
@@ -273,8 +309,23 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
     expect(res.note).toMatch(/remote/i);
   });
 
-  it("matches a nested listing entry by basename (ComfyUI lists 'sub/file')", async () => {
+  it("matches a nested entry by its CATEGORY-RELATIVE path (ComfyUI lists 'sub/file')", async () => {
     h.liveListings["loras"] = ["sub/new.safetensors"];
+    const res = await verifyLandedModel(target, "loras/sub", { attempts: 1, retryMs: 0 });
+    expect(res.liveVisible).toBe("visible");
+  });
+
+  it("does NOT call a same-named file in a DIFFERENT subfolder visible (codex gate r2)", async () => {
+    // The live server holds loras/b/new.safetensors; we wrote loras/a/new.safetensors
+    // into a tree it does not read. A basename comparison would fabricate success.
+    h.liveListings["loras"] = ["b/new.safetensors"];
+    const res = await verifyLandedModel(target, "loras/a", { attempts: 1, retryMs: 0 });
+    expect(res.liveVisible).toBe("not-visible");
+    expect(res.note).toMatch(/a\/new\.safetensors/);
+  });
+
+  it("normalizes OS-native separators in the live listing", async () => {
+    h.liveListings["loras"] = ["sub\\new.safetensors"];
     const res = await verifyLandedModel(target, "loras/sub", { attempts: 1, retryMs: 0 });
     expect(res.liveVisible).toBe("visible");
   });

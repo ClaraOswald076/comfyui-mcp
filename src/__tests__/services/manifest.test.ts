@@ -28,6 +28,14 @@ const installCustomNodeMock = vi.hoisted(() => vi.fn());
 const installModelViaManagerMock = vi.hoisted(() => vi.fn());
 const listInstalledNodesMock = vi.hoisted(() => vi.fn());
 const downloadModelMock = vi.hoisted(() => vi.fn());
+/** #369 post-landing verification. Default: the connected ComfyUI DOES list the
+ *  landed file (the healthy local case these manifest tests model). */
+const verifyLandedModelMock = vi.hoisted(() =>
+  vi.fn(async (targetPath: string) => ({
+    verifiedPath: targetPath,
+    liveVisible: "visible" as const,
+  })),
+);
 const resolveExistingModelFileMock = vi.hoisted(() => vi.fn());
 const listLocalModelsMock = vi.hoisted(() => vi.fn());
 const savedWorkspaceMock = vi.hoisted(() => vi.fn(() => undefined as string | undefined));
@@ -106,6 +114,12 @@ vi.mock("../../services/model-resolver.js", () => ({
   },
   resolveExistingModelFile: (...a: unknown[]) => resolveExistingModelFileMock(...a),
   listLocalModels: (...a: unknown[]) => listLocalModelsMock(...a),
+  // #369: after landing, the job verifies the file against the LIVE server's own
+  // listing, and only a CONFIRMED placement is reported as "applied". These tests
+  // model the healthy local case (the connected ComfyUI does read from there);
+  // the unconfirmed/wrong-place renderings are covered in download-jobs.test.ts
+  // and download-live-destination.test.ts.
+  verifyLandedModel: (...a: unknown[]) => verifyLandedModelMock(...(a as [string, string])),
   // Faithful mirror of the real managerModelDestination (pure logic) so the
   // remote-model path resolves a Manager-valid { type, save_path }.
   managerModelDestination: (category: string, relPath?: string) => {
@@ -865,7 +879,12 @@ describe("applyManifest", () => {
         save_path: "default",
         trayCategory: "checkpoints",
       });
-      expect(byAction.model.status).toBe("applied");
+      // #369: a ComfyUI-Manager dispatch is ACCEPTED, not verified as landed
+      // (Manager reports its queue task done even on failure, and there is no local
+      // file to check), so it reports PENDING with the caveat spelled out rather
+      // than claiming an apply nobody confirmed.
+      expect(byAction.model.status).toBe("pending");
+      expect(byAction.model.message).toMatch(/NOT verified as landed/);
     });
 
     it("derives type + save_path from a nested model local_path", async () => {
@@ -933,7 +952,12 @@ describe("applyManifest", () => {
         save_path: "default",
         trayCategory: "checkpoints",
       });
-      expect(byAction.model.status).toBe("applied");
+      // #369: a ComfyUI-Manager dispatch is ACCEPTED, not verified as landed
+      // (Manager reports its queue task done even on failure, and there is no local
+      // file to check), so it reports PENDING with the caveat spelled out rather
+      // than claiming an apply nobody confirmed.
+      expect(byAction.model.status).toBe("pending");
+      expect(byAction.model.message).toMatch(/NOT verified as landed/);
     });
   });
 });

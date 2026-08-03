@@ -883,7 +883,20 @@ async function applyManifestSections(
           // Panel tray: watch the canonical category for the file to land (#143).
           trayCategory: category,
         });
-        results.push(report("model", item, "applied", res.message));
+        // A Manager dispatch is ACCEPTED, not landed — Manager reports its queue task
+        // done even on failure, and there is no local file to verify. Reporting that
+        // as "applied" is the same fabricated success #369 is about, so it is PENDING
+        // with the caveat spelled out (codex gate, round 2).
+        results.push(
+          report(
+            "model",
+            item,
+            "pending",
+            `${res.message} NOTE: the dispatch was ACCEPTED, NOT verified as landed — ` +
+              "ComfyUI-Manager reports its queue task 'done' even on failure. Confirm with " +
+              "list_local_models before relying on it.",
+          ),
+        );
         continue;
       }
       const target = await resolveLocalModelPath(model);
@@ -931,25 +944,30 @@ async function applyManifestSections(
         // wrong placement is reported as such, never as a clean apply.
         const placement = describePlacement(job);
         results.push(
-          // A download the running ComfyUI demonstrably cannot read is NOT an apply —
-          // that is the #369 failure, just wearing a manifest's clothes. An
-          // unconfirmed placement stays "applied" (the transfer really did finish, and
-          // "pending" here means "still downloading"), but the message never omits the
-          // caveat, so nothing downstream can read it as verified.
-          placement.wrongPlace
+          // "applied" must mean the running ComfyUI can actually load it (#369) —
+          // that is the whole failure, just wearing a manifest's clothes. A
+          // demonstrably unreadable placement is a FAILURE; an unconfirmed one is
+          // PENDING (the transfer finished, the placement has not been established).
+          placement.confirmed
             ? report(
                 "model",
                 item,
-                "failed",
-                `Model downloaded to ${job.path}, but it is NOT usable by the connected ComfyUI: ${placement.warning}`,
-              )
-            : report(
-                "model",
-                item,
                 "applied",
-                `Model downloaded to ${job.path}${placement.pathQualifier}.` +
-                  (placement.confirmed ? "" : ` NOTE: ${placement.warning}`),
-              ),
+                `Model downloaded to ${job.path}${placement.pathQualifier}.`,
+              )
+            : placement.wrongPlace
+              ? report(
+                  "model",
+                  item,
+                  "failed",
+                  `Model ${placement.pathLabel} ${job.path}, but it is NOT usable by the connected ComfyUI: ${placement.warning}`,
+                )
+              : report(
+                  "model",
+                  item,
+                  "pending",
+                  `Model ${placement.pathLabel} ${job.path}. ${placement.warning}`,
+                ),
         );
       } else {
         results.push(

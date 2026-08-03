@@ -838,6 +838,9 @@ export interface PlacementReport {
   confirmed: boolean;
   /** True when the file exists on disk but the live server will NOT read it. */
   wrongPlace: boolean;
+  /** How to introduce the path. "landed at" is reserved for a CONFIRMED placement —
+   *  an unverified state must not borrow the settled-sounding phrase (codex gate). */
+  pathLabel: string;
   /** Parenthetical for the path line, e.g. "(verified on disk, and the connected …)". */
   pathQualifier: string;
   /** The explanatory line to surface when `confirmed` is false. */
@@ -849,6 +852,7 @@ export function describePlacement(job: DownloadJob): PlacementReport {
     return {
       confirmed: false,
       wrongPlace: false,
+      pathLabel: "requested destination",
       pathQualifier: "",
       warning:
         "the dispatch was ACCEPTED, NOT verified as landed — ComfyUI-Manager reports its queue " +
@@ -861,12 +865,14 @@ export function describePlacement(job: DownloadJob): PlacementReport {
       return {
         confirmed: true,
         wrongPlace: false,
+        pathLabel: "landed at",
         pathQualifier: " (verified on disk, and the connected ComfyUI lists it)",
       };
     case "not-visible":
       return {
         confirmed: false,
         wrongPlace: true,
+        pathLabel: "written to",
         pathQualifier: " (verified on disk)",
         warning:
           `NOT VISIBLE to the connected ComfyUI — ${job.verify_note ?? "the running server does not list this file."}`,
@@ -875,6 +881,7 @@ export function describePlacement(job: DownloadJob): PlacementReport {
       return {
         confirmed: false,
         wrongPlace: false,
+        pathLabel: "written to",
         pathQualifier: " (verified on disk)",
         warning:
           `visibility to the connected ComfyUI is UNCONFIRMED${job.verify_note ? ` — ${job.verify_note}` : ""}. Check list_local_models before relying on it.`,
@@ -885,10 +892,12 @@ export function describePlacement(job: DownloadJob): PlacementReport {
       return {
         confirmed: false,
         wrongPlace: false,
+        pathLabel: "written to",
         pathQualifier: "",
         warning:
-          "placement has NOT been confirmed yet — the check against the connected ComfyUI has " +
-          "not completed. Re-check with download_status, or confirm with list_local_models.",
+          "the file was materialized locally, but placement has NOT been confirmed yet — the " +
+          "check against the connected ComfyUI has not completed. Re-check with download_status, " +
+          "or confirm with list_local_models.",
       };
   }
 }
