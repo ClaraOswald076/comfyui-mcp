@@ -1220,6 +1220,22 @@ describe("restart_comfyui — a PID is not a process identity (#776)", () => {
 });
 
 describe("restart_comfyui — plain installs are unchanged (#776)", () => {
+  /**
+   * After the restart, make `/system_stats` describe a DIFFERENT server than the
+   * one we launched (or fail outright). The identification phase before the stop
+   * consumes two calls — the bracketed fetch and the re-confirmation — so only the
+   * third and later answers belong to whatever came back on the port.
+   */
+  function servingArgvAfterRestart(argv: string[] | "unreachable"): void {
+    let calls = 0;
+    mockGetSystemStats.mockImplementation(async () => {
+      calls++;
+      if (calls <= 2) return { system: { argv: [PLAIN_MAIN, "--port", "8188"] } };
+      if (argv === "unreachable") throw new Error("ECONNRESET");
+      return { system: { argv } };
+    });
+  }
+
   function usePlainInstall(): void {
     mockFindComfyuiPython.mockReturnValue(PLAIN_PY);
     mockLiveRootFromArgv.mockReturnValue(PLAIN_BASE);
@@ -1314,6 +1330,8 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
     // child is decisive on its own — it cannot be the process now answering — so
     // "undecidable PID" must not launder a failed relaunch into a success.
     usePlainInstall();
+    // The replacement is another launcher's ComfyUI, running a different install.
+    servingArgvAfterRestart([join(resolve("OtherComfy"), "main.py"), "--port", "8188"]);
     const children = spawnCapturingChildren(999);
     let killed = false;
     mockExecSync.mockImplementation((cmd: string) => {
@@ -1401,6 +1419,9 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
     // delivers the `exit` event. A bare `portOwnerPid === ourPid` would call it
     // "ours". A synchronous signal-0 probe says otherwise.
     usePlainInstall();
+    // ...and the process that inherited the number runs a different install, so the
+    // argv cross-check agrees rather than rescuing it.
+    servingArgvAfterRestart([join(resolve("OtherComfy"), "main.py"), "--port", "8188"]);
     spawnCapturingChildren(4321);
     let killed = false;
     let relaunched = false;
@@ -1713,12 +1734,97 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
     killSpy.mockRestore();
   });
 
+  it("resolves an unmappable port owner by asking the SERVER what it is running", async () => {
+    // The #449 host: no usable port-owner lookup. Rather than a permanent shrug,
+    // the server's own argv answers it — a match is as strong as a pid comparison.
+    usePlainInstall();
+    servingArgvAfterRestart([PLAIN_MAIN, "--port", "8188"]);
+    spawnCapturingChildren(4321);
+    let killed = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill|pkill|\bkill\b/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (/netstat/i.test(cmd)) {
+        // Owned while identifying; never mappable again afterwards.
+        return killed ? "" : "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed) throw new Error("not listening");
+        return "p4321\nn127.0.0.1:8188\n";
+      }
+      return "";
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true }) as Response),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.listener_ownership).toBe("ours");
+    expect(result.started).toBe(true);
+    expect(result.message).toMatch(/restarted successfully/i);
+
+    killSpy.mockRestore();
+  });
+
+  it("claims a GRANDCHILD listener as ours even when the WRAPPER has already exited", async () => {
+    // A wrapper script launches ComfyUI and exits; the grandchild is reparented, so
+    // lineage can no longer place it in our tree. The server's own command line
+    // still can — otherwise a legitimately indirect launcher reads as "not ours".
+    usePlainInstall();
+    servingArgvAfterRestart([PLAIN_MAIN, "--port", "8188"]);
+    const children = spawnCapturingChildren(4321);
+    let killed = false;
+    let relaunched = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill|pkill|\bkill\b/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (/netstat/i.test(cmd)) {
+        return killed && !relaunched
+          ? ""
+          : `  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       ${relaunched ? 9999 : 4321}`;
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed && !relaunched) throw new Error("not listening");
+        return `p${relaunched ? 9999 : 4321}\nn127.0.0.1:8188\n`;
+      }
+      return "";
+    });
+    // The grandchild has been reparented to init — lineage is a dead end here.
+    __processControlTestHooks.setParentPidResolver(() => 1);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        relaunched = true;
+        // The wrapper we spawned exits once its child is up.
+        children[0]?.emit("exit", 0, null);
+        return { ok: true } as Response;
+      }),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.listener_ownership).toBe("ours");
+    expect(result.started).toBe(true);
+
+    killSpy.mockRestore();
+  });
+
   it("says so plainly when listener ownership is UNDECIDABLE — without denying a restart that worked", async () => {
-    // Unmappable port owner + a still-alive launched child. Reporting this as a
-    // FAILED restart would mislabel every ordinary restart on hosts where the
+    // Unmappable port owner, a still-alive launched child, AND a server that will
+    // not say what it is running — every identity signal exhausted. Reporting this
+    // as a FAILED restart would mislabel every ordinary restart on hosts where the
     // port-owner lookup is unavailable, so the result stays started:true and the
     // uncertainty is stated instead of guessed either way.
     usePlainInstall();
+    servingArgvAfterRestart("unreachable");
     spawnCapturingChildren(999);
     let killed = false;
     mockExecSync.mockImplementation((cmd: string) => {

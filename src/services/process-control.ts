@@ -616,7 +616,22 @@ function classifyListenerOwnership(input: {
   child: ChildProcess;
   launchArgv?: string[];
   portOwnerPid: number | null;
+  /**
+   * The `sys.argv` reported by whatever server is now answering. An independent
+   * line of evidence that does not need a pid at all: a healthy server running the
+   * command line we just launched is ours; one running something else is not. This
+   * is what lets a host with no usable port-owner lookup (#449) still get a real
+   * answer instead of a permanent shrug.
+   */
+  servingArgv?: string[];
 }): ListenerOwnership {
+  /** Does the server that is answering run what we launched? */
+  const byArgv = (): "match" | "differ" | "unknown" => {
+    if (!input.servingArgv?.length || !input.launchArgv?.length) return "unknown";
+    return commandLineMatchesArgv(input.launchArgv.join(" "), input.servingArgv)
+      ? "match"
+      : "differ";
+  };
   // A Desktop launch is undecidable BY DESIGN: we spawn the Electron shell (or
   // macOS `open`) and its child binds the port, so a pid mismatch proves nothing.
   // A LAUNCH THAT NEVER HAPPENED is decisive on every path, Desktop included —
@@ -632,15 +647,30 @@ function classifyListenerOwnership(input: {
   // never-launched checks but BEFORE `childExited`, because for Desktop a launcher
   // exiting is normal rather than evidence of failure.
   if (input.isDesktopApp) return "unconfirmed";
-  if (input.childExited) return "not-ours";
 
   const alive = launchedChildStillRunning(input.child);
-  // Definitively gone (ESRCH) — whatever is serving the port is not it, even
-  // though the `exit` event has not been delivered yet.
-  if (alive === false) return "not-ours";
+  // OUR DIRECT CHILD IS GONE — by its `exit` event, or by a signal-0 probe (ESRCH)
+  // that does not wait for the event loop. Usually that means the healthy listener
+  // is somebody else's. But it is ALSO the shape of a wrapper script that launched
+  // ComfyUI as its grandchild and then exited normally, after which the grandchild
+  // is reparented and lineage can no longer place it in our tree. What still can:
+  // the server is running the exact command line we launched (codex gate P2).
+  if (input.childExited || alive === false) {
+    return byArgv() === "match" ? "ours" : "not-ours";
+  }
 
   const ourPid = input.child.pid;
-  if (ourPid == null || input.portOwnerPid == null) return "unconfirmed";
+  if (input.portOwnerPid == null) {
+    // The port owner could not be mapped (#449). Rather than shrug, ask the server
+    // what it is running: a match is as strong as a pid comparison, and a MISMATCH
+    // is decisive counter-evidence that this call did not start the healthy
+    // listener — which is exactly the case that must not read as success.
+    const verdict = byArgv();
+    if (verdict === "match") return "ours";
+    if (verdict === "differ") return "not-ours";
+    return "unconfirmed";
+  }
+  if (ourPid == null) return "unconfirmed";
   if (input.portOwnerPid !== ourPid) {
     // A DIFFERENT pid holds the port. That is usually somebody else's server — but
     // it is also the shape of a legitimately indirect launch (a wrapper script, a
@@ -651,6 +681,10 @@ function classifyListenerOwnership(input: {
     const descendant = isOurDescendant(input.portOwnerPid);
     if (descendant === true) return "ours";
     if (descendant === false) return "not-ours";
+    // Lineage unreadable — fall back to what the server says it is running.
+    const verdict = byArgv();
+    if (verdict === "match") return "ours";
+    if (verdict === "differ") return "not-ours";
     return "unconfirmed";
   }
   // The pid MATCHES — but it could be a recycled number we cannot signal.
@@ -2036,6 +2070,15 @@ export async function startComfyUI(): Promise<StartResult> {
 
   const newPid = findPidByPort(port);
   const env = launchEnvInfo(info);
+  // The API just answered, so ask it what it is running. This is the one identity
+  // signal that needs no pid at all, and it is what keeps hosts with an unusable
+  // port-owner lookup from getting a permanent "cannot tell".
+  let servingArgv: string[] | undefined;
+  try {
+    servingArgv = (await getSystemStats()).system.argv ?? undefined;
+  } catch {
+    servingArgv = undefined;
+  }
   // Is the healthy listener actually OURS?
   //   • A Desktop launch is UNDECIDABLE by design: we spawn the Electron shell (or
   //     macOS `open`), and the process that binds the port is its child, so a pid
@@ -2060,6 +2103,7 @@ export async function startComfyUI(): Promise<StartResult> {
     child: launched.child,
     launchArgv: launched.launchArgv,
     portOwnerPid: newPid,
+    servingArgv,
   });
   // Only the NON-Desktop undecidable case is worth calling out: for a Desktop
   // launcher the pid relationship is indirect by design, not a gap in evidence.
