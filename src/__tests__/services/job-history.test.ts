@@ -5,6 +5,8 @@ import {
   extractExecutionError,
   extractExecutionStats,
   extractTextOutputs,
+  hasAffirmativeSuccessStatus,
+  historyCompletionTimeMs,
 } from "../../services/job-history.js";
 
 function historyEntry(messages: unknown): HistoryEntry {
@@ -143,5 +145,124 @@ describe("extractTextOutputs — real ComfyUI payload", () => {
     expect(analyzeHistoryEntry(entry).text_outputs).toEqual([
       { node_id: "2", text: ["TEXT-PREVIEW-PROOF-42"] },
     ]);
+  });
+});
+
+describe("hasAffirmativeSuccessStatus (#751 asset-registration gate)", () => {
+  const entryWith = (status: Record<string, unknown>): HistoryEntry =>
+    ({ prompt: {}, outputs: {}, status }) as unknown as HistoryEntry;
+
+  it("accepts a genuine success (status_str success, no error messages)", () => {
+    expect(
+      hasAffirmativeSuccessStatus(
+        entryWith({
+          status_str: "success",
+          completed: true,
+          messages: [
+            ["execution_start", { timestamp: 1 }],
+            ["execution_success", { timestamp: 2 }],
+          ],
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects status_str 'error' even when messages are absent", () => {
+    expect(
+      hasAffirmativeSuccessStatus(
+        entryWith({ status_str: "error", completed: true, messages: [] }),
+      ),
+    ).toBe(false);
+  });
+
+  it("rejects missing status_str / missing status (default-success is not evidence)", () => {
+    expect(
+      hasAffirmativeSuccessStatus(entryWith({ completed: true, messages: [] })),
+    ).toBe(false);
+    expect(hasAffirmativeSuccessStatus(entryWith({}))).toBe(false);
+  });
+
+  it("rejects a contradictory entry: status_str success but an error/interrupt message exists", () => {
+    expect(
+      hasAffirmativeSuccessStatus(
+        entryWith({
+          status_str: "success",
+          completed: true,
+          messages: [["execution_error", { exception_message: "boom" }]],
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      hasAffirmativeSuccessStatus(
+        entryWith({
+          status_str: "success",
+          completed: true,
+          messages: [["execution_interrupted", {}]],
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("treats malformed messages as no evidence either way (status_str still decides)", () => {
+    // Malformed tuples are dropped by normalization — they are neither an
+    // error veto nor success evidence; the affirming status_str carries it.
+    expect(
+      hasAffirmativeSuccessStatus(
+        entryWith({
+          status_str: "success",
+          completed: true,
+          messages: ["execution_error", ["execution_error"], ["execution_error", null]],
+        }),
+      ),
+    ).toBe(true);
+  });
+});
+
+describe("historyCompletionTimeMs (#751 r4 real-completion-time gate)", () => {
+  const NOW = 1_800_000_000_000;
+  const entryWith = (messages: unknown[]): HistoryEntry =>
+    ({
+      prompt: {},
+      outputs: {},
+      status: { status_str: "success", completed: true, messages },
+    }) as unknown as HistoryEntry;
+
+  it("returns the execution_success timestamp (epoch ms)", () => {
+    const entry = entryWith([
+      ["execution_start", { timestamp: NOW - 5000 }],
+      ["execution_success", { timestamp: NOW - 1000 }],
+    ]);
+    expect(historyCompletionTimeMs(entry, NOW)).toBe(NOW - 1000);
+  });
+
+  it("normalizes epoch-seconds timestamps to ms", () => {
+    const successS = Math.floor((NOW - 2000) / 1000);
+    const entry = entryWith([["execution_success", { timestamp: successS }]]);
+    expect(historyCompletionTimeMs(entry, NOW)).toBe(successS * 1000);
+  });
+
+  it("does NOT fall back to execution_start (start time is not completion time)", () => {
+    const entry = entryWith([["execution_start", { timestamp: NOW - 5000 }]]);
+    expect(historyCompletionTimeMs(entry, NOW)).toBeUndefined();
+  });
+
+  it("returns undefined when messages are absent or the timestamp is not a number", () => {
+    expect(historyCompletionTimeMs(entryWith([]), NOW)).toBeUndefined();
+    expect(
+      historyCompletionTimeMs(entryWith([["execution_success", {}]]), NOW),
+    ).toBeUndefined();
+    expect(
+      historyCompletionTimeMs(
+        entryWith([["execution_success", { timestamp: "soon" }]]),
+        NOW,
+      ),
+    ).toBeUndefined();
+  });
+
+  it("rejects implausibly far-future timestamps as untrustworthy", () => {
+    const entry = entryWith([
+      ["execution_success", { timestamp: NOW + 3_600_000 }],
+    ]);
+    expect(historyCompletionTimeMs(entry, NOW)).toBeUndefined();
   });
 });

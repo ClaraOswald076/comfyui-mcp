@@ -397,7 +397,7 @@ List recently generated image AND video files from ComfyUI's output/ directory, 
 
 ## list_assets
 
-List recently generated assets from the in-memory registry, newest-first. Assets are registered automatically when a workflow completes successfully. The registry is ephemeral and clears on server restart; records expire after COMFYUI_ASSET_TTL_HOURS (default 24h).
+List recently generated assets, newest-first. Each call first reconciles ComfyUI's /history, so outputs are listed even when this session did not watch the render complete (e.g. queued via panel_run, by an earlier session, or before a server restart) — those are tagged source:'history-reconcile', versus source:'watched' for renders this server saw finish. Returns count + assets (asset_id, prompt_id, filename, url, source, created_at). The registry is ephemeral and clears on server restart; records expire after COMFYUI_ASSET_TTL_HOURS (default 24h), and only the most recent completed runs are reconciled — use get_history / get_image by filename for anything older.
 
 ### Parameters
 

@@ -35,6 +35,61 @@ export interface HistoryAnalysis {
 
 export type HistoryStatusMessage = readonly [string, Record<string, unknown>];
 
+/**
+ * Affirmative-success test for a history entry — the ONE eligibility gate both
+ * asset-registration paths (JobWatcher.handleCompletion and the list_assets
+ * history reconcile) share, so a run can never become an asset without real
+ * success evidence (#751 codex gate r3).
+ *
+ * It deliberately does NOT trust buildCompletionNotification's derived status:
+ * that derivation defaults to "success" whenever messages carry no well-formed
+ * execution_error/interrupted event, which silently promotes a run ComfyUI
+ * marked status_str:"error" (or any entry with missing/malformed status or
+ * messages) to "success". Here the entry's OWN status_str must affirm success
+ * AND no error/interrupt message may exist; anything short fails toward NOT
+ * registering.
+ */
+export function hasAffirmativeSuccessStatus(entry: HistoryEntry): boolean {
+  if (entry?.status?.status_str !== "success") return false;
+  const messages = normalizeHistoryMessages(entry);
+  return !messages.some(
+    (m) => m[0] === "execution_error" || m[0] === "execution_interrupted",
+  );
+}
+
+/** ComfyUI history timestamps are epoch seconds or milliseconds depending on
+ *  version — infer from magnitude, mirroring durationMs below. */
+function normalizeEpochMs(ts: unknown): number | undefined {
+  if (typeof ts !== "number" || !Number.isFinite(ts)) return undefined;
+  if (ts > 1_000_000_000_000) return ts; // epoch ms
+  if (ts > 1_000_000_000) return ts * 1000; // epoch s
+  return undefined;
+}
+
+/**
+ * The run's real completion time (ms epoch), taken ONLY from the
+ * execution_success message — the one truthful completion timestamp recorded
+ * by ComfyUI. execution_start is deliberately not a fallback: it is start
+ * time, and using it would backdate a long render past the TTL / a `since`
+ * boundary and hide it. Values implausibly far in the future (clock skew,
+ * non-epoch garbage) are rejected. Returns undefined when history carries no
+ * trustworthy value — the caller must then use its own truthful observation
+ * time (watched path) or skip the record (reconcile path). Shared by both
+ * asset-registration paths so "real completion time" means the same thing on
+ * each (#751 codex gate r4).
+ */
+export function historyCompletionTimeMs(
+  entry: HistoryEntry,
+  now: number,
+): number | undefined {
+  const success = normalizeHistoryMessages(entry).find(
+    (m) => m[0] === "execution_success",
+  );
+  const ms = normalizeEpochMs(success?.[1]?.timestamp);
+  if (ms === undefined || ms > now + 60_000) return undefined;
+  return ms;
+}
+
 const executionErrorSchema = z.object({
   node_id: z.union([z.string(), z.number()]).optional(),
   node_type: z.string().optional(),
