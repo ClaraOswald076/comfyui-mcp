@@ -831,15 +831,17 @@ async function assertDestinationVisibleToLiveServer(
     } catch {
       return; // cannot rule extra roots out → no refusal
     }
-    if (!live.authoritative) return;
-    // `authoritative: true` with NO roots does not mean "the server registers no
-    // extra model paths" — getLiveExtraModelRoots is deliberately fail-closed and
-    // skips a RELATIVE --extra-model-paths-config, and it can only find the
-    // auto-loaded default when the live main.py root resolved. In exactly the shape
-    // this refusal targets (relative argv, no cwd, no process observation) neither
-    // holds, so an empty list would be MISREAD as proof and would refuse a perfectly
-    // legitimate "my models live on another drive" install (codex gate, round 10).
-    // Only conclude "no extra roots" when we could actually have SEEN them.
+    // This branch reasons from the ABSENCE of an extra root, which needs EXHAUSTIVE,
+    // not `authoritative`. They are different claims: the helper still reports
+    // authoritative when it skipped a relative config flag, could not read a config
+    // file, or DROPPED a group whose base_path needed a server-only env var. Reading
+    // authoritative here refused a legitimate external-drive install outright (codex
+    // gate, round 18) — the exact outcome the base-anchored ruling exists to prevent.
+    if (!live.authoritative || !live.exhaustive) return;
+    // Even exhaustive enumeration is only meaningful if we could have LOCATED the
+    // server's configs at all: with a relative argv, no cwd and no process
+    // observation there is nothing to enumerate, so an empty list is not proof
+    // (codex gate, round 10).
     const enumerable =
       parseExtraModelPathsConfigsFromArgvRaw(snapshot.argv).some((v) => isAbsolute(v)) ||
       liveRootFromArgv(snapshot.argv, snapshot.cwd) !== undefined;
@@ -1012,6 +1014,17 @@ export async function isUnderLiveModelRoots(
  * downgrade a correctly verified download with a false "a DIFFERENT install"
  * warning (codex gate, round 12). Unknown is the honest answer there. Never throws.
  */
+/** Do two absolute models roots name the same directory? Windows paths are
+ *  case-insensitive and mix separators, so comparing them raw would report a
+ *  server "change" that never happened. */
+export function sameModelsRoot(a: string, b: string): boolean {
+  const norm = (s: string): string => {
+    const slashed = s.replace(/\\/g, "/").replace(/\/+$/, "");
+    return platform() === "win32" ? slashed.toLowerCase() : slashed;
+  };
+  return norm(a) === norm(b);
+}
+
 export async function currentLiveModelsRoot(): Promise<string | undefined> {
   try {
     const dest = await resolveModelsDirWithBases();
@@ -1443,12 +1456,13 @@ async function assertNoEscapingSymlinkAncestor(
   // custom_nodes also feed the veto.
   let live: Awaited<ReturnType<typeof getLiveExtraModelRoots>> = {
     authoritative: false,
+    exhaustive: false,
     roots: [],
   };
   try {
     live = await getLiveExtraModelRoots(liveSnapshot);
   } catch {
-    live = { authoritative: false, roots: [] };
+    live = { authoritative: false, exhaustive: false, roots: [] };
   }
   for (const er of live.roots) {
     if (isCodeCategory(er.category)) codeRoots.push(await canon(er.dir));
@@ -2075,8 +2089,28 @@ export async function downloadModel(
     filename: resolvedFilename,
   } = await resolveDownloadTarget(url, targetSubfolder, filename);
 
+  // BIND the destination to the server it was resolved for. Re-resolving is right,
+  // but the answer must not go stale between resolving it and writing: a ComfyUI
+  // replaced during the mkdir would otherwise take the bytes into the root the
+  // PREVIOUS server read (codex gate, round 18). A mid-stream swap cannot be
+  // prevented — but writing into a root we can no longer vouch for can be. Both
+  // observations must be live-authoritative to compare; when either is unknown
+  // there is nothing to bind and the (already never-confirmed) non-authoritative
+  // path applies.
+  const rootAtResolve = await currentLiveModelsRoot();
+
   // Ensure target directory exists
   await mkdir(targetDir, { recursive: true });
+
+  const rootBeforeWrite = await currentLiveModelsRoot();
+  if (rootAtResolve && rootBeforeWrite && !sameModelsRoot(rootAtResolve, rootBeforeWrite)) {
+    throw new ModelError(
+      `Refusing to start this download: the connected ComfyUI changed while the destination was ` +
+        `being prepared. It read "${rootAtResolve}" when the destination was resolved and reads ` +
+        `"${rootBeforeWrite}" now, so "${targetPath}" is no longer where the running server ` +
+        "looks. Re-issue the download now that the current server is connected.",
+    );
+  }
 
   const request = applyDownloadAuth(url, auth);
   const headers: Record<string, string> = { ...request.headers };

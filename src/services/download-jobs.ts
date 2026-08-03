@@ -899,29 +899,36 @@ function diskQualifier(job: DownloadJob): string {
 export function describePlacement(
   job: DownloadJob,
   /** The models root the CONNECTED server reads right now (currentLiveModelsRoot()).
-   *  When it differs from the root the verdict was made against, that verdict
-   *  describes a DIFFERENT ComfyUI and may not be re-asserted as current success —
-   *  the reconnect/replaced-server stale positive (codex gate, round 11). */
+   *  A stored `visible` verdict may ONLY be re-asserted when this is present and
+   *  names the same root the verdict was made against — see below. */
   ctx?: { liveModelsDir?: string },
 ): PlacementReport {
   if (
     !job.viaManager &&
     job.live_visible === "visible" &&
-    ctx?.liveModelsDir &&
-    !sameRoot(ctx.liveModelsDir, job.verified_root)
+    !sameRoot(ctx?.liveModelsDir, job.verified_root)
   ) {
-    // Covers BOTH stale shapes (codex gate, rounds 11 and 16):
-    //  - the verdict names a DIFFERENT root than the server now reads; and
-    //  - the verdict carries NO root at all (it was made against a destination only
-    //    local configuration could vouch for) while the connected server now HAS a
-    //    resolvable authoritative root. Neither may be re-asserted as current
-    //    success — the earlier confirmation was about another server.
+    // A CONFIRMED rendering requires the READER to have re-established the verdict,
+    // so every way of failing to do that lands here (codex gate, rounds 11, 16, 18):
+    //  - the verdict names a DIFFERENT root than the server now reads;
+    //  - the verdict carries NO root (made against a destination only local
+    //    configuration could vouch for);
+    //  - and — the inversion this closes — there is NO current observation at all,
+    //    because the probe transiently failed or resolved non-authoritatively.
+    // That last case previously fell through to "confirmed", reading a MISSING
+    // observation as "no contradiction". It is not: nothing verified that the server
+    // answering NOW can read this file. Absence of evidence renders as unverified.
     return {
       confirmed: false,
       wrongPlace: false,
       pathLabel: "written to",
       pathQualifier: diskQualifier(job),
-      warning: job.verified_root
+      warning: !ctx?.liveModelsDir
+        ? "this download was confirmed earlier, but the connected ComfyUI could not be asked " +
+          "just now which models directory it reads, so that confirmation cannot be re-established " +
+          "for the server you are connected to. Re-check with download_status, or confirm with " +
+          "list_local_models."
+        : job.verified_root
         ? `this download was verified against a ComfyUI reading "${job.verified_root}", but the ` +
           `connected server now reads "${ctx.liveModelsDir}" — a DIFFERENT install. The earlier ` +
           "confirmation does not apply to it; check list_local_models against the server you are " +

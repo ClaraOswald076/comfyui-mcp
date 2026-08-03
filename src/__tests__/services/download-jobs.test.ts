@@ -1403,8 +1403,11 @@ describe("download job registry", () => {
       started_at: 0,
     };
 
-    it("confirms ONLY a file the connected ComfyUI listed", () => {
-      const r = describePlacement({ ...base, live_visible: "visible" });
+    it("confirms a file the connected ComfyUI listed, when the reader re-establishes the root", () => {
+      const r = describePlacement(
+        { ...base, live_visible: "visible", verified_root: "C:/A/models" },
+        { liveModelsDir: "C:/A/models" },
+      );
       expect(r.confirmed).toBe(true);
       expect(r.wrongPlace).toBe(false);
       expect(r.warning).toBeUndefined();
@@ -1478,12 +1481,18 @@ describe("download job registry", () => {
       expect(r.confirmed).toBe(process.platform === "win32");
     });
 
-    it("keeps a VISIBLE verdict when the current live root is UNKNOWN (no false alarm)", () => {
+    it("does NOT re-assert a VISIBLE verdict with NO current observation (codex gate r18)", () => {
+      // The probe transiently failed, so nothing verified that the server answering
+      // NOW can read this file. A MISSING observation is "cannot confirm", never
+      // "no contradiction" — the inversion that let a replaced server render as
+      // success. Only a reader that re-establishes the verdict may confirm it.
       const r = describePlacement(
         { ...base, live_visible: "visible", verified_root: "C:/A/models" },
         {},
       );
-      expect(r.confirmed).toBe(true);
+      expect(r.confirmed).toBe(false);
+      expect(r.pathLabel).not.toBe("landed at");
+      expect(r.warning).toMatch(/could not be asked just now/);
     });
 
     it("never claims 'verified on disk' when the post-landing stat failed (codex gate r9)", () => {

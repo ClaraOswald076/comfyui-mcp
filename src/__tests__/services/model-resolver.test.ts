@@ -45,13 +45,18 @@ vi.mock("node:fs/promises", () => ({
 // downloadModel now roots the destination at the LIVE server's models dir
 // (resolveModelsDir, from /system_stats argv). Stub it to the COMFYUI_PATH-based
 // dir so these path-safety tests stay hermetic (no real ComfyUI connection).
+/** Successive models roots resolveModelsDirWithBases hands out (see the mock). */
+const liveRoots = vi.hoisted(() => ({ queue: [] as string[] }));
 vi.mock("../../services/output-dir.js", () => ({
   resolveModelsDir: vi.fn(async () => "/comfy/models"),
   // The download resolver now derives the models dir AND the base-install dirs
   // (for the code-root veto) from ONE call. No base dirs here → the symlink-escape
   // guard falls back to the models-root sibling (#633 codex r4).
   resolveModelsDirWithBases: vi.fn(async () => ({
-    modelsDir: "/comfy/models",
+    // Successive values let a test model the live server being REPLACED between the
+    // destination resolution and the write (#369 write-time binding). Defaults to a
+    // single stable root.
+    modelsDir: liveRoots.queue.shift() ?? "/comfy/models",
     baseDirs: [],
     snapshot: { reachable: false },
     // Live-authoritative: these path-safety tests are about containment, not about
@@ -138,6 +143,33 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+});
+
+describe("downloadModel — the destination is BOUND to the server it was resolved for (#369)", () => {
+  it("REFUSES to start when the live server changes between resolving and writing", async () => {
+    // Calls: (1) resolveDownloadTarget, (2) the root captured at resolve, (3) the
+    // root re-checked immediately before the first byte. A ComfyUI replaced during
+    // the mkdir must not take the bytes into the PREVIOUS server's tree.
+    liveRoots.queue = ["/comfy/models", "/comfy/models", "/other/models"];
+
+    await expect(
+      downloadModel("https://example.com/x.safetensors", "checkpoints", "x.safetensors"),
+    ).rejects.toThrow(/changed while the destination was being prepared/);
+    // The refusal happens BEFORE any bytes move.
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("proceeds when the live server is the same one throughout", async () => {
+    liveRoots.queue = ["/comfy/models", "/comfy/models", "/comfy/models"];
+    // Reaches the transfer (which this suite's fetch mock then governs) rather than
+    // refusing — a stable server must never be mistaken for a swap.
+    await downloadModel(
+      "https://example.com/x.safetensors",
+      "checkpoints",
+      "x.safetensors",
+    ).catch(() => undefined);
+    expect(fetchMock).toHaveBeenCalled();
+  });
 });
 
 describe("downloadModel — filename path safety", () => {

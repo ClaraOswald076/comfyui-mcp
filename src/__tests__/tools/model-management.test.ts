@@ -114,7 +114,11 @@ describe("download_model tool", () => {
       // A symlinked models tree: the real location is what must be reported.
       verifiedPath: "/mnt/models/checkpoints/x.safetensors",
       liveVisible: "visible",
+      // Confirmation requires the RENDERER to re-establish the verdict, so the
+      // verdict's root and the reader's current root must agree (#369).
+      verifiedAgainstRoot: "/live/models",
     });
+    currentLiveRootMock.mockResolvedValueOnce("/live/models");
 
     const { downloadModel } = makeServer();
     const res = await downloadModel({

@@ -34,6 +34,9 @@ const verifyLandedModelMock = vi.hoisted(() =>
   vi.fn(async (targetPath: string) => ({
     verifiedPath: targetPath,
     liveVisible: "visible" as const,
+    // The verdict names the root it was made against; the reader below reports the
+    // SAME root, which is what licenses re-asserting it as applied (#369).
+    verifiedAgainstRoot: "/fake/ComfyUI/models",
   })),
 );
 /** #369: does the connected ComfyUI already list this entry? Default yes, so an
@@ -58,7 +61,7 @@ const isUnderLiveModelRootsMock = vi.hoisted(() =>
 /** The models root the connected server reads NOW. Undefined = unknown, which never
  *  invalidates a verdict. */
 const currentLiveRootMock = vi.hoisted(() =>
-  vi.fn(async (): Promise<string | undefined> => undefined),
+  vi.fn(async (): Promise<string | undefined> => "/fake/ComfyUI/models"),
 );
 const resolveExistingModelFileMock = vi.hoisted(() => vi.fn());
 const listLocalModelsMock = vi.hoisted(() => vi.fn());
