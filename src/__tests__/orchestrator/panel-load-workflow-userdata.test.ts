@@ -597,10 +597,12 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
   });
 
   it("holds the invariant that no request key ever carries a traversal segment", async () => {
-    // This asserts the INVARIANT, not one mechanism. Two things currently uphold
-    // it — the caller-side traversal guard and the listing filter — so the test
-    // cannot attribute a pass to either. It is here to fail if a future change
-    // lets a server-supplied string reach the request key.
+    // This asserts the INVARIANT, not one mechanism, and it cannot attribute a
+    // pass to either the caller-side traversal guard or the listing filter — under
+    // NFC-only matching a "../" entry can never match a clean requested name, so
+    // the listing filter is unreachable today and is forward defense. The test is
+    // here to fail if a future change lets a server-supplied string reach the
+    // request key.
     routeMock(["../../secret.json", "..\\secret.json"], {});
 
     const { ctx, calls } = makeCtx();

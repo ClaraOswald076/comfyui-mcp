@@ -2341,11 +2341,12 @@ function assertUiWorkflow(parsed: unknown, sourceLabel: string): Record<string, 
  * so the resolver never guesses:
  *   - server serves the file            → load it
  *   - server refuses (401/403/5xx)      → error, no local fallback
- *   - server says it has no such name   → retry the server's OWN exact key if the
- *                                         listing has a single normalization/case
- *                                         match, otherwise REFUSE (an absence from
- *                                         the authority means any local hit is a
- *                                         DIFFERENT file)
+ *   - server says it has no such name   → retry the server's OWN exact key if its
+ *                                         listing has a single UNICODE-NORMALIZATION
+ *                                         match (case and separator differences are
+ *                                         named, never substituted), otherwise
+ *                                         REFUSE — an absence from the authority
+ *                                         means any local hit is a DIFFERENT file
  *   - name matches several library keys → REFUSE as ambiguous, naming them
  *   - server unreachable (no answer)    → best-effort reconstructed local dirs,
  *                                         and REFUSE if more than one file matches
