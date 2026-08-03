@@ -1,9 +1,11 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { AssetRegistry, applyOverrides } from "../services/asset-registry.js";
+import { reconcileAssetsFromHistory } from "../services/asset-reconcile.js";
 import { enqueueWorkflow } from "../services/workflow-executor.js";
 import { viewAssetImage } from "../services/view-image.js";
 import { errorToToolResult } from "../utils/errors.js";
+import { logger } from "../utils/logger.js";
 
 function summarizeRecord(record: ReturnType<typeof AssetRegistry.get>) {
   if (!record) return null;
@@ -15,6 +17,7 @@ function summarizeRecord(record: ReturnType<typeof AssetRegistry.get>) {
     subfolder: record.subfolder,
     type: record.type,
     url: record.url,
+    source: record.source,
     created_at: new Date(record.createdAt).toISOString(),
   };
 }
@@ -44,7 +47,7 @@ export function registerAssetTools(server: McpServer): void {
 
   server.tool(
     "list_assets",
-    "List recently generated assets from the in-memory registry, newest-first. Assets are registered automatically when a workflow completes successfully. The registry is ephemeral and clears on server restart; records expire after COMFYUI_ASSET_TTL_HOURS (default 24h).",
+    "List recently generated assets, newest-first. Each call first reconciles ComfyUI's /history, so outputs are listed even when this session did not watch the render complete (e.g. queued via panel_run, by an earlier session, or before a server restart) — those are tagged source:'history-reconcile', versus source:'watched' for renders this server saw finish. Returns count + assets (asset_id, prompt_id, filename, url, source, created_at). The registry is ephemeral and clears on server restart; records expire after COMFYUI_ASSET_TTL_HOURS (default 24h), and only the most recent completed runs are reconciled — use get_history / get_image by filename for anything older.",
     {
       limit: z
         .number()
@@ -61,13 +64,37 @@ export function registerAssetTools(server: McpServer): void {
     async (args) => {
       try {
         const since = args.since ? Date.parse(args.since) : undefined;
+        // Close the #751 gap: outputs whose completion this process didn't
+        // watch (panel_run dispatches, earlier sessions, pre-restart runs)
+        // register from history on demand. Best-effort — the registry still
+        // answers when ComfyUI is unreachable.
+        let note: string | undefined;
+        try {
+          await reconcileAssetsFromHistory();
+        } catch (reconcileErr) {
+          const message =
+            reconcileErr instanceof Error
+              ? reconcileErr.message
+              : String(reconcileErr);
+          logger.warn("list_assets history reconcile failed", { error: message });
+          note = `Could not reconcile from ComfyUI history (${message}); showing watched-session assets only.`;
+        }
         const records = AssetRegistry.list({ limit: args.limit, since });
+        if (records.length === 0 && note === undefined) {
+          note =
+            "No assets found — nothing completed under this server's watch and no recent completed outputs in ComfyUI history. " +
+            "Use get_history to inspect past runs and get_image to fetch an output by filename.";
+        }
         return {
           content: [
             {
               type: "text" as const,
               text: JSON.stringify(
-                { count: records.length, assets: records.map(summarizeRecord) },
+                {
+                  count: records.length,
+                  assets: records.map(summarizeRecord),
+                  ...(note !== undefined ? { note } : {}),
+                },
                 null,
                 2,
               ),

@@ -13,6 +13,14 @@ export interface AssetOutput {
   images: AssetImage[];
 }
 
+/**
+ * Provenance of a record: "watched" means this process saw the prompt complete
+ * (JobWatcher); "history-reconcile" means the record was recovered from
+ * ComfyUI's /history after the fact (render dispatched by the panel, an earlier
+ * session, or before a server restart — see issue #751).
+ */
+export type AssetSource = "watched" | "history-reconcile";
+
 export interface AssetRecord {
   assetId: string;
   promptId: string;
@@ -23,12 +31,18 @@ export interface AssetRecord {
   url: string;
   workflow: WorkflowJSON;
   createdAt: number;
+  source: AssetSource;
 }
 
 export interface RegisterArgs {
   promptId: string;
   workflow: WorkflowJSON;
   outputs: AssetOutput[];
+  /** Defaults to "watched". */
+  source?: AssetSource;
+  /** ms epoch. Reconciled records pass the run's real completion time so
+   *  ordering, `since` filters, and TTL expiry stay truthful. Defaults to now. */
+  createdAt?: number;
 }
 
 export interface ListArgs {
@@ -53,7 +67,10 @@ const state = {
   config: { ttlMs: DEFAULT_TTL_MS, now: Date.now } as RegistryConfig,
 };
 
-function makeAssetId(promptId: string, img: AssetImage): string {
+function makeAssetId(
+  promptId: string,
+  img: Pick<AssetImage, "filename" | "subfolder" | "type">,
+): string {
   const hash = createHash("sha256")
     .update(`${promptId}\0${img.filename}\0${img.subfolder}\0${img.type}`)
     .digest("hex");
@@ -73,7 +90,7 @@ export const AssetRegistry = {
    * Register all images produced by a completed prompt.
    * Returns the AssetRecords created (one per image).
    */
-  register({ promptId, workflow, outputs }: RegisterArgs): AssetRecord[] {
+  register({ promptId, workflow, outputs, source, createdAt }: RegisterArgs): AssetRecord[] {
     const snapshot = deepCloneWorkflow(workflow);
     const created: AssetRecord[] = [];
     for (const output of outputs) {
@@ -88,13 +105,23 @@ export const AssetRegistry = {
           type: img.type,
           url: img.url,
           workflow: snapshot,
-          createdAt: state.config.now(),
+          createdAt: createdAt ?? state.config.now(),
+          source: source ?? "watched",
         };
         state.records.set(assetId, record);
         created.push(record);
       }
     }
     return created;
+  },
+
+  /** True when a live (unexpired) record exists for this prompt + image. */
+  has(
+    promptId: string,
+    img: Pick<AssetImage, "filename" | "subfolder" | "type">,
+  ): boolean {
+    const record = state.records.get(makeAssetId(promptId, img));
+    return record !== undefined && !isExpired(record);
   },
 
   /** Look up a record by id. Returns undefined for missing or expired. */
