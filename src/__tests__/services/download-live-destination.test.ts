@@ -406,6 +406,14 @@ describe("currentLiveModelsRoot — only a LIVE-AUTHORITATIVE answer (#369)", ()
 describe("post-write: the reported path is VERIFIED, not intended (#369)", () => {
   const target = resolve("/live/ComfyUI/models/loras/new.safetensors");
 
+  beforeEach(() => {
+    // Default to the healthy case: the destination IS the root the running server
+    // reported, so a listing hit is decisive. Tests about the non-authoritative
+    // ambiguity set `configured-base` explicitly.
+    h.modelsDirSource = "observed-root";
+    h.destModelsDir = "/live/ComfyUI/models";
+  });
+
   it("reports the on-disk path and 'visible' when the live server lists the file", async () => {
     h.liveListings["loras"] = ["new.safetensors", "old.safetensors"];
     const res = await verifyLandedModel(target, "loras", { attempts: 1, retryMs: 0 });
@@ -482,6 +490,20 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
     });
     expect(res.liveVisible).toBe("unknown");
     expect(res.note).toMatch(/ALREADY listed that name/);
+  });
+
+  it("does NOT confirm a non-authoritative destination when the PRE-download listing was unavailable (codex gate r14)", async () => {
+    // Nothing establishes that the entry appeared because of THIS write — the live
+    // server may have listed that name all along, from a tree we did not write to.
+    h.modelsDirSource = "configured-base";
+    h.liveListings["loras"] = ["new.safetensors"];
+    const res = await verifyLandedModel(target, "loras", {
+      attempts: 1,
+      retryMs: 0,
+      listedBefore: undefined,
+    });
+    expect(res.liveVisible).toBe("unknown");
+    expect(res.note).toMatch(/could not be checked/);
   });
 
   it("DOES confirm when the entry APPEARED because of this download", async () => {

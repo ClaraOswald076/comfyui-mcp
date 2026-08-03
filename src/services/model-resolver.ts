@@ -1113,8 +1113,13 @@ export async function verifyLandedModel(
         "tree, or re-download now that the correct server is connected.",
     };
   }
-  const ambiguous =
-    !destinationIsLiveAuthoritative && opts?.listedBefore === true;
+  // On a destination the running server never vouched for, the ONLY thing that makes
+  // a listing hit meaningful is that the entry APPEARED because of this write. That
+  // needs an explicit "it was not there before": an UNAVAILABLE pre-download listing
+  // (`undefined`) proves nothing and must be treated as ambiguous too, or a
+  // pre-existing same-named file in the live tree fabricates a verified success
+  // (codex gate, round 14).
+  const ambiguous = !destinationIsLiveAuthoritative && opts?.listedBefore !== false;
 
   let sawListing = false;
   for (let i = 0; i < attempts; i++) {
@@ -1156,9 +1161,12 @@ export async function verifyLandedModel(
           liveVisible: "unknown",
           note:
             `The connected ComfyUI (${getComfyUIBaseUrl()}) lists "${wanted}" under "${category}", ` +
-            "but it ALREADY listed that name before this download, and this destination came from " +
-            "local configuration rather than from the running server — so it cannot be confirmed " +
-            `that the file the server loads is the one just written to ${verifiedPath}. ` +
+            (opts?.listedBefore === true
+              ? "but it ALREADY listed that name before this download, "
+              : "but whether it listed that name BEFORE this download could not be checked, ") +
+            "and this destination came from local configuration rather than from the running " +
+            "server — so it cannot be confirmed that the file the server loads is the one just " +
+            `written to ${verifiedPath}. ` +
             "Point COMFYUI_PATH at the ComfyUI that is actually running (or launch it with an " +
             "absolute --base-directory) to get a definite answer.",
         };
