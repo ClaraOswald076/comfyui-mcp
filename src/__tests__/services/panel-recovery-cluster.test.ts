@@ -44,11 +44,13 @@ process.env.COMFYUI_MCP_PANEL_LOCK = join(
 );
 
 const mode = vi.hoisted(() => ({ local: true, remote: false }));
+const generation = vi.hoisted(() => ({ value: 0 }));
 vi.mock("../../config.js", () => ({
   config: { comfyuiPath: undefined as string | undefined },
   isLocalMode: () => mode.local,
   isRemoteMode: () => mode.remote,
   getComfyUIBaseUrl: () => "http://127.0.0.1:8188",
+  getComfyuiTargetGeneration: () => generation.value,
 }));
 
 const workspace = vi.hoisted(() => ({
@@ -86,6 +88,7 @@ import {
 import {
   __resetPanelBaseCache,
   __setPanelBaseForTests,
+  lastPanelBaseResolution,
   lastPanelDiskObservation,
   primePanelBase,
   recordPanelDiskObservation,
@@ -118,6 +121,7 @@ beforeEach(() => {
   workspace.reachable = false;
   workspace.liveArgv = undefined;
   workspace.liveCwd = undefined;
+  generation.value = 0;
   __resetPanelBaseCache();
 });
 
@@ -779,6 +783,36 @@ describe("a wholesale replacement needs the RUNNING server to have chosen the tr
     const resolution = await primePanelBase();
     expect(resolution.source).toBe("configured");
     expect(resolution.liveProbeFailed).toBe(true);
+  });
+
+  it("a same-URL retarget invalidates the cached base — a restart onto a new tree is not reused", async () => {
+    // setComfyuiTarget bumps the generation even for a round trip back to the
+    // same address, which is exactly what a ComfyUI restart onto a different
+    // --base-directory looks like from outside. A cache that survived that
+    // would freeze the OLD root into the next status read or mutation, which
+    // would then verify its own work in a tree nobody serves.
+    const liveRoot = join(root, "live", "ComfyUI");
+    mkdirSync(join(liveRoot, "custom_nodes"), { recursive: true });
+    workspace.reachable = true;
+    workspace.liveArgv = [`${liveRoot}/main.py`];
+    __resetPanelBaseCache();
+    expect((await primePanelBase()).base).toBe(liveRoot);
+    expect(lastPanelBaseResolution()?.base).toBe(liveRoot);
+
+    generation.value++; // a retarget landed
+    expect(lastPanelBaseResolution()).toBeUndefined();
+  });
+
+  it("an UNREADABLE custom_nodes is not a proven absence", async () => {
+    // existsSync collapses every error to false, so EACCES looked identical to
+    // a fresh install with no custom_nodes — the first is unknown, the second
+    // is proven. Recommending an install over the first could clobber a panel.
+    const h = makeDeps({ withoutSwapOps: true });
+    h.deps.isDirectory = () => undefined; // stat failed: indeterminate
+    const { detectPanelInstall } = await import("../../services/panel-installer.js");
+    const detected = await detectPanelInstall(h.deps);
+    expect(detected.installed).toBe(false);
+    expect(detected.scanReliable).toBe(false);
   });
 
   it("a live-resolved base is corroborated", async () => {

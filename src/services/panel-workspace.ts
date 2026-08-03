@@ -169,7 +169,7 @@ export async function resolvePanelBase(): Promise<PanelBaseResolution> {
 const PANEL_BASE_TTL_MS = 60_000;
 
 let cached:
-  | { at: number; target: string; resolution: PanelBaseResolution }
+  | { at: number; target: string; generation: number; resolution: PanelBaseResolution }
   | undefined;
 
 /** Cache key: which ComfyUI this resolution describes. Never throws. */
@@ -205,6 +205,13 @@ function targetGeneration(): number {
 function cachedResolution(): PanelBaseResolution | undefined {
   if (!cached) return undefined;
   if (cached.target !== targetKey()) return undefined;
+  // The URL is not enough here either. setComfyuiTarget bumps the generation
+  // even for a round trip back to the SAME address, which is exactly what a
+  // ComfyUI restart onto a different --base-directory looks like from outside:
+  // same URL, different custom_nodes. A cache that survived that would freeze
+  // the OLD root into a status read or — far worse — into a mutation, which
+  // would then verify its own work in a tree nobody is serving.
+  if (cached.generation !== targetGeneration()) return undefined;
   if (Date.now() - cached.at > PANEL_BASE_TTL_MS) return undefined;
   return cached.resolution;
 }
@@ -230,7 +237,12 @@ export async function primePanelBase(
       ? { base: configured, source: "configured" }
       : { source: "none" };
   }
-  cached = { at: Date.now(), target: targetKey(), resolution };
+  cached = {
+    at: Date.now(),
+    target: targetKey(),
+    generation: targetGeneration(),
+    resolution,
+  };
   return resolution;
 }
 
@@ -271,6 +283,7 @@ export function __setPanelBaseForTests(
   cached = {
     at: Date.now(),
     target: targetKey(),
+    generation: targetGeneration(),
     resolution: base ? { base, source } : { source: "none" },
   };
 }
@@ -350,6 +363,11 @@ export function recordPanelDiskObservation(
 /** Forget the on-disk observation — the pack is not there (or was removed). */
 export function clearPanelDiskObservation(): void {
   diskObservation = undefined;
+  // Drop the resolved base with it. A hello is also the moment ComfyUI may have
+  // restarted with different launch flags — and therefore a different
+  // custom_nodes — so keeping the previous root cached would let the very next
+  // operation freeze the wrong tree.
+  cached = undefined;
 }
 
 /**

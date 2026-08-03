@@ -742,6 +742,13 @@ export async function detectPanelInstall(
   // Candidate dirs: fast-path names first, then any other subdir.
   const candidates: string[] = FAST_PATH_DIRS.map((n) => join(customNodes, n));
   let scanReliable = true;
+  // `existsSync` collapses EVERY error to false, so an unreadable custom_nodes
+  // (EACCES/EIO) is indistinguishable from a fresh install that has none — and
+  // the second is a proven absence while the first is not. The tri-state probe
+  // tells them apart: only `undefined` (could not determine) makes the scan
+  // unreliable, so an install is never recommended over a directory we simply
+  // could not read into.
+  if (deps.isDirectory(customNodes) === undefined) scanReliable = false;
   if (deps.existsSync(customNodes)) {
     let entries: string[] = [];
     try {

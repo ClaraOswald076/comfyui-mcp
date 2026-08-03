@@ -160,31 +160,28 @@ export function assertPanelPinAllows(action: string, id: string): void {
         `must be unset/changed in the environment — unpin cannot remove it)`
       : ``;
 
-  // #774/#784 — this refusal names install_panel(action='unpin') as the way
-  // out, and in a remote/cloud session that tool cannot act. A pin that can only
-  // be cleared by a tool the caller cannot reach is another dead end, so say
-  // where the pin actually lives when install_panel is not usable here. (An env
-  // pin already has its own instruction and needs no addition.)
-  const ctx = panelRecoveryContext();
-  const unreachableNote =
-    ctx.installPanelUsable || pin.source === "env"
-      ? ``
-      : ` NOTE: install_panel cannot act in this session, so the pin must be ` +
-        `cleared where the panel lives — remove the pin from the ComfyUI host's ` +
-        `~/.comfyui-mcp/panel-settings.json (or unset ${PANEL_PIN_ENV_VAR} there) ` +
-        `and restart the orchestrator on that host.`;
+  // #774/#784 — the way out of this refusal must be a way the caller can
+  // actually take. `install_panel(action='unpin')` is the right instruction in a
+  // local session and a dead end in a remote/cloud one, where install_panel
+  // cannot act at all. So the LEAD instruction switches with the session rather
+  // than being appended to. An env pin already carries its own instruction (unset
+  // the variable), which is host-side either way and needs no substitution.
+  const usable = panelRecoveryContext().installPanelUsable || pin.source === "env";
+  const clearIt = usable
+    ? `clear the pin with install_panel(action='unpin')${envNote}`
+    : `clear the pin ON THE COMFYUI HOST — install_panel cannot act in this ` +
+      `session, so remove it from that machine's ~/.comfyui-mcp/panel-settings.json ` +
+      `(or unset ${PANEL_PIN_ENV_VAR} there) and restart the orchestrator running there`;
 
   throw new PanelPinnedError(
-    (bulk
+    bulk
       ? `Refusing to ${action} "${id}": that would also move the sidebar panel pack, ` +
         `which is ${describePanelPin(pin)}. ComfyUI-Manager cannot update ` +
-        `everything-except-one-pack, so either clear the pin first with ` +
-        `install_panel(action='unpin')${envNote} and re-run, or update the other packs ` +
-        `individually by id.`
+        `everything-except-one-pack, so either ${clearIt} and re-run, or update the ` +
+        `other packs individually by id.`
       : `Refusing to ${action} the sidebar panel pack ("${id}"): it is ` +
         `${describePanelPin(pin)}. A pin is honoured even when a newer panel exists — ` +
-        `clear it first with install_panel(action='unpin')${envNote}, then re-run.`) +
-      unreachableNote,
+        `${clearIt}, then re-run.`,
   );
 }
 
