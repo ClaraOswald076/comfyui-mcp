@@ -2243,8 +2243,9 @@ const normalizeStoreKey = (key: string): string =>
 
 /**
  * The connected ComfyUI's OWN list of saved workflow store keys, or null when the
- * listing could not be read. This is the same source panel_list_workflows /
- * list_workflows report, so it reflects the server's runtime `--user-directory`
+ * listing could not be read. This is the same source list_workflows reports (the
+ * SAVED library, not the open tabs), so it reflects the server's runtime
+ * `--user-directory`
  * — it is asked, never reconstructed. Used only to turn an authoritative
  * "no such name" into either the server's EXACT key or an explicit refusal.
  * Never throws: an unreadable listing simply means "no extra information".
@@ -2292,7 +2293,7 @@ function assertUiWorkflow(parsed: unknown, sourceLabel: string): Record<string, 
  * An ABSOLUTE path is read off the orchestrator's own disk, unchanged.
  *
  * A RELATIVE name is resolved AUTHORITATIVELY by the CONNECTED ComfyUI's userdata
- * API — the same source panel_list_workflows / panel_open_workflow read. That
+ * API — the same source list_workflows / panel_open_workflow read. That
  * server resolves the name under its RUNTIME `--user-directory`, so a custom user
  * directory just works and a same-named file under a reconstructed default-layout
  * path can never shadow it (#202).
@@ -2447,14 +2448,31 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
   // listing and look for the same name in a different Unicode normal form or
   // letter case — a name pasted from a listing (or produced on another OS) can be
   // byte-different yet denote the same file, which is how a workflow that
-  // panel_list_workflows plainly shows still 404s here. Only the SERVER's exact
+  // list_workflows plainly shows still 404s here. Only the SERVER's exact
   // key is retried, so this resolves the name the connected ComfyUI itself
   // reports — it never reconstructs a path. More than one match is AMBIGUOUS and
   // is refused rather than guessed at.
+  // Turn a RAW key from the server's listing into the store key to request. The
+  // server's own bytes are preserved (codex MAJOR): re-deriving the key through
+  // normalizeStoreKey would NFC-normalize it, so a library that stores the
+  // DECOMPOSED spelling would be re-asked with the COMPOSED one — i.e. the exact
+  // key that just 404'd — and a uniquely listed workflow would be refused. Only a
+  // missing "workflows/" prefix is added.
+  const storeKeyForListed = (listedKey: string): string => {
+    const trimmed = listedKey.replace(/^[\\/]+/, "");
+    return /^workflows[\\/]/i.test(trimmed) ? trimmed : `workflows/${trimmed}`;
+  };
+
   let listedButUnserved: string | null = null;
   let caseNearMisses: string[] = [];
   if (outcome.kind === "absent") {
-    const listed = await listUserdataWorkflowKeys();
+    const rawListed = await listUserdataWorkflowKeys();
+    // A listing entry is server-supplied data, so it gets the SAME escape guard as
+    // caller input before it is echoed back as a request key.
+    const listed = rawListed?.filter((k) => {
+      const segs = normalizeStoreKey(k).split("/");
+      return !segs.includes("..") && !segs.some((s) => /^[A-Za-z]:/.test(s));
+    });
     if (listed) {
       const want = normalizeStoreKey(rel);
       // The ONLY accepted equivalence is Unicode normalization. NFC "é" and NFD
@@ -2473,14 +2491,15 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
         throw new Error(
           `"${p}" is ambiguous in the connected ComfyUI's workflow library — it matches ` +
             `${matches.length} saved workflows (${matches.map((k) => `"${k}"`).join(", ")}). ` +
-            `Refusing to guess which one you meant: pass the exact name from panel_list_workflows, ` +
+            `Refusing to guess which one you meant: pass the exact name from list_workflows, ` +
             `or an absolute path.`,
         );
       }
       if (matches.length === 1) {
-        if (normalizeStoreKey(matches[0]) !== rel.replace(/\\/g, "/")) {
-          outcome = await fetchUserdataKey(`workflows/${normalizeStoreKey(matches[0])}`);
-        }
+        const retryKey = storeKeyForListed(matches[0]);
+        // Only re-ask when the server's spelling actually differs from what was
+        // already sent — otherwise this would repeat the request that just failed.
+        if (retryKey !== requestedKey) outcome = await fetchUserdataKey(retryKey);
         // Still absent after retrying the server's OWN key: the library lists the
         // name but will not serve it. Say so — that is a server-side condition the
         // user must see, not a cue to go hunting for a local file.
@@ -2505,7 +2524,7 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
     // possibly-different local file; report the status honestly.
     throw new Error(
       `Could not read "${p}" from the connected ComfyUI: ${outcome.detail}. ` +
-        `Pass an absolute path, or a name shown by panel_list_workflows.`,
+        `Pass an absolute path, or a name shown by list_workflows.`,
     );
   }
   if (outcome.kind === "absent") {
@@ -2528,7 +2547,8 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
           : "") +
         ` The connected ComfyUI is the authority on its own user directory (it may have been started` +
         ` with --user-directory), so the orchestrator will NOT guess at a local path that could be a` +
-        ` different file. Use a name exactly as shown by panel_list_workflows, or pass an absolute path.`,
+        ` different file. Use a name exactly as shown by list_workflows (which reads the same library),` +
+        ` or pass an absolute path.`,
     );
   }
 
@@ -2574,7 +2594,7 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
   throw new Error(
     `No workflow file at "${p}". It ${outcome.detail}, and it is not under the orchestrator's ` +
       `reconstructed workflows dir (${comfyWorkflowsDirs().join(" or ") || "COMFYUI_PATH not set"}). ` +
-      `Pass an absolute path, or a name shown by panel_list_workflows.`,
+      `Pass an absolute path, or a name shown by list_workflows.`,
   );
 }
 
@@ -4208,7 +4228,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         path: z
           .string()
           .optional()
-          .describe("Path to a workflow .json — an ABSOLUTE path on the ComfyUI machine's disk, or a name from panel_list_workflows, which is looked up in the connected ComfyUI's own workflow library (so a custom --user-directory resolves correctly). Read + parsed server-side and loaded onto the canvas (keeps a large JSON out of chat). A name the library does not have is REFUSED rather than guessed at from a local path."),
+          .describe("Path to a workflow .json — an ABSOLUTE path on the ComfyUI machine's disk, or a name from list_workflows, which is looked up in the connected ComfyUI's own saved-workflow library (so a custom --user-directory resolves correctly). Read + parsed server-side and loaded onto the canvas (keeps a large JSON out of chat). A name the library does not have is REFUSED rather than guessed at from a local path."),
         graph: z
           .union([z.string(), z.record(z.string(), z.unknown())])
           .optional()

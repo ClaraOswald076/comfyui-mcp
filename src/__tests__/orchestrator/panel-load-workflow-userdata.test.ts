@@ -99,7 +99,7 @@ describe("panel_load_workflow: userdata fallback for a custom --user-directory (
     expect(calls).toHaveLength(0);
     const text = JSON.stringify(res);
     expect(text).toMatch(/workflow library/i);
-    expect(text).toMatch(/panel_list_workflows/);
+    expect(text).toMatch(/list_workflows/);
   });
 
   it("surfaces an honest error (no graph_load) when the userdata file is not a UI workflow", async () => {
@@ -254,7 +254,7 @@ describe("panel_load_workflow: userdata fallback for a custom --user-directory (
       expect(calls).toHaveLength(0);
       const text = JSON.stringify(res);
       expect(text).toMatch(/staged\.json/); // names what it tried
-      expect(text).toMatch(/panel_list_workflows/);
+      expect(text).toMatch(/list_workflows/);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -417,6 +417,54 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
     expect(fetchApi).toHaveBeenCalledWith(`/api/userdata/${encodeURIComponent(`workflows/${nfc}`)}`);
   });
 
+  it("resolves the REVERSE direction too — an NFC name against a DECOMPOSED library key", async () => {
+    // The mirror of the test above, and the one that catches a retry which
+    // re-derives the key instead of echoing the server's bytes (codex MAJOR): if
+    // the retry NFC-normalized the listed key it would re-send the caller's own
+    // spelling — the key that just 404'd — and refuse a uniquely listed workflow.
+    const nfc = "caf\u00e9.json";
+    const nfd = "cafe\u0301.json";
+    const graph = { nodes: [{ id: 9, type: "DecomposedLibraryNode" }], links: [] };
+    routeMock([nfd], { [`workflows/${nfd}`]: graph });
+
+    const { ctx, calls } = makeCtx();
+    const res = await loadWorkflow().handler({ path: nfc }, ctx);
+
+    expect(res.isError).toBeUndefined();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].graph).toMatchObject(graph);
+    expect(fetchApi).toHaveBeenCalledWith(`/api/userdata/${encodeURIComponent(`workflows/${nfd}`)}`);
+  });
+
+  it("uses the server's key verbatim when the listing already carries the workflows/ prefix", async () => {
+    // Some listings report the full store key. It must not be double-prefixed, and
+    // it must not be rewritten.
+    const graph = { nodes: [{ id: 11, type: "PrefixedListingNode" }], links: [] };
+    routeMock(["workflows/Prefixed Name.json"], { "workflows/Prefixed Name.json": graph });
+
+    const { ctx, calls } = makeCtx();
+    const res = await loadWorkflow().handler({ path: "Prefixed Name.json" }, ctx);
+
+    expect(res.isError).toBeUndefined();
+    expect(calls[0].graph).toMatchObject(graph);
+    expect(fetchApi).not.toHaveBeenCalledWith(
+      `/api/userdata/${encodeURIComponent("workflows/workflows/Prefixed Name.json")}`,
+    );
+  });
+
+  it("never echoes a traversal entry from a hostile listing back as a request key", async () => {
+    routeMock(["../../secret.json", "..\\secret.json"], {});
+
+    const { ctx, calls } = makeCtx();
+    const res = await loadWorkflow().handler({ path: "secret.json" }, ctx);
+
+    expect(res.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+    for (const call of fetchApi.mock.calls) {
+      expect(String(call[0])).not.toMatch(/%2E%2E|\.\./i);
+    }
+  });
+
   it("REFUSES when two listed keys NORMALIZE to the requested name (ambiguous, no guess)", async () => {
     // Two library keys, one NFC and one NFD, both spelling the same name. A
     // case-sensitive store can hold both; picking either would be a coin flip over
@@ -499,7 +547,7 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
     // The listing WAS consulted (and its 500 swallowed) — otherwise this test would
     // pass even if the near-miss lookup had been dropped entirely.
     expect(fetchApi).toHaveBeenCalledWith("/api/userdata?dir=workflows");
-    expect(JSON.stringify(res)).toMatch(/panel_list_workflows/);
+    expect(JSON.stringify(res)).toMatch(/list_workflows/);
   });
 });
 
@@ -644,7 +692,7 @@ describe("readWorkflowFromPath: refuses a '..' traversal segment (#414 hardening
     expect(JSON.stringify(res)).toMatch(/not a valid workflow name/i);
   });
 
-  it("does NOT read a file via a symlink under the workflows dir that escapes the root", async () => {
+  it("does NOT read a file via a symlink under the workflows dir that escapes the root", async (t) => {
     // A lexically-clean name ("linked/secret.json") where `linked` is a symlink to
     // an EXTERNAL dir would, without realpath containment, be read on the local
     // fallback. The realpath check rejects it. (Skipped where the OS denies
@@ -663,7 +711,11 @@ describe("readWorkflowFromPath: refuses a '..' traversal segment (#414 hardening
       try {
         symlinkSync(external, join(defaultDir, "linked"), "junction");
       } catch {
-        return; // unprivileged symlink creation — skip on this platform
+        // Unprivileged symlink creation (stock Windows). Mark the test SKIPPED
+        // rather than returning — a bare return reports a green test that never
+        // ran its assertion (codex).
+        t.skip();
+        return;
       }
       process.env.COMFYUI_PATH = root;
       // Unreachable server → the local fallback is reached, so the realpath
