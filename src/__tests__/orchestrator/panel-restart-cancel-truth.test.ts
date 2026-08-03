@@ -82,6 +82,12 @@ beforeEach(() => {
     intervalMs: 5,
     probeTimeoutMs: 10,
   });
+  // Fast decline-probe recheck window (the real one is ~6s).
+  __panelToolsTestHooks.setDeclineProbeTiming({
+    windowMs: 25,
+    intervalMs: 5,
+    probeTimeoutMs: 5,
+  });
   // Default: the local relaunch preflight PASSES (the live preflightLocalRestart
   // would probe real processes/ports). The refusal tests override it.
   __panelToolsTestHooks.setLocalRestartPreflight(async () => ({ ok: true }));
@@ -91,15 +97,20 @@ afterEach(() => {
   __panelToolsTestHooks.setPanelRebootTiming(null);
   __panelToolsTestHooks.setHealthProbe(null);
   __panelToolsTestHooks.setLocalRestartPreflight(null);
+  __panelToolsTestHooks.setDeclineProbeTiming(null);
 });
 
 describe("panel_restart_comfyui — decline truthfulness (#742)", () => {
-  it("a decline while the server is PROVEN DOWN reports the lost server — never 'Cancelled'", async () => {
+  it("a decline while the server is PERSISTENTLY down reports the lost server — never 'Cancelled'", async () => {
     // The confirm resolved "no" (a decline, OR the card failed into the catch-all
-    // "no" because the tab died with the server). The endpoint probe PROVES the
-    // server is down (ECONNREFUSED): the old "Cancelled — ComfyUI was not
-    // restarted." would be a lie — a stop already happened.
-    __panelToolsTestHooks.setHealthProbe(async () => "down");
+    // "no" because the tab died with the server). The endpoint stays refused for
+    // the WHOLE recheck window — only then may the report call it lost (a single
+    // ECONNREFUSED is just a normal restart down-window, codex gate).
+    let probes = 0;
+    __panelToolsTestHooks.setHealthProbe(async () => {
+      probes++;
+      return "down";
+    });
     const { ctx, sends } = makeCtx({ confirm: "no" });
 
     const res = await restartTool().handler({}, ctx);
@@ -110,14 +121,61 @@ describe("panel_restart_comfyui — decline truthfulness (#742)", () => {
     expect(t).not.toMatch(/was not restarted/i);
     expect(t).toMatch(/ComfyUI is DOWN/i);
     expect(t).toMatch(/STOPPED and did not come back/i);
+    expect(t).toMatch(/recheck window/i);
     expect(t).toMatch(/start ComfyUI manually/i);
     expect(t).toMatch(/Pinokio/i);
+    // NOT a single-probe verdict: the window rechecked before declaring loss.
+    expect(probes).toBeGreaterThan(1);
     // Nothing was dispatched after the decline — the report is about PRIOR state.
     expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
   });
 
-  it("a decline with a HEALTHY server keeps the plain cancel line", async () => {
-    __panelToolsTestHooks.setHealthProbe(async () => "healthy");
+  it("a decline with the server down-then-HEALTHY inside the window does NOT declare a loss", async () => {
+    // A genuinely restarting server is refused during its normal down window
+    // (codex gate High #1): a recovery inside the recheck window must NOT be
+    // reported as a lost server — the truthful outcome is "it came back".
+    const seq: Array<"down" | "healthy"> = ["down", "down", "healthy"];
+    let probes = 0;
+    __panelToolsTestHooks.setHealthProbe(async () => {
+      const s = seq[Math.min(probes, seq.length - 1)];
+      probes++;
+      return s;
+    });
+    const { ctx, sends } = makeCtx({ confirm: "no" });
+
+    const res = await restartTool().handler({}, ctx);
+    const t = text(res);
+
+    expect(res.isError).toBeFalsy();
+    expect(t).not.toMatch(/ComfyUI is DOWN/i);
+    expect(t).not.toMatch(/did not come back/i);
+    expect(t).not.toMatch(/start ComfyUI manually/i);
+    expect(t).toMatch(/^Cancelled — no new restart was dispatched/);
+    expect(t).toMatch(/healthy again/i);
+    // It kept polling past the first refused sample instead of declaring loss.
+    expect(probes).toBe(3);
+    expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
+  });
+
+  it("a decline with a HEALTHY server keeps the plain cancel line (one probe, no stall)", async () => {
+    let probes = 0;
+    __panelToolsTestHooks.setHealthProbe(async () => {
+      probes++;
+      return "healthy";
+    });
+    const { ctx, sends } = makeCtx({ confirm: "no" });
+
+    const res = await restartTool().handler({}, ctx);
+
+    expect(text(res)).toBe("Cancelled — ComfyUI was not restarted.");
+    expect(probes).toBe(1); // healthy on the first sample → no recheck window
+    expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
+  });
+
+  it("a decline with an UNVERIFIABLE server keeps the plain cancel line (never alarmist)", async () => {
+    // "unknown" (a transient 5xx / timeout / ambiguous error) is NOT a proven
+    // down — only ECONNREFUSED at the END of the window flips the report.
+    __panelToolsTestHooks.setHealthProbe(async () => "unknown");
     const { ctx, sends } = makeCtx({ confirm: "no" });
 
     const res = await restartTool().handler({}, ctx);
@@ -126,11 +184,42 @@ describe("panel_restart_comfyui — decline truthfulness (#742)", () => {
     expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
   });
 
-  it("a decline with an UNVERIFIABLE server keeps the plain cancel line (never alarmist)", async () => {
-    // "unknown" (a transient 5xx / timeout / ambiguous error) is NOT a proven
-    // down — only ECONNREFUSED flips the report.
-    __panelToolsTestHooks.setHealthProbe(async () => "unknown");
-    const { ctx, sends } = makeCtx({ confirm: "no" });
+  it("an UNBOUND probe target gets a generic unreachable report — never a causation claim (codex gate)", async () => {
+    // The bound tab does NOT provably front our boot instance, so the only probe
+    // is the configured endpoint — no proven relationship to the restart. The
+    // report may say the server is unreachable, but must NEVER claim a restart
+    // (ours or an earlier one) stopped it.
+    let probes = 0;
+    __panelToolsTestHooks.setHealthProbe(async () => {
+      probes++;
+      return "down";
+    });
+    const { ctx, sends } = makeCtx({ confirm: "no", frontsBoot: false });
+
+    const res = await restartTool().handler({}, ctx);
+    const t = text(res);
+
+    expect(res.isError).toBeFalsy();
+    expect(t).not.toMatch(/^Cancelled/);
+    expect(t).toMatch(/appears to be DOWN|unreachable/i);
+    // NO causation: not "stopped by a restart", not "did not come back".
+    expect(t).not.toMatch(/restart initiated earlier/i);
+    expect(t).not.toMatch(/STOPPED and did not come back/i);
+    expect(t).not.toMatch(/was NOT what stopped it/i);
+    expect(t).toMatch(/can't tell|can't confirm|isn't provably/i);
+    expect(probes).toBeGreaterThan(1);
+    expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
+  });
+
+  it("an UNBOUND probe target that recovers keeps the plain cancel line", async () => {
+    const seq: Array<"down" | "healthy"> = ["down", "healthy"];
+    let probes = 0;
+    __panelToolsTestHooks.setHealthProbe(async () => {
+      const s = seq[Math.min(probes, seq.length - 1)];
+      probes++;
+      return s;
+    });
+    const { ctx, sends } = makeCtx({ confirm: "no", frontsBoot: false });
 
     const res = await restartTool().handler({}, ctx);
 

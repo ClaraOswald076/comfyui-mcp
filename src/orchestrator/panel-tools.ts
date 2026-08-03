@@ -257,6 +257,17 @@ const MAX_REBOOT_BUDGET_MS = 240_000; // 240s  → settle+budget ≤ 250s < 300s
 // confirmation itself (no auto-confirm): it bounds only how long we wait for the answer.
 const RESTART_CONFIRM_TIMEOUT_MS = 90_000; // 90s
 
+// #742 decline-probe recheck window: a single ECONNREFUSED is NOT proof of a
+// lost server — a genuinely restarting instance is refused during its normal
+// down window (codex gate). When the decline path probes before reporting, it
+// rechecks over this SHORT, bounded window and only declares DOWN when the
+// endpoint is STILL refused at the end of it; a recovery inside the window is
+// reported as such. Deliberately small: the turn already ended on the user's
+// decline, so this is a report-time check and must not stall.
+const DECLINE_PROBE_WINDOW_MS = 6_000; // 6s total
+const DECLINE_PROBE_INTERVAL_MS = 2_000; // 2s between samples
+const DECLINE_PROBE_TIMEOUT_MS = 2_000; // per-sample probe ceiling
+
 function parsePositiveNumberEnv(name: string, fallback: number): number {
   const raw = process.env[name];
   if (raw == null || raw === "") return fallback;
@@ -315,6 +326,13 @@ export const __panelToolsTestHooks = {
     fn: (() => Promise<{ ok: boolean; reason?: string }>) | null,
   ): void {
     localRestartPreflightOverride = fn;
+  },
+  /** Inject a fast #742 decline-probe recheck window so decline-path tests
+   *  don't wait the real ~6s. null restores the DECLINE_PROBE_* constants. */
+  setDeclineProbeTiming(
+    timing: { windowMs: number; intervalMs: number; probeTimeoutMs: number } | null,
+  ): void {
+    declineProbeTimingOverride = timing;
   },
   looksLikeSystemStats,
   probeComfyHealth,
@@ -751,6 +769,73 @@ function normalizeProbe(v: boolean | ProbeStatus): ProbeStatus {
   return v;
 }
 
+interface DeclineProbeOutcome {
+  /**
+   * "healthy"   — the FIRST sample was healthy (a clean decline; no recheck).
+   * "recovered" — an early sample was a proven down but a LATER sample came
+   *               back healthy inside the window (a genuine restart's down
+   *               window — NEVER a lost server, codex gate).
+   * "down"      — no healthy sample AND the LAST sample (taken at the end of
+   *               the window) was a proven down. Only this may be reported as
+   *               a loss — a single refused sample never suffices.
+   * "ambiguous" — anything else (no healthy sample, last sample not a proven
+   *               down) — the plain cancel line, never alarmist.
+   */
+  status: "healthy" | "recovered" | "down" | "ambiguous";
+  attempts: number;
+  waited_ms: number;
+}
+
+/**
+ * The #742 decline-path recheck: poll `base` over a short, bounded window
+ * (clamped to `deadline`) so a server that is merely mid-restart is not
+ * falsely declared lost on a single ECONNREFUSED. Samples immediately, then
+ * sleeps intervalMs between samples, taking the LAST sample at the window's
+ * end — "still refused at the END of the window" is the only down verdict.
+ * Never throws.
+ */
+async function probeDeclineRecovery(
+  base: string | null,
+  windowMs: number,
+  intervalMs: number,
+  probeTimeoutMs: number,
+  deadline: number,
+): Promise<DeclineProbeOutcome> {
+  const start = Date.now();
+  const end = Math.min(start + Math.max(1, windowMs), deadline);
+  const probe = healthProbeOverride ?? probeComfyEndpoint;
+  let attempts = 0;
+  let sawDown = false;
+  let last: ProbeStatus = "unknown";
+  for (;;) {
+    attempts++;
+    const t = Math.max(1, Math.min(probeTimeoutMs, end - Date.now()));
+    let status: ProbeStatus = "unknown";
+    try {
+      status = normalizeProbe(await probe(base, t));
+    } catch {
+      status = "unknown";
+    }
+    if (status === "healthy") {
+      return {
+        status: sawDown ? "recovered" : "healthy",
+        attempts,
+        waited_ms: Date.now() - start,
+      };
+    }
+    if (status === "down") sawDown = true;
+    last = status;
+    const remaining = end - Date.now();
+    if (remaining <= 0) break;
+    await new Promise((r) => setTimeout(r, Math.max(1, Math.min(intervalMs, remaining))));
+  }
+  return {
+    status: last === "down" ? "down" : "ambiguous",
+    attempts,
+    waited_ms: Date.now() - start,
+  };
+}
+
 /**
  * The FIXED ComfyUI base URL to health-probe during a reboot readiness wait, or
  * null when we must fall back to the panel round-trip (as before #509). Captured by
@@ -819,6 +904,14 @@ let healthProbeOverride:
 let localRestartPreflightOverride:
   | (() => Promise<{ ok: boolean; reason?: string }>)
   | null = null;
+
+/** Test injection for the #742 decline-probe recheck window, so tests don't
+ *  wait the real ~6s. null → the DECLINE_PROBE_* constants. */
+let declineProbeTimingOverride: {
+  windowMs: number;
+  intervalMs: number;
+  probeTimeoutMs: number;
+} | null = null;
 
 /**
  * The concurrent-observation gate shared between the reboot handler and observeRecovery.
@@ -5402,39 +5495,66 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           );
         }
         if (decision !== "yes") {
-          // #742: NEVER claim "not restarted" while the server is actually DOWN.
-          // A decline reaches here when the user picked "No" — but ALSO when the
-          // confirm card could not be answered because the panel tab died WITH
-          // the server (confirm maps any non-timeout card error to "no"; e.g. a
-          // reboot accepted moments earlier in the same turn already stopped
-          // ComfyUI, and nothing re-launched it). Probe the same endpoint the
-          // reboot observer would use (falling back to the configured target,
-          // exactly what health_check probes) before making a state claim. Only
-          // a PROVEN-down endpoint (ECONNREFUSED — nothing is listening) flips
-          // the report; healthy/unknown keeps the plain cancel line so a genuine
-          // decline is never alarmist.
-          const cancelProbeBase = captureRebootHealthBase(ctx) ?? getComfyUIBaseUrl();
-          const cancelProbe = healthProbeOverride ?? probeComfyEndpoint;
-          let cancelStatus: ProbeStatus = "unknown";
-          try {
-            cancelStatus = normalizeProbe(
-              await cancelProbe(
-                cancelProbeBase,
-                Math.max(1, Math.min(3000, overallDeadline - Date.now())),
-              ),
-            );
-          } catch {
-            cancelStatus = "unknown";
-          }
-          if (cancelStatus === "down") {
+          // #742: NEVER claim "not restarted" while the server is actually DOWN —
+          // and NEVER declare a loss from ONE probe (codex gate): a genuinely
+          // restarting server is refused during its normal down window, and a
+          // transport/card error mapping to "no" is exactly how a tab dying
+          // during a healthy prior reboot lands here. So recheck over a short,
+          // bounded window and report DOWN only when the endpoint is STILL
+          // refused at the end of it; a recovery inside the window is reported
+          // as such (bound instance) or keeps the plain cancel line (unbound).
+          // CAUSATION ("a restart took it down") is named ONLY when the probed
+          // target is PROVABLY the same boot instance the restart would have
+          // stopped — the same binding the refuse-safe preflight uses; an
+          // unbound configured endpoint gets a generic unreachable report that
+          // never claims "we stopped it".
+          const declineBootBase = captureRebootHealthBase(ctx);
+          const boundToRestartTarget =
+            declineBootBase != null && sameHttpBase(getComfyUIBaseUrl(), declineBootBase);
+          const declineProbeBase = boundToRestartTarget
+            ? declineBootBase
+            : getComfyUIBaseUrl();
+          const declineTiming = declineProbeTimingOverride ?? {
+            windowMs: DECLINE_PROBE_WINDOW_MS,
+            intervalMs: DECLINE_PROBE_INTERVAL_MS,
+            probeTimeoutMs: DECLINE_PROBE_TIMEOUT_MS,
+          };
+          const outcome = await probeDeclineRecovery(
+            declineProbeBase,
+            declineTiming.windowMs,
+            declineTiming.intervalMs,
+            declineTiming.probeTimeoutMs,
+            overallDeadline,
+          );
+          if (outcome.status === "down") {
+            const secs = Math.max(1, Math.round(outcome.waited_ms / 1000));
+            if (boundToRestartTarget) {
+              return ok(
+                "⚠️ ComfyUI is DOWN — it was STOPPED and did not come back (still " +
+                  `unreachable after a ${secs}s recheck window), so do NOT treat this as ` +
+                  "\"nothing happened\". The restart just declined was NOT what stopped " +
+                  "it (nothing was dispatched after the decline), but a restart initiated " +
+                  "earlier already took the server down and it never returned. Start " +
+                  "ComfyUI manually from whatever launches it (e.g. Pinokio, the Desktop " +
+                  "app, or your terminal), then reload the panel tab so it reconnects. " +
+                  "restart_comfyui can attempt the relaunch for you when the install's " +
+                  "launch path is resolvable.",
+              );
+            }
             return ok(
-              "⚠️ ComfyUI is DOWN — it was STOPPED and did not come back, so do NOT treat " +
-                "this as \"nothing happened\". The restart just declined was NOT what stopped " +
-                "it (nothing was dispatched after the decline), but a restart initiated " +
-                "earlier already took the server down and it never returned. Start ComfyUI " +
-                "manually from whatever launches it (e.g. Pinokio, the Desktop app, or your " +
-                "terminal), then reload the panel tab so it reconnects. restart_comfyui can " +
-                "attempt the relaunch for you when the install's launch path is resolvable.",
+              "⚠️ ComfyUI appears to be DOWN — the configured endpoint was still " +
+                `unreachable after a ${secs}s recheck window. The restart just declined ` +
+                "was NOT dispatched, and I can't confirm from here whether the server " +
+                "was actually stopped — this endpoint isn't provably the instance the " +
+                "restart would have cycled. Check ComfyUI on its host and start it " +
+                "manually if it is down, then reload the panel tab so it reconnects.",
+            );
+          }
+          if (outcome.status === "recovered" && boundToRestartTarget) {
+            return ok(
+              "Cancelled — no new restart was dispatched. Note: ComfyUI was briefly " +
+                "unreachable but is healthy again — a restart initiated earlier " +
+                "appears to have completed.",
             );
           }
           return ok("Cancelled — ComfyUI was not restarted.");
