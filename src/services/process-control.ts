@@ -21,6 +21,8 @@ import {
   recordLaunchedInterpreter,
   clearLaunchedInterpreter,
   readProcessIdentity,
+  commandLineMatchesArgv,
+  type ProcessIdentity,
 } from "./live-interpreter.js";
 import {
   liveRootFromArgv,
@@ -724,17 +726,55 @@ function resolveLiveProcessEnv(pid: number): NodeJS.ProcessEnv | undefined {
  * scenarios on any host.
  */
 let processIdentityOverride:
-  | ((pid: number) => { startedAt?: string } | undefined)
+  | ((pid: number) => ProcessIdentity | undefined)
   | null = null;
 
-function resolveProcessIdentity(pid: number): { startedAt?: string } | undefined {
+function resolveProcessIdentity(pid: number): ProcessIdentity | undefined {
   if (processIdentityOverride) return processIdentityOverride(pid);
+  // MEASURED: the Windows reader (a PowerShell `Get-CimInstance` spawn) costs
+  // ~2.4s per call even for a pid that does not exist, which would be paid twice
+  // on every restart and ~40x across the test suite. Linux's `/proc/<pid>/stat`
+  // read is free, and Linux is also the only platform where we read
+  // `/proc/<pid>/environ` at all — so the expensive readers buy nothing the
+  // port-ownership re-check does not already give.
   if (!pid || pid <= 0 || process.platform !== "linux") return undefined;
   try {
     return readProcessIdentity(pid);
   } catch {
     return undefined;
   }
+}
+
+/**
+ * A process identity we are willing to BIND to the ComfyUI that answered us.
+ *
+ * A creation-time stamp read moments after the port lookup is not by itself proof
+ * that the number still denotes the server: in the window between them ComfyUI can
+ * exit, the OS can recycle the pid, and a replacement can take the port — after
+ * which every later re-read agrees with itself about the WRONG process (coordinator
+ * gate). A timestamp cannot close that; an INDEPENDENT observation can. So the
+ * OS's view of the pid must corroborate the server's own view of itself: the
+ * process's command line has to match the `sys.argv` that `/system_stats` reported
+ * over HTTP (the same correlation #401 uses to keep a proxy on the port from
+ * passing itself off as ComfyUI). Anything unreadable or non-matching yields no
+ * identity at all, and the caller falls back to evidence that refuses rather than
+ * guesses.
+ */
+function resolveCorroboratedIdentity(
+  pid: number,
+  argv: string[],
+): ProcessIdentity | undefined {
+  if (argv.length === 0) return undefined;
+  const identity = resolveProcessIdentity(pid);
+  if (!identity?.startedAt) return undefined;
+  if (!commandLineMatchesArgv(identity.commandLine, argv)) {
+    logger.warn(
+      "Not binding to PID: the OS's command line for it does not match the argv ComfyUI reported",
+      { pid, commandLine: identity.commandLine ?? "(unavailable)" },
+    );
+    return undefined;
+  }
+  return identity;
 }
 
 /**
@@ -751,11 +791,14 @@ function resolveProcessIdentity(pid: number): { startedAt?: string } | undefined
 function captureVerifiedLiveEnv(
   pid: number,
   startedAt: string | undefined,
+  argv: string[],
 ): NodeJS.ProcessEnv | undefined {
   if (!startedAt) return undefined;
   const env = resolveLiveProcessEnv(pid);
   if (!env) return undefined;
-  const after = resolveProcessIdentity(pid)?.startedAt;
+  // Re-verify with the SAME corroboration used to bind in the first place, so a
+  // recycled pid cannot satisfy the re-check just by agreeing with itself.
+  const after = resolveCorroboratedIdentity(pid, argv)?.startedAt;
   if (!after || after !== startedAt) {
     logger.warn(
       "Discarding the captured ComfyUI environment: the pid's identity changed while reading it",
@@ -801,13 +844,24 @@ function processIdentityStillValid(
     }
   }
   if (info.startedAt) {
-    const now = resolveProcessIdentity(info.pid)?.startedAt;
-    if (now && now !== info.startedAt) {
+    // Same corroboration as the binding: a changed creation time OR a command line
+    // that no longer matches the server's argv both mean this number is not the
+    // process we identified.
+    const now = resolveProcessIdentity(info.pid);
+    if (now?.startedAt && now.startedAt !== info.startedAt) {
       return {
         ok: false,
         reason:
           `PID ${info.pid} is no longer the ComfyUI process we identified (its creation time ` +
           "changed), so the number has been reused by a different program and must not be killed",
+      };
+    }
+    if (now?.commandLine && !commandLineMatchesArgv(now.commandLine, info.argv)) {
+      return {
+        ok: false,
+        reason:
+          `PID ${info.pid} is running something other than the ComfyUI we identified ` +
+          `(its command line no longer matches that server's arguments), so it must not be killed`,
       };
     }
   }
@@ -1266,11 +1320,16 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
   // Same live-only window for the ENVIRONMENT (#776): read it now, while the pid
   // is guaranteed alive, so a relaunch can reproduce the launcher environment the
   // server was actually started with instead of substituting the orchestrator's.
-  // The pid's IDENTITY (creation time), taken at the same moment as the pid itself
-  // so everything downstream can prove the number still denotes THIS process.
-  const startedAt = desktop ? undefined : resolveProcessIdentity(pid)?.startedAt;
+  // The pid's IDENTITY (creation time), CORROBORATED against the argv the server
+  // itself reported — so a pid recycled between the port lookup and this read is
+  // never bound to, however self-consistent its own later re-reads would be.
+  const startedAt = desktop
+    ? undefined
+    : resolveCorroboratedIdentity(pid, argv)?.startedAt;
   // Bound to that identity - never adopted from a pid we cannot still prove.
-  const liveEnv = desktop ? undefined : captureVerifiedLiveEnv(pid, startedAt);
+  const liveEnv = desktop
+    ? undefined
+    : captureVerifiedLiveEnv(pid, startedAt, argv);
 
   return {
     pid,
@@ -1296,14 +1355,6 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
     );
   }
   logger.info("Stopping ComfyUI...");
-  detachSupervisor();
-  // The server we may have launched is going away — clear the shares-our-env flag so
-  // a differently-launched successor doesn't inherit env-trust it shouldn't (#633 P1b).
-  // Forget the recorded interpreter too: a stop was requested, so the launch record
-  // must not outlive the process it describes (#401).
-  recordedLaunchChild = undefined;
-  resetLocalComfyUILaunchState();
-  clearLaunchedInterpreter();
 
   // Gather info before we kill it (or reuse the caller's pre-validated info so a
   // relaunch preflight in restartComfyUI is not discarded).
@@ -1329,6 +1380,11 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
   // and the OS recycled the number, killing it would destroy an unrelated program.
   // Refuse instead - nothing has been touched yet, so this costs a restart, never
   // the server.
+  //
+  // ORDERING IS LOAD-BEARING (coordinator gate): this runs BEFORE the supervisor
+  // teardown below. A refusal leaves a still-RUNNING server, and tearing down its
+  // crash supervision first would silently disarm auto-restart for a server we
+  // then declined to touch — turning a safe refusal into a later lost server.
   const identity = processIdentityStillValid(info);
   if (!identity.ok) {
     return {
@@ -1339,6 +1395,16 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
       has_restart_info: false,
     };
   }
+
+  // Past this point the stop is COMMITTED — only now may we drop supervision.
+  detachSupervisor();
+  // The server we may have launched is going away — clear the shares-our-env flag so
+  // a differently-launched successor doesn't inherit env-trust it shouldn't (#633 P1b).
+  // Forget the recorded interpreter too: a stop was requested, so the launch record
+  // must not outlive the process it describes (#401).
+  recordedLaunchChild = undefined;
+  resetLocalComfyUILaunchState();
+  clearLaunchedInterpreter();
 
   // Save for later start
   lastProcessInfo = info;
@@ -1945,7 +2011,17 @@ export async function restartComfyUI(): Promise<RestartResult> {
     // Reached only when startComfyUI reported started:true — i.e. the healthy
     // listener is ours, or ownership was undecidable. A listener that is provably
     // NOT ours returns started:false and is handled in the branch above.
-    message: `ComfyUI restarted successfully. ${startResult.message}`,
+    //
+    // "restarted successfully" is a claim of PROOF, so it is reserved for the case
+    // where the port owner was actually matched to the process we launched. When
+    // ownership could not be determined the server is genuinely up and the flags
+    // stay positive (denying that would mislabel every ordinary restart on hosts
+    // where the port-owner lookup is unavailable), but the sentence must not
+    // ATTRIBUTE that healthy listener to this restart (coordinator gate).
+    message:
+      (startResult.listener_ownership === "unconfirmed"
+        ? "ComfyUI is up and ready after the restart, though this call's own process could not be confirmed as the one serving the port. "
+        : "ComfyUI restarted successfully. ") + startResult.message,
     auto_restart: startResult.auto_restart,
     launch_env: startResult.launch_env,
     listener_ownership: startResult.listener_ownership,

@@ -583,9 +583,12 @@ describe("restart_comfyui — irreproducible launcher environments (#776)", () =
       PINOKIO_APP_NAME: "comfy",
     };
     __processControlTestHooks.setLiveEnvResolver(() => ({ ...LIVE_ENV }));
-    // A STABLE process identity across the read — the capture is only adopted
-    // when the pid provably still denotes the same process.
-    __processControlTestHooks.setProcessIdentityResolver(() => ({ startedAt: "t1" }));
+    // A STABLE identity that also CORROBORATES the server's own argv — the capture
+    // is only adopted when the pid provably still denotes that same ComfyUI.
+    __processControlTestHooks.setProcessIdentityResolver(() => ({
+      startedAt: "t1",
+      commandLine: `${PINOKIO_PY} ${PINOKIO_MAIN} --port 8188`,
+    }));
     mockLivePortThenFree();
     spawnCapturingChildren();
     vi.stubGlobal(
@@ -607,11 +610,14 @@ describe("restart_comfyui — irreproducible launcher environments (#776)", () =
 });
 
 describe("restart_comfyui — a PID is not a process identity (#776)", () => {
+  const PINOKIO_ARGV = [PINOKIO_MAIN, "--port", "8188"];
+  const PLAIN_ARGV = [PLAIN_MAIN, "--port", "8188"];
+
   function usePinokioInstall(): void {
     mockFindComfyuiPython.mockReturnValue(PINOKIO_PY);
     mockLiveRootFromArgv.mockReturnValue(PINOKIO_APP);
     mockGetSystemStats.mockResolvedValue({
-      system: { argv: [PINOKIO_MAIN, "--port", "8188"] },
+      system: { argv: PINOKIO_ARGV },
     });
     mockExistsSync.mockImplementation((p: string) => {
       const s = String(p);
@@ -624,13 +630,22 @@ describe("restart_comfyui — a PID is not a process identity (#776)", () => {
     });
   }
 
-  /** An identity reader that returns the given stamps in call order. */
-  function identitySequence(stamps: string[]): void {
+  /**
+   * An identity reader returning the given (creation-time, command-line) pairs in
+   * call order. A plain string is shorthand for "this stamp, still running the
+   * ComfyUI we identified".
+   */
+  function identitySequence(
+    steps: Array<string | { startedAt: string; commandLine: string }>,
+    matchingArgv: string[],
+  ): void {
     let i = 0;
     __processControlTestHooks.setProcessIdentityResolver(() => {
-      const stamp = stamps[Math.min(i, stamps.length - 1)];
+      const step = steps[Math.min(i, steps.length - 1)];
       i++;
-      return { startedAt: stamp };
+      return typeof step === "string"
+        ? { startedAt: step, commandLine: matchingArgv.join(" ") }
+        : step;
     });
   }
 
@@ -645,7 +660,8 @@ describe("restart_comfyui — a PID is not a process identity (#776)", () => {
       PATH: "/some/unrelated/process/path",
       NOT_COMFYUI: "1",
     }));
-    identitySequence(["t1", "t2"]); // lookup, then re-verify after the env read
+    // lookup, then the re-verify after the env read sees a different process.
+    identitySequence(["t1", "t2"], PINOKIO_ARGV);
     mockLivePortThenFree();
     spawnCapturingChildren();
     const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
@@ -654,6 +670,34 @@ describe("restart_comfyui — a PID is not a process identity (#776)", () => {
 
     expect(result.stopped).toBe(false);
     expect(result.started).toBe(false);
+    expect(result.message).toMatch(/refusing to restart/i);
+    expect(result.message).toMatch(/Pinokio/);
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(killSpy).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  });
+
+  it("does NOT bind to a PID whose command line does not match the argv ComfyUI reported", async () => {
+    // The gap a creation-time stamp alone cannot close: if the pid was recycled
+    // BEFORE we ever read its stamp, every later re-read agrees with itself about
+    // the WRONG process. The independent signal is the server's own /system_stats
+    // argv — an unrelated program on that number cannot match it. Same proof as
+    // above: this Pinokio install is only restartable via a live environment, so
+    // rejecting the binding must drop it back to the refusal.
+    usePinokioInstall();
+    __processControlTestHooks.setLiveEnvResolver(() => ({ NOT_COMFYUI: "1" }));
+    __processControlTestHooks.setProcessIdentityResolver(() => ({
+      startedAt: "t9",
+      commandLine: "/usr/bin/some-unrelated-daemon --serve",
+    }));
+    mockLivePortThenFree();
+    spawnCapturingChildren();
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(false);
     expect(result.message).toMatch(/refusing to restart/i);
     expect(result.message).toMatch(/Pinokio/);
     expect(mockSpawn).not.toHaveBeenCalled();
@@ -704,7 +748,7 @@ describe("restart_comfyui — a PID is not a process identity (#776)", () => {
     // The stronger identity: the number is still listening, but it is not the
     // process we identified (#650's pid + creation-time identity).
     usePlainInstallForIdentity();
-    identitySequence(["t1", "t2"]); // lookup, then the pre-kill re-verify
+    identitySequence(["t1", "t2"], PLAIN_ARGV); // lookup, then the pre-kill re-verify
     mockLivePortThenFree();
     spawnCapturingChildren();
     const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
@@ -725,7 +769,7 @@ describe("restart_comfyui — a PID is not a process identity (#776)", () => {
     mockFindComfyuiPython.mockReturnValue(PLAIN_PY);
     mockLiveRootFromArgv.mockReturnValue(PLAIN_BASE);
     mockGetSystemStats.mockResolvedValue({
-      system: { argv: [PLAIN_MAIN, "--port", "8188"] },
+      system: { argv: PLAIN_ARGV },
     });
     mockExistsSync.mockImplementation((p: string) => {
       const s = String(p);
@@ -864,6 +908,48 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
     killSpy.mockRestore();
   });
 
+  it("claims a successful restart ONLY when the port owner is matched to the process we launched", async () => {
+    // The one case where "restarted successfully" is a claim we can back: the
+    // mapped port owner IS our child's pid.
+    usePlainInstall();
+    spawnCapturingChildren(4321);
+    let killed = false;
+    let relaunched = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill|pkill|\bkill\b/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (/netstat/i.test(cmd)) {
+        return killed && !relaunched
+          ? ""
+          : "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed && !relaunched) throw new Error("not listening");
+        return "p4321\nn127.0.0.1:8188\n";
+      }
+      return "";
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        relaunched = true;
+        return { ok: true } as Response;
+      }),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.started).toBe(true);
+    expect(result.listener_ownership).toBe("ours");
+    expect(result.message).toMatch(/restarted successfully/i);
+    expect(result.message).not.toMatch(/could not be confirmed/i);
+
+    killSpy.mockRestore();
+  });
+
   it("says so plainly when listener ownership is UNDECIDABLE — without denying a restart that worked", async () => {
     // Unmappable port owner + a still-alive launched child. Reporting this as a
     // FAILED restart would mislabel every ordinary restart on hosts where the
@@ -898,6 +984,9 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
     expect(result.ready).toBe(true);
     expect(result.listener_ownership).toBe("unconfirmed");
     expect(result.message).toMatch(/could not be confirmed as the process this call launched/i);
+    // ...and the headline must not ATTRIBUTE the healthy listener to this restart.
+    expect(result.message).not.toMatch(/restarted successfully/i);
+    expect(result.message).toMatch(/could not be confirmed as the one serving the port/i);
     // THE POINT of a string state: `undefined` would be dropped by JSON.stringify,
     // leaving a payload indistinguishable from one that never carried the field —
     // i.e. from a plain success. The uncertainty has to reach the consumer.
