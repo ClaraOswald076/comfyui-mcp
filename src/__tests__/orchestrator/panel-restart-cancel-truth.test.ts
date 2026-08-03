@@ -535,6 +535,30 @@ describe("panel_restart_comfyui — Pinokio-style refuse-safe preflight (#742)",
     expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
   });
 
+  it("a PASSING preflight retargeted mid-await to a SAFE install still does NOT dispatch (r10)", async () => {
+    // The preflight returns ok — but the runtime config retargeted DURING its
+    // await, so the pass may have validated a DIFFERENT (safe) install while
+    // the tab still fronts the original instance. A pass for a different
+    // install must never bless a stop of the tab-fronted one: its relaunch is
+    // UNPROVEN → refuse, never dispatch.
+    __panelToolsTestHooks.setLocalRestartPreflight(async () => {
+      hoistedConfig.configBase.value = "http://127.0.0.1:9999"; // retarget mid-await
+      return { ok: true }; // a pass — possibly for the WRONG install
+    });
+    __panelToolsTestHooks.setHealthProbe(async () => "down");
+    const { ctx, sends } = makeCtx({ confirm: "yes", frontsBoot: true });
+
+    const out = parse(await restartTool().handler({}, ctx));
+    const note = String(out.note ?? "");
+
+    expect(out.refused).toBe(true);
+    expect(note).toMatch(/Refusing to restart/i);
+    expect(note).toMatch(/still running/i);
+    expect(note).toMatch(/settle/i);
+    // CRITICAL: no stop/reboot is sent to the unproven tab-fronted instance.
+    expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
+  });
+
   it("does NOT consult the preflight when the tab doesn't provably front our boot instance", async () => {
     // The preflight guards OUR local boot instance only. A reboot bound for a
     // different/remote instance proceeds exactly as before (dispatched +

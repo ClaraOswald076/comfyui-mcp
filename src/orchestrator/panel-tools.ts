@@ -5685,47 +5685,75 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // downstream may reuse it (r7).
         const preflightHealthBase = captureRebootHealthBase(ctx);
         if (preflightHealthBase != null && sameHttpBase(getComfyUIBaseUrl(), preflightHealthBase)) {
+          // Snapshot the mutable config base AT THE DECISION (it equals the
+          // tab-fronted base right now, per the gate above) so a mid-await
+          // retarget is detectable afterward (r10).
+          const preflightConfigBase = getComfyUIBaseUrl();
           const preflight = await (localRestartPreflightOverride ?? preflightLocalRestart)();
-          if (!preflight.ok) {
-            // r8: the preflight AWAIT makes the pre-decision binding STALE — a
-            // rebind/retarget during it would let this refusal's "ComfyUI is
-            // still running" describe a target that was never validated.
-            // Re-heal and re-capture BEFORE composing anything.
+          // r8/r9/r10: the preflight AWAIT makes the pre-decision captures
+          // STALE — and the preflight itself reads MUTABLE config (target URL,
+          // port, COMFYUI_PATH) throughout, so a config retarget during the
+          // await can re-point the whole assessment at a DIFFERENT install
+          // while the tab still fronts the original one. Re-heal and
+          // re-capture BEFORE trusting the result either way. The guarantee
+          // that must hold: a stop/reboot is only ever sent when the preflight
+          // validated THE instance the dispatch will cycle.
+          ctx.ensureReachable?.();
+          const postPreflightHealthBase = captureRebootHealthBase(ctx);
+          const tabFrontsSameInstance =
+            postPreflightHealthBase != null &&
+            sameHttpBase(preflightHealthBase, postPreflightHealthBase);
+          const configStable = sameHttpBase(getComfyUIBaseUrl(), preflightConfigBase);
+          if (!configStable && tabFrontsSameInstance) {
+            // r10: the target config moved MID-CHECK, so the preflight result
+            // — pass OR fail — cannot vouch for the tab-fronted instance (a
+            // PASS may have validated a different, safe install; it must never
+            // bless a stop of this one). Its relaunch is UNPROVEN → refuse; an
+            // instance with an unproven relaunch is never sent a stop.
+            return ok({
+              rebooting: false,
+              ready: false,
+              confirmed_cycle: false,
+              refused: true,
+              note:
+                "Refusing to restart ComfyUI: the ComfyUI target configuration changed " +
+                "while the restart safety check was running, so the check cannot vouch " +
+                "for a safe relaunch of the instance this panel fronts. A stop is never " +
+                "sent to an instance whose relaunch is unproven — ComfyUI was NOT " +
+                "stopped (it is still running). Let the target settle, then retry " +
+                "panel_restart_comfyui.",
+            });
+          }
+          if (!preflight.ok && tabFrontsSameInstance) {
             // r9: the danger proof follows the INSTANCE the tab fronts, NOT the
             // mutable runtime config — a config-only retarget mid-await must
             // not wash out the proof that the tab-fronted boot instance is
-            // unrelaunchable. When the tab STILL fronts that same instance the
-            // failed preflight just proved dangerous, the proof is still valid
-            // and the refusal stands: an instance proven unrelaunchable is
-            // NEVER sent a stop/reboot, regardless of config/tab shuffling
-            // mid-flight. Only a genuinely different, unconfirmable target
-            // falls through to the honest-unconfirmed dispatch (nothing was
-            // ever proved dangerous for it — and nothing was ever stopped,
-            // the preflight never stops anything).
-            ctx.ensureReachable?.();
-            const refusalHealthBase = captureRebootHealthBase(ctx);
-            const sameProvenDangerousInstance =
-              refusalHealthBase != null &&
-              sameHttpBase(preflightHealthBase, refusalHealthBase);
-            if (sameProvenDangerousInstance) {
-              return ok({
-                rebooting: false,
-                ready: false,
-                confirmed_cycle: false,
-                refused: true,
-                note:
-                  `Refusing to restart ComfyUI: ${preflight.reason} This looks like an ` +
-                  "externally-managed install (e.g. Pinokio): a restart from here would STOP " +
-                  "ComfyUI and nothing would bring it back automatically, so it was refused " +
-                  "BEFORE anything was stopped — ComfyUI is still running. Restart it from the " +
-                  "launcher that owns it (e.g. Pinokio's own controls), or point COMFYUI_PATH " +
-                  "at the live install so a relaunch can be proven and use restart_comfyui.",
-              });
-            }
-            // Genuinely different / unconfirmable target → fall through to the
-            // dispatch path (re-captured again below, r7); no refusal is
-            // composed here.
+            // unrelaunchable. The tab STILL fronts that same instance, so the
+            // proof is still valid and the refusal stands: an instance proven
+            // unrelaunchable is NEVER sent a stop/reboot, regardless of
+            // config/tab shuffling mid-flight. Only a genuinely different,
+            // unconfirmable target falls through to the honest-unconfirmed
+            // dispatch (nothing was ever proved dangerous for it — and nothing
+            // was ever stopped, the preflight never stops anything).
+            return ok({
+              rebooting: false,
+              ready: false,
+              confirmed_cycle: false,
+              refused: true,
+              note:
+                `Refusing to restart ComfyUI: ${preflight.reason} This looks like an ` +
+                "externally-managed install (e.g. Pinokio): a restart from here would STOP " +
+                "ComfyUI and nothing would bring it back automatically, so it was refused " +
+                "BEFORE anything was stopped — ComfyUI is still running. Restart it from the " +
+                "launcher that owns it (e.g. Pinokio's own controls), or point COMFYUI_PATH " +
+                "at the live install so a relaunch can be proven and use restart_comfyui.",
+            });
           }
+          // Otherwise: a PASS with a stable config (proven safe for THE
+          // tab-fronted instance — proceed), or the tab now fronts a genuinely
+          // different, unconfirmable target (nothing provable about it — the
+          // dispatch path below treats that honestly, r6/r7). Nothing was
+          // stopped in any case — the preflight never stops anything.
         }
         // r7: the preflight AWAIT sits between the binding capture and the dispatch,
         // breaking the no-await invariant above — a tab/connection rebind during
