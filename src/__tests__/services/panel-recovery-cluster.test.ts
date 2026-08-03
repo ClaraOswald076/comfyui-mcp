@@ -563,6 +563,36 @@ describe("update no longer contradicts status on a registry-zip install (#771)",
     expect((err as Error).message).not.toMatch(/Panel updated/);
   });
 
+  it("INSTALL/REINSTALL never report an unrequested downgrade as having 'advanced'", async () => {
+    // The update path decides direction in classifyPanelUpdate; install and
+    // reinstall have their own movement test, and it had the same hole.
+    writePanelPack(PANEL_DIR(), "0.11.40");
+    const h = makeDeps({ withoutSwapOps: true });
+    h.deps.reinstall = async () => {
+      writePanelPack(PANEL_DIR(), "0.11.38");
+      return { mechanism: "manager-http", message: "reinstalled", details: {} };
+    };
+    const err = await runPanelActionInner("reinstall", h.deps).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect((err as Error).message).toMatch(/did NOT go forward/);
+    expect((err as Error).message).not.toMatch(/advanced to/);
+  });
+
+  it("…but an EXPLICITLY requested older version is honoured, and labelled a downgrade", async () => {
+    // install_custom_node(version='0.11.38') is redirected here precisely so the
+    // caller gets what they asked for. Refusing that would break the redirect.
+    writePanelPack(PANEL_DIR(), "0.11.40");
+    const h = makeDeps({ withoutSwapOps: true });
+    h.deps.reinstall = async () => {
+      writePanelPack(PANEL_DIR(), "0.11.38");
+      return { mechanism: "manager-http", message: "reinstalled", details: {} };
+    };
+    const result = await runPanelActionInner("reinstall", h.deps, { version: "0.11.38" });
+    expect(result.installedVersion).toBe("0.11.38");
+    expect(result.message).toMatch(/DOWNGRADED, as explicitly requested/);
+    expect(result.message).not.toMatch(/advanced to/);
+  });
+
   it("classifyPanelUpdate itself calls a regression 'downgraded', not 'updated'", async () => {
     const { classifyPanelUpdate } = await import("../../services/panel-installer.js");
     expect(
@@ -815,6 +845,42 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     expect(note).toMatch(/RESTORED/);
     expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
     expect(existsSync(join(root, ".comfyui-agent-panel.swap.json"))).toBe(false);
+  });
+
+  it("a PIN blocks the status-path repair too — a restore is still a mutation", async () => {
+    const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1`);
+    writePanelPack(backupDir, "0.11.34");
+    writeFileSync(
+      join(root, ".comfyui-agent-panel.swap.json"),
+      JSON.stringify({ dir: PANEL_DIR(), backupDir, staging: "x", startedAt: Date.now() }),
+    );
+    const h = makeDeps({});
+    h.deps.readPin = () => ({ pinned: true, source: "settings" as const, version: "0.11.34" });
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    // The repair is refused (it swallows and reports nothing) and NOTHING moved.
+    expect(await repairInterruptedPanelSwap(h.deps)).toBeUndefined();
+    expect(existsSync(PANEL_DIR())).toBe(false);
+    expect(existsSync(backupDir)).toBe(true);
+    expect(existsSync(join(root, ".comfyui-agent-panel.swap.json"))).toBe(true);
+  });
+
+  it("a retarget aborts the status-path repair rather than restoring the wrong tree", async () => {
+    const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1`);
+    writePanelPack(backupDir, "0.11.34");
+    writeFileSync(
+      join(root, ".comfyui-agent-panel.swap.json"),
+      JSON.stringify({ dir: PANEL_DIR(), backupDir, staging: "x", startedAt: Date.now() }),
+    );
+    const h = makeDeps({});
+    const pinned = await pinPanelBase(h.deps);
+    generation.value++; // a retarget landed after the freeze
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    expect(await repairInterruptedPanelSwap(pinned)).toBeUndefined();
+    expect(existsSync(PANEL_DIR())).toBe(false);
   });
 
   it("the on-load auto-install repairs an interrupted swap before doing anything else", async () => {

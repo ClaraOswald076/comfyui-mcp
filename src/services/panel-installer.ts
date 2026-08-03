@@ -623,6 +623,34 @@ function pinnedBaseOf(deps: PanelInstallerDeps): string | undefined {
   return (deps as MarkedDeps)[PINNED_BASE];
 }
 
+/**
+ * Refuse if the ComfyUI target changed since this dep set was frozen.
+ *
+ * Shared by EVERY path that mutates the panel, not just the explicit ones. The
+ * automatic paths need it most: the on-load ensure and the interrupted-swap
+ * repair both freeze a local base and then act on it, and a hello retarget can
+ * land in between — restoring or installing into tree A while the Manager
+ * request, and the answer we hand back, belong to B.
+ *
+ * A dep set with no pinned generation was never frozen (a direct call with
+ * injected deps), so there is nothing to compare and nothing to refuse.
+ */
+function assertPinnedTarget(
+  deps: PanelInstallerDeps,
+  action: string,
+  stage: string,
+): void {
+  const frozen = pinnedGenerationOf(deps);
+  if (frozen === undefined || panelTargetGeneration() === frozen) return;
+  throw new PanelInstallError(
+    `Panel ${action} ABORTED ${stage}: the ComfyUI this orchestrator targets changed ` +
+      `while the operation was in flight, so the local directory it was working in ` +
+      `(${deps.comfyuiPath() ?? "unresolved"}) may no longer belong to the install this ` +
+      `result would describe. NOT acting on, or reporting, a possibly-wrong tree. ` +
+      `Re-run install_panel(action='status'), then retry.`,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Version pin
 //
@@ -1208,6 +1236,10 @@ async function ensureInner(deps: PanelInstallerDeps): Promise<EnsureResult> {
   // and already holds the op lock, so it is where the repair belongs.
   const ensureBase = deps.comfyuiPath();
   if (ensureBase) {
+    // Same target binding the explicit mutations use: this runs unattended on
+    // load, and the hello that triggers it retargets asynchronously, so a
+    // retarget can land between the freeze and this restore.
+    assertPinnedTarget(deps, "auto-install", "before repairing an interrupted swap");
     const repaired = reconcilePanelSwap(ensureBase, deps, { repair: true });
     if (repaired.note) {
       logger.warn(`[panel] on load:${repaired.note}`);
@@ -1271,6 +1303,7 @@ async function ensureInner(deps: PanelInstallerDeps): Promise<EnsureResult> {
         reason: `panel version pin in force — ${describePanelPin(latePin)}`,
       };
     }
+    assertPinnedTarget(deps, "auto-install", "before the ComfyUI-Manager install");
     await deps.install({ id: PANEL_REGISTRY_ID, version: PANEL_VERSION });
     // #639 — VERIFY it actually landed (fresh re-read); never log "installed"
     // from the Manager result alone (a stale 3.x no-op drains the queue trivially).
@@ -1301,6 +1334,7 @@ async function ensureInner(deps: PanelInstallerDeps): Promise<EnsureResult> {
           `update ComfyUI-Manager, then restart ComfyUI.`,
       };
     }
+    assertPinnedTarget(deps, "auto-install", "before reporting the install");
     return {
       action: "installed",
       reason: `Installed ${PANEL_REGISTRY_ID} (${post.version}).`,
@@ -1454,7 +1488,19 @@ export async function repairInterruptedPanelSwap(
     // Cheap pre-checks, no lock: is there anything to repair at all?
     if (!pinned.existsSync(swapJournalPath(base))) return undefined;
     return await withPanelOpLock(
-      async () => reconcilePanelSwap(base, pinned, { repair: true }).note,
+      async () => {
+        // A PIN IS A PROMISE, and this repair MOVES a directory. "Nothing moves
+        // the panel while a pin is in force" has to include a well-intentioned
+        // restore — a pinned user who was interrupted gets the state reported
+        // (panelStatus says exactly where the copy is), not rearranged for them.
+        assertNotPinned("repair", pinned);
+        // And the target must still be the one we froze against: a retarget
+        // landing here would restore tree A while the caller is asking about B.
+        assertPinnedTarget(pinned, "repair", "before restoring the previous panel");
+        const outcome = reconcilePanelSwap(base, pinned, { repair: true });
+        assertPinnedTarget(pinned, "repair", "before reporting the restore");
+        return outcome.note;
+      },
       { timeoutMs: ENSURE_LOCK_WAIT_MS },
     );
   } catch (err) {
@@ -3417,6 +3463,36 @@ export async function runPanelActionInner(
   // disk movement is checked FIRST — the ComfyUI-Manager queue counts are
   // queue-WIDE (not task-correlated), so they must NEVER veto a change the disk
   // already proves.
+  //
+  // AND MOVED IS NOT FORWARD. Same rule as the update path, which decides this
+  // in classifyPanelUpdate: a Manager that resolves an older build and lands it
+  // would otherwise be reported as the pack having "advanced to" a version
+  // BELOW the one it replaced. The one legitimate backwards move is a caller who
+  // asked for that exact version — `install_custom_node(version='0.11.20')` is
+  // redirected here precisely so it gets what it asked for — so an explicit
+  // request is honoured, and labelled as the downgrade it is.
+  const regressed =
+    !!previousVersion &&
+    !!post.version &&
+    SEMVER_RE.test(previousVersion.trim()) &&
+    SEMVER_RE.test(post.version.trim()) &&
+    compareSemver(post.version, previousVersion) < 0;
+  if (regressed) {
+    const requested = opts.version?.trim();
+    if (!requested || requested !== post.version) {
+      throw new PanelInstallError(
+        `Panel ${action} did NOT go forward: the pack at ${post.dir ?? "custom_nodes"} ` +
+          `is now ${post.version}, which is OLDER than the ${previousVersion} that was ` +
+          `installed before${
+            requested ? ` (you asked for "${requested}", which is not what landed)` : ""
+          }. ComfyUI-Manager resolved and applied an earlier build. NOT reporting this ` +
+          `as a completed ${action} — you are now on an older panel than you started ` +
+          `with. Update ComfyUI-Manager on the host and retry, or reinstall the panel ` +
+          `from source, then RESTART ComfyUI.`,
+      );
+    }
+  }
+
   const versionMoved =
     !!previousVersion && !!post.version && post.version !== previousVersion;
   const revMoved =
@@ -3464,7 +3540,11 @@ export async function runPanelActionInner(
     restartRequired: true,
     message:
       `Panel ${action} applied via ComfyUI-Manager: pack ${
-        wasPresent ? "advanced to" : "installed on disk at"
+        wasPresent
+          ? regressed
+            ? "was DOWNGRADED, as explicitly requested, to"
+            : "advanced to"
+          : "installed on disk at"
       } ${PANEL_REGISTRY_ID} ${post.version}. RESTART ComfyUI to load the panel node.`,
     previousVersion,
     installedVersion: post.version,
