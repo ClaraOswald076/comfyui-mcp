@@ -89,6 +89,7 @@ import {
   primePanelBase,
   recordPanelDiskObservation,
   resolvePanelBase,
+  verifiedPanelDiskVersion,
 } from "../../services/panel-workspace.js";
 
 function pyproject(version: string, name = PANEL_REGISTRY_ID): string {
@@ -354,6 +355,37 @@ describe("disk-current but handshake-old is diagnosed as a stale tab, not a stal
     await panelStatus(); // custom_nodes is empty in this fixture
     expect(lastPanelDiskObservation()).toBeUndefined();
   });
+
+  // The failure direction that matters: telling a genuinely-behind user their
+  // install is fine sends them straight back into the loop. The recorded
+  // version is therefore never trusted on its own — it is only a POINTER, and
+  // the version is re-read at the moment of use.
+  it("the recorded version is re-read from disk, not replayed", async () => {
+    writePanelPack(PANEL_DIR(), "0.11.38");
+    recordPanelDiskObservation("0.11.38", PANEL_DIR());
+    expect(verifiedPanelDiskVersion()).toBe("0.11.38");
+
+    // The pack is downgraded behind our back — the stale record must not stand.
+    writePanelPack(PANEL_DIR(), "0.11.20");
+    expect(verifiedPanelDiskVersion()).toBe("0.11.20");
+  });
+
+  it("a pack REMOVED after the observation yields no version at all", () => {
+    writePanelPack(PANEL_DIR(), "0.11.38");
+    recordPanelDiskObservation("0.11.38", PANEL_DIR());
+    rmSync(PANEL_DIR(), { recursive: true, force: true });
+    expect(verifiedPanelDiskVersion()).toBeUndefined();
+  });
+
+  it("a dir that is no longer the PANEL yields no version", () => {
+    mkdirSync(PANEL_DIR(), { recursive: true });
+    writeFileSync(
+      join(PANEL_DIR(), "pyproject.toml"),
+      `[project]\nname = "something-else"\nversion = "9.9.9"\n`,
+    );
+    recordPanelDiskObservation("0.11.38", PANEL_DIR());
+    expect(verifiedPanelDiskVersion()).toBeUndefined();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -575,6 +607,38 @@ describe("the panel's ComfyUI root is the RUNNING server's (#766, #769)", () => 
     const resolved = await resolvePanelBase();
     expect(resolved.base).toBeUndefined();
     expect(resolved.source).toBe("none");
+  });
+
+  it("the base is FROZEN for the whole operation — it cannot drift mid-update", async () => {
+    // The live-base resolution is cached with a short TTL and falls back to the
+    // configured base when it expires. A ComfyUI-Manager operation can easily
+    // outlive that. If the base were re-read per call, the pre-op detection
+    // could inspect tree A and the post-op verification tree B — and if B held
+    // a newer panel, the "did the pack move?" proof would compare two different
+    // directories and bless a success that never happened. That is the
+    // fabricated-success class this file exists to prevent.
+    const treeA = join(root, "A");
+    const treeB = join(root, "B");
+    mkdirSync(join(treeA, "custom_nodes"), { recursive: true });
+    mkdirSync(join(treeB, "custom_nodes"), { recursive: true });
+    writePanelPack(join(treeA, "custom_nodes", PANEL_REGISTRY_ID), "0.11.34");
+    // Tree B already holds a NEWER panel — the trap. Nothing touches it, so any
+    // "updated" verdict read from it would be pure fiction.
+    writePanelPack(join(treeB, "custom_nodes", PANEL_REGISTRY_ID), "0.11.99");
+
+    const h = makeDeps({ withoutSwapOps: true, updateThrows: "manager cannot resolve it" });
+    // A dep set whose base MOVES on every read, simulating the cache expiring.
+    let reads = 0;
+    h.deps.comfyuiPath = () => (reads++ === 0 ? treeA : treeB);
+
+    const err = await runPanelActionInner("update", h.deps).catch((e: Error) => e);
+    // Pinned: everything after the first read still describes tree A, so the
+    // op fails honestly instead of claiming tree B's 0.11.99 as an update.
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect((err as Error).message).toContain(treeA);
+    expect((err as Error).message).not.toContain("0.11.99");
+    expect(readFileSync(join(treeA, "custom_nodes", PANEL_REGISTRY_ID, "pyproject.toml"), "utf-8"))
+      .toContain("0.11.34");
   });
 
   it("the real defaultDeps read through the live-first resolver", async () => {

@@ -23,6 +23,25 @@ import {
   clearPanelDiskObservation,
   recordPanelDiskObservation,
 } from "../../services/panel-workspace.js";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+/** A real on-disk panel pack, since the skew resolver re-reads the pyproject. */
+const tempPacks: string[] = [];
+function writeTempPanelPack(version: string): string {
+  const dir = join(mkdtempSync(join(tmpdir(), "cmcp-bundle-")), "comfyui-agent-panel");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, "pyproject.toml"),
+    `[project]\nname = "comfyui-agent-panel"\nversion = "${version}"\n`,
+  );
+  tempPacks.push(dir);
+  return dir;
+}
+afterEach(() => {
+  for (const d of tempPacks.splice(0)) rmSync(d, { recursive: true, force: true });
+});
 
 // #570 P0c — classifier that decides which commands must pass the enforcement+stamp gate.
 describe("requiresWorkflowStampEnforcement (#570 P0c)", () => {
@@ -1748,7 +1767,11 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     // install_panel is what closed the loop: it correctly reports nothing to do.
     // The orchestrator runs the panel sync on this same hello, so the on-disk
     // version is observed alongside the handshake — enough to name it.
-    recordPanelDiskObservation("0.11.38", "/comfy/custom_nodes/comfyui-agent-panel");
+    // A REAL pack on disk: the skew resolver re-reads the pyproject at the
+    // moment of use rather than trusting the recorded version, so a fabricated
+    // path would (correctly) prove nothing.
+    const packDir = writeTempPanelPack("0.11.38");
+    recordPanelDiskObservation("0.11.38", packDir);
     try {
       const stale = new WebSocket(`ws://127.0.0.1:${port}`);
       await new Promise<void>((res, rej) => {
@@ -1783,7 +1806,8 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     // The guard on the branch above: a stale-install user must not be told their
     // install is fine. Only a disk version at or above the floor earns the
     // refresh diagnosis.
-    recordPanelDiskObservation("0.11.20", "/comfy/custom_nodes/comfyui-agent-panel");
+    const packDir = writeTempPanelPack("0.11.20");
+    recordPanelDiskObservation("0.11.20", packDir);
     try {
       const behind = new WebSocket(`ws://127.0.0.1:${port}`);
       await new Promise<void>((res, rej) => {

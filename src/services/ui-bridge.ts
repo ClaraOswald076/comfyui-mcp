@@ -22,7 +22,7 @@ import {
   describePanelUpdateRecovery,
   type PanelBundleSkew,
 } from "./panel-recovery.js";
-import { lastPanelDiskObservation } from "./panel-workspace.js";
+import { verifiedPanelDiskVersion } from "./panel-workspace.js";
 import { compareSemver, detectInstallMode } from "./self-update.js";
 
 export const DEFAULT_BRIDGE_PORT = 9101;
@@ -315,18 +315,23 @@ export function requiredPanelVersion(): string {
  * these must hold, and any unknown resolves to "no skew" (fall through to the
  * ordinary update guidance):
  *
- *   - a RECENT on-disk observation exists (the sync ran; it is not a guess);
- *   - its version PARSES and is >= the required floor — the install is provably
- *     not the problem;
+ *   - `verifiedPanelDiskVersion()` returns a version, which means the pack is
+ *     STILL the panel and STILL there: it re-reads the pyproject NOW, from the
+ *     directory the last scan found, for the ComfyUI we are CURRENTLY targeting.
+ *     A recorded version is never trusted on its own — the pack may have been
+ *     removed, downgraded, or replaced since, and the target may have changed
+ *     out from under the observation (the orchestrator kicks off the panel sync
+ *     and retargets in the same hello handler);
+ *   - that version PARSES and is >= the required floor — the install is
+ *     provably not the problem;
  *   - the tab advertised NO version, or one that parses and is BELOW the floor.
  *     A tab claiming the same current version yet missing the capability is some
  *     other fault, not this one, and must not be given this diagnosis.
  */
 function resolveStaleBundleSkew(panelVersion?: string): PanelBundleSkew | undefined {
-  const observed = lastPanelDiskObservation();
-  if (!observed) return undefined;
+  const disk = verifiedPanelDiskVersion()?.trim();
+  if (!disk) return undefined;
   const required = requiredPanelVersion();
-  const disk = observed.version.trim();
   if (!SEMVER_RE.test(disk) || !SEMVER_RE.test(required.trim())) return undefined;
   if (compareSemver(disk, required) < 0) return undefined; // install really IS behind
 
@@ -337,7 +342,7 @@ function resolveStaleBundleSkew(panelVersion?: string): PanelBundleSkew | undefi
     if (compareSemver(advertised, required) >= 0) return undefined;
   }
   return {
-    diskVersion: observed.version,
+    diskVersion: disk,
     handshakeVersion: advertised || undefined,
     requiredVersion: required,
   };

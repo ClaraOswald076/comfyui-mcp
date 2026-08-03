@@ -25,6 +25,7 @@
 
 import {
   panelStatus,
+  pinPanelBase,
   runPanelAction,
   runPanelActionInner,
   withPanelOpLock,
@@ -473,7 +474,15 @@ export async function performPanelSync(
   // the stale decision (codex gate). runPanelAction's own wrapper would lock
   // only the mutation half, so this calls the inner action directly.
   return withPanelOpLock(async () => {
-    const before = await panelStatus(deps);
+    // Freeze the ComfyUI base for the WHOLE sync, not per-call. This function
+    // makes three separate reads of the install — the pre-decision status, the
+    // mutation's own pre/post detection, and the post-status re-read — and the
+    // honesty of every claim it makes depends on all three describing the same
+    // directory. Pinning inside each callee is not enough: the live-base cache
+    // has a short TTL and a Manager operation can outlive it, so two calls could
+    // resolve different trees (see pinPanelBase).
+    const pinnedDeps = await pinPanelBase(deps);
+    const before = await panelStatus(pinnedDeps);
     const assessment = evaluatePanelSync(before, {
       orchestratorVersion: opts.orchestratorVersion,
       requiredVersion: opts.requiredVersion,
@@ -492,12 +501,12 @@ export async function performPanelSync(
     // `update` refreshes an existing pack; `install` is for a pack that isn't
     // there. Both go through the same verified path and both fail closed.
     const action = before.installed ? "update" : "install";
-    const result = await runPanelActionInner(action, deps);
+    const result = await runPanelActionInner(action, pinnedDeps);
 
     // Re-read from disk. `runPanelAction` already proved movement, but the version
     // we hand back to the user must be one we OBSERVED after the fact, not the one
     // the installer intended or reported.
-    const after = await panelStatus(deps);
+    const after = await panelStatus(pinnedDeps);
     if (!after.installed || !after.installedVersion) {
       throw new Error(
         `Panel ${action} reported success, but re-reading the pack afterwards could ` +

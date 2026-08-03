@@ -39,9 +39,10 @@
 // Remote/cloud mode resolves to nothing at all: the live root is a path on
 // SOMEONE ELSE'S filesystem and must never be handed to a local `join()`.
 
-import { statSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { getComfyUIBaseUrl, isLocalMode } from "../config.js";
+import { parsePyproject } from "./node-authoring.js";
 import { parseBaseDirFromArgv } from "./output-dir.js";
 import {
   getLiveServerSnapshot,
@@ -225,26 +226,31 @@ export function __resetPanelBaseCache(): void {
 // ---------------------------------------------------------------------------
 
 export interface PanelDiskObservation {
-  /** Version read from the pack's pyproject.toml. */
+  /** Version read from the pack's pyproject.toml at observation time. */
   version: string;
-  /** Where it was read from. */
+  /** WHERE it was read from. This is the durable part — see below. */
   dir?: string;
   /** When (epoch ms). */
   at: number;
+  /** Which ComfyUI it describes. An observation does not survive a retarget. */
+  target: string;
 }
 
 /**
- * How long an observation stays usable. Generous on purpose: the sync runs on
- * every panel hello, so while a tab is connected this is at most one-hello old,
- * and a refusal can only happen while a tab IS connected.
+ * How long an observation's POINTER stays usable. The version it carries is
+ * never trusted on age alone — see `verifiedPanelDiskVersion`.
  */
 const DISK_OBSERVATION_TTL_MS = 30 * 60_000;
+
+/** pyproject `[project].name` that identifies the panel pack. Kept as a literal
+ *  rather than imported from panel-installer, which imports this module. */
+const PANEL_PROJECT_NAME = "comfyui-agent-panel";
 
 let diskObservation: PanelDiskObservation | undefined;
 
 /** Record a version READ FROM DISK. Called by panelStatus, never guessed. */
 export function recordPanelDiskObservation(version: string, dir?: string): void {
-  diskObservation = { version, dir, at: Date.now() };
+  diskObservation = { version, dir, at: Date.now(), target: targetKey() };
 }
 
 /** Forget the on-disk observation — the pack is not there (or was removed). */
@@ -252,9 +258,46 @@ export function clearPanelDiskObservation(): void {
   diskObservation = undefined;
 }
 
-/** The last on-disk read, if one is recent enough to be worth acting on. */
+/**
+ * The last on-disk read, if it still describes THIS ComfyUI and is recent.
+ *
+ * The target check matters more than the clock. The orchestrator kicks off the
+ * panel sync on a hello and retargets ComfyUI in the same handler, so an
+ * observation can be recorded a moment before the target changes — and a
+ * version read from the OLD machine's disk must never be presented as evidence
+ * about the new one.
+ */
 export function lastPanelDiskObservation(): PanelDiskObservation | undefined {
   if (!diskObservation) return undefined;
+  if (diskObservation.target !== targetKey()) return undefined;
   if (Date.now() - diskObservation.at > DISK_OBSERVATION_TTL_MS) return undefined;
   return diskObservation;
+}
+
+/**
+ * The panel's on-disk version RIGHT NOW, re-read from the directory the last
+ * observation pointed at — or undefined if that cannot be confirmed.
+ *
+ * The recorded version is deliberately NOT returned. It is a fact about the
+ * past, and the one conclusion it feeds — "your install is fine, the browser
+ * tab is the stale part" — is exactly the conclusion that must never be wrong:
+ * telling someone whose install is genuinely behind to hard-refresh sends them
+ * back into the loop this whole change exists to break. So the observation
+ * supplies only the WHERE (which needs the async scan), and the version is read
+ * fresh and cheaply at the moment of use. A pack that was removed, downgraded,
+ * or replaced by something else since the scan therefore yields undefined and
+ * the caller falls back to ordinary update guidance.
+ */
+export function verifiedPanelDiskVersion(): string | undefined {
+  const observed = lastPanelDiskObservation();
+  if (!observed?.dir) return undefined;
+  try {
+    const raw = readFileSync(join(observed.dir, "pyproject.toml"), "utf-8");
+    const parsed = parsePyproject(raw);
+    // Still the panel, and still has a version. Anything else is not proof.
+    if (parsed.projectName !== PANEL_PROJECT_NAME) return undefined;
+    return parsed.version;
+  } catch {
+    return undefined;
+  }
 }

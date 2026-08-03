@@ -525,22 +525,50 @@ export const defaultDeps: PanelInstallerDeps = {
 };
 
 /**
- * Resolve the LIVE ComfyUI base once, at the START of a panel operation, so
- * every `deps.comfyuiPath()` inside it agrees (#766/#769).
- *
- * The resolution needs `/system_stats`, so it is async, while the dep is sync
- * and is read from several places within one operation — detection, the shadow
- * scan, the post-op re-read. If those could disagree, the "did the pack MOVE?"
- * proof would be comparing two different directories, which is the one thing
- * this file must never do.
- *
- * Only fires for the REAL deps. An injected dep set has already declared where
- * ComfyUI is; probing a live server would be both pointless and, in tests,
- * a network call nobody asked for.
+ * Marks a dep set derived from `defaultDeps`. `pinPanelBase` returns a NEW
+ * object, so identity against `defaultDeps` no longer answers "are these the
+ * real deps?" — and that question governs whether we probe the live server and
+ * whether an on-disk read is worth recording. Carry the answer explicitly.
  */
-async function primeBaseFor(deps: PanelInstallerDeps): Promise<void> {
-  if (deps !== defaultDeps) return;
-  await primePanelBase();
+const REAL_DEPS = Symbol("panel-installer.realDeps");
+type MarkedDeps = PanelInstallerDeps & { [REAL_DEPS]?: true };
+
+/** Is this the production dep set (rather than an injected test one)? */
+function isRealDeps(deps: PanelInstallerDeps): boolean {
+  return deps === defaultDeps || (deps as MarkedDeps)[REAL_DEPS] === true;
+}
+
+/**
+ * Resolve the LIVE ComfyUI base once and FREEZE it for the rest of the
+ * operation (#766/#769).
+ *
+ * Priming alone is not enough, and assuming it was is a real bug: the live
+ * resolution is cached with a short TTL, and `panelBaseSync()` falls back to the
+ * configured base once that expires. A single panel update can easily outlive
+ * it — ComfyUI-Manager operations are slow. On a Comfy Desktop split install the
+ * pre-op detection would then inspect the live `--base-directory` tree while the
+ * post-op verification inspected the configured one, and if the configured tree
+ * happened to hold a newer panel the "did it move?" proof would compare two
+ * different directories and report a success that never happened. That is
+ * precisely the fabricated-success class #639 exists to prevent.
+ *
+ * So the base is read ONCE and pinned into a dep set for the whole operation.
+ * Pinning is idempotent — an already-pinned set re-pins to the same value — and
+ * for an injected dep set (whose `comfyuiPath` is already a constant) it is a
+ * no-op that preserves existing behaviour exactly.
+ */
+export async function pinPanelBase(
+  deps: PanelInstallerDeps,
+): Promise<PanelInstallerDeps> {
+  const real = isRealDeps(deps);
+  // Only probe the live server for the REAL deps. An injected dep set has
+  // already declared where ComfyUI is; probing would be pointless and, in
+  // tests, a network call nobody asked for.
+  if (real) await primePanelBase();
+  const base = deps.comfyuiPath();
+  const pinned: MarkedDeps = { ...deps, comfyuiPath: () => base };
+  if (real) pinned[REAL_DEPS] = true;
+  return pinned;
 }
 
 // ---------------------------------------------------------------------------
@@ -1284,9 +1312,11 @@ export interface PanelStatus {
 
 /** status action — never throws. */
 export async function panelStatus(
-  deps: PanelInstallerDeps = defaultDeps,
+  depsIn: PanelInstallerDeps = defaultDeps,
 ): Promise<PanelStatus> {
-  await primeBaseFor(deps);
+  // Freeze the base for this whole read: detection, the shadow scan and the
+  // reported path must all describe ONE directory (see pinPanelBase).
+  const deps = await pinPanelBase(depsIn);
   const detection = await detectPanelInstall(deps).catch(
     () =>
       ({ applicable: false, installed: false, isDevSymlink: false }) as PanelDetection,
@@ -1317,7 +1347,7 @@ export async function panelStatus(
   // chosen. Both issues were, at bottom, a status report about a directory the
   // user did not think they were asking about; naming it makes that visible
   // instead of leaving "installed: false" to be read as "the panel is missing".
-  const baseResolution = deps === defaultDeps ? lastPanelBaseResolution() : undefined;
+  const baseResolution = isRealDeps(deps) ? lastPanelBaseResolution() : undefined;
   const comfyuiPath = deps.comfyuiPath();
   const baseSource: PanelBaseSource | undefined = baseResolution?.source;
   const baseNote = (() => {
@@ -1368,7 +1398,7 @@ export async function panelStatus(
   // the tab's advertised version describe the same moment. Only a real read is
   // recorded; an absent or unreadable pack CLEARS it rather than leaving a stale
   // "your install is fine" behind.
-  if (deps === defaultDeps) {
+  if (isRealDeps(deps)) {
     if (detection.applicable && detection.installed && detection.version) {
       recordPanelDiskObservation(detection.version, detection.dir);
     } else {
@@ -2234,14 +2264,16 @@ export function runPanelAction(
 
 export async function runPanelActionInner(
   action: "install" | "update" | "reinstall",
-  deps: PanelInstallerDeps,
+  depsIn: PanelInstallerDeps,
   opts: PanelActionOptions = {},
 ): Promise<PanelActionResult> {
   const targetVersion = opts.version?.trim() || PANEL_VERSION;
-  // Resolve the LIVE ComfyUI base ONCE, before the first deps.comfyuiPath()
-  // read, so detection, the shadow scan and the post-op re-read all describe
-  // the same directory (#766/#769).
-  await primeBaseFor(deps);
+  // Resolve the LIVE ComfyUI base ONCE and FREEZE it for the whole operation,
+  // so detection, the shadow scan, the staging/backup paths and the post-op
+  // re-read all describe the same directory (#766/#769). A base that drifted
+  // mid-op would make the "did the pack move?" proof compare two different
+  // trees — see pinPanelBase.
+  const deps = await pinPanelBase(depsIn);
   // P1b — truly LOCAL-only. Refuse in remote/cloud mode even when COMFYUI_PATH
   // is set: installCustomNode/reinstallCustomNode would queue Manager mutations
   // against the REMOTE host while our symlink guard inspected the LOCAL disk —
