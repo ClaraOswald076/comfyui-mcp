@@ -778,6 +778,50 @@ describe("run completion journal correlation (#468)", () => {
     expect(seen[0].dropped_completions).toBe(lost);
   });
 
+  it("an eviction disclosure never lands on a HANDED-OFF entry that can't report it", () => {
+    // deliverPending only reads PENDING entries. Stamping the count on a
+    // handed-off one attaches the warning to text already queued (nobody will
+    // build that payload again) and ack() then spends it: neither replayed nor
+    // disclosed. With no pending entry it must go to the side map, where the
+    // next pending delivery picks it up.
+    for (let i = 0; i < 32; i++) journal.record("t", { kind: "executed", prompt_id: `h-${i}` });
+    journal.deliverPending("t", () => true); // all handed off, none acked
+    expect(journal.pending("t")).toHaveLength(0);
+
+    journal.record("t", { kind: "executed", prompt_id: "overflow" }); // evicts one
+    const lost = journal.droppedFor("t");
+    expect(lost).toBeGreaterThan(0);
+    // No pending entry carries it…
+    expect(journal.outstanding("t").filter((e) => e.state === "handed_off" && e.disclose)).toHaveLength(0);
+    // …and the next PENDING delivery reports it.
+    const seen: CompletionPayload[] = [];
+    journal.deliverPending("t", (p) => {
+      seen.push(p);
+      return true;
+    });
+    expect(seen[0].dropped_completions).toBe(lost);
+  });
+
+  it("a very late resend is still suppressed after the bounded memo has aged out", () => {
+    // The delivered memo is FIFO-capped, so a busy tab ages it out. The run
+    // TICKET's `settled` flag is the second, longer-lived record of "we already
+    // reported this run" — either one must suppress a resend.
+    journal.openRun(PROMPT_A, { tabId: "t" });
+    const entry = journal.record("t", { kind: "executed", prompt_id: PROMPT_A });
+    journal.deliverPending("t", () => true);
+    journal.ack(entry!.token);
+    expect(journal.ticketFor(PROMPT_A)?.settled).toBe(true);
+
+    // Age the memo out with a flood of other acked completions.
+    for (let i = 0; i < 300; i++) {
+      const e = journal.record("t", { kind: "executed", prompt_id: `flood-${i}` });
+      journal.deliverPending("t", () => true);
+      journal.ack(e!.token);
+    }
+    // The late resend is still recognised as already delivered.
+    expect(journal.record("t", { kind: "executed", prompt_id: PROMPT_A })).toBeNull();
+  });
+
   it("an eviction disclosure survives a hand-off that is never consumed", () => {
     // A hand-off is not consumption. If the agent holding the warning is stopped
     // before its turn runs, the replay must carry the warning again — clearing it

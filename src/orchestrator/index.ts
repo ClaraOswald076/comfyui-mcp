@@ -779,6 +779,10 @@ export async function runPanelOrchestrator(): Promise<void> {
     logger.error(
       `[panel-orchestrator] FATAL uncaught exception — exiting so a fresh orchestrator can take over: ${err.stack ?? err.message}`,
     );
+    // #468 — this path exits without any teardown, so record whatever run
+    // completions die with it. Log-only by construction (see the function): a
+    // crash is no time to await a bridge write.
+    reportLostCompletionsOnExit();
     process.exit(1);
   });
 
@@ -2104,7 +2108,10 @@ export async function runPanelOrchestrator(): Promise<void> {
    * the run: an UNDETERMINED outcome the user can act on beats a promise that
    * silently evaporates. Best-effort and never throws — this runs on the way out.
    */
+  let lostCompletionsReported = false;
   function reportLostCompletionsOnExit(): void {
+    if (lostCompletionsReported) return; // every exit path calls this; report once
+    lostCompletionsReported = true;
     const byTab = new Map<string, string[]>();
     try {
       for (const entry of RunCompletions.allOutstanding()) {
@@ -5158,6 +5165,12 @@ export async function runPanelOrchestrator(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info("[panel-orchestrator] shutting down — stopping agents…");
+    // #468 — EVERY exit path discloses, not just the fatal self-exit: an ordinary
+    // SIGTERM/SIGINT teardown destroys the in-memory journal just as thoroughly.
+    // Runs BEFORE stopAll() so the still-live agents' tabs are still routable for
+    // the chat notice. Idempotent (reportLostCompletionsOnExit no-ops the second
+    // time), so the self-exit path calling it first is harmless.
+    reportLostCompletionsOnExit();
     selfRestarter?.stop();
     clearInterval(downloadTimer);
     clearInterval(queueStatusTimer);

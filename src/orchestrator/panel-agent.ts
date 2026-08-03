@@ -2405,6 +2405,14 @@ export class PanelAgentManager {
   async stopAll(): Promise<void> {
     this.pendingEffortRestart.clear();
     this.pendingMcpRestart.clear();
+    // #468 — go through the same detach seam as reset()/retire() for EVERY key
+    // before dropping held mail. The journal is about to be reported on by the
+    // orchestrator's shutdown disclosure, and an entry still marked `handed_off`
+    // because its token died inside discarded held mail would be missed by the
+    // replay AND read as merely "in flight" rather than lost.
+    for (const key of [...this.heldMessages.keys()]) {
+      this.detachHeldCompletions(key, "shutdown");
+    }
     this.heldMessages.clear();
     await Promise.all([...this.agents.values()].map((a) => a.stop()));
     this.agents.clear();

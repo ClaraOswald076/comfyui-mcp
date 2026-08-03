@@ -310,7 +310,15 @@ export class RunCompletionJournalImpl {
       // Already DELIVERED once (its carrying turn ended, so the entry is gone).
       // A panel that re-sends the frame must not produce a second delivery — the
       // dedupe below can't see an entry that no longer exists.
-      if (this.delivered.has(deliveredKey(key, correlation.promptId))) {
+      // Two independent records of "already delivered": the bounded memo, and the
+      // run TICKET's own `settled` flag. The memo is FIFO-capped, so a busy tab
+      // can age it out and then re-deliver a very late resend; the ticket outlives
+      // it for any run this session actually queued. Either one is proof.
+      const settledTicket = this.tickets.get(correlation.promptId);
+      if (
+        this.delivered.has(deliveredKey(key, correlation.promptId)) ||
+        (settledTicket?.settled === true && settledTicket.tabId === key)
+      ) {
         logger.info(
           `[run-completions] ignoring a re-sent completion for ${describe(correlation)} — already delivered to tab ${key.slice(0, 8)}`,
         );
@@ -413,7 +421,13 @@ export class RunCompletionJournalImpl {
    */
   private noteDropped(key: string, count = 1): void {
     if (count <= 0) return;
-    const carrier = [...this.entries.values()].find((e) => e.key === key);
+    // The carrier must be an entry `deliverPending` will actually READ — i.e. a
+    // PENDING one. A handed-off entry's payload was already built and queued, so
+    // stamping the count on it would attach a warning to text nobody will ever
+    // see again, and `ack()` would then spend it: the eviction would be neither
+    // replayed nor disclosed. With no pending entry the count goes to the side
+    // map, where the next pending delivery for this tab picks it up.
+    const carrier = [...this.entries.values()].find((e) => e.key === key && e.state === "pending");
     if (carrier) {
       carrier.disclose = (carrier.disclose ?? 0) + count;
       return;
