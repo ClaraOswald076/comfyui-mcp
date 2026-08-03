@@ -66,6 +66,11 @@ const CODEX_INTERRUPT_TIMEOUT_MS =
   Number.isFinite(configuredInterruptTimeoutMs) && configuredInterruptTimeoutMs > 0
     ? configuredInterruptTimeoutMs
     : 1500;
+const configuredStallSteerTimeoutMs = Number(process.env.COMFYUI_MCP_CODEX_STALL_STEER_TIMEOUT_MS);
+const CODEX_STALL_STEER_TIMEOUT_MS =
+  Number.isFinite(configuredStallSteerTimeoutMs) && configuredStallSteerTimeoutMs > 0
+    ? configuredStallSteerTimeoutMs
+    : CODEX_INTERRUPT_TIMEOUT_MS;
 const configuredCloseTimeoutMs = Number(process.env.COMFYUI_MCP_CODEX_CLOSE_TIMEOUT_MS);
 const CODEX_CLOSE_TIMEOUT_MS =
   Number.isFinite(configuredCloseTimeoutMs) && configuredCloseTimeoutMs > 0
@@ -1408,16 +1413,30 @@ export class CodexBackend implements AgentBackend {
     const threadId = this.threadId;
     const turnId = this.turnId;
     if (!client || !threadId || !turnId || !notice.trim()) return false;
+    let timer: NodeJS.Timeout | undefined;
+    let timedOut = false;
     try {
-      await client.request("turn/steer", {
-        threadId,
-        expectedTurnId: turnId,
-        input: [{ type: "text", text: notice }],
-      });
+      await Promise.race([
+        client.request("turn/steer", {
+          threadId,
+          expectedTurnId: turnId,
+          input: [{ type: "text", text: notice }],
+        }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            timedOut = true;
+            reject(new Error(`turn/steer timed out after ${CODEX_STALL_STEER_TIMEOUT_MS}ms`));
+          }, CODEX_STALL_STEER_TIMEOUT_MS);
+        }),
+      ]);
       return true;
     } catch (err) {
-      logger.debug(`[codex-backend] stalled-turn steer unavailable: ${msgOf(err)}`);
+      logger.debug(
+        `[codex-backend] stalled-turn steer ${timedOut ? "timed out" : "unavailable"}: ${msgOf(err)}`,
+      );
       return false;
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 

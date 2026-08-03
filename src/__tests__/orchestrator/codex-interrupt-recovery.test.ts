@@ -16,6 +16,7 @@ let CodexBackend: BackendModule["CodexBackend"];
 
 beforeAll(async () => {
   vi.stubEnv("COMFYUI_MCP_CODEX_INTERRUPT_TIMEOUT_MS", "25");
+  vi.stubEnv("COMFYUI_MCP_CODEX_STALL_STEER_TIMEOUT_MS", "25");
   vi.stubEnv("COMFYUI_MCP_CODEX_CLOSE_TIMEOUT_MS", "25");
   vi.stubEnv("COMFYUI_MCP_CODEX_FORCE_KILL_GRACE_MS", "10");
   vi.resetModules();
@@ -91,6 +92,32 @@ describe("CodexBackend interrupt recovery", () => {
       expectedTurnId: "turn-1",
       input: [{ type: "text", text: "harness stall" }],
     });
+  });
+
+  it("bounds a hung stalled-turn steer so PanelAgent can take legacy recovery", async () => {
+    let resolveSteer!: (value: unknown) => void;
+    const client = {
+      request: vi.fn(
+        () =>
+          new Promise<unknown>((resolve) => {
+            resolveSteer = resolve;
+          }),
+      ),
+      close: vi.fn().mockResolvedValue(undefined),
+    };
+    const backend = new CodexBackend();
+    installActiveClient(backend, client);
+
+    const recovery = backend.recoverStalledTurn("harness stall");
+    expect(await settlesWithin(recovery)).toBe(true);
+    await expect(recovery).resolves.toBe(false);
+    // A late app-server completion belongs to the already-abandoned steer only;
+    // it must not mutate the still-live client or turn identities.
+    resolveSteer({});
+    await new Promise((resolve) => setImmediate(resolve));
+    expect((backend as any).client).toBe(client);
+    expect((backend as any).threadId).toBe("thread-1");
+    expect((backend as any).turnId).toBe("turn-1");
   });
 
   it("keeps the turn alive while app-server reports a retryable error", async () => {
