@@ -921,16 +921,64 @@ export async function verifyLandedModel(
   // same name in the LIVE tree would otherwise verify our write into a STALE tree
   // as a success (codex gate, round 3) — so a name that was already listed BEFORE
   // the download proves nothing there.
+  const landed = verifiedPath ?? resolve(targetPath);
+  const under = (root: string): boolean => {
+    const r = resolve(root);
+    return landed === r || landed.startsWith(r + sep);
+  };
   let destinationIsLiveAuthoritative = false;
+  /** The server the file was landed for is NOT the server answering now, and the
+   *  file sits outside every tree that server reads. */
+  let outsideLiveRoots = false;
   try {
     const dest = await resolveModelsDirWithBases();
-    const root = resolve(dest.modelsDir);
-    const p = verifiedPath ?? resolve(targetPath);
-    destinationIsLiveAuthoritative =
-      isLiveAuthoritativeModelsDir(dest.source) &&
-      (p === root || p.startsWith(root + sep));
+    if (isLiveAuthoritativeModelsDir(dest.source)) {
+      if (under(dest.modelsDir)) {
+        destinationIsLiveAuthoritative = true;
+      } else {
+        // We KNOW the root the live server reads, and the landed file is not in it.
+        // Before calling that a wrong place, allow the legitimate #633 shape: a
+        // destination that (via a symlink) really lives in a registered EXTRA model
+        // root. Anything else is outside everything the running server reads —
+        // which is exactly what a ComfyUI restart onto a DIFFERENT install between
+        // the write and this check produces (codex gate, round 4).
+        let extra: Awaited<ReturnType<typeof getLiveExtraModelRoots>>;
+        try {
+          extra = await getLiveExtraModelRoots(dest.snapshot);
+        } catch {
+          extra = { authoritative: false, roots: [] };
+        }
+        const inExtra = extra.roots.some((r) => {
+          try {
+            return under(r.dir);
+          } catch {
+            return false;
+          }
+        });
+        outsideLiveRoots = !inExtra;
+      }
+    }
   } catch {
     destinationIsLiveAuthoritative = false;
+  }
+  if (outsideLiveRoots) {
+    let liveRoot: string | undefined;
+    try {
+      liveRoot = await resolveModelsDir();
+    } catch {
+      liveRoot = undefined;
+    }
+    return {
+      verifiedPath,
+      liveVisible: "not-visible",
+      note:
+        `The file IS on disk at ${landed}, but that is OUTSIDE every directory the ` +
+        `connected ComfyUI (${getComfyUIBaseUrl()}) reads models from` +
+        (liveRoot ? ` (its models directory is ${liveRoot})` : "") +
+        ". This happens when the running server is replaced by a different install " +
+        "while a download is in flight. Move the file into the running server's models " +
+        "tree, or re-download now that the correct server is connected.",
+    };
   }
   const ambiguous =
     !destinationIsLiveAuthoritative && opts?.listedBefore === true;

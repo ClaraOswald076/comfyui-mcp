@@ -386,6 +386,44 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
     expect(res.liveVisible).toBe("visible");
   });
 
+  it("reports NOT-VISIBLE when the live root moved out from under the landed file (restart A→B; codex gate r4)", async () => {
+    // Server A was live when the file landed under A's models root. B replaced it on
+    // the same port before verification and happens to list the same filename — that
+    // is B's OWN copy, not ours, and ours is outside everything B reads.
+    h.modelsDirSource = "observed-root";
+    h.destModelsDir = "/serverB/models"; // the CURRENT live root
+    h.liveListings["loras"] = ["new.safetensors"]; // B's own same-named model
+    h.liveExtraRoots = { authoritative: true, roots: [] };
+    const res = await verifyLandedModel(target, "loras", {
+      attempts: 1,
+      retryMs: 0,
+      listedBefore: false,
+    });
+    expect(res.liveVisible).toBe("not-visible");
+    expect(res.note).toMatch(/OUTSIDE every directory/);
+  });
+
+  it("still confirms a #633 destination that really lives in a registered EXTRA root", async () => {
+    // A symlinked models/<link> resolving onto another drive is legitimate: the
+    // landed realpath is outside the primary root but inside a live extra root.
+    const external = resolve("/E/render/models/loras/new.safetensors");
+    realpathMock.mockImplementation(async () => external);
+    h.modelsDirSource = "observed-root";
+    h.destModelsDir = "/serverB/models";
+    h.liveExtraRoots = {
+      authoritative: true,
+      roots: [{ category: "loras", dir: resolve("/E/render/models/loras") }],
+    };
+    h.liveListings["loras"] = ["new.safetensors"];
+    const res = await verifyLandedModel(target, "loras", {
+      attempts: 1,
+      retryMs: 0,
+      listedBefore: false,
+    });
+    expect(res.liveVisible).toBe("visible");
+    expect(res.verifiedPath).toBe(external);
+  });
+
   it("normalizes OS-native separators in the live listing", async () => {
     h.liveListings["loras"] = ["sub\\new.safetensors"];
     const res = await verifyLandedModel(target, "loras/sub", { attempts: 1, retryMs: 0 });

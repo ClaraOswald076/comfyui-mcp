@@ -420,6 +420,56 @@ describe("applyManifest", () => {
     expect(downloadModelMock).not.toHaveBeenCalled();
   });
 
+  // #369 — "already exists" is a claim about a path the RUNNING server may not read.
+  it("FAILS an existing file the connected ComfyUI does not list (stale install)", async () => {
+    resolveExistingModelFileMock.mockResolvedValueOnce({
+      path: "C:/stale/models/checkpoints/big.safetensors",
+      root: "C:/stale/models",
+      info: { isFile: () => true },
+    });
+    liveListingHasEntryMock.mockResolvedValueOnce(false);
+
+    const result = await applyManifest({
+      manifest: {
+        models: [
+          {
+            url: "https://example.com/big.safetensors",
+            model_type: "checkpoints",
+            filename: "big.safetensors",
+          },
+        ],
+      },
+    });
+
+    expect(result.summary).toMatchObject({ skipped: 0, failed: 1 });
+    expect(result.results[0].message).toMatch(/does not list/);
+    expect(downloadModelMock).not.toHaveBeenCalled();
+  });
+
+  it("reports PENDING (never skipped) when the server cannot be asked about an existing file", async () => {
+    resolveExistingModelFileMock.mockResolvedValueOnce({
+      path: "C:/comfy/models/checkpoints/big.safetensors",
+      root: "C:/comfy/models",
+      info: { isFile: () => true },
+    });
+    liveListingHasEntryMock.mockResolvedValueOnce(undefined);
+
+    const result = await applyManifest({
+      manifest: {
+        models: [
+          {
+            url: "https://example.com/big.safetensors",
+            model_type: "checkpoints",
+            filename: "big.safetensors",
+          },
+        ],
+      },
+    });
+
+    expect(result.summary).toMatchObject({ skipped: 0, failed: 0, pending: 1 });
+    expect(result.results[0].message).toMatch(/NOT confirmed as installed/);
+  });
+
   it("skips a CATEGORY-ROOT target found by filename anywhere in the served category", async () => {
     // model_type: checkpoints (category-root target). Not at the computed path
     // nor the exact relative path in any root, but ComfyUI serves it from a

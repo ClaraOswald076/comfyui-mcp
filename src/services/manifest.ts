@@ -920,15 +920,19 @@ async function applyManifestSections(
                   "the running server does not read. Point COMFYUI_PATH at the ComfyUI that is " +
                   "actually running, or launch it with an absolute --base-directory.",
               )
-            : report(
-                "model",
-                item,
-                "skipped",
-                `Model already exists at ${existing}.` +
-                  (visible === undefined
-                    ? " NOTE: the connected ComfyUI could not be asked whether it reads from there."
-                    : ""),
-              ),
+            : visible === undefined
+              ? // The server could not be asked, so "already exists" is an
+                // UNVERIFIED claim about a path it may not read (codex gate,
+                // round 4). Report it as pending, never as a satisfied item.
+                report(
+                  "model",
+                  item,
+                  "pending",
+                  `A file exists at ${existing}, but the connected ComfyUI could not be asked ` +
+                    `whether it reads from there (its "${target.targetSubfolder}" listing was ` +
+                    "unavailable), so this is NOT confirmed as installed. Check list_local_models.",
+                )
+              : report("model", item, "skipped", `Model already exists at ${existing}.`),
         );
         continue;
       }
