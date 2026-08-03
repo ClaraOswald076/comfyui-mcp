@@ -73,6 +73,7 @@ import {
   type ModelChoice,
   type NeutralTurn,
   GROK_CAPABILITIES,
+  stampTurn,
 } from "./agent-backend.js";
 import type { ImageRef } from "./panel-agent.js";
 import {
@@ -820,6 +821,7 @@ export class GrokBackend implements AgentBackend {
     };
 
     // Process the neutral channel one turn at a time.
+    let turnSeq = 0;
     for await (const turn of opts.channel) {
       // LIVE MODEL SWITCH (P1): PanelAgent treats setModel as live and does NOT
       // restart run() for a model-only change, so the persistent loop adopts it
@@ -837,7 +839,7 @@ export class GrokBackend implements AgentBackend {
           ...(this.model ? { model: this.model } : {}),
         };
       }
-      yield* this.runTurn(this.client, turn, opts.onActivity);
+      yield* stampTurn(this.runTurn(this.client, turn, opts.onActivity), ++turnSeq);
     }
   }
 
@@ -1520,8 +1522,9 @@ export class GrokDirectBackend extends OllamaBackend {
       .filter(Boolean)
       .join("\n\n");
 
+    let turnSeq = 0;
     for await (const turn of opts.channel) {
-      yield* this.runGrokTurn(turn, instructions, opts);
+      yield* stampTurn(this.runGrokTurn(turn, instructions, opts), ++turnSeq);
     }
   }
 

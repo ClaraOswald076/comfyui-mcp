@@ -26,7 +26,7 @@ import type {
   NeutralTurn,
 } from "./agent-backend.js";
 import type { ImageRef } from "./panel-agent.js";
-import { OLLAMA_CAPABILITIES } from "./agent-backend.js";
+import { OLLAMA_CAPABILITIES, stampTurn } from "./agent-backend.js";
 import type { GeminiMcpServerSpec } from "./gemini-backend.js";
 import { resolvePrompt } from "../services/prompt-overrides.js";
 import { retiredToolMessage } from "../tools/vocabulary.js";
@@ -803,8 +803,9 @@ export class OllamaBackend implements AgentBackend {
     }
     yield { type: "session", sessionId: this.sessionId, model: this.model };
 
+    let turnSeq = 0;
     for await (const turn of opts.channel) {
-      yield* this.runTurn(turn, opts);
+      yield* stampTurn(this.runTurn(turn, opts), ++turnSeq);
     }
   }
 

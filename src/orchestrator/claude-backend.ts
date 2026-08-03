@@ -270,6 +270,24 @@ export class ClaudeBackend implements AgentBackend {
   private turnSeq = 0;
   private lastResultTurnId = 0;
   private classificationPoisoned = false;
+  /** Run-relative zero for turn MARKERS (#728): set at every run() entry to the
+   *  backend-wide lastResultTurnId, so event stamps are 1-based per run and
+   *  match PanelAgent's per-dispatch mirror. */
+  private markerBase = 0;
+  /** Interrupted traces PARKED by subtype-aware correlation (#728 r5): an
+   *  interrupted turn ends with an INTERRUPTED-subtype result, so when a result
+   *  with any other subtype arrives while the oldest trace is interrupted and a
+   *  newer trace exists, that turn's result is permanently LOST and the arriving
+   *  result belongs to the newer turn — the interrupted trace is skipped
+   *  (parked) rather than popped. The park legitimizes the resulting forward
+   *  jump in lastResultTurnId, and lets a genuinely interrupted late landing
+   *  still pop its OWN trace (a backward pop) and classify/stamp by its flags. */
+  private parkedInterrupted = new Set<number>();
+  /** Interrupted traces whose late landing already HAPPENED (moved out of
+   *  parkedInterrupted on the pop) — consumption tracking so a SECOND
+   *  interrupted landing can never re-consume a landed trace; with no
+   *  unconsumed candidate it fails closed as traceless (#728 r6). */
+  private consumedInterrupted = new Set<number>();
   private turns: Array<{
     id: number;
     hasContent: boolean;
@@ -411,6 +429,9 @@ export class ClaudeBackend implements AgentBackend {
     this.turns.length = 0;
     this.lastResultTurnId = this.turnSeq;
     this.classificationPoisoned = false;
+    this.parkedInterrupted.clear(); // dead session's parks die with it
+    this.consumedInterrupted.clear(); // …and its landing history
+    this.markerBase = this.lastResultTurnId; // turn markers are run-relative (#728)
     // Wrap the neutral channel: shape each turn into the SDK's native form right
     // before it's read, so PanelAgent never deals in SDKUserMessage.
     async function* prompt(): AsyncGenerator<SDKUserMessage> {
@@ -435,6 +456,15 @@ export class ClaudeBackend implements AgentBackend {
     }
     const q = query({ prompt: prompt(), options: this.buildOptions(opts) });
     this.q = q;
+    // TURN MARKERS (#728): stamp every event with the marker of the turn it
+    // BELONGS to, derived from the #745 per-turn trace FIFO (the SDK's input
+    // pump and output reader are independent streams, so the marker can't ride
+    // the input side). RESULT-message events are stamped by route() itself with
+    // the trace it popped (the result's OWN turn, subtype-aware — #728 r5);
+    // every other message is stamped here with the NEWEST in-flight trace (the
+    // turn currently producing output). markerBase re-zeroes the backend-wide
+    // trace ids per run (1 = this run's first turn), matching PanelAgent's
+    // per-dispatch mirror (Nth submitted turn = marker N).
     for await (const message of q) {
       // LIVENESS: every SDKMessage — including the ones route() doesn't translate
       // (tool-progress, rate-limit, etc.) — is a sign the session is alive, so
@@ -442,7 +472,17 @@ export class ClaudeBackend implements AgentBackend {
       // this is effectively a no-op for behavior here; it keeps the watchdog's
       // re-arm source uniform across both backends via the port.
       opts.onActivity?.();
-      yield* this.route(message);
+      const streamTurn = this.turns[this.turns.length - 1]?.id;
+      for (const ev of this.route(message)) {
+        // Session init arrives OUTSIDE any turn — leave it unstamped (an
+        // unmarked event is never dead-lettered). Result-message events arrive
+        // pre-stamped by route().
+        if (ev.type === "session" || message.type === "result") {
+          yield ev;
+          continue;
+        }
+        yield streamTurn === undefined ? ev : { ...ev, turn: streamTurn - this.markerBase };
+      }
     }
   }
 
@@ -651,31 +691,103 @@ export class ClaudeBackend implements AgentBackend {
         // is unrecoverable once crossed, so the poison is terminal for the
         // session — content evidence must not rescue it (it accrued to a
         // mismatched trace, which is not proof of ITS turn's success).
-        const trace = this.turns.shift() ?? null;
+        // SUBTYPE-AWARE correlation on the SDK's REAL result vocabulary
+        // (#728 r5–r10): results arrive as `success` or `error_*` — an
+        // interrupted turn ends with an error_during_execution result (the
+        // interrupt landing); there is no "interrupted" result subtype.
+        //
+        // UNIFORM write-off (r10): an interrupted turn the PANEL killed (its
+        // trace is marked) that was then SUPERSEDED by a newer submission never
+        // delivers — the turn gate only submits newer work after the older
+        // turn's result was written off. So for EVERY landing (success or
+        // error_*): any interrupted-marked trace OLDER than the oldest LIVE
+        // non-interrupted trace is written off (parked as lost), and the
+        // landing pops that oldest live non-interrupted trace — a healthy
+        // turn's genuine success or error classifies by ITS flags (a genuine
+        // error_during_execution from a healthy newer turn is NOT blessed and
+        // is NOT attributed to the killed older turn). With NO live
+        // non-interrupted trace, the landing is an interrupt landing and pops
+        // the oldest LIVE interrupted trace (kills settle in submission order —
+        // the older turn's legitimate landing still pops the older trace, even
+        // when a newer interrupted turn's trace exists from queued input), else
+        // the oldest PARKED-but-unconsumed interrupted trace (a late landing
+        // for a written-off turn — the r6 tolerance), else nothing (anomalous
+        // → traceless fail-closed below). Each trace still lands at most once
+        // (landed parks move to consumedInterrupted).
+        const resultSubtype: string = message.subtype;
+        const oldestLive = this.turns.findIndex((t) => !t.interrupted);
+        if (oldestLive > 0) {
+          for (let i = 0; i < oldestLive; i++) {
+            if (this.turns[i].interrupted) this.parkedInterrupted.add(this.turns[i].id);
+          }
+        }
+        let idx = oldestLive;
+        if (idx < 0) {
+          idx = this.turns.findIndex((t) => t.interrupted && !this.parkedInterrupted.has(t.id));
+        }
+        if (idx < 0) {
+          idx = this.turns.findIndex(
+            (t) => t.interrupted && this.parkedInterrupted.has(t.id) && !this.consumedInterrupted.has(t.id),
+          );
+        }
+        const trace = idx >= 0 ? (this.turns.splice(idx, 1)[0] ?? null) : null;
         let unverifiable: string | null = null;
         if (this.classificationPoisoned) {
           unverifiable = "Turn bookkeeping was poisoned by an earlier overflow — no result in this session can be verified";
         } else if (!trace) {
           unverifiable = "The result could not be matched to any submitted turn";
           logger.warn(`[claude-backend] ${unverifiable} — unverifiable, failing closed (#740)`);
-        } else if (trace.id !== this.lastResultTurnId + 1) {
-          // The pop crossed an evicted-turn gap → poison the session (do NOT
-          // advance lastResultTurnId to the wrong trace's id — alignment is
-          // unrecoverable, so resyncing would just hide the next mismatch).
-          this.classificationPoisoned = true;
-          unverifiable = "Turn bookkeeping overflowed, so the result cannot be matched to its turn";
-          logger.warn(
-            `[claude-backend] result crosses an evicted-turn gap (popped turn ${trace.id}, expected ${this.lastResultTurnId + 1}) — unverifiable; classification poisoned for the rest of the session (#740)`,
-          );
         } else {
-          this.lastResultTurnId = trace.id;
+          let crossesGap = false;
+          if (trace.id > this.lastResultTurnId + 1) {
+            // Forward jump: legit only when EVERY skipped id is a parked
+            // interrupted trace; anything else is an evicted-turn gap.
+            for (let id = this.lastResultTurnId + 1; id < trace.id && !crossesGap; id++) {
+              if (!this.parkedInterrupted.has(id)) crossesGap = true;
+            }
+          } else if (trace.id <= this.lastResultTurnId) {
+            // Backward pop: legit only for a parked (or landed-once) interrupted
+            // trace's deferred landing.
+            crossesGap = !(this.parkedInterrupted.has(trace.id) || this.consumedInterrupted.has(trace.id));
+          }
+          if (crossesGap) {
+            // The pop crossed an evicted-turn gap → poison the session (do NOT
+            // advance lastResultTurnId to the wrong trace's id — alignment is
+            // unrecoverable, so resyncing would just hide the next mismatch).
+            this.classificationPoisoned = true;
+            unverifiable = "Turn bookkeeping overflowed, so the result cannot be matched to its turn";
+            logger.warn(
+              `[claude-backend] result crosses an evicted-turn gap (popped turn ${trace.id}, expected ${this.lastResultTurnId + 1}) — unverifiable; classification poisoned for the rest of the session (#740)`,
+            );
+          } else {
+            // A legitimately popped park is now LANDED — consumed once, so a
+            // second landing for it finds no candidate (#728 r6).
+            if (this.parkedInterrupted.delete(trace.id)) this.consumedInterrupted.add(trace.id);
+            if (trace.id > this.lastResultTurnId) this.lastResultTurnId = trace.id;
+          }
         }
-        let ok = message.subtype === "success";
-        if (ok && unverifiable !== null) {
+        // The result's OWN turn marker (#728): stamped here, where the trace it
+        // popped is known (a per-message stamp in run() could not see the
+        // subtype-aware skip). A traceless result stays UNMARKED so its
+        // fail-closed error and gate completion still reach the panel.
+        const stamp = trace ? { turn: trace.id - this.markerBase } : {};
+        // An interrupted turn's terminal (an error_during_execution landing for
+        // its own interrupted-marked trace) is the interrupt LANDING, not a
+        // failure — blessed like a success; the empty-turn guard below still
+        // spares it. Any other error_* subtype classifies by the trace's own
+        // flags (a genuine failure for a non-interrupted turn).
+        let ok =
+          resultSubtype === "success" ||
+          (resultSubtype === "error_during_execution" && trace !== null && trace.interrupted);
+        if (unverifiable !== null) {
+          // Fail closed with the reason VISIBLE — including an anomalous
+          // interrupted landing with no unconsumed candidate (#728 r6), whose
+          // ok is already false.
           ok = false;
           yield {
             type: "error",
             message: `${unverifiable} — reporting the turn as unverifiable rather than a success.`,
+            ...stamp,
           };
         } else if (ok && trace !== null && trace.blockReason !== null) {
           // The blocking informational already yielded the visible error above.
@@ -686,6 +798,7 @@ export class ClaudeBackend implements AgentBackend {
           yield {
             type: "error",
             message: "The model ended the turn without producing a reply.",
+            ...stamp,
           };
         }
         yield {
@@ -694,6 +807,7 @@ export class ClaudeBackend implements AgentBackend {
           subtype: message.subtype,
           ...(contextWindow !== undefined ? { contextWindow } : {}),
           ...(typeof m.total_cost_usd === "number" ? { costUsd: m.total_cost_usd } : {}),
+          ...stamp,
         };
         break;
       }

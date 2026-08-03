@@ -75,7 +75,7 @@ export interface AgentCapabilities {
  * meter, the result subtype/contextWindow/cost, live thinking-token counts). A
  * non-Claude backend simply omits the optional fields it can't supply.
  */
-export type AgentEvent =
+export type AgentEvent = (
   /** Session opened/continued; `model` is the SDK-reported active model, if any. */
   | { type: "session"; sessionId: string; model?: string }
   /** Incremental assistant/thinking text (token-by-token streaming). */
@@ -100,7 +100,31 @@ export type AgentEvent =
       costUsd?: number;
     }
   | { type: "rate_limit"; resetsAt?: number; kind?: string }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string }
+) & {
+  /** Backend-minted TURN MARKER (#728): a monotonically increasing id (1 = the
+   *  first turn read from the channel in this run) the backend stamps on every
+   *  event it emits FOR a submitted turn, so PanelAgent can attribute stragglers:
+   *  an event stamped with a turn OLDER than the in-flight turn is dead-lettered
+   *  (logged, never painted, never gate-affecting) instead of corrupting the turn
+   *  that replaced an abandoned one. OMITTED = legacy/third-party backend (or an
+   *  event outside any turn, like session init) — NO dead-lettering, previous
+   *  behavior (better a rare duplicate than a wedge). */
+  turn?: number;
+};
+
+/** Stamp every event of a per-turn stream with the backend-minted `turn` marker
+ *  (see AgentEvent.turn). Backends mint one incrementing marker per turn read
+ *  from the channel and wrap their per-turn generator: events inside a turn are
+ *  stamped; a `session` event (outside any turn) passes through unstamped. */
+export async function* stampTurn(
+  stream: AsyncIterable<AgentEvent>,
+  turn: number,
+): AsyncGenerator<AgentEvent> {
+  for await (const ev of stream) {
+    yield ev.type === "session" ? ev : { ...ev, turn };
+  }
+}
 
 export interface ModelChoice {
   id: string;

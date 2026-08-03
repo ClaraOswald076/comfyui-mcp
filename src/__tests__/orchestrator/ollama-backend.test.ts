@@ -177,7 +177,7 @@ describe("OllamaBackend", () => {
     expect(assistant.text).toBe("Hello!");
     expect(assistant.usage).toEqual({ input_tokens: 10, output_tokens: 5 });
     const results = events.filter((e) => e.type === "result");
-    expect(results).toEqual([{ type: "result", ok: true, usage: { input_tokens: 10, output_tokens: 5 } }]);
+    expect(results).toEqual([{ type: "result", ok: true, turn: 1, usage: { input_tokens: 10, output_tokens: 5 } }]);
   });
 
   it("num_ctx is model-aware: 16384 for stock, OMITTED for the fine-tune (baked 65536 governs), env override wins", async () => {
@@ -248,7 +248,7 @@ describe("OllamaBackend", () => {
     expect(nudges.length).toBeGreaterThanOrEqual(1);
     // Turn ends with the loop-breaker, not max_tool_rounds (32 rounds later).
     expect(events.filter((e) => e.type === "result")).toEqual([
-      { type: "result", ok: false, subtype: "tool_loop" },
+      { type: "result", ok: false, subtype: "tool_loop", turn: 1 },
     ]);
     expect(chatRequests.length).toBeLessThanOrEqual(5);
   });
@@ -315,7 +315,7 @@ describe("OllamaBackend", () => {
     expect(String(limitNudges[0].content)).toContain("panel_add_node");
     // And the turn ends on the loop-breaker, not by running to max_tool_rounds.
     expect(events.filter((e) => e.type === "result")).toEqual([
-      { type: "result", ok: false, subtype: "tool_loop" },
+      { type: "result", ok: false, subtype: "tool_loop", turn: 1 },
     ]);
   });
 
@@ -340,7 +340,7 @@ describe("OllamaBackend", () => {
     const second = chatRequests[1];
     const toolMsg = second.messages.find((m) => m.role === "tool");
     expect(toolMsg).toMatchObject({ tool_name: "list_tools", content: "result-of-list_tools" });
-    expect(events.filter((e) => e.type === "result")).toEqual([{ type: "result", ok: true, usage: expect.anything() }]);
+    expect(events.filter((e) => e.type === "result")).toEqual([{ type: "result", ok: true, turn: 1, usage: expect.anything() }]);
   });
 
   it("a retired comfy tool name gets the ledger's specific error, not the bare Available list (#659)", async () => {
@@ -427,7 +427,7 @@ describe("OllamaBackend", () => {
     const events = await collect(backend, turnsOf({ text: "hi" }));
     expect(events.some((e) => e.type === "error")).toBe(true);
     const results = events.filter((e) => e.type === "result");
-    expect(results).toEqual([{ type: "result", ok: false, subtype: "error" }]);
+    expect(results).toEqual([{ type: "result", ok: false, subtype: "error", turn: 1 }]);
   });
 
   it("interrupt() aborts the in-flight stream and yields one interrupted result", async () => {
@@ -445,7 +445,7 @@ describe("OllamaBackend", () => {
     })();
     await done;
     const results = events.filter((e) => e.type === "result");
-    expect(results).toEqual([{ type: "result", ok: false, subtype: "interrupted" }]);
+    expect(results).toEqual([{ type: "result", ok: false, subtype: "interrupted", turn: 1 }]);
     expect(events.some((e) => e.type === "error")).toBe(false); // interrupt is not an error
   });
 

@@ -332,8 +332,8 @@ describe("PiBackend turns", () => {
       "Second",
     ]);
     expect(events.filter((e) => e.type === "result")).toEqual([
-      { type: "result", ok: true, subtype: "end_turn" },
-      { type: "result", ok: true, subtype: "end_turn" },
+      { type: "result", ok: true, subtype: "end_turn", turn: 1 },
+      { type: "result", ok: true, subtype: "end_turn", turn: 2 },
     ]);
 
     // Turn 1: fresh (no --session), --mode json, persona prepended, model set.
@@ -468,7 +468,7 @@ describe("PiBackend turns", () => {
     expect(err.message).toContain("code 7");
     expect(err.message).toContain("quota exceeded");
     expect(events.filter((e) => e.type === "result")).toEqual([
-      { type: "result", ok: false, subtype: "error" },
+      { type: "result", ok: false, subtype: "error", turn: 1 },
     ]);
   });
 
@@ -480,7 +480,7 @@ describe("PiBackend turns", () => {
     const events = await collect(backend.run({ channel: channelOf([{ text: "hi" }]) }));
     expect(events.some((e) => e.type === "session")).toBe(false);
     expect(events.filter((e) => e.type === "result")).toEqual([
-      { type: "result", ok: false, subtype: "error" },
+      { type: "result", ok: false, subtype: "error", turn: 1 },
     ]);
   });
 
@@ -512,7 +512,7 @@ describe("PiBackend turns", () => {
     await drain;
     expect(hoisted.killed).toContain(hoisted.procs[0]!.pid);
     expect(events.filter((e) => e.type === "result")).toEqual([
-      { type: "result", ok: false, subtype: "cancelled" },
+      { type: "result", ok: false, subtype: "cancelled", turn: 1 },
     ]);
   });
 
@@ -527,7 +527,7 @@ describe("PiBackend turns", () => {
     await backend.interrupt();
     await drain;
     expect(events.filter((e) => e.type === "result")).toEqual([
-      { type: "result", ok: false, subtype: "cancelled" },
+      { type: "result", ok: false, subtype: "cancelled", turn: 1 },
     ]);
     if (hoisted.procs[0]) expect(hoisted.killed).toContain(hoisted.procs[0]!.pid);
   });
@@ -539,7 +539,7 @@ describe("PiBackend turns", () => {
     await new Promise((r) => setTimeout(r, 650));
     const events = await collect(backend.run({ channel: channelOf([{ text: "hi" }]) }));
     expect(events.filter((e) => e.type === "result")).toEqual([
-      { type: "result", ok: true, subtype: "end_turn" },
+      { type: "result", ok: true, subtype: "end_turn", turn: 1 },
     ]);
     expect(hoisted.killed).toEqual([]);
   });

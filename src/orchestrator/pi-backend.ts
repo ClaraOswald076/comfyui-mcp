@@ -69,6 +69,7 @@ import {
   type ModelChoice,
   type NeutralTurn,
   PI_CAPABILITIES,
+  stampTurn,
 } from "./agent-backend.js";
 
 /** The per-turn child: stdin ignored (pi takes the prompt via argv), stdout +
@@ -333,8 +334,9 @@ export class PiBackend implements AgentBackend {
       };
     }
 
+    let turnSeq = 0;
     for await (const turn of opts.channel) {
-      yield* this.runTurn(turn, cwd, opts.onActivity);
+      yield* stampTurn(this.runTurn(turn, cwd, opts.onActivity), ++turnSeq);
     }
   }
 

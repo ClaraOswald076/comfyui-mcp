@@ -78,6 +78,11 @@ const INIT = {
 
 const RESULT_SUCCESS = { type: "result", subtype: "success" };
 
+/** The interrupt landing in the SDK's REAL result vocabulary (#728 r9: an
+ *  interrupted turn ends with an error_during_execution result — there is no
+ *  "interrupted" result subtype). */
+const RESULT_INTERRUPTED = { type: "result", subtype: "error_during_execution" };
+
 function assistantMsg(text: string) {
   return {
     type: "assistant",
@@ -333,7 +338,7 @@ describe("Claude backend — interruptPending is strictly turn-scoped (#745 revi
     expect(errors[0].message).toContain("without producing a reply");
   });
 
-  it("a LATE result from an interrupted turn classifies by its OWN flags and leaves the next turn untouched", async () => {
+  it("a superseded interrupted turn never delivers — the first result classifies to the NEWER turn (#728 r10)", async () => {
     let releaseTurnB!: () => void;
     const gate = new Promise<void>((resolve) => {
       releaseTurnB = resolve;
@@ -347,29 +352,28 @@ describe("Claude backend — interruptPending is strictly turn-scoped (#745 revi
     hoisted.queue.push(INIT);
     await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
     // Turn A is interrupted mid-flight and produces NO result; the panel's
-    // no-result fallback releases the gate (panel-agent.ts:671 acknowledges the
-    // late result) and turn B is submitted.
+    // no-result fallback releases the gate and turn B is submitted. Per the
+    // r10 contract, a killed turn SUPERSEDED by a newer submission never
+    // delivers — so the FIRST result after the supersession is the newer
+    // turn's own, even as error_during_execution (A is written off/parked;
+    // pre-r10 this stream was attributed to A — that premise is rejected).
     await backend.interrupt();
     releaseTurnB();
     await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(2));
-    // NOW turn A's late empty result/success arrives: it is the interrupt
-    // landing for A → ok:true, NO synthetic failure attributed to the turn in
-    // flight, and turn B's state untouched.
-    hoisted.queue.push(RESULT_SUCCESS);
+    hoisted.queue.push(RESULT_INTERRUPTED); // classifies as B's genuine error
     await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(1));
-    expect(resultsOf(events)[0]).toMatchObject({ ok: true });
-    expect(errorsOf(events)).toHaveLength(0);
-    // Turn B's own empty result then classifies on B's flags → ok:false + the
-    // synthetic error, exactly as required for a genuinely empty turn.
-    hoisted.queue.push(RESULT_SUCCESS);
+    expect(resultsOf(events)[0]).toMatchObject({ ok: false, turn: 2 });
+    expect(errorsOf(events)).toHaveLength(0); // genuine error result — no synthetic error
+    // A's genuinely late landing, if it ever arrives, is then tolerated via
+    // its parked trace: blessed ok:true (the interrupt landing, not a failure),
+    // stamped with A's own marker — and turn B's classification untouched.
+    hoisted.queue.push(RESULT_INTERRUPTED);
     hoisted.queue.end();
     await done;
     const results = resultsOf(events);
     expect(results).toHaveLength(2);
-    expect(results[1]).toMatchObject({ ok: false });
-    const errors = errorsOf(events);
-    expect(errors).toHaveLength(1);
-    expect(errors[0].message).toContain("without producing a reply");
+    expect(results[1]).toMatchObject({ ok: true, turn: 1 });
+    expect(errorsOf(events)).toHaveLength(0);
   });
 
   it("an interrupt's blessing does not survive a session restart, and a stray result from the dead session fails closed", async () => {
