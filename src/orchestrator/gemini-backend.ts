@@ -74,6 +74,7 @@ import {
   type ModelChoice,
   type NeutralTurn,
   GEMINI_CAPABILITIES,
+  stampTurn,
 } from "./agent-backend.js";
 import type { ImageRef } from "./panel-agent.js";
 
@@ -825,6 +826,7 @@ export class GeminiBackend implements AgentBackend {
     };
 
     // Process the neutral channel one turn at a time.
+    let turnSeq = 0;
     for await (const turn of opts.channel) {
       // LIVE MODEL SWITCH (P1): PanelAgent treats setModel as live and does NOT
       // restart run() for a model-only change, so the persistent loop adopts it
@@ -842,7 +844,7 @@ export class GeminiBackend implements AgentBackend {
           ...(this.model ? { model: this.model } : {}),
         };
       }
-      yield* this.runTurn(this.client, turn, opts.onActivity);
+      yield* stampTurn(this.runTurn(this.client, turn, opts.onActivity), ++turnSeq);
     }
   }
 

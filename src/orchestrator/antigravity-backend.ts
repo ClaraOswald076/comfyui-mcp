@@ -81,6 +81,7 @@ import {
   type ModelChoice,
   type NeutralTurn,
   ANTIGRAVITY_CAPABILITIES,
+  stampTurn,
 } from "./agent-backend.js";
 import type { GeminiMcpServerSpec } from "./gemini-backend.js";
 
@@ -551,8 +552,9 @@ export class AntigravityBackend implements AgentBackend {
       ...(this.model ? { model: this.model } : {}),
     };
 
+    let turnSeq = 0;
     for await (const turn of opts.channel) {
-      yield* this.runTurn(turn, cwd, opts.onActivity);
+      yield* stampTurn(this.runTurn(turn, cwd, opts.onActivity), ++turnSeq);
     }
   }
 

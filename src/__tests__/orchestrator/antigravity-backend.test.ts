@@ -422,8 +422,8 @@ describe("AntigravityBackend turns", () => {
       "Second answer",
     ]);
     expect(events.filter((e) => e.type === "result")).toEqual([
-      { type: "result", ok: true, subtype: "end_turn" },
-      { type: "result", ok: true, subtype: "end_turn" },
+      { type: "result", ok: true, subtype: "end_turn", turn: 1 },
+      { type: "result", ok: true, subtype: "end_turn", turn: 2 },
     ]);
 
     // Turn 1: fresh (-p, no -c), persona prepended, model + skip-permissions set.
@@ -491,7 +491,7 @@ describe("AntigravityBackend turns", () => {
     expect(err.message).toContain("code 7");
     expect(err.message).toContain("quota exceeded");
     expect(events.filter((e) => e.type === "result")).toEqual([
-      { type: "result", ok: false, subtype: "error" },
+      { type: "result", ok: false, subtype: "error", turn: 1 },
     ]);
   });
 
@@ -517,7 +517,7 @@ describe("AntigravityBackend turns", () => {
     await drain;
     expect(hoisted.killed).toContain(hoisted.procs[0]!.pid);
     expect(events.filter((e) => e.type === "result")).toEqual([
-      { type: "result", ok: false, subtype: "cancelled" },
+      { type: "result", ok: false, subtype: "cancelled", turn: 1 },
     ]);
   });
 
@@ -543,7 +543,7 @@ describe("AntigravityBackend turns", () => {
     await drain;
 
     expect(events.filter((e) => e.type === "result")).toEqual([
-      { type: "result", ok: false, subtype: "cancelled" },
+      { type: "result", ok: false, subtype: "cancelled", turn: 1 },
     ]);
     // and the child must not be left running
     if (hoisted.procs[0]) expect(hoisted.killed).toContain(hoisted.procs[0]!.pid);
@@ -556,7 +556,7 @@ describe("AntigravityBackend turns", () => {
     await new Promise((r) => setTimeout(r, 650)); // let it expire (no turn started)
     const events = await collect(backend.run({ channel: channelOf([{ text: "hi" }]) }));
     expect(events.filter((e) => e.type === "result")).toEqual([
-      { type: "result", ok: true, subtype: "end_turn" },
+      { type: "result", ok: true, subtype: "end_turn", turn: 1 },
     ]);
     expect(hoisted.killed).toEqual([]);
   });
@@ -571,7 +571,7 @@ describe("AntigravityBackend turns", () => {
     const err = events.find((e) => e.type === "error") as { message: string };
     expect(err.message).toMatch(/too large/i);
     expect(events.filter((e) => e.type === "result")).toEqual([
-      { type: "result", ok: false, subtype: "error" },
+      { type: "result", ok: false, subtype: "error", turn: 1 },
     ]);
   });
 

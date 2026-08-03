@@ -18,8 +18,12 @@
 // `error` event already painted the failure line suppresses the stall warning,
 // and a late `error` event after the stall warning suppresses the error line.
 // And when the fallback abandons a turn (force-release with no result), the dead
-// turn's straggler `error`/`result` are dead-lettered — never painted against,
-// and never completing the gate of, the turn that replaces it (r2).
+// turn's stragglers are dead-lettered by BACKEND-MINTED TURN MARKER (r3): every
+// event is stamped with the monotonic marker of the turn it belongs to, so an
+// event stamped OLDER than the in-flight turn (or ≤ the abandoned turn's marker)
+// is logged but never painted and never gate-affecting — regardless of
+// interleaving with the new turn's own events. Backends that never stamp
+// (legacy) get NO dead-lettering — previous behavior.
 //
 // TURN_IDLE_MS / INTERRUPT_RELEASE_FALLBACK_MS are read from the env at
 // panel-agent module load, so set SHORT windows BEFORE importing the module.
@@ -57,7 +61,18 @@ const GATE_HELD_MS = 150;
  *  current one is held, mirroring the Claude SDK's independent input pump), so
  *  a turn-gate release is observable as a new turn being READ — independent of
  *  the withheld result. No events are ever emitted spontaneously, so the
- *  watchdog trips on schedule. */
+ *  watchdog trips on schedule.
+ *
+ *  TURN MARKERS (#728 r3): like the real backends, it mints a monotonic marker
+ *  per turn READ (1, 2, …) and stamps it on that turn's terminal event — even
+ *  when the event is emitted LATE, after a newer turn was read (true attribution
+ *  is the contract). Terminal emission is decoupled from the pump loop (the gate
+ *  promise is registered at READ time and emits itself), so a later turn's
+ *  terminal can land while an earlier turn's is still withheld. Test-driven
+ *  emissions (emitError/emitEvent) carry an explicit marker so a straggler can
+ *  be attributed to a DEAD turn on purpose. `legacy = true` suppresses all
+ *  markers, modeling a third-party backend that never stamps (PanelAgent must
+ *  then do NO dead-lettering — previous behavior). */
 class HeldResultBackend implements AgentBackend {
   readonly id = "claude" as const;
   readonly capabilities = CLAUDE_CAPABILITIES;
@@ -67,6 +82,12 @@ class HeldResultBackend implements AgentBackend {
    *  the test alone decides when (if ever) the interrupted result lands. Set to
    *  true right before agent.stop() so teardown's interrupt unwinds the pump. */
   releaseOnInterrupt = false;
+  /** Legacy mode: emit every event WITHOUT a turn marker (third-party backend). */
+  legacy = false;
+  /** Turns with marker ≥ this emit LIVENESS (onActivity pings) while held — a
+   *  healthy working backend, so the (correctly re-armed) watchdog stays quiet
+   *  for them during long observation windows. Default ∞: nothing pings. */
+  livenessFromTurn = Number.POSITIVE_INFINITY;
   private startedCount = 0;
   private startedWaiters: Array<{ n: number; resolve: () => void }> = [];
 
@@ -100,24 +121,35 @@ class HeldResultBackend implements AgentBackend {
     });
   }
 
-  /** Release the OLDEST held turn, emitting `ev` as its terminal event (default:
-   *  the interrupt landing). Turn 2+ can thus end with a SUCCESS result while the
-   *  stalled turn's straggler is the interrupted one. */
-  releaseTurn(ev: AgentEvent = { type: "result", ok: false, subtype: "interrupted" }): void {
-    this.releaseResolvers.shift()?.(ev);
+  /** Release the held turn whose marker is `n` (1 = the first turn read),
+   *  emitting `ev` as its terminal event (default: the interrupt landing),
+   *  stamped with turn n so even a LATE straggler is attributed to its own turn. */
+  releaseTurn(n: number, ev: AgentEvent = { type: "result", ok: false, subtype: "interrupted" }): void {
+    this.held.get(n)?.(ev);
   }
 
-  /** Emit an `error` event for the in-flight turn (test-controlled) — the way
-   *  codex/gemini/grok report a turn failure BEFORE their terminal result. The
-   *  error leaves the turn ACTIVE (no result), so the watchdog can still trip. */
-  emitError(message: string): void {
-    this.emitFn?.({ type: "error", message });
+  /** Emit an `error` event (test-controlled) — the way codex/gemini/grok report
+   *  a turn failure BEFORE their terminal result. The error leaves the turn
+   *  ACTIVE (no result), so the watchdog can still trip. `turn` is the marker it
+   *  belongs to (the DEAD turn's marker manufactures a straggler). */
+  emitError(message: string, turn?: number): void {
+    this.emitFn?.({
+      type: "error",
+      message,
+      ...(turn !== undefined && !this.legacy ? { turn } : {}),
+    });
+  }
+
+  /** Emit any event verbatim (test-controlled, marker included as given). */
+  emitEvent(ev: AgentEvent): void {
+    this.emitFn?.(ev);
   }
 
   private emitFn: ((ev: AgentEvent) => void) | null = null;
-  /** One resolver per in-flight turn, FIFO — resolved by `releaseTurn()` with the
-   *  terminal event to emit for that turn. */
-  private releaseResolvers: Array<(ev: AgentEvent) => void> = [];
+  /** Held terminal gates by marker — resolved by `releaseTurn()` with the
+   *  terminal event to emit. Registered AT READ TIME so a later turn can be
+   *  released while an earlier one is still withheld. */
+  private held = new Map<number, (ev: AgentEvent) => void>();
 
   async *run(opts: BackendStartOptions): AsyncGenerator<AgentEvent> {
     const out: AgentEvent[] = [];
@@ -129,33 +161,44 @@ class HeldResultBackend implements AgentBackend {
       wakeOut = null;
     };
 
-    // INPUT PUMP — concurrent, read-ahead, manual per-turn result release.
+    // INPUT PUMP — read each turn as the gate releases it; hold its terminal
+    // event until the test releases it. Record + register at READ time (via the
+    // read promise itself), NOT at a pump loop top that only advances after the
+    // previous turn's release — an early (buggy) gate release or an out-of-order
+    // terminal would otherwise be invisible to the test.
     const pump = (async () => {
       const it = opts.channel[Symbol.asyncIterator]();
-      // Record each turn at READ time — the moment the gate releases it into the
-      // backend — via the read promise itself, NOT at the pump loop top: the loop
-      // only consumes the read-ahead AFTER this turn's withheld result, which
-      // would make an early (buggy) gate release invisible to the test.
+      let marker = 0;
       const read = () =>
         it.next().then((res) => {
-          if (!res.done) {
-            this.turns.push(res.value.text);
-            this.markStarted();
+          if (res.done) return res;
+          marker += 1; // mint: the marker of the turn just read
+          const k = marker;
+          this.turns.push(res.value.text);
+          this.markStarted();
+          // SILENCE: no events for this turn until the test releases its
+          // terminal event. The gate emits ITSELF when released — decoupled
+          // from this pump's read loop, so any turn's terminal can land while
+          // an earlier turn's is still withheld.
+          const gate = new Promise<AgentEvent>((resolve) => {
+            this.held.set(k, resolve);
+          });
+          void gate.then((terminal) => {
+            this.held.delete(k);
+            emit(this.legacy ? terminal : { ...terminal, turn: k });
+          });
+          // Liveness for healthy held turns (opt-in per test): re-arms the
+          // panel's idle watchdog so it correctly does NOT trip them.
+          if (k >= this.livenessFromTurn) {
+            const ping = setInterval(() => opts.onActivity?.(), 40);
+            ping.unref?.();
+            void gate.then(() => clearInterval(ping));
           }
           return res;
         });
       let r = await read(); // read turn 1
       while (!r.done) {
-        // DECOUPLED read-ahead: begin reading the NEXT turn now (parks at the
-        // turn gate while this turn is held) — mirrors the SDK input pump.
-        const readAhead = read();
-        // SILENCE: no events for this turn until the test releases its terminal
-        // event (an interrupted result, or whatever releaseTurn was given).
-        const terminal = await new Promise<AgentEvent>((resolve) => {
-          this.releaseResolvers.push(resolve);
-        });
-        emit(terminal);
-        r = await readAhead;
+        r = await read(); // gated by the panel's turn gate — one per release
       }
       inputDone = true;
       wakeOut?.();
@@ -185,8 +228,8 @@ class HeldResultBackend implements AgentBackend {
     // test armed releaseOnInterrupt (teardown), which lets agent.stop()'s
     // interrupt unwind the pump so the run loop can end.
     if (!this.releaseOnInterrupt) return;
-    const held = this.releaseResolvers;
-    this.releaseResolvers = [];
+    const held = [...this.held.values()];
+    this.held.clear();
     for (const r of held) r({ type: "result", ok: false, subtype: "interrupted" });
   }
 
@@ -243,7 +286,7 @@ describe("stall watchdog interrupt reports once and holds the turn gate (#728)",
 
     // The backend delivers the interrupted turn's terminal result — the genuine
     // turn end. NOW the gate opens and the queued turn drains.
-    backend.releaseTurn();
+    backend.releaseTurn(1);
     await backend.waitStarted(2);
     expect(backend.turns[1]).toContain("second message");
 
@@ -306,7 +349,7 @@ describe("stall watchdog interrupt reports once and holds the turn gate (#728)",
     agent.send("second message queued behind the stall");
 
     // The backend reports the turn's failure, then goes silent (no result).
-    backend.emitError("provider exploded");
+    backend.emitError("provider exploded", 1);
     await waitFor(() => says.some((s) => /turn failed/i.test(s)));
 
     // The watchdog still trips on the silence (the error left the turn active)
@@ -349,8 +392,8 @@ describe("stall watchdog interrupt reports once and holds the turn gate (#728)",
 
     // A late `error` event arrives for the same (already-reported) turn, then
     // the interrupted result settles the turn and opens the gate.
-    backend.emitError("late backend error");
-    backend.releaseTurn();
+    backend.emitError("late backend error", 1);
+    backend.releaseTurn(1);
     await backend.waitStarted(2);
     expect(backend.turns[1]).toContain("second message");
 
@@ -372,6 +415,10 @@ describe("stall watchdog interrupt reports once and holds the turn gate (#728)",
     // turn completes on its OWN result.
     const says: string[] = [];
     const backend = new HeldResultBackend();
+    // Turn 2+ is a HEALTHY working backend (liveness pings) — only turn 1 is
+    // frozen — so turn 2's (correctly re-armed) watchdog stays quiet while the
+    // test holds it through the straggler-observation windows.
+    backend.livenessFromTurn = 2;
     const agent = new PanelAgent("tab-728e", makeDeps(says) as never, backend);
     void agent.start();
 
@@ -389,18 +436,18 @@ describe("stall watchdog interrupt reports once and holds the turn gate (#728)",
     agent.send("third message");
 
     // Straggler #1: the DEAD turn's late error — dead-lettered, never painted.
-    backend.emitError("late old-turn error");
+    backend.emitError("late old-turn error", 1);
     await new Promise((r) => setTimeout(r, 100));
     expect(says.filter((s) => s.includes("⚠️"))).toHaveLength(1); // still only the stall warning
 
     // Straggler #2: the DEAD turn's late result — dead-lettered; it must NOT
     // complete turn 2's gate, so turn 3 stays parked.
-    backend.releaseTurn(); // FIFO: turn 1's withheld terminal (interrupted)
+    backend.releaseTurn(1); // turn 1's withheld terminal (interrupted)
     await new Promise((r) => setTimeout(r, GATE_HELD_MS));
     expect(backend.turns).toEqual(["first message", "second message"]);
 
     // Turn 2's OWN result (success) completes turn 2 → turn 3 drains.
-    backend.releaseTurn({ type: "result", ok: true, subtype: "success" });
+    backend.releaseTurn(2, { type: "result", ok: true, subtype: "success" });
     await backend.waitStarted(3);
     expect(backend.turns[2]).toContain("third message");
 
@@ -412,5 +459,123 @@ describe("stall watchdog interrupt reports once and holds the turn gate (#728)",
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toMatch(/stopped responding/i);
     expect(says.join("\n")).not.toMatch(/turn failed/i);
+  });
+
+  it("result-only new turn after a fallback abandonment is NOT dead-lettered (no wedge)", async () => {
+    // The r3 codex-gate finding #1: after the fallback abandons A, B's VALID
+    // first event may be its terminal result (the event contract permits
+    // result-only turns). With markers it is stamped B — not A — so it reaches
+    // completeTurn() and B's gate opens. (The credit heuristic dead-lettered it
+    // as A's and wedged B.)
+    const says: string[] = [];
+    const backend = new HeldResultBackend();
+    const agent = new PanelAgent("tab-728f", makeDeps(says) as never, backend);
+    void agent.start();
+
+    agent.send("first message");
+    await backend.waitStarted(1);
+    agent.send("second message");
+
+    // A stalls → watchdog → fallback abandons A (its result NEVER comes) → B.
+    await waitFor(() => tripped(backend, says));
+    await backend.waitStarted(2);
+    expect(backend.turns).toEqual(["first message", "second message"]);
+    agent.send("third message"); // queued behind B's gate
+
+    // B's FIRST and ONLY event is its terminal result — stamped 2, so it
+    // completes B's gate even though A's terminal never arrived.
+    backend.releaseTurn(2, { type: "result", ok: true, subtype: "success" });
+    await backend.waitStarted(3); // would time out if B were wedged
+    expect(backend.turns[2]).toContain("third message");
+
+    backend.releaseOnInterrupt = true; // let stop()'s interrupt unwind the pump
+    await agent.stop();
+
+    const warnings = says.filter((s) => s.includes("⚠️"));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/stopped responding/i);
+  });
+
+  it("new turn's work before the dead turn's late terminal keeps the straggler dead-lettered", async () => {
+    // The r3 codex-gate finding #2: B emits ordinary work BEFORE A's late
+    // terminal. Markers make attribution order-independent — A's terminal is
+    // stamped 1, so it is dead-lettered no matter what B emitted first: no wrong
+    // report, no premature gate completion. (The credit heuristic cleared the
+    // credit on B's work and then attributed A's terminal to B.)
+    const says: string[] = [];
+    const backend = new HeldResultBackend();
+    backend.livenessFromTurn = 2; // B works healthily while held (see test E)
+    const agent = new PanelAgent("tab-728g", makeDeps(says) as never, backend);
+    void agent.start();
+
+    agent.send("first message");
+    await backend.waitStarted(1);
+    agent.send("second message");
+
+    await waitFor(() => tripped(backend, says));
+    await backend.waitStarted(2);
+    expect(backend.turns).toEqual(["first message", "second message"]);
+    agent.send("third message"); // queued behind B's gate
+
+    // B's valid work arrives FIRST (stamped 2 → processed normally)…
+    backend.emitEvent({ type: "assistant", text: "B is working", turn: 2 });
+    await waitFor(() => says.some((s) => s.includes("B is working")));
+
+    // …THEN A's late terminal (stamped 1): still dead-lettered — turn 3 parked.
+    backend.releaseTurn(1);
+    await new Promise((r) => setTimeout(r, GATE_HELD_MS));
+    expect(backend.turns).toEqual(["first message", "second message"]);
+
+    // B's OWN terminal completes B → turn 3 drains.
+    backend.releaseTurn(2, { type: "result", ok: true, subtype: "success" });
+    await backend.waitStarted(3);
+    expect(backend.turns[2]).toContain("third message");
+
+    backend.releaseOnInterrupt = true; // let stop()'s interrupt unwind the pump
+    await agent.stop();
+
+    // No wrong report: only the original stall warning.
+    const warnings = says.filter((s) => s.includes("⚠️"));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/stopped responding/i);
+    expect(says.join("\n")).not.toMatch(/turn failed/i);
+  });
+
+  it("legacy no-marker backend gets NO dead-lettering (previous behavior)", async () => {
+    // A backend that never stamps turn markers must behave exactly as before
+    // this PR series: PanelAgent can't attribute stragglers, so it does NOT
+    // dead-letter — better a rare duplicate than a wedge.
+    const says: string[] = [];
+    const backend = new HeldResultBackend();
+    backend.legacy = true; // emit everything WITHOUT a turn marker
+    const agent = new PanelAgent("tab-728h", makeDeps(says) as never, backend);
+    void agent.start();
+
+    agent.send("first message");
+    await backend.waitStarted(1);
+    agent.send("second message");
+
+    await waitFor(() => tripped(backend, says));
+    await backend.waitStarted(2);
+    expect(backend.turns).toEqual(["first message", "second message"]);
+    agent.send("third message"); // queued behind turn 2's gate
+
+    // Unmarked straggler error → processed (painted), exactly as pre-markers.
+    backend.emitError("legacy straggler error");
+    await waitFor(() => says.some((s) => /turn failed/i.test(s)));
+
+    // Unmarked straggler result → completes the gate, exactly as pre-markers:
+    // turn 3 drains WITHOUT turn 2's own result ever arriving.
+    backend.releaseTurn(1);
+    await backend.waitStarted(3);
+    expect(backend.turns[2]).toContain("third message");
+
+    backend.releaseOnInterrupt = true; // let stop()'s interrupt unwind the pump
+    await agent.stop();
+
+    const warnings = says.filter((s) => s.includes("⚠️"));
+    expect(warnings).toHaveLength(2); // stall warning + the painted straggler error
+    expect(warnings[0]).toMatch(/stopped responding/i);
+    expect(warnings[1]).toMatch(/turn failed/i);
   });
 });

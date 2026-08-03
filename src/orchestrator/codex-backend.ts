@@ -51,6 +51,7 @@ import {
   type ModelChoice,
   type NeutralTurn,
   CODEX_CAPABILITIES,
+  stampTurn,
 } from "./agent-backend.js";
 import type { ImageRef } from "./panel-agent.js";
 
@@ -944,8 +945,9 @@ export class CodexBackend implements AgentBackend {
     // Process the neutral channel one turn at a time. onActivity is the LIVENESS
     // signal — every raw app-server notification for the active turn re-arms
     // PanelAgent's idle watchdog so a long, quiet generation doesn't falsely trip.
+    let turnSeq = 0;
     for await (const turn of opts.channel) {
-      yield* this.runTurn(client, turn, opts.onActivity);
+      yield* stampTurn(this.runTurn(client, turn, opts.onActivity), ++turnSeq);
       // A timed-out interrupt detaches this client. End the old run before it can
       // consume another queued turn; PanelAgent will start a fresh app-server.
       if (this.client !== client) return;

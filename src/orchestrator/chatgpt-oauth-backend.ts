@@ -8,7 +8,7 @@ import { randomUUID } from "node:crypto";
 import { logger } from "../utils/logger.js";
 import { errorText } from "./error-text.js";
 import type { AgentEvent, BackendStartOptions, ModelChoice, NeutralTurn } from "./agent-backend.js";
-import { CHATGPT_CAPABILITIES } from "./agent-backend.js";
+import { CHATGPT_CAPABILITIES, stampTurn } from "./agent-backend.js";
 import { resolveOpenAICodexOAuth } from "../services/code-provider-auth.js";
 import { OllamaBackend, type OllamaBackendDeps } from "./ollama-backend.js";
 
@@ -321,8 +321,9 @@ export class ChatGptOAuthBackend extends OllamaBackend {
 
     const instructions = [CHATGPT_SYSTEM_PROMPT, this.deps.systemAppend].filter(Boolean).join("\n\n");
 
+    let turnSeq = 0;
     for await (const turn of opts.channel) {
-      yield* this.runCodexTurn(turn, instructions, opts);
+      yield* stampTurn(this.runCodexTurn(turn, instructions, opts), ++turnSeq);
     }
   }
 

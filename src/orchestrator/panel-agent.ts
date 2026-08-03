@@ -262,15 +262,19 @@ export class PanelAgent {
    *  the one parked on the gate, so a stale timer can't cut a later, legit turn
    *  short. Refreshed on every interrupt(). See armInterruptReleaseFallback(). */
   private interruptGuardTurn = 0;
-  /** Turns the interrupt-release fallback ABANDONED (force-released with no
-   *  terminal result) whose straggler emissions may still arrive — the turn-epoch
-   *  attribution for events, which carry no turn id: the backend streams turns
-   *  strictly sequentially, so while this is > 0 an `error`/`result` belongs to a
-   *  DEAD turn and is dead-lettered (logged, never painted, never completes the
-   *  NEW turn's gate — #728 r2). A `result` consumes one credit (the dead turn's
-   *  terminal); any ordinary work event (assistant/tool_call/…) proves the backend
-   *  moved past the dead turn(s) with no result coming and clears the rest. */
-  private deadLetterTurns = 0;
+  /** Monotonic marker of the CURRENT in-flight turn, mirrored from the backend's
+   *  mint: the backend increments its marker once per turn it reads from the
+   *  channel and stamps it on every event of that turn; PanelAgent increments
+   *  this once per turn it YIELDS — same sequence, same reset point (run start)
+   *  — so the Nth dispatched turn's events all carry marker N (#728 r3). Events
+   *  stamped with an OLDER marker are stragglers from an abandoned turn and are
+   *  dead-lettered (see handleEvent). Backends that never stamp (turn undefined)
+   *  get NO dead-lettering — previous behavior. */
+  private currentTurnMarker = 0;
+  /** Marker of the turn the interrupt-release fallback most recently ABANDONED
+   *  (force-released with no terminal result). Its stragglers are provably dead
+   *  even before the next dispatch increments currentTurnMarker. 0 = none. */
+  private abandonedTurnMarker = 0;
   /** Mutable so the model/effort picker can change them at runtime. */
   private model: string;
   private effort?: Effort;
@@ -640,10 +644,11 @@ export class PanelAgent {
         logger.debug(
           `[panel-agent ${this.short()}] interrupt: no result within ${INTERRUPT_RELEASE_FALLBACK_MS}ms — releasing the gate`,
         );
-        // Mark the abandoned turn CLOSED: its terminal result never arrived, so a
-        // straggler `error`/`result` from it must dead-letter (logged only) rather
-        // than paint against — or complete the gate of — the turn that replaces it.
-        this.deadLetterTurns += 1;
+        // Mark the abandoned turn CLOSED: its terminal result never arrived, so
+        // its straggler emissions are provably dead (their stamped marker is ≤
+        // this watermark) and dead-letter rather than paint against — or complete
+        // the gate of — the turn that replaces it.
+        this.abandonedTurnMarker = this.currentTurnMarker;
         this.releaseTurns();
       }
     }, INTERRUPT_RELEASE_FALLBACK_MS);
@@ -756,6 +761,9 @@ export class PanelAgent {
       // re-queue it (send-now must address BOTH the interrupted and new message).
       this.inFlight = { text, ...(images.length ? { images } : {}) };
       this.yieldedTurns += 1; // this batch is turn N
+      // Mirror the backend's turn-marker mint: the Nth turn yielded here is the
+      // Nth turn the backend reads — its events carry marker N (#728 r3).
+      this.currentTurnMarker += 1;
       // Mark the turn in flight AT DISPATCH (not on the first event). Without this
       // the watchdog's `busy` guard would be false for the exact zero-event freeze
       // it's meant to catch, so onTurnStalled() would no-op. (handleEvent's later
@@ -767,6 +775,13 @@ export class PanelAgent {
       // the outgoing turn's result restore the wrong context window (#543).
       this.turnModel = this.model;
       this.deps.onTurn?.(this.tabId, "working");
+      // Drop the PREVIOUS turn's watchdog state at dispatch: a stale idle timer
+      // left by an abandoned turn (its result never disarmed it — e.g. after the
+      // interrupt fallback, whose stragglers are now dead-lettered instead) would
+      // otherwise fire into THIS turn and trip it spuriously, and a latched
+      // idleTripped would leave this turn with no watchdog at all. Fresh turn →
+      // fresh watchdog.
+      this.clearIdleWatchdog();
       // Arm the freeze watchdog AT DISPATCH: a turn that produces NO events at all
       // (the exact ROOT CAUSE B freeze — turn/start sent, no notifications ever
       // returned) never reaches handleEvent, so arming here is what catches it.
@@ -816,13 +831,15 @@ export class PanelAgent {
       // recoverable resume-miss from counting toward the give-up threshold.
       let resumeMiss = false;
       // Fresh channel → reset the turn-gate counters so a restart/resume never
-      // inherits a stale offset that would mis-gate the first batch. A restarted
-      // session can also never receive the OLD session's straggler emissions, so
-      // any dead-letter credits die with it.
+      // inherits a stale offset that would mis-gate the first batch. The backend's
+      // turn-marker mint also restarts with the new run, so the mirrored markers
+      // reset too (and a restarted session can never receive the OLD session's
+      // straggler emissions anyway).
       this.yieldedTurns = 0;
       this.completedTurns = 0;
       this.turnWaiter = null;
-      this.deadLetterTurns = 0;
+      this.currentTurnMarker = 0;
+      this.abandonedTurnMarker = 0;
       // Drop the prior session's last assistant UUID so a fork can't report a
       // stale (pre-fork) anchor for the first turn of the new session.
       this.lastAssistantUuid = null;
@@ -1017,30 +1034,22 @@ export class PanelAgent {
     // this agent was retired in favor of (a leak of the old workflow's reply/session into
     // the switched-to one). Dropping the event is safe: a stopped agent's turn is over.
     if (this.closed) return;
-    // DEAD-LETTER (#728 r2): events attributed to a turn the interrupt-release
-    // fallback already abandoned (force-released with no terminal result). The
-    // backend streams turns strictly sequentially, so while deadLetterTurns > 0
-    // an `error` is the DEAD turn's trailing failure report (never painted against
-    // the new turn) and a `result` is the dead turn's terminal (consumes one
-    // credit; must NOT completeTurn — that would open the NEW turn's gate early,
-    // and must not clear the new turn's watchdog/busy either). Any ordinary work
-    // event proves the backend moved past the dead turn(s) with no result coming,
-    // so the remaining credits are dropped and the event is handled normally.
-    if (this.deadLetterTurns > 0) {
-      if (ev.type === "result") {
-        this.deadLetterTurns -= 1;
-        logger.debug(
-          `[panel-agent ${this.short()}] dead-lettered a straggler result (subtype=${ev.subtype}) from an abandoned turn`,
-        );
-        return;
-      }
-      if (ev.type === "error") {
-        logger.debug(
-          `[panel-agent ${this.short()}] dead-lettered a straggler error from an abandoned turn`,
-        );
-        return;
-      }
-      this.deadLetterTurns = 0;
+    // DEAD-LETTER by turn marker (#728 r3): an event stamped with a turn OLDER
+    // than the in-flight turn — or belonging to the fallback-abandoned turn — is
+    // a straggler from a turn that is no longer current. It is logged but NEVER
+    // painted (a dead turn's error must not report against the new turn) and
+    // NEVER gate-affecting (a dead turn's result must not completeTurn the new
+    // turn's gate early, nor clear its watchdog/busy). Events with NO marker
+    // (legacy backend, or session-level traffic) skip this entirely — previous
+    // behavior; better a rare duplicate than a wedge.
+    if (
+      typeof ev.turn === "number" &&
+      (ev.turn <= this.abandonedTurnMarker || ev.turn < this.currentTurnMarker)
+    ) {
+      logger.debug(
+        `[panel-agent ${this.short()}] dead-lettered a straggler ${ev.type} from turn ${ev.turn} (current=${this.currentTurnMarker}, abandoned≤${this.abandonedTurnMarker})`,
+      );
+      return;
     }
     // Any event means the turn is alive — reset the idle watchdog. The `result`
     // case below disarms it entirely (turn ended). Placed before the switch so it

@@ -365,6 +365,12 @@ export class ClaudeBackend implements AgentBackend {
     }
     const q = query({ prompt: prompt(), options: this.buildOptions(opts) });
     this.q = q;
+    // TURN MARKERS (#728): the SDK's input pump and output reader are independent
+    // streams, so the marker can't ride the input side — instead stamp output-side
+    // by turn boundary: the SDK ends every turn with a `result` message, so events
+    // between results belong to that turn. The count restarts with each run(),
+    // matching PanelAgent's per-dispatch mirror (Nth submitted turn = marker N).
+    let outTurn = 1;
     for await (const message of q) {
       // LIVENESS: every SDKMessage — including the ones route() doesn't translate
       // (tool-progress, rate-limit, etc.) — is a sign the session is alive, so
@@ -372,7 +378,12 @@ export class ClaudeBackend implements AgentBackend {
       // this is effectively a no-op for behavior here; it keeps the watchdog's
       // re-arm source uniform across both backends via the port.
       opts.onActivity?.();
-      yield* this.route(message);
+      for (const ev of this.route(message)) {
+        // Session init arrives OUTSIDE any turn — leave it unstamped (an unmarked
+        // event is never dead-lettered). Everything else belongs to outTurn.
+        yield ev.type === "session" ? ev : { ...ev, turn: outTurn };
+      }
+      if (message.type === "result") outTurn += 1;
     }
   }
 
