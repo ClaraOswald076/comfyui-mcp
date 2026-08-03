@@ -15,7 +15,7 @@
 // default layout working — and "no answer" means no HTTP Response object exists,
 // not merely a reply we could not decode.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -387,6 +387,92 @@ describe("readWorkflowFromPath: a refusal is never mistaken for an unreachable s
     expect(fetchInit).toHaveBeenCalledWith(
       expect.objectContaining({ headers: expect.objectContaining({ "Comfy-User": "default" }) }),
     );
+  });
+
+  it("the local fallback will not load a file whose on-disk name is spelled differently", async () => {
+    // resolve() answers in the filesystem's terms: on a case-insensitive volume
+    // "foo.json" opens an on-disk "Foo.json", which is exactly the substitution the
+    // server path refuses. With ComfyUI unreachable there is no authority to say
+    // the two names are the same file, so the local branch must apply the same
+    // rule (codex MAJOR) — every segment has to appear verbatim in its directory.
+    const root = mkdtempSync(join(tmpdir(), "cmcp-userdir-"));
+    try {
+      const defaultDir = join(root, "user", "default", "workflows");
+      mkdirSync(defaultDir, { recursive: true });
+      writeFileSync(
+        join(defaultDir, "Foo.json"),
+        JSON.stringify({ nodes: [{ id: 81, type: "DifferentlyCasedNode" }], links: [] }),
+        "utf8",
+      );
+      process.env.COMFYUI_PATH = root;
+
+      fetchApi.mockRejectedValue(new Error("ECONNREFUSED"));
+
+      // Only a case-INSENSITIVE volume can even offer the wrong file here; on a
+      // case-sensitive one there is simply no candidate. Both must refuse, but only
+      // the former can name the near miss.
+      const caseInsensitiveVolume = existsSync(join(defaultDir, "foo.json"));
+
+      const { ctx, calls } = makeCtx();
+      const res = await loadWorkflow().handler({ path: "foo.json" }, ctx);
+
+      expect(res.isError).toBe(true);
+      expect(calls).toHaveLength(0);
+      if (caseInsensitiveVolume) {
+        // The differently-cased file is NAMED so the caller can retype it.
+        expect(JSON.stringify(res)).toMatch(/not spelled the way you asked/i);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("the local fallback does not let resolve() collapse a repeated separator", async () => {
+    // "recipes//foo.json" is a distinct key everywhere else in this resolver, but
+    // resolve() collapses the run and would open recipes/foo.json.
+    const root = mkdtempSync(join(tmpdir(), "cmcp-userdir-"));
+    try {
+      const nested = join(root, "user", "default", "workflows", "recipes");
+      mkdirSync(nested, { recursive: true });
+      writeFileSync(
+        join(nested, "foo.json"),
+        JSON.stringify({ nodes: [{ id: 82, type: "CollapsedSeparatorNode" }], links: [] }),
+        "utf8",
+      );
+      process.env.COMFYUI_PATH = root;
+
+      fetchApi.mockRejectedValue(new Error("ECONNREFUSED"));
+
+      const { ctx, calls } = makeCtx();
+      const res = await loadWorkflow().handler({ path: "recipes//foo.json" }, ctx);
+
+      expect(res.isError).toBe(true);
+      expect(calls).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("a nested EXACT name still loads from the reconstructed dir when unreachable", async () => {
+    // The strictness must not break the ordinary nested case it is guarding.
+    const root = mkdtempSync(join(tmpdir(), "cmcp-userdir-"));
+    try {
+      const nested = join(root, "user", "default", "workflows", "recipes");
+      mkdirSync(nested, { recursive: true });
+      const staged = { nodes: [{ id: 83, type: "ExactNestedNode" }], links: [] };
+      writeFileSync(join(nested, "foo.json"), JSON.stringify(staged), "utf8");
+      process.env.COMFYUI_PATH = root;
+
+      fetchApi.mockRejectedValue(new Error("ECONNREFUSED"));
+
+      const { ctx, calls } = makeCtx();
+      const res = await loadWorkflow().handler({ path: "recipes/foo.json" }, ctx);
+
+      expect(res.isError).toBeUndefined();
+      expect(calls[0].graph).toMatchObject(staged);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("a statusless transport error still allows the reconstructed local dir (default layout)", async () => {

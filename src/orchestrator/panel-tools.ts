@@ -25,7 +25,7 @@
 
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { extname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { comfyuiFetch } from "../comfyui/fetch.js";
@@ -2712,10 +2712,51 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
       return false;
     }
   };
+  /**
+   * Is `rel` the name the file on disk ACTUALLY has, segment for segment?
+   *
+   * `resolve(dir, rel)` answers in the filesystem's terms, not the store's (codex
+   * MAJOR). It collapses repeated separators, so "recipes//foo.json" — a distinct
+   * key everywhere else in this resolver — silently opens recipes/foo.json; and on
+   * a case-insensitive volume `foo.json` opens an on-disk `Foo.json`, the very
+   * substitution the server path refuses. That left the two branches applying
+   * different rules to the same input depending only on whether ComfyUI happened
+   * to answer.
+   *
+   * Walking the directory entries restores one rule: every segment must appear
+   * VERBATIM in its parent listing. An empty segment (from a repeated separator)
+   * can never match, and a case- or normalization-different on-disk name is
+   * refused exactly as it would be against the server.
+   */
+  const localNameIsExact = (base: string, name: string): boolean => {
+    // Split on BOTH separators: Windows resolve() honours either, so the check has
+    // to see the same segmentation the read would.
+    const segs = name.split(/[\\/]/);
+    let dir = base;
+    for (const seg of segs) {
+      let entries: string[];
+      try {
+        entries = readdirSync(dir);
+      } catch {
+        return false;
+      }
+      if (!entries.includes(seg)) return false;
+      dir = join(dir, seg);
+    }
+    return true;
+  };
+  // Spellings that exist on disk but are NOT what was asked for — reported so the
+  // refusal is actionable, never loaded.
+  const misspelled: string[] = [];
   const hits = comfyWorkflowsDirs()
     .map((dir) => ({ dir, path: resolve(dir, rel) }))
     .filter(({ path }) => existsSync(path) && statSync(path).isFile())
     .filter(({ dir, path }) => realBaseUnder(dir, path))
+    .filter(({ dir, path }) => {
+      if (localNameIsExact(dir, rel)) return true;
+      misspelled.push(path);
+      return false;
+    })
     .map(({ path }) => path);
   // De-duplicate by REAL path: the two guessed layouts can be the same directory
   // (a symlink/junction), which is one candidate, not an ambiguity.
@@ -2731,8 +2772,14 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
 
   throw new Error(
     `No workflow file at "${p}". It ${outcome.detail}, and it is not under the orchestrator's ` +
-      `reconstructed workflows dir (${comfyWorkflowsDirs().join(" or ") || "COMFYUI_PATH not set"}). ` +
-      `Pass an absolute path, or a name shown by list_workflows.`,
+      `reconstructed workflows dir (${comfyWorkflowsDirs().join(" or ") || "COMFYUI_PATH not set"}).` +
+      (misspelled.length
+        ? ` A file exists at ${misspelled.map((f) => `"${f}"`).join(", ")}, but its name on disk is` +
+          ` not spelled the way you asked (letter case, repeated separator, or Unicode` +
+          ` normalization), and with ComfyUI unreachable there is no authority to confirm they are` +
+          ` the same file — so it was NOT loaded. Retype the name exactly, or pass an absolute path.`
+        : "") +
+      ` Pass an absolute path, or a name shown by list_workflows.`,
   );
 }
 
