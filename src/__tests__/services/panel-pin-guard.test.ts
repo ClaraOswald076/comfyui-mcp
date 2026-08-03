@@ -6,34 +6,10 @@
 // and `id="all"` reached the SAME ComfyUI-Manager mutation without ever passing
 // the guard. A pinned user was one generic call away from being moved.
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import * as fs from "node:fs";
-import { spawnSync } from "node:child_process";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdtempSync, existsSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-
-const panelLockTestHooks = vi.hoisted(() => ({
-  beforeClaimWrite: undefined as undefined | (() => void),
-  afterCleanupWrite: undefined as undefined | (() => void),
-}));
-
-vi.mock("node:fs", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("node:fs")>();
-  return {
-    ...actual,
-    writeSync: (...args: Parameters<typeof actual.writeSync>) => {
-      const hook = panelLockTestHooks.beforeClaimWrite;
-      panelLockTestHooks.beforeClaimWrite = undefined;
-      hook?.();
-      const result = actual.writeSync(...args);
-      const afterCleanupWrite = panelLockTestHooks.afterCleanupWrite;
-      panelLockTestHooks.afterCleanupWrite = undefined;
-      afterCleanupWrite?.();
-      return result;
-    },
-  };
-});
 
 import {
   activePanelPendingOps,
@@ -59,9 +35,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  vi.restoreAllMocks();
-  panelLockTestHooks.beforeClaimWrite = undefined;
-  panelLockTestHooks.afterCleanupWrite = undefined;
   delete process.env.COMFYUI_MCP_PANEL_SETTINGS;
   delete process.env.COMFYUI_MCP_PANEL_LOCK;
   delete process.env.COMFYUI_MCP_PANEL_PENDING;
@@ -278,101 +251,17 @@ describe("withPanelMutationLock — a FILE lock, so it holds across processes", 
     expect(existsSync(panelLockPath())).toBe(true);
   });
 
-  it("reclaims a stale lock whose owner is demonstrably dead", async () => {
+  it("fails closed on a stale dead-owner lock and names the safe recovery boundary", async () => {
     const path = panelLockPath();
-    // The age and dead-pid gates are both required before reclaim.
     writeFileSync(path, JSON.stringify({ pid: 0x7fffffff }));
     const old = new Date(Date.now() - 60 * 60_000);
     const { utimesSync } = await import("node:fs");
     utimesSync(path, old, old);
-    await expect(withPanelMutationLock(async () => "recovered", { timeoutMs: 300 })).resolves.toBe(
-      "recovered",
-    );
-    expect(existsSync(path)).toBe(false);
-  });
-
-  it("does not delete a fresh cross-process replacement after observing a stale lock", async () => {
-    const path = panelLockPath();
-    const freshRecord = JSON.stringify({ pid: 12345, fresh: true });
-    writeFileSync(path, JSON.stringify({ pid: 0x7fffffff }));
-    const old = new Date(Date.now() - 60 * 60_000);
-    const { utimesSync } = await import("node:fs");
-    utimesSync(path, old, old);
-
-    // Run the replacement in a separate Node process after this process has
-    // observed the abandoned lock but before it records its reclaim claim. It
-    // models an already-running older orchestrator winning the old reclaim.
-    let replaced = false;
-    panelLockTestHooks.beforeClaimWrite = () => {
-      replaced = true;
-      const child = spawnSync(
-        process.execPath,
-        [
-          "-e",
-          `const fs=require('node:fs');fs.rmSync(${JSON.stringify(path)});fs.writeFileSync(${JSON.stringify(path)},${JSON.stringify(freshRecord)});`,
-        ],
-        { encoding: "utf-8" },
-      );
-      expect(child.status).toBe(0);
-    };
 
     await expect(
       withPanelMutationLock(async () => "must not run", { timeoutMs: 300 }),
-    ).rejects.toThrow(/Timed out/);
-    expect(replaced).toBe(true);
-    expect(fs.readFileSync(path, "utf-8")).toBe(freshRecord);
-  });
-
-  it("recovers after a dead claimant leaves an old partial reclaim record", async () => {
-    const path = panelLockPath();
-    const claim = `${path}.reclaim`;
-    writeFileSync(path, JSON.stringify({ pid: 0x7fffffff }));
-    writeFileSync(claim, "partial");
-    const old = new Date(Date.now() - 60 * 60_000);
-    const { utimesSync } = await import("node:fs");
-    utimesSync(path, old, old);
-    utimesSync(claim, old, old);
-
-    await expect(withPanelMutationLock(async () => "recovered", { timeoutMs: 500 })).resolves.toBe(
-      "recovered",
-    );
-    expect(existsSync(path)).toBe(false);
-    expect(existsSync(claim)).toBe(false);
-  });
-
-  it("does not delete a fresh claim that replaces an abandoned claim during cleanup", async () => {
-    const path = panelLockPath();
-    const claim = `${path}.reclaim`;
-    const freshClaim = JSON.stringify({ pid: process.pid, token: "fresh-claim" });
-    writeFileSync(path, JSON.stringify({ pid: 0x7fffffff }));
-    writeFileSync(claim, JSON.stringify({ pid: 0x7fffffff, token: "dead-claim" }));
-    const old = new Date(Date.now() - 60 * 60_000);
-    const { utimesSync } = await import("node:fs");
-    utimesSync(path, old, old);
-    utimesSync(claim, old, old);
-
-    // A separate process replaces the fixed claim after cleanup has taken its
-    // exclusive token. Snapshot equality must make cleanup leave this fresh
-    // token intact, so no later claimant can steal its base lock.
-    let replaced = false;
-    panelLockTestHooks.afterCleanupWrite = () => {
-      replaced = true;
-      const child = spawnSync(
-        process.execPath,
-        [
-          "-e",
-          `const fs=require('node:fs');fs.rmSync(${JSON.stringify(claim)});fs.writeFileSync(${JSON.stringify(claim)},${JSON.stringify(freshClaim)});`,
-        ],
-        { encoding: "utf-8" },
-      );
-      expect(child.status).toBe(0);
-    };
-
-    await expect(
-      withPanelMutationLock(async () => "must not run", { timeoutMs: 300 }),
-    ).rejects.toThrow(/Timed out/);
-    expect(replaced).toBe(true);
-    expect(fs.readFileSync(claim, "utf-8")).toBe(freshClaim);
+    ).rejects.toThrow(/stop or restart every comfyui-mcp orchestrator.*delete this exact lock file/i);
+    expect(existsSync(path)).toBe(true);
   });
 
   it("does NOT reclaim an old lock whose owner is still ALIVE", async () => {
@@ -413,39 +302,6 @@ describe("withPanelMutationLock — a FILE lock, so it holds across processes", 
       withPanelMutationLock(async () => "should not run", { timeoutMs: 300 }),
     ).rejects.toThrow(/Timed out/);
     expect(existsSync(path)).toBe(true);
-  });
-
-  it("keeps a concurrent contender behind the action that reclaimed the stale lock", async () => {
-    // The successor must acquire through the same exclusive-create loop, not
-    // run alongside the action that just reclaimed the abandoned holder.
-    const path = panelLockPath();
-    writeFileSync(path, JSON.stringify({ pid: 0x7fffffff }));
-    const old = new Date(Date.now() - 60 * 60_000);
-    const { utimesSync } = await import("node:fs");
-    utimesSync(path, old, old);
-
-    const order: string[] = [];
-    let releaseFirst: (() => void) | undefined;
-    const firstMayFinish = new Promise<void>((resolve) => {
-      releaseFirst = resolve;
-    });
-    const first = withPanelMutationLock(async () => {
-      order.push("reclaimed holder started");
-      await firstMayFinish;
-      order.push("reclaimed holder finished");
-    });
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    const second = withPanelMutationLock(async () => order.push("contender ran"));
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(order).toEqual(["reclaimed holder started"]);
-
-    releaseFirst?.();
-    await Promise.all([first, second]);
-    expect(order).toEqual([
-      "reclaimed holder started",
-      "reclaimed holder finished",
-      "contender ran",
-    ]);
   });
 
   it("resolves with the action's OWN result, and only after its side effects finished", async () => {

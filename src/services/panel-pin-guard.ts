@@ -29,7 +29,6 @@ import {
   openSync,
   readFileSync,
   rmSync,
-  statSync,
   writeFileSync,
   writeSync,
 } from "node:fs";
@@ -227,14 +226,6 @@ export function panelLockPath(): string {
   );
 }
 
-/**
- * A lock older than this is assumed abandoned by a crashed process. Panel
- * operations are ComfyUI-Manager queue cycles measured in seconds; ten minutes
- * is far beyond a legitimate one, so reclaiming at that point cannot cut a live
- * op short, while still guaranteeing a crash can never wedge pinning forever.
- */
-const STALE_LOCK_MS = 10 * 60_000;
-
 /** Default acquisition budget. Callers that must not block (the fire-and-forget
  *  on-load ensure) pass something much shorter. */
 const DEFAULT_ACQUIRE_MS = 60_000;
@@ -272,199 +263,6 @@ function pidAlive(pid: unknown): boolean {
   }
 }
 
-interface StaleLockSnapshot {
-  readonly raw: string;
-  readonly dev: number;
-  readonly ino: number;
-}
-
-function staleLockSnapshot(path: string): StaleLockSnapshot | undefined {
-  try {
-    const before = statSync(path);
-    if (Date.now() - before.mtimeMs <= STALE_LOCK_MS) return undefined;
-    const raw = readFileSync(path, "utf-8");
-    const after = statSync(path);
-    if (
-      before.dev !== after.dev ||
-      before.ino !== after.ino ||
-      before.mtimeMs !== after.mtimeMs ||
-      before.size !== after.size
-    ) {
-      return undefined;
-    }
-    let pid: unknown;
-    try {
-      pid = (JSON.parse(raw) as { pid?: unknown })?.pid;
-    } catch {
-      return undefined;
-    }
-    if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return undefined;
-    return pidAlive(pid) ? undefined : { raw, dev: after.dev, ino: after.ino };
-  } catch {
-    return undefined;
-  }
-}
-
-function stableLockFileSnapshot(path: string): StaleLockSnapshot | undefined {
-  try {
-    const before = statSync(path);
-    const raw = readFileSync(path, "utf-8");
-    const after = statSync(path);
-    if (
-      before.dev !== after.dev ||
-      before.ino !== after.ino ||
-      before.mtimeMs !== after.mtimeMs ||
-      before.size !== after.size
-    ) {
-      return undefined;
-    }
-    return { raw, dev: after.dev, ino: after.ino };
-  } catch {
-    return undefined;
-  }
-}
-
-/** A reclaim claim is only arbitration metadata, not the operation lock. A
- * crashed claimant must therefore never leave future recovery wedged behind an
- * incomplete record. */
-function reclaimClaimIsAbandoned(path: string): boolean {
-  try {
-    if (Date.now() - statSync(path).mtimeMs <= STALE_LOCK_MS) return false;
-    const record = JSON.parse(readFileSync(path, "utf-8")) as { pid?: unknown };
-    return !pidAlive(record.pid);
-  } catch {
-    // This is safe for a claim (unlike the base lock): a writer whose old,
-    // partial claim is removed cannot pass the token ownership check below.
-    try {
-      return Date.now() - statSync(path).mtimeMs > STALE_LOCK_MS;
-    } catch {
-      return false;
-    }
-  }
-}
-
-function snapshotStillMatches(path: string, observed: StaleLockSnapshot): boolean {
-  try {
-    const before = statSync(path);
-    const raw = readFileSync(path, "utf-8");
-    const after = statSync(path);
-    return (
-      before.dev === after.dev &&
-      before.ino === after.ino &&
-      before.mtimeMs === after.mtimeMs &&
-      before.size === after.size &&
-      after.dev === observed.dev &&
-      after.ino === observed.ino &&
-      raw === observed.raw
-    );
-  } catch {
-    return false;
-  }
-}
-
-/**
- * A stale fixed claim is itself reclaimed through an independent, tokenized
- * cleanup claim. The cleanup record is fresh and owned by this process, so a
- * competing cleaner cannot replace the fixed claim between its snapshot check
- * and removal. Reaping an abandoned cleanup record touches only metadata.
- */
-function clearAbandonedReclaimClaim(claim: string): void {
-  const observed = stableLockFileSnapshot(claim);
-  if (!observed) return;
-  const cleanup = `${claim}.cleanup`;
-  const token = randomUUID();
-  let fd: number | undefined;
-  try {
-    fd = openSync(cleanup, "wx");
-    writeSync(fd, JSON.stringify({ pid: process.pid, token }));
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException)?.code === "EEXIST" && reclaimClaimIsAbandoned(cleanup)) {
-      // Cleanup is arbitration metadata only, never the fixed claim pathname.
-      rmSync(cleanup, { force: true });
-    }
-    return;
-  } finally {
-    if (fd !== undefined) closeSync(fd);
-  }
-
-  const ownsCleanup = (): boolean => {
-    try {
-      const record = JSON.parse(readFileSync(cleanup, "utf-8")) as {
-        pid?: unknown;
-        token?: unknown;
-      };
-      return record.pid === process.pid && record.token === token;
-    } catch {
-      return false;
-    }
-  };
-  const releaseCleanup = (): void => {
-    if (ownsCleanup()) rmSync(cleanup, { force: true });
-  };
-
-  try {
-    if (ownsCleanup() && snapshotStillMatches(claim, observed) && ownsCleanup()) {
-      rmSync(claim);
-    }
-  } finally {
-    releaseCleanup();
-  }
-}
-
-function reclaimBoundStaleLock(path: string, observed: StaleLockSnapshot): boolean {
-  const claim = `${path}.reclaim`;
-  const token = randomUUID();
-  let fd: number | undefined;
-  try {
-    // The claim has independent exclusive-create semantics. It binds this
-    // reclaimer to the observed stale snapshot before the base path moves.
-    fd = openSync(claim, "wx");
-    writeSync(fd, JSON.stringify({ pid: process.pid, token }));
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException)?.code === "EEXIST" && reclaimClaimIsAbandoned(claim)) {
-      clearAbandonedReclaimClaim(claim);
-    }
-    return false;
-  } finally {
-    if (fd !== undefined) closeSync(fd);
-  }
-
-  const ownsClaim = (): boolean => {
-    try {
-      const record = JSON.parse(readFileSync(claim, "utf-8")) as {
-        pid?: unknown;
-        token?: unknown;
-      };
-      return record.pid === process.pid && record.token === token;
-    } catch {
-      return false;
-    }
-  };
-  const releaseClaim = (): void => {
-    if (ownsClaim()) rmSync(claim, { force: true });
-  };
-
-  try {
-    if (!ownsClaim()) return false;
-    const current = staleLockSnapshot(path);
-    // A later fresh lock cannot satisfy the source file's exact identity and
-    // bytes, so this reclaimer cannot delete it.
-    if (
-      !current ||
-      current.dev !== observed.dev ||
-      current.ino !== observed.ino ||
-      current.raw !== observed.raw ||
-      !ownsClaim()
-    ) {
-      return false;
-    }
-    rmSync(path);
-    return true;
-  } finally {
-    releaseClaim();
-  }
-}
-
 async function acquireFileLock(timeoutMs: number): Promise<() => void> {
   const path = panelLockPath();
   mkdirSync(dirname(path), { recursive: true });
@@ -489,7 +287,7 @@ async function acquireFileLock(timeoutMs: number): Promise<() => void> {
           logger.warn(
             `[panel] could not remove the panel op lock at ${path}: ${
               err instanceof Error ? err.message : String(err)
-            } (it will be reclaimed as stale).`,
+            } (use the restart-and-recovery instructions from the next panel operation).`,
           );
         }
       };
@@ -503,20 +301,14 @@ async function acquireFileLock(timeoutMs: number): Promise<() => void> {
           }. Refusing to mutate the panel without it.`,
         );
       }
-      const stale = staleLockSnapshot(path);
-      if (stale) {
-        // Only a demonstrably abandoned lock gets here: old locks with a live
-        // owner (and all fresh locks) still wait. The exclusive claim binds
-        // this reclaimer to its observed file before the base is removed.
-        if (reclaimBoundStaleLock(path, stale)) continue;
-      }
       if (Date.now() >= deadline) {
         throw new Error(
           `Timed out after ${timeoutMs}ms waiting for the panel operation lock ` +
             `(${path}). Another panel install/update/pin is in progress — possibly in ` +
-            `another orchestrator process. Fresh locks, malformed locks, and locks owned by a ` +
-            `live process are never auto-reclaimed; a proven abandoned lock is reclaimed ` +
-            `automatically. Retry shortly.`,
+            `another orchestrator process. It is never auto-reclaimed: a concurrent pre-upgrade ` +
+            `orchestrator could replace an observed stale path with a fresh lock. To recover a ` +
+            `proven abandoned lock, stop or restart every comfyui-mcp orchestrator, verify none ` +
+            `remain, delete this exact lock file, then retry.`,
         );
       }
       await sleep(POLL_MS);
