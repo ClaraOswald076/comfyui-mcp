@@ -57,6 +57,39 @@ export function hasAffirmativeSuccessStatus(entry: HistoryEntry): boolean {
   );
 }
 
+/** ComfyUI history timestamps are epoch seconds or milliseconds depending on
+ *  version — infer from magnitude, mirroring durationMs below. */
+function normalizeEpochMs(ts: unknown): number | undefined {
+  if (typeof ts !== "number" || !Number.isFinite(ts)) return undefined;
+  if (ts > 1_000_000_000_000) return ts; // epoch ms
+  if (ts > 1_000_000_000) return ts * 1000; // epoch s
+  return undefined;
+}
+
+/**
+ * The run's real completion time (ms epoch), taken ONLY from the
+ * execution_success message — the one truthful completion timestamp recorded
+ * by ComfyUI. execution_start is deliberately not a fallback: it is start
+ * time, and using it would backdate a long render past the TTL / a `since`
+ * boundary and hide it. Values implausibly far in the future (clock skew,
+ * non-epoch garbage) are rejected. Returns undefined when history carries no
+ * trustworthy value — the caller must then use its own truthful observation
+ * time (watched path) or skip the record (reconcile path). Shared by both
+ * asset-registration paths so "real completion time" means the same thing on
+ * each (#751 codex gate r4).
+ */
+export function historyCompletionTimeMs(
+  entry: HistoryEntry,
+  now: number,
+): number | undefined {
+  const success = normalizeHistoryMessages(entry).find(
+    (m) => m[0] === "execution_success",
+  );
+  const ms = normalizeEpochMs(success?.[1]?.timestamp);
+  if (ms === undefined || ms > now + 60_000) return undefined;
+  return ms;
+}
+
 const executionErrorSchema = z.object({
   node_id: z.union([z.string(), z.number()]).optional(),
   node_type: z.string().optional(),

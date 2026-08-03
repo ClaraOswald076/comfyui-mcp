@@ -19,6 +19,7 @@ import type { WorkflowJSON } from "../comfyui/types.js";
 import {
   analyzeHistoryEntry,
   hasAffirmativeSuccessStatus,
+  historyCompletionTimeMs,
   normalizeHistoryMessages,
   type ExecutionStats,
   type ExecutionErrorDetails,
@@ -264,6 +265,14 @@ async function handleCompletion(
   if (state.completed) return;
   state.completed = true;
 
+  // The watch's OWN observed finish time: the moment this watcher detected
+  // the completion (WS event or poll tick). For a live-watched job this is a
+  // real, truthful observation — within one poll interval / WS latency of the
+  // actual finish — and serves as the createdAt fallback when the history
+  // entry carries no usable execution_success timestamp (never the registry's
+  // silent default-now; provenance is recorded on the record, #751 r4 gate).
+  const observedFinishAt = Date.now();
+
   logger.info(`Completion detected via ${detectedBy}`, { prompt_id: promptId });
 
   // Stop both monitoring tracks
@@ -314,6 +323,11 @@ async function handleCompletion(
     // best-effort outcome is a display matter, not an asset guarantee.)
     if (hasAffirmativeSuccessStatus(entry) && state.workflow) {
       try {
+        // createdAt is a REAL time, never the registry's silent default-now:
+        // prefer the entry's recorded execution_success timestamp; fall back
+        // to this watcher's own observed finish time — distinguishable via
+        // createdAtSource ("history" vs "observed").
+        const recordedAt = historyCompletionTimeMs(entry, observedFinishAt);
         const records = AssetRegistry.register({
           promptId,
           workflow: state.workflow,
@@ -326,6 +340,8 @@ async function handleCompletion(
               url: img.url,
             })),
           })),
+          createdAt: recordedAt ?? observedFinishAt,
+          createdAtSource: recordedAt !== undefined ? "history" : "observed",
         });
         const idByKey = new Map(
           records.map((r) => [`${r.nodeId}|${r.filename}|${r.subfolder}|${r.type}`, r.assetId]),

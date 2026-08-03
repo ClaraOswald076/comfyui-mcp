@@ -19,6 +19,7 @@ function summarizeRecord(record: ReturnType<typeof AssetRegistry.get>) {
     url: record.url,
     source: record.source,
     created_at: new Date(record.createdAt).toISOString(),
+    created_at_source: record.createdAtSource,
   };
 }
 

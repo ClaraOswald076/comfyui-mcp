@@ -100,6 +100,7 @@ describe("reconcileAssetsFromHistory", () => {
       type: "output",
       source: "history-reconcile",
       createdAt: successTs,
+      createdAtSource: "history",
     });
     expect(record.assetId).toMatch(/^a_[0-9a-f]{8}$/);
     expect(record.url).toContain("filename=panel-prompt_00001_.png");

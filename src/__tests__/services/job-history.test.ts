@@ -6,6 +6,7 @@ import {
   extractExecutionStats,
   extractTextOutputs,
   hasAffirmativeSuccessStatus,
+  historyCompletionTimeMs,
 } from "../../services/job-history.js";
 
 function historyEntry(messages: unknown): HistoryEntry {
@@ -214,5 +215,54 @@ describe("hasAffirmativeSuccessStatus (#751 asset-registration gate)", () => {
         }),
       ),
     ).toBe(true);
+  });
+});
+
+describe("historyCompletionTimeMs (#751 r4 real-completion-time gate)", () => {
+  const NOW = 1_800_000_000_000;
+  const entryWith = (messages: unknown[]): HistoryEntry =>
+    ({
+      prompt: {},
+      outputs: {},
+      status: { status_str: "success", completed: true, messages },
+    }) as unknown as HistoryEntry;
+
+  it("returns the execution_success timestamp (epoch ms)", () => {
+    const entry = entryWith([
+      ["execution_start", { timestamp: NOW - 5000 }],
+      ["execution_success", { timestamp: NOW - 1000 }],
+    ]);
+    expect(historyCompletionTimeMs(entry, NOW)).toBe(NOW - 1000);
+  });
+
+  it("normalizes epoch-seconds timestamps to ms", () => {
+    const successS = Math.floor((NOW - 2000) / 1000);
+    const entry = entryWith([["execution_success", { timestamp: successS }]]);
+    expect(historyCompletionTimeMs(entry, NOW)).toBe(successS * 1000);
+  });
+
+  it("does NOT fall back to execution_start (start time is not completion time)", () => {
+    const entry = entryWith([["execution_start", { timestamp: NOW - 5000 }]]);
+    expect(historyCompletionTimeMs(entry, NOW)).toBeUndefined();
+  });
+
+  it("returns undefined when messages are absent or the timestamp is not a number", () => {
+    expect(historyCompletionTimeMs(entryWith([]), NOW)).toBeUndefined();
+    expect(
+      historyCompletionTimeMs(entryWith([["execution_success", {}]]), NOW),
+    ).toBeUndefined();
+    expect(
+      historyCompletionTimeMs(
+        entryWith([["execution_success", { timestamp: "soon" }]]),
+        NOW,
+      ),
+    ).toBeUndefined();
+  });
+
+  it("rejects implausibly far-future timestamps as untrustworthy", () => {
+    const entry = entryWith([
+      ["execution_success", { timestamp: NOW + 3_600_000 }],
+    ]);
+    expect(historyCompletionTimeMs(entry, NOW)).toBeUndefined();
   });
 });

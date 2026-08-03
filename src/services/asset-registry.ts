@@ -21,6 +21,14 @@ export interface AssetOutput {
  */
 export type AssetSource = "watched" | "history-reconcile";
 
+/**
+ * Provenance of a record's createdAt: "history" means the run's recorded
+ * execution_success timestamp; "observed" means the moment this process
+ * observed the finish (the live watch's detection, or the registry clock
+ * fallback) — a real observation, but not ComfyUI's recorded time.
+ */
+export type CreatedAtSource = "history" | "observed";
+
 export interface AssetRecord {
   assetId: string;
   promptId: string;
@@ -31,6 +39,7 @@ export interface AssetRecord {
   url: string;
   workflow: WorkflowJSON;
   createdAt: number;
+  createdAtSource: CreatedAtSource;
   source: AssetSource;
 }
 
@@ -40,9 +49,13 @@ export interface RegisterArgs {
   outputs: AssetOutput[];
   /** Defaults to "watched". */
   source?: AssetSource;
-  /** ms epoch. Reconciled records pass the run's real completion time so
-   *  ordering, `since` filters, and TTL expiry stay truthful. Defaults to now. */
+  /** ms epoch. Callers pass a REAL time — the run's recorded completion
+   *  timestamp or their own observed finish time. Defaults to the registry
+   *  clock (itself an observation). */
   createdAt?: number;
+  /** Provenance of createdAt. Defaults to "observed" — pass "history" only
+   *  when createdAt is the entry's recorded execution_success timestamp. */
+  createdAtSource?: CreatedAtSource;
 }
 
 export interface ListArgs {
@@ -90,7 +103,7 @@ export const AssetRegistry = {
    * Register all images produced by a completed prompt.
    * Returns the AssetRecords created (one per image).
    */
-  register({ promptId, workflow, outputs, source, createdAt }: RegisterArgs): AssetRecord[] {
+  register({ promptId, workflow, outputs, source, createdAt, createdAtSource }: RegisterArgs): AssetRecord[] {
     const snapshot = deepCloneWorkflow(workflow);
     const created: AssetRecord[] = [];
     for (const output of outputs) {
@@ -106,6 +119,7 @@ export const AssetRegistry = {
           url: img.url,
           workflow: snapshot,
           createdAt: createdAt ?? state.config.now(),
+          createdAtSource: createdAtSource ?? "observed",
           source: source ?? "watched",
         };
         state.records.set(assetId, record);

@@ -56,6 +56,7 @@ interface ListResult {
     url: string;
     source: string;
     created_at: string;
+    created_at_source?: string;
   }>;
   note?: string;
 }
@@ -143,6 +144,7 @@ describe("list_assets (#751)", () => {
       type: "output",
       source: "history-reconcile",
       created_at: new Date(successTs).toISOString(),
+      created_at_source: "history",
     });
     expect(asset.asset_id).toMatch(/^a_[0-9a-f]{8}$/);
     expect(asset.url).toContain("type=output");

@@ -1,7 +1,7 @@
 import { getHistory, type HistoryEntry } from "../comfyui/client.js";
 import { buildCompletionNotification } from "./job-watcher.js";
 import { extractWorkflowGraph } from "./history-select.js";
-import { hasAffirmativeSuccessStatus, normalizeHistoryMessages } from "./job-history.js";
+import { hasAffirmativeSuccessStatus, historyCompletionTimeMs } from "./job-history.js";
 import { AssetRegistry } from "./asset-registry.js";
 import { logger } from "../utils/logger.js";
 
@@ -48,30 +48,6 @@ function queueNumberOf(entry: HistoryEntry): number {
   return Array.isArray(p) ? Number(p[0]) || 0 : 0;
 }
 
-/** ComfyUI history timestamps are epoch seconds or milliseconds depending on
- *  version — infer from magnitude, mirroring durationMs in job-history.ts. */
-function normalizeEpochMs(ts: unknown): number | undefined {
-  if (typeof ts !== "number" || !Number.isFinite(ts)) return undefined;
-  if (ts > 1_000_000_000_000) return ts; // epoch ms
-  if (ts > 1_000_000_000) return ts * 1000; // epoch s
-  return undefined;
-}
-
-/** The run's real completion time (ms epoch), taken ONLY from the
- *  execution_success message — the one truthful completion timestamp.
- *  execution_start is deliberately not a fallback: it is start time, and using
- *  it would backdate a long render past the TTL / a `since` boundary and hide
- *  it. Returns undefined when history carries no trustworthy value. */
-function completionTimeMs(entry: HistoryEntry, now: number): number | undefined {
-  const success = normalizeHistoryMessages(entry).find(
-    (m) => m[0] === "execution_success",
-  );
-  const ms = normalizeEpochMs(success?.[1]?.timestamp);
-  // Implausibly far in the future (clock skew, non-epoch value) — untrustworthy.
-  if (ms === undefined || ms > now + 60_000) return undefined;
-  return ms;
-}
-
 export async function reconcileAssetsFromHistory(opts: {
   maxPrompts?: number;
   now?: () => number;
@@ -105,8 +81,10 @@ export async function reconcileAssetsFromHistory(opts: {
 
     // createdAt must be the run's REAL completion time — an entry without a
     // trustworthy execution_success timestamp is skipped rather than guessed
-    // (see completionTimeMs).
-    const createdAt = completionTimeMs(entry, now());
+    // (see historyCompletionTimeMs; the watched path can fall back to its own
+    // observed finish time, but a reconciler running long after the fact has
+    // no such observation).
+    const createdAt = historyCompletionTimeMs(entry, now());
     if (createdAt === undefined) {
       logger.debug("Skipping history entry with no usable completion timestamp", {
         prompt_id: promptId,
@@ -136,6 +114,7 @@ export async function reconcileAssetsFromHistory(opts: {
       outputs: fresh,
       source: "history-reconcile",
       createdAt,
+      createdAtSource: "history",
     });
     registered += records.length;
   }

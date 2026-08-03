@@ -329,6 +329,64 @@ describe("watched-path asset registration (#751 r3 gate)", () => {
   });
 });
 
+describe("watched-path createdAt provenance (#751 r4 gate)", () => {
+  beforeEach(() => {
+    getHistoryMock.mockReset();
+    AssetRegistry.configure({ ttlMs: 24 * 60 * 60 * 1000, now: Date.now });
+    AssetRegistry.clear();
+  });
+
+  afterEach(() => {
+    for (const id of JobWatcher.listActive()) JobWatcher.unwatch(id);
+    delete process.env.COMFYUI_JOB_POLL_INTERVAL_S;
+  });
+
+  it("uses the entry's real execution_success timestamp when present", async () => {
+    const ts = Date.now() - 8000;
+    await runWatchedCompletion(
+      "watched-ts",
+      completionEntry({
+        statusStr: "success",
+        messages: [
+          ["execution_start", { prompt_id: "watched-ts", timestamp: ts - 5000 }],
+          ["execution_success", { prompt_id: "watched-ts", timestamp: ts }],
+        ],
+      }),
+    );
+    const [rec] = AssetRegistry.list();
+    expect(rec.createdAt).toBe(ts);
+    expect(rec.createdAtSource).toBe("history");
+  });
+
+  it("uses the watch's observed finish time (provenance 'observed') when the entry has no timestamp", async () => {
+    const before = Date.now();
+    await runWatchedCompletion(
+      "watched-nots",
+      completionEntry({ statusStr: "success", messages: [] }),
+    );
+    const after = Date.now();
+    const [rec] = AssetRegistry.list();
+    expect(rec.createdAtSource).toBe("observed");
+    expect(rec.createdAt).toBeGreaterThanOrEqual(before);
+    expect(rec.createdAt).toBeLessThanOrEqual(after);
+  });
+
+  it("treats a far-future execution_success timestamp as bogus and falls back to observed", async () => {
+    await runWatchedCompletion(
+      "watched-futurets",
+      completionEntry({
+        statusStr: "success",
+        messages: [
+          ["execution_success", { prompt_id: "watched-futurets", timestamp: Date.now() + 3_600_000 }],
+        ],
+      }),
+    );
+    const [rec] = AssetRegistry.list();
+    expect(rec.createdAtSource).toBe("observed");
+    expect(rec.createdAt).toBeLessThan(Date.now() + 60_000);
+  });
+});
+
 describe("watcher timeout / poll env overrides", () => {
   afterEach(() => {
     delete process.env.COMFYUI_JOB_TIMEOUT_S;
