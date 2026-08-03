@@ -305,12 +305,12 @@ Delete a model file from the local ComfyUI models directories. Resolves the path
 
 ## list_extra_paths
 
-View ComfyUI extra search-path config for standalone/manual installs and ComfyUI Desktop. Resolves LIVE-FIRST: the file the running ComfyUI actually reads (its --extra-model-paths-config, else the extra_model_paths.yaml beside its main.py), falling back to the local heuristic only when no server is reachable — &lt;ComfyUI root&gt;/extra_model_paths.yaml (COMFYUI_PATH, else the saved default workspace from workspace action:"set_default") or the Desktop app-data extra_models_config.yaml. Reports generic categories, so model categories and custom_nodes entries are both visible when present. Read-only.
+View ComfyUI extra search-path config for standalone/manual installs and ComfyUI Desktop. Resolves LIVE-FIRST: the file the running ComfyUI actually reads (its --extra-model-paths-config, else the extra_model_paths.yaml beside its main.py), falling back to the local heuristic only when no server is reachable — &lt;ComfyUI root&gt;/extra_model_paths.yaml (COMFYUI_PATH, else the saved default workspace from workspace action:"set_default") or the Desktop app-data extra_models_config.yaml. Reports generic categories, so model categories and custom_nodes entries are both visible when present. Read-only. Exception: if a reachable LOCAL server does not expose main.py, auto returns a clearly marked unconfirmed local fallback instead of rejecting the list request.
 
 ### Parameters
 
 <ParamField path="target" type="enum">
-  Config target. auto (default) is LIVE-FIRST: the running ComfyUI's own --extra-model-paths-config, else the extra_model_paths.yaml next to its main.py; only when no server is reachable does it fall back to the Desktop config if one exists, otherwise standalone. standalone forces &lt;ComfyUI root&gt;/extra_model_paths.yaml, where the root is COMFYUI_PATH (or an auto-detected install) and falls back to the saved default workspace; desktop forces the OS app-data extra_models_config.yaml. Use standalone/desktop (or config_path) to deliberately target a file the running server does not read. Options: `auto`, `standalone`, `desktop`.
+  Config target. auto (default) is LIVE-FIRST: the running ComfyUI's own --extra-model-paths-config, else the extra_model_paths.yaml next to its main.py. When no server is reachable, or a reachable LOCAL server does not expose main.py, auto shows the Desktop config if one exists, otherwise standalone; the latter case is explicitly marked as an unconfirmed display fallback. standalone forces &lt;ComfyUI root&gt;/extra_model_paths.yaml, where the root is COMFYUI_PATH (or an auto-detected install) and falls back to the saved default workspace; desktop forces the OS app-data extra_models_config.yaml. Use standalone/desktop (or config_path) to deliberately target a file the running server does not read. Options: `auto`, `standalone`, `desktop`.
 </ParamField>
 <ParamField path="config_path" type="string">
   Explicit YAML config path override, mainly for advanced/manual installs.
@@ -336,7 +336,7 @@ Add a directory to a ComfyUI extra search-path YAML config. Use this for model c
 ### Parameters
 
 <ParamField path="target" type="enum">
-  Config target. auto (default) is LIVE-FIRST: the running ComfyUI's own --extra-model-paths-config, else the extra_model_paths.yaml next to its main.py; only when no server is reachable does it fall back to the Desktop config if one exists, otherwise standalone. standalone forces &lt;ComfyUI root&gt;/extra_model_paths.yaml, where the root is COMFYUI_PATH (or an auto-detected install) and falls back to the saved default workspace; desktop forces the OS app-data extra_models_config.yaml. Use standalone/desktop (or config_path) to deliberately target a file the running server does not read. Options: `auto`, `standalone`, `desktop`.
+  Config target. auto (default) is LIVE-FIRST: the running ComfyUI's own --extra-model-paths-config, else the extra_model_paths.yaml next to its main.py. When no server is reachable, or a reachable LOCAL server does not expose main.py, auto shows the Desktop config if one exists, otherwise standalone; the latter case is explicitly marked as an unconfirmed display fallback. standalone forces &lt;ComfyUI root&gt;/extra_model_paths.yaml, where the root is COMFYUI_PATH (or an auto-detected install) and falls back to the saved default workspace; desktop forces the OS app-data extra_models_config.yaml. Use standalone/desktop (or config_path) to deliberately target a file the running server does not read. Options: `auto`, `standalone`, `desktop`.
 </ParamField>
 <ParamField path="config_path" type="string">
   Explicit YAML config path override, mainly for advanced/manual installs.
@@ -377,7 +377,7 @@ Remove a directory from a ComfyUI extra search-path YAML config. Matches the sto
 ### Parameters
 
 <ParamField path="target" type="enum">
-  Config target. auto (default) is LIVE-FIRST: the running ComfyUI's own --extra-model-paths-config, else the extra_model_paths.yaml next to its main.py; only when no server is reachable does it fall back to the Desktop config if one exists, otherwise standalone. standalone forces &lt;ComfyUI root&gt;/extra_model_paths.yaml, where the root is COMFYUI_PATH (or an auto-detected install) and falls back to the saved default workspace; desktop forces the OS app-data extra_models_config.yaml. Use standalone/desktop (or config_path) to deliberately target a file the running server does not read. Options: `auto`, `standalone`, `desktop`.
+  Config target. auto (default) is LIVE-FIRST: the running ComfyUI's own --extra-model-paths-config, else the extra_model_paths.yaml next to its main.py. When no server is reachable, or a reachable LOCAL server does not expose main.py, auto shows the Desktop config if one exists, otherwise standalone; the latter case is explicitly marked as an unconfirmed display fallback. standalone forces &lt;ComfyUI root&gt;/extra_model_paths.yaml, where the root is COMFYUI_PATH (or an auto-detected install) and falls back to the saved default workspace; desktop forces the OS app-data extra_models_config.yaml. Use standalone/desktop (or config_path) to deliberately target a file the running server does not read. Options: `auto`, `standalone`, `desktop`.
 </ParamField>
 <ParamField path="config_path" type="string">
   Explicit YAML config path override, mainly for advanced/manual installs.

@@ -38,6 +38,7 @@ import { config } from "../../config.js";
 import {
   addExtraPath,
   expandVars,
+  getExtraModelRoots,
   listExtraPaths,
   removeExtraPath,
 } from "../../services/extra-paths.js";
@@ -855,17 +856,36 @@ describe("a reachable server with NO --extra-model-paths-config is still authori
     expect(existsSync(join(stale, "cfg.yaml"))).toBe(false);
   });
 
-  it("REFUSES when a reachable server's argv reveals no main.py and no flag", async () => {
-    // We cannot tell where it reads from; the local heuristic would just be a guess.
-    const workspaceA = await trackTmp();
-    await saveDefaultWorkspace(workspaceA);
-    config.comfyuiPath = undefined;
+  it("lists the local auto target when a reachable local server omits main.py, but keeps mutations fail-closed (#764)", async () => {
+    // Current ComfyUI launchers may report `python -m comfyui` rather than main.py in
+    // /system_stats. The active API target is already classified local (otherwise the
+    // snapshot would be unreachable), so list_auto must not pretend that means remote.
+    // A Desktop config is the exact static fallback a user can successfully select with
+    // target:"desktop"; it is useful to display, but not proven to be the live server's
+    // config and must never be auto-mutated.
+    const appData = await trackTmp();
+    process.env.APPDATA = appData;
+    const desktop = join(appData, "ComfyUI", "extra_models_config.yaml");
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(join(appData, "ComfyUI"), { recursive: true });
+    await writeFile(desktop, "desktop:\n  checkpoints: E:/models\n", "utf-8");
     mockGetSystemStats.mockResolvedValue({ system: { argv: ["python", "-m", "comfyui"] } });
 
-    await expect(listExtraPaths()).rejects.toThrow(/UNRESOLVED.*does not reveal a main\.py/s);
-    // …and the documented escape hatch still works.
-    const forced = await listExtraPaths({ target: "standalone" });
-    expect(forced.path).toBe(join(workspaceA, "extra_model_paths.yaml"));
+    const listed = await listExtraPaths();
+    expect(listed.target).toBe("desktop");
+    expect(listed.path).toBe(desktop);
+    expect(listed.groups[0].categories).toEqual([{ category: "checkpoints", paths: ["E:/models"] }]);
+    expect(listed.notes.some((note) => /local and reachable.*fallback.*not confirmation/is.test(note))).toBe(
+      true,
+    );
+    // The fallback is presentation-only: model lookup/removal must not treat its
+    // unproven paths as live roots.
+    await expect(getExtraModelRoots()).resolves.toEqual([]);
+
+    await expect(addExtraPath({ category: "loras", path: "E:/loras" })).rejects.toThrow(
+      /UNRESOLVED.*does not reveal a main\.py/s,
+    );
+    expect(await readFile(desktop, "utf-8")).toBe("desktop:\n  checkpoints: E:/models\n");
   });
 
   it("falls back to the static heuristic only when the server is UNREACHABLE", async () => {

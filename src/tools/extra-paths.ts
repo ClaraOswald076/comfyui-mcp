@@ -15,9 +15,10 @@ const targetArgs = {
     .optional()
     .describe(
       "Config target. auto (default) is LIVE-FIRST: the running ComfyUI's own " +
-        "--extra-model-paths-config, else the extra_model_paths.yaml next to its main.py; " +
-        "only when no server is reachable does it fall back to the Desktop config if one " +
-        "exists, otherwise standalone. standalone forces <ComfyUI root>/extra_model_paths.yaml, " +
+        "--extra-model-paths-config, else the extra_model_paths.yaml next to its main.py. " +
+        "When no server is reachable, or a reachable LOCAL server does not expose main.py, " +
+        "auto shows the Desktop config if one exists, otherwise standalone; the latter case is " +
+        "explicitly marked as an unconfirmed display fallback. standalone forces <ComfyUI root>/extra_model_paths.yaml, " +
         "where the root is COMFYUI_PATH (or an auto-detected install) and falls back to the " +
         "saved default workspace; desktop forces the OS app-data extra_models_config.yaml. " +
         "Use standalone/desktop (or config_path) to deliberately target a file the running " +
@@ -59,7 +60,8 @@ export function registerExtraPathsTools(server: McpServer): void {
       "extra_model_paths.yaml (COMFYUI_PATH, else the saved default workspace from " +
       "workspace action:\"set_default\") or the Desktop app-data extra_models_config.yaml. Reports generic " +
       "categories, so model categories and custom_nodes entries are both visible when present. " +
-      "Read-only.",
+      "Read-only. Exception: if a reachable LOCAL server does not expose main.py, auto returns " +
+      "a clearly marked unconfirmed local fallback instead of rejecting the list request.",
     targetArgs,
     async (args) => {
       try {
