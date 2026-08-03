@@ -902,12 +902,48 @@ describe("run completion journal correlation (#468)", () => {
     journal.openRun(PROMPT_A, { tabId: "t" }); // B reuses the id — a FRESH ticket
     expect(journal.ticketFor(PROMPT_A)?.reused).toBeUndefined(); // nothing marked
     const real = journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "run B (real)" });
+    expect(real).not.toBeNull();
     expect(real!.token).not.toBe(late!.token);
 
     journal.ack(late!.token);
     expect(journal.pending("t")).toHaveLength(1);
     expect(journal.pending("t")[0].payload.note).toBe("run B (real)");
     expect(journal.ticketFor(PROMPT_A)?.settled).toBe(false); // B still outstanding
+  });
+
+  it("an older generation's PENDING entry is never merged into by a newer run", () => {
+    // Both entries are `pending`, so the state predicate alone permits the merge
+    // — identity is what forbids it. A's completion arrived with no agent to
+    // take it; its ticket is then evicted and the id re-queued for B. Merging
+    // would overwrite A's result with B's and leave the survivor stamped with
+    // A's generation, so its ack could settle neither run.
+    journal.openRun(PROMPT_A, { tabId: "t" });
+    const a = journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "run A" });
+    expect(journal.pending("t")).toHaveLength(1); // never handed off
+
+    for (let i = 0; i < 80; i++) journal.openRun(`later-${i}`, { tabId: "t" }); // evict A's ticket
+    journal.openRun(PROMPT_A, { tabId: "t" }); // B reuses the id — fresh generation
+
+    const b = journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "run B" });
+    expect(b!.token).not.toBe(a!.token); // separate entries, both deliverable
+    expect(journal.pending("t")).toHaveLength(2);
+    expect(journal.pending("t").map((e) => e.payload.note)).toEqual(["run A", "run B"]);
+  });
+
+  it("an older generation's ack cannot write a memo that suppresses the newer run", () => {
+    // A is handed off; A's ticket is evicted; B reuses the id; THEN A's carrying
+    // turn ends. A's ack must not leave a proof that swallows B's real result.
+    journal.openRun(PROMPT_A, { tabId: "t" });
+    const a = journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "run A" });
+    journal.deliverPending("t", () => true); // A handed off, unread
+
+    for (let i = 0; i < 80; i++) journal.openRun(`later-${i}`, { tabId: "t" }); // evict A's ticket
+    journal.openRun(PROMPT_A, { tabId: "t" }); // B reuses the id — fresh generation
+    journal.ack(a!.token); // A's turn ends AFTER B was queued
+
+    const b = journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "run B" });
+    expect(b).not.toBeNull(); // NOT suppressed by A's memo
+    expect(b!.payload.note).toBe("run B");
   });
 
   it("the no-coalesce rule survives the reused TICKET being evicted", () => {
@@ -1017,29 +1053,33 @@ describe("run completion journal correlation (#468)", () => {
     expect(seen[0].dropped_completions).toBe(lost);
   });
 
-  it("a very late resend is still suppressed after the bounded memo has aged out", () => {
-    // The delivered memo is FIFO-capped, so a busy tab ages it out. The run
-    // TICKET's `settled` flag is the second, longer-lived record of "we already
-    // reported this run" — either one must suppress a resend.
+  it("a resend is suppressed for as long as the run's IDENTITY survives, then reported as undetermined", () => {
+    // Suppression is keyed by ticket GENERATION, so it lasts exactly as long as
+    // the identity that makes "we already reported THIS run" a true statement.
     journal.openRun(PROMPT_A, { tabId: "t" });
     const entry = journal.record("t", { kind: "executed", prompt_id: PROMPT_A });
     journal.deliverPending("t", () => true);
     journal.ack(entry!.token);
     expect(journal.ticketFor(PROMPT_A)?.settled).toBe(true);
+    expect(journal.record("t", { kind: "executed", prompt_id: PROMPT_A })).toBeNull(); // resend: suppressed
 
-    // Flood with REAL runs (openRun + completion + ack), so the ticket map
-    // overflows too — the settled ticket is evicted preferentially, which is
-    // exactly the window where the proof used to disappear.
+    // Flood with REAL runs so the ticket map overflows and this run's identity
+    // is evicted. Past that point the journal genuinely cannot tell a resend
+    // from a first delivery for an id it no longer knows.
     for (let i = 0; i < 200; i++) {
       journal.openRun(`flood-${i}`, { tabId: "t" });
       const e = journal.record("t", { kind: "executed", prompt_id: `flood-${i}` });
       journal.deliverPending("t", () => true);
       journal.ack(e!.token);
     }
-    // Its ticket is long gone (tickets are the smaller bound, and settled ones
-    // are evicted first) — the memo is what must outlive it.
     expect(journal.ticketFor(PROMPT_A)).toBeUndefined();
-    expect(journal.record("t", { kind: "executed", prompt_id: PROMPT_A })).toBeNull();
+
+    // Delivered again rather than swallowed — and honestly, as UNDETERMINED.
+    // Duplicate over loss: the alternative is a generation-blind memo, which is
+    // what used to suppress a genuinely NEW run that reused the id.
+    const late = journal.record("t", { kind: "executed", prompt_id: PROMPT_A });
+    expect(late).not.toBeNull();
+    expect(late!.correlation.status).toBe("foreign");
   });
 
   it("an eviction disclosure survives a hand-off that is never consumed", () => {
@@ -1088,12 +1128,16 @@ describe("run completion journal correlation (#468)", () => {
       journal.ack(e!.token);
     }
     expect(journal.ticketFor(PROMPT_A)).toBeUndefined(); // evicted, so this is a FRESH ticket
-    expect(journal.record("t", { kind: "executed", prompt_id: PROMPT_A })).toBeNull(); // resend: suppressed
 
     journal.openRun(PROMPT_A, { tabId: "t" }); // ComfyUI reused the id for a NEW run
     const second = journal.record("t", { kind: "executed", prompt_id: PROMPT_A });
     expect(second).not.toBeNull();
+    // A FRESH ticket is a new generation, so the older run's memo cannot reach
+    // it: the new run is matched and delivered as its own.
     expect(second!.correlation.status).toBe("matched");
+    journal.deliverPending("t", () => true);
+    journal.ack(second!.token);
+    expect(journal.ticketFor(PROMPT_A)?.settled).toBe(true); // ITS ticket, settled by ITS ack
   });
 
   it("a stall/rewind abandon is CARRIED, so a freezing backend can't replay forever", () => {

@@ -208,10 +208,17 @@ const MAX_CARRIED_RELEASES = 3;
 const IDLESS_COLLAPSE_MS = 30_000;
 const IDLESS_REPEAT_HINT_MS = 10 * 60_000;
 
-/** Memo key for an already-delivered (tab, run). "|" separates them; a ComfyUI
- *  prompt id is a fixed-format UUID, so the pair can't alias another. */
-function deliveredKey(key: string, promptId: string): string {
-  return `${key}|${promptId}`;
+/**
+ * Memo key for an already-delivered run: (tab, prompt id, TICKET GENERATION).
+ *
+ * The generation is what makes this an identity rather than a guess. A prompt id
+ * alone is not one — ComfyUI reuses ids, and a ticket can be evicted and
+ * recreated — so a memo keyed on the id would let run A's delivery suppress run
+ * B's real completion. `gen` is `RunTicket.seq`, or 0 when this tab has no
+ * ticket for the id at all (an unqueued, foreign run).
+ */
+function deliveredKey(key: string, promptId: string, gen: number): string {
+  return `${key}|${promptId}|${gen}`;
 }
 
 /**
@@ -248,6 +255,15 @@ export class RunCompletionJournalImpl {
   private seq = 0;
   /** Monotonic ticket-generation counter — see RunTicket.seq. */
   private ticketSeq = 0;
+
+  /** The generation this tab's ticket for `promptId` is currently on, or 0 when
+   *  it has none. THE run identity: every proof and every merge is keyed on it,
+   *  so an id reused (or a ticket evicted and recreated) can never let one run's
+   *  bookkeeping answer for another's. */
+  private generationOf(key: string, promptId: string): number {
+    const ticket = this.tickets.get(promptId);
+    return ticket && ticket.tabId === key ? ticket.seq : 0;
+  }
   /** Pull a still-queued completion back off its agent (see setRevoker). */
   private revoke: ((key: string, token: string) => boolean) | null = null;
   /** Re-deliver a tab's pending completions (after a revoke re-arms one). */
@@ -289,14 +305,11 @@ export class RunCompletionJournalImpl {
    *  attribute. */
   openRun(promptId: string | null | undefined, meta: { tabId: string; toNodeId?: number }): boolean {
     if (typeof promptId !== "string" || !promptId) return false;
-    // CLEAR the already-delivered memo for this (tab, run) FIRST, on EVERY path.
-    // The memo only ever means "we already reported THIS run", which queuing the
-    // id again makes false — and the memo outlives the ticket by design, so the
-    // reopen branch below is NOT the only way to reach a stale one: after 64
-    // later runs the old ticket is evicted, and a reuse of the id then takes the
-    // fresh-ticket path while the memo still stands. Leaving it would suppress
-    // the NEW run's real completion after `panel_run` promised to deliver it.
-    this.delivered.delete(deliveredKey(meta.tabId, promptId));
+    // NOTE: no memo clearing is needed here. The delivered memo is keyed by
+    // ticket GENERATION, and every path below either bumps the generation (a
+    // reopen) or mints a fresh one (a new ticket), so a newly queued run's memo
+    // key is unused by construction. This used to be a `delete` precisely because
+    // the key was generation-blind — the structural fix removed the need.
     const existing = this.tickets.get(promptId);
     if (existing) {
       // Same prompt id queued again (a re-run of an id ComfyUI reused, or a
@@ -397,6 +410,9 @@ export class RunCompletionJournalImpl {
     let idlessRepeat = false;
     /** This id already stands for more than one run (see RunTicket.reused). */
     let idReused = false;
+    /** Ticket generation this completion belongs to — the run identity (0 = no
+     *  ticket, i.e. a run this tab never queued). */
+    let gen = 0;
     if (correlation.status !== "unidentified") {
       // Already DELIVERED once (its carrying turn ended, so the entry is gone).
       // A panel that re-sends the frame must not produce a second delivery — the
@@ -411,9 +427,14 @@ export class RunCompletionJournalImpl {
       // the newer run's real result. A duplicate delivery (labelled UNDETERMINED)
       // is the correct trade here.
       idReused = settledTicket?.reused === true && settledTicket.tabId === key;
+      // The memo is keyed by GENERATION, so an older run's delivery can never
+      // suppress a newer one that merely reuses the id (or that got a fresh
+      // ticket after the old one was evicted): different generation, different
+      // key, no match.
+      gen = this.generationOf(key, correlation.promptId);
       if (
         !idReused &&
-        (this.delivered.has(deliveredKey(key, correlation.promptId)) ||
+        (this.delivered.has(deliveredKey(key, correlation.promptId, gen)) ||
           (settledTicket?.settled === true && settledTicket.tabId === key))
       ) {
         logger.info(
@@ -437,10 +458,17 @@ export class RunCompletionJournalImpl {
       // reason. The `reused`/`ambiguousId` checks below are now an OPTIMISATION
       // for better wording (an ambiguous run should read as UNDETERMINED rather
       // than merge at all), never the thing correctness rests on.
+      //
+      // The target must ALSO be the same GENERATION. A `pending` entry from an
+      // older run of the same id (its ticket evicted, the id then re-queued) is
+      // still a DIFFERENT run: overwriting its payload would drop that run's
+      // result and leave the survivor stamped with the wrong generation, so its
+      // ack could settle neither. Same-state AND same-identity.
       for (const entry of idReused ? [] : this.entries.values()) {
         if (
           entry.key === key &&
           entry.state === "pending" && // never merge into text already committed to a turn
+          (entry.ticketSeq ?? 0) === gen && // …nor across run generations
           !entry.superseded && // a re-queued run never merges into the old one's entry
           !entry.ambiguousId && // nor into one that arrived under a reused id
           entry.correlation.status !== "unidentified" &&
@@ -511,11 +539,10 @@ export class RunCompletionJournalImpl {
         : {}),
       // Freeze the ambiguity onto the entry — see JournalEntry.ambiguousId.
       ...(idReused ? { ambiguousId: true } : {}),
-      // …and the exact ticket GENERATION this matched, so its ack can never
-      // settle a later run that merely reuses the id (see RunTicket.seq).
-      ...(correlation.status === "matched"
-        ? { ticketSeq: this.tickets.get(correlation.promptId)?.seq }
-        : {}),
+      // …and the GENERATION this completion belongs to, for EVERY identified
+      // entry (not just matched ones): it is what keeps its ack, its memo and any
+      // future merge bound to this run rather than to whatever the id means later.
+      ...(correlation.status !== "unidentified" ? { ticketSeq: gen } : {}),
     };
     this.entries.set(entry.token, entry);
     this.trimEntries(key);
@@ -681,7 +708,11 @@ export class RunCompletionJournalImpl {
       // ticket without going through openRun would inherit the trap.
       const ticket = this.tickets.get(entry.correlation.promptId);
       if (!(ticket?.reused === true && ticket.tabId === entry.key)) {
-        this.memoDelivered(entry.key, entry.correlation.promptId);
+        // Memoize against THIS entry's own generation, never the id's current
+        // meaning: an older run's ack must not write a proof that then suppresses
+        // the newer run which reused the id (or got a fresh ticket after the old
+        // one was evicted).
+        this.memoDelivered(entry.key, entry.correlation.promptId, entry.ticketSeq ?? 0);
       }
     } else if (entry.fingerprint) {
       // ID-LESS: memoize the CONTENT so a re-sent identical frame after the ack
@@ -845,8 +876,8 @@ export class RunCompletionJournalImpl {
    *  frame is suppressed rather than delivered a second time. Bounded FIFO; the
    *  run TICKET's `settled` flag is the other record, and an evicted settled
    *  ticket feeds this one so neither expires before the other. */
-  private memoDelivered(key: string, promptId: string): void {
-    this.delivered.add(deliveredKey(key, promptId));
+  private memoDelivered(key: string, promptId: string, gen: number): void {
+    this.delivered.add(deliveredKey(key, promptId, gen));
     while (this.delivered.size > MAX_DELIVERED_MEMO) {
       const oldest = this.delivered.values().next().value;
       if (oldest === undefined) break;
