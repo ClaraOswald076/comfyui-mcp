@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, type Stats } from "node:fs";
+import { platform } from "node:os";
 import { readdir, stat, mkdir, readFile, lstat, realpath } from "node:fs/promises";
 import { dirname, join, basename, resolve, relative, sep, isAbsolute, extname } from "node:path";
 import { config, getComfyUIBaseUrl, isRemoteMode } from "../config.js";
@@ -1021,6 +1022,31 @@ export async function currentLiveModelsRoot(): Promise<string | undefined> {
   }
 }
 
+/**
+ * Why a destination could not be confirmed, and how the USER can upgrade themselves
+ * into a verified answer.
+ *
+ * Saying "unconfirmed" without saying WHY leaves the user with nothing to act on.
+ * There are exactly two reasons the live root stays unpinnable: the running server
+ * reported a relative `main.py` with no working directory (so its own report is not
+ * enough), and the OS process table could not be read to identify the process on our
+ * port. The second is a TOOLING gap on POSIX — `lsof` is simply not installed on
+ * many minimal images — and installing it converts this host into a verifiable one.
+ */
+function unverifiableDestinationRemedy(): string {
+  const probe =
+    platform() === "win32"
+      ? "the process listening on the ComfyUI port could not be identified"
+      : "the process listening on the ComfyUI port could not be identified (this needs `lsof`, " +
+        "which is missing on many minimal images — installing it makes future downloads verifiable)";
+  return (
+    "This happens when the running ComfyUI reports a RELATIVE main.py with no working " +
+    `directory AND ${probe}. To get a definite answer: point COMFYUI_PATH at the ComfyUI ` +
+    "that is actually running, launch it with an absolute --base-directory, or make its " +
+    "process observable. Meanwhile, confirm with list_local_models."
+  );
+}
+
 export interface LandedModelVerification {
   /** The path CONFIRMED to exist on disk after the download (symlinks resolved).
    *  This — never the intended path — is what callers report. */
@@ -1195,8 +1221,8 @@ export async function verifyLandedModel(
               : opts?.listedBefore === undefined
                 ? " (whether it listed that name before this download could not be checked)"
                 : "") +
-            ". Point COMFYUI_PATH at the ComfyUI that is actually running (or launch it with an " +
-            "absolute --base-directory) to get a definite answer.",
+            ". " +
+            unverifiableDestinationRemedy(),
         };
       }
     }

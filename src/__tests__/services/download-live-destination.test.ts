@@ -521,6 +521,11 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
     });
     expect(res.liveVisible).toBe("unknown");
     expect(res.note).toMatch(/cannot be tied to the file just written/);
+    // An unverifiable result must say WHY and how to become verifiable, or the user
+    // has nothing to act on.
+    expect(res.note).toMatch(/RELATIVE main\.py/);
+    expect(res.note).toMatch(/could not be identified/);
+    expect(res.note).toMatch(/list_local_models/);
   });
 
   it("DOES confirm a re-download into a LIVE-AUTHORITATIVE root even though the name pre-existed", async () => {
