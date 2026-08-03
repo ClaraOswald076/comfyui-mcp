@@ -839,6 +839,29 @@ describe("run completion journal correlation (#468)", () => {
     expect(third!.correlation.status).toBe("foreign");
   });
 
+  it("a REUSED id never COALESCES — B's completion gets its own entry, so A's ack can't take it", () => {
+    // Coalescing assumes the prompt id identifies one run; `reused` is exactly
+    // the state where that is void. Merging B into A's entry would return A's
+    // entry for B, leave A's text in the already-queued turn, and let A's ack
+    // remove the sole entry — B never delivered. Duplicate over loss.
+    journal.openRun(PROMPT_A, { tabId: "t" });
+    journal.openRun(PROMPT_A, { tabId: "t" }); // ComfyUI reused the id
+    expect(journal.ticketFor(PROMPT_A)?.reused).toBe(true);
+
+    const late = journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "run A (late)" });
+    journal.deliverPending("t", () => true); // A handed off, unread
+
+    const real = journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "run B (real)" });
+    expect(real).not.toBeNull();
+    expect(real!.token).not.toBe(late!.token); // its OWN entry, never merged
+    expect(real!.payload.note).toBe("run B (real)");
+
+    // A's turn ends: it takes only its own entry with it.
+    journal.ack(late!.token);
+    expect(journal.pending("t")).toHaveLength(1);
+    expect(journal.pending("t")[0].payload.note).toBe("run B (real)");
+  });
+
   it("re-queuing a prompt id SUPERSEDES the old entry — the old result can't answer for the new run", () => {
     // Prompt-id reuse while the previous completion is still in an agent's queue.
     // Merging into that entry would hand the OLD result over as the NEW run's

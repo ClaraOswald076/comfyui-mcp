@@ -391,7 +391,15 @@ export class RunCompletionJournalImpl {
         );
         return null;
       }
-      for (const entry of this.entries.values()) {
+      // COALESCE is an optimisation that ASSUMES the prompt id identifies one
+      // run — which is exactly the assumption `reused` voids. Merging there is a
+      // LOSS: B's real completion would overwrite A's entry and be returned as
+      // it, while the turn already queued still holds A's text; A's ack then
+      // removes the sole entry and B is never delivered. So for a reused id, do
+      // not coalesce at all — B gets its own entry, flagged UNDETERMINED like
+      // every other ambiguous case. Duplicate over loss, the same rule the
+      // suppression checks above follow.
+      for (const entry of idReused ? [] : this.entries.values()) {
         if (
           entry.key === key &&
           !entry.superseded && // a re-queued run never merges into the old one's entry
@@ -619,7 +627,17 @@ export class RunCompletionJournalImpl {
     // run's real completion.
     if (entry.superseded) return;
     if (entry.correlation.status !== "unidentified") {
-      this.memoDelivered(entry.key, entry.correlation.promptId);
+      // …and do not memoize a REUSED id either. DEFENSE IN DEPTH, not a live
+      // defect: `openRun` already clears the memo on every path, so no reachable
+      // sequence can let a stale one suppress a later legitimate completion (and
+      // therefore no test can fail on this line). It is here because writing a
+      // "we already reported this run" proof about an id that stands for MORE
+      // THAN ONE run is meaningless on its face, and a future caller that opens a
+      // ticket without going through openRun would inherit the trap.
+      const ticket = this.tickets.get(entry.correlation.promptId);
+      if (!(ticket?.reused === true && ticket.tabId === entry.key)) {
+        this.memoDelivered(entry.key, entry.correlation.promptId);
+      }
     } else if (entry.fingerprint) {
       // ID-LESS: memoize the CONTENT so a re-sent identical frame after the ack
       // doesn't produce a second turn. Windowed in record(), bounded here.

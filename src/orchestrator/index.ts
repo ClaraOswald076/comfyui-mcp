@@ -9,7 +9,16 @@
 // panel-agent.ts). Each agent runs on the user's Claude SUBSCRIPTION with no API
 // key. See docs/design/panel-orchestrator.md.
 
-import { existsSync, mkdirSync, writeFileSync, unlinkSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  writeFileSync,
+  unlinkSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeSync,
+} from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir, homedir, networkInterfaces } from "node:os";
 import { dirname, join } from "node:path";
@@ -2132,15 +2141,24 @@ export async function runPanelOrchestrator(): Promise<void> {
     } catch {
       return; // nothing readable — nothing to report
     }
-    // LOG FIRST, unconditionally. The chat push below can only reach a CONNECTED
-    // tab (an offline one's frame lands in the bridge's missedFrames buffer, which
-    // dies with the process moments later), and `bridge` may not even exist yet on
-    // a very early fatal. The log is the record that always survives — it is what
-    // a user or maintainer has after the respawn.
+    // LOG FIRST, unconditionally, and SYNCHRONOUSLY. This is the durable half of
+    // the disclosure: the chat push below can only reach a CONNECTED tab (an
+    // offline one's frame lands in the bridge's missedFrames buffer, which dies
+    // with the process moments later), and `bridge` may not even exist yet on a
+    // very early fatal.
+    //
+    // `writeSync` on fd 2, not the logger: `process.stderr.write` is async when
+    // stderr is a pipe (the normal case under the ComfyUI launcher), so a
+    // `process.exit()` immediately after can terminate with the record still
+    // queued and never written. Since the whole in-memory-journal tradeoff rests
+    // on "the disclosure always happens", the write it rests on must block.
     for (const [panelTab, runs] of byTab) {
-      logger.error(
-        `[panel-orchestrator] tab ${panelTab.slice(0, 8)} — self-exit with ${runs.length} undelivered run completion(s), outcome UNDETERMINED: ${runs.join("; ")}`,
-      );
+      const line = `[panel-orchestrator] tab ${panelTab.slice(0, 8)} — exiting with ${runs.length} undelivered run completion(s), outcome UNDETERMINED: ${runs.join("; ")}`;
+      try {
+        writeSync(2, `${line}\n`);
+      } catch {
+        logger.error(line); // fd 2 unavailable — best-effort through the logger
+      }
     }
     try {
       for (const [panelTab, runs] of byTab) {
@@ -5214,8 +5232,16 @@ export async function runPanelOrchestrator(): Promise<void> {
       // No lockfile / unreadable — nothing to clean up.
     }
   };
+  /** The single in-flight teardown, so repeated signals queue behind it. */
+  let teardownOnce: Promise<void> | null = null;
   const shutdown = async () => {
-    await teardownCore();
+    // RE-ENTRANT SAFE (#468). teardownCore's `shuttingDown` flag makes a second
+    // call return IMMEDIATELY, so a repeated SIGTERM used to race straight past
+    // the in-flight teardown to process.exit() — skipping the undelivered-
+    // completion disclosure the first one had not reached yet. Memoize the
+    // teardown promise so every later signal AWAITS the first one instead.
+    teardownOnce ??= teardownCore();
+    await teardownOnce;
     process.exit(0);
   };
   process.on("SIGINT", shutdown);
