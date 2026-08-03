@@ -83,10 +83,14 @@ function reconnectingBridge(initial: string[] = []) {
 beforeEach(() => {
   // Keep the reconnect wait fast so tests don't sit through the real ~20s budget.
   __panelToolsTestHooks.setReconnectWaitTiming({ budgetMs: 500, intervalMs: 5 });
+  // The #742 refuse-safe preflight passes by default here (the live one would
+  // probe real processes/ports); these tests exercise the post-dispatch paths.
+  __panelToolsTestHooks.setLocalRestartPreflight(async () => ({ ok: true }));
 });
 afterEach(() => {
   __panelToolsTestHooks.setReconnectWaitTiming(null);
   __panelToolsTestHooks.setRetrySettleMs(null);
+  __panelToolsTestHooks.setLocalRestartPreflight(null);
   __openWorkflowTestHooks.setOpenVerifyTiming(null);
   resetClient.mockClear();
   resetObjectInfoCache.mockClear();

@@ -58,7 +58,11 @@ vi.mock("../../services/env-capabilities.js", () => ({
 
 import {
   __processControlTestHooks,
+  clearRestartDispatch,
+  getRestartDispatchRecord,
   parseListenerPidFromNetstat,
+  preflightLocalRestart,
+  PROCESS_WIDE_RESTART_DISPATCH_TOKEN,
   restartComfyUI,
   startComfyUI,
   stopComfyUI,
@@ -697,5 +701,246 @@ describe("findPidByPort resilience to localized netstat state (#449)", () => {
     expect(killSpy).not.toHaveBeenCalled();
 
     killSpy.mockRestore();
+  });
+});
+
+describe("restart truthfulness + Pinokio-shaped refusal (#742)", () => {
+  // Same live-port wiring as the #368/#370 preflight suite: a live PID on the
+  // port (so the running instance is found) with every kill recorded, so a test
+  // can prove the server was NOT taken down.
+  function mockLivePortNoKill(): void {
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (cmd.includes("netstat"))
+        return "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
+      if (cmd.includes("lsof")) return "p4321\nn127.0.0.1:8188\n";
+      return ""; // tasklist / taskkill / `if exist` → nothing
+    });
+  }
+
+  // The #742 shape: a Pinokio-managed ComfyUI — externally supervised, launched
+  // as a RELATIVE `main.py`, with no COMFYUI_PATH anchor and no resolvable
+  // interpreter from here. A plain Manager restart kills it and the supervisor
+  // does NOT re-launch it, so any restart from us must refuse BEFORE a stop.
+  function mockPinokioShapedInstall(): void {
+    mockLivePortNoKill();
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: ["main.py", "--port", "8188"] },
+    });
+    mockConfig.comfyuiPath = undefined;
+    mockFindComfyuiPython.mockReturnValue(undefined);
+  }
+
+  it("preflightLocalRestart refuses a Pinokio-shaped install (no resolvable main.py/interpreter)", async () => {
+    mockPinokioShapedInstall();
+
+    const preflight = await preflightLocalRestart();
+
+    expect(preflight.ok).toBe(false);
+    expect(preflight.reason).toMatch(/could not build a relaunch command/i);
+  });
+
+  it("restartComfyUI refuses a Pinokio-shaped install BEFORE any stop (no kill, no spawn)", async () => {
+    mockPinokioShapedInstall();
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(false);
+    expect(result.started).toBe(false);
+    expect(result.message).toMatch(/refusing to restart/i);
+    expect(result.message).toMatch(/left running/i);
+    expect(result.message).not.toMatch(/cancel/i);
+    // Server left running: no kill, no relaunch spawn, no client reset.
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(mockResetClient).not.toHaveBeenCalled();
+    expect(
+      mockExecSync.mock.calls.some(([c]) => /taskkill/i.test(String(c))),
+    ).toBe(false);
+    expect(killSpy).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  });
+
+  it("preflightLocalRestart passes a resolvable local install", async () => {
+    mockLivePortNoKill();
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: ["/fake/ComfyUI/main.py", "--port", "8188"] },
+    });
+    // Default mocks: interpreter resolved, every path exists.
+
+    const preflight = await preflightLocalRestart();
+
+    expect(preflight.ok).toBe(true);
+  });
+
+  it("preflightLocalRestart passes a Desktop app (the Manager reboot IS its safe path, #400)", async () => {
+    mockLivePortNoKill();
+    mockGetSystemStats.mockResolvedValue({
+      system: {
+        argv: [
+          "C:\\Users\\x\\AppData\\Local\\Programs\\Comfy Desktop\\resources\\ComfyUI\\main.py",
+          "--port",
+          "8188",
+        ],
+      },
+    });
+    mockExistsSync.mockImplementation(() => false); // relaunch never consulted
+
+    const preflight = await preflightLocalRestart();
+
+    expect(preflight.ok).toBe(true);
+  });
+
+  it("preflightLocalRestart passes when no running process can be proven", async () => {
+    mockNoPortProcess();
+    mockGetSystemStats.mockRejectedValue(new Error("connection refused"));
+
+    const preflight = await preflightLocalRestart();
+
+    expect(preflight.ok).toBe(true);
+  });
+
+  it("stop succeeded but relaunch fails → truthful lost-server message, never 'cancelled' (#742)", async () => {
+    let killed = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill/i.test(String(cmd))) {
+        killed = true;
+        return "";
+      }
+      if (cmd.includes("netstat")) {
+        if (killed) return ""; // port freed after the kill
+        return "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
+      }
+      if (cmd.includes("lsof")) {
+        if (killed) throw new Error("not listening");
+        return "p4321\nn127.0.0.1:8188\n";
+      }
+      return ""; // tasklist / `sleep 1 && kill -9` / etc.
+    });
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: ["/fake/ComfyUI/main.py", "--port", "8188"] },
+    });
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => {
+      killed = true;
+      return true;
+    });
+    const children = mockSpawnedChildren();
+    // Readiness never resolves; the relaunch's spawn error short-circuits it.
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => undefined)));
+
+    const pending = restartComfyUI();
+    await vi.waitFor(() => expect(children.length).toBe(1), {
+      timeout: 10000,
+      interval: 20,
+    });
+    children[0].emit("error", spawnError());
+    const result = await pending;
+
+    // The stop DID happen — the report must say so truthfully.
+    expect(result.stopped).toBe(true);
+    expect(result.started).toBe(false);
+    expect(result.message).toMatch(/stopped but could not be started/i);
+    expect(result.message).not.toMatch(/cancel/i);
+    expect(result.spawn_error).toBeTruthy();
+    // r4/r5: the stop stamped the restart-dispatch record (process-wide slot;
+    // never cleared — the relaunch failed).
+    const rec = getRestartDispatchRecord(PROCESS_WIDE_RESTART_DISPATCH_TOKEN);
+    expect(rec).not.toBeNull();
+    expect(rec!.base).toBe("http://127.0.0.1:8188");
+
+    killSpy.mockRestore();
+  });
+
+  it("a successful kill+relaunch restart CLEARS the dispatch record (r4)", async () => {
+    let killed = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill/i.test(String(cmd))) {
+        killed = true;
+        return "";
+      }
+      if (cmd.includes("netstat")) {
+        if (killed) return ""; // port freed after the kill
+        return "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
+      }
+      if (cmd.includes("lsof")) {
+        if (killed) throw new Error("not listening");
+        return "p4321\nn127.0.0.1:8188\n";
+      }
+      return ""; // tasklist / `sleep 1 && kill -9` / etc.
+    });
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: ["/fake/ComfyUI/main.py", "--port", "8188"] },
+    });
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => {
+      killed = true;
+      return true;
+    });
+    mockSpawnedChildren();
+    mockFetchOk(true); // the relaunch comes up healthy on the first probe
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(true);
+    expect(result.started).toBe(true);
+    // Observed back → OUR process-wide record is cleared: this restart
+    // explains no later down.
+    expect(getRestartDispatchRecord(PROCESS_WIDE_RESTART_DISPATCH_TOKEN)).toBeNull();
+
+    killSpy.mockRestore();
+  });
+
+  it("a Manager reboot that never comes back leaves the dispatch record stamped (r4)", async () => {
+    // Desktop argv → the Manager-reboot path. The reboot FIRES (connection
+    // drop) but readiness never returns — the record must stay stamped.
+    mockLivePortNoKill();
+    mockGetSystemStats.mockResolvedValue({
+      system: {
+        argv: [
+          "C:\\Users\\x\\AppData\\Local\\Programs\\Comfy Desktop\\resources\\ComfyUI\\main.py",
+          "--port",
+          "8188",
+        ],
+      },
+    });
+    __processControlTestHooks.setRemoteRebootTimingForTests({
+      settleMs: 0,
+      budgetMs: 30,
+      intervalMs: 5,
+    });
+    const fetchMock = vi.fn(async (url: unknown) => {
+      if (String(url).includes("reboot")) throw new Error("socket hang up"); // drop = fired
+      return { ok: false } as Response; // readiness never ok
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(true);
+    expect(result.started).toBe(false);
+    const rec = getRestartDispatchRecord(PROCESS_WIDE_RESTART_DISPATCH_TOKEN);
+    expect(rec).not.toBeNull();
+    expect(rec!.base).toBe("http://127.0.0.1:8188");
+  });
+
+  it("a recovery clear removes ONLY the dispatching session's record (r5)", () => {
+    // Two sessions' records coexist; clearing one's token must never touch the
+    // other's — A's recovery cannot clear B's record.
+    __processControlTestHooks.setRestartDispatchRecord("tok-a", {
+      at: Date.now(),
+      base: "http://127.0.0.1:8188",
+    });
+    __processControlTestHooks.setRestartDispatchRecord("tok-b", {
+      at: Date.now(),
+      base: "http://127.0.0.1:8188",
+    });
+
+    clearRestartDispatch("tok-a");
+    expect(getRestartDispatchRecord("tok-a")).toBeNull();
+    expect(getRestartDispatchRecord("tok-b")).not.toBeNull(); // B's survives
+
+    clearRestartDispatch("tok-b");
+    expect(getRestartDispatchRecord("tok-b")).toBeNull();
+    // Unknown token → no-op, never throws.
+    expect(() => clearRestartDispatch("tok-nope")).not.toThrow();
   });
 });

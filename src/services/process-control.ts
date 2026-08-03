@@ -1,4 +1,5 @@
 import { execSync, spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync, readlinkSync, statSync } from "node:fs";
 import { platform } from "node:os";
 import { isAbsolute, join } from "node:path";
@@ -1397,6 +1398,11 @@ async function restartViaManagerReboot(context: {
   // timed-out branch (which returns early) can't leave the pre-reboot dialect
   // pinned for the instance that eventually comes back (#646).
   resetManagerApiCache("comfyui reboot fired via Manager");
+  // #742 r4/r5: record the dispatch — a later decline-path DOWN report may
+  // name restart causation only against such a record. No session identity
+  // exists here, so stamp the shared PROCESS-WIDE slot (never grounds
+  // causation on its own).
+  recordRestartDispatch(getComfyUIBaseUrl(), PROCESS_WIDE_RESTART_DISPATCH_TOKEN);
 
   const timing = getRemoteRebootTiming();
   if (timing.settleMs > 0) await sleep(timing.settleMs);
@@ -1428,6 +1434,9 @@ async function restartViaManagerReboot(context: {
   resetClient();
   resetObjectInfoCache();
   resetManagerApiCache("comfyui rebooted via Manager");
+  // #742 r4/r5: the dispatched restart was observed back — clear OUR record
+  // (the process-wide slot only; never another session's record).
+  clearRestartDispatch(PROCESS_WIDE_RESTART_DISPATCH_TOKEN);
 
   return {
     stopped: true,
@@ -1494,6 +1503,10 @@ export async function restartComfyUI(): Promise<RestartResult> {
       message: `Could not stop ComfyUI: ${stopResult.message}`,
     };
   }
+  // #742 r4/r5: the stop DID happen — record the dispatch. No session identity
+  // exists here, so stamp the shared PROCESS-WIDE slot (never grounds causation
+  // on its own; a panel caller stamps its own session token from the result).
+  recordRestartDispatch(getComfyUIBaseUrl(), PROCESS_WIDE_RESTART_DISPATCH_TOKEN);
 
   // Brief pause to let OS fully release resources
   await sleep(1000);
@@ -1512,6 +1525,10 @@ export async function restartComfyUI(): Promise<RestartResult> {
     };
   }
 
+  // #742 r4/r5: the restart was observed back — clear OUR record (the
+  // process-wide slot only; never another session's record).
+  clearRestartDispatch(PROCESS_WIDE_RESTART_DISPATCH_TOKEN);
+
   return {
     stopped: true,
     started: true,
@@ -1520,6 +1537,105 @@ export async function restartComfyUI(): Promise<RestartResult> {
     message: `ComfyUI restarted successfully. ${startResult.message}`,
     auto_restart: startResult.auto_restart,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Restart dispatch records (#742 r4/r5) — bookkeeping of restarts THIS
+// orchestrator actually dispatched (a Manager reboot fired, or a kill+relaunch
+// whose stop succeeded). The panel decline path may name restart CAUSATION for
+// a down server only against a record whose TOKEN the declining session holds
+// (r5): the orchestrator hosts many per-tab/per-connection sessions, so a
+// module-global record would let session A's failed restart fabricate
+// causation for session B's decline (and A's recovery clear B's record).
+// Records are keyed by an opaque token returned to the stamper; a session
+// stores only its own token. Headless stamp sites (no session identity) share
+// the single PROCESS-WIDE slot — a documented process-wide fallback that can
+// NEVER ground causation (no session holds that token).
+// ---------------------------------------------------------------------------
+
+interface RestartDispatchRecord {
+  /** Epoch ms when the restart was dispatched. */
+  at: number;
+  /** The ComfyUI base URL the restart targeted (null = unknown). */
+  base: string | null;
+}
+
+/** Token → record. Only the holder of a token may ground causation on (or
+ *  clear) its record. */
+const restartDispatchRecords = new Map<string, RestartDispatchRecord>();
+
+/** The shared slot for session-less (headless) stamps — never causation. */
+export const PROCESS_WIDE_RESTART_DISPATCH_TOKEN = "process-wide";
+
+/** How long a recorded dispatch plausibly explains a down server. Also the
+ *  prune horizon: older records can never ground causation, so they are
+ *  reaped on each stamp (bounds the map across many sessions). */
+export const RESTART_DISPATCH_CAUSATION_WINDOW_MS = 10 * 60_000; // 10 min
+
+/**
+ * Stamp that a restart was ACTUALLY dispatched (reboot fired / stop done) and
+ * return the opaque token identifying the record. Callers WITH a session
+ * identity take the fresh token and store it per-session; session-less
+ * (headless) callers pass PROCESS_WIDE_RESTART_DISPATCH_TOKEN so all unheld
+ * stamps share one bounded slot. Stale records are pruned on each stamp.
+ */
+export function recordRestartDispatch(base: string | null, token?: string): string {
+  const now = Date.now();
+  for (const [t, r] of restartDispatchRecords) {
+    if (now - r.at > RESTART_DISPATCH_CAUSATION_WINDOW_MS) {
+      restartDispatchRecords.delete(t);
+    }
+  }
+  const t = token ?? randomUUID();
+  restartDispatchRecords.set(t, { at: now, base });
+  return t;
+}
+
+/** Remove ONLY the record identified by `token` — a recovery may never clear
+ *  another session's record (r5). Unknown token → no-op. */
+export function clearRestartDispatch(token: string): void {
+  restartDispatchRecords.delete(token);
+}
+
+/** The record identified by `token`, or null. */
+export function getRestartDispatchRecord(
+  token: string,
+): RestartDispatchRecord | null {
+  return restartDispatchRecords.get(token) ?? null;
+}
+
+/**
+ * Refuse-safe preflight for an OUT-OF-BAND restart — one that stops ComfyUI
+ * WITHOUT going through our validated kill+relaunch (e.g. the panel's
+ * ComfyUI-Manager reboot, which asks the Manager to cycle the process and never
+ * consults our relaunch command). The same atomic-ish invariant as
+ * restartComfyUI applies (#368/#370): a stop must never happen before a
+ * relaunch is proven possible. On a Pinokio-style install (#742) the running
+ * server is externally supervised yet its relaunch is NOT provable from here
+ * (a relative `main.py` argv with no COMFYUI_PATH/workspace anchor and no live
+ * process cwd), and the supervisor does NOT re-launch after a plain Manager
+ * restart — so the reboot would kill ComfyUI permanently. Only the PROVEN
+ * dangerous shape refuses: a reachable, running, non-Desktop local instance
+ * whose relaunch command cannot be built/validated. Everything else returns
+ * ok:true and the caller proceeds exactly as before:
+ *   - remote mode (no local process to assess);
+ *   - nothing found / unreachable-but-unmapped (no proven running process —
+ *     #449 already punts those to a Manager reboot on purpose);
+ *   - a Desktop app (Electron-supervised — the Manager reboot IS its safe
+ *     restart path, #400);
+ *   - a validated relaunch (assessRelaunch, the #476/#426 machinery).
+ */
+export async function preflightLocalRestart(): Promise<{
+  ok: boolean;
+  reason?: string;
+}> {
+  if (isRemoteMode()) return { ok: true };
+  const { info } = await acquireProcessInfo();
+  if (!info) return { ok: true };
+  if (info.isDesktopApp) return { ok: true };
+  const relaunch = assessRelaunch(info);
+  if (relaunch.ok) return { ok: true };
+  return { ok: false, reason: relaunch.reason };
 }
 
 export const __processControlTestHooks = {
@@ -1531,6 +1647,7 @@ export const __processControlTestHooks = {
     supervisorGaveUp = false;
     remoteRebootTimingOverride = null;
     liveCwdResolverOverride = null;
+    restartDispatchRecords.clear();
   },
   /** Inject a fake live-process-cwd resolver (#535) so tests can drive the
    *  `/proc/<pid>/cwd` relative-script anchor without a real process/filesystem. */
@@ -1539,6 +1656,15 @@ export const __processControlTestHooks = {
   },
   setLastProcessInfo(info: ProcessInfo): void {
     lastProcessInfo = info;
+  },
+  /** Seed/remove a #742 r4/r5 restart-dispatch record directly (fresh/stale/
+   *  foreign base) so decline-path causation tests don't run a real restart. */
+  setRestartDispatchRecord(
+    token: string,
+    record: RestartDispatchRecord | null,
+  ): void {
+    if (record == null) restartDispatchRecords.delete(token);
+    else restartDispatchRecords.set(token, record);
   },
   /** Inject fast remote-reboot timing so tests don't wait the real ~120s budget. */
   setRemoteRebootTimingForTests(timing: RemoteRebootTiming | null): void {

@@ -648,6 +648,23 @@ export function isTargetingLocal(): boolean {
 // local and a RunPod pod — the UI must never lie about where a job runs.
 type ComfyuiTargetListener = (url: string, isLocal: boolean) => void;
 const comfyuiTargetListeners = new Set<ComfyuiTargetListener>();
+
+// ── Target generation (#742 r11/r12) ─────────────────────────────────────────
+// Monotonic epoch bumped in setComfyuiTarget BEFORE the mutation is
+// observable, so any observer of the new target value (including synchronous
+// target-change listeners) always sees the new generation with it — the
+// target-generation contract. A final-state base comparison (A vs A) cannot
+// detect an intervening A→B→A mutation, so consumers that read the mutable
+// target across an await (e.g. the panel restart's refuse-safe preflight)
+// must instead require the GENERATION to be unchanged after the await — any
+// mutation, including a round trip back to the same base, bumps it.
+let comfyuiTargetGeneration = 0;
+
+/** The current target generation — increments on every successful setComfyuiTarget. */
+export function getComfyuiTargetGeneration(): number {
+  return comfyuiTargetGeneration;
+}
+
 export function onComfyuiTargetChanged(cb: ComfyuiTargetListener): () => void {
   comfyuiTargetListeners.add(cb);
   return () => comfyuiTargetListeners.delete(cb);
@@ -731,6 +748,14 @@ export function setComfyuiTarget(url: string): boolean {
   } catch {
     return false;
   }
+  // Bump the target generation BEFORE the mutation is observable (#742 r12):
+  // the contract is that ANY observer of the new target value — including a
+  // synchronous target-change listener fired below — sees the new generation
+  // with it. The reverse ordering (new target fanned out with the old epoch)
+  // is the violation; a post-parse failure leaving the epoch advanced is
+  // harmless by comparison (consumers like the #742 r10 check simply refuse
+  // conservatively), and nothing past this point can fail the retarget anyway.
+  comfyuiTargetGeneration += 1;
   config.comfyuiHost = t.host;
   config.comfyuiPort = t.port;
   config.resolvedPort = t.port;

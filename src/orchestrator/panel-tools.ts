@@ -63,13 +63,23 @@ import {
   resetObjectInfoCache,
 } from "../comfyui/client.js";
 import { convertUiToApi, collectNodeTypes } from "../services/workflow-converter.js";
-import { restartComfyUI } from "../services/process-control.js";
+import {
+  restartComfyUI,
+  preflightLocalRestart,
+  recordRestartDispatch,
+  clearRestartDispatch,
+  getRestartDispatchRecord,
+  RESTART_DISPATCH_CAUSATION_WINDOW_MS,
+  PROCESS_WIDE_RESTART_DISPATCH_TOKEN,
+  __processControlTestHooks,
+} from "../services/process-control.js";
 import { resetManagerApiCache } from "../services/manager-api-cache.js";
 import {
   isRemoteMode,
   isCloudMode,
   getBootLocalComfyUIBaseUrl,
   getComfyUIBaseUrl,
+  getComfyuiTargetGeneration,
 } from "../config.js";
 import { sliceWorkflow } from "../services/workflow-slicer.js";
 import { validateA2UISpecServer } from "../services/a2ui-spec.js";
@@ -257,6 +267,20 @@ const MAX_REBOOT_BUDGET_MS = 240_000; // 240s  → settle+budget ≤ 250s < 300s
 // confirmation itself (no auto-confirm): it bounds only how long we wait for the answer.
 const RESTART_CONFIRM_TIMEOUT_MS = 90_000; // 90s
 
+// #742 decline-probe recheck window: a single ECONNREFUSED is NOT proof of a
+// lost server — a genuinely restarting instance is refused during its normal
+// down window (codex gate). When the decline path probes before reporting, it
+// rechecks over this SHORT, bounded window and only declares DOWN when the
+// endpoint is STILL refused at the end of it; a recovery inside the window is
+// reported as such. Deliberately small: the turn already ended on the user's
+// decline, so this is a report-time check and must not stall.
+const DECLINE_PROBE_WINDOW_MS = 6_000; // 6s total
+const DECLINE_PROBE_INTERVAL_MS = 2_000; // 2s between samples
+const DECLINE_PROBE_TIMEOUT_MS = 2_000; // per-sample probe ceiling
+// #742 r4/r5: the decline path may name restart causation only against a
+// dispatch RECORDED within RESTART_DISPATCH_CAUSATION_WINDOW_MS (imported from
+// process-control) whose token THIS session holds — see sessionRestartDispatch.
+
 function parsePositiveNumberEnv(name: string, fallback: number): number {
   const raw = process.env[name];
   if (raw == null || raw === "") return fallback;
@@ -308,6 +332,39 @@ export const __panelToolsTestHooks = {
       | null,
   ): void {
     healthProbeOverride = fn;
+  },
+  /** Inject a fake #742 restart preflight so reboot tests don't probe real
+   *  processes/ports. null restores the live preflightLocalRestart. */
+  setLocalRestartPreflight(
+    fn: (() => Promise<{ ok: boolean; reason?: string }>) | null,
+  ): void {
+    localRestartPreflightOverride = fn;
+  },
+  /** Inject a fast #742 decline-probe recheck window so decline-path tests
+   *  don't wait the real ~6s. null restores the DECLINE_PROBE_* constants. */
+  setDeclineProbeTiming(
+    timing: { windowMs: number; intervalMs: number; probeTimeoutMs: number } | null,
+  ): void {
+    declineProbeTimingOverride = timing;
+  },
+  /** Direct access to the #742 decline recheck loop so its hard-deadline
+   *  guarantee (codex gate r2) can be unit-tested with a custom deadline. */
+  probeDeclineRecovery,
+  /** r5: the restart-dispatch record THIS session (ctx) holds, or null. */
+  getSessionRestartDispatch(
+    ctx: PanelToolCtx,
+  ): { at: number; base: string | null } | null {
+    return sessionRestartDispatch(ctx);
+  },
+  /** r5: seed a restart-dispatch record HELD BY this session (ctx) — with an
+   *  explicit `at` so fresh/stale shapes don't need a real restart. */
+  seedSessionRestartDispatch(
+    ctx: PanelToolCtx,
+    record: { at: number; base: string | null },
+  ): void {
+    const token = randomUUID();
+    __processControlTestHooks.setRestartDispatchRecord(token, record);
+    sessionRestartDispatchTokens.set(ctx, token);
   },
   looksLikeSystemStats,
   probeComfyHealth,
@@ -744,6 +801,90 @@ function normalizeProbe(v: boolean | ProbeStatus): ProbeStatus {
   return v;
 }
 
+interface DeclineProbeOutcome {
+  /**
+   * "healthy"   — the FIRST sample was healthy (a clean decline; no recheck).
+   * "recovered" — an early sample was a proven down but a LATER sample came
+   *               back healthy inside the window (a genuine restart's down
+   *               window — NEVER a lost server, codex gate).
+   * "down"      — no healthy sample AND the LAST sample taken within the
+   *               window was a proven down AND the FULL window ran its
+   *               course (the deadline did not truncate it — a truncated
+   *               observation can't prove permanence, codex gate r3). Only
+   *               this may be reported as a loss — a single refused sample,
+   *               or a shortened window, never suffices.
+   * "ambiguous" — anything else (no healthy sample, last sample not a proven
+   *               down, or a truncated window) — the plain cancel line,
+   *               never alarmist.
+   */
+  status: "healthy" | "recovered" | "down" | "ambiguous";
+  attempts: number;
+  waited_ms: number;
+}
+
+/**
+ * The #742 decline-path recheck: poll `base` over a short, bounded window
+ * (clamped to `deadline`) so a server that is merely mid-restart is not
+ * falsely declared lost on a single ECONNREFUSED. Samples immediately, then
+ * sleeps intervalMs between samples — "still refused at the END of the
+ * window" is the only down verdict, and ONLY when the full window ran: a
+ * deadline that truncates the window downgrades the verdict to "ambiguous"
+ * regardless of the samples taken (r3). The deadline is HARD (codex gate
+ * r2): no awaited probe may START once the remaining budget is exhausted —
+ * the loop stops and the verdict falls to the last known state (or
+ * "ambiguous" when nothing was sampled). Never throws.
+ */
+async function probeDeclineRecovery(
+  base: string | null,
+  windowMs: number,
+  intervalMs: number,
+  probeTimeoutMs: number,
+  deadline: number,
+): Promise<DeclineProbeOutcome> {
+  const start = Date.now();
+  const windowEnd = start + Math.max(1, windowMs);
+  const end = Math.min(windowEnd, deadline);
+  // r3: a window the deadline cuts short can never prove permanence — DOWN
+  // requires the FULL recheck window to have run its course.
+  const truncated = end < windowEnd;
+  const probe = healthProbeOverride ?? probeComfyEndpoint;
+  let attempts = 0;
+  let sawDown = false;
+  let last: ProbeStatus = "unknown";
+  for (;;) {
+    // HARD deadline: NEVER begin an awaited probe with an exhausted remainder
+    // (clamping an expired remainder to a 1ms timeout would still start — and
+    // await — a probe PAST the deadline, defeating the guarantee).
+    const remaining = end - Date.now();
+    if (remaining <= 0) break;
+    attempts++;
+    const t = Math.min(probeTimeoutMs, remaining);
+    let status: ProbeStatus = "unknown";
+    try {
+      status = normalizeProbe(await probe(base, t));
+    } catch {
+      status = "unknown";
+    }
+    if (status === "healthy") {
+      return {
+        status: sawDown ? "recovered" : "healthy",
+        attempts,
+        waited_ms: Date.now() - start,
+      };
+    }
+    if (status === "down") sawDown = true;
+    last = status;
+    const left = end - Date.now();
+    if (left <= 0) break;
+    await new Promise((r) => setTimeout(r, Math.max(1, Math.min(intervalMs, left))));
+  }
+  return {
+    status: last === "down" && !truncated ? "down" : "ambiguous",
+    attempts,
+    waited_ms: Date.now() - start,
+  };
+}
+
 /**
  * The FIXED ComfyUI base URL to health-probe during a reboot readiness wait, or
  * null when we must fall back to the panel round-trip (as before #509). Captured by
@@ -806,6 +947,62 @@ function captureRebootHealthBase(ctx: PanelToolCtx): string | null {
 let healthProbeOverride:
   | ((base: string | null, timeoutMs: number) => Promise<boolean | ProbeStatus>)
   | null = null;
+
+/** Test injection for the #742 refuse-safe restart preflight (the real one is
+ *  preflightLocalRestart in process-control). null → the live preflight. */
+let localRestartPreflightOverride:
+  | (() => Promise<{ ok: boolean; reason?: string }>)
+  | null = null;
+
+/** Test injection for the #742 decline-probe recheck window, so tests don't
+ *  wait the real ~6s. null → the DECLINE_PROBE_* constants. */
+let declineProbeTimingOverride: {
+  windowMs: number;
+  intervalMs: number;
+  probeTimeoutMs: number;
+} | null = null;
+
+// #742 r5: restart-dispatch tokens held PER SESSION. Each MCP session gets its
+// own PanelToolCtx (one per connection — see the session factory in
+// panel-mcp-http), so keying by the ctx object scopes a dispatch record to the
+// session that dispatched it: session A's failed restart can never ground
+// causation for session B's decline, and A's recovery clears only A's record.
+// WeakMap → entries die with their session's ctx.
+const sessionRestartDispatchTokens = new WeakMap<object, string>();
+
+/** Stamp a restart dispatch and hold its token on THIS session (replacing any
+ *  record the session previously held — a session has at most one live one).
+ *  Returns the held token so clears can be CLEAR-IF-SAME (r15). */
+function stampSessionRestartDispatch(ctx: PanelToolCtx, base: string | null): string {
+  const prev = sessionRestartDispatchTokens.get(ctx);
+  if (prev) clearRestartDispatch(prev);
+  const token = recordRestartDispatch(base);
+  sessionRestartDispatchTokens.set(ctx, token);
+  return token;
+}
+
+/** The dispatch token THIS session currently holds, or undefined. */
+function sessionRestartDispatchToken(ctx: PanelToolCtx): string | undefined {
+  return sessionRestartDispatchTokens.get(ctx);
+}
+
+/** The restart-dispatch record THIS session holds, or null. */
+function sessionRestartDispatch(
+  ctx: PanelToolCtx,
+): { at: number; base: string | null } | null {
+  const held = sessionRestartDispatchToken(ctx);
+  return held ? getRestartDispatchRecord(held) : null;
+}
+
+/** Clear ONLY when the session STILL holds `token` (r15): a newer dispatch
+ *  that landed since `token` was validated keeps its record — a
+ *  read-current-then-clear would evict the newer dispatch's record and make a
+ *  later persistent DOWN falsely report "no restart was dispatched". */
+function clearSessionRestartDispatchIfSame(ctx: PanelToolCtx, token: string): void {
+  if (sessionRestartDispatchTokens.get(ctx) !== token) return;
+  sessionRestartDispatchTokens.delete(ctx);
+  clearRestartDispatch(token);
+}
 
 /**
  * The concurrent-observation gate shared between the reboot handler and observeRecovery.
@@ -5340,7 +5537,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_restart_comfyui",
-      "Restart the user's ComfyUI server via the built-in Manager — needed to load newly installed/updated custom nodes. CALL THIS DIRECTLY when a restart is needed: it pops a confirm card and only restarts on a yes (don't ask separately first). ComfyUI and this agent go down briefly, then the panel auto-reconnects and you resume. ⚠️ BUSY GUARD: a restart ABORTS any in-progress or queued generation — if ComfyUI is generating, this tool REFUSES and tells you (it does NOT restart). When that happens, tell the user a render is running and WAIT for it (poll panel_node_queue_status), or pass force:true ONLY if the user explicitly confirms they want to kill the running generation. Best practice: before restarting after an install, check the queue is idle first. Only call when a restart is actually needed.",
+      "Restart the user's ComfyUI server via the built-in Manager — needed to load newly installed/updated custom nodes. CALL THIS DIRECTLY when a restart is needed: it pops a confirm card and only restarts on a yes (don't ask separately first). ComfyUI and this agent go down briefly, then the panel auto-reconnects and you resume. ⚠️ BUSY GUARD: a restart ABORTS any in-progress or queued generation — if ComfyUI is generating, this tool REFUSES and tells you (it does NOT restart). When that happens, tell the user a render is running and WAIT for it (poll panel_node_queue_status), or pass force:true ONLY if the user explicitly confirms they want to kill the running generation. Best practice: before restarting after an install, check the queue is idle first. Only call when a restart is actually needed. On an externally-managed install whose relaunch can't be proven from here (e.g. Pinokio), the restart is REFUSED before anything is stopped — restart from the launcher that owns the server instead.",
       { force: z.boolean().optional() },
       async ({ force }, ctx) => {
         // Whole-handler budget (#536): confirm + dispatch + readiness — INCLUDING
@@ -5389,6 +5586,143 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           );
         }
         if (decision !== "yes") {
+          // #742: NEVER claim "not restarted" while the server is actually DOWN —
+          // and NEVER declare a loss from ONE probe (codex gate): a genuinely
+          // restarting server is refused during its normal down window, and a
+          // transport/card error mapping to "no" is exactly how a tab dying
+          // during a healthy prior reboot lands here. So recheck over a short,
+          // bounded window and report DOWN only when the endpoint is STILL
+          // refused at the end of it; a recovery inside the window is reported
+          // as such (bound instance) or keeps the plain cancel line (unbound).
+          // CAUSATION ("a restart took it down") is named ONLY when the probed
+          // target is PROVABLY the same boot instance the restart would have
+          // stopped — the same binding the refuse-safe preflight uses; an
+          // unbound configured endpoint gets a generic unreachable report that
+          // never claims "we stopped it".
+          const declineBootBase = captureRebootHealthBase(ctx);
+          const boundToRestartTarget =
+            declineBootBase != null && sameHttpBase(getComfyUIBaseUrl(), declineBootBase);
+          const declineProbeBase = boundToRestartTarget
+            ? declineBootBase
+            : getComfyUIBaseUrl();
+          // r15: capture the session's held dispatch TOKEN before the probe
+          // awaits — the exoneration clear (r13) and the recovery claim (r14)
+          // must key on the token VALIDATED HERE, never whichever token is
+          // current after the awaits: a concurrent accepted restart stamping a
+          // fresh token mid-probe keeps its record (clear-if-same below), so a
+          // later persistent DOWN can still attribute to it.
+          const declineHeldToken = sessionRestartDispatchToken(ctx);
+          const declineTiming = declineProbeTimingOverride ?? {
+            windowMs: DECLINE_PROBE_WINDOW_MS,
+            intervalMs: DECLINE_PROBE_INTERVAL_MS,
+            probeTimeoutMs: DECLINE_PROBE_TIMEOUT_MS,
+          };
+          const outcome = await probeDeclineRecovery(
+            declineProbeBase,
+            declineTiming.windowMs,
+            declineTiming.intervalMs,
+            declineTiming.probeTimeoutMs,
+            overallDeadline,
+          );
+          // The VALIDATED token's record (null when it was superseded by a
+          // newer stamp during the probe — the conservative outcome: neither
+          // claim nor clear keys on a record this probe didn't validate).
+          const declineHeldRecord = declineHeldToken
+            ? getRestartDispatchRecord(declineHeldToken)
+            : null;
+          // r13: a HEALTHY/RECOVERED observation exonerates any dispatch THIS
+          // session has on record — the restart explained itself, so its token
+          // must never ground causation for a LATER, independent failure.
+          // Base-matched: a healthy observation only exonerates the instance
+          // it was taken on (an unbound healthy endpoint says nothing about a
+          // boot-instance record). The 10-minute causation window stays as the
+          // backstop for records never observed back.
+          // r14: the record is captured BEFORE the clear — the recovery CLAIM
+          // below ("a restart initiated earlier appears to have completed")
+          // requires the token to have been present at this moment.
+          // r15: CLEAR-IF-SAME — the clear fires only when the session still
+          // holds the SAME token validated before the probe; a newer dispatch
+          // stamped mid-probe keeps its record.
+          if (outcome.status === "healthy" || outcome.status === "recovered") {
+            if (
+              declineHeldToken != null &&
+              declineHeldRecord != null &&
+              (declineHeldRecord.base == null ||
+                sameHttpBase(declineHeldRecord.base, declineProbeBase))
+            ) {
+              clearSessionRestartDispatchIfSame(ctx, declineHeldToken);
+            }
+          }
+          if (outcome.status === "down") {
+            const secs = Math.max(1, Math.round(outcome.waited_ms / 1000));
+            if (boundToRestartTarget) {
+              // r4: causation may be named ONLY against a RECORDED restart
+              // dispatch — recent enough to plausibly be the cause, and
+              // targeting THIS instance. r5: the record must be one THIS
+              // SESSION dispatched (holds the token of) — another session's
+              // failed restart never grounds causation here. An unrelated
+              // crash / manual stop (no record, a stale record, another
+              // instance's record, or another session's record) gets the
+              // causation-free report.
+              const dispatch = sessionRestartDispatch(ctx);
+              const causative =
+                dispatch != null &&
+                Date.now() - dispatch.at <= RESTART_DISPATCH_CAUSATION_WINDOW_MS &&
+                (dispatch.base == null || sameHttpBase(dispatch.base, declineBootBase));
+              if (causative) {
+                return ok(
+                  "⚠️ ComfyUI is DOWN — it was STOPPED and did not come back (still " +
+                    `unreachable after a ${secs}s recheck window), so do NOT treat this as ` +
+                    "\"nothing happened\". The restart just declined was NOT what stopped " +
+                    "it (nothing was dispatched after the decline), but a restart initiated " +
+                    "earlier already took the server down and it never returned. Start " +
+                    "ComfyUI manually from whatever launches it (e.g. Pinokio, the Desktop " +
+                    "app, or your terminal), then reload the panel tab so it reconnects. " +
+                    "restart_comfyui can attempt the relaunch for you when the install's " +
+                    "launch path is resolvable.",
+                );
+              }
+              return ok(
+                "⚠️ ComfyUI is DOWN — still unreachable after " +
+                  `a ${secs}s recheck window — and no restart was dispatched through me ` +
+                  "that would explain it (the restart just declined was NOT dispatched, " +
+                  "and none is on record recently for this instance). Something else " +
+                  "stopped it (a crash, a manual stop, or its launcher). Start ComfyUI " +
+                  "manually from whatever launches it (e.g. Pinokio, the Desktop app, or " +
+                  "your terminal), then reload the panel tab so it reconnects.",
+              );
+            }
+            return ok(
+              "⚠️ ComfyUI appears to be DOWN — the configured endpoint was still " +
+                `unreachable after a ${secs}s recheck window. The restart just declined ` +
+                "was NOT dispatched, and I can't confirm from here whether the server " +
+                "was actually stopped — this endpoint isn't provably the instance the " +
+                "restart would have cycled. Check ComfyUI on its host and start it " +
+                "manually if it is down, then reload the panel tab so it reconnects.",
+            );
+          }
+          if (outcome.status === "recovered" && boundToRestartTarget) {
+            // r14: the recovery CLAIM ("a restart initiated earlier appears to
+            // have completed") passes the SAME causation gate as the DOWN
+            // report — a session-held, bound-confirmed record, recent, and
+            // base-matched, captured BEFORE the r13 exoneration clear (which
+            // fires either way). Without it, the down→healthy cycle alone
+            // proves nothing about what caused the down: report the recovery
+            // causation-free.
+            const recoveryCausative =
+              declineHeldRecord != null &&
+              Date.now() - declineHeldRecord.at <= RESTART_DISPATCH_CAUSATION_WINDOW_MS &&
+              (declineHeldRecord.base == null ||
+                sameHttpBase(declineHeldRecord.base, declineBootBase));
+            return ok(
+              recoveryCausative
+                ? "Cancelled — no new restart was dispatched. Note: ComfyUI was briefly " +
+                    "unreachable but is healthy again — a restart initiated earlier " +
+                    "appears to have completed."
+                : "Cancelled — no new restart was dispatched. ComfyUI was briefly " +
+                    "unreachable but is healthy again.",
+            );
+          }
           return ok("Cancelled — ComfyUI was not restarted.");
         }
         // Heal an orphaned session onto the live tab FIRST, then bind the reboot dispatch
@@ -5396,6 +5730,103 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // completion prevents any rebind in between). The boot-endpoint probe target is
         // server-authorized + immutable, bound to the exact host FAMILY the reboot goes
         // to (null unless the bound tab provably fronts our boot instance).
+        ctx.ensureReachable?.();
+        // #742 REFUSE-SAFE PREFLIGHT: a Manager reboot stops ComfyUI OUT-OF-BAND —
+        // it never goes through our validated kill+relaunch — so before dispatching
+        // anything, the stop must be provable survivable (#368/#370: losing a restart
+        // is cheap, losing the server is not). On a Pinokio-style install (externally
+        // supervised; no main.py/interpreter resolvable from here) a plain Manager
+        // restart kills the process and the supervisor does NOT re-launch it — the
+        // exact #742 lost-server. When the reboot would target OUR local boot
+        // instance (the same instance binding the legacy fallback uses), prove a
+        // relaunch is possible FIRST and refuse BEFORE any stop when it isn't. Only
+        // the PROVEN-dangerous shape refuses (a reachable local non-Desktop process
+        // with an unbuildable/unvalidatable relaunch); every other shape — Desktop
+        // (Electron-supervised, #400), unverifiable, or remote — proceeds exactly as
+        // before. The binding for this DECISION is captured pre-await; nothing
+        // downstream may reuse it (r7).
+        const preflightHealthBase = captureRebootHealthBase(ctx);
+        if (preflightHealthBase != null && sameHttpBase(getComfyUIBaseUrl(), preflightHealthBase)) {
+          // Snapshot the target GENERATION at the decision (r11): a final-state
+          // base comparison (A vs A) cannot detect an intervening A→B→A
+          // retarget, so stability is judged by the monotonic epoch bumped on
+          // EVERY retarget — any mutation, including a round trip back to the
+          // same base, is caught.
+          const preflightTargetGeneration = getComfyuiTargetGeneration();
+          const preflight = await (localRestartPreflightOverride ?? preflightLocalRestart)();
+          // r8/r9/r10: the preflight AWAIT makes the pre-decision captures
+          // STALE — and the preflight itself reads MUTABLE config (target URL,
+          // port, COMFYUI_PATH) throughout, so a config retarget during the
+          // await can re-point the whole assessment at a DIFFERENT install
+          // while the tab still fronts the original one. Re-heal and
+          // re-capture BEFORE trusting the result either way. The guarantee
+          // that must hold: a stop/reboot is only ever sent when the preflight
+          // validated THE instance the dispatch will cycle.
+          ctx.ensureReachable?.();
+          const postPreflightHealthBase = captureRebootHealthBase(ctx);
+          const tabFrontsSameInstance =
+            postPreflightHealthBase != null &&
+            sameHttpBase(preflightHealthBase, postPreflightHealthBase);
+          const configStable =
+            getComfyuiTargetGeneration() === preflightTargetGeneration;
+          if (!configStable && tabFrontsSameInstance) {
+            // r10: the target config moved MID-CHECK, so the preflight result
+            // — pass OR fail — cannot vouch for the tab-fronted instance (a
+            // PASS may have validated a different, safe install; it must never
+            // bless a stop of this one). Its relaunch is UNPROVEN → refuse; an
+            // instance with an unproven relaunch is never sent a stop.
+            return ok({
+              rebooting: false,
+              ready: false,
+              confirmed_cycle: false,
+              refused: true,
+              note:
+                "Refusing to restart ComfyUI: the ComfyUI target configuration changed " +
+                "while the restart safety check was running, so the check cannot vouch " +
+                "for a safe relaunch of the instance this panel fronts. A stop is never " +
+                "sent to an instance whose relaunch is unproven — ComfyUI was NOT " +
+                "stopped (it is still running). Let the target settle, then retry " +
+                "panel_restart_comfyui.",
+            });
+          }
+          if (!preflight.ok && tabFrontsSameInstance) {
+            // r9: the danger proof follows the INSTANCE the tab fronts, NOT the
+            // mutable runtime config — a config-only retarget mid-await must
+            // not wash out the proof that the tab-fronted boot instance is
+            // unrelaunchable. The tab STILL fronts that same instance, so the
+            // proof is still valid and the refusal stands: an instance proven
+            // unrelaunchable is NEVER sent a stop/reboot, regardless of
+            // config/tab shuffling mid-flight. Only a genuinely different,
+            // unconfirmable target falls through to the honest-unconfirmed
+            // dispatch (nothing was ever proved dangerous for it — and nothing
+            // was ever stopped, the preflight never stops anything).
+            return ok({
+              rebooting: false,
+              ready: false,
+              confirmed_cycle: false,
+              refused: true,
+              note:
+                `Refusing to restart ComfyUI: ${preflight.reason} This looks like an ` +
+                "externally-managed install (e.g. Pinokio): a restart from here would STOP " +
+                "ComfyUI and nothing would bring it back automatically, so it was refused " +
+                "BEFORE anything was stopped — ComfyUI is still running. Restart it from the " +
+                "launcher that owns it (e.g. Pinokio's own controls), or point COMFYUI_PATH " +
+                "at the live install so a relaunch can be proven and use restart_comfyui.",
+            });
+          }
+          // Otherwise: a PASS with a stable config (proven safe for THE
+          // tab-fronted instance — proceed), or the tab now fronts a genuinely
+          // different, unconfirmable target (nothing provable about it — the
+          // dispatch path below treats that honestly, r6/r7). Nothing was
+          // stopped in any case — the preflight never stops anything.
+        }
+        // r7: the preflight AWAIT sits between the binding capture and the dispatch,
+        // breaking the no-await invariant above — a tab/connection rebind during
+        // that await would make every pre-await capture stale (the dispatch would
+        // go to an unconfirmable/different target while the causation stamp, the
+        // recovery observer, and the legacy-fallback gate all read the STALE bound
+        // base). Re-heal and re-capture the tab id, panel identity, and health base
+        // AT THE DISPATCH POINT; everything below uses ONLY these fresh captures.
         ctx.ensureReachable?.();
         const boundTabId = ctx.tabId;
         // Snapshot the exact browser-tab registration that is about to receive the
@@ -5573,6 +6004,18 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               );
             }
             clearTimeout(restartTimer);
+            // #742 r5/r6: the managed restart stopped the process — record the
+            // dispatch with THIS session holding the token, stamped with the
+            // BOUND-CONFIRMED base (this fallback only runs when the instance
+            // binding held, so healthBase is non-null here). restartComfyUI
+            // also stamped its own process-wide record, which never grounds
+            // causation. Only a PROVEN stop is recorded; a refusal/timeout
+            // (restart undefined, or stopped!==true) records nothing. The
+            // token is kept so the recovery clear below is CLEAR-IF-SAME (r15).
+            let legacyDispatchToken: string | undefined;
+            if (restart?.stopped === true) {
+              legacyDispatchToken = stampSessionRestartDispatch(ctx, healthBase);
+            }
             // DEFINITIVE no-restart: a spawn failure, OR restartComfyUI refused before
             // stopping anything (no process found / unsafe relaunch → stopped:false &&
             // started:false). The process was NOT cycled, so the still-healthy endpoint is
@@ -5592,6 +6035,14 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             // Otherwise (the process WAS stopped/started, or restartComfyUI's own readiness
             // poll merely expired — neither terminal) DEFER to OUR OWN observed DOWN→UP.
             const recovery = await proofPromise;
+            // #742 r4/r5/r15: the managed restart was observed back — clear THIS
+            // session's record, CLEAR-IF-SAME: only when the session still holds
+            // the token THIS restart stamped (a concurrent dispatch's newer
+            // record survives). restartComfyUI also clears its own process-wide
+            // record on success; this covers only-observer-saw-it recoveries.
+            if (recovery.ready && legacyDispatchToken != null) {
+              clearSessionRestartDispatchIfSame(ctx, legacyDispatchToken);
+            }
             const observed = recovery.via === "observed-cycle";
             // The legacy Manager path restarts ComfyUI out-of-band too. Server recovery alone
             // is not graph-tool readiness: wait for the browser tab to reconnect, then verify
@@ -5651,6 +6102,24 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         resetClient();
         resetObjectInfoCache();
         resetManagerApiCache("panel Manager reboot");
+        // #742 r4/r5/r6: record the ACTUAL dispatch (acceptance proven — a refusal
+        // never reaches here). ONLY a BOUND-CONFIRMED target (the same binding
+        // the r1 causation scoping and the refuse-safe preflight use) may stamp a
+        // causation-capable record — held on THIS session with the BOUND base at
+        // stamp time, never the mutable configured one. An unbound/unconfirmable
+        // target (r6) stamps only the shared PROCESS-WIDE slot, which never
+        // grounds causation: the dispatch can't be proven to have hit the
+        // instance a later decline would probe, and a session that rebinds to
+        // the boot tab afterward can't claim it either (a re-targeted session
+        // can't prove the earlier dispatch hit its current instance — no claim
+        // is the truthful answer). It is cleared below if observed back —
+        // CLEAR-IF-SAME on the token stamped here (r15).
+        let acceptedDispatchToken: string | undefined;
+        if (healthBase != null && sameHttpBase(getComfyUIBaseUrl(), healthBase)) {
+          acceptedDispatchToken = stampSessionRestartDispatch(ctx, healthBase);
+        } else {
+          recordRestartDispatch(getComfyUIBaseUrl(), PROCESS_WIDE_RESTART_DISPATCH_TOKEN);
+        }
 
         // Observe recovery. There is exactly ONE sound proof that THIS ComfyUI instance
         // actually cycled: a directly OBSERVED down→up on the server-authorized, immutable,
@@ -5687,6 +6156,12 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // down→up, which the observer has been (and continues) watching for.
         gate.deadline = Math.min(Date.now() + timing.budgetMs, overallDeadline);
         const recovery = await recoveryPromise!;
+        // #742 r4/r5/r15: the dispatched restart was observed back — clear the
+        // record, CLEAR-IF-SAME: only when the session still holds the token
+        // THIS dispatch stamped (a concurrent dispatch's newer record survives).
+        if (recovery.ready && acceptedDispatchToken != null) {
+          clearSessionRestartDispatchIfSame(ctx, acceptedDispatchToken);
+        }
         if (!recovery.ready) {
           const waited = Math.round(recovery.waited_ms / 1000);
           return ok({
