@@ -139,6 +139,8 @@ interface Harness {
   deps: PanelInstallerDeps;
   updateCalls: number;
   clones: string[];
+  /** How many times the #724 fast-forward actually ran. */
+  gitMerges: number;
 }
 
 function makeDeps(opts: {
@@ -156,7 +158,7 @@ function makeDeps(opts: {
   withoutSwapOps?: boolean;
 }): Harness {
   const revs = opts.revs ?? {};
-  const h: Harness = { deps: null as never, updateCalls: 0, clones: [] };
+  const h: Harness = { deps: null as never, updateCalls: 0, clones: [], gitMerges: 0 };
 
   const base: PanelInstallerDeps = {
     isLocalMode: () => mode.local,
@@ -191,6 +193,7 @@ function makeDeps(opts: {
     gitStatusPorcelain: () => "",
     gitFetch: () => {},
     gitMergeFfOnly: () => {
+      h.gitMerges++;
       throw new Error("no upstream in this persona");
     },
     gitWorktreeRoot: (dir) => dir,
@@ -330,13 +333,17 @@ describe("disk-current but handshake-old is diagnosed as a stale tab, not a stal
     expect(text).toMatch(/HARD-REFRESH/);
   });
 
-  it("the skew branch outranks remote mode — no update helps either way", () => {
+  it("the skew branch outranks remote mode — and still never names an uncallable tool", () => {
     mode.local = false;
     mode.remote = true;
     __resetPanelBaseCache();
     const text = describePanelUpdateRecovery(undefined, SKEW);
     expect(text).toMatch(/Do NOT update the panel/);
     expect(text).not.toMatch(/ON THE COMFYUI HOST/);
+    // Even the closing "it would report nothing to do" aside must not mention a
+    // tool that is not callable in this session.
+    expect(text).not.toMatch(/install_panel/);
+    expect(text).toMatch(/No update of any kind will help/);
   });
 
   it("without a skew, the ordinary update guidance is unchanged", async () => {
@@ -822,7 +829,13 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
 });
 
 describe("a wholesale replacement needs the RUNNING server to have chosen the tree (#766)", () => {
-  it("an unreachable server marks the resolution UNCORROBORATED (what gates the swap)", async () => {
+  // NOTE: the corroboration gate applies to the PRODUCTION dep set only — an
+  // injected one declares its own base and there is no live server to
+  // corroborate it against — so it cannot be driven from these harness-based
+  // tests. What the gate reads is the resolution below, which IS covered: both
+  // direct fallbacks (the #724 fast-forward and the #771 swap) call the same
+  // assertSwapTreeCorroborated helper over it.
+  it("an unreachable server marks the resolution UNCORROBORATED (what gates both fallbacks)", async () => {
     // The fallback to COMFYUI_PATH is fine for a read and is labelled as such,
     // but on a Desktop split install it is the tree the server does NOT read.
     // Replacing a panel there would update a copy nobody serves and report it as

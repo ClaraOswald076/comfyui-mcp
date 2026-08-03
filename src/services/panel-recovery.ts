@@ -240,9 +240,14 @@ export function describePanelUpdateRecovery(
       `carry no cache-busting key, so an ordinary reload can serve the stale file again: ` +
       `HARD-REFRESH this ComfyUI tab with a cache-bypassing reload (Ctrl+Shift+R, or ` +
       `Cmd+Shift+R on macOS; if that does not take, open DevTools and use ` +
-      `right-click reload → "Empty Cache and Hard Reload"). Running ` +
-      `install_panel(action:'update') here will correctly report nothing to do — the ` +
-      `install is not the problem.`
+      `right-click reload → "Empty Cache and Hard Reload"). ` +
+      // Only name the tool where naming it is useful. In a remote/cloud session
+      // it is not callable at all, so "it would report nothing to do" is a
+      // pointless mention of an absent tool; say the plain thing instead.
+      (ctx.installPanelUsable
+        ? `Running install_panel(action:'update') here will correctly report nothing ` +
+          `to do — the install is not the problem.`
+        : `No update of any kind will help — the install is not the problem.`)
     );
   }
 

@@ -1797,6 +1797,33 @@ function finalizeUpdate(
  * changed, no restart needed). A failed pull throws with BOTH diagnostics; it
  * never reads as "nothing to pull".
  */
+/**
+ * The corroboration refusal shared by BOTH direct fallbacks.
+ *
+ * A "direct" fallback bypasses ComfyUI-Manager and mutates a directory this
+ * process picked. That is only defensible when the running server itself named
+ * the tree — otherwise, on a Comfy Desktop split install, we would fast-forward
+ * (or replace) a dormant checkout and report a verified success while the
+ * browser's panel never moved.
+ */
+function assertSwapTreeCorroborated(
+  deps: PanelInstallerDeps,
+  comfyuiPath: string,
+  what: string,
+  managerReason: string,
+): void {
+  if (swapTreeIsCorroborated(deps)) return;
+  throw new PanelInstallError(
+    `Panel update did NOT apply (${managerReason}), and ${what} is REFUSED: the ` +
+      `running ComfyUI did not confirm that ${comfyuiPath} is the tree it serves from, ` +
+      `so this is the CONFIGURED path rather than a corroborated one. On a split ` +
+      `install (Comfy Desktop's --base-directory, #766) those differ, and updating the ` +
+      `panel here could move a copy nobody serves while the browser keeps loading the ` +
+      `real one — reported as a verified success. Start ComfyUI so its install root can ` +
+      `be read, then retry. ${describePanelUpdateRecovery()}`,
+  );
+}
+
 async function updateViaGitCheckoutFallback(opts: {
   deps: PanelInstallerDeps;
   dir: string;
@@ -2332,17 +2359,12 @@ async function updateViaRegistryZipReinstall(opts: {
   } = opts;
 
   // CORROBORATE THE TREE before replacing anything in it.
-  if (!swapTreeIsCorroborated(deps)) {
-    throw new PanelInstallError(
-      `Panel update did NOT apply (${managerReason}), and the reinstall-from-source ` +
-        `fallback is REFUSED: the running ComfyUI could not be reached, so ${comfyuiPath} ` +
-        `is the CONFIGURED path rather than a tree the live server confirmed it reads. ` +
-        `On a split install (Comfy Desktop's --base-directory, #766) those differ, and ` +
-        `replacing the panel here could update a copy nobody serves while the browser ` +
-        `keeps loading the real one — reported as a verified success. Start ComfyUI so ` +
-        `its install root can be confirmed, then retry. ${describePanelUpdateRecovery()}`,
-    );
-  }
+  assertSwapTreeCorroborated(
+    deps,
+    comfyuiPath,
+    "the reinstall-from-source fallback",
+    managerReason,
+  );
 
   // NOT A GIT CHECKOUT. This is the whole precondition: this path replaces the
   // directory wholesale, which would discard a checkout's branch, remotes and
@@ -2972,6 +2994,9 @@ export async function runPanelActionInner(
         `"${PANEL_REGISTRY_ID}" in its own installed-pack list, though the pack IS ` +
         `on disk at ${freshDir ?? "custom_nodes"})`;
       if (freshRev && freshDir) {
+        // Same corroboration the ZIP swap demands: a DIRECT mutation must act
+        // on a tree the running server named, not merely on a configured one.
+        assertSwapTreeCorroborated(deps, comfyPath, "the git fallback", managerReason);
         return updateViaGitCheckoutFallback({
           deps,
           dir: freshDir,
@@ -3116,6 +3141,14 @@ export async function runPanelActionInner(
             `or moved panel dirs, then retry.`,
         );
       }
+      // Same corroboration the ZIP swap demands: a DIRECT mutation must act on
+      // a tree the running server named, not merely on a configured one (#766).
+      assertSwapTreeCorroborated(
+        deps,
+        comfyPath,
+        "the git fallback",
+        "ComfyUI-Manager never enqueued the update (the stale legacy 3.x silent no-op)",
+      );
       return updateViaGitCheckoutFallback({
         deps,
         dir: detection.dir,
