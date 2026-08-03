@@ -3172,6 +3172,20 @@ let askTimingOverride: AskTiming | null = null;
 // misconfigured COMFYUI_PANEL_ASK_DEADLINE_S/GRACE_S can never recreate #486.
 const ASK_TOTAL_BUDGET_CAP_MS = 285_000;
 
+/**
+ * The per-request timeout an INTERNAL MCP client must use when calling panel_*
+ * tools (#325). Several panel tools are DESIGNED to block on a human well past
+ * the MCP SDK's 60s default request timeout: panel_ask / the confirm / consent
+ * cards wait up to ASK_TOTAL_BUDGET_CAP_MS (285s), and panel_request_secret
+ * waits up to 300s on its masked input. A client that calls them with the SDK
+ * default (the ollama-family backends' loopback panel client did) kills the
+ * request at 60s with `MCP error -32001: Request timed out` — the user picks an
+ * option minutes later, the server delivers it, and the model never sees it.
+ * Sized above the LONGEST blocking card (the 300s secret card) with margin for
+ * loopback transport + processing. Fast tools are unaffected: this is only an
+ * upper bound, never a wait. */
+export const PANEL_TOOL_MCP_TIMEOUT_MS = 315_000;
+
 function getAskTiming(): AskTiming {
   if (askTimingOverride) return askTimingOverride;
   const pollMs = Math.round(parsePositiveNumberEnv("COMFYUI_PANEL_ASK_POLL_S", 0.5) * 1000);
