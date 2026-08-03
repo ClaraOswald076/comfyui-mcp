@@ -107,6 +107,13 @@ export interface JournalEntry {
   /** Content fingerprint — set only for ID-LESS completions, which have no run
    *  identity to dedupe on. See idlessFingerprint(). */
   fingerprint?: string;
+  /** How many turns carried this completion and then ended without a provable
+   *  ack. Bounds the replay loop — see release(). */
+  carriedReleases?: number;
+  /** ID-LESS only: an identical completion was delivered recently, so this may be
+   *  the same frame re-sent. Delivered anyway (never swallowed) but FLAGGED, so
+   *  the agent doesn't double-count it. */
+  possibleRepeat?: boolean;
 }
 
 /** Runs tracked at once. Ample for any real batch; bounded so a long session
@@ -122,18 +129,37 @@ const MAX_ENTRIES_TOTAL = 96;
 const MAX_DELIVERED_MEMO = 256;
 /** Tabs whose evicted-completion counter is retained. */
 const MAX_DROPPED_KEYS = 64;
-/** How many times a completion may be handed to a LIVE agent without a provable
- *  ack before the journal settles it anyway. Bounds the hand-off/release cycle
- *  (see release()); each hand-off already put the text into a turn the agent
- *  read, so settling risks a duplicate, never a loss. */
-const MAX_HANDOFFS = 3;
-/** How long an ID-LESS completion's content fingerprint suppresses an identical
- *  repeat. Bounded on purpose: with no prompt id, identical content is the ONLY
- *  evidence of sameness, and two genuinely distinct renders can eventually
- *  produce identical filenames (ComfyUI reuses `ComfyUI_temp_*_00001_` after a
- *  restart). Long enough to absorb a panel re-send burst, short enough that a
- *  later real render is never mistaken for a repeat. */
-const IDLESS_DEDUPE_WINDOW_MS = 10 * 60_000;
+/** How many times a completion may be CARRIED BY A TURN THAT THEN ENDED without a
+ *  provable ack before the journal settles it anyway.
+ *
+ *  Counts turns, NOT queue hand-offs. A hand-off only means the event was queued;
+ *  an agent torn down before it drained its queue never showed the text to
+ *  anyone, so counting those would settle — and lose — a completion that three
+ *  ordinary provider/session replacements had merely shuffled around. The only
+ *  cycle that needs bounding is "dispatched into a turn → that turn ended → its
+ *  result could not be proven to be its own → replay", which a backend that
+ *  declares turn markers but never stamps its results would otherwise repeat
+ *  forever. Each of THOSE put the completion's text into a turn the agent read,
+ *  so settling risks a duplicate, never a loss. */
+const MAX_CARRIED_RELEASES = 3;
+/**
+ * ID-LESS completions have no run identity, so content is the only evidence of
+ * sameness — and identical content is NOT proof: ComfyUI reuses temp output names
+ * (`ComfyUI_temp_*_00001_`) after a restart, so two genuinely different renders
+ * can look the same. The policy therefore splits by how much a mistake costs:
+ *
+ *  • STILL JOURNALED, UNDELIVERED, within IDLESS_COLLAPSE_MS — collapse onto the
+ *    one entry. This is a transport-retry timescale, not a render timescale: two
+ *    real renders finishing with byte-identical output lists AND both still
+ *    undelivered inside 30s is not a case that occurs, while a panel re-sending a
+ *    frame is. Collapsing here is what stops one output producing two turns.
+ *  • ALREADY DELIVERED, within IDLESS_REPEAT_HINT_MS — do NOT suppress. Swallow
+ *    the wrong one and a real render is silently lost, which is the failure this
+ *    whole file exists to prevent. Deliver it FLAGGED as a possible repeat so the
+ *    agent can decline to double-count it, and let the agent judge.
+ */
+const IDLESS_COLLAPSE_MS = 30_000;
+const IDLESS_REPEAT_HINT_MS = 10 * 60_000;
 
 /** Memo key for an already-delivered (tab, run). "|" separates them; a ComfyUI
  *  prompt id is a fixed-format UUID, so the pair can't alias another. */
@@ -236,6 +262,7 @@ export class RunCompletionJournalImpl {
    */
   record(key: string, payload: CompletionPayload): JournalEntry | null {
     const correlation = this.correlate(key, payload);
+    let idlessRepeat = false;
     if (correlation.status !== "unidentified") {
       // Already DELIVERED once (its carrying turn ended, so the entry is gone).
       // A panel that re-sends the frame must not produce a second delivery — the
@@ -265,26 +292,31 @@ export class RunCompletionJournalImpl {
     } else {
       const print = idlessFingerprint(key, payload);
       const now = Date.now();
-      // Already delivered an identical id-less completion recently.
-      const seenAt = this.idlessSeen.get(print);
-      if (seenAt !== undefined && now - seenAt < IDLESS_DEDUPE_WINDOW_MS) {
-        logger.info(
-          `[run-completions] ignoring a re-sent id-less completion for tab ${key.slice(0, 8)} — identical content already delivered`,
-        );
-        return null;
-      }
-      if (seenAt !== undefined) this.idlessSeen.delete(print); // stale — let it through
-      // Or one is still journaled and undelivered.
+      // COLLAPSE only onto a still-journaled, undelivered twin from the same
+      // re-send burst. Safe: neither copy has reached anyone, so one delivery
+      // instead of two cannot lose news the agent already has.
       for (const entry of this.entries.values()) {
         if (
           entry.key === key &&
           entry.correlation.status === "unidentified" &&
           entry.fingerprint === print &&
-          now - entry.arrivedAt < IDLESS_DEDUPE_WINDOW_MS
+          now - entry.arrivedAt < IDLESS_COLLAPSE_MS
         ) {
           entry.payload = payload;
           return entry;
         }
+      }
+      // Already DELIVERED an identical id-less completion recently. Deliberately
+      // NOT suppressed: identical content is not proof of identity, and swallowing
+      // a second real render is a silent loss. Deliver it flagged instead.
+      const seenAt = this.idlessSeen.get(print);
+      const repeatHint = seenAt !== undefined && now - seenAt < IDLESS_REPEAT_HINT_MS;
+      if (seenAt !== undefined && !repeatHint) this.idlessSeen.delete(print); // stale
+      idlessRepeat = repeatHint;
+      if (repeatHint) {
+        logger.info(
+          `[run-completions] tab ${key.slice(0, 8)}: an id-less completion with identical content was already delivered — forwarding it FLAGGED as a possible repeat (never suppressed: content is not identity)`,
+        );
       }
     }
     const entry: JournalEntry = {
@@ -296,7 +328,7 @@ export class RunCompletionJournalImpl {
       attempts: 0,
       state: "pending",
       ...(correlation.status === "unidentified"
-        ? { fingerprint: idlessFingerprint(key, payload) }
+        ? { fingerprint: idlessFingerprint(key, payload), ...(idlessRepeat ? { possibleRepeat: true } : {}) }
         : {}),
     };
     this.entries.set(entry.token, entry);
@@ -362,6 +394,7 @@ export class RunCompletionJournalImpl {
         // reads a replay as "this landed late", not as another render.
         ...(entry.attempts > 0 ? { replayed: true } : {}),
         ...(lost > 0 ? { dropped_completions: lost } : {}),
+        ...(entry.possibleRepeat ? { possible_repeat: true } : {}),
       };
       const handedOff = inject(payload, entry.token);
       this.noteAttempt(entry.token, handedOff);
@@ -419,27 +452,31 @@ export class RunCompletionJournalImpl {
   }
 
   /**
-   * An agent gave a hand-off back undelivered (it was stopped, its turn was
-   * abandoned, or the turn's result could not be proven to be its own). Re-arm
-   * it for replay.
+   * An agent gave a hand-off back undelivered. Re-arm it for replay.
    *
-   * BOUNDED. `attempts` counts hand-offs to a LIVE agent — each one put the
-   * completion's text into a turn the agent actually read. A backend that
-   * declares turn markers but keeps emitting unmarked results would otherwise
-   * bounce the same entry between hand-off and release forever, re-delivering it
-   * on every turn. After MAX_HANDOFFS the evidence of delivery is overwhelming
-   * (the agent has seen it that many times), so we settle it rather than loop.
-   * This can only ever cause a duplicate, never a loss.
+   * `carried` distinguishes the two causes, and ONLY the first is bounded:
+   *  • carried: true  — a turn actually DISPATCHED with this completion in it and
+   *    then ended, but its result could not be proven to be that turn's own. The
+   *    agent read the text. A backend that declares turn markers yet never stamps
+   *    its results would bounce the entry here on every single turn, so after
+   *    MAX_CARRIED_RELEASES we settle rather than loop: a duplicate at worst.
+   *  • carried: false — a teardown handed it back (agent stopped, held mail
+   *    discarded, session died). NOBODY read it. These must never count toward
+   *    the bound, or three ordinary provider/session replacements would settle —
+   *    and lose — a completion that was only ever shuffled between queues.
    */
-  release(token: string): void {
+  release(token: string, opts: { carried?: boolean } = {}): void {
     const entry = this.entries.get(token);
     if (!entry) return;
-    if (entry.attempts >= MAX_HANDOFFS) {
-      logger.warn(
-        `[run-completions] ${describe(entry.correlation)} was handed to a live agent ${entry.attempts}× without a provable ack — settling it instead of replaying again`,
-      );
-      this.ack(token);
-      return;
+    if (opts.carried) {
+      entry.carriedReleases = (entry.carriedReleases ?? 0) + 1;
+      if (entry.carriedReleases >= MAX_CARRIED_RELEASES) {
+        logger.warn(
+          `[run-completions] ${describe(entry.correlation)} was carried by ${entry.carriedReleases} turns that ended without a provable ack — settling it instead of replaying again`,
+        );
+        this.ack(token);
+        return;
+      }
     }
     entry.state = "pending";
   }

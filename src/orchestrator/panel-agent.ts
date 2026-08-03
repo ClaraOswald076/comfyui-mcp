@@ -214,11 +214,12 @@ export interface PanelAgentDeps {
   /** #468 — the turn CARRYING these run-completion journal tokens ended, so the
    *  completions genuinely reached the agent. The journal drops them. */
   onEventDelivered?: (tabId: string, tokens: string[]) => void;
-  /** #468 — these run-completion journal tokens are being handed BACK: the
-   *  agent was stopped, or the turn carrying them was abandoned, before they
-   *  could be read. The journal re-arms them for replay. Also fired for tokens
-   *  refused outright (injecting into a closed agent). */
-  onEventUndelivered?: (tabId: string, tokens: string[]) => void;
+  /** #468 — these run-completion journal tokens are being handed BACK for replay.
+   *  `carried` true means a turn actually DISPATCHED with them and then ended
+   *  (the agent read the text; only its ack couldn't be proven) — the journal
+   *  bounds that cycle. `carried` false/absent means a teardown handed them back
+   *  and NOBODY read them, which must never count toward that bound. */
+  onEventUndelivered?: (tabId: string, tokens: string[], opts?: { carried?: boolean }) => void;
   /** In-process MCP server giving the agent LIVE control of this tab's graph. */
   panelServer?: McpSdkServerConfigWithInstance;
   /**
@@ -429,10 +430,10 @@ export class PanelAgent {
   /** Hand a set of run-completion journal tokens back as UNDELIVERED (#468), so
    *  the journal re-arms them for replay instead of letting them die with this
    *  agent / this abandoned turn. Never throws into the caller's path. */
-  private releaseEventTokens(tokens: string[] | undefined): void {
+  private releaseEventTokens(tokens: string[] | undefined, opts: { carried?: boolean } = {}): void {
     if (!tokens?.length) return;
     try {
-      this.deps.onEventUndelivered?.(this.tabId, [...tokens]);
+      this.deps.onEventUndelivered?.(this.tabId, [...tokens], opts);
     } catch (err) {
       logger.warn(`[panel-agent ${this.short()}] releasing completion tokens: ${msgOf(err)}`);
     }
@@ -503,6 +504,7 @@ export class PanelAgent {
       run_correlation?: "matched" | "foreign" | "unidentified";
       replayed?: boolean;
       dropped_completions?: number;
+      possible_repeat?: boolean;
     },
     opts?: { eventToken?: string },
   ): boolean {
@@ -532,6 +534,12 @@ export class PanelAgent {
         // let them disappear (#468). The agent must treat those runs as unknown.
         (typeof ev.dropped_completions === "number" && ev.dropped_completions > 0
           ? `⚠️ ${ev.dropped_completions} EARLIER completion(s) for this tab could not be delivered and were dropped — treat the outcome of those runs as UNDETERMINED and check get_history if you were waiting on one. `
+          : ``) +
+        // An id-less completion whose content matches one already reported. We
+        // will NOT swallow it (identical content is not proof of identity, and a
+        // swallowed render is a silent loss), so hand the judgement to the agent.
+        (ev.possible_repeat
+          ? `⚠️ POSSIBLE REPEAT: a completion with identical outputs was already reported to you recently, and this one carries no prompt id to tell them apart. It may be the same event re-sent, or a second render that produced identical filenames — do NOT count it twice without checking (get_history). `
           : ``) +
         runIdentityPreamble(ev) +
         (note
@@ -910,7 +918,10 @@ export class PanelAgent {
       if (this.turnEventTokens.length) {
         const stale = this.turnEventTokens;
         this.turnEventTokens = [];
-        this.releaseEventTokens(stale);
+        // CARRIED: a turn genuinely dispatched with these and has now been
+        // superseded, so the agent read the text — this is the same unprovable-
+        // ack cycle as the result path and is bounded with it.
+        this.releaseEventTokens(stale, { carried: true });
       }
       this.turnEventTokens = carriedTokens;
       this.inFlight = {
@@ -1390,7 +1401,10 @@ export class PanelAgent {
             logger.warn(
               `[panel-agent ${this.short()}] an unmarked result cannot ack turn ${this.turnEventTokensMarker}'s run completion(s) — handing ${carried.length} back for replay (#468)`,
             );
-            this.releaseEventTokens(carried);
+            // CARRIED: this turn ran and ended with the completion in it, so the
+            // agent read it — only the ack is unprovable. Bounded, so a backend
+            // that never stamps its results can't replay this forever.
+            this.releaseEventTokens(carried, { carried: true });
           }
         }
         // Turn ended cleanly → disarm the freeze watchdog. (If it already tripped,
@@ -1526,8 +1540,10 @@ export interface PanelAgentManagerOptions {
    *  completions genuinely reached the agent. Forwarded verbatim from the agent. */
   onEventDelivered?: (tabId: string, tokens: string[]) => void;
   /** #468 — these run-completion journal tokens came back UNDELIVERED (agent
-   *  stopped, turn abandoned, injection refused). Re-arm them for replay. */
-  onEventUndelivered?: (tabId: string, tokens: string[]) => void;
+   *  stopped, turn abandoned, injection refused). Re-arm them for replay.
+   *  `carried` true = a turn ran with them and ended (the agent read the text,
+   *  only the ack is unprovable) — the only cycle the journal bounds. */
+  onEventUndelivered?: (tabId: string, tokens: string[], opts?: { carried?: boolean }) => void;
   /** #468 — a fresh agent is mapped and ready for this key. The orchestrator
    *  uses it to replay any journaled run completions the previous agent never
    *  delivered, so a completion survives the restart that lost it. */
@@ -1846,6 +1862,7 @@ export class PanelAgentManager {
       run_correlation?: "matched" | "foreign" | "unidentified";
       replayed?: boolean;
       dropped_completions?: number;
+      possible_repeat?: boolean;
     },
     opts?: { eventToken?: string },
   ): boolean {
@@ -1955,8 +1972,23 @@ export class PanelAgentManager {
         // path (it used to exit, which mooted cleanup).
         void agent.stop().catch(() => {});
       } else if (gaveUp) {
-        // The bounded self-restart loop gave up — the session keeps dropping. Same
-        // fatal signal: let the orchestrator self-exit + respawn.
+        // The bounded self-restart loop gave up — the session keeps dropping.
+        // Same treatment as the hard-start failure above for the agent's QUEUE
+        // (#468): its still-unread messages — a run completion among them — were
+        // dying here. `settle` only unmapped the agent, so a completion sitting
+        // in its queue stayed `handed_off` in the journal, a state deliverPending
+        // skips: no replay, ever. Capture the queue into held mail (its tokens
+        // ride along, so a respawn re-delivers exactly once) and stop() the agent
+        // so anything left over is handed back.
+        const orphaned = agent.takePending();
+        if (orphaned.length) {
+          this.heldMessages.set(key, [...(this.heldMessages.get(key) ?? []), ...orphaned]);
+          logger.warn(
+            `[panel-orchestrator] tab ${key.slice(0, 8)} holding ${orphaned.length} undelivered message(s) from an agent that gave up — re-delivered on the next successful start`,
+          );
+        }
+        void agent.stop().catch(() => {});
+        // Fatal signal: let the orchestrator self-exit + respawn.
         this.opts.onAgentFatal?.(key, "agent session kept dropping (self-restart gave up)");
       }
     };
@@ -2211,6 +2243,9 @@ export class PanelAgentManager {
    *  to the journal (#468). The mail itself is untouched — only ownership of the
    *  completion moves — so a preserved (retire) or discarded (reset) queue can
    *  never take a completion down with it. No-op when there is none. */
+  // NOTE: every teardown release below is UNCARRIED (the default) — nobody read
+  // those completions, so they must not count toward the journal's bounded
+  // replay cycle. Only a turn that ran and ended is `carried`.
   private detachHeldCompletions(key: string, reason: string): void {
     const held = this.heldMessages.get(key);
     if (!held?.length) return;

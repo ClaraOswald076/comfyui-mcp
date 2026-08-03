@@ -2042,8 +2042,8 @@ export async function runPanelOrchestrator(): Promise<void> {
     onEventDelivered: (_key, tokens) => {
       for (const token of tokens) RunCompletions.ack(token);
     },
-    onEventUndelivered: (key, tokens) => {
-      for (const token of tokens) RunCompletions.release(token);
+    onEventUndelivered: (key, tokens, opts) => {
+      for (const token of tokens) RunCompletions.release(token, { carried: opts?.carried === true });
       const panelTab = panelTabOf(key);
       logger.warn(
         `[panel-orchestrator] tab ${panelTab.slice(0, 8)} handed back ${tokens.length} undelivered run completion(s) — journaled for replay (#468)`,

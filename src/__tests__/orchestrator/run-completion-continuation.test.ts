@@ -432,6 +432,40 @@ describe("run completion across automatic goal continuation (#468)", () => {
     expect(journal.outstanding(tab)).toHaveLength(1);
   });
 
+  it("a completion survives an agent whose self-restart loop GAVE UP", async () => {
+    // The give-up branch of settle() only unmapped the agent — its still-unread
+    // queue died with it, leaving the journal entry `handed_off`, a state
+    // deliverPending() skips. Silent, permanent loss.
+    let starts = 0;
+    const flappy: AgentBackend = {
+      id: "claude" as const,
+      capabilities: CLAUDE_CAPABILITIES,
+      // A session that ends immediately, every time, without reading the channel.
+      // eslint-disable-next-line require-yield
+      async *run(): AsyncGenerator<AgentEvent> {
+        starts += 1;
+        return;
+      },
+      async interrupt() {},
+      async listModels() {
+        return [];
+      },
+    };
+    const { journal, manager, arrive } = makeHarness(flappy);
+    const tab = "tab-gaveup";
+
+    journal.openRun(PROMPT_A, { tabId: tab });
+    manager.send(tab, "go");
+    arrive(tab, { kind: "executed", prompt_id: PROMPT_A, images: [{ filename: "gaveup.png" }] });
+    await waitFor(() => journal.pending(tab).length === 0); // taken onto the doomed queue
+    await waitFor(() => starts >= 4, 5000); // the bounded restart loop gives up
+
+    // Held for the next start, with its token intact — not stranded handed_off.
+    await waitFor(() => manager.hasHeldMail(tab), 5000);
+    expect(journal.outstanding(tab)).toHaveLength(1);
+    expect(journal.ticketFor(PROMPT_A)?.settled).toBe(false);
+  });
+
   it("a replayed completion never satisfies a DIFFERENT run", async () => {
     const backend = new ContinuationBackend();
     const { journal, manager, arrive } = makeHarness(backend);
@@ -668,27 +702,43 @@ describe("run completion journal correlation (#468)", () => {
     expect(journal.outstanding("wf:dest")).toHaveLength(0);
   });
 
-  it("an identical ID-LESS completion re-sent is not delivered twice", () => {
+  it("an identical ID-LESS completion re-sent while still journaled collapses onto one entry", () => {
     // With no prompt id there is no run identity, so content is the only
-    // evidence of sameness. A re-sent frame must not produce a second turn —
-    // UNDETERMINED labelling doesn't stop the agent double-reporting.
+    // evidence of sameness. While BOTH copies are undelivered, collapsing them
+    // cannot lose news the agent already has — so a re-sent frame must not
+    // produce two turns.
     const payload = { kind: "executed", images: [{ filename: "mystery_0001.png" }] };
     const first = journal.record("t", { ...payload });
     expect(first).not.toBeNull();
-    expect(journal.record("t", { ...payload })).toBe(first); // collapses while journaled
+    expect(journal.record("t", { ...payload })).toBe(first);
     expect(journal.pending("t")).toHaveLength(1);
 
-    journal.deliverPending("t", () => true);
-    journal.ack(first!.token);
-    // …and still suppressed after the ack, when no entry survives to collapse on.
-    expect(journal.record("t", { ...payload })).toBeNull();
-    expect(journal.pending("t")).toHaveLength(0);
-
-    // A DIFFERENT id-less render is still delivered.
+    // A DIFFERENT id-less render is still its own entry.
     expect(
       journal.record("t", { kind: "executed", images: [{ filename: "other_0002.png" }] }),
     ).not.toBeNull();
-    expect(journal.pending("t")).toHaveLength(1);
+    expect(journal.pending("t")).toHaveLength(2);
+  });
+
+  it("an ID-LESS completion matching an ALREADY-DELIVERED one is FLAGGED, never swallowed", () => {
+    // Identical content is not proof of identity — ComfyUI reuses temp output
+    // names across a restart — so suppressing here could silently lose a second
+    // real render. Deliver it, flagged, and let the agent decide.
+    const payload = { kind: "executed", images: [{ filename: "ComfyUI_temp_00001_.png" }] };
+    const first = journal.record("t", { ...payload });
+    journal.deliverPending("t", () => true);
+    journal.ack(first!.token);
+
+    const again = journal.record("t", { ...payload });
+    expect(again).not.toBeNull(); // NOT swallowed
+    expect(again!.possibleRepeat).toBe(true);
+    const seen: CompletionPayload[] = [];
+    journal.deliverPending("t", (p) => {
+      seen.push(p);
+      return true;
+    });
+    expect(seen[0].possible_repeat).toBe(true);
+    expect(seen[0].run_correlation).toBe("unidentified");
   });
 
   it("the id-less content memo moves with a tab-id migration", () => {
@@ -697,7 +747,30 @@ describe("run completion journal correlation (#468)", () => {
     journal.deliverPending("tmp:draft", () => true);
     journal.ack(entry!.token);
     journal.moveKey("tmp:draft", "wf:saved.json");
-    expect(journal.record("wf:saved.json", { ...payload })).toBeNull();
+    const again = journal.record("wf:saved.json", { ...payload });
+    expect(again!.possibleRepeat).toBe(true); // the memo followed the tab
+  });
+
+  it("teardown hand-backs are UNBOUNDED — only turns that ran count toward the settle bound", () => {
+    // A completion queued behind a busy turn can survive several ordinary
+    // provider/session replacements before anything drains that queue. Those
+    // hand-backs must never settle it: nobody read it.
+    journal.openRun(PROMPT_A, { tabId: "t" });
+    const entry = journal.record("t", { kind: "executed", prompt_id: PROMPT_A });
+    for (let i = 0; i < 10; i++) {
+      journal.deliverPending("t", () => true);
+      journal.release(entry!.token); // teardown: uncarried
+    }
+    expect(journal.outstanding("t")).toHaveLength(1);
+    expect(journal.ticketFor(PROMPT_A)?.settled).toBe(false);
+
+    // A turn that RAN and ended without a provable ack is the cycle that IS
+    // bounded — three of those settle it rather than replay forever.
+    for (let i = 0; i < 3; i++) {
+      journal.deliverPending("t", () => true);
+      journal.release(entry!.token, { carried: true });
+    }
+    expect(journal.outstanding("t")).toHaveLength(0);
   });
 
   it("moveKey carries the delivered memo and the eviction counter, not just the entries", () => {
