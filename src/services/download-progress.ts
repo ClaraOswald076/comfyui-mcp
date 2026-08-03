@@ -518,6 +518,13 @@ export interface PersistedDownloadJob {
   resume?: unknown;
   /** Epoch ms of this snapshot (set on write). */
   updated: number;
+  /**
+   * Read-only diagnostics added when an in-flight record missed the liveness
+   * heartbeat. These are never persisted: a stale heartbeat is not proof that
+   * the physical transfer stopped, so callers must keep the record visible.
+   */
+  staleInflight?: boolean;
+  staleForMs?: number;
 }
 
 function sanitizeIdPart(id: string): string {
@@ -547,7 +554,7 @@ let persistSeq = 0;
  *  Returns TRUE iff the record was DURABLY replaced (the atomic rename succeeded), so the
  *  caller (the heartbeat) can keep retrying a transiently-failing TERMINAL persist until
  *  the terminal state is durable — otherwise a done/cancelled job could linger as a fresh
- *  "downloading" record (bounded by the stale reap, but this recovers it sooner). Returns
+ *  "downloading" record (bounded by long record retention, but this recovers it sooner). Returns
  *  false when there is no channel dir (nothing to persist) or the replace didn't happen. */
 export function persistDownloadJob(job: Omit<PersistedDownloadJob, "updated">): boolean {
   const dir = channelDir();
@@ -570,7 +577,7 @@ export function persistDownloadJob(job: Omit<PersistedDownloadJob, "updated">): 
     // the torn-read that lets another process see the record as absent and start a SECOND
     // writer. On persistent failure we KEEP the prior COMPLETE record untouched and drop
     // the temp; the next ~15s heartbeat retries the atomic replace (self-healing). A
-    // terminal persist that can't replace ages out via the stale-in-flight reap instead
+    // terminal persist that can't replace ages out via long record retention instead
     // of ever corrupting the scanned .json.
     let renamed = false;
     for (let attempt = 0; attempt < 5 && !renamed; attempt++) {
@@ -606,11 +613,10 @@ export function removePersistedDownloadJob(id: string): void {
   }
 }
 
-/** How long a TERMINAL (done/error/cancelled) persisted record is kept for late
- *  adoption before it's reaped on the next scan. A slow multi-GB in-flight download
- *  stays adoptable because its owner heartbeats the record within
- *  PERSISTED_INFLIGHT_STALE_MS — so only a DEAD (crashed) writer's in-flight record
- *  goes stale and gets reaped (below). */
+// A missed heartbeat is only a liveness hint, not proof the transfer stopped:
+// an orchestrator/session reconnect can interrupt persistence while the HTTP
+// stream continues. Keep in-flight records for the same bounded retention as
+// terminal records so read paths cannot delete a live owner's state (#761).
 const PERSISTED_JOB_TTL_MS = 6 * 60 * 60 * 1000; // 6h
 
 function parseJobFile(dir: string, f: string): PersistedDownloadJob | null {
@@ -618,21 +624,20 @@ function parseJobFile(dir: string, f: string): PersistedDownloadJob | null {
     const raw = JSON.parse(readFileSync(join(dir, f), "utf8")) as PersistedDownloadJob;
     if (!raw || typeof raw !== "object" || typeof raw.id !== "string") return null;
     const age = typeof raw.updated === "number" ? Date.now() - raw.updated : 0;
-    // Reap a record that is either a long-settled terminal one OR a DEAD in-flight one.
-    // In-flight records are heartbeated every ~15s by their live owner, so an in-flight
-    // record older than PERSISTED_INFLIGHT_STALE_MS (60s) means the writer crashed —
-    // reap it so download_status / cancel_download never report a dead download as
-    // "still streaming". A genuinely-live (even stalled) download keeps heartbeating and
-    // is never stale; a falsely-reaped one reappears on the owner's next heartbeat.
-    const terminalExpired = raw.status !== "downloading" && age > PERSISTED_JOB_TTL_MS;
-    const inflightDead = raw.status === "downloading" && age > PERSISTED_INFLIGHT_STALE_MS;
-    if (terminalExpired || inflightDead) {
+    // This parser backs read paths (including download_status). A heartbeat gap
+    // beyond the short freshness window is not sufficient evidence to destructively
+    // delete a potentially live transfer; adoption/cancel freshness checks below
+    // still treat it as non-live. Reap only after the bounded long retention.
+    if (age > PERSISTED_JOB_TTL_MS) {
       try {
         rmSync(join(dir, f), { force: true });
       } catch {
         /* ignore */
       }
       return null;
+    }
+    if (raw.status === "downloading" && age > PERSISTED_INFLIGHT_STALE_MS) {
+      return { ...raw, staleInflight: true, staleForMs: age };
     }
     return raw;
   } catch {
@@ -711,8 +716,8 @@ export function findPersistedDownloadJob(query: { trayId?: string; destKey?: str
   // jobs (they share a dest_key). Adopting by URL/destination alone then can't tell them
   // apart — so REFUSE to guess when more than one DISTINCT LIVE job matches; the caller
   // must use the exact id. Distinctness is (id, trayId). Ambiguity is judged over LIVE
-  // (fresh in-flight) records ONLY: a stale/dead record (crashed session, explicitly
-  // never reaped) must not block adoption or force a false decline.
+  // (fresh in-flight) records ONLY: a heartbeat-stale record may still be streaming,
+  // but must not block adoption or force a false decline.
   const distinctKey = (j: PersistedDownloadJob): string => `${j.id}\n${j.trayId}`;
   const now = Date.now();
   const live = matches.filter(
