@@ -1137,6 +1137,26 @@ describe("run completion journal correlation (#468)", () => {
     expect(seen[0].dropped_completions).toBe(lost);
   });
 
+  it("an eviction REVOKES the queued copy, so the agent's queue stays bounded with the journal", () => {
+    // The journal's cap bounds the journal; the agent's QUEUE owns the payload.
+    // Evicting only the record left the text queued forever, so a panel resending
+    // in a loop grew that queue without limit — and it all drains into one turn,
+    // starving the genuine completion.
+    const queued = new Set<string>();
+    journal.setRevoker((_key, token) => queued.delete(token));
+    for (let i = 0; i < 60; i++) {
+      const e = journal.record("t", { kind: "executed", prompt_id: `p-${i}` });
+      journal.deliverPending("t", (_p, token) => {
+        queued.add(token);
+        return true;
+      });
+      void e;
+    }
+    // The journal is capped… and so is what the agent is actually holding.
+    expect(journal.outstanding("t").length).toBeLessThanOrEqual(32);
+    expect(queued.size).toBe(journal.outstanding("t").length);
+  });
+
   it("an eviction disclosure never lands on a HANDED-OFF entry that can't report it", () => {
     // deliverPending only reads PENDING entries. Stamping the count on a
     // handed-off one attaches the warning to text already queued (nobody will

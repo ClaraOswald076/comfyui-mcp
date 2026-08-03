@@ -1047,6 +1047,15 @@ export class RunCompletionJournalImpl {
         const victim = mine.find((e) => e.state === "handed_off") ?? mine[0];
         this.entries.delete(victim.token);
         mine = mine.filter((e) => e !== victim);
+        // …and PULL ITS QUEUED COPY with it. The journal's cap bounds the
+        // journal; the agent's queue owns the actual payload, so evicting the
+        // record alone left the text queued forever. A panel resending in a tight
+        // loop would then grow that queue without limit while the journal stayed
+        // at 32 — and the whole backlog drains into ONE turn, which is how the
+        // genuine completion gets starved. Revoking keeps the two bounded
+        // together. (No-op once the carrying turn has started; that copy is
+        // already committed and is bounded by the turn instead.)
+        this.revoke?.(victim.key, victim.token);
         // Its own loss PLUS any disclosure it was carrying for the tab — moved to
         // whatever survives, so an eviction can never drop the disclosure itself.
         this.noteDropped(victim.key, 1 + (victim.disclose ?? 0));
