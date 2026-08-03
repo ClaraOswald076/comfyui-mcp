@@ -82,9 +82,10 @@ beforeEach(() => {
     intervalMs: 5,
     probeTimeoutMs: 10,
   });
-  // Fast decline-probe recheck window (the real one is ~6s).
+  // Fast decline-probe recheck window (the real one is ~6s). Wide enough that
+  // real-timer slop can't eat it before a scripted mid-window sample lands.
   __panelToolsTestHooks.setDeclineProbeTiming({
-    windowMs: 25,
+    windowMs: 100,
     intervalMs: 5,
     probeTimeoutMs: 5,
   });
@@ -225,6 +226,60 @@ describe("panel_restart_comfyui — decline truthfulness (#742)", () => {
 
     expect(text(res)).toBe("Cancelled — ComfyUI was not restarted.");
     expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
+  });
+
+  it("recheck loop NEVER starts an awaited probe after the hard deadline (codex gate r2)", async () => {
+    // A long configured window but a deadline expiring mid-loop: the loop must
+    // STOP at the deadline — the old code clamped the expired remainder to a
+    // 1ms timeout and still awaited one more probe past it. Fake timers make
+    // the exact probe-start instants deterministic.
+    vi.useFakeTimers();
+    try {
+      const starts: number[] = [];
+      __panelToolsTestHooks.setHealthProbe(async () => {
+        starts.push(Date.now());
+        return "down";
+      });
+      const t0 = Date.now();
+      const pending = __panelToolsTestHooks.probeDeclineRecovery(
+        null,
+        5000, // windowMs — far beyond the deadline
+        5, // intervalMs
+        5, // probeTimeoutMs
+        t0 + 20, // hard deadline at +20ms
+      );
+      await vi.advanceTimersByTimeAsync(10000);
+      const out = await pending;
+
+      // Samples at 0/5/10/15ms; at +20 the deadline is exhausted, so NO probe
+      // may start there — the old code started (and awaited) one with a
+      // clamped 1ms timeout.
+      expect(starts.map((s) => s - t0)).toEqual([0, 5, 10, 15]);
+      expect(out.attempts).toBe(4);
+      // The verdict is the last known state, and the elapsed time respects the
+      // deadline (nowhere near the 5000ms window).
+      expect(out.status).toBe("down");
+      expect(out.waited_ms).toBeLessThanOrEqual(25);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("recheck loop with an ALREADY-EXPIRED deadline probes nothing and reports ambiguous", async () => {
+    // No remaining budget at entry: not even the first probe may start — the
+    // verdict is ambiguous, so the report keeps the plain/generic line.
+    let probes = 0;
+    __panelToolsTestHooks.setHealthProbe(async () => {
+      probes++;
+      return "down";
+    });
+    const t0 = Date.now();
+
+    const out = await __panelToolsTestHooks.probeDeclineRecovery(null, 5000, 5, 5, t0 - 1);
+
+    expect(probes).toBe(0);
+    expect(out.attempts).toBe(0);
+    expect(out.status).toBe("ambiguous");
   });
 });
 

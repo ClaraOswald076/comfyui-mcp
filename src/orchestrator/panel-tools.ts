@@ -334,6 +334,9 @@ export const __panelToolsTestHooks = {
   ): void {
     declineProbeTimingOverride = timing;
   },
+  /** Direct access to the #742 decline recheck loop so its hard-deadline
+   *  guarantee (codex gate r2) can be unit-tested with a custom deadline. */
+  probeDeclineRecovery,
   looksLikeSystemStats,
   probeComfyHealth,
   probeComfyEndpoint,
@@ -775,8 +778,8 @@ interface DeclineProbeOutcome {
    * "recovered" — an early sample was a proven down but a LATER sample came
    *               back healthy inside the window (a genuine restart's down
    *               window — NEVER a lost server, codex gate).
-   * "down"      — no healthy sample AND the LAST sample (taken at the end of
-   *               the window) was a proven down. Only this may be reported as
+   * "down"      — no healthy sample AND the LAST sample taken within the
+   *               window was a proven down. Only this may be reported as
    *               a loss — a single refused sample never suffices.
    * "ambiguous" — anything else (no healthy sample, last sample not a proven
    *               down) — the plain cancel line, never alarmist.
@@ -790,9 +793,11 @@ interface DeclineProbeOutcome {
  * The #742 decline-path recheck: poll `base` over a short, bounded window
  * (clamped to `deadline`) so a server that is merely mid-restart is not
  * falsely declared lost on a single ECONNREFUSED. Samples immediately, then
- * sleeps intervalMs between samples, taking the LAST sample at the window's
- * end — "still refused at the END of the window" is the only down verdict.
- * Never throws.
+ * sleeps intervalMs between samples — "still refused at the END of the
+ * window" is the only down verdict. The deadline is HARD (codex gate r2): no
+ * awaited probe may START once the remaining budget is exhausted — the loop
+ * stops and the verdict falls to the last known state (or "ambiguous" when
+ * nothing was sampled). Never throws.
  */
 async function probeDeclineRecovery(
   base: string | null,
@@ -808,8 +813,13 @@ async function probeDeclineRecovery(
   let sawDown = false;
   let last: ProbeStatus = "unknown";
   for (;;) {
+    // HARD deadline: NEVER begin an awaited probe with an exhausted remainder
+    // (clamping an expired remainder to a 1ms timeout would still start — and
+    // await — a probe PAST the deadline, defeating the guarantee).
+    const remaining = end - Date.now();
+    if (remaining <= 0) break;
     attempts++;
-    const t = Math.max(1, Math.min(probeTimeoutMs, end - Date.now()));
+    const t = Math.min(probeTimeoutMs, remaining);
     let status: ProbeStatus = "unknown";
     try {
       status = normalizeProbe(await probe(base, t));
@@ -825,9 +835,9 @@ async function probeDeclineRecovery(
     }
     if (status === "down") sawDown = true;
     last = status;
-    const remaining = end - Date.now();
-    if (remaining <= 0) break;
-    await new Promise((r) => setTimeout(r, Math.max(1, Math.min(intervalMs, remaining))));
+    const left = end - Date.now();
+    if (left <= 0) break;
+    await new Promise((r) => setTimeout(r, Math.max(1, Math.min(intervalMs, left))));
   }
   return {
     status: last === "down" ? "down" : "ambiguous",
