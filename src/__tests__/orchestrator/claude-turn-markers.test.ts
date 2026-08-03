@@ -303,63 +303,47 @@ describe("Claude backend turn markers (#728 r4)", () => {
     expect(errorsOf(events).some((e) => /could not be matched|unverifiable/i.test(e.message))).toBe(true);
   });
 
-  it("two interrupted unparked turns: the later turn's first landing is its OWN (#728 r7)", async () => {
-    // The r7 codex-gate finding: A and newer C are BOTH interrupted and BOTH
-    // unparked (no non-interrupted result ever triggered the skip). The SDK
-    // processes turns sequentially and the panel only submits a newer turn
-    // after the older turn's result was written off, so C's terminal arriving
-    // first belongs to C — the older interrupted A is provably lost and is
-    // written off (parked) on the spot. (Blindly popping the oldest fabricated
-    // an ok:true turn-A result that the panel dead-letters, wedging C.)
-    let releaseA!: () => void;
+  it("queued-input ordering: C's trace exists while A is unsettled — A's landing pops A, then C's pops C (#728 r8)", async () => {
+    // The r8 codex-gate reframing: the SDK emits results in PROCESSING ORDER,
+    // so a newer turn's trace can exist while the older turn is still settling
+    // (queued input) — and the older turn's legitimate landing MUST still pop
+    // the OLDEST live interrupted trace. (The r7 newest-preference assigned
+    // A's legitimate landing to C — writing A off and fabricating C's
+    // terminal — and its C-terminal-first ordering is impossible under this
+    // contract, so that test is replaced by this valid one.)
     let releaseC!: () => void;
-    const gateA = new Promise<void>((resolve) => {
-      releaseA = resolve;
-    });
     const gateC = new Promise<void>((resolve) => {
       releaseC = resolve;
     });
-    async function* threeTurns() {
-      yield { text: "turn 1" };
-      await gateA;
+    async function* twoTurns() {
       yield { text: "turn A" };
       await gateC;
       yield { text: "turn C" };
     }
-    const { backend, events, done } = await startBackend(threeTurns());
+    const { backend, events, done } = await startBackend(twoTurns());
     hoisted.queue.push(INIT);
     await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
-    // Turn 1 completes normally (establishes the A=2 / C=3 numbering).
-    hoisted.queue.push(assistantMsg("one"));
-    hoisted.queue.push(RESULT_SUCCESS);
+
+    // A is interrupted; C's trace is then created while A is STILL unsettled,
+    // and C is marked interrupted too (the SDK is still settling A).
+    await backend.interrupt(); // marks A (newest at the time)
+    releaseC();
+    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(2));
+    await backend.interrupt(); // marks C
+
+    // A's legitimate interrupted result arrives FIRST (processing order) →
+    // pops/stamps A, NOT C.
+    hoisted.queue.push(RESULT_INTERRUPTED);
     await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(1));
     expect(resultsOf(events)[0]).toMatchObject({ ok: true, turn: 1 });
 
-    // A and C are BOTH interrupted, BOTH unparked; C's landing arrives FIRST.
-    releaseA();
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(2));
-    await backend.interrupt(); // marks A (newest at the time)
-    releaseC();
-    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(3));
-    await backend.interrupt(); // marks C
-    hoisted.queue.push(RESULT_INTERRUPTED); // C's terminal, arriving first
-    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(2));
-    // …stamped and classified as C's OWN (blessed landing) — A written off.
-    expect(resultsOf(events)[1]).toMatchObject({ ok: true, turn: 3 });
-
-    // A's OWN late landing (no newer trace anymore) still pops A's trace.
-    hoisted.queue.push(RESULT_INTERRUPTED);
-    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(3));
-    expect(resultsOf(events)[2]).toMatchObject({ ok: true, turn: 2 });
-
-    // A landing AFTER A was already consumed → anomalous → fail closed.
+    // C's own landing then pops C.
     hoisted.queue.push(RESULT_INTERRUPTED);
     hoisted.queue.end();
     await done;
     const results = resultsOf(events);
-    expect(results).toHaveLength(4);
-    expect(results[3]).toMatchObject({ ok: false });
-    expect(results[3].turn).toBeUndefined();
-    expect(errorsOf(events).some((e) => /could not be matched|unverifiable/i.test(e.message))).toBe(true);
+    expect(results).toHaveLength(2);
+    expect(results[1]).toMatchObject({ ok: true, turn: 2 });
+    expect(errorsOf(events)).toHaveLength(0);
   });
 });
