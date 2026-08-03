@@ -692,49 +692,45 @@ export class ClaudeBackend implements AgentBackend {
         // session — content evidence must not rescue it (it accrued to a
         // mismatched trace, which is not proof of ITS turn's success).
         // SUBTYPE-AWARE correlation on the SDK's REAL result vocabulary
-        // (#728 r5–r9): results arrive as `success` or `error_*` — an
+        // (#728 r5–r10): results arrive as `success` or `error_*` — an
         // interrupted turn ends with an error_during_execution result (the
         // interrupt landing); there is no "interrupted" result subtype.
-        // Combined with SEQUENTIAL EMISSION (results always emit in processing
-        // order — a turn's result ALWAYS precedes the next turn's result in
-        // the stream):
-        //  • A SUCCESS landing can never belong to an interrupted-marked turn,
-        //    so if the oldest trace is interrupted and a newer trace exists,
-        //    that turn's result is permanently LOST — skip (park) the
-        //    interrupted trace(s) and pop the first non-interrupted one (the
-        //    r5 skip). This is the ONLY write-off; never by preference.
-        //  • An error_* landing belongs to the OLDEST LIVE (unparked) trace —
-        //    interrupted turn or not (a healthy turn's genuine failure is
-        //    likewise its own). A newer interrupted turn's trace may exist
-        //    while the older turn is still settling (queued input); the older
-        //    turn's legitimate landing MUST still pop the older trace. Only
-        //    when no live candidate remains is the landing a parked trace's
-        //    own late one (a write-off that proved wrong). Each trace lands at
-        //    most once: landed parks move to consumedInterrupted, so a SECOND
-        //    landing for the same turn finds no candidate and fails closed
-        //    (traceless) below.
+        //
+        // UNIFORM write-off (r10): an interrupted turn the PANEL killed (its
+        // trace is marked) that was then SUPERSEDED by a newer submission never
+        // delivers — the turn gate only submits newer work after the older
+        // turn's result was written off. So for EVERY landing (success or
+        // error_*): any interrupted-marked trace OLDER than the oldest LIVE
+        // non-interrupted trace is written off (parked as lost), and the
+        // landing pops that oldest live non-interrupted trace — a healthy
+        // turn's genuine success or error classifies by ITS flags (a genuine
+        // error_during_execution from a healthy newer turn is NOT blessed and
+        // is NOT attributed to the killed older turn). With NO live
+        // non-interrupted trace, the landing is an interrupt landing and pops
+        // the oldest LIVE interrupted trace (kills settle in submission order —
+        // the older turn's legitimate landing still pops the older trace, even
+        // when a newer interrupted turn's trace exists from queued input), else
+        // the oldest PARKED-but-unconsumed interrupted trace (a late landing
+        // for a written-off turn — the r6 tolerance), else nothing (anomalous
+        // → traceless fail-closed below). Each trace still lands at most once
+        // (landed parks move to consumedInterrupted).
         const resultSubtype: string = message.subtype;
-        const successLanding = resultSubtype === "success";
-        let trace: (typeof this.turns)[number] | null = null;
-        if (successLanding) {
-          let traceIndex = 0;
-          while (traceIndex < this.turns.length - 1 && this.turns[traceIndex].interrupted) {
-            this.parkedInterrupted.add(this.turns[traceIndex].id);
-            traceIndex += 1;
+        const oldestLive = this.turns.findIndex((t) => !t.interrupted);
+        if (oldestLive > 0) {
+          for (let i = 0; i < oldestLive; i++) {
+            if (this.turns[i].interrupted) this.parkedInterrupted.add(this.turns[i].id);
           }
-          trace = traceIndex === 0 ? (this.turns.shift() ?? null) : (this.turns.splice(traceIndex, 1)[0] ?? null);
-        } else {
-          // Oldest LIVE (unparked) trace first — interrupted or not; a parked
-          // trace's result was already written off, so only when no live
-          // candidate remains is the landing a parked trace's own late one.
-          let idx = this.turns.findIndex((t) => !this.parkedInterrupted.has(t.id));
-          if (idx < 0) {
-            idx = this.turns.findIndex(
-              (t) => this.parkedInterrupted.has(t.id) && !this.consumedInterrupted.has(t.id),
-            );
-          }
-          trace = idx >= 0 ? (this.turns.splice(idx, 1)[0] ?? null) : null;
         }
+        let idx = oldestLive;
+        if (idx < 0) {
+          idx = this.turns.findIndex((t) => t.interrupted && !this.parkedInterrupted.has(t.id));
+        }
+        if (idx < 0) {
+          idx = this.turns.findIndex(
+            (t) => t.interrupted && this.parkedInterrupted.has(t.id) && !this.consumedInterrupted.has(t.id),
+          );
+        }
+        const trace = idx >= 0 ? (this.turns.splice(idx, 1)[0] ?? null) : null;
         let unverifiable: string | null = null;
         if (this.classificationPoisoned) {
           unverifiable = "Turn bookkeeping was poisoned by an earlier overflow — no result in this session can be verified";

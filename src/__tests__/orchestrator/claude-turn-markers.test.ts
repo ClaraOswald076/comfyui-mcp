@@ -122,10 +122,10 @@ describe("Claude backend turn markers (#728 r4)", () => {
     //   • B's valid stream event must stamp with B's marker (2) — a per-result
     //     counter would stamp it 1 (A's), and PanelAgent would dead-letter B's
     //     legitimate work;
-    //   • A's LATE result must stamp with A's own marker (1) → PanelAgent
-    //     dead-letters the abandoned turn's straggler;
-    //   • B's result-only terminal must stamp with B's own marker (2) →
-    //     PanelAgent completes B's gate (no wedge).
+    //   • B's terminal pops/stamps B (a killed, superseded turn never delivers
+    //     — the r10 contract), completing B's gate (no wedge);
+    //   • A's LATE landing then pops its own parked trace, stamped with A's
+    //     own marker (1) → PanelAgent dead-letters the straggler.
     let releaseTurnB!: () => void;
     const gate = new Promise<void>((resolve) => {
       releaseTurnB = resolve;
@@ -144,12 +144,13 @@ describe("Claude backend turn markers (#728 r4)", () => {
 
     // B's valid stream event WHILE A's result is still missing.
     hoisted.queue.push(assistantMsg("B working"));
-    // A's LATE result — the interrupt landing (error_during_execution in the
-    // SDK's real vocabulary; a success subtype here would correlate to the
-    // NEWER turn, not A)…
-    hoisted.queue.push(RESULT_INTERRUPTED);
-    // …then B's result-only terminal.
+    // B's terminal FIRST (per the r10 contract: a killed, superseded turn never
+    // delivers, so B's success writes A off and pops/stamps B)…
     hoisted.queue.push(RESULT_SUCCESS);
+    // …then A's LATE landing (error_during_execution in the SDK's real
+    // vocabulary) — tolerated via its parked trace, stamped with A's own
+    // marker, so PanelAgent dead-letters the abandoned turn's straggler.
+    hoisted.queue.push(RESULT_INTERRUPTED);
     hoisted.queue.end();
     await done;
 
@@ -157,11 +158,11 @@ describe("Claude backend turn markers (#728 r4)", () => {
     expect(events.find((e) => e.type === "session")?.turn).toBeUndefined();
     // B's stream event is attributed to B, NOT to the still-open abandoned turn.
     expect(events.find((e) => e.type === "assistant")).toMatchObject({ turn: 2 });
-    // Each terminal is stamped with its OWN turn, in submission order.
+    // Each terminal is stamped with its OWN turn, in arrival order.
     const results = resultsOf(events);
     expect(results).toHaveLength(2);
-    expect(results[0]).toMatchObject({ turn: 1 }); // A's late terminal
-    expect(results[1]).toMatchObject({ turn: 2 }); // B's result-only terminal
+    expect(results[0]).toMatchObject({ ok: true, turn: 2 }); // B's terminal
+    expect(results[1]).toMatchObject({ ok: true, turn: 1 }); // A's late landing
   });
 
   it("stamps a normal two-turn flow 1, 1, 2, 2 (run-relative, matching the panel mirror)", async () => {
@@ -345,6 +346,48 @@ describe("Claude backend turn markers (#728 r4)", () => {
     const results = resultsOf(events);
     expect(results).toHaveLength(2);
     expect(results[1]).toMatchObject({ ok: true, turn: 2 });
+    expect(errorsOf(events)).toHaveLength(0);
+  });
+
+  it("healthy newer turn's genuine error pops/stamps itself — not the killed older turn (#728 r10)", async () => {
+    // The r10 codex-gate finding: A was interrupted (marked) and superseded by
+    // healthy B; A's interrupt terminal is missing (a killed, superseded turn
+    // never delivers). B's GENUINE error_during_execution must pop/stamp B —
+    // popping A instead would bless a fabricated ok:true stamped 1 that the
+    // panel dead-letters while B's gate stays held.
+    let releaseB!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseB = resolve;
+    });
+    async function* twoTurns() {
+      yield { text: "turn A" };
+      await gate;
+      yield { text: "turn B" };
+    }
+    const { backend, events, done } = await startBackend(twoTurns());
+    hoisted.queue.push(INIT);
+    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    await backend.interrupt(); // marks A; A's terminal will never arrive
+    releaseB();
+    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(2));
+
+    // B's GENUINE error lands first: A is written off (parked), B is popped —
+    // classified by B's OWN flags (a genuine failure, NO blessing) and stamped
+    // with B's marker, so the panel completes B's gate.
+    hoisted.queue.push(RESULT_INTERRUPTED); // error_during_execution — B's genuine error
+    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(1));
+    expect(resultsOf(events)[0]).toMatchObject({ ok: false, turn: 2 });
+    expect(errorsOf(events)).toHaveLength(0); // a genuine error result carries no synthetic error
+
+    // A's late interrupt landing (if it ever arrives) pops its own parked
+    // trace: blessed via ITS mark (ok:true — the landing, not a failure) and
+    // stamped with A's marker, so the panel dead-letters the straggler.
+    hoisted.queue.push(RESULT_INTERRUPTED);
+    hoisted.queue.end();
+    await done;
+    const results = resultsOf(events);
+    expect(results).toHaveLength(2);
+    expect(results[1]).toMatchObject({ ok: true, turn: 1 });
     expect(errorsOf(events)).toHaveLength(0);
   });
 });
