@@ -236,23 +236,28 @@ export class ClaudeBackend implements AgentBackend {
   readonly capabilities = CLAUDE_CAPABILITIES;
   private deps: ClaudeBackendDeps;
   private q: Query | null = null;
-  // #740 turn-truthfulness state (reset on init and after every result): a turn
-  // that produced NO user-visible content must never be reported as a successful
-  // turn, and a blocking SDK informational message (prevent_continuation — e.g. a
-  // UserPromptSubmit hook denied the prompt) makes the turn a failure even when
-  // the SDK's own result still arrives with subtype "success".
-  private turnHasContent = false;
-  private turnBlockReason: string | null = null;
-  // A turn is ACTIVE from the moment its user batch is handed to the SDK (the
-  // prompt generator in run()) until its terminal result is consumed.
-  private turnActive = false;
-  // Set by interrupt() — but only while a turn is ACTIVE — and consumed by that
-  // turn's result (mirrors PanelAgent's interruptRequested): an interrupted
-  // turn's empty result is the interrupt landing, not an empty-turn failure.
-  // Strictly turn-scoped (#745 review): an idle/late interrupt() leaves NO state
-  // behind, and a newly submitted turn clears any stale mark, so neither can
-  // bless a LATER turn's genuinely-empty result/success.
-  private interruptPending = false;
+  // #740 turn-truthfulness, with TURN IDENTITY (#745 r2 review): every submitted
+  // turn gets a trace; stream messages accrue to the LATEST trace, and each
+  // terminal result is classified against the trace it belongs to (results
+  // arrive in submission order, possibly with a turn's result missing or LATE —
+  // the panel's no-result fallback releases the next turn and tolerates the
+  // late result, panel-agent.ts:671 — so the backend must too). A late result
+  // from a superseded turn therefore classifies by ITS OWN flags and never
+  // resets or consumes the in-flight turn's state. A turn that produced NO
+  // user-visible content is never a successful turn, and a blocking SDK
+  // informational message (prevent_continuation — e.g. a UserPromptSubmit hook
+  // denied the prompt) fails its turn even when the SDK's own result still
+  // arrives with subtype "success". `interrupted` mirrors PanelAgent's
+  // interruptRequested: an interrupted turn's empty result is the interrupt
+  // landing, not an empty-turn failure — and only the turn that was in flight
+  // when interrupt() landed may be marked.
+  private turnSeq = 0;
+  private turns: Array<{
+    id: number;
+    hasContent: boolean;
+    blockReason: string | null;
+    interrupted: boolean;
+  }> = [];
 
   constructor(deps: ClaudeBackendDeps) {
     this.deps = deps;
@@ -373,17 +378,27 @@ export class ClaudeBackend implements AgentBackend {
   async *run(opts: BackendStartOptions): AsyncGenerator<AgentEvent> {
     const query = await loadQuery();
     const self = this;
+    // A (re)started session can never produce results for turns submitted to a
+    // PREVIOUS session — drop those dead traces. Done here, at run() entry
+    // (BEFORE the new query exists), rather than on system/init: the SDK's
+    // prompt drain legitimately pulls the first batch before init is processed,
+    // and an init-time clear would unmark that genuinely in-flight turn (#745).
+    this.turns.length = 0;
     // Wrap the neutral channel: shape each turn into the SDK's native form right
     // before it's read, so PanelAgent never deals in SDKUserMessage.
     async function* prompt(): AsyncGenerator<SDKUserMessage> {
       for await (const turn of opts.channel) {
         const msg = await self.shapeTurn(turn);
-        // The batch is handed to the SDK: this turn is now in flight until its
-        // terminal result. A newly submitted turn also clears any stale
-        // interruptPending mark — an interrupt only ever blesses the result of
-        // the turn that was in flight when it landed (#745 review).
-        self.turnActive = true;
-        self.interruptPending = false;
+        // The batch is handed to the SDK: stamp the turn's identity. Its trace
+        // accrues this turn's content/block/interrupt flags until its terminal
+        // result pops it (FIFO) for classification. Bounded: wedged turns whose
+        // result never arrives would otherwise grow the queue without limit —
+        // past the cap the oldest (long-superseded) trace is dropped.
+        self.turns.push({ id: ++self.turnSeq, hasContent: false, blockReason: null, interrupted: false });
+        if (self.turns.length > 16) {
+          self.turns.shift();
+          logger.warn("[claude-backend] over 16 unresolved turns — dropped the oldest turn trace (#740)");
+        }
         yield msg;
       }
     }
@@ -411,9 +426,12 @@ export class ClaudeBackend implements AgentBackend {
   }
 
   async interrupt(): Promise<void> {
-    // Scope the empty-turn blessing to the turn actually in flight: an
-    // interrupt() with NO active turn leaves no state behind (#745 review).
-    if (this.turnActive) this.interruptPending = true;
+    // Scope the empty-turn blessing to the turn actually in flight (the latest
+    // unresolved submission): an interrupt() with NO turn in flight leaves no
+    // state behind, and a superseded turn's trace keeps whatever mark IT earned
+    // (#745 review).
+    const active = this.turns[this.turns.length - 1];
+    if (active) active.interrupted = true;
     await this.q?.interrupt();
   }
 
@@ -444,16 +462,11 @@ export class ClaudeBackend implements AgentBackend {
     switch (message.type) {
       case "system":
         if (message.subtype === "init") {
-          // New session (or a restarted one): STREAM-side turn classification
-          // starts clean (init is always the first in-stream message, so this
-          // can only precede the session's assistant/result messages).
-          // turnActive/interruptPending are NOT reset here: they are
-          // SUBMISSION-side state — the prompt drain can hand a turn to the SDK
-          // before this init is processed, and clearing here would unmark that
-          // genuinely in-flight turn (#745 review). A stale mark is cleared by
-          // the next prompt submission instead.
-          this.turnHasContent = false;
-          this.turnBlockReason = null;
+          // New session (or a restarted one). No turn state is reset here: all
+          // of it is per-turn (the `turns` FIFO), and dead traces from a
+          // previous session are dropped at run() entry — an init-time clear
+          // could unmark a turn the prompt drain already handed to the SDK
+          // before this init was processed (#745 review).
           yield {
             type: "session",
             sessionId: message.session_id,
@@ -475,16 +488,19 @@ export class ClaudeBackend implements AgentBackend {
           // turn logic depends on. A BLOCKING one (prevent_continuation, e.g. a
           // UserPromptSubmit hook denied the prompt) means execution stops here,
           // yet the SDK still ends the turn with a result whose subtype is
-          // "success". Remember the reason so that result is classified as the
-          // failure it actually is, and surface the reason now so the user never
-          // watches a turn silently produce nothing.
+          // "success". Record the reason on the CURRENT turn's trace so that
+          // turn's result is classified as the failure it actually is, and
+          // surface the reason now so the user never watches a turn silently
+          // produce nothing.
           const prevent =
             message.prevent_continuation === true ||
             (message as unknown as { preventContinuation?: unknown }).preventContinuation === true;
           const content = typeof message.content === "string" ? message.content.trim() : "";
           if (prevent) {
-            this.turnBlockReason = content || "blocked by a hook";
-            logger.warn(`[claude-backend] turn blocked: ${this.turnBlockReason}`);
+            const reason = content || "blocked by a hook";
+            const turn = this.turns[this.turns.length - 1];
+            if (turn) turn.blockReason = reason;
+            logger.warn(`[claude-backend] turn blocked: ${reason}`);
             yield {
               type: "error",
               message: content || "The turn was blocked before it could produce a reply.",
@@ -499,7 +515,8 @@ export class ClaudeBackend implements AgentBackend {
           // payload, so the turn counts as having content and is not
           // misclassified as an empty one. (The panel doesn't render these
           // banners today — unchanged.)
-          this.turnHasContent = true;
+          const turn = this.turns[this.turns.length - 1];
+          if (turn) turn.hasContent = true;
         }
         break;
       case "stream_event": {
@@ -526,9 +543,12 @@ export class ClaudeBackend implements AgentBackend {
         break;
       }
       case "assistant": {
-        // An assistant message means the model actually responded this turn —
-        // the turn counts as having content (#740).
-        this.turnHasContent = true;
+        // An assistant message means the model actually responded — the CURRENT
+        // (latest submitted, still unresolved) turn counts as having content
+        // (#740). In-stream messages always belong to the newest in-flight turn:
+        // a superseded turn's output ends with its own result, which pops it.
+        const turn = this.turns[this.turns.length - 1];
+        if (turn) turn.hasContent = true;
         // Remember this message's UUID — it's the rewind anchor for the turn.
         const auid = (message as unknown as { uuid?: string }).uuid;
         // Each assistant API response carries the CURRENT context size — report
@@ -579,23 +599,28 @@ export class ClaudeBackend implements AgentBackend {
             contextWindow = mu.contextWindow;
           }
         }
-        // #740: classify the result truthfully. The SDK reports subtype "success"
-        // even for a turn a blocking hook prevented from producing ANY output (the
-        // informational above), and for a turn that simply ended with no assistant
-        // message — the panel must never present either as a silent empty success.
-        // One result consumes the per-turn state; the next turn starts clean.
-        const blockReason = this.turnBlockReason;
-        const empty = !this.turnHasContent;
-        const wasInterrupted = this.interruptPending;
-        this.turnHasContent = false;
-        this.turnBlockReason = null;
-        this.turnActive = false;
-        this.interruptPending = false;
+        // #740: classify the result truthfully, against the trace of the turn it
+        // BELONGS to (#745 r2). Results arrive in submission order, so the oldest
+        // unresolved trace is this result's turn — even when the result is LATE
+        // (an earlier turn was interrupted, produced nothing, and the panel's
+        // fallback already released the next turn; panel-agent.ts:671 tolerates
+        // that late result, and so does this FIFO: popping the old trace leaves
+        // the in-flight turn's state untouched). The SDK reports subtype
+        // "success" even for a turn a blocking hook prevented from producing ANY
+        // output, and for a turn that simply ended with no assistant message —
+        // the panel must never present either as a silent empty success.
+        const trace = this.turns.shift() ?? null;
+        if (!trace) {
+          // A result with no matching submission (e.g. a stray from a session
+          // that was restarted at run() entry): provenance unknown — pass it
+          // through by subtype rather than fabricating either outcome.
+          logger.warn("[claude-backend] result with no matching submitted turn — classifying by subtype only (#740)");
+        }
         let ok = message.subtype === "success";
-        if (ok && blockReason !== null) {
+        if (ok && trace?.blockReason != null) {
           // The blocking informational already yielded the visible error above.
           ok = false;
-        } else if (ok && empty && !wasInterrupted) {
+        } else if (ok && trace && !trace.hasContent && !trace.interrupted) {
           ok = false;
           logger.warn("[claude-backend] result/success with no assistant content — reporting a failed turn (#740)");
           yield {

@@ -104,14 +104,16 @@ async function* channel() {
   yield { text: "hi" };
 }
 
-/** Drive one backend session over the given script; resolve with the events. */
+/** Drive one backend session over the given script; resolve with the events.
+ *  The turn is SUBMITTED before the script's messages are pushed — production
+ *  ordering (the SDK pulls the user prompt before any turn message exists),
+ *  which per-turn state tracking relies on. */
 async function runScript(script: unknown[]): Promise<AgentEvent[]> {
-  const { ClaudeBackend } = await import("../../orchestrator/claude-backend.js");
-  const backend = new ClaudeBackend({ mcpServers: {}, systemAppend: "" });
+  const { events, done } = await startBackend(channel());
+  await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
   for (const m of script) hoisted.queue.push(m);
   hoisted.queue.end();
-  const events: AgentEvent[] = [];
-  for await (const ev of backend.run({ channel: channel() as never })) events.push(ev);
+  await done;
   return events;
 }
 
@@ -314,7 +316,7 @@ describe("Claude backend — interruptPending is strictly turn-scoped (#745 revi
     expect(errors[0].message).toContain("without producing a reply");
   });
 
-  it("an interrupt's blessing does not survive a session re-init", async () => {
+  it("a LATE result from an interrupted turn classifies by its OWN flags and leaves the next turn untouched", async () => {
     let releaseTurnB!: () => void;
     const gate = new Promise<void>((resolve) => {
       releaseTurnB = resolve;
@@ -327,18 +329,71 @@ describe("Claude backend — interruptPending is strictly turn-scoped (#745 revi
     const { backend, events, done } = await startBackend(twoTurns());
     hoisted.queue.push(INIT);
     await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
-    await backend.interrupt(); // turn A in flight → marked
-    // The session RESTARTS before turn A's result ever arrives: per-turn state
-    // (including the mark) resets.
-    hoisted.queue.push(INIT);
+    // Turn A is interrupted mid-flight and produces NO result; the panel's
+    // no-result fallback releases the gate (panel-agent.ts:671 acknowledges the
+    // late result) and turn B is submitted.
+    await backend.interrupt();
     releaseTurnB();
     await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(2));
+    // NOW turn A's late empty result/success arrives: it is the interrupt
+    // landing for A → ok:true, NO synthetic failure attributed to the turn in
+    // flight, and turn B's state untouched.
+    hoisted.queue.push(RESULT_SUCCESS);
+    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(1));
+    expect(resultsOf(events)[0]).toMatchObject({ ok: true });
+    expect(errorsOf(events)).toHaveLength(0);
+    // Turn B's own empty result then classifies on B's flags → ok:false + the
+    // synthetic error, exactly as required for a genuinely empty turn.
     hoisted.queue.push(RESULT_SUCCESS);
     hoisted.queue.end();
     await done;
     const results = resultsOf(events);
-    expect(results).toHaveLength(1);
-    expect(results[0]).toMatchObject({ ok: false });
+    expect(results).toHaveLength(2);
+    expect(results[1]).toMatchObject({ ok: false });
+    const errors = errorsOf(events);
+    expect(errors).toHaveLength(1);
+    expect(errors[0].message).toContain("without producing a reply");
+  });
+
+  it("an interrupt's blessing does not survive a session restart, and a stray result from the dead session is inert", async () => {
+    const { ClaudeBackend } = await import("../../orchestrator/claude-backend.js");
+    const backend = new ClaudeBackend({ mcpServers: {}, systemAppend: "" });
+    // Session 1: turn A goes in flight and is interrupted; the session then
+    // dies with NO result for A — the self-restart loop re-calls run() on the
+    // SAME backend instance (as PanelAgent does).
+    const events1: AgentEvent[] = [];
+    const done1 = (async () => {
+      for await (const ev of backend.run({ channel: channel() as never })) events1.push(ev);
+    })();
+    hoisted.queue.push(INIT);
+    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    await backend.interrupt();
+    hoisted.queue.end();
+    await done1;
+    // Session 2.
+    hoisted.queue.reset();
+    hoisted.promptsSeen = 0;
+    const events: AgentEvent[] = [];
+    const done2 = (async () => {
+      for await (const ev of backend.run({ channel: channel() as never })) events.push(ev);
+    })();
+    hoisted.queue.push(INIT);
+    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+    // Turn B ends genuinely empty → failure + the synthetic error (no leak of
+    // session 1's blessing across the restart boundary).
+    hoisted.queue.push(RESULT_SUCCESS);
+    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(1));
+    expect(resultsOf(events)[0]).toMatchObject({ ok: false });
     expect(errorsOf(events)).toHaveLength(1);
+    // A STRAY late result from the dead session (no matching submitted turn)
+    // classifies by its subtype only — it must not fail, fail again, or consume
+    // anything belonging to session 2.
+    hoisted.queue.push(RESULT_SUCCESS);
+    hoisted.queue.end();
+    await done2;
+    const results = resultsOf(events);
+    expect(results).toHaveLength(2);
+    expect(results[1]).toMatchObject({ ok: true });
+    expect(errorsOf(events)).toHaveLength(1); // still exactly the one from turn B
   });
 });
