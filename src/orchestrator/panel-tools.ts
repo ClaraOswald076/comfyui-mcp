@@ -5687,19 +5687,39 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         if (preflightHealthBase != null && sameHttpBase(getComfyUIBaseUrl(), preflightHealthBase)) {
           const preflight = await (localRestartPreflightOverride ?? preflightLocalRestart)();
           if (!preflight.ok) {
-            return ok({
-              rebooting: false,
-              ready: false,
-              confirmed_cycle: false,
-              refused: true,
-              note:
-                `Refusing to restart ComfyUI: ${preflight.reason} This looks like an ` +
-                "externally-managed install (e.g. Pinokio): a restart from here would STOP " +
-                "ComfyUI and nothing would bring it back automatically, so it was refused " +
-                "BEFORE anything was stopped — ComfyUI is still running. Restart it from the " +
-                "launcher that owns it (e.g. Pinokio's own controls), or point COMFYUI_PATH " +
-                "at the live install so a relaunch can be proven and use restart_comfyui.",
-            });
+            // r8: the preflight AWAIT makes the pre-decision binding STALE — a
+            // rebind/retarget during it would let this refusal's "ComfyUI is
+            // still running" describe a target that was never validated.
+            // Re-heal and re-capture BEFORE composing anything. The bound
+            // target is always THIS orchestrator's boot instance, so "changed"
+            // can only mean now-UNBOUND (unconfirmable): nothing was stopped
+            // (the preflight never stops anything), so fall through and let
+            // the dispatch path treat the unbound target honestly (r6/r7:
+            // dispatched-unconfirmed, process-wide-only stamp) rather than
+            // issuing a stale-target refusal.
+            ctx.ensureReachable?.();
+            const refusalHealthBase = captureRebootHealthBase(ctx);
+            const stillBound =
+              refusalHealthBase != null &&
+              sameHttpBase(getComfyUIBaseUrl(), refusalHealthBase) &&
+              sameHttpBase(preflightHealthBase, refusalHealthBase);
+            if (stillBound) {
+              return ok({
+                rebooting: false,
+                ready: false,
+                confirmed_cycle: false,
+                refused: true,
+                note:
+                  `Refusing to restart ComfyUI: ${preflight.reason} This looks like an ` +
+                  "externally-managed install (e.g. Pinokio): a restart from here would STOP " +
+                  "ComfyUI and nothing would bring it back automatically, so it was refused " +
+                  "BEFORE anything was stopped — ComfyUI is still running. Restart it from the " +
+                  "launcher that owns it (e.g. Pinokio's own controls), or point COMFYUI_PATH " +
+                  "at the live install so a relaunch can be proven and use restart_comfyui.",
+              });
+            }
+            // Binding changed mid-await → fall through to the dispatch path
+            // (re-captured again below, r7); no refusal is composed here.
           }
         }
         // r7: the preflight AWAIT sits between the binding capture and the dispatch,

@@ -454,6 +454,40 @@ describe("panel_restart_comfyui — Pinokio-style refuse-safe preflight (#742)",
     expect(resetObjectInfoCache).not.toHaveBeenCalled();
   });
 
+  it("a failing preflight with a mid-await REBIND issues NO stale-target refusal (r8)", async () => {
+    // Bound at the preflight decision; the session rebinds to an unconfirmable
+    // target DURING the await and the preflight FAILS. The refusal must NOT be
+    // composed against the stale pre-await target ("ComfyUI is still running"
+    // would describe a target never validated) — nothing was stopped, so the
+    // flow falls through to the honest unbound dispatch instead.
+    const fronts = { current: true }; // bound when the preflight is decided…
+    __panelToolsTestHooks.setLocalRestartPreflight(async () => {
+      fronts.current = false; // …but a rebind lands DURING the preflight await
+      return {
+        ok: false,
+        reason:
+          "Resolved ComfyUI script does not exist on disk: main.py — could not " +
+          "locate the ComfyUI install.",
+      };
+    });
+    __panelToolsTestHooks.setHealthProbe(async () => "down");
+    const { ctx, sends } = makeCtx({ confirm: "yes", fronts });
+
+    const out = parse(await restartTool().handler({}, ctx));
+    const note = String(out.note ?? "");
+
+    // NO stale-target refusal, no unvalidated "still running" claim…
+    expect(note).not.toMatch(/Refusing to restart/i);
+    expect(note).not.toMatch(/still running/i);
+    expect(out.refused).not.toBe(true);
+    // …the restart proceeds against the CURRENT (unbound) target and is
+    // reported honestly as dispatched-but-unconfirmable.
+    expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(true);
+    expect(out.rebooting).toBe(true);
+    expect(note).toMatch(/can't confirm/i);
+    expect(__panelToolsTestHooks.getSessionRestartDispatch(ctx)).toBeNull();
+  });
+
   it("does NOT consult the preflight when the tab doesn't provably front our boot instance", async () => {
     // The preflight guards OUR local boot instance only. A reboot bound for a
     // different/remote instance proceeds exactly as before (dispatched +
