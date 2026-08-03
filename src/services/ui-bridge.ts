@@ -2043,6 +2043,13 @@ export class UiBridge {
       const stamp = this.resolveTabWorkflowUuid?.(opts.tabId ?? conn.tabId);
       const hasTrustedStamp = typeof stamp === "string" && stamp.length > 0;
       if (!conn.enforcesWorkflowStamp || !conn.enforcesWorkflowStampAtWrite || !hasTrustedStamp) {
+        // The two CAPABILITY branches (missing panel fences) are typed so the tool
+        // layer drops its futile retry/rebind suffix (#709). The NO-IDENTITY branch
+        // is deliberately NOT capability-marked: an unresolvable workflow identity
+        // is a binding problem a retry/rebind genuinely fixes, so the generic
+        // wrapper must keep firing for it (codex gate — the marker must never
+        // false-positive a non-capability refusal).
+        const capabilityMissing = !conn.enforcesWorkflowStamp || !conn.enforcesWorkflowStampAtWrite;
         // #709 — user-facing, so name the FULL tab id: the log-style slice(0,8)
         // rendering ("wf:workf") was misread as a corrupted routing identity and
         // sent the diagnosis down a wrong path. And lead with the recovery that
@@ -2064,17 +2071,14 @@ export class UiBridge {
               `boundary after asynchronous work (detected panel ${conn.panelVersion ?? "version unknown"}; this MCP ` +
                 `requires panel ${requiredPanelVersion()}+). ${recovery}`
           : `this workflow has no trusted identity for the panel to fence the command against`;
-        return Promise.reject(
-          markCapabilityRefusal(
-            markDispatched(
-              new Error(
-                `"${cmd.cmd}" cannot be safely targeted to the active workflow: ${why}. Read-only graph ` +
-                  `commands (graph_outline, graph_query, graph_get_state) still work.`,
-              ),
-              false,
-            ),
+        const refusal = markDispatched(
+          new Error(
+            `"${cmd.cmd}" cannot be safely targeted to the active workflow: ${why}. Read-only graph ` +
+              `commands (graph_outline, graph_query, graph_get_state) still work.`,
           ),
+          false,
         );
+        return Promise.reject(capabilityMissing ? markCapabilityRefusal(refusal) : refusal);
       }
     }
     if (conn.sock.readyState !== WebSocket.OPEN) {

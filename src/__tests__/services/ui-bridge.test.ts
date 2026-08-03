@@ -1776,6 +1776,30 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     old.close();
   });
 
+  it("#709: the NO-IDENTITY refusal is NOT capability-marked — retry/rebind stays the right guidance", async () => {
+    // An ENFORCING panel (both stamps advertised) whose workflow identity the
+    // orchestrator cannot resolve: a binding/identity problem, NOT a missing panel
+    // capability. The refusal must NOT carry the capability marker — marking it
+    // would suppress the retry/rebind wrapper, which IS the right recovery here
+    // (a rebind re-resolves the identity; nothing needs a panel update).
+    const modern = await connectPanel("tmp:enforcing-unresolved", "M");
+    await vi.waitFor(() =>
+      expect(bridge.tabs().some((t) => t.tab_id === "tmp:enforcing-unresolved")).toBe(true),
+    );
+    bridge.setTabWorkflowUuidResolver(() => undefined); // no trusted identity to stamp
+    const caught = await bridge
+      .send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "tmp:enforcing-unresolved" })
+      .then(
+        () => null,
+        (err) => err,
+      );
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toMatch(/no trusted identity/);
+    expect(isCapabilityRefusal(caught)).toBe(false); // NOT a capability refusal
+    expect(dispatchOutcomeOf(caught)).toBe(false); // still categorically pre-dispatch
+    modern.close();
+  });
+
   it("FAILS CLOSED when a panel has only the pre-await stamp fence (#718)", async () => {
     const old = new WebSocket(`ws://127.0.0.1:${port}`);
     await new Promise<void>((res, rej) => {

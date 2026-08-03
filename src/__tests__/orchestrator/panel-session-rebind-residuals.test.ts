@@ -429,6 +429,46 @@ describe("#442 defect 4: a MUTATING panel command names the rebind on a no-route
     expect(text).not.toMatch(/Retry in a moment/);
   });
 
+  it("#709: a NO-IDENTITY refusal (not capability-marked) keeps the retry/rebind wrapper", async () => {
+    // Same gate, THIRD branch: the panel enforces the stamp but the workflow has no
+    // trusted identity to fence against — a binding/identity problem where retrying
+    // or rebinding onto the live tab genuinely re-resolves the identity. The error
+    // is dispatched:false but deliberately NOT capability-marked, so the generic
+    // recovery wrapper MUST still fire.
+    const identityCause = markDispatched(
+      new Error(
+        `"graph_set_widget" cannot be safely targeted to the active workflow: this workflow ` +
+          `has no trusted identity for the panel to fence the command against. Read-only graph ` +
+          `commands (graph_outline, graph_query, graph_get_state) still work.`,
+      ),
+      false,
+    );
+    const live = new Set(["wf:workflows/x.json"]);
+    const sent: Array<{ cmd: Record<string, unknown> }> = [];
+    const bridge = {
+      send: async (cmd: Record<string, unknown>, opts?: { tabId?: string }) => {
+        if (opts?.tabId && !live.has(opts.tabId)) throw new Error("unexpected route");
+        throw identityCause;
+      },
+      push: () => 1,
+      canReach: (id: string) => live.has(id),
+      tabs: () => [...live].map((t) => ({ tab_id: t, title: t, connected_at: 0 })),
+      resolveActiveTabId: () => [...live][0],
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, "wf:workflows/x.json", new WorkflowTargetStore());
+
+    const res = await defByName("panel_set_widget").handler(
+      { node_id: 7, widget: "steps", value: 20 },
+      ctx,
+    );
+    expect(res.isError).toBe(true);
+    expect(sent.length).toBe(0);
+    const text = textOf(res);
+    expect(text).toMatch(/no trusted identity/); // the cause is preserved…
+    expect(text).toContain('rebind with panel_set_workflow_target({mode:"current"})'); // …AND the wrapper fires
+    expect(text).toMatch(/Nothing was applied/i);
+  });
+
   it("does NOT mis-wrap a POST-dispatch executor failure that merely quotes 'no connected tab' as 'nothing applied'", async () => {    // A LIVE tab that ACCEPTS the command (it IS dispatched, pushed to `sent`) but whose
     // executor rejects with a message quoting the routing phrase. Because the typed flag is
     // absent (dispatchOutcomeOf === undefined, not false), the wrapper must NOT fire — the
