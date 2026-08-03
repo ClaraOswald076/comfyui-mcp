@@ -19,7 +19,7 @@
 // process/port/network/filesystem is touched.
 
 import { EventEmitter } from "node:events";
-import { delimiter, join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 class FakeChild extends EventEmitter {
@@ -128,7 +128,8 @@ const SM_PY = join(SM_PKG, "venv", "Scripts", "python.exe");
 const SM_GIT_ROOT = join(SM_DATA, "PortableGit");
 const SM_GIT_DIR = join(SM_GIT_ROOT, "cmd");
 const SM_GIT_EXE = join(SM_GIT_DIR, "git.exe");
-const SM_FFMPEG_ROOT = join(SM_DATA, "Assets", "ffmpeg");
+const SM_ASSETS_ROOT = join(SM_DATA, "Assets");
+const SM_FFMPEG_ROOT = join(SM_ASSETS_ROOT, "ffmpeg");
 const SM_SETTINGS = join(SM_DATA, "settings.json");
 const SM_FFMPEG_DIR = join(SM_FFMPEG_ROOT, "bin");
 const SM_FFMPEG_EXE = join(SM_FFMPEG_DIR, "ffmpeg.exe");
@@ -264,10 +265,22 @@ describe("restart_comfyui — Stability Matrix launcher environment (#776)", () 
     });
     const configExists =
       opts?.settingsJson !== undefined || (opts?.settingsUnreadable ?? false);
+    // A real filesystem implies every ancestor of an existing directory, so
+    // listing `Assets/ffmpeg` must also make `Assets` exist — otherwise the mock
+    // models a shape that cannot occur on disk.
+    const existingDirs = new Set<string>();
+    for (const root of roots) {
+      let cur = root;
+      while (cur.length > SM_DATA.length && cur.startsWith(SM_DATA)) {
+        existingDirs.add(cur);
+        cur = dirname(cur);
+      }
+      existingDirs.add(SM_DATA);
+    }
     mockExistsSync.mockImplementation((p: string) => {
       const s = String(p);
       if (s === SM_MAIN || s === SM_PY) return true;
-      if (roots.includes(s)) return true;
+      if (existingDirs.has(s)) return true;
       if (git && s === SM_GIT_EXE) return true;
       if (ffmpeg && s === SM_FFMPEG_EXE) return true;
       if (configExists && s === SM_SETTINGS) return true;
@@ -436,6 +449,25 @@ describe("restart_comfyui — Stability Matrix launcher environment (#776)", () 
 
     expect(message).toMatch(/bundled FFmpeg/i);
     expect(message).toMatch(/Restart ComfyUI from Stability Matrix/i);
+  });
+
+  it("recognizes the `<Data>/Assets` store as Stability Matrix even without an ffmpeg subfolder", async () => {
+    // The corroboration boundary: requiring `Assets/ffmpeg` specifically missed a
+    // real layout — `Data/Packages/…` beside `Data/Assets`, with PortableGit
+    // expected but unlocatable. That fell through as a plain install, inherited our
+    // environment, and reproduced "Bad git executable". With the store recognized,
+    // the per-component evidence rules apply: PortableGit is present but its binary
+    // is not, which is ambiguous and must refuse.
+    useStabilityMatrix({
+      git: false,
+      ffmpeg: false,
+      roots: [SM_ASSETS_ROOT, SM_GIT_ROOT],
+    });
+
+    const message = await expectRefusedBeforeStopping();
+
+    expect(message).toMatch(/Stability Matrix/i);
+    expect(message).toMatch(/bundled Git/i);
   });
 
   it("does NOT mistake an ordinary install that merely lives under a `Data/Packages` path for Stability Matrix", async () => {
@@ -966,6 +998,82 @@ describe("restart_comfyui — a PID is not a process identity (#776)", () => {
     expect(result.message).toMatch(/5555/);
     expect(killSpy).not.toHaveBeenCalled();
     expect(mockSpawn).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  });
+
+  it("REFUSES rather than binding an answer it could not bracket (port lookup unreadable on one side)", async () => {
+    // The bracket must be REQUIRED, not best-effort: if the pre-call lookup comes
+    // back empty there is no anchor, and A-answers-then-B-takes-the-port with
+    // identical argv would satisfy every later self-consistent check. One flaky
+    // lookup is retried; a bracket that still cannot be closed refuses.
+    usePlainInstallForIdentity();
+    let lookups = 0;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/netstat/i.test(cmd)) {
+        lookups++;
+        // Every PRE-call lookup (odd) is unreadable; every post-call one succeeds.
+        return lookups % 2 === 1
+          ? ""
+          : "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
+      }
+      if (/lsof/i.test(cmd)) {
+        lookups++;
+        if (lookups % 2 === 1) throw new Error("not listening");
+        return "p4321\nn127.0.0.1:8188\n";
+      }
+      return "";
+    });
+    spawnCapturingChildren();
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(false);
+    expect(result.started).toBe(false);
+    expect(result.message).toMatch(/could not be read on both sides/i);
+    expect(killSpy).not.toHaveBeenCalled();
+    expect(mockSpawn).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  });
+
+  it("RETRIES a single flaky lookup rather than refusing outright", async () => {
+    // Refusing on the first hiccup would be its own regression — one bad read is
+    // retried, and a stable bracket on the retry proceeds normally.
+    usePlainInstallForIdentity();
+    let lookups = 0;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill|pkill|\bkill\b/i.test(cmd)) {
+        lookups = 100; // past the kill the port is free
+        return "";
+      }
+      if (/netstat/i.test(cmd)) {
+        lookups++;
+        if (lookups === 1) return ""; // one flaky pre-call read
+        return lookups < 100
+          ? "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321"
+          : "";
+      }
+      if (/lsof/i.test(cmd)) {
+        lookups++;
+        if (lookups === 1 || lookups >= 100) throw new Error("not listening");
+        return "p4321\nn127.0.0.1:8188\n";
+      }
+      return "";
+    });
+    spawnCapturingChildren();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true }) as Response),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.message).not.toMatch(/could not be read on both sides/i);
+    expect(result.stopped).toBe(true);
+    expect(result.started).toBe(true);
 
     killSpy.mockRestore();
   });

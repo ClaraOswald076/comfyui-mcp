@@ -266,13 +266,17 @@ export function detectStabilityMatrix(
       const dataRoot = dirOf(ancestor);
       if (!dataRoot) continue;
       const gitRoot = joinPath(dataRoot, "PortableGit");
-      const ffmpegRoot = joinPath(dataRoot, "Assets", "ffmpeg");
+      const assetsRoot = joinPath(dataRoot, "Assets");
+      const ffmpegRoot = joinPath(assetsRoot, "ffmpeg");
       const hasGitRoot = pathExists(gitRoot);
       const hasFfmpegRoot = pathExists(ffmpegRoot);
-      // No Stability Matrix tooling beside `Packages` → not a Stability Matrix
-      // install (or one with nothing to inject). Either way there is nothing to
-      // reconstruct, so fall through to the ordinary inherit path.
-      if (!hasGitRoot && !hasFfmpegRoot) continue;
+      // Corroboration is `PortableGit` OR the `Assets` STORE — not `Assets/ffmpeg`
+      // specifically. Requiring the ffmpeg subdirectory missed a real layout
+      // (`Data/Packages/…` beside `Data/Assets`, with PortableGit expected but
+      // currently unlocatable): it fell through as a plain install, inherited our
+      // environment, and reproduced "Bad git executable" (codex gate). Recognising
+      // it lets the per-component evidence rules below decide properly.
+      if (!hasGitRoot && !pathExists(assetsRoot)) continue;
 
       const gitExe = firstExisting([
         joinPath(gitRoot, "cmd", "git.exe"),

@@ -1546,29 +1546,56 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
   // reproduce: the identity of the port owner BEFORE the HTTP call. If the same
   // pid still owns the port afterwards, the answer we hold was produced while that
   // one process held the socket throughout.
-  let ownerBefore: number | null = null;
-  try {
-    ownerBefore = findPidByPort(port);
-  } catch {
-    ownerBefore = null;
-  }
-
+  // The bracket is REQUIRED, not best-effort (codex gate): if the first lookup
+  // came back empty we have no anchor, and A-answers-then-B-takes-the-port with
+  // identical argv would sail through every later self-consistent check. A single
+  // flaky lookup is retried; a bracket we still cannot close refuses.
+  const safeFindPid = (): number | null => {
+    try {
+      return findPidByPort(port);
+    } catch {
+      return null;
+    }
+  };
   let argv: string[] = [];
-  try {
-    const stats = await getSystemStats();
-    argv = stats.system.argv ?? [];
-  } catch {
-    logger.warn("Could not fetch system_stats — will rely on PID detection");
+  let pid: number | null = null;
+  let bracketed = false;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const ownerBefore = safeFindPid();
+    try {
+      const stats = await getSystemStats();
+      argv = stats.system.argv ?? [];
+    } catch {
+      argv = [];
+      logger.warn("Could not fetch system_stats — will rely on PID detection");
+    }
+    const ownerAfter = safeFindPid();
+    pid = ownerAfter ?? ownerBefore;
+    // No answer to bind means there is nothing to mis-bind: the pid-only paths
+    // below (including #449's reachable-but-unmapped) own that case.
+    if (argv.length === 0) break;
+    if (ownerBefore != null && ownerAfter != null) {
+      if (ownerBefore !== ownerAfter) {
+        const err = new ProcessControlError(
+          `The process listening on port ${port} changed while ComfyUI was being identified ` +
+            `(PID ${ownerBefore} answered, PID ${ownerAfter} holds the port now). Nothing was ` +
+            `stopped: the launch arguments we hold describe the instance that has gone, not the ` +
+            `one running now. Re-run once the server has settled.`,
+        );
+        err.identityAmbiguous = true;
+        throw err;
+      }
+      bracketed = true;
+      break;
+    }
+    // One side of the bracket was unreadable — retry once before giving up.
   }
-
-  // 2. Find PID by port
-  const pid = findPidByPort(port);
-  if (ownerBefore != null && pid != null && ownerBefore !== pid) {
+  if (argv.length > 0 && pid != null && !bracketed) {
     const err = new ProcessControlError(
-      `The process listening on port ${port} changed while ComfyUI was being identified ` +
-        `(PID ${ownerBefore} answered, PID ${pid} holds the port now). Nothing was stopped: ` +
-        `the launch arguments we hold describe the instance that has gone, not the one ` +
-        `running now. Re-run once the server has settled.`,
+      `ComfyUI answered on port ${port}, but the process owning that port could not be read ` +
+        `on both sides of the request, so its answer cannot be tied to PID ${pid}. Nothing was ` +
+        `stopped: acting on an unverified pairing risks controlling the wrong process. Re-run, ` +
+        `or restart ComfyUI from the launcher that owns it.`,
     );
     err.identityAmbiguous = true;
     throw err;
