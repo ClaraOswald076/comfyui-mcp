@@ -127,9 +127,15 @@ const PLAIN_PY = join(PLAIN_BASE, "venv", "bin", "python");
 // Pinokio: an app tree under a `pinokio` root.
 const PINOKIO_HOME = resolve("pinokio");
 const PINOKIO_API = join(PINOKIO_HOME, "api");
+const PINOKIO_BIN = join(PINOKIO_HOME, "bin");
 const PINOKIO_APP = join(PINOKIO_API, "comfy.git", "app");
 const PINOKIO_MAIN = join(PINOKIO_APP, "main.py");
 const PINOKIO_PY = join(PINOKIO_APP, "env", "bin", "python");
+
+// An ordinary install that merely SITS under a `pinokio` tree (not inside its
+// `api/` app subtree) — this must never be mistaken for a Pinokio-managed server.
+const BENIGN_PINOKIO_PATH = join(PINOKIO_BIN, "comfy", "main.py");
+const BENIGN_PINOKIO_PY = join(PINOKIO_BIN, "comfy", "venv", "bin", "python");
 
 const ORIGINAL_ENV = { ...process.env };
 
@@ -195,6 +201,10 @@ beforeEach(() => {
   // No live-process environment is readable by default (the Windows/macOS case,
   // and the #776 reporter's platform). Individual tests opt in.
   __processControlTestHooks.setLiveEnvResolver(() => undefined);
+  // Likewise no creation-time stamp by default — the shape on the platforms where
+  // the native read is deliberately skipped. Tests that exercise PID identity
+  // install their own resolver.
+  __processControlTestHooks.setProcessIdentityResolver(() => undefined);
 });
 
 afterEach(() => {
@@ -329,6 +339,22 @@ describe("restart_comfyui — Stability Matrix launcher environment (#776)", () 
     const message = await expectRefusedBeforeStopping();
 
     expect(message).toMatch(/bundled FFmpeg/i);
+    expect(message).toMatch(/no ffmpeg binary inside it/i);
+  });
+
+  it("REFUSES before stopping with an intact PortableGit when the FFmpeg asset dir is ABSENT ENTIRELY", async () => {
+    // The exact partial-approval hole: Git resolves, so a "Git is the fatal one"
+    // rule would approve, stop a healthy server, and relaunch knowingly incomplete.
+    // From here we cannot tell "this install has no FFmpeg" from "its FFmpeg lives
+    // somewhere we don't know to look", and the #776 lesson is that guessing wrong
+    // costs the user their server — so an unresolvable component always refuses.
+    useStabilityMatrix({ git: true, ffmpeg: false, roots: [SM_GIT_ROOT] });
+
+    const message = await expectRefusedBeforeStopping();
+
+    expect(message).toMatch(/bundled FFmpeg/i);
+    expect(message).toMatch(/does not exist, so we cannot tell/i);
+    expect(message).toMatch(/Restart ComfyUI from Stability Matrix/i);
   });
 
   it("does NOT mistake an ordinary install that merely lives under a `Data/Packages` path for Stability Matrix", async () => {
@@ -426,8 +452,8 @@ describe("restart_comfyui — irreproducible launcher environments (#776)", () =
     mockExistsSync.mockImplementation((p: string) => {
       const s = String(p);
       if (s === PINOKIO_MAIN || s === PINOKIO_PY) return true;
-      // The `api/` tree is the on-disk evidence that this really is a Pinokio home.
-      return corroborated && s === PINOKIO_API;
+      // BOTH `api/` and `bin/` are the on-disk evidence of a real Pinokio home.
+      return corroborated && (s === PINOKIO_API || s === PINOKIO_BIN);
     });
   }
 
@@ -445,6 +471,44 @@ describe("restart_comfyui — irreproducible launcher environments (#776)", () =
     expect(result.message).toMatch(/Pinokio/);
     expect(mockSpawn).not.toHaveBeenCalled();
     expect(killSpy).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  });
+
+  it("does NOT refuse an ordinary install that merely SITS under a `pinokio` tree", async () => {
+    // The inverse regression: a real Pinokio home (both `api/` and `bin/` present)
+    // but an install living under `pinokio/bin/...`, NOT inside the `api/` app
+    // subtree Pinokio manages. A path-component name is not evidence, and a false
+    // refusal blocks a restart that would have worked.
+    mockFindComfyuiPython.mockReturnValue(BENIGN_PINOKIO_PY);
+    mockLiveRootFromArgv.mockReturnValue(join(PINOKIO_BIN, "comfy"));
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: [BENIGN_PINOKIO_PATH, "--port", "8188"] },
+    });
+    mockExistsSync.mockImplementation((p: string) => {
+      const s = String(p);
+      return (
+        s === BENIGN_PINOKIO_PATH ||
+        s === BENIGN_PINOKIO_PY ||
+        s === PINOKIO_API ||
+        s === PINOKIO_BIN
+      );
+    });
+    mockLivePortThenFree();
+    spawnCapturingChildren();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true }) as Response),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.message).not.toMatch(/refusing to restart/i);
+    expect(result.message).not.toMatch(/Pinokio/);
+    expect(result.started).toBe(true);
+    expect(result.launch_env?.source).toBe("inherited");
+    expect(result.launch_env?.reproducible).toBe(true);
 
     killSpy.mockRestore();
   });
@@ -519,6 +583,9 @@ describe("restart_comfyui — irreproducible launcher environments (#776)", () =
       PINOKIO_APP_NAME: "comfy",
     };
     __processControlTestHooks.setLiveEnvResolver(() => ({ ...LIVE_ENV }));
+    // A STABLE process identity across the read — the capture is only adopted
+    // when the pid provably still denotes the same process.
+    __processControlTestHooks.setProcessIdentityResolver(() => ({ startedAt: "t1" }));
     mockLivePortThenFree();
     spawnCapturingChildren();
     vi.stubGlobal(
@@ -537,6 +604,134 @@ describe("restart_comfyui — irreproducible launcher environments (#776)", () =
 
     killSpy.mockRestore();
   });
+});
+
+describe("restart_comfyui — a PID is not a process identity (#776)", () => {
+  function usePinokioInstall(): void {
+    mockFindComfyuiPython.mockReturnValue(PINOKIO_PY);
+    mockLiveRootFromArgv.mockReturnValue(PINOKIO_APP);
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: [PINOKIO_MAIN, "--port", "8188"] },
+    });
+    mockExistsSync.mockImplementation((p: string) => {
+      const s = String(p);
+      return (
+        s === PINOKIO_MAIN ||
+        s === PINOKIO_PY ||
+        s === PINOKIO_API ||
+        s === PINOKIO_BIN
+      );
+    });
+  }
+
+  /** An identity reader that returns the given stamps in call order. */
+  function identitySequence(stamps: string[]): void {
+    let i = 0;
+    __processControlTestHooks.setProcessIdentityResolver(() => {
+      const stamp = stamps[Math.min(i, stamps.length - 1)];
+      i++;
+      return { startedAt: stamp };
+    });
+  }
+
+  it("does NOT adopt the environment of a PID that was recycled during the read", async () => {
+    // ComfyUI exits after the port lookup and the OS hands its number to an
+    // unrelated process, whose /proc/<pid>/environ we would otherwise adopt as
+    // ComfyUI's launch environment. Proof that it is rejected: this Pinokio
+    // install is only restartable BECAUSE of a live environment, so discarding
+    // the bogus capture must drop it back to the irreproducible-launcher refusal.
+    usePinokioInstall();
+    __processControlTestHooks.setLiveEnvResolver(() => ({
+      PATH: "/some/unrelated/process/path",
+      NOT_COMFYUI: "1",
+    }));
+    identitySequence(["t1", "t2"]); // lookup, then re-verify after the env read
+    mockLivePortThenFree();
+    spawnCapturingChildren();
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(false);
+    expect(result.started).toBe(false);
+    expect(result.message).toMatch(/refusing to restart/i);
+    expect(result.message).toMatch(/Pinokio/);
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(killSpy).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  });
+
+  it("does NOT KILL a PID that no longer owns the port it was found on", async () => {
+    // The server exited between the port lookup and the stop. Its number may
+    // already belong to something else, so nothing may be killed.
+    usePlainInstallForIdentity();
+    let netstatCalls = 0;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/netstat/i.test(cmd)) {
+        netstatCalls++;
+        // Owned during the lookup; gone by the pre-kill re-check.
+        return netstatCalls <= 1
+          ? "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321"
+          : "";
+      }
+      if (/lsof/i.test(cmd)) {
+        netstatCalls++;
+        if (netstatCalls > 1) throw new Error("not listening");
+        return "p4321\nn127.0.0.1:8188\n";
+      }
+      return "";
+    });
+    spawnCapturingChildren();
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(false);
+    expect(result.started).toBe(false);
+    expect(result.message).toMatch(/no longer owns that port/i);
+    expect(result.message).toMatch(/must not be killed/i);
+    expect(killSpy).not.toHaveBeenCalled();
+    expect(
+      mockExecSync.mock.calls.some(([cmd]) => /taskkill/i.test(String(cmd))),
+    ).toBe(false);
+    expect(mockSpawn).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  });
+
+  it("does NOT KILL a PID whose process CREATION TIME changed under it", async () => {
+    // The stronger identity: the number is still listening, but it is not the
+    // process we identified (#650's pid + creation-time identity).
+    usePlainInstallForIdentity();
+    identitySequence(["t1", "t2"]); // lookup, then the pre-kill re-verify
+    mockLivePortThenFree();
+    spawnCapturingChildren();
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(false);
+    expect(result.started).toBe(false);
+    expect(result.message).toMatch(/creation time/i);
+    expect(result.message).toMatch(/must not be killed/i);
+    expect(killSpy).not.toHaveBeenCalled();
+    expect(mockSpawn).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  });
+
+  function usePlainInstallForIdentity(): void {
+    mockFindComfyuiPython.mockReturnValue(PLAIN_PY);
+    mockLiveRootFromArgv.mockReturnValue(PLAIN_BASE);
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: [PLAIN_MAIN, "--port", "8188"] },
+    });
+    mockExistsSync.mockImplementation((p: string) => {
+      const s = String(p);
+      return s === PLAIN_MAIN || s === PLAIN_PY;
+    });
+  }
 });
 
 describe("restart_comfyui — plain installs are unchanged (#776)", () => {
@@ -610,7 +805,7 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
 
     const result = await restartComfyUI();
 
-    expect(result.listener_is_launched_process).toBe(false);
+    expect(result.listener_ownership).toBe("not-ours");
     // The STRUCTURED result must not read as a successful restart either: this
     // call did not start the server. `ready` stays true — the server really is up.
     expect(result.started).toBe(false);
@@ -619,6 +814,8 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
     expect(result.message).toMatch(/NOT as a result of this restart/i);
     expect(result.message).toMatch(/another launcher or supervisor owns it/i);
     expect(result.message).not.toMatch(/could not be started/i);
+    // ...and it must SURVIVE the tool's JSON serialization.
+    expect(JSON.parse(JSON.stringify(result)).listener_ownership).toBe("not-ours");
 
     killSpy.mockRestore();
   });
@@ -657,7 +854,7 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
 
     const result = await restartComfyUI();
 
-    expect(result.listener_is_launched_process).toBe(false);
+    expect(result.listener_ownership).toBe("not-ours");
     expect(result.started).toBe(false);
     expect(result.ready).toBe(true);
     expect(result.message).not.toMatch(/restarted successfully/i);
@@ -699,8 +896,14 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
 
     expect(result.started).toBe(true);
     expect(result.ready).toBe(true);
-    expect(result.listener_is_launched_process).toBeUndefined();
+    expect(result.listener_ownership).toBe("unconfirmed");
     expect(result.message).toMatch(/could not be confirmed as the process this call launched/i);
+    // THE POINT of a string state: `undefined` would be dropped by JSON.stringify,
+    // leaving a payload indistinguishable from one that never carried the field —
+    // i.e. from a plain success. The uncertainty has to reach the consumer.
+    const serialized = JSON.parse(JSON.stringify(result));
+    expect(Object.hasOwn(serialized, "listener_ownership")).toBe(true);
+    expect(serialized.listener_ownership).toBe("unconfirmed");
 
     killSpy.mockRestore();
   });

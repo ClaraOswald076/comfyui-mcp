@@ -20,6 +20,7 @@ import { parseListenerPidFromNetstat, findPidByPort } from "./port-owner.js";
 import {
   recordLaunchedInterpreter,
   clearLaunchedInterpreter,
+  readProcessIdentity,
 } from "./live-interpreter.js";
 import {
   liveRootFromArgv,
@@ -56,6 +57,16 @@ interface ProcessInfo {
    */
   liveEnv?: NodeJS.ProcessEnv;
   /**
+   * The port owner's process CREATION TIME, read at the same moment as the pid.
+   * A pid is not an identity (pids are recycled), so anything that acts ON this
+   * process (reading its environment, killing it) re-verifies this stamp first;
+   * a changed stamp means the number now belongs to somebody else. Reuses #650's
+   * pid+creation-time identity rather than inventing a second scheme.
+   * `undefined` when the platform/permissions make it unreadable, in which case
+   * the cheaper port-ownership re-check is the only guard.
+   */
+  startedAt?: string;
+  /**
    * The resolved relaunch ENVIRONMENT decision (#776) — computed once by
    * assessRelaunch (pre-stop, so a refusal happens before anything is killed) and
    * reused verbatim by the spawn, so the process that comes back is launched into
@@ -83,11 +94,13 @@ interface StartResult {
   launch_env?: LaunchEnvInfo;
   /**
    * Whether the process now listening on the port is the one WE launched.
-   * `undefined` when it cannot be decided (no spawn pid, or the port owner could
-   * not be mapped). `false` means a healthy server is up but somebody else owns
-   * it — readiness alone must never be read as "our relaunch worked".
+   *
+   * A STRING tri-state, not a boolean-or-undefined, precisely so the uncertain
+   * case survives `JSON.stringify` (which DROPS `undefined` keys, making "we could
+   * not determine this" indistinguishable from a response that never carried the
+   * field at all).
    */
-  listener_is_launched_process?: boolean;
+  listener_ownership?: ListenerOwnership;
 }
 
 interface RestartResult {
@@ -102,12 +115,26 @@ interface RestartResult {
   launch_env?: LaunchEnvInfo;
   /**
    * Whether the process now listening on the port is the one WE launched.
-   * `undefined` when it cannot be decided (no spawn pid, or the port owner could
-   * not be mapped). `false` means a healthy server is up but somebody else owns
-   * it — readiness alone must never be read as "our relaunch worked".
+   *
+   * A STRING tri-state, not a boolean-or-undefined, precisely so the uncertain
+   * case survives `JSON.stringify` (which DROPS `undefined` keys, making "we could
+   * not determine this" indistinguishable from a response that never carried the
+   * field at all).
    */
-  listener_is_launched_process?: boolean;
+  listener_ownership?: ListenerOwnership;
 }
+
+/**
+ * Who owns the process serving the port after a launch (#776).
+ *   "ours"        - the port owner IS the process this call launched (proven).
+ *   "not-ours"    - a healthy listener that provably is NOT ours (a different
+ *                   mapped owner, or our launched child already dead).
+ *   "unconfirmed" - genuinely undecidable: the launched child is alive and the API
+ *                   is ready, but the port owner could not be mapped (a supported
+ *                   condition, #449), or the launcher's pid is indirect (Desktop).
+ *                   Never silently upgraded to "ours".
+ */
+type ListenerOwnership = "ours" | "not-ours" | "unconfirmed";
 
 interface StartupReadinessResult {
   ready: boolean;
@@ -684,6 +711,109 @@ function resolveLiveProcessEnv(pid: number): NodeJS.ProcessEnv | undefined {
   return readLiveProcessEnv(pid);
 }
 
+/**
+ * Injectable process-IDENTITY reader (creation time), reusing #650's identity
+ * scheme from live-interpreter rather than inventing a second one.
+ *
+ * Native reads happen only on Linux, where `/proc/<pid>/stat` is a free file read
+ * AND which is the only platform where we read `/proc/<pid>/environ` at all. The
+ * Windows/macOS readers cost a PowerShell/`ps` spawn per call and would buy
+ * nothing the port-ownership re-check below does not already give: a recycled pid
+ * belongs to an unrelated program, which by definition is not listening on our
+ * port. An injected override always wins so tests can drive recycled-pid
+ * scenarios on any host.
+ */
+let processIdentityOverride:
+  | ((pid: number) => { startedAt?: string } | undefined)
+  | null = null;
+
+function resolveProcessIdentity(pid: number): { startedAt?: string } | undefined {
+  if (processIdentityOverride) return processIdentityOverride(pid);
+  if (!pid || pid <= 0 || process.platform !== "linux") return undefined;
+  try {
+    return readProcessIdentity(pid);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The live environment of a pid we can still PROVE is the process we identified.
+ *
+ * Reading `/proc/<pid>/environ` from a bare number is not enough: between the port
+ * lookup and the read, ComfyUI can exit and the OS can hand the number to an
+ * unrelated process, whose environment we would then adopt as ComfyUI's launch
+ * environment. So the creation time is re-verified immediately AFTER the read, and
+ * any gap in the evidence (no stamp before, no stamp after, or a changed stamp)
+ * discards the capture and falls through to the on-disk tiers, which refuse rather
+ * than guess.
+ */
+function captureVerifiedLiveEnv(
+  pid: number,
+  startedAt: string | undefined,
+): NodeJS.ProcessEnv | undefined {
+  if (!startedAt) return undefined;
+  const env = resolveLiveProcessEnv(pid);
+  if (!env) return undefined;
+  const after = resolveProcessIdentity(pid)?.startedAt;
+  if (!after || after !== startedAt) {
+    logger.warn(
+      "Discarding the captured ComfyUI environment: the pid's identity changed while reading it",
+      { pid, before: startedAt, after: after ?? "(unavailable)" },
+    );
+    return undefined;
+  }
+  return env;
+}
+
+/**
+ * May we still act on (kill) the process we identified? Returns a refusal reason
+ * when the pid provably no longer denotes that process.
+ *
+ * Two independent checks, cheapest first:
+ *   1. it must STILL own the port we found it on - a recycled pid belongs to some
+ *      unrelated program, which by definition is not listening there;
+ *   2. when a creation-time stamp was captured, it must still match.
+ * Missing evidence is NOT treated as failure (that would refuse restarts on hosts
+ * where the reads are unavailable); only a POSITIVE mismatch refuses.
+ */
+function processIdentityStillValid(
+  info: ProcessInfo,
+): { ok: true } | { ok: false; reason: string } {
+  // A Desktop pid may legitimately not be the port owner (it can come from the
+  // Electron-shell scan when the API is unreachable), so the port check is
+  // meaningless there.
+  if (!info.isDesktopApp) {
+    let owner: number | null = null;
+    try {
+      owner = findPidByPort(info.port);
+    } catch {
+      owner = null;
+    }
+    if (owner !== info.pid) {
+      return {
+        ok: false,
+        reason:
+          `the process identified on port ${info.port} (PID ${info.pid}) no longer owns that port ` +
+          `(now ${owner ?? "nothing"}), so it exited on its own - this PID may since have been ` +
+          "reused by an unrelated program and must not be killed",
+      };
+    }
+  }
+  if (info.startedAt) {
+    const now = resolveProcessIdentity(info.pid)?.startedAt;
+    if (now && now !== info.startedAt) {
+      return {
+        ok: false,
+        reason:
+          `PID ${info.pid} is no longer the ComfyUI process we identified (its creation time ` +
+          "changed), so the number has been reused by a different program and must not be killed",
+      };
+    }
+  }
+  return { ok: true };
+}
+
 function resolveLiveProcessCwd(pid: number): string | undefined {
   if (liveCwdResolverOverride) return liveCwdResolverOverride(pid);
   if (!pid || IS_WIN) return undefined;
@@ -1136,7 +1266,11 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
   // Same live-only window for the ENVIRONMENT (#776): read it now, while the pid
   // is guaranteed alive, so a relaunch can reproduce the launcher environment the
   // server was actually started with instead of substituting the orchestrator's.
-  const liveEnv = desktop ? undefined : resolveLiveProcessEnv(pid);
+  // The pid's IDENTITY (creation time), taken at the same moment as the pid itself
+  // so everything downstream can prove the number still denotes THIS process.
+  const startedAt = desktop ? undefined : resolveProcessIdentity(pid)?.startedAt;
+  // Bound to that identity - never adopted from a pid we cannot still prove.
+  const liveEnv = desktop ? undefined : captureVerifiedLiveEnv(pid, startedAt);
 
   return {
     pid,
@@ -1146,6 +1280,7 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
     desktopExePath: desktopExe,
     liveCwd,
     liveEnv,
+    startedAt,
   };
 }
 
@@ -1185,6 +1320,22 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
       message:
         acquireDiagnostic ??
         `No ComfyUI process found on port ${config.resolvedPort}. Is ComfyUI running?`,
+      has_restart_info: false,
+    };
+  }
+
+  // LAST-MOMENT IDENTITY CHECK: the pid was resolved before the relaunch preflight
+  // ran, and a pid is not a process identity. If the server exited in that window
+  // and the OS recycled the number, killing it would destroy an unrelated program.
+  // Refuse instead - nothing has been touched yet, so this costs a restart, never
+  // the server.
+  const identity = processIdentityStillValid(info);
+  if (!identity.ok) {
+    return {
+      stopped: false,
+      message:
+        `Refusing to stop: ${identity.reason}. Nothing was killed. ` +
+        "Re-run once ComfyUI is running again (or start it with start_comfyui).",
       has_restart_info: false,
     };
   }
@@ -1354,7 +1505,9 @@ export async function startComfyUI(): Promise<StartResult> {
         launchEnvWarning(info),
       auto_restart: supervisorResult(info),
       launch_env: env,
-      listener_is_launched_process: false,
+      // Nothing is serving the port, so there is no listener to attribute — the
+      // down state is already carried by started:false / ready:false.
+      listener_ownership: "unconfirmed",
     };
   }
 
@@ -1369,24 +1522,26 @@ export async function startComfyUI(): Promise<StartResult> {
   //     shape), which is precisely the "an external supervisor restored the API"
   //     case that must never be reported as our successful restart (codex gate).
   //   • Otherwise it needs both pids. An unmappable port owner (a real, supported
-  //     condition on some hosts — #449) stays `undefined`: we assert NEITHER way.
+  //     condition on some hosts — #449) is "unconfirmed": we assert NEITHER way.
   //     It deliberately does NOT become a failure — the child we launched is still
   //     alive and the API is ready, so denying it would report every ordinary
   //     restart as failed on any host where the port-owner lookup is unavailable,
   //     which is a far worse (and far more common) lie than an unconfirmed
-  //     success. The undecidability is stated in the message AND in
-  //     `listener_is_launched_process`, so no caller has to infer it.
+  //     success. That uncertainty is carried by an EXPLICIT string state, so it
+  //     survives JSON serialization instead of vanishing with an `undefined`.
   const ourPid = launched.child.pid;
-  const listenerIsOurs = info.isDesktopApp
-    ? undefined
+  const ownership: ListenerOwnership = info.isDesktopApp
+    ? "unconfirmed"
     : launchedChildExit
-      ? false
+      ? "not-ours"
       : ourPid == null || newPid == null
-        ? undefined
-        : newPid === ourPid;
+        ? "unconfirmed"
+        : newPid === ourPid
+          ? "ours"
+          : "not-ours";
   // Only the NON-Desktop undecidable case is worth calling out: for a Desktop
   // launcher the pid relationship is indirect by design, not a gap in evidence.
-  const ownershipUnconfirmed = !info.isDesktopApp && listenerIsOurs === undefined;
+  const ownershipUnconfirmed = !info.isDesktopApp && ownership === "unconfirmed";
   return {
     // `started` means "THIS call started the server". When the healthy listener is
     // provably NOT the process we launched, we did not start it — programmatic
@@ -1394,18 +1549,18 @@ export async function startComfyUI(): Promise<StartResult> {
     // answers (codex gate). `ready` stays TRUE because the server genuinely IS
     // ready: claiming otherwise would be its own lie and would push callers into
     // needless recovery.
-    started: listenerIsOurs !== false,
+    started: ownership !== "not-ours",
     ready: true,
     readiness,
     message:
-      `ComfyUI ${listenerIsOurs === false ? "is ready" : "started"} on port ${port}${newPid ? ` (PID ${newPid})` : ""}` +
+      `ComfyUI ${ownership === "not-ours" ? "is ready" : "started"} on port ${port}${newPid ? ` (PID ${newPid})` : ""}` +
       // Say WHICH environment it came back in whenever that was not simply ours
       // (#776) — the user needs to know a launcher environment was restored.
       (env && env.source !== "inherited" ? ` — ${env.note}.` : "") +
       // NEVER imply our relaunch is the healthy server when the port is owned by
       // a DIFFERENT process (codex gate): an external launcher/supervisor can bind
       // the port while our child fails, and readiness alone cannot tell them apart.
-      (listenerIsOurs === false
+      (ownership === "not-ours"
         ? ` NOTE: the healthy server on port ${port}${newPid ? ` (PID ${newPid})` : ""} is NOT the process this call launched (PID ${
             ourPid ?? "unknown"
           }${launchedChildExit ? `, which exited: ${exitCause(launchedChildExit)}` : ""}) — another launcher or supervisor owns it, so this server was not started by us.`
@@ -1419,7 +1574,7 @@ export async function startComfyUI(): Promise<StartResult> {
     pid: newPid ?? undefined,
     auto_restart: supervisorResult(info),
     launch_env: env,
-    listener_is_launched_process: listenerIsOurs,
+    listener_ownership: ownership,
   };
 }
 
@@ -1774,7 +1929,7 @@ export async function restartComfyUI(): Promise<RestartResult> {
       auto_restart: startResult.auto_restart,
       spawn_error: startResult.spawn_error,
       launch_env: startResult.launch_env,
-      listener_is_launched_process: startResult.listener_is_launched_process,
+      listener_ownership: startResult.listener_ownership,
     };
   }
 
@@ -1793,7 +1948,7 @@ export async function restartComfyUI(): Promise<RestartResult> {
     message: `ComfyUI restarted successfully. ${startResult.message}`,
     auto_restart: startResult.auto_restart,
     launch_env: startResult.launch_env,
-    listener_is_launched_process: startResult.listener_is_launched_process,
+    listener_ownership: startResult.listener_ownership,
   };
 }
 
@@ -1911,7 +2066,16 @@ export const __processControlTestHooks = {
     remoteRebootTimingOverride = null;
     liveCwdResolverOverride = null;
     liveEnvResolverOverride = null;
+    processIdentityOverride = null;
     restartDispatchRecords.clear();
+  },
+  /** Inject a fake process-identity (creation time) reader so tests can drive
+   *  recycled-PID scenarios on any host, including where the native read is
+   *  deliberately skipped. */
+  setProcessIdentityResolver(
+    fn: ((pid: number) => { startedAt?: string } | undefined) | null,
+  ): void {
+    processIdentityOverride = fn;
   },
   /** Inject a fake live-process-ENVIRONMENT reader (#776) so tests can drive the
    *  `/proc/<pid>/environ` capture without a real process. */

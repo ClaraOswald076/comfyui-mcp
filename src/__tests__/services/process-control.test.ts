@@ -370,7 +370,11 @@ describe("process-control crash supervision", () => {
     mockExecSync.mockImplementation((cmd: string) => {
       if (cmd.includes("netstat") || cmd.includes("lsof")) {
         portCheckCalls += 1;
-        if (portCheckCalls === 3) {
+        // Call 3 is stop_comfyui's port→PID lookup; call 4 is the pre-kill
+        // identity re-check (#776) confirming that PID still owns the port — a
+        // process that vanished in between must NOT be killed. Calls 5+ model the
+        // port freeing after the kill so waitForPortFree returns immediately.
+        if (portCheckCalls === 3 || portCheckCalls === 4) {
           if (cmd.includes("netstat"))
             return "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
           // `lsof -nP -iTCP:PORT -sTCP:LISTEN -Fpn` field output: p<pid> / n<addr:port>.
