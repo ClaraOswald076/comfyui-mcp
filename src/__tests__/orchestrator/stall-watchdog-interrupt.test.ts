@@ -17,6 +17,9 @@
 // genuine turn end. ONE report per turn, both directions: a stall after an
 // `error` event already painted the failure line suppresses the stall warning,
 // and a late `error` event after the stall warning suppresses the error line.
+// And when the fallback abandons a turn (force-release with no result), the dead
+// turn's straggler `error`/`result` are dead-lettered — never painted against,
+// and never completing the gate of, the turn that replaces it (r2).
 //
 // TURN_IDLE_MS / INTERRUPT_RELEASE_FALLBACK_MS are read from the env at
 // panel-agent module load, so set SHORT windows BEFORE importing the module.
@@ -64,9 +67,6 @@ class HeldResultBackend implements AgentBackend {
    *  the test alone decides when (if ever) the interrupted result lands. Set to
    *  true right before agent.stop() so teardown's interrupt unwinds the pump. */
   releaseOnInterrupt = false;
-  /** One resolver per in-flight turn, FIFO — resolved by `releaseTurn()` to emit
-   *  that turn's interrupted `result`. */
-  private releaseResolvers: Array<() => void> = [];
   private startedCount = 0;
   private startedWaiters: Array<{ n: number; resolve: () => void }> = [];
 
@@ -100,9 +100,11 @@ class HeldResultBackend implements AgentBackend {
     });
   }
 
-  /** Release the OLDEST held turn so its interrupted `result` is emitted. */
-  releaseTurn(): void {
-    this.releaseResolvers.shift()?.();
+  /** Release the OLDEST held turn, emitting `ev` as its terminal event (default:
+   *  the interrupt landing). Turn 2+ can thus end with a SUCCESS result while the
+   *  stalled turn's straggler is the interrupted one. */
+  releaseTurn(ev: AgentEvent = { type: "result", ok: false, subtype: "interrupted" }): void {
+    this.releaseResolvers.shift()?.(ev);
   }
 
   /** Emit an `error` event for the in-flight turn (test-controlled) — the way
@@ -113,6 +115,9 @@ class HeldResultBackend implements AgentBackend {
   }
 
   private emitFn: ((ev: AgentEvent) => void) | null = null;
+  /** One resolver per in-flight turn, FIFO — resolved by `releaseTurn()` with the
+   *  terminal event to emit for that turn. */
+  private releaseResolvers: Array<(ev: AgentEvent) => void> = [];
 
   async *run(opts: BackendStartOptions): AsyncGenerator<AgentEvent> {
     const out: AgentEvent[] = [];
@@ -144,11 +149,12 @@ class HeldResultBackend implements AgentBackend {
         // DECOUPLED read-ahead: begin reading the NEXT turn now (parks at the
         // turn gate while this turn is held) — mirrors the SDK input pump.
         const readAhead = read();
-        // SILENCE: no events for this turn until the test releases its result.
-        await new Promise<void>((resolve) => {
+        // SILENCE: no events for this turn until the test releases its terminal
+        // event (an interrupted result, or whatever releaseTurn was given).
+        const terminal = await new Promise<AgentEvent>((resolve) => {
           this.releaseResolvers.push(resolve);
         });
-        emit({ type: "result", ok: false, subtype: "interrupted" });
+        emit(terminal);
         r = await readAhead;
       }
       inputDone = true;
@@ -181,7 +187,7 @@ class HeldResultBackend implements AgentBackend {
     if (!this.releaseOnInterrupt) return;
     const held = this.releaseResolvers;
     this.releaseResolvers = [];
-    for (const r of held) r();
+    for (const r of held) r({ type: "result", ok: false, subtype: "interrupted" });
   }
 
   async listModels(): Promise<ModelChoice[]> {
@@ -352,6 +358,56 @@ describe("stall watchdog interrupt reports once and holds the turn gate (#728)",
     await agent.stop();
 
     // Exactly ONE report — the stall warning; the late error line is suppressed.
+    const warnings = says.filter((s) => s.includes("⚠️"));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/stopped responding/i);
+    expect(says.join("\n")).not.toMatch(/turn failed/i);
+  });
+
+  it("fallback release + new dispatch → the dead turn's straggler error/result are dead-lettered", async () => {
+    // The r2 codex-gate finding on PR #746: after the bounded fallback force-opens
+    // the gate, the ABANDONED turn may still emit. Its straggler `error` must not
+    // paint against the NEW turn (whose dispatch reset errorSurfaced), and its
+    // straggler `result` must not complete the NEW turn's gate early — the new
+    // turn completes on its OWN result.
+    const says: string[] = [];
+    const backend = new HeldResultBackend();
+    const agent = new PanelAgent("tab-728e", makeDeps(says) as never, backend);
+    void agent.start();
+
+    agent.send("first message");
+    await backend.waitStarted(1);
+    agent.send("second message");
+
+    // Watchdog trips; the interrupted result NEVER arrives, so the bounded
+    // fallback abandons turn 1 and opens the gate → turn 2 dispatches.
+    await waitFor(() => tripped(backend, says));
+    await backend.waitStarted(2);
+    expect(backend.turns).toEqual(["first message", "second message"]);
+
+    // A third message queues behind turn 2's gate.
+    agent.send("third message");
+
+    // Straggler #1: the DEAD turn's late error — dead-lettered, never painted.
+    backend.emitError("late old-turn error");
+    await new Promise((r) => setTimeout(r, 100));
+    expect(says.filter((s) => s.includes("⚠️"))).toHaveLength(1); // still only the stall warning
+
+    // Straggler #2: the DEAD turn's late result — dead-lettered; it must NOT
+    // complete turn 2's gate, so turn 3 stays parked.
+    backend.releaseTurn(); // FIFO: turn 1's withheld terminal (interrupted)
+    await new Promise((r) => setTimeout(r, GATE_HELD_MS));
+    expect(backend.turns).toEqual(["first message", "second message"]);
+
+    // Turn 2's OWN result (success) completes turn 2 → turn 3 drains.
+    backend.releaseTurn({ type: "result", ok: true, subtype: "success" });
+    await backend.waitStarted(3);
+    expect(backend.turns[2]).toContain("third message");
+
+    backend.releaseOnInterrupt = true; // let stop()'s interrupt unwind the pump
+    await agent.stop();
+
+    // Exactly ONE report overall: the original stall warning.
     const warnings = says.filter((s) => s.includes("⚠️"));
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toMatch(/stopped responding/i);
