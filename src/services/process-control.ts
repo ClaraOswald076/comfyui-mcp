@@ -482,17 +482,20 @@ function launchEnvInfo(info?: ProcessInfo): LaunchEnvInfo | undefined {
  * itself failed (the #776 shape — ComfyUI aborting during import), not that it is
  * merely slow.
  */
+function exitCause(exit: {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+}): string {
+  if (exit.signal != null) return `killed by ${exit.signal}`;
+  if (exit.code != null) return `exit code ${exit.code}`;
+  return "for an unknown reason";
+}
+
 function describeLaunchedChildExit(
   exit: { code: number | null; signal: NodeJS.Signals | null } | undefined,
 ): string {
   if (!exit) return "";
-  const how =
-    exit.signal != null
-      ? `killed by ${exit.signal}`
-      : exit.code != null
-        ? `exit code ${exit.code}`
-        : "for an unknown reason";
-  return ` The process this call launched EXITED (${how}) before the API came up, so ComfyUI is DOWN — this was a failed relaunch, not a slow start.`;
+  return ` The process this call launched EXITED (${exitCause(exit)}) before the API came up, so ComfyUI is DOWN — this was a failed relaunch, not a slow start.`;
 }
 
 /**
@@ -1357,12 +1360,24 @@ export async function startComfyUI(): Promise<StartResult> {
 
   const newPid = findPidByPort(port);
   const env = launchEnvInfo(info);
-  // Is the healthy listener actually OURS? Only decidable when we know both PIDs;
-  // an unmappable port owner (the #449 shape) stays `undefined` rather than
-  // asserting either way.
+  // Is the healthy listener actually OURS?
+  //   • A Desktop launch is UNDECIDABLE by design: we spawn the Electron shell (or
+  //     macOS `open`), and the process that binds the port is its child, so a pid
+  //     mismatch there proves nothing.
+  //   • A launched child that has ALREADY EXITED cannot be the healthy listener —
+  //     that is decisive even when the port owner cannot be mapped at all (the #449
+  //     shape), which is precisely the "an external supervisor restored the API"
+  //     case that must never be reported as our successful restart (codex gate).
+  //   • Otherwise it needs both pids; an unmappable port owner stays `undefined`
+  //     rather than asserting either way.
   const ourPid = launched.child.pid;
-  const listenerIsOurs =
-    ourPid == null || newPid == null ? undefined : newPid === ourPid;
+  const listenerIsOurs = info.isDesktopApp
+    ? undefined
+    : launchedChildExit
+      ? false
+      : ourPid == null || newPid == null
+        ? undefined
+        : newPid === ourPid;
   return {
     started: true,
     ready: true,
@@ -1376,9 +1391,9 @@ export async function startComfyUI(): Promise<StartResult> {
       // a DIFFERENT process (codex gate): an external launcher/supervisor can bind
       // the port while our child fails, and readiness alone cannot tell them apart.
       (listenerIsOurs === false
-        ? ` NOTE: the process serving port ${port} (PID ${newPid}) is NOT the one this call launched (PID ${ourPid}${
-            launchedChildExit ? ", which has since exited" : ""
-          }) — another launcher or supervisor owns it, so this server was not started by us.`
+        ? ` NOTE: the healthy server on port ${port}${newPid ? ` (PID ${newPid})` : ""} is NOT the process this call launched (PID ${
+            ourPid ?? "unknown"
+          }${launchedChildExit ? `, which exited: ${exitCause(launchedChildExit)}` : ""}) — another launcher or supervisor owns it, so this server was not started by us.`
         : "") +
       launchEnvWarning(info),
     pid: newPid ?? undefined,

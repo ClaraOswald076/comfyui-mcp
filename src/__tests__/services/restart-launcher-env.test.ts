@@ -558,6 +558,48 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
     killSpy.mockRestore();
   });
 
+  it("does NOT claim success when our child died and the replacement listener's PID cannot even be mapped", async () => {
+    // The #449 shape: a healthy API but an unmappable port owner. A DEAD launched
+    // child is decisive on its own — it cannot be the process now answering — so
+    // "undecidable PID" must not launder a failed relaunch into a success.
+    usePlainInstall();
+    const children = spawnCapturingChildren(999);
+    let killed = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill|pkill|\bkill\b/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      // After the kill the port owner is never mappable again.
+      if (/netstat/i.test(cmd)) {
+        return killed ? "" : "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed) throw new Error("not listening");
+        return "p4321\nn127.0.0.1:8188\n";
+      }
+      return "";
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        // Our child is gone, yet something healthy answers on the port.
+        children[0]?.emit("exit", 1, null);
+        return { ok: true } as Response;
+      }),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.listener_is_launched_process).toBe(false);
+    expect(result.message).not.toMatch(/restarted successfully/i);
+    expect(result.message).toMatch(/NOT as a result of this restart/i);
+    expect(result.message).toMatch(/which exited: exit code 1/);
+
+    killSpy.mockRestore();
+  });
+
   it("names the launched process's EXIT when it dies before the API comes up", async () => {
     usePlainInstall();
     mockLivePortThenFree();
