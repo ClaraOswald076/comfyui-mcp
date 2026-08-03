@@ -93,6 +93,8 @@ import {
   resolveComfyuiPython,
   resolveInstallInterpreter,
   resolveLiveComfyUIBase,
+  resolveLiveServerRoot,
+  resetLiveServerRootCache,
   resolveRootInterpreter,
 } from "../../services/workspace-env.js";
 
@@ -109,6 +111,7 @@ beforeEach(() => {
   mockGetSystemStats.mockReset();
   setExecFileResponder(() => new Error("not configured"));
   resetWorkspaceConfig();
+  resetLiveServerRootCache();
   delete process.env.COMFYUI_PATH;
 });
 
@@ -1225,6 +1228,137 @@ describe("resolveComfyuiPython live-first (#401 / #433)", () => {
       // is NOT probed — it is not the remote server's.
       expect(res.python).not.toBe(exeB);
       expect(res.python).toBe(IS_WIN ? "python.exe" : "python3");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveLiveServerRoot (#369) — the ONE notion of "the live server's install
+// root". The bug it exists to end: ComfyUI Desktop and the Windows portable
+// bundle both report a RELATIVE `main.py` with no cwd, argv resolution returns
+// nothing, and the download destination silently fell through to COMFYUI_PATH —
+// a DIFFERENT install the running server never reads from.
+// ---------------------------------------------------------------------------
+describe("resolveLiveServerRoot (#369)", () => {
+  /** Portable Windows bundle: <root>/python_embeded/python.exe + <root>/ComfyUI/main.py */
+  async function makePortableBundle(
+    base: string,
+  ): Promise<{ python: string; serverRoot: string }> {
+    const embedded = join(base, "python_embeded");
+    await mkdir(embedded, { recursive: true });
+    const python = join(embedded, IS_WIN ? "python.exe" : "python3");
+    await writeFile(python, "", "utf-8");
+    const serverRoot = join(base, "ComfyUI");
+    await mkdir(serverRoot, { recursive: true });
+    await writeFile(join(serverRoot, "main.py"), "", "utf-8");
+    return { python, serverRoot };
+  }
+
+  it("resolves from argv when the script path is absolute", async () => {
+    const dir = await tmpDir();
+    try {
+      const res = resolveLiveServerRoot([join(dir, "main.py"), "--listen"]);
+      expect(res.source).toBe("argv");
+      expect(res.root).toBe(dir);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("anchors a RELATIVE main.py on the interpreter the OS observes — live wins over a stale COMFYUI_PATH", async () => {
+    const dir = await tmpDir();
+    try {
+      // Two installs, exactly as in the reopened report: the portable bundle is
+      // LIVE, and COMFYUI_PATH points at an unrelated second checkout.
+      const live = join(dir, "ComfyUI_windows_portable2");
+      const stale = join(dir, "Documents", "ComfyUI");
+      await mkdir(stale, { recursive: true });
+      await writeFile(join(stale, "main.py"), "", "utf-8");
+      const { python, serverRoot } = await makePortableBundle(live);
+      mockConfig.comfyuiPath = stale;
+
+      const res = resolveLiveServerRoot(
+        ["ComfyUI\\main.py", "--windows-standalone-build"],
+        undefined,
+        { observedPython: python },
+      );
+      expect(res.source).toBe("observed-process");
+      expect(res.root).toBe(serverRoot);
+      expect(res.root).not.toBe(stale);
+      expect(res.relDir).toBe("ComfyUI");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("anchors a Desktop-style nested venv interpreter on its own server root", async () => {
+    const dir = await tmpDir();
+    try {
+      const serverRoot = join(dir, "ComfyUI");
+      await mkdir(serverRoot, { recursive: true });
+      await writeFile(join(serverRoot, "main.py"), "", "utf-8");
+      const python = await makeVenvPython(serverRoot);
+
+      const res = resolveLiveServerRoot([join("ComfyUI", "main.py")], undefined, {
+        observedPython: python,
+      });
+      expect(res.source).toBe("observed-process");
+      expect(res.root).toBe(serverRoot);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves a BARE main.py against the observed interpreter's own root", async () => {
+    const dir = await tmpDir();
+    try {
+      await writeFile(join(dir, "main.py"), "", "utf-8");
+      const python = await makeVenvPython(dir);
+      const res = resolveLiveServerRoot(["main.py"], undefined, { observedPython: python });
+      expect(res.source).toBe("observed-process");
+      expect(res.root).toBe(dir);
+      expect(res.relDir).toBe(".");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("stays UNRESOLVED when nothing observes the process — never a layout guess", () => {
+    h.mockLiveInterpreter.mockReturnValue(undefined);
+    const res = resolveLiveServerRoot(["ComfyUI\\main.py"]);
+    expect(res.source).toBe("unresolved");
+    expect(res.root).toBeUndefined();
+    expect(res.relDir).toBe("ComfyUI");
+  });
+
+  it("stays UNRESOLVED when the observed interpreter is not inside an install tree", async () => {
+    const dir = await tmpDir();
+    try {
+      // A system python with no ComfyUI anywhere above it.
+      const python = join(dir, IS_WIN ? "python.exe" : "python3");
+      await writeFile(python, "", "utf-8");
+      const res = resolveLiveServerRoot(["ComfyUI\\main.py"], undefined, {
+        observedPython: python,
+      });
+      expect(res.source).toBe("unresolved");
+      expect(res.observedPython).toBe(python);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("never probes the process table in REMOTE mode (its paths are on another host)", async () => {
+    const dir = await tmpDir();
+    try {
+      const { python } = await makePortableBundle(dir);
+      const res = resolveLiveServerRoot(["ComfyUI\\main.py"], undefined, {
+        observedPython: python,
+        remote: true,
+      });
+      expect(res.source).toBe("unresolved");
+      expect(res.root).toBeUndefined();
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

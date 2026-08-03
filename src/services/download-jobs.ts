@@ -21,6 +21,7 @@ import {
   downloadModel,
   resolveDownloadTarget,
   shouldDispatchDownloadToManager,
+  verifyLandedModel,
 } from "./model-resolver.js";
 import type { DownloadAuth } from "./download-auth.js";
 import type { ResumeDiagnostic } from "./download-resume-diag.js";
@@ -94,6 +95,17 @@ export interface DownloadJob {
    *  download outlives its tool call they have to survive somewhere the agent
    *  can still read them, or handing back a handle would silently drop them. */
   notes?: string[];
+  /**
+   * Post-landing verification against the LIVE server (#369). A local download is
+   * only honestly "done" if the bytes are on disk AND the connected ComfyUI reads
+   * from where they landed — reporting the INTENDED path is what let a 4.88 GB
+   * model be announced as a success from a stale install the server never read.
+   * "visible" = the server lists the file; "not-visible" = it does not (the file
+   * exists but is unusable there); "unknown" = it could not be checked.
+   */
+  live_visible?: "visible" | "not-visible" | "unknown";
+  /** Why, for anything other than a plain "visible". Surfaced verbatim. */
+  verify_note?: string;
   /** A persisted in-flight record missed its owner heartbeat. It stays visible
    *  because this is not proof the physical transfer stopped (#761). */
   staleInflight?: boolean;
@@ -556,6 +568,27 @@ export async function startDownloadJob(
       // dispatch has no local rename, so commit done here when it returns (dispatch
       // accepted — the viaManager flag marks it as unverified in the tools). Idempotent.
       commitDone(path);
+      // VERIFY, don't assume (#369). A LOCAL download is reported with the path we
+      // confirmed on disk, plus whether the connected ComfyUI actually reads from
+      // there. This runs INSIDE `settled`, so a small download that finishes within
+      // download_model's grace window is already verified when the tool answers.
+      // Never allowed to demote a completed download: verifyLandedModel never throws
+      // and the catch below keeps `done`.
+      if (!dispatchToManager && (job.status as DownloadJob["status"]) === "done") {
+        try {
+          const verdict = await verifyLandedModel(path, targetSubfolder);
+          if (verdict.verifiedPath) job.path = verdict.verifiedPath;
+          job.live_visible = verdict.liveVisible;
+          job.verify_note = verdict.note;
+        } catch (err) {
+          // Verification is a REPORT, never a gate: the bytes are on disk either
+          // way. Record that we could not confirm placement and carry on to the
+          // post-download hook — swallowing this must not skip onComplete.
+          job.live_visible = "unknown";
+          job.verify_note = `Placement could not be verified: ${err instanceof Error ? err.message : String(err)}`;
+        }
+        persistJobRecord(job);
+      }
       if (onComplete) {
         // Post-processing must not turn a landed file into a failed download —
         // the bytes are on disk either way, and reporting "error" here would
@@ -721,6 +754,8 @@ function persistJobRecord(job: DownloadJob): boolean {
     req_key: job.reqKey,
     via_manager: job.viaManager,
     resume: job.resume,
+    live_visible: job.live_visible,
+    verify_note: job.verify_note,
   });
 }
 
@@ -746,6 +781,8 @@ function jobFromPersisted(rec: PersistedDownloadJob): DownloadJob {
     reqKey: rec.req_key,
     viaManager: rec.via_manager,
     resume: rec.resume as ResumeDiagnostic | undefined,
+    live_visible: rec.live_visible,
+    verify_note: rec.verify_note,
     staleInflight: rec.staleInflight,
     staleForMs: rec.staleForMs,
   };

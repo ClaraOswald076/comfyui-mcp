@@ -2,6 +2,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const downloadModelMock = vi.fn();
 const listLocalModelsMock = vi.fn();
+/** #369 post-landing verification, controlled per test. Default: the honest
+ *  "could not check" verdict, echoing the path back. */
+const verifyLandedModelMock = vi.fn(async (targetPath: string) => ({
+  verifiedPath: targetPath,
+  liveVisible: "unknown" as string,
+  note: "no live server in this test",
+}));
 vi.mock("../../services/model-resolver.js", async () => {
   const actual = await vi.importActual<typeof import("../../services/model-resolver.js")>(
     "../../services/model-resolver.js",
@@ -19,6 +26,8 @@ vi.mock("../../services/model-resolver.js", async () => {
       const name = filename ?? String(url).split("/").pop() ?? "model.safetensors";
       return { targetDir: `/m/${sub}`, filename: name, targetPath: `/m/${sub}/${name}` };
     },
+    verifyLandedModel: (...a: unknown[]) =>
+      verifyLandedModelMock(...(a as [string, string])),
   };
 });
 
@@ -51,6 +60,12 @@ function makeServer() {
 beforeEach(() => {
   downloadModelMock.mockReset();
   listLocalModelsMock.mockReset();
+  verifyLandedModelMock.mockReset();
+  verifyLandedModelMock.mockImplementation(async (targetPath: string) => ({
+    verifiedPath: targetPath,
+    liveVisible: "unknown",
+    note: "no live server in this test",
+  }));
 });
 
 describe("download_model tool", () => {
@@ -83,9 +98,91 @@ describe("download_model tool", () => {
     );
     expect(res.isError).toBeFalsy();
   });
+
+  // -------------------------------------------------------------------------
+  // #369 — success is only ever claimed for a destination that was VERIFIED.
+  // -------------------------------------------------------------------------
+  it("reports the VERIFIED on-disk path when the connected ComfyUI lists the file", async () => {
+    downloadModelMock.mockResolvedValueOnce("/m/checkpoints/x.safetensors");
+    verifyLandedModelMock.mockResolvedValueOnce({
+      // A symlinked models tree: the real location is what must be reported.
+      verifiedPath: "/mnt/models/checkpoints/x.safetensors",
+      liveVisible: "visible",
+    });
+
+    const { downloadModel } = makeServer();
+    const res = await downloadModel({
+      url: "https://example.com/x.safetensors",
+      target_subfolder: "checkpoints",
+      filename: "x.safetensors",
+    });
+
+    const text = res.content[0].text;
+    expect(text).toContain("/mnt/models/checkpoints/x.safetensors");
+    expect(text).toContain("verified on disk");
+    expect(text).toContain("the connected ComfyUI lists it");
+  });
+
+  it("does NOT claim success when the landed file is invisible to the connected ComfyUI", async () => {
+    downloadModelMock.mockResolvedValueOnce("/stale/models/checkpoints/x.safetensors");
+    verifyLandedModelMock.mockResolvedValueOnce({
+      verifiedPath: "/stale/models/checkpoints/x.safetensors",
+      liveVisible: "not-visible",
+      note: "The file IS on disk but the connected ComfyUI does NOT list it.",
+    });
+
+    const { downloadModel } = makeServer();
+    const res = await downloadModel({
+      url: "https://example.com/x.safetensors",
+      target_subfolder: "checkpoints",
+      filename: "x.safetensors",
+    });
+
+    const text = res.content[0].text;
+    expect(text).not.toContain("downloaded successfully");
+    expect(text).toContain("NOT usable by the connected ComfyUI");
+    expect(text).toContain("The file IS on disk but the connected ComfyUI does NOT list it.");
+    expect(text).toContain("Do NOT tell the user the model is ready");
+  });
+
+  it("qualifies the result when placement could not be confirmed", async () => {
+    downloadModelMock.mockResolvedValueOnce("/m/checkpoints/x.safetensors");
+    const { downloadModel } = makeServer();
+    const res = await downloadModel({
+      url: "https://example.com/x.safetensors",
+      target_subfolder: "checkpoints",
+      filename: "x.safetensors",
+    });
+
+    const text = res.content[0].text;
+    expect(text).not.toContain("downloaded successfully");
+    expect(text).toContain("could NOT be confirmed");
+  });
 });
 
 describe("download_status tool", () => {
+  it("surfaces a landed-but-invisible download as a WARNING, not a bare 'landed at' (#369)", async () => {
+    downloadModelMock.mockResolvedValueOnce("/stale/models/checkpoints/x.safetensors");
+    verifyLandedModelMock.mockResolvedValueOnce({
+      verifiedPath: "/stale/models/checkpoints/x.safetensors",
+      liveVisible: "not-visible",
+      note: "the running server reads /live/ComfyUI/models instead",
+    });
+
+    const { downloadModel, downloadStatus } = makeServer();
+    await downloadModel({
+      url: "https://example.com/x.safetensors",
+      target_subfolder: "checkpoints",
+      filename: "x.safetensors",
+    });
+
+    const res = await downloadStatus({});
+    const text = res.content[0].text;
+    expect(text).toContain("landed at (verified on disk): /stale/models/checkpoints/x.safetensors");
+    expect(text).toContain("WARNING: NOT VISIBLE to the connected ComfyUI");
+    expect(text).toContain("the running server reads /live/ComfyUI/models instead");
+  });
+
   it("keeps a heartbeat-stale persisted transfer visible without prompting a concurrent reissue (#761)", async () => {
     const dir = await mkdtemp(join(tmpdir(), "model-management-status-"));
     setProgressDir(dir);

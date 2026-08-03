@@ -516,6 +516,13 @@ export interface PersistedDownloadJob {
    *  check can distinguish them. Absent on pre-fix records. */
   owner?: string;
   resume?: unknown;
+  /** Post-landing live-server verification (#369): whether the CONNECTED ComfyUI
+   *  actually lists the landed file, so a reconnecting session still sees the
+   *  "downloaded but invisible to the running server" warning instead of a bare
+   *  "done". Absent on pre-fix records. */
+  live_visible?: "visible" | "not-visible" | "unknown";
+  /** The verification explanation, surfaced verbatim by download_status. */
+  verify_note?: string;
   /** Epoch ms of this snapshot (set on write). */
   updated: number;
   /**

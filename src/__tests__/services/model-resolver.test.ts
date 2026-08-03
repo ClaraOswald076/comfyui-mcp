@@ -54,7 +54,12 @@ vi.mock("../../services/output-dir.js", () => ({
     modelsDir: "/comfy/models",
     baseDirs: [],
     snapshot: { reachable: false },
+    // Live-authoritative: these path-safety tests are about containment, not about
+    // the #369 stale-install check (which only runs for a locally-configured root).
+    source: "live-root" as const,
   })),
+  isLiveAuthoritativeModelsDir: (s: string) =>
+    s === "argv-flag" || s === "live-root" || s === "observed-root",
 }));
 
 // The symlink-escape guard consults registered extra_model_paths roots (#633).

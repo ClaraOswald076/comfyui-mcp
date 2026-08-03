@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { existsSync, type Stats } from "node:fs";
 import { readdir, stat, mkdir, readFile, lstat, realpath } from "node:fs/promises";
 import { dirname, join, basename, resolve, relative, sep, isAbsolute, extname } from "node:path";
-import { config, isRemoteMode } from "../config.js";
+import { config, getComfyUIBaseUrl, isRemoteMode } from "../config.js";
 import { getClient, getSystemStats } from "../comfyui/client.js";
 import { getExtraModelRoots, getLiveExtraModelRoots } from "./extra-paths.js";
 import { resolveEffectiveComfyUIBase, liveRootFromArgv } from "./workspace-env.js";
@@ -17,7 +17,9 @@ import {
   resolveModelsDirWithBases,
   parseModelsDirFromArgv,
   hasUnresolvableRelativeModelDirFlag,
+  isLiveAuthoritativeModelsDir,
   type LiveServerSnapshot,
+  type ModelsDirSource,
 } from "./output-dir.js";
 import {
   applyDownloadAuth,
@@ -581,6 +583,224 @@ export function resolveModelSubfolder(targetSubfolder: string): string {
   return targetDir;
 }
 
+// ---------------------------------------------------------------------------
+// Live-server visibility (#369): does the CONNECTED ComfyUI actually read here?
+// ---------------------------------------------------------------------------
+
+/**
+ * The file extensions ComfyUI core registers for its model folders
+ * (`folder_paths.supported_pt_extensions`). Deliberately EXCLUDES `.gguf` and
+ * other custom-node-registered types: this set is used to decide whether a
+ * candidate directory's contents SHOULD appear in the live server's listing, and
+ * over-including would turn "core doesn't list this type" into a false refusal.
+ */
+const CORE_MODEL_EXTENSIONS = new Set([
+  ".ckpt",
+  ".pt",
+  ".pt2",
+  ".bin",
+  ".pth",
+  ".safetensors",
+  ".sft",
+]);
+
+/** The models/ CATEGORY a target subfolder belongs to — its first path segment
+ *  (`"loras/sdxl"` → `"loras"`), which is the folder name ComfyUI's `/models/<cat>`
+ *  endpoint is keyed by. */
+function categoryOf(targetSubfolder: string): string {
+  return (targetSubfolder ?? "").trim().split(/[\\/]+/).filter(Boolean)[0] ?? "";
+}
+
+/**
+ * What the LIVE server reports for a model category via its own `/models/<cat>`
+ * endpoint — the SAME source of truth `list_local_models` reads, which is exactly
+ * why #369 was so confusing: the reader asked the server and the writer asked
+ * COMFYUI_PATH, and the two disagreed silently.
+ *
+ * Returns `undefined` (INCONCLUSIVE — never an empty array) when the server is
+ * unreachable, the endpoint is absent/errors, or the body is not a string array.
+ * Callers must treat inconclusive as "no evidence", never as "no files".
+ */
+export async function liveCategoryListing(
+  category: string,
+): Promise<string[] | undefined> {
+  if (!category) return undefined;
+  try {
+    const client = getClient();
+    const res = await client.fetchApi(`/models/${encodeURIComponent(category)}`);
+    if (!res.ok) return undefined;
+    const json = (await res.json()) as unknown;
+    if (!Array.isArray(json)) return undefined;
+    return json.filter((n): n is string => typeof n === "string");
+  } catch {
+    return undefined;
+  }
+}
+
+/** Model-extension basenames present under a category directory on disk. */
+async function coreModelFilesUnder(categoryDir: string): Promise<string[]> {
+  let entries: string[];
+  try {
+    entries = await readdir(categoryDir, { recursive: true });
+  } catch {
+    return [];
+  }
+  return entries
+    .filter((e) => CORE_MODEL_EXTENSIONS.has(extname(e).toLowerCase()))
+    .map((e) => basename(e));
+}
+
+/**
+ * REFUSE a destination the connected ComfyUI demonstrably does not read from.
+ *
+ * Runs ONLY when the models root came from LOCAL CONFIGURATION that the running
+ * server never vouched for (`configured-base` / `base-anchored`) — a live-resolved
+ * root is already authoritative and needs no second opinion. The test is a pure
+ * disagreement check against the server's own `/models/<category>` listing: if the
+ * candidate category directory holds core-extension model files and the live server
+ * lists NONE of them, that directory is not part of its search path. That is the
+ * #369 signature exactly (3 files on disk, 24 unrelated files in the live listing),
+ * and catching it BEFORE the transfer saves the user the multi-GB download that
+ * would otherwise be reported as a success and then be invisible.
+ *
+ * Fails OPEN on anything inconclusive (server unreachable, endpoint missing, empty
+ * candidate dir, any overlap at all) — this must never block a legitimate download
+ * into a fresh or shared models tree.
+ */
+async function assertDestinationVisibleToLiveServer(
+  modelsRoot: string,
+  targetSubfolder: string,
+  source: ModelsDirSource,
+  snapshot: LiveServerSnapshot,
+): Promise<void> {
+  if (isLiveAuthoritativeModelsDir(source)) return;
+  if (!snapshot.reachable || isRemoteMode()) return;
+  const category = categoryOf(targetSubfolder);
+  if (!category) return;
+  const listing = await liveCategoryListing(category);
+  if (listing === undefined) return; // inconclusive — no evidence either way
+  const onDisk = await coreModelFilesUnder(join(modelsRoot, category));
+  if (onDisk.length === 0) return; // nothing to compare — no evidence
+  const liveNames = new Set(listing.map((n) => basename(n)));
+  if (onDisk.some((n) => liveNames.has(n))) return; // agrees — same tree
+  throw new ModelError(
+    `Refusing to download into "${join(modelsRoot, category)}": the connected ComfyUI ` +
+      `(${getComfyUIBaseUrl()}) does not read from it. That directory already holds ` +
+      `${onDisk.length} model file(s) and the running server lists ${listing.length} for ` +
+      `"${category}" — with NONE in common, so it is a DIFFERENT install than the one ` +
+      "serving you. This destination came from local configuration (COMFYUI_PATH / the " +
+      "saved default workspace), not from the running server, which could not tell us its " +
+      "own install root. Point COMFYUI_PATH at the ComfyUI that is actually running, or " +
+      "launch it with an absolute --base-directory, then retry.",
+  );
+}
+
+export interface LandedModelVerification {
+  /** The path CONFIRMED to exist on disk after the download (symlinks resolved).
+   *  This — never the intended path — is what callers report. */
+  verifiedPath?: string;
+  /** Whether the CONNECTED ComfyUI actually lists the landed file. */
+  liveVisible: "visible" | "not-visible" | "unknown";
+  /** Why, for anything other than a plain "visible". */
+  note?: string;
+}
+
+/** How many times we re-ask the live server before concluding a landed file is
+ *  invisible to it. ComfyUI caches its folder listings and invalidates on the
+ *  directory mtime, so the first re-read normally already sees the new file; the
+ *  retries only cover a filesystem whose mtime lands a beat late. */
+const LIVE_VISIBILITY_ATTEMPTS = 3;
+const LIVE_VISIBILITY_RETRY_MS = 1000;
+
+/**
+ * Confirm, AFTER a download lands, that the bytes are (a) really on disk and
+ * (b) somewhere the LIVE server reads from — then report the path we actually
+ * confirmed. Reporting the INTENDED path is what made #369 a fabricated success:
+ * `download_status` said "done … landed at <stale install>" while the running
+ * ComfyUI could not see the file at all.
+ *
+ * Never throws: a completed transfer must not be turned into a failure by a
+ * verification hiccup. An inconclusive answer is reported as `unknown` with the
+ * reason, which callers surface instead of an unqualified success.
+ */
+export async function verifyLandedModel(
+  targetPath: string,
+  targetSubfolder: string,
+  opts?: { attempts?: number; retryMs?: number },
+): Promise<LandedModelVerification> {
+  let verifiedPath: string | undefined;
+  try {
+    const info = await stat(targetPath);
+    if (!info.isFile()) {
+      return {
+        liveVisible: "unknown",
+        note: `${targetPath} exists but is not a file.`,
+      };
+    }
+    try {
+      verifiedPath = resolve(await realpath(targetPath));
+    } catch {
+      verifiedPath = resolve(targetPath);
+    }
+  } catch {
+    return {
+      liveVisible: "unknown",
+      note: `The file could not be confirmed on disk at ${targetPath}.`,
+    };
+  }
+
+  if (isRemoteMode()) {
+    return {
+      verifiedPath,
+      liveVisible: "unknown",
+      note: "The connected ComfyUI is remote, so local on-disk placement cannot be checked against it.",
+    };
+  }
+
+  const category = categoryOf(targetSubfolder);
+  const wanted = basename(targetPath);
+  const attempts = opts?.attempts ?? LIVE_VISIBILITY_ATTEMPTS;
+  const retryMs = opts?.retryMs ?? LIVE_VISIBILITY_RETRY_MS;
+  let sawListing = false;
+  for (let i = 0; i < attempts; i++) {
+    const listing = await liveCategoryListing(category);
+    if (listing !== undefined) {
+      sawListing = true;
+      if (listing.some((n) => basename(n) === wanted)) {
+        return { verifiedPath, liveVisible: "visible" };
+      }
+    }
+    if (i < attempts - 1 && retryMs > 0) {
+      await new Promise((r) => setTimeout(r, retryMs));
+    }
+  }
+  if (!sawListing) {
+    return {
+      verifiedPath,
+      liveVisible: "unknown",
+      note:
+        `The connected ComfyUI (${getComfyUIBaseUrl()}) did not answer for the ` +
+        `"${category}" model folder, so it could not be confirmed that it reads from this location.`,
+    };
+  }
+  let liveModelsDir: string | undefined;
+  try {
+    liveModelsDir = await resolveModelsDir();
+  } catch {
+    liveModelsDir = undefined;
+  }
+  return {
+    verifiedPath,
+    liveVisible: "not-visible",
+    note:
+      `The file IS on disk at ${verifiedPath}, but the connected ComfyUI ` +
+      `(${getComfyUIBaseUrl()}) does NOT list "${wanted}" under "${category}" — it will not be ` +
+      `usable in a workflow from there.` +
+      (liveModelsDir ? ` The models directory that server reads is ${liveModelsDir}.` : "") +
+      " Move the file into the running server's models tree (or point COMFYUI_PATH at that install and re-download).",
+  };
+}
+
 /**
  * Like resolveModelSubfolder, but roots the destination at the CONNECTED
  * server's real models directory (its `--base-directory`/models, read from
@@ -607,12 +827,18 @@ export async function resolveModelSubfolderPreferServer(
   // code-root veto needs, AND the snapshot the escape-authorizer uses — so they can
   // never disagree (a second stats call could straddle a server restart and combine
   // model roots from server B with code bases from server A; #633 codex).
-  const { modelsDir, baseDirs, snapshot } = await resolveModelsDirWithBases();
+  const { modelsDir, baseDirs, snapshot, source } = await resolveModelsDirWithBases();
   const modelsRoot = resolve(modelsDir);
   const targetDir = resolve(modelsRoot, raw);
   if (targetDir !== modelsRoot && !targetDir.startsWith(modelsRoot + sep)) {
     throw new ModelError(`Refusing to write outside the models directory: ${raw}`);
   }
+  // The root did NOT come from the running server (it could not tell us where it
+  // lives, so we fell back to local config). Before writing, check the one thing
+  // that can still expose a stale-install destination: the server's own listing for
+  // this category. #369 shipped 4.88 GB into a directory the live ComfyUI had never
+  // heard of; refusing here costs nothing and saves the transfer.
+  await assertDestinationVisibleToLiveServer(modelsRoot, raw, source, snapshot);
   // Path-string containment (above) is not enough: an EXISTING symlink somewhere
   // between modelsRoot and targetDir could redirect the real write OUTSIDE the
   // models dir. Because THIS resolver is the single canonical write-target for

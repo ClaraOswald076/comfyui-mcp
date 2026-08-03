@@ -94,6 +94,14 @@ vi.mock("../../services/model-resolver.js", () => ({
     const base = String(url).split("/").pop() || "model.safetensors";
     return { targetDir: `/M/${s}`, filename: base, targetPath: `/M/${s}/${base}` };
   }),
+  // #369 post-landing verification. These tests have no filesystem/server, so the
+  // stub reports the honest "could not check" verdict and echoes the path back —
+  // the real verification semantics live in model-resolver.test.ts.
+  verifyLandedModel: vi.fn(async (targetPath: string) => ({
+    verifiedPath: targetPath,
+    liveVisible: "unknown" as const,
+    note: "no live server in this test",
+  })),
 }));
 
 import {

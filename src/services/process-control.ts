@@ -20,6 +20,7 @@ import {
   resolveEffectiveComfyUIBase,
   markLocalComfyUILaunched,
   resetLocalComfyUILaunchState,
+  resetLiveServerRootCache,
 } from "./workspace-env.js";
 
 // ---------------------------------------------------------------------------
@@ -484,6 +485,9 @@ function adoptLaunchedChild(child: ChildProcess): void {
     // Same fail-closed reasoning for the recorded interpreter: once our child is
     // gone, a successor on that port may run a DIFFERENT python (#401).
     clearLaunchedInterpreter();
+    // …and the brief process-table observation that derives the live INSTALL ROOT
+    // from it (#369): a successor may serve a different install entirely.
+    resetLiveServerRootCache();
   };
   child.once("exit", clearIfCurrent);
   child.once("error", clearIfCurrent);
@@ -1004,6 +1008,9 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
   recordedLaunchChild = undefined;
   resetLocalComfyUILaunchState();
   clearLaunchedInterpreter();
+  // The observed live INSTALL ROOT was derived from that process; a successor on
+  // this port may be a different install, so drop it with the record (#369).
+  resetLiveServerRootCache();
 
   // Gather info before we kill it (or reuse the caller's pre-validated info so a
   // relaunch preflight in restartComfyUI is not discarded).

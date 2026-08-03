@@ -159,7 +159,19 @@ export function registerModelManagementTools(server: McpServer): void {
           const text = job.viaManager
             ? `Download DISPATCHED to the remote ComfyUI via ComfyUI-Manager (server-side fetch):\n${job.path}\n\n` +
               `NOTE: the dispatch was ACCEPTED, NOT verified as landed — ComfyUI-Manager reports its queue task 'done' even on failure, so this does not guarantee the file is present. Confirm with list_local_models before relying on it.`
-            : `Model downloaded successfully to:\n${job.path}`;
+            : job.live_visible === "not-visible"
+              ? // NOT a success. The bytes are on disk but the running ComfyUI does not
+                // read from there, so calling this "downloaded successfully" is the exact
+                // fabricate-success failure of #369.
+                `Download finished, but the model is NOT usable by the connected ComfyUI.\n\n` +
+                `Verified on disk at:\n${job.path}\n\n` +
+                `${job.verify_note}\n\n` +
+                `Do NOT tell the user the model is ready — it is not visible to the server that would load it.`
+              : job.live_visible === "unknown"
+                ? `Model downloaded to (verified on disk):\n${job.path}\n\n` +
+                  `NOTE: it could NOT be confirmed that the connected ComfyUI reads from this location. ${job.verify_note ?? ""}`.trim() +
+                  `\nCheck list_local_models before relying on it.`
+                : `Model downloaded successfully to (verified on disk, and the connected ComfyUI lists it):\n${job.path}`;
           return {
             content: [{ type: "text", text }],
           };
@@ -262,7 +274,16 @@ export function registerModelManagementTools(server: McpServer): void {
             j.status === "done"
               ? j.viaManager
                 ? `\n    dispatched to the remote ComfyUI via ComfyUI-Manager (server-side fetch): ${j.path}\n    NOTE: this means the dispatch was accepted, NOT that the file has verifiably landed — Manager reports its task done even on failure. Confirm with list_local_models.`
-                : `\n    landed at: ${j.path}`
+                : // A LOCAL download reports the path VERIFIED on disk, plus whether the
+                  // connected ComfyUI actually reads from there (#369). "landed at" alone
+                  // is what made a wrong-destination download look like a success.
+                  j.live_visible === "not-visible"
+                  ? `\n    landed at (verified on disk): ${j.path}\n    WARNING: NOT VISIBLE to the connected ComfyUI — ${j.verify_note}`
+                  : j.live_visible === "unknown"
+                    ? `\n    landed at (verified on disk): ${j.path}\n    NOTE: visibility to the connected ComfyUI is UNCONFIRMED${j.verify_note ? ` — ${j.verify_note}` : ""}`
+                    : j.live_visible === "visible"
+                      ? `\n    landed at (verified on disk, and listed by the connected ComfyUI): ${j.path}`
+                      : `\n    landed at: ${j.path}`
               : j.status === "error"
                 ? `\n    failed: ${j.error}`
                 : j.status === "cancelled"

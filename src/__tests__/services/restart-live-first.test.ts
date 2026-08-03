@@ -90,6 +90,9 @@ vi.mock("../../services/workspace-env.js", () => ({
   // Launched-by-us env-trust flag (#633 P1b) — inert here; start/stop just toggle it.
   markLocalComfyUILaunched: vi.fn(),
   resetLocalComfyUILaunchState: vi.fn(),
+  // The brief process-table observation memo behind the live INSTALL ROOT (#369).
+  // process-control drops it whenever the server it describes goes away.
+  resetLiveServerRootCache: vi.fn(),
 }));
 
 import {
