@@ -17,7 +17,6 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
-  writeSync,
   appendFileSync,
 } from "node:fs";
 import { execFileSync } from "node:child_process";
@@ -2165,35 +2164,28 @@ export async function runPanelOrchestrator(): Promise<void> {
           `[panel-orchestrator] tab ${panelTab.slice(0, 8)} — exiting with ${runs.length} undelivered run completion(s), outcome UNDETERMINED: ${runs.join("; ")}`,
       )
       .join("\n");
-    // FILE FIRST. A synchronous write to a PIPE can block indefinitely if its
-    // reader has stalled — and blocking here blocks the event loop, so Node can't
-    // even dispatch the repeated SIGTERM that is supposed to force the exit: the
-    // process becomes unkillable through its handled signals. A regular file
-    // always makes progress, so it is the durable sink; the console sinks are
-    // tried only if it is unavailable (e.g. a very early fatal where `lockPath`
-    // doesn't exist yet). The async logger below adds console visibility without
-    // ever blocking.
-    const sinks: Array<() => void> = [
-      () => appendFileSync(`${lockPath}.lost-completions.log`, `${new Date().toISOString()} ${record}\n`),
-      () => writeSync(2, `${record}\n`),
-      () => writeSync(1, `${record}\n`),
-    ];
+    // A FILE is the ONLY synchronous sink. A sync write to a PIPE can block
+    // indefinitely when its reader has stalled, and blocking here blocks the
+    // event loop — so Node can never dispatch the repeated SIGTERM that is
+    // supposed to force the exit, and the process becomes unkillable through its
+    // handled signals. A regular file always makes progress.
+    //
+    // There is deliberately NO synchronous fallback. Ranking the two outcomes:
+    // an unkillable process is worse than a missing log line, and a stderr
+    // `writeSync` in the fallback would reintroduce exactly the hang the file
+    // sink exists to avoid. If the file write fails we accept losing the durable
+    // record and fall back to the async logger, which can never wedge the exit.
     let recorded = false;
-    for (const write of sinks) {
-      try {
-        write();
-        recorded = true;
-        break;
-      } catch {
-        /* try the next sink */
-      }
+    try {
+      appendFileSync(`${lockPath}.lost-completions.log`, `${new Date().toISOString()} ${record}\n`);
+      recorded = true;
+    } catch {
+      // No usable file (a very early fatal, a read-only dir) — console only.
     }
-    // Console visibility, always — non-blocking, so it can never wedge the exit.
-    // When the file sink took the record this is a convenience; when nothing did,
-    // it is the last chance.
+    // Console visibility, always, and always non-blocking.
     logger.error(record);
     if (!recorded) {
-      logger.error("[panel-orchestrator] …and no synchronous sink accepted that record (it may not survive)");
+      logger.error("[panel-orchestrator] …and no durable sink accepted that record (it may not survive)");
     }
     try {
       for (const [panelTab, runs] of byTab) {

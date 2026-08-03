@@ -585,6 +585,42 @@ describe("run completion across automatic goal continuation (#468)", () => {
     expect(journal.outstanding(tab)[0].carriedReleases ?? 0).toBe(0); // …unbounded
   });
 
+  it("a failed start never HOLDS a completion — it goes back to the journal", async () => {
+    // Held mail is unbounded and the journal's revocation only reaches a LIVE
+    // agent's queue, so a completion parked in held mail is a copy the journal
+    // can no longer cap: each failed-start/retry cycle would strand another
+    // batch, and the pile eventually drains into one turn. The journal is their
+    // record, so they are handed back instead — and the user's own message is
+    // still held.
+    const doomed: AgentBackend = {
+      id: "claude" as const,
+      capabilities: CLAUDE_CAPABILITIES,
+      async prepare() {
+        throw new Error("endpoint rejected the key (http 401)");
+      },
+      // eslint-disable-next-line require-yield
+      async *run(): AsyncGenerator<AgentEvent> {
+        throw new Error("never runs");
+      },
+      async interrupt() {},
+      async listModels() {
+        return [];
+      },
+    };
+    const { journal, manager, arrive } = makeHarness(doomed);
+    const tab = "tab-no-held-completions";
+
+    journal.openRun(PROMPT_A, { tabId: tab });
+    manager.send(tab, "keep me"); // a real user message
+    arrive(tab, { kind: "executed", prompt_id: PROMPT_A, images: [{ filename: "held.png" }] });
+    await waitFor(() => journal.pending(tab).length === 0); // taken by the doomed agent
+    await waitFor(() => manager.hasHeldMail(tab)); // …the USER message is held
+
+    // The completion came straight back to the journal, replayable and capped.
+    expect(journal.pending(tab)).toHaveLength(1);
+    expect(journal.outstanding(tab)).toHaveLength(1);
+  });
+
   it("a completion survives an agent whose self-restart loop GAVE UP", async () => {
     // The give-up branch of settle() only unmapped the agent — its still-unread
     // queue died with it, leaving the journal entry `handed_off`, a state
@@ -1393,22 +1429,34 @@ describe("run completion journal correlation (#468)", () => {
     expect(journal.outstanding("wf:dest")).toHaveLength(0);
   });
 
-  it("an identical ID-LESS completion re-sent while still journaled collapses onto one entry", () => {
-    // With no prompt id there is no run identity, so content is the only
-    // evidence of sameness. While BOTH copies are undelivered, collapsing them
-    // cannot lose news the agent already has — so a re-sent frame must not
-    // produce two turns.
+  it("an identical ID-LESS completion is NEVER merged — it gets its own entry, flagged", () => {
+    // For an id-less completion "a twin nobody has seen yet" is not
+    // establishable: there is no id, and ComfyUI reuses temp output names, so
+    // same-tab/same-content/both-pending is exactly the state two genuinely
+    // different renders present. Merging there would delete one of them. So the
+    // collapse is gone entirely — the last surviving suppression.
     const payload = { kind: "executed", images: [{ filename: "mystery_0001.png" }] };
     const first = journal.record("t", { ...payload });
-    expect(first).not.toBeNull();
-    expect(journal.record("t", { ...payload })).toBe(first);
-    expect(journal.pending("t")).toHaveLength(1);
+    expect(first.possibleRepeat).toBeUndefined(); // nothing preceded it
 
-    // A DIFFERENT id-less render is still its own entry.
-    expect(
-      journal.record("t", { kind: "executed", images: [{ filename: "other_0002.png" }] }),
-    ).not.toBeNull();
+    const second = journal.record("t", { ...payload });
+    expect(second.token).not.toBe(first.token); // its OWN entry
+    expect(second.possibleRepeat).toBe(true); // …flagged, so it isn't double-counted
     expect(journal.pending("t")).toHaveLength(2);
+
+    // Both reach the agent, and the second says so.
+    const seen: CompletionPayload[] = [];
+    journal.deliverPending("t", (p) => {
+      seen.push(p);
+      return true;
+    });
+    expect(seen).toHaveLength(2);
+    expect(seen[0].possible_repeat).toBeUndefined();
+    expect(seen[1].possible_repeat).toBe(true);
+
+    // A DIFFERENT id-less render is its own entry, and NOT flagged.
+    const other = journal.record("t", { kind: "executed", images: [{ filename: "other_0002.png" }] });
+    expect(other.possibleRepeat).toBeUndefined();
   });
 
   it("an ID-LESS twin is NEVER merged into an entry that is already handed off", () => {

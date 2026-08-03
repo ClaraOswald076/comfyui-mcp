@@ -2078,13 +2078,7 @@ export class PanelAgentManager {
         // agent's queue — including the one that triggered it. Capture them
         // (BEFORE stop(), which closes the agent) for re-delivery by the next
         // spawn on this key, so nothing dies silently with the doomed agent.
-        const orphaned = agent.takePending();
-        if (orphaned.length) {
-          this.heldMessages.set(key, [...(this.heldMessages.get(key) ?? []), ...orphaned]);
-          logger.warn(
-            `[panel-orchestrator] tab ${key.slice(0, 8)} holding ${orphaned.length} undelivered message(s) — re-delivered on the next successful start`,
-          );
-        }
+        this.holdOrphanedMail(key, agent.takePending(), "a failed start");
         // PER-TAB degradation (issue #250): a hard start failure is almost
         // always a tab-local configuration error — an invalid API key (the
         // endpoint 401s in prepare()), an unreachable base URL, a missing CLI
@@ -2112,13 +2106,7 @@ export class PanelAgentManager {
         // skips: no replay, ever. Capture the queue into held mail (its tokens
         // ride along, so a respawn re-delivers exactly once) and stop() the agent
         // so anything left over is handed back.
-        const orphaned = agent.takePending();
-        if (orphaned.length) {
-          this.heldMessages.set(key, [...(this.heldMessages.get(key) ?? []), ...orphaned]);
-          logger.warn(
-            `[panel-orchestrator] tab ${key.slice(0, 8)} holding ${orphaned.length} undelivered message(s) from an agent that gave up — re-delivered on the next successful start`,
-          );
-        }
+        this.holdOrphanedMail(key, agent.takePending(), "an agent that gave up");
         void agent.stop().catch(() => {});
         // Fatal signal: let the orchestrator self-exit + respawn.
         this.opts.onAgentFatal?.(key, "agent session kept dropping (self-restart gave up)");
@@ -2391,6 +2379,40 @@ export class PanelAgentManager {
    * must not count toward the journal's bounded replay cycle. Only a turn that
    * ran and ended is `carried`.
    */
+  /**
+   * Park a dead agent's unsent mail for the next spawn — but NEVER its injected
+   * completions (#468).
+   *
+   * Held mail is unbounded and the journal's revocation can only reach a LIVE
+   * agent's queue, so a completion parked here is a copy the journal can no
+   * longer count or cap: each failed-start/retry cycle would strand another
+   * capped batch in held mail, and the whole pile eventually drains into one
+   * turn. Completions are revocable by design and the JOURNAL is their record —
+   * so they are handed back instead, and replayed (bounded) into whatever agent
+   * comes next. Only the user's own messages are held.
+   */
+  private holdOrphanedMail(key: string, orphaned: QueueItem[], reason: string): void {
+    if (!orphaned.length) return;
+    const completions = orphaned.filter((it) => it.completionOnly);
+    const mail = orphaned.filter((it) => !it.completionOnly);
+    if (mail.length) {
+      this.heldMessages.set(key, [...(this.heldMessages.get(key) ?? []), ...mail]);
+      logger.warn(
+        `[panel-orchestrator] tab ${key.slice(0, 8)} holding ${mail.length} undelivered message(s) from ${reason} — re-delivered on the next successful start`,
+      );
+    }
+    const tokens = completions.flatMap((it) => it.eventTokens ?? []);
+    if (!tokens.length) return;
+    logger.warn(
+      `[panel-orchestrator] tab ${key.slice(0, 8)}: ${tokens.length} run completion(s) were queued on ${reason} — returned to the journal (never held) for bounded replay (#468)`,
+    );
+    try {
+      this.opts.onEventUndelivered?.(key, tokens);
+    } catch (err) {
+      logger.warn(`[panel-orchestrator] tab ${key.slice(0, 8)} returning orphaned completions: ${msgOf(err)}`);
+    }
+  }
+
   private detachHeldCompletions(key: string, reason: string): void {
     const held = this.heldMessages.get(key);
     if (!held?.length) return;

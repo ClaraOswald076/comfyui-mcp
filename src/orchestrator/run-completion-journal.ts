@@ -190,22 +190,12 @@ const MAX_DROPPED_KEYS = 64;
  *  so settling risks a duplicate, never a loss. */
 const MAX_CARRIED_RELEASES = 3;
 /**
- * ID-LESS completions have no run identity, so content is the only evidence of
- * sameness — and identical content is NOT proof: ComfyUI reuses temp output names
- * (`ComfyUI_temp_*_00001_`) after a restart, so two genuinely different renders
- * can look the same. The policy therefore splits by how much a mistake costs:
- *
- *  • STILL JOURNALED, UNDELIVERED, within IDLESS_COLLAPSE_MS — collapse onto the
- *    one entry. This is a transport-retry timescale, not a render timescale: two
- *    real renders finishing with byte-identical output lists AND both still
- *    undelivered inside 30s is not a case that occurs, while a panel re-sending a
- *    frame is. Collapsing here is what stops one output producing two turns.
- *  • ALREADY DELIVERED, within IDLESS_REPEAT_HINT_MS — do NOT suppress. Swallow
- *    the wrong one and a real render is silently lost, which is the failure this
- *    whole file exists to prevent. Deliver it FLAGGED as a possible repeat so the
- *    agent can decline to double-count it, and let the agent judge.
+ * How long an identical ID-LESS completion is still worth FLAGGING as a possible
+ * repeat. Content is the only evidence of sameness these have, and it is not
+ * proof — ComfyUI reuses temp output names (`ComfyUI_temp_*_00001_`) after a
+ * restart, so two genuinely different renders can look identical. Hence the flag
+ * is all it drives: nothing here ever merges or suppresses a completion.
  */
-const IDLESS_COLLAPSE_MS = 30_000;
 const IDLESS_REPEAT_HINT_MS = 10 * 60_000;
 
 /**
@@ -563,44 +553,33 @@ export class RunCompletionJournalImpl {
     } else {
       const print = idlessFingerprint(key, payload);
       const now = Date.now();
-      // COLLAPSE only onto a twin that is STILL PENDING — not yet handed to any
-      // agent. That is the whole safety argument: neither copy has reached
-      // anyone, so one delivery instead of two cannot lose news the agent
-      // already has. `handed_off` does NOT qualify: that copy is sitting unread
-      // in a busy agent's queue and will be acked when its turn ends, so merging
-      // a second real render into it would delete the second render outright —
-      // the exact silent swallow this design splits to avoid.
-      for (const entry of this.entries.values()) {
-        if (
-          entry.key === key &&
-          entry.state === "pending" &&
-          entry.correlation.status === "unidentified" &&
-          entry.fingerprint === print &&
-          now - entry.arrivedAt < IDLESS_COLLAPSE_MS
-        ) {
-          entry.payload = payload;
-          return entry;
-        }
-      }
-      // An identical twin that is already handed off (or delivered) falls
-      // through to a NEW entry below, flagged `possible_repeat` — never merged.
-      const twinInFlight = [...this.entries.values()].some(
+      // NEVER COLLAPSE AN ID-LESS COMPLETION.
+      //
+      // The collapse was the last surviving suppression, and it fails for the
+      // same reason all the others did — its premise is not establishable. For an
+      // identified run, "a twin nobody has seen yet" is a fact: same prompt id,
+      // same ticket generation. For an ID-LESS one there is no id, and ComfyUI
+      // reuses temp output names (this file says exactly that a few hundred lines
+      // up), so "same tab, same content, both pending, within 30s" is PRECISELY
+      // the state two genuinely different renders present. Merging there deletes
+      // one of them, silently.
+      //
+      // So every id-less completion gets its own entry. When an identical one is
+      // already journaled — in ANY state — or was delivered recently, the new one
+      // is FLAGGED `possible_repeat` and the agent decides. That is the same trade
+      // already accepted everywhere else: a duplicate turn beats a lost render,
+      // and a wording optimisation must never be load-bearing for correctness.
+      const twinJournaled = [...this.entries.values()].some(
         (e) =>
-          e.key === key &&
-          e.state === "handed_off" &&
-          e.correlation.status === "unidentified" &&
-          e.fingerprint === print,
+          e.key === key && e.correlation.status === "unidentified" && e.fingerprint === print,
       );
-      // Already DELIVERED an identical id-less completion recently. Deliberately
-      // NOT suppressed: identical content is not proof of identity, and swallowing
-      // a second real render is a silent loss. Deliver it flagged instead.
       const seenAt = this.idlessSeen.get(print);
       const repeatHint = seenAt !== undefined && now - seenAt < IDLESS_REPEAT_HINT_MS;
       if (seenAt !== undefined && !repeatHint) this.idlessSeen.delete(print); // stale
-      idlessRepeat = repeatHint || twinInFlight;
+      idlessRepeat = repeatHint || twinJournaled;
       if (idlessRepeat) {
         logger.info(
-          `[run-completions] tab ${key.slice(0, 8)}: an id-less completion with identical content was already delivered — forwarding it FLAGGED as a possible repeat (never suppressed: content is not identity)`,
+          `[run-completions] tab ${key.slice(0, 8)}: an id-less completion with identical content is already known — forwarding this one FLAGGED as a possible repeat (never merged, never suppressed: content is not identity)`,
         );
       }
     }
