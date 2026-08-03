@@ -1007,6 +1007,111 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
     killSpy.mockRestore();
   });
 
+  it("does NOT claim an ALIVE recycled PID as ours — the process creation time tells instances apart", async () => {
+    // The hardest variant: our child died, the OS reused its number, the
+    // replacement is ALIVE (signal-0 succeeds), owns the port, and is even another
+    // ComfyUI with an identical command line. Nothing but the per-instance
+    // creation time can tell them apart.
+    usePlainInstall();
+    let killed = false;
+    let relaunched = false;
+    // Identity by PHASE: the old server before the spawn, our child at the spawn,
+    // then a DIFFERENT instance on the same number when the listener is checked.
+    let readsAfterSpawn = 0;
+    let spawnedYet = false;
+    __processControlTestHooks.setProcessIdentityResolver(() => {
+      const commandLine = `${PLAIN_PY} ${PLAIN_MAIN} --port 8188`;
+      if (!spawnedYet) return { startedAt: "old-server", commandLine };
+      readsAfterSpawn++;
+      return {
+        startedAt: readsAfterSpawn <= 1 ? "our-child" : "recycled-instance",
+        commandLine,
+      };
+    });
+    mockSpawn.mockImplementation(() => {
+      spawnedYet = true;
+      const child = new FakeChild();
+      child.pid = 4321;
+      return child;
+    });
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill|pkill|\bkill\b/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (/netstat/i.test(cmd)) {
+        return killed && !relaunched
+          ? ""
+          : "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed && !relaunched) throw new Error("not listening");
+        return "p4321\nn127.0.0.1:8188\n";
+      }
+      return "";
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        relaunched = true;
+        return { ok: true } as Response;
+      }),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.listener_ownership).toBe("not-ours");
+    expect(result.started).toBe(false);
+    expect(result.ready).toBe(true);
+    expect(result.message).not.toMatch(/restarted successfully/i);
+
+    killSpy.mockRestore();
+  });
+
+  it("DOES claim it when the creation time still matches (the stamp is not a blanket veto)", async () => {
+    usePlainInstall();
+    spawnCapturingChildren(4321);
+    let killed = false;
+    let relaunched = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill|pkill|\bkill\b/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (/netstat/i.test(cmd)) {
+        return killed && !relaunched
+          ? ""
+          : "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed && !relaunched) throw new Error("not listening");
+        return "p4321\nn127.0.0.1:8188\n";
+      }
+      return "";
+    });
+    __processControlTestHooks.setProcessIdentityResolver(() => ({
+      startedAt: "spawned-at-1000",
+      commandLine: `${PLAIN_PY} ${PLAIN_MAIN} --port 8188`,
+    }));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        relaunched = true;
+        return { ok: true } as Response;
+      }),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.listener_ownership).toBe("ours");
+    expect(result.started).toBe(true);
+    expect(result.message).toMatch(/restarted successfully/i);
+
+    killSpy.mockRestore();
+  });
+
   it("says so plainly when listener ownership is UNDECIDABLE — without denying a restart that worked", async () => {
     // Unmappable port owner + a still-alive launched child. Reporting this as a
     // FAILED restart would mislabel every ordinary restart on hosts where the

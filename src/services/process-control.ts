@@ -552,6 +552,7 @@ function classifyListenerOwnership(input: {
   childExited: boolean;
   child: ChildProcess;
   launchArgv?: string[];
+  launchedAt?: string;
   portOwnerPid: number | null;
 }): ListenerOwnership {
   // A Desktop launch is undecidable BY DESIGN: we spawn the Electron shell (or
@@ -569,9 +570,32 @@ function classifyListenerOwnership(input: {
   if (input.portOwnerPid !== ourPid) return "not-ours";
   // The pid MATCHES — but it could be a recycled number we cannot signal.
   if (alive !== true) return "unconfirmed";
-  // Where the OS exposes it, require the port owner to still be running what we
-  // launched. Unreadable (the platforms where the identity read is skipped) leaves
-  // the pid+liveness match standing; a POSITIVE mismatch is counter-evidence.
+
+  // PER-INSTANCE identity. Everything above can be satisfied by a recycled number:
+  // same pid, signalable, and (if the replacement is another ComfyUI started with
+  // the same argv) even the same command line. Only the process CREATION TIME
+  // distinguishes instances, so when we captured ours at spawn it has to still be
+  // there. A positive mismatch is proof this is a different process; losing the
+  // ability to read it is not proof of anything, but it does mean we can no longer
+  // CLAIM the launch, so it degrades to "unconfirmed" rather than "ours".
+  if (input.launchedAt) {
+    const now = resolveProcessIdentityUnbounded(ourPid);
+    if (!now?.startedAt) return "unconfirmed";
+    if (now.startedAt !== input.launchedAt) return "not-ours";
+    if (
+      now.commandLine &&
+      input.launchArgv &&
+      !commandLineMatchesArgv(now.commandLine, input.launchArgv)
+    ) {
+      return "not-ours";
+    }
+    return "ours";
+  }
+
+  // No creation-time stamp was available at spawn. Fall back to the weaker signal:
+  // where the OS exposes it, the port owner must still be running what we launched.
+  // A POSITIVE mismatch is counter-evidence; unreadable leaves the pid+liveness
+  // match standing.
   const identity = resolveProcessIdentity(ourPid);
   if (
     identity?.commandLine &&
@@ -667,6 +691,14 @@ interface SpawnedComfyUI {
    * started, rather than a different program that inherited its pid.
    */
   launchArgv?: string[];
+  /**
+   * OUR child's process creation time, captured at spawn. A pid NUMBER is not an
+   * instance: a recycled number can match, be signalable, and even carry an
+   * identical command line (a second ComfyUI started with the same argv). The
+   * creation time is what tells instances apart, so it is what lets a later check
+   * say "the process on the port really is the one we launched".
+   */
+  launchedAt?: string;
 }
 
 let recordedLaunchChild: ChildProcess | undefined;
@@ -736,7 +768,13 @@ function spawnFromProcessInfo(info: ProcessInfo): SpawnedComfyUI | null {
   // the moment a different process owns the port. (Desktop-app launches return
   // above: that exe is a launcher, not an interpreter.)
   if (child.pid) recordLaunchedInterpreter(child.pid, cmd.exe);
-  return { child, launchArgv: [cmd.exe, ...cmd.args] };
+  return {
+    child,
+    launchArgv: [cmd.exe, ...cmd.args],
+    launchedAt: child.pid
+      ? resolveProcessIdentityUnbounded(child.pid)?.startedAt
+      : undefined,
+  };
 }
 
 /**
@@ -827,6 +865,25 @@ function resolveProcessIdentity(pid: number): ProcessIdentity | undefined {
   // `/proc/<pid>/environ` at all — so the expensive readers buy nothing the
   // port-ownership re-check does not already give.
   if (!pid || pid <= 0 || process.platform !== "linux") return undefined;
+  try {
+    return readProcessIdentity(pid);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Identity read WITHOUT the platform gate above.
+ *
+ * Reserved for the two moments that decide whether we may CLAIM to have started
+ * the server: recording our own child's creation time at spawn, and re-checking it
+ * against the process later found on the port. Those are the only places where the
+ * expensive Windows read buys something the cheap checks cannot give — a
+ * per-INSTANCE identity. Everything else stays on the gated reader.
+ */
+function resolveProcessIdentityUnbounded(pid: number): ProcessIdentity | undefined {
+  if (processIdentityOverride) return processIdentityOverride(pid);
+  if (!pid || pid <= 0) return undefined;
   try {
     return readProcessIdentity(pid);
   } catch {
@@ -1690,6 +1747,7 @@ export async function startComfyUI(): Promise<StartResult> {
     childExited: launchedChildExit != null,
     child: launched.child,
     launchArgv: launched.launchArgv,
+    launchedAt: launched.launchedAt,
     portOwnerPid: newPid,
   });
   // Only the NON-Desktop undecidable case is worth calling out: for a Desktop
