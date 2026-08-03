@@ -5614,9 +5614,16 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // it was taken on (an unbound healthy endpoint says nothing about a
           // boot-instance record). The 10-minute causation window stays as the
           // backstop for records never observed back.
+          // r14: the record is captured BEFORE the clear — the recovery CLAIM
+          // below ("a restart initiated earlier appears to have completed")
+          // requires the token to have been present at this moment.
+          const heldBeforeProbeOutcome = sessionRestartDispatch(ctx);
           if (outcome.status === "healthy" || outcome.status === "recovered") {
-            const held = sessionRestartDispatch(ctx);
-            if (held != null && (held.base == null || sameHttpBase(held.base, declineProbeBase))) {
+            if (
+              heldBeforeProbeOutcome != null &&
+              (heldBeforeProbeOutcome.base == null ||
+                sameHttpBase(heldBeforeProbeOutcome.base, declineProbeBase))
+            ) {
               clearSessionRestartDispatch(ctx);
             }
           }
@@ -5669,10 +5676,25 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             );
           }
           if (outcome.status === "recovered" && boundToRestartTarget) {
+            // r14: the recovery CLAIM ("a restart initiated earlier appears to
+            // have completed") passes the SAME causation gate as the DOWN
+            // report — a session-held, bound-confirmed record, recent, and
+            // base-matched, captured BEFORE the r13 exoneration clear (which
+            // fires either way). Without it, the down→healthy cycle alone
+            // proves nothing about what caused the down: report the recovery
+            // causation-free.
+            const recoveryCausative =
+              heldBeforeProbeOutcome != null &&
+              Date.now() - heldBeforeProbeOutcome.at <= RESTART_DISPATCH_CAUSATION_WINDOW_MS &&
+              (heldBeforeProbeOutcome.base == null ||
+                sameHttpBase(heldBeforeProbeOutcome.base, declineBootBase));
             return ok(
-              "Cancelled — no new restart was dispatched. Note: ComfyUI was briefly " +
-                "unreachable but is healthy again — a restart initiated earlier " +
-                "appears to have completed.",
+              recoveryCausative
+                ? "Cancelled — no new restart was dispatched. Note: ComfyUI was briefly " +
+                    "unreachable but is healthy again — a restart initiated earlier " +
+                    "appears to have completed."
+                : "Cancelled — no new restart was dispatched. ComfyUI was briefly " +
+                    "unreachable but is healthy again.",
             );
           }
           return ok("Cancelled — ComfyUI was not restarted.");

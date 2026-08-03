@@ -313,8 +313,34 @@ describe("panel_restart_comfyui — decline truthfulness (#742)", () => {
     expect(t).not.toMatch(/start ComfyUI manually/i);
     expect(t).toMatch(/^Cancelled — no new restart was dispatched/);
     expect(t).toMatch(/healthy again/i);
+    // r14: with NO dispatch on record, the recovery note is CAUSATION-FREE —
+    // it must not credit an earlier restart that isn't provably on record.
+    expect(t).not.toMatch(/restart initiated earlier/i);
     // It kept polling past the first refused sample instead of declaring loss.
     expect(probes).toBe(3);
+    expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
+  });
+
+  it("a down-then-HEALTHY recovery names the causation ONLY with a fresh session-held dispatch (r14)", async () => {
+    const seq: Array<"down" | "healthy"> = ["down", "healthy"];
+    let probes = 0;
+    __panelToolsTestHooks.setHealthProbe(async () => {
+      const s = seq[Math.min(probes, seq.length - 1)];
+      probes++;
+      return s;
+    });
+    const { ctx, sends } = makeCtx({ confirm: "no" });
+    __panelToolsTestHooks.seedSessionRestartDispatch(ctx, { at: Date.now(), base: BOOT_BASE });
+
+    const res = await restartTool().handler({}, ctx);
+    const t = text(res);
+
+    expect(t).toMatch(/^Cancelled — no new restart was dispatched/);
+    expect(t).toMatch(/healthy again/i);
+    expect(t).toMatch(/restart initiated earlier/i);
+    // The observed recovery exonerates the dispatch either way (r13): the
+    // token is cleared even though the note named it.
+    expect(__panelToolsTestHooks.getSessionRestartDispatch(ctx)).toBeNull();
     expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
   });
 
