@@ -2233,13 +2233,30 @@ function httpStatusOfError(err: unknown): number | undefined {
   return typeof status === "number" && Number.isFinite(status) ? status : undefined;
 }
 
-/** Compare two userdata store keys the way a filesystem does: one path-separator
- *  flavour, one Unicode normal form. A name copied out of a listing (or typed on
- *  a different OS) can carry the SAME characters in a different normalization —
- *  NFD "é" vs NFC "é" are byte-different but the same file name, and a raw
- *  byte comparison 404s on a workflow that visibly exists in the library. */
-const normalizeStoreKey = (key: string): string =>
-  key.replace(/\\/g, "/").replace(/^\/+/, "").replace(/^workflows\/+/i, "").normalize("NFC");
+/** Drop the leading slashes and the one leading "workflows/" segment, leaving a
+ *  store-RELATIVE key. Both separators are accepted here because either can spell
+ *  that prefix, whichever OS produced the string. */
+const stripLibraryPrefix = (key: string): string =>
+  key.replace(/^[\\/]+/, "").replace(/^workflows[\\/]+/i, "");
+
+/** The form two userdata store keys are compared in when deciding they are the
+ *  SAME NAME. Unicode normalization is the only equivalence applied: NFD "é" and
+ *  NFC "é" are one character sequence written two ways, so a name pasted from a
+ *  listing (or produced on another OS) can be byte-different yet denote the same
+ *  file, and a raw byte comparison 404s on a workflow that visibly exists.
+ *
+ *  Path separators are deliberately NOT folded (codex MAJOR): on POSIX a file
+ *  literally named `dir\foo.json` is a DIFFERENT file from `dir/foo.json`, so
+ *  treating `\` as `/` here would let a request for one resolve to the other. Case
+ *  is not folded either, for the same reason. Both of those are instead reported
+ *  as near misses in the refusal. */
+const matchStoreKey = (key: string): string => stripLibraryPrefix(key).normalize("NFC");
+
+/** The looser form used ONLY to describe a near miss in an error message — never
+ *  to select a file to load. Folds the two equivalences that are real on some
+ *  filesystems and not on others: separator flavour and letter case. */
+const looseStoreKey = (key: string): string =>
+  matchStoreKey(key).replace(/\\/g, "/").toLowerCase();
 
 /**
  * The connected ComfyUI's OWN list of saved workflow store keys, or null when the
@@ -2464,17 +2481,20 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
   };
 
   let listedButUnserved: string | null = null;
-  let caseNearMisses: string[] = [];
+  let nearMisses: string[] = [];
+  let resolvedKey = requestedKey;
   if (outcome.kind === "absent") {
     const rawListed = await listUserdataWorkflowKeys();
     // A listing entry is server-supplied data, so it gets the SAME escape guard as
-    // caller input before it is echoed back as a request key.
+    // caller input before it is echoed back as a request key. The split is
+    // deliberately liberal about separators — that is a REJECTION rule, where being
+    // over-inclusive can only refuse more, never resolve to another file.
     const listed = rawListed?.filter((k) => {
-      const segs = normalizeStoreKey(k).split("/");
+      const segs = stripLibraryPrefix(k).split(/[\/]+/);
       return !segs.includes("..") && !segs.some((s) => /^[A-Za-z]:/.test(s));
     });
     if (listed) {
-      const want = normalizeStoreKey(rel);
+      const want = matchStoreKey(rel);
       // The ONLY accepted equivalence is Unicode normalization. NFC "é" and NFD
       // "e"+U+0301 are the SAME character sequence written two ways — the same
       // name, not a similar one — so retrying the server's form of it resolves
@@ -2486,7 +2506,7 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
       // "foo.json" are two DIFFERENT files, and silently serving the other one is
       // exactly the wrong-graph substitution this resolver must not make. A
       // case-only near miss is instead NAMED in the refusal below.
-      const matches = listed.filter((k) => normalizeStoreKey(k) === want);
+      const matches = listed.filter((k) => matchStoreKey(k) === want);
       if (matches.length > 1) {
         throw new Error(
           `"${p}" is ambiguous in the connected ComfyUI's workflow library — it matches ` +
@@ -2499,25 +2519,36 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
         const retryKey = storeKeyForListed(matches[0]);
         // Only re-ask when the server's spelling actually differs from what was
         // already sent — otherwise this would repeat the request that just failed.
-        if (retryKey !== requestedKey) outcome = await fetchUserdataKey(retryKey);
+        if (retryKey !== requestedKey) {
+          outcome = await fetchUserdataKey(retryKey);
+          // Remember which key was actually read, so a malformed / non-UI file
+          // names the file that was consulted rather than the caller's spelling.
+          if (outcome.kind !== "absent") resolvedKey = retryKey;
+        }
         // Still absent after retrying the server's OWN key: the library lists the
         // name but will not serve it. Say so — that is a server-side condition the
         // user must see, not a cue to go hunting for a local file.
         if (outcome.kind === "absent") listedButUnserved = matches[0];
       } else {
-        caseNearMisses = listed.filter(
-          (k) => normalizeStoreKey(k).toLowerCase() === want.toLowerCase(),
-        );
+        // Reported only. A key that differs by separator flavour or letter case is
+        // a DIFFERENT file on some filesystems, so it is never substituted.
+        nearMisses = listed.filter((k) => looseStoreKey(k) === looseStoreKey(rel));
       }
     }
   }
 
   if (outcome.kind === "found") {
     // A found-but-non-UI file must surface its own honest error, not silence.
-    return assertUiWorkflow(outcome.parsed, `The workflow "${p}" from the ComfyUI userdata library`);
+    return assertUiWorkflow(
+      outcome.parsed,
+      `The workflow "${p}" from the ComfyUI userdata library (read as "${resolvedKey}")`,
+    );
   }
   if (outcome.kind === "malformed") {
-    throw new Error(`The workflow "${p}" in the ComfyUI userdata library is not valid JSON: ${outcome.detail}`);
+    throw new Error(
+      `The workflow "${p}" in the ComfyUI userdata library (read as "${resolvedKey}") is not ` +
+        `valid JSON: ${outcome.detail}`,
+    );
   }
   if (outcome.kind === "refused") {
     // Server is reachable but did not serve the file — do NOT fall back to a
@@ -2540,9 +2571,9 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
           ? ` Its library DOES list "${listedButUnserved}", but the server would not serve that key —` +
             ` the file may have been removed or be unreadable on the ComfyUI machine.`
           : "") +
-        (caseNearMisses.length
-          ? ` The library does list ${caseNearMisses.map((k) => `"${k}"`).join(", ")}, which differs` +
-            ` only in letter case — a different file on a case-sensitive filesystem, so it was NOT` +
+        (nearMisses.length
+          ? ` The library does list ${nearMisses.map((k) => `"${k}"`).join(", ")}, which differs only` +
+            ` in letter case or path separator — a DIFFERENT file on some filesystems, so it was NOT` +
             ` substituted. Retype the name exactly if that is the one you meant.`
           : "") +
         ` The connected ComfyUI is the authority on its own user directory (it may have been started` +
@@ -2565,6 +2596,15 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
   // targets an external directory can't be read on the fallback (codex).
   // Canonicalizing BOTH sides keeps a legitimately-symlinked workflows dir working
   // (its base resolves too), while blocking a per-file escape.
+  //
+  // KNOWN AND ACCEPTED: this check is check-then-open, so it does not survive a
+  // concurrent swap of the checked file for a symlink between the realpath and the
+  // read (codex MAJOR). Closing that needs an fd-based open + fstat, and the threat
+  // it defends against is another process on the user's OWN machine racing their
+  // own workflow load — outside this project's trust model, where the orchestrator,
+  // the panel and the user are one trust domain. The check remains as a guard
+  // against a statically mis-linked workflows dir, which is the accidental case
+  // that actually happens.
   const realBaseUnder = (base: string, candidate: string): boolean => {
     try {
       const rb = realpathSync(base);

@@ -437,19 +437,46 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
   });
 
   it("uses the server's key verbatim when the listing already carries the workflows/ prefix", async () => {
-    // Some listings report the full store key. It must not be double-prefixed, and
-    // it must not be rewritten.
+    // Some listings report the FULL store key. The caller's spelling must miss
+    // first (otherwise the listing branch is never entered), and the retry must
+    // then send the listed key without nesting a second workflows/ segment.
+    const nfc = "caf\u00e9.json";
+    const nfd = "cafe\u0301.json";
     const graph = { nodes: [{ id: 11, type: "PrefixedListingNode" }], links: [] };
-    routeMock(["workflows/Prefixed Name.json"], { "workflows/Prefixed Name.json": graph });
+    routeMock([`workflows/${nfc}`], { [`workflows/${nfc}`]: graph });
 
     const { ctx, calls } = makeCtx();
-    const res = await loadWorkflow().handler({ path: "Prefixed Name.json" }, ctx);
+    const res = await loadWorkflow().handler({ path: nfd }, ctx);
 
     expect(res.isError).toBeUndefined();
     expect(calls[0].graph).toMatchObject(graph);
+    // The listing branch WAS used: the caller's spelling 404'd, the listed key served.
+    expect(fetchApi).toHaveBeenCalledWith(`/api/userdata/${encodeURIComponent(`workflows/${nfd}`)}`);
+    expect(fetchApi).toHaveBeenCalledWith(`/api/userdata/${encodeURIComponent(`workflows/${nfc}`)}`);
     expect(fetchApi).not.toHaveBeenCalledWith(
-      `/api/userdata/${encodeURIComponent("workflows/workflows/Prefixed Name.json")}`,
+      `/api/userdata/${encodeURIComponent(`workflows/workflows/${nfc}`)}`,
     );
+  });
+
+  it("does NOT treat a backslash as a path separator when matching (POSIX aliasing)", async () => {
+    // On POSIX a file literally named "dir\\foo.json" is a DIFFERENT file from
+    // "dir/foo.json". Folding separators in the match would substitute one for the
+    // other (codex MAJOR). It must refuse and never fetch the backslash key.
+    const backslashKey = "dir\\foo.json";
+    routeMock([backslashKey], {
+      [`workflows/${backslashKey}`]: { nodes: [{ id: 1, type: "WrongSeparatorNode" }], links: [] },
+    });
+
+    const { ctx, calls } = makeCtx();
+    const res = await loadWorkflow().handler({ path: "dir/foo.json" }, ctx);
+
+    expect(res.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+    expect(fetchApi).not.toHaveBeenCalledWith(
+      `/api/userdata/${encodeURIComponent(`workflows/${backslashKey}`)}`,
+    );
+    // But it IS named as a near miss so the user can retype it.
+    expect(JSON.stringify(res)).toMatch(/path separator/i);
   });
 
   it("never echoes a traversal entry from a hostile listing back as a request key", async () => {
