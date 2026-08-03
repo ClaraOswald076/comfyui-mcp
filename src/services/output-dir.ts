@@ -2,7 +2,12 @@ import { existsSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { config, isRemoteMode } from "../config.js";
 import { getSystemStats } from "../comfyui/client.js";
-import { resolveEffectiveComfyUIBase, liveRootFromArgv } from "./workspace-env.js";
+import {
+  resolveEffectiveComfyUIBase,
+  liveRootFromArgv,
+  resolveLiveServerRoot,
+  hasComfyUIEntrypoint,
+} from "./workspace-env.js";
 import { ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 
@@ -31,6 +36,42 @@ export interface LiveServerSnapshot {
   reachable: boolean;
   argv?: string[];
   cwd?: string;
+  /** The live server's install root as established by the ONE canonical resolver
+   *  (resolveLiveServerRoot) from THIS snapshot — including the OS-observed anchor
+   *  that argv alone cannot produce. Consumers that need
+   *  `<live root>/extra_model_paths.yaml` must use this rather than re-parsing argv,
+   *  or they miss the relative-`main.py` shape entirely (codex gate, round 12).
+   *  LOCAL mode only. */
+  liveRoot?: string;
+}
+
+/**
+ * Provenance of a resolved models directory (#369).
+ *
+ *  - `argv-flag`     — the server's own `--base-directory`/`--models-directory`.
+ *  - `live-root`     — the server's own argv `main.py` root (absolute / cwd-resolved).
+ *  - `observed-root` — a relative argv `main.py` re-anchored on the interpreter the
+ *                      OS reports for the process on our port.
+ *  - `base-anchored` — the configured base CORROBORATED by the relative `main.py`
+ *                      the live server reported really existing under it.
+ *  - `configured-base` — plain COMFYUI_PATH / default workspace. This is the only
+ *                      value a REACHABLE server never vouched for, and the one that
+ *                      wrote a 4.88 GB model into a stale install in #369.
+ *
+ * The first three are LIVE-AUTHORITATIVE. `isLiveAuthoritativeModelsDir()` is the
+ * single predicate callers use, so nobody re-derives that classification.
+ */
+export type ModelsDirSource =
+  | "argv-flag"
+  | "live-root"
+  | "observed-root"
+  | "base-anchored"
+  | "configured-base";
+
+/** True when the models dir was established from the RUNNING server rather than
+ *  from local configuration the server never vouched for. */
+export function isLiveAuthoritativeModelsDir(source: ModelsDirSource): boolean {
+  return source === "argv-flag" || source === "live-root" || source === "observed-root";
 }
 
 /** Resolve a possibly-relative dir against a base (or COMFYUI_PATH, or cwd). */
@@ -229,10 +270,18 @@ export async function resolveModelsDirWithBases(): Promise<{
    *  snapshot and can never mix roots from a server that changed between two calls
    *  (codex inter-snapshot race). `reachable` is false when the server was down. */
   snapshot: LiveServerSnapshot;
+  /** WHERE the models dir came from. The three live-* values are anchored on the
+   *  running server; `base-anchored` and `configured-base` are local config, which
+   *  a reachable server may silently disagree with (#369) — callers that WRITE use
+   *  this to decide whether the destination still needs corroborating. */
+  source: ModelsDirSource;
 }> {
   const baseDirs = new Set<string>();
   let modelsDir: string | undefined;
+  let source: ModelsDirSource = "configured-base";
   const snapshot: LiveServerSnapshot = { reachable: false };
+  /** The live server's install root, resolved through the ONE canonical resolver. */
+  let live: ReturnType<typeof resolveLiveServerRoot> | undefined;
   try {
     const stats = await getSystemStats();
     const argv = stats.system?.argv;
@@ -240,14 +289,25 @@ export async function resolveModelsDirWithBases(): Promise<{
     snapshot.reachable = true;
     snapshot.argv = argv;
     snapshot.cwd = cwd;
+    // THE live install root (#369): argv when it resolves, else the OS-observed
+    // process anchor for the relative-`main.py`-with-no-cwd shape that ComfyUI
+    // Desktop and the Windows portable bundle both report. Computed ONCE here and
+    // used for BOTH the code-root bases and the models dir, so the two can never
+    // be derived from different notions of "live".
+    live = resolveLiveServerRoot(argv, cwd, { remote: isRemoteMode() });
     // Collect base-install dirs (LOCAL only) from the SAME call, regardless of how
     // the models dir resolves, so the code-root veto always has the real
     // --base-directory / live-root even when --models-directory diverges.
     if (!isRemoteMode()) {
       const baseDir = parseBaseDirFromArgv(argv, cwd);
       if (baseDir) baseDirs.add(resolve(baseDir));
-      const liveRoot = liveRootFromArgv(argv, cwd);
-      if (liveRoot) baseDirs.add(resolve(liveRoot));
+      if (live.root) {
+        baseDirs.add(resolve(live.root));
+        // Publish it on the snapshot so downstream consumers (the extra-model-root
+        // authorizer) use the SAME established root instead of re-deriving a weaker
+        // one from argv.
+        snapshot.liveRoot = resolve(live.root);
+      }
     }
     const fromArgv = parseModelsDirFromArgv(argv, cwd);
     if (fromArgv) {
@@ -255,18 +315,19 @@ export async function resolveModelsDirWithBases(): Promise<{
         modelsDir: fromArgv,
       });
       modelsDir = fromArgv;
+      source = "argv-flag";
     } else if (!isRemoteMode()) {
       // No explicit --base-directory/--models-directory flag: derive the models
-      // root from the LIVE connected server's OWN install root (its main.py path in
-      // argv). Only adopt it when it EXISTS locally (a Docker/forwarded server
-      // reports a container-side path that is not the host's) — else fall through
-      // to COMFYUI_PATH/default (#490/#463).
-      const liveRoot = liveRootFromArgv(argv, cwd);
-      if (liveRoot && existsSync(liveRoot)) {
-        modelsDir = join(liveRoot, "models");
+      // root from the LIVE connected server's OWN install root. Only adopt it when
+      // it EXISTS locally (a Docker/forwarded server reports a container-side path
+      // that is not the host's) — else fall through to the corroborated/refusing
+      // logic below (#490/#463).
+      if (live.root && existsSync(live.root)) {
+        modelsDir = join(live.root, "models");
+        source = live.source === "argv" ? "live-root" : "observed-root";
         logger.debug(
-          "Resolved ComfyUI models directory from the live server's main.py root",
-          { modelsDir },
+          "Resolved ComfyUI models directory from the live server's install root",
+          { modelsDir, source },
         );
       }
     }
@@ -299,15 +360,48 @@ export async function resolveModelsDirWithBases(): Promise<{
   const base = resolveEffectiveComfyUIBase();
   if (base) baseDirs.add(resolve(base));
   if (!modelsDir) {
-    if (base) modelsDir = resolve(base, "models");
-    else
+    // The live server NAMED a relative `main.py` we could not pin to an install
+    // (no cwd reported, and the OS process table could not identify the process or
+    // its interpreter is not inside an install tree). COMFYUI_PATH is then NOT
+    // evidence of anything: on the reporter's machine it was a SECOND, stale
+    // install and 4.88 GB landed there while the running server never saw it
+    // (#369). Accept it ONLY when it CORROBORATES what the server reported — the
+    // very same relative `main.py` really exists under it. Otherwise refuse: an
+    // honest "I don't know where this would land" beats a fabricated success.
+    const anchored =
+      base && live?.relDir !== undefined && live.source === "unresolved"
+        ? resolve(base, live.relDir)
+        : undefined;
+    if (anchored && hasComfyUIEntrypoint(anchored)) {
+      modelsDir = join(anchored, "models");
+      source = "base-anchored";
+      baseDirs.add(anchored);
+      logger.debug(
+        "Anchored the live server's relative main.py on the configured base",
+        { modelsDir, relDir: live?.relDir },
+      );
+    } else if (snapshot.reachable && !isRemoteMode() && live?.source === "unresolved" && live.relDir !== undefined) {
+      throw new ValidationError(
+        "The models directory of the CONNECTED ComfyUI could not be determined, so a " +
+          "download has no verified destination. What could not be determined:\n" +
+          `  - the running server reported its launch script as the RELATIVE path "${join(live.relDir, "main.py")}" and did NOT report a working directory, so its install root is unknown;\n` +
+          `  - the OS process table did not identify an interpreter for the ComfyUI listening on ${config.resolvedPort} that sits inside an install tree${live.observedPython ? ` (observed "${live.observedPython}")` : ""};\n` +
+          `  - ${base ? `the configured local base "${base}" does not contain "${join(live.relDir, "main.py")}", so it is a DIFFERENT install than the one that is running` : "no COMFYUI_PATH or default workspace is configured"}.\n` +
+          "Refusing to write to a guessed directory (that is how a model lands in a stale install and is reported as a success). " +
+          "Fix by launching ComfyUI with an ABSOLUTE --base-directory, or set COMFYUI_PATH to the install that is actually running.",
+      );
+    } else if (base) {
+      modelsDir = resolve(base, "models");
+      source = "configured-base";
+    } else {
       throw new ValidationError(
         "No local ComfyUI models directory could be resolved. Set the COMFYUI_PATH " +
           "environment variable, save a default workspace with workspace (action:\"set_default\"), " +
           "or connect to a running ComfyUI so its models directory can be detected.",
       );
+    }
   }
-  return { modelsDir, baseDirs: [...baseDirs], snapshot };
+  return { modelsDir, baseDirs: [...baseDirs], snapshot, source };
 }
 
 /**

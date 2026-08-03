@@ -6,9 +6,13 @@ icon: "images"
 
 <Info>14 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
 
+<Tip>**You don't type these calls.** Ask your agent for what you want in ordinary English — it chooses the tool and fills in the arguments. The JSON on this page is what it sends. New here? Start with [Using the tools](/using-tools).</Tip>
+
 ## view_image
 
 Fetch a registered asset's bytes and return them as an inline image so the agent can see the result. Use this after enqueue_workflow completes (asset_id is included in the completion notification) to inspect, critique, or compare generated images. Only supports image mime types (PNG/JPEG/WebP); audio/video assets must be saved to disk via get_image.
+
+<Tip>**In plain terms:** Puts an image in front of the agent so it can actually look at it — for "is this any good?", "compare these two", "what is wrong with the hands".</Tip>
 
 ### Parameters
 
@@ -18,16 +22,18 @@ Fetch a registered asset's bytes and return them as an inline image so the agent
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** Show me that one.
 
 ```json
 {
   "tool": "view_image",
   "arguments": {
-    "asset_id": "<asset_id>"
+    "asset_id": "asset_01HQ8Z3K7V"
   }
 }
 ```
+
+**You get back:** The image inline, visible to both of you. The asset id comes from the completion message of the run that made it.
 
 ---
 
@@ -52,16 +58,20 @@ Fetch a generated image from ComfyUI and return it as an inline image. Video/aud
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** Save that render onto my desktop.
 
 ```json
 {
   "tool": "get_image",
   "arguments": {
-    "filename": "<filename>"
+    "filename": "portrait_00042_.png",
+    "type": "output",
+    "save_dir": "C:/Users/me/Desktop"
   }
 }
 ```
+
+**You get back:** The file copied to that folder, and the path it landed at. Use this rather than view_image for video and audio, which cannot be shown inline.
 
 ---
 
@@ -98,7 +108,7 @@ Re-encode a generated image to PNG, JPEG, or WebP and return it inline as an ima
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -141,7 +151,7 @@ Measure the color of a rendered image (not by eye): returns black/white points, 
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -170,7 +180,7 @@ Remove an image's background, returning a transparent (RGBA) cutout — the high
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -201,7 +211,7 @@ Upscale an image with an ESRGAN super-resolution model — the high-level entry 
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -238,7 +248,7 @@ Stage an EXISTING ComfyUI output (or temp/preview) as an INPUT so the next stage
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -269,7 +279,7 @@ Upload a generated ComfyUI output to cloud storage. Source can be asset_id or a 
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -297,7 +307,7 @@ Upload a local image file to the connected ComfyUI's input/ directory via the HT
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -325,7 +335,7 @@ Upload a local video file (.mp4, .mov, .webm, .avi, .mkv, .m4v) to the connected
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -353,7 +363,7 @@ Upload a local audio file (.wav, .mp3, .flac, .ogg, .m4a, .aac) to the connected
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -370,6 +380,8 @@ Upload a local audio file (.wav, .mp3, .flac, .ogg, .m4a, .aac) to the connected
 
 List recently generated image AND video files from ComfyUI's output/ directory, newest-first, with each file's kind ('image' | 'video'), subfolder, size, and modification time. Covers stills (.png/.jpg/.jpeg/.bmp) and video/animation outputs (.mp4/.webm/.mov/.mkv/.m4v/.avi/.gif/.webp). LOCAL ComfyUI (COMFYUI_PATH set): a RECURSIVE filesystem scan of output/ — includes subfolders like video/ that VHS/SaveVideo write to, and reports size + modification time. REMOTE ComfyUI: derives the list from /history over HTTP instead (size/modified are unavailable and omitted). It does NOT return the media bytes themselves — fetch those with get_image. USE THIS TO CONFIRM A VIDEO RENDER (e.g. VHS_VideoCombine / LTX / WAN output) when get_history shows the prompt done but lists no output: VHS-style video nodes write the file but often do NOT register in ComfyUI's /history, so the local filesystem scan is the reliable way to verify the .mp4 exists — then chain it with stage_output_as_input. Read-only.
 
+<Tip>**In plain terms:** What has ComfyUI actually written to disk lately. Worth knowing: video nodes often finish without registering in ComfyUI's history, so this is the reliable way to confirm a video really rendered.</Tip>
+
 ### Parameters
 
 <ParamField path="limit" type="integer">
@@ -382,16 +394,34 @@ List recently generated image AND video files from ComfyUI's output/ directory, 
   Response shape: markdown (default, human/agent-readable) or json (&#123;images:[&#123;filename,subfolder,kind,size,modified&#125;]&#125; — for app clients building pick grids). Options: `markdown`, `json`.
 </ParamField>
 
-### Example
+### Examples
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** Show me the last few things I generated.
 
 ```json
 {
   "tool": "list_output_images",
-  "arguments": {}
+  "arguments": {
+    "limit": 10
+  }
 }
 ```
+
+**You get back:** The ten newest files, newest first, each with whether it is an image or a video, its folder, size and time. Not the pictures themselves — ask to see one and the agent fetches it.
+
+**You say:** Did that fox render ever come out?
+
+```json
+{
+  "tool": "list_output_images",
+  "arguments": {
+    "pattern": "fox",
+    "limit": 5
+  }
+}
+```
+
+**You get back:** Only files whose names contain "fox".
 
 ---
 
@@ -410,7 +440,7 @@ List recently generated assets, newest-first. Each call first reconciles ComfyUI
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -433,7 +463,7 @@ Get full provenance for a registered asset including the workflow snapshot that 
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {

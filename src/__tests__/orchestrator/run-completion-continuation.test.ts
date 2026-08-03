@@ -35,6 +35,9 @@ import { destinationHasCollisionState } from "../../orchestrator/session-store.j
 let PanelAgentManager: typeof import("../../orchestrator/panel-agent.js").PanelAgentManager;
 
 beforeAll(async () => {
+  // Short freeze window so the #587 stall/steer path is reachable deterministically.
+  // panel-agent reads this at module load, hence the dynamic import below it.
+  process.env.COMFYUI_MCP_TURN_IDLE_MS = "150";
   ({ PanelAgentManager } = await import("../../orchestrator/panel-agent.js"));
 });
 
@@ -510,6 +513,70 @@ describe("run completion across automatic goal continuation (#468)", () => {
     // …and the completion appears EXACTLY ONCE. Stripping only the token left a
     // second, token-less copy of this text behind in the preserved mail.
     expect(all.split("leak.png").length - 1).toBe(1);
+  });
+
+  it("a STEERED stall keeps the completion on the live turn — it is not handed back", async () => {
+    // #587 added a stall path that does NOT abandon the turn: a capable provider
+    // is steered with a harness notice and the turn stays authoritative. The
+    // #468 token hand-back therefore belongs in finishStalledTurn (the genuinely
+    // abandoned path) and MUST NOT run here — releasing on a live turn replays a
+    // completion that turn is still carrying, i.e. a duplicate.
+    const backend = new MarkerBackend({ silentTurns: true });
+    let steers = 0;
+    (backend as unknown as { recoverStalledTurn: (n: string) => Promise<boolean> }).recoverStalledTurn =
+      async () => {
+        steers += 1;
+        return true; // provider accepted the notice — turn stays live
+      };
+    const { journal, manager, arrive } = makeHarness(backend);
+    const tab = "tab-steered-stall";
+
+    journal.openRun(PROMPT_A, { tabId: tab });
+    manager.send(tab, "go");
+    await waitFor(() => backend.turns.length >= 1);
+    backend.emit({ type: "result", ok: true, subtype: "success", turn: 1 });
+
+    arrive(tab, { kind: "executed", prompt_id: PROMPT_A, images: [{ filename: "steered.png" }] });
+    await waitFor(() => backend.turns.length >= 2); // turn 2 carries it, then freezes
+
+    await waitFor(() => steers >= 1, 4000); // the watchdog steered instead of abandoning
+    await new Promise((r) => setTimeout(r, 30));
+
+    // The completion is STILL on the live turn: one entry, still handed off, and
+    // handed off EXACTLY ONCE. `attempts` is the discriminator — releasing on the
+    // steer path re-queues it, so the agent would hold two copies of the same
+    // completion (one in the live turn, one behind it) even though the entry
+    // count and the turn count both look unchanged.
+    expect(journal.outstanding(tab)).toHaveLength(1);
+    expect(journal.outstanding(tab)[0].state).toBe("handed_off");
+    expect(journal.outstanding(tab)[0].attempts).toBe(1);
+    expect(journal.outstanding(tab)[0].carriedReleases ?? 0).toBe(0);
+    expect(backend.turns).toHaveLength(2); // no replay turn was created
+  });
+
+  it("an ABANDONED stall (no provider recovery) does hand the completion back", async () => {
+    // The other side of the #587 split: with no `recoverStalledTurn` the turn is
+    // genuinely written off, so the completion it carried must come back rather
+    // than die with it. This is the path the #468 release now lives on.
+    const backend = new MarkerBackend({ silentTurns: true }); // no steer hook
+    const { journal, manager, arrive } = makeHarness(backend);
+    const tab = "tab-abandoned-stall";
+
+    journal.openRun(PROMPT_A, { tabId: tab });
+    manager.send(tab, "go");
+    await waitFor(() => backend.turns.length >= 1);
+    backend.emit({ type: "result", ok: true, subtype: "success", turn: 1 });
+
+    arrive(tab, { kind: "executed", prompt_id: PROMPT_A, images: [{ filename: "abandoned.png" }] });
+    await waitFor(() => backend.turns.length >= 2); // turn 2 carries it, then freezes
+
+    // Handed back and immediately re-offered — never lost with the written-off turn.
+    await waitFor(() => backend.turns.length >= 3, 4000);
+    expect(backend.turns[2]).toContain("abandoned.png");
+    expect(journal.outstanding(tab)).toHaveLength(1);
+    // …and UNCARRIED: turn 2 produced no stamped event, so the backend never
+    // proved it received the completion.
+    expect(journal.outstanding(tab)[0].carriedReleases ?? 0).toBe(0);
   });
 
   it("a rewind hands its completion back as CARRIED (bounded, not an infinite replay)", async () => {

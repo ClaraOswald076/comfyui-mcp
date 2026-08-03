@@ -44,6 +44,7 @@
             "pages": [
               "index",
               "quickstart",
+              "using-tools",
               "local-vs-comfy-cloud",
               "installation",
               "roadmap"

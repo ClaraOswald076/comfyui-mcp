@@ -19,6 +19,8 @@
 //   - result              ← `turn/completed` ({threadId, turn:{status}})
 //   - error               ← `error` notification ({error:{message}})
 //   - interrupt()         → `turn/interrupt` ({threadId, turnId})
+//   - recoverStalledTurn()→ `turn/steer` (an explicit harness-stall notice;
+//                            never misrepresented as a user cancellation)
 //   - listModels()        ← `config/read` (or a sensible static fallback)
 //
 // FULL PARITY with Claude: the Codex backend now drives the live ComfyUI canvas
@@ -64,6 +66,11 @@ const CODEX_INTERRUPT_TIMEOUT_MS =
   Number.isFinite(configuredInterruptTimeoutMs) && configuredInterruptTimeoutMs > 0
     ? configuredInterruptTimeoutMs
     : 1500;
+const configuredStallSteerTimeoutMs = Number(process.env.COMFYUI_MCP_CODEX_STALL_STEER_TIMEOUT_MS);
+const CODEX_STALL_STEER_TIMEOUT_MS =
+  Number.isFinite(configuredStallSteerTimeoutMs) && configuredStallSteerTimeoutMs > 0
+    ? configuredStallSteerTimeoutMs
+    : CODEX_INTERRUPT_TIMEOUT_MS;
 const configuredCloseTimeoutMs = Number(process.env.COMFYUI_MCP_CODEX_CLOSE_TIMEOUT_MS);
 const CODEX_CLOSE_TIMEOUT_MS =
   Number.isFinite(configuredCloseTimeoutMs) && configuredCloseTimeoutMs > 0
@@ -1386,6 +1393,48 @@ export class CodexBackend implements AgentBackend {
         return;
       }
       logger.debug(`[codex-backend] interrupt: ${msgOf(err)}`);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Tell Codex that the harness, not the user, observed a stalled turn. The
+   * app-server's `turn/interrupt` schema deliberately has no reason field and
+   * reports a pending tool interruption with its generic user-rejection text.
+   * `turn/steer` is the protocol operation for injecting an explicit message
+   * into the active turn, so it preserves the distinction for the agent.
+   *
+   * Older app-servers can reject `turn/steer`; return false so PanelAgent falls
+   * back to its existing bounded interrupt/restart recovery rather than wedging.
+   */
+  async recoverStalledTurn(notice: string): Promise<boolean> {
+    const client = this.client;
+    const threadId = this.threadId;
+    const turnId = this.turnId;
+    if (!client || !threadId || !turnId || !notice.trim()) return false;
+    let timer: NodeJS.Timeout | undefined;
+    let timedOut = false;
+    try {
+      await Promise.race([
+        client.request("turn/steer", {
+          threadId,
+          expectedTurnId: turnId,
+          input: [{ type: "text", text: notice }],
+        }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            timedOut = true;
+            reject(new Error(`turn/steer timed out after ${CODEX_STALL_STEER_TIMEOUT_MS}ms`));
+          }, CODEX_STALL_STEER_TIMEOUT_MS);
+        }),
+      ]);
+      return true;
+    } catch (err) {
+      logger.debug(
+        `[codex-backend] stalled-turn steer ${timedOut ? "timed out" : "unavailable"}: ${msgOf(err)}`,
+      );
+      return false;
     } finally {
       if (timer) clearTimeout(timer);
     }

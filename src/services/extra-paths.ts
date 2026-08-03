@@ -966,6 +966,16 @@ export async function getExtraModelRoots(
  *
  * Returns `authoritative: false` (and no roots) whenever the server was unreachable,
  * so the caller REFUSES every escaping symlink rather than authorize from a guess.
+ *
+ * `authoritative` says the roots LISTED can be trusted — it does NOT say they are all
+ * the roots this server has. Several paths deliberately drop roots and still return
+ * authoritative: a relative `--extra-model-paths-config` we cannot locate, a config
+ * that is unreadable or was deleted after the server loaded it, and a group whose
+ * `base_path` needs an env var belonging to a separately-launched server. So a caller
+ * must NEVER reason from a root's ABSENCE here ("the server registers nothing that
+ * could hold these models") — doing that refused a legitimate external-drive install
+ * outright (#369). Absence of a root is not evidence; if a future caller genuinely
+ * needs that inference it has to be built and TESTED alongside its consumer.
  * Never throws.
  */
 export async function getLiveExtraModelRoots(
@@ -981,7 +991,13 @@ export async function getLiveExtraModelRoots(
   // Auto-loaded default in the LIVE install root (its main.py dir). Skip in remote
   // mode: the live root is a path on the remote host.
   if (!isRemoteMode()) {
-    const liveRoot = liveRootFromArgv(argv, snapshot.cwd);
+    // Prefer the root the caller already established through the ONE canonical
+    // resolver (OS-observed when argv is a relative `main.py` with no cwd). That is
+    // strictly stronger provenance than re-deriving it from argv here, and without
+    // it a portable/Desktop install's auto-loaded config is never found at all —
+    // which made a legitimate external model root look like "no extra roots"
+    // (codex gate, round 12). Falls back to the argv derivation.
+    const liveRoot = snapshot.liveRoot ?? liveRootFromArgv(argv, snapshot.cwd);
     if (liveRoot) configPaths.add(resolve(liveRoot, "extra_model_paths.yaml"));
   }
 
@@ -993,6 +1009,10 @@ export async function getLiveExtraModelRoots(
 
   const roots: ExtraModelRoot[] = [];
   for (const cfg of configPaths) {
+    // A config that is gone (never existed, or deleted since the server loaded it)
+    // contributes no roots here — but the RUNNING process may still hold the roots it
+    // gave at startup. That is why no caller may treat this result as the complete
+    // set; see the docblock.
     if (!existsSync(cfg)) continue;
     let raw: Record<string, unknown>;
     try {

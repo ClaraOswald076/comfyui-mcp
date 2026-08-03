@@ -6,6 +6,8 @@ icon: "puzzle"
 
 <Info>21 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
 
+<Tip>**You don't type these calls.** Ask your agent for what you want in ordinary English — it chooses the tool and fills in the arguments. The JSON on this page is what it sends. New here? Start with [Using the tools](/using-tools).</Tip>
+
 ## search_custom_nodes
 
 Search the public ComfyUI Registry (registry.comfy.org) for custom node packs by keyword. Read-only and network-only: queries the hosted registry over HTTP and does NOT require a running ComfyUI or COMFYUI_PATH. Returns a ranked list of packs with id, name, author, install count, and latest version. Use to discover packs to install; pass a returned id to get_node_pack_details for full info. This searches node PACKS, not models (use search_models) and not local installs (use list_local_models).
@@ -24,16 +26,19 @@ Search the public ComfyUI Registry (registry.comfy.org) for custom node packs by
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** Is there a node pack for face detailing?
 
 ```json
 {
   "tool": "search_custom_nodes",
   "arguments": {
-    "query": "<query>"
+    "query": "face detailer",
+    "limit": 5
   }
 }
 ```
+
+**You get back:** Matching packs from the registry with their ids, authors and descriptions. The id is what install_custom_node wants.
 
 ---
 
@@ -49,7 +54,7 @@ Get full details for one ComfyUI custom node pack from the public ComfyUI Regist
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -92,16 +97,20 @@ Install a ComfyUI custom node pack by registry id, git URL, or name. Local insta
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** Install the Impact Pack.
 
 ```json
 {
   "tool": "install_custom_node",
   "arguments": {
-    "id": "<id>"
+    "id": "comfyui-impact-pack"
   }
 }
 ```
+
+**You get back:** Progress, then confirmation. New nodes do not appear until ComfyUI restarts — the agent will normally offer to do that for you.
+
+<Warning>A custom node pack is third-party code that runs inside your ComfyUI. Install packs you have reason to trust, the same as any other plugin.</Warning>
 
 ---
 
@@ -126,7 +135,7 @@ Update an installed ComfyUI custom node pack, or pass 'all' to update every inst
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -163,7 +172,7 @@ Reinstall a ComfyUI custom node pack. Local operations prefer official comfy-cli
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -197,7 +206,7 @@ Repair a ComfyUI custom node pack's install and Python dependencies, or pass 'al
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -225,7 +234,7 @@ List installed ComfyUI custom node packs with their version and enabled/disabled
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -244,7 +253,7 @@ Reconcile the Python dependencies of all installed custom node packs through off
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -267,7 +276,7 @@ Analyze a ComfyUI workflow (API JSON) and determine which custom node packs it r
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -284,6 +293,8 @@ Analyze a ComfyUI workflow (API JSON) and determine which custom node packs it r
 
 Resolve and install the custom node packs a ComfyUI workflow requires via ComfyUI-Manager. Determines the missing packs, resets the Manager queue, queues the installs, starts the worker, and reports what was installed/already-present/unresolved. Runs server-side through ComfyUI-Manager on the connected instance (works against a local OR remote --comfyui-url target); a ComfyUI restart is typically needed before new nodes load. Mirrors `comfy-cli node install-deps`.
 
+<Tip>**In plain terms:** For a workflow someone sent you that is full of red nodes: this installs the node PACKS it needs. Missing model files are a different problem — that is resolve_missing_models.</Tip>
+
 ### Parameters
 
 <ParamField path="workflow" type="string | object" required>
@@ -292,16 +303,37 @@ Resolve and install the custom node packs a ComfyUI workflow requires via ComfyU
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** Someone sent me this workflow and half the nodes are red. Fix it.
 
 ```json
 {
   "tool": "install_workflow_dependencies",
   "arguments": {
-    "workflow": "<workflow>"
+    "workflow": {
+      "4": {
+        "class_type": "CheckpointLoaderSimple",
+        "inputs": {
+          "ckpt_name": "sd_xl_base_1.0.safetensors"
+        }
+      },
+      "9": {
+        "class_type": "SaveImage",
+        "inputs": {
+          "filename_prefix": "portrait",
+          "images": [
+            "8",
+            0
+          ]
+        }
+      }
+    }
   }
 }
 ```
+
+<Note>Shortened for readability — two nodes of a real API-format graph are shown. In practice the agent passes the whole thing: the graph it just loaded with get_workflow, or the one it built for you.</Note>
+
+**You get back:** What it installed, what was already there, and anything it could not find. A restart is normally needed before the nodes load.
 
 ---
 
@@ -312,6 +344,8 @@ Custom-node snapshots via ComfyUI-Manager (mirrors `comfy node save-snapshot` / 
 - action:"save" — Save the current custom-node and version state. With no `name`, Manager assigns a timestamped snapshot (works against remote instances). Providing `name` writes a custom-named snapshot file, which requires a local ComfyUI install and is unavailable in remote (--comfyui-url) mode.
 - action:"restore" — Restore a previously saved snapshot by `name` (required). ComfyUI-Manager applies the custom-node changes on the next ComfyUI restart; use action:"list" to find available names.
 
+<Tip>**In plain terms:** A restore point for your installed node packs. Take one before a round of installing, and you have a way back if something breaks.</Tip>
+
 ### Parameters
 
 <ParamField path="action" type="enum" required>
@@ -321,18 +355,37 @@ Custom-node snapshots via ComfyUI-Manager (mirrors `comfy node save-snapshot` / 
   Snapshot name (no extension, no path separators). REQUIRED for action:"restore" (as shown by action:"list"). OPTIONAL for action:"save" — omit to let ComfyUI-Manager assign a timestamped name. Ignored by action:"list".
 </ParamField>
 
-### Example
+### Examples
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** Save where my nodes are at before I start installing things.
 
 ```json
 {
   "tool": "node_snapshot",
   "arguments": {
-    "action": "list"
+    "action": "save",
+    "name": "before-impact-pack"
   }
 }
 ```
+
+**You get back:** Confirmation that the snapshot was recorded.
+
+**You say:** That broke everything. Put it back how it was.
+
+```json
+{
+  "tool": "node_snapshot",
+  "arguments": {
+    "action": "restore",
+    "name": "before-impact-pack"
+  }
+}
+```
+
+**You get back:** What it added, removed or re-pinned to match the snapshot.
+
+<Warning>Restoring rewrites your installed node packs to match the snapshot — anything installed since is uninstalled or downgraded.</Warning>
 
 ---
 
@@ -354,7 +407,7 @@ All actions are argument-free; `action` is the only parameter. `good`/`bad` requ
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -400,7 +453,7 @@ Generate a new ComfyUI custom-node pack from a template into &lt;COMFYUI_PATH&gt
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -432,7 +485,7 @@ Test that a custom-node pack actually loads in ComfyUI — the middle step of th
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -458,7 +511,7 @@ Publish a local custom-node pack to the public Comfy Registry (registry.comfy.or
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -487,7 +540,7 @@ List the files in one installed custom-node pack under &lt;COMFYUI_PATH&gt;/cust
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -521,7 +574,7 @@ Read a slice of one file inside a custom-node pack (read-only), with bounded out
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -558,7 +611,7 @@ Regex-search custom-node source under custom_nodes/ (read-only). Uses ripgrep wh
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -592,7 +645,7 @@ Create or overwrite one file inside a custom-node pack under custom_nodes/. Refu
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -618,7 +671,7 @@ Apply a unified diff to custom-node source under custom_nodes/. Every touched pa
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -655,7 +708,7 @@ Run a git operation inside one custom-node pack (status/diff/log/commit/push). R
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {

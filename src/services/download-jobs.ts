@@ -19,8 +19,10 @@ import { realpath } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import {
   downloadModel,
+  liveListingHasEntry,
   resolveDownloadTarget,
   shouldDispatchDownloadToManager,
+  verifyLandedModel,
 } from "./model-resolver.js";
 import type { DownloadAuth } from "./download-auth.js";
 import type { ResumeDiagnostic } from "./download-resume-diag.js";
@@ -94,6 +96,34 @@ export interface DownloadJob {
    *  download outlives its tool call they have to survive somewhere the agent
    *  can still read them, or handing back a handle would silently drop them. */
   notes?: string[];
+  /**
+   * Post-landing verification against the LIVE server (#369). A local download is
+   * only honestly "done" if the bytes are on disk AND the connected ComfyUI reads
+   * from where they landed — reporting the INTENDED path is what let a 4.88 GB
+   * model be announced as a success from a stale install the server never read.
+   *
+   * "visible"     = the server lists the file — the ONLY value that licenses the
+   *                 word "successfully".
+   * "not-visible" = it does not (the file exists but is unusable there).
+   * "unknown"     = the check ran and could not conclude.
+   * "pending"     = the file has landed but the check has not finished yet. Set
+   *                 SYNCHRONOUSLY with `done`, so there is no window in which a
+   *                 renderer sees a completed job with no verification field and
+   *                 mistakes that for success (codex gate, round 1).
+   * undefined     = a pre-fix persisted record, or a Manager dispatch. Treated
+   *                 exactly like "pending" by every renderer: unconfirmed.
+   */
+  live_visible?: "visible" | "not-visible" | "unknown" | "pending";
+  /** Why, for anything other than a plain "visible". Surfaced verbatim. */
+  verify_note?: string;
+  /** The live models root the placement verdict was made against. When the
+   *  CONNECTED server later reads a DIFFERENT root, the verdict is STALE and must
+   *  not be re-asserted as current success (codex gate, round 11). */
+  verified_root?: string;
+  /** Was the file CONFIRMED present on disk by the post-landing check? False when
+   *  the stat failed (deleted or unreadable between the rename and the check), in
+   *  which case no renderer may claim "verified on disk" for `job.path`. */
+  disk_verified?: boolean;
   /** A persisted in-flight record missed its owner heartbeat. It stays visible
    *  because this is not proof the physical transfer stopped (#761). */
   staleInflight?: boolean;
@@ -361,8 +391,17 @@ export async function startDownloadJob(
   // too (the local callback race is inherently local, but this keeps the server
   // write single-writer and the last-started result deterministic).
   let serializeKey: string;
+  /** Did the live server ALREADY list this exact entry before we started? Captured
+   *  HERE, before any bytes are written, so the post-landing check can tell "the
+   *  server sees it BECAUSE we wrote it" from "it already knew that name" (#369). */
+  let listedBefore: boolean | undefined;
   if (!dispatchToManager) {
     const target = await resolveDownloadTarget(url, targetSubfolder, filename);
+    try {
+      listedBefore = await liveListingHasEntry(targetSubfolder, target.filename);
+    } catch {
+      listedBefore = undefined; // unknowable → the check stays conservative
+    }
     // Fold auth into the destination key too (#467 P1-A): two concurrent calls to
     // the SAME on-disk destination with DIFFERENT auth are DIFFERENT downloads
     // (different representations) and must NOT dedup to one writer/one job.
@@ -515,6 +554,12 @@ export async function startDownloadJob(
     job.path = landedPath;
     job.status = "done";
     job.finished_at = Date.now();
+    // A LOCAL landing is not yet a verified placement. Mark it PENDING in the SAME
+    // synchronous step that publishes "done" (and in the same persisted record), so
+    // no reader — this session's tool call inside its grace window, or another
+    // session reading the record — can ever see a completed local download with no
+    // verification field and render it as confirmed success (#369, codex gate).
+    if (!dispatchToManager) job.live_visible = "pending";
     persistJobRecord(job);
   };
   const settled = (async () => {
@@ -556,6 +601,34 @@ export async function startDownloadJob(
       // dispatch has no local rename, so commit done here when it returns (dispatch
       // accepted — the viaManager flag marks it as unverified in the tools). Idempotent.
       commitDone(path);
+      // VERIFY, don't assume (#369). A LOCAL download is reported with the path we
+      // confirmed on disk, plus whether the connected ComfyUI actually reads from
+      // there. This runs INSIDE `settled`, so a small download that finishes within
+      // download_model's grace window is already verified when the tool answers.
+      // Never allowed to demote a completed download: verifyLandedModel never throws
+      // and the catch below keeps `done`.
+      if (!dispatchToManager && (job.status as DownloadJob["status"]) === "done") {
+        try {
+          const verdict = await verifyLandedModel(path, targetSubfolder, { listedBefore });
+          if (verdict.verifiedPath) job.path = verdict.verifiedPath;
+          job.verified_root = verdict.verifiedAgainstRoot;
+          // No verifiedPath means the on-disk stat did NOT succeed — the file was
+          // removed or became unreadable between the rename and this check. Record
+          // that so no renderer claims "verified on disk" for the retained path.
+          job.disk_verified = !!verdict.verifiedPath;
+          job.live_visible = verdict.liveVisible;
+          job.verify_note = verdict.note;
+        } catch (err) {
+          // Verification is a REPORT, never a gate: the bytes are on disk either
+          // way. Record that we could not confirm placement and carry on to the
+          // post-download hook — swallowing this must not skip onComplete. The
+          // on-disk check did not complete either, so nothing may claim it did.
+          job.disk_verified = false;
+          job.live_visible = "unknown";
+          job.verify_note = `Placement could not be verified: ${err instanceof Error ? err.message : String(err)}`;
+        }
+        persistJobRecord(job);
+      }
       if (onComplete) {
         // Post-processing must not turn a landed file into a failed download —
         // the bytes are on disk either way, and reporting "error" here would
@@ -721,6 +794,10 @@ function persistJobRecord(job: DownloadJob): boolean {
     req_key: job.reqKey,
     via_manager: job.viaManager,
     resume: job.resume,
+    live_visible: job.live_visible,
+    verify_note: job.verify_note,
+    disk_verified: job.disk_verified,
+    verified_root: job.verified_root,
   });
 }
 
@@ -746,6 +823,10 @@ function jobFromPersisted(rec: PersistedDownloadJob): DownloadJob {
     reqKey: rec.req_key,
     viaManager: rec.via_manager,
     resume: rec.resume as ResumeDiagnostic | undefined,
+    live_visible: rec.live_visible,
+    verify_note: rec.verify_note,
+    disk_verified: rec.disk_verified,
+    verified_root: rec.verified_root,
     staleInflight: rec.staleInflight,
     staleForMs: rec.staleForMs,
   };
@@ -766,6 +847,150 @@ function hasAmbiguousForeignSibling(id: string, localTrayId: string): boolean {
       rec.status === "downloading" &&
       now - (rec.updated ?? 0) < PERSISTED_INFLIGHT_STALE_MS,
   );
+}
+
+/**
+ * What we ACTUALLY know about where a completed download landed (#369).
+ *
+ * This is THE single placement policy — every tool that renders a finished job
+ * (`download_model`, `download_status`, `download_civitai_model`, `apply_manifest`)
+ * must go through it, or the wording drifts and one of them starts claiming a
+ * success nobody verified. That is precisely how a 4.88 GB model in a stale install
+ * came back as "downloaded successfully".
+ *
+ * `confirmed` is true for EXACTLY ONE state: the connected ComfyUI listed the file.
+ * A Manager dispatch, a still-pending check, an inconclusive check, and a pre-fix
+ * persisted record are all UNCONFIRMED — never successes.
+ */
+export interface PlacementReport {
+  /** True only when the running ComfyUI actually listed the landed file. */
+  confirmed: boolean;
+  /** True when the file exists on disk but the live server will NOT read it. */
+  wrongPlace: boolean;
+  /** How to introduce the path. "landed at" is reserved for a CONFIRMED placement —
+   *  an unverified state must not borrow the settled-sounding phrase (codex gate). */
+  pathLabel: string;
+  /** Parenthetical for the path line, e.g. "(verified on disk, and the connected …)". */
+  pathQualifier: string;
+  /** The explanatory line to surface when `confirmed` is false. */
+  warning?: string;
+}
+
+/** " (verified on disk)" only when the post-landing stat actually succeeded. A job
+ *  whose file vanished between the rename and the check keeps its path but must not
+ *  carry a disk-verification claim (codex gate, round 9). */
+/** Do two absolute root paths name the same directory? Windows paths are
+ *  case-insensitive and mix separators, so `C:\ComfyUI\models` and
+ *  `c:/comfyui/models` are the SAME install — comparing them raw produced a false
+ *  "a DIFFERENT install" downgrade of a correct verdict (codex gate, round 17). */
+function sameRoot(a: string | undefined, b: string | undefined): boolean {
+  if (!a || !b) return false;
+  const norm = (s: string): string => {
+    const slashed = s.replace(/\\/g, "/").replace(/\/+$/, "");
+    return process.platform === "win32" ? slashed.toLowerCase() : slashed;
+  };
+  return norm(a) === norm(b);
+}
+
+function diskQualifier(job: DownloadJob): string {
+  return job.disk_verified === false ? " (NOT found on disk when checked)" : " (verified on disk)";
+}
+
+export function describePlacement(
+  job: DownloadJob,
+  /** The models root the CONNECTED server reads right now (currentLiveModelsRoot()).
+   *  A stored `visible` verdict may ONLY be re-asserted when this is present and
+   *  names the same root the verdict was made against — see below. */
+  ctx?: { liveModelsDir?: string },
+): PlacementReport {
+  if (
+    !job.viaManager &&
+    job.live_visible === "visible" &&
+    !sameRoot(ctx?.liveModelsDir, job.verified_root)
+  ) {
+    // A CONFIRMED rendering requires the READER to have re-established the verdict,
+    // so every way of failing to do that lands here (codex gate, rounds 11, 16, 18):
+    //  - the verdict names a DIFFERENT root than the server now reads;
+    //  - the verdict carries NO root (made against a destination only local
+    //    configuration could vouch for);
+    //  - and — the inversion this closes — there is NO current observation at all,
+    //    because the probe transiently failed or resolved non-authoritatively.
+    // That last case previously fell through to "confirmed", reading a MISSING
+    // observation as "no contradiction". It is not: nothing verified that the server
+    // answering NOW can read this file. Absence of evidence renders as unverified.
+    return {
+      confirmed: false,
+      wrongPlace: false,
+      pathLabel: "written to",
+      pathQualifier: diskQualifier(job),
+      warning: !ctx?.liveModelsDir
+        ? "this download was confirmed earlier, but the connected ComfyUI could not be asked " +
+          "just now which models directory it reads, so that confirmation cannot be re-established " +
+          "for the server you are connected to. Re-check with download_status, or confirm with " +
+          "list_local_models."
+        : job.verified_root
+        ? `this download was verified against a ComfyUI reading "${job.verified_root}", but the ` +
+          `connected server now reads "${ctx.liveModelsDir}" — a DIFFERENT install. The earlier ` +
+          "confirmation does not apply to it; check list_local_models against the server you are " +
+          "connected to now."
+        : "this download's placement was confirmed against a models directory that could only be " +
+          `inferred from local configuration, and the connected server now reports "${ctx.liveModelsDir}" ` +
+          "as the directory it reads. The earlier confirmation cannot be re-asserted for it; " +
+          "check list_local_models against the server you are connected to now.",
+    };
+  }
+  if (job.viaManager) {
+    return {
+      confirmed: false,
+      wrongPlace: false,
+      pathLabel: "requested destination",
+      pathQualifier: "",
+      warning:
+        "the dispatch was ACCEPTED, NOT verified as landed — ComfyUI-Manager reports its queue " +
+        "task 'done' even on failure, so this does not guarantee the file is present. Confirm " +
+        "with list_local_models before relying on it.",
+    };
+  }
+  switch (job.live_visible) {
+    case "visible":
+      return {
+        confirmed: true,
+        wrongPlace: false,
+        pathLabel: "landed at",
+        pathQualifier: " (verified on disk, and the connected ComfyUI lists it)",
+      };
+    case "not-visible":
+      return {
+        confirmed: false,
+        wrongPlace: true,
+        pathLabel: "written to",
+        pathQualifier: diskQualifier(job),
+        warning:
+          `NOT VISIBLE to the connected ComfyUI — ${job.verify_note ?? "the running server does not list this file."}`,
+      };
+    case "unknown":
+      return {
+        confirmed: false,
+        wrongPlace: false,
+        pathLabel: "written to",
+        pathQualifier: diskQualifier(job),
+        warning:
+          `visibility to the connected ComfyUI is UNCONFIRMED${job.verify_note ? ` — ${job.verify_note}` : ""}. Check list_local_models before relying on it.`,
+      };
+    default:
+      // "pending" and undefined (pre-fix record) alike: the file landed, the check
+      // has not concluded. Never rendered as a confirmed success.
+      return {
+        confirmed: false,
+        wrongPlace: false,
+        pathLabel: "written to",
+        pathQualifier: "",
+        warning:
+          "the file was materialized locally, but placement has NOT been confirmed yet — the " +
+          "check against the connected ComfyUI has not completed. Re-check with download_status, " +
+          "or confirm with list_local_models.",
+      };
+  }
 }
 
 export function getDownloadJob(id: string): DownloadJob | undefined {

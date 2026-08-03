@@ -510,6 +510,201 @@ export function liveRelDirFromArgv(argv: string[] | undefined): string | undefin
   return dir === "" ? "." : dir;
 }
 
+// ---------------------------------------------------------------------------
+// The ONE notion of "the live server's install root" (#369)
+// ---------------------------------------------------------------------------
+
+/** How the live server's install root was established. Only the first three are
+ *  authoritative — each is anchored on something OBSERVED about the running
+ *  process; `unresolved` means we genuinely do not know and callers that would
+ *  otherwise WRITE must refuse rather than guess. */
+export type LiveServerRootSource = "argv" | "observed-process" | "unresolved";
+
+export interface LiveServerRootResolution {
+  /** Absolute install root of the running ComfyUI, when it could be established. */
+  root?: string;
+  source: LiveServerRootSource;
+  /** The RELATIVE `main.py` dir the server reported (`"ComfyUI"`, `"."`), when its
+   *  argv named a relative script. Present even when the root stays unresolved —
+   *  callers use it to anchor a corroborated fallback and to explain a refusal. */
+  relDir?: string;
+  /** The interpreter the OS reports for the process on our port, when observed. */
+  observedPython?: string;
+}
+
+/** How far up from the observed interpreter we look for the live install root.
+ *  Covers every layout ComfyUI ships: `<root>/python_embeded/python.exe` (1 up),
+ *  `<root>/.venv/bin/python` (2 up), and a nested `<bundle>/ComfyUI/.venv/Scripts/
+ *  python.exe` re-anchored on `ComfyUI` (4 up). Bounded so a stray `main.py` far
+ *  above the install can never be mistaken for the server's. */
+const OBSERVED_ROOT_MAX_ASCENT = 5;
+
+/**
+ * Env directories that only a ComfyUI BUNDLE ships — a portable/Desktop layout keeps
+ * its interpreter here, one level ABOVE the server root (`<bundle>/python_embeded/
+ * python.exe` + `<bundle>/ComfyUI/main.py`).
+ *
+ * A generic `.venv`/`venv`/`env` is deliberately NOT in this set. Those live
+ * anywhere: a server started from `C:\Tools\venv\Scripts\python.exe` with a stale
+ * `C:\Tools\ComfyUI\main.py` beside it would otherwise have that unrelated install
+ * accepted as "observed" — a wrong destination presented as verified success (codex
+ * gate, round 13). A generic venv still qualifies via the "interpreter is INSIDE the
+ * candidate root" rule, which is what the real `<root>/.venv/...` layout satisfies.
+ * Compared case-insensitively (Windows).
+ */
+const BUNDLE_ENV_DIR_NAMES = new Set([
+  "python_embeded",
+  "python_embedded",
+  "standalone-env",
+]);
+
+/** Binary subdirectories that may sit below a bundle env dir. */
+const ENV_BIN_DIR_NAMES = new Set(["scripts", "bin"]);
+
+/**
+ * Is `python` positioned INSIDE the install rooted at `root`, anchored from `base`?
+ *
+ * Two accepted shapes, and nothing else:
+ *  1. the interpreter lives under `root` itself (`<root>/.venv/Scripts/python.exe`);
+ *  2. it sits in a BUNDLE env directory of the bundle `base` that `root` was
+ *     anchored on (`<bundle>/python_embeded/python.exe` + `<bundle>/ComfyUI/main.py`)
+ *     — a layout only a ComfyUI portable/Desktop bundle has.
+ *
+ * Without this test the ascent is unsound (codex gate, round 3): a server started
+ * with a SYSTEM python (`C:\Python311\python.exe`) has ancestors that are not its
+ * install at all, so walking up to `C:\` and finding a stale `C:\ComfyUI\main.py`
+ * would confidently name the WRONG install as live — reintroducing the very bug.
+ * Shape 2 is restricted to BUNDLE env dirs for the same reason (round 13): a generic
+ * `C:\Tools\venv` says nothing about a `C:\Tools\ComfyUI` that happens to sit beside it.
+ */
+function interpreterBelongsToInstall(python: string, base: string, root: string): boolean {
+  const py = pathResolve(python);
+  const pyDir = dirname(py);
+  const within = (parent: string, child: string): boolean => {
+    const p = pathResolve(parent);
+    const c = pathResolve(child);
+    return c === p || c.startsWith(p.endsWith(sep) ? p : p + sep);
+  };
+  if (within(root, py)) return true;
+  if (!within(base, py)) return false;
+  const rel = pyDir.slice(pathResolve(base).length).split(sep).filter(Boolean);
+  if (rel.length === 0) return true; // interpreter sits directly in the bundle root
+  const [first, ...rest] = rel.map((seg) => seg.toLowerCase());
+  return (
+    BUNDLE_ENV_DIR_NAMES.has(first) && rest.every((seg) => ENV_BIN_DIR_NAMES.has(seg))
+  );
+}
+
+/**
+ * Anchor a RELATIVE `main.py` dir on the interpreter the OS says the live ComfyUI
+ * process is running. Walk up from the interpreter and accept the first ancestor
+ * under which `<ancestor>/<relDir>/main.py` really exists — but ONLY when the
+ * interpreter is positioned inside that install (interpreterBelongsToInstall), so
+ * an unrelated `main.py` further up the filesystem can never be adopted. Returns
+ * undefined when nothing on the bounded path qualifies.
+ */
+function anchorRelDirOnInterpreter(python: string, relDir: string): string | undefined {
+  if (!isAbsolute(python)) return undefined;
+  let dir = dirname(pathResolve(python));
+  for (let i = 0; i < OBSERVED_ROOT_MAX_ASCENT; i++) {
+    const candidate = pathResolve(dir, relDir);
+    if (hasMainPy(candidate) && interpreterBelongsToInstall(python, dir, candidate)) {
+      return candidate;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return undefined;
+}
+
+/**
+ * The interpreter the OS reports for the ComfyUI on our port.
+ *
+ * DELIBERATELY NOT CACHED. `resolveLiveInterpreter` shells out (netstat/WMI on
+ * Windows, lsof on POSIX), so memoizing it is tempting — but this answer decides
+ * WHERE A DOWNLOAD IS WRITTEN. A cache keyed on port+argv cannot tell a restarted
+ * server apart from the one it replaced (a relaunch of ComfyUI reports the same
+ * relative `ComfyUI\main.py` on the same port), so any reuse window is a window in
+ * which a download can be written into the PREVIOUS install — the exact failure
+ * #369 is about (codex gate, round 1). Each resolution re-observes the process
+ * that is live right now; correctness here outranks a few hundred milliseconds.
+ */
+function observeLivePython(argv: string[] | undefined): string | undefined {
+  let statsHost: string | undefined;
+  try {
+    statsHost = new URL(getComfyUIBaseUrl()).hostname;
+  } catch {
+    /* unparseable target → no host filter */
+  }
+  try {
+    return resolveLiveInterpreter({
+      port: config.resolvedPort,
+      host: statsHost,
+      remote: false,
+      serverArgv: argv,
+    })?.python;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * THE live ComfyUI server's install root — the single notion every write-side
+ * caller (download destination, package install) must resolve through, so they can
+ * never disagree about which install is "the live one".
+ *
+ * Two tiers, both anchored on something OBSERVED:
+ *
+ *  1. `argv` — the server's OWN `/system_stats` argv resolves to an absolute
+ *     `main.py` directory (absolute argv[0], or a relative one plus an absolute
+ *     server-reported cwd). The server told us where it lives.
+ *
+ *  2. `observed-process` — the server reported a RELATIVE `main.py` and NO cwd.
+ *     This is the shape ComfyUI **Desktop** and the Windows **portable** bundle
+ *     both report (`ComfyUI\main.py`), and it is exactly why #369 kept recurring:
+ *     with argv unresolvable, the download destination silently fell through to
+ *     COMFYUI_PATH — a DIFFERENT, stale install — and the model landed where the
+ *     running server never reads. So we ask the OS instead: `resolveLiveInterpreter`
+ *     identifies the process listening on our port (correlated against the server's
+ *     own argv, so a proxy can't impersonate it) and reports its interpreter; the
+ *     relative `main.py` dir is re-anchored on that interpreter's install tree.
+ *
+ * Anything else is `unresolved`. There is deliberately NO layout-guess tier: a
+ * COMFYUI_PATH that merely looks plausible is what wrote 4.88 GB into the wrong
+ * install. Callers decide what an unresolved root means for them (a WRITE must
+ * refuse or fall back only to something independently corroborated).
+ *
+ * Never throws. `remote` short-circuits to unresolved — a remote server's paths are
+ * on another host and no local process is it.
+ */
+export function resolveLiveServerRoot(
+  argv: string[] | undefined,
+  cwd?: string,
+  opts?: {
+    /** Test seam / caller-supplied observation, bypassing the process-table probe. */
+    observedPython?: string;
+    /** Skip the process-table probe entirely (remote server). Defaults to isRemoteMode(). */
+    remote?: boolean;
+  },
+): LiveServerRootResolution {
+  const relDir = liveRelDirFromArgv(argv);
+  const fromArgv = liveRootFromArgv(argv, cwd);
+  if (fromArgv) return { root: fromArgv, source: "argv", relDir };
+  const remote = opts?.remote ?? isRemoteMode();
+  if (remote || relDir === undefined) return { source: "unresolved", relDir };
+
+  let observedPython = opts?.observedPython;
+  if (!observedPython) observedPython = observeLivePython(argv);
+  if (!observedPython) return { source: "unresolved", relDir };
+
+  const anchored = anchorRelDirOnInterpreter(observedPython, relDir);
+  if (anchored) {
+    return { root: anchored, source: "observed-process", relDir, observedPython };
+  }
+  return { source: "unresolved", relDir, observedPython };
+}
+
 /**
  * Resolve the Python interpreter that ACTUALLY belongs to a ComfyUI install
  * `root`, honoring EVERY layout ComfyUI ships with — portable Windows builds keep
@@ -546,6 +741,15 @@ function safeExists(p: string): boolean {
 /** Does this directory hold a ComfyUI entrypoint (`main.py`/`main.pyw`)? */
 function hasMainPy(dir: string): boolean {
   return safeExists(join(dir, "main.py")) || safeExists(join(dir, "main.pyw"));
+}
+
+/**
+ * Public form of the entrypoint test, so a caller that must CORROBORATE a
+ * configured base against the relative `main.py` the live server reported uses the
+ * exact same on-disk check this module anchors with (never a second, drifting one).
+ */
+export function hasComfyUIEntrypoint(dir: string): boolean {
+  return hasMainPy(dir);
 }
 
 /**
@@ -724,8 +928,12 @@ export interface InstallInterpreterResolution {
  * Shares the positional-only script extraction of `scriptTokenFromArgv` via
  * `liveRelDirFromArgv` — a main.py-shaped flag VALUE is never the script (#648). */
 function liveRootForInstall(argv: string[] | undefined, cwd: string | undefined, root: string | undefined): string | undefined {
-  const absolute = liveRootFromArgv(argv, cwd);
-  if (absolute) return absolute;
+  // Go through the ONE live-root resolver (#369) so the install path and the
+  // download path can never disagree about which install is the live one. It
+  // covers the argv-absolute case AND the OS-observed anchor for a relative
+  // `main.py` — strictly more than the argv-only resolution this used to do.
+  const live = resolveLiveServerRoot(argv, cwd);
+  if (live.root) return live.root;
   if (!root) return undefined;
   const relDir = liveRelDirFromArgv(argv);
   if (relDir === undefined) return undefined;

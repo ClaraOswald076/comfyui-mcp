@@ -28,6 +28,41 @@ const installCustomNodeMock = vi.hoisted(() => vi.fn());
 const installModelViaManagerMock = vi.hoisted(() => vi.fn());
 const listInstalledNodesMock = vi.hoisted(() => vi.fn());
 const downloadModelMock = vi.hoisted(() => vi.fn());
+/** #369 post-landing verification. Default: the connected ComfyUI DOES list the
+ *  landed file (the healthy local case these manifest tests model). */
+const verifyLandedModelMock = vi.hoisted(() =>
+  vi.fn(async (targetPath: string) => ({
+    verifiedPath: targetPath,
+    liveVisible: "visible" as const,
+    // The verdict names the root it was made against; the reader below reports the
+    // SAME root, which is what licenses re-asserting it as applied (#369).
+    verifiedAgainstRoot: "/fake/ComfyUI/models",
+  })),
+);
+/** #369: does the connected ComfyUI already list this entry? Default yes, so an
+ *  existing file still counts as a legitimate skip. */
+const liveListingHasEntryMock = vi.hoisted(() =>
+  vi.fn(async (): Promise<boolean | undefined> => true),
+);
+/** #369: is an existing file physically inside a tree the live server reads? Only
+ *  a positive answer licenses an "already exists" SKIP. Default TRUE — these tests
+ *  model the healthy local case; the unconfirmed/stale paths are asserted
+ *  explicitly below. */
+/** #369: does the live server serve a file of this basename in the category?
+ *  Default TRUE — the healthy case these tests model. */
+const liveListingHasBasenameMock = vi.hoisted(() =>
+  vi.fn(async (): Promise<boolean | undefined> => true),
+);
+const isUnderLiveModelRootsMock = vi.hoisted(() =>
+  vi.fn(async (): Promise<{ inRoots: boolean | undefined; liveRoot?: string }> => ({
+    inRoots: true,
+  })),
+);
+/** The models root the connected server reads NOW. Undefined = unknown, which never
+ *  invalidates a verdict. */
+const currentLiveRootMock = vi.hoisted(() =>
+  vi.fn(async (): Promise<string | undefined> => "/fake/ComfyUI/models"),
+);
 const resolveExistingModelFileMock = vi.hoisted(() => vi.fn());
 const listLocalModelsMock = vi.hoisted(() => vi.fn());
 const savedWorkspaceMock = vi.hoisted(() => vi.fn(() => undefined as string | undefined));
@@ -106,6 +141,25 @@ vi.mock("../../services/model-resolver.js", () => ({
   },
   resolveExistingModelFile: (...a: unknown[]) => resolveExistingModelFileMock(...a),
   listLocalModels: (...a: unknown[]) => listLocalModelsMock(...a),
+  // #369: after landing, the job verifies the file against the LIVE server's own
+  // listing, and only a CONFIRMED placement is reported as "applied". These tests
+  // model the healthy local case (the connected ComfyUI does read from there);
+  // the unconfirmed/wrong-place renderings are covered in download-jobs.test.ts
+  // and download-live-destination.test.ts.
+  verifyLandedModel: (...a: unknown[]) => verifyLandedModelMock(...(a as [string, string])),
+  // The "already exists" shortcut confirms the file is one the LIVE server reads
+  // before it counts as a skip (#369). Default: it is.
+  liveListingHasEntry: (...a: unknown[]) => liveListingHasEntryMock(...(a as [string, string])),
+  // A skip additionally requires the live server to really serve a file of that
+  // BASENAME in the category (the container/host path-collision guard). Default yes.
+  liveListingHasBasename: (...a: unknown[]) =>
+    liveListingHasBasenameMock(...(a as [string, string])),
+  // The decisive containment test. Default UNKNOWN (only local config could answer),
+  // so these tests exercise the listing-based fallback.
+  isUnderLiveModelRoots: (...a: unknown[]) => isUnderLiveModelRootsMock(...(a as [string])),
+  // The models root the connected server reads NOW — compared against the root a
+  // verdict was made against, so a replaced server invalidates a stale positive.
+  currentLiveModelsRoot: async (): Promise<string | undefined> => currentLiveRootMock(),
   // Faithful mirror of the real managerModelDestination (pure logic) so the
   // remote-model path resolves a Manager-valid { type, save_path }.
   managerModelDestination: (category: string, relPath?: string) => {
@@ -398,6 +452,118 @@ describe("applyManifest", () => {
     expect(downloadModelMock).not.toHaveBeenCalled();
   });
 
+  // #369 — "already exists" is a claim about a path the RUNNING server may not read.
+  it("FAILS an existing file that is not in any tree the connected ComfyUI reads", async () => {
+    resolveExistingModelFileMock.mockResolvedValueOnce({
+      path: "C:/stale/models/checkpoints/big.safetensors",
+      root: "C:/stale/models",
+      info: { isFile: () => true },
+    });
+    isUnderLiveModelRootsMock.mockResolvedValueOnce({ inRoots: false });
+
+    const result = await applyManifest({
+      manifest: {
+        models: [
+          {
+            url: "https://example.com/big.safetensors",
+            model_type: "checkpoints",
+            filename: "big.safetensors",
+          },
+        ],
+      },
+    });
+
+    expect(result.summary).toMatchObject({ skipped: 0, failed: 1 });
+    expect(result.results[0].message).toMatch(/NOT in any directory/);
+    expect(downloadModelMock).not.toHaveBeenCalled();
+  });
+
+  it("FAILS a same-named existing file that is OUTSIDE every live model root (codex gate r5)", async () => {
+    // C:\Stale\...\big.safetensors exists locally AND the live server has its own
+    // D:\Live\...\big.safetensors, so a name-only listing check would call it a skip.
+    // The containment test is decisive and overrides it.
+    resolveExistingModelFileMock.mockResolvedValueOnce({
+      path: "C:/Stale/models/checkpoints/big.safetensors",
+      root: "C:/Stale/models",
+      info: { isFile: () => true },
+    });
+    // Decisive: the containment answer short-circuits the name-only listing check
+    // (which would have said "yes, the server lists big.safetensors" — its own copy).
+    isUnderLiveModelRootsMock.mockResolvedValueOnce({ inRoots: false });
+
+    const result = await applyManifest({
+      manifest: {
+        models: [
+          {
+            url: "https://example.com/big.safetensors",
+            model_type: "checkpoints",
+            filename: "big.safetensors",
+          },
+        ],
+      },
+    });
+
+    expect(result.summary).toMatchObject({ skipped: 0, failed: 1 });
+    expect(result.results[0].message).toMatch(/NOT in any directory/);
+  });
+
+  it("FAILS a contained file the live server does not serve at all (container/host collision; codex gate r15)", async () => {
+    // The container reports --models-directory /models; the HOST happens to have its
+    // own /models with this file. Containment passes, but the running server does not
+    // list the name anywhere in the category — so it is NOT installed for it.
+    resolveExistingModelFileMock.mockResolvedValueOnce({
+      path: "C:/models/checkpoints/big.safetensors",
+      root: "C:/models",
+      info: { isFile: () => true },
+    });
+    isUnderLiveModelRootsMock.mockResolvedValueOnce({ inRoots: true });
+    liveListingHasBasenameMock.mockResolvedValueOnce(false);
+
+    const result = await applyManifest({
+      manifest: {
+        models: [
+          {
+            url: "https://example.com/big.safetensors",
+            model_type: "checkpoints",
+            filename: "big.safetensors",
+          },
+        ],
+      },
+    });
+
+    expect(result.summary).toMatchObject({ skipped: 0, failed: 1 });
+    expect(result.results[0].message).toMatch(/does not list/);
+    expect(downloadModelMock).not.toHaveBeenCalled();
+  });
+
+  it("reports PENDING (never skipped) when containment cannot be established — even if the server lists the NAME", async () => {
+    // The stale tree and the live tree both hold `big.safetensors`. A name-only
+    // listing hit must NOT promote an unconfirmed placement to "installed".
+    resolveExistingModelFileMock.mockResolvedValueOnce({
+      path: "C:/comfy/models/checkpoints/big.safetensors",
+      root: "C:/comfy/models",
+      info: { isFile: () => true },
+    });
+    isUnderLiveModelRootsMock.mockResolvedValueOnce({ inRoots: undefined });
+    liveListingHasEntryMock.mockResolvedValueOnce(true);
+
+    const result = await applyManifest({
+      manifest: {
+        models: [
+          {
+            url: "https://example.com/big.safetensors",
+            model_type: "checkpoints",
+            filename: "big.safetensors",
+          },
+        ],
+      },
+    });
+
+    expect(result.summary).toMatchObject({ skipped: 0, failed: 0, pending: 1 });
+    expect(result.results[0].message).toMatch(/not confirmed as installed/);
+    expect(result.results[0].message).toMatch(/may be its OWN copy elsewhere/);
+  });
+
   it("skips a CATEGORY-ROOT target found by filename anywhere in the served category", async () => {
     // model_type: checkpoints (category-root target). Not at the computed path
     // nor the exact relative path in any root, but ComfyUI serves it from a
@@ -686,8 +852,11 @@ describe("applyManifest", () => {
       });
       expect(result.results[1].message).toMatch(/not started/i);
       expect(installCustomNodeMock).toHaveBeenCalledTimes(1);
-      // Pending is not a failure: success stays true (nothing FAILED).
-      expect(result.success).toBe(true);
+      // Pending is not a FAILURE, but it is not a settled success either: an
+      // unfinished apply must not report success (#369). `summary.failed` is the
+      // hard-failure signal.
+      expect(result.summary.failed).toBe(0);
+      expect(result.success).toBe(false);
     } finally {
       if (prevBudget === undefined) delete process.env.COMFYUI_MCP_MANIFEST_NODE_BUDGET_MS;
       else process.env.COMFYUI_MCP_MANIFEST_NODE_BUDGET_MS = prevBudget;
@@ -711,8 +880,9 @@ describe("applyManifest", () => {
       expect(result.summary).toMatchObject({ applied: 0, failed: 0, pending: 1 });
       expect(result.results[0].status).toBe("pending");
       expect(result.results[0].message).toMatch(/background|RUNNING/i);
-      // success reflects only that nothing FAILED (the apply isn't fully settled).
-      expect(result.success).toBe(true);
+      // The apply is not settled, so it is not a success — but nothing FAILED.
+      expect(result.summary.failed).toBe(0);
+      expect(result.success).toBe(false);
     } finally {
       if (prevGrace === undefined) delete process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS;
       else process.env.COMFYUI_MCP_DOWNLOAD_GRACE_MS = prevGrace;
@@ -865,7 +1035,12 @@ describe("applyManifest", () => {
         save_path: "default",
         trayCategory: "checkpoints",
       });
-      expect(byAction.model.status).toBe("applied");
+      // #369: a ComfyUI-Manager dispatch is ACCEPTED, not verified as landed
+      // (Manager reports its queue task done even on failure, and there is no local
+      // file to check), so it reports PENDING with the caveat spelled out rather
+      // than claiming an apply nobody confirmed.
+      expect(byAction.model.status).toBe("pending");
+      expect(byAction.model.message).toMatch(/NOT verified as landed/);
     });
 
     it("derives type + save_path from a nested model local_path", async () => {
@@ -933,7 +1108,12 @@ describe("applyManifest", () => {
         save_path: "default",
         trayCategory: "checkpoints",
       });
-      expect(byAction.model.status).toBe("applied");
+      // #369: a ComfyUI-Manager dispatch is ACCEPTED, not verified as landed
+      // (Manager reports its queue task done even on failure, and there is no local
+      // file to check), so it reports PENDING with the caveat spelled out rather
+      // than claiming an apply nobody confirmed.
+      expect(byAction.model.status).toBe("pending");
+      expect(byAction.model.message).toMatch(/NOT verified as landed/);
     });
   });
 });

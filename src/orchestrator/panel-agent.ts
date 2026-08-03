@@ -317,15 +317,16 @@ export class PanelAgent {
   // app-server) would otherwise leave the panel "working" forever. This is an
   // IDLE timer (reset on every received event), NOT a hard turn cap: legit tool
   // work is slow but still streams progress/tool events, so only a TRUE stall
-  // (no events at all for the whole window) trips it. On trip we surface a clear
-  // terminal error (the turn's ONE failure report) and route through the guarded
-  // interrupt() flow: the aborted turn's terminal result — or the bounded
-  // interrupt-release fallback if no result ever arrives — advances the turn-gate
-  // at the genuine turn end, so the next queued batch never runs ahead of the
-  // wedged turn settling (#728).
+  // (no events at all for the whole window) trips it. A capable provider first
+  // receives an explicit harness-stall notice, never a synthetic user rejection.
+  // If that recovery is unavailable or remains silent for another window, the
+  // guarded interrupt() flow provides the existing bounded gate-release fallback
+  // so the next queued batch never runs ahead of a wedged turn settling (#728).
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   /** Guards against a trip firing twice / racing a real result for one turn. */
   private idleTripped = false;
+  /** A provider-native, non-user-cancel recovery is attempted at most once per turn. */
+  private stallRecoverySteered = false;
   /** Tool calls started (item/started) but not yet ended (item/completed). A tool
    *  in flight is legitimate work even when the app-server sends nothing, so the
    *  watchdog defers while this is > 0 — the fix for the #307-review finding that
@@ -656,13 +657,20 @@ export class PanelAgent {
       const done = dl.filter((d) => d.status === "done").map((d) => d.name);
       const failed = dl.filter((d) => d.status !== "done").map((d) => d.name);
       const parts: string[] = [];
-      if (done.length) parts.push(`finished: ${done.join(", ")}`);
+      // This event is raised by the TRANSFER, which finishes BEFORE the placement
+      // check against the connected ComfyUI does. Saying "finished" here would be a
+      // bare success claim during that window (#369) — a model can land in an
+      // install the running server never reads — so the wording says only what the
+      // event actually proves and points at download_status for the verdict.
+      if (done.length) parts.push(`transfer completed: ${done.join(", ")}`);
       if (failed.length) parts.push(`FAILED: ${failed.join(", ")}`);
       const plural = dl.length > 1 ? "these downloads" : "it";
       text =
         `[panel event] Model download ${parts.join("; ")}. ` +
-        `If you were waiting on ${plural} to continue a task, proceed now — ` +
-        `call download_status for the exact landed path(s)${failed.length ? " or the error detail" : ""}. ` +
+        `The bytes finished transferring; whether the connected ComfyUI can actually LOAD ` +
+        `${plural} is confirmed separately. If you were waiting on ${plural} to continue a task, ` +
+        `call download_status FIRST for the verified path and placement verdict${failed.length ? " or the error detail" : ""} — ` +
+        `do not tell the user a model is ready until download_status confirms it. ` +
         `Otherwise reply with ONE short sentence acknowledging it and no tool calls.`;
     }
     if (!text) return false;
@@ -1239,21 +1247,111 @@ export class PanelAgent {
       this.idleTimer = null;
     }
     this.idleTripped = false;
+    this.stallRecoverySteered = false;
     // The turn ended — drop any tool-busy state so a start whose matching end was
     // never seen (errored/interrupted turn) can't defer the NEXT turn's watchdog.
     this.openToolCalls = 0;
     this.toolBusySince = 0;
   }
 
+  /** The exact notice injected into capable providers when a harness watchdog
+   *  sees a frozen turn. It must never be conflated with a user cancellation. */
+  private static readonly STALL_RECOVERY_NOTICE =
+    "[harness stall notice] This turn stalled with no activity and was detected by the harness. " +
+    "The user did NOT reject or cancel this tool call. Do not tell the user that they stopped it. " +
+    "Inspect side effects if the call may have started; otherwise it is safe to retry the same call.";
+
+  /** Finish the legacy interruption path after no native stall recovery is
+   *  available. This retains the existing gate/restart safety for old providers. */
+  private finishStalledTurn(alreadyReported: boolean): void {
+    this.busy = false;
+    // The stalled turn is abandoned — don't re-queue its text (a wedged message
+    // could otherwise loop on every interrupt, and it may already have performed
+    // tool side effects).
+    this.inFlight = null;
+    // …but a run COMPLETION the abandoned turn was carrying is not the agent's
+    // work, it's news the agent still needs (#468). Hand its tokens back so the
+    // journal replays them into the next turn instead of losing them with the
+    // turn we just wrote off.
+    //
+    // THIS is the abandon path. The #587 steer path deliberately does NOT come
+    // here: there the turn stays live and keeps carrying its tokens, so releasing
+    // them would replay a completion the live turn still holds.
+    //
+    // CARRIED only if the backend produced at least one event for this turn —
+    // i.e. it demonstrably received the completion and then went silent. A turn
+    // that produced NOTHING never reached the model, so it must not count toward
+    // the settle bound (that freeze is bounded by the self-restart give-up
+    // machinery instead, which tears the agent down rather than quietly retiring
+    // a completion nobody saw).
+    const stalledTokens = this.turnEventTokens;
+    this.turnEventTokens = [];
+    this.releaseEventTokens(stalledTokens, { carried: this.turnProducedEvents });
+    if (!alreadyReported) {
+      this.deps.onSay(
+        this.tabId,
+        "⚠️ The agent stopped responding (the turn stalled with no activity). I've cleared it — please try again.",
+      );
+    }
+    this.deps.onTurn?.(this.tabId, "done");
+    // Do NOT completeTurn() here: the gate must stay held until the turn genuinely
+    // ends. interrupt() arms the bounded release fallback and stops the wedged
+    // backend; the aborted turn's `result` (or that fallback) releases the next
+    // queued batch at the right moment. The self-restart loop in start() recovers
+    // the session.
+    void this.interrupt();
+  }
+
+  /** Attempt one provider-native recovery before the legacy interrupt path.
+   *  A steer is an explicit agent-facing harness notice, not a synthetic user
+   *  rejection. Its short re-arm preserves the ordinary bounded fallback if the
+   *  provider remains frozen after accepting it. */
+  private async recoverStalledTurn(stalledMarker: number, alreadyReported: boolean): Promise<void> {
+    const recover = this.backend.recoverStalledTurn;
+    if (!recover || this.stallRecoverySteered) {
+      this.finishStalledTurn(alreadyReported);
+      return;
+    }
+    this.stallRecoverySteered = true;
+    let steered = false;
+    try {
+      steered = await recover.call(this.backend, PanelAgent.STALL_RECOVERY_NOTICE);
+    } catch (err) {
+      logger.debug(`[panel-agent ${this.short()}] stalled-turn recovery: ${msgOf(err)}`);
+    }
+    // The active turn may have completed while the asynchronous steer request was
+    // in flight. Never resurrect a settled or replacement turn.
+    const stillCurrent =
+      !this.closed &&
+      this.busy &&
+      this.currentTurnMarker === stalledMarker &&
+      this.completedTurns < this.yieldedTurns;
+    if (!steered || !stillCurrent) {
+      if (stillCurrent) this.finishStalledTurn(alreadyReported);
+      return;
+    }
+    // The provider accepted the precise notice. Keep the turn authoritative and
+    // allow a second full idle window; if it remains frozen, the next watchdog
+    // trip falls through to the established bounded interrupt/restart recovery.
+    this.idleTripped = false;
+    this.bumpIdleWatchdog();
+    if (!alreadyReported) {
+      this.deps.onSay(
+        this.tabId,
+        "⚠️ The agent stalled with no activity. I sent it a harness-stall notice — you did NOT cancel it; it can inspect state and retry safely.",
+      );
+    }
+  }
+
   /** The current turn produced NO events for the whole idle window → it's frozen.
-   *  Surface a clear error (unless this turn's failure was ALREADY reported — one
-   *  report per turn), clear the "working" indicator, and interrupt via the
-   *  guarded interrupt() flow so the turn-gate opens only when the turn GENUINELY
-   *  ends (the aborted turn's terminal result, or the bounded interrupt-release
-   *  fallback if none arrives) — not synchronously here, which let the next queued
-   *  batch run before the wedged turn had settled. errorSurfaced +
-   *  interruptRequested suppress the follow-up interrupted result's "turn failed"
-   *  line (#728). Idempotent per turn via idleTripped. */
+   *  First send a capable provider an explicit non-user-cancel notice. If that
+   *  is unavailable (or it remains silent through another full window), surface
+   *  the legacy clear + use the guarded interrupt() flow so the turn-gate opens
+   *  only when the turn GENUINELY ends (the aborted turn's terminal result, or the
+   *  bounded interrupt-release fallback if none arrives) — not synchronously here,
+   *  which let the next queued batch run before the wedged turn had settled.
+   *  errorSurfaced + interruptRequested suppress the follow-up interrupted
+   *  result's "turn failed" line (#728). Idempotent per trip via idleTripped. */
   private onTurnStalled(): void {
     if (this.closed || this.idleTripped || !this.busy) return;
     // A tool call in flight is legitimate work even with a silent app-server (an
@@ -1276,41 +1374,20 @@ export class PanelAgent {
     // failure. (interrupt() also sets interruptRequested, so the result case
     // treats that result as the interrupt landing, not a new failure.)
     const alreadyReported = this.errorSurfaced;
+    const recovery = this.stallRecoverySteered || !this.backend.recoverStalledTurn
+      ? " via legacy interrupt"
+      : " with provider notice";
     logger.error(
-      `[panel-agent ${this.short()}] turn stalled — no events for ${Math.round(TURN_IDLE_MS / 1000)}s; interrupting${alreadyReported ? " (failure already reported)" : " and surfacing error"}`,
+      `[panel-agent ${this.short()}] turn stalled — no events for ${Math.round(TURN_IDLE_MS / 1000)}s; recovering${recovery}${alreadyReported ? " (failure already reported)" : " and surfacing error"}`,
     );
     this.errorSurfaced = true;
-    this.busy = false;
-    // The stalled turn is abandoned + surfaced as an error — don't re-queue its
-    // text (a wedged message could otherwise loop on every interrupt, and it may
-    // already have performed tool side effects).
-    this.inFlight = null;
-    // …but a run COMPLETION the abandoned turn was carrying is not the agent's
-    // work, it's news the agent still needs (#468). Hand its tokens back so the
-    // journal replays them into the next turn instead of losing them with the
-    // turn we just wrote off.
-    const stalledTokens = this.turnEventTokens;
-    this.turnEventTokens = [];
-    // CARRIED only if the backend produced at least one event for this turn —
-    // i.e. it demonstrably received the completion and then went silent. A turn
-    // that produced NOTHING never reached the model, so it must not count toward
-    // the settle bound (that freeze is bounded by the self-restart give-up
-    // machinery instead, which tears the agent down rather than quietly retiring
-    // a completion nobody saw).
-    this.releaseEventTokens(stalledTokens, { carried: this.turnProducedEvents });
-    if (!alreadyReported) {
-      this.deps.onSay(
-        this.tabId,
-        "⚠️ The agent stopped responding (the turn stalled with no activity). I've cleared it — please try again.",
-      );
-    }
-    this.deps.onTurn?.(this.tabId, "done");
-    // Do NOT completeTurn() here: the gate must stay held until the turn genuinely
-    // ends. interrupt() arms the bounded release fallback and stops the wedged
-    // backend; the aborted turn's `result` (or that fallback) releases the next
-    // queued batch at the right moment. The self-restart loop in start() recovers
-    // the session.
-    void this.interrupt();
+    const stalledMarker = this.currentTurnMarker;
+    // #468 note: the run-completion tokens this turn is carrying are handed back
+    // in finishStalledTurn(), NOT here. #587 introduced a path where the stall is
+    // recovered by STEERING the provider and the turn stays live — releasing the
+    // tokens on that path would replay the completion into a turn that is still
+    // holding it, i.e. a duplicate. Only the genuinely-abandoned path releases.
+    void this.recoverStalledTurn(stalledMarker, alreadyReported);
   }
 
   // Handle a canonical AgentEvent from the backend. This is the provider-agnostic

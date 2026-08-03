@@ -1,11 +1,12 @@
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, type Stats } from "node:fs";
+import { platform } from "node:os";
 import { readdir, stat, mkdir, readFile, lstat, realpath } from "node:fs/promises";
 import { dirname, join, basename, resolve, relative, sep, isAbsolute, extname } from "node:path";
-import { config, isRemoteMode } from "../config.js";
+import { config, getComfyUIBaseUrl, isRemoteMode } from "../config.js";
 import { getClient, getSystemStats } from "../comfyui/client.js";
 import { getExtraModelRoots, getLiveExtraModelRoots } from "./extra-paths.js";
-import { resolveEffectiveComfyUIBase, liveRootFromArgv } from "./workspace-env.js";
+import { resolveEffectiveComfyUIBase, resolveLiveServerRoot } from "./workspace-env.js";
 import { installModelViaManager } from "./node-management.js";
 import { ModelError, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
@@ -17,7 +18,9 @@ import {
   resolveModelsDirWithBases,
   parseModelsDirFromArgv,
   hasUnresolvableRelativeModelDirFlag,
+  isLiveAuthoritativeModelsDir,
   type LiveServerSnapshot,
+  type ModelsDirSource,
 } from "./output-dir.js";
 import {
   applyDownloadAuth,
@@ -581,6 +584,618 @@ export function resolveModelSubfolder(targetSubfolder: string): string {
   return targetDir;
 }
 
+// ---------------------------------------------------------------------------
+// Live-server visibility (#369): does the CONNECTED ComfyUI actually read here?
+// ---------------------------------------------------------------------------
+
+/**
+ * The file extensions ComfyUI core registers for its model folders
+ * (`folder_paths.supported_pt_extensions`). Deliberately EXCLUDES `.gguf` and
+ * other custom-node-registered types: this set is used to decide whether a
+ * candidate directory's contents SHOULD appear in the live server's listing, and
+ * over-including would turn "core doesn't list this type" into a false refusal.
+ */
+const CORE_MODEL_EXTENSIONS = new Set([
+  ".ckpt",
+  ".pt",
+  ".pt2",
+  ".bin",
+  ".pth",
+  ".safetensors",
+  ".sft",
+]);
+
+/** The models/ CATEGORY a target subfolder belongs to — its first path segment
+ *  (`"loras/sdxl"` → `"loras"`), which is the folder name ComfyUI's `/models/<cat>`
+ *  endpoint is keyed by. */
+function categoryOf(targetSubfolder: string): string {
+  return (targetSubfolder ?? "").trim().split(/[\\/]+/).filter(Boolean)[0] ?? "";
+}
+
+/** The part of a target subfolder BELOW its category (`"loras/sdxl/x"` → `"sdxl/x"`,
+ *  `"loras"` → `""`). ComfyUI's `/models/<category>` listing is relative to the
+ *  category, so this is what a landed file's entry must be prefixed with. */
+function subfolderRemainder(targetSubfolder: string): string {
+  const parts = (targetSubfolder ?? "").trim().split(/[\\/]+/).filter(Boolean);
+  return parts.slice(1).join("/");
+}
+
+/**
+ * What the LIVE server reports for a model category via its own `/models/<cat>`
+ * endpoint — the SAME source of truth `list_local_models` reads, which is exactly
+ * why #369 was so confusing: the reader asked the server and the writer asked
+ * COMFYUI_PATH, and the two disagreed silently.
+ *
+ * Returns `undefined` (INCONCLUSIVE — never an empty array) when the server is
+ * unreachable, the endpoint is absent/errors, or the body is not a string array.
+ * Callers must treat inconclusive as "no evidence", never as "no files".
+ */
+export async function liveCategoryListing(
+  category: string,
+): Promise<string[] | undefined> {
+  if (!category) return undefined;
+  try {
+    const client = getClient();
+    const res = await client.fetchApi(`/models/${encodeURIComponent(category)}`);
+    if (!res.ok) return undefined;
+    const json = (await res.json()) as unknown;
+    if (!Array.isArray(json)) return undefined;
+    return json.filter((n): n is string => typeof n === "string");
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Model files under a category directory, as CATEGORY-RELATIVE paths — the exact
+ * form ComfyUI's `/models/<category>` listing uses (`"sdxl/x.safetensors"`). Bare
+ * basenames would make `loras/a/shared.safetensors` look accounted for by a live
+ * `loras/b/shared.safetensors` from a different install (codex gate, round 9).
+ */
+async function coreModelFilesUnder(categoryDir: string): Promise<string[]> {
+  let entries: string[] | undefined;
+  try {
+    entries = await readdir(categoryDir, { recursive: true });
+  } catch {
+    return [];
+  }
+  // Not just tidiness: this feeds a REFUSAL, so an unreadable/odd listing must
+  // become "no evidence", never a crash inside the download path.
+  if (!Array.isArray(entries)) return [];
+  return entries
+    .filter((e) => typeof e === "string" && CORE_MODEL_EXTENSIONS.has(extname(e).toLowerCase()))
+    .map((e) => normRel(e));
+}
+
+/** How many populated categories of the candidate models root we cross-check.
+ *  Bounded so a large models tree costs a handful of cheap HTTP calls, not one
+ *  per folder. */
+const DISAGREEMENT_PROBE_CATEGORIES = 6;
+
+/** Immediate subdirectories of the candidate models root, in a stable order. */
+async function categoriesUnder(modelsRoot: string): Promise<string[]> {
+  try {
+    const entries = await readdir(modelsRoot, { withFileTypes: true });
+    if (!Array.isArray(entries)) return [];
+    const names: string[] = [];
+    for (const e of entries) {
+      const entry = e as { name?: unknown; isDirectory?: unknown } | null;
+      if (!entry || typeof entry.isDirectory !== "function") continue;
+      if (typeof entry.name !== "string") continue;
+      if ((entry.isDirectory as () => boolean)()) names.push(entry.name);
+    }
+    return names.sort();
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * REFUSE a destination the connected ComfyUI demonstrably does not read from.
+ *
+ * Runs ONLY when the models root came from LOCAL CONFIGURATION that the running
+ * server never vouched for (`configured-base` / `base-anchored`) — a live-resolved
+ * root is already authoritative and needs no second opinion. The test is a pure
+ * disagreement check against the server's own `/models/<category>` listing: if a
+ * category directory in the candidate root holds core-extension model files and the
+ * live server lists NONE of them, that root is not part of its search path. That is
+ * the #369 signature exactly (3 files on disk, 24 unrelated files in the live
+ * listing), and catching it BEFORE the transfer saves the user the multi-GB download
+ * that would otherwise be reported as a success and then be invisible.
+ *
+ * The evidence is gathered ROOT-WIDE, not just from the target category: a stale
+ * install commonly has an EMPTY `diffusion_models/` while its `checkpoints/` is full
+ * of files the live server has never heard of (codex gate, round 1 — the target
+ * category alone made an empty-but-wrong destination look evidence-free).
+ *
+ * Agreement means CONTAINMENT, not overlap (codex gate, round 5): a directory the
+ * server scans has ALL of its model files in that server's listing. A single shared
+ * filename proves nothing — two unrelated installs routinely hold the same popular
+ * checkpoint — so overlap alone must never suppress the refusal.
+ *
+ * POSITIVE EVIDENCE ONLY. There is deliberately no "the live server lists models
+ * this tree cannot account for" rule: being unable to EXPLAIN the server's models is
+ * absence of evidence, not proof that this destination belongs to another install
+ * (maintainer ruling). Unaccountable is a proceed-unverified state — see the note at
+ * the end of the body.
+ *
+ * Fails OPEN on anything inconclusive — server unreachable, endpoint missing, an
+ * empty candidate directory, or full containment. It must never block a legitimate
+ * download into a fresh or shared models tree.
+ */
+async function assertDestinationVisibleToLiveServer(
+  modelsRoot: string,
+  targetSubfolder: string,
+  source: ModelsDirSource,
+  snapshot: LiveServerSnapshot,
+): Promise<void> {
+  // A live-resolved root that EXISTS on this filesystem is authoritative and needs
+  // no second opinion. A live-resolved root that does NOT exist locally is a
+  // different animal: a loopback ComfyUI inside Docker / behind an SSH forward
+  // reports its CONTAINER-side `--models-directory`, and writing that path here
+  // silently creates a host directory the server never reads (codex gate, round 3).
+  // The check below is cheap and fails open, so run it for that case too.
+  if (isLiveAuthoritativeModelsDir(source) && existsSync(modelsRoot)) return;
+  if (!snapshot.reachable || isRemoteMode()) return;
+
+  // The target category first (it is the one that matters), then the rest of the
+  // root — so a populated sibling can still expose a wrong install when the target
+  // folder happens to be empty.
+  const target = categoryOf(targetSubfolder);
+  const present = await categoriesUnder(modelsRoot);
+  const primary = [...(target ? [target] : []), ...present.filter((c) => c !== target)];
+
+  let probed = 0;
+  let worst: { category: string; missing: string[]; onDisk: number; live: number } | undefined;
+
+  for (const category of primary) {
+    if (probed >= DISAGREEMENT_PROBE_CATEGORIES) break;
+    const onDisk = await coreModelFilesUnder(join(modelsRoot, category));
+    if (onDisk.length === 0) continue; // nothing here to contradict anything
+    const listing = await liveCategoryListing(category);
+    if (listing === undefined) continue; // the server can't speak for it — no evidence
+    probed += 1;
+    // CONTAINMENT, not overlap. If this directory really is one the server reads, it
+    // SCANS it — so EVERY core-extension file in it must appear in the listing. A
+    // merely-overlapping name proves nothing: two unrelated installs routinely share
+    // `sd_xl_base_1.0.safetensors`, and treating that as agreement let a download
+    // proceed into a stale tree (codex gate, round 5). Compared as CATEGORY-RELATIVE
+    // paths, so `a/shared.safetensors` is not accounted for by a live
+    // `b/shared.safetensors` (codex gate, round 9).
+    const liveNames = new Set(listing.map((n) => normRel(n)));
+    const missing = onDisk.filter((n) => !liveNames.has(n));
+    if (missing.length === 0) continue; // this folder is fully accounted for — agrees
+    worst = { category, missing, onDisk: onDisk.length, live: listing.length };
+    break;
+  }
+
+  if (worst) {
+    const sample = worst.missing.slice(0, 3).join(", ");
+    throw new ModelError(
+      `Refusing to download into "${modelsRoot}": the connected ComfyUI ` +
+        `(${getComfyUIBaseUrl()}) does not read from it. Its "${worst.category}" folder holds ` +
+        `${worst.onDisk} model file(s), ${worst.missing.length} of which the running server does ` +
+        `NOT list (e.g. ${sample}) — if it scanned this directory it would see all of them, so ` +
+        "this is a DIFFERENT install than the one serving you. This destination came from local " +
+        "configuration (COMFYUI_PATH / the saved default workspace), not from the running server, " +
+        "which could not tell us its own install root. Point COMFYUI_PATH at the ComfyUI that is " +
+        "actually running, or launch it with an absolute --base-directory, then retry.",
+    );
+  }
+
+  // NOTE — there is deliberately NO 'the server lists models this tree does not contain'
+  // refusal. That inference is itself absence of evidence: not being able to ACCOUNT
+  // for the server's models is not proof the destination belongs to a different
+  // install. The roots could be registered by a config we cannot read, one deleted
+  // after the server loaded it, or a path shape nobody has enumerated yet — and each
+  // time that rule was tightened it produced another FALSE REFUSAL of a legitimate
+  // setup (an external drive, a moved YAML). Per the maintainer ruling, unaccountable
+  // is a PROCEED-UNVERIFIED state, not a refusal: the download goes through and the
+  // post-write check reports honestly. This guard refuses only on POSITIVE evidence —
+  // files sitting in this tree that the running server demonstrably does not read.
+}
+
+/** Normalize a listing entry / relative path for comparison (ComfyUI reports
+ *  OS-native separators). */
+function normRel(s: string): string {
+  return s.replace(/\\/g, "/").replace(/^\.?\//, "");
+}
+
+/** The category-relative entry a file at `<models>/<targetSubfolder>/<filename>`
+ *  would appear as in ComfyUI's `/models/<category>` listing. */
+function listingEntryFor(targetSubfolder: string, filename: string): string {
+  const rest = subfolderRemainder(targetSubfolder);
+  return normRel(rest ? `${rest}/${filename}` : filename);
+}
+
+/**
+ * Was this exact entry ALREADY in the live server's listing before we wrote?
+ *
+ * Captured BEFORE the transfer so the post-write check can tell "the server now
+ * sees the file BECAUSE we wrote it" from "the server already had a file of that
+ * name somewhere else". Without that distinction a download into a stale tree that
+ * happens to share a filename with the live install verifies as `visible` and is
+ * reported as a success (codex gate, round 3). `undefined` = the server could not
+ * answer, so nothing is known either way.
+ */
+export async function liveListingHasEntry(
+  targetSubfolder: string,
+  filename: string,
+): Promise<boolean | undefined> {
+  const listing = await liveCategoryListing(categoryOf(targetSubfolder));
+  if (listing === undefined) return undefined;
+  const wanted = listingEntryFor(targetSubfolder, filename);
+  return listing.some((n) => normRel(n) === wanted);
+}
+
+/**
+ * Does the live server list a file with this BASENAME anywhere in the category?
+ *
+ * Deliberately looser than `liveListingHasEntry`: the manifest's existing-file
+ * lookup itself matches a basename anywhere in the served category (a `checkpoints`
+ * target satisfied by `checkpoints/sdxl/big.safetensors`), so confirming it with an
+ * exact-path check would FAIL legitimate nested installs. This is used only as an
+ * ADDITIONAL requirement on the skip path — it can rule a skip out, never in on its
+ * own. `undefined` = the server could not answer.
+ */
+export async function liveListingHasBasename(
+  category: string,
+  filename: string,
+): Promise<boolean | undefined> {
+  const listing = await liveCategoryListing(categoryOf(category));
+  if (listing === undefined) return undefined;
+  const wanted = basename(filename);
+  return listing.some((n) => basename(normRel(n)) === wanted);
+}
+
+/**
+ * Is `absPath` inside a directory tree the CONNECTED server actually reads models
+ * from — its primary models root, or a LIVE-registered extra model root (the #633
+ * external-drive shape)?
+ *
+ * `undefined` means UNKNOWN, not "no": the primary root itself could only be
+ * resolved from local configuration the running server never vouched for, so
+ * containment in it says nothing. Callers must treat unknown as unconfirmed, never
+ * as confirmation. Never throws.
+ */
+export interface LiveRootMembership {
+  /** true = inside a tree the server reads; false = demonstrably not; undefined =
+   *  only local configuration could answer, so nothing is known. */
+  inRoots: boolean | undefined;
+  /** The live primary models root this answer was computed against, when it was
+   *  live-authoritative. Returned so a caller can STAMP the exact root it checked
+   *  rather than taking a second, possibly-later observation (codex gate, r12). */
+  liveRoot?: string;
+}
+
+export async function isUnderLiveModelRoots(
+  absPath: string,
+  /** The models CATEGORY the path belongs to. Live extra roots are category-scoped
+   *  (`{ category, dir }`), so a `checkpoints` root must never vouch for a LoRA
+   *  (codex gate, round 6). Omitted = consider every root. */
+  category?: string,
+): Promise<LiveRootMembership> {
+  /** Canonicalize so a junctioned/symlinked root is compared by where it REALLY
+   *  lives. `C:\ComfyUI\models` being a junction to `D:\Models` is a legitimate,
+   *  supported layout; a lexical-only compare would call a correctly-placed file
+   *  "outside the live roots" and fabricate a failure (codex gate, round 6). */
+  const canon = async (p: string): Promise<{ real: string; lex: string; ok: boolean }> => {
+    const lex = resolve(p);
+    try {
+      return { real: resolve(await realpath(p)), lex, ok: true };
+    } catch {
+      return { real: lex, lex, ok: false }; // not created yet / unreadable
+    }
+  };
+  const target = await canon(absPath);
+  const under = (root: { real: string; lex: string }): boolean => {
+    const hit = (r: string, t: string): boolean => t === r || t.startsWith(r + sep);
+    // Either canonical form matching is enough — only ONE side may be resolvable.
+    return (
+      hit(root.real, target.real) ||
+      hit(root.lex, target.lex) ||
+      hit(root.real, target.lex) ||
+      hit(root.lex, target.real)
+    );
+  };
+
+  let dest: Awaited<ReturnType<typeof resolveModelsDirWithBases>>;
+  try {
+    dest = await resolveModelsDirWithBases();
+  } catch {
+    return { inRoots: undefined };
+  }
+  if (!isLiveAuthoritativeModelsDir(dest.source)) return { inRoots: undefined };
+  const liveRoot = resolve(dest.modelsDir);
+
+  // A negative answer is only honest when everything it rests on could actually be
+  // canonicalized; otherwise say UNKNOWN rather than accuse a correct placement.
+  let fullyCanonical = target.ok;
+  const primary = await canon(dest.modelsDir);
+  fullyCanonical = fullyCanonical && primary.ok;
+  if (under(primary)) return { inRoots: true, liveRoot };
+
+  let extra: Awaited<ReturnType<typeof getLiveExtraModelRoots>>;
+  try {
+    extra = await getLiveExtraModelRoots(dest.snapshot);
+  } catch {
+    return { inRoots: undefined, liveRoot };
+  }
+  const wantCat = (category ?? "").trim().toLowerCase();
+  for (const r of extra.roots) {
+    if (wantCat && String(r.category ?? "").trim().toLowerCase() !== wantCat) continue;
+    const rc = await canon(r.dir);
+    fullyCanonical = fullyCanonical && rc.ok;
+    if (under(rc)) return { inRoots: true, liveRoot };
+  }
+  // The live roots are known and this path is in none of them.
+  if (!extra.authoritative) return { inRoots: undefined, liveRoot };
+  return { inRoots: fullyCanonical ? false : undefined, liveRoot };
+}
+
+/**
+ * The models root the connected server reads RIGHT NOW — and ONLY when that answer
+ * is LIVE-AUTHORITATIVE. A transient `/system_stats` outage makes the resolver fall
+ * back to COMFYUI_PATH, and reporting THAT as "what the server reads now" would
+ * downgrade a correctly verified download with a false "a DIFFERENT install"
+ * warning (codex gate, round 12). Unknown is the honest answer there. Never throws.
+ */
+/** Do two absolute models roots name the same directory? Windows paths are
+ *  case-insensitive and mix separators, so comparing them raw would report a
+ *  server "change" that never happened. */
+export function sameModelsRoot(a: string, b: string): boolean {
+  const norm = (s: string): string => {
+    const slashed = s.replace(/\\/g, "/").replace(/\/+$/, "");
+    return platform() === "win32" ? slashed.toLowerCase() : slashed;
+  };
+  return norm(a) === norm(b);
+}
+
+export async function currentLiveModelsRoot(): Promise<string | undefined> {
+  try {
+    const dest = await resolveModelsDirWithBases();
+    if (!isLiveAuthoritativeModelsDir(dest.source)) return undefined;
+    return resolve(dest.modelsDir);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Why a destination could not be confirmed, and how the USER can upgrade themselves
+ * into a verified answer.
+ *
+ * Saying "unconfirmed" without saying WHY leaves the user with nothing to act on.
+ * There are exactly two reasons the live root stays unpinnable: the running server
+ * reported a relative `main.py` with no working directory (so its own report is not
+ * enough), and the OS process table could not be read to identify the process on our
+ * port. The second is a TOOLING gap on POSIX — `lsof` is simply not installed on
+ * many minimal images — and installing it converts this host into a verifiable one.
+ */
+function unverifiableDestinationRemedy(): string {
+  const probe =
+    platform() === "win32"
+      ? "the process listening on the ComfyUI port could not be identified"
+      : "the process listening on the ComfyUI port could not be identified (this needs `lsof`, " +
+        "which is missing on many minimal images — installing it makes future downloads verifiable)";
+  return (
+    "This happens when the running ComfyUI reports a RELATIVE main.py with no working " +
+    `directory AND ${probe}. To get a definite answer: point COMFYUI_PATH at the ComfyUI ` +
+    "that is actually running, launch it with an absolute --base-directory, or make its " +
+    "process observable. Meanwhile, confirm with list_local_models."
+  );
+}
+
+export interface LandedModelVerification {
+  /** The path CONFIRMED to exist on disk after the download (symlinks resolved).
+   *  This — never the intended path — is what callers report. */
+  verifiedPath?: string;
+  /** The live models root this verdict was made against. A reader that finds the
+   *  CONNECTED server reading a different root must treat the verdict as stale
+   *  rather than re-assert it (codex gate, round 11). */
+  verifiedAgainstRoot?: string;
+  /** Whether the CONNECTED ComfyUI actually lists the landed file. */
+  liveVisible: "visible" | "not-visible" | "unknown";
+  /** Why, for anything other than a plain "visible". */
+  note?: string;
+}
+
+/** How many times we re-ask the live server before concluding a landed file is
+ *  invisible to it. ComfyUI caches its folder listings and invalidates on the
+ *  directory mtime, so the first re-read normally already sees the new file; the
+ *  retries only cover a filesystem whose mtime lands a beat late. */
+const LIVE_VISIBILITY_ATTEMPTS = 3;
+const LIVE_VISIBILITY_RETRY_MS = 1000;
+
+/**
+ * Confirm, AFTER a download lands, that the bytes are (a) really on disk and
+ * (b) somewhere the LIVE server reads from — then report the path we actually
+ * confirmed. Reporting the INTENDED path is what made #369 a fabricated success:
+ * `download_status` said "done … landed at <stale install>" while the running
+ * ComfyUI could not see the file at all.
+ *
+ * Never throws: a completed transfer must not be turned into a failure by a
+ * verification hiccup. An inconclusive answer is reported as `unknown` with the
+ * reason, which callers surface instead of an unqualified success.
+ */
+export async function verifyLandedModel(
+  targetPath: string,
+  targetSubfolder: string,
+  opts?: {
+    attempts?: number;
+    retryMs?: number;
+    /** Whether the live server ALREADY listed this exact entry BEFORE the download
+     *  (liveListingHasEntry, captured by the job before it started). */
+    listedBefore?: boolean;
+  },
+): Promise<LandedModelVerification> {
+  let verifiedPath: string | undefined;
+  try {
+    const info = await stat(targetPath);
+    if (!info.isFile()) {
+      return {
+        liveVisible: "unknown",
+        note: `${targetPath} exists but is not a file.`,
+      };
+    }
+    try {
+      verifiedPath = resolve(await realpath(targetPath));
+    } catch {
+      verifiedPath = resolve(targetPath);
+    }
+  } catch {
+    return {
+      liveVisible: "unknown",
+      note: `The file could not be confirmed on disk at ${targetPath}.`,
+    };
+  }
+
+  if (isRemoteMode()) {
+    return {
+      verifiedPath,
+      liveVisible: "unknown",
+      note: "The connected ComfyUI is remote, so local on-disk placement cannot be checked against it.",
+    };
+  }
+
+  const category = categoryOf(targetSubfolder);
+  // Match the FULL path the server would report relative to the category, not the
+  // bare filename: `/models/loras` lists nested entries as "a/foo.safetensors", so a
+  // basename comparison would call a download into `loras/a` "visible" because the
+  // LIVE tree happens to hold an unrelated `loras/b/foo.safetensors` — a direct
+  // false success (codex gate, round 2). Separators are normalized because ComfyUI
+  // reports OS-native ones.
+  const wanted = listingEntryFor(targetSubfolder, basename(targetPath));
+  const attempts = opts?.attempts ?? LIVE_VISIBILITY_ATTEMPTS;
+  const retryMs = opts?.retryMs ?? LIVE_VISIBILITY_RETRY_MS;
+
+  // Is the directory we wrote into one the RUNNING server told us about? Only then
+  // does "the server lists this name" prove that the bytes we just wrote are the
+  // ones it will load. On a locally-configured root a pre-existing entry of the
+  // same name in the LIVE tree would otherwise verify our write into a STALE tree
+  // as a success (codex gate, round 3) — so a name that was already listed BEFORE
+  // the download proves nothing there.
+  // Is the file inside a tree the RUNNING server actually reads? `true` makes the
+  // listing decisive; `false` means it demonstrably is not (a ComfyUI restart onto
+  // a DIFFERENT install between the write and this check produces exactly that —
+  // codex gate, round 4); `undefined` means only local configuration could answer,
+  // so a pre-existing listing entry proves nothing about OUR bytes.
+  const landed = verifiedPath ?? resolve(targetPath);
+  const membership = await isUnderLiveModelRoots(landed, category);
+  const destinationIsLiveAuthoritative = membership.inRoots === true;
+  if (membership.inRoots === false) {
+    const liveRoot = membership.liveRoot;
+    return {
+      verifiedPath,
+      verifiedAgainstRoot: liveRoot,
+      liveVisible: "not-visible",
+      note:
+        `The file IS on disk at ${landed}, but that is OUTSIDE every directory the ` +
+        `connected ComfyUI (${getComfyUIBaseUrl()}) reads models from` +
+        (liveRoot ? ` (its models directory is ${liveRoot})` : "") +
+        ". This happens when the running server is replaced by a different install " +
+        "while a download is in flight. Move the file into the running server's models " +
+        "tree, or re-download now that the correct server is connected.",
+    };
+  }
+  // A listing hit only PROVES something about the bytes we just wrote when the
+  // directory we wrote to is one the RUNNING server told us it reads. On any other
+  // destination the listing describes a tree we cannot tie to this write:
+  //   - the name may have been there all along (round 3);
+  //   - the pre-write listing may have been unavailable, so "it appeared" is not
+  //     established (round 14);
+  //   - the server answering AFTER the write may not even be the one that answered
+  //     BEFORE it, and its own same-named model then masquerades as ours (round 17).
+  // Each of those was a separate route to a fabricated success, and every fix that
+  // stopped short of this rule left another. So: a non-authoritative destination is
+  // reported HONESTLY as unconfirmed. It costs a noisier message on hosts where the
+  // live root cannot be pinned; it never refuses, never fails, and never lies.
+  const ambiguous = !destinationIsLiveAuthoritative;
+
+  let sawListing = false;
+  for (let i = 0; i < attempts; i++) {
+    const listing = await liveCategoryListing(category);
+    if (listing !== undefined) {
+      sawListing = true;
+      if (listing.some((n) => normRel(n) === wanted)) {
+        // RE-CHECK membership AFTER the listing. The root check and the listing are
+        // two separate observations; a ComfyUI restart onto a DIFFERENT install
+        // between them would otherwise let the NEW server's own same-named model
+        // confirm OUR file, which that server cannot read (codex gate, round 11).
+        const still = await isUnderLiveModelRoots(landed, category);
+        if (still.inRoots === false) {
+          return {
+            verifiedPath,
+            // Stamp the root THIS check ran against — never a third, later
+            // observation, which could name yet another server (codex gate, r12).
+            verifiedAgainstRoot: still.liveRoot,
+            liveVisible: "not-visible",
+            note:
+              `The file IS on disk at ${landed}, but the connected ComfyUI ` +
+              `(${getComfyUIBaseUrl()}) changed while this was being checked and no longer ` +
+              "reads from that location — the entry it lists is its OWN file of the same name. " +
+              "Re-download now that the correct server is connected.",
+          };
+        }
+        if (!ambiguous) {
+          return {
+            verifiedPath,
+            // The root the POST-listing membership check just validated against —
+            // taking a fresh observation here could stamp a server that replaced it
+            // between the two awaits (codex gate, round 12).
+            verifiedAgainstRoot: still.liveRoot ?? membership.liveRoot,
+            liveVisible: "visible",
+          };
+        }
+        return {
+          verifiedPath,
+          liveVisible: "unknown",
+          note:
+            `The connected ComfyUI (${getComfyUIBaseUrl()}) lists "${wanted}" under "${category}", ` +
+            "but this destination came from local configuration rather than from the running " +
+            "server, so that listing cannot be tied to the file just written to " +
+            `${verifiedPath} — it may be the server's own copy elsewhere` +
+            (opts?.listedBefore === true
+              ? " (it already listed that name before this download)"
+              : opts?.listedBefore === undefined
+                ? " (whether it listed that name before this download could not be checked)"
+                : "") +
+            ". " +
+            unverifiableDestinationRemedy(),
+        };
+      }
+    }
+    if (i < attempts - 1 && retryMs > 0) {
+      await new Promise((r) => setTimeout(r, retryMs));
+    }
+  }
+  if (!sawListing) {
+    return {
+      verifiedPath,
+      liveVisible: "unknown",
+      note:
+        `The connected ComfyUI (${getComfyUIBaseUrl()}) did not answer for the ` +
+        `"${category}" model folder, so it could not be confirmed that it reads from this location.`,
+    };
+  }
+  let liveModelsDir: string | undefined;
+  try {
+    liveModelsDir = await resolveModelsDir();
+  } catch {
+    liveModelsDir = undefined;
+  }
+  return {
+    verifiedPath,
+    liveVisible: "not-visible",
+    note:
+      `The file IS on disk at ${verifiedPath}, but the connected ComfyUI ` +
+      `(${getComfyUIBaseUrl()}) does NOT list "${wanted}" under "${category}" — it will not be ` +
+      `usable in a workflow from there.` +
+      (liveModelsDir ? ` The models directory that server reads is ${liveModelsDir}.` : "") +
+      " Move the file into the running server's models tree (or point COMFYUI_PATH at that install and re-download).",
+  };
+}
+
 /**
  * Like resolveModelSubfolder, but roots the destination at the CONNECTED
  * server's real models directory (its `--base-directory`/models, read from
@@ -594,6 +1209,22 @@ export function resolveModelSubfolder(targetSubfolder: string): string {
 export async function resolveModelSubfolderPreferServer(
   targetSubfolder: string,
 ): Promise<string> {
+  return (await resolveModelSubfolderWithLiveRoot(targetSubfolder)).targetDir;
+}
+
+/**
+ * As `resolveModelSubfolderPreferServer`, but also returns the LIVE models root that
+ * THIS resolution used — when it was live-authoritative.
+ *
+ * The writer must bind its destination to the server the destination was computed
+ * for. Taking a separate observation afterwards leaves a window in which the server
+ * is replaced BETWEEN the resolution and the capture, so both later observations
+ * agree with each other while the target still points into the previous install
+ * (codex gate, round 18). Returning it from the same call closes that window.
+ */
+export async function resolveModelSubfolderWithLiveRoot(
+  targetSubfolder: string,
+): Promise<{ targetDir: string; liveRootAtResolve?: string }> {
   const raw = (targetSubfolder ?? "").trim();
   if (!raw) {
     throw new ModelError("target_subfolder is required (e.g. 'loras', 'checkpoints').");
@@ -607,12 +1238,18 @@ export async function resolveModelSubfolderPreferServer(
   // code-root veto needs, AND the snapshot the escape-authorizer uses — so they can
   // never disagree (a second stats call could straddle a server restart and combine
   // model roots from server B with code bases from server A; #633 codex).
-  const { modelsDir, baseDirs, snapshot } = await resolveModelsDirWithBases();
+  const { modelsDir, baseDirs, snapshot, source } = await resolveModelsDirWithBases();
   const modelsRoot = resolve(modelsDir);
   const targetDir = resolve(modelsRoot, raw);
   if (targetDir !== modelsRoot && !targetDir.startsWith(modelsRoot + sep)) {
     throw new ModelError(`Refusing to write outside the models directory: ${raw}`);
   }
+  // The root did NOT come from the running server (it could not tell us where it
+  // lives, so we fell back to local config). Before writing, check the one thing
+  // that can still expose a stale-install destination: the server's own listing for
+  // this category. #369 shipped 4.88 GB into a directory the live ComfyUI had never
+  // heard of; refusing here costs nothing and saves the transfer.
+  await assertDestinationVisibleToLiveServer(modelsRoot, raw, source, snapshot);
   // Path-string containment (above) is not enough: an EXISTING symlink somewhere
   // between modelsRoot and targetDir could redirect the real write OUTSIDE the
   // models dir. Because THIS resolver is the single canonical write-target for
@@ -621,7 +1258,10 @@ export async function resolveModelSubfolderPreferServer(
   // so it can never diverge from a caller's separate pre-validation (e.g.
   // apply_manifest resolving the root a second time; #490 codex review).
   await assertNoEscapingSymlinkAncestor(modelsRoot, targetDir, raw, baseDirs, snapshot);
-  return targetDir;
+  return {
+    targetDir,
+    liveRootAtResolve: isLiveAuthoritativeModelsDir(source) ? modelsRoot : undefined,
+  };
 }
 
 /**
@@ -845,6 +1485,10 @@ export interface ResolvedDownloadTarget {
   filename: string;
   /** Absolute final path the file is written to: join(targetDir, filename). */
   targetPath: string;
+  /** The LIVE models root THIS resolution used, when live-authoritative. The writer
+   *  binds to it so the bytes cannot start in a tree the server stopped reading
+   *  between the resolution and the write (codex gate, round 18). */
+  liveRootAtResolve?: string;
 }
 
 /**
@@ -867,7 +1511,8 @@ export async function resolveDownloadTarget(
   targetSubfolder: string,
   filename?: string,
 ): Promise<ResolvedDownloadTarget> {
-  const targetDir = await resolveModelSubfolderPreferServer(targetSubfolder);
+  const { targetDir, liveRootAtResolve } =
+    await resolveModelSubfolderWithLiveRoot(targetSubfolder);
   const rawFilename =
     filename ?? (basename(new URL(url).pathname) || "model.safetensors");
   const resolvedFilename = basename(rawFilename);
@@ -889,7 +1534,7 @@ export async function resolveDownloadTarget(
       { filename: rawFilename },
     );
   }
-  return { targetDir, filename: resolvedFilename, targetPath };
+  return { targetDir, filename: resolvedFilename, targetPath, liveRootAtResolve };
 }
 
 /**
@@ -1283,14 +1928,18 @@ export async function shouldDispatchDownloadToManager(): Promise<boolean> {
     // dispatch to the Manager when NEITHER is discoverable (#420 reconnect with an
     // opaque/relative argv we can't resolve).
     if (parseModelsDirFromArgv(argv, cwd)) return false;
-    // Derive the server's own install root from argv (its main.py). Only treat it
-    // as a LOCAL stream target when that path ACTUALLY EXISTS on this filesystem:
-    // a loopback ComfyUI inside Docker / behind an SSH port-forward reports a
-    // container-side main.py path that is NOT the host's, so writing there would
-    // create a bogus host directory instead of reaching the server. When the root
-    // isn't locally present, hand the fetch to the connected Manager (server-side
-    // write), which lands in the real install regardless.
-    const liveRoot = liveRootFromArgv(argv, cwd);
+    // Derive the server's own install root through the ONE canonical resolver — the
+    // SAME notion resolveModelsDirWithBases writes into, so this predicate can never
+    // disagree with the destination (#369). It covers the relative-`main.py`-no-cwd
+    // shape (Desktop / Windows portable) that the old argv-only check could not
+    // resolve, which needlessly bounced those installs through the Manager (and then
+    // failed outright when Manager isn't installed). Only treat the root as a LOCAL
+    // stream target when it ACTUALLY EXISTS on this filesystem: a loopback ComfyUI
+    // inside Docker / behind an SSH port-forward reports a container-side path that
+    // is NOT the host's, so writing there would create a bogus host directory
+    // instead of reaching the server. When it isn't locally present, hand the fetch
+    // to the connected Manager (server-side write), which lands correctly regardless.
+    const liveRoot = resolveLiveServerRoot(argv, cwd, { remote: false }).root;
     if (liveRoot && existsSync(liveRoot)) return false;
     return true;
   } catch {
@@ -1369,12 +2018,48 @@ export async function downloadModel(
   // not blindly at COMFYUI_PATH/models — otherwise a Desktop install downloads
   // into a stale checkout the running server never reads (#346/#369). Resolution
   // + filename validation go through the SHARED resolveDownloadTarget so the
-  // background job registry keys jobs by the exact same targetPath (no drift).
-  const { targetDir, targetPath, filename: resolvedFilename } =
-    await resolveDownloadTarget(url, targetSubfolder, filename);
+  // background job registry keys jobs by the exact same targetPath.
+  //
+  // DELIBERATE: this RE-RESOLVES rather than reusing the target startDownloadJob
+  // keyed on. If the live server was replaced in between (a restart onto the same
+  // port serving a DIFFERENT install), the freshly resolved root is the one the
+  // server now reads, and the stale key is the one that would put the file where
+  // nobody looks — so the CURRENT destination wins over a stable key. `onLanded`
+  // reports the real path back to the job, and verifyLandedModel confirms it, so
+  // nothing is ever reported at the stale path. Accepted residual (disclosed):
+  // across such a restart the job's serialization key can name the previous
+  // destination, so a concurrent same-file request may run a duplicate transfer.
+  // That is bounded by the existing per-writer O_EXCL temp + atomic rename (#467) —
+  // a duplicate download, never a corrupt file — and is strictly preferable to
+  // writing into an install the server no longer serves.
+  const {
+    targetDir,
+    targetPath,
+    filename: resolvedFilename,
+    // BIND the destination to the server it was resolved for. Re-resolving is right,
+    // but the answer must not go stale between resolving it and writing: a ComfyUI
+    // replaced during the mkdir would otherwise take the bytes into the root the
+    // PREVIOUS server read. This root comes from the SAME resolution that produced
+    // targetPath — capturing it separately afterwards would leave a window in which
+    // the swap happens BEFORE the capture, so both later observations agree while the
+    // target still points into the old install (codex gate, round 18). Both roots
+    // must be live-authoritative to compare; when either is unknown there is nothing
+    // to bind, and the (already never-confirmed) non-authoritative path applies.
+    liveRootAtResolve: rootAtResolve,
+  } = await resolveDownloadTarget(url, targetSubfolder, filename);
 
   // Ensure target directory exists
   await mkdir(targetDir, { recursive: true });
+
+  const rootBeforeWrite = await currentLiveModelsRoot();
+  if (rootAtResolve && rootBeforeWrite && !sameModelsRoot(rootAtResolve, rootBeforeWrite)) {
+    throw new ModelError(
+      `Refusing to start this download: the connected ComfyUI changed while the destination was ` +
+        `being prepared. It read "${rootAtResolve}" when the destination was resolved and reads ` +
+        `"${rootBeforeWrite}" now, so "${targetPath}" is no longer where the running server ` +
+        "looks. Re-issue the download now that the current server is connected.",
+    );
+  }
 
   const request = applyDownloadAuth(url, auth);
   const headers: Record<string, string> = { ...request.headers };

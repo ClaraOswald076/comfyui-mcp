@@ -3,6 +3,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   searchHuggingFaceModels,
   listLocalModels,
+  currentLiveModelsRoot,
   MODEL_SUBDIRS,
 } from "../services/model-resolver.js";
 import {
@@ -11,6 +12,7 @@ import {
   findDownloadJob,
   listDownloadJobs,
   cancelDownloadJob,
+  describePlacement,
   type DownloadJob,
 } from "../services/download-jobs.js";
 import { readDownloadProgress } from "../services/download-progress.js";
@@ -156,10 +158,27 @@ export function registerModelManagementTools(server: McpServer): void {
         if (timer) clearTimeout(timer);
 
         if (job.status === "done") {
+          // ONE placement policy for every consumer (#369): only a file the running
+          // ComfyUI actually lists may be called a success. A Manager dispatch, a
+          // still-pending check and an inconclusive check are all unconfirmed.
+          const placement = describePlacement(job, {
+            liveModelsDir: await currentLiveModelsRoot(),
+          });
           const text = job.viaManager
             ? `Download DISPATCHED to the remote ComfyUI via ComfyUI-Manager (server-side fetch):\n${job.path}\n\n` +
-              `NOTE: the dispatch was ACCEPTED, NOT verified as landed — ComfyUI-Manager reports its queue task 'done' even on failure, so this does not guarantee the file is present. Confirm with list_local_models before relying on it.`
-            : `Model downloaded successfully to:\n${job.path}`;
+              `NOTE: ${placement.warning}`
+            : placement.confirmed
+              ? `Model downloaded successfully to${placement.pathQualifier}:\n${job.path}`
+              : placement.wrongPlace
+                ? // NOT a success. The bytes are on disk but the running ComfyUI does not
+                  // read from there, so calling this "downloaded successfully" is the exact
+                  // fabricate-success failure of #369.
+                  `Download finished, but the model is NOT usable by the connected ComfyUI.\n\n` +
+                  `${placement.pathLabel}${placement.pathQualifier}:\n${job.path}\n\n` +
+                  `${placement.warning}\n\n` +
+                  `Do NOT tell the user the model is ready — it is not visible to the server that would load it.`
+                : `Model ${placement.pathLabel}${placement.pathQualifier}:\n${job.path}\n\n` +
+                  `NOTE: ${placement.warning}`;
           return {
             content: [{ type: "text", text }],
           };
@@ -249,6 +268,9 @@ export function registerModelManagementTools(server: McpServer): void {
           };
         }
 
+        // ONE resolution for the whole listing: a verdict made against a
+        // DIFFERENT ComfyUI than the one connected now must not be re-asserted (#369).
+        const liveModelsDir = await currentLiveModelsRoot();
         const lines = list.map((j) => {
           const p = readDownloadProgress(j.progressId ?? j.trayId);
           const bytes =
@@ -258,11 +280,17 @@ export function registerModelManagementTools(server: McpServer): void {
                 ? `  ${(p.downloaded / 1024 ** 3).toFixed(2)} GB so far`
                 : "";
           const head = `- \`${j.id}\` **${j.status}**${bytes}`;
+          // Same single placement policy the download_model renderer uses (#369):
+          // a bare "landed at" is only ever printed for a CONFIRMED placement.
+          const placement =
+            j.status === "done" ? describePlacement(j, { liveModelsDir }) : undefined;
           const detail =
-            j.status === "done"
+            j.status === "done" && placement
               ? j.viaManager
-                ? `\n    dispatched to the remote ComfyUI via ComfyUI-Manager (server-side fetch): ${j.path}\n    NOTE: this means the dispatch was accepted, NOT that the file has verifiably landed — Manager reports its task done even on failure. Confirm with list_local_models.`
-                : `\n    landed at: ${j.path}`
+                ? `\n    dispatched to the remote ComfyUI via ComfyUI-Manager (server-side fetch): ${j.path}\n    NOTE: ${placement.warning}`
+                : placement.confirmed
+                  ? `\n    ${placement.pathLabel}${placement.pathQualifier}: ${j.path}`
+                  : `\n    ${placement.pathLabel}${placement.pathQualifier}: ${j.path}\n    ${placement.wrongPlace ? "WARNING" : "NOTE"}: ${placement.warning}`
               : j.status === "error"
                 ? `\n    failed: ${j.error}`
                 : j.status === "cancelled"

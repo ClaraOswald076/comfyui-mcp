@@ -6,6 +6,8 @@ icon: "power"
 
 <Info>3 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
 
+<Tip>**You don't type these calls.** Ask your agent for what you want in ordinary English — it chooses the tool and fills in the arguments. The JSON on this page is what it sends. New here? Start with [Using the tools](/using-tools).</Tip>
+
 ## start_comfyui
 
 Start ComfyUI using process info saved from a previous stop_comfyui call. Supports both Desktop app and manual Python installs. Polls the API for bounded readiness before reporting ready.
@@ -14,7 +16,7 @@ Start ComfyUI using process info saved from a previous stop_comfyui call. Suppor
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** Start ComfyUI.
 
 ```json
 {
@@ -22,6 +24,8 @@ Start ComfyUI using process info saved from a previous stop_comfyui call. Suppor
   "arguments": {}
 }
 ```
+
+**You get back:** It launches the server and waits until it is answering, then tells you the URL. Only works for a ComfyUI on this machine.
 
 ---
 
@@ -33,7 +37,7 @@ Stop the running ComfyUI process. Captures process info so it can be restarted w
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** Shut ComfyUI down, I need the VRAM.
 
 ```json
 {
@@ -42,17 +46,23 @@ Stop the running ComfyUI process. Captures process info so it can be restarted w
 }
 ```
 
+**You get back:** Confirmation that the process stopped.
+
+<Warning>Any running or queued render is lost.</Warning>
+
 ---
 
 ## restart_comfyui
 
 Restart ComfyUI: stops the running process (capturing its config), waits for the port to free, relaunches with the same arguments, and polls the API for bounded readiness. Also works against a REMOTE/tunnelled ComfyUI (via --comfyui-url) by rebooting through ComfyUI-Manager over HTTP and polling for it to come back (requires ComfyUI-Manager present and its security level permitting the reboot).
 
+<Tip>**In plain terms:** The standard next step after installing a node pack — new nodes are not loaded until ComfyUI starts again.</Tip>
+
 <Note>This tool takes no parameters.</Note>
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** Restart it so the new nodes load.
 
 ```json
 {
@@ -60,5 +70,9 @@ Restart ComfyUI: stops the running process (capturing its config), waits for the
   "arguments": {}
 }
 ```
+
+**You get back:** The server stops and comes back up, and you are told when it is answering again.
+
+<Warning>Anything queued or rendering is lost. Check the queue is empty first if a long job is in flight.</Warning>
 
 ---

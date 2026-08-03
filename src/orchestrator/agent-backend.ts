@@ -222,6 +222,13 @@ export interface AgentBackend {
   run(opts: BackendStartOptions): AsyncIterable<AgentEvent>;
   /** Stop the current turn without ending the session (if supported). */
   interrupt(): Promise<void>;
+  /**
+   * Try to recover a watchdog-stalled turn without representing the interruption
+   * as a user cancellation. Returns true only when the provider accepted the
+   * supplied agent-facing notice; callers must retain their normal interrupt
+   * fallback for older providers/protocols.
+   */
+  recoverStalledTurn?(notice: string): Promise<boolean>;
   /** Switch the model on the LIVE session (next turn uses it), if supported. */
   setModel?(model: string): Promise<void>;
   /** Models the current account can use (empty if `modelEnumeration` is false). */

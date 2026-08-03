@@ -6,6 +6,8 @@ icon: "box"
 
 <Info>16 tools. Generated from the live MCP tool schemas — do not edit by hand; run `npm run docs:gen`.</Info>
 
+<Tip>**You don't type these calls.** Ask your agent for what you want in ordinary English — it chooses the tool and fills in the arguments. The JSON on this page is what it sends. New here? Start with [Using the tools](/using-tools).</Tip>
+
 ## search_models
 
 Search HuggingFace Hub for models usable in ComfyUI (checkpoints, LoRAs, VAEs, ControlNets, etc.). Read-only and network-only: queries HuggingFace over HTTP, does NOT require a running ComfyUI or COMFYUI_PATH and does not download anything. Returns a ranked list with modelId, author, downloads, likes, and tags. Pick a result's download URL and pass it to download_model to install it locally. For CIVITAI searches ('find a Flux LoRA on Civitai') use search_civitai_models instead — it filters by type + base model and returns ids for download_civitai_model. For packs of custom nodes (not models) use search_custom_nodes.
@@ -24,16 +26,19 @@ Search HuggingFace Hub for models usable in ComfyUI (checkpoints, LoRAs, VAEs, C
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** Find me a Flux model I can actually run.
 
 ```json
 {
   "tool": "search_models",
   "arguments": {
-    "query": "<query>"
+    "query": "flux schnell",
+    "limit": 5
   }
 }
 ```
+
+**You get back:** Matching models with their download URLs and file sizes. Nothing is downloaded — this is a search.
 
 ---
 
@@ -67,7 +72,7 @@ Search CivitAI by keyword for checkpoints, LoRAs, embeddings, VAEs, and ControlN
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -96,7 +101,7 @@ Find CivitAI CREATORS — THE tool for 'who are the top creators on Civitai' and
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -128,17 +133,21 @@ Download a model file to the connected ComfyUI's models directory from a URL (Hu
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** Get that one.
 
 ```json
 {
   "tool": "download_model",
   "arguments": {
-    "url": "<url>",
-    "target_subfolder": "<target_subfolder>"
+    "url": "https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/flux1-schnell.safetensors",
+    "target_subfolder": "checkpoints"
   }
 }
 ```
+
+**You get back:** Live progress in the panel's download tray, and the path the file landed at. `target_subfolder` decides which ComfyUI dropdown it shows up in — checkpoints, loras, vae and so on.
+
+<Warning>Model files are large — many are 5-25 GB. Check you have the disk space before agreeing to a few of these.</Warning>
 
 ---
 
@@ -163,7 +172,7 @@ Download a model from CivitAI into the connected ComfyUI's models/ directory. Re
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -180,6 +189,8 @@ Download a model from CivitAI into the connected ComfyUI's models/ directory. Re
 
 Find the model files a workflow needs but this ComfyUI does NOT have, and search CivitAI + HuggingFace for installable candidates. THE tool for 'this Template says a model is missing — go get it'. Detects by comparing each model widget against the option list the server actually publishes, so it covers checkpoints, LoRAs, VAEs, ControlNets, UNets, CLIP and custom-pack model types without any per-node mapping. Each candidate reports size, source, precision/quantisation (fp16 / fp8 / GGUF Q4_K_M …) and whether it FITS this GPU's VRAM — so when the exact file is too big you can see the quantised variant that isn't. Read-only: it downloads nothing. Pass a chosen candidate to download_model (url) or download_civitai_model (id), using the reported directory as target_subfolder. For missing custom NODE PACKS (not models) use install_workflow_dependencies instead.
 
+<Tip>**In plain terms:** The answer to "this workflow says a model is missing". It works out what is actually absent and finds downloadable candidates, including smaller quantised versions when the full file will not fit your GPU.</Tip>
+
 ### Parameters
 
 <ParamField path="workflow" type="string | object" required>
@@ -191,16 +202,37 @@ Find the model files a workflow needs but this ComfyUI does NOT have, and search
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** This workflow won't run, it says something's missing. Find it for me.
 
 ```json
 {
   "tool": "resolve_missing_models",
   "arguments": {
-    "workflow": "<workflow>"
+    "workflow": {
+      "4": {
+        "class_type": "CheckpointLoaderSimple",
+        "inputs": {
+          "ckpt_name": "sd_xl_base_1.0.safetensors"
+        }
+      },
+      "9": {
+        "class_type": "SaveImage",
+        "inputs": {
+          "filename_prefix": "portrait",
+          "images": [
+            "8",
+            0
+          ]
+        }
+      }
+    }
   }
 }
 ```
+
+<Note>Shortened for readability — two nodes of a real API-format graph are shown. In practice the agent passes the whole thing: the graph it just loaded with get_workflow, or the one it built for you.</Note>
+
+**You get back:** Each missing file with candidate downloads, their sizes and precision, and whether each one fits your VRAM. It downloads nothing — you pick, then it fetches.
 
 ---
 
@@ -216,14 +248,18 @@ List model files available to the connected ComfyUI, grouped by type. Read-only.
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** Which checkpoints do I already have?
 
 ```json
 {
   "tool": "list_local_models",
-  "arguments": {}
+  "arguments": {
+    "model_type": "checkpoints"
+  }
 }
 ```
+
+**You get back:** The model filenames in that folder — the exact strings a workflow needs. Omit `model_type` to see every folder at once.
 
 ---
 
@@ -242,7 +278,7 @@ Check on model downloads started by download_model. Reports each download's stat
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -265,7 +301,7 @@ Cancel ONE in-flight model download started by download_model / download_civitai
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -290,16 +326,20 @@ Delete a model file from the local ComfyUI models directories. Resolves the path
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+**You say:** Delete that old LoRA, I'm out of disk space.
 
 ```json
 {
   "tool": "remove_model",
   "arguments": {
-    "path": "<path>"
+    "path": "loras/old-character-v1.safetensors"
   }
 }
 ```
+
+**You get back:** Confirmation, and how much space came back.
+
+<Warning>This deletes the file. There is no undo and no recycle bin — you would have to download it again. Check the path is the one you mean.</Warning>
 
 ---
 
@@ -318,7 +358,7 @@ View ComfyUI extra search-path config for standalone/manual installs and ComfyUI
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -356,7 +396,7 @@ Add a directory to a ComfyUI extra search-path YAML config. Use this for model c
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -394,7 +434,7 @@ Remove a directory from a ComfyUI extra search-path YAML config. Matches the sto
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -416,7 +456,7 @@ List textual-inversion embeddings installed on the connected ComfyUI server (rea
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -442,7 +482,7 @@ Free GPU VRAM by unloading cached models from ComfyUI. Use this between generati
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
@@ -483,7 +523,7 @@ Curate a model file's embedded .safetensors metadata (Model Explorer). Driven by
 
 ### Example
 
-<Note>Example coming soon — the call below is a generated skeleton.</Note>
+<Note>No worked example yet — the call below is a skeleton generated from the required parameters. Real examples live in `scripts/tool-doc-examples.ts`; contributions welcome.</Note>
 
 ```json
 {
