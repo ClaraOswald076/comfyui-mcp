@@ -625,7 +625,16 @@ function classifyListenerOwnership(input: {
    */
   servingArgv?: string[];
 }): ListenerOwnership {
-  /** Does the server that is answering run what we launched? */
+  /**
+   * Does the server that is answering run what we launched?
+   *
+   * Deliberately ASYMMETRIC in what it can conclude. A MISMATCH is proof the
+   * listener is not ours — nobody else's command line is ours. A match is only
+   * CORROBORATION: another supervisor can start the very same ComfyUI command, win
+   * the bind race, and answer with identical argv, so "runs what we launched" can
+   * never by itself promote anything to "ours" (codex gate). It can only stop us
+   * asserting the negative.
+   */
   const byArgv = (): "match" | "differ" | "unknown" => {
     if (!input.servingArgv?.length || !input.launchArgv?.length) return "unknown";
     return commandLineMatchesArgv(input.launchArgv.join(" "), input.servingArgv)
@@ -656,19 +665,19 @@ function classifyListenerOwnership(input: {
   // is reparented and lineage can no longer place it in our tree. What still can:
   // the server is running the exact command line we launched (codex gate P2).
   if (input.childExited || alive === false) {
-    return byArgv() === "match" ? "ours" : "not-ours";
+    // A match cannot make this "ours" — our direct child is gone, and the server
+    // could equally be another supervisor's identical instance. But it does mean we
+    // cannot honestly assert the negative either, so the wrapper case degrades to
+    // "unconfirmed" instead of telling that user their own server is not theirs.
+    return byArgv() === "match" ? "unconfirmed" : "not-ours";
   }
 
   const ourPid = input.child.pid;
   if (input.portOwnerPid == null) {
-    // The port owner could not be mapped (#449). Rather than shrug, ask the server
-    // what it is running: a match is as strong as a pid comparison, and a MISMATCH
-    // is decisive counter-evidence that this call did not start the healthy
-    // listener — which is exactly the case that must not read as success.
-    const verdict = byArgv();
-    if (verdict === "match") return "ours";
-    if (verdict === "differ") return "not-ours";
-    return "unconfirmed";
+    // The port owner could not be mapped (#449). The server's own argv still
+    // decides the NEGATIVE: a different command line proves this call did not start
+    // the healthy listener, which is the case that must never read as success.
+    return byArgv() === "differ" ? "not-ours" : "unconfirmed";
   }
   if (ourPid == null) return "unconfirmed";
   if (input.portOwnerPid !== ourPid) {
@@ -681,11 +690,8 @@ function classifyListenerOwnership(input: {
     const descendant = isOurDescendant(input.portOwnerPid);
     if (descendant === true) return "ours";
     if (descendant === false) return "not-ours";
-    // Lineage unreadable — fall back to what the server says it is running.
-    const verdict = byArgv();
-    if (verdict === "match") return "ours";
-    if (verdict === "differ") return "not-ours";
-    return "unconfirmed";
+    // Lineage unreadable — the server's argv can still rule the listener OUT.
+    return byArgv() === "differ" ? "not-ours" : "unconfirmed";
   }
   // The pid MATCHES — but it could be a recycled number we cannot signal.
   if (alive !== true) return "unconfirmed";

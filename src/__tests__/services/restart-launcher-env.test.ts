@@ -1734,9 +1734,12 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
     killSpy.mockRestore();
   });
 
-  it("resolves an unmappable port owner by asking the SERVER what it is running", async () => {
-    // The #449 host: no usable port-owner lookup. Rather than a permanent shrug,
-    // the server's own argv answers it — a match is as strong as a pid comparison.
+  it("does NOT promote a matching server argv to ownership — another supervisor can run the same command", async () => {
+    // The #449 host: no usable port-owner lookup, and the server reports exactly the
+    // command line we launched. That is corroboration, NOT proof: another supervisor
+    // could have started the same ComfyUI and won the bind race. So it stays
+    // unconfirmed — never "restarted successfully" — while still not denying a
+    // restart that almost certainly worked.
     usePlainInstall();
     servingArgvAfterRestart([PLAIN_MAIN, "--port", "8188"]);
     spawnCapturingChildren(4321);
@@ -1764,17 +1767,19 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
 
     const result = await restartComfyUI();
 
-    expect(result.listener_ownership).toBe("ours");
+    expect(result.listener_ownership).toBe("unconfirmed");
     expect(result.started).toBe(true);
-    expect(result.message).toMatch(/restarted successfully/i);
+    expect(result.message).not.toMatch(/restarted successfully/i);
 
     killSpy.mockRestore();
   });
 
-  it("claims a GRANDCHILD listener as ours even when the WRAPPER has already exited", async () => {
+  it("does NOT report a wrapper-launched grandchild as NOT ours once the wrapper has exited", async () => {
     // A wrapper script launches ComfyUI and exits; the grandchild is reparented, so
-    // lineage can no longer place it in our tree. The server's own command line
-    // still can — otherwise a legitimately indirect launcher reads as "not ours".
+    // lineage is a dead end by construction. The server's own command line cannot
+    // prove the listener is ours (another supervisor could run the same command),
+    // but it does stop us asserting the negative — otherwise a legitimately
+    // indirect launcher is told its own server is not its own.
     usePlainInstall();
     servingArgvAfterRestart([PLAIN_MAIN, "--port", "8188"]);
     const children = spawnCapturingChildren(4321);
@@ -1811,8 +1816,9 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
 
     const result = await restartComfyUI();
 
-    expect(result.listener_ownership).toBe("ours");
+    expect(result.listener_ownership).toBe("unconfirmed");
     expect(result.started).toBe(true);
+    expect(result.message).not.toMatch(/NOT as a result of this restart/i);
 
     killSpy.mockRestore();
   });
