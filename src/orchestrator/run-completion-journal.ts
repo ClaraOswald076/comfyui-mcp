@@ -114,6 +114,14 @@ export interface JournalEntry {
    *  the same frame re-sent. Delivered anyway (never swallowed) but FLAGGED, so
    *  the agent doesn't double-count it. */
   possibleRepeat?: boolean;
+  /** This entry's prompt id was queued AGAIN while it was still undelivered, so
+   *  it belongs to the older run. Still delivered, but it can no longer be merged
+   *  into, settle a ticket, or memoize a delivery. */
+  superseded?: boolean;
+  /** Evicted-completion count this entry is carrying out on the tab's behalf, so
+   *  the disclosure rides a real delivery instead of a side map that could be
+   *  discarded before it is ever reported. */
+  disclose?: number;
 }
 
 /** Runs tracked at once. Ample for any real batch; bounded so a long session
@@ -214,6 +222,25 @@ export class RunCompletionJournalImpl {
       existing.settled = false;
       existing.tabId = meta.tabId;
       existing.queuedAt = Date.now();
+      // SUPERSEDE any entry still carrying the PREVIOUS run's completion for this
+      // id. Without this, the new run's completion merges into an entry that is
+      // already sitting in an agent queue holding the OLD completion's text: when
+      // that turn ends, ack() removes the shared entry and settles the REOPENED
+      // ticket — the old result is presented as the new run's, and the new run's
+      // real completion is never delivered. A superseded entry is skipped by the
+      // dedupe scan and can no longer settle a ticket or memoize a delivery.
+      for (const entry of this.entries.values()) {
+        if (
+          entry.correlation.status !== "unidentified" &&
+          entry.correlation.promptId === promptId &&
+          !entry.superseded
+        ) {
+          entry.superseded = true;
+          logger.warn(
+            `[run-completions] prompt ${promptId} was queued again while its previous completion was still undelivered — the older entry is superseded and can no longer answer for the new run`,
+          );
+        }
+      }
       // …and CLEAR the already-delivered memo for it. Reopening the ticket while
       // the memo stood meant the reopened run's completion was suppressed as a
       // duplicate of the PREVIOUS run's: `panel_run` promised automatic delivery
@@ -283,6 +310,7 @@ export class RunCompletionJournalImpl {
       for (const entry of this.entries.values()) {
         if (
           entry.key === key &&
+          !entry.superseded && // a re-queued run never merges into the old one's entry
           entry.correlation.status !== "unidentified" &&
           entry.correlation.promptId === correlation.promptId
         ) {
@@ -364,21 +392,31 @@ export class RunCompletionJournalImpl {
   /** Count a lost completion for a tab, bounding the map so a churn of one-off
    *  tabs can't grow it forever (the oldest unreported count is discarded — it
    *  was already logged at ERROR when it happened). */
-  private noteDropped(key: string): void {
-    this.dropped.set(key, (this.dropped.get(key) ?? 0) + 1);
+  /**
+   * Record that a completion for `key` was destroyed by an eviction, so the next
+   * delivery to that tab can report it as UNDETERMINED.
+   *
+   * The count is stamped onto a SURVIVING entry for the same tab whenever one
+   * exists — it then rides out on a real delivery and cannot be discarded. The
+   * side map is only for a tab with nothing left to carry it, i.e. a tab whose
+   * next delivery is hypothetical anyway; that is the only thing the bound can
+   * ever discard, and it is logged.
+   */
+  private noteDropped(key: string, count = 1): void {
+    if (count <= 0) return;
+    const carrier = [...this.entries.values()].find((e) => e.key === key);
+    if (carrier) {
+      carrier.disclose = (carrier.disclose ?? 0) + count;
+      return;
+    }
+    this.dropped.set(key, (this.dropped.get(key) ?? 0) + count);
     while (this.dropped.size > MAX_DROPPED_KEYS) {
-      // Discard a counter for a tab that has NOTHING left to carry the
-      // disclosure out on first — its next delivery (if any) is hypothetical.
-      // Only if every tracked tab still has entries do we drop the oldest, and
-      // that one is logged at ERROR because the disclosure dies with it.
-      const victim =
-        [...this.dropped.keys()].find((k) => ![...this.entries.values()].some((e) => e.key === k)) ??
-        this.dropped.keys().next().value;
+      const victim = this.dropped.keys().next().value;
       if (victim === undefined) break;
       const lost = this.dropped.get(victim) ?? 0;
       this.dropped.delete(victim);
       logger.error(
-        `[run-completions] discarding the undelivered-completion count (${lost}) for tab ${victim.slice(0, 8)} — over ${MAX_DROPPED_KEYS} tabs are tracking one; that tab will not be told`,
+        `[run-completions] discarding the undelivered-completion count (${lost}) for tab ${victim.slice(0, 8)} — over ${MAX_DROPPED_KEYS} agentless tabs are tracking one; that tab will not be told`,
       );
     }
   }
@@ -414,7 +452,10 @@ export class RunCompletionJournalImpl {
       // Any completion this tab lost to an eviction rides out on the next one
       // that DOES get through, so an evicted completion is reported rather than
       // silently forgotten.
-      const lost = this.dropped.get(key) ?? 0;
+      // The tab's evicted-completion count: whatever this entry is carrying, plus
+      // anything stranded in the side map from a period when the tab had no entry
+      // to carry it.
+      const lost = (entry.disclose ?? 0) + (this.dropped.get(key) ?? 0);
       const payload: CompletionPayload = {
         ...entry.payload,
         run_correlation: entry.correlation.status,
@@ -430,7 +471,10 @@ export class RunCompletionJournalImpl {
       const handedOff = inject(payload, entry.token);
       this.noteAttempt(entry.token, handedOff);
       if (!handedOff) return { delivered, blockedOn: entry };
-      if (lost > 0) this.dropped.delete(key);
+      if (lost > 0) {
+        this.dropped.delete(key);
+        delete entry.disclose;
+      }
       delivered += 1;
     }
     return { delivered, blockedOn: null };
@@ -449,6 +493,12 @@ export class RunCompletionJournalImpl {
     return this.entries.size > 0;
   }
 
+  /** Every still-unacked entry, across all tabs — for the last-ditch disclosure
+   *  the orchestrator makes when a fatal self-exit is about to destroy them. */
+  allOutstanding(): JournalEntry[] {
+    return [...this.entries.values()];
+  }
+
   /** Record the outcome of a delivery attempt. `handedOff` true = an agent took
    *  it onto its queue (not yet proof it was read). */
   noteAttempt(token: string, handedOff: boolean): void {
@@ -464,6 +514,12 @@ export class RunCompletionJournalImpl {
     const entry = this.entries.get(token);
     if (!entry) return;
     this.entries.delete(token);
+    // A SUPERSEDED entry belongs to a run whose prompt id was queued again. It
+    // was still delivered (its text reached the agent), but it must not settle
+    // the REOPENED ticket — that would present the old result as the new run's —
+    // and must not memoize the id as delivered, which would then suppress the new
+    // run's real completion.
+    if (entry.superseded) return;
     if (entry.correlation.status !== "unidentified") {
       // Remember (tab, run) so a later re-send of the same frame is suppressed
       // rather than delivered a second time. Bounded FIFO — old ids age out; a
@@ -637,8 +693,13 @@ export class RunCompletionJournalImpl {
     this.idlessSeen.clear();
     this.seq = 0;
   }
+  /** Evicted completions this tab has not been told about yet — wherever the
+   *  count currently lives (riding an entry, or the agentless side map). */
   droppedFor(key: string): number {
-    return this.dropped.get(key) ?? 0;
+    const carried = [...this.entries.values()]
+      .filter((e) => e.key === key)
+      .reduce((n, e) => n + (e.disclose ?? 0), 0);
+    return carried + (this.dropped.get(key) ?? 0);
   }
 
   private trimTickets(): void {
@@ -682,7 +743,9 @@ export class RunCompletionJournalImpl {
         const victim = mine.find((e) => e.state === "handed_off") ?? mine[0];
         this.entries.delete(victim.token);
         mine = mine.filter((e) => e !== victim);
-        this.noteDropped(victim.key);
+        // Its own loss PLUS any disclosure it was carrying for the tab — moved to
+        // whatever survives, so an eviction can never drop the disclosure itself.
+        this.noteDropped(victim.key, 1 + (victim.disclose ?? 0));
         logger.error(
           `[run-completions] ${label} — dropped a ${victim.state === "pending" ? "still-undelivered" : "handed-off-but-unconfirmed"} completion for ${describe(victim.correlation)}; the next delivery will report it as undetermined`,
         );

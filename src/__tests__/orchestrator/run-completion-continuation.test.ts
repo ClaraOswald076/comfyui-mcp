@@ -27,6 +27,7 @@ import type {
 import { CLAUDE_CAPABILITIES } from "../../orchestrator/agent-backend.js";
 import {
   RunCompletionJournalImpl,
+  describe as describeCorrelation,
   type CompletionPayload,
 } from "../../orchestrator/run-completion-journal.js";
 import { destinationHasCollisionState } from "../../orchestrator/session-store.js";
@@ -714,6 +715,60 @@ describe("run completion journal correlation (#468)", () => {
     expect(second!.correlation.status).toBe("matched");
   });
 
+  it("re-queuing a prompt id SUPERSEDES the old entry — the old result can't answer for the new run", () => {
+    // Prompt-id reuse while the previous completion is still in an agent's queue.
+    // Merging into that entry would hand the OLD result over as the NEW run's
+    // (its queued turn still holds the old text) and the new completion would
+    // never be delivered at all.
+    journal.openRun(PROMPT_A, { tabId: "t" });
+    const old = journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "run A" });
+    journal.deliverPending("t", () => true); // handed off, unread, unacked
+
+    journal.openRun(PROMPT_A, { tabId: "t" }); // ComfyUI reused the id
+    const fresh = journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "run B" });
+    expect(fresh).not.toBeNull();
+    expect(fresh!.token).not.toBe(old!.token); // its OWN entry, not a merge
+    expect(journal.pending("t")).toHaveLength(1);
+
+    // The old entry's turn ends: it must NOT settle the reopened ticket, and must
+    // NOT memoize the id as delivered (which would suppress run B's completion).
+    journal.ack(old!.token);
+    expect(journal.ticketFor(PROMPT_A)?.settled).toBe(false);
+    expect(journal.pending("t")).toHaveLength(1); // run B still awaits delivery
+
+    // Run B's own delivery settles it.
+    journal.deliverPending("t", () => true);
+    journal.ack(fresh!.token);
+    expect(journal.ticketFor(PROMPT_A)?.settled).toBe(true);
+  });
+
+  it("an eviction disclosure rides a surviving entry, so it can't be discarded before it's told", () => {
+    // The side map is bounded; a count parked there for a tab that still HAS a
+    // deliverable entry could be discarded before it was ever reported. The
+    // count now rides that entry instead.
+    journal.record("t", { kind: "executed", prompt_id: "keeper" });
+    for (let i = 0; i < 40; i++) journal.record("t", { kind: "executed", prompt_id: `e-${i}` });
+    const lost = journal.droppedFor("t");
+    expect(lost).toBeGreaterThan(0);
+    // The count must live ON a surviving entry, not in the boundable side map —
+    // that is what makes it undiscardable while the tab can still be told.
+    const carrier = journal.outstanding("t").find((e) => (e.disclose ?? 0) > 0);
+    expect(carrier).toBeDefined();
+    expect(carrier!.disclose).toBe(lost);
+    // Churn far past the side map's bound with agentless tabs; ours is untouched.
+    for (let i = 0; i < 200; i++) {
+      journal.record(`ghost-${i}`, { kind: "executed", prompt_id: `g-${i}` });
+      journal.forget(`ghost-${i}`);
+    }
+    expect(journal.droppedFor("t")).toBe(lost); // still intact
+    const seen: CompletionPayload[] = [];
+    journal.deliverPending("t", (p) => {
+      seen.push(p);
+      return true;
+    });
+    expect(seen[0].dropped_completions).toBe(lost);
+  });
+
   it("hasOutstanding reports any undelivered completion (the self-restart gate)", () => {
     expect(journal.hasOutstanding()).toBe(false);
     const entry = journal.record("t", { kind: "executed", prompt_id: PROMPT_A });
@@ -722,6 +777,26 @@ describe("run completion journal correlation (#468)", () => {
     expect(journal.hasOutstanding()).toBe(true); // handed off is NOT delivered
     journal.ack(entry!.token);
     expect(journal.hasOutstanding()).toBe(false);
+  });
+
+  it("allOutstanding names every undelivered completion, per tab, for the exit disclosure", () => {
+    // A FATAL self-exit bypasses the idle gate by design and the journal is
+    // in-memory, so these die with the process. They must be reported on the way
+    // out (per tab, naming the run) rather than silently evaporating.
+    journal.openRun(PROMPT_A, { tabId: "wf:one" });
+    journal.record("wf:one", { kind: "executed", prompt_id: PROMPT_A });
+    journal.record("wf:two", { kind: "executed", prompt_id: PROMPT_B });
+    const handed = journal.record("wf:two", { kind: "executed" });
+    journal.deliverPending("wf:two", () => true); // handed off still counts
+
+    const all = journal.allOutstanding();
+    expect(all).toHaveLength(3);
+    expect(all.filter((e) => e.key === "wf:one")).toHaveLength(1);
+    expect(all.filter((e) => e.key === "wf:two")).toHaveLength(2);
+    expect(describeCorrelation(all[0].correlation)).toContain(PROMPT_A);
+
+    journal.ack(handed!.token);
+    expect(journal.allOutstanding()).toHaveLength(2); // acked ones are gone
   });
 
   it("only the entry's OWN run is settled on ack", () => {

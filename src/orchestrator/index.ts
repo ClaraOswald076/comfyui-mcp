@@ -794,6 +794,13 @@ export async function runPanelOrchestrator(): Promise<void> {
     logger.error(
       `[panel-orchestrator] self-exit (${why}) — closing the bridge so a fresh orchestrator can take over.`,
     );
+    // #468 — a fatal self-exit deliberately BYPASSES the idle gate (the whole
+    // point is to collapse a wedged orchestrator), and the journal is in-memory,
+    // so any undelivered run completion dies here. It must not die SILENTLY:
+    // tell each affected tab, in the panel chat, exactly which runs it will never
+    // be told about, so the user (and the agent that resumes after the respawn)
+    // treats them as UNDETERMINED instead of still-pending.
+    reportLostCompletionsOnExit();
     if (runShutdown) {
       runShutdown();
     } else {
@@ -2088,6 +2095,45 @@ export async function runPanelOrchestrator(): Promise<void> {
    * onto its queue — the entry stays in the journal until the turn that carried
    * it ends (onEventDelivered), which is what makes it survive a restart.
    */
+  /**
+   * Last-ditch disclosure before the process dies (#468).
+   *
+   * The self-exit paths (agent-fatal, a never-handshaking probe) skip the idle
+   * gate on purpose, and the journal does not survive the process — so a
+   * completion still journaled here is genuinely lost. Say so, per tab, naming
+   * the run: an UNDETERMINED outcome the user can act on beats a promise that
+   * silently evaporates. Best-effort and never throws — this runs on the way out.
+   */
+  function reportLostCompletionsOnExit(): void {
+    try {
+      const byTab = new Map<string, string[]>();
+      for (const entry of RunCompletions.allOutstanding()) {
+        const list = byTab.get(entry.key) ?? [];
+        list.push(describeCorrelation(entry.correlation));
+        byTab.set(entry.key, list);
+      }
+      for (const [panelTab, runs] of byTab) {
+        logger.error(
+          `[panel-orchestrator] tab ${panelTab.slice(0, 8)} — self-exit with ${runs.length} undelivered run completion(s): ${runs.join("; ")}`,
+        );
+        bridge.push(
+          {
+            type: "say",
+            text:
+              `⚠️ The agent backend is being restarted, and ${runs.length} finished render result(s) could not be delivered ` +
+              `(${runs.join("; ")}). Their outcome is UNDETERMINED from the agent's point of view — ask it to check ` +
+              `\`get_history\` for those runs once it reconnects rather than assuming it saw them.`,
+          },
+          panelTab,
+        );
+      }
+    } catch (err) {
+      logger.warn(
+        `[panel-orchestrator] could not report lost completions on exit: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   function flushRunCompletions(panelTabId: string): void {
     const key = agentKeyFor(panelTabId);
     const { blockedOn } = RunCompletions.deliverPending(panelTabId, (payload, token) =>
