@@ -1355,6 +1355,32 @@ describe("resolveLiveServerRoot (#369)", () => {
     }
   });
 
+  it("never adopts a stale sibling install from a GENERIC venv beside it (codex gate r13)", async () => {
+    const dir = await tmpDir();
+    try {
+      // The live server runs D:\Live\ComfyUI\main.py from an EXTERNAL venv at
+      // <dir>/venv, and an unrelated <dir>/ComfyUI/main.py sits beside that venv.
+      // A generic venv says nothing about which install it serves.
+      const stale = join(dir, "ComfyUI");
+      await mkdir(stale, { recursive: true });
+      await writeFile(join(stale, "main.py"), "", "utf-8");
+      const python = await makeVenvPython(join(dir, "external"));
+      // Move it so the venv is a SIBLING of the stale install, not inside it.
+      const sibling = IS_WIN ? join(dir, "venv", "Scripts") : join(dir, "venv", "bin");
+      await mkdir(sibling, { recursive: true });
+      const siblingPython = join(sibling, basename(python));
+      await writeFile(siblingPython, "", "utf-8");
+
+      const res = resolveLiveServerRoot(["ComfyUI\\main.py"], undefined, {
+        observedPython: siblingPython,
+      });
+      expect(res.source).toBe("unresolved");
+      expect(res.root).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("stays UNRESOLVED when the observed interpreter is not inside an install tree", async () => {
     const dir = await tmpDir();
     try {

@@ -540,34 +540,42 @@ export interface LiveServerRootResolution {
 const OBSERVED_ROOT_MAX_ASCENT = 5;
 
 /**
- * Directory names that make an interpreter part of an INSTALL rather than merely
- * somewhere above it: the env dirs ComfyUI's supported layouts keep python in.
+ * Env directories that only a ComfyUI BUNDLE ships — a portable/Desktop layout keeps
+ * its interpreter here, one level ABOVE the server root (`<bundle>/python_embeded/
+ * python.exe` + `<bundle>/ComfyUI/main.py`).
+ *
+ * A generic `.venv`/`venv`/`env` is deliberately NOT in this set. Those live
+ * anywhere: a server started from `C:\Tools\venv\Scripts\python.exe` with a stale
+ * `C:\Tools\ComfyUI\main.py` beside it would otherwise have that unrelated install
+ * accepted as "observed" — a wrong destination presented as verified success (codex
+ * gate, round 13). A generic venv still qualifies via the "interpreter is INSIDE the
+ * candidate root" rule, which is what the real `<root>/.venv/...` layout satisfies.
  * Compared case-insensitively (Windows).
  */
-const ENV_DIR_NAMES = new Set([
+const BUNDLE_ENV_DIR_NAMES = new Set([
   "python_embeded",
   "python_embedded",
   "standalone-env",
-  ".venv",
-  "venv",
-  "env",
-  "scripts",
-  "bin",
 ]);
+
+/** Binary subdirectories that may sit below a bundle env dir. */
+const ENV_BIN_DIR_NAMES = new Set(["scripts", "bin"]);
 
 /**
  * Is `python` positioned INSIDE the install rooted at `root`, anchored from `base`?
  *
  * Two accepted shapes, and nothing else:
  *  1. the interpreter lives under `root` itself (`<root>/.venv/Scripts/python.exe`);
- *  2. it sits in a sibling ENV directory of the bundle `base` that `root` was
- *     anchored on (`<bundle>/python_embeded/python.exe` + `<bundle>/ComfyUI/main.py`),
- *     with EVERY segment between `base` and the interpreter being an env dir.
+ *  2. it sits in a BUNDLE env directory of the bundle `base` that `root` was
+ *     anchored on (`<bundle>/python_embeded/python.exe` + `<bundle>/ComfyUI/main.py`)
+ *     — a layout only a ComfyUI portable/Desktop bundle has.
  *
  * Without this test the ascent is unsound (codex gate, round 3): a server started
  * with a SYSTEM python (`C:\Python311\python.exe`) has ancestors that are not its
  * install at all, so walking up to `C:\` and finding a stale `C:\ComfyUI\main.py`
  * would confidently name the WRONG install as live — reintroducing the very bug.
+ * Shape 2 is restricted to BUNDLE env dirs for the same reason (round 13): a generic
+ * `C:\Tools\venv` says nothing about a `C:\Tools\ComfyUI` that happens to sit beside it.
  */
 function interpreterBelongsToInstall(python: string, base: string, root: string): boolean {
   const py = pathResolve(python);
@@ -581,7 +589,10 @@ function interpreterBelongsToInstall(python: string, base: string, root: string)
   if (!within(base, py)) return false;
   const rel = pyDir.slice(pathResolve(base).length).split(sep).filter(Boolean);
   if (rel.length === 0) return true; // interpreter sits directly in the bundle root
-  return rel.every((seg) => ENV_DIR_NAMES.has(seg.toLowerCase()));
+  const [first, ...rest] = rel.map((seg) => seg.toLowerCase());
+  return (
+    BUNDLE_ENV_DIR_NAMES.has(first) && rest.every((seg) => ENV_BIN_DIR_NAMES.has(seg))
+  );
 }
 
 /**
