@@ -500,7 +500,10 @@ export class PanelAgent {
     // (#468).
     const rewoundTokens = this.turnEventTokens;
     this.turnEventTokens = [];
-    this.releaseEventTokens(rewoundTokens);
+    // CARRIED, for the same reason as the stall path: the turn was dispatched
+    // with the completion in it, and a rewind can repeat, so this release is
+    // bounded rather than an unbounded replay source.
+    this.releaseEventTokens(rewoundTokens, { carried: true });
     // Break the current stream so start()'s loop re-enters and forks.
     void this.backend.interrupt().catch(() => {});
     const wake = this.waiting;
@@ -771,6 +774,11 @@ export class PanelAgent {
       // `completionOnly` item that a later detach can remove cleanly (#468).
       this.queue.unshift(...interrupted.items);
     } else {
+      // UNCARRIED on purpose. This is a plain Stop — a deliberate human act that
+      // does not repeat on its own, so it cannot form the automatic loop the
+      // bound exists to break; settling a completion on the user's third Stop
+      // would be a surprise, not a safeguard. (The stall watchdog and rewind DO
+      // auto-repeat, so those are carried.)
       this.releaseEventTokens(interruptedTokens);
     }
     // Track the turn this interrupt is aborting (the one holding the gate). The
@@ -1246,7 +1254,11 @@ export class PanelAgent {
     // turn we just wrote off.
     const stalledTokens = this.turnEventTokens;
     this.turnEventTokens = [];
-    this.releaseEventTokens(stalledTokens);
+    // CARRIED: the turn was DISPATCHED with the completion in it. The watchdog
+    // re-arms on every turn, so a backend that keeps freezing would otherwise
+    // replay the same completion forever — this release must count toward the
+    // MAX_CARRIED_RELEASES bound like the result path does.
+    this.releaseEventTokens(stalledTokens, { carried: true });
     if (!alreadyReported) {
       this.deps.onSay(
         this.tabId,

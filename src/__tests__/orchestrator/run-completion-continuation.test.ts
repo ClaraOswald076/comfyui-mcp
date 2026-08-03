@@ -164,8 +164,10 @@ function makeHarness(backend: AgentBackend) {
     onEventDelivered: (_key: string, tokens: string[]) => {
       for (const t of tokens) journal.ack(t);
     },
-    onEventUndelivered: (key: string, tokens: string[]) => {
-      for (const t of tokens) journal.release(t);
+    // Mirrors index.ts exactly, INCLUDING the `carried` flag — a harness that
+    // drops it would silently exercise the unbounded path.
+    onEventUndelivered: (key: string, tokens: string[], opts?: { carried?: boolean }) => {
+      for (const t of tokens) journal.release(t, { carried: opts?.carried === true });
       flush(key);
     },
     onAgentReady: (key: string) => flush(key),
@@ -504,6 +506,28 @@ describe("run completion across automatic goal continuation (#468)", () => {
     // …and the completion appears EXACTLY ONCE. Stripping only the token left a
     // second, token-less copy of this text behind in the preserved mail.
     expect(all.split("leak.png").length - 1).toBe(1);
+  });
+
+  it("a rewind hands its completion back as CARRIED (bounded, not an infinite replay)", async () => {
+    // A turn abandoned by a rewind (and, by the same wiring, by the stall
+    // watchdog) must return the completion it was carrying — but as a CARRIED
+    // release, or an agent that keeps abandoning turns would be handed the same
+    // completion on every turn forever.
+    const backend = new ContinuationBackend();
+    const { journal, manager, arrive } = makeHarness(backend);
+    const tab = "tab-rewind-carried";
+
+    journal.openRun(PROMPT_A, { tabId: tab });
+    manager.send(tab, "go");
+    await waitFor(() => backend.turns.length >= 1);
+    backend.finishTurn();
+
+    arrive(tab, { kind: "executed", prompt_id: PROMPT_A, images: [{ filename: "rewound.png" }] });
+    await waitFor(() => backend.turns.length >= 2); // turn 2 carries it
+
+    manager.rewind(tab, null); // abandons the in-flight turn
+    await waitFor(() => (journal.outstanding(tab)[0]?.carriedReleases ?? 0) >= 1);
+    expect(journal.outstanding(tab)).toHaveLength(1); // returned, not lost
   });
 
   it("a completion survives an agent whose self-restart loop GAVE UP", async () => {
@@ -856,6 +880,41 @@ describe("run completion journal correlation (#468)", () => {
     const carrier = journal.outstanding("t")[0];
     journal.ack(carrier.token);
     expect(journal.droppedFor("t")).toBe(0);
+  });
+
+  it("a prompt id reused AFTER its ticket was evicted still delivers the new run's completion", () => {
+    // The memo outlives the ticket by design, so a reuse can take the
+    // FRESH-ticket path with a stale memo still standing. `panel_run` promises
+    // automatic delivery for that new run — the memo must not swallow it.
+    journal.openRun(PROMPT_A, { tabId: "t" });
+    const first = journal.record("t", { kind: "executed", prompt_id: PROMPT_A });
+    journal.deliverPending("t", () => true);
+    journal.ack(first!.token);
+    for (let i = 0; i < 200; i++) {
+      journal.openRun(`flood-${i}`, { tabId: "t" });
+      const e = journal.record("t", { kind: "executed", prompt_id: `flood-${i}` });
+      journal.deliverPending("t", () => true);
+      journal.ack(e!.token);
+    }
+    expect(journal.ticketFor(PROMPT_A)).toBeUndefined(); // evicted, so this is a FRESH ticket
+    expect(journal.record("t", { kind: "executed", prompt_id: PROMPT_A })).toBeNull(); // resend: suppressed
+
+    journal.openRun(PROMPT_A, { tabId: "t" }); // ComfyUI reused the id for a NEW run
+    const second = journal.record("t", { kind: "executed", prompt_id: PROMPT_A });
+    expect(second).not.toBeNull();
+    expect(second!.correlation.status).toBe("matched");
+  });
+
+  it("a stall/rewind abandon is CARRIED, so a freezing backend can't replay forever", () => {
+    // Both auto-repeat, so an unbounded release there is an infinite replay
+    // source. Three dispatched-and-abandoned turns settle it instead.
+    journal.openRun(PROMPT_A, { tabId: "t" });
+    const entry = journal.record("t", { kind: "executed", prompt_id: PROMPT_A });
+    for (let i = 0; i < 3; i++) {
+      journal.deliverPending("t", () => true);
+      journal.release(entry!.token, { carried: true });
+    }
+    expect(journal.outstanding("t")).toHaveLength(0);
   });
 
   it("hasOutstanding reports any undelivered completion (the self-restart gate)", () => {

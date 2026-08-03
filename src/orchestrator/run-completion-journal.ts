@@ -216,6 +216,14 @@ export class RunCompletionJournalImpl {
    *  attribute. */
   openRun(promptId: string | null | undefined, meta: { tabId: string; toNodeId?: number }): boolean {
     if (typeof promptId !== "string" || !promptId) return false;
+    // CLEAR the already-delivered memo for this (tab, run) FIRST, on EVERY path.
+    // The memo only ever means "we already reported THIS run", which queuing the
+    // id again makes false — and the memo outlives the ticket by design, so the
+    // reopen branch below is NOT the only way to reach a stale one: after 64
+    // later runs the old ticket is evicted, and a reuse of the id then takes the
+    // fresh-ticket path while the memo still stands. Leaving it would suppress
+    // the NEW run's real completion after `panel_run` promised to deliver it.
+    this.delivered.delete(deliveredKey(meta.tabId, promptId));
     const existing = this.tickets.get(promptId);
     if (existing) {
       // Same prompt id queued again (a re-run of an id ComfyUI reused, or a
@@ -252,12 +260,6 @@ export class RunCompletionJournalImpl {
           );
         }
       }
-      // …and CLEAR the already-delivered memo for it. Reopening the ticket while
-      // the memo stood meant the reopened run's completion was suppressed as a
-      // duplicate of the PREVIOUS run's: `panel_run` promised automatic delivery
-      // and the journal then swallowed it. The memo only ever means "we already
-      // reported THIS run", which a genuine re-queue makes false.
-      this.delivered.delete(deliveredKey(meta.tabId, promptId));
       return true;
     }
     this.tickets.set(promptId, {
