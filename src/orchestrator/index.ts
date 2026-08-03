@@ -2795,13 +2795,24 @@ export async function runPanelOrchestrator(): Promise<void> {
           // different provider. Purging first means there is nothing to hand
           // back. Read-only pre-pass over the same predicate the loop uses, so
           // the two can't disagree about what counts as a collision.
+          // #468 CRITICAL — a tab holding ONLY a journal entry is NOT empty. Its
+          // agent and durable session may both be gone (New chat) while an
+          // undelivered completion for its render is still addressed to it;
+          // without counting that the destination reads as unoccupied, the source
+          // is rebound onto its id, and the next flush hands the DESTINATION
+          // tab's render to the SOURCE tab's conversation.
+          const destinationJournaled = RunCompletions.outstanding(panelTab).length;
           const destinationHadState = [...KNOWN_BACKENDS].some((b) =>
             destinationHasCollisionState({
               hasManagerState: manager.hasAnyState(panelTab + AGENT_KEY_SEP + b),
               hasDurableSession: sessionStore.get(panelTab + AGENT_KEY_SEP + b) !== undefined,
               renderHeldCount: heldDuringGen.get(panelTab + AGENT_KEY_SEP + b)?.length ?? 0,
+              journaledCompletionCount: destinationJournaled,
             }),
           );
+          // PURGE, never inherit: the destination's completions belong to the tab
+          // being superseded, and there is no agent left to deliver them to.
+          // forget() logs each one, so the loss is disclosed, not silent.
           if (destinationHadState) RunCompletions.forget(panelTab);
           for (const b of KNOWN_BACKENDS) {
             const srcKey = migratedFrom + AGENT_KEY_SEP + b;
@@ -2825,6 +2836,11 @@ export async function runPanelOrchestrator(): Promise<void> {
                 hasManagerState: manager.hasAnyState(newKey),
                 hasDurableSession: sessionStore.get(newKey) !== undefined,
                 renderHeldCount: heldDuringGen.get(newKey)?.length ?? 0,
+                // #468 — journal state is per PANEL TAB, not per backend, so the
+                // same count applies to every provider's key. Counted BEFORE the
+                // pre-pass purge above so a journal-only destination still drives
+                // the per-backend reset + the bridge-queue drop below.
+                journaledCompletionCount: destinationJournaled,
               })
             ) {
               destinationCollision = true;

@@ -29,6 +29,7 @@ import {
   RunCompletionJournalImpl,
   type CompletionPayload,
 } from "../../orchestrator/run-completion-journal.js";
+import { destinationHasCollisionState } from "../../orchestrator/session-store.js";
 
 let PanelAgentManager: typeof import("../../orchestrator/panel-agent.js").PanelAgentManager;
 
@@ -54,7 +55,7 @@ async function waitFor(cond: () => boolean, timeoutMs = 2000): Promise<void> {
  */
 class ContinuationBackend implements AgentBackend {
   readonly id = "claude" as const;
-  readonly capabilities = CLAUDE_CAPABILITIES;
+  readonly capabilities = CLAUDE_CAPABILITIES; // declares turnMarkers: true
   turns: string[] = [];
   /** Resolves the turn currently in flight. */
   private release: (() => void) | null = null;
@@ -63,13 +64,17 @@ class ContinuationBackend implements AgentBackend {
 
   async *run(opts: BackendStartOptions): AsyncGenerator<AgentEvent> {
     yield { type: "session", sessionId: "sess-468" };
+    let turnSeq = 0;
     for await (const turn of opts.channel) {
       this.turns.push((turn as { text?: string }).text ?? "");
+      turnSeq += 1;
       await new Promise<void>((resolve) => {
         this.release = resolve;
       });
       if (this.strandTurns) continue;
-      yield { type: "result", ok: true, subtype: "success" };
+      // Stamped with its own turn marker, exactly as a real marker-declaring
+      // backend does — that is what lets it ack the completion it carried.
+      yield { type: "result", ok: true, subtype: "success", turn: turnSeq };
     }
   }
 
@@ -95,10 +100,17 @@ class ContinuationBackend implements AgentBackend {
  */
 class MarkerBackend implements AgentBackend {
   readonly id = "claude" as const;
-  readonly capabilities = CLAUDE_CAPABILITIES;
+  readonly capabilities = CLAUDE_CAPABILITIES; // declares turnMarkers: true
   turns: string[] = [];
   private sink: ((ev: AgentEvent) => void) | null = null;
   private queued: AgentEvent[] = [];
+  /** When true a turn emits NO stamped event at all (the zero-output turn whose
+   *  traceless terminal is what breaks a learn-by-observation ack gate). */
+  private readonly silentTurns: boolean;
+
+  constructor(opts: { silentTurns?: boolean } = {}) {
+    this.silentTurns = opts.silentTurns === true;
+  }
 
   async *run(opts: BackendStartOptions): AsyncGenerator<AgentEvent> {
     let wake: (() => void) | null = null;
@@ -111,8 +123,7 @@ class MarkerBackend implements AgentBackend {
     void (async () => {
       for await (const turn of opts.channel) {
         this.turns.push((turn as { text?: string }).text ?? "");
-        // Mark the turn as producing SOME stamped output, so the agent learns
-        // this backend stamps markers (exactly what Claude does).
+        if (this.silentTurns) continue;
         this.sink?.({ type: "assistant", text: "", turn: this.turns.length } as AgentEvent);
       }
     })();
@@ -246,7 +257,7 @@ describe("run completion across automatic goal continuation (#468)", () => {
 
   it("a traceless straggler result does NOT ack the current turn's completion", async () => {
     // #728 lets an UNMARKED result through the dead-letter guard for gate
-    // liveness. On a marker-stamping backend that result may belong to an
+    // liveness. On a marker-declaring backend that result may belong to an
     // abandoned earlier turn, so it must not retire a completion the CURRENT
     // turn is carrying — otherwise a turn that then stalls has nothing to
     // hand back and the completion is gone.
@@ -264,12 +275,77 @@ describe("run completion across automatic goal continuation (#468)", () => {
 
     // An unmarked straggler from the abandoned turn 1 arrives.
     backend.emit({ type: "result", ok: false, subtype: "error_during_execution" });
-    await new Promise((r) => setTimeout(r, 20));
-    expect(journal.outstanding(tab)).toHaveLength(1); // NOT acked
+    // It is handed BACK, not acked — and immediately re-delivered into a new
+    // turn, so the completion is neither lost nor fabricated as delivered.
+    await waitFor(() => backend.turns.length >= 3);
+    expect(backend.turns[2]).toContain("carried.png");
+    expect(backend.turns[2]).toContain("RE-DELIVERED");
+    expect(journal.outstanding(tab)).toHaveLength(1);
+    expect(journal.ticketFor(PROMPT_A)?.settled).toBe(false);
 
-    // Turn 2's own (marked) result is what acks it.
-    backend.emit({ type: "result", ok: true, subtype: "success", turn: 2 });
+    // Only the carrying turn's OWN marked result settles it.
+    backend.emit({ type: "result", ok: true, subtype: "success", turn: 3 });
     await waitFor(() => journal.outstanding(tab).length === 0);
+    expect(journal.ticketFor(PROMPT_A)?.settled).toBe(true);
+  });
+
+  it("a straggler arriving BEFORE the carrying turn stamps anything still cannot ack", async () => {
+    // The unsound-inference case: a gate that LEARNS "this backend stamps" by
+    // observation is still unlearned in exactly this window — a zero-output
+    // turn's traceless terminal lands before the replacement turn emits any
+    // stamped event. Capability is DECLARED, so the gate holds from the start.
+    const backend = new MarkerBackend({ silentTurns: true });
+    const { journal, manager, arrive } = makeHarness(backend);
+    const tab = "tab-straggler-early";
+
+    journal.openRun(PROMPT_A, { tabId: tab });
+    manager.send(tab, "go"); // turn 1 emits NOTHING
+    await waitFor(() => backend.turns.length >= 1);
+    backend.emit({ type: "result", ok: true, subtype: "success", turn: 1 });
+
+    arrive(tab, { kind: "executed", prompt_id: PROMPT_A, images: [{ filename: "early.png" }] });
+    await waitFor(() => backend.turns.length >= 2); // turn 2 carries it, still silent
+
+    // No marker has EVER been observed on this run at this point — a
+    // learn-by-observation gate would ack here and destroy the replay.
+    backend.emit({ type: "result", ok: false, subtype: "error_during_execution" });
+    await waitFor(() => backend.turns.length >= 3); // handed back and re-delivered
+    expect(backend.turns[2]).toContain("early.png");
+    expect(journal.outstanding(tab)).toHaveLength(1);
+    expect(journal.ticketFor(PROMPT_A)?.settled).toBe(false);
+  });
+
+  it("a completion parked in held mail survives retire() (provider switch)", async () => {
+    // retire() PRESERVES held mail, which is why it used to strand the
+    // completion riding in it: the journal entry stayed `handed_off` — a state
+    // deliverPending() skips — with no agent left to consume it.
+    const doomed: AgentBackend = {
+      id: "claude" as const,
+      capabilities: CLAUDE_CAPABILITIES,
+      async prepare() {
+        throw new Error("endpoint rejected the key (http 401)");
+      },
+      // eslint-disable-next-line require-yield
+      async *run(): AsyncGenerator<AgentEvent> {
+        throw new Error("never runs");
+      },
+      async interrupt() {},
+      async listModels() {
+        return [];
+      },
+    };
+    const { journal, manager, arrive } = makeHarness(doomed);
+    const tab = "tab-retire-heldmail";
+
+    journal.openRun(PROMPT_A, { tabId: tab });
+    manager.send(tab, "go");
+    arrive(tab, { kind: "executed", prompt_id: PROMPT_A, images: [{ filename: "retired.png" }] });
+    await waitFor(() => journal.pending(tab).length === 0); // taken by the doomed agent
+    await waitFor(() => manager.hasHeldMail(tab));
+
+    manager.retire(tab); // provider switch retires the failed key
+    expect(journal.pending(tab)).toHaveLength(1); // handed back, replayable
+    expect(journal.outstanding(tab)).toHaveLength(1);
   });
 
   it("reports an uncorrelatable completion as UNDETERMINED instead of swallowing it", async () => {
@@ -555,6 +631,73 @@ describe("run completion journal correlation (#468)", () => {
       return false;
     });
     expect(seen).toEqual([PROMPT_A]);
+  });
+
+  it("a tab holding ONLY a journal entry counts as OCCUPIED for a tab-id migration", () => {
+    // CRITICAL: the destination of a same-workflow tab-id migration can have had
+    // its agent AND durable session cleared (New chat) and still hold an
+    // undelivered completion. If the occupancy check ignores the journal, the
+    // destination reads as empty, the source is rebound onto its id, and the
+    // next flush hands the DESTINATION tab's render to the SOURCE tab's
+    // conversation — a cross-conversation delivery, worse than a lost one.
+    expect(
+      destinationHasCollisionState({
+        hasManagerState: false,
+        hasDurableSession: false,
+        renderHeldCount: 0,
+        journaledCompletionCount: 1,
+      }),
+    ).toBe(true);
+    expect(
+      destinationHasCollisionState({
+        hasManagerState: false,
+        hasDurableSession: false,
+        renderHeldCount: 0,
+        journaledCompletionCount: 0,
+      }),
+    ).toBe(false);
+    // …and the purge that follows leaves nothing for the incoming agent to
+    // inherit, for BOTH pending and already-handed-off entries.
+    journal.record("wf:dest", { kind: "executed", prompt_id: PROMPT_B });
+    journal.deliverPending("wf:dest", () => true);
+    journal.record("wf:dest", { kind: "executed", prompt_id: PROMPT_A });
+    expect(journal.outstanding("wf:dest")).toHaveLength(2);
+    journal.forget("wf:dest");
+    expect(journal.outstanding("wf:dest")).toHaveLength(0);
+    journal.moveKey("wf:src", "wf:dest"); // then the source migrates in
+    expect(journal.outstanding("wf:dest")).toHaveLength(0);
+  });
+
+  it("an identical ID-LESS completion re-sent is not delivered twice", () => {
+    // With no prompt id there is no run identity, so content is the only
+    // evidence of sameness. A re-sent frame must not produce a second turn —
+    // UNDETERMINED labelling doesn't stop the agent double-reporting.
+    const payload = { kind: "executed", images: [{ filename: "mystery_0001.png" }] };
+    const first = journal.record("t", { ...payload });
+    expect(first).not.toBeNull();
+    expect(journal.record("t", { ...payload })).toBe(first); // collapses while journaled
+    expect(journal.pending("t")).toHaveLength(1);
+
+    journal.deliverPending("t", () => true);
+    journal.ack(first!.token);
+    // …and still suppressed after the ack, when no entry survives to collapse on.
+    expect(journal.record("t", { ...payload })).toBeNull();
+    expect(journal.pending("t")).toHaveLength(0);
+
+    // A DIFFERENT id-less render is still delivered.
+    expect(
+      journal.record("t", { kind: "executed", images: [{ filename: "other_0002.png" }] }),
+    ).not.toBeNull();
+    expect(journal.pending("t")).toHaveLength(1);
+  });
+
+  it("the id-less content memo moves with a tab-id migration", () => {
+    const payload = { kind: "executed", images: [{ filename: "idless.png" }] };
+    const entry = journal.record("tmp:draft", { ...payload });
+    journal.deliverPending("tmp:draft", () => true);
+    journal.ack(entry!.token);
+    journal.moveKey("tmp:draft", "wf:saved.json");
+    expect(journal.record("wf:saved.json", { ...payload })).toBeNull();
   });
 
   it("moveKey carries the delivered memo and the eviction counter, not just the entries", () => {

@@ -262,13 +262,6 @@ export class PanelAgent {
   /** The turn marker `turnEventTokens` belongs to (#468). A completion is acked
    *  only by the result of the turn that CARRIED it — see the `result` case. */
   private turnEventTokensMarker = 0;
-  /** True once this run has seen ANY marker-stamped event, i.e. the backend
-   *  stamps turn markers (Claude does; Codex/Gemini don't). On a stamping
-   *  backend an UNMARKED result is a traceless straggler — possibly from an
-   *  abandoned earlier turn — so it must not ack the current turn's completion
-   *  tokens. On a non-stamping backend there is nothing to compare against, so
-   *  the pre-#468 tolerance applies unchanged. Reset per run. */
-  private sawTurnMarkers = false;
   /** True while a turn is in flight (working→done). Lets the manager defer a
    *  session-restarting option change (effort) until the turn finishes, instead
    *  of interrupting and silently dropping the in-flight reply. */
@@ -1006,10 +999,9 @@ export class PanelAgent {
       this.turnWaiter = null;
       this.currentTurnMarker = 0;
       this.abandonedTurnMarker = 0;
-      // The #468 ack gate mirrors the marker reset: a fresh run re-learns whether
-      // this backend stamps, and no marker from the dead run can satisfy it.
+      // The #468 ack gate mirrors the marker reset: no marker minted by the dead
+      // run can satisfy the new one's first turn.
       this.turnEventTokensMarker = 0;
-      this.sawTurnMarkers = false;
       // Drop the prior session's last assistant UUID so a fork can't report a
       // stale (pre-fork) anchor for the first turn of the new session.
       this.lastAssistantUuid = null;
@@ -1239,10 +1231,6 @@ export class PanelAgent {
       );
       return;
     }
-    // Learn whether this backend stamps turn markers at all (#468 ack gate). Set
-    // from any surviving stamped event; a backend that never stamps leaves it
-    // false and keeps the pre-#468 ack behavior.
-    if (typeof ev.turn === "number") this.sawTurnMarkers = true;
     // Any event means the turn is alive — reset the idle watchdog. The `result`
     // case below disarms it entirely (turn ended). Placed before the switch so it
     // covers every event type without per-case bumps.
@@ -1370,24 +1358,39 @@ export class PanelAgent {
         // them and settles their run tickets. This is the ONLY ack point; every
         // other exit from a turn hands the tokens back for replay.
         //
-        // ACK GATE: only THIS turn's result may ack. On a marker-stamping
-        // backend an UNMARKED result is a traceless straggler (Claude emits one
-        // for a result it cannot match to a submitted turn) that the #728
-        // dead-letter deliberately lets through for gate liveness — it must not
-        // also retire a completion the CURRENT turn is carrying, or a turn that
-        // then stalls would have nothing left to hand back. A non-stamping
-        // backend has nothing to compare, so it keeps the previous behavior. The
-        // un-acked tokens are handed back at the next dispatch (see channel()).
-        const ackable =
-          !this.sawTurnMarkers ||
-          (typeof ev.turn === "number" && ev.turn === this.turnEventTokensMarker);
-        if (this.turnEventTokens.length && ackable) {
-          const delivered = this.turnEventTokens;
+        // ACK GATE: only THIS turn's own result may ack. On a backend that
+        // DECLARES turn markers, an UNMARKED result is a traceless straggler
+        // (Claude emits one for a result it cannot match to a submitted turn)
+        // that the #728 dead-letter deliberately lets through for gate liveness
+        // — it must not also retire a completion the CURRENT turn is carrying,
+        // or a turn that then stalls would have nothing left to hand back.
+        //
+        // The capability is DECLARED, never inferred from "have I seen a marker
+        // yet": a zero-output turn's straggler arrives BEFORE the replacement
+        // turn stamps anything, so an observation-based gate is unsound in
+        // exactly the window it exists to protect. A backend that declares no
+        // markers keeps the pre-#468 behavior (nothing to compare against).
+        //
+        // Not ackable → hand the tokens BACK right here, so a completion can
+        // never dangle on a turn that has already ended. The journal re-queues
+        // it into a later turn: a duplicate at worst, never a loss.
+        if (this.turnEventTokens.length) {
+          const carried = this.turnEventTokens;
           this.turnEventTokens = [];
-          try {
-            this.deps.onEventDelivered?.(this.tabId, delivered);
-          } catch (err) {
-            logger.warn(`[panel-agent ${this.short()}] acking completion tokens: ${msgOf(err)}`);
+          const ackable =
+            this.backend.capabilities.turnMarkers !== true ||
+            (typeof ev.turn === "number" && ev.turn === this.turnEventTokensMarker);
+          if (ackable) {
+            try {
+              this.deps.onEventDelivered?.(this.tabId, carried);
+            } catch (err) {
+              logger.warn(`[panel-agent ${this.short()}] acking completion tokens: ${msgOf(err)}`);
+            }
+          } else {
+            logger.warn(
+              `[panel-agent ${this.short()}] an unmarked result cannot ack turn ${this.turnEventTokensMarker}'s run completion(s) — handing ${carried.length} back for replay (#468)`,
+            );
+            this.releaseEventTokens(carried);
           }
         }
         // Turn ended cleanly → disarm the freeze watchdog. (If it already tripped,
@@ -2178,13 +2181,49 @@ export class PanelAgentManager {
     return { model: this.modelFor(tabId), effort: this.effortFor(tabId), restarted, deferred };
   }
 
-  /** Hand back every run-completion token sitting in a key's HELD mail (#468), so
-   *  discarding that mail can never strand a completion in the journal's
-   *  handed-off state (which `deliverPending` skips). Safe to call before any
-   *  heldMessages drop; a no-op when there is none. */
-  private releaseHeldTokens(key: string): void {
-    const tokens = (this.heldMessages.get(key) ?? []).flatMap((it) => it.eventTokens ?? []);
+  /**
+   * THE SINGLE TEARDOWN SEAM for unbinding a key's agent (#468). Every path that
+   * stops an agent must go through here, so a future third teardown can't
+   * silently re-open the hole that `retire()` had: it preserved `heldMessages`
+   * without releasing the run-completion tokens parked in them, leaving those
+   * entries `handed_off` — a state `deliverPending()` skips — with no agent left
+   * to consume them and no disclosure.
+   *
+   * Held mail is DETACHED from its completion tokens either way: the message
+   * text keeps whatever preservation semantics the caller wants, while ownership
+   * of the completion returns to the journal, which replays it to whatever agent
+   * serves this panel tab next (a different provider's key included — the
+   * journal is keyed by panel tab).
+   *
+   * `dropHeldMail` distinguishes the two callers: reset() is an explicit fresh
+   * start and discards the mail; retire() preserves it for when the workflow is
+   * reopened. Returns the unbound agent (if any) for the caller to stop.
+   */
+  private unbindAgent(key: string, opts: { dropHeldMail: boolean; reason: string }): PanelAgent | undefined {
+    const agent = this.agents.get(key);
+    this.agents.delete(key);
+    this.detachHeldCompletions(key, opts.reason);
+    if (opts.dropHeldMail) this.heldMessages.delete(key);
+    return agent;
+  }
+
+  /** Strip the run-completion tokens out of a key's HELD mail and hand them back
+   *  to the journal (#468). The mail itself is untouched — only ownership of the
+   *  completion moves — so a preserved (retire) or discarded (reset) queue can
+   *  never take a completion down with it. No-op when there is none. */
+  private detachHeldCompletions(key: string, reason: string): void {
+    const held = this.heldMessages.get(key);
+    if (!held?.length) return;
+    const tokens: string[] = [];
+    for (const item of held) {
+      if (!item.eventTokens?.length) continue;
+      tokens.push(...item.eventTokens);
+      delete item.eventTokens; // the journal owns it now — never ack it twice
+    }
     if (!tokens.length) return;
+    logger.warn(
+      `[panel-orchestrator] tab ${key.slice(0, 8)} ${reason}: ${tokens.length} run completion(s) were parked in held mail — returned to the journal for replay (#468)`,
+    );
     try {
       this.opts.onEventUndelivered?.(key, tokens);
     } catch (err) {
@@ -2197,8 +2236,9 @@ export class PanelAgentManager {
    *  so the caller (e.g. resume_session) can set a new pendingResume right after
    *  without a concurrent send() spawning a non-resumed agent in an await gap. */
   reset(tabId: string): void {
-    const agent = this.agents.get(tabId);
-    this.agents.delete(tabId);
+    // Unbind through the SHARED teardown seam (#468) — it is what guarantees a
+    // run completion parked in held mail is handed back rather than discarded.
+    const agent = this.unbindAgent(tabId, { dropHeldMail: true, reason: "reset" });
     this.pendingResume.delete(tabId);
     // Forget the durable session too — a NEW chat must start fresh, so the disk
     // fallback in send() can't resurrect the conversation the user just cleared.
@@ -2207,12 +2247,6 @@ export class PanelAgentManager {
     this.opts.sessionStore?.clear(tabId);
     this.pendingEffortRestart.delete(tabId); // a reset supersedes any deferred restart
     this.pendingMcpRestart.delete(tabId);
-    // A reset is an explicit fresh start — drop held mail. But a run completion
-    // riding in that mail is NEWS, not conversation, and its journal entry is
-    // still marked handed-off; hand its tokens back or the completion would be
-    // stranded in a state nothing ever flushes again (#468).
-    this.releaseHeldTokens(tabId);
-    this.heldMessages.delete(tabId);
     // Drop this key's picker override so a provider switch (which reset()s the old
     // key) can't carry the old provider's model/effort into the new backend's spawn.
     this.modelByKey.delete(tabId);
@@ -2229,11 +2263,17 @@ export class PanelAgentManager {
    *  chat — this preserves sessionStore/pendingResume/held mail, so the retired
    *  workflow resumes exactly where it left off when reopened, while its now-stopped
    *  agent can no longer push frames that the bridge migration alias would leak into
-   *  the newly-targeted view. No-op when no live agent owns the key. */
+   *  the newly-targeted view.
+   *
+   *  Held mail is PRESERVED (that is the point) but its run completions are NOT
+   *  (#468): with the agent gone they would sit `handed_off` forever — a state
+   *  `deliverPending()` skips — so a provider switch that retires the key would
+   *  silently swallow them. The shared teardown detaches and returns them, and it
+   *  runs even when no live agent owns the key (a retire with only held mail is
+   *  exactly the case that lost them). */
   retire(tabId: string): void {
-    const agent = this.agents.get(tabId);
+    const agent = this.unbindAgent(tabId, { dropHeldMail: false, reason: "retire" });
     if (!agent) return;
-    this.agents.delete(tabId);
     void agent.stop();
     logger.info(
       `[panel-orchestrator] tab ${tabId.slice(0, 8)} retired (workflow switch on the same socket) — durable session preserved`,

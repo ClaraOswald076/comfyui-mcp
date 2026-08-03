@@ -104,6 +104,9 @@ export interface JournalEntry {
   arrivedAt: number;
   attempts: number;
   state: EntryState;
+  /** Content fingerprint — set only for ID-LESS completions, which have no run
+   *  identity to dedupe on. See idlessFingerprint(). */
+  fingerprint?: string;
 }
 
 /** Runs tracked at once. Ample for any real batch; bounded so a long session
@@ -119,11 +122,39 @@ const MAX_ENTRIES_TOTAL = 96;
 const MAX_DELIVERED_MEMO = 256;
 /** Tabs whose evicted-completion counter is retained. */
 const MAX_DROPPED_KEYS = 64;
+/** How many times a completion may be handed to a LIVE agent without a provable
+ *  ack before the journal settles it anyway. Bounds the hand-off/release cycle
+ *  (see release()); each hand-off already put the text into a turn the agent
+ *  read, so settling risks a duplicate, never a loss. */
+const MAX_HANDOFFS = 3;
+/** How long an ID-LESS completion's content fingerprint suppresses an identical
+ *  repeat. Bounded on purpose: with no prompt id, identical content is the ONLY
+ *  evidence of sameness, and two genuinely distinct renders can eventually
+ *  produce identical filenames (ComfyUI reuses `ComfyUI_temp_*_00001_` after a
+ *  restart). Long enough to absorb a panel re-send burst, short enough that a
+ *  later real render is never mistaken for a repeat. */
+const IDLESS_DEDUPE_WINDOW_MS = 10 * 60_000;
 
 /** Memo key for an already-delivered (tab, run). "|" separates them; a ComfyUI
  *  prompt id is a fixed-format UUID, so the pair can't alias another. */
 function deliveredKey(key: string, promptId: string): string {
   return `${key}|${promptId}`;
+}
+
+/**
+ * Fingerprint for an ID-LESS completion (a panel that forwarded no `prompt_id`).
+ * With no run identity, content is all we have to tell "the panel re-sent the
+ * same frame" from "a second render finished": kind + note + error + the exact
+ * output list. Combined with IDLESS_DEDUPE_WINDOW_MS this collapses a repeat
+ * without letting a later, genuinely different render inherit the suppression.
+ * Filenames are NOT sorted — the panel emits them in output order, and a
+ * different order is a different batch.
+ */
+function idlessFingerprint(key: string, payload: CompletionPayload): string {
+  const files = (payload.images ?? [])
+    .map((i) => `${i.subfolder ?? ""}/${i.type ?? ""}/${i.filename}`)
+    .join(",");
+  return `${key}|~idless~|${payload.kind ?? ""}|${payload.note ?? ""}|${payload.error ?? ""}|${files}`;
 }
 
 export class RunCompletionJournalImpl {
@@ -137,6 +168,10 @@ export class RunCompletionJournalImpl {
    *  panel that re-sends the frame after the entry was removed can't produce a
    *  second delivery. */
   private delivered = new Set<string>();
+  /** Content fingerprint → delivery time, for ID-LESS completions (which have no
+   *  run identity to memoize). Bounded FIFO + a time window, so an identical
+   *  re-send is suppressed but a later genuinely-different render is not. */
+  private idlessSeen = new Map<string, number>();
   private seq = 0;
 
   /** `panel_run` queued a render. Returns false when ComfyUI/the panel gave us
@@ -187,11 +222,17 @@ export class RunCompletionJournalImpl {
   /**
    * Journal a completion addressed to `key`. Correlation is computed here, once.
    *
-   * DEDUPE: an identified completion (matched or foreign) collapses onto any
-   * existing undelivered entry for the same key + prompt id — one run can never
-   * produce two deliveries, however many times the panel re-sends it. An
-   * unidentified completion has nothing to dedupe on, so it is always a new
-   * entry (bounded by MAX_ENTRIES_PER_KEY).
+   * DEDUPE, in both directions:
+   *  • IDENTIFIED (matched or foreign) — collapses onto any existing undelivered
+   *    entry for the same key + prompt id, and is suppressed outright once that
+   *    (tab, run) has been acked. One run can never produce two deliveries,
+   *    however many times the panel re-sends it.
+   *  • ID-LESS — there is no run identity, so it dedupes on a CONTENT
+   *    fingerprint within IDLESS_DEDUPE_WINDOW_MS. That is enough to stop a
+   *    re-sent frame producing two turns (the agent double-reporting, or acting
+   *    twice on one output), while a later genuinely different render — or the
+   *    same content long afterwards — is still delivered.
+   * Returns null when the completion is a suppressed duplicate.
    */
   record(key: string, payload: CompletionPayload): JournalEntry | null {
     const correlation = this.correlate(key, payload);
@@ -221,6 +262,30 @@ export class RunCompletionJournalImpl {
           return entry;
         }
       }
+    } else {
+      const print = idlessFingerprint(key, payload);
+      const now = Date.now();
+      // Already delivered an identical id-less completion recently.
+      const seenAt = this.idlessSeen.get(print);
+      if (seenAt !== undefined && now - seenAt < IDLESS_DEDUPE_WINDOW_MS) {
+        logger.info(
+          `[run-completions] ignoring a re-sent id-less completion for tab ${key.slice(0, 8)} — identical content already delivered`,
+        );
+        return null;
+      }
+      if (seenAt !== undefined) this.idlessSeen.delete(print); // stale — let it through
+      // Or one is still journaled and undelivered.
+      for (const entry of this.entries.values()) {
+        if (
+          entry.key === key &&
+          entry.correlation.status === "unidentified" &&
+          entry.fingerprint === print &&
+          now - entry.arrivedAt < IDLESS_DEDUPE_WINDOW_MS
+        ) {
+          entry.payload = payload;
+          return entry;
+        }
+      }
     }
     const entry: JournalEntry = {
       token: `rc${++this.seq}`,
@@ -230,6 +295,9 @@ export class RunCompletionJournalImpl {
       arrivedAt: Date.now(),
       attempts: 0,
       state: "pending",
+      ...(correlation.status === "unidentified"
+        ? { fingerprint: idlessFingerprint(key, payload) }
+        : {}),
     };
     this.entries.set(entry.token, entry);
     this.trimEntries(key);
@@ -334,6 +402,15 @@ export class RunCompletionJournalImpl {
         if (oldest === undefined) break;
         this.delivered.delete(oldest);
       }
+    } else if (entry.fingerprint) {
+      // ID-LESS: memoize the CONTENT so a re-sent identical frame after the ack
+      // doesn't produce a second turn. Windowed in record(), bounded here.
+      this.idlessSeen.set(entry.fingerprint, Date.now());
+      while (this.idlessSeen.size > MAX_DELIVERED_MEMO) {
+        const oldest = this.idlessSeen.keys().next().value;
+        if (oldest === undefined) break;
+        this.idlessSeen.delete(oldest);
+      }
     }
     if (entry.correlation.status === "matched") {
       const ticket = this.tickets.get(entry.correlation.promptId);
@@ -341,11 +418,29 @@ export class RunCompletionJournalImpl {
     }
   }
 
-  /** An agent gave a hand-off back undelivered (it was stopped, or its turn was
-   *  abandoned before it could be read). Re-arm it for replay. */
+  /**
+   * An agent gave a hand-off back undelivered (it was stopped, its turn was
+   * abandoned, or the turn's result could not be proven to be its own). Re-arm
+   * it for replay.
+   *
+   * BOUNDED. `attempts` counts hand-offs to a LIVE agent — each one put the
+   * completion's text into a turn the agent actually read. A backend that
+   * declares turn markers but keeps emitting unmarked results would otherwise
+   * bounce the same entry between hand-off and release forever, re-delivering it
+   * on every turn. After MAX_HANDOFFS the evidence of delivery is overwhelming
+   * (the agent has seen it that many times), so we settle it rather than loop.
+   * This can only ever cause a duplicate, never a loss.
+   */
   release(token: string): void {
     const entry = this.entries.get(token);
     if (!entry) return;
+    if (entry.attempts >= MAX_HANDOFFS) {
+      logger.warn(
+        `[run-completions] ${describe(entry.correlation)} was handed to a live agent ${entry.attempts}× without a provable ack — settling it instead of replaying again`,
+      );
+      this.ack(token);
+      return;
+    }
     entry.state = "pending";
   }
 
@@ -376,6 +471,20 @@ export class RunCompletionJournalImpl {
       this.dropped.delete(from);
       this.dropped.set(to, (this.dropped.get(to) ?? 0) + lost);
     }
+    // The id-less content memo and every entry's fingerprint embed the tab key,
+    // so they must be re-keyed too or a post-migration re-send is delivered
+    // twice — the same defect as the delivered memo above.
+    const fromPrefix = `${from}|~idless~|`;
+    for (const [print, at] of [...this.idlessSeen]) {
+      if (!print.startsWith(fromPrefix)) continue;
+      this.idlessSeen.delete(print);
+      this.idlessSeen.set(`${to}|~idless~|${print.slice(fromPrefix.length)}`, at);
+    }
+    for (const entry of this.entries.values()) {
+      if (entry.fingerprint?.startsWith(fromPrefix)) {
+        entry.fingerprint = `${to}|~idless~|${entry.fingerprint.slice(fromPrefix.length)}`;
+      }
+    }
   }
 
   /**
@@ -404,6 +513,9 @@ export class RunCompletionJournalImpl {
     this.dropped.delete(key);
     for (const memo of [...this.delivered]) {
       if (memo.startsWith(`${key}|`)) this.delivered.delete(memo);
+    }
+    for (const print of [...this.idlessSeen.keys()]) {
+      if (print.startsWith(`${key}|~idless~|`)) this.idlessSeen.delete(print);
     }
   }
 
@@ -446,6 +558,7 @@ export class RunCompletionJournalImpl {
     this.entries.clear();
     this.dropped.clear();
     this.delivered.clear();
+    this.idlessSeen.clear();
     this.seq = 0;
   }
   droppedFor(key: string): number {
