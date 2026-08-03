@@ -636,6 +636,31 @@ export function dispatchOutcomeOf(err: unknown): boolean | undefined {
  *  buffer. */
 const REPLY_TIMEOUT = Symbol.for("comfyui-mcp.bridge.reply-timeout");
 
+/** Marks an error as a CAPABILITY refusal: the connected panel does not enforce the
+ *  workflow-stamp contract a mutation needs (#570/#718), so the command was refused
+ *  pre-dispatch. Unlike a transient routing failure, NEITHER a retry nor a rebind can
+ *  add the missing capability — only a panel update + browser hard-refresh can — so
+ *  callers must key their recovery wording on THIS typed marker (#709) instead of
+ *  appending the generic "retry / rebind" suffix, which sends the agent into a futile
+ *  loop that contradicts the refusal's own guidance. */
+const CAPABILITY_REFUSAL = Symbol.for("comfyui-mcp.bridge.capability-refusal");
+
+/** Tag an error as a capability refusal and return it (for throw/reject). */
+export function markCapabilityRefusal<E extends Error>(err: E): E {
+  Object.defineProperty(err, CAPABILITY_REFUSAL, {
+    value: true,
+    enumerable: false,
+    configurable: true,
+  });
+  return err;
+}
+
+/** True when `err` carries the typed capability-refusal marker set by the bridge. */
+export function isCapabilityRefusal(err: unknown): boolean {
+  if (err == null || (typeof err !== "object" && typeof err !== "function")) return false;
+  return (err as Record<symbol, unknown>)[CAPABILITY_REFUSAL] === true;
+}
+
 /** Tag an error as a reply-timeout and return it (for throw/reject). */
 export function markReplyTimeout<E extends Error>(err: E): E {
   Object.defineProperty(err, REPLY_TIMEOUT, {
@@ -2051,26 +2076,42 @@ export class UiBridge {
       const stamp = this.resolveTabWorkflowUuid?.(opts.tabId ?? conn.tabId);
       const hasTrustedStamp = typeof stamp === "string" && stamp.length > 0;
       if (!conn.enforcesWorkflowStamp || !conn.enforcesWorkflowStampAtWrite || !hasTrustedStamp) {
+        // The two CAPABILITY branches (missing panel fences) are typed so the tool
+        // layer drops its futile retry/rebind suffix (#709). The NO-IDENTITY branch
+        // is deliberately NOT capability-marked: an unresolvable workflow identity
+        // is a binding problem a retry/rebind genuinely fixes, so the generic
+        // wrapper must keep firing for it (codex gate — the marker must never
+        // false-positive a non-capability refusal).
+        const capabilityMissing = !conn.enforcesWorkflowStamp || !conn.enforcesWorkflowStampAtWrite;
+        // #709 — user-facing, so name the FULL tab id: the log-style slice(0,8)
+        // rendering ("wf:workf") was misread as a corrupted routing identity and
+        // sent the diagnosis down a wrong path. And lead with the recovery that
+        // actually clears the dominant cause: the on-disk pack can be current
+        // while the open browser tab keeps running a CACHED older bundle (a
+        // restart reconnects the tab but never re-downloads the extension JS),
+        // so the capability the hello advertises lags the version on disk.
+        const recovery =
+          `Run install_panel(action:'update'), restart ComfyUI, then hard-refresh the ` +
+          `ComfyUI browser tab (Ctrl+Shift+R) so it loads the updated bundle — a restart ` +
+          `alone leaves the tab running its cached old panel JS; rebinding cannot add the ` +
+          `missing capability`;
         const why = !conn.enforcesWorkflowStamp
-          ? `panel tab ${conn.tabId.slice(0, 8)} does not enforce per-command workflow targeting ` +
+          ? `panel tab ${conn.tabId} does not enforce per-command workflow targeting ` +
             `(detected panel ${conn.panelVersion ?? "version unknown"}; this MCP requires panel ` +
-              `${requiredPanelVersion()}+). Run install_panel(action:'update') and restart ComfyUI; ` +
-              `rebinding cannot add the missing capability`
+              `${requiredPanelVersion()}+). ${recovery}`
           : !conn.enforcesWorkflowStampAtWrite
-            ? `panel tab ${conn.tabId.slice(0, 8)} does not recheck workflow targeting at the graph write ` +
+            ? `panel tab ${conn.tabId} does not recheck workflow targeting at the graph write ` +
               `boundary after asynchronous work (detected panel ${conn.panelVersion ?? "version unknown"}; this MCP ` +
-                `requires panel ${requiredPanelVersion()}+). Run install_panel(action:'update'), restart ComfyUI, ` +
-                `then hard-refresh the ComfyUI browser tab; rebinding cannot add the missing capability`
+                `requires panel ${requiredPanelVersion()}+). ${recovery}`
           : `this workflow has no trusted identity for the panel to fence the command against`;
-        return Promise.reject(
-          markDispatched(
-            new Error(
-              `"${cmd.cmd}" cannot be safely targeted to the active workflow: ${why}. Read-only graph ` +
-                `commands (graph_outline, graph_query, graph_get_state) still work.`,
-            ),
-            false,
+        const refusal = markDispatched(
+          new Error(
+            `"${cmd.cmd}" cannot be safely targeted to the active workflow: ${why}. Read-only graph ` +
+              `commands (graph_outline, graph_query, graph_get_state) still work.`,
           ),
+          false,
         );
+        return Promise.reject(capabilityMissing ? markCapabilityRefusal(refusal) : refusal);
       }
     }
     if (conn.sock.readyState !== WebSocket.OPEN) {

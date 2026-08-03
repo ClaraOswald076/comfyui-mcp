@@ -27,7 +27,7 @@ const { buildPanelToolDefs, makePanelToolCtx, __panelToolsTestHooks, __openWorkf
   await import("../../orchestrator/panel-tools.js");
 import { getBootLocalComfyUIBaseUrl } from "../../config.js";
 import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
-import { markDispatched } from "../../services/ui-bridge.js";
+import { markCapabilityRefusal, markDispatched } from "../../services/ui-bridge.js";
 import type { PanelToolCtx, ToolResult } from "../../orchestrator/panel-tools.js";
 
 const BOOT_BASE = (getBootLocalComfyUIBaseUrl() ?? "http://127.0.0.1:8188").replace(/\/+$/, "");
@@ -382,8 +382,94 @@ describe("#442 defect 4: a MUTATING panel command names the rebind on a no-route
     expect(sent.length).toBe(0); // the mutating write was NEVER dispatched (no double-apply)
   });
 
-  it("does NOT mis-wrap a POST-dispatch executor failure that merely quotes 'no connected tab' as 'nothing applied'", async () => {
-    // A LIVE tab that ACCEPTS the command (it IS dispatched, pushed to `sent`) but whose
+  it("#709: a CAPABILITY refusal surfaces its own guidance verbatim — no futile retry/rebind suffix", async () => {
+    // The connected tab runs a stale panel bundle (no workflow-stamp enforcement).
+    // The bridge refuses pre-dispatch with the SAME typed dispatched:false flag as a
+    // transient no-route — but the generic "retry / rebind with
+    // panel_set_workflow_target({mode:"current"})" wrapper can never clear a missing
+    // capability, contradicts the refusal's own text, and sent agents into a loop.
+    const capabilityCause = markCapabilityRefusal(
+      markDispatched(
+        new Error(
+          `"graph_set_widget" cannot be safely targeted to the active workflow: panel tab ` +
+            `wf:workflows/x.json does not enforce per-command workflow targeting (detected panel ` +
+            `0.11.20; this MCP requires panel 0.11.35+). Run install_panel(action:'update'), ` +
+            `restart ComfyUI, then hard-refresh the ComfyUI browser tab (Ctrl+Shift+R); rebinding ` +
+            `cannot add the missing capability. Read-only graph commands still work.`,
+        ),
+        false,
+      ),
+    );
+    const live = new Set(["wf:workflows/x.json"]);
+    const sent: Array<{ cmd: Record<string, unknown> }> = [];
+    const bridge = {
+      send: async (cmd: Record<string, unknown>, opts?: { tabId?: string }) => {
+        if (opts?.tabId && !live.has(opts.tabId)) throw new Error("unexpected route");
+        throw capabilityCause; // the gate's pre-dispatch refusal
+      },
+      push: () => 1,
+      canReach: (id: string) => live.has(id),
+      tabs: () => [...live].map((t) => ({ tab_id: t, title: t, connected_at: 0 })),
+      resolveActiveTabId: () => [...live][0],
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, "wf:workflows/x.json", new WorkflowTargetStore());
+
+    const res = await defByName("panel_set_widget").handler(
+      { node_id: 7, widget: "steps", value: 20 },
+      ctx,
+    );
+    expect(res.isError).toBe(true);
+    expect(sent.length).toBe(0); // pre-dispatch: nothing was sent
+    const text = textOf(res);
+    // The refusal's own, correct recovery is surfaced…
+    expect(text).toMatch(/hard-refresh the ComfyUI browser tab/);
+    expect(text).toMatch(/rebinding cannot add the missing capability/);
+    // …and the contradictory generic advice is NOT appended.
+    expect(text).not.toContain('rebind with panel_set_workflow_target({mode:"current"})');
+    expect(text).not.toMatch(/Retry in a moment/);
+  });
+
+  it("#709: a NO-IDENTITY refusal (not capability-marked) keeps the retry/rebind wrapper", async () => {
+    // Same gate, THIRD branch: the panel enforces the stamp but the workflow has no
+    // trusted identity to fence against — a binding/identity problem where retrying
+    // or rebinding onto the live tab genuinely re-resolves the identity. The error
+    // is dispatched:false but deliberately NOT capability-marked, so the generic
+    // recovery wrapper MUST still fire.
+    const identityCause = markDispatched(
+      new Error(
+        `"graph_set_widget" cannot be safely targeted to the active workflow: this workflow ` +
+          `has no trusted identity for the panel to fence the command against. Read-only graph ` +
+          `commands (graph_outline, graph_query, graph_get_state) still work.`,
+      ),
+      false,
+    );
+    const live = new Set(["wf:workflows/x.json"]);
+    const sent: Array<{ cmd: Record<string, unknown> }> = [];
+    const bridge = {
+      send: async (cmd: Record<string, unknown>, opts?: { tabId?: string }) => {
+        if (opts?.tabId && !live.has(opts.tabId)) throw new Error("unexpected route");
+        throw identityCause;
+      },
+      push: () => 1,
+      canReach: (id: string) => live.has(id),
+      tabs: () => [...live].map((t) => ({ tab_id: t, title: t, connected_at: 0 })),
+      resolveActiveTabId: () => [...live][0],
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, "wf:workflows/x.json", new WorkflowTargetStore());
+
+    const res = await defByName("panel_set_widget").handler(
+      { node_id: 7, widget: "steps", value: 20 },
+      ctx,
+    );
+    expect(res.isError).toBe(true);
+    expect(sent.length).toBe(0);
+    const text = textOf(res);
+    expect(text).toMatch(/no trusted identity/); // the cause is preserved…
+    expect(text).toContain('rebind with panel_set_workflow_target({mode:"current"})'); // …AND the wrapper fires
+    expect(text).toMatch(/Nothing was applied/i);
+  });
+
+  it("does NOT mis-wrap a POST-dispatch executor failure that merely quotes 'no connected tab' as 'nothing applied'", async () => {    // A LIVE tab that ACCEPTS the command (it IS dispatched, pushed to `sent`) but whose
     // executor rejects with a message quoting the routing phrase. Because the typed flag is
     // absent (dispatchOutcomeOf === undefined, not false), the wrapper must NOT fire — the
     // raw executor error surfaces and we never falsely claim nothing applied.
