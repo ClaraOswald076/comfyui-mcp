@@ -28,9 +28,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
-  renameSync,
   rmSync,
-  statSync,
   writeFileSync,
   writeSync,
 } from "node:fs";
@@ -228,14 +226,6 @@ export function panelLockPath(): string {
   );
 }
 
-/**
- * A lock older than this is assumed abandoned by a crashed process. Panel
- * operations are ComfyUI-Manager queue cycles measured in seconds; ten minutes
- * is far beyond a legitimate one, so reclaiming at that point cannot cut a live
- * op short, while still guaranteeing a crash can never wedge pinning forever.
- */
-const STALE_LOCK_MS = 10 * 60_000;
-
 /** Default acquisition budget. Callers that must not block (the fire-and-forget
  *  on-load ensure) pass something much shorter. */
 const DEFAULT_ACQUIRE_MS = 60_000;
@@ -273,48 +263,6 @@ function pidAlive(pid: unknown): boolean {
   }
 }
 
-/**
- * A lock is stale only when it is BOTH old AND owned by a dead process.
- *
- * The pid check is what makes reclaiming safe. Age alone let two waiters both
- * judge the same lock stale, and the slower one could then delete the FRESH
- * lock the faster one had just taken — putting two mutations in flight at once,
- * the exact thing the lock exists to prevent. A live holder's lock now never
- * reads as stale, so that interleaving cannot arise. (pid liveness is the right
- * test here precisely because this is a single-machine, local-first project.)
- */
-function lockIsStale(path: string): boolean {
-  try {
-    if (Date.now() - statSync(path).mtimeMs <= STALE_LOCK_MS) return false;
-    let pid: unknown;
-    try {
-      pid = (JSON.parse(readFileSync(path, "utf-8")) as { pid?: unknown })?.pid;
-    } catch {
-      // Unreadable/corrupt content on an already-old lock: nobody can claim it.
-      return true;
-    }
-    return !pidAlive(pid);
-  } catch {
-    // Vanished between EEXIST and stat — the next create attempt will settle it.
-    return false;
-  }
-}
-
-/**
- * Remove a lock judged stale, ATOMICALLY. Renaming first means only one waiter
- * can win the reclaim (the rest get ENOENT and simply retry); deleting the path
- * directly would let a straggler delete whatever now sits there.
- */
-function reclaimStaleLock(path: string): void {
-  const claim = `${path}.reclaim-${randomUUID()}`;
-  try {
-    renameSync(path, claim);
-  } catch {
-    return; // someone else reclaimed it first — just retry the create
-  }
-  rmSync(claim, { force: true });
-}
-
 async function acquireFileLock(timeoutMs: number): Promise<() => void> {
   const path = panelLockPath();
   mkdirSync(dirname(path), { recursive: true });
@@ -339,7 +287,7 @@ async function acquireFileLock(timeoutMs: number): Promise<() => void> {
           logger.warn(
             `[panel] could not remove the panel op lock at ${path}: ${
               err instanceof Error ? err.message : String(err)
-            } (it will be reclaimed as stale).`,
+            } (use the restart-and-recovery instructions from the next panel operation).`,
           );
         }
       };
@@ -353,19 +301,14 @@ async function acquireFileLock(timeoutMs: number): Promise<() => void> {
           }. Refusing to mutate the panel without it.`,
         );
       }
-      if (lockIsStale(path)) {
-        // Never rename/delete after a stale observation: another process can
-        // replace this path with a fresh lock between the check and reclaim.
-        // Node lacks an atomic compare-and-rename, so failing closed is the
-        // only way to avoid stealing that new holder.
-      }
       if (Date.now() >= deadline) {
         throw new Error(
           `Timed out after ${timeoutMs}ms waiting for the panel operation lock ` +
             `(${path}). Another panel install/update/pin is in progress — possibly in ` +
-            `another orchestrator process. The lock is never auto-reclaimed because that could ` +
-            `steal a fresh holder after a stale observation. Retry shortly or recover a proven ` +
-            `abandoned lock explicitly.`,
+            `another orchestrator process. It is never auto-reclaimed: a concurrent pre-upgrade ` +
+            `orchestrator could replace an observed stale path with a fresh lock. To recover a ` +
+            `proven abandoned lock, stop or restart every comfyui-mcp orchestrator, verify none ` +
+            `remain, delete this exact lock file, then retry.`,
         );
       }
       await sleep(POLL_MS);
