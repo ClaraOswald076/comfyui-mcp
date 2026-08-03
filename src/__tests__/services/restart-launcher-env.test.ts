@@ -1718,6 +1718,54 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
     killSpy.mockRestore();
   });
 
+  it("does NOT claim a DESCENDANT listener that is running something other than what we launched", async () => {
+    // Lineage says the port owner is in our tree, but the server reports different
+    // launch arguments — our wrapper stayed alive and brought up a different (or
+    // stale) ComfyUI. Being in our tree does not make it the process we launched,
+    // so this must not read as a successful restart.
+    usePlainInstall();
+    servingArgvAfterRestart([join(resolve("OtherComfy"), "main.py"), "--port", "8188"]);
+    spawnCapturingChildren(4321);
+    let killed = false;
+    let relaunched = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill|pkill|\bkill\b/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (/netstat/i.test(cmd)) {
+        return killed && !relaunched
+          ? ""
+          : `  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       ${relaunched ? 9999 : 4321}`;
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed && !relaunched) throw noListener();
+        return `p${relaunched ? 9999 : 4321}\nn127.0.0.1:8188\n`;
+      }
+      return "";
+    });
+    // 9999 IS our grandchild — lineage alone would say "ours".
+    __processControlTestHooks.setParentPidResolver((pid) =>
+      pid === 9999 ? 4321 : pid === 4321 ? process.pid : 1,
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        relaunched = true;
+        return { ok: true } as Response;
+      }),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.listener_ownership).toBe("not-ours");
+    expect(result.started).toBe(false);
+    expect(result.message).not.toMatch(/restarted successfully/i);
+
+    killSpy.mockRestore();
+  });
+
   it("reports a listener OUTSIDE our process tree as not-ours", async () => {
     usePlainInstall();
     spawnCapturingChildren(4321);

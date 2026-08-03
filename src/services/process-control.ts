@@ -739,7 +739,12 @@ function classifyListenerOwnership(input: {
     // our tree => not ours; unreadable => unconfirmed, never a false negative that
     // tells a wrapper-launched user their own server isn't theirs.
     const descendant = isOurDescendant(input.portOwnerPid);
-    if (descendant === true) return "ours";
+    // Lineage does not outrank direct contrary evidence: a wrapper of ours can
+    // stay alive and bring up a DIFFERENT (or stale) ComfyUI, which would be in our
+    // process tree while plainly not being what we launched. `listener_ownership`
+    // answers "is this the process THIS CALL launched", so a differing command line
+    // is decisive there too (codex gate).
+    if (descendant === true) return byArgv() === "differ" ? "not-ours" : "ours";
     if (descendant === false) return "not-ours";
     // Lineage unreadable — the server's argv can still rule the listener OUT.
     return byArgv() === "differ" ? "not-ours" : "unconfirmed";
@@ -763,7 +768,9 @@ function classifyListenerOwnership(input: {
   if (parent !== process.pid) return "not-ours";
 
   // Belt and braces: where the OS exposes it, the port owner must also still be
-  // running what we launched.
+  // running what we launched — and the SERVER's own account of itself must agree.
+  // Both are decisive negatives, for the same reason as above: pid identity says
+  // which process, not which program it is running.
   const identity = resolveProcessIdentity(ourPid);
   if (
     identity?.commandLine &&
@@ -772,6 +779,7 @@ function classifyListenerOwnership(input: {
   ) {
     return "not-ours";
   }
+  if (byArgv() === "differ") return "not-ours";
   return "ours";
 }
 
