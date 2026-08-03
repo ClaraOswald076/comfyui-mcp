@@ -93,6 +93,7 @@ vi.mock("../../services/workspace-env.js", () => ({
   resetLocalComfyUILaunchState: vi.fn(),
 }));
 
+import { detectStabilityMatrix } from "../../services/launcher-env.js";
 import {
   __processControlTestHooks,
   preflightLocalRestart,
@@ -352,6 +353,65 @@ describe("restart_comfyui — Stability Matrix launcher environment (#776)", () 
     expect(spawnOptions().env).toBeUndefined();
 
     killSpy.mockRestore();
+  });
+});
+
+describe("launcher layout detection — path-root handling (#776)", () => {
+  // The paths come from the running ComfyUI's sys.argv, which is WINDOWS-flavored
+  // whenever ComfyUI runs on Windows regardless of this host. These are pure
+  // string+existsSync tests, so they pin the parsing on every OS.
+  function pinTooling(dataRoot: string, sep: string): string {
+    const gitRoot = `${dataRoot}${sep}PortableGit`;
+    const gitExe = `${gitRoot}${sep}cmd${sep}git.exe`;
+    mockExistsSync.mockImplementation((p: string) => {
+      const s = String(p);
+      return s === gitRoot || s === gitExe;
+    });
+    return gitExe;
+  }
+
+  it("keeps a UNC root intact (both leading backslashes)", () => {
+    const DATA = "\\\\server\\share\\SM\\Data";
+    const gitExe = pinTooling(DATA, "\\");
+
+    const sm = detectStabilityMatrix([`${DATA}\\Packages\\ComfyUI\\main.py`]);
+
+    expect(sm?.dataRoot).toBe(DATA);
+    expect(sm?.gitExe).toBe(gitExe);
+  });
+
+  it("keeps an extended-length (\\\\?\\) root intact", () => {
+    const DATA = "\\\\?\\C:\\SM\\Data";
+    const gitExe = pinTooling(DATA, "\\");
+
+    const sm = detectStabilityMatrix([`${DATA}\\Packages\\ComfyUI\\main.py`]);
+
+    expect(sm?.dataRoot).toBe(DATA);
+    expect(sm?.gitExe).toBe(gitExe);
+  });
+
+  it("keeps a drive-letter root intact", () => {
+    const DATA = "C:\\Stability Matrix\\Data";
+    const gitExe = pinTooling(DATA, "\\");
+
+    const sm = detectStabilityMatrix([`${DATA}\\Packages\\ComfyUI\\main.py`]);
+
+    expect(sm?.dataRoot).toBe(DATA);
+    expect(sm?.gitExe).toBe(gitExe);
+  });
+
+  it("keeps a POSIX absolute root intact", () => {
+    const DATA = "/home/u/StabilityMatrix/Data";
+    const gitExe = `${DATA}/PortableGit/cmd/git`;
+    mockExistsSync.mockImplementation((p: string) => {
+      const s = String(p);
+      return s === `${DATA}/PortableGit` || s === gitExe;
+    });
+
+    const sm = detectStabilityMatrix([`${DATA}/Packages/ComfyUI/main.py`]);
+
+    expect(sm?.dataRoot).toBe(DATA);
+    expect(sm?.gitExe).toBe(gitExe);
   });
 });
 
