@@ -261,6 +261,36 @@ describe("panel_restart_comfyui — decline truthfulness (#742)", () => {
     expect(tA).toMatch(/restart initiated earlier/i);
   });
 
+  it("a healthy/recovered decline probe CLEARS the dispatch token — a later independent failure is causation-FREE (r13)", async () => {
+    const { ctx } = makeCtx({ confirm: "no" });
+
+    // 1. Healthy FIRST SAMPLE exonerates the recorded dispatch immediately.
+    __panelToolsTestHooks.seedSessionRestartDispatch(ctx, { at: Date.now(), base: BOOT_BASE });
+    __panelToolsTestHooks.setHealthProbe(async () => "healthy");
+    await restartTool().handler({}, ctx);
+    expect(__panelToolsTestHooks.getSessionRestartDispatch(ctx)).toBeNull();
+
+    // 2. RECOVERED-in-window (down then healthy) exonerates it too.
+    __panelToolsTestHooks.seedSessionRestartDispatch(ctx, { at: Date.now(), base: BOOT_BASE });
+    const seq: Array<"down" | "healthy"> = ["down", "healthy"];
+    let i = 0;
+    __panelToolsTestHooks.setHealthProbe(async () => seq[Math.min(i++, seq.length - 1)]);
+    const res2 = await restartTool().handler({}, ctx);
+    expect(text(res2)).toMatch(/healthy again/i); // the recovery WAS reported
+    expect(__panelToolsTestHooks.getSessionRestartDispatch(ctx)).toBeNull();
+
+    // 3. The server now fails INDEPENDENTLY (full-window down): with the
+    // dispatch exonerated, the report must be causation-FREE — never "a
+    // restart initiated earlier took it down" for a restart that recovered.
+    __panelToolsTestHooks.setHealthProbe(async () => "down");
+    const res3 = await restartTool().handler({}, ctx);
+    const t3 = text(res3);
+    expect(t3).toMatch(/ComfyUI is DOWN/i);
+    expect(t3).toMatch(/no restart was dispatched/i);
+    expect(t3).not.toMatch(/restart initiated earlier/i);
+    expect(t3).not.toMatch(/STOPPED and did not come back/i);
+  });
+
   it("a decline with the server down-then-HEALTHY inside the window does NOT declare a loss", async () => {
     // A genuinely restarting server is refused during its normal down window
     // (codex gate High #1): a recovery inside the recheck window must NOT be

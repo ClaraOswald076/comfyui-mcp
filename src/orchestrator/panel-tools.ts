@@ -5607,6 +5607,19 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             declineTiming.probeTimeoutMs,
             overallDeadline,
           );
+          // r13: a HEALTHY/RECOVERED observation exonerates any dispatch THIS
+          // session has on record — the restart explained itself, so its token
+          // must never ground causation for a LATER, independent failure.
+          // Base-matched: a healthy observation only exonerates the instance
+          // it was taken on (an unbound healthy endpoint says nothing about a
+          // boot-instance record). The 10-minute causation window stays as the
+          // backstop for records never observed back.
+          if (outcome.status === "healthy" || outcome.status === "recovered") {
+            const held = sessionRestartDispatch(ctx);
+            if (held != null && (held.base == null || sameHttpBase(held.base, declineProbeBase))) {
+              clearSessionRestartDispatch(ctx);
+            }
+          }
           if (outcome.status === "down") {
             const secs = Math.max(1, Math.round(outcome.waited_ms / 1000));
             if (boundToRestartTarget) {
