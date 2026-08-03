@@ -679,13 +679,17 @@ function implicitLiveTarget(
  * launch flags and the install root can never be read from two different server states.
  * And when the server IS reachable but tells us nothing usable — a relative
  * `--extra-model-paths-config` with no reported cwd, or an argv with no `main.py` — the
- * answer is an explicit UNRESOLVED, never a quiet fall-through to the local heuristic:
- * we would be guessing at a file the running server does not read, and "success" on that
- * guess is exactly the silent no-op this branch exists to stop. `target`/`config_path`
- * remain the deliberate escape hatch, and both short-circuit above this.
+ * answer is normally an explicit UNRESOLVED, never a quiet fall-through to the local
+ * heuristic: a mutation would otherwise report success for a file the running server may
+ * not read. `list_extra_paths` is deliberately narrower: when the connected target is
+ * already classified LOCAL but its argv simply omits main.py, it may show the known local
+ * auto target with an explicit non-authoritative note (#764). Mutations keep refusing that
+ * state, so the fallback cannot fabricate a successful edit. `target`/`config_path` remain
+ * the deliberate escape hatch, and both short-circuit above this.
  */
 async function resolveTargetPathPreferServer(
   opts: ExtraPathOptions = {},
+  allowUnprovenLocalListFallback = false,
 ): Promise<ResolvedTarget & { serverResolved: boolean }> {
   // Explicit config_path or an explicit non-auto target: honor the caller.
   if (opts.configPath || (opts.target && opts.target !== "auto")) {
@@ -724,6 +728,23 @@ async function resolveTargetPathPreferServer(
   if (rawFlags.length === 0) {
     // No flag — ComfyUI loads the yaml next to its own main.py when that file exists.
     if (script && liveRoot) return implicitLiveTarget(liveRoot, opts);
+    // getLiveServerSnapshot only returns reachable:true in local mode. Some supported
+    // launchers use `python -m comfyui` (or otherwise omit main.py from sys.argv), so
+    // there is no live-root proof even though the active API target is local and usable.
+    // Listing the caller's already-known local target is useful and truthful as long as
+    // the response plainly says it is NOT a claim about the running server. Do not share
+    // this fallback with add/remove: an edit here could be a silent no-op (#764).
+    if (allowUnprovenLocalListFallback) {
+      const fallback = resolveTargetPath(opts);
+      return {
+        ...fallback,
+        notes: [
+          ...fallback.notes,
+          "NOTE: the connected ComfyUI is local and reachable, but its /system_stats launch argv does not reveal main.py, so the config the running server reads cannot be proven. Showing the local auto-selected config instead; this is a fallback, not confirmation that the live server reads it. Pass config_path or target: \"standalone\"/\"desktop\" to choose a file explicitly.",
+        ],
+        serverResolved: false,
+      };
+    }
     throw new ValidationError(
       "UNRESOLVED: the running ComfyUI was not launched with --extra-model-paths-config and " +
         "its launch argv does not reveal a main.py, so the extra_model_paths.yaml it reads " +
@@ -844,10 +865,15 @@ async function resolveTargetPathPreferServer(
   };
 }
 
-export async function listExtraPaths(
+/** Read one config for presentation or model discovery. `allowUnprovenLocalListFallback`
+ * must stay false for every caller that uses roots to resolve, delete, or otherwise act
+ * on a model: the #764 fallback is useful display only, not evidence that ComfyUI loads
+ * those directories. */
+async function readExtraPathsConfig(
   opts: ExtraPathOptions = {},
+  allowUnprovenLocalListFallback = false,
 ): Promise<ExtraPathsConfigInfo> {
-  const resolved = await resolveTargetPathPreferServer(opts);
+  const resolved = await resolveTargetPathPreferServer(opts, allowUnprovenLocalListFallback);
   // Point of use: an inferred root that vanished between resolution and this read must
   // surface as UNRESOLVED, NOT as a normal empty config (readConfigFile maps a missing
   // file to {}, which would look authoritative — the exact failure #648 is about).
@@ -855,6 +881,14 @@ export async function listExtraPaths(
   const raw = await readConfigFile(resolved.path);
   assertRootIntact(resolved.guard);
   return summarize(resolved.target, resolved.path, raw, resolved.notes, resolved.serverResolved);
+}
+
+export async function listExtraPaths(
+  opts: ExtraPathOptions = {},
+): Promise<ExtraPathsConfigInfo> {
+  // #764: a display-only read may fall back when a reachable LOCAL server omits main.py
+  // from argv. Model discovery and mutations use the normal fail-closed resolver.
+  return readExtraPathsConfig(opts, true);
 }
 
 /** One model search directory contributed by extra_model_paths configuration. */
@@ -881,7 +915,10 @@ export async function getExtraModelRoots(
 ): Promise<ExtraModelRoot[]> {
   let info: ExtraPathsConfigInfo;
   try {
-    info = await listExtraPaths(opts);
+    // Do NOT use listExtraPaths here: its #764 local fallback is deliberately
+    // non-authoritative and these roots feed model lookup/removal. An unproven config
+    // must contribute no roots rather than allowing a stale path to resolve a model.
+    info = await readExtraPathsConfig(opts);
   } catch {
     return [];
   }
