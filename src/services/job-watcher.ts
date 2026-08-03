@@ -129,6 +129,22 @@ function buildImageUrl(
   return `${getComfyUIBaseUrl()}/view?${params.toString()}`;
 }
 
+/** A media ref from history is only real when it carries a non-empty string
+ *  filename. Anything else — null, missing, empty, or non-string filename — is
+ *  malformed /history data and must be dropped here, never emitted as an
+ *  output or registered as an asset with filename=undefined (#753 gate). */
+interface HistoryMediaRef {
+  filename: string;
+  subfolder?: string;
+  type?: string;
+}
+
+function isHistoryMediaRef(value: unknown): value is HistoryMediaRef {
+  if (value === null || typeof value !== "object") return false;
+  const filename = (value as { filename?: unknown }).filename;
+  return typeof filename === "string" && filename.length > 0;
+}
+
 export function buildCompletionNotification(
   promptId: string,
   entry: HistoryEntry,
@@ -177,24 +193,22 @@ export function buildCompletionNotification(
     if (!nodeOutput || typeof nodeOutput !== "object") continue;
     const out = nodeOutput as Record<string, unknown>;
 
-    // Extract image outputs (SaveImage, PreviewImage)
+    // Extract image outputs (SaveImage, PreviewImage) — malformed refs are
+    // filtered BEFORE any use, so a bad /history entry can neither crash the
+    // parse nor surface as an output with filename=undefined.
     if (Array.isArray(out.images)) {
-      const images = (
-        out.images as Array<{
-          filename: string;
-          subfolder?: string;
-          type?: string;
-        }>
-      ).map((img) => ({
-        filename: img.filename,
-        subfolder: img.subfolder ?? "",
-        type: img.type ?? "output",
-        url: buildImageUrl(
-          img.filename,
-          img.subfolder ?? "",
-          img.type ?? "output",
-        ),
-      }));
+      const images = (out.images as unknown[])
+        .filter(isHistoryMediaRef)
+        .map((img) => ({
+          filename: img.filename,
+          subfolder: img.subfolder ?? "",
+          type: img.type ?? "output",
+          url: buildImageUrl(
+            img.filename,
+            img.subfolder ?? "",
+            img.type ?? "output",
+          ),
+        }));
       if (images.length > 0) {
         outputs.push({ node_id: nodeId, images });
       }
@@ -208,11 +222,7 @@ export function buildCompletionNotification(
     for (const videoKey of ["videos", "video", "gifs"] as const) {
       const videoData = out[videoKey];
       if (!Array.isArray(videoData)) continue;
-      for (const vid of videoData as Array<{
-        filename: string;
-        subfolder?: string;
-        type?: string;
-      }>) {
+      for (const vid of (videoData as unknown[]).filter(isHistoryMediaRef)) {
         videos.push({
           filename: vid.filename,
           subfolder: vid.subfolder ?? "",

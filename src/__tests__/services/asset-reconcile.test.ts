@@ -248,6 +248,41 @@ describe("reconcileAssetsFromHistory", () => {
     expect(all[0].createdAt).toBe(ts);
   });
 
+  it("rejects malformed image refs — never registers filename=undefined (codex r2 P1)", async () => {
+    const ts = Date.now() - 1000;
+    getHistoryMock.mockResolvedValue({
+      mixed: historyEntry({
+        queue: 2,
+        promptId: "mixed",
+        successTs: ts,
+        outputs: {
+          "9": {
+            images: [
+              { subfolder: "", type: "output" }, // filename missing
+              { filename: "", subfolder: "", type: "output" }, // empty filename
+              { filename: 123, subfolder: "", type: "output" }, // non-string filename
+              null, // not an object at all
+              { filename: "mixed_00002_.png", subfolder: "", type: "output" },
+            ],
+          },
+        },
+      }),
+      allbad: historyEntry({
+        queue: 1,
+        promptId: "allbad",
+        successTs: ts,
+        outputs: { "9": { images: [{ type: "output" }] } },
+      }),
+    });
+
+    const result = await reconcileAssetsFromHistory();
+
+    expect(result.registered).toBe(1);
+    const all = AssetRegistry.list();
+    expect(all).toHaveLength(1);
+    expect(all[0]).toMatchObject({ promptId: "mixed", filename: "mixed_00002_.png" });
+  });
+
   it("reconciles only the newest maxPrompts completed prompts, ordered by queue number", async () => {
     const ts = Date.now() - 1000;
     getHistoryMock.mockResolvedValue({

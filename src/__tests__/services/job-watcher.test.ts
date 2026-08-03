@@ -97,6 +97,49 @@ describe("buildCompletionNotification", () => {
     expect(notification.execution_stats).toBeUndefined();
   });
 
+  it("drops malformed image/video refs — never emits filename=undefined (codex r2 P1)", () => {
+    const entry = {
+      prompt: {},
+      outputs: {
+        "9": {
+          images: [
+            { subfolder: "", type: "output" }, // filename missing
+            { filename: "", subfolder: "", type: "output" }, // empty filename
+            { filename: 123, subfolder: "", type: "output" }, // non-string filename
+            null, // not an object at all
+            { filename: "good.png", subfolder: "", type: "output" },
+          ],
+          videos: [{ type: "output" }, { filename: "clip.mp4", type: "output" }],
+        },
+        // Every ref malformed — the node must drop out entirely, not emit
+        // an output entry with zero real files.
+        "10": { images: [{ type: "output" }] },
+      },
+      status: {
+        status_str: "success",
+        completed: true,
+        messages: [
+          ["execution_success", { prompt_id: PROMPT_ID, timestamp: START }],
+        ],
+      },
+    } as unknown as HistoryEntry;
+
+    const notification = buildCompletionNotification(PROMPT_ID, entry, START);
+
+    expect(notification.outputs).toEqual([
+      {
+        node_id: "9",
+        images: [expect.objectContaining({ filename: "good.png" })],
+      },
+    ]);
+    expect(notification.video_outputs).toEqual([
+      {
+        node_id: "9",
+        videos: [expect.objectContaining({ filename: "clip.mp4" })],
+      },
+    ]);
+  });
+
   it("extracts image and video outputs (videos/video/gifs keys)", () => {
     const entry: HistoryEntry = {
       prompt: {},
