@@ -58,6 +58,7 @@ vi.mock("../../services/env-capabilities.js", () => ({
 
 import {
   __processControlTestHooks,
+  getLastRestartDispatch,
   parseListenerPidFromNetstat,
   preflightLocalRestart,
   restartComfyUI,
@@ -839,7 +840,82 @@ describe("restart truthfulness + Pinokio-shaped refusal (#742)", () => {
     expect(result.message).toMatch(/stopped but could not be started/i);
     expect(result.message).not.toMatch(/cancel/i);
     expect(result.spawn_error).toBeTruthy();
+    // r4: the stop stamped the restart-dispatch record (never cleared — the
+    // relaunch failed), so a later decline may name the causation.
+    const rec = getLastRestartDispatch();
+    expect(rec).not.toBeNull();
+    expect(rec!.base).toBe("http://127.0.0.1:8188");
 
     killSpy.mockRestore();
+  });
+
+  it("a successful kill+relaunch restart CLEARS the dispatch record (r4)", async () => {
+    let killed = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill/i.test(String(cmd))) {
+        killed = true;
+        return "";
+      }
+      if (cmd.includes("netstat")) {
+        if (killed) return ""; // port freed after the kill
+        return "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
+      }
+      if (cmd.includes("lsof")) {
+        if (killed) throw new Error("not listening");
+        return "p4321\nn127.0.0.1:8188\n";
+      }
+      return ""; // tasklist / `sleep 1 && kill -9` / etc.
+    });
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: ["/fake/ComfyUI/main.py", "--port", "8188"] },
+    });
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => {
+      killed = true;
+      return true;
+    });
+    mockSpawnedChildren();
+    mockFetchOk(true); // the relaunch comes up healthy on the first probe
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(true);
+    expect(result.started).toBe(true);
+    // Observed back → the record is cleared: this restart explains no later down.
+    expect(getLastRestartDispatch()).toBeNull();
+
+    killSpy.mockRestore();
+  });
+
+  it("a Manager reboot that never comes back leaves the dispatch record stamped (r4)", async () => {
+    // Desktop argv → the Manager-reboot path. The reboot FIRES (connection
+    // drop) but readiness never returns — the record must stay stamped.
+    mockLivePortNoKill();
+    mockGetSystemStats.mockResolvedValue({
+      system: {
+        argv: [
+          "C:\\Users\\x\\AppData\\Local\\Programs\\Comfy Desktop\\resources\\ComfyUI\\main.py",
+          "--port",
+          "8188",
+        ],
+      },
+    });
+    __processControlTestHooks.setRemoteRebootTimingForTests({
+      settleMs: 0,
+      budgetMs: 30,
+      intervalMs: 5,
+    });
+    const fetchMock = vi.fn(async (url: unknown) => {
+      if (String(url).includes("reboot")) throw new Error("socket hang up"); // drop = fired
+      return { ok: false } as Response; // readiness never ok
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(true);
+    expect(result.started).toBe(false);
+    const rec = getLastRestartDispatch();
+    expect(rec).not.toBeNull();
+    expect(rec!.base).toBe("http://127.0.0.1:8188");
   });
 });

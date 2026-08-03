@@ -1397,6 +1397,9 @@ async function restartViaManagerReboot(context: {
   // timed-out branch (which returns early) can't leave the pre-reboot dialect
   // pinned for the instance that eventually comes back (#646).
   resetManagerApiCache("comfyui reboot fired via Manager");
+  // #742 r4: record the dispatch — a later decline-path DOWN report may name
+  // restart causation only against such a record.
+  recordRestartDispatch(getComfyUIBaseUrl());
 
   const timing = getRemoteRebootTiming();
   if (timing.settleMs > 0) await sleep(timing.settleMs);
@@ -1428,6 +1431,9 @@ async function restartViaManagerReboot(context: {
   resetClient();
   resetObjectInfoCache();
   resetManagerApiCache("comfyui rebooted via Manager");
+  // #742 r4: the dispatched restart was observed back — clear the record so it
+  // explains no later down state.
+  clearRestartDispatch();
 
   return {
     stopped: true,
@@ -1494,6 +1500,9 @@ export async function restartComfyUI(): Promise<RestartResult> {
       message: `Could not stop ComfyUI: ${stopResult.message}`,
     };
   }
+  // #742 r4: the stop DID happen — record the dispatch. A later decline-path
+  // DOWN report may name restart causation only against this record.
+  recordRestartDispatch(getComfyUIBaseUrl());
 
   // Brief pause to let OS fully release resources
   await sleep(1000);
@@ -1512,6 +1521,10 @@ export async function restartComfyUI(): Promise<RestartResult> {
     };
   }
 
+  // #742 r4: the restart was observed back — clear the dispatch record so a
+  // completed restart explains no later down state.
+  clearRestartDispatch();
+
   return {
     stopped: true,
     started: true,
@@ -1520,6 +1533,40 @@ export async function restartComfyUI(): Promise<RestartResult> {
     message: `ComfyUI restarted successfully. ${startResult.message}`,
     auto_restart: startResult.auto_restart,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Restart dispatch record (#742 r4) — session-scoped bookkeeping of the last
+// restart THIS orchestrator actually dispatched (a Manager reboot fired, or a
+// kill+relaunch whose stop succeeded). The panel decline path may name restart
+// CAUSATION for a down server only against such a record — an unrelated crash
+// or manual stop must never be reported as "a restart took it down". A record
+// is cleared the moment its restart is observed back, so a completed restart
+// explains nothing that happens afterward.
+// ---------------------------------------------------------------------------
+
+interface RestartDispatchRecord {
+  /** Epoch ms when the restart was dispatched. */
+  at: number;
+  /** The ComfyUI base URL the restart targeted (null = unknown). */
+  base: string | null;
+}
+
+let lastRestartDispatch: RestartDispatchRecord | null = null;
+
+/** Stamp that a restart was ACTUALLY dispatched (reboot fired / stop done). */
+export function recordRestartDispatch(base: string | null): void {
+  lastRestartDispatch = { at: Date.now(), base };
+}
+
+/** The recorded restart was observed back — it no longer explains a down state. */
+export function clearRestartDispatch(): void {
+  lastRestartDispatch = null;
+}
+
+/** The last restart dispatch on record, or null when none/unaccounted-for. */
+export function getLastRestartDispatch(): RestartDispatchRecord | null {
+  return lastRestartDispatch;
 }
 
 /**
@@ -1565,6 +1612,7 @@ export const __processControlTestHooks = {
     supervisorGaveUp = false;
     remoteRebootTimingOverride = null;
     liveCwdResolverOverride = null;
+    lastRestartDispatch = null;
   },
   /** Inject a fake live-process-cwd resolver (#535) so tests can drive the
    *  `/proc/<pid>/cwd` relative-script anchor without a real process/filesystem. */
@@ -1573,6 +1621,11 @@ export const __processControlTestHooks = {
   },
   setLastProcessInfo(info: ProcessInfo): void {
     lastProcessInfo = info;
+  },
+  /** Seed the #742 r4 restart-dispatch record directly (fresh/stale/foreign
+   *  base) so decline-path causation tests don't run a real restart first. */
+  setLastRestartDispatch(record: RestartDispatchRecord | null): void {
+    lastRestartDispatch = record;
   },
   /** Inject fast remote-reboot timing so tests don't wait the real ~120s budget. */
   setRemoteRebootTimingForTests(timing: RemoteRebootTiming | null): void {

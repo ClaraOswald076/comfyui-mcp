@@ -63,7 +63,13 @@ import {
   resetObjectInfoCache,
 } from "../comfyui/client.js";
 import { convertUiToApi, collectNodeTypes } from "../services/workflow-converter.js";
-import { restartComfyUI, preflightLocalRestart } from "../services/process-control.js";
+import {
+  restartComfyUI,
+  preflightLocalRestart,
+  recordRestartDispatch,
+  clearRestartDispatch,
+  getLastRestartDispatch,
+} from "../services/process-control.js";
 import { resetManagerApiCache } from "../services/manager-api-cache.js";
 import {
   isRemoteMode,
@@ -267,6 +273,13 @@ const RESTART_CONFIRM_TIMEOUT_MS = 90_000; // 90s
 const DECLINE_PROBE_WINDOW_MS = 6_000; // 6s total
 const DECLINE_PROBE_INTERVAL_MS = 2_000; // 2s between samples
 const DECLINE_PROBE_TIMEOUT_MS = 2_000; // per-sample probe ceiling
+
+// #742 r4: how long a RECORDED restart dispatch plausibly explains a down
+// server. The decline path's DOWN report may name restart causation only
+// against a dispatch on record within this window (and targeting the probed
+// instance); combined with clear-on-observed-recovery, an unrelated crash or
+// manual stop is never misreported as "a restart took it down".
+const RESTART_DISPATCH_CAUSATION_WINDOW_MS = 10 * 60_000; // 10 min
 
 function parsePositiveNumberEnv(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -5549,16 +5562,37 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           if (outcome.status === "down") {
             const secs = Math.max(1, Math.round(outcome.waited_ms / 1000));
             if (boundToRestartTarget) {
+              // r4: causation may be named ONLY against a RECORDED restart
+              // dispatch — recent enough to plausibly be the cause, and
+              // targeting THIS instance. An unrelated crash / manual stop (no
+              // record, a stale record, or another instance's record) gets the
+              // causation-free report.
+              const dispatch = getLastRestartDispatch();
+              const causative =
+                dispatch != null &&
+                Date.now() - dispatch.at <= RESTART_DISPATCH_CAUSATION_WINDOW_MS &&
+                (dispatch.base == null || sameHttpBase(dispatch.base, declineBootBase));
+              if (causative) {
+                return ok(
+                  "⚠️ ComfyUI is DOWN — it was STOPPED and did not come back (still " +
+                    `unreachable after a ${secs}s recheck window), so do NOT treat this as ` +
+                    "\"nothing happened\". The restart just declined was NOT what stopped " +
+                    "it (nothing was dispatched after the decline), but a restart initiated " +
+                    "earlier already took the server down and it never returned. Start " +
+                    "ComfyUI manually from whatever launches it (e.g. Pinokio, the Desktop " +
+                    "app, or your terminal), then reload the panel tab so it reconnects. " +
+                    "restart_comfyui can attempt the relaunch for you when the install's " +
+                    "launch path is resolvable.",
+                );
+              }
               return ok(
-                "⚠️ ComfyUI is DOWN — it was STOPPED and did not come back (still " +
-                  `unreachable after a ${secs}s recheck window), so do NOT treat this as ` +
-                  "\"nothing happened\". The restart just declined was NOT what stopped " +
-                  "it (nothing was dispatched after the decline), but a restart initiated " +
-                  "earlier already took the server down and it never returned. Start " +
-                  "ComfyUI manually from whatever launches it (e.g. Pinokio, the Desktop " +
-                  "app, or your terminal), then reload the panel tab so it reconnects. " +
-                  "restart_comfyui can attempt the relaunch for you when the install's " +
-                  "launch path is resolvable.",
+                "⚠️ ComfyUI is DOWN — still unreachable after " +
+                  `a ${secs}s recheck window — and no restart was dispatched through me ` +
+                  "that would explain it (the restart just declined was NOT dispatched, " +
+                  "and none is on record recently for this instance). Something else " +
+                  "stopped it (a crash, a manual stop, or its launcher). Start ComfyUI " +
+                  "manually from whatever launches it (e.g. Pinokio, the Desktop app, or " +
+                  "your terminal), then reload the panel tab so it reconnects.",
               );
             }
             return ok(
@@ -5811,6 +5845,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             // Otherwise (the process WAS stopped/started, or restartComfyUI's own readiness
             // poll merely expired — neither terminal) DEFER to OUR OWN observed DOWN→UP.
             const recovery = await proofPromise;
+            // #742 r4: the managed restart was observed back — clear the record
+            // (restartComfyUI also clears on its own success; this covers the
+            // case where only OUR observer saw the recovery).
+            if (recovery.ready) clearRestartDispatch();
             const observed = recovery.via === "observed-cycle";
             // The legacy Manager path restarts ComfyUI out-of-band too. Server recovery alone
             // is not graph-tool readiness: wait for the browser tab to reconnect, then verify
@@ -5870,6 +5908,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         resetClient();
         resetObjectInfoCache();
         resetManagerApiCache("panel Manager reboot");
+        // #742 r4: record the ACTUAL dispatch (acceptance proven — a refusal never
+        // reaches here). A later decline-path DOWN report may name restart causation
+        // only against this record; it is cleared below if the restart is observed back.
+        recordRestartDispatch(healthBase ?? getComfyUIBaseUrl());
 
         // Observe recovery. There is exactly ONE sound proof that THIS ComfyUI instance
         // actually cycled: a directly OBSERVED down→up on the server-authorized, immutable,
@@ -5906,6 +5948,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // down→up, which the observer has been (and continues) watching for.
         gate.deadline = Math.min(Date.now() + timing.budgetMs, overallDeadline);
         const recovery = await recoveryPromise!;
+        // #742 r4: the dispatched restart was observed back — clear the record so
+        // it explains no later down state.
+        if (recovery.ready) clearRestartDispatch();
         if (!recovery.ready) {
           const waited = Math.round(recovery.waited_ms / 1000);
           return ok({
