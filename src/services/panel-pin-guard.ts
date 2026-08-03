@@ -305,6 +305,25 @@ function staleLockSnapshot(path: string): StaleLockSnapshot | undefined {
   }
 }
 
+function stableLockFileSnapshot(path: string): StaleLockSnapshot | undefined {
+  try {
+    const before = statSync(path);
+    const raw = readFileSync(path, "utf-8");
+    const after = statSync(path);
+    if (
+      before.dev !== after.dev ||
+      before.ino !== after.ino ||
+      before.mtimeMs !== after.mtimeMs ||
+      before.size !== after.size
+    ) {
+      return undefined;
+    }
+    return { raw, dev: after.dev, ino: after.ino };
+  } catch {
+    return undefined;
+  }
+}
+
 /** A reclaim claim is only arbitration metadata, not the operation lock. A
  * crashed claimant must therefore never leave future recovery wedged behind an
  * incomplete record. */
@@ -324,6 +343,74 @@ function reclaimClaimIsAbandoned(path: string): boolean {
   }
 }
 
+function snapshotStillMatches(path: string, observed: StaleLockSnapshot): boolean {
+  try {
+    const before = statSync(path);
+    const raw = readFileSync(path, "utf-8");
+    const after = statSync(path);
+    return (
+      before.dev === after.dev &&
+      before.ino === after.ino &&
+      before.mtimeMs === after.mtimeMs &&
+      before.size === after.size &&
+      after.dev === observed.dev &&
+      after.ino === observed.ino &&
+      raw === observed.raw
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A stale fixed claim is itself reclaimed through an independent, tokenized
+ * cleanup claim. The cleanup record is fresh and owned by this process, so a
+ * competing cleaner cannot replace the fixed claim between its snapshot check
+ * and removal. Reaping an abandoned cleanup record touches only metadata.
+ */
+function clearAbandonedReclaimClaim(claim: string): void {
+  const observed = stableLockFileSnapshot(claim);
+  if (!observed) return;
+  const cleanup = `${claim}.cleanup`;
+  const token = randomUUID();
+  let fd: number | undefined;
+  try {
+    fd = openSync(cleanup, "wx");
+    writeSync(fd, JSON.stringify({ pid: process.pid, token }));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "EEXIST" && reclaimClaimIsAbandoned(cleanup)) {
+      // Cleanup is arbitration metadata only, never the fixed claim pathname.
+      rmSync(cleanup, { force: true });
+    }
+    return;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+
+  const ownsCleanup = (): boolean => {
+    try {
+      const record = JSON.parse(readFileSync(cleanup, "utf-8")) as {
+        pid?: unknown;
+        token?: unknown;
+      };
+      return record.pid === process.pid && record.token === token;
+    } catch {
+      return false;
+    }
+  };
+  const releaseCleanup = (): void => {
+    if (ownsCleanup()) rmSync(cleanup, { force: true });
+  };
+
+  try {
+    if (ownsCleanup() && snapshotStillMatches(claim, observed) && ownsCleanup()) {
+      rmSync(claim);
+    }
+  } finally {
+    releaseCleanup();
+  }
+}
+
 function reclaimBoundStaleLock(path: string, observed: StaleLockSnapshot): boolean {
   const claim = `${path}.reclaim`;
   const token = randomUUID();
@@ -335,9 +422,7 @@ function reclaimBoundStaleLock(path: string, observed: StaleLockSnapshot): boole
     writeSync(fd, JSON.stringify({ pid: process.pid, token }));
   } catch (err) {
     if ((err as NodeJS.ErrnoException)?.code === "EEXIST" && reclaimClaimIsAbandoned(claim)) {
-      // The claim is coordination metadata, never the operation lock. Removing
-      // a dead claimant's record never removes or edits the base lock.
-      rmSync(claim, { force: true });
+      clearAbandonedReclaimClaim(claim);
     }
     return false;
   } finally {

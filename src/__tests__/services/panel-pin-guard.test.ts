@@ -15,6 +15,7 @@ import { dirname, join } from "node:path";
 
 const panelLockTestHooks = vi.hoisted(() => ({
   beforeClaimWrite: undefined as undefined | (() => void),
+  afterCleanupWrite: undefined as undefined | (() => void),
 }));
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -25,7 +26,11 @@ vi.mock("node:fs", async (importOriginal) => {
       const hook = panelLockTestHooks.beforeClaimWrite;
       panelLockTestHooks.beforeClaimWrite = undefined;
       hook?.();
-      return actual.writeSync(...args);
+      const result = actual.writeSync(...args);
+      const afterCleanupWrite = panelLockTestHooks.afterCleanupWrite;
+      panelLockTestHooks.afterCleanupWrite = undefined;
+      afterCleanupWrite?.();
+      return result;
     },
   };
 });
@@ -56,6 +61,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.restoreAllMocks();
   panelLockTestHooks.beforeClaimWrite = undefined;
+  panelLockTestHooks.afterCleanupWrite = undefined;
   delete process.env.COMFYUI_MCP_PANEL_SETTINGS;
   delete process.env.COMFYUI_MCP_PANEL_LOCK;
   delete process.env.COMFYUI_MCP_PANEL_PENDING;
@@ -332,6 +338,41 @@ describe("withPanelMutationLock — a FILE lock, so it holds across processes", 
     );
     expect(existsSync(path)).toBe(false);
     expect(existsSync(claim)).toBe(false);
+  });
+
+  it("does not delete a fresh claim that replaces an abandoned claim during cleanup", async () => {
+    const path = panelLockPath();
+    const claim = `${path}.reclaim`;
+    const freshClaim = JSON.stringify({ pid: process.pid, token: "fresh-claim" });
+    writeFileSync(path, JSON.stringify({ pid: 0x7fffffff }));
+    writeFileSync(claim, JSON.stringify({ pid: 0x7fffffff, token: "dead-claim" }));
+    const old = new Date(Date.now() - 60 * 60_000);
+    const { utimesSync } = await import("node:fs");
+    utimesSync(path, old, old);
+    utimesSync(claim, old, old);
+
+    // A separate process replaces the fixed claim after cleanup has taken its
+    // exclusive token. Snapshot equality must make cleanup leave this fresh
+    // token intact, so no later claimant can steal its base lock.
+    let replaced = false;
+    panelLockTestHooks.afterCleanupWrite = () => {
+      replaced = true;
+      const child = spawnSync(
+        process.execPath,
+        [
+          "-e",
+          `const fs=require('node:fs');fs.rmSync(${JSON.stringify(claim)});fs.writeFileSync(${JSON.stringify(claim)},${JSON.stringify(freshClaim)});`,
+        ],
+        { encoding: "utf-8" },
+      );
+      expect(child.status).toBe(0);
+    };
+
+    await expect(
+      withPanelMutationLock(async () => "must not run", { timeoutMs: 300 }),
+    ).rejects.toThrow(/Timed out/);
+    expect(replaced).toBe(true);
+    expect(fs.readFileSync(claim, "utf-8")).toBe(freshClaim);
   });
 
   it("does NOT reclaim an old lock whose owner is still ALIVE", async () => {
