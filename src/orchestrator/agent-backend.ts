@@ -62,6 +62,24 @@ export interface AgentCapabilities {
   /** Accepts inline image input in a user turn (vision). When false, image refs
    *  the panel sends are ignored by the backend (text-only). */
   vision: boolean;
+  /**
+   * Stamps the #728 TURN MARKER (`AgentEvent.turn`) on the events it emits for a
+   * submitted turn. DECLARED, never inferred: #468's run-completion ack requires
+   * knowing up front whether an UNMARKED `result` could be a straggler from an
+   * abandoned turn. Inferring it from "have I seen a marker yet" is unsound while
+   * still unlearned — a zero-output turn's traceless terminal arrives before the
+   * replacement turn stamps anything, and would falsely ack (and destroy the
+   * replay of) a completion the replacement turn is carrying.
+   *
+   * true  → an unmarked result never acks a completion; the carrying turn's own
+   *         marked result does (an unmarked one hands the tokens back instead).
+   * false → a legacy/third-party backend that never stamps; unmarked results ack,
+   *         the pre-#468 behavior.
+   *
+   * Optional so an out-of-tree backend that omits it is treated as non-stamping,
+   * which is the conservative reading for something that also never dead-letters.
+   */
+  turnMarkers?: boolean;
 }
 
 /**
@@ -235,6 +253,7 @@ export const CLAUDE_CAPABILITIES: AgentCapabilities = {
   slashCommands: true,
   hooks: true,
   vision: true, // resolves image refs to inline base64 blocks (shapeTurn)
+  turnMarkers: true, // claude-backend stamps every event from the #745 per-turn trace FIFO
 };
 
 /** Capability descriptor for the Codex app-server backend (Phase 2). */
@@ -248,6 +267,7 @@ export const CODEX_CAPABILITIES: AgentCapabilities = {
   slashCommands: false,
   hooks: false,
   vision: true, // gpt-5.5 sees images; delivered as `localImage` turn input items
+  turnMarkers: true, // stampTurn() wraps each per-turn stream
 };
 
 /** Capability descriptor for the Gemini CLI ACP backend (Agent Client Protocol).
@@ -265,6 +285,7 @@ export const GEMINI_CAPABILITIES: AgentCapabilities = {
   slashCommands: false,
   hooks: false,
   vision: true, // gemini-2.5 sees images; delivered as inline base64 image ContentBlocks
+  turnMarkers: true, // stampTurn() wraps each per-turn stream
 };
 
 /** Capability descriptor for the Antigravity CLI backend (`agy`, issue #262) —
@@ -285,6 +306,7 @@ export const ANTIGRAVITY_CAPABILITIES: AgentCapabilities = {
   slashCommands: false,
   hooks: false,
   vision: false, // no documented image input in -p mode
+  turnMarkers: true, // stampTurn() wraps each per-turn stream
 };
 
 /** Capability descriptor for the pi.dev CLI backend (`pi`, issue #491) — the
@@ -306,6 +328,7 @@ export const PI_CAPABILITIES: AgentCapabilities = {
   slashCommands: false,
   hooks: false,
   vision: false, // no documented headless image input
+  turnMarkers: true, // stampTurn() wraps each per-turn stream
 };
 
 /** Capability descriptor for the Grok CLI ACP backend (xAI / Grok Build).
@@ -321,6 +344,7 @@ export const GROK_CAPABILITIES: AgentCapabilities = {
   slashCommands: false,
   hooks: false,
   vision: true,
+  turnMarkers: true, // stampTurn() wraps each per-turn stream
 };
 
 /** Capability descriptor for the Ollama local-LLM backend (issue #97's panel
@@ -343,6 +367,7 @@ export const OLLAMA_CAPABILITIES: AgentCapabilities = {
   slashCommands: false,
   hooks: false,
   vision: true, // attempted for every model; graceful strip-and-retry on rejection
+  turnMarkers: true, // stampTurn() wraps each per-turn stream
 };
 
 /** ChatGPT subscription via direct Codex OAuth (~/.codex/auth.json) — Codex Responses
@@ -357,6 +382,7 @@ export const CHATGPT_CAPABILITIES: AgentCapabilities = {
   slashCommands: false,
   hooks: false,
   vision: true, // Responses input_image data URLs; strip-and-retry on rejection (#218)
+  turnMarkers: true, // stampTurn() wraps each per-turn stream
 };
 
 /** Kimi Code subscription OAuth or KIMI_API_KEY — OpenAI-compatible coding API. */

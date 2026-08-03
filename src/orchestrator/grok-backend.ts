@@ -1319,6 +1319,11 @@ const GROK_DIRECT_CAPABILITIES = {
   slashCommands: false,
   hooks: false,
   vision: false, // the 6-tool router is text-only (mirrors Ollama/ChatGPT); NeutralTurn.images unused here
+  // This adapter DOES stamp turn markers (see stampTurn in run() below), so it
+  // must say so: #468's run-completion ack trusts the declaration, and a backend
+  // that stamps but declares otherwise would let an unmarked straggler ack a
+  // completion it never carried. Declaration and behavior must not disagree.
+  turnMarkers: true,
 };
 
 /** Direct-token Grok (xAI) backend — see the module-level comment above for the

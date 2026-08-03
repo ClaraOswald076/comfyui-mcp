@@ -181,16 +181,27 @@ export function carryWorkflowCommandStamp(
 /** #570 — does the DESTINATION of a tab-id migration already hold state for a backend, so the
  *  incoming tab would inherit/leak it? Covers EVERY kind of per-backend state that must be reset
  *  before the source is rebound in: manager live/pending/held (`hasManagerState`), a dormant
- *  durable session (`hasDurableSession`), OR a RENDER-HELD queue (`renderHeldCount` — the
+ *  durable session (`hasDurableSession`), a RENDER-HELD queue (`renderHeldCount` — the
  *  orchestrator-level heldDuringGen, which manager.reset does NOT clear and which the source-held
  *  re-key would otherwise APPEND to, flushing the superseded tab's queued message into the incoming
- *  tab on render completion). Any of these ⇒ collision ⇒ reset + clear the destination's held. */
+ *  tab on render completion), OR a JOURNALED RUN COMPLETION (`journaledCompletionCount`, #468 — a
+ *  tab whose agent and session were already cleared (New chat) can still hold an undelivered
+ *  completion; without this it reads as UNOCCUPIED, the incoming source is rebound onto its id, and
+ *  the next flush delivers the DESTINATION tab's render into the SOURCE tab's conversation. A tab
+ *  holding a journal entry is not empty). Any of these ⇒ collision ⇒ reset + clear the
+ *  destination's held state. */
 export function destinationHasCollisionState(opts: {
   hasManagerState: boolean;
   hasDurableSession: boolean;
   renderHeldCount: number;
+  journaledCompletionCount?: number;
 }): boolean {
-  return opts.hasManagerState || opts.hasDurableSession || opts.renderHeldCount > 0;
+  return (
+    opts.hasManagerState ||
+    opts.hasDurableSession ||
+    opts.renderHeldCount > 0 ||
+    (opts.journaledCompletionCount ?? 0) > 0
+  );
 }
 
 /** #570 — does a connected SIBLING tab own the session behind a candidate stable key? A stable key

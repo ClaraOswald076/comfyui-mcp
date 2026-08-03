@@ -9,7 +9,16 @@
 // panel-agent.ts). Each agent runs on the user's Claude SUBSCRIPTION with no API
 // key. See docs/design/panel-orchestrator.md.
 
-import { existsSync, mkdirSync, writeFileSync, unlinkSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  writeFileSync,
+  unlinkSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  appendFileSync,
+} from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir, homedir, networkInterfaces } from "node:os";
 import { dirname, join } from "node:path";
@@ -101,6 +110,11 @@ import { startPanelConsoleHttpServer, type PanelConsoleHttpServer } from "./pane
 import type { AgentBackend } from "./agent-backend.js";
 import { readComfyuiCrashLog, formatCrashNote } from "../services/crash-log.js";
 import { QueueMonitor, type StallReport } from "../services/queue-monitor.js";
+import {
+  RunCompletions,
+  describe as describeCorrelation,
+  type CompletionPayload,
+} from "./run-completion-journal.js";
 import { initRunpodWatcher, getRunpodWatcher, type RunpodStatusFrame, type RunpodAlertFrame } from "../services/runpod-watch.js";
 import { getPod } from "../services/runpod-client.js";
 import { listTargetChangeRequests, consumeTargetChange, ackTargetChange, setProgressDir, CONTROL_PREFIX, newestAttemptEpochs, isSupersededAttempt, downloadAttemptKey } from "../services/download-progress.js";
@@ -774,6 +788,10 @@ export async function runPanelOrchestrator(): Promise<void> {
     logger.error(
       `[panel-orchestrator] FATAL uncaught exception — exiting so a fresh orchestrator can take over: ${err.stack ?? err.message}`,
     );
+    // #468 — this path exits without any teardown, so record whatever run
+    // completions die with it. Log-only by construction (see the function): a
+    // crash is no time to await a bridge write.
+    reportLostCompletionsOnExit();
     process.exit(1);
   });
 
@@ -789,6 +807,13 @@ export async function runPanelOrchestrator(): Promise<void> {
     logger.error(
       `[panel-orchestrator] self-exit (${why}) — closing the bridge so a fresh orchestrator can take over.`,
     );
+    // #468 — a fatal self-exit deliberately BYPASSES the idle gate (the whole
+    // point is to collapse a wedged orchestrator), and the journal is in-memory,
+    // so any undelivered run completion dies here. It must not die SILENTLY:
+    // tell each affected tab, in the panel chat, exactly which runs it will never
+    // be told about, so the user (and the agent that resumes after the respawn)
+    // treats them as UNDETERMINED instead of still-pending.
+    reportLostCompletionsOnExit();
     if (runShutdown) {
       runShutdown();
     } else {
@@ -2031,6 +2056,30 @@ export async function runPanelOrchestrator(): Promise<void> {
     onAgentFatal: (tabId, reason) => {
       requestSelfExit(`tab ${tabId.slice(0, 8)} ${reason}`);
     },
+    // #468 — run-completion journal acks. `key` is the composite agent key; the
+    // journal is keyed by the PANEL TAB, so a provider switch (which retires
+    // `tab::old` and spawns `tab::new`) can never strand a completion.
+    onEventDelivered: (_key, tokens) => {
+      for (const token of tokens) RunCompletions.ack(token);
+    },
+    onEventUndelivered: (key, tokens, opts) => {
+      for (const token of tokens) RunCompletions.release(token, { carried: opts?.carried === true });
+      const panelTab = panelTabOf(key);
+      logger.warn(
+        `[panel-orchestrator] tab ${panelTab.slice(0, 8)} handed back ${tokens.length} undelivered run completion(s) — journaled for replay (#468)`,
+      );
+      // Try again immediately. When the agent is still alive (a stall-abandoned
+      // turn, a plain Stop) this re-queues the completion into its next turn;
+      // when it is going away, injectEvent refuses and the entry simply stays
+      // pending for the next spawn. The refusal path returns false WITHOUT
+      // calling back here, so this cannot recurse.
+      flushRunCompletions(panelTab);
+    },
+    // A fresh agent for this key can take mail now — replay whatever the
+    // previous one never delivered.
+    onAgentReady: (key) => {
+      flushRunCompletions(panelTabOf(key));
+    },
     sessionStore,
     // #570 P0 — bind each persisted exact session to its tab's FULL trusted workflow
     // identity (server-observed origin + per-instance uuid), so a saved workflow
@@ -2045,6 +2094,130 @@ export async function runPanelOrchestrator(): Promise<void> {
   // Let refreshEnvCapabilities() feed a freshly-gathered env block into agents
   // spawned after a ComfyUI restart/reconnect.
   liveManager = manager;
+
+  // #468 — let the journal pull a still-unread completion back off an agent's
+  // queue when it has to WEAKEN that completion's correlation (a reused prompt
+  // id, a replaced conversation). The wording is baked in at queue time, so
+  // without this the stale copy would still reach the agent claiming to be the
+  // run it queued. Only ever removes an injected `completionOnly` item.
+  RunCompletions.setRevoker(
+    (panelTabId, token) => manager.revokeEvent(agentKeyFor(panelTabId), token),
+    (panelTabId) => flushRunCompletions(panelTabId),
+  );
+
+  /**
+   * Deliver every journaled run completion for a panel tab (#468).
+   *
+   * Called on arrival, and again at every later delivery opportunity (a fresh
+   * agent spawn). Order is preserved and the loop STOPS at the first refusal, so
+   * a completion can never overtake an older one that is still stuck.
+   *
+   * Nothing here re-correlates: each entry carries the verdict computed when it
+   * ARRIVED, so a replay can never be re-attributed to a run that started after
+   * it landed. `injectEvent` returning true means only that the agent took it
+   * onto its queue — the entry stays in the journal until the turn that carried
+   * it ends (onEventDelivered), which is what makes it survive a restart.
+   */
+  /**
+   * Last-ditch disclosure before the process dies (#468).
+   *
+   * The self-exit paths (agent-fatal, a never-handshaking probe) skip the idle
+   * gate on purpose, and the journal does not survive the process — so a
+   * completion still journaled here is genuinely lost. Say so, per tab, naming
+   * the run: an UNDETERMINED outcome the user can act on beats a promise that
+   * silently evaporates. Best-effort and never throws — this runs on the way out.
+   */
+  let lostCompletionsReported = false;
+  function reportLostCompletionsOnExit(): void {
+    if (lostCompletionsReported) return; // every exit path calls this; report once
+    lostCompletionsReported = true;
+    const byTab = new Map<string, string[]>();
+    try {
+      for (const entry of RunCompletions.allOutstanding()) {
+        const list = byTab.get(entry.key) ?? [];
+        list.push(describeCorrelation(entry.correlation));
+        byTab.set(entry.key, list);
+      }
+    } catch {
+      return; // nothing readable — nothing to report
+    }
+    // LOG FIRST, unconditionally, and SYNCHRONOUSLY. This is the durable half of
+    // the disclosure: the chat push below can only reach a CONNECTED tab (an
+    // offline one's frame lands in the bridge's missedFrames buffer, which dies
+    // with the process moments later), and `bridge` may not even exist yet on a
+    // very early fatal.
+    //
+    // `writeSync` on fd 2, not the logger: `process.stderr.write` is async when
+    // stderr is a pipe (the normal case under the ComfyUI launcher), so a
+    // `process.exit()` immediately after can terminate with the record still
+    // queued and never written. Since the whole in-memory-journal tradeoff rests
+    // on "the disclosure always happens", the write it rests on must block.
+    // ONE write for every tab, not one per tab: a synchronous write to a full
+    // pipe blocks until its reader drains, so the smallest possible number of
+    // bytes is the right shape. (Blocking here is the deliberate cost of a
+    // guaranteed record — a stderr reader that has stopped consuming is a broken
+    // environment, and losing the disclosure would undercut the whole
+    // in-memory-journal tradeoff.)
+    const record = [...byTab]
+      .map(
+        ([panelTab, runs]) =>
+          `[panel-orchestrator] tab ${panelTab.slice(0, 8)} — exiting with ${runs.length} undelivered run completion(s), outcome UNDETERMINED: ${runs.join("; ")}`,
+      )
+      .join("\n");
+    // A FILE is the ONLY synchronous sink. A sync write to a PIPE can block
+    // indefinitely when its reader has stalled, and blocking here blocks the
+    // event loop — so Node can never dispatch the repeated SIGTERM that is
+    // supposed to force the exit, and the process becomes unkillable through its
+    // handled signals. A regular file always makes progress.
+    //
+    // There is deliberately NO synchronous fallback. Ranking the two outcomes:
+    // an unkillable process is worse than a missing log line, and a stderr
+    // `writeSync` in the fallback would reintroduce exactly the hang the file
+    // sink exists to avoid. If the file write fails we accept losing the durable
+    // record and fall back to the async logger, which can never wedge the exit.
+    let recorded = false;
+    try {
+      appendFileSync(`${lockPath}.lost-completions.log`, `${new Date().toISOString()} ${record}\n`);
+      recorded = true;
+    } catch {
+      // No usable file (a very early fatal, a read-only dir) — console only.
+    }
+    // Console visibility, always, and always non-blocking.
+    logger.error(record);
+    if (!recorded) {
+      logger.error("[panel-orchestrator] …and no durable sink accepted that record (it may not survive)");
+    }
+    try {
+      for (const [panelTab, runs] of byTab) {
+        bridge.push(
+          {
+            type: "say",
+            text:
+              `⚠️ The agent backend is being restarted, and ${runs.length} finished render result(s) could not be delivered ` +
+              `(${runs.join("; ")}). Their outcome is UNDETERMINED from the agent's point of view — ask it to check ` +
+              `\`get_history\` for those runs once it reconnects rather than assuming it saw them.`,
+          },
+          panelTab,
+        );
+      }
+    } catch (err) {
+      logger.warn(
+        `[panel-orchestrator] could not push the lost-completion notice (the log above is the record): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  function flushRunCompletions(panelTabId: string): void {
+    const key = agentKeyFor(panelTabId);
+    const { blockedOn } = RunCompletions.deliverPending(panelTabId, (payload, token) =>
+      manager.injectEvent(key, payload, { eventToken: token }),
+    );
+    if (blockedOn) {
+      logger.warn(
+        `[panel-orchestrator] tab ${panelTabId.slice(0, 8)} has no live agent for ${describeCorrelation(blockedOn.correlation)} — journaled, replayed when one comes back (#468)`,
+      );
+    }
+  }
 
   // Flag the mobile mirror picker's "session attached" (green) dot from live agents.
   bridge.setHasSessionPredicate((tabId) => manager.hasLiveAgent(agentKeyFor(tabId)));
@@ -2680,6 +2853,12 @@ export async function runPanelOrchestrator(): Promise<void> {
           // under migratedFrom would still resolve the retired workflow's tool call after the
           // switch (#570 P0). The socket is unchanged, so only queued WORK is dropped.
           bridge.dropQueuedDeliveries(migratedFrom);
+          // #468 — the old id's journaled run completions belong to the workflow
+          // being switched AWAY from. Carrying them onto an unproven-different
+          // workflow would deliver one workflow's render as another's, which is
+          // exactly the misattribution the journal exists to prevent. Drop them
+          // (logged per entry) rather than migrate them.
+          RunCompletions.forget(migratedFrom);
           manager.retire(migratedFrom + AGENT_KEY_SEP + prevBackend);
           logger.info(
             `[panel-orchestrator] same-socket re-hello ${migratedFrom.slice(0, 12)} → ${panelTab.slice(0, 12)} without proven workflow continuity — old agent retired (NOT rebound); each workflow keeps its own conversation`,
@@ -2727,6 +2906,33 @@ export async function runPanelOrchestrator(): Promise<void> {
           // have a LIVE agent (a provider switch retires the others), so at most one rebind is a
           // live-agent move; the rest are durable-only.
           let destinationCollision = false;
+          // #468 — the journal purge must happen BEFORE the loop, not after it.
+          // manager.reset() inside the loop hands back any run-completion tokens
+          // parked in that provider's held mail, and the hand-back callback
+          // flushes immediately — into whatever agent currently owns panelTab,
+          // which on a collision is the SUPERSEDED destination tab's agent on a
+          // different provider. Purging first means there is nothing to hand
+          // back. Read-only pre-pass over the same predicate the loop uses, so
+          // the two can't disagree about what counts as a collision.
+          // #468 CRITICAL — a tab holding ONLY a journal entry is NOT empty. Its
+          // agent and durable session may both be gone (New chat) while an
+          // undelivered completion for its render is still addressed to it;
+          // without counting that the destination reads as unoccupied, the source
+          // is rebound onto its id, and the next flush hands the DESTINATION
+          // tab's render to the SOURCE tab's conversation.
+          const destinationJournaled = RunCompletions.outstanding(panelTab).length;
+          const destinationHadState = [...KNOWN_BACKENDS].some((b) =>
+            destinationHasCollisionState({
+              hasManagerState: manager.hasAnyState(panelTab + AGENT_KEY_SEP + b),
+              hasDurableSession: sessionStore.get(panelTab + AGENT_KEY_SEP + b) !== undefined,
+              renderHeldCount: heldDuringGen.get(panelTab + AGENT_KEY_SEP + b)?.length ?? 0,
+              journaledCompletionCount: destinationJournaled,
+            }),
+          );
+          // PURGE, never inherit: the destination's completions belong to the tab
+          // being superseded, and there is no agent left to deliver them to.
+          // forget() logs each one, so the loss is disclosed, not silent.
+          if (destinationHadState) RunCompletions.forget(panelTab);
           for (const b of KNOWN_BACKENDS) {
             const srcKey = migratedFrom + AGENT_KEY_SEP + b;
             const newKey = panelTab + AGENT_KEY_SEP + b;
@@ -2749,6 +2955,11 @@ export async function runPanelOrchestrator(): Promise<void> {
                 hasManagerState: manager.hasAnyState(newKey),
                 hasDurableSession: sessionStore.get(newKey) !== undefined,
                 renderHeldCount: heldDuringGen.get(newKey)?.length ?? 0,
+                // #468 — journal state is per PANEL TAB, not per backend, so the
+                // same count applies to every provider's key. Counted BEFORE the
+                // pre-pass purge above so a journal-only destination still drives
+                // the per-backend reset + the bridge-queue drop below.
+                journaledCompletionCount: destinationJournaled,
               })
             ) {
               destinationCollision = true;
@@ -2771,6 +2982,14 @@ export async function runPanelOrchestrator(): Promise<void> {
           // panelTab; the incoming source's in-flight work is under migratedFrom (its canonical id
           // at send time) and is untouched, so the proven migration's own continuity is preserved.
           if (destinationCollision) bridge.dropQueuedDeliveries(panelTab);
+          // #468 — the superseded destination's journal state was already purged
+          // above (before anything could hand tokens back); now re-address the
+          // INCOMING tab's own completions + run tickets onto the new id.
+          RunCompletions.moveKey(migratedFrom, panelTab);
+          // rebindAgent MOVES the agent rather than spawning one, so onAgentReady
+          // never fires for the new id — flush explicitly or the re-addressed
+          // entries would sit pending until some unrelated later trigger.
+          flushRunCompletions(panelTab);
           // #570 — carry the PROVEN source identity forward as the tab's prior identity. The
           // rebound agent belongs to it (prevIdentity === newIdentity by sameWorkflow), but the
           // new tab id has no prior identity and the agent may have no durable record yet
@@ -2862,6 +3081,7 @@ export async function runPanelOrchestrator(): Promise<void> {
         }
       }
       const prev = tabBackends.get(panelTab);
+      let providerSwitched = false;
       if (prev && prev !== backend) {
         // #570 — Provider switch via re-hello: RETIRE (not reset) the previous provider's
         // agent so it stops lingering but its identity-bound durable session is PRESERVED. A
@@ -2871,8 +3091,15 @@ export async function runPanelOrchestrator(): Promise<void> {
         // still starts fresh (the panel replays the transcript as context on its first message).
         manager.retire(panelTab + AGENT_KEY_SEP + prev);
         bridge.broadcastTabList(); // live agent dropped on backend switch → refresh dot
+        providerSwitched = true;
       }
       tabBackends.set(panelTab, backend);
+      // #468 — retire() handed back any run completion the OLD provider held, but
+      // the flush it triggered ran while agentKeyFor() still resolved the OLD
+      // backend, so it could only re-journal it. Re-address it now that the tab
+      // points at the NEW provider, so the completion reaches the conversation
+      // the user actually switched to instead of waiting for their next message.
+      if (providerSwitched) flushRunCompletions(panelTab);
       // A headless client (mobile/remote pseudo-panel, no browser canvas) advertises
       // itself in the hello frame so its agent gets the in-turn-delivery directive.
       if ((event as { headless?: unknown }).headless === true) headlessTabs.add(panelTab);
@@ -2956,6 +3183,13 @@ export async function runPanelOrchestrator(): Promise<void> {
             heldDuringGen.delete(bKey); // render-held work belonging to the torn-down provider
           }
           bridge.dropQueuedDeliveries(panelTab);
+          // #468 — this tab id is no longer provably serving the workflow that
+          // queued its outstanding runs (replaced in place). Close those tickets
+          // so a late completion is reported to whoever holds the tab now as
+          // UNDETERMINED instead of "the run YOU queued". Journal ENTRIES are
+          // kept: a completion that already arrived is still real news and is
+          // still delivered — just no longer as this conversation's own.
+          RunCompletions.closeRuns(panelTab);
         }
       }
 
@@ -3373,6 +3607,12 @@ export async function runPanelOrchestrator(): Promise<void> {
         else tabStableKey.delete(panelTab);
       }
       tabBackends.set(panelTab, reqBackend);
+      // #468 — the retire() above handed back any run completion the outgoing
+      // provider's agent held, but that flush ran while agentKeyFor() still
+      // resolved the OLD backend. Re-address it now that the tab points at the
+      // new one, so the completion reaches the conversation the user switched to
+      // instead of sitting journaled until their next message.
+      if (prev !== reqBackend) flushRunCompletions(panelTab);
       // Leaving a LOCAL provider frees its VRAM (no other tab still on it) —
       // the point of switching to Claude/hosted is usually reclaiming the GPU.
       if (prev !== reqBackend) {
@@ -3909,6 +4149,22 @@ export async function runPanelOrchestrator(): Promise<void> {
       // but a mirror viewer (mobile has no Blind concept) can inject
       // agent_event frames with images onto a blinded desktop tab.
       const evForTab = blindTabs.has(event.tab_id) ? { ...ev, images: [] } : ev;
+      // #468 — a RUN COMPLETION is a promise `panel_run` made ("end your turn,
+      // you WILL be notified"), so it goes through the journal: correlated by
+      // exact prompt id ONCE, here, and replayed until the turn that carries it
+      // ends. Other agent_event kinds (download_done) keep the old best-effort
+      // path — nothing is waiting on them the way a render is.
+      if (ev.kind === "executed") {
+        // Journal the BLIND-STRIPPED copy: a replay must not resurrect pixels
+        // the blind gate removed on arrival. `null` = the panel re-sent a
+        // completion this tab was already given; suppressed, never duplicated.
+        const entry = RunCompletions.record(event.tab_id, evForTab as CompletionPayload);
+        logger.info(
+          `[panel-orchestrator] tab ${event.tab_id.slice(0, 8)} run completion for ${describeCorrelation(entry.correlation)}${entry.possibleRepeat ? " (flagged as a possible repeat)" : ""}`,
+        );
+        flushRunCompletions(event.tab_id);
+        return;
+      }
       const delivered = manager.injectEvent(agentKeyFor(event.tab_id), evForTab);
       if (delivered) {
         logger.info(`[panel-orchestrator] tab ${event.tab_id.slice(0, 8)} event → agent: ${event.kind}`);
@@ -3949,6 +4205,12 @@ export async function runPanelOrchestrator(): Promise<void> {
       // reset() is synchronous (map cleared now), so no concurrent send() can
       // spawn an agent before we report the cleared session.
       manager.reset(agentKeyFor(tabId));
+      // #468 — the conversation that queued this tab's outstanding renders is
+      // gone. Close its run tickets so a render it queued, finishing after the
+      // New chat, is reported to the replacement agent as UNDETERMINED rather
+      // than as "the run YOU queued". Already-arrived completions keep the
+      // verdict frozen at their arrival and are still delivered.
+      RunCompletions.closeRuns(tabId);
       // reset() clears the exact-tab store; the stable resume index (#570) is the
       // manager's blind spot, so drop it here too — a deliberate NEW chat must not
       // be resurrected by the unsaved-workflow fallback on the next reload.
@@ -3993,6 +4255,10 @@ export async function runPanelOrchestrator(): Promise<void> {
       const sid = typeof event.session_id === "string" ? event.session_id : undefined;
       const key = agentKeyFor(tabId);
       manager.reset(key);
+      // #468 — same as New chat: the conversation being replaced owns the open
+      // runs, so a completion landing after the switch is UNDETERMINED, not the
+      // historical session's own render.
+      RunCompletions.closeRuns(tabId);
       if (sid) manager.setResume(key, sid);
       bridge.push({ type: "ack", ok: true, kind: "resume_session" }, tabId);
       bridge.broadcastTabList(); // live agent dropped → refresh mirror pickers
@@ -4952,6 +5218,12 @@ export async function runPanelOrchestrator(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info("[panel-orchestrator] shutting down — stopping agents…");
+    // #468 — EVERY exit path discloses, not just the fatal self-exit: an ordinary
+    // SIGTERM/SIGINT teardown destroys the in-memory journal just as thoroughly.
+    // Runs BEFORE stopAll() so the still-live agents' tabs are still routable for
+    // the chat notice. Idempotent (reportLostCompletionsOnExit no-ops the second
+    // time), so the self-exit path calling it first is harmless.
+    reportLostCompletionsOnExit();
     selfRestarter?.stop();
     clearInterval(downloadTimer);
     clearInterval(queueStatusTimer);
@@ -4985,8 +5257,42 @@ export async function runPanelOrchestrator(): Promise<void> {
       // No lockfile / unreadable — nothing to clean up.
     }
   };
+  /** The single in-flight teardown, so repeated signals queue behind it. */
+  let teardownOnce: Promise<void> | null = null;
+  /** How long a REPEATED shutdown signal waits for the in-flight teardown before
+   *  forcing the exit. Long enough for a healthy teardown to finish, short enough
+   *  that a hung one can't make the process unkillable via SIGINT/SIGTERM. */
+  const FORCED_SHUTDOWN_GRACE_MS = 3000;
   const shutdown = async () => {
-    await teardownCore();
+    // RE-ENTRANT SAFE (#468). teardownCore's `shuttingDown` flag makes a second
+    // call return IMMEDIATELY, so a repeated SIGTERM used to race straight past
+    // the in-flight teardown to process.exit() — skipping the undelivered-
+    // completion disclosure the first one had not reached yet. Memoize the
+    // teardown promise so every later signal AWAITS the first one instead.
+    const first = teardownOnce === null;
+    teardownOnce ??= teardownCore();
+    // …but BOUNDED. A repeated signal is a user asking harder, and awaiting an
+    // unbounded teardown would make the process unkillable through its handled
+    // signals if anything in it hangs. The first signal waits; a later one gives
+    // the in-flight teardown a short grace and then forces the exit. The
+    // completion disclosure is unaffected either way — it runs at the TOP of
+    // teardownCore, before anything that could block.
+    if (first) {
+      await teardownOnce;
+    } else {
+      await Promise.race([
+        teardownOnce,
+        new Promise<void>((resolve) => {
+          const t = setTimeout(() => {
+            logger.warn(
+              `[panel-orchestrator] shutdown did not finish within ${FORCED_SHUTDOWN_GRACE_MS}ms of a repeated signal — forcing exit`,
+            );
+            resolve();
+          }, FORCED_SHUTDOWN_GRACE_MS);
+          t.unref?.();
+        }),
+      ]);
+    }
     process.exit(0);
   };
   process.on("SIGINT", shutdown);
@@ -5009,6 +5315,11 @@ export async function runPanelOrchestrator(): Promise<void> {
       // the gate reads as the full "nothing queued or held" contract.)
       !manager.hasHeldMail() &&
       ![...heldDuringGen.values()].some((msgs) => msgs.length > 0) &&
+      // Undelivered run completions (#468) are in-memory like the held mail
+      // above, so teardown erases them too. A restart while one is journaled
+      // would silently drop the render result the agent was promised — exactly
+      // the failure this whole path exists to prevent. Wait for it to land.
+      !RunCompletions.hasOutstanding() &&
       !QueueMonitor.isBusy(),
     announce: (text) => void bridge.push({ type: "say", text }),
     teardown: teardownCore,

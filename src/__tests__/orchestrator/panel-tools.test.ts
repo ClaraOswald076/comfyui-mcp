@@ -27,6 +27,7 @@ import {
 } from "../../orchestrator/panel-tools.js";
 import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
 import { markReplyTimeout } from "../../services/ui-bridge.js";
+import { RunCompletions } from "../../orchestrator/run-completion-journal.js";
 
 type Forwarded = Record<string, unknown>;
 
@@ -707,7 +708,10 @@ describe("panel-tools: panel_run verdict is derived from the ComfyUI reply", () 
   it("#194: a root SaveImage run-to-node the panel ACCEPTS is queued success (not subgraph-rejected)", async () => {
     const reply: ToolResult = {
       content: [
-        { type: "text", text: JSON.stringify({ queued: true, batch_count: 1, to_node_id: 9 }) },
+        {
+          type: "text",
+          text: JSON.stringify({ queued: true, batch_count: 1, to_node_id: 9, prompt_id: "p-194" }),
+        },
       ],
     };
     const { ctx, calls } = makeRunCtx(reply);
@@ -777,12 +781,33 @@ describe("panel-tools: panel_run verdict is derived from the ComfyUI reply", () 
 
   it("a genuine queue (queued:true, no errors) still gets the anti-poll note", async () => {
     const reply: ToolResult = {
-      content: [{ type: "text", text: JSON.stringify({ queued: true, batch_count: 1 }) }],
+      content: [
+        { type: "text", text: JSON.stringify({ queued: true, batch_count: 1, prompt_id: "p-ok" }) },
+      ],
     };
     const { ctx } = makeRunCtx(reply);
     const res = await defByName("panel_run").handler({}, ctx);
     expect(res.isError).toBeFalsy();
     expect(textOf(res)).toContain(QUEUED_NOTE);
+    // #468 — the anti-poll instruction is only safe because the completion can be
+    // correlated back to this exact run; the ticket is what makes that possible.
+    expect(RunCompletions.ticketFor("p-ok")).toBeDefined();
+  });
+
+  it("#468: a queue with NO prompt id does NOT promise automatic delivery — it says UNDETERMINED", async () => {
+    // The panel forwards ComfyUI's /prompt reply; without a prompt_id there is
+    // nothing to correlate a later completion to, so telling the agent to idle
+    // and wait would park it on a promise the orchestrator cannot keep.
+    const reply: ToolResult = {
+      content: [{ type: "text", text: JSON.stringify({ queued: true, batch_count: 1 }) }],
+    };
+    const { ctx } = makeRunCtx(reply);
+    const res = await defByName("panel_run").handler({}, ctx);
+    expect(res.isError).toBeFalsy();
+    const text = textOf(res);
+    expect(text).not.toContain(QUEUED_NOTE);
+    expect(text).toContain("UNDETERMINED");
+    expect(text).toContain("get_history");
   });
 });
 
