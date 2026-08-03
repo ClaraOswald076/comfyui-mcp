@@ -24,6 +24,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 class FakeChild extends EventEmitter {
   unref = vi.fn();
+  /** Set per-test when the listener-ownership check matters. */
+  pid: number | undefined = undefined;
 }
 
 const mockConfig = vi.hoisted(() => ({
@@ -161,10 +163,11 @@ function mockLivePortThenFree(): { killed: () => boolean } {
   return { killed: () => killed };
 }
 
-function spawnCapturingChildren(): FakeChild[] {
+function spawnCapturingChildren(pid?: number): FakeChild[] {
   const children: FakeChild[] = [];
   mockSpawn.mockImplementation(() => {
     const child = new FakeChild();
+    child.pid = pid;
     children.push(child);
     return child;
   });
@@ -506,6 +509,76 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
     // No env override: `spawn` inherits process.env, exactly as before #776.
     expect(spawnOptions().env).toBeUndefined();
     expect(result.launch_env?.source).toBe("inherited");
+
+    killSpy.mockRestore();
+  });
+
+  it("does NOT claim a successful restart when the healthy listener is somebody ELSE's process", async () => {
+    // Readiness only proves that SOMETHING answers on the port. If an external
+    // launcher/supervisor bound it while our child failed, the server is up but
+    // OUR relaunch did not do it — saying "restarted successfully" would be false.
+    usePlainInstall();
+    // The port owner reported after the relaunch (4321) is not our child (999).
+    spawnCapturingChildren(999);
+    let killed = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill|pkill|\bkill\b/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (/netstat/i.test(cmd)) {
+        // Free during the post-kill wait, then a DIFFERENT process owns it again.
+        return killed && !restarted
+          ? ""
+          : "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed && !restarted) throw new Error("not listening");
+        return "p4321\nn127.0.0.1:8188\n";
+      }
+      return "";
+    });
+    let restarted = false;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        restarted = true; // something answers on the port again
+        return { ok: true } as Response;
+      }),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.listener_is_launched_process).toBe(false);
+    expect(result.message).not.toMatch(/restarted successfully/i);
+    expect(result.message).toMatch(/NOT as a result of this restart/i);
+    expect(result.message).toMatch(/another launcher or supervisor owns it/i);
+
+    killSpy.mockRestore();
+  });
+
+  it("names the launched process's EXIT when it dies before the API comes up", async () => {
+    usePlainInstall();
+    mockLivePortThenFree();
+    const children = spawnCapturingChildren();
+    // The API never answers; meanwhile the process we launched dies (the #776
+    // shape: ComfyUI aborting during import in a degraded environment).
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        children[0]?.emit("exit", 1, null);
+        throw new Error("ECONNREFUSED");
+      }),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(true);
+    expect(result.started).toBe(false);
+    expect(result.message).toMatch(/EXITED \(exit code 1\)/);
+    expect(result.message).toMatch(/failed relaunch, not a slow start/i);
 
     killSpy.mockRestore();
   });

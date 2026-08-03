@@ -81,6 +81,13 @@ interface StartResult {
   spawn_error?: ChildProcessErrorDetails;
   /** How the relaunch environment was resolved (#776). */
   launch_env?: LaunchEnvInfo;
+  /**
+   * Whether the process now listening on the port is the one WE launched.
+   * `undefined` when it cannot be decided (no spawn pid, or the port owner could
+   * not be mapped). `false` means a healthy server is up but somebody else owns
+   * it — readiness alone must never be read as "our relaunch worked".
+   */
+  listener_is_launched_process?: boolean;
 }
 
 interface RestartResult {
@@ -93,6 +100,13 @@ interface RestartResult {
   spawn_error?: ChildProcessErrorDetails;
   /** How the relaunch environment was resolved (#776). */
   launch_env?: LaunchEnvInfo;
+  /**
+   * Whether the process now listening on the port is the one WE launched.
+   * `undefined` when it cannot be decided (no spawn pid, or the port owner could
+   * not be mapped). `false` means a healthy server is up but somebody else owns
+   * it — readiness alone must never be read as "our relaunch worked".
+   */
+  listener_is_launched_process?: boolean;
 }
 
 interface StartupReadinessResult {
@@ -460,6 +474,25 @@ function childProcessErrorDetails(err: unknown): ChildProcessErrorDetails {
 /** The launch-environment facts to report, once a plan has been resolved (#776). */
 function launchEnvInfo(info?: ProcessInfo): LaunchEnvInfo | undefined {
   return info?.envPlan?.info;
+}
+
+/**
+ * The sentence naming the DEATH of the process we launched, when it died before
+ * the API answered. Far more actionable than "60/60 probes": it says the relaunch
+ * itself failed (the #776 shape — ComfyUI aborting during import), not that it is
+ * merely slow.
+ */
+function describeLaunchedChildExit(
+  exit: { code: number | null; signal: NodeJS.Signals | null } | undefined,
+): string {
+  if (!exit) return "";
+  const how =
+    exit.signal != null
+      ? `killed by ${exit.signal}`
+      : exit.code != null
+        ? `exit code ${exit.code}`
+        : "for an unknown reason";
+  return ` The process this call launched EXITED (${how}) before the API came up, so ComfyUI is DOWN — this was a failed relaunch, not a slow start.`;
 }
 
 /**
@@ -1251,6 +1284,16 @@ export async function startComfyUI(): Promise<StartResult> {
     };
   }
   const spawnError = captureChildProcessError(launched.child);
+  // TRUTHFULNESS WATCH (codex gate): remember whether the process WE launched died
+  // before the readiness poll finished. Readiness only proves that SOMETHING answers
+  // on the port — it cannot tell our relaunch apart from an external
+  // launcher/supervisor that grabbed the port meanwhile. Recording the exit (rather
+  // than racing it) changes no timing and no outcome; it only lets the report name
+  // what actually happened instead of implying our child is the healthy server.
+  let launchedChildExit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+  launched.child.once("exit", (code, signal) => {
+    launchedChildExit = { code, signal };
+  });
   launched.child.unref();
   lastProcessInfo = info;
   superviseChild(launched.child, info);
@@ -1303,15 +1346,23 @@ export async function startComfyUI(): Promise<StartResult> {
       // otherwise-healthy install fails during import.
       message:
         `ComfyUI process was launched but the API did not become ready after ${readiness.waited_ms}ms (${readiness.attempts}/${readiness.max_tries} probes). Check the ComfyUI logs.` +
+        describeLaunchedChildExit(launchedChildExit) +
         (env ? ` Launch environment: ${env.note}.` : "") +
         launchEnvWarning(info),
       auto_restart: supervisorResult(info),
       launch_env: env,
+      listener_is_launched_process: false,
     };
   }
 
   const newPid = findPidByPort(port);
   const env = launchEnvInfo(info);
+  // Is the healthy listener actually OURS? Only decidable when we know both PIDs;
+  // an unmappable port owner (the #449 shape) stays `undefined` rather than
+  // asserting either way.
+  const ourPid = launched.child.pid;
+  const listenerIsOurs =
+    ourPid == null || newPid == null ? undefined : newPid === ourPid;
   return {
     started: true,
     ready: true,
@@ -1321,10 +1372,19 @@ export async function startComfyUI(): Promise<StartResult> {
       // Say WHICH environment it came back in whenever that was not simply ours
       // (#776) — the user needs to know a launcher environment was restored.
       (env && env.source !== "inherited" ? ` — ${env.note}.` : "") +
+      // NEVER imply our relaunch is the healthy server when the port is owned by
+      // a DIFFERENT process (codex gate): an external launcher/supervisor can bind
+      // the port while our child fails, and readiness alone cannot tell them apart.
+      (listenerIsOurs === false
+        ? ` NOTE: the process serving port ${port} (PID ${newPid}) is NOT the one this call launched (PID ${ourPid}${
+            launchedChildExit ? ", which has since exited" : ""
+          }) — another launcher or supervisor owns it, so this server was not started by us.`
+        : "") +
       launchEnvWarning(info),
     pid: newPid ?? undefined,
     auto_restart: supervisorResult(info),
     launch_env: env,
+    listener_is_launched_process: listenerIsOurs,
   };
 }
 
@@ -1672,6 +1732,7 @@ export async function restartComfyUI(): Promise<RestartResult> {
       auto_restart: startResult.auto_restart,
       spawn_error: startResult.spawn_error,
       launch_env: startResult.launch_env,
+      listener_is_launched_process: startResult.listener_is_launched_process,
     };
   }
 
@@ -1684,9 +1745,17 @@ export async function restartComfyUI(): Promise<RestartResult> {
     started: true,
     ready: startResult.ready,
     readiness: startResult.readiness,
-    message: `ComfyUI restarted successfully. ${startResult.message}`,
+    // Only claim a clean "restarted successfully" when the healthy listener is the
+    // process we launched (or we could not tell). When it provably is NOT ours, say
+    // the server is up but somebody ELSE brought it back (codex gate) — startResult's
+    // own message carries the PID detail.
+    message:
+      (startResult.listener_is_launched_process === false
+        ? "ComfyUI is back up, but NOT as a result of this restart. "
+        : "ComfyUI restarted successfully. ") + startResult.message,
     auto_restart: startResult.auto_restart,
     launch_env: startResult.launch_env,
+    listener_is_launched_process: startResult.listener_is_launched_process,
   };
 }
 
