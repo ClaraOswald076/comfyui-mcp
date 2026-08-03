@@ -6,6 +6,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.49.3] - 2026-08-03
+
+### MCP
+
+#### Fixed
+- panel_ask and other blocking card tools no longer die at 60s on ollama-family backends — the internal panel MCP client now uses a 315s timeout, above the longest card budget (#325) (#754)
+- list_assets reconciles from ComfyUI history, so panel-dispatched renders and earlier sessions surface — every registered record requires affirmative success evidence (on both the watched and reconcile paths), a non-empty filename, a real output, and a truthfully-sourced completion time (#751) (#753)
+- the too-old panel verdict now quotes both detected panel and MCP versions (#422) (#755)
+
+
 ## [0.49.2] - 2026-08-02
 
 ### MCP
