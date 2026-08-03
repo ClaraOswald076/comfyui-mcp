@@ -331,6 +331,27 @@ export class RunCompletionJournalImpl {
     }
   }
 
+  /** Has this tab ALREADY seen a completion for this prompt id — delivered (a
+   *  memo from any generation) or still journaled? If so the id is not a fresh
+   *  identity, however long ago that was and whether or not its ticket survives.
+   *  Both stores are bounded, so this is a small scan. */
+  private hasHistoryFor(key: string, promptId: string): boolean {
+    const prefix = `${key}|${promptId}|`;
+    for (const memo of this.delivered) {
+      if (memo.startsWith(prefix)) return true;
+    }
+    for (const entry of this.entries.values()) {
+      if (
+        entry.key === key &&
+        entry.correlation.status !== "unidentified" &&
+        entry.correlation.promptId === promptId
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /** `panel_run` queued a render. Returns false when ComfyUI/the panel gave us
    *  no prompt id — the caller MUST then tell the agent its completion cannot be
    *  correlated rather than promising a notification it may not be able to
@@ -358,6 +379,15 @@ export class RunCompletionJournalImpl {
       this.retireOlderEntriesFor(promptId);
       return true;
     }
+    // A FRESH ticket is only a fresh IDENTITY if this tab has no history for the
+    // id. If it does — a delivered memo from an earlier generation, or an entry
+    // still journaled — then ComfyUI has REUSED the id and the ticket was merely
+    // evicted in between. Nothing on the wire separates "run A's late resend"
+    // from "run B's completion" in that state, so the new ticket is born
+    // ambiguous: had it been treated as a clean identity, A's resend would
+    // correlate as B, its ack would settle B, and B's real completion would then
+    // be suppressed by B's own settled flag — misattribution AND loss.
+    const hasHistory = this.hasHistoryFor(meta.tabId, promptId);
     this.tickets.set(promptId, {
       promptId,
       tabId: meta.tabId,
@@ -365,7 +395,13 @@ export class RunCompletionJournalImpl {
       queuedAt: Date.now(),
       ...(typeof meta.toNodeId === "number" ? { toNodeId: meta.toNodeId } : {}),
       settled: false,
+      ...(hasHistory ? { reused: true } : {}),
     });
+    if (hasHistory) {
+      logger.warn(
+        `[run-completions] prompt ${promptId} was queued again for tab ${meta.tabId.slice(0, 8)} after its ticket had been evicted — this tab already has history for that id, so it is treated as REUSED (every completion for it reported as undetermined)`,
+      );
+    }
     // …and on THIS branch too. A fresh ticket after the old one was evicted is
     // still a NEW run for an id that already has journaled completions: without
     // this, an older `matched` entry survives untouched and goes on telling the
@@ -855,6 +891,16 @@ export class RunCompletionJournalImpl {
     }
     for (const [pid, ticket] of [...this.tickets]) {
       if (ticket.tabId === key) this.tickets.delete(pid);
+    }
+    // An eviction disclosure this tab was still owed dies with it — the tab is
+    // gone, so there is no delivery left to carry it. Say so at ERROR rather than
+    // dropping it silently: the eviction path PROMISES the loss will be reported,
+    // and this is the one place that promise cannot be kept.
+    const owed = this.dropped.get(key) ?? 0;
+    if (owed > 0) {
+      logger.error(
+        `[run-completions] tab ${key.slice(0, 8)} is gone still owed a disclosure for ${owed} evicted completion(s) — it will never be told; treat those runs as UNDETERMINED`,
+      );
     }
     this.dropped.delete(key);
     for (const memo of [...this.delivered]) {

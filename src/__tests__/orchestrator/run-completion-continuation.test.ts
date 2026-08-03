@@ -900,7 +900,9 @@ describe("run completion journal correlation (#468)", () => {
     expect(journal.ticketFor(PROMPT_A)).toBeUndefined();
 
     journal.openRun(PROMPT_A, { tabId: "t" }); // B reuses the id — a FRESH ticket
-    expect(journal.ticketFor(PROMPT_A)?.reused).toBeUndefined(); // nothing marked
+    // …but NOT a fresh identity: this tab already has history for the id, so the
+    // new ticket is born ambiguous and every completion for it reads UNDETERMINED.
+    expect(journal.ticketFor(PROMPT_A)?.reused).toBe(true);
     const real = journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "run B (real)" });
     expect(real).not.toBeNull();
     expect(real!.token).not.toBe(late!.token);
@@ -908,7 +910,7 @@ describe("run completion journal correlation (#468)", () => {
     journal.ack(late!.token);
     expect(journal.pending("t")).toHaveLength(1);
     expect(journal.pending("t")[0].payload.note).toBe("run B (real)");
-    expect(journal.ticketFor(PROMPT_A)?.settled).toBe(false); // B still outstanding
+    expect(journal.ticketFor(PROMPT_A)?.settled).toBe(false); // A's ack settles nothing
   });
 
   it("an older generation's PENDING entry is never merged into by a newer run", () => {
@@ -979,6 +981,32 @@ describe("run completion journal correlation (#468)", () => {
     journal.ack(first!.token);
     const third = journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "external 3" });
     expect(third).not.toBeNull(); // never suppressed by the first's ack
+  });
+
+  it("a late resend of an ACKED run cannot settle — nor suppress — the run that reused its id", () => {
+    // The nastiest ordering: A completes and is fully acked; A's ticket is
+    // evicted; B reuses the id. A's late resend is byte-identical to B's
+    // completion, so treating the new ticket as a clean identity meant the
+    // resend correlated as B, its ack SETTLED B, and B's real completion was
+    // then suppressed by B's own settled flag — misattribution and loss.
+    journal.openRun(PROMPT_A, { tabId: "t" });
+    const a = journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "run A" });
+    journal.deliverPending("t", () => true);
+    journal.ack(a!.token); // A fully delivered and settled
+
+    for (let i = 0; i < 80; i++) journal.openRun(`later-${i}`, { tabId: "t" }); // evict A's ticket
+    journal.openRun(PROMPT_A, { tabId: "t" }); // B reuses the id
+
+    const resend = journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "A resend" });
+    expect(resend).not.toBeNull();
+    expect(resend!.correlation.status).toBe("foreign"); // cannot claim to be B
+    journal.deliverPending("t", () => true);
+    journal.ack(resend!.token);
+    expect(journal.ticketFor(PROMPT_A)?.settled).toBe(false); // B is NOT answered
+
+    const real = journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "run B" });
+    expect(real).not.toBeNull(); // B's own completion still lands
+    expect(real!.payload.note).toBe("run B");
   });
 
   it("the no-coalesce rule survives the reused TICKET being evicted", () => {
@@ -1151,7 +1179,9 @@ describe("run completion journal correlation (#468)", () => {
   it("a prompt id reused AFTER its ticket was evicted still delivers the new run's completion", () => {
     // The memo outlives the ticket by design, so a reuse can take the
     // FRESH-ticket path with a stale memo still standing. `panel_run` promises
-    // automatic delivery for that new run — the memo must not swallow it.
+    // automatic delivery for that new run — the memo must not swallow it. And
+    // because this tab already has history for the id, the new ticket is born
+    // ambiguous: delivered, but honestly, as UNDETERMINED.
     journal.openRun(PROMPT_A, { tabId: "t" });
     const first = journal.record("t", { kind: "executed", prompt_id: PROMPT_A });
     journal.deliverPending("t", () => true);
@@ -1165,14 +1195,16 @@ describe("run completion journal correlation (#468)", () => {
     expect(journal.ticketFor(PROMPT_A)).toBeUndefined(); // evicted, so this is a FRESH ticket
 
     journal.openRun(PROMPT_A, { tabId: "t" }); // ComfyUI reused the id for a NEW run
+    expect(journal.ticketFor(PROMPT_A)?.reused).toBe(true); // history ⇒ ambiguous
     const second = journal.record("t", { kind: "executed", prompt_id: PROMPT_A });
+    // DELIVERED — the older run's memo never reaches it — but as UNDETERMINED,
+    // because a late resend of the older run is indistinguishable from this one.
     expect(second).not.toBeNull();
-    // A FRESH ticket is a new generation, so the older run's memo cannot reach
-    // it: the new run is matched and delivered as its own.
-    expect(second!.correlation.status).toBe("matched");
+    expect(second!.correlation.status).toBe("foreign");
+    // …and a further completion for the id is not suppressed by this one's ack.
     journal.deliverPending("t", () => true);
     journal.ack(second!.token);
-    expect(journal.ticketFor(PROMPT_A)?.settled).toBe(true); // ITS ticket, settled by ITS ack
+    expect(journal.record("t", { kind: "executed", prompt_id: PROMPT_A })).not.toBeNull();
   });
 
   it("a stall/rewind abandon is CARRIED, so a freezing backend can't replay forever", () => {
