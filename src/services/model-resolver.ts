@@ -741,9 +741,18 @@ async function assertDestinationVisibleToLiveServer(
   // root — so a populated sibling can still expose a wrong install when the target
   // folder happens to be empty.
   const target = categoryOf(targetSubfolder);
+  const present = await categoriesUnder(modelsRoot);
+  // A models root with NO subdirectories at all gives the checks below nothing to
+  // work with — which is exactly the shape a container-side `--models-directory`
+  // takes on the host (the path simply does not exist here), and the target
+  // category alone may be empty on the live server too. Probe a few standard
+  // categories so "the server has models, this tree has none" can still be seen
+  // (codex gate, round 7). Cheap: only when the tree really is bare.
+  const fallback = present.length === 0 ? [...MODEL_SUBDIRS] : [];
   const ordered = [
     ...(target ? [target] : []),
-    ...(await categoriesUnder(modelsRoot)).filter((c) => c !== target),
+    ...present.filter((c) => c !== target),
+    ...fallback.filter((c) => c !== target),
   ];
 
   let probed = 0;

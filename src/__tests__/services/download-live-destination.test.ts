@@ -291,6 +291,21 @@ describe("pre-write: a destination the LIVE server does not read from is refused
     expect(h.fetchCalls).toEqual([]);
   });
 
+  it("finds evidence in OTHER categories when the models root has no subdirectories at all (codex gate r7)", async () => {
+    // The container-side --models-directory does not exist on the host, so there are
+    // no category folders to enumerate and the TARGET category is empty on the live
+    // server too. Probing standard categories still exposes the mismatch.
+    h.modelsDirSource = "argv-flag";
+    h.modelsRootExists = false;
+    h.onDisk = {}; // no subdirectories at all
+    h.liveListings["loras"] = []; // the target category really is empty upstream
+    h.liveListings["checkpoints"] = ["a.safetensors", "b.safetensors"];
+    h.liveExtraRoots = { authoritative: true, roots: [] };
+    await expect(resolveModelSubfolderPreferServer("loras")).rejects.toThrow(
+      /DIFFERENT install/,
+    );
+  });
+
   it("DOES check a live-resolved root that does NOT exist locally (container path; codex gate r3)", async () => {
     // A loopback ComfyUI inside Docker reports its CONTAINER-side --models-directory.
     // Writing that path on the host silently creates a directory nobody reads.
