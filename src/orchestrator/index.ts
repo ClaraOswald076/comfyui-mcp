@@ -18,6 +18,7 @@ import { randomBytes } from "node:crypto";
 import readline from "node:readline";
 import { startUiBridge, isLoopbackBindHost, SESSION_EPOCH, type UiBridge } from "../services/ui-bridge.js";
 import { setupSecureBridge, resolveComfyuiPathForTarget, type SecureBridge } from "../services/secure-bridge.js";
+import { judgeHelloRetarget, canonComfyuiTargetUrl } from "../services/hello-retarget.js";
 import { startQuickTunnel } from "../services/tunnel.js";
 import { detectInstallMode } from "../services/self-update.js";
 import { performPanelSync } from "../services/panel-sync.js";
@@ -2144,15 +2145,9 @@ export async function runPanelOrchestrator(): Promise<void> {
   // http://h:443 and http://h are NOT the same endpoint (codex finding).
   // Shared by applyComfyuiUrl's dedupe and the control-channel ack check
   // (runpodProxyUrl omits :443 while getComfyUIBaseUrl includes it — codex).
-  const canonTargetUrl = (u: string): string => {
-    try {
-      const p = new URL(u);
-      if ((p.protocol === "https:" && p.port === "443") || (p.protocol === "http:" && p.port === "80")) p.port = "";
-      return p.toString().replace(/\/+$/, "");
-    } catch {
-      return u.replace(/\/+$/, "");
-    }
-  };
+  // ONE implementation with the hello-retarget judge's same-target check so
+  // the dedupe and the veto can never disagree (canonComfyuiTargetUrl).
+  const canonTargetUrl = (u: string): string => canonComfyuiTargetUrl(u);
   const applyComfyuiUrl = (rawUrl: unknown): boolean => {
     if (typeof rawUrl !== "string") return false;
     const next = rawUrl.trim().replace(/\/+$/, "");
@@ -2555,17 +2550,42 @@ export async function runPanelOrchestrator(): Promise<void> {
       // BEFORE the readiness probe so the "ready" ack reflects the right instance —
       // but a hello can arrive from a STALE browser tab on a DEAD instance (E2E
       // finding: a zombie :8189 tab kept retargeting the orchestrator to a corpse
-      // and silently breaking every tool that probes the target). Probe
-      // loopback/LAN hellos first; RunPod proxies skip the probe (booting pods
-      // answer late — readiness is the connector's job).
+      // and silently breaking every tool that probes the target). The veto
+      // (judgeHelloRetarget, #303) protects only a HEALTHY current target: when the
+      // current target reads dead too — the ComfyUI restart window — the live
+      // tab's hello is trusted instead, so the reconnect correction back to a
+      // LOCAL target can never be vetoed into keeping a stale REMOTE one (#756).
+      // TRUST: hello.comfyui_url is page-JS-writable, so every apply path is
+      // gated on the SERVER-OBSERVED handshake origin (tabServerOrigin — the
+      // browser sets it, page JS can't forge it; #509's trusted source, codex
+      // gate). Only a corroborated claim gets the no-probe shortcuts and the
+      // both-dead recovery; an uncorroborated claim must earn its retarget by
+      // answering its probe, and a dead one fails closed. RunPod proxies still
+      // skip the probe for corroborated claims (booting pods answer late —
+      // readiness is the connector's job).
       const helloUrl = (event as { comfyui_url?: unknown }).comfyui_url;
       void (async () => {
-        if (typeof helloUrl === "string" && !/\.proxy\.runpod\.net/i.test(helloUrl)) {
-          const base = helloUrl.trim().replace(/\/+$/, "");
-          if (base && !(await probeOk(`${base}/system_stats`, 3_000))) {
-            logger.warn(`[panel-orchestrator] ignoring hello retarget to unreachable ${base} (stale tab on a dead instance?) — keeping ${comfyuiUrl}`);
-            return;
-          }
+        const verdict = await judgeHelloRetarget({
+          helloUrl,
+          currentUrl: comfyuiUrl,
+          observedOrigin: bridge.tabServerOrigin(panelTab),
+          probe: (u) => probeOk(u, 3_000),
+        });
+        if (!verdict.apply) {
+          logger.warn(
+            verdict.reason === "vetoed-untrusted"
+              ? `[panel-orchestrator] refusing hello retarget to ${verdict.base}: the tab's handshake origin does not ` +
+                `corroborate the claimed URL and the claimed instance is unreachable — NOT retargeting on an ` +
+                `unverifiable claim (keeping ${comfyuiUrl})`
+              : `[panel-orchestrator] ignoring hello retarget to unreachable ${verdict.base} (stale tab on a dead instance?) — keeping ${comfyuiUrl}`,
+          );
+          return;
+        }
+        if (verdict.reason === "current-also-unreachable") {
+          logger.info(
+            `[panel-orchestrator] hello target ${verdict.base} and current target ${comfyuiUrl} are BOTH unreachable ` +
+              `(ComfyUI restart window?) — trusting the live tab's origin-corroborated hello rather than pinning a stale target (#756)`,
+          );
         }
         applyComfyuiUrl(helloUrl);
       })();
