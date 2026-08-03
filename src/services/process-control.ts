@@ -561,27 +561,33 @@ let parentPidResolverOverride: ((pid: number) => number | undefined) | null = nu
  */
 function readParentPid(pid: number): number | undefined {
   if (parentPidResolverOverride) return parentPidResolverOverride(pid);
-  if (!pid || pid <= 0) return undefined;
-  try {
-    const out = IS_WIN
-      ? execFileSync(
-          "powershell",
-          [
-            "-NoProfile",
-            "-Command",
-            `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}").ParentProcessId`,
-          ],
-          { encoding: "utf-8", timeout: 8000, windowsHide: true },
-        )
-      : execFileSync("ps", ["-p", String(pid), "-o", "ppid="], {
-          encoding: "utf-8",
-          timeout: 5000,
-        });
-    const parsed = Number.parseInt(out.trim(), 10);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
-  } catch {
-    return undefined;
+  // Same OS call as the rest of the identity — never a second spawn.
+  return resolveProcessIdentity(pid)?.parentPid;
+}
+
+/**
+ * Is `pid` this orchestrator, or a DESCENDANT of it?
+ *
+ * A direct-child test is too strict for a legitimately indirect launcher: a
+ * wrapper script, a double fork, or a venv trampoline all mean the process that
+ * ends up holding the port is our grandchild, not our child. Telling those users
+ * "this server was not started by us" is a false negative, so the parent chain is
+ * walked (a few hops, hard-bounded) before concluding anything.
+ *
+ * Returns `undefined` the moment the chain becomes unreadable — not knowing is
+ * never promoted to a claim in either direction.
+ */
+function isOurDescendant(pid: number, maxHops = 4): boolean | undefined {
+  let current = pid;
+  for (let hop = 0; hop < maxHops; hop++) {
+    if (current === process.pid) return true;
+    const parent = readParentPid(current);
+    if (parent == null) return undefined;
+    // pid 1 / 0 / self-parenting = we reached the top without finding ourselves.
+    if (parent === current || parent <= 1) return false;
+    current = parent;
   }
+  return false;
 }
 
 /**
@@ -617,7 +623,18 @@ function classifyListenerOwnership(input: {
 
   const ourPid = input.child.pid;
   if (ourPid == null || input.portOwnerPid == null) return "unconfirmed";
-  if (input.portOwnerPid !== ourPid) return "not-ours";
+  if (input.portOwnerPid !== ourPid) {
+    // A DIFFERENT pid holds the port. That is usually somebody else's server — but
+    // it is also the shape of a legitimately indirect launch (a wrapper script, a
+    // double fork, a trampoline), where the listener is our GRANDchild. Walk the
+    // parent chain before concluding: descendant => still ours; provably outside
+    // our tree => not ours; unreadable => unconfirmed, never a false negative that
+    // tells a wrapper-launched user their own server isn't theirs.
+    const descendant = isOurDescendant(input.portOwnerPid);
+    if (descendant === true) return "ours";
+    if (descendant === false) return "not-ours";
+    return "unconfirmed";
+  }
   // The pid MATCHES — but it could be a recycled number we cannot signal.
   if (alive !== true) return "unconfirmed";
 
@@ -884,15 +901,27 @@ let processIdentityOverride:
   | ((pid: number) => ProcessIdentity | undefined)
   | null = null;
 
+/**
+ * Read a process's identity — command line, creation time and PARENT pid — in one
+ * OS call.
+ *
+ * This is deliberately NOT platform-gated any more. It was, on cost grounds: the
+ * Windows reader is a PowerShell `Get-CimInstance` spawn, measured at ~2.4s even
+ * for a pid that does not exist. But skipping it there meant Windows had NO
+ * identity evidence at all, so "the re-check couldn't reach the server" collapsed
+ * to a bare numeric port/pid comparison — and a replacement instance with
+ * different argv was killed on the strength of the previous one's answer (codex
+ * gate). That is the reported platform and the common case on it.
+ *
+ * The cost is bounded by WHERE it is called: once when binding the pid, once
+ * immediately before the kill, and once when deciding ownership after a launch —
+ * never inside a poll. A restart already spends tens of seconds; a few of them
+ * buying "we are certain this is the right process" is the trade the whole issue
+ * is about.
+ */
 function resolveProcessIdentity(pid: number): ProcessIdentity | undefined {
   if (processIdentityOverride) return processIdentityOverride(pid);
-  // MEASURED: the Windows reader (a PowerShell `Get-CimInstance` spawn) costs
-  // ~2.4s per call even for a pid that does not exist, which would be paid twice
-  // on every restart and ~40x across the test suite. Linux's `/proc/<pid>/stat`
-  // read is free, and Linux is also the only platform where we read
-  // `/proc/<pid>/environ` at all — so the expensive readers buy nothing the
-  // port-ownership re-check does not already give.
-  if (!pid || pid <= 0 || process.platform !== "linux") return undefined;
+  if (!pid || pid <= 0) return undefined;
   try {
     return readProcessIdentity(pid);
   } catch {
@@ -1504,7 +1533,26 @@ async function reconfirmAnsweringServer(
 async function gatherProcessInfo(): Promise<ProcessInfo> {
   const port = config.resolvedPort;
 
-  // 1. Get argv from /system_stats
+  // 1. Get argv from /system_stats, BRACKETED by port-owner lookups.
+  //
+  // The argv and the pid are two separate observations, and the whole hazard is
+  // that they may describe two different processes: A answers, A exits, B binds
+  // the port, and the pid we then look up is B's — after which B is "identified"
+  // from A's answer and is what a restart would kill. Re-asking afterwards does
+  // NOT settle this: it only proves the CURRENT owner is self-consistent, which a
+  // replacement with identical argv satisfies perfectly (codex gate).
+  //
+  // So carry something across the two observations that a substitution cannot
+  // reproduce: the identity of the port owner BEFORE the HTTP call. If the same
+  // pid still owns the port afterwards, the answer we hold was produced while that
+  // one process held the socket throughout.
+  let ownerBefore: number | null = null;
+  try {
+    ownerBefore = findPidByPort(port);
+  } catch {
+    ownerBefore = null;
+  }
+
   let argv: string[] = [];
   try {
     const stats = await getSystemStats();
@@ -1515,6 +1563,16 @@ async function gatherProcessInfo(): Promise<ProcessInfo> {
 
   // 2. Find PID by port
   const pid = findPidByPort(port);
+  if (ownerBefore != null && pid != null && ownerBefore !== pid) {
+    const err = new ProcessControlError(
+      `The process listening on port ${port} changed while ComfyUI was being identified ` +
+        `(PID ${ownerBefore} answered, PID ${pid} holds the port now). Nothing was stopped: ` +
+        `the launch arguments we hold describe the instance that has gone, not the one ` +
+        `running now. Re-run once the server has settled.`,
+    );
+    err.identityAmbiguous = true;
+    throw err;
+  }
   if (!pid) {
     // Liveness is the reachable SERVER, not only a local PID scan. If
     // /system_stats just answered (argv populated) yet we still can't map the
@@ -1709,7 +1767,49 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
     };
   }
 
-  // COMMITTED — only now may we drop supervision.
+  // A KILL THAT RETURNED IS STILL NOT PROOF THE PROCESS DIED (codex gate). On
+  // POSIX the forced `kill -9` is issued through a shell whose failure is swallowed
+  // wholesale — an ignored SIGTERM followed by a failed SIGKILL looks exactly like
+  // success from here. The port is the observable that settles it: wait for it to
+  // be released, and let the timeout DECIDE rather than merely warn.
+  let stillOurs = false;
+  try {
+    await waitForPortFree(info.port);
+  } catch {
+    // Timed out. Distinguish "our target is still sitting there" (the kill did not
+    // work — the server is UP, so refusing is safe and correct) from "somebody else
+    // now holds the port" (our target did die; a successor took it).
+    let ownerNow: number | null = null;
+    try {
+      ownerNow = findPidByPort(info.port);
+    } catch {
+      ownerNow = null;
+    }
+    stillOurs = ownerNow === info.pid;
+    if (!stillOurs) {
+      logger.warn(
+        "Port did not free in time, but it is no longer held by the process we killed",
+        { pid: info.pid, owner: ownerNow ?? "(unmappable)" },
+      );
+    }
+  }
+  if (stillOurs) {
+    deliberateStop = false;
+    logger.warn("Stop aborted: the killed process still holds the port", {
+      pid: info.pid,
+      port: info.port,
+    });
+    return {
+      stopped: false,
+      message:
+        `Could not stop ComfyUI: PID ${info.pid} still holds port ${info.port} after the kill ` +
+        `was issued, so it is still running. Nothing was torn down — its crash supervision ` +
+        `and launch record are untouched. Stop it from the launcher/console that owns it.`,
+      has_restart_info: false,
+    };
+  }
+
+  // COMMITTED — the process is provably gone. Only now may we drop supervision.
   detachSupervisor();
   // The server we may have launched is going away — clear the shares-our-env flag so
   // a differently-launched successor doesn't inherit env-trust it shouldn't (#633 P1b).
@@ -1732,13 +1832,6 @@ export async function stopComfyUI(preInfo?: ProcessInfo): Promise<StopResult> {
   resetClient();
   resetObjectInfoCache();
   resetManagerApiCache("comfyui stopped");
-
-  // Wait for port to actually free
-  try {
-    await waitForPortFree(info.port);
-  } catch {
-    logger.warn("Port did not free in time, but process kill was sent");
-  }
 
   return {
     stopped: true,

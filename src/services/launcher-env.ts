@@ -214,18 +214,30 @@ function dirOf(p: string): string | undefined {
  * expected", which is the ambiguous case that must refuse. Unreadable/missing
  * config reads as "not mentioned": we never manufacture ambiguity.
  */
-function launcherConfigMentions(dataRoot: string, needle: string): boolean {
+function launcherConfigMentions(
+  dataRoot: string,
+  needle: string,
+): "mentions" | "absent" | "unreadable" {
+  let sawUnreadable = false;
   for (const name of ["settings.json", "settings.jsonc"]) {
+    const path = joinPath(dataRoot, name);
+    // MISSING and UNREADABLE are NOT the same answer. Folding them together is how
+    // a momentarily unreadable config would let a component be declared
+    // "not installed", the restart proceed without it, and ComfyUI-Manager abort at
+    // import — the original down-server bug, reached through the very rule meant to
+    // stop over-refusing. A config we cannot read tells us nothing, which is the
+    // ambiguous case (codex gate).
+    if (!pathExists(path)) continue;
     try {
-      const raw = readFileSync(joinPath(dataRoot, name), "utf-8");
+      const raw = readFileSync(path, "utf-8");
       // Config files here are a few KB; cap the scan so a pathological file
       // cannot cost anything meaningful.
-      if (raw.slice(0, 512 * 1024).toLowerCase().includes(needle)) return true;
+      if (raw.slice(0, 512 * 1024).toLowerCase().includes(needle)) return "mentions";
     } catch {
-      // Missing or unreadable — not a mention.
+      sawUnreadable = true;
     }
   }
-  return false;
+  return sawUnreadable ? "unreadable" : "absent";
 }
 
 function componentEvidence(
@@ -236,9 +248,12 @@ function componentEvidence(
 ): ComponentEvidence {
   if (resolved) return "resolved";
   if (rootExists) return "ambiguous";
-  return launcherConfigMentions(dataRoot, configNeedle)
-    ? "ambiguous"
-    : "not-installed";
+  // "not-installed" requires BOTH halves of the evidence: the directory absent AND
+  // the launcher's own config silent about it. An unreadable config is neither, so
+  // it stays ambiguous.
+  return launcherConfigMentions(dataRoot, configNeedle) === "absent"
+    ? "not-installed"
+    : "ambiguous";
 }
 
 export function detectStabilityMatrix(

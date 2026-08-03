@@ -43,7 +43,11 @@ const mockLiveRootFromArgv = vi.hoisted(() =>
   vi.fn<[string[], string?], string | undefined>(),
 );
 /** Contents served for `<Data>/settings.json`, or undefined for "no such file". */
-const mockSettingsJsonRef = vi.hoisted(() => ({ value: undefined as string | undefined }));
+const mockSettingsJsonRef = vi.hoisted(() => ({
+  value: undefined as string | undefined,
+  /** The file exists on disk but reading it throws. */
+  unreadable: false,
+}));
 
 vi.mock("../../config.js", () => ({
   config: mockConfig,
@@ -69,8 +73,9 @@ vi.mock("node:fs", () => ({
   // else — /proc reads — is absent, as on the reporter's platform.
   readFileSync: vi.fn((p: string) => {
     const s = String(p);
-    if (mockSettingsJsonRef.value !== undefined && /settings\.jsonc?$/i.test(s)) {
-      return mockSettingsJsonRef.value;
+    if (/settings\.jsonc?$/i.test(s)) {
+      if (mockSettingsJsonRef.unreadable) throw new Error("EACCES");
+      if (mockSettingsJsonRef.value !== undefined) return mockSettingsJsonRef.value;
     }
     throw new Error("ENOENT");
   }),
@@ -124,6 +129,7 @@ const SM_GIT_ROOT = join(SM_DATA, "PortableGit");
 const SM_GIT_DIR = join(SM_GIT_ROOT, "cmd");
 const SM_GIT_EXE = join(SM_GIT_DIR, "git.exe");
 const SM_FFMPEG_ROOT = join(SM_DATA, "Assets", "ffmpeg");
+const SM_SETTINGS = join(SM_DATA, "settings.json");
 const SM_FFMPEG_DIR = join(SM_FFMPEG_ROOT, "bin");
 const SM_FFMPEG_EXE = join(SM_FFMPEG_DIR, "ffmpeg.exe");
 
@@ -217,6 +223,7 @@ beforeEach(() => {
   // override this; every other test just needs the common case not to lie.
   __processControlTestHooks.setParentPidResolver(() => process.pid);
   mockSettingsJsonRef.value = undefined;
+  mockSettingsJsonRef.unreadable = false;
 });
 
 afterEach(() => {
@@ -240,11 +247,14 @@ describe("restart_comfyui — Stability Matrix launcher environment (#776)", () 
     roots?: string[];
     /** Contents of `<Data>/settings.json`, when the test wants one to exist. */
     settingsJson?: string;
+    /** The config file EXISTS but every read of it throws. */
+    settingsUnreadable?: boolean;
   }): void {
     const git = opts?.git ?? true;
     const ffmpeg = opts?.ffmpeg ?? true;
     const roots = opts?.roots ?? [SM_GIT_ROOT, SM_FFMPEG_ROOT];
     mockSettingsJsonRef.value = opts?.settingsJson;
+    mockSettingsJsonRef.unreadable = opts?.settingsUnreadable ?? false;
     mockFindComfyuiPython.mockReturnValue(SM_PY);
     mockLiveRootFromArgv.mockReturnValue(SM_PKG);
     mockGetSystemStats.mockResolvedValue({
@@ -252,12 +262,15 @@ describe("restart_comfyui — Stability Matrix launcher environment (#776)", () 
         argv: [SM_MAIN, "--preview-method", "auto", "--enable-manager"],
       },
     });
+    const configExists =
+      opts?.settingsJson !== undefined || (opts?.settingsUnreadable ?? false);
     mockExistsSync.mockImplementation((p: string) => {
       const s = String(p);
       if (s === SM_MAIN || s === SM_PY) return true;
       if (roots.includes(s)) return true;
       if (git && s === SM_GIT_EXE) return true;
       if (ffmpeg && s === SM_FFMPEG_EXE) return true;
+      if (configExists && s === SM_SETTINGS) return true;
       return false;
     });
   }
@@ -386,6 +399,25 @@ describe("restart_comfyui — Stability Matrix launcher environment (#776)", () 
     expect(result.message).toMatch(/no bundled FFmpeg anywhere under its Data folder/i);
 
     killSpy.mockRestore();
+  });
+
+  it("REFUSES when the launcher's config EXISTS but cannot be read", async () => {
+    // "not-installed" needs BOTH halves: directory absent AND config silent. An
+    // unreadable config is neither — folding it into "no mention" would classify a
+    // missing PortableGit as not-installed, relaunch without it, and let
+    // ComfyUI-Manager abort at import. That is the original down-server bug,
+    // reached through the very rule that stops over-refusing.
+    useStabilityMatrix({
+      git: false,
+      ffmpeg: true,
+      roots: [SM_FFMPEG_ROOT],
+      settingsUnreadable: true,
+    });
+
+    const message = await expectRefusedBeforeStopping();
+
+    expect(message).toMatch(/bundled Git/i);
+    expect(message).toMatch(/Restart ComfyUI from Stability Matrix/i);
   });
 
   it("REFUSES when the launcher's own config names a component whose directory is missing", async () => {
@@ -840,18 +872,21 @@ describe("restart_comfyui — a PID is not a process identity (#776)", () => {
     // The server exited between the port lookup and the stop. Its number may
     // already belong to something else, so nothing may be killed.
     usePlainInstallForIdentity();
+    // Three lookups belong to identifying the server: the one bracketing
+    // /system_stats on each side, and the re-confirmation's. The FOURTH is the
+    // pre-kill re-check — by which point the process has exited on its own.
+    const IDENTIFY_LOOKUPS = 3;
     let netstatCalls = 0;
     mockExecSync.mockImplementation((cmd: string) => {
       if (/netstat/i.test(cmd)) {
         netstatCalls++;
-        // Owned during the lookup; gone by the pre-kill re-check.
-        return netstatCalls <= 1
+        return netstatCalls <= IDENTIFY_LOOKUPS
           ? "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321"
           : "";
       }
       if (/lsof/i.test(cmd)) {
         netstatCalls++;
-        if (netstatCalls > 1) throw new Error("not listening");
+        if (netstatCalls > IDENTIFY_LOOKUPS) throw new Error("not listening");
         return "p4321\nn127.0.0.1:8188\n";
       }
       return "";
@@ -889,6 +924,46 @@ describe("restart_comfyui — a PID is not a process identity (#776)", () => {
     expect(result.started).toBe(false);
     expect(result.message).toMatch(/creation time/i);
     expect(result.message).toMatch(/must not be killed/i);
+    expect(killSpy).not.toHaveBeenCalled();
+    expect(mockSpawn).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  });
+
+  it("REFUSES when the port changes hands around the /system_stats call, even with IDENTICAL argv", async () => {
+    // The re-ask cannot settle this on its own: A answers, A exits, B binds the
+    // port, and if B reports the same argv then both the second answer and the
+    // second port lookup are self-consistent — B is accepted and killed. What B
+    // cannot reproduce is the identity of the port owner BEFORE the HTTP call, so
+    // that observation is what the answer is bracketed by.
+    usePlainInstallForIdentity();
+    let portLookups = 0;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/netstat/i.test(cmd)) {
+        portLookups++;
+        // A owns it during the pre-fetch lookup; B owns it by the post-fetch one.
+        return portLookups <= 1
+          ? "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321"
+          : "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       5555";
+      }
+      if (/lsof/i.test(cmd)) {
+        portLookups++;
+        return portLookups <= 1
+          ? "p4321\nn127.0.0.1:8188\n"
+          : "p5555\nn127.0.0.1:8188\n";
+      }
+      return "";
+    });
+    spawnCapturingChildren();
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(false);
+    expect(result.started).toBe(false);
+    expect(result.message).toMatch(/changed while ComfyUI was being identified/i);
+    expect(result.message).toMatch(/4321/);
+    expect(result.message).toMatch(/5555/);
     expect(killSpy).not.toHaveBeenCalled();
     expect(mockSpawn).not.toHaveBeenCalled();
 
@@ -953,6 +1028,37 @@ describe("restart_comfyui — a PID is not a process identity (#776)", () => {
 
     killSpy.mockRestore();
   });
+
+  it("does NOT report a successful stop when the killed process still holds the port", async () => {
+    // A kill that RETURNS is not proof of death: on POSIX the forced `kill -9` runs
+    // through a shell whose failure is swallowed, so an ignored signal looks exactly
+    // like success. Teardown would then disarm supervision on a live server and
+    // report stopped:true. The port release is the observable that decides.
+    usePlainInstallForIdentity();
+    mockExecSync.mockImplementation((cmd: string) => {
+      // The kill "succeeds" (returns cleanly) but the process never dies, so the
+      // port stays held by the very PID we targeted.
+      if (/taskkill|pkill|\bkill\b/i.test(cmd)) return "";
+      if (/netstat/i.test(cmd)) {
+        return "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
+      }
+      if (/lsof/i.test(cmd)) return "p4321\nn127.0.0.1:8188\n";
+      return "";
+    });
+    spawnCapturingChildren();
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(false);
+    expect(result.started).toBe(false);
+    expect(result.message).toMatch(/still holds port 8188/i);
+    expect(result.message).toMatch(/nothing was torn down/i);
+    // Critically: no relaunch was attempted against a server that is still running.
+    expect(mockSpawn).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  }, 30_000);
 
   it("leaves crash supervision INTACT when the kill itself fails", async () => {
     // `taskkill`/`kill` fail for ordinary reasons — access denied above all — and
@@ -1038,8 +1144,12 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
     // launcher/supervisor bound it while our child failed, the server is up but
     // OUR relaunch did not do it — saying "restarted successfully" would be false.
     usePlainInstall();
-    // The port owner reported after the relaunch (4321) is not our child (999).
+    // The port owner reported after the relaunch (4321) is not our child (999),
+    // and it sits outside our process tree entirely (parented to init).
     spawnCapturingChildren(999);
+    __processControlTestHooks.setParentPidResolver((pid) =>
+      pid === 999 ? process.pid : 1,
+    );
     let killed = false;
     mockExecSync.mockImplementation((cmd: string) => {
       if (/taskkill|pkill|\bkill\b/i.test(cmd)) {
@@ -1295,6 +1405,93 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
     expect(result.listener_ownership).toBe("unconfirmed");
     expect(result.started).toBe(true);
     expect(result.message).not.toMatch(/restarted successfully/i);
+
+    killSpy.mockRestore();
+  });
+
+  it("claims a GRANDCHILD listener as ours — a wrapper/double-fork launch is not a foreign server", async () => {
+    // An indirect launcher (wrapper script, double fork, trampoline) means the
+    // process holding the port is our grandchild, not our child. A direct-child
+    // test would tell that user their own server "was not started by us".
+    usePlainInstall();
+    spawnCapturingChildren(4321);
+    let killed = false;
+    let relaunched = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill|pkill|\bkill\b/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (/netstat/i.test(cmd)) {
+        // After the relaunch a DIFFERENT pid (our grandchild) holds the port.
+        return killed && !relaunched
+          ? ""
+          : `  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       ${relaunched ? 9999 : 4321}`;
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed && !relaunched) throw new Error("not listening");
+        return `p${relaunched ? 9999 : 4321}\nn127.0.0.1:8188\n`;
+      }
+      return "";
+    });
+    // 9999's parent is 4321 (the child we spawned), whose parent is us.
+    __processControlTestHooks.setParentPidResolver((pid) =>
+      pid === 9999 ? 4321 : pid === 4321 ? process.pid : 1,
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        relaunched = true;
+        return { ok: true } as Response;
+      }),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.listener_ownership).toBe("ours");
+    expect(result.started).toBe(true);
+    expect(result.message).toMatch(/restarted successfully/i);
+
+    killSpy.mockRestore();
+  });
+
+  it("reports a listener OUTSIDE our process tree as not-ours", async () => {
+    usePlainInstall();
+    spawnCapturingChildren(4321);
+    let killed = false;
+    let relaunched = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill|pkill|\bkill\b/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (/netstat/i.test(cmd)) {
+        return killed && !relaunched
+          ? ""
+          : `  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       ${relaunched ? 9999 : 4321}`;
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed && !relaunched) throw new Error("not listening");
+        return `p${relaunched ? 9999 : 4321}\nn127.0.0.1:8188\n`;
+      }
+      return "";
+    });
+    // 9999 belongs to some other launcher's tree, rooted at init.
+    __processControlTestHooks.setParentPidResolver((pid) => (pid === 9999 ? 1 : process.pid));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        relaunched = true;
+        return { ok: true } as Response;
+      }),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.listener_ownership).toBe("not-ours");
+    expect(result.started).toBe(false);
 
     killSpy.mockRestore();
   });

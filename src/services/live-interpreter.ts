@@ -111,6 +111,13 @@ export interface ProcessIdentity {
   /** Process creation time, in whatever stable form the platform provides. Only ever
    *  compared against another reading taken on the SAME platform. */
   startedAt?: string;
+  /**
+   * The process's PARENT pid. Read in the same OS call as the rest, because
+   * process-control uses it to prove that the process serving ComfyUI's port
+   * really is the child it spawned (#776) — lineage is the one identity signal
+   * that does not depend on WHEN it is read.
+   */
+  parentPid?: number;
 }
 
 /**
@@ -128,6 +135,12 @@ export interface ProcessIdentity {
  * through the venv symlink to the base interpreter.
  * macOS: `ps -o lstart=,command=`.
  */
+function parsePid(raw: string | undefined): number | undefined {
+  if (raw == null) return undefined;
+  const parsed = Number.parseInt(raw.trim(), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
 export function readProcessIdentity(pid: number): ProcessIdentity | undefined {
   try {
     if (IS_WIN) {
@@ -137,41 +150,58 @@ export function readProcessIdentity(pid: number): ProcessIdentity | undefined {
           "-NoProfile",
           "-Command",
           `$p = Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}"; ` +
-            `if ($p) { "START=" + $p.CreationDate.ToFileTimeUtc(); "CMD=" + $p.CommandLine }`,
+            `if ($p) { "START=" + $p.CreationDate.ToFileTimeUtc(); "PPID=" + $p.ParentProcessId; "CMD=" + $p.CommandLine }`,
         ],
         { encoding: "utf-8", timeout: 8000, windowsHide: true },
       );
       const startedAt = out.match(/^START=(.+)$/m)?.[1]?.trim();
+      // PPID before CMD in the output so a multi-line command line (captured with
+      // [\s\S]) cannot swallow it.
+      const parentPid = parsePid(out.match(/^PPID=(.+)$/m)?.[1]);
       const commandLine = out.match(/^CMD=([\s\S]*)$/m)?.[1]?.trim();
       if (!startedAt && !commandLine) return undefined;
-      return { commandLine: commandLine || undefined, startedAt: startedAt || undefined };
+      return {
+        commandLine: commandLine || undefined,
+        startedAt: startedAt || undefined,
+        parentPid,
+      };
     }
     if (platform() === "linux") {
       // argv entries are "\u0000"-separated; rejoin them as a command line.
       const raw = readFileSync(`/proc/${pid}/cmdline`, "utf-8");
       const commandLine = raw.split("\u0000").filter(Boolean).join(" ").trim();
       let startedAt: string | undefined;
+      let parentPid: number | undefined;
       try {
         const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
         // Field 2 (comm) can contain spaces and parens — parse after the LAST ')'.
         const after = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/);
         // After comm, fields run state(3)… so starttime (field 22) is index 19 here.
         startedAt = after[19];
+        // ppid is field 4, i.e. index 1 in this same post-comm numbering.
+        parentPid = parsePid(after[1]);
       } catch {
         /* start time unavailable → the launched-by-us tier fails closed */
       }
       if (!commandLine && !startedAt) return undefined;
-      return { commandLine: commandLine || undefined, startedAt };
+      return { commandLine: commandLine || undefined, startedAt, parentPid };
     }
-    const out = execFileSync("ps", ["-p", String(pid), "-o", "lstart=,command="], {
-      encoding: "utf-8",
-      timeout: 8000,
-    }).trim();
+    const out = execFileSync(
+      "ps",
+      ["-p", String(pid), "-o", "ppid=,lstart=,command="],
+      { encoding: "utf-8", timeout: 8000 },
+    ).trim();
     if (!out) return undefined;
-    // `lstart` is a ctime-style stamp: "Fri Aug  1 12:00:00 2026".
-    const m = out.match(/^(\w{3}\s+\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+([\s\S]*)$/);
+    // `ppid` first, then `lstart` (a ctime-style stamp: "Fri Aug  1 12:00:00 2026").
+    const m = out.match(
+      /^\s*(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+([\s\S]*)$/,
+    );
     if (!m) return { commandLine: out };
-    return { startedAt: m[1].replace(/\s+/g, " "), commandLine: m[2].trim() };
+    return {
+      parentPid: parsePid(m[1]),
+      startedAt: m[2].replace(/\s+/g, " "),
+      commandLine: m[3].trim(),
+    };
   } catch {
     return undefined;
   }
