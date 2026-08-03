@@ -691,24 +691,32 @@ export class ClaudeBackend implements AgentBackend {
         // is unrecoverable once crossed, so the poison is terminal for the
         // session — content evidence must not rescue it (it accrued to a
         // mismatched trace, which is not proof of ITS turn's success).
-        // An INTERRUPTED-subtype landing does not skip. SEQUENTIAL-EMISSION
-        // INVARIANT (#728 r8): the SDK emits results in processing order — a
-        // turn's result ALWAYS precedes the next turn's result in the stream,
-        // so the oldest LIVE (unparked) interrupted trace owns the next
-        // landing. A turn is only ever written off by a NON-interrupted result
-        // passing it (the r5 skip parks it — its result is then provably lost),
-        // NEVER by preference: a newer interrupted turn's trace can exist while
-        // an older turn is still settling (queued input), and the older turn's
-        // legitimate landing MUST still pop the older trace. The parked
-        // fallback below is the tolerance for a write-off that proved wrong
-        // (a genuinely late landing for an already-parked turn). Each trace
-        // lands at most once: landed parks move to consumedInterrupted, so a
-        // SECOND landing for the same turn finds no candidate and fails closed
-        // (traceless) below.
+        // SUBTYPE-AWARE correlation on the SDK's REAL result vocabulary
+        // (#728 r5–r9): results arrive as `success` or `error_*` — an
+        // interrupted turn ends with an error_during_execution result (the
+        // interrupt landing); there is no "interrupted" result subtype.
+        // Combined with SEQUENTIAL EMISSION (results always emit in processing
+        // order — a turn's result ALWAYS precedes the next turn's result in
+        // the stream):
+        //  • A SUCCESS landing can never belong to an interrupted-marked turn,
+        //    so if the oldest trace is interrupted and a newer trace exists,
+        //    that turn's result is permanently LOST — skip (park) the
+        //    interrupted trace(s) and pop the first non-interrupted one (the
+        //    r5 skip). This is the ONLY write-off; never by preference.
+        //  • An error_* landing belongs to the OLDEST LIVE (unparked) trace —
+        //    interrupted turn or not (a healthy turn's genuine failure is
+        //    likewise its own). A newer interrupted turn's trace may exist
+        //    while the older turn is still settling (queued input); the older
+        //    turn's legitimate landing MUST still pop the older trace. Only
+        //    when no live candidate remains is the landing a parked trace's
+        //    own late one (a write-off that proved wrong). Each trace lands at
+        //    most once: landed parks move to consumedInterrupted, so a SECOND
+        //    landing for the same turn finds no candidate and fails closed
+        //    (traceless) below.
         const resultSubtype: string = message.subtype;
-        const interruptedLanding = resultSubtype === "interrupted";
+        const successLanding = resultSubtype === "success";
         let trace: (typeof this.turns)[number] | null = null;
-        if (!interruptedLanding) {
+        if (successLanding) {
           let traceIndex = 0;
           while (traceIndex < this.turns.length - 1 && this.turns[traceIndex].interrupted) {
             this.parkedInterrupted.add(this.turns[traceIndex].id);
@@ -716,16 +724,13 @@ export class ClaudeBackend implements AgentBackend {
           }
           trace = traceIndex === 0 ? (this.turns.shift() ?? null) : (this.turns.splice(traceIndex, 1)[0] ?? null);
         } else {
-          // Oldest LIVE (unparked) interrupted trace first; a parked trace's
-          // result was already written off, so only when no live candidate
-          // remains is the landing a parked trace's own late one.
-          let idx = this.turns.findIndex((t) => t.interrupted && !this.parkedInterrupted.has(t.id));
+          // Oldest LIVE (unparked) trace first — interrupted or not; a parked
+          // trace's result was already written off, so only when no live
+          // candidate remains is the landing a parked trace's own late one.
+          let idx = this.turns.findIndex((t) => !this.parkedInterrupted.has(t.id));
           if (idx < 0) {
             idx = this.turns.findIndex(
-              (t) =>
-                t.interrupted &&
-                this.parkedInterrupted.has(t.id) &&
-                !this.consumedInterrupted.has(t.id),
+              (t) => this.parkedInterrupted.has(t.id) && !this.consumedInterrupted.has(t.id),
             );
           }
           trace = idx >= 0 ? (this.turns.splice(idx, 1)[0] ?? null) : null;
@@ -770,12 +775,14 @@ export class ClaudeBackend implements AgentBackend {
         // subtype-aware skip). A traceless result stays UNMARKED so its
         // fail-closed error and gate completion still reach the panel.
         const stamp = trace ? { turn: trace.id - this.markerBase } : {};
-        // An interrupted turn's terminal (subtype "interrupted") is the
-        // interrupt LANDING for its own interrupted trace, not a failure —
-        // blessed like a success; the empty-turn guard below still spares it.
+        // An interrupted turn's terminal (an error_during_execution landing for
+        // its own interrupted-marked trace) is the interrupt LANDING, not a
+        // failure — blessed like a success; the empty-turn guard below still
+        // spares it. Any other error_* subtype classifies by the trace's own
+        // flags (a genuine failure for a non-interrupted turn).
         let ok =
           resultSubtype === "success" ||
-          (resultSubtype === "interrupted" && trace !== null && trace.interrupted);
+          (resultSubtype === "error_during_execution" && trace !== null && trace.interrupted);
         if (unverifiable !== null) {
           // Fail closed with the reason VISIBLE — including an anomalous
           // interrupted landing with no unconsumed candidate (#728 r6), whose

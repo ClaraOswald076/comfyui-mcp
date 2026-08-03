@@ -84,9 +84,10 @@ const INIT = {
 
 const RESULT_SUCCESS = { type: "result", subtype: "success" };
 
-/** The interrupt landing (#728 r5 contract: an interrupted turn ends with an
- *  INTERRUPTED-subtype result). */
-const RESULT_INTERRUPTED = { type: "result", subtype: "interrupted" };
+/** The interrupt landing in the SDK's REAL result vocabulary (#728 r9: an
+ *  interrupted turn ends with an error_during_execution result — there is no
+ *  "interrupted" result subtype). */
+const RESULT_INTERRUPTED = { type: "result", subtype: "error_during_execution" };
 
 function assistantMsg(text: string) {
   return {
@@ -143,8 +144,8 @@ describe("Claude backend turn markers (#728 r4)", () => {
 
     // B's valid stream event WHILE A's result is still missing.
     hoisted.queue.push(assistantMsg("B working"));
-    // A's LATE result — the interrupt landing, subtype "interrupted" per the
-    // SDK contract (#728 r5; a success subtype here would correlate to the
+    // A's LATE result — the interrupt landing (error_during_execution in the
+    // SDK's real vocabulary; a success subtype here would correlate to the
     // NEWER turn, not A)…
     hoisted.queue.push(RESULT_INTERRUPTED);
     // …then B's result-only terminal.
@@ -196,12 +197,12 @@ describe("Claude backend turn markers (#728 r4)", () => {
 
   it("permanent loss: B's terminal classifies/stamps as B when A's result never arrives (#728 r5)", async () => {
     // The r5 codex-gate finding: A is interrupted and its result NEVER arrives
-    // (permanent loss). The SDK contract is that an interrupted turn ends with
-    // an INTERRUPTED-subtype result, so B's success terminal can never be A's
-    // terminal — the oldest (interrupted) trace is skipped/parked and B's
-    // terminal pops/stamps B's OWN trace. (Blind FIFO would pop A's trace:
-    // B's terminal would be blessed by A's interrupt and stamped 1 — blessed
-    // AND dead-lettered by the panel: a permanent wedge.)
+    // (permanent loss). In the SDK's real result vocabulary an interrupted turn
+    // ends with an error_during_execution result, so B's success terminal can
+    // never be A's terminal — the oldest (interrupted) trace is skipped/parked
+    // and B's terminal pops/stamps B's OWN trace. (Blind FIFO would pop A's
+    // trace: B's terminal would be blessed by A's interrupt and stamped 1 —
+    // blessed AND dead-lettered by the panel: a permanent wedge.)
     let releaseTurnB!: () => void;
     const gate = new Promise<void>((resolve) => {
       releaseTurnB = resolve;
