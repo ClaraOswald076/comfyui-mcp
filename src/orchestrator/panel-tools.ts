@@ -779,10 +779,14 @@ interface DeclineProbeOutcome {
    *               back healthy inside the window (a genuine restart's down
    *               window — NEVER a lost server, codex gate).
    * "down"      — no healthy sample AND the LAST sample taken within the
-   *               window was a proven down. Only this may be reported as
-   *               a loss — a single refused sample never suffices.
+   *               window was a proven down AND the FULL window ran its
+   *               course (the deadline did not truncate it — a truncated
+   *               observation can't prove permanence, codex gate r3). Only
+   *               this may be reported as a loss — a single refused sample,
+   *               or a shortened window, never suffices.
    * "ambiguous" — anything else (no healthy sample, last sample not a proven
-   *               down) — the plain cancel line, never alarmist.
+   *               down, or a truncated window) — the plain cancel line,
+   *               never alarmist.
    */
   status: "healthy" | "recovered" | "down" | "ambiguous";
   attempts: number;
@@ -794,10 +798,12 @@ interface DeclineProbeOutcome {
  * (clamped to `deadline`) so a server that is merely mid-restart is not
  * falsely declared lost on a single ECONNREFUSED. Samples immediately, then
  * sleeps intervalMs between samples — "still refused at the END of the
- * window" is the only down verdict. The deadline is HARD (codex gate r2): no
- * awaited probe may START once the remaining budget is exhausted — the loop
- * stops and the verdict falls to the last known state (or "ambiguous" when
- * nothing was sampled). Never throws.
+ * window" is the only down verdict, and ONLY when the full window ran: a
+ * deadline that truncates the window downgrades the verdict to "ambiguous"
+ * regardless of the samples taken (r3). The deadline is HARD (codex gate
+ * r2): no awaited probe may START once the remaining budget is exhausted —
+ * the loop stops and the verdict falls to the last known state (or
+ * "ambiguous" when nothing was sampled). Never throws.
  */
 async function probeDeclineRecovery(
   base: string | null,
@@ -807,7 +813,11 @@ async function probeDeclineRecovery(
   deadline: number,
 ): Promise<DeclineProbeOutcome> {
   const start = Date.now();
-  const end = Math.min(start + Math.max(1, windowMs), deadline);
+  const windowEnd = start + Math.max(1, windowMs);
+  const end = Math.min(windowEnd, deadline);
+  // r3: a window the deadline cuts short can never prove permanence — DOWN
+  // requires the FULL recheck window to have run its course.
+  const truncated = end < windowEnd;
   const probe = healthProbeOverride ?? probeComfyEndpoint;
   let attempts = 0;
   let sawDown = false;
@@ -840,7 +850,7 @@ async function probeDeclineRecovery(
     await new Promise((r) => setTimeout(r, Math.max(1, Math.min(intervalMs, left))));
   }
   return {
-    status: last === "down" ? "down" : "ambiguous",
+    status: last === "down" && !truncated ? "down" : "ambiguous",
     attempts,
     waited_ms: Date.now() - start,
   };

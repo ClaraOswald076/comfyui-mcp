@@ -256,9 +256,43 @@ describe("panel_restart_comfyui — decline truthfulness (#742)", () => {
       // clamped 1ms timeout.
       expect(starts.map((s) => s - t0)).toEqual([0, 5, 10, 15]);
       expect(out.attempts).toBe(4);
-      // The verdict is the last known state, and the elapsed time respects the
-      // deadline (nowhere near the 5000ms window).
-      expect(out.status).toBe("down");
+      // The elapsed time respects the deadline (nowhere near the 5000ms window).
+      expect(out.waited_ms).toBeLessThanOrEqual(25);
+      // r3: the deadline TRUNCATED the window — a truncated observation can't
+      // prove permanence, so even an all-refused run is "ambiguous", NEVER
+      // "down" (a lost-server report requires the FULL window).
+      expect(out.status).toBe("ambiguous");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("recheck loop returns DOWN only when the FULL window ran with final refusal (r3)", async () => {
+    // The window completes well before the deadline: every sample refused, so
+    // the full-window observation DOES prove the server stayed down.
+    vi.useFakeTimers();
+    try {
+      const starts: number[] = [];
+      __panelToolsTestHooks.setHealthProbe(async () => {
+        starts.push(Date.now());
+        return "down";
+      });
+      const t0 = Date.now();
+      const pending = __panelToolsTestHooks.probeDeclineRecovery(
+        null,
+        20, // windowMs — completes at +20ms…
+        5,
+        5,
+        t0 + 10000, // …with the deadline far beyond it (no truncation)
+      );
+      await vi.advanceTimersByTimeAsync(1000);
+      const out = await pending;
+
+      // Samples at 0/5/10/15ms; the window's own end stops the loop (no probe
+      // starts at +20 with an exhausted remainder).
+      expect(starts.map((s) => s - t0)).toEqual([0, 5, 10, 15]);
+      expect(out.attempts).toBe(4);
+      expect(out.status).toBe("down"); // full-window refusal → provable loss
       expect(out.waited_ms).toBeLessThanOrEqual(25);
     } finally {
       vi.useRealTimers();
