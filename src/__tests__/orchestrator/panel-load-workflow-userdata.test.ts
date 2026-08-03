@@ -372,9 +372,12 @@ describe("readWorkflowFromPath: a refusal is never mistaken for an unreachable s
     });
   });
 
-  it("applies the client's own request headers", async () => {
-    // The direct fetch must not drop what fetchApi used to add (Comfy-User, Accept,
-    // and the injected COMFYUI_AUTH_* handling that lives in the client's fetch).
+  it("passes the client's own apiHeaders() to the client's own fetch", async () => {
+    // Bypassing fetchApi must not drop what it used to assemble. What this asserts
+    // is exactly that: the headers the CLIENT produced reach the fetch the CLIENT
+    // was configured with. COMFYUI_AUTH_* injection is not exercised here — it
+    // lives inside that configured fetch (comfyuiFetch), so calling the client's
+    // own `fetch` is what preserves it, and that is what is checked.
     fetchApi.mockResolvedValue({
       ok: true,
       status: 200,
