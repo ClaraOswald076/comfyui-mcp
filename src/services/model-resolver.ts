@@ -1401,13 +1401,12 @@ async function assertNoEscapingSymlinkAncestor(
   // custom_nodes also feed the veto.
   let live: Awaited<ReturnType<typeof getLiveExtraModelRoots>> = {
     authoritative: false,
-    exhaustive: false,
     roots: [],
   };
   try {
     live = await getLiveExtraModelRoots(liveSnapshot);
   } catch {
-    live = { authoritative: false, exhaustive: false, roots: [] };
+    live = { authoritative: false, roots: [] };
   }
   for (const er of live.roots) {
     if (isCodeCategory(er.category)) codeRoots.push(await canon(er.dir));

@@ -1240,6 +1240,12 @@ describe("resolveComfyuiPython live-first (#401 / #433)", () => {
 // a DIFFERENT install the running server never reads from.
 // ---------------------------------------------------------------------------
 describe("resolveLiveServerRoot (#369)", () => {
+  // Build the relative argv with join(), NEVER a hardcoded "ComfyUI\\main.py".
+  // node's path.dirname only treats "\" as a separator on Windows, so a backslash
+  // literal parses as the single filename "ComfyUI\main.py" on POSIX — relDir comes
+  // back "." and the entire shape under test evaporates. These passed locally on
+  // Windows and failed on the macOS CI leg for exactly that reason. join() produces
+  // the form each platform's ComfyUI actually reports.
   /** Portable Windows bundle: <root>/python_embeded/python.exe + <root>/ComfyUI/main.py */
   async function makePortableBundle(
     base: string,
@@ -1278,7 +1284,7 @@ describe("resolveLiveServerRoot (#369)", () => {
       mockConfig.comfyuiPath = stale;
 
       const res = resolveLiveServerRoot(
-        ["ComfyUI\\main.py", "--windows-standalone-build"],
+        [join("ComfyUI", "main.py"), "--windows-standalone-build"],
         undefined,
         { observedPython: python },
       );
@@ -1325,7 +1331,7 @@ describe("resolveLiveServerRoot (#369)", () => {
 
   it("stays UNRESOLVED when nothing observes the process — never a layout guess", () => {
     h.mockLiveInterpreter.mockReturnValue(undefined);
-    const res = resolveLiveServerRoot(["ComfyUI\\main.py"]);
+    const res = resolveLiveServerRoot([join("ComfyUI", "main.py")]);
     expect(res.source).toBe("unresolved");
     expect(res.root).toBeUndefined();
     expect(res.relDir).toBe("ComfyUI");
@@ -1345,7 +1351,7 @@ describe("resolveLiveServerRoot (#369)", () => {
       const python = join(sysDir, IS_WIN ? "python.exe" : "python3");
       await writeFile(python, "", "utf-8");
 
-      const res = resolveLiveServerRoot(["ComfyUI\\main.py"], undefined, {
+      const res = resolveLiveServerRoot([join("ComfyUI", "main.py")], undefined, {
         observedPython: python,
       });
       expect(res.source).toBe("unresolved");
@@ -1371,7 +1377,7 @@ describe("resolveLiveServerRoot (#369)", () => {
       const siblingPython = join(sibling, basename(python));
       await writeFile(siblingPython, "", "utf-8");
 
-      const res = resolveLiveServerRoot(["ComfyUI\\main.py"], undefined, {
+      const res = resolveLiveServerRoot([join("ComfyUI", "main.py")], undefined, {
         observedPython: siblingPython,
       });
       expect(res.source).toBe("unresolved");
@@ -1387,7 +1393,7 @@ describe("resolveLiveServerRoot (#369)", () => {
       // A system python with no ComfyUI anywhere above it.
       const python = join(dir, IS_WIN ? "python.exe" : "python3");
       await writeFile(python, "", "utf-8");
-      const res = resolveLiveServerRoot(["ComfyUI\\main.py"], undefined, {
+      const res = resolveLiveServerRoot([join("ComfyUI", "main.py")], undefined, {
         observedPython: python,
       });
       expect(res.source).toBe("unresolved");
@@ -1401,7 +1407,7 @@ describe("resolveLiveServerRoot (#369)", () => {
     const dir = await tmpDir();
     try {
       const { python } = await makePortableBundle(dir);
-      const res = resolveLiveServerRoot(["ComfyUI\\main.py"], undefined, {
+      const res = resolveLiveServerRoot([join("ComfyUI", "main.py")], undefined, {
         observedPython: python,
         remote: true,
       });

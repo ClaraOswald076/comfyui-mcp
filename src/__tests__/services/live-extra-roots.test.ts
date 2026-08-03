@@ -119,51 +119,6 @@ describe("getLiveExtraModelRoots — fail-closed authorization", () => {
     const res = await getLiveExtraModelRoots(reachable(["python", "main.py"]));
     expect(res.authoritative).toBe(true);
     expect(res.roots).toEqual([]);
-    // No config to read and none named: nothing was missed, so this genuinely IS
-    // the complete root set. A caller may reason from the absence of a root here.
-    expect(res.exhaustive).toBe(true);
-  });
-
-  // `authoritative` and `exhaustive` are different claims (#369): the first says the
-  // listed roots reflect the live snapshot, the second that NONE were missed. Only
-  // the second licenses reasoning from a root's ABSENCE.
-  describe("exhaustive — were all roots enumerable?", () => {
-    it("is NOT exhaustive when a RELATIVE --extra-model-paths-config had to be skipped", async () => {
-      const res = await getLiveExtraModelRoots(
-        reachable(["python", "main.py", "--extra-model-paths-config", "cfg/extra.yaml"]),
-      );
-      expect(res.authoritative).toBe(true);
-      expect(res.exhaustive).toBe(false);
-    });
-
-    it("is NOT exhaustive when a LAUNCHED config no longer exists on disk", async () => {
-      // The running server still holds the roots that file gave it at startup.
-      const dir = await trackTmp();
-      const missing = join(dir, "gone.yaml");
-      const res = await getLiveExtraModelRoots(
-        reachable(["python", "main.py", "--extra-model-paths-config", missing]),
-      );
-      expect(res.authoritative).toBe(true);
-      expect(res.exhaustive).toBe(false);
-    });
-
-    it("is NOT exhaustive when a group is DROPPED for an unresolvable env var", async () => {
-      // A separately-launched server's environment is not ours, so this group's roots
-      // are unknown — not absent. Refusing on that basis blocked a legitimate
-      // external-drive install.
-      const liveRoot = await trackTmp();
-      await writeFile(
-        join(liveRoot, "extra_model_paths.yaml"),
-        ["grp:", "  base_path: ${MODELS_DRIVE}/models", "  loras: loras"].join("\n"),
-        "utf-8",
-      );
-      const res = await getLiveExtraModelRoots(
-        reachable(["python", join(liveRoot, "main.py")]),
-      );
-      expect(res.authoritative).toBe(true);
-      expect(res.roots).toEqual([]);
-      expect(res.exhaustive).toBe(false);
-    });
   });
 
   it("expands a base_path '~' to the home dir (ComfyUI expanduser) → ABSOLUTE, not <cfgDir>/~", async () => {

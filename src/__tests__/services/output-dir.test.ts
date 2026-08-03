@@ -291,7 +291,7 @@ describe("models dir + extra-config argv parsing (#345/#346/#369)", () => {
   // a second, stale install and then reported it as a success.
   // -------------------------------------------------------------------------
   describe("#369 relative argv main.py with no server cwd", () => {
-    const RELATIVE_ARGV = ["ComfyUI\\main.py", "--windows-standalone-build"];
+    const RELATIVE_ARGV = [join("ComfyUI", "main.py"), "--windows-standalone-build"];
 
     it("the LIVE server wins over a disagreeing COMFYUI_PATH when the OS observes the process", async () => {
       const liveRoot = resolve("/portable2/ComfyUI");

@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, vi } from "vitest";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 
 // ---------------------------------------------------------------------------
 // #369 — "download_model reports success, the model never appears".
@@ -27,7 +27,7 @@ const h = vi.hoisted(() => ({
   fetchCalls: [] as string[],
   /** What getLiveExtraModelRoots reports — only an AUTHORITATIVE, EMPTY answer can
    *  rule out "the server's models live on another drive". */
-  liveExtraRoots: { authoritative: false, exhaustive: false, roots: [] as unknown[] },
+  liveExtraRoots: { authoritative: false, roots: [] as unknown[] },
   /** Does the resolved models root exist on THIS filesystem? */
   modelsRootExists: true,
   /** The models root resolveModelsDirWithBases reports (the download destination). */
@@ -52,7 +52,7 @@ vi.mock("../../config.js", () => ({
 }));
 
 vi.mock("../../comfyui/client.js", () => ({
-  getSystemStats: vi.fn(async () => ({ system: { argv: ["ComfyUI\\main.py"] } })),
+  getSystemStats: vi.fn(async () => ({ system: { argv: [join("ComfyUI", "main.py")] } })),
   getClient: () => ({
     fetchApi: async (path: string) => {
       h.fetchCalls.push(path);
@@ -131,7 +131,7 @@ beforeEach(() => {
   h.onDisk = {};
   h.modelsDirSource = "configured-base";
   h.fetchCalls = [];
-  h.liveExtraRoots = { authoritative: false, exhaustive: false, roots: [] };
+  h.liveExtraRoots = { authoritative: false, roots: [] };
   h.modelsRootExists = true;
   h.destModelsDir = "/comfy/models";
   // Absolute argv main.py: the live install root resolves, so the server's
@@ -230,7 +230,7 @@ describe("pre-write: a destination the LIVE server does not read from is refused
     h.liveListings["loras"] = [];
     h.liveListings["checkpoints"] = [];
     h.liveListings["text_encoders"] = ["t5xxl.safetensors"];
-    h.liveExtraRoots = { authoritative: true, exhaustive: true, roots: [] };
+    h.liveExtraRoots = { authoritative: true, roots: [] };
     await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBe(
       resolve("/comfy/models/loras"),
     );
@@ -265,7 +265,7 @@ describe("pre-write: a destination the LIVE server does not read from is refused
     h.onDisk = { loras: [], checkpoints: [] };
     h.liveListings["loras"] = ["a.safetensors", "b.safetensors"];
     h.liveListings["checkpoints"] = ["c.safetensors"];
-    h.liveExtraRoots = { authoritative: true, exhaustive: true, roots: [] };
+    h.liveExtraRoots = { authoritative: true, roots: [] };
     await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBe(
       resolve("/comfy/models/loras"),
     );
@@ -277,7 +277,7 @@ describe("pre-write: a destination the LIVE server does not read from is refused
     // blocked the user from downloading into a perfectly valid primary tree.
     h.onDisk = { loras: [] };
     h.liveListings["loras"] = ["live-only.safetensors"];
-    h.liveExtraRoots = { authoritative: true, exhaustive: true, roots: [] };
+    h.liveExtraRoots = { authoritative: true, roots: [] };
     await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBe(
       resolve("/comfy/models/loras"),
     );
@@ -286,7 +286,7 @@ describe("pre-write: a destination the LIVE server does not read from is refused
   it("PROCEEDS on a brand-new models tree (a fresh install's first model)", async () => {
     h.onDisk = { loras: [] };
     h.liveListings["loras"] = [];
-    h.liveExtraRoots = { authoritative: true, exhaustive: true, roots: [] };
+    h.liveExtraRoots = { authoritative: true, roots: [] };
     await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBe(
       resolve("/comfy/models/loras"),
     );
@@ -319,7 +319,7 @@ describe("pre-write: a destination the LIVE server does not read from is refused
     h.modelsRootExists = false;
     h.onDisk = {}; // nothing on the host at that path
     h.liveListings["loras"] = ["a.safetensors", "b.safetensors"];
-    h.liveExtraRoots = { authoritative: true, exhaustive: true, roots: [] };
+    h.liveExtraRoots = { authoritative: true, roots: [] };
     await expect(resolveModelSubfolderPreferServer("loras")).resolves.toBeTruthy();
   });
 
@@ -494,7 +494,7 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
     h.modelsDirSource = "observed-root";
     h.destModelsDir = "/serverB/models"; // the CURRENT live root
     h.liveListings["loras"] = ["new.safetensors"]; // B's own same-named model
-    h.liveExtraRoots = { authoritative: true, exhaustive: true, roots: [] };
+    h.liveExtraRoots = { authoritative: true, roots: [] };
     const res = await verifyLandedModel(target, "loras", {
       attempts: 1,
       retryMs: 0,
@@ -509,7 +509,7 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
     // and lists its OWN same-named model. That must not confirm A's file.
     h.modelsDirSource = "observed-root";
     h.destModelsDir = "/live/ComfyUI/models"; // A: the landed file IS under this
-    h.liveExtraRoots = { authoritative: true, exhaustive: true, roots: [] };
+    h.liveExtraRoots = { authoritative: true, roots: [] };
     h.liveListings["loras"] = ["new.safetensors"];
     let calls = 0;
     resolveModelsDirWithBasesMock.mockImplementation(async () => {
@@ -585,7 +585,7 @@ describe("post-write: the reported path is VERIFIED, not intended (#369)", () =>
     });
     h.modelsDirSource = "observed-root";
     h.destModelsDir = "/comfy/models";
-    h.liveExtraRoots = { authoritative: true, exhaustive: true, roots: [] };
+    h.liveExtraRoots = { authoritative: true, roots: [] };
     h.liveListings["loras"] = ["new.safetensors"];
     const res = await verifyLandedModel(target, "loras", {
       attempts: 1,

@@ -967,44 +967,26 @@ export async function getExtraModelRoots(
  * Returns `authoritative: false` (and no roots) whenever the server was unreachable,
  * so the caller REFUSES every escaping symlink rather than authorize from a guess.
  *
- * `authoritative` and `exhaustive` are DIFFERENT claims and must not be conflated:
- *   - `authoritative` — these roots reflect the LIVE snapshot, so each one listed can
- *     be trusted to authorize a write. This is what the #633 symlink allowance needs.
- *   - `exhaustive` — every root this server could have was actually enumerable. False
- *     when a relative `--extra-model-paths-config` had to be skipped, a config file
- *     was unreadable, or a group was dropped because its `base_path` needed an env
- *     var belonging to a separately-launched server.
- *
- * A caller reasoning from a root's ABSENCE ("the server registers nothing that could
- * hold these models") needs `exhaustive`. Reading `authoritative` for that refused a
- * legitimate external-drive install whose config used a server-only env var (codex
- * gate, round 18). Never throws.
+ * `authoritative` says the roots LISTED can be trusted — it does NOT say they are all
+ * the roots this server has. Several paths deliberately drop roots and still return
+ * authoritative: a relative `--extra-model-paths-config` we cannot locate, a config
+ * that is unreadable or was deleted after the server loaded it, and a group whose
+ * `base_path` needs an env var belonging to a separately-launched server. So a caller
+ * must NEVER reason from a root's ABSENCE here ("the server registers nothing that
+ * could hold these models") — doing that refused a legitimate external-drive install
+ * outright (#369). Absence of a root is not evidence; if a future caller genuinely
+ * needs that inference it has to be built and TESTED alongside its consumer.
+ * Never throws.
  */
 export async function getLiveExtraModelRoots(
   snapshot: LiveServerSnapshot,
-): Promise<{ authoritative: boolean; exhaustive: boolean; roots: ExtraModelRoot[] }> {
-  if (!snapshot?.reachable) return { authoritative: false, exhaustive: false, roots: [] };
+): Promise<{ authoritative: boolean; roots: ExtraModelRoot[] }> {
+  if (!snapshot?.reachable) return { authoritative: false, roots: [] };
   const argv = snapshot.argv;
   const configPaths = new Set<string>();
-  // Did we manage to READ every source of roots this server could have? Distinct from
-  // `authoritative` (see the return docs): a RELATIVE config flag we must skip, an
-  // unreadable config, or a group dropped for an unresolvable env var each leave roots
-  // we never saw. A caller reasoning from a root's ABSENCE needs THIS, not
-  // `authoritative` (codex gate, round 18).
-  let exhaustive = true;
-  /** Configs the server was EXPLICITLY launched with. Their absence is meaningful;
-   *  the implicit default's absence is not (most installs have no
-   *  `extra_model_paths.yaml` at all). */
-  const explicitConfigs = new Set<string>();
   // Launched flag files — ABSOLUTE values only (relative → fail closed, see docblock).
   for (const raw of parseExtraModelPathsConfigsFromArgvRaw(argv)) {
-    if (isAbsolute(raw)) {
-      const abs = resolve(raw);
-      configPaths.add(abs);
-      explicitConfigs.add(abs);
-    } else {
-      exhaustive = false; // a config we cannot locate may register anything
-    }
+    if (isAbsolute(raw)) configPaths.add(resolve(raw));
   }
   // Auto-loaded default in the LIVE install root (its main.py dir). Skip in remote
   // mode: the live root is a path on the remote host.
@@ -1027,15 +1009,11 @@ export async function getLiveExtraModelRoots(
 
   const roots: ExtraModelRoot[] = [];
   for (const cfg of configPaths) {
-    if (!existsSync(cfg)) {
-      // A config the server was LAUNCHED with but that is no longer on disk (moved or
-      // deleted since startup) still governs the roots the running process holds in
-      // memory — its roots are UNKNOWN to us, not absent (codex gate, round 18). The
-      // implicit `<live root>/extra_model_paths.yaml` is different: most installs
-      // simply do not have one, so its absence is normal and proves nothing either way.
-      if (explicitConfigs.has(cfg)) exhaustive = false;
-      continue;
-    }
+    // A config that is gone (never existed, or deleted since the server loaded it)
+    // contributes no roots here — but the RUNNING process may still hold the roots it
+    // gave at startup. That is why no caller may treat this result as the complete
+    // set; see the docblock.
+    if (!existsSync(cfg)) continue;
     let raw: Record<string, unknown>;
     try {
       // ACCEPTED (intentional, not a defect — maintainer ruling): this reads the config's
@@ -1045,7 +1023,6 @@ export async function getLiveExtraModelRoots(
       // where the user wants"); it becomes visible to ComfyUI on its next restart.
       raw = parseConfig(await readFile(cfg, "utf-8"));
     } catch {
-      exhaustive = false; // its roots are UNKNOWN, not absent
       continue; // unreadable/malformed — skip; never authorize from a bad file
     }
     // Match ComfyUI: relative entries resolve against the YAML file's OWN directory.
@@ -1062,10 +1039,7 @@ export async function getLiveExtraModelRoots(
       let base: string | undefined;
       if (group.base_path) {
         const expanded = expandLiveBasePath(group.base_path.trim(), trustServerEnv);
-        if (expanded === undefined) {
-          exhaustive = false; // this group's roots are UNKNOWN, not absent
-          continue; // unresolvable base_path → skip this group
-        }
+        if (expanded === undefined) continue; // unresolvable base_path → skip this group
         base = isAbsolute(expanded) ? resolve(expanded) : resolve(cfgDir, expanded);
       }
       for (const category of group.categories) {
@@ -1083,7 +1057,7 @@ export async function getLiveExtraModelRoots(
       }
     }
   }
-  return { authoritative: true, exhaustive, roots };
+  return { authoritative: true, roots };
 }
 
 function ensureGroup(raw: Record<string, unknown>, name: string): Record<string, unknown> {
