@@ -1,4 +1,9 @@
-import { execSync, spawn, type ChildProcess } from "node:child_process";
+import {
+  execSync,
+  execFileSync,
+  spawn,
+  type ChildProcess,
+} from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, readlinkSync, statSync } from "node:fs";
 import { platform } from "node:os";
@@ -534,6 +539,44 @@ function launchedChildStillRunning(child: ChildProcess): boolean | undefined {
 }
 
 /**
+ * TRUE where the platform's process creation stamp is too COARSE to identify an
+ * instance on its own. macOS `ps -o lstart` is SECOND-resolution, so a pid
+ * recycled inside the same second compares EQUAL — the same limitation
+ * live-interpreter documents for its launched-by-us tier. Linux ticks and Windows
+ * FileTime are sub-second, where equality really is proof.
+ */
+const PLATFORM_HAS_COARSE_CREATION_STAMP = platform() === "darwin";
+/** Mutable only so tests can exercise the macOS branch from any host. */
+let coarseCreationStamp = PLATFORM_HAS_COARSE_CREATION_STAMP;
+
+/** Injectable parent-pid reader (see readParentPid). */
+let parentPidResolverOverride: ((pid: number) => number | undefined) | null = null;
+
+/**
+ * The parent pid of `pid`, used ONLY to break the macOS coarse-stamp tie.
+ *
+ * A process that inherited our child's number within the same second is still a
+ * DIFFERENT process, and the discriminator that survives is lineage: we spawned
+ * our child, so its parent is this very orchestrator. Another ComfyUI — even one
+ * with a byte-identical command line, started by some other launcher — has a
+ * different parent. Unreadable means "cannot tell", never "ours".
+ */
+function readParentPid(pid: number): number | undefined {
+  if (parentPidResolverOverride) return parentPidResolverOverride(pid);
+  if (!pid || pid <= 0 || IS_WIN) return undefined;
+  try {
+    const out = execFileSync("ps", ["-p", String(pid), "-o", "ppid="], {
+      encoding: "utf-8",
+      timeout: 5000,
+    }).trim();
+    const parsed = Number.parseInt(out, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Who owns the healthy listener after a launch — the single place that decides
  * whether this call may claim it started the server.
  *
@@ -588,6 +631,14 @@ function classifyListenerOwnership(input: {
       !commandLineMatchesArgv(now.commandLine, input.launchArgv)
     ) {
       return "not-ours";
+    }
+    // Where the stamp is only second-resolution (macOS), equality is NOT proof:
+    // a number recycled inside the same second by another ComfyUI with identical
+    // argv would satisfy everything above. Lineage settles it — we spawned our
+    // child, so it is still OUR child. Anything else (including an unreadable
+    // parent) withholds the claim instead of making it.
+    if (coarseCreationStamp && readParentPid(ourPid) !== process.pid) {
+      return "unconfirmed";
     }
     return "ours";
   }
@@ -2288,7 +2339,19 @@ export const __processControlTestHooks = {
     liveCwdResolverOverride = null;
     liveEnvResolverOverride = null;
     processIdentityOverride = null;
+    parentPidResolverOverride = null;
+    coarseCreationStamp = PLATFORM_HAS_COARSE_CREATION_STAMP;
     restartDispatchRecords.clear();
+  },
+  /** Inject a fake parent-pid reader so the macOS coarse-stamp tiebreak can be
+   *  driven on any host. */
+  setParentPidResolver(fn: ((pid: number) => number | undefined) | null): void {
+    parentPidResolverOverride = fn;
+  },
+  /** Pretend this platform's creation stamp is second-resolution (macOS) so the
+   *  tiebreak branch can be tested from any host. */
+  setCoarseCreationStamp(coarse: boolean): void {
+    coarseCreationStamp = coarse;
   },
   /** Inject a fake process-identity (creation time) reader so tests can drive
    *  recycled-PID scenarios on any host, including where the native read is

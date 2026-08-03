@@ -1112,6 +1112,104 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
     killSpy.mockRestore();
   });
 
+  /** The relaunch scenario shared by the coarse-stamp tests: same pid, alive, and
+   *  the port owned again once the API answers. */
+  function stableRelaunchOnPid4321(): void {
+    usePlainInstall();
+    spawnCapturingChildren(4321);
+    let killed = false;
+    let relaunched = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill|pkill|\bkill\b/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (/netstat/i.test(cmd)) {
+        return killed && !relaunched
+          ? ""
+          : "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed && !relaunched) throw new Error("not listening");
+        return "p4321\nn127.0.0.1:8188\n";
+      }
+      return "";
+    });
+    __processControlTestHooks.setProcessIdentityResolver(() => ({
+      startedAt: "same-second",
+      commandLine: `${PLAIN_PY} ${PLAIN_MAIN} --port 8188`,
+    }));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        relaunched = true;
+        return { ok: true } as Response;
+      }),
+    );
+  }
+
+  it("does NOT claim ownership on a COARSE (second-resolution) stamp when lineage says the process is not our child", async () => {
+    // macOS `ps -o lstart` is second-resolution, so a pid recycled inside the same
+    // second by ANOTHER ComfyUI with identical argv matches on pid, liveness,
+    // creation time and command line alike. Lineage is the discriminator: that
+    // process was not spawned by us.
+    __processControlTestHooks.setCoarseCreationStamp(true);
+    stableRelaunchOnPid4321();
+    __processControlTestHooks.setParentPidResolver(() => process.pid + 1);
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.listener_ownership).toBe("unconfirmed");
+    expect(result.message).not.toMatch(/restarted successfully/i);
+
+    killSpy.mockRestore();
+  });
+
+  it("withholds the claim on a COARSE stamp when the parent cannot be read at all", async () => {
+    __processControlTestHooks.setCoarseCreationStamp(true);
+    stableRelaunchOnPid4321();
+    __processControlTestHooks.setParentPidResolver(() => undefined);
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.listener_ownership).toBe("unconfirmed");
+
+    killSpy.mockRestore();
+  });
+
+  it("DOES claim it on a COARSE stamp when the process is provably our own child", async () => {
+    __processControlTestHooks.setCoarseCreationStamp(true);
+    stableRelaunchOnPid4321();
+    __processControlTestHooks.setParentPidResolver(() => process.pid);
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.listener_ownership).toBe("ours");
+    expect(result.message).toMatch(/restarted successfully/i);
+
+    killSpy.mockRestore();
+  });
+
+  it("does NOT pay for the lineage read where the stamp is already sub-second", async () => {
+    // Linux ticks / Windows FileTime identify an instance on their own, so the
+    // extra `ps` call must not happen there.
+    __processControlTestHooks.setCoarseCreationStamp(false);
+    stableRelaunchOnPid4321();
+    const parentPid = vi.fn(() => process.pid);
+    __processControlTestHooks.setParentPidResolver(parentPid);
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.listener_ownership).toBe("ours");
+    expect(parentPid).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  });
+
   it("says so plainly when listener ownership is UNDECIDABLE — without denying a restart that worked", async () => {
     // Unmappable port owner + a still-alive launched child. Reporting this as a
     // FAILED restart would mislabel every ordinary restart on hosts where the
