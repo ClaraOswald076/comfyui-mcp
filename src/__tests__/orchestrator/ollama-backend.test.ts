@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { OllamaBackend, comfyuiSpawnEnv, isOllamaModel, type McpToolClient } from "../../orchestrator/ollama-backend.js";
+import { PANEL_TOOL_MCP_TIMEOUT_MS, __panelAskTestHooks } from "../../orchestrator/panel-tools.js";
 import type { AgentEvent, NeutralTurn } from "../../orchestrator/agent-backend.js";
 
 // ---------------------------------------------------------------------------
@@ -394,8 +395,13 @@ describe("OllamaBackend", () => {
     expect(String(listResult?.content)).toContain("panel_focus_node: Focus a node in the canvas.");
     expect(String(listResult?.content)).toContain("panel_clear");
     expect(String(listResult?.content)).not.toContain("Long detail here");
-    // panel_call_tool unwrapped the JSON-string args and dispatched the real tool
-    expect(panelCall).toHaveBeenCalledWith({ name: "panel_focus_node", arguments: { node_id: 3 } });
+    // panel_call_tool unwrapped the JSON-string args and dispatched the real tool —
+    // carrying the #325 request timeout that covers long-blocking card tools.
+    expect(panelCall).toHaveBeenCalledWith(
+      { name: "panel_focus_node", arguments: { node_id: 3 } },
+      undefined,
+      { timeout: PANEL_TOOL_MCP_TIMEOUT_MS },
+    );
     expect(events.filter((e) => e.type === "result")).toHaveLength(1);
   });
 
@@ -624,5 +630,139 @@ describe("comfyuiSpawnEnv (#667)", () => {
   it("unset env AND no spec mode gets the documented compact default", () => {
     const env = comfyuiSpawnEnv(undefined, {});
     expect(env.COMFYUI_MCP_TOOL_MODE).toBe("compact");
+  });
+});
+
+describe("panel_ask survives a slow human answer (#325)", () => {
+  // ROOT CAUSE of #325: the ollama-family backends reach panel_* tools over the
+  // loopback HTTP MCP with an MCP SDK Client whose DEFAULT request timeout is
+  // 60s. panel_ask is DESIGNED to block on a human up to ~285s (240s card
+  // deadline + 45s late-answer grace, #486), so a user who didn't pick within
+  // 60s got `MCP error -32001: Request timed out` — and their eventual choice,
+  // delivered server-side, never reached the model. The fake panel client below
+  // models the SDK's timeout behavior faithfully: it rejects with the exact
+  // -32001 error when the request's timeout budget is shorter than the (slow)
+  // user's answer time, and delivers the pick otherwise.
+  const ASK_TOOL = [{ name: "panel_ask", description: "Ask the user to choose." }];
+  const ANSWERED_AT_MS = 90_000; // a slow-but-normal human answer (T+90s)
+  const USER_PICK = "Local GPU + Blender";
+
+  function sdkTimeoutPanelClient(calls: Array<{ name: string; timeout?: number }>) {
+    const callTool = vi.fn(
+      async (
+        params: { name: string; arguments: Record<string, unknown> },
+        _resultSchema?: unknown,
+        options?: { timeout?: number },
+      ) => {
+        calls.push({ name: params.name, timeout: options?.timeout });
+        // The MCP SDK's Protocol.request rejects with -32001 after `timeout` ms
+        // (60s when unspecified) — before a slow answer could ever arrive.
+        const budget = options?.timeout ?? 60_000;
+        if (budget < ANSWERED_AT_MS) throw new Error("MCP error -32001: Request timed out");
+        return { content: [{ type: "text", text: USER_PICK }] };
+      },
+    );
+    const client: McpToolClient = {
+      listTools: async () => ({ tools: ASK_TOOL }),
+      callTool: callTool as unknown as McpToolClient["callTool"],
+      close: async () => {},
+    };
+    return { client, callTool };
+  }
+
+  const ASK_ARGS = {
+    question: "Which?",
+    options: [{ label: "Local GPU + Blender" }, { label: "Cloud" }],
+  };
+
+  function scriptPanelAskTurn(direct: boolean) {
+    chatScript.push(
+      [
+        {
+          message: {
+            content: "",
+            tool_calls: [
+              {
+                function: direct
+                  ? { name: "panel_ask", arguments: ASK_ARGS } // bare name — forgiving dispatch
+                  : { name: "panel_call_tool", arguments: { name: "panel_ask", args: ASK_ARGS } },
+              },
+            ],
+          },
+          done: true,
+        },
+      ],
+      [{ message: { content: "done." }, done: true }],
+    );
+  }
+
+  function lastToolResult(): string {
+    const toolMsg = chatRequests[1].messages.filter((m) => m.role === "tool").at(-1);
+    return String(toolMsg?.content ?? "");
+  }
+
+  it("an answered card resolves the call with the user's choice (panel_call_tool router)", async () => {
+    const calls: Array<{ name: string; timeout?: number }> = [];
+    const { client: panel, callTool } = sdkTimeoutPanelClient(calls);
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ panel }),
+    });
+    scriptPanelAskTurn(false);
+
+    await collect(backend, turnsOf({ text: "ask me which" }));
+    // The request carried a timeout that covers a slow human answer — NOT the
+    // SDK's 60s default that produced #325's -32001.
+    expect(calls).toEqual([{ name: "panel_ask", timeout: PANEL_TOOL_MCP_TIMEOUT_MS }]);
+    expect(callTool).toHaveBeenCalledTimes(1);
+    // …so the user's pick (validated at T+90s, past the old 60s kill) was fed
+    // back to the model as the tool result, not a -32001 transport error.
+    expect(lastToolResult()).toContain(USER_PICK);
+    expect(lastToolResult()).not.toContain("-32001");
+  });
+
+  it("an answered card resolves with the user's choice (forgiving direct dispatch)", async () => {
+    const calls: Array<{ name: string; timeout?: number }> = [];
+    const { client: panel } = sdkTimeoutPanelClient(calls);
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ panel }),
+    });
+    scriptPanelAskTurn(true);
+
+    await collect(backend, turnsOf({ text: "ask me which" }));
+    expect(calls).toEqual([{ name: "panel_ask", timeout: PANEL_TOOL_MCP_TIMEOUT_MS }]);
+    expect(lastToolResult()).toContain(USER_PICK);
+    expect(lastToolResult()).not.toContain("-32001");
+  });
+
+  it("a genuine request timeout still surfaces truthfully (never swallowed)", async () => {
+    // The transport REALLY timed out (e.g. the user walked away past the whole
+    // card budget): the -32001 must reach the model as an honest tool error —
+    // the fix widens the budget, it does not hide a real timeout.
+    const callTool = vi.fn(async () => {
+      throw new Error("MCP error -32001: Request timed out");
+    });
+    const panel: McpToolClient = {
+      listTools: async () => ({ tools: ASK_TOOL }),
+      callTool: callTool as unknown as McpToolClient["callTool"],
+      close: async () => {},
+    };
+    const backend = new OllamaBackend({
+      model: "gemma4:e4b",
+      connectToolClients: async () => ({ panel }),
+    });
+    scriptPanelAskTurn(false);
+
+    await collect(backend, turnsOf({ text: "ask me which" }));
+    expect(lastToolResult()).toContain("-32001");
+  });
+
+  it("the client timeout covers the LONGEST blocking panel card with margin", () => {
+    // panel_ask / confirm / consent are hard-capped at ASK_TOTAL_BUDGET_CAP_MS;
+    // panel_request_secret waits up to 300s on its masked input. The client
+    // timeout must exceed BOTH or one can still be killed client-side mid-answer.
+    expect(PANEL_TOOL_MCP_TIMEOUT_MS).toBeGreaterThan(__panelAskTestHooks.ASK_TOTAL_BUDGET_CAP_MS);
+    expect(PANEL_TOOL_MCP_TIMEOUT_MS).toBeGreaterThan(300_000);
   });
 });

@@ -30,14 +30,23 @@ import { OLLAMA_CAPABILITIES, stampTurn } from "./agent-backend.js";
 import type { GeminiMcpServerSpec } from "./gemini-backend.js";
 import { resolvePrompt } from "../services/prompt-overrides.js";
 import { retiredToolMessage } from "../tools/vocabulary.js";
+import { PANEL_TOOL_MCP_TIMEOUT_MS } from "./panel-tools.js";
 
 type McpToolInfo = { name: string; description?: string; inputSchema?: unknown };
 type McpCallResult = { isError?: boolean; content?: Array<{ type: string; text?: string }> };
 
-/** The slice of the MCP SDK Client the backend uses — injectable for tests. */
+/** The slice of the MCP SDK Client the backend uses — injectable for tests.
+ *  callTool mirrors the SDK's real 3-arg signature (params, resultSchema?,
+ *  options?) so a per-request timeout can ride along: the SDK's 60s default
+ *  kills long-blocking panel card tools client-side before the user answers
+ *  (#325). */
 export interface McpToolClient {
   listTools(): Promise<{ tools: McpToolInfo[] }>;
-  callTool(params: { name: string; arguments: Record<string, unknown> }): Promise<McpCallResult>;
+  callTool(
+    params: { name: string; arguments: Record<string, unknown> },
+    resultSchema?: unknown,
+    options?: { timeout?: number },
+  ): Promise<McpCallResult>;
   close(): Promise<void>;
 }
 
@@ -518,7 +527,16 @@ export class OllamaBackend implements AgentBackend {
         if (inner === null || typeof inner !== "object" || Array.isArray(inner)) {
           return { text: `args must be a JSON object. See panel_describe_tool {"name": "${wanted}"}.`, isError: true };
         }
-        const res = await this.panel.callTool({ name: wanted, arguments: inner as Record<string, unknown> });
+        // #325 — a blocking card tool (panel_ask / secret / consent) waits on the
+        // HUMAN up to ~285-300s server-side; the MCP SDK's 60s default request
+        // timeout would kill the call first ("MCP error -32001: Request timed
+        // out") and silently drop the user's eventual pick. Carry a timeout that
+        // covers the longest card (harmless for fast tools — an upper bound only).
+        const res = await this.panel.callTool(
+          { name: wanted, arguments: inner as Record<string, unknown> },
+          undefined,
+          { timeout: PANEL_TOOL_MCP_TIMEOUT_MS },
+        );
         if (res.isError) {
           logger.warn(`[ollama-backend] panel tool '${wanted}' returned isError: ${textOf(res).slice(0, 300)}`);
         }
@@ -530,7 +548,10 @@ export class OllamaBackend implements AgentBackend {
       // the compact server's call_tool, whose unknown-name error carries
       // close-match suggestions the model can recover from.
       if (this.panel && this.panelTools.some((t) => t.name === name)) {
-        const res = await this.panel.callTool({ name, arguments: args });
+        // Same #325 timeout as the panel_call_tool router path above.
+        const res = await this.panel.callTool({ name, arguments: args }, undefined, {
+          timeout: PANEL_TOOL_MCP_TIMEOUT_MS,
+        });
         return { text: textOf(res), isError: !!res.isError };
       }
       if (this.comfy && this.comfyTools.some((t) => t.name === "call_tool")) {
