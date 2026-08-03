@@ -500,6 +500,89 @@ function childProcessErrorDetails(err: unknown): ChildProcessErrorDetails {
   };
 }
 
+/**
+ * Is the process we spawned still alive? Tri-state, because only a DEFINITE answer
+ * may change a verdict.
+ *
+ * Node delivers a child's `exit` event through the event loop, so "the handler has
+ * not run yet" is NOT evidence the child is alive — and a pid whose child died can
+ * be recycled by another program in that window (codex gate). A signal-0 probe
+ * answers synchronously:
+ *   false     - ESRCH, or an exit already recorded: our child is definitively gone.
+ *   undefined - no pid to probe, or EPERM (a process has that pid but we may not
+ *               signal it, i.e. it belongs to another user). "Cannot tell", never
+ *               "alive" — and never "dead" either, since a missing pid must not by
+ *               itself convict a launch that may well have worked.
+ *   true      - the pid exists and is signalable. Necessary, NOT sufficient: a
+ *               recycled pid also passes, which is why the caller additionally
+ *               corroborates the command line.
+ */
+function launchedChildStillRunning(child: ChildProcess): boolean | undefined {
+  const pid = child.pid;
+  if (pid == null) return undefined;
+  // Loose null check on purpose: a not-yet-exited child reports `null` here, and
+  // an absent property must read the same way rather than as "already exited".
+  if (child.exitCode != null || child.signalCode != null) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return false;
+    return undefined;
+  }
+}
+
+/**
+ * Who owns the healthy listener after a launch — the single place that decides
+ * whether this call may claim it started the server.
+ *
+ * The trap it exists to avoid: a matching pid NUMBER is not proof. Our child can
+ * die, the OS can hand its number to another program, and that program can bind the
+ * port — all before Node delivers the `exit` event, at which point a naive
+ * `portOwnerPid === ourPid` says "ours" about somebody else's process. So a
+ * positive verdict requires the number to match AND the child to be provably alive
+ * AND (where the OS will tell us) the port owner's command line to match what we
+ * actually launched. Any hole in that chain degrades to "unconfirmed"; definite
+ * counter-evidence gives "not-ours".
+ */
+function classifyListenerOwnership(input: {
+  isDesktopApp: boolean;
+  /** The child's `exit` event has already been delivered. */
+  childExited: boolean;
+  child: ChildProcess;
+  launchArgv?: string[];
+  portOwnerPid: number | null;
+}): ListenerOwnership {
+  // A Desktop launch is undecidable BY DESIGN: we spawn the Electron shell (or
+  // macOS `open`) and its child binds the port, so a pid mismatch proves nothing.
+  if (input.isDesktopApp) return "unconfirmed";
+  if (input.childExited) return "not-ours";
+
+  const alive = launchedChildStillRunning(input.child);
+  // Definitively gone (ESRCH) — whatever is serving the port is not it, even
+  // though the `exit` event has not been delivered yet.
+  if (alive === false) return "not-ours";
+
+  const ourPid = input.child.pid;
+  if (ourPid == null || input.portOwnerPid == null) return "unconfirmed";
+  if (input.portOwnerPid !== ourPid) return "not-ours";
+  // The pid MATCHES — but it could be a recycled number we cannot signal.
+  if (alive !== true) return "unconfirmed";
+  // Where the OS exposes it, require the port owner to still be running what we
+  // launched. Unreadable (the platforms where the identity read is skipped) leaves
+  // the pid+liveness match standing; a POSITIVE mismatch is counter-evidence.
+  const identity = resolveProcessIdentity(ourPid);
+  if (
+    identity?.commandLine &&
+    input.launchArgv &&
+    !commandLineMatchesArgv(identity.commandLine, input.launchArgv)
+  ) {
+    return "not-ours";
+  }
+  return "ours";
+}
+
 /** The launch-environment facts to report, once a plan has been resolved (#776). */
 function launchEnvInfo(info?: ProcessInfo): LaunchEnvInfo | undefined {
   return info?.envPlan?.info;
@@ -578,6 +661,12 @@ function rememberRestartAttempt(policy: RestartPolicy): boolean {
 
 interface SpawnedComfyUI {
   child: ChildProcess;
+  /**
+   * The exact (interpreter + args) we launched, for a NON-Desktop spawn. Used to
+   * corroborate that the process later found on the port really is the one we
+   * started, rather than a different program that inherited its pid.
+   */
+  launchArgv?: string[];
 }
 
 let recordedLaunchChild: ChildProcess | undefined;
@@ -647,7 +736,7 @@ function spawnFromProcessInfo(info: ProcessInfo): SpawnedComfyUI | null {
   // the moment a different process owns the port. (Desktop-app launches return
   // above: that exe is a launcher, not an interpreter.)
   if (child.pid) recordLaunchedInterpreter(child.pid, cmd.exe);
-  return { child };
+  return { child, launchArgv: [cmd.exe, ...cmd.args] };
 }
 
 /**
@@ -1596,15 +1685,13 @@ export async function startComfyUI(): Promise<StartResult> {
   //     success. That uncertainty is carried by an EXPLICIT string state, so it
   //     survives JSON serialization instead of vanishing with an `undefined`.
   const ourPid = launched.child.pid;
-  const ownership: ListenerOwnership = info.isDesktopApp
-    ? "unconfirmed"
-    : launchedChildExit
-      ? "not-ours"
-      : ourPid == null || newPid == null
-        ? "unconfirmed"
-        : newPid === ourPid
-          ? "ours"
-          : "not-ours";
+  const ownership: ListenerOwnership = classifyListenerOwnership({
+    isDesktopApp: info.isDesktopApp,
+    childExited: launchedChildExit != null,
+    child: launched.child,
+    launchArgv: launched.launchArgv,
+    portOwnerPid: newPid,
+  });
   // Only the NON-Desktop undecidable case is worth calling out: for a Desktop
   // launcher the pid relationship is indirect by design, not a gap in evidence.
   const ownershipUnconfirmed = !info.isDesktopApp && ownership === "unconfirmed";

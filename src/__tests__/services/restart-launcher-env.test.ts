@@ -950,6 +950,63 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
     killSpy.mockRestore();
   });
 
+  it("does NOT claim a matching PID as ours when the child is already gone but its `exit` event has not been delivered", async () => {
+    // The lifecycle race: our child dies, the OS reuses its number for a program
+    // that binds the port, and readiness sees that healthy replacement BEFORE Node
+    // delivers the `exit` event. A bare `portOwnerPid === ourPid` would call it
+    // "ours". A synchronous signal-0 probe says otherwise.
+    usePlainInstall();
+    spawnCapturingChildren(4321);
+    let killed = false;
+    let relaunched = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill|pkill|\bkill\b/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (/netstat/i.test(cmd)) {
+        return killed && !relaunched
+          ? ""
+          : "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed && !relaunched) throw new Error("not listening");
+        return "p4321\nn127.0.0.1:8188\n";
+      }
+      return "";
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        relaunched = true;
+        return { ok: true } as Response;
+      }),
+    );
+    // Signal-0 liveness probes for our child report ESRCH; the process-group kill
+    // during the stop still succeeds. NOTE the `exit` event is deliberately never
+    // emitted — that is the whole point of the race.
+    const killSpy = vi
+      .spyOn(process, "kill")
+      .mockImplementation((pid: number, signal?: string | number) => {
+        if (signal === 0) {
+          const err = new Error("ESRCH") as NodeJS.ErrnoException;
+          err.code = "ESRCH";
+          throw err;
+        }
+        return true;
+      });
+
+    const result = await restartComfyUI();
+
+    expect(result.listener_ownership).toBe("not-ours");
+    expect(result.started).toBe(false);
+    expect(result.ready).toBe(true);
+    expect(result.message).not.toMatch(/restarted successfully/i);
+    expect(result.message).toMatch(/NOT as a result of this restart/i);
+
+    killSpy.mockRestore();
+  });
+
   it("says so plainly when listener ownership is UNDECIDABLE — without denying a restart that worked", async () => {
     // Unmappable port owner + a still-alive launched child. Reporting this as a
     // FAILED restart would mislabel every ordinary restart on hosts where the
