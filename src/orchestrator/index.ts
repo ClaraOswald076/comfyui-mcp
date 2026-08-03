@@ -101,6 +101,11 @@ import { startPanelConsoleHttpServer, type PanelConsoleHttpServer } from "./pane
 import type { AgentBackend } from "./agent-backend.js";
 import { readComfyuiCrashLog, formatCrashNote } from "../services/crash-log.js";
 import { QueueMonitor, type StallReport } from "../services/queue-monitor.js";
+import {
+  RunCompletions,
+  describe as describeCorrelation,
+  type CompletionPayload,
+} from "./run-completion-journal.js";
 import { initRunpodWatcher, getRunpodWatcher, type RunpodStatusFrame, type RunpodAlertFrame } from "../services/runpod-watch.js";
 import { getPod } from "../services/runpod-client.js";
 import { listTargetChangeRequests, consumeTargetChange, ackTargetChange, setProgressDir, CONTROL_PREFIX, newestAttemptEpochs, isSupersededAttempt, downloadAttemptKey } from "../services/download-progress.js";
@@ -2031,6 +2036,30 @@ export async function runPanelOrchestrator(): Promise<void> {
     onAgentFatal: (tabId, reason) => {
       requestSelfExit(`tab ${tabId.slice(0, 8)} ${reason}`);
     },
+    // #468 — run-completion journal acks. `key` is the composite agent key; the
+    // journal is keyed by the PANEL TAB, so a provider switch (which retires
+    // `tab::old` and spawns `tab::new`) can never strand a completion.
+    onEventDelivered: (_key, tokens) => {
+      for (const token of tokens) RunCompletions.ack(token);
+    },
+    onEventUndelivered: (key, tokens) => {
+      for (const token of tokens) RunCompletions.release(token);
+      const panelTab = panelTabOf(key);
+      logger.warn(
+        `[panel-orchestrator] tab ${panelTab.slice(0, 8)} handed back ${tokens.length} undelivered run completion(s) — journaled for replay (#468)`,
+      );
+      // Try again immediately. When the agent is still alive (a stall-abandoned
+      // turn, a plain Stop) this re-queues the completion into its next turn;
+      // when it is going away, injectEvent refuses and the entry simply stays
+      // pending for the next spawn. The refusal path returns false WITHOUT
+      // calling back here, so this cannot recurse.
+      flushRunCompletions(panelTab);
+    },
+    // A fresh agent for this key can take mail now — replay whatever the
+    // previous one never delivered.
+    onAgentReady: (key) => {
+      flushRunCompletions(panelTabOf(key));
+    },
     sessionStore,
     // #570 P0 — bind each persisted exact session to its tab's FULL trusted workflow
     // identity (server-observed origin + per-instance uuid), so a saved workflow
@@ -2045,6 +2074,31 @@ export async function runPanelOrchestrator(): Promise<void> {
   // Let refreshEnvCapabilities() feed a freshly-gathered env block into agents
   // spawned after a ComfyUI restart/reconnect.
   liveManager = manager;
+
+  /**
+   * Deliver every journaled run completion for a panel tab (#468).
+   *
+   * Called on arrival, and again at every later delivery opportunity (a fresh
+   * agent spawn). Order is preserved and the loop STOPS at the first refusal, so
+   * a completion can never overtake an older one that is still stuck.
+   *
+   * Nothing here re-correlates: each entry carries the verdict computed when it
+   * ARRIVED, so a replay can never be re-attributed to a run that started after
+   * it landed. `injectEvent` returning true means only that the agent took it
+   * onto its queue — the entry stays in the journal until the turn that carried
+   * it ends (onEventDelivered), which is what makes it survive a restart.
+   */
+  function flushRunCompletions(panelTabId: string): void {
+    const key = agentKeyFor(panelTabId);
+    const { blockedOn } = RunCompletions.deliverPending(panelTabId, (payload, token) =>
+      manager.injectEvent(key, payload, { eventToken: token }),
+    );
+    if (blockedOn) {
+      logger.warn(
+        `[panel-orchestrator] tab ${panelTabId.slice(0, 8)} has no live agent for ${describeCorrelation(blockedOn.correlation)} — journaled, replayed when one comes back (#468)`,
+      );
+    }
+  }
 
   // Flag the mobile mirror picker's "session attached" (green) dot from live agents.
   bridge.setHasSessionPredicate((tabId) => manager.hasLiveAgent(agentKeyFor(tabId)));
@@ -2680,6 +2734,12 @@ export async function runPanelOrchestrator(): Promise<void> {
           // under migratedFrom would still resolve the retired workflow's tool call after the
           // switch (#570 P0). The socket is unchanged, so only queued WORK is dropped.
           bridge.dropQueuedDeliveries(migratedFrom);
+          // #468 — the old id's journaled run completions belong to the workflow
+          // being switched AWAY from. Carrying them onto an unproven-different
+          // workflow would deliver one workflow's render as another's, which is
+          // exactly the misattribution the journal exists to prevent. Drop them
+          // (logged per entry) rather than migrate them.
+          RunCompletions.forget(migratedFrom);
           manager.retire(migratedFrom + AGENT_KEY_SEP + prevBackend);
           logger.info(
             `[panel-orchestrator] same-socket re-hello ${migratedFrom.slice(0, 12)} → ${panelTab.slice(0, 12)} without proven workflow continuity — old agent retired (NOT rebound); each workflow keeps its own conversation`,
@@ -2727,6 +2787,11 @@ export async function runPanelOrchestrator(): Promise<void> {
           // have a LIVE agent (a provider switch retires the others), so at most one rebind is a
           // live-agent move; the rest are durable-only.
           let destinationCollision = false;
+          // #468 — PROVEN same workflow, new tab id: the journal is keyed by
+          // panel tab, so one move re-addresses every undelivered completion for
+          // every provider. Re-addressing only — never broadening: entries for
+          // other tabs are untouched, and their frozen correlation is unchanged.
+          RunCompletions.moveKey(migratedFrom, panelTab);
           for (const b of KNOWN_BACKENDS) {
             const srcKey = migratedFrom + AGENT_KEY_SEP + b;
             const newKey = panelTab + AGENT_KEY_SEP + b;
@@ -3909,6 +3974,21 @@ export async function runPanelOrchestrator(): Promise<void> {
       // but a mirror viewer (mobile has no Blind concept) can inject
       // agent_event frames with images onto a blinded desktop tab.
       const evForTab = blindTabs.has(event.tab_id) ? { ...ev, images: [] } : ev;
+      // #468 — a RUN COMPLETION is a promise `panel_run` made ("end your turn,
+      // you WILL be notified"), so it goes through the journal: correlated by
+      // exact prompt id ONCE, here, and replayed until the turn that carries it
+      // ends. Other agent_event kinds (download_done) keep the old best-effort
+      // path — nothing is waiting on them the way a render is.
+      if (ev.kind === "executed") {
+        // Journal the BLIND-STRIPPED copy: a replay must not resurrect pixels
+        // the blind gate removed on arrival.
+        const entry = RunCompletions.record(event.tab_id, evForTab as CompletionPayload);
+        logger.info(
+          `[panel-orchestrator] tab ${event.tab_id.slice(0, 8)} run completion for ${describeCorrelation(entry.correlation)}`,
+        );
+        flushRunCompletions(event.tab_id);
+        return;
+      }
       const delivered = manager.injectEvent(agentKeyFor(event.tab_id), evForTab);
       if (delivered) {
         logger.info(`[panel-orchestrator] tab ${event.tab_id.slice(0, 8)} event → agent: ${event.kind}`);

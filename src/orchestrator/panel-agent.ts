@@ -41,6 +41,39 @@ function msgOf(err: unknown): string {
   return errorText(err);
 }
 
+/**
+ * Opening clause naming WHICH run a completion belongs to (#468).
+ *
+ * The whole point is that the agent must never read a completion as the answer
+ * to its own `panel_run` unless the orchestrator PROVED it by exact prompt id.
+ * So:
+ *  • matched      → say so, and name the id.
+ *  • foreign      → real run, real id, but not one this session queued. Say
+ *                   UNDETERMINED and forbid treating it as the awaited render.
+ *  • unidentified → no id at all. Same, plus how to find out for certain.
+ * An event with no correlation field (a legacy/simulated frame) gets the old
+ * neutral wording — unchanged behavior.
+ */
+function runIdentityPreamble(ev: { prompt_id?: string; run_correlation?: string }): string {
+  const pid = typeof ev.prompt_id === "string" && ev.prompt_id.trim() ? ev.prompt_id.trim() : null;
+  switch (ev.run_correlation) {
+    case "matched":
+      return `This is the run YOU queued with panel_run (prompt ${pid}). `;
+    case "foreign":
+      return (
+        `This run (prompt ${pid}) does NOT match any run you queued with panel_run — its origin is UNDETERMINED. ` +
+        `Do NOT treat it as the render you are waiting on; if you are still waiting on your own run, verify it with get_history before acting. `
+      );
+    case "unidentified":
+      return (
+        `The panel reported NO prompt id for this run, so it CANNOT be correlated to the render you queued — its origin is UNDETERMINED. ` +
+        `Do NOT assume it is your run; verify yours with get_history before acting on it. `
+      );
+    default:
+      return pid ? `(prompt ${pid}) ` : ``;
+  }
+}
+
 /** Idle window for the per-turn freeze watchdog: if a turn that's in flight
  *  receives NO events at all for this long, treat it as stalled. Generous (legit
  *  tool work is slow but still streams progress) and overridable for tests via
@@ -127,6 +160,21 @@ export interface ImageRef {
   type?: string; // "input" | "output" | "temp" (ComfyUI /view folder)
 }
 
+/** One queued user turn (a panel message, or an injected panel event).
+ *
+ *  `eventTokens` carry #468's run-completion journal tokens through the queue.
+ *  A completion is only ACKED once the turn that carried it ended, so an item
+ *  that is queued-but-unread when the agent dies (or whose turn is abandoned by
+ *  the stall watchdog) is handed BACK to the journal and replayed instead of
+ *  vanishing with the agent. */
+export interface QueueItem {
+  text: string;
+  images?: ImageRef[];
+  mid?: string;
+  /** Run-completion journal tokens this item is carrying (#468). */
+  eventTokens?: string[];
+}
+
 export interface PanelAgentDeps {
   /** mcpServers config for the spawned agent (the comfyui MCP). */
   mcpServers: Options["mcpServers"];
@@ -163,6 +211,14 @@ export interface PanelAgentDeps {
    *  "read" moment) — carries the client mid so the panel can flip that bubble
    *  from queued/muted to read. */
   onSeen?: (tabId: string, mid: string) => void;
+  /** #468 — the turn CARRYING these run-completion journal tokens ended, so the
+   *  completions genuinely reached the agent. The journal drops them. */
+  onEventDelivered?: (tabId: string, tokens: string[]) => void;
+  /** #468 — these run-completion journal tokens are being handed BACK: the
+   *  agent was stopped, or the turn carrying them was abandoned, before they
+   *  could be read. The journal re-arms them for replay. Also fired for tokens
+   *  refused outright (injecting into a closed agent). */
+  onEventUndelivered?: (tabId: string, tokens: string[]) => void;
   /** In-process MCP server giving the agent LIVE control of this tab's graph. */
   panelServer?: McpSdkServerConfigWithInstance;
   /**
@@ -190,7 +246,7 @@ export class PanelAgent {
    *  turn-gate, rewind tracking and self-restart; the backend owns the SDK call,
    *  option building, and SDKMessage→AgentEvent normalization. */
   private backend: AgentBackend;
-  private queue: Array<{ text: string; images?: ImageRef[]; mid?: string }> = [];
+  private queue: Array<QueueItem> = [];
   private waiting: (() => void) | null = null;
   private closed = false;
   /** The user message(s) of the turn currently in flight — captured at dispatch so
@@ -198,7 +254,11 @@ export class PanelAgent {
    *  new message, instead of dropping the work the agent was mid-reply on. Cleared
    *  on a clean turn result (nothing to re-queue) and on stall/rewind (abandoned on
    *  purpose). Null whenever no turn is in flight. */
-  private inFlight: { text: string; images?: ImageRef[] } | null = null;
+  private inFlight: { text: string; images?: ImageRef[]; eventTokens?: string[] } | null = null;
+  /** Run-completion journal tokens carried by the turn currently in flight
+   *  (#468). Acked when that turn's `result` lands; handed back to the journal
+   *  when the turn is abandoned (stall watchdog) or the agent is stopped. */
+  private turnEventTokens: string[] = [];
   /** True while a turn is in flight (working→done). Lets the manager defer a
    *  session-restarting option change (effort) until the turn finishes, instead
    *  of interrupting and silently dropping the in-flight reply. */
@@ -350,12 +410,29 @@ export class PanelAgent {
 
   /** Queue a panel message and wake the streaming generator (the "channel in").
    *  `images` are ComfyUI refs delivered inline as image blocks (vision). */
-  send(text: string, opts?: { title?: string; images?: ImageRef[]; mid?: string }): void {
+  send(text: string, opts?: { title?: string; images?: ImageRef[]; mid?: string; eventTokens?: string[] }): void {
     if (opts?.title) this.title = opts.title;
-    this.queue.push({ text, images: opts?.images, mid: opts?.mid });
+    this.queue.push({
+      text,
+      images: opts?.images,
+      mid: opts?.mid,
+      ...(opts?.eventTokens?.length ? { eventTokens: [...opts.eventTokens] } : {}),
+    });
     const wake = this.waiting;
     this.waiting = null;
     wake?.();
+  }
+
+  /** Hand a set of run-completion journal tokens back as UNDELIVERED (#468), so
+   *  the journal re-arms them for replay instead of letting them die with this
+   *  agent / this abandoned turn. Never throws into the caller's path. */
+  private releaseEventTokens(tokens: string[] | undefined): void {
+    if (!tokens?.length) return;
+    try {
+      this.deps.onEventUndelivered?.(this.tabId, [...tokens]);
+    } catch (err) {
+      logger.warn(`[panel-agent ${this.short()}] releasing completion tokens: ${msgOf(err)}`);
+    }
   }
 
   /** Rewind the CONVERSATION: fork the session at `anchor` (an assistant UUID
@@ -369,6 +446,12 @@ export class PanelAgent {
     // A rewind deliberately DROPS everything after the anchor (the edited message
     // arrives separately), so the interrupted turn's text must NOT be re-queued.
     this.inFlight = null;
+    // The dropped turn may have been carrying a run completion — that is news,
+    // not conversation, so hand it back for replay rather than rewinding it away
+    // (#468).
+    const rewoundTokens = this.turnEventTokens;
+    this.turnEventTokens = [];
+    this.releaseEventTokens(rewoundTokens);
     // Break the current stream so start()'s loop re-enters and forks.
     void this.backend.interrupt().catch(() => {});
     const wake = this.waiting;
@@ -405,13 +488,26 @@ export class PanelAgent {
    * reached the agent." Only meaningful when a session is live (the manager only
    * calls this for an existing agent, so we never spawn one just for an event).
    */
-  injectEvent(ev: {
-    kind?: string;
-    images?: ImageRef[];
-    error?: string;
-    note?: string;
-    downloads?: Array<{ name: string; status: string }>;
-  }): void {
+  injectEvent(
+    ev: {
+      kind?: string;
+      images?: ImageRef[];
+      error?: string;
+      note?: string;
+      downloads?: Array<{ name: string; status: string }>;
+      /** #468 — run identity + how it correlates to a run this session queued. */
+      prompt_id?: string;
+      run_correlation?: "matched" | "foreign" | "unidentified";
+      replayed?: boolean;
+    },
+    opts?: { eventToken?: string },
+  ): boolean {
+    // A closed agent's queue is never drained again, so accepting an event here
+    // would silently swallow it (#468). REFUSE — and deliberately do NOT hand the
+    // token back through onEventUndelivered: the caller is the journal's own
+    // flush, which keeps a refused entry pending from the `false` return. Calling
+    // back would recurse (release → flush → inject → release → …).
+    if (this.closed) return false;
     let text: string | null = null;
     let images: ImageRef[] | undefined;
     if (ev.kind === "executed") {
@@ -423,6 +519,12 @@ export class PanelAgent {
       const note = typeof ev.note === "string" && ev.note.trim() ? ev.note.trim() : null;
       text =
         `[panel event] ` +
+        // #468 — a completion that was journaled and re-delivered says so, so the
+        // agent reads it as "this landed late", not as a second render.
+        (ev.replayed
+          ? `(RE-DELIVERED — this completion could not be handed to you when it arrived.) `
+          : ``) +
+        runIdentityPreamble(ev) +
         (note
           ? `${note} `
           : `A run on the user's canvas just finished and produced ${imgs.length} output image(s): ${names}. `) +
@@ -453,7 +555,7 @@ export class PanelAgent {
       // batch of settled downloads for this tab), so a multi-file pack install
       // wakes the agent ONCE, not per file.
       const dl = (ev.downloads ?? []).filter((d) => d && d.name);
-      if (dl.length === 0) return;
+      if (dl.length === 0) return false;
       const done = dl.filter((d) => d.status === "done").map((d) => d.name);
       const failed = dl.filter((d) => d.status !== "done").map((d) => d.name);
       const parts: string[] = [];
@@ -466,13 +568,18 @@ export class PanelAgent {
         `call download_status for the exact landed path(s)${failed.length ? " or the error detail" : ""}. ` +
         `Otherwise reply with ONE short sentence acknowledging it and no tool calls.`;
     }
-    if (!text) return;
+    if (!text) return false;
     this.busy = true;
     this.deps.onTurn?.(this.tabId, "working"); // event triggers a turn — show working
-    this.queue.push({ text, images });
+    this.queue.push({
+      text,
+      images,
+      ...(opts?.eventToken ? { eventTokens: [opts.eventToken] } : {}),
+    });
     const wake = this.waiting;
     this.waiting = null;
     wake?.();
+    return true;
   }
 
   /** Push a ComfyUI EXECUTION error into the session with urgency — the "hey,
@@ -548,8 +655,10 @@ export class PanelAgent {
   }
   /** Remove and return any unsent queued messages — so a session restart can hand
    *  them to the replacement agent instead of dropping them. Items keep their
-   *  panel `mid`, so re-delivery still flips the right bubble on dequeue (seen). */
-  takePending(): Array<{ text: string; images?: ImageRef[]; mid?: string }> {
+   *  panel `mid`, so re-delivery still flips the right bubble on dequeue (seen),
+   *  AND their run-completion tokens (#468), so a carried-over completion is
+   *  acked by the replacement agent rather than replayed as a duplicate. */
+  takePending(): Array<QueueItem> {
     const items = this.queue;
     this.queue = [];
     return items;
@@ -585,10 +694,22 @@ export class PanelAgent {
     // the user wants BOTH the interrupted message and the new one answered. A plain
     // Stop / Ctrl+C / Esc (requeueInFlight=false) must NOT re-queue, or it would
     // silently re-run the turn the user just stopped (double tool actions).
+    // #468 — the interrupted turn's run-completion tokens travel with its text.
+    // Re-queued: they ride the re-queued item and are acked when THAT turn ends.
+    // Dropped (plain Stop): hand them back so the completion is replayed rather
+    // than dying with the turn the user cancelled.
+    const interruptedTokens = this.turnEventTokens;
+    this.turnEventTokens = [];
     if (interrupted && opts.requeueInFlight) {
       // Front of the queue: the interrupted work is addressed before whatever the
       // user sends next (which is appended after this interrupt is handled).
-      this.queue.unshift({ text: interrupted.text, images: interrupted.images });
+      this.queue.unshift({
+        text: interrupted.text,
+        images: interrupted.images,
+        ...(interruptedTokens.length ? { eventTokens: interruptedTokens } : {}),
+      });
+    } else {
+      this.releaseEventTokens(interruptedTokens);
     }
     // Track the turn this interrupt is aborting (the one holding the gate). The
     // fallback only force-releases while THIS turn is still the one parked on the
@@ -666,6 +787,15 @@ export class PanelAgent {
   async stop(): Promise<void> {
     this.closed = true;
     this.inFlight = null; // teardown must not leave a turn that could be re-queued
+    // #468 — every run completion this agent still holds (queued-but-unread, or
+    // carried by the turn we're tearing down) goes BACK to the journal. A tab
+    // that is genuinely gone has its entries dropped explicitly by the
+    // orchestrator (forget); everything else is replayed into the replacement
+    // agent. Done before the awaits below so a concurrent spawn can pick them up.
+    const orphanedTokens = [...this.queue.flatMap((it) => it.eventTokens ?? []), ...this.turnEventTokens];
+    this.turnEventTokens = [];
+    for (const item of this.queue) delete item.eventTokens;
+    this.releaseEventTokens(orphanedTokens);
     this.clearIdleWatchdog(); // don't let a turn watchdog fire after teardown
     const wake = this.waiting;
     this.waiting = null;
@@ -759,7 +889,17 @@ export class PanelAgent {
       if (this.closed) return;
       // Remember the in-flight turn's user text so an interrupt mid-reply can
       // re-queue it (send-now must address BOTH the interrupted and new message).
-      this.inFlight = { text, ...(images.length ? { images } : {}) };
+      // #468 — the run-completion tokens this batch carries. They ride with the
+      // in-flight capture so a crash-requeue keeps them attached, and are ACKED
+      // only when this turn's `result` lands (proof the agent actually read the
+      // completion), not merely because it was spliced off the queue.
+      const carriedTokens = batch.flatMap((it) => it.eventTokens ?? []);
+      this.turnEventTokens = carriedTokens;
+      this.inFlight = {
+        text,
+        ...(images.length ? { images } : {}),
+        ...(carriedTokens.length ? { eventTokens: carriedTokens } : {}),
+      };
       this.yieldedTurns += 1; // this batch is turn N
       // Mirror the backend's turn-marker mint: the Nth turn yielded here is the
       // Nth turn the backend reads — its events carry marker N (#728 r3).
@@ -904,6 +1044,10 @@ export class PanelAgent {
         if (this.inFlight) {
           const interrupted = this.inFlight;
           this.inFlight = null;
+          // Its run-completion tokens (#468) ride the re-queued item, so they are
+          // acked when the RE-RUN turn ends — not left dangling on a turn whose
+          // session died.
+          this.turnEventTokens = [];
           this.queue.unshift(interrupted);
           logger.warn(
             `[panel-agent ${this.short()}] crash mid-turn — re-queued the interrupted message so it isn't lost`,
@@ -917,6 +1061,13 @@ export class PanelAgent {
       // first turn — gate run-ahead). The gate counters are reset next iteration.
       this.clearIdleWatchdog();
       this.clearInterruptReleaseFallback();
+      // A turn that never produced a `result` (the session just ended) never
+      // acked its run completions. Hand them back so the restarted session
+      // replays them instead of the completion dying with the dead session
+      // (#468). No-op after a clean result or the crash re-queue above.
+      const strandedTokens = this.turnEventTokens;
+      this.turnEventTokens = [];
+      this.releaseEventTokens(strandedTokens);
       if (this.closed) break;
       // Session ended on its own — bound rapid failure loops so a persistently
       // broken SDK doesn't spin forever or black-hole each message.
@@ -1007,6 +1158,13 @@ export class PanelAgent {
     // text (a wedged message could otherwise loop on every interrupt, and it may
     // already have performed tool side effects).
     this.inFlight = null;
+    // …but a run COMPLETION the abandoned turn was carrying is not the agent's
+    // work, it's news the agent still needs (#468). Hand its tokens back so the
+    // journal replays them into the next turn instead of losing them with the
+    // turn we just wrote off.
+    const stalledTokens = this.turnEventTokens;
+    this.turnEventTokens = [];
+    this.releaseEventTokens(stalledTokens);
     if (!alreadyReported) {
       this.deps.onSay(
         this.tabId,
@@ -1173,6 +1331,19 @@ export class PanelAgent {
         // Turn completed → nothing to re-queue on a later interrupt. (A clean
         // completion must NOT have its message re-queued.)
         this.inFlight = null;
+        // #468 — the turn that CARRIED the run completion(s) has ended, so they
+        // demonstrably reached the model's context. Ack them: the journal drops
+        // them and settles their run tickets. This is the ONLY ack point; every
+        // other exit from a turn hands the tokens back for replay.
+        if (this.turnEventTokens.length) {
+          const delivered = this.turnEventTokens;
+          this.turnEventTokens = [];
+          try {
+            this.deps.onEventDelivered?.(this.tabId, delivered);
+          } catch (err) {
+            logger.warn(`[panel-agent ${this.short()}] acking completion tokens: ${msgOf(err)}`);
+          }
+        }
         // Turn ended cleanly → disarm the freeze watchdog. (If it already tripped,
         // completeTurn() is a capped no-op, so the gate can't double-advance.)
         this.clearIdleWatchdog();
@@ -1302,6 +1473,16 @@ export interface PanelAgentManagerOptions {
    * per-tab configuration errors handled by onStartFailure above.
    */
   onAgentFatal?: (tabId: string, reason: string) => void;
+  /** #468 — a turn carrying these run-completion journal tokens ENDED, so the
+   *  completions genuinely reached the agent. Forwarded verbatim from the agent. */
+  onEventDelivered?: (tabId: string, tokens: string[]) => void;
+  /** #468 — these run-completion journal tokens came back UNDELIVERED (agent
+   *  stopped, turn abandoned, injection refused). Re-arm them for replay. */
+  onEventUndelivered?: (tabId: string, tokens: string[]) => void;
+  /** #468 — a fresh agent is mapped and ready for this key. The orchestrator
+   *  uses it to replay any journaled run completions the previous agent never
+   *  delivered, so a completion survives the restart that lost it. */
+  onAgentReady?: (tabId: string) => void;
   /**
    * Durable per-tab session store. When set, the manager persists each tab's SDK
    * session id here and uses it as the resume fallback when a tab first spawns —
@@ -1326,7 +1507,7 @@ export class PanelAgentManager {
    *  captured here at settle(err) instead of dying with the agent — the next
    *  spawn on the same composite key re-delivers them, so nothing sent into the
    *  spawn → prepare()-reject window is silently dropped. */
-  private heldMessages = new Map<string, Array<{ text: string; images?: ImageRef[]; mid?: string }>>();
+  private heldMessages = new Map<string, Array<QueueItem>>();
   /** Tabs whose effort changed mid-turn — the session restart is deferred to the
    *  next idle moment so we never interrupt (and silently drop) a live reply. */
   private pendingEffortRestart = new Set<string>();
@@ -1407,6 +1588,8 @@ export class PanelAgentManager {
       onThinking: this.opts.onThinking,
       onToolCall: this.opts.onToolCall,
       onSeen: this.opts.onSeen,
+      onEventDelivered: this.opts.onEventDelivered,
+      onEventUndelivered: this.opts.onEventUndelivered,
       panelServer: this.opts.makePanelServer?.(tabId),
       pluginPath: this.opts.pluginPath,
     }, backend);
@@ -1578,7 +1761,16 @@ export class PanelAgentManager {
     const resume = oldAgent.sessionId ?? undefined;
     const pending = oldAgent.takePending();
     const fresh = this.spawn(tabId, resume); // new agent owns the tab now
-    for (const item of pending) fresh.send(item.text, { images: item.images, mid: item.mid });
+    for (const item of pending) {
+      fresh.send(item.text, {
+        images: item.images,
+        mid: item.mid,
+        // #468 — carry the run-completion tokens over so the replacement agent
+        // acks the completion it inherited (rather than the journal replaying it
+        // as a second copy).
+        ...(item.eventTokens?.length ? { eventTokens: item.eventTokens } : {}),
+      });
+    }
     if (nudge) fresh.send(nudge);
     void oldAgent.stop(); // retire the old one; it's no longer mapped
     return pending.length;
@@ -1590,7 +1782,9 @@ export class PanelAgentManager {
   }
 
   /** Feed a ComfyUI execution event to an EXISTING agent (no-op if none — we
-   *  never spawn an agent just to react to an event). Returns whether delivered. */
+   *  never spawn an agent just to react to an event). Returns whether the agent
+   *  TOOK it onto its queue — not that it was read; a run completion carrying an
+   *  `eventToken` is only acked when the turn that delivered it ends (#468). */
   injectEvent(
     tabId: string,
     ev: {
@@ -1599,12 +1793,15 @@ export class PanelAgentManager {
       error?: string;
       note?: string;
       downloads?: Array<{ name: string; status: string }>;
+      prompt_id?: string;
+      run_correlation?: "matched" | "foreign" | "unidentified";
+      replayed?: boolean;
     },
+    opts?: { eventToken?: string },
   ): boolean {
     const agent = this.agents.get(tabId);
     if (!agent || agent.isStopped) return false; // best-effort; don't enqueue into a closed agent
-    agent.injectEvent(ev);
-    return true;
+    return agent.injectEvent(ev, opts);
   }
 
   /** Push a ComfyUI execution error to a tab's agent — interrupt the live turn
@@ -1630,10 +1827,25 @@ export class PanelAgentManager {
     const held = this.heldMessages.get(tabId);
     if (held?.length) {
       this.heldMessages.delete(tabId);
-      for (const item of held) agent.send(item.text, { images: item.images, mid: item.mid });
+      for (const item of held) {
+        agent.send(item.text, {
+          images: item.images,
+          mid: item.mid,
+          ...(item.eventTokens?.length ? { eventTokens: item.eventTokens } : {}),
+        });
+      }
       logger.info(
         `[panel-orchestrator] tab ${tabId.slice(0, 8)} re-delivering ${held.length} message(s) held from the previous failed start`,
       );
+    }
+    // #468 — a fresh agent is mapped and can take mail: replay any run
+    // completions journaled while this key had no live agent. Fired BEFORE
+    // start() so the replay is queued ahead of the session coming up, and after
+    // held mail so ordering stays chronological.
+    try {
+      this.opts.onAgentReady?.(tabId);
+    } catch (err) {
+      logger.warn(`[panel-orchestrator] tab ${tabId.slice(0, 8)} completion replay: ${msgOf(err)}`);
     }
     // start() now SELF-RESTARTS internally on session-end, so it only settles on
     // an intentional stop() or after it gives up (repeated immediate failures),

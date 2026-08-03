@@ -56,6 +56,7 @@ import { setComfyuiSecret, setAgentSecret, isAllowedAgentSecretKey } from "../se
 import { flattenUiWorkflow } from "../services/flatten-workflow.js";
 import { getNsfwConsent, setNsfwConsent } from "../services/panel-settings.js";
 import { QueueMonitor } from "../services/queue-monitor.js";
+import { RunCompletions } from "./run-completion-journal.js";
 import {
   getClient,
   getObjectInfo,
@@ -4278,10 +4279,25 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           return typeof pid === "string" && pid ? pid : null;
         })();
         QueueMonitor.markSelfQueued(queuedId);
+        // #468 — open a run ticket so the render's completion can be CORRELATED
+        // to this exact call by prompt id. This is what lets the orchestrator
+        // journal an undelivered completion and replay it into the right run
+        // instead of losing it while the agent works through a goal.
+        const correlatable = RunCompletions.openRun(queuedId, {
+          tabId: ctx.tabId,
+          ...(typeof args.to_node_id === "number" ? { toNodeId: args.to_node_id } : {}),
+        });
         // Append anti-poll guidance: the agent should go idle after queuing so the
         // executed event auto-injects the output image, rather than busy-polling.
-        const note =
-          "\n\n[IMPORTANT] You will be notified automatically with the output image(s)/video when the render finishes — do NOT poll queue (action:\"list\"), get_history, or list_output_images. Just end your turn now and wait for the result to be delivered to you.";
+        //
+        // HONEST WHEN WE CAN'T PROMISE IT (#468): the anti-poll instruction is only
+        // safe because the completion is correlated by prompt id. Without one — the
+        // panel forwarded no `prompt_id` — a later completion can only be reported as
+        // UNDETERMINED, so telling the agent to idle and wait would park it on a
+        // promise we can't keep. Say so and point at the verification path instead.
+        const note = correlatable
+          ? "\n\n[IMPORTANT] You will be notified automatically with the output image(s)/video when the render finishes — do NOT poll queue (action:\"list\"), get_history, or list_output_images. Just end your turn now and wait for the result to be delivered to you."
+          : "\n\n[IMPORTANT] The run was queued, but the panel reported NO prompt id for it, so a completion event CANNOT be correlated back to this run — its outcome will be reported to you as UNDETERMINED. Do NOT simply idle and wait indefinitely: end your turn, and if nothing arrives, confirm the outcome with get_history before acting on it.";
         // Backpressure note. A backlog is only alarming when it's a job we did NOT
         // queue (possibly foreign/stuck). Deliberately batching renders — a sweep,
         // a multi-variant comparison — is a NORMAL workflow, so a queue made of our

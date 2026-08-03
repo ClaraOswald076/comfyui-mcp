@@ -1,0 +1,351 @@
+// Durable-across-the-turn delivery of a render COMPLETION to the panel agent
+// (issue #468).
+//
+// THE FAILURE. `panel_run` queues a render on the user's canvas and tells the
+// agent — in so many words — "end your turn, you WILL be notified when it
+// finishes". That promise is kept by exactly one mechanism: the panel's
+// `agent_event` frame → PanelAgentManager.injectEvent → PanelAgent.queue. That
+// path used to be fire-and-forget in three independent ways:
+//
+//   1. UNCORRELATED. The completion carried no run identity the orchestrator
+//      ever looked at. `panel_run` learns ComfyUI's `prompt_id` (it already
+//      hands it to QueueMonitor.markSelfQueued) but nothing downstream used it,
+//      so a completion could not be tied to the run that was outstanding — and
+//      an outstanding run could never be known to be unanswered.
+//   2. SILENTLY DROPPED with no live agent. injectEvent returns false for a
+//      missing/stopped agent and the caller only logged on success. Nothing
+//      recorded the loss.
+//   3. DIED WITH A QUEUED-BUT-UNREAD ITEM. The event is only really delivered
+//      when channel() splices it into a turn. Everything before that — a
+//      stop()/retire(), a stall-abandoned turn, a takePending() race — discards
+//      it.
+//
+// AUTOMATIC GOAL CONTINUATION is what turns those windows from theoretical into
+// routine. An ordinary single run ends the agent's turn and leaves it idle, so
+// the completion lands in an empty queue and is drained immediately. A
+// continuation keeps the agent BUSY for the whole render: the completion sits in
+// `queue` (window 3) for minutes, and the continuation's own turn churn is
+// exactly what fires the deferred session restarts (effort/model change,
+// comfyui-MCP-env respawn) that applyPendingRestarts defers "until idle" and the
+// self-restart loop — each of which tears the listener down (windows 2 and 3)
+// underneath the very render whose completion is in flight.
+//
+// THE CONTRACT HERE.
+//  • Runs are ticketed by ComfyUI's `prompt_id`, opened by `panel_run`.
+//  • Every completion is CORRELATED ONCE, AT ARRIVAL, by EXACT prompt-id
+//    equality against an open ticket — never by recency, never re-derived later.
+//  • An uncorrelatable completion is still delivered, labelled UNDETERMINED. It
+//    is never swallowed and never allowed to answer for a run it can't be proven
+//    to belong to.
+//  • Undelivered completions are JOURNALED and replayed at the next delivery
+//    opportunity (a fresh agent spawn, a later completion for the same tab).
+//  • An entry is cleared only on a positive ack — the turn that CARRIED it
+//    ended. Handed to an agent that then died, it comes back and is replayed.
+//
+// LOCAL trust domain: this is accidental-loss bookkeeping, not a defense against
+// a hostile panel. Everything is in-memory and process-scoped; an orchestrator
+// restart drops the journal along with the agents it was addressing.
+
+import { logger } from "../utils/logger.js";
+
+/** How a completion relates to the runs this session queued. Computed ONCE, at
+ *  arrival, and frozen onto the journal entry — a replay never re-correlates,
+ *  so a completion can never drift onto a run that started after it landed. */
+export type RunCorrelation =
+  /** Exact prompt-id match with a run `panel_run` queued from this session. */
+  | { status: "matched"; promptId: string }
+  /** Carries a prompt id, but no run this session queued has that id. Real, but
+   *  NOT ours — it must never satisfy an outstanding `panel_run`. */
+  | { status: "foreign"; promptId: string }
+  /** No prompt id at all. Unattributable in principle; reported as such. */
+  | { status: "unidentified" };
+
+/** The completion payload as it arrives from the panel (the `agent_event` frame
+ *  minus the routing fields). Kept loose on purpose — the panel is free to add
+ *  fields and we forward what we're given. */
+export interface CompletionPayload {
+  kind?: string;
+  images?: Array<{ filename: string; subfolder?: string; type?: string }>;
+  error?: string;
+  note?: string;
+  prompt_id?: string;
+  [k: string]: unknown;
+}
+
+/** A run `panel_run` queued and is waiting on. */
+export interface RunTicket {
+  promptId: string;
+  /** Panel tab the run was queued from (diagnostics only — correlation is by
+   *  prompt id, which ComfyUI makes globally unique, so a ctx.tabId rebind
+   *  between queue and completion cannot break the match). */
+  tabId: string;
+  queuedAt: number;
+  toNodeId?: number;
+  /** True once a completion for this exact prompt id was acked as delivered. */
+  settled: boolean;
+}
+
+export type EntryState =
+  /** Waiting for a delivery attempt. */
+  | "pending"
+  /** Handed to a live agent; not proven consumed yet. */
+  | "handed_off";
+
+export interface JournalEntry {
+  token: string;
+  /** Composite agent key this completion is addressed to. An entry is only ever
+   *  replayed to THIS key (moved wholesale by `moveKey` on a tab-id migration) —
+   *  it is never broadcast or re-targeted. */
+  key: string;
+  payload: CompletionPayload;
+  correlation: RunCorrelation;
+  arrivedAt: number;
+  attempts: number;
+  state: EntryState;
+}
+
+/** Runs tracked at once. Ample for any real batch; bounded so a long session
+ *  can't grow the map without limit. */
+const MAX_TICKETS = 64;
+/** Undelivered completions held per agent key. */
+const MAX_ENTRIES_PER_KEY = 16;
+
+export class RunCompletionJournalImpl {
+  /** prompt id → ticket. Keyed globally: ComfyUI prompt ids are UUIDs, so an
+   *  exact match is proof of identity on its own and survives a session's tab
+   *  id being rebound between the queue and the completion. */
+  private tickets = new Map<string, RunTicket>();
+  /** token → entry (insertion-ordered, which is also delivery order). */
+  private entries = new Map<string, JournalEntry>();
+  private seq = 0;
+
+  /** `panel_run` queued a render. Returns false when ComfyUI/the panel gave us
+   *  no prompt id — the caller MUST then tell the agent its completion cannot be
+   *  correlated rather than promising a notification it may not be able to
+   *  attribute. */
+  openRun(promptId: string | null | undefined, meta: { tabId: string; toNodeId?: number }): boolean {
+    if (typeof promptId !== "string" || !promptId) return false;
+    const existing = this.tickets.get(promptId);
+    if (existing) {
+      // Same prompt id queued again (a re-run of an id ComfyUI reused, or a
+      // duplicate reply): reopen it rather than stacking a second ticket, so one
+      // prompt id always means one run.
+      existing.settled = false;
+      existing.queuedAt = Date.now();
+      return true;
+    }
+    this.tickets.set(promptId, {
+      promptId,
+      tabId: meta.tabId,
+      queuedAt: Date.now(),
+      ...(typeof meta.toNodeId === "number" ? { toNodeId: meta.toNodeId } : {}),
+      settled: false,
+    });
+    this.trimTickets();
+    return true;
+  }
+
+  /** Classify a completion against the open runs. EXACT prompt-id equality only:
+   *  there is deliberately no "the newest outstanding run" fallback, because
+   *  attributing a completion to the wrong run is worse than not attributing it
+   *  at all. */
+  correlate(payload: CompletionPayload): RunCorrelation {
+    const pid = typeof payload.prompt_id === "string" ? payload.prompt_id.trim() : "";
+    if (!pid) return { status: "unidentified" };
+    return this.tickets.has(pid) ? { status: "matched", promptId: pid } : { status: "foreign", promptId: pid };
+  }
+
+  /**
+   * Journal a completion addressed to `key`. Correlation is computed here, once.
+   *
+   * DEDUPE: an identified completion (matched or foreign) collapses onto any
+   * existing undelivered entry for the same key + prompt id — one run can never
+   * produce two deliveries, however many times the panel re-sends it. An
+   * unidentified completion has nothing to dedupe on, so it is always a new
+   * entry (bounded by MAX_ENTRIES_PER_KEY).
+   */
+  record(key: string, payload: CompletionPayload): JournalEntry {
+    const correlation = this.correlate(payload);
+    if (correlation.status !== "unidentified") {
+      for (const entry of this.entries.values()) {
+        if (
+          entry.key === key &&
+          entry.correlation.status !== "unidentified" &&
+          entry.correlation.promptId === correlation.promptId
+        ) {
+          entry.payload = payload;
+          // Re-open it for delivery: a re-send is the panel telling us the
+          // outcome again, and the previous hand-off is not proven consumed.
+          if (entry.state === "handed_off") entry.state = "pending";
+          return entry;
+        }
+      }
+    }
+    const entry: JournalEntry = {
+      token: `rc${++this.seq}`,
+      key,
+      payload,
+      correlation,
+      arrivedAt: Date.now(),
+      attempts: 0,
+      state: "pending",
+    };
+    this.entries.set(entry.token, entry);
+    this.trimEntries(key);
+    return entry;
+  }
+
+  /** Entries awaiting a delivery attempt for this key, in arrival order. */
+  pending(key: string): JournalEntry[] {
+    const out: JournalEntry[] = [];
+    for (const entry of this.entries.values()) {
+      if (entry.key === key && entry.state === "pending") out.push(entry);
+    }
+    return out;
+  }
+
+  /**
+   * Deliver every pending entry for `key`, in ARRIVAL order, stopping at the
+   * first refusal so a newer completion can never overtake an older one that is
+   * still stuck.
+   *
+   * `inject` returns whether the agent TOOK the payload onto its queue — not
+   * that it was read. The entry stays journaled either way; only `ack` (the turn
+   * that carried it ended) removes it. That is the whole durability property:
+   * hand it to an agent that then dies and it comes back here.
+   *
+   * NOTHING is re-correlated: the payload is stamped with the verdict frozen at
+   * arrival, so a replay can never be re-attributed to a run that started later.
+   */
+  deliverPending(
+    key: string,
+    inject: (payload: CompletionPayload, token: string) => boolean,
+  ): { delivered: number; blockedOn: JournalEntry | null } {
+    let delivered = 0;
+    for (const entry of this.pending(key)) {
+      const payload: CompletionPayload = {
+        ...entry.payload,
+        run_correlation: entry.correlation.status,
+        ...(entry.correlation.status === "unidentified"
+          ? {}
+          : { prompt_id: entry.correlation.promptId }),
+        // Second and later attempts ARE re-deliveries — say so, so the agent
+        // reads a replay as "this landed late", not as another render.
+        ...(entry.attempts > 0 ? { replayed: true } : {}),
+      };
+      const handedOff = inject(payload, entry.token);
+      this.noteAttempt(entry.token, handedOff);
+      if (!handedOff) return { delivered, blockedOn: entry };
+      delivered += 1;
+    }
+    return { delivered, blockedOn: null };
+  }
+
+  /** All still-unacked entries for a key (pending OR handed off) — diagnostics. */
+  outstanding(key: string): JournalEntry[] {
+    return [...this.entries.values()].filter((e) => e.key === key);
+  }
+
+  /** Record the outcome of a delivery attempt. `handedOff` true = an agent took
+   *  it onto its queue (not yet proof it was read). */
+  noteAttempt(token: string, handedOff: boolean): void {
+    const entry = this.entries.get(token);
+    if (!entry) return;
+    entry.attempts += 1;
+    entry.state = handedOff ? "handed_off" : "pending";
+  }
+
+  /** The turn that CARRIED this completion ended — it genuinely reached the
+   *  agent. Drop the entry and settle its run. */
+  ack(token: string): void {
+    const entry = this.entries.get(token);
+    if (!entry) return;
+    this.entries.delete(token);
+    if (entry.correlation.status === "matched") {
+      const ticket = this.tickets.get(entry.correlation.promptId);
+      if (ticket) ticket.settled = true;
+    }
+  }
+
+  /** An agent gave a hand-off back undelivered (it was stopped, or its turn was
+   *  abandoned before it could be read). Re-arm it for replay. */
+  release(token: string): void {
+    const entry = this.entries.get(token);
+    if (!entry) return;
+    entry.state = "pending";
+  }
+
+  /** Move every entry addressed to `from` onto `to` — a panel tab-id migration
+   *  re-keys the agent, and its undelivered completions must move WITH it. This
+   *  re-addresses, it never broadens: entries for other keys are untouched. */
+  moveKey(from: string, to: string): void {
+    if (from === to) return;
+    for (const entry of this.entries.values()) {
+      if (entry.key === from) entry.key = to;
+    }
+  }
+
+  /** Drop everything addressed to a key that will never come back (tab closed).
+   *  Logs any completion that dies unacked — a loss must never be silent. */
+  forget(key: string): void {
+    for (const [token, entry] of [...this.entries]) {
+      if (entry.key !== key) continue;
+      this.entries.delete(token);
+      logger.warn(
+        `[run-completions] dropping an undelivered completion for ${describe(entry.correlation)} — its tab (${key.slice(0, 8)}) is gone`,
+      );
+    }
+  }
+
+  /** Test/diagnostic helpers. */
+  ticketFor(promptId: string): RunTicket | undefined {
+    return this.tickets.get(promptId);
+  }
+  reset(): void {
+    this.tickets.clear();
+    this.entries.clear();
+    this.seq = 0;
+  }
+
+  private trimTickets(): void {
+    while (this.tickets.size > MAX_TICKETS) {
+      // Prefer evicting a settled ticket; otherwise the oldest. An evicted OPEN
+      // ticket means a later completion for it correlates as "foreign" — i.e.
+      // UNDETERMINED, which is the honest reading once we've forgotten the run.
+      let victim: string | null = null;
+      for (const [pid, t] of this.tickets) {
+        if (t.settled) {
+          victim = pid;
+          break;
+        }
+      }
+      if (!victim) victim = this.tickets.keys().next().value ?? null;
+      if (!victim) return;
+      this.tickets.delete(victim);
+    }
+  }
+
+  private trimEntries(key: string): void {
+    const mine = [...this.entries.values()].filter((e) => e.key === key);
+    while (mine.length > MAX_ENTRIES_PER_KEY) {
+      const victim = mine.shift();
+      if (!victim) return;
+      this.entries.delete(victim.token);
+      logger.error(
+        `[run-completions] journal for tab ${key.slice(0, 8)} exceeded ${MAX_ENTRIES_PER_KEY} undelivered completions — dropped the oldest (${describe(victim.correlation)})`,
+      );
+    }
+  }
+}
+
+/** Short human label for a correlation, for logs. */
+export function describe(correlation: RunCorrelation): string {
+  return correlation.status === "unidentified"
+    ? "an unidentified run"
+    : `${correlation.status === "matched" ? "run" : "foreign run"} ${correlation.promptId}`;
+}
+
+/** Process-wide journal (mirrors the QueueMonitor singleton): `panel_run` opens
+ *  tickets from the tool layer while the orchestrator's panel-event handler
+ *  records and replays completions, with no ctx plumbing between them. */
+export const RunCompletions = new RunCompletionJournalImpl();
