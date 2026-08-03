@@ -241,4 +241,65 @@ describe("Claude backend turn markers (#728 r4)", () => {
     expect(results[1]).toMatchObject({ ok: true, turn: 1 });
     expect(errorsOf(events)).toHaveLength(1); // still only B's synthetic error
   });
+
+  it("a newer interrupted turn's terminal does not re-consume a parked trace (#728 r6)", async () => {
+    // The r6 codex-gate finding: with A parked (its result already declared
+    // lost), a NEW interrupted turn C's interrupted terminal must pop/stamp
+    // C's OWN trace — blindly popping the oldest (parked A) stamps A, so the
+    // panel dead-letters C's real terminal and C wedges. Each trace lands at
+    // most once; a landing with no unconsumed candidate fails closed.
+    let releaseB!: () => void;
+    let releaseC!: () => void;
+    const gateB = new Promise<void>((resolve) => {
+      releaseB = resolve;
+    });
+    const gateC = new Promise<void>((resolve) => {
+      releaseC = resolve;
+    });
+    async function* threeTurns() {
+      yield { text: "turn A" };
+      await gateB;
+      yield { text: "turn B" };
+      await gateC;
+      yield { text: "turn C" };
+    }
+    const { backend, events, done } = await startBackend(threeTurns());
+    hoisted.queue.push(INIT);
+    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(1));
+
+    // A is interrupted (its result will never come); B's success terminal
+    // parks A and classifies/stamps B (the permanent-loss path).
+    await backend.interrupt();
+    releaseB();
+    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(2));
+    hoisted.queue.push(RESULT_SUCCESS); // B's terminal → skip/park A
+    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(1));
+    expect(resultsOf(events)[0]).toMatchObject({ turn: 2 });
+
+    // C is interrupted; C's interrupted terminal must pop/stamp C's OWN trace —
+    // NOT the parked A.
+    releaseC();
+    await vi.waitFor(() => expect(hoisted.promptsSeen).toBe(3));
+    await backend.interrupt(); // marks the newest unresolved trace — C
+    hoisted.queue.push(RESULT_INTERRUPTED); // C's landing
+    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(2));
+    expect(resultsOf(events)[1]).toMatchObject({ ok: true, turn: 3 });
+
+    // A's OWN late landing still pops its parked trace — exactly once.
+    hoisted.queue.push(RESULT_INTERRUPTED); // A's landing
+    await vi.waitFor(() => expect(resultsOf(events)).toHaveLength(3));
+    expect(resultsOf(events)[2]).toMatchObject({ ok: true, turn: 1 });
+
+    // A SECOND landing with no unconsumed candidate is anomalous → fail closed
+    // (the #745 traceless rule): unverifiable, ok:false, never fabricated, and
+    // UNMARKED so the panel still sees it.
+    hoisted.queue.push(RESULT_INTERRUPTED);
+    hoisted.queue.end();
+    await done;
+    const results = resultsOf(events);
+    expect(results).toHaveLength(4);
+    expect(results[3]).toMatchObject({ ok: false });
+    expect(results[3].turn).toBeUndefined();
+    expect(errorsOf(events).some((e) => /could not be matched|unverifiable/i.test(e.message))).toBe(true);
+  });
 });

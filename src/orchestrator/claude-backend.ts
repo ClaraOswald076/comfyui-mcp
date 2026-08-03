@@ -283,6 +283,11 @@ export class ClaudeBackend implements AgentBackend {
    *  jump in lastResultTurnId, and lets a genuinely interrupted late landing
    *  still pop its OWN trace (a backward pop) and classify/stamp by its flags. */
   private parkedInterrupted = new Set<number>();
+  /** Interrupted traces whose late landing already HAPPENED (moved out of
+   *  parkedInterrupted on the pop) — consumption tracking so a SECOND
+   *  interrupted landing can never re-consume a landed trace; with no
+   *  unconsumed candidate it fails closed as traceless (#728 r6). */
+  private consumedInterrupted = new Set<number>();
   private turns: Array<{
     id: number;
     hasContent: boolean;
@@ -425,6 +430,7 @@ export class ClaudeBackend implements AgentBackend {
     this.lastResultTurnId = this.turnSeq;
     this.classificationPoisoned = false;
     this.parkedInterrupted.clear(); // dead session's parks die with it
+    this.consumedInterrupted.clear(); // …and its landing history
     this.markerBase = this.lastResultTurnId; // turn markers are run-relative (#728)
     // Wrap the neutral channel: shape each turn into the SDK's native form right
     // before it's read, so PanelAgent never deals in SDKUserMessage.
@@ -685,8 +691,8 @@ export class ClaudeBackend implements AgentBackend {
         // is unrecoverable once crossed, so the poison is terminal for the
         // session — content evidence must not rescue it (it accrued to a
         // mismatched trace, which is not proof of ITS turn's success).
-        // SUBTYPE-AWARE correlation (#728 r5): an interrupted turn ends with an
-        // INTERRUPTED-subtype result, so a result with any OTHER subtype can
+        // SUBTYPE-AWARE correlation (#728 r5/r6): an interrupted turn ends with
+        // an INTERRUPTED-subtype result, so a result with any OTHER subtype can
         // never be an interrupted trace's terminal. If the oldest trace is
         // marked interrupted and this result is NOT, that turn's result is
         // permanently LOST (the panel's fallback released the next turn long
@@ -694,20 +700,39 @@ export class ClaudeBackend implements AgentBackend {
         // interrupted trace(s) and pop the first non-interrupted one, for
         // classification AND for the turn-marker stamp (otherwise the new turn's
         // terminal stamps with the abandoned turn's marker and PanelAgent
-        // dead-letters it — a permanent wedge). A genuinely INTERRUPTED-subtype
-        // landing does not skip: it pops the oldest (parked) interrupted trace
-        // and classifies/stamps by ITS flags.
+        // dead-letters it — a permanent wedge).
+        //
+        // An INTERRUPTED-subtype landing does not skip — but it does NOT blindly
+        // pop the oldest trace either (r6): a parked trace's result was already
+        // declared lost, so a fresh landing belongs to the oldest UNPARKED
+        // interrupted trace (a NEWER turn interrupted after the park — blindly
+        // popping parked A would stamp C's real terminal with A's marker and
+        // wedge C). Only when no unparked candidate remains is it the parked
+        // trace's own late landing. Each trace lands at most once: a landed
+        // park moves to consumedInterrupted, so a SECOND landing for the same
+        // turn finds no candidate and fails closed (traceless) below.
         const resultSubtype: string = message.subtype;
         const interruptedLanding = resultSubtype === "interrupted";
-        let traceIndex = 0;
+        let trace: (typeof this.turns)[number] | null = null;
         if (!interruptedLanding) {
+          let traceIndex = 0;
           while (traceIndex < this.turns.length - 1 && this.turns[traceIndex].interrupted) {
             this.parkedInterrupted.add(this.turns[traceIndex].id);
             traceIndex += 1;
           }
+          trace = traceIndex === 0 ? (this.turns.shift() ?? null) : (this.turns.splice(traceIndex, 1)[0] ?? null);
+        } else {
+          let idx = this.turns.findIndex((t) => t.interrupted && !this.parkedInterrupted.has(t.id));
+          if (idx < 0) {
+            idx = this.turns.findIndex(
+              (t) =>
+                t.interrupted &&
+                this.parkedInterrupted.has(t.id) &&
+                !this.consumedInterrupted.has(t.id),
+            );
+          }
+          trace = idx >= 0 ? (this.turns.splice(idx, 1)[0] ?? null) : null;
         }
-        const trace =
-          traceIndex === 0 ? (this.turns.shift() ?? null) : (this.turns.splice(traceIndex, 1)[0] ?? null);
         let unverifiable: string | null = null;
         if (this.classificationPoisoned) {
           unverifiable = "Turn bookkeeping was poisoned by an earlier overflow — no result in this session can be verified";
@@ -723,8 +748,9 @@ export class ClaudeBackend implements AgentBackend {
               if (!this.parkedInterrupted.has(id)) crossesGap = true;
             }
           } else if (trace.id <= this.lastResultTurnId) {
-            // Backward pop: legit only for a parked interrupted trace's landing.
-            crossesGap = !this.parkedInterrupted.has(trace.id);
+            // Backward pop: legit only for a parked (or landed-once) interrupted
+            // trace's deferred landing.
+            crossesGap = !(this.parkedInterrupted.has(trace.id) || this.consumedInterrupted.has(trace.id));
           }
           if (crossesGap) {
             // The pop crossed an evicted-turn gap → poison the session (do NOT
@@ -736,7 +762,9 @@ export class ClaudeBackend implements AgentBackend {
               `[claude-backend] result crosses an evicted-turn gap (popped turn ${trace.id}, expected ${this.lastResultTurnId + 1}) — unverifiable; classification poisoned for the rest of the session (#740)`,
             );
           } else {
-            this.parkedInterrupted.delete(trace.id);
+            // A legitimately popped park is now LANDED — consumed once, so a
+            // second landing for it finds no candidate (#728 r6).
+            if (this.parkedInterrupted.delete(trace.id)) this.consumedInterrupted.add(trace.id);
             if (trace.id > this.lastResultTurnId) this.lastResultTurnId = trace.id;
           }
         }
@@ -751,7 +779,10 @@ export class ClaudeBackend implements AgentBackend {
         let ok =
           resultSubtype === "success" ||
           (resultSubtype === "interrupted" && trace !== null && trace.interrupted);
-        if (ok && unverifiable !== null) {
+        if (unverifiable !== null) {
+          // Fail closed with the reason VISIBLE — including an anomalous
+          // interrupted landing with no unconsumed candidate (#728 r6), whose
+          // ok is already false.
           ok = false;
           yield {
             type: "error",
