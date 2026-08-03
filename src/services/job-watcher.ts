@@ -18,6 +18,7 @@ import { AssetRegistry } from "./asset-registry.js";
 import type { WorkflowJSON } from "../comfyui/types.js";
 import {
   analyzeHistoryEntry,
+  hasAffirmativeSuccessStatus,
   normalizeHistoryMessages,
   type ExecutionStats,
   type ExecutionErrorDetails,
@@ -302,9 +303,16 @@ async function handleCompletion(
     const notification = buildCompletionNotification(promptId, entry, state.startTime);
 
     // Register outputs with the AssetRegistry so they can be referenced by
-    // asset_id for view_image / regenerate. Only register on successful
-    // completion with a stored workflow snapshot.
-    if (notification.status === "success" && state.workflow) {
+    // asset_id for view_image / regenerate. Registration requires AFFIRMATIVE
+    // success evidence — the shared predicate (job-history) both registration
+    // paths use. The live watch only detects "finished" (WS and poll both
+    // route success AND error to this handler), and notification.status is a
+    // derivation that defaults to success when messages are absent/malformed;
+    // the history entry's own status_str + messages are therefore the
+    // AUTHORITATIVE status source for registration on this path too. (The
+    // derived status still drives the completion FILE, where presenting a
+    // best-effort outcome is a display matter, not an asset guarantee.)
+    if (hasAffirmativeSuccessStatus(entry) && state.workflow) {
       try {
         const records = AssetRegistry.register({
           promptId,

@@ -1,7 +1,7 @@
 import { getHistory, type HistoryEntry } from "../comfyui/client.js";
 import { buildCompletionNotification } from "./job-watcher.js";
 import { extractWorkflowGraph } from "./history-select.js";
-import { normalizeHistoryMessages } from "./job-history.js";
+import { hasAffirmativeSuccessStatus, normalizeHistoryMessages } from "./job-history.js";
 import { AssetRegistry } from "./asset-registry.js";
 import { logger } from "../utils/logger.js";
 
@@ -20,14 +20,15 @@ import { logger } from "../utils/logger.js";
  * createdAt (so ordering, `since` filters, and TTL expiry stay truthful).
  *
  * Nothing is fabricated: an entry registers only when its history status
- * affirmatively says success (status_str === "success" AND no error/interrupt
- * message — missing, unknown, or contradictory status fails toward NOT
- * registering), it carries a usable prompt graph, it lists real image outputs,
- * and it has a real execution_success timestamp for createdAt (execution_start
- * is not completion time, and "now" would silently misorder — untimed entries
- * are skipped, not guessed). Entries older than the registry TTL register but
- * read as expired immediately — the TTL stays the single source of truth for
- * record lifetime.
+ * affirmatively says success (hasAffirmativeSuccessStatus — the predicate
+ * shared with the watched path: status_str === "success" AND no
+ * error/interrupt message, with missing, unknown, or contradictory status
+ * failing toward NOT registering), it carries a usable prompt graph, it lists
+ * real image outputs, and it has a real execution_success timestamp for
+ * createdAt (execution_start is not completion time, and "now" would silently
+ * misorder — untimed entries are skipped, not guessed). Entries older than
+ * the registry TTL register but read as expired immediately — the TTL stays
+ * the single source of truth for record lifetime.
  */
 
 export interface ReconcileResult {
@@ -88,22 +89,15 @@ export async function reconcileAssetsFromHistory(opts: {
   let skippedExisting = 0;
 
   for (const [promptId, entry] of completed) {
-    // Eligibility keys on the HISTORY entry's own status fields, not the
-    // notification builder's default: buildCompletionNotification assumes
-    // success unless it finds a well-formed execution_error/interrupted
-    // message, which would admit a status_str:"error" entry whose messages
-    // are missing or malformed. Anything short of an affirmative success
-    // fails toward NOT registering.
-    if (entry.status?.status_str !== "success") continue;
+    // Eligibility keys on the HISTORY entry's own status via the shared
+    // affirmative-success predicate (job-history) — the SAME gate the watched
+    // path registers through, never the notification builder's default-success.
+    if (!hasAffirmativeSuccessStatus(entry)) continue;
 
     // Parse outputs exactly like the watched path does — same extraction and
-    // URL building. The notification's message-derived status acts as a veto:
-    // a contradictory execution_error/interrupted message rejects the entry
-    // even when status_str says success.
+    // URL building.
     const notification = buildCompletionNotification(promptId, entry, now());
-    if (notification.status !== "success" || notification.outputs.length === 0) {
-      continue;
-    }
+    if (notification.outputs.length === 0) continue;
     // The recorded graph is the provenance regenerate / get_asset_metadata
     // rely on; without it there is nothing truthful to register.
     const workflow = extractWorkflowGraph(entry);

@@ -35,6 +35,28 @@ export interface HistoryAnalysis {
 
 export type HistoryStatusMessage = readonly [string, Record<string, unknown>];
 
+/**
+ * Affirmative-success test for a history entry — the ONE eligibility gate both
+ * asset-registration paths (JobWatcher.handleCompletion and the list_assets
+ * history reconcile) share, so a run can never become an asset without real
+ * success evidence (#751 codex gate r3).
+ *
+ * It deliberately does NOT trust buildCompletionNotification's derived status:
+ * that derivation defaults to "success" whenever messages carry no well-formed
+ * execution_error/interrupted event, which silently promotes a run ComfyUI
+ * marked status_str:"error" (or any entry with missing/malformed status or
+ * messages) to "success". Here the entry's OWN status_str must affirm success
+ * AND no error/interrupt message may exist; anything short fails toward NOT
+ * registering.
+ */
+export function hasAffirmativeSuccessStatus(entry: HistoryEntry): boolean {
+  if (entry?.status?.status_str !== "success") return false;
+  const messages = normalizeHistoryMessages(entry);
+  return !messages.some(
+    (m) => m[0] === "execution_error" || m[0] === "execution_interrupted",
+  );
+}
+
 const executionErrorSchema = z.object({
   node_id: z.union([z.string(), z.number()]).optional(),
   node_type: z.string().optional(),
