@@ -131,6 +131,17 @@ export interface JournalEntry {
    *  it belongs to the older run. Still delivered, but it can no longer be merged
    *  into, settle a ticket, or memoize a delivery. */
   superseded?: boolean;
+  /**
+   * This entry ARRIVED while its prompt id was already known to be reused, so
+   * the id cannot tell which run it belongs to.
+   *
+   * Stamped on the ENTRY, not read from the ticket, because tickets are
+   * evictable: 64 later runs drop the `reused` ticket, `idReused` goes false,
+   * and a subsequent ambiguous completion would coalesce into this one — the ack
+   * of one then removing the only entry and losing the other. The entry outlives
+   * the ticket, so the ambiguity does too.
+   */
+  ambiguousId?: boolean;
   /** Evicted-completion count this entry is carrying out on the tab's behalf, so
    *  the disclosure rides a real delivery instead of a side map that could be
    *  discarded before it is ever reported. */
@@ -367,6 +378,8 @@ export class RunCompletionJournalImpl {
   record(key: string, payload: CompletionPayload): JournalEntry | null {
     const correlation = this.correlate(key, payload);
     let idlessRepeat = false;
+    /** This id already stands for more than one run (see RunTicket.reused). */
+    let idReused = false;
     if (correlation.status !== "unidentified") {
       // Already DELIVERED once (its carrying turn ended, so the entry is gone).
       // A panel that re-sends the frame must not produce a second delivery — the
@@ -380,7 +393,7 @@ export class RunCompletionJournalImpl {
       // generation a completion belongs to, so suppressing on them could swallow
       // the newer run's real result. A duplicate delivery (labelled UNDETERMINED)
       // is the correct trade here.
-      const idReused = settledTicket?.reused === true && settledTicket.tabId === key;
+      idReused = settledTicket?.reused === true && settledTicket.tabId === key;
       if (
         !idReused &&
         (this.delivered.has(deliveredKey(key, correlation.promptId)) ||
@@ -403,6 +416,10 @@ export class RunCompletionJournalImpl {
         if (
           entry.key === key &&
           !entry.superseded && // a re-queued run never merges into the old one's entry
+          // …and never merge into one that ARRIVED under a reused id. The ticket
+          // that made `idReused` true above is evictable, so after 64 later runs
+          // the incoming side can no longer tell — but the entry still can.
+          !entry.ambiguousId &&
           entry.correlation.status !== "unidentified" &&
           entry.correlation.promptId === correlation.promptId
         ) {
@@ -471,6 +488,8 @@ export class RunCompletionJournalImpl {
       ...(correlation.status === "unidentified"
         ? { fingerprint: idlessFingerprint(key, payload), ...(idlessRepeat ? { possibleRepeat: true } : {}) }
         : {}),
+      // Freeze the ambiguity onto the entry — see JournalEntry.ambiguousId.
+      ...(idReused ? { ambiguousId: true } : {}),
     };
     this.entries.set(entry.token, entry);
     this.trimEntries(key);

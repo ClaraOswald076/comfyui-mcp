@@ -862,6 +862,29 @@ describe("run completion journal correlation (#468)", () => {
     expect(journal.pending("t")[0].payload.note).toBe("run B (real)");
   });
 
+  it("the no-coalesce rule survives the reused TICKET being evicted", () => {
+    // Tickets are the smallest bound (64) and evictable. If ambiguity were read
+    // only from the live ticket, 64 later runs would make the incoming side
+    // forget — and the next ambiguous completion would merge into the earlier
+    // one, whose ack then removes the sole entry. The mark lives on the ENTRY,
+    // which outlives the ticket.
+    journal.openRun(PROMPT_A, { tabId: "t" });
+    journal.openRun(PROMPT_A, { tabId: "t" }); // reused
+    const late = journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "run A (late)" });
+    expect(late!.ambiguousId).toBe(true);
+    journal.deliverPending("t", () => true); // handed off, unread
+
+    // Evict the reused ticket with 64+ later runs.
+    for (let i = 0; i < 80; i++) journal.openRun(`later-${i}`, { tabId: "t" });
+    expect(journal.ticketFor(PROMPT_A)).toBeUndefined();
+
+    const real = journal.record("t", { kind: "executed", prompt_id: PROMPT_A, note: "run B (real)" });
+    expect(real!.token).not.toBe(late!.token); // still its OWN entry
+    journal.ack(late!.token);
+    expect(journal.pending("t")).toHaveLength(1);
+    expect(journal.pending("t")[0].payload.note).toBe("run B (real)");
+  });
+
   it("re-queuing a prompt id SUPERSEDES the old entry — the old result can't answer for the new run", () => {
     // Prompt-id reuse while the previous completion is still in an agent's queue.
     // Merging into that entry would hand the OLD result over as the NEW run's

@@ -18,6 +18,7 @@ import {
   readdirSync,
   rmSync,
   writeSync,
+  appendFileSync,
 } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir, homedir, networkInterfaces } from "node:os";
@@ -2152,14 +2153,38 @@ export async function runPanelOrchestrator(): Promise<void> {
     // `process.exit()` immediately after can terminate with the record still
     // queued and never written. Since the whole in-memory-journal tradeoff rests
     // on "the disclosure always happens", the write it rests on must block.
-    for (const [panelTab, runs] of byTab) {
-      const line = `[panel-orchestrator] tab ${panelTab.slice(0, 8)} — exiting with ${runs.length} undelivered run completion(s), outcome UNDETERMINED: ${runs.join("; ")}`;
+    // ONE write for every tab, not one per tab: a synchronous write to a full
+    // pipe blocks until its reader drains, so the smallest possible number of
+    // bytes is the right shape. (Blocking here is the deliberate cost of a
+    // guaranteed record — a stderr reader that has stopped consuming is a broken
+    // environment, and losing the disclosure would undercut the whole
+    // in-memory-journal tradeoff.)
+    const record = [...byTab]
+      .map(
+        ([panelTab, runs]) =>
+          `[panel-orchestrator] tab ${panelTab.slice(0, 8)} — exiting with ${runs.length} undelivered run completion(s), outcome UNDETERMINED: ${runs.join("; ")}`,
+      )
+      .join("\n");
+    // Try each SYNCHRONOUS sink in turn — stderr, stdout, then a file beside the
+    // lockfile. The async logger is the last resort only: on the
+    // uncaughtException path `process.exit(1)` follows immediately, so anything
+    // merely queued would be dropped.
+    const sinks: Array<() => void> = [
+      () => writeSync(2, `${record}\n`),
+      () => writeSync(1, `${record}\n`),
+      () => appendFileSync(`${lockPath}.lost-completions.log`, `${new Date().toISOString()} ${record}\n`),
+    ];
+    let recorded = false;
+    for (const write of sinks) {
       try {
-        writeSync(2, `${line}\n`);
+        write();
+        recorded = true;
+        break;
       } catch {
-        logger.error(line); // fd 2 unavailable — best-effort through the logger
+        /* try the next sink */
       }
     }
+    if (!recorded) logger.error(record); // every synchronous sink failed
     try {
       for (const [panelTab, runs] of byTab) {
         bridge.push(
