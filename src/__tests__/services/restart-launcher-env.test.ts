@@ -109,9 +109,11 @@ const SM_DATA = resolve("StabilityMatrixTest", "Data");
 const SM_PKG = join(SM_DATA, "Packages", "ComfyUI");
 const SM_MAIN = join(SM_PKG, "main.py");
 const SM_PY = join(SM_PKG, "venv", "Scripts", "python.exe");
-const SM_GIT_DIR = join(SM_DATA, "PortableGit", "cmd");
+const SM_GIT_ROOT = join(SM_DATA, "PortableGit");
+const SM_GIT_DIR = join(SM_GIT_ROOT, "cmd");
 const SM_GIT_EXE = join(SM_GIT_DIR, "git.exe");
-const SM_FFMPEG_DIR = join(SM_DATA, "Assets", "ffmpeg", "bin");
+const SM_FFMPEG_ROOT = join(SM_DATA, "Assets", "ffmpeg");
+const SM_FFMPEG_DIR = join(SM_FFMPEG_ROOT, "bin");
 const SM_FFMPEG_EXE = join(SM_FFMPEG_DIR, "ffmpeg.exe");
 
 // A plain install (no launcher marker anywhere in its paths).
@@ -120,7 +122,9 @@ const PLAIN_MAIN = join(PLAIN_BASE, "main.py");
 const PLAIN_PY = join(PLAIN_BASE, "venv", "bin", "python");
 
 // Pinokio: an app tree under a `pinokio` root.
-const PINOKIO_APP = resolve("pinokio", "api", "comfy.git", "app");
+const PINOKIO_HOME = resolve("pinokio");
+const PINOKIO_API = join(PINOKIO_HOME, "api");
+const PINOKIO_APP = join(PINOKIO_API, "comfy.git", "app");
 const PINOKIO_MAIN = join(PINOKIO_APP, "main.py");
 const PINOKIO_PY = join(PINOKIO_APP, "env", "bin", "python");
 
@@ -199,8 +203,19 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("restart_comfyui — Stability Matrix launcher environment (#776)", () => {
-  function useStabilityMatrix(opts?: { assets?: boolean }): void {
-    const assets = opts?.assets ?? true;
+  /**
+   * @param git    the bundled git binary is resolvable
+   * @param ffmpeg the bundled ffmpeg binary is resolvable
+   * @param roots  which tooling ROOT directories exist (the detection evidence)
+   */
+  function useStabilityMatrix(opts?: {
+    git?: boolean;
+    ffmpeg?: boolean;
+    roots?: string[];
+  }): void {
+    const git = opts?.git ?? true;
+    const ffmpeg = opts?.ffmpeg ?? true;
+    const roots = opts?.roots ?? [SM_GIT_ROOT, SM_FFMPEG_ROOT];
     mockFindComfyuiPython.mockReturnValue(SM_PY);
     mockLiveRootFromArgv.mockReturnValue(SM_PKG);
     mockGetSystemStats.mockResolvedValue({
@@ -211,8 +226,10 @@ describe("restart_comfyui — Stability Matrix launcher environment (#776)", () 
     mockExistsSync.mockImplementation((p: string) => {
       const s = String(p);
       if (s === SM_MAIN || s === SM_PY) return true;
-      if (!assets) return false;
-      return s === SM_GIT_EXE || s === SM_FFMPEG_EXE;
+      if (roots.includes(s)) return true;
+      if (git && s === SM_GIT_EXE) return true;
+      if (ffmpeg && s === SM_FFMPEG_EXE) return true;
+      return false;
     });
   }
 
@@ -256,11 +273,7 @@ describe("restart_comfyui — Stability Matrix launcher environment (#776)", () 
     killSpy.mockRestore();
   });
 
-  it("REFUSES before stopping when the launcher's tooling cannot be found on disk", async () => {
-    // The install is provably launcher-owned, but its Git/FFmpeg assets are gone,
-    // so its environment cannot be reproduced. Guessing (= inheriting ours) is
-    // exactly what took the server down in #776.
-    useStabilityMatrix({ assets: false });
+  async function expectRefusedBeforeStopping(): Promise<string> {
     mockLivePortThenFree();
     spawnCapturingChildren();
     const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
@@ -270,9 +283,6 @@ describe("restart_comfyui — Stability Matrix launcher environment (#776)", () 
     expect(result.stopped).toBe(false);
     expect(result.started).toBe(false);
     expect(result.message).toMatch(/refusing to restart/i);
-    expect(result.message).toMatch(/Stability Matrix/i);
-    // Told to use the owning launcher — not the generic COMFYUI_PATH advice.
-    expect(result.message).toMatch(/Restart ComfyUI from Stability Matrix/i);
     // NOTHING was stopped and nothing was spawned.
     expect(mockSpawn).not.toHaveBeenCalled();
     expect(killSpy).not.toHaveBeenCalled();
@@ -281,11 +291,70 @@ describe("restart_comfyui — Stability Matrix launcher environment (#776)", () 
     ).toBe(false);
 
     killSpy.mockRestore();
+    return result.message;
+  }
+
+  it("REFUSES before stopping when NONE of the launcher's tooling resolves", async () => {
+    // Provably launcher-owned (both tooling roots are there) but neither binary
+    // resolves — the environment cannot be reproduced. Guessing (= inheriting
+    // ours) is exactly what took the server down in #776.
+    useStabilityMatrix({ git: false, ffmpeg: false });
+
+    const message = await expectRefusedBeforeStopping();
+
+    expect(message).toMatch(/Stability Matrix/i);
+    // Told to use the owning launcher — not the generic COMFYUI_PATH advice.
+    expect(message).toMatch(/Restart ComfyUI from Stability Matrix/i);
+  });
+
+  it("REFUSES before stopping on a PARTIAL layout — FFmpeg present but the bundled Git missing", async () => {
+    // A half-rebuilt environment is not a rebuilt environment: relaunching with
+    // ffmpeg but no git reproduces the exact #776 failure (Manager aborts at
+    // import with "Bad git executable" and the server never comes back).
+    useStabilityMatrix({ git: false, ffmpeg: true });
+
+    const message = await expectRefusedBeforeStopping();
+
+    expect(message).toMatch(/bundled Git/i);
+    expect(message).toMatch(/Bad git executable/i);
+  });
+
+  it("REFUSES before stopping when the FFmpeg asset dir exists but holds no ffmpeg binary", async () => {
+    useStabilityMatrix({ git: true, ffmpeg: false });
+
+    const message = await expectRefusedBeforeStopping();
+
+    expect(message).toMatch(/bundled FFmpeg/i);
+  });
+
+  it("does NOT mistake an ordinary install that merely lives under a `Data/Packages` path for Stability Matrix", async () => {
+    // Name-only evidence must never trigger a refusal: no PortableGit/Assets
+    // beside `Packages` means there is no launcher tooling to reconstruct, and
+    // this install restarted fine before #776.
+    useStabilityMatrix({ git: false, ffmpeg: false, roots: [] });
+    mockLivePortThenFree();
+    spawnCapturingChildren();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true }) as Response),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.message).not.toMatch(/refusing to restart/i);
+    expect(result.started).toBe(true);
+    expect(result.launch_env?.source).toBe("inherited");
+    expect(result.launch_env?.reproducible).toBe(true);
+    expect(spawnOptions().env).toBeUndefined();
+
+    killSpy.mockRestore();
   });
 });
 
 describe("restart_comfyui — irreproducible launcher environments (#776)", () => {
-  function usePinokio(): void {
+  function usePinokio(opts?: { corroborated?: boolean }): void {
+    const corroborated = opts?.corroborated ?? true;
     mockFindComfyuiPython.mockReturnValue(PINOKIO_PY);
     mockLiveRootFromArgv.mockReturnValue(PINOKIO_APP);
     mockGetSystemStats.mockResolvedValue({
@@ -293,7 +362,9 @@ describe("restart_comfyui — irreproducible launcher environments (#776)", () =
     });
     mockExistsSync.mockImplementation((p: string) => {
       const s = String(p);
-      return s === PINOKIO_MAIN || s === PINOKIO_PY;
+      if (s === PINOKIO_MAIN || s === PINOKIO_PY) return true;
+      // The `api/` tree is the on-disk evidence that this really is a Pinokio home.
+      return corroborated && s === PINOKIO_API;
     });
   }
 
@@ -311,6 +382,27 @@ describe("restart_comfyui — irreproducible launcher environments (#776)", () =
     expect(result.message).toMatch(/Pinokio/);
     expect(mockSpawn).not.toHaveBeenCalled();
     expect(killSpy).not.toHaveBeenCalled();
+
+    killSpy.mockRestore();
+  });
+
+  it("does NOT treat a directory merely NAMED `pinokio` as a Pinokio install", async () => {
+    // Name-only evidence must never refuse a restart that works today.
+    usePinokio({ corroborated: false });
+    mockLivePortThenFree();
+    spawnCapturingChildren();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true }) as Response),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.message).not.toMatch(/refusing to restart/i);
+    expect(result.started).toBe(true);
+    expect(result.launch_env?.source).toBe("inherited");
+    expect(result.launch_env?.reproducible).toBe(true);
 
     killSpy.mockRestore();
   });

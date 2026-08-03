@@ -100,6 +100,12 @@ export interface StabilityMatrixLayout {
   gitExe?: string;
   /** `<Data>/Assets/ffmpeg[/bin]` — absent when not on disk. */
   ffmpegDir?: string;
+  /**
+   * TRUE when `<Data>/Assets/ffmpeg` exists but no ffmpeg binary could be found
+   * inside it — a layout we do not understand, which must refuse rather than
+   * relaunch with an incomplete reconstruction.
+   */
+  ffmpegPresentButUnresolved: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -178,9 +184,12 @@ function dirOf(p: string): string | undefined {
  * Stability Matrix keeps every package under `<Data>/Packages/<PackageName>` and
  * its shared tooling as siblings of `Packages` (`<Data>/PortableGit`,
  * `<Data>/Assets`). So: find an ancestor literally named `Packages` whose parent
- * either is named `Data` or actually HOLDS one of those tooling directories.
- * Both halves are evidence, not assumption — a directory that merely happens to
- * be called `Packages` never matches on its own.
+ * ACTUALLY HOLDS one of those tooling directories on disk.
+ *
+ * The tooling directory is REQUIRED corroboration, never inferred from a name: a
+ * perfectly ordinary install that happens to live under some `…/Data/Packages/…`
+ * path must NOT be mistaken for a Stability Matrix one, because that
+ * misclassification would refuse a restart that works today.
  */
 export function detectStabilityMatrix(
   paths: ReadonlyArray<string | undefined>,
@@ -191,29 +200,33 @@ export function detectStabilityMatrix(
       if (basenameOf(ancestor).toLowerCase() !== "packages") continue;
       const dataRoot = dirOf(ancestor);
       if (!dataRoot) continue;
-      const isDataRoot =
-        basenameOf(dataRoot).toLowerCase() === "data" ||
-        pathExists(joinPath(dataRoot, "PortableGit")) ||
-        pathExists(joinPath(dataRoot, "Assets"));
-      if (!isDataRoot) continue;
+      const gitRoot = joinPath(dataRoot, "PortableGit");
+      const ffmpegRoot = joinPath(dataRoot, "Assets", "ffmpeg");
+      const hasGitRoot = pathExists(gitRoot);
+      const hasFfmpegRoot = pathExists(ffmpegRoot);
+      // No Stability Matrix tooling beside `Packages` → not a Stability Matrix
+      // install (or one with nothing to inject). Either way there is nothing to
+      // reconstruct, so fall through to the ordinary inherit path.
+      if (!hasGitRoot && !hasFfmpegRoot) continue;
 
       const gitExe = firstExisting([
-        joinPath(dataRoot, "PortableGit", "cmd", "git.exe"),
-        joinPath(dataRoot, "PortableGit", "cmd", "git"),
-        joinPath(dataRoot, "PortableGit", "bin", "git.exe"),
-        joinPath(dataRoot, "PortableGit", "bin", "git"),
+        joinPath(gitRoot, "cmd", "git.exe"),
+        joinPath(gitRoot, "cmd", "git"),
+        joinPath(gitRoot, "bin", "git.exe"),
+        joinPath(gitRoot, "bin", "git"),
       ]);
       const ffmpegExe = firstExisting([
-        joinPath(dataRoot, "Assets", "ffmpeg", "bin", "ffmpeg.exe"),
-        joinPath(dataRoot, "Assets", "ffmpeg", "bin", "ffmpeg"),
-        joinPath(dataRoot, "Assets", "ffmpeg", "ffmpeg.exe"),
-        joinPath(dataRoot, "Assets", "ffmpeg", "ffmpeg"),
+        joinPath(ffmpegRoot, "bin", "ffmpeg.exe"),
+        joinPath(ffmpegRoot, "bin", "ffmpeg"),
+        joinPath(ffmpegRoot, "ffmpeg.exe"),
+        joinPath(ffmpegRoot, "ffmpeg"),
       ]);
       return {
         dataRoot,
         gitExe,
         gitDir: gitExe ? dirOf(gitExe) : undefined,
         ffmpegDir: ffmpegExe ? dirOf(ffmpegExe) : undefined,
+        ffmpegPresentButUnresolved: hasFfmpegRoot && !ffmpegExe,
       };
     }
   }
@@ -231,10 +244,21 @@ export function detectStabilityMatrix(
  * disk tells us what the running process actually got. Relaunching such a server
  * with OUR environment is precisely the #776 failure mode, so these refuse.
  */
-const OPAQUE_LAUNCHER_DIRS: ReadonlyArray<{ dir: string; name: string }> = [
-  { dir: "pinokio", name: "Pinokio" },
+const OPAQUE_LAUNCHER_DIRS: ReadonlyArray<{
+  dir: string;
+  name: string;
+  /** At least one of these must exist under the root — name alone is not proof. */
+  corroborate: string[];
+}> = [
+  // A Pinokio home holds `api/` (the installed apps) and `bin/` (its shims).
+  { dir: "pinokio", name: "Pinokio", corroborate: ["api", "bin"] },
 ];
 
+/**
+ * A recognized launcher whose environment we cannot rebuild. As with Stability
+ * Matrix, the directory NAME is only a candidate — the launcher's own layout must
+ * be corroborated on disk before we let it refuse a restart that otherwise works.
+ */
 export function detectOpaqueLauncher(
   paths: ReadonlyArray<string | undefined>,
 ): { name: string; root: string } | null {
@@ -243,7 +267,9 @@ export function detectOpaqueLauncher(
     for (const ancestor of ancestorsOf(p)) {
       const base = basenameOf(ancestor).toLowerCase();
       const hit = OPAQUE_LAUNCHER_DIRS.find((l) => l.dir === base);
-      if (hit) return { name: hit.name, root: ancestor };
+      if (!hit) continue;
+      if (!hit.corroborate.some((d) => pathExists(joinPath(ancestor, d)))) continue;
+      return { name: hit.name, root: ancestor };
     }
   }
   return null;
@@ -385,13 +411,28 @@ export function resolveLaunchEnvironment(
   // 2. Stability Matrix — reconstruct exactly what it injects, from disk.
   const sm = detectStabilityMatrix(input.paths);
   if (sm) {
-    const additions = [sm.gitDir, sm.ffmpegDir].filter(
-      (d): d is string => typeof d === "string" && d.length > 0,
-    );
-    if (additions.length === 0) {
-      // We KNOW this install is launcher-owned but found none of the tooling it
-      // injects. Reproducing the environment is impossible and inheriting ours
-      // is the exact #776 failure — refuse instead of guessing.
+    // PARTIAL reconstruction is NOT reconstruction (codex gate). Detection above
+    // only fires when at least one tooling root exists beside `Packages`, so this
+    // IS a launcher-owned install — and a component we can see but cannot resolve
+    // means we would relaunch it missing exactly the thing the launcher supplies.
+    // The git binary is the fatal one: without it ComfyUI-Manager aborts during
+    // import and the server never comes up at all (#776), so it is REQUIRED. An
+    // ffmpeg asset directory that exists but holds no recognizable binary is a
+    // shape we do not understand — refuse rather than half-rebuild.
+    const missing: string[] = [];
+    if (!sm.gitExe) {
+      missing.push(
+        `its bundled Git (looked under "${joinPath(sm.dataRoot, "PortableGit")}") — ` +
+          "without it ComfyUI-Manager aborts at import with \"Bad git executable\"",
+      );
+    }
+    if (sm.ffmpegPresentButUnresolved) {
+      missing.push(
+        `its bundled FFmpeg (found "${joinPath(sm.dataRoot, "Assets", "ffmpeg")}" but no ` +
+          "ffmpeg binary inside it)",
+      );
+    }
+    if (missing.length > 0) {
       return {
         reproducible: false,
         info: {
@@ -399,30 +440,30 @@ export function resolveLaunchEnvironment(
           reproducible: false,
           launcher: "Stability Matrix",
           note:
-            "Stability Matrix install detected, but its bundled Git/FFmpeg could not " +
-            "be located on disk — the launcher environment could NOT be reproduced",
+            "Stability Matrix install detected, but part of the tooling it injects could " +
+            "not be located on disk — the launcher environment could NOT be reproduced",
         },
         reason:
           `This ComfyUI is managed by Stability Matrix (${sm.dataRoot}), which launches it ` +
-          "with its own bundled Git and FFmpeg on PATH, but neither " +
-          `"${joinPath(sm.dataRoot, "PortableGit")}" nor ` +
-          `"${joinPath(sm.dataRoot, "Assets", "ffmpeg")}" could be found on disk, so that ` +
-          "environment cannot be reproduced here.",
+          `with its own bundled tooling on PATH, but this could not be located: ${missing.join("; ")}. ` +
+          "That environment cannot be reproduced here.",
         advice:
           "Restart ComfyUI from Stability Matrix itself so it comes back with the " +
           "environment its packages expect.",
       };
     }
+    const additions = [sm.gitDir, sm.ffmpegDir].filter(
+      (d): d is string => typeof d === "string" && d.length > 0,
+    );
     const { env, added } = withPathAdditions(baseEnv, additions);
-    if (sm.gitExe) {
-      // GitPython (ComfyUI-Manager) resolves `git` through this variable first;
-      // Stability Matrix sets it, and without it Manager aborts at import with
-      // "Bad git executable" even when PATH is right (#776).
-      const gitKey = findEnvKey(env, "GIT_PYTHON_GIT_EXECUTABLE") ?? "GIT_PYTHON_GIT_EXECUTABLE";
-      env[gitKey] = sm.gitExe;
-    }
-    const parts: string[] = [];
-    if (sm.gitDir) parts.push("PortableGit");
+    // GitPython (ComfyUI-Manager) resolves `git` through this variable first;
+    // Stability Matrix sets it, and without it Manager aborts at import with
+    // "Bad git executable" even when PATH is right (#776). Guaranteed present —
+    // a missing git refused above.
+    const gitKey =
+      findEnvKey(env, "GIT_PYTHON_GIT_EXECUTABLE") ?? "GIT_PYTHON_GIT_EXECUTABLE";
+    env[gitKey] = sm.gitExe!;
+    const parts = ["PortableGit"];
     if (sm.ffmpegDir) parts.push("FFmpeg");
     return {
       reproducible: true,
@@ -434,9 +475,8 @@ export function resolveLaunchEnvironment(
         path_additions: added,
         note:
           `Stability Matrix install detected (${sm.dataRoot}) — relaunched with its ` +
-          `${parts.join(" + ")} on PATH` +
-          (sm.gitExe ? " and GIT_PYTHON_GIT_EXECUTABLE set" : "") +
-          ", so ComfyUI-Manager and ffmpeg-dependent nodes keep working",
+          `${parts.join(" + ")} on PATH and GIT_PYTHON_GIT_EXECUTABLE set, ` +
+          "so ComfyUI-Manager and ffmpeg-dependent nodes keep working",
       },
     };
   }
