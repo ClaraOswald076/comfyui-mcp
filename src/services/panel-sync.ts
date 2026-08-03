@@ -39,6 +39,7 @@ import {
   type PanelPinState,
 } from "./panel-settings.js";
 import { requiredPanelVersion as requiredBridgePanelVersion, SEMVER_RE } from "./ui-bridge.js";
+import { describeInstallPanelAction } from "./panel-recovery.js";
 import { compareSemver, detectInstallMode } from "./self-update.js";
 
 export { requiredBridgePanelVersion as requiredPanelVersion };
@@ -64,6 +65,20 @@ export { requiredBridgePanelVersion as requiredPanelVersion };
 function isComparableVersion(v: string | undefined): v is string {
   return typeof v === "string" && SEMVER_RE.test(v.trim());
 }
+
+/**
+ * How to clear a pin, phrased for THIS session. These summaries are pushed
+ * straight into the embedded panel chat on every hello, and that surface does
+ * not carry install_panel (#784) — naming it there is the same dead end the
+ * bridge refusal had.
+ */
+const UNPIN_INSTRUCTION = (): string =>
+  describeInstallPanelAction(
+    "unpin",
+    "removing the pin on the ComfyUI host (its ~/.comfyui-mcp/panel-settings.json, " +
+      "or the COMFYUI_MCP_PANEL_PIN variable there) and restarting the orchestrator " +
+      "running on that machine",
+  );
 
 /**
  * The one thing an `up-to-date` verdict was missing.
@@ -202,7 +217,7 @@ export function evaluatePanelSync(
     return (
       ` NOTE: the panel is ${describePanelPin(pin)} and BEHIND what ${orch} ` +
         `expects (${status.installedVersion} < ${required}) — left untouched; ` +
-        `unpin with install_panel(action='unpin') to close the gap.`
+        `close the gap by ${UNPIN_INSTRUCTION()}.`
     );
   })();
 
@@ -300,6 +315,28 @@ export function evaluatePanelSync(
   }
 
   if (!status.installed) {
+    // #766 — "not installed" is only actionable when the absence is PROVEN.
+    // When the ComfyUI root came from configuration rather than from the running
+    // server, a perfectly good panel may be sitting in the tree that is actually
+    // served, and installing would drop a second copy into a custom_nodes
+    // nothing loads — the user then sees no panel and no error. Refuse to act on
+    // an unproven absence, exactly as we refuse on an unreliable scan above.
+    if (status.absenceProven === false) {
+      return {
+        ...base,
+        decision: "blocked",
+        behind: false,
+        summary:
+          `No panel was found in ${status.comfyuiPath ?? "custom_nodes"}, but that root ` +
+          `was NOT confirmed by the running ComfyUI — so this is not a proven absence ` +
+          `and nothing will be installed. On a split install (Comfy Desktop's ` +
+          `--base-directory, #766) the panel lives in a different tree and installing ` +
+          `here would land in a custom_nodes that is never loaded. Make sure ComfyUI is ` +
+          `running and reachable so its own install root can be read, or check ` +
+          `get_environment's local.workspace_path, then re-check.` +
+          driftNote,
+      };
+    }
     // Not installed at all. That is definitionally behind, but a pin still wins:
     // installing the nightly channel would land some version other than the
     // pinned one.
@@ -311,7 +348,7 @@ export function evaluatePanelSync(
         summary:
           `The panel pack is not installed, and ${orch} needs panel ${required}+. ` +
           `You are ${describePanelPin(pin)}, so nothing will be installed automatically. ` +
-          `Clear the pin (install_panel(action='unpin')) to let the sync install it.`,
+          `Clear the pin (${UNPIN_INSTRUCTION()}) to let the sync install it.`,
       };
     }
     return {
@@ -340,7 +377,7 @@ export function evaluatePanelSync(
         behind: false,
         summary:
           `${cannotCompare} You are also ${describePanelPin(pin)}, so nothing will ` +
-          `be changed either way. Clear the pin (install_panel(action='unpin')) ` +
+          `be changed either way. Clear the pin (${UNPIN_INSTRUCTION()}) ` +
           `first if you want to move the panel at all.`,
       };
     }
@@ -350,7 +387,8 @@ export function evaluatePanelSync(
       behind: false,
       summary:
         `${cannotCompare} NOT syncing on a guess — check the pack's pyproject.toml, ` +
-        `or run install_panel(action='update') deliberately.`,
+        `or run ${describeInstallPanelAction("update", "the update on the ComfyUI host")} ` +
+        `deliberately.`,
     };
   }
 
@@ -377,7 +415,7 @@ export function evaluatePanelSync(
         `${status.installedVersion} — a newer panel that matches your orchestrator ` +
         `exists. You are ${describePanelPin(pin)}, so NOTHING has been changed and ` +
         `nothing will be. If you want the newer panel, clear the pin first ` +
-        `(install_panel(action='unpin')` +
+        `(${UNPIN_INSTRUCTION()}` +
         (pin.source === "env"
           ? `, though this pin comes from ${PANEL_PIN_ENV_VAR} and must be unset in ` +
             `the environment`
@@ -518,7 +556,7 @@ export async function performPanelSync(
         `Panel ${action} reported success, but re-reading the pack afterwards could ` +
           `not confirm an installed version${after.dir ? ` at ${after.dir}` : ""}. NOT ` +
           `reporting a completed sync. Check custom_nodes and re-run ` +
-          `install_panel(action='status').`,
+          `${describeInstallPanelAction("status", "re-checking the pack on the ComfyUI host")}.`,
       );
     }
     if (after.shadows.length > 0) {
@@ -538,7 +576,7 @@ export async function performPanelSync(
           `could not be enumerated afterwards to check for shadow copies, so it cannot be ` +
           `confirmed that the browser will load THIS panel rather than a stray ` +
           `".comfyui-agent-panel.bak-*". NOT reporting a completed sync — re-run ` +
-          `install_panel(action='status') once custom_nodes is readable.`,
+          `${describeInstallPanelAction("status", "a re-check on the ComfyUI host")} once custom_nodes is readable.`,
       );
     }
 

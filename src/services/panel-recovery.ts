@@ -120,6 +120,25 @@ export function panelRecoveryContext(): PanelRecoveryContext {
   return { installPanelUsable: true, comfyuiPath };
 }
 
+/**
+ * Name an install_panel action ONLY where install_panel can be invoked.
+ *
+ * The bridge refusal was the loudest instance of the #774/#784 dead end, but it
+ * was never the only one: the sync assessment, the pin notes, the auto-sync
+ * failure message and the interrupted-swap guidance all named install_panel
+ * unconditionally, and the embedded `panel_*` surface — the very surface those
+ * messages are pushed to — does not carry it. Every one of them routes through
+ * here so the instruction is a real one wherever it is rendered.
+ */
+export function describeInstallPanelAction(
+  action: "status" | "sync" | "update" | "install" | "unpin",
+  /** What to say instead when install_panel cannot be invoked here. */
+  hostSide: string,
+  ctx: PanelRecoveryContext = panelRecoveryContext(),
+): string {
+  return ctx.installPanelUsable ? `install_panel(action='${action}')` : hostSide;
+}
+
 function blockerPhrase(blocker: PanelRecoveryBlocker | undefined): string {
   switch (blocker) {
     case "remote":

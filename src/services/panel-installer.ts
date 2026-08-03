@@ -52,7 +52,11 @@ import {
   type PanelPinState,
 } from "./panel-settings.js";
 import { withPanelMutationLock } from "./panel-pin-guard.js";
-import { describePanelUpdateRecovery, PANEL_REPO_URL } from "./panel-recovery.js";
+import {
+  describeInstallPanelAction,
+  describePanelUpdateRecovery,
+  PANEL_REPO_URL,
+} from "./panel-recovery.js";
 import { compareSemver } from "./self-update.js";
 import { SEMVER_RE } from "./ui-bridge.js";
 import {
@@ -1181,6 +1185,22 @@ async function ensureInner(deps: PanelInstallerDeps): Promise<EnsureResult> {
           "skipping auto-install to avoid a duplicate/unverified install.",
       };
     }
+    // #766 — and the same caution about WHICH TREE we looked in. An unattended
+    // install into a root the running server never named would land in a
+    // custom_nodes nothing loads, and the user would see no panel and no error.
+    // On a split install (Comfy Desktop's --base-directory) the configured path
+    // is exactly that root. Nobody is watching this path, so it only acts on a
+    // tree the live server itself chose.
+    if (isRealDeps(deps) && !isLiveDerivedBase(lastPanelBaseResolution())) {
+      return {
+        action: "unavailable",
+        reason:
+          "The panel appears absent, but the ComfyUI root scanned came from " +
+          "configuration rather than the running server, so it is not proven to be " +
+          "the tree ComfyUI serves from (#766). Skipping auto-install rather than " +
+          "installing into a custom_nodes that may never be loaded.",
+      };
+    }
     // Final pin check adjacent to the mutation (see runPanelActionInner): the
     // reachability probe and detection above are not instantaneous.
     const latePin = readPinSafe(deps);
@@ -1264,7 +1284,13 @@ export async function ensurePanelInstalled(
     // the lock we give up quickly (returning `unavailable`) rather than eating
     // the whole ensure budget waiting.
     return await withTimeout(
-      withPanelOpLock(() => ensureInner(deps), { timeoutMs: ENSURE_LOCK_WAIT_MS }),
+      // Resolve and FREEZE the live base for the unattended install too. This
+      // path runs on load with nobody watching, so an unprimed `panelBaseSync()`
+      // would fall back to the configured tree and quietly inspect — or install
+      // into — a custom_nodes the running server never reads (#766).
+      withPanelOpLock(async () => ensureInner(await pinPanelBase(deps)), {
+        timeoutMs: ENSURE_LOCK_WAIT_MS,
+      }),
       opts.timeoutMs ?? ENSURE_TIMEOUT_MS,
     );
   } catch (err) {
@@ -1324,6 +1350,18 @@ export interface PanelStatus {
   comfyuiPath?: string;
   /** How `comfyuiPath` was chosen. See panel-workspace.ts. */
   baseSource?: PanelBaseSource;
+  /**
+   * Only meaningful when `installed` is false: is that absence PROVEN?
+   *
+   * `installed: false` reads as authoritative, and prose warnings do not travel
+   * — a caller reading the boolean would never see the note explaining that the
+   * tree we scanned is not the one the server reads. So the qualification gets
+   * its own field. False when the scan could not complete, or when the ComfyUI
+   * root came from configuration rather than from the running server (#766), in
+   * which case a perfectly good panel may be sitting in the tree that is
+   * actually served. Consumers must not install on an unproven absence.
+   */
+  absenceProven?: boolean;
   note: string;
 }
 
@@ -1471,7 +1509,10 @@ export async function panelStatus(
   const pin = readPinSafe(deps);
   const pinNote = pin.pinned
     ? ` PIN: ${describePanelPin(pin)} — install/update/reinstall are refused ` +
-      `until it is cleared with install_panel(action='unpin')` +
+      `until it is cleared by ${describeInstallPanelAction(
+        "unpin",
+        "removing the pin on the ComfyUI host and restarting the orchestrator there",
+      )}` +
       (pin.source === "env" ? ` (env pins must be unset in the environment).` : `.`)
     : "";
 
@@ -1487,6 +1528,11 @@ export async function panelStatus(
     scanReliable: detection.scanReliable,
     comfyuiPath,
     baseSource,
+    absenceProven: detection.installed
+      ? undefined
+      : detection.applicable &&
+        detection.scanReliable !== false &&
+        (!isRealDeps(deps) || isLiveDerivedBase(baseResolution)),
     pin,
     note: note + baseNote + swapNote + shadowNote + pinNote,
   };
@@ -2170,7 +2216,8 @@ function reconcilePanelSwap(
       note:
         ` WARNING: a previous panel update was interrupted and custom_nodes has NO panel ` +
         `at ${journal.dir}; the previous copy is at ${journal.backupDir}. Run ` +
-        `install_panel(action='update') to repair it automatically, or move it back ` +
+        `${describeInstallPanelAction("update", "an update on the ComfyUI host")} to ` +
+        `repair it automatically, or move it back ` +
         `manually, then restart ComfyUI.`,
     };
   }
@@ -2208,7 +2255,10 @@ function reconcilePanelSwap(
       ` WARNING: a previous panel update was interrupted and custom_nodes has NO panel ` +
       `at ${journal.dir}. The backup recorded at ${journal.backupDir} is not there ` +
       `either — look in ${join(comfyuiPath, "custom_nodes_backup")} and move the panel ` +
-      `back, or reinstall it with install_panel(action='install').`,
+      `back, or reinstall it with ${describeInstallPanelAction(
+        "install",
+        "a fresh install on the ComfyUI host",
+      )}.`,
   };
 }
 

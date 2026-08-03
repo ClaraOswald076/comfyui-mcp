@@ -23,6 +23,7 @@ import { startQuickTunnel } from "../services/tunnel.js";
 import { detectInstallMode } from "../services/self-update.js";
 import { performPanelSync } from "../services/panel-sync.js";
 import { clearPanelDiskObservation } from "../services/panel-workspace.js";
+import { panelRecoveryContext } from "../services/panel-recovery.js";
 import { isPanelAutoInstallDisabled } from "../services/panel-installer.js";
 import { SelfRestarter } from "../services/self-restart.js";
 import {
@@ -2554,7 +2555,14 @@ export async function runPanelOrchestrator(): Promise<void> {
                 type: "say",
                 text:
                   `⚠️ Could not automatically sync the ComfyUI-MCP panel; no update was claimed. ` +
-                  `Run install_panel(action:'status') to inspect it, then retry install_panel(action:'sync') if appropriate. (${detail})`,
+                  // #784 — this is pushed to the embedded panel chat, whose
+                  // tool set does not include install_panel. Name it only where
+                  // it can be invoked.
+                  `${
+                    panelRecoveryContext().installPanelUsable
+                      ? "Run install_panel(action:'status') to inspect it, then retry install_panel(action:'sync') if appropriate."
+                      : "Inspect and update the panel pack on the ComfyUI host itself — no tool in this session can do it."
+                  } (${detail})`,
               },
               panelTab,
             );

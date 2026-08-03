@@ -883,6 +883,23 @@ describe("a wholesale replacement needs the RUNNING server to have chosen the tr
     expect(detected.scanReliable).toBe(false);
   });
 
+  it("an UNPROVEN absence is structured, not just prose — and blocks the sync", async () => {
+    // `installed: false` reads as authoritative and prose warnings do not
+    // travel, so the qualification gets its own field. Installing on an
+    // unproven absence would drop a second copy into a custom_nodes nothing
+    // loads: the user then sees no panel and no error.
+    workspace.base = root;
+    workspace.reachable = false; // configured fallback ⇒ not live-derived
+    __resetPanelBaseCache();
+    const { panelStatus } = await import("../../services/panel-installer.js");
+    const { evaluatePanelSync } = await import("../../services/panel-sync.js");
+    const status = await panelStatus();
+    expect(status.installed).toBe(false);
+    expect(status.absenceProven).toBe(false);
+    expect(evaluatePanelSync(status).decision).toBe("blocked");
+    expect(evaluatePanelSync(status).summary).toMatch(/not a proven absence/);
+  });
+
   it("a live-resolved base is corroborated", async () => {
     const liveRoot = join(root, "live", "ComfyUI");
     mkdirSync(join(liveRoot, "custom_nodes"), { recursive: true });
