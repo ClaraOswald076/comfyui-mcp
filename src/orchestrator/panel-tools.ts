@@ -2234,10 +2234,16 @@ function httpStatusOfError(err: unknown): number | undefined {
 }
 
 /** Drop the leading slashes and the one leading "workflows/" segment, leaving a
- *  store-RELATIVE key. Both separators are accepted here because either can spell
- *  that prefix, whichever OS produced the string. */
+ *  store-RELATIVE key.
+ *
+ *  Only the FORWARD-slash spelling counts as the library prefix (codex MAJOR).
+ *  ComfyUI store keys are always "/"-separated, so `workflows\foo.json` was never
+ *  one — while on POSIX it is a perfectly legal LITERAL filename. Accepting the
+ *  backslash spelling would silently rewrite a request for that literal file into
+ *  a request for `workflows/foo.json`, i.e. a different graph. A caller who types
+ *  the backslash form gets a refusal that names the close match instead. */
 const stripLibraryPrefix = (key: string): string =>
-  key.replace(/^[\\/]+/, "").replace(/^workflows[\\/]+/i, "");
+  key.replace(/^\/+/, "").replace(/^workflows\/+/i, "");
 
 /** The form two userdata store keys are compared in when deciding they are the
  *  SAME NAME. Unicode normalization is the only equivalence applied: NFD "é" and
@@ -2253,10 +2259,11 @@ const stripLibraryPrefix = (key: string): string =>
 const matchStoreKey = (key: string): string => stripLibraryPrefix(key).normalize("NFC");
 
 /** The looser form used ONLY to describe a near miss in an error message — never
- *  to select a file to load. Folds the two equivalences that are real on some
- *  filesystems and not on others: separator flavour and letter case. */
+ *  to select a file to load. Folds the equivalences that hold on some filesystems
+ *  and not others: separator flavour (including a backslash-spelled library
+ *  prefix) and letter case. */
 const looseStoreKey = (key: string): string =>
-  matchStoreKey(key).replace(/\\/g, "/").toLowerCase();
+  stripLibraryPrefix(key.replace(/\\/g, "/")).normalize("NFC").toLowerCase();
 
 /**
  * The connected ComfyUI's OWN list of saved workflow store keys, or null when the
@@ -2381,7 +2388,7 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
   // path all normalize to the same store-relative name. (A genuinely absolute path
   // — including a Windows leading-slash path — was already handled and returned
   // above, so it never reaches this relative-name normalization.)
-  const rel = p.replace(/^[\\/]+/, "").replace(/^workflows[\\/]+/i, "");
+  const rel = stripLibraryPrefix(p);
   // Refuse traversal / drive-relative escapes (codex): a real workflow name is a
   // plain relative path whose segments are filenames/subfolders. Stripping the
   // "workflows/" prefix must never turn the input into something that ESCAPES the
@@ -2490,7 +2497,7 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
     // deliberately liberal about separators — that is a REJECTION rule, where being
     // over-inclusive can only refuse more, never resolve to another file.
     const listed = rawListed?.filter((k) => {
-      const segs = stripLibraryPrefix(k).split(/[\/]+/);
+      const segs = stripLibraryPrefix(k.replace(/\\/g, "/")).split("/");
       return !segs.includes("..") && !segs.some((s) => /^[A-Za-z]:/.test(s));
     });
     if (listed) {
@@ -2520,10 +2527,22 @@ async function readWorkflowFromPath(rawPath: string): Promise<Record<string, unk
         // Only re-ask when the server's spelling actually differs from what was
         // already sent — otherwise this would repeat the request that just failed.
         if (retryKey !== requestedKey) {
-          outcome = await fetchUserdataKey(retryKey);
-          // Remember which key was actually read, so a malformed / non-UI file
-          // names the file that was consulted rather than the caller's spelling.
-          if (outcome.kind !== "absent") resolvedKey = retryKey;
+          const retry = await fetchUserdataKey(retryKey);
+          if (retry.kind === "unreachable") {
+            // The server ALREADY answered — a 404 plus a readable listing. A
+            // transport blip on the follow-up does not un-answer that (codex
+            // MAJOR): letting it become "unreachable" would re-open the
+            // reconstructed-local-dir fallback after the authority had spoken.
+            outcome = {
+              kind: "refused",
+              detail: `the library lists "${matches[0]}", but re-reading it failed: ${retry.detail}`,
+            };
+          } else {
+            outcome = retry;
+            // Remember which key was actually read, so a malformed / non-UI file
+            // names the file that was consulted rather than the caller's spelling.
+            if (retry.kind !== "absent") resolvedKey = retryKey;
+          }
         }
         // Still absent after retrying the server's OWN key: the library lists the
         // name but will not serve it. Say so — that is a server-side condition the

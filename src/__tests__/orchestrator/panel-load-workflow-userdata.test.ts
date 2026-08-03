@@ -479,7 +479,68 @@ describe("readWorkflowFromPath: near-miss names resolve via the server's OWN lis
     expect(JSON.stringify(res)).toMatch(/path separator/i);
   });
 
+  it("does NOT treat a BACKSLASH-spelled workflows/ prefix as the library prefix", async () => {
+    // On POSIX "workflows\foo.json" is a legal LITERAL filename, not a prefixed
+    // spelling of "foo.json". Stripping it would turn a request for that literal
+    // file into a request for a different graph (codex MAJOR).
+    routeMock(["foo.json"], {
+      "workflows/foo.json": { nodes: [{ id: 1, type: "DifferentGraphNode" }], links: [] },
+    });
+
+    const { ctx, calls } = makeCtx();
+    const res = await loadWorkflow().handler({ path: "workflows\\foo.json" }, ctx);
+
+    expect(res.isError).toBe(true);
+    expect(calls).toHaveLength(0);
+    // "workflows/foo.json" exists and would have loaded had the prefix been stripped.
+    expect(fetchApi).not.toHaveBeenCalledWith(
+      `/api/userdata/${encodeURIComponent("workflows/foo.json")}`,
+    );
+    // The close match is still surfaced so the caller can retype it.
+    expect(JSON.stringify(res)).toMatch(/path separator/i);
+  });
+
+  it("a retry that cannot be completed REFUSES — it does not reopen the local fallback", async () => {
+    // The server already answered (404 + a readable listing). A transport failure
+    // on the follow-up read must not be reclassified as "unreachable", which would
+    // hand the reconstructed local dir back its veto (codex MAJOR).
+    const nfc = "caf\u00e9.json";
+    const nfd = "cafe\u0301.json";
+    const root = mkdtempSync(join(tmpdir(), "cmcp-userdir-"));
+    try {
+      const defaultDir = join(root, "user", "default", "workflows");
+      mkdirSync(defaultDir, { recursive: true });
+      writeFileSync(
+        join(defaultDir, nfd),
+        JSON.stringify({ nodes: [{ id: 1, type: "StaleLocalNode" }], links: [] }),
+        "utf8",
+      );
+      process.env.COMFYUI_PATH = root;
+
+      fetchApi.mockImplementation(async (route: string) => {
+        if (route.startsWith("/api/userdata?")) return { ok: true, status: 200, json: async () => [nfc] };
+        if (route === `/api/userdata/${encodeURIComponent(`workflows/${nfc}`)}`) {
+          throw new Error("ECONNRESET"); // statusless failure on the retry
+        }
+        return { ok: false, status: 404, json: async () => ({}) };
+      });
+
+      const { ctx, calls } = makeCtx();
+      const res = await loadWorkflow().handler({ path: nfd }, ctx);
+
+      expect(res.isError).toBe(true);
+      expect(calls).toHaveLength(0); // the stale local file was NOT loaded
+      expect(JSON.stringify(res)).toMatch(/re-reading it failed/i);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("never echoes a traversal entry from a hostile listing back as a request key", async () => {
+    // Defense in depth. With exact (normalization-only) matching a listed key
+    // containing ".." can never equal a caller name that passed the traversal
+    // guard, so this filter is unreachable today — it exists so that any future
+    // loosening of the match cannot turn a server-supplied string into an escape.
     routeMock(["../../secret.json", "..\\secret.json"], {});
 
     const { ctx, calls } = makeCtx();
