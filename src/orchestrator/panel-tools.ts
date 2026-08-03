@@ -37,6 +37,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { UiBridge } from "../services/ui-bridge.js";
 import {
   dispatchOutcomeOf,
+  isCapabilityRefusal,
   isPanelCmdUnsupportedError,
   isReplyTimeoutTagged,
   requiresWorkflowStampEnforcement,
@@ -2737,6 +2738,17 @@ export function makePanelToolCtx(
       // preserving the raw cause. Keying on the TYPED flag (not error text) means a
       // POST-dispatch executor ok:false reply that merely quotes "no connected tab" is
       // never mis-wrapped as "nothing applied".
+      // #709: a CAPABILITY refusal (the tab's panel does not enforce the workflow-stamp
+      // contract) shares the dispatched:false flag with transient routing failures, but
+      // the generic recovery below — "retry in a moment / rebind with
+      // panel_set_workflow_target({mode:"current"})" — can NEVER clear it (the refusal's
+      // own text says so: rebinding cannot add the missing capability). Appending it
+      // sent agents into a futile retry/rebind loop that contradicted the embedded
+      // guidance. Key on the TYPED marker and surface the cause verbatim instead; it
+      // already names the real recovery (update + restart + browser hard-refresh).
+      if (isCapabilityRefusal(err)) {
+        return fail(err instanceof Error ? err.message : String(err));
+      }
       if (dispatchOutcomeOf(err) === false) {
         const name = typeof cmd.cmd === "string" ? cmd.cmd : "panel command";
         // Neutral wording: a dispatched:false flag proves only that the command was NOT

@@ -10,6 +10,7 @@ import {
   minPanelVersionForCmd,
   markDispatched,
   dispatchOutcomeOf,
+  isCapabilityRefusal,
   defaultBridgeTimeoutMs,
   BRIDGE_DEFAULT_TIMEOUT_MS,
   BRIDGE_READ_DEFAULT_TIMEOUT_MS,
@@ -1732,6 +1733,46 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
     await expect(
       bridge.send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "old-skew" }),
     ).rejects.toThrow(/detected panel 0\.11\.0.*requires panel 0\.11\.35\+.*install_panel\(action:'update'\).*restart ComfyUI.*rebinding cannot/i);
+    old.close();
+  });
+
+  it("#709: the capability refusal carries the typed marker, the FULL tab id, and the hard-refresh recovery", async () => {
+    // The stale-bundle recurrence: on-disk panel current, browser tab still running a
+    // cached pre-#570 bundle. The refusal must (a) be typed so the tool layer never
+    // appends the futile retry/rebind suffix, (b) name the full routing id — the old
+    // slice(0,8) rendering ("wf:workf") was misread as a corrupted identity — and
+    // (c) lead with the hard-refresh recovery a bare restart cannot achieve.
+    const old = new WebSocket(`ws://127.0.0.1:${port}`);
+    await new Promise<void>((res, rej) => {
+      old.on("open", () => {
+        old.send(
+          JSON.stringify({
+            type: "hello",
+            tab_id: "wf:workflows/portrait.json",
+            title: "portrait",
+            panel_version: "0.11.20",
+          }),
+        );
+        res();
+      });
+      old.on("error", rej);
+    });
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:workflows/portrait.json")).toBe(true));
+    const caught = await bridge
+      .send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "wf:workflows/portrait.json" })
+      .then(
+        () => null,
+        (err) => err,
+      );
+    expect(caught).toBeInstanceOf(Error);
+    expect(isCapabilityRefusal(caught)).toBe(true); // typed — the tool layer keys on this
+    expect(dispatchOutcomeOf(caught)).toBe(false); // still categorically pre-dispatch
+    expect((caught as Error).message).toContain("panel tab wf:workflows/portrait.json"); // full id, not "wf:workf"
+    expect((caught as Error).message).toMatch(/hard-refresh the ComfyUI browser tab/);
+    expect((caught as Error).message).toMatch(/cached old panel JS/);
+    // Non-capability errors are NOT mismarked.
+    expect(isCapabilityRefusal(new Error("no connected tab"))).toBe(false);
+    expect(isCapabilityRefusal(undefined)).toBe(false);
     old.close();
   });
 
