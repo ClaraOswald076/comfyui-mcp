@@ -723,6 +723,7 @@ interface UeLinkEntry {
  */
 function materializeUeInGraph(
   nodes: UiNode[],
+  links: ReadonlyArray<{ id: number; origin_id: number; origin_slot: number }>,
   extra: Record<string, unknown> | undefined,
   scope: string,
   warnings: string[],
@@ -758,6 +759,92 @@ function materializeUeInGraph(
 
   const nodesById = new Map(nodes.map((n) => [n.id, n]));
   const senderIds = new Set(senders.map((s) => s.id));
+
+  // ── Whole-record staleness: is the sender STILL fed by the recorded producer? ──
+  // Verifying only that `controller` is still a sender is not enough. A record
+  // left over from before its sender was DISCONNECTED or REWIRED would otherwise
+  // materialize `upstream → consumer`: an edge that does not exist live. A
+  // fabricated connection is worse than a dropped one — a missing link renders as
+  // an obviously broken graph, a fabricated one renders as a plausible graph that
+  // is silently wrong and looks deliberate to whoever opens it.
+  const linkSrc = new Map<number, { node: number; slot: number }>();
+  for (const l of links) {
+    if (l && typeof l.id === "number") {
+      linkSrc.set(l.id, { node: l.origin_id, slot: l.origin_slot });
+    }
+  }
+  const busSet = new Map<string, UiNode>();
+  for (const n of nodes) {
+    if (!isSetVirtual(n.type)) continue;
+    const b = busKey(n.widgets_values);
+    if (b != null) busSet.set(String(b), n);
+  }
+  // This runs BEFORE de-virtualization, and the pack's `upstream` is sometimes the
+  // REAL producer and sometimes the virtual node in front of it. So BOTH sides of
+  // the comparison are normalized past Reroute/Get/Set first — comparing a raw
+  // origin against a resolved one would flag a perfectly current record as stale
+  // and drop a live connection. `null` means the chain could NOT be resolved,
+  // which is distinct from "resolved to something else".
+  const realOfNode = (
+    nodeId: number,
+    slot: number,
+    depth = 0,
+  ): { node: number; slot: number } | null => {
+    if (depth > 100) return null;
+    const n = nodesById.get(nodeId);
+    if (!n) return { node: nodeId, slot }; // outside this graph — take at face value
+    if (n.type === "Reroute" || isGetVirtual(n.type) || isSetVirtual(n.type)) {
+      const via = isGetVirtual(n.type)
+        ? (() => {
+            const b = busKey(n.widgets_values);
+            const setN = b != null ? busSet.get(String(b)) : undefined;
+            return (setN?.inputs ?? []).find((i) => i.link != null);
+          })()
+        : (n.inputs ?? []).find((i) => i.link != null);
+      return via?.link != null ? realSourceOf(via.link, depth + 1) : null;
+    }
+    return { node: nodeId, slot };
+  };
+  const realSourceOf = (linkId: number, depth = 0): { node: number; slot: number } | null => {
+    if (depth > 100) return null;
+    const src = linkSrc.get(linkId);
+    if (!src) return null;
+    return realOfNode(src.node, src.slot, depth + 1);
+  };
+  /**
+   * Verify the record against the sender's LIVE feed.
+   *  - "ok"          the sender is still fed by exactly this producer + slot
+   *  - "detached"    the sender has no incoming connection at all
+   *  - "rewired"     every feed resolved, none to this producer + slot
+   *  - "unverifiable" a feed exists but its chain could not be resolved
+   * A sender with no `controller` on the record can't be attributed, so it is not
+   * assessed ("ok" — older lists predate the field and say nothing either way).
+   */
+  const assessRecord = (raw: UeLinkEntry): "ok" | "detached" | "rewired" | "unverifiable" => {
+    if (raw.controller == null) return "ok";
+    // Seed Everywhere and friends: the sender IS the producer (it owns the widget),
+    // so there is no incoming feed to compare against.
+    if (raw.upstream === raw.controller) return "ok";
+    const ctrl = nodesById.get(raw.controller);
+    if (!ctrl) return "ok"; // already reported by the sender check above
+    // A sender can have SEVERAL inputs (Prompts Everywhere, Anything Everywhere3),
+    // each with its own record — the record is current if ANY feed matches.
+    const feeds = (ctrl.inputs ?? []).filter((i) => i.link != null);
+    if (feeds.length === 0) return "detached";
+    const want = realOfNode(raw.upstream, raw.upstream_slot);
+    if (!want) return "unverifiable";
+    let anyUnresolved = false;
+    for (const f of feeds) {
+      const real = realSourceOf(f.link as number);
+      if (!real) {
+        anyUnresolved = true;
+        continue;
+      }
+      if (real.node === want.node && real.slot === want.slot) return "ok";
+    }
+    return anyUnresolved ? "unverifiable" : "rewired";
+  };
+
   let added = 0;
   for (const raw of ueLinks as UeLinkEntry[]) {
     const dst = nodesById.get(raw?.downstream);
@@ -797,6 +884,25 @@ function materializeUeInGraph(
       );
       continue;
     }
+    // Fourth stale shape, and the only one that would produce an EDGE rather than
+    // an absence: the sender survives but is no longer fed by the recorded
+    // producer. Never materialize an unconfirmed record — say what could not be
+    // confirmed instead.
+    const verdict = assessRecord(raw);
+    if (verdict !== "ok") {
+      const ctrl = nodesById.get(raw.controller as number);
+      const who = `${ctrl?.type ?? "broadcast node"} #${raw.controller}`;
+      const why =
+        verdict === "detached"
+          ? `${who} no longer has any incoming connection, so it broadcasts nothing`
+          : verdict === "rewired"
+            ? `${who} is now fed by a different producer than the recorded node ${raw.upstream} (slot ${raw.upstream_slot})`
+            : `${who}'s own incoming connection could not be resolved, so the recorded producer node ${raw.upstream} (slot ${raw.upstream_slot}) could not be confirmed`;
+      warnings.push(
+        `A cg-use-everywhere record in ${scope} feeding node ${dst.id} (${dst.type}) input "${inputLabel}" is stale: ${why}. That input is left UNCONNECTED rather than wired from a broadcast the live graph does not have.`,
+      );
+      continue;
+    }
     const id = nextId();
     addLink(
       id,
@@ -832,6 +938,11 @@ function materializeUeLinks(
   const links = (ui.links ??= []);
   let added = materializeUeInGraph(
     ui.nodes ?? [],
+    // Normalize the top level's tuple links to the object shape the staleness
+    // check reads; a subgraph definition already stores them that way.
+    links
+      .filter((l) => Array.isArray(l))
+      .map((l) => ({ id: l[0], origin_id: l[1], origin_slot: l[2] })),
     ui.extra as Record<string, unknown> | undefined,
     "the top-level graph",
     warnings,
@@ -842,6 +953,7 @@ function materializeUeLinks(
     const sgLinks = (sg.links ??= []);
     added += materializeUeInGraph(
       sg.nodes ?? [],
+      sgLinks,
       sg.extra,
       `subgraph "${sg.name ?? sg.id}"`,
       warnings,

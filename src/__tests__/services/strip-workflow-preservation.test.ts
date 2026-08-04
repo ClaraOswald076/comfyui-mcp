@@ -260,14 +260,18 @@ describe("#361 — cg-use-everywhere broadcast links", () => {
           type: "GetNode",
           mode: 0,
           inputs: [],
-          outputs: [{ name: "IMAGE", type: "IMAGE", links: [] }],
+          outputs: [{ name: "IMAGE", type: "IMAGE", links: [22] }],
           widgets_values: ["img"],
         },
         {
+          // The sender is genuinely fed THROUGH the bus, and the pack's record
+          // names the bus node as `upstream`. Both sides of the staleness check
+          // must be normalized past the virtual wiring or this current record
+          // would be misread as rewired and its live connection dropped.
           id: 7,
           type: "Anything Everywhere",
           mode: 0,
-          inputs: [{ name: "anything", type: "*", link: null }],
+          inputs: [{ name: "anything", type: "*", link: 22 }],
           outputs: [],
           widgets_values: [],
         },
@@ -280,10 +284,14 @@ describe("#361 — cg-use-everywhere broadcast links", () => {
           widgets_values: ["out"],
         },
       ],
-      links: [[21, 1, 0, 4, 0, "IMAGE"]],
+      links: [
+        [21, 1, 0, 4, 0, "IMAGE"],
+        [22, 5, 0, 7, 0, "IMAGE"],
+      ],
     } as never;
-    const { workflow } = convertUiToApi(g, OBJECT_INFO);
+    const { workflow, warnings } = convertUiToApi(g, OBJECT_INFO);
     expect(workflow["3"].inputs.images).toEqual(["1", 0]);
+    expect(warnings).toEqual([]);
   });
 
   it("a broadcast into a node that no longer exists is reported", () => {
@@ -317,6 +325,170 @@ describe("#361 — cg-use-everywhere broadcast links", () => {
     const { workflow, warnings } = convertUiToApi(g as never, OBJECT_INFO);
     expect(workflow["3"].inputs.images).toBeUndefined();
     expect(joined(warnings)).toContain("no longer a broadcast node");
+  });
+
+  it("a record whose sender was REWIRED to a different producer fabricates nothing", () => {
+    // The most ordinary staleness of all: node 7 is still a live sender, but its
+    // input now comes from node 2 while the record still names node 1. Wiring
+    // 1 → consumer would put an edge in the stripped graph that does not exist
+    // live — a fabricated connection renders as a plausible graph that is
+    // silently wrong, which is worse than an obviously missing one.
+    const g = ueGraph(true) as unknown as {
+      nodes: {
+        id: number;
+        type: string;
+        mode: number;
+        inputs?: { name: string; type: string; link: number | null }[];
+        outputs?: { name: string; type: string; links: number[] }[];
+        widgets_values: unknown[];
+      }[];
+      links: unknown[];
+    };
+    g.nodes.push({
+      id: 2,
+      type: "LoadImage",
+      mode: 0,
+      inputs: [],
+      outputs: [{ name: "IMAGE", type: "IMAGE", links: [30] }],
+      widgets_values: ["b.png"],
+    });
+    g.nodes.find((n) => n.id === 7)!.inputs![0].link = 30; // rewired away from node 1
+    g.nodes.find((n) => n.id === 1)!.outputs![0].links = [];
+    g.links = [[30, 2, 0, 7, 0, "IMAGE"]];
+    const { workflow, warnings } = convertUiToApi(g as never, OBJECT_INFO);
+    expect(workflow["3"].inputs.images).toBeUndefined();
+    expect(joined(warnings)).toContain("fed by a different producer");
+  });
+
+  it("a record whose sender was DISCONNECTED fabricates nothing", () => {
+    const g = ueGraph(true) as unknown as {
+      nodes: { id: number; inputs?: { link: number | null }[] }[];
+      links: unknown[];
+    };
+    g.nodes.find((n) => n.id === 7)!.inputs![0].link = null;
+    g.links = [];
+    const { workflow, warnings } = convertUiToApi(g as never, OBJECT_INFO);
+    expect(workflow["3"].inputs.images).toBeUndefined();
+    expect(joined(warnings)).toContain("no longer has any incoming connection");
+  });
+
+  it("a sender that IS its own producer (Seed Everywhere shape) is still materialized", () => {
+    // The controller owns the widget, so it has no incoming feed to compare —
+    // requiring one would drop every Seed Everywhere broadcast.
+    const g = {
+      extra: {
+        ue_links: [
+          {
+            downstream: 3,
+            downstream_slot: 0,
+            upstream: 9,
+            upstream_slot: 0,
+            controller: 9,
+            type: "IMAGE",
+          },
+        ],
+      },
+      nodes: [
+        {
+          id: 9,
+          type: "Seed Everywhere",
+          mode: 0,
+          inputs: [],
+          outputs: [{ name: "IMAGE", type: "IMAGE", links: [] }],
+          widgets_values: [42],
+        },
+        {
+          id: 3,
+          type: "SaveImage",
+          mode: 0,
+          inputs: [{ name: "images", type: "IMAGE", link: null }],
+          outputs: [],
+          widgets_values: ["out"],
+        },
+      ],
+      links: [],
+    } as never;
+    const { workflow, warnings } = convertUiToApi(g, {
+      ...(OBJECT_INFO as object),
+      "Seed Everywhere": {
+        input: { required: { seed: ["INT", { default: 0 }] } },
+        output: ["IMAGE"],
+      },
+    } as never);
+    expect(workflow["3"].inputs.images).toEqual(["9", 0]);
+    expect(warnings).toEqual([]);
+  });
+
+  it("a MULTI-INPUT sender keeps every one of its current records", () => {
+    // Prompts Everywhere-style: two records share one controller, each naming a
+    // different producer. Checking only the sender's first feed would flag the
+    // second record as rewired and drop a live connection.
+    const g = {
+      extra: {
+        ue_links: [
+          { downstream: 3, downstream_slot: 0, upstream: 1, upstream_slot: 0, controller: 7, type: "IMAGE" },
+          { downstream: 4, downstream_slot: 0, upstream: 2, upstream_slot: 0, controller: 7, type: "IMAGE" },
+        ],
+      },
+      nodes: [
+        {
+          id: 1,
+          type: "LoadImage",
+          mode: 0,
+          inputs: [],
+          outputs: [{ name: "IMAGE", type: "IMAGE", links: [40] }],
+          widgets_values: ["a.png"],
+        },
+        {
+          id: 2,
+          type: "LoadImage",
+          mode: 0,
+          inputs: [],
+          outputs: [{ name: "IMAGE", type: "IMAGE", links: [41] }],
+          widgets_values: ["b.png"],
+        },
+        {
+          id: 7,
+          type: "Anything Everywhere3",
+          mode: 0,
+          inputs: [
+            { name: "anything", type: "*", link: 40 },
+            { name: "anything2", type: "*", link: 41 },
+          ],
+          outputs: [],
+          widgets_values: [],
+        },
+        {
+          id: 3,
+          type: "SaveImage",
+          mode: 0,
+          inputs: [{ name: "images", type: "IMAGE", link: null }],
+          outputs: [],
+          widgets_values: ["out"],
+        },
+        {
+          id: 4,
+          type: "SaveImage",
+          mode: 0,
+          inputs: [{ name: "images", type: "IMAGE", link: null }],
+          outputs: [],
+          widgets_values: ["out2"],
+        },
+      ],
+      links: [
+        [40, 1, 0, 7, 0, "IMAGE"],
+        [41, 2, 0, 7, 1, "IMAGE"],
+      ],
+    } as never;
+    const { workflow, warnings } = convertUiToApi(g, {
+      ...(OBJECT_INFO as object),
+      "Anything Everywhere3": {
+        input: { required: {}, optional: { anything: ["*"], anything2: ["*"] } },
+      },
+    } as never);
+    expect(workflow["3"].inputs.images).toEqual(["1", 0]);
+    expect(workflow["4"].inputs.images).toEqual(["2", 0]);
+    expect(warnings).toEqual([]);
   });
 
   it("an EMPTY computed list is an answer, not an unknown — no warning, no invented link", () => {
