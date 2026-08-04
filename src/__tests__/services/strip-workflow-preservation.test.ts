@@ -610,6 +610,79 @@ describe("#361 — promoted subgraph widget values", () => {
     expect(joined(warnings)).toContain("more than one promotion claims that name");
   });
 
+  it("a NESTED instance's name-keyed values survive an outer promotion into it", () => {
+    // Outer(700) wraps Inner(60), which wraps EmptyLatentImage(50). Inner carries
+    // its OWN name-keyed { height: 1088 }; Outer promotes Inner's `width` = 1920.
+    // Overwriting Inner's map with a positional array would drop `height`, and
+    // Inner's own expansion pass would then leave it at the stale 512 — silently.
+    const OUTER = "sg-outer";
+    const INNER = "sg-inner";
+    const g = {
+      definitions: {
+        subgraphs: [
+          {
+            id: INNER,
+            name: "Inner",
+            inputNode: { id: -10 },
+            outputNode: { id: -20 },
+            inputs: [],
+            outputs: [{ id: "o1", name: "LATENT", type: "LATENT", linkIds: [] }],
+            widgets: [],
+            nodes: [
+              {
+                id: 50,
+                type: "EmptyLatentImage",
+                mode: 0,
+                inputs: [],
+                outputs: [{ name: "LATENT", type: "LATENT", links: [] }],
+                widgets_values: [512, 512, 1],
+              },
+            ],
+            links: [],
+          },
+          {
+            id: OUTER,
+            name: "Outer",
+            inputNode: { id: -10 },
+            outputNode: { id: -20 },
+            inputs: [],
+            outputs: [{ id: "o1", name: "LATENT", type: "LATENT", linkIds: [] }],
+            widgets: [],
+            nodes: [
+              {
+                id: 60,
+                type: INNER,
+                mode: 0,
+                properties: { proxyWidgets: [["50", "width"], ["50", "height"]] },
+                inputs: [],
+                outputs: [{ name: "LATENT", type: "LATENT", links: [] }],
+                widgets_values: { height: 1088 },
+              },
+            ],
+            links: [],
+          },
+        ],
+      },
+      nodes: [
+        {
+          id: 700,
+          type: OUTER,
+          mode: 0,
+          properties: { proxyWidgets: [["60", "width"]] },
+          inputs: [],
+          outputs: [],
+          widgets_values: [1920],
+        },
+      ],
+      links: [],
+    } as never;
+    const { workflow, warnings } = convertUiToApi(g, OBJECT_INFO);
+    const inner = onlyInner(workflow as never);
+    expect(inner.inputs.width).toBe(1920); // outer promotion
+    expect(inner.inputs.height).toBe(1088); // nested instance's own value, kept
+    expect(warnings).toEqual([]);
+  });
+
   it("a promoted widget with NO serialized value keeps the inner node's own value, silently", () => {
     // Not a loss: the subgraph node's widget is a proxy VIEW of the inner widget,
     // so no serialized override means the inner value is what was displayed.

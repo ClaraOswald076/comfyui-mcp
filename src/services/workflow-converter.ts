@@ -1220,6 +1220,16 @@ function expandSingleComponent(
         ([, wn]) => wn === widgetName,
       );
       if (idx < 0) return false;
+      const nestedWv = target.widgets_values as unknown;
+      // A nested instance may itself carry a NAME-KEYED widgets_values. Overlay
+      // the value in that representation — replacing the object with a positional
+      // array would discard the nested instance's OTHER promoted values, which
+      // its own expansion pass would then silently leave at their stale inner
+      // values (codex gate r3).
+      if (nestedWv && typeof nestedWv === "object" && !Array.isArray(nestedWv)) {
+        (nestedWv as Record<string, unknown>)[widgetName] = value;
+        return true;
+      }
       if (!Array.isArray(target.widgets_values)) target.widgets_values = [];
       target.widgets_values[idx] = value;
       return true;
