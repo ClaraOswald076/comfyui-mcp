@@ -396,7 +396,17 @@ function findDesktopExePath(argv: string[]): string | undefined {
  * definite `free`; an `unknown` keeps waiting and, if that is all we ever get,
  * surfaces as the timeout — a caller must not read it as success.
  */
-async function waitForPortFree(port: number, timeoutMs = 15000): Promise<void> {
+/** How long to wait for the port to be observed free after a kill. Tunable for the
+ *  same reason the startup probes are (COMFYUI_STARTUP_CHECK_*): a host with a slow
+ *  or unavailable port probe should not be stuck with one hardcoded budget. */
+function getPortFreeTimeoutMs(): number {
+  return Math.round(parsePositiveNumberEnv("COMFYUI_PORT_FREE_TIMEOUT_S", 15) * 1000);
+}
+
+async function waitForPortFree(
+  port: number,
+  timeoutMs = getPortFreeTimeoutMs(),
+): Promise<void> {
   const start = Date.now();
   let lastUnknown: string | undefined;
   while (Date.now() - start < timeoutMs) {
@@ -665,32 +675,49 @@ function classifyListenerOwnership(input: {
    */
   const byArgv = (): "match" | "differ" | "unknown" => {
     if (!input.servingArgv?.length || !input.launchArgv?.length) return "unknown";
-    // BOTH directions. `commandLineMatchesArgv(haystack, tokens)` only asks whether
-    // every token appears in the haystack, so a single call is a SUBSET test — and
-    // a foreign server whose argv is a strict subset of ours would "match", turning
-    // the deliberately non-promoting match into a false one (codex gate). Compare
-    // each way instead. The interpreter is dropped from our side because the server
-    // reports `sys.argv`, which never contains it.
-    // Path-like tokens are reduced to their final segment for the reverse check.
-    // We resolve the script to an ABSOLUTE path to launch it, while the server
-    // reports the (often RELATIVE) `sys.argv` it was handed — and
-    // commandLineMatchesArgv treats an absolute token as an exact claim by design
-    // (#401). Comparing them verbatim would make every portable-launcher install
-    // read as a different server. Flags are left alone, so a foreign SUBSET still
-    // fails on the missing ones.
-    const ourTokens = input.launchArgv
-      .slice(1)
-      .map((t) => (looksLikePath(t) ? t.split(/[\\/]/).pop() || t : t));
-    if (ourTokens.length === 0) return "unknown";
-    const servingContainsOurs = commandLineMatchesArgv(
-      input.servingArgv.join(" "),
-      ourTokens,
-    );
-    const oursContainsServing = commandLineMatchesArgv(
-      input.launchArgv.join(" "),
-      input.servingArgv,
-    );
-    return servingContainsOurs && oursContainsServing ? "match" : "differ";
+    // Compared as normalised token MULTISETS, both directions at once. A one-way
+    // containment test is a SUBSET check, and a foreign server whose argv is a
+    // strict subset of ours would "match" (codex gate); requiring the same tokens
+    // on both sides rules that out.
+    //
+    // The normalisation is deliberately NOT `commandLineMatchesArgv`, which was the
+    // second half of this bug. That helper normalises separators only when the HOST
+    // is Windows — correct for its own job (#401 compares two observations of the
+    // same machine), wrong here: `sys.argv` follows the SERVER, so a Windows-launched
+    // ComfyUI answers `ComfyUI\main.py` even when this orchestrator runs on Linux.
+    // Under host-normalisation that never matches our POSIX-resolved absolute path,
+    // and the "difference" it reports is really "I could not compare these" — an
+    // absence dressed as a finding.
+    const normalise = (token: string): string =>
+      token
+        .trim()
+        .replace(/^["']+|["']+$/g, "")
+        .toLowerCase()
+        .replace(/\\/g, "/");
+    /**
+     * Do two argv tokens denote the same thing? Paths are compared SEGMENT-ALIGNED
+     * (one may be a suffix of the other) rather than by basename: we launch the
+     * script by absolute path while the server reports the relative one it was
+     * handed, so `/opt/x/ComfyUI/main.py` and `ComfyUI\main.py` agree — while two
+     * DIFFERENT installs do not, which a basename comparison could never tell apart
+     * given every ComfyUI script is called `main.py`.
+     */
+    const tokensAgree = (a: string, b: string): boolean => {
+      if (a === b) return true;
+      const pathish = (s: string): boolean => /\//.test(s) || /^[a-z]:/.test(s);
+      if (!pathish(a) || !pathish(b)) return false;
+      return a.endsWith(`/${b}`) || b.endsWith(`/${a}`);
+    };
+    // The interpreter is dropped from our side: the server reports `sys.argv`,
+    // which never contains it. Order is preserved on both sides (a relaunch passes
+    // the same arguments in the same order), so compare positionally.
+    const ours = input.launchArgv.slice(1).map(normalise).filter(Boolean);
+    const serving = input.servingArgv.map(normalise).filter(Boolean);
+    if (ours.length === 0 || serving.length === 0) return "unknown";
+    const same =
+      ours.length === serving.length &&
+      ours.every((token, i) => tokensAgree(token, serving[i]));
+    return same ? "match" : "differ";
   };
   // A Desktop launch is undecidable BY DESIGN: we spawn the Electron shell (or
   // macOS `open`) and its child binds the port, so a pid mismatch proves nothing.
@@ -725,10 +752,18 @@ function classifyListenerOwnership(input: {
 
   const ourPid = input.child.pid;
   if (input.portOwnerPid == null) {
-    // The port owner could not be mapped (#449). The server's own argv still
-    // decides the NEGATIVE: a different command line proves this call did not start
-    // the healthy listener, which is the case that must never read as success.
-    return byArgv() === "differ" ? "not-ours" : "unconfirmed";
+    // NO LISTENER WAS IDENTIFIED — the port owner could not be mapped at all (#449:
+    // no `lsof`, a permission-denied probe, the process already gone, the port
+    // already free). `not-ours` is a POSITIVE finding about an identified process,
+    // so it cannot be reached from here: there is nothing to have found. Reporting
+    // one would be manufacturing a definite answer out of an absence, which is the
+    // error this whole class of bug keeps taking (#796).
+    //
+    // The server's own argv is deliberately NOT consulted as a negative here. It
+    // describes whatever is ANSWERING, not which process holds the socket, and it
+    // cannot distinguish "a different program" from "we could not compare" — see
+    // byArgv, whose "differ" is not a proof of difference.
+    return "unconfirmed";
   }
   if (ourPid == null) return "unconfirmed";
   if (input.portOwnerPid !== ourPid) {

@@ -243,6 +243,9 @@ beforeEach(() => {
   process.env = { ...ORIGINAL_ENV };
   process.env.COMFYUI_STARTUP_CHECK_INTERVAL_S = "0.01";
   process.env.COMFYUI_STARTUP_CHECK_MAX_TRIES = "1";
+  // Keep the port-free wait short: these fixtures deliberately exercise the
+  // TIMEOUT path, and 15s of real waiting per test destabilises the whole suite.
+  process.env.COMFYUI_PORT_FREE_TIMEOUT_S = "1";
   process.env.PATH = ORIGINAL_ENV.PATH ?? "/usr/bin";
   mockConfig.resolvedPort = 8188;
   mockConfig.comfyuiPath = undefined;
@@ -1987,9 +1990,11 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
 
     const result = await restartComfyUI();
 
-    // The port owner is unmappable after the kill, so argv is the only signal —
-    // and a subset must read as DIFFERENT, not as a match.
-    expect(result.listener_ownership).toBe("not-ours");
+    // The port owner is unmappable, so NO listener was identified — and an absence
+    // can never yield the positive verdict `not-ours`. What matters here is that a
+    // subset argv does not read as a MATCH and so cannot promote to "ours": the
+    // claim is withheld, and no success is reported.
+    expect(result.listener_ownership).toBe("unconfirmed");
     expect(result.message).not.toMatch(/restarted successfully/i);
 
     killSpy.mockRestore();

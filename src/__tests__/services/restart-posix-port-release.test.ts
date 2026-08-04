@@ -125,6 +125,9 @@ beforeEach(() => {
   process.env = { ...ORIGINAL_ENV };
   process.env.COMFYUI_STARTUP_CHECK_INTERVAL_S = "0.01";
   process.env.COMFYUI_STARTUP_CHECK_MAX_TRIES = "1";
+  // Keep the port-free wait short: these fixtures deliberately exercise the
+  // TIMEOUT path, and 15s of real waiting per test destabilises the whole suite.
+  process.env.COMFYUI_PORT_FREE_TIMEOUT_S = "1";
   mockConfig.resolvedPort = 8188;
   mockConfig.comfyuiPath = BASE;
   mockFindComfyuiPython.mockReturnValue(PYTHON);
@@ -151,8 +154,10 @@ afterEach(() => {
 describe("restart_comfyui on POSIX — port release via lsof (#776)", () => {
   it("completes PROMPTLY when lsof reports the port free after the kill", async () => {
     // The regression: reading lsof's exit-1 as "could not look" made the port-free
-    // wait burn its entire budget on every successful restart. A generous ceiling
-    // here still fails loudly against that behaviour (the wait is 15s).
+    // wait burn its entire budget on every successful restart. The budget is raised
+    // back to 10s for THIS test so the ceiling below actually proves the wait
+    // resolved early, rather than passing because the budget itself was short.
+    process.env.COMFYUI_PORT_FREE_TIMEOUT_S = "10";
     let killed = false;
     mockExecSync.mockImplementation((cmd: string) => {
       if (/kill/i.test(cmd)) {
@@ -178,6 +183,97 @@ describe("restart_comfyui on POSIX — port release via lsof (#776)", () => {
     expect(result.stopped).toBe(true);
     expect(result.started).toBe(true);
     expect(elapsed).toBeLessThan(8000);
+
+    killSpy.mockRestore();
+  }, 20_000);
+
+  /** Port owned while identifying, then unmappable for good once the kill lands. */
+  function killThenUnmappablePort(): void {
+    let killed = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/kill/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed) throw lsofNoMatches();
+        return "p4321\nn127.0.0.1:8188\n";
+      }
+      return "";
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true }) as Response),
+    );
+  }
+
+  it("does NOT fabricate 'not-ours' when the port owner is UNMAPPABLE", async () => {
+    // No listener can be identified at all after the kill. "I could not determine
+    // who owns this listener" must not be reported as "I determined this listener is
+    // not ours" — `not-ours` is a POSITIVE finding about an identified process,
+    // never the shape of an absence.
+    killThenUnmappablePort();
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.listener_ownership).toBe("unconfirmed");
+    expect(result.started).toBe(true);
+
+    killSpy.mockRestore();
+  }, 20_000);
+
+  it("does NOT read a WINDOWS-flavoured sys.argv as a different program", async () => {
+    // `sys.argv` follows the SERVER, not us: a Windows-launched ComfyUI answers
+    // `ComfyUI\main.py` however this orchestrator is running. Compared with
+    // host-dialect normalisation that never matches our POSIX-resolved absolute
+    // path, and the "difference" reported is really "I could not compare these".
+    //
+    // Driven through the child-exited branch, where the argv comparison is what
+    // decides: our direct child is gone (positive evidence), so a genuine mismatch
+    // would say `not-ours` — only a correct match keeps it at `unconfirmed`.
+    let answers = 0;
+    mockGetSystemStats.mockImplementation(async () => {
+      answers++;
+      // Identification uses the absolute argv; the server that answers AFTER the
+      // relaunch reports the Windows-flavoured relative form of the same script.
+      return {
+        system: {
+          argv: answers <= 2 ? ARGV : ["ComfyUI\\main.py", "--port", "8188"],
+        },
+      };
+    });
+    let killed = false;
+    const children: FakeChild[] = [];
+    mockSpawn.mockImplementation(() => {
+      const child = new FakeChild();
+      children.push(child);
+      return child;
+    });
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/kill/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed) throw lsofNoMatches();
+        return "p4321\nn127.0.0.1:8188\n";
+      }
+      return "";
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        // The process we launched is gone — the branch where argv decides.
+        children[0]?.emit("exit", 0, null);
+        return { ok: true } as Response;
+      }),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.listener_ownership).toBe("unconfirmed");
 
     killSpy.mockRestore();
   }, 20_000);
