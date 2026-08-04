@@ -1943,9 +1943,22 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     });
 
     // Everything after the fence is fallible, and none of it may escape.
-    expect(() => AskAnswers.closeAsks(TAB)).not.toThrow();
-    deadWarn.mockRestore();
-    surfacer.mockRestore();
+    //
+    // Restored in a `finally`, NOT after the assertion: the mutant this test
+    // exists to catch (unguarding the catch-block warn) is exactly the case
+    // where closeAsks throws — so restoring afterwards would leave a logger that
+    // throws installed for every later test in the file, and the mutation run
+    // would report a cascade instead of this one honest failure.
+    let escaped: unknown;
+    try {
+      AskAnswers.closeAsks(TAB);
+    } catch (err) {
+      escaped = err;
+    } finally {
+      deadWarn.mockRestore();
+      surfacer.mockRestore();
+    }
+    expect(escaped).toBeUndefined();
 
     // PASS 2 RAN TO THE END: both queued copies were actually offered back, not
     // just the first. A throw out of entry 1's catch would leave entry 2 queued on
