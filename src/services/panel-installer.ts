@@ -2498,14 +2498,6 @@ const PANEL_SWAP_JOURNAL = ".comfyui-agent-panel.swap.json";
  */
 const PANEL_INCOMING_NAME = ".comfyui-agent-panel.incoming";
 
-/**
- * Floor for "the panel bundle actually has content". The real bundle is hundreds
- * of kilobytes; this only has to be large enough that a zero-byte or truncated
- * remnant cannot pass, without being so large that a legitimately slimmer future
- * build would be rejected.
- */
-const MIN_PANEL_BUNDLE_CHARS = 1024;
-
 interface PanelSwapJournal {
   /** Canonical panel dir the swap targets. */
   dir: string;
@@ -2551,6 +2543,67 @@ interface SwapReconcileResult {
  * "no".
  */
 /**
+ * (1) IDENTITY — is this directory the panel PACK, whatever state it is in?
+ *
+ * The same question `detectPanelInstall` asks, and the same answer: the
+ * pyproject `[project].name`. Deliberately says nothing about whether the pack
+ * works — a broken panel is still the panel, and must be recognised as such or
+ * recovery would mistake an unrelated custom node for it.
+ *
+ * "Has any pyproject.toml at all" is NOT this test. Every custom node pack has
+ * one, so using it to resolve the canonical panel directory let an unrelated
+ * node occupying `custom_nodes/comfyui-mcp-panel` be selected as the panel.
+ */
+function dirIsPanelByIdentity(dir: string, deps: PanelInstallerDeps): boolean {
+  try {
+    const pyproject = join(dir, "pyproject.toml");
+    if (!deps.existsSync(pyproject)) return false;
+    return parsePyproject(deps.readFile(pyproject)).projectName === PANEL_REGISTRY_ID;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Find the panel backup this ComfyUI root holds, WITHOUT depending on the
+ * journal to name it.
+ *
+ * The design premise is that recovery derives from the filesystem, and the
+ * journal is advisory — so it must not be the only way to find our own backup.
+ * When `.incoming` proves an interruption but the journal is gone, a perfectly
+ * good previous panel can be sitting in custom_nodes_backup, discoverable by
+ * looking. Refusing then, and telling the user no previous copy exists while one
+ * does, is a plain failure rather than the ambiguity the refusal policy covers.
+ *
+ * Only VIABLE panels are candidates, every path is containment-checked, and the
+ * most recent wins — the backup names carry the `Date.now()` they were made
+ * with, and a later swap's backup is the one that matches what was just replaced.
+ */
+function discoverPanelBackup(
+  comfyuiPath: string,
+  deps: PanelInstallerDeps,
+): string | undefined {
+  const backupRoot = join(comfyuiPath, "custom_nodes_backup");
+  let entries: string[];
+  try {
+    entries = deps.readdir(backupRoot);
+  } catch {
+    return undefined; // absent or unreadable — nothing discoverable
+  }
+  const candidates: Array<{ dir: string; stamp: number }> = [];
+  for (const name of entries) {
+    const dir = join(backupRoot, name);
+    if (!isInsideDir(backupRoot, dir)) continue;
+    if (!dirIsUsablePanel(dir, deps)) continue;
+    const trailing = /-(\d{10,})$/.exec(name);
+    candidates.push({ dir, stamp: trailing ? Number(trailing[1]) : 0 });
+  }
+  if (candidates.length === 0) return undefined;
+  candidates.sort((a, b) => b.stamp - a.stamp);
+  return candidates[0].dir;
+}
+
+/**
  * Is `child` genuinely INSIDE `parent`?
  *
  * A `startsWith` prefix test is not a containment test, and the difference is
@@ -2594,13 +2647,195 @@ function resolveCanonicalPanelDir(
   const customNodes = join(comfyuiPath, "custom_nodes");
   for (const name of FAST_PATH_DIRS) {
     const candidate = join(customNodes, name);
-    if (deps.existsSync(join(candidate, "pyproject.toml"))) return candidate;
+    if (dirIsPanelByIdentity(candidate, deps)) return candidate;
   }
   const journalName = journal?.dir ? basename(journal.dir) : undefined;
   if (journalName && FAST_PATH_DIRS.includes(journalName)) {
     return join(customNodes, journalName);
   }
   return join(customNodes, PANEL_REGISTRY_ID);
+}
+
+/**
+ * Trailing characters that cannot end a complete statement — an expression is
+ * still owed a right-hand side. Balanced delimiters alone would accept
+ * `const a = 5 +`, which is a truncation.
+ *
+ * `}` `)` `]` and identifier/literal characters are all legitimate endings, as
+ * is `;`. ASI means a module need not end in a semicolon, so requiring one
+ * would false-reject `export default 5`.
+ */
+const INCOMPLETE_TAIL = new Set([
+  "+", "-", "*", "/", "%", "=", "<", ">", "&", "|", "^", "!", "~", ",", ".", "?", ":",
+]);
+
+/**
+ * Is this source a STRUCTURALLY COMPLETE JavaScript module?
+ *
+ * The honest answer would come from a parser, but there is none available at
+ * runtime — `typescript` is a devDependency and the published package carries no
+ * JS parser, so importing one here would mean adding a dependency to every
+ * install for a check that runs on a recovery path. What this does instead is
+ * the floor that actually detects the failure in question: a real lexer that
+ * understands strings, template literals (including `${}` nesting), comments and
+ * regex literals, and then asserts the two things truncation always breaks —
+ * every delimiter closed, and the file not ending mid-token or mid-expression.
+ *
+ * It is not a validity check and does not pretend to be: it will accept code
+ * that a parser would reject for other reasons. It exists to answer "was this
+ * file cut off?", which is the question recovery has to ask.
+ *
+ * Biased toward REJECT on anything it cannot follow, because the consequences
+ * are asymmetric: a false reject refuses an update or restores a backup (safe,
+ * recoverable), while a false accept installs a broken panel over a working one.
+ */
+export function moduleIsStructurallyComplete(source: string): boolean {
+  // Open delimiters, plus markers for template text (`) and a template
+  // substitution (${) so `}` can tell which context it closes.
+  const stack: string[] = [];
+  let i = 0;
+  let lastMeaningful = "";
+  const n = source.length;
+
+  /** Could a `/` at this position begin a regex literal rather than divide? */
+  const regexCanStart = (): boolean => {
+    if (lastMeaningful === "") return true;
+    if ("([{,;:=!&|?+-*%~^<>".includes(lastMeaningful)) return true;
+    // `return /re/`, `typeof /re/`, `case /re/` … — a word char could equally be
+    // an identifier being divided, so only treat known keywords as regex-leading.
+    const before = source.slice(Math.max(0, i - 12), i);
+    return /\b(return|typeof|case|in|of|new|delete|void|do|else|yield|await)\s*$/.test(
+      before,
+    );
+  };
+
+  while (i < n) {
+    const c = source[i];
+    const top = stack.length > 0 ? stack[stack.length - 1] : "";
+
+    // Inside template TEXT (not a substitution): only ` and ${ are structural.
+    if (top === "`") {
+      if (c === "\\") {
+        i += 2;
+        continue;
+      }
+      if (c === "`") {
+        stack.pop();
+        lastMeaningful = "`";
+        i++;
+        continue;
+      }
+      if (c === "$" && source[i + 1] === "{") {
+        stack.push("${");
+        i += 2;
+        continue;
+      }
+      i++;
+      continue;
+    }
+
+    // Comments.
+    if (c === "/" && source[i + 1] === "/") {
+      const nl = source.indexOf("\n", i);
+      if (nl === -1) {
+        // A line comment running to EOF is a complete file, not a truncation.
+        i = n;
+        continue;
+      }
+      i = nl + 1;
+      continue;
+    }
+    if (c === "/" && source[i + 1] === "*") {
+      const end = source.indexOf("*/", i + 2);
+      if (end === -1) return false; // unterminated block comment ⇒ cut off
+      i = end + 2;
+      continue;
+    }
+
+    // Strings.
+    if (c === '"' || c === "'") {
+      i++;
+      let closed = false;
+      while (i < n) {
+        const d = source[i];
+        if (d === "\\") {
+          i += 2;
+          continue;
+        }
+        if (d === c) {
+          closed = true;
+          i++;
+          break;
+        }
+        if (d === "\n") return false; // unterminated string literal
+        i++;
+      }
+      if (!closed) return false;
+      lastMeaningful = c;
+      continue;
+    }
+
+    // Template literal start.
+    if (c === "`") {
+      stack.push("`");
+      i++;
+      continue;
+    }
+
+    // Regex literal.
+    if (c === "/" && regexCanStart()) {
+      i++;
+      let inClass = false;
+      let closed = false;
+      while (i < n) {
+        const d = source[i];
+        if (d === "\\") {
+          i += 2;
+          continue;
+        }
+        if (d === "[") inClass = true;
+        else if (d === "]") inClass = false;
+        else if (d === "/" && !inClass) {
+          closed = true;
+          i++;
+          break;
+        } else if (d === "\n") return false; // unterminated regex
+        i++;
+      }
+      if (!closed) return false;
+      while (i < n && /[a-z]/i.test(source[i])) i++; // flags
+      lastMeaningful = "/";
+      continue;
+    }
+
+    // Delimiters.
+    if (c === "(" || c === "[" || c === "{") {
+      stack.push(c);
+      lastMeaningful = c;
+      i++;
+      continue;
+    }
+    if (c === ")" || c === "]" || c === "}") {
+      const expected = c === ")" ? "(" : c === "]" ? "[" : "{";
+      if (top === "${" && c === "}") {
+        stack.pop(); // back into template text
+        lastMeaningful = "}";
+        i++;
+        continue;
+      }
+      if (top !== expected) return false; // mismatched or over-closed
+      stack.pop();
+      lastMeaningful = c;
+      i++;
+      continue;
+    }
+
+    if (!/\s/.test(c)) lastMeaningful = c;
+    i++;
+  }
+
+  if (stack.length > 0) return false; // something was never closed
+  return !INCOMPLETE_TAIL.has(lastMeaningful);
 }
 
 function dirIsUsablePanel(dir: string, deps: PanelInstallerDeps): boolean {
@@ -2613,19 +2848,18 @@ function dirIsUsablePanel(dir: string, deps: PanelInstallerDeps): boolean {
     // THE JS BUNDLE IS NOT OPTIONAL, AND ITS PRESENCE IS NOT ENOUGH.
     //
     // "A regular file exists at this path" is a claim about the DIRECTORY ENTRY,
-    // and a directory entry surviving while its data did not is the canonical
-    // shape of the crash this whole mechanism exists to handle — a zero-byte or
-    // truncated bundle is exactly what a power loss leaves. So the file must
-    // also carry a plausible amount of content, and look like the module the
-    // browser is meant to execute.
+    // and an entry surviving while its data did not is the canonical shape of
+    // the crash this whole mechanism exists to handle. So the bundle must be a
+    // COMPLETE module, which is a question about structure — not about size and
+    // not about which words appear in it. A size floor plus token presence gets
+    // it wrong in both directions at once: a crash-truncated bundle keeps its
+    // early `import` and stays over any threshold, while a perfectly ordinary
+    // small extension is refused for being short.
     const bundle = join(dir, ...PANEL_WEB_MARKERS[0]);
     if (deps.probeFile(bundle) !== true) return false;
     const source = deps.readFile(bundle);
-    if (source.trim().length < MIN_PANEL_BUNDLE_CHARS) return false;
-    // Content shape: the panel bundle is an ES module and always registers
-    // itself with the ComfyUI frontend. A file that is large but holds none of
-    // this is not the bundle (a partial write of something else, or padding).
-    return /\bimport\b|\bexport\b|registerExtension/.test(source);
+    if (source.trim().length === 0) return false;
+    return moduleIsStructurallyComplete(source);
   } catch {
     return false;
   }
@@ -2675,12 +2909,16 @@ function reconcilePanelSwap(
     // is preserved. That is not the refusal that was ruled for; it is the
     // refusal being suppressed, which is worse than either option weighed.
     const staleCanonical = resolveCanonicalPanelDir(comfyuiPath, deps, stale);
-    const staleBackup = isInsideDir(
-      join(comfyuiPath, "custom_nodes_backup"),
-      stale.backupDir,
-    )
-      ? stale.backupDir
-      : undefined;
+    // Same rule as the in-flight path: the journal is preferred but not the only
+    // way to find our backup. Here it matters for DISCLOSURE rather than for a
+    // move — the refusal has to be able to tell the user where their panel is,
+    // and "the journal named a path that no longer resolves" is no reason to
+    // report that no copy exists when one is sitting in custom_nodes_backup.
+    const staleBackup =
+      (isInsideDir(join(comfyuiPath, "custom_nodes_backup"), stale.backupDir) &&
+      dirIsUsablePanel(stale.backupDir, deps)
+        ? stale.backupDir
+        : undefined) ?? discoverPanelBackup(comfyuiPath, deps);
     if (deps.existsSync(staleCanonical)) {
       // Panel present and no swap in flight — the record is simply spent.
       dropJournal();
@@ -2736,10 +2974,19 @@ function reconcilePanelSwap(
   const backupRootPath = join(comfyuiPath, "custom_nodes_backup");
   // Containment, not prefix — see isInsideDir. The journal names the SOURCE of a
   // restore, so a traversal here reaches another installation.
-  const journalBackup =
-    journal?.backupDir && isInsideDir(backupRootPath, journal.backupDir)
+  // The journal is PREFERRED (it names the copy this specific swap made) but is
+  // not required: when it is gone, or names something unusable, the backup is
+  // discovered by scanning. Depending on the journal to locate our own backup
+  // would make a recoverable panel undiscoverable for no reason other than a
+  // lost advisory file — in a state where `.incoming` has already PROVEN an
+  // interrupted swap, so there is no ambiguity to be cautious about.
+  const namedBackup =
+    journal?.backupDir &&
+    isInsideDir(backupRootPath, journal.backupDir) &&
+    dirIsUsablePanel(journal.backupDir, deps)
       ? journal.backupDir
       : undefined;
+  const journalBackup = namedBackup ?? discoverPanelBackup(comfyuiPath, deps);
   // "EXISTS" IS WEAKER THAN "WORKS", and the difference decides whether we are
   // allowed to delete anything. The discard branch below throws away the staged
   // panel on the strength of the canonical one being fine — so the canonical one
@@ -2828,7 +3075,9 @@ function reconcilePanelSwap(
   // exists to protect. Re-check the tree as it is NOW, and when it does not
   // hold up, prefer the copy we know worked.
   if (!dirIsUsablePanel(incomingDir, deps)) {
-    const backupUsable = !!journalBackup && dirIsUsablePanel(journalBackup, deps);
+      // journalBackup is already viability-checked by resolution (named or
+    // discovered), so this only asks whether we HAVE one.
+    const backupUsable = !!journalBackup;
     if (!backupUsable || !deps.rename) {
       return {
         ok: false,

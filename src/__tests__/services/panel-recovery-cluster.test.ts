@@ -75,6 +75,7 @@ vi.mock("../../services/workspace-env.js", () => ({
 
 import {
   defaultDeps,
+  moduleIsStructurallyComplete,
   PanelInstallError,
   pinPanelBase,
   PANEL_REGISTRY_ID,
@@ -1153,6 +1154,79 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     expect(readdirSync(join(root, "custom_nodes"))).toEqual([PANEL_REGISTRY_ID]);
   });
 
+  // ── Bundle completeness ────────────────────────────────────────────────────
+  // Size and token presence are not evidence of well-formedness. They were wrong
+  // in BOTH directions: a crash-truncated bundle keeps its early `import` and
+  // stays over any threshold, while an ordinary small extension is refused for
+  // being short. Both directions are pinned here.
+
+  describe("moduleIsStructurallyComplete", () => {
+    const complete = [
+      ['a genuinely SMALL but valid extension', 'import{app}from"./app.js";app.registerExtension({name:"x"});'],
+      ["no trailing semicolon (ASI)", "export default 5"],
+      ["template literals with nested substitutions", 'const a=`x${`y${1+2}`}z`;'],
+      ["regex containing quotes and brackets", 'const re=/["\'{[(]/g; export{re};'],
+      ["division that is not a regex", "const r = (a+b) / c / d;"],
+      ["a line comment running to EOF", "export const a=1;\n// trailing note"],
+      ["braces inside strings", 'const s = "){"; export {s};'],
+    ] as const;
+    for (const [label, src] of complete) {
+      it(`accepts ${label}`, () => {
+        expect(moduleIsStructurallyComplete(src)).toBe(true);
+      });
+    }
+
+    const truncated = [
+      ["cut mid-call", 'import{app}from"./app.js";app.registerExtension({name:"x"'],
+      ["cut inside a string", 'const msg = "hello wor'],
+      ["cut inside a template literal", "const a = `abc${1+"],
+      ["cut inside a block comment", "/* explanatory note that never"],
+      ["cut after a binary operator", "const a = 5 +"],
+      ["cut after a comma", "const a = [1, 2,"],
+      ["unbalanced closer", "})"],
+    ] as const;
+    for (const [label, src] of truncated) {
+      it(`rejects a bundle ${label}`, () => {
+        expect(moduleIsStructurallyComplete(src)).toBe(false);
+      });
+    }
+  });
+
+  it("P0: a bundle truncated AFTER a valid prefix is refused, however large", async () => {
+    // The old heuristic accepted this: it is well over any size floor and its
+    // first line contains `import`. It is also syntactically incomplete.
+    const plausible =
+      `import { app } from "../../scripts/app.js";\n` +
+      `${"// filler filler filler filler filler\n".repeat(60)}` +
+      `app.registerExtension({ name: "comfyui-mcp.panel", async setup() {\n` +
+      `  const label = "this string never clo`;
+    const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1`);
+    writePanelPack(backupDir, "0.11.34");
+    writePanelPack(INCOMING(), "0.11.38", { bundle: plausible });
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
+    expect(note).toMatch(/INCOMPLETE/);
+    // The good copy is what ends up installed.
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
+  });
+
+  it("P1: a genuinely SMALL valid bundle is accepted by the swap, not refused for size", async () => {
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    const tiny = 'import{app}from"../../scripts/app.js";app.registerExtension({name:"p"});';
+    const h = makeDeps({ updateThrows: "manager cannot resolve it" });
+    h.deps.gitClonePanel = (dest) => {
+      h.clones.push(dest);
+      writePanelPack(dest, "0.11.38", { bundle: tiny });
+    };
+    const result = await runPanelActionInner("update", h.deps);
+    expect(result.installedVersion).toBe("0.11.38");
+    expect(readFileSync(join(PANEL_DIR(), "web", "js", "comfyui-mcp-panel.js"), "utf-8")).toBe(
+      tiny,
+    );
+  });
+
   it("P0: a TRUNCATED bundle is not usable — a surviving entry is not surviving data", async () => {
     // A zero-byte or truncated JS file is the canonical shape of "the directory
     // entry survived, the data did not".
@@ -1170,6 +1244,63 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     expect(note).toMatch(/INCOMPLETE/);
     // The good copy is what ends up installed, not the truncated one.
     expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
+  });
+
+  it("P0: the backup is DISCOVERED when the journal is gone — .incoming already proves the interruption", async () => {
+    // This is NOT the ruled residual. There, `.incoming` is lost and the state
+    // is indistinguishable from a deliberate uninstall. Here `.incoming` is
+    // PRESENT, which is unambiguous proof of an interrupted swap — so recovery
+    // is licensed, and refusing while a viable copy sits discoverable on disk
+    // (and telling the user none exists) is a plain failure.
+    const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1770000000000`);
+    writePanelPack(backupDir, "0.11.34");
+    writePanelPack(INCOMING(), "0.11.38", { bundle: "const a = [1," }); // husk
+    // No journal at all.
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
+    expect(note).toMatch(/RESTORED/);
+    expect(note).not.toMatch(/No previous copy could be located/);
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
+  });
+
+  it("discovery picks the MOST RECENT viable backup and ignores unusable ones", async () => {
+    const older = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.20-1700000000000`);
+    const newer = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1770000000000`);
+    const husk = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.30-1780000000000`);
+    writePanelPack(older, "0.11.20");
+    writePanelPack(newer, "0.11.34");
+    writePanelPack(husk, "0.11.30", { bundle: "" }); // newest, but unusable
+    writePanelPack(INCOMING(), "0.11.38", { bundle: "const a = [1," });
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    await repairInterruptedPanelSwap(makeDeps({}).deps);
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
+  });
+
+  it("P1: an unrelated node occupying the panel's dir name is not mistaken for the panel", async () => {
+    // "has any pyproject.toml" is not an identity test — every custom node pack
+    // has one. Selecting an unrelated node as the canonical panel let the stale
+    // journal be deleted as spent, suppressing the ruled disclosure.
+    const impostor = join(root, "custom_nodes", "comfyui-mcp-panel");
+    mkdirSync(impostor, { recursive: true });
+    writeFileSync(join(impostor, "pyproject.toml"), pyproject("1.0.0", "some-other-node"));
+    const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1770000000000`);
+    writePanelPack(backupDir, "0.11.34");
+    writeFileSync(
+      join(root, ".comfyui-agent-panel.swap.json"),
+      JSON.stringify({ dir: PANEL_DIR(), backupDir, staging: "x", startedAt: Date.now() }),
+    );
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
+    // The refusal is NOT suppressed, and the backup is disclosed.
+    expect(note).toMatch(/HAS been preserved/);
+    expect(note).toContain(backupDir);
+    expect(existsSync(join(root, ".comfyui-agent-panel.swap.json"))).toBe(true);
   });
 
   it("P0: a `..` traversal in the journal's backup path is REFUSED, not resolved", async () => {
