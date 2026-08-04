@@ -64,7 +64,9 @@ describe("classifyNonJson names what answered instead of ComfyUI (#828)", () => 
     expect(d.message).toContain("maintenance");
   });
 
-  it("calls a 401/403 an authentication gate and points the credential at the GATEWAY", () => {
+  it("does not assert an identity proxy from a 401/403 STATUS alone", () => {
+    // ComfyUI behind the user's own auth layer returns these too; the status
+    // does not say which answered.
     const d = classifyNonJson({
       url: URL_UNDER_TEST,
       status: 403,
@@ -72,8 +74,34 @@ describe("classifyNonJson names what answered instead of ComfyUI (#828)", () => 
       body: "<html><body>Access denied</body></html>",
     });
     expect(d.kind).toBe("login");
+    expect(d.message).toContain("does not distinguish them");
+    expect(d.message).not.toContain("SIGN-IN PAGE");
+    // It still points the credential at the right place.
     expect(d.message).toContain("COMFYUI_AUTH_TOKEN");
     expect(d.message).toContain("CF_ACCESS_CLIENT_ID");
+  });
+
+  it("names a sign-in page only when the BODY shows one", () => {
+    const d = classifyNonJson({
+      url: URL_UNDER_TEST,
+      status: 403,
+      contentType: "text/html",
+      body: '<html><form><input type="password" name="p"></form></html>',
+    });
+    expect(d.kind).toBe("login");
+    expect(d.message).toContain("SIGN-IN PAGE");
+  });
+
+  it("does not assert a proxy from a 502 STATUS alone", () => {
+    const d = classifyNonJson({
+      url: URL_UNDER_TEST,
+      status: 503,
+      contentType: "text/plain",
+      body: "unavailable",
+    });
+    expect(d.kind).toBe("proxy-error");
+    expect(d.message).toContain("does not identify what");
+    expect(d.message).not.toContain("its OWN error page");
   });
 
   it("recognises a sign-in PAGE served with a 200 (a login redirect that already followed)", () => {
@@ -94,7 +122,7 @@ describe("classifyNonJson names what answered instead of ComfyUI (#828)", () => 
       body: "<html><head><title>502 Bad Gateway</title></head><body><center>nginx</center></body></html>",
     });
     expect(d.kind).toBe("proxy-error");
-    expect(d.message).toContain("reverse proxy");
+    expect(d.message).toContain("its OWN error page");
     expect(d.message).toContain("could not reach");
   });
 

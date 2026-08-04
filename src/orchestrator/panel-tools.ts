@@ -192,9 +192,18 @@ function fail(err: unknown): ToolResult {
  *  correct: the credential is not in place, so proceeding would send the caller
  *  back into the same failure believing it was fixed. */
 export function secretNotPersisted(receipt: SecretSaveReceipt): Error {
+  // Whether a credential SURVIVED the rollback changes what the caller should do
+  // next, so it must not be flattened into a blanket "nothing is configured"
+  // (codex gate, round 2, finding 3): if a previous working value is still in
+  // place, telling the user nothing is configured sends them after the wrong
+  // problem, and telling them not to retry may be wrong too.
+  const state = receipt.stillConfigured
+    ? `The new value was rolled back rather than left half-applied, so the credential that was in place BEFORE this attempt is still in effect — the new one is not. ` +
+      `If the action failed because the old value is wrong, it will still fail; do not read this as "now fixed".`
+    : `The value was rolled back rather than left half-applied, so nothing is configured — do not retry the action that needed it.`;
   return new Error(
     `"${receipt.key}" was NOT saved: writing ${receipt.path} appeared to succeed, but reading the file back does not show that key with the value just supplied. ` +
-      `The value was rolled back rather than left half-applied, so nothing is configured — do not retry the action that needed it. ` +
+      `${state} ` +
       `Check that ${receipt.path} is writable and not being rewritten by another process, then set the key again (panel Settings › credentials, or the env var directly, which takes precedence over the file).`,
   );
 }
@@ -208,7 +217,17 @@ export function describeComfyuiSecretSave(receipt: SecretSaveReceipt): string {
       ? `🔒 Saved env "${receipt.key}" to ${receipt.path} — verified by reading the file back (the value itself is never shown or logged).`
       : `🔒 Wrote env "${receipt.key}" to ${receipt.path}, but the file could not be re-read to confirm it, so whether it persisted is UNKNOWN — treat the steps below as unconfirmed and re-check if the action still fails.`,
   );
-  if (receipt.livePickup) {
+  // Every claim below rests on the value actually being IN the store. When that
+  // could not be confirmed, none of them may be made (codex gate, round 2,
+  // finding 4): a running tool child falls back to whatever it inherited when
+  // the file is unreadable, so "it picks it up, retry now" would be a promise
+  // about a state nobody observed — the #826 defect again.
+  const confirmed = receipt.persisted === "yes";
+  if (!confirmed) {
+    parts.push(
+      `Because that could not be confirmed, I cannot say the comfyui tools can see the new value: a running tool session falls back to the credential it started with whenever the store is unreadable.`,
+    );
+  } else if (receipt.livePickup) {
     // This is the property that makes the answer safe to act on immediately: the
     // tools resolve this key from the file at USE time, so the already-running
     // tool process sees it whether or not any respawn happens.
@@ -236,9 +255,11 @@ export function describeComfyuiSecretSave(receipt: SecretSaveReceipt): string {
     );
   }
   parts.push(
-    receipt.livePickup
-      ? `Retry the action that needed this credential now.`
-      : `Retry after the tool session is rebuilt.`,
+    !confirmed
+      ? `Before relying on it, re-check ${receipt.path} carries "${receipt.key}"; if the action fails again the same way, treat the credential as unset and set it again.`
+      : receipt.livePickup
+        ? `Retry the action that needed this credential now.`
+        : `Retry after the tool session is rebuilt.`,
   );
   return parts.join(" ");
 }
@@ -5568,7 +5589,11 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             { cmd: "request_secret", label: args.label, hint: args.hint },
             { tabId: ctx.tabId, timeoutMs: 300000 },
           );
-          if (typeof secret !== "string" || secret.length === 0) {
+          // A whitespace-only paste must be treated as "nothing entered": it
+          // would write and read back cleanly (so the save would be CONFIRMED)
+          // while every reader treats a blank as absent, leaving the credential
+          // unset behind a success message (codex gate, round 2, finding 1).
+          if (typeof secret !== "string" || secret.trim().length === 0) {
             return ok("No token entered — nothing was saved.");
           }
           const server = (args.mcp_server as string) ?? "";

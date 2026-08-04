@@ -112,6 +112,29 @@ export function markFileDerived(key: string): void {
   fileDerivedKeys.add(key);
 }
 
+/** Undo `markFileDerived`. Used when a save is rolled back, so a failed write
+ *  cannot leave the RESTORED value's precedence changed behind it. */
+export function unmarkFileDerived(key: string): void {
+  fileDerivedKeys.delete(key);
+}
+
+/**
+ * True when this key's current value came from a REAL environment variable — the
+ * shell / the parent's explicit env — rather than from the canonical file.
+ *
+ * This is the provenance test a parent must use when telling a child which
+ * injected credentials the file owns. Comparing the injected value against the
+ * file's CURRENT value is not equivalent: if the file was rotated by another
+ * writer after this process booted, its in-memory copy is merely STALE, not
+ * shell-provided — and treating it as shell-provided would inject the stale
+ * value unmarked and pin it in the child, making a configured on-disk credential
+ * invisible all over again (codex gate, round 2, finding 2).
+ */
+export function isShellProvided(key: string): boolean {
+  const v = process.env[key];
+  return typeof v === "string" && v.trim() !== "" && !fileDerivedKeys.has(key);
+}
+
 /** Test-only: forget the boot provenance so a suite can re-simulate startup. */
 export function resetEnvFileProvenanceForTests(): void {
   fileDerivedKeys.clear();

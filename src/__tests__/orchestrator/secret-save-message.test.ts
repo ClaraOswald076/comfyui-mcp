@@ -45,6 +45,22 @@ describe("describeComfyuiSecretSave: says only what was observed (#826)", () => 
     expect(text).toContain("unconfirmed");
   });
 
+  it("makes NO live-pickup or retry-now claim when persistence is UNKNOWN", () => {
+    // Every downstream claim rests on the value actually being in the store. A
+    // running tool session falls back to the credential it started with when the
+    // store is unreadable, so "it picks it up, retry now" would be a promise
+    // about a state nobody observed.
+    const text = describeComfyuiSecretSave({ ...base, persisted: "unknown", livePickup: true });
+    expect(text).not.toContain("re-read that file each time");
+    expect(text).not.toContain("no respawn required");
+    expect(text).not.toContain("Retry the action that needed this credential now");
+    expect(text).toContain("I cannot say the comfyui tools can see the new value");
+    expect(text).toContain("falls back to the credential it started with");
+    // ...and it still says what to do from here.
+    expect(text).toContain("re-check");
+    expect(text).toContain("treat the credential as unset");
+  });
+
   it("never promises a respawn when NO subscriber reported one", () => {
     const text = describeComfyuiSecretSave({ ...base, respawn: null });
     // The old wording. It must be gone: it asserted a future event nobody checked.
@@ -105,8 +121,24 @@ describe("describeComfyuiSecretSave: says only what was observed (#826)", () => 
   });
 });
 
+describe("secretNotPersisted: reflects whether a credential SURVIVED the rollback", () => {
+  it("does NOT say 'nothing is configured' when a previous value is still in effect", () => {
+    const err = secretNotPersisted({ ...base, persisted: "no", stillConfigured: true });
+    expect(err.message).toContain("was NOT saved");
+    expect(err.message).not.toContain("nothing is configured");
+    expect(err.message).toContain("still in effect");
+    // And it must not be read as "now fixed" — the old value may be the problem.
+    expect(err.message).toContain('do not read this as "now fixed"');
+  });
+
+  it("does not tell the caller to skip retrying when a credential is still in effect", () => {
+    const err = secretNotPersisted({ ...base, persisted: "no", stillConfigured: true });
+    expect(err.message).not.toContain("do not retry the action that needed it");
+  });
+});
+
 describe("secretNotPersisted: refuses, and says do NOT retry (#826)", () => {
-  const err = secretNotPersisted({ ...base, persisted: "no" });
+  const err = secretNotPersisted({ ...base, persisted: "no", stillConfigured: false });
 
   it("is an error, not a success dressed as a warning", () => {
     expect(err).toBeInstanceOf(Error);
