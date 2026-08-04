@@ -743,9 +743,23 @@ function materializeUeInGraph(
   boundary?: { inputNodeId: number; inputs: SubgraphInput[] },
 ): number {
   const senders = nodes.filter((n) => typeof n.type === "string" && isUeSender(n.type));
-  if (senders.length === 0) return 0;
-
   const ueLinks = extra?.ue_links;
+  if (senders.length === 0) {
+    // Records but no recognized sender. Returning 0 here silently would be the
+    // single worst outcome this whole change exists to prevent: a real broadcast
+    // dropped with nothing said, and it is exactly what an unrecognized sender
+    // CLASS produces. We cannot tell a deleted sender (records genuinely stale,
+    // dropping them is right) from a sender class this converter doesn't know
+    // (records live, dropping them is a loss) — so this is a could-not-determine
+    // and it is reported as one.
+    if (Array.isArray(ueLinks) && ueLinks.length > 0) {
+      warnings.push(
+        `${ueLinks.length} cg-use-everywhere broadcast record(s) are present in ${scope}, but no node in it is recognized as a cg-use-everywhere broadcast node. Either those broadcast nodes were deleted (leaving the records stale) or they are a sender class this converter does not recognize — the records cannot be attributed either way, so every input they name is UNCONNECTED in the stripped graph.`,
+      );
+    }
+    return 0;
+  }
+
   // An EMPTY computed list is an ANSWER — the pack analysed the graph and found
   // no broadcast to record — so the stripped graph is faithful and nothing is
   // reported. Only an ABSENT (or non-array) list is an unknown, and only that is
@@ -827,31 +841,23 @@ function materializeUeInGraph(
    */
   const assessRecord = (
     raw: UeLinkEntry,
-  ): "ok" | "detached" | "rewired" | "unverifiable" | "orphaned" => {
+  ): "ok" | "detached" | "rewired" | "unverifiable" | "unattributable" => {
     const want = realOfNode(raw.upstream, raw.upstream_slot);
     if (!want) return "unverifiable";
     const matches = (feedLink: number) => {
       const real = realSourceOf(feedLink);
       return real ? real.node === want.node && real.slot === want.slot : null;
     };
-    // No `controller` (older lists omit the field): the record can't be tied to a
-    // particular sender — but it is NOT therefore current. Treating "cannot
-    // determine" as "determined current" is what let a stale record fabricate an
-    // edge in the first place. What IS checkable is whether ANY live broadcast
-    // node is fed by the recorded producer; if none is, no live broadcast can
-    // carry this value and the record is left over.
+    // No `controller` (older lists omit the field): the record cannot be tied to
+    // ANY sender. Scanning for "some live sender happens to be fed by this
+    // producer" reads a COINCIDENCE as evidence — the record's own sender may be
+    // long gone while an unrelated sender shares that producer and broadcasts it
+    // somewhere else entirely, which fabricates an edge the live graph lacks.
+    // The one self-attributing shape is a producer that IS itself a broadcast
+    // node (Seed Everywhere owns its widget): that names its own single channel
+    // unambiguously, with no attribution to guess at.
     if (raw.controller == null) {
-      let anyUnresolved = false;
-      for (const s of senders) {
-        // Seed Everywhere and friends ARE their own producer.
-        if (s.id === want.node) return "ok";
-        for (const f of (s.inputs ?? []).filter((i) => i.link != null)) {
-          const m = matches(f.link as number);
-          if (m === null) anyUnresolved = true;
-          else if (m) return "ok";
-        }
-      }
-      return anyUnresolved ? "unverifiable" : "orphaned";
+      return senderIds.has(want.node) ? "ok" : "unattributable";
     }
     // Seed Everywhere and friends: the sender IS the producer (it owns the widget),
     // so there is no incoming feed to compare against.
@@ -860,6 +866,20 @@ function materializeUeInGraph(
     if (!ctrl) return "ok"; // already reported by the sender check above
     // A sender can have SEVERAL inputs (Prompts Everywhere, Anything Everywhere3),
     // each with its own record — the record is current if ANY feed matches.
+    //
+    // KNOWN LIMIT, and it is a limit of the DATA, not of this check. A ue_links
+    // record carries { downstream, downstream_slot, upstream, upstream_slot,
+    // controller, type } and nothing that says WHICH INPUT of the sender the
+    // broadcast came through. On a multi-input sender the producer identity is
+    // therefore the only handle on channel identity, which is what is matched
+    // here. What cannot be checked is whether that channel routes to THIS target:
+    // deciding that is the pack's own type/name matching, and re-implementing it
+    // would be a second guess layered on the first. So a list that went stale by
+    // SWAPPING two channels of one sender (positive/negative both still feeding
+    // it, just exchanged) is indistinguishable from a current one and is accepted.
+    // Refusing every multi-input record instead would drop the broadcasts of every
+    // Prompts Everywhere / Anything Everywhere3 graph, permanently and with no
+    // remedy the user could act on — a certain loss traded for an occasional one.
     const feeds = (ctrl.inputs ?? []).filter((i) => i.link != null);
     if (feeds.length === 0) return "detached";
     let anyUnresolved = false;
@@ -928,11 +948,11 @@ function materializeUeInGraph(
           ? `${who} no longer has any incoming connection, so it broadcasts nothing`
           : verdict === "rewired"
             ? `${who} is now fed by a different producer than the recorded node ${raw.upstream} (slot ${raw.upstream_slot})`
-            : verdict === "orphaned"
-              ? `the record names no broadcast node of its own, and none of this graph's broadcast nodes is fed by the recorded producer node ${raw.upstream} (slot ${raw.upstream_slot})`
+            : verdict === "unattributable"
+              ? `the record names no broadcast node of its own (an older cg-use-everywhere list), so it cannot be attributed to any sender here and there is no way to confirm that producer node ${raw.upstream} (slot ${raw.upstream_slot}) still feeds this input — another sender sharing that producer would prove nothing about THIS target`
               : `${who}'s own incoming connection could not be resolved, so the recorded producer node ${raw.upstream} (slot ${raw.upstream_slot}) could not be confirmed`;
       warnings.push(
-        `A cg-use-everywhere record in ${scope} feeding node ${dst.id} (${dst.type}) input "${inputLabel}" is stale: ${why}. That input is left UNCONNECTED rather than wired from a broadcast the live graph does not have.`,
+        `A cg-use-everywhere record in ${scope} feeding node ${dst.id} (${dst.type}) input "${inputLabel}" could not be confirmed against the live graph: ${why}. That input is left UNCONNECTED rather than wired from a broadcast the live graph may not have.`,
       );
       continue;
     }

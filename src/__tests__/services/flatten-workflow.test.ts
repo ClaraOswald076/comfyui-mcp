@@ -189,11 +189,17 @@ describe("flattenUiWorkflow — Use-Everywhere", () => {
       "Anything Everywhere?",
       "Anything Everywhere3",
       "Prompts Everywhere",
+      "Prompts Everywhere?",
       "Seed Everywhere",
+      // The pack registers this one, but the predicate used to compare the
+      // "Seed Everywhere" family with equality, so it went unrecognized — and an
+      // unrecognized sender means its broadcasts are dropped with nothing said.
+      "Seed Everywhere?",
     ]) {
       expect(isUeSender(t)).toBe(true);
     }
     expect(isUeSender("KSampler")).toBe(false);
+    expect(isUeSender("SaveImage")).toBe(false);
   });
 });
 

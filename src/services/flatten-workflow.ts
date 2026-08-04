@@ -35,9 +35,20 @@ const isRerouteType = (t: string) => t === "Reroute";
 /** Wiring-only virtual node: exists purely to carry a connection. */
 const isWiringVirtual = (t: string) => isRerouteType(t) || GET_SET_TYPES.has(t);
 
-/** cg-use-everywhere sender detection — mirrors the pack's own is_UEnode(). */
+/**
+ * cg-use-everywhere sender detection. The pack's own is_UEnode() prefix-matches
+ * "Anything Everywhere" (so the "?" and "3" variants are covered) but compares
+ * the other two families with EQUALITY — which misses the registered
+ * "Seed Everywhere?" class. That asymmetry is an oversight, and here it is a
+ * silent-loss bug: an unrecognized sender makes the materializer conclude there
+ * are no broadcasts at all, dropping real ones with nothing said. Under-matching
+ * costs a dropped connection; over-matching at worst asks the user to re-save.
+ * All three families are therefore prefix-matched.
+ */
 export const isUeSender = (t: string): boolean =>
-  t.startsWith("Anything Everywhere") || t === "Seed Everywhere" || t === "Prompts Everywhere";
+  t.startsWith("Anything Everywhere") ||
+  t.startsWith("Seed Everywhere") ||
+  t.startsWith("Prompts Everywhere");
 
 /** Shape cg-use-everywhere writes into graph.extra.ue_links. */
 interface UeLink {

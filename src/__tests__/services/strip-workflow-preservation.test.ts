@@ -405,12 +405,155 @@ describe("#361 — cg-use-everywhere broadcast links", () => {
     expect(joined(warnings)).toContain("names no broadcast node of its own");
   });
 
-  it("a CONTROLLERLESS record that DOES match a live sender's feed is still materialized", () => {
-    const g = ueGraph(true) as unknown as { extra: { ue_links: Record<string, unknown>[] } };
-    delete g.extra.ue_links[0].controller;
-    const { workflow, warnings } = convertUiToApi(g as never, OBJECT_INFO);
-    expect(workflow["3"].inputs.images).toEqual(["1", 0]);
+  // NOTE: an earlier revision asserted the opposite here — that a controllerless
+  // record is materialized as long as SOME live sender is fed by the recorded
+  // producer. That expectation was wrong and this test now pins the correct
+  // behaviour: an unrelated sender sharing a producer is a coincidence, not
+  // evidence about THIS record's target.
+  it("an UNRELATED sender sharing the producer does not validate a controllerless record", () => {
+    // The record's own sender is gone. A live Prompts Everywhere is also fed by
+    // node 1 but broadcasts it somewhere else entirely — wiring 1 → SaveImage#3
+    // off the back of that would be a fabricated edge.
+    const g = {
+      extra: {
+        ue_links: [
+          { downstream: 3, downstream_slot: 0, upstream: 1, upstream_slot: 0, type: "IMAGE" },
+        ],
+      },
+      nodes: [
+        {
+          id: 1,
+          type: "LoadImage",
+          mode: 0,
+          inputs: [],
+          outputs: [{ name: "IMAGE", type: "IMAGE", links: [60] }],
+          widgets_values: ["a.png"],
+        },
+        {
+          id: 7,
+          type: "Prompts Everywhere",
+          mode: 0,
+          inputs: [{ name: "anything", type: "*", link: 60 }],
+          outputs: [],
+          widgets_values: [],
+        },
+        {
+          id: 3,
+          type: "SaveImage",
+          mode: 0,
+          inputs: [{ name: "images", type: "IMAGE", link: null }],
+          outputs: [],
+          widgets_values: ["out"],
+        },
+      ],
+      links: [[60, 1, 0, 7, 0, "IMAGE"]],
+    } as never;
+    const { workflow, warnings } = convertUiToApi(g, {
+      ...(OBJECT_INFO as object),
+      "Prompts Everywhere": { input: { required: {}, optional: { anything: ["*"] } } },
+    } as never);
+    expect(workflow["3"].inputs.images).toBeUndefined();
+    expect(joined(warnings)).toContain("cannot be attributed to any sender");
+  });
+
+  it("a controllerless record whose producer IS a broadcast node is self-attributing", () => {
+    // Seed Everywhere owns its widget, so the record names its own single channel
+    // — there is no attribution left to guess, and refusing it would drop a live
+    // broadcast for no gain.
+    const g = {
+      extra: {
+        ue_links: [
+          { downstream: 3, downstream_slot: 0, upstream: 9, upstream_slot: 0, type: "IMAGE" },
+        ],
+      },
+      nodes: [
+        {
+          id: 9,
+          type: "Seed Everywhere",
+          mode: 0,
+          inputs: [],
+          outputs: [{ name: "IMAGE", type: "IMAGE", links: [] }],
+          widgets_values: [42],
+        },
+        {
+          id: 3,
+          type: "SaveImage",
+          mode: 0,
+          inputs: [{ name: "images", type: "IMAGE", link: null }],
+          outputs: [],
+          widgets_values: ["out"],
+        },
+      ],
+      links: [],
+    } as never;
+    const { workflow, warnings } = convertUiToApi(g, {
+      ...(OBJECT_INFO as object),
+      "Seed Everywhere": {
+        input: { required: { seed: ["INT", { default: 0 }] } },
+        output: ["IMAGE"],
+      },
+    } as never);
+    expect(workflow["3"].inputs.images).toEqual(["9", 0]);
     expect(warnings).toEqual([]);
+  });
+
+  it("'Seed Everywhere?' is recognized as a broadcast node, so its records materialize", () => {
+    // The pack registers this class, but the sender predicate compared the
+    // "Seed Everywhere" family with equality — so the node was invisible, and
+    // with no recognized sender the whole list was dropped with no warning.
+    const g = {
+      extra: {
+        ue_links: [
+          {
+            downstream: 3,
+            downstream_slot: 0,
+            upstream: 9,
+            upstream_slot: 0,
+            controller: 9,
+            type: "IMAGE",
+          },
+        ],
+      },
+      nodes: [
+        {
+          id: 9,
+          type: "Seed Everywhere?",
+          mode: 0,
+          inputs: [],
+          outputs: [{ name: "IMAGE", type: "IMAGE", links: [] }],
+          widgets_values: [42],
+        },
+        {
+          id: 3,
+          type: "SaveImage",
+          mode: 0,
+          inputs: [{ name: "images", type: "IMAGE", link: null }],
+          outputs: [],
+          widgets_values: ["out"],
+        },
+      ],
+      links: [],
+    } as never;
+    const { workflow, warnings } = convertUiToApi(g, {
+      ...(OBJECT_INFO as object),
+      "Seed Everywhere?": {
+        input: { required: { seed: ["INT", { default: 0 }] } },
+        output: ["IMAGE"],
+      },
+    } as never);
+    expect(workflow["3"].inputs.images).toEqual(["9", 0]);
+    expect(warnings).toEqual([]);
+  });
+
+  it("records with NO recognized broadcast node are reported, never dropped in silence", () => {
+    // The backstop for any sender class this converter does not know: records
+    // present, nothing to attribute them to. Deleted senders and unrecognized
+    // senders are indistinguishable here, so it is a could-not-determine.
+    const g = ueGraph(true) as unknown as { nodes: { id: number }[] };
+    g.nodes = g.nodes.filter((n) => n.id !== 7); // every sender gone
+    const { workflow, warnings } = convertUiToApi(g as never, OBJECT_INFO);
+    expect(workflow["3"].inputs.images).toBeUndefined();
+    expect(joined(warnings)).toContain("no node in it is recognized as a cg-use-everywhere broadcast node");
   });
 
   it("a sender fed from a subgraph's INPUT boundary broadcasts the outer producer", () => {
