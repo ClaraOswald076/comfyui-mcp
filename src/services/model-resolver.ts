@@ -209,8 +209,13 @@ export async function searchHuggingFaceModels(
   if (filter) params.set("filter", filter);
 
   const headers: Record<string, string> = {};
-  if (config.huggingfaceToken) {
-    headers["Authorization"] = `Bearer ${config.huggingfaceToken}`;
+  // Captured ONCE: the credential getters resolve from the canonical store on
+  // every access, so testing one read and interpolating another can send a
+  // different token — or `Bearer undefined` — if the store is rewritten in
+  // between (codex gate, round 6, finding 3).
+  const hfToken = config.huggingfaceToken;
+  if (hfToken) {
+    headers["Authorization"] = `Bearer ${hfToken}`;
   }
 
   const url = applyHfEndpoint(`https://huggingface.co/api/models?${params}`);
@@ -1695,10 +1700,12 @@ function localAuthHeadersFor(
   // or the ORIGINAL url was a HF url that HF_ENDPOINT rewrote to a trusted mirror. NEVER a
   // substring match (see isHuggingFaceHost). isCivitaiUrl is likewise hostname-parsed, so
   // the CivitAI branch is safe by construction.
-  if (!auth && config.huggingfaceToken && (wasHfUrl || isHuggingFaceHost(url))) {
-    headers["Authorization"] = `Bearer ${config.huggingfaceToken}`;
-  } else if (!auth && config.civitaiApiToken && isCivitaiUrl(url)) {
-    headers["Authorization"] = `Bearer ${config.civitaiApiToken}`;
+  const hfToken = config.huggingfaceToken;
+  const civitaiToken = config.civitaiApiToken;
+  if (!auth && hfToken && (wasHfUrl || isHuggingFaceHost(url))) {
+    headers["Authorization"] = `Bearer ${hfToken}`;
+  } else if (!auth && civitaiToken && isCivitaiUrl(url)) {
+    headers["Authorization"] = `Bearer ${civitaiToken}`;
   }
   return headers;
 }
@@ -2068,13 +2075,15 @@ export async function downloadModel(
   // NEVER a substring match — `https://evil.example/m.safetensors?ref=huggingface.co` parses
   // to evil.example and must get NO token (a credential-leak; the same parsed-host authority
   // the remote flip probe uses).
-  if (!auth && config.huggingfaceToken && (wasHfUrl || isHuggingFaceHost(url))) {
-    headers["Authorization"] = `Bearer ${config.huggingfaceToken}`;
-  } else if (!auth && config.civitaiApiToken && isCivitaiUrl(url)) {
+  const hfToken = config.huggingfaceToken;
+  const civitaiToken = config.civitaiApiToken;
+  if (!auth && hfToken && (wasHfUrl || isHuggingFaceHost(url))) {
+    headers["Authorization"] = `Bearer ${hfToken}`;
+  } else if (!auth && civitaiToken && isCivitaiUrl(url)) {
     // CivitAI auth travels as a request header (never in the URL/query) so the
     // token can't leak into logs, errors, or redirect URLs. fetch drops the
     // header on the cross-origin redirect to the already-signed download host.
-    headers["Authorization"] = `Bearer ${config.civitaiApiToken}`;
+    headers["Authorization"] = `Bearer ${civitaiToken}`;
   }
 
   const sensitiveParams =

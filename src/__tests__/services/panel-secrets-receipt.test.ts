@@ -530,6 +530,36 @@ describe("slot saves report what the read-back PROVED (#826 gate round 3)", () =
     }
   });
 
+  it("EMITS a change when only the in-process copy was dropped (a shell-only revoke)", () => {
+    // A shell-provided key has no line in the store, so gating the emit on "a
+    // line was removed" meant no child was ever respawned — a live tool session
+    // kept using the credential the user had just revoked, while the console
+    // reported it no longer resolves. The respawn is what removes it from the
+    // child's env, so the event must fire.
+    resetEnvFileProvenanceForTests();
+    process.env.CIVITAI_API_TOKEN = "civ-from-shell";
+    const cb = vi.fn();
+    const off = onComfyuiSecretsChanged(cb);
+    try {
+      expect(removeComfyuiSecret("CIVITAI_API_TOKEN")).toBe(true);
+      expect(cb).toHaveBeenCalledTimes(1);
+      expect(buildComfyuiMcpEnv({}).CIVITAI_API_TOKEN).toBeUndefined();
+    } finally {
+      off();
+    }
+  });
+
+  it("emits NOTHING when there was no credential to remove at all", () => {
+    const cb = vi.fn();
+    const off = onComfyuiSecretsChanged(cb);
+    try {
+      expect(removeComfyuiSecret("CIVITAI_API_TOKEN")).toBe(false);
+      expect(cb).not.toHaveBeenCalled();
+    } finally {
+      off();
+    }
+  });
+
   it("reports 'still-resolves' when the store still carries an alias", () => {
     writeFileSync(envPath, "CIVITAI_API_TOKEN=left-behind\n", { mode: 0o600 });
     expect(slotRevokeState("civitai")).toBe("still-resolves");

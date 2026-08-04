@@ -160,6 +160,37 @@ describe("check_workflow_runtime must not call an answering server unreachable (
     expect(parsed.note).toContain("POSSIBLY paid");
   });
 
+  it("keeps the non-JSON reason for a RAW markup-parse failure the probe could not confirm", async () => {
+    // The parse error itself proves the server answered with something that is
+    // not JSON. Filing that under "unavailable" because the follow-up probe was
+    // inconclusive loses the #828 diagnosis and sends the user to check whether
+    // ComfyUI is running.
+    checkWorkflowRuntimeMock.mockRejectedValue(
+      new SyntaxError(`Unexpected token '<', "<!DOCTYPE "... is not valid JSON`),
+    );
+    const out = await getHandler("check_workflow_runtime")({ graph });
+    const parsed = JSON.parse(out.content[0].text);
+    expect(parsed.reason).toBe("non_json_response");
+    expect(parsed.note).toContain("was reached");
+    expect(parsed.note).toContain("not identified"); // the probe did not settle what answered
+    expect(parsed.note).toContain("POSSIBLY paid");
+  });
+
+  it("redacts a reflected credential out of the failure detail it reports", async () => {
+    authHeaders.value = { Authorization: "Bearer echoed-secret-token-here" };
+    try {
+      checkWorkflowRuntimeMock.mockRejectedValue(
+        new SyntaxError(
+          `Unexpected token '<', "<html>Bearer echoed-secret-token-here</html>" is not valid JSON`,
+        ),
+      );
+      const out = await getHandler("check_workflow_runtime")({ graph });
+      expect(out.content[0].text).not.toContain("echoed-secret-token-here");
+    } finally {
+      authHeaders.value = {};
+    }
+  });
+
   it("keeps the unreachable wording for a genuine transport failure", async () => {
     checkWorkflowRuntimeMock.mockRejectedValue(new Error("fetch failed"));
     const out = await getHandler("check_workflow_runtime")({ graph });

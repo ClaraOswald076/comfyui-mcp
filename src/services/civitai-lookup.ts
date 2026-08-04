@@ -30,8 +30,13 @@ export async function lookupByHash(
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
   };
-  if (config.civitaiApiToken) {
-    headers["Authorization"] = `Bearer ${config.civitaiApiToken}`;
+  // Captured ONCE: the credential getters resolve from the canonical store on
+  // every access, so testing one read and interpolating another can send a
+  // different token — or `Bearer undefined` — if the store is rewritten in
+  // between (codex gate, round 6, finding 3).
+  const civitaiToken = config.civitaiApiToken;
+  if (civitaiToken) {
+    headers["Authorization"] = `Bearer ${civitaiToken}`;
   }
 
   try {

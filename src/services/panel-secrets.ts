@@ -612,7 +612,14 @@ export function setEnvSecret(
  *  any key still present in the JSON store that .env no longer provides. */
 export function removeEnvSecret(key: string): boolean {
   const removed = removeEnvFileKey(key);
-  if (process.env[key] !== undefined) delete process.env[key];
+  // Dropping the IN-PROCESS value is a change in its own right. A SHELL-provided
+  // key has no line in the store, so `removed` is false — and gating the emit on
+  // `removed` alone meant no child was ever respawned for it, leaving a live
+  // tool session using a credential the user had just revoked while the console
+  // answered that it no longer resolves (codex gate, round 6, finding 1). The
+  // respawn is what actually takes it out of the child's env.
+  const envDeleted = process.env[key] !== undefined;
+  if (envDeleted) delete process.env[key];
   // Purge the legacy JSON maps so a revoked key can't resurrect via migration.
   const s = read();
   let purgedJson = false;
@@ -623,7 +630,7 @@ export function removeEnvSecret(key: string): boolean {
     }
   }
   if (purgedJson) write(s);
-  const changed = removed || purgedJson;
+  const changed = removed || purgedJson || envDeleted;
   if (changed) {
     if (isAllowedComfyuiSecretKey(key)) emitComfyuiChange({}); // comfyui-only restart (#269)
     if (isAllowedAgentSecretKey(key)) emitAgentChange();
