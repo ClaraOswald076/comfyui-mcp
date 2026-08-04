@@ -4043,12 +4043,16 @@ async function askUserWithGrace(
     // A CONVERSATION BOUNDARY is a different exemption, and the rid does NOT
     // cover it. A rid proves WHICH CARD replied; it says nothing about whose
     // conversation is live now. If this ask was retired while its request was
-    // still pending — most concretely, a different browser tab took the
-    // recurring key over — then returning the pick here hands it straight into
-    // the conversation the boundary exists to keep it out of, through the one
-    // channel the boundary does not police. So the journal's verdict governs
-    // both paths.
-    if (entry.recoverable === false) {
+    // still pending — a New chat, a rewind, a provider switch, or a different
+    // browser tab taking the recurring key over — then returning the pick here
+    // hands it straight into the conversation the boundary exists to keep it out
+    // of, through the one channel the boundary does not police.
+    //
+    // Keyed on `retired` and not `recoverable`: the latter also covers AMBIGUITY,
+    // and an ambiguous answer that arrived on THIS send's own rid is
+    // unambiguously this card's. The rid exemption is right for that axis and
+    // wrong only for this one.
+    if (entry.retired === true) {
       return fail(
         withDroppedText(
           tabId,

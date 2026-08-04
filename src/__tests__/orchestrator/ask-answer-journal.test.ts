@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { readFileSync } from "node:fs";
+import { logger } from "../../utils/logger.js";
 import {
   AskAnswers,
   askFingerprint,
@@ -1604,6 +1605,106 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     expect(AskAnswers.droppedFor(TAB)).toBe(5); // B's survives, untouched
     expect(AskAnswers.reportDropped(TAB)).toBe(5);
     AskAnswers.setIncarnationResolver(() => OCCUPANT);
+  });
+
+  // ── The SECOND boundary: cross-CONVERSATION on the SAME tab ───────────────
+  //
+  // New chat, rewind and a provider switch all keep the same tab id AND the same
+  // browser-tab incarnation, so `(tabId, incarnation)` cannot fence them at all.
+  // Every path that can hand an answer or a disclosure to a live turn has to
+  // consult the boundary mark instead — recovery, replay, push, and the debt
+  // report. Gating them one at a time is how three separate bypasses arrived.
+
+  // P0-1: a turn was already carrying the answer when the boundary happened. Its
+  // release re-armed the entry to `pending`, and the push path never consulted
+  // the mark — so the OLD conversation's answer was pushed into the replacement,
+  // which could then ack it (pushed entries carry no carrier binding).
+  it("a boundary-retired answer is never re-armed for the replacement conversation", () => {
+    openAndAnswer("pa-carry", SAMPLER, "dpmpp_2m");
+    const token = AskAnswers.entriesFor(TAB)[0].token;
+    AskAnswers.deliverPending(TAB, () => true); // a turn is carrying it
+    expect(AskAnswers.entriesFor(TAB)[0].delivery).toBe("handed_off");
+
+    AskAnswers.closeAsks(TAB); // New chat / rewind / provider switch
+    // The carrying turn ends without proving it was read — the ordinary release.
+    AskAnswers.release(token, { carried: false });
+
+    expect(AskAnswers.entriesFor(TAB)[0].delivery).toBe("none");
+    expect(AskAnswers.pending(TAB)).toHaveLength(0);
+    expect(AskAnswers.hasOutstanding()).toBe(false);
+    // Nothing was swallowed: it is still journaled, still disclosed, still named.
+    const rec = AskAnswers.recover(TAB, askFingerprint(SAMPLER));
+    expect(rec.status).toBe("unattributed");
+    if (rec.status !== "unattributed") return;
+    expect(rec.others.some((e) => e.answer === "dpmpp_2m")).toBe(true);
+    expect(AskAnswers.allOutstanding().map((e) => e.answer)).toContain("dpmpp_2m");
+  });
+
+  it("a retired answer cannot be delivered even if something re-arms it directly", () => {
+    openAndAnswer("pa-force", SAMPLER, "dpmpp_2m");
+    AskAnswers.closeAsks(TAB);
+    // Belt and braces: the push path itself refuses, not merely the re-arm.
+    AskAnswers.entriesFor(TAB)[0].delivery = "pending";
+    expect(AskAnswers.pending(TAB)).toHaveLength(0);
+    const seen: AskAnswerEvent[] = [];
+    AskAnswers.deliverPending(TAB, (payload) => {
+      seen.push(payload);
+      return true;
+    });
+    expect(seen).toEqual([]);
+  });
+
+  // P0-2: the eviction DEBT survived a conversation boundary untouched, so the
+  // replacement conversation's next ask reported the old conversation's warning
+  // as its own and settled it with its own ack.
+  it("a conversation boundary retires the debt — reported, then cleared", () => {
+    const tokens: string[] = [];
+    AskAnswers.setTurnAttacher((_key, token) => {
+      tokens.push(token);
+      return TURN;
+    });
+    AskAnswers.noteDroppedForTest(TAB, 5);
+    expect(AskAnswers.droppedFor(TAB)).toBe(5);
+
+    AskAnswers.closeAsks(TAB); // New chat on the SAME tab, SAME incarnation
+
+    // The replacement conversation is owed nothing and can settle nothing.
+    expect(AskAnswers.reportDropped(TAB)).toBe(0);
+    expect(tokens).toHaveLength(0);
+    expect(AskAnswers.droppedFor(TAB)).toBe(0);
+    expect(AskAnswers.outstandingDebt()).toHaveLength(0);
+    expect(AskAnswers.hasOutstanding()).toBe(false);
+  });
+
+  it("a boundary also clears debt riding on an entry, so it is not stranded", () => {
+    // Fill past the ceiling so an eviction stamps its loss onto a surviving entry.
+    for (let i = 0; i < 60; i += 1) {
+      openAndAnswer(`pa-e-${i}`, { question: `E${i}?`, options: [{ label: "x" }, { label: "y" }] }, `E${i}`);
+    }
+    const owed = AskAnswers.droppedFor(TAB);
+    expect(owed).toBeGreaterThan(0);
+    const carrier = AskAnswers.entriesFor(TAB).find((e) => (e.disclose ?? 0) > 0);
+    expect(carrier).toBeDefined();
+    const carried = carrier!.disclose!;
+
+    const errors: string[] = [];
+    const spy = vi.spyOn(logger, "error").mockImplementation((msg: unknown) => {
+      errors.push(String(msg));
+    });
+    AskAnswers.closeAsks(TAB);
+    spy.mockRestore();
+
+    // Those entries are no longer pushed, so a disclosure left riding one would
+    // be stranded on text nobody will read. It is SURFACED with the rest — a
+    // retirement that merely cleared it would trade a misattribution for a
+    // silent loss — and only then cleared.
+    const surfaced = errors.find((m) => m.includes("its conversation was replaced"));
+    expect(surfaced, "the retirement must report what was owed").toBeDefined();
+    expect(surfaced).toContain(`${owed} validated answer(s)`);
+    expect(carried).toBeGreaterThan(0);
+    expect(carrier!.disclose ?? 0).toBe(0);
+    expect(AskAnswers.droppedFor(TAB)).toBe(0);
+    expect(AskAnswers.reportDropped(TAB)).toBe(0);
   });
 
   it("never throws when the flusher does", () => {

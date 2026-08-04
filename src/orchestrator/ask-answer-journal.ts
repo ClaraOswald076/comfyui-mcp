@@ -228,6 +228,24 @@ export interface AskEntry {
    */
   recoverable?: boolean;
   /**
+   * The CONVERSATION that asked this question is gone — New chat, a rewind, a
+   * provider switch, an in-place workflow replacement, or another browser tab
+   * taking the key over.
+   *
+   * Deliberately separate from `recoverable`, which also covers AMBIGUITY (an ask
+   * id that stopped identifying one card). The two axes are independent and want
+   * opposite treatment: an ambiguous answer is still PUSHED, labelled
+   * UNDETERMINED, because nobody else can claim it; a retired one must not reach
+   * a live turn at all, because the turn belongs to a conversation that never
+   * asked. Folding them into one flag would either start swallowing ambiguous
+   * answers or keep leaking retired ones.
+   *
+   * There are TWO orthogonal boundaries in this file and this is the second:
+   * `(tabId, incarnation)` fences a different BROWSER TAB, and cannot fence this
+   * one — New chat happens on the same tab, with the same incarnation.
+   */
+  retired?: boolean;
+  /**
    * Which browser-tab INCARNATION this answer belongs to, captured at arrival.
    *
    * Entries are keyed by panel tab id, and that id recurs — `wf:<hash>` names a
@@ -501,6 +519,26 @@ export class AskAnswerJournalImpl {
    * When NOTHING can resolve incarnations at all (no resolver wired) the check is
    * inert and tab-keying alone governs, exactly as before.
    */
+  /**
+   * May this answer be handed to a LIVE TURN — recovered, replayed, or pushed?
+   *
+   * The single gate for the whole set. Both boundaries are checked here, because
+   * they are independent and each alone is insufficient:
+   *  • RETIRED — its conversation is gone (New chat, rewind, provider switch,
+   *    workflow replacement, takeover). Same tab, same incarnation, so no amount
+   *    of incarnation keying can see it.
+   *  • a DIFFERENT OCCUPANT — another browser tab holds this recurring key. Same
+   *    conversation identity as far as the tab is concerned, so no amount of
+   *    epoch bumping can see it.
+   *
+   * Gating the paths one at a time is how the rid bypass, the re-arm bypass and
+   * the debt-reporting bypass each arrived separately; making it a property of
+   * the SET is the fix.
+   */
+  private mayReachLiveTurn(entry: AskEntry): boolean {
+    return entry.retired !== true && this.sameOccupant(entry);
+  }
+
   private sameOccupant(entry: AskEntry): boolean {
     if (this.incarnationOf === null) return true; // nothing to distinguish
     const now = this.incarnationOf(entry.key);
@@ -747,6 +785,9 @@ export class AskAnswerJournalImpl {
       // A question the CURRENT conversation never asked may be reported, never
       // returned as its answer.
       ...(conversationGone || existing !== undefined ? { recoverable: false } : {}),
+      // The BOUNDARY axis only — `existing !== undefined` is ambiguity, which is
+      // still deliverable (labelled), so it must not set this.
+      ...(conversationGone ? { retired: true } : {}),
       // A SECOND answer under one ask id: the id is ambiguous for this entry too,
       // and that must outlive the ticket that proved it.
       ...(existing !== undefined || ticket?.reused === true ? { ambiguousId: true } : {}),
@@ -841,7 +882,7 @@ export class AskAnswerJournalImpl {
         (e) =>
           e.correlation.status === "matched" &&
           e.recoverable !== false &&
-          this.sameOccupant(e) &&
+          this.mayReachLiveTurn(e) &&
           e.fingerprint !== null &&
           e.fingerprint === fingerprint &&
           now - e.answeredAt <= RECOVER_MAX_AGE_MS,
@@ -951,11 +992,39 @@ export class AskAnswerJournalImpl {
    * the count of answers whose TEXT is already gone is retired.
    */
   retireDebt(key: string, incarnation: string): void {
+    this.surfaceAndClearDebt(key, incarnation, "disconnected");
+  }
+
+  /**
+   * SURFACE a debt that can no longer be delivered, then clear it.
+   *
+   * Used for both endings a debt can have: the tab went away, or the
+   * conversation it was owed to was replaced. Both are "there is no longer
+   * anywhere to deliver this", and both must REPORT before clearing — retiring a
+   * warning to stop it being misattributed, without saying it anywhere, would
+   * trade a misattribution for a silent loss, which is the one trade this file
+   * refuses everywhere else.
+   *
+   * Clears the entry-carried disclosures too: those ride out on a push, and a
+   * retired conversation's entries are no longer pushed, so leaving them there
+   * would strand the warning on text nobody will read.
+   */
+  private surfaceAndClearDebt(
+    key: string,
+    incarnation: string | undefined,
+    why: "disconnected" | "its conversation was replaced",
+  ): void {
     const slot = tabIncarnationSlot(key, incarnation);
-    const owed = this.undisclosedDrop(slot);
+    let owed = this.undisclosedDrop(slot);
+    for (const entry of this.entries.values()) {
+      if (entry.key !== key || entry.incarnation !== incarnation) continue;
+      if (!entry.disclose) continue;
+      owed += entry.disclose;
+      delete entry.disclose;
+    }
     if (owed > 0) {
       logger.error(
-        `[ask-answers] tab ${key.slice(0, 8)} disconnected still owed a disclosure for ${owed} validated answer(s) whose content was already dropped — recording it here, as there is no longer anywhere to deliver it; treat those answers as UNDETERMINED`,
+        `[ask-answers] tab ${key.slice(0, 8)} ${why} still owed a disclosure for ${owed} validated answer(s) whose content was already dropped — recording it here, as there is no longer anywhere to deliver it; treat those answers as UNDETERMINED`,
       );
     }
     this.dropped.delete(slot);
@@ -999,7 +1068,7 @@ export class AskAnswerJournalImpl {
       // the card up, so the answer waits (for its own tab to come back) rather
       // than being announced to a stranger. It is still disclosed by a failing
       // ask, and still named on the way out — held, never swallowed.
-      if (entry.key === key && entry.delivery === "pending" && this.sameOccupant(entry)) {
+      if (entry.key === key && entry.delivery === "pending" && this.mayReachLiveTurn(entry)) {
         out.push(entry);
       }
     }
@@ -1140,6 +1209,14 @@ export class AskAnswerJournalImpl {
     // one. Settling it here on a bound would forge the very proof this split
     // exists to withhold.
     if (entry.returned && entry.delivery === "none") return;
+    // A boundary happened while a turn was carrying this. Re-arming it would
+    // hand the OLD conversation's answer to the replacement one — the same bypass
+    // as the rid path, through the release/push door. It stays journaled and
+    // disclosable; it just stops being deliverable.
+    if (entry.retired === true) {
+      entry.delivery = "none";
+      return;
+    }
     if (opts.carried) {
       entry.carriedReleases = (entry.carriedReleases ?? 0) + 1;
       if (entry.carriedReleases >= MAX_CARRIED_RELEASES) {
@@ -1331,6 +1408,13 @@ export class AskAnswerJournalImpl {
     // question attached, i.e. the disclosure would lose the only thing that makes
     // it honest.
     this.tabEpoch.set(key, (this.tabEpoch.get(key) ?? 0) + 1);
+    // The eviction DEBT is owed to the conversation being replaced, and scoping it
+    // by (tab, incarnation) cannot fence this axis — New chat happens on the same
+    // tab, same incarnation. Left alone, the replacement conversation's next ask
+    // would report the old conversation's warning as its own and settle it with
+    // its own ack. Surfaced and retired, exactly as a tab-gone does: reported,
+    // then cleared, never silently dropped.
+    this.surfaceAndClearDebt(key, this.incarnationOf?.(key), "its conversation was replaced");
     for (const entry of this.entries.values()) {
       if (entry.key !== key) continue;
       if (entry.correlation.status === "matched") {
@@ -1340,6 +1424,11 @@ export class AskAnswerJournalImpl {
       // also how a later ask of the SAME question notices this answer exists and
       // reports it. See AskEntry.recoverable.
       entry.recoverable = false;
+      // …and mark it RETIRED, which is what every path that can reach a live turn
+      // consults (see AskEntry.retired). Setting `delivery` alone is not enough:
+      // a turn that was already carrying this answer releases it back to
+      // `pending` afterwards, and the re-arm has no idea a boundary happened.
+      entry.retired = true;
       // …and STOP PUSHING it. Its addressee is gone.
       //
       // This is where an ask answer parts company with a run completion (#468),
