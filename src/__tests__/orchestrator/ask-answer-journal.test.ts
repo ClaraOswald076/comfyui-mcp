@@ -501,11 +501,45 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     expect(AskAnswers.hasOutstanding()).toBe(false);
   });
 
-  it("takeDropped reports the un-carried debt once", () => {
+  // codex round 4, P0: the ask path used to TAKE the debt, i.e. spend it on the
+  // first tool result — which is a hand-off, not a receipt, so an abandoned call
+  // carried the "N answers were lost" disclosure away with it. It is now spent by
+  // a COUNT of reports (the same trade MAX_CARRIED_RELEASES makes for a push):
+  // repeated at worst, never swallowed, and it cannot repeat forever.
+  it("an eviction debt survives a hand-off and is retired only after several reports", () => {
     strandEvictionDebt();
-    const owed = AskAnswers.takeDropped(TAB);
-    expect(owed).toBeGreaterThan(0);
-    expect(AskAnswers.takeDropped(TAB)).toBe(0); // said once
+    const first = AskAnswers.reportDropped(TAB);
+    expect(first).toBeGreaterThan(0);
+    // A second tool result still carries it — the first may never have landed.
+    expect(AskAnswers.reportDropped(TAB)).toBe(first);
+    expect(AskAnswers.hasOutstanding()).toBe(true);
+    // …but it does not repeat for ever.
+    expect(AskAnswers.reportDropped(TAB)).toBe(first);
+    expect(AskAnswers.reportDropped(TAB)).toBe(0);
+    expect(AskAnswers.droppedFor(TAB)).toBe(0);
+  });
+
+  // codex round 4, P0: `record` collapsed onto ANY existing entry for the ask id,
+  // so a genuinely different validated answer under a reused id was silently
+  // discarded. Only an IDENTICAL observation may collapse.
+  it("a DIFFERENT answer under the same ask id is kept, and both become undetermined", () => {
+    AskAnswers.openAsk("pa-two", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SAMPLER),
+      question: SAMPLER.question,
+    });
+    AskAnswers.closeAsk("pa-two");
+    const a = AskAnswers.record("pa-two", "euler", { tabId: TAB });
+    // The same observation seen twice is ONE answer.
+    expect(AskAnswers.record("pa-two", "euler", { tabId: TAB }).token).toBe(a.token);
+    // A different pick is a different answer and must not vanish.
+    const b = AskAnswers.record("pa-two", "dpmpp_2m", { tabId: TAB });
+    expect(b.token).not.toBe(a.token);
+    expect(AskAnswers.entriesFor(TAB).map((e) => e.answer).sort()).toEqual(["dpmpp_2m", "euler"]);
+    // Neither may satisfy a question — nothing says which card either came from.
+    expect(a.recoverable).toBe(false);
+    expect(b.recoverable).toBe(false);
+    expect(AskAnswers.recover(TAB, askFingerprint(SAMPLER)).status).toBe("unattributed");
   });
 
   // codex round 2, P0: ownership of an ask id used to be answered from a BOUNDED

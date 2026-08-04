@@ -53,6 +53,25 @@
 // match exactly is reported as an unattributed answer to ITS OWN question —
 // quoted with that question, so it cannot be read as an answer to anything else.
 //
+// WHAT IS DELIBERATELY NOT GUARANTEED. Three residuals survived four rounds of
+// adversarial review; each is an ACCEPTED trade with its reasoning, not an
+// oversight, and each is stated where it lives as well as here.
+//
+//  1. A RETURNED ANSWER EVICTED BY THE PER-TAB CEILING IS LOGGED, NOT COUNTED as
+//     an undetermined loss (see trimEntries). It reached a caller; what its
+//     eviction costs is the ability to RECOVER it. Counting each one would fire
+//     after ~48 ordinary successful asks and tell the agent that answers it
+//     almost certainly received are unknown — and a warning that is usually
+//     false is its own kind of silence.
+//  2. A RESTART IS NOT DEFERRED FOR A RETURNED ANSWER (see hasOutstanding vs.
+//     allOutstanding). Deferring on one would stall the self-restarter for the
+//     whole recovery window after EVERY ask. The fatal-exit disclosure names it
+//     instead: saying so on the way out costs nothing.
+//  3. A CARD ANSWERED BEYOND THE BRIDGE'S OPEN-CARD CEILING cannot be recognised
+//     at all (UiBridge.MAX_ASK_RID_MAPPINGS). Reaching it needs 1024 unanswered
+//     cards outstanding at once; it is logged at ERROR, and reporting it as a
+//     "dropped answer" would be a lie about questions nobody answered.
+//
 // LOCAL trust domain: this is accidental-loss bookkeeping, not a defence against
 // a hostile panel. Everything is in-memory and process-scoped.
 
@@ -228,6 +247,9 @@ const RECOVER_MAX_AGE_MS = 10 * 60_000;
 const MAX_CARRIED_RELEASES = 3;
 /** Tabs whose evicted-answer counter is retained. */
 const MAX_DROPPED_KEYS = 64;
+/** How many separate tool results may report an eviction debt before it is
+ *  considered said. See reportDropped(). */
+const MAX_DEBT_REPORTS = 3;
 
 /**
  * EXACT identity of a question, and the whole of the cross-question guard.
@@ -335,6 +357,10 @@ export class AskAnswerJournalImpl {
   private entries = new Map<string, AskEntry>();
   /** Answers this tab lost to an eviction and has not yet been told about. */
   private dropped = new Map<string, number>();
+  /** How many tool results have already carried each tab's eviction debt. The
+   *  debt is spent by a COUNT of reports, never by a single hand-off — see
+   *  reportDropped(). */
+  private droppedReports = new Map<string, number>();
   private seq = 0;
   private ticketSeq = 0;
   /** Deliver a tab's newly-orphaned answers (see setFlusher). */
@@ -456,8 +482,26 @@ export class AskAnswerJournalImpl {
    * dropped because it "looks like" something already seen.
    */
   record(askId: string, reply: unknown, meta: { tabId: string }): AskEntry {
+    const text = answerText(reply);
     const existing = [...this.entries.values()].find((e) => e.askId === askId);
-    if (existing) return existing;
+    // Collapse ONLY an identical observation. The same card's reply can be seen
+    // twice (the handler's grace poll takes it out of the bridge buffer while the
+    // sink has already forwarded it) and that is one answer, not two — identity,
+    // not suppression.
+    //
+    // A DIFFERENT answer under the same id is a different validated answer (two
+    // cards, one reused id). Returning the old entry there would silently
+    // discard what the user just chose, so it gets its own entry, and BOTH are
+    // demoted to unattributable: nothing on the wire says which card either came
+    // from, so neither may satisfy a question.
+    if (existing) {
+      if (existing.answer === text) return existing;
+      logger.warn(
+        `[ask-answers] a SECOND, different answer arrived under ask id ${askId.slice(0, 12)} ("${text}" vs "${existing.answer}") — both are kept and both are reported as UNDETERMINED; neither can satisfy a question`,
+      );
+      existing.correlation = { status: "foreign", askId };
+      existing.recoverable = false;
+    }
     const ticket = this.tickets.get(askId);
     // A REUSED id proves nothing: the panel sends only the id, so an answer for
     // it could belong to either card. Report it as foreign — real, but
@@ -466,7 +510,7 @@ export class AskAnswerJournalImpl {
     // resume of a historical session) while its card stayed on screen.
     const conversationGone =
       ticket !== undefined && ticket.epoch !== (this.tabEpoch.get(ticket.tabId) ?? 0);
-    const attributable = ticket !== undefined && ticket.reused !== true;
+    const attributable = ticket !== undefined && ticket.reused !== true && existing === undefined;
     const correlation: AskCorrelation = attributable
       ? { status: "matched", askId }
       : { status: "foreign", askId };
@@ -483,7 +527,7 @@ export class AskAnswerJournalImpl {
       // The question TEXT is still carried: it is what makes that report honest.
       fingerprint: attributable ? ticket.fingerprint : null,
       question: ticket?.question ?? null,
-      answer: answerText(reply),
+      answer: text,
       answeredAt: Date.now(),
       correlation,
       ticketSeq: ticket?.seq ?? 0,
@@ -496,7 +540,7 @@ export class AskAnswerJournalImpl {
       delivery: ticket?.awaiting === true || conversationGone ? "none" : "pending",
       // A question the CURRENT conversation never asked may be reported, never
       // returned as its answer.
-      ...(conversationGone ? { recoverable: false } : {}),
+      ...(conversationGone || existing !== undefined ? { recoverable: false } : {}),
       attempts: 0,
     };
     this.entries.set(entry.token, entry);
@@ -620,9 +664,22 @@ export class AskAnswerJournalImpl {
    * ERROR, and repeating the warning on every subsequent ask forever is worse
    * than reporting it once at the first opportunity.
    */
-  takeDropped(key: string): number {
+  reportDropped(key: string): number {
     const owed = this.dropped.get(key) ?? 0;
-    this.dropped.delete(key);
+    if (owed <= 0) return 0;
+    const said = (this.droppedReports.get(key) ?? 0) + 1;
+    // Bounded by REPORTS, not cleared on the first one. A ToolResult is a
+    // hand-off, not a receipt (that IS #486), so spending the debt on the first
+    // report would let an abandoned call take the disclosure with it — the
+    // suppression rule, one level up. Three independent tool results is the same
+    // trade MAX_CARRIED_RELEASES makes for a pushed answer: a repeated warning at
+    // worst, never a swallowed one, and it cannot repeat forever.
+    if (said >= MAX_DEBT_REPORTS) {
+      this.dropped.delete(key);
+      this.droppedReports.delete(key);
+    } else {
+      this.droppedReports.set(key, said);
+    }
     return owed;
   }
 
@@ -683,6 +740,7 @@ export class AskAnswerJournalImpl {
         // replayed, and the warning must go with it. Only ack() clears it.
         entry.disclose = lost;
         this.dropped.delete(key);
+        this.droppedReports.delete(key);
       }
       delivered += 1;
     }
@@ -803,6 +861,10 @@ export class AskAnswerJournalImpl {
     if (lost !== undefined) {
       this.dropped.delete(from);
       this.dropped.set(to, (this.dropped.get(to) ?? 0) + lost);
+      // The destination inherits the DEBT but not the source's report credit:
+      // those reports went to the source tab's agent, not this one's.
+      this.droppedReports.delete(from);
+      this.droppedReports.delete(to);
     }
   }
 
@@ -903,6 +965,7 @@ export class AskAnswerJournalImpl {
     this.tabEpoch.clear();
     this.entries.clear();
     this.dropped.clear();
+    this.droppedReports.clear();
     this.seq = 0;
     this.ticketSeq = 0;
   }
@@ -952,6 +1015,7 @@ export class AskAnswerJournalImpl {
       if (victim === undefined) break;
       const lost = this.dropped.get(victim) ?? 0;
       this.dropped.delete(victim);
+      this.droppedReports.delete(victim);
       logger.error(
         `[ask-answers] discarding the undelivered-answer count (${lost}) for tab ${victim.slice(0, 8)} — over ${MAX_DROPPED_KEYS} tabs are tracking one; that tab will not be told`,
       );

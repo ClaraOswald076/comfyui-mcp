@@ -3953,7 +3953,7 @@ function askTimeoutResult(
  *  succeed. Reading it also SPENDS it (droppedFor is drained by the journal only
  *  when a push carries it), so it is said once. */
 function withDroppedText(tabId: string, text: string): string {
-  const dropped = AskAnswers.takeDropped(tabId);
+  const dropped = AskAnswers.reportDropped(tabId);
   if (dropped <= 0) return text;
   return (
     `${text}\n\n⚠️ ${dropped} further validated answer(s) for this tab were dropped before they ` +
