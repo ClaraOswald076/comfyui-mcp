@@ -3037,28 +3037,27 @@ async function updateViaRegistryZipReinstall(opts: {
   try {
     ops.rename(incomingDir, dir);
   } catch (err) {
-    // A panel IS still reachable (the incoming dir is served), so this is a
-    // naming problem rather than an outage. Prefer restoring the known-good
-    // copy; if that is not possible, say plainly that the new one is live under
-    // the wrong name and leave the journal for the next reconcile.
-    let restored = false;
-    try {
-      ops.removeDir(incomingDir);
-      ops.rename(backupDir, dir);
-      restored = true;
-    } catch {
-      restored = false;
-    }
-    if (restored) ops.removeDir(journalPath);
+    // DO NOT "ROLL BACK" HERE. The obvious-looking recovery — delete the
+    // incoming copy, move the backup home — deletes the ONLY panel currently
+    // under custom_nodes before it knows whether the restore will succeed. If
+    // that second step then fails, the user is left with no panel at all: the
+    // exact outage this whole ordering exists to prevent, reintroduced on a
+    // path that was trying to help.
+    //
+    // Nothing needs undoing anyway. The incoming directory is a fully validated
+    // panel (identity, version, built web bundle — all checked before it was
+    // staged) and ComfyUI is serving it right now. This is a NAMING problem, not
+    // an outage, and reconciliation finishes it later. So leave the filesystem
+    // exactly as it is, keep the journal, and say so.
     throw new PanelInstallError(
-      `Panel update did NOT apply: ${managerReason}, and the reinstall-from-source ` +
+      `Panel update did NOT complete: ${managerReason}, and the reinstall-from-source ` +
         `fallback failed while moving the new panel into place ` +
         `(${incomingDir} → ${dir}: ${err instanceof Error ? err.message : String(err)}). ` +
-        (restored
-          ? `The previous panel was RESTORED to ${dir} — nothing was lost.`
-          : `The new panel is still at ${incomingDir} and ComfyUI WILL serve it, so you ` +
-            `are not without a panel; the previous copy is at ${backupDir}. Re-run ` +
-            `install_panel(action='status') to have this finished automatically.`),
+        `You are NOT without a panel — the new one is at ${incomingDir} and ComfyUI ` +
+        `serves it, and the previous copy is at ${backupDir}. Nothing was rolled back, ` +
+        `because undoing this would have meant deleting the only panel in custom_nodes ` +
+        `first. Re-run install_panel(action='status') to have it moved into place ` +
+        `automatically, then RESTART ComfyUI.`,
     );
   }
 
@@ -3179,8 +3178,14 @@ export async function runPanelActionInner(
       message: `${result.message}${carried.note}`,
     };
   } catch (err) {
-    if (carried.note && err instanceof PanelInstallError) {
-      throw new PanelInstallError(`${err.message}${carried.note}`);
+    // ANY error, not just ours. install/reinstall await ComfyUI-Manager
+    // operations directly, which reject with NodeManagementError and friends —
+    // so restricting this to PanelInstallError meant a repair could happen and
+    // then be silently dropped because the action failed for an unrelated
+    // reason. The message is appended in place rather than re-wrapped, so the
+    // original error's CLASS and details survive for callers that check them.
+    if (carried.note && err instanceof Error) {
+      err.message = `${err.message}${carried.note}`;
     }
     throw err;
   }

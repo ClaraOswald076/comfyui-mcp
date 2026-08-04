@@ -852,6 +852,54 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     expect(existsSync(INCOMING())).toBe(false);
   });
 
+  it("a failed final rename does NOT roll back by deleting the only served panel", async () => {
+    // The obvious recovery — drop the incoming copy, move the backup home —
+    // deletes the ONLY panel in custom_nodes before knowing the restore will
+    // work. If the restore then fails, the user has nothing. Nothing needs
+    // undoing anyway: the incoming copy is validated and already being served.
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    const h = makeDeps({ cloneVersion: "0.11.38", updateThrows: "manager cannot resolve it" });
+    const realRename = h.deps.rename!;
+    let renames = 0;
+    h.deps.rename = (from, to) => {
+      if (++renames === 3) throw new Error("EACCES on the final rename");
+      realRename(from, to);
+    };
+    let removals = 0;
+    const realRemove = h.deps.removeDir!;
+    h.deps.removeDir = (p) => {
+      if (p === INCOMING()) removals++;
+      realRemove(p);
+    };
+
+    const err = await runPanelActionInner("update", h.deps).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    // The served copy was left alone, so a panel is still reachable.
+    expect(removals).toBe(0);
+    expect(aPanelIsReachable()).toBe(true);
+    expect(existsSync(INCOMING())).toBe(true);
+    expect((err as Error).message).toMatch(/NOT without a panel/);
+    // And the message doesn't claim a rollback that never happened.
+    expect((err as Error).message).not.toMatch(/RESTORED/);
+  });
+
+  it("a repair is reported even when the action then fails with a non-panel error", async () => {
+    // install/reinstall await ComfyUI-Manager directly, which rejects with its
+    // own error types. Restricting the note to PanelInstallError meant a repair
+    // could happen and then vanish because the action failed for another reason.
+    writePanelPack(INCOMING(), "0.11.38"); // an interrupted swap to finish first
+    const h = makeDeps({});
+    h.deps.install = async () => {
+      throw new TypeError("something entirely unrelated blew up");
+    };
+    const err = await runPanelActionInner("install", h.deps).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(TypeError); // original class preserved
+    expect((err as Error).message).toMatch(/something entirely unrelated/);
+    expect((err as Error).message).toMatch(/interrupted/i);
+    // The repair really did happen.
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.38");
+  });
+
   it("interruption BEFORE the old panel moved aside is undone, keeping the working panel", async () => {
     writePanelPack(PANEL_DIR(), "0.11.34");
     writePanelPack(INCOMING(), "0.11.38"); // staged, but the swap never went on
