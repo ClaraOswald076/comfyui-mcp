@@ -323,19 +323,59 @@ function interruptHonorMs(): number {
   return Number.isFinite(s) && s > 0 ? Math.round(s * 1000) : 30000;
 }
 
+/** The outcome of watching the queue for a job to leave the running slot. */
+interface RunningClearance {
+  outcome:
+    /** A successful poll observed it gone. */
+    | "cleared"
+    /** Polls kept answering, and the job was still running when time ran out. */
+    | "still-running"
+    /** The observation itself failed — nothing was determined about the job. */
+    | "unobservable";
+  /** At least one poll in the window answered (so an "unobservable" outcome
+   *  means the queue stopped answering PARTWAY through, not that it never
+   *  answered — the messages must not conflate the two). */
+  observed: boolean;
+}
+
 /** Poll /queue until the target running job is gone (or any-running is gone when
- *  no id given), or the timeout elapses. Returns true if it cleared. */
-async function waitForRunningCleared(promptId: string | undefined, timeoutMs: number): Promise<boolean> {
+ *  no id given), or the timeout elapses.
+ *
+ *  THREE outcomes, because a failed poll is not "still running": if ComfyUI
+ *  died mid-job, /queue stops answering AND the job is gone — folding that
+ *  into "still-running" ends in a confident "wedged, restart ComfyUI, do NOT
+ *  queue another run" verdict about a job that no longer exists. "Cleared"
+ *  and "still-running" both require a live observation; anything else is
+ *  "unobservable". */
+async function waitForRunningCleared(
+  promptId: string | undefined,
+  timeoutMs: number,
+): Promise<RunningClearance> {
   const start = Date.now();
+  let everObserved = false;
+  let lastPollFailed = false;
   while (Date.now() - start < timeoutMs) {
     await sleep(1500);
     const q = await getQueueSummary().catch(() => null);
-    if (!q) continue;
-    if (q.running === 0) return true;
+    if (!q) {
+      lastPollFailed = true;
+      continue;
+    }
+    everObserved = true;
+    lastPollFailed = false;
+    if (q.running === 0) return { outcome: "cleared", observed: true };
     // A DIFFERENT job is now running → the one we targeted has cleared.
-    if (promptId && !q.running_jobs.some((j) => j.prompt_id === promptId)) return true;
+    if (promptId && !q.running_jobs.some((j) => j.prompt_id === promptId)) {
+      return { outcome: "cleared", observed: true };
+    }
   }
-  return false;
+  // Timed out. "Still running" is a claim about NOW, and only a poll that is
+  // still answering at the end of the window can make it — a run of failures
+  // (or never observing at all) means the queue's state is simply unknown.
+  return {
+    outcome: everObserved && !lastPollFailed ? "still-running" : "unobservable",
+    observed: everObserved,
+  };
 }
 
 export interface EscalatedCancelResult {
@@ -343,6 +383,10 @@ export interface EscalatedCancelResult {
   honored: boolean; // did the running job actually stop?
   freed_vram: boolean; // did we escalate to POST /free?
   wedged: boolean; // still running after interrupt + free → needs a restart
+  /** The queue stopped answering mid-verification — the job's fate is UNKNOWN,
+   *  neither "stopped" nor "wedged" (a crashed ComfyUI also stops answering,
+   *  and takes the job with it). */
+  unverified?: boolean;
   pending_cleared?: number; // how many pending jobs were dropped (if clear_pending)
   running_prompt_id?: string;
   message: string;
@@ -361,15 +405,33 @@ export async function cancelRunningJobEscalating(opts: {
   clear_pending?: boolean;
 }): Promise<EscalatedCancelResult> {
   let pending_cleared: number | undefined;
+  let clearPendingFailed = false;
   if (opts.clear_pending) {
     const before = await getQueueSummary().catch(() => null);
-    await clearAllQueued().catch((err) => logger.warn("clear_pending failed (continuing)", { err }));
-    pending_cleared = before?.pending;
+    await clearAllQueued().catch((err) => {
+      clearPendingFailed = true;
+      logger.warn("clear_pending failed (continuing)", { err });
+    });
+    // Only a clear that did not fail may report a count — "cleared (N)" on a
+    // failed request is a confident false statement.
+    pending_cleared = clearPendingFailed ? undefined : before?.pending;
   }
+  // The pending half of every verdict message, true to what actually happened.
+  const pendingNote = !opts.clear_pending
+    ? `Pending jobs were NOT cleared — pass clear_pending:true or call queue (action:"clear").`
+    : clearPendingFailed
+      ? `Clearing pending jobs FAILED — they may still be queued; check queue (action:"list").`
+      : pending_cleared != null
+        ? `Pending jobs were cleared (${pending_cleared}).`
+        : `Pending jobs were cleared.`;
 
   // Identify the job we're trying to stop so we can verify it actually clears.
   const pre = await getQueueSummary().catch(() => null);
   const runningId = opts.prompt_id ?? pre?.running_jobs?.[0]?.prompt_id;
+  // "Interrupted" is only a claim we may make about a job we OBSERVED running.
+  const targetSeenRunning = opts.prompt_id
+    ? !!pre?.running_jobs.some((j) => j.prompt_id === opts.prompt_id)
+    : !!pre && pre.running > 0;
 
   if (pre && pre.running === 0 && !opts.prompt_id) {
     return {
@@ -378,14 +440,45 @@ export async function cancelRunningJobEscalating(opts: {
       freed_vram: false,
       wedged: false,
       pending_cleared,
-      message: `No job is running.${pending_cleared != null ? ` Cleared ${pending_cleared} pending.` : ""}`,
+      message: `No job is running.${opts.clear_pending ? ` ${pendingNote}` : ""}`,
+    };
+  }
+  if (pre && opts.prompt_id && !targetSeenRunning) {
+    return {
+      interrupted: false,
+      honored: true,
+      freed_vram: false,
+      wedged: false,
+      pending_cleared,
+      message:
+        `${opts.prompt_id} is not running (verified via /queue) — nothing to interrupt.` +
+        `${opts.clear_pending ? ` ${pendingNote}` : ""}`,
     };
   }
 
   await clientInterrupt(opts.prompt_id);
   logger.info("Interrupt sent (escalating cancel)", { prompt_id: runningId ?? "current" });
 
-  if (await waitForRunningCleared(runningId, interruptHonorMs())) {
+  const firstClearance = await waitForRunningCleared(runningId, interruptHonorMs());
+  if (firstClearance.outcome === "cleared") {
+    if (!targetSeenRunning) {
+      // The queue is verifiably empty NOW, but the pre-interrupt read failed —
+      // so "the interrupt stopped it" asserts a start state nobody observed.
+      return {
+        interrupted: true,
+        honored: false,
+        freed_vram: false,
+        wedged: false,
+        unverified: true,
+        pending_cleared,
+        running_prompt_id: runningId,
+        message:
+          `Interrupt sent${runningId ? ` (${runningId})` : ""}, and nothing is running now ` +
+          `(verified via /queue) — but the queue could not be read BEFORE the interrupt, so ` +
+          `whether a job was running, and whether the interrupt stopped it, is UNKNOWN.` +
+          `${opts.clear_pending ? ` ${pendingNote}` : ""}`,
+      };
+    }
     return {
       interrupted: true,
       honored: true,
@@ -394,48 +487,180 @@ export async function cancelRunningJobEscalating(opts: {
       pending_cleared,
       running_prompt_id: runningId,
       message: `Interrupted the running job${runningId ? ` (${runningId})` : ""}.${
-        pending_cleared != null ? ` Cleared ${pending_cleared} pending.` : ""
+        opts.clear_pending ? ` ${pendingNote}` : ""
       }`,
     };
   }
 
-  // Not honored — the step is long-running. Free VRAM and re-check.
+  // Not honored — the step is long-running. Free VRAM and re-check. The /free
+  // result is tracked, not swallowed into the narration: a failed escalation
+  // must not be described as a performed one — and a throw only means no
+  // successful completion was OBSERVED (the request may have applied and the
+  // response been lost), so "never reached the server" is not ours to say
+  // either. On Comfy Cloud the call is a deliberate no-op, which no message
+  // may narrate as a VRAM free.
   logger.warn("Interrupt not honored in window; escalating to /free", { prompt_id: runningId ?? "current" });
-  await clientFreeMemory({ unload_models: true, free_memory: true }).catch((err) =>
-    logger.warn("/free during cancel escalation failed (continuing)", { err }),
-  );
+  const freeRan = !isCloudMode();
+  let freeFailed = false;
+  await clientFreeMemory({ unload_models: true, free_memory: true }).catch((err) => {
+    freeFailed = true;
+    logger.warn("/free during cancel escalation failed (continuing)", { err });
+  });
+  // freed_vram is true only when the escalation RAN and did not fail.
+  const freedVram = freeRan && !freeFailed;
+  const freeFailedPhrase =
+    "the VRAM-free escalation did not complete — whether it freed anything is unknown";
 
-  if (await waitForRunningCleared(runningId, Math.min(interruptHonorMs(), 12000))) {
+  const finalClearance = await waitForRunningCleared(
+    runningId,
+    Math.min(interruptHonorMs(), 12000),
+  );
+  // The duration the message may claim: continuous verified polling only when
+  // the FIRST window was observed end-to-end; otherwise only the final check
+  // was a live observation, and the message must not claim more.
+  const watchedDuration = (first: RunningClearance): string =>
+    first.outcome === "still-running"
+      ? ` across ~${Math.round((interruptHonorMs() + Math.min(interruptHonorMs(), 12000)) / 1000)}s of verified polling`
+      : ` at a verified check ~${Math.round(Math.min(interruptHonorMs(), 12000) / 1000)}s after the escalation`;
+  // "The job stopped" (or "this job is wedged") is only ours to claim when the
+  // target was seen running BEFORE the interrupt. A named prompt first sighted
+  // in a later window may have STARTED after the interrupt — the interrupt was
+  // a no-op for it, and its later stop is not our doing.
+  const stopVerified = targetSeenRunning;
+  if (finalClearance.outcome === "cleared") {
+    // The queue is verifiably empty — but WHY is only knowable if we watched
+    // it the whole time, and WHETHER a job was running at all is only knowable
+    // if the start was observed.
+    // A job was SEEN during the window, but never tied to the interrupt.
+    const sawUntiedJob =
+      !stopVerified &&
+      (firstClearance.outcome === "still-running" || firstClearance.observed);
+    const message =
+      firstClearance.outcome === "unobservable" && targetSeenRunning
+        ? `The running job${runningId ? ` (${runningId})` : ""} has STOPPED (verified via /queue), ` +
+          `but what stopped it is unknown — the queue was unreachable for a while after the ` +
+          `interrupt${
+            freeFailed
+              ? `, and ${freeFailedPhrase} — so the interrupt may have worked late or ComfyUI restarted`
+              : freeRan
+                ? `, so the interrupt may have worked late, the VRAM free may have done it, or ComfyUI restarted`
+                : `, so the interrupt may have worked late or ComfyUI restarted`
+          }.${opts.clear_pending ? ` ${pendingNote}` : ""}`
+        : sawUntiedJob
+          ? `A job was running during the interrupt window and nothing is running now (verified ` +
+            `via /queue) — but the queue could not be read BEFORE the interrupt, so whether the ` +
+            `job that stopped is the one that was interrupted is UNKNOWN.${
+              opts.clear_pending ? ` ${pendingNote}` : ""
+            }`
+          : !stopVerified
+            ? `Nothing is running now (verified via /queue), but /queue never answered from before ` +
+              `the interrupt through the honor window — so whether a job was running at all, and ` +
+              `what stopped it if one was, is UNKNOWN.${opts.clear_pending ? ` ${pendingNote}` : ""}`
+            : freeFailed
+              ? `The job didn't stop on interrupt and ${freeFailedPhrase}, but the job ` +
+                `HAS now stopped anyway (verified via /queue)${runningId ? ` (${runningId})` : ""}.${
+                  opts.clear_pending ? ` ${pendingNote}` : ""
+                }`
+              : freeRan
+                ? `The job didn't stop within the interrupt window; after the VRAM-free escalation it ` +
+                  `has now STOPPED (verified via /queue)${runningId ? ` (${runningId})` : ""}.${
+                    opts.clear_pending ? ` ${pendingNote}` : ""
+                  }`
+                : `The job didn't stop within the interrupt window and has now STOPPED ` +
+                  `(verified via /queue)${runningId ? ` (${runningId})` : ""}.${
+                    opts.clear_pending ? ` ${pendingNote}` : ""
+                  }`;
     return {
       interrupted: true,
-      honored: true,
-      freed_vram: true,
+      honored: stopVerified,
+      freed_vram: freedVram,
       wedged: false,
+      unverified: stopVerified ? undefined : true,
       pending_cleared,
       running_prompt_id: runningId,
-      message: `The job didn't stop on interrupt; freeing VRAM cleared it${runningId ? ` (${runningId})` : ""}.${
-        pending_cleared != null ? ` Cleared ${pending_cleared} pending.` : ""
-      }`,
+      message,
+    };
+  }
+
+  if (finalClearance.outcome === "unobservable") {
+    const subject = targetSeenRunning
+      ? `⚠️ The running job${runningId ? ` (${runningId})` : ""} was sent an interrupt`
+      : `⚠️ An interrupt was sent${runningId ? ` for ${runningId}` : ""}`;
+    const unknownWhat = targetSeenRunning
+      ? `whether it is still running is UNKNOWN — ComfyUI may be down or restarting, which would ` +
+        `ALSO have stopped the job`
+      : `whether a job was running — and whether one still is — is UNKNOWN. ComfyUI may be down ` +
+        `or restarting`;
+    // "Stopped answering" is only a claim we may make if it answered at all.
+    const reachability = finalClearance.observed
+      ? `stopped answering partway through verification`
+      : `did not answer during verification`;
+    return {
+      interrupted: true,
+      honored: false,
+      freed_vram: freedVram,
+      wedged: false,
+      unverified: true,
+      pending_cleared,
+      running_prompt_id: runningId,
+      message:
+        subject +
+        (freeFailed
+          ? ` (${freeFailedPhrase})`
+          : freeRan && targetSeenRunning
+            ? ` (and a VRAM free)`
+            : ``) +
+        `, but /queue ${reachability}, so ${unknownWhat}. This is not a confirmed wedge. ` +
+        `Check ComfyUI is up (get_environment) and inspect the queue before deciding anything. ` +
+        (opts.clear_pending
+          ? pendingNote
+          : `Pending jobs were NOT cleared — pass clear_pending:true or call queue (action:"clear").`),
+    };
+  }
+
+  if (!stopVerified) {
+    // A job is verifiably wedged — but nothing established it is the job the
+    // interrupt addressed (no pre-interrupt read; a named prompt may have
+    // STARTED after it). The wedge itself is real (interrupt + VRAM free did
+    // not stop it); only the IDENTITY is unknown.
+    return {
+      interrupted: true,
+      honored: false,
+      freed_vram: freedVram,
+      wedged: true,
+      unverified: true,
+      pending_cleared,
+      running_prompt_id: runningId,
+      message:
+        `⚠️ ${opts.prompt_id ? `The job ${opts.prompt_id}` : "A job"} is still running after interrupt` +
+        (freeFailed ? ` (${freeFailedPhrase})` : freeRan ? ` + VRAM free` : ``) +
+        watchedDuration(firstClearance) +
+        ` — it is wedged inside a single step (ComfyUI only honors interrupts ` +
+        `BETWEEN steps). Whether this IS the job the interrupt addressed is UNKNOWN — ` +
+        (opts.prompt_id
+          ? `it was never observed running before the interrupt, so it may have started after. `
+          : `the queue could not be read beforehand. `) +
+        `An HTTP cancel cannot kill a wedged step; restart ` +
+        `ComfyUI (panel_restart_comfyui, or restart_comfyui) to clear it. ` +
+        `${pendingNote} Do NOT queue another run until this is gone.`,
     };
   }
 
   return {
     interrupted: true,
     honored: false,
-    freed_vram: true,
+    freed_vram: freedVram,
     wedged: true,
     pending_cleared,
     running_prompt_id: runningId,
     message:
-      `⚠️ The running job${runningId ? ` (${runningId})` : ""} did NOT stop after interrupt + VRAM free within ` +
-      `~${Math.round(interruptHonorMs() / 1000)}s — it is wedged inside a single step (ComfyUI only honors interrupts ` +
+      `⚠️ The running job${runningId ? ` (${runningId})` : ""} did NOT stop after interrupt` +
+      (freeFailed ? ` (${freeFailedPhrase})` : freeRan ? ` + VRAM free` : ``) +
+      watchedDuration(firstClearance) +
+      ` — it is wedged inside a single step (ComfyUI only honors interrupts ` +
       `BETWEEN steps, so a multi-minute step ignores cancel). An HTTP cancel cannot kill this; restart ComfyUI ` +
       `(panel_restart_comfyui, or restart_comfyui) to clear it. ` +
-      `${
-        opts.clear_pending
-          ? `Pending jobs were cleared (${pending_cleared ?? 0}).`
-          : "Pending jobs were NOT cleared — pass clear_pending:true or call queue (action:\"clear\")."
-      } Do NOT queue another run until this is gone.`,
+      `${pendingNote} Do NOT queue another run until this is gone.`,
   };
 }
 

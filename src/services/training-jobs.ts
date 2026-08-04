@@ -125,6 +125,9 @@ export interface TrainingJob {
      *  or pod-only delivery). */
     catalogId?: string;
     previewFile?: string;
+    /** The catalog entry failed although the LoRA itself was published —
+     *  disclosed, never allowed to mark the job failed after the fact. */
+    catalogError?: string;
     /** Pod jobs: path inside the pod's models/loras (when delivered there). */
     podLoraPath?: string;
   };
@@ -1299,34 +1302,60 @@ async function handoffToComfyUI(job: TrainingJob, deps: TrainingJobDeps): Promis
     return;
   }
 
-  const catalog = deps.catalog ?? getLoraCatalog();
-  const entry = catalog.upsert({
-    relPath: `loras/${job.name}.safetensors`,
-    displayName: job.name.replace(/_/g, " "),
-    description: `Character LoRA trained ${job.target === "pod" ? "on a RunPod pod" : "locally"} on FLUX.1-dev via ostris ai-toolkit (comfyui-mcp trainer, job ${job.id}).`,
-    setupInstructions:
-      "Load with LoraLoaderModelOnly on a FLUX.1-dev checkpoint" +
-      (job.trigger ? ` and include the trigger word "${job.trigger}" in the prompt.` : "."),
-    keywords: job.trigger ? [job.trigger] : [],
-    baseModels: ["FLUX.1-dev"],
-    strengthDefault: 1.0,
-    tags: ["trained-locally", "character", ...(job.target === "pod" ? ["trained-on-pod"] : [])],
-    // Explicitly clear the flag — retraining a LoRA whose entry was marked
-    // missing must become visible again (upsert otherwise preserves it).
-    missing: false,
-  });
-
-  // Best-effort: newest sample image becomes the catalog preview.
+  // The LoRA itself was ALREADY copied to dest above — what follows only
+  // records it in the catalog. Refuse-vs-disclose: a catalog failure must
+  // never bounce back as "output handoff failed" for a model that IS
+  // published, so it is caught here and disclosed on the result instead.
+  let catalogId: string | undefined;
   let previewFile: string | undefined;
-  const samples = findSamples(job.outputDir, job.name, 1);
-  if (samples.length > 0) {
-    try {
-      previewFile = catalog.setPreview(entry.id, samples[0]).previewFile;
-    } catch (err) {
-      logger.debug(`[training-jobs] preview copy skipped: ${err instanceof Error ? err.message : String(err)}`);
+  let catalogError: string | undefined;
+  try {
+    const catalog = deps.catalog ?? getLoraCatalog();
+    const entry = catalog.upsert({
+      relPath: `loras/${job.name}.safetensors`,
+      displayName: job.name.replace(/_/g, " "),
+      description: `Character LoRA trained ${job.target === "pod" ? "on a RunPod pod" : "locally"} on FLUX.1-dev via ostris ai-toolkit (comfyui-mcp trainer, job ${job.id}).`,
+      setupInstructions:
+        "Load with LoraLoaderModelOnly on a FLUX.1-dev checkpoint" +
+        (job.trigger ? ` and include the trigger word "${job.trigger}" in the prompt.` : "."),
+      keywords: job.trigger ? [job.trigger] : [],
+      baseModels: ["FLUX.1-dev"],
+      strengthDefault: 1.0,
+      tags: ["trained-locally", "character", ...(job.target === "pod" ? ["trained-on-pod"] : [])],
+      // Explicitly clear the flag — retraining a LoRA whose entry was marked
+      // missing must become visible again (upsert otherwise preserves it).
+      missing: false,
+    });
+    catalogId = entry.id;
+
+    // Best-effort: newest sample image becomes the catalog preview. A failure
+    // here can come AFTER the file was written (setPreview discloses exactly
+    // that) — so it is recorded, not just logged: a completed job must not
+    // report neither previewFile nor error while the preview sits unreconciled.
+    const samples = findSamples(job.outputDir, job.name, 1);
+    if (samples.length > 0) {
+      try {
+        previewFile = catalog.setPreview(entry.id, samples[0]).previewFile;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn(`[training-jobs] preview copy skipped: ${msg}`);
+        catalogError = catalogError ?? `preview: ${msg}`;
+      }
     }
+  } catch (err) {
+    catalogError = err instanceof Error ? err.message : String(err);
+    logger.warn(
+      `[training-jobs] the LoRA was published to ${dest} but recording it in the catalog failed: ${catalogError}`,
+    );
   }
-  job.result = { loraPath: dest!, loraRelPath: `loras/${job.name}.safetensors`, catalogId: entry.id, previewFile, podLoraPath };
+  job.result = {
+    loraPath: dest!,
+    loraRelPath: `loras/${job.name}.safetensors`,
+    catalogId,
+    previewFile,
+    podLoraPath,
+    ...(catalogError ? { catalogError } : {}),
+  };
 }
 
 async function finalizeJob(job: TrainingJob, code: number, tail: string, deps: TrainingJobDeps): Promise<void> {

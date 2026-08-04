@@ -71,6 +71,7 @@ import {
   panelTargetGeneration,
   primePanelBase,
   recordPanelDiskObservation,
+  type PanelBaseResolution,
   type PanelBaseSource,
 } from "./panel-workspace.js";
 
@@ -1413,21 +1414,45 @@ async function ensureInner(deps: PanelInstallerDeps): Promise<EnsureResult> {
           "skipping auto-install to avoid a duplicate/unverified install.",
       };
     }
-    // #766 — and the same caution about WHICH TREE we looked in. An unattended
-    // install into a root the running server never named would land in a
-    // custom_nodes nothing loads, and the user would see no panel and no error.
-    // On a split install (Comfy Desktop's --base-directory) the configured path
-    // is exactly that root. Nobody is watching this path, so it only acts on a
-    // tree the live server itself chose.
-    if (isRealDeps(deps) && !isLiveDerivedBase(lastPanelBaseResolution())) {
-      return {
-        action: "unavailable",
-        reason:
-          "The panel appears absent, but the ComfyUI root scanned came from " +
-          "configuration rather than the running server, so it is not proven to be " +
-          "the tree ComfyUI serves from (#766). Skipping auto-install rather than " +
-          "installing into a custom_nodes that may never be loaded.",
-      };
+    // #766/#820 — and the same caution about WHICH TREE we looked in. An
+    // unattended install into a root the running server never named would land
+    // in a custom_nodes nothing loads, and the user would see no panel and no
+    // error. On a split install (Comfy Desktop's --base-directory) the
+    // configured path is exactly that root. Live-derived is not sufficient on
+    // its own (#820): the resolution is re-read HERE while the tree was frozen
+    // at pin time, and the two can diverge with NO retarget — the pin-time
+    // probe failed (configured fallback frozen), then a re-resolution of the
+    // SAME target recovered and named the server's real --base-directory. The
+    // pinned-generation check cannot see that (no retarget, no bump), so a
+    // live-derived resolution naming tree B would license an install into
+    // frozen tree A — an observation of one tree licensing a mutation of
+    // another. The resolution must name the tree we are about to install into.
+    //
+    // And it must be FRESH: the resolution cache lives for 60s, and a ComfyUI
+    // restart at the same URL (new --base-directory, no retarget, no bump)
+    // leaves the cache naming the OLD tree. The pin froze from that cache, so
+    // a cached A-to-A match can certify a tree the server no longer serves.
+    // The reachability probe above succeeded, so re-resolve FORCED — a live
+    // answer is available right now.
+    if (isRealDeps(deps)) {
+      const installTree = pinnedBaseOf(deps) ?? deps.comfyuiPath();
+      const resolution = await primePanelBase({ force: true });
+      const liveBase = isLiveDerivedBase(resolution) ? resolution?.base : undefined;
+      if (!liveBase || !samePathCI(installTree, liveBase, deps)) {
+        return {
+          action: "unavailable",
+          reason: liveBase
+            ? `The panel appears absent in ${installTree ?? "the resolved tree"}, ` +
+              `but the running ComfyUI's own launch arguments name a DIFFERENT tree ` +
+              `(${liveBase}), so the tree that would be installed into is not proven ` +
+              `to be the one ComfyUI serves from (#766/#820). Skipping auto-install ` +
+              `rather than installing into a custom_nodes that may never be loaded.`
+            : "The panel appears absent, but the ComfyUI root scanned came from " +
+              "configuration rather than the running server, so it is not proven to be " +
+              "the tree ComfyUI serves from (#766). Skipping auto-install rather than " +
+              "installing into a custom_nodes that may never be loaded.",
+        };
+      }
     }
     // Final pin check adjacent to the mutation (see runPanelActionInner): the
     // reachability probe and detection above are not instantaneous.
@@ -1773,8 +1798,21 @@ export async function panelStatus(
   const baseResolution = isRealDeps(deps) ? lastPanelBaseResolution() : undefined;
   const comfyuiPath = deps.comfyuiPath();
   const baseSource: PanelBaseSource | undefined = baseResolution?.source;
+  // A live-derived resolution taken NOW only certifies the tree FROZEN for this
+  // read when it names that same tree (#820). The two can diverge without any
+  // retarget (a pin-time probe failure froze the configured fallback, a later
+  // re-resolution naming the server's real root), and attributing this scan to
+  // the resolution's tree anyway would certify the wrong root.
+  const resolutionNamesScannedTree =
+    !!baseResolution?.base && samePathCI(comfyuiPath, baseResolution.base, deps);
+  // The corroboration verdict for THIS read, computed ONCE here: the recording
+  // step below (clearPanelDiskObservation) drops the resolution cache, so any
+  // re-read afterwards answers "nothing resolved" — a cache wipe is not
+  // evidence the tree was uncorroborated.
+  const scannedTreeCorroborated =
+    isLiveDerivedBase(baseResolution) && resolutionNamesScannedTree;
   const baseNote = (() => {
-    if (!baseResolution?.base) return "";
+    if (!baseResolution?.base || !resolutionNamesScannedTree) return "";
     if (baseResolution.source === "live-base-directory") {
       return (
         ` Resolved against the RUNNING ComfyUI's --base-directory (${baseResolution.base})` +
@@ -1827,8 +1865,18 @@ export async function panelStatus(
     // `installed: false` from a failed enumeration is "we could not look", and
     // inviting an install on that basis could clobber a panel the scan simply
     // missed — the loss `scanReliable` was introduced to prevent.
-    const uncorroborated =
-      isRealDeps(deps) && !isLiveDerivedBase(baseResolution);
+    // uncorroborated means the resolution does not certify THIS tree — either
+    // it is not live-derived at all, or it is live-derived but names a
+    // DIFFERENT tree (#820). The two causes are stated separately below:
+    // folding them into one message would assert whichever cause it happened
+    // to name.
+    const liveMismatchBase =
+      isRealDeps(deps) &&
+      isLiveDerivedBase(baseResolution) &&
+      !resolutionNamesScannedTree
+        ? baseResolution?.base
+        : undefined;
+    const uncorroborated = isRealDeps(deps) && !scannedTreeCorroborated;
     note = swapNote
       ? // An unresolved interrupted swap OWNS this message. Leading with "Not
         // installed — run install" would tell the user to start fresh in the
@@ -1845,7 +1893,14 @@ export async function panelStatus(
         `recommended — one could clobber a panel the scan missed. Make custom_nodes ` +
         `readable, then re-check.`
       : uncorroborated
-      ? `No panel found in ${comfyuiPath ?? "custom_nodes"} — but this is the ` +
+      ? liveMismatchBase
+      ? `No panel found in ${comfyuiPath ?? "custom_nodes"} — and the only live ` +
+        `reading available names a DIFFERENT tree (${liveMismatchBase}), so whether ` +
+        `the running ComfyUI serves from this one is UNCORROBORATED: "not installed" ` +
+        `here may simply be the wrong tree (#766/#820). Check that tree, or ` +
+        `get_environment's local.workspace_path, before installing — a blind install ` +
+        `here would land in a custom_nodes nothing loads.`
+      : `No panel found in ${comfyuiPath ?? "custom_nodes"} — but this is the ` +
         `CONFIGURED path, and the running ComfyUI did not confirm it is the tree it ` +
         `serves from, so "not installed" is UNCORROBORATED. On a split install ` +
         `(Comfy Desktop's --base-directory, #766) the panel lives elsewhere and ` +
@@ -1909,7 +1964,7 @@ export async function panelStatus(
       ? undefined
       : detection.applicable &&
         detection.scanReliable !== false &&
-        (!isRealDeps(deps) || isLiveDerivedBase(baseResolution)),
+        (!isRealDeps(deps) || scannedTreeCorroborated),
     pin,
     note: note + baseNote + swapNote + shadowNote + pinNote,
   };
@@ -2308,7 +2363,32 @@ function assertSwapTreeCorroborated(
   what: string,
   managerReason: string,
 ): void {
-  if (swapTreeIsCorroborated(deps)) return;
+  // An injected dep set declared its own base; nothing to corroborate against.
+  if (!isRealDeps(deps)) return;
+  // ONE read for the verdict AND the message: a cache expiry between two
+  // reads would narrate a different-tree refusal as "the CONFIGURED path".
+  const resolution = lastPanelBaseResolution();
+  if (liveResolutionNamesTree(deps, pinnedBaseOf(deps) ?? deps.comfyuiPath(), resolution)) {
+    return;
+  }
+  // "Not corroborated" covers two different situations — no live-derived
+  // reading at all, or a live reading that names ANOTHER tree (#820) — and
+  // only the second tells the user where their served panel actually lives.
+  // Asserting "this is the CONFIGURED path" for both would mislabel the
+  // mismatch case, so name it when it is the cause.
+  const liveBase = isLiveDerivedBase(resolution) ? resolution?.base : undefined;
+  const mismatch =
+    liveBase && !samePathCI(comfyuiPath, liveBase, deps) ? liveBase : undefined;
+  if (mismatch) {
+    throw new PanelInstallError(
+      `Panel update did NOT apply (${managerReason}), and ${what} is REFUSED: the ` +
+        `running ComfyUI's own launch arguments name a DIFFERENT tree (${mismatch}) ` +
+        `than ${comfyuiPath}, so updating here could move a copy nobody serves while ` +
+        `the browser keeps loading the real one — reported as a verified success. ` +
+        `Check which install this orchestrator is targeting (COMFYUI_PATH / saved ` +
+        `workspace), then retry. ${describePanelUpdateRecovery()}`,
+    );
+  }
   throw new PanelInstallError(
     `Panel update did NOT apply (${managerReason}), and ${what} is REFUSED: the ` +
       `running ComfyUI did not confirm that ${comfyuiPath} is the tree it serves from, ` +
@@ -2791,7 +2871,7 @@ interface SwapReconcileResult {
  * copy", "your panel at <dir>"), so the appended sentence has an antecedent.
  *
  * AND IT MUST BE THIS TREE THAT WAS CORROBORATED — the same rule, and the same
- * reasoning, as `swapTreeIsCorroborated`. Asking only "is the CURRENT
+ * reasoning, as the swap's corroboration gate (`liveResolutionNamesTree`). Asking only "is the CURRENT
  * resolution live-derived?" answers a question about NOW, while the path this
  * sentence names was pinned earlier. A retarget in between (status pins A, the
  * target moves to B, a live probe caches B) would let an observation
@@ -2805,6 +2885,9 @@ function servingQualifier(
   comfyuiPath: string,
   subject: string,
 ): string {
+  // ONE read, for the verdict AND the message: the cache can expire between
+  // two reads, and a mismatch claim derived from a second, empty read would
+  // assert "a DIFFERENT tree" on nothing more than a lost cache entry.
   const resolution = isRealDeps(deps) ? lastPanelBaseResolution() : undefined;
   const liveBase = isLiveDerivedBase(resolution) ? resolution?.base : undefined;
   const confirmed =
@@ -4092,41 +4175,42 @@ function resolveSwapOps(deps: PanelInstallerDeps): PanelSwapOps | undefined {
 }
 
 /**
- * May we perform a WHOLESALE REPLACEMENT against this tree?
+ * Does the CURRENT base resolution corroborate THIS tree — i.e. the running
+ * server itself named a root, and the root it named IS this one?
  *
- * The base resolution falls back to the configured path whenever
- * `/system_stats` cannot be reached — and on a Comfy Desktop split install the
- * configured path is exactly the tree the running server does NOT read (#766).
- * A transient probe failure is indistinguishable from "there is no split", so
- * the fallback can hand us a directory that holds a panel nobody is serving.
+ * Both halves are load-bearing and neither implies the other:
  *
- * For a READ that is acceptable (it is the best answer available, and it is
- * labelled). For deleting a directory and moving another over it, it is not: we
- * would replace a dormant copy, verify it happily, and report a verified update
- * while the panel in the user's browser stayed exactly where it was. So this
- * path requires the running server to have had a SAY in choosing the tree.
+ *  - LIVE-DERIVED: the base resolution falls back to the configured path
+ *    whenever `/system_stats` cannot be reached — and on a Comfy Desktop split
+ *    install the configured path is exactly the tree the running server does
+ *    NOT read (#766). A transient probe failure is indistinguishable from
+ *    "there is no split", so the fallback can hand us a directory that holds a
+ *    panel nobody is serving. REACHABLE IS NOT ENOUGH either: a /system_stats
+ *    response with absent or unparseable argv proves only that something
+ *    answered on the URL; it does not prove COMFYUI_PATH is the tree that
+ *    server reads. Only a root the running server actually named qualifies.
  *
- * `liveProbeFailed === false` with `source: "configured"` is fine — the server
- * answered and its argv simply offered nothing better.
+ *  - SAME TREE: asking only "is the CURRENT resolution live-derived?" answers
+ *    a question about NOW, while the tree we are about to mutate or describe
+ *    was frozen earlier. The two can diverge WITHOUT any retarget — a probe
+ *    that failed at pin time (configured fallback frozen) recovering when the
+ *    same target is re-resolved — so the pinned-generation check cannot see it
+ *    (#820). A live-derived resolution naming root B is not evidence about
+ *    root A: an observation of one tree must never license a mutation of, or
+ *    a claim about, another.
+ *
+ * This asks only the resolution question. What an INJECTED dep set means
+ * (there is no live server to corroborate against) is each caller's decision.
  */
-function swapTreeIsCorroborated(deps: PanelInstallerDeps): boolean {
-  // An injected dep set declared its own base explicitly; there is no live
-  // server to corroborate it against and none is implied.
-  if (!isRealDeps(deps)) return true;
-  // REACHABLE IS NOT ENOUGH. A /system_stats response with absent or
-  // unparseable argv proves only that something answered on the URL; it does
-  // not prove COMFYUI_PATH is the tree that server reads. Require a root the
-  // running server actually named.
-  const resolution = lastPanelBaseResolution();
+function liveResolutionNamesTree(
+  deps: PanelInstallerDeps,
+  tree: string | undefined,
+  // Callers that also MESSAGE about the resolution pass their own read, so a
+  // cache expiry cannot split the verdict from the narration.
+  resolution: PanelBaseResolution | undefined = lastPanelBaseResolution(),
+): boolean {
   if (!isLiveDerivedBase(resolution)) return false;
-  // AND IT MUST BE THE TREE WE FROZE. Asking only "is the CURRENT resolution
-  // live-derived?" answers a question about now, while the directory we are
-  // about to mutate was chosen earlier — so a retarget in between would let a
-  // live-derived answer about server B bless a mutation of server A's tree,
-  // which is precisely the wrong-tree swap this gate exists to stop. The two
-  // must be the same directory.
-  const frozen = pinnedBaseOf(deps) ?? deps.comfyuiPath();
-  return !!frozen && !!resolution?.base && samePathCI(frozen, resolution.base, deps);
+  return !!tree && !!resolution?.base && samePathCI(tree, resolution.base, deps);
 }
 
 async function updateViaRegistryZipReinstall(opts: {

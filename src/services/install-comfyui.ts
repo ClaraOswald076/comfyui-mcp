@@ -121,16 +121,24 @@ function defaultHasCommand(cmd: string): boolean {
 }
 
 function defaultIsNonEmptyDir(p: string): boolean {
+  // Three answers, because the caller's never-clobber guard reads `false` as
+  // "safe to install here". There is NO existsSync pre-screen: it cannot tell
+  // "absent" from "cannot look", and folding an unreadable target into
+  // "empty/absent" would wave the installer into a directory it may be about
+  // to clobber. Only a proven-absent (ENOENT) target is empty.
   try {
-    if (!existsSync(p)) return false;
     const st = statSync(p);
     if (!st.isDirectory()) {
       // A file occupying the target path is also a conflict.
       return true;
     }
     return readdirSync(p).length > 0;
-  } catch {
-    return false;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return false;
+    throw new ValidationError(
+      `Could not inspect the target path ${p}: ${err instanceof Error ? err.message : String(err)}. ` +
+        `Refusing to install into a directory whose contents cannot be checked — it may not be empty.`,
+    );
   }
 }
 
