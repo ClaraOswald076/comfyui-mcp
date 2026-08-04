@@ -1865,19 +1865,29 @@ export type McpEnvRestartOutcome = "applied" | "scheduled" | "no-agent";
 
 /** Per-outcome counts across every live agent for one env change. */
 export interface McpEnvRestartTally {
+  /** Sessions that were genuinely live — i.e. actually classified as applied or
+   *  scheduled. Counted from the OUTCOMES, not from the map size: a key can be
+   *  mapped to an already-stopped agent, and reporting "of 1 live" when zero
+   *  sessions existed overstates the work (codex gate, round 1, finding 6). */
   live: number;
   applied: number;
   scheduled: number;
 }
 
-/** Fold one agent's outcome into a tally. "no-agent" counts as neither — an
- *  agent that vanished between the key snapshot and the apply was NOT respawned,
- *  and must not inflate "applied" (which would report work that never happened)
- *  nor "scheduled" (which would promise work nothing will do). Exported so that
- *  third state is directly testable; it is otherwise only reachable via a race. */
+/** Fold one agent's outcome into a tally. "no-agent" counts as NOTHING — an
+ *  agent that was already stopped, or vanished between the key snapshot and the
+ *  apply, was not respawned and nothing will respawn it; it must inflate neither
+ *  "applied" (work that never happened), nor "scheduled" (work nothing will do),
+ *  nor "live". Exported so that third state is directly testable; it is
+ *  otherwise only reachable via a stopped-but-still-mapped agent. */
 export function tallyRestart(tally: McpEnvRestartTally, outcome: McpEnvRestartOutcome): void {
-  if (outcome === "applied") tally.applied++;
-  else if (outcome === "scheduled") tally.scheduled++;
+  if (outcome === "applied") {
+    tally.applied++;
+    tally.live++;
+  } else if (outcome === "scheduled") {
+    tally.scheduled++;
+    tally.live++;
+  }
 }
 
 /** Owns one PanelAgent per tab id, spawned lazily on the tab's first message. */
@@ -2048,7 +2058,7 @@ export class PanelAgentManager {
     // (spawn + retire) while we iterate, and mutating a Map during its own
     // iteration is how a tab silently gets skipped.
     const keys = [...this.agents.keys()];
-    const tally: McpEnvRestartTally = { live: keys.length, applied: 0, scheduled: 0 };
+    const tally: McpEnvRestartTally = { live: 0, applied: 0, scheduled: 0 };
     for (const tabId of keys) {
       // A SILENT env respawn (no nudge) must NOT downgrade a tab that already has
       // a retry nudge queued (#164): a concurrent env change on another tab, or a

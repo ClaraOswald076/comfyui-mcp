@@ -335,7 +335,8 @@ export function registerSkillsAccessTools(server: McpServer): void {
               {
                 type: "text" as const,
                 text: parsedOk
-                  ? `ComfyUI returned ${res.status} for /api/workflow_templates. Is the server running and recent enough to expose workflow templates?`
+                  ? `ComfyUI returned ${res.status} for /api/workflow_templates, with this JSON body: ${body.replace(/\s+/g, " ").trim().slice(0, 200)}. ` +
+                    `If the body is a ComfyUI error, the server may predate the workflow-templates endpoint; if it is a gateway's own error envelope, the request never reached ComfyUI.`
                   : classifyNonJson({ url, status: res.status, contentType, body }).message,
               },
             ],

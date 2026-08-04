@@ -79,6 +79,12 @@ function looksLikeLoginPage(body: string): boolean {
   );
 }
 
+/** Does this HTML actually carry ComfyUI's own frontend markers? Only then may
+ *  we name the frontend as the responder rather than listing candidates. */
+function looksLikeComfyFrontend(body: string): boolean {
+  return /<title>[^<]*comfyui/i.test(body) || /\bid=["']?vue-app\b/i.test(body) || /comfyui[.-]frontend/i.test(body);
+}
+
 function looksLikeProxyErrorPage(body: string): boolean {
   return /\b(bad gateway|gateway time-?out|service unavailable|nginx|cloudflare|traefik|haproxy|envoy)\b/i.test(
     body,
@@ -114,8 +120,15 @@ export function classifyNonJson(args: {
     cause = "whatever is answering this host does not serve that route at all";
   } else if (html) {
     kind = "html-page";
-    cause =
-      "the ComfyUI web frontend (or a proxy's catch-all) served its index.html for this path instead of routing it to the ComfyUI HTTP API — the usual cause is a reverse proxy that forwards the UI but not the API routes, or a base URL that points at a front end rather than at ComfyUI";
+    // Do NOT assert which HTML this is. A generic 2xx HTML body is consistent
+    // with the ComfyUI frontend's SPA catch-all, a reverse proxy that forwards
+    // the UI but not the API routes, a maintenance page, a WAF, or an unrelated
+    // web app on this host — and nothing in the response singles one out (codex
+    // gate, round 1, finding 4). List the candidates; name one only when the
+    // body actually carries ComfyUI's own frontend markers.
+    cause = looksLikeComfyFrontend(body)
+      ? "the ComfyUI web FRONTEND answered this path (its markers are in the body) instead of the ComfyUI HTTP API — typically a reverse proxy that forwards the UI but not the API routes, or a base URL pointing at the frontend's catch-all"
+      : "some HTTP responder other than the ComfyUI JSON API answered this path; this body alone does not identify which. The usual candidates are the ComfyUI frontend's SPA catch-all, a reverse proxy that forwards the UI but not the API routes, a maintenance/WAF page, or an unrelated web app on this host";
   } else {
     kind = "not-json";
     cause = "the response body is not JSON at all";
@@ -210,12 +223,16 @@ export async function fetchComfyJson<T = unknown>(
  */
 export function looksLikeHtmlParsedAsJson(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
-  return (
-    /Unexpected token\s+'?</.test(msg) ||
+  // Require a MARKUP indicator, not merely "is not valid JSON" (codex gate,
+  // round 1, finding 5): a bare JSON-syntax complaint can come from a truncated
+  // or malformed JSON body, and triggering a speculative re-probe on it risks
+  // replacing a truthful error with one about a DIFFERENT, later response.
+  const markup = msg.includes("<");
+  const jsonSyntax =
     /is not valid JSON/.test(msg) ||
-    /<!DOCTYPE/i.test(msg) ||
-    /Unexpected token .* in JSON at position/.test(msg)
-  );
+    /in JSON at position/.test(msg) ||
+    /Unexpected token/.test(msg);
+  return markup && jsonSyntax;
 }
 
 /**
@@ -250,7 +267,20 @@ export async function diagnoseComfyEndpoint(url: string): Promise<NonJsonDiagnos
 export async function rethrowWithJsonDiagnosis(err: unknown, url: string): Promise<never> {
   if (looksLikeHtmlParsedAsJson(err)) {
     const diagnosis = await diagnoseComfyEndpoint(url);
-    if (diagnosis) throw new NonJsonResponseError(diagnosis);
+    if (diagnosis) {
+      // The probe is a SEPARATE, later request — it does not prove it saw the
+      // same response that failed. Say so, keep the original message, and chain
+      // the original as `cause`, so a transient change between the two requests
+      // cannot silently rewrite a truthful error into a speculative one (codex
+      // gate, round 1, finding 5).
+      const original = err instanceof Error ? err.message : String(err);
+      throw new NonJsonResponseError({
+        ...diagnosis,
+        message:
+          `The request failed while parsing the response as JSON: ${original} ` +
+          `A follow-up probe of ${url} — a separate request, so not necessarily the same response — found: ${diagnosis.message}`,
+      });
+    }
   }
   throw err;
 }

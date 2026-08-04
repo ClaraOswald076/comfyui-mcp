@@ -119,22 +119,24 @@ describe("restartForMcpEnv reports what it actually did (#826)", () => {
 });
 
 describe("tallyRestart: an agent that vanished counts as NEITHER (#826)", () => {
-  it("counts 'applied' as applied and nothing else", () => {
-    const t = { live: 1, applied: 0, scheduled: 0 };
+  it("counts 'applied' as applied, and as one live session", () => {
+    const t = { live: 0, applied: 0, scheduled: 0 };
     tallyRestart(t, "applied");
     expect(t).toEqual({ live: 1, applied: 1, scheduled: 0 });
   });
 
-  it("counts 'scheduled' as scheduled and nothing else", () => {
-    const t = { live: 1, applied: 0, scheduled: 0 };
+  it("counts 'scheduled' as scheduled, and as one live session", () => {
+    const t = { live: 0, applied: 0, scheduled: 0 };
     tallyRestart(t, "scheduled");
     expect(t).toEqual({ live: 1, applied: 0, scheduled: 1 });
   });
 
-  it("counts 'no-agent' as neither — a vanished agent was not respawned and nothing will respawn it", () => {
-    const t = { live: 1, applied: 0, scheduled: 0 };
+  it("counts 'no-agent' as NOTHING — not applied, not scheduled, and not live", () => {
+    // A key can be mapped to an already-stopped agent. Reporting "of 1 live"
+    // when zero sessions existed overstates the work the save set in motion.
+    const t = { live: 0, applied: 0, scheduled: 0 };
     tallyRestart(t, "no-agent");
-    expect(t).toEqual({ live: 1, applied: 0, scheduled: 0 });
+    expect(t).toEqual({ live: 0, applied: 0, scheduled: 0 });
   });
 });
 

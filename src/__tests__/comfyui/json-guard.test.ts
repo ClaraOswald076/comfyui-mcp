@@ -13,12 +13,13 @@
 // reported as HTML, and a valid-JSON-but-wrong-document 200 is reported as such
 // instead of being handed on as data.
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   classifyNonJson,
   isNonJsonResponseError,
   looksLikeHtmlParsedAsJson,
   readComfyJson,
+  rethrowWithJsonDiagnosis,
 } from "../../comfyui/json-guard.js";
 
 const URL_UNDER_TEST = "http://remote.example:8188/api/workflow_templates";
@@ -31,18 +32,36 @@ function res(body: string, init: { status?: number; contentType?: string } = {})
 }
 
 describe("classifyNonJson names what answered instead of ComfyUI (#828)", () => {
-  it("calls a 2xx HTML document the frontend/proxy catch-all, not a dead server", () => {
+  it("names the ComfyUI FRONTEND only when the body carries its markers", () => {
     const d = classifyNonJson({
       url: URL_UNDER_TEST,
       status: 200,
       contentType: "text/html; charset=utf-8",
-      body: "<!DOCTYPE html><html><head><title>ComfyUI</title></head><body><div id=app></div></body></html>",
+      body: "<!DOCTYPE html><html><head><title>ComfyUI</title></head><body><div id='vue-app'></div></body></html>",
     });
     expect(d.kind).toBe("html-page");
-    expect(d.message).toContain("index.html");
+    expect(d.message).toContain("ComfyUI web FRONTEND answered");
     expect(d.message).toContain("reverse proxy");
     // It must NOT accuse the server of being down/unreachable — it answered.
     expect(d.message).not.toMatch(/unreachable|not running|could not reach/i);
+  });
+
+  it("does NOT name a responder for generic HTML — it lists candidates instead", () => {
+    // Nothing in a bare HTML body singles out the frontend, a proxy, a
+    // maintenance page or an unrelated app. A confident wrong diagnosis costs
+    // more than an honest "this does not identify which".
+    const d = classifyNonJson({
+      url: URL_UNDER_TEST,
+      status: 200,
+      contentType: "text/html",
+      body: "<!DOCTYPE html><html><body><h1>Site under maintenance</h1></body></html>",
+    });
+    expect(d.kind).toBe("html-page");
+    expect(d.message).toContain("does not identify which");
+    expect(d.message).not.toContain("ComfyUI web FRONTEND answered");
+    // The candidates are still listed, so the message stays actionable.
+    expect(d.message).toContain("reverse proxy");
+    expect(d.message).toContain("maintenance");
   });
 
   it("calls a 401/403 an authentication gate and points the credential at the GATEWAY", () => {
@@ -223,5 +242,70 @@ describe("looksLikeHtmlParsedAsJson recognises a library's own parse failure (#8
   it("does NOT match an unrelated transport failure — that must keep its own message", () => {
     expect(looksLikeHtmlParsedAsJson(new Error("fetch failed"))).toBe(false);
     expect(looksLikeHtmlParsedAsJson(new Error("ECONNREFUSED 127.0.0.1:8188"))).toBe(false);
+  });
+
+  it("does NOT match a JSON-syntax error with no MARKUP in it", () => {
+    // A truncated or malformed JSON body is a real, truthful error. Treating it
+    // as "probably HTML" would fire a speculative second request and let a
+    // LATER, different response rewrite the diagnosis.
+    expect(
+      looksLikeHtmlParsedAsJson(new SyntaxError("Unterminated string in JSON at position 42")),
+    ).toBe(false);
+    expect(looksLikeHtmlParsedAsJson(new SyntaxError("Unexpected end of JSON input"))).toBe(false);
+    expect(
+      looksLikeHtmlParsedAsJson(new SyntaxError(`Unexpected token 'x', "xyz" is not valid JSON`)),
+    ).toBe(false);
+  });
+});
+
+describe("rethrowWithJsonDiagnosis never asserts a cause it did not prove (#828)", () => {
+  const ORIGINAL = new SyntaxError(`Unexpected token '<', "<!DOCTYPE "... is not valid JSON`);
+  const PROBE_URL = "http://remote.example:8188/object_info";
+
+  it("keeps the ORIGINAL message and marks the probe as a separate request", async () => {
+    global.fetch = vi.fn(
+      async () =>
+        new Response("<!DOCTYPE html><html></html>", {
+          status: 200,
+          headers: { "content-type": "text/html" },
+        }),
+    ) as unknown as typeof fetch;
+
+    await expect(rethrowWithJsonDiagnosis(ORIGINAL, PROBE_URL)).rejects.toSatisfy((e: unknown) => {
+      if (!isNonJsonResponseError(e)) return false;
+      return (
+        e.message.includes(ORIGINAL.message) &&
+        e.message.includes("not necessarily the same response")
+      );
+    });
+  });
+
+  it("rethrows the ORIGINAL untouched when the probe is inconclusive", async () => {
+    // The endpoint answers JSON now, so we cannot claim the earlier body was
+    // HTML — the truthful original error must survive unchanged.
+    global.fetch = vi.fn(
+      async () =>
+        new Response('{"ok":true}', {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    ) as unknown as typeof fetch;
+
+    await expect(rethrowWithJsonDiagnosis(ORIGINAL, PROBE_URL)).rejects.toBe(ORIGINAL);
+  });
+
+  it("rethrows the ORIGINAL untouched when the probe itself fails", async () => {
+    global.fetch = vi.fn(async () => {
+      throw new Error("fetch failed");
+    }) as unknown as typeof fetch;
+    await expect(rethrowWithJsonDiagnosis(ORIGINAL, PROBE_URL)).rejects.toBe(ORIGINAL);
+  });
+
+  it("does not probe at all for an error that is not markup-parsed-as-JSON", async () => {
+    const spy = vi.fn();
+    global.fetch = spy as unknown as typeof fetch;
+    const transport = new Error("fetch failed");
+    await expect(rethrowWithJsonDiagnosis(transport, PROBE_URL)).rejects.toBe(transport);
+    expect(spy).not.toHaveBeenCalled();
   });
 });
