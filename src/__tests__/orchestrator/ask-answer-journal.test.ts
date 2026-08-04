@@ -62,6 +62,10 @@ function strandEvictionDebt(): void {
   AskAnswers.record("pa-live", "dpmpp_2m", { tabId: TAB }); // still awaiting -> "none"
 }
 
+/** The agent instance the test's turns belong to. The journal refuses an ack
+ *  from anything else, so tests have to name who is acking. */
+const TURN = "pa-test-turn";
+
 /** An ordinary successful ask: answered, handed back in a tool result, and the
  *  turn that carried it produced its own result — the ACK. This is the common
  *  path, and the only one allowed to be forgotten quietly. */
@@ -78,13 +82,14 @@ function ordinaryAckedAsk(
   const token = AskAnswers.record(askId, answer, { tabId: TAB }).token;
   AskAnswers.markReturned(token);
   AskAnswers.closeAsk(askId);
-  AskAnswers.ack(token); // the turn's own result landed
+  AskAnswers.ack(token, { carrier: TURN }); // the turn's own result landed
 }
 
 beforeEach(() => {
   AskAnswers.reset();
   AskAnswers.setFlusher(() => {});
   AskAnswers.setRevoker(() => false); // nothing queued unless a test says so
+  AskAnswers.setTurnAttacher(() => TURN); // a live turn, unless a test says otherwise
 });
 
 describe("ask-answer journal — an answer survives its tool call (#486)", () => {
@@ -486,7 +491,7 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     const carried: string[] = [];
     AskAnswers.setTurnAttacher((_key, token) => {
       carried.push(token);
-      return true;
+      return TURN;
     });
     AskAnswers.openAsk("pa-attach", {
       tabId: TAB,
@@ -495,7 +500,7 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     });
     const token = AskAnswers.markReturnedForTest("pa-attach", "dpmpp_2m", TAB);
     expect(carried).toEqual([token]);
-    AskAnswers.setTurnAttacher(() => false);
+    expect(AskAnswers.entriesFor(TAB)[0].carrier).toBe(TURN);
   });
 
   it("a trimmed TICKET can only weaken a correlation, never drop the answer", () => {
@@ -646,7 +651,7 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     expect(owed).toBeGreaterThan(0);
 
     // No live turn to ride: nothing is retired, however many results carry it.
-    AskAnswers.setTurnAttacher(() => false);
+    AskAnswers.setTurnAttacher(() => null);
     for (let i = 0; i < 10; i += 1) expect(AskAnswers.reportDropped(TAB)).toBe(owed);
     expect(AskAnswers.hasOutstanding()).toBe(true);
 
@@ -654,20 +659,20 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     const tokens: string[] = [];
     AskAnswers.setTurnAttacher((_key, token) => {
       tokens.push(token);
-      return true;
+      return TURN;
     });
     expect(AskAnswers.reportDropped(TAB)).toBe(owed);
     AskAnswers.release(tokens[0], { carried: true });
     // …and a turn that HANDED THE WARNING BACK can never settle it afterwards:
     // its token is spent, so a late ack for it must be a no-op rather than a
     // retroactive claim that the tab was told.
-    AskAnswers.ack(tokens[0]);
+    AskAnswers.ack(tokens[0], { carrier: TURN });
     expect(AskAnswers.droppedFor(TAB)).toBe(owed);
     expect(AskAnswers.reportDropped(TAB)).toBe(owed);
     expect(AskAnswers.droppedFor(TAB)).toBe(owed);
 
     // …and only that turn's own result settles it.
-    AskAnswers.ack(tokens[tokens.length - 1]);
+    AskAnswers.ack(tokens[tokens.length - 1], { carrier: TURN });
     expect(AskAnswers.droppedFor(TAB)).toBe(0);
     expect(AskAnswers.reportDropped(TAB)).toBe(0);
     expect(AskAnswers.outstandingDebt().some((x) => x.key === TAB)).toBe(false);
@@ -778,9 +783,16 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     AskAnswers.closeAsk("pa-ask-1");
     expect(AskAnswers.hasOutstanding()).toBe(false); // restarts are not stalled
     expect(AskAnswers.allOutstanding().map((e) => e.answer)).toContain("dpmpp_2m");
-    // …and once it is far outside the recovery window there is nothing left to
-    // claim, so it stops being reported.
-    AskAnswers.entriesFor(TAB)[0].answeredAt = Date.now() - ASK_RECOVER_MAX_AGE_MS * 2;
+    // Coordinator gate P0-1: it stays reported NO MATTER HOW OLD it is. An
+    // earlier draft dropped it out of the exit disclosure once the recovery
+    // window lapsed, which quietly undid the whole returned/acked split — past
+    // ten minutes the answer was neither pending nor debt-bearing, so a fatal
+    // exit said nothing at all. Unacked means unproven, and time does not turn
+    // unproven into delivered.
+    AskAnswers.entriesFor(TAB)[0].answeredAt = Date.now() - ASK_RECOVER_MAX_AGE_MS * 100;
+    expect(AskAnswers.allOutstanding().map((e) => e.answer)).toContain("dpmpp_2m");
+    // …and the moment it IS proven read, it stops being news.
+    AskAnswers.ack(AskAnswers.entriesFor(TAB)[0].token, { carrier: TURN });
     expect(AskAnswers.allOutstanding()).toHaveLength(0);
   });
 
@@ -964,6 +976,13 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     expect(src).toContain("AskAnswers.setFlusher(");
     expect(src).toContain("AskAnswers.setTurnAttacher(");
     expect(src).toContain("manager.attachTurnToken(");
+    // …and the debt's lifecycle end must be wired, or removing its ceiling just
+    // trades a silent loss for unbounded growth.
+    expect(src).toContain("bridge.setTabGoneListener(");
+    expect(src).toContain("AskAnswers.retireDebt(");
+    // The ack must carry WHO is acking, or a switched provider can certify the
+    // previous conversation's answer.
+    expect(src).toMatch(/AskAnswers\.ack\(token, from\)/);
 
     // The fatal-exit disclosure must keep RENDERS and ANSWERS apart. A lost
     // answer is not a ComfyUI run and will NEVER be in history, so pointing the
@@ -1149,7 +1168,7 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     const carrier = AskAnswers.entriesFor(TAB).find((e) => (e.disclose ?? 0) > 0);
     expect(carrier).toBeDefined();
     AskAnswers.markSurfaced(carrier!.token); // a recovery handed it over
-    AskAnswers.ack(carrier!.token); // …and that turn completed
+    AskAnswers.ack(carrier!.token, { carrier: TURN }); // …and that turn completed
     expect(carrier!.acked).toBe(true); // now the preferred eviction victim
     // More answers arrive, all of them ACKED, so every eviction they cause takes
     // the quiet path and creates NO new debt — leaving the carrier's count as the
@@ -1232,6 +1251,38 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     expect(AskAnswers.reportDropped(FIRST)).toBe(still);
     expect(AskAnswers.hasOutstanding()).toBe(true);
     expect(AskAnswers.outstandingDebt().some((x) => x.key === FIRST && x.count > 0)).toBe(true);
+  });
+
+  // Coordinator gate P1-2: removing the ceiling was right, but a debt then needs
+  // a LIFECYCLE end or it accumulates for every temporary tab that never
+  // reconnects. It must end because it was SURFACED or its tab went away — never
+  // because a counter filled up and picked a victim.
+  it("a tab leaving the bridge surfaces and retires its debt, keeping its answers", () => {
+    strandEvictionDebt();
+    expect(AskAnswers.droppedFor(TAB)).toBeGreaterThan(0);
+    const answersBefore = AskAnswers.entriesFor(TAB).length;
+    expect(answersBefore).toBeGreaterThan(0);
+
+    AskAnswers.retireDebt(TAB); // what the bridge's tab-gone listener calls
+
+    expect(AskAnswers.droppedFor(TAB)).toBe(0);
+    expect(AskAnswers.outstandingDebt().some((x) => x.key === TAB)).toBe(false);
+    // A disconnect is usually a reload — the ANSWERS are still deliverable.
+    expect(AskAnswers.entriesFor(TAB)).toHaveLength(answersBefore);
+  });
+
+  it("debt does not accumulate across many short-lived tabs", () => {
+    // Each short-lived tab strands a debt and then goes away. ONLY the tab-gone
+    // wire may clear it — no `forget`, no ceiling — so if the wire is missing the
+    // map grows without limit, which is the cost of removing the ceiling.
+    for (let t = 0; t < 300; t += 1) {
+      const tab = `tab-ephemeral-${t}`;
+      AskAnswers.noteDroppedForTest(tab, 1);
+      AskAnswers.retireDebt(tab);
+    }
+    expect(AskAnswers.outstandingDebt()).toHaveLength(0);
+    expect(AskAnswers.droppedFor("tab-ephemeral-0")).toBe(0);
+    expect(AskAnswers.droppedFor("tab-ephemeral-299")).toBe(0);
   });
 
   it("never throws when the flusher does", () => {

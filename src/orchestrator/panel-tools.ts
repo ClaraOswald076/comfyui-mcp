@@ -2261,7 +2261,7 @@ async function userdataFetch(route: string): Promise<Response> {
  * earlier).
  *
  * Only the literal lowercase FORWARD-slash spelling counts (codex MAJOR). ComfyUI
- * store keys are always "/"-separated and lowercase here, so `workflowsoo.json`
+ * store keys are always "/"-separated and lowercase here, so `workflows\foo.json`
  * and `WORKFLOWS/foo.json` are ordinary names — a real subfolder on a
  * case-sensitive host, or a legal literal filename on POSIX — and stripping either
  * would rewrite a request into one for a different graph.
@@ -2284,7 +2284,7 @@ const stripLibraryPrefix = (key: string): string => key.replace(/^workflows\//, 
  * subfolder matches only that exact path.
  *
  * Path separators are deliberately NOT folded (codex MAJOR): on POSIX a file
- * literally named `diroo.json` is a DIFFERENT file from `dir/foo.json`. Case is
+ * literally named `dir\foo.json` is a DIFFERENT file from `dir/foo.json`. Case is
  * not folded either, for the same reason. Both are reported as near misses instead.
  */
 const matchName = (name: string): string => name.normalize("NFC");

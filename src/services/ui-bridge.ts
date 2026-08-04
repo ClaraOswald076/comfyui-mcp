@@ -901,6 +901,8 @@ export class UiBridge {
    * caller required — after which it is durable and can be replayed or pushed.
    */
   private lateAskSink: ((askId: string, result: unknown, tabId: string) => void) | null = null;
+  /** See setTabGoneListener. */
+  private onTabGone: ((tabId: string) => void) | null = null;
   /** Buffered late-but-valid ask_user answers (ask_id → result), drained by the
    *  caller via takeLateAskReply(). Bounded by a short TTL — a stale unclaimed
    *  answer is pruned rather than kept forever. */
@@ -1657,6 +1659,17 @@ export class UiBridge {
           if (drivenTab === tabId) this.mirrorViewers.delete(s);
         }
         this.subscribers.delete(tabId);
+        // #486 — the tab is off the map. Anything holding per-tab state it can
+        // only ever hand to THIS tab needs to know now, while the count is still
+        // known, rather than accumulating a record for a tab that may never come
+        // back. Never let a listener's fault break the disconnect path.
+        try {
+          this.onTabGone?.(tabId);
+        } catch (err) {
+          logger.warn(
+            `[ui-bridge] tab-gone listener threw for ${tabId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
         logger.info(
           `[ui-bridge] panel tab disconnected: ${tabId.slice(0, 8)} — ${this.conns.size} tab(s) remain`,
         );
@@ -1950,6 +1963,14 @@ export class UiBridge {
    *  (#486). Called once at orchestrator start-up. */
   setLateAskReplySink(sink: (askId: string, result: unknown, tabId: string) => void): void {
     this.lateAskSink = sink;
+  }
+
+  /** Notified when a tab's PRIMARY connection is dropped and it leaves the
+   *  connection map (#486). Lets per-tab bookkeeping that can only ever be
+   *  delivered to that tab be surfaced and retired, instead of accumulating for
+   *  a tab that may never reconnect. */
+  setTabGoneListener(listener: (tabId: string) => void): void {
+    this.onTabGone = listener;
   }
 
   takeLateAskReply(askId: string): unknown | undefined {

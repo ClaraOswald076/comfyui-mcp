@@ -235,7 +235,9 @@ export interface PanelAgentDeps {
   onSeen?: (tabId: string, mid: string) => void;
   /** #468 — the turn CARRYING these run-completion journal tokens ended, so the
    *  completions genuinely reached the agent. The journal drops them. */
-  onEventDelivered?: (tabId: string, tokens: string[]) => void;
+  /** #486 — `carrier` identifies the AGENT INSTANCE whose turn carried these
+   *  tokens, so a journal can refuse an ack from anything else. */
+  onEventDelivered?: (tabId: string, tokens: string[], from?: { carrier?: string }) => void;
   /** #468 — these run-completion journal tokens are being handed BACK for replay.
    *  `carried` true means a turn actually DISPATCHED with them and then ended
    *  (the agent read the text; only its ack couldn't be proven) — the journal
@@ -264,6 +266,17 @@ export class PanelAgent {
    *  pushes, sessionStore persistence, the bound panel MCP server) keeps addressing
    *  the DEAD pre-migration tab (#568 Defect 1). */
   tabId: string;
+  /**
+   * Identity of THIS agent object, for the whole of its life (#486).
+   *
+   * Deliberately independent of `tabId`: a tab-id migration re-keys the same
+   * conversation and must NOT invalidate an ack, while a provider switch builds a
+   * NEW agent — which is exactly the case that must not be able to certify the
+   * previous conversation's answer. The instance is the thing that distinguishes
+   * those two, so the carrier identity is the instance and nothing else.
+   */
+  private static instanceSeq = 0;
+  readonly carrierId = `pa${++PanelAgent.instanceSeq}`;
   private deps: PanelAgentDeps;
   /** The injected provider adapter (Claude today). PanelAgent owns the queue,
    *  turn-gate, rewind tracking and self-restart; the backend owns the SDK call,
@@ -1665,7 +1678,7 @@ export class PanelAgent {
             (typeof ev.turn === "number" && ev.turn === this.turnEventTokensMarker);
           if (ackable) {
             try {
-              this.deps.onEventDelivered?.(this.tabId, carried);
+              this.deps.onEventDelivered?.(this.tabId, carried, { carrier: this.carrierId });
             } catch (err) {
               logger.warn(`[panel-agent ${this.short()}] acking completion tokens: ${msgOf(err)}`);
             }
@@ -1812,7 +1825,9 @@ export interface PanelAgentManagerOptions {
   onAgentFatal?: (tabId: string, reason: string) => void;
   /** #468 — a turn carrying these run-completion journal tokens ENDED, so the
    *  completions genuinely reached the agent. Forwarded verbatim from the agent. */
-  onEventDelivered?: (tabId: string, tokens: string[]) => void;
+  /** #486 — `carrier` identifies the AGENT INSTANCE whose turn carried these
+   *  tokens, so a journal can refuse an ack from anything else. */
+  onEventDelivered?: (tabId: string, tokens: string[], from?: { carrier?: string }) => void;
   /** #468 — these run-completion journal tokens came back UNDELIVERED (agent
    *  stopped, turn abandoned, injection refused). Re-arm them for replay.
    *  `carried` true = a turn ran with them and ended (the agent read the text,
@@ -2173,12 +2188,22 @@ export class PanelAgentManager {
     return agent.revokeEvent(token);
   }
 
-  /** Ride a journal token on the tab's IN-FLIGHT turn so that turn's result acks
-   *  it (#486). False when no agent or no turn is running. */
-  attachTurnToken(tabId: string, token: string): boolean {
+  /**
+   * Ride a journal token on the tab's IN-FLIGHT turn so that turn's result acks
+   * it (#486).
+   *
+   * Returns the CARRIER IDENTITY the token was attached to — the agent key plus
+   * that agent's instance identity — or null when there is no agent or no turn
+   * running. The caller freezes it onto the entry and the journal refuses any
+   * ack that does not match, so a provider switch (which re-points the tab at a
+   * different agent) can never let one conversation's turn certify another's
+   * answer.
+   */
+  attachTurnToken(tabId: string, token: string): string | null {
     const agent = this.agents.get(tabId);
-    if (!agent || agent.isStopped) return false;
-    return agent.attachTurnToken(token);
+    if (!agent || agent.isStopped) return null;
+    if (!agent.attachTurnToken(token)) return null;
+    return agent.carrierId;
   }
 
   /** Push a ComfyUI execution error to a tab's agent — interrupt the live turn

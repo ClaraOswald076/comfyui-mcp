@@ -2062,8 +2062,8 @@ export async function runPanelOrchestrator(): Promise<void> {
     // #468 — run-completion journal acks. `key` is the composite agent key; the
     // journal is keyed by the PANEL TAB, so a provider switch (which retires
     // `tab::old` and spawns `tab::new`) can never strand a completion.
-    onEventDelivered: (_key, tokens) => {
-      for (const token of tokens) ackEventToken(token);
+    onEventDelivered: (_key, tokens, from) => {
+      for (const token of tokens) ackEventToken(token, from);
     },
     onEventUndelivered: (key, tokens, opts) => {
       for (const token of tokens) releaseEventToken(token, opts?.carried === true);
@@ -2136,6 +2136,11 @@ export async function runPanelOrchestrator(): Promise<void> {
   AskAnswers.setTurnAttacher((panelTabId, token) =>
     manager.attachTurnToken(agentKeyFor(panelTabId), token),
   );
+  // #486 — the debt map has no ceiling (a bounded store must not decide whether a
+  // warning is owed), so it needs a LIFECYCLE end instead: a tab leaving the
+  // bridge's connection map surfaces whatever it is still owed and retires it.
+  // Journal entries survive — a disconnect is usually a reload.
+  bridge.setTabGoneListener((tabId) => AskAnswers.retireDebt(tabId));
   bridge.setLateAskReplySink((askId, result, tabId) => {
     if (!AskAnswers.tracks(askId)) return;
     const entry = AskAnswers.record(askId, result, { tabId });
@@ -2335,8 +2340,11 @@ export async function runPanelOrchestrator(): Promise<void> {
    * both ignore an unknown token — but routing it correctly is what keeps an ack
    * from leaving the real entry outstanding forever.
    */
-  function ackEventToken(token: string): void {
-    if (token.startsWith("aa")) AskAnswers.ack(token);
+  function ackEventToken(token: string, from?: { carrier?: string }): void {
+    // #486 — the ask journal verifies WHICH agent instance is acking, so a
+    // provider switch cannot let the new conversation certify the old one's
+    // answer. Run completions have their own turn-marker gate and need none.
+    if (token.startsWith("aa")) AskAnswers.ack(token, from);
     else RunCompletions.ack(token);
   }
   function releaseEventToken(token: string, carried: boolean): void {

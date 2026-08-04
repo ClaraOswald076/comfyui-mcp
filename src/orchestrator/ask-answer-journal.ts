@@ -191,6 +191,18 @@ export interface AskEntry {
    * answer quietly.
    */
   acked?: boolean;
+  /**
+   * WHICH agent's turn is carrying this answer, captured at the instant it was
+   * handed back and never re-resolved. `null` when there was no live turn to
+   * ride (so nothing can ever ack it).
+   *
+   * The identity has to be frozen because the tab→agent mapping MOVES: a
+   * provider switch retires the old agent and re-points the tab at a new one. An
+   * ack that asked "who owns this tab now?" would let the new provider's turn
+   * settle an answer that belonged to the old conversation — an answer the new
+   * conversation never saw, marked proven-read and therefore silently evictable.
+   */
+  carrier?: string | null;
   delivery: AskDeliveryState;
   attempts: number;
   /** How many turns carried this answer and then ended without a provable ack. */
@@ -381,15 +393,16 @@ export class AskAnswerJournalImpl {
    *  reportDropped(). */
   /** Outstanding eviction-disclosure tokens: token -> panel tab. Retired only
    *  by the ack of the turn that carried the warning (see reportDropped). */
-  private debtTokens = new Map<string, string>();
+  private debtTokens = new Map<string, { key: string; carrier: string | null }>();
   private seq = 0;
   private ticketSeq = 0;
   /** Deliver a tab's newly-orphaned answers (see setFlusher). */
   private flush: ((key: string) => void) | null = null;
   /** Pull a still-queued answer event back off its agent (see setRevoker). */
   private revoke: ((key: string, token: string) => boolean) | null = null;
-  /** Ride a token on the tab's in-flight turn (see setTurnAttacher). */
-  private attachTurn: ((key: string, token: string) => boolean) | null = null;
+  /** Ride a token on the tab's in-flight turn, returning the CARRIER IDENTITY it
+   *  attached to (null when there was no live turn). See setTurnAttacher. */
+  private attachTurn: ((key: string, token: string) => string | null) | null = null;
 
   /**
    * Wire the push channel (#486).
@@ -428,7 +441,7 @@ export class AskAnswerJournalImpl {
    * lands (the model ran to completion after receiving the answer), or it never
    * does and the answer stays accounted for.
    */
-  setTurnAttacher(attach: (key: string, token: string) => boolean): void {
+  setTurnAttacher(attach: (key: string, token: string) => string | null): void {
     this.attachTurn = attach;
   }
 
@@ -687,17 +700,35 @@ export class AskAnswerJournalImpl {
 
   /** The ask handler put this answer into its ToolResult. A hand-off, not proof
    *  of consumption — see AskEntry.returned. */
-  markReturned(token: string): void {
+  markReturned(token: string, opts: { replay?: boolean } = {}): void {
     // BY TOKEN, not by ask id: under a reused id one ask id can own two entries,
     // and marking the sibling returned would quietly retire an answer nobody has
     // been given.
     const entry = this.entries.get(token);
     if (entry) {
       entry.returned = true;
+      if (opts.replay) entry.replayHint = true;
       // Ride the turn this tool call is running inside, so that turn's result —
       // and nothing less — acks the answer. No live turn to ride means no proof,
       // so the answer simply stays unacked, which is the conservative reading.
-      this.attachTurn?.(entry.key, token);
+      //
+      // THE CARRIER IS CAPTURED HERE, at the instant of return, and frozen onto
+      // the entry. Resolving it later from "whoever owns this tab now" is how a
+      // switched provider's turn could ack an answer it never saw: a stale
+      // pre-switch ask handler resumes, attaches to the NEW provider's turn, and
+      // that turn's result settles an answer the new conversation was never
+      // shown. `ack` compares against this, so only the turn that actually
+      // carried the answer can settle it.
+      //
+      // …and an answer whose CONVERSATION is gone never attaches at all. Capturing
+      // the carrier is not enough on its own here: a stale pre-switch ask handler
+      // that resumes when its card is clicked would attach to whatever turn is
+      // running NOW, and that turn's result would then certify — accurately, and
+      // uselessly — an answer the current conversation was never shown. The
+      // conversation boundary already marked this entry unrecoverable; it makes it
+      // unackable too, so the answer stays honestly unproven.
+      entry.carrier =
+        entry.recoverable === false ? null : (this.attachTurn?.(entry.key, token) ?? null);
       // It reached A caller. Do not ALSO push it as an orphan; a re-ask can
       // still recover it if that caller was already dead.
       //
@@ -772,8 +803,16 @@ export class AskAnswerJournalImpl {
     // only durable copy at exactly the moment it is most likely to be needed
     // again. It is marked handed-over and flagged, so a further re-ask of the
     // same question gets it again, labelled "you have seen this".
-    entry.returned = true;
-    entry.replayHint = true;
+    //
+    // IT GOES THROUGH markReturned, and must: a recovery hands the answer to a
+    // live turn exactly as a fresh answer does, so it has to attach a token and
+    // capture its carrier BY CONSTRUCTION. An earlier draft set the flags here
+    // by hand and forgot to attach — so a recovery that completed perfectly
+    // stayed unacked forever, aged into apparent loss, and eventually raised
+    // eviction debt and warnings despite the agent having read it. That is the
+    // routine-false-warning failure the ack split exists to prevent, arriving
+    // through a different door.
+    this.markReturned(token, { replay: true });
   }
 
   /** Every unconsumed ORPHAN answer for a tab — those that were never handed
@@ -810,8 +849,37 @@ export class AskAnswerJournalImpl {
     // its own result. No live turn to ride means no proof and no retirement — the
     // debt simply stands and the next result reports it again.
     const token = `aad${++this.seq}`;
-    if (this.attachTurn?.(key, token) === true) this.debtTokens.set(token, key);
+    const carrier = this.attachTurn?.(key, token) ?? null;
+    // Bound to the turn that carried it, for the same reason an answer is: a
+    // switched provider must not be able to certify a warning it never showed.
+    if (carrier !== null) this.debtTokens.set(token, { key, carrier });
     return owed;
+  }
+
+  /**
+   * The tab's connection is gone. SURFACE any disclosure it is still owed, then
+   * retire it.
+   *
+   * This is the lifecycle wire that keeps the debt map from growing forever now
+   * that it has no ceiling — and the distinction matters: a debt must end because
+   * it was SAID or because its tab genuinely went away, never because a counter
+   * filled up and picked a victim. The durable ERROR log is the disclosure here;
+   * there is no live tab left to tell in-band, which is precisely why keeping the
+   * counter any longer would be bookkeeping for nobody.
+   *
+   * JOURNAL ENTRIES ARE NOT TOUCHED. A disconnect is often a reload, and the
+   * answers themselves are still deliverable to the tab when it comes back; only
+   * the count of answers whose TEXT is already gone is retired.
+   */
+  retireDebt(key: string): void {
+    const owed = this.dropped.get(key) ?? 0;
+    if (owed > 0) {
+      logger.error(
+        `[ask-answers] tab ${key.slice(0, 8)} disconnected still owed a disclosure for ${owed} validated answer(s) whose content was already dropped — recording it here, as there is no longer anywhere to deliver it; treat those answers as UNDETERMINED`,
+      );
+    }
+    this.dropped.delete(key);
+    for (const [t, d] of [...this.debtTokens]) if (d.key === key) this.debtTokens.delete(t);
   }
 
   /** Answers this tab lost to an eviction and has not yet been told about. */
@@ -878,19 +946,31 @@ export class AskAnswerJournalImpl {
   }
 
   /** The turn that CARRIED this answer ended — it genuinely reached the agent. */
-  ack(token: string): void {
+  ack(token: string, from?: { carrier?: string }): void {
     // An eviction-DISCLOSURE token (see reportDropped): the turn that carried the
     // warning produced its result, so the tab has genuinely been told.
-    const debtKey = this.debtTokens.get(token);
-    if (debtKey !== undefined) {
+    const debt = this.debtTokens.get(token);
+    if (debt !== undefined) {
+      if (!this.carriedBy(debt.carrier, from)) return;
       this.debtTokens.delete(token);
-      this.dropped.delete(debtKey);
+      this.dropped.delete(debt.key);
       // Any other outstanding token for the same tab is now moot.
-      for (const [t, k] of [...this.debtTokens]) if (k === debtKey) this.debtTokens.delete(t);
+      for (const [t, d] of [...this.debtTokens]) if (d.key === debt.key) this.debtTokens.delete(t);
       return;
     }
     const entry = this.entries.get(token);
     if (!entry) return;
+    // ONLY THE TURN THAT ACTUALLY CARRIED IT may settle it. The carrier was
+    // frozen at hand-off (see AskEntry.carrier); a result arriving from anything
+    // else — most concretely, the NEW provider's turn after a switch moved the
+    // tab's agent mapping — proves nothing about this answer, so it is refused
+    // and the answer stays honestly unacked.
+    if (!this.carriedBy(entry.carrier, from)) {
+      logger.warn(
+        `[ask-answers] refusing an ack for the user's answer to "${preview(entry.question)}" from ${from?.carrier ?? "an unidentified turn"} — it was handed to ${entry.carrier ?? "no turn at all"}; the answer stays unconfirmed`,
+      );
+      return;
+    }
     // The push is done, but the ANSWER stays journaled while it is still within
     // the recovery window: a re-ask of the identical question must still be able
     // to return it as its result rather than making the user answer twice. It is
@@ -983,15 +1063,22 @@ export class AskAnswerJournalImpl {
    *    nothing and keeps the loss from being silent.
    */
   allOutstanding(): AskEntry[] {
-    const now = Date.now();
     return [...this.entries.values()].filter(
       (e) =>
         e.delivery !== "none" ||
         (e.disclose ?? 0) > 0 ||
-        // UNACKED only: an answer the agent provably read is not news on the way
-        // out, and naming every ask of the last ten minutes would bury the ones
-        // that actually went missing.
-        (e.acked !== true && now - e.answeredAt <= RECOVER_MAX_AGE_MS),
+        // UNACKED, with NO TIME BOUND. An answer the agent provably read is not
+        // news on the way out; one whose receipt was never confirmed is, and it
+        // stays news for as long as it exists.
+        //
+        // An earlier draft also required it to be inside the recovery window,
+        // which quietly undid the whole `returned`/`acked` split: past ten
+        // minutes an unacked answer was neither pending nor debt-bearing, so the
+        // fatal-exit path was handed nothing and a validated choice vanished in
+        // silence. UNACKED MEANS UNPROVEN, and time does not turn unproven into
+        // delivered — the window governs whether an answer may be RECOVERED, and
+        // has no business governing whether a loss is reported.
+        e.acked !== true,
     );
   }
 
@@ -1132,9 +1219,31 @@ export class AskAnswerJournalImpl {
   ticketFor(askId: string): AskTicket | undefined {
     return this.tickets.get(askId);
   }
+  /**
+   * Is an ack from `from` allowed to settle something handed to `carrier`?
+   *
+   * A PUSHED entry has no carrier binding (its token was queued, not attached to
+   * a running turn) and #468's own machinery already gates it — those pass. A
+   * hand-off that never found a live turn (`carrier === null`) can never be
+   * settled by anyone. Everything else must match EXACTLY.
+   *
+   * An ack that arrives with no identity at all is UNVERIFIABLE, and is refused
+   * for a bound answer: "we could not tell who this came from" must never
+   * collapse into "it came from the right place".
+   */
+  private carriedBy(carrier: string | null | undefined, from?: { carrier?: string }): boolean {
+    if (carrier === undefined) return true; // never bound to a turn (a push)
+    if (carrier === null) return false; // handed back with no live turn to ride
+    return from?.carrier === carrier;
+  }
+
   /** Simulate the ticket map's bound biting, without running 1024 asks. */
   dropTicketForTest(askId: string): void {
     this.tickets.delete(askId);
+  }
+  /** Strand an eviction debt on a tab without staging 48 evictions. */
+  noteDroppedForTest(key: string, count: number): void {
+    this.dropped.set(key, (this.dropped.get(key) ?? 0) + count);
   }
   /** Record + hand back in one step, returning the token. */
   markReturnedForTest(askId: string, reply: unknown, tabId: string): string {
