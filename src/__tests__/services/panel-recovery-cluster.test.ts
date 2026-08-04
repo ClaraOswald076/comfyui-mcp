@@ -883,6 +883,58 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     expect((err as Error).message).not.toMatch(/RESTORED/);
   });
 
+  it("a retarget aborts the repair a MUTATION would have performed, before it moves anything", async () => {
+    // The repair completes or discards a staged swap, so it is a mutation and
+    // is bound to the frozen target like every other. Without the assertion, a
+    // retarget between the freeze and the action would let it act on the
+    // PREVIOUS target's interrupted swap.
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    writePanelPack(INCOMING(), "0.11.38");
+    const h = makeDeps({ cloneVersion: "0.11.40" });
+    let moved = 0;
+    const realRename = h.deps.rename!;
+    const realRemove = h.deps.removeDir!;
+    h.deps.rename = (from, to) => {
+      moved++;
+      realRename(from, to);
+    };
+    h.deps.removeDir = (p) => {
+      if (p === INCOMING()) moved++;
+      realRemove(p);
+    };
+
+    const pinned = await pinPanelBase(h.deps);
+    generation.value++; // the retarget lands after the freeze
+
+    const err = await runPanelActionInner("update", pinned).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect((err as Error).message).toMatch(/ABORTED/);
+    expect(moved).toBe(0); // nothing was moved or discarded
+    expect(existsSync(INCOMING())).toBe(true);
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
+  });
+
+  it("the swap checks the version it OBSERVES afterwards, not just the one it staged", async () => {
+    // The staged clone is validated before the swap, but this read happens
+    // after it — and a concurrent Manager run or manual edit in between can
+    // leave something older in place. Reporting that as an update would be
+    // fabricated progress.
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    const h = makeDeps({ cloneVersion: "0.11.38", updateThrows: "manager cannot resolve it" });
+    const realRename = h.deps.rename!;
+    let renames = 0;
+    h.deps.rename = (from, to) => {
+      realRename(from, to);
+      // After the final rename lands, something else downgrades the pack.
+      if (++renames === 3) writePanelPack(PANEL_DIR(), "0.11.33");
+    };
+    const err = await runPanelActionInner("update", h.deps).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect((err as Error).message).toMatch(/did NOT go forward/);
+    expect((err as Error).message).toMatch(/0\.11\.33/);
+    expect((err as Error).message).not.toMatch(/Panel updated/);
+  });
+
   it("a repair is reported even when the action then fails with a non-panel error", async () => {
     // install/reinstall await ComfyUI-Manager directly, which rejects with its
     // own error types. Restricting the note to PanelInstallError meant a repair

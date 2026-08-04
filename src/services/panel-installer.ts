@@ -3099,6 +3099,26 @@ async function updateViaRegistryZipReinstall(opts: {
         `is at ${backupDir}.`,
     );
   }
+  // AND IT MUST HAVE GONE FORWARD. The STAGED version was checked before the
+  // swap, but this is a fresh read taken afterwards, and the two can disagree:
+  // a concurrent Manager run or a manual edit between the final rename and this
+  // read can leave something older in place. Reporting that as "updated" is the
+  // same fabricated progress this file refuses everywhere else, so the OBSERVED
+  // version is checked, not just the intended one.
+  if (
+    previousVersion &&
+    SEMVER_RE.test(previousVersion.trim()) &&
+    SEMVER_RE.test(post.version.trim()) &&
+    compareSemver(post.version, previousVersion) < 0
+  ) {
+    throw new PanelInstallError(
+      `Panel reinstall-from-source did NOT go forward: after the swap, ${dir} reads ` +
+        `${post.version}, which is OLDER than the ${previousVersion} it replaced — even ` +
+        `though the clone that was staged was newer. Something changed the pack between ` +
+        `the swap and this check. NOT reporting an update. The previous panel is at ` +
+        `${backupDir}; check custom_nodes before restarting ComfyUI.`,
+    );
+  }
 
   assertSameTarget("before reporting the reinstall");
   const message =
@@ -3279,6 +3299,12 @@ async function runPanelActionCore(
     );
   };
 
+  // The repair MOVES directories (it completes or discards a staged swap), so it
+  // is bound to the frozen target exactly like every other mutation here. Without
+  // this, a retarget landing between the freeze and this point could discard or
+  // complete the PREVIOUS target's interrupted swap before the later assertions
+  // ever ran.
+  assertSameTarget("before repairing an interrupted swap");
   const swapRepair = reconcilePanelSwap(comfyPath, deps, { repair: true });
   if (!swapRepair.ok) {
     // A broken swap we could NOT put right. Proceeding would install a fresh
