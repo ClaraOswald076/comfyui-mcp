@@ -6547,7 +6547,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               "Refusing to restart ComfyUI: I could not confirm that this panel's ComfyUI is " +
               "the local instance I can account for, so I cannot tell which server the restart " +
               "would stop — and it STOPS it, relying on whatever supervises it to start it " +
-              "again. Nothing was dispatched and ComfyUI is still running. Restart it from " +
+              // A claim about what I DID, not about a server I have just said I cannot
+              // identify: "it is still running" would be exactly the unvalidated
+              // assertion the stale-target rule forbids (r8).
+              "again. Nothing was dispatched, so nothing was stopped. Restart it from " +
               "whatever launches it (its own launcher, the Desktop app, or your terminal), or " +
               "use restart_comfyui, which acts on the instance this server is configured for.",
           });
@@ -6651,6 +6654,36 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // routing id while the original is still reconnecting.
         const preRestartPanelIdentity = ctx.panelConnectionIdentity?.();
         const healthBase = captureRebootHealthBase(ctx);
+        // THE BINDING RULE APPLIES AT THE DISPATCH POINT, NOT ONLY BEFORE THE AWAIT.
+        //
+        // The check above happens before the preflight; a tab or connection rebind
+        // DURING that await lands here with a target that is no longer bound, and
+        // `tabFrontsSameInstance` being false meant neither post-await refusal fired
+        // — so both a passing and a failing preflight fell through and the fresh,
+        // unidentified tab received the reboot (codex gate round 12). The pre-await
+        // check is kept because it avoids assessing an instance we already know we
+        // may not act on; this one is what actually holds the line.
+        //
+        // Same rule, same exclusions: only a LOCAL target we cannot tie to the
+        // instance this server accounts for is refused.
+        const dispatchBound =
+          healthBase != null && sameHttpBase(getComfyUIBaseUrl(), healthBase);
+        if (!dispatchBound && !isRemoteMode() && !isCloudMode()) {
+          return ok({
+            rebooting: false,
+            ready: false,
+            confirmed_cycle: false,
+            refused: true,
+            note:
+              "Refusing to restart ComfyUI: the panel connection changed while the restart " +
+              "was being prepared, and I can no longer confirm which ComfyUI this tab " +
+              "fronts — a restart STOPS a server, so it is never sent to one I cannot " +
+              // Again: what I did, not what an unidentified instance is doing.
+              "identify. Nothing was dispatched, so nothing was stopped. Retry once " +
+              "the panel has settled, or use restart_comfyui, which acts on the instance " +
+              "this server is configured for.",
+          });
+        }
         const timing = getPanelRebootTiming();
         const dispatchTimeout = Math.max(1, Math.min(15000, overallDeadline - Date.now()));
         // CONCURRENT OBSERVATION (coordinator): start probing the fixed boot endpoint NOW,
