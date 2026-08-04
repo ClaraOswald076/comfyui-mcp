@@ -285,27 +285,44 @@ const CIVITAI_TYPE_BY_DIR: Record<string, string[]> = {
 
 const MB = 1024 * 1024;
 
+export interface CandidateLookup {
+  candidates: ModelCandidate[];
+  /**
+   * Providers whose LOOKUP FAILED — distinct from "answered with nothing".
+   * An empty `candidates` with failures here is "could not look", and saying
+   * "no candidates found" for it is the confident-wrong-negative fold.
+   */
+  failedProviders: string[];
+}
+
 /**
  * Find installable candidates for ONE missing model, annotated with precision,
- * size and whether it fits this GPU, best first.
+ * size and whether it fits this GPU, best first — AND which providers failed
+ * to answer at all.
  *
  * Deliberately does NOT auto-pick: the same filename ships across quants and
  * base models, so we return a ranked, annotated list and let the caller decide.
  * Network failures degrade to fewer candidates rather than failing the lookup —
- * a partial answer beats none when one provider is down.
+ * a partial answer beats none when one provider is down — but the failures are
+ * REPORTED, so an empty list is never read as "nothing exists" when the search
+ * itself failed.
  */
-export async function resolveCandidates(
+export async function resolveCandidatesDetailed(
   missing: MissingModel,
   deps: ResolveDeps,
   opts: { limit?: number } = {},
-): Promise<ModelCandidate[]> {
+): Promise<CandidateLookup> {
   const limit = opts.limit ?? 8;
   const query = fileStem(missing.name);
   const vram = await deps.vramBytes().catch(() => undefined);
   const out: ModelCandidate[] = [];
+  const failedProviders: string[] = [];
 
   const civitaiTypes = missing.directory ? CIVITAI_TYPE_BY_DIR[missing.directory] : undefined;
-  const hits = await deps.searchCivitai(query, civitaiTypes).catch(() => []);
+  const hits = await deps.searchCivitai(query, civitaiTypes).catch(() => {
+    failedProviders.push("CivitAI");
+    return [];
+  });
   for (const h of hits) {
     const size = typeof h.size_mb === "number" ? Math.round(h.size_mb * MB) : undefined;
     const p = classifyPrecision(h.name);
@@ -327,9 +344,15 @@ export async function resolveCandidates(
   // routinely ranked below the official one, and on a constrained GPU it is the
   // only candidate that actually helps — slicing too tightly drops exactly the
   // answer the user needs.
-  const repos = await deps.searchHf(query).catch(() => []);
+  const repos = await deps.searchHf(query).catch(() => {
+    failedProviders.push("HuggingFace");
+    return [];
+  });
   for (const repo of repos.slice(0, 6)) {
-    const files = await deps.hfRepoFiles(repo.id).catch(() => []);
+    const files = await deps.hfRepoFiles(repo.id).catch(() => {
+      failedProviders.push(`HuggingFace repo ${repo.id}`);
+      return [];
+    });
     for (const f of files) {
       const p = classifyPrecision(f.filename);
       out.push({
@@ -345,7 +368,19 @@ export async function resolveCandidates(
     }
   }
 
-  return rankCandidates(missing.name, dedupeCandidates(out)).slice(0, limit);
+  return {
+    candidates: rankCandidates(missing.name, dedupeCandidates(out)).slice(0, limit),
+    failedProviders,
+  };
+}
+
+/** The candidate list alone — see `resolveCandidatesDetailed` for the contract. */
+export async function resolveCandidates(
+  missing: MissingModel,
+  deps: ResolveDeps,
+  opts: { limit?: number } = {},
+): Promise<ModelCandidate[]> {
+  return (await resolveCandidatesDetailed(missing, deps, opts)).candidates;
 }
 
 /**

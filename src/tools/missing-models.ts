@@ -6,7 +6,7 @@ import { searchCivitaiModels } from "../services/civitai-resolver.js";
 import { searchHuggingFaceModels } from "../services/model-resolver.js";
 import {
   findMissingModels,
-  resolveCandidates,
+  resolveCandidatesDetailed,
   type ModelCandidate,
   type ObjectInfoLike,
   type ResolveDeps,
@@ -151,12 +151,32 @@ export function registerMissingModelTools(server: McpServer): void {
             `needed by node ${m.node_id} (${m.node_type} · ${m.widget})${m.directory ? ` → installs to \`models/${m.directory}/\`` : ""}`,
             "",
           );
-          const candidates = await resolveCandidates(m, deps, { limit: args.limit ?? 8 }).catch(() => []);
-          if (candidates.length === 0) {
-            lines.push("_No candidates found on CivitAI or HuggingFace — try search_models / search_civitai_models with a different query._", "");
+          const lookup = await resolveCandidatesDetailed(m, deps, { limit: args.limit ?? 8 }).catch(
+            (err) => ({
+              candidates: [],
+              failedProviders: [
+                `the candidate lookup itself (${err instanceof Error ? err.message : String(err)})`,
+              ],
+            }),
+          );
+          if (lookup.candidates.length === 0) {
+            lines.push(
+              lookup.failedProviders.length > 0
+                ? `_No candidates — but the lookup FAILED (${lookup.failedProviders.join("; ")}), so ` +
+                  `this is "could not look", NOT "nothing exists". Check the network/provider and retry, ` +
+                  `or try search_models / search_civitai_models with a different query._`
+                : `_No candidates found on CivitAI or HuggingFace — try search_models / search_civitai_models with a different query._`,
+              "",
+            );
             continue;
           }
-          lines.push(...candidates.map(renderCandidate), "");
+          if (lookup.failedProviders.length > 0) {
+            lines.push(
+              `_(Partial results — the ${lookup.failedProviders.join("; ")} lookup failed; other sources may have more.)_`,
+              "",
+            );
+          }
+          lines.push(...lookup.candidates.map(renderCandidate), "");
         }
 
         lines.push(

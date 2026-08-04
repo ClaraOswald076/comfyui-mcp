@@ -116,27 +116,116 @@ function defaultDisplayName(relPath: string): string {
   return file.replace(/\.(safetensors|ckpt|pt|bin)$/i, "").replace(/_/g, " ");
 }
 
-function readCatalogFile(): LoraCatalogFile {
-  const path = loraCatalogPath();
-  if (!existsSync(path)) {
-    return { version: CATALOG_VERSION, entries: {} };
-  }
+/**
+ * The on-disk catalog read THREE ways: absent (start fresh), parsed (use it),
+ * or CORRUPT (present but unparseable — crash-truncated, hand-edited wrong).
+ * The third must never be folded into the first: an empty in-memory catalog
+ * written back over a corrupt file destroys whatever curation the file still
+ * holds — "could not determine" becoming "determined empty" with data loss.
+ */
+interface CatalogRead {
+  data: LoraCatalogFile;
+  /** Why the existing file could not be used — set only when it EXISTS. */
+  corrupt?: string;
+}
+
+/** The catalog file's raw text, three ways: absent, unreadable, or the bytes. */
+function readCatalogRaw(path: string): { raw?: string; unreadable?: string } {
+  // NO existsSync pre-screen: it cannot tell "absent" from "cannot look" (an
+  // unsearchable ancestor answers false either way), and a false "absent"
+  // would let a later write overwrite a catalog we merely failed to SEE.
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf-8")) as unknown;
+    return { raw: readFileSync(path, "utf-8") };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return {};
+    return { unreadable: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** Parse raw catalog text, setting aside malformed entry VALUES. */
+function parseCatalogRaw(raw: string): CatalogRead {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    const entries = (parsed as LoraCatalogFile | null)?.entries;
     if (
       parsed &&
       typeof parsed === "object" &&
       (parsed as LoraCatalogFile).version === CATALOG_VERSION &&
-      typeof (parsed as LoraCatalogFile).entries === "object"
+      // null passes typeof "object"; an ARRAY passes it too but string-keyed
+      // upserts on it do not survive JSON.stringify — the write would report
+      // success and persist nothing. Only a plain record is a catalog.
+      entries !== null &&
+      entries !== undefined &&
+      typeof entries === "object" &&
+      !Array.isArray(entries)
     ) {
-      return parsed as LoraCatalogFile;
+      // The record itself is shaped right, but individual VALUES may not be
+      // (a hand-edit or a partial write leaves "some-lora": null or {} behind
+      // — a null crashes list(), a missing displayName crashes the sort, a
+      // missing id makes remove() "delete" a key of `undefined`, a key that
+      // is not the entry's id makes remove() delete nothing while reporting
+      // the removal done, a string in an array field (or a non-string member)
+      // crashes .some(x => x.toLowerCase()), a non-string previewFile makes
+      // remove() throw AFTER the entry was durably deleted, and a null
+      // createdAt is silently coalesced on the next write). The bar is the
+      // shape every write path in this file produces. Keep the valid
+      // entries, and mark the file corrupt so the next write PRESERVES the
+      // original before replacing it.
+      const clean: Record<string, LoraCatalogEntry> = {};
+      const dropped: string[] = [];
+      for (const [key, value] of Object.entries(entries)) {
+        const v = value as LoraCatalogEntry | null;
+        const rec = v as unknown as Record<string, unknown> | null;
+        const stringArray = (f: string, required: boolean) => {
+          const arr = rec?.[f];
+          if (arr === undefined) return !required;
+          return Array.isArray(arr) && arr.every((x) => typeof x === "string");
+        };
+        const optString = (f: string) =>
+          rec?.[f] === undefined || typeof rec?.[f] === "string";
+        const optNumber = (f: string) =>
+          rec?.[f] === undefined || typeof rec?.[f] === "number";
+        if (
+          v &&
+          typeof v === "object" &&
+          !Array.isArray(v) &&
+          v.id === key &&
+          typeof v.relPath === "string" &&
+          typeof v.displayName === "string" &&
+          typeof rec!.createdAt === "string" &&
+          typeof rec!.updatedAt === "string" &&
+          typeof rec!.description === "string" &&
+          typeof rec!.setupInstructions === "string" &&
+          stringArray("keywords", true) &&
+          stringArray("baseModels", true) &&
+          stringArray("negativeKeywords", false) &&
+          stringArray("tags", false) &&
+          ["previewFile", "sourceUrl", "notes", "modifiedAt"].every(optString) &&
+          ["strengthMin", "strengthMax", "strengthDefault", "civitaiModelId", "civitaiVersionId", "fileSize"].every(optNumber) &&
+          // "missing": "false" is truthy — a present LoRA would list as missing.
+          (rec!.missing === undefined || typeof rec!.missing === "boolean")
+        ) {
+          clean[key] = value;
+        } else {
+          dropped.push(key);
+        }
+      }
+      if (dropped.length === 0) return { data: parsed as LoraCatalogFile };
+      const detail =
+        `${dropped.length} malformed ${dropped.length === 1 ? "entry" : "entries"} ` +
+        `(${dropped.slice(0, 3).join(", ")}${dropped.length > 3 ? ", …" : ""})`;
+      return {
+        data: { ...(parsed as LoraCatalogFile), entries: clean },
+        corrupt: detail,
+      };
     }
+    return { data: { version: CATALOG_VERSION, entries: {} }, corrupt: "not a v1 catalog" };
   } catch (err) {
-    logger.warn(
-      `[lora-catalog] could not parse ${path}: ${err instanceof Error ? err.message : String(err)}`,
-    );
+    return {
+      data: { version: CATALOG_VERSION, entries: {} },
+      corrupt: err instanceof Error ? err.message : String(err),
+    };
   }
-  return { version: CATALOG_VERSION, entries: {} };
 }
 
 function writeCatalogFile(data: LoraCatalogFile): void {
@@ -144,6 +233,9 @@ function writeCatalogFile(data: LoraCatalogFile): void {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(data, null, 2));
 }
+
+/** Monotonic suffix so two backups in the same millisecond never collide. */
+let backupSeq = 0;
 
 function normalizeRelPath(path: string): string {
   const p = path.replace(/\\/g, "/").replace(/^\/+/, "");
@@ -226,15 +318,144 @@ export function toLoraSummary(entry: LoraCatalogEntry): Record<string, unknown> 
   };
 }
 
+/**
+ * Is this preview file still referenced by the catalog AS IT NOW IS ON DISK?
+ * Checked before deleting: another writer may have persisted a reference to
+ * the file after our own write, and deleting it would orphan THEIR entry.
+ * A failed re-read answers "referenced" — the safe side for a delete.
+ */
+function previewReferencedOnDisk(previewFile: string): boolean {
+  const probe = readCatalogRaw(loraCatalogPath());
+  if (!probe.raw) return true; // unreadable/absent → do not delete
+  const read = parseCatalogRaw(probe.raw);
+  // A corrupt catalog says NOTHING about what references the file — the safe
+  // answer for a delete is "referenced".
+  if (read.corrupt) return true;
+  return Object.values(read.data.entries).some((e) => e.previewFile === previewFile);
+}
+
+/** Delete a preview file only once nothing on disk references it. */
+function deletePreviewIfUnreferenced(previewsDirPath: string, previewFile: string): void {
+  if (previewReferencedOnDisk(previewFile)) return;
+  const p = join(previewsDirPath, previewFile);
+  if (existsSync(p)) {
+    try {
+      unlinkSync(p);
+    } catch {
+      /* best effort */
+    }
+  }
+}
+
 export class LoraCatalog {
-  private data: LoraCatalogFile;
+  // Immediately overwritten by reload() from the constructor.
+  private data: LoraCatalogFile = { version: CATALOG_VERSION, entries: {} };
+  /**
+   * The on-disk state `this.data` was built from — the baseline every write
+   * is checked against. `{}` (neither field) means the file was absent.
+   */
+  private baseline: { raw?: string; unreadable?: string } = {};
 
   constructor() {
-    this.data = readCatalogFile();
+    this.reload();
   }
 
   reload(): void {
-    this.data = readCatalogFile();
+    const path = loraCatalogPath();
+    const probe = readCatalogRaw(path);
+    this.baseline = probe;
+    if (probe.unreadable) {
+      logger.warn(`[lora-catalog] could not read ${path}: ${probe.unreadable}`);
+      this.data = { version: CATALOG_VERSION, entries: {} };
+      return;
+    }
+    if (probe.raw === undefined) {
+      this.data = { version: CATALOG_VERSION, entries: {} };
+      return;
+    }
+    const read = parseCatalogRaw(probe.raw);
+    if (read.corrupt) {
+      logger.warn(
+        `[lora-catalog] ${path}: ${read.corrupt}; the original will be preserved before any write replaces it.`,
+      );
+    }
+    this.data = read.data;
+  }
+
+  /**
+   * Persist — but NEVER over a corrupt original without preserving it first.
+   * The corrupt file is the only copy of whatever curation it still holds;
+   * overwriting it unread is the rescue path deleting the thing it rescues.
+   * If it cannot even be copied, refuse the write outright: a loud failure
+   * beats silent data loss.
+   *
+   * TWO checks before anything is replaced:
+   *  - STALE-INSTANCE: the file must still be the state this.data was built
+   *    from. Another writer's COMPLETED, healthy update is refused (re-read
+   *    and retry) rather than silently overwritten; a file that became
+   *    CORRUPT since our read is preserved and then replaced (nothing
+   *    readable is lost — our in-memory state is the newer good copy of it).
+   *  - MID-PERSIST RACE: the bytes probed must still be the bytes on disk
+   *    when the write begins. The window cannot be zero without a lock (none
+   *    exists for this file); the check covers the realistic interleaving — a
+   *    whole recovery landing between the two reads.
+   *
+   * And on ANY failure, re-sync from disk before rethrowing: the caller is
+   * about to see this mutation as FAILED, so it must not linger in memory —
+   * a later persist would silently commit what was reported as not applied.
+   */
+  private persist(): void {
+    try {
+      const path = loraCatalogPath();
+      const probe = readCatalogRaw(path);
+      const now = readCatalogRaw(path);
+      if (now.raw !== probe.raw || now.unreadable !== probe.unreadable) {
+        throw new Error(
+          `The LoRA catalog at ${path} changed on disk while this write was being ` +
+            `prepared — NOT overwriting another writer's update. This change was not ` +
+            `saved; re-read and retry.`,
+        );
+      }
+      const unchanged =
+        probe.raw === this.baseline.raw && probe.unreadable === this.baseline.unreadable;
+      const probeParsed = probe.raw !== undefined ? parseCatalogRaw(probe.raw) : undefined;
+      const corrupt = probe.unreadable ?? probeParsed?.corrupt;
+      if (!unchanged && !corrupt) {
+        throw new Error(
+          `The LoRA catalog at ${path} changed on disk since it was read — NOT ` +
+            `overwriting another writer's update. This change was not saved; re-read ` +
+            `and retry.`,
+        );
+      }
+      if (corrupt) {
+        const action = probe.unreadable ? "read" : "parsed";
+        // Unique per process AND per backup within it: two stale instances
+        // sharing a Date.now() tick must not have the second backup overwrite
+        // the first — that would erase the corrupt original after all.
+        const backup = `${path}.corrupt-${Date.now()}-${process.pid}-${backupSeq++}`;
+        try {
+          copyFileSync(path, backup);
+          logger.warn(
+            `[lora-catalog] the catalog at ${path} could not be ${action} (${corrupt}); ` +
+              `the original was preserved at ${backup} before being replaced.`,
+          );
+        } catch (err) {
+          throw new Error(
+            `The LoRA catalog at ${path} could not be ${action} (${corrupt}) and ` +
+              `could not be preserved either (${err instanceof Error ? err.message : String(err)}). ` +
+              `Refusing to overwrite it — inspect or repair the file manually.`,
+          );
+        }
+      }
+      writeCatalogFile(this.data);
+      // The file on disk is now exactly what we wrote — that is the baseline
+      // the NEXT persist compares against.
+      this.baseline = { raw: JSON.stringify(this.data, null, 2) };
+    } catch (err) {
+      // reload() never throws (a failed read degrades to empty + corrupt).
+      this.reload();
+      throw err;
+    }
   }
 
   list(opts: LoraCatalogListOptions = {}): LoraCatalogEntry[] {
@@ -300,7 +521,7 @@ export class LoraCatalog {
       }
     }
 
-    writeCatalogFile(this.data);
+    this.persist();
     return {
       scanned: models.length,
       added,
@@ -348,7 +569,7 @@ export class LoraCatalog {
     };
 
     this.data.entries[id] = entry;
-    writeCatalogFile(this.data);
+    this.persist();
     return entry;
   }
 
@@ -368,36 +589,43 @@ export class LoraCatalog {
     const destName = `${entry.id}${ext}`;
     const dest = join(dir, destName);
 
-    if (entry.previewFile && entry.previewFile !== destName) {
-      const old = join(dir, entry.previewFile);
-      if (existsSync(old)) {
-        try {
-          unlinkSync(old);
-        } catch {
-          /* best effort */
-        }
-      }
+    // Write the new preview and PERSIST the reference before deleting the old
+    // one: persist can refuse (a concurrently-changed catalog, an
+    // unpreservable corrupt original), and an old preview deleted ahead of a
+    // failed persist leaves the surviving entry pointing at a file that is
+    // gone. An orphaned NEW preview after a failed persist is the harmless
+    // direction.
+    copyFileSync(src, dest);
+    let updated: LoraCatalogEntry;
+    try {
+      updated = this.upsert({ id: entry.id, previewFile: destName });
+    } catch (err) {
+      // The file swap already happened; only its description failed. Disclose
+      // BOTH — refusing as though nothing changed would misreport applied
+      // work, and the retry reconciles the catalog with the file.
+      throw new Error(
+        `The preview image was already written to ${dest}, but recording it in the ` +
+          `catalog FAILED: ${err instanceof Error ? err.message : String(err)}. ` +
+          `The file on disk is the NEW preview; the catalog may still describe the old one — retry to reconcile.`,
+      );
     }
 
-    copyFileSync(src, dest);
-    return this.upsert({ id: entry.id, previewFile: destName });
+    if (entry.previewFile && entry.previewFile !== destName) {
+      deletePreviewIfUnreferenced(dir, entry.previewFile);
+    }
+    return updated;
   }
 
   remove(idOrPath: string): boolean {
     const entry = this.get(idOrPath);
     if (!entry) return false;
-    if (entry.previewFile) {
-      const p = join(loraPreviewsDir(), entry.previewFile);
-      if (existsSync(p)) {
-        try {
-          unlinkSync(p);
-        } catch {
-          /* best effort */
-        }
-      }
-    }
     delete this.data.entries[entry.id];
-    writeCatalogFile(this.data);
+    // Persist BEFORE deleting the preview: a refused persist reloads the
+    // entry (still referencing its preview), so the preview must still exist.
+    this.persist();
+    if (entry.previewFile) {
+      deletePreviewIfUnreferenced(loraPreviewsDir(), entry.previewFile);
+    }
     return true;
   }
 }
