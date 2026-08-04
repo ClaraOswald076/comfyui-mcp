@@ -4529,4 +4529,3 @@ describe("panel_ask keeps a validated answer across a tool timeout (#486)", () =
     expect(__panelAskTestHooks.ASK_TOTAL_BUDGET_CAP_MS).toBeLessThan(300000);
   });
 });
-

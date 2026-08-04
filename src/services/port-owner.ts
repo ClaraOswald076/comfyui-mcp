@@ -784,35 +784,6 @@ function pidVanished(err: unknown): boolean {
   return code === "ENOENT" || code === "ESRCH";
 }
 
-/**
- * Does `pid` STILL hold `inode`? Tri-state — `undefined` when we could not look.
- *
- * The closing half of the bracket. Re-reading the socket table proves the INODE is
- * still on the port; it says nothing about whether the pid we named still holds it.
- * An fd can be closed (or passed on) between the walk and the re-read, leaving the
- * same inode listening under a different owner while we return the former one as
- * `owned` — and that pid is what a stop kills (coordinator gate).
- */
-function pidStillHoldsInode(pid: number, inode: string): boolean | undefined {
-  const wanted = `socket:[${inode}]`;
-  let fds: string[];
-  try {
-    fds = procFdReader.listFds(pid);
-  } catch (err) {
-    // The process is gone: it is definitively not holding the socket any more.
-    return pidVanished(err) ? false : undefined;
-  }
-  for (const fd of fds) {
-    try {
-      if (procFdReader.readFdLink(pid, fd) === wanted) return true;
-    } catch (err) {
-      // One fd closing mid-scan is ordinary; a permission wall means we cannot say.
-      if (!pidVanished(err)) return undefined;
-    }
-  }
-  return false;
-}
-
 function attributeInodes(inodes: string[], port: number): ProcAttribution {
   const wanted = new Map(inodes.map((inode) => [`socket:[${inode}]`, inode]));
   let pids: number[];
@@ -951,30 +922,39 @@ export function probePortOwner(port: number, host?: string): PortOwnerProbe {
       // /system_stats pairing: carry something across two observations that a
       // substitution cannot reproduce.
       const after = readKernelSocketTables(port, host);
-      // BOTH HALVES of the pairing have to survive, because the finding is about a
-      // pid AND a socket:
-      //   • the SPECIFIC inode the fd walk matched must still be listening on the
-      //     port — not merely "some listener is there", which a replacement socket
-      //     would satisfy;
-      //   • and the pid must STILL hold it. Confirming only the inode leaves the
-      //     other substitution open: the fd is closed or handed on, the same inode is
-      //     on the port under a new owner, and the pid we return is a former holder
-      //     (coordinator gate). That pid is what a stop kills.
+      // THE WHOLE FINDING HAS TO REPRODUCE, not just a part of it.
+      //
+      // The claim being bracketed is "exactly one visible process holds THIS socket",
+      // so the closing check re-derives exactly that. Two weaker versions were both
+      // wrong, in the same way:
+      //   • confirming only that a listener is still on the port accepts a REPLACEMENT
+      //     socket that reused the inode;
+      //   • confirming only that OUR pid still holds the inode accepts a SECOND holder
+      //     appearing beside it — which the opening scan would have refused as
+      //     ambiguous, so the bracket would have laundered a verdict the same evidence
+      //     was not allowed to produce a moment earlier (codex gate round 10).
+      // A full re-attribution costs one more `/proc` walk on the positive path — the
+      // same order as the lsof spawn it replaces — and is the only form that cannot
+      // certify something the first pass would have rejected.
+      // The two conditions are exactly the two halves of the claim, and no more:
+      // the socket we attributed is still listening, and re-deriving the owner still
+      // yields THIS pid — alone. Requiring the re-attribution to arrive via the same
+      // INODE was a third condition the claim does not make: a process listening on
+      // both address families holds two of them, and which one the walk stops at is
+      // an artifact of fd ordering. `stillListening` already pins the socket.
       const stillListening = after.inodes.includes(attributed.inode);
-      const stillHeld = stillListening
-        ? pidStillHoldsInode(attributed.pid, attributed.inode)
-        : false;
-      if (stillListening && stillHeld === true) {
+      const recheck = stillListening ? attributeInodes(after.inodes, port) : undefined;
+      if (recheck?.state === "owned" && recheck.pid === attributed.pid) {
         return { state: "owned", pid: attributed.pid };
       }
       procNote = !stillListening
         ? `the socket listening on port ${port} changed while its owner was being identified, ` +
           `so PID ${attributed.pid} cannot be tied to it`
-        : stillHeld === false
-          ? `PID ${attributed.pid} no longer holds the socket listening on port ${port}, so it ` +
-            `cannot be named as its owner`
-          : `PID ${attributed.pid} could not be re-checked against the socket listening on ` +
-            `port ${port}, so its ownership is unconfirmed`;
+        : recheck?.state === "owned"
+          ? `the socket listening on port ${port} changed hands while its owner was being ` +
+            `identified (PID ${attributed.pid}, then PID ${recheck.pid})`
+          : `PID ${attributed.pid} could not be re-confirmed as the owner of the socket ` +
+            `listening on port ${port}: ${recheck?.reason ?? "the re-check could not be performed"}`;
     } else {
       procNote = attributed.reason;
     }

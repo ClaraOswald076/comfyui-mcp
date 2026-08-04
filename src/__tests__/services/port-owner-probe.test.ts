@@ -1647,7 +1647,83 @@ describe("probePortOwner — POSIX (#795: owner attributed from /proc/<pid>/fd)"
     expect(probe.state).toBe("unknown");
     expect(probe).not.toMatchObject({ pid: 4321 });
     expect(probe).toMatchObject({
-      reason: expect.stringMatching(/no longer holds the socket/i),
+      reason: expect.stringMatching(/could not be re-confirmed as the owner/i),
+    });
+    // The inner reason states the search was COMPLETE and found nobody — not that it
+    // hit a wall, which is the other way to fail this re-check.
+    expect(probe).toMatchObject({
+      reason: expect.stringMatching(/no process in \/proc holds it/i),
+    });
+  });
+
+  it("a socket that CHANGED HANDS between the scans is not attributed to the old owner", async () => {
+    // The fd is passed on: the same inode is still listening, so the socket half of
+    // the bracket holds — but the owner is now somebody else, and returning the
+    // former holder would point a stop at a process that no longer has anything to do
+    // with the port.
+    const { probePortOwner, __portOwnerTestHooks } = await loadProbe();
+    mockExecSync.mockReturnValue("");
+    __portOwnerTestHooks.setProcNetReader((t) =>
+      t === "/proc/net/tcp" ? v4Table([{ port: 8188, inode: "54321" }]) : emptyV6,
+    );
+    const tree: Record<number, Record<string, string>> = {
+      4321: { "0": "socket:[54321]" },
+      200: { "0": "/dev/null" },
+    };
+    const walker = fdReader(tree);
+    let walks = 0;
+    __portOwnerTestHooks.setProcFdReader({
+      ...walker,
+      listPids: () => {
+        walks++;
+        if (walks > 1) {
+          tree[4321] = { "0": "/dev/null" };
+          tree[200] = { "0": "socket:[54321]" };
+        }
+        return walker.listPids();
+      },
+    });
+
+    const probe = probePortOwner(8188);
+    expect(probe.state).toBe("unknown");
+    expect(probe).not.toMatchObject({ pid: 4321 });
+    expect(probe).toMatchObject({
+      reason: expect.stringMatching(/changed hands .*PID 4321, then PID 200/i),
+    });
+  });
+
+  it("a SECOND holder appearing between the scans withdraws the finding", async () => {
+    // The claim being bracketed is "exactly one visible process holds this socket".
+    // Re-checking only that OUR pid still holds it accepts a second holder appearing
+    // beside it — which the opening scan would have refused as ambiguous, so the
+    // bracket would launder a verdict the same evidence was not allowed to produce a
+    // moment earlier. The closing check therefore re-derives the WHOLE finding.
+    const { probePortOwner, __portOwnerTestHooks } = await loadProbe();
+    mockExecSync.mockReturnValue("");
+    __portOwnerTestHooks.setProcNetReader((t) =>
+      t === "/proc/net/tcp" ? v4Table([{ port: 8188, inode: "54321" }]) : emptyV6,
+    );
+    // 4321 holds it throughout; 200 inherits the same socket after the first pass.
+    const tree: Record<number, Record<string, string>> = {
+      4321: { "0": "socket:[54321]" },
+      200: { "0": "/dev/null" },
+    };
+    const walker = fdReader(tree);
+    let walks = 0;
+    __portOwnerTestHooks.setProcFdReader({
+      ...walker,
+      listPids: () => {
+        walks++;
+        if (walks > 1) tree[200] = { "0": "socket:[54321]" };
+        return walker.listPids();
+      },
+    });
+
+    const probe = probePortOwner(8188);
+    expect(probe.state).toBe("unknown");
+    expect(probe).not.toMatchObject({ pid: 4321 });
+    expect(probe).toMatchObject({
+      reason: expect.stringMatching(/held by several processes \(200, 4321\)/),
     });
   });
 
@@ -1676,7 +1752,7 @@ describe("probePortOwner — POSIX (#795: owner attributed from /proc/<pid>/fd)"
     const probe = probePortOwner(8188);
     expect(probe.state).toBe("unknown");
     expect(probe).toMatchObject({
-      reason: expect.stringMatching(/no longer holds the socket/i),
+      reason: expect.stringMatching(/no process in \/proc holds it/i),
     });
   });
 
@@ -1702,7 +1778,7 @@ describe("probePortOwner — POSIX (#795: owner attributed from /proc/<pid>/fd)"
     const probe = probePortOwner(8188);
     expect(probe.state).toBe("unknown");
     expect(probe).toMatchObject({
-      reason: expect.stringMatching(/could not be re-checked/i),
+      reason: expect.stringMatching(/could not all be read/i),
     });
   });
 
