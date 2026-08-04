@@ -3,6 +3,7 @@ import {
   AskAnswers,
   askFingerprint,
   ASK_RECOVER_MAX_AGE_MS,
+  PANEL_ASK_ID_PREFIX,
   type AskAnswerEvent,
 } from "../../orchestrator/ask-answer-journal.js";
 
@@ -47,7 +48,7 @@ beforeEach(() => {
 
 describe("ask-answer journal — an answer survives its tool call (#486)", () => {
   it("journals an answer that arrives with NO handler waiting, and arms it for delivery", () => {
-    openAndAnswer("ask-1", SAMPLER, "dpmpp_2m");
+    openAndAnswer("pa-ask-1", SAMPLER, "dpmpp_2m");
     const entries = AskAnswers.entriesFor(TAB);
     expect(entries).toHaveLength(1);
     expect(entries[0].answer).toBe("dpmpp_2m");
@@ -58,7 +59,7 @@ describe("ask-answer journal — an answer survives its tool call (#486)", () =>
   });
 
   it("recovers it for a re-ask of the IDENTICAL question", () => {
-    openAndAnswer("ask-1", SAMPLER, "dpmpp_2m");
+    openAndAnswer("pa-ask-1", SAMPLER, "dpmpp_2m");
     const rec = AskAnswers.recover(TAB, askFingerprint(SAMPLER));
     expect(rec.status).toBe("recovered");
     if (rec.status !== "recovered") return;
@@ -67,7 +68,7 @@ describe("ask-answer journal — an answer survives its tool call (#486)", () =>
   });
 
   it("hands the SAME answer over only once", () => {
-    openAndAnswer("ask-1", SAMPLER, "dpmpp_2m");
+    openAndAnswer("pa-ask-1", SAMPLER, "dpmpp_2m");
     const first = AskAnswers.recover(TAB, askFingerprint(SAMPLER));
     expect(first.status).toBe("recovered");
     if (first.status !== "recovered") return;
@@ -79,14 +80,14 @@ describe("ask-answer journal — an answer survives its tool call (#486)", () =>
     // The ordinary success path: the handler got the answer and returned it. It
     // may have gone into a dead request (unobservable), so it stays journaled —
     // but it must not ALSO be announced to the agent, or every ask would double.
-    AskAnswers.openAsk("ask-1", {
+    AskAnswers.openAsk("pa-ask-1", {
       tabId: TAB,
       fingerprint: askFingerprint(SAMPLER),
       question: SAMPLER.question,
     });
-    AskAnswers.record("ask-1", "euler", { tabId: TAB });
-    AskAnswers.markReturned("ask-1");
-    AskAnswers.closeAsk("ask-1");
+    AskAnswers.record("pa-ask-1", "euler", { tabId: TAB });
+    AskAnswers.markReturned("pa-ask-1");
+    AskAnswers.closeAsk("pa-ask-1");
     expect(AskAnswers.hasOutstanding()).toBe(false);
     expect(AskAnswers.orphansFor(TAB)).toHaveLength(0);
     expect(AskAnswers.recover(TAB, askFingerprint(SAMPLER)).status).toBe("recovered");
@@ -95,7 +96,7 @@ describe("ask-answer journal — an answer survives its tool call (#486)", () =>
 
 describe("ask-answer journal — cross-question misattribution guard (#486)", () => {
   it("a journaled answer NEVER satisfies a different question", () => {
-    openAndAnswer("ask-1", SAMPLER, "dpmpp_2m");
+    openAndAnswer("pa-ask-1", SAMPLER, "dpmpp_2m");
     const rec = AskAnswers.recover(TAB, askFingerprint(SCHEDULER));
     // Not "recovered", and not silently "none" either: the answer exists and is
     // handed back for DISCLOSURE, quoted with its own question.
@@ -153,12 +154,12 @@ describe("ask-answer journal — cross-question misattribution guard (#486)", ()
   });
 
   it("an answer given on ANOTHER tab never satisfies this tab's question", () => {
-    openAndAnswer("ask-1", SAMPLER, "dpmpp_2m", { tabId: OTHER_TAB });
+    openAndAnswer("pa-ask-1", SAMPLER, "dpmpp_2m", { tabId: OTHER_TAB });
     expect(AskAnswers.recover(TAB, askFingerprint(SAMPLER)).status).toBe("none");
   });
 
   it("an answer too old to be presented as fresh is disclosed, never returned", () => {
-    openAndAnswer("ask-1", SAMPLER, "dpmpp_2m");
+    openAndAnswer("pa-ask-1", SAMPLER, "dpmpp_2m");
     const entry = AskAnswers.entriesFor(TAB)[0];
     entry.answeredAt = Date.now() - ASK_RECOVER_MAX_AGE_MS - 1000;
     const rec = AskAnswers.recover(TAB, askFingerprint(SAMPLER));
@@ -168,7 +169,7 @@ describe("ask-answer journal — cross-question misattribution guard (#486)", ()
   });
 
   it("a replaced conversation revokes the licence to satisfy a re-ask, but keeps the answer", () => {
-    openAndAnswer("ask-1", SAMPLER, "dpmpp_2m");
+    openAndAnswer("pa-ask-1", SAMPLER, "dpmpp_2m");
     AskAnswers.closeAsks(TAB); // New chat / resume of a historical session
     const rec = AskAnswers.recover(TAB, askFingerprint(SAMPLER));
     expect(rec.status).toBe("unattributed");
@@ -180,7 +181,7 @@ describe("ask-answer journal — cross-question misattribution guard (#486)", ()
   });
 
   it("an answer whose ask id this session never opened is UNATTRIBUTED, never matched", () => {
-    AskAnswers.record("never-opened", "dpmpp_2m", { tabId: TAB });
+    AskAnswers.record("pa-never-opened", "dpmpp_2m", { tabId: TAB });
     const entry = AskAnswers.entriesFor(TAB)[0];
     expect(entry.correlation.status).toBe("foreign");
     expect(entry.fingerprint).toBeNull();
@@ -202,7 +203,7 @@ describe("ask-answer journal — durable delivery (#486, mirroring #468)", () =>
   }
 
   it("delivers the answer WITH the question that it answers", () => {
-    openAndAnswer("ask-1", SAMPLER, "dpmpp_2m");
+    openAndAnswer("pa-ask-1", SAMPLER, "dpmpp_2m");
     const [ev] = drain(TAB);
     expect(ev.ask_answer).toBe("dpmpp_2m");
     expect(ev.ask_question).toBe(SAMPLER.question);
@@ -210,7 +211,7 @@ describe("ask-answer journal — durable delivery (#486, mirroring #468)", () =>
   });
 
   it("an answer handed to an agent that then DIES comes back and is replayed", () => {
-    openAndAnswer("ask-1", SAMPLER, "dpmpp_2m");
+    openAndAnswer("pa-ask-1", SAMPLER, "dpmpp_2m");
     const token = AskAnswers.entriesFor(TAB)[0].token;
     drain(TAB);
     expect(AskAnswers.pending(TAB)).toHaveLength(0);
@@ -223,7 +224,7 @@ describe("ask-answer journal — durable delivery (#486, mirroring #468)", () =>
   });
 
   it("teardown handbacks are UNBOUNDED; only turns that carried it are counted", () => {
-    openAndAnswer("ask-1", SAMPLER, "dpmpp_2m");
+    openAndAnswer("pa-ask-1", SAMPLER, "dpmpp_2m");
     const token = AskAnswers.entriesFor(TAB)[0].token;
     for (let i = 0; i < 10; i += 1) {
       drain(TAB);
@@ -240,7 +241,7 @@ describe("ask-answer journal — durable delivery (#486, mirroring #468)", () =>
   });
 
   it("the turn that carried it ending clears the push but keeps it recoverable", () => {
-    openAndAnswer("ask-1", SAMPLER, "dpmpp_2m");
+    openAndAnswer("pa-ask-1", SAMPLER, "dpmpp_2m");
     const token = AskAnswers.entriesFor(TAB)[0].token;
     drain(TAB);
     AskAnswers.ack(token);
@@ -250,14 +251,14 @@ describe("ask-answer journal — durable delivery (#486, mirroring #468)", () =>
   });
 
   it("a tab that goes away drops its answers and its tickets", () => {
-    openAndAnswer("ask-1", SAMPLER, "dpmpp_2m");
+    openAndAnswer("pa-ask-1", SAMPLER, "dpmpp_2m");
     AskAnswers.forget(TAB);
     expect(AskAnswers.entriesFor(TAB)).toHaveLength(0);
     expect(AskAnswers.hasOutstanding()).toBe(false);
   });
 
   it("a tab-id migration re-addresses the answer instead of stranding it", () => {
-    openAndAnswer("ask-1", SAMPLER, "dpmpp_2m");
+    openAndAnswer("pa-ask-1", SAMPLER, "dpmpp_2m");
     AskAnswers.moveKey(TAB, OTHER_TAB);
     expect(AskAnswers.entriesFor(TAB)).toHaveLength(0);
     expect(AskAnswers.pending(OTHER_TAB)).toHaveLength(1);
@@ -268,19 +269,19 @@ describe("ask-answer journal — durable delivery (#486, mirroring #468)", () =>
     const flushed: string[] = [];
     AskAnswers.setFlusher((k) => flushed.push(k));
     // Landed with no handler waiting → pushed immediately.
-    openAndAnswer("ask-1", SAMPLER, "dpmpp_2m");
+    openAndAnswer("pa-ask-1", SAMPLER, "dpmpp_2m");
     expect(flushed).toContain(TAB);
     flushed.length = 0;
     // …and an answer that lands WHILE the handler is running is that handler's to
     // return, so it is not announced until the handler unwinds without it.
-    AskAnswers.openAsk("ask-2", {
+    AskAnswers.openAsk("pa-ask-2", {
       tabId: TAB,
       fingerprint: askFingerprint(SCHEDULER),
       question: SCHEDULER.question,
     });
-    AskAnswers.record("ask-2", "karras", { tabId: TAB });
+    AskAnswers.record("pa-ask-2", "karras", { tabId: TAB });
     expect(flushed).toHaveLength(0);
-    AskAnswers.closeAsk("ask-2");
+    AskAnswers.closeAsk("pa-ask-2");
     expect(flushed).toContain(TAB);
   });
 });
@@ -290,7 +291,7 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     // 16 answers fit per tab; the 17th evicts one. Every one of these reached
     // nobody, so the eviction is a real loss and must be reported.
     for (let i = 0; i < 20; i += 1) {
-      openAndAnswer(`ask-${i}`, { question: `Q${i}?`, options: [{ label: "a" }, { label: "b" }] }, `A${i}`);
+      openAndAnswer(`pa-ask-${i}`, { question: `Q${i}?`, options: [{ label: "a" }, { label: "b" }] }, `A${i}`);
     }
     expect(AskAnswers.droppedFor(TAB)).toBeGreaterThan(0);
     const seen: AskAnswerEvent[] = [];
@@ -303,7 +304,7 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
 
   it("an eviction disclosure is NOT spent by a hand-off that is later given back", () => {
     for (let i = 0; i < 20; i += 1) {
-      openAndAnswer(`ask-${i}`, { question: `Q${i}?`, options: [{ label: "a" }, { label: "b" }] }, `A${i}`);
+      openAndAnswer(`pa-ask-${i}`, { question: `Q${i}?`, options: [{ label: "a" }, { label: "b" }] }, `A${i}`);
     }
     const carrier = AskAnswers.pending(TAB)[0];
     AskAnswers.deliverPending(TAB, () => true);
@@ -322,14 +323,14 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     openAndAnswer("orphan", SAMPLER, "dpmpp_2m");
     for (let i = 0; i < 30; i += 1) {
       const ask = { question: `Q${i}?`, options: [{ label: "a" }, { label: "b" }] };
-      AskAnswers.openAsk(`ret-${i}`, {
+      AskAnswers.openAsk(`pa-ret-${i}`, {
         tabId: TAB,
         fingerprint: askFingerprint(ask),
         question: ask.question,
       });
-      AskAnswers.record(`ret-${i}`, `A${i}`, { tabId: TAB });
-      AskAnswers.markReturned(`ret-${i}`);
-      AskAnswers.closeAsk(`ret-${i}`);
+      AskAnswers.record(`pa-ret-${i}`, `A${i}`, { tabId: TAB });
+      AskAnswers.markReturned(`pa-ret-${i}`);
+      AskAnswers.closeAsk(`pa-ret-${i}`);
     }
     expect(AskAnswers.droppedFor(TAB)).toBe(0);
     // The orphan is still there — it was never a candidate for a quiet eviction.
@@ -340,45 +341,45 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     // `tracks()` is what the bridge sink filters on. If it were answered from the
     // (bounded) ticket map, an eviction would make a validated answer vanish —
     // a bounded store protecting against a bounded store.
-    AskAnswers.openAsk("ask-old", {
+    AskAnswers.openAsk("pa-ask-old", {
       tabId: TAB,
       fingerprint: askFingerprint(SAMPLER),
       question: SAMPLER.question,
     });
-    AskAnswers.closeAsk("ask-old"); // its tool call died; the ticket is evictable
+    AskAnswers.closeAsk("pa-ask-old"); // its tool call died; the ticket is evictable
     for (let i = 0; i < 200; i += 1) {
       const ask = { question: `Q${i}?`, options: [{ label: "a" }, { label: "b" }] };
-      AskAnswers.openAsk(`ask-${i}`, {
+      AskAnswers.openAsk(`pa-ask-${i}`, {
         tabId: TAB,
         fingerprint: askFingerprint(ask),
         question: ask.question,
       });
-      AskAnswers.closeAsk(`ask-${i}`);
+      AskAnswers.closeAsk(`pa-ask-${i}`);
     }
-    expect(AskAnswers.ticketFor("ask-old")).toBeUndefined(); // ticket trimmed away
-    expect(AskAnswers.tracks("ask-old")).toBe(true); // …but still one of ours
-    AskAnswers.record("ask-old", "dpmpp_2m", { tabId: TAB });
-    const entry = AskAnswers.entriesFor(TAB).find((e) => e.askId === "ask-old");
+    expect(AskAnswers.ticketFor("pa-ask-old")).toBeUndefined(); // ticket trimmed away
+    expect(AskAnswers.tracks("pa-ask-old")).toBe(true); // …but still one of ours
+    AskAnswers.record("pa-ask-old", "dpmpp_2m", { tabId: TAB });
+    const entry = AskAnswers.entriesFor(TAB).find((e) => e.askId === "pa-ask-old");
     expect(entry?.answer).toBe("dpmpp_2m");
     expect(entry?.correlation.status).toBe("foreign"); // weakened, not lost
   });
 
   it("the same answer observed twice collapses to one entry (identity, not suppression)", () => {
     // The grace poll and the bridge sink can both see one card's reply.
-    AskAnswers.openAsk("ask-1", {
+    AskAnswers.openAsk("pa-ask-1", {
       tabId: TAB,
       fingerprint: askFingerprint(SAMPLER),
       question: SAMPLER.question,
     });
-    const a = AskAnswers.record("ask-1", "dpmpp_2m", { tabId: TAB });
-    const b = AskAnswers.record("ask-1", "dpmpp_2m", { tabId: TAB });
+    const a = AskAnswers.record("pa-ask-1", "dpmpp_2m", { tabId: TAB });
+    const b = AskAnswers.record("pa-ask-1", "dpmpp_2m", { tabId: TAB });
     expect(b.token).toBe(a.token);
     expect(AskAnswers.entriesFor(TAB)).toHaveLength(1);
   });
 
   it("two DIFFERENT answers are never merged, however alike", () => {
-    openAndAnswer("ask-1", SAMPLER, "dpmpp_2m");
-    openAndAnswer("ask-2", SAMPLER, "dpmpp_2m");
+    openAndAnswer("pa-ask-1", SAMPLER, "dpmpp_2m");
+    openAndAnswer("pa-ask-2", SAMPLER, "dpmpp_2m");
     expect(AskAnswers.entriesFor(TAB)).toHaveLength(2);
   });
 
@@ -388,7 +389,7 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
   // answer was recovered. The debt belongs to the TAB, not to its carrier.
   it("a recovery that consumes the disclosure's carrier re-homes the debt", () => {
     for (let i = 0; i < 20; i += 1) {
-      openAndAnswer(`ask-${i}`, { question: `Q${i}?`, options: [{ label: "a" }, { label: "b" }] }, `A${i}`);
+      openAndAnswer(`pa-ask-${i}`, { question: `Q${i}?`, options: [{ label: "a" }, { label: "b" }] }, `A${i}`);
     }
     const owed = AskAnswers.droppedFor(TAB);
     expect(owed).toBeGreaterThan(0);
@@ -402,20 +403,20 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
   // recovery window. "It went into a ToolResult" is exactly the thing that is not
   // provable here — that IS #486 — so nothing may be dropped on that basis.
   it("nothing is ever expired by age — only recovery, eviction or a gone tab remove an answer", () => {
-    AskAnswers.openAsk("ask-1", {
+    AskAnswers.openAsk("pa-ask-1", {
       tabId: TAB,
       fingerprint: askFingerprint(SAMPLER),
       question: SAMPLER.question,
     });
-    AskAnswers.record("ask-1", "dpmpp_2m", { tabId: TAB });
-    AskAnswers.markReturned("ask-1");
-    AskAnswers.closeAsk("ask-1");
+    AskAnswers.record("pa-ask-1", "dpmpp_2m", { tabId: TAB });
+    AskAnswers.markReturned("pa-ask-1");
+    AskAnswers.closeAsk("pa-ask-1");
     const entry = AskAnswers.entriesFor(TAB)[0];
     entry.answeredAt = Date.now() - ASK_RECOVER_MAX_AGE_MS * 10;
     // Any number of later journal operations must not sweep it away.
-    openAndAnswer("ask-2", SCHEDULER, "karras");
+    openAndAnswer("pa-ask-2", SCHEDULER, "karras");
     AskAnswers.recover(TAB, askFingerprint(SCHEDULER));
-    expect(AskAnswers.entriesFor(TAB).some((e) => e.askId === "ask-1")).toBe(true);
+    expect(AskAnswers.entriesFor(TAB).some((e) => e.askId === "pa-ask-1")).toBe(true);
     // Too old to be presented as a fresh decision, but still REPORTABLE.
     const rec = AskAnswers.recover(TAB, askFingerprint(SAMPLER));
     expect(rec.status).toBe("unattributed");
@@ -428,15 +429,15 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
   // same tab, and PUSHED into the replacement conversation — an unsolicited turn
   // about a decision that conversation never asked for.
   it("an answer to a card whose conversation was replaced is never announced to the new one", () => {
-    AskAnswers.openAsk("ask-1", {
+    AskAnswers.openAsk("pa-ask-1", {
       tabId: TAB,
       fingerprint: askFingerprint(SAMPLER),
       question: SAMPLER.question,
     });
-    AskAnswers.closeAsk("ask-1");
+    AskAnswers.closeAsk("pa-ask-1");
     AskAnswers.closeAsks(TAB); // New chat / resume of a historical session
     // The user clicks the still-rendered old card.
-    const entry = AskAnswers.record("ask-1", "dpmpp_2m", { tabId: TAB });
+    const entry = AskAnswers.record("pa-ask-1", "dpmpp_2m", { tabId: TAB });
     expect(entry.delivery).toBe("none");
     expect(AskAnswers.pending(TAB)).toHaveLength(0);
     expect(AskAnswers.hasOutstanding()).toBe(false);
@@ -449,7 +450,7 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
   });
 
   it("an already-journaled answer stops being pushed when its conversation is replaced", () => {
-    openAndAnswer("ask-1", SAMPLER, "dpmpp_2m");
+    openAndAnswer("pa-ask-1", SAMPLER, "dpmpp_2m");
     expect(AskAnswers.pending(TAB)).toHaveLength(1);
     AskAnswers.closeAsks(TAB);
     expect(AskAnswers.pending(TAB)).toHaveLength(0);
@@ -457,21 +458,21 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
   });
 
   it("a late answer for a tab that is GONE is never armed for a doomed push", () => {
-    AskAnswers.openAsk("ask-1", {
+    AskAnswers.openAsk("pa-ask-1", {
       tabId: TAB,
       fingerprint: askFingerprint(SAMPLER),
       question: SAMPLER.question,
     });
-    AskAnswers.closeAsk("ask-1");
+    AskAnswers.closeAsk("pa-ask-1");
     AskAnswers.forget(TAB); // workflow switched away / tab closed
-    const entry = AskAnswers.record("ask-1", "dpmpp_2m", { tabId: TAB });
+    const entry = AskAnswers.record("pa-ask-1", "dpmpp_2m", { tabId: TAB });
     expect(entry.delivery).toBe("none");
     expect(AskAnswers.hasOutstanding()).toBe(false);
   });
 
   it("takeDropped reports the un-carried debt once, and leaves entry-carried debt to its push", () => {
     for (let i = 0; i < 20; i += 1) {
-      openAndAnswer(`ask-${i}`, { question: `Q${i}?`, options: [{ label: "a" }, { label: "b" }] }, `A${i}`);
+      openAndAnswer(`pa-ask-${i}`, { question: `Q${i}?`, options: [{ label: "a" }, { label: "b" }] }, `A${i}`);
     }
     // Move all the debt into the side map by consuming every carrier.
     for (const e of AskAnswers.entriesFor(TAB).filter((x) => (x.disclose ?? 0) > 0)) {
@@ -489,11 +490,101 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     expect(AskAnswers.takeDropped(TAB)).toBe(0); // said once
   });
 
+  // codex round 2, P0: ownership of an ask id used to be answered from a BOUNDED
+  // set of remembered ids, so an eviction made the bridge's sink ignore — and
+  // therefore silently drop — a validated answer. It is now syntactic: a
+  // property of the id itself, which cannot expire, evict, or be raced.
+  it("ownership of an ask id is syntactic, so no bound can make an answer vanish", () => {
+    expect(AskAnswers.tracks(`${PANEL_ASK_ID_PREFIX}anything-at-all`)).toBe(true);
+    // Never opened, never remembered, journal completely empty — still ours.
+    AskAnswers.reset();
+    expect(AskAnswers.tracks(`${PANEL_ASK_ID_PREFIX}${"x".repeat(40)}`)).toBe(true);
+    // A confirm / 18+ consent / secret card's plain id is NOT ours: those cards
+    // have deliberately non-recoverable paths (a recovered "Yes, go ahead" must
+    // never authorise a different destructive operation).
+    expect(AskAnswers.tracks("b6f0a2c8-0000-4000-8000-000000000000")).toBe(false);
+  });
+
+  // codex round 2, P0: reopening an ask id overwrote the ticket's question and
+  // fingerprint, so the FIRST card's late click would be frozen with the SECOND
+  // question's identity and could be recovered as its answer.
+  it("a REUSED ask id can never satisfy a question — either question", () => {
+    AskAnswers.openAsk("pa-dup", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SAMPLER),
+      question: SAMPLER.question,
+    });
+    AskAnswers.closeAsk("pa-dup");
+    // The same id opened again, now for a DIFFERENT question.
+    AskAnswers.openAsk("pa-dup", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SCHEDULER),
+      question: SCHEDULER.question,
+    });
+    AskAnswers.closeAsk("pa-dup");
+    // The first card is clicked. Nothing on the wire says which card it was.
+    const entry = AskAnswers.record("pa-dup", "dpmpp_2m", { tabId: TAB });
+    expect(entry.correlation.status).toBe("foreign");
+    expect(entry.fingerprint).toBeNull();
+    expect(AskAnswers.recover(TAB, askFingerprint(SCHEDULER)).status).toBe("unattributed");
+    expect(AskAnswers.recover(TAB, askFingerprint(SAMPLER)).status).toBe("unattributed");
+    // …but it is still delivered, labelled UNDETERMINED.
+    expect(entry.delivery).toBe("pending");
+  });
+
+  // codex round 2, P0: the eviction DEBT is destroyed by a teardown exactly as an
+  // entry is, so a restart while one is owed turns a disclosed loss back into a
+  // silent one. It must hold the restart gate and appear in the exit disclosure.
+  it("an owed eviction disclosure keeps the journal 'outstanding' and is named on exit", () => {
+    for (let i = 0; i < 20; i += 1) {
+      openAndAnswer(`pa-ask-${i}`, { question: `Q${i}?`, options: [{ label: "a" }, { label: "b" }] }, `A${i}`);
+    }
+    expect(AskAnswers.droppedFor(TAB)).toBeGreaterThan(0);
+    // Every surviving answer is recovered away (each consume re-homes the debt),
+    // so all that is left of the eviction is a COUNTER with no carrier.
+    for (const e of AskAnswers.entriesFor(TAB)) AskAnswers.consume(e.token);
+    expect(AskAnswers.entriesFor(TAB)).toHaveLength(0);
+    expect(AskAnswers.hasOutstanding()).toBe(true); // the debt still holds the gate
+    const debt = AskAnswers.outstandingDebt();
+    expect(debt.some((d) => d.key === TAB && d.count > 0)).toBe(true);
+  });
+
+  it("a debt that a turn actually CARRIED is spent, and stops holding the gate", () => {
+    for (let i = 0; i < 20; i += 1) {
+      openAndAnswer(`pa-ask-${i}`, { question: `Q${i}?`, options: [{ label: "a" }, { label: "b" }] }, `A${i}`);
+    }
+    expect(AskAnswers.droppedFor(TAB)).toBeGreaterThan(0);
+    AskAnswers.deliverPending(TAB, () => true);
+    for (const e of AskAnswers.entriesFor(TAB)) AskAnswers.ack(e.token);
+    expect(AskAnswers.hasOutstanding()).toBe(false);
+    expect(AskAnswers.outstandingDebt()).toHaveLength(0);
+  });
+
+  // codex round 2, P0: a RETURNED answer inside the recovery window is still the
+  // only copy of a decision that may never have reached the model, so a fatal
+  // exit must name it even though a restart does not wait for it.
+  it("a recently-returned answer is named by the exit disclosure, but does not block a restart", () => {
+    AskAnswers.openAsk("pa-ask-1", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SAMPLER),
+      question: SAMPLER.question,
+    });
+    AskAnswers.record("pa-ask-1", "dpmpp_2m", { tabId: TAB });
+    AskAnswers.markReturned("pa-ask-1");
+    AskAnswers.closeAsk("pa-ask-1");
+    expect(AskAnswers.hasOutstanding()).toBe(false); // restarts are not stalled
+    expect(AskAnswers.allOutstanding().map((e) => e.answer)).toContain("dpmpp_2m");
+    // …and once it is far outside the recovery window there is nothing left to
+    // claim, so it stops being reported.
+    AskAnswers.entriesFor(TAB)[0].answeredAt = Date.now() - ASK_RECOVER_MAX_AGE_MS * 2;
+    expect(AskAnswers.allOutstanding()).toHaveLength(0);
+  });
+
   it("never throws when the flusher does", () => {
     AskAnswers.setFlusher(() => {
       throw new Error("no agent");
     });
-    expect(() => openAndAnswer("ask-1", SAMPLER, "dpmpp_2m")).toThrow();
+    expect(() => openAndAnswer("pa-ask-1", SAMPLER, "dpmpp_2m")).toThrow();
     // The entry is journaled regardless — the throw happens after the record.
     expect(AskAnswers.entriesFor(TAB)).toHaveLength(1);
     vi.restoreAllMocks();

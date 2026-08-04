@@ -60,6 +60,7 @@ import { RunCompletions } from "./run-completion-journal.js";
 import {
   AskAnswers,
   askFingerprint,
+  PANEL_ASK_ID_PREFIX,
   type AskEntry,
   type AskRecovery,
 } from "./ask-answer-journal.js";
@@ -3988,7 +3989,10 @@ async function askUserWithGrace(
   const timing = getAskTiming();
   // ONE ceiling for the whole handler, anchored before any work is done.
   const budgetEnd = Date.now() + ASK_TOTAL_BUDGET_CAP_MS;
-  const askId = randomUUID();
+  // PREFIXED so the bridge's late-answer sink can tell a panel_ask card from the
+  // other `ask_user` cards (confirm / 18+ consent / secret) purely from the id —
+  // see PANEL_ASK_ID_PREFIX. Ownership must not depend on any bounded store.
+  const askId = `${PANEL_ASK_ID_PREFIX}${randomUUID()}`;
   // Self-heal FIRST: the tab this resolves to is the tab the card renders on, and
   // it is the journal key every later match is made against. It throws when no
   // tab is bindable at all — surfaced as the tool's error exactly as before,

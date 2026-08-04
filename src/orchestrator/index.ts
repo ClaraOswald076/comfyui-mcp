@@ -2169,8 +2169,19 @@ export async function runPanelOrchestrator(): Promise<void> {
       // record is actionable rather than a bare count.
       for (const entry of AskAnswers.allOutstanding()) {
         const list = byTab.get(entry.key) ?? [];
-        list.push(`the user's answer to "${previewQuestion(entry.question)}"`);
+        list.push(
+          `the user's answer to "${previewQuestion(entry.question)}"${entry.returned ? " (handed to a tool call whose receipt was never confirmed)" : ""}`,
+        );
         byTab.set(entry.key, list);
+      }
+      // …and the answers whose only surviving record is a COUNTER, because the
+      // journal's bound already destroyed the text. Naming the count is the last
+      // thing that keeps that promise; without it the eviction path's "the next
+      // delivery will report it" quietly becomes never.
+      for (const { key, count } of AskAnswers.outstandingDebt()) {
+        const list = byTab.get(key) ?? [];
+        list.push(`${count} further answer(s) already dropped by the journal (content lost)`);
+        byTab.set(key, list);
       }
     } catch {
       return; // nothing readable — nothing to report

@@ -3097,6 +3097,44 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
     bridge.setLateAskReplySink(() => {});
   });
 
+  // codex round 2, P0: the rid→ask_id MAPPING is what makes a late reply
+  // recognisable as a card answer at all, so it gates the durable sink. It used
+  // to share the 5-minute TTL of the reply BUFFER — but a question card sits on
+  // screen until the user deals with it, which can be far longer than any tool
+  // call, so an answer given at T+6min was discarded with no record.
+  it("the ask-id mapping outlives the reply buffer, so a much-later answer is still recognised", async () => {
+    const seen: string[] = [];
+    bridge.setLateAskReplySink((askId) => seen.push(askId));
+    const sock = await connectPanel("tab-longwait", "wf");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-longwait")).toBe(true));
+    sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd === "ask_user") {
+        // A user who takes their time: the reply comes long after the card's own
+        // reply timer, and after the prune below has run.
+        setTimeout(() => {
+          sock.send(JSON.stringify({ rid: msg.rid, ok: true, result: "Much Later" }));
+        }, 300);
+      }
+    });
+    await expect(
+      bridge.send(
+        { cmd: "ask_user", ask_id: "pa-slow", question: "?", options: [] },
+        { tabId: "tab-longwait", timeoutMs: 30 },
+      ),
+    ).rejects.toThrow(/did not reply/i);
+    // Age the mapping past the BUFFER's TTL (5 min) but well inside the
+    // mapping's own (60 min)…
+    const map = (bridge as unknown as { askRidToId: Map<string, { ts: number }> }).askRidToId;
+    for (const e of map.values()) e.ts = Date.now() - 20 * 60_000;
+    // …and force a prune pass (any take runs one) BEFORE the reply lands, so the
+    // mapping has to survive its own TTL rule rather than merely not be swept.
+    expect(bridge.takeLateAskReply("nothing-here")).toBeUndefined();
+    expect(map.size).toBe(1);
+    await vi.waitFor(() => expect(seen).toEqual(["pa-slow"]), { timeout: 3000 });
+    bridge.setLateAskReplySink(() => {});
+  });
+
   it("a throwing sink never breaks the message loop or loses the buffered answer", async () => {
     bridge.setLateAskReplySink(() => {
       throw new Error("journal exploded");

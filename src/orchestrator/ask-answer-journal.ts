@@ -97,6 +97,20 @@ export interface AskTicket {
    * left to hand it to) and therefore worth pushing to the agent on its own.
    */
   awaiting: boolean;
+  /**
+   * This ask id was opened MORE THAN ONCE, so it no longer identifies a single
+   * question.
+   *
+   * Nothing on the wire distinguishes the first card's reply from the second's —
+   * the panel sends only the id — so once an id is reused, ANY answer for it is
+   * genuinely unattributable. It is therefore correlated as `foreign`
+   * (UNDETERMINED) rather than confidently matched: without this, the first
+   * card's late click would be frozen with the SECOND question's fingerprint and
+   * could then be recovered as the answer to a question it was never shown for.
+   * (`panel_ask` mints a fresh UUID per card, so this is defence in depth — but
+   * it is the difference between "unreachable" and "impossible".)
+   */
+  reused?: boolean;
 }
 
 /** Where an entry is in the PUSH pipeline (the durable agent-event delivery used
@@ -149,17 +163,33 @@ export interface AskEntry {
 
 /** Cards tracked at once. Generous: real sessions have one or two. */
 const MAX_TICKETS = 64;
-/** Ask ids remembered as "ours" (see AskAnswerJournalImpl.retired). Deliberately
- *  far larger than MAX_TICKETS so the memory always outlives the ticket. */
-const MAX_REMEMBERED_ASK_IDS = 1024;
+/** Ask ids whose CONVERSATION was replaced, remembered so a late click on the
+ *  old card is not announced to the replacement one. Bounded — and safely so:
+ *  forgetting one only means the answer is treated as an ordinary unattributable
+ *  answer (journaled, labelled), never that it is dropped. */
+const MAX_CONVERSATION_GONE_IDS = 1024;
+
+/**
+ * Prefix every `panel_ask` card's ask id carries.
+ *
+ * The bridge's late-answer sink is fed by EVERY `ask_user` card — the confirm
+ * gate, the 18+ consent card, the secret prompt — and only `panel_ask` answers
+ * belong in this journal. Ownership therefore has to be decidable from the id
+ * ITSELF: an earlier draft answered it from a bounded set of remembered ids,
+ * which meant an eviction turned a validated answer into nothing. A bounded
+ * store must never be what protects against loss, so the test is syntactic and
+ * cannot expire, evict, or be raced.
+ */
+export const PANEL_ASK_ID_PREFIX = "pa-";
 /**
  * How long a ticket is kept. The bridge only forwards a LATE answer for a card
- * whose rid→ask_id mapping is still alive, and that mapping is TTL-pruned at 5
- * minutes (UiBridge.LATE_ASK_TTL_MS) — so a ticket older than this can no longer
- * receive one and pruning it is provably lossless rather than a bound we are
- * hoping never bites.
+ * whose rid→ask_id mapping is still alive, so this must OUTLIVE that mapping's
+ * own TTL (UiBridge.LATE_ASK_MAP_TTL_MS, 60 minutes) or a ticket could be gone
+ * while an answer for it can still arrive. Sized above it, so pruning here is
+ * provably lossless rather than a bound we are hoping never bites — and losing
+ * one anyway only weakens a correlation to UNDETERMINED, never drops an answer.
  */
-const TICKET_MAX_AGE_MS = 7 * 60_000;
+const TICKET_MAX_AGE_MS = 65 * 60_000;
 /** Undelivered/unconsumed answers held per panel tab. */
 const MAX_ENTRIES_PER_KEY = 16;
 /** …and across all tabs. */
@@ -281,7 +311,6 @@ export class AskAnswerJournalImpl {
    * ticket may only ever WEAKEN a correlation (matched → foreign, i.e.
    * UNDETERMINED); it must never turn an answer into nothing.
    */
-  private retired = new Set<string>();
   /**
    * Ask ids whose CONVERSATION was replaced (New chat / resume of a historical
    * session) while their card was still on screen.
@@ -324,17 +353,25 @@ export class AskAnswerJournalImpl {
    */
   openAsk(askId: string, meta: { tabId: string; fingerprint: string; question: string }): void {
     this.pruneTickets();
-    this.remember(askId);
     const existing = this.tickets.get(askId);
     if (existing) {
-      // The same ask id dispatched again (a retry). Reopen rather than stack a
-      // second ticket, so one ask id always means one question.
+      // The same ask id dispatched AGAIN. Reopen rather than stack a second
+      // ticket (one ask id always means one ticket) — but the id now stands for
+      // MORE THAN ONE question, and the panel's reply carries only the id, so
+      // nothing can ever say which card an answer for it came from. Mark it
+      // reused: every answer for it is reported UNDETERMINED from here on, and
+      // in particular the older card's late click can no longer be frozen with
+      // the newer question's fingerprint and recovered as its answer.
       existing.tabId = meta.tabId;
       existing.fingerprint = meta.fingerprint;
       existing.question = meta.question;
       existing.openedAt = Date.now();
       existing.seq = ++this.ticketSeq;
       existing.awaiting = true;
+      existing.reused = true;
+      logger.warn(
+        `[ask-answers] ask id ${askId.slice(0, 12)} was opened again — it no longer identifies one question, so every answer for it is reported as UNDETERMINED`,
+      );
       return;
     }
     this.tickets.set(askId, {
@@ -356,7 +393,7 @@ export class AskAnswerJournalImpl {
    *  (a recovered "Yes, go ahead" must never authorise a different destructive
    *  operation). */
   tracks(askId: string): boolean {
-    return this.tickets.has(askId) || this.retired.has(askId);
+    return askId.startsWith(PANEL_ASK_ID_PREFIX);
   }
 
   /**
@@ -400,7 +437,11 @@ export class AskAnswerJournalImpl {
     const existing = [...this.entries.values()].find((e) => e.askId === askId);
     if (existing) return existing;
     const ticket = this.tickets.get(askId);
-    const correlation: AskCorrelation = ticket
+    // A REUSED id proves nothing: the panel sends only the id, so an answer for
+    // it could belong to either card. Report it as foreign — real, but
+    // UNDETERMINED — rather than claiming it answers the question now open.
+    const attributable = ticket !== undefined && ticket.reused !== true;
+    const correlation: AskCorrelation = attributable
       ? { status: "matched", askId }
       : { status: "foreign", askId };
     const entry: AskEntry = {
@@ -411,7 +452,10 @@ export class AskAnswerJournalImpl {
       // from, so an unattributable answer is still addressed somewhere real
       // instead of being dropped for want of a key.
       key: ticket?.tabId ?? meta.tabId,
-      fingerprint: ticket?.fingerprint ?? null,
+      // The fingerprint is the LICENCE to satisfy a re-ask, so a reused id gets
+      // none — its answer may only ever be reported, never returned as an answer.
+      // The question TEXT is still carried: it is what makes that report honest.
+      fingerprint: attributable ? ticket.fingerprint : null,
       question: ticket?.question ?? null,
       answer: answerText(reply),
       answeredAt: Date.now(),
@@ -432,9 +476,9 @@ export class AskAnswerJournalImpl {
       logger.warn(
         `[ask-answers] an answer arrived for a card whose conversation was replaced (ask ${askId.slice(0, 8)}, tab ${entry.key.slice(0, 8)}): "${entry.answer}" — journaled for disclosure, NOT announced to the replacement conversation`,
       );
-    } else if (!ticket) {
+    } else if (!attributable) {
       logger.warn(
-        `[ask-answers] a validated answer arrived for ask ${askId.slice(0, 8)} with no open ticket — journaled as UNATTRIBUTED; it can never satisfy a question, only be reported`,
+        `[ask-answers] a validated answer arrived for ask ${askId.slice(0, 8)} with ${ticket ? "a REUSED (ambiguous) ticket" : "no open ticket"} — journaled as UNATTRIBUTED; it can never satisfy a question, only be reported`,
       );
     }
     this.trimEntries(entry.key);
@@ -654,13 +698,48 @@ export class AskAnswerJournalImpl {
    *  self-restart gate reads this: the journal is in-memory, so restarting while
    *  one is outstanding silently drops an answer the user actually gave. */
   hasOutstanding(): boolean {
-    return [...this.entries.values()].some((e) => e.delivery !== "none");
+    // The eviction DEBT counts too. It is a promise to tell the agent that an
+    // answer was lost, and it is destroyed by a teardown exactly as an entry is —
+    // tearing down while one is owed turns a disclosed loss back into a silent
+    // one, which is the whole thing this journal exists to prevent.
+    if (this.dropped.size > 0) return true;
+    return [...this.entries.values()].some(
+      (e) => e.delivery !== "none" || (e.disclose ?? 0) > 0,
+    );
   }
 
-  /** Every answer still awaiting a push, across all tabs — for the last-ditch
-   *  disclosure the orchestrator makes when a fatal exit destroys them. */
+  /**
+   * Everything the last-ditch, we-are-about-to-die disclosure must name.
+   *
+   * Broader than `hasOutstanding` on purpose. A restart is a CHOICE we can defer,
+   * so it waits only on what is still deliverable; a fatal exit is not, so it
+   * reports everything a validated answer might still have been needed for:
+   *  • answers awaiting a push (nobody has them);
+   *  • answers that went into a ToolResult RECENTLY — "returned" is a hand-off,
+   *    not a receipt (that IS #486), and inside the recovery window a re-ask was
+   *    still able to produce it. Deferring restarts on these would stall the
+   *    self-restarter after every single ask; SAYING so on the way out costs
+   *    nothing and keeps the loss from being silent.
+   */
   allOutstanding(): AskEntry[] {
-    return [...this.entries.values()].filter((e) => e.delivery !== "none");
+    const now = Date.now();
+    return [...this.entries.values()].filter(
+      (e) =>
+        e.delivery !== "none" ||
+        (e.disclose ?? 0) > 0 ||
+        now - e.answeredAt <= RECOVER_MAX_AGE_MS,
+    );
+  }
+
+  /** Tabs still owed an eviction disclosure, with the count — so a fatal exit can
+   *  name a loss whose carrier is only a counter. */
+  outstandingDebt(): Array<{ key: string; count: number }> {
+    const byTab = new Map<string, number>();
+    for (const [key, n] of this.dropped) byTab.set(key, (byTab.get(key) ?? 0) + n);
+    for (const e of this.entries.values()) {
+      if ((e.disclose ?? 0) > 0) byTab.set(e.key, (byTab.get(e.key) ?? 0) + e.disclose!);
+    }
+    return [...byTab].map(([key, count]) => ({ key, count }));
   }
 
   /** Move every entry AND every open ticket from `from` onto `to` — a panel
@@ -687,11 +766,13 @@ export class AskAnswerJournalImpl {
     for (const [token, entry] of [...this.entries]) {
       if (entry.key !== key) continue;
       this.entries.delete(token);
-      if (!entry.returned) {
-        logger.warn(
-          `[ask-answers] dropping a validated answer to "${preview(entry.question)}" — its tab (${key.slice(0, 8)}) is gone`,
-        );
-      }
+      // EVERY answer is logged, returned ones included: "it went into a
+      // ToolResult" is not proof it was received, so a returned answer inside
+      // the recovery window is still the only copy of a decision that may never
+      // have reached the model.
+      logger.warn(
+        `[ask-answers] dropping a validated answer ("${entry.answer}") to "${preview(entry.question)}" — its tab (${key.slice(0, 8)}) is gone${entry.returned ? " (it had been handed to a tool result, which is not proof it was received)" : ""}`,
+      );
     }
     for (const [id, ticket] of [...this.tickets]) {
       if (ticket.tabId !== key) continue;
@@ -732,7 +813,7 @@ export class AskAnswerJournalImpl {
       // unattributable answer and announcing it to the replacement agent.
       this.conversationGone.add(id);
     }
-    while (this.conversationGone.size > MAX_REMEMBERED_ASK_IDS) {
+    while (this.conversationGone.size > MAX_CONVERSATION_GONE_IDS) {
       const oldest = this.conversationGone.values().next().value;
       if (oldest === undefined) break;
       this.conversationGone.delete(oldest);
@@ -779,24 +860,11 @@ export class AskAnswerJournalImpl {
     // NOTE: the flusher is deliberately NOT cleared — it belongs to the process's
     // orchestrator, not to any one test's fixture.
     this.tickets.clear();
-    this.retired.clear();
     this.conversationGone.clear();
     this.entries.clear();
     this.dropped.clear();
     this.seq = 0;
     this.ticketSeq = 0;
-  }
-
-  /** Remember an ask id forever-ish (bounded FIFO) so `tracks()` never denies
-   *  one of ours just because its ticket was trimmed. Far larger than
-   *  MAX_TICKETS so it always outlives the ticket it mirrors. */
-  private remember(askId: string): void {
-    this.retired.add(askId);
-    while (this.retired.size > MAX_REMEMBERED_ASK_IDS) {
-      const oldest = this.retired.values().next().value;
-      if (oldest === undefined) break;
-      this.retired.delete(oldest);
-    }
   }
 
   /** Tickets whose card can no longer receive an answer (see TICKET_MAX_AGE_MS)
@@ -875,8 +943,14 @@ export class AskAnswerJournalImpl {
         this.entries.delete(victim.token);
         mine = mine.filter((e) => e !== victim);
         if (victim.returned) {
+          // Logged, not counted as a loss for the agent: it DID reach a caller,
+          // and counting every ordinary successful ask as an undetermined
+          // dropped answer would cry wolf on every tab that asks a lot — the
+          // warning would stop meaning anything, which is its own kind of
+          // silence. The record is here, with the answer text, so a real loss is
+          // still reconstructable.
           logger.warn(
-            `[ask-answers] ${label} — forgetting an already-returned answer to "${preview(victim.question)}" (a re-ask can no longer recover it)`,
+            `[ask-answers] ${label} — forgetting an already-returned answer ("${victim.answer}") to "${preview(victim.question)}"; a re-ask can no longer recover it, and a tool result is not proof it was received`,
           );
           continue;
         }
