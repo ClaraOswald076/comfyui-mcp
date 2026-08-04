@@ -1065,6 +1065,37 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     expect(b.recoverable).toBe(false);
   });
 
+  // Coordinator gate: the collapse guard read `ticket?.reused`, which is an
+  // EVICTABLE store — once the reused ticket was trimmed the guard silently
+  // switched back on and the second card's validated answer was discarded before
+  // it ever had an entry. The ambiguity now lives on the ENTRY, which outlives
+  // the ticket.
+  it("a trimmed reused TICKET does not re-enable the identical-answer collapse", () => {
+    AskAnswers.openAsk("pa-evicted", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SAMPLER),
+      question: SAMPLER.question,
+    });
+    AskAnswers.closeAsk("pa-evicted");
+    const a = AskAnswers.record("pa-evicted", "euler", { tabId: TAB });
+    // A second card reuses the id, for a different question…
+    AskAnswers.openAsk("pa-evicted", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SCHEDULER),
+      question: SCHEDULER.question,
+    });
+    expect(a.ambiguousId).toBe(true); // frozen on the entry at reopen
+    // …and then the ticket ceiling bites.
+    AskAnswers.dropTicketForTest("pa-evicted");
+    expect(AskAnswers.ticketFor("pa-evicted")).toBeUndefined();
+    // The user answers the SECOND card with the same text.
+    const b = AskAnswers.record("pa-evicted", "euler", { tabId: TAB });
+    expect(b.token).not.toBe(a.token); // kept, not collapsed away
+    expect(AskAnswers.entriesFor(TAB)).toHaveLength(2);
+    expect(b.recoverable).toBe(false);
+    expect(a.recoverable).toBe(false);
+  });
+
   it("…but one observation seen twice is still ONE answer", () => {
     // The grace poll and the bridge sink can both see a single card's reply. The
     // id is not reused there, so the collapse is identity, not suppression.

@@ -214,6 +214,17 @@ export interface AskEntry {
    * revoking a permission silently revoked a promise.
    */
   recoverable?: boolean;
+  /**
+   * This entry's ask id stands for MORE THAN ONE card.
+   *
+   * Stamped on the ENTRY, not read from the ticket, because tickets are
+   * EVICTABLE: once the reused ticket is trimmed, `ticket?.reused !== true` goes
+   * true again and the identical-answer collapse switches back on — silently
+   * discarding the second card's validated answer before it ever has an entry.
+   * The entry outlives the ticket, so the ambiguity must too. (Exactly the
+   * reasoning behind JournalEntry.ambiguousId in #468's run journal.)
+   */
+  ambiguousId?: boolean;
 }
 
 /**
@@ -462,6 +473,21 @@ export class AskAnswerJournalImpl {
       logger.warn(
         `[ask-answers] ask id ${askId.slice(0, 12)} was opened again — it no longer identifies one question, so every answer for it is reported as UNDETERMINED`,
       );
+      // FREEZE THE AMBIGUITY ONTO THE ENTRIES THAT ALREADY EXIST for this id.
+      // The ticket is evictable and this fact is not: once it is trimmed away,
+      // anything keyed on `ticket.reused` silently reverts to treating the id as
+      // a clean identity. Each such entry keeps its OWN question text — that is
+      // still honest and is what makes its disclosure useful — but loses the
+      // licence to answer anything.
+      for (const entry of this.entries.values()) {
+        if (entry.askId !== askId) continue;
+        entry.ambiguousId = true;
+        entry.recoverable = false;
+        entry.fingerprint = null;
+        if (entry.correlation.status === "matched") {
+          entry.correlation = { status: "foreign", askId };
+        }
+      }
       this.trimTickets();
       return;
     }
@@ -559,12 +585,20 @@ export class AskAnswerJournalImpl {
     // both) are two validated answers to two questions, and merging them leaves
     // the second question unanswered with no record at all.
     if (existing) {
-      if (existing.answer === text && ticket?.reused !== true) return existing;
+      // The ENTRY's own ambiguity flag is the load-bearing half — see
+      // AskEntry.ambiguousId. `ticket?.reused` is kept alongside it as the
+      // earliest signal, but it may have been evicted, and a bound must never be
+      // what decides whether an answer is allowed to disappear.
+      if (existing.answer === text && existing.ambiguousId !== true && ticket?.reused !== true) {
+        return existing;
+      }
       logger.warn(
         `[ask-answers] a SECOND answer arrived under ask id ${askId.slice(0, 12)} ("${text}"${existing.answer === text ? " — same text, but the id is REUSED so this is a different card" : ` vs "${existing.answer}"`}) — both are kept and both are reported as UNDETERMINED; neither can satisfy a question`,
       );
       existing.correlation = { status: "foreign", askId };
       existing.recoverable = false;
+      // …and the ambiguity is frozen here too, so it survives the ticket.
+      existing.ambiguousId = true;
     }
     // A REUSED id proves nothing: the panel sends only the id, so an answer for
     // it could belong to either card. Report it as foreign — real, but
@@ -629,6 +663,9 @@ export class AskAnswerJournalImpl {
       // A question the CURRENT conversation never asked may be reported, never
       // returned as its answer.
       ...(conversationGone || existing !== undefined ? { recoverable: false } : {}),
+      // A SECOND answer under one ask id: the id is ambiguous for this entry too,
+      // and that must outlive the ticket that proved it.
+      ...(existing !== undefined || ticket?.reused === true ? { ambiguousId: true } : {}),
       attempts: 0,
     };
     this.entries.set(entry.token, entry);
