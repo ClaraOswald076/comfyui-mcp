@@ -575,6 +575,9 @@ describe("panel_restart_comfyui — Pinokio-style refuse-safe preflight (#742)",
     // The refusal is about the binding that actually applies now.
     expect(out.refused).toBe(true);
     expect(note).toMatch(/panel connection changed/i);
+    // Same condition on this refusal: name the alternative and say why it works.
+    expect(note).toMatch(/use restart_comfyui instead/i);
+    expect(note).toMatch(/not tied to a browser tab/i);
     // CRITICAL: nothing was dispatched to the unidentified target.
     expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
   });
@@ -661,6 +664,10 @@ describe("panel_restart_comfyui — Pinokio-style refuse-safe preflight (#742)",
     // It reports what it DID — not a 'still running' claim about an instance it has
     // just said it cannot identify (the same rule r8 enforces for a stale target).
     expect(String(out.note)).toMatch(/nothing was stopped/i);
+    // A user who loses this entry point is told which one still works AND why: the
+    // refusal is a documented trade, not a dead end (coordinator ruling).
+    expect(String(out.note)).toMatch(/use restart_comfyui instead/i);
+    expect(String(out.note)).toMatch(/not tied to a browser tab/i);
     // A PASSING local assessment did not launder permission for a target it does not
     // describe — and was never even asked.
     expect(preflight).not.toHaveBeenCalled();

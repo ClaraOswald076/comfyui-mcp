@@ -1022,6 +1022,26 @@ export function probePortOwner(port: number, host?: string): PortOwnerProbe {
     return { state: "free" };
   };
 
+  // WHICH HALF CARRIES THE GUARANTEE — stated here because the two sources below do
+  // NOT offer the same one, and a reader who assumes they do will over-trust this.
+  //
+  // The `/proc` attribution above brackets a pid against a SPECIFIC SOCKET: the inode
+  // is re-read from the kernel table and the pid's complete fd set must still contain
+  // it, so a socket that changed hands, or was released while its holder kept another
+  // listener on the same port, withdraws the finding.
+  //
+  // `lsof -Fpn` cannot express that. Its records carry a pid and an address:port and
+  // NO inode, so this fallback attributes BY PID ALONE — it can say "some process is
+  // listening there and it is this one", not "this process holds the socket I was
+  // tracking". The substitution the bracket closes is therefore closed for the /proc
+  // path and NOT for this one.
+  //
+  // It is kept regardless, and deliberately: it is exactly the pre-existing behaviour
+  // (this is how the port owner has always been named on hosts without a readable
+  // /proc), so nothing is made worse, while removing it would restore the permanent
+  // "cannot confirm" on every non-Linux and unprivileged host — the very state #795
+  // exists to shrink. The honest summary is that /proc attribution is stronger than
+  // lsof attribution, not that both are airtight.
   try {
     const out = runLsofListenerQuery(port);
     const pid = parseListenerPidFromLsof(out, port, host);

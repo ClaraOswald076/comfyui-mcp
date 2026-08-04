@@ -6550,9 +6550,17 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               // A claim about what I DID, not about a server I have just said I cannot
               // identify: "it is still running" would be exactly the unvalidated
               // assertion the stale-target rule forbids (r8).
-              "again. Nothing was dispatched, so nothing was stopped. Restart it from " +
-              "whatever launches it (its own launcher, the Desktop app, or your terminal), or " +
-              "use restart_comfyui, which acts on the instance this server is configured for.",
+              "again. Nothing was dispatched, so nothing was stopped. USE restart_comfyui " +
+              // The alternative is NAMED and the difference EXPLAINED (coordinator
+              // ruling): this tool restarts whatever the calling TAB fronts, which is
+              // exactly the thing that could not be identified here. restart_comfyui is
+              // not tab-scoped — it acts on the ComfyUI this server is configured for,
+              // which it can identify and assess — so it remains available. A user who
+              // loses one entry point must be told the other one works, and why.
+              "INSTEAD: unlike this panel-scoped restart, it is not tied to a browser tab " +
+              "— it acts on the ComfyUI this server is configured for, which it CAN " +
+              "identify and check before stopping. Or restart ComfyUI from whatever " +
+              "launches it (its own launcher, the Desktop app, or your terminal).",
           });
         }
         if (preflightBound) {
@@ -6679,9 +6687,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               "was being prepared, and I can no longer confirm which ComfyUI this tab " +
               "fronts — a restart STOPS a server, so it is never sent to one I cannot " +
               // Again: what I did, not what an unidentified instance is doing.
-              "identify. Nothing was dispatched, so nothing was stopped. Retry once " +
-              "the panel has settled, or use restart_comfyui, which acts on the instance " +
-              "this server is configured for.",
+              "identify. Nothing was dispatched, so nothing was stopped. Retry once the " +
+              "panel has settled, or USE restart_comfyui INSTEAD: unlike this panel-scoped " +
+              "restart, it is not tied to a browser tab — it acts on the ComfyUI this " +
+              "server is configured for, which it CAN identify and check before stopping.",
           });
         }
         const timing = getPanelRebootTiming();
