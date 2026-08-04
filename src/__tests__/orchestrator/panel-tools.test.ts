@@ -4221,14 +4221,22 @@ describe("panel_ask keeps a validated answer across a tool timeout (#486)", () =
     expect(text).toContain(SAMPLER.question);
   });
 
-  it("a recovered answer is served ONCE — a later ask does not get it again", async () => {
+  // codex round 3, P0: the recovery used to DELETE the journal's copy the moment
+  // it handed the answer back — but that hand-off is a ToolResult, which is
+  // exactly the thing that can be abandoned (it IS #486). Destroying the copy
+  // there recreates the bug one level up, so a further re-ask gets it AGAIN,
+  // flagged so the agent does not act on it twice.
+  it("a recovered answer survives its own hand-off and is re-surfaced, flagged", async () => {
     await askThenAnswerLate(SAMPLER, "dpmpp_2m");
     const ctx = () => ({ bridge: timingOutBridge(), tabId: TAB }) as unknown as PanelToolCtx;
     const first = await defByName("panel_ask").handler(SAMPLER as Record<string, unknown>, ctx());
     expect(first.isError).toBeFalsy();
+    expect(askText(first)).toContain("dpmpp_2m");
+    expect(askText(first)).not.toMatch(/handed to you before/i);
     const second = await defByName("panel_ask").handler(SAMPLER as Record<string, unknown>, ctx());
-    expect(second.isError).toBe(true);
-    expect(askText(second)).not.toContain("dpmpp_2m");
+    expect(second.isError).toBeFalsy();
+    expect(askText(second)).toContain("dpmpp_2m");
+    expect(askText(second)).toMatch(/handed to you before/i);
   });
 
   // THE INVERSE, and the more damaging direction: a replayed answer must never

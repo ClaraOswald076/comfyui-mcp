@@ -3041,8 +3041,14 @@ export async function runPanelOrchestrator(): Promise<void> {
           // and the next flush would announce the DESTINATION tab's answer to the
           // SOURCE tab's conversation — an answer delivered to a conversation
           // that never asked the question.
+          // The eviction DEBT counts as state too: a destination holding only
+          // "we dropped N of your answers" is not empty — moveKey would carry
+          // that debt under the destination id and the incoming source's agent
+          // would be told the DESTINATION tab's answers were lost.
           const destinationJournaled =
-            RunCompletions.outstanding(panelTab).length + AskAnswers.entriesFor(panelTab).length;
+            RunCompletions.outstanding(panelTab).length +
+            AskAnswers.entriesFor(panelTab).length +
+            AskAnswers.droppedFor(panelTab);
           const destinationHadState = [...KNOWN_BACKENDS].some((b) =>
             destinationHasCollisionState({
               hasManagerState: manager.hasAnyState(panelTab + AGENT_KEY_SEP + b),

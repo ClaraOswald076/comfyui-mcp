@@ -910,21 +910,18 @@ export class UiBridge {
    *  journal the sink feeds — so this stays short. */
   private static readonly LATE_ASK_TTL_MS = 5 * 60 * 1000;
   /**
-   * TTL for the rid→ask_id MAPPING, which is a different thing with a different
+   * Ask cards whose rid→ask_id mapping is retained.
+   *
+   * This mapping is a different thing from the buffer above, with a different
    * job: it is what lets a late reply be RECOGNISED as a card answer at all, and
-   * therefore what gates the durable sink. A question card sits on screen until
-   * the user deals with it — which can be far longer than any tool call — so
-   * pruning this at the buffer's 5 minutes would silently discard a validated
-   * answer that the journal would otherwise have kept (#486). Kept an order of
-   * magnitude longer than the journal's own recovery window, so the JOURNAL's
-   * bound is the binding one and this is never the thing that loses an answer.
-   * Three small fields per open card; the cardinality cap below bounds it.
+   * therefore what gates the durable ask journal (#486). It deliberately has NO
+   * TTL. A question card sits on screen until the user deals with it, which can
+   * be arbitrarily longer than any tool call, so any clock here would be a
+   * stopwatch quietly deciding that a validated answer no longer counts — and
+   * the answer would be dropped with no record at all. Three small fields per
+   * card, so a whole session's worth costs nothing; overflowing THIS is the only
+   * way a mapping is ever forgotten, and it is logged at ERROR.
    */
-  private static readonly LATE_ASK_MAP_TTL_MS = 60 * 60 * 1000;
-  /** Concurrent ask cards whose rid→ask_id mapping is retained. Far above any
-   *  real session (which has one or two); exceeding it is logged, because
-   *  dropping the oldest mapping means a late answer for that card can no longer
-   *  be recognised. */
   private static readonly MAX_ASK_RID_MAPPINGS = 1024;
   /** In-flight IDEMPOTENT reads whose socket dropped mid-command, parked per tabId
    *  waiting a bounded grace for that tab to reconnect so we can re-dispatch them
@@ -1897,16 +1894,14 @@ export class UiBridge {
     for (const [id, e] of this.lateAskReplies) {
       if (now - e.ts > UiBridge.LATE_ASK_TTL_MS) this.lateAskReplies.delete(id);
     }
-    // TTL-prune abandoned rid→ask_id mappings on their OWN, much longer clock —
-    // this is what makes a late answer recognisable at all (#486), so it must
-    // outlive the buffer above rather than share its window.
-    for (const [rid, e] of this.askRidToId) {
-      if (now - e.ts > UiBridge.LATE_ASK_MAP_TTL_MS) this.askRidToId.delete(rid);
-    }
-    // Cardinality cap in case of a burst of asks within one TTL window — drop the
-    // oldest-inserted mappings so the map can never grow unbounded. LOUD: past
-    // this point a late answer for that card can no longer be recognised, so it
-    // is a real (if wildly unlikely) degradation, not routine housekeeping.
+    // NOTE: rid→ask_id mappings are deliberately NOT TTL-pruned — see
+    // MAX_ASK_RID_MAPPINGS. A card can be answered arbitrarily late, and this
+    // mapping is the only thing that makes such an answer recognisable.
+    //
+    // The cardinality cap is the sole bound: drop the oldest-inserted mappings so
+    // the map can never grow without limit. LOUD, because past this point a late
+    // answer for that card can no longer be recognised — a real (if wildly
+    // unlikely) degradation, not routine housekeeping.
     if (this.askRidToId.size > UiBridge.MAX_ASK_RID_MAPPINGS) {
       const excess = this.askRidToId.size - UiBridge.MAX_ASK_RID_MAPPINGS;
       logger.error(

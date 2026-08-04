@@ -41,6 +41,26 @@ function openAndAnswer(
   AskAnswers.record(askId, answer, { tabId });
 }
 
+/**
+ * Drive the journal into the state where an eviction's disclosure has NO entry
+ * to ride out on, so the debt is parked in the side map: fill the tab's ceiling
+ * with orphans, hand them all off, then record one more answer whose own handler
+ * is still awaiting (delivery "none") so the eviction it triggers finds nothing
+ * pending to stamp.
+ */
+function strandEvictionDebt(): void {
+  for (let i = 0; i < 48; i += 1) {
+    openAndAnswer(`pa-fill-${i}`, { question: `F${i}?`, options: [{ label: "a" }, { label: "b" }] }, `F${i}`);
+  }
+  AskAnswers.deliverPending(TAB, () => true); // every entry handed off, none pending
+  AskAnswers.openAsk("pa-live", {
+    tabId: TAB,
+    fingerprint: askFingerprint(SAMPLER),
+    question: SAMPLER.question,
+  });
+  AskAnswers.record("pa-live", "dpmpp_2m", { tabId: TAB }); // still awaiting -> "none"
+}
+
 beforeEach(() => {
   AskAnswers.reset();
   AskAnswers.setFlusher(() => {});
@@ -67,13 +87,23 @@ describe("ask-answer journal — an answer survives its tool call (#486)", () =>
     expect(rec.entry.question).toBe(SAMPLER.question);
   });
 
-  it("hands the SAME answer over only once", () => {
+  // A recovery is a HAND-OFF, not a receipt: the ToolResult carrying it can be
+  // abandoned exactly like the one that lost it in the first place. So the
+  // journal keeps its copy and a further re-ask gets it again, FLAGGED.
+  it("a recovered answer is kept and can be surfaced again, flagged", () => {
     openAndAnswer("pa-ask-1", SAMPLER, "dpmpp_2m");
     const first = AskAnswers.recover(TAB, askFingerprint(SAMPLER));
     expect(first.status).toBe("recovered");
     if (first.status !== "recovered") return;
-    AskAnswers.consume(first.entry.token);
-    expect(AskAnswers.recover(TAB, askFingerprint(SAMPLER)).status).toBe("none");
+    expect(first.entry.replayHint).toBeUndefined();
+    AskAnswers.markSurfaced(first.entry.token);
+    const again = AskAnswers.recover(TAB, askFingerprint(SAMPLER));
+    expect(again.status).toBe("recovered");
+    if (again.status !== "recovered") return;
+    expect(again.entry.answer).toBe("dpmpp_2m");
+    expect(again.entry.replayHint).toBe(true);
+    // …and it stops being announced as an unclaimed orphan.
+    expect(AskAnswers.orphansFor(TAB)).toHaveLength(0);
   });
 
   it("an answer handed to a tool result is NOT pushed, but is still recoverable", () => {
@@ -290,7 +320,7 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
   it("an evicted ORPHAN is counted and disclosed on the next delivery", () => {
     // 16 answers fit per tab; the 17th evicts one. Every one of these reached
     // nobody, so the eviction is a real loss and must be reported.
-    for (let i = 0; i < 20; i += 1) {
+    for (let i = 0; i < 60; i += 1) {
       openAndAnswer(`pa-ask-${i}`, { question: `Q${i}?`, options: [{ label: "a" }, { label: "b" }] }, `A${i}`);
     }
     expect(AskAnswers.droppedFor(TAB)).toBeGreaterThan(0);
@@ -303,7 +333,7 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
   });
 
   it("an eviction disclosure is NOT spent by a hand-off that is later given back", () => {
-    for (let i = 0; i < 20; i += 1) {
+    for (let i = 0; i < 60; i += 1) {
       openAndAnswer(`pa-ask-${i}`, { question: `Q${i}?`, options: [{ label: "a" }, { label: "b" }] }, `A${i}`);
     }
     const carrier = AskAnswers.pending(TAB)[0];
@@ -321,7 +351,7 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     // Ordinary successful asks must not manufacture "answers were dropped"
     // warnings — they reached a caller. Only the orphan is a loss.
     openAndAnswer("orphan", SAMPLER, "dpmpp_2m");
-    for (let i = 0; i < 30; i += 1) {
+    for (let i = 0; i < 70; i += 1) {
       const ask = { question: `Q${i}?`, options: [{ label: "a" }, { label: "b" }] };
       AskAnswers.openAsk(`pa-ret-${i}`, {
         tabId: TAB,
@@ -347,7 +377,7 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
       question: SAMPLER.question,
     });
     AskAnswers.closeAsk("pa-ask-old"); // its tool call died; the ticket is evictable
-    for (let i = 0; i < 200; i += 1) {
+    for (let i = 0; i < 1200; i += 1) {
       const ask = { question: `Q${i}?`, options: [{ label: "a" }, { label: "b" }] };
       AskAnswers.openAsk(`pa-ask-${i}`, {
         tabId: TAB,
@@ -383,20 +413,21 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     expect(AskAnswers.entriesFor(TAB)).toHaveLength(2);
   });
 
-  // codex round 1, P0: an eviction disclosure was stamped onto a surviving entry,
-  // and `consume()` (a recovery) then deleted that carrier outright — so an
-  // eviction the journal had promised to report vanished because an unrelated
-  // answer was recovered. The debt belongs to the TAB, not to its carrier.
-  it("a recovery that consumes the disclosure's carrier re-homes the debt", () => {
-    for (let i = 0; i < 20; i += 1) {
+  // codex rounds 1+3, P0: an eviction disclosure is stamped onto a surviving
+  // entry, and a recovery used to DELETE that carrier — so an eviction the
+  // journal had promised to report vanished because an unrelated answer was
+  // recovered. A recovery no longer deletes anything, so the debt rides on.
+  it("a recovery leaves the disclosure's carrier (and its debt) in place", () => {
+    for (let i = 0; i < 60; i += 1) {
       openAndAnswer(`pa-ask-${i}`, { question: `Q${i}?`, options: [{ label: "a" }, { label: "b" }] }, `A${i}`);
     }
     const owed = AskAnswers.droppedFor(TAB);
     expect(owed).toBeGreaterThan(0);
     const carrier = AskAnswers.entriesFor(TAB).find((e) => (e.disclose ?? 0) > 0);
     expect(carrier).toBeDefined();
-    AskAnswers.consume(carrier!.token);
+    AskAnswers.markSurfaced(carrier!.token);
     expect(AskAnswers.droppedFor(TAB)).toBe(owed);
+    expect(AskAnswers.entriesFor(TAB).some((e) => e.token === carrier!.token)).toBe(true);
   });
 
   // codex round 1, P0: a RETURNED answer used to be deleted once it aged past the
@@ -470,21 +501,8 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     expect(AskAnswers.hasOutstanding()).toBe(false);
   });
 
-  it("takeDropped reports the un-carried debt once, and leaves entry-carried debt to its push", () => {
-    for (let i = 0; i < 20; i += 1) {
-      openAndAnswer(`pa-ask-${i}`, { question: `Q${i}?`, options: [{ label: "a" }, { label: "b" }] }, `A${i}`);
-    }
-    // Move all the debt into the side map by consuming every carrier.
-    for (const e of AskAnswers.entriesFor(TAB).filter((x) => (x.disclose ?? 0) > 0)) {
-      AskAnswers.consume(e.token);
-    }
-    // Consuming re-homes onto another PENDING entry when one exists, so drain
-    // them all to force the side map.
-    while (AskAnswers.entriesFor(TAB).some((e) => (e.disclose ?? 0) > 0)) {
-      const carrier = AskAnswers.entriesFor(TAB).find((e) => (e.disclose ?? 0) > 0)!;
-      AskAnswers.consume(carrier.token);
-      if (AskAnswers.pending(TAB).length === 0) break;
-    }
+  it("takeDropped reports the un-carried debt once", () => {
+    strandEvictionDebt();
     const owed = AskAnswers.takeDropped(TAB);
     expect(owed).toBeGreaterThan(0);
     expect(AskAnswers.takeDropped(TAB)).toBe(0); // said once
@@ -536,21 +554,16 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
   // entry is, so a restart while one is owed turns a disclosed loss back into a
   // silent one. It must hold the restart gate and appear in the exit disclosure.
   it("an owed eviction disclosure keeps the journal 'outstanding' and is named on exit", () => {
-    for (let i = 0; i < 20; i += 1) {
-      openAndAnswer(`pa-ask-${i}`, { question: `Q${i}?`, options: [{ label: "a" }, { label: "b" }] }, `A${i}`);
-    }
+    strandEvictionDebt();
+    // Nothing is left pending or handed off that carries it — only a counter.
     expect(AskAnswers.droppedFor(TAB)).toBeGreaterThan(0);
-    // Every surviving answer is recovered away (each consume re-homes the debt),
-    // so all that is left of the eviction is a COUNTER with no carrier.
-    for (const e of AskAnswers.entriesFor(TAB)) AskAnswers.consume(e.token);
-    expect(AskAnswers.entriesFor(TAB)).toHaveLength(0);
-    expect(AskAnswers.hasOutstanding()).toBe(true); // the debt still holds the gate
+    expect(AskAnswers.hasOutstanding()).toBe(true); // the debt holds the restart gate
     const debt = AskAnswers.outstandingDebt();
-    expect(debt.some((d) => d.key === TAB && d.count > 0)).toBe(true);
+    expect(debt.some((x) => x.key === TAB && x.count > 0)).toBe(true);
   });
 
   it("a debt that a turn actually CARRIED is spent, and stops holding the gate", () => {
-    for (let i = 0; i < 20; i += 1) {
+    for (let i = 0; i < 60; i += 1) {
       openAndAnswer(`pa-ask-${i}`, { question: `Q${i}?`, options: [{ label: "a" }, { label: "b" }] }, `A${i}`);
     }
     expect(AskAnswers.droppedFor(TAB)).toBeGreaterThan(0);
@@ -578,6 +591,124 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     // claim, so it stops being reported.
     AskAnswers.entriesFor(TAB)[0].answeredAt = Date.now() - ASK_RECOVER_MAX_AGE_MS * 2;
     expect(AskAnswers.allOutstanding()).toHaveLength(0);
+  });
+
+  // codex round 3, P0: the reused-id guard used to live only on the surviving
+  // TICKET, so evicting that ticket restored a "fresh" identity to an id a
+  // still-rendered card can answer — and the old card's click would then be
+  // frozen with the NEW question's fingerprint and could satisfy it.
+  it("reuse is proven by an answer on file, not only by a surviving ticket", () => {
+    AskAnswers.openAsk("pa-dup2", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SAMPLER),
+      question: SAMPLER.question,
+    });
+    AskAnswers.closeAsk("pa-dup2");
+    AskAnswers.record("pa-dup2", "dpmpp_2m", { tabId: TAB });
+    // The ticket disappears (an eviction, a purge — anything bounded)…
+    AskAnswers.dropTicketForTest("pa-dup2");
+    expect(AskAnswers.ticketFor("pa-dup2")).toBeUndefined();
+    // …and the id is opened again for a DIFFERENT question.
+    AskAnswers.openAsk("pa-dup2", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SCHEDULER),
+      question: SCHEDULER.question,
+    });
+    expect(AskAnswers.ticketFor("pa-dup2")?.reused).toBe(true);
+    expect(AskAnswers.recover(TAB, askFingerprint(SCHEDULER)).status).toBe("unattributed");
+  });
+
+  // codex round 3, P0: the "this card's conversation is gone" mark used to be a
+  // BOUNDED set of ask ids, so past its ceiling a late click on a retired card
+  // was announced to the replacement conversation. It is now a per-tab
+  // generation, which nothing can overflow.
+  it("the replaced-conversation mark is a per-tab generation, not a bounded set", () => {
+    AskAnswers.openAsk("pa-old", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SAMPLER),
+      question: SAMPLER.question,
+    });
+    AskAnswers.closeAsk("pa-old");
+    AskAnswers.closeAsks(TAB);
+    // Hundreds of unrelated asks later, the old card is finally clicked. The old
+    // mark was a FIFO set of ask ids, so this is exactly what used to age it out
+    // and let the answer be announced to the replacement conversation; the epoch
+    // lives on the ticket and is untouched by other cards.
+    for (let i = 0; i < 900; i += 1) {
+      AskAnswers.openAsk(`pa-noise-${i}`, {
+        tabId: OTHER_TAB,
+        fingerprint: askFingerprint({ question: `N${i}?`, options: [{ label: "a" }] }),
+        question: `N${i}?`,
+      });
+      AskAnswers.closeAsk(`pa-noise-${i}`);
+    }
+    const entry = AskAnswers.record("pa-old", "dpmpp_2m", { tabId: TAB });
+    expect(entry.delivery).toBe("none"); // never announced to the new conversation
+    expect(entry.recoverable).toBe(false);
+    // …and still reported, with the question it answers intact.
+    expect(entry.question).toBe(SAMPLER.question);
+  });
+
+  // codex round 3, P0: revoking recoverability by NULLING the fingerprint also
+  // erased the journal's ability to notice "this is about the very question
+  // being re-asked", so the answer stopped being DISCLOSED as well.
+  // The card is still on screen and its question is still on file, so the answer
+  // correlates cleanly — but the conversation that asked is gone, so it may be
+  // REPORTED and never RETURNED. Recoverability is revoked independently of the
+  // fingerprint precisely so this entry can be recognised without being usable.
+  it("a late answer to a retired card can never satisfy the re-ask it matches", () => {
+    AskAnswers.openAsk("pa-retired2", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SAMPLER),
+      question: SAMPLER.question,
+    });
+    AskAnswers.closeAsk("pa-retired2");
+    AskAnswers.closeAsks(TAB);
+    const entry = AskAnswers.record("pa-retired2", "dpmpp_2m", { tabId: TAB });
+    expect(entry.fingerprint).toBe(askFingerprint(SAMPLER)); // recognisable…
+    expect(entry.recoverable).toBe(false); // …but not usable
+    const rec = AskAnswers.recover(TAB, askFingerprint(SAMPLER));
+    expect(rec.status).toBe("unattributed");
+    if (rec.status !== "unattributed") return;
+    expect(rec.others.some((e) => e.answer === "dpmpp_2m")).toBe(true);
+  });
+
+  it("a revoked answer keeps the fingerprint that makes it disclosable", () => {
+    openAndAnswer("pa-ask-1", SAMPLER, "dpmpp_2m");
+    AskAnswers.closeAsks(TAB);
+    const entry = AskAnswers.entriesFor(TAB)[0];
+    expect(entry.recoverable).toBe(false);
+    expect(entry.fingerprint).toBe(askFingerprint(SAMPLER)); // still recognisable
+    expect(AskAnswers.recover(TAB, askFingerprint(SAMPLER)).status).toBe("unattributed");
+  });
+
+  it("a tab-id migration carries the conversation generation with the tickets", () => {
+    AskAnswers.openAsk("pa-live", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SAMPLER),
+      question: SAMPLER.question,
+    });
+    AskAnswers.closeAsk("pa-live");
+    AskAnswers.moveKey(TAB, OTHER_TAB);
+    // The agent moved with the tab id, so its still-live card is still live.
+    const entry = AskAnswers.record("pa-live", "dpmpp_2m", { tabId: OTHER_TAB });
+    expect(entry.key).toBe(OTHER_TAB);
+    expect(entry.delivery).toBe("pending");
+    expect(AskAnswers.recover(OTHER_TAB, askFingerprint(SAMPLER)).status).toBe("recovered");
+  });
+
+  it("a migration does NOT resurrect a card whose conversation was already retired", () => {
+    AskAnswers.openAsk("pa-retired", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SAMPLER),
+      question: SAMPLER.question,
+    });
+    AskAnswers.closeAsk("pa-retired");
+    AskAnswers.closeAsks(TAB); // New chat BEFORE the migration
+    AskAnswers.moveKey(TAB, OTHER_TAB);
+    const entry = AskAnswers.record("pa-retired", "dpmpp_2m", { tabId: OTHER_TAB });
+    expect(entry.delivery).toBe("none");
+    expect(entry.recoverable).toBe(false);
   });
 
   it("never throws when the flusher does", () => {

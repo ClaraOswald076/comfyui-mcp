@@ -3878,7 +3878,11 @@ async function pollLateAskReply(
 function recoveredAskResult(entry: AskEntry): ToolResult {
   const ageS = Math.max(0, Math.round((Date.now() - entry.answeredAt) / 1000));
   return ok(
-    `[RECOVERED ANSWER] The user already answered this EXACT question ${ageS}s ago, but that ` +
+    (entry.replayHint
+      ? `[NOTE] This answer has been handed to you before — it is being surfaced again because ` +
+        `the earlier hand-off could not be confirmed. Do not act on it twice.\n\n`
+      : ``) +
+      `[RECOVERED ANSWER] The user already answered this EXACT question ${ageS}s ago, but that ` +
       `answer could not be handed back — the tool call that asked had already timed out, so ` +
       `it was journaled instead of being lost (#486).\n\n` +
       `QUESTION IT ANSWERS: ${entry.question ?? "(unrecorded)"}\n` +
@@ -3910,11 +3914,16 @@ function askTimeoutResult(
     "re-invoke panel_ask from an interactive ComfyUI tab.";
   // What is surfaced, and why each:
   //  • an answer that reached NO tool call — nobody has it, so it must be told;
-  //  • an answer to THIS EXACT question that DID reach a tool call but is now too
-  //    old to be presented as a fresh decision. "It went into a ToolResult" is
-  //    precisely the thing this file says is not proof of receipt (that IS #486),
-  //    so a stale one is reported rather than quietly forgotten — the agent is
-  //    told the user answered this before, and can decide whether to re-ask.
+  //  • an answer to THIS EXACT question that DID reach a tool call but could not
+  //    be returned now (too old to present as a fresh decision, or its
+  //    conversation was replaced). "It went into a ToolResult" is precisely the
+  //    thing this file says is not proof of receipt (that IS #486), so it is
+  //    reported rather than quietly forgotten — the agent is told the user
+  //    answered this before and can decide whether to re-ask.
+  // The fingerprint match is what makes the second bullet safe AND what makes it
+  // reachable: revoking recoverability must not also revoke the disclosure, so
+  // an entry that is no longer allowed to ANSWER keeps its fingerprint and is
+  // still recognised here as being about the question at hand.
   // An answer that reached a caller and belongs to a DIFFERENT question is not
   // news and stays quiet.
   const orphans =
@@ -4044,11 +4053,17 @@ async function askUserWithGrace(
     const recovery = AskAnswers.recover(tabId, fingerprint);
     if (recovery.status === "recovered") {
       const entry = recovery.entry;
-      AskAnswers.consume(entry.token);
+      // Render BEFORE marking: markSurfaced stamps `replayHint`, and the wording
+      // must describe the entry as it was when we recovered it, not as this very
+      // call has just left it.
+      //
       // Our OWN card's answer that merely lost the poll race is not a "recovered
       // earlier answer" — it is this ask's answer, and reads as one.
       const body =
         entry.askId === askId ? ok(entry.answer) : recoveredAskResult(entry);
+      // Marked handed-over, NOT deleted: this ToolResult can be abandoned too,
+      // and destroying the journal's copy here would recreate #486 one level up.
+      AskAnswers.markSurfaced(entry.token);
       return withDroppedAnswerWarning(tabId, body);
     }
     return askTimeoutResult(tabId, fingerprint, recovery);

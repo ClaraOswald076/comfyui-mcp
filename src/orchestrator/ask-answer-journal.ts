@@ -98,6 +98,17 @@ export interface AskTicket {
    */
   awaiting: boolean;
   /**
+   * Which CONVERSATION on this tab asked the question.
+   *
+   * Bumped on the tab (never on the ticket) by closeAsks(), so a card left on
+   * screen across a New chat / a resume of a historical session is recognisable
+   * as belonging to the conversation that is gone. An epoch per TAB, rather than
+   * a remembered set of ask ids, because the set would be bounded — and a bound
+   * that decides whether an answer may be announced to a different conversation
+   * is a bound deciding a correctness question.
+   */
+  epoch: number;
+  /**
    * This ask id was opened MORE THAN ONCE, so it no longer identifies a single
    * question.
    *
@@ -159,16 +170,30 @@ export interface AskEntry {
   /** This answer was already handed to the agent once (as a tool result or a
    *  push) and is being surfaced again. A LABEL, never a veto. */
   replayHint?: boolean;
+  /**
+   * This answer may be REPORTED but may never be RETURNED as the answer to a
+   * question — the conversation that asked it is gone, or its ask id stopped
+   * identifying one question.
+   *
+   * Separate from the fingerprint on purpose. An earlier draft revoked
+   * recoverability by NULLING the fingerprint, which also erased the journal's
+   * ability to notice "this is about the very question being re-asked" — so the
+   * answer stopped being disclosed as well as stopping being returned, i.e.
+   * revoking a permission silently revoked a promise.
+   */
+  recoverable?: boolean;
 }
 
-/** Cards tracked at once. Generous: real sessions have one or two. */
-const MAX_TICKETS = 64;
-/** Ask ids whose CONVERSATION was replaced, remembered so a late click on the
- *  old card is not announced to the replacement one. Bounded — and safely so:
- *  forgetting one only means the answer is treated as an ordinary unattributable
- *  answer (journaled, labelled), never that it is dropped. */
-const MAX_CONVERSATION_GONE_IDS = 1024;
-
+/**
+ * Cards tracked at once. A ticket is a handful of small fields, and it is what
+ * makes an answer ATTRIBUTABLE, so this is sized for a whole session's asks
+ * rather than for the two that are usually open. There is deliberately no age
+ * limit: a question card sits on screen until the user deals with it, and any
+ * clock here would be a bound quietly deciding that an answer no longer counts.
+ * Overflowing is logged at ERROR and only ever WEAKENS a correlation to
+ * UNDETERMINED — it never drops an answer.
+ */
+const MAX_TICKETS = 1024;
 /**
  * Prefix every `panel_ask` card's ask id carries.
  *
@@ -181,19 +206,10 @@ const MAX_CONVERSATION_GONE_IDS = 1024;
  * cannot expire, evict, or be raced.
  */
 export const PANEL_ASK_ID_PREFIX = "pa-";
-/**
- * How long a ticket is kept. The bridge only forwards a LATE answer for a card
- * whose rid→ask_id mapping is still alive, so this must OUTLIVE that mapping's
- * own TTL (UiBridge.LATE_ASK_MAP_TTL_MS, 60 minutes) or a ticket could be gone
- * while an answer for it can still arrive. Sized above it, so pruning here is
- * provably lossless rather than a bound we are hoping never bites — and losing
- * one anyway only weakens a correlation to UNDETERMINED, never drops an answer.
- */
-const TICKET_MAX_AGE_MS = 65 * 60_000;
 /** Undelivered/unconsumed answers held per panel tab. */
-const MAX_ENTRIES_PER_KEY = 16;
+const MAX_ENTRIES_PER_KEY = 48;
 /** …and across all tabs. */
-const MAX_ENTRIES_TOTAL = 48;
+const MAX_ENTRIES_TOTAL = 192;
 /**
  * How long a journaled answer may still be RECOVERED as the result of a re-ask
  * of the identical question.
@@ -311,16 +327,10 @@ export class AskAnswerJournalImpl {
    * ticket may only ever WEAKEN a correlation (matched → foreign, i.e.
    * UNDETERMINED); it must never turn an answer into nothing.
    */
-  /**
-   * Ask ids whose CONVERSATION was replaced (New chat / resume of a historical
-   * session) while their card was still on screen.
-   *
-   * An answer that arrives for one of these is real and is journaled, but it is
-   * addressed to a conversation that no longer exists, so it is never announced
-   * to the replacement one — see closeAsks() for why this differs from #468's
-   * treatment of run completions.
-   */
-  private conversationGone = new Set<string>();
+  /** Panel tab -> the generation of the conversation currently attached to it.
+   *  Bumped by closeAsks(); a ticket minted under an older generation belongs to
+   *  a conversation that is gone. See AskTicket.epoch. */
+  private tabEpoch = new Map<string, number>();
   /** token → entry (insertion-ordered, which is also delivery order). */
   private entries = new Map<string, AskEntry>();
   /** Answers this tab lost to an eviction and has not yet been told about. */
@@ -352,9 +362,15 @@ export class AskAnswerJournalImpl {
    * arrives with no ticket is (correctly, but uselessly) foreign.
    */
   openAsk(askId: string, meta: { tabId: string; fingerprint: string; question: string }): void {
-    this.pruneTickets();
+    const epoch = this.tabEpoch.get(meta.tabId) ?? 0;
     const existing = this.tickets.get(askId);
-    if (existing) {
+    // REUSE is also proven by an ANSWER already on file for this id, not only by
+    // a surviving ticket. The ticket map is bounded, so keying the guard on it
+    // alone would let an eviction restore a "fresh" identity to an id that a
+    // still-rendered card can answer — the old card's click would then be frozen
+    // with the NEW question's fingerprint and could satisfy it.
+    const answered = [...this.entries.values()].some((e) => e.askId === askId);
+    if (existing || answered) {
       // The same ask id dispatched AGAIN. Reopen rather than stack a second
       // ticket (one ask id always means one ticket) — but the id now stands for
       // MORE THAN ONE question, and the panel's reply carries only the id, so
@@ -362,16 +378,22 @@ export class AskAnswerJournalImpl {
       // reused: every answer for it is reported UNDETERMINED from here on, and
       // in particular the older card's late click can no longer be frozen with
       // the newer question's fingerprint and recovered as its answer.
-      existing.tabId = meta.tabId;
-      existing.fingerprint = meta.fingerprint;
-      existing.question = meta.question;
-      existing.openedAt = Date.now();
-      existing.seq = ++this.ticketSeq;
-      existing.awaiting = true;
-      existing.reused = true;
+      this.tickets.set(askId, {
+        ...(existing ?? {}),
+        askId,
+        tabId: meta.tabId,
+        fingerprint: meta.fingerprint,
+        question: meta.question,
+        openedAt: Date.now(),
+        epoch,
+        seq: ++this.ticketSeq,
+        awaiting: true,
+        reused: true,
+      });
       logger.warn(
         `[ask-answers] ask id ${askId.slice(0, 12)} was opened again — it no longer identifies one question, so every answer for it is reported as UNDETERMINED`,
       );
+      this.trimTickets();
       return;
     }
     this.tickets.set(askId, {
@@ -380,6 +402,7 @@ export class AskAnswerJournalImpl {
       fingerprint: meta.fingerprint,
       question: meta.question,
       openedAt: Date.now(),
+      epoch,
       seq: ++this.ticketSeq,
       awaiting: true,
     });
@@ -433,13 +456,16 @@ export class AskAnswerJournalImpl {
    * dropped because it "looks like" something already seen.
    */
   record(askId: string, reply: unknown, meta: { tabId: string }): AskEntry {
-    this.pruneTickets();
     const existing = [...this.entries.values()].find((e) => e.askId === askId);
     if (existing) return existing;
     const ticket = this.tickets.get(askId);
     // A REUSED id proves nothing: the panel sends only the id, so an answer for
     // it could belong to either card. Report it as foreign — real, but
     // UNDETERMINED — rather than claiming it answers the question now open.
+    // The conversation that opened this ticket has been replaced (New chat, or a
+    // resume of a historical session) while its card stayed on screen.
+    const conversationGone =
+      ticket !== undefined && ticket.epoch !== (this.tabEpoch.get(ticket.tabId) ?? 0);
     const attributable = ticket !== undefined && ticket.reused !== true;
     const correlation: AskCorrelation = attributable
       ? { status: "matched", askId }
@@ -467,12 +493,14 @@ export class AskAnswerJournalImpl {
       // all) has nobody left and is armed for the push immediately. An answer to
       // a card whose CONVERSATION was replaced is never pushed at all — see
       // closeAsks(); it is journaled for disclosure only.
-      delivery:
-        ticket?.awaiting === true || this.conversationGone.has(askId) ? "none" : "pending",
+      delivery: ticket?.awaiting === true || conversationGone ? "none" : "pending",
+      // A question the CURRENT conversation never asked may be reported, never
+      // returned as its answer.
+      ...(conversationGone ? { recoverable: false } : {}),
       attempts: 0,
     };
     this.entries.set(entry.token, entry);
-    if (this.conversationGone.has(askId)) {
+    if (conversationGone) {
       logger.warn(
         `[ask-answers] an answer arrived for a card whose conversation was replaced (ask ${askId.slice(0, 8)}, tab ${entry.key.slice(0, 8)}): "${entry.answer}" — journaled for disclosure, NOT announced to the replacement conversation`,
       );
@@ -532,6 +560,7 @@ export class AskAnswerJournalImpl {
       .filter(
         (e) =>
           e.correlation.status === "matched" &&
+          e.recoverable !== false &&
           e.fingerprint !== null &&
           e.fingerprint === fingerprint &&
           now - e.answeredAt <= RECOVER_MAX_AGE_MS,
@@ -556,11 +585,18 @@ export class AskAnswerJournalImpl {
    * would let an eviction that the journal promised to report disappear because
    * an unrelated answer was recovered.
    */
-  consume(token: string): void {
+  markSurfaced(token: string): void {
     const entry = this.entries.get(token);
     if (!entry) return;
-    this.entries.delete(token);
-    if (entry.disclose) this.noteDropped(entry.key, entry.disclose);
+    // NOT DELETED. An earlier draft consumed a recovered answer outright, on the
+    // reasoning that it had now been handed over — which is the same mistake as
+    // every suppression #468 removed, one level up: the ToolResult carrying it
+    // can itself be abandoned (that IS #486), so deleting the entry destroys the
+    // only durable copy at exactly the moment it is most likely to be needed
+    // again. It is marked handed-over and flagged, so a further re-ask of the
+    // same question gets it again, labelled "you have seen this".
+    entry.returned = true;
+    entry.replayHint = true;
   }
 
   /** Every unconsumed ORPHAN answer for a tab — those that were never handed
@@ -750,9 +786,19 @@ export class AskAnswerJournalImpl {
     for (const entry of this.entries.values()) {
       if (entry.key === from) entry.key = to;
     }
+    // The conversation GENERATION moves with the tickets, or they would all read
+    // as belonging to a replaced conversation at the destination (or, worse, a
+    // retired one would read as live there). A ticket whose conversation was
+    // still current at the source is current at the destination — the agent moved
+    // with it; one already retired stays retired.
+    const fromEpoch = this.tabEpoch.get(from) ?? 0;
+    const toEpoch = this.tabEpoch.get(to) ?? 0;
     for (const ticket of this.tickets.values()) {
-      if (ticket.tabId === from) ticket.tabId = to;
+      if (ticket.tabId !== from) continue;
+      ticket.tabId = to;
+      ticket.epoch = ticket.epoch === fromEpoch ? toEpoch : toEpoch - 1;
     }
+    this.tabEpoch.delete(from);
     const lost = this.dropped.get(from);
     if (lost !== undefined) {
       this.dropped.delete(from);
@@ -774,15 +820,12 @@ export class AskAnswerJournalImpl {
         `[ask-answers] dropping a validated answer ("${entry.answer}") to "${preview(entry.question)}" — its tab (${key.slice(0, 8)}) is gone${entry.returned ? " (it had been handed to a tool result, which is not proof it was received)" : ""}`,
       );
     }
-    for (const [id, ticket] of [...this.tickets]) {
-      if (ticket.tabId !== key) continue;
-      this.tickets.delete(id);
-      // Its card may still be on screen. There is no agent left at this tab id,
-      // so a late answer must not be armed for a push that can only fail (and
-      // would sit pending until an eviction) — journal it for disclosure only,
-      // exactly as for a replaced conversation.
-      this.conversationGone.add(id);
-    }
+    // The TAB is gone, so every conversation it hosted is gone too: bump the
+    // epoch rather than deleting the tickets. A card left on screen can still be
+    // clicked, and the surviving ticket is what names the question that answer
+    // belongs to — while the newer epoch keeps it from being armed for a push at
+    // a tab id no agent answers to, exactly as for a replaced conversation.
+    this.tabEpoch.set(key, (this.tabEpoch.get(key) ?? 0) + 1);
     const owed = this.dropped.get(key) ?? 0;
     if (owed > 0) {
       logger.error(
@@ -803,30 +846,23 @@ export class AskAnswerJournalImpl {
    * quoted with their own question. A correlation may only ever get WEAKER.
    */
   closeAsks(key: string): void {
-    for (const [id, ticket] of [...this.tickets]) {
-      if (ticket.tabId !== key) continue;
-      this.tickets.delete(id);
-      // The CARD IS STILL ON SCREEN. The user can click it minutes from now, and
-      // the bridge will happily deliver that answer — to a conversation that no
-      // longer exists. Remember the id so `record` recognises it as belonging to
-      // the retired conversation instead of treating it as an ordinary
-      // unattributable answer and announcing it to the replacement agent.
-      this.conversationGone.add(id);
-    }
-    while (this.conversationGone.size > MAX_CONVERSATION_GONE_IDS) {
-      const oldest = this.conversationGone.values().next().value;
-      if (oldest === undefined) break;
-      this.conversationGone.delete(oldest);
-    }
+    // BUMP THE TAB'S CONVERSATION GENERATION. Every ticket already minted for
+    // this tab now carries an older epoch, which is what makes a card left on
+    // screen recognisable as the retired conversation's — with no per-id
+    // bookkeeping to overflow. The TICKETS ARE KEPT: they are what still name the
+    // question, and deleting them would turn a late click into an answer with no
+    // question attached, i.e. the disclosure would lose the only thing that makes
+    // it honest.
+    this.tabEpoch.set(key, (this.tabEpoch.get(key) ?? 0) + 1);
     for (const entry of this.entries.values()) {
       if (entry.key !== key) continue;
       if (entry.correlation.status === "matched") {
         entry.correlation = { status: "foreign", askId: entry.correlation.askId };
-        // Its fingerprint was the licence to satisfy a matching re-ask; the
-        // conversation that asked is gone, so revoke it. The QUESTION TEXT stays —
-        // it is what makes the disclosure honest.
-        entry.fingerprint = null;
       }
+      // Revoke the LICENCE to satisfy a re-ask, but keep the fingerprint: it is
+      // also how a later ask of the SAME question notices this answer exists and
+      // reports it. See AskEntry.recoverable.
+      entry.recoverable = false;
       // …and STOP PUSHING it. Its addressee is gone.
       //
       // This is where an ask answer parts company with a run completion (#468),
@@ -838,8 +874,8 @@ export class AskAnswerJournalImpl {
       // for, which is a cross-conversation confusion with no upside.
       //
       // NOT a silent discard: the entry stays journaled (so a later ask on this
-      // tab that times out still reports it as UNATTRIBUTED, quoted with its own
-      // question) and the loss of the push is logged here.
+      // tab that times out still reports it, quoted with its own question) and
+      // the loss of the push is logged here.
       if (entry.delivery === "pending") {
         entry.delivery = "none";
         logger.warn(
@@ -853,6 +889,10 @@ export class AskAnswerJournalImpl {
   ticketFor(askId: string): AskTicket | undefined {
     return this.tickets.get(askId);
   }
+  /** Simulate the ticket map's bound biting, without running 1024 asks. */
+  dropTicketForTest(askId: string): void {
+    this.tickets.delete(askId);
+  }
   entriesFor(key: string): AskEntry[] {
     return [...this.entries.values()].filter((e) => e.key === key);
   }
@@ -860,21 +900,13 @@ export class AskAnswerJournalImpl {
     // NOTE: the flusher is deliberately NOT cleared — it belongs to the process's
     // orchestrator, not to any one test's fixture.
     this.tickets.clear();
-    this.conversationGone.clear();
+    this.tabEpoch.clear();
     this.entries.clear();
     this.dropped.clear();
     this.seq = 0;
     this.ticketSeq = 0;
   }
 
-  /** Tickets whose card can no longer receive an answer (see TICKET_MAX_AGE_MS)
-   *  and which no handler is still waiting on. */
-  private pruneTickets(): void {
-    const now = Date.now();
-    for (const [id, t] of [...this.tickets]) {
-      if (!t.awaiting && now - t.openedAt > TICKET_MAX_AGE_MS) this.tickets.delete(id);
-    }
-  }
 
   private trimTickets(): void {
     while (this.tickets.size > MAX_TICKETS) {
@@ -892,7 +924,7 @@ export class AskAnswerJournalImpl {
       if (!victim) victim = this.tickets.keys().next().value ?? null;
       if (!victim) return;
       logger.error(
-        `[ask-answers] over ${MAX_TICKETS} question cards are tracked at once — forgetting ask ${victim.slice(0, 8)}; a late answer for it will be reported as UNATTRIBUTED`,
+        `[ask-answers] over ${MAX_TICKETS} question cards have been tracked — forgetting ask ${victim.slice(0, 12)}; a late answer for it will be reported as UNATTRIBUTED (its question can no longer be named)`,
       );
       this.tickets.delete(victim);
     }
@@ -943,12 +975,22 @@ export class AskAnswerJournalImpl {
         this.entries.delete(victim.token);
         mine = mine.filter((e) => e !== victim);
         if (victim.returned) {
-          // Logged, not counted as a loss for the agent: it DID reach a caller,
-          // and counting every ordinary successful ask as an undetermined
-          // dropped answer would cry wolf on every tab that asks a lot — the
-          // warning would stop meaning anything, which is its own kind of
-          // silence. The record is here, with the answer text, so a real loss is
-          // still reconstructable.
+          // LOGGED, NOT COUNTED as an undetermined loss for the agent — the one
+          // place this file deliberately stops short, so the reasoning is spelled
+          // out rather than assumed.
+          //
+          // A returned answer DID reach a caller; what its eviction costs is the
+          // ability to RECOVER it, not a delivery. Counting each one as "a
+          // validated answer was dropped, treat it as UNDETERMINED" would fire
+          // after ~48 ordinary successful asks on a tab and tell the agent that
+          // answers it almost certainly received are unknown. A warning that is
+          // usually false is its own kind of silence: it trains the reader to
+          // ignore the one that is true.
+          //
+          // The exposure is bounded on both sides — the per-tab ceiling is far
+          // above any plausible burst, orphans are never evicted before these,
+          // and the full answer text is written here — so what survives is a
+          // reconstructable record rather than a misleading alarm.
           logger.warn(
             `[ask-answers] ${label} — forgetting an already-returned answer ("${victim.answer}") to "${preview(victim.question)}"; a re-ask can no longer recover it, and a tool result is not proof it was received`,
           );
