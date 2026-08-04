@@ -544,6 +544,28 @@ export class PanelAgent {
     return true;
   }
 
+  /**
+   * Attach a journal token to the turn that is RUNNING RIGHT NOW (#486).
+   *
+   * A `panel_ask` answer goes back to the model as a TOOL RESULT, not as an
+   * injected event — so it has no hand-off to ack. But the tool call happens
+   * INSIDE a live turn, and this class already knows exactly when a turn is
+   * proven to have been read: `turnEventTokens` are acked only when that turn's
+   * own marked `result` lands (#468). Riding the same wires makes "the model
+   * received this answer" a fact rather than an assumption, which is the whole
+   * point — a `tools/call` that was abandoned never produces that result, so its
+   * token is released unacked and the answer stays accounted for.
+   *
+   * Returns false when there is no turn in flight to attach to; the caller then
+   * treats the answer as unacked, which is the conservative reading.
+   */
+  attachTurnToken(token: string): boolean {
+    if (!this.inFlight) return false;
+    if (this.turnEventTokens.includes(token)) return true;
+    this.turnEventTokens.push(token);
+    return true;
+  }
+
   /** Drop a still-queued message (the user cancelled/edited it before the agent
    *  got to it). Returns true if it was found and removed; false if it was
    *  already dequeued (the turn started — too late to cancel). */
@@ -2149,6 +2171,14 @@ export class PanelAgentManager {
     const agent = this.agents.get(tabId);
     if (!agent || agent.isStopped) return false;
     return agent.revokeEvent(token);
+  }
+
+  /** Ride a journal token on the tab's IN-FLIGHT turn so that turn's result acks
+   *  it (#486). False when no agent or no turn is running. */
+  attachTurnToken(tabId: string, token: string): boolean {
+    const agent = this.agents.get(tabId);
+    if (!agent || agent.isStopped) return false;
+    return agent.attachTurnToken(token);
   }
 
   /** Push a ComfyUI execution error to a tab's agent — interrupt the live turn

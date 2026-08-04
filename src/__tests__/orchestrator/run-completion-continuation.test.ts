@@ -30,6 +30,7 @@ import {
   describe as describeCorrelation,
   type CompletionPayload,
 } from "../../orchestrator/run-completion-journal.js";
+import { AskAnswerJournalImpl } from "../../orchestrator/ask-answer-journal.js";
 import { destinationHasCollisionState } from "../../orchestrator/session-store.js";
 
 let PanelAgentManager: typeof import("../../orchestrator/panel-agent.js").PanelAgentManager;
@@ -1638,5 +1639,100 @@ describe("run completion journal correlation (#468)", () => {
     journal.forget("gone");
     expect(journal.outstanding("gone")).toHaveLength(0);
     expect(journal.outstanding("kept")).toHaveLength(1);
+  });
+});
+
+// #486 — a `panel_ask` answer goes back to the model as a TOOL RESULT, so it has
+// no hand-off to ack. It rides the turn its tool call is running inside, and is
+// acked by exactly the same rule a run completion is: that turn produced its own
+// marked result. "Written to the transport" is NOT that rule — a `tools/call` can
+// be abandoned, which is the whole of #486 — so these tests drive a real manager
+// and hold the difference.
+describe("panel_ask answer acks on the turn that returned it (#486)", () => {
+  function askHarness(backend: AgentBackend) {
+    const journal = new AskAnswerJournalImpl();
+    const manager = new PanelAgentManager({
+      mcpServers: {},
+      systemAppend: "",
+      model: "claude-test",
+      onSay: () => {},
+      onTurn: () => {},
+      makeBackend: () => backend,
+      onEventDelivered: (_key: string, tokens: string[]) => {
+        for (const t of tokens) journal.ack(t);
+      },
+      onEventUndelivered: (_key: string, tokens: string[], opts?: { carried?: boolean }) => {
+        for (const t of tokens) journal.release(t, { carried: opts?.carried === true });
+      },
+      onAgentReady: () => {},
+    } as never);
+    journal.setTurnAttacher((key, token) => manager.attachTurnToken(key, token));
+    return { journal, manager };
+  }
+
+  /** What the ask handler does from inside a live turn. */
+  function answerDuringTurn(
+    journal: AskAnswerJournalImpl,
+    tab: string,
+    askId: string,
+    answer: string,
+  ): string {
+    journal.openAsk(askId, { tabId: tab, fingerprint: "fp-sampler", question: "Which sampler?" });
+    const token = journal.record(askId, answer, { tabId: tab }).token;
+    journal.markReturned(token); // hands it back AND rides the turn
+    journal.closeAsk(askId);
+    return token;
+  }
+
+  it("acks only when the turn that returned the answer produces its result", async () => {
+    const backend = new ContinuationBackend();
+    const { journal, manager } = askHarness(backend);
+    const tab = "tab-ask-ack";
+
+    manager.send(tab, "ask me which sampler");
+    await waitFor(() => backend.turns.length >= 1);
+
+    const token = answerDuringTurn(journal, tab, "pa-ack-1", "dpmpp_2m");
+    // Handed to the tool result — but the turn has not finished, so there is NO
+    // proof the model read it yet.
+    expect(journal.entriesFor(tab)[0].returned).toBe(true);
+    expect(journal.entriesFor(tab)[0].acked).toBeUndefined();
+
+    backend.finishTurn(); // the turn's own marked result lands
+    await waitFor(() => journal.entriesFor(tab)[0]?.acked === true);
+    expect(journal.entriesFor(tab)[0].token).toBe(token);
+    // An acked answer is not news: it holds no gate and is not named on exit.
+    expect(journal.hasOutstanding()).toBe(false);
+    expect(journal.allOutstanding()).toHaveLength(0);
+  });
+
+  it("a turn that never completes leaves the answer UNACKED and accounted for", async () => {
+    const backend = new ContinuationBackend();
+    backend.strandTurns = true; // the turn never yields a result — the #486 shape
+    const { journal, manager } = askHarness(backend);
+    const tab = "tab-ask-stranded";
+
+    manager.send(tab, "ask me which sampler");
+    await waitFor(() => backend.turns.length >= 1);
+    answerDuringTurn(journal, tab, "pa-ack-2", "dpmpp_2m");
+
+    // Tear the agent down mid-turn: the token comes back unacked.
+    manager.reset(tab);
+    await waitFor(() => journal.entriesFor(tab).length === 1);
+    expect(journal.entriesFor(tab)[0].acked).toBeUndefined();
+    // …and it is still the only copy of the user's decision: named on the way out
+    // and still recoverable by a re-ask of the same question.
+    expect(journal.allOutstanding().map((e) => e.answer)).toContain("dpmpp_2m");
+    expect(journal.recover(tab, "fp-sampler").status).toBe("recovered");
+  });
+
+  it("an answer returned with NO live turn is never treated as read", () => {
+    const backend = new ContinuationBackend();
+    const { journal, manager } = askHarness(backend);
+    const tab = "tab-ask-noturn";
+    // Nothing was ever sent, so there is no turn to ride.
+    expect(manager.attachTurnToken(tab, "aa-nope")).toBe(false);
+    answerDuringTurn(journal, tab, "pa-ack-3", "dpmpp_2m");
+    expect(journal.entriesFor(tab)[0].acked).toBeUndefined();
   });
 });

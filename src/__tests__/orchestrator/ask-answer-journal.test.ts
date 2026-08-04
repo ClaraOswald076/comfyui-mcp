@@ -62,6 +62,25 @@ function strandEvictionDebt(): void {
   AskAnswers.record("pa-live", "dpmpp_2m", { tabId: TAB }); // still awaiting -> "none"
 }
 
+/** An ordinary successful ask: answered, handed back in a tool result, and the
+ *  turn that carried it produced its own result — the ACK. This is the common
+ *  path, and the only one allowed to be forgotten quietly. */
+function ordinaryAckedAsk(
+  askId: string,
+  ask: { question: string; options: unknown },
+  answer: string,
+): void {
+  AskAnswers.openAsk(askId, {
+    tabId: TAB,
+    fingerprint: askFingerprint(ask),
+    question: ask.question,
+  });
+  const token = AskAnswers.record(askId, answer, { tabId: TAB }).token;
+  AskAnswers.markReturned(token);
+  AskAnswers.closeAsk(askId);
+  AskAnswers.ack(token); // the turn's own result landed
+}
+
 beforeEach(() => {
   AskAnswers.reset();
   AskAnswers.setFlusher(() => {});
@@ -372,23 +391,111 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     expect(seen[0].dropped_answers).toBeGreaterThan(0);
   });
 
-  it("an already-RETURNED answer is evicted before an orphan, and silently", () => {
+  it("an ACKED answer is evicted before an orphan, and silently", () => {
     // Ordinary successful asks must not manufacture "answers were dropped"
-    // warnings — they reached a caller. Only the orphan is a loss.
-    openAndAnswer("orphan", SAMPLER, "dpmpp_2m");
+    // warnings — the agent provably read them. Only the orphan is a loss.
+    openAndAnswer("pa-orphan", SAMPLER, "dpmpp_2m");
     for (let i = 0; i < 70; i += 1) {
-      const ask = { question: `Q${i}?`, options: [{ label: "a" }, { label: "b" }] };
-      AskAnswers.openAsk(`pa-ret-${i}`, {
-        tabId: TAB,
-        fingerprint: askFingerprint(ask),
-        question: ask.question,
-      });
-      AskAnswers.markReturned(AskAnswers.record(`pa-ret-${i}`, `A${i}`, { tabId: TAB }).token);
-      AskAnswers.closeAsk(`pa-ret-${i}`);
+      ordinaryAckedAsk(`pa-ret-${i}`, { question: `Q${i}?`, options: [{ label: "a" }, { label: "b" }] }, `A${i}`);
     }
     expect(AskAnswers.droppedFor(TAB)).toBe(0);
     // The orphan is still there — it was never a candidate for a quiet eviction.
     expect(AskAnswers.orphansFor(TAB).map((e) => e.answer)).toContain("dpmpp_2m");
+  });
+
+  it("acked answers are evicted BEFORE a returned-but-unacked one", () => {
+    // The ORDER is what keeps the common path quiet. If an unacked answer were
+    // picked while acked ones were available, every busy tab would start
+    // reporting undetermined losses for answers that were merely returned.
+    AskAnswers.openAsk("pa-unconfirmed", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SAMPLER),
+      question: SAMPLER.question,
+    });
+    AskAnswers.markReturnedForTest("pa-unconfirmed", "dpmpp_2m", TAB);
+    AskAnswers.closeAsk("pa-unconfirmed");
+    for (let i = 0; i < 70; i += 1) {
+      ordinaryAckedAsk(`pa-ok-${i}`, { question: `Q${i}?`, options: [{ label: "a" }, { label: "b" }] }, `A${i}`);
+    }
+    // Every eviction took an ACKED answer, so nothing was disclosed…
+    expect(AskAnswers.droppedFor(TAB)).toBe(0);
+    // …and the one answer whose receipt was never confirmed is still on file.
+    expect(AskAnswers.entriesFor(TAB).some((e) => e.answer === "dpmpp_2m")).toBe(true);
+  });
+
+  // THE SPLIT (coordinator ruling on Trade A). "returned" says only that the
+  // answer was written to a transport that may already have been abandoned —
+  // which IS #486 — so it can never be the licence to forget. Only a turn that
+  // produced its own result proves the model read it.
+  it("a RETURNED-but-UNACKED answer evicted is counted and disclosed", () => {
+    // 60 answers handed back to tool calls whose turns never completed.
+    for (let i = 0; i < 60; i += 1) {
+      const ask = { question: `U${i}?`, options: [{ label: "a" }, { label: "b" }] };
+      AskAnswers.openAsk(`pa-unacked-${i}`, {
+        tabId: TAB,
+        fingerprint: askFingerprint(ask),
+        question: ask.question,
+      });
+      AskAnswers.markReturned(AskAnswers.record(`pa-unacked-${i}`, `U${i}`, { tabId: TAB }).token);
+      AskAnswers.closeAsk(`pa-unacked-${i}`);
+    }
+    // The ceiling bit, and every eviction was a #486 failure, not an ordinary ask.
+    expect(AskAnswers.droppedFor(TAB)).toBeGreaterThan(0);
+    expect(AskAnswers.hasOutstanding()).toBe(true);
+  });
+
+  it("an ACKED answer never blocks a restart and is not named on the way out", () => {
+    ordinaryAckedAsk("pa-acked", SAMPLER, "dpmpp_2m");
+    const entry = AskAnswers.entriesFor(TAB)[0];
+    expect(entry.acked).toBe(true);
+    expect(AskAnswers.hasOutstanding()).toBe(false);
+    expect(AskAnswers.allOutstanding()).toHaveLength(0);
+  });
+
+  it("a returned answer whose turn never completed IS named on the way out", () => {
+    AskAnswers.openAsk("pa-unconfirmed", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SAMPLER),
+      question: SAMPLER.question,
+    });
+    const token = AskAnswers.markReturnedForTest("pa-unconfirmed", "dpmpp_2m", TAB);
+    AskAnswers.closeAsk("pa-unconfirmed");
+    // The turn ended without proving it was read — #468's release path.
+    AskAnswers.release(token, { carried: true });
+    expect(AskAnswers.entriesFor(TAB)[0].acked).toBeUndefined();
+    expect(AskAnswers.allOutstanding().map((e) => e.answer)).toContain("dpmpp_2m");
+  });
+
+  it("a released tool-result answer is never re-armed for a push, nor settled by a bound", () => {
+    AskAnswers.openAsk("pa-tr", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SAMPLER),
+      question: SAMPLER.question,
+    });
+    const token = AskAnswers.markReturnedForTest("pa-tr", "dpmpp_2m", TAB);
+    AskAnswers.closeAsk("pa-tr");
+    for (let i = 0; i < 10; i += 1) AskAnswers.release(token, { carried: true });
+    // Nothing re-sends a tool-result answer, so there is no loop to bound — and
+    // settling it on one would forge the proof the split exists to withhold.
+    expect(AskAnswers.pending(TAB)).toHaveLength(0);
+    expect(AskAnswers.entriesFor(TAB)[0].acked).toBeUndefined();
+    expect(AskAnswers.entriesFor(TAB)[0].delivery).toBe("none");
+  });
+
+  it("the turn attacher is asked to carry every returned answer", () => {
+    const carried: string[] = [];
+    AskAnswers.setTurnAttacher((_key, token) => {
+      carried.push(token);
+      return true;
+    });
+    AskAnswers.openAsk("pa-attach", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SAMPLER),
+      question: SAMPLER.question,
+    });
+    const token = AskAnswers.markReturnedForTest("pa-attach", "dpmpp_2m", TAB);
+    expect(carried).toEqual([token]);
+    AskAnswers.setTurnAttacher(() => false);
   });
 
   it("a trimmed TICKET can only weaken a correlation, never drop the answer", () => {
@@ -797,22 +904,56 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     // re-addresses renders across it: a finished render is useful to whoever is
     // on the tab now, an answer to a card the new conversation never put up is
     // not. Both switch paths must retire the asks.
+    // …and it must be GATED on an actual change of provider. A routine
+    // same-provider re-hello or a no-op set_backend retiring live cards is the
+    // over-refusal direction of the same fold: a still-live conversation treated
+    // as replaced, so the user's answer to a card it really did put up comes back
+    // "unattributed".
     for (const guard of [
       "if (providerSwitched) flushRunCompletions(panelTab);",
       "if (prev !== reqBackend) flushRunCompletions(panelTab);",
     ]) {
       const at = src.indexOf(guard);
       expect(at, `provider-switch site not found: ${guard}`).toBeGreaterThan(-1);
+      const cond = guard.slice(0, guard.indexOf(")") + 1); // "if (providerSwitched)"
       expect(
         src.slice(at, at + 900),
-        `${guard} must retire ask state`,
-      ).toContain("AskAnswers.closeAsks(panelTab)");
+        `${guard} must retire ask state, under the same guard`,
+      ).toContain(`${cond} AskAnswers.closeAsks(panelTab)`);
+    }
+    // The unconditional form must not appear at either switch site.
+    for (const guard of [
+      "if (providerSwitched) flushRunCompletions(panelTab);",
+      "if (prev !== reqBackend) flushRunCompletions(panelTab);",
+    ]) {
+      const at = src.indexOf(guard);
+      const window = src.slice(at, at + 900);
+      const unguarded = window.match(/\n\s*AskAnswers\.closeAsks\(panelTab\)/);
+      expect(unguarded, `${guard}: closeAsks must not run when the provider is unchanged`).toBeNull();
     }
 
     // The unsend hook must actually be wired, or closeAsks silently degrades to
-    // "leave the stale copy queued".
+    // "leave the stale copy queued"; and the turn attacher must be wired, or the
+    // journal has no proof of receipt for the ordinary path and every eviction
+    // becomes a disclosed loss.
     expect(src).toContain("AskAnswers.setRevoker(");
     expect(src).toContain("AskAnswers.setFlusher(");
+    expect(src).toContain("AskAnswers.setTurnAttacher(");
+    expect(src).toContain("manager.attachTurnToken(");
+
+    // The fatal-exit disclosure must keep RENDERS and ANSWERS apart. A lost
+    // answer is not a ComfyUI run and will NEVER be in history, so pointing the
+    // user at `get_history` for one is a remedy naming a lever that cannot work —
+    // in the one moment they are already dealing with a failure.
+    const exitAt = src.indexOf("The agent backend is being restarted");
+    expect(exitAt, "exit notice not found").toBeGreaterThan(-1);
+    const notice = src.slice(exitAt, exitAt + 1600);
+    expect(notice, "the answer branch must not send the user to get_history").toMatch(
+      /answer\(s\) you gave[\s\S]*there is NO history to look it up in/,
+    );
+    expect(notice, "the answer branch must ask for the answer again").toMatch(
+      /tell it your choice again/,
+    );
 
     // …and every OTHER boundary is defined by where the run journal draws one.
     // Pairing the two journals structurally is what stops the next boundary from
@@ -953,19 +1094,13 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     const carrier = AskAnswers.entriesFor(TAB).find((e) => (e.disclose ?? 0) > 0);
     expect(carrier).toBeDefined();
     AskAnswers.markSurfaced(carrier!.token); // a recovery handed it over
-    expect(carrier!.returned).toBe(true); // …now the preferred eviction victim
-    // More answers arrive, all of them RETURNED, so every eviction they cause
-    // takes the quiet returned-victim path and creates NO new debt — leaving the
-    // carrier's count as the only debt in play.
+    AskAnswers.ack(carrier!.token); // …and that turn completed
+    expect(carrier!.acked).toBe(true); // now the preferred eviction victim
+    // More answers arrive, all of them ACKED, so every eviction they cause takes
+    // the quiet path and creates NO new debt — leaving the carrier's count as the
+    // only debt in play.
     for (let i = 60; i < 80; i += 1) {
-      const ask = { question: `R${i}?`, options: [{ label: "a" }, { label: "b" }] };
-      AskAnswers.openAsk(`pa-ret-${i}`, {
-        tabId: TAB,
-        fingerprint: askFingerprint(ask),
-        question: ask.question,
-      });
-      AskAnswers.markReturned(AskAnswers.record(`pa-ret-${i}`, `R${i}`, { tabId: TAB }).token);
-      AskAnswers.closeAsk(`pa-ret-${i}`);
+      ordinaryAckedAsk(`pa-ret-${i}`, { question: `R${i}?`, options: [{ label: "a" }, { label: "b" }] }, `R${i}`);
     }
     expect(AskAnswers.entriesFor(TAB).some((e) => e.token === carrier!.token)).toBe(false);
     // EXACTLY the same debt — it moved, it did not evaporate with its carrier.
@@ -997,6 +1132,51 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     expect(entry.key).toBe(TAB);
     expect(entry.correlation.status).toBe("foreign");
     expect(AskAnswers.entriesFor(OTHER_TAB)).toHaveLength(0);
+  });
+
+  // Gate P0-2: the disclosure DEBT used to be evictable on the same terms as
+  // payload (64 tabs), so the 65th tab with stranded debt deleted the oldest
+  // tab's only record — after which its later ask, the restart gate and the
+  // fatal-exit report all had nothing, and the log line said outright that the
+  // tab "will not be told". A bounded store must never decide whether a warning
+  // is owed.
+  it("debt for the FIRST tab survives far past any tab ceiling", () => {
+    const FIRST = "tab-first-0001";
+    const strandFor = (tab: string): void => {
+      // Fill the tab's ceiling with orphans, hand them all off, then land one
+      // more answer whose handler is still awaiting — so the eviction it triggers
+      // has no pending entry to stamp and the debt goes to the side map.
+      for (let i = 0; i < 48; i += 1) {
+        const ask = { question: `${tab}-Q${i}?`, options: [{ label: "a" }, { label: "b" }] };
+        AskAnswers.openAsk(`pa-${tab}-${i}`, {
+          tabId: tab,
+          fingerprint: askFingerprint(ask),
+          question: ask.question,
+        });
+        AskAnswers.closeAsk(`pa-${tab}-${i}`);
+        AskAnswers.record(`pa-${tab}-${i}`, `A${i}`, { tabId: tab });
+      }
+      AskAnswers.deliverPending(tab, () => true);
+      AskAnswers.openAsk(`pa-${tab}-live`, {
+        tabId: tab,
+        fingerprint: askFingerprint(SAMPLER),
+        question: SAMPLER.question,
+      });
+      AskAnswers.record(`pa-${tab}-live`, "dpmpp_2m", { tabId: tab });
+    };
+    strandFor(FIRST);
+    const owed = AskAnswers.droppedFor(FIRST);
+    expect(owed).toBeGreaterThan(0);
+    // 200 further tabs each strand their own debt — three times the old ceiling.
+    for (let t = 1; t <= 200; t += 1) strandFor(`tab-other-${String(t).padStart(4, "0")}`);
+    // The FIRST tab is still owed (never less — the global ceiling may have cost
+    // it more answers since), still holds the restart gate, and is still named by
+    // the fatal-exit report.
+    const still = AskAnswers.droppedFor(FIRST);
+    expect(still).toBeGreaterThanOrEqual(owed);
+    expect(AskAnswers.reportDropped(FIRST)).toBe(still);
+    expect(AskAnswers.hasOutstanding()).toBe(true);
+    expect(AskAnswers.outstandingDebt().some((x) => x.key === FIRST && x.count > 0)).toBe(true);
   });
 
   it("never throws when the flusher does", () => {

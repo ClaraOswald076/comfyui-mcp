@@ -3135,6 +3135,37 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
     bridge.setLateAskReplySink(() => {});
   });
 
+  // Preferring loss over misattribution past the open-card ceiling is a sound
+  // call, but a server log is not a disclosure to the person holding the mouse:
+  // without a notice, the next thing that happens is someone clicking a button on
+  // a card that is still on screen and having it do NOTHING. Say it on their
+  // screen, at the moment we know.
+  it("tells the USER when an open card can no longer accept an answer", async () => {
+    const sock = await connectPanel("tab-overflow", "wf");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-overflow")).toBe(true));
+    const said: string[] = [];
+    sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.type === "say" && typeof msg.text === "string") said.push(msg.text);
+    });
+    // Fill the mapping past its ceiling without waiting on 1024 real sends.
+    const map = (bridge as unknown as {
+      askRidToId: Map<string, { askId: string; ts: number; tabId: string }>;
+    }).askRidToId;
+    for (let i = 0; i < 1100; i += 1) {
+      map.set(`rid-${i}`, { askId: `pa-${i}`, ts: Date.now(), tabId: "tab-overflow" });
+    }
+    // Any take runs a prune pass, which is where the ceiling bites.
+    expect(bridge.takeLateAskReply("nothing-here")).toBeUndefined();
+    expect(map.size).toBeLessThanOrEqual(1024);
+    await vi.waitFor(() =>
+      expect(said.some((t) => /can no longer accept an answer/i.test(t))).toBe(true),
+    );
+    expect(said.find((t) => /can no longer accept an answer/i.test(t))).toMatch(
+      /type your choice in the chat/i,
+    );
+  });
+
   it("a throwing sink never breaks the message loop or loses the buffered answer", async () => {
     bridge.setLateAskReplySink(() => {
       throw new Error("journal exploded");

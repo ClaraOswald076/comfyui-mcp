@@ -2128,6 +2128,14 @@ export async function runPanelOrchestrator(): Promise<void> {
   AskAnswers.setRevoker((panelTabId, token) =>
     manager.revokeEvent(agentKeyFor(panelTabId), token),
   );
+  // …and let a TOOL-RESULT answer ride the turn its tool call is running inside,
+  // so #468's ack-on-carry settles it. Without this the journal has no proof of
+  // receipt for the ordinary path and must treat every answer as possibly lost;
+  // with it, "the model read this" is a fact and only the genuinely unconfirmed
+  // ones are held open (#486).
+  AskAnswers.setTurnAttacher((panelTabId, token) =>
+    manager.attachTurnToken(agentKeyFor(panelTabId), token),
+  );
   bridge.setLateAskReplySink((askId, result, tabId) => {
     if (!AskAnswers.tracks(askId)) return;
     const entry = AskAnswers.record(askId, result, { tabId });
@@ -2162,32 +2170,39 @@ export async function runPanelOrchestrator(): Promise<void> {
   function reportLostCompletionsOnExit(): void {
     if (lostCompletionsReported) return; // every exit path calls this; report once
     lostCompletionsReported = true;
-    const byTab = new Map<string, string[]>();
+    // RENDERS and ANSWERS are kept APART, all the way to the wording. They are
+    // lost the same way but they are not the same loss, and their remedies are
+    // not interchangeable: a render can be looked up in ComfyUI's history, an
+    // answer NEVER can — it only ever existed in this journal, so the only thing
+    // the user can do is give it again. Telling someone to check `get_history`
+    // for a lost answer names a lever that cannot work, in the one moment they
+    // are already dealing with a failure.
+    const byTab = new Map<string, { runs: string[]; answers: string[] }>();
+    const slot = (key: string): { runs: string[]; answers: string[] } => {
+      const cur = byTab.get(key) ?? { runs: [], answers: [] };
+      byTab.set(key, cur);
+      return cur;
+    };
     try {
       for (const entry of RunCompletions.allOutstanding()) {
-        const list = byTab.get(entry.key) ?? [];
-        list.push(describeCorrelation(entry.correlation));
-        byTab.set(entry.key, list);
+        slot(entry.key).runs.push(describeCorrelation(entry.correlation));
       }
       // #486 — an ask answer the user actually gave that never reached the agent
       // dies with this process exactly as a completion does, and is at least as
-      // costly to lose. Report it in the same breath, naming the question so the
-      // record is actionable rather than a bare count.
+      // costly to lose. Carry the ANSWER TEXT, not just the question: it is the
+      // one copy left anywhere, and quoting it back is what lets the user confirm
+      // it rather than be asked from scratch.
       for (const entry of AskAnswers.allOutstanding()) {
-        const list = byTab.get(entry.key) ?? [];
-        list.push(
-          `the user's answer to "${previewQuestion(entry.question)}"${entry.returned ? " (handed to a tool call whose receipt was never confirmed)" : ""}`,
+        slot(entry.key).answers.push(
+          `“${entry.answer}” (to “${previewQuestion(entry.question)}”)${entry.returned ? " — it went into a tool call whose receipt was never confirmed" : ""}`,
         );
-        byTab.set(entry.key, list);
       }
       // …and the answers whose only surviving record is a COUNTER, because the
       // journal's bound already destroyed the text. Naming the count is the last
       // thing that keeps that promise; without it the eviction path's "the next
       // delivery will report it" quietly becomes never.
       for (const { key, count } of AskAnswers.outstandingDebt()) {
-        const list = byTab.get(key) ?? [];
-        list.push(`${count} further answer(s) already dropped by the journal (content lost)`);
-        byTab.set(key, list);
+        slot(key).answers.push(`${count} further answer(s) whose text is already lost`);
       }
     } catch {
       return; // nothing readable — nothing to report
@@ -2210,9 +2225,16 @@ export async function runPanelOrchestrator(): Promise<void> {
     // environment, and losing the disclosure would undercut the whole
     // in-memory-journal tradeoff.)
     const record = [...byTab]
-      .map(
-        ([panelTab, runs]) =>
-          `[panel-orchestrator] tab ${panelTab.slice(0, 8)} — exiting with ${runs.length} undelivered render result(s)/user answer(s), outcome UNDETERMINED: ${runs.join("; ")}`,
+      .map(([panelTab, { runs, answers }]) =>
+        [
+          `[panel-orchestrator] tab ${panelTab.slice(0, 8)} — exiting with`,
+          runs.length
+            ? ` ${runs.length} undelivered render result(s), outcome UNDETERMINED: ${runs.join("; ")}.`
+            : "",
+          answers.length
+            ? ` ${answers.length} validated user ANSWER(S) that never reached the agent and cannot be looked up anywhere: ${answers.join("; ")}.`
+            : "",
+        ].join(""),
       )
       .join("\n");
     // A FILE is the ONLY synchronous sink. A sync write to a PIPE can block
@@ -2239,17 +2261,25 @@ export async function runPanelOrchestrator(): Promise<void> {
       logger.error("[panel-orchestrator] …and no durable sink accepted that record (it may not survive)");
     }
     try {
-      for (const [panelTab, runs] of byTab) {
-        bridge.push(
-          {
-            type: "say",
-            text:
-              `⚠️ The agent backend is being restarted, and ${runs.length} finished render result(s) / answered question card(s) could not be delivered ` +
-              `(${runs.join("; ")}). Their outcome/content is UNDETERMINED from the agent's point of view — ask it to check ` +
-              `\`get_history\` for those runs once it reconnects rather than assuming it saw them.`,
-          },
-          panelTab,
-        );
+      for (const [panelTab, { runs, answers }] of byTab) {
+        // Two different losses, two different remedies — never merged.
+        const parts: string[] = ["⚠️ The agent backend is being restarted."];
+        if (runs.length) {
+          parts.push(
+            `${runs.length} finished render result(s) could not be delivered (${runs.join("; ")}). ` +
+              `Their outcome is UNDETERMINED from the agent's point of view — ask it to check \`get_history\` ` +
+              `for those runs once it reconnects rather than assuming it saw them.`,
+          );
+        }
+        if (answers.length) {
+          parts.push(
+            `${answers.length} answer(s) you gave on a question card never reached the agent: ${answers.join("; ")}. ` +
+              `An answer is not a render — there is NO history to look it up in, and the agent has no way to ` +
+              `recover it once this restart completes. Please tell it your choice again (or paste the text above) ` +
+              `when it comes back.`,
+          );
+        }
+        bridge.push({ type: "say", text: parts.join(" ") }, panelTab);
       }
     } catch (err) {
       logger.warn(
@@ -3248,7 +3278,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       // identical re-ask recover it — hands one conversation a decision made in
       // another. Retire the asks instead; closeAsks downgrades and unsends, it
       // never deletes, so the answer is still reported.
-      AskAnswers.closeAsks(panelTab);
+      if (providerSwitched) AskAnswers.closeAsks(panelTab);
       // A headless client (mobile/remote pseudo-panel, no browser canvas) advertises
       // itself in the hello frame so its agent gets the in-turn-delivery directive.
       if ((event as { headless?: unknown }).headless === true) headlessTabs.add(panelTab);
@@ -3779,7 +3809,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       // identical re-ask recover it — hands one conversation a decision made in
       // another. Retire the asks instead; closeAsks downgrades and unsends, it
       // never deletes, so the answer is still reported.
-      AskAnswers.closeAsks(panelTab);
+      if (prev !== reqBackend) AskAnswers.closeAsks(panelTab);
       // Leaving a LOCAL provider frees its VRAM (no other tab still on it) —
       // the point of switching to Claude/hosted is usually reclaiming the GPU.
       if (prev !== reqBackend) {

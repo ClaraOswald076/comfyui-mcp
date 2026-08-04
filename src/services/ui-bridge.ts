@@ -1908,9 +1908,36 @@ export class UiBridge {
         `[ui-bridge] over ${UiBridge.MAX_ASK_RID_MAPPINGS} question cards are open at once — forgetting the ${excess} oldest; a late answer for those can no longer be delivered`,
       );
       let i = 0;
-      for (const rid of this.askRidToId.keys()) {
+      const orphanedTabs = new Set<string>();
+      for (const [rid, e] of this.askRidToId) {
         if (i++ >= excess) break;
         this.askRidToId.delete(rid);
+        orphanedTabs.add(e.tabId);
+      }
+      // TELL THE USER, on their own screen.
+      //
+      // Preferring loss over misattribution here is a sound call, but a server
+      // log is not a disclosure to the person holding the mouse: without this,
+      // the next thing that happens is someone clicking a button on a card that
+      // is still sitting there and having it do NOTHING — no answer delivered, no
+      // error, no sign anything went wrong. That is the worst possible
+      // presentation of a deliberate trade. Say it once per affected tab, at the
+      // moment we know, and name what to do instead.
+      for (const tabId of orphanedTabs) {
+        try {
+          this.push(
+            {
+              type: "say",
+              text:
+                `⚠️ Too many question cards are open at once in this tab, so the oldest ones can no ` +
+                `longer accept an answer — clicking them will do nothing. Answer the most recent card, ` +
+                `or just type your choice in the chat and the agent will pick it up.`,
+            },
+            tabId,
+          );
+        } catch {
+          // Best-effort: the log above is the durable record.
+        }
       }
     }
   }

@@ -178,6 +178,19 @@ export interface AskEntry {
    * a re-ask of the identical question can still recover it.
    */
   returned: boolean;
+  /**
+   * PROVEN read by the agent — the turn that carried this answer produced its
+   * own marked result (#468's ack-on-carry, ridden by a tool-result answer via
+   * PanelAgent.attachTurnToken).
+   *
+   * `returned` and `acked` are deliberately two fields, because they answer two
+   * different questions and conflating them is the bug this whole file exists to
+   * kill. `returned` says only that the answer was written to a transport that
+   * MAY have been abandoned — the premise of #486. `acked` says the model ran to
+   * completion after receiving it. Only the second may license forgetting an
+   * answer quietly.
+   */
+  acked?: boolean;
   delivery: AskDeliveryState;
   attempts: number;
   /** How many turns carried this answer and then ended without a provable ack. */
@@ -245,8 +258,6 @@ const RECOVER_MAX_AGE_MS = 10 * 60_000;
  *  those put the text into a turn the agent read, so settling risks a duplicate,
  *  never a loss. */
 const MAX_CARRIED_RELEASES = 3;
-/** Tabs whose evicted-answer counter is retained. */
-const MAX_DROPPED_KEYS = 64;
 /** How many separate tool results may report an eviction debt before it is
  *  considered said. See reportDropped(). */
 const MAX_DEBT_REPORTS = 3;
@@ -367,6 +378,8 @@ export class AskAnswerJournalImpl {
   private flush: ((key: string) => void) | null = null;
   /** Pull a still-queued answer event back off its agent (see setRevoker). */
   private revoke: ((key: string, token: string) => boolean) | null = null;
+  /** Ride a token on the tab's in-flight turn (see setTurnAttacher). */
+  private attachTurn: ((key: string, token: string) => boolean) | null = null;
 
   /**
    * Wire the push channel (#486).
@@ -392,6 +405,21 @@ export class AskAnswerJournalImpl {
    */
   setRevoker(revoke: (key: string, token: string) => boolean): void {
     this.revoke = revoke;
+  }
+
+  /**
+   * Wire the TOOL-RESULT ack (#486).
+   *
+   * An answer PUSHED as an event is acked when the turn carrying it ends. An
+   * answer handed back as a TOOL RESULT had no such proof — and treating the
+   * hand-off itself as proof is exactly the assumption #486 exists to demolish.
+   * This rides the token on the turn the tool call is running inside, so the
+   * SAME ack-on-carry machinery settles it: either that turn's own marked result
+   * lands (the model ran to completion after receiving the answer), or it never
+   * does and the answer stays accounted for.
+   */
+  setTurnAttacher(attach: (key: string, token: string) => boolean): void {
+    this.attachTurn = attach;
   }
 
   /**
@@ -630,6 +658,10 @@ export class AskAnswerJournalImpl {
     const entry = this.entries.get(token);
     if (entry) {
       entry.returned = true;
+      // Ride the turn this tool call is running inside, so that turn's result —
+      // and nothing less — acks the answer. No live turn to ride means no proof,
+      // so the answer simply stays unacked, which is the conservative reading.
+      this.attachTurn?.(entry.key, token);
       // It reached A caller. Do not ALSO push it as an orphan; a re-ask can
       // still recover it if that caller was already dead.
       //
@@ -820,9 +852,23 @@ export class AskAnswerJournalImpl {
     // the recovery window: a re-ask of the identical question must still be able
     // to return it as its result rather than making the user answer twice. It is
     // flagged so any later surfacing reads as "you have seen this".
-    delete entry.disclose;
+    //
+    // The eviction DISCLOSURE it carries is only SPENT when a real delivery
+    // actually rendered it — `deliverPending` stamps the count onto the entry and
+    // puts `dropped_answers` in that payload, and `attempts > 0` is the record of
+    // it. An entry acked without ever having been pushed (a TOOL-RESULT answer
+    // riding its turn) never showed anyone that count, so deleting it here would
+    // spend a warning nobody was given: re-home it instead.
+    if (entry.disclose) {
+      const owed = entry.disclose;
+      delete entry.disclose;
+      if (entry.attempts === 0) this.noteDropped(entry.key, owed);
+    }
     entry.delivery = "none";
     entry.returned = true;
+    // THE proof. Everything that may forget an answer QUIETLY keys on this and
+    // never on `returned`.
+    entry.acked = true;
     entry.replayHint = true;
   }
 
@@ -840,6 +886,14 @@ export class AskAnswerJournalImpl {
   release(token: string, opts: { carried?: boolean } = {}): void {
     const entry = this.entries.get(token);
     if (!entry) return;
+    // A TOOL-RESULT answer riding a turn (see setTurnAttacher) is not in a
+    // delivery loop: nothing re-sends it, so there is no cycle to bound and
+    // nothing to re-arm. Its turn ended without proving it was read, so the only
+    // correct outcome is that it stays UNACKED — which is what keeps it
+    // recoverable and makes its eviction a disclosed loss rather than a silent
+    // one. Settling it here on a bound would forge the very proof this split
+    // exists to withhold.
+    if (entry.returned && entry.delivery === "none") return;
     if (opts.carried) {
       entry.carriedReleases = (entry.carriedReleases ?? 0) + 1;
       if (entry.carriedReleases >= MAX_CARRIED_RELEASES) {
@@ -886,7 +940,10 @@ export class AskAnswerJournalImpl {
       (e) =>
         e.delivery !== "none" ||
         (e.disclose ?? 0) > 0 ||
-        now - e.answeredAt <= RECOVER_MAX_AGE_MS,
+        // UNACKED only: an answer the agent provably read is not news on the way
+        // out, and naming every ask of the last ten minutes would bury the ones
+        // that actually went missing.
+        (e.acked !== true && now - e.answeredAt <= RECOVER_MAX_AGE_MS),
     );
   }
 
@@ -1033,6 +1090,12 @@ export class AskAnswerJournalImpl {
   dropTicketForTest(askId: string): void {
     this.tickets.delete(askId);
   }
+  /** Record + hand back in one step, returning the token. */
+  markReturnedForTest(askId: string, reply: unknown, tabId: string): string {
+    const token = this.record(askId, reply, { tabId }).token;
+    this.markReturned(token);
+    return token;
+  }
   entriesFor(key: string): AskEntry[] {
     return [...this.entries.values()].filter((e) => e.key === key);
   }
@@ -1088,16 +1151,20 @@ export class AskAnswerJournalImpl {
       return;
     }
     this.dropped.set(key, (this.dropped.get(key) ?? 0) + count);
-    while (this.dropped.size > MAX_DROPPED_KEYS) {
-      const victim = this.dropped.keys().next().value;
-      if (victim === undefined) break;
-      const lost = this.dropped.get(victim) ?? 0;
-      this.dropped.delete(victim);
-      this.droppedReports.delete(victim);
-      logger.error(
-        `[ask-answers] discarding the undelivered-answer count (${lost}) for tab ${victim.slice(0, 8)} — over ${MAX_DROPPED_KEYS} tabs are tracking one; that tab will not be told`,
-      );
-    }
+    // NO CEILING HERE, deliberately.
+    //
+    // This map is not payload — it is the PROMISE that a loss will be reported,
+    // and it is the last record of answers whose text is already gone. Evicting
+    // it on the same terms as data (as an earlier draft did, at 64 tabs) turns a
+    // disclosed loss straight back into a silent one: the tab's next ask, the
+    // restart gate and the fatal-exit report all lose their only trace, and the
+    // log line that announced it said outright that the tab would never be told.
+    // A bounded store must never be what decides whether a warning is owed.
+    //
+    // It cannot grow without limit anyway: one integer per PANEL TAB that has
+    // stranded debt, removed by forget() when the tab goes away (which logs at
+    // ERROR, the one place the promise genuinely cannot be kept) and merged by
+    // moveKey() across a tab-id migration.
   }
 
   /**
@@ -1113,41 +1180,37 @@ export class AskAnswerJournalImpl {
     const evict = (scope: (e: AskEntry) => boolean, limit: number, label: string): void => {
       let mine = [...this.entries.values()].filter(scope);
       while (mine.length > limit) {
-        const victim = mine.find((e) => e.returned) ?? mine[0];
+        // EVICTION ORDER, and the one decision that may forget an answer
+        // QUIETLY. It keys on ACKED — the turn that carried the answer produced
+        // its own marked result — never on `returned`, which says only that the
+        // answer was written to a transport that may already have been
+        // abandoned. That is the premise of #486, so it cannot also be the
+        // licence to forget.
+        //
+        // Ordinary asks ARE acked (the model reads the tool result and finishes
+        // its turn), so the common path stays silent and no warning cries wolf.
+        // An answer whose turn never completed is precisely the #486 failure, so
+        // it is counted and disclosed exactly like one that reached nobody.
+        const victim =
+          mine.find((e) => e.acked === true) ??
+          mine.find((e) => e.returned) ??
+          mine[0];
         this.entries.delete(victim.token);
         mine = mine.filter((e) => e !== victim);
-        if (victim.returned) {
-          // LOGGED, NOT COUNTED as an undetermined loss for the agent — the one
-          // place this file deliberately stops short, so the reasoning is spelled
-          // out rather than assumed.
-          //
-          // A returned answer DID reach a caller; what its eviction costs is the
-          // ability to RECOVER it, not a delivery. Counting each one as "a
-          // validated answer was dropped, treat it as UNDETERMINED" would fire
-          // after ~48 ordinary successful asks on a tab and tell the agent that
-          // answers it almost certainly received are unknown. A warning that is
-          // usually false is its own kind of silence: it trains the reader to
-          // ignore the one that is true.
-          //
-          // The exposure is bounded on both sides — the per-tab ceiling is far
-          // above any plausible burst, orphans are never evicted before these,
-          // and the full answer text is written here — so what survives is a
-          // reconstructable record rather than a misleading alarm.
-          // …but ANY DISCLOSURE IT WAS CARRYING is re-homed, not dropped with it.
-          // The residual above permits losing THIS answer's recoverability; it
-          // says nothing about the debt owed for EARLIER answers that reached
-          // nobody, which merely happened to be stamped on this entry. (Reachable
-          // because a recovery marks its entry `returned` while it is carrying a
-          // count — after which it becomes the preferred eviction victim.)
+        if (victim.acked === true) {
+          // ANY DISCLOSURE IT WAS CARRYING is re-homed, not dropped with it: this
+          // answer's own recoverability is what may be forgotten, never the debt
+          // owed for EARLIER answers that reached nobody and merely happened to
+          // be stamped on this entry.
           if (victim.disclose) this.noteDropped(victim.key, victim.disclose);
-          logger.warn(
-            `[ask-answers] ${label} — forgetting an already-returned answer ("${victim.answer}") to "${preview(victim.question)}"; a re-ask can no longer recover it, and a tool result is not proof it was received`,
+          logger.debug(
+            `[ask-answers] ${label} — forgetting an answer to "${preview(victim.question)}" that the agent provably read`,
           );
           continue;
         }
         this.noteDropped(victim.key, 1 + (victim.disclose ?? 0));
         logger.error(
-          `[ask-answers] ${label} — dropped a VALIDATED answer to "${preview(victim.question)}" that had reached nobody; the next delivery will report it as undetermined`,
+          `[ask-answers] ${label} — dropped a VALIDATED answer to "${preview(victim.question)}"${victim.returned ? " that went into a tool call whose receipt was never confirmed" : " that had reached nobody"}; the next delivery will report it as undetermined`,
         );
       }
     };
