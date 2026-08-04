@@ -304,7 +304,13 @@ export function redactedError(err: unknown): unknown {
   const copy = new Error(safe);
   if (err instanceof Error) {
     copy.name = err.name;
-    copy.stack = err.stack;
+    // A Node stack EMBEDS the message in its first line, so copying it verbatim
+    // would carry the credential straight past the redaction and into any
+    // unhandled-rejection log (codex gate, round 8, finding 3). Redact the stack
+    // with the same substitution, and drop it entirely when that is not safe —
+    // a stack trace is never worth handing a credential back through.
+    const stack = err.stack ? redactComfyAuthValues(err.stack) : undefined;
+    if (stack) copy.stack = stack;
   }
   return copy;
 }
