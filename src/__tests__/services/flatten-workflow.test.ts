@@ -183,6 +183,124 @@ describe("flattenUiWorkflow — Use-Everywhere", () => {
     const consumer = graph.nodes.find((n) => n.type === "SomeConsumer")!;
     expect(consumer.inputs![0].link).toBeNull();
     expect(report.warnings.join("\n")).toContain("cannot be attributed to any sender");
+    // The record names no sender, so we cannot tell WHICH one has to survive —
+    // deleting any would erase the evidence of the broadcast we declined to
+    // materialize, and scrubbing ue_links would erase the record itself.
+    expect(graph.nodes.some((n) => n.type === "Anything Everywhere")).toBe(true);
+    expect(graph.extra?.ue_links).toBeDefined();
+  });
+
+  it("a confirmed record whose producer output does not exist is reported, not dropped in silence", () => {
+    // A self-producing sender skips the feed check, so this record passes
+    // confirmation and then fails to BUILD (the node serializes no outputs). The
+    // return value used to be discarded: no edge, no warning, and the sender then
+    // deletable — a could-not-determine folded into a silent loss.
+    const g: UiWorkflow = {
+      nodes: [
+        node(1, "Seed Everywhere", { widgets_values: [42] }), // no outputs array
+        node(3, "SomeConsumer", { inputs: [{ name: "seed", type: "INT", link: null }] }),
+      ],
+      links: [],
+      last_link_id: 0,
+      extra: {
+        ue_links: [
+          { downstream: 3, downstream_slot: 0, upstream: 1, upstream_slot: 0, controller: 1, type: "INT" },
+        ],
+      },
+    };
+    const { graph, report } = flattenUiWorkflow(g);
+    const consumer = graph.nodes.find((n) => n.type === "SomeConsumer")!;
+    expect(consumer.inputs![0].link).toBeNull();
+    expect(report.warnings.join("\n")).toContain("which this graph does not have");
+    expect(graph.nodes.some((n) => n.type === "Seed Everywhere")).toBe(true);
+  });
+
+  it("a LIVE broadcast whose sender is fed through a Get/Set bus is still materialized", () => {
+    // Pass 1 replaces the sender's bus-fed input with a fresh direct link; the
+    // staleness check must see that fresh link, or it reads the feed as
+    // unresolvable and refuses a broadcast that is perfectly current.
+    const g: UiWorkflow = {
+      nodes: [
+        node(1, "CheckpointLoaderSimple", { outputs: [{ name: "MODEL", type: "MODEL", links: [10] }] }),
+        node(2, "SetNode", {
+          widgets_values: ["m"],
+          inputs: [{ name: "MODEL", type: "MODEL", link: 10 }],
+          outputs: [{ name: "*", type: "*", links: [] }],
+        }),
+        node(3, "GetNode", {
+          widgets_values: ["m"],
+          outputs: [{ name: "MODEL", type: "MODEL", links: [11] }],
+        }),
+        node(4, "Anything Everywhere", { inputs: [{ name: "anything", type: "*", link: 11 }] }),
+        node(5, "SomeConsumer", { inputs: [{ name: "model", type: "MODEL", link: null }] }),
+      ],
+      links: [
+        [10, 1, 0, 2, 0, "MODEL"],
+        [11, 3, 0, 4, 0, "MODEL"],
+      ],
+      last_link_id: 11,
+      extra: {
+        ue_links: [
+          { downstream: 5, downstream_slot: 0, upstream: 1, upstream_slot: 0, controller: 4, type: "MODEL" },
+        ],
+      },
+    };
+    const { graph, report } = flattenUiWorkflow(g);
+    const consumer = graph.nodes.find((n) => n.type === "SomeConsumer")!;
+    const link = graph.links.find((l) => l[0] === consumer.inputs![0].link)!;
+    expect([link[1], link[2]]).toEqual([1, 0]);
+    expect(report.warnings).toEqual([]);
+  });
+
+  it("a record whose upstream IS the bus node resolves through it", () => {
+    // The pack sometimes records the virtual in front of the producer rather than
+    // the producer; a GetNode has no incoming link, so it must be followed over
+    // its bus, not by looking for an input.
+    const g: UiWorkflow = {
+      nodes: [
+        node(1, "CheckpointLoaderSimple", { outputs: [{ name: "MODEL", type: "MODEL", links: [10] }] }),
+        node(2, "SetNode", {
+          widgets_values: ["m"],
+          inputs: [{ name: "MODEL", type: "MODEL", link: 10 }],
+          outputs: [{ name: "*", type: "*", links: [] }],
+        }),
+        node(3, "GetNode", {
+          widgets_values: ["m"],
+          outputs: [{ name: "MODEL", type: "MODEL", links: [11] }],
+        }),
+        node(4, "Anything Everywhere", { inputs: [{ name: "anything", type: "*", link: 11 }] }),
+        node(5, "SomeConsumer", { inputs: [{ name: "model", type: "MODEL", link: null }] }),
+      ],
+      links: [
+        [10, 1, 0, 2, 0, "MODEL"],
+        [11, 3, 0, 4, 0, "MODEL"],
+      ],
+      last_link_id: 11,
+      extra: {
+        ue_links: [
+          { downstream: 5, downstream_slot: 0, upstream: 3, upstream_slot: 0, controller: 4, type: "MODEL" },
+        ],
+      },
+    };
+    const { graph, report } = flattenUiWorkflow(g);
+    const consumer = graph.nodes.find((n) => n.type === "SomeConsumer")!;
+    const link = graph.links.find((l) => l[0] === consumer.inputs![0].link)!;
+    expect([link[1], link[2]]).toEqual([1, 0]);
+    expect(report.warnings).toEqual([]);
+  });
+
+  it("a stale last_link_id cannot make a fresh link collide with an existing one", () => {
+    const g = ueGraph(true);
+    // An existing link sitting at exactly the id the stale header hands out next.
+    // The header is only a header, and tooling that edits a graph does not always
+    // maintain it.
+    g.nodes.push(node(9, "SomeConsumer", { inputs: [{ name: "model", type: "MODEL", link: 6 }] }));
+    g.links.push([6, 1, 0, 9, 0, "MODEL"]);
+    g.nodes[0].outputs![0].links = [5, 6];
+    g.last_link_id = 5;
+    const { graph } = flattenUiWorkflow(g);
+    const ids = graph.links.map((l) => l[0]);
+    expect(new Set(ids).size).toBe(ids.length);
   });
 
   it("a class merely SHARING a sender name prefix cannot skip the feed check", () => {

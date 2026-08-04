@@ -151,7 +151,34 @@ export function flattenUiWorkflow(
     return { id: link[1], slot: link[2], type: link[5] };
   };
 
-  let nextLinkId = (ui.last_link_id ?? Math.max(0, ...linkMap.keys())) + 1;
+  /** Walk from a NODE + output slot past any virtual wiring to the real producer.
+   *  A GetNode has no input to follow — its value arrives over the bus — so this
+   *  mirrors resolveReal's Get handling instead of looking for an incoming link. */
+  const resolveRealFromNode = (
+    nodeId: number,
+    slot: number,
+  ): { id: number; slot: number } | null => {
+    const n = nodesById.get(nodeId);
+    if (!n) return { id: nodeId, slot };
+    if (includeGetSet && isGetType(n.type)) {
+      const bus = n.widgets_values?.[0];
+      const setLink = bus != null ? busSource.get(String(bus)) : undefined;
+      const r = setLink != null ? resolveReal(setLink) : null;
+      return r ? { id: r.id, slot: r.slot } : null;
+    }
+    if (includeGetSet && (isSetType(n.type) || isRerouteType(n.type))) {
+      const inp = (n.inputs ?? []).find((i) => i.link != null);
+      const r = inp?.link != null ? resolveReal(inp.link) : null;
+      return r ? { id: r.id, slot: r.slot } : null;
+    }
+    return { id: nodeId, slot };
+  };
+
+  // Take the MAXIMUM of the header and the ids actually present. `last_link_id`
+  // is only a header: a graph edited by tooling that did not maintain it can
+  // carry links above it, and a fresh id equal to an existing one yields two
+  // links with the same id — an ambiguous graph, produced silently.
+  let nextLinkId = Math.max(ui.last_link_id ?? 0, 0, ...linkMap.keys()) + 1;
   const freshLinks: UiLink[] = [];
   let rewired = 0;
 
@@ -168,9 +195,15 @@ export function flattenUiWorkflow(
     const srcOutput = src?.outputs?.[srcSlot];
     if (!src || !dst || !dstInput || !srcOutput) return null;
     const id = nextLinkId++;
-    freshLinks.push([id, srcId, srcSlot, dstId, dstSlot, type]);
+    const link: UiLink = [id, srcId, srcSlot, dstId, dstSlot, type];
+    freshLinks.push(link);
     dstInput.link = id;
     srcOutput.links = [...(srcOutput.links ?? []), id];
+    // Index it: pass 1 REPLACES a virtual-fed input with a fresh direct link, and
+    // pass 2's staleness check resolves the sender's feed through this same map.
+    // Leaving fresh links out of it made a rewired feed look UNRESOLVABLE, which
+    // would refuse a perfectly live broadcast.
+    linkMap.set(id, link);
     return id;
   };
 
@@ -222,6 +255,10 @@ export function flattenUiWorkflow(
       /** Senders with at least one record we could not confirm — kept in place so
        *  the user can re-save and recover the real broadcast. */
       const unconfirmed = new Set<number>();
+      /** Set when a refused record names NO sender, so we cannot tell WHICH one
+       *  has to survive. Deleting any of them would erase the evidence of the
+       *  broadcast we declined to materialize, so none is deleted. */
+      let blockSenderDeletion = false;
       /** Senders whose channel could not be verified (several distinct producers,
        *  and a record does not name the input it came through). Disclosed once. */
       const multiFeed = new Map<number, string>();
@@ -284,10 +321,13 @@ export function flattenUiWorkflow(
         let srcSlot = uel.upstream_slot;
         const up = nodesById.get(srcId);
         if (up && isWiringVirtual(up.type)) {
-          const viaInp = (up.inputs ?? []).find((i) => i.link != null);
-          const resolved = viaInp?.link != null ? resolveReal(viaInp.link) : null;
+          const resolved = resolveRealFromNode(srcId, srcSlot);
           if (!resolved) {
-            warnings.push(`ue_link upstream #${srcId} is an unresolvable virtual node — skipped`);
+            warnings.push(
+              `ue_link upstream #${srcId} (${up.type}) is virtual wiring that could not be resolved to a real producer — ${dst.type} #${dst.id} input "${dstInput.name ?? uel.downstream_slot}" is left unconnected`,
+            );
+            if (uel.controller != null) unconfirmed.add(uel.controller);
+            else blockSenderDeletion = true;
             continue;
           }
           srcId = resolved.id;
@@ -299,10 +339,26 @@ export function flattenUiWorkflow(
             `ue_link → ${dst.type} #${dst.id} input "${dstInput.name ?? uel.downstream_slot}" could not be confirmed against the live graph: ${why} — left unconnected, and the sender is kept in place so a re-save can recover it`,
           );
           if (uel.controller != null) unconfirmed.add(uel.controller);
+          else blockSenderDeletion = true;
           continue;
         }
         const added = addDirectLink(srcId, srcSlot, uel.downstream, uel.downstream_slot, uel.type ?? dstInput.type ?? "*");
-        if (added != null) rewired++;
+        if (added == null) {
+          // Confirmed, but the edge could not be built — the producer node or that
+          // output slot is not in the graph. Swallowing the null returned a
+          // FLATTENED graph missing a broadcast it claimed to resolve, and let the
+          // sender be deleted on top of it.
+          const srcNode = nodesById.get(srcId);
+          warnings.push(
+            `ue_link → ${dst.type} #${dst.id} input "${dstInput.name ?? uel.downstream_slot}" names producer #${srcId}${
+              srcNode ? ` (${srcNode.type}) output slot ${srcSlot}` : ""
+            }, which this graph does not have — left unconnected, and the sender is kept in place`,
+          );
+          if (uel.controller != null) unconfirmed.add(uel.controller);
+          else blockSenderDeletion = true;
+          continue;
+        }
+        rewired++;
       }
       for (const [id, type] of multiFeed) {
         warnings.push(
@@ -316,6 +372,7 @@ export function flattenUiWorkflow(
       const liveOrigins = new Set<number>();
       for (const l of freshLinks) liveOrigins.add(l[1]);
       for (const s of ueSenders) {
+        if (blockSenderDeletion) break;
         if (!liveOrigins.has(s.id) && !unconfirmed.has(s.id)) ueDeletable.add(s.id);
       }
     }
