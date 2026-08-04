@@ -571,11 +571,26 @@ export class AskAnswerJournalImpl {
       ticketSeq: ticket?.seq ?? 0,
       returned: false,
       // An answer that lands while its own handler is still running is that
-      // handler's to return; one that lands afterwards (or with no ticket at
-      // all) has nobody left and is armed for the push immediately. An answer to
-      // a card whose CONVERSATION was replaced is never pushed at all — see
-      // closeAsks(); it is journaled for disclosure only.
-      delivery: ticket?.awaiting === true || conversationGone ? "none" : "pending",
+      // handler's to return; one that lands afterwards has nobody left and is
+      // armed for the push immediately.
+      //
+      // TWO cases are never pushed, and are journaled for disclosure only:
+      //  • its CONVERSATION was replaced — see closeAsks();
+      //  • THERE IS NO TICKET AT ALL. Without one we cannot tell whether the card
+      //    belongs to the conversation now on this tab or to a retired one (the
+      //    ticket carried that generation), and announcing it anyway would fold
+      //    "could not determine" into "determined not retired". It is also the
+      //    one delivery with nothing to offer: the wording for an unattributable
+      //    answer already says its meaning is UNDETERMINED and that nothing may
+      //    be inferred from it, so pushing it into a conversation that may not be
+      //    the one that asked buys nothing and risks exactly the
+      //    wrong-conversation delivery the epoch guard exists to prevent. The
+      //    answer is still logged with its text and still reported by a later ask
+      //    on this tab — it is not swallowed, it is just not announced.
+      delivery:
+        ticket === undefined || ticket.awaiting === true || conversationGone
+          ? "none"
+          : "pending",
       // A question the CURRENT conversation never asked may be reported, never
       // returned as its answer.
       ...(conversationGone || existing !== undefined ? { recoverable: false } : {}),

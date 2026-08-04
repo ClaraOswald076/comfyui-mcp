@@ -217,9 +217,33 @@ describe("ask-answer journal — cross-question misattribution guard (#486)", ()
     expect(entry.correlation.status).toBe("foreign");
     expect(entry.fingerprint).toBeNull();
     expect(entry.question).toBeNull();
-    // It is delivered (labelled), but it can satisfy nothing.
-    expect(entry.delivery).toBe("pending");
+    // NOT announced: with no ticket there is no conversation generation, so we
+    // cannot tell whether the card belongs to the conversation on this tab now or
+    // to a retired one — and announcing it anyway would fold "could not
+    // determine" into "determined not retired". Journaled, logged, and reported
+    // by a later ask instead; it can satisfy nothing either way.
+    expect(entry.delivery).toBe("none");
     expect(AskAnswers.recover(TAB, askFingerprint(SAMPLER)).status).toBe("unattributed");
+    expect(AskAnswers.orphansFor(TAB).some((e) => e.answer === "dpmpp_2m")).toBe(true);
+  });
+
+  // codex round 13, P1: the journal's ticket bound and the bridge's mapping bound
+  // are separate, so a retired card could lose its ticket (and with it the
+  // conversation generation) while the bridge still recognised its answer — which
+  // was then announced to whatever conversation held the tab.
+  it("a retired card whose ticket was evicted is still never announced", () => {
+    AskAnswers.openAsk("pa-retired3", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SAMPLER),
+      question: SAMPLER.question,
+    });
+    AskAnswers.closeAsk("pa-retired3");
+    AskAnswers.closeAsks(TAB); // conversation replaced
+    AskAnswers.dropTicketForTest("pa-retired3"); // …and the ticket bound bites
+    const entry = AskAnswers.record("pa-retired3", "dpmpp_2m", { tabId: TAB });
+    expect(entry.delivery).toBe("none");
+    expect(AskAnswers.hasOutstanding()).toBe(false);
+    expect(AskAnswers.orphansFor(TAB).some((e) => e.answer === "dpmpp_2m")).toBe(true);
   });
 });
 
