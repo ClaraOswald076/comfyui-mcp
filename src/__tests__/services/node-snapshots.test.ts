@@ -45,8 +45,15 @@ vi.mock("node:fs", async (importOriginal) => {
     // Pending-operation markers are deliberately read back before a deferred
     // restore starts. Keep snapshot file writes mocked, but make this one marker
     // write real so its durability check exercises the production contract.
+    // Since #798 the marker write is ATOMIC and DURABLE (durable-write.ts):
+    // content goes to a `<pending>.tmp-*` sibling through a real file
+    // DESCRIPTOR and is then renamed over the marker — so the fd-form write
+    // must reach the real fs as well, or the rename publishes a 0-byte file.
     writeFileSync: (...args: Parameters<typeof import("node:fs")["writeFileSync"]>) => {
       fsMocks.writeFileSync(...args);
+      if (typeof args[0] === "number") {
+        return real.writeFileSync(...args);
+      }
       if (String(args[0]) === process.env.COMFYUI_MCP_PANEL_PENDING) {
         return real.writeFileSync(...args);
       }
@@ -346,6 +353,7 @@ describe("restoreNodeSnapshot", () => {
   });
 
   it("refuses before contacting Manager when the deferred-restore marker cannot persist", async () => {
+<<<<<<< HEAD
     // Make the marker's PARENT a regular file, so every read/write against it
     // fails. The mutation must not run without the durable warning a later pin
     // depends on.
@@ -363,6 +371,19 @@ describe("restoreNodeSnapshot", () => {
     writeFileSync(blocker, "not a directory");
     const previous = process.env.COMFYUI_MCP_PANEL_PENDING;
     process.env.COMFYUI_MCP_PANEL_PENDING = join(blocker, "pending.json");
+=======
+    // Point the marker at a path inside a directory that does not exist (the
+    // fs mock here makes mkdirSync a no-op, so nothing can create it): the
+    // atomic durable write (#798) then fails at the open, before any record
+    // can be read or written. The mutation must not run without the durable
+    // warning a later pin depends on.
+    const previous = process.env.COMFYUI_MCP_PANEL_PENDING;
+    process.env.COMFYUI_MCP_PANEL_PENDING = join(
+      tmpdir(),
+      `cmcp-no-such-dir-${process.pid}`,
+      "pending.json",
+    );
+>>>>>>> b556ff4 (fix(panel): explicit reclaim for a proven-abandoned op lock, durable marker/pin writes, honest panel_reload scope (#760, #798, #765))
     try {
       await expect(restoreNodeSnapshot("prod")).rejects.toThrow(
         /Could not persist the pending snapshot-restore marker/i,

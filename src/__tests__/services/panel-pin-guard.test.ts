@@ -6,6 +6,7 @@
 // and `id="all"` reached the SAME ComfyUI-Manager mutation without ever passing
 // the guard. A pinned user was one generic call away from being moved.
 
+<<<<<<< HEAD
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   mkdtempSync,
@@ -16,8 +17,118 @@ import {
   readdirSync,
   readFileSync,
 } from "node:fs";
+=======
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, existsSync, rmSync, writeFileSync, mkdirSync, readdirSync } from "node:fs";
+>>>>>>> b556ff4 (fix(panel): explicit reclaim for a proven-abandoned op lock, durable marker/pin writes, honest panel_reload scope (#760, #798, #765))
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+
+// #798 — durability is observable only as "fsync happened on THAT FILE before
+// the write was reported done". Track openSync fd→path and record which paths
+// get fsync'd (delegating to the real fs throughout), so the tests below fail
+// if the fsync is ever removed from a load-bearing write. Counting bare calls
+// is not enough: the best-effort DIRECTORY fsync would keep a bare counter
+// green with the file fsync deleted. closeSync drops the mapping so a recycled
+// fd can never attribute a later fsync to a dead path.
+const fsyncTracker = vi.hoisted(() => ({
+  paths: [] as string[],
+  fdPaths: new Map<number, string>(),
+  onBeforeRename: undefined as undefined | ((from: string, to: string) => void),
+  onBeforeLink: undefined as undefined | ((from: string, to: string) => void),
+  /** When set, the next fsync on a path containing this substring throws. */
+  failFsyncFor: undefined as string | undefined,
+  /** When set, an fsync on EXACTLY this path throws (with `code` if given). */
+  failFsyncExact: undefined as { path: string; code?: string } | undefined,
+  /** When set, openSync on EXACTLY this path throws EACCES. */
+  failOpenFor: undefined as string | undefined,
+  /** When set, writeSync on a path containing this substring reports 0 bytes. */
+  zeroWriteFor: undefined as string | undefined,
+  /** When set, rmSync on a path containing this substring throws EPERM. */
+  failRmFor: undefined as string | undefined,
+  onBeforeOpen: undefined as undefined | ((path: string, flags: unknown) => void),
+}));
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    openSync: (
+      p: Parameters<typeof actual.openSync>[0],
+      flags: Parameters<typeof actual.openSync>[1],
+      mode?: Parameters<typeof actual.openSync>[2],
+    ) => {
+      if (fsyncTracker.failOpenFor && String(p) === fsyncTracker.failOpenFor) {
+        const err = new Error("injected open failure") as NodeJS.ErrnoException;
+        err.code = "EACCES";
+        throw err;
+      }
+      fsyncTracker.onBeforeOpen?.(String(p), flags);
+      const fd = actual.openSync(p, flags, mode);
+      fsyncTracker.fdPaths.set(fd, String(p));
+      return fd;
+    },
+    closeSync: (fd: number) => {
+      fsyncTracker.fdPaths.delete(fd);
+      return actual.closeSync(fd);
+    },
+    fsyncSync: (fd: number) => {
+      const p = fsyncTracker.fdPaths.get(fd);
+      if (p) {
+        fsyncTracker.paths.push(p);
+        if (fsyncTracker.failFsyncExact && p === fsyncTracker.failFsyncExact.path) {
+          const spec = fsyncTracker.failFsyncExact;
+          fsyncTracker.failFsyncExact = undefined;
+          const err = new Error("injected fsync failure") as NodeJS.ErrnoException;
+          if (spec.code) err.code = spec.code;
+          throw err;
+        }
+        if (fsyncTracker.failFsyncFor && p.includes(fsyncTracker.failFsyncFor)) {
+          fsyncTracker.failFsyncFor = undefined;
+          throw new Error("injected fsync failure");
+        }
+      }
+      return actual.fsyncSync(fd);
+    },
+    // Test hook for the reclaim's replace-between-observation-and-rename race:
+    // lets a test swap the lock's content at the exact moment it is moved aside.
+    renameSync: (
+      from: Parameters<typeof actual.renameSync>[0],
+      to: Parameters<typeof actual.renameSync>[1],
+    ) => {
+      fsyncTracker.onBeforeRename?.(String(from), String(to));
+      return actual.renameSync(from, to);
+    },
+    // Same, for the reclaim's link-back restore: lets a test land a fresh lock
+    // at the path in the exact gap the restore must never overwrite into.
+    linkSync: (
+      from: Parameters<typeof actual.linkSync>[0],
+      to: Parameters<typeof actual.linkSync>[1],
+    ) => {
+      fsyncTracker.onBeforeLink?.(String(from), String(to));
+      return actual.linkSync(from, to);
+    },
+    // A writeSync that reports 0 bytes written (without writing) — the
+    // resource-pressure short write the lock init must detect, not spin on.
+    writeSync: (fd: number, ...args: unknown[]) => {
+      const p = fsyncTracker.fdPaths.get(fd);
+      if (p && fsyncTracker.zeroWriteFor && p.includes(fsyncTracker.zeroWriteFor)) {
+        return 0;
+      }
+      return (actual.writeSync as (...a: unknown[]) => number)(fd, ...args);
+    },
+    // An rmSync that fails (AV holding the file) — cleanup paths must report
+    // the OUTCOME honestly, not misclassify the main operation as failed.
+    rmSync: (p: Parameters<typeof actual.rmSync>[0], ...args: unknown[]) => {
+      if (fsyncTracker.failRmFor && String(p).includes(fsyncTracker.failRmFor)) {
+        const err = new Error("injected rm failure") as NodeJS.ErrnoException;
+        err.code = "EPERM";
+        throw err;
+      }
+      return (actual.rmSync as (...a: unknown[]) => void)(p, ...args);
+    },
+  };
+});
 
 import {
   activePanelPendingOps,
@@ -26,6 +137,7 @@ import {
   PanelPinnedError,
   panelLockPath,
   panelPendingOpsPath,
+  reclaimAbandonedPanelLock,
   recordPanelPendingOp,
   targetsPanelPack,
   targetsPanelPackExactly,
@@ -332,6 +444,369 @@ describe("withPanelMutationLock — a FILE lock, so it holds across processes", 
     );
     expect(observedByNextAcquisition).toEqual(["side effect committed"]);
   });
+
+  it("the timeout error reports the OBSERVED lock state and names the unlock remedy (#760)", async () => {
+    // The recurrence reports on #760 hit this blind: a 60s timeout with no lock
+    // owner, no age, and no remedy short of hand-deleting an internal file. The
+    // message must say what was actually observed and what to do about it.
+    const path = panelLockPath();
+    writeFileSync(
+      path,
+      JSON.stringify({ pid: 0x7fffffff, startedAt: "2026-08-02T10:06:42.831Z" }),
+    );
+    const old = new Date(Date.now() - 60 * 60_000);
+    const { utimesSync } = await import("node:fs");
+    utimesSync(path, old, old);
+
+    const err = await withPanelMutationLock(async () => "must not run", {
+      timeoutMs: 300,
+    }).catch((e: Error) => e);
+    const message = (err as Error).message;
+    expect(message).toContain(String(0x7fffffff));
+    expect(message).toMatch(/no longer running/);
+    expect(message).toContain("install_panel(action='unlock')");
+    // The manual boundary stays as the fallback.
+    expect(message).toMatch(
+      /stop or restart every comfyui-mcp orchestrator.*delete this exact lock file/i,
+    );
+  });
+
+  it("the timeout error says when the observed owner is STILL RUNNING", async () => {
+    // The same message must not suggest reclaiming a live holder's lock.
+    writeFileSync(panelLockPath(), JSON.stringify({ pid: process.pid }));
+    const err = await withPanelMutationLock(async () => "must not run", {
+      timeoutMs: 300,
+    }).catch((e: Error) => e);
+    expect((err as Error).message).toMatch(/STILL RUNNING/);
+  });
+
+  it("a failed lock init removes the just-created file instead of wedging every later op", async () => {
+    // Codex gate: if the write/fsync/close after the exclusive create fails,
+    // the husk would otherwise stay behind with THIS (live) process's pid —
+    // every later acquire times out behind it, and reclaim rightly refuses a
+    // live owner's lock. The init path must clean up after itself.
+    fsyncTracker.failFsyncFor = "panel-op.lock";
+    await expect(
+      withPanelMutationLock(async () => "must not run", { timeoutMs: 300 }),
+    ).rejects.toThrow(/Could not take the panel operation lock/);
+    expect(existsSync(panelLockPath())).toBe(false);
+    // And the very next operation acquires cleanly.
+    await expect(
+      withPanelMutationLock(async () => "recovered", { timeoutMs: 500 }),
+    ).resolves.toBe("recovered");
+  });
+
+  it("a zero-byte short write fails the acquire (never spins, never leaves a husk)", async () => {
+    // Codex gate round 6: writeSync reports bytes written; ignoring that, a
+    // truncated lock record is fsync'd as if valid — and its unreadable owner
+    // pid would wedge reclaim forever. A zero-progress write must fail the
+    // init (and the init cleanup must remove the just-created file).
+    fsyncTracker.zeroWriteFor = "panel-op.lock";
+    try {
+      await expect(
+        withPanelMutationLock(async () => "must not run", { timeoutMs: 300 }),
+      ).rejects.toThrow(/short write/);
+      expect(existsSync(panelLockPath())).toBe(false);
+    } finally {
+      fsyncTracker.zeroWriteFor = undefined;
+    }
+    await expect(
+      withPanelMutationLock(async () => "recovered", { timeoutMs: 500 }),
+    ).resolves.toBe("recovered");
+  });
+});
+
+describe("reclaimAbandonedPanelLock — the explicit recovery for a wedged lock (#760)", () => {
+  // Comfortably not a live pid on any platform.
+  const DEAD_PID = 0x7fffffff;
+
+  async function plantLock(contents: string, ageMs = 0): Promise<string> {
+    const path = panelLockPath();
+    writeFileSync(path, contents);
+    if (ageMs > 0) {
+      const t = new Date(Date.now() - ageMs);
+      const { utimesSync } = await import("node:fs");
+      utimesSync(path, t, t);
+    }
+    return path;
+  }
+
+  it("reports no-lock when there is nothing to reclaim", () => {
+    const res = reclaimAbandonedPanelLock();
+    expect(res.outcome).toBe("no-lock");
+    expect(res.detail).toMatch(/nothing to reclaim/i);
+  });
+
+  it("reclaims a lock that is BOTH old AND owned by a dead pid — and a new op proceeds", async () => {
+    const path = await plantLock(
+      JSON.stringify({ pid: DEAD_PID, startedAt: "2026-08-02T10:06:42.831Z" }),
+      60 * 60_000,
+    );
+    const res = reclaimAbandonedPanelLock();
+    expect(res.outcome).toBe("reclaimed");
+    expect(res.detail).toContain(String(DEAD_PID));
+    expect(existsSync(path)).toBe(false);
+    // The point of the reclaim: the wedged acquire path works again at once.
+    await expect(
+      withPanelMutationLock(async () => "recovered", { timeoutMs: 500 }),
+    ).resolves.toBe("recovered");
+  });
+
+  it("REFUSES an old lock whose owner is still ALIVE, and leaves it in place", async () => {
+    // Age alone is not abandonment: this is exactly the lock a slow-but-live
+    // operation holds, and reclaiming it would run two mutations at once.
+    const path = await plantLock(JSON.stringify({ pid: process.pid }), 60 * 60_000);
+    const res = reclaimAbandonedPanelLock();
+    expect(res.outcome).toBe("refused");
+    expect(res.detail).toMatch(/STILL RUNNING/);
+    expect(existsSync(path)).toBe(true);
+  });
+
+  it("REFUSES a recent lock even when its recorded pid is dead", async () => {
+    // A just-taken lock can be in the window before its writer committed the
+    // pid record; youth means "cannot call it abandoned", not "abandoned".
+    const path = await plantLock(JSON.stringify({ pid: DEAD_PID }));
+    const res = reclaimAbandonedPanelLock();
+    expect(res.outcome).toBe("refused");
+    expect(res.detail).toMatch(/window/);
+    expect(existsSync(path)).toBe(true);
+  });
+
+  it("REFUSES an old lock whose content is not valid JSON", async () => {
+    // Unreadable content proves nothing about the owner — treating "we could
+    // not tell" as "the owner is gone" is how a live holder's lock gets deleted.
+    const path = await plantLock("not json", 60 * 60_000);
+    const res = reclaimAbandonedPanelLock();
+    expect(res.outcome).toBe("refused");
+    expect(res.detail).toMatch(/not valid JSON/);
+    expect(existsSync(path)).toBe(true);
+  });
+
+  it("REFUSES an old EMPTY lock (a crash mid-write) rather than guessing", async () => {
+    const path = await plantLock("", 60 * 60_000);
+    const res = reclaimAbandonedPanelLock();
+    expect(res.outcome).toBe("refused");
+    expect(existsSync(path)).toBe(true);
+  });
+
+  it("REFUSES an old lock whose record has no valid pid", async () => {
+    const path = await plantLock(JSON.stringify({ pid: "not-a-pid" }), 60 * 60_000);
+    const res = reclaimAbandonedPanelLock();
+    expect(res.outcome).toBe("refused");
+    expect(res.detail).toMatch(/no valid owner pid/);
+    expect(existsSync(path)).toBe(true);
+  });
+
+  it("never deletes a lock that was REPLACED between the observation and the reclaim", async () => {
+    // The race the byte-compare exists for: the abandoned lock is observed,
+    // then a DIFFERENT holder's lock lands at the path before the rename
+    // moves it aside. What is moved aside no longer matches the observed
+    // bytes, so it must be put back — never deleted.
+    const path = await plantLock(JSON.stringify({ pid: DEAD_PID }), 60 * 60_000);
+    const freshLock = JSON.stringify({ pid: process.pid, startedAt: "fresh" });
+    fsyncTracker.onBeforeRename = (from) => {
+      if (from !== path) return; // only the lock-aside rename, not temp renames
+      // Replace the path's content with a fresh holder's lock, then let the
+      // real rename move THAT aside.
+      writeFileSync(path, freshLock);
+    };
+    try {
+      const res = reclaimAbandonedPanelLock();
+      expect(res.outcome).toBe("refused");
+      expect(res.detail).toMatch(/DIFFERENT holder/);
+      const { readFileSync } = await import("node:fs");
+      expect(readFileSync(path, "utf-8")).toBe(freshLock);
+    } finally {
+      fsyncTracker.onBeforeRename = undefined;
+    }
+  });
+
+  it("the restore never OVERWRITES a fresh lock that lands in the restore gap", async () => {
+    // Codex gate finding: a rename-based restore silently REPLACES an existing
+    // destination, so a fresh lock created between the aside and the restore
+    // would be destroyed. The link-based restore must fail EEXIST instead and
+    // leave BOTH files in place, reported.
+    const path = await plantLock(JSON.stringify({ pid: DEAD_PID }), 60 * 60_000);
+    const replaced = JSON.stringify({ pid: 0x7ffffffe, startedAt: "replaced" });
+    const freshest = JSON.stringify({ pid: process.pid, startedAt: "freshest" });
+    fsyncTracker.onBeforeRename = (from) => {
+      if (from === path) writeFileSync(path, replaced); // force the byte mismatch
+    };
+    fsyncTracker.onBeforeLink = (_from, to) => {
+      if (to === path) writeFileSync(path, freshest); // a fresh lock in the gap
+    };
+    try {
+      const res = reclaimAbandonedPanelLock();
+      expect(res.outcome).toBe("refused");
+      expect(res.detail).toMatch(/preserved at/);
+      const { readFileSync, readdirSync } = await import("node:fs");
+      // The fresh lock at the path is untouched...
+      expect(readFileSync(path, "utf-8")).toBe(freshest);
+      // ...and the replaced lock is preserved at the claim path, not deleted.
+      const claim = readdirSync(dirname(path)).find((f) => f.includes("reclaim-"));
+      expect(claim).toBeDefined();
+      expect(readFileSync(join(dirname(path), claim!), "utf-8")).toBe(replaced);
+    } finally {
+      fsyncTracker.onBeforeRename = undefined;
+      fsyncTracker.onBeforeLink = undefined;
+    }
+  });
+
+  it("an observation made on a REPLACED fresh lock reads the fresh age, never the stale one", async () => {
+    // Codex gate round 3: with a path-based stat then a path-based read, a lock
+    // replaced between them pairs the STALE lock's mtime with the FRESH lock's
+    // pid, and a young lock gets reclaimed. The observation is descriptor-
+    // pinned, so the age and the owner bytes always come from one instance.
+    const path = await plantLock(JSON.stringify({ pid: DEAD_PID }), 60 * 60_000);
+    const fresh = JSON.stringify({ pid: DEAD_PID - 1, startedAt: "fresh" });
+    fsyncTracker.onBeforeOpen = (p, flags) => {
+      if (p === path && flags === "r") {
+        // Replace the stale lock with a fresh one just before observation.
+        rmSync(path, { force: true });
+        writeFileSync(path, fresh);
+      }
+    };
+    try {
+      const res = reclaimAbandonedPanelLock();
+      expect(res.outcome).toBe("refused");
+      expect(res.detail).toMatch(/window/); // the age gate, with the FRESH age
+      const { readFileSync } = await import("node:fs");
+      expect(readFileSync(path, "utf-8")).toBe(fresh);
+    } finally {
+      fsyncTracker.onBeforeOpen = undefined;
+    }
+  });
+
+  it("an unopenable lock is REFUSED, never reported as absent (codex gate)", async () => {    // Only ENOENT proves absence. A present-but-unopenable lock (permissions,
+    // AV interference) must not read as "nothing to reclaim" — it is still
+    // blocking every panel operation.
+    const path = await plantLock(JSON.stringify({ pid: DEAD_PID }), 60 * 60_000);
+    fsyncTracker.failOpenFor = path;
+    try {
+      const res = reclaimAbandonedPanelLock();
+      expect(res.outcome).toBe("refused");
+      expect(res.detail).toMatch(/could not be opened/);
+      expect(res.detail).not.toMatch(/nothing to reclaim/i);
+    } finally {
+      fsyncTracker.failOpenFor = undefined;
+    }
+    expect(existsSync(path)).toBe(true);
+  });
+
+  it("a reclaim whose aside-copy cleanup fails still reports the reclaim honestly (codex gate)", async () => {
+    // The lock path is already free once the verified stale lock is moved
+    // aside, so an AV/EPERM failure removing the aside copy is a CLEANUP
+    // issue — the reclaim must still report success and name the leftover,
+    // never throw a generic failure for work that succeeded.
+    const path = await plantLock(JSON.stringify({ pid: DEAD_PID }), 60 * 60_000);
+    fsyncTracker.failRmFor = ".reclaim-";
+    try {
+      const res = reclaimAbandonedPanelLock();
+      expect(res.outcome).toBe("reclaimed");
+      expect(res.detail).toMatch(/blocks nothing/);
+      expect(res.detail).toMatch(/reclaim-/);
+      expect(existsSync(path)).toBe(false);
+    } finally {
+      fsyncTracker.failRmFor = undefined;
+    }
+  });
+
+  it("never leaves a stray claim file behind after a successful reclaim", async () => {
+    const path = await plantLock(JSON.stringify({ pid: DEAD_PID }), 60 * 60_000);
+    const res = reclaimAbandonedPanelLock();
+    expect(res.outcome).toBe("reclaimed");
+    const { readdirSync } = await import("node:fs");
+    const leftovers = readdirSync(dirname(path)).filter((f) => f.includes("reclaim"));
+    expect(leftovers).toEqual([]);
+  });
+});
+
+describe("durable writes (#798) — records that must not outlive the action they describe", () => {
+  beforeEach(() => {
+    fsyncTracker.paths.length = 0;
+  });
+
+  it("recordPanelPendingOp fsyncs the marker's own bytes before the Manager handoff", () => {
+    recordPanelPendingOp("update-all", "a queued update_all may still move the panel", 60_000);
+    // The atomic write fsyncs the temp file the marker is renamed from.
+    expect(fsyncTracker.paths.some((p) => p.includes("panel-pending-ops.json"))).toBe(true);
+  });
+
+  it("the panel op lock write is fsync'd — its pid record is what proves abandonment", async () => {
+    await withPanelMutationLock(async () => undefined);
+    expect(fsyncTracker.paths.some((p) => p.includes("panel-op.lock"))).toBe(true);
+  });
+
+  it("a pin write is fsync'd — a protection record must not be lost after being reported", () => {
+    setPanelVersionPin("0.11.20");
+    expect(fsyncTracker.paths.some((p) => p.includes("panel-settings.json"))).toBe(true);
+  });
+
+  it("a directory fsync failure that is NOT 'unsupported' fails the write (codex gate)", () => {
+    // EIO-style failures must not be swallowed like the Windows EPERM: the
+    // rename's directory entry is then not proven durable, and reporting the
+    // marker as written would be a false durable-success.
+    fsyncTracker.failFsyncExact = { path: dirname(panelPendingOpsPath()) };
+    expect(() =>
+      recordPanelPendingOp("update-all", "doomed marker", 60_000),
+    ).toThrow(/Could not persist the pending update-all marker/);
+    // The record itself LANDED (temp fsync + atomic rename succeeded before the
+    // directory sync failed) — but the refusal means the guarded operation will
+    // never run, so the landed record is rolled back (id-matched): leaving it
+    // would warn every later pin about a phantom pending op.
+    expect(activePanelPendingOps()).toEqual([]);
+    // And no torn temp file remains from either write.
+    const leftovers = readdirSync(dirname(panelPendingOpsPath())).filter((f) =>
+      f.includes(".tmp-"),
+    );
+    expect(leftovers).toEqual([]);
+  });
+
+  it("a failed POST-HANDOFF enrichment keeps the landed marker (codex gate round 5)", () => {
+    // update_all records the marker BEFORE the Manager handoff, then RE-RECORDS
+    // it enriched with base/uiId after the queue accepts. A failure of that
+    // second write must NOT roll back: the operation is already pending out of
+    // band, and deleting its record is how a later pin claims clean protection
+    // over a live window.
+    recordPanelPendingOp("update-all", "first", 60_000);
+    fsyncTracker.failFsyncExact = { path: dirname(panelPendingOpsPath()) };
+    expect(() =>
+      recordPanelPendingOp("update-all", "enriched", 60_000, {
+        base: "http://orig:8188",
+        keepRecordOnFailure: true,
+      }),
+    ).toThrow(/Could not persist the pending update-all marker/);
+    // The enrich write landed (temp fsync + rename) before the directory sync
+    // failed, and it survives: the marker still describes the live operation.
+    const active = activePanelPendingOps();
+    expect(active).toHaveLength(1);
+    expect(active[0].detail).toBe("enriched");
+    expect(active[0].base).toBe("http://orig:8188");
+  });
+
+  it("a failed re-record restores the REPLACED predecessor, not an empty file (codex gate round 7)", () => {
+    // update_all A is already with the Manager (its marker landed). A second
+    // update_all B records its marker BEFORE its own handoff, replacing A's
+    // same-kind record — and that write fails after landing. B never starts,
+    // but A is still pending: the rollback must bring A's record back, not
+    // leave the file empty (a later pin would claim clean protection over A's
+    // live window) nor keep B (a phantom).
+    const first = recordPanelPendingOp("update-all", "first", 60_000);
+    fsyncTracker.failFsyncExact = { path: dirname(panelPendingOpsPath()) };
+    expect(() => recordPanelPendingOp("update-all", "second", 60_000)).toThrow(
+      /Could not persist the pending update-all marker/,
+    );
+    const active = activePanelPendingOps();
+    expect(active).toHaveLength(1);
+    expect(active[0].id).toBe(first.id);
+    expect(active[0].detail).toBe("first");
+  });
+
+  it("a platform that cannot fsync directories at all (EPERM, e.g. Windows) still completes the write", () => {
+    fsyncTracker.failFsyncExact = { path: dirname(panelPendingOpsPath()), code: "EPERM" };
+    const op = recordPanelPendingOp("update-all", "tolerated dir fsync", 60_000);
+    expect(activePanelPendingOps().map((o) => o.id)).toEqual([op.id]);
+  });
 });
 
 describe("assertPanelNotTargetedUnverifiable — paths that cannot verify", () => {
@@ -427,6 +902,35 @@ describe("pending-op markers — record, read, and clear (#689)", () => {
     // ...and the unreadable record still reads as a (synthetic) pending op.
     expect(activePanelPendingOps()).toHaveLength(1);
     expect(activePanelPendingOps()[0].kind).toBe("unknown");
+  });
+
+  it("a clear whose write landed before a directory-sync failure reports the OBSERVED state (codex gate)", () => {
+    // The clear's atomic rename lands before the directory sync fails, so the
+    // record IS gone. Reporting it as surviving (the old catch-all false)
+    // would attach a phantom "still pending" warning to the pin result.
+    const op = recordPanelPendingOp("update-all", "u", 60_000);
+    fsyncTracker.failFsyncExact = { path: dirname(panelPendingOpsPath()) };
+    expect(clearPanelPendingOp(op)).toBe(true);
+    expect(activePanelPendingOps()).toEqual([]);
+  });
+
+  it("a ZERO-BYTE marker file (a torn write) reads as empty, not unreadable-forever (#798)", () => {
+    // A crash between truncate and write leaves 0 bytes, which provably holds
+    // NO record. Reading that as "unreadable" refused every later update_all
+    // and warned on every pin permanently, with no recovery path.
+    writeFileSync(panelPendingOpsPath(), "");
+    expect(activePanelPendingOps()).toEqual([]);
+    // And recording works again — the wedge self-heals.
+    const op = recordPanelPendingOp("update-all", "after the torn write", 60_000);
+    expect(activePanelPendingOps().map((o) => o.id)).toEqual([op.id]);
+  });
+
+  it("the marker write is atomic — no temp file is left behind (#798)", () => {
+    recordPanelPendingOp("update-all", "u", 60_000);
+    const leftovers = readdirSync(dirname(panelPendingOpsPath())).filter((f) =>
+      f.includes(".tmp-"),
+    );
+    expect(leftovers).toEqual([]);
   });
 });
 

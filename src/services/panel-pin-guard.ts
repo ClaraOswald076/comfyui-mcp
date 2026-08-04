@@ -26,17 +26,25 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import {
   closeSync,
+<<<<<<< HEAD
   fsyncSync,
+=======
+  existsSync,
+  fstatSync,
+  fsyncSync,
+  linkSync,
+>>>>>>> b556ff4 (fix(panel): explicit reclaim for a proven-abandoned op lock, durable marker/pin writes, honest panel_reload scope (#760, #798, #765))
   mkdirSync,
   openSync,
   readFileSync,
   renameSync,
   rmSync,
-  writeFileSync,
+  statSync,
   writeSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { writeFileDurable } from "../utils/durable-write.js";
 import { logger } from "../utils/logger.js";
 import {
   describePanelManagementRedirect,
@@ -294,6 +302,300 @@ function pidAlive(pid: unknown): boolean {
   }
 }
 
+/**
+ * A lock is PROVABLY abandoned only when it is BOTH older than this AND owned
+ * by a dead process. Panel operations are ComfyUI-Manager queue cycles
+ * measured in seconds to minutes; ten minutes is far beyond a legitimate one,
+ * so a lock older than that with a dead owner cannot be a live op — while a
+ * younger lock, even with a dead-looking owner, stays untouched.
+ */
+const STALE_LOCK_MS = 10 * 60_000;
+
+/** What observing the lock file could establish about its holder. */
+interface PanelLockObservation {
+  /** Milliseconds since the lock file's mtime. */
+  ageMs: number;
+  /** The file's exact bytes when readable — the reclaim's compare token. */
+  raw?: string;
+  /** The recorded owner pid, when the content parses and carries a valid one. */
+  pid?: number;
+  /** When the lock was taken (the record's startedAt), for messages. */
+  startedAt?: string;
+  /** Pid liveness — only set when a valid pid was recorded. */
+  alive?: boolean;
+  /** Why the content proved nothing about the owner (unreadable/corrupt/pid). */
+  contentProblem?: string;
+}
+
+/**
+ * Observe the lock WITHOUT acting on it. Returns undefined when the path
+ * cannot be opened (usually: vanished) — the caller's next create attempt or
+ * re-observation settles that.
+ *
+ * Stat and read go through ONE descriptor, so the age and the owner bytes
+ * always describe the SAME instance: with separate path-based calls, a lock
+ * replaced between the stat and the read would pair the OLD lock's mtime with
+ * the FRESH lock's pid, and a young lock could be judged old (codex gate). A
+ * lock file is written once at creation, so an mtime/size change between the
+ * two fstats means in-place interference — indeterminate, not stale.
+ *
+ * Deliberately conservative: any content that cannot yield a valid pid is a
+ * `contentProblem`, NOT a dead owner. An unreadable/corrupt lock cannot prove
+ * abandonment, and treating "we couldn't tell" as "the owner is gone" is how a
+ * live holder's lock gets deleted (#796's fold, pointed at a positive).
+ */
+function observePanelLock(path: string): PanelLockObservation | undefined {
+  let fd: number;
+  try {
+    fd = openSync(path, "r");
+  } catch (err) {
+    // ONLY ENOENT proves absence. Any other open failure (permissions, AV
+    // interference, I/O) means the lock is present but uninspectable — that
+    // must read as indeterminate, never as "no lock" (codex gate).
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return undefined;
+    let ageMs = 0;
+    try {
+      ageMs = Math.max(0, Date.now() - statSync(path).mtimeMs);
+    } catch {
+      // display-only
+    }
+    return {
+      ageMs,
+      contentProblem: `could not be opened (${err instanceof Error ? err.message : String(err)})`,
+    };
+  }
+  try {
+    const before = fstatSync(fd);
+    const raw = readFileSync(fd, "utf-8");
+    const after = fstatSync(fd);
+    const ageMs = Math.max(0, Date.now() - after.mtimeMs);
+    if (before.mtimeMs !== after.mtimeMs || before.size !== after.size) {
+      return { ageMs, contentProblem: "changed while being read" };
+    }
+    let record: { pid?: unknown; startedAt?: unknown };
+    try {
+      record = JSON.parse(raw) as { pid?: unknown; startedAt?: unknown };
+    } catch {
+      return { ageMs, raw, contentProblem: "is not valid JSON" };
+    }
+    const startedAt = typeof record?.startedAt === "string" ? record.startedAt : undefined;
+    const pid = record?.pid;
+    if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
+      return { ageMs, raw, startedAt, contentProblem: "records no valid owner pid" };
+    }
+    return { ageMs, raw, pid, startedAt, alive: pidAlive(pid) };
+  } catch (err) {
+    // A mid-read failure (e.g. the fd turned out to be a directory). The age
+    // here is display-only — the contentProblem is what the decision reads.
+    let ageMs = 0;
+    try {
+      ageMs = Math.max(0, Date.now() - statSync(path).mtimeMs);
+    } catch {
+      // vanished mid-observation; the message just says what it can
+    }
+    return {
+      ageMs,
+      contentProblem: `unreadable (${err instanceof Error ? err.message : String(err)})`,
+    };
+  } finally {
+    try {
+      closeSync(fd);
+    } catch {
+      // nothing to do with a close failure on a read-only observation
+    }
+  }
+}
+
+/** "12 minutes" / "3 hours" — for human-facing lock messages. */
+function describeLockAge(ageMs: number): string {
+  const minutes = Math.round(ageMs / 60_000);
+  if (minutes < 1) return "under a minute";
+  if (minutes < 120) return `${minutes} minutes`;
+  return `${Math.round(minutes / 60)} hours`;
+}
+
+/** Compose the observed lock state as one sentence for error/report text. */
+function describeObservedLock(path: string, obs: PanelLockObservation): string {
+  const age = describeLockAge(obs.ageMs);
+  if (obs.pid === undefined) {
+    return (
+      `The lock at ${path} was taken ${age} ago, but its content ${obs.contentProblem}, ` +
+      `so its owner cannot be identified.`
+    );
+  }
+  return (
+    `The lock at ${path} was taken ${age} ago by pid ${obs.pid}` +
+    `${obs.startedAt ? ` (started ${obs.startedAt})` : ""}, and that process is ` +
+    `${obs.alive ? "STILL RUNNING" : "no longer running"}.`
+  );
+}
+
+export interface PanelLockReclaimResult {
+  outcome: "no-lock" | "reclaimed" | "refused";
+  /** What was observed and what was (not) done — safe to relay verbatim. */
+  detail: string;
+}
+
+/**
+ * Reclaim the panel operation lock — ONLY when it is provably abandoned
+ * (#760): older than STALE_LOCK_MS AND owned by a recorded pid that is dead.
+ * Every other state refuses, because deleting a lock whose holder might be
+ * alive is how two panel mutations run at once.
+ *
+ * This is the explicit, operator/agent-invoked recovery that the acquire
+ * path's timeout message names. The acquire loop itself NEVER reclaims
+ * automatically (#779): Node has no atomic compare-and-rename, so between a
+ * stale observation and a delete, a concurrent (e.g. pre-upgrade)
+ * orchestrator could replace the path with a fresh lock and have it stolen.
+ * The same race is bounded here by RENAMING the file aside first and
+ * comparing its bytes against the observed ones: a lock that was replaced
+ * between observation and reclaim does not match and is never deleted. The
+ * restore is a HARD LINK, not a rename — rename would silently overwrite a
+ * fresh lock that appeared at the path in the meantime, while linkSync fails
+ * with EEXIST and both files are reported, nothing destroyed.
+ */
+export function reclaimAbandonedPanelLock(): PanelLockReclaimResult {
+  const path = panelLockPath();
+  const obs = observePanelLock(path);
+  if (!obs) {
+    return {
+      outcome: "no-lock",
+      detail:
+        `No panel operation lock is present at ${path} — nothing to reclaim. ` +
+        `Whatever was blocking panel operations is already gone.`,
+    };
+  }
+  const manual =
+    `To clear it by hand instead: stop or restart every comfyui-mcp orchestrator, ` +
+    `verify none remain, delete this exact lock file, then retry.`;
+  const refuse = (why: string): PanelLockReclaimResult => ({
+    outcome: "refused",
+    detail: `Refusing to reclaim the panel operation lock: ${why} ${manual}`,
+  });
+
+  // No valid pid → abandonment is unprovable at ANY age; say what the content
+  // actually showed rather than hiding behind the age gate.
+  if (obs.pid === undefined) {
+    return refuse(
+      `it is ${describeLockAge(obs.ageMs)} old, but its content ${obs.contentProblem}, ` +
+        `so there is no owner whose death could prove it abandoned.`,
+    );
+  }
+  if (obs.ageMs <= STALE_LOCK_MS) {
+    return refuse(
+      `it was taken only ${describeLockAge(obs.ageMs)} ago — inside the ` +
+        `${STALE_LOCK_MS / 60_000}-minute window in which a slow ComfyUI-Manager ` +
+        `operation is still legitimate, so it cannot be called abandoned.`,
+    );
+  }
+  if (obs.alive) {
+    return refuse(
+      `it is ${describeLockAge(obs.ageMs)} old, but its owner — pid ${obs.pid} — is ` +
+        `STILL RUNNING, so a panel operation may be in progress right now.`,
+    );
+  }
+
+  // Provably abandoned. Rename aside, verify the moved file is the EXACT bytes
+  // that were judged abandoned, and only then delete.
+  const claim = `${path}.reclaim-${randomUUID()}`;
+  try {
+    renameSync(path, claim);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+      return {
+        outcome: "no-lock",
+        detail:
+          `The abandoned lock at ${path} disappeared before it could be reclaimed — ` +
+          `another process removed it first. This call deleted nothing.`,
+      };
+    }
+    return refuse(
+      `moving it aside failed (${err instanceof Error ? err.message : String(err)}), ` +
+        `so its current state could not be verified.`,
+    );
+  }
+  let moved: string | undefined;
+  try {
+    moved = readFileSync(claim, "utf-8");
+  } catch {
+    moved = undefined;
+  }
+  if (moved === undefined || moved !== obs.raw) {
+    // The path was REPLACED between the observation and the rename: what was
+    // moved aside is a different (possibly live) holder's lock. Put it back
+    // with a HARD LINK, never a rename — a rename would silently OVERWRITE a
+    // fresh lock that landed at the path in the meantime (codex gate), while
+    // linkSync fails with EEXIST and leaves both files intact.
+    try {
+      linkSync(claim, path);
+    } catch (err) {
+      if (existsSync(path)) {
+        return {
+          outcome: "refused",
+          detail:
+            `The lock at ${path} changed mid-reclaim, and yet another lock appeared at ` +
+            `the path before the replaced one could be restored. Nothing was deleted or ` +
+            `overwritten: the replaced lock is preserved at ${claim}. Stop every ` +
+            `comfyui-mcp orchestrator, verify none remain, then reconcile both files ` +
+            `by hand.`,
+        };
+      }
+      return {
+        outcome: "refused",
+        detail:
+          `The lock at ${path} changed mid-reclaim and restoring it failed ` +
+          `(${err instanceof Error ? err.message : String(err)}). Nothing was deleted: ` +
+          `the replaced lock is preserved at ${claim} and the path is currently free. ` +
+          `Stop every comfyui-mcp orchestrator, verify none remain, then reconcile ` +
+          `both files by hand.`,
+      };
+    }
+    // The restore succeeded. The claim name is now a duplicate (hard link) of
+    // the restored lock, so removing it is cosmetic — a failure here must NOT
+    // be reported as a restore failure (codex gate).
+    const restored = refuse(
+      `the lock changed between inspection and reclaim — a DIFFERENT holder's lock ` +
+        `is now at ${path}. It was put back untouched; nothing was deleted.`,
+    );
+    try {
+      rmSync(claim, { force: true });
+      return restored;
+    } catch {
+      return {
+        ...restored,
+        detail:
+          `${restored.detail} (A duplicate name for it remains at ${claim} — a hard ` +
+          `link to the same restored lock; delete it by hand, it blocks nothing.)`,
+      };
+    }
+  }
+  // The abandoned lock is verified and moved aside; the lock path is already
+  // free, so the reclaim HAS succeeded — a failure removing the aside copy is
+  // cleanup, and must be reported as such, never as a reclaim failure (codex).
+  const reclaimed: PanelLockReclaimResult = {
+    outcome: "reclaimed",
+    detail:
+      `Reclaimed the abandoned panel operation lock at ${path}: it was ` +
+      `${describeLockAge(obs.ageMs)} old and its owner, pid ${obs.pid}` +
+      `${obs.startedAt ? ` (started ${obs.startedAt})` : ""}, is no longer running. ` +
+      `That abandoned lock no longer blocks panel operations; if another operation ` +
+      `has since taken a fresh lock there, the usual wait/timeout applies to it.`,
+  };
+  try {
+    rmSync(claim, { force: true });
+    return reclaimed;
+  } catch (err) {
+    return {
+      ...reclaimed,
+      detail:
+        `${reclaimed.detail} (Removing the renamed-aside copy at ${claim} failed: ` +
+        `${
+          err instanceof Error ? err.message : String(err)
+        } — delete that file by hand; it blocks nothing.)`,
+    };
+  }
+}
+
 async function acquireFileLock(timeoutMs: number): Promise<() => void> {
   const path = panelLockPath();
   mkdirSync(dirname(path), { recursive: true });
@@ -304,12 +606,56 @@ async function acquireFileLock(timeoutMs: number): Promise<() => void> {
       // "wx" = create-exclusive: atomic across processes, which is the whole point.
       const fd = openSync(path, "wx");
       try {
-        writeSync(
-          fd,
-          JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }),
-        );
-      } finally {
+        // A short writeSync is NOT a failure return — it reports the bytes
+        // actually written. Loop to completion; a zero-byte progress means the
+        // record would be truncated (an unreadable owner pid that reclaim can
+        // never prove abandoned — the #760 wedge again), so fail the init and
+        // let the cleanup below remove the husk (codex gate). The payload is
+        // ASCII (pid + ISO timestamp), so string offsets track byte offsets.
+        const payload = JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() });
+        let written = 0;
+        while (written < payload.length) {
+          const n = writeSync(fd, payload.slice(written), null, "utf-8");
+          if (n <= 0) {
+            throw new Error(
+              `short write on the panel operation lock (${written}/${payload.length} bytes)`,
+            );
+          }
+          written += n;
+        }
+        // Durable (#798): the recorded pid is the ONLY thing a post-crash
+        // observation (the timeout report / reclaimAbandonedPanelLock) can prove
+        // abandonment from — a buffered loss would leave an ownerless lock that
+        // nothing can verify or reclaim.
+        fsyncSync(fd);
         closeSync(fd);
+      } catch (initErr) {
+        // A failed init must not leave the husk behind: this call created the
+        // file (exclusive create) and no mutation has run under it, so a
+        // leftover would wedge every later acquire behind a lock whose recorded
+        // owner is alive but holds nothing — and reclaim would rightly refuse
+        // it (codex gate). Only the file THIS call created can be removed here:
+        // no other process can have created or reclaimed the path in between
+        // (reclaim requires an old lock with a dead owner; this one is fresh
+        // and this process is alive).
+        try {
+          closeSync(fd); // may already be closed if closeSync itself threw
+        } catch {
+          // the init failure is the one to report
+        }
+        try {
+          rmSync(path, { force: true });
+        } catch (cleanupErr) {
+          throw new Error(
+            `Could not initialise the panel operation lock at ${path} (${
+              initErr instanceof Error ? initErr.message : String(initErr)
+            }), and removing the just-created file also failed (${
+              cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)
+            }). The leftover lock is NOT held by any operation — delete that file ` +
+              `by hand, then retry.`,
+          );
+        }
+        throw initErr;
       }
       return () => {
         try {
@@ -333,13 +679,36 @@ async function acquireFileLock(timeoutMs: number): Promise<() => void> {
         );
       }
       if (Date.now() >= deadline) {
+        // Report the OBSERVED state of the lock that blocked us — the remedy
+        // differs by whether its owner is alive, and "another operation is in
+        // progress" is a claim we could not verify without looking.
+        const obs = observePanelLock(path);
+        if (!obs) {
+          if (!existsSync(path)) {
+            // It vanished between EEXIST and the deadline: the next create
+            // attempt settles it, so keep looping rather than report a timeout
+            // against a lock that is no longer there.
+            continue;
+          }
+          // Present but not inspectable (a permissions/IO failure on stat is
+          // NOT proof the holder is gone) — fail closed with the manual path.
+          throw new Error(
+            `Timed out after ${timeoutMs}ms waiting for the panel operation lock ` +
+              `(${path}). The lock file exists but could not be inspected, so its ` +
+              `owner is unknown and it cannot be auto-reclaimed. To recover it by ` +
+              `hand: stop or restart every comfyui-mcp orchestrator, verify none ` +
+              `remain, delete this exact lock file, then retry.`,
+          );
+        }
         throw new Error(
-          `Timed out after ${timeoutMs}ms waiting for the panel operation lock ` +
-            `(${path}). Another panel install/update/pin is in progress — possibly in ` +
-            `another orchestrator process. It is never auto-reclaimed: a concurrent pre-upgrade ` +
-            `orchestrator could replace an observed stale path with a fresh lock. To recover a ` +
-            `proven abandoned lock, stop or restart every comfyui-mcp orchestrator, verify none ` +
-            `remain, delete this exact lock file, then retry.`,
+          `Timed out after ${timeoutMs}ms waiting for the panel operation lock. ` +
+            `${describeObservedLock(path, obs)} The lock is never auto-reclaimed: a ` +
+            `concurrent pre-upgrade orchestrator could replace an observed stale path ` +
+            `with a fresh lock. To recover a proven abandoned lock, run ` +
+            `install_panel(action='unlock') — it re-verifies that the recorded owner is ` +
+            `dead and the lock is old before deleting anything, and refuses otherwise. ` +
+            `Or do it by hand: stop or restart every comfyui-mcp orchestrator, verify ` +
+            `none remain, delete this exact lock file, then retry.`,
         );
       }
       await sleep(POLL_MS);
@@ -575,6 +944,13 @@ function readPanelPendingOpsFile(): PendingOpsRead {
   if (raw.trim() === "") {
     return { ops: [], unreadable: true, state: "empty" };
   }
+  // A zero-byte file is the signature of a torn pre-#798 write (crash between
+  // truncate and write). It provably contains NO record — reading it as
+  // "unreadable" would refuse every later update_all / warn on every pin
+  // forever, with no recovery path, over a file we can read perfectly well.
+  // (Non-empty unparseable content stays unreadable: it COULD have held a
+  // record, and failing closed there is the whole point.)
+  if (raw.length === 0) return { ops: [], unreadable: false };
   try {
     const parsed = JSON.parse(raw) as unknown;
     const ops =
@@ -598,19 +974,30 @@ function readPanelPendingOpsFile(): PendingOpsRead {
  * out-of-band window cannot be durably recorded must not start: otherwise a
  * user can set a pin immediately afterwards and be told it protects a panel
  * which the already-queued Manager operation is still free to move. The write
- * is read back before returning, so a successful syscall alone is not treated
- * as proof that the warning is durable.
+ * is fsync'd (so the record cannot be lost while the action it describes
+ * survives, #798) and read back before returning, so a successful syscall
+ * alone is not treated as proof that the warning is durable.
  *
  * Once this succeeds, callers deliberately leave the marker in place even if
  * their Manager request errors. A transport error cannot prove the remote
  * Manager did not accept the request, and retaining a conservative warning is
  * safer than letting a later pin claim clean protection.
+ *
+ * On FAILURE the file is rolled back to the PRE-CALL record set — not merely
+ * "without this call's record": the write REPLACES a same-kind predecessor,
+ * and that predecessor may describe an operation still pending with the
+ * Manager (codex gate). The rollback only fires when the file still holds
+ * exactly what this call wrote, so a concurrent recorder's work is never
+ * erased, and it is skipped entirely when the caller passes
+ * `keepRecordOnFailure: true` — a call that merely RE-RECORDS an operation
+ * already handed to the Manager (the update_all base/uiId enrichment), where
+ * the operation IS pending and the marker must survive a failed enrichment.
  */
 export function recordPanelPendingOp(
   kind: "update-all" | "snapshot-restore",
   detail: string,
   ttlMs: number,
-  extra: { base?: string; uiId?: string } = {},
+  extra: { base?: string; uiId?: string; keepRecordOnFailure?: boolean } = {},
 ): PanelPendingOp {
   const now = Date.now();
   const op: PanelPendingOp = {
@@ -622,9 +1009,11 @@ export function recordPanelPendingOp(
     ...(extra.base ? { base: extra.base } : {}),
     ...(extra.uiId ? { uiId: extra.uiId } : {}),
   };
+  let priorOps: PanelPendingOp[] | undefined;
   try {
     const path = panelPendingOpsPath();
     const prior = readPanelPendingOpsFile();
+<<<<<<< HEAD
     // Refuse only when the prior file has CONTENT we cannot decode: that content
     // may describe a real queued operation, and overwriting it destroys a warning
     // we were never able to read.
@@ -667,6 +1056,21 @@ export function recordPanelPendingOp(
           ]
         : [];
     writePanelPendingOpsAtomic(path, JSON.stringify({ ops: [...carried, ...kept, op] }, null, 2));
+=======
+    if (prior.unreadable) throw new Error("existing pending-operation record is unreadable");
+    priorOps = prior.ops;
+    const kept = prior.ops.filter((o) => o.kind !== kind);
+    mkdirSync(dirname(path), { recursive: true });
+    // DURABLE and ATOMIC, deliberately (#798): the next thing the caller does
+    // is hand the operation to ComfyUI-Manager, an action this process cannot
+    // serialize and which may land after a crash. A buffered marker could be
+    // lost while the operation it records survives — leaving a later pin free
+    // to claim clean protection over a window nothing on disk describes — and
+    // a torn one would read as "unreadable" and refuse every later update_all.
+    // That is precisely the crash this marker exists for, so it goes through
+    // writeFileDurable (temp + fsync + rename) before the handoff.
+    writeFileDurable(path, JSON.stringify({ ops: [...kept, op] }, null, 2));
+>>>>>>> b556ff4 (fix(panel): explicit reclaim for a proven-abandoned op lock, durable marker/pin writes, honest panel_reload scope (#760, #798, #765))
 
     // Verify the exact replacement record, not merely that JSON still parses.
     // A partial/redirected write that drops this operation would recreate the
@@ -687,6 +1091,35 @@ export function recordPanelPendingOp(
       throw new Error("pending-operation record did not survive a read-back verification");
     }
   } catch (err) {
+    // The record MAY have landed before the failure (the atomic rename precedes
+    // the directory sync, and the read-back can fail after a successful write).
+    // This throw means the guarded operation will NOT start — so restore the
+    // PRE-CALL record set: our write REPLACED a same-kind predecessor that may
+    // still describe a live pending operation, and leaving OUR record instead
+    // would warn every later pin about a phantom one (codex gate rounds 4+7).
+    // Restore only when the file still holds exactly what this call wrote, so
+    // a concurrent recorder's work is never erased; a failed restore leaves
+    // the conservative over-warning, which is the safe direction.
+    if (!extra.keepRecordOnFailure && priorOps !== undefined) {
+      const recordKey = (o: PanelPendingOp): string => o.id ?? `${o.kind}:${o.queuedAt}`;
+      try {
+        const path = panelPendingOpsPath();
+        const current = readPanelPendingOpsFile();
+        if (!current.unreadable) {
+          const expected = new Set(
+            [...priorOps.filter((o) => o.kind !== kind), op].map(recordKey),
+          );
+          const unchangedSinceOurWrite =
+            current.ops.length === expected.size &&
+            current.ops.every((c) => expected.has(recordKey(c)));
+          if (unchangedSinceOurWrite) {
+            writeFileDurable(path, JSON.stringify({ ops: priorOps }, null, 2));
+          }
+        }
+      } catch {
+        // best-effort — the refusal below is the operative signal
+      }
+    }
     throw new Error(
       `Could not persist the pending ${kind} marker: ${
         err instanceof Error ? err.message : String(err)
@@ -706,11 +1139,15 @@ export function recordPanelPendingOp(
  * longer pending. Clearing anything else would let a later pin write report
  * clean protection while queued work is still out there.
  *
- * Read-back verified like recordPanelPendingOp, and fails CLOSED: any read or
- * write failure returns false and leaves the marker (and its warning) in
- * place. Returns true when the exact record is gone afterwards — including
- * when it was already absent (that is the goal state, not a success claim
- * about work this call did).
+ * Read-back verified like recordPanelPendingOp. A WRITE failure does not
+ * settle the answer by itself — writeFileDurable's atomic rename precedes the
+ * directory sync, so a directory-sync failure can mean the clear DID land —
+ * so the post-state is always READ BACK and the observed state reported
+ * (codex gate): claiming "the marker remains" when it is gone would attach a
+ * phantom warning to the pin result. Only a READ failure (or a marker still
+ * present) returns false, leaving the warning in place. Returns true when the
+ * exact record is gone afterwards — including when it was already absent
+ * (that is the goal state, not a success claim about work this call did).
  */
 export function clearPanelPendingOp(op: PanelPendingOp): boolean {
   // Identity by unique id when the record has one; only legacy records fall
@@ -725,7 +1162,21 @@ export function clearPanelPendingOp(op: PanelPendingOp): boolean {
     if (prior.unreadable) return false;
     if (!prior.ops.some(matches)) return true; // already gone
     const kept = prior.ops.filter((candidate) => !matches(candidate));
-    writePanelPendingOpsAtomic(path, JSON.stringify({ ops: kept }, null, 2));
+    // Rebase resolution (#847 + #798). Both branches wanted a durable rewrite of
+    // this crash-recovery record; they differed in how. `writePanelPendingOpsAtomic`
+    // is the stronger of the two — temp file + fsync + rename, so a crash mid-write
+    // cannot leave a truncated marker where `writeFileSync` would — and #798's
+    // warn-and-verify is kept around it, because a write error here does not prove
+    // the clear failed: the read-back below is what settles it.
+    try {
+      writePanelPendingOpsAtomic(path, JSON.stringify({ ops: kept }, null, 2));
+    } catch (writeErr) {
+      logger.warn(
+        `[panel] the pending ${op.kind} marker clear hit a write error (${
+          writeErr instanceof Error ? writeErr.message : String(writeErr)
+        }) — verifying the on-disk state before reporting.`,
+      );
+    }
     const confirmed = readPanelPendingOpsFile();
     return !confirmed.unreadable && !confirmed.ops.some(matches);
   } catch (err) {

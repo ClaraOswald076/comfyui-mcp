@@ -243,19 +243,24 @@ export async function updateAllCustomNodes(): Promise<UpdateNodesResult> {
     // self-heal retry mints a fresh one). On v4 the ui_id identifies the
     // update_all's per-pack tasks (each `${ui_id}_${pack}`) in the queue
     // history, which is what makes a later pin's cancel PROVABLE (#689 round
-    // 3). If the rewrite fails, the marker stays base-unknown — never a stale
-    // base — so the pin-cancel path treats it as unverifiable and sends no
-    // blind reset. Refusing now would punish a success.
+    // 3). keepRecordOnFailure: the operation is ALREADY with the Manager, so a
+    // failed enrichment must leave the marker in place (the pre-handoff
+    // rollback would delete the record of a live pending op — codex gate). The
+    // marker then stays as last successfully written — possibly base-unknown,
+    // never a stale base — so the pin-cancel path treats it as unverifiable
+    // and sends no blind reset. Refusing now would punish a success.
     try {
       recordPanelPendingOp("update-all", detail, UPDATE_ALL_PENDING_MS, {
         base: result.base,
         uiId: result.uiId,
+        keepRecordOnFailure: true,
       });
     } catch (err) {
       logger.warn(
-        `[panel] update_all is queued, but the pending-op marker could not be ` +
-          `enriched with its base/ui_id — it remains base-unknown, so a later ` +
-          `pin will report it as unverifiable rather than cancel blindly: ${
+        `[panel] update_all is queued, but the enriched pending-op marker could ` +
+          `not be confirmed durably written — the marker remains as last ` +
+          `successfully written (possibly base-unknown), so a later pin may ` +
+          `report it as unverifiable rather than cancel blindly: ${
             err instanceof Error ? err.message : String(err)
           }`,
       );

@@ -6476,12 +6476,12 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_reload",
-      "Soft-reload yourself to pick up code changes WITHOUT restarting ComfyUI — your chat session resumes automatically and you'll be nudged to continue. Use scope 'orchestrator' (default) after backend/orchestrator code changed (new tools, system prompt, services); use scope 'frontend' after the panel UI (web JS/CSS) changed. This ENDS the current turn — your tools/prompt are reloaded and you continue fresh. For custom-node or model changes that need a full ComfyUI restart, use panel_restart_comfyui instead. Only call this when code has actually changed and needs to take effect now.",
+      "Soft-reload yourself to pick up code changes WITHOUT restarting ComfyUI — your chat session resumes automatically and you'll be nudged to continue. This ENDS the current turn. What each scope actually reloads: 'orchestrator' (default) respawns your agent and its comfyui tool server, so agent config, MCP servers (panel_add_mcp/panel_remove_mcp), the system prompt, and the code behind the comfyui server's tools all reload from the comfyui-mcp build on disk; 'frontend' re-fetches the panel UI (web JS/CSS). What it does NOT reload: the long-lived orchestrator process that serves every panel_* tool (including this one) and the services those tools use — that process keeps the code it started with, and only the user can restart it (the panel prints the exact restart command when this runs). So after editing orchestrator/panel-tool code, do NOT claim the change is live after this call — say the orchestrator process must be restarted. For custom-node or model changes that need a full ComfyUI restart, use panel_restart_comfyui instead. Only call this when code has actually changed and needs to take effect now.",
       {
         scope: z
           .enum(["orchestrator", "frontend"])
           .optional()
-          .describe("'orchestrator' (default): respawn the agent for new backend code. 'frontend': reload the panel UI for new web code."),
+          .describe("'orchestrator' (default): respawn the agent and its comfyui tool server (agent config, MCP servers, system prompt, comfyui tool code). Does NOT restart the long-lived orchestrator process behind the panel_* tools. 'frontend': reload the panel UI for new web code."),
       },
       async (args: A, ctx) => {
         // panel_reload is an explicit "recover me now" signal — if THIS session's
@@ -6524,7 +6524,30 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             return fail(err);
           }
         }
-        return ctx.call({ cmd: "soft_reload", scope: (args.scope as string) ?? "orchestrator" }, 15000);
+        const scope = (args.scope as string) ?? "orchestrator";
+        const res = await ctx.call({ cmd: "soft_reload", scope }, 15000);
+        // #765 — the agent reads this result as its last context before the
+        // reload, and again after the resume, so it is the place to state what
+        // the reload could NOT have refreshed: the panel_* tools run inside the
+        // long-lived orchestrator process, which a soft reload never restarts.
+        // Without this the agent resumes believing an orchestrator/service code
+        // change took effect when it did not.
+        if (scope === "orchestrator" && !res.isError) {
+          const text = res.content?.find((c) => c.type === "text");
+          if (text && "text" in text) {
+            text.text +=
+              "\n\nReminder of what this reloads: you and your comfyui tool server " +
+              "restart fresh from the comfyui-mcp build on disk. What it does NOT " +
+              "reload: the long-lived orchestrator process that serves every " +
+              "panel_* tool and the services behind them — it keeps the code it " +
+              "started with. If the change you were picking up touched " +
+              "orchestrator/panel-tool code (e.g. a service a panel_* tool " +
+              "imports), it is NOT in effect: tell the user the orchestrator " +
+              "process must be restarted (the panel shows the exact restart " +
+              "command).";
+          }
+        }
+        return res;
       },
     ),
     def(

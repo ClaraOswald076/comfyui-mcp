@@ -19,7 +19,7 @@ import {
   PANEL_PIN_ENV_VAR,
   setPanelVersionPin,
 } from "../services/panel-settings.js";
-import { activePanelPendingOps } from "../services/panel-pin-guard.js";
+import { activePanelPendingOps, reclaimAbandonedPanelLock } from "../services/panel-pin-guard.js";
 import { cancelPanelPendingOps } from "../services/panel-pending-cancel.js";
 import { errorToToolResult } from "../utils/errors.js";
 
@@ -32,7 +32,7 @@ function json(value: unknown) {
 export function registerInstallPanelTools(server: McpServer): void {
   server.tool(
     "install_panel",
-    "Install, update, reinstall, sync, pin, or report status of the ComfyUI sidebar " +
+    "Install, update, reinstall, sync, pin, unpin, unlock, or report status of the ComfyUI sidebar " +
       "panel ('comfyui-agent-panel' on the Comfy Registry; repo comfyui-mcp-panel) in " +
       "the LOCAL ComfyUI's custom_nodes. Uses the same ComfyUI-Manager path as " +
       "install_custom_node and always targets the 'nightly' (git-HEAD) channel. " +
@@ -42,7 +42,10 @@ export function registerInstallPanelTools(server: McpServer): void {
       "auto-restart. The panel is also auto-installed-if-missing when the MCP server " +
       "loads. A version PIN (action='pin') holds the panel where it is: while a pin " +
       "is set, install/update/reinstall/sync and the auto-install all refuse, and " +
-      "'sync' only warns that a newer panel exists.",
+      "'sync' only warns that a newer panel exists. Panel operations are serialized " +
+      "across orchestrator processes by a lock file that is never auto-reclaimed — " +
+      "if a crashed orchestrator wedges it, action='unlock' reclaims the lock once " +
+      "it is provably abandoned.",
     {
       action: z
         .enum([
@@ -53,6 +56,7 @@ export function registerInstallPanelTools(server: McpServer): void {
           "sync",
           "pin",
           "unpin",
+          "unlock",
         ])
         .default("status")
         .describe(
@@ -66,7 +70,11 @@ export function registerInstallPanelTools(server: McpServer): void {
             "clone, keeping the previous copy outside custom_nodes. Success is " +
             "always re-read from disk. reinstall: uninstall " +
             "+ reinstall (nightly). pin: hold the panel at a version (requires " +
-            "`version`). unpin: clear the pin so a sync can proceed. " +
+            "`version`). unpin: clear the pin so a sync can proceed. unlock: " +
+            "recover from a crashed/killed orchestrator's leftover panel operation " +
+            "lock — reclaims it ONLY when it is provably abandoned (older than the " +
+            "stale threshold AND its recorded owner process is dead), and refuses " +
+            "with the observed state otherwise. " +
             "install/update/reinstall/sync refuse on a dev symlink or an active " +
             "pin, and require a local workspace (COMFYUI_PATH or the saved default workspace).",
         ),
@@ -262,6 +270,17 @@ export function registerInstallPanelTools(server: McpServer): void {
                 : `No pin was set; nothing to clear. install_panel(action='sync') can ` +
                   `proceed.`,
           });
+        }
+
+        if (action === "unlock") {
+          // Recovery for the wedge from #760: a crashed/killed orchestrator
+          // leaves panel-op.lock behind and the acquire path deliberately never
+          // auto-reclaims it (#779). This is the explicit recovery the timeout
+          // message names — it re-verifies the lock is provably abandoned (old
+          // AND its recorded owner is dead) before deleting anything, and says
+          // exactly what it observed when it refuses. It does NOT take the lock
+          // itself: a wedged lock is the very case this exists for.
+          return json({ action: "unlock", ...reclaimAbandonedPanelLock() });
         }
 
         return json(await runPanelAction(action));
