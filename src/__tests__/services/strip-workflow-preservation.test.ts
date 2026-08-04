@@ -292,6 +292,133 @@ describe("#361 — cg-use-everywhere broadcast links", () => {
     const { warnings } = convertUiToApi(g as never, OBJECT_INFO);
     expect(joined(warnings)).toContain("no longer exists");
   });
+
+  it("a record whose OWN sender was deleted is stale — reported, and no link fabricated", () => {
+    // Sender 7 is still there (so the list is still consulted), but this record
+    // was produced by a sender that has since been removed.
+    const g = ueGraph(true) as unknown as {
+      extra: { ue_links: { controller: number }[] };
+    };
+    g.extra.ue_links[0].controller = 8;
+    const { workflow, warnings } = convertUiToApi(g as never, OBJECT_INFO);
+    expect(workflow["3"].inputs.images).toBeUndefined();
+    expect(joined(warnings)).toContain("the record is stale");
+  });
+
+  it("a record naming an output slot the producer no longer has is stale, not wired", () => {
+    const g = ueGraph(true) as unknown as {
+      extra: { ue_links: { upstream_slot: number }[] };
+    };
+    g.extra.ue_links[0].upstream_slot = 5; // LoadImage(1) serializes ONE output
+    const { workflow, warnings } = convertUiToApi(g as never, OBJECT_INFO);
+    expect(workflow["3"].inputs.images).toBeUndefined();
+    expect(joined(warnings)).toContain("which only has 1 output(s)");
+  });
+
+  it("senders INSIDE a subgraph definition are not silently ignored", () => {
+    const g = {
+      definitions: {
+        subgraphs: [
+          {
+            id: SG_ID,
+            name: "Inner",
+            inputNode: { id: -10 },
+            outputNode: { id: -20 },
+            inputs: [],
+            outputs: [],
+            widgets: [],
+            // No extra.ue_links here: the broadcast is unrecoverable and must be said.
+            nodes: [
+              {
+                id: 80,
+                type: "Anything Everywhere",
+                mode: 0,
+                inputs: [{ name: "anything", type: "*", link: null }],
+                outputs: [],
+                widgets_values: [],
+              },
+              {
+                id: 81,
+                type: "SaveImage",
+                mode: 0,
+                inputs: [{ name: "images", type: "IMAGE", link: null }],
+                outputs: [],
+                widgets_values: ["out"],
+              },
+            ],
+            links: [],
+          },
+        ],
+      },
+      nodes: [
+        {
+          id: 706,
+          type: SG_ID,
+          mode: 0,
+          properties: {},
+          inputs: [],
+          outputs: [],
+          widgets_values: [],
+        },
+      ],
+      links: [],
+    } as never;
+    const { warnings } = convertUiToApi(g, OBJECT_INFO);
+    expect(joined(warnings)).toContain('subgraph "Inner"');
+    expect(joined(warnings)).toContain("CANNOT be recovered");
+  });
+
+  it("an UNUSED subgraph definition's broken wiring is not reported as this graph's loss", () => {
+    const g = {
+      definitions: {
+        subgraphs: [
+          {
+            id: "never-instantiated",
+            name: "Dead",
+            inputNode: { id: -10 },
+            outputNode: { id: -20 },
+            inputs: [],
+            outputs: [],
+            widgets: [],
+            nodes: [
+              {
+                id: 90,
+                type: "GetNode",
+                mode: 0,
+                inputs: [],
+                outputs: [{ name: "IMAGE", type: "IMAGE", links: [90] }],
+                widgets_values: ["orphan"],
+              },
+              {
+                id: 91,
+                type: "SaveImage",
+                mode: 0,
+                inputs: [{ name: "images", type: "IMAGE", link: 90 }],
+                outputs: [],
+                widgets_values: ["out"],
+              },
+            ],
+            links: [
+              { id: 90, origin_id: 90, origin_slot: 0, target_id: 91, target_slot: 0, type: "IMAGE" },
+            ],
+          },
+        ],
+      },
+      nodes: [
+        {
+          id: 1,
+          type: "LoadImage",
+          mode: 0,
+          inputs: [],
+          outputs: [{ name: "IMAGE", type: "IMAGE", links: [] }],
+          widgets_values: ["a.png"],
+        },
+      ],
+      links: [],
+    } as never;
+    const { warnings } = convertUiToApi(g, OBJECT_INFO);
+    expect(warnings).toEqual([]);
+  });
 });
 
 // ── 3. Promoted ("proxy") subgraph widget values ────────────────────────────
@@ -498,6 +625,110 @@ describe("#361 — promoted subgraph widget values", () => {
     const loader = Object.values(workflow).find((n) => n.class_type === "CheckpointLoaderSimple")!;
     expect(loader.inputs.ckpt_name).toBe("not_installed.safetensors");
     expect(joined(warnings)).toContain("not installed on the connected server");
+  });
+});
+
+// ── 3b. Virtual wiring across a subgraph boundary (codex gate) ──────────────
+
+describe("#361 — a subgraph output routed through a Set/Get bus", () => {
+  it("survives expansion instead of being pruned as an anonymous dangling reference", () => {
+    // Component(706) → SetNode(4) "img" → GetNode(5) → SaveImage(3). Rewriting
+    // the link tuple alone was not enough: the expander rewires consumers from
+    // the component's own outputs[].links, so the re-homed edge has to land there
+    // too or the component expands away and the consumer's input vanishes.
+    const g = {
+      definitions: {
+        subgraphs: [
+          {
+            id: SG_ID,
+            name: "Src",
+            inputNode: { id: -10 },
+            outputNode: { id: -20 },
+            inputs: [],
+            outputs: [{ id: "o1", name: "IMAGE", type: "IMAGE", linkIds: [102] }],
+            widgets: [],
+            nodes: [
+              {
+                id: 50,
+                type: "LoadImage",
+                mode: 0,
+                inputs: [],
+                outputs: [{ name: "IMAGE", type: "IMAGE", links: [102] }],
+                widgets_values: ["a.png"],
+              },
+            ],
+            links: [
+              { id: 102, origin_id: 50, origin_slot: 0, target_id: -20, target_slot: 0, type: "IMAGE" },
+            ],
+          },
+        ],
+      },
+      nodes: [
+        {
+          id: 706,
+          type: SG_ID,
+          mode: 0,
+          properties: {},
+          inputs: [],
+          outputs: [{ name: "IMAGE", type: "IMAGE", links: [11] }],
+          widgets_values: [],
+        },
+        {
+          id: 4,
+          type: "SetNode",
+          mode: 0,
+          inputs: [{ name: "value", type: "IMAGE", link: 11 }],
+          outputs: [],
+          widgets_values: ["img"],
+        },
+        {
+          id: 5,
+          type: "GetNode",
+          mode: 0,
+          inputs: [],
+          outputs: [{ name: "IMAGE", type: "IMAGE", links: [10] }],
+          widgets_values: ["img"],
+        },
+        {
+          id: 3,
+          type: "SaveImage",
+          mode: 0,
+          inputs: [{ name: "images", type: "IMAGE", link: 10 }],
+          outputs: [],
+          widgets_values: ["out"],
+        },
+      ],
+      links: [
+        [11, 706, 0, 4, 0, "IMAGE"],
+        [10, 5, 0, 3, 0, "IMAGE"],
+      ],
+    } as never;
+    const { workflow, warnings } = convertUiToApi(g, OBJECT_INFO);
+    const inner = Object.entries(workflow).find(([, n]) => n.class_type === "LoadImage")!;
+    expect(workflow["3"].inputs.images).toEqual([inner[0], 0]);
+    expect(warnings).toEqual([]);
+  });
+
+  it("a connection dropped because its producer left the graph names the node and input", () => {
+    // A consumer wired to a node that is not in the prompt used to be reported
+    // only as a bare "pruned N dangling reference(s)" count.
+    const g = {
+      nodes: [
+        {
+          id: 3,
+          type: "SaveImage",
+          mode: 0,
+          inputs: [{ name: "images", type: "IMAGE", link: 10 }],
+          outputs: [],
+          widgets_values: ["out"],
+        },
+      ],
+      links: [[10, 42, 0, 3, 0, "IMAGE"]],
+    } as never;
+    const { warnings } = convertUiToApi(g, OBJECT_INFO);
+    expect(joined(warnings)).toContain("Node 3 (SaveImage)");
+    expect(joined(warnings)).toContain('input "images"');
+    expect(joined(warnings)).toContain("pointed at node 42");
   });
 });
 

@@ -590,6 +590,18 @@ function deVirtualizeGraph(
       const real = resolveReal(lsrc(l), lsrcSlot(l));
       if (real.ok && !isWiringVirtual(byId.get(real.node as number)?.type)) {
         setLsrc(l, real.node, real.slot);
+        // Re-home the link on the RESOLVED producer's output slot. The link tuple
+        // alone is not enough: the subgraph expander treats a component node's
+        // `outputs[].links` as the authoritative list of consumers to rewire, so a
+        // `component → Set/Get → consumer` edge whose id never landed there was
+        // dropped when the component expanded away — surfacing only as an
+        // anonymous "pruned dangling reference" (codex gate, #361).
+        const producer = byId.get(real.node as number);
+        const outSlot = producer?.outputs?.[real.slot as number];
+        if (outSlot) {
+          const existing = outSlot.links ?? [];
+          if (!existing.includes(lid(l))) outSlot.links = [...existing, lid(l)];
+        }
       } else {
         // Unresolved bus/reroute. Dropping it silently is issue #361's actual
         // harm: the consumer's input simply vanishes and the stripped graph looks
@@ -633,10 +645,37 @@ function deVirtualizeGraph(
   (links as any[]).push(...keptLinks);
 }
 
-/** Strip wiring virtuals from the top-level graph and every subgraph definition. */
-function deVirtualize(ui: UiWorkflow, warnings: string[]): void {
+/**
+ * The subgraph definitions actually INSTANTIATED by this workflow, transitively.
+ * A workflow file keeps definitions that no node instantiates (deleted instances,
+ * imported libraries); nothing in them reaches the stripped graph, so reporting
+ * their unresolved wiring would be pure noise that buries the real losses
+ * (codex gate, #361).
+ */
+function reachableSubgraphs(ui: UiWorkflow): SubgraphDefinition[] {
+  const defs = ui.definitions?.subgraphs ?? [];
+  if (defs.length === 0) return [];
+  const byId = new Map(defs.map((sg) => [sg.id, sg]));
+  const reached = new Set<string>();
+  const queue: UiNode[][] = [ui.nodes ?? []];
+  while (queue.length) {
+    for (const n of queue.pop()!) {
+      if (!byId.has(n.type) || reached.has(n.type)) continue;
+      reached.add(n.type);
+      queue.push(byId.get(n.type)!.nodes ?? []);
+    }
+  }
+  return defs.filter((sg) => reached.has(sg.id));
+}
+
+/** Strip wiring virtuals from the top-level graph and every LIVE subgraph definition. */
+function deVirtualize(
+  ui: UiWorkflow,
+  warnings: string[],
+  liveSubgraphs: SubgraphDefinition[],
+): void {
   deVirtualizeGraph(ui.nodes, ui.links as unknown[], warnings, "the top-level graph");
-  for (const sg of ui.definitions?.subgraphs ?? []) {
+  for (const sg of liveSubgraphs) {
     deVirtualizeGraph(
       sg.nodes,
       sg.links as unknown[],
@@ -672,70 +711,147 @@ interface UeLinkEntry {
   downstream_slot: number;
   upstream: number;
   upstream_slot: number;
+  /** The sender node that produced this broadcast (absent in older lists). */
+  controller?: number;
   type?: string;
 }
 
-function materializeUeLinks(ui: UiWorkflow, warnings: string[]): void {
-  const nodes = ui.nodes ?? [];
+/**
+ * Materialize the broadcasts of ONE graph (the top level, or one subgraph
+ * definition — hence the `addLink` indirection, since a definition stores links
+ * as objects rather than tuples). Reports, never guesses.
+ */
+function materializeUeInGraph(
+  nodes: UiNode[],
+  extra: Record<string, unknown> | undefined,
+  scope: string,
+  warnings: string[],
+  nextId: () => number,
+  addLink: (
+    id: number,
+    srcId: number,
+    srcSlot: number,
+    dstId: number,
+    dstSlot: number,
+    type: string,
+  ) => void,
+): number {
   const senders = nodes.filter((n) => typeof n.type === "string" && isUeSender(n.type));
-  if (senders.length === 0) return;
+  if (senders.length === 0) return 0;
 
-  const ueLinks = (ui.extra as Record<string, unknown> | undefined)?.ue_links;
+  const ueLinks = extra?.ue_links;
   if (!Array.isArray(ueLinks) || ueLinks.length === 0) {
     warnings.push(
       `${senders.length} cg-use-everywhere broadcast node(s) (${senders
         .map((s) => `${s.type} #${s.id}`)
-        .join(", ")}) are present, but the graph carries no computed "extra.ue_links" list. ` +
+        .join(", ")}) are present in ${scope}, but it carries no computed "extra.ue_links" list. ` +
         `Their broadcast connections are NOT ordinary graph links and CANNOT be recovered from this file, so every input they feed is UNCONNECTED in the stripped graph. ` +
         `Open the workflow with cg-use-everywhere active and save (or queue) it once so the pack writes extra.ue_links, then strip again.`,
     );
-    return;
+    return 0;
   }
 
   const nodesById = new Map(nodes.map((n) => [n.id, n]));
-  const links = (ui.links ??= []);
-  let nextLinkId =
-    Math.max(
-      ui.last_link_id ?? 0,
-      0,
-      ...links.filter((l) => Array.isArray(l)).map((l) => l[0]),
-    ) + 1;
-
   let added = 0;
   for (const raw of ueLinks as UeLinkEntry[]) {
     const dst = nodesById.get(raw?.downstream);
     const dstInput = dst?.inputs?.[raw?.downstream_slot];
     if (!dst || !dstInput) {
       warnings.push(
-        `A cg-use-everywhere broadcast targets node #${raw?.downstream} slot ${raw?.downstream_slot}, which no longer exists in this graph — that broadcast connection is ABSENT from the stripped graph.`,
+        `A cg-use-everywhere broadcast in ${scope} targets node #${raw?.downstream} slot ${raw?.downstream_slot}, which no longer exists — that broadcast connection is ABSENT from the stripped graph.`,
       );
       continue;
     }
+    const inputLabel = dstInput.name ?? String(raw.downstream_slot);
     if (dstInput.link != null) continue; // real link present — UE would not fire
+    // A record naming a sender that is GONE is left over from a deleted
+    // broadcast; honoring it would fabricate a connection the live graph does not
+    // have. (An older list with no `controller` field says nothing either way, so
+    // it is not treated as stale.)
+    if (raw.controller != null && !nodesById.has(raw.controller)) {
+      warnings.push(
+        `A cg-use-everywhere record in ${scope} feeding node ${dst.id} (${dst.type}) input "${inputLabel}" names broadcast node #${raw.controller}, which is no longer in the graph — the record is stale, so that input is left UNCONNECTED rather than wired from a deleted broadcast.`,
+      );
+      continue;
+    }
     const src = nodesById.get(raw.upstream);
-    const srcOut = src?.outputs?.[raw.upstream_slot];
     if (!src) {
       warnings.push(
-        `A cg-use-everywhere broadcast into node ${dst.id} (${dst.type}) input "${
-          dstInput.name ?? raw.downstream_slot
-        }" names producer #${raw.upstream}, which is not in this graph — that connection is ABSENT from the stripped graph.`,
+        `A cg-use-everywhere broadcast in ${scope} into node ${dst.id} (${dst.type}) input "${inputLabel}" names producer #${raw.upstream}, which is not in this graph — that connection is ABSENT from the stripped graph.`,
       );
       continue;
     }
-    const id = nextLinkId++;
-    links.push([
+    // Only reject the slot when we can POSITIVELY observe it is gone (the node
+    // serializes an outputs array that is too short). An absent outputs array is
+    // an unknown, not a "no" — and the pack's own computed list is the authority
+    // on what it wired — so it is trusted rather than silently dropped.
+    if (Array.isArray(src.outputs) && raw.upstream_slot >= src.outputs.length) {
+      warnings.push(
+        `A cg-use-everywhere broadcast in ${scope} into node ${dst.id} (${dst.type}) input "${inputLabel}" names output slot ${raw.upstream_slot} of node ${src.id} (${src.type}), which only has ${src.outputs.length} output(s) — the record is stale, so that input is left UNCONNECTED rather than wired to a slot that does not exist.`,
+      );
+      continue;
+    }
+    const id = nextId();
+    addLink(
       id,
       raw.upstream,
       raw.upstream_slot,
       raw.downstream,
       raw.downstream_slot,
       raw.type ?? dstInput.type ?? "*",
-    ]);
+    );
     dstInput.link = id;
+    const srcOut = src.outputs?.[raw.upstream_slot];
     if (srcOut) srcOut.links = [...(srcOut.links ?? []), id];
     added++;
   }
-  ui.last_link_id = nextLinkId - 1;
+  return added;
+}
+
+function materializeUeLinks(
+  ui: UiWorkflow,
+  warnings: string[],
+  liveSubgraphs: SubgraphDefinition[],
+): void {
+  // ONE id counter across the whole workflow: subgraph expansion offsets inner
+  // link ids from the global maximum, so a definition-local id that collides with
+  // a top-level one would be remapped onto a live edge.
+  let maxId = ui.last_link_id ?? 0;
+  for (const l of ui.links ?? []) if (Array.isArray(l)) maxId = Math.max(maxId, l[0]);
+  for (const sg of ui.definitions?.subgraphs ?? []) {
+    for (const l of sg.links ?? []) maxId = Math.max(maxId, l?.id ?? 0);
+  }
+  const nextId = () => ++maxId;
+
+  const links = (ui.links ??= []);
+  let added = materializeUeInGraph(
+    ui.nodes ?? [],
+    ui.extra as Record<string, unknown> | undefined,
+    "the top-level graph",
+    warnings,
+    nextId,
+    (id, s, ss, d, ds, t) => links.push([id, s, ss, d, ds, t]),
+  );
+  for (const sg of liveSubgraphs) {
+    const sgLinks = (sg.links ??= []);
+    added += materializeUeInGraph(
+      sg.nodes ?? [],
+      sg.extra,
+      `subgraph "${sg.name ?? sg.id}"`,
+      warnings,
+      nextId,
+      (id, s, ss, d, ds, t) =>
+        sgLinks.push({
+          id,
+          origin_id: s,
+          origin_slot: ss,
+          target_id: d,
+          target_slot: ds,
+          type: t,
+        }),
+    );
+  }
+  ui.last_link_id = maxId;
   if (added > 0) {
     logger.info(`Materialized ${added} cg-use-everywhere broadcast link(s)`);
   }
@@ -1642,8 +1758,11 @@ export function convertUiToApi(
   // could NOT preserve into the same warnings list (#361).
   const warnings: string[] = [];
   const cleaned = structuredClone(ui);
-  materializeUeLinks(cleaned, warnings);
-  deVirtualize(cleaned, warnings);
+  // Only definitions this workflow actually instantiates can affect the result;
+  // an unused one's wiring problems are not this graph's losses.
+  const liveSubgraphs = reachableSubgraphs(cleaned);
+  materializeUeLinks(cleaned, warnings, liveSubgraphs);
+  deVirtualize(cleaned, warnings, liveSubgraphs);
   const { expanded, warnings: expandWarnings } = expandComponents(cleaned);
   warnings.push(...expandWarnings);
 
@@ -2640,8 +2759,7 @@ export function convertUiToApi(
   // component expansion didn't remap). ComfyUI errors hard ("Node X not found")
   // on these, so drop the connection like an unresolved link.
   const validIds = new Set(Object.keys(workflow));
-  let prunedRefs = 0;
-  for (const node of Object.values(workflow)) {
+  for (const [nodeId, node] of Object.entries(workflow)) {
     const ins = node.inputs as Record<string, unknown>;
     for (const [name, val] of Object.entries(ins)) {
       if (
@@ -2652,12 +2770,14 @@ export function convertUiToApi(
       ) {
         if (process.env.DEBUG_PRUNE) logger.info(`PRUNE: ${(node as {class_type?:string}).class_type}.${name} -> missing ${val[0]}`);
         delete ins[name];
-        prunedRefs++;
+        // Name the node and the input. A bare count ("pruned N references") told
+        // the caller a connection was lost but not WHICH — the same silent-loss
+        // shape as #361 itself.
+        warnings.push(
+          `Node ${nodeId} (${node.class_type}): input "${name}" pointed at node ${val[0]}, which is not in the stripped graph, so the connection was DROPPED (its producer was removed by subgraph expansion or by mute/bypass resolution).`,
+        );
       }
     }
-  }
-  if (prunedRefs > 0) {
-    warnings.push(`Pruned ${prunedRefs} dangling input reference(s) to nodes not in the prompt.`);
   }
 
   // Drop links whose source output type clearly mismatches the consuming input's
