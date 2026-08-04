@@ -230,6 +230,52 @@ describe("get_template_schema must not call an answering server unreachable (#82
     expect(text).toContain("HTML page");
   });
 
+  it("does not report a template MISSING when the index endpoint returned an error", async () => {
+    // An HTTP error is not an empty index. Falling through with `{}` made a 502
+    // read as "there is no template by that name" — a confident wrong verdict
+    // about the template, from a response that said nothing about templates.
+    global.fetch = vi.fn(async () => htmlResponse(502)) as unknown as typeof fetch;
+    const out = await getHandler("get_template_schema", registerTemplateSchemaTools)({
+      template: "some-template",
+    });
+    const text = out.content[0].text;
+    expect(text).not.toMatch(/No custom-node-contributed workflow template named/);
+    expect(text).toContain("UNKNOWN");
+    expect(text).toContain("502");
+  });
+
+  it("does not report a template MISSING for a gateway's JSON error envelope either", async () => {
+    global.fetch = vi.fn(
+      async () =>
+        new Response('{"message":"forbidden"}', {
+          status: 403,
+          headers: { "content-type": "application/json" },
+        }),
+    ) as unknown as typeof fetch;
+    const out = await getHandler("get_template_schema", registerTemplateSchemaTools)({
+      template: "some-template",
+    });
+    const error = String(JSON.parse(out.content[0].text).error);
+    expect(error).not.toMatch(/No custom-node-contributed workflow template named/);
+    expect(error).toContain("UNKNOWN");
+    expect(error).toContain('{"message":"forbidden"}'); // the body verbatim
+    expect(error).toContain("403");
+  });
+
+  it("still reports a genuinely absent template as absent", async () => {
+    global.fetch = vi.fn(
+      async () =>
+        new Response('{"pack-a":[{"name":"something-else"}]}', {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    ) as unknown as typeof fetch;
+    const out = await getHandler("get_template_schema", registerTemplateSchemaTools)({
+      template: "some-template",
+    });
+    expect(out.content[0].text).toMatch(/No custom-node-contributed workflow template named/);
+  });
+
   it("keeps the unreachable wording for a genuine transport failure", async () => {
     global.fetch = vi.fn(async () => {
       throw new Error("fetch failed");
