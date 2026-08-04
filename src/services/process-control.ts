@@ -157,7 +157,37 @@ interface RestartResult {
  *                   condition, #449), or the launcher's pid is indirect (Desktop).
  *                   Never silently upgraded to "ours".
  */
-type ListenerOwnership = "ours" | "not-ours" | "unconfirmed";
+declare const CLASSIFIED: unique symbol;
+
+/**
+ * A verdict about who owns the healthy listener.
+ *
+ * BRANDED ON PURPOSE. The values are ordinary strings at runtime (they serialise
+ * and compare as `"ours"` / `"not-ours"` / `"unconfirmed"`), but the type carries a
+ * phantom property no literal can satisfy — so `listener_ownership: "not-ours"`
+ * simply does not compile. Only `classifyListenerOwnership`, which actually gathers
+ * the evidence, can mint a definite verdict; every other return path must call
+ * `unclassifiedOwnership()` and therefore cannot claim more than it knows.
+ *
+ * This exists because the same defect kept reappearing on new paths: a definite
+ * answer returned by code that never ran the check (#796). Making it a convention
+ * meant remembering it at each site; making it a TYPE means the compiler remembers.
+ */
+type ListenerOwnership = ("ours" | "not-ours" | "unconfirmed") & {
+  readonly [CLASSIFIED]: true;
+};
+
+/** The only verdict a site that did NOT classify is entitled to return. */
+function unclassifiedOwnership(): ListenerOwnership {
+  return "unconfirmed" as ListenerOwnership;
+}
+
+/** Mint a classified verdict. Callable only from the classifier below. */
+function classified(
+  verdict: "ours" | "not-ours" | "unconfirmed",
+): ListenerOwnership {
+  return verdict as ListenerOwnership;
+}
 
 interface StartupReadinessResult {
   ready: boolean;
@@ -688,12 +718,31 @@ function classifyListenerOwnership(input: {
     // Under host-normalisation that never matches our POSIX-resolved absolute path,
     // and the "difference" it reports is really "I could not compare these" — an
     // absence dressed as a finding.
-    const normalise = (token: string): string =>
-      token
-        .trim()
-        .replace(/^["']+|["']+$/g, "")
-        .toLowerCase()
-        .replace(/\\/g, "/");
+    /** A token written in a Windows path dialect (drive prefix or backslashes). */
+    const isWindowsDialect = (t: string): boolean =>
+      /^[a-zA-Z]:[\\/]/.test(t) || /^\\\\/.test(t) || t.includes("\\");
+    /**
+     * Canonicalise a token WITHOUT deciding case: separators to `/`, extended
+     * prefixes (`\\?\`, `\\?\UNC\`) stripped, and `.`/`..` segments resolved, so
+     * two spellings of the same path compare equal instead of reading as `differ`.
+     */
+    const normalise = (token: string): string => {
+      let t = token.trim().replace(/^["']+|["']+$/g, "").replace(/\\/g, "/");
+      t = t.replace(/^\/\/\?\/unc\//i, "//").replace(/^\/\/\?\//, "");
+      if (!/\//.test(t)) return t;
+      const rooted = t.startsWith("/");
+      const drive = /^([a-zA-Z]:)(?=\/)/.exec(t)?.[1] ?? "";
+      const out: string[] = [];
+      for (const seg of t.slice(drive.length).split("/")) {
+        if (seg === "" || seg === ".") continue;
+        if (seg === ".." && out.length > 0 && out[out.length - 1] !== "..") {
+          out.pop();
+          continue;
+        }
+        out.push(seg);
+      }
+      return `${drive}${rooted && !drive ? "/" : drive ? "/" : ""}${out.join("/")}`;
+    };
     /**
      * Do two argv tokens denote the same thing? Paths are compared SEGMENT-ALIGNED
      * (one may be a suffix of the other) rather than by basename: we launch the
@@ -702,17 +751,36 @@ function classifyListenerOwnership(input: {
      * DIFFERENT installs do not, which a basename comparison could never tell apart
      * given every ComfyUI script is called `main.py`.
      */
-    const tokensAgree = (a: string, b: string): boolean => {
-      if (a === b) return true;
-      const pathish = (s: string): boolean => /\//.test(s) || /^[a-z]:/.test(s);
-      if (!pathish(a) || !pathish(b)) return false;
-      return a.endsWith(`/${b}`) || b.endsWith(`/${a}`);
+    /** Canonical text plus the dialect it was WRITTEN in (read before normalising,
+     *  which strips the backslashes that identify it). */
+    const prepare = (raw: string): { text: string; windows: boolean } => ({
+      text: normalise(raw),
+      windows: isWindowsDialect(raw.trim().replace(/^["']+|["']+$/g, "")),
+    });
+    const tokensAgree = (
+      a: { text: string; windows: boolean },
+      b: { text: string; windows: boolean },
+    ): boolean => {
+      // CASE-FOLDING IS CONDITIONAL ON THE DIALECT, never unconditional. Folding
+      // everything made `/srv/ComfyUI/main.py` and `/srv/comfyui/main.py` — two
+      // genuinely different directories on a case-sensitive filesystem — compare
+      // equal, which fabricates a MATCH. That is the dangerous direction: a match
+      // can promote a descendant listener to "ours" and so license stopping a
+      // process that isn't ours. Windows paths ARE case-insensitive, so fold only
+      // when a side was written in that dialect; POSIX paths compare exactly.
+      const fold = a.windows || b.windows;
+      const x = fold ? a.text.toLowerCase() : a.text;
+      const y = fold ? b.text.toLowerCase() : b.text;
+      if (x === y) return true;
+      const pathish = (s: string): boolean => /\//.test(s) || /^[a-zA-Z]:/.test(s);
+      if (!pathish(x) || !pathish(y)) return false;
+      return x.endsWith(`/${y}`) || y.endsWith(`/${x}`);
     };
     // The interpreter is dropped from our side: the server reports `sys.argv`,
     // which never contains it. Order is preserved on both sides (a relaunch passes
     // the same arguments in the same order), so compare positionally.
-    const ours = input.launchArgv.slice(1).map(normalise).filter(Boolean);
-    const serving = input.servingArgv.map(normalise).filter(Boolean);
+    const ours = input.launchArgv.slice(1).map(prepare).filter((t) => t.text);
+    const serving = input.servingArgv.map(prepare).filter((t) => t.text);
     if (ours.length === 0 || serving.length === 0) return "unknown";
     const same =
       ours.length === serving.length &&
@@ -726,14 +794,14 @@ function classifyListenerOwnership(input: {
   // error is latched independently of the readiness race, and Node leaves `pid`
   // undefined only when the spawn did not happen, so the two are the same fact
   // arriving by different routes.
-  if (input.spawnFailed) return "not-ours";
-  if (input.child.pid == null) return "not-ours";
+  if (input.spawnFailed) return classified("not-ours");
+  if (input.child.pid == null) return classified("not-ours");
   // A Desktop launch is undecidable BY DESIGN once it HAS started: we spawn the
   // Electron shell (or macOS `open`, which exits immediately by design), and the
   // process that binds the port is its child. Note this sits AFTER the
   // never-launched checks but BEFORE `childExited`, because for Desktop a launcher
   // exiting is normal rather than evidence of failure.
-  if (input.isDesktopApp) return "unconfirmed";
+  if (input.isDesktopApp) return classified("unconfirmed");
 
   const alive = launchedChildStillRunning(input.child);
   // OUR DIRECT CHILD IS GONE — by its `exit` event, or by a signal-0 probe (ESRCH)
@@ -747,7 +815,7 @@ function classifyListenerOwnership(input: {
     // could equally be another supervisor's identical instance. But it does mean we
     // cannot honestly assert the negative either, so the wrapper case degrades to
     // "unconfirmed" instead of telling that user their own server is not theirs.
-    return byArgv() === "match" ? "unconfirmed" : "not-ours";
+    return byArgv() === "match" ? classified("unconfirmed") : classified("not-ours");
   }
 
   const ourPid = input.child.pid;
@@ -763,9 +831,9 @@ function classifyListenerOwnership(input: {
     // describes whatever is ANSWERING, not which process holds the socket, and it
     // cannot distinguish "a different program" from "we could not compare" — see
     // byArgv, whose "differ" is not a proof of difference.
-    return "unconfirmed";
+    return classified("unconfirmed");
   }
-  if (ourPid == null) return "unconfirmed";
+  if (ourPid == null) return classified("unconfirmed");
   if (input.portOwnerPid !== ourPid) {
     // A DIFFERENT pid holds the port. That is usually somebody else's server — but
     // it is also the shape of a legitimately indirect launch (a wrapper script, a
@@ -779,13 +847,13 @@ function classifyListenerOwnership(input: {
     // process tree while plainly not being what we launched. `listener_ownership`
     // answers "is this the process THIS CALL launched", so a differing command line
     // is decisive there too (codex gate).
-    if (descendant === true) return byArgv() === "differ" ? "not-ours" : "ours";
-    if (descendant === false) return "not-ours";
+    if (descendant === true) return byArgv() === "differ" ? classified("not-ours") : classified("ours");
+    if (descendant === false) return classified("not-ours");
     // Lineage unreadable — the server's argv can still rule the listener OUT.
-    return byArgv() === "differ" ? "not-ours" : "unconfirmed";
+    return byArgv() === "differ" ? classified("not-ours") : classified("unconfirmed");
   }
   // The pid MATCHES — but it could be a recycled number we cannot signal.
-  if (alive !== true) return "unconfirmed";
+  if (alive !== true) return classified("unconfirmed");
 
   // LINEAGE is the discriminator, and the only one that does not depend on WHEN we
   // looked (coordinator gate P1(2)). A creation stamp read after `spawn()` returns
@@ -799,8 +867,8 @@ function classifyListenerOwnership(input: {
   // Not knowing is never promoted to "ours": an unreadable parent withholds the
   // claim. Knowing it is somebody else's is decisive.
   const parent = readParentPid(ourPid);
-  if (parent == null) return "unconfirmed";
-  if (parent !== process.pid) return "not-ours";
+  if (parent == null) return classified("unconfirmed");
+  if (parent !== process.pid) return classified("not-ours");
 
   // Belt and braces: where the OS exposes it, the port owner must also still be
   // running what we launched — and the SERVER's own account of itself must agree.
@@ -812,10 +880,10 @@ function classifyListenerOwnership(input: {
     input.launchArgv &&
     !commandLineMatchesArgv(identity.commandLine, input.launchArgv)
   ) {
-    return "not-ours";
+    return classified("not-ours");
   }
-  if (byArgv() === "differ") return "not-ours";
-  return "ours";
+  if (byArgv() === "differ") return classified("not-ours");
+  return classified("ours");
 }
 
 /** The launch-environment facts to report, once a plan has been resolved (#776). */
@@ -2090,19 +2158,29 @@ export async function startComfyUI(): Promise<StartResult> {
   }
   const port = config.resolvedPort;
 
-  // Check if already running
-  const existingPid = findPidByPort(port);
-  if (existingPid) {
+  // Check if already running. TRI-STATE: "the lookup could not run" is NOT "the
+  // port is free". Collapsing them let us spawn into a port the old server may
+  // still hold, and then report `started:true` because readiness reached THAT
+  // server before the new child's bind failure surfaced — a restart claimed on
+  // evidence nobody had (codex gate P1-c).
+  const preLaunchProbe = probePortOwner(port);
+  if (preLaunchProbe.state === "owned") {
     return {
       started: false,
-      message: `ComfyUI is already running on port ${port} (PID ${existingPid})`,
-      pid: existingPid,
-      // Something is serving the port and it is emphatically NOT a process this
-      // call launched — we never got as far as spawning. Reached during a restart
-      // when another launcher grabbed the port in the gap after our stop
-      // (coordinator gate P2(5)).
-      listener_ownership: "not-ours",
+      message: `ComfyUI is already running on port ${port} (PID ${preLaunchProbe.pid})`,
+      pid: preLaunchProbe.pid,
+      // Something is serving the port and we never got as far as spawning. We did
+      // not classify a launch of ours, so we may not name a definite verdict.
+      listener_ownership: unclassifiedOwnership(),
     };
+  }
+  /** Was the port OBSERVED free before we spawned? `false` = we could not tell. */
+  const portObservedFreeBeforeLaunch = preLaunchProbe.state === "free";
+  if (!portObservedFreeBeforeLaunch) {
+    logger.warn(
+      "Could not determine whether the port was free before launching — a start will not be claimed on readiness alone",
+      { port, reason: preLaunchProbe.state === "unknown" ? preLaunchProbe.reason : "" },
+    );
   }
 
   let info = lastProcessInfo;
@@ -2123,7 +2201,7 @@ export async function startComfyUI(): Promise<StartResult> {
         started: false,
         message:
           "No previous process info and could not find ComfyUI Desktop app. Start ComfyUI manually.",
-        listener_ownership: "unconfirmed",
+        listener_ownership: unclassifiedOwnership(),
       };
     }
   }
@@ -2141,7 +2219,7 @@ export async function startComfyUI(): Promise<StartResult> {
         ? "Could not determine ComfyUI Desktop executable path. Please start it manually."
         : "No command-line info captured from previous run. Start ComfyUI manually.",
       auto_restart: supervisorResult(info),
-      listener_ownership: "unconfirmed",
+      listener_ownership: unclassifiedOwnership(),
     };
   }
   const spawnError = captureChildProcessError(launched.child);
@@ -2201,7 +2279,7 @@ export async function startComfyUI(): Promise<StartResult> {
       launch_env: launchEnvInfo(info),
       // The spawn failed outright: whatever may be serving that port, it is
       // certainly not something this call started.
-      listener_ownership: "not-ours",
+      listener_ownership: unclassifiedOwnership(),
     };
   }
 
@@ -2225,7 +2303,7 @@ export async function startComfyUI(): Promise<StartResult> {
       launch_env: env,
       // Nothing is serving the port, so there is no listener to attribute — the
       // down state is already carried by started:false / ready:false.
-      listener_ownership: "unconfirmed",
+      listener_ownership: unclassifiedOwnership(),
     };
   }
 
@@ -2269,6 +2347,14 @@ export async function startComfyUI(): Promise<StartResult> {
   // Only the NON-Desktop undecidable case is worth calling out: for a Desktop
   // launcher the pid relationship is indirect by design, not a gap in evidence.
   const ownershipUnconfirmed = !info.isDesktopApp && ownership === "unconfirmed";
+  // A start may be CLAIMED only on evidence. Ownership "ours" is proof. Ownership
+  // "unconfirmed" is accepted as a start ONLY when we also observed the port to be
+  // FREE before spawning — otherwise the healthy API may be the very server that
+  // was already there, and readiness would be certifying somebody else's process
+  // as our restart (codex gate P1-c).
+  const mayClaimStart =
+    ownership === "ours" ||
+    (ownership === "unconfirmed" && portObservedFreeBeforeLaunch);
   return {
     // `started` means "THIS call started the server". When the healthy listener is
     // provably NOT the process we launched, we did not start it — programmatic
@@ -2276,7 +2362,7 @@ export async function startComfyUI(): Promise<StartResult> {
     // answers (codex gate). `ready` stays TRUE because the server genuinely IS
     // ready: claiming otherwise would be its own lie and would push callers into
     // needless recovery.
-    started: ownership !== "not-ours",
+    started: mayClaimStart,
     ready: true,
     readiness,
     message:
@@ -2296,6 +2382,11 @@ export async function startComfyUI(): Promise<StartResult> {
       // "our relaunch is the healthy server" is unconfirmed rather than proven.
       (ownershipUnconfirmed
         ? ` (Could not map the process owning port ${port}, so this could not be confirmed as the process this call launched — the launched process is alive and the API is ready.)`
+        : "") +
+      // The port was never observed free, so a healthy API is not evidence WE
+      // produced it — it may be the server that was already there.
+      (!portObservedFreeBeforeLaunch && ownership !== "ours"
+        ? ` NOTE: the port was never observed free before launching, so this call cannot claim to have started the server that is answering.`
         : "") +
       launchEnvWarning(info),
     pid: newPid ?? undefined,
@@ -2508,7 +2599,7 @@ async function restartViaManagerReboot(context: {
       message: reboot.note ?? "ComfyUI-Manager reboot could not be triggered.",
       // The Manager reboot path never spawns a process of ours, so ownership of
       // whatever serves the port is never something this call can claim.
-      listener_ownership: "unconfirmed",
+      listener_ownership: unclassifiedOwnership(),
     };
   }
 
@@ -2548,7 +2639,7 @@ async function restartViaManagerReboot(context: {
       message:
         `Reboot was triggered but ComfyUI did not come back within ${timing.budgetMs}ms — ` +
         "check the host (is it the Desktop app / supervised?).",
-      listener_ownership: "unconfirmed",
+      listener_ownership: unclassifiedOwnership(),
     };
   }
 
@@ -2574,7 +2665,7 @@ async function restartViaManagerReboot(context: {
       `${context.label}/supervised restart.`,
     // The supervisor that owns the process cycled it; we launched nothing, so we
     // cannot (and must not) claim the listener as ours.
-    listener_ownership: "unconfirmed",
+    listener_ownership: unclassifiedOwnership(),
   };
 }
 
@@ -2599,7 +2690,7 @@ export async function restartComfyUI(): Promise<RestartResult> {
       message:
         diagnostic ??
         `No ComfyUI process found on port ${config.resolvedPort} to restart. Is ComfyUI running?`,
-      listener_ownership: "unconfirmed",
+      listener_ownership: unclassifiedOwnership(),
     };
   }
   // A locally-installed ComfyUI **Desktop** instance is Electron-supervised.
@@ -2626,7 +2717,7 @@ export async function restartComfyUI(): Promise<RestartResult> {
           "Fix the launch path (e.g. COMFYUI_PATH) and try again."),
       // Refused before touching anything: the still-running server is the one that
       // was already there, which this call did not start.
-      listener_ownership: "not-ours",
+      listener_ownership: unclassifiedOwnership(),
     };
   }
 
@@ -2640,7 +2731,7 @@ export async function restartComfyUI(): Promise<RestartResult> {
       message: `Could not stop ComfyUI: ${stopResult.message}`,
       // Nothing was stopped and nothing launched — whatever is on the port is not
       // this call's doing.
-      listener_ownership: "not-ours",
+      listener_ownership: unclassifiedOwnership(),
     };
   }
   // #742 r4/r5: the stop DID happen — record the dispatch. No session identity

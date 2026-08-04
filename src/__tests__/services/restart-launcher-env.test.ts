@@ -53,6 +53,11 @@ const errno = vi.hoisted(
     },
 );
 
+/** Per-test override letting a path's `statSync` fail with a chosen errno. */
+const mockStatThrows = vi.hoisted(() => ({
+  value: undefined as ((p: string) => NodeJS.ErrnoException | undefined) | undefined,
+}));
+
 const mockSettingsJsonRef = vi.hoisted(() => ({
   value: undefined as string | undefined,
   /** The file exists on disk but reading it throws. */
@@ -91,8 +96,12 @@ vi.mock("node:fs", () => ({
     }
     throw errno("ENOENT", "no such file or directory");
   }),
+  // statSync backs the launcher-evidence probe, which classifies from the ERRNO:
+  // ENOENT means "not there", anything else means "could not look".
   statSync: vi.fn((p: string) => {
-    if (!mockExistsSync(String(p))) throw new Error("ENOENT");
+    const forced = mockStatThrows.value?.(String(p));
+    if (forced) throw forced;
+    if (!mockExistsSync(String(p))) throw errno("ENOENT", "no such file");
     return { isFile: () => true, isDirectory: () => false };
   }),
 }));
@@ -267,6 +276,7 @@ beforeEach(() => {
   __processControlTestHooks.setParentPidResolver(() => process.pid);
   mockSettingsJsonRef.value = undefined;
   mockSettingsJsonRef.unreadable = false;
+  mockStatThrows.value = undefined;
 });
 
 afterEach(() => {
@@ -454,6 +464,36 @@ describe("restart_comfyui — Stability Matrix launcher environment (#776)", () 
     expect(result.message).toMatch(/no bundled FFmpeg anywhere under its Data folder/i);
 
     killSpy.mockRestore();
+  });
+
+  it("REFUSES when the launcher's tooling directories cannot be READ", async () => {
+    // An ACL-unreadable `Data/PortableGit` looks exactly like "this install has no
+    // PortableGit" to `existsSync`. Falling through to the plain-install plan there
+    // relaunches a launcher-managed server WITHOUT its environment — #776 itself,
+    // reached through the fix for it.
+    mockFindComfyuiPython.mockReturnValue(SM_PY);
+    mockLiveRootFromArgv.mockReturnValue(SM_PKG);
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: [SM_MAIN, "--port", "8188"] },
+    });
+    mockExistsSync.mockImplementation((p: string) => {
+      const s = String(p);
+      return s === SM_MAIN || s === SM_PY;
+    });
+    // statSync is what the launcher probe uses: EACCES on the tooling roots means
+    // "we could not look", which must not be spent as "there is nothing here".
+    mockStatThrows.value = (p: string) => {
+      const s = String(p);
+      if (s === SM_GIT_ROOT || s === SM_ASSETS_ROOT || s === SM_FFMPEG_ROOT) {
+        return errno("EACCES", "permission denied");
+      }
+      return undefined;
+    };
+
+    const message = await expectRefusedBeforeStopping();
+
+    expect(message).toMatch(/could not be read/i);
+    expect(message).toMatch(/Restart ComfyUI from its launcher/i);
   });
 
   it("REFUSES when the launcher's config EXISTS but cannot be read", async () => {
@@ -2198,10 +2238,16 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
 
     const result = await restartComfyUI();
 
-    expect(result.listener_ownership).toBe("not-ours");
+    // `unconfirmed`, NOT `not-ours`: this branch never ran ownership
+    // classification — it returned the moment it saw the port occupied. Only the
+    // classifier may name a definite verdict, so a site that did not classify
+    // cannot claim one (it is a compile error to try). What this test guards is
+    // unchanged: the field is PRESENT on this path, it survives JSON, and no
+    // success is claimed.
+    expect(result.listener_ownership).toBe("unconfirmed");
     const serialized = JSON.parse(JSON.stringify(result));
     expect(Object.hasOwn(serialized, "listener_ownership")).toBe(true);
-    expect(serialized.listener_ownership).toBe("not-ours");
+    expect(serialized.listener_ownership).toBe("unconfirmed");
     expect(result.message).not.toMatch(/restarted successfully/i);
 
     killSpy.mockRestore();

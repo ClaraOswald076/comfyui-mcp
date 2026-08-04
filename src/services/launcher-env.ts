@@ -40,7 +40,7 @@
  * guess.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 // NOTE: readFileSync is used both for `/proc/<pid>/environ` and for the launcher's
 // own config file (launcherConfigMentions).
 import { delimiter } from "node:path";
@@ -164,13 +164,32 @@ function joinPath(base: string, ...parts: string[]): string {
   return [base.replace(/[\\/]+$/, ""), ...parts].join(sep);
 }
 
-/** existsSync that can never throw (a bad path must read as "absent"). */
-function pathExists(p: string): boolean {
+/**
+ * Does this path exist? THREE answers, because `existsSync` only has two and
+ * spends the wrong one: it returns FALSE for a path it cannot access, so an
+ * ACL-unreadable `Data/PortableGit` looked exactly like "this install has no
+ * PortableGit". Detection then fell through to the plain-install plan and the
+ * relaunch dropped the launcher environment — the #776 failure itself, reached
+ * through the fix for it (codex gate P1-e).
+ */
+type DirProbe = "present" | "absent" | "inaccessible";
+
+function probePath(p: string): DirProbe {
   try {
-    return existsSync(p);
-  } catch {
-    return false;
+    statSync(p);
+    return "present";
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    // Only these mean "there is nothing here". EACCES/EPERM/ELOOP/EIO and an
+    // unset code all mean "we could not look".
+    if (code === "ENOENT" || code === "ENOTDIR") return "absent";
+    return "inaccessible";
   }
+}
+
+/** Convenience for the places where only "definitely there" matters. */
+function pathExists(p: string): boolean {
+  return probePath(p) === "present";
 }
 
 function firstExisting(candidates: string[]): string | undefined {
@@ -265,7 +284,7 @@ function componentEvidence(
 
 export function detectStabilityMatrix(
   paths: ReadonlyArray<string | undefined>,
-): StabilityMatrixLayout | null {
+): StabilityMatrixLayout | "inaccessible" | null {
   for (const p of paths) {
     if (!p) continue;
     for (const ancestor of ancestorsOf(p)) {
@@ -275,15 +294,29 @@ export function detectStabilityMatrix(
       const gitRoot = joinPath(dataRoot, "PortableGit");
       const assetsRoot = joinPath(dataRoot, "Assets");
       const ffmpegRoot = joinPath(assetsRoot, "ffmpeg");
-      const hasGitRoot = pathExists(gitRoot);
-      const hasFfmpegRoot = pathExists(ffmpegRoot);
+      const gitRootProbe = probePath(gitRoot);
+      const assetsRootProbe = probePath(assetsRoot);
+      const ffmpegRootProbe = probePath(ffmpegRoot);
+      // We could not READ the evidence that would tell us whether this is a
+      // launcher-managed install. That is not "it isn't one" — falling through to
+      // the plain-install plan here is exactly how a launcher-owned server gets
+      // relaunched without its environment. Surface it so the caller refuses.
+      if (
+        gitRootProbe === "inaccessible" ||
+        assetsRootProbe === "inaccessible" ||
+        ffmpegRootProbe === "inaccessible"
+      ) {
+        return "inaccessible";
+      }
+      const hasGitRoot = gitRootProbe === "present";
+      const hasFfmpegRoot = ffmpegRootProbe === "present";
       // Corroboration is `PortableGit` OR the `Assets` STORE — not `Assets/ffmpeg`
       // specifically. Requiring the ffmpeg subdirectory missed a real layout
       // (`Data/Packages/…` beside `Data/Assets`, with PortableGit expected but
       // currently unlocatable): it fell through as a plain install, inherited our
       // environment, and reproduced "Bad git executable" (codex gate). Recognising
       // it lets the per-component evidence rules below decide properly.
-      if (!hasGitRoot && !pathExists(assetsRoot)) continue;
+      if (!hasGitRoot && assetsRootProbe !== "present") continue;
 
       const gitExe = firstExisting([
         joinPath(gitRoot, "cmd", "git.exe"),
@@ -514,6 +547,31 @@ export function resolveLaunchEnvironment(
 
   // 2. Stability Matrix — reconstruct exactly what it injects, from disk.
   const sm = detectStabilityMatrix(input.paths);
+  if (sm === "inaccessible") {
+    // We could not READ the evidence that decides whether this install is
+    // launcher-managed. Treating that as "not a launcher install" is what would
+    // relaunch a Stability Matrix server without its PATH — #776 exactly. So it
+    // refuses, like every other case where the launcher environment is known to be
+    // beyond our reach.
+    return {
+      reproducible: false,
+      info: {
+        source: "inherited",
+        reproducible: false,
+        note:
+          "the launcher evidence beside this install could not be read, so whether " +
+          "its environment needs reconstructing could NOT be determined",
+      },
+      reason:
+        "This ComfyUI sits in a Stability Matrix-shaped layout, but the directories that " +
+        "would say whether the launcher injects its own Git/FFmpeg could not be read " +
+        "(permission denied or otherwise inaccessible). Relaunching without an " +
+        "environment it may require is the failure this check exists to prevent.",
+      advice:
+        "Restart ComfyUI from its launcher, or make the launcher's Data folder readable " +
+        "by this process and try again.",
+    };
+  }
   if (sm) {
     // PARTIAL reconstruction is NOT reconstruction — but "partial" has to mean
     // something we would actually DROP, not merely something that isn't there.

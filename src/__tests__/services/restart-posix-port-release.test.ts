@@ -278,6 +278,188 @@ describe("restart_comfyui on POSIX — port release via lsof (#776)", () => {
     killSpy.mockRestore();
   }, 20_000);
 
+  it("does NOT claim a start when the port was never OBSERVED free before launching", async () => {
+    // The stop committed unverified, and the port lookup is unavailable from then
+    // on. We still launch (refusing after a kill could leave the server down), but
+    // readiness may be reaching the server that was ALREADY there — so a healthy
+    // API is not evidence that THIS call started anything.
+    let killed = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/kill/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed) throw lsofMissing(); // probe unusable from here on
+        return "p4321\nn127.0.0.1:8188\n";
+      }
+      return "";
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true }) as Response),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.ready).toBe(true);
+    expect(result.started).toBe(false);
+    expect(result.message).toMatch(/never observed free before launching/i);
+    expect(result.message).not.toMatch(/restarted successfully/i);
+
+    killSpy.mockRestore();
+  }, 30_000);
+
+  it("does NOT treat CASE-DISTINCT POSIX paths as the same install", async () => {
+    // The dangerous direction. Folding case unconditionally made
+    // `/opt/PosixComfy/ComfyUI/main.py` and `/opt/posixcomfy/comfyui/main.py` —
+    // different directories on a case-sensitive filesystem — compare EQUAL, which
+    // fabricates a MATCH. A match can promote a descendant listener to "ours" and
+    // so license stopping a process that is not ours.
+    //
+    // Driven through the child-exited branch, where the argv comparison decides:
+    // a fabricated match would read "unconfirmed", the real answer is "not-ours".
+    let answers = 0;
+    mockGetSystemStats.mockImplementation(async () => {
+      answers++;
+      return {
+        system: {
+          argv:
+            answers <= 2
+              ? ARGV
+              : ["/opt/posixcomfy/comfyui/main.py", "--port", "8188"],
+        },
+      };
+    });
+    let killed = false;
+    const children: FakeChild[] = [];
+    mockSpawn.mockImplementation(() => {
+      const child = new FakeChild();
+      children.push(child);
+      return child;
+    });
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/kill/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed) throw lsofNoMatches();
+        return "p4321\nn127.0.0.1:8188\n";
+      }
+      return "";
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        children[0]?.emit("exit", 0, null);
+        return { ok: true } as Response;
+      }),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.listener_ownership).toBe("not-ours");
+
+    killSpy.mockRestore();
+  }, 20_000);
+
+  it("DOES treat case-distinct WINDOWS paths as the same install", async () => {
+    // The other half of the same rule: Windows filesystems ARE case-insensitive, so
+    // folding is correct there — and withholding it would manufacture a spurious
+    // "different program" for a perfectly ordinary Windows install.
+    let answers = 0;
+    mockGetSystemStats.mockImplementation(async () => {
+      answers++;
+      return {
+        system: {
+          argv: answers <= 2 ? ARGV : ["COMFYUI\\MAIN.PY", "--port", "8188"],
+        },
+      };
+    });
+    let killed = false;
+    const children: FakeChild[] = [];
+    mockSpawn.mockImplementation(() => {
+      const child = new FakeChild();
+      children.push(child);
+      return child;
+    });
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/kill/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed) throw lsofNoMatches();
+        return "p4321\nn127.0.0.1:8188\n";
+      }
+      return "";
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        children[0]?.emit("exit", 0, null);
+        return { ok: true } as Response;
+      }),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.listener_ownership).toBe("unconfirmed");
+
+    killSpy.mockRestore();
+  }, 20_000);
+
+  it("treats `.`/`..` spellings of the SAME path as equal, not as a difference", async () => {
+    let answers = 0;
+    mockGetSystemStats.mockImplementation(async () => {
+      answers++;
+      return {
+        system: {
+          argv:
+            answers <= 2
+              ? ARGV
+              : ["/opt/PosixComfy/x/../ComfyUI/./main.py", "--port", "8188"],
+        },
+      };
+    });
+    let killed = false;
+    const children: FakeChild[] = [];
+    mockSpawn.mockImplementation(() => {
+      const child = new FakeChild();
+      children.push(child);
+      return child;
+    });
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/kill/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed) throw lsofNoMatches();
+        return "p4321\nn127.0.0.1:8188\n";
+      }
+      return "";
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        children[0]?.emit("exit", 0, null);
+        return { ok: true } as Response;
+      }),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.listener_ownership).toBe("unconfirmed");
+
+    killSpy.mockRestore();
+  }, 20_000);
+
   it("does NOT read a MISSING lsof as proof the port is free", async () => {
     // A container without lsof. The probe did not run, so the stop cannot claim the
     // process died — but it still commits and relaunches, because a refusal after

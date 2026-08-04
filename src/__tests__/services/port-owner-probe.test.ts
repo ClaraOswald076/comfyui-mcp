@@ -88,6 +88,52 @@ describe("probePortOwner — POSIX (lsof)", () => {
     expect(probe.state).toBe("unknown");
   });
 
+  it("reports UNKNOWN when lsof exits 1 but COMPLAINS on stderr", async () => {
+    // A permission-restricted lsof exits 1 having enumerated nothing and says so on
+    // stderr. Exit status alone would read that as "the port is free" — certifying
+    // a release that never happened, and tearing down supervision under a server
+    // that may still be serving.
+    mockExecSync.mockImplementation(() => {
+      const err = exitWith(1) as Error & { status: number; stderr: string };
+      err.stderr = "lsof: WARNING: can't stat() /proc/1234: Permission denied";
+      throw err;
+    });
+    const { probePortOwner } = await loadProbe();
+
+    expect(probePortOwner(8188).state).toBe("unknown");
+  });
+
+  it("reports UNKNOWN when lsof exits 1 with partial output on stdout", async () => {
+    mockExecSync.mockImplementation(() => {
+      const err = exitWith(1) as Error & { status: number; stdout: string };
+      err.stdout = "p999\n";
+      throw err;
+    });
+    const { probePortOwner } = await loadProbe();
+
+    expect(probePortOwner(8188).state).toBe("unknown");
+  });
+
+  it("still reports FREE for a QUIET exit 1 (empty stdout and stderr)", async () => {
+    mockExecSync.mockImplementation(() => {
+      const err = exitWith(1) as Error & { status: number; stdout: string; stderr: string };
+      err.stdout = "";
+      err.stderr = "";
+      throw err;
+    });
+    const { probePortOwner } = await loadProbe();
+
+    expect(probePortOwner(8188)).toEqual({ state: "free" });
+  });
+
+  it("passes -w so lsof's routine warnings do not masquerade as a failed enumeration", async () => {
+    mockExecSync.mockReturnValue("");
+    const { probePortOwner } = await loadProbe();
+    probePortOwner(8188);
+
+    expect(String(mockExecSync.mock.calls[0][0])).toMatch(/lsof -w /);
+  });
+
   it("reports UNKNOWN for a spawn-level failure (errno), not free", async () => {
     mockExecSync.mockImplementation(() => {
       throw spawnFailure("ENOENT");

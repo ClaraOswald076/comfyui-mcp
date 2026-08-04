@@ -85,7 +85,7 @@ export function parseListenerPidFromNetstat(
 }
 
 /**
- * Parse `lsof -nP -iTCP:PORT -sTCP:LISTEN -Fpn` field output. Records look like
+ * Parse `lsof -w -nP -iTCP:PORT -sTCP:LISTEN -Fpn` field output. Records look like
  *   p1234
  *   n127.0.0.1:8188
  * so we can bind the match to the ADDRESS as well as the port, which the plain
@@ -132,13 +132,32 @@ export type PortOwnerProbe =
   | { state: "free" }
   | { state: "unknown"; reason: string };
 
-/** Did this execSync failure mean "ran fine, matched nothing"? */
+/**
+ * Did this execSync failure mean "ran fine, enumerated everything, matched
+ * nothing"? Only that reading is evidence the port is free.
+ *
+ * Exit status 1 alone is NOT enough. `lsof` also exits 1 when it could not
+ * enumerate — a permission-restricted run reports what it could not open on
+ * stderr and exits 1 having listed nothing, which is "I could not look", not
+ * "nobody is listening". Certifying that as free would let `waitForPortFree`
+ * report a release that never happened and tear down supervision under a live
+ * server. So a clean empty result must ALSO be quiet on both streams; the `-w`
+ * flag on the invocation suppresses lsof's routine warnings so that anything
+ * remaining on stderr genuinely means the enumeration was incomplete.
+ */
 function isEmptyResultExit(err: unknown): boolean {
-  const e = err as NodeJS.ErrnoException & { status?: number };
+  const e = err as NodeJS.ErrnoException & {
+    status?: number;
+    stdout?: Buffer | string;
+    stderr?: Buffer | string;
+  };
   // A spawn-level failure (command missing, timeout) tells us nothing about the
-  // port; only a clean "no matches" exit does. lsof uses exit 1 for that.
+  // port; only a clean "no matches" exit does.
   if (e?.code) return false;
-  return e?.status === 1;
+  if (e?.status !== 1) return false;
+  const text = (v: Buffer | string | undefined): string =>
+    v == null ? "" : (typeof v === "string" ? v : v.toString("utf-8")).trim();
+  return text(e.stdout) === "" && text(e.stderr) === "";
 }
 
 export function probePortOwner(port: number, host?: string): PortOwnerProbe {
@@ -180,7 +199,7 @@ export function probePortOwner(port: number, host?: string): PortOwnerProbe {
   }
 
   try {
-    const out = execSync(`lsof -nP -iTCP:${port} -sTCP:LISTEN -Fpn`, {
+    const out = execSync(`lsof -w -nP -iTCP:${port} -sTCP:LISTEN -Fpn`, {
       encoding: "utf-8",
       timeout: 5000,
     });
