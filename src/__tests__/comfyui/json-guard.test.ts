@@ -99,6 +99,24 @@ describe("classifyNonJson names what answered instead of ComfyUI (#828)", () => 
     });
     expect(d.kind).toBe("login");
     expect(d.message).toContain("SIGN-IN PAGE");
+    // A body-confirmed gateway DOES justify "give the credential to the gateway".
+    expect(d.message).toContain("belongs to that GATEWAY, not to ComfyUI");
+  });
+
+  it("does not send the credential to the GATEWAY on an unconfirmed 401/403", () => {
+    // ComfyUI behind the user's own auth layer returns these too, and telling
+    // them to configure the wrong side wastes the round trip.
+    const d = classifyNonJson({
+      url: URL_UNDER_TEST,
+      status: 401,
+      contentType: "text/plain",
+      body: "unauthorized",
+    });
+    expect(d.kind).toBe("login");
+    expect(d.message).not.toContain("belongs to that GATEWAY, not to ComfyUI");
+    expect(d.message).toContain("this response does not say which");
+    // The remedy is still actionable — it names the knobs the connector uses.
+    expect(d.message).toContain("COMFYUI_AUTH_TOKEN");
   });
 
   it("does not assert a proxy from a 502 STATUS alone", () => {
@@ -378,6 +396,30 @@ describe("looksLikeHtmlParsedAsJson recognises a library's own parse failure (#8
 describe("rethrowWithJsonDiagnosis never asserts a cause it did not prove (#828)", () => {
   const ORIGINAL = new SyntaxError(`Unexpected token '<', "<!DOCTYPE "... is not valid JSON`);
   const PROBE_URL = "http://remote.example:8188/object_info";
+
+  it("redacts a reflected credential OUT of the original parse message", async () => {
+    // The library's parse error QUOTES the body it choked on, so a gateway that
+    // reflects the request puts our own token in that message — and the message
+    // is carried verbatim into the diagnosis.
+    authHeaders.value = { Authorization: "Bearer echoed-secret-token-here" };
+    try {
+      global.fetch = vi.fn(
+        async () =>
+          new Response("<!DOCTYPE html><html></html>", {
+            status: 200,
+            headers: { "content-type": "text/html" },
+          }),
+      ) as unknown as typeof fetch;
+      const reflecting = new SyntaxError(
+        `Unexpected token '<', "<html>Bearer echoed-secret-token-here</html>" is not valid JSON`,
+      );
+      await expect(rethrowWithJsonDiagnosis(reflecting, PROBE_URL)).rejects.toSatisfy(
+        (e: unknown) => e instanceof Error && !e.message.includes("echoed-secret-token-here"),
+      );
+    } finally {
+      authHeaders.value = {};
+    }
+  });
 
   it("keeps the ORIGINAL message and marks the probe as a separate request", async () => {
     global.fetch = vi.fn(

@@ -33,6 +33,12 @@ const fsState = vi.hoisted(() => ({
   readsBroken: false,
   /** Swallow only SOME writes — used to fail one alias of a slot fan-out. */
   failWriteOnCall: null as null | (() => boolean),
+  /** Once this many writes have completed, arm `breakNextReads` failing reads —
+   *  so a restore's WRITE can land while only its verification read fails, which
+   *  is exactly the case where a restore is genuinely unverifiable. */
+  breakReadsAfterWriteCount: null as number | null,
+  breakNextReads: 0,
+  writeCount: 0,
 }));
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
@@ -40,12 +46,25 @@ vi.mock("node:fs", async (importOriginal) => {
     if (fsState.swallowWrites) return;
     if (fsState.failWriteOnCall?.()) return; // this write silently does not land
     const out = actual.writeFileSync(...args);
+    fsState.writeCount++;
     if (fsState.breakReadsAfterWrite) fsState.readsBroken = true;
+    if (
+      fsState.breakReadsAfterWriteCount !== null &&
+      fsState.writeCount === fsState.breakReadsAfterWriteCount
+    ) {
+      fsState.breakNextReads = 2; // the setter's read-back, then the restore check
+    }
     return out;
   };
   const readFileSync: typeof actual.readFileSync = ((...args: Parameters<typeof actual.readFileSync>) => {
-    if (fsState.readsBroken && String(args[0]).endsWith(".env")) {
-      throw Object.assign(new Error("EIO: i/o error, read"), { code: "EIO" });
+    if (String(args[0]).endsWith(".env")) {
+      if (fsState.readsBroken) {
+        throw Object.assign(new Error("EIO: i/o error, read"), { code: "EIO" });
+      }
+      if (fsState.breakNextReads > 0) {
+        fsState.breakNextReads--;
+        throw Object.assign(new Error("EIO: i/o error, read"), { code: "EIO" });
+      }
     }
     return actual.readFileSync(...args);
   }) as typeof actual.readFileSync;
@@ -62,6 +81,7 @@ import {
   clearPanelSecret,
   hasLivePickup,
   listPanelSecretsMasked,
+  maskSecret,
   migrateSecretsToEnv,
   onComfyuiSecretsChanged,
   panelSecretsPath,
@@ -69,6 +89,7 @@ import {
   setAgentSecret,
   setComfyuiSecret,
   setPanelSecret,
+  slotRevokeState,
   slotSaveConfirmed,
   slotShellProvidedKeys,
   slotStillResolves,
@@ -93,6 +114,9 @@ beforeEach(() => {
   fsState.breakReadsAfterWrite = false;
   fsState.readsBroken = false;
   fsState.failWriteOnCall = null;
+  fsState.breakReadsAfterWriteCount = null;
+  fsState.breakNextReads = 0;
+  fsState.writeCount = 0;
   dir = mkdtempSync(join(tmpdir(), "cmcp-receipt-"));
   envPath = join(dir, ".env");
   process.env.COMFYUI_MCP_ENV_FILE = envPath;
@@ -113,6 +137,9 @@ afterEach(() => {
   fsState.breakReadsAfterWrite = false;
   fsState.readsBroken = false;
   fsState.failWriteOnCall = null;
+  fsState.breakReadsAfterWriteCount = null;
+  fsState.breakNextReads = 0;
+  fsState.writeCount = 0;
   delete process.env.COMFYUI_MCP_ENV_FILE;
   delete process.env.COMFYUI_MCP_PANEL_SECRETS;
   for (const k of ALL_KEYS) {
@@ -374,6 +401,89 @@ describe("slot saves report what the read-back PROVED (#826 gate round 3)", () =
     expect(env.HUGGINGFACE_TOKEN).toBeUndefined();
   });
 
+  it("does NOT claim a clean rollback when the restore could not be verified", () => {
+    // freshSecretValue falls back to the in-process copy when the store is
+    // unreadable, so comparing against it would "confirm" a restore that never
+    // reached disk. The verdict must come from the store, and stay UNKNOWN when
+    // the store cannot be read.
+    setPanelSecret("huggingface", "hf-old"); // writes 1 and 2
+    let call = 0;
+    // Fail the SECOND alias of the new save, then let the FIRST alias's restore
+    // write land and break reads immediately afterwards — so the restore itself
+    // succeeded but cannot be verified.
+    fsState.failWriteOnCall = () => ++call === 2;
+    fsState.breakReadsAfterWriteCount = 4;
+    let outcome: ReturnType<typeof setPanelSecret>;
+    try {
+      outcome = setPanelSecret("huggingface", "hf-new");
+    } finally {
+      fsState.failWriteOnCall = null;
+      fsState.breakReadsAfterWriteCount = null;
+      fsState.readsBroken = false;
+    }
+    expect(outcome.confirmed).toBe(false);
+    expect(outcome.unverifiedKeys).toContain("HF_TOKEN");
+    // NOT a clean rollback: an UNPROVEN restore is not a proven one, and
+    // `rolledBack` is what the caller turns into "nothing was half-applied".
+    expect(outcome.strandedKeys).toEqual([]);
+    expect(outcome.rolledBack).toBe(false);
+  });
+
+  it("restores a SHELL-provided previous value without persisting it into the store", () => {
+    // Writing a shell secret back through the setter would move it into the
+    // file and mark it file-derived: the text is restored, but where the value
+    // lives and how it resolves are silently changed.
+    resetEnvFileProvenanceForTests();
+    process.env.HF_TOKEN = "hf-from-shell";
+    process.env.HUGGINGFACE_TOKEN = "hf-from-shell";
+    writeFileSync(envPath, "# store starts empty\n", { mode: 0o600 });
+    let call = 0;
+    fsState.failWriteOnCall = () => ++call === 2;
+    try {
+      setPanelSecret("huggingface", "hf-new");
+    } finally {
+      fsState.failWriteOnCall = null;
+    }
+    // Restored in the environment...
+    expect(process.env.HF_TOKEN).toBe("hf-from-shell");
+    // ...but NOT written into the credential store, and still shell-provided.
+    expect(readFileSync(envPath, "utf-8")).not.toContain("hf-from-shell");
+    expect(slotShellProvidedKeys("huggingface")).toContain("HF_TOKEN");
+  });
+
+  it("fires NO change event for a slot save that failed and was rolled back", () => {
+    // Each successful alias used to emit before the later alias's failure was
+    // known, so a save that ultimately failed still respawned every idle agent —
+    // and the rollback respawned them all again.
+    setPanelSecret("huggingface", "hf-old");
+    const cb = vi.fn();
+    const off = onComfyuiSecretsChanged(cb);
+    try {
+      let call = 0;
+      fsState.failWriteOnCall = () => ++call === 2;
+      try {
+        const outcome = setPanelSecret("huggingface", "hf-new");
+        expect(outcome.rolledBack).toBe(true);
+      } finally {
+        fsState.failWriteOnCall = null;
+      }
+      expect(cb).not.toHaveBeenCalled();
+    } finally {
+      off();
+    }
+  });
+
+  it("fires EXACTLY ONE change event for a successful multi-alias slot save", () => {
+    const cb = vi.fn();
+    const off = onComfyuiSecretsChanged(cb);
+    try {
+      expect(setPanelSecret("huggingface", "hf-abc").confirmed).toBe(true);
+      expect(cb).toHaveBeenCalledTimes(1);
+    } finally {
+      off();
+    }
+  });
+
   it("restores the earlier alias before re-throwing a per-key validation failure", () => {
     // A control character is rejected per key. The FIRST alias would already
     // have been written when the second is rejected, so the throw must not leave
@@ -404,9 +514,43 @@ describe("slot saves report what the read-back PROVED (#826 gate round 3)", () =
     expect(slotStillResolves("civitai")).toBe(false);
   });
 
+  it("reports the revoke state as UNKNOWN when the store cannot be re-read", () => {
+    // After a revoke deletes this process's copy, an unreadable store makes
+    // every alias resolve to undefined — which reads as "gone" while a child
+    // that CAN read the file still finds the old credential there.
+    setPanelSecret("civitai", "civ-abc");
+    expect(slotRevokeState("civitai")).toBe("still-resolves");
+    clearPanelSecret("civitai");
+    expect(slotRevokeState("civitai")).toBe("gone");
+    fsState.readsBroken = true;
+    try {
+      expect(slotRevokeState("civitai")).toBe("unknown");
+    } finally {
+      fsState.readsBroken = false;
+    }
+  });
+
+  it("reports 'still-resolves' when the store still carries an alias", () => {
+    writeFileSync(envPath, "CIVITAI_API_TOKEN=left-behind\n", { mode: 0o600 });
+    expect(slotRevokeState("civitai")).toBe("still-resolves");
+  });
+
   it("names NO shell keys for a credential this store owns", () => {
     setPanelSecret("civitai", "civ-abc");
     expect(slotShellProvidedKeys("civitai")).toEqual([]);
+  });
+
+  it("masks the value a READER would use, not whichever alias it checks first", () => {
+    // A shell-set legacy alias outranks a file-set canonical one for
+    // freshSecretValue. Resolving aliases independently and taking the first
+    // would display a token consumers are not using.
+    resetEnvFileProvenanceForTests();
+    process.env.HUGGINGFACE_TOKEN = "shell-alias-value";
+    writeFileSync(envPath, "HF_TOKEN=file-alias-value\n", { mode: 0o600 });
+    const hf = listPanelSecretsMasked().find((s) => s.id === "huggingface")!;
+    expect(hf.set).toBe(true);
+    expect(hf.masked).toBe(maskSecret("shell-alias-value"));
+    expect(hf.masked).not.toBe(maskSecret("file-alias-value"));
   });
 
   it("shows a slot as SET when only its LEGACY alias is configured", () => {

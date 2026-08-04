@@ -124,6 +124,66 @@ export function panelSecretsPath(): string {
 // emitter is enough to tell the orchestrator to re-inject + respawn.
 const emitter = new EventEmitter();
 
+// ── Emission suspension ─────────────────────────────────────────────────────
+// A multi-key operation (a Settings SLOT save fans out to a slot's alias keys)
+// must not fire a change per key: each successful alias emits BEFORE the later
+// alias's failure is known, so a save that ultimately fails — and is rolled back
+// — would still have respawned every idle agent against a half-written state,
+// and the rollback would respawn them all again (codex gate, round 5, finding
+// 7). Suspend for the duration, then emit ONCE for the state actually left.
+let emitSuspendDepth = 0;
+let suspendedComfyuiChange = false;
+let suspendedAgentChange = false;
+
+function emitComfyuiChange(payload: Partial<ComfyuiSecretChange>): void {
+  if (emitSuspendDepth > 0) {
+    suspendedComfyuiChange = true;
+    return;
+  }
+  emitter.emit("change", payload);
+}
+
+function emitAgentChange(): void {
+  if (emitSuspendDepth > 0) {
+    suspendedAgentChange = true;
+    return;
+  }
+  emitter.emit("agentChange");
+}
+
+/**
+ * Run `fn` with change events suspended, then emit at most one of each for the
+ * FINAL state. `decide` sees whether anything was suppressed and returns what to
+ * emit — a caller whose operation failed AND was fully rolled back can emit
+ * nothing, because nothing changed.
+ */
+function withSuspendedEmissions<T>(
+  fn: () => T,
+  decide: (result: T | undefined, suppressed: { comfyui: boolean; agent: boolean }) => {
+    comfyui?: Partial<ComfyuiSecretChange> | false;
+    agent?: boolean;
+  },
+): T {
+  const outerComfyui = suspendedComfyuiChange;
+  const outerAgent = suspendedAgentChange;
+  suspendedComfyuiChange = false;
+  suspendedAgentChange = false;
+  emitSuspendDepth++;
+  let result: T | undefined;
+  try {
+    result = fn();
+    return result;
+  } finally {
+    emitSuspendDepth--;
+    const suppressed = { comfyui: suspendedComfyuiChange, agent: suspendedAgentChange };
+    suspendedComfyuiChange = outerComfyui;
+    suspendedAgentChange = outerAgent;
+    const plan = decide(result, suppressed);
+    if (plan.comfyui) emitComfyuiChange(plan.comfyui);
+    if (plan.agent) emitAgentChange();
+  }
+}
+
 /** Payload for a comfyui tool-secret change. `requested` is true ONLY when the
  *  change ANSWERS an outstanding panel_request_secret (the agent asked the user
  *  for a token to unblock an action) — a Settings-panel slot save, a background
@@ -522,12 +582,12 @@ export function setEnvSecret(
   // not an intention. No listener → `respawn: null`, never a fabricated zero.
   const reports: SecretRespawnReport[] = [];
   if (isAllowedComfyuiSecretKey(trimmed))
-    emitter.emit("change", {
+    emitComfyuiChange({
       requested: opts.requested === true,
       tabId: opts.tabId,
       report: (r: SecretRespawnReport) => reports.push(r),
     });
-  if (isAllowedAgentSecretKey(trimmed)) emitter.emit("agentChange"); // flip provider readiness live
+  if (isAllowedAgentSecretKey(trimmed)) emitAgentChange(); // flip provider readiness live
   return {
     key: trimmed,
     path: envFilePath(),
@@ -565,8 +625,8 @@ export function removeEnvSecret(key: string): boolean {
   if (purgedJson) write(s);
   const changed = removed || purgedJson;
   if (changed) {
-    if (isAllowedComfyuiSecretKey(key)) emitter.emit("change"); // comfyui-only restart (#269)
-    if (isAllowedAgentSecretKey(key)) emitter.emit("agentChange");
+    if (isAllowedComfyuiSecretKey(key)) emitComfyuiChange({}); // comfyui-only restart (#269)
+    if (isAllowedAgentSecretKey(key)) emitAgentChange();
   }
   return changed;
 }
@@ -875,11 +935,15 @@ export interface SlotSaveOutcome {
   /** The slot was left exactly as it was before this call (no alias carries the
    *  new value). Only meaningful when `confirmed` is false. */
   rolledBack: boolean;
-  /** Aliases left carrying the NEW value despite the overall failure, because
-   *  restoring them did not itself take effect. Non-empty means the slot is in a
+  /** Aliases PROVEN to still carry the NEW value despite the overall failure,
+   *  because restoring them did not take effect. Non-empty means the slot is in a
    *  MIXED state and the caller must say so — claiming "nothing was
    *  half-applied" over this is the round-4 defect. */
   strandedKeys: string[];
+  /** Aliases whose restore could NOT be verified either way (the store went
+   *  unreadable). Neither proven restored nor proven stranded — the caller must
+   *  say so rather than pick one (codex gate, round 5, finding 2). */
+  unverifiedKeys: string[];
 }
 
 /**
@@ -899,62 +963,141 @@ export interface SlotSaveOutcome {
 export function setPanelSecret(slotId: string, value: string): SlotSaveOutcome {
   const slot = SLOT_BY_ID.get(slotId);
   if (!slot) throw new Error(`unknown credential slot "${slotId}"`);
-  const set = slot.store === "agent" ? setAgentSecret : setComfyuiSecret;
-  const remove = slot.store === "agent" ? removeAgentSecret : removeComfyuiSecret;
-  const before = slot.envKeys.map((key) => ({ key, previous: freshSecretValue(key) }));
+  const before = slot.envKeys.map((key) => ({
+    key,
+    previous: freshSecretValue(key),
+    // Provenance matters for the restore: writing a SHELL-provided value back
+    // through the setter would persist it into the store and mark it
+    // file-derived — restoring the text while silently changing where the value
+    // lives and how it resolves (codex gate, round 5, finding 2).
+    wasShellProvided: isShellProvided(key),
+  }));
 
   const receipts: SecretSaveReceipt[] = [];
   let thrown: unknown = null;
   let failed = false;
-  for (const key of slot.envKeys) {
-    try {
-      const receipt = set(key, value);
-      receipts.push(receipt);
-      if (receipt.persisted !== "yes") {
-        // "unknown" is not a proven failure, but it is not a proven success
-        // either — stop here rather than layering more unverified writes on it.
-        failed = true;
-        break;
-      }
-    } catch (err) {
-      thrown = err;
-      failed = true;
-      break;
-    }
-  }
-  if (!failed) {
-    return { slot: slotId, receipts, confirmed: true, rolledBack: false, strandedKeys: [] };
-  }
+  let strandedKeys: string[] = [];
+  let unverifiedKeys: string[] = [];
 
-  // Restore every alias this call actually changed.
-  const strandedKeys: string[] = [];
-  for (const { key, previous } of before) {
-    if (freshSecretValue(key) === previous) continue; // untouched by this call
-    try {
-      if (previous === undefined) remove(key);
-      else set(key, previous);
-      if (freshSecretValue(key) !== previous) strandedKeys.push(key);
-    } catch {
-      strandedKeys.push(key);
-    }
-  }
+  const outcome = withSuspendedEmissions(
+    (): SlotSaveOutcome => {
+      for (const key of slot.envKeys) {
+        try {
+          const receipt = setEnvSecret(key, value);
+          receipts.push(receipt);
+          if (receipt.persisted !== "yes") {
+            // "unknown" is not a proven failure, but it is not a proven success
+            // either — stop rather than layering more unverified writes on it.
+            failed = true;
+            break;
+          }
+        } catch (err) {
+          thrown = err;
+          failed = true;
+          break;
+        }
+      }
+      if (!failed) {
+        return {
+          slot: slotId,
+          receipts,
+          confirmed: true,
+          rolledBack: false,
+          strandedKeys: [],
+          unverifiedKeys: [],
+        };
+      }
+      // Restore every alias this call actually changed, and PROVE each restore
+      // from the store rather than from freshSecretValue — which falls back to
+      // the in-process copy when the store is unreadable and would therefore
+      // "confirm" a restore that never reached disk.
+      for (const { key, previous, wasShellProvided } of before) {
+        const state = restoreEnvKey(key, previous, wasShellProvided);
+        if (state === "stranded") strandedKeys.push(key);
+        else if (state === "unverified") unverifiedKeys.push(key);
+      }
+      return {
+        slot: slotId,
+        receipts,
+        confirmed: false,
+        rolledBack: strandedKeys.length === 0 && unverifiedKeys.length === 0,
+        strandedKeys,
+        unverifiedKeys,
+      };
+    },
+    (result, suppressed) => {
+      // Emit ONCE, for the state actually left. A save that failed and was fully
+      // rolled back changed nothing, so it must not respawn anything.
+      const changed = !!result && (result.confirmed || !result.rolledBack);
+      if (!changed) return {};
+      return {
+        comfyui: suppressed.comfyui ? {} : false,
+        agent: suppressed.agent,
+      };
+    },
+  );
   if (thrown) {
-    if (strandedKeys.length) {
+    if (strandedKeys.length || unverifiedKeys.length) {
+      const mixed = [...strandedKeys, ...unverifiedKeys];
       throw new Error(
         `${thrown instanceof Error ? thrown.message : String(thrown)} ` +
-          `Restoring the slot did not fully take effect: ${strandedKeys.join(", ")} still carr${strandedKeys.length > 1 ? "y" : "ies"} the new value. ` +
+          `Restoring the slot could not be confirmed for ${mixed.join(", ")}, so it may be in a MIXED state. ` +
           `Set "${slotId}" again, or clear it, before relying on it.`,
       );
     }
     throw thrown;
   }
-  return {
-    slot: slotId,
-    receipts,
-    confirmed: false,
-    rolledBack: strandedKeys.length === 0,
-    strandedKeys,
-  };
+  return outcome;
+}
+
+/**
+ * Put one alias key back to its pre-save state, and say whether that is PROVEN.
+ *   "restored"   — the store agrees the key is back to `previous`.
+ *   "stranded"   — the store proves it still carries the new value.
+ *   "unverified" — the store could not be read, so neither is established.
+ * Never collapses "unverified" into either verdict.
+ */
+function restoreEnvKey(
+  key: string,
+  previous: string | undefined,
+  wasShellProvided: boolean,
+): "restored" | "stranded" | "unverified" {
+  // Already as it was? Then this call never changed it — rewriting would be a
+  // pointless write that can itself fail and manufacture a "stranded" verdict
+  // for a key that was never touched.
+  const current = parseEnvFile();
+  if (current !== null) {
+    const wanted = wasShellProvided || previous === undefined ? undefined : previous;
+    if (current[key] === wanted) {
+      // Keep the in-process copy and the provenance in step with the store.
+      if (previous === undefined) delete process.env[key];
+      else process.env[key] = previous;
+      if (wasShellProvided) unmarkFileDerived(key);
+      return "restored";
+    }
+  }
+  try {
+    if (wasShellProvided) {
+      // The value belongs to the ENVIRONMENT, not to the store: drop whatever we
+      // wrote and hand precedence back, rather than persisting a shell secret.
+      removeEnvFileKey(key);
+      if (previous === undefined) delete process.env[key];
+      else process.env[key] = previous;
+      unmarkFileDerived(key);
+    } else if (previous === undefined) {
+      removeEnvSecret(key);
+    } else {
+      setEnvSecret(key, previous);
+    }
+  } catch {
+    return "stranded";
+  }
+  const parsed = parseEnvFile();
+  if (parsed === null) return "unverified";
+  const inStore = parsed[key];
+  if (wasShellProvided) return inStore === undefined ? "restored" : "stranded";
+  if (previous === undefined) return inStore === undefined ? "restored" : "stranded";
+  return inStore === previous ? "restored" : "stranded";
 }
 
 /** True when EVERY key of a slot save is proven to have landed. A single alias
@@ -996,6 +1139,29 @@ export function slotStillResolves(slotId: string): boolean {
   return slot.envKeys.some((k) => freshSecretValue(k) !== undefined);
 }
 
+/**
+ * The revoke's VERIFIED end state:
+ *   "gone"           — the store is readable and carries no alias of this slot.
+ *   "still-resolves" — an alias still supplies a credential.
+ *   "unknown"        — the store could not be read, so neither is established.
+ *
+ * `slotStillResolves` alone is not enough here: after a revoke deletes this
+ * process's copy, an unreadable store makes every alias resolve to undefined —
+ * which reads as "gone" while a child that CAN read the file still finds the old
+ * credential there. Reporting a revoke on that basis is a false acknowledgement
+ * (codex gate, round 5, finding 3).
+ */
+export function slotRevokeState(slotId: string): "gone" | "still-resolves" | "unknown" {
+  const slot = SLOT_BY_ID.get(slotId);
+  if (!slot) throw new Error(`unknown credential slot "${slotId}"`);
+  const parsed = parseEnvFile();
+  if (parsed === null) return "unknown"; // the store may still carry it; we cannot tell
+  if (slot.envKeys.some((k) => typeof parsed[k] === "string" && parsed[k].trim())) {
+    return "still-resolves";
+  }
+  return slotStillResolves(slotId) ? "still-resolves" : "gone";
+}
+
 /** The slot's keys currently supplied by a REAL environment variable. Read
  *  BEFORE a revoke: this store can delete them from THIS process, but not from
  *  the environment the process was started with, so they come back on the next
@@ -1012,11 +1178,13 @@ export function slotShellProvidedKeys(slotId: string): string[] {
  *  configured" verdict for a credential that is in effect (codex gate, round 4,
  *  answer B). The mask shows the alias that actually resolves. */
 export function listPanelSecretsMasked(): { id: string; label: string; set: boolean; masked: string | null }[] {
-  const comfyui = loadComfyuiSecretEnv();
-  const agent = loadAgentSecretEnv();
   return CREDENTIAL_SLOTS.map((slot) => {
-    const store = slot.store === "agent" ? agent : comfyui;
-    const val = slot.envKeys.map((k) => store[k]).find((v) => typeof v === "string" && v);
+    // Resolved with the SAME alias precedence a reader uses (freshSecretValue
+    // over the whole alias list), not by resolving each alias independently and
+    // taking the first: those differ — a shell-set legacy alias outranks a
+    // file-set canonical one for a reader, so picking per-alias would display a
+    // token consumers are not using (codex gate, round 5, finding 6).
+    const val = freshSecretValue(...slot.envKeys);
     return { id: slot.id, label: slot.label, set: !!val, masked: val ? maskSecret(val) : null };
   });
 }

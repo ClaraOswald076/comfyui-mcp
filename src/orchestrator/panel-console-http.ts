@@ -15,9 +15,9 @@ import {
   setPanelSecret,
   clearPanelSecret,
   listPanelSecretsMasked,
+  slotRevokeState,
   slotSaveConfirmed,
   slotShellProvidedKeys,
-  slotStillResolves,
   unconfirmedSlotKeys,
   CREDENTIAL_SLOTS,
 } from "../services/panel-secrets.js";
@@ -424,13 +424,30 @@ export function startPanelConsoleHttpServer(opts: {
             // effective for this process and must not be reported as complete.
             const shellKeys = slotShellProvidedKeys(slot);
             const removed = clearPanelSecret(slot);
-            if (slotStillResolves(slot)) {
+            const state = slotRevokeState(slot);
+            if (state === "still-resolves") {
               sendJson(res, 500, {
                 ok: false,
                 slot,
                 cleared: false,
+                still_resolves: true,
                 error:
                   `Removed an entry for "${slot}", but the credential still resolves — something else is still providing it. It is NOT revoked.`,
+              });
+              return;
+            }
+            if (state === "unknown") {
+              // The store could not be read, so we cannot say the credential is
+              // gone: a tool process that CAN read it may still find the old
+              // value there. Report the uncertainty instead of either verdict.
+              sendJson(res, 200, {
+                ok: true,
+                slot,
+                cleared: removed,
+                still_resolves: null,
+                warning:
+                  `"${slot}" no longer applies to this process, but the credential store could not be re-read, so whether it is gone from disk is UNKNOWN. ` +
+                  `A tool session that can read the store may still find the old value. Re-check before relying on the revoke.`,
               });
               return;
             }
@@ -467,16 +484,21 @@ export function startPanelConsoleHttpServer(opts: {
             // "nothing was half-applied" is only claimed when the restore is
             // proven complete.
             const stranded = outcome.strandedKeys;
+            const unverifiedRestore = outcome.unverifiedKeys;
             const aftermath = stranded.length
-              ? `Restoring the slot did not fully take effect: ${stranded.join(", ")} still carr${stranded.length > 1 ? "y" : "ies"} the new value, so the slot is in a MIXED state — set it again, or clear it, before relying on it.`
-              : `The change was rolled back, so nothing was half-applied.`;
-            sendJson(res, failed.length || stranded.length ? 500 : 200, {
-              ok: failed.length === 0 && stranded.length === 0,
+              ? `Restoring the slot did not take effect for ${stranded.join(", ")}, which still carr${stranded.length > 1 ? "y" : "ies"} the new value — the slot is in a MIXED state; set it again, or clear it, before relying on it.`
+              : unverifiedRestore.length
+                ? `Restoring the slot could NOT be verified for ${unverifiedRestore.join(", ")} (the store was unreadable), so whether anything was half-applied is unknown — re-check before relying on it.`
+                : `The change was rolled back, so nothing was half-applied.`;
+            const hard = failed.length > 0 || stranded.length > 0;
+            sendJson(res, hard ? 500 : 200, {
+              ok: !hard,
               slot,
               // Key NAMES and verdicts only — never a value.
               unconfirmed,
               rolled_back: outcome.rolledBack,
               ...(stranded.length ? { stranded_keys: stranded } : {}),
+              ...(unverifiedRestore.length ? { unverified_restore_keys: unverifiedRestore } : {}),
               ...(failed.length
                 ? {
                     error:
@@ -486,7 +508,7 @@ export function startPanelConsoleHttpServer(opts: {
                   ? { error: `"${slot}" could not be saved cleanly. ${aftermath}` }
                   : {
                       warning:
-                        `"${slot}" was written but the store could not be re-read to confirm it (${unconfirmed.map((u) => u.key).join(", ")}). Treat it as unverified.`,
+                        `"${slot}" was written but the store could not be re-read to confirm it (${unconfirmed.map((u) => u.key).join(", ")}). Treat it as unverified. ${aftermath}`,
                     }),
             });
             return;
