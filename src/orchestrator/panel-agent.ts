@@ -886,6 +886,16 @@ export class PanelAgent {
     this.interruptReleaseTimer.unref?.();
   }
 
+  /** INVARIANT that makes the net starvation-free rather than merely eventually-
+   *  scheduled, and the reason every clear lives behind this one seam: the fallback is
+   *  only ever cleared at a point where the gate is (or is about to be) OPEN —
+   *  completeTurn() and releaseTurns() both open it, and start()'s session-ended clear
+   *  is followed by a counter reset on the next loop iteration. So "an interrupt
+   *  happened and the gate is still closed" implies a timer is armed, and that timer's
+   *  deadline was set by the FIRST interrupt of the burst (arm coalesces) while its
+   *  guard tracks the LATEST interrupt's still-stuck turn. A storm can therefore neither
+   *  postpone the release nor aim it at the wrong turn. Any new clear site must preserve
+   *  this — clearing while the gate stays shut re-creates the #568 wedge. */
   private clearInterruptReleaseFallback(): void {
     if (this.interruptReleaseTimer) {
       clearTimeout(this.interruptReleaseTimer);
@@ -1879,7 +1889,9 @@ export class PanelAgentManager {
   }
 
   /** Whether a live agent (session) exists for this composite key — used to flag
-   *  the mobile mirror picker's "session attached" dot. */
+   *  the mobile mirror picker's "session attached" dot, and as the SYNCHRONOUS half
+   *  of {@link interrupt}'s outcome for callers that must report it without waiting
+   *  on the backend's (possibly slow, possibly hung) interrupt round-trip (#568). */
   hasLiveAgent(key: string): boolean {
     return this.agents.has(key);
   }
@@ -2573,8 +2585,17 @@ export class PanelAgentManager {
     );
   }
 
-  async interrupt(tabId: string, opts: { requeueInFlight?: boolean } = {}): Promise<void> {
-    await this.agents.get(tabId)?.interrupt(opts);
+  /** Interrupt a tab's live agent. Returns whether a live agent actually TOOK the
+   *  interrupt — an interrupt addressed to a key with no agent is a silent no-op that
+   *  arms NO recovery at all (no turn gate is held, no release fallback is scheduled),
+   *  so the caller must not report it as a completed cancellation. Reporting "done"
+   *  for an interrupt nothing received is the same could-not/did-not conflation that
+   *  made #568 look like a wedge nobody could explain. */
+  async interrupt(tabId: string, opts: { requeueInFlight?: boolean } = {}): Promise<boolean> {
+    const agent = this.agents.get(tabId);
+    if (!agent) return false;
+    await agent.interrupt(opts);
+    return true;
   }
 
   async stopAll(): Promise<void> {
