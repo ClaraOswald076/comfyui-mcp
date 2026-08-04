@@ -1313,6 +1313,30 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     expect(AskAnswers.outstandingDebt()).toHaveLength(0);
   });
 
+  // The journal half of the same seam: even if a stranger reaches the debt, its
+  // result must not settle it. The disclosure token is bound to the AGENT
+  // INSTANCE that carried it, so a different conversation on the same tab key
+  // cannot certify a warning it never showed.
+  it("a different agent instance cannot ack the departed tab's disclosure", () => {
+    AskAnswers.noteDroppedForTest(TAB, 3);
+    const tokens: string[] = [];
+    AskAnswers.setTurnAttacher((_key, token) => {
+      tokens.push(token);
+      return "pa-instance-A";
+    });
+    expect(AskAnswers.reportDropped(TAB)).toBe(3);
+
+    // A second browser tab takes over the same key; its agent is a NEW instance.
+    AskAnswers.ack(tokens[0], { carrier: "pa-instance-B" });
+    expect(AskAnswers.droppedFor(TAB)).toBe(3); // still owed
+    AskAnswers.ack(tokens[0]); // …and an unidentified ack proves nothing either
+    expect(AskAnswers.droppedFor(TAB)).toBe(3);
+
+    // Only the instance that actually carried the warning retires it.
+    AskAnswers.ack(tokens[0], { carrier: "pa-instance-A" });
+    expect(AskAnswers.droppedFor(TAB)).toBe(0);
+  });
+
   it("never throws when the flusher does", () => {
     AskAnswers.setFlusher(() => {
       throw new Error("no agent");

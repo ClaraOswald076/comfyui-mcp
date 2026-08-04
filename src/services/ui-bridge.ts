@@ -724,6 +724,19 @@ export function isCapabilityRefusal(err: unknown): boolean {
 }
 
 /** Tag an error as a reply-timeout and return it (for throw/reject). */
+/**
+ * Key for a pending "is this tab gone?" clock (#486).
+ *
+ * (tab id, INCARNATION) — a `wf:<hash>` tab id recurs, so it names a workflow,
+ * not a browser tab. The incarnation is the panel's sessionStorage-backed
+ * `tab_session_id`: unique per browser tab and stable across a reload, which is
+ * exactly the distinction the clock has to draw. JSON-encoded so neither part
+ * can be forged into the other by a separator.
+ */
+function tabGoneSlot(tabId: string, incarnation: string | undefined): string {
+  return JSON.stringify([tabId, incarnation ?? null]);
+}
+
 export function markReplyTimeout<E extends Error>(err: E): E {
   Object.defineProperty(err, REPLY_TIMEOUT, {
     value: true,
@@ -914,8 +927,8 @@ export class UiBridge {
    * slightly longer, while firing early destroys it.
    */
   private tabGoneGraceMs = 60_000;
-  /** Armed tab-gone timers, cancelled by a re-hello. */
-  private tabGoneTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Armed tab-gone clocks, keyed by (tab id, incarnation) — see armTabGone. */
+  private tabGoneTimers = new Map<string, { timer: ReturnType<typeof setTimeout> }>();
   /** Buffered late-but-valid ask_user answers (ask_id → result), drained by the
    *  caller via takeLateAskReply(). Bounded by a short TTL — a stale unclaimed
    *  answer is pruned rather than kept forever. */
@@ -1386,16 +1399,22 @@ export class UiBridge {
             // Already gone.
           }
         }
-        // #486 — the tab is BACK. Cancel any pending "is it gone?" clock so an
+        const incomingTabSessionId =
+          typeof (msg as { tab_session_id?: unknown }).tab_session_id === "string" &&
+          (msg as { tab_session_id?: string }).tab_session_id?.trim()
+            ? (msg as { tab_session_id?: string }).tab_session_id!.trim()
+            : undefined;
+        // #486 — THIS tab is back. Cancel its pending "is it gone?" clock, so an
         // ordinary reload never retires state only this tab can be told about.
         //
-        // DEFENCE IN DEPTH: the timer re-checks `conns` before firing, so a
-        // reconnect is already safe without this and no test can fail on it. It
-        // is here because a live timer for a tab that is demonstrably present is
-        // a lie about the state of the world, and the next person to add a
-        // condition to that callback should not have to discover that the guard
-        // depends on the re-check being reached.
-        this.cancelTabGone(tabId);
+        // Matched on the BROWSER-TAB SESSION, not the key: a `wf:<hash>` key
+        // recurs, so a DIFFERENT tab opening the same saved workflow takes it
+        // over. Keyed on the id alone, that stranger's hello would cancel the
+        // departed tab's clock — and a later result from the stranger could then
+        // report and settle the departed tab's lost-answer disclosure as its own.
+        // Same key is not the same tab; only the same incarnation coming back is
+        // a proven return.
+        this.cancelTabGone(tabId, incomingTabSessionId);
         this.conns.set(tabId, {
           sock,
           tabId,
@@ -1406,11 +1425,7 @@ export class UiBridge {
           // tab id. The browser-tab identity must have arrived on THIS hello,
           // otherwise it cannot prove that the tab receiving the reboot is the
           // tab that came back afterwards.
-          tabSessionId:
-            typeof (msg as { tab_session_id?: unknown }).tab_session_id === "string" &&
-            (msg as { tab_session_id?: string }).tab_session_id?.trim()
-              ? (msg as { tab_session_id?: string }).tab_session_id!.trim()
-              : undefined,
+          tabSessionId: incomingTabSessionId,
           headless: incomingHeadless,
           panelVersion:
             typeof (msg as { panel_version?: unknown }).panel_version === "string"
@@ -1673,6 +1688,9 @@ export class UiBridge {
       let wasPrimary = false;
       if (tabId && this.conns.get(tabId)?.sock === sock) {
         wasPrimary = true;
+        // #486 — capture WHICH incarnation is leaving before the record goes;
+        // the gone-clock is armed for that browser tab, not for the key.
+        const departingIncarnation = this.conns.get(tabId)?.tabSessionId;
         this.conns.delete(tabId);
         if (this.lastActiveTabId === tabId) this.setLastActiveTab(null);
         // The mirrored desktop tab is gone — detach its viewers so their input
@@ -1686,7 +1704,7 @@ export class UiBridge {
         // socket closed, and an ordinary F5 produces exactly this. So the
         // tab-gone listener is ARMED here and only fires if the tab stays away
         // for the grace: a reload cancels it on the re-hello (see armTabGone).
-        this.armTabGone(tabId);
+        this.armTabGone(tabId, departingIncarnation);
         logger.info(
           `[ui-bridge] panel tab disconnected: ${tabId.slice(0, 8)} — ${this.conns.size} tab(s) remain`,
         );
@@ -1991,15 +2009,33 @@ export class UiBridge {
     if (typeof opts.graceMs === "number" && opts.graceMs >= 0) this.tabGoneGraceMs = opts.graceMs;
   }
 
-  /** Start the "is this tab actually gone?" clock. A re-hello for the same id
-   *  cancels it (cancelTabGone), so a reload never fires the listener. */
-  private armTabGone(tabId: string): void {
+  /**
+   * Start the "is this tab actually gone?" clock for the INCARNATION that just
+   * left — its browser-tab session id, which is sessionStorage-backed and so
+   * survives a reload while being unique per browser tab.
+   *
+   * `incarnation` undefined means the departing panel never identified itself
+   * (an old build). Nothing can then PROVE it came back, so nothing may suppress
+   * the signal: it fires at the end of the grace. Unknown-return has to let the
+   * disclosure surface — folding "could not tell" into "it's back" is how a
+   * warning goes missing.
+   */
+  private armTabGone(tabId: string, incarnation: string | undefined): void {
     if (!this.onTabGone) return;
-    this.cancelTabGone(tabId);
+    // Keyed per INCARNATION, so two browser tabs that share a recurring
+    // `wf:<hash>` key each get their own clock. Keyed by tab id alone, the
+    // second tab's departure would silently drop the first tab's pending
+    // signal and it would never be declarable gone at all.
+    const slot = tabGoneSlot(tabId, incarnation);
+    const prev = this.tabGoneTimers.get(slot);
+    if (prev) clearTimeout(prev.timer);
     const timer = setTimeout(() => {
-      this.tabGoneTimers.delete(tabId);
-      // Re-check: the tab may have come back under this very id.
-      if (this.conns.has(tabId)) return;
+      this.tabGoneTimers.delete(slot);
+      // Re-check, on the INCARNATION and not just the key: something else may
+      // now hold this recurring id, and a stranger holding the key is not this
+      // tab coming back.
+      const now = this.conns.get(tabId);
+      if (now && incarnation !== undefined && now.tabSessionId === incarnation) return;
       try {
         this.onTabGone?.(tabId);
       } catch (err) {
@@ -2010,15 +2046,28 @@ export class UiBridge {
     }, this.tabGoneGraceMs);
     // Never hold the process open just to declare a tab gone.
     timer.unref?.();
-    this.tabGoneTimers.set(tabId, timer);
+    this.tabGoneTimers.set(slot, { timer });
   }
 
-  /** The tab is back (or is being torn down deliberately) — it is not gone. */
-  private cancelTabGone(tabId: string): void {
-    const timer = this.tabGoneTimers.get(tabId);
-    if (!timer) return;
-    clearTimeout(timer);
-    this.tabGoneTimers.delete(tabId);
+  /**
+   * THIS tab is back (or is being torn down deliberately) — it is not gone.
+   *
+   * Only the SAME incarnation cancels. A different browser tab taking over a
+   * recurring `wf:<hash>` key must leave the departed tab's clock running, or
+   * the departed tab becomes permanently undeclarable and its disclosure can be
+   * settled by a conversation that never owned it. `undefined` cancels
+   * unconditionally, for the deliberate teardown path that has no incarnation to
+   * name.
+   */
+  private cancelTabGone(tabId: string, incarnation: string | undefined): void {
+    // An UNIDENTIFIED hello (an old panel that sends no `tab_session_id`) proves
+    // nothing about which tab came back, so it cancels nothing.
+    if (incarnation === undefined) return;
+    const slot = tabGoneSlot(tabId, incarnation);
+    const armed = this.tabGoneTimers.get(slot);
+    if (!armed) return;
+    clearTimeout(armed.timer);
+    this.tabGoneTimers.delete(slot);
   }
 
   takeLateAskReply(askId: string): unknown | undefined {
@@ -2775,7 +2824,7 @@ export class UiBridge {
   }
 
   async stop(): Promise<void> {
-    for (const timer of this.tabGoneTimers.values()) clearTimeout(timer);
+    for (const armed of this.tabGoneTimers.values()) clearTimeout(armed.timer);
     this.tabGoneTimers.clear();
     if (this.bindRetryTimer) {
       clearTimeout(this.bindRetryTimer);

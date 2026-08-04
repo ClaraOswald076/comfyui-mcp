@@ -129,7 +129,11 @@ async function startBridgeOnFreePort(
   throw new Error(`could not bind a free bridge port after 6 attempts: ${lastErr}`);
 }
 
-function connectPanel(tabId?: string, title = "workflow-a"): Promise<WebSocket> {
+function connectPanel(
+  tabId?: string,
+  title = "workflow-a",
+  opts: { tabSessionId?: string } = {},
+): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
     const sock = new WebSocket(`ws://127.0.0.1:${port}`);
     sock.on("open", () => {
@@ -144,6 +148,9 @@ function connectPanel(tabId?: string, title = "workflow-a"): Promise<WebSocket> 
             title,
             enforces_workflow_stamp: true,
             enforces_workflow_stamp_at_write: true,
+            // The panel's sessionStorage-backed browser-tab identity: unique per
+            // browser tab, stable across a reload (#486/#709).
+            ...(opts.tabSessionId ? { tab_session_id: opts.tabSessionId } : {}),
           }),
         );
       }
@@ -3171,29 +3178,38 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
   // retired live per-tab bookkeeping (the eviction-disclosure debt) during every
   // reload, so the reconnected conversation kept the answer and lost the warning
   // that an answer had been dropped — the worst possible split.
-  it("an ordinary reload does NOT declare the tab gone", async () => {
-    const gone: string[] = [];
-    bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: 300 });
-    const sock = await connectPanel("tab-reload", "wf");
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-reload")).toBe(true));
+  it("an ordinary reload does NOT declare the tab gone", () => {
+    return (async () => {
+      const gone: string[] = [];
+      bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: 300 });
+      const sock = await connectPanel("tab-reload", "wf", { tabSessionId: "browser-tab-A" });
+      await vi.waitFor(() =>
+        expect(bridge.tabs().some((t) => t.tab_id === "tab-reload")).toBe(true),
+      );
 
-    // F5: the socket closes and the same tab re-hellos moments later.
-    sock.close();
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-reload")).toBe(false));
-    const back = await connectPanel("tab-reload", "wf");
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-reload")).toBe(true));
+      // F5: the socket closes and the SAME browser tab re-hellos moments later.
+      // Its `tab_session_id` lives in sessionStorage, so it comes back unchanged.
+      sock.close();
+      await vi.waitFor(() =>
+        expect(bridge.tabs().some((t) => t.tab_id === "tab-reload")).toBe(false),
+      );
+      const back = await connectPanel("tab-reload", "wf", { tabSessionId: "browser-tab-A" });
+      await vi.waitFor(() =>
+        expect(bridge.tabs().some((t) => t.tab_id === "tab-reload")).toBe(true),
+      );
 
-    // Well past the grace: the tab came back, so it was never gone.
-    await new Promise((r) => setTimeout(r, 600));
-    expect(gone).toEqual([]);
-    back.close();
-    bridge.setTabGoneListener(() => {});
+      // Well past the grace: the tab came back, so it was never gone.
+      await new Promise((r) => setTimeout(r, 600));
+      expect(gone).toEqual([]);
+      back.close();
+      bridge.setTabGoneListener(() => {});
+    })();
   });
 
   it("a tab that stays away IS declared gone, once the grace elapses", async () => {
     const gone: string[] = [];
     bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: 150 });
-    const sock = await connectPanel("tab-really-gone", "wf");
+    const sock = await connectPanel("tab-really-gone", "wf", { tabSessionId: "browser-tab-Z" });
     await vi.waitFor(() =>
       expect(bridge.tabs().some((t) => t.tab_id === "tab-really-gone")).toBe(true),
     );
@@ -3202,6 +3218,79 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
     expect(gone).toEqual([]);
     // …and only after the tab has genuinely stayed away.
     await vi.waitFor(() => expect(gone).toEqual(["tab-really-gone"]), { timeout: 3000 });
+    bridge.setTabGoneListener(() => {});
+  });
+
+  // Coordinator gate: SAME KEY IS NOT THE SAME TAB. A `wf:<hash>` id names a
+  // saved workflow, so a different browser tab opening that workflow takes the
+  // key over. Keyed on the id alone, that stranger's hello cancelled the
+  // departed tab's clock (and satisfied the timer's re-check), so the departed
+  // tab was never declarable gone — and a later result from the stranger could
+  // report and settle the departed tab's lost-answer disclosure as its own.
+  it("a DIFFERENT browser tab taking over the same key does not cancel the departed tab's clock", async () => {
+    const gone: string[] = [];
+    bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: 250 });
+    const tabA = await connectPanel("wf:shared", "wf", { tabSessionId: "browser-tab-A" });
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:shared")).toBe(true));
+
+    // A goes away…
+    tabA.close();
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:shared")).toBe(false));
+    // …and a DIFFERENT browser tab opens the same saved workflow before the grace
+    // elapses, taking over the recurring key.
+    const tabB = await connectPanel("wf:shared", "wf", { tabSessionId: "browser-tab-B" });
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:shared")).toBe(true));
+
+    // A is still gone, and must be declarable so — even though something now
+    // holds its key.
+    await vi.waitFor(() => expect(gone).toEqual(["wf:shared"]), { timeout: 3000 });
+    tabB.close();
+    bridge.setTabGoneListener(() => {});
+  });
+
+  // …and the clocks must be independent. Keyed by tab id alone, the SECOND tab's
+  // departure re-arms over the first tab's pending clock and the first tab is
+  // never declared gone at all — its disclosure stranded for good.
+  it("two incarnations of one key get independent clocks", async () => {
+    const gone: string[] = [];
+    // Long enough that A's clock is DEMONSTRABLY still pending when B leaves —
+    // otherwise A fires on its own and the test would pass even with one shared
+    // slot per tab id.
+    bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: 1200 });
+    const tabA = await connectPanel("wf:two", "wf", { tabSessionId: "browser-tab-A" });
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:two")).toBe(true));
+    tabA.close();
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:two")).toBe(false));
+
+    // B takes the key over, then leaves too — well before A's clock has elapsed.
+    const tabB = await connectPanel("wf:two", "wf", { tabSessionId: "browser-tab-B" });
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:two")).toBe(true));
+    tabB.close();
+    expect(gone).toEqual([]); // neither clock has elapsed yet
+
+    // BOTH departures are declarable: two separate tabs went away.
+    await vi.waitFor(() => expect(gone.filter((t) => t === "wf:two")).toHaveLength(2), {
+      timeout: 6000,
+    });
+    bridge.setTabGoneListener(() => {});
+  });
+
+  it("an unidentified panel cannot prove it came back, so the clock still fires", async () => {
+    const gone: string[] = [];
+    bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: 200 });
+    // No tab_session_id: an old build. Nothing can prove which tab returned, and
+    // unknown-return must let the disclosure surface.
+    const sock = await connectPanel("tab-anonymous", "wf");
+    await vi.waitFor(() =>
+      expect(bridge.tabs().some((t) => t.tab_id === "tab-anonymous")).toBe(true),
+    );
+    sock.close();
+    const back = await connectPanel("tab-anonymous", "wf");
+    await vi.waitFor(() =>
+      expect(bridge.tabs().some((t) => t.tab_id === "tab-anonymous")).toBe(true),
+    );
+    await vi.waitFor(() => expect(gone).toEqual(["tab-anonymous"]), { timeout: 3000 });
+    back.close();
     bridge.setTabGoneListener(() => {});
   });
 
