@@ -1209,7 +1209,17 @@ function expandSingleComponent(
       if (compInput.link == null) continue;
 
       const outerLink = outerLinkMap.get(compInput.link);
-      if (!outerLink) continue;
+      if (!outerLink) {
+        // The slot claims a connection whose link does not exist. The inner
+        // consumers are then treated as unfed and cleared by 8b below, so the
+        // inner nodes silently fall back to their own stored values — the
+        // subgraph-boundary counterpart of a dangling input reference, and just
+        // as invisible unless it is said.
+        warnings.push(
+          `Component "${sg.name}" (node ${compNode.id}): input "${compInput.name}" claims link ${compInput.link}, which does not exist in the graph, so the connection is DROPPED and everything inside fed by that input falls back to its own stored value.`,
+        );
+        continue;
+      }
 
       const srcNodeId = outerLink[1];
       const srcSlot = outerLink[2];

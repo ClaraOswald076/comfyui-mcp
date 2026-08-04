@@ -1118,6 +1118,19 @@ describe("#361 — a subgraph output routed through a Set/Get bus", () => {
     expect(warnings).toEqual([]);
   });
 
+  it("a subgraph input claiming a link that does not exist is reported, not silently cleared", () => {
+    const g = subgraphGraph({
+      proxy: [],
+      values: [],
+      linkWidth: true,
+    }) as unknown as { links: unknown[] };
+    g.links = []; // component input still claims link 200, which is now absent
+    const { workflow, warnings } = convertUiToApi(g as never, OBJECT_INFO);
+    expect(onlyInner(workflow as never).inputs.width).toBe(512); // fell back
+    expect(joined(warnings)).toContain('input "width" claims link 200');
+    expect(joined(warnings)).toContain("falls back to its own stored value");
+  });
+
   it("a connection dropped because its producer left the graph names the node and input", () => {
     // A consumer wired to a node that is not in the prompt used to be reported
     // only as a bare "pruned N dangling reference(s)" count.
