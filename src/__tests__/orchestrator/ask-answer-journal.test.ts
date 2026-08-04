@@ -981,6 +981,11 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     // trades a silent loss for unbounded growth.
     expect(src).toContain("bridge.setTabGoneListener(");
     expect(src).toContain("AskAnswers.retireDebt(");
+    // A different browser tab taking over a recurring key is a conversation
+    // boundary too — the ENTRIES are tab-keyed, so the newcomer must be shut out
+    // of them at the hello, not merely kept from the debt.
+    expect(src).toMatch(/setTabTakenOverListener\(\(tabId\) => AskAnswers\.closeAsks\(tabId\)\)/);
+    expect(src).toContain("AskAnswers.setIncarnationResolver(");
     // The ack must carry WHO is acking, or a switched provider can certify the
     // previous conversation's answer.
     expect(src).toMatch(/AskAnswers\.ack\(token, from\)/);

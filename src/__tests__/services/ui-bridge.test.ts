@@ -3301,6 +3301,68 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
   // identity precisely when its Web Locks lease could not be acquired — i.e.
   // when a duplicate tab copied the sessionStorage id — so the anonymous path
   // IS the two-tabs-one-key case, not an exotic edge.
+  // The ENTRIES are keyed by tab id, not incarnation — so a takeover has to be a
+  // CONVERSATION BOUNDARY, announced at the hello rather than after a grace: the
+  // newcomer must not be able to reach the departed tab's answers at all.
+  it("a takeover by a different browser tab is announced immediately", async () => {
+    const takenOver: Array<[string, string]> = [];
+    bridge.setTabTakenOverListener((tabId, departed) => takenOver.push([tabId, departed]));
+    const tabA = await connectPanel("wf:boundary", "wf", { tabSessionId: "browser-tab-A" });
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:boundary")).toBe(true));
+    expect(takenOver).toEqual([]);
+
+    const tabB = await connectPanel("wf:boundary", "wf", { tabSessionId: "browser-tab-B" });
+    await vi.waitFor(() => expect(takenOver).toHaveLength(1));
+    expect(takenOver[0]).toEqual(["wf:boundary", "browser-tab-A"]);
+    tabA.close();
+    tabB.close();
+    bridge.setTabTakenOverListener(() => {});
+  });
+
+  // The incarnation COMPARISON (rather than merely "was someone here?") is what
+  // this guards: a panel re-hellos on its own live socket — a title change, a
+  // re-registration — with the old connection still in the map. Same occupant,
+  // so its conversation continues and nothing may be retired.
+  it("a re-hello from the SAME tab on a live socket is not a takeover", async () => {
+    const takenOver: string[] = [];
+    bridge.setTabTakenOverListener((tabId) => takenOver.push(tabId));
+    const sock = await connectPanel("wf:rehello", "wf", { tabSessionId: "browser-tab-A" });
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:rehello")).toBe(true));
+
+    // Re-register on the SAME socket, without any disconnect in between.
+    sock.send(
+      JSON.stringify({
+        type: "hello",
+        tab_id: "wf:rehello",
+        title: "renamed",
+        enforces_workflow_stamp: true,
+        enforces_workflow_stamp_at_write: true,
+        tab_session_id: "browser-tab-A",
+      }),
+    );
+    await vi.waitFor(() =>
+      expect(bridge.tabs().some((t) => t.title === "renamed")).toBe(true),
+    );
+    expect(takenOver).toEqual([]);
+    sock.close();
+    bridge.setTabTakenOverListener(() => {});
+  });
+
+  it("an ordinary reload is NOT a takeover", async () => {
+    const takenOver: string[] = [];
+    bridge.setTabTakenOverListener((tabId) => takenOver.push(tabId));
+    const sock = await connectPanel("wf:same", "wf", { tabSessionId: "browser-tab-A" });
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:same")).toBe(true));
+    sock.close();
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:same")).toBe(false));
+    const back = await connectPanel("wf:same", "wf", { tabSessionId: "browser-tab-A" });
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:same")).toBe(true));
+    await new Promise((r) => setTimeout(r, 100));
+    expect(takenOver).toEqual([]); // same occupant — its conversation continues
+    back.close();
+    bridge.setTabTakenOverListener(() => {});
+  });
+
   it("two anonymous departures on one key are both declarable", async () => {
     const gone: string[] = [];
     bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: 1200 });

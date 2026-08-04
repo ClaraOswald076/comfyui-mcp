@@ -2145,6 +2145,12 @@ export async function runPanelOrchestrator(): Promise<void> {
   // warning is owed), so it needs a LIFECYCLE end instead: a tab leaving the
   // bridge's connection map surfaces whatever it is still owed and retires it.
   // Journal entries survive — a disconnect is usually a reload.
+  // #486 — a DIFFERENT browser tab taking over a recurring `wf:<hash>` key is a
+  // CONVERSATION BOUNDARY, exactly like New chat or a provider switch: the
+  // newcomer never asked the previous occupant's questions, so its answers must
+  // stop being recoverable and stop being pushed. closeAsks downgrades and
+  // unsends; it never deletes, so those answers are still reported.
+  bridge.setTabTakenOverListener((tabId) => AskAnswers.closeAsks(tabId));
   bridge.setTabGoneListener((tabId, incarnation) => AskAnswers.retireDebt(tabId, incarnation));
   bridge.setLateAskReplySink((askId, result, tabId) => {
     if (!AskAnswers.tracks(askId)) return;

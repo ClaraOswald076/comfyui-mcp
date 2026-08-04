@@ -933,6 +933,8 @@ export class UiBridge {
   private lateAskSink: ((askId: string, result: unknown, tabId: string) => void) | null = null;
   /** See setTabGoneListener. */
   private onTabGone: ((tabId: string, incarnation: string) => void) | null = null;
+  /** See setTabTakenOverListener. */
+  private onTabTakenOver: ((tabId: string, departed: string) => void) | null = null;
   /**
    * How long a tab must stay away before it counts as GONE rather than
    * reconnecting.
@@ -1448,6 +1450,21 @@ export class UiBridge {
         // be distinct rather than shared.
         const incarnationId = incomingTabSessionId ?? `anon:${++this.nextAnonIncarnation}`;
         this.sockIncarnation.set(sock, { tabId, incarnation: incarnationId });
+        // #486 — A DIFFERENT BROWSER TAB has taken this recurring key over. That is
+        // not a reconnect, it is a change of occupant: the previous tab's
+        // conversation is over, and anything of its still addressed to this key must
+        // stop being answerable BEFORE the newcomer can reach it. Fired here, at the
+        // hello, rather than on the departing socket's grace — a takeover is proof,
+        // so there is nothing to wait for.
+        if (existing && existing.incarnationId !== incarnationId) {
+          try {
+            this.onTabTakenOver?.(tabId, existing.incarnationId);
+          } catch (err) {
+            logger.warn(
+              `[ui-bridge] tab-takeover listener threw for ${tabId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
         this.cancelTabGone(tabId, incarnationId);
         this.conns.set(tabId, {
           sock,
@@ -2047,6 +2064,19 @@ export class UiBridge {
    *  connection map (#486). Lets per-tab bookkeeping that can only ever be
    *  delivered to that tab be surfaced and retired, instead of accumulating for
    *  a tab that may never reconnect. */
+  /**
+   * Notified when a DIFFERENT browser tab takes over a recurring tab key (#486).
+   *
+   * Distinct from the gone-listener, and deliberately immediate: a disconnect
+   * might be a reload, but a takeover is PROOF the previous occupant is done —
+   * something else is holding its key right now. Anything keyed by tab id that
+   * belongs to the departed occupant's CONVERSATION must be retired here, before
+   * the newcomer can reach it.
+   */
+  setTabTakenOverListener(listener: (tabId: string, departed: string) => void): void {
+    this.onTabTakenOver = listener;
+  }
+
   setTabGoneListener(
     listener: (tabId: string, incarnation: string) => void,
     opts: { graceMs?: number } = {},
