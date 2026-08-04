@@ -1340,6 +1340,30 @@ describe("node-management service", () => {
       expect(mockedExec).not.toHaveBeenCalled();
     });
 
+    it("the CLI workspace is pinned with the target across the pre-check await (retarget mid-op)", async () => {
+      mockedExec.mockReturnValue(cliEnvelope({ message: "disabled" }) as never);
+      let listCalls = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname + (new URL(url).search || "");
+          if (path.startsWith("/v2/customnode/installed")) {
+            listCalls++;
+            // A retarget landing between the pre-check and the CLI run must not
+            // move the CLI to a different install.
+            if (listCalls === 1) config.comfyuiPath = "/other/comfy";
+            return jsonResponse(listCalls === 1 ? installedEnabled : installedDisabled);
+          }
+          if (path === "/v2/manager/queue/status") return jsonResponse(drained);
+          return new Response("", { status: 200 });
+        }),
+      );
+      const res = await disableCustomNode({ id: "my-pack", useCmCli: true });
+      expect(res.mechanism).toBe("comfy-cli");
+      const cliArgs = mockedExec.mock.calls[0]?.[1] as string[];
+      expect(cliArgs[cliArgs.indexOf("--workspace") + 1]).toBe(COMFY);
+    });
+
     it("enable queues an enable task keyed by cnr_id and verifies the pack reports enabled", async () => {
       const { calls } = stubChangingList(installedDisabled, installedEnabled);
       const res = await enableCustomNode({ id: "my-pack" });

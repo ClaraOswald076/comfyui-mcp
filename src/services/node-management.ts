@@ -1346,19 +1346,24 @@ export function nonInteractiveGitEnv(): NodeJS.ProcessEnv {
 
 /**
  * Run an official `comfy node` subcommand. Returns normalized JSON data.
- * Throws ProcessControlError if comfyuiPath is undefined (remote mode).
+ * Throws ProcessControlError when no local workspace is available (remote
+ * mode). `workspace` is the CALL-SCOPED local ComfyUI root, captured by the
+ * caller BEFORE its first await — a retarget mid-operation must not send the
+ * CLI at a different install than the pre/post checks described.
  */
-function runCmCli(args: string[]): string {
-  if (!config.comfyuiPath) {
+function runCmCli(args: string[], workspace?: string): string {
+  const ws = workspace ?? config.comfyuiPath;
+  if (!ws) {
     throw new ProcessControlError(
-      "This operation requires a local ComfyUI install. Set COMFYUI_PATH or use the Manager HTTP API.",
+      "This operation requires a local ComfyUI install. Set COMFYUI_PATH or a " +
+        "default workspace (workspace action 'set_default'), or use the Manager HTTP API.",
     );
   }
   logger.info("Running comfy-cli", { args: ["node", ...args].join(" ") });
   try {
     const envelope = assertComfyCliOk(
       runComfyCliSync(["node", ...args], {
-        workspace: config.comfyuiPath,
+        workspace: ws,
         timeoutMs: COMFY_CLI_TIMEOUT,
         env: config.githubToken ? { GITHUB_TOKEN: config.githubToken } : undefined,
       }),
@@ -2039,20 +2044,23 @@ export async function installCustomNode(opts: InstallOptions): Promise<NodeOpRes
 }
 
 /**
- * Why the comfy-cli subprocess path cannot run, or undefined when it can.
- * Probed BEFORE anything is submitted (#808): an explicit useCmCli on a host
- * without a usable CLI must fall back to Manager HTTP, not die with
- * NODE_MANAGEMENT_ERROR after the tool description promised a fallback.
+ * Why the comfy-cli subprocess path cannot run against `workspace`, or
+ * undefined when it can. Probed BEFORE anything is submitted (#808): an
+ * explicit useCmCli on a host without a usable CLI must fall back to Manager
+ * HTTP, not die with NODE_MANAGEMENT_ERROR after the tool description promised
+ * a fallback. `workspace` is the caller's captured local root — COMFYUI_PATH,
+ * an adopted root, or the saved default workspace, which the CLI layer
+ * supports natively (comfy-cli.ts defaultWorkspace).
  */
-function comfyCliUnavailableReason(): string | undefined {
-  if (!config.comfyuiPath) {
-    return "no local ComfyUI install path is set (COMFYUI_PATH), which the comfy-cli subprocess needs";
+function comfyCliUnavailableReason(workspace: string | undefined): string | undefined {
+  if (!workspace) {
+    return "no local ComfyUI install path is available (COMFYUI_PATH unset and no saved default workspace), which the comfy-cli subprocess needs";
   }
-  const executable = resolveComfyCliExecutable({ workspace: config.comfyuiPath });
+  const executable = resolveComfyCliExecutable({ workspace });
   if (!executable) {
     return "comfy-cli was not found on PATH or in the workspace's .venv (install comfy-cli>=1.11.1, set COMFY_CLI_PATH, or install it into the workspace venv)";
   }
-  const version = getComfyCliVersion({ workspace: config.comfyuiPath });
+  const version = getComfyCliVersion({ workspace });
   if (!isSupportedComfyCliVersion(version)) {
     return `comfy-cli >=1.11.1 is required; found ${version ?? "an unrecognized version"}`;
   }
@@ -2088,7 +2096,12 @@ async function installCustomNodeImpl(
   // Keep both the mutation and its post-queue on-disk verification on the
   // target selected for this invocation. Otherwise a panel retarget between
   // them can turn an A-side install into a B-side fabricated success/fallback.
+  // The CLI workspace is pinned the same way: runCmCli reads mutable
+  // config.comfyuiPath when given no workspace, so capture the local root NOW
+  // (COMFYUI_PATH, an adopted root, or the saved default workspace — the CLI
+  // layer supports all three) and pass it down explicitly.
   const managerBase = managerBaseUrl();
+  const cliWorkspace = opts.comfyuiPath ?? resolveEffectiveComfyUIBase();
 
   // #808 — a requested comfy-cli that is not usable is a FALLBACK, not a fatal
   // error: the probe runs before anything is submitted, so dropping to Manager
@@ -2098,11 +2111,11 @@ async function installCustomNodeImpl(
   // disclosed rather than silent.
   let cliFallbackNote: string | undefined;
   if (opts.useCmCli) {
-    const cliProblem = comfyCliUnavailableReason();
+    const cliProblem = comfyCliUnavailableReason(cliWorkspace);
     if (cliProblem === undefined) {
       // cm-cli install accepts registry ids and git urls alike.
       const installId = source === "git" ? gitId : id;
-      const out = runCmCli(["install", installId, "--mode", mode, "--channel", channel]);
+      const out = runCmCli(["install", installId, "--mode", mode, "--channel", channel], cliWorkspace);
       if (source === "git" && gitRef) {
         runGitCheckout(gitId, gitRef, basePath);
       }
@@ -2831,12 +2844,16 @@ async function setCustomNodeEnabled(
   const { id } = opts;
   const op = enable ? "enable" : "disable";
   const base = managerBaseUrl();
+  // Pinned with the target: the CLI must run against the SAME local install
+  // the pre/post checks describe, even if config.comfyuiPath is retargeted
+  // during an await below (codex gate round 5).
+  const cliWorkspace = resolveEffectiveComfyUIBase();
 
   // CLI availability probe FIRST (#808 fallback discipline), but NO subprocess
   // runs yet: the presence pre-check below comes before either mechanism,
   // because a CLI run of an already-satisfied/no-such-pack request reports a
   // pre-existing state as a fresh transition exactly like a queued no-op.
-  const cliProblem = opts.useCmCli ? comfyCliUnavailableReason() : undefined;
+  const cliProblem = opts.useCmCli ? comfyCliUnavailableReason(cliWorkspace) : undefined;
   const useCli = opts.useCmCli === true && cliProblem === undefined;
   let cliFallbackNote: string | undefined;
   if (opts.useCmCli && !useCli) {
@@ -2909,7 +2926,7 @@ async function setCustomNodeEnabled(
 
   if (useCli) {
     const preStateUnknown = presence.state !== "manager-listed";
-    const out = runCmCli([op, id]);
+    const out = runCmCli([op, id], cliWorkspace);
     // comfy-cli's exit is its OWN claim — verify against the Manager list
     // when it can be read rather than reporting the claim as the state.
     const verdict = await readEnabledVerdict(id, enable, base);
@@ -3035,10 +3052,12 @@ export async function uninstallCustomNode(opts: NodeStateOptions): Promise<NodeO
 async function uninstallCustomNodeImpl(opts: NodeStateOptions): Promise<NodeOpResult> {
   const { id } = opts;
   const base = managerBaseUrl();
+  // Pinned with the target, same as in setCustomNodeEnabled (codex gate round 5).
+  const cliWorkspace = resolveEffectiveComfyUIBase();
 
   // CLI availability probe FIRST (#808 fallback discipline) — but nothing runs
   // until the presence pre-check below has answered what there is to remove.
-  const cliProblem = opts.useCmCli ? comfyCliUnavailableReason() : undefined;
+  const cliProblem = opts.useCmCli ? comfyCliUnavailableReason(cliWorkspace) : undefined;
   const useCli = opts.useCmCli === true && cliProblem === undefined;
   let cliFallbackNote: string | undefined;
   if (opts.useCmCli && !useCli) {
@@ -3094,7 +3113,7 @@ async function uninstallCustomNodeImpl(opts: NodeStateOptions): Promise<NodeOpRe
   }
 
   if (useCli) {
-    const out = runCmCli(["uninstall", id]);
+    const out = runCmCli(["uninstall", id], cliWorkspace);
     // comfy-cli's exit is its OWN claim. Verify removal: the Manager installed
     // list when it can be read; otherwise the on-disk directory (a CLI session
     // is a local one, so the disk answers). A pack that is still discoverable
