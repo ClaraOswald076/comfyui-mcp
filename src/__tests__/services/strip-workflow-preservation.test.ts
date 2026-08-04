@@ -86,6 +86,8 @@ describe("#361 — Set/Get bus links", () => {
     return { nodes, links } as never;
   }
 
+  // Guard (not a #361 regression test — the pre-fix converter also resolved this):
+  // the new disclosure must not fire on a graph that loses nothing.
   it("a RESOLVABLE bus still becomes a real link, with nothing reported as lost", () => {
     const { workflow, warnings } = convertUiToApi(busGraph("img", "img"), OBJECT_INFO);
     expect(workflow["3"].inputs.images).toEqual(["1", 0]);
@@ -303,6 +305,28 @@ describe("#361 — cg-use-everywhere broadcast links", () => {
     const { workflow, warnings } = convertUiToApi(g as never, OBJECT_INFO);
     expect(workflow["3"].inputs.images).toBeUndefined();
     expect(joined(warnings)).toContain("the record is stale");
+  });
+
+  it("a controller id now belonging to an ORDINARY node is stale, not wired", () => {
+    // The id survives, but it is no longer a broadcast node — existence alone is
+    // not enough to trust the record.
+    const g = ueGraph(true) as unknown as {
+      extra: { ue_links: { controller: number }[] };
+    };
+    g.extra.ue_links[0].controller = 1; // node 1 is a LoadImage, not a sender
+    const { workflow, warnings } = convertUiToApi(g as never, OBJECT_INFO);
+    expect(workflow["3"].inputs.images).toBeUndefined();
+    expect(joined(warnings)).toContain("no longer a broadcast node");
+  });
+
+  it("an EMPTY computed list is an answer, not an unknown — no warning, no invented link", () => {
+    // The pack analysed the graph and recorded zero broadcasts. Reporting that as
+    // "unrecoverable" would invent a loss that did not happen.
+    const g = ueGraph(true) as unknown as { extra: { ue_links: unknown[] } };
+    g.extra.ue_links = [];
+    const { workflow, warnings } = convertUiToApi(g as never, OBJECT_INFO);
+    expect(workflow["3"].inputs.images).toBeUndefined();
+    expect(warnings).toEqual([]);
   });
 
   it("a record naming an output slot the producer no longer has is stale, not wired", () => {
@@ -563,6 +587,27 @@ describe("#361 — promoted subgraph widget values", () => {
     );
     expect(joined(warnings)).toContain('"not_a_widget"');
     expect(joined(warnings)).toContain("could not be applied");
+  });
+
+  it("a NAME-KEYED widgets_values on the subgraph node is read by promoted-widget name", () => {
+    const g = subgraphGraph({ proxy: [["-1", "width"]], values: [] }) as unknown as {
+      nodes: { id: number; widgets_values: unknown }[];
+    };
+    g.nodes.find((n) => n.id === 706)!.widgets_values = { width: 1920 };
+    const { workflow, warnings } = convertUiToApi(g as never, OBJECT_INFO);
+    expect(onlyInner(workflow as never).inputs.width).toBe(1920);
+    expect(warnings).toEqual([]);
+  });
+
+  it("a name-keyed capture with two promotions of the SAME name refuses both and says why", () => {
+    const g = subgraphGraph({
+      proxy: [["-1", "width"], ["50", "width"]],
+      values: [],
+    }) as unknown as { nodes: { id: number; widgets_values: unknown }[] };
+    g.nodes.find((n) => n.id === 706)!.widgets_values = { width: 1920 };
+    const { workflow, warnings } = convertUiToApi(g as never, OBJECT_INFO);
+    expect(onlyInner(workflow as never).inputs.width).toBe(512); // inner's own value
+    expect(joined(warnings)).toContain("more than one promotion claims that name");
   });
 
   it("a promoted widget with NO serialized value keeps the inner node's own value, silently", () => {

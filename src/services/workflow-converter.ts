@@ -740,7 +740,12 @@ function materializeUeInGraph(
   if (senders.length === 0) return 0;
 
   const ueLinks = extra?.ue_links;
-  if (!Array.isArray(ueLinks) || ueLinks.length === 0) {
+  // An EMPTY computed list is an ANSWER — the pack analysed the graph and found
+  // no broadcast to record — so the stripped graph is faithful and nothing is
+  // reported. Only an ABSENT (or non-array) list is an unknown, and only that is
+  // warned about. Collapsing the two would either invent a loss or hide one.
+  if (Array.isArray(ueLinks) && ueLinks.length === 0) return 0;
+  if (!Array.isArray(ueLinks)) {
     warnings.push(
       `${senders.length} cg-use-everywhere broadcast node(s) (${senders
         .map((s) => `${s.type} #${s.id}`)
@@ -752,6 +757,7 @@ function materializeUeInGraph(
   }
 
   const nodesById = new Map(nodes.map((n) => [n.id, n]));
+  const senderIds = new Set(senders.map((s) => s.id));
   let added = 0;
   for (const raw of ueLinks as UeLinkEntry[]) {
     const dst = nodesById.get(raw?.downstream);
@@ -764,13 +770,13 @@ function materializeUeInGraph(
     }
     const inputLabel = dstInput.name ?? String(raw.downstream_slot);
     if (dstInput.link != null) continue; // real link present — UE would not fire
-    // A record naming a sender that is GONE is left over from a deleted
-    // broadcast; honoring it would fabricate a connection the live graph does not
-    // have. (An older list with no `controller` field says nothing either way, so
-    // it is not treated as stale.)
-    if (raw.controller != null && !nodesById.has(raw.controller)) {
+    // A record whose own broadcast node is GONE — deleted outright, or that id
+    // reused by an ordinary node — is left over; honoring it would fabricate a
+    // connection the live graph does not have. (An older list with no
+    // `controller` field says nothing either way, so it is not treated as stale.)
+    if (raw.controller != null && !senderIds.has(raw.controller)) {
       warnings.push(
-        `A cg-use-everywhere record in ${scope} feeding node ${dst.id} (${dst.type}) input "${inputLabel}" names broadcast node #${raw.controller}, which is no longer in the graph — the record is stale, so that input is left UNCONNECTED rather than wired from a deleted broadcast.`,
+        `A cg-use-everywhere record in ${scope} feeding node ${dst.id} (${dst.type}) input "${inputLabel}" names broadcast node #${raw.controller}, which is no longer a broadcast node in this graph — the record is stale, so that input is left UNCONNECTED rather than wired from a broadcast that no longer exists.`,
       );
       continue;
     }
@@ -1180,7 +1186,28 @@ function expandSingleComponent(
   const proxyWidgets: [string, string][] = Array.isArray(compNode.properties?.proxyWidgets)
     ? (compNode.properties!.proxyWidgets as [string, string][])
     : [];
-  const widgetValues = compNode.widgets_values ?? [];
+  const rawWidgetValues = compNode.widgets_values ?? [];
+  // A subgraph instance normally serializes its promoted values POSITIONALLY,
+  // parallel to proxyWidgets. Some captures key every widget BY NAME instead (the
+  // shape the main converter already accepts). Read both, or a name-keyed capture
+  // would leave every promotion at the inner node's stale value — silently.
+  const widgetValues: unknown[] = Array.isArray(rawWidgetValues) ? rawWidgetValues : [];
+  const wvByName: Record<string, unknown> | null =
+    !Array.isArray(rawWidgetValues) && rawWidgetValues && typeof rawWidgetValues === "object"
+      ? (rawWidgetValues as unknown as Record<string, unknown>)
+      : null;
+  // A flat name→value map can only be attributed when the promoted names are
+  // UNIQUE. Two promotions of the same widget name (from different inner nodes)
+  // share one slot, so the stored value belongs to neither in particular — refuse
+  // both rather than push one control's value onto another.
+  const nameClaims = new Map<string, number>();
+  if (wvByName) {
+    for (const e of proxyWidgets) {
+      if (Array.isArray(e) && e.length >= 2) {
+        nameClaims.set(e[1], (nameClaims.get(e[1]) ?? 0) + 1);
+      }
+    }
+  }
 
   /** Record a promoted value on an inner node BY NAME. A nested subgraph
    *  instance has no object_info of its own, so its promotion is recorded
@@ -1212,7 +1239,17 @@ function expandSingleComponent(
     const entry = proxyWidgets[i];
     if (!Array.isArray(entry) || entry.length < 2) continue;
     const [innerNodeIdStr, widgetName] = entry;
-    const value = i < widgetValues.length ? widgetValues[i] : undefined;
+    if (wvByName && (nameClaims.get(widgetName) ?? 0) > 1) {
+      warnings.push(
+        `Component "${sg.name}" (node ${compNode.id}): promoted widget "${widgetName}" could not be resolved from the name-keyed capture because more than one promotion claims that name, so the single stored value can't be attributed to the right one. Left to the inner node's own value rather than risk assigning another control's.`,
+      );
+      continue;
+    }
+    const value = wvByName
+      ? wvByName[widgetName]
+      : i < widgetValues.length
+        ? widgetValues[i]
+        : undefined;
     if (value === undefined || value === null) continue;
 
     const remapped = nodeRemap.get(Number(innerNodeIdStr));
