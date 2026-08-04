@@ -1616,6 +1616,96 @@ describe("probePortOwner — POSIX (#795: owner attributed from /proc/<pid>/fd)"
     expect(reader.mock.calls.filter((c) => c[0] === "/proc/net/tcp").length).toBe(2);
   });
 
+  it("the SAME PID must still hold the socket, not merely the same inode be listening", async () => {
+    // The bracket has two halves because the finding pairs a pid with a socket.
+    // Re-reading the table proves the INODE is still on the port; it says nothing
+    // about who holds it. An fd can be closed or handed on between the walk and the
+    // re-read, leaving that inode listening under a NEW owner while the pid we return
+    // is a former holder — and that pid is what a stop kills.
+    const { probePortOwner, __portOwnerTestHooks } = await loadProbe();
+    mockExecSync.mockReturnValue("");
+    __portOwnerTestHooks.setProcNetReader((t) =>
+      t === "/proc/net/tcp" ? v4Table([{ port: 8188, inode: "54321" }]) : emptyV6,
+    );
+    // The first walk finds 4321 holding it; by the re-check it has let it go.
+    let walks = 0;
+    const tree: Record<number, Record<string, string>> = {
+      4321: { "0": "socket:[54321]" },
+    };
+    const walker = fdReader(tree);
+    __portOwnerTestHooks.setProcFdReader({
+      ...walker,
+      listFds: (pid) => {
+        walks++;
+        // The attribution walk sees the fd; the re-check does not.
+        if (walks > 1) tree[4321] = { "0": "/dev/null" };
+        return walker.listFds(pid);
+      },
+    });
+
+    const probe = probePortOwner(8188);
+    expect(probe.state).toBe("unknown");
+    expect(probe).not.toMatchObject({ pid: 4321 });
+    expect(probe).toMatchObject({
+      reason: expect.stringMatching(/no longer holds the socket/i),
+    });
+  });
+
+  it("a pid that EXITED before the re-check is a definite negative, not a blind spot", async () => {
+    // The reason is what distinguishes these, since both refuse: a process that no
+    // longer exists definitively does not hold the socket, whereas a permission wall
+    // means we could not look. Collapsing the first into the second would report a
+    // blind spot to a user whose evidence was actually complete.
+    const { probePortOwner, __portOwnerTestHooks } = await loadProbe();
+    mockExecSync.mockReturnValue("");
+    __portOwnerTestHooks.setProcNetReader((t) =>
+      t === "/proc/net/tcp" ? v4Table([{ port: 8188, inode: "54321" }]) : emptyV6,
+    );
+    let walks = 0;
+    const walker = fdReader({ 4321: { "0": "socket:[54321]" } });
+    __portOwnerTestHooks.setProcFdReader({
+      ...walker,
+      listFds: (pid) => {
+        walks++;
+        // The process is gone by the time we re-check.
+        if (walks > 1) throw enoent();
+        return walker.listFds(pid);
+      },
+    });
+
+    const probe = probePortOwner(8188);
+    expect(probe.state).toBe("unknown");
+    expect(probe).toMatchObject({
+      reason: expect.stringMatching(/no longer holds the socket/i),
+    });
+  });
+
+  it("a re-check that cannot be performed does not confirm ownership either", async () => {
+    // A permission wall on the re-read is "I could not look", and an unverified
+    // pairing must not be spent as a verified one.
+    const { probePortOwner, __portOwnerTestHooks } = await loadProbe();
+    mockExecSync.mockReturnValue("");
+    __portOwnerTestHooks.setProcNetReader((t) =>
+      t === "/proc/net/tcp" ? v4Table([{ port: 8188, inode: "54321" }]) : emptyV6,
+    );
+    let walks = 0;
+    const walker = fdReader({ 4321: { "0": "socket:[54321]" } });
+    __portOwnerTestHooks.setProcFdReader({
+      ...walker,
+      listFds: (pid) => {
+        walks++;
+        if (walks > 1) throw eacces();
+        return walker.listFds(pid);
+      },
+    });
+
+    const probe = probePortOwner(8188);
+    expect(probe.state).toBe("unknown");
+    expect(probe).toMatchObject({
+      reason: expect.stringMatching(/could not be re-checked/i),
+    });
+  });
+
   it("a single readable holder is named even when another process could not be read", async () => {
     // A DELIBERATE asymmetry, stated so it is reviewed rather than assumed. Requiring
     // a complete /proc walk would make attribution impossible on any multi-user host

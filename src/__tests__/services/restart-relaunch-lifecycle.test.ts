@@ -124,6 +124,7 @@ vi.mock("../../services/workspace-env.js", () => ({
 
 import {
   __processControlTestHooks,
+  preflightLocalRestart,
   restartComfyUI,
   startComfyUI,
   stopComfyUI,
@@ -231,7 +232,7 @@ describe("classifyDesktopSupervision — is anything going to start this again? 
   }
 
   it("a live Desktop shell directly above the server is SUPERVISED", () => {
-    const verdict = classifyDesktopSupervision(
+    const { verdict } = classifyDesktopSupervision(
       tree({ 500: { parent: 300 }, 300: { cmd: DESKTOP_SHELL, parent: 100 } }),
     );
     expect(verdict).toBe("supervised");
@@ -244,7 +245,7 @@ describe("classifyDesktopSupervision — is anything going to start this again? 
     // tree root, so an ordinary live Desktop would come back `abandoned` and the one
     // recovery path left to that user would be refused — precisely when they already
     // have no working ComfyUI.
-    const verdict = classifyDesktopSupervision(
+    const { verdict } = classifyDesktopSupervision(
       tree({
         500: { cmd: DESKTOP_SHELL, started: "1000", parent: 400 },
         400: { cmd: "explorer.exe", started: "10", parent: 1 },
@@ -257,7 +258,7 @@ describe("classifyDesktopSupervision — is anything going to start this again? 
     // A launcher shim between the shell and python is ordinary. Stopping at the
     // first non-supervisor would report every wrapped Desktop install abandoned and
     // deny those users a restart that works.
-    const verdict = classifyDesktopSupervision(
+    const { verdict } = classifyDesktopSupervision(
       tree({
         500: { parent: 400 },
         400: { cmd: "cmd.exe /c launch.bat", parent: 300 },
@@ -270,7 +271,7 @@ describe("classifyDesktopSupervision — is anything going to start this again? 
   it("THE #814 SHAPE: the supervisor's pid is provably vacant → ABANDONED", () => {
     // The Desktop shell that spawned this server has exited. A Manager reboot stops
     // the process and there is nobody left to start it again.
-    const verdict = classifyDesktopSupervision(
+    const { verdict } = classifyDesktopSupervision(
       tree({ 500: { parent: 300 }, 300: { cmd: DESKTOP_SHELL } }, { vanished: [300] }),
     );
     expect(verdict).toBe("abandoned");
@@ -278,12 +279,12 @@ describe("classifyDesktopSupervision — is anything going to start this again? 
 
   it("a process reparented to init is ABANDONED", () => {
     // On POSIX the reparenting IS the record that whoever spawned it has gone.
-    const verdict = classifyDesktopSupervision(tree({ 500: { parent: 1 } }));
+    const { verdict } = classifyDesktopSupervision(tree({ 500: { parent: 1 } }));
     expect(verdict).toBe("abandoned");
   });
 
   it("a readable chain to the tree top with no supervisor on it is ABANDONED", () => {
-    const verdict = classifyDesktopSupervision(
+    const { verdict } = classifyDesktopSupervision(
       tree({
         500: { parent: 400 },
         400: { cmd: "explorer.exe", parent: 200 },
@@ -297,7 +298,7 @@ describe("classifyDesktopSupervision — is anything going to start this again? 
     // Refusing on missing evidence would take the Desktop restart away from every
     // host whose process tree cannot be read, which is the far more common and far
     // more damaging failure. Only a positive finding refuses.
-    const verdict = classifyDesktopSupervision(tree({ 500: {} }));
+    const { verdict } = classifyDesktopSupervision(tree({ 500: {} }));
     expect(verdict).toBe("unconfirmed");
   });
 
@@ -307,7 +308,7 @@ describe("classifyDesktopSupervision — is anything going to start this again? 
     // its number to ANOTHER Comfy Desktop.exe (the user restarted the app), and that
     // new shell has never heard of this backend. Causality catches it — a parent
     // cannot have started after its child.
-    const verdict = classifyDesktopSupervision(
+    const { verdict } = classifyDesktopSupervision(
       tree({
         500: { parent: 300, started: "1000" },
         300: { cmd: DESKTOP_SHELL, started: "5000" }, // started AFTER its "child"
@@ -318,7 +319,7 @@ describe("classifyDesktopSupervision — is anything going to start this again? 
 
   it("a supervisor that genuinely predates the server is still SUPERVISED", () => {
     // The control for the causality check: an ordinary tree must not be broken by it.
-    const verdict = classifyDesktopSupervision(
+    const { verdict } = classifyDesktopSupervision(
       tree({
         500: { parent: 300, started: "5000" },
         300: { cmd: DESKTOP_SHELL, started: "1000" },
@@ -331,7 +332,7 @@ describe("classifyDesktopSupervision — is anything going to start this again? 
     // Without a way to check the link, "that pid exists and looks like a shell" is
     // not evidence it is THIS server's shell. Unconfirmed still proceeds, so this
     // costs a restart nothing on a host with no readable start times.
-    const verdict = classifyDesktopSupervision(
+    const { verdict } = classifyDesktopSupervision(
       tree({ 500: { parent: 300 }, 300: { cmd: DESKTOP_SHELL } }, { noStamps: true }),
     );
     expect(verdict).toBe("unconfirmed");
@@ -341,7 +342,7 @@ describe("classifyDesktopSupervision — is anything going to start this again? 
     // Pids are recycled: something holding that number is not evidence that a
     // supervisor does. This is the other direction of the same rule — an
     // unidentifiable parent must not license the stop either.
-    const verdict = classifyDesktopSupervision(tree({ 500: { parent: 300 }, 300: {} }));
+    const { verdict } = classifyDesktopSupervision(tree({ 500: { parent: 300 }, 300: {} }));
     expect(verdict).toBe("unconfirmed");
   });
 
@@ -351,21 +352,21 @@ describe("classifyDesktopSupervision — is anything going to start this again? 
     // restart on the strength of a process we never identified. The stamp is
     // readable, so only the identity is missing — which is exactly the case that
     // must not be mistaken for evidence.
-    const verdict = classifyDesktopSupervision(
+    const { verdict } = classifyDesktopSupervision(
       tree({ 500: { started: "5000", parent: 300 }, 300: { started: "1000", parent: 1 } }),
     );
     expect(verdict).toBe("unconfirmed");
   });
 
   it("a parent whose existence cannot be established is unconfirmed", () => {
-    const verdict = classifyDesktopSupervision(
+    const { verdict } = classifyDesktopSupervision(
       tree({ 500: { parent: 300 }, 300: { cmd: DESKTOP_SHELL } }, { unknownExistence: [300] }),
     );
     expect(verdict).toBe("unconfirmed");
   });
 
   it("a self-parenting reading is damage, not a tree root", () => {
-    const verdict = classifyDesktopSupervision(tree({ 500: { parent: 500 } }));
+    const { verdict } = classifyDesktopSupervision(tree({ 500: { parent: 500 } }));
     expect(verdict).toBe("unconfirmed");
   });
 
@@ -377,7 +378,7 @@ describe("classifyDesktopSupervision — is anything going to start this again? 
     for (let pid = 500; pid < 600; pid++) {
       nodes[pid] = { parent: pid + 1, cmd: "wrapper", started: String(2000 - pid) };
     }
-    const verdict = classifyDesktopSupervision(tree(nodes));
+    const { verdict } = classifyDesktopSupervision(tree(nodes));
     expect(verdict).toBe("unconfirmed");
   });
 
@@ -801,7 +802,11 @@ describe("restart_comfyui — a Desktop reboot needs a supervisor that is actual
       if (pid === 4321) return { startedAt: "5000", parentPid: 300 };
       if (pid === 300) {
         return {
-          commandLine: "C:\\Program Files\\Comfy Desktop\\Comfy Desktop.exe",
+          // As Windows really reports it: a path with spaces is QUOTED, and
+          // ExecutablePath is supplied alongside — which is what actually decides.
+          commandLine: '"C:\\Program Files\\Comfy Desktop\\Comfy Desktop.exe"',
+          argv: ["C:\\Program Files\\Comfy Desktop\\Comfy Desktop.exe"],
+          executablePath: "C:\\Program Files\\Comfy Desktop\\Comfy Desktop.exe",
           startedAt: "2000",
         };
       }
@@ -1018,6 +1023,140 @@ describe("restart_comfyui — a Desktop reboot needs a supervisor that is actual
     expect(fetchSpy).toHaveBeenCalled();
   });
 
+  it("a shim living INSIDE the bundle is not the bundle's shell", async () => {
+    // The accidental sibling of the two forgeries the gate already caught. Accepting
+    // any binary under `Contents/MacOS/` meant a launcher script or venv python that
+    // happens to live inside the app bundle was read as the Electron shell — and a
+    // shim re-execs nothing, so the reboot would stop a server nothing restarts. The
+    // bundle's MAIN binary is named after the bundle; a shim is not.
+    desktopServer();
+    __processControlTestHooks.setProcessIdentityResolver((pid) => {
+      if (pid === 4321) return { startedAt: "5000", parentPid: 300 };
+      if (pid === 300) {
+        return {
+          commandLine:
+            "/Applications/Comfy Desktop.app/Contents/MacOS/python launch.py --port 8188",
+          startedAt: "2000",
+          parentPid: 1,
+        };
+      }
+      return undefined;
+    });
+    __processControlTestHooks.setParentPidResolver((pid) => {
+      if (pid === 4321) return 300;
+      if (pid === 300) return 1;
+      return undefined;
+    });
+    __processControlTestHooks.setProcessExistsProbe(() => true);
+    const fetchSpy = vi.fn(async () => ({ ok: true }) as Response);
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const result = await restartComfyUI();
+
+    expect(result.message).toMatch(/refusing to restart/i);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(killWasIssued()).toBe(false);
+  });
+
+  it("a shim inside the bundle is rejected on the AUTHENTICATED path too", async () => {
+    // The same rule has to hold wherever the executable comes from. Here the OS names
+    // the binary outright — and it is a python living in the bundle's MacOS dir, not
+    // the bundle's own binary. A check that accepted any path through
+    // `Contents/MacOS/` would call it the shell on the strength of authenticated
+    // evidence, which is worse than doing it on a guess.
+    desktopServer();
+    __processControlTestHooks.setProcessIdentityResolver((pid) => {
+      if (pid === 4321) return { startedAt: "5000", parentPid: 300 };
+      if (pid === 300) {
+        return {
+          commandLine: "(unreadable)",
+          executablePath: "/Applications/Comfy Desktop.app/Contents/MacOS/python",
+          startedAt: "2000",
+          parentPid: 1,
+        };
+      }
+      return undefined;
+    });
+    __processControlTestHooks.setParentPidResolver((pid) => {
+      if (pid === 4321) return 300;
+      if (pid === 300) return 1;
+      return undefined;
+    });
+    __processControlTestHooks.setProcessExistsProbe(() => true);
+    const fetchSpy = vi.fn(async () => ({ ok: true }) as Response);
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const result = await restartComfyUI();
+
+    expect(result.message).toMatch(/no Desktop app is still supervising it/i);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("the bundle's OWN binary on the authenticated path IS the shell", async () => {
+    // The control for the two rejections above: the real thing must still be
+    // recognised, or macOS Desktop users lose the restart entirely.
+    desktopServer();
+    __processControlTestHooks.setProcessIdentityResolver((pid) => {
+      if (pid === 4321) return { startedAt: "5000", parentPid: 300 };
+      if (pid === 300) {
+        return {
+          commandLine: "(unreadable)",
+          executablePath:
+            "/Applications/Comfy Desktop.app/Contents/MacOS/Comfy Desktop",
+          startedAt: "2000",
+          parentPid: 1,
+        };
+      }
+      return undefined;
+    });
+    __processControlTestHooks.setParentPidResolver((pid) => {
+      if (pid === 4321) return 300;
+      if (pid === 300) return 1;
+      return undefined;
+    });
+    __processControlTestHooks.setProcessExistsProbe(() => true);
+    const fetchSpy = vi.fn(async () => ({ ok: true, status: 200 }) as Response);
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const result = await restartComfyUI();
+
+    expect(result.message).not.toMatch(/refusing to restart/i);
+    expect(fetchSpy).toHaveBeenCalled();
+  });
+
+  it("an Electron HELPER inside the bundle is not the shell either", async () => {
+    // Helpers live at `<App>.app/Contents/Frameworks/<Helper>.app/Contents/MacOS/…`,
+    // so the bundle naming the path is not the one followed by `Contents/MacOS`. They
+    // are excluded structurally rather than by a name blocklist.
+    desktopServer();
+    __processControlTestHooks.setProcessIdentityResolver((pid) => {
+      if (pid === 4321) return { startedAt: "5000", parentPid: 300 };
+      if (pid === 300) {
+        return {
+          commandLine:
+            "/Applications/Comfy Desktop.app/Contents/Frameworks/Comfy Desktop Helper.app" +
+            "/Contents/MacOS/Comfy Desktop Helper --type=renderer",
+          startedAt: "2000",
+          parentPid: 1,
+        };
+      }
+      return undefined;
+    });
+    __processControlTestHooks.setParentPidResolver((pid) => {
+      if (pid === 4321) return 300;
+      if (pid === 300) return 1;
+      return undefined;
+    });
+    __processControlTestHooks.setProcessExistsProbe(() => true);
+    const fetchSpy = vi.fn(async () => ({ ok: true }) as Response);
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const result = await restartComfyUI();
+
+    expect(result.message).toMatch(/refusing to restart/i);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
   it("a WRAPPER that merely mentions the Desktop install is not a supervisor", async () => {
     // A Desktop BACKEND identifies itself by carrying `--extra-model-paths-config
     // …/Comfy Desktop/…`. Testing a candidate supervisor with that same rule would
@@ -1055,12 +1194,56 @@ describe("restart_comfyui — a Desktop reboot needs a supervisor that is actual
     expect(killWasIssued()).toBe(false);
   });
 
-  it("an UNREADABLE process tree still proceeds — uncertainty is not a refusal", async () => {
-    // Refusing here would break the Desktop restart on every host where the parent
-    // chain cannot be read. Only the proven-abandoned shape refuses.
+  it("an UNREADABLE process tree REFUSES the reboot, and names what it could not establish", async () => {
+    // THE POLICY, and it is the inverse of the one that governs `listener_ownership`.
+    //
+    // There, `unconfirmed` keeps `started: true` because the launch has ALREADY
+    // HAPPENED and only its description is uncertain — denying it would turn an
+    // uncertain description into a false one, so uncertainty is DISCLOSED.
+    //
+    // A reboot has NOT happened yet and cannot be undone. "I could not establish that
+    // anything will restart this" is uncertainty about whether the user still has a
+    // ComfyUI afterwards, so it is REFUSED. Refuse before, disclose after.
+    //
+    // The chain here is exactly the dangerous shape: a Desktop parent that HAS
+    // departed, on a host where the probe cannot say so. Proceeding would stop an
+    // orphaned backend that nothing relaunches — #814 recurring through a gap in the
+    // evidence rather than through a gap in the check.
     desktopServer();
     __processControlTestHooks.setProcessIdentityResolver((pid) =>
-      pid === 4321 ? { startedAt: "stable-stamp" } : undefined,
+      pid === 4321 ? { startedAt: "5000", parentPid: 300 } : undefined,
+    );
+    __processControlTestHooks.setParentPidResolver((pid) => (pid === 4321 ? 300 : undefined));
+    // The parent is gone, but this host cannot establish that either way.
+    __processControlTestHooks.setProcessExistsProbe(() => undefined);
+    const fetchSpy = vi.fn(async () => ({ ok: true, status: 200 }) as Response);
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const result = await restartComfyUI();
+
+    expect(result.stopped).toBe(false);
+    expect(result.started).toBe(false);
+    expect(result.message).toMatch(/refusing to restart/i);
+    // The refusal SAYS what it failed to establish — a bare "unconfirmed" would leave
+    // the user with nothing to act on.
+    expect(result.message).toMatch(
+      /could not be established whether PID 300 .* is still running/i,
+    );
+    expect(result.message).toMatch(/still running \(not stopped\)|left running/i);
+    // CRITICAL: nothing was dispatched and nothing was killed.
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(killWasIssued()).toBe(false);
+  });
+
+  it("#400 is not disturbed: the refusal leaves the server RUNNING, it never kills it", async () => {
+    // The claim this policy had to be separated from. #400 established that a Desktop
+    // process must never be KILLED locally, because respawning the exe does not
+    // reliably bring the listener back. Refusing an unverified Manager stop does not
+    // touch that: the server stays up and the user is pointed at the app that
+    // restarts it reliably.
+    desktopServer();
+    __processControlTestHooks.setProcessIdentityResolver((pid) =>
+      pid === 4321 ? { startedAt: "5000" } : undefined,
     );
     __processControlTestHooks.setParentPidResolver(() => undefined);
     const fetchSpy = vi.fn(async () => ({ ok: true, status: 200 }) as Response);
@@ -1068,8 +1251,10 @@ describe("restart_comfyui — a Desktop reboot needs a supervisor that is actual
 
     const result = await restartComfyUI();
 
-    expect(result.message).not.toMatch(/refusing to restart/i);
-    expect(fetchSpy).toHaveBeenCalled();
+    expect(result.message).toMatch(/refusing to restart/i);
+    expect(result.message).toMatch(/Restart it from the ComfyUI Desktop app/i);
+    expect(killWasIssued()).toBe(false);
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 
   it("a wedged DESKTOP instance is recognised from the OS command line and never killed", async () => {
@@ -1099,5 +1284,53 @@ describe("restart_comfyui — a Desktop reboot needs a supervisor that is actual
     // than the kill+relaunch path.
     expect(result.message).toMatch(/no Desktop app is still supervising it/i);
     expect(killWasIssued()).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The out-of-band preflight — the door beside the gate
+// ---------------------------------------------------------------------------
+
+describe("preflightLocalRestart — an instance we cannot identify is not a pass", () => {
+  it("REFUSES when the local ComfyUI cannot be resolved at all", async () => {
+    // The widened gate had a door beside it: a local instance whose listener cannot
+    // be attributed — a container with no `lsof`, a permission wall, no `/proc` —
+    // resolves to NOTHING here, and `!info` returned ok:true. The preflight
+    // "assessed" it, passed, and the Manager reboot went out without anyone having
+    // checked whether a supervisor was still there: the container/permission form of
+    // the same #814 loss.
+    //
+    // Modelled as probes that cannot RUN (which is "I could not look") and a server
+    // that does not answer.
+    mockGetSystemStats.mockRejectedValue(new Error("fetch failed"));
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/netstat|lsof|tasklist|pgrep|powershell/i.test(String(cmd))) {
+        throw new Error("command not found");
+      }
+      return "";
+    });
+
+    const result = await preflightLocalRestart();
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/could not be identified/i);
+    // It says what it could not establish rather than asserting something is wrong.
+    expect(result.reason).toMatch(/could not be established that stopping it/i);
+  });
+
+  it("still PASSES a non-Desktop instance whose relaunch is validated", async () => {
+    // The control: the refusal must be about missing evidence, not a blanket denial.
+    // A reachable install with a resolvable launch command proceeds exactly as before.
+    mockGetSystemStats.mockResolvedValue({
+      system: { argv: [ABS_MAIN, "--port", "8188"] },
+    });
+    mockLivePortThenFree();
+    __processControlTestHooks.setProcessIdentityResolver(() => ({
+      startedAt: "stable-stamp",
+    }));
+
+    const result = await preflightLocalRestart();
+
+    expect(result.ok).toBe(true);
   });
 });

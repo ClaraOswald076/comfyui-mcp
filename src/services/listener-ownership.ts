@@ -75,6 +75,20 @@ export function unclassifiedSupervision(): SupervisorRelaunch {
   return "unconfirmed" as SupervisorRelaunch;
 }
 
+/**
+ * The verdict AND what stopped the walk from reaching a definite one.
+ *
+ * `because` exists because `unconfirmed` now REFUSES a reboot rather than allowing
+ * it, and a refusal that cannot say what it failed to establish is not actionable:
+ * "could not read the parent of PID 4321" tells a user (and a maintainer) something
+ * a bare "unconfirmed" does not. Only populated for `unconfirmed` — the two definite
+ * verdicts describe themselves.
+ */
+export interface SupervisionAssessment {
+  verdict: SupervisorRelaunch;
+  because?: string;
+}
+
 export interface SupervisionEvidence {
   /** The process that would be stopped — the one holding ComfyUI's port. */
   pid: number;
@@ -160,8 +174,11 @@ export function compareStartTimes(
  *                  none of them a supervisor. Positive too — this is the #814 shape,
  *                  and it is what refuses a stop.
  *   `unconfirmed`— the chain became unreadable, a pid could not be probed, or the hop
- *                  budget ran out. NOT an answer in either direction: it neither
- *                  licenses the stop by itself nor denies the user a restart.
+ *                  budget ran out. NOT an answer in either direction — and note that
+ *                  it is the CALLER that decides what to do with it. For a reboot,
+ *                  which is irreversible and has not happened yet, the caller refuses:
+ *                  see assessDesktopSupervision. Each such outcome carries `because`,
+ *                  so a refusal can name what it failed to establish.
  *
  * The hop budget is small on purpose. A Desktop backend sits one or two levels under
  * its shell; a chain longer than that is not a layout we can reason about, and
@@ -170,7 +187,14 @@ export function compareStartTimes(
 export function classifyDesktopSupervision(
   input: SupervisionEvidence,
   maxHops = 8,
-): SupervisorRelaunch {
+): SupervisionAssessment {
+  const unconfirmed = (because: string): SupervisionAssessment => ({
+    verdict: classifiedSupervision("unconfirmed"),
+    because,
+  });
+  const definite = (v: "supervised" | "abandoned"): SupervisionAssessment => ({
+    verdict: classifiedSupervision(v),
+  });
   const self = input.readIdentity(input.pid);
   // THE PROCESS MAY BE THE SUPERVISOR ITSELF. When ComfyUI is unreachable and its
   // port cannot be attributed, the caller falls back to the Desktop shell's own pid —
@@ -180,27 +204,25 @@ export function classifyDesktopSupervision(
   // user refused, exactly when they already have no working ComfyUI (codex gate
   // round 7). A live shell supervises its own backend; there is nothing above it to
   // look for.
-  if (self && input.isSupervisorProcess(self)) {
-    return classifiedSupervision("supervised");
-  }
+  if (self && input.isSupervisorProcess(self)) return definite("supervised");
   let current = input.pid;
   let currentStartedAt = self?.startedAt;
   for (let hop = 0; hop < maxHops; hop++) {
     const parent = input.readParentPid(current);
     // The chain stopped being readable. Nothing was learned in either direction.
-    if (parent == null) return classifiedSupervision("unconfirmed");
+    if (parent == null) return unconfirmed(`the parent process of PID ${current} could not be read`);
     // A process cannot be its own parent; that reading is damage, not a tree root.
-    if (parent === current) return classifiedSupervision("unconfirmed");
+    if (parent === current) return unconfirmed(`PID ${current} was reported as its own parent, which is not a tree this can be read from`);
     // The TOP of the tree, reached without passing a supervisor. On POSIX an
     // orphan is reparented to init (1) — that reparenting is itself the record
     // that whoever spawned it has gone.
-    if (parent <= 1) return classifiedSupervision("abandoned");
+    if (parent <= 1) return definite("abandoned");
     const alive = input.processExists(parent);
     // THE #814 SIGNAL: the parent's number is vacant, so the shell that spawned this
     // server has exited. Nothing is left to act on a reboot request.
-    if (alive === false) return classifiedSupervision("abandoned");
+    if (alive === false) return definite("abandoned");
     // Exists, but we could not establish that — do not spend it either way.
-    if (alive !== true) return classifiedSupervision("unconfirmed");
+    if (alive !== true) return unconfirmed(`it could not be established whether PID ${parent} (the parent of PID ${current}) is still running`);
     const identity = input.readIdentity(parent);
     // Something holds that number and we cannot see WHAT it is. A pid can be
     // RECYCLED, so "a process exists there" is not evidence a supervisor does.
@@ -212,7 +234,7 @@ export function classifyDesktopSupervision(
     // authenticated evidence that exists precisely to settle this question would
     // never be consulted (codex gate round 4).
     if (!identity || (!identity.commandLine && !identity.executablePath)) {
-      return classifiedSupervision("unconfirmed");
+      return unconfirmed(`PID ${parent} (the parent of PID ${current}) exists but what it is running could not be read`);
     }
     // IS THIS REALLY THE PARENT, or just whoever holds that number now? A pid
     // recorded in a child's record outlives the process that earned it, and the
@@ -221,19 +243,24 @@ export function classifyDesktopSupervision(
     // The process at that number started AFTER its supposed child, so the real
     // parent has exited — which is what made the number reusable. That is positive
     // evidence the supervisor is gone.
-    if (order === "parent-newer") return classifiedSupervision("abandoned");
+    if (order === "parent-newer") return definite("abandoned");
     // No usable stamps on one side or the other: the link is unverified, so nothing
-    // built on it may be claimed. Costs a Desktop restart nothing — `unconfirmed`
-    // proceeds.
-    if (order === "unknown") return classifiedSupervision("unconfirmed");
-    if (input.isSupervisorProcess(identity)) {
-      return classifiedSupervision("supervised");
+    // built on it may be claimed.
+    if (order === "unknown") {
+      return unconfirmed(
+        `PID ${parent} could not be confirmed as the parent of PID ${current} — the process ` +
+          `start times needed to rule out a reused PID could not be compared`,
+      );
     }
+    if (input.isSupervisorProcess(identity)) return definite("supervised");
     current = parent;
     currentStartedAt = identity.startedAt;
   }
   // Ran out of hops: did not finish looking.
-  return classifiedSupervision("unconfirmed");
+  return unconfirmed(
+    `no Desktop supervisor was found within ${maxHops} levels above PID ${input.pid}, and the ` +
+      `walk ran out before reaching the top of the process tree`,
+  );
 }
 
 // ---------------------------------------------------------------------------

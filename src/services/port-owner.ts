@@ -204,6 +204,33 @@ type LsofAbsence = "stated" | "inconclusive" | "silent";
 const LSOF_INCONCLUSIVE_REASON =
   "lsof reported nothing listening on the port but also reported that it could not enumerate everything, so its search describes only what it could see";
 
+/**
+ * THE ONLY WAY THIS MODULE MAY RUN `lsof`.
+ *
+ * Invariant 4 — lsof must STATE absence (`-V`); silence is not evidence — is a
+ * property of the COMMAND, and a rule that lives in a comment survives only as long
+ * as everyone remembers it at the next call site. A quiet `lsof` without `-V` exits 1
+ * with empty stdout AND stderr whether it searched and found nothing or could not
+ * search at all, so a second invocation that omitted the flag would hand a caller a
+ * `free` verdict for a live port. Building the argument list HERE, once, is what
+ * makes the invariant structural: there is no other place to get an lsof result from,
+ * and a future call site inherits `-V` whether or not its author knew to ask for it.
+ *
+ * `2>&1` for the matching reason: lsof reports an INCOMPLETE enumeration on stderr,
+ * and on the success path `execSync` returns stdout ONLY — so without the redirect a
+ * marker on stdout beside a warning on stderr reads as a clean absence and certifies
+ * a release from a search that admitted it was partial. The error path already sees
+ * both streams; this makes the success path see what the error path sees. Warnings do
+ * not disturb the field parser, which keys on `p`/`n` line prefixes, so a host whose
+ * lsof warns routinely loses only the fast path — a wait, never a wrong answer.
+ */
+function runLsofListenerQuery(port: number): string {
+  return execSync(`lsof -V -nP -iTCP:${port} -sTCP:LISTEN -Fpn 2>&1`, {
+    encoding: "utf-8",
+    timeout: 5000,
+  });
+}
+
 function readLsofAbsence(output: string): LsofAbsence {
   if (!/internet address not located/i.test(output)) return "silent";
   return admitsIncompleteEnumeration(output) ? "inconclusive" : "stated";
@@ -757,6 +784,35 @@ function pidVanished(err: unknown): boolean {
   return code === "ENOENT" || code === "ESRCH";
 }
 
+/**
+ * Does `pid` STILL hold `inode`? Tri-state — `undefined` when we could not look.
+ *
+ * The closing half of the bracket. Re-reading the socket table proves the INODE is
+ * still on the port; it says nothing about whether the pid we named still holds it.
+ * An fd can be closed (or passed on) between the walk and the re-read, leaving the
+ * same inode listening under a different owner while we return the former one as
+ * `owned` — and that pid is what a stop kills (coordinator gate).
+ */
+function pidStillHoldsInode(pid: number, inode: string): boolean | undefined {
+  const wanted = `socket:[${inode}]`;
+  let fds: string[];
+  try {
+    fds = procFdReader.listFds(pid);
+  } catch (err) {
+    // The process is gone: it is definitively not holding the socket any more.
+    return pidVanished(err) ? false : undefined;
+  }
+  for (const fd of fds) {
+    try {
+      if (procFdReader.readFdLink(pid, fd) === wanted) return true;
+    } catch (err) {
+      // One fd closing mid-scan is ordinary; a permission wall means we cannot say.
+      if (!pidVanished(err)) return undefined;
+    }
+  }
+  return false;
+}
+
 function attributeInodes(inodes: string[], port: number): ProcAttribution {
   const wanted = new Map(inodes.map((inode) => [`socket:[${inode}]`, inode]));
   let pids: number[];
@@ -895,15 +951,30 @@ export function probePortOwner(port: number, host?: string): PortOwnerProbe {
       // /system_stats pairing: carry something across two observations that a
       // substitution cannot reproduce.
       const after = readKernelSocketTables(port, host);
-      // The SPECIFIC inode the fd walk matched — not merely "one of the ones we
-      // started with". A different listener arriving on the port is exactly the
-      // substitution being guarded against.
-      if (after.inodes.includes(attributed.inode)) {
+      // BOTH HALVES of the pairing have to survive, because the finding is about a
+      // pid AND a socket:
+      //   • the SPECIFIC inode the fd walk matched must still be listening on the
+      //     port — not merely "some listener is there", which a replacement socket
+      //     would satisfy;
+      //   • and the pid must STILL hold it. Confirming only the inode leaves the
+      //     other substitution open: the fd is closed or handed on, the same inode is
+      //     on the port under a new owner, and the pid we return is a former holder
+      //     (coordinator gate). That pid is what a stop kills.
+      const stillListening = after.inodes.includes(attributed.inode);
+      const stillHeld = stillListening
+        ? pidStillHoldsInode(attributed.pid, attributed.inode)
+        : false;
+      if (stillListening && stillHeld === true) {
         return { state: "owned", pid: attributed.pid };
       }
-      procNote =
-        `the socket listening on port ${port} changed while its owner was being identified, ` +
-        `so PID ${attributed.pid} cannot be tied to it`;
+      procNote = !stillListening
+        ? `the socket listening on port ${port} changed while its owner was being identified, ` +
+          `so PID ${attributed.pid} cannot be tied to it`
+        : stillHeld === false
+          ? `PID ${attributed.pid} no longer holds the socket listening on port ${port}, so it ` +
+            `cannot be named as its owner`
+          : `PID ${attributed.pid} could not be re-checked against the socket listening on ` +
+            `port ${port}, so its ownership is unconfirmed`;
     } else {
       procNote = attributed.reason;
     }
@@ -936,21 +1007,7 @@ export function probePortOwner(port: number, host?: string): PortOwnerProbe {
   };
 
   try {
-    // `-V` makes lsof STATE what it failed to locate, which is the only positive
-    // "nothing is listening" signal it offers (see readLsofAbsence).
-    //
-    // `2>&1` because lsof reports an INCOMPLETE enumeration on stderr, and on the
-    // success path `execSync` returns stdout ONLY — so without the redirect a marker
-    // on stdout beside a warning on stderr reads as a clean absence, and certifies a
-    // release from a search that admitted it was partial. The error path already sees
-    // both streams; this makes the success path see what the error path sees.
-    // Warnings do not disturb the field parser, which keys on `p`/`n` line prefixes.
-    // A host whose lsof warns routinely therefore loses the fast path — it costs a
-    // wait, never a wrong answer, which is the trade this whole probe makes.
-    const out = execSync(`lsof -V -nP -iTCP:${port} -sTCP:LISTEN -Fpn 2>&1`, {
-      encoding: "utf-8",
-      timeout: 5000,
-    });
+    const out = runLsofListenerQuery(port);
     const pid = parseListenerPidFromLsof(out, port, host);
     if (pid) return { state: "owned", pid };
     const absence = readLsofAbsence(out);

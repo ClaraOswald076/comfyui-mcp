@@ -412,7 +412,15 @@ function isDesktopSupervisorProcess(identity: ProcessIdentity): boolean {
     const base = norm.split("/").pop() ?? "";
     // Current and legacy Windows branding, including the electron-era install dir.
     if (base === "comfy desktop.exe" || base === "comfyui.exe") return true;
-    return /\/(comfy desktop|comfyui)\.app\/contents\/macos\//.test(norm);
+    // macOS: the bundle's MAIN binary, which by convention is named after the bundle
+    // (`Comfy Desktop.app/Contents/MacOS/Comfy Desktop`). Accepting ANY binary under
+    // `Contents/MacOS/` was too loose: a venv shim or launcher script living inside
+    // the bundle would pass, and a shim re-execs nothing (coordinator gate). The
+    // backreference ties the two halves together so the binary must belong to the
+    // bundle naming it. Electron HELPERS are excluded structurally — they live in
+    // `Contents/Frameworks/<Helper>.app/Contents/MacOS/…`, so the first bundle in the
+    // path is not followed by `Contents/MacOS/`.
+    return /\/(comfy desktop|comfyui)\.app\/contents\/macos\/\1$/.test(norm);
   };
 
   // THE KERNEL'S ANSWER FIRST, and ALONE when it exists (codex gate round 3).
@@ -441,8 +449,16 @@ function isDesktopSupervisorProcess(identity: ProcessIdentity): boolean {
   // the app name itself, so the directory prefix before it has none. An argument can
   // never satisfy that — reaching it would mean crossing the space that separates it
   // from argv[0].
+  //
+  // The BINARY NAME is required here too, for the same reason as above: a launcher
+  // script or venv shim inside the bundle would otherwise be read as the shell
+  // (coordinator gate). `\2` ties it to the bundle that names it, and the match must
+  // end at whitespace or end-of-line so the binary is the whole argv[0] rather than a
+  // prefix of some longer name.
   const line = (identity.commandLine ?? "").trim().replace(/\\/g, "/").toLowerCase();
-  return /^"?(\/[^\s"]*\/)?(comfy desktop|comfyui)\.app\/contents\/macos\//.test(line);
+  return /^"?(\/[^\s"]*\/)?(comfy desktop|comfyui)\.app\/contents\/macos\/\2(\s|"|$)/.test(
+    line,
+  );
 }
 
 function isDesktopApp(argv: string[]): boolean {
@@ -1402,33 +1418,74 @@ function processExists(pid: number): boolean | undefined {
  * "couldn't confirm it came back" — a verdict computed AFTER the stop, about a stop
  * it should never have made.
  *
- * ONLY the proven-abandoned shape refuses. `unconfirmed` proceeds exactly as before,
- * because a Desktop restart normally works and refusing on missing evidence would
- * take that away from every host where the process tree cannot be read — the same
- * standing ruling the rest of this file applies to uncertainty.
+ * ONLY `supervised` proceeds. `unconfirmed` REFUSES, and the asymmetry with the rest
+ * of this file is deliberate rather than an inconsistency (coordinator gate):
+ *
+ *   `listener_ownership` reports on an action that HAS ALREADY HAPPENED — the child
+ *   was spawned, the server is answering — and only the DESCRIPTION of it is
+ *   uncertain. Denying `started` there would turn an uncertain description into a
+ *   false one, so uncertainty is DISCLOSED.
+ *
+ *   A reboot has NOT happened yet and cannot be undone. Uncertainty about whether
+ *   anything will restart the process is uncertainty about whether the user still has
+ *   a ComfyUI afterwards, so it is REFUSED.
+ *
+ * Refuse before, disclose after — the same principle pointed in opposite directions
+ * by whether the irreversible step is still ahead.
+ *
+ * The earlier reading — that proceeding on `unconfirmed` preserved #400 — conflated
+ * two different claims. #400 established that a Desktop process must never be KILLED
+ * locally, because respawning the exe does not reliably bring the listener back. It
+ * did not establish that an UNVERIFIED Manager stop is safe. Only the first is
+ * settled, and refusing here does not touch it: the refusal leaves the server
+ * RUNNING and points the user at the Desktop app, which restarts it reliably.
  */
 function assessDesktopSupervision(info: ProcessInfo): {
   ok: boolean;
   reason?: string;
   supervision: SupervisorRelaunch;
 } {
-  if (!info.pid) return { ok: true, supervision: unclassifiedSupervision() };
-  const supervision = classifyDesktopSupervision({
+  const cannotAssess = (because: string): {
+    ok: boolean;
+    reason: string;
+    supervision: SupervisorRelaunch;
+  } => ({
+    ok: false,
+    supervision: unclassifiedSupervision(),
+    reason:
+      `this is a ComfyUI Desktop instance, and it could not be established that a Desktop app ` +
+      `is still supervising it (${because}). A restart from here asks ComfyUI-Manager to STOP ` +
+      `the process and depends on that supervisor to start it again — so without that, the ` +
+      `stop could not be undone.`,
+  });
+
+  // NO SPECIAL CASE FOR A MISSING PID. An early `ok: true` here would be one more
+  // permissive exit skipping the guard, and an untestable one at that. The classifier
+  // already handles pid 0 the way it handles any pid it cannot read — the identity
+  // and parent reads come back empty and the verdict is `unconfirmed`, which now
+  // refuses — so letting it fall through inherits a path that IS tested.
+  const { verdict, because } = classifyDesktopSupervision({
     pid: info.pid,
     readParentPid,
     readIdentity: resolveProcessIdentity,
     processExists,
     isSupervisorProcess: isDesktopSupervisorProcess,
   });
-  if (supervision !== "abandoned") return { ok: true, supervision };
+  if (verdict === "supervised") return { ok: true, supervision: verdict };
+  if (verdict === "abandoned") {
+    return {
+      ok: false,
+      supervision: verdict,
+      reason:
+        `ComfyUI Desktop started the server on port ${info.port} (PID ${info.pid}), but no ` +
+        `Desktop app is still supervising it — its parent process is gone. A restart from here ` +
+        `asks ComfyUI-Manager to stop the process and relies on that supervisor to start it ` +
+        `again, so it would be stopped and nothing would bring it back.`,
+    };
+  }
   return {
-    ok: false,
-    supervision,
-    reason:
-      `ComfyUI Desktop started the server on port ${info.port} (PID ${info.pid}), but no ` +
-      `Desktop app is still supervising it — its parent process is gone. A restart from here ` +
-      `asks ComfyUI-Manager to stop the process and relies on that supervisor to start it ` +
-      `again, so it would be stopped and nothing would bring it back.`,
+    ...cannotAssess(because ?? `the process tree above PID ${info.pid} could not be read`),
+    supervision: verdict,
   };
 }
 
@@ -2978,30 +3035,51 @@ export function getRestartDispatchRecord(
  * server is externally supervised yet its relaunch is NOT provable from here
  * (a relative `main.py` argv with no COMFYUI_PATH/workspace anchor and no live
  * process cwd), and the supervisor does NOT re-launch after a plain Manager
- * restart — so the reboot would kill ComfyUI permanently. Only the PROVEN
- * dangerous shape refuses: a reachable, running, non-Desktop local instance
- * whose relaunch command cannot be built/validated. Everything else returns
- * ok:true and the caller proceeds exactly as before:
- *   - remote mode (no local process to assess);
- *   - nothing found / unreachable-but-unmapped (no proven running process —
- *     #449 already punts those to a Manager reboot on purpose);
- *   - a Desktop app (Electron-supervised — the Manager reboot IS its safe
- *     restart path, #400);
- *   - a validated relaunch (assessRelaunch, the #476/#426 machinery).
+ * restart — so the reboot would kill ComfyUI permanently.
+ *
+ * WHAT PASSES is now stated positively, because every "everything else proceeds"
+ * clause here turned out to be a way in for the same loss:
+ *   - remote mode — there is no local process to assess, and the Manager reboot is
+ *     that target's restart path by design;
+ *   - a Desktop instance a live supervisor is proven to be watching (#400's safe
+ *     path, now checked rather than assumed);
+ *   - a non-Desktop instance whose relaunch command can be built and validated
+ *     (assessRelaunch, the #476/#426 machinery).
+ * Everything else — including an instance that could not be identified at all —
+ * REFUSES, and says what it could not establish.
  */
 export async function preflightLocalRestart(): Promise<{
   ok: boolean;
   reason?: string;
 }> {
   if (isRemoteMode()) return { ok: true };
-  const { info } = await acquireProcessInfo();
-  if (!info) return { ok: true };
+  const { info, diagnostic } = await acquireProcessInfo();
+  // NOTHING COULD BE RESOLVED — and that is not a pass (coordinator gate).
+  //
+  // This was the door beside the widened gate: a local instance whose listener cannot
+  // be attributed (a container with no `lsof`, a permission wall, no `/proc`) resolves
+  // to NOTHING here, so the preflight "assessed" it, passed, and the reboot went out
+  // without anyone having checked whether a supervisor was still there. That is the
+  // container/permission form of the very #814 loss the gate exists to prevent — an
+  // instance we cannot identify is an instance whose relaunch we cannot prove.
+  //
+  // The refusal is safe in the genuinely-nothing-running case too: there is no server
+  // to lose, and the message says exactly what could not be established rather than
+  // asserting something is wrong.
+  if (!info) {
+    return {
+      ok: false,
+      reason:
+        `the ComfyUI this restart would stop could not be identified from here` +
+        (diagnostic ? ` (${diagnostic})` : ` (nothing was found listening on port ${config.resolvedPort})`) +
+        `, so it could not be established that stopping it is something we could undo.`,
+    };
+  }
   if (info.isDesktopApp) {
     // NOT an automatic pass any more (#814). Electron supervision is what makes a
     // Desktop reboot safe, and it is a FACT about the running process tree, not a
-    // property of the install — when the supervisor has gone, the reboot is a stop
-    // with no way back. Only that proven shape refuses; everything else still
-    // proceeds, as #400 requires.
+    // property of the install. See assessDesktopSupervision for why UNCONFIRMED
+    // refuses here while it is merely disclosed on the post-launch ownership path.
     const desktop = assessDesktopSupervision(info);
     if (desktop.ok) return { ok: true };
     return { ok: false, reason: `${desktop.reason}${describeRecovery(recoveryHint(info))}` };
