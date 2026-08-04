@@ -26,7 +26,7 @@ import {
 import { getDataset, getJobConfig, listDatasets, previewConfig, readTrainingFile, deleteDataset, updateDataset } from "../services/training-datasets.js";
 import { captionDataset, captionImage } from "../services/train-caption.js";
 import { errorToToolResult } from "../utils/errors.js";
-import { isRemoteMode } from "../config.js";
+import { config, isRemoteMode } from "../config.js";
 
 function textEnvelope(envelope: unknown) {
   const failed = typeof envelope === "object" && envelope !== null && "ok" in envelope && envelope.ok === false;
@@ -582,7 +582,7 @@ export function registerTrainTools(server: McpServer): void {
             ...doctor.data,
             trainingRoot: trainingRoot(),
             hfCache: hfCacheRoot(),
-            hfTokenSet: !!process.env.HF_TOKEN?.trim(),
+            hfTokenSet: !!config.huggingfaceToken?.trim(),
             // Dataset staging + the LoRA handoff need a LOCAL ComfyUI filesystem
             // on this MCP's machine — false in remote mode, so panel/mobile can
             // warn before a doomed launch instead of failing at staging.

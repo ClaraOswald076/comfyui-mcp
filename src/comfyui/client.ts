@@ -10,7 +10,7 @@ import {
 import { logger } from "../utils/logger.js";
 import { ComfyUIError, ConnectionError, WorkflowExecutionError } from "../utils/errors.js";
 import { comfyuiFetch } from "./fetch.js";
-import { fetchComfyJson, rethrowWithJsonDiagnosis } from "./json-guard.js";
+import { fetchComfyJson, redactErrorMessage, rethrowWithJsonDiagnosis } from "./json-guard.js";
 import * as cloudClient from "./cloud-client.js";
 import type { ObjectInfo, SystemStats, QueueStatus } from "./types.js";
 
@@ -231,8 +231,12 @@ export async function getObjectInfo(): Promise<ObjectInfo> {
       // before giving up — this is exactly the reconnect the caller expects.
       // Only reset if OUR client is still current: a concurrent reset may have
       // already installed a newer client we must not close.
+      // The library's parse errors QUOTE the body they choked on, and a gateway
+      // that reflects the request can have put our ComfyUI credential in that
+      // body — so this message goes through the same redaction as any body text
+      // before it reaches the log (codex gate, round 5, finding 5).
       logger.warn("getObjectInfo failed; resetting client and retrying once", {
-        error: err instanceof Error ? err.message : String(err),
+        error: redactErrorMessage(err),
       });
       resetClientIfCurrent(startClient);
       try {

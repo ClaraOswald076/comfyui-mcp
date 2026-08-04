@@ -189,8 +189,15 @@ export function classifyNonJson(args: {
     `Content-Type: ${contentType || "(none)"}. Body starts: ${bodyPrefix || "(empty)"}. ` +
     `Confirm the configured ComfyUI base URL really is a ComfyUI API root — a URL that loads the ComfyUI UI in a browser is not proof, because the UI is served by the same catch-all that produced this page. ` +
     `The check is that ${getComfyUIBaseUrl()}/system_stats returns JSON with a "system"/"devices" shape; if it returns HTML too, the base URL, its path prefix, or the proxy's route map is wrong` +
+    // The credential instruction must follow the same evidence rule as the
+    // diagnosis above. Only a body-confirmed sign-in page justifies "give it to
+    // the gateway"; a bare 401/403 could equally be ComfyUI's own auth layer, and
+    // sending the user to configure the wrong side wastes the round trip (codex
+    // gate, round 5, finding 4).
     (kind === "login"
-      ? `, and any credential must be supplied to the GATEWAY (COMFYUI_AUTH_TOKEN / COMFYUI_AUTH_HEADER, or the CF_ACCESS_CLIENT_ID + CF_ACCESS_CLIENT_SECRET pair), not to ComfyUI.`
+      ? html && looksLikeLoginPage(body)
+        ? `, and the credential belongs to that GATEWAY, not to ComfyUI: set COMFYUI_AUTH_TOKEN / COMFYUI_AUTH_HEADER, or the CF_ACCESS_CLIENT_ID + CF_ACCESS_CLIENT_SECRET pair.`
+        : `. Whichever layer rejected the request is the one that needs the credential — this response does not say which; the connector sends COMFYUI_AUTH_TOKEN / COMFYUI_AUTH_HEADER (and the CF_ACCESS_CLIENT_ID + CF_ACCESS_CLIENT_SECRET pair) on every ComfyUI request, so configure them for whichever layer is doing the rejecting.`
       : `.`);
 
   return { kind, url, status, contentType, bodyPrefix, message };
@@ -266,6 +273,21 @@ export async function fetchComfyJson<T = unknown>(
 }
 
 /**
+ * An error's message with any configured ComfyUI credential removed — for the
+ * parser errors that QUOTE the body they choked on, which a reflecting gateway
+ * can have filled with our own token. Falls back to a placeholder when the
+ * credential is too short to substitute safely: a message is never worth
+ * handing a credential back through.
+ */
+export function redactErrorMessage(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  return (
+    redactComfyAuthValues(raw) ??
+    "(message withheld: it contains the configured ComfyUI credential)"
+  );
+}
+
+/**
  * True when an error looks like `JSON.parse` choking on a markup body — the
  * signature of a client library that called `res.json()` itself and so gave us
  * no URL, status, or content type to report.
@@ -322,7 +344,11 @@ export async function rethrowWithJsonDiagnosis(err: unknown, url: string): Promi
       // the original as `cause`, so a transient change between the two requests
       // cannot silently rewrite a truthful error into a speculative one (codex
       // gate, round 1, finding 5).
-      const original = err instanceof Error ? err.message : String(err);
+      // The library's raw parse message quotes the body it choked on, so it can
+      // carry a credential a reflecting gateway echoed back. Redact it like any
+      // other body text, and withhold it entirely when redaction cannot be done
+      // safely (codex gate, round 5, finding 5).
+      const original = redactErrorMessage(err);
       throw new NonJsonResponseError({
         ...diagnosis,
         message:

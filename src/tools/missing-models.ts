@@ -12,6 +12,7 @@ import {
   type ResolveDeps,
 } from "../services/missing-models.js";
 import { errorToToolResult, ValidationError } from "../utils/errors.js";
+import { config } from "../config.js";
 
 function parseWorkflow(input: unknown): WorkflowJSON {
   if (typeof input === "string") {
@@ -48,7 +49,13 @@ const WEIGHT_RE = /\.(safetensors|ckpt|pt|pth|bin|gguf|sft)$/i;
 async function hfRepoFiles(repoId: string): Promise<Array<{ filename: string; size_bytes?: number }>> {
   const path = repoId.split("/").map(encodeURIComponent).join("/");
   const res = await fetch(`https://huggingface.co/api/models/${path}/tree/main`, {
-    headers: process.env.HF_TOKEN ? { authorization: `Bearer ${process.env.HF_TOKEN}` } : undefined,
+    // config.huggingfaceToken resolves at ACCESS time from the canonical
+    // ~/.comfyui-mcp/.env and honours the HUGGINGFACE_TOKEN alias too (#826):
+    // reading process.env.HF_TOKEN directly made a token saved after this
+    // process started invisible here, while the save reported live pickup.
+    headers: config.huggingfaceToken
+      ? { authorization: `Bearer ${config.huggingfaceToken}` }
+      : undefined,
   });
   if (!res.ok) return [];
   const body = (await res.json()) as Array<{ type?: string; path?: string; size?: number }>;
