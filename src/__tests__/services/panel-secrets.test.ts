@@ -126,7 +126,7 @@ describe("panel-secrets (canonical .env store)", () => {
       setComfyuiSecret("CIVITAI_API_TOKEN", "tok"); // Settings slot path omits opts
       off();
       expect(cb).toHaveBeenCalledTimes(1);
-      expect(cb).toHaveBeenLastCalledWith({ requested: false });
+      expect(cb).toHaveBeenLastCalledWith(expect.objectContaining({ requested: false }));
     });
 
     it("marks a panel_request_secret save (requested:true) as requested → nudge eligible", () => {
@@ -135,7 +135,7 @@ describe("panel-secrets (canonical .env store)", () => {
       setComfyuiSecret("CIVITAI_API_TOKEN", "tok", { requested: true });
       off();
       expect(cb).toHaveBeenCalledTimes(1);
-      expect(cb).toHaveBeenLastCalledWith({ requested: true });
+      expect(cb).toHaveBeenLastCalledWith(expect.objectContaining({ requested: true }));
     });
 
     it("carries the requesting tabId so ONLY that tab is nudged (never a broadcast)", () => {
@@ -143,7 +143,7 @@ describe("panel-secrets (canonical .env store)", () => {
       const off = onComfyuiSecretsChanged(cb);
       setComfyuiSecret("CIVITAI_API_TOKEN", "tok", { requested: true, tabId: "tab-xyz" });
       off();
-      expect(cb).toHaveBeenLastCalledWith({ requested: true, tabId: "tab-xyz" });
+      expect(cb).toHaveBeenLastCalledWith(expect.objectContaining({ requested: true, tabId: "tab-xyz" }));
     });
 
     it("drops tabId for a NON-requested change (a stray tabId can't smuggle a nudge)", () => {
@@ -152,7 +152,7 @@ describe("panel-secrets (canonical .env store)", () => {
       // Not requested, but a tabId is present on the raw event — must be ignored.
       setComfyuiSecret("CIVITAI_API_TOKEN", "tok", { tabId: "tab-xyz" });
       off();
-      expect(cb).toHaveBeenLastCalledWith({ requested: false, tabId: undefined });
+      expect(cb).toHaveBeenLastCalledWith(expect.objectContaining({ requested: false, tabId: undefined }));
     });
 
     it("marks a REVOKE as NOT requested → a removed token never nudges 'retry'", () => {
@@ -162,7 +162,7 @@ describe("panel-secrets (canonical .env store)", () => {
       expect(removeComfyuiSecret("CIVITAI_API_TOKEN")).toBe(true);
       off();
       expect(cb).toHaveBeenCalledTimes(1);
-      expect(cb).toHaveBeenLastCalledWith({ requested: false });
+      expect(cb).toHaveBeenLastCalledWith(expect.objectContaining({ requested: false }));
     });
   });
 

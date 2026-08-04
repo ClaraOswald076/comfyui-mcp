@@ -20,6 +20,7 @@ import { EventEmitter } from "node:events";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { comfyuiEnvFilePath, parseEnvFile } from "../env-file.js";
 import { logger } from "../utils/logger.js";
 import { OPENAI_KEY_PROVIDERS, providerModelHint } from "./openai-provider-registry.js";
 
@@ -125,6 +126,23 @@ export interface ComfyuiSecretChange {
    *  `requested` — so the orchestrator can nudge ONLY that tab's agent to retry
    *  (never a broadcast to unrelated tabs). Undefined for non-request changes. */
   tabId?: string;
+  /** Report back what the subscriber ACTUALLY did about the tool-child respawn.
+   *  The emit is synchronous, so whatever a listener reports here is available to
+   *  `setEnvSecret`'s caller before it composes its answer. A listener that does
+   *  not call this contributes nothing — silence is never read as success (#826). */
+  report?: (r: SecretRespawnReport) => void;
+}
+
+/** What a subscriber did about respawning the comfyui tool child. Counts only —
+ *  never a promise about a future state we have not observed. */
+export interface SecretRespawnReport {
+  /** Live agent sessions at the moment of the change. */
+  live: number;
+  /** Sessions replaced RIGHT NOW (they were idle) — an observed respawn. */
+  applied: number;
+  /** Sessions that were mid-turn, so their replacement is queued for the next
+   *  idle. Scheduled, NOT done — describe it that way. */
+  scheduled: number;
 }
 
 /** Subscribe to "a comfyui tool secret changed". The callback receives whether
@@ -135,11 +153,71 @@ export function onComfyuiSecretsChanged(cb: (change: ComfyuiSecretChange) => voi
     cb({
       requested: payload?.requested === true,
       tabId: payload?.requested === true ? payload?.tabId : undefined,
+      report: payload?.report,
     });
   emitter.on("change", handler);
   return () => {
     emitter.off("change", handler);
   };
+}
+
+/**
+ * The OBSERVED outcome of persisting a secret. Every field is something we
+ * checked, not something we intend — `panel_request_secret` composes its answer
+ * from this instead of asserting a respawn that may never fire (#826).
+ */
+export interface SecretSaveReceipt {
+  /** The env var written. Never the value. */
+  key: string;
+  /** The canonical file it was written to (contains no secret). */
+  path: string;
+  /** "yes"      — a read-back of the file proved the key now carries this value.
+   *  "no"       — the read-back proved it does NOT: the save did not take effect.
+   *  "unknown"  — the file could not be re-read, so neither verdict is available.
+   *  Deliberately three-valued: "could not determine" must never harden into a
+   *  definite answer in either direction. */
+  persisted: "yes" | "no" | "unknown";
+  /** True when every consumer of this key resolves it from the canonical file at
+   *  ACCESS time, so an already-running tool process sees it with no respawn. */
+  livePickup: boolean;
+  /** What the orchestrator's listener reported. `null` when NO listener answered
+   *  — then nothing is known to be driving a respawn and we must not claim one. */
+  respawn: SecretRespawnReport | null;
+}
+
+/**
+ * Keys every reader resolves at ACCESS time from the canonical .env, so a value
+ * saved after a process started is visible to it without a respawn:
+ *   CIVITAI_API_TOKEN / HF_TOKEN / HUGGINGFACE_TOKEN → config.ts lazy getters
+ *   RUNPOD_API_KEY                                    → services/runpod-client.ts
+ *   REGISTRY_ACCESS_TOKEN                             → services/node-authoring.ts
+ * The remaining allowlisted keys (GEMINI_API_KEY / GOOGLE_* / RUNCOMFY_API_KEY)
+ * are read only IN the orchestrator, where setEnvSecret updates process.env
+ * directly — also live, but by a different mechanism, so they are listed
+ * separately rather than lumped in.
+ */
+const CHILD_LIVE_RELOAD_KEYS = new Set([
+  "CIVITAI_API_TOKEN",
+  "HF_TOKEN",
+  "HUGGINGFACE_TOKEN",
+  "RUNPOD_API_KEY",
+  "REGISTRY_ACCESS_TOKEN",
+]);
+
+/** Keys whose only reader is the orchestrator process itself — `setEnvSecret`
+ *  assigns process.env there, so they take effect immediately in-process. */
+const ORCHESTRATOR_ONLY_KEYS = new Set([
+  "GEMINI_API_KEY",
+  "GOOGLE_GENERATIVE_AI_API_KEY",
+  "GOOGLE_API_KEY",
+  "RUNCOMFY_API_KEY",
+  ...AGENT_SECRET_ENV_ALLOWLIST,
+]);
+
+/** True when a saved value for `key` is picked up by its readers without any
+ *  process being respawned. Presence-only; never touches a value. */
+export function hasLivePickup(key: string): boolean {
+  return CHILD_LIVE_RELOAD_KEYS.has(key) || ORCHESTRATOR_ONLY_KEYS.has(key);
 }
 
 function read(): PanelSecrets {
@@ -176,9 +254,12 @@ function write(secrets: PanelSecrets): void {
 // it isn't a flat KEY=value env var.) Writes are a surgical single-line upsert:
 // the rest of the user's .env — comments, other keys — is preserved byte-for-byte.
 
-/** Path to the canonical dotenv. Matches config.ts; overridable for tests. */
+/** Path to the canonical dotenv. Delegates to env-file.ts, which is the SINGLE
+ *  resolver config.ts (the reader, in this process AND in the spawned comfyui
+ *  child) also uses — so the file we write can never be a different file from the
+ *  one the tools read (#826). */
 export function envFilePath(): string {
-  return process.env.COMFYUI_MCP_ENV_FILE || join(homedir(), ".comfyui-mcp", ".env");
+  return comfyuiEnvFilePath();
 }
 
 /** Encode a value for a .env line — quote only when it contains characters a
@@ -252,7 +333,7 @@ export function setEnvSecret(
   key: string,
   value: string,
   opts: { requested?: boolean; tabId?: string } = {},
-): void {
+): SecretSaveReceipt {
   const trimmed = key.trim();
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(trimmed)) {
     throw new Error(`Invalid env var name "${key}" — use a valid shell identifier.`);
@@ -264,6 +345,14 @@ export function setEnvSecret(
   }
   upsertEnvFile(trimmed, value);
   process.env[trimmed] = value; // live in-process effect (env wins over the file)
+  // VERIFY the write by reading the canonical file back. Reporting "saved" from
+  // the mere absence of a throw is how a caller ends up believing it is
+  // configured while nothing downstream can see the value (#826). The comparison
+  // is against the value we already hold; neither the stored nor the supplied
+  // value is logged, and only the three-valued verdict leaves this function.
+  const readBack = parseEnvFile();
+  const persisted: SecretSaveReceipt["persisted"] =
+    readBack === null ? "unknown" : readBack[trimmed] === value ? "yes" : "no";
   // Only a COMFYUI tool secret should restart the comfyui MCP child + inject the
   // "retry the download that needed this token" nudge (#269): saving an
   // agent-ONLY provider key (OPENROUTER/GLM/KIMI…) previously restarted every
@@ -272,9 +361,33 @@ export function setEnvSecret(
   // `requested` rides the change so the orchestrator only injects the retry
   // nudge when this save ANSWERS an outstanding panel_request_secret — a
   // Settings slot save / background reload / revoke leaves it false (#164).
+  // Collect what listeners actually did. `emit` is SYNCHRONOUS, so every report
+  // has landed by the time this returns — the receipt describes observed work,
+  // not an intention. No listener → `respawn: null`, never a fabricated zero.
+  const reports: SecretRespawnReport[] = [];
   if (isAllowedComfyuiSecretKey(trimmed))
-    emitter.emit("change", { requested: opts.requested === true, tabId: opts.tabId });
+    emitter.emit("change", {
+      requested: opts.requested === true,
+      tabId: opts.tabId,
+      report: (r: SecretRespawnReport) => reports.push(r),
+    });
   if (isAllowedAgentSecretKey(trimmed)) emitter.emit("agentChange"); // flip provider readiness live
+  return {
+    key: trimmed,
+    path: envFilePath(),
+    persisted,
+    livePickup: hasLivePickup(trimmed),
+    respawn: reports.length
+      ? reports.reduce(
+          (a, b) => ({
+            live: a.live + b.live,
+            applied: a.applied + b.applied,
+            scheduled: a.scheduled + b.scheduled,
+          }),
+          { live: 0, applied: 0, scheduled: 0 },
+        )
+      : null,
+  };
 }
 
 /** Canonical remover: drop a token from .env + process.env + emit. Also PURGES
@@ -407,7 +520,7 @@ export function setComfyuiSecret(
   key: string,
   value: string,
   opts: { requested?: boolean; tabId?: string } = {},
-): void {
+): SecretSaveReceipt {
   const trimmed = key.trim();
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(trimmed)) {
     throw new Error(`Invalid env var name "${key}" — use a valid shell identifier (letters, digits, underscore).`);
@@ -421,7 +534,7 @@ export function setComfyuiSecret(
   // `opts.requested` is set ONLY by panel_request_secret (an agent-driven token
   // ask) so the orchestrator can nudge "retry the action"; the Settings slot
   // save path (setPanelSecret) omits it → no spurious nudge (#164).
-  setEnvSecret(trimmed, value, opts); // canonical store = ~/.comfyui-mcp/.env
+  return setEnvSecret(trimmed, value, opts); // canonical store = ~/.comfyui-mcp/.env
 }
 
 /** Remove a stored comfyui secret. Returns false if absent. Emits on removal. */
@@ -470,14 +583,14 @@ export function onAgentSecretsChanged(cb: () => void): () => void {
  * and hydrate it into process.env immediately, then emit so the orchestrator
  * re-probes readiness / re-pushes the model list. Rejects non-allowlisted keys.
  */
-export function setAgentSecret(key: string, value: string): void {
+export function setAgentSecret(key: string, value: string): SecretSaveReceipt {
   const trimmed = key.trim();
   if (!isAllowedAgentSecretKey(trimmed)) {
     throw new Error(
       `Env var "${trimmed}" is not an accepted agent secret. Allowed: ${AGENT_SECRET_ENV_ALLOWLIST.join(", ")}.`,
     );
   }
-  setEnvSecret(trimmed, value); // canonical store = ~/.comfyui-mcp/.env
+  return setEnvSecret(trimmed, value); // canonical store = ~/.comfyui-mcp/.env
 }
 
 /** Remove a stored agent secret. Returns false if absent. Also drops it from
@@ -495,7 +608,19 @@ export function removeAgentSecret(key: string): boolean {
  * (Claude in-process + Codex stdio) use, so a saved secret reaches either.
  */
 export function buildComfyuiMcpEnv(base: Record<string, string>): Record<string, string> {
-  return { ...base, ...loadComfyuiSecretEnv() };
+  return {
+    ...base,
+    // PIN the canonical dotenv path into the child (#826). The child resolves
+    // credentials from that file at access time, so if the orchestrator writes
+    // to a non-default path (COMFYUI_MCP_ENV_FILE) while the child resolves the
+    // default one, a saved token is written to a file nothing reads — a "saved
+    // successfully" that the tools can never see. Forwarding the override makes
+    // writer and reader the same file by construction. Not a secret: a path.
+    ...(process.env.COMFYUI_MCP_ENV_FILE
+      ? { COMFYUI_MCP_ENV_FILE: process.env.COMFYUI_MCP_ENV_FILE }
+      : {}),
+    ...loadComfyuiSecretEnv(),
+  };
 }
 
 // ── Agent-provider spawn env (tool-secret scoping) ───────────────────────────

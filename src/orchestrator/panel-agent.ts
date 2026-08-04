@@ -1850,6 +1850,36 @@ export interface PanelAgentManagerOptions {
   identityForKey?: (key: string) => string | undefined;
 }
 
+/**
+ * What a requested comfyui-MCP-env respawn actually did for ONE agent (#826):
+ *   "applied"   — the agent was idle, so it was replaced RIGHT NOW. The tool
+ *                 subprocess is being recreated with the rebuilt env. Observed.
+ *   "scheduled" — the agent is mid-turn; the replacement is queued for its next
+ *                 idle. NOT done yet, and callers must not describe it as done.
+ *   "no-agent"  — there is no live agent on this key, so nothing was or will be
+ *                 respawned by this call. Never report this as a success.
+ * Returned so a caller can state what happened instead of asserting a respawn it
+ * never observed — the exact defect in #826.
+ */
+export type McpEnvRestartOutcome = "applied" | "scheduled" | "no-agent";
+
+/** Per-outcome counts across every live agent for one env change. */
+export interface McpEnvRestartTally {
+  live: number;
+  applied: number;
+  scheduled: number;
+}
+
+/** Fold one agent's outcome into a tally. "no-agent" counts as neither — an
+ *  agent that vanished between the key snapshot and the apply was NOT respawned,
+ *  and must not inflate "applied" (which would report work that never happened)
+ *  nor "scheduled" (which would promise work nothing will do). Exported so that
+ *  third state is directly testable; it is otherwise only reachable via a race. */
+export function tallyRestart(tally: McpEnvRestartTally, outcome: McpEnvRestartOutcome): void {
+  if (outcome === "applied") tally.applied++;
+  else if (outcome === "scheduled") tally.scheduled++;
+}
+
 /** Owns one PanelAgent per tab id, spawned lazily on the tab's first message. */
 export class PanelAgentManager {
   private agents = new Map<string, PanelAgent>();
@@ -2013,37 +2043,42 @@ export class PanelAgentManager {
    *  next idle so the turn that SAVED the secret finishes first (we never
    *  interrupt a live reply). `nudge`, if given, is enqueued to each resumed
    *  agent so it auto-continues (e.g. retries the download the secret unblocked). */
-  restartAllForMcpEnv(nudge?: string): void {
-    for (const tabId of this.agents.keys()) {
+  restartAllForMcpEnv(nudge?: string): McpEnvRestartTally {
+    // Snapshot the key set: applyPendingRestarts REPLACES entries in this.agents
+    // (spawn + retire) while we iterate, and mutating a Map during its own
+    // iteration is how a tab silently gets skipped.
+    const keys = [...this.agents.keys()];
+    const tally: McpEnvRestartTally = { live: keys.length, applied: 0, scheduled: 0 };
+    for (const tabId of keys) {
       // A SILENT env respawn (no nudge) must NOT downgrade a tab that already has
       // a retry nudge queued (#164): a concurrent env change on another tab, or a
       // retarget, would otherwise erase a still-pending per-request nudge before
       // its busy agent could apply it. Keep the existing nudge; still coalesce.
       if (nudge === undefined && this.pendingMcpRestart.get(tabId)) {
-        this.applyPendingRestarts(tabId);
+        tallyRestart(tally, this.applyPendingRestarts(tabId));
         continue;
       }
       this.pendingMcpRestart.set(tabId, nudge ?? null);
       // Apply immediately when the tab is already idle; otherwise it fires on the
       // next turn-done via applyPendingRestarts().
-      this.applyPendingRestarts(tabId);
+      tallyRestart(tally, this.applyPendingRestarts(tabId));
     }
+    return tally;
   }
 
   /** Single-tab variant of restartAllForMcpEnv — used when ONE tab's tool-server
    *  spawn env changed (e.g. the Blind toggle, issue #90). Same coalesced
    *  at-idle replacement; no-op when the tab has no live agent. */
-  restartForMcpEnv(key: string, nudge?: string): void {
-    if (!this.agents.has(key)) return;
+  restartForMcpEnv(key: string, nudge?: string): McpEnvRestartOutcome {
+    if (!this.agents.has(key)) return "no-agent";
     // A SILENT restart (no nudge — a blind-mode toggle #90, a provider-key
     // refresh #278) must NOT erase a per-request secret nudge already queued for
     // this tab (#164). A real nudge still replaces/refreshes any existing one.
     if (nudge === undefined && this.pendingMcpRestart.get(key)) {
-      this.applyPendingRestarts(key);
-      return;
+      return this.applyPendingRestarts(key);
     }
     this.pendingMcpRestart.set(key, nudge ?? null);
-    this.applyPendingRestarts(key);
+    return this.applyPendingRestarts(key);
   }
 
   /** Rebuild a live agent because its PROVIDER credential rotated (#278): keyed
@@ -2070,19 +2105,19 @@ export class PanelAgentManager {
    *
    * No-op unless something is pending and the agent has fully settled (idle).
    */
-  private applyPendingRestarts(tabId: string): void {
+  private applyPendingRestarts(tabId: string): McpEnvRestartOutcome {
     const wantEffort = this.pendingEffortRestart.has(tabId);
     const wantMcp = this.pendingMcpRestart.has(tabId);
-    if (!wantEffort && !wantMcp) return;
+    if (!wantEffort && !wantMcp) return "no-agent";
     const agent = this.agents.get(tabId);
     if (!agent || agent.isStopped) {
       this.pendingEffortRestart.delete(tabId);
       this.pendingMcpRestart.delete(tabId);
-      return;
+      return "no-agent";
     }
     // Still mid-work (a queued message will start the next turn) — wait for the
     // next idle so we don't restart between back-to-back turns.
-    if (agent.isBusy || agent.hasPending) return;
+    if (agent.isBusy || agent.hasPending) return "scheduled";
     // Only the MCP respawn carries a retry nudge.
     const nudge = wantMcp ? (this.pendingMcpRestart.get(tabId) ?? undefined) : undefined;
     this.pendingEffortRestart.delete(tabId);
@@ -2094,6 +2129,7 @@ export class PanelAgentManager {
     logger.info(
       `[panel-orchestrator] tab ${tabId.slice(0, 8)} restart applied (idle, reason=${reasons}, ${carried} queued carried over${nudge ? " + retry nudge" : ""})`,
     );
+    return "applied";
   }
 
   /** Cancel a still-queued message for a tab (user edited/deleted it before the

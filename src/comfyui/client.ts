@@ -10,6 +10,7 @@ import {
 import { logger } from "../utils/logger.js";
 import { ComfyUIError, ConnectionError, WorkflowExecutionError } from "../utils/errors.js";
 import { comfyuiFetch } from "./fetch.js";
+import { fetchComfyJson, rethrowWithJsonDiagnosis } from "./json-guard.js";
 import * as cloudClient from "./cloud-client.js";
 import type { ObjectInfo, SystemStats, QueueStatus } from "./types.js";
 
@@ -123,11 +124,31 @@ export async function ensureConnected(): Promise<Client> {
   }
 }
 
+/** True when a decoded /system_stats body has the recognizable ComfyUI shape (a
+ *  `system` object and/or a `devices` array). A bare 2xx carrying an API
+ *  gateway's own JSON envelope is NOT ComfyUI and must not be handed on as
+ *  stats — the same predicate the panel's reboot certification uses. */
+function looksLikeSystemStats(body: unknown): boolean {
+  if (!body || typeof body !== "object") return false;
+  const b = body as { system?: unknown; devices?: unknown };
+  return (b.system != null && typeof b.system === "object") || Array.isArray(b.devices);
+}
+
 export async function getSystemStats(): Promise<SystemStats> {
   if (isCloudMode()) return cloudClient.getSystemStats();
-  const client = getClient();
-  const stats = await client.getSystemStats();
-  return stats as unknown as SystemStats;
+  requireLocalMode("getSystemStats");
+  // Fetched directly (not via the client library) so a non-JSON answer can be
+  // DIAGNOSED rather than surfacing as "Unexpected token '<', "<!DOCTYPE "..."
+  // (#828). comfyuiFetch carries the same auth headers the library would, and
+  // getComfyUIBaseUrl() carries the same path prefix, so a proxied/prefixed
+  // remote resolves identically.
+  const url = `${getComfyUIBaseUrl()}/system_stats`;
+  const stats = await fetchComfyJson<SystemStats>(url, {
+    init: { signal: AbortSignal.timeout(15000) },
+    expectShape: looksLikeSystemStats,
+    shapeHint: "a ComfyUI /system_stats document (it has no `system` object and no `devices` array)",
+  });
+  return stats;
 }
 
 // /object_info is large (~MBs) and slow (300-800 ms) but only changes when
@@ -214,7 +235,16 @@ export async function getObjectInfo(): Promise<ObjectInfo> {
         error: err instanceof Error ? err.message : String(err),
       });
       resetClientIfCurrent(startClient);
-      return commit((await getClient().getNodeDefs()) as unknown as ObjectInfo);
+      try {
+        return commit((await getClient().getNodeDefs()) as unknown as ObjectInfo);
+      } catch (retryErr) {
+        // The client library parses JSON itself, so an HTML body reaches us as a
+        // bare "Unexpected token '<'" naming neither the URL nor the responder
+        // (#828). Re-probe the endpoint ONCE to say what actually answered; if
+        // the probe is inconclusive the original error is rethrown untouched —
+        // an unproven cause must never be presented as the cause.
+        return await rethrowWithJsonDiagnosis(retryErr, `${getComfyUIBaseUrl()}/object_info`);
+      }
     }
   })();
   objectInfoInflight = inflight;
