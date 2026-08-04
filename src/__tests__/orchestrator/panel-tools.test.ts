@@ -3665,9 +3665,19 @@ describe("confirm-card timeout is honest, bounded, and late-answer-safe (#360)",
     return (res.content[0] as { text: string }).text;
   }
 
+  // #814 widened the refuse-safe preflight to EVERY local target, not only a
+  // tab-bound one, so panel_restart_comfyui now consults it on this path too.
+  // These tests are about the confirm card, and the real preflight would do live
+  // process/port discovery against the host — stub a PASS so the card is the only
+  // thing under test.
+  beforeEach(() => {
+    __panelToolsTestHooks.setLocalRestartPreflight(async () => ({ ok: true }));
+  });
+
   afterEach(() => {
     __panelAskTestHooks.setAskTiming(null);
     __panelToolsTestHooks.setHealthProbe(null);
+    __panelToolsTestHooks.setLocalRestartPreflight(null);
   });
 
   // FAIL-BEFORE: the old confirm swallowed a card-reply timeout as `false`, so an

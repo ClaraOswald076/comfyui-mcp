@@ -25,6 +25,9 @@ vi.mock("../../comfyui/client.js", () => ({
 const hoistedConfig = vi.hoisted(() => ({
   configBase: { value: null as string | null },
   generation: { value: 0 },
+  /** #814: drive REMOTE mode, the one target shape the widened preflight gate
+   *  deliberately excludes (no local process to assess). */
+  remote: { value: false },
 }));
 vi.mock("../../config.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../config.js")>();
@@ -32,6 +35,7 @@ vi.mock("../../config.js", async (importOriginal) => {
     ...actual,
     getComfyUIBaseUrl: () => hoistedConfig.configBase.value ?? actual.getComfyUIBaseUrl(),
     getComfyuiTargetGeneration: () => hoistedConfig.generation.value,
+    isRemoteMode: () => hoistedConfig.remote.value || actual.isRemoteMode(),
   };
 });
 
@@ -127,6 +131,7 @@ beforeEach(() => {
   // r9: real configured base unless a test retargets it mid-flight.
   hoistedConfig.configBase.value = null;
   hoistedConfig.generation.value = 0;
+  hoistedConfig.remote.value = false;
 });
 
 afterEach(() => {
@@ -137,6 +142,7 @@ afterEach(() => {
   __processControlTestHooks.reset();
   hoistedConfig.configBase.value = null;
   hoistedConfig.generation.value = 0;
+  hoistedConfig.remote.value = false;
 });
 
 describe("panel_restart_comfyui — decline truthfulness (#742)", () => {
@@ -649,18 +655,67 @@ describe("panel_restart_comfyui — Pinokio-style refuse-safe preflight (#742)",
     expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
   });
 
-  it("does NOT consult the preflight when the tab doesn't provably front our boot instance", async () => {
-    // The preflight guards OUR local boot instance only. A reboot bound for a
-    // different/remote instance proceeds exactly as before (dispatched +
-    // accepted, honestly unconfirmable from here).
+  it("#814: a LOCAL target the tab cannot be bound to is STILL assessed, and a failing assessment refuses", async () => {
+    // THE #814 DEFECT, pinned. The safety check used to be gated on the same
+    // capture as the CERTIFICATION — "can I watch this instance come back?" — so
+    // an instance we could not watch was also an instance we never assessed. The
+    // reboot went out with no evidence at all, the server stopped, nothing brought
+    // it back, and the result then said it could not confirm the return: a verdict
+    // about a stop that should never have been made. Being unable to observe a
+    // recovery is a reason for more care about stopping, not less.
+    //
+    // FAIL-BEFORE: with the gate keyed on the tab binding, `frontsBoot: false`
+    // skipped the preflight entirely and dispatched. PASS-AFTER: the preflight runs
+    // for the local target and its refusal stands.
+    const preflight = vi.fn(async () => ({
+      ok: false,
+      reason: "no Desktop app is still supervising it.",
+    }));
+    __panelToolsTestHooks.setLocalRestartPreflight(preflight);
+    const { ctx, sends } = makeCtx({ confirm: "yes", frontsBoot: false });
+
+    const out = parse(await restartTool().handler({}, ctx));
+
+    expect(preflight).toHaveBeenCalled();
+    expect(out.refused).toBe(true);
+    expect(out.rebooting).toBe(false);
+    // The REASON is carried through, not replaced by a generic one — a Desktop
+    // user must not be sent to look at Pinokio's controls.
+    expect(String(out.note)).toMatch(/no Desktop app is still supervising it/);
+    expect(String(out.note)).toMatch(/still running/i);
+    // CRITICAL: nothing was ever dispatched, so nothing was ever stopped.
+    expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
+  });
+
+  it("#814: an unbindable LOCAL target with a PASSING assessment still dispatches", async () => {
+    // The counterpart, and the reason the widened gate is a check rather than a
+    // blanket refusal: an instance we cannot watch but CAN prove relaunchable is
+    // restarted exactly as before — the result is honestly unconfirmable, which is
+    // a different thing from unsafe.
+    const preflight = vi.fn(async () => ({ ok: true }));
+    __panelToolsTestHooks.setLocalRestartPreflight(preflight);
+    const { ctx, sends } = makeCtx({ confirm: "yes", frontsBoot: false });
+
+    const out = parse(await restartTool().handler({}, ctx));
+
+    expect(preflight).toHaveBeenCalled();
+    expect(out.rebooting).toBe(true);
+    expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(true);
+  });
+
+  it("a REMOTE target is not assessed — the Manager reboot is its only restart path", async () => {
+    // There is no local process to assess, and a supervised remote (the tunnelled
+    // Desktop app) restarts through exactly this reboot by design. Refusing here
+    // would remove a path that works, which is the opposite of the point.
+    hoistedConfig.remote.value = true;
     const preflight = vi.fn(async () => ({ ok: false, reason: "would refuse" }));
     __panelToolsTestHooks.setLocalRestartPreflight(preflight);
     const { ctx, sends } = makeCtx({ confirm: "yes", frontsBoot: false });
 
     const out = parse(await restartTool().handler({}, ctx));
 
-    expect(out.rebooting).toBe(true);
     expect(preflight).not.toHaveBeenCalled();
+    expect(out.rebooting).toBe(true);
     expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(true);
   });
 

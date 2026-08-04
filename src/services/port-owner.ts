@@ -7,7 +7,7 @@
 // existing tests keep importing it from there.
 
 import { execSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync, readlinkSync } from "node:fs";
 import { platform } from "node:os";
 
 const IS_WIN = platform() === "win32";
@@ -241,13 +241,48 @@ const defaultProcNetReader: ProcNetTableReader = (table) => readFileSync(table, 
 
 let procNetReader: ProcNetTableReader = defaultProcNetReader;
 
+/**
+ * How `/proc/<pid>/fd` is walked to ATTRIBUTE a kernel socket to a process (#795).
+ *
+ * Injected for the same reason as the socket-table reader: on a Linux runner the
+ * real `/proc` exists, so an un-injected read would grade assertions against the
+ * runner's own process table instead of the fixtures. Kept as three narrow
+ * operations rather than a filesystem handle so a test can make ONE pid unreadable
+ * (the permission case that must never become a definite answer) without having to
+ * model a filesystem.
+ */
+export interface ProcFdReader {
+  /** Numeric entries of `/proc` — every process on the machine. */
+  listPids(): number[];
+  /** Entries of `/proc/<pid>/fd`. */
+  listFds(pid: number): string[];
+  /** Target of `/proc/<pid>/fd/<fd>` — `socket:[<inode>]` for a socket. */
+  readFdLink(pid: number, fd: string): string;
+}
+
+const defaultProcFdReader: ProcFdReader = {
+  listPids: () =>
+    readdirSync("/proc")
+      .filter((name) => /^\d+$/.test(name))
+      .map((name) => Number(name)),
+  listFds: (pid) => readdirSync(`/proc/${pid}/fd`),
+  readFdLink: (pid, fd) => readlinkSync(`/proc/${pid}/fd/${fd}`),
+};
+
+let procFdReader: ProcFdReader = defaultProcFdReader;
+
 export const __portOwnerTestHooks = {
   /** Drive the kernel-table read. `null` restores the real `/proc` reader. */
   setProcNetReader(fn: ProcNetTableReader | null): void {
     procNetReader = fn ?? defaultProcNetReader;
   },
+  /** Drive the `/proc/<pid>/fd` walk (#795). `null` restores the real reader. */
+  setProcFdReader(fn: ProcFdReader | null): void {
+    procFdReader = fn ?? defaultProcFdReader;
+  },
   reset(): void {
     procNetReader = defaultProcNetReader;
+    procFdReader = defaultProcFdReader;
   },
 };
 
@@ -387,7 +422,15 @@ const KERNEL_DECIMAL = /^\d+$/;
 interface KernelRow {
   slot: number;
   localPort: string;
+  /** The local address exactly as the table printed it (8 or 32 hex digits). */
+  localAddressHex: string;
   state: string;
+  /**
+   * The socket's inode, present only when the WHOLE row parsed. This is the join
+   * key to `/proc/<pid>/fd/*` → `socket:[<inode>]`, i.e. the half of the identity
+   * that names an OWNER (#795); the existence half above never depends on it.
+   */
+  inode?: string;
 }
 
 /**
@@ -428,7 +471,12 @@ function parseKernelRowPrefix(
   ) {
     return undefined;
   }
-  return { slot: Number(slot[1]), localPort: local[2], state };
+  return {
+    slot: Number(slot[1]),
+    localPort: local[2],
+    localAddressHex: local[1],
+    state,
+  };
 }
 
 function parseKernelRow(
@@ -448,7 +496,63 @@ function parseKernelRow(
   ) {
     return undefined;
   }
-  return prefix;
+  return { ...prefix, inode: cols[9] };
+}
+
+/**
+ * The kernel's hex local address as text the ADDRESS COMPARATOR understands, or
+ * `undefined` when this module will not risk a comparison.
+ *
+ * Both tables print addresses as little-endian 32-bit words, so the bytes come out
+ * reversed WITHIN each word: `0100007F` is 127.0.0.1, and the 32-digit
+ * `00000000000000000000000001000000` is `::1`. Verified against live kernel output.
+ *
+ * Only the forms whose spelling is unambiguous are produced — a dotted quad, the
+ * two wildcards, `::1`, and an IPv4-mapped `::ffff:a.b.c.d` reduced to its IPv4
+ * form. A general IPv6 address has several legal textual spellings (which groups
+ * `::` elides, leading zeros, case), and picking one to string-compare against a
+ * user-supplied host would be a guess; guessing here would produce a POSITIVE
+ * attribution, which is the direction that licenses stopping a process. So it
+ * returns `undefined` and the caller declines to attribute — the honest cost is a
+ * fall-through to lsof, never a wrong owner.
+ */
+function decodeKernelAddress(hex: string): string | undefined {
+  const bytes: number[] = [];
+  if (hex.length !== 8 && hex.length !== 32) return undefined;
+  for (let word = 0; word < hex.length / 8; word++) {
+    const w = hex.slice(word * 8, word * 8 + 8);
+    // Little-endian: the LAST byte pair of the word is the FIRST address byte.
+    for (let i = 3; i >= 0; i--) {
+      const byte = parseInt(w.slice(i * 2, i * 2 + 2), 16);
+      if (Number.isNaN(byte)) return undefined;
+      bytes.push(byte);
+    }
+  }
+  if (bytes.length === 4) return bytes.join(".");
+  const zeros = (from: number, to: number): boolean =>
+    bytes.slice(from, to).every((b) => b === 0);
+  if (zeros(0, 16)) return "::";
+  if (zeros(0, 15) && bytes[15] === 1) return "::1";
+  // IPv4-mapped (::ffff:a.b.c.d) — what a dual-stack socket shows for an IPv4 peer.
+  if (zeros(0, 10) && bytes[10] === 0xff && bytes[11] === 0xff) {
+    return bytes.slice(12).join(".");
+  }
+  return undefined;
+}
+
+/**
+ * May a kernel row be attributed to the host we are actually talking to?
+ *
+ * With no host constraint every listener on the port qualifies, exactly as the lsof
+ * parser behaves — so the address is not even decoded. With one, an address we
+ * decline to decode is NOT a match: the strictness belongs to the finding that
+ * would name an owner.
+ */
+function kernelRowServesHost(localAddressHex: string, wantHost?: string): boolean {
+  if (!wantHost) return true;
+  const decoded = decodeKernelAddress(localAddressHex);
+  if (decoded === undefined) return false;
+  return addressServesHost(decoded, wantHost);
 }
 
 /**
@@ -477,8 +581,25 @@ function kernelHeader(remoteColumn: string): RegExp {
   );
 }
 
-function readKernelSocketTables(port: number): KernelSocketTables {
+/**
+ * What the kernel tables said: whether anything is listening, and — separately —
+ * the inodes of the listening sockets that may be attributed to `host` (#795).
+ *
+ * The two answer DIFFERENT questions and are gathered to different standards. The
+ * existence half stays exactly as #785 left it: port-only (a listener on any local
+ * address blocks a `free` verdict) and satisfied by a row truncated after its state.
+ * The inode half backs a POSITIVE claim about a specific process, so it takes only
+ * rows that parsed WHOLE and whose address provably serves the host asked about.
+ */
+interface KernelTableReading {
+  existence: KernelSocketTables;
+  inodes: string[];
+}
+
+function readKernelSocketTables(port: number, host?: string): KernelTableReading {
   const wanted = port.toString(16).toUpperCase().padStart(4, "0");
+  const inodes: string[] = [];
+  let sawListener = false;
   let tablesRead = 0;
   let blind = false;
   for (const { path: table, addressHexWidth, header } of KERNEL_TABLES) {
@@ -528,19 +649,32 @@ function readKernelSocketTables(port: number): KernelSocketTables {
       // ahead of this would be the same fold as everywhere else in this function,
       // merely pointed at a positive: withholding a finding we actually made.
       const prefix = parseKernelRowPrefix(cols, addressHexWidth);
-      if (
-        prefix &&
+      const matchesPort =
+        prefix != null &&
         prefix.localPort.toUpperCase() === wanted &&
-        prefix.state.toUpperCase() === LISTEN_STATE
-      ) {
-        return "listening";
-      }
+        prefix.state.toUpperCase() === LISTEN_STATE;
+      if (matchesPort) sawListener = true;
       // Everything below serves the NEGATIVE, which is the half that needs the row
-      // to be whole.
+      // to be whole — and the inode, which needs the same wholeness for its own
+      // reason (see KernelTableReading). Scanning ON past a positive costs one more
+      // table read and cannot unmake `sawListener`, which is spent before `blind`
+      // below: a socket we have already seen stays seen however damaged the rest is.
       const row = parseKernelRow(cols, addressHexWidth);
       if (row === undefined) {
         blind = true;
         continue;
+      }
+      if (
+        matchesPort &&
+        row.inode != null &&
+        // A LISTEN row always carries a real inode. `0` is what a socket with no
+        // inode of its own prints (a TIME_WAIT/request socket), and `socket:[0]`
+        // is not something any `/proc/<pid>/fd` entry points at — matching on it
+        // could only ever produce a coincidence, never an owner.
+        row.inode !== "0" &&
+        kernelRowServesHost(row.localAddressHex, host)
+      ) {
+        inodes.push(row.inode);
       }
       // The kernel numbers rows with a running counter from 0, so the sequence is
       // its own continuity check: a GAP means a record between these two is missing
@@ -555,11 +689,133 @@ function readKernelSocketTables(port: number): KernelSocketTables {
     // not see where it ENDS. Either way this read cannot support a definite negative.
     if (!sawHeader || !raw.endsWith("\n")) blind = true;
   }
-  // A blind spot outranks everything except a positive: it means something could
-  // still be hiding. Only when nothing could be — every table either read cleanly
-  // or provably does not exist — may this answer be spent.
-  if (blind) return "incomplete";
-  return tablesRead === 0 ? "unavailable" : "none";
+  // A POSITIVE outranks everything, including a blind spot: a socket we saw is a
+  // socket, however much else was lost. Then a blind spot outranks the negative — it
+  // means something could still be hiding. Only when nothing could be — every table
+  // either read cleanly or provably does not exist — may the negative be spent.
+  const existence: KernelSocketTables = sawListener
+    ? "listening"
+    : blind
+      ? "incomplete"
+      : tablesRead === 0
+        ? "unavailable"
+        : "none";
+  return { existence, inodes };
+}
+
+/**
+ * WHO holds these listening sockets, resolved from `/proc` alone (#795).
+ *
+ * `/proc/net/tcp{,6}` gave the socket's inode; every `/proc/<pid>/fd/*` symlink of a
+ * process holding it reads `socket:[<inode>]`. Matching the two names the owner with
+ * no external binary at all, which is the point: a host without `lsof` was otherwise
+ * permanently unable to identify its own ComfyUI, and every feature built on process
+ * identity degraded to "cannot confirm" there forever.
+ *
+ * Both halves of the tri-state are earned:
+ *   • `owned` means THIS PROCESS HOLDS THE LISTENING SOCKET. Deliberately not "is
+ *     the only process that holds it" — see the note on blindness below.
+ *   • anything else is `unattributed`, which is NOT a statement that the port is
+ *     free — the kernel already told us a socket is there. It only means this source
+ *     could not name the owner, and the caller falls through to lsof exactly as
+ *     before.
+ *
+ * SEVERAL VISIBLE holders is `unattributed` on purpose. Forked workers and
+ * SO_REUSEPORT siblings genuinely share one listener, and picking one of them out of
+ * a set we can SEE would be arbitrary. "Two processes share this socket" is a better
+ * answer than an arbitrary one.
+ *
+ * A pid whose `/proc/<pid>/fd` cannot be read does NOT withdraw a single-holder
+ * finding, and that asymmetry is a decision, not an oversight:
+ *
+ *   • Requiring a complete walk would make attribution impossible on any multi-user
+ *     host. An unprivileged process cannot read the fds of ANY other user's process,
+ *     and every Linux box runs root daemons — so "the walk was complete" is
+ *     essentially never true, and demanding it would restore exactly the permanent
+ *     "cannot confirm" this whole change exists to remove.
+ *   • lsof reaches no further. It reads the same `/proc/<pid>/fd` with the same
+ *     credentials, so falling through to it after refusing here buys nothing.
+ *   • The residual harm is bounded by HOW the pid is spent. A socket is shared by
+ *     INHERITANCE (fork, or SCM_RIGHTS), so an unseen co-holder is essentially always
+ *     a descendant — and every kill in this codebase kills the process TREE/group,
+ *     which takes those with it. Nothing here is ever used to certify a port as free;
+ *     that verdict comes only from the kernel table, which sees every socket
+ *     regardless of owner.
+ */
+type ProcAttribution =
+  /** `inode` is carried so the caller can re-verify THAT socket, not just the port. */
+  | { state: "owned"; pid: number; inode: string }
+  | { state: "unattributed"; reason: string };
+
+/** Did this read fail because the process is GONE, or because we could not look? */
+function pidVanished(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException)?.code;
+  // ENOENT: the pid exited between listing /proc and reading its fds — it cannot be
+  // holding the socket. ESRCH is the same fact by another name. Anything else
+  // (EACCES/EPERM on another user's process, and an errno-less failure) is a place we
+  // could not see into, and something could be hiding there.
+  return code === "ENOENT" || code === "ESRCH";
+}
+
+function attributeInodes(inodes: string[], port: number): ProcAttribution {
+  const wanted = new Map(inodes.map((inode) => [`socket:[${inode}]`, inode]));
+  let pids: number[];
+  try {
+    pids = procFdReader.listPids();
+  } catch (err) {
+    return {
+      state: "unattributed",
+      reason: `a socket is listening on port ${port} but /proc could not be enumerated to name its owner (${
+        err instanceof Error ? err.message : String(err)
+      })`,
+    };
+  }
+  const owners = new Map<number, string>();
+  let blind = false;
+  for (const pid of pids) {
+    let fds: string[];
+    try {
+      fds = procFdReader.listFds(pid);
+    } catch (err) {
+      if (!pidVanished(err)) blind = true;
+      continue;
+    }
+    for (const fd of fds) {
+      let link: string;
+      try {
+        link = procFdReader.readFdLink(pid, fd);
+      } catch (err) {
+        // A single fd closing mid-walk is ordinary; a permission wall is not.
+        if (!pidVanished(err)) blind = true;
+        continue;
+      }
+      const inode = wanted.get(link);
+      if (inode !== undefined) {
+        owners.set(pid, inode);
+        break;
+      }
+    }
+  }
+  if (owners.size === 1) {
+    const [pid, inode] = [...owners][0];
+    return { state: "owned", pid, inode };
+  }
+  if (owners.size > 1) {
+    return {
+      state: "unattributed",
+      reason: `the socket listening on port ${port} is held by several processes (${[
+        ...owners.keys(),
+      ]
+        .sort((a, b) => a - b)
+        .join(", ")}), so no single process owns it`,
+    };
+  }
+  return {
+    state: "unattributed",
+    reason: blind
+      ? `a socket is listening on port ${port} but the /proc entries that would name its owner could not all be read (it belongs to another user, or the process list changed underneath us)`
+      : `a socket is listening on port ${port} but no process in /proc holds it`,
+  };
 }
 
 export function probePortOwner(port: number, host?: string): PortOwnerProbe {
@@ -612,12 +868,52 @@ export function probePortOwner(port: number, host?: string): PortOwnerProbe {
   // not, so lsof failing to find or name a listener the kernel CAN see means "I
   // could not identify it", never "it is not there". A positive existence finding is
   // therefore never overridable by a negative from a source that sees strictly less.
-  const kernel = readKernelSocketTables(port);
+  const reading = readKernelSocketTables(port, host);
+  const kernel = reading.existence;
   if (kernel === "none") return { state: "free" };
+
+  // ATTRIBUTION FROM THE SAME SOURCE (#795). The kernel table already handed us the
+  // listening socket's inode; `/proc/<pid>/fd` says which process holds it. Consulted
+  // BEFORE lsof because it is the same evidence one step further along, needs no
+  // external binary, and reaches exactly as far as an unprivileged lsof does — so on
+  // a host with no lsof at all this is the difference between an identified server
+  // and a permanent "cannot confirm". It never answers `free`: existence was settled
+  // above, and failing to NAME an owner is not evidence there is none.
+  let procNote: string | undefined;
+  if (reading.inodes.length > 0) {
+    const attributed = attributeInodes(reading.inodes, port);
+    if (attributed.state === "owned") {
+      // BRACKET THE JOIN (codex gate). The inode came from one read and the fd walk
+      // is another, and a socket inode is reusable the moment its socket closes: the
+      // listener can go away between the two, its number be handed to an unrelated
+      // socket, and the walk then name whatever process holds THAT. Nothing later
+      // would catch it on the path where the server is wedged and has no argv to
+      // corroborate against — and the pid is what a stop kills.
+      //
+      // So re-read the table and require the SAME inode to still be listening on the
+      // port. This is the same discipline the restart path already applies to the
+      // /system_stats pairing: carry something across two observations that a
+      // substitution cannot reproduce.
+      const after = readKernelSocketTables(port, host);
+      // The SPECIFIC inode the fd walk matched — not merely "one of the ones we
+      // started with". A different listener arriving on the port is exactly the
+      // substitution being guarded against.
+      if (after.inodes.includes(attributed.inode)) {
+        return { state: "owned", pid: attributed.pid };
+      }
+      procNote =
+        `the socket listening on port ${port} changed while its owner was being identified, ` +
+        `so PID ${attributed.pid} cannot be tied to it`;
+    } else {
+      procNote = attributed.reason;
+    }
+  }
 
   const listeningButUnnamed = {
     state: "unknown",
-    reason: "a socket is listening on the port but lsof could not name its owner",
+    reason:
+      "a socket is listening on the port but lsof could not name its owner" +
+      (procNote ? `, and ${procNote}` : ""),
   } as const;
 
   /**
@@ -676,7 +972,12 @@ export function probePortOwner(port: number, host?: string): PortOwnerProbe {
     }
     return {
       state: "unknown",
-      reason: `lsof: ${err instanceof Error ? err.message : String(err)}`,
+      reason:
+        // The /proc finding leads when there is one: on a host with no lsof at all
+        // (#795's whole subject) "lsof: spawn ENOENT" says nothing about the port,
+        // while "a socket is listening but its owner is another user's" does.
+        (procNote ? `${procNote}; ` : "") +
+        `lsof: ${err instanceof Error ? err.message : String(err)}`,
     };
   }
 }

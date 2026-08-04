@@ -6493,8 +6493,27 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // (Electron-supervised, #400), unverifiable, or remote — proceeds exactly as
         // before. The binding for this DECISION is captured pre-await; nothing
         // downstream may reuse it (r7).
+        //
+        // #814: THE GATE IS NOT THE SAME AS THE PROOF. `captureRebootHealthBase`
+        // answers "can I CERTIFY that this instance cycled?" — it requires a
+        // loopback boot base, a server-observed handshake Origin, a pathless mount.
+        // Gating the SAFETY CHECK on that same capture meant an instance we could
+        // not certify was also an instance we never assessed: the reboot went out
+        // with no evidence at all, the server stopped, nothing brought it back, and
+        // the result honestly reported that it could not confirm the return — a
+        // verdict computed after a stop it should not have made. Being unable to
+        // watch something come back is a reason for MORE care about stopping it, not
+        // less. So the assessment below now runs for ANY local target; only the
+        // certification stays bound to the tab.
         const preflightHealthBase = captureRebootHealthBase(ctx);
-        if (preflightHealthBase != null && sameHttpBase(getComfyUIBaseUrl(), preflightHealthBase)) {
+        const preflightBound =
+          preflightHealthBase != null &&
+          sameHttpBase(getComfyUIBaseUrl(), preflightHealthBase);
+        // Cloud/remote targets are excluded for the reason they always were: there is
+        // no local process to assess, and the Manager reboot is their ONLY restart
+        // path — a supervised remote (the tunnelled Desktop app) restarts through it
+        // by design, so refusing there would remove a path that works.
+        if (preflightBound || (!isRemoteMode() && !isCloudMode())) {
           // Snapshot the target GENERATION at the decision (r11): a final-state
           // base comparison (A vs A) cannot detect an intervening A→B→A
           // retarget, so stability is judged by the monotonic epoch bumped on
@@ -6517,7 +6536,16 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             sameHttpBase(preflightHealthBase, postPreflightHealthBase);
           const configStable =
             getComfyuiTargetGeneration() === preflightTargetGeneration;
-          if (!configStable && tabFrontsSameInstance) {
+          // WHOM DOES THE ASSESSMENT SPEAK FOR?
+          //   • bound (r9): the instance the TAB fronts, so it holds exactly as long
+          //     as the tab still fronts that same instance — unchanged behaviour.
+          //   • unbound (#814): there was no tab binding to follow, so the assessment
+          //     speaks for the orchestrator's own local target, which is what the
+          //     reboot will reach. It applies unconditionally; whether the config
+          //     moved mid-await is handled immediately below, where an assessment
+          //     that can no longer vouch for anything refuses rather than proceeds.
+          const assessmentApplies = preflightBound ? tabFrontsSameInstance : true;
+          if (!configStable && assessmentApplies) {
             // r10: the target config moved MID-CHECK, so the preflight result
             // — pass OR fail — cannot vouch for the tab-fronted instance (a
             // PASS may have validated a different, safe install; it must never
@@ -6531,13 +6559,15 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               note:
                 "Refusing to restart ComfyUI: the ComfyUI target configuration changed " +
                 "while the restart safety check was running, so the check cannot vouch " +
-                "for a safe relaunch of the instance this panel fronts. A stop is never " +
+                `for a safe relaunch of the instance this restart would cycle${
+                  preflightBound ? " (the one this panel fronts)" : ""
+                }. A stop is never ` +
                 "sent to an instance whose relaunch is unproven — ComfyUI was NOT " +
                 "stopped (it is still running). Let the target settle, then retry " +
                 "panel_restart_comfyui.",
             });
           }
-          if (!preflight.ok && tabFrontsSameInstance) {
+          if (!preflight.ok && assessmentApplies) {
             // r9: the danger proof follows the INSTANCE the tab fronts, NOT the
             // mutable runtime config — a config-only retarget mid-await must
             // not wash out the proof that the tab-fronted boot instance is
@@ -6554,11 +6584,17 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               confirmed_cycle: false,
               refused: true,
               note:
-                `Refusing to restart ComfyUI: ${preflight.reason} This looks like an ` +
-                "externally-managed install (e.g. Pinokio): a restart from here would STOP " +
-                "ComfyUI and nothing would bring it back automatically, so it was refused " +
-                "BEFORE anything was stopped — ComfyUI is still running. Restart it from the " +
-                "launcher that owns it (e.g. Pinokio's own controls), or point COMFYUI_PATH " +
+                // The REASON leads, because there is now more than one shape that
+                // reaches here — an externally-managed install whose launch command
+                // cannot be rebuilt (Pinokio, #742) and a Desktop instance whose
+                // supervisor has gone (#814) — and telling a Desktop user to check
+                // Pinokio would send them somewhere they have never been.
+                `Refusing to restart ComfyUI: ${preflight.reason} A restart from here would ` +
+                "STOP ComfyUI and nothing would bring it back automatically, so it was " +
+                "refused BEFORE anything was stopped — ComfyUI is still running. Restart it " +
+                "from whatever launches it (its own launcher — e.g. Pinokio's own controls — " +
+                "the Desktop app, or your terminal); for an externally-managed install you " +
+                "can also point COMFYUI_PATH " +
                 "at the live install so a relaunch can be proven and use restart_comfyui.",
             });
           }
