@@ -118,10 +118,56 @@ export async function searchNodes(
 
   const start = (page - 1) * limit;
   const paged = filtered.slice(start, start + limit);
+
+  // #773 — the client-side filter only ever sees a 100-pack WINDOW of a
+  // registry with thousands of packs, so a query naming a real pack outside
+  // that window (including its exact id, e.g. "comfyui kjnodes" →
+  // "comfyui-kjnodes") false-empties. When the filter matched NOTHING, try the
+  // direct pack-details endpoint with the query normalized to a registry-id
+  // slug before reporting no matches. The fallback can only ADD a result; a
+  // 404 (no such id) or any fetch failure leaves the honest empty answer.
+  if (lowerQuery && filtered.length === 0) {
+    const candidate = registryIdCandidateFromQuery(query);
+    if (candidate) {
+      try {
+        const details = await getNodePackDetails(candidate);
+        logger.info(
+          `Registry search "${query}" matched nothing in the fetched window, ` +
+            `but "${candidate}" resolved via the direct pack-details endpoint`,
+        );
+        return [normalizeSearchResult(details)];
+      } catch (err) {
+        // 404 = genuinely no pack with that id; anything else = the fallback
+        // could not answer. Either way the SEARCH answer stays empty — it was
+        // empty on its own — so this only ever declines to add a result.
+        logger.debug(
+          `Registry exact-id fallback for "${query}" ("${candidate}") did not resolve: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
+  }
+
   logger.info(
     `Registry search "${query}": fetched ${allNodes.length}, matched ${filtered.length}, returning ${paged.length} (page ${page}, limit ${limit})`,
   );
   return paged.map(normalizeSearchResult);
+}
+
+/**
+ * Normalize a free-text query to a candidate Comfy Registry pack id: lowercase,
+ * runs of non-alphanumerics collapsed to single hyphens, edges trimmed
+ * ("comfyui kjnodes" → "comfyui-kjnodes"). Undefined when nothing usable
+ * remains.
+ */
+export function registryIdCandidateFromQuery(query: string): string | undefined {
+  const slug = query
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug.length > 0 ? slug : undefined;
 }
 
 /** Coerce the registry's object-shaped `latest_version` into a string. */

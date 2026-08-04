@@ -37,6 +37,7 @@ import { extname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { comfyuiFetch } from "../comfyui/fetch.js";
 import { assertPanelNotTargetedUnverifiable } from "../services/panel-pin-guard.js";
+import { normalizeGitUrlInstallArgs } from "../services/node-management.js";
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { parse as parseYaml } from "yaml";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
@@ -7783,7 +7784,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_install_node",
-      "Install a custom-node pack into the user's ComfyUI via the BUILT-IN Manager (queues the install). Pass `id` (registry id like 'comfyui-kjnodes' or 'author/repo') from panel_search_nodes, or `repository` (git URL) for a nightly install. A ComfyUI restart (panel_restart_comfyui) is usually required afterward to load the nodes — poll panel_node_queue_status first. Prefer this over the headless install_custom_node tool. " +
+      "Install a custom-node pack into the user's ComfyUI via the BUILT-IN Manager (queues the install). Pass `id` (registry id like 'comfyui-kjnodes' or 'author/repo') from panel_search_nodes, or `repository` (git URL) for a nightly install. A search result whose `id` IS a git URL (legacy/repository-style entries) is auto-routed to a from-source 'nightly' install — 'latest' cannot resolve for those. A ComfyUI restart (panel_restart_comfyui) is usually required afterward to load the nodes — poll panel_node_queue_status first. Prefer this over the headless install_custom_node tool. " +
         "⚠️ QUEUE-DONE IS NOT INSTALLED: Manager marks a task 'done' (queue drained) even when the git clone produced NOTHING — an empty dir, a transient git failure, or a repo not in its registry. So after the queue is idle you MUST VERIFY with panel_list_nodes that each pack actually appears before you restart or report success; a pack you installed that is absent from that list did NOT install (retry it, or install it from its git `repository` URL). " +
         "Install packs ONE AT A TIME and confirm each populated before the next — batching several installs then restarting is exactly how you end up with empty dirs and a broken restart.",
       {
@@ -7799,10 +7800,30 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // spellings (registry id and git URL) — see panel-pin-guard.
         assertPanelNotTargetedUnverifiable("panel_install_node", args.id);
         assertPanelNotTargetedUnverifiable("panel_install_node", args.repository);
-        return ctx.call(
-          { cmd: "nodes_install", id: args.id, repository: args.repository, version: args.version, channel: args.channel, mode: args.mode },
+        // #789 — a search result whose `id` is a repository URL (the Manager's
+        // legacy/repository-style entries) cannot install as id+"latest": the
+        // Manager resolves that as a registry version and rejects it ("not
+        // available node: <repo>@<version>"). Route it as the from-source
+        // repository install that works, and disclose the rewrite.
+        const norm = normalizeGitUrlInstallArgs(args);
+        const res = await ctx.call(
+          {
+            cmd: "nodes_install",
+            id: norm.id ?? args.id,
+            repository: norm.repository ?? args.repository,
+            version: norm.version ?? args.version,
+            channel: args.channel,
+            mode: args.mode,
+          },
           30000,
         );
+        if (norm.note) {
+          const text = res.content.find((c) => c.type === "text");
+          if (text && text.type === "text") {
+            text.text += `\n\nNOTE: ${norm.note}`;
+          }
+        }
+        return res;
       },
     ),
     def(

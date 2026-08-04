@@ -6,6 +6,9 @@ import {
   updateCustomNode,
   reinstallCustomNode,
   fixCustomNode,
+  disableCustomNode,
+  enableCustomNode,
+  uninstallCustomNode,
   listInstalledNodes,
   syncNodeDependencies,
   parseGitUrl,
@@ -164,7 +167,7 @@ const useCmCliSchema = z
   .boolean()
   .optional()
   .describe(
-    "Force the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install.",
+    "Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — when the CLI is unavailable, the operation falls back to Manager HTTP automatically (disclosed in the result).",
   );
 
 const channelSchema = z
@@ -326,6 +329,81 @@ export function registerNodeManagementTools(server: McpServer): void {
           assertPanelNotTargetedUnverifiable("fix_custom_node", args.id);
         }
         const result = await fixCustomNode({ ...args, useCmCli: preferLocalComfyCli(args.useCmCli) });
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+        };
+      } catch (err) {
+        return errorToToolResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "disable_custom_node",
+    "Disable an installed ComfyUI custom node pack WITHOUT removing it — the reversible first step of a cleanup (re-enable with enable_custom_node; uninstall_custom_node removes a pack outright). Uses the ComfyUI-Manager HTTP API (works against remote instances) or official comfy-cli locally, and re-reads the installed-pack list afterwards so a Manager no-op is reported as NOT disabled rather than as success. A ComfyUI restart is required for the change to take effect. REFUSES the comfyui-mcp sidebar panel pack.",
+    {
+      id: z
+        .string()
+        .describe("Registry id / module name of the installed pack to disable."),
+      useCmCli: useCmCliSchema,
+    },
+    async (args) => {
+      try {
+        // Same refusal as fix_custom_node: this path's post-state check reads
+        // the Manager list, which cannot see a ".bak" shadow copy (#641) — the
+        // panel goes through the verified install_panel path only.
+        if (targetsPanelPackExactly(args.id)) {
+          assertPanelNotTargetedUnverifiable("disable_custom_node", args.id);
+        }
+        const result = await disableCustomNode({ ...args, useCmCli: preferLocalComfyCli(args.useCmCli) });
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+        };
+      } catch (err) {
+        return errorToToolResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "enable_custom_node",
+    "Re-enable a ComfyUI custom node pack previously disabled with disable_custom_node. Uses the ComfyUI-Manager HTTP API (works against remote instances) or official comfy-cli locally, and re-reads the installed-pack list afterwards so a Manager no-op is reported as NOT enabled rather than as success. A ComfyUI restart is required for the change to take effect. REFUSES the comfyui-mcp sidebar panel pack.",
+    {
+      id: z
+        .string()
+        .describe("Registry id / module name of the installed pack to enable."),
+      useCmCli: useCmCliSchema,
+    },
+    async (args) => {
+      try {
+        if (targetsPanelPackExactly(args.id)) {
+          assertPanelNotTargetedUnverifiable("enable_custom_node", args.id);
+        }
+        const result = await enableCustomNode({ ...args, useCmCli: preferLocalComfyCli(args.useCmCli) });
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+        };
+      } catch (err) {
+        return errorToToolResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "uninstall_custom_node",
+    "Uninstall a ComfyUI custom node pack (removes it). IRREVERSIBLE through this tool — for a cleanup audit prefer disable_custom_node, which is reversible. The pack must be one ComfyUI-Manager tracks: an id that resolves nowhere is REFUSED before anything is queued (a drained queue would otherwise read exactly like a success), and a pack that is on disk but unmanaged is named so you can remove its directory yourself. After the queue drains the installed-pack list is re-read and the pack must be GONE before anything claims 'uninstalled'. A ComfyUI restart is required to unload it fully. REFUSES the comfyui-mcp sidebar panel pack.",
+    {
+      id: z
+        .string()
+        .describe("Registry id / module name of the installed pack to uninstall."),
+      useCmCli: useCmCliSchema,
+    },
+    async (args) => {
+      try {
+        if (targetsPanelPackExactly(args.id)) {
+          assertPanelNotTargetedUnverifiable("uninstall_custom_node", args.id);
+        }
+        const result = await uninstallCustomNode({ ...args, useCmCli: preferLocalComfyCli(args.useCmCli) });
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
         };

@@ -27,6 +27,20 @@ vi.mock("../../config.js", () => ({
   getComfyUIAuthHeaders: () => ({}),
 }));
 
+// #775 — named saves resolve the local install root through
+// resolveEffectiveComfyUIBase (COMFYUI_PATH, then the saved default workspace),
+// not a bare config.comfyuiPath check. Control the saved-default half here.
+const wsMock = vi.hoisted(() => ({ saved: undefined as string | undefined }));
+vi.mock("../../services/workspace-env.js", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../../services/workspace-env.js")>();
+  return {
+    ...actual,
+    resolveEffectiveComfyUIBase: () =>
+      (config as { comfyuiPath?: string }).comfyuiPath ?? wsMock.saved,
+  };
+});
+
 const fsMocks = vi.hoisted(() => ({
   existsSync: vi.fn(() => false),
   mkdirSync: vi.fn(),
@@ -76,6 +90,7 @@ import {
   saveNodeSnapshot,
   restoreNodeSnapshot,
   listNodeSnapshots,
+  cancelPendingSnapshotRestore,
 } from "../../services/node-snapshots.js";
 import { NodeSnapshotError } from "../../utils/errors.js";
 import { config } from "../../config.js";
@@ -98,6 +113,7 @@ beforeEach(() => {
   fsMocks.mkdirSync.mockReset();
   fsMocks.writeFileSync.mockReset();
   (config as { comfyuiPath?: string }).comfyuiPath = "/fake/comfyui";
+  wsMock.saved = undefined;
   vi.stubGlobal("fetch", fetchMock);
 });
 
@@ -293,6 +309,47 @@ describe("saveNodeSnapshot (named — file path)", () => {
     // Must not have made any HTTP call or written files.
     expect(fetchMock).not.toHaveBeenCalled();
     expect(fsMocks.writeFileSync).not.toHaveBeenCalled();
+  });
+
+  it("#775 resolves a named save from the SAVED DEFAULT WORKSPACE when COMFYUI_PATH is unset", async () => {
+    // The reported defect: a local install connected via URL, default workspace
+    // saved, was told "remote (--comfyui-url) mode" by code that only checked
+    // config.comfyuiPath. The shared resolver (get_environment / extra_paths)
+    // knows the workspace — the snapshot must be written under IT.
+    (config as { comfyuiPath?: string }).comfyuiPath = undefined;
+    wsMock.saved = "/saved/ws";
+    const state = { comfyui: "abc123", git_custom_nodes: {} };
+    fetchMock.mockResolvedValueOnce(jsonResponse(state));
+
+    const result = await saveNodeSnapshot("pre-cleanup");
+    expect(result.method).toBe("file");
+    const [writtenPath] = fsMocks.writeFileSync.mock.calls[0] ?? [];
+    expect(writtenPath).toBe(
+      join("/saved/ws", "user", "__manager", "snapshots", "pre-cleanup.json"),
+    );
+  });
+
+  it("#775 the no-local-root refusal names what was actually checked (not a blanket 'remote mode')", async () => {
+    (config as { comfyuiPath?: string }).comfyuiPath = undefined;
+    wsMock.saved = undefined;
+    const err = await saveNodeSnapshot("name").catch((e: Error) => e);
+    expect(err).toBeInstanceOf(NodeSnapshotError);
+    expect(err.message).toMatch(/COMFYUI_PATH is unset/);
+    expect(err.message).toMatch(/default workspace/);
+    expect(err.message).not.toMatch(/unavailable in remote \(--comfyui-url\) mode/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("#775 cancelPendingSnapshotRestore checks the saved default workspace, not just COMFYUI_PATH", async () => {
+    (config as { comfyuiPath?: string }).comfyuiPath = undefined;
+    wsMock.saved = "/saved/ws";
+    const result = cancelPendingSnapshotRestore();
+    // Not the false "remote" verdict: the local candidates WERE checked.
+    expect(result.outcome).toBe("not-scheduled");
+    expect(result.checkedPaths.length).toBeGreaterThan(0);
+    expect(
+      result.checkedPaths.every((p) => p.replace(/\\/g, "/").startsWith("/saved/ws/")),
+    ).toBe(true);
   });
 
   it("rejects path-traversal names before any IO", async () => {

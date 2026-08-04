@@ -1,7 +1,8 @@
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { config, getComfyUIBaseUrl } from "../config.js";
+import { getComfyUIBaseUrl } from "../config.js";
 import { comfyuiFetch } from "../comfyui/fetch.js";
+import { resolveEffectiveComfyUIBase } from "./workspace-env.js";
 import {
   recordPanelPendingOp,
   SNAPSHOT_RESTORE_PENDING_MS,
@@ -21,7 +22,9 @@ import { logger } from "../utils/logger.js";
 //
 // The HTTP API works against remote instances (--comfyui-url). Naming a
 // snapshot is only possible via the file fallback (writes get_current output
-// to the Manager snapshots dir), which requires a local config.comfyuiPath.
+// to the Manager snapshots dir), which requires a resolvable local install
+// root (resolveEffectiveComfyUIBase: COMFYUI_PATH, else the saved default
+// workspace — never in remote mode).
 // ---------------------------------------------------------------------------
 
 export interface SaveSnapshotResult {
@@ -50,7 +53,11 @@ const SNAPSHOTS_UNSUPPORTED_MESSAGE =
   "Node snapshots aren't supported on this ComfyUI-Manager build — its HTTP API " +
   "doesn't expose the /snapshot/* endpoints (common on the bundled ComfyUI Desktop " +
   "Manager). Update ComfyUI-Manager to a build that supports snapshots, or manage " +
-  "snapshots from the ComfyUI-Manager UI / comfy-cli instead.";
+  "snapshots from the ComfyUI-Manager UI / comfy-cli instead. When neither is " +
+  "available there is still a rollback path: before changing anything, copy the " +
+  "pack directories under custom_nodes somewhere safe (or move them into a " +
+  "custom_nodes/.disabled folder) and record what moved — restore is moving them " +
+  "back.";
 
 /**
  * True when an error indicates the Manager build simply lacks the snapshot
@@ -221,8 +228,8 @@ export async function listNodeSnapshots(): Promise<ListSnapshotsResult> {
  * - No name: POST /snapshot/save (Manager names it {date}_snapshot). Works
  *   remotely. We diff getlist before/after to report the created name.
  * - Named: fetch GET /snapshot/get_current and write <name>.json into the
- *   local Manager snapshots dir. Requires config.comfyuiPath (errors clearly
- *   in remote --comfyui-url mode).
+ *   local Manager snapshots dir. Requires a resolvable local install root
+ *   (resolveEffectiveComfyUIBase); errors clearly when there is none.
  */
 export async function saveNodeSnapshot(
   name?: string,
@@ -256,13 +263,20 @@ export async function saveNodeSnapshot(
     }
   }
 
-  // Named snapshot — requires a local install to write the file.
+  // Named snapshot — requires a local install to write the file. Resolve the
+  // install root through the SAME resolver get_environment / list_extra_paths /
+  // the comfy-cli wrapper use (#775): config.comfyuiPath, then the saved default
+  // workspace — never a bare "comfyuiPath unset ⇒ remote" conclusion, which
+  // misclassified a local install connected via --comfyui-url as remote.
   validateSnapshotName(trimmed);
-  if (!config.comfyuiPath) {
+  const comfyuiBase = resolveEffectiveComfyUIBase();
+  if (!comfyuiBase) {
     throw new NodeSnapshotError(
-      "Saving a named snapshot requires a local ComfyUI install path, which " +
-        "is unavailable in remote (--comfyui-url) mode. Omit the name to let " +
-        "ComfyUI-Manager assign a timestamped snapshot instead.",
+      "Saving a named snapshot requires a local ComfyUI install path, and none is " +
+        "available: COMFYUI_PATH is unset, no default workspace is saved (set one with " +
+        "the workspace tool, action 'set_default'), or the session targets a genuinely " +
+        "remote ComfyUI. Omit the name to let ComfyUI-Manager assign a timestamped " +
+        "snapshot instead — that works remotely.",
     );
   }
 
@@ -293,7 +307,7 @@ export async function saveNodeSnapshot(
   const isJson = lower.endsWith(".json");
   const fileName = isYaml || isJson ? trimmed : `${trimmed}.json`;
 
-  const dir = resolveSnapshotWriteDir(config.comfyuiPath);
+  const dir = resolveSnapshotWriteDir(comfyuiBase);
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
   }
@@ -420,20 +434,25 @@ export interface CancelSnapshotRestoreResult {
  * one of these, and leaving any of them in place risks the restore running).
  */
 export function cancelPendingSnapshotRestore(): CancelSnapshotRestoreResult {
-  if (!config.comfyuiPath) {
+  // Same resolver as a named save (#775): the saved default workspace counts as
+  // a local install path — a bare comfyuiPath check misclassified exactly that
+  // session as "remote".
+  const comfyuiBase = resolveEffectiveComfyUIBase();
+  if (!comfyuiBase) {
     return {
       outcome: "remote",
       deletedPaths: [],
       checkedPaths: [],
       detail:
-        "cannot cancel — remote host: the deferred restore file " +
+        "cannot cancel — no local install path (COMFYUI_PATH unset, no saved " +
+        "default workspace, or a genuinely remote target): the deferred restore file " +
         "(<ComfyUI>/user/**/startup-scripts/restore-snapshot.json) lives on the " +
         "ComfyUI host and this orchestrator has no local install path to delete " +
         "it through. Delete it on the host BEFORE the next ComfyUI restart, or " +
         "the restore will run.",
     };
   }
-  const checkedPaths = managerFilesDirCandidates(config.comfyuiPath).map((dir) =>
+  const checkedPaths = managerFilesDirCandidates(comfyuiBase).map((dir) =>
     join(dir, RESTORE_SNAPSHOT_FILE),
   );
   const found = checkedPaths.filter((p) => existsSync(p));
