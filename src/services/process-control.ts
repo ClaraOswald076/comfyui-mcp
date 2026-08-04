@@ -20,6 +20,13 @@ import {
   type LaunchEnvInfo,
   type LaunchEnvResolution,
 } from "./launcher-env.js";
+import {
+  classifyListenerOwnership,
+  isDescendantOfChild,
+  launchedChildStillRunning,
+  unclassifiedOwnership,
+  type ListenerOwnership,
+} from "./listener-ownership.js";
 import { resetManagerApiCache } from "./manager-api-cache.js";
 import {
   parseListenerPidFromNetstat,
@@ -145,48 +152,6 @@ interface RestartResult {
    * it explicitly.
    */
   listener_ownership: ListenerOwnership;
-}
-
-/**
- * Who owns the process serving the port after a launch (#776).
- *   "ours"        - the port owner IS the process this call launched (proven).
- *   "not-ours"    - a healthy listener that provably is NOT ours (a different
- *                   mapped owner, or our launched child already dead).
- *   "unconfirmed" - genuinely undecidable: the launched child is alive and the API
- *                   is ready, but the port owner could not be mapped (a supported
- *                   condition, #449), or the launcher's pid is indirect (Desktop).
- *                   Never silently upgraded to "ours".
- */
-declare const CLASSIFIED: unique symbol;
-
-/**
- * A verdict about who owns the healthy listener.
- *
- * BRANDED ON PURPOSE. The values are ordinary strings at runtime (they serialise
- * and compare as `"ours"` / `"not-ours"` / `"unconfirmed"`), but the type carries a
- * phantom property no literal can satisfy — so `listener_ownership: "not-ours"`
- * simply does not compile. Only `classifyListenerOwnership`, which actually gathers
- * the evidence, can mint a definite verdict; every other return path must call
- * `unclassifiedOwnership()` and therefore cannot claim more than it knows.
- *
- * This exists because the same defect kept reappearing on new paths: a definite
- * answer returned by code that never ran the check (#796). Making it a convention
- * meant remembering it at each site; making it a TYPE means the compiler remembers.
- */
-type ListenerOwnership = ("ours" | "not-ours" | "unconfirmed") & {
-  readonly [CLASSIFIED]: true;
-};
-
-/** The only verdict a site that did NOT classify is entitled to return. */
-function unclassifiedOwnership(): ListenerOwnership {
-  return "unconfirmed" as ListenerOwnership;
-}
-
-/** Mint a classified verdict. Callable only from the classifier below. */
-function classified(
-  verdict: "ours" | "not-ours" | "unconfirmed",
-): ListenerOwnership {
-  return verdict as ListenerOwnership;
 }
 
 interface StartupReadinessResult {
@@ -575,38 +540,6 @@ function childProcessErrorDetails(err: unknown): ChildProcessErrorDetails {
   };
 }
 
-/**
- * Is the process we spawned still alive? Tri-state, because only a DEFINITE answer
- * may change a verdict.
- *
- * Node delivers a child's `exit` event through the event loop, so "the handler has
- * not run yet" is NOT evidence the child is alive — and a pid whose child died can
- * be recycled by another program in that window (codex gate). A signal-0 probe
- * answers synchronously:
- *   false     - ESRCH, or an exit already recorded: our child is definitively gone.
- *   undefined - no pid to probe, or EPERM (a process has that pid but we may not
- *               signal it, i.e. it belongs to another user). "Cannot tell", never
- *               "alive" — and never "dead" either, since a missing pid must not by
- *               itself convict a launch that may well have worked.
- *   true      - the pid exists and is signalable. Necessary, NOT sufficient: a
- *               recycled pid also passes, which is why the caller additionally
- *               corroborates the command line.
- */
-function launchedChildStillRunning(child: ChildProcess): boolean | undefined {
-  const pid = child.pid;
-  if (pid == null) return undefined;
-  // Loose null check on purpose: a not-yet-exited child reports `null` here, and
-  // an absent property must read the same way rather than as "already exited".
-  if (child.exitCode != null || child.signalCode != null) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === "ESRCH") return false;
-    return undefined;
-  }
-}
 
 /** Injectable parent-pid reader (see readParentPid). */
 let parentPidResolverOverride: ((pid: number) => number | undefined) | null = null;
@@ -629,262 +562,7 @@ function readParentPid(pid: number): number | undefined {
   return resolveProcessIdentity(pid)?.parentPid;
 }
 
-/**
- * Is `pid` this orchestrator, or a DESCENDANT of it?
- *
- * A direct-child test is too strict for a legitimately indirect launcher: a
- * wrapper script, a double fork, or a venv trampoline all mean the process that
- * ends up holding the port is our grandchild, not our child. Telling those users
- * "this server was not started by us" is a false negative, so the parent chain is
- * walked (a few hops, hard-bounded) before concluding anything.
- *
- * Returns `undefined` the moment the chain becomes unreadable — not knowing is
- * never promoted to a claim in either direction.
- */
-function isOurDescendant(pid: number, maxHops = 8): boolean | undefined {
-  let current = pid;
-  for (let hop = 0; hop < maxHops; hop++) {
-    if (current === process.pid) return true;
-    const parent = readParentPid(current);
-    if (parent == null) return undefined;
-    // pid 1 / 0 / self-parenting = we reached the TOP of the tree without finding
-    // ourselves, which is a real negative answer.
-    if (parent === current || parent <= 1) return false;
-    current = parent;
-  }
-  // Ran out of budget. That is "I did not finish looking", NOT "it is not ours" —
-  // a deep-but-legitimate wrapper chain must not be reported as a foreign server
-  // just because the walk was bounded (codex gate).
-  return undefined;
-}
 
-/**
- * Who owns the healthy listener after a launch — the single place that decides
- * whether this call may claim it started the server.
- *
- * The trap it exists to avoid: a matching pid NUMBER is not proof. Our child can
- * die, the OS can hand its number to another program, and that program can bind the
- * port — all before Node delivers the `exit` event, at which point a naive
- * `portOwnerPid === ourPid` says "ours" about somebody else's process. So a
- * positive verdict requires the number to match AND the child to be provably alive
- * AND (where the OS will tell us) the port owner's command line to match what we
- * actually launched. Any hole in that chain degrades to "unconfirmed"; definite
- * counter-evidence gives "not-ours".
- */
-function classifyListenerOwnership(input: {
-  isDesktopApp: boolean;
-  /** The child's `exit` event has already been delivered. */
-  childExited: boolean;
-  /**
-   * The child's `error` event has been delivered — the spawn FAILED. Latched
-   * independently of the readiness race, because a healthy listener answering
-   * first must not hide the fact that our launch never happened.
-   */
-  spawnFailed: boolean;
-  child: ChildProcess;
-  launchArgv?: string[];
-  portOwnerPid: number | null;
-  /**
-   * The `sys.argv` reported by whatever server is now answering. An independent
-   * line of evidence that does not need a pid at all: a healthy server running the
-   * command line we just launched is ours; one running something else is not. This
-   * is what lets a host with no usable port-owner lookup (#449) still get a real
-   * answer instead of a permanent shrug.
-   */
-  servingArgv?: string[];
-}): ListenerOwnership {
-  /**
-   * Does the server that is answering run what we launched?
-   *
-   * Deliberately ASYMMETRIC in what it can conclude. A MISMATCH is proof the
-   * listener is not ours — nobody else's command line is ours. A match is only
-   * CORROBORATION: another supervisor can start the very same ComfyUI command, win
-   * the bind race, and answer with identical argv, so "runs what we launched" can
-   * never by itself promote anything to "ours" (codex gate). It can only stop us
-   * asserting the negative.
-   */
-  const byArgv = (): "match" | "differ" | "unknown" => {
-    if (!input.servingArgv?.length || !input.launchArgv?.length) return "unknown";
-    // Compared as normalised token MULTISETS, both directions at once. A one-way
-    // containment test is a SUBSET check, and a foreign server whose argv is a
-    // strict subset of ours would "match" (codex gate); requiring the same tokens
-    // on both sides rules that out.
-    //
-    // The normalisation is deliberately NOT `commandLineMatchesArgv`, which was the
-    // second half of this bug. That helper normalises separators only when the HOST
-    // is Windows — correct for its own job (#401 compares two observations of the
-    // same machine), wrong here: `sys.argv` follows the SERVER, so a Windows-launched
-    // ComfyUI answers `ComfyUI\main.py` even when this orchestrator runs on Linux.
-    // Under host-normalisation that never matches our POSIX-resolved absolute path,
-    // and the "difference" it reports is really "I could not compare these" — an
-    // absence dressed as a finding.
-    /** A token written in a Windows path dialect (drive prefix or backslashes). */
-    const isWindowsDialect = (t: string): boolean =>
-      /^[a-zA-Z]:[\\/]/.test(t) || /^\\\\/.test(t) || t.includes("\\");
-    /**
-     * Canonicalise a token WITHOUT deciding case: separators to `/`, extended
-     * prefixes (`\\?\`, `\\?\UNC\`) stripped, and `.`/`..` segments resolved, so
-     * two spellings of the same path compare equal instead of reading as `differ`.
-     */
-    const normalise = (token: string): string => {
-      let t = token.trim().replace(/^["']+|["']+$/g, "").replace(/\\/g, "/");
-      t = t.replace(/^\/\/\?\/unc\//i, "//").replace(/^\/\/\?\//, "");
-      if (!/\//.test(t)) return t;
-      const rooted = t.startsWith("/");
-      const drive = /^([a-zA-Z]:)(?=\/)/.exec(t)?.[1] ?? "";
-      const out: string[] = [];
-      for (const seg of t.slice(drive.length).split("/")) {
-        if (seg === "" || seg === ".") continue;
-        if (seg === ".." && out.length > 0 && out[out.length - 1] !== "..") {
-          out.pop();
-          continue;
-        }
-        out.push(seg);
-      }
-      return `${drive}${rooted && !drive ? "/" : drive ? "/" : ""}${out.join("/")}`;
-    };
-    /**
-     * Do two argv tokens denote the same thing? Paths are compared SEGMENT-ALIGNED
-     * (one may be a suffix of the other) rather than by basename: we launch the
-     * script by absolute path while the server reports the relative one it was
-     * handed, so `/opt/x/ComfyUI/main.py` and `ComfyUI\main.py` agree — while two
-     * DIFFERENT installs do not, which a basename comparison could never tell apart
-     * given every ComfyUI script is called `main.py`.
-     */
-    /** Canonical text plus the dialect it was WRITTEN in (read before normalising,
-     *  which strips the backslashes that identify it). */
-    const prepare = (raw: string): { text: string; windows: boolean } => ({
-      text: normalise(raw),
-      windows: isWindowsDialect(raw.trim().replace(/^["']+|["']+$/g, "")),
-    });
-    const tokensAgree = (
-      a: { text: string; windows: boolean },
-      b: { text: string; windows: boolean },
-    ): boolean => {
-      // CASE-FOLDING IS CONDITIONAL ON THE DIALECT, never unconditional. Folding
-      // everything made `/srv/ComfyUI/main.py` and `/srv/comfyui/main.py` — two
-      // genuinely different directories on a case-sensitive filesystem — compare
-      // equal, which fabricates a MATCH. That is the dangerous direction: a match
-      // can promote a descendant listener to "ours" and so license stopping a
-      // process that isn't ours. Windows paths ARE case-insensitive, so fold only
-      // when a side was written in that dialect; POSIX paths compare exactly.
-      const fold = a.windows || b.windows;
-      const x = fold ? a.text.toLowerCase() : a.text;
-      const y = fold ? b.text.toLowerCase() : b.text;
-      if (x === y) return true;
-      const pathish = (s: string): boolean => /\//.test(s) || /^[a-zA-Z]:/.test(s);
-      if (!pathish(x) || !pathish(y)) return false;
-      return x.endsWith(`/${y}`) || y.endsWith(`/${x}`);
-    };
-    // The interpreter is dropped from our side: the server reports `sys.argv`,
-    // which never contains it. Order is preserved on both sides (a relaunch passes
-    // the same arguments in the same order), so compare positionally.
-    const ours = input.launchArgv.slice(1).map(prepare).filter((t) => t.text);
-    const serving = input.servingArgv.map(prepare).filter((t) => t.text);
-    if (ours.length === 0 || serving.length === 0) return "unknown";
-    const same =
-      ours.length === serving.length &&
-      ours.every((token, i) => tokensAgree(token, serving[i]));
-    return same ? "match" : "differ";
-  };
-  // A Desktop launch is undecidable BY DESIGN: we spawn the Electron shell (or
-  // macOS `open`) and its child binds the port, so a pid mismatch proves nothing.
-  // A LAUNCH THAT NEVER HAPPENED is decisive on every path, Desktop included —
-  // these come FIRST so no later shortcut can soften them (codex gate). The spawn
-  // error is latched independently of the readiness race, and Node leaves `pid`
-  // undefined only when the spawn did not happen, so the two are the same fact
-  // arriving by different routes.
-  if (input.spawnFailed) return classified("not-ours");
-  if (input.child.pid == null) return classified("not-ours");
-  // A Desktop launch is undecidable BY DESIGN once it HAS started: we spawn the
-  // Electron shell (or macOS `open`, which exits immediately by design), and the
-  // process that binds the port is its child. Note this sits AFTER the
-  // never-launched checks but BEFORE `childExited`, because for Desktop a launcher
-  // exiting is normal rather than evidence of failure.
-  if (input.isDesktopApp) return classified("unconfirmed");
-
-  const alive = launchedChildStillRunning(input.child);
-  // OUR DIRECT CHILD IS GONE — by its `exit` event, or by a signal-0 probe (ESRCH)
-  // that does not wait for the event loop. Usually that means the healthy listener
-  // is somebody else's. But it is ALSO the shape of a wrapper script that launched
-  // ComfyUI as its grandchild and then exited normally, after which the grandchild
-  // is reparented and lineage can no longer place it in our tree. What still can:
-  // the server is running the exact command line we launched (codex gate P2).
-  if (input.childExited || alive === false) {
-    // A match cannot make this "ours" — our direct child is gone, and the server
-    // could equally be another supervisor's identical instance. But it does mean we
-    // cannot honestly assert the negative either, so the wrapper case degrades to
-    // "unconfirmed" instead of telling that user their own server is not theirs.
-    return byArgv() === "match" ? classified("unconfirmed") : classified("not-ours");
-  }
-
-  const ourPid = input.child.pid;
-  if (input.portOwnerPid == null) {
-    // NO LISTENER WAS IDENTIFIED — the port owner could not be mapped at all (#449:
-    // no `lsof`, a permission-denied probe, the process already gone, the port
-    // already free). `not-ours` is a POSITIVE finding about an identified process,
-    // so it cannot be reached from here: there is nothing to have found. Reporting
-    // one would be manufacturing a definite answer out of an absence, which is the
-    // error this whole class of bug keeps taking (#796).
-    //
-    // The server's own argv is deliberately NOT consulted as a negative here. It
-    // describes whatever is ANSWERING, not which process holds the socket, and it
-    // cannot distinguish "a different program" from "we could not compare" — see
-    // byArgv, whose "differ" is not a proof of difference.
-    return classified("unconfirmed");
-  }
-  if (ourPid == null) return classified("unconfirmed");
-  if (input.portOwnerPid !== ourPid) {
-    // A DIFFERENT pid holds the port. That is usually somebody else's server — but
-    // it is also the shape of a legitimately indirect launch (a wrapper script, a
-    // double fork, a trampoline), where the listener is our GRANDchild. Walk the
-    // parent chain before concluding: descendant => still ours; provably outside
-    // our tree => not ours; unreadable => unconfirmed, never a false negative that
-    // tells a wrapper-launched user their own server isn't theirs.
-    const descendant = isOurDescendant(input.portOwnerPid);
-    // Lineage does not outrank direct contrary evidence: a wrapper of ours can
-    // stay alive and bring up a DIFFERENT (or stale) ComfyUI, which would be in our
-    // process tree while plainly not being what we launched. `listener_ownership`
-    // answers "is this the process THIS CALL launched", so a differing command line
-    // is decisive there too (codex gate).
-    if (descendant === true) return byArgv() === "differ" ? classified("not-ours") : classified("ours");
-    if (descendant === false) return classified("not-ours");
-    // Lineage unreadable — the server's argv can still rule the listener OUT.
-    return byArgv() === "differ" ? classified("not-ours") : classified("unconfirmed");
-  }
-  // The pid MATCHES — but it could be a recycled number we cannot signal.
-  if (alive !== true) return classified("unconfirmed");
-
-  // LINEAGE is the discriminator, and the only one that does not depend on WHEN we
-  // looked (coordinator gate P1(2)). A creation stamp read after `spawn()` returns
-  // can already describe a replacement — the child may have died and its number
-  // been reused before the read, and on Windows that read alone takes seconds. But
-  // parentage cannot be forged by timing: we spawned this child, so the process on
-  // the port must still be OUR child. Another ComfyUI — even one with a
-  // byte-identical command line and an identical creation second — has a different
-  // parent.
-  //
-  // Not knowing is never promoted to "ours": an unreadable parent withholds the
-  // claim. Knowing it is somebody else's is decisive.
-  const parent = readParentPid(ourPid);
-  if (parent == null) return classified("unconfirmed");
-  if (parent !== process.pid) return classified("not-ours");
-
-  // Belt and braces: where the OS exposes it, the port owner must also still be
-  // running what we launched — and the SERVER's own account of itself must agree.
-  // Both are decisive negatives, for the same reason as above: pid identity says
-  // which process, not which program it is running.
-  const identity = resolveProcessIdentity(ourPid);
-  if (
-    identity?.commandLine &&
-    input.launchArgv &&
-    !commandLineMatchesArgv(identity.commandLine, input.launchArgv)
-  ) {
-    return classified("not-ours");
-  }
-  if (byArgv() === "differ") return classified("not-ours");
-  return classified("ours");
-}
 
 /** The launch-environment facts to report, once a plan has been resolved (#776). */
 function launchEnvInfo(info?: ProcessInfo): LaunchEnvInfo | undefined {
@@ -2343,18 +2021,29 @@ export async function startComfyUI(): Promise<StartResult> {
     launchArgv: launched.launchArgv,
     portOwnerPid: newPid,
     servingArgv,
+    // The OS readers are injected so the classifier stays free of platform code
+    // (and so tests can drive lineage without a real process tree).
+    readParentPid,
+    readIdentity: resolveProcessIdentity,
+    childIsAlive: launchedChildStillRunning(launched.child),
   });
   // Only the NON-Desktop undecidable case is worth calling out: for a Desktop
   // launcher the pid relationship is indirect by design, not a gap in evidence.
   const ownershipUnconfirmed = !info.isDesktopApp && ownership === "unconfirmed";
-  // A start may be CLAIMED only on evidence. Ownership "ours" is proof. Ownership
-  // "unconfirmed" is accepted as a start ONLY when we also observed the port to be
-  // FREE before spawning — otherwise the healthy API may be the very server that
-  // was already there, and readiness would be certifying somebody else's process
-  // as our restart (codex gate P1-c).
-  const mayClaimStart =
-    ownership === "ours" ||
-    (ownership === "unconfirmed" && portObservedFreeBeforeLaunch);
+  // The pre-launch "the port was free" observation deliberately does NOT carry the
+  // claim: another process can bind between that probe and `spawn()`, so it is a
+  // fact about a moment that has PASSED, not about the server now answering. It was
+  // briefly used to gate `started` and that was wrong twice over — stale evidence,
+  // and it made an `unconfirmed` classification report success for somebody else's
+  // process. It now only ever appears as a stated ABSENCE in the message below,
+  // which is a safe thing to spend.
+  //
+  // `started` therefore rests on the classification alone: `not-ours` is the one
+  // verdict that denies it. `unconfirmed` keeps it TRUE by the standing ruling —
+  // denying it would report every ordinary restart as failed on any host whose
+  // port-owner lookup is unavailable, a far more common and more damaging lie than
+  // an unconfirmed success that the message explicitly qualifies.
+  const mayClaimStart = ownership !== "not-ours";
   return {
     // `started` means "THIS call started the server". When the healthy listener is
     // provably NOT the process we launched, we did not start it — programmatic

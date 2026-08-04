@@ -102,10 +102,32 @@ const MAIN = `${BASE}/main.py`;
 const PYTHON = `${BASE}/venv/bin/python`;
 const ARGV = [MAIN, "--port", "8188"];
 
-/** `lsof` exiting 1 with no output: "ran fine, matched nothing". */
+/**
+ * `lsof -V` positively STATING that nothing is listening — verbatim the shape a
+ * real lsof produces (status 1, the "not located" line on stdout). This marker,
+ * not the exit status, is what makes "the port is free" an actual finding: a
+ * permission-restricted run also exits 1, and does so with empty stdout AND empty
+ * stderr, so silence proves nothing.
+ */
 function lsofNoMatches(): Error {
-  const err = new Error("no listener") as Error & { status?: number };
+  const err = new Error("no listener") as Error & {
+    status?: number;
+    stdout?: string;
+    stderr?: string;
+  };
   err.status = 1;
+  err.stdout = "lsof: Internet address not located: TCP:8188\n";
+  err.stderr = "";
+  return err;
+}
+
+/** `lsof` exiting 1 SILENTLY — the shape a restricted enumeration produces. Not
+ *  a statement about the port, and must never be read as one. */
+function lsofQuietFailure(): Error {
+  const err = new Error("") as Error & { status?: number; stdout?: string; stderr?: string };
+  err.status = 1;
+  err.stdout = "";
+  err.stderr = "";
   return err;
 }
 
@@ -159,21 +181,29 @@ describe("restart_comfyui on POSIX — port release via lsof (#776)", () => {
     // resolved early, rather than passing because the budget itself was short.
     process.env.COMFYUI_PORT_FREE_TIMEOUT_S = "10";
     let killed = false;
+    let relaunched = false;
     mockExecSync.mockImplementation((cmd: string) => {
       if (/kill/i.test(cmd)) {
         killed = true;
         return "";
       }
       if (/lsof/i.test(cmd)) {
-        if (killed) throw lsofNoMatches();
+        // Free once the kill lands, then owned again by the relaunched child. That
+        // is the ordinary successful shape — and the only one that can PROVE a
+        // start, now that a claim requires identifying our own listener.
+        if (killed && !relaunched) throw lsofNoMatches();
         return "p4321\nn127.0.0.1:8188\n";
       }
       return "";
     });
     vi.stubGlobal(
       "fetch",
-      vi.fn(async () => ({ ok: true }) as Response),
+      vi.fn(async () => {
+        relaunched = true;
+        return { ok: true } as Response;
+      }),
     );
+    __processControlTestHooks.setParentPidResolver(() => process.pid);
     const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
 
     const startedAt = Date.now();
@@ -181,6 +211,7 @@ describe("restart_comfyui on POSIX — port release via lsof (#776)", () => {
     const elapsed = Date.now() - startedAt;
 
     expect(result.stopped).toBe(true);
+    expect(result.listener_ownership).toBe("ours");
     expect(result.started).toBe(true);
     expect(elapsed).toBeLessThan(8000);
 
@@ -218,7 +249,13 @@ describe("restart_comfyui on POSIX — port release via lsof (#776)", () => {
     const result = await restartComfyUI();
 
     expect(result.listener_ownership).toBe("unconfirmed");
+    // `started` stays TRUE for `unconfirmed` by standing ruling: denying it would
+    // report every ordinary restart as failed on a host whose port-owner lookup is
+    // unavailable. What must NOT happen is a definite verdict — and the message
+    // qualifies the claim rather than asserting proof.
+    expect(result.ready).toBe(true);
     expect(result.started).toBe(true);
+    expect(result.message).not.toMatch(/restarted successfully/i);
 
     killSpy.mockRestore();
   }, 20_000);
@@ -304,7 +341,11 @@ describe("restart_comfyui on POSIX — port release via lsof (#776)", () => {
     const result = await restartComfyUI();
 
     expect(result.ready).toBe(true);
-    expect(result.started).toBe(false);
+    // The stale pre-launch observation carries no CLAIM either way — it is a fact
+    // about a moment that has passed. What it still earns is disclosure: the
+    // message states that the port was never seen free, so a reader knows the
+    // healthy API may be the server that was already there.
+    expect(result.listener_ownership).toBe("unconfirmed");
     expect(result.message).toMatch(/never observed free before launching/i);
     expect(result.message).not.toMatch(/restarted successfully/i);
 
@@ -370,12 +411,29 @@ describe("restart_comfyui on POSIX — port release via lsof (#776)", () => {
     // The other half of the same rule: Windows filesystems ARE case-insensitive, so
     // folding is correct there — and withholding it would manufacture a spurious
     // "different program" for a perfectly ordinary Windows install.
+    //
+    // The launch path must be DRIVE-ROOTED, which is what identifies the dialect.
+    // A bare `COMFYUI\MAIN.PY` alone cannot: backslashes with no drive are equally
+    // a legal POSIX filename, and folding on that evidence is the false-match bug
+    // the sibling test guards. On a real Windows host our side is always rooted,
+    // so the pair folds; pairing a POSIX launch path with a Windows-cased serving
+    // argv is a combination that cannot occur.
+    const WIN_MAIN = "C:\\Comfy\\ComfyUI\\main.py";
+    const WIN_PY = "C:\\Comfy\\ComfyUI\\venv\\Scripts\\python.exe";
+    mockFindComfyuiPython.mockReturnValue(WIN_PY);
+    mockExistsSync.mockImplementation((p: string) => {
+      const s = String(p);
+      return s === WIN_MAIN || s === WIN_PY;
+    });
     let answers = 0;
     mockGetSystemStats.mockImplementation(async () => {
       answers++;
       return {
         system: {
-          argv: answers <= 2 ? ARGV : ["COMFYUI\\MAIN.PY", "--port", "8188"],
+          argv:
+            answers <= 2
+              ? [WIN_MAIN, "--port", "8188"]
+              : ["COMFYUI\\MAIN.PY", "--port", "8188"],
         },
       };
     });
@@ -459,6 +517,146 @@ describe("restart_comfyui on POSIX — port release via lsof (#776)", () => {
 
     killSpy.mockRestore();
   }, 20_000);
+
+  it("does NOT fold case for a POSIX path that merely CONTAINS a backslash", async () => {
+    // Backslash is a legal filename character on POSIX. Treating it as a Windows
+    // marker enabled case folding, so `/srv/Comfy\A` and `/srv/comfy\a` — two
+    // different installs — compared equal. That is the false-MATCH direction, and
+    // with a descendant listener a false match promotes to `ours`, which licenses
+    // stopping a process that is not ours.
+    let answers = 0;
+    mockGetSystemStats.mockImplementation(async () => {
+      answers++;
+      return {
+        system: {
+          argv:
+            answers <= 2
+              ? ["/opt/Comfy\\A/main.py", "--port", "8188"]
+              : ["/opt/comfy\\a/main.py", "--port", "8188"],
+        },
+      };
+    });
+    mockFindComfyuiPython.mockReturnValue("/opt/Comfy\\A/venv/bin/python");
+    mockExistsSync.mockImplementation((p: string) => {
+      const s = String(p);
+      return s === "/opt/Comfy\\A/main.py" || s === "/opt/Comfy\\A/venv/bin/python";
+    });
+    let killed = false;
+    const children: FakeChild[] = [];
+    mockSpawn.mockImplementation(() => {
+      const child = new FakeChild();
+      children.push(child);
+      return child;
+    });
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/kill/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed) throw lsofNoMatches();
+        return "p4321\nn127.0.0.1:8188\n";
+      }
+      return "";
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        children[0]?.emit("exit", 0, null);
+        return { ok: true } as Response;
+      }),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.listener_ownership).toBe("not-ours");
+
+    killSpy.mockRestore();
+  }, 20_000);
+
+  it("cannot compare DRIVE-RELATIVE paths, and says so rather than matching them", async () => {
+    // `C:ComfyUI\main.py` resolves against that drive's own working directory, so
+    // identical text can denote different installs in two processes. Comparing it
+    // as if it were a location is a fabricated match.
+    let answers = 0;
+    mockGetSystemStats.mockImplementation(async () => {
+      answers++;
+      return {
+        system: {
+          argv: answers <= 2 ? ARGV : ["C:ComfyUI\\main.py", "--port", "8188"],
+        },
+      };
+    });
+    let killed = false;
+    const children: FakeChild[] = [];
+    mockSpawn.mockImplementation(() => {
+      const child = new FakeChild();
+      children.push(child);
+      return child;
+    });
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/kill/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed) throw lsofNoMatches();
+        return "p4321\nn127.0.0.1:8188\n";
+      }
+      return "";
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        children[0]?.emit("exit", 0, null);
+        return { ok: true } as Response;
+      }),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    // Not comparable => "unknown" => the departed-child branch degrades rather
+    // than convicting, and certainly does not promote.
+    expect(result.listener_ownership).toBe("unconfirmed");
+
+    killSpy.mockRestore();
+  }, 20_000);
+
+  it("does NOT read a SILENT lsof failure as proof the port is free", async () => {
+    // The inverse of the fix: a restricted enumeration exits 1 having listed
+    // nothing and says nothing on either stream. Reading "quiet" as "free" would
+    // certify a release that never happened — and no `-w`/warning heuristic can
+    // rescue it, since the silence is indistinguishable. Only lsof's explicit
+    // "Internet address not located" is a finding.
+    let killed = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/kill/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed) throw lsofQuietFailure();
+        return "p4321\nn127.0.0.1:8188\n";
+      }
+      return "";
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true }) as Response),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    // The stop still COMMITS (a refusal after the kill could not restore anything)
+    // but it is reported as unverified rather than as a confirmed release.
+    expect(result.stopped).toBe(true);
+    expect(result.message).toMatch(/could not be checked after the kill/i);
+
+    killSpy.mockRestore();
+  }, 30_000);
 
   it("does NOT read a MISSING lsof as proof the port is free", async () => {
     // A container without lsof. The probe did not run, so the stop cannot claim the

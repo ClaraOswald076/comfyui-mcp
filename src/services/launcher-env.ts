@@ -268,12 +268,15 @@ function launcherConfigMentions(
 
 function componentEvidence(
   resolved: boolean,
-  rootExists: boolean,
+  rootProbe: DirProbe,
   dataRoot: string,
   configNeedle: string,
 ): ComponentEvidence {
   if (resolved) return "resolved";
-  if (rootExists) return "ambiguous";
+  // PRESENT: it is there but we could not point at the binary. INACCESSIBLE: we
+  // could not look at all. Both mean "this component may well be injected and we
+  // would silently drop it" — the ambiguous case.
+  if (rootProbe !== "absent") return "ambiguous";
   // "not-installed" requires BOTH halves of the evidence: the directory absent AND
   // the launcher's own config silent about it. An unreadable config is neither, so
   // it stays ambiguous.
@@ -284,7 +287,7 @@ function componentEvidence(
 
 export function detectStabilityMatrix(
   paths: ReadonlyArray<string | undefined>,
-): StabilityMatrixLayout | "inaccessible" | null {
+): StabilityMatrixLayout | null {
   for (const p of paths) {
     if (!p) continue;
     for (const ancestor of ancestorsOf(p)) {
@@ -297,25 +300,20 @@ export function detectStabilityMatrix(
       const gitRootProbe = probePath(gitRoot);
       const assetsRootProbe = probePath(assetsRoot);
       const ffmpegRootProbe = probePath(ffmpegRoot);
-      // We could not READ the evidence that would tell us whether this is a
-      // launcher-managed install. That is not "it isn't one" — falling through to
-      // the plain-install plan here is exactly how a launcher-owned server gets
-      // relaunched without its environment. Surface it so the caller refuses.
-      if (
-        gitRootProbe === "inaccessible" ||
-        assetsRootProbe === "inaccessible" ||
-        ffmpegRootProbe === "inaccessible"
-      ) {
-        return "inaccessible";
-      }
       const hasGitRoot = gitRootProbe === "present";
       const hasFfmpegRoot = ffmpegRootProbe === "present";
-      // Corroboration is `PortableGit` OR the `Assets` STORE — not `Assets/ffmpeg`
-      // specifically. Requiring the ffmpeg subdirectory missed a real layout
-      // (`Data/Packages/…` beside `Data/Assets`, with PortableGit expected but
-      // currently unlocatable): it fell through as a plain install, inherited our
-      // environment, and reproduced "Bad git executable" (codex gate). Recognising
-      // it lets the per-component evidence rules below decide properly.
+      // Corroboration must be POSITIVE: at least one piece of Stability Matrix
+      // tooling actually PRESENT beside `Packages`. `PortableGit` OR the `Assets`
+      // STORE — not `Assets/ffmpeg` specifically, since a real layout can have the
+      // store without that subdirectory.
+      //
+      // An INACCESSIBLE sibling is deliberately not corroboration. Treating it as
+      // such made a plain install at `C:\Work\Data\Packages\ComfyUI` refuse to
+      // restart at all merely because an unrelated `C:\Work\Data\Assets` was
+      // ACL-denied — unreadable evidence proving the OTHER shape, which is the same
+      // fold in the opposite direction. Where the layout IS corroborated, an
+      // unreadable component is still ambiguous and still refuses (below); where it
+      // is not, we proceed unverified like any other plain install.
       if (!hasGitRoot && assetsRootProbe !== "present") continue;
 
       const gitExe = firstExisting([
@@ -335,8 +333,8 @@ export function detectStabilityMatrix(
         gitExe,
         gitDir: gitExe ? dirOf(gitExe) : undefined,
         ffmpegDir: ffmpegExe ? dirOf(ffmpegExe) : undefined,
-        git: componentEvidence(!!gitExe, hasGitRoot, dataRoot, "portablegit"),
-        ffmpeg: componentEvidence(!!ffmpegExe, hasFfmpegRoot, dataRoot, "ffmpeg"),
+        git: componentEvidence(!!gitExe, gitRootProbe, dataRoot, "portablegit"),
+        ffmpeg: componentEvidence(!!ffmpegExe, ffmpegRootProbe, dataRoot, "ffmpeg"),
       };
     }
   }
@@ -547,31 +545,6 @@ export function resolveLaunchEnvironment(
 
   // 2. Stability Matrix — reconstruct exactly what it injects, from disk.
   const sm = detectStabilityMatrix(input.paths);
-  if (sm === "inaccessible") {
-    // We could not READ the evidence that decides whether this install is
-    // launcher-managed. Treating that as "not a launcher install" is what would
-    // relaunch a Stability Matrix server without its PATH — #776 exactly. So it
-    // refuses, like every other case where the launcher environment is known to be
-    // beyond our reach.
-    return {
-      reproducible: false,
-      info: {
-        source: "inherited",
-        reproducible: false,
-        note:
-          "the launcher evidence beside this install could not be read, so whether " +
-          "its environment needs reconstructing could NOT be determined",
-      },
-      reason:
-        "This ComfyUI sits in a Stability Matrix-shaped layout, but the directories that " +
-        "would say whether the launcher injects its own Git/FFmpeg could not be read " +
-        "(permission denied or otherwise inaccessible). Relaunching without an " +
-        "environment it may require is the failure this check exists to prevent.",
-      advice:
-        "Restart ComfyUI from its launcher, or make the launcher's Data folder readable " +
-        "by this process and try again.",
-    };
-  }
   if (sm) {
     // PARTIAL reconstruction is NOT reconstruction — but "partial" has to mean
     // something we would actually DROP, not merely something that isn't there.

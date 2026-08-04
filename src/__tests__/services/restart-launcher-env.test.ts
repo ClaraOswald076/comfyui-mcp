@@ -478,22 +478,31 @@ describe("restart_comfyui — Stability Matrix launcher environment (#776)", () 
     });
     mockExistsSync.mockImplementation((p: string) => {
       const s = String(p);
-      return s === SM_MAIN || s === SM_PY;
+      return s === SM_MAIN || s === SM_PY || s === SM_ASSETS_ROOT;
     });
-    // statSync is what the launcher probe uses: EACCES on the tooling roots means
-    // "we could not look", which must not be spent as "there is nothing here".
+    // The layout is CORROBORATED — `Data/Assets` is present — and it is the
+    // PortableGit directory that cannot be read. EACCES means "we could not look",
+    // which must not be spent as "there is nothing here": that would relaunch a
+    // launcher-managed server without the environment it needs.
+    //
+    // Note the corroboration is deliberately positive. An install whose ONLY
+    // Stability Matrix evidence is an unreadable sibling is NOT treated as one —
+    // unreadable evidence cannot prove the other shape either, and refusing there
+    // would strand a plain install that merely lives under a `Data/Packages` path.
     mockStatThrows.value = (p: string) => {
       const s = String(p);
-      if (s === SM_GIT_ROOT || s === SM_ASSETS_ROOT || s === SM_FFMPEG_ROOT) {
-        return errno("EACCES", "permission denied");
-      }
+      if (s === SM_GIT_ROOT) return errno("EACCES", "permission denied");
       return undefined;
     };
 
     const message = await expectRefusedBeforeStopping();
 
-    expect(message).toMatch(/could not be read/i);
-    expect(message).toMatch(/Restart ComfyUI from its launcher/i);
+    // Refused through the ordinary component-evidence path: an unreadable
+    // PortableGit is `ambiguous`, exactly like one that exists but whose binary
+    // cannot be located. There is no separate "inaccessible" verdict to maintain.
+    expect(message).toMatch(/Stability Matrix/i);
+    expect(message).toMatch(/bundled Git/i);
+    expect(message).toMatch(/Restart ComfyUI from Stability Matrix/i);
   });
 
   it("REFUSES when the launcher's config EXISTS but cannot be read", async () => {
@@ -1587,6 +1596,53 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
     killSpy.mockRestore();
   });
 
+  it("does NOT convict a departed child when the server's argv is UNREADABLE", async () => {
+    // The third leg of a tri-state, which is how the polarity bug survived: the
+    // existing tests covered `match` and `differ`, so testing `=== "match"` and
+    // defaulting the rest to `not-ours` looked correct. `unknown` — the serving
+    // argv could not be obtained — is an ABSENCE, and must degrade exactly as a
+    // match does. Otherwise the wrapper-launched user this branch exists to protect
+    // is told their own server is not theirs whenever the argv cannot be read.
+    usePlainInstall();
+    servingArgvAfterRestart("unreachable");
+    const children = spawnCapturingChildren(4321);
+    let killed = false;
+    let relaunched = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill|pkill|\bkill\b/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (/netstat/i.test(cmd)) {
+        return killed && !relaunched
+          ? ""
+          : "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed && !relaunched) throw noListener();
+        return "p4321\nn127.0.0.1:8188\n";
+      }
+      return "";
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        relaunched = true;
+        // The wrapper we spawned has exited; its grandchild serves the port.
+        children[0]?.emit("exit", 0, null);
+        return { ok: true } as Response;
+      }),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.listener_ownership).toBe("unconfirmed");
+    expect(result.message).not.toMatch(/NOT as a result of this restart/i);
+
+    killSpy.mockRestore();
+  });
+
   it("does NOT claim a matching PID as ours when the child is already gone but its `exit` event has not been delivered", async () => {
     // The lifecycle race: our child dies, the OS reuses its number for a program
     // that binds the port, and readiness sees that healthy replacement BEFORE Node
@@ -1794,6 +1850,56 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
     // 9999 IS our grandchild — lineage alone would say "ours".
     __processControlTestHooks.setParentPidResolver((pid) =>
       pid === 9999 ? 4321 : pid === 4321 ? process.pid : 1,
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        relaunched = true;
+        return { ok: true } as Response;
+      }),
+    );
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
+    const result = await restartComfyUI();
+
+    expect(result.listener_ownership).toBe("not-ours");
+    expect(result.started).toBe(false);
+    expect(result.message).not.toMatch(/restarted successfully/i);
+
+    killSpy.mockRestore();
+  });
+
+  it("does NOT claim a SIBLING of this call's child — ancestry under the orchestrator is not ancestry under the launch", async () => {
+    // The stale-instance case. A ComfyUI started by an EARLIER request is also a
+    // descendant of this long-lived MCP process, has identical argv, and may still
+    // hold the port. Tracing ancestry to the ORCHESTRATOR reports it as ours and
+    // announces a restart that never happened — while the child we just spawned may
+    // have died on a bind failure. Lineage has to be traced to THIS launch's child.
+    usePlainInstall();
+    spawnCapturingChildren(4321);
+    let killed = false;
+    let relaunched = false;
+    mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill|pkill|kill/i.test(cmd)) {
+        killed = true;
+        return "";
+      }
+      if (/netstat/i.test(cmd)) {
+        return killed && !relaunched
+          ? ""
+          : `  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       ${relaunched ? 7777 : 4321}`;
+      }
+      if (/lsof/i.test(cmd)) {
+        if (killed && !relaunched) throw noListener();
+        return `p${relaunched ? 7777 : 4321}
+n127.0.0.1:8188
+`;
+      }
+      return "";
+    });
+    // 7777 is a SIBLING: its parent is the orchestrator, not our child 4321.
+    __processControlTestHooks.setParentPidResolver((pid) =>
+      pid === 7777 ? process.pid : pid === 4321 ? process.pid : 1,
     );
     vi.stubGlobal(
       "fetch",

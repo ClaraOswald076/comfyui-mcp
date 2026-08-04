@@ -20,6 +20,15 @@ const mockPlatform = vi.hoisted(() => vi.fn(() => "linux"));
 
 vi.mock("node:child_process", () => ({ execSync: mockExecSync }));
 vi.mock("node:os", () => ({ platform: mockPlatform }));
+// The kernel socket table is consulted before lsof on Linux. These tests drive the
+// LSOF contract specifically, so make /proc unreadable and let it fall through
+// deterministically (a real Linux runner would otherwise answer from
+// /proc/net/tcp first and never reach the code under test).
+vi.mock("node:fs", () => ({
+  readFileSync: vi.fn(() => {
+    throw new Error("no /proc in test");
+  }),
+}));
 
 /** `execSync` throws with `status` (the exit code) for a command that RAN and
  *  failed, and with `code` (an errno) only for a spawn-level failure. */
@@ -58,22 +67,42 @@ describe("probePortOwner — POSIX (lsof)", () => {
     expect(probePortOwner(8188)).toEqual({ state: "owned", pid: 4321 });
   });
 
-  it("reports FREE for lsof's 'ran fine, matched nothing' (exit 1)", async () => {
-    // lsof's documented convention for an empty result set. This is real evidence
-    // that the port is free — the probe ran and saw nothing.
+  it("reports FREE only when lsof STATES the address was not located", async () => {
+    // Verified against lsof(8) and by experiment: exit 1 means "an error was
+    // detected, INCLUDING failure to locate", so it cannot distinguish "searched
+    // and found nothing" from "could not search". `-V` makes lsof say which it was,
+    // and that statement is the only thing treated as evidence of a free port.
     mockExecSync.mockImplementation(() => {
-      throw exitWith(1);
+      const err = exitWith(1) as Error & { status: number; stdout: string };
+      err.stdout = "lsof: Internet address not located: TCP:8188";
+      throw err;
     });
     const { probePortOwner } = await loadProbe();
 
     expect(probePortOwner(8188)).toEqual({ state: "free" });
   });
 
-  it("reports FREE when lsof succeeds with no matching records", async () => {
-    mockExecSync.mockReturnValue("");
+  it("reports UNKNOWN for a BARE exit 1 with no such statement", async () => {
+    mockExecSync.mockImplementation(() => {
+      throw exitWith(1);
+    });
+    const { probePortOwner } = await loadProbe();
+
+    expect(probePortOwner(8188).state).toBe("unknown");
+  });
+
+  it("reports FREE when lsof exits 0 and states the address was not located", async () => {
+    mockExecSync.mockReturnValue("lsof: Internet address not located: TCP:8188");
     const { probePortOwner } = await loadProbe();
 
     expect(probePortOwner(8188)).toEqual({ state: "free" });
+  });
+
+  it("reports UNKNOWN when lsof exits 0 but names nobody and states nothing", async () => {
+    mockExecSync.mockReturnValue("");
+    const { probePortOwner } = await loadProbe();
+
+    expect(probePortOwner(8188).state).toBe("unknown");
   });
 
   it("reports UNKNOWN when the command is MISSING (shell exit 127), not free", async () => {
@@ -114,7 +143,10 @@ describe("probePortOwner — POSIX (lsof)", () => {
     expect(probePortOwner(8188).state).toBe("unknown");
   });
 
-  it("still reports FREE for a QUIET exit 1 (empty stdout and stderr)", async () => {
+  it("reports UNKNOWN for a QUIET exit 1 — silence is not a finding", async () => {
+    // MEASURED on Linux: an enumeration that cannot see another user's sockets
+    // exits 1 with EMPTY stdout and EMPTY stderr, with or without `-w`. Reading
+    // that as "free" is what would certify a release that never happened.
     mockExecSync.mockImplementation(() => {
       const err = exitWith(1) as Error & { status: number; stdout: string; stderr: string };
       err.stdout = "";
@@ -123,15 +155,17 @@ describe("probePortOwner — POSIX (lsof)", () => {
     });
     const { probePortOwner } = await loadProbe();
 
-    expect(probePortOwner(8188)).toEqual({ state: "free" });
+    expect(probePortOwner(8188).state).toBe("unknown");
   });
 
-  it("passes -w so lsof's routine warnings do not masquerade as a failed enumeration", async () => {
+  it("passes -V so lsof STATES what it failed to locate", async () => {
     mockExecSync.mockReturnValue("");
     const { probePortOwner } = await loadProbe();
     probePortOwner(8188);
 
-    expect(String(mockExecSync.mock.calls[0][0])).toMatch(/lsof -w /);
+    expect(String(mockExecSync.mock.calls[0][0])).toMatch(/lsof -V /);
+    // `-w` would SUPPRESS warnings, making silence less informative, not more.
+    expect(String(mockExecSync.mock.calls[0][0])).not.toMatch(/ -w /);
   });
 
   it("reports UNKNOWN for a spawn-level failure (errno), not free", async () => {
