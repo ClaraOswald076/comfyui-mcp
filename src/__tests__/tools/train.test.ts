@@ -12,6 +12,25 @@ vi.mock("../../config.js", () => ({
   config: mockConfig,
 }));
 
+// train_doctor probes the docker daemon and the trainer bootstrap. Those are
+// real I/O with real timeouts (5s+ on a runner with no docker), and none of it
+// is what these tests are about — stub them so the handler exercises only its
+// own reporting.
+vi.mock("../../services/ai-toolkit.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../services/ai-toolkit.js")>();
+  return {
+    ...actual,
+    trainerDoctor: async () => ({ ok: true, data: {} }),
+  };
+});
+vi.mock("../../services/trainer-bootstrap.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../services/trainer-bootstrap.js")>();
+  return {
+    ...actual,
+    bootstrapStatus: async () => ({ dir: "", cloned: false, venv: false, ready: false, ref: "" }),
+  };
+});
+
 import { registerTrainTools } from "../../tools/train.js";
 
 /** Capture the zod SHAPE a tool registered with (server.tool(name, desc, shape, handler)). */
