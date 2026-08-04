@@ -107,12 +107,35 @@ function pyproject(version: string, name = PANEL_REGISTRY_ID): string {
 }
 
 /** Write a panel pack (pyproject + the built web bundle ComfyUI serves). */
-function writePanelPack(dir: string, version: string, opts: { web?: boolean } = {}): void {
+/**
+ * A realistic bundle body. Viability now requires the served JS to carry actual
+ * content and look like the module the browser executes — because "the file
+ * exists" is a claim about the directory entry, and an entry surviving without
+ * its data is the exact crash shape recovery has to handle. A one-line stub
+ * fixture would quietly stop exercising that.
+ */
+function panelBundle(version: string): string {
+  return (
+    `// comfyui-mcp-panel ${version}\n` +
+    `import { app } from "../../scripts/app.js";\n` +
+    `app.registerExtension({ name: "comfyui-mcp.panel", async setup() {} });\n` +
+    `// padding to a plausible bundle size\n${"//x\n".repeat(400)}`
+  );
+}
+
+function writePanelPack(
+  dir: string,
+  version: string,
+  opts: { web?: boolean; bundle?: string } = {},
+): void {
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, "pyproject.toml"), pyproject(version));
   if (opts.web !== false) {
     mkdirSync(join(dir, "web", "js"), { recursive: true });
-    writeFileSync(join(dir, "web", "js", "comfyui-mcp-panel.js"), `// ${version}\n`);
+    writeFileSync(
+      join(dir, "web", "js", "comfyui-mcp-panel.js"),
+      opts.bundle ?? panelBundle(version),
+    );
   }
 }
 
@@ -1104,6 +1127,121 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     expect(existsSync(INCOMING())).toBe(true);
     expect(readFileSync(join(INCOMING(), "pyproject.toml"), "utf-8")).toContain("0.11.38");
     expect(note).toMatch(/NOT a usable panel/);
+  });
+
+  it("P0: the INITIAL swap refuses a staged clone that would not load", async () => {
+    // The swap validated with the SERVE predicate, which passes on the wordmark
+    // SVG alone. A clone with a valid pyproject and no JS bundle would move the
+    // only working panel to backup, install the husk, and — because the
+    // post-check reads metadata — report a successful update with nothing
+    // loadable in custom_nodes.
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    const h = makeDeps({ updateThrows: "manager cannot resolve it" });
+    h.deps.gitClonePanel = (dest) => {
+      h.clones.push(dest);
+      mkdirSync(join(dest, "web", "img"), { recursive: true });
+      writeFileSync(join(dest, "pyproject.toml"), pyproject("0.11.38"));
+      writeFileSync(join(dest, "web", "img", "comfyui-mcp-wordmark.svg"), "<svg/>");
+    };
+    const err = await runPanelActionInner("update", h.deps).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect((err as Error).message).toMatch(/usable built web bundle/);
+    // The working panel never moved — the refusal lands during validation,
+    // before the swap creates anything at all.
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
+    expect(existsSync(join(root, "custom_nodes_backup"))).toBe(false);
+    expect(readdirSync(join(root, "custom_nodes"))).toEqual([PANEL_REGISTRY_ID]);
+  });
+
+  it("P0: a TRUNCATED bundle is not usable — a surviving entry is not surviving data", async () => {
+    // A zero-byte or truncated JS file is the canonical shape of "the directory
+    // entry survived, the data did not".
+    const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1`);
+    writePanelPack(backupDir, "0.11.34");
+    writePanelPack(INCOMING(), "0.11.38", { bundle: "" }); // zero-byte bundle
+    writeFileSync(
+      join(root, ".comfyui-agent-panel.swap.json"),
+      JSON.stringify({ dir: PANEL_DIR(), backupDir, staging: "x", startedAt: Date.now() }),
+    );
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
+    expect(note).toMatch(/INCOMPLETE/);
+    // The good copy is what ends up installed, not the truncated one.
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
+  });
+
+  it("P0: a `..` traversal in the journal's backup path is REFUSED, not resolved", async () => {
+    // startsWith is not containment: this has the right prefix and resolves into
+    // a DIFFERENT ComfyUI install. Restoring from there would move that install's
+    // panel into this one and leave it with none.
+    const otherRoot = join(root, "OtherComfy");
+    const otherPanel = join(otherRoot, "custom_nodes", PANEL_REGISTRY_ID);
+    writePanelPack(otherPanel, "9.9.9");
+    const traversal = join(
+      root,
+      "custom_nodes_backup",
+      "..",
+      "OtherComfy",
+      "custom_nodes",
+      PANEL_REGISTRY_ID,
+    );
+    writePanelPack(INCOMING(), "0.11.38", { bundle: "" }); // husk, so a restore is attempted
+    writeFileSync(
+      join(root, ".comfyui-agent-panel.swap.json"),
+      JSON.stringify({
+        dir: PANEL_DIR(),
+        backupDir: traversal,
+        staging: "x",
+        startedAt: Date.now(),
+      }),
+    );
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
+
+    // The other installation is untouched — nothing was pulled out of it.
+    expect(readFileSync(join(otherPanel, "pyproject.toml"), "utf-8")).toContain("9.9.9");
+    expect(existsSync(PANEL_DIR())).toBe(false);
+    expect(note).toMatch(/No previous copy could be located/);
+  });
+
+  it("P1: recovery promotes to the REPO-named dir when that is where the panel lives", async () => {
+    // The pack ordinarily installs to custom_nodes/comfyui-mcp-panel while its
+    // registry name is comfyui-agent-panel. Deriving the registry name blindly
+    // would promote to a second directory and leave BOTH served.
+    const repoNamed = join(root, "custom_nodes", "comfyui-mcp-panel");
+    writePanelPack(repoNamed, "0.11.34");
+    writePanelPack(INCOMING(), "0.11.38");
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    await repairInterruptedPanelSwap(makeDeps({}).deps);
+    // Exactly one panel directory remains — no second, competing extension.
+    expect(readdirSync(join(root, "custom_nodes"))).toEqual(["comfyui-mcp-panel"]);
+  });
+
+  it("P2: a stale journal pointing at some unrelated existing dir cannot suppress the refusal", async () => {
+    // journal.dir deciding "the panel exists" let an untrusted path silence the
+    // disclosure the ruling requires, leaving the preserved backup unmentioned.
+    const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1`);
+    writePanelPack(backupDir, "0.11.34");
+    const unrelated = join(root, "unrelated-but-existing");
+    mkdirSync(unrelated, { recursive: true });
+    writeFileSync(
+      join(root, ".comfyui-agent-panel.swap.json"),
+      JSON.stringify({ dir: unrelated, backupDir, staging: "x", startedAt: Date.now() }),
+    );
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
+    // The user is TOLD, and told where their backup is.
+    expect(note).toMatch(/HAS been preserved/);
+    expect(note).toContain(backupDir);
+    expect(existsSync(join(root, ".comfyui-agent-panel.swap.json"))).toBe(true);
   });
 
   it("a hand-edited journal cannot redirect where the panel is moved to", async () => {

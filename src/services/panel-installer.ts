@@ -36,7 +36,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { config, isLocalMode } from "../config.js";
 import { logger } from "../utils/logger.js";
 import { parsePyproject } from "./node-authoring.js";
@@ -1027,10 +1027,38 @@ const PANEL_WEB_MARKERS = [
 ] as const;
 
 /**
- * Tri-state: does `dir` serve the panel's web-extension assets? true = a marker
- * is present, false = all markers CONFIRMED absent, undefined = a probe FAILED
- * (indeterminate). Callers must treat undefined as a POSSIBLE shadow (fail
- * closed), never as "no assets". Never throws.
+ * THREE DIFFERENT QUESTIONS ARE ASKED ABOUT A PANEL DIRECTORY. Confusing them
+ * has now caused the same class of bug three times, so they are named here and
+ * each has exactly one predicate:
+ *
+ *  1. IDENTITY — "is this the panel pack?" Answered by the pyproject
+ *     `[project].name`, in detectPanelInstall. Deliberately does NOT consider
+ *     whether the pack works: a broken install must still be FOUND, or update
+ *     could never repair it.
+ *
+ *  2. SERVE — "would ComfyUI serve anything out of here?" Answered by
+ *     `servesPanelWebAssets`, and used ONLY by shadow detection. EITHER marker
+ *     counts, because either is enough for the browser to load something from
+ *     this directory and shadow the real panel. Fails closed on an
+ *     indeterminate probe.
+ *
+ *  3. VIABILITY — "would this directory work as the panel?" Answered by
+ *     `dirIsUsablePanel`, and used by every path that DECIDES BETWEEN COPIES:
+ *     the staged clone before a swap, and each candidate during recovery.
+ *     Strictly stronger than SERVE — a directory holding only the wordmark
+ *     would pass (2) and must fail (3).
+ *
+ * Using (2) where (3) was meant is what let a husk be installed over a working
+ * panel. If a new call site appears, say which of the three it is asking.
+ */
+
+/**
+ * (2) SERVE. Tri-state: does `dir` serve the panel's web-extension assets? true
+ * = a marker is present, false = all markers CONFIRMED absent, undefined = a
+ * probe FAILED (indeterminate). Callers must treat undefined as a POSSIBLE
+ * shadow (fail closed), never as "no assets". Never throws.
+ *
+ * NOT a viability test — see dirIsUsablePanel for that.
  */
 function servesPanelWebAssets(
   dir: string,
@@ -2470,6 +2498,14 @@ const PANEL_SWAP_JOURNAL = ".comfyui-agent-panel.swap.json";
  */
 const PANEL_INCOMING_NAME = ".comfyui-agent-panel.incoming";
 
+/**
+ * Floor for "the panel bundle actually has content". The real bundle is hundreds
+ * of kilobytes; this only has to be large enough that a zero-byte or truncated
+ * remnant cannot pass, without being so large that a legitimately slimmer future
+ * build would be rejected.
+ */
+const MIN_PANEL_BUNDLE_CHARS = 1024;
+
 interface PanelSwapJournal {
   /** Canonical panel dir the swap targets. */
   dir: string;
@@ -2504,7 +2540,8 @@ interface SwapReconcileResult {
 }
 
 /**
- * Is this directory a panel that would actually WORK if ComfyUI loaded it?
+ * (3) VIABILITY — is this directory a panel that would actually WORK if ComfyUI
+ * loaded it?
  *
  * Deliberately stricter than "the directory is there": recovery decisions delete
  * things, and a husk — an emptied directory, or one left by a half-finished move
@@ -2513,6 +2550,59 @@ interface SwapReconcileResult {
  * web bundle; every uncertainty (unreadable file, indeterminate probe) answers
  * "no".
  */
+/**
+ * Is `child` genuinely INSIDE `parent`?
+ *
+ * A `startsWith` prefix test is not a containment test, and the difference is
+ * not academic here: the journal is an on-disk record we do not control, and
+ * `<root>/custom_nodes_backup/../../Other/ComfyUI/custom_nodes/comfyui-mcp-panel`
+ * has the right prefix while resolving into a DIFFERENT ComfyUI installation.
+ * Restoring from there would move another install's panel into this one and
+ * leave that one with none. Resolve both sides first, then compare on path
+ * SEGMENTS via `relative` — a result that is empty, absolute, or starts with
+ * ".." means it is not inside.
+ */
+function isInsideDir(parent: string, child: string): boolean {
+  try {
+    const rel = relative(resolve(parent), resolve(child));
+    return rel.length > 0 && !isAbsolute(rel) && !rel.split(/[\\/]/).includes("..");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Where the panel canonically lives under THIS ComfyUI root.
+ *
+ * The parent is always this root's custom_nodes — never anything the journal
+ * says. The NAME, though, cannot simply be the registry id: the pack ordinarily
+ * installs to a directory named after the REPO ("comfyui-mcp-panel") while its
+ * registry name is "comfyui-agent-panel" (see FAST_PATH_DIRS). Deriving the
+ * registry name unconditionally would make recovery promote a replacement to a
+ * directory the existing install does not use, leaving BOTH served — two
+ * competing panel extensions, created by the repair.
+ *
+ * So: an existing panel directory wins; failing that, the journal may pick
+ * between the two KNOWN names (a whitelist, not free choice); failing that, the
+ * registry name is the default.
+ */
+function resolveCanonicalPanelDir(
+  comfyuiPath: string,
+  deps: PanelInstallerDeps,
+  journal: PanelSwapJournal | undefined,
+): string {
+  const customNodes = join(comfyuiPath, "custom_nodes");
+  for (const name of FAST_PATH_DIRS) {
+    const candidate = join(customNodes, name);
+    if (deps.existsSync(join(candidate, "pyproject.toml"))) return candidate;
+  }
+  const journalName = journal?.dir ? basename(journal.dir) : undefined;
+  if (journalName && FAST_PATH_DIRS.includes(journalName)) {
+    return join(customNodes, journalName);
+  }
+  return join(customNodes, PANEL_REGISTRY_ID);
+}
+
 function dirIsUsablePanel(dir: string, deps: PanelInstallerDeps): boolean {
   try {
     const pyproject = join(dir, "pyproject.toml");
@@ -2520,15 +2610,22 @@ function dirIsUsablePanel(dir: string, deps: PanelInstallerDeps): boolean {
     if (parsePyproject(deps.readFile(pyproject)).projectName !== PANEL_REGISTRY_ID) {
       return false;
     }
-    // THE JS BUNDLE IS NOT OPTIONAL. servesPanelWebAssets answers a different
-    // question — "would ComfyUI serve anything from here?" — and is true when
-    // EITHER marker is present, so a directory holding only the wordmark SVG
-    // passes it. That is the right test for detecting a shadow; it is the wrong
-    // test for "this panel would load", and using it here let a husk with the
-    // bundle missing license deleting the only complete copy. Require the file
-    // the browser actually executes, and require it as a CONFIRMED regular file
-    // (an indeterminate probe is not a yes).
-    return deps.probeFile(join(dir, ...PANEL_WEB_MARKERS[0])) === true;
+    // THE JS BUNDLE IS NOT OPTIONAL, AND ITS PRESENCE IS NOT ENOUGH.
+    //
+    // "A regular file exists at this path" is a claim about the DIRECTORY ENTRY,
+    // and a directory entry surviving while its data did not is the canonical
+    // shape of the crash this whole mechanism exists to handle — a zero-byte or
+    // truncated bundle is exactly what a power loss leaves. So the file must
+    // also carry a plausible amount of content, and look like the module the
+    // browser is meant to execute.
+    const bundle = join(dir, ...PANEL_WEB_MARKERS[0]);
+    if (deps.probeFile(bundle) !== true) return false;
+    const source = deps.readFile(bundle);
+    if (source.trim().length < MIN_PANEL_BUNDLE_CHARS) return false;
+    // Content shape: the panel bundle is an ES module and always registers
+    // itself with the ComfyUI frontend. A file that is large but holds none of
+    // this is not the bundle (a partial write of something else, or padding).
+    return /\bimport\b|\bexport\b|registerExtension/.test(source);
   } catch {
     return false;
   }
@@ -2570,7 +2667,21 @@ function reconcilePanelSwap(
   if (!incomingPresent) {
     const stale = readJournal();
     if (!stale) return { ok: true };
-    if (deps.existsSync(stale.dir)) {
+    // DERIVED, not taken from the journal. Asking `existsSync(stale.dir)` let an
+    // untrusted (stale, or hand-edited) path decide whether a panel exists: a
+    // `dir` pointing at any unrelated directory that happens to exist reads as
+    // "the panel is fine", so the journal is deleted and success returned — in
+    // exactly the state where the ruling requires the user be TOLD their backup
+    // is preserved. That is not the refusal that was ruled for; it is the
+    // refusal being suppressed, which is worse than either option weighed.
+    const staleCanonical = resolveCanonicalPanelDir(comfyuiPath, deps, stale);
+    const staleBackup = isInsideDir(
+      join(comfyuiPath, "custom_nodes_backup"),
+      stale.backupDir,
+    )
+      ? stale.backupDir
+      : undefined;
+    if (deps.existsSync(staleCanonical)) {
       // Panel present and no swap in flight — the record is simply spent.
       dropJournal();
       return { ok: true };
@@ -2587,7 +2698,7 @@ function reconcilePanelSwap(
     // five things they need: that the canonical path is empty, that a backup
     // exists AND where, why we will not move it for them, and the exact command
     // to restore it plus the exact command to start fresh.
-    const backupPresent = deps.existsSync(stale.backupDir);
+    const backupPresent = !!staleBackup && deps.existsSync(staleBackup);
     const reinstall = describeInstallPanelAction(
       "install",
       "a fresh install on the ComfyUI host",
@@ -2595,19 +2706,19 @@ function reconcilePanelSwap(
     return {
       ok: false,
       note: backupPresent
-        ? ` WARNING: there is NO panel at ${stale.dir}, and a swap journal is still ` +
+        ? ` WARNING: there is NO panel at ${staleCanonical}, and a swap journal is still ` +
           `present at ${journalPath}. Your previous panel HAS been preserved — it is at ` +
-          `${stale.backupDir}. Nothing has been moved back automatically, because this ` +
+          `${staleBackup}. Nothing has been moved back automatically, because this ` +
           `state cannot be told apart from a completed update followed by a DELIBERATE ` +
           `uninstall, and restoring would then resurrect something you removed on ` +
-          `purpose. To put it back: mv "${stale.backupDir}" "${stale.dir}" && rm ` +
+          `purpose. To put it back: mv "${staleBackup}" "${staleCanonical}" && rm ` +
           `"${journalPath}" — then restart ComfyUI. To start fresh instead: delete ` +
           `"${journalPath}" and run ${reinstall}.`
-        : ` WARNING: there is NO panel at ${stale.dir}, a swap journal is still present ` +
-          `at ${journalPath}, and the backup it names (${stale.backupDir}) is NOT there ` +
+        : ` WARNING: there is NO panel at ${staleCanonical}, a swap journal is still present ` +
+          `at ${journalPath}, and the backup it names (${staleBackup}) is NOT there ` +
           `either. Nothing has been moved. Look in ` +
           `${join(comfyuiPath, "custom_nodes_backup")} for a copy and move it to ` +
-          `"${stale.dir}"; otherwise delete "${journalPath}" and run ${reinstall}.`,
+          `"${staleCanonical}"; otherwise delete "${journalPath}" and run ${reinstall}.`,
     };
   }
 
@@ -2621,10 +2732,12 @@ function reconcilePanelSwap(
   // THIS ComfyUI root, so derive it and use the journal only for the one thing
   // it alone knows: where the old copy was parked. Even that is accepted only
   // when it points inside this root's custom_nodes_backup.
-  const canonicalDir = join(comfyuiPath, "custom_nodes", PANEL_REGISTRY_ID);
+  const canonicalDir = resolveCanonicalPanelDir(comfyuiPath, deps, journal);
   const backupRootPath = join(comfyuiPath, "custom_nodes_backup");
+  // Containment, not prefix — see isInsideDir. The journal names the SOURCE of a
+  // restore, so a traversal here reaches another installation.
   const journalBackup =
-    journal?.backupDir && journal.backupDir.startsWith(backupRootPath)
+    journal?.backupDir && isInsideDir(backupRootPath, journal.backupDir)
       ? journal.backupDir
       : undefined;
   // "EXISTS" IS WEAKER THAN "WORKS", and the difference decides whether we are
@@ -3015,10 +3128,16 @@ async function updateViaRegistryZipReinstall(opts: {
     // if a clone ever landed without them, swapping it in would serve the
     // browser nothing — an "update" that silently uninstalls the panel. An
     // indeterminate probe is not a pass.
-    if (servesPanelWebAssets(staging, deps) !== true) {
+    // (3) VIABILITY, not (2) SERVE. This decides whether to replace a working
+    // panel with this clone, so it must ask whether the clone would LOAD — the
+    // serve test passes on the wordmark SVG alone, which would let a husk be
+    // installed over the user's working copy and then be reported as a
+    // successful update by the metadata-only post-check.
+    if (!dirIsUsablePanel(staging, deps)) {
       throw new PanelInstallError(
-        `the freshly cloned panel at ${staging} does not carry the built web bundle ` +
-          `(web/js), so installing it would leave the ComfyUI tab with no panel at all`,
+        `the freshly cloned panel at ${staging} does not carry a usable built web bundle ` +
+          `(web/js/comfyui-mcp-panel.js missing, empty, or truncated), so installing it ` +
+          `would leave the ComfyUI tab with no panel at all`,
       );
     }
 
