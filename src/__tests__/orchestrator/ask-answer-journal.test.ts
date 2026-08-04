@@ -910,6 +910,40 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     expect(AskAnswers.entriesFor(TAB)).toHaveLength(1);
   });
 
+  // codex round 11, P1: an eviction stamps its undetermined-loss count onto a
+  // surviving entry; a recovery then marks that carrier `returned`, which makes
+  // it the PREFERRED eviction victim — and the returned-victim path dropped it
+  // without re-homing the count. The accepted residual permits losing that
+  // entry's recoverability, not the debt owed for OTHER answers that reached
+  // nobody.
+  it("evicting a RETURNED carrier re-homes the debt it was carrying", () => {
+    for (let i = 0; i < 60; i += 1) {
+      openAndAnswer(`pa-ask-${i}`, { question: `Q${i}?`, options: [{ label: "a" }, { label: "b" }] }, `A${i}`);
+    }
+    const owed = AskAnswers.droppedFor(TAB);
+    expect(owed).toBeGreaterThan(0);
+    const carrier = AskAnswers.entriesFor(TAB).find((e) => (e.disclose ?? 0) > 0);
+    expect(carrier).toBeDefined();
+    AskAnswers.markSurfaced(carrier!.token); // a recovery handed it over
+    expect(carrier!.returned).toBe(true); // …now the preferred eviction victim
+    // More answers arrive, all of them RETURNED, so every eviction they cause
+    // takes the quiet returned-victim path and creates NO new debt — leaving the
+    // carrier's count as the only debt in play.
+    for (let i = 60; i < 80; i += 1) {
+      const ask = { question: `R${i}?`, options: [{ label: "a" }, { label: "b" }] };
+      AskAnswers.openAsk(`pa-ret-${i}`, {
+        tabId: TAB,
+        fingerprint: askFingerprint(ask),
+        question: ask.question,
+      });
+      AskAnswers.markReturned(AskAnswers.record(`pa-ret-${i}`, `R${i}`, { tabId: TAB }).token);
+      AskAnswers.closeAsk(`pa-ret-${i}`);
+    }
+    expect(AskAnswers.entriesFor(TAB).some((e) => e.token === carrier!.token)).toBe(false);
+    // EXACTLY the same debt — it moved, it did not evaporate with its carrier.
+    expect(AskAnswers.droppedFor(TAB)).toBe(owed);
+  });
+
   it("never throws when the flusher does", () => {
     AskAnswers.setFlusher(() => {
       throw new Error("no agent");

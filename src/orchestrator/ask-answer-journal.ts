@@ -1108,6 +1108,13 @@ export class AskAnswerJournalImpl {
           // above any plausible burst, orphans are never evicted before these,
           // and the full answer text is written here — so what survives is a
           // reconstructable record rather than a misleading alarm.
+          // …but ANY DISCLOSURE IT WAS CARRYING is re-homed, not dropped with it.
+          // The residual above permits losing THIS answer's recoverability; it
+          // says nothing about the debt owed for EARLIER answers that reached
+          // nobody, which merely happened to be stamped on this entry. (Reachable
+          // because a recovery marks its entry `returned` while it is carrying a
+          // count — after which it becomes the preferred eviction victim.)
+          if (victim.disclose) this.noteDropped(victim.key, victim.disclose);
           logger.warn(
             `[ask-answers] ${label} — forgetting an already-returned answer ("${victim.answer}") to "${preview(victim.question)}"; a re-ask can no longer recover it, and a tool result is not proof it was received`,
           );
