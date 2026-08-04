@@ -119,12 +119,6 @@ export function flattenUiWorkflow(
   const nodesById = new Map<number, UiNode>(nodes.map((n) => [n.id, n]));
   const linkMap = new Map<number, UiLink>();
   for (const l of ui.links ?? []) if (Array.isArray(l)) linkMap.set(l[0], l);
-  /** The link ids the graph ARRIVED with. Used to tell a genuinely dangling input
-   *  reference (an id that was never a link here) from one purged on purpose
-   *  because its endpoint was removed — the second is intended and already
-   *  reported by whatever removed it, the first is a real connection the source
-   *  graph claims and this one does not have. */
-  const preexistingLinkIds = new Set(linkMap.keys());
 
   // bus name (Set node's first widget) -> the link id feeding that Set's input.
   // Multiple Sets writing the same key: LAST one wins (matches litegraph's
@@ -458,12 +452,22 @@ export function flattenUiWorkflow(
           `${info.type} #${id}: a broadcast could not be matched to a specific sender input — this sender carries ${carries}, and a ue_link record does not name the input a broadcast came through, so a saved list that went stale by SWAPPING its channels would look identical; re-save with cg-use-everywhere active if this sender's routing matters`,
         );
       }
-      // A sender is deletable only when it is not the real producer of any
-      // surviving link (Seed Everywhere IS its own upstream — it must stay), and
-      // never when one of its records could not be confirmed: deleting it would
-      // destroy the only evidence of a broadcast we declined to materialize.
+      // A sender is deletable only when it is not the real producer of any link
+      // (Seed Everywhere IS its own upstream — it must stay), and never when one
+      // of its records could not be confirmed: deleting it would destroy the only
+      // evidence of a broadcast we declined to materialize.
+      //
+      // PRE-EXISTING outgoing links count, not just the ones materialized here.
+      // Counting only freshLinks protected a sender that produced a MATERIALIZED
+      // link while deleting one that was already the real producer of an ordinary
+      // link — taking that link with it and silently disconnecting its consumer.
+      // (Reachable whenever a sender's record adds nothing: its target already had
+      // a real link, so the record is skipped, no fresh link is created, and the
+      // sender looked unused.) A node that really produces a connection is not
+      // virtual wiring, whatever its class.
       const liveOrigins = new Set<number>();
       for (const l of freshLinks) liveOrigins.add(l[1]);
+      for (const l of ui.links ?? []) if (Array.isArray(l)) liveOrigins.add(l[1]);
       // A non-empty list is not proof that it accounts for EVERY sender: one that
       // predates a sender has no row for it. Deleting such a sender would remove a
       // node whose broadcasts were never materialized — a silent, unrecoverable
@@ -472,10 +476,19 @@ export function flattenUiWorkflow(
       const attributed = new Set<number>();
       for (const r of ueLinks) {
         if (r?.controller != null) attributed.add(r.controller);
-        // A controllerless record still accounts for its sender when the producer
-        // IS that sender (the self-producing shape accepted above).
-        else if (isSelfProducingUeSender(nodesById.get(r?.upstream)?.type ?? "")) {
-          attributed.add(r.upstream);
+        else {
+          // A controllerless record still accounts for its sender when the
+          // producer IS that sender (the self-producing shape accepted above) —
+          // judged on the NORMALIZED producer, since the record may name a virtual
+          // in front of it. Reading the raw field here let such a record be
+          // materialized correctly and then reported as if the sender had no
+          // record at all: a false disclosure, which is the failure mode that
+          // teaches people to ignore the true ones. (The converter normalizes in
+          // its equivalent; this is the site that was left behind.)
+          const p = resolveRealFromNode(r?.upstream, r?.upstream_slot);
+          if (p && isSelfProducingUeSender(nodesById.get(p.id)?.type ?? "")) {
+            attributed.add(p.id);
+          }
         }
       }
       for (const s of ueSenders) {
@@ -560,21 +573,21 @@ export function flattenUiWorkflow(
     for (let slot = 0; slot < (n.inputs?.length ?? 0); slot++) {
       const inp = n.inputs![slot];
       if (inp.link == null || survivingIds.has(inp.link)) continue;
-      // An id that was NEVER a link in this graph is a dangling reference: the
-      // source claims a connection the graph does not contain. Clearing it in
-      // silence is the same observation-failed-treated-as-no that this change
-      // removes everywhere else — and the converter already reports its
-      // equivalent. (An id that WAS a link and got purged with its endpoint is an
-      // intended removal, already reported by whatever removed it, so it stays
-      // quiet here. That second branch is DEFENSIVE: no constructible graph
-      // reaches it, because the nodes holding such a reference are removed along
-      // with the link. It is kept so the check states the right rule rather than
-      // the one that happens to be reachable today.)
-      if (!preexistingLinkIds.has(inp.link)) {
-        warnings.push(
-          `${n.type} #${n.id} input "${inp.name ?? slot}" claims link ${inp.link}, which does not exist in this graph — left unconnected`,
-        );
-      }
+      // This input claims a connection the flattened graph does not have. Say so —
+      // clearing it in silence is the same observation-failed-treated-as-a-no that
+      // this change removes everywhere else, and the converter already reports its
+      // equivalent.
+      //
+      // The question is asked about THIS INPUT's claim, not about the id in the
+      // abstract. An earlier version suppressed the report when the id existed
+      // ANYWHERE in the arriving graph, which let a bogus claim on an id belonging
+      // to a link into a DIFFERENT node be cleared silently — the same
+      // bare-identifier-vs-identifier-in-context mistake as the raw-vs-normalized
+      // producer bugs elsewhere in this pass, one level down. Whether the id was
+      // once a link somewhere says nothing about whether it fed this input.
+      warnings.push(
+        `${n.type} #${n.id} input "${inp.name ?? slot}" claims link ${inp.link}, which is not a connection into this input in the flattened graph — left unconnected`,
+      );
       inp.link = null;
     }
     for (const out of n.outputs ?? []) {

@@ -390,6 +390,25 @@ const CORPUS: Case[] = [
       "the flattener keeps a Seed Everywhere because it IS the real producer of the link it just created.",
   },
   {
+    name: "CONTROLLERLESS record naming a VIRTUAL that resolves to a self-producing sender",
+    why: "no row paired a controllerless record with a virtualized upstream, so the corpus missed a divergence introduced by the round that unified producer resolution: one tool normalized this and the other read the raw field, materialized the broadcast correctly, and then falsely reported that the sender had no record. A true result plus an untrue disclosure is worse than either alone.",
+    graph: () =>
+      graph(
+        [
+          n(1, "Seed Everywhere", { outputs: [{ name: "IMAGE", type: "IMAGE", links: [41] }] }),
+          n(2, "Reroute", {
+            inputs: [{ name: "", type: "IMAGE", link: 41 }],
+            outputs: [{ name: "", type: "IMAGE", links: [] }],
+          }),
+          consumer(3, "Consumer", null),
+        ],
+        [[41, 1, 0, 2, 0, "IMAGE"]],
+        { ue_links: [rec(3, 2)] }, // no controller, upstream is the Reroute
+      ),
+    api: { wiring: { "Consumer.image": "Seed Everywhere" }, silent: true },
+    flat: { wiring: { "Consumer.image": "Seed Everywhere" }, silent: true },
+  },
+  {
     name: "'Seed Everywhere?' — a registered class the predicate used to miss",
     why: "an unrecognized sender made both tools conclude there were no broadcasts at all: a real one dropped with nothing said.",
     graph: () =>

@@ -306,13 +306,65 @@ describe("flattenUiWorkflow — Use-Everywhere", () => {
     expect(report.warnings.join("\n")).toContain('input "model" claims link 77');
   });
 
-  it("a healthy bus, whose original links are purged on purpose, reports nothing", () => {
-    // Guards the common path against a spurious dangling-reference report. NOTE:
-    // this does NOT exercise the was-a-real-link-but-purged branch of that check
-    // — I could not construct a graph where a SURVIVING input still points at a
-    // purged id (the nodes holding those references are removed with them). That
-    // branch is therefore defensive, and is documented as such in the source
-    // rather than pinned by a test that would not fail without it.
+  it("a sender that is the REAL producer of a pre-existing link is never deleted", () => {
+    // Seed Everywhere #9 genuinely produces link 5 into #3. Its ue_links record
+    // adds nothing (its target #4 already has a real link, so UE would not fire),
+    // so the sender created no FRESH link and looked unused — and was deleted,
+    // taking a real connection with it and disconnecting #3 in silence.
+    const g: UiWorkflow = {
+      nodes: [
+        node(9, "Seed Everywhere", {
+          widgets_values: [42],
+          outputs: [{ name: "INT", type: "INT", links: [5] }],
+        }),
+        node(3, "SomeConsumer", { inputs: [{ name: "seed", type: "INT", link: 5 }] }),
+        node(1, "CheckpointLoaderSimple", { outputs: [{ name: "INT", type: "INT", links: [6] }] }),
+        node(4, "OtherConsumer", { inputs: [{ name: "seed", type: "INT", link: 6 }] }),
+      ],
+      links: [
+        [5, 9, 0, 3, 0, "INT"],
+        [6, 1, 0, 4, 0, "INT"],
+      ],
+      last_link_id: 6,
+      extra: {
+        ue_links: [
+          { downstream: 4, downstream_slot: 0, upstream: 9, upstream_slot: 0, controller: 9, type: "INT" },
+        ],
+      },
+    };
+    const { graph, report } = flattenUiWorkflow(g);
+    expect(graph.nodes.some((n) => n.type === "Seed Everywhere")).toBe(true);
+    const consumer = graph.nodes.find((n) => n.id === 3)!;
+    expect(consumer.inputs![0].link).toBe(5);
+    expect(report.warnings).toEqual([]);
+  });
+
+  it("an input claiming an id that belongs to a link into ANOTHER node is reported", () => {
+    // Link 10 really exists — as Producer → Reroute. The Consumer's claim on it is
+    // bogus. Keying the report on "did this id exist anywhere" suppressed it and
+    // the edge was cleared in silence; the question has to be about THIS input's
+    // claim. This is the shape that disproved an earlier "unreachable" comment.
+    const g: UiWorkflow = {
+      nodes: [
+        node(1, "CheckpointLoaderSimple", { outputs: [{ name: "MODEL", type: "MODEL", links: [10] }] }),
+        node(2, "Reroute", {
+          inputs: [{ name: "", type: "MODEL", link: 10 }],
+          outputs: [{ name: "", type: "MODEL", links: [] }],
+        }),
+        node(3, "SomeConsumer", { inputs: [{ name: "model", type: "MODEL", link: 10 }] }),
+      ],
+      links: [[10, 1, 0, 2, 0, "MODEL"]],
+      last_link_id: 10,
+    };
+    const { graph, report } = flattenUiWorkflow(g);
+    expect(graph.nodes.find((n) => n.id === 3)!.inputs![0].link).toBeNull();
+    expect(report.warnings.join("\n")).toContain('input "model" claims link 10');
+  });
+
+  it("a healthy bus reports nothing", () => {
+    // Guards the common path: every flattened bus retires the links that fed its
+    // virtual nodes, and pass 1 re-points their consumers at fresh surviving ids,
+    // so no surviving input is left claiming a retired one.
     const g: UiWorkflow = {
       nodes: [
         node(1, "CheckpointLoaderSimple", { outputs: [{ name: "MODEL", type: "MODEL", links: [10] }] }),
