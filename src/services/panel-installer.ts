@@ -36,6 +36,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { config, isLocalMode } from "../config.js";
 import { logger } from "../utils/logger.js";
@@ -239,6 +240,16 @@ export interface PanelInstallerDeps {
    * in order rather than from this call.
    */
   syncDir?: (p: string) => void;
+  /**
+   * Size and SHA-256 of a file, read as BYTES (never via a utf-8 round trip,
+   * which would corrupt binary assets). undefined when it cannot be read.
+   * Backs the integrity manifest.
+   */
+  fileDigest?: (p: string) => { size: number; sha256: string } | undefined;
+  /** SHA-256 of a string, for the manifest's own digest. */
+  hashString?: (v: string) => string;
+  /** Filesystem mtime in ms, or undefined. Used to order backups by real time. */
+  mtimeMs?: (p: string) => number | undefined;
   /**
    * The user's explicit panel-version pin, if any. While a pin is in force NO
    * code path here may move the panel — install/update/reinstall refuse and the
@@ -551,6 +562,25 @@ export const defaultDeps: PanelInstallerDeps = {
     } catch {
       // Unsupported on this platform (Windows cannot fsync a directory handle).
       // Not an error: see the barrier comment in updateViaRegistryZipReinstall.
+    }
+  },
+  fileDigest: (p) => {
+    try {
+      const buf = readFileSync(p);
+      return {
+        size: buf.byteLength,
+        sha256: createHash("sha256").update(buf).digest("hex"),
+      };
+    } catch {
+      return undefined;
+    }
+  },
+  hashString: (v) => createHash("sha256").update(v, "utf-8").digest("hex"),
+  mtimeMs: (p) => {
+    try {
+      return statSync(p).mtimeMs;
+    } catch {
+      return undefined;
     }
   },
   writeFile: (p, contents) => {
@@ -1043,10 +1073,16 @@ const PANEL_WEB_MARKERS = [
  *     indeterminate probe.
  *
  *  3. VIABILITY — "would this directory work as the panel?" Answered by
- *     `dirIsUsablePanel`, and used by every path that DECIDES BETWEEN COPIES:
- *     the staged clone before a swap, and each candidate during recovery.
- *     Strictly stronger than SERVE — a directory holding only the wordmark
- *     would pass (2) and must fail (3).
+ *     `dirHasPanelFiles`: identity plus the bundle the browser loads. Used for
+ *     an ALREADY-INSTALLED panel (a backup, or the current install), which we
+ *     did not stage and so cannot have a manifest for. Strictly stronger than
+ *     SERVE — a directory holding only the wordmark passes (2) and fails (3).
+ *
+ *  4. INTEGRITY — "did this tree survive intact?" Answered EXACTLY by
+ *     `verifyStagedTree` against a manifest written when the tree was staged.
+ *     This is the question a staged replacement must answer before it is
+ *     promoted over a working panel; content-inspection was the wrong tool for
+ *     it and has been removed.
  *
  * Using (2) where (3) was meant is what let a husk be installed over a working
  * panel. If a new call site appears, say which of the three it is asking.
@@ -1058,7 +1094,7 @@ const PANEL_WEB_MARKERS = [
  * probe FAILED (indeterminate). Callers must treat undefined as a POSSIBLE
  * shadow (fail closed), never as "no assets". Never throws.
  *
- * NOT a viability test — see dirIsUsablePanel for that.
+ * NOT a shape or integrity test — see dirHasPanelFiles and verifyStagedTree.
  */
 function servesPanelWebAssets(
   dir: string,
@@ -2579,6 +2615,19 @@ function dirIsPanelByIdentity(dir: string, deps: PanelInstallerDeps): boolean {
  * most recent wins — the backup names carry the `Date.now()` they were made
  * with, and a later swap's backup is the one that matches what was just replaced.
  */
+/**
+ * Does this name match the backup directories the swap itself creates?
+ *
+ * The swap names them `<panel-dir-name>-<version>-<epoch-ms>`. Anything else
+ * under custom_nodes_backup belongs to the user, and restoring from it would be
+ * us choosing a copy we know nothing about over the one we made.
+ */
+function isPanelSwapBackupName(name: string): boolean {
+  return FAST_PATH_DIRS.some(
+    (base) => name.startsWith(`${base}-`) && /-\d{10,}$/.test(name),
+  );
+}
+
 function discoverPanelBackup(
   comfyuiPath: string,
   deps: PanelInstallerDeps,
@@ -2590,16 +2639,25 @@ function discoverPanelBackup(
   } catch {
     return undefined; // absent or unreadable — nothing discoverable
   }
-  const candidates: Array<{ dir: string; stamp: number }> = [];
+  const candidates: Array<{ dir: string; mtime: number }> = [];
   for (const name of entries) {
     const dir = join(backupRoot, name);
     if (!isInsideDir(backupRoot, dir)) continue;
-    if (!dirIsUsablePanel(dir, deps)) continue;
-    const trailing = /-(\d{10,})$/.exec(name);
-    candidates.push({ dir, stamp: trailing ? Number(trailing[1]) : 0 });
+    // OURS ONLY. Any panel-shaped directory used to qualify, so a copy the user
+    // deliberately parked here ("saved-copy-0.11.20") competed with the backup
+    // an interrupted swap actually made — and could win it. Restore only from
+    // something WE created, recognisable by the name the swap builds.
+    if (!isPanelSwapBackupName(name)) continue;
+    if (!dirHasPanelFiles(dir, deps)) continue;
+    // REAL TIME, not a number parsed out of the name. That suffix is a string on
+    // disk that anything can rename; mtime is the filesystem's own record of
+    // when the directory was put there.
+    const mtime = deps.mtimeMs?.(dir);
+    if (mtime === undefined) continue; // cannot order it — do not guess
+    candidates.push({ dir, mtime });
   }
   if (candidates.length === 0) return undefined;
-  candidates.sort((a, b) => b.stamp - a.stamp);
+  candidates.sort((a, b) => b.mtime - a.mtime);
   return candidates[0].dir;
 }
 
@@ -2657,212 +2715,178 @@ function resolveCanonicalPanelDir(
 }
 
 /**
- * Trailing characters that cannot end a complete statement — an expression is
- * still owed a right-hand side. Balanced delimiters alone would accept
- * `const a = 5 +`, which is a truncation.
+ * (3) SHAPE — does this directory contain the files a panel needs?
  *
- * `}` `)` `]` and identifier/literal characters are all legitimate endings, as
- * is `;`. ASI means a module need not end in a semicolon, so requiring one
- * would false-reject `export default 5`.
+ * Identity plus the presence of the bundle the browser loads. NOT a content
+ * check: an earlier revision tried to decide whether the bundle was a complete
+ * JavaScript module, which is the wrong question asked the wrong way. Syntactic
+ * validity is undecidable-in-practice with a hand-written lexer (ASI, regex vs
+ * division, CR-only line endings, HTML-like comments — the rules never stop),
+ * and every rule added is a fresh way to be wrong in BOTH directions: refusing a
+ * legitimate install, or discarding somebody's only working panel.
+ *
+ * Integrity is a different question and it has an exact answer — see
+ * `verifyStagedTree`. This predicate is only used where integrity cannot be:
+ * for an ALREADY-INSTALLED panel (a backup, or the current install), which we
+ * did not stage and therefore cannot have a manifest for.
  */
-const INCOMPLETE_TAIL = new Set([
-  "+", "-", "*", "/", "%", "=", "<", ">", "&", "|", "^", "!", "~", ",", ".", "?", ":",
-]);
-
-/**
- * Is this source a STRUCTURALLY COMPLETE JavaScript module?
- *
- * The honest answer would come from a parser, but there is none available at
- * runtime — `typescript` is a devDependency and the published package carries no
- * JS parser, so importing one here would mean adding a dependency to every
- * install for a check that runs on a recovery path. What this does instead is
- * the floor that actually detects the failure in question: a real lexer that
- * understands strings, template literals (including `${}` nesting), comments and
- * regex literals, and then asserts the two things truncation always breaks —
- * every delimiter closed, and the file not ending mid-token or mid-expression.
- *
- * It is not a validity check and does not pretend to be: it will accept code
- * that a parser would reject for other reasons. It exists to answer "was this
- * file cut off?", which is the question recovery has to ask.
- *
- * Biased toward REJECT on anything it cannot follow, because the consequences
- * are asymmetric: a false reject refuses an update or restores a backup (safe,
- * recoverable), while a false accept installs a broken panel over a working one.
- */
-export function moduleIsStructurallyComplete(source: string): boolean {
-  // Open delimiters, plus markers for template text (`) and a template
-  // substitution (${) so `}` can tell which context it closes.
-  const stack: string[] = [];
-  let i = 0;
-  let lastMeaningful = "";
-  const n = source.length;
-
-  /** Could a `/` at this position begin a regex literal rather than divide? */
-  const regexCanStart = (): boolean => {
-    if (lastMeaningful === "") return true;
-    if ("([{,;:=!&|?+-*%~^<>".includes(lastMeaningful)) return true;
-    // `return /re/`, `typeof /re/`, `case /re/` … — a word char could equally be
-    // an identifier being divided, so only treat known keywords as regex-leading.
-    const before = source.slice(Math.max(0, i - 12), i);
-    return /\b(return|typeof|case|in|of|new|delete|void|do|else|yield|await)\s*$/.test(
-      before,
-    );
-  };
-
-  while (i < n) {
-    const c = source[i];
-    const top = stack.length > 0 ? stack[stack.length - 1] : "";
-
-    // Inside template TEXT (not a substitution): only ` and ${ are structural.
-    if (top === "`") {
-      if (c === "\\") {
-        i += 2;
-        continue;
-      }
-      if (c === "`") {
-        stack.pop();
-        lastMeaningful = "`";
-        i++;
-        continue;
-      }
-      if (c === "$" && source[i + 1] === "{") {
-        stack.push("${");
-        i += 2;
-        continue;
-      }
-      i++;
-      continue;
-    }
-
-    // Comments.
-    if (c === "/" && source[i + 1] === "/") {
-      const nl = source.indexOf("\n", i);
-      if (nl === -1) {
-        // A line comment running to EOF is a complete file, not a truncation.
-        i = n;
-        continue;
-      }
-      i = nl + 1;
-      continue;
-    }
-    if (c === "/" && source[i + 1] === "*") {
-      const end = source.indexOf("*/", i + 2);
-      if (end === -1) return false; // unterminated block comment ⇒ cut off
-      i = end + 2;
-      continue;
-    }
-
-    // Strings.
-    if (c === '"' || c === "'") {
-      i++;
-      let closed = false;
-      while (i < n) {
-        const d = source[i];
-        if (d === "\\") {
-          i += 2;
-          continue;
-        }
-        if (d === c) {
-          closed = true;
-          i++;
-          break;
-        }
-        if (d === "\n") return false; // unterminated string literal
-        i++;
-      }
-      if (!closed) return false;
-      lastMeaningful = c;
-      continue;
-    }
-
-    // Template literal start.
-    if (c === "`") {
-      stack.push("`");
-      i++;
-      continue;
-    }
-
-    // Regex literal.
-    if (c === "/" && regexCanStart()) {
-      i++;
-      let inClass = false;
-      let closed = false;
-      while (i < n) {
-        const d = source[i];
-        if (d === "\\") {
-          i += 2;
-          continue;
-        }
-        if (d === "[") inClass = true;
-        else if (d === "]") inClass = false;
-        else if (d === "/" && !inClass) {
-          closed = true;
-          i++;
-          break;
-        } else if (d === "\n") return false; // unterminated regex
-        i++;
-      }
-      if (!closed) return false;
-      while (i < n && /[a-z]/i.test(source[i])) i++; // flags
-      lastMeaningful = "/";
-      continue;
-    }
-
-    // Delimiters.
-    if (c === "(" || c === "[" || c === "{") {
-      stack.push(c);
-      lastMeaningful = c;
-      i++;
-      continue;
-    }
-    if (c === ")" || c === "]" || c === "}") {
-      const expected = c === ")" ? "(" : c === "]" ? "[" : "{";
-      if (top === "${" && c === "}") {
-        stack.pop(); // back into template text
-        lastMeaningful = "}";
-        i++;
-        continue;
-      }
-      if (top !== expected) return false; // mismatched or over-closed
-      stack.pop();
-      lastMeaningful = c;
-      i++;
-      continue;
-    }
-
-    if (!/\s/.test(c)) lastMeaningful = c;
-    i++;
-  }
-
-  if (stack.length > 0) return false; // something was never closed
-  return !INCOMPLETE_TAIL.has(lastMeaningful);
+function dirHasPanelFiles(dir: string, deps: PanelInstallerDeps): boolean {
+  if (!dirIsPanelByIdentity(dir, deps)) return false;
+  const bundle = join(dir, ...PANEL_WEB_MARKERS[0]);
+  if (deps.probeFile(bundle) !== true) return false;
+  // EMPTY IS NOT PRESENT. A zero-length file is still a regular file, so the
+  // presence check alone accepted it — and an empty bundle is a directory entry
+  // whose data is gone, which is the crash shape, not a panel. This is not a
+  // size heuristic: there is no threshold to tune, only the difference between
+  // "there are bytes" and "there are none". Anything beyond that (is the
+  // JavaScript complete?) is the integrity manifest's job, not a guess made
+  // from content.
+  const size = deps.fileDigest?.(bundle)?.size;
+  return size === undefined ? true : size > 0;
 }
 
-function dirIsUsablePanel(dir: string, deps: PanelInstallerDeps): boolean {
+/**
+ * Integrity manifest, written INTO a staged tree at the moment we create it.
+ *
+ * This is the answer to "did this tree survive intact?", and it is exact. At
+ * stage time we hold the freshly cloned files, so we can record what they are:
+ * every path, its byte size, and its content hash, plus a hash over that list.
+ * Recovery then re-derives the same values and compares.
+ *
+ * Why this and not a content check: comparing bytes to what we ourselves staged
+ * cannot false-reject a valid bundle — minified single-line output, a trailing
+ * regex literal, CR line endings and every other lexical curiosity are simply
+ * irrelevant. And it is strictly stronger, because it catches things no parse
+ * could: a file that is syntactically perfect but is the wrong half of another
+ * file, a missing asset, a partially-written image.
+ *
+ * Every failure mode is benign and distinguishable:
+ *   - manifest absent or unreadable  -> UNVERIFIABLE -> refuse and disclose
+ *   - manifest present, tree differs -> CORRUPT      -> restore the backup
+ *   - everything matches             -> INTACT       -> promote
+ */
+const PANEL_MANIFEST_NAME = ".comfyui-mcp-integrity.json";
+
+interface PanelManifestEntry {
+  path: string;
+  size: number;
+  sha256: string;
+}
+
+interface PanelManifest {
+  version: 1;
+  files: PanelManifestEntry[];
+  digest: string;
+}
+
+/** Stable digest over the file list, so a doctored manifest is detectable. */
+function manifestDigest(files: PanelManifestEntry[], deps: PanelInstallerDeps): string {
+  const canonical = files
+    .map((f) => `${f.path} | ${f.size} | ${f.sha256}`)
+    .join("\n");
+  return deps.hashString?.(canonical) ?? "";
+}
+
+/**
+ * Every file under `dir`, as paths relative to it, sorted for a stable digest.
+ * Returns undefined if any directory could not be read — a partial listing must
+ * never be mistaken for a complete one.
+ *
+ * `.git` is skipped: it is enormous, it is rewritten by git itself, and it is
+ * not what ComfyUI loads. The manifest covers what the panel IS.
+ */
+function collectTreeFiles(
+  dir: string,
+  deps: PanelInstallerDeps,
+  prefix = "",
+): string[] | undefined {
+  let entries: string[];
   try {
-    const pyproject = join(dir, "pyproject.toml");
-    if (!deps.existsSync(pyproject)) return false;
-    if (parsePyproject(deps.readFile(pyproject)).projectName !== PANEL_REGISTRY_ID) {
-      return false;
-    }
-    // THE JS BUNDLE IS NOT OPTIONAL, AND ITS PRESENCE IS NOT ENOUGH.
-    //
-    // "A regular file exists at this path" is a claim about the DIRECTORY ENTRY,
-    // and an entry surviving while its data did not is the canonical shape of
-    // the crash this whole mechanism exists to handle. So the bundle must be a
-    // COMPLETE module, which is a question about structure — not about size and
-    // not about which words appear in it. A size floor plus token presence gets
-    // it wrong in both directions at once: a crash-truncated bundle keeps its
-    // early `import` and stays over any threshold, while a perfectly ordinary
-    // small extension is refused for being short.
-    const bundle = join(dir, ...PANEL_WEB_MARKERS[0]);
-    if (deps.probeFile(bundle) !== true) return false;
-    const source = deps.readFile(bundle);
-    if (source.trim().length === 0) return false;
-    return moduleIsStructurallyComplete(source);
+    entries = deps.readdir(dir);
   } catch {
-    return false;
+    return undefined;
   }
+  const out: string[] = [];
+  for (const name of entries) {
+    if (prefix === "" && (name === ".git" || name === PANEL_MANIFEST_NAME)) continue;
+    const full = join(dir, name);
+    const rel = prefix === "" ? name : `${prefix}/${name}`;
+    const isDir = deps.isDirectory(full);
+    if (isDir === undefined) return undefined; // could not classify — not a complete listing
+    if (isDir) {
+      const nested = collectTreeFiles(full, deps, rel);
+      if (!nested) return undefined;
+      out.push(...nested);
+    } else {
+      out.push(rel);
+    }
+  }
+  return out.sort();
+}
+
+/**
+ * Record what we just staged. THROWS on any failure: a swap whose result cannot
+ * later be verified is not one we should start, because the whole recovery
+ * design rests on being able to tell an intact tree from a damaged one.
+ */
+function writeStagedManifest(dir: string, deps: PanelInstallerDeps): void {
+  if (!deps.fileDigest || !deps.hashString || !deps.writeFile) {
+    throw new PanelInstallError(
+      "this build cannot compute an integrity manifest (missing filesystem digest support)",
+    );
+  }
+  const rels = collectTreeFiles(dir, deps);
+  if (!rels) {
+    throw new PanelInstallError(`could not enumerate the staged tree at ${dir}`);
+  }
+  const files: PanelManifestEntry[] = [];
+  for (const rel of rels) {
+    const d = deps.fileDigest(join(dir, ...rel.split("/")));
+    if (!d) throw new PanelInstallError(`could not hash the staged file ${rel}`);
+    files.push({ path: rel, size: d.size, sha256: d.sha256 });
+  }
+  const manifest: PanelManifest = {
+    version: 1,
+    files,
+    digest: manifestDigest(files, deps),
+  };
+  deps.writeFile(join(dir, PANEL_MANIFEST_NAME), JSON.stringify(manifest));
+}
+
+export type StagedTreeVerdict = "intact" | "corrupt" | "unverifiable";
+
+/**
+ * Compare a staged tree against the manifest written when it was staged.
+ *
+ * `unverifiable` is a first-class answer, deliberately distinct from `corrupt`:
+ * "we cannot tell" must not be reported as "it is broken", because the two lead
+ * to different actions — disclose and stop, versus restore the backup.
+ */
+function verifyStagedTree(dir: string, deps: PanelInstallerDeps): StagedTreeVerdict {
+  if (!deps.fileDigest || !deps.hashString) return "unverifiable";
+  const manifestPath = join(dir, PANEL_MANIFEST_NAME);
+  if (!deps.existsSync(manifestPath)) return "unverifiable";
+  let manifest: PanelManifest;
+  try {
+    manifest = JSON.parse(deps.readFile(manifestPath)) as PanelManifest;
+  } catch {
+    return "unverifiable"; // truncated or corrupt manifest — cannot tell
+  }
+  if (manifest?.version !== 1 || !Array.isArray(manifest.files)) return "unverifiable";
+  if (manifest.digest !== manifestDigest(manifest.files, deps)) return "unverifiable";
+
+  const actual = collectTreeFiles(dir, deps);
+  if (!actual) return "unverifiable";
+  if (actual.length !== manifest.files.length) return "corrupt";
+  const expected = new Map(manifest.files.map((f) => [f.path, f]));
+  for (const rel of actual) {
+    const want = expected.get(rel);
+    if (!want) return "corrupt"; // a file we never staged
+    const got = deps.fileDigest(join(dir, ...rel.split("/")));
+    if (!got) return "unverifiable"; // could not read it back
+    if (got.size !== want.size || got.sha256 !== want.sha256) return "corrupt";
+  }
+  return "intact";
 }
 
 function reconcilePanelSwap(
@@ -2916,7 +2940,7 @@ function reconcilePanelSwap(
     // report that no copy exists when one is sitting in custom_nodes_backup.
     const staleBackup =
       (isInsideDir(join(comfyuiPath, "custom_nodes_backup"), stale.backupDir) &&
-      dirIsUsablePanel(stale.backupDir, deps)
+      dirHasPanelFiles(stale.backupDir, deps)
         ? stale.backupDir
         : undefined) ?? discoverPanelBackup(comfyuiPath, deps);
     if (deps.existsSync(staleCanonical)) {
@@ -2953,10 +2977,10 @@ function reconcilePanelSwap(
           `"${journalPath}" — then restart ComfyUI. To start fresh instead: delete ` +
           `"${journalPath}" and run ${reinstall}.`
         : ` WARNING: there is NO panel at ${staleCanonical}, a swap journal is still present ` +
-          `at ${journalPath}, and the backup it names (${staleBackup}) is NOT there ` +
-          `either. Nothing has been moved. Look in ` +
-          `${join(comfyuiPath, "custom_nodes_backup")} for a copy and move it to ` +
-          `"${staleCanonical}"; otherwise delete "${journalPath}" and run ${reinstall}.`,
+          `at ${journalPath}, and no preserved copy of the panel could be found under ` +
+          `${join(comfyuiPath, "custom_nodes_backup")}. Nothing has been moved. If you have ` +
+          `a copy elsewhere, move it to "${staleCanonical}"; otherwise delete ` +
+          `"${journalPath}" and run ${reinstall}.`,
     };
   }
 
@@ -2983,7 +3007,7 @@ function reconcilePanelSwap(
   const namedBackup =
     journal?.backupDir &&
     isInsideDir(backupRootPath, journal.backupDir) &&
-    dirIsUsablePanel(journal.backupDir, deps)
+    dirHasPanelFiles(journal.backupDir, deps)
       ? journal.backupDir
       : undefined;
   const journalBackup = namedBackup ?? discoverPanelBackup(comfyuiPath, deps);
@@ -2994,7 +3018,7 @@ function reconcilePanelSwap(
   // ComfyUI actually serves. A husk left by a half-finished move, or a directory
   // someone emptied, would otherwise cost the user the only working copy.
   const canonicalPresent = deps.existsSync(canonicalDir);
-  const canonicalUsable = canonicalPresent && dirIsUsablePanel(canonicalDir, deps);
+  const canonicalUsable = canonicalPresent && dirHasPanelFiles(canonicalDir, deps);
 
   // REPAIR ONLY UNDER THE OP LOCK. panelStatus is called from many places and
   // holds no lock, so repairing from there could move directories out from
@@ -3074,8 +3098,28 @@ function reconcilePanelSwap(
   // user's good copy in backup: the recovery destroying the very thing it
   // exists to protect. Re-check the tree as it is NOW, and when it does not
   // hold up, prefer the copy we know worked.
-  if (!dirIsUsablePanel(incomingDir, deps)) {
-      // journalBackup is already viability-checked by resolution (named or
+  const stagedVerdict = verifyStagedTree(incomingDir, deps);
+  if (stagedVerdict === "unverifiable") {
+    // "Cannot tell" is not "broken", and must not be treated as either outcome.
+    // Promoting an unverified tree risks installing a husk over a working panel;
+    // restoring the backup would discard a replacement that may be perfectly
+    // fine. So: change nothing, and say exactly what is where.
+    return {
+      ok: false,
+      note:
+        ` WARNING: a panel update was interrupted, and whether the replacement left at ` +
+        `${incomingDir} survived intact CANNOT be determined — its integrity manifest is ` +
+        `missing or unreadable. Nothing has been moved. ComfyUI is serving that copy, so ` +
+        `the panel still loads.` +
+        (journalBackup
+          ? ` Your previous panel is preserved at ${journalBackup}; to go back to it: mv ` +
+            `"${journalBackup}" "${canonicalDir}" and remove "${incomingDir}".`
+          : ` No previous copy could be located under ${backupRootPath}.`) +
+        ` Then restart ComfyUI.`,
+    };
+  }
+  if (stagedVerdict === "corrupt") {
+    // journalBackup is already shape-checked by resolution (named or
     // discovered), so this only asks whether we HAVE one.
     const backupUsable = !!journalBackup;
     if (!backupUsable || !deps.rename) {
@@ -3377,18 +3421,23 @@ async function updateViaRegistryZipReinstall(opts: {
     // if a clone ever landed without them, swapping it in would serve the
     // browser nothing — an "update" that silently uninstalls the panel. An
     // indeterminate probe is not a pass.
-    // (3) VIABILITY, not (2) SERVE. This decides whether to replace a working
-    // panel with this clone, so it must ask whether the clone would LOAD — the
-    // serve test passes on the wordmark SVG alone, which would let a husk be
-    // installed over the user's working copy and then be reported as a
-    // successful update by the metadata-only post-check.
-    if (!dirIsUsablePanel(staging, deps)) {
+    // (3) SHAPE. Pre-swap, the question is only "did the clone complete" —
+    // answered by git exiting cleanly, the pack identifying itself, and the
+    // bundle being present. Truncation-by-crash is a RECOVERY-time concern,
+    // answered exactly by the integrity manifest below; trying to detect it
+    // here by inspecting file contents was the wrong tool for the job.
+    if (!dirHasPanelFiles(staging, deps)) {
       throw new PanelInstallError(
-        `the freshly cloned panel at ${staging} does not carry a usable built web bundle ` +
-          `(web/js/comfyui-mcp-panel.js missing, empty, or truncated), so installing it ` +
+        `the freshly cloned panel at ${staging} is not a complete panel pack ` +
+          `(pyproject identity or web/js/comfyui-mcp-panel.js missing), so installing it ` +
           `would leave the ComfyUI tab with no panel at all`,
       );
     }
+
+    // (4) INTEGRITY — record what we staged, so recovery can later prove whether
+    // this exact tree survived. Throwing here is deliberate: a swap whose result
+    // could never be verified is not one worth starting.
+    writeStagedManifest(staging, deps);
 
     // NEVER BACKWARDS, and never a pointless swap.
     //

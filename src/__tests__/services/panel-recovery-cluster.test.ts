@@ -33,8 +33,10 @@ import {
   renameSync,
   rmSync,
   statSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -75,7 +77,6 @@ vi.mock("../../services/workspace-env.js", () => ({
 
 import {
   defaultDeps,
-  moduleIsStructurallyComplete,
   PanelInstallError,
   pinPanelBase,
   PANEL_REGISTRY_ID,
@@ -122,6 +123,67 @@ function panelBundle(version: string): string {
     `app.registerExtension({ name: "comfyui-mcp.panel", async setup() {} });\n` +
     `// padding to a plausible bundle size\n${"//x\n".repeat(400)}`
   );
+}
+
+/** Every file under `dir`, relative and sorted — mirrors collectTreeFiles. */
+function treeFiles(dir: string, prefix = ""): string[] {
+  const out: string[] = [];
+  for (const name of readdirSync(dir)) {
+    if (prefix === "" && (name === ".git" || name === ".comfyui-mcp-integrity.json")) {
+      continue;
+    }
+    const full = join(dir, name);
+    const rel = prefix === "" ? name : `${prefix}/${name}`;
+    if (statSync(full).isDirectory()) out.push(...treeFiles(full, rel));
+    else out.push(rel);
+  }
+  return out.sort();
+}
+
+/**
+ * Write the integrity manifest exactly as the swap does at stage time, so
+ * fixtures exercise the real verification rather than a stand-in.
+ */
+function writeManifest(dir: string): void {
+  const files = treeFiles(dir).map((rel) => {
+    const buf = readFileSync(join(dir, ...rel.split("/")));
+    return {
+      path: rel,
+      size: buf.byteLength,
+      sha256: createHash("sha256").update(buf).digest("hex"),
+    };
+  });
+  const canonical = files.map((f) => `${f.path} | ${f.size} | ${f.sha256}`).join("\n");
+  writeFileSync(
+    join(dir, ".comfyui-mcp-integrity.json"),
+    JSON.stringify({
+      version: 1,
+      files,
+      digest: createHash("sha256").update(canonical, "utf-8").digest("hex"),
+    }),
+  );
+}
+
+/**
+ * Damage a staged tree AFTER its manifest was written — the real crash order.
+ * Staging corrupt content and then hashing it would produce a manifest that
+ * agrees with the damage, which verifies as intact and tests nothing.
+ */
+function corruptStagedBundle(dir = INCOMING(), replacement = ""): void {
+  writeFileSync(join(dir, "web", "js", "comfyui-mcp-panel.js"), replacement);
+}
+
+/** A staged `.incoming` tree as the swap would leave it: pack + manifest. */
+function stageIncoming(version: string, opts: { bundle?: string } = {}): string {
+  const dir = INCOMING();
+  writePanelPack(dir, version, opts);
+  writeManifest(dir);
+  return dir;
+}
+
+/** A backup directory named the way the swap names them (base-version-epochms). */
+function backupPath(version: string, stamp = Date.now()): string {
+  return join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-${version}-${stamp}`);
 }
 
 function writePanelPack(
@@ -260,11 +322,31 @@ function makeDeps(opts: {
         rename: (from, to) => renameSync(from, to),
         removeDir: (p) => rmSync(p, { recursive: true, force: true }),
         writeFile: (p, contents) => writeFileSync(p, contents, "utf-8"),
+        fileDigest: (p) => {
+          try {
+            const buf = readFileSync(p);
+            return {
+              size: buf.byteLength,
+              sha256: createHash("sha256").update(buf).digest("hex"),
+            };
+          } catch {
+            return undefined;
+          }
+        },
+        hashString: (v) => createHash("sha256").update(v, "utf-8").digest("hex"),
+        mtimeMs: (p) => {
+          try {
+            return statSync(p).mtimeMs;
+          } catch {
+            return undefined;
+          }
+        },
       };
   return h;
 }
 
 const PANEL_DIR = () => join(root, "custom_nodes", PANEL_REGISTRY_ID);
+const INCOMING = () => join(root, "custom_nodes", ".comfyui-agent-panel.incoming");
 
 // ---------------------------------------------------------------------------
 // 1. Never recommend a tool the caller cannot invoke (#774, #784)
@@ -793,7 +875,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
       cloneWithoutWeb: true,
     });
     const err = await runPanelActionInner("update", h.deps).catch((e: Error) => e);
-    expect((err as Error).message).toMatch(/built web bundle/);
+    expect((err as Error).message).toMatch(/not a complete panel pack/);
     // The working panel is still in place.
     expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
     expect(readdirSync(join(root, "custom_nodes"))).toEqual([PANEL_REGISTRY_ID]);
@@ -828,7 +910,6 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
   // matters because a journal's directory entry is not made durable by fsync'ing
   // the journal's contents.
 
-  const INCOMING = () => join(root, "custom_nodes", ".comfyui-agent-panel.incoming");
 
   /** Is ANY panel-serving directory present in custom_nodes right now? */
   function aPanelIsReachable(): boolean {
@@ -918,7 +999,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     // retarget between the freeze and the action would let it act on the
     // PREVIOUS target's interrupted swap.
     writePanelPack(PANEL_DIR(), "0.11.34");
-    writePanelPack(INCOMING(), "0.11.38");
+    stageIncoming("0.11.38");
     const h = makeDeps({ cloneVersion: "0.11.40" });
     let moved = 0;
     const realRename = h.deps.rename!;
@@ -986,7 +1067,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
   it("a repair that already landed is reported even if the call then throws", async () => {
     // The catch used to return undefined, swallowing the disclosure along with
     // the error — a change to the user's install, hidden.
-    writePanelPack(INCOMING(), "0.11.38");
+    stageIncoming("0.11.38");
     const h = makeDeps({});
     let renamed = false;
     const realRename = h.deps.rename!;
@@ -1008,7 +1089,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     // install/reinstall await ComfyUI-Manager directly, which rejects with its
     // own error types. Restricting the note to PanelInstallError meant a repair
     // could happen and then vanish because the action failed for another reason.
-    writePanelPack(INCOMING(), "0.11.38"); // an interrupted swap to finish first
+    stageIncoming("0.11.38"); // an interrupted swap to finish first
     const h = makeDeps({});
     h.deps.install = async () => {
       throw new TypeError("something entirely unrelated blew up");
@@ -1023,7 +1104,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
 
   it("interruption BEFORE the old panel moved aside is undone, keeping the working panel", async () => {
     writePanelPack(PANEL_DIR(), "0.11.34");
-    writePanelPack(INCOMING(), "0.11.38"); // staged, but the swap never went on
+    stageIncoming("0.11.38"); // staged, but the swap never went on
     const { repairInterruptedPanelSwap } = await import(
       "../../services/panel-installer.js"
     );
@@ -1070,15 +1151,80 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     expect(readdirSync(join(root, "custom_nodes_backup"))).toEqual([]);
   });
 
+  it("P0: a file truncated AFTER the manifest was written is detected, and the backup restored", async () => {
+    // The exact sequence a crash produces: the tree is staged and recorded
+    // intact, then data is lost. No parsing is involved — the bytes simply no
+    // longer match what we ourselves wrote down.
+    const backupDir = backupPath("0.11.34");
+    writePanelPack(backupDir, "0.11.34");
+    stageIncoming("0.11.38");
+    const bundle = join(INCOMING(), "web", "js", "comfyui-mcp-panel.js");
+    const full = readFileSync(bundle, "utf-8");
+    writeFileSync(bundle, full.slice(0, Math.floor(full.length / 2))); // half a file
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
+    expect(note).toMatch(/INCOMPLETE/);
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
+    expect(existsSync(INCOMING())).toBe(false);
+  });
+
+  it("P0: a MISSING manifest is a disclosed refusal, never a promotion", async () => {
+    // "Cannot tell" is its own answer. Promoting would risk installing a husk
+    // over a working panel; restoring would discard a replacement that may be
+    // perfectly fine. So: change nothing, and say where everything is.
+    const backupDir = backupPath("0.11.34");
+    writePanelPack(backupDir, "0.11.34");
+    stageIncoming("0.11.38");
+    rmSync(join(INCOMING(), ".comfyui-mcp-integrity.json"));
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
+    expect(note).toMatch(/CANNOT be determined/);
+    expect(note).toContain(backupDir); // the user is told where their panel is
+    // Nothing moved in either direction.
+    expect(existsSync(INCOMING())).toBe(true);
+    expect(existsSync(PANEL_DIR())).toBe(false);
+    expect(existsSync(backupDir)).toBe(true);
+  });
+
+  it("a DOCTORED manifest cannot vouch for a tree — the digest covers the file list", async () => {
+    const backupDir = backupPath("0.11.34");
+    writePanelPack(backupDir, "0.11.34");
+    stageIncoming("0.11.38");
+    const manifestPath = join(INCOMING(), ".comfyui-mcp-integrity.json");
+    const m = JSON.parse(readFileSync(manifestPath, "utf-8"));
+    // Rewrite an entry to match damaged content without touching the digest.
+    m.files[0].sha256 = "0".repeat(64);
+    writeFileSync(manifestPath, JSON.stringify(m));
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    expect(await repairInterruptedPanelSwap(makeDeps({}).deps)).toMatch(
+      /CANNOT be determined/,
+    );
+  });
+
+  it("an INTACT staged tree is promoted", async () => {
+    stageIncoming("0.11.38");
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    expect(await repairInterruptedPanelSwap(makeDeps({}).deps)).toMatch(/moved into place/);
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.38");
+  });
+
   it("P0: a HUSK incoming is never promoted — the good copy is restored instead", async () => {
     // A crash can keep the .incoming directory ENTRY while losing file data
     // that was still unwritten. Promoting that husk would make it the panel of
     // record and strand the user's working copy in backup — the recovery
     // destroying the thing it exists to protect.
-    const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1`);
+    const backupDir = backupPath("0.11.34");
     writePanelPack(backupDir, "0.11.34"); // the good copy
-    mkdirSync(INCOMING(), { recursive: true });
-    writeFileSync(join(INCOMING(), "pyproject.toml"), pyproject("0.11.38")); // no bundle
+    stageIncoming("0.11.38"); // staged intact, manifest written…
+    rmSync(join(INCOMING(), "web", "js", "comfyui-mcp-panel.js")); // …then the crash ate it
     writeFileSync(
       join(root, ".comfyui-agent-panel.swap.json"),
       JSON.stringify({ dir: PANEL_DIR(), backupDir, staging: "x", startedAt: Date.now() }),
@@ -1098,14 +1244,14 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
   });
 
   it("a husk incoming with NO recoverable backup reports rather than promoting it", async () => {
-    mkdirSync(INCOMING(), { recursive: true });
-    writeFileSync(join(INCOMING(), "pyproject.toml"), pyproject("0.11.38"));
+    stageIncoming("0.11.38");
+    rmSync(join(INCOMING(), "web", "js", "comfyui-mcp-panel.js"));
     const { repairInterruptedPanelSwap } = await import(
       "../../services/panel-installer.js"
     );
     const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
     expect(note).toMatch(/INCOMPLETE/);
-    expect(note).toMatch(/no usable panel bundle/);
+    expect(note).toMatch(/No previous copy could be located/);
     // Not promoted — the canonical name is still free rather than holding a husk.
     expect(existsSync(PANEL_DIR())).toBe(false);
   });
@@ -1118,7 +1264,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     mkdirSync(join(PANEL_DIR(), "web", "img"), { recursive: true });
     writeFileSync(join(PANEL_DIR(), "pyproject.toml"), pyproject("0.11.34"));
     writeFileSync(join(PANEL_DIR(), "web", "img", "comfyui-mcp-wordmark.svg"), "<svg/>");
-    writePanelPack(INCOMING(), "0.11.38"); // the only COMPLETE copy
+    stageIncoming("0.11.38"); // the only COMPLETE copy
 
     const { repairInterruptedPanelSwap } = await import(
       "../../services/panel-installer.js"
@@ -1146,7 +1292,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     };
     const err = await runPanelActionInner("update", h.deps).catch((e: Error) => e);
     expect(err).toBeInstanceOf(PanelInstallError);
-    expect((err as Error).message).toMatch(/usable built web bundle/);
+    expect((err as Error).message).toMatch(/not a complete panel pack/);
     // The working panel never moved — the refusal lands during validation,
     // before the swap creates anything at all.
     expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
@@ -1154,85 +1300,13 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     expect(readdirSync(join(root, "custom_nodes"))).toEqual([PANEL_REGISTRY_ID]);
   });
 
-  // ── Bundle completeness ────────────────────────────────────────────────────
-  // Size and token presence are not evidence of well-formedness. They were wrong
-  // in BOTH directions: a crash-truncated bundle keeps its early `import` and
-  // stays over any threshold, while an ordinary small extension is refused for
-  // being short. Both directions are pinned here.
-
-  describe("moduleIsStructurallyComplete", () => {
-    const complete = [
-      ['a genuinely SMALL but valid extension', 'import{app}from"./app.js";app.registerExtension({name:"x"});'],
-      ["no trailing semicolon (ASI)", "export default 5"],
-      ["template literals with nested substitutions", 'const a=`x${`y${1+2}`}z`;'],
-      ["regex containing quotes and brackets", 'const re=/["\'{[(]/g; export{re};'],
-      ["division that is not a regex", "const r = (a+b) / c / d;"],
-      ["a line comment running to EOF", "export const a=1;\n// trailing note"],
-      ["braces inside strings", 'const s = "){"; export {s};'],
-    ] as const;
-    for (const [label, src] of complete) {
-      it(`accepts ${label}`, () => {
-        expect(moduleIsStructurallyComplete(src)).toBe(true);
-      });
-    }
-
-    const truncated = [
-      ["cut mid-call", 'import{app}from"./app.js";app.registerExtension({name:"x"'],
-      ["cut inside a string", 'const msg = "hello wor'],
-      ["cut inside a template literal", "const a = `abc${1+"],
-      ["cut inside a block comment", "/* explanatory note that never"],
-      ["cut after a binary operator", "const a = 5 +"],
-      ["cut after a comma", "const a = [1, 2,"],
-      ["unbalanced closer", "})"],
-    ] as const;
-    for (const [label, src] of truncated) {
-      it(`rejects a bundle ${label}`, () => {
-        expect(moduleIsStructurallyComplete(src)).toBe(false);
-      });
-    }
-  });
-
-  it("P0: a bundle truncated AFTER a valid prefix is refused, however large", async () => {
-    // The old heuristic accepted this: it is well over any size floor and its
-    // first line contains `import`. It is also syntactically incomplete.
-    const plausible =
-      `import { app } from "../../scripts/app.js";\n` +
-      `${"// filler filler filler filler filler\n".repeat(60)}` +
-      `app.registerExtension({ name: "comfyui-mcp.panel", async setup() {\n` +
-      `  const label = "this string never clo`;
-    const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1`);
-    writePanelPack(backupDir, "0.11.34");
-    writePanelPack(INCOMING(), "0.11.38", { bundle: plausible });
-    const { repairInterruptedPanelSwap } = await import(
-      "../../services/panel-installer.js"
-    );
-    const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
-    expect(note).toMatch(/INCOMPLETE/);
-    // The good copy is what ends up installed.
-    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
-  });
-
-  it("P1: a genuinely SMALL valid bundle is accepted by the swap, not refused for size", async () => {
-    writePanelPack(PANEL_DIR(), "0.11.34");
-    const tiny = 'import{app}from"../../scripts/app.js";app.registerExtension({name:"p"});';
-    const h = makeDeps({ updateThrows: "manager cannot resolve it" });
-    h.deps.gitClonePanel = (dest) => {
-      h.clones.push(dest);
-      writePanelPack(dest, "0.11.38", { bundle: tiny });
-    };
-    const result = await runPanelActionInner("update", h.deps);
-    expect(result.installedVersion).toBe("0.11.38");
-    expect(readFileSync(join(PANEL_DIR(), "web", "js", "comfyui-mcp-panel.js"), "utf-8")).toBe(
-      tiny,
-    );
-  });
-
   it("P0: a TRUNCATED bundle is not usable — a surviving entry is not surviving data", async () => {
     // A zero-byte or truncated JS file is the canonical shape of "the directory
     // entry survived, the data did not".
-    const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1`);
+    const backupDir = backupPath("0.11.34");
     writePanelPack(backupDir, "0.11.34");
-    writePanelPack(INCOMING(), "0.11.38", { bundle: "" }); // zero-byte bundle
+    stageIncoming("0.11.38");
+    corruptStagedBundle(); // zero-byte bundle
     writeFileSync(
       join(root, ".comfyui-agent-panel.swap.json"),
       JSON.stringify({ dir: PANEL_DIR(), backupDir, staging: "x", startedAt: Date.now() }),
@@ -1252,9 +1326,10 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     // PRESENT, which is unambiguous proof of an interrupted swap — so recovery
     // is licensed, and refusing while a viable copy sits discoverable on disk
     // (and telling the user none exists) is a plain failure.
-    const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1770000000000`);
+    const backupDir = backupPath("0.11.34", 1770000000000);
     writePanelPack(backupDir, "0.11.34");
-    writePanelPack(INCOMING(), "0.11.38", { bundle: "const a = [1," }); // husk
+    stageIncoming("0.11.38");
+    corruptStagedBundle(); // husk
     // No journal at all.
     const { repairInterruptedPanelSwap } = await import(
       "../../services/panel-installer.js"
@@ -1266,13 +1341,21 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
   });
 
   it("discovery picks the MOST RECENT viable backup and ignores unusable ones", async () => {
-    const older = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.20-1700000000000`);
-    const newer = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1770000000000`);
-    const husk = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.30-1780000000000`);
+    const older = backupPath("0.11.20", 1700000000000);
+    const newer = backupPath("0.11.34", 1770000000000);
+    const husk = backupPath("0.11.30", 1780000000000);
     writePanelPack(older, "0.11.20");
     writePanelPack(newer, "0.11.34");
-    writePanelPack(husk, "0.11.30", { bundle: "" }); // newest, but unusable
-    writePanelPack(INCOMING(), "0.11.38", { bundle: "const a = [1," });
+    writePanelPack(husk, "0.11.30", { bundle: "" }); // newest by time, but unusable
+    // Selection orders by REAL mtime, not by the digits in the name, so the
+    // fixture has to set real times — created-milliseconds-apart would leave
+    // the ordering to chance and quietly stop testing anything.
+    const t = (s: number) => new Date(Date.now() - s * 1000);
+    utimesSync(older, t(300), t(300));
+    utimesSync(newer, t(60), t(60));
+    utimesSync(husk, t(1), t(1));
+    stageIncoming("0.11.38");
+    corruptStagedBundle();
     const { repairInterruptedPanelSwap } = await import(
       "../../services/panel-installer.js"
     );
@@ -1287,7 +1370,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     const impostor = join(root, "custom_nodes", "comfyui-mcp-panel");
     mkdirSync(impostor, { recursive: true });
     writeFileSync(join(impostor, "pyproject.toml"), pyproject("1.0.0", "some-other-node"));
-    const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1770000000000`);
+    const backupDir = backupPath("0.11.34", 1770000000000);
     writePanelPack(backupDir, "0.11.34");
     writeFileSync(
       join(root, ".comfyui-agent-panel.swap.json"),
@@ -1318,7 +1401,8 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
       "custom_nodes",
       PANEL_REGISTRY_ID,
     );
-    writePanelPack(INCOMING(), "0.11.38", { bundle: "" }); // husk, so a restore is attempted
+    stageIncoming("0.11.38");
+    corruptStagedBundle(); // husk, so a restore is attempted
     writeFileSync(
       join(root, ".comfyui-agent-panel.swap.json"),
       JSON.stringify({
@@ -1345,7 +1429,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     // would promote to a second directory and leave BOTH served.
     const repoNamed = join(root, "custom_nodes", "comfyui-mcp-panel");
     writePanelPack(repoNamed, "0.11.34");
-    writePanelPack(INCOMING(), "0.11.38");
+    stageIncoming("0.11.38");
     const { repairInterruptedPanelSwap } = await import(
       "../../services/panel-installer.js"
     );
@@ -1357,7 +1441,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
   it("P2: a stale journal pointing at some unrelated existing dir cannot suppress the refusal", async () => {
     // journal.dir deciding "the panel exists" let an untrusted path silence the
     // disclosure the ruling requires, leaving the preserved backup unmentioned.
-    const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1`);
+    const backupDir = backupPath("0.11.34");
     writePanelPack(backupDir, "0.11.34");
     const unrelated = join(root, "unrelated-but-existing");
     mkdirSync(unrelated, { recursive: true });
@@ -1379,7 +1463,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     // The journal informs; it never designates. Taking the destination from
     // journal.dir would let a stale or edited record send the panel anywhere.
     const elsewhere = join(root, "elsewhere", "panel");
-    writePanelPack(INCOMING(), "0.11.38");
+    stageIncoming("0.11.38");
     writeFileSync(
       join(root, ".comfyui-agent-panel.swap.json"),
       JSON.stringify({
@@ -1403,7 +1487,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     // or left by a half-finished move — would otherwise be read as a healthy
     // install and used to justify deleting the only usable copy.
     mkdirSync(PANEL_DIR(), { recursive: true }); // present, but no pyproject/web
-    writePanelPack(INCOMING(), "0.11.38");
+    stageIncoming("0.11.38");
     const { repairInterruptedPanelSwap } = await import(
       "../../services/panel-installer.js"
     );
@@ -1417,7 +1501,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
 
   it("a canonical panel missing its BUILT BUNDLE is not treated as healthy either", async () => {
     writePanelPack(PANEL_DIR(), "0.11.34", { web: false }); // pyproject only
-    writePanelPack(INCOMING(), "0.11.38");
+    stageIncoming("0.11.38");
     const { repairInterruptedPanelSwap } = await import(
       "../../services/panel-installer.js"
     );
@@ -1431,7 +1515,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     // A swap that COMPLETED and died before deleting its journal, after which
     // the user uninstalled the panel on purpose. "There is a journal" only ever
     // meant "a journal exists" — it must not be read as "a swap is half-done".
-    const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1`);
+    const backupDir = backupPath("0.11.34");
     writePanelPack(backupDir, "0.11.34");
     writeFileSync(
       join(root, ".comfyui-agent-panel.swap.json"),
@@ -1457,7 +1541,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
   });
 
   it("says so plainly when the backup named by a stale journal is ALSO gone", async () => {
-    const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1`);
+    const backupDir = backupPath("0.11.34");
     writeFileSync(
       join(root, ".comfyui-agent-panel.swap.json"),
       JSON.stringify({ dir: PANEL_DIR(), backupDir, staging: "x", startedAt: Date.now() }),
@@ -1466,7 +1550,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
       "../../services/panel-installer.js"
     );
     const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
-    expect(note).toMatch(/is NOT there/);
+    expect(note).toMatch(/no preserved copy of the panel could be found/);
     expect(note).toContain(join(root, "custom_nodes_backup"));
     // Must not claim a preserved copy that isn't there.
     expect(note).not.toMatch(/HAS been preserved/);
@@ -1474,7 +1558,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
 
   it("a completed swap's spent journal is simply cleared when the panel IS present", async () => {
     writePanelPack(PANEL_DIR(), "0.11.38");
-    const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1`);
+    const backupDir = backupPath("0.11.34");
     writePanelPack(backupDir, "0.11.34");
     writeFileSync(
       join(root, ".comfyui-agent-panel.swap.json"),
@@ -1489,7 +1573,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
   });
 
   it("a PIN blocks the status-path repair too — a restore is still a mutation", async () => {
-    writePanelPack(INCOMING(), "0.11.38");
+    stageIncoming("0.11.38");
     const h = makeDeps({});
     h.deps.readPin = () => ({ pinned: true, source: "settings" as const, version: "0.11.34" });
     const { repairInterruptedPanelSwap } = await import(
@@ -1500,7 +1584,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
   });
 
   it("a retarget aborts the status-path repair rather than acting on the wrong tree", async () => {
-    writePanelPack(INCOMING(), "0.11.38");
+    stageIncoming("0.11.38");
     const h = makeDeps({});
     const pinned = await pinPanelBase(h.deps);
     generation.value++; // a retarget landed after the freeze
@@ -1512,7 +1596,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
   });
 
   it("the on-load auto-install finishes an interrupted swap before doing anything else", async () => {
-    writePanelPack(INCOMING(), "0.11.38"); // canonical absent: the second half
+    stageIncoming("0.11.38"); // canonical absent: the second half
     const { ensurePanelInstalled } = await import("../../services/panel-installer.js");
     const result = await ensurePanelInstalled({ deps: makeDeps({}).deps });
     expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.38");
@@ -1520,7 +1604,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
   });
 
   it("a bare panelStatus still only REPORTS — it holds no lock, so it must not move directories", async () => {
-    writePanelPack(INCOMING(), "0.11.38");
+    stageIncoming("0.11.38");
     const { panelStatus } = await import("../../services/panel-installer.js");
     const status = await panelStatus(makeDeps({ withoutSwapOps: true }).deps);
     expect(status.note).toMatch(/interrupted/i);
@@ -1530,7 +1614,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
   it("a mutation REPORTS the repair it performed, not just the work it was asked to do", async () => {
     // Restoring somebody's panel is a material event; "update succeeded" alone
     // would hide it.
-    writePanelPack(INCOMING(), "0.11.30"); // an interrupted swap to finish first
+    stageIncoming("0.11.30"); // an interrupted swap to finish first
     const h = makeDeps({ cloneVersion: "0.11.38", updateThrows: "manager cannot resolve it" });
     const result = await runPanelActionInner("update", h.deps);
     expect(result.recoveryNote).toMatch(/interrupted/i);
@@ -1540,7 +1624,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
 
   it("REFUSES every mutation when an interrupted swap could NOT be reconciled", async () => {
     writePanelPack(PANEL_DIR(), "0.11.34");
-    writePanelPack(INCOMING(), "0.11.38");
+    stageIncoming("0.11.38");
     const h = makeDeps({ cloneVersion: "0.11.40" });
     h.deps.removeDir = () => {
       throw new Error("EACCES: cannot clear the staged copy");
@@ -1558,7 +1642,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
       throw new Error("EACCES: read-only filesystem");
     };
     const err = await runPanelActionInner("update", h.deps).catch((e: Error) => e);
-    expect((err as Error).message).toMatch(/could not record where the previous panel/);
+    expect((err as Error).message).toMatch(/EACCES|could not record/);
     expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
     expect(existsSync(INCOMING())).toBe(false);
   });
@@ -1575,7 +1659,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
   it("a PIN also blocks the interrupted-swap repair — no mutation means no mutation", async () => {
     // The repair moves directories too. A pinned user who was interrupted gets
     // the state reported, never silently rearranged.
-    const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1`);
+    const backupDir = backupPath("0.11.34");
     writePanelPack(backupDir, "0.11.34");
     writeFileSync(
       join(root, ".comfyui-agent-panel.swap.json"),
