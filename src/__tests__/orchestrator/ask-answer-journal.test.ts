@@ -1844,6 +1844,114 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     expect(AskAnswers.mayDisclose(entry)).toBe(false);
   });
 
+  // Gate P0: the ordering fix in surfaceAndClearDebt (count -> report -> clear)
+  // put a FALLIBLE step ahead of the PROTECTIVE one in its caller. A logger that
+  // throws aborted closeAsks with the fence half-built — and the caller has
+  // ALREADY reset the old agent by then, so it does not stop; the replacement
+  // agent's ready-flush pushes the still-unretired answer.
+  //
+  // The test models the CONTINUATION, not a retry: throw, swallow it exactly as
+  // a caller mid-teardown would, and then do what the caller does next.
+  it("a throwing report cannot leave the boundary half-built", () => {
+    openAndAnswer("pa-halfbuilt", SAMPLER, "dpmpp_2m");
+    // Give the tab an eviction debt too, so the report has something to say and
+    // therefore something to throw on.
+    AskAnswers.noteDroppedForTest(TAB, 2);
+    expect(AskAnswers.pending(TAB)).toHaveLength(1);
+
+    const boom = vi.spyOn(logger, "error").mockImplementation(() => {
+      throw new Error("log sink is down");
+    });
+    // The boundary happens; its report fails.
+    expect(() => AskAnswers.closeAsks(TAB)).toThrow(/log sink is down/);
+    boom.mockRestore();
+
+    // THE CALLER CONTINUES — the old agent is already gone and a replacement
+    // spawns, which flushes on ready. Nothing of the old conversation may go out.
+    const pushed: AskAnswerEvent[] = [];
+    AskAnswers.deliverPending(TAB, (payload) => {
+      pushed.push(payload);
+      return true;
+    });
+    expect(pushed).toEqual([]);
+    expect(AskAnswers.pending(TAB)).toHaveLength(0);
+
+    // …and an identical re-ask cannot recover it either.
+    const rec = AskAnswers.recover(TAB, askFingerprint(SAMPLER));
+    expect(rec.status).toBe("unattributed");
+    if (rec.status !== "unattributed") return;
+    expect(rec.others.some((e) => e.answer === "dpmpp_2m")).toBe(false);
+    expect(rec.withheld).toBeGreaterThan(0);
+
+    // The fence is complete; only the DEBT report is still owed, because the step
+    // that destroys it never ran.
+    expect(AskAnswers.entriesFor(TAB)[0].retired).toBe(true);
+    expect(AskAnswers.droppedFor(TAB)).toBe(2);
+  });
+
+  it("a throwing recall cannot leave the boundary half-built either", () => {
+    openAndAnswer("pa-recall", SAMPLER, "dpmpp_2m");
+    openAndAnswer("pa-recall-2", SCHEDULER, "karras");
+    AskAnswers.deliverPending(TAB, () => true); // both queued into a turn
+    AskAnswers.setRevoker(() => {
+      throw new Error("agent is gone");
+    });
+
+    // The revoke is fallible and runs AFTER the fence, so it cannot skip it.
+    AskAnswers.closeAsks(TAB);
+
+    expect(AskAnswers.entriesFor(TAB).every((e) => e.retired === true)).toBe(true);
+    expect(AskAnswers.pending(TAB)).toHaveLength(0);
+    expect(AskAnswers.recover(TAB, askFingerprint(SAMPLER)).status).toBe("unattributed");
+    AskAnswers.setRevoker(() => false);
+  });
+
+  // Gate P1: `closeAsk` (the ask handler's own unwind) re-armed a RETIRED entry
+  // to `pending`. `pending()` rightly refused to deliver it, but
+  // `hasOutstanding()` counted it as owed — so the self-restart gate stayed shut
+  // forever, cleared only by an unrelated boundary or eviction.
+  it("a retired answer never becomes a permanent blocker on the restart gate", () => {
+    AskAnswers.openAsk("pa-block", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SAMPLER),
+      question: SAMPLER.question,
+    });
+    // The boundary lands while the ask is still waiting…
+    AskAnswers.closeAsks(TAB);
+    // …the old card is then answered…
+    AskAnswers.record("pa-block", "dpmpp_2m", { tabId: TAB });
+    // …and the handler's `finally` unwinds.
+    AskAnswers.closeAsk("pa-block");
+
+    // The unwind must not ARM it in the first place…
+    expect(AskAnswers.entriesFor(TAB)[0].delivery).toBe("none");
+    expect(AskAnswers.pending(TAB)).toHaveLength(0);
+    expect(AskAnswers.hasOutstanding()).toBe(false);
+
+    // …and INDEPENDENTLY, an entry that somehow is armed must still not count as
+    // owed. Two separate guards, because they answer different questions: one
+    // stops the arming, the other stops an undeliverable entry holding the gate.
+    AskAnswers.entriesFor(TAB)[0].delivery = "pending";
+    expect(AskAnswers.pending(TAB)).toHaveLength(0);
+    expect(AskAnswers.hasOutstanding()).toBe(false);
+    // Still journaled and still named on the way out — fenced, not swallowed.
+    expect(AskAnswers.entriesFor(TAB).some((e) => e.answer === "dpmpp_2m")).toBe(true);
+    expect(AskAnswers.allOutstanding().some((e) => e.answer === "dpmpp_2m")).toBe(true);
+  });
+
+  it("a temporarily undeliverable answer DOES still hold the gate", () => {
+    // A different browser tab holding the key is TEMPORARY — the answer becomes
+    // deliverable again when its own tab returns — so tearing down while one is
+    // waiting would be a real loss. Only retirement is permanent.
+    let holder: string | undefined = "browser-tab-A";
+    AskAnswers.setIncarnationResolver(() => holder);
+    openAndAnswer("pa-wait", SAMPLER, "dpmpp_2m");
+    holder = "browser-tab-B";
+    expect(AskAnswers.pending(TAB)).toHaveLength(0); // not deliverable to B…
+    expect(AskAnswers.hasOutstanding()).toBe(true); // …but still owed to A
+    AskAnswers.setIncarnationResolver(() => OCCUPANT);
+  });
+
   it("never throws when the flusher does", () => {
     AskAnswers.setFlusher(() => {
       throw new Error("no agent");

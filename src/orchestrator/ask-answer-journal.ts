@@ -686,7 +686,11 @@ export class AskAnswerJournalImpl {
     for (const entry of this.entries.values()) {
       if (entry.askId !== askId) continue;
       answered = true;
-      if (!entry.returned && entry.delivery === "none") {
+      // A RETIRED answer is never armed. Arming it produces an entry that
+      // `pending()` correctly refuses to deliver and `hasOutstanding()` counted
+      // as owed — a permanent blocker on the self-restart gate, cleared only by
+      // some unrelated later boundary or eviction.
+      if (!entry.returned && entry.delivery === "none" && entry.retired !== true) {
         entry.delivery = "pending";
         armed = entry;
       }
@@ -1293,8 +1297,18 @@ export class AskAnswerJournalImpl {
     // tearing down while one is owed turns a disclosed loss back into a silent
     // one, which is the whole thing this journal exists to prevent.
     for (const slot of this.dropped.keys()) if (this.undisclosedDrop(slot) > 0) return true;
+    // …but a RETIRED answer is not owed to anyone. It can never be delivered —
+    // the conversation it belongs to is gone — so it is finished, whatever its
+    // `delivery` flag says, and holding the restart gate open for it would wait
+    // forever. Two predicates disagreeing about what `pending` means is what made
+    // this a deadlock: `pending()` reads it as "deliverable", this reads it as
+    // "owed", and only a retirement makes those differ permanently.
+    //
+    // NOT extended to a different-occupant mismatch, which is TEMPORARY: that
+    // answer becomes deliverable again the moment its own browser tab returns, so
+    // tearing down while one is waiting would be a real loss.
     return [...this.entries.values()].some(
-      (e) => e.delivery !== "none" || (e.disclose ?? 0) > 0,
+      (e) => (e.delivery !== "none" && e.retired !== true) || (e.disclose ?? 0) > 0,
     );
   }
 
@@ -1454,21 +1468,23 @@ export class AskAnswerJournalImpl {
    * quoted with their own question. A correlation may only ever get WEAKER.
    */
   closeAsks(key: string): void {
-    // BUMP THE TAB'S CONVERSATION GENERATION. Every ticket already minted for
-    // this tab now carries an older epoch, which is what makes a card left on
-    // screen recognisable as the retired conversation's — with no per-id
-    // bookkeeping to overflow. The TICKETS ARE KEPT: they are what still name the
-    // question, and deleting them would turn a late click into an answer with no
-    // question attached, i.e. the disclosure would lose the only thing that makes
-    // it honest.
+    // ORDER IS THE WHOLE POINT HERE. The rule this and surfaceAndClearDebt share:
+    //
+    //   FENCE BEFORE YOU REPORT. REPORT BEFORE YOU DESTROY.
+    //
+    // Nothing that can throw may stand between a decision and the state change
+    // that makes it safe. In surfaceAndClearDebt the irreversible act is the
+    // clear, so the report goes first. HERE the protective act is the retire, so
+    // it goes first — an earlier draft reported the debt (through a logger, which
+    // can fail) before marking anything retired, and a logger failure left the
+    // fence half-built. The caller has already reset the old agent by then, so
+    // the replacement's ready-flush would push the still-unretired answer and an
+    // identical re-ask could recover it.
+    //
+    // PASS 1 is pure state: no logging, no callbacks, nothing that can throw. By
+    // the end of it every answer on this tab is fenced.
     this.tabEpoch.set(key, (this.tabEpoch.get(key) ?? 0) + 1);
-    // The eviction DEBT is owed to the conversation being replaced, and scoping it
-    // by (tab, incarnation) cannot fence this axis — New chat happens on the same
-    // tab, same incarnation. Left alone, the replacement conversation's next ask
-    // would report the old conversation's warning as its own and settle it with
-    // its own ack. Surfaced and retired, exactly as a tab-gone does: reported,
-    // then cleared, never silently dropped.
-    this.surfaceAndClearDebt(key, this.incarnationOf?.(key), "its conversation was replaced");
+    const queued: AskEntry[] = [];
     for (const entry of this.entries.values()) {
       if (entry.key !== key) continue;
       if (entry.correlation.status === "matched") {
@@ -1489,29 +1505,48 @@ export class AskAnswerJournalImpl {
       // which is still delivered to the replacement conversation downgraded. A
       // completion's payload is independently useful — the images are on the
       // user's canvas either way. An answer to a question the replacement
-      // conversation never asked is useful to nobody: pushing it injects an
-      // unsolicited turn about a decision the new conversation has no context
-      // for, which is a cross-conversation confusion with no upside.
+      // conversation never asked is useful to nobody.
       //
       // NOT a silent discard: the entry stays journaled (so a later ask on this
-      // tab that times out still reports it, quoted with its own question) and
-      // the loss of the push is logged here.
-      // PENDING is easy — it has not been queued anywhere yet. HANDED_OFF has
-      // already been materialised into the agent's queue with wording that claims
-      // the reader put the card up, so it must be pulled back; only once the
-      // carrying turn has STARTED is the text beyond recall.
-      const stale = entry.delivery;
-      if (stale === "pending" || (stale === "handed_off" && this.revoke?.(entry.key, entry.token))) {
-        entry.delivery = "none";
+      // tab that times out still reports its EXISTENCE) and the loss of the push
+      // is logged in pass 2.
+      if (entry.delivery === "pending") entry.delivery = "none";
+      else if (entry.delivery === "handed_off") queued.push(entry);
+    }
+    // PASS 2 is fallible: pulling a queued copy back off an agent, and saying what
+    // happened. Each is isolated, so one failure cannot skip the rest — and none
+    // of it can undo pass 1, which has already made every answer here unusable.
+    for (const entry of queued) {
+      let recalled = false;
+      try {
+        // HANDED_OFF has already been materialised into the agent's queue with
+        // wording that claims the reader put the card up, so it must be pulled
+        // back; only once the carrying turn has STARTED is the text beyond
+        // recall.
+        recalled = this.revoke?.(entry.key, entry.token) === true;
+      } catch (err) {
         logger.warn(
-          `[ask-answers] the conversation that asked "${preview(entry.question)}" on tab ${key.slice(0, 8)} was replaced — the user's answer ("${entry.answer}") will NOT be announced to the replacement conversation; it is kept only for disclosure`,
-        );
-      } else if (stale === "handed_off") {
-        logger.warn(
-          `[ask-answers] tab ${key.slice(0, 8)}: the user's answer to "${preview(entry.question)}" was already being read when the conversation was replaced — it could not be recalled`,
+          `[ask-answers] could not recall a queued answer on tab ${key.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
+      if (recalled) entry.delivery = "none";
+      try {
+        logger.warn(
+          recalled
+            ? `[ask-answers] the conversation that asked "${preview(entry.question)}" on tab ${key.slice(0, 8)} was replaced — the user's answer ("${entry.answer}") will NOT be announced to the replacement conversation; it is kept only for disclosure`
+            : `[ask-answers] tab ${key.slice(0, 8)}: the user's answer to "${preview(entry.question)}" was already being read when the conversation was replaced — it could not be recalled`,
+        );
+      } catch {
+        // The fence is already up; a log sink that is down cannot undo it.
+      }
     }
+    // PASS 3, last because it is the one that DESTROYS. The eviction debt is owed
+    // to the conversation being replaced, and scoping it by (tab, incarnation)
+    // cannot fence this axis — New chat happens on the same tab, same
+    // incarnation. Left alone, the replacement conversation's next ask would
+    // report the old conversation's warning as its own and settle it with its own
+    // ack. Surfaced and retired, exactly as a tab-gone does.
+    this.surfaceAndClearDebt(key, this.incarnationOf?.(key), "its conversation was replaced");
   }
 
   /** Test/diagnostic helpers. */
