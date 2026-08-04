@@ -562,9 +562,16 @@ export class AskAnswerJournalImpl {
       key: attributable ? ticket.tabId : meta.tabId,
       // The fingerprint is the LICENCE to satisfy a re-ask, so a reused id gets
       // none — its answer may only ever be reported, never returned as an answer.
-      // The question TEXT is still carried: it is what makes that report honest.
       fingerprint: attributable ? ticket.fingerprint : null,
-      question: ticket?.question ?? null,
+      // …and NOR is the question text, for a REUSED id. The ticket then holds the
+      // LATER card's question, and printing that beside the EARLIER card's answer
+      // states a false association — the very mistake this file exists to
+      // prevent, committed in the disclosure meant to be the honest fallback. A
+      // ticket that is merely RETIRED (its conversation replaced) is different:
+      // its question is still that card's own, and keeping it is what lets the
+      // report name what was actually asked.
+      question:
+        ticket === undefined || ticket.reused === true ? null : ticket.question,
       answer: text,
       answeredAt: Date.now(),
       correlation,

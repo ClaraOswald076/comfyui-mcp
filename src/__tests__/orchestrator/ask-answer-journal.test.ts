@@ -601,6 +601,10 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     const entry = AskAnswers.record("pa-dup", "dpmpp_2m", { tabId: TAB });
     expect(entry.correlation.status).toBe("foreign");
     expect(entry.fingerprint).toBeNull();
+    // codex round 14, P2: the ticket now holds the LATER card's question, so
+    // carrying it would print that question beside the EARLIER card's answer —
+    // a false association stated inside the honest-fallback disclosure itself.
+    expect(entry.question).toBeNull();
     expect(AskAnswers.recover(TAB, askFingerprint(SCHEDULER)).status).toBe("unattributed");
     expect(AskAnswers.recover(TAB, askFingerprint(SAMPLER)).status).toBe("unattributed");
     // …but it is still delivered, labelled UNDETERMINED.
