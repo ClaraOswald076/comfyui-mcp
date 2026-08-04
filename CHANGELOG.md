@@ -6,6 +6,26 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.49.4] - 2026-08-03
+
+### MCP
+
+#### Fixed
+- poll past the worker's wall clock + surface root-cause clusters (#799)
+- make the completion event durable across automatic goal continuation (#468) (#786)
+- resolve panel_load_workflow relative paths against the live user directory (#202) (#787)
+- resolve the destination from the live server and verify it on disk (#369) (#794)
+- stop root icon requests becoming logged 404s (#783)
+- distinguish watchdog stalls from user cancellations (#782)
+- make stale panel-lock recovery fail closed (#779)
+- list reachable local extra paths without argv main.py (#781)
+- retain stale persisted downloads (#761) (#780)
+- gate the hello retarget on the server-observed origin — never trust the spoofable claim (codex gate)
+- hello veto protects only a healthy target — a ComfyUI restart can no longer pin stale remote state
+- do not capability-mark the no-trusted-identity refusal (codex gate)
+- type the capability refusal; full tab id + hard-refresh recovery
+
+
 ## [0.49.3] - 2026-08-03
 
 ### MCP
