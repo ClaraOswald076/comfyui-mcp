@@ -390,8 +390,29 @@ export function flattenUiWorkflow(
       // destroy the only evidence of a broadcast we declined to materialize.
       const liveOrigins = new Set<number>();
       for (const l of freshLinks) liveOrigins.add(l[1]);
+      // A non-empty list is not proof that it accounts for EVERY sender: one that
+      // predates a sender has no row for it. Deleting such a sender would remove a
+      // node whose broadcasts were never materialized — a silent, unrecoverable
+      // edit. A sender that reaches nothing also has no row, and the two cannot be
+      // told apart, so it is kept and reported.
+      const attributed = new Set<number>();
+      for (const r of ueLinks) {
+        if (r?.controller != null) attributed.add(r.controller);
+        // A controllerless record still accounts for its sender when the producer
+        // IS that sender (the self-producing shape accepted above).
+        else if (isSelfProducingUeSender(nodesById.get(r?.upstream)?.type ?? "")) {
+          attributed.add(r.upstream);
+        }
+      }
+      for (const s of ueSenders) {
+        if (attributed.has(s.id)) continue;
+        warnings.push(
+          `${s.type} #${s.id} is a Use-Everywhere sender, but no record in extra.ue_links names it — either it currently broadcasts to nothing or the saved list predates it, so nothing was wired from it and it is kept in place`,
+        );
+      }
       for (const s of ueSenders) {
         if (blockSenderDeletion) break;
+        if (!attributed.has(s.id)) continue; // unaccounted for — never delete it
         if (!liveOrigins.has(s.id) && !unconfirmed.has(s.id)) ueDeletable.add(s.id);
       }
     }

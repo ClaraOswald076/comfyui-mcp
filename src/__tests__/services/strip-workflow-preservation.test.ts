@@ -921,6 +921,35 @@ describe("#361 — cg-use-everywhere broadcast links", () => {
     expect(joined(warnings)).toContain("could not be confirmed against the live graph");
   });
 
+  it("a live sender that the ue_links list does not mention is reported", () => {
+    // A non-empty list is not proof it covers every sender. One that predates a
+    // sender simply has no row for it, and that sender's broadcasts then come out
+    // unconnected — on a list that looked usable, exactly the silent difference
+    // this whole change removes.
+    const g = ueGraph(true) as unknown as {
+      nodes: {
+        id: number;
+        type: string;
+        mode: number;
+        inputs?: unknown[];
+        outputs?: unknown[];
+        widgets_values: unknown[];
+      }[];
+    };
+    g.nodes.push({
+      id: 8,
+      type: "Anything Everywhere",
+      mode: 0,
+      inputs: [{ name: "anything", type: "*", link: null }],
+      outputs: [],
+      widgets_values: [],
+    });
+    const { workflow, warnings } = convertUiToApi(g as never, OBJECT_INFO);
+    expect(workflow["3"].inputs.images).toEqual(["1", 0]); // listed record still wired
+    expect(joined(warnings)).toContain("Anything Everywhere #8");
+    expect(joined(warnings)).toContain("no record in extra.ue_links names it");
+  });
+
   it("an EMPTY computed list is an answer, not an unknown — no warning, no invented link", () => {
     // The pack analysed the graph and recorded zero broadcasts. Reporting that as
     // "unrecoverable" would invent a loss that did not happen.

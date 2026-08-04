@@ -1003,6 +1003,27 @@ function materializeUeInGraph(
     }
     added++;
   }
+  // A non-empty list is not proof that it accounts for EVERY sender. One that
+  // predates a sender simply has no row for it, and the broadcasts of that sender
+  // then come out unconnected — which, on a list that looked usable, is exactly
+  // the silent difference this change exists to remove. A sender that genuinely
+  // reaches nothing has no row either, and the two are indistinguishable here, so
+  // it is reported as the could-not-determine it is.
+  const attributed = new Set<number>();
+  for (const r of ueLinks as UeLinkEntry[]) {
+    if (r?.controller != null) attributed.add(r.controller);
+    // A controllerless record still accounts for its sender when the producer IS
+    // that sender (the self-producing shape accepted above).
+    else if (isSelfProducingUeSender(nodesById.get(r?.upstream)?.type ?? "")) {
+      attributed.add(r.upstream);
+    }
+  }
+  for (const s of senders) {
+    if (attributed.has(s.id)) continue;
+    warnings.push(
+      `${s.type} #${s.id} in ${scope} is a cg-use-everywhere broadcast node, but no record in extra.ue_links names it. Either it currently broadcasts to nothing, or the saved list predates it — indistinguishable from the file, so nothing was wired from it and any inputs it feeds are UNCONNECTED in the stripped graph. Re-save (or queue) with cg-use-everywhere active to refresh the list.`,
+    );
+  }
   for (const [id, type] of multiFeedControllers) {
     warnings.push(
       `Node ${id} (${type}) in ${scope} broadcasts from more than one producer, and a cg-use-everywhere record does not say which of the sender's inputs a broadcast came through. Each producer was confirmed to still feed this node, so the wiring below is materialized — but if the saved broadcast list went stale by SWAPPING that sender's channels, the stripped graph carries the swap and there is no way to tell from the file. Re-save (or queue) the workflow with cg-use-everywhere active if this sender's routing matters.`,

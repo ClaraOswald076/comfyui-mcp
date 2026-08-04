@@ -355,6 +355,21 @@ describe("flattenUiWorkflow — Use-Everywhere", () => {
     expect(report.warnings.some((w) => w.includes("ue_links is missing"))).toBe(true);
   });
 
+  it("a PARTIAL ue_links list never deletes the sender it does not mention", () => {
+    // A non-empty list is not proof it accounts for every sender. Sender #7 has no
+    // row (the list predates it, or it reaches nothing) — deleting it would remove
+    // a node whose broadcasts were never materialized, silently and for good.
+    const g = ueGraph(true);
+    g.nodes.push(
+      node(8, "Anything Everywhere", { inputs: [{ name: "anything", type: "*", link: null }] }),
+    );
+    (g.extra!.ue_links as { controller: number }[])[0].controller = 8; // only #8 is listed
+    const { graph, report } = flattenUiWorkflow(g);
+    expect(graph.nodes.some((n) => n.id === 2)).toBe(true); // #7-equivalent survives
+    expect(report.warnings.join("\n")).toContain("no record in extra.ue_links names it");
+    expect(graph.extra?.ue_links).toBeDefined();
+  });
+
   it("an EMPTY computed ue_links list is an answer — no warning, and nothing removed", () => {
     // The pack analysed the graph and recorded no broadcast. Warning there invents
     // a problem on a faithful graph (and disagreed with the converter); an empty
