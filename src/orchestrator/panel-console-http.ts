@@ -437,12 +437,19 @@ export function startPanelConsoleHttpServer(opts: {
             sendJson(res, 200, {
               ok: true,
               slot,
+              // `cleared` keeps its established meaning — an entry was removed
+              // from the credential STORE — and `still_resolves` reports the
+              // verified end state. Two fields, each true to its own question:
+              // conflating them is how `cleared:false` ended up sitting next to
+              // a "cleared for this session" note (codex gate, round 4,
+              // finding 5).
               cleared: removed,
+              still_resolves: false,
               ...(shellKeys.length
                 ? {
                     warning:
-                      `Cleared for this session only: ${shellKeys.join(", ")} ${shellKeys.length > 1 ? "are" : "is"} set as a real environment variable ` +
-                      `outside this app, so the value returns when it restarts. Unset it there to revoke it permanently.`,
+                      `${shellKeys.join(", ")} ${shellKeys.length > 1 ? "are" : "is"} set as a real environment variable outside this app, not in the credential store. ` +
+                      `It no longer applies to the running process, but it returns on the next start — unset it where it is defined to revoke it permanently.`,
                   }
                 : {}),
             });
@@ -450,25 +457,37 @@ export function startPanelConsoleHttpServer(opts: {
           }
           // Report what the read-back PROVED, not that the call returned. The
           // same failure panel_request_secret refuses was answered ok:true here.
-          const receipts = setPanelSecret(slot, value);
-          if (!slotSaveConfirmed(receipts)) {
-            const unconfirmed = unconfirmedSlotKeys(receipts);
+          const outcome = setPanelSecret(slot, value);
+          if (!slotSaveConfirmed(outcome)) {
+            const unconfirmed = unconfirmedSlotKeys(outcome.receipts);
             const failed = unconfirmed.filter((u) => u.persisted === "no");
-            sendJson(res, failed.length ? 500 : 200, {
-              ok: failed.length === 0,
+            // Describe the state we LEFT, not the state we intended. A slot with
+            // alias keys is written serially, so a failure part-way can leave an
+            // earlier alias live; `strandedKeys` names exactly that case, and
+            // "nothing was half-applied" is only claimed when the restore is
+            // proven complete.
+            const stranded = outcome.strandedKeys;
+            const aftermath = stranded.length
+              ? `Restoring the slot did not fully take effect: ${stranded.join(", ")} still carr${stranded.length > 1 ? "y" : "ies"} the new value, so the slot is in a MIXED state — set it again, or clear it, before relying on it.`
+              : `The change was rolled back, so nothing was half-applied.`;
+            sendJson(res, failed.length || stranded.length ? 500 : 200, {
+              ok: failed.length === 0 && stranded.length === 0,
               slot,
               // Key NAMES and verdicts only — never a value.
               unconfirmed,
+              rolled_back: outcome.rolledBack,
+              ...(stranded.length ? { stranded_keys: stranded } : {}),
               ...(failed.length
                 ? {
                     error:
-                      `"${slot}" was NOT saved: the credential store does not come back carrying ${failed.map((f) => f.key).join(", ")}. ` +
-                      `The change was rolled back, so nothing was half-applied.`,
+                      `"${slot}" was NOT saved: the credential store does not come back carrying ${failed.map((f) => f.key).join(", ")}. ${aftermath}`,
                   }
-                : {
-                    warning:
-                      `"${slot}" was written but the store could not be re-read to confirm it (${unconfirmed.map((u) => u.key).join(", ")}). Treat it as unverified.`,
-                  }),
+                : stranded.length
+                  ? { error: `"${slot}" could not be saved cleanly. ${aftermath}` }
+                  : {
+                      warning:
+                        `"${slot}" was written but the store could not be re-read to confirm it (${unconfirmed.map((u) => u.key).join(", ")}). Treat it as unverified.`,
+                    }),
             });
             return;
           }

@@ -7,7 +7,12 @@ import { parse as parseYaml } from "yaml";
 import { errorToToolResult } from "../utils/errors.js";
 import { getComfyUIBaseUrl, getComfyUIAuthHeaders } from "../config.js";
 import { checkWorkflowRuntime, extractWorkflowClassTypes } from "../services/api-nodes.js";
-import { classifyNonJson, isNonJsonResponseError, readComfyJson } from "../comfyui/json-guard.js";
+import {
+  bodyPrefixOf,
+  classifyNonJson,
+  isNonJsonResponseError,
+  readComfyJson,
+} from "../comfyui/json-guard.js";
 
 // Optional, opt-in observability hook for the knowledge-parity smoke test: when
 // COMFYUI_MCP_TOOL_TRACE points at a file, each of these tools appends a JSONL
@@ -335,8 +340,14 @@ export function registerSkillsAccessTools(server: McpServer): void {
               {
                 type: "text" as const,
                 text: parsedOk
-                  ? `ComfyUI returned ${res.status} for /api/workflow_templates, with this JSON body: ${body.replace(/\s+/g, " ").trim().slice(0, 200)}. ` +
-                    `If the body is a ComfyUI error, the server may predate the workflow-templates endpoint; if it is a gateway's own error envelope, the request never reached ComfyUI.`
+                  ? // Do NOT attribute the status to ComfyUI: a JSON error body
+                    // can just as easily be a gateway's own envelope that never
+                    // reached it (#828). Offer both readings, assert neither.
+                    // The body goes through the same credential redaction as the
+                    // non-JSON path — a gateway that reflects the request could
+                    // otherwise echo our ComfyUI token into this tool result.
+                    `The request to ${url} returned ${res.status} with this JSON body: ${bodyPrefixOf(body)}. ` +
+                    `If that is a ComfyUI error, the server may predate the workflow-templates endpoint; if it is a gateway's own error envelope, the request never reached ComfyUI.`
                   : classifyNonJson({ url, status: res.status, contentType, body }).message,
               },
             ],

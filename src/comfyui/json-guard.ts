@@ -69,18 +69,42 @@ export function isNonJsonResponseError(err: unknown): err is NonJsonResponseErro
  *  this prefix goes into an error the agent sees. Any configured auth header
  *  value found in the body is therefore replaced before the prefix is built:
  *  we know exactly which strings are secret, so this is redaction, not guessing. */
-function bodyPrefixOf(body: string): string {
-  let text = body;
-  for (const value of Object.values(getComfyUIAuthHeaders())) {
-    if (!value) continue;
-    // The header value may be "Bearer <token>"; redact the whole thing and the
-    // bare token part, so neither form survives.
-    for (const candidate of [value, value.replace(/^\S+\s+/, "")]) {
-      if (candidate.length >= 4) text = text.split(candidate).join("«redacted»");
+export function bodyPrefixOf(body: string): string {
+  const redacted = redactComfyAuthValues(body);
+  if (redacted === null) {
+    // A configured credential is present in the body but too short to replace
+    // without mangling unrelated text. FAIL CLOSED: withhold the prefix rather
+    // than hand the credential back through a tool result.
+    return "(body withheld: it contains the configured ComfyUI credential)";
+  }
+  const flat = redacted.replace(/\s+/g, " ").trim();
+  return flat.length > 160 ? `${flat.slice(0, 160)}…` : flat;
+}
+
+/**
+ * Remove any CONFIGURED ComfyUI auth value from text that is about to be shown.
+ *
+ * A gateway that reflects the request (an "invalid token: …" page, a debug echo)
+ * can put our own credential in its body, and these bodies go into errors the
+ * agent sees. We know exactly which strings are secret, so this is redaction,
+ * not guessing. Returns `null` when a configured value occurs but is too SHORT
+ * (< 8 chars) to substitute safely — the caller must then withhold the text
+ * entirely rather than emit a partially-redacted version (codex gate, round 4,
+ * finding 2).
+ */
+export function redactComfyAuthValues(text: string): string | null {
+  let out = text;
+  for (const headerValue of Object.values(getComfyUIAuthHeaders())) {
+    if (!headerValue) continue;
+    // The header value may be "Bearer <token>"; handle the whole thing and the
+    // bare token, so neither form survives.
+    for (const candidate of [headerValue, headerValue.replace(/^\S+\s+/, "")]) {
+      if (!candidate || !out.includes(candidate)) continue;
+      if (candidate.length < 8) return null; // too short to replace safely
+      out = out.split(candidate).join("«redacted»");
     }
   }
-  const flat = text.replace(/\s+/g, " ").trim();
-  return flat.length > 160 ? `${flat.slice(0, 160)}…` : flat;
+  return out;
 }
 
 function looksLikeHtml(contentType: string, body: string): boolean {

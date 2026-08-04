@@ -181,3 +181,36 @@ export function freshSecretValue(...keys: string[]): string | undefined {
 export function secretKeyPresent(...keys: string[]): boolean {
   return freshSecretValue(...keys) !== undefined;
 }
+
+/**
+ * Resolve MANY independent keys against ONE snapshot of the canonical file.
+ *
+ * Calling `freshSecretValue` per key re-reads the file per key, which is both
+ * wasteful and inconsistent: a rotation landing mid-loop yields a view where
+ * some keys are pre-rotation and some post. Callers that build a whole env (the
+ * child's spawn env, the masked settings view) need one coherent picture.
+ * Precedence per key is identical to `freshSecretValue`.
+ */
+export function freshSecretValues(keys: readonly string[]): Record<string, string> {
+  const parsed = parseEnvFile();
+  const out: Record<string, string> = {};
+  for (const k of keys) {
+    const envValue = process.env[k];
+    if (typeof envValue === "string" && envValue.trim() && !fileDerivedKeys.has(k)) {
+      out[k] = envValue;
+      continue;
+    }
+    if (parsed) {
+      const fileValue = parsed[k];
+      if (typeof fileValue === "string" && fileValue.trim()) {
+        out[k] = fileValue;
+        continue;
+      }
+      // Readable file without the key: it is genuinely unset, so a stale
+      // boot-seeded value must not resurrect it.
+      if (fileDerivedKeys.has(k)) continue;
+    }
+    if (typeof envValue === "string" && envValue.trim()) out[k] = envValue;
+  }
+  return out;
+}

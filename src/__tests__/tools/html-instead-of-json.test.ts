@@ -11,9 +11,10 @@
 
 import { describe, expect, it, beforeEach, vi } from "vitest";
 
+const authHeaders = vi.hoisted(() => ({ value: {} as Record<string, string> }));
 vi.mock("../../config.js", () => ({
   getComfyUIBaseUrl: () => "http://remote.example:8188",
-  getComfyUIAuthHeaders: () => ({}),
+  getComfyUIAuthHeaders: () => authHeaders.value,
 }));
 
 // check_workflow_runtime classifies nodes through this service; make it throw the
@@ -80,7 +81,7 @@ describe("list_workflow_templates on an HTML-answering remote (#828)", () => {
     expect(text).toContain("502");
   });
 
-  it("shows the JSON error body verbatim so the caller can tell ComfyUI from a gateway", async () => {
+  it("shows the JSON error body so the caller can tell ComfyUI from a gateway", async () => {
     global.fetch = vi.fn(
       async () =>
         new Response('{"error":"unknown route"}', {
@@ -96,6 +97,27 @@ describe("list_workflow_templates on an HTML-answering remote (#828)", () => {
     // alone does not say whether ComfyUI or something in front of it answered.
     expect(text).toContain("may predate the workflow-templates endpoint");
     expect(text).toContain("never reached ComfyUI");
+    // ...and it must NOT open by attributing the status to ComfyUI.
+    expect(text).not.toMatch(/^ComfyUI returned/);
+  });
+
+  it("redacts our own ComfyUI credential from a JSON error body a gateway reflected", async () => {
+    // The JSON-error branch echoes the body, so a gateway that reflects the
+    // request would otherwise put our token straight into the tool result.
+    authHeaders.value = { Authorization: "Bearer reflected-secret-token" };
+    try {
+      global.fetch = vi.fn(
+        async () =>
+          new Response('{"error":"bad token: Bearer reflected-secret-token"}', {
+            status: 401,
+            headers: { "content-type": "application/json" },
+          }),
+      ) as unknown as typeof fetch;
+      const out = await getHandler("list_workflow_templates")({});
+      expect(out.content[0].text).not.toContain("reflected-secret-token");
+    } finally {
+      authHeaders.value = {};
+    }
   });
 
   it("still returns the index on a healthy JSON 200", async () => {
