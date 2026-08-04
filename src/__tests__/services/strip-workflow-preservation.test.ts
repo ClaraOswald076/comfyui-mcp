@@ -756,7 +756,7 @@ describe("#361 — cg-use-everywhere broadcast links", () => {
     // indistinguishable from this one.
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain("Node 7 (Anything Everywhere3)");
-    expect(warnings[0]).toContain("broadcasts from more than one producer");
+    expect(warnings[0]).toContain("could not be matched to a specific sender input");
   });
 
   it("a sender with several inputs from ONE producer needs no channel caveat", () => {
@@ -874,7 +874,7 @@ describe("#361 — cg-use-everywhere broadcast links", () => {
       },
     } as never);
     expect(workflow["3"].inputs.images).toEqual(["1", 0]); // not dropped
-    expect(joined(warnings)).toContain("broadcasts from more than one producer");
+    expect(joined(warnings)).toContain("could not be matched to a specific sender input");
     expect(joined(warnings)).toContain("SWAPPING");
   });
 

@@ -311,7 +311,10 @@ export function flattenUiWorkflow(
       let blockSenderDeletion = false;
       /** Senders whose channel could not be verified (several distinct producers,
        *  and a record does not name the input it came through). Disclosed once. */
-      const multiFeed = new Map<number, string>();
+      const multiFeed = new Map<
+        number,
+        { type: string; confirmed: number; unresolved: number }
+      >();
       /** null = confirmed against the live graph; otherwise the reason it is not. */
       const unconfirmedReason = (uel: UeLink, srcId: number, srcSlot: number): string | null => {
         const ctrlId = uel.controller;
@@ -356,7 +359,13 @@ export function flattenUiWorkflow(
           if (r.id === srcId && r.slot === srcSlot) matched = true;
         }
         if (matched) {
-          if (distinct.size + unresolved > 1) multiFeed.set(ctrl.id, ctrl.type);
+          if (distinct.size + unresolved > 1) {
+            multiFeed.set(ctrl.id, {
+              type: ctrl.type,
+              confirmed: distinct.size,
+              unresolved,
+            });
+          }
           return null;
         }
         return unresolved > 0
@@ -417,9 +426,17 @@ export function flattenUiWorkflow(
         }
         rewired++;
       }
-      for (const [id, type] of multiFeed) {
+      for (const [id, info] of multiFeed) {
+        // Say only what is true: this fires both for several CONFIRMED producers
+        // and for a channel that could not be resolved at all, and claiming every
+        // producer was confirmed in the second case would be a false statement in
+        // a disclosure.
+        const carries =
+          info.unresolved > 0
+            ? `${info.confirmed} confirmed producer(s) plus ${info.unresolved} input(s) whose own source could NOT be resolved`
+            : `${info.confirmed} different confirmed producers`;
         warnings.push(
-          `${type} #${id} broadcasts from more than one producer, and a ue_link record does not say which of its inputs a broadcast came through — each producer was confirmed to still feed it, but a saved list that went stale by SWAPPING its channels would look identical, so re-save with cg-use-everywhere active if this sender's routing matters`,
+          `${info.type} #${id}: a broadcast could not be matched to a specific sender input — this sender carries ${carries}, and a ue_link record does not name the input a broadcast came through, so a saved list that went stale by SWAPPING its channels would look identical; re-save with cg-use-everywhere active if this sender's routing matters`,
         );
       }
       // A sender is deletable only when it is not the real producer of any

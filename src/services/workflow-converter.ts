@@ -834,7 +834,10 @@ function materializeUeInGraph(
    *  verified, because the sender carries several distinct producers and a
    *  ue_links record does not name the sender input it came through. Disclosed
    *  once per sender rather than per record. */
-  const multiFeedControllers = new Map<number, string>();
+  const multiFeedControllers = new Map<
+    number,
+    { type: string; confirmed: number; unresolved: number }
+  >();
   /**
    * Verify the record against the sender's LIVE feed.
    *  - "ok"          the sender is still fed by exactly this producer + slot
@@ -925,7 +928,13 @@ function materializeUeInGraph(
     if (!matched) return unresolved > 0 ? "unverifiable" : "rewired";
     // Confirmed live, but on a sender carrying MORE THAN ONE distinct producer the
     // channel→target association is not recoverable from the record (see above).
-    if (distinct.size + unresolved > 1) multiFeedControllers.set(ctrl.id, ctrl.type);
+    if (distinct.size + unresolved > 1) {
+      multiFeedControllers.set(ctrl.id, {
+        type: ctrl.type,
+        confirmed: distinct.size,
+        unresolved,
+      });
+    }
     return "ok";
   };
 
@@ -1044,9 +1053,17 @@ function materializeUeInGraph(
       `${s.type} #${s.id} in ${scope} is a cg-use-everywhere broadcast node, but no record in extra.ue_links names it. Either it currently broadcasts to nothing, or the saved list predates it — indistinguishable from the file, so nothing was wired from it and any inputs it feeds are UNCONNECTED in the stripped graph. Re-save (or queue) with cg-use-everywhere active to refresh the list.`,
     );
   }
-  for (const [id, type] of multiFeedControllers) {
+  for (const [id, info] of multiFeedControllers) {
+    // Say only what is true. This fires both when several producers were
+    // CONFIRMED and when one channel could not be resolved at all, and claiming
+    // "every producer was confirmed" in the second case is a false statement in a
+    // disclosure — which is how disclosures get ignored.
+    const carries =
+      info.unresolved > 0
+        ? `${info.confirmed} confirmed producer(s) plus ${info.unresolved} input(s) whose own source could NOT be resolved`
+        : `${info.confirmed} different confirmed producers`;
     warnings.push(
-      `Node ${id} (${type}) in ${scope} broadcasts from more than one producer, and a cg-use-everywhere record does not say which of the sender's inputs a broadcast came through. Each producer was confirmed to still feed this node, so the wiring below is materialized — but if the saved broadcast list went stale by SWAPPING that sender's channels, the stripped graph carries the swap and there is no way to tell from the file. Re-save (or queue) the workflow with cg-use-everywhere active if this sender's routing matters.`,
+      `Node ${id} (${info.type}) in ${scope}: a cg-use-everywhere broadcast could not be matched to a specific sender input — this sender carries ${carries}, and a ue_links record does not name the input a broadcast came through. The wiring is materialized, but a saved list that went stale by SWAPPING this sender's channels would look identical from the file. Re-save (or queue) the workflow with cg-use-everywhere active if this sender's routing matters.`,
     );
   }
   return added;

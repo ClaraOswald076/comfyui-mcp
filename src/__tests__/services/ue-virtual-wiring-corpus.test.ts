@@ -498,11 +498,15 @@ const CORPUS: Case[] = [
     },
     api: {
       wiring: { "Consumer.image": "ProducerA" },
-      discloses: [/broadcasts from more than one producer/],
+      // The caveat must say what is TRUE of THIS shape: one confirmed producer
+      // and one input whose source could not be resolved. Claiming "every
+      // producer was confirmed" here would be a false statement inside a
+      // disclosure, which is how disclosures get ignored.
+      discloses: [/could not be matched to a specific sender input/, /could NOT be resolved/],
     },
     flat: {
       wiring: { "Consumer.image": "ProducerA" },
-      discloses: [/broadcasts from more than one producer/],
+      discloses: [/could not be matched to a specific sender input/, /could NOT be resolved/],
     },
   },
   {
@@ -549,11 +553,13 @@ const CORPUS: Case[] = [
       ),
     api: {
       wiring: { "Consumer.image": "ProducerA", "Consumer2.image": "ProducerB" },
-      discloses: [/broadcasts from more than one producer/],
+      // Here every producer really WAS confirmed — the wording must distinguish
+      // this from the one-known-one-unresolved shape above.
+      discloses: [/could not be matched to a specific sender input/, /2 different confirmed producers/],
     },
     flat: {
       wiring: { "Consumer.image": "ProducerA", "Consumer2.image": "ProducerB" },
-      discloses: [/broadcasts from more than one producer/],
+      discloses: [/could not be matched to a specific sender input/, /2 different confirmed producers/],
     },
   },
   {
