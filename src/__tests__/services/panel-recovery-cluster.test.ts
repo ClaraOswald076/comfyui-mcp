@@ -966,6 +966,41 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     expect(existsSync(INCOMING())).toBe(false);
   });
 
+  it("a failed step-2 gets the staged copy OUT of custom_nodes rather than deleting it in place", async () => {
+    // A recursive delete can fail partway and leave a half-deleted directory
+    // still under custom_nodes — still served, still shadowing, now damaged. A
+    // rename out is atomic: it either works completely or changes nothing.
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    const h = makeDeps({ cloneVersion: "0.11.38", updateThrows: "manager cannot resolve it" });
+    const realRename = h.deps.rename!;
+    let renames = 0;
+    h.deps.rename = (from, to) => {
+      if (++renames === 2) throw new Error("EACCES moving the old panel aside");
+      realRename(from, to);
+    };
+    const err = await runPanelActionInner("update", h.deps).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    // No staged copy left behind to shadow the real one.
+    expect(existsSync(INCOMING())).toBe(false);
+    expect(readdirSync(join(root, "custom_nodes"))).toEqual([PANEL_REGISTRY_ID]);
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
+  });
+
+  it("refuses to move the old panel aside if the staged copy is not actually visible", async () => {
+    // The recovery guarantee depends on step 1 having really landed; never move
+    // the working panel out on the strength of a rename that did not take.
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    const h = makeDeps({ cloneVersion: "0.11.38", updateThrows: "manager cannot resolve it" });
+    const realExists = h.deps.existsSync;
+    h.deps.existsSync = (p) => (p === INCOMING() ? false : realExists(p));
+    const err = await runPanelActionInner("update", h.deps).catch((e: Error) => e);
+    expect((err as Error).message).toMatch(/not visible at/);
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
+    // The backup ROOT is created up front, but nothing was moved into it — the
+    // working panel never left custom_nodes.
+    expect(readdirSync(join(root, "custom_nodes_backup"))).toEqual([]);
+  });
+
   it("a canonical dir that merely EXISTS does not license discarding the staged panel", async () => {
     // "exists" is weaker than "works". A husk at the canonical name — emptied,
     // or left by a half-finished move — would otherwise be read as a healthy

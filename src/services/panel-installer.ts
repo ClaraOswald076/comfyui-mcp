@@ -232,6 +232,14 @@ export interface PanelInstallerDeps {
    */
   writeFile?: (p: string, contents: string) => void;
   /**
+   * Best-effort durability barrier for a DIRECTORY's entries, used between the
+   * swap's renames. Optional and must never throw: several platforms (Windows
+   * notably) cannot open a directory handle to fsync at all, and on those the
+   * ordering guarantee comes from the filesystem committing metadata operations
+   * in order rather than from this call.
+   */
+  syncDir?: (p: string) => void;
+  /**
    * The user's explicit panel-version pin, if any. While a pin is in force NO
    * code path here may move the panel — install/update/reinstall refuse and the
    * on-load ensure skips. Never throws (an unreadable pin reports
@@ -532,6 +540,19 @@ export const defaultDeps: PanelInstallerDeps = {
   // there to prevent. Write, fsync the file, then fsync the containing
   // directory so the new entry itself is durable (a no-op on platforms that
   // refuse it, which is not a failure).
+  syncDir: (p) => {
+    try {
+      const fd = openSync(p, "r");
+      try {
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+    } catch {
+      // Unsupported on this platform (Windows cannot fsync a directory handle).
+      // Not an error: see the barrier comment in updateViaRegistryZipReinstall.
+    }
+  },
   writeFile: (p, contents) => {
     const fd = openSync(p, "w");
     try {
@@ -3053,16 +3074,58 @@ async function updateViaRegistryZipReinstall(opts: {
     );
   }
 
+  // BARRIER BETWEEN STEP 1 AND STEP 2.
+  //
+  // The recovery guarantee rests on this: if "old panel moved aside" survives a
+  // crash, the earlier "new panel moved in" must have survived too, or there is
+  // no panel and no marker to find one by.
+  //
+  // Two things back that up, in order of strength. First, both are RENAMES in
+  // the same directory — metadata operations, which a journaling filesystem
+  // (NTFS, ext4, APFS) commits in order, so a later one cannot land while an
+  // earlier one is lost. That is a genuinely different situation from the
+  // journal FILE this ordering replaced: file contents sit in the page cache and
+  // can be dropped while later metadata persists, which is exactly why a journal
+  // was the wrong mechanism. Second, belt and braces: confirm the entry is
+  // actually visible before continuing, so we never move the old panel aside on
+  // the strength of a rename that did not take, and ask the platform for a
+  // durability barrier where it can give one.
+  if (!deps.existsSync(incomingDir)) {
+    ops.removeDir(staging);
+    ops.removeDir(journalPath);
+    throw new PanelInstallError(
+      `Panel update did NOT apply: nothing was changed on disk. ${managerReason}, and ` +
+        `the reinstall-from-source fallback stopped because the staged panel is not ` +
+        `visible at ${incomingDir} after being moved there. The existing panel is ` +
+        `untouched. Check ${comfyuiPath}/custom_nodes and retry.`,
+    );
+  }
+  deps.syncDir?.(join(comfyuiPath, "custom_nodes"));
+
   // STEP 2 — move the old panel OUT, to a sibling of custom_nodes. Leaving it
   // beside the new one would shadow it in the browser (#641).
   try {
     ops.rename(dir, backupDir);
   } catch (err) {
-    // The old panel is still in place and serving; discard the staged copy so it
-    // cannot shadow it, and leave the install exactly as we found it.
+    // The old panel is still in place and serving; get the staged copy OUT of
+    // custom_nodes so it cannot shadow it, and leave the install exactly as we
+    // found it.
+    //
+    // MOVE FIRST, DELETE SECOND. A plain recursive delete can fail partway (a
+    // locked file, a permission fault) and leave a half-deleted directory still
+    // sitting in custom_nodes — still served, still shadowing, and now damaged.
+    // A rename back out to the staging path is a single atomic metadata
+    // operation on the same volume, so it either fully succeeds or changes
+    // nothing; only then is the deletion attempted, where a failure is harmless
+    // because the directory is no longer under custom_nodes.
     let cleared = true;
     try {
-      ops.removeDir(incomingDir);
+      ops.rename(incomingDir, staging);
+      try {
+        ops.removeDir(staging);
+      } catch {
+        // Outside custom_nodes now — leftover bytes, not a shadow.
+      }
     } catch {
       cleared = false;
     }
