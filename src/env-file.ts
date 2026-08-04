@@ -153,25 +153,31 @@ export function resetEnvFileProvenanceForTests(): void {
  * HF_TOKEN then HUGGINGFACE_TOKEN). Never logs.
  */
 export function freshSecretValue(...keys: string[]): string | undefined {
-  for (const k of keys) {
-    const v = process.env[k];
-    if (typeof v === "string" && v.trim() && !fileDerivedKeys.has(k)) return v;
-  }
+  // ALIAS ORDER OUTRANKS SOURCE. Each alias is resolved fully (env, then file)
+  // before the next alias is considered, so the canonical name always beats the
+  // legacy one whichever side it came from.
+  //
+  // Checking every alias's ENV value first was wrong: a pre-existing shell
+  // HUGGINGFACE_TOKEN then beat a freshly saved HF_TOKEN in the file, so the
+  // save reported success and every download kept using the old credential —
+  // the #826 shape all over again (codex gate, round 7, finding 1). It also
+  // contradicted the boot-time rule this replaced, which was plainly
+  // `HF_TOKEN || HUGGINGFACE_TOKEN`.
+  //
+  // The shell escape hatch is untouched: within ONE alias, a real environment
+  // variable still outranks the file.
   const parsed = parseEnvFile();
-  if (parsed) {
-    for (const k of keys) {
-      const v = parsed[k];
-      if (typeof v === "string" && v.trim()) return v;
-    }
-    // The file is readable and does not carry any alias — the credential is
-    // genuinely unset. Do NOT fall through to a stale boot-seeded value.
-    for (const k of keys) {
-      if (fileDerivedKeys.has(k)) return undefined;
-    }
-  }
   for (const k of keys) {
-    const v = process.env[k];
-    if (typeof v === "string" && v.trim()) return v;
+    const envValue = process.env[k];
+    if (typeof envValue === "string" && envValue.trim() && !fileDerivedKeys.has(k)) return envValue;
+    if (parsed) {
+      const fileValue = parsed[k];
+      if (typeof fileValue === "string" && fileValue.trim()) return fileValue;
+      // The file is readable and does not carry this alias, so a value seeded
+      // from the file at boot is stale — it must not resurrect the credential.
+      if (fileDerivedKeys.has(k)) continue;
+    }
+    if (typeof envValue === "string" && envValue.trim()) return envValue;
   }
   return undefined;
 }
@@ -192,6 +198,9 @@ export function secretKeyPresent(...keys: string[]): boolean {
  * Precedence per key is identical to `freshSecretValue`.
  */
 export function freshSecretValues(keys: readonly string[]): Record<string, string> {
+  // Per-key, INDEPENDENT resolution: these are distinct variables, not aliases
+  // for one credential, so there is no ordering between them. (Alias ordering is
+  // freshSecretValue's job, and the child applies it to what it inherits.)
   const parsed = parseEnvFile();
   const out: Record<string, string> = {};
   for (const k of keys) {

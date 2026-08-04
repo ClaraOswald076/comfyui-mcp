@@ -132,6 +132,28 @@ describe("env-file: freshSecretValue resolves at ACCESS time (#826)", () => {
     expect(freshSecretValue("HF_TOKEN", "HUGGINGFACE_TOKEN")).toBe("legacy");
   });
 
+  it("lets the CANONICAL alias in the file beat a legacy alias set in the shell", () => {
+    // Checking every alias's env value before any alias's file value made a
+    // pre-existing shell HUGGINGFACE_TOKEN outrank a freshly saved HF_TOKEN, so
+    // the save reported success and every download kept using the old
+    // credential — #826 all over again. Each alias resolves FULLY in turn.
+    process.env.HUGGINGFACE_TOKEN = "legacy-from-shell";
+    writeEnv("HF_TOKEN=canonical-just-saved\n");
+    expect(freshSecretValue("HF_TOKEN", "HUGGINGFACE_TOKEN")).toBe("canonical-just-saved");
+  });
+
+  it("keeps the shell escape hatch WITHIN one alias", () => {
+    process.env.HF_TOKEN = "canonical-from-shell";
+    writeEnv("HF_TOKEN=canonical-from-file\n");
+    expect(freshSecretValue("HF_TOKEN", "HUGGINGFACE_TOKEN")).toBe("canonical-from-shell");
+  });
+
+  it("falls through to the legacy alias only when the canonical one is unset everywhere", () => {
+    process.env.HUGGINGFACE_TOKEN = "legacy-from-shell";
+    writeEnv("# no HF_TOKEN here\n");
+    expect(freshSecretValue("HF_TOKEN", "HUGGINGFACE_TOKEN")).toBe("legacy-from-shell");
+  });
+
   it("ignores a blank value (a key present but empty is not a credential)", () => {
     writeEnv("CIVITAI_API_TOKEN=\n");
     expect(freshSecretValue("CIVITAI_API_TOKEN")).toBeUndefined();

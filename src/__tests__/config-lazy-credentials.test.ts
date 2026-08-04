@@ -107,6 +107,30 @@ describe("config download credentials resolve at ACCESS time (#826)", () => {
     expect(config.civitaiApiToken).toBe("from-shell");
   });
 
+  it("lets a saved HF_TOKEN beat a pre-existing shell HUGGINGFACE_TOKEN", async () => {
+    // The user has an old legacy alias in their shell and saves the canonical
+    // one. If the legacy alias won, the save would report success while every
+    // download kept using the old credential.
+    process.env.HUGGINGFACE_TOKEN = "legacy-from-shell";
+    writeFileSync(envPath, "", { mode: 0o600 });
+    const config = await bootConfig();
+    expect(config.huggingfaceToken).toBe("legacy-from-shell");
+    writeFileSync(envPath, "HF_TOKEN=canonical-just-saved\n", { mode: 0o600 });
+    expect(config.huggingfaceToken).toBe("canonical-just-saved");
+  });
+
+  it("still accepts an explicit assignment (the field is not getter-only)", async () => {
+    // These were plain writable properties; code and tests assign them, and a
+    // getter-only descriptor makes every such assignment throw in strict mode.
+    writeFileSync(envPath, "CIVITAI_API_TOKEN=from-file\n", { mode: 0o600 });
+    const config = await bootConfig();
+    expect(config.civitaiApiToken).toBe("from-file");
+    config.civitaiApiToken = "explicit-override";
+    expect(config.civitaiApiToken).toBe("explicit-override");
+    config.civitaiApiToken = undefined;
+    expect(config.civitaiApiToken).toBe("from-file");
+  });
+
   it("exposes the credential file path so a caller can name it without guessing", async () => {
     writeFileSync(envPath, "", { mode: 0o600 });
     vi.resetModules();
