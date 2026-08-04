@@ -552,11 +552,14 @@ export class AskAnswerJournalImpl {
     const entry: AskEntry = {
       token: `aa${++this.seq}`,
       askId,
-      // The TICKET's tab is authoritative when we have one (that is the tab the
-      // card was rendered on); otherwise the tab the reply physically arrived
-      // from, so an unattributable answer is still addressed somewhere real
-      // instead of being dropped for want of a key.
-      key: ticket?.tabId ?? meta.tabId,
+      // The TICKET's tab is authoritative only while the ticket is ATTRIBUTABLE.
+      // A REUSED id can name a ticket opened by a DIFFERENT tab, and taking its
+      // tab would re-address the answer to a conversation that never rendered the
+      // card — labelled `foreign`, so it could not satisfy anything, but still
+      // delivered to the wrong place. The bridge-supplied tab is the PROVEN
+      // source of this reply (it comes from the routed send, not from the id), so
+      // it wins whenever the ticket cannot be trusted.
+      key: attributable ? ticket.tabId : meta.tabId,
       // The fingerprint is the LICENCE to satisfy a re-ask, so a reused id gets
       // none — its answer may only ever be reported, never returned as an answer.
       // The question TEXT is still carried: it is what makes that report honest.

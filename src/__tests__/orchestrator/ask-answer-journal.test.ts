@@ -944,6 +944,33 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     expect(AskAnswers.droppedFor(TAB)).toBe(owed);
   });
 
+  // codex round 12, P0: the ticket map is global, so a REUSED id can name a
+  // ticket opened by a DIFFERENT tab. Taking that ticket's tab re-addressed the
+  // answer to a conversation that never rendered the card — labelled `foreign`
+  // so it could satisfy nothing, but still delivered to the wrong place.
+  it("an unattributable answer is addressed to the tab that PROVABLY sent it", () => {
+    AskAnswers.openAsk("pa-shared", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SAMPLER),
+      question: SAMPLER.question,
+    });
+    AskAnswers.closeAsk("pa-shared");
+    // The other tab accidentally dispatches a card with the same id.
+    AskAnswers.openAsk("pa-shared", {
+      tabId: OTHER_TAB,
+      fingerprint: askFingerprint(SCHEDULER),
+      question: SCHEDULER.question,
+    });
+    AskAnswers.closeAsk("pa-shared");
+    expect(AskAnswers.ticketFor("pa-shared")?.tabId).toBe(OTHER_TAB);
+    // The reply comes back from the FIRST tab — the bridge routed it, so that is
+    // proven, unlike anything the shared id can say.
+    const entry = AskAnswers.record("pa-shared", "dpmpp_2m", { tabId: TAB });
+    expect(entry.key).toBe(TAB);
+    expect(entry.correlation.status).toBe("foreign");
+    expect(AskAnswers.entriesFor(OTHER_TAB)).toHaveLength(0);
+  });
+
   it("never throws when the flusher does", () => {
     AskAnswers.setFlusher(() => {
       throw new Error("no agent");
