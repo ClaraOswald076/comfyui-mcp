@@ -93,6 +93,18 @@ interface ProcessInfo {
   osArgvExact?: boolean;
   /** The OS's raw command line — the recovery hint even when argv is not spawnable. */
   osCommandLine?: string;
+  /**
+   * TRUE when `pid` was found by SCANNING PROCESS NAMES for a Desktop shell, rather
+   * than resolved from the port.
+   *
+   * The distinction decides whether anything may be concluded about supervision. A
+   * port-resolved pid is the process that would be stopped, so what stands above it
+   * is its supervisor. A name-scanned one is merely "a Desktop app is running
+   * somewhere on this machine" — bound to no port and no backend — and a second,
+   * unrelated Desktop window must never license stopping a server it has never heard
+   * of (codex gate round 9).
+   */
+  pidFromDesktopScan?: boolean;
   isDesktopApp: boolean;
   desktopExePath?: string;
   /**
@@ -1459,6 +1471,20 @@ function assessDesktopSupervision(info: ProcessInfo): {
       `stop could not be undone.`,
   });
 
+  // A SHELL FOUND BY NAME IS NOT EVIDENCE ABOUT THIS PORT'S SERVER. When ComfyUI
+  // could not be attributed to the port, the caller falls back to whatever Desktop
+  // process is running anywhere on the machine. That pid is bound to no port and no
+  // backend: a second, unrelated Desktop window would otherwise stand in as the
+  // supervisor of an orphaned backend it has never heard of, and the reboot would
+  // stop a server nothing restarts (codex gate round 9). There is nothing to classify
+  // here — the premise is missing, not the evidence.
+  if (info.pidFromDesktopScan) {
+    return cannotAssess(
+      `the server on port ${info.port} could not be identified, and the only ComfyUI Desktop ` +
+        `process found (PID ${info.pid}) was located by scanning process names — nothing ties ` +
+        `it to that port, so it cannot be shown to supervise the server this would stop`,
+    );
+  }
   // NO SPECIAL CASE FOR A MISSING PID. An early `ok: true` here would be one more
   // permissive exit skipping the guard, and an untestable one at that. The classifier
   // already handles pid 0 the way it handles any pid it cannot read — the identity
@@ -1634,6 +1660,10 @@ async function acquireProcessInfo(): Promise<{
           argv: [],
           isDesktopApp: true,
           desktopExePath: findDesktopExeFromCommonPaths(),
+          // FOUND BY NAME, NOT BY PORT — nothing ties this shell to the server on
+          // config.resolvedPort. Recorded so the restart preflight cannot mistake
+          // "a Desktop app is running" for "this Desktop app supervises that server".
+          pidFromDesktopScan: true,
         },
       };
     }

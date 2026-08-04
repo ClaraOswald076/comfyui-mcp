@@ -238,20 +238,25 @@ describe("classifyDesktopSupervision — is anything going to start this again? 
     expect(verdict).toBe("supervised");
   });
 
-  it("the DESKTOP SHELL ITSELF is a supervisor — it is not walked past", () => {
-    // When ComfyUI is unreachable and its port cannot be attributed, the caller falls
-    // back to the Desktop shell's own pid; that fallback exists so a hung install can
-    // still be rebooted. Walking up from the shell finds Explorer/launchd and then the
-    // tree root, so an ordinary live Desktop would come back `abandoned` and the one
-    // recovery path left to that user would be refused — precisely when they already
-    // have no working ComfyUI.
+  it("being a Desktop shell ITSELF proves nothing about the server on the port", () => {
+    // An earlier revision short-circuited to `supervised` when the pid handed in was
+    // itself a Desktop shell, to serve a caller that falls back to "use whatever
+    // Desktop process is running" when the port cannot be attributed. But that
+    // fallback picks a shell by scanning process NAMES — bound to no port and no
+    // backend — so a second, unrelated Desktop window would have licensed stopping an
+    // orphaned backend it has never heard of.
+    //
+    // The premise was the problem, not the walk: the caller now declines before
+    // reaching here (see the preflight suite), and this classifier only ever sees a
+    // pid resolved FROM THE PORT. Asked about a shell anyway, it answers the same way
+    // it answers about anything with no supervisor above it.
     const { verdict } = classifyDesktopSupervision(
       tree({
         500: { cmd: DESKTOP_SHELL, started: "1000", parent: 400 },
         400: { cmd: "explorer.exe", started: "10", parent: 1 },
       }),
     );
-    expect(verdict).toBe("supervised");
+    expect(verdict).not.toBe("supervised");
   });
 
   it("an intermediate wrapper is walked THROUGH, not treated as an answer", () => {
@@ -1316,6 +1321,43 @@ describe("preflightLocalRestart — an instance we cannot identify is not a pass
     expect(result.reason).toMatch(/could not be identified/i);
     // It says what it could not establish rather than asserting something is wrong.
     expect(result.reason).toMatch(/could not be established that stopping it/i);
+  });
+
+  it("REFUSES when the only Desktop app found was located by scanning process names", async () => {
+    // Round-9 gate. When the port cannot be attributed, acquireProcessInfo falls back
+    // to the first Desktop process on the machine — bound to no port and no backend.
+    // Treating it as the supervisor let an unrelated Desktop window (a reopened app,
+    // a second install) authorize stopping an orphaned backend it has never heard of:
+    // the same lost server by a new route.
+    //
+    // Modelled as: the server does not answer, no port owner can be resolved, and a
+    // Desktop process IS found by name.
+    mockGetSystemStats.mockRejectedValue(new Error("fetch failed"));
+    mockExecSync.mockImplementation((cmd: string) => {
+      const c = String(cmd);
+      // The port cannot be attributed at all.
+      if (/netstat|lsof/i.test(c)) throw new Error("command not found");
+      // …but a Desktop shell is running somewhere.
+      if (/tasklist/i.test(c)) return '"Comfy Desktop.exe","900","Console","1","206,248 K"';
+      if (/pgrep/i.test(c)) return "900\n";
+      return "";
+    });
+    // Even a perfectly readable, live shell at that pid must not stand in.
+    __processControlTestHooks.setProcessIdentityResolver((pid) =>
+      pid === 900
+        ? {
+            executablePath: "C:\\Program Files\\Comfy Desktop\\Comfy Desktop.exe",
+            startedAt: "1000",
+          }
+        : undefined,
+    );
+    __processControlTestHooks.setProcessExistsProbe(() => true);
+
+    const result = await preflightLocalRestart();
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/scanning process names/i);
+    expect(result.reason).toMatch(/nothing ties it to that port/i);
   });
 
   it("still PASSES a non-Desktop instance whose relaunch is validated", async () => {

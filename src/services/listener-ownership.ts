@@ -195,16 +195,19 @@ export function classifyDesktopSupervision(
   const definite = (v: "supervised" | "abandoned"): SupervisionAssessment => ({
     verdict: classifiedSupervision(v),
   });
+  // NO SELF-SUPERVISOR SHORTCUT. An earlier revision returned `supervised` when the
+  // pid handed in was ITSELF a Desktop shell, to serve the caller's fallback of
+  // "ComfyUI could not be attributed to the port, so use whatever Desktop shell is
+  // running". But that fallback picks a shell by scanning process NAMES — it is bound
+  // to no port and to no backend, so "this pid is a Desktop shell" says nothing about
+  // whether it supervises the server the reboot would stop. A second, unrelated
+  // Desktop window would have licensed stopping an orphaned backend it has never
+  // heard of, which is the same lost server by a new route (codex gate round 9).
+  //
+  // The premise, not the shortcut, was the problem: that caller now declines before
+  // reaching here, so every pid this classifier sees is one resolved FROM THE PORT —
+  // a backend, whose supervisor is genuinely somewhere above it.
   const self = input.readIdentity(input.pid);
-  // THE PROCESS MAY BE THE SUPERVISOR ITSELF. When ComfyUI is unreachable and its
-  // port cannot be attributed, the caller falls back to the Desktop shell's own pid —
-  // that fallback exists precisely so a hung install can still be rebooted. Walking
-  // UP from the shell finds Explorer/launchd and then the tree root, so an ordinary
-  // live Desktop would be reported `abandoned` and the one recovery path left to that
-  // user refused, exactly when they already have no working ComfyUI (codex gate
-  // round 7). A live shell supervises its own backend; there is nothing above it to
-  // look for.
-  if (self && input.isSupervisorProcess(self)) return definite("supervised");
   let current = input.pid;
   let currentStartedAt = self?.startedAt;
   for (let hop = 0; hop < maxHops; hop++) {
