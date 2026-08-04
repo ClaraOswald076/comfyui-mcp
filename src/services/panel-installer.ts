@@ -1612,10 +1612,31 @@ export async function repairInterruptedPanelSwap(
     // marker — the in-flight directory is the authority (a journal can be lost
     // while the rename that created it survives), and the journal alone still
     // deserves a report even though it is never grounds to move anything.
+    //
+    // TRI-STATE, because `existsSync` folds EACCES/EIO into `false`: an
+    // UNREADABLE `.incoming` or journal would otherwise read as "there is
+    // nothing here" and this whole path would silently no-op on the one state
+    // it exists to catch. `isDirectory` and `probeFile` both answer `undefined`
+    // for "could not determine", which is neither present nor absent.
     const incoming = join(base, "custom_nodes", PANEL_INCOMING_NAME);
-    if (!pinned.existsSync(incoming) && !pinned.existsSync(swapJournalPath(base))) {
-      return undefined;
+    const journalFile = swapJournalPath(base);
+    // `probeFile` is the right probe for this: its FALSE is a determination
+    // (ENOENT/ENOTDIR, or "it is a directory"), whereas `isDirectory` answers
+    // `undefined` for a merely-absent path and would make every ordinary
+    // no-swap-in-flight call look indeterminate.
+    const incomingProbe = pinned.probeFile(incoming);
+    const journalState = pinned.probeFile(journalFile);
+    if (incomingProbe === undefined || journalState === undefined) {
+      return (
+        ` WARNING: whether an interrupted panel update is present could NOT be determined ` +
+        `— "${incoming}" or "${journalFile}" could not be inspected. Nothing has been ` +
+        `changed. Check that ${base}/custom_nodes is readable, then re-run ` +
+        `${describeInstallPanelAction("status", "a re-check on the ComfyUI host")}.`
+      );
     }
+    // Presence of the DIRECTORY still comes from existsSync — probeFile says
+    // "not a regular file" for a directory, which is not the same as absent.
+    if (!pinned.existsSync(incoming) && journalState !== true) return undefined;
     // The note is captured OUTSIDE the lock body so a throw AFTER a successful
     // repair still reports it. The earlier version returned undefined from the
     // catch below, which swallowed the disclosure along with the error — the
@@ -1654,11 +1675,23 @@ export async function repairInterruptedPanelSwap(
     // at all, which is the refuse-and-disclose contract failing at precisely the
     // moment it matters. A pre-check already established there was SOMETHING to
     // look at, so reaching here means we could not finish looking — say so.
+    // ABSOLUTE PATHS, not directory names. This is the message a user gets when
+    // their panel is missing, and "look in custom_nodes" is not something they
+    // can act on — the point of disclosing is that they can find the thing.
+    const root = panelBaseSync();
+    const incomingPath = root
+      ? join(root, "custom_nodes", PANEL_INCOMING_NAME)
+      : `<ComfyUI>/custom_nodes/${PANEL_INCOMING_NAME}`;
+    const backupRoot = root
+      ? join(root, "custom_nodes_backup")
+      : "<ComfyUI>/custom_nodes_backup";
     return (
       ` WARNING: an interrupted panel update was detected but could not be examined ` +
-      `(${detail}). Nothing has been changed. Check custom_nodes for ` +
-      `".comfyui-agent-panel.incoming" and custom_nodes_backup for a preserved copy, ` +
-      `then re-run ${describeInstallPanelAction("status", "a re-check on the ComfyUI host")}.`
+      `(${detail}). Nothing has been changed. A staged replacement may be at ` +
+      `"${incomingPath}", and your previous panel may be preserved under ` +
+      `"${backupRoot}" — if there is a copy there and no panel in custom_nodes, move it ` +
+      `back. Then re-run ` +
+      `${describeInstallPanelAction("status", "a re-check on the ComfyUI host")}.`
     );
   }
 }
@@ -1972,6 +2005,7 @@ export function isProvenLegacyEmptyQueue(details: unknown): boolean {
 export type UpdateOutcome =
   | "updated" // version OR git-HEAD moved on disk → the update definitely applied.
   | "downgraded" // the version PROVABLY went backwards — applied, but not an update.
+  | "moved-unknown-direction" // the version changed but the pair cannot be compared.
   | "no-op" // nothing moved AND Manager shows the stale-3.x no-op signature.
   | "unverified"; // nothing provably moved / can't read post identity — fail closed.
 
@@ -2043,6 +2077,26 @@ export function classifyPanelUpdate(
   const versionMoved =
     !!previousVersion && !!installedVersion && installedVersion !== previousVersion;
   const revMoved = !!previousRev && !!installedRev && installedRev !== previousRev;
+
+  // A CHANGED VERSION WE CANNOT COMPARE IS NOT A KNOWN-FORWARD ONE. The
+  // regression check above needs both sides to parse, so a pair like
+  // "0.11.34" -> "nightly" (or any unparseable string) slipped past it and was
+  // then classified "updated" purely because the strings differ — announcing a
+  // direction that was never established. It moved; which way is unknown, and
+  // that is exactly the "could not determine" this file refuses to round up.
+  //
+  // A git-HEAD advance with an UNCHANGED version stays a legitimate update:
+  // that is the nightly channel working normally, and nothing about it is
+  // ambiguous.
+  const versionComparable =
+    !!previousVersion &&
+    !!installedVersion &&
+    SEMVER_RE.test(previousVersion.trim()) &&
+    SEMVER_RE.test(installedVersion.trim());
+  if (versionMoved && !versionComparable) {
+    return { ...base, outcome: "moved-unknown-direction" };
+  }
+
   if (versionMoved || revMoved) return { ...base, outcome: "updated" };
 
   // Nothing provably moved. Use the Manager counts ONLY to name the failure:
@@ -2072,6 +2126,34 @@ function finalizeUpdate(
       message:
         `Panel updated (${from} → ${to}) via ComfyUI-Manager (${PANEL_VERSION}). ` +
         `RESTART ComfyUI to load the updated panel node.`,
+      previousVersion,
+      installedVersion,
+    };
+  }
+
+  // The version changed, but not in a direction we could establish.
+  //
+  // DISCLOSED, NOT REFUSED — deliberately. The change really happened and is on
+  // disk, so throwing would report a failure for work that was done: the user
+  // would not be told to restart, and a retry would re-run the whole swap. The
+  // defect being fixed is the unqualified claim "Panel updated", not the fact
+  // of reporting. So this returns, and the message says exactly what is known —
+  // it CHANGED, from what to what, and that the direction is unknown. That is
+  // the same shape as the sync layer's `stillBehind: null`, which already
+  // handles this honestly one level up.
+  if (outcome === "moved-unknown-direction") {
+    const message =
+      `Panel CHANGED${dirNote}: "${previousVersion ?? "unknown"}" → ` +
+      `"${installedVersion ?? "unreadable"}". At least one of those is not a comparable ` +
+      `version number, so whether this moved FORWARD or BACKWARD could NOT be ` +
+      `established — this is not being reported as an upgrade. RESTART ComfyUI to load ` +
+      `what is now on disk, then check the version with ` +
+      `${describeInstallPanelAction("status", "a re-check on the ComfyUI host")}.`;
+    return {
+      action: "update",
+      result: { ...result, message },
+      restartRequired: true,
+      message,
       previousVersion,
       installedVersion,
     };
@@ -3127,15 +3209,37 @@ function reconcilePanelSwap(
   // holds no lock, so repairing from there could move directories out from
   // under another process's in-flight swap. From a read it only reports.
   if (!opts.repair) {
+    // ONLY SAY WHAT WAS ESTABLISHED. This is a REPORT, and it was asserting two
+    // things it had not checked: that the existing panel "is intact" (from a
+    // bare existsSync) and that the staged copy "still loads" (without asking
+    // the integrity predicate at all). A damaged incoming tree or an unreadable
+    // canonical directory therefore produced a confident, wrong reassurance —
+    // the same fabricated-success shape as claiming an update that did not
+    // happen, in the one message a worried user is reading.
+    const canonicalWorks = canonicalUsable;
+    const stagedVerdictForReport = verifyStagedTree(incomingDir, deps);
     return {
       ok: false,
       note:
         ` WARNING: a panel update was interrupted — a staged replacement is sitting at ` +
         `${incomingDir}. ${
-          canonicalPresent
-            ? `Your existing panel at ${canonicalDir} is intact.`
-            : `ComfyUI is currently serving that staged copy; the previous panel is at ` +
-              `${journal?.backupDir ?? join(comfyuiPath, "custom_nodes_backup")}.`
+          canonicalWorks
+            ? `Your existing panel at ${canonicalDir} looks complete and is what ComfyUI ` +
+              `will load once the staged copy is cleared.`
+            : canonicalPresent
+              ? `The directory at ${canonicalDir} is present but does NOT look like a ` +
+                `working panel.`
+              : stagedVerdictForReport === "intact"
+                ? `ComfyUI is currently serving that staged copy, which verifies intact; ` +
+                  `the previous panel is at ` +
+                  `${journalBackup ?? join(comfyuiPath, "custom_nodes_backup")}.`
+                : `There is no panel at ${canonicalDir}, and the staged copy ` +
+                  `${
+                    stagedVerdictForReport === "corrupt"
+                      ? "did NOT survive intact"
+                      : "could NOT be verified"
+                  }; the previous panel is at ` +
+                  `${journalBackup ?? join(comfyuiPath, "custom_nodes_backup")}.`
         } Run ${describeInstallPanelAction("update", "an update on the ComfyUI host")} ` +
         `to finish or undo it automatically.`,
     };
@@ -4249,6 +4353,48 @@ async function runPanelActionCore(
             `Update ComfyUI-Manager on the host and retry, or restore the newer panel, ` +
             `then RESTART ComfyUI.`,
         );
+      }
+      // AND THE SAME RULE FOR AN UNCOMPARABLE PAIR. The regression check above
+      // needs both sides to parse; a changed-but-unparseable pair would sail
+      // past it and be announced as an update whose direction was never
+      // established. A git-HEAD advance with an unchanged version is unaffected.
+      const managerVersionMoved =
+        !!previousVersion &&
+        !!afterManager.version &&
+        afterManager.version !== previousVersion;
+      if (
+        managerMoved &&
+        managerVersionMoved &&
+        !(
+          SEMVER_RE.test(previousVersion!.trim()) &&
+          SEMVER_RE.test(afterManager.version!.trim())
+        )
+      ) {
+        // Disclosed rather than refused, for the same reason as finalizeUpdate:
+        // the change is on disk, so reporting a failure would cost the user the
+        // restart instruction and invite a retry that re-runs the whole swap.
+        assertNoPanelShadow("update", afterManager.dir, deps);
+        assertSameTarget("before reporting a changed panel");
+        const changed =
+          `Panel CHANGED at ${afterManager.dir}: "${previousVersion}" → ` +
+          `"${afterManager.version}". At least one of those is not a comparable version ` +
+          `number, so whether this moved FORWARD or BACKWARD could NOT be established — ` +
+          `this is not being reported as an upgrade. (ComfyUI-Manager also errored while ` +
+          `checking its own installed-pack list: ${managerFailure}.) RESTART ComfyUI, then ` +
+          `check the version with ` +
+          `${describeInstallPanelAction("status", "a re-check on the ComfyUI host")}.`;
+        return {
+          action: "update",
+          result: {
+            mechanism: "manager-http",
+            message: changed,
+            details: { manager_error: managerFailure },
+          },
+          restartRequired: true,
+          message: changed,
+          previousVersion,
+          installedVersion: afterManager.version,
+        };
       }
       if (managerMoved && afterManager.dir) {
         // It DID work; only the reporting failed. Verify it the same way every

@@ -720,12 +720,66 @@ describe("update no longer contradicts status on a registry-zip install (#771)",
         {},
       ).outcome,
     ).toBe("updated");
+    // A changed pair we cannot COMPARE is not a known-forward one. This
+    // assertion previously demanded "updated", which encoded the defect: the
+    // regression check needs both sides to parse, so an unparseable pair sailed
+    // past it and had a direction announced that was never established.
     expect(
       classifyPanelUpdate(
         { previousVersion: "nightly", installedVersion: "dev" },
         {},
       ).outcome,
+    ).toBe("moved-unknown-direction");
+    expect(
+      classifyPanelUpdate(
+        { previousVersion: "0.11.34", installedVersion: "nightly" },
+        {},
+      ).outcome,
+    ).toBe("moved-unknown-direction");
+    // A git-HEAD advance with an UNCHANGED version stays a legitimate update —
+    // that is the nightly channel working normally, and nothing is ambiguous.
+    expect(
+      classifyPanelUpdate(
+        {
+          previousVersion: "nightly",
+          installedVersion: "nightly",
+          previousRev: "a".repeat(40),
+          installedRev: "b".repeat(40),
+        },
+        {},
+      ).outcome,
     ).toBe("updated");
+  });
+
+  it("an uncomparable version CHANGE is refused, not announced as an update", async () => {
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    const h = makeDeps({ withoutSwapOps: true });
+    h.deps.update = async () => {
+      writePanelPack(PANEL_DIR(), "nightly"); // changed, but not comparable
+      return { mechanism: "manager-http", message: "updated", details: {} };
+    };
+    // DISCLOSED, not refused: the change is on disk, so reporting a failure
+    // would cost the user the restart instruction and invite a retry that
+    // re-runs the swap. What must not happen is the unqualified claim.
+    const result = await runPanelActionInner("update", h.deps);
+    expect(result.message).toMatch(/Panel CHANGED/);
+    expect(result.message).toMatch(/could NOT be established/);
+    expect(result.message).not.toMatch(/Panel updated/);
+    expect(result.restartRequired).toBe(true);
+  });
+
+  it("an UNREADABLE .incoming is not read as 'nothing to repair'", async () => {
+    // existsSync folds EACCES into false, so an unreadable staged directory
+    // would make the whole repair path silently no-op on the one state it
+    // exists to catch.
+    const h = makeDeps({});
+    h.deps.probeFile = (p) => (p.endsWith(".incoming") ? undefined : true);
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(h.deps);
+    expect(note).toMatch(/could NOT be determined/);
+    expect(note).toContain(join(root, "custom_nodes"));
   });
 
   it("an UNRELIABLE scan never propagates the Manager's absence claim", async () => {
