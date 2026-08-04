@@ -167,7 +167,7 @@ const useCmCliSchema = z
   .boolean()
   .optional()
   .describe(
-    "Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — when the CLI is unavailable, the operation falls back to Manager HTTP automatically (disclosed in the result).",
+    "Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — for install/disable/enable/uninstall, an unavailable CLI falls back to Manager HTTP automatically (disclosed in the result); update/reinstall/fix/list do not fall back.",
   );
 
 const channelSchema = z
@@ -184,9 +184,11 @@ function formatInstalledNodes(nodes: InstalledNode[]): string {
         n.auxId ? `git:${n.auxId}` : null,
       ].filter(Boolean);
       const idStr = idParts.length ? ` [${idParts.join(", ")}]` : "";
+      const state =
+        n.enabled === undefined ? "state unknown" : n.enabled ? "enabled" : "disabled";
       return (
         `${i + 1}. ${n.module}${idStr}\n` +
-        `   version: ${n.version ?? "unknown"} | ${n.enabled ? "enabled" : "disabled"}`
+        `   version: ${n.version ?? "unknown"} | ${state}`
       );
     })
     .join("\n");

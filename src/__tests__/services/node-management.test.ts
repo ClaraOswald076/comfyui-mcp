@@ -1121,6 +1121,39 @@ describe("node-management service", () => {
       expect((err as Error).message).toMatch(/could NOT be verified/);
       expect((err as Error).message).not.toMatch(/not present afterward/);
     });
+
+    it("on-disk pack + UNREADABLE Manager list → unverifiable, never 'Manager does not track it'", async () => {
+      // The disk says present, but the list could not be read — so neither
+      // "Manager does not track it" nor "the op resolved to nothing" was
+      // observed, and the message must not claim them.
+      impactOnDisk();
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname + (new URL(url).search || "");
+          if (path.startsWith("/v2/customnode/installed")) {
+            return new Response("boom", { status: 500 });
+          }
+          if (path === "/v2/manager/queue/status") {
+            return jsonResponse({
+              total_count: 1,
+              done_count: 1,
+              in_progress_count: 0,
+              is_processing: false,
+            });
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
+      const err = await updateCustomNode({ id: "comfyui-impact-pack" }).catch(
+        (e: Error) => e,
+      );
+      expect(err).toBeInstanceOf(NodeManagementError);
+      expect((err as Error).message).toMatch(/present on disk/);
+      expect((err as Error).message).toMatch(/could NOT be verified/);
+      expect((err as Error).message).not.toMatch(/does not track/);
+      expect((err as Error).message).not.toMatch(/resolved to NOTHING/);
+    });
   });
 
   // ---- comfy-cli fallback (#808) --------------------------------------------
@@ -1188,12 +1221,16 @@ describe("node-management service", () => {
     });
 
     it("disable reports UNVERIFIED — neither success nor failure — when the post-op list cannot be read", async () => {
+      // Pre-op read succeeds (the target validates), the POST-OP read fails.
+      let listCalls = 0;
       vi.stubGlobal(
         "fetch",
         vi.fn(async (url: string, init?: RequestInit) => {
           const path = new URL(url).pathname + (new URL(url).search || "");
           if (path.startsWith("/v2/customnode/installed")) {
-            return new Response("boom", { status: 500 });
+            listCalls++;
+            if (listCalls > 1) return new Response("boom", { status: 500 });
+            return jsonResponse(installedEnabled);
           }
           if (path === "/v2/manager/queue/status") return jsonResponse(drained);
           return new Response("", { status: 200 });
@@ -1203,6 +1240,47 @@ describe("node-management service", () => {
       expect(res.message).toMatch(/could NOT be verified/);
       expect(res.message).not.toMatch(/Disabled "my-pack"/);
       expect(res.message).not.toMatch(/did NOT take effect/);
+    });
+
+    it("disable refuses an id that resolves nowhere — NOTHING is queued", async () => {
+      fsCtl.readdirSync = () => [];
+      const { calls } = stubFetch({ installedBody: {} });
+      const err = await disableCustomNode({ id: "ghost-pack" }).catch((e: Error) => e);
+      expect(err).toBeInstanceOf(NodeManagementError);
+      expect((err as Error).message).toMatch(/not installed/);
+      expect((err as Error).message).toMatch(/NOTHING was queued/);
+      expect(
+        calls.some(
+          (c) => (c.body as { kind?: string } | undefined)?.kind === "disable",
+        ),
+      ).toBe(false);
+    });
+
+    it("disable stays UNVERIFIED when Manager reports no enabled flag at all", async () => {
+      // A build that carries neither `enabled` nor `is_disabled` — the flag
+      // must not be invented as "enabled" and then "verified".
+      stubFetch({ installedBody: { "my-pack": { ver: "1.0.0", cnr_id: "my-pack" } } });
+      const res = await disableCustomNode({ id: "my-pack" });
+      expect(res.message).toMatch(/could NOT be verified/);
+      expect(res.message).not.toMatch(/Disabled "my-pack" via/);
+    });
+
+    it("disable via comfy-cli verifies against the Manager list afterwards", async () => {
+      mockedExec.mockReturnValue(cliEnvelope({ message: "disabled" }) as never);
+      stubFetch({ installedBody: installedDisabled });
+      const res = await disableCustomNode({ id: "my-pack", useCmCli: true });
+      expect(res.mechanism).toBe("comfy-cli");
+      expect(res.message).toMatch(/via official comfy-cli/);
+      expect(res.message).toMatch(/verified against ComfyUI-Manager/);
+    });
+
+    it("disable via comfy-cli discloses when the CLI's success claim doesn't hold", async () => {
+      mockedExec.mockReturnValue(cliEnvelope({ message: "disabled" }) as never);
+      // CLI claims success; Manager still reports the pack enabled.
+      stubFetch({ installedBody: installedEnabled });
+      const res = await disableCustomNode({ id: "my-pack", useCmCli: true });
+      expect(res.message).toMatch(/did NOT take effect/);
+      expect(res.message).not.toMatch(/^Disabled/);
     });
 
     it("disable with useCmCli falls back to Manager HTTP when the CLI is unavailable, disclosed", async () => {
@@ -1293,18 +1371,23 @@ describe("node-management service", () => {
       expect(out.repository).toBe(URL);
       expect(out.version).toBe("nightly");
       expect(out.note).toMatch(/from-source/);
+      // The URL is NOT forwarded as `id` too — the reroute off the id path is
+      // the whole point; sending both leaves it to downstream precedence.
+      expect(out.id).toBeUndefined();
     });
 
     it("translates an explicit 'latest' on a git URL to 'nightly' (the #789 failure shape)", () => {
       const out = normalizeGitUrlInstallArgs({ id: URL, version: "latest" });
       expect(out.version).toBe("nightly");
       expect(out.note).toBeTruthy();
+      expect(out.id).toBeUndefined();
     });
 
     it("leaves an explicit non-latest version untouched — the caller's choice stands", () => {
       const out = normalizeGitUrlInstallArgs({ id: URL, version: "8.28.3" });
       expect(out.version).toBe("8.28.3");
       expect(out.note).toBeUndefined();
+      expect(out.id).toBeUndefined();
     });
 
     it("leaves a plain registry id install untouched", () => {
@@ -1369,16 +1452,44 @@ describe("node-management service", () => {
       expect(nodes[0].module).toBe("PackA");
     });
 
-    it("treats missing enabled as enabled unless is_disabled is set", async () => {
+    it("missing enabled/is_disabled is UNKNOWN, never defaulted to a definite state", async () => {
       stubFetch({
         installedBody: {
           A: { ver: "1" },
           B: { ver: "1", is_disabled: true },
+          C: { ver: "1", is_disabled: false },
         },
       });
       const nodes = await listInstalledNodes();
-      expect(nodes.find((n) => n.module === "A")!.enabled).toBe(true);
+      // A reported nothing — claiming "enabled" would be inventing state the
+      // verification paths then treat as observed.
+      expect(nodes.find((n) => n.module === "A")!.enabled).toBeUndefined();
       expect(nodes.find((n) => n.module === "B")!.enabled).toBe(false);
+      expect(nodes.find((n) => n.module === "C")!.enabled).toBe(true);
+    });
+
+    it("an unreadable installed-list payload is an ERROR, not an empty list", async () => {
+      // A 200 whose body is HTML/text parses to a raw string in managerFetch;
+      // parseInstalled would silently read it as "nothing installed".
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname;
+          if (path === "/v2/manager/queue/status") {
+            return jsonResponse({
+              total_count: 1,
+              done_count: 1,
+              in_progress_count: 0,
+              is_processing: false,
+            });
+          }
+          if (path.startsWith("/v2/customnode/installed")) {
+            return new Response("<!doctype html><html>catchall</html>", { status: 200 });
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
+      await expect(listInstalledNodes()).rejects.toThrow(/unreadable payload/);
     });
   });
 
@@ -1595,6 +1706,62 @@ describe("node-management service", () => {
       // start + status polled on the UNPREFIXED routes; the task route never used
       expect(legacyCallTo(calls, "/manager/queue/start")).toBeDefined();
       expect(legacyCallTo(calls, "/v2/manager/queue/task")).toBeUndefined();
+    });
+
+    it("disable sends the pack's REAL installed version as node_ver (legacy body keys on it)", async () => {
+      const { calls } = stubLegacyFetch({
+        installedBody: {
+          "my-pack": { ver: "1.2.3", cnr_id: "my-pack", enabled: false },
+        },
+      });
+      const res = await disableCustomNode({ id: "my-pack" });
+      expect(res.mechanism).toBe("manager-http");
+      expect(legacyCallTo(calls, "/manager/queue/disable")?.body).toMatchObject({
+        id: "my-pack",
+        version: "1.2.3",
+      });
+      expect(res.message).toMatch(/Disabled "my-pack"/);
+    });
+
+    it("uninstall sends the pack's REAL installed version as node_ver (legacy body keys on it)", async () => {
+      let listCalls = 0;
+      const calls: Call[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+          const method = init?.method ?? "GET";
+          const body = init?.body ? JSON.parse(init.body as string) : undefined;
+          calls.push({ url, method, body });
+          const path = new URL(url).pathname;
+          if (path.startsWith("/v2/")) {
+            return new Response("405: Method Not Allowed", { status: 405 });
+          }
+          if (path === "/manager/queue/status") {
+            return jsonResponse({
+              total_count: 1,
+              done_count: 1,
+              in_progress_count: 0,
+              is_processing: false,
+            });
+          }
+          if (path === "/customnode/installed") {
+            listCalls++;
+            // Pre-check sees the pack; post-op it is gone.
+            return jsonResponse(
+              listCalls === 1
+                ? { "my-pack": { ver: "4.5.6", cnr_id: "my-pack", enabled: true } }
+                : {},
+            );
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
+      const res = await uninstallCustomNode({ id: "my-pack" });
+      expect(res.message).toMatch(/Uninstalled "my-pack"/);
+      expect(legacyCallTo(calls, "/manager/queue/uninstall")?.body).toMatchObject({
+        id: "my-pack",
+        version: "4.5.6",
+      });
     });
 
     it("installs a git URL natively via { version:'unknown', files:[url] }", async () => {

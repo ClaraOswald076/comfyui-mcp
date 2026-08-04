@@ -92,7 +92,7 @@ Install a ComfyUI custom node pack by registry id, git URL, or name. Local insta
   ComfyUI-Manager channel name (default 'default').
 </ParamField>
 <ParamField path="useCmCli" type="boolean">
-  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — when the CLI is unavailable, the operation falls back to Manager HTTP automatically (disclosed in the result).
+  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — for install/disable/enable/uninstall, an unavailable CLI falls back to Manager HTTP automatically (disclosed in the result); update/reinstall/fix/list do not fall back.
 </ParamField>
 
 ### Example
@@ -130,7 +130,7 @@ Update an installed ComfyUI custom node pack, or pass 'all' to update every inst
   ComfyUI-Manager channel name (default 'default').
 </ParamField>
 <ParamField path="useCmCli" type="boolean">
-  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — when the CLI is unavailable, the operation falls back to Manager HTTP automatically (disclosed in the result).
+  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — for install/disable/enable/uninstall, an unavailable CLI falls back to Manager HTTP automatically (disclosed in the result); update/reinstall/fix/list do not fall back.
 </ParamField>
 
 ### Example
@@ -167,7 +167,7 @@ Reinstall a ComfyUI custom node pack. Local operations prefer official comfy-cli
   ComfyUI-Manager channel name (default 'default').
 </ParamField>
 <ParamField path="useCmCli" type="boolean">
-  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — when the CLI is unavailable, the operation falls back to Manager HTTP automatically (disclosed in the result).
+  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — for install/disable/enable/uninstall, an unavailable CLI falls back to Manager HTTP automatically (disclosed in the result); update/reinstall/fix/list do not fall back.
 </ParamField>
 
 ### Example
@@ -201,7 +201,7 @@ Repair a ComfyUI custom node pack's install and Python dependencies, or pass 'al
   ComfyUI-Manager channel name (default 'default').
 </ParamField>
 <ParamField path="useCmCli" type="boolean">
-  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — when the CLI is unavailable, the operation falls back to Manager HTTP automatically (disclosed in the result).
+  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — for install/disable/enable/uninstall, an unavailable CLI falls back to Manager HTTP automatically (disclosed in the result); update/reinstall/fix/list do not fall back.
 </ParamField>
 
 ### Example
@@ -229,7 +229,7 @@ Disable an installed ComfyUI custom node pack WITHOUT removing it — the revers
   Registry id / module name of the installed pack to disable.
 </ParamField>
 <ParamField path="useCmCli" type="boolean">
-  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — when the CLI is unavailable, the operation falls back to Manager HTTP automatically (disclosed in the result).
+  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — for install/disable/enable/uninstall, an unavailable CLI falls back to Manager HTTP automatically (disclosed in the result); update/reinstall/fix/list do not fall back.
 </ParamField>
 
 ### Example
@@ -257,7 +257,7 @@ Re-enable a ComfyUI custom node pack previously disabled with disable_custom_nod
   Registry id / module name of the installed pack to enable.
 </ParamField>
 <ParamField path="useCmCli" type="boolean">
-  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — when the CLI is unavailable, the operation falls back to Manager HTTP automatically (disclosed in the result).
+  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — for install/disable/enable/uninstall, an unavailable CLI falls back to Manager HTTP automatically (disclosed in the result); update/reinstall/fix/list do not fall back.
 </ParamField>
 
 ### Example
@@ -285,7 +285,7 @@ Uninstall a ComfyUI custom node pack (removes it). IRREVERSIBLE through this too
   Registry id / module name of the installed pack to uninstall.
 </ParamField>
 <ParamField path="useCmCli" type="boolean">
-  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — when the CLI is unavailable, the operation falls back to Manager HTTP automatically (disclosed in the result).
+  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — for install/disable/enable/uninstall, an unavailable CLI falls back to Manager HTTP automatically (disclosed in the result); update/reinstall/fix/list do not fall back.
 </ParamField>
 
 ### Example
@@ -313,7 +313,7 @@ List installed ComfyUI custom node packs with their version and enabled/disabled
   'default' lists all installed packs; 'imported' lists only those successfully imported this session. Options: `default`, `imported`.
 </ParamField>
 <ParamField path="useCmCli" type="boolean">
-  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — when the CLI is unavailable, the operation falls back to Manager HTTP automatically (disclosed in the result).
+  Prefer the official comfy-cli subprocess instead of the ComfyUI-Manager HTTP API. Local operations use comfy-cli by default; set false to force Manager HTTP. Requires a local ComfyUI install — for install/disable/enable/uninstall, an unavailable CLI falls back to Manager HTTP automatically (disclosed in the result); update/reinstall/fix/list do not fall back.
 </ParamField>
 
 ### Example
