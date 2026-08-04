@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { readFileSync } from "node:fs";
 import {
   AskAnswers,
   askFingerprint,
@@ -743,6 +744,30 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     const entry = AskAnswers.record("pa-retired", "dpmpp_2m", { tabId: OTHER_TAB });
     expect(entry.delivery).toBe("none");
     expect(entry.recoverable).toBe(false);
+  });
+
+  // codex round 5, P0: a REWIND discards everything after its anchor, so a
+  // question card the dropped branch put up was never asked by the conversation
+  // that now exists — but the handler only reset the agent, leaving the ask
+  // journal's epoch untouched. A late click on that card was then announced as
+  // "a question card YOU put up", and an identical re-ask in the fork recovered
+  // it. Every conversation boundary must retire this tab's asks.
+  //
+  // Asserted structurally: driving index.ts's panel-event dispatcher needs a
+  // booted orchestrator, and the property at stake is the WIRING — that each
+  // boundary handler calls closeAsks — not behaviour the journal's own tests
+  // don't already cover.
+  it("every conversation-boundary handler retires the tab's asks", () => {
+    const src = readFileSync(
+      new URL("../../orchestrator/index.ts", import.meta.url),
+      "utf8",
+    );
+    for (const kind of ["new_session", "resume_session", "rewind"]) {
+      const start = src.indexOf(`event.type === "${kind}"`);
+      expect(start, `${kind} handler not found`).toBeGreaterThan(-1);
+      const block = src.slice(start, src.indexOf("\n      return;", start));
+      expect(block, `${kind} must retire ask state`).toContain("AskAnswers.closeAsks(");
+    }
   });
 
   it("never throws when the flusher does", () => {

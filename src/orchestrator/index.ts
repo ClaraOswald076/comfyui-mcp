@@ -4386,6 +4386,14 @@ export async function runPanelOrchestrator(): Promise<void> {
       const tabId = event.tab_id;
       const anchor = typeof event.anchor === "string" ? event.anchor : null;
       const ok = manager.rewind(agentKeyFor(tabId), anchor);
+      // #486 — a REWIND is a conversation boundary too, not just New chat and
+      // resume: everything after the anchor is discarded, so a question card the
+      // dropped branch put up was never asked by the conversation that now
+      // exists. Retire this tab's asks so a late click on such a card can neither
+      // be announced as "a question card YOU put up" nor recovered as the answer
+      // to an identical question the fork asks afresh. The answers themselves are
+      // kept and still reported — closeAsks downgrades, it does not delete.
+      if (ok) AskAnswers.closeAsks(tabId);
       bridge.push({ type: "ack", ok, kind: "rewind" }, tabId);
       logger.info(`[panel-orchestrator] tab ${tabId.slice(0, 8)} rewind (anchor=${anchor ? anchor.slice(0, 8) : "fresh"}, ok=${ok})`);
       return;
