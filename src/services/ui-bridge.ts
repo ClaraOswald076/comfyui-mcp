@@ -18,6 +18,11 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import { logger } from "../utils/logger.js";
+import {
+  describePanelUpdateRecovery,
+  type PanelBundleSkew,
+} from "./panel-recovery.js";
+import { primePanelBase, verifiedPanelDiskVersion } from "./panel-workspace.js";
 import { compareSemver, detectInstallMode } from "./self-update.js";
 
 export const DEFAULT_BRIDGE_PORT = 9101;
@@ -291,6 +296,63 @@ export function requiredPanelVersion(): string {
     if (!SEMVER_RE.test(best.trim()) || compareSemver(min, best) > 0) best = min;
   }
   return best;
+}
+
+/**
+ * Is the INSTALL even the problem?
+ *
+ * A stale browser bundle and a stale install produce the SAME refusal — the tab
+ * advertises an old capability set either way — but they have opposite remedies,
+ * and telling a user to update an install that is already current is what makes
+ * the loop feel unfixable. Distinguishing them needs two facts observed at the
+ * same moment, and both already exist: the tab's advertised version arrives in
+ * its `hello`, and the orchestrator runs the panel sync on that SAME hello,
+ * which reads the installed version off disk (panelStatus records it).
+ *
+ * Returns a skew ONLY on positive proof, because the cost of a wrong answer is
+ * asymmetric: claiming "your install is fine, just refresh" to someone whose
+ * install is genuinely behind sends them straight back round the loop. So all of
+ * these must hold, and any unknown resolves to "no skew" (fall through to the
+ * ordinary update guidance):
+ *
+ *   - `verifiedPanelDiskVersion()` returns a version, which means the pack is
+ *     STILL the panel and STILL there: it re-reads the pyproject NOW, from the
+ *     directory the last scan found, for the ComfyUI we are CURRENTLY targeting.
+ *     A recorded version is never trusted on its own — the pack may have been
+ *     removed, downgraded, or replaced since, and the target may have changed
+ *     out from under the observation (the orchestrator kicks off the panel sync
+ *     and retargets in the same hello handler);
+ *   - that version PARSES and is >= the required floor — the install is
+ *     provably not the problem;
+ *   - the tab advertised NO version, or one that parses and is BELOW the floor.
+ *     A tab claiming the same current version yet missing the capability is some
+ *     other fault, not this one, and must not be given this diagnosis.
+ */
+function resolveStaleBundleSkew(panelVersion?: string): PanelBundleSkew | undefined {
+  const disk = verifiedPanelDiskVersion()?.trim();
+  if (!disk) {
+    // Could not confirm — most often because the live-base resolution has gone
+    // stale and this refusal is the first thing to ask in a while. Refresh it in
+    // the background (never awaited; building an error message must not block on
+    // I/O) so a retry, which agents reliably make, can answer properly.
+    void primePanelBase().catch(() => {});
+    return undefined;
+  }
+  const required = requiredPanelVersion();
+  if (!SEMVER_RE.test(disk) || !SEMVER_RE.test(required.trim())) return undefined;
+  if (compareSemver(disk, required) < 0) return undefined; // install really IS behind
+
+  const advertised = panelVersion?.trim();
+  if (advertised) {
+    // A version we cannot parse is not proof of an old tab.
+    if (!SEMVER_RE.test(advertised)) return undefined;
+    if (compareSemver(advertised, required) >= 0) return undefined;
+  }
+  return {
+    diskVersion: disk,
+    handshakeVersion: advertised || undefined,
+    requiredVersion: required,
+  };
 }
 
 /** True when the panel ADVERTISED a PARSEABLE version (in its `hello`) that already
@@ -2155,11 +2217,24 @@ export class UiBridge {
         // while the open browser tab keeps running a CACHED older bundle (a
         // restart reconnects the tab but never re-downloads the extension JS),
         // so the capability the hello advertises lags the version on disk.
-        const recovery =
-          `Run install_panel(action:'update'), restart ComfyUI, then hard-refresh the ` +
-          `ComfyUI browser tab (Ctrl+Shift+R) so it loads the updated bundle — a restart ` +
-          `alone leaves the tab running its cached old panel JS; rebinding cannot add the ` +
-          `missing capability`;
+        //
+        // #774/#784 — the recovery is resolved from THIS session's context, not
+        // hardcoded. This gate is hard by design (a wrong-workflow write cannot
+        // be retracted), which makes it doubly important that the one remedy it
+        // names is a remedy the caller can actually reach: in remote/cloud mode
+        // install_panel is a no-op, and on the embedded `panel_*` surface it is
+        // not even present. describePanelUpdateRecovery names it only where it
+        // works, and hands over concrete host-side commands everywhere else.
+        //
+        // And FIRST it asks a different question: is the INSTALL even the
+        // problem? `resolveStaleBundleSkew` answers that from the version the
+        // panel sync read OFF DISK at this tab's own hello. When the pack on
+        // disk already clears the floor, no update of any kind helps and the
+        // remedy is a cache-bypassing reload of this tab.
+        const recovery = describePanelUpdateRecovery(
+          undefined,
+          resolveStaleBundleSkew(conn.panelVersion),
+        );
         const why = !conn.enforcesWorkflowStamp
           ? `panel tab ${conn.tabId} does not enforce per-command workflow targeting ` +
             `(detected panel ${conn.panelVersion ?? "version unknown"}; this MCP requires panel ` +

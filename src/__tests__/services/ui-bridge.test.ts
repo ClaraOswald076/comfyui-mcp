@@ -19,6 +19,40 @@ import {
   requiresWorkflowStampEnforcement,
 } from "../../services/ui-bridge.js";
 import { carryWorkflowCommandStamp } from "../../orchestrator/session-store.js";
+import {
+  __resetPanelBaseCache,
+  __setPanelBaseForTests,
+  clearPanelDiskObservation,
+  recordPanelDiskObservation,
+} from "../../services/panel-workspace.js";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+/**
+ * A real on-disk panel pack under a resolved base. The skew resolver re-reads
+ * the pyproject AND requires the pack to sit under the currently-resolved
+ * ComfyUI root, so neither a fabricated path nor an unbound one proves anything.
+ */
+const tempRoots: string[] = [];
+function writeTempPanelPack(version: string): string {
+  const base = mkdtempSync(join(tmpdir(), "cmcp-bundle-"));
+  const dir = join(base, "custom_nodes", "comfyui-agent-panel");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, "pyproject.toml"),
+    `[project]\nname = "comfyui-agent-panel"\nversion = "${version}"\n`,
+  );
+  tempRoots.push(base);
+  __setPanelBaseForTests(base);
+  recordPanelDiskObservation(version, dir, base);
+  return dir;
+}
+afterEach(() => {
+  clearPanelDiskObservation();
+  __resetPanelBaseCache();
+  for (const d of tempRoots.splice(0)) rmSync(d, { recursive: true, force: true });
+});
 
 // #570 P0c — classifier that decides which commands must pass the enforcement+stamp gate.
 describe("requiresWorkflowStampEnforcement (#570 P0c)", () => {
@@ -1835,6 +1869,78 @@ describe("UiBridge — desktop-tab mirror (multi-viewer fanout)", () => {
       bridge.send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "old-skew" }),
     ).rejects.toThrow(/detected panel 0\.11\.0.*requires panel 0\.11\.35\+.*install_panel\(action:'update'\).*restart ComfyUI.*rebinding cannot/i);
     old.close();
+  });
+
+  it("names the stale TAB, not the install, when the pack on disk already clears the floor", async () => {
+    // The unfixable-loop shape. The panel's module URLs carry no cache-busting
+    // key and the capability is advertised from the single file that also builds
+    // `hello`, so a tab holding the pre-0.11.35 copy announces the old
+    // capability set while the pack ON DISK is current. Telling that user to run
+    // install_panel is what closed the loop: it correctly reports nothing to do.
+    // The orchestrator runs the panel sync on this same hello, so the on-disk
+    // version is observed alongside the handshake — enough to name it.
+    // A REAL pack on disk: the skew resolver re-reads the pyproject at the
+    // moment of use rather than trusting the recorded version, so a fabricated
+    // path would (correctly) prove nothing.
+    writeTempPanelPack("0.11.38");
+    try {
+      const stale = new WebSocket(`ws://127.0.0.1:${port}`);
+      await new Promise<void>((res, rej) => {
+        stale.on("open", () => {
+          stale.send(
+            JSON.stringify({ type: "hello", tab_id: "stale-bundle", title: "wf", panel_version: "0.11.34" }),
+          );
+          res();
+        });
+        stale.on("error", rej);
+      });
+      await vi.waitFor(() =>
+        expect(bridge.tabs().some((t) => t.tab_id === "stale-bundle")).toBe(true),
+      );
+      const err = await bridge
+        .send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "stale-bundle" })
+        .catch((e: Error) => e);
+      expect((err as Error).message).toMatch(/Do NOT update the panel/);
+      expect((err as Error).message).toMatch(/HARD-REFRESH/);
+      expect((err as Error).message).toMatch(/0\.11\.38/);
+      // It must NOT send them back to the tool that will report nothing to do.
+      expect((err as Error).message).not.toMatch(/Run install_panel\(action:'update'\)/);
+      // The gate itself still refused the write — the diagnosis changed, not the gate.
+      expect(isCapabilityRefusal(err as Error)).toBe(true);
+      stale.close();
+    } finally {
+      clearPanelDiskObservation();
+    }
+  });
+
+  it("an install that is genuinely BEHIND still gets the update remedy, never a refresh", async () => {
+    // The guard on the branch above: a stale-install user must not be told their
+    // install is fine. Only a disk version at or above the floor earns the
+    // refresh diagnosis.
+    writeTempPanelPack("0.11.20");
+    try {
+      const behind = new WebSocket(`ws://127.0.0.1:${port}`);
+      await new Promise<void>((res, rej) => {
+        behind.on("open", () => {
+          behind.send(
+            JSON.stringify({ type: "hello", tab_id: "really-old", title: "wf", panel_version: "0.11.20" }),
+          );
+          res();
+        });
+        behind.on("error", rej);
+      });
+      await vi.waitFor(() =>
+        expect(bridge.tabs().some((t) => t.tab_id === "really-old")).toBe(true),
+      );
+      const err = await bridge
+        .send({ cmd: "graph_add_node", node: "x" } as never, { tabId: "really-old" })
+        .catch((e: Error) => e);
+      expect((err as Error).message).not.toMatch(/Do NOT update the panel/);
+      expect((err as Error).message).toMatch(/install_panel\(action:'update'\)|ON THE COMFYUI HOST/);
+      behind.close();
+    } finally {
+      clearPanelDiskObservation();
+    }
   });
 
   it("#709: the capability refusal carries the typed marker, the FULL tab id, and the hard-refresh recovery", async () => {

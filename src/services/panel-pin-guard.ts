@@ -19,7 +19,8 @@
 // This module deliberately imports NOTHING from panel-installer or
 // node-management: panel-installer already imports node-management's mutations,
 // so a guard that reached back into either would create an import cycle. It
-// depends only on the pin store.
+// depends only on the pin store (and panel-recovery, which is itself a leaf over
+// config + panel-workspace and reaches back into neither).
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
@@ -35,6 +36,10 @@ import {
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { logger } from "../utils/logger.js";
+import {
+  describePanelManagementRedirect,
+  panelRecoveryContext,
+} from "./panel-recovery.js";
 import {
   describePanelPin,
   getPanelPinState,
@@ -155,16 +160,35 @@ export function assertPanelPinAllows(action: string, id: string): void {
         `must be unset/changed in the environment — unpin cannot remove it)`
       : ``;
 
+  // #774/#784 — the way out of this refusal must be a way the caller can
+  // actually take. `install_panel(action='unpin')` is the right instruction in a
+  // local session and a dead end in a remote/cloud one, where install_panel
+  // cannot act at all. So the LEAD instruction switches with the session rather
+  // than being appended to. An env pin already carries its own instruction (unset
+  // the variable), which is host-side either way and needs no substitution.
+  const usable = panelRecoveryContext().installPanelUsable;
+  const clearIt = usable
+    ? `clear the pin with install_panel(action='unpin')${envNote}`
+    : pin.source === "env"
+      ? // An env pin is not cleared by any tool anywhere, so naming one would be
+        // noise on top of a dead end — say plainly where the variable lives.
+        `clear the pin ON THE COMFYUI HOST: unset ${PANEL_PIN_ENV_VAR} in that ` +
+        `machine's environment (or ~/.comfyui-mcp/.env) and restart the ` +
+        `orchestrator running there`
+      : `clear the pin ON THE COMFYUI HOST — install_panel cannot act in this ` +
+        `session, so remove it from that machine's ` +
+        `~/.comfyui-mcp/panel-settings.json and restart the orchestrator ` +
+        `running there`;
+
   throw new PanelPinnedError(
     bulk
       ? `Refusing to ${action} "${id}": that would also move the sidebar panel pack, ` +
         `which is ${describePanelPin(pin)}. ComfyUI-Manager cannot update ` +
-        `everything-except-one-pack, so either clear the pin first with ` +
-        `install_panel(action='unpin')${envNote} and re-run, or update the other packs ` +
-        `individually by id.`
+        `everything-except-one-pack, so either ${clearIt} and re-run, or update the ` +
+        `other packs individually by id.`
       : `Refusing to ${action} the sidebar panel pack ("${id}"): it is ` +
         `${describePanelPin(pin)}. A pin is honoured even when a newer panel exists — ` +
-        `clear it first with install_panel(action='unpin')${envNote}, then re-run.`,
+        `${clearIt}, then re-run.`,
   );
 }
 
@@ -182,6 +206,13 @@ export function assertPanelPinAllows(action: string, id: string): void {
  * checked, they refuse and name the tool that does verify.
  *
  * The pin is reported FIRST when set, because that is the more specific reason.
+ *
+ * #774/#784 — the REDIRECT is resolved from the session context rather than
+ * hardcoded to "use install_panel". Pairing this refusal with a pointer at a
+ * tool that is a no-op here (remote/cloud) or absent here (the embedded
+ * `panel_*` surface) is what closed the loop into a deadlock: every door the
+ * user tried named another door that was also shut. Refusing remains correct —
+ * this path genuinely cannot verify the move — but the way out must be real.
  */
 export function assertPanelNotTargetedUnverifiable(
   toolName: string,
@@ -196,9 +227,7 @@ export function assertPanelNotTargetedUnverifiable(
       `path reports success as soon as the ComfyUI-Manager queue drains, which a ` +
       `stale Manager does WITHOUT doing any work (#639) and which cannot see a ` +
       `".bak" shadow copy shadowing the real panel (#641) — so it could tell you the ` +
-      `panel updated when it did not. Use install_panel instead: ` +
-      `install_panel(action='sync') brings the panel in line with this orchestrator ` +
-      `and re-reads the installed version from disk, and action='status' reports it.`,
+      `panel updated when it did not. ${describePanelManagementRedirect()}`,
   );
 }
 

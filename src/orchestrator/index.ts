@@ -31,6 +31,8 @@ import { judgeHelloRetarget, canonComfyuiTargetUrl } from "../services/hello-ret
 import { startQuickTunnel } from "../services/tunnel.js";
 import { detectInstallMode } from "../services/self-update.js";
 import { performPanelSync } from "../services/panel-sync.js";
+import { clearPanelDiskObservation } from "../services/panel-workspace.js";
+import { panelRecoveryContext } from "../services/panel-recovery.js";
 import { isPanelAutoInstallDisabled } from "../services/panel-installer.js";
 import { SelfRestarter } from "../services/self-restart.js";
 import {
@@ -2687,6 +2689,19 @@ export async function runPanelOrchestrator(): Promise<void> {
       // bridge pins each CURRENT socket's kind on its FIRST hello, so query that
       // trusted session state rather than this raw (and replayable) hello's
       // `headless`. A headless mirror cannot load the desktop extension.
+      // #771/#784 — a hello means this tab (and possibly ComfyUI itself) just
+      // came back, and the retarget below may still change which server we are
+      // talking to. Any earlier on-disk reading could therefore describe a
+      // different install, so drop it SYNCHRONOUSLY here, before anything can
+      // read it again. During that gap a write refusal falls back to ordinary
+      // update guidance instead of certifying a stale reading as "your install
+      // is fine, just hard-refresh".
+      //
+      // UNCONDITIONAL, and deliberately outside the auto-sync branch below: a
+      // user who disabled auto-sync still gets write refusals, and a same-URL
+      // restart onto a different --base-directory would otherwise leave the
+      // previous tree's reading standing with nothing to replace it.
+      clearPanelDiskObservation();
       if (
         !bridge.isCurrentHeadless(panelTab) &&
         !isPanelAutoInstallDisabled()
@@ -2713,7 +2728,14 @@ export async function runPanelOrchestrator(): Promise<void> {
                 type: "say",
                 text:
                   `⚠️ Could not automatically sync the ComfyUI-MCP panel; no update was claimed. ` +
-                  `Run install_panel(action:'status') to inspect it, then retry install_panel(action:'sync') if appropriate. (${detail})`,
+                  // #784 — this is pushed to the embedded panel chat, whose
+                  // tool set does not include install_panel. Name it only where
+                  // it can be invoked.
+                  `${
+                    panelRecoveryContext().installPanelUsable
+                      ? "Run install_panel(action:'status') to inspect it, then retry install_panel(action:'sync') if appropriate."
+                      : "Inspect and update the panel pack on the ComfyUI host itself — no tool in this session can do it."
+                  } (${detail})`,
               },
               panelTab,
             );

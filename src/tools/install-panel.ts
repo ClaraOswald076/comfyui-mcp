@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   panelStatus,
+  repairInterruptedPanelSwap,
   runPanelAction,
   withPanelOpLock,
 } from "../services/panel-installer.js";
@@ -59,10 +60,11 @@ export function registerInstallPanelTools(server: McpServer): void {
             "(never errors). sync: bring the panel up to what this orchestrator " +
             "needs — no-ops when already current, WARNS ONLY when pinned, and " +
             "reports the version re-read from disk afterwards. install: add the " +
-            "panel (nightly). update: pull the latest nightly — when ComfyUI-Manager " +
-            "provably no-ops the update (stale legacy 3.x) and the panel is a real " +
-            "git checkout, it is fast-forwarded directly via git pull --ff-only and " +
-            "verified on disk instead. reinstall: uninstall " +
+            "panel (nightly). update: pull the latest nightly. Works on either " +
+            "install shape — a git checkout is fast-forwarded, and a Comfy Registry " +
+            "ZIP install (which has no .git) is replaced with a verified fresh " +
+            "clone, keeping the previous copy outside custom_nodes. Success is " +
+            "always re-read from disk. reinstall: uninstall " +
             "+ reinstall (nightly). pin: hold the panel at a version (requires " +
             "`version`). unpin: clear the pin so a sync can proceed. " +
             "install/update/reinstall/sync refuse on a dev symlink or an active " +
@@ -83,8 +85,18 @@ export function registerInstallPanelTools(server: McpServer): void {
     async ({ action, version, reason }) => {
       try {
         if (action === "status") {
+          // A crash between the swap's two renames leaves custom_nodes with NO
+          // panel. Repair it here — asking "what's going on?" is exactly when a
+          // user hits that state, and requiring them to know to run a MUTATION
+          // to get their panel back is not a recovery path. Takes the op lock
+          // itself and no-ops when there is nothing to repair.
+          const repaired = await repairInterruptedPanelSwap();
           const status = await panelStatus();
-          return json({ ...status, sync: evaluatePanelSync(status) });
+          return json({
+            ...status,
+            note: repaired ? `${status.note}${repaired}` : status.note,
+            sync: evaluatePanelSync(status),
+          });
         }
 
         if (action === "sync") {

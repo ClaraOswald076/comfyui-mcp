@@ -24,7 +24,9 @@
 //     copy) resolves to "don't touch it", never to "probably fine".
 
 import {
+  assertPinnedTarget,
   panelStatus,
+  pinPanelBase,
   runPanelAction,
   runPanelActionInner,
   withPanelOpLock,
@@ -38,6 +40,7 @@ import {
   type PanelPinState,
 } from "./panel-settings.js";
 import { requiredPanelVersion as requiredBridgePanelVersion, SEMVER_RE } from "./ui-bridge.js";
+import { describeInstallPanelAction } from "./panel-recovery.js";
 import { compareSemver, detectInstallMode } from "./self-update.js";
 
 export { requiredBridgePanelVersion as requiredPanelVersion };
@@ -63,6 +66,44 @@ export { requiredBridgePanelVersion as requiredPanelVersion };
 function isComparableVersion(v: string | undefined): v is string {
   return typeof v === "string" && SEMVER_RE.test(v.trim());
 }
+
+/**
+ * How to clear a pin, phrased for THIS session. These summaries are pushed
+ * straight into the embedded panel chat on every hello, and that surface does
+ * not carry install_panel (#784) — naming it there is the same dead end the
+ * bridge refusal had.
+ */
+const UNPIN_INSTRUCTION = (): string =>
+  describeInstallPanelAction(
+    "unpin",
+    "removing the pin on the ComfyUI host (its ~/.comfyui-mcp/panel-settings.json, " +
+      "or the COMFYUI_MCP_PANEL_PIN variable there) and restarting the orchestrator " +
+      "running on that machine",
+  );
+
+/**
+ * The one thing an `up-to-date` verdict was missing.
+ *
+ * "Nothing to do" is true and, to a user whose graph writes are being refused
+ * for a too-old panel, completely useless — it is the last step of the loop that
+ * made #771/#784 feel unfixable. The reason both can be true at once is that the
+ * write gate reads what the browser TAB advertised, and the panel's module URLs
+ * carry no cache-busting key: a tab holding the pre-0.11.35 copy of the file
+ * that builds the `hello` announces the old capability set while the pack on
+ * disk is current. So the honest completion of "nothing to do" is "…and if
+ * writes are still refused, the tab is the stale part".
+ *
+ * Phrased conditionally on purpose: this function cannot see the tab's
+ * handshake, so it must not assert that a skew IS happening. The bridge refusal
+ * (which sees both) makes the definite call. (Cache-busting itself is
+ * #584 / panel #596 and is not addressed here.)
+ */
+const STALE_BUNDLE_HINT =
+  ` If graph WRITES are still being refused for a too-old panel, the install is not ` +
+  `the problem — the open ComfyUI browser tab is running a CACHED older copy of the ` +
+  `panel's JavaScript, and the capability check reads what the tab announced. ` +
+  `Hard-refresh that tab with a cache-bypassing reload (Ctrl+Shift+R, or Cmd+Shift+R ` +
+  `on macOS); updating or reinstalling the pack will keep reporting nothing to do.`;
 
 /**
  * What a just-written persisted pin actually achieved. Writing the settings file
@@ -177,7 +218,7 @@ export function evaluatePanelSync(
     return (
       ` NOTE: the panel is ${describePanelPin(pin)} and BEHIND what ${orch} ` +
         `expects (${status.installedVersion} < ${required}) — left untouched; ` +
-        `unpin with install_panel(action='unpin') to close the gap.`
+        `close the gap by ${UNPIN_INSTRUCTION()}.`
     );
   })();
 
@@ -275,6 +316,28 @@ export function evaluatePanelSync(
   }
 
   if (!status.installed) {
+    // #766 — "not installed" is only actionable when the absence is PROVEN.
+    // When the ComfyUI root came from configuration rather than from the running
+    // server, a perfectly good panel may be sitting in the tree that is actually
+    // served, and installing would drop a second copy into a custom_nodes
+    // nothing loads — the user then sees no panel and no error. Refuse to act on
+    // an unproven absence, exactly as we refuse on an unreliable scan above.
+    if (status.absenceProven === false) {
+      return {
+        ...base,
+        decision: "blocked",
+        behind: false,
+        summary:
+          `No panel was found in ${status.comfyuiPath ?? "custom_nodes"}, but that root ` +
+          `was NOT confirmed by the running ComfyUI — so this is not a proven absence ` +
+          `and nothing will be installed. On a split install (Comfy Desktop's ` +
+          `--base-directory, #766) the panel lives in a different tree and installing ` +
+          `here would land in a custom_nodes that is never loaded. Make sure ComfyUI is ` +
+          `running and reachable so its own install root can be read, or check ` +
+          `get_environment's local.workspace_path, then re-check.` +
+          driftNote,
+      };
+    }
     // Not installed at all. That is definitionally behind, but a pin still wins:
     // installing the nightly channel would land some version other than the
     // pinned one.
@@ -286,7 +349,7 @@ export function evaluatePanelSync(
         summary:
           `The panel pack is not installed, and ${orch} needs panel ${required}+. ` +
           `You are ${describePanelPin(pin)}, so nothing will be installed automatically. ` +
-          `Clear the pin (install_panel(action='unpin')) to let the sync install it.`,
+          `Clear the pin (${UNPIN_INSTRUCTION()}) to let the sync install it.`,
       };
     }
     return {
@@ -315,7 +378,7 @@ export function evaluatePanelSync(
         behind: false,
         summary:
           `${cannotCompare} You are also ${describePanelPin(pin)}, so nothing will ` +
-          `be changed either way. Clear the pin (install_panel(action='unpin')) ` +
+          `be changed either way. Clear the pin (${UNPIN_INSTRUCTION()}) ` +
           `first if you want to move the panel at all.`,
       };
     }
@@ -325,7 +388,8 @@ export function evaluatePanelSync(
       behind: false,
       summary:
         `${cannotCompare} NOT syncing on a guess — check the pack's pyproject.toml, ` +
-        `or run install_panel(action='update') deliberately.`,
+        `or run ${describeInstallPanelAction("update", "the update on the ComfyUI host")} ` +
+        `deliberately.`,
     };
   }
 
@@ -352,7 +416,7 @@ export function evaluatePanelSync(
         `${status.installedVersion} — a newer panel that matches your orchestrator ` +
         `exists. You are ${describePanelPin(pin)}, so NOTHING has been changed and ` +
         `nothing will be. If you want the newer panel, clear the pin first ` +
-        `(install_panel(action='unpin')` +
+        `(${UNPIN_INSTRUCTION()}` +
         (pin.source === "env"
           ? `, though this pin comes from ${PANEL_PIN_ENV_VAR} and must be unset in ` +
             `the environment`
@@ -368,7 +432,7 @@ export function evaluatePanelSync(
       behind: false,
       summary:
         `Panel ${status.installedVersion} already meets what ${orch} needs ` +
-        `(${required}+). Nothing to do.`,
+        `(${required}+). Nothing to do.${STALE_BUNDLE_HINT}`,
     };
   }
 
@@ -449,13 +513,34 @@ export async function performPanelSync(
   // the stale decision (codex gate). runPanelAction's own wrapper would lock
   // only the mutation half, so this calls the inner action directly.
   return withPanelOpLock(async () => {
-    const before = await panelStatus(deps);
+    // Freeze the ComfyUI base for the WHOLE sync, not per-call. This function
+    // makes three separate reads of the install — the pre-decision status, the
+    // mutation's own pre/post detection, and the post-status re-read — and the
+    // honesty of every claim it makes depends on all three describing the same
+    // directory. Pinning inside each callee is not enough: the live-base cache
+    // has a short TTL and a Manager operation can outlive it, so two calls could
+    // resolve different trees (see pinPanelBase).
+    // A sync is what the orchestrator runs on every panel HELLO, which is also
+    // the signal that ComfyUI may have just restarted — possibly with different
+    // launch flags, and therefore a different custom_nodes. Force a fresh
+    // resolution rather than serving a cached base that could describe the
+    // previous process. (pinPanelBase only probes for the REAL dep set; an
+    // injected one has already declared where ComfyUI is.)
+    const pinnedDeps = await pinPanelBase(deps, { force: true });
+    const before = await panelStatus(pinnedDeps);
     const assessment = evaluatePanelSync(before, {
       orchestratorVersion: opts.orchestratorVersion,
       requiredVersion: opts.requiredVersion,
     });
 
     if (assessment.decision !== "sync") {
+      // EVERY return path, not just the one that mutated. This verdict was
+      // computed from a status read of the FROZEN tree, and a retarget can land
+      // while that read is awaited — handing target A's "already meets what this
+      // orchestrator needs" to a tab that now belongs to B, which may be far
+      // behind. A non-mutating answer about the wrong install is still a wrong
+      // answer, and this one gets pushed straight into the panel chat.
+      assertPinnedTarget(pinnedDeps, "sync", `before reporting "${assessment.decision}"`);
       return {
         synced: false,
         decision: assessment.decision,
@@ -468,18 +553,18 @@ export async function performPanelSync(
     // `update` refreshes an existing pack; `install` is for a pack that isn't
     // there. Both go through the same verified path and both fail closed.
     const action = before.installed ? "update" : "install";
-    const result = await runPanelActionInner(action, deps);
+    const result = await runPanelActionInner(action, pinnedDeps);
 
     // Re-read from disk. `runPanelAction` already proved movement, but the version
     // we hand back to the user must be one we OBSERVED after the fact, not the one
     // the installer intended or reported.
-    const after = await panelStatus(deps);
+    const after = await panelStatus(pinnedDeps);
     if (!after.installed || !after.installedVersion) {
       throw new Error(
         `Panel ${action} reported success, but re-reading the pack afterwards could ` +
           `not confirm an installed version${after.dir ? ` at ${after.dir}` : ""}. NOT ` +
           `reporting a completed sync. Check custom_nodes and re-run ` +
-          `install_panel(action='status').`,
+          `${describeInstallPanelAction("status", "re-checking the pack on the ComfyUI host")}.`,
       );
     }
     if (after.shadows.length > 0) {
@@ -499,7 +584,7 @@ export async function performPanelSync(
           `could not be enumerated afterwards to check for shadow copies, so it cannot be ` +
           `confirmed that the browser will load THIS panel rather than a stray ` +
           `".comfyui-agent-panel.bak-*". NOT reporting a completed sync — re-run ` +
-          `install_panel(action='status') once custom_nodes is readable.`,
+          `${describeInstallPanelAction("status", "a re-check on the ComfyUI host")} once custom_nodes is readable.`,
       );
     }
 
@@ -519,6 +604,12 @@ export async function performPanelSync(
             `not. `
           : ``;
 
+    // The action checked the frozen target before IT returned, but this
+    // function then does another awaited status read and publishes its own
+    // success — which the orchestrator pushes straight into the panel chat. A
+    // retarget in that last gap would announce a verified sync of tree A to a
+    // tab that now belongs to B. Re-assert before the claim leaves here.
+    assertPinnedTarget(pinnedDeps, "sync", "before reporting a completed sync");
     return {
       synced: true,
       decision: "sync",
