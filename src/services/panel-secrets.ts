@@ -16,11 +16,17 @@
 // straight from the panel's secure input, and only the env-var KEYS are ever
 // logged (see comfyuiSecretKeys()).
 
+import dotenv from "dotenv";
 import { EventEmitter } from "node:events";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { comfyuiEnvFilePath, parseEnvFile } from "../env-file.js";
+import {
+  comfyuiEnvFilePath,
+  markFileDerived,
+  parseEnvFile,
+  MANAGED_SECRET_KEYS_ENV,
+} from "../env-file.js";
 import { logger } from "../utils/logger.js";
 import { OPENAI_KEY_PROVIDERS, providerModelHint } from "./openai-provider-registry.js";
 
@@ -198,17 +204,26 @@ export interface SecretSaveReceipt {
 }
 
 /**
- * Keys every reader resolves at ACCESS time from the canonical .env, so a value
- * saved after a process started is visible to it without a respawn:
+ * Keys whose EVERY reader resolves them at ACCESS time from the canonical .env
+ * (via env-file.ts freshSecretValue), so a value saved after a process started
+ * is visible to it with no respawn:
  *   CIVITAI_API_TOKEN / HF_TOKEN / HUGGINGFACE_TOKEN → config.ts lazy getters
  *   RUNPOD_API_KEY                                    → services/runpod-client.ts
  *   REGISTRY_ACCESS_TOKEN                             → services/node-authoring.ts
- * The remaining allowlisted keys (GEMINI_API_KEY / GOOGLE_* / RUNCOMFY_API_KEY)
- * are read only IN the orchestrator, where setEnvSecret updates process.env
- * directly — also live, but by a different mechanism, so they are listed
- * separately rather than lumped in.
+ *
+ * DELIBERATELY EXCLUDED, though they are allowlisted and do take effect in the
+ * orchestrator's own process.env immediately:
+ *   GEMINI_API_KEY / GOOGLE_* — forwarded into the Gemini CLI SUBPROCESS's spawn
+ *     env (gemini-backend buildAgentSpawnEnv keep-list), so a live CLI keeps the
+ *     old key until it is respawned (codex gate, round 1, answer A).
+ *   OPENROUTER/GLM/KIMI/… — keyed backends capture the credential at
+ *     construction (#278), so a live one keeps the old key until rebuilt.
+ *   RUNCOMFY_API_KEY — no reader resolves it lazily.
+ * For those the receipt says a respawn is needed and reports its actual
+ * disposition, rather than claiming a pickup that a running subprocess will not
+ * make. Over-claiming here is exactly the #826 defect in miniature.
  */
-const CHILD_LIVE_RELOAD_KEYS = new Set([
+const LIVE_RELOAD_KEYS = new Set([
   "CIVITAI_API_TOKEN",
   "HF_TOKEN",
   "HUGGINGFACE_TOKEN",
@@ -216,20 +231,10 @@ const CHILD_LIVE_RELOAD_KEYS = new Set([
   "REGISTRY_ACCESS_TOKEN",
 ]);
 
-/** Keys whose only reader is the orchestrator process itself — `setEnvSecret`
- *  assigns process.env there, so they take effect immediately in-process. */
-const ORCHESTRATOR_ONLY_KEYS = new Set([
-  "GEMINI_API_KEY",
-  "GOOGLE_GENERATIVE_AI_API_KEY",
-  "GOOGLE_API_KEY",
-  "RUNCOMFY_API_KEY",
-  ...AGENT_SECRET_ENV_ALLOWLIST,
-]);
-
-/** True when a saved value for `key` is picked up by its readers without any
- *  process being respawned. Presence-only; never touches a value. */
+/** True when a saved value for `key` is picked up by EVERY one of its readers
+ *  without any process being respawned. Presence-only; never touches a value. */
 export function hasLivePickup(key: string): boolean {
-  return CHILD_LIVE_RELOAD_KEYS.has(key) || ORCHESTRATOR_ONLY_KEYS.has(key);
+  return LIVE_RELOAD_KEYS.has(key);
 }
 
 // Rebase resolution: the incoming commit added the receipt/live-pickup machinery
@@ -279,20 +284,58 @@ export function envFilePath(): string {
   return comfyuiEnvFilePath();
 }
 
-/** Encode a value for a .env line — quote only when it contains characters a
- *  bare value can't hold; double-quoted + JSON-escaped is dotenv-compatible. */
-function encodeEnvValue(value: string): string {
-  return /[\s#"'\\]/.test(value) ? JSON.stringify(value) : value;
+/**
+ * Encode a value for a .env line.
+ *
+ * The previous encoder used JSON.stringify, which is NOT what dotenv decodes: a
+ * double-quoted dotenv value only expands \n and \r, so a credential containing
+ * a quote or a backslash was written JSON-escaped and read back with the escapes
+ * still in it (codex gate, round 1, finding 3). That silently stored the WRONG
+ * value. Encode in a form dotenv actually reverses:
+ *   - bare when the value needs no quoting at all;
+ *   - single-quoted (dotenv treats these literally — no escape expansion) when
+ *     the value contains no single quote and no newline;
+ *   - double-quoted with \n / \r escaped otherwise, which needs the value to
+ *     carry no double quote and no backslash (dotenv would not undo those).
+ * `encodeEnvValue` returns null when the value cannot be represented faithfully;
+ * the caller REFUSES rather than writing something that reads back different.
+ */
+function encodeEnvValue(value: string): string | null {
+  if (!/[\s#"'\\]/.test(value)) return value;
+  if (!value.includes("'") && !/[\n\r]/.test(value)) return `'${value}'`;
+  if (!value.includes('"') && !value.includes("\\")) {
+    return `"${value.replace(/\r/g, "\\r").replace(/\n/g, "\\n")}"`;
+  }
+  return null;
+}
+
+/** Build the `KEY=value` line and PROVE dotenv reads it back as the same value.
+ *  Throws (without ever including the value) when it cannot be represented — a
+ *  refusal before the write, not a corrupt store discovered afterwards. */
+function encodeEnvLine(key: string, value: string): string {
+  const encoded = encodeEnvValue(value);
+  const line = encoded === null ? null : `${key}=${encoded}`;
+  if (line === null || dotenv.parse(line)[key] !== value) {
+    throw new Error(
+      `The value supplied for "${key}" cannot be stored faithfully in ${envFilePath()} — ` +
+        `it contains a combination of quote, backslash and newline characters this dotenv store cannot round-trip. ` +
+        `Nothing was written. Set ${key} as a real environment variable instead (it takes precedence over the file), ` +
+        `or re-issue a token without those characters.`,
+    );
+  }
+  return line;
 }
 
 /** Upsert `KEY=value` into the canonical .env, 0600, preserving every other line
  *  (comments included). Replaces the first uncommented `KEY=` line, else appends. */
 function upsertEnvFile(key: string, value: string): void {
+  // Encode + verify BEFORE touching the file, so an unrepresentable value never
+  // half-lands (it would read back different and look like tampering).
+  const line = encodeEnvLine(key, value);
   const p = envFilePath();
   mkdirSync(dirname(p), { recursive: true });
   const raw = existsSync(p) ? readFileSync(p, "utf-8") : "";
   const lines = raw.length ? raw.split(/\r?\n/) : [];
-  const line = `${key}=${encodeEnvValue(value)}`;
   const re = new RegExp(`^\\s*${key}\\s*=`);
   let replaced = false;
   for (let i = 0; i < lines.length; i++) {
@@ -360,8 +403,13 @@ export function setEnvSecret(
       `Env var "${trimmed}" is not an accepted secret. Allowed: ${[...new Set([...COMFYUI_SECRET_ENV_ALLOWLIST, ...AGENT_SECRET_ENV_ALLOWLIST])].join(", ")}.`,
     );
   }
+  const previous = process.env[trimmed];
   upsertEnvFile(trimmed, value);
   process.env[trimmed] = value; // live in-process effect (env wins over the file)
+  // The canonical file is now this key's AUTHORITY even though we just assigned
+  // process.env, so a later re-read (a rotate by another process, a revoke) wins
+  // over this in-memory copy instead of being pinned by it.
+  markFileDerived(trimmed);
   // VERIFY the write by reading the canonical file back. Reporting "saved" from
   // the mere absence of a throw is how a caller ends up believing it is
   // configured while nothing downstream can see the value (#826). The comparison
@@ -370,6 +418,23 @@ export function setEnvSecret(
   const readBack = parseEnvFile();
   const persisted: SecretSaveReceipt["persisted"] =
     readBack === null ? "unknown" : readBack[trimmed] === value ? "yes" : "no";
+  if (persisted === "no") {
+    // The durable store demonstrably does not carry this value. ROLL BACK the
+    // in-process assignment and emit NOTHING, so the system is left exactly as it
+    // was and the caller's "nothing is configured" is TRUE (codex gate, round 1,
+    // finding 2: without this, the value was live in the orchestrator's env — and
+    // would be injected into the next child — while the tool reported failure,
+    // the opposite false verdict).
+    if (previous === undefined) delete process.env[trimmed];
+    else process.env[trimmed] = previous;
+    return {
+      key: trimmed,
+      path: envFilePath(),
+      persisted,
+      livePickup: hasLivePickup(trimmed),
+      respawn: null,
+    };
+  }
   // Only a COMFYUI tool secret should restart the comfyui MCP child + inject the
   // "retry the download that needed this token" nudge (#269): saving an
   // agent-ONLY provider key (OPENROUTER/GLM/KIMI…) previously restarted every
@@ -626,6 +691,15 @@ export function removeAgentSecret(key: string): boolean {
  * (Claude in-process + Codex stdio) use, so a saved secret reaches either.
  */
 export function buildComfyuiMcpEnv(base: Record<string, string>): Record<string, string> {
+  const secrets = loadComfyuiSecretEnv();
+  // Which of the injected credentials does the canonical FILE own? Those must be
+  // marked so the child treats its inherited copy as file-derived and a later
+  // rotate/revoke supersedes it (codex gate, round 1, finding 1). A key the file
+  // does NOT carry the same value for came from a real environment variable —
+  // the shell escape hatch — and the child must keep pinning it. Determined by
+  // comparing against the file rather than by bookkeeping, so it cannot drift.
+  const file = parseEnvFile();
+  const managed = file ? Object.keys(secrets).filter((k) => file[k] === secrets[k]) : [];
   return {
     ...base,
     // PIN the canonical dotenv path into the child (#826). The child resolves
@@ -637,7 +711,9 @@ export function buildComfyuiMcpEnv(base: Record<string, string>): Record<string,
     ...(process.env.COMFYUI_MCP_ENV_FILE
       ? { COMFYUI_MCP_ENV_FILE: process.env.COMFYUI_MCP_ENV_FILE }
       : {}),
-    ...loadComfyuiSecretEnv(),
+    // KEY NAMES only — never values.
+    ...(managed.length ? { [MANAGED_SECRET_KEYS_ENV]: managed.join(",") } : {}),
+    ...secrets,
   };
 }
 

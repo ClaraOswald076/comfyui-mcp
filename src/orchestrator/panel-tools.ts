@@ -205,7 +205,8 @@ function fail(err: unknown): ToolResult {
 export function secretNotPersisted(receipt: SecretSaveReceipt): Error {
   return new Error(
     `"${receipt.key}" was NOT saved: writing ${receipt.path} appeared to succeed, but reading the file back does not show that key with the value just supplied. ` +
-      `Nothing is configured — do not retry the action that needed it. Check that ${receipt.path} is writable and not managed by another process, then set the key again (panel Settings › credentials, or the env var directly).`,
+      `The value was rolled back rather than left half-applied, so nothing is configured — do not retry the action that needed it. ` +
+      `Check that ${receipt.path} is writable and not being rewritten by another process, then set the key again (panel Settings › credentials, or the env var directly, which takes precedence over the file).`,
   );
 }
 

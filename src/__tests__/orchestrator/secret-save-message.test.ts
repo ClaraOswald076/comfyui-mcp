@@ -112,9 +112,14 @@ describe("secretNotPersisted: refuses, and says do NOT retry (#826)", () => {
     expect(err).toBeInstanceOf(Error);
   });
 
-  it("states plainly that nothing is configured", () => {
+  it("states plainly that nothing is configured, AND that the value was rolled back", () => {
+    // The in-process assignment is undone before this error is raised, so
+    // "nothing is configured" is a fact rather than a half-truth — without the
+    // rollback the value would still be live in the orchestrator's env (and
+    // injected into the next child) while the tool reported failure.
     expect(err.message).toContain("was NOT saved");
-    expect(err.message).toContain("Nothing is configured");
+    expect(err.message).toContain("rolled back rather than left half-applied");
+    expect(err.message).toContain("nothing is configured");
   });
 
   it("tells the caller NOT to retry the blocked action — the loop #826 reported", () => {

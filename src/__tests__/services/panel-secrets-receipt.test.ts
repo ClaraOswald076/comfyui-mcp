@@ -49,6 +49,7 @@ import {
   AGENT_SECRET_ENV_ALLOWLIST,
   type SecretRespawnReport,
 } from "../../services/panel-secrets.js";
+import { MANAGED_SECRET_KEYS_ENV } from "../../env-file.js";
 
 const ALL_KEYS = [...new Set([...COMFYUI_SECRET_ENV_ALLOWLIST, ...AGENT_SECRET_ENV_ALLOWLIST])];
 
@@ -107,6 +108,79 @@ describe("secret save receipt: persistence is VERIFIED, not assumed (#826)", () 
     // either verdict, in either direction.
     store.mode = "unreadable";
     expect(setComfyuiSecret("CIVITAI_API_TOKEN", "civ-abc").persisted).toBe("unknown");
+  });
+
+  it("ROLLS BACK process.env on persisted:'no', so 'nothing is configured' is true", () => {
+    // Without the rollback the value stayed live in the orchestrator's env — and
+    // would be injected into the next child's spawn env — while the tool
+    // reported failure and told the caller not to retry: the opposite false
+    // verdict to #826, and just as misleading.
+    expect(process.env.CIVITAI_API_TOKEN).toBeUndefined();
+    store.mode = "drop";
+    expect(setComfyuiSecret("CIVITAI_API_TOKEN", "civ-abc").persisted).toBe("no");
+    expect(process.env.CIVITAI_API_TOKEN).toBeUndefined();
+    expect(buildComfyuiMcpEnv({}).CIVITAI_API_TOKEN).toBeUndefined();
+  });
+
+  it("restores the PREVIOUS value on persisted:'no' rather than clearing a working one", () => {
+    store.mode = "real";
+    setComfyuiSecret("CIVITAI_API_TOKEN", "civ-working");
+    expect(process.env.CIVITAI_API_TOKEN).toBe("civ-working");
+    store.mode = "drop";
+    expect(setComfyuiSecret("CIVITAI_API_TOKEN", "civ-broken").persisted).toBe("no");
+    expect(process.env.CIVITAI_API_TOKEN).toBe("civ-working");
+  });
+
+  it("emits NO change event on persisted:'no' — a failed save must set nothing in motion", () => {
+    const cb = vi.fn();
+    const off = onComfyuiSecretsChanged(cb);
+    try {
+      store.mode = "drop";
+      const r = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-abc", { requested: true });
+      expect(r.persisted).toBe("no");
+      expect(r.respawn).toBeNull();
+      expect(cb).not.toHaveBeenCalled();
+    } finally {
+      off();
+    }
+  });
+});
+
+describe("secret values must survive the dotenv round trip, or be refused (#826 gate)", () => {
+  it("stores a value containing spaces and reads it back identically", () => {
+    const r = setComfyuiSecret("CIVITAI_API_TOKEN", "a token with spaces");
+    expect(r.persisted).toBe("yes");
+    expect(process.env.CIVITAI_API_TOKEN).toBe("a token with spaces");
+  });
+
+  it("stores a value containing a hash, a quote or a backslash without corrupting it", () => {
+    for (const v of ['tok#1', 'tok"quoted', "tok\\back\\slash", "tok'single"]) {
+      const r = setComfyuiSecret("CIVITAI_API_TOKEN", v);
+      expect(r.persisted).toBe("yes");
+      expect(process.env.CIVITAI_API_TOKEN).toBe(v);
+    }
+  });
+
+  it("REFUSES a value it cannot represent, rather than writing something different", () => {
+    // A value carrying both quote flavours plus a backslash has no faithful
+    // dotenv encoding. Storing a mangled copy would be the worst outcome: the
+    // save reports success and every request authenticates with the wrong token.
+    expect(() => setComfyuiSecret("CIVITAI_API_TOKEN", `a'b"c\\d`)).toThrow(
+      /cannot be stored faithfully/,
+    );
+    // ...and it says how to proceed from here.
+    expect(() => setComfyuiSecret("CIVITAI_API_TOKEN", `a'b"c\\d`)).toThrow(
+      /real environment variable/,
+    );
+  });
+
+  it("never includes the value in the refusal", () => {
+    try {
+      setComfyuiSecret("CIVITAI_API_TOKEN", `secret'value"with\\everything`);
+      throw new Error("expected a refusal");
+    } catch (err) {
+      expect((err as Error).message).not.toContain("secret");
+    }
   });
 });
 
@@ -195,12 +269,18 @@ describe("secret save receipt: livePickup describes the ACTUAL read path", () =>
     expect(setComfyuiSecret("CIVITAI_API_TOKEN", "civ-abc").livePickup).toBe(true);
   });
 
-  it("marks orchestrator-read provider keys as live (setEnvSecret assigns process.env in-process)", () => {
-    expect(hasLivePickup("OPENROUTER_API_KEY")).toBe(true);
-    expect(hasLivePickup("GEMINI_API_KEY")).toBe(true);
+  it("does NOT claim live pickup for keys a running SUBPROCESS still holds", () => {
+    // GEMINI_API_KEY / GOOGLE_* are forwarded into the Gemini CLI subprocess's
+    // spawn env, and OPENROUTER/GLM-style keys are captured by keyed backends at
+    // construction (#278). Both keep the OLD value until respawned, so claiming
+    // a live pickup for them would be the #826 defect in miniature.
+    expect(hasLivePickup("GEMINI_API_KEY")).toBe(false);
+    expect(hasLivePickup("GOOGLE_API_KEY")).toBe(false);
+    expect(hasLivePickup("OPENROUTER_API_KEY")).toBe(false);
   });
 
   it("does NOT claim live pickup for a key nothing is known to re-read", () => {
+    expect(hasLivePickup("RUNCOMFY_API_KEY")).toBe(false);
     expect(hasLivePickup("SOME_UNRELATED_KEY")).toBe(false);
   });
 });
@@ -221,5 +301,31 @@ describe("buildComfyuiMcpEnv pins the credential file into the child (#826)", ()
     setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new");
     const env = buildComfyuiMcpEnv({ CIVITAI_API_TOKEN: "civ-base", COMFYUI_URL: "http://x" });
     expect(env.CIVITAI_API_TOKEN).toBe("civ-new");
+  });
+
+  it("marks an injected credential the FILE owns, so a later rotate supersedes it in the child", () => {
+    // Without the marker the child sees the injected copy as a real environment
+    // variable and pins it for its whole life — a rotate or revoke is ignored
+    // while the save reports that the running tools re-read the file.
+    setComfyuiSecret("CIVITAI_API_TOKEN", "civ-managed");
+    const env = buildComfyuiMcpEnv({ COMFYUI_URL: "http://x" });
+    expect(env[MANAGED_SECRET_KEYS_ENV]?.split(",")).toContain("CIVITAI_API_TOKEN");
+    // KEY NAMES only — the marker must never carry a value.
+    expect(env[MANAGED_SECRET_KEYS_ENV]).not.toContain("civ-managed");
+  });
+
+  it("does NOT mark a shell-only credential, so the child keeps the escape hatch pinned", () => {
+    // The file does not carry this value, so the canonical store is not its
+    // authority — marking it would let an unrelated file entry override the
+    // user's explicit environment variable.
+    process.env.HF_TOKEN = "hf-from-shell";
+    const env = buildComfyuiMcpEnv({ COMFYUI_URL: "http://x" });
+    expect(env.HF_TOKEN).toBe("hf-from-shell");
+    expect(env[MANAGED_SECRET_KEYS_ENV]?.split(",") ?? []).not.toContain("HF_TOKEN");
+  });
+
+  it("omits the marker entirely when no credential is file-owned", () => {
+    const env = buildComfyuiMcpEnv({ COMFYUI_URL: "http://x" });
+    expect(MANAGED_SECRET_KEYS_ENV in env).toBe(false);
   });
 });

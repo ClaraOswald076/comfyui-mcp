@@ -18,12 +18,14 @@ import {
   comfyuiEnvFilePath,
   freshSecretValue,
   loadEnvFileIntoProcess,
+  markFileDerived,
   parseEnvFile,
   resetEnvFileProvenanceForTests,
   secretKeyPresent,
+  MANAGED_SECRET_KEYS_ENV,
 } from "../env-file.js";
 
-const KEYS = ["CIVITAI_API_TOKEN", "HF_TOKEN", "HUGGINGFACE_TOKEN"];
+const KEYS = ["CIVITAI_API_TOKEN", "HF_TOKEN", "HUGGINGFACE_TOKEN", MANAGED_SECRET_KEYS_ENV];
 
 let dir: string;
 let envPath: string;
@@ -133,6 +135,51 @@ describe("env-file: freshSecretValue resolves at ACCESS time (#826)", () => {
   it("ignores a blank value (a key present but empty is not a credential)", () => {
     writeEnv("CIVITAI_API_TOKEN=\n");
     expect(freshSecretValue("CIVITAI_API_TOKEN")).toBeUndefined();
+  });
+
+  it("lets the file supersede a credential INHERITED from the parent when it is marked managed", () => {
+    // The orchestrator injects current credential values into the child's spawn
+    // env, so the child sees them as real environment variables and would pin
+    // them for its whole life — a rotate or revoke ignored forever, while the
+    // save reports that the running tools re-read the file. The marker (KEY
+    // NAMES only) tells the child the file is their authority.
+    process.env.CIVITAI_API_TOKEN = "inherited-at-spawn";
+    process.env[MANAGED_SECRET_KEYS_ENV] = "CIVITAI_API_TOKEN";
+    writeEnv("CIVITAI_API_TOKEN=inherited-at-spawn\n");
+    loadEnvFileIntoProcess();
+    expect(freshSecretValue("CIVITAI_API_TOKEN")).toBe("inherited-at-spawn");
+
+    writeEnv("CIVITAI_API_TOKEN=rotated-later\n");
+    expect(freshSecretValue("CIVITAI_API_TOKEN")).toBe("rotated-later");
+
+    writeEnv("# revoked\n");
+    expect(freshSecretValue("CIVITAI_API_TOKEN")).toBeUndefined();
+  });
+
+  it("keeps pinning an inherited credential that was NOT marked managed", () => {
+    // An unmarked inherited value came from a real environment variable (the
+    // shell escape hatch); an unrelated file entry must not override it.
+    process.env.HF_TOKEN = "inherited-from-shell";
+    writeEnv("HF_TOKEN=file-value\n");
+    loadEnvFileIntoProcess();
+    expect(freshSecretValue("HF_TOKEN")).toBe("inherited-from-shell");
+  });
+
+  it("markFileDerived makes the file authoritative for a key assigned in-process", () => {
+    process.env.CIVITAI_API_TOKEN = "just-assigned";
+    writeEnv("CIVITAI_API_TOKEN=just-assigned\n");
+    expect(freshSecretValue("CIVITAI_API_TOKEN")).toBe("just-assigned");
+    markFileDerived("CIVITAI_API_TOKEN");
+    writeEnv("CIVITAI_API_TOKEN=rotated-by-another-process\n");
+    expect(freshSecretValue("CIVITAI_API_TOKEN")).toBe("rotated-by-another-process");
+  });
+
+  it("ignores a blank/whitespace marker list without marking a phantom key", () => {
+    process.env[MANAGED_SECRET_KEYS_ENV] = " , ,";
+    process.env.CIVITAI_API_TOKEN = "from-shell";
+    writeEnv("CIVITAI_API_TOKEN=from-file\n");
+    loadEnvFileIntoProcess();
+    expect(freshSecretValue("CIVITAI_API_TOKEN")).toBe("from-shell");
   });
 
   it("never throws on a corrupt file — an unparseable store means 'no credential', not a crash", () => {

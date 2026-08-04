@@ -30,6 +30,22 @@ import { join } from "node:path";
  */
 const fileDerivedKeys = new Set<string>();
 
+/**
+ * Env var (KEY NAMES ONLY — never values) by which a parent process tells a child
+ * "these keys are in your spawn env, but the canonical .env is their AUTHORITY".
+ *
+ * The orchestrator injects current credential values into the comfyui child's
+ * spawn env (buildComfyuiMcpEnv) so the credential arrives even if the child
+ * cannot read the file. Without this marker the child would see those as REAL
+ * environment variables and pin them forever — so a rotate or a revoke would be
+ * ignored for the life of the child while the save reported that the running
+ * tools re-read the file (codex gate, round 1, finding 1: the remaining #826
+ * false-success path). Marking them file-derived makes a later re-read
+ * supersede the inherited copy, while `freshSecretValue`'s last fallback still
+ * uses that copy when the file is unreadable.
+ */
+export const MANAGED_SECRET_KEYS_ENV = "COMFYUI_MCP_MANAGED_SECRET_KEYS";
+
 /** Path to the canonical dotenv. `COMFYUI_MCP_ENV_FILE` overrides it (tests, and
  *  unusual installs) — resolved here ONCE so the writer and every reader, in the
  *  orchestrator and in the spawned child alike, can never disagree about which
@@ -62,6 +78,13 @@ export function parseEnvFile(): Record<string, string> | null {
  * config.ts calls this instead of dotenv.config() so the provenance is recorded.
  */
 export function loadEnvFileIntoProcess(): string[] {
+  // A parent that injected credential values into our spawn env tells us here
+  // which of them the canonical file OWNS, so a later rotate/revoke supersedes
+  // the inherited copy instead of being pinned for this process's whole life.
+  for (const k of (process.env[MANAGED_SECRET_KEYS_ENV] ?? "").split(",")) {
+    const key = k.trim();
+    if (key) fileDerivedKeys.add(key);
+  }
   const parsed = parseEnvFile();
   if (!parsed) return [];
   const applied: string[] = [];
@@ -79,6 +102,14 @@ export function loadEnvFileIntoProcess(): string[] {
  *  (so a file re-read supersedes it) rather than from a real env var. */
 export function isFileDerived(key: string): boolean {
   return fileDerivedKeys.has(key);
+}
+
+/** Record that the canonical file is now this key's AUTHORITY, even though its
+ *  current process.env value was assigned in-process. Called by the secret
+ *  writer: after a save, the file is where the value lives, so a later re-read
+ *  (a rotate by another process, a revoke) must supersede the in-memory copy. */
+export function markFileDerived(key: string): void {
+  fileDerivedKeys.add(key);
 }
 
 /** Test-only: forget the boot provenance so a suite can re-simulate startup. */

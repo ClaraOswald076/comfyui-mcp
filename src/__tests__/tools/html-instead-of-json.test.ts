@@ -65,7 +65,9 @@ describe("list_workflow_templates on an HTML-answering remote (#828)", () => {
     expect(text).not.toMatch(/Unexpected token/);
     expect(text).toContain("http://remote.example:8188/api/workflow_templates");
     expect(text).toContain("HTML page");
-    expect(text).toContain("index.html");
+    // This fixture carries ComfyUI's own frontend markers, so naming the
+    // frontend is warranted rather than speculative.
+    expect(text).toContain("ComfyUI web FRONTEND answered");
   });
 
   it("does not blame the ComfyUI VERSION when a non-2xx is actually a proxy page", async () => {
@@ -78,7 +80,7 @@ describe("list_workflow_templates on an HTML-answering remote (#828)", () => {
     expect(text).toContain("502");
   });
 
-  it("keeps the version hint when the server DOES answer with a JSON error", async () => {
+  it("shows the JSON error body verbatim so the caller can tell ComfyUI from a gateway", async () => {
     global.fetch = vi.fn(
       async () =>
         new Response('{"error":"unknown route"}', {
@@ -88,7 +90,12 @@ describe("list_workflow_templates on an HTML-answering remote (#828)", () => {
     ) as unknown as typeof fetch;
     const out = await getHandler("list_workflow_templates")({});
     expect(out.isError).toBe(true);
-    expect(out.content[0].text).toContain("recent enough to expose workflow templates");
+    const text = out.content[0].text;
+    expect(text).toContain('{"error":"unknown route"}');
+    // Both readings are offered; neither is asserted, because a 404 JSON body
+    // alone does not say whether ComfyUI or something in front of it answered.
+    expect(text).toContain("may predate the workflow-templates endpoint");
+    expect(text).toContain("never reached ComfyUI");
   });
 
   it("still returns the index on a healthy JSON 200", async () => {
