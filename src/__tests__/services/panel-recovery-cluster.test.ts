@@ -789,90 +789,134 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
   });
 
-  it("an INTERRUPTED swap is repaired on the next operation — never leaves the user with no panel", async () => {
-    // Replacing a directory takes two renames and cannot be made atomic, so a
-    // crash between them leaves custom_nodes empty and the working copy in
-    // custom_nodes_backup. The journal written before the first rename is what
-    // makes that recoverable.
-    const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1`);
-    writePanelPack(backupDir, "0.11.34");
-    expect(existsSync(PANEL_DIR())).toBe(false); // mid-swap: no panel served
-    writeFileSync(
-      join(root, ".comfyui-agent-panel.swap.json"),
-      JSON.stringify({
-        dir: PANEL_DIR(),
-        backupDir,
-        staging: join(root, ".comfyui-agent-panel.staging-dead"),
-        startedAt: Date.now(),
-        previousVersion: "0.11.34",
-      }),
+  // ── Interrupted swaps ──────────────────────────────────────────────────────
+  //
+  // Replacing a directory needs more than one rename, so there is no atomic
+  // version. The ordering therefore guarantees the next best thing: at every
+  // interruptible point SOME panel directory is present in custom_nodes, and the
+  // recovery state is derivable from the filesystem alone — the incoming
+  // directory existing IS the evidence. No journal is required for it, which
+  // matters because a journal's directory entry is not made durable by fsync'ing
+  // the journal's contents.
+
+  const INCOMING = () => join(root, "custom_nodes", ".comfyui-agent-panel.incoming");
+
+  /** Is ANY panel-serving directory present in custom_nodes right now? */
+  function aPanelIsReachable(): boolean {
+    return readdirSync(join(root, "custom_nodes")).some((name) =>
+      existsSync(join(root, "custom_nodes", name, "web", "js", "comfyui-mcp-panel.js")),
     );
+  }
 
+  it("P0: interruption between the renames still leaves a panel reachable, and it is recovered", async () => {
+    // Drive a REAL swap and kill it at the worst moment — after the old panel
+    // has been moved aside and before the new one is under its proper name.
+    writePanelPack(PANEL_DIR(), "0.11.34");
     const h = makeDeps({ cloneVersion: "0.11.38", updateThrows: "manager cannot resolve it" });
-    const result = await runPanelActionInner("update", h.deps);
+    const realRename = h.deps.rename!;
+    let renames = 0;
+    // A POWER LOSS DOES NO CLEANUP. So once we reach the third rename (incoming
+    // -> canonical) every further filesystem operation fails, including the
+    // inline rollback the process would normally perform — leaving exactly the
+    // on-disk state a crash would leave behind, not a tidied-up one.
+    h.deps.rename = (from, to) => {
+      // 1st: staging -> incoming. 2nd: canonical -> backup. 3rd: the crash.
+      if (++renames >= 3) throw new Error("SIMULATED CRASH between renames");
+      realRename(from, to);
+    };
+    h.deps.removeDir = () => {
+      throw new Error("SIMULATED CRASH — no cleanup runs");
+    };
+    const err = await runPanelActionInner("update", h.deps).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
 
-    // The working copy was put back first, then the update proceeded normally.
-    expect(result.previousVersion).toBe("0.11.34");
-    expect(result.installedVersion).toBe("0.11.38");
+    // The canonical name is empty at this instant — this IS the window the old
+    // ordering made fatal.
+    expect(existsSync(PANEL_DIR())).toBe(false);
+    expect(existsSync(INCOMING())).toBe(true);
+
+    // THE POINT: custom_nodes is NOT empty of panels. ComfyUI serves every
+    // directory under it, including dot-prefixed ones, so the user still has a
+    // working panel even though it is not yet under its canonical name.
+    expect(aPanelIsReachable()).toBe(true);
+
+    // And recovery does not depend on the journal surviving: delete it, and the
+    // filesystem state alone is still enough.
+    rmSync(join(root, ".comfyui-agent-panel.swap.json"), { force: true });
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
+    expect(note).toMatch(/moved into place/);
     expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.38");
-    // The spent journal is gone.
-    expect(existsSync(join(root, ".comfyui-agent-panel.swap.json"))).toBe(false);
+    expect(existsSync(INCOMING())).toBe(false);
   });
 
-  it("repairs an interrupted swap from a plain STATUS read — the panel comes back without a mutation", async () => {
-    // The crash-between-renames state leaves custom_nodes with NO panel. Asking
-    // "what's going on?" is exactly when a user hits it, and requiring them to
-    // know to run a MUTATION to get their panel back is not a recovery path.
+  it("interruption BEFORE the old panel moved aside is undone, keeping the working panel", async () => {
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    writePanelPack(INCOMING(), "0.11.38"); // staged, but the swap never went on
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
+    expect(note).toMatch(/discarded/);
+    // The conservative outcome: the known-good panel stays, the unverified
+    // half-swap is dropped, and no shadow is left behind.
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
+    expect(existsSync(INCOMING())).toBe(false);
+  });
+
+  it("a STALE journal with no in-flight swap NEVER resurrects a deliberately removed panel", async () => {
+    // A swap that COMPLETED and died before deleting its journal, after which
+    // the user uninstalled the panel on purpose. "There is a journal" only ever
+    // meant "a journal exists" — it must not be read as "a swap is half-done".
     const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1`);
     writePanelPack(backupDir, "0.11.34");
     writeFileSync(
       join(root, ".comfyui-agent-panel.swap.json"),
-      JSON.stringify({
-        dir: PANEL_DIR(),
-        backupDir,
-        staging: "x",
-        startedAt: Date.now(),
-        previousVersion: "0.11.34",
-      }),
+      JSON.stringify({ dir: PANEL_DIR(), backupDir, staging: "x", startedAt: Date.now() }),
     );
-    expect(existsSync(PANEL_DIR())).toBe(false); // no panel served
-
     const { repairInterruptedPanelSwap } = await import(
       "../../services/panel-installer.js"
     );
     const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
 
-    expect(note).toMatch(/RESTORED/);
-    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
-    expect(existsSync(join(root, ".comfyui-agent-panel.swap.json"))).toBe(false);
+    expect(note).toMatch(/may be left over from a swap that COMPLETED/);
+    expect(note).toMatch(/nothing has been moved/);
+    // The uninstall stands.
+    expect(existsSync(PANEL_DIR())).toBe(false);
+    expect(existsSync(backupDir)).toBe(true);
   });
 
-  it("a PIN blocks the status-path repair too — a restore is still a mutation", async () => {
+  it("a completed swap's spent journal is simply cleared when the panel IS present", async () => {
+    writePanelPack(PANEL_DIR(), "0.11.38");
     const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1`);
     writePanelPack(backupDir, "0.11.34");
     writeFileSync(
       join(root, ".comfyui-agent-panel.swap.json"),
       JSON.stringify({ dir: PANEL_DIR(), backupDir, staging: "x", startedAt: Date.now() }),
     );
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    expect(await repairInterruptedPanelSwap(makeDeps({}).deps)).toBeUndefined();
+    expect(existsSync(join(root, ".comfyui-agent-panel.swap.json"))).toBe(false);
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.38");
+  });
+
+  it("a PIN blocks the status-path repair too — a restore is still a mutation", async () => {
+    writePanelPack(INCOMING(), "0.11.38");
     const h = makeDeps({});
     h.deps.readPin = () => ({ pinned: true, source: "settings" as const, version: "0.11.34" });
     const { repairInterruptedPanelSwap } = await import(
       "../../services/panel-installer.js"
     );
-    // The repair is refused (it swallows and reports nothing) and NOTHING moved.
     expect(await repairInterruptedPanelSwap(h.deps)).toBeUndefined();
-    expect(existsSync(PANEL_DIR())).toBe(false);
-    expect(existsSync(backupDir)).toBe(true);
-    expect(existsSync(join(root, ".comfyui-agent-panel.swap.json"))).toBe(true);
+    expect(existsSync(INCOMING())).toBe(true); // untouched
   });
 
-  it("a retarget aborts the status-path repair rather than restoring the wrong tree", async () => {
-    const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1`);
-    writePanelPack(backupDir, "0.11.34");
-    writeFileSync(
-      join(root, ".comfyui-agent-panel.swap.json"),
-      JSON.stringify({ dir: PANEL_DIR(), backupDir, staging: "x", startedAt: Date.now() }),
-    );
+  it("a retarget aborts the status-path repair rather than acting on the wrong tree", async () => {
+    writePanelPack(INCOMING(), "0.11.38");
     const h = makeDeps({});
     const pinned = await pinPanelBase(h.deps);
     generation.value++; // a retarget landed after the freeze
@@ -880,73 +924,59 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
       "../../services/panel-installer.js"
     );
     expect(await repairInterruptedPanelSwap(pinned)).toBeUndefined();
-    expect(existsSync(PANEL_DIR())).toBe(false);
+    expect(existsSync(INCOMING())).toBe(true);
   });
 
-  it("the on-load auto-install repairs an interrupted swap before doing anything else", async () => {
-    const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1`);
-    writePanelPack(backupDir, "0.11.34");
-    writeFileSync(
-      join(root, ".comfyui-agent-panel.swap.json"),
-      JSON.stringify({ dir: PANEL_DIR(), backupDir, staging: "x", startedAt: Date.now() }),
-    );
+  it("the on-load auto-install finishes an interrupted swap before doing anything else", async () => {
+    writePanelPack(INCOMING(), "0.11.38"); // canonical absent: the second half
     const { ensurePanelInstalled } = await import("../../services/panel-installer.js");
     const result = await ensurePanelInstalled({ deps: makeDeps({}).deps });
-    // The panel is back, and the ensure did NOT install a second copy over it.
-    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
-    expect(result.action).not.toBe("installed");
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.38");
+    expect(result.action).not.toBe("installed"); // it did not install a second copy
   });
 
   it("a bare panelStatus still only REPORTS — it holds no lock, so it must not move directories", async () => {
-    const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1`);
-    writePanelPack(backupDir, "0.11.34");
-    writeFileSync(
-      join(root, ".comfyui-agent-panel.swap.json"),
-      JSON.stringify({ dir: PANEL_DIR(), backupDir, staging: "x", startedAt: Date.now() }),
-    );
+    writePanelPack(INCOMING(), "0.11.38");
     const { panelStatus } = await import("../../services/panel-installer.js");
     const status = await panelStatus(makeDeps({ withoutSwapOps: true }).deps);
     expect(status.note).toMatch(/interrupted/i);
-    expect(status.note).toContain(backupDir);
-    // Untouched — repairing from an unlocked read could cut across another
-    // process's in-flight swap.
-    expect(existsSync(PANEL_DIR())).toBe(false);
-    expect(existsSync(join(root, ".comfyui-agent-panel.swap.json"))).toBe(true);
+    expect(existsSync(INCOMING())).toBe(true);
   });
 
-  it("REFUSES every mutation when an interrupted swap could NOT be repaired", async () => {
-    // Otherwise an install would drop a fresh panel into the empty canonical
-    // path, report success, and leave the user's real one stranded — after
-    // which the next reconcile, seeing a directory there, deletes the journal
-    // that recorded where it went.
-    writeFileSync(
-      join(root, ".comfyui-agent-panel.swap.json"),
-      JSON.stringify({
-        dir: PANEL_DIR(),
-        backupDir: join(root, "custom_nodes_backup", "gone"), // not there
-        staging: "x",
-        startedAt: Date.now(),
-      }),
-    );
-    const h = makeDeps({ cloneVersion: "0.11.38" });
+  it("a mutation REPORTS the repair it performed, not just the work it was asked to do", async () => {
+    // Restoring somebody's panel is a material event; "update succeeded" alone
+    // would hide it.
+    writePanelPack(INCOMING(), "0.11.30"); // an interrupted swap to finish first
+    const h = makeDeps({ cloneVersion: "0.11.38", updateThrows: "manager cannot resolve it" });
+    const result = await runPanelActionInner("update", h.deps);
+    expect(result.recoveryNote).toMatch(/interrupted/i);
+    expect(result.message).toContain(result.recoveryNote!);
+    expect(result.installedVersion).toBe("0.11.38");
+  });
+
+  it("REFUSES every mutation when an interrupted swap could NOT be reconciled", async () => {
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    writePanelPack(INCOMING(), "0.11.38");
+    const h = makeDeps({ cloneVersion: "0.11.40" });
+    h.deps.removeDir = () => {
+      throw new Error("EACCES: cannot clear the staged copy");
+    };
     const err = await runPanelActionInner("install", h.deps).catch((e: Error) => e);
     expect(err).toBeInstanceOf(PanelInstallError);
     expect((err as Error).message).toMatch(/REFUSED/);
     expect((err as Error).message).toMatch(/interrupted/i);
-    expect(existsSync(PANEL_DIR())).toBe(false);
   });
 
-  it("REFUSES the swap when the recovery journal cannot be written", async () => {
+  it("REFUSES the swap when the recovery record cannot be written", async () => {
     writePanelPack(PANEL_DIR(), "0.11.34");
     const h = makeDeps({ cloneVersion: "0.11.38", updateThrows: "manager cannot resolve it" });
     h.deps.writeFile = () => {
       throw new Error("EACCES: read-only filesystem");
     };
     const err = await runPanelActionInner("update", h.deps).catch((e: Error) => e);
-    expect((err as Error).message).toMatch(/recovery journal/);
-    // An unrecoverable swap is worse than no swap: nothing moved.
+    expect((err as Error).message).toMatch(/could not record where the previous panel/);
     expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
-    expect(existsSync(join(root, "custom_nodes_backup", PANEL_REGISTRY_ID))).toBe(false);
+    expect(existsSync(INCOMING())).toBe(false);
   });
 
   it("REFUSES while the panel is version-pinned — a pin is a promise", async () => {

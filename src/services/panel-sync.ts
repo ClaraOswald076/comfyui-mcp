@@ -534,6 +534,13 @@ export async function performPanelSync(
     });
 
     if (assessment.decision !== "sync") {
+      // EVERY return path, not just the one that mutated. This verdict was
+      // computed from a status read of the FROZEN tree, and a retarget can land
+      // while that read is awaited — handing target A's "already meets what this
+      // orchestrator needs" to a tab that now belongs to B, which may be far
+      // behind. A non-mutating answer about the wrong install is still a wrong
+      // answer, and this one gets pushed straight into the panel chat.
+      assertPinnedTarget(pinnedDeps, "sync", `before reporting "${assessment.decision}"`);
       return {
         synced: false,
         decision: assessment.decision,
