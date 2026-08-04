@@ -2107,6 +2107,33 @@ export function classifyPanelUpdate(
   return { ...base, outcome: "unverified" };
 }
 
+/*
+ * REFUSE vs DISCLOSE — they are not two severities of the same thing, and
+ * picking the wrong one is its own defect. The distinction is WHETHER THE
+ * ACTION HAS ALREADY HAPPENED:
+ *
+ *   REFUSE   when the action has NOT yet happened and proceeding without
+ *            certainty would be unsafe. A refusal PREVENTS something. Every
+ *            pre-mutation guard in this file is of this kind: unproven absence,
+ *            an uncorroborated tree, an unverifiable staged copy, a pin.
+ *
+ *   DISCLOSE when the action is ALREADY COMPLETE and only its CHARACTERISATION
+ *            is uncertain. There is nothing left to prevent; the only remaining
+ *            duty is to describe honestly.
+ *
+ * Reporting a failure for work that succeeded is a fabrication too — the mirror
+ * image of the fabricated-success bug this file exists to prevent, and here the
+ * worse of the two: an error invites the user to RE-RUN a destructive swap in
+ * order to fix something that already worked, turning an honest uncertainty into
+ * an actual risk.
+ *
+ * That is why `moved-unknown-direction` below returns rather than throws. The
+ * bytes are on disk; what was wrong was never the reporting, it was the
+ * unqualified claim "Panel updated". And note the sync layer already expresses
+ * this state correctly one level up (`stillBehind: null` + "could NOT be
+ * confirmed") — replacing a working could-not-determine with a false definite
+ * is a regression whichever definite you pick.
+ */
 /** Turn an update verdict into an honest result — or throw when it did not apply. */
 function finalizeUpdate(
   verdict: UpdateVerdict,
