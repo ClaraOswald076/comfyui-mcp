@@ -158,6 +158,24 @@ describe("searchNodes exact-id fallback (#773)", () => {
     expect(results).toEqual([]);
   });
 
+  it("a non-404 fallback failure is REFUSED — 'no matches' was never established", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (/\/nodes\/[^?]+$/.test(url)) {
+        return new Response("boom", { status: 500 });
+      }
+      return new Response(JSON.stringify({ nodes: NODES }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    await expect(searchNodes("definitely not a pack")).rejects.toThrow(
+      /could not be resolved/,
+    );
+  });
+
   it("does NOT call the fallback when the search itself matched", async () => {
     const fetchMock = vi.fn(async () =>
       new Response(JSON.stringify({ nodes: NODES }), {

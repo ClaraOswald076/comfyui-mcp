@@ -1729,6 +1729,12 @@ export async function resolvePackPresence(
   id: string,
   base: string,
 ): Promise<PackPresence> {
+  // Capture the disk context BEFORE the first await: `base` is pinned by the
+  // caller, and the disk root must describe the SAME target. Reading the
+  // mutable global mode after the list request would let a mid-op retarget
+  // pair a remote Manager answer with a newly-local disk (or vice versa).
+  const diskBase = isRemoteMode() ? undefined : resolveEffectiveComfyUIBase();
+
   let installed: InstalledNode[] | undefined;
   let listError: string | undefined;
   try {
@@ -1741,7 +1747,6 @@ export async function resolvePackPresence(
     if (node) return { state: "manager-listed", node };
   }
 
-  const diskBase = isRemoteMode() ? undefined : resolveEffectiveComfyUIBase();
   const disk = diskBase ? findPackOnDisk(id, diskBase) : undefined;
   if (disk?.state === "found") {
     return {
@@ -2112,7 +2117,7 @@ async function installCustomNodeImpl(
     });
     cliFallbackNote =
       `comfy-cli was requested (useCmCli) but is not usable here: ${cliProblem}. ` +
-      `NOTHING was run through comfy-cli — the install went through ComfyUI-Manager instead.`;
+      `NOTHING was run through comfy-cli — the install below used ComfyUI-Manager instead.`;
   }
   const withCliNote = (result: NodeOpResult): NodeOpResult =>
     cliFallbackNote
@@ -2866,7 +2871,7 @@ async function setCustomNodeEnabled(
     });
     cliFallbackNote =
       `comfy-cli was requested (useCmCli) but is not usable here: ${cliProblem}. ` +
-      `NOTHING was run through comfy-cli — the ${op} went through ComfyUI-Manager instead.`;
+      `NOTHING was run through comfy-cli — ComfyUI-Manager was used for what follows instead.`;
   }
 
   const base = managerBaseUrl();
@@ -2913,6 +2918,21 @@ async function setCustomNodeEnabled(
     );
   }
   const tracked = presence.node as InstalledNode;
+
+  // Already in the requested state: queueing would be a no-op whose drained
+  // queue reads exactly like a transition — and the post-op read-back would
+  // "verify" a state that predates the call. Say so and queue nothing. (An
+  // UNREPORTED enabled flag is not this case: proceed and let the post-op
+  // verdict be inconclusive if it stays unreported.)
+  if (tracked.enabled === enable) {
+    return {
+      mechanism: "manager-http",
+      message:
+        `"${id}" is already ${enable ? "enabled" : "disabled"} in ComfyUI-Manager's ` +
+        `installed-pack list — NOTHING was queued.` +
+        (cliFallbackNote ? ` ${cliFallbackNote}` : ""),
+    };
+  }
 
   const status = await queueManagerTask(
     op,
@@ -3051,7 +3071,7 @@ async function uninstallCustomNodeImpl(opts: NodeStateOptions): Promise<NodeOpRe
     });
     cliFallbackNote =
       `comfy-cli was requested (useCmCli) but is not usable here: ${cliProblem}. ` +
-      `NOTHING was run through comfy-cli — the uninstall went through ComfyUI-Manager instead.`;
+      `NOTHING was run through comfy-cli — ComfyUI-Manager was used for what follows instead.`;
   }
   const withCliNote = (result: NodeOpResult): NodeOpResult =>
     cliFallbackNote
@@ -3245,13 +3265,26 @@ async function listInstalledNodesAt(
     { base },
   );
   // A 200 with an empty or non-JSON body parses to undefined / a raw string in
-  // managerFetch, and parseInstalled would silently turn that into [] — an
-  // EMPTY list, which downstream gates read as "the pack is absent". An
-  // unreadable payload is NOT an empty list: refuse to answer from it.
-  if (raw === undefined || raw === null || typeof raw !== "object") {
+  // managerFetch, and an ERROR ENVELOPE like {"error": "…"} parses to an object
+  // whose values are scalars — parseInstalled would silently turn ALL of these
+  // into [], an EMPTY list, which downstream gates read as "the pack is
+  // absent". An unreadable payload is NOT an empty list: refuse to answer
+  // from it. ({} is a legitimate "nothing installed".)
+  const readable =
+    raw !== undefined &&
+    raw !== null &&
+    typeof raw === "object" &&
+    (Array.isArray(raw)
+      ? raw.every(
+          (el) => typeof el === "string" || (el !== null && typeof el === "object"),
+        )
+      : Object.values(raw as Record<string, unknown>).every(
+          (v) => v !== null && typeof v === "object" && !Array.isArray(v),
+        ));
+  if (!readable) {
     throw new NodeManagementError(
       `ComfyUI-Manager's installed-pack list returned an unreadable payload ` +
-        `(expected a JSON object or array, got ${
+        `(expected a JSON object of pack records or an array, got ${
           raw === undefined ? "an empty body" : `a ${typeof raw}`
         }) — treating the list as UNREADABLE, not as empty.`,
     );

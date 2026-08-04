@@ -124,8 +124,9 @@ export async function searchNodes(
   // that window (including its exact id, e.g. "comfyui kjnodes" →
   // "comfyui-kjnodes") false-empties. When the filter matched NOTHING, try the
   // direct pack-details endpoint with the query normalized to a registry-id
-  // slug before reporting no matches. The fallback can only ADD a result; a
-  // 404 (no such id) or any fetch failure leaves the honest empty answer.
+  // slug before reporting no matches. The fallback can only ADD a result; only
+  // an observed 404 leaves the honest empty answer — any other failure means
+  // absence was never established and is refused with the reason.
   if (lowerQuery && filtered.length === 0) {
     const candidate = registryIdCandidateFromQuery(query);
     if (candidate) {
@@ -137,13 +138,26 @@ export async function searchNodes(
         );
         return [normalizeSearchResult(details)];
       } catch (err) {
-        // 404 = genuinely no pack with that id; anything else = the fallback
-        // could not answer. Either way the SEARCH answer stays empty — it was
-        // empty on its own — so this only ever declines to add a result.
+        // Only an observed 404 establishes "no pack with that id". Anything
+        // else (500, network) means the fallback could not answer — and the
+        // window search cannot establish absence on its own (that is why the
+        // fallback exists), so reporting "no matches" would be an unearned
+        // negative. Refuse with the reason instead.
+        const status =
+          err instanceof RegistryError
+            ? (err.details as { status?: number } | undefined)?.status
+            : undefined;
+        if (status !== 404) {
+          throw new RegistryError(
+            `Registry search "${query}" matched nothing in the fetched pack window, ` +
+              `and the exact-id fallback for "${candidate}" could not be resolved ` +
+              `(${err instanceof Error ? err.message : String(err)}) — so "no matches" ` +
+              `cannot be confirmed. Retry, or look the pack up directly with ` +
+              `get_node_pack_details.`,
+          );
+        }
         logger.debug(
-          `Registry exact-id fallback for "${query}" ("${candidate}") did not resolve: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
+          `Registry exact-id fallback for "${query}": no pack with id "${candidate}" (404)`,
         );
       }
     }

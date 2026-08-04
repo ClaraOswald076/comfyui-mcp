@@ -1203,14 +1203,50 @@ describe("node-management service", () => {
       is_processing: false,
     };
 
+    /** Installed-list responses that CHANGE between the pre-op and post-op
+     *  reads: the pre-check sees `pre`, the post-op verification sees `post`. */
+    const stubChangingList = (pre: unknown, post: unknown) => {
+      let listCalls = 0;
+      const calls: Call[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string, init?: RequestInit) => {
+          const method = init?.method ?? "GET";
+          const body = init?.body ? JSON.parse(init.body as string) : undefined;
+          calls.push({ url, method, body });
+          const path = new URL(url).pathname + (new URL(url).search || "");
+          if (path.startsWith("/v2/customnode/installed")) {
+            listCalls++;
+            return jsonResponse(listCalls === 1 ? pre : post);
+          }
+          if (path === "/v2/manager/queue/status") return jsonResponse(drained);
+          return new Response("", { status: 200 });
+        }),
+      );
+      return { calls };
+    };
+
     it("disable queues a disable task and verifies the pack reports disabled", async () => {
-      const { calls } = stubFetch({ installedBody: installedDisabled });
+      const { calls } = stubChangingList(installedEnabled, installedDisabled);
       const res = await disableCustomNode({ id: "my-pack" });
       expect(taskOf(calls, "disable").params).toMatchObject({
         node_name: "my-pack",
       });
       expect(res.message).toMatch(/Disabled "my-pack"/);
       expect(res.message).toMatch(/verified/);
+    });
+
+    it("disable of an ALREADY-DISABLED pack queues nothing and says so (no fabricated transition)", async () => {
+      const { calls } = stubChangingList(installedDisabled, installedDisabled);
+      const res = await disableCustomNode({ id: "my-pack" });
+      expect(res.message).toMatch(/already disabled/);
+      expect(res.message).toMatch(/NOTHING was queued/);
+      expect(res.message).not.toMatch(/Disabled "my-pack" via/);
+      expect(
+        calls.some(
+          (c) => (c.body as { kind?: string } | undefined)?.kind === "disable",
+        ),
+      ).toBe(false);
     });
 
     it("disable discloses when Manager still reports the pack enabled", async () => {
@@ -1286,7 +1322,7 @@ describe("node-management service", () => {
     it("disable with useCmCli falls back to Manager HTTP when the CLI is unavailable, disclosed", async () => {
       // No comfy binary anywhere (workspace venv or PATH).
       mockedExists.mockReturnValue(false);
-      stubFetch({ installedBody: installedDisabled });
+      stubChangingList(installedEnabled, installedDisabled);
       const res = await disableCustomNode({ id: "my-pack", useCmCli: true });
       expect(res.mechanism).toBe("manager-http");
       expect(res.message).toMatch(/comfy-cli was requested/);
@@ -1295,7 +1331,7 @@ describe("node-management service", () => {
     });
 
     it("enable queues an enable task keyed by cnr_id and verifies the pack reports enabled", async () => {
-      const { calls } = stubFetch({ installedBody: installedEnabled });
+      const { calls } = stubChangingList(installedDisabled, installedEnabled);
       const res = await enableCustomNode({ id: "my-pack" });
       expect(taskOf(calls, "enable").params).toMatchObject({ cnr_id: "my-pack" });
       expect(res.message).toMatch(/Enabled "my-pack"/);
@@ -1466,6 +1502,29 @@ describe("node-management service", () => {
       expect(nodes.find((n) => n.module === "A")!.enabled).toBeUndefined();
       expect(nodes.find((n) => n.module === "B")!.enabled).toBe(false);
       expect(nodes.find((n) => n.module === "C")!.enabled).toBe(true);
+    });
+
+    it("an installed-list ERROR ENVELOPE ({\"error\": …}) is unreadable, not an empty list", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname;
+          if (path === "/v2/manager/queue/status") {
+            return jsonResponse({
+              total_count: 1,
+              done_count: 1,
+              in_progress_count: 0,
+              is_processing: false,
+            });
+          }
+          if (path.startsWith("/v2/customnode/installed")) {
+            // Parses as an object — but its values are scalars, not pack records.
+            return jsonResponse({ error: "temporary failure" });
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
+      await expect(listInstalledNodes()).rejects.toThrow(/unreadable payload/);
     });
 
     it("an unreadable installed-list payload is an ERROR, not an empty list", async () => {
@@ -1709,11 +1768,38 @@ describe("node-management service", () => {
     });
 
     it("disable sends the pack's REAL installed version as node_ver (legacy body keys on it)", async () => {
-      const { calls } = stubLegacyFetch({
-        installedBody: {
-          "my-pack": { ver: "1.2.3", cnr_id: "my-pack", enabled: false },
-        },
-      });
+      let listCalls = 0;
+      const calls: Call[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+          const method = init?.method ?? "GET";
+          const body = init?.body ? JSON.parse(init.body as string) : undefined;
+          calls.push({ url, method, body });
+          const path = new URL(url).pathname;
+          if (path.startsWith("/v2/")) {
+            return new Response("405: Method Not Allowed", { status: 405 });
+          }
+          if (path === "/manager/queue/status") {
+            return jsonResponse({
+              total_count: 1,
+              done_count: 1,
+              in_progress_count: 0,
+              is_processing: false,
+            });
+          }
+          if (path === "/customnode/installed") {
+            listCalls++;
+            // Pre-check sees the pack enabled; post-op it reports disabled.
+            return jsonResponse(
+              listCalls === 1
+                ? { "my-pack": { ver: "1.2.3", cnr_id: "my-pack", enabled: true } }
+                : { "my-pack": { ver: "1.2.3", cnr_id: "my-pack", enabled: false } },
+            );
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
       const res = await disableCustomNode({ id: "my-pack" });
       expect(res.mechanism).toBe("manager-http");
       expect(legacyCallTo(calls, "/manager/queue/disable")?.body).toMatchObject({
