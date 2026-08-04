@@ -71,7 +71,8 @@ interface UeLink {
   downstream_slot: number;
   upstream: number;
   upstream_slot: number;
-  controller: number;
+  /** The sender that produced this broadcast (absent in older lists). */
+  controller?: number;
   type?: string;
 }
 
@@ -209,6 +210,66 @@ export function flattenUiWorkflow(
           `UE broadcasts NOT materialized (open the graph with cg-use-everywhere active and save/queue once, then retry); senders left in place`,
       );
     } else {
+      // A ue_links record is only as current as the last time the pack analysed
+      // the graph. Materializing one without checking it against the LIVE wiring
+      // invents a connection the graph does not have — which reads as a plausible
+      // graph that is silently wrong, worse than an obviously missing link. Same
+      // policy as convertUiToApi's materializer (issue #361); kept as a separate
+      // implementation because this one walks a different link representation and
+      // its failure action differs — it must never delete or disconnect anything,
+      // only decline to add.
+      const ueSenderIds = new Set(ueSenders.map((s) => s.id));
+      /** Senders with at least one record we could not confirm — kept in place so
+       *  the user can re-save and recover the real broadcast. */
+      const unconfirmed = new Set<number>();
+      /** Senders whose channel could not be verified (several distinct producers,
+       *  and a record does not name the input it came through). Disclosed once. */
+      const multiFeed = new Map<number, string>();
+      /** null = confirmed against the live graph; otherwise the reason it is not. */
+      const unconfirmedReason = (uel: UeLink, srcId: number, srcSlot: number): string | null => {
+        const ctrlId = uel.controller;
+        if (ctrlId == null) {
+          // Unattributable: an unrelated sender sharing the producer proves
+          // nothing about THIS target. Only a self-producing sender names its own
+          // single channel unambiguously.
+          const up = nodesById.get(srcId);
+          return up && isSelfProducingUeSender(up.type)
+            ? null
+            : "the record names no broadcast node of its own (an older cg-use-everywhere list), so it cannot be attributed to any sender here";
+        }
+        const ctrl = nodesById.get(ctrlId);
+        if (!ctrl || !ueSenderIds.has(ctrlId)) {
+          return `broadcast node #${ctrlId} is no longer a broadcast node in this graph`;
+        }
+        // The Seed Everywhere family owns its value, so it has no feed to compare.
+        // Restricted to that closed set: recognition is deliberately generous, and
+        // a merely name-alike class must not inherit an exemption from checking.
+        if (srcId === ctrlId && isSelfProducingUeSender(ctrl.type)) return null;
+        const feeds = (ctrl.inputs ?? []).filter((i) => i.link != null);
+        if (feeds.length === 0) {
+          return `${ctrl.type} #${ctrl.id} no longer has any incoming connection, so it broadcasts nothing`;
+        }
+        let unresolved = false;
+        let matched = false;
+        const distinct = new Set<string>();
+        for (const f of feeds) {
+          const r = resolveReal(f.link as number);
+          if (!r) {
+            unresolved = true;
+            continue;
+          }
+          distinct.add(`${r.id}:${r.slot}`);
+          if (r.id === srcId && r.slot === srcSlot) matched = true;
+        }
+        if (matched) {
+          if (distinct.size > 1) multiFeed.set(ctrl.id, ctrl.type);
+          return null;
+        }
+        return unresolved
+          ? `${ctrl.type} #${ctrl.id}'s own incoming connection could not be resolved, so the recorded producer node ${srcId} could not be confirmed`
+          : `${ctrl.type} #${ctrl.id} is now fed by a different producer than the recorded node ${srcId}`;
+      };
+
       for (const uel of ueLinks) {
         const dst = nodesById.get(uel.downstream);
         const dstInput = dst?.inputs?.[uel.downstream_slot];
@@ -232,15 +293,30 @@ export function flattenUiWorkflow(
           srcId = resolved.id;
           srcSlot = resolved.slot;
         }
+        const why = unconfirmedReason(uel, srcId, srcSlot);
+        if (why) {
+          warnings.push(
+            `ue_link → ${dst.type} #${dst.id} input "${dstInput.name ?? uel.downstream_slot}" could not be confirmed against the live graph: ${why} — left unconnected, and the sender is kept in place so a re-save can recover it`,
+          );
+          if (uel.controller != null) unconfirmed.add(uel.controller);
+          continue;
+        }
         const added = addDirectLink(srcId, srcSlot, uel.downstream, uel.downstream_slot, uel.type ?? dstInput.type ?? "*");
         if (added != null) rewired++;
       }
+      for (const [id, type] of multiFeed) {
+        warnings.push(
+          `${type} #${id} broadcasts from more than one producer, and a ue_link record does not say which of its inputs a broadcast came through — each producer was confirmed to still feed it, but a saved list that went stale by SWAPPING its channels would look identical, so re-save with cg-use-everywhere active if this sender's routing matters`,
+        );
+      }
       // A sender is deletable only when it is not the real producer of any
-      // surviving link (Seed Everywhere IS its own upstream — it must stay).
+      // surviving link (Seed Everywhere IS its own upstream — it must stay), and
+      // never when one of its records could not be confirmed: deleting it would
+      // destroy the only evidence of a broadcast we declined to materialize.
       const liveOrigins = new Set<number>();
       for (const l of freshLinks) liveOrigins.add(l[1]);
       for (const s of ueSenders) {
-        if (!liveOrigins.has(s.id)) ueDeletable.add(s.id);
+        if (!liveOrigins.has(s.id) && !unconfirmed.has(s.id)) ueDeletable.add(s.id);
       }
     }
   }

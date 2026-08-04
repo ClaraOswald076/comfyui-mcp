@@ -144,6 +144,70 @@ describe("flattenUiWorkflow — Use-Everywhere", () => {
     expect(graph.extra?.ue_links).toBeUndefined();
   });
 
+  // #361: a ue_links record is only as current as the pack's last analysis.
+  // Materializing one without checking it against the LIVE wiring invents a
+  // connection the graph does not have — which reads as a plausible graph that is
+  // silently wrong, and is worse than an obviously missing link.
+  it("refuses a record whose sender was REWIRED, and keeps that sender in place", () => {
+    const g = ueGraph(true);
+    // The sender now takes its value from node 9, not the recorded node 1.
+    g.nodes.push(
+      node(9, "CheckpointLoaderSimple", { outputs: [{ name: "MODEL", type: "MODEL", links: [6] }] }),
+    );
+    g.nodes[0].outputs![0].links = [];
+    g.nodes[1].inputs![0].link = 6;
+    g.links = [[6, 9, 0, 2, 0, "MODEL"]];
+    const { graph, report } = flattenUiWorkflow(g);
+    const consumer = graph.nodes.find((n) => n.type === "SomeConsumer")!;
+    expect(consumer.inputs![0].link).toBeNull(); // no fabricated edge
+    expect(graph.nodes.some((n) => n.type === "Anything Everywhere")).toBe(true);
+    expect(report.warnings.join("\n")).toContain("could not be confirmed against the live graph");
+    expect(report.warnings.join("\n")).toContain("fed by a different producer");
+  });
+
+  it("refuses a record naming a sender that is gone", () => {
+    const g = ueGraph(true);
+    g.nodes = g.nodes.filter((n) => n.type !== "Anything Everywhere");
+    // Another sender keeps UE processing alive, but it is not this record's.
+    g.nodes.push(node(8, "Anything Everywhere", { inputs: [{ name: "anything", type: "*", link: null }] }));
+    const { graph, report } = flattenUiWorkflow(g);
+    const consumer = graph.nodes.find((n) => n.type === "SomeConsumer")!;
+    expect(consumer.inputs![0].link).toBeNull();
+    expect(report.warnings.join("\n")).toContain("no longer a broadcast node");
+  });
+
+  it("refuses a controllerless record unless its producer is itself a broadcast node", () => {
+    const g = ueGraph(true);
+    delete (g.extra!.ue_links as { controller?: number }[])[0].controller;
+    const { graph, report } = flattenUiWorkflow(g);
+    const consumer = graph.nodes.find((n) => n.type === "SomeConsumer")!;
+    expect(consumer.inputs![0].link).toBeNull();
+    expect(report.warnings.join("\n")).toContain("cannot be attributed to any sender");
+  });
+
+  it("a class merely SHARING a sender name prefix cannot skip the feed check", () => {
+    // Recognition is generous on purpose, so a foreign "Seed Everywhere …" class
+    // is treated as a sender — but it must not inherit the self-producing
+    // exemption that skips verification.
+    const g: UiWorkflow = {
+      nodes: [
+        node(1, "Seed Everywhere Helper", { outputs: [{ name: "INT", type: "INT", links: [] }] }),
+        node(3, "SomeConsumer", { inputs: [{ name: "seed", type: "INT", link: null }] }),
+      ],
+      links: [],
+      last_link_id: 0,
+      extra: {
+        ue_links: [
+          { downstream: 3, downstream_slot: 0, upstream: 1, upstream_slot: 0, controller: 1, type: "INT" },
+        ],
+      },
+    };
+    const { graph, report } = flattenUiWorkflow(g);
+    const consumer = graph.nodes.find((n) => n.type === "SomeConsumer")!;
+    expect(consumer.inputs![0].link).toBeNull();
+    expect(report.warnings.join("\n")).toContain("no longer has any incoming connection");
+  });
+
   it("keeps Seed Everywhere — it is its own real producer", () => {
     const g: UiWorkflow = {
       nodes: [
