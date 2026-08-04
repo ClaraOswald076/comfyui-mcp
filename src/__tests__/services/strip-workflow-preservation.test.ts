@@ -750,7 +750,175 @@ describe("#361 — cg-use-everywhere broadcast links", () => {
     } as never);
     expect(workflow["3"].inputs.images).toEqual(["1", 0]);
     expect(workflow["4"].inputs.images).toEqual(["2", 0]);
+    // Both records are preserved — and the residual is disclosed ONCE for the
+    // sender, because a record does not name the input its broadcast came
+    // through, so a stale list that swapped the sender's channels would be
+    // indistinguishable from this one.
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("Node 7 (Anything Everywhere3)");
+    expect(warnings[0]).toContain("broadcasts from more than one producer");
+  });
+
+  it("a sender with several inputs from ONE producer needs no channel caveat", () => {
+    // One producer, so there is no channel to confuse — the caveat must not fire
+    // here or it becomes noise on every multi-input graph.
+    const g = {
+      extra: {
+        ue_links: [
+          { downstream: 3, downstream_slot: 0, upstream: 1, upstream_slot: 0, controller: 7, type: "IMAGE" },
+        ],
+      },
+      nodes: [
+        {
+          id: 1,
+          type: "LoadImage",
+          mode: 0,
+          inputs: [],
+          outputs: [{ name: "IMAGE", type: "IMAGE", links: [40, 41] }],
+          widgets_values: ["a.png"],
+        },
+        {
+          id: 7,
+          type: "Anything Everywhere3",
+          mode: 0,
+          inputs: [
+            { name: "anything", type: "*", link: 40 },
+            { name: "anything2", type: "*", link: 41 },
+          ],
+          outputs: [],
+          widgets_values: [],
+        },
+        {
+          id: 3,
+          type: "SaveImage",
+          mode: 0,
+          inputs: [{ name: "images", type: "IMAGE", link: null }],
+          outputs: [],
+          widgets_values: ["out"],
+        },
+      ],
+      links: [
+        [40, 1, 0, 7, 0, "IMAGE"],
+        [41, 1, 0, 7, 1, "IMAGE"],
+      ],
+    } as never;
+    const { workflow, warnings } = convertUiToApi(g, {
+      ...(OBJECT_INFO as object),
+      "Anything Everywhere3": {
+        input: { required: {}, optional: { anything: ["*"], anything2: ["*"] } },
+      },
+    } as never);
+    expect(workflow["3"].inputs.images).toEqual(["1", 0]);
     expect(warnings).toEqual([]);
+  });
+
+  it("a CHANNEL-SWAPPED stale list is materialized but the uncertainty is disclosed", () => {
+    // The record says node 1 feeds SaveImage#3; live, node 1 feeds the sender's
+    // SECOND input while node 2 feeds the first. Nothing in a ue_links record
+    // names the sender input a broadcast came through, so this is
+    // indistinguishable from a current list — it cannot be REFUSED without
+    // dropping every legitimate multi-channel graph, but it must not pass in
+    // silence either.
+    const g = {
+      extra: {
+        ue_links: [
+          { downstream: 3, downstream_slot: 0, upstream: 1, upstream_slot: 0, controller: 7, type: "IMAGE" },
+        ],
+      },
+      nodes: [
+        {
+          id: 1,
+          type: "LoadImage",
+          mode: 0,
+          inputs: [],
+          outputs: [{ name: "IMAGE", type: "IMAGE", links: [41] }],
+          widgets_values: ["a.png"],
+        },
+        {
+          id: 2,
+          type: "LoadImage",
+          mode: 0,
+          inputs: [],
+          outputs: [{ name: "IMAGE", type: "IMAGE", links: [40] }],
+          widgets_values: ["b.png"],
+        },
+        {
+          id: 7,
+          type: "Prompts Everywhere",
+          mode: 0,
+          inputs: [
+            { name: "anything", type: "*", link: 40 },
+            { name: "anything2", type: "*", link: 41 },
+          ],
+          outputs: [],
+          widgets_values: [],
+        },
+        {
+          id: 3,
+          type: "SaveImage",
+          mode: 0,
+          inputs: [{ name: "images", type: "IMAGE", link: null }],
+          outputs: [],
+          widgets_values: ["out"],
+        },
+      ],
+      links: [
+        [40, 2, 0, 7, 0, "IMAGE"],
+        [41, 1, 0, 7, 1, "IMAGE"],
+      ],
+    } as never;
+    const { workflow, warnings } = convertUiToApi(g, {
+      ...(OBJECT_INFO as object),
+      "Prompts Everywhere": {
+        input: { required: {}, optional: { anything: ["*"], anything2: ["*"] } },
+      },
+    } as never);
+    expect(workflow["3"].inputs.images).toEqual(["1", 0]); // not dropped
+    expect(joined(warnings)).toContain("broadcasts from more than one producer");
+    expect(joined(warnings)).toContain("SWAPPING");
+  });
+
+  it("a non-UE class sharing a sender name PREFIX cannot skip the feed check", () => {
+    // Recognition is generous on purpose (an unrecognized sender loses its
+    // broadcasts silently), so a foreign "Seed Everywhere …" class can be
+    // classified as a sender. It must NOT therefore inherit the self-producing
+    // exemption that skips feed verification, or a stale record naming it would
+    // be materialized unchecked.
+    const g = {
+      extra: {
+        ue_links: [
+          { downstream: 3, downstream_slot: 0, upstream: 9, upstream_slot: 0, type: "IMAGE" },
+        ],
+      },
+      nodes: [
+        {
+          id: 9,
+          type: "Seed Everywhere Helper",
+          mode: 0,
+          inputs: [],
+          outputs: [{ name: "IMAGE", type: "IMAGE", links: [] }],
+          widgets_values: [1],
+        },
+        {
+          id: 3,
+          type: "SaveImage",
+          mode: 0,
+          inputs: [{ name: "images", type: "IMAGE", link: null }],
+          outputs: [],
+          widgets_values: ["out"],
+        },
+      ],
+      links: [],
+    } as never;
+    const { workflow, warnings } = convertUiToApi(g, {
+      ...(OBJECT_INFO as object),
+      "Seed Everywhere Helper": {
+        input: { required: { seed: ["INT", { default: 0 }] } },
+        output: ["IMAGE"],
+      },
+    } as never);
+    expect(workflow["3"].inputs.images).toBeUndefined();
+    expect(joined(warnings)).toContain("could not be confirmed against the live graph");
   });
 
   it("an EMPTY computed list is an answer, not an unknown — no warning, no invented link", () => {

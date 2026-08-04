@@ -13,7 +13,7 @@ import type {
   SubgraphLink,
 } from "../comfyui/types.js";
 import { logger } from "../utils/logger.js";
-import { isUeSender } from "./flatten-workflow.js";
+import { isSelfProducingUeSender, isUeSender } from "./flatten-workflow.js";
 
 export interface ConversionResult {
   workflow: WorkflowJSON;
@@ -830,6 +830,11 @@ function materializeUeInGraph(
     if (!src) return null;
     return realOfNode(src.node, src.slot, depth + 1);
   };
+  /** Senders whose records were materialized but whose CHANNEL could not be
+   *  verified, because the sender carries several distinct producers and a
+   *  ue_links record does not name the sender input it came through. Disclosed
+   *  once per sender rather than per record. */
+  const multiFeedControllers = new Map<number, string>();
   /**
    * Verify the record against the sender's LIVE feed.
    *  - "ok"          the sender is still fed by exactly this producer + slot
@@ -844,24 +849,31 @@ function materializeUeInGraph(
   ): "ok" | "detached" | "rewired" | "unverifiable" | "unattributable" => {
     const want = realOfNode(raw.upstream, raw.upstream_slot);
     if (!want) return "unverifiable";
-    const matches = (feedLink: number) => {
-      const real = realSourceOf(feedLink);
-      return real ? real.node === want.node && real.slot === want.slot : null;
-    };
     // No `controller` (older lists omit the field): the record cannot be tied to
     // ANY sender. Scanning for "some live sender happens to be fed by this
     // producer" reads a COINCIDENCE as evidence — the record's own sender may be
     // long gone while an unrelated sender shares that producer and broadcasts it
     // somewhere else entirely, which fabricates an edge the live graph lacks.
-    // The one self-attributing shape is a producer that IS itself a broadcast
-    // node (Seed Everywhere owns its widget): that names its own single channel
-    // unambiguously, with no attribution to guess at.
+    // The one self-attributing shape is a producer that IS itself a SELF-PRODUCING
+    // broadcast node (Seed Everywhere owns its widget): that names its own single
+    // channel unambiguously, with no attribution to guess at. It must be a
+    // self-producing class specifically — accepting any recognized sender here
+    // would skip the feed check for a relay sender, which is how an over-broad
+    // class match could turn a stale record into a fabricated edge.
     if (raw.controller == null) {
-      return senderIds.has(want.node) ? "ok" : "unattributable";
+      const up = nodesById.get(want.node);
+      return up && isSelfProducingUeSender(up.type) ? "ok" : "unattributable";
     }
     // Seed Everywhere and friends: the sender IS the producer (it owns the widget),
-    // so there is no incoming feed to compare against.
-    if (raw.upstream === raw.controller) return "ok";
+    // so there is no incoming feed to compare against. Same narrowing — a relay
+    // sender that merely names itself as its own upstream is not exempt from
+    // verification, it falls through to the feed check below.
+    if (
+      raw.upstream === raw.controller &&
+      isSelfProducingUeSender(nodesById.get(raw.controller)?.type ?? "")
+    ) {
+      return "ok";
+    }
     const ctrl = nodesById.get(raw.controller);
     if (!ctrl) return "ok"; // already reported by the sender check above
     // A sender can have SEVERAL inputs (Prompts Everywhere, Anything Everywhere3),
@@ -876,19 +888,33 @@ function materializeUeInGraph(
     // deciding that is the pack's own type/name matching, and re-implementing it
     // would be a second guess layered on the first. So a list that went stale by
     // SWAPPING two channels of one sender (positive/negative both still feeding
-    // it, just exchanged) is indistinguishable from a current one and is accepted.
-    // Refusing every multi-input record instead would drop the broadcasts of every
-    // Prompts Everywhere / Anything Everywhere3 graph, permanently and with no
-    // remedy the user could act on — a certain loss traded for an occasional one.
+    // it, just exchanged) is indistinguishable from a current one.
+    //
+    // Refusing every multi-input record would drop the broadcasts of every Prompts
+    // Everywhere / Anything Everywhere3 graph, permanently and with no remedy the
+    // user could act on — a certain loss traded for an occasional one. So the
+    // record IS materialized, and `multiFeedControllers` records the sender so the
+    // residual is DISCLOSED once per sender. Unverifiable and undisclosed are
+    // different failures; only the second one is this issue.
     const feeds = (ctrl.inputs ?? []).filter((i) => i.link != null);
     if (feeds.length === 0) return "detached";
     let anyUnresolved = false;
+    let matched = false;
+    const distinct = new Set<string>();
     for (const f of feeds) {
-      const m = matches(f.link as number);
-      if (m === null) anyUnresolved = true;
-      else if (m) return "ok";
+      const real = realSourceOf(f.link as number);
+      if (!real) {
+        anyUnresolved = true;
+        continue;
+      }
+      distinct.add(`${real.node}:${real.slot}`);
+      if (real.node === want.node && real.slot === want.slot) matched = true;
     }
-    return anyUnresolved ? "unverifiable" : "rewired";
+    if (!matched) return anyUnresolved ? "unverifiable" : "rewired";
+    // Confirmed live, but on a sender carrying MORE THAN ONE distinct producer the
+    // channel→target association is not recoverable from the record (see above).
+    if (distinct.size > 1) multiFeedControllers.set(ctrl.id, ctrl.type);
+    return "ok";
   };
 
   let added = 0;
@@ -976,6 +1002,11 @@ function materializeUeInGraph(
       if (srcOut) srcOut.links = [...(srcOut.links ?? []), id];
     }
     added++;
+  }
+  for (const [id, type] of multiFeedControllers) {
+    warnings.push(
+      `Node ${id} (${type}) in ${scope} broadcasts from more than one producer, and a cg-use-everywhere record does not say which of the sender's inputs a broadcast came through. Each producer was confirmed to still feed this node, so the wiring below is materialized — but if the saved broadcast list went stale by SWAPPING that sender's channels, the stripped graph carries the swap and there is no way to tell from the file. Re-save (or queue) the workflow with cg-use-everywhere active if this sender's routing matters.`,
+    );
   }
   return added;
 }

@@ -50,6 +50,21 @@ export const isUeSender = (t: string): boolean =>
   t.startsWith("Seed Everywhere") ||
   t.startsWith("Prompts Everywhere");
 
+/**
+ * The UE senders that OWN the value they broadcast instead of relaying an input —
+ * the Seed Everywhere family holds its seed in a widget and IS its own producer.
+ * Every other sender relays whatever is wired into it.
+ *
+ * Deliberately a CLOSED set, unlike isUeSender's prefix match. Recognition should
+ * be generous (an unrecognized sender silently loses its broadcasts), but this
+ * predicate gates the one path that accepts a record WITHOUT verifying the
+ * sender's incoming feed, and an exception that skips verification has to be
+ * narrow. A future self-producing variant that is not listed here simply takes
+ * the ordinary feed check and is refused with a warning — disclosed, not silent.
+ */
+export const isSelfProducingUeSender = (t: string): boolean =>
+  t === "Seed Everywhere" || t === "Seed Everywhere?";
+
 /** Shape cg-use-everywhere writes into graph.extra.ue_links. */
 interface UeLink {
   downstream: number;
