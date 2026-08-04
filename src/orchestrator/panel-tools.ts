@@ -7806,6 +7806,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // available node: <repo>@<version>"). Route it as the from-source
         // repository install that works, and disclose the rewrite.
         const norm = normalizeGitUrlInstallArgs(args);
+        if (norm.conflict) return fail(norm.conflict);
         const res = await ctx.call(
           {
             cmd: "nodes_install",

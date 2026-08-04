@@ -1240,7 +1240,7 @@ describe("node-management service", () => {
       const { calls } = stubChangingList(installedDisabled, installedDisabled);
       const res = await disableCustomNode({ id: "my-pack" });
       expect(res.message).toMatch(/already disabled/);
-      expect(res.message).toMatch(/NOTHING was queued/);
+      expect(res.message).toMatch(/NOTHING was run/);
       expect(res.message).not.toMatch(/Disabled "my-pack" via/);
       expect(
         calls.some(
@@ -1303,11 +1303,20 @@ describe("node-management service", () => {
 
     it("disable via comfy-cli verifies against the Manager list afterwards", async () => {
       mockedExec.mockReturnValue(cliEnvelope({ message: "disabled" }) as never);
-      stubFetch({ installedBody: installedDisabled });
+      stubChangingList(installedEnabled, installedDisabled);
       const res = await disableCustomNode({ id: "my-pack", useCmCli: true });
       expect(res.mechanism).toBe("comfy-cli");
       expect(res.message).toMatch(/via official comfy-cli/);
       expect(res.message).toMatch(/verified against ComfyUI-Manager/);
+    });
+
+    it("disable via comfy-cli of an ALREADY-DISABLED pack runs nothing and says so", async () => {
+      stubChangingList(installedDisabled, installedDisabled);
+      const res = await disableCustomNode({ id: "my-pack", useCmCli: true });
+      expect(res.mechanism).toBe("comfy-cli");
+      expect(res.message).toMatch(/already disabled/);
+      expect(res.message).toMatch(/NOTHING was run/);
+      expect(mockedExec).not.toHaveBeenCalled();
     });
 
     it("disable via comfy-cli discloses when the CLI's success claim doesn't hold", async () => {
@@ -1395,6 +1404,48 @@ describe("node-management service", () => {
       expect(res.message).toMatch(/did NOT take effect/);
       expect(res.message).not.toMatch(/Uninstalled "my-pack" via/);
     });
+
+    it("uninstall via comfy-cli refuses a pack that was never installed — nothing runs", async () => {
+      // CLI usable (default mocks), but the pre-check resolves nowhere —
+      // the CLI must not run so its exit 0 can be "verified" as a no-op.
+      fsCtl.readdirSync = () => [];
+      stubFetch({ installedBody: {} });
+      const err = await uninstallCustomNode({ id: "ghost-pack", useCmCli: true }).catch(
+        (e: Error) => e,
+      );
+      expect(err).toBeInstanceOf(NodeManagementError);
+      expect((err as Error).message).toMatch(/not installed/);
+      expect(mockedExec).not.toHaveBeenCalled();
+    });
+
+    it("uninstall via comfy-cli verifies on DISK when the Manager list is unreadable", async () => {
+      // The CLI works on the local install even when Manager's list is down —
+      // but then the postcondition is checked against the filesystem.
+      fsCtl.readdirSync = () => [];
+      mockedExec.mockReturnValue(cliEnvelope({ message: "uninstalled" }) as never);
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname + (new URL(url).search || "");
+          if (path.startsWith("/v2/customnode/installed")) {
+            return new Response("boom", { status: 500 });
+          }
+          if (path === "/v2/manager/queue/status") {
+            return jsonResponse({
+              total_count: 1,
+              done_count: 1,
+              in_progress_count: 0,
+              is_processing: false,
+            });
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
+      const res = await uninstallCustomNode({ id: "my-pack", useCmCli: true });
+      expect(res.mechanism).toBe("comfy-cli");
+      expect(res.message).toMatch(/no matching pack directory remains/);
+      expect(res.message).toMatch(/NOT checked/);
+    });
   });
 
   // ---- panel_install_node git-URL normalization (#789) ----------------------
@@ -1437,6 +1488,16 @@ describe("node-management service", () => {
       const out = normalizeGitUrlInstallArgs({ repository: URL });
       expect(out.repository).toBe(URL);
       expect(out.version).toBe("nightly");
+    });
+
+    it("refuses when BOTH id and repository are given — two targets, not one", () => {
+      const out = normalizeGitUrlInstallArgs({
+        id: "comfyui-kjnodes",
+        repository: URL,
+      });
+      expect(out.conflict).toMatch(/BOTH/);
+      expect(out.version).toBeUndefined();
+      expect(out.repository).toBeUndefined();
     });
   });
 
@@ -1520,6 +1581,28 @@ describe("node-management service", () => {
           if (path.startsWith("/v2/customnode/installed")) {
             // Parses as an object — but its values are scalars, not pack records.
             return jsonResponse({ error: "temporary failure" });
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
+      await expect(listInstalledNodes()).rejects.toThrow(/unreadable payload/);
+    });
+
+    it("a STRING-array installed payload is unreadable — parseInstalled drops bare strings", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname;
+          if (path === "/v2/manager/queue/status") {
+            return jsonResponse({
+              total_count: 1,
+              done_count: 1,
+              in_progress_count: 0,
+              is_processing: false,
+            });
+          }
+          if (path.startsWith("/v2/customnode/installed")) {
+            return jsonResponse(["temporary failure"]);
           }
           return new Response("", { status: 200 });
         }),

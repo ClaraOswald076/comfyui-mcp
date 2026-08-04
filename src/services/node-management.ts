@@ -2830,42 +2830,16 @@ async function setCustomNodeEnabled(
 ): Promise<NodeOpResult> {
   const { id } = opts;
   const op = enable ? "enable" : "disable";
+  const base = managerBaseUrl();
 
-  // Same fallback discipline as install (#808): a requested-but-unusable CLI
-  // drops to Manager HTTP with disclosure, never a dead-end error.
+  // CLI availability probe FIRST (#808 fallback discipline), but NO subprocess
+  // runs yet: the presence pre-check below comes before either mechanism,
+  // because a CLI run of an already-satisfied/no-such-pack request reports a
+  // pre-existing state as a fresh transition exactly like a queued no-op.
+  const cliProblem = opts.useCmCli ? comfyCliUnavailableReason() : undefined;
+  const useCli = opts.useCmCli === true && cliProblem === undefined;
   let cliFallbackNote: string | undefined;
-  if (opts.useCmCli) {
-    const cliProblem = comfyCliUnavailableReason();
-    if (cliProblem === undefined) {
-      const base = managerBaseUrl();
-      const out = runCmCli([op, id]);
-      // comfy-cli's exit is its OWN claim — verify against the Manager list
-      // when it can be read rather than reporting the claim as the state.
-      const verdict = await readEnabledVerdict(id, enable, base);
-      if (verdict.state === "not-applied") {
-        return {
-          mechanism: "comfy-cli",
-          message:
-            `comfy-cli reported the ${op} of "${id}" successful, but ComfyUI-Manager ` +
-            `still reports the pack as ${verdict.reported} — the ${op} did NOT take ` +
-            `effect. Check the ComfyUI server log for the underlying error.`,
-          details: out.trim(),
-        };
-      }
-      return {
-        mechanism: "comfy-cli",
-        message:
-          verdict.state === "applied"
-            ? `${enable ? "Enabled" : "Disabled"} "${id}" via official comfy-cli ` +
-              `(verified against ComfyUI-Manager's installed-pack list). A ComfyUI ` +
-              `restart is required for the change to take effect.`
-            : `${enable ? "Enabled" : "Disabled"} "${id}" via official comfy-cli ` +
-              `(comfy-cli's own report — the post-state could not be independently ` +
-              `verified: ${verdict.reason}). A ComfyUI restart is required for the ` +
-              `change to take effect.`,
-        details: out.trim(),
-      };
-    }
+  if (opts.useCmCli && !useCli) {
     logger.info(`comfy-cli requested (useCmCli) but unavailable — falling back to Manager HTTP for ${op}`, {
       reason: cliProblem,
     });
@@ -2874,10 +2848,8 @@ async function setCustomNodeEnabled(
       `NOTHING was run through comfy-cli — ComfyUI-Manager was used for what follows instead.`;
   }
 
-  const base = managerBaseUrl();
-
-  // Pre-queue validation: a disable/enable queued for an id Manager never
-  // heard of drains as a silent no-op, and the LEGACY dialects key the body on
+  // Pre-op validation: a disable/enable for an id Manager never heard of is a
+  // silent no-op (queue or CLI alike), and the LEGACY dialects key the body on
   // the pack's REAL installed version (node-bisect's controller does the same
   // — "never send 'unknown' for an installed pack"). Both need the installed
   // list read up front.
@@ -2910,29 +2882,73 @@ async function setCustomNodeEnabled(
           `list_installed_nodes.`,
     );
   }
-  if (presence.state === "unverifiable") {
+  if (presence.state === "unverifiable" && !useCli) {
+    // The HTTP path cannot validate or verify without the Manager list. The
+    // comfy-cli path CAN still act (it works on the local install directly) —
+    // it proceeds below, disclosing that the pre-state was never established.
     throw new NodeManagementError(
       `Whether "${id}" is installed could not be determined (${presence.reason}), so ` +
         `the ${op} was NOT queued — a ${op} queued blind would drain silently whether ` +
         `or not it did anything. Check that ComfyUI-Manager is reachable, then retry.`,
     );
   }
-  const tracked = presence.node as InstalledNode;
 
-  // Already in the requested state: queueing would be a no-op whose drained
-  // queue reads exactly like a transition — and the post-op read-back would
-  // "verify" a state that predates the call. Say so and queue nothing. (An
-  // UNREPORTED enabled flag is not this case: proceed and let the post-op
-  // verdict be inconclusive if it stays unreported.)
-  if (tracked.enabled === enable) {
+  // Already in the requested state: running anything would be a no-op whose
+  // post-op read-back would "verify" a state that predates the call. Say so
+  // and do nothing. (An UNREPORTED enabled flag is not this case: proceed and
+  // let the post-op verdict be inconclusive if it stays unreported.)
+  if (presence.state === "manager-listed" && presence.node?.enabled === enable) {
     return {
-      mechanism: "manager-http",
+      mechanism: useCli ? "comfy-cli" : "manager-http",
       message:
         `"${id}" is already ${enable ? "enabled" : "disabled"} in ComfyUI-Manager's ` +
-        `installed-pack list — NOTHING was queued.` +
+        `installed-pack list — NOTHING was run.` +
         (cliFallbackNote ? ` ${cliFallbackNote}` : ""),
     };
   }
+
+  if (useCli) {
+    const preStateUnknown = presence.state !== "manager-listed";
+    const out = runCmCli([op, id]);
+    // comfy-cli's exit is its OWN claim — verify against the Manager list
+    // when it can be read rather than reporting the claim as the state.
+    const verdict = await readEnabledVerdict(id, enable, base);
+    if (verdict.state === "not-applied") {
+      return {
+        mechanism: "comfy-cli",
+        message:
+          `comfy-cli reported the ${op} of "${id}" successful, but ComfyUI-Manager ` +
+          `still reports the pack as ${verdict.reported} — the ${op} did NOT take ` +
+          `effect. Check the ComfyUI server log for the underlying error.`,
+        details: out.trim(),
+      };
+    }
+    return {
+      mechanism: "comfy-cli",
+      message:
+        (verdict.state === "applied"
+          ? `${enable ? "Enabled" : "Disabled"} "${id}" via official comfy-cli ` +
+            `(verified against ComfyUI-Manager's installed-pack list)`
+          : `${enable ? "Enabled" : "Disabled"} "${id}" via official comfy-cli ` +
+            `(comfy-cli's own report — the post-state could not be independently ` +
+            `verified: ${verdict.reason})`) +
+        (preStateUnknown
+          ? `. NOTE: the pre-operation state was never established (${presence.reason}), so this is not a verified transition`
+          : "") +
+        `. A ComfyUI restart is required for the change to take effect.`,
+      details: out.trim(),
+    };
+  }
+
+  if (presence.state !== "manager-listed") {
+    // Unreachable by construction (absent/on-disk threw; unverifiable without a
+    // usable CLI threw; unverifiable WITH one returned inside the CLI branch) —
+    // a guard, not a load-bearing check.
+    throw new NodeManagementError(
+      `Whether "${id}" is installed could not be determined, so the ${op} was NOT queued.`,
+    );
+  }
+  const tracked = presence.node as InstalledNode;
 
   const status = await queueManagerTask(
     op,
@@ -3018,54 +3034,14 @@ export async function uninstallCustomNode(opts: NodeStateOptions): Promise<NodeO
 
 async function uninstallCustomNodeImpl(opts: NodeStateOptions): Promise<NodeOpResult> {
   const { id } = opts;
+  const base = managerBaseUrl();
 
-  // Same fallback discipline as install (#808): a requested-but-unusable CLI
-  // drops to Manager HTTP with disclosure.
+  // CLI availability probe FIRST (#808 fallback discipline) — but nothing runs
+  // until the presence pre-check below has answered what there is to remove.
+  const cliProblem = opts.useCmCli ? comfyCliUnavailableReason() : undefined;
+  const useCli = opts.useCmCli === true && cliProblem === undefined;
   let cliFallbackNote: string | undefined;
-  if (opts.useCmCli) {
-    const cliProblem = comfyCliUnavailableReason();
-    if (cliProblem === undefined) {
-      const base = managerBaseUrl();
-      const out = runCmCli(["uninstall", id]);
-      // comfy-cli's exit is its OWN claim — verify absence against the Manager
-      // list when it can be read rather than reporting the claim as the state.
-      let installed: InstalledNode[] | undefined;
-      let listError: string | undefined;
-      try {
-        installed = await listInstalledNodesAt(base);
-      } catch (err) {
-        listError = err instanceof Error ? err.message : String(err);
-      }
-      if (!installed) {
-        return {
-          mechanism: "comfy-cli",
-          message:
-            `Uninstalled "${id}" via official comfy-cli (comfy-cli's own report — the ` +
-            `post-state could not be independently verified: ComfyUI-Manager's ` +
-            `installed-pack list could not be read (${listError})). A ComfyUI restart ` +
-            `is required to unload it fully.`,
-          details: out.trim(),
-        };
-      }
-      if (findInstalledNode(id, installed)) {
-        return {
-          mechanism: "comfy-cli",
-          message:
-            `comfy-cli reported the uninstall of "${id}" successful, but the pack is ` +
-            `STILL in ComfyUI-Manager's installed-pack list — the uninstall did NOT ` +
-            `take effect. Check the ComfyUI server log for the underlying error.`,
-          details: out.trim(),
-        };
-      }
-      return {
-        mechanism: "comfy-cli",
-        message:
-          `Uninstalled "${id}" via official comfy-cli (verified absent from ` +
-          `ComfyUI-Manager's installed-pack list). A ComfyUI restart is required to ` +
-          `unload it fully.`,
-        details: out.trim(),
-      };
-    }
+  if (opts.useCmCli && !useCli) {
     logger.info("comfy-cli requested (useCmCli) but unavailable — falling back to Manager HTTP for uninstall", {
       reason: cliProblem,
     });
@@ -3073,16 +3049,11 @@ async function uninstallCustomNodeImpl(opts: NodeStateOptions): Promise<NodeOpRe
       `comfy-cli was requested (useCmCli) but is not usable here: ${cliProblem}. ` +
       `NOTHING was run through comfy-cli — ComfyUI-Manager was used for what follows instead.`;
   }
-  const withCliNote = (result: NodeOpResult): NodeOpResult =>
-    cliFallbackNote
-      ? { ...result, message: `${cliFallbackNote} ${result.message}` }
-      : result;
 
-  const base = managerBaseUrl();
-
-  // Pre-queue: Manager can only uninstall a pack it TRACKS. Queueing an id that
-  // resolves nowhere is a silent no-op whose drained queue reads exactly like a
-  // success — refuse instead, with the reason that is actually true.
+  // Pre-op: an uninstall of an id that resolves nowhere is a silent no-op —
+  // via Manager (drained queue) or comfy-cli (exit 0) alike — and reading
+  // absence afterwards would "verify" a state that predated the call. Refuse
+  // with the reason that is actually true.
   const presence = await resolvePackPresence(id, base);
   if (presence.state === "on-disk") {
     throw new NodeManagementError(
@@ -3111,7 +3082,10 @@ async function uninstallCustomNodeImpl(opts: NodeStateOptions): Promise<NodeOpRe
           `with list_installed_nodes.`,
     );
   }
-  if (presence.state === "unverifiable") {
+  if (presence.state === "unverifiable" && !useCli) {
+    // The HTTP path cannot validate or verify without the Manager list. The
+    // comfy-cli path can still act on the local install — it proceeds below,
+    // with the postcondition checked on disk instead.
     throw new NodeManagementError(
       `Whether "${id}" is installed could not be determined (${presence.reason}), so the ` +
         `uninstall was NOT queued — an uninstall queued blind would drain silently whether ` +
@@ -3119,6 +3093,91 @@ async function uninstallCustomNodeImpl(opts: NodeStateOptions): Promise<NodeOpRe
     );
   }
 
+  if (useCli) {
+    const out = runCmCli(["uninstall", id]);
+    // comfy-cli's exit is its OWN claim. Verify removal: the Manager installed
+    // list when it can be read; otherwise the on-disk directory (a CLI session
+    // is a local one, so the disk answers). A pack that is still discoverable
+    // afterwards means the uninstall did NOT take effect — disclose it.
+    let installed: InstalledNode[] | undefined;
+    let listError: string | undefined;
+    try {
+      installed = await listInstalledNodesAt(base);
+    } catch (err) {
+      listError = err instanceof Error ? err.message : String(err);
+    }
+    if (installed) {
+      if (findInstalledNode(id, installed)) {
+        return {
+          mechanism: "comfy-cli",
+          message:
+            `comfy-cli reported the uninstall of "${id}" successful, but the pack is ` +
+            `STILL in ComfyUI-Manager's installed-pack list — the uninstall did NOT ` +
+            `take effect. Check the ComfyUI server log for the underlying error.`,
+          details: out.trim(),
+        };
+      }
+      return {
+        mechanism: "comfy-cli",
+        message:
+          `Uninstalled "${id}" via official comfy-cli (verified absent from ` +
+          `ComfyUI-Manager's installed-pack list` +
+          (presence.state === "manager-listed"
+            ? ""
+            : `; whether it was there BEFORE the operation could not be established — the list was unreadable then`) +
+          `). A ComfyUI restart is required to unload it fully.`,
+        details: out.trim(),
+      };
+    }
+    // List unreadable — the disk answers in a local session.
+    const diskBase = isRemoteMode() ? undefined : resolveEffectiveComfyUIBase();
+    const disk = diskBase ? findPackOnDisk(id, diskBase) : undefined;
+    if (disk?.state === "found") {
+      return {
+        mechanism: "comfy-cli",
+        message:
+          `comfy-cli reported the uninstall of "${id}" successful, but the pack ` +
+          `directory still exists at ${disk.dir} — the uninstall did NOT take ` +
+          `effect. Check the ComfyUI server log for the underlying error.`,
+        details: out.trim(),
+      };
+    }
+    if (disk?.state === "not-found") {
+      return {
+        mechanism: "comfy-cli",
+        message:
+          `Uninstalled "${id}" via official comfy-cli (verified: no matching pack ` +
+          `directory remains under ${disk.scanned}; ComfyUI-Manager's installed-pack ` +
+          `list could not be read, so the list side was NOT checked). A ComfyUI ` +
+          `restart is required to unload it fully.`,
+        details: out.trim(),
+      };
+    }
+    return {
+      mechanism: "comfy-cli",
+      message:
+        `Uninstalled "${id}" via official comfy-cli (comfy-cli's own report — the ` +
+        `post-state could not be independently verified: ComfyUI-Manager's ` +
+        `installed-pack list could not be read (${listError})` +
+        (disk?.state === "unreadable" ? ` and the disk check was inconclusive (${disk.reason})` : "") +
+        `). A ComfyUI restart is required to unload it fully.`,
+      details: out.trim(),
+    };
+  }
+
+  const withCliNote = (result: NodeOpResult): NodeOpResult =>
+    cliFallbackNote
+      ? { ...result, message: `${cliFallbackNote} ${result.message}` }
+      : result;
+
+  if (presence.state !== "manager-listed") {
+    // Unreachable by construction (absent/on-disk threw; unverifiable without a
+    // usable CLI threw; unverifiable WITH one returned inside the CLI branch) —
+    // a guard, not a load-bearing check.
+    throw new NodeManagementError(
+      `Whether "${id}" is installed could not be determined, so the uninstall was NOT queued.`,
+    );
+  }
   const status = await queueManagerTask(
     "uninstall",
     // Legacy 3.x keys the body on node_name + the REAL installed version
@@ -3181,6 +3240,8 @@ export interface GitUrlInstallArgs {
 export interface NormalizedGitUrlInstallArgs extends GitUrlInstallArgs {
   /** Human-facing disclosure of any rewrite, for the tool result. */
   note?: string;
+  /** Set when the call names two targets; the caller must REFUSE, not pick one. */
+  conflict?: string;
 }
 
 /**
@@ -3196,10 +3257,22 @@ export interface NormalizedGitUrlInstallArgs extends GitUrlInstallArgs {
  *     channel a from-source install can resolve).
  * An explicit non-"latest" version is the caller's own choice and passes
  * through untouched; the rewrite is always disclosed in `note`.
+ *
+ * `id` AND `repository` together name TWO targets (the schema presents them as
+ * alternatives); that is a conflict to refuse, not a precedence to pick.
  */
 export function normalizeGitUrlInstallArgs(
   args: GitUrlInstallArgs,
 ): NormalizedGitUrlInstallArgs {
+  if (args.id && args.repository) {
+    return {
+      conflict:
+        `panel_install_node was given BOTH id ("${args.id}") and repository ` +
+        `("${args.repository}") — those are two different ways to name the target and ` +
+        `they may not name the same pack. Pass exactly one: the registry id, or the ` +
+        `git repository URL.`,
+    };
+  }
   const gitTarget =
     args.repository && looksLikeGitUrl(args.repository)
       ? args.repository
@@ -3208,11 +3281,10 @@ export function normalizeGitUrlInstallArgs(
         : undefined;
   if (!gitTarget) return {};
   const version = args.version?.trim();
+  // The URL travels as `repository` ONLY: a URL that arrived as `id` is not
+  // forwarded as both (routing off the id path is the whole point), and
+  // id+repository together were refused above.
   const out: NormalizedGitUrlInstallArgs = { repository: gitTarget };
-  // When the URL arrived AS the id, do NOT forward it as both id and
-  // repository — the whole point is to route AWAY from the id path, and
-  // sending both leaves the routing to downstream precedence.
-  if (args.id && args.id !== gitTarget) out.id = args.id;
   if (version === undefined || version.length === 0 || version.toLowerCase() === "latest") {
     out.version = "nightly";
     out.note =
@@ -3275,9 +3347,9 @@ async function listInstalledNodesAt(
     raw !== null &&
     typeof raw === "object" &&
     (Array.isArray(raw)
-      ? raw.every(
-          (el) => typeof el === "string" || (el !== null && typeof el === "object"),
-        )
+      ? // parseInstalled only understands entry OBJECTS — a bare string element
+        // (["temporary failure"]) would be silently dropped, reading as empty.
+        raw.every((el) => el !== null && typeof el === "object" && !Array.isArray(el))
       : Object.values(raw as Record<string, unknown>).every(
           (v) => v !== null && typeof v === "object" && !Array.isArray(v),
         ));
