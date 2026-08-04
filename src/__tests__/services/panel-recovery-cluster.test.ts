@@ -2176,9 +2176,37 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
       "../../services/panel-installer.js"
     );
     const note = await repairInterruptedPanelSwap(h.deps);
-    expect(note).toMatch(/could not even be checked for/);
+    expect(note).toMatch(/could not even be located/);
     expect(note).not.toMatch(/could not be opened/);
+    expect(note).not.toMatch(/was located, but its contents could not be checked/);
     expect(existsSync(INCOMING())).toBe(true); // decision unchanged: refused
+  });
+
+  it("a MISSING digest dep refuses without asserting an open that never happened", async () => {
+    // The one member of the SHAPE bucket that is not a filesystem event. With a
+    // readable pyproject and a readable non-empty bundle but no `fileDigest`,
+    // nothing is opened — there is no way to ask — so the refusal must not say a
+    // file "could not be opened". Keeping the verdict and neutralising the
+    // SENTENCE is the fix: a fourth verdict would put a non-observation into a
+    // vocabulary about what was seen on disk.
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    stageIncoming("0.11.38");
+    const h = makeDeps({});
+    delete (h.deps as { fileDigest?: unknown }).fileDigest;
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(h.deps);
+    expect(note).toMatch(/was located, but its contents could not be checked/);
+    expect(note).toMatch(/not a finding that it is broken/);
+    // No filesystem claim, because no filesystem operation was attempted.
+    expect(note).not.toMatch(/could not be opened/);
+    expect(note).not.toMatch(/could not be read/);
+    expect(note).not.toMatch(/check permissions/);
+    // The DECISION is unchanged — still fails closed, still moves nothing.
+    expect(existsSync(INCOMING())).toBe(true);
+    expect(existsSync(PANEL_DIR())).toBe(true);
+    expect(note).toMatch(/before removing anything/);
   });
 
   it("a regular FILE at the destination gets the hazard that actually applies to it", async () => {

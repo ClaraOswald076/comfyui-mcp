@@ -3003,9 +3003,14 @@ type PanelShapeVerdict =
   | "usable"
   /** Positively established: identity or bundle is wrong/absent/empty. */
   | "not-a-panel"
-  /** An input could not even be CHECKED FOR — the stat failed, nothing was opened. */
+  /** An input could not even be LOCATED — the stat failed, nothing was opened. */
   | "probe-failed"
-  /** An input is there and OPENING it failed. See PanelIdentityVerdict. */
+  /**
+   * An input was located and its contents were not established. A BUCKET, unlike
+   * the identity verdict's: a failed open, OR a dep set with no `fileDigest`,
+   * where nothing was opened at all. Its rendering therefore makes no
+   * filesystem claim — see `describePanelShape`.
+   */
   | "unreadable"
   /** The pyproject WAS read; its contents would not parse. See PanelIdentityVerdict. */
   | "malformed";
@@ -3116,15 +3121,28 @@ function describePanelShape(dir: string, verdict: PanelShapeVerdict): string {
         `not a finding that it is broken`
       );
     case "unreadable":
+      // CLAIM-NEUTRAL, BECAUSE THIS VERDICT IS A BUCKET AND ONE OF ITS MEMBERS
+      // IS NOT A FILESYSTEM FAILURE AT ALL. Two paths land here: an open that
+      // genuinely failed, and a dep set carrying no `fileDigest`, where nothing
+      // was opened because there was no way to ask. "Is there but could not be
+      // opened" asserts an open failure that, on the second path, never
+      // happened. The renderer cannot tell them apart — so the sentence says
+      // only what is true of both: the contents were not established. The
+      // action/message split one level in — the BUCKET a value falls into is
+      // not the SENTENCE it earns.
+      //
+      // The IDENTITY verdict's `unreadable` has exactly one member (a real open
+      // failure, since identity never consults `fileDigest`), which is why its
+      // narration keeps the precise cause and the permissions remedy.
       return (
         `whether the directory at ${dir} holds a working panel could NOT be determined ` +
-        `— one of its files is there but could not be opened, so this is not a finding ` +
-        `that it is broken`
+        `— one of its files was located, but its contents could not be checked, so this ` +
+        `is not a finding that it is broken`
       );
     case "probe-failed":
       return (
         `whether the directory at ${dir} holds a working panel could NOT be determined ` +
-        `— one of its files could not even be checked for, so nothing about its contents ` +
+        `— one of its files could not even be located, so nothing about its contents ` +
         `was established`
       );
   }
@@ -3146,11 +3164,14 @@ function panelShapeVerdict(dir: string, deps: PanelInstallerDeps): PanelShapeVer
   const bundleProbe = deps.probeFile(bundle);
   if (bundleProbe === undefined) return "probe-failed";
   if (bundleProbe !== true) return "not-a-panel";
-  // A dep set with no `fileDigest` is a dep-shape gap, not a filesystem event —
-  // production always wires it (defaultDeps, and panelStatusAt's spread of it),
-  // so this is the fail-closed answer for a caller that cannot ask, and
-  // "could not be opened" is literally what happened: there was no way to open
-  // it. Not a fourth cause; nothing on disk was observed to be wrong.
+  // A dep set with no `fileDigest` is a DEP-SHAPE GAP, not a filesystem event —
+  // production always wires it (defaultDeps, and panelStatusAt's spread of it).
+  // It fails closed here, with the same verdict as a failed read, and that is
+  // deliberate: a FOURTH verdict would put a non-observation into a vocabulary
+  // about what was seen on disk, and the next reader would try to produce it
+  // from a probe. Nothing on disk was observed to be wrong here — so the cost is
+  // paid in the SENTENCE instead, which is why `describePanelShape` makes no
+  // filesystem claim for `unreadable`.
   if (!deps.fileDigest) return "unreadable";
   const digest = deps.fileDigest(bundle);
   if (!digest) return "unreadable"; // located, and the read of it failed
