@@ -186,18 +186,24 @@ const MAX_DROPPED_KEYS = 64;
 /**
  * EXACT identity of a question, and the whole of the cross-question guard.
  *
- * Everything the user actually reads on the card goes in, in order: the question
- * text, the option LABELS in the order they are rendered, the multi-select flag,
- * and the header chip. Two asks are "the same question" only when a user looking
- * at both cards would see the same thing.
+ * EVERYTHING THE USER READS ON THE CARD GOES IN, in order: the question text,
+ * the header chip, the multi-select flag, and every option's LABEL **and
+ * DESCRIPTION**. Two asks are "the same question" only when a user looking at
+ * both cards would see the same thing.
+ *
+ * The descriptions are not decoration: they are the one-line explanations the
+ * user reads to decide, so "euler / fast, lower quality" and "euler / now the
+ * recommended default" are different decisions wearing the same label. Leaving
+ * them out would let a re-worded card recover an answer the user gave to
+ * different information. The guard errs strict in every direction: a stricter
+ * fingerprint costs at most a re-ask, a looser one lets an answer satisfy a
+ * question it was not given for.
  *
  * Deliberately NOT included: the tab id (an entry carries its tab separately, so
- * a tab-id migration re-keys it without invalidating every fingerprint), option
- * DESCRIPTIONS (cosmetic sub-text that does not change what is being decided —
- * including them would be harmless but would turn a reworded tooltip into a
- * failed recovery), and any timestamp.
+ * a tab-id migration re-keys it without invalidating every fingerprint) and any
+ * timestamp.
  *
- * Whitespace is trimmed and internal runs collapsed on the question/labels only,
+ * Whitespace is trimmed and internal runs collapsed on the text fields only,
  * because a re-ask is often the model re-emitting the same prompt with different
  * wrapping. Nothing else is normalized: case, punctuation and ordering are all
  * significant, so "Delete the file?" never matches "delete the file".
@@ -211,8 +217,13 @@ export function askFingerprint(ask: {
   const norm = (s: string): string => s.replace(/\s+/g, " ").trim();
   const labels = Array.isArray(ask.options)
     ? ask.options.map((o) => {
-        const label = (o as { label?: unknown } | null)?.label;
-        return typeof label === "string" ? norm(label) : JSON.stringify(o ?? null);
+        const opt = o as { label?: unknown; description?: unknown } | null;
+        if (typeof opt?.label !== "string") return JSON.stringify(o ?? null);
+        // Label AND description — an option is the whole thing the user reads.
+        return JSON.stringify([
+          norm(opt.label),
+          typeof opt.description === "string" ? norm(opt.description) : "",
+        ]);
       })
     : [];
   // JSON.stringify is the delimiter: it escapes the payload itself, so no
@@ -271,6 +282,16 @@ export class AskAnswerJournalImpl {
    * UNDETERMINED); it must never turn an answer into nothing.
    */
   private retired = new Set<string>();
+  /**
+   * Ask ids whose CONVERSATION was replaced (New chat / resume of a historical
+   * session) while their card was still on screen.
+   *
+   * An answer that arrives for one of these is real and is journaled, but it is
+   * addressed to a conversation that no longer exists, so it is never announced
+   * to the replacement one — see closeAsks() for why this differs from #468's
+   * treatment of run completions.
+   */
+  private conversationGone = new Set<string>();
   /** token → entry (insertion-ordered, which is also delivery order). */
   private entries = new Map<string, AskEntry>();
   /** Answers this tab lost to an eviction and has not yet been told about. */
@@ -376,7 +397,6 @@ export class AskAnswerJournalImpl {
    */
   record(askId: string, reply: unknown, meta: { tabId: string }): AskEntry {
     this.pruneTickets();
-    this.expireStaleReturned();
     const existing = [...this.entries.values()].find((e) => e.askId === askId);
     if (existing) return existing;
     const ticket = this.tickets.get(askId);
@@ -400,12 +420,19 @@ export class AskAnswerJournalImpl {
       returned: false,
       // An answer that lands while its own handler is still running is that
       // handler's to return; one that lands afterwards (or with no ticket at
-      // all) has nobody left and is armed for the push immediately.
-      delivery: ticket?.awaiting === true ? "none" : "pending",
+      // all) has nobody left and is armed for the push immediately. An answer to
+      // a card whose CONVERSATION was replaced is never pushed at all — see
+      // closeAsks(); it is journaled for disclosure only.
+      delivery:
+        ticket?.awaiting === true || this.conversationGone.has(askId) ? "none" : "pending",
       attempts: 0,
     };
     this.entries.set(entry.token, entry);
-    if (!ticket) {
+    if (this.conversationGone.has(askId)) {
+      logger.warn(
+        `[ask-answers] an answer arrived for a card whose conversation was replaced (ask ${askId.slice(0, 8)}, tab ${entry.key.slice(0, 8)}): "${entry.answer}" — journaled for disclosure, NOT announced to the replacement conversation`,
+      );
+    } else if (!ticket) {
       logger.warn(
         `[ask-answers] a validated answer arrived for ask ${askId.slice(0, 8)} with no open ticket — journaled as UNATTRIBUTED; it can never satisfy a question, only be reported`,
       );
@@ -454,7 +481,6 @@ export class AskAnswerJournalImpl {
    * journals an answer microseconds after the last poll).
    */
   recover(key: string, fingerprint: string): AskRecovery {
-    this.expireStaleReturned();
     const now = Date.now();
     const mine = [...this.entries.values()].filter((e) => e.key === key);
     if (mine.length === 0) return { status: "none" };
@@ -479,9 +505,18 @@ export class AskAnswerJournalImpl {
    * agent's queue is deliberate: the tool result the caller is about to return
    * carries the SAME answer with the SAME question attached, so the worst case
    * is the agent reading it twice — never acting on an answer it wasn't given.
+   *
+   * Any eviction disclosure the entry was CARRYING is handed back to the tab
+   * first. The disclosure is a debt owed to the tab, not a property of whichever
+   * entry happens to be carrying it: consuming the carrier without re-homing it
+   * would let an eviction that the journal promised to report disappear because
+   * an unrelated answer was recovered.
    */
   consume(token: string): void {
+    const entry = this.entries.get(token);
+    if (!entry) return;
     this.entries.delete(token);
+    if (entry.disclose) this.noteDropped(entry.key, entry.disclose);
   }
 
   /** Every unconsumed ORPHAN answer for a tab — those that were never handed
@@ -489,6 +524,26 @@ export class AskAnswerJournalImpl {
    *  validated answer is never silently dropped. */
   orphansFor(key: string): AskEntry[] {
     return [...this.entries.values()].filter((e) => e.key === key && !e.returned);
+  }
+
+  /**
+   * Take the eviction debt that has NO other carrier — the count parked in the
+   * side map because this tab had no pending entry to stamp it onto, i.e. no
+   * push is coming to disclose it. The ask path reports it instead.
+   *
+   * Debt riding on an ENTRY is deliberately left alone: that copy goes out with
+   * a real delivery and is cleared only when the turn carrying it ends, so
+   * taking it here could drop a disclosure that push still owes.
+   *
+   * Reporting into a ToolResult is a hand-off, not a proof, so this can still be
+   * lost with an abandoned call — but the eviction itself was already logged at
+   * ERROR, and repeating the warning on every subsequent ask forever is worse
+   * than reporting it once at the first opportunity.
+   */
+  takeDropped(key: string): number {
+    const owed = this.dropped.get(key) ?? 0;
+    this.dropped.delete(key);
+    return owed;
   }
 
   /** Answers this tab lost to an eviction and has not yet been told about. */
@@ -639,7 +694,13 @@ export class AskAnswerJournalImpl {
       }
     }
     for (const [id, ticket] of [...this.tickets]) {
-      if (ticket.tabId === key) this.tickets.delete(id);
+      if (ticket.tabId !== key) continue;
+      this.tickets.delete(id);
+      // Its card may still be on screen. There is no agent left at this tab id,
+      // so a late answer must not be armed for a push that can only fail (and
+      // would sit pending until an eviction) — journal it for disclosure only,
+      // exactly as for a replaced conversation.
+      this.conversationGone.add(id);
     }
     const owed = this.dropped.get(key) ?? 0;
     if (owed > 0) {
@@ -662,15 +723,48 @@ export class AskAnswerJournalImpl {
    */
   closeAsks(key: string): void {
     for (const [id, ticket] of [...this.tickets]) {
-      if (ticket.tabId === key) this.tickets.delete(id);
+      if (ticket.tabId !== key) continue;
+      this.tickets.delete(id);
+      // The CARD IS STILL ON SCREEN. The user can click it minutes from now, and
+      // the bridge will happily deliver that answer — to a conversation that no
+      // longer exists. Remember the id so `record` recognises it as belonging to
+      // the retired conversation instead of treating it as an ordinary
+      // unattributable answer and announcing it to the replacement agent.
+      this.conversationGone.add(id);
+    }
+    while (this.conversationGone.size > MAX_REMEMBERED_ASK_IDS) {
+      const oldest = this.conversationGone.values().next().value;
+      if (oldest === undefined) break;
+      this.conversationGone.delete(oldest);
     }
     for (const entry of this.entries.values()) {
-      if (entry.key !== key || entry.correlation.status !== "matched") continue;
-      entry.correlation = { status: "foreign", askId: entry.correlation.askId };
-      // Its fingerprint was the licence to satisfy a matching re-ask; the
-      // conversation that asked is gone, so revoke it. The QUESTION TEXT stays —
-      // it is what makes the disclosure honest.
-      entry.fingerprint = null;
+      if (entry.key !== key) continue;
+      if (entry.correlation.status === "matched") {
+        entry.correlation = { status: "foreign", askId: entry.correlation.askId };
+        // Its fingerprint was the licence to satisfy a matching re-ask; the
+        // conversation that asked is gone, so revoke it. The QUESTION TEXT stays —
+        // it is what makes the disclosure honest.
+        entry.fingerprint = null;
+      }
+      // …and STOP PUSHING it. Its addressee is gone.
+      //
+      // This is where an ask answer parts company with a run completion (#468),
+      // which is still delivered to the replacement conversation downgraded. A
+      // completion's payload is independently useful — the images are on the
+      // user's canvas either way. An answer to a question the replacement
+      // conversation never asked is useful to nobody: pushing it injects an
+      // unsolicited turn about a decision the new conversation has no context
+      // for, which is a cross-conversation confusion with no upside.
+      //
+      // NOT a silent discard: the entry stays journaled (so a later ask on this
+      // tab that times out still reports it as UNATTRIBUTED, quoted with its own
+      // question) and the loss of the push is logged here.
+      if (entry.delivery === "pending") {
+        entry.delivery = "none";
+        logger.warn(
+          `[ask-answers] the conversation that asked "${preview(entry.question)}" on tab ${key.slice(0, 8)} was replaced — the user's answer ("${entry.answer}") will NOT be announced to the replacement conversation; it is kept only for disclosure`,
+        );
+      }
     }
   }
 
@@ -686,6 +780,7 @@ export class AskAnswerJournalImpl {
     // orchestrator, not to any one test's fixture.
     this.tickets.clear();
     this.retired.clear();
+    this.conversationGone.clear();
     this.entries.clear();
     this.dropped.clear();
     this.seq = 0;
@@ -735,23 +830,6 @@ export class AskAnswerJournalImpl {
     }
   }
 
-  /**
-   * Forget RETURNED answers past the recovery window.
-   *
-   * These were handed to a tool result and can no longer be recovered by a
-   * re-ask, so dropping them asserts nothing and loses nothing that was still
-   * reachable — it is what keeps ordinary successful asks from filling the
-   * journal and evicting a genuine orphan. ORPHANED answers are never
-   * age-expired: they were handed to nobody, so only a delivery or an
-   * explicitly-disclosed eviction may remove one.
-   */
-  private expireStaleReturned(): void {
-    const now = Date.now();
-    for (const [token, e] of [...this.entries]) {
-      if (!e.returned || e.delivery !== "none") continue;
-      if (now - e.answeredAt > RECOVER_MAX_AGE_MS) this.entries.delete(token);
-    }
-  }
 
   /**
    * Record that an answer for `key` was destroyed by an eviction, so the next

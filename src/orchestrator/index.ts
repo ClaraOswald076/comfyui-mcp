@@ -3023,7 +3023,15 @@ export async function runPanelOrchestrator(): Promise<void> {
           // without counting that the destination reads as unoccupied, the source
           // is rebound onto its id, and the next flush hands the DESTINATION
           // tab's render to the SOURCE tab's conversation.
-          const destinationJournaled = RunCompletions.outstanding(panelTab).length;
+          // #486 — the ask journal counts too, for exactly the same reason and
+          // with a worse failure if it doesn't: a destination whose only state is
+          // the user's ANSWER to a question its (now-gone) conversation asked
+          // would read as unoccupied, the source would be rebound onto its id,
+          // and the next flush would announce the DESTINATION tab's answer to the
+          // SOURCE tab's conversation — an answer delivered to a conversation
+          // that never asked the question.
+          const destinationJournaled =
+            RunCompletions.outstanding(panelTab).length + AskAnswers.entriesFor(panelTab).length;
           const destinationHadState = [...KNOWN_BACKENDS].some((b) =>
             destinationHasCollisionState({
               hasManagerState: manager.hasAnyState(panelTab + AGENT_KEY_SEP + b),

@@ -3897,15 +3897,29 @@ function recoveredAskResult(entry: AskEntry): ToolResult {
  * the question at hand, which is the misattribution this whole path exists to
  * prevent. Reporting them beats swallowing them — the user did answer something.
  */
-function askTimeoutResult(tabId: string, recovery: AskRecovery): ToolResult {
+function askTimeoutResult(
+  tabId: string,
+  fingerprint: string,
+  recovery: AskRecovery,
+): ToolResult {
   let text =
     "The question card was not answered in time (or no interactive panel surface " +
     "rendered it — e.g. an exec/headless run), so nothing was selected. If you " +
     "still need the decision, ask the user directly in plain chat text, or " +
     "re-invoke panel_ask from an interactive ComfyUI tab.";
-  // Only answers that were never handed back to ANY tool call are surfaced here;
-  // one that already reached a caller is not news.
-  const orphans = recovery.status === "unattributed" ? recovery.others.filter((e) => !e.returned) : [];
+  // What is surfaced, and why each:
+  //  • an answer that reached NO tool call — nobody has it, so it must be told;
+  //  • an answer to THIS EXACT question that DID reach a tool call but is now too
+  //    old to be presented as a fresh decision. "It went into a ToolResult" is
+  //    precisely the thing this file says is not proof of receipt (that IS #486),
+  //    so a stale one is reported rather than quietly forgotten — the agent is
+  //    told the user answered this before, and can decide whether to re-ask.
+  // An answer that reached a caller and belongs to a DIFFERENT question is not
+  // news and stays quiet.
+  const orphans =
+    recovery.status === "unattributed"
+      ? recovery.others.filter((e) => !e.returned || e.fingerprint === fingerprint)
+      : [];
   if (orphans.length > 0) {
     text +=
       `\n\nHOWEVER — the user DID validate ${orphans.length} answer(s) on this tab that could NOT be ` +
@@ -3920,14 +3934,31 @@ function askTimeoutResult(tabId: string, recovery: AskRecovery): ToolResult {
         )
         .join("\n");
   }
-  const dropped = AskAnswers.droppedFor(tabId);
-  if (dropped > 0) {
-    text +=
-      `\n\n⚠️ ${dropped} further validated answer(s) for this tab were dropped before they could be ` +
-      `delivered — their content is UNDETERMINED and cannot be recovered. Ask the user again for ` +
-      `anything you were waiting on.`;
-  }
-  return fail(text);
+  return fail(withDroppedText(tabId, text));
+}
+
+/** The tab's undisclosed eviction debt, appended to whatever is being reported.
+ *  Every exit from the ask path runs through this — an eviction the journal
+ *  promised to report must not go unsaid just because THIS ask happened to
+ *  succeed. Reading it also SPENDS it (droppedFor is drained by the journal only
+ *  when a push carries it), so it is said once. */
+function withDroppedText(tabId: string, text: string): string {
+  const dropped = AskAnswers.takeDropped(tabId);
+  if (dropped <= 0) return text;
+  return (
+    `${text}\n\n⚠️ ${dropped} further validated answer(s) for this tab were dropped before they ` +
+    `could be delivered — their content is UNDETERMINED and cannot be recovered. Ask the user ` +
+    `again for anything you were waiting on.`
+  );
+}
+
+/** Same, for a ToolResult that is already built (the success/recovery paths). */
+function withDroppedAnswerWarning(tabId: string, res: ToolResult): ToolResult {
+  const first = res.content[0];
+  if (!first || first.type !== "text") return res;
+  const text = withDroppedText(tabId, first.text);
+  if (text === first.text) return res;
+  return { ...res, content: [{ type: "text", text }, ...res.content.slice(1)] };
 }
 
 /**
@@ -3987,7 +4018,10 @@ async function askUserWithGrace(
   const handBack = (reply: unknown): ToolResult => {
     AskAnswers.record(askId, reply, { tabId });
     AskAnswers.markReturned(askId);
-    return ok(reply);
+    // Even a clean answer carries out any eviction debt this tab is still owed —
+    // an answer the journal admits it dropped must not go unmentioned merely
+    // because the NEXT ask happened to succeed.
+    return withDroppedAnswerWarning(tabId, ok(reply));
   };
   try {
     const reply = await ctx.bridge.send(cmd as unknown as { cmd: string }, {
@@ -4009,9 +4043,11 @@ async function askUserWithGrace(
       AskAnswers.consume(entry.token);
       // Our OWN card's answer that merely lost the poll race is not a "recovered
       // earlier answer" — it is this ask's answer, and reads as one.
-      return entry.askId === askId ? ok(entry.answer) : recoveredAskResult(entry);
+      const body =
+        entry.askId === askId ? ok(entry.answer) : recoveredAskResult(entry);
+      return withDroppedAnswerWarning(tabId, body);
     }
-    return askTimeoutResult(tabId, recovery);
+    return askTimeoutResult(tabId, fingerprint, recovery);
   } finally {
     // This handler is gone. Anything already journaled for this ask that we did
     // NOT hand back is now provably orphaned — arm it for the durable push so

@@ -4319,6 +4319,53 @@ describe("panel_ask keeps a validated answer across a tool timeout (#486)", () =
     expect(askText(res)).not.toMatch(/HOWEVER/);
   });
 
+  // codex round 1, P0: an answer that went into a ToolResult used to be forgotten
+  // once it aged past the recovery window. But "it went into a ToolResult" is
+  // exactly what is NOT provable here (that IS #486), so a re-ask of the same
+  // question past the window must still be TOLD the user answered it — the
+  // difference between a stale answer and silence.
+  it("a re-ask past the recovery window is told the user answered it before", async () => {
+    const bridge = {
+      send: async () => "dpmpp_2m",
+      canReach: () => true,
+      isHeadless: () => false,
+      resolveActiveTabId: () => TAB,
+      takeLateAskReply: () => undefined,
+      push: () => 1,
+    } as unknown as PanelToolCtx["bridge"];
+    const first = await defByName("panel_ask").handler(SAMPLER as Record<string, unknown>, {
+      bridge,
+      tabId: TAB,
+    } as unknown as PanelToolCtx);
+    expect(askText(first)).toBe("dpmpp_2m");
+    // Age it out of the recovery window (it must NOT have been deleted).
+    const entry = AskAnswers.entriesFor(TAB)[0];
+    expect(entry).toBeDefined();
+    entry.answeredAt = Date.now() - 60 * 60_000;
+    const res = await defByName("panel_ask").handler(SAMPLER as Record<string, unknown>, {
+      bridge: timingOutBridge(),
+      tabId: TAB,
+    } as unknown as PanelToolCtx);
+    // Not served as this ask's answer (too old to present as a fresh decision)…
+    expect(res.isError).toBe(true);
+    // …but reported, quoted with the question it answers.
+    expect(askText(res)).toContain("dpmpp_2m");
+    expect(askText(res)).toContain(SAMPLER.question);
+  });
+
+  it("an answer to a card whose CONVERSATION was replaced can never satisfy a re-ask", async () => {
+    await askThenAnswerLate(SAMPLER, "dpmpp_2m");
+    AskAnswers.closeAsks(TAB); // New chat / resume of a historical session
+    const res = await defByName("panel_ask").handler(SAMPLER as Record<string, unknown>, {
+      bridge: timingOutBridge(),
+      tabId: TAB,
+    } as unknown as PanelToolCtx);
+    expect(res.isError).toBe(true);
+    expect(askText(res)).not.toContain("RECOVERED ANSWER");
+    // Still reported as unattributed rather than swallowed.
+    expect(askText(res)).toContain("dpmpp_2m");
+  });
+
   it("holds the WHOLE handler under one wall-clock ceiling anchored at entry", () => {
     // The card deadline and the grace poll used to be additive on top of
     // everything else, so a bounded ask could still overrun the enclosing

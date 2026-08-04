@@ -114,12 +114,33 @@ describe("ask-answer journal — cross-question misattribution guard (#486)", ()
     expect(askFingerprint({ ...SAMPLER, options: [{ label: "euler" }] })).not.toBe(base);
     expect(askFingerprint({ ...SAMPLER, multi_select: true })).not.toBe(base);
     expect(askFingerprint({ ...SAMPLER, header: "Sampler" })).not.toBe(base);
-    // …but not on cosmetics the user's decision does not depend on.
+    // The option DESCRIPTIONS are part of the question: they are the one-line
+    // explanations the user reads to decide, so the same labels with different
+    // explanations are a different decision and must not recover each other.
+    expect(
+      askFingerprint({
+        ...SAMPLER,
+        options: [{ label: "euler", description: "fast, lower quality" }, { label: "dpmpp_2m" }],
+      }),
+    ).not.toBe(base);
+    expect(
+      askFingerprint({
+        ...SAMPLER,
+        options: [{ label: "euler", description: "now the recommended default" }, { label: "dpmpp_2m" }],
+      }),
+    ).not.toBe(
+      askFingerprint({
+        ...SAMPLER,
+        options: [{ label: "euler", description: "fast, lower quality" }, { label: "dpmpp_2m" }],
+      }),
+    );
+    // …but whitespace/wrapping is not a decision, and a re-ask often re-emits the
+    // same prompt wrapped differently.
     expect(
       askFingerprint({
         ...SAMPLER,
         question: "  Which sampler   should I use?\n",
-        options: [{ label: "euler", description: "fast" }, { label: " dpmpp_2m " }],
+        options: [{ label: " euler " }, { label: "dpmpp_2m\n" }],
       }),
     ).toBe(base);
   });
@@ -359,6 +380,113 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     openAndAnswer("ask-1", SAMPLER, "dpmpp_2m");
     openAndAnswer("ask-2", SAMPLER, "dpmpp_2m");
     expect(AskAnswers.entriesFor(TAB)).toHaveLength(2);
+  });
+
+  // codex round 1, P0: an eviction disclosure was stamped onto a surviving entry,
+  // and `consume()` (a recovery) then deleted that carrier outright — so an
+  // eviction the journal had promised to report vanished because an unrelated
+  // answer was recovered. The debt belongs to the TAB, not to its carrier.
+  it("a recovery that consumes the disclosure's carrier re-homes the debt", () => {
+    for (let i = 0; i < 20; i += 1) {
+      openAndAnswer(`ask-${i}`, { question: `Q${i}?`, options: [{ label: "a" }, { label: "b" }] }, `A${i}`);
+    }
+    const owed = AskAnswers.droppedFor(TAB);
+    expect(owed).toBeGreaterThan(0);
+    const carrier = AskAnswers.entriesFor(TAB).find((e) => (e.disclose ?? 0) > 0);
+    expect(carrier).toBeDefined();
+    AskAnswers.consume(carrier!.token);
+    expect(AskAnswers.droppedFor(TAB)).toBe(owed);
+  });
+
+  // codex round 1, P0: a RETURNED answer used to be deleted once it aged past the
+  // recovery window. "It went into a ToolResult" is exactly the thing that is not
+  // provable here — that IS #486 — so nothing may be dropped on that basis.
+  it("nothing is ever expired by age — only recovery, eviction or a gone tab remove an answer", () => {
+    AskAnswers.openAsk("ask-1", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SAMPLER),
+      question: SAMPLER.question,
+    });
+    AskAnswers.record("ask-1", "dpmpp_2m", { tabId: TAB });
+    AskAnswers.markReturned("ask-1");
+    AskAnswers.closeAsk("ask-1");
+    const entry = AskAnswers.entriesFor(TAB)[0];
+    entry.answeredAt = Date.now() - ASK_RECOVER_MAX_AGE_MS * 10;
+    // Any number of later journal operations must not sweep it away.
+    openAndAnswer("ask-2", SCHEDULER, "karras");
+    AskAnswers.recover(TAB, askFingerprint(SCHEDULER));
+    expect(AskAnswers.entriesFor(TAB).some((e) => e.askId === "ask-1")).toBe(true);
+    // Too old to be presented as a fresh decision, but still REPORTABLE.
+    const rec = AskAnswers.recover(TAB, askFingerprint(SAMPLER));
+    expect(rec.status).toBe("unattributed");
+    if (rec.status !== "unattributed") return;
+    expect(rec.others.some((e) => e.answer === "dpmpp_2m")).toBe(true);
+  });
+
+  // codex round 1, P0: `closeAsks` dropped the ticket but the card was still on
+  // screen, so a click minutes later was journaled as `foreign`, addressed to the
+  // same tab, and PUSHED into the replacement conversation — an unsolicited turn
+  // about a decision that conversation never asked for.
+  it("an answer to a card whose conversation was replaced is never announced to the new one", () => {
+    AskAnswers.openAsk("ask-1", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SAMPLER),
+      question: SAMPLER.question,
+    });
+    AskAnswers.closeAsk("ask-1");
+    AskAnswers.closeAsks(TAB); // New chat / resume of a historical session
+    // The user clicks the still-rendered old card.
+    const entry = AskAnswers.record("ask-1", "dpmpp_2m", { tabId: TAB });
+    expect(entry.delivery).toBe("none");
+    expect(AskAnswers.pending(TAB)).toHaveLength(0);
+    expect(AskAnswers.hasOutstanding()).toBe(false);
+    // …not swallowed either: it is still on file for disclosure, and it can never
+    // satisfy a question.
+    const rec = AskAnswers.recover(TAB, askFingerprint(SAMPLER));
+    expect(rec.status).toBe("unattributed");
+    if (rec.status !== "unattributed") return;
+    expect(rec.others.some((e) => e.answer === "dpmpp_2m")).toBe(true);
+  });
+
+  it("an already-journaled answer stops being pushed when its conversation is replaced", () => {
+    openAndAnswer("ask-1", SAMPLER, "dpmpp_2m");
+    expect(AskAnswers.pending(TAB)).toHaveLength(1);
+    AskAnswers.closeAsks(TAB);
+    expect(AskAnswers.pending(TAB)).toHaveLength(0);
+    expect(AskAnswers.entriesFor(TAB)).toHaveLength(1); // kept for disclosure
+  });
+
+  it("a late answer for a tab that is GONE is never armed for a doomed push", () => {
+    AskAnswers.openAsk("ask-1", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SAMPLER),
+      question: SAMPLER.question,
+    });
+    AskAnswers.closeAsk("ask-1");
+    AskAnswers.forget(TAB); // workflow switched away / tab closed
+    const entry = AskAnswers.record("ask-1", "dpmpp_2m", { tabId: TAB });
+    expect(entry.delivery).toBe("none");
+    expect(AskAnswers.hasOutstanding()).toBe(false);
+  });
+
+  it("takeDropped reports the un-carried debt once, and leaves entry-carried debt to its push", () => {
+    for (let i = 0; i < 20; i += 1) {
+      openAndAnswer(`ask-${i}`, { question: `Q${i}?`, options: [{ label: "a" }, { label: "b" }] }, `A${i}`);
+    }
+    // Move all the debt into the side map by consuming every carrier.
+    for (const e of AskAnswers.entriesFor(TAB).filter((x) => (x.disclose ?? 0) > 0)) {
+      AskAnswers.consume(e.token);
+    }
+    // Consuming re-homes onto another PENDING entry when one exists, so drain
+    // them all to force the side map.
+    while (AskAnswers.entriesFor(TAB).some((e) => (e.disclose ?? 0) > 0)) {
+      const carrier = AskAnswers.entriesFor(TAB).find((e) => (e.disclose ?? 0) > 0)!;
+      AskAnswers.consume(carrier.token);
+      if (AskAnswers.pending(TAB).length === 0) break;
+    }
+    const owed = AskAnswers.takeDropped(TAB);
+    expect(owed).toBeGreaterThan(0);
+    expect(AskAnswers.takeDropped(TAB)).toBe(0); // said once
   });
 
   it("never throws when the flusher does", () => {
