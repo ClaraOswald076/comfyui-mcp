@@ -348,11 +348,54 @@ describe("flattenUiWorkflow — Use-Everywhere", () => {
     expect(link[1]).toBe(1);
   });
 
-  it("UE senders without ue_links are left in place with a loud warning", () => {
+  it("UE senders with a MISSING ue_links list are left in place with a loud warning", () => {
     const { graph, report } = flattenUiWorkflow(ueGraph(false));
     expect(report.removed.ue).toBe(0);
     expect(graph.nodes.some((n) => n.type === "Anything Everywhere")).toBe(true);
-    expect(report.warnings.some((w) => w.includes("ue_links is empty"))).toBe(true);
+    expect(report.warnings.some((w) => w.includes("ue_links is missing"))).toBe(true);
+  });
+
+  it("an EMPTY computed ue_links list is an answer — no warning, and nothing removed", () => {
+    // The pack analysed the graph and recorded no broadcast. Warning there invents
+    // a problem on a faithful graph (and disagreed with the converter); an empty
+    // list is also not a licence to delete the senders.
+    const g = ueGraph(true);
+    g.extra!.ue_links = [];
+    const { graph, report } = flattenUiWorkflow(g);
+    expect(report.removed.ue).toBe(0);
+    expect(graph.nodes.some((n) => n.type === "Anything Everywhere")).toBe(true);
+    expect(report.warnings).toEqual([]);
+  });
+
+  it("a Get/Set chain resolving to a producer the graph lacks is reported, not silently cleared", () => {
+    // Pass 1 resolves the bus, but the producer serializes no output slot, so no
+    // replacement link can be built. Discarding that left the virtual deleted and
+    // the consumer quietly disconnected.
+    const g: UiWorkflow = {
+      nodes: [
+        node(1, "CheckpointLoaderSimple"), // no outputs array at all
+        node(2, "SetNode", {
+          widgets_values: ["m"],
+          inputs: [{ name: "MODEL", type: "MODEL", link: 10 }],
+          outputs: [{ name: "*", type: "*", links: [] }],
+        }),
+        node(3, "GetNode", {
+          widgets_values: ["m"],
+          outputs: [{ name: "MODEL", type: "MODEL", links: [11] }],
+        }),
+        node(4, "KSampler", { inputs: [{ name: "model", type: "MODEL", link: 11 }] }),
+      ],
+      links: [
+        [10, 1, 0, 2, 0, "MODEL"],
+        [11, 3, 0, 4, 0, "MODEL"],
+      ],
+      last_link_id: 11,
+    };
+    const { graph, report } = flattenUiWorkflow(g);
+    const sampler = graph.nodes.find((n) => n.type === "KSampler")!;
+    expect(sampler.inputs![0].link).toBeNull();
+    expect(report.warnings.join("\n")).toContain("which this graph does not have");
+    expect(report.warnings.join("\n")).toContain('KSampler #4 input "model"');
   });
 
   it("skips a ue_link whose receiver input got a real link since analysis", () => {

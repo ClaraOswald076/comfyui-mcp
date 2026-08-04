@@ -226,7 +226,21 @@ export function flattenUiWorkflow(
           );
           continue;
         }
-        addDirectLink(resolved.id, resolved.slot, node.id, slot, resolved.type ?? link[5]);
+        const added = addDirectLink(resolved.id, resolved.slot, node.id, slot, resolved.type ?? link[5]);
+        if (added == null) {
+          // The chain resolved, but the edge could not be built — that producer or
+          // output slot is not in the graph. Discarding the null left the virtual
+          // deleted, no replacement link, and the final scrub quietly clearing the
+          // consumer: a real connection gone with nothing said.
+          inp.link = null;
+          const producer = nodesById.get(resolved.id);
+          warnings.push(
+            `${node.type} #${node.id} input "${inp.name ?? slot}" resolves through ${origin.type} #${origin.id} to node #${resolved.id}${
+              producer ? ` (${producer.type}) output slot ${resolved.slot}` : ""
+            }, which this graph does not have — left unconnected`,
+          );
+          continue;
+        }
         rewired++;
       }
     }
@@ -237,12 +251,17 @@ export function flattenUiWorkflow(
   const ueDeletable = new Set<number>();
   if (includeUe && ueSenders.length) {
     const ueLinks = (ui.extra?.ue_links as UeLink[] | undefined) ?? null;
-    if (!Array.isArray(ueLinks) || ueLinks.length === 0) {
+    // An EMPTY computed list is an ANSWER — the pack analysed the graph and
+    // recorded no broadcast — so there is nothing to materialize and nothing to
+    // report. Only an ABSENT (or non-array) list is an unknown. Folding the two
+    // together warned on a faithful graph, and disagreed with the converter.
+    // Either way the senders stay: an empty list is not a licence to delete them.
+    if (!Array.isArray(ueLinks)) {
       warnings.push(
-        `${ueSenders.length} Use-Everywhere sender(s) present but extra.ue_links is empty — ` +
+        `${ueSenders.length} Use-Everywhere sender(s) present but extra.ue_links is missing — ` +
           `UE broadcasts NOT materialized (open the graph with cg-use-everywhere active and save/queue once, then retry); senders left in place`,
       );
-    } else {
+    } else if (ueLinks.length > 0) {
       // A ue_links record is only as current as the last time the pack analysed
       // the graph. Materializing one without checking it against the LIVE wiring
       // invents a connection the graph does not have — which reads as a plausible
