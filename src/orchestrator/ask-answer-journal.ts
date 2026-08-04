@@ -77,6 +77,7 @@
 
 import { createHash } from "node:crypto";
 import { logger } from "../utils/logger.js";
+import { tabIncarnationSlot } from "../services/ui-bridge.js";
 
 /** How an answer relates to the asks this session dispatched. Computed ONCE, at
  *  arrival, and frozen onto the journal entry — a replay never re-correlates, so
@@ -407,6 +408,18 @@ export class AskAnswerJournalImpl {
   private disclosedUpTo = new Map<string, number>();
   private seq = 0;
   private ticketSeq = 0;
+  /**
+   * Which browser-tab INCARNATION currently holds a panel tab (#486).
+   *
+   * A `wf:<hash>` tab id names a saved workflow, so it recurs: a second browser
+   * tab opening that workflow takes the key over. Anything that holds or settles
+   * per-tab state must therefore be scoped to (tab, incarnation) — otherwise the
+   * newcomer reads, reports and ACKS the departed tab's bookkeeping, and the
+   * departed tab's own disclosure is silently marked told. Undefined when the tab
+   * is not currently connected.
+   */
+  private incarnationOf: ((key: string) => string | undefined) | null = null;
+
   /** Deliver a tab's newly-orphaned answers (see setFlusher). */
   private flush: ((key: string) => void) | null = null;
   /** Pull a still-queued answer event back off its agent (see setRevoker). */
@@ -454,6 +467,16 @@ export class AskAnswerJournalImpl {
    */
   setTurnAttacher(attach: (key: string, token: string) => string | null): void {
     this.attachTurn = attach;
+  }
+
+  /** Wire the per-tab incarnation lookup — see `incarnationOf`. */
+  setIncarnationResolver(resolve: (key: string) => string | undefined): void {
+    this.incarnationOf = resolve;
+  }
+
+  /** The debt bucket for a tab's CURRENT occupant. */
+  private debtSlot(key: string): string {
+    return tabIncarnationSlot(key, this.incarnationOf?.(key));
   }
 
   /**
@@ -848,8 +871,11 @@ export class AskAnswerJournalImpl {
    * than reporting it once at the first opportunity.
    */
   reportDropped(key: string): number {
-    const total = this.dropped.get(key) ?? 0;
-    const owed = total - (this.disclosedUpTo.get(key) ?? 0);
+    // THIS occupant's bucket only. A different browser tab that inherited the
+    // key has its own, so it can neither read nor settle the departed tab's.
+    const slot = this.debtSlot(key);
+    const total = this.dropped.get(slot) ?? 0;
+    const owed = total - (this.disclosedUpTo.get(slot) ?? 0);
     if (owed <= 0) return 0;
     // The debt is NOT spent by being written into a tool result. A ToolResult is
     // a hand-off, not a receipt — that IS #486 — so counting reports (an earlier
@@ -866,7 +892,7 @@ export class AskAnswerJournalImpl {
     // switched provider must not be able to certify a warning it never showed.
     // The token remembers the TOTAL it is showing, so its ack settles exactly
     // that and nothing that arrives afterwards.
-    if (carrier !== null) this.debtTokens.set(token, { key, carrier, upTo: total });
+    if (carrier !== null) this.debtTokens.set(token, { key: slot, carrier, upTo: total });
     return owed;
   }
 
@@ -885,22 +911,33 @@ export class AskAnswerJournalImpl {
    * answers themselves are still deliverable to the tab when it comes back; only
    * the count of answers whose TEXT is already gone is retired.
    */
-  retireDebt(key: string): void {
-    const owed = this.undisclosedDrop(key);
+  retireDebt(key: string, incarnation: string): void {
+    const slot = tabIncarnationSlot(key, incarnation);
+    const owed = this.undisclosedDrop(slot);
     if (owed > 0) {
       logger.error(
         `[ask-answers] tab ${key.slice(0, 8)} disconnected still owed a disclosure for ${owed} validated answer(s) whose content was already dropped — recording it here, as there is no longer anywhere to deliver it; treat those answers as UNDETERMINED`,
       );
     }
-    this.dropped.delete(key);
-    this.disclosedUpTo.delete(key);
-    for (const [t, d] of [...this.debtTokens]) if (d.key === key) this.debtTokens.delete(t);
+    this.dropped.delete(slot);
+    this.disclosedUpTo.delete(slot);
+    for (const [t, x] of [...this.debtTokens]) if (x.key === slot) this.debtTokens.delete(t);
   }
 
   /** The part of a tab's eviction total that has NOT yet been surfaced and
    *  confirmed. See disclosedUpTo. */
-  private undisclosedDrop(key: string): number {
-    return Math.max(0, (this.dropped.get(key) ?? 0) - (this.disclosedUpTo.get(key) ?? 0));
+  private undisclosedDrop(slot: string): number {
+    return Math.max(0, (this.dropped.get(slot) ?? 0) - (this.disclosedUpTo.get(slot) ?? 0));
+  }
+
+  /** Every debt bucket belonging to a panel tab, across all its incarnations. */
+  private debtSlotsFor(key: string): string[] {
+    // A slot is `["<tabId>",<incarnation>]`, so the tab's slots are exactly those
+    // starting `["<tabId>",` — JSON-escaped, so no tab id can spoof another's.
+    const prefix = `[${JSON.stringify(key)},`;
+    return [...new Set([...this.dropped.keys(), ...this.disclosedUpTo.keys()])].filter((s) =>
+      s.startsWith(prefix),
+    );
   }
 
   /** Answers this tab lost to an eviction and has not yet been told about. */
@@ -908,7 +945,11 @@ export class AskAnswerJournalImpl {
     const carried = [...this.entries.values()]
       .filter((e) => e.key === key)
       .reduce((n, e) => n + (e.disclose ?? 0), 0);
-    return carried + this.undisclosedDrop(key);
+    // Every incarnation's bucket: a diagnostic view of what this TAB is owed,
+    // whoever is holding it now.
+    return (
+      carried + this.debtSlotsFor(key).reduce((n, slot) => n + this.undisclosedDrop(slot), 0)
+    );
   }
 
   /** Entries awaiting a push attempt for this key, in arrival order. */
@@ -939,7 +980,7 @@ export class AskAnswerJournalImpl {
   ): { delivered: number; blockedOn: AskEntry | null } {
     let delivered = 0;
     for (const entry of this.pending(key)) {
-      const lost = (entry.disclose ?? 0) + this.undisclosedDrop(key);
+      const lost = (entry.disclose ?? 0) + this.undisclosedDrop(this.debtSlot(key));
       const payload: AskAnswerEvent = {
         kind: "ask_answer",
         ask_question: entry.question,
@@ -959,8 +1000,9 @@ export class AskAnswerJournalImpl {
         // If this agent dies before its turn runs, the entry is released and
         // replayed, and the warning must go with it. Only ack() clears it.
         entry.disclose = lost;
-        this.dropped.delete(key);
-        this.disclosedUpTo.delete(key);
+        const slot = this.debtSlot(key);
+        this.dropped.delete(slot);
+        this.disclosedUpTo.delete(slot);
       }
       delivered += 1;
     }
@@ -1074,7 +1116,7 @@ export class AskAnswerJournalImpl {
     // answer was lost, and it is destroyed by a teardown exactly as an entry is —
     // tearing down while one is owed turns a disclosed loss back into a silent
     // one, which is the whole thing this journal exists to prevent.
-    for (const key of this.dropped.keys()) if (this.undisclosedDrop(key) > 0) return true;
+    for (const slot of this.dropped.keys()) if (this.undisclosedDrop(slot) > 0) return true;
     return [...this.entries.values()].some(
       (e) => e.delivery !== "none" || (e.disclose ?? 0) > 0,
     );
@@ -1117,9 +1159,13 @@ export class AskAnswerJournalImpl {
    *  name a loss whose carrier is only a counter. */
   outstandingDebt(): Array<{ key: string; count: number }> {
     const byTab = new Map<string, number>();
-    for (const key of this.dropped.keys()) {
-      const owed = this.undisclosedDrop(key);
-      if (owed > 0) byTab.set(key, (byTab.get(key) ?? 0) + owed);
+    for (const slot of this.dropped.keys()) {
+      const owed = this.undisclosedDrop(slot);
+      if (owed <= 0) continue;
+      // The exit disclosure names TABS, not incarnations — every incarnation's
+      // loss belongs to the tab the user is looking at.
+      const key = JSON.parse(slot)[0] as string;
+      byTab.set(key, (byTab.get(key) ?? 0) + owed);
     }
     for (const e of this.entries.values()) {
       if ((e.disclose ?? 0) > 0) byTab.set(e.key, (byTab.get(e.key) ?? 0) + e.disclose!);
@@ -1160,15 +1206,22 @@ export class AskAnswerJournalImpl {
     for (const debt of this.debtTokens.values()) {
       if (debt.key === from) debt.key = to;
     }
-    const lost = this.undisclosedDrop(from);
-    if (this.dropped.has(from)) {
-      this.dropped.delete(from);
-      this.disclosedUpTo.delete(from);
-      // Carry the UNDISCLOSED remainder only — what the source tab was already
-      // told is told, and re-importing it would warn the destination twice.
-      this.dropped.set(to, (this.dropped.get(to) ?? 0) + lost);
-      // The destination inherits the DEBT but not the source's report credit:
-      // those reports went to the source tab's agent, not this one's.
+    // Every incarnation's bucket moves with the tab id, keeping its own
+    // incarnation: the id changed, the browser tabs did not.
+    for (const slot of this.debtSlotsFor(from)) {
+      const [, incarnation] = JSON.parse(slot) as [string, string | null];
+      // Carry the UNDISCLOSED remainder only — what was already told is told,
+      // and re-importing it would warn the destination twice.
+      const lost = this.undisclosedDrop(slot);
+      this.dropped.delete(slot);
+      this.disclosedUpTo.delete(slot);
+      if (lost <= 0) continue;
+      const moved = tabIncarnationSlot(to, incarnation ?? undefined);
+      this.dropped.set(moved, (this.dropped.get(moved) ?? 0) + lost);
+    }
+    for (const debt of this.debtTokens.values()) {
+      const [tab, incarnation] = JSON.parse(debt.key) as [string, string | null];
+      if (tab === from) debt.key = tabIncarnationSlot(to, incarnation ?? undefined);
     }
   }
 
@@ -1196,17 +1249,22 @@ export class AskAnswerJournalImpl {
     // belongs to — while the newer epoch keeps it from being armed for a push at
     // a tab id no agent answers to, exactly as for a replaced conversation.
     this.tabEpoch.set(key, (this.tabEpoch.get(key) ?? 0) + 1);
-    const owed = this.undisclosedDrop(key);
+    const slots = this.debtSlotsFor(key);
+    const owed = slots.reduce((n, slot) => n + this.undisclosedDrop(slot), 0);
     if (owed > 0) {
       logger.error(
         `[ask-answers] tab ${key.slice(0, 8)} is gone still owed a disclosure for ${owed} evicted answer(s) — it will never be told`,
       );
     }
-    this.dropped.delete(key);
-    this.disclosedUpTo.delete(key);
+    for (const slot of slots) {
+      this.dropped.delete(slot);
+      this.disclosedUpTo.delete(slot);
+    }
     // Both halves together — see moveKey. A token left behind here would let a
     // later ack clear a debt for a tab that no longer exists.
-    for (const [t, d] of [...this.debtTokens]) if (d.key === key) this.debtTokens.delete(t);
+    for (const [t, x] of [...this.debtTokens]) {
+      if ((JSON.parse(x.key) as [string, string | null])[0] === key) this.debtTokens.delete(t);
+    }
   }
 
   /**
@@ -1296,7 +1354,7 @@ export class AskAnswerJournalImpl {
   }
   /** Strand an eviction debt on a tab without staging 48 evictions. */
   noteDroppedForTest(key: string, count: number): void {
-    this.dropped.set(key, (this.dropped.get(key) ?? 0) + count);
+    this.dropped.set(this.debtSlot(key), (this.dropped.get(this.debtSlot(key)) ?? 0) + count);
   }
   /** Record + hand back in one step, returning the token. */
   markReturnedForTest(askId: string, reply: unknown, tabId: string): string {
@@ -1359,7 +1417,7 @@ export class AskAnswerJournalImpl {
       carrier.disclose = (carrier.disclose ?? 0) + count;
       return;
     }
-    this.dropped.set(key, (this.dropped.get(key) ?? 0) + count);
+    this.dropped.set(this.debtSlot(key), (this.dropped.get(this.debtSlot(key)) ?? 0) + count);
     // NO CEILING HERE, deliberately.
     //
     // This map is not payload — it is the PROMISE that a loss will be reported,

@@ -90,6 +90,7 @@ beforeEach(() => {
   AskAnswers.setFlusher(() => {});
   AskAnswers.setRevoker(() => false); // nothing queued unless a test says so
   AskAnswers.setTurnAttacher(() => TURN); // a live turn, unless a test says otherwise
+  AskAnswers.setIncarnationResolver(() => undefined); // one occupant, unless a test says otherwise
 });
 
 describe("ask-answer journal — an answer survives its tool call (#486)", () => {
@@ -1385,6 +1386,59 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     AskAnswers.ack(tokens[1], { carrier: TURN });
     expect(AskAnswers.droppedFor(TAB)).toBe(3);
     expect(AskAnswers.hasOutstanding()).toBe(true);
+  });
+
+  // Coordinator gate P0: the CLOCK was incarnation-scoped but the DEBT was not.
+  // After A disconnects owing a disclosure, B opens the same recurring key and
+  // calls panel_ask — and A's debt was reported into B's result and settled by
+  // B's ack, so A's own gone-callback later found nothing to disclose. Cross-tab
+  // delivery AND acknowledgement, one layer below where the keying was fixed.
+  it("a NEW tab on the same key neither reads nor settles the departed tab's debt", () => {
+    let holder: string | undefined = "browser-tab-A";
+    AskAnswers.setIncarnationResolver(() => holder);
+    const tokens: string[] = [];
+    AskAnswers.setTurnAttacher((_key, token) => {
+      tokens.push(token);
+      return TURN;
+    });
+
+    // A strands a debt on the shared key.
+    AskAnswers.noteDroppedForTest(TAB, 3);
+    expect(AskAnswers.reportDropped(TAB)).toBe(3);
+    AskAnswers.ack(tokens[0], { carrier: TURN }); // A was told, and settles it
+    expect(AskAnswers.droppedFor(TAB)).toBe(0);
+
+    // A strands a SECOND debt and then leaves without being told.
+    AskAnswers.noteDroppedForTest(TAB, 2);
+    expect(AskAnswers.droppedFor(TAB)).toBe(2);
+
+    // A different browser tab takes the key over and asks a question.
+    holder = "browser-tab-B";
+    expect(AskAnswers.reportDropped(TAB)).toBe(0); // B is owed nothing
+    // …and even a well-formed ack from B settles nothing of A's.
+    AskAnswers.noteDroppedForTest(TAB, 1); // B's own, later loss
+    expect(AskAnswers.reportDropped(TAB)).toBe(1);
+    AskAnswers.ack(tokens[tokens.length - 1], { carrier: TURN });
+
+    // A's 2 are still owed and still surface when A is finally declared gone.
+    holder = "browser-tab-A";
+    expect(AskAnswers.reportDropped(TAB)).toBe(2);
+    expect(AskAnswers.hasOutstanding()).toBe(true);
+    AskAnswers.setIncarnationResolver(() => undefined);
+  });
+
+  it("retiring one incarnation's debt leaves the other's alone", () => {
+    let holder: string | undefined = "browser-tab-A";
+    AskAnswers.setIncarnationResolver(() => holder);
+    AskAnswers.noteDroppedForTest(TAB, 2);
+    holder = "browser-tab-B";
+    AskAnswers.noteDroppedForTest(TAB, 5);
+    expect(AskAnswers.droppedFor(TAB)).toBe(7); // the tab is owed both
+
+    AskAnswers.retireDebt(TAB, "browser-tab-A"); // A's departure is disclosed
+    expect(AskAnswers.droppedFor(TAB)).toBe(5); // B's survives, untouched
+    expect(AskAnswers.reportDropped(TAB)).toBe(5);
+    AskAnswers.setIncarnationResolver(() => undefined);
   });
 
   it("never throws when the flusher does", () => {

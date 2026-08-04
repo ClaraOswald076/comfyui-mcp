@@ -2133,6 +2133,11 @@ export async function runPanelOrchestrator(): Promise<void> {
   // receipt for the ordinary path and must treat every answer as possibly lost;
   // with it, "the model read this" is a fact and only the genuinely unconfirmed
   // ones are held open (#486).
+  // #486 — a `wf:<hash>` tab id names a WORKFLOW, so a second browser tab can
+  // take it over. The journal scopes every per-tab debt to whoever is actually
+  // holding the key, so the newcomer can neither be told nor settle the
+  // departed tab's owed disclosure.
+  AskAnswers.setIncarnationResolver((panelTabId) => bridge.tabIncarnation(panelTabId));
   AskAnswers.setTurnAttacher((panelTabId, token) =>
     manager.attachTurnToken(agentKeyFor(panelTabId), token),
   );
@@ -2140,7 +2145,7 @@ export async function runPanelOrchestrator(): Promise<void> {
   // warning is owed), so it needs a LIFECYCLE end instead: a tab leaving the
   // bridge's connection map surfaces whatever it is still owed and retires it.
   // Journal entries survive — a disconnect is usually a reload.
-  bridge.setTabGoneListener((tabId) => AskAnswers.retireDebt(tabId));
+  bridge.setTabGoneListener((tabId, incarnation) => AskAnswers.retireDebt(tabId, incarnation));
   bridge.setLateAskReplySink((askId, result, tabId) => {
     if (!AskAnswers.tracks(askId)) return;
     const entry = AskAnswers.record(askId, result, { tabId });

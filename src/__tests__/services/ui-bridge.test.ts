@@ -3275,6 +3275,53 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
     bridge.setTabGoneListener(() => {});
   });
 
+  // Coordinator gate P1: two tabs open at once on one key. B's hello SUPERSEDES
+  // A's socket, so by the time A's close handler runs the map already points at
+  // B — and an "was I the primary?" guard answers no for a tab that very much
+  // did just leave, so A was never armed at all and could never be declared gone.
+  it("a tab superseded by a second tab on the same key is still declared gone", async () => {
+    const gone: string[] = [];
+    bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: 250 });
+    const tabA = await connectPanel("wf:takeover", "wf", { tabSessionId: "browser-tab-A" });
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:takeover")).toBe(true));
+
+    // B opens the SAME saved workflow while A is still connected. The bridge
+    // supersedes A's socket rather than refusing B.
+    const tabB = await connectPanel("wf:takeover", "wf", { tabSessionId: "browser-tab-B" });
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:takeover")).toBe(true));
+
+    // A left, even though it never got to be "the primary that disconnected".
+    await vi.waitFor(() => expect(gone).toEqual(["wf:takeover"]), { timeout: 3000 });
+    tabB.close();
+    void tabA;
+    bridge.setTabGoneListener(() => {});
+  });
+
+  // …and P1-2: anonymous panels must NOT share one slot. The panel omits its
+  // identity precisely when its Web Locks lease could not be acquired — i.e.
+  // when a duplicate tab copied the sessionStorage id — so the anonymous path
+  // IS the two-tabs-one-key case, not an exotic edge.
+  it("two anonymous departures on one key are both declarable", async () => {
+    const gone: string[] = [];
+    bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: 1200 });
+    const anonA = await connectPanel("wf:anon", "wf"); // no tab_session_id
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:anon")).toBe(true));
+    anonA.close();
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:anon")).toBe(false));
+
+    const anonB = await connectPanel("wf:anon", "wf"); // also anonymous
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:anon")).toBe(true));
+    anonB.close();
+    expect(gone).toEqual([]); // neither clock has elapsed yet
+
+    // Two unproven departures, two owed warnings — the second must not overwrite
+    // or clear the first.
+    await vi.waitFor(() => expect(gone.filter((t) => t === "wf:anon")).toHaveLength(2), {
+      timeout: 6000,
+    });
+    bridge.setTabGoneListener(() => {});
+  });
+
   it("an unidentified panel cannot prove it came back, so the clock still fires", async () => {
     const gone: string[] = [];
     bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: 200 });

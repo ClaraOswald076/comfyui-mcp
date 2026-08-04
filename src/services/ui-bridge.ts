@@ -110,6 +110,23 @@ interface Conn {
    * tab across a ComfyUI restart. It is used only as an accidental-routing
    * correctness proof for restart readiness; absence fails that proof closed. */
   tabSessionId?: string;
+  /**
+   * ALWAYS-PRESENT incarnation identity for this connection (#486).
+   *
+   * `tabSessionId` when the panel proved one, otherwise a bridge-minted
+   * `anon:<n>` unique to THIS connection. Never absent, and never shared: the
+   * panel returns no identity precisely when its Web Locks lease could not be
+   * acquired — i.e. when a duplicated browser tab copied the sessionStorage id —
+   * which is exactly the two-tabs-one-key case, so collapsing all such
+   * connections into one "anonymous" bucket would lose the very distinction that
+   * matters most. Distinct by construction instead.
+   *
+   * Kept SEPARATE from `tabSessionId` on purpose: that field is a proof used by
+   * the restart-readiness gate (#570/#709) and must stay absent when unproven. A
+   * synthetic id is fine for "which connection is this?" and would be a lie for
+   * "did the same browser tab come back?".
+   */
+  incarnationId: string;
   /** Canvas-less client (mobile/remote pseudo-panel) — advertised in `hello`.
    *  Lets tools resolve media to inline bytes instead of a browser /view ref. */
   headless: boolean;
@@ -733,7 +750,7 @@ export function isCapabilityRefusal(err: unknown): boolean {
  * exactly the distinction the clock has to draw. JSON-encoded so neither part
  * can be forged into the other by a separator.
  */
-function tabGoneSlot(tabId: string, incarnation: string | undefined): string {
+export function tabIncarnationSlot(tabId: string, incarnation: string | undefined): string {
   return JSON.stringify([tabId, incarnation ?? null]);
 }
 
@@ -915,7 +932,7 @@ export class UiBridge {
    */
   private lateAskSink: ((askId: string, result: unknown, tabId: string) => void) | null = null;
   /** See setTabGoneListener. */
-  private onTabGone: ((tabId: string) => void) | null = null;
+  private onTabGone: ((tabId: string, incarnation: string) => void) | null = null;
   /**
    * How long a tab must stay away before it counts as GONE rather than
    * reconnecting.
@@ -929,6 +946,18 @@ export class UiBridge {
   private tabGoneGraceMs = 60_000;
   /** Armed tab-gone clocks, keyed by (tab id, incarnation) — see armTabGone. */
   private tabGoneTimers = new Map<string, { timer: ReturnType<typeof setTimeout> }>();
+  /** Counter behind the synthetic `anon:<n>` incarnations. */
+  private nextAnonIncarnation = 0;
+  /**
+   * Which (tab, incarnation) each live socket registered as.
+   *
+   * The close handler needs this because "was I the primary connection?" is the
+   * WRONG question: when a second tab takes over a recurring `wf:<hash>` key the
+   * bridge closes the first socket, and by the time that close fires the map
+   * already points at the newcomer — so the departing tab was never armed at all
+   * and could never be declared gone. The socket knows who it was; ask it.
+   */
+  private sockIncarnation = new Map<BridgeSocket, { tabId: string; incarnation: string }>();
   /** Buffered late-but-valid ask_user answers (ask_id → result), drained by the
    *  caller via takeLateAskReply(). Bounded by a short TTL — a stale unclaimed
    *  answer is pruned rather than kept forever. */
@@ -1414,7 +1443,12 @@ export class UiBridge {
         // report and settle the departed tab's lost-answer disclosure as its own.
         // Same key is not the same tab; only the same incarnation coming back is
         // a proven return.
-        this.cancelTabGone(tabId, incomingTabSessionId);
+        // ALWAYS an identity for this connection — the panel's proven one, or a
+        // fresh synthetic. See PanelConn.incarnationId for why anonymous ones must
+        // be distinct rather than shared.
+        const incarnationId = incomingTabSessionId ?? `anon:${++this.nextAnonIncarnation}`;
+        this.sockIncarnation.set(sock, { tabId, incarnation: incarnationId });
+        this.cancelTabGone(tabId, incarnationId);
         this.conns.set(tabId, {
           sock,
           tabId,
@@ -1426,6 +1460,7 @@ export class UiBridge {
           // otherwise it cannot prove that the tab receiving the reboot is the
           // tab that came back afterwards.
           tabSessionId: incomingTabSessionId,
+          incarnationId,
           headless: incomingHeadless,
           panelVersion:
             typeof (msg as { panel_version?: unknown }).panel_version === "string"
@@ -1685,12 +1720,16 @@ export class UiBridge {
         if (set.delete(sock) && set.size === 0) this.subscribers.delete(tid);
       }
       this.mirrorViewers.delete(sock);
+      // #486 — WHICH connection just died, from the socket itself. Asked before
+      // any of the map surgery below, and independently of whether this socket
+      // was still the primary: a second tab taking over a recurring key closes
+      // this one AFTER installing itself, so "am I in the map?" answers no for a
+      // tab that very much did just leave.
+      const departing = this.sockIncarnation.get(sock);
+      this.sockIncarnation.delete(sock);
       let wasPrimary = false;
       if (tabId && this.conns.get(tabId)?.sock === sock) {
         wasPrimary = true;
-        // #486 — capture WHICH incarnation is leaving before the record goes;
-        // the gone-clock is armed for that browser tab, not for the key.
-        const departingIncarnation = this.conns.get(tabId)?.tabSessionId;
         this.conns.delete(tabId);
         if (this.lastActiveTabId === tabId) this.setLastActiveTab(null);
         // The mirrored desktop tab is gone — detach its viewers so their input
@@ -1700,16 +1739,20 @@ export class UiBridge {
           if (drivenTab === tabId) this.mirrorViewers.delete(s);
         }
         this.subscribers.delete(tabId);
-        // #486 — a socket close is NOT evidence the tab is gone; it is evidence a
-        // socket closed, and an ordinary F5 produces exactly this. So the
-        // tab-gone listener is ARMED here and only fires if the tab stays away
-        // for the grace: a reload cancels it on the re-hello (see armTabGone).
-        this.armTabGone(tabId, departingIncarnation);
         logger.info(
           `[ui-bridge] panel tab disconnected: ${tabId.slice(0, 8)} — ${this.conns.size} tab(s) remain`,
         );
       }
       if (wasPrimary) this.broadcastTabList(); // a desktop tab left — refresh pickers
+      // #486 — a socket close is NOT evidence the tab is gone; it is evidence a
+      // socket closed, and an ordinary F5 produces exactly this. Arm the clock for
+      // THIS connection's incarnation and let it fire only if that incarnation
+      // stays away. Armed whether or not the socket was still primary: a takeover
+      // by a second tab on the same recurring key leaves the departing tab out of
+      // the map, and it is exactly the one that must still be declarable.
+      if (departing && this.conns.get(departing.tabId)?.incarnationId !== departing.incarnation) {
+        this.armTabGone(departing.tabId, departing.incarnation);
+      }
       // An in-flight command's socket just died. Instead of hard-failing every one
       // with a bare "disconnected" (which reads as a clean failure and invites a
       // blind retry — double render for a run), hand each to the disconnect handler:
@@ -2004,7 +2047,10 @@ export class UiBridge {
    *  connection map (#486). Lets per-tab bookkeeping that can only ever be
    *  delivered to that tab be surfaced and retired, instead of accumulating for
    *  a tab that may never reconnect. */
-  setTabGoneListener(listener: (tabId: string) => void, opts: { graceMs?: number } = {}): void {
+  setTabGoneListener(
+    listener: (tabId: string, incarnation: string) => void,
+    opts: { graceMs?: number } = {},
+  ): void {
     this.onTabGone = listener;
     if (typeof opts.graceMs === "number" && opts.graceMs >= 0) this.tabGoneGraceMs = opts.graceMs;
   }
@@ -2020,13 +2066,13 @@ export class UiBridge {
    * disclosure surface — folding "could not tell" into "it's back" is how a
    * warning goes missing.
    */
-  private armTabGone(tabId: string, incarnation: string | undefined): void {
+  private armTabGone(tabId: string, incarnation: string): void {
     if (!this.onTabGone) return;
     // Keyed per INCARNATION, so two browser tabs that share a recurring
     // `wf:<hash>` key each get their own clock. Keyed by tab id alone, the
     // second tab's departure would silently drop the first tab's pending
     // signal and it would never be declarable gone at all.
-    const slot = tabGoneSlot(tabId, incarnation);
+    const slot = tabIncarnationSlot(tabId, incarnation);
     const prev = this.tabGoneTimers.get(slot);
     if (prev) clearTimeout(prev.timer);
     const timer = setTimeout(() => {
@@ -2034,10 +2080,11 @@ export class UiBridge {
       // Re-check, on the INCARNATION and not just the key: something else may
       // now hold this recurring id, and a stranger holding the key is not this
       // tab coming back.
-      const now = this.conns.get(tabId);
-      if (now && incarnation !== undefined && now.tabSessionId === incarnation) return;
+      // Re-check on the INCARNATION, not the key: something else may now hold
+      // this recurring id, and a stranger holding the key is not this tab back.
+      if (this.conns.get(tabId)?.incarnationId === incarnation) return;
       try {
-        this.onTabGone?.(tabId);
+        this.onTabGone?.(tabId, incarnation);
       } catch (err) {
         logger.warn(
           `[ui-bridge] tab-gone listener threw for ${tabId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`,
@@ -2059,11 +2106,12 @@ export class UiBridge {
    * unconditionally, for the deliberate teardown path that has no incarnation to
    * name.
    */
-  private cancelTabGone(tabId: string, incarnation: string | undefined): void {
-    // An UNIDENTIFIED hello (an old panel that sends no `tab_session_id`) proves
-    // nothing about which tab came back, so it cancels nothing.
-    if (incarnation === undefined) return;
-    const slot = tabGoneSlot(tabId, incarnation);
+  private cancelTabGone(tabId: string, incarnation: string): void {
+    // Only the SAME incarnation cancels. An anonymous connection gets a fresh
+    // synthetic id, so it can never match a predecessor's slot — an unidentified
+    // panel therefore still cannot suppress anyone's owed warning, which is the
+    // asymmetry this must preserve.
+    const slot = tabIncarnationSlot(tabId, incarnation);
     const armed = this.tabGoneTimers.get(slot);
     if (!armed) return;
     clearTimeout(armed.timer);
@@ -2076,6 +2124,13 @@ export class UiBridge {
     if (!e) return undefined;
     this.lateAskReplies.delete(askId);
     return e.result;
+  }
+
+  /** The incarnation currently holding `tabId` — the identity every structure
+   *  that stores per-tab state must scope to, so a different browser tab taking
+   *  over a recurring `wf:<hash>` key cannot read, settle or inherit it (#486). */
+  tabIncarnation(tabId: string): string | undefined {
+    return this.conns.get(tabId)?.incarnationId;
   }
 
   /** All currently connected tabs, most recent hello last. */
