@@ -58,6 +58,13 @@ import { getNsfwConsent, setNsfwConsent } from "../services/panel-settings.js";
 import { QueueMonitor } from "../services/queue-monitor.js";
 import { RunCompletions } from "./run-completion-journal.js";
 import {
+  AskAnswers,
+  askFingerprint,
+  PANEL_ASK_ID_PREFIX,
+  type AskEntry,
+  type AskRecovery,
+} from "./ask-answer-journal.js";
+import {
   getClient,
   getObjectInfo,
   backfillObjectInfo,
@@ -2254,7 +2261,7 @@ async function userdataFetch(route: string): Promise<Response> {
  * earlier).
  *
  * Only the literal lowercase FORWARD-slash spelling counts (codex MAJOR). ComfyUI
- * store keys are always "/"-separated and lowercase here, so `workflowsoo.json`
+ * store keys are always "/"-separated and lowercase here, so `workflows\foo.json`
  * and `WORKFLOWS/foo.json` are ordinary names — a real subfolder on a
  * case-sensitive host, or a legal literal filename on POSIX — and stripping either
  * would rewrite a request into one for a different graph.
@@ -2277,7 +2284,7 @@ const stripLibraryPrefix = (key: string): string => key.replace(/^workflows\//, 
  * subfolder matches only that exact path.
  *
  * Path separators are deliberately NOT folded (codex MAJOR): on POSIX a file
- * literally named `diroo.json` is a DIFFERENT file from `dir/foo.json`. Case is
+ * literally named `dir\foo.json` is a DIFFERENT file from `dir/foo.json`. Case is
  * not folded either, for the same reason. Both are reported as near misses instead.
  */
 const matchName = (name: string): string => name.normalize("NFC");
@@ -3253,6 +3260,11 @@ export function makePanelToolCtx(
     const deadlineMs = Math.max(1, Math.min(base.deadlineMs, total));
     const graceMs = Math.max(0, total - deadlineMs);
     const timing = { deadlineMs, graceMs, pollMs: base.pollMs };
+    // ONE absolute ceiling for card wait + grace, anchored before any work — see
+    // pollLateAskReply's `hardDeadline`. Without it the two budgets are additive
+    // on top of everything else the handler does, which is how a bounded confirm
+    // still overran the enclosing tools/call budget.
+    const budgetEnd = Date.now() + total;
     const askId = randomUUID();
     try {
       ensureReachable();
@@ -3276,7 +3288,7 @@ export function makePanelToolCtx(
       // panel, transport failure) → "no" so the destructive op is SKIPPED, exactly
       // as the previous catch-all did.
       if (isReplyTimeoutError(err)) {
-        const late = await pollLateAskReply(bridge, askId, timing);
+        const late = await pollLateAskReply(bridge, askId, timing, budgetEnd);
         if (late !== undefined) return isAffirmative(late) ? "yes" : "no";
         return "timeout";
       }
@@ -3827,16 +3839,28 @@ function reResolveDesktopTab(ctx: PanelToolCtx, label: string): string | undefin
 }
 
 /** Poll the bridge's late-reply buffer for a validated ask answer that arrived
- *  after the card-reply timeout, up to the grace budget. undefined if none. */
+ *  after the card-reply timeout, up to the grace budget. undefined if none.
+ *
+ *  `hardDeadline` is an ABSOLUTE wall-clock ceiling (a timestamp), so the total
+ *  ask cannot creep past the enclosing MCP `tools/call` budget by accumulating
+ *  the pre-send work, the send itself and then a fresh full grace on top: the
+ *  grace only ever gets what is LEFT of the budget measured from the moment the
+ *  handler started. Without it the observed worst case is deadline + grace +
+ *  everything else, which is how an ask still ended in a raw transport timeout
+ *  instead of a clean result. */
 async function pollLateAskReply(
   bridge: PanelToolCtx["bridge"],
   askId: string,
   timing: AskTiming,
+  hardDeadline?: number,
 ): Promise<unknown | undefined> {
   const take = (bridge as unknown as { takeLateAskReply?: (id: string) => unknown })
     .takeLateAskReply;
   if (typeof take !== "function") return undefined;
-  const deadline = Date.now() + timing.graceMs;
+  const deadline = Math.min(
+    Date.now() + timing.graceMs,
+    hardDeadline ?? Number.POSITIVE_INFINITY,
+  );
   for (;;) {
     const late = take.call(bridge, askId);
     if (late !== undefined) return late;
@@ -3846,19 +3870,166 @@ async function pollLateAskReply(
   }
 }
 
+/** The tool result for an answer the user gave to THIS EXACT question earlier,
+ *  which no tool call was alive to receive (#486). Always says so, always quotes
+ *  the question it belongs to, and always says how old it is — a recovered
+ *  answer must never be readable as a fresh one, nor as an answer to anything
+ *  else. */
+function recoveredAskResult(entry: AskEntry): ToolResult {
+  const ageS = Math.max(0, Math.round((Date.now() - entry.answeredAt) / 1000));
+  return ok(
+    (entry.replayHint
+      ? `[NOTE] This answer has been handed to you before — it is being surfaced again because ` +
+        `the earlier hand-off could not be confirmed. Do not act on it twice.\n\n`
+      : ``) +
+      `[RECOVERED ANSWER] The user already answered this EXACT question ${ageS}s ago, but that ` +
+      `answer could not be handed back — the tool call that asked had already timed out, so ` +
+      `it was journaled instead of being lost (#486).\n\n` +
+      `QUESTION IT ANSWERS: ${entry.question ?? "(unrecorded)"}\n` +
+      `THE USER'S ANSWER: ${entry.answer}\n\n` +
+      `This is their answer to THAT question and to nothing else. It was given ${ageS}s ago, ` +
+      `not just now — do not re-ask it, but if something relevant has changed since, confirm ` +
+      `before acting on it.`,
+  );
+}
+
 /**
- * Run a panel_ask: render the choice card and return the user's pick. Clamps the
- * card deadline under the MCP tools/call budget and, on a reply-timeout, honors a
- * late-but-valid answer from the bridge's late-reply buffer before failing (#486).
+ * The honest failure for an ask nobody answered — plus every validated answer
+ * for this tab that could NOT be attributed to the question just asked.
+ *
+ * Those answers are quoted WITH their own question, never on their own: an
+ * unattributed answer that is merely mentioned invites the agent to use it for
+ * the question at hand, which is the misattribution this whole path exists to
+ * prevent. Reporting them beats swallowing them — the user did answer something.
+ */
+function askTimeoutResult(
+  tabId: string,
+  fingerprint: string,
+  recovery: AskRecovery,
+): ToolResult {
+  let text =
+    "The question card was not answered in time (or no interactive panel surface " +
+    "rendered it — e.g. an exec/headless run), so nothing was selected. If you " +
+    "still need the decision, ask the user directly in plain chat text, or " +
+    "re-invoke panel_ask from an interactive ComfyUI tab.";
+  // What is surfaced, and why each:
+  //  • an answer that reached NO tool call — nobody has it, so it must be told;
+  //  • an answer to THIS EXACT question that DID reach a tool call but could not
+  //    be returned now (too old to present as a fresh decision, or its
+  //    conversation was replaced). "It went into a ToolResult" is precisely the
+  //    thing this file says is not proof of receipt (that IS #486), so it is
+  //    reported rather than quietly forgotten — the agent is told the user
+  //    answered this before and can decide whether to re-ask.
+  // The fingerprint match is what makes the second bullet safe AND what makes it
+  // reachable: revoking recoverability must not also revoke the disclosure, so
+  // an entry that is no longer allowed to ANSWER keeps its fingerprint and is
+  // still recognised here as being about the question at hand.
+  // An answer that reached a caller and belongs to a DIFFERENT question is not
+  // news and stays quiet.
+  // `recovery.others` has ALREADY been gated by the journal to what this
+  // conversation may see; this only narrows it further to what is NEWS.
+  const orphans =
+    recovery.status === "unattributed"
+      ? recovery.others.filter((e) => !e.returned || e.fingerprint === fingerprint)
+      : [];
+  const withheld = recovery.status === "unattributed" ? recovery.withheld : 0;
+  if (orphans.length > 0) {
+    text +=
+      `\n\nHOWEVER — the user DID validate ${orphans.length} answer(s) on this tab that could NOT be ` +
+      `attributed to the question you just asked. They are reported here rather than discarded. ` +
+      `Each answers ONLY its own question below; do NOT use any of them as the answer to the ` +
+      `question you just asked:\n` +
+      orphans
+        .map(
+          (e) =>
+            `  • QUESTION: ${e.question ?? "(UNRECORDED — this answer cannot be tied to any question this session asked; its meaning is UNDETERMINED)"}\n` +
+            `    ANSWER: ${e.answer}`,
+        )
+        .join("\n");
+  }
+  if (withheld > 0) {
+    // Said, never shown. These belong to a different browser tab on this
+    // recurring key, or to a conversation that has been replaced — rendering
+    // their chosen option here would leak exactly what the boundary contains, so
+    // the count is the disclosure and the text stays in the durable log.
+    text +=
+      `\n\nAlso: ${withheld} validated answer(s) on this tab belong to a DIFFERENT conversation ` +
+      `or browser tab (a new chat, a rewind, a provider switch, or another tab holding this ` +
+      `workflow). They are not shown here and are not yours to act on — if you need this ` +
+      `decision, ask again.`;
+  }
+  return fail(text);
+}
+
+/** The tab's undisclosed eviction debt, appended to whatever is being reported.
+ *  Every exit from the ask path runs through this — an eviction the journal
+ *  promised to report must not go unsaid just because THIS ask happened to
+ *  succeed. Reading it also SPENDS it (droppedFor is drained by the journal only
+ *  when a push carries it), so it is said once. */
+function withDroppedText(tabId: string, text: string): string {
+  const dropped = AskAnswers.reportDropped(tabId);
+  if (dropped <= 0) return text;
+  return (
+    `${text}\n\n⚠️ ${dropped} further validated answer(s) for this tab were dropped before they ` +
+    `could be delivered — their content is UNDETERMINED and cannot be recovered. Ask the user ` +
+    `again for anything you were waiting on.`
+  );
+}
+
+/** Same, for a ToolResult that is already built (the success/recovery paths). */
+function withDroppedAnswerWarning(tabId: string, res: ToolResult): ToolResult {
+  const first = res.content[0];
+  if (!first || first.type !== "text") return res;
+  const text = withDroppedText(tabId, first.text);
+  if (text === first.text) return res;
+  return { ...res, content: [{ type: "text", text }, ...res.content.slice(1)] };
+}
+
+/**
+ * Run a panel_ask: render the choice card and return the user's pick.
+ *
  * Sent DIRECTLY over the bridge (like the confirm/consent cards) so a stable
- * `ask_id` can key the late-reply buffer.
+ * `ask_id` keys both the bridge's late-reply buffer and the durable ask journal.
+ *
+ * #486, in three layers:
+ *  1. CLAMP the card deadline under the MCP `tools/call` budget, and hold the
+ *     whole handler (card wait + grace poll) to ONE absolute wall-clock ceiling
+ *     anchored at entry, so the ask always resolves as a clean tool result
+ *     rather than dying as a raw transport timeout.
+ *  2. JOURNAL every validated answer at the moment it validates — including one
+ *     that arrives with no caller left (via the bridge's late-answer sink). An
+ *     answer that reaches a ToolResult is journaled too, because a ToolResult is
+ *     a hand-off and not proof: the request may already have been abandoned.
+ *  3. On a card timeout, RECOVER the answer the user already gave to THIS EXACT
+ *     question — matched on the frozen question fingerprint, never on recency —
+ *     and if there is none, REPORT any unattributed answers instead of letting
+ *     them disappear.
  */
 async function askUserWithGrace(
   ctx: PanelToolCtx,
   ask: { question: string; options: unknown; header?: unknown; multi_select?: unknown },
 ): Promise<ToolResult> {
   const timing = getAskTiming();
-  const askId = randomUUID();
+  // ONE ceiling for the whole handler, anchored before any work is done.
+  const budgetEnd = Date.now() + ASK_TOTAL_BUDGET_CAP_MS;
+  // PREFIXED so the bridge's late-answer sink can tell a panel_ask card from the
+  // other `ask_user` cards (confirm / 18+ consent / secret) purely from the id —
+  // see PANEL_ASK_ID_PREFIX. Ownership must not depend on any bounded store.
+  const askId = `${PANEL_ASK_ID_PREFIX}${randomUUID()}`;
+  // Self-heal FIRST: the tab this resolves to is the tab the card renders on, and
+  // it is the journal key every later match is made against. It throws when no
+  // tab is bindable at all — surfaced as the tool's error exactly as before,
+  // without opening a ticket for a card that was never dispatched.
+  try {
+    ctx.ensureReachable?.();
+  } catch (err) {
+    return fail(err);
+  }
+  const tabId = ctx.tabId;
+  const fingerprint = askFingerprint(ask);
+  // Open the ticket BEFORE dispatching: the answer can validate the instant the
+  // card renders, and an answer that arrives with no ticket is unattributable.
+  AskAnswers.openAsk(askId, { tabId, fingerprint, question: ask.question });
   const cmd = {
     cmd: "ask_user",
     ask_id: askId,
@@ -3867,25 +4038,124 @@ async function askUserWithGrace(
     header: ask.header,
     multi_select: ask.multi_select,
   };
-  try {
-    ctx.ensureReachable?.();
-    const reply = await ctx.bridge.send(cmd as unknown as { cmd: string }, {
-      tabId: ctx.tabId,
-      timeoutMs: timing.deadlineMs,
-    });
-    return ok(reply);
-  } catch (err) {
-    if (isReplyTimeoutError(err)) {
-      const late = await pollLateAskReply(ctx.bridge, askId, timing);
-      if (late !== undefined) return ok(late);
+  /** Journal an answer we are about to hand back. `markReturned` records that a
+   *  ToolResult carried it — a hand-off, NOT proof it was received — so it is not
+   *  ALSO pushed to the agent, while a re-ask can still recover it if the caller
+   *  was already gone. */
+  /**
+   * THE ONE EXIT for anything this handler learned from the journal.
+   *
+   * Every outlet that can put journal state in front of a live turn goes through
+   * here — the verbatim answer, the recovered answer, the timeout report, and the
+   * eviction-debt footnote. That is deliberate and structural: the last three
+   * defects on this path were each a NEW outlet (a rid-exempt hand-back, the
+   * `others` list, the debt footnote) that reached a live turn without passing
+   * the boundary check, and auditing outlets one at a time is what let each of
+   * them ship. A single exit means a new outlet cannot be added without either
+   * routing through this gate or deleting it.
+   *
+   * The gate is: an answer belonging to a REPLACED conversation never has its
+   * CONTENT rendered, and a result that is not the live conversation's own never
+   * carries that conversation's debt footnote.
+   */
+  const deliver = (
+    outcome:
+      | { kind: "answer"; entry: AskEntry; raw: unknown; ridCorrelated: boolean }
+      | { kind: "recovered"; entry: AskEntry }
+      | { kind: "timeout"; recovery: AskRecovery },
+  ): ToolResult => {
+    // RETIRED — the conversation that asked is gone. Say so WITHOUT the pick: the
+    // replacement turn reading the old choice is the leak, and a label on it is
+    // not a fence. The text itself stays in the journal and in the durable log,
+    // for the disclosure paths that belong to the conversation it was given to.
+    if (outcome.kind !== "timeout" && outcome.entry.retired === true) {
       return fail(
-        "The question card was not answered in time (or no interactive panel surface " +
-          "rendered it — e.g. an exec/headless run), so nothing was selected. If you " +
-          "still need the decision, ask the user directly in plain chat text, or " +
-          "re-invoke panel_ask from an interactive ComfyUI tab.",
+        `The user answered this question card, but the conversation that asked it has been ` +
+          `replaced since (a new chat, a rewind, a provider switch, or a different browser tab ` +
+          `taking over this workflow). Their choice is NOT shown here and is not yours to act ` +
+          `on — it was given to a conversation that no longer exists. Ask again if you still ` +
+          `need this decision.`,
       );
     }
-    return fail(err);
+    if (outcome.kind === "timeout") {
+      // The debt footnote rides ONLY a result the LIVE conversation will receive.
+      // `reportDropped` selects the current occupant's debt and attaches its
+      // token to the turn running now, so putting it on a result that belongs to
+      // a conversation replaced mid-ask would let the live turn's ack settle a
+      // warning that conversation never saw — the debt path reaching a live turn
+      // through a helper, which is how it slipped the gate before.
+      const body = askTimeoutResult(tabId, fingerprint, outcome.recovery);
+      return AskAnswers.askBelongsToLiveConversation(askId)
+        ? withDroppedAnswerWarning(tabId, body)
+        : body;
+    }
+    if (outcome.kind === "recovered") {
+      const body =
+        outcome.entry.askId === askId
+          ? ok(outcome.entry.answer)
+          : recoveredAskResult(outcome.entry);
+      AskAnswers.markSurfaced(outcome.entry.token);
+      return withDroppedAnswerWarning(tabId, body);
+    }
+    // A LATE answer is claimed from a buffer keyed by `ask_id` ALONE, so if that
+    // id ever stood for two cards the buffer cannot say which one this reply came
+    // from — and returning it here would hand card B the answer the user gave to
+    // card A. The rid-correlated path is exempt and deliberately so: a reply that
+    // came back on THIS send's own request id is this card's reply by
+    // construction, whatever the ask id has meant elsewhere.
+    if (!outcome.ridCorrelated && outcome.entry.correlation.status !== "matched") {
+      // NOT marked returned: nobody has been given this as an answer, so it stays
+      // an orphan — pushed and disclosed — rather than quietly counting as
+      // delivered. Its own content IS shown: it is not retired, so it belongs to
+      // this conversation; only its QUESTION is undetermined.
+      return fail(
+        withDroppedText(
+          tabId,
+          `A validated answer came back for this question card, but its ask id no longer identifies ` +
+            `a single card, so it CANNOT be attributed to the question you just asked — it may be the ` +
+            `user's answer to a different card. It is NOT being returned as your answer.\n\n` +
+            `WHAT THE USER PICKED (question UNDETERMINED): ${outcome.entry.answer}\n\n` +
+            `Ask again if you still need this decision.`,
+        ),
+      );
+    }
+    AskAnswers.markReturned(outcome.entry.token);
+    // Even a clean answer carries out any eviction debt this tab is still owed —
+    // an answer the journal admits it dropped must not go unmentioned merely
+    // because the NEXT ask happened to succeed.
+    return withDroppedAnswerWarning(tabId, ok(outcome.raw));
+  };
+
+  const handBack = (reply: unknown, opts: { ridCorrelated: boolean }): ToolResult =>
+    deliver({
+      kind: "answer",
+      entry: AskAnswers.record(askId, reply, { tabId }),
+      raw: reply,
+      ridCorrelated: opts.ridCorrelated,
+    });
+  try {
+    const reply = await ctx.bridge.send(cmd as unknown as { cmd: string }, {
+      tabId,
+      timeoutMs: Math.max(1, Math.min(timing.deadlineMs, budgetEnd - Date.now())),
+    });
+    return handBack(reply, { ridCorrelated: true });
+  } catch (err) {
+    if (!isReplyTimeoutError(err)) return fail(err);
+    const late = await pollLateAskReply(ctx.bridge, askId, timing, budgetEnd);
+    if (late !== undefined) return handBack(late, { ridCorrelated: false });
+    // Nothing came back on this card's own wire. An answer the user gave to this
+    // EXACT question may still be journaled — from THIS card (the sink beat the
+    // last poll) or from an earlier ask whose tool call died before it could
+    // return one. Matched on the frozen fingerprint only.
+    const recovery = AskAnswers.recover(tabId, fingerprint);
+    return recovery.status === "recovered"
+      ? deliver({ kind: "recovered", entry: recovery.entry })
+      : deliver({ kind: "timeout", recovery });
+  } finally {
+    // This handler is gone. Anything already journaled for this ask that we did
+    // NOT hand back is now provably orphaned — arm it for the durable push so
+    // the agent is told even if panel_ask is never called again.
+    AskAnswers.closeAsk(askId);
   }
 }
 
@@ -3899,6 +4169,7 @@ export const __panelAskTestHooks = {
   ASK_TOTAL_BUDGET_CAP_MS,
   askSurfaceError,
   isReplyTimeoutError,
+  askFingerprint,
 };
 
 /** One shared tool definition: name, description, zod raw-shape schema, and a

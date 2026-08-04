@@ -235,7 +235,9 @@ export interface PanelAgentDeps {
   onSeen?: (tabId: string, mid: string) => void;
   /** #468 — the turn CARRYING these run-completion journal tokens ended, so the
    *  completions genuinely reached the agent. The journal drops them. */
-  onEventDelivered?: (tabId: string, tokens: string[]) => void;
+  /** #486 — `carrier` identifies the AGENT INSTANCE whose turn carried these
+   *  tokens, so a journal can refuse an ack from anything else. */
+  onEventDelivered?: (tabId: string, tokens: string[], from?: { carrier?: string }) => void;
   /** #468 — these run-completion journal tokens are being handed BACK for replay.
    *  `carried` true means a turn actually DISPATCHED with them and then ended
    *  (the agent read the text; only its ack couldn't be proven) — the journal
@@ -264,6 +266,17 @@ export class PanelAgent {
    *  pushes, sessionStore persistence, the bound panel MCP server) keeps addressing
    *  the DEAD pre-migration tab (#568 Defect 1). */
   tabId: string;
+  /**
+   * Identity of THIS agent object, for the whole of its life (#486).
+   *
+   * Deliberately independent of `tabId`: a tab-id migration re-keys the same
+   * conversation and must NOT invalidate an ack, while a provider switch builds a
+   * NEW agent — which is exactly the case that must not be able to certify the
+   * previous conversation's answer. The instance is the thing that distinguishes
+   * those two, so the carrier identity is the instance and nothing else.
+   */
+  private static instanceSeq = 0;
+  readonly carrierId = `pa${++PanelAgent.instanceSeq}`;
   private deps: PanelAgentDeps;
   /** The injected provider adapter (Claude today). PanelAgent owns the queue,
    *  turn-gate, rewind tracking and self-restart; the backend owns the SDK call,
@@ -544,6 +557,28 @@ export class PanelAgent {
     return true;
   }
 
+  /**
+   * Attach a journal token to the turn that is RUNNING RIGHT NOW (#486).
+   *
+   * A `panel_ask` answer goes back to the model as a TOOL RESULT, not as an
+   * injected event — so it has no hand-off to ack. But the tool call happens
+   * INSIDE a live turn, and this class already knows exactly when a turn is
+   * proven to have been read: `turnEventTokens` are acked only when that turn's
+   * own marked `result` lands (#468). Riding the same wires makes "the model
+   * received this answer" a fact rather than an assumption, which is the whole
+   * point — a `tools/call` that was abandoned never produces that result, so its
+   * token is released unacked and the answer stays accounted for.
+   *
+   * Returns false when there is no turn in flight to attach to; the caller then
+   * treats the answer as unacked, which is the conservative reading.
+   */
+  attachTurnToken(token: string): boolean {
+    if (!this.inFlight) return false;
+    if (this.turnEventTokens.includes(token)) return true;
+    this.turnEventTokens.push(token);
+    return true;
+  }
+
   /** Drop a still-queued message (the user cancelled/edited it before the agent
    *  got to it). Returns true if it was found and removed; false if it was
    *  already dequeued (the turn started — too late to cancel). */
@@ -586,6 +621,13 @@ export class PanelAgent {
       replayed?: boolean;
       dropped_completions?: number;
       possible_repeat?: boolean;
+      /** #486 - a validated `panel_ask` answer that no tool call was alive to
+       *  receive, carried together with the question it (and only it) answers. */
+      ask_question?: string | null;
+      ask_answer?: string;
+      ask_correlation?: "matched" | "foreign";
+      ask_answered_at?: number;
+      dropped_answers?: number;
     },
     opts?: { eventToken?: string },
   ): boolean {
@@ -640,6 +682,48 @@ export class PanelAgent {
       if (this.backend.capabilities.vision) {
         images = imgs.filter((i) => i.filename).map((i) => ({ ...i, type: i.type ?? "output" }));
       }
+    } else if (ev.kind === "ask_answer") {
+      // #486 — the user ANSWERED a question card, but no tool call was alive to
+      // receive it (the `tools/call` that asked had already timed out or been
+      // abandoned). The answer was journaled instead of lost; this is it.
+      //
+      // The QUESTION is always carried with the ANSWER, and the wording pins the
+      // answer to that question explicitly. Losing an answer costs a re-ask;
+      // letting one be read as the answer to a DIFFERENT question makes the
+      // agent act on a decision the user never made — so an answer that could
+      // not be tied to a question this session asked says exactly that and asks
+      // for nothing to be inferred from it.
+      const answer = typeof ev.ask_answer === "string" ? ev.ask_answer : "";
+      if (!answer) return false;
+      const ageS = Math.max(
+        0,
+        Math.round((Date.now() - (ev.ask_answered_at ?? Date.now())) / 1000),
+      );
+      text =
+        `[panel event] ` +
+        (ev.replayed
+          ? `(RE-DELIVERED — this answer could not be handed to you when it arrived.) `
+          : ``) +
+        (ev.possible_repeat
+          ? `⚠️ You may already have been given this answer — do not act on it twice. `
+          : ``) +
+        (typeof ev.dropped_answers === "number" && ev.dropped_answers > 0
+          ? `⚠️ ${ev.dropped_answers} further validated answer(s) on this tab were dropped before delivery — their content is UNDETERMINED. `
+          : ``) +
+        (ev.ask_correlation === "matched" && ev.ask_question
+          ? `The user DID answer a question card you put up ${ageS}s ago, but their answer could not be returned ` +
+            `to the panel_ask call that asked (it had already timed out), so the tool reported no answer. Here it is:\n\n` +
+            `QUESTION YOU ASKED: ${ev.ask_question}\n` +
+            `THE USER'S ANSWER: ${answer}\n\n` +
+            `This is their answer to THAT question and to nothing else — do not apply it to any other decision, ` +
+            `and do not ask it again. If you already proceeded without it, say so and reconcile. `
+          : `A user answered a question card ${ageS}s ago and the answer could NOT be tied to any question this ` +
+            `session asked — its meaning is UNDETERMINED. Reported so it is not silently discarded:\n\n` +
+            `QUESTION: ${ev.ask_question ?? "(unrecorded)"}\n` +
+            `ANSWER: ${answer}\n\n` +
+            `Do NOT treat this as the answer to anything you are currently deciding. If you need that decision, ` +
+            `ask again with panel_ask. `) +
+        `Reply with ONE short sentence and continue — no tool call is required just to acknowledge this.`;
     } else if (ev.kind === "run_error") {
       text =
         `[panel event] The user's workflow run just ERRORED: ${ev.error ?? "unknown error"}. ` +
@@ -1594,7 +1678,7 @@ export class PanelAgent {
             (typeof ev.turn === "number" && ev.turn === this.turnEventTokensMarker);
           if (ackable) {
             try {
-              this.deps.onEventDelivered?.(this.tabId, carried);
+              this.deps.onEventDelivered?.(this.tabId, carried, { carrier: this.carrierId });
             } catch (err) {
               logger.warn(`[panel-agent ${this.short()}] acking completion tokens: ${msgOf(err)}`);
             }
@@ -1741,7 +1825,9 @@ export interface PanelAgentManagerOptions {
   onAgentFatal?: (tabId: string, reason: string) => void;
   /** #468 — a turn carrying these run-completion journal tokens ENDED, so the
    *  completions genuinely reached the agent. Forwarded verbatim from the agent. */
-  onEventDelivered?: (tabId: string, tokens: string[]) => void;
+  /** #486 — `carrier` identifies the AGENT INSTANCE whose turn carried these
+   *  tokens, so a journal can refuse an ack from anything else. */
+  onEventDelivered?: (tabId: string, tokens: string[], from?: { carrier?: string }) => void;
   /** #468 — these run-completion journal tokens came back UNDELIVERED (agent
    *  stopped, turn abandoned, injection refused). Re-arm them for replay.
    *  `carried` true = a turn ran with them and ended (the agent read the text,
@@ -2078,6 +2164,13 @@ export class PanelAgentManager {
       replayed?: boolean;
       dropped_completions?: number;
       possible_repeat?: boolean;
+      /** #486 - a validated `panel_ask` answer that no tool call was alive to
+       *  receive, carried together with the question it (and only it) answers. */
+      ask_question?: string | null;
+      ask_answer?: string;
+      ask_correlation?: "matched" | "foreign";
+      ask_answered_at?: number;
+      dropped_answers?: number;
     },
     opts?: { eventToken?: string },
   ): boolean {
@@ -2093,6 +2186,24 @@ export class PanelAgentManager {
     const agent = this.agents.get(tabId);
     if (!agent || agent.isStopped) return false;
     return agent.revokeEvent(token);
+  }
+
+  /**
+   * Ride a journal token on the tab's IN-FLIGHT turn so that turn's result acks
+   * it (#486).
+   *
+   * Returns the CARRIER IDENTITY the token was attached to — the agent key plus
+   * that agent's instance identity — or null when there is no agent or no turn
+   * running. The caller freezes it onto the entry and the journal refuses any
+   * ack that does not match, so a provider switch (which re-points the tab at a
+   * different agent) can never let one conversation's turn certify another's
+   * answer.
+   */
+  attachTurnToken(tabId: string, token: string): string | null {
+    const agent = this.agents.get(tabId);
+    if (!agent || agent.isStopped) return null;
+    if (!agent.attachTurnToken(token)) return null;
+    return agent.carrierId;
   }
 
   /** Push a ComfyUI execution error to a tab's agent — interrupt the live turn

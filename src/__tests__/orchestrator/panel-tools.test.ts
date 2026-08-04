@@ -28,6 +28,7 @@ import {
 import { WorkflowTargetStore } from "../../services/workflow-target-store.js";
 import { markReplyTimeout } from "../../services/ui-bridge.js";
 import { RunCompletions } from "../../orchestrator/run-completion-journal.js";
+import { AskAnswers } from "../../orchestrator/ask-answer-journal.js";
 
 type Forwarded = Record<string, unknown>;
 
@@ -4121,3 +4122,401 @@ describe("panel_strip_workflow live-canvas fallback (issue #384)", () => {
     expect(err.message).toContain("pass pack, path, or graph");
   });
 });
+
+// -- #486: a VALIDATED panel_ask answer must survive the tool call that asked --
+//
+// The whole failure is that the user's answer has exactly one delivery channel —
+// the return value of an MCP `tools/call` that can be dead by the time it
+// arrives. These tests drive the real handler over a fake bridge and hold both
+// halves of the fix: an answer that was given is never lost, and a recovered
+// answer is never applied to a different question.
+describe("panel_ask keeps a validated answer across a tool timeout (#486)", () => {
+  const REPLY_TIMEOUT_ERR = (cmd: string, ms: number) =>
+    new Error(
+      `Panel tab abcd1234 did not reply to "${cmd}" within ${ms} ms — the ComfyUI tab may be backgrounded or frozen`,
+    );
+  const TAB = "abcd1234";
+  const SAMPLER = {
+    question: "Which sampler should I use?",
+    options: [{ label: "euler" }, { label: "dpmpp_2m" }],
+  };
+  const SCHEDULER = {
+    question: "Which scheduler should I use?",
+    options: [{ label: "karras" }, { label: "normal" }],
+  };
+
+  /** Ask ids of every card the handler actually dispatched, in order. */
+  let dispatchedAskIds: string[] = [];
+
+  function timingOutBridge(): PanelToolCtx["bridge"] {
+    return {
+      send: async (cmd: Record<string, unknown>, opts?: { timeoutMs?: number }) => {
+        if (typeof cmd.ask_id === "string") dispatchedAskIds.push(cmd.ask_id);
+        throw REPLY_TIMEOUT_ERR(String(cmd.cmd), opts?.timeoutMs ?? 0);
+      },
+      canReach: () => true,
+      isHeadless: () => false,
+      resolveActiveTabId: () => TAB,
+      takeLateAskReply: () => undefined,
+      push: () => 1,
+    } as unknown as PanelToolCtx["bridge"];
+  }
+
+  function askText(res: ToolResult): string {
+    return (res.content[0] as { text: string }).text;
+  }
+
+  beforeEach(() => {
+    AskAnswers.reset();
+    AskAnswers.setFlusher(() => {});
+    dispatchedAskIds = [];
+    __panelAskTestHooks.setAskTiming({ deadlineMs: 5, graceMs: 10, pollMs: 2 });
+  });
+  afterEach(() => {
+    __panelAskTestHooks.setAskTiming(null);
+    AskAnswers.reset();
+  });
+
+  /** Play out the real #486 sequence: the card times out (the tool call is gone),
+   *  and only THEN does the user validate a pick, which the bridge's late-answer
+   *  sink journals with nobody left to hand it to. */
+  async function askThenAnswerLate(
+    ask: { question: string; options: unknown },
+    answer: string,
+  ): Promise<ToolResult> {
+    const ctx: PanelToolCtx = {
+      bridge: timingOutBridge(),
+      tabId: TAB,
+    } as unknown as PanelToolCtx;
+    const res = await defByName("panel_ask").handler(ask as Record<string, unknown>, ctx);
+    const askId = dispatchedAskIds[dispatchedAskIds.length - 1];
+    AskAnswers.record(askId, answer, { tabId: TAB }); // the bridge sink
+    return res;
+  }
+
+  it("journals the answer as an ORPHAN when no tool call is left to receive it", async () => {
+    const first = await askThenAnswerLate(SAMPLER, "dpmpp_2m");
+    expect(first.isError).toBe(true); // the first call genuinely timed out
+    const orphans = AskAnswers.orphansFor(TAB);
+    expect(orphans).toHaveLength(1);
+    expect(orphans[0].answer).toBe("dpmpp_2m");
+    expect(orphans[0].question).toBe(SAMPLER.question);
+    // Armed for the durable push, so the agent learns of it even if panel_ask is
+    // never called again.
+    expect(orphans[0].delivery).toBe("pending");
+  });
+
+  it("a re-ask of the SAME question returns the answer the user already gave", async () => {
+    await askThenAnswerLate(SAMPLER, "dpmpp_2m");
+    const ctx: PanelToolCtx = {
+      bridge: timingOutBridge(),
+      tabId: TAB,
+    } as unknown as PanelToolCtx;
+    // The user does not answer again — they believe they already did.
+    const res = await defByName("panel_ask").handler(SAMPLER as Record<string, unknown>, ctx);
+    expect(res.isError).toBeFalsy();
+    const text = askText(res);
+    expect(text).toContain("dpmpp_2m");
+    expect(text).toContain("RECOVERED ANSWER");
+    expect(text).toContain(SAMPLER.question);
+  });
+
+  // codex round 3, P0: the recovery used to DELETE the journal's copy the moment
+  // it handed the answer back — but that hand-off is a ToolResult, which is
+  // exactly the thing that can be abandoned (it IS #486). Destroying the copy
+  // there recreates the bug one level up, so a further re-ask gets it AGAIN,
+  // flagged so the agent does not act on it twice.
+  it("a recovered answer survives its own hand-off and is re-surfaced, flagged", async () => {
+    await askThenAnswerLate(SAMPLER, "dpmpp_2m");
+    const ctx = () => ({ bridge: timingOutBridge(), tabId: TAB }) as unknown as PanelToolCtx;
+    const first = await defByName("panel_ask").handler(SAMPLER as Record<string, unknown>, ctx());
+    expect(first.isError).toBeFalsy();
+    expect(askText(first)).toContain("dpmpp_2m");
+    expect(askText(first)).not.toMatch(/handed to you before/i);
+    const second = await defByName("panel_ask").handler(SAMPLER as Record<string, unknown>, ctx());
+    expect(second.isError).toBeFalsy();
+    expect(askText(second)).toContain("dpmpp_2m");
+    expect(askText(second)).toMatch(/handed to you before/i);
+  });
+
+  // THE INVERSE, and the more damaging direction: a replayed answer must never
+  // satisfy a DIFFERENT question. The agent acting on an answer to something else
+  // is worse than the agent losing the answer entirely.
+  it("a journaled answer NEVER satisfies a different question", async () => {
+    await askThenAnswerLate(SAMPLER, "dpmpp_2m");
+    const ctx: PanelToolCtx = {
+      bridge: timingOutBridge(),
+      tabId: TAB,
+    } as unknown as PanelToolCtx;
+    const res = await defByName("panel_ask").handler(SCHEDULER as Record<string, unknown>, ctx);
+    // NOT answered — the scheduler question has no answer on file.
+    expect(res.isError).toBe(true);
+    const text = askText(res);
+    expect(text).toMatch(/not answered in time/i);
+    // ...but the sampler answer is REPORTED rather than swallowed, quoted with
+    // the question it actually answers and an explicit refusal to let it stand in.
+    expect(text).toContain(SAMPLER.question);
+    expect(text).toContain("dpmpp_2m");
+    expect(text).toMatch(/do NOT use any of them as the answer to the question you just asked/i);
+  });
+
+  it("an answer given on a DIFFERENT tab never leaks into this tab's ask", async () => {
+    await askThenAnswerLate(SAMPLER, "dpmpp_2m");
+    const ctx: PanelToolCtx = {
+      bridge: timingOutBridge(),
+      tabId: "zzzz9999",
+    } as unknown as PanelToolCtx;
+    const res = await defByName("panel_ask").handler(SAMPLER as Record<string, unknown>, ctx);
+    expect(res.isError).toBe(true);
+    expect(askText(res)).not.toContain("dpmpp_2m");
+  });
+
+  it("an answer that merely lost the grace-poll race is returned as THIS ask's own answer", async () => {
+    // The sink journals the pick microseconds after the last poll. It is this
+    // card's answer, so it comes back verbatim — not dressed up as a recovery.
+    let askId: string | null = null;
+    const bridge = {
+      send: async (cmd: Record<string, unknown>, opts?: { timeoutMs?: number }) => {
+        askId = String(cmd.ask_id);
+        throw REPLY_TIMEOUT_ERR(String(cmd.cmd), opts?.timeoutMs ?? 0);
+      },
+      canReach: () => true,
+      isHeadless: () => false,
+      resolveActiveTabId: () => TAB,
+      takeLateAskReply: () => {
+        // Landed in the journal instead of the buffer, just after the last poll.
+        if (askId) AskAnswers.record(askId, "dpmpp_2m", { tabId: TAB });
+        return undefined;
+      },
+      push: () => 1,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx: PanelToolCtx = { bridge, tabId: TAB } as unknown as PanelToolCtx;
+    const res = await defByName("panel_ask").handler(SAMPLER as Record<string, unknown>, ctx);
+    expect(res.isError).toBeFalsy();
+    expect(askText(res)).toBe("dpmpp_2m");
+  });
+
+  it("the ordinary answered path is unchanged — the raw pick, and nothing pushed", async () => {
+    const bridge = {
+      send: async () => "euler",
+      canReach: () => true,
+      isHeadless: () => false,
+      resolveActiveTabId: () => TAB,
+      takeLateAskReply: () => undefined,
+      push: () => 1,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx: PanelToolCtx = { bridge, tabId: TAB } as unknown as PanelToolCtx;
+    const res = await defByName("panel_ask").handler(SAMPLER as Record<string, unknown>, ctx);
+    expect(res.isError).toBeFalsy();
+    expect(askText(res)).toBe("euler");
+    // A ToolResult is a hand-off, not a proof, so the answer stays on file — but
+    // it must NOT be announced to the agent as an orphan, or every single ask
+    // would be reported twice.
+    expect(AskAnswers.hasOutstanding()).toBe(false);
+    expect(AskAnswers.orphansFor(TAB)).toHaveLength(0);
+  });
+
+  it("a plain unanswered ask (nothing ever given) still fails cleanly and quietly", async () => {
+    const ctx: PanelToolCtx = {
+      bridge: timingOutBridge(),
+      tabId: TAB,
+    } as unknown as PanelToolCtx;
+    const res = await defByName("panel_ask").handler(SAMPLER as Record<string, unknown>, ctx);
+    expect(res.isError).toBe(true);
+    expect(askText(res)).toMatch(/not answered in time/i);
+    expect(askText(res)).not.toMatch(/HOWEVER/);
+  });
+
+  // codex round 1, P0: an answer that went into a ToolResult used to be forgotten
+  // once it aged past the recovery window. But "it went into a ToolResult" is
+  // exactly what is NOT provable here (that IS #486), so a re-ask of the same
+  // question past the window must still be TOLD the user answered it — the
+  // difference between a stale answer and silence.
+  it("a re-ask past the recovery window is told the user answered it before", async () => {
+    const bridge = {
+      send: async () => "dpmpp_2m",
+      canReach: () => true,
+      isHeadless: () => false,
+      resolveActiveTabId: () => TAB,
+      takeLateAskReply: () => undefined,
+      push: () => 1,
+    } as unknown as PanelToolCtx["bridge"];
+    const first = await defByName("panel_ask").handler(SAMPLER as Record<string, unknown>, {
+      bridge,
+      tabId: TAB,
+    } as unknown as PanelToolCtx);
+    expect(askText(first)).toBe("dpmpp_2m");
+    // Age it out of the recovery window (it must NOT have been deleted).
+    const entry = AskAnswers.entriesFor(TAB)[0];
+    expect(entry).toBeDefined();
+    entry.answeredAt = Date.now() - 60 * 60_000;
+    const res = await defByName("panel_ask").handler(SAMPLER as Record<string, unknown>, {
+      bridge: timingOutBridge(),
+      tabId: TAB,
+    } as unknown as PanelToolCtx);
+    // Not served as this ask's answer (too old to present as a fresh decision)…
+    expect(res.isError).toBe(true);
+    // …but reported, quoted with the question it answers.
+    expect(askText(res)).toContain("dpmpp_2m");
+    expect(askText(res)).toContain(SAMPLER.question);
+  });
+
+  it("an answer to a card whose CONVERSATION was replaced can never satisfy a re-ask", async () => {
+    await askThenAnswerLate(SAMPLER, "dpmpp_2m");
+    AskAnswers.closeAsks(TAB); // New chat / resume of a historical session
+    const res = await defByName("panel_ask").handler(SAMPLER as Record<string, unknown>, {
+      bridge: timingOutBridge(),
+      tabId: TAB,
+    } as unknown as PanelToolCtx);
+    expect(res.isError).toBe(true);
+    expect(askText(res)).not.toContain("RECOVERED ANSWER");
+    // Reported as a COUNT, never as content: the pick belongs to the replaced
+    // conversation, and showing it here is the leak the boundary exists to stop.
+    expect(askText(res)).not.toContain("dpmpp_2m");
+    expect(askText(res)).toMatch(/belong to a DIFFERENT conversation/i);
+    // …and it is still on file, not swallowed.
+    expect(AskAnswers.entriesFor(TAB).some((e) => e.answer === "dpmpp_2m")).toBe(true);
+  });
+
+  // codex round 9, P0: the LATE answer is claimed from a bridge buffer keyed by
+  // `ask_id` ALONE. If that id ever stood for two cards, the buffer cannot say
+  // which one the reply came from — and the handler used to return it as this
+  // question's answer regardless, handing card B the answer given to card A.
+  // The rid-correlated path is exempt: a reply on THIS send's own request id is
+  // this card's reply by construction.
+  it("a LATE answer whose ask id is ambiguous is reported, never returned as the answer", async () => {
+    let askId: string | null = null;
+    const bridge = {
+      send: async (cmd: Record<string, unknown>, opts?: { timeoutMs?: number }) => {
+        askId = String(cmd.ask_id);
+        // Make the id stand for a SECOND card before the late answer is claimed.
+        AskAnswers.openAsk(askId, {
+          tabId: TAB,
+          fingerprint: "some-other-question",
+          question: "A different question entirely?",
+        });
+        throw REPLY_TIMEOUT_ERR(String(cmd.cmd), opts?.timeoutMs ?? 0);
+      },
+      canReach: () => true,
+      isHeadless: () => false,
+      resolveActiveTabId: () => TAB,
+      takeLateAskReply: () => "dpmpp_2m",
+      push: () => 1,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx: PanelToolCtx = { bridge, tabId: TAB } as unknown as PanelToolCtx;
+    const res = await defByName("panel_ask").handler(SAMPLER as Record<string, unknown>, ctx);
+    expect(res.isError).toBe(true);
+    expect(askText(res)).toMatch(/CANNOT be attributed/i);
+    // The pick is still surfaced — reported, never swallowed — and it was not
+    // counted as delivered, so the orphan machinery still owns it.
+    expect(askText(res)).toContain("dpmpp_2m");
+    expect(AskAnswers.orphansFor(TAB).some((e) => e.answer === "dpmpp_2m")).toBe(true);
+  });
+
+  // Gate: a rid proves WHICH CARD replied — it says nothing about whose
+  // conversation is live. An ask retired while its request was still pending (a
+  // different browser tab took the recurring key over, a New chat, a rewind)
+  // must not have its answer handed back through the tool-result channel, which
+  // is the one path a conversation boundary does not otherwise police.
+  it("an answer arriving after its conversation was replaced is reported, not returned", async () => {
+    let askId: string | null = null;
+    const bridge = {
+      send: async (cmd: Record<string, unknown>) => {
+        askId = String(cmd.ask_id);
+        // The boundary lands while this request is still in flight…
+        AskAnswers.closeAsks(TAB);
+        // …and only then does the user click, resolving THIS send's own rid.
+        return "dpmpp_2m";
+      },
+      canReach: () => true,
+      isHeadless: () => false,
+      resolveActiveTabId: () => TAB,
+      takeLateAskReply: () => undefined,
+      push: () => 1,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx: PanelToolCtx = { bridge, tabId: TAB } as unknown as PanelToolCtx;
+
+    const res = await defByName("panel_ask").handler(SAMPLER as Record<string, unknown>, ctx);
+    expect(askId).not.toBeNull();
+    expect(res.isError).toBe(true);
+    expect(askText(res)).toMatch(/conversation that asked it has been replaced/i);
+    // The pick is NOT shown. Labelling it "for the replaced conversation" does
+    // not stop the replacement turn from reading it — the tool result is the one
+    // channel a boundary never policed, and a label is not a fence.
+    expect(askText(res)).not.toContain("dpmpp_2m");
+    // …and it was not counted as delivered to anyone, nor swallowed.
+    expect(AskAnswers.entriesFor(TAB)[0].returned).toBe(false);
+    expect(AskAnswers.entriesFor(TAB)[0].answer).toBe("dpmpp_2m");
+  });
+
+  // Gate P0-2: the timeout report rendered every same-key entry's question AND
+  // answer verbatim. `others` never went through the boundary gate, because
+  // nothing about a disclosure looked like a hand-off — so tab A's chosen option
+  // was printed into tab B's result.
+  it("a timed-out ask never prints another conversation's chosen option", async () => {
+    await askThenAnswerLate(SAMPLER, "dpmpp_2m");
+    AskAnswers.closeAsks(TAB); // the conversation that asked is replaced
+
+    const res = await defByName("panel_ask").handler(SCHEDULER as Record<string, unknown>, {
+      bridge: timingOutBridge(),
+      tabId: TAB,
+    } as unknown as PanelToolCtx);
+
+    expect(res.isError).toBe(true);
+    // The pick is NOT rendered…
+    expect(askText(res)).not.toContain("dpmpp_2m");
+    // …but the fact that something was answered IS disclosed.
+    expect(askText(res)).toMatch(/belong to a DIFFERENT conversation/i);
+    expect(AskAnswers.entriesFor(TAB).some((e) => e.answer === "dpmpp_2m")).toBe(true);
+  });
+
+  // Gate P0-3: the debt footnote is added by a helper, and the helper reported
+  // the CURRENT occupant's debt and attached its token to the CURRENT turn — so a
+  // result belonging to a conversation replaced mid-ask could carry, and have
+  // settled, a warning that conversation never saw.
+  it("a result from a replaced conversation carries no debt footnote", async () => {
+    const bridge = {
+      send: async (cmd: Record<string, unknown>, opts?: { timeoutMs?: number }) => {
+        void cmd;
+        // The boundary lands while this ask is still in flight (its own debt is
+        // surfaced and retired there)…
+        AskAnswers.closeAsks(TAB);
+        // …and the REPLACEMENT conversation then loses answers of its own. That
+        // debt is owed to it, not to the ask that is about to unwind here.
+        AskAnswers.noteDroppedForTest(TAB, 2);
+        throw REPLY_TIMEOUT_ERR("ask_user", opts?.timeoutMs ?? 0);
+      },
+      canReach: () => true,
+      isHeadless: () => false,
+      resolveActiveTabId: () => TAB,
+      takeLateAskReply: () => undefined,
+      push: () => 1,
+    } as unknown as PanelToolCtx["bridge"];
+
+    const res = await defByName("panel_ask").handler(SAMPLER as Record<string, unknown>, {
+      bridge,
+      tabId: TAB,
+    } as unknown as PanelToolCtx);
+
+    expect(res.isError).toBe(true);
+    // No "N further validated answer(s) were dropped" on a result that belongs to
+    // a conversation that no longer exists — the live turn's ack would otherwise
+    // settle a warning nobody was shown.
+    expect(askText(res)).not.toMatch(/were dropped before they/i);
+    // …and the replacement conversation is still owed it, undisturbed.
+    expect(AskAnswers.droppedFor(TAB)).toBe(2);
+    expect(AskAnswers.reportDropped(TAB)).toBe(2);
+  });
+
+  it("holds the WHOLE handler under one wall-clock ceiling anchored at entry", () => {
+    // The card deadline and the grace poll used to be additive on top of
+    // everything else, so a bounded ask could still overrun the enclosing
+    // tools/call budget and die as a raw transport timeout instead of a result.
+    const t = __panelAskTestHooks.getAskTiming();
+    expect(t.deadlineMs + t.graceMs).toBeLessThanOrEqual(
+      __panelAskTestHooks.ASK_TOTAL_BUDGET_CAP_MS,
+    );
+    expect(__panelAskTestHooks.ASK_TOTAL_BUDGET_CAP_MS).toBeLessThan(300000);
+  });
+});
+

@@ -30,6 +30,7 @@ import {
   describe as describeCorrelation,
   type CompletionPayload,
 } from "../../orchestrator/run-completion-journal.js";
+import { AskAnswerJournalImpl } from "../../orchestrator/ask-answer-journal.js";
 import { destinationHasCollisionState } from "../../orchestrator/session-store.js";
 
 let PanelAgentManager: typeof import("../../orchestrator/panel-agent.js").PanelAgentManager;
@@ -1638,5 +1639,224 @@ describe("run completion journal correlation (#468)", () => {
     journal.forget("gone");
     expect(journal.outstanding("gone")).toHaveLength(0);
     expect(journal.outstanding("kept")).toHaveLength(1);
+  });
+});
+
+// #486 — a `panel_ask` answer goes back to the model as a TOOL RESULT, so it has
+// no hand-off to ack. It rides the turn its tool call is running inside, and is
+// acked by exactly the same rule a run completion is: that turn produced its own
+// marked result. "Written to the transport" is NOT that rule — a `tools/call` can
+// be abandoned, which is the whole of #486 — so these tests drive a real manager
+// and hold the difference.
+describe("panel_ask answer acks on the turn that returned it (#486)", () => {
+  function askHarness(backend: AgentBackend) {
+    const journal = new AskAnswerJournalImpl();
+    const manager = new PanelAgentManager({
+      mcpServers: {},
+      systemAppend: "",
+      model: "claude-test",
+      onSay: () => {},
+      onTurn: () => {},
+      makeBackend: () => backend,
+      onEventDelivered: (_key: string, tokens: string[], from?: { carrier?: string }) => {
+        for (const t of tokens) journal.ack(t, from);
+      },
+      onEventUndelivered: (_key: string, tokens: string[], opts?: { carried?: boolean }) => {
+        for (const t of tokens) journal.release(t, { carried: opts?.carried === true });
+      },
+      onAgentReady: () => {},
+    } as never);
+    journal.setTurnAttacher((key, token) => manager.attachTurnToken(key, token));
+    return { journal, manager };
+  }
+
+  /** What the ask handler does from inside a live turn. */
+  function answerDuringTurn(
+    journal: AskAnswerJournalImpl,
+    tab: string,
+    askId: string,
+    answer: string,
+  ): string {
+    journal.openAsk(askId, { tabId: tab, fingerprint: "fp-sampler", question: "Which sampler?" });
+    const token = journal.record(askId, answer, { tabId: tab }).token;
+    journal.markReturned(token); // hands it back AND rides the turn
+    journal.closeAsk(askId);
+    return token;
+  }
+
+  it("acks only when the turn that returned the answer produces its result", async () => {
+    const backend = new ContinuationBackend();
+    const { journal, manager } = askHarness(backend);
+    const tab = "tab-ask-ack";
+
+    manager.send(tab, "ask me which sampler");
+    await waitFor(() => backend.turns.length >= 1);
+
+    const token = answerDuringTurn(journal, tab, "pa-ack-1", "dpmpp_2m");
+    // Handed to the tool result — but the turn has not finished, so there is NO
+    // proof the model read it yet.
+    expect(journal.entriesFor(tab)[0].returned).toBe(true);
+    expect(journal.entriesFor(tab)[0].acked).toBeUndefined();
+
+    backend.finishTurn(); // the turn's own marked result lands
+    await waitFor(() => journal.entriesFor(tab)[0]?.acked === true);
+    expect(journal.entriesFor(tab)[0].token).toBe(token);
+    // An acked answer is not news: it holds no gate and is not named on exit.
+    expect(journal.hasOutstanding()).toBe(false);
+    expect(journal.allOutstanding()).toHaveLength(0);
+  });
+
+  it("a turn that never completes leaves the answer UNACKED and accounted for", async () => {
+    const backend = new ContinuationBackend();
+    backend.strandTurns = true; // the turn never yields a result — the #486 shape
+    const { journal, manager } = askHarness(backend);
+    const tab = "tab-ask-stranded";
+
+    manager.send(tab, "ask me which sampler");
+    await waitFor(() => backend.turns.length >= 1);
+    answerDuringTurn(journal, tab, "pa-ack-2", "dpmpp_2m");
+
+    // Tear the agent down mid-turn: the token comes back unacked.
+    manager.reset(tab);
+    await waitFor(() => journal.entriesFor(tab).length === 1);
+    expect(journal.entriesFor(tab)[0].acked).toBeUndefined();
+    // …and it is still the only copy of the user's decision: named on the way out
+    // and still recoverable by a re-ask of the same question.
+    expect(journal.allOutstanding().map((e) => e.answer)).toContain("dpmpp_2m");
+    expect(journal.recover(tab, "fp-sampler").status).toBe("recovered");
+  });
+
+  it("an answer returned with NO live turn is never treated as read", () => {
+    const backend = new ContinuationBackend();
+    const { journal, manager } = askHarness(backend);
+    const tab = "tab-ask-noturn";
+    // Nothing was ever sent, so there is no turn to ride.
+    expect(manager.attachTurnToken(tab, "aa-nope")).toBeNull();
+    answerDuringTurn(journal, tab, "pa-ack-3", "dpmpp_2m");
+    const entry = journal.entriesFor(tab)[0];
+    expect(entry.carrier).toBeNull();
+    expect(entry.acked).toBeUndefined();
+    // …and nothing can ever settle it, however the ack is dressed up.
+    journal.ack(entry.token, { carrier: "pa1" });
+    journal.ack(entry.token);
+    expect(journal.entriesFor(tab)[0].acked).toBeUndefined();
+  });
+
+  // COORDINATOR GATE P0-2. The tab -> agent mapping MOVES on a provider switch,
+  // so an ack resolved from "whoever owns this tab now" let the NEW provider's
+  // turn certify an answer the new conversation never saw — after which the
+  // entry was acked and therefore silently evictable. The carrier identity is
+  // captured at the instant of return and compared at ack, so it cannot.
+  it("a provider switch cannot ack an answer handed to the previous conversation", async () => {
+    const backend = new ContinuationBackend();
+    const { journal, manager } = askHarness(backend);
+    const tab = "tab-ask-switch";
+
+    // The card is shown and answered inside provider A's turn.
+    manager.send(tab, "ask me which sampler");
+    await waitFor(() => backend.turns.length >= 1);
+    const token = answerDuringTurn(journal, tab, "pa-switch", "dpmpp_2m");
+    const carrierA = journal.entriesFor(tab)[0].carrier;
+    expect(carrierA).not.toBeNull();
+
+    // The user switches provider: the old agent is retired and the SAME tab key
+    // is taken over by a brand-new agent instance.
+    journal.closeAsks(tab); // what the switch path does
+    manager.reset(tab);
+    manager.send(tab, "different provider now");
+    await waitFor(() => backend.turns.length >= 2);
+    const carrierB = manager.attachTurnToken(tab, "aa-probe");
+    expect(carrierB).not.toBe(carrierA);
+
+    // The NEW conversation's turn completes. It must not settle the old
+    // conversation's answer.
+    backend.finishTurn();
+    await new Promise((r) => setTimeout(r, 50));
+    const entry = journal.entriesFor(tab).find((e) => e.token === token);
+    expect(entry?.acked).toBeUndefined();
+    // …so the answer is still accounted for: named on the way out, and never a
+    // candidate for a silent eviction.
+    expect(journal.allOutstanding().map((e) => e.answer)).toContain("dpmpp_2m");
+  });
+
+  // The sharper shape of the same defect: a STALE pre-switch ask handler resumes
+  // AFTER the switch (its card was clicked late) and hands the answer back. It
+  // would otherwise attach to whatever turn is running now — the new
+  // conversation's — whose result then certifies, accurately and uselessly, an
+  // answer that conversation was never shown.
+  it("a stale handler resuming after a switch cannot attach to the new conversation's turn", async () => {
+    const backend = new ContinuationBackend();
+    const { journal, manager } = askHarness(backend);
+    const tab = "tab-ask-stale";
+
+    manager.send(tab, "ask me which sampler");
+    await waitFor(() => backend.turns.length >= 1);
+    journal.openAsk("pa-stale", {
+      tabId: tab,
+      fingerprint: "fp-sampler",
+      question: "Which sampler?",
+    });
+    const token = journal.record("pa-stale", "dpmpp_2m", { tabId: tab }).token;
+
+    // Provider switch happens BEFORE the handler gets to return.
+    journal.closeAsks(tab);
+    manager.reset(tab);
+    manager.send(tab, "different provider now");
+    await waitFor(() => backend.turns.length >= 2);
+
+    // …and only now does the stale handler resume and hand the answer back.
+    journal.markReturned(token);
+    expect(journal.entriesFor(tab)[0].carrier).toBeNull();
+
+    backend.finishTurn();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(journal.entriesFor(tab)[0].acked).toBeUndefined();
+    expect(journal.allOutstanding().map((e) => e.answer)).toContain("dpmpp_2m");
+  });
+
+  it("an ack from a DIFFERENT agent instance is refused", () => {
+    const backend = new ContinuationBackend();
+    const { journal } = askHarness(backend);
+    const tab = "tab-ask-wrongcarrier";
+    journal.setTurnAttacher(() => "pa-agent-A");
+    journal.openAsk("pa-x", { tabId: tab, fingerprint: "fp", question: "Which sampler?" });
+    const token = journal.record("pa-x", "dpmpp_2m", { tabId: tab }).token;
+    journal.markReturned(token);
+    expect(journal.entriesFor(tab)[0].carrier).toBe("pa-agent-A");
+
+    journal.ack(token, { carrier: "pa-agent-B" }); // a different conversation
+    expect(journal.entriesFor(tab)[0].acked).toBeUndefined();
+    journal.ack(token); // …and an ack with no identity at all is unverifiable
+    expect(journal.entriesFor(tab)[0].acked).toBeUndefined();
+
+    journal.ack(token, { carrier: "pa-agent-A" }); // the one that carried it
+    expect(journal.entriesFor(tab)[0].acked).toBe(true);
+  });
+
+  // P1-1: a RECOVERY hands the answer to a live turn exactly as a fresh answer
+  // does, so it must attach by construction. It used to set the flags by hand and
+  // never attach — so a perfect recovery stayed unacked forever, aged into
+  // apparent loss, and eventually raised warnings despite successful receipt.
+  it("a recovered answer attaches to its turn and can be acked", async () => {
+    const backend = new ContinuationBackend();
+    const { journal, manager } = askHarness(backend);
+    const tab = "tab-ask-recover";
+
+    manager.send(tab, "ask me which sampler");
+    await waitFor(() => backend.turns.length >= 1);
+    // An answer arrives with no handler waiting (the #486 orphan).
+    journal.openAsk("pa-rec", { tabId: tab, fingerprint: "fp-sampler", question: "Which sampler?" });
+    journal.closeAsk("pa-rec");
+    const token = journal.record("pa-rec", "dpmpp_2m", { tabId: tab }).token;
+    // A re-ask recovers it and hands it back inside the live turn.
+    const rec = journal.recover(tab, "fp-sampler");
+    expect(rec.status).toBe("recovered");
+    journal.markSurfaced(token);
+    expect(journal.entriesFor(tab)[0].carrier).not.toBeNull();
+
+    backend.finishTurn();
+    await waitFor(() => journal.entriesFor(tab)[0]?.acked === true);
+    // Proven read → not news, and quietly forgettable.
+    expect(journal.allOutstanding()).toHaveLength(0);
   });
 });

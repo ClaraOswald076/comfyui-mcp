@@ -129,7 +129,11 @@ async function startBridgeOnFreePort(
   throw new Error(`could not bind a free bridge port after 6 attempts: ${lastErr}`);
 }
 
-function connectPanel(tabId?: string, title = "workflow-a"): Promise<WebSocket> {
+function connectPanel(
+  tabId?: string,
+  title = "workflow-a",
+  opts: { tabSessionId?: string } = {},
+): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
     const sock = new WebSocket(`ws://127.0.0.1:${port}`);
     sock.on("open", () => {
@@ -144,6 +148,9 @@ function connectPanel(tabId?: string, title = "workflow-a"): Promise<WebSocket> 
             title,
             enforces_workflow_stamp: true,
             enforces_workflow_stamp_at_write: true,
+            // The panel's sessionStorage-backed browser-tab identity: unique per
+            // browser tab, stable across a reload (#486/#709).
+            ...(opts.tabSessionId ? { tab_session_id: opts.tabSessionId } : {}),
           }),
         );
       }
@@ -3066,6 +3073,360 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
     // The late-but-valid answer must be recoverable via the buffer, then drained.
     await vi.waitFor(() => expect(bridge.takeLateAskReply("ask-xyz")).toBe("Late Pick"));
     expect(bridge.takeLateAskReply("ask-xyz")).toBeUndefined(); // drained once
+  });
+
+  // The buffer only helps a caller that is still alive to poll it, and #486 is
+  // exactly the case where there is none — the tools/call that asked has been
+  // abandoned. The SINK is what makes the answer durable: it fires at arrival,
+  // with the tab it was rendered on, whether or not anyone is listening.
+  it("hands a late ask_user answer to the durable sink at arrival, with its tab", async () => {
+    const seen: Array<{ askId: string; result: unknown; tabId: string }> = [];
+    bridge.setLateAskReplySink((askId, result, tabId) => seen.push({ askId, result, tabId }));
+    const sock = await connectPanel("tab-sink", "wf");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-sink")).toBe(true));
+    sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd === "ask_user") {
+        setTimeout(() => {
+          sock.send(JSON.stringify({ rid: msg.rid, ok: true, result: "Sunk Pick" }));
+        }, 80);
+      }
+    });
+    await expect(
+      bridge.send(
+        { cmd: "ask_user", ask_id: "ask-sink", question: "?", options: [] },
+        { tabId: "tab-sink", timeoutMs: 30 },
+      ),
+    ).rejects.toThrow(/did not reply/i);
+    // NOBODY polls takeLateAskReply here — that is the point.
+    await vi.waitFor(() => expect(seen).toHaveLength(1));
+    expect(seen[0]).toEqual({ askId: "ask-sink", result: "Sunk Pick", tabId: "tab-sink" });
+    bridge.setLateAskReplySink(() => {});
+  });
+
+  // codex round 2, P0: the rid→ask_id MAPPING is what makes a late reply
+  // recognisable as a card answer at all, so it gates the durable sink. It used
+  // to share the 5-minute TTL of the reply BUFFER — but a question card sits on
+  // screen until the user deals with it, which can be far longer than any tool
+  // call, so an answer given at T+6min was discarded with no record.
+  it("the ask-id mapping outlives the reply buffer, so a much-later answer is still recognised", async () => {
+    const seen: string[] = [];
+    bridge.setLateAskReplySink((askId) => seen.push(askId));
+    const sock = await connectPanel("tab-longwait", "wf");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-longwait")).toBe(true));
+    sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd === "ask_user") {
+        // A user who takes their time: the reply comes long after the card's own
+        // reply timer, and after the prune below has run.
+        setTimeout(() => {
+          sock.send(JSON.stringify({ rid: msg.rid, ok: true, result: "Much Later" }));
+        }, 300);
+      }
+    });
+    await expect(
+      bridge.send(
+        { cmd: "ask_user", ask_id: "pa-slow", question: "?", options: [] },
+        { tabId: "tab-longwait", timeoutMs: 30 },
+      ),
+    ).rejects.toThrow(/did not reply/i);
+    // Age the mapping past the BUFFER's TTL (5 min) but well inside the
+    // mapping's own (60 min)…
+    const map = (bridge as unknown as { askRidToId: Map<string, { ts: number }> }).askRidToId;
+    for (const e of map.values()) e.ts = Date.now() - 20 * 60_000;
+    // …and force a prune pass (any take runs one) BEFORE the reply lands, so the
+    // mapping has to survive its own TTL rule rather than merely not be swept.
+    expect(bridge.takeLateAskReply("nothing-here")).toBeUndefined();
+    expect(map.size).toBe(1);
+    await vi.waitFor(() => expect(seen).toEqual(["pa-slow"]), { timeout: 3000 });
+    bridge.setLateAskReplySink(() => {});
+  });
+
+  // Preferring loss over misattribution past the open-card ceiling is a sound
+  // call, but a server log is not a disclosure to the person holding the mouse:
+  // without a notice, the next thing that happens is someone clicking a button on
+  // a card that is still on screen and having it do NOTHING. Say it on their
+  // screen, at the moment we know.
+  it("tells the USER when an open card can no longer accept an answer", async () => {
+    const sock = await connectPanel("tab-overflow", "wf");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-overflow")).toBe(true));
+    const said: string[] = [];
+    sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.type === "say" && typeof msg.text === "string") said.push(msg.text);
+    });
+    // Fill the mapping past its ceiling without waiting on 1024 real sends.
+    const map = (bridge as unknown as {
+      askRidToId: Map<string, { askId: string; ts: number; tabId: string }>;
+    }).askRidToId;
+    for (let i = 0; i < 1100; i += 1) {
+      map.set(`rid-${i}`, { askId: `pa-${i}`, ts: Date.now(), tabId: "tab-overflow" });
+    }
+    // Any take runs a prune pass, which is where the ceiling bites.
+    expect(bridge.takeLateAskReply("nothing-here")).toBeUndefined();
+    expect(map.size).toBeLessThanOrEqual(1024);
+    await vi.waitFor(() =>
+      expect(said.some((t) => /can no longer accept an answer/i.test(t))).toBe(true),
+    );
+    expect(said.find((t) => /can no longer accept an answer/i.test(t))).toMatch(
+      /type your choice in the chat/i,
+    );
+  });
+
+  // Coordinator gate P0: a socket close is NOT evidence a tab is gone — an
+  // ordinary F5 produces exactly that. Firing the tab-gone listener on the close
+  // retired live per-tab bookkeeping (the eviction-disclosure debt) during every
+  // reload, so the reconnected conversation kept the answer and lost the warning
+  // that an answer had been dropped — the worst possible split.
+  // THE GONE-CLOCK TESTS CONTROL TIME RATHER THAN RACING IT.
+  //
+  // These are the one behaviour here defined by elapsed time, and a raced grace
+  // fails both ways: too short and it fails on a CORRECT implementation, too long
+  // and a timer that fires before the successor's hello lands makes a broken
+  // cancel look caught — a false pass, which is worse, because a mutation
+  // "verified" through it was never verified at all. So every test below sets a
+  // grace no run can reach, waits for the state it cares about to be PROVABLY
+  // reached, and only then runs the clocks.
+  const NEVER = 600_000;
+  /** The bridge has finished registering `incarnation` on `tabId`. */
+  const occupied = (tabId: string, incarnation: string) =>
+    vi.waitFor(() => expect(bridge.tabIncarnation(tabId)).toBe(incarnation));
+  const vacant = (tabId: string) =>
+    vi.waitFor(() => expect(bridge.tabIncarnation(tabId)).toBeUndefined());
+
+  it("an ordinary reload does NOT declare the tab gone", async () => {
+    const gone: string[] = [];
+    bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: NEVER });
+    const sock = await connectPanel("tab-reload", "wf", { tabSessionId: "browser-tab-A" });
+    await occupied("tab-reload", "browser-tab-A");
+
+    // F5: the socket closes and the SAME browser tab re-hellos. Its
+    // `tab_session_id` is sessionStorage-backed, so it comes back unchanged.
+    sock.close();
+    await vacant("tab-reload");
+    const back = await connectPanel("tab-reload", "wf", { tabSessionId: "browser-tab-A" });
+    // The reconnect is COMPLETE before the clock is allowed to run — otherwise a
+    // pass would prove only that the timer won a race.
+    await occupied("tab-reload", "browser-tab-A");
+
+    bridge.__runTabGoneClocksForTest();
+    expect(gone).toEqual([]);
+    back.close();
+    bridge.setTabGoneListener(() => {});
+  });
+
+  it("a tab that stays away IS declared gone", async () => {
+    const gone: string[] = [];
+    bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: NEVER });
+    const sock = await connectPanel("tab-really-gone", "wf", { tabSessionId: "browser-tab-Z" });
+    await occupied("tab-really-gone", "browser-tab-Z");
+    sock.close();
+    await vacant("tab-really-gone");
+    expect(gone).toEqual([]); // nothing at the moment of the close
+
+    bridge.__runTabGoneClocksForTest();
+    expect(gone).toEqual(["tab-really-gone"]);
+    bridge.setTabGoneListener(() => {});
+  });
+
+  // Coordinator gate: SAME KEY IS NOT THE SAME TAB. A `wf:<hash>` id names a
+  // saved workflow, so a different browser tab opening that workflow takes the
+  // key over. Keyed on the id alone, that stranger's hello cancelled the
+  // departed tab's clock (and satisfied the timer's re-check), so the departed
+  // tab was never declarable gone — and a later result from the stranger could
+  // report and settle the departed tab's lost-answer disclosure as its own.
+  it("a DIFFERENT browser tab taking over the same key does not cancel the departed tab's clock", async () => {
+    const gone: string[] = [];
+    bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: NEVER });
+    const tabA = await connectPanel("wf:shared", "wf", { tabSessionId: "browser-tab-A" });
+    await occupied("wf:shared", "browser-tab-A");
+    tabA.close();
+    await vacant("wf:shared");
+
+    // A DIFFERENT browser tab opens the same saved workflow, taking over the
+    // recurring key. Its hello is PROVABLY complete before the clock runs, so a
+    // pass means the cancel really did decline — not that it lost a race.
+    const tabB = await connectPanel("wf:shared", "wf", { tabSessionId: "browser-tab-B" });
+    await occupied("wf:shared", "browser-tab-B");
+
+    bridge.__runTabGoneClocksForTest();
+    expect(gone).toEqual(["wf:shared"]);
+    tabB.close();
+    bridge.setTabGoneListener(() => {});
+  });
+
+  // …and the clocks must be independent. Keyed by tab id alone, the SECOND tab's
+  // departure re-arms over the first tab's pending clock and the first tab is
+  // never declared gone at all — its disclosure stranded for good.
+  it("two incarnations of one key get independent clocks", async () => {
+    const gone: string[] = [];
+    bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: NEVER });
+    const tabA = await connectPanel("wf:two", "wf", { tabSessionId: "browser-tab-A" });
+    await occupied("wf:two", "browser-tab-A");
+    tabA.close();
+    await vacant("wf:two");
+
+    // B takes the key over, then leaves too. A's clock is still armed throughout
+    // — the grace cannot elapse — so this cannot pass by A firing early.
+    const tabB = await connectPanel("wf:two", "wf", { tabSessionId: "browser-tab-B" });
+    await occupied("wf:two", "browser-tab-B");
+    tabB.close();
+    await vacant("wf:two");
+    expect(gone).toEqual([]);
+
+    bridge.__runTabGoneClocksForTest();
+    expect(gone.filter((t) => t === "wf:two")).toHaveLength(2);
+    bridge.setTabGoneListener(() => {});
+  });
+
+  // Coordinator gate P1: two tabs open at once on one key. B's hello SUPERSEDES
+  // A's socket, so by the time A's close handler runs the map already points at
+  // B — and a "was I the primary?" guard answers no for a tab that very much did
+  // just leave, so A was never armed at all and could never be declared gone.
+  it("a tab superseded by a second tab on the same key is still declared gone", async () => {
+    const gone: string[] = [];
+    bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: NEVER });
+    const tabA = await connectPanel("wf:takeover", "wf", { tabSessionId: "browser-tab-A" });
+    await occupied("wf:takeover", "browser-tab-A");
+
+    // B opens the SAME saved workflow while A is still connected; the bridge
+    // supersedes A's socket rather than refusing B.
+    const tabB = await connectPanel("wf:takeover", "wf", { tabSessionId: "browser-tab-B" });
+    await occupied("wf:takeover", "browser-tab-B");
+    // A's close is asynchronous — wait until it has actually armed something.
+    await vi.waitFor(() => {
+      bridge.__runTabGoneClocksForTest();
+      expect(gone).toEqual(["wf:takeover"]);
+    });
+    tabB.close();
+    void tabA;
+    bridge.setTabGoneListener(() => {});
+  });
+
+  // The ENTRIES are keyed by tab id, not incarnation — so a takeover has to be a
+  // CONVERSATION BOUNDARY, announced at the hello rather than after a grace: the
+  // newcomer must not be able to reach the departed tab's answers at all.
+  it("a takeover by a different browser tab is announced immediately", async () => {
+    const takenOver: Array<[string, string]> = [];
+    bridge.setTabTakenOverListener((tabId, departed) => takenOver.push([tabId, departed]));
+    const tabA = await connectPanel("wf:boundary", "wf", { tabSessionId: "browser-tab-A" });
+    await occupied("wf:boundary", "browser-tab-A");
+    expect(takenOver).toEqual([]);
+
+    const tabB = await connectPanel("wf:boundary", "wf", { tabSessionId: "browser-tab-B" });
+    await vi.waitFor(() => expect(takenOver).toHaveLength(1));
+    expect(takenOver[0]).toEqual(["wf:boundary", "browser-tab-A"]);
+    tabA.close();
+    tabB.close();
+    bridge.setTabTakenOverListener(() => {});
+  });
+
+  // The incarnation COMPARISON (rather than merely "was someone here?") is what
+  // this guards: a panel re-hellos on its own live socket — a title change, a
+  // re-registration — with the old connection still in the map. Same occupant,
+  // so its conversation continues and nothing may be retired. This is also why
+  // the anonymous id must be per CONNECTION: minted per hello, a re-hello would
+  // look like a stranger to itself.
+  it("a re-hello from the SAME tab on a live socket is not a takeover", async () => {
+    const takenOver: string[] = [];
+    bridge.setTabTakenOverListener((tabId) => takenOver.push(tabId));
+    for (const identity of [{ tabSessionId: "browser-tab-A" }, {}]) {
+      const key = identity.tabSessionId ? "wf:rehello" : "wf:rehello-anon";
+      const sock = await connectPanel(key, "wf", identity);
+      await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === key)).toBe(true));
+      const before = bridge.tabIncarnation(key);
+
+      // Re-register on the SAME socket, with no disconnect in between.
+      sock.send(
+        JSON.stringify({
+          type: "hello",
+          tab_id: key,
+          title: "renamed",
+          enforces_workflow_stamp: true,
+          enforces_workflow_stamp_at_write: true,
+          ...(identity.tabSessionId ? { tab_session_id: identity.tabSessionId } : {}),
+        }),
+      );
+      await vi.waitFor(() =>
+        expect(bridge.tabs().some((t) => t.tab_id === key && t.title === "renamed")).toBe(true),
+      );
+      // Same connection, same incarnation — and therefore not a takeover.
+      expect(bridge.tabIncarnation(key)).toBe(before);
+      expect(takenOver).toEqual([]);
+      sock.close();
+      await vacant(key);
+    }
+    bridge.setTabTakenOverListener(() => {});
+  });
+
+  // …and P1-2: anonymous panels must NOT share one slot. The panel omits its
+  // identity precisely when its Web Locks lease could not be acquired — i.e.
+  // when a duplicate tab copied the sessionStorage id — so the anonymous path IS
+  // the two-tabs-one-key case, not an exotic edge.
+  it("two anonymous departures on one key are both declarable", async () => {
+    const gone: string[] = [];
+    bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: NEVER });
+    const anonA = await connectPanel("wf:anon", "wf"); // no tab_session_id
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:anon")).toBe(true));
+    anonA.close();
+    await vacant("wf:anon");
+
+    const anonB = await connectPanel("wf:anon", "wf"); // also anonymous
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:anon")).toBe(true));
+    anonB.close();
+    await vacant("wf:anon");
+    expect(gone).toEqual([]);
+
+    // Two unproven departures, two owed warnings — the second must not overwrite
+    // or clear the first.
+    bridge.__runTabGoneClocksForTest();
+    expect(gone.filter((t) => t === "wf:anon")).toHaveLength(2);
+    bridge.setTabGoneListener(() => {});
+  });
+
+  it("an unidentified panel cannot prove it came back, so the clock still fires", async () => {
+    const gone: string[] = [];
+    bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: NEVER });
+    // No tab_session_id: the panel could not take its Web Locks lease. Nothing
+    // can prove which tab returned, and unknown-return must let the disclosure
+    // surface.
+    const sock = await connectPanel("tab-anonymous", "wf");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-anonymous")).toBe(true));
+    sock.close();
+    await vacant("tab-anonymous");
+    const back = await connectPanel("tab-anonymous", "wf");
+    // The "reconnect" is COMPLETE before the clock runs, so a pass proves the
+    // cancel declined rather than that the timer got there first.
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-anonymous")).toBe(true));
+
+    bridge.__runTabGoneClocksForTest();
+    expect(gone).toEqual(["tab-anonymous"]);
+    back.close();
+    bridge.setTabGoneListener(() => {});
+  });
+
+  it("a throwing sink never breaks the message loop or loses the buffered answer", async () => {
+    bridge.setLateAskReplySink(() => {
+      throw new Error("journal exploded");
+    });
+    const sock = await connectPanel("tab-sink-bad", "wf");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-sink-bad")).toBe(true));
+    sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd === "ask_user") {
+        setTimeout(() => {
+          sock.send(JSON.stringify({ rid: msg.rid, ok: true, result: "Still Here" }));
+        }, 80);
+      }
+    });
+    await expect(
+      bridge.send(
+        { cmd: "ask_user", ask_id: "ask-bad", question: "?", options: [] },
+        { tabId: "tab-sink-bad", timeoutMs: 30 },
+      ),
+    ).rejects.toThrow(/did not reply/i);
+    await vi.waitFor(() => expect(bridge.takeLateAskReply("ask-bad")).toBe("Still Here"));
+    bridge.setLateAskReplySink(() => {});
   });
 
   it("does not buffer a non-ask command's late reply (no ask_id → dropped)", async () => {

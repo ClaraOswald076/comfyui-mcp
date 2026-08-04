@@ -110,6 +110,23 @@ interface Conn {
    * tab across a ComfyUI restart. It is used only as an accidental-routing
    * correctness proof for restart readiness; absence fails that proof closed. */
   tabSessionId?: string;
+  /**
+   * ALWAYS-PRESENT incarnation identity for this connection (#486).
+   *
+   * `tabSessionId` when the panel proved one, otherwise a bridge-minted
+   * `anon:<n>` unique to THIS connection. Never absent, and never shared: the
+   * panel returns no identity precisely when its Web Locks lease could not be
+   * acquired — i.e. when a duplicated browser tab copied the sessionStorage id —
+   * which is exactly the two-tabs-one-key case, so collapsing all such
+   * connections into one "anonymous" bucket would lose the very distinction that
+   * matters most. Distinct by construction instead.
+   *
+   * Kept SEPARATE from `tabSessionId` on purpose: that field is a proof used by
+   * the restart-readiness gate (#570/#709) and must stay absent when unproven. A
+   * synthetic id is fine for "which connection is this?" and would be a lie for
+   * "did the same browser tab come back?".
+   */
+  incarnationId: string;
   /** Canvas-less client (mobile/remote pseudo-panel) — advertised in `hello`.
    *  Lets tools resolve media to inline bytes instead of a browser /view ref. */
   headless: boolean;
@@ -724,6 +741,19 @@ export function isCapabilityRefusal(err: unknown): boolean {
 }
 
 /** Tag an error as a reply-timeout and return it (for throw/reject). */
+/**
+ * Key for a pending "is this tab gone?" clock (#486).
+ *
+ * (tab id, INCARNATION) — a `wf:<hash>` tab id recurs, so it names a workflow,
+ * not a browser tab. The incarnation is the panel's sessionStorage-backed
+ * `tab_session_id`: unique per browser tab and stable across a reload, which is
+ * exactly the distinction the clock has to draw. JSON-encoded so neither part
+ * can be forged into the other by a separator.
+ */
+export function tabIncarnationSlot(tabId: string, incarnation: string | undefined): string {
+  return JSON.stringify([tabId, incarnation ?? null]);
+}
+
 export function markReplyTimeout<E extends Error>(err: E): E {
   Object.defineProperty(err, REPLY_TIMEOUT, {
     value: true,
@@ -890,15 +920,71 @@ export class UiBridge {
    *  caller, instead of being discarded as a "late reply for a timed-out command"
    *  (#486). Timestamped so an abandoned mapping (timeout/disconnect/send-failure
    *  whose late reply never arrives) is TTL-pruned rather than kept forever. */
-  private askRidToId = new Map<string, { askId: string; ts: number }>();
+  private askRidToId = new Map<string, { askId: string; ts: number; tabId: string }>();
+  /**
+   * Notified the instant a LATE (post-reply-timeout) ask answer validates (#486).
+   *
+   * The buffer below only helps a caller that is still alive to poll it. The
+   * whole of #486 is the case where nobody is: the `tools/call` that asked has
+   * been abandoned, so the answer would sit here unread until the TTL pruned it.
+   * This hands it to the orchestrator's ask journal at ARRIVAL, with no live
+   * caller required — after which it is durable and can be replayed or pushed.
+   */
+  private lateAskSink: ((askId: string, result: unknown, tabId: string) => void) | null = null;
+  /** See setTabGoneListener. */
+  private onTabGone: ((tabId: string, incarnation: string) => void) | null = null;
+  /** See setTabTakenOverListener. */
+  private onTabTakenOver: ((tabId: string, departed: string) => void) | null = null;
+  /**
+   * How long a tab must stay away before it counts as GONE rather than
+   * reconnecting.
+   *
+   * A reload closes the socket and re-hellos moments later, so firing on the
+   * close itself would retire live per-tab state during an ordinary F5. Sized
+   * far above any reload (and above RECONNECT_GRACE_MS, which bounds a much more
+   * urgent decision): waiting costs nothing but a little bookkeeping held
+   * slightly longer, while firing early destroys it.
+   */
+  private tabGoneGraceMs = 60_000;
+  /** Armed tab-gone clocks, keyed by (tab id, incarnation) — see armTabGone. */
+  private tabGoneTimers = new Map<
+    string,
+    { timer: ReturnType<typeof setTimeout>; tabId: string; incarnation: string }
+  >();
+  /** Counter behind the synthetic `anon:<n>` incarnations. */
+  private nextAnonIncarnation = 0;
+  /**
+   * Which (tab, incarnation) each live socket registered as.
+   *
+   * The close handler needs this because "was I the primary connection?" is the
+   * WRONG question: when a second tab takes over a recurring `wf:<hash>` key the
+   * bridge closes the first socket, and by the time that close fires the map
+   * already points at the newcomer — so the departing tab was never armed at all
+   * and could never be declared gone. The socket knows who it was; ask it.
+   */
+  private sockIncarnation = new Map<BridgeSocket, { tabId: string; incarnation: string }>();
   /** Buffered late-but-valid ask_user answers (ask_id → result), drained by the
    *  caller via takeLateAskReply(). Bounded by a short TTL — a stale unclaimed
    *  answer is pruned rather than kept forever. */
   private lateAskReplies = new Map<string, { result: unknown; ts: number }>();
-  /** TTL for a buffered late ask answer / an unresolved rid→ask_id mapping. Long
-   *  enough to cover a slow human pick within the MCP tools/call budget, short
-   *  enough that abandoned entries don't accumulate. */
+  /** TTL for a BUFFERED late ask answer. Only an in-flight caller drains this
+   *  (its grace poll lives well under 5 minutes), and the durable copy is the
+   *  journal the sink feeds — so this stays short. */
   private static readonly LATE_ASK_TTL_MS = 5 * 60 * 1000;
+  /**
+   * Ask cards whose rid→ask_id mapping is retained.
+   *
+   * This mapping is a different thing from the buffer above, with a different
+   * job: it is what lets a late reply be RECOGNISED as a card answer at all, and
+   * therefore what gates the durable ask journal (#486). It deliberately has NO
+   * TTL. A question card sits on screen until the user deals with it, which can
+   * be arbitrarily longer than any tool call, so any clock here would be a
+   * stopwatch quietly deciding that a validated answer no longer counts — and
+   * the answer would be dropped with no record at all. Three small fields per
+   * card, so a whole session's worth costs nothing; overflowing THIS is the only
+   * way a mapping is ever forgotten, and it is logged at ERROR.
+   */
+  private static readonly MAX_ASK_RID_MAPPINGS = 1024;
   /** In-flight IDEMPOTENT reads whose socket dropped mid-command, parked per tabId
    *  waiting a bounded grace for that tab to reconnect so we can re-dispatch them
    *  (resume) instead of hard-failing. Never holds mutating commands. */
@@ -1347,6 +1433,52 @@ export class UiBridge {
             // Already gone.
           }
         }
+        const incomingTabSessionId =
+          typeof (msg as { tab_session_id?: unknown }).tab_session_id === "string" &&
+          (msg as { tab_session_id?: string }).tab_session_id?.trim()
+            ? (msg as { tab_session_id?: string }).tab_session_id!.trim()
+            : undefined;
+        // #486 — THIS tab is back. Cancel its pending "is it gone?" clock, so an
+        // ordinary reload never retires state only this tab can be told about.
+        //
+        // Matched on the BROWSER-TAB SESSION, not the key: a `wf:<hash>` key
+        // recurs, so a DIFFERENT tab opening the same saved workflow takes it
+        // over. Keyed on the id alone, that stranger's hello would cancel the
+        // departed tab's clock — and a later result from the stranger could then
+        // report and settle the departed tab's lost-answer disclosure as its own.
+        // Same key is not the same tab; only the same incarnation coming back is
+        // a proven return.
+        // ALWAYS an identity for this connection — the panel's proven one, or a
+        // fresh synthetic. See PanelConn.incarnationId for why anonymous ones must
+        // be distinct rather than shared.
+        // PER CONNECTION, not per hello. A panel re-hellos on its own live socket
+        // (a title change, a re-registration), and minting a fresh `anon:<n>`
+        // there would make the connection look like a stranger to itself: the
+        // takeover branch below would fire and close its own asks, after which
+        // its real conversation could neither recover nor be pushed its answers.
+        // The identity is a property of the connection; an event that can repeat
+        // on one connection must not mint a new one.
+        const incarnationId =
+          incomingTabSessionId ??
+          this.sockIncarnation.get(sock)?.incarnation ??
+          `anon:${++this.nextAnonIncarnation}`;
+        this.sockIncarnation.set(sock, { tabId, incarnation: incarnationId });
+        // #486 — A DIFFERENT BROWSER TAB has taken this recurring key over. That is
+        // not a reconnect, it is a change of occupant: the previous tab's
+        // conversation is over, and anything of its still addressed to this key must
+        // stop being answerable BEFORE the newcomer can reach it. Fired here, at the
+        // hello, rather than on the departing socket's grace — a takeover is proof,
+        // so there is nothing to wait for.
+        if (existing && existing.incarnationId !== incarnationId) {
+          try {
+            this.onTabTakenOver?.(tabId, existing.incarnationId);
+          } catch (err) {
+            logger.warn(
+              `[ui-bridge] tab-takeover listener threw for ${tabId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
+        this.cancelTabGone(tabId, incarnationId);
         this.conns.set(tabId, {
           sock,
           tabId,
@@ -1357,11 +1489,8 @@ export class UiBridge {
           // tab id. The browser-tab identity must have arrived on THIS hello,
           // otherwise it cannot prove that the tab receiving the reboot is the
           // tab that came back afterwards.
-          tabSessionId:
-            typeof (msg as { tab_session_id?: unknown }).tab_session_id === "string" &&
-            (msg as { tab_session_id?: string }).tab_session_id?.trim()
-              ? (msg as { tab_session_id?: string }).tab_session_id!.trim()
-              : undefined,
+          tabSessionId: incomingTabSessionId,
+          incarnationId,
           headless: incomingHeadless,
           panelVersion:
             typeof (msg as { panel_version?: unknown }).panel_version === "string"
@@ -1488,6 +1617,18 @@ export class UiBridge {
             if (msg.ok) {
               this.pruneLateAsk();
               this.lateAskReplies.set(entry.askId, { result: msg.result, ts: Date.now() });
+              // …and hand it to the durable journal RIGHT NOW, whether or not any
+              // caller is still polling (#486). The buffer above is only reachable
+              // by a live poller; this is what makes an answer given after the
+              // tool call died survive at all. Never let a sink fault break the
+              // message loop.
+              try {
+                this.lateAskSink?.(entry.askId, msg.result, entry.tabId);
+              } catch (err) {
+                logger.warn(
+                  `[ui-bridge] late ask-answer sink threw (the answer is still buffered): ${err instanceof Error ? err.message : String(err)}`,
+                );
+              }
             }
           }
           return;
@@ -1609,6 +1750,13 @@ export class UiBridge {
         if (set.delete(sock) && set.size === 0) this.subscribers.delete(tid);
       }
       this.mirrorViewers.delete(sock);
+      // #486 — WHICH connection just died, from the socket itself. Asked before
+      // any of the map surgery below, and independently of whether this socket
+      // was still the primary: a second tab taking over a recurring key closes
+      // this one AFTER installing itself, so "am I in the map?" answers no for a
+      // tab that very much did just leave.
+      const departing = this.sockIncarnation.get(sock);
+      this.sockIncarnation.delete(sock);
       let wasPrimary = false;
       if (tabId && this.conns.get(tabId)?.sock === sock) {
         wasPrimary = true;
@@ -1626,6 +1774,15 @@ export class UiBridge {
         );
       }
       if (wasPrimary) this.broadcastTabList(); // a desktop tab left — refresh pickers
+      // #486 — a socket close is NOT evidence the tab is gone; it is evidence a
+      // socket closed, and an ordinary F5 produces exactly this. Arm the clock for
+      // THIS connection's incarnation and let it fire only if that incarnation
+      // stays away. Armed whether or not the socket was still primary: a takeover
+      // by a second tab on the same recurring key leaves the departing tab out of
+      // the map, and it is exactly the one that must still be declarable.
+      if (departing && this.conns.get(departing.tabId)?.incarnationId !== departing.incarnation) {
+        this.armTabGone(departing.tabId, departing.incarnation);
+      }
       // An in-flight command's socket just died. Instead of hard-failing every one
       // with a bare "disconnected" (which reads as a clean failure and invites a
       // blind retry — double render for a run), hand each to the disconnect handler:
@@ -1858,20 +2015,50 @@ export class UiBridge {
     for (const [id, e] of this.lateAskReplies) {
       if (now - e.ts > UiBridge.LATE_ASK_TTL_MS) this.lateAskReplies.delete(id);
     }
-    // TTL-prune abandoned rid→ask_id mappings (a card that timed out / dropped and
-    // whose late reply never came), so they don't linger past the window a caller
-    // could still claim them.
-    for (const [rid, e] of this.askRidToId) {
-      if (now - e.ts > UiBridge.LATE_ASK_TTL_MS) this.askRidToId.delete(rid);
-    }
-    // Belt-and-suspenders cardinality cap in case of a burst of asks within one TTL
-    // window — drop the oldest-inserted mappings so the map can never grow unbounded.
-    if (this.askRidToId.size > 256) {
-      const excess = this.askRidToId.size - 256;
+    // NOTE: rid→ask_id mappings are deliberately NOT TTL-pruned — see
+    // MAX_ASK_RID_MAPPINGS. A card can be answered arbitrarily late, and this
+    // mapping is the only thing that makes such an answer recognisable.
+    //
+    // The cardinality cap is the sole bound: drop the oldest-inserted mappings so
+    // the map can never grow without limit. LOUD, because past this point a late
+    // answer for that card can no longer be recognised — a real (if wildly
+    // unlikely) degradation, not routine housekeeping.
+    if (this.askRidToId.size > UiBridge.MAX_ASK_RID_MAPPINGS) {
+      const excess = this.askRidToId.size - UiBridge.MAX_ASK_RID_MAPPINGS;
+      logger.error(
+        `[ui-bridge] over ${UiBridge.MAX_ASK_RID_MAPPINGS} question cards are open at once — forgetting the ${excess} oldest; a late answer for those can no longer be delivered`,
+      );
       let i = 0;
-      for (const rid of this.askRidToId.keys()) {
+      const orphanedTabs = new Set<string>();
+      for (const [rid, e] of this.askRidToId) {
         if (i++ >= excess) break;
         this.askRidToId.delete(rid);
+        orphanedTabs.add(e.tabId);
+      }
+      // TELL THE USER, on their own screen.
+      //
+      // Preferring loss over misattribution here is a sound call, but a server
+      // log is not a disclosure to the person holding the mouse: without this,
+      // the next thing that happens is someone clicking a button on a card that
+      // is still sitting there and having it do NOTHING — no answer delivered, no
+      // error, no sign anything went wrong. That is the worst possible
+      // presentation of a deliberate trade. Say it once per affected tab, at the
+      // moment we know, and name what to do instead.
+      for (const tabId of orphanedTabs) {
+        try {
+          this.push(
+            {
+              type: "say",
+              text:
+                `⚠️ Too many question cards are open at once in this tab, so the oldest ones can no ` +
+                `longer accept an answer — clicking them will do nothing. Answer the most recent card, ` +
+                `or just type your choice in the chat and the agent will pick it up.`,
+            },
+            tabId,
+          );
+        } catch {
+          // Best-effort: the log above is the durable record.
+        }
       }
     }
   }
@@ -1880,12 +2067,131 @@ export class UiBridge {
    *  after the card-reply timeout, or undefined if none arrived. The panel_ask
    *  handler polls this for a bounded grace so a slow-but-valid pick is honored
    *  rather than discarded (#486). */
+  /** Wire the durable ask-answer journal to late (post-timeout) card answers
+   *  (#486). Called once at orchestrator start-up. */
+  setLateAskReplySink(sink: (askId: string, result: unknown, tabId: string) => void): void {
+    this.lateAskSink = sink;
+  }
+
+  /** Notified when a tab's PRIMARY connection is dropped and it leaves the
+   *  connection map (#486). Lets per-tab bookkeeping that can only ever be
+   *  delivered to that tab be surfaced and retired, instead of accumulating for
+   *  a tab that may never reconnect. */
+  /**
+   * Notified when a DIFFERENT browser tab takes over a recurring tab key (#486).
+   *
+   * Distinct from the gone-listener, and deliberately immediate: a disconnect
+   * might be a reload, but a takeover is PROOF the previous occupant is done —
+   * something else is holding its key right now. Anything keyed by tab id that
+   * belongs to the departed occupant's CONVERSATION must be retired here, before
+   * the newcomer can reach it.
+   */
+  setTabTakenOverListener(listener: (tabId: string, departed: string) => void): void {
+    this.onTabTakenOver = listener;
+  }
+
+  setTabGoneListener(
+    listener: (tabId: string, incarnation: string) => void,
+    opts: { graceMs?: number } = {},
+  ): void {
+    this.onTabGone = listener;
+    if (typeof opts.graceMs === "number" && opts.graceMs >= 0) this.tabGoneGraceMs = opts.graceMs;
+  }
+
+  /**
+   * Start the "is this tab actually gone?" clock for the INCARNATION that just
+   * left — its browser-tab session id, which is sessionStorage-backed and so
+   * survives a reload while being unique per browser tab.
+   *
+   * `incarnation` undefined means the departing panel never identified itself
+   * (an old build). Nothing can then PROVE it came back, so nothing may suppress
+   * the signal: it fires at the end of the grace. Unknown-return has to let the
+   * disclosure surface — folding "could not tell" into "it's back" is how a
+   * warning goes missing.
+   */
+  private armTabGone(tabId: string, incarnation: string): void {
+    if (!this.onTabGone) return;
+    // Keyed per INCARNATION, so two browser tabs that share a recurring
+    // `wf:<hash>` key each get their own clock. Keyed by tab id alone, the
+    // second tab's departure would silently drop the first tab's pending
+    // signal and it would never be declarable gone at all.
+    const slot = tabIncarnationSlot(tabId, incarnation);
+    const prev = this.tabGoneTimers.get(slot);
+    if (prev) clearTimeout(prev.timer);
+    const timer = setTimeout(() => this.fireTabGone(slot, tabId, incarnation), this.tabGoneGraceMs);
+    // Never hold the process open just to declare a tab gone.
+    timer.unref?.();
+    this.tabGoneTimers.set(slot, { timer, tabId, incarnation });
+  }
+
+  /** The clock elapsed for one (tab, incarnation). Split out so a test can run
+   *  it at a chosen moment instead of racing a wall-clock grace. */
+  private fireTabGone(slot: string, tabId: string, incarnation: string): void {
+    this.tabGoneTimers.delete(slot);
+    // Re-check on the INCARNATION, not the key: something else may now hold this
+    // recurring id, and a stranger holding the key is not this tab coming back.
+    if (this.conns.get(tabId)?.incarnationId === incarnation) return;
+    try {
+      this.onTabGone?.(tabId, incarnation);
+    } catch (err) {
+      logger.warn(
+        `[ui-bridge] tab-gone listener threw for ${tabId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * TEST ONLY — run every armed gone-clock right now.
+   *
+   * The clocks are the one part of this file whose behaviour is defined by
+   * elapsed time, and a test that races a real grace is worse than no test: too
+   * short and it fails on a correct implementation, too long and a timer that
+   * fires before the successor's hello lands makes a broken cancel look caught.
+   * Widening the window only hides the second direction. So tests wait for the
+   * state they care about to be provably reached, then run the clocks here.
+   */
+  __runTabGoneClocksForTest(): void {
+    for (const [slot, armed] of [...this.tabGoneTimers]) {
+      clearTimeout(armed.timer);
+      this.fireTabGone(slot, armed.tabId, armed.incarnation);
+    }
+  }
+
+  /**
+   * THIS tab is back (or is being torn down deliberately) — it is not gone.
+   *
+   * Only the SAME incarnation cancels. A different browser tab taking over a
+   * recurring `wf:<hash>` key must leave the departed tab's clock running, or
+   * the departed tab becomes permanently undeclarable and its disclosure can be
+   * settled by a conversation that never owned it. `undefined` cancels
+   * unconditionally, for the deliberate teardown path that has no incarnation to
+   * name.
+   */
+  private cancelTabGone(tabId: string, incarnation: string): void {
+    // Only the SAME incarnation cancels. An anonymous connection gets a fresh
+    // synthetic id, so it can never match a predecessor's slot — an unidentified
+    // panel therefore still cannot suppress anyone's owed warning, which is the
+    // asymmetry this must preserve.
+    const slot = tabIncarnationSlot(tabId, incarnation);
+    const armed = this.tabGoneTimers.get(slot);
+    if (!armed) return;
+    clearTimeout(armed.timer);
+    this.tabGoneTimers.delete(slot);
+  }
+
   takeLateAskReply(askId: string): unknown | undefined {
     this.pruneLateAsk();
     const e = this.lateAskReplies.get(askId);
     if (!e) return undefined;
     this.lateAskReplies.delete(askId);
     return e.result;
+  }
+
+  /** The incarnation currently holding `tabId` — the identity every structure
+   *  that stores per-tab state must scope to, so a different browser tab taking
+   *  over a recurring `wf:<hash>` key cannot read, settle or inherit it (#486). */
+  tabIncarnation(tabId: string): string | undefined {
+    return this.conns.get(tabId)?.incarnationId;
   }
 
   /** All currently connected tabs, most recent hello last. */
@@ -2315,7 +2621,10 @@ export class UiBridge {
     const askId = (cmd as { ask_id?: unknown }).ask_id;
     if (typeof askId === "string" && askId) {
       this.pruneLateAsk();
-      this.askRidToId.set(rid, { askId, ts: Date.now() });
+      // Carry the ROUTED tab id with the mapping: the late-reply branch runs in a
+      // scope that only knows the socket, and the journal needs the tab the card
+      // was rendered on to address the answer.
+      this.askRidToId.set(rid, { askId, ts: Date.now(), tabId: ctx.tabId });
     }
     // Rewrite an old-panel "Unknown command" rejection into an actionable
     // update-your-panel message (see makeUnknownCommandError). Applied to the
@@ -2631,6 +2940,8 @@ export class UiBridge {
   }
 
   async stop(): Promise<void> {
+    for (const armed of this.tabGoneTimers.values()) clearTimeout(armed.timer);
+    this.tabGoneTimers.clear();
     if (this.bindRetryTimer) {
       clearTimeout(this.bindRetryTimer);
       this.bindRetryTimer = null;
