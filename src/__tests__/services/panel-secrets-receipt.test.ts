@@ -473,6 +473,38 @@ describe("slot saves report what the read-back PROVED (#826 gate round 3)", () =
     }
   });
 
+  it("DOES fire a change when a failed save left an alias stranded", () => {
+    // A proven-failed write returns before emitting, so nothing is "suppressed"
+    // during the fan-out. Keying the final emit off that would emit nothing for
+    // a slot left partially stranded — and a child that needs a respawn to see
+    // the change would run on its old spawn env until something unrelated
+    // restarted it. The store DID change, so the event must fire.
+    resetEnvFileProvenanceForTests();
+    writeFileSync(envPath, "# store starts empty\n", { mode: 0o600 });
+    const cb = vi.fn();
+    const off = onComfyuiSecretsChanged(cb);
+    try {
+      let write = 0;
+      // Alias 1's write lands; alias 2's does not (so the save fails); then the
+      // restore of alias 1 cannot write either, leaving it STRANDED.
+      fsState.failWriteOnCall = () => {
+        write += 1;
+        return write >= 2;
+      };
+      try {
+        const outcome = setPanelSecret("huggingface", "hf-new");
+        expect(outcome.confirmed).toBe(false);
+        expect(outcome.strandedKeys).toContain("HF_TOKEN");
+        expect(outcome.rolledBack).toBe(false);
+      } finally {
+        fsState.failWriteOnCall = null;
+      }
+      expect(cb).toHaveBeenCalledTimes(1);
+    } finally {
+      off();
+    }
+  });
+
   it("fires EXACTLY ONE change event for a successful multi-alias slot save", () => {
     const cb = vi.fn();
     const off = onComfyuiSecretsChanged(cb);

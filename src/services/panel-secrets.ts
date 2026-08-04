@@ -1032,14 +1032,20 @@ export function setPanelSecret(slotId: string, value: string): SlotSaveOutcome {
         unverifiedKeys,
       };
     },
-    (result, suppressed) => {
+    (result) => {
       // Emit ONCE, for the state actually left. A save that failed and was fully
       // rolled back changed nothing, so it must not respawn anything.
       const changed = !!result && (result.confirmed || !result.rolledBack);
       if (!changed) return {};
+      // Keyed off the SLOT, not off whether a per-key emit happened to be
+      // suppressed during the fan-out: a proven-failed write returns before
+      // emitting, so a slot left partially STRANDED would suppress nothing and
+      // therefore emit nothing — leaving a child that needs a respawn to see the
+      // change running on its old spawn env until something unrelated restarted
+      // it (codex gate, final round).
       return {
-        comfyui: suppressed.comfyui ? {} : false,
-        agent: suppressed.agent,
+        comfyui: slot.store === "comfyui" ? {} : false,
+        agent: slot.store === "agent",
       };
     },
   );
