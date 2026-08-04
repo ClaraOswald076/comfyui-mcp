@@ -28,6 +28,10 @@ const SCHEDULER = {
   question: "Which scheduler should I use?",
   options: [{ label: "karras" }, { label: "normal" }],
 };
+const THIRD_Q = {
+  question: "Should I upscale the result?",
+  options: [{ label: "yes" }, { label: "no" }],
+};
 
 function openAndAnswer(
   askId: string,
@@ -1889,17 +1893,81 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     expect(AskAnswers.droppedFor(TAB)).toBe(2);
   });
 
-  it("a throwing recall cannot leave the boundary half-built either", () => {
+  // Gate P0: A CATCH BLOCK THAT CAN THROW IS NOT A GUARD.
+  //
+  // Pass 2 wraps `revoke()` so a throwing revoker cannot abort the boundary — but
+  // the logger.warn that REPORTS that failure was itself unguarded, so a throwing
+  // revoker plus a throwing warn sink handed the abort straight back: closeAsks
+  // exited inside the first entry's catch, skipping every remaining recall AND
+  // pass 3 (surfaceAndClearDebt). Both halves of the debt then survived on a
+  // retired conversation —
+  //   • the side-map half for a SAME-INCARNATION replacement (New chat does not
+  //     change the incarnation) to read via reportDropped() and settle with its
+  //     own ack, i.e. the departed conversation's warning misattributed and then
+  //     silenced;
+  //   • the entry-carried half stamped on an entry that is now retired and
+  //     therefore permanently undeliverable, which hasOutstanding() still counts
+  //     as owed — a self-restart gate stuck shut forever.
+  //
+  // So this drives BOTH throwing sinks at once and asserts the pass actually ran:
+  // both queued tokens reached the revoker, and the destroy-step after it did too.
+  it("a throwing recall — even with a throwing warn sink — cannot leave the boundary half-built", () => {
     openAndAnswer("pa-recall", SAMPLER, "dpmpp_2m");
     openAndAnswer("pa-recall-2", SCHEDULER, "karras");
+    // Captured BEFORE the hand-off: these two are exactly what pass 2 must pull
+    // back, and naming them is what makes deleting the recall loop fail.
+    const queuedTokens = AskAnswers.entriesFor(TAB).map((e) => e.token);
+    expect(queuedTokens).toHaveLength(2);
     AskAnswers.deliverPending(TAB, () => true); // both queued into a turn
-    AskAnswers.setRevoker(() => {
+
+    // Debt in BOTH places, so pass 3 has both halves to destroy: the side map
+    // (no pending entry to stamp right now) …
+    AskAnswers.noteDroppedForTest(TAB, 2);
+    // … and stamped onto a surviving PENDING entry (the half that jams the gate).
+    openAndAnswer("pa-recall-3", THIRD_Q, "yes");
+    AskAnswers.noteDroppedForTest(TAB, 3);
+    expect(AskAnswers.droppedFor(TAB)).toBe(5);
+
+    const recalls: Array<[string, string]> = [];
+    AskAnswers.setRevoker((key, token) => {
+      recalls.push([key, token]);
       throw new Error("agent is gone");
     });
+    // The failure REPORT is fallible too — that is the whole finding.
+    const deadWarn = vi.spyOn(logger, "warn").mockImplementation(() => {
+      throw new Error("log sink is down");
+    });
+    const surfaced: string[] = [];
+    const surfacer = vi.spyOn(logger, "error").mockImplementation((msg: string) => {
+      surfaced.push(msg);
+    });
 
-    // The revoke is fallible and runs AFTER the fence, so it cannot skip it.
-    AskAnswers.closeAsks(TAB);
+    // Everything after the fence is fallible, and none of it may escape.
+    expect(() => AskAnswers.closeAsks(TAB)).not.toThrow();
+    deadWarn.mockRestore();
+    surfacer.mockRestore();
 
+    // PASS 2 RAN TO THE END: both queued copies were actually offered back, not
+    // just the first. A throw out of entry 1's catch would leave entry 2 queued on
+    // an agent whose conversation is gone.
+    expect(recalls).toEqual([
+      [TAB, queuedTokens[0]],
+      [TAB, queuedTokens[1]],
+    ]);
+
+    // PASS 3 RAN AT ALL, and said WHY and HOW MUCH before destroying it — the
+    // reason, not just the state.
+    expect(surfaced).toHaveLength(1);
+    expect(surfaced[0]).toMatch(/its conversation was replaced/);
+    expect(surfaced[0]).toMatch(/5 validated answer/);
+    expect(AskAnswers.droppedFor(TAB)).toBe(0);
+    // …so the replacement conversation cannot be handed the departed one's
+    // warning as its own…
+    expect(AskAnswers.reportDropped(TAB)).toBe(0);
+    // …and no retired, undeliverable entry is left holding the restart gate.
+    expect(AskAnswers.hasOutstanding()).toBe(false);
+
+    // PASS 1's fence is intact throughout.
     expect(AskAnswers.entriesFor(TAB).every((e) => e.retired === true)).toBe(true);
     expect(AskAnswers.pending(TAB)).toHaveLength(0);
     expect(AskAnswers.recover(TAB, askFingerprint(SAMPLER)).status).toBe("unattributed");

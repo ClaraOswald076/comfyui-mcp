@@ -1525,9 +1525,26 @@ export class AskAnswerJournalImpl {
         // recall.
         recalled = this.revoke?.(entry.key, entry.token) === true;
       } catch (err) {
-        logger.warn(
-          `[ask-answers] could not recall a queued answer on tab ${key.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`,
-        );
+        // A CATCH BLOCK THAT CAN THROW IS NOT A GUARD. The try above exists so a
+        // throwing revoker cannot abort the pass — but the report of that failure
+        // is itself fallible, and an unguarded one hands the abort straight back:
+        // a throwing revoker AND a throwing warn sink together would exit
+        // closeAsks here, skipping the remaining recalls and, worse, pass 3. The
+        // debt would then stay on the tab for a same-incarnation replacement to
+        // read and settle as its own, and any entry-carried `disclose` would sit
+        // on a retired, undeliverable entry holding hasOutstanding() — and so the
+        // self-restart gate — open forever.
+        //
+        // Every step of this pass therefore has a TERMINAL error path: the report
+        // of a failure must never become a new failure that skips the rest.
+        try {
+          logger.warn(
+            `[ask-answers] could not recall a queued answer on tab ${key.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        } catch {
+          // The fence is already up; a log sink that is down cannot undo it, and
+          // must not stop the debt from being surfaced.
+        }
       }
       if (recalled) entry.delivery = "none";
       try {
