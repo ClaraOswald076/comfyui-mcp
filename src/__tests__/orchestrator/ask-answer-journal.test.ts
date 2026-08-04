@@ -1949,16 +1949,21 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     // where closeAsks throws — so restoring afterwards would leave a logger that
     // throws installed for every later test in the file, and the mutation run
     // would report a cascade instead of this one honest failure.
+    let threw = false;
     let escaped: unknown;
     try {
       AskAnswers.closeAsks(TAB);
     } catch (err) {
+      threw = true;
       escaped = err;
     } finally {
       deadWarn.mockRestore();
       surfacer.mockRestore();
     }
-    expect(escaped).toBeUndefined();
+    // `threw` is what DECIDES — a thrown `undefined` is still a throw, and
+    // testing the captured value alone would call that an escape-free run.
+    // `escaped` rides along only so a failure prints what got out.
+    expect({ threw, escaped }).toEqual({ threw: false, escaped: undefined });
 
     // PASS 2 RAN TO THE END: both queued copies were actually offered back, not
     // just the first. A throw out of entry 1's catch would leave entry 2 queued on
