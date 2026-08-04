@@ -60,7 +60,12 @@ import {
   removeUserMcpServer,
   setUserMcpServerSecret,
 } from "../services/user-mcp-config.js";
-import { setComfyuiSecret, setAgentSecret, isAllowedAgentSecretKey } from "../services/panel-secrets.js";
+import {
+  setComfyuiSecret,
+  setAgentSecret,
+  isAllowedAgentSecretKey,
+  type SecretSaveReceipt,
+} from "../services/panel-secrets.js";
 import { flattenUiWorkflow } from "../services/flatten-workflow.js";
 import { listWorkflowLibraryKeys, userdataFetch } from "../services/userdata-library.js";
 import { getNsfwConsent, setNsfwConsent } from "../services/panel-settings.js";
@@ -183,6 +188,69 @@ function ok(value: unknown): ToolResult {
 function fail(err: unknown): ToolResult {
   const msg = err instanceof Error ? err.message : String(err);
   return { content: [{ type: "text", text: `Error: ${msg}` }], isError: true };
+}
+
+// ── Honest secret-save reporting (#826) ─────────────────────────────────────
+// `panel_request_secret` used to answer "the comfyui tools respawn with it as
+// soon as this turn ends" unconditionally — a claim about a FUTURE event nothing
+// verified. When the respawn did not fire, the token sat on disk while every
+// download kept returning the same 401, and no signal separated "no token
+// configured" from "token present but never injected". These two helpers turn a
+// SecretSaveReceipt (all observed facts) into text that states only what was
+// checked. Neither ever touches, formats, or logs a secret VALUE.
+
+/** Error for a save a read-back proved did not take effect. Refusing here is
+ *  correct: the credential is not in place, so proceeding would send the caller
+ *  back into the same failure believing it was fixed. */
+export function secretNotPersisted(receipt: SecretSaveReceipt): Error {
+  return new Error(
+    `"${receipt.key}" was NOT saved: writing ${receipt.path} appeared to succeed, but reading the file back does not show that key with the value just supplied. ` +
+      `Nothing is configured — do not retry the action that needed it. Check that ${receipt.path} is writable and not managed by another process, then set the key again (panel Settings › credentials, or the env var directly).`,
+  );
+}
+
+/** The ack for a comfyui tool secret: what was verified, how the running tools
+ *  pick it up, and the ACTUAL respawn disposition — never a promise. */
+export function describeComfyuiSecretSave(receipt: SecretSaveReceipt): string {
+  const parts: string[] = [];
+  parts.push(
+    receipt.persisted === "yes"
+      ? `🔒 Saved env "${receipt.key}" to ${receipt.path} — verified by reading the file back (the value itself is never shown or logged).`
+      : `🔒 Wrote env "${receipt.key}" to ${receipt.path}, but the file could not be re-read to confirm it, so whether it persisted is UNKNOWN — treat the steps below as unconfirmed and re-check if the action still fails.`,
+  );
+  if (receipt.livePickup) {
+    // This is the property that makes the answer safe to act on immediately: the
+    // tools resolve this key from the file at USE time, so the already-running
+    // tool process sees it whether or not any respawn happens.
+    parts.push(
+      `The comfyui tools re-read that file each time they use this credential, so the tool process already running picks it up — no reload, and no respawn required.`,
+    );
+  } else {
+    parts.push(
+      `This key is read from the tool process's environment at startup, so only a respawned tool session will see it.`,
+    );
+  }
+  if (receipt.respawn === null) {
+    parts.push(
+      `No agent session reported back, so NO tool-session respawn was scheduled by this save.`,
+    );
+  } else {
+    const { applied, scheduled, live } = receipt.respawn;
+    const bits: string[] = [];
+    if (applied) bits.push(`${applied} replaced now`);
+    if (scheduled) bits.push(`${scheduled} queued for the end of this turn`);
+    parts.push(
+      bits.length
+        ? `Tool sessions being rebuilt with the new environment: ${bits.join(", ")} (of ${live} live).`
+        : `No live tool session needed rebuilding (${live} live).`,
+    );
+  }
+  parts.push(
+    receipt.livePickup
+      ? `Retry the action that needed this credential now.`
+      : `Retry after the tool session is rebuilt.`,
+  );
+  return parts.join(" ");
 }
 
 /**
@@ -6628,7 +6696,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
     ),
     def(
       "panel_request_secret",
-      "Securely collect an API token / secret from the user and write it straight to config — you NEVER see the value and it is never saved to chat history. The panel shows a masked input; the pasted value goes directly to the orchestrator, which stores it on the target MCP server, then applies it. Returns only a redacted confirmation.\n\nTWO targets:\n• The BUILT-IN comfyui server (mcp_server 'comfyui', target_kind 'env') — for tokens YOUR OWN comfyui tools need. The env key MUST be one of a fixed allowlist: CIVITAI_API_TOKEN (download_civitai_model), HUGGINGFACE_TOKEN or HF_TOKEN (HuggingFace downloads). Any other key is rejected. The secret is injected into the comfyui server's env and the server is RESPAWNED automatically — NO panel_reload needed; after this turn ends the tools restart with it and you'll be nudged to retry. THIS is what fixes a download that returned HTTP 401.\n• A user-added MCP server (e.g. the 'civitai' http server you added with panel_add_mcp) — use target_kind 'header' (e.g. Authorization, value_prefix 'Bearer ') for http/sse, or 'env' for stdio; then call panel_reload to load it.\n\nFor a CivitAI DOWNLOAD 401, target 'comfyui' env CIVITAI_API_TOKEN — NOT the 'civitai' MCP server (that's only the search MCP).",
+      "Securely collect an API token / secret from the user and write it straight to config — you NEVER see the value and it is never saved to chat history. The panel shows a masked input; the pasted value goes directly to the orchestrator, which stores it on the target MCP server, then applies it. Returns only a redacted confirmation.\n\nTWO targets:\n• The BUILT-IN comfyui server (mcp_server 'comfyui', target_kind 'env') — for tokens YOUR OWN comfyui tools need. The env key MUST be one of a fixed allowlist: CIVITAI_API_TOKEN (download_civitai_model), HUGGINGFACE_TOKEN or HF_TOKEN (HuggingFace downloads). Any other key is rejected. The secret is written to the canonical credential file, which the comfyui tools re-read each time they use a credential — so the running tools pick it up with NO panel_reload. The tool result states what was actually verified (that the file now carries the key) and what the live tool sessions did; if it reports the save could NOT be confirmed, treat it as unconfigured rather than retrying blindly. THIS is what fixes a download that returned HTTP 401.\n• A user-added MCP server (e.g. the 'civitai' http server you added with panel_add_mcp) — use target_kind 'header' (e.g. Authorization, value_prefix 'Bearer ') for http/sse, or 'env' for stdio; then call panel_reload to load it.\n\nFor a CivitAI DOWNLOAD 401, target 'comfyui' env CIVITAI_API_TOKEN — NOT the 'civitai' MCP server (that's only the search MCP).",
       {
         label: z.string().describe("Prompt shown above the masked input, e.g. 'Paste your CivitAI API token'."),
         target_kind: z.enum(["header", "env"]).describe("'header' for http/sse servers (e.g. Authorization); 'env' for stdio servers and the built-in comfyui server."),
@@ -6652,9 +6720,16 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // orchestrator's OWN env, which flips the OpenRouter provider to ready
           // and lists its models. NOT injected into the comfyui child.
           if (server.toLowerCase() === "orchestrator" || isAllowedAgentSecretKey(args.key as string)) {
-            setAgentSecret(args.key as string, secret);
+            const receipt = setAgentSecret(args.key as string, secret);
+            if (receipt.persisted === "no") return fail(secretNotPersisted(receipt));
+            // Provider keys are read IN this process, so the save takes effect
+            // immediately — but say which provider the KEY enables rather than
+            // naming OpenRouter for every key (GLM/Kimi/Moonshot/Custom all land
+            // here too, and being told the wrong provider was enabled is the same
+            // misdirection as being told a respawn happened).
             return ok(
-              `🔒 ${args.key} saved to your ~/.comfyui-mcp config. The OpenRouter provider is now enabled — pick it in the provider list.`,
+              `🔒 ${receipt.key} saved to ${receipt.path}${receipt.persisted === "unknown" ? " (the file could not be re-read to confirm — check it if the provider still reads as unconfigured)" : " (confirmed by reading the file back; the value is never shown or logged)"}. ` +
+                `The orchestrator reads provider keys in-process, so the provider this key belongs to is enabled now — pick it in the provider list.`,
             );
           }
           // The BUILT-IN comfyui server is NOT in the user's ~/.claude.json — the
@@ -6667,20 +6742,27 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                 "The built-in comfyui server takes secrets as env vars — use target_kind 'env' (e.g. key 'CIVITAI_API_TOKEN').",
               );
             }
-            setComfyuiSecret(args.key as string, `${(args.value_prefix as string) ?? ""}${secret}`, {
-              // This save ANSWERS an outstanding agent secret request — mark it so
-              // the orchestrator injects the "retry the action" nudge, and carry
-              // the requesting tab so ONLY that tab's agent is nudged (never a
-              // broadcast to unrelated tabs). A Settings-panel slot save omits
-              // both and never nudges (#164).
-              requested: true,
-              tabId: ctx.tabId,
-            });
-            // Redacted ack ONLY — the secret never enters the agent's context. The
-            // respawn is deferred to this turn's end, so this is accurate.
-            return ok(
-              `🔒 Token saved for the built-in comfyui tools (env "${args.key}"). It's being applied now — the comfyui tools respawn with it as soon as this turn ends, then I'll retry. No reload needed.`,
+            const receipt = setComfyuiSecret(
+              args.key as string,
+              `${(args.value_prefix as string) ?? ""}${secret}`,
+              {
+                // This save ANSWERS an outstanding agent secret request — mark it so
+                // the orchestrator injects the "retry the action" nudge, and carry
+                // the requesting tab so ONLY that tab's agent is nudged (never a
+                // broadcast to unrelated tabs). A Settings-panel slot save omits
+                // both and never nudges (#164).
+                requested: true,
+                tabId: ctx.tabId,
+              },
             );
+            // The save either took effect or it did not — REFUSE when a read-back
+            // proves it did not, rather than returning a success the tools cannot
+            // act on (#826: a token that reports configured but is invisible is
+            // worse than an honest failure, because every later 401 then
+            // misdirects the caller).
+            if (receipt.persisted === "no") return fail(secretNotPersisted(receipt));
+            // Redacted ack ONLY — the secret never enters the agent's context.
+            return ok(describeComfyuiSecretSave(receipt));
           }
           setUserMcpServerSecret(
             {

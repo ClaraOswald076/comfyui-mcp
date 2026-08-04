@@ -54,6 +54,7 @@ import {
   fetchSupportedCommands,
   isEffort,
   type Effort,
+  type McpEnvRestartOutcome,
   type ModelInfo,
   type SlashCommand,
   type UsageStatus,
@@ -2689,15 +2690,25 @@ export async function runPanelOrchestrator(): Promise<void> {
     // the action" nudge is not, so it must never broadcast to unrelated tabs.
     // restartAllForMcpEnv() is nudge-preserving, so this can't erase a per-request
     // nudge already queued on another tab (#164).
-    manager.restartAllForMcpEnv();
+    const tally = manager.restartAllForMcpEnv();
     // NUDGE only the tab whose panel_request_secret this change answers — a
     // Settings slot save, a background token (re)load, or a revoke leaves
     // `requested` false and nudges nothing. The per-tab pending-restart map
     // coalesces, so a repeat event for the same tab can't double-inject (#164).
     const nudgedTab = change.requested && change.tabId ? change.tabId : null;
-    if (nudgedTab) manager.restartForMcpEnv(agentKeyFor(nudgedTab), SECRET_RETRY_NUDGE);
+    let nudgeOutcome: McpEnvRestartOutcome | null = null;
+    if (nudgedTab) nudgeOutcome = manager.restartForMcpEnv(agentKeyFor(nudgedTab), SECRET_RETRY_NUDGE);
+    // Tell the SAVER what actually happened (#826). The emit is synchronous, so
+    // this lands before setEnvSecret returns and the tool can describe the real
+    // disposition instead of promising a respawn nobody observed. A tab with no
+    // live agent contributes nothing — restartForMcpEnv already returned
+    // "no-agent" for it and the tally counts only agents that exist.
+    change.report?.(tally);
     logger.info(
-      `[panel-orchestrator] tool secret ${change.requested ? "saved (requested)" : "changed"} → comfyui MCP env updated + agents respawn on idle${nudgedTab ? ` + retry nudge → tab ${nudgedTab.slice(0, 8)}` : ""} (keys: ${comfyuiSecretKeys().join(", ") || "none"})`,
+      `[panel-orchestrator] tool secret ${change.requested ? "saved (requested)" : "changed"} → comfyui MCP env updated; ` +
+        `agent respawn: ${tally.applied} applied now, ${tally.scheduled} scheduled at idle, of ${tally.live} live` +
+        `${nudgedTab ? ` + retry nudge → tab ${nudgedTab.slice(0, 8)} (${nudgeOutcome})` : ""} ` +
+        `(keys: ${comfyuiSecretKeys().join(", ") || "none"})`,
     );
   });
 

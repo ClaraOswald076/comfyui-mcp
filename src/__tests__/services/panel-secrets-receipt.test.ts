@@ -1,0 +1,225 @@
+// #826 — panel_request_secret reported success while the credential never
+// reached anything that could use it. The defect is not the failed injection; it
+// is the FABRICATED success: the tool asserted "the comfyui tools respawn with it
+// as soon as this turn ends" without observing a respawn, and asserted the save
+// itself from the mere absence of a throw.
+//
+// These tests pin the receipt that replaced the assertion. Every field must be a
+// thing that was checked: whether a read-back of the canonical file shows the
+// key, whether any subscriber actually reported a respawn, and whether the value
+// is picked up without one. A subscriber that says nothing must produce `null`
+// (unknown), never a zero that reads as "checked, nothing needed".
+//
+// Nothing here logs a secret value; the receipt itself never carries one.
+
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+// The read-back is what makes "saved" an observation instead of an assumption,
+// so the tests must be able to make the store DISAGREE with the write (a
+// concurrent writer, a read-only overlay, a filesystem that discarded it) and to
+// make it UNREADABLE. Both are properties of parseEnvFile, mocked here with a
+// pass-through default so every other test still exercises the real store.
+const store = vi.hoisted(() => ({ mode: "real" as "real" | "drop" | "tamper" | "unreadable" }));
+vi.mock("../../env-file.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../env-file.js")>();
+  return {
+    ...actual,
+    parseEnvFile: () => {
+      if (store.mode === "unreadable") return null;
+      const real = actual.parseEnvFile();
+      if (!real || store.mode === "real") return real;
+      const copy = { ...real };
+      if (store.mode === "drop") delete copy.CIVITAI_API_TOKEN;
+      else copy.CIVITAI_API_TOKEN = "somebody-elses-value";
+      return copy;
+    },
+  };
+});
+
+import {
+  buildComfyuiMcpEnv,
+  hasLivePickup,
+  onComfyuiSecretsChanged,
+  setAgentSecret,
+  setComfyuiSecret,
+  COMFYUI_SECRET_ENV_ALLOWLIST,
+  AGENT_SECRET_ENV_ALLOWLIST,
+  type SecretRespawnReport,
+} from "../../services/panel-secrets.js";
+
+const ALL_KEYS = [...new Set([...COMFYUI_SECRET_ENV_ALLOWLIST, ...AGENT_SECRET_ENV_ALLOWLIST])];
+
+let dir: string;
+let envPath: string;
+let saved: Record<string, string | undefined>;
+
+beforeEach(() => {
+  store.mode = "real";
+  dir = mkdtempSync(join(tmpdir(), "cmcp-receipt-"));
+  envPath = join(dir, ".env");
+  process.env.COMFYUI_MCP_ENV_FILE = envPath;
+  saved = {};
+  for (const k of ALL_KEYS) {
+    saved[k] = process.env[k];
+    delete process.env[k];
+  }
+});
+
+afterEach(() => {
+  store.mode = "real";
+  delete process.env.COMFYUI_MCP_ENV_FILE;
+  for (const k of ALL_KEYS) {
+    if (saved[k] === undefined) delete process.env[k];
+    else process.env[k] = saved[k];
+  }
+  rmSync(dir, { recursive: true, force: true });
+});
+
+describe("secret save receipt: persistence is VERIFIED, not assumed (#826)", () => {
+  it("reports persisted:'yes' only after a read-back of the canonical file agrees", () => {
+    const receipt = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-abc", { requested: true });
+    expect(receipt.persisted).toBe("yes");
+    expect(receipt.key).toBe("CIVITAI_API_TOKEN");
+    expect(receipt.path).toBe(envPath);
+  });
+
+  it("reports persisted:'no' when the store does NOT come back carrying the key", () => {
+    // The write call returned normally — the OLD code called that success. The
+    // read-back proves the store does not have it, so the save did not take
+    // effect and the caller must refuse rather than send the user back into the
+    // same 401 believing it is fixed.
+    store.mode = "drop";
+    expect(setComfyuiSecret("CIVITAI_API_TOKEN", "civ-abc").persisted).toBe("no");
+  });
+
+  it("reports persisted:'no' when the store carries the key with a DIFFERENT value", () => {
+    // Same-key/other-value is the dangerous near-miss: a presence-only check would
+    // read as success while the tools go on using somebody else's credential.
+    store.mode = "tamper";
+    expect(setComfyuiSecret("CIVITAI_API_TOKEN", "civ-second").persisted).toBe("no");
+  });
+
+  it("reports persisted:'unknown' when the store cannot be re-read at all", () => {
+    // "Could not determine" must stay undetermined — it may never harden into
+    // either verdict, in either direction.
+    store.mode = "unreadable";
+    expect(setComfyuiSecret("CIVITAI_API_TOKEN", "civ-abc").persisted).toBe("unknown");
+  });
+});
+
+describe("secret save receipt: respawn is REPORTED, never assumed (#826)", () => {
+  it("reports respawn:null when NO subscriber answered — silence is not success", () => {
+    const receipt = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-abc", { requested: true });
+    expect(receipt.respawn).toBeNull();
+  });
+
+  it("carries exactly what the subscriber reported (applied vs scheduled vs live)", () => {
+    const off = onComfyuiSecretsChanged((change) => {
+      change.report?.({ live: 3, applied: 1, scheduled: 2 });
+    });
+    try {
+      const receipt = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-abc", { requested: true });
+      expect(receipt.respawn).toEqual<SecretRespawnReport>({ live: 3, applied: 1, scheduled: 2 });
+    } finally {
+      off();
+    }
+  });
+
+  it("sums multiple subscribers rather than letting the last one overwrite", () => {
+    const offA = onComfyuiSecretsChanged((c) => c.report?.({ live: 1, applied: 1, scheduled: 0 }));
+    const offB = onComfyuiSecretsChanged((c) => c.report?.({ live: 2, applied: 0, scheduled: 2 }));
+    try {
+      const receipt = setComfyuiSecret("HF_TOKEN", "hf-abc", { requested: true });
+      expect(receipt.respawn).toEqual({ live: 3, applied: 1, scheduled: 2 });
+    } finally {
+      offA();
+      offB();
+    }
+  });
+
+  it("stays null when a subscriber exists but reports NOTHING — an unanswered listener proves nothing", () => {
+    const off = onComfyuiSecretsChanged(() => {
+      /* subscribes, does no respawn work, reports nothing */
+    });
+    try {
+      expect(setComfyuiSecret("CIVITAI_API_TOKEN", "civ-abc").respawn).toBeNull();
+    } finally {
+      off();
+    }
+  });
+
+  it("collects the report SYNCHRONOUSLY, so the saver can answer with it", () => {
+    // The whole design depends on emit() being synchronous. If a subscriber's
+    // report landed after setComfyuiSecret returned, the receipt would always say
+    // "no subscriber" and the tool would be back to guessing.
+    let reportedDuringCall = false;
+    const off = onComfyuiSecretsChanged((c) => {
+      reportedDuringCall = true;
+      c.report?.({ live: 1, applied: 0, scheduled: 1 });
+    });
+    try {
+      const receipt = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-abc");
+      expect(reportedDuringCall).toBe(true);
+      expect(receipt.respawn).not.toBeNull();
+    } finally {
+      off();
+    }
+  });
+
+  it("does not fire the comfyui change (nor collect a report) for an AGENT-only key", () => {
+    const cb = vi.fn();
+    const off = onComfyuiSecretsChanged(cb);
+    try {
+      setAgentSecret("OPENROUTER_API_KEY", "or-abc");
+      expect(cb).not.toHaveBeenCalled();
+    } finally {
+      off();
+    }
+  });
+});
+
+describe("secret save receipt: livePickup describes the ACTUAL read path", () => {
+  it("marks the child-side credentials as live (their readers re-read the file)", () => {
+    for (const k of [
+      "CIVITAI_API_TOKEN",
+      "HF_TOKEN",
+      "HUGGINGFACE_TOKEN",
+      "RUNPOD_API_KEY",
+      "REGISTRY_ACCESS_TOKEN",
+    ]) {
+      expect(hasLivePickup(k)).toBe(true);
+    }
+    expect(setComfyuiSecret("CIVITAI_API_TOKEN", "civ-abc").livePickup).toBe(true);
+  });
+
+  it("marks orchestrator-read provider keys as live (setEnvSecret assigns process.env in-process)", () => {
+    expect(hasLivePickup("OPENROUTER_API_KEY")).toBe(true);
+    expect(hasLivePickup("GEMINI_API_KEY")).toBe(true);
+  });
+
+  it("does NOT claim live pickup for a key nothing is known to re-read", () => {
+    expect(hasLivePickup("SOME_UNRELATED_KEY")).toBe(false);
+  });
+});
+
+describe("buildComfyuiMcpEnv pins the credential file into the child (#826)", () => {
+  it("forwards COMFYUI_MCP_ENV_FILE so writer and reader cannot be different files", () => {
+    const env = buildComfyuiMcpEnv({ COMFYUI_URL: "http://x" });
+    expect(env.COMFYUI_MCP_ENV_FILE).toBe(envPath);
+  });
+
+  it("omits it entirely when unset, leaving the child on the default path", () => {
+    delete process.env.COMFYUI_MCP_ENV_FILE;
+    const env = buildComfyuiMcpEnv({ COMFYUI_URL: "http://x" });
+    expect("COMFYUI_MCP_ENV_FILE" in env).toBe(false);
+  });
+
+  it("still lets a saved secret win over the base env on a key clash", () => {
+    setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new");
+    const env = buildComfyuiMcpEnv({ CIVITAI_API_TOKEN: "civ-base", COMFYUI_URL: "http://x" });
+    expect(env.CIVITAI_API_TOKEN).toBe("civ-new");
+  });
+});

@@ -8,6 +8,7 @@ import {
 } from "node:fs";
 import { platform } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { freshSecretValue } from "../env-file.js";
 import { resolveEffectiveComfyUIBase } from "./workspace-env.js";
 import { ComfyUIError, ValidationError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
@@ -647,7 +648,10 @@ export function publishCustomNode(
   // Require the registry token. comfy-cli reads --token; we pass it via env so
   // it never lands in argv (which we log) — comfy-cli falls back to the
   // REGISTRY_ACCESS_TOKEN env var when --token is absent.
-  const token = process.env.REGISTRY_ACCESS_TOKEN;
+  // Access-time resolution against the canonical ~/.comfyui-mcp/.env (#826) so a
+  // token the panel saved after this process started is actually seen, instead of
+  // reporting "not set" forever against a token that is on disk.
+  const token = freshSecretValue("REGISTRY_ACCESS_TOKEN");
   if (!token || !token.trim()) {
     throw new ValidationError(
       "REGISTRY_ACCESS_TOKEN is not set. Create an API key at " +

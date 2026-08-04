@@ -13,6 +13,7 @@
 
 import { createHash } from "node:crypto";
 import { z } from "zod";
+import { freshSecretValue } from "../env-file.js";
 
 const RUNPOD_GRAPHQL_ENDPOINT = "https://api.runpod.io/graphql";
 
@@ -61,7 +62,11 @@ export class RunpodAuthError extends Error {
 }
 
 function getApiKey(): string {
-  const key = process.env.RUNPOD_API_KEY?.trim();
+  // Resolved at ACCESS time from the canonical ~/.comfyui-mcp/.env (#826): a key
+  // the panel saved AFTER this process started is otherwise invisible for the
+  // whole life of the process, so every RunPod call keeps reporting "not set"
+  // while a valid key sits on disk.
+  const key = freshSecretValue("RUNPOD_API_KEY")?.trim();
   if (!key) throw new RunpodAuthError();
   return key;
 }
