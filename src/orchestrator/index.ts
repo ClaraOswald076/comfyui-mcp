@@ -3323,6 +3323,14 @@ export async function runPanelOrchestrator(): Promise<void> {
           // kept: a completion that already arrived is still real news and is
           // still delivered — just no longer as this conversation's own.
           RunCompletions.closeRuns(panelTab);
+          // #486 — and the QUESTIONS it asked, for the same reason but with a
+          // sharper failure: a card the replaced workflow's agent put up can
+          // still be clicked, and without this its answer stays `matched` and
+          // gets announced to whoever holds the tab now as "a question card YOU
+          // put up" — or recovered as the answer to a byte-identical question the
+          // new workflow asks. Retiring the epoch keeps the answer (it is still
+          // reported) while revoking its right to answer for anyone else.
+          AskAnswers.closeAsks(panelTab);
         }
       }
 

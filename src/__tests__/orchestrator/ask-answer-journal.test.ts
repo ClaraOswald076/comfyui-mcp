@@ -762,11 +762,29 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
       new URL("../../orchestrator/index.ts", import.meta.url),
       "utf8",
     );
-    for (const kind of ["new_session", "resume_session", "rewind"]) {
-      const start = src.indexOf(`event.type === "${kind}"`);
-      expect(start, `${kind} handler not found`).toBeGreaterThan(-1);
-      const block = src.slice(start, src.indexOf("\n      return;", start));
-      expect(block, `${kind} must retire ask state`).toContain("AskAnswers.closeAsks(");
+    // A rewind is a boundary with no run-journal counterpart, so it is named.
+    const start = src.indexOf('event.type === "rewind"');
+    expect(start, "rewind handler not found").toBeGreaterThan(-1);
+    const block = src.slice(start, src.indexOf("\n      return;", start));
+    expect(block, "rewind must retire ask state").toContain("AskAnswers.closeAsks(");
+
+    // …and every OTHER boundary is defined by where the run journal draws one.
+    // Pairing the two journals structurally is what stops the next boundary from
+    // being added to one and forgotten in the other — which is exactly how a late
+    // answer reached a conversation that never asked the question, twice.
+    const pairs: Array<[RegExp, string]> = [
+      [/RunCompletions\.closeRuns\((\w+)\)/g, "AskAnswers.closeAsks($1)"],
+      [/RunCompletions\.forget\((\w+)\)/g, "AskAnswers.forget($1)"],
+    ];
+    for (const [re, template] of pairs) {
+      const found = [...src.matchAll(re)];
+      expect(found.length, `no ${re.source} call sites found`).toBeGreaterThan(0);
+      for (const m of found) {
+        const arg = m[1];
+        const want = template.replace("$1", arg);
+        const near = src.slice(m.index!, m.index! + 900);
+        expect(near, `${m[0]} is not paired with ${want}`).toContain(want);
+      }
     }
   });
 
