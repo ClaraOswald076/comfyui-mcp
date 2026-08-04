@@ -11,7 +11,16 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { extname, join, resolve, sep } from "node:path";
 import { allBackendReadiness } from "./backend-readiness.js";
 import { getLoraCatalog, loraPreviewsDir } from "../services/lora-catalog.js";
-import { setPanelSecret, clearPanelSecret, listPanelSecretsMasked, CREDENTIAL_SLOTS } from "../services/panel-secrets.js";
+import {
+  setPanelSecret,
+  clearPanelSecret,
+  listPanelSecretsMasked,
+  slotSaveConfirmed,
+  slotShellProvidedKeys,
+  slotStillResolves,
+  unconfirmedSlotKeys,
+  CREDENTIAL_SLOTS,
+} from "../services/panel-secrets.js";
 import { OPENAI_KEY_PROVIDER_IDS } from "../services/openai-provider-registry.js";
 import { logger } from "../utils/logger.js";
 
@@ -405,12 +414,64 @@ export function startPanelConsoleHttpServer(opts: {
         }
         try {
           if (clear) {
-            // Revoke path (issue #203): remove every alias key of the slot.
+            // Revoke path (issue #203): remove every alias key of the slot, then
+            // VERIFY the slot no longer resolves. Reporting `cleared:true` from
+            // "a line was removed" alone would call the credential revoked while
+            // another form of the assignment still supplies it (codex gate,
+            // round 3, finding 2).
+            // Captured BEFORE the clear: keys a real environment variable
+            // supplies come back on the next start, so the revoke is only
+            // effective for this process and must not be reported as complete.
+            const shellKeys = slotShellProvidedKeys(slot);
             const removed = clearPanelSecret(slot);
-            sendJson(res, 200, { ok: true, slot, cleared: removed });
+            if (slotStillResolves(slot)) {
+              sendJson(res, 500, {
+                ok: false,
+                slot,
+                cleared: false,
+                error:
+                  `Removed an entry for "${slot}", but the credential still resolves — something else is still providing it. It is NOT revoked.`,
+              });
+              return;
+            }
+            sendJson(res, 200, {
+              ok: true,
+              slot,
+              cleared: removed,
+              ...(shellKeys.length
+                ? {
+                    warning:
+                      `Cleared for this session only: ${shellKeys.join(", ")} ${shellKeys.length > 1 ? "are" : "is"} set as a real environment variable ` +
+                      `outside this app, so the value returns when it restarts. Unset it there to revoke it permanently.`,
+                  }
+                : {}),
+            });
             return;
           }
-          setPanelSecret(slot, value);
+          // Report what the read-back PROVED, not that the call returned. The
+          // same failure panel_request_secret refuses was answered ok:true here.
+          const receipts = setPanelSecret(slot, value);
+          if (!slotSaveConfirmed(receipts)) {
+            const unconfirmed = unconfirmedSlotKeys(receipts);
+            const failed = unconfirmed.filter((u) => u.persisted === "no");
+            sendJson(res, failed.length ? 500 : 200, {
+              ok: failed.length === 0,
+              slot,
+              // Key NAMES and verdicts only — never a value.
+              unconfirmed,
+              ...(failed.length
+                ? {
+                    error:
+                      `"${slot}" was NOT saved: the credential store does not come back carrying ${failed.map((f) => f.key).join(", ")}. ` +
+                      `The change was rolled back, so nothing was half-applied.`,
+                  }
+                : {
+                    warning:
+                      `"${slot}" was written but the store could not be re-read to confirm it (${unconfirmed.map((u) => u.key).join(", ")}). Treat it as unverified.`,
+                  }),
+            });
+            return;
+          }
           const masked = listPanelSecretsMasked().find((s) => s.id === slot)?.masked ?? null;
           sendJson(res, 200, { ok: true, slot, masked });
         } catch (err) {

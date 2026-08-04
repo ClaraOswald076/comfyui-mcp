@@ -310,17 +310,25 @@ function envValueCandidates(value: string): string[] {
  * without ever including the value in the error.
  */
 function encodeEnvLine(key: string, value: string): string {
-  if (/[\n\r]/.test(value)) {
-    // A multi-line value CAN be quoted such that dotenv reverses it, but this
-    // store's upsert/remove are LINE-based: the next save of any other key would
-    // match only the value's first physical line and leave its continuation
-    // behind as garbage. Refusing is the honest option — no credential this tool
-    // accepts contains a line break, and a store that silently corrupts on the
-    // next unrelated write is worse than one that says no.
+  // Refuse CONTROL characters outright, before any encoding is considered.
+  //   - a line break: this store's upsert/remove are LINE-based, so the next
+  //     save of any OTHER key would match only the value's first physical line
+  //     and leave its continuation behind as garbage;
+  //   - a NUL: dotenv will round-trip it happily, so the read-back would CONFIRM
+  //     the save — but process.env truncates at NUL, so the value the readers and
+  //     the spawned child actually get is a different, shorter string (codex
+  //     gate, round 3, finding 4). A confirmed save that delivers something else
+  //     is the worst outcome of all;
+  //   - any other C0 control: same class of hazard, no credential contains one.
+  // eslint-disable-next-line no-control-regex
+  // Written with \u escapes on purpose: a literal control byte in this
+  // source would make the file read as a binary blob to git, unreviewable
+  // in a diff.
+  if (/[\u0000-\u001f\u007f]/.test(value)) {
     throw new Error(
-      `The value supplied for "${key}" cannot be stored faithfully in ${envFilePath()} — it contains a line break, ` +
-        `which this line-based store cannot hold without corrupting on a later write. Nothing was written. ` +
-        `Set ${key} as a real environment variable instead (it takes precedence over the file), or re-issue it without line breaks.`,
+      `The value supplied for "${key}" cannot be stored faithfully in ${envFilePath()} — it contains a control character ` +
+        `(a line break, a NUL, or similar), which neither this line-based store nor a process environment can carry unchanged. Nothing was written. ` +
+        `Set ${key} as a real environment variable instead (it takes precedence over the file), or re-issue it without control characters.`,
     );
   }
   for (const candidate of envValueCandidates(value)) {
@@ -339,6 +347,18 @@ function encodeEnvLine(key: string, value: string): string {
   );
 }
 
+/**
+ * Every line dotenv would read as an assignment to `key` — including the
+ * `export KEY=…` form it accepts. Matching only `KEY=` left an `export` line
+ * behind: an upsert would append a second assignment and a revoke would remove
+ * the wrong one, leaving the OLD credential effective while the tool reported
+ * the key cleared (codex gate, round 3, finding 2). Upsert and revoke share this
+ * so they can never disagree about what "a line for this key" means.
+ */
+function envKeyLinePattern(key: string): RegExp {
+  return new RegExp(`^\\s*(?:export\\s+)?${key}\\s*=`);
+}
+
 /** Upsert `KEY=value` into the canonical .env, 0600, preserving every other line
  *  (comments included). Replaces the FIRST uncommented `KEY=` line and DROPS any
  *  later duplicates, else appends. Dropping the duplicates matters: dotenv lets a
@@ -354,7 +374,7 @@ function upsertEnvFile(key: string, value: string): void {
   mkdirSync(dirname(p), { recursive: true });
   const raw = existsSync(p) ? readFileSync(p, "utf-8") : "";
   const original = raw.length ? raw.split(/\r?\n/) : [];
-  const re = new RegExp(`^\\s*${key}\\s*=`);
+  const re = envKeyLinePattern(key);
   const lines: string[] = [];
   let replaced = false;
   for (const existing of original) {
@@ -381,13 +401,15 @@ function upsertEnvFile(key: string, value: string): void {
   }
 }
 
-/** Remove every uncommented `KEY=` line from the canonical .env. Returns whether
- *  anything was removed. */
+/** Remove EVERY uncommented assignment to `key` from the canonical .env
+ *  (including the `export KEY=` form dotenv honors). Returns whether anything
+ *  was removed. A revoke that leaves one form behind reports the credential
+ *  cleared while it is still in effect. */
 function removeEnvFileKey(key: string): boolean {
   const p = envFilePath();
   if (!existsSync(p)) return false;
   const lines = readFileSync(p, "utf-8").split(/\r?\n/);
-  const re = new RegExp(`^\\s*${key}\\s*=`);
+  const re = envKeyLinePattern(key);
   const kept = lines.filter((l) => !re.test(l));
   if (kept.length === lines.length) return false;
   writeFileSync(p, kept.join("\n"), { mode: 0o600 });
@@ -558,6 +580,12 @@ export function migrateSecretsToEnv(): string[] {
       if (process.env[k]) continue; // .env / real env already wins
       upsertEnvFile(k, v);
       process.env[k] = v;
+      // The canonical file is this value's AUTHORITY now — it lives there. Without
+      // the mark it would read as SHELL-provided, so buildComfyuiMcpEnv would
+      // inject it to the child unmarked and the child would pin it: a later
+      // rotate or revoke invisible to that child while the save reports live
+      // pickup (codex gate, round 3, finding 1).
+      markFileDerived(k);
       migrated.push(k);
     }
   }
@@ -838,12 +866,37 @@ export function maskSecret(v: string): string {
   return `${v.slice(0, 4)}…${v.slice(-3)}`;
 }
 
-/** Set every env key of a slot (alias fan-out) into its store. Throws on unknown slot. */
-export function setPanelSecret(slotId: string, value: string): void {
+/**
+ * Set every env key of a slot (alias fan-out) into its store, and return the
+ * RECEIPT for each. Throws on unknown slot.
+ *
+ * The receipts are the point: this is the Settings-panel path, and it used to
+ * discard them, so the exact read-back-proven failure `panel_request_secret`
+ * refuses was still answered `{ok:true}` here (codex gate, round 3, finding 3).
+ * The caller must inspect `persisted` before telling the user it saved.
+ */
+export function setPanelSecret(slotId: string, value: string): SecretSaveReceipt[] {
   const slot = SLOT_BY_ID.get(slotId);
   if (!slot) throw new Error(`unknown credential slot "${slotId}"`);
   const set = slot.store === "agent" ? setAgentSecret : setComfyuiSecret;
-  for (const key of slot.envKeys) set(key, value);
+  return slot.envKeys.map((key) => set(key, value));
+}
+
+/** True when EVERY key of a slot save is proven to have landed. A single alias
+ *  that did not persist means the slot is not reliably configured — the reader
+ *  that happens to consult that alias would find nothing. */
+export function slotSaveConfirmed(receipts: SecretSaveReceipt[]): boolean {
+  return receipts.length > 0 && receipts.every((r) => r.persisted === "yes");
+}
+
+/** The keys of a slot save whose persistence could NOT be confirmed, with their
+ *  verdict — for an honest answer that names what is uncertain. No values. */
+export function unconfirmedSlotKeys(
+  receipts: SecretSaveReceipt[],
+): { key: string; persisted: SecretSaveReceipt["persisted"] }[] {
+  return receipts
+    .filter((r) => r.persisted !== "yes")
+    .map((r) => ({ key: r.key, persisted: r.persisted }));
 }
 
 /** Clear a slot: remove EVERY env key (alias fan-out, mirroring setPanelSecret)
@@ -857,6 +910,25 @@ export function clearPanelSecret(slotId: string): boolean {
   let removed = false;
   for (const key of slot.envKeys) removed = remove(key) || removed;
   return removed;
+}
+
+/** Whether a slot still resolves to a credential — read AFTER a revoke to prove
+ *  the clear actually took effect rather than reporting the removal of one line
+ *  while another form of the assignment still supplies the value. */
+export function slotStillResolves(slotId: string): boolean {
+  const slot = SLOT_BY_ID.get(slotId);
+  if (!slot) throw new Error(`unknown credential slot "${slotId}"`);
+  return slot.envKeys.some((k) => freshSecretValue(k) !== undefined);
+}
+
+/** The slot's keys currently supplied by a REAL environment variable. Read
+ *  BEFORE a revoke: this store can delete them from THIS process, but not from
+ *  the environment the process was started with, so they come back on the next
+ *  start. Calling that a completed revoke would be a state we did not reach. */
+export function slotShellProvidedKeys(slotId: string): string[] {
+  const slot = SLOT_BY_ID.get(slotId);
+  if (!slot) throw new Error(`unknown credential slot "${slotId}"`);
+  return slot.envKeys.filter((k) => isShellProvided(k));
 }
 
 /** Masked per-slot state: set = the slot's PRIMARY (first) env key has a stored value. */

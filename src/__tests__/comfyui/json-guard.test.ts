@@ -14,6 +14,15 @@
 // instead of being handed on as data.
 
 import { describe, expect, it, vi } from "vitest";
+
+// The body prefix is diagnostic, but a gateway that REFLECTS the request could
+// put our own ComfyUI credential in it — and the prefix goes into an error the
+// agent sees. Mock the auth headers so the redaction can be exercised.
+const authHeaders = vi.hoisted(() => ({ value: {} as Record<string, string> }));
+vi.mock("../../config.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../config.js")>();
+  return { ...actual, getComfyUIAuthHeaders: () => authHeaders.value };
+});
 import {
   classifyNonJson,
   isNonJsonResponseError,
@@ -182,6 +191,52 @@ describe("classifyNonJson names what answered instead of ComfyUI (#828)", () => 
     expect(d.message).toContain("/system_stats");
     expect(d.message).toContain("devices");
     expect(d.message).toContain("is not proof");
+  });
+});
+
+describe("the diagnostic body prefix never carries our own credential back", () => {
+  it("redacts a configured auth token a reflecting gateway echoed into its page", () => {
+    authHeaders.value = { Authorization: "Bearer super-secret-token-xyz" };
+    try {
+      const d = classifyNonJson({
+        url: URL_UNDER_TEST,
+        status: 401,
+        contentType: "text/html",
+        body: "<html><body>Invalid credential: Bearer super-secret-token-xyz</body></html>",
+      });
+      expect(d.bodyPrefix).not.toContain("super-secret-token-xyz");
+      expect(d.message).not.toContain("super-secret-token-xyz");
+      expect(d.bodyPrefix).toContain("«redacted»");
+    } finally {
+      authHeaders.value = {};
+    }
+  });
+
+  it("redacts the bare token even when the page echoes it without the scheme", () => {
+    authHeaders.value = { Authorization: "Bearer super-secret-token-xyz" };
+    try {
+      const d = classifyNonJson({
+        url: URL_UNDER_TEST,
+        status: 403,
+        contentType: "text/html",
+        body: "<html>token super-secret-token-xyz rejected</html>",
+      });
+      expect(d.bodyPrefix).not.toContain("super-secret-token-xyz");
+    } finally {
+      authHeaders.value = {};
+    }
+  });
+
+  it("leaves an ordinary body untouched when no credential is configured", () => {
+    authHeaders.value = {};
+    const d = classifyNonJson({
+      url: URL_UNDER_TEST,
+      status: 200,
+      contentType: "text/html",
+      body: "<html>plain page</html>",
+    });
+    expect(d.bodyPrefix).toBe("<html>plain page</html>");
+    expect(d.bodyPrefix).not.toContain("«redacted»");
   });
 });
 
