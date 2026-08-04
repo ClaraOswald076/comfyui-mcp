@@ -3003,7 +3003,9 @@ type PanelShapeVerdict =
   | "usable"
   /** Positively established: identity or bundle is wrong/absent/empty. */
   | "not-a-panel"
-  /** An input could not be READ at all, so nothing was established either way. */
+  /** An input could not even be CHECKED FOR — the stat failed, nothing was opened. */
+  | "probe-failed"
+  /** An input is there and OPENING it failed. See PanelIdentityVerdict. */
   | "unreadable"
   /** The pyproject WAS read; its contents would not parse. See PanelIdentityVerdict. */
   | "malformed";
@@ -3018,21 +3020,37 @@ type PanelShapeVerdict =
  * probe failed; it established nothing. So callers that SPEAK ask this, and
  * callers that ACT keep the boolean.
  *
- * AND "UNREADABLE" IS A CAUSE, NOT A BUCKET. Folding a parse failure into it
- * repeats this round's own defect inside the vocabulary introduced to fix it: a
- * present, readable, but MALFORMED pyproject.toml made the note say the file
- * "could not be read" and "the probe failed". It was read; it did not parse.
- * The two point the user at different remedies — a permissions problem versus a
- * damaged file — so they are different answers.
+ * AND "UNREADABLE" IS A CAUSE, NOT A BUCKET — THREE OF THEM, WITH THREE
+ * REMEDIES. This is the durable output of several rounds and the next change
+ * here will want to collapse it again, so: the identity test walks three steps,
+ * and each can fail in a way the others cannot.
+ *
+ *   probe-failed  The `statSync` behind `probeFile` did not complete, so we do
+ *                 not even know whether the file is THERE. NOTHING was opened.
+ *                 Points at the containing directory or the filesystem — a bad
+ *                 mount, a path that changed under us, a directory we cannot
+ *                 traverse. Saying "could not be read" here narrates an open
+ *                 that was never attempted.
+ *   unreadable    The file is THERE (the probe said so) and opening it failed.
+ *                 Points at that file — its permissions, or an I/O error.
+ *   malformed     It opened and read fine; the CONTENTS would not parse. Points
+ *                 at repairing or replacing the file. Not a permissions problem
+ *                 in any form.
+ *
+ * Every one of them is fail-closed for the DECISION — `dirIsPanelByIdentity`
+ * answers `false` for all three and that is untouched. They differ only in what
+ * the user is told to go and do, which is the entire reason they are separate.
  */
 type PanelIdentityVerdict =
   /** Positively established: the pyproject names the panel pack. */
   | "panel"
   /** Positively established: readable, and it is something else (or absent). */
   | "not-a-panel"
-  /** The pyproject could not be READ (probe failed, or the read threw). */
+  /** The probe did not complete — the file was never opened, or even located. */
+  | "probe-failed"
+  /** The file is there, and OPENING it failed. */
   | "unreadable"
-  /** The pyproject WAS read, and its contents would not parse. */
+  /** The file WAS read, and its contents would not parse. */
   | "malformed";
 
 function panelIdentityVerdict(
@@ -3040,17 +3058,19 @@ function panelIdentityVerdict(
   deps: PanelInstallerDeps,
 ): PanelIdentityVerdict {
   const pyproject = join(dir, "pyproject.toml");
+  // THREE STEPS, THREE ANSWERS. `probeFile` answers `undefined` for a stat that
+  // did not complete (EACCES on the parent, EIO, a vanished mount) — that is an
+  // UNPERFORMED read, not a failed one, and reporting it as "could not be read"
+  // states a mechanism nobody observed and sends the user to check the wrong
+  // thing. Only ENOENT/ENOTDIR are a determination, and they mean "not there".
   const pyprobe = deps.probeFile(pyproject);
-  if (pyprobe === undefined) return "unreadable";
+  if (pyprobe === undefined) return "probe-failed";
   if (pyprobe !== true) return "not-a-panel";
-  // TWO STEPS, TWO ANSWERS. One try/catch around both the read and the parse
-  // cannot tell them apart, and the sentence built from it then narrated a
-  // failure that did not happen.
   let raw: string;
   try {
     raw = deps.readFile(pyproject);
   } catch {
-    return "unreadable"; // present, but the read itself failed
+    return "unreadable"; // located, and the OPEN failed
   }
   let identity: string | undefined;
   try {
@@ -3098,7 +3118,14 @@ function describePanelShape(dir: string, verdict: PanelShapeVerdict): string {
     case "unreadable":
       return (
         `whether the directory at ${dir} holds a working panel could NOT be determined ` +
-        `— one of its files could not be read, so this is not a finding that it is broken`
+        `— one of its files is there but could not be opened, so this is not a finding ` +
+        `that it is broken`
+      );
+    case "probe-failed":
+      return (
+        `whether the directory at ${dir} holds a working panel could NOT be determined ` +
+        `— one of its files could not even be checked for, so nothing about its contents ` +
+        `was established`
       );
   }
 }
@@ -3114,12 +3141,19 @@ function panelShapeVerdict(dir: string, deps: PanelInstallerDeps): PanelShapeVer
   if (identity !== "panel") return identity;
 
   const bundle = join(dir, ...PANEL_WEB_MARKERS[0]);
+  // Same three causes on the bundle: a stat that did not complete is an
+  // UNPERFORMED read, not a failed one.
   const bundleProbe = deps.probeFile(bundle);
-  if (bundleProbe === undefined) return "unreadable";
+  if (bundleProbe === undefined) return "probe-failed";
   if (bundleProbe !== true) return "not-a-panel";
-  if (!deps.fileDigest) return "unreadable"; // no way to ask
+  // A dep set with no `fileDigest` is a dep-shape gap, not a filesystem event —
+  // production always wires it (defaultDeps, and panelStatusAt's spread of it),
+  // so this is the fail-closed answer for a caller that cannot ask, and
+  // "could not be opened" is literally what happened: there was no way to open
+  // it. Not a fourth cause; nothing on disk was observed to be wrong.
+  if (!deps.fileDigest) return "unreadable";
   const digest = deps.fileDigest(bundle);
-  if (!digest) return "unreadable"; // present but unreadable
+  if (!digest) return "unreadable"; // located, and the read of it failed
   return digest.size > 0 ? "usable" : "not-a-panel";
 }
 
@@ -3483,32 +3517,54 @@ function reconcilePanelSwap(
     // different moments), "that directory could not be read" is then a failure
     // that did not happen. The refusal stands either way — it is the sentence
     // that has to match what was seen.
+    // ONE CAUSE PER SENTENCE, AND ONE REMEDY PER CAUSE — see PanelIdentityVerdict
+    // for why `unreadable` is three answers rather than one. A stat that did not
+    // complete never opened the file, so telling that user their pyproject
+    // "could not be read" and to go and check permissions on it describes a
+    // mechanism nobody observed and points at the wrong thing to fix.
     const staleIdentity = panelIdentityVerdict(staleCanonical, deps);
+    const staleUndetermined = (because: string) =>
+      `whether a panel remains at ${staleCanonical} could NOT be determined (${because})`;
     const staleCanonicalClause =
       staleIdentity === "not-a-panel"
         ? `there is NO panel at ${staleCanonical}`
-        : staleIdentity === "unreadable"
-          ? `whether a panel remains at ${staleCanonical} could NOT be determined (its ` +
-            `pyproject.toml could not be read)`
-          : staleIdentity === "malformed"
-            ? `whether a panel remains at ${staleCanonical} could NOT be determined (its ` +
-              `pyproject.toml was read, but its contents would not parse)`
-            : `a re-read of ${staleCanonical} DID find the panel's pyproject.toml there, ` +
-              `disagreeing with the check this refusal was decided on`;
+        : staleIdentity === "probe-failed"
+          ? staleUndetermined(
+              `its pyproject.toml could not even be checked for — the probe failed ` +
+                `before anything was opened`,
+            )
+          : staleIdentity === "unreadable"
+            ? staleUndetermined(`its pyproject.toml is there, but opening it failed`)
+            : staleIdentity === "malformed"
+              ? staleUndetermined(
+                  `its pyproject.toml was read, but its contents would not parse`,
+                )
+              : `a re-read of ${staleCanonical} DID find the panel's pyproject.toml there, ` +
+                `disagreeing with the check this refusal was decided on`;
     // Its own sentence, not an aside inside the first one — an em-dash caveat
     // wedged mid-clause is exactly the shape a reader skims past.
+    const staleNotGone = ` Do not read that as the panel being gone:`;
     const staleCanonicalCaveat =
       staleIdentity === "not-a-panel"
         ? ``
-        : staleIdentity === "unreadable"
-          ? ` Do not read that as the panel being gone: the file could not be opened, so ` +
-            `nothing was established either way — check permissions on that directory.`
-          : staleIdentity === "malformed"
-            ? ` Do not read that as the panel being gone: the file is there and readable, ` +
-              `it is its CONTENTS that are damaged — repairing or replacing that ` +
-              `pyproject.toml is the remedy, not a permissions change.`
-            : ` Treat the panel at that path as possibly intact — nothing is being moved ` +
-              `while two readings of it disagree.`;
+        : staleIdentity === "probe-failed"
+          ? // The pyproject sits INSIDE this directory, so that is what to point at.
+            // `dirname` named custom_nodes — which the occupancy sentence below
+            // may have just demonstrated is perfectly traversable, sending the
+            // user to check something this very message shows is fine.
+            `${staleNotGone} nothing about that file was established, not even whether ` +
+            `it is there. That points at the directory holding it or at the filesystem ` +
+            `— check that ${staleCanonical} is reachable and readable — not at the file ` +
+            `itself, which was never opened.`
+          : staleIdentity === "unreadable"
+            ? `${staleNotGone} the file was found and could not be opened, so nothing ` +
+              `was established either way — check permissions on that file.`
+            : staleIdentity === "malformed"
+              ? `${staleNotGone} the file is there and it read fine, it is its CONTENTS ` +
+                `that are damaged — repairing or replacing that pyproject.toml is the ` +
+                `remedy, not a permissions change.`
+              : ` Treat the panel at that path as possibly intact — nothing is being moved ` +
+                `while two readings of it disagree.`;
     // "NOT THE PANEL" IS NOT "NOT THERE", and the commands care about the second.
     // Identity answers which pack is at that path; it establishes NOTHING about
     // whether the path is free. An unrelated package sitting at
@@ -3531,22 +3587,53 @@ function reconcilePanelSwap(
           : staleCanonicalPresence === "unknown"
             ? ` Whether anything still exists at ${staleCanonical} could not be determined.`
             : ``;
-    // The warning names the thing THIS branch is moving — "the backup" has no
-    // antecedent in the branch where no backup was found — and only the restore
-    // command carries the `&&` that would clear the record.
-    const nestingWarning = (moved: string) =>
-      `Moving onto a path that still exists nests ${moved} INSIDE it rather than ` +
-      `replacing what is there.`;
+    // AND THE RATIONALE IS PRESENCE-SHAPED TOO. A directory move NESTS onto a
+    // directory and FAILS outright onto a regular file — opposite mechanisms,
+    // opposite remedies — and onto an indeterminate path neither can be claimed.
+    // `other` exists so a regular file is not narrated as a directory; explaining
+    // the directory hazard for one put the same defect back in the sentence that
+    // was added to prevent it.
+    //
+    // The warning also names the thing THIS branch is moving: "the backup" has no
+    // antecedent where no backup was found.
+    const moveHazard = (moved: string): string => {
+      switch (staleCanonicalPresence) {
+        case "directory":
+          return (
+            `Moving onto a path that still exists nests ${moved} INSIDE it rather than ` +
+            `replacing what is there.`
+          );
+        case "other":
+          return (
+            `A directory cannot be moved onto a regular file: the move would simply ` +
+            `FAIL and leave you exactly where you are. Remove or rename that file first.`
+          );
+        case "unknown":
+          return (
+            `What is at that path could not be determined, so what a move onto it ` +
+            `would do could not be determined either.`
+          );
+        default:
+          return ``;
+      }
+    };
+    // ONLY WHERE THE MOVE WOULD SUCCEED. The `&&` runs `rm` on the exit status of
+    // `mv`, so it clears the record only when the move REPORTS success — which a
+    // nest does and a failed move onto a file does not. Attaching this to `other`
+    // warned about a deletion that cannot happen there.
+    const recordAlsoLost =
+      staleCanonicalPresence === "directory"
+        ? ` The "&&" would then count that as success and delete the swap record too.`
+        : ``;
     const restoreCommand = canonicalProvenEmpty
       ? `To put it back: mv "${staleBackup}" "${staleCanonical}" && rm "${journalPath}" — ` +
         `then restart ComfyUI.`
-      : `${nestingWarning("the backup")} The "&&" would then count that as success and ` +
-        `delete the swap record too. ONLY once nothing remains at ${staleCanonical}, put ` +
-        `it back with: mv "${staleBackup}" "${staleCanonical}" && rm "${journalPath}" — ` +
-        `then restart ComfyUI.`;
+      : `${moveHazard("the backup")}${recordAlsoLost} ONLY once nothing remains at ` +
+        `${staleCanonical}, put it back with: mv "${staleBackup}" "${staleCanonical}" && ` +
+        `rm "${journalPath}" — then restart ComfyUI.`;
     const elsewhereCommand = canonicalProvenEmpty
       ? `If you have a copy elsewhere, move it to "${staleCanonical}"`
-      : `${nestingWarning("that copy")} So only once nothing remains at ` +
+      : `${moveHazard("that copy")} So only once nothing remains at ` +
         `${staleCanonical}, and if you have a copy elsewhere, move that copy to ` +
         `"${staleCanonical}"`;
     return {

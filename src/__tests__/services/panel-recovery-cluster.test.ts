@@ -2129,6 +2129,86 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     expect(note).not.toMatch(/the probe failed/);
   });
 
+  it("a probe that never ran is not narrated as a read that failed", async () => {
+    // The real EACCES-on-the-parent shape, not a contrived one: `existsSync`
+    // folds the error into false (so the fail-closed decision correctly refuses)
+    // while `probeFile` reports it as indeterminate. Nothing was opened — so
+    // "could not be read" and "check permissions on that file" describe a
+    // mechanism nobody observed and point at the wrong thing to fix.
+    const backupDir = backupPath("0.11.34");
+    writePanelPack(backupDir, "0.11.34");
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    writeFileSync(
+      join(root, ".comfyui-agent-panel.swap.json"),
+      JSON.stringify({ dir: PANEL_DIR(), backupDir, staging: "x", startedAt: Date.now() }),
+    );
+    const h = makeDeps({});
+    const pyprojectPath = join(PANEL_DIR(), "pyproject.toml");
+    const realProbe = h.deps.probeFile;
+    h.deps.probeFile = (p) => (p === pyprojectPath ? undefined : realProbe(p));
+    h.deps.existsSync = (p) => (p === pyprojectPath ? false : existsSync(p));
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(h.deps);
+    expect(note).toMatch(/could not even be checked for/);
+    expect(note).toMatch(/the probe failed before anything was opened/);
+    expect(note).toMatch(/not at the file itself, which was never opened/);
+    // The other two causes, and their remedies, must be absent.
+    expect(note).not.toMatch(/could not be read/);
+    expect(note).not.toMatch(/opening it failed/);
+    expect(note).not.toMatch(/check permissions on that file/);
+    expect(note).not.toMatch(/would not parse/);
+    // Decision unchanged: still refuses, journal kept.
+    expect(existsSync(join(root, ".comfyui-agent-panel.swap.json"))).toBe(true);
+  });
+
+  it("the SHAPE verdict tells the same three causes apart", async () => {
+    // Same split one question later: an indeterminate probe on the web bundle is
+    // an unperformed read, and the repair note must not call it a failed one.
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    stageIncoming("0.11.38");
+    const h = makeDeps({});
+    const bundle = join(PANEL_DIR(), "web", "js", "comfyui-mcp-panel.js");
+    const realProbe = h.deps.probeFile;
+    h.deps.probeFile = (p) => (p === bundle ? undefined : realProbe(p));
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(h.deps);
+    expect(note).toMatch(/could not even be checked for/);
+    expect(note).not.toMatch(/could not be opened/);
+    expect(existsSync(INCOMING())).toBe(true); // decision unchanged: refused
+  });
+
+  it("a regular FILE at the destination gets the hazard that actually applies to it", async () => {
+    // `other` exists so a regular file is not narrated as a directory — and then
+    // the move rationale explained the DIRECTORY hazard for it. A directory move
+    // onto a regular file does not nest, it FAILS; and because it fails, the
+    // `&&` never runs and the swap record is never deleted. Opposite mechanism,
+    // opposite remedy.
+    const backupDir = backupPath("0.11.34");
+    writePanelPack(backupDir, "0.11.34");
+    writeFileSync(PANEL_DIR(), "not a directory\n");
+    writeFileSync(
+      join(root, ".comfyui-agent-panel.swap.json"),
+      JSON.stringify({ dir: PANEL_DIR(), backupDir, staging: "x", startedAt: Date.now() }),
+    );
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
+    expect(note).toMatch(/A regular FILE still exists at/);
+    expect(note).toMatch(/the move would simply FAIL and leave you exactly where you are/);
+    expect(note).toMatch(/Remove or rename that file first/);
+    // Neither directory-shaped claim may survive here.
+    expect(note).not.toMatch(/nests/);
+    expect(note).not.toMatch(/delete the swap record/);
+    // Still gated, and still refusing.
+    expect(note).toMatch(/ONLY once nothing remains at/);
+    expect(existsSync(join(root, ".comfyui-agent-panel.swap.json"))).toBe(true);
+  });
+
   it("'not the panel' is not 'not there' — the restore command is gated on the path being free", async () => {
     // An unrelated package occupies the canonical name. Identity correctly says
     // not-a-panel; that establishes NOTHING about the path being free, and the
