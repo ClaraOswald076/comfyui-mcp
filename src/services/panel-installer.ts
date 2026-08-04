@@ -2736,9 +2736,53 @@ interface SwapReconcileResult {
  * a claim is only as strong as the observation behind it: an observation that
  * failed must weaken the sentence, never quietly become its negative.
  */
-function dirPresence(p: string, deps: PanelInstallerDeps): boolean | undefined {
-  if (deps.probeFile(p) === undefined) return undefined;
-  return deps.existsSync(p);
+/**
+ * The qualifier every sentence about the RUNNING SERVER must carry.
+ *
+ * Whether a directory is on disk here, and whether the ComfyUI the user is
+ * actually running serves from here, are different questions — and the second
+ * is frequently unproven, because the base may be a configured path the live
+ * server never confirmed (#766). Saying "ComfyUI serves it, so the panel works"
+ * from an unconfirmed root presents evidence about one subject as evidence
+ * about another.
+ *
+ * Guarding one such sentence and leaving its neighbours bare is how this got
+ * missed twice, so this exists as the single thing to append: any sentence
+ * about what ComfyUI is loading appends this, and inherits the guard by
+ * construction rather than by remembering.
+ *
+ * Empty string when the root IS live-derived — the claim is then plain fact and
+ * needs no hedge.
+ */
+function servingQualifier(deps: PanelInstallerDeps, comfyuiPath: string): string {
+  const confirmed = !isRealDeps(deps) || isLiveDerivedBase(lastPanelBaseResolution());
+  return confirmed
+    ? ``
+    : ` (assuming ${comfyuiPath} is the install ComfyUI actually runs from — that ` +
+      `could NOT be confirmed here)`;
+}
+
+export type DirPresence =
+  /** Present, and it is a directory. */
+  | "directory"
+  /** Present, but it is a REGULAR FILE — positively the wrong kind of thing. */
+  | "other"
+  /** Confirmed not there. */
+  | "absent"
+  /** The probe itself failed; nothing was determined. */
+  | "unknown";
+
+function dirPresence(p: string, deps: PanelInstallerDeps): DirPresence {
+  // FOUR STATES, because the earlier three folded a positive observation into
+  // the wrong neighbour. `probeFile === true` means "this is a regular file" —
+  // a determination, not an ambiguity — so a stray file named
+  // `.comfyui-agent-panel.incoming` (a failed extract, a half-written temp)
+  // was reported as a present staged replacement and then described as a
+  // directory, which nobody had observed. Answer it precisely instead.
+  const probe = deps.probeFile(p);
+  if (probe === undefined) return "unknown";
+  if (probe === true) return "other";
+  return deps.existsSync(p) ? "directory" : "absent";
 }
 
 /** The panel version recorded in a directory's pyproject, if readable. */
@@ -2898,6 +2942,50 @@ function resolveCanonicalPanelDir(
  * for an ALREADY-INSTALLED panel (a backup, or the current install), which we
  * did not stage and therefore cannot have a manifest for.
  */
+/**
+ * WHY `false` HAPPENED, not just that it did.
+ *
+ * `dirHasPanelFiles` is fail-closed by ruling, and that is right FOR THE
+ * DECISION: refusing to promote or overwrite on an unreadable file is the safe
+ * answer. But the same boolean was also feeding a user-visible verdict, where
+ * `false` reads as "we determined it is not viable" — so a healthy, stat-able
+ * panel whose bundle happens to hit EACCES was told it "does NOT look like a
+ * working panel". That is a claim nobody established.
+ *
+ * So the predicate keeps its boolean for callers that ACT, and this returns the
+ * reason for callers that SPEAK. Fail closed for the decision; stay honest for
+ * the sentence.
+ */
+type PanelShapeVerdict =
+  | "usable"
+  /** Positively established: identity or bundle is wrong/absent/empty. */
+  | "not-a-panel"
+  /** An input could not be read, so nothing was established either way. */
+  | "unreadable";
+
+function panelShapeVerdict(dir: string, deps: PanelInstallerDeps): PanelShapeVerdict {
+  const pyproject = join(dir, "pyproject.toml");
+  const pyprobe = deps.probeFile(pyproject);
+  if (pyprobe === undefined) return "unreadable";
+  if (pyprobe !== true) return "not-a-panel";
+  let identity: string | undefined;
+  try {
+    identity = parsePyproject(deps.readFile(pyproject)).projectName;
+  } catch {
+    return "unreadable"; // present but could not be read/parsed
+  }
+  if (identity !== PANEL_REGISTRY_ID) return "not-a-panel";
+
+  const bundle = join(dir, ...PANEL_WEB_MARKERS[0]);
+  const bundleProbe = deps.probeFile(bundle);
+  if (bundleProbe === undefined) return "unreadable";
+  if (bundleProbe !== true) return "not-a-panel";
+  if (!deps.fileDigest) return "unreadable"; // no way to ask
+  const digest = deps.fileDigest(bundle);
+  if (!digest) return "unreadable"; // present but unreadable
+  return digest.size > 0 ? "usable" : "not-a-panel";
+}
+
 function dirHasPanelFiles(dir: string, deps: PanelInstallerDeps): boolean {
   if (!dirIsPanelByIdentity(dir, deps)) return false;
   const bundle = join(dir, ...PANEL_WEB_MARKERS[0]);
@@ -3131,7 +3219,23 @@ function reconcilePanelSwap(
   // "There is no interrupted swap" and "we could not tell whether there is one"
   // lead to opposite messages, and only one of them is safe to guess.
   const incomingState = dirPresence(incomingDir, deps);
-  if (incomingState === undefined) {
+  if (incomingState === "other") {
+    // Positively the wrong KIND of thing. A regular file with this name is an
+    // ordinary accident (a failed extract, a half-written temp), and it is
+    // neither a staged replacement nor an absence — announcing "a staged
+    // replacement is sitting at …" and then describing it as a directory would
+    // assert something nobody observed.
+    return {
+      ok: false,
+      note:
+        ` WARNING: "${incomingDir}" exists but is a FILE, not a staged panel directory. ` +
+        `That is not something this recovery path created, so nothing has been changed ` +
+        `and no conclusion about an interrupted update should be drawn from it. Remove ` +
+        `or rename that file, then re-run ` +
+        `${describeInstallPanelAction("status", "a re-check on the ComfyUI host")}.`,
+    };
+  }
+  if (incomingState === "unknown") {
     return {
       ok: false,
       note:
@@ -3142,7 +3246,7 @@ function reconcilePanelSwap(
         `${describeInstallPanelAction("status", "a re-check on the ComfyUI host")}.`,
     };
   }
-  const incomingPresent = incomingState;
+  const incomingPresent = incomingState === "directory";
 
   const readJournal = (): PanelSwapJournal | undefined => {
     if (!deps.existsSync(journalPath)) return undefined;
@@ -3291,9 +3395,17 @@ function reconcilePanelSwap(
   // Tri-state as well: an unreadable-but-present panel must not be announced as
   // "there is no panel at <path>".
   const canonicalState = dirPresence(canonicalDir, deps);
-  const canonicalPresent = canonicalState === true;
-  const canonicalUnknown = canonicalState === undefined;
+  const canonicalPresent = canonicalState === "directory";
+  const canonicalUnknown = canonicalState === "unknown";
+  // A regular file at the canonical name is present-but-wrong-kind: not a panel,
+  // and not an absence either.
+  const canonicalIsFile = canonicalState === "other";
   const canonicalUsable = canonicalPresent && dirHasPanelFiles(canonicalDir, deps);
+  // The REASON, for the sentence. dirHasPanelFiles stays fail-closed for the
+  // decision; this says whether its  was established or merely unread.
+  const canonicalShape: PanelShapeVerdict = canonicalPresent
+    ? panelShapeVerdict(canonicalDir, deps)
+    : "not-a-panel";
 
   // REPAIR ONLY UNDER THE OP LOCK. panelStatus is called from many places and
   // holds no lock, so repairing from there could move directories out from
@@ -3327,12 +3439,8 @@ function reconcilePanelSwap(
     // never confirmed, so "ComfyUI is currently serving that staged copy" was
     // evidence about one subject presented as evidence about another. Only the
     // live-derived case earns the present tense.
-    const servingRootConfirmed =
-      !isRealDeps(deps) || isLiveDerivedBase(lastPanelBaseResolution());
-    const servedPhrase = servingRootConfirmed
-      ? `ComfyUI is currently serving that staged copy`
-      : `ComfyUI will be serving that staged copy IF ${comfyuiPath} is the install ` +
-        `it runs from (that could not be confirmed here)`;
+    const servedPhrase =
+      `ComfyUI is currently serving that staged copy` + servingQualifier(deps, comfyuiPath);
 
     return {
       ok: false,
@@ -3347,8 +3455,12 @@ function reconcilePanelSwap(
                 `directory could not be inspected, so do not read this as it being absent. ` +
                 `${backupSentence}.`
               : canonicalPresent
-                ? `The directory at ${canonicalDir} is present but does NOT look like a ` +
-                  `working panel.`
+                ? canonicalShape === "unreadable"
+                  ? `The directory at ${canonicalDir} is present, but whether it is a ` +
+                    `working panel could NOT be determined — one of its files could not ` +
+                    `be read. Do not read that as it being broken.`
+                  : `The directory at ${canonicalDir} is present but does NOT look like a ` +
+                    `working panel.`
                 : stagedVerdictForReport === "intact"
                   ? `${servedPhrase}, and it verifies intact; ${backupSentence}.`
                   : `There is no panel at ${canonicalDir}, and the staged copy ` +
@@ -3375,7 +3487,7 @@ function reconcilePanelSwap(
         `is present but is NOT a usable panel (no readable panel pyproject.toml, or no ` +
         `built web bundle). Nothing has been moved: discarding the staged replacement ` +
         `at ${incomingDir} could remove the only working copy. ComfyUI serves that ` +
-        `staged copy, so the panel still loads. Inspect ${canonicalDir}, remove it if ` +
+        `staged copy${servingQualifier(deps, comfyuiPath)}, so the panel still loads. Inspect ${canonicalDir}, remove it if ` +
         `it is a leftover, then re-run ` +
         `${describeInstallPanelAction("status", "a re-check on the ComfyUI host")}.`,
     };
@@ -3451,7 +3563,8 @@ function reconcilePanelSwap(
         ok: false,
         note:
           ` WARNING: a panel update was interrupted, and the replacement left at ` +
-          `${incomingDir} is INCOMPLETE — it has no usable panel bundle, so it was not ` +
+          `${incomingDir} FAILED its integrity check — its files no longer match what was ` +
+          `staged, so it was not ` +
           `moved into place. ${
             journalBackup
               ? `Your previous panel is at ${journalBackup}, but it could not be ` +
@@ -3492,7 +3605,8 @@ function reconcilePanelSwap(
           ` WARNING: a panel update was interrupted, the replacement at ${incomingDir} is ` +
           `INCOMPLETE, and your previous panel at ${journalBackup} could not be restored ` +
           `automatically (${err instanceof Error ? err.message : String(err)}). ComfyUI ` +
-          `is still serving the incomplete copy. Move "${journalBackup}" to ` +
+          `is still serving the incomplete copy${servingQualifier(deps, comfyuiPath)}. Move ` +
+          `"${journalBackup}" to ` +
           `"${canonicalDir}" and remove "${incomingDir}", then restart ComfyUI.`,
       };
     }
@@ -3519,7 +3633,8 @@ function reconcilePanelSwap(
       ok: huskCleared,
       note:
         ` NOTE: a previous panel update was interrupted and the replacement it left ` +
-        `behind was INCOMPLETE (no usable panel bundle), so it was NOT installed. Your ` +
+        `behind FAILED its integrity check — its files no longer match what was staged — ` +
+        `so it was NOT installed. Your ` +
         `previous panel has been RESTORED to ${canonicalDir} — nothing was lost.` +
         (wentBackwards
           ? ` NOTE: the restored copy is ${restoringVersion}, which is OLDER than the ` +
@@ -3566,7 +3681,8 @@ function reconcilePanelSwap(
       note:
         ` WARNING: a panel update was interrupted and its replacement at ${incomingDir} ` +
         `could not be moved into place (${err instanceof Error ? err.message : String(err)}). ` +
-        `ComfyUI is still serving it, so the panel works, but it is not under its proper ` +
+        `ComfyUI is still serving it${servingQualifier(deps, comfyuiPath)}, so the panel ` +
+        `works, but it is not under its proper ` +
         `name — rename it to ${canonicalDir} manually, then restart ComfyUI.`,
     };
   }
@@ -4039,7 +4155,7 @@ async function updateViaRegistryZipReinstall(opts: {
       `Panel update did NOT apply: ${managerReason}, and the reinstall-from-source ` +
         `fallback could not move the existing panel out of custom_nodes ` +
         `(${dir} → ${backupDir}: ${err instanceof Error ? err.message : String(err)}). ` +
-        `Your panel at ${dir} is untouched and still serving. ` +
+        `Your panel at ${dir} is untouched and still serving${servingQualifier(deps, comfyuiPath)}. ` +
         (cleared
           ? `The staged replacement was discarded.`
           : `The staged replacement at ${incomingDir} could NOT be discarded and may ` +
@@ -4071,7 +4187,8 @@ async function updateViaRegistryZipReinstall(opts: {
         `fallback failed while moving the new panel into place ` +
         `(${incomingDir} → ${dir}: ${err instanceof Error ? err.message : String(err)}). ` +
         `You are NOT without a panel — the new one is at ${incomingDir} and ComfyUI ` +
-        `serves it, and the previous copy is at ${backupDir}. Nothing was rolled back, ` +
+        `serves it${servingQualifier(deps, comfyuiPath)}, and the previous copy is at ` +
+        `${backupDir}. Nothing was rolled back, ` +
         `because undoing this would have meant deleting the only panel in custom_nodes ` +
         `first. Re-run install_panel(action='status') to have it moved into place ` +
         `automatically, then RESTART ComfyUI.`,

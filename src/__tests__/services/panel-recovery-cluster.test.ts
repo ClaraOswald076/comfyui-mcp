@@ -885,7 +885,8 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     // counts.
     writePanelPack(PANEL_DIR(), "0.11.34");
     const h = makeDeps({ updateThrows: "manager cannot resolve it", cloneVersion: "0.11.38" });
-    h.deps.probeFile = (p) => (p.endsWith(".git") ? undefined : true);
+    const realProbe = h.deps.probeFile;
+    h.deps.probeFile = (p) => (p.endsWith(".git") ? undefined : realProbe(p));
     const err = await runPanelActionInner("update", h.deps).catch((e: Error) => e);
     expect((err as Error).message).toMatch(/could NOT be determined/);
     expect(h.clones).toHaveLength(0);
@@ -1220,7 +1221,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
       "../../services/panel-installer.js"
     );
     const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
-    expect(note).toMatch(/INCOMPLETE/);
+    expect(note).toMatch(/FAILED its integrity check/);
     expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
     expect(existsSync(INCOMING())).toBe(false);
   });
@@ -1483,7 +1484,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
 
     // THE GOOD COPY SURVIVES, and is what is installed.
-    expect(note).toMatch(/INCOMPLETE/);
+    expect(note).toMatch(/FAILED its integrity check/);
     expect(note).toMatch(/RESTORED/);
     expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
     expect(existsSync(join(PANEL_DIR(), "web", "js", "comfyui-mcp-panel.js"))).toBe(true);
@@ -1498,7 +1499,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
       "../../services/panel-installer.js"
     );
     const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
-    expect(note).toMatch(/INCOMPLETE/);
+    expect(note).toMatch(/FAILED its integrity check/);
     expect(note).toMatch(/No previous copy could be located/);
     // Not promoted — the canonical name is still free rather than holding a husk.
     expect(existsSync(PANEL_DIR())).toBe(false);
@@ -1563,7 +1564,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
       "../../services/panel-installer.js"
     );
     const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
-    expect(note).toMatch(/INCOMPLETE/);
+    expect(note).toMatch(/FAILED its integrity check/);
     // The good copy is what ends up installed, not the truncated one.
     expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
   });
@@ -1871,6 +1872,71 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     expect(status.note).not.toMatch(/Not installed\./);
   });
 
+  it("P1-2: an UNREADABLE canonical panel is UNDETERMINED in the message, and still refused by the decision", async () => {
+    // Fail-closed is right for the ACTION — refusing to promote or overwrite on
+    // an unreadable file is safe. But the same boolean was feeding a verdict,
+    // where `false` reads as "we determined it is not viable". A healthy panel
+    // whose bundle hits EACCES was being told it isn't a working panel.
+    stageIncoming("0.11.38");
+    writePanelPack(PANEL_DIR(), "0.11.34"); // a real, healthy canonical panel
+    const bundle = join(PANEL_DIR(), "web", "js", "comfyui-mcp-panel.js");
+    const h = makeDeps({ withoutSwapOps: true });
+    const realDigest = h.deps.fileDigest!;
+    h.deps.fileDigest = (p) => (p === bundle ? undefined : realDigest(p)); // EACCES on read
+
+    const { panelStatus } = await import("../../services/panel-installer.js");
+    const status = await panelStatus(h.deps);
+
+    // THE SENTENCE stays honest: undetermined, not negative.
+    expect(status.note).toMatch(/could NOT be determined/);
+    expect(status.note).toMatch(/Do not read that as it being broken/);
+    expect(status.note).not.toMatch(/does NOT look like a working panel/);
+
+    // THE DECISION still fails closed: the staged copy is not discarded on the
+    // strength of a canonical panel we could not read.
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const h2 = makeDeps({});
+    const realDigest2 = h2.deps.fileDigest!;
+    h2.deps.fileDigest = (p) => (p === bundle ? undefined : realDigest2(p));
+    await repairInterruptedPanelSwap(h2.deps);
+    expect(existsSync(INCOMING())).toBe(true); // not discarded
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
+  });
+
+  it("P1-1: a stray FILE at the .incoming name is neither a staged copy nor an absence", async () => {
+    // probeFile === true is a positive determination of the WRONG type. Folding
+    // it into "present" made status announce "a staged replacement is sitting
+    // at …" and then describe it as a directory — never observed.
+    writeFileSync(INCOMING(), "not a directory\n");
+    const { panelStatus } = await import("../../services/panel-installer.js");
+    const status = await panelStatus(makeDeps({ withoutSwapOps: true }).deps);
+    expect(status.note).toMatch(/exists but is a FILE, not a staged panel directory/);
+    expect(status.note).not.toMatch(/a staged replacement is sitting at/);
+  });
+
+  it("P1-4: an integrity failure is reported as one, not as a bundle verdict", async () => {
+    // Integrity is integrity: a differing README yields `corrupt` correctly.
+    // The verdict is right; "has no usable panel bundle" claims something the
+    // verdict does not establish, when pyproject and the served JS are intact.
+    const backupDir = backupPath("0.11.34");
+    writePanelPack(backupDir, "0.11.34");
+    stageIncoming("0.11.38");
+    writeFileSync(join(INCOMING(), "README.md"), "changed after staging\n");
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
+    expect(note).toMatch(/FAILED its integrity check/);
+    expect(note).toMatch(/no longer match what was staged/);
+    expect(note).not.toMatch(/no usable panel bundle/);
+    // The bundle really was fine — the claim would have been false.
+    expect(
+      readFileSync(join(PANEL_DIR(), "web", "js", "comfyui-mcp-panel.js"), "utf-8").length,
+    ).toBeGreaterThan(0);
+  });
+
   it("an UNREADABLE journal is not reported as 'no swap record'", async () => {
     const h = makeDeps({ withoutSwapOps: true });
     h.deps.probeFile = (p) => (p.endsWith(".swap.json") ? undefined : false);
@@ -1900,8 +1966,11 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     await primePanelBase();
     const { panelStatus } = await import("../../services/panel-installer.js");
     const status = await panelStatus();
-    expect(status.note).not.toMatch(/ComfyUI is currently serving/);
-    expect(status.note).toMatch(/IF .* is the install it runs from/);
+    // The claim is not removed, it is QUALIFIED — and the qualifier is a single
+    // shared suffix, so a new sentence about the running server inherits it by
+    // construction rather than by someone remembering to guard it.
+    expect(status.note).toMatch(/could NOT be confirmed here/);
+    expect(status.note).toMatch(/assuming .* is the install ComfyUI actually runs from/);
   });
 
   it("with NO validated backup, the message names no path at all", async () => {
