@@ -1537,6 +1537,9 @@ export interface PanelStatus {
 export async function repairInterruptedPanelSwap(
   deps: PanelInstallerDeps = defaultDeps,
 ): Promise<string | undefined> {
+  // Declared OUTSIDE the try so the catch can still report a repair that
+  // already landed on disk before something later threw.
+  const performed: { note?: string } = {};
   try {
     const pinned = await pinPanelBase(deps);
     const base = pinned.comfyuiPath();
@@ -1549,7 +1552,11 @@ export async function repairInterruptedPanelSwap(
     if (!pinned.existsSync(incoming) && !pinned.existsSync(swapJournalPath(base))) {
       return undefined;
     }
-    return await withPanelOpLock(
+    // The note is captured OUTSIDE the lock body so a throw AFTER a successful
+    // repair still reports it. The earlier version returned undefined from the
+    // catch below, which swallowed the disclosure along with the error — the
+    // same defect as hiding a repair behind a failed action, one layer down.
+    const locked = await withPanelOpLock(
       async () => {
         // A PIN IS A PROMISE, and this repair MOVES a directory. "Nothing moves
         // the panel while a pin is in force" has to include a well-intentioned
@@ -1560,16 +1567,24 @@ export async function repairInterruptedPanelSwap(
         // landing here would restore tree A while the caller is asking about B.
         assertPinnedTarget(pinned, "repair", "before restoring the previous panel");
         const outcome = reconcilePanelSwap(base, pinned, { repair: true });
+        // Recorded BEFORE the post-assert, because by this point any repair has
+        // already happened on disk — if the assert then throws, the user still
+        // needs to be told what was moved.
+        performed.note = outcome.note;
         assertPinnedTarget(pinned, "repair", "before reporting the restore");
         return outcome.note;
       },
       { timeoutMs: ENSURE_LOCK_WAIT_MS },
     );
+    return locked;
   } catch (err) {
     logger.debug("panel: interrupted-swap repair skipped", {
       err: err instanceof Error ? err.message : String(err),
     });
-    return undefined;
+    // A repair that ALREADY HAPPENED is reported even though the call went on to
+    // fail. Returning undefined here would hide a change to the user's install
+    // behind an unrelated error.
+    return performed.note;
   }
 }
 
@@ -1636,6 +1651,13 @@ export async function panelStatus(
     return "";
   })();
 
+  // An interrupted swap is REPORTED here, never repaired: panelStatus holds no
+  // lock and is called from everywhere, so moving directories from it could cut
+  // across another process's in-flight swap. The mutation paths do the repair.
+  const swapNote = comfyuiPath
+    ? (reconcilePanelSwap(comfyuiPath, deps, { repair: false }).note ?? "")
+    : "";
+
   let note: string;
   if (!detection.applicable) {
     note = !deps.isLocalMode()
@@ -1662,7 +1684,16 @@ export async function panelStatus(
     // missed — the loss `scanReliable` was introduced to prevent.
     const uncorroborated =
       isRealDeps(deps) && !isLiveDerivedBase(baseResolution);
-    note = detection.scanReliable === false
+    note = swapNote
+      ? // An unresolved interrupted swap OWNS this message. Leading with "Not
+        // installed — run install" would tell the user to start fresh in the
+        // same breath as telling them their previous panel was preserved and
+        // exactly how to put it back: two contradictory instructions, the
+        // destructive-sounding one first. The swap note carries the full remedy.
+        `No panel is currently installed at ${comfyuiPath ?? "custom_nodes"}, and an ` +
+        `unresolved panel update is the likely reason — see the WARNING below BEFORE ` +
+        `installing a fresh copy.`
+      : detection.scanReliable === false
       ? `Whether the panel is installed is UNKNOWN: ${comfyuiPath ?? "custom_nodes"}` +
         `/custom_nodes could not be fully enumerated (or a candidate's pyproject.toml ` +
         `could not be read), so this is NOT a proven absence and no install is ` +
@@ -1706,13 +1737,6 @@ export async function panelStatus(
       clearPanelDiskObservation();
     }
   }
-
-  // An interrupted swap is REPORTED here, never repaired: panelStatus holds no
-  // lock and is called from everywhere, so moving directories from it could cut
-  // across another process's in-flight swap. The mutation paths do the repair.
-  const swapNote = comfyuiPath
-    ? (reconcilePanelSwap(comfyuiPath, deps, { repair: false }).note ?? "")
-    : "";
 
   const pin = readPinSafe(deps);
   const pinNote = pin.pinned
@@ -2496,7 +2520,15 @@ function dirIsUsablePanel(dir: string, deps: PanelInstallerDeps): boolean {
     if (parsePyproject(deps.readFile(pyproject)).projectName !== PANEL_REGISTRY_ID) {
       return false;
     }
-    return servesPanelWebAssets(dir, deps) === true;
+    // THE JS BUNDLE IS NOT OPTIONAL. servesPanelWebAssets answers a different
+    // question — "would ComfyUI serve anything from here?" — and is true when
+    // EITHER marker is present, so a directory holding only the wordmark SVG
+    // passes it. That is the right test for detecting a shadow; it is the wrong
+    // test for "this panel would load", and using it here let a husk with the
+    // bundle missing license deleting the only complete copy. Require the file
+    // the browser actually executes, and require it as a CONFIRMED regular file
+    // (an indeterminate probe is not a yes).
+    return deps.probeFile(join(dir, ...PANEL_WEB_MARKERS[0])) === true;
   } catch {
     return false;
   }
@@ -2549,16 +2581,33 @@ function reconcilePanelSwap(
     // deliberately uninstalled the panel. Restoring the backup would then
     // resurrect software they intentionally removed. "There is a journal" only
     // ever meant "a journal exists". So: report, never mutate.
+    // REFUSING IS ONLY ACCEPTABLE IF THE USER IS HANDED THEIR DATA BACK.
+    // "Cannot determine, not restoring" abandons someone at their worst moment —
+    // panel gone, and no idea a backup even exists. So the refusal states all
+    // five things they need: that the canonical path is empty, that a backup
+    // exists AND where, why we will not move it for them, and the exact command
+    // to restore it plus the exact command to start fresh.
+    const backupPresent = deps.existsSync(stale.backupDir);
+    const reinstall = describeInstallPanelAction(
+      "install",
+      "a fresh install on the ComfyUI host",
+    );
     return {
       ok: false,
-      note:
-        ` NOTE: a panel swap journal is present at ${journalPath}, but no in-flight swap ` +
-        `was found and there is no panel at ${stale.dir}. That record may be left over ` +
-        `from a swap that COMPLETED, in which case the panel is absent because it was ` +
-        `deliberately uninstalled — so nothing has been moved. If you DID lose the panel ` +
-        `to an interrupted update, its previous copy should be at ${stale.backupDir}: ` +
-        `move it back and delete the journal, or reinstall with ` +
-        `${describeInstallPanelAction("install", "a fresh install on the ComfyUI host")}.`,
+      note: backupPresent
+        ? ` WARNING: there is NO panel at ${stale.dir}, and a swap journal is still ` +
+          `present at ${journalPath}. Your previous panel HAS been preserved — it is at ` +
+          `${stale.backupDir}. Nothing has been moved back automatically, because this ` +
+          `state cannot be told apart from a completed update followed by a DELIBERATE ` +
+          `uninstall, and restoring would then resurrect something you removed on ` +
+          `purpose. To put it back: mv "${stale.backupDir}" "${stale.dir}" && rm ` +
+          `"${journalPath}" — then restart ComfyUI. To start fresh instead: delete ` +
+          `"${journalPath}" and run ${reinstall}.`
+        : ` WARNING: there is NO panel at ${stale.dir}, a swap journal is still present ` +
+          `at ${journalPath}, and the backup it names (${stale.backupDir}) is NOT there ` +
+          `either. Nothing has been moved. Look in ` +
+          `${join(comfyuiPath, "custom_nodes_backup")} for a copy and move it to ` +
+          `"${stale.dir}"; otherwise delete "${journalPath}" and run ${reinstall}.`,
     };
   }
 
@@ -2566,8 +2615,18 @@ function reconcilePanelSwap(
   // still there — and either way a panel is present in custom_nodes right now,
   // because the incoming directory is itself served.
   const journal = readJournal();
-  const canonicalDir =
-    journal?.dir ?? join(comfyuiPath, "custom_nodes", PANEL_REGISTRY_ID);
+  // THE JOURNAL INFORMS; IT NEVER DESIGNATES. Taking the destination from
+  // journal.dir means a stale — or hand-edited — record can send the incoming
+  // directory anywhere on disk. The canonical path is a known constant under
+  // THIS ComfyUI root, so derive it and use the journal only for the one thing
+  // it alone knows: where the old copy was parked. Even that is accepted only
+  // when it points inside this root's custom_nodes_backup.
+  const canonicalDir = join(comfyuiPath, "custom_nodes", PANEL_REGISTRY_ID);
+  const backupRootPath = join(comfyuiPath, "custom_nodes_backup");
+  const journalBackup =
+    journal?.backupDir && journal.backupDir.startsWith(backupRootPath)
+      ? journal.backupDir
+      : undefined;
   // "EXISTS" IS WEAKER THAN "WORKS", and the difference decides whether we are
   // allowed to delete anything. The discard branch below throws away the staged
   // panel on the strength of the canonical one being fine — so the canonical one
@@ -2646,8 +2705,85 @@ function reconcilePanelSwap(
   }
 
   // Interrupted AFTER the old panel was moved aside: the staged copy is the only
-  // panel in custom_nodes, and ComfyUI is already serving it. Finish the move so
-  // it sits under its proper name.
+  // panel in custom_nodes, and ComfyUI is already serving it.
+  //
+  // VALIDATE IT BEFORE PROMOTING IT. The clone was checked before step 1, but a
+  // crash can retain the directory ENTRY while losing file data that was still
+  // unwritten — so the thing sitting there now may be a husk. Renaming a husk
+  // into the canonical name would make it the panel of record and strand the
+  // user's good copy in backup: the recovery destroying the very thing it
+  // exists to protect. Re-check the tree as it is NOW, and when it does not
+  // hold up, prefer the copy we know worked.
+  if (!dirIsUsablePanel(incomingDir, deps)) {
+    const backupUsable = !!journalBackup && dirIsUsablePanel(journalBackup, deps);
+    if (!backupUsable || !deps.rename) {
+      return {
+        ok: false,
+        note:
+          ` WARNING: a panel update was interrupted, and the replacement left at ` +
+          `${incomingDir} is INCOMPLETE — it has no usable panel bundle, so it was not ` +
+          `moved into place. ${
+            journalBackup
+              ? `Your previous panel is at ${journalBackup}, but it could not be ` +
+                `restored automatically either. Move it to "${canonicalDir}" manually`
+              : `No previous copy could be located under ${backupRootPath}. Reinstall ` +
+                `with ${describeInstallPanelAction(
+                  "install",
+                  "a fresh install on the ComfyUI host",
+                )}`
+          }, remove "${incomingDir}", then restart ComfyUI.`,
+      };
+    }
+    // RESTORE FIRST, then clear the husk. Doing it the other way round would
+    // leave custom_nodes with no panel at all in between, which is the state
+    // this whole ordering exists to avoid.
+    try {
+      deps.rename(journalBackup, canonicalDir);
+    } catch (err) {
+      return {
+        ok: false,
+        note:
+          ` WARNING: a panel update was interrupted, the replacement at ${incomingDir} is ` +
+          `INCOMPLETE, and your previous panel at ${journalBackup} could not be restored ` +
+          `automatically (${err instanceof Error ? err.message : String(err)}). ComfyUI ` +
+          `is still serving the incomplete copy. Move "${journalBackup}" to ` +
+          `"${canonicalDir}" and remove "${incomingDir}", then restart ComfyUI.`,
+      };
+    }
+    let huskCleared = true;
+    try {
+      // Out of custom_nodes first (atomic), then delete — a partial recursive
+      // delete in place would leave a damaged directory still shadowing.
+      const rejected = join(comfyuiPath, `.comfyui-agent-panel.rejected-${Date.now()}`);
+      deps.rename(incomingDir, rejected);
+      try {
+        deps.removeDir?.(rejected);
+      } catch {
+        // Outside custom_nodes — leftover bytes, not a shadow.
+      }
+    } catch {
+      huskCleared = false;
+    }
+    dropJournal();
+    logger.warn(
+      `[panel] an interrupted panel update left an INCOMPLETE replacement at ` +
+        `${incomingDir}; restored the previous panel from ${journalBackup} instead.`,
+    );
+    return {
+      ok: huskCleared,
+      note:
+        ` NOTE: a previous panel update was interrupted and the replacement it left ` +
+        `behind was INCOMPLETE (no usable panel bundle), so it was NOT installed. Your ` +
+        `previous panel has been RESTORED to ${canonicalDir} — nothing was lost.` +
+        (huskCleared
+          ? ` Retry the update when convenient.`
+          : ` The incomplete copy at ${incomingDir} could not be removed and may SHADOW ` +
+            `the restored panel — delete that directory, then restart ComfyUI.`) +
+        ` RESTART ComfyUI.`,
+    };
+  }
+
+  // The replacement holds up. Finish the move so it sits under its proper name.
   if (!deps.rename) {
     return {
       ok: false,
@@ -2669,7 +2805,7 @@ function reconcilePanelSwap(
       note:
         ` NOTE: a previous panel update was interrupted after it had moved the old copy ` +
         `aside. The new panel has been moved into place at ${canonicalDir}` +
-        `${journal?.backupDir ? ` (the previous copy remains at ${journal.backupDir})` : ""}. ` +
+        `${journalBackup ? ` (the previous copy remains at ${journalBackup})` : ""}. ` +
         `RESTART ComfyUI to load it.`,
     };
   } catch (err) {
@@ -3080,16 +3216,22 @@ async function updateViaRegistryZipReinstall(opts: {
   // crash, the earlier "new panel moved in" must have survived too, or there is
   // no panel and no marker to find one by.
   //
-  // Two things back that up, in order of strength. First, both are RENAMES in
-  // the same directory — metadata operations, which a journaling filesystem
-  // (NTFS, ext4, APFS) commits in order, so a later one cannot land while an
-  // earlier one is lost. That is a genuinely different situation from the
-  // journal FILE this ordering replaced: file contents sit in the page cache and
-  // can be dropped while later metadata persists, which is exactly why a journal
-  // was the wrong mechanism. Second, belt and braces: confirm the entry is
-  // actually visible before continuing, so we never move the old panel aside on
-  // the strength of a rename that did not take, and ask the platform for a
-  // durability barrier where it can give one.
+  // BE PRECISE ABOUT WHAT THIS DOES AND DOES NOT GUARANTEE. It is tempting to
+  // say "journaling filesystems commit metadata in order, so a later rename
+  // cannot land while an earlier one is lost" — but that is NOT a durability
+  // contract, on NTFS especially, absent an explicit flush. So the reordering
+  // case is real, not exotic.
+  //
+  // What this barrier does give: the entry is confirmed VISIBLE before the old
+  // panel is moved aside, so we never act on a rename that did not take, and the
+  // platform is asked for a durability barrier where it can provide one (it
+  // cannot on Windows, which has no directory handle to fsync).
+  //
+  // The residual — losing the .incoming entry while old→backup survives — lands
+  // in the journal-without-incoming state, which deliberately REPORTS instead of
+  // restoring: that state is indistinguishable from a completed swap followed by
+  // a deliberate uninstall, so restoring would be acting on evidence we do not
+  // have. The refusal names the backup path and the exact command to restore it.
   if (!deps.existsSync(incomingDir)) {
     ops.removeDir(staging);
     ops.removeDir(journalPath);
@@ -3217,10 +3359,24 @@ async function updateViaRegistryZipReinstall(opts: {
   // read can leave something older in place. Reporting that as "updated" is the
   // same fabricated progress this file refuses everywhere else, so the OBSERVED
   // version is checked, not just the intended one.
+  // AN UNCOMPARABLE RESULT IS "COULD NOT COMPARE", NOT "FINE". Both versions
+  // were required to be strictly comparable before the swap, so a post-swap
+  // version that no longer parses means something changed the pack underneath
+  // us — and a value like "0.11.33.0" would otherwise slip past the regression
+  // check below (four components fail the strict grammar) and be reported as
+  // "Panel updated (0.11.34 → 0.11.33.0)". Refuse rather than claim.
+  if (!SEMVER_RE.test(post.version.trim())) {
+    throw new PanelInstallError(
+      `Panel reinstall-from-source cannot be verified: after the swap, ${dir} reports ` +
+        `version "${post.version}", which is not a comparable version number, so whether ` +
+        `it moved FORWARD from ${previousVersion ?? "the previous version"} cannot be ` +
+        `established. NOT reporting an update. The previous panel is at ${backupDir}; ` +
+        `check the pack's pyproject.toml before restarting ComfyUI.`,
+    );
+  }
   if (
     previousVersion &&
     SEMVER_RE.test(previousVersion.trim()) &&
-    SEMVER_RE.test(post.version.trim()) &&
     compareSemver(post.version, previousVersion) < 0
   ) {
     throw new PanelInstallError(

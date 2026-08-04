@@ -97,6 +97,11 @@ import {
   verifiedPanelDiskVersion,
 } from "../../services/panel-workspace.js";
 
+/** Escape a filesystem path for embedding in a RegExp. */
+function escapeRe(v: string): string {
+  return v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function pyproject(version: string, name = PANEL_REGISTRY_ID): string {
   return `[project]\nname = "${name}"\nversion = "${version}"\n`;
 }
@@ -935,6 +940,46 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     expect((err as Error).message).not.toMatch(/Panel updated/);
   });
 
+  it("an UNCOMPARABLE post-swap version is 'could not compare', never an update", async () => {
+    // Both versions were required to be strictly comparable before the swap, so
+    // an unparseable one afterwards means something changed the pack. A value
+    // like 0.11.33.0 fails the strict three-component grammar, skipping the
+    // regression check, and would otherwise be reported as an update.
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    const h = makeDeps({ cloneVersion: "0.11.38", updateThrows: "manager cannot resolve it" });
+    const realRename = h.deps.rename!;
+    let renames = 0;
+    h.deps.rename = (from, to) => {
+      realRename(from, to);
+      if (++renames === 3) writePanelPack(PANEL_DIR(), "0.11.33.0");
+    };
+    const err = await runPanelActionInner("update", h.deps).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect((err as Error).message).toMatch(/not a comparable version number/);
+    expect((err as Error).message).not.toMatch(/Panel updated/);
+  });
+
+  it("a repair that already landed is reported even if the call then throws", async () => {
+    // The catch used to return undefined, swallowing the disclosure along with
+    // the error — a change to the user's install, hidden.
+    writePanelPack(INCOMING(), "0.11.38");
+    const h = makeDeps({});
+    let renamed = false;
+    const realRename = h.deps.rename!;
+    h.deps.rename = (from, to) => {
+      realRename(from, to);
+      renamed = true;
+      generation.value++; // the post-repair assertion will now throw
+    };
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const pinned = await pinPanelBase(h.deps);
+    const note = await repairInterruptedPanelSwap(pinned);
+    expect(renamed).toBe(true); // the repair really happened
+    expect(note).toMatch(/moved into place/); // …and was still reported
+  });
+
   it("a repair is reported even when the action then fails with a non-panel error", async () => {
     // install/reinstall await ComfyUI-Manager directly, which rejects with its
     // own error types. Restricting the note to PanelInstallError meant a repair
@@ -1001,6 +1046,89 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     expect(readdirSync(join(root, "custom_nodes_backup"))).toEqual([]);
   });
 
+  it("P0: a HUSK incoming is never promoted — the good copy is restored instead", async () => {
+    // A crash can keep the .incoming directory ENTRY while losing file data
+    // that was still unwritten. Promoting that husk would make it the panel of
+    // record and strand the user's working copy in backup — the recovery
+    // destroying the thing it exists to protect.
+    const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1`);
+    writePanelPack(backupDir, "0.11.34"); // the good copy
+    mkdirSync(INCOMING(), { recursive: true });
+    writeFileSync(join(INCOMING(), "pyproject.toml"), pyproject("0.11.38")); // no bundle
+    writeFileSync(
+      join(root, ".comfyui-agent-panel.swap.json"),
+      JSON.stringify({ dir: PANEL_DIR(), backupDir, staging: "x", startedAt: Date.now() }),
+    );
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
+
+    // THE GOOD COPY SURVIVES, and is what is installed.
+    expect(note).toMatch(/INCOMPLETE/);
+    expect(note).toMatch(/RESTORED/);
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
+    expect(existsSync(join(PANEL_DIR(), "web", "js", "comfyui-mcp-panel.js"))).toBe(true);
+    // And the husk is gone from custom_nodes, so it cannot shadow it.
+    expect(existsSync(INCOMING())).toBe(false);
+  });
+
+  it("a husk incoming with NO recoverable backup reports rather than promoting it", async () => {
+    mkdirSync(INCOMING(), { recursive: true });
+    writeFileSync(join(INCOMING(), "pyproject.toml"), pyproject("0.11.38"));
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
+    expect(note).toMatch(/INCOMPLETE/);
+    expect(note).toMatch(/no usable panel bundle/);
+    // Not promoted — the canonical name is still free rather than holding a husk.
+    expect(existsSync(PANEL_DIR())).toBe(false);
+  });
+
+  it("the JS BUNDLE is what makes a panel usable — the wordmark alone is not enough", async () => {
+    // servesPanelWebAssets answers "would ComfyUI serve anything from here?" and
+    // is true for either marker. That is right for shadow detection and wrong
+    // for "this panel would load": using it here let a husk canonical license
+    // deleting the only complete copy.
+    mkdirSync(join(PANEL_DIR(), "web", "img"), { recursive: true });
+    writeFileSync(join(PANEL_DIR(), "pyproject.toml"), pyproject("0.11.34"));
+    writeFileSync(join(PANEL_DIR(), "web", "img", "comfyui-mcp-wordmark.svg"), "<svg/>");
+    writePanelPack(INCOMING(), "0.11.38"); // the only COMPLETE copy
+
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
+    // The complete copy must NOT be discarded on the strength of a husk.
+    expect(existsSync(INCOMING())).toBe(true);
+    expect(readFileSync(join(INCOMING(), "pyproject.toml"), "utf-8")).toContain("0.11.38");
+    expect(note).toMatch(/NOT a usable panel/);
+  });
+
+  it("a hand-edited journal cannot redirect where the panel is moved to", async () => {
+    // The journal informs; it never designates. Taking the destination from
+    // journal.dir would let a stale or edited record send the panel anywhere.
+    const elsewhere = join(root, "elsewhere", "panel");
+    writePanelPack(INCOMING(), "0.11.38");
+    writeFileSync(
+      join(root, ".comfyui-agent-panel.swap.json"),
+      JSON.stringify({
+        dir: elsewhere, // points outside custom_nodes
+        backupDir: join(root, "custom_nodes_backup", "x"),
+        staging: "x",
+        startedAt: Date.now(),
+      }),
+    );
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    await repairInterruptedPanelSwap(makeDeps({}).deps);
+    // Landed at the derived canonical path, not the journal's.
+    expect(existsSync(elsewhere)).toBe(false);
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.38");
+  });
+
   it("a canonical dir that merely EXISTS does not license discarding the staged panel", async () => {
     // "exists" is weaker than "works". A husk at the canonical name — emptied,
     // or left by a half-finished move — would otherwise be read as a healthy
@@ -1045,11 +1173,34 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     );
     const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
 
-    expect(note).toMatch(/may be left over from a swap that COMPLETED/);
-    expect(note).toMatch(/nothing has been moved/);
-    // The uninstall stands.
+    // The uninstall stands — nothing was resurrected.
     expect(existsSync(PANEL_DIR())).toBe(false);
     expect(existsSync(backupDir)).toBe(true);
+
+    // REFUSING IS ONLY ACCEPTABLE IF THE USER GETS THEIR DATA BACK. All five
+    // things they need must be in the message:
+    expect(note).toMatch(/NO panel at/); //                    1. canonical is empty
+    expect(note).toContain(backupDir); //                      2. the backup, by absolute path
+    expect(note).toMatch(/HAS been preserved/); //                 …and that it survived
+    expect(note).toMatch(/DELIBERATE uninstall/); //           3. why we will not move it
+    expect(note).toMatch(new RegExp(`mv "${escapeRe(backupDir)}"`)); // 4. exact restore command
+    expect(note).toMatch(/To start fresh instead/); //         5. exact reinstall route
+  });
+
+  it("says so plainly when the backup named by a stale journal is ALSO gone", async () => {
+    const backupDir = join(root, "custom_nodes_backup", `${PANEL_REGISTRY_ID}-0.11.34-1`);
+    writeFileSync(
+      join(root, ".comfyui-agent-panel.swap.json"),
+      JSON.stringify({ dir: PANEL_DIR(), backupDir, staging: "x", startedAt: Date.now() }),
+    );
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
+    expect(note).toMatch(/is NOT there/);
+    expect(note).toContain(join(root, "custom_nodes_backup"));
+    // Must not claim a preserved copy that isn't there.
+    expect(note).not.toMatch(/HAS been preserved/);
   });
 
   it("a completed swap's spent journal is simply cleared when the panel IS present", async () => {
