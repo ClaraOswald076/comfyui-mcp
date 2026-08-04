@@ -2751,15 +2751,31 @@ interface SwapReconcileResult {
  * about what ComfyUI is loading appends this, and inherits the guard by
  * construction rather than by remembering.
  *
- * Empty string when the root IS live-derived — the claim is then plain fact and
- * needs no hedge.
+ * THE SERVING CLAIM LIVES HERE, NOT IN THE SENTENCE BEFORE IT. The first
+ * revision left the claim in the base clause and appended a parenthetical
+ * retraction — "ComfyUI is currently serving that staged copy (assuming X is
+ * the install ComfyUI actually runs from — that could NOT be confirmed here)".
+ * A reader takes the main clause and skims the parenthetical, so the guard
+ * bought nothing: the sentence still ASSERTED and then took it back. Base
+ * clauses are therefore NEUTRAL about the running server — they name a copy, a
+ * path and its state, and stop — and this supplies the serving claim itself,
+ * in the present tense only when the root is live-derived. The two directions
+ * then agree, and nothing is asserted before it is qualified.
+ *
+ * `subject` is the noun phrase the base clause just established ("that staged
+ * copy", "your panel at <dir>"), so the appended sentence has an antecedent.
  */
-function servingQualifier(deps: PanelInstallerDeps, comfyuiPath: string): string {
+function servingQualifier(
+  deps: PanelInstallerDeps,
+  comfyuiPath: string,
+  subject: string,
+): string {
   const confirmed = !isRealDeps(deps) || isLiveDerivedBase(lastPanelBaseResolution());
   return confirmed
-    ? ``
-    : ` (assuming ${comfyuiPath} is the install ComfyUI actually runs from — that ` +
-      `could NOT be confirmed here)`;
+    ? ` The running ComfyUI loads its panel from ${comfyuiPath}, so ${subject} is in ` +
+      `the tree it serves.`
+    : ` Whether the running ComfyUI loads its panel from ${comfyuiPath} could NOT be ` +
+      `confirmed here, so whether ${subject} is in the tree it serves is unknown.`;
 }
 
 export type DirPresence =
@@ -2963,7 +2979,28 @@ type PanelShapeVerdict =
   /** An input could not be read, so nothing was established either way. */
   | "unreadable";
 
-function panelShapeVerdict(dir: string, deps: PanelInstallerDeps): PanelShapeVerdict {
+/**
+ * The same split, one question earlier: WHY the identity test said no.
+ *
+ * `dirIsPanelByIdentity` answers the boolean the DECISIONS need, and its `false`
+ * is fail-closed by ruling. But an unreadable `pyproject.toml` produces that
+ * same `false`, and a sentence built straight from it announced "there is NO
+ * panel at <path>" about a directory whose identity was never established. The
+ * probe failed; it established nothing. So callers that SPEAK ask this, and
+ * callers that ACT keep the boolean.
+ */
+type PanelIdentityVerdict =
+  /** Positively established: the pyproject names the panel pack. */
+  | "panel"
+  /** Positively established: readable, and it is something else (or absent). */
+  | "not-a-panel"
+  /** The pyproject could not be read or parsed — nothing was established. */
+  | "unreadable";
+
+function panelIdentityVerdict(
+  dir: string,
+  deps: PanelInstallerDeps,
+): PanelIdentityVerdict {
   const pyproject = join(dir, "pyproject.toml");
   const pyprobe = deps.probeFile(pyproject);
   if (pyprobe === undefined) return "unreadable";
@@ -2974,7 +3011,12 @@ function panelShapeVerdict(dir: string, deps: PanelInstallerDeps): PanelShapeVer
   } catch {
     return "unreadable"; // present but could not be read/parsed
   }
-  if (identity !== PANEL_REGISTRY_ID) return "not-a-panel";
+  return identity === PANEL_REGISTRY_ID ? "panel" : "not-a-panel";
+}
+
+function panelShapeVerdict(dir: string, deps: PanelInstallerDeps): PanelShapeVerdict {
+  const identity = panelIdentityVerdict(dir, deps);
+  if (identity !== "panel") return identity;
 
   const bundle = join(dir, ...PANEL_WEB_MARKERS[0]);
   const bundleProbe = deps.probeFile(bundle);
@@ -3334,21 +3376,67 @@ function reconcilePanelSwap(
       "install",
       "a fresh install on the ComfyUI host",
     );
+    // SAY WHAT THE PROBE FOUND, not what its failure would have implied. The
+    // decision above is `dirIsPanelByIdentity`, which is fail-closed and stays
+    // that way — but its `false` also covers "the pyproject could not be read",
+    // and building "there is NO panel at <path>" out of that reports an absence
+    // nobody observed. A real panel whose pyproject hit EACCES was told it was
+    // gone, in the one message a worried user reads.
+    // THREE ANSWERS, THREE SENTENCES. Folding `panel` in with `unreadable` would
+    // repeat the defect one layer down: the decision above read `false`, but if
+    // this later read DOES find the pack (the two observations were taken at
+    // different moments), "that directory could not be read" is then a failure
+    // that did not happen. The refusal stands either way — it is the sentence
+    // that has to match what was seen.
+    const staleIdentity = panelIdentityVerdict(staleCanonical, deps);
+    const staleCanonicalClause =
+      staleIdentity === "not-a-panel"
+        ? `there is NO panel at ${staleCanonical}`
+        : staleIdentity === "unreadable"
+          ? `whether a panel remains at ${staleCanonical} could NOT be determined (that ` +
+            `directory could not be read)`
+          : `a re-read of ${staleCanonical} DID find the panel's pyproject.toml there, ` +
+            `disagreeing with the check this refusal was decided on`;
+    // Its own sentence, not an aside inside the first one — an em-dash caveat
+    // wedged mid-clause is exactly the shape a reader skims past.
+    const staleCanonicalCaveat =
+      staleIdentity === "not-a-panel"
+        ? ``
+        : staleIdentity === "unreadable"
+          ? ` Do not read that as the panel being gone: the probe failed, so nothing was ` +
+            `established either way.`
+          : ` Treat the panel at that path as possibly intact — nothing is being moved ` +
+            `while two readings of it disagree.`;
+    // AND SO DOES EVERY INSTRUCTION DERIVED FROM IT. `mv` onto a path that may
+    // still hold a panel is not the same act as `mv` onto an empty one, so both
+    // commands below — restore-the-backup AND bring-your-own-copy — are gated on
+    // the emptiness actually having been established. Guarding one of a pair is
+    // the pointwise mistake this file keeps paying for.
+    const canonicalProvenEmpty = staleIdentity === "not-a-panel";
+    const restoreCommand = canonicalProvenEmpty
+      ? `To put it back: mv "${staleBackup}" "${staleCanonical}" && rm "${journalPath}" — ` +
+        `then restart ComfyUI.`
+      : `ONLY once you have confirmed ${staleCanonical} holds no panel, put it back with: ` +
+        `mv "${staleBackup}" "${staleCanonical}" && rm "${journalPath}" — then restart ComfyUI.`;
+    const elsewhereCommand = canonicalProvenEmpty
+      ? `If you have a copy elsewhere, move it to "${staleCanonical}"`
+      : `If you confirm ${staleCanonical} holds no panel and you have a copy elsewhere, ` +
+        `move that copy to "${staleCanonical}"`;
     return {
       ok: false,
       note: backupPresent
-        ? ` WARNING: there is NO panel at ${staleCanonical}, and a swap journal is still ` +
-          `present at ${journalPath}. Your previous panel HAS been preserved — it is at ` +
+        ? ` WARNING: ${staleCanonicalClause}, and a swap journal is still ` +
+          `present at ${journalPath}.${staleCanonicalCaveat} Your previous panel HAS been ` +
+          `preserved — it is at ` +
           `${staleBackup}. Nothing has been moved back automatically, because this ` +
           `state cannot be told apart from a completed update followed by a DELIBERATE ` +
           `uninstall, and restoring would then resurrect something you removed on ` +
-          `purpose. To put it back: mv "${staleBackup}" "${staleCanonical}" && rm ` +
-          `"${journalPath}" — then restart ComfyUI. To start fresh instead: delete ` +
+          `purpose. ${restoreCommand} To start fresh instead: delete ` +
           `"${journalPath}" and run ${reinstall}.`
-        : ` WARNING: there is NO panel at ${staleCanonical}, a swap journal is still present ` +
+        : ` WARNING: ${staleCanonicalClause}, a swap journal is still present ` +
           `at ${journalPath}, and no preserved copy of the panel could be found under ` +
-          `${join(comfyuiPath, "custom_nodes_backup")}. Nothing has been moved. If you have ` +
-          `a copy elsewhere, move it to "${staleCanonical}"; otherwise delete ` +
+          `${join(comfyuiPath, "custom_nodes_backup")}.${staleCanonicalCaveat} Nothing has ` +
+          `been moved. ${elsewhereCommand}; otherwise delete ` +
           `"${journalPath}" and run ${reinstall}.`,
     };
   }
@@ -3437,10 +3525,21 @@ function reconcilePanelSwap(
     // matches what we staged; it proves nothing about which install the running
     // ComfyUI serves. The root here may be a configured one the live server
     // never confirmed, so "ComfyUI is currently serving that staged copy" was
-    // evidence about one subject presented as evidence about another. Only the
-    // live-derived case earns the present tense.
-    const servedPhrase =
-      `ComfyUI is currently serving that staged copy` + servingQualifier(deps, comfyuiPath);
+    // evidence about one subject presented as evidence about another. The claim
+    // now lives entirely inside the qualifier, which puts it in the present
+    // tense only for a live-derived root — the clauses before it say nothing
+    // about the running server at all.
+    const stagedServing = servingQualifier(deps, comfyuiPath, `that staged copy`);
+
+    // FOUR STATES, NOT TWO — and this chain was collapsing them again at the
+    // consumer. `dirPresence` distinguishes a directory, a regular FILE at the
+    // canonical name, a confirmed absence and a failed probe; reading "other" as
+    // absence reported "There is no panel at <path>" about a path where a file
+    // had been positively observed. Say which one was seen.
+    const canonicalGoneClause = canonicalIsFile
+      ? `There is a FILE, not a directory, at ${canonicalDir}, so no panel is installed ` +
+        `under that name`
+      : `There is no panel at ${canonicalDir}`;
 
     return {
       ok: false,
@@ -3448,8 +3547,9 @@ function reconcilePanelSwap(
         ` WARNING: a panel update was interrupted — a staged replacement is sitting at ` +
         `${incomingDir}. ${
           canonicalWorks
-            ? `Your existing panel at ${canonicalDir} looks complete and is what ComfyUI ` +
-              `will load once the staged copy is cleared.`
+            ? `Your existing panel at ${canonicalDir} looks complete — a readable panel ` +
+              `pyproject.toml and the built web bundle are both there.` +
+              servingQualifier(deps, comfyuiPath, `that panel`)
             : canonicalUnknown
               ? `Whether a panel remains at ${canonicalDir} could NOT be determined — that ` +
                 `directory could not be inspected, so do not read this as it being absent. ` +
@@ -3462,8 +3562,9 @@ function reconcilePanelSwap(
                   : `The directory at ${canonicalDir} is present but does NOT look like a ` +
                     `working panel.`
                 : stagedVerdictForReport === "intact"
-                  ? `${servedPhrase}, and it verifies intact; ${backupSentence}.`
-                  : `There is no panel at ${canonicalDir}, and the staged copy ` +
+                  ? `${canonicalGoneClause}. The staged copy verifies intact, and ` +
+                    `${backupSentence}.${stagedServing}`
+                  : `${canonicalGoneClause}, and the staged copy ` +
                     `${
                       stagedVerdictForReport === "corrupt"
                         ? "did NOT survive intact"
@@ -3480,15 +3581,27 @@ function reconcilePanelSwap(
     // the ONLY usable panel, and completing the move cannot rename onto an
     // occupied name. The user is not broken in the meantime: the staged copy is
     // dot-prefixed, so ComfyUI serves it. Report and touch nothing.
+    //
+    // THE REFUSAL IS RIGHT; THE SENTENCE HAS TO MATCH IT. `canonicalUsable` is
+    // fail-closed, so an EACCES on the bundle lands here too — and saying the
+    // directory "is NOT a usable panel" then states a verdict the read never
+    // reached. Same action/message split as everywhere else: refuse either way,
+    // but only claim what was established.
+    const canonicalClause =
+      canonicalShape === "unreadable"
+        ? `whether the directory at ${canonicalDir} is a usable panel could NOT be ` +
+          `determined — one of its files could not be read, so this is not a finding ` +
+          `that it is broken`
+        : `the directory at ${canonicalDir} is present but is NOT a usable panel (no ` +
+          `readable panel pyproject.toml, or no built web bundle)`;
     return {
       ok: false,
       note:
-        ` WARNING: a panel update was interrupted, and the directory at ${canonicalDir} ` +
-        `is present but is NOT a usable panel (no readable panel pyproject.toml, or no ` +
-        `built web bundle). Nothing has been moved: discarding the staged replacement ` +
-        `at ${incomingDir} could remove the only working copy. ComfyUI serves that ` +
-        `staged copy${servingQualifier(deps, comfyuiPath)}, so the panel still loads. Inspect ${canonicalDir}, remove it if ` +
-        `it is a leftover, then re-run ` +
+        ` WARNING: a panel update was interrupted, and ${canonicalClause}. Nothing has ` +
+        `been moved: discarding the staged replacement at ${incomingDir} could remove ` +
+        `the only working copy.` +
+        servingQualifier(deps, comfyuiPath, `that staged copy`) +
+        ` Inspect ${canonicalDir}, remove it if it is a leftover, then re-run ` +
         `${describeInstallPanelAction("status", "a re-check on the ComfyUI host")}.`,
     };
   }
@@ -3540,18 +3653,25 @@ function reconcilePanelSwap(
     // Promoting an unverified tree risks installing a husk over a working panel;
     // restoring the backup would discard a replacement that may be perfectly
     // fine. So: change nothing, and say exactly what is where.
+    //
+    // "ComfyUI is serving that copy, so the panel still loads" was TWO unchecked
+    // claims in one breath — which install the running server reads, and that
+    // the copy is a working panel (this branch could not even verify it). The
+    // serving half goes through the qualifier; the loads-fine half is simply not
+    // something this branch established, so it is not said.
     return {
       ok: false,
       note:
         ` WARNING: a panel update was interrupted, and whether the replacement left at ` +
         `${incomingDir} survived intact CANNOT be determined — its integrity manifest is ` +
-        `missing or unreadable. Nothing has been moved. ComfyUI is serving that copy, so ` +
-        `the panel still loads.` +
+        `missing or unreadable. Nothing has been moved; that copy is still sitting where ` +
+        `the interrupted update left it.` +
+        servingQualifier(deps, comfyuiPath, `that copy`) +
         (journalBackup
           ? ` Your previous panel is preserved at ${journalBackup}; to go back to it: mv ` +
-            `"${journalBackup}" "${canonicalDir}" and remove "${incomingDir}".`
-          : ` No previous copy could be located under ${backupRootPath}.`) +
-        ` Then restart ComfyUI.`,
+            `"${journalBackup}" "${canonicalDir}" and remove "${incomingDir}", then restart ` +
+            `ComfyUI.`
+          : ` No previous copy could be located under ${backupRootPath}.`),
     };
   }
   if (stagedVerdict === "corrupt") {
@@ -3599,15 +3719,22 @@ function reconcilePanelSwap(
     try {
       deps.rename(journalBackup, canonicalDir);
     } catch (err) {
+      // INTEGRITY MISMATCH IS THE OBSERVATION; "INCOMPLETE" IS NOT. The manifest
+      // says these files no longer match what was staged — which a single
+      // differing README produces, with the pyproject and the served bundle
+      // perfectly fine. Refusing to promote it is right either way; calling it
+      // incomplete states a shape the check never looked at.
       return {
         ok: false,
         note:
-          ` WARNING: a panel update was interrupted, the replacement at ${incomingDir} is ` +
-          `INCOMPLETE, and your previous panel at ${journalBackup} could not be restored ` +
-          `automatically (${err instanceof Error ? err.message : String(err)}). ComfyUI ` +
-          `is still serving the incomplete copy${servingQualifier(deps, comfyuiPath)}. Move ` +
-          `"${journalBackup}" to ` +
-          `"${canonicalDir}" and remove "${incomingDir}", then restart ComfyUI.`,
+          ` WARNING: a panel update was interrupted; the replacement at ${incomingDir} ` +
+          `FAILED its integrity check — its files no longer match what was staged — and ` +
+          `your previous panel at ${journalBackup} could not be restored automatically ` +
+          `(${err instanceof Error ? err.message : String(err)}). That failed replacement ` +
+          `is still sitting at ${incomingDir}.` +
+          servingQualifier(deps, comfyuiPath, `that failed replacement`) +
+          ` Move "${journalBackup}" to "${canonicalDir}" and remove "${incomingDir}", then ` +
+          `restart ComfyUI.`,
       };
     }
     let huskCleared = true;
@@ -3626,8 +3753,9 @@ function reconcilePanelSwap(
     }
     dropJournal();
     logger.warn(
-      `[panel] an interrupted panel update left an INCOMPLETE replacement at ` +
-        `${incomingDir}; restored the previous panel from ${journalBackup} instead.`,
+      `[panel] an interrupted panel update left a replacement at ${incomingDir} that ` +
+        `FAILED its integrity check; restored the previous panel from ${journalBackup} ` +
+        `instead.`,
     );
     return {
       ok: huskCleared,
@@ -3644,8 +3772,8 @@ function reconcilePanelSwap(
           : ``) +
         (huskCleared
           ? ` Retry the update when convenient.`
-          : ` The incomplete copy at ${incomingDir} could not be removed and may SHADOW ` +
-            `the restored panel — delete that directory, then restart ComfyUI.`) +
+          : ` The rejected replacement at ${incomingDir} could not be removed and may ` +
+            `SHADOW the restored panel — delete that directory.`) +
         ` RESTART ComfyUI.`,
     };
   }
@@ -3681,9 +3809,10 @@ function reconcilePanelSwap(
       note:
         ` WARNING: a panel update was interrupted and its replacement at ${incomingDir} ` +
         `could not be moved into place (${err instanceof Error ? err.message : String(err)}). ` +
-        `ComfyUI is still serving it${servingQualifier(deps, comfyuiPath)}, so the panel ` +
-        `works, but it is not under its proper ` +
-        `name — rename it to ${canonicalDir} manually, then restart ComfyUI.`,
+        `That replacement verified intact against its staging manifest; it is simply still ` +
+        `under the staging name rather than ${canonicalDir}.` +
+        servingQualifier(deps, comfyuiPath, `that replacement`) +
+        ` Rename it to ${canonicalDir} manually, then restart ComfyUI.`,
     };
   }
 }
@@ -4155,10 +4284,11 @@ async function updateViaRegistryZipReinstall(opts: {
       `Panel update did NOT apply: ${managerReason}, and the reinstall-from-source ` +
         `fallback could not move the existing panel out of custom_nodes ` +
         `(${dir} → ${backupDir}: ${err instanceof Error ? err.message : String(err)}). ` +
-        `Your panel at ${dir} is untouched and still serving${servingQualifier(deps, comfyuiPath)}. ` +
+        `Your panel at ${dir} is untouched — nothing was moved out from under it.` +
+        servingQualifier(deps, comfyuiPath, `that panel`) +
         (cleared
-          ? `The staged replacement was discarded.`
-          : `The staged replacement at ${incomingDir} could NOT be discarded and may ` +
+          ? ` The staged replacement was discarded.`
+          : ` The staged replacement at ${incomingDir} could NOT be discarded and may ` +
             `shadow it — remove that directory, then restart ComfyUI.`) +
         ` Check permissions / that ComfyUI does not hold the directory open (stop ` +
         `ComfyUI and retry).`,
@@ -4186,9 +4316,10 @@ async function updateViaRegistryZipReinstall(opts: {
       `Panel update did NOT complete: ${managerReason}, and the reinstall-from-source ` +
         `fallback failed while moving the new panel into place ` +
         `(${incomingDir} → ${dir}: ${err instanceof Error ? err.message : String(err)}). ` +
-        `You are NOT without a panel — the new one is at ${incomingDir} and ComfyUI ` +
-        `serves it${servingQualifier(deps, comfyuiPath)}, and the previous copy is at ` +
-        `${backupDir}. Nothing was rolled back, ` +
+        `NOTHING WAS LOST: the new panel is a fully validated copy sitting at ` +
+        `${incomingDir}, and the previous copy is at ${backupDir}.` +
+        servingQualifier(deps, comfyuiPath, `that new copy`) +
+        ` Nothing was rolled back, ` +
         `because undoing this would have meant deleting the only panel in custom_nodes ` +
         `first. Re-run install_panel(action='status') to have it moved into place ` +
         `automatically, then RESTART ComfyUI.`,

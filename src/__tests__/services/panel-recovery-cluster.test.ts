@@ -1044,7 +1044,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     expect(removals).toBe(0);
     expect(aPanelIsReachable()).toBe(true);
     expect(existsSync(INCOMING())).toBe(true);
-    expect((err as Error).message).toMatch(/NOT without a panel/);
+    expect((err as Error).message).toMatch(/NOTHING WAS LOST/);
     // And the message doesn't claim a rollback that never happened.
     expect((err as Error).message).not.toMatch(/RESTORED/);
   });
@@ -1969,8 +1969,219 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     // The claim is not removed, it is QUALIFIED — and the qualifier is a single
     // shared suffix, so a new sentence about the running server inherits it by
     // construction rather than by someone remembering to guard it.
-    expect(status.note).toMatch(/could NOT be confirmed here/);
-    expect(status.note).toMatch(/assuming .* is the install ComfyUI actually runs from/);
+    expect(status.note).toMatch(
+      /Whether the running ComfyUI loads its panel from .* could NOT be confirmed here/,
+    );
+    // AND THE CLAUSES AGREE. The first revision asserted and then retracted
+    // ("ComfyUI is currently serving that staged copy (assuming … could NOT be
+    // confirmed)"), which a reader skims straight past. The serving claim now
+    // lives only inside the qualifier, so from an unconfirmed root NO sentence
+    // asserts what the running server is doing.
+    expect(status.note).not.toMatch(/ComfyUI is (currently |still )?serving/);
+    expect(status.note).not.toMatch(/ComfyUI serves that/);
+    expect(status.note).not.toMatch(/is what ComfyUI will load/);
+    expect(status.note).not.toMatch(/assuming .* is the install ComfyUI actually runs from/);
+  });
+
+  it("a LIVE-derived root does earn the present tense, in the same sentence slot", async () => {
+    // The other direction of the same property: only a live-derived root gets
+    // the plain assertion, and it arrives through the identical suffix rather
+    // than from a sentence written for the occasion.
+    stageIncoming("0.11.38");
+    workspace.base = root;
+    workspace.reachable = true; // the running server itself named this tree
+    workspace.liveArgv = [`${root}/main.py`];
+    __resetPanelBaseCache();
+    await primePanelBase();
+    const { panelStatus } = await import("../../services/panel-installer.js");
+    const status = await panelStatus();
+    expect(status.note).toMatch(
+      /The running ComfyUI loads its panel from .*, so that staged copy is in the tree it serves/,
+    );
+    expect(status.note).not.toMatch(/could NOT be confirmed here/);
+  });
+
+  it("the 'your existing panel looks complete' report goes through the qualifier too", async () => {
+    // This sentence bypassed the suffix entirely and asserted "is what ComfyUI
+    // will load" — a claim about the running server, and about a shadow it had
+    // not resolved, from a root that may be configured-only.
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    stageIncoming("0.11.38");
+    const { panelStatus } = await import("../../services/panel-installer.js");
+    const status = await panelStatus(makeDeps({}).deps);
+    expect(status.note).toMatch(/looks complete/);
+    expect(status.note).toMatch(/is in the tree it serves/);
+    expect(status.note).not.toMatch(/is what ComfyUI will load/);
+  });
+
+  it("the unverifiable branch says where the copy IS, not what it does", async () => {
+    // "ComfyUI is serving that copy, so the panel still loads" was two unchecked
+    // claims: which install the server reads, and that the copy works — in the
+    // one branch that could not verify the copy at all.
+    stageIncoming("0.11.38");
+    rmSync(join(INCOMING(), ".comfyui-mcp-integrity.json"));
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
+    expect(note).toMatch(/CANNOT be determined/);
+    expect(note).toMatch(/is in the tree it serves/); // via the shared qualifier
+    expect(note).not.toMatch(/ComfyUI is serving that copy/);
+    expect(note).not.toMatch(/the panel still loads/);
+    expect(existsSync(INCOMING())).toBe(true); // and it still moved nothing
+  });
+
+  it("a regular FILE at the canonical name is reported as one, not as an absence", async () => {
+    // `dirPresence` answers four states so this could be said precisely, and
+    // then the consumer collapsed "other" back into "absent": a file positively
+    // observed at that path was reported as "There is no panel at <path>".
+    stageIncoming("0.11.38");
+    rmSync(join(INCOMING(), ".comfyui-mcp-integrity.json")); // staged: unverifiable
+    writeFileSync(PANEL_DIR(), "not a directory\n");
+    const { panelStatus } = await import("../../services/panel-installer.js");
+    const status = await panelStatus(makeDeps({}).deps);
+    expect(status.note).toMatch(/There is a FILE, not a directory, at/);
+    expect(status.note).not.toMatch(/There is no panel at/);
+  });
+
+  it("an unreadable canonical dir is refused WITHOUT being called 'NOT a usable panel'", async () => {
+    // Both halves of the split in one assertion: the decision stays fail-closed
+    // (nothing is moved), and the sentence stops stating a verdict the read
+    // never reached.
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    stageIncoming("0.11.38");
+    const h = makeDeps({});
+    const realDigest = h.deps.fileDigest!;
+    const bundle = join(PANEL_DIR(), "web", "js", "comfyui-mcp-panel.js");
+    h.deps.fileDigest = (p) => (p === bundle ? undefined : realDigest(p));
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(h.deps);
+    expect(note).toMatch(/could NOT be determined/);
+    expect(note).toMatch(/not a finding that it is broken/);
+    expect(note).not.toMatch(/is NOT a usable panel/);
+    expect(existsSync(INCOMING())).toBe(true); // decision unchanged: refused
+    expect(existsSync(PANEL_DIR())).toBe(true);
+  });
+
+  it("a failed identity probe is not reported as 'there is NO panel'", async () => {
+    // Stale journal, no `.incoming`, and a REAL panel at the canonical name
+    // whose pyproject cannot be read. The probe failed; it established nothing.
+    const backupDir = backupPath("0.11.34");
+    writePanelPack(backupDir, "0.11.34");
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    writeFileSync(
+      join(root, ".comfyui-agent-panel.swap.json"),
+      JSON.stringify({ dir: PANEL_DIR(), backupDir, staging: "x", startedAt: Date.now() }),
+    );
+    const h = makeDeps({});
+    const realRead = h.deps.readFile;
+    const pyprojectPath = join(PANEL_DIR(), "pyproject.toml");
+    h.deps.readFile = (p) => {
+      if (p === pyprojectPath) throw new Error("EACCES");
+      return realRead(p);
+    };
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(h.deps);
+    expect(note).toMatch(/whether a panel remains at .* could NOT be determined/);
+    expect(note).not.toMatch(/there is NO panel at/);
+    // …and the instruction derived from that undetermined state says so too,
+    // rather than telling someone to mv over a path that may hold their panel.
+    expect(note).toMatch(/ONLY once you have confirmed .* holds no panel/);
+    expect(note).toContain(backupDir);
+    // Still refuses to move anything — the ruling is untouched.
+    expect(existsSync(join(root, ".comfyui-agent-panel.swap.json"))).toBe(true);
+    expect(existsSync(backupDir)).toBe(true);
+  });
+
+  it("the bring-your-own-copy instruction is gated on emptiness too, not just the restore", async () => {
+    // The twin of the above with NO backup to offer. Guarding one command of a
+    // pair and leaving the other bare is the pointwise mistake this file keeps
+    // paying for: "move it to <path>" over a directory the probe could not read
+    // can overwrite the panel it failed to assess.
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    writeFileSync(
+      join(root, ".comfyui-agent-panel.swap.json"),
+      JSON.stringify({
+        dir: PANEL_DIR(),
+        backupDir: backupPath("0.11.34"), // named, but never written
+        staging: "x",
+        startedAt: Date.now(),
+      }),
+    );
+    const h = makeDeps({});
+    const realRead = h.deps.readFile;
+    const pyprojectPath = join(PANEL_DIR(), "pyproject.toml");
+    h.deps.readFile = (p) => {
+      if (p === pyprojectPath) throw new Error("EACCES");
+      return realRead(p);
+    };
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(h.deps);
+    expect(note).toMatch(/could NOT be determined/);
+    expect(note).toMatch(/If you confirm .* holds no panel and you have a copy elsewhere/);
+    // The unconditional form must be gone from this branch.
+    expect(note).not.toMatch(/Nothing has been moved\. If you have a copy elsewhere/);
+    expect(existsSync(pyprojectPath)).toBe(true); // and nothing was touched
+  });
+
+  it("a LATER read that DOES find the panel is disclosed, not called a failed read", async () => {
+    // `panelIdentityVerdict` has three answers and the consumer had two: folding
+    // `panel` in with `unreadable` would report "that directory could not be
+    // read" about a directory this very probe just read and identified.
+    const backupDir = backupPath("0.11.34");
+    writePanelPack(backupDir, "0.11.34");
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    writeFileSync(
+      join(root, ".comfyui-agent-panel.swap.json"),
+      JSON.stringify({ dir: PANEL_DIR(), backupDir, staging: "x", startedAt: Date.now() }),
+    );
+    const h = makeDeps({});
+    // The deciding predicate reads `false` (its existsSync gate misses), while
+    // the later verdict probe reads the file fine — two observations, taken at
+    // different moments, disagreeing.
+    const pyprojectPath = join(PANEL_DIR(), "pyproject.toml");
+    h.deps.existsSync = (p) => (p === pyprojectPath ? false : existsSync(p));
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(h.deps);
+    expect(note).toMatch(/DID find the panel's pyproject\.toml there/);
+    expect(note).toMatch(/two readings of it disagree/);
+    expect(note).not.toMatch(/could not be read/);
+    expect(note).not.toMatch(/there is NO panel at/);
+    // The refusal is unchanged: the journal stays, nothing moves.
+    expect(note).toMatch(/ONLY once you have confirmed/);
+    expect(existsSync(join(root, ".comfyui-agent-panel.swap.json"))).toBe(true);
+    expect(existsSync(PANEL_DIR())).toBe(true);
+    expect(existsSync(backupDir)).toBe(true);
+  });
+
+  it("a manifest mismatch is an integrity failure, never an 'INCOMPLETE' copy", async () => {
+    // A differing README yields `corrupt` correctly — with the pyproject and the
+    // served bundle both fine. "Incomplete" describes a shape the check never
+    // looked at.
+    const backupDir = backupPath("0.11.34");
+    writePanelPack(backupDir, "0.11.34");
+    stageIncoming("0.11.38");
+    writeFileSync(join(INCOMING(), "README.md"), "changed after staging\n");
+    const h = makeDeps({});
+    h.deps.rename = () => {
+      throw new Error("EACCES on restore");
+    };
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(h.deps);
+    expect(note).toMatch(/FAILED its integrity check/);
+    expect(note).toMatch(/no longer match what was staged/);
+    expect(note).not.toMatch(/INCOMPLETE/);
+    expect(note).not.toMatch(/incomplete copy/);
   });
 
   it("with NO validated backup, the message names no path at all", async () => {
