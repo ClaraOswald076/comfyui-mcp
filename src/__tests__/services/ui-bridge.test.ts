@@ -1148,6 +1148,27 @@ describe("UiBridge (multi-tab)", () => {
       sockA.close();
       sockB.close();
     });
+
+    it("follows a migration CHAIN, and a revoke of a superseded hop is inert", async () => {
+      const { sockA, sockB } = await twoTabsWithAActive();
+      // wf:aaa → tmp:mid → wf:ccc, all on the SAME socket (the reported id-scheme chain).
+      sockA.send(JSON.stringify({ type: "hello", tab_id: "tmp:mid" }));
+      await vi.waitFor(() => expect(bridge.resolveActiveTabId()).toBe("tmp:mid"));
+      sockA.send(JSON.stringify({ type: "hello", tab_id: "wf:ccc" }));
+      await vi.waitFor(() => expect(bridge.resolveActiveTabId()).toBe("wf:ccc"));
+
+      // Revoking the FIRST (already superseded) hop must not touch the live selection:
+      // the carry it recorded was overwritten by the second hop, and only the write
+      // SEQUENCE distinguishes "my carry is still current" from "it was superseded".
+      bridge.revokeTabMigration("wf:aaa");
+      expect(bridge.resolveActiveTabId()).toBe("wf:ccc");
+
+      // Revoking the hop that actually produced the live selection DOES clear it.
+      bridge.revokeTabMigration("tmp:mid");
+      expect(() => bridge.resolveActiveTabId()).toThrow(/none is "last active"/);
+      sockA.close();
+      sockB.close();
+    });
   });
 
   it("follows MIGRATION CHAINS: uuid → tmp: → wf: (the exact #210 field sequence)", async () => {
