@@ -1604,9 +1604,14 @@ export async function repairInterruptedPanelSwap(
   // Declared OUTSIDE the try so the catch can still report a repair that
   // already landed on disk before something later threw.
   const performed: { note?: string } = {};
+  // The root this call actually examined, captured for the catch: a retarget is
+  // the likeliest reason we end up there, and re-resolving would describe the
+  // NEW install while the swap we found is under the old one.
+  const examined: { base?: string } = {};
   try {
     const pinned = await pinPanelBase(deps);
     const base = pinned.comfyuiPath();
+    examined.base = base;
     if (!base || !pinned.isLocalMode()) return undefined;
     // Cheap pre-check, no lock: is there anything to look at? Gated on EITHER
     // marker — the in-flight directory is the authority (a journal can be lost
@@ -1678,7 +1683,14 @@ export async function repairInterruptedPanelSwap(
     // ABSOLUTE PATHS, not directory names. This is the message a user gets when
     // their panel is missing, and "look in custom_nodes" is not something they
     // can act on — the point of disclosing is that they can find the thing.
-    const root = panelBaseSync();
+    //
+    // THE PINNED ROOT, not a fresh resolution. The most likely reason we are in
+    // this catch is that the target changed mid-repair — which is exactly when
+    // `panelBaseSync()` returns the NEW root, so the paths handed to the user
+    // would describe install B while the interrupted swap we detected is under
+    // install A. A disclosed refusal whose recovery paths point at the wrong
+    // machine is the same defect as inventing a location.
+    const root = examined.base;
     const incomingPath = root
       ? join(root, "custom_nodes", PANEL_INCOMING_NAME)
       : `<ComfyUI>/custom_nodes/${PANEL_INCOMING_NAME}`;
@@ -1798,7 +1810,7 @@ export async function panelStatus(
         // same breath as telling them their previous panel was preserved and
         // exactly how to put it back: two contradictory instructions, the
         // destructive-sounding one first. The swap note carries the full remedy.
-        `No panel is currently installed at ${comfyuiPath ?? "custom_nodes"}, and an ` +
+        `No panel was FOUND at ${comfyuiPath ?? "custom_nodes"}, and an ` +
         `unresolved panel update is the likely reason — see the WARNING below BEFORE ` +
         `installing a fresh copy.`
       : detection.scanReliable === false
@@ -2710,6 +2722,25 @@ interface SwapReconcileResult {
  * one, so using it to resolve the canonical panel directory let an unrelated
  * node occupying `custom_nodes/comfyui-mcp-panel` be selected as the panel.
  */
+/**
+ * Tri-state presence of a DIRECTORY: true / false / undefined ("could not tell").
+ *
+ * `existsSync` alone cannot express the third answer — it folds EACCES, EIO and
+ * every other error into `false`, which is how an unreadable directory came to
+ * be reported as an absent one. `probeFile` is the probe whose FALSE is a real
+ * determination (ENOENT/ENOTDIR, or "it is a directory"), so it supplies the
+ * indeterminate case, and `existsSync` distinguishes present-directory from
+ * absent once we know the probe itself succeeded.
+ *
+ * Every status claim about whether something is THERE goes through this, because
+ * a claim is only as strong as the observation behind it: an observation that
+ * failed must weaken the sentence, never quietly become its negative.
+ */
+function dirPresence(p: string, deps: PanelInstallerDeps): boolean | undefined {
+  if (deps.probeFile(p) === undefined) return undefined;
+  return deps.existsSync(p);
+}
+
 /** The panel version recorded in a directory's pyproject, if readable. */
 function readPanelVersionAt(
   dir: string,
@@ -3096,7 +3127,22 @@ function reconcilePanelSwap(
 ): SwapReconcileResult {
   const journalPath = swapJournalPath(comfyuiPath);
   const incomingDir = join(comfyuiPath, "custom_nodes", PANEL_INCOMING_NAME);
-  const incomingPresent = deps.existsSync(incomingDir);
+  // TRI-STATE, so an unreadable staged directory cannot be reported as absent.
+  // "There is no interrupted swap" and "we could not tell whether there is one"
+  // lead to opposite messages, and only one of them is safe to guess.
+  const incomingState = dirPresence(incomingDir, deps);
+  if (incomingState === undefined) {
+    return {
+      ok: false,
+      note:
+        ` WARNING: whether a panel update was interrupted could NOT be determined — ` +
+        `"${incomingDir}" could not be inspected. Nothing has been changed, and no ` +
+        `conclusion about your panel should be drawn from this report. Check that ` +
+        `${join(comfyuiPath, "custom_nodes")} is readable, then re-run ` +
+        `${describeInstallPanelAction("status", "a re-check on the ComfyUI host")}.`,
+    };
+  }
+  const incomingPresent = incomingState;
 
   const readJournal = (): PanelSwapJournal | undefined => {
     if (!deps.existsSync(journalPath)) return undefined;
@@ -3123,6 +3169,19 @@ function reconcilePanelSwap(
   // effects survive. The journal is now only a convenience — it names where the
   // old copy went — and is never, on its own, grounds to move anything.
   if (!incomingPresent) {
+    // The journal is advisory, but "there is no journal" is still a CLAIM, and
+    // an unreadable one must not become it — that is what would let a genuinely
+    // interrupted state be reported as nothing at all.
+    if (deps.probeFile(journalPath) === undefined) {
+      return {
+        ok: false,
+        note:
+          ` WARNING: no staged replacement is present, but whether a panel swap record ` +
+          `exists could NOT be determined — "${journalPath}" could not be inspected. ` +
+          `Nothing has been changed. Check that ${comfyuiPath} is readable, then re-run ` +
+          `${describeInstallPanelAction("status", "a re-check on the ComfyUI host")}.`,
+      };
+    }
     const stale = readJournal();
     if (!stale) return { ok: true };
     // DERIVED, not taken from the journal. Asking `existsSync(stale.dir)` let an
@@ -3229,7 +3288,11 @@ function reconcilePanelSwap(
   // has to be PROVEN fine: a real panel pyproject and the built web bundle
   // ComfyUI actually serves. A husk left by a half-finished move, or a directory
   // someone emptied, would otherwise cost the user the only working copy.
-  const canonicalPresent = deps.existsSync(canonicalDir);
+  // Tri-state as well: an unreadable-but-present panel must not be announced as
+  // "there is no panel at <path>".
+  const canonicalState = dirPresence(canonicalDir, deps);
+  const canonicalPresent = canonicalState === true;
+  const canonicalUnknown = canonicalState === undefined;
   const canonicalUsable = canonicalPresent && dirHasPanelFiles(canonicalDir, deps);
 
   // REPAIR ONLY UNDER THE OP LOCK. panelStatus is called from many places and
@@ -3245,6 +3308,32 @@ function reconcilePanelSwap(
     // happen, in the one message a worried user is reading.
     const canonicalWorks = canonicalUsable;
     const stagedVerdictForReport = verifyStagedTree(incomingDir, deps);
+
+    // WHERE THE PREVIOUS COPY IS — or plainly that we could not find one.
+    // `journalBackup ?? <backup root>` invented a location: with no validated
+    // backup (an interrupted FIRST install, or a backup since lost) it still
+    // asserted the panel "is at" a directory that may hold nothing. That is
+    // worse than saying nothing, because it ends the user's search somewhere
+    // empty — and the whole reason a manual-recovery residual is acceptable is
+    // that the message tells them where the copy actually is.
+    const backupSentence = journalBackup
+      ? `the previous panel is preserved at ${journalBackup}`
+      : `NO preserved copy of the previous panel could be found under ` +
+        `${backupRootPath} — do not assume one is there`;
+
+    // AND WHAT WE CAN SAY ABOUT SERVING. Manifest integrity proves this TREE
+    // matches what we staged; it proves nothing about which install the running
+    // ComfyUI serves. The root here may be a configured one the live server
+    // never confirmed, so "ComfyUI is currently serving that staged copy" was
+    // evidence about one subject presented as evidence about another. Only the
+    // live-derived case earns the present tense.
+    const servingRootConfirmed =
+      !isRealDeps(deps) || isLiveDerivedBase(lastPanelBaseResolution());
+    const servedPhrase = servingRootConfirmed
+      ? `ComfyUI is currently serving that staged copy`
+      : `ComfyUI will be serving that staged copy IF ${comfyuiPath} is the install ` +
+        `it runs from (that could not be confirmed here)`;
+
     return {
       ok: false,
       note:
@@ -3253,20 +3342,21 @@ function reconcilePanelSwap(
           canonicalWorks
             ? `Your existing panel at ${canonicalDir} looks complete and is what ComfyUI ` +
               `will load once the staged copy is cleared.`
-            : canonicalPresent
-              ? `The directory at ${canonicalDir} is present but does NOT look like a ` +
-                `working panel.`
-              : stagedVerdictForReport === "intact"
-                ? `ComfyUI is currently serving that staged copy, which verifies intact; ` +
-                  `the previous panel is at ` +
-                  `${journalBackup ?? join(comfyuiPath, "custom_nodes_backup")}.`
-                : `There is no panel at ${canonicalDir}, and the staged copy ` +
-                  `${
-                    stagedVerdictForReport === "corrupt"
-                      ? "did NOT survive intact"
-                      : "could NOT be verified"
-                  }; the previous panel is at ` +
-                  `${journalBackup ?? join(comfyuiPath, "custom_nodes_backup")}.`
+            : canonicalUnknown
+              ? `Whether a panel remains at ${canonicalDir} could NOT be determined — that ` +
+                `directory could not be inspected, so do not read this as it being absent. ` +
+                `${backupSentence}.`
+              : canonicalPresent
+                ? `The directory at ${canonicalDir} is present but does NOT look like a ` +
+                  `working panel.`
+                : stagedVerdictForReport === "intact"
+                  ? `${servedPhrase}, and it verifies intact; ${backupSentence}.`
+                  : `There is no panel at ${canonicalDir}, and the staged copy ` +
+                    `${
+                      stagedVerdictForReport === "corrupt"
+                        ? "did NOT survive intact"
+                        : "could NOT be verified"
+                    }; ${backupSentence}.`
         } Run ${describeInstallPanelAction("update", "an update on the ComfyUI host")} ` +
         `to finish or undo it automatically.`,
     };

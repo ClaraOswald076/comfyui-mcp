@@ -1851,6 +1851,74 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     expect(result.action).not.toBe("installed"); // it did not install a second copy
   });
 
+  // ── Status claims must trace to observations that were actually made ───────
+  //
+  // Every claim in a status message has to be backed by an observation that
+  // succeeded. An observation that FAILED must weaken the sentence — it must
+  // never quietly become the negative, and it must never license asserting
+  // something that was not looked at.
+
+  it("an UNREADABLE .incoming is not reported as 'no interrupted swap'", async () => {
+    // existsSync folds EACCES into false, so status said "Not installed." for a
+    // user whose panel was in backup and whose staged copy was merely
+    // unreadable — a fabricated absence, on the worried-user path.
+    writePanelPack(backupPath("0.11.34"), "0.11.34");
+    const h = makeDeps({ withoutSwapOps: true });
+    h.deps.probeFile = (p) => (p.endsWith(".incoming") ? undefined : true);
+    const { panelStatus } = await import("../../services/panel-installer.js");
+    const status = await panelStatus(h.deps);
+    expect(status.note).toMatch(/could NOT be determined/);
+    expect(status.note).not.toMatch(/Not installed\./);
+  });
+
+  it("an UNREADABLE journal is not reported as 'no swap record'", async () => {
+    const h = makeDeps({ withoutSwapOps: true });
+    h.deps.probeFile = (p) => (p.endsWith(".swap.json") ? undefined : false);
+    const { panelStatus } = await import("../../services/panel-installer.js");
+    const status = await panelStatus(h.deps);
+    expect(status.note).toMatch(/could NOT be determined/);
+  });
+
+  it("an UNREADABLE canonical panel is not reported as 'there is no panel at'", async () => {
+    stageIncoming("0.11.38");
+    const h = makeDeps({ withoutSwapOps: true });
+    h.deps.probeFile = (p) =>
+      p === PANEL_DIR() ? undefined : statSync(p).isFile();
+    const { panelStatus } = await import("../../services/panel-installer.js");
+    const status = await panelStatus(h.deps);
+    expect(status.note).toMatch(/could NOT be determined/);
+    expect(status.note).not.toMatch(/There is no panel at/);
+  });
+
+  it("does NOT claim ComfyUI is serving the staged copy from an unconfirmed root", async () => {
+    // Manifest integrity proves this TREE matches what we staged. It proves
+    // nothing about which install the running ComfyUI serves.
+    stageIncoming("0.11.38");
+    workspace.base = root;
+    workspace.reachable = false; // configured root, never confirmed by the server
+    __resetPanelBaseCache();
+    await primePanelBase();
+    const { panelStatus } = await import("../../services/panel-installer.js");
+    const status = await panelStatus();
+    expect(status.note).not.toMatch(/ComfyUI is currently serving/);
+    expect(status.note).toMatch(/IF .* is the install it runs from/);
+  });
+
+  it("with NO validated backup, the message names no path at all", async () => {
+    // `journalBackup ?? <backup root>` invented a location — asserting the
+    // previous panel "is at" a directory that may hold nothing, which ends the
+    // user's search somewhere empty. The whole reason a manual-recovery
+    // residual is acceptable is that we say where the copy actually is.
+    stageIncoming("0.11.38");
+    corruptStagedBundle(); // no canonical, staged unusable, and no backup exists
+    const { panelStatus } = await import("../../services/panel-installer.js");
+    const status = await panelStatus(makeDeps({ withoutSwapOps: true }).deps);
+    expect(status.note).toMatch(/NO preserved copy of the previous panel could be found/);
+    expect(status.note).toMatch(/do not assume one is there/);
+    // And it must not assert a location for a copy it never found.
+    expect(status.note).not.toMatch(/previous panel is preserved at/);
+  });
+
   it("a bare panelStatus still only REPORTS — it holds no lock, so it must not move directories", async () => {
     stageIncoming("0.11.38");
     const { panelStatus } = await import("../../services/panel-installer.js");
