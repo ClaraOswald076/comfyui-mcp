@@ -4409,6 +4409,40 @@ describe("panel_ask keeps a validated answer across a tool timeout (#486)", () =
     expect(AskAnswers.orphansFor(TAB).some((e) => e.answer === "dpmpp_2m")).toBe(true);
   });
 
+  // Gate: a rid proves WHICH CARD replied — it says nothing about whose
+  // conversation is live. An ask retired while its request was still pending (a
+  // different browser tab took the recurring key over, a New chat, a rewind)
+  // must not have its answer handed back through the tool-result channel, which
+  // is the one path a conversation boundary does not otherwise police.
+  it("an answer arriving after its conversation was replaced is reported, not returned", async () => {
+    let askId: string | null = null;
+    const bridge = {
+      send: async (cmd: Record<string, unknown>) => {
+        askId = String(cmd.ask_id);
+        // The boundary lands while this request is still in flight…
+        AskAnswers.closeAsks(TAB);
+        // …and only then does the user click, resolving THIS send's own rid.
+        return "dpmpp_2m";
+      },
+      canReach: () => true,
+      isHeadless: () => false,
+      resolveActiveTabId: () => TAB,
+      takeLateAskReply: () => undefined,
+      push: () => 1,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx: PanelToolCtx = { bridge, tabId: TAB } as unknown as PanelToolCtx;
+
+    const res = await defByName("panel_ask").handler(SAMPLER as Record<string, unknown>, ctx);
+    expect(askId).not.toBeNull();
+    expect(res.isError).toBe(true);
+    expect(askText(res)).toMatch(/conversation that asked it has been replaced/i);
+    // Reported, never swallowed — the pick is quoted, attributed to the
+    // conversation it was actually given to.
+    expect(askText(res)).toContain("dpmpp_2m");
+    // …and it was not counted as delivered to anyone.
+    expect(AskAnswers.entriesFor(TAB)[0].returned).toBe(false);
+  });
+
   it("holds the WHOLE handler under one wall-clock ceiling anchored at entry", () => {
     // The card deadline and the grace poll used to be additive on top of
     // everything else, so a bounded ask could still overrun the enclosing

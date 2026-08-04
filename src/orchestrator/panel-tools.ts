@@ -4039,6 +4039,28 @@ async function askUserWithGrace(
     // The rid-correlated path is exempt and deliberately so: a reply that came
     // back on THIS send's own request id is this card's reply by construction,
     // whatever the ask id has meant elsewhere.
+    //
+    // A CONVERSATION BOUNDARY is a different exemption, and the rid does NOT
+    // cover it. A rid proves WHICH CARD replied; it says nothing about whose
+    // conversation is live now. If this ask was retired while its request was
+    // still pending — most concretely, a different browser tab took the
+    // recurring key over — then returning the pick here hands it straight into
+    // the conversation the boundary exists to keep it out of, through the one
+    // channel the boundary does not police. So the journal's verdict governs
+    // both paths.
+    if (entry.recoverable === false) {
+      return fail(
+        withDroppedText(
+          tabId,
+          `The user answered this question card, but the conversation that asked it has been ` +
+            `replaced since (a new chat, a rewind, a provider switch, or a different browser tab ` +
+            `taking over this workflow). The answer is NOT being returned as yours, because the ` +
+            `question is no longer one this conversation asked.\n\n` +
+            `WHAT THE USER PICKED (for the REPLACED conversation): ${entry.answer}\n\n` +
+            `Ask again if you still need this decision.`,
+        ),
+      );
+    }
     if (!opts.ridCorrelated && entry.correlation.status !== "matched") {
       // NOT marked returned: nobody has been given this as an answer, so it stays
       // an orphan — pushed and disclosed — rather than quietly counting as
