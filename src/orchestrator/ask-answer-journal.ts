@@ -1103,7 +1103,7 @@ export class AskAnswerJournalImpl {
     if (entry.disclose) {
       const owed = entry.disclose;
       delete entry.disclose;
-      if (entry.attempts === 0) this.noteDropped(entry.key, owed);
+      if (entry.attempts === 0) this.noteDropped(entry.key, owed, entry.incarnation);
     }
     entry.delivery = "none";
     entry.returned = true;
@@ -1398,8 +1398,8 @@ export class AskAnswerJournalImpl {
     this.tickets.delete(askId);
   }
   /** Strand an eviction debt on a tab without staging 48 evictions. */
-  noteDroppedForTest(key: string, count: number): void {
-    this.dropped.set(this.debtSlot(key), (this.dropped.get(this.debtSlot(key)) ?? 0) + count);
+  noteDroppedForTest(key: string, count: number, incarnation?: string): void {
+    this.noteDropped(key, count, incarnation ?? this.incarnationOf?.(key));
   }
   /** Record + hand back in one step, returning the token. */
   markReturnedForTest(askId: string, reply: unknown, tabId: string): string {
@@ -1453,16 +1453,24 @@ export class AskAnswerJournalImpl {
    * PENDING entry when there is one — it then rides out on a real delivery and
    * cannot be discarded.
    */
-  private noteDropped(key: string, count = 1): void {
+  private noteDropped(key: string, count: number, incarnation: string | undefined): void {
     if (count <= 0) return;
+    // THE LOSS BELONGS TO THE OCCUPANT IT HAPPENED TO, and that is carried in,
+    // never re-derived from the key at write time. The bucket is keyed by
+    // incarnation, so deriving an owner here would file A's loss under whoever
+    // holds the key NOW — B is then pushed A's `dropped_answers`, B's ack clears
+    // it, and A's own lifecycle callback (which retires A's bucket) finds
+    // nothing left to disclose. Keying the bucket and then guessing the key is
+    // the same halfway pattern as scoping the clock but not the debt.
     const carrier = [...this.entries.values()].find(
-      (e) => e.key === key && e.delivery === "pending",
+      (e) => e.key === key && e.delivery === "pending" && e.incarnation === incarnation,
     );
     if (carrier) {
       carrier.disclose = (carrier.disclose ?? 0) + count;
       return;
     }
-    this.dropped.set(this.debtSlot(key), (this.dropped.get(this.debtSlot(key)) ?? 0) + count);
+    const slot = tabIncarnationSlot(key, incarnation);
+    this.dropped.set(slot, (this.dropped.get(slot) ?? 0) + count);
     // NO CEILING HERE, deliberately.
     //
     // This map is not payload — it is the PROMISE that a loss will be reported,
@@ -1514,13 +1522,13 @@ export class AskAnswerJournalImpl {
           // answer's own recoverability is what may be forgotten, never the debt
           // owed for EARLIER answers that reached nobody and merely happened to
           // be stamped on this entry.
-          if (victim.disclose) this.noteDropped(victim.key, victim.disclose);
+          if (victim.disclose) this.noteDropped(victim.key, victim.disclose, victim.incarnation);
           logger.debug(
             `[ask-answers] ${label} — forgetting an answer to "${preview(victim.question)}" that the agent provably read`,
           );
           continue;
         }
-        this.noteDropped(victim.key, 1 + (victim.disclose ?? 0));
+        this.noteDropped(victim.key, 1 + (victim.disclose ?? 0), victim.incarnation);
         logger.error(
           `[ask-answers] ${label} — dropped a VALIDATED answer to "${preview(victim.question)}"${victim.returned ? " that went into a tool call whose receipt was never confirmed" : " that had reached nobody"}; the next delivery will report it as undetermined`,
         );

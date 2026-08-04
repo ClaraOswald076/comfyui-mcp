@@ -3178,46 +3178,54 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
   // retired live per-tab bookkeeping (the eviction-disclosure debt) during every
   // reload, so the reconnected conversation kept the answer and lost the warning
   // that an answer had been dropped — the worst possible split.
-  it("an ordinary reload does NOT declare the tab gone", () => {
-    return (async () => {
-      const gone: string[] = [];
-      bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: 300 });
-      const sock = await connectPanel("tab-reload", "wf", { tabSessionId: "browser-tab-A" });
-      await vi.waitFor(() =>
-        expect(bridge.tabs().some((t) => t.tab_id === "tab-reload")).toBe(true),
-      );
+  // THE GONE-CLOCK TESTS CONTROL TIME RATHER THAN RACING IT.
+  //
+  // These are the one behaviour here defined by elapsed time, and a raced grace
+  // fails both ways: too short and it fails on a CORRECT implementation, too long
+  // and a timer that fires before the successor's hello lands makes a broken
+  // cancel look caught — a false pass, which is worse, because a mutation
+  // "verified" through it was never verified at all. So every test below sets a
+  // grace no run can reach, waits for the state it cares about to be PROVABLY
+  // reached, and only then runs the clocks.
+  const NEVER = 600_000;
+  /** The bridge has finished registering `incarnation` on `tabId`. */
+  const occupied = (tabId: string, incarnation: string) =>
+    vi.waitFor(() => expect(bridge.tabIncarnation(tabId)).toBe(incarnation));
+  const vacant = (tabId: string) =>
+    vi.waitFor(() => expect(bridge.tabIncarnation(tabId)).toBeUndefined());
 
-      // F5: the socket closes and the SAME browser tab re-hellos moments later.
-      // Its `tab_session_id` lives in sessionStorage, so it comes back unchanged.
-      sock.close();
-      await vi.waitFor(() =>
-        expect(bridge.tabs().some((t) => t.tab_id === "tab-reload")).toBe(false),
-      );
-      const back = await connectPanel("tab-reload", "wf", { tabSessionId: "browser-tab-A" });
-      await vi.waitFor(() =>
-        expect(bridge.tabs().some((t) => t.tab_id === "tab-reload")).toBe(true),
-      );
+  it("an ordinary reload does NOT declare the tab gone", async () => {
+    const gone: string[] = [];
+    bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: NEVER });
+    const sock = await connectPanel("tab-reload", "wf", { tabSessionId: "browser-tab-A" });
+    await occupied("tab-reload", "browser-tab-A");
 
-      // Well past the grace: the tab came back, so it was never gone.
-      await new Promise((r) => setTimeout(r, 600));
-      expect(gone).toEqual([]);
-      back.close();
-      bridge.setTabGoneListener(() => {});
-    })();
+    // F5: the socket closes and the SAME browser tab re-hellos. Its
+    // `tab_session_id` is sessionStorage-backed, so it comes back unchanged.
+    sock.close();
+    await vacant("tab-reload");
+    const back = await connectPanel("tab-reload", "wf", { tabSessionId: "browser-tab-A" });
+    // The reconnect is COMPLETE before the clock is allowed to run — otherwise a
+    // pass would prove only that the timer won a race.
+    await occupied("tab-reload", "browser-tab-A");
+
+    bridge.__runTabGoneClocksForTest();
+    expect(gone).toEqual([]);
+    back.close();
+    bridge.setTabGoneListener(() => {});
   });
 
-  it("a tab that stays away IS declared gone, once the grace elapses", async () => {
+  it("a tab that stays away IS declared gone", async () => {
     const gone: string[] = [];
-    bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: 150 });
+    bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: NEVER });
     const sock = await connectPanel("tab-really-gone", "wf", { tabSessionId: "browser-tab-Z" });
-    await vi.waitFor(() =>
-      expect(bridge.tabs().some((t) => t.tab_id === "tab-really-gone")).toBe(true),
-    );
+    await occupied("tab-really-gone", "browser-tab-Z");
     sock.close();
-    // Nothing at the moment of the close…
-    expect(gone).toEqual([]);
-    // …and only after the tab has genuinely stayed away.
-    await vi.waitFor(() => expect(gone).toEqual(["tab-really-gone"]), { timeout: 3000 });
+    await vacant("tab-really-gone");
+    expect(gone).toEqual([]); // nothing at the moment of the close
+
+    bridge.__runTabGoneClocksForTest();
+    expect(gone).toEqual(["tab-really-gone"]);
     bridge.setTabGoneListener(() => {});
   });
 
@@ -3229,21 +3237,20 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
   // report and settle the departed tab's lost-answer disclosure as its own.
   it("a DIFFERENT browser tab taking over the same key does not cancel the departed tab's clock", async () => {
     const gone: string[] = [];
-    bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: 250 });
+    bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: NEVER });
     const tabA = await connectPanel("wf:shared", "wf", { tabSessionId: "browser-tab-A" });
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:shared")).toBe(true));
-
-    // A goes away…
+    await occupied("wf:shared", "browser-tab-A");
     tabA.close();
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:shared")).toBe(false));
-    // …and a DIFFERENT browser tab opens the same saved workflow before the grace
-    // elapses, taking over the recurring key.
-    const tabB = await connectPanel("wf:shared", "wf", { tabSessionId: "browser-tab-B" });
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:shared")).toBe(true));
+    await vacant("wf:shared");
 
-    // A is still gone, and must be declarable so — even though something now
-    // holds its key.
-    await vi.waitFor(() => expect(gone).toEqual(["wf:shared"]), { timeout: 3000 });
+    // A DIFFERENT browser tab opens the same saved workflow, taking over the
+    // recurring key. Its hello is PROVABLY complete before the clock runs, so a
+    // pass means the cancel really did decline — not that it lost a race.
+    const tabB = await connectPanel("wf:shared", "wf", { tabSessionId: "browser-tab-B" });
+    await occupied("wf:shared", "browser-tab-B");
+
+    bridge.__runTabGoneClocksForTest();
+    expect(gone).toEqual(["wf:shared"]);
     tabB.close();
     bridge.setTabGoneListener(() => {});
   });
@@ -3253,54 +3260,49 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
   // never declared gone at all — its disclosure stranded for good.
   it("two incarnations of one key get independent clocks", async () => {
     const gone: string[] = [];
-    // Long enough that A's clock is DEMONSTRABLY still pending when B leaves —
-    // otherwise A fires on its own and the test would pass even with one shared
-    // slot per tab id.
-    bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: 1200 });
+    bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: NEVER });
     const tabA = await connectPanel("wf:two", "wf", { tabSessionId: "browser-tab-A" });
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:two")).toBe(true));
+    await occupied("wf:two", "browser-tab-A");
     tabA.close();
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:two")).toBe(false));
+    await vacant("wf:two");
 
-    // B takes the key over, then leaves too — well before A's clock has elapsed.
+    // B takes the key over, then leaves too. A's clock is still armed throughout
+    // — the grace cannot elapse — so this cannot pass by A firing early.
     const tabB = await connectPanel("wf:two", "wf", { tabSessionId: "browser-tab-B" });
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:two")).toBe(true));
+    await occupied("wf:two", "browser-tab-B");
     tabB.close();
-    expect(gone).toEqual([]); // neither clock has elapsed yet
+    await vacant("wf:two");
+    expect(gone).toEqual([]);
 
-    // BOTH departures are declarable: two separate tabs went away.
-    await vi.waitFor(() => expect(gone.filter((t) => t === "wf:two")).toHaveLength(2), {
-      timeout: 6000,
-    });
+    bridge.__runTabGoneClocksForTest();
+    expect(gone.filter((t) => t === "wf:two")).toHaveLength(2);
     bridge.setTabGoneListener(() => {});
   });
 
   // Coordinator gate P1: two tabs open at once on one key. B's hello SUPERSEDES
   // A's socket, so by the time A's close handler runs the map already points at
-  // B — and an "was I the primary?" guard answers no for a tab that very much
-  // did just leave, so A was never armed at all and could never be declared gone.
+  // B — and a "was I the primary?" guard answers no for a tab that very much did
+  // just leave, so A was never armed at all and could never be declared gone.
   it("a tab superseded by a second tab on the same key is still declared gone", async () => {
     const gone: string[] = [];
-    bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: 250 });
+    bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: NEVER });
     const tabA = await connectPanel("wf:takeover", "wf", { tabSessionId: "browser-tab-A" });
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:takeover")).toBe(true));
+    await occupied("wf:takeover", "browser-tab-A");
 
-    // B opens the SAME saved workflow while A is still connected. The bridge
+    // B opens the SAME saved workflow while A is still connected; the bridge
     // supersedes A's socket rather than refusing B.
     const tabB = await connectPanel("wf:takeover", "wf", { tabSessionId: "browser-tab-B" });
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:takeover")).toBe(true));
-
-    // A left, even though it never got to be "the primary that disconnected".
-    await vi.waitFor(() => expect(gone).toEqual(["wf:takeover"]), { timeout: 3000 });
+    await occupied("wf:takeover", "browser-tab-B");
+    // A's close is asynchronous — wait until it has actually armed something.
+    await vi.waitFor(() => {
+      bridge.__runTabGoneClocksForTest();
+      expect(gone).toEqual(["wf:takeover"]);
+    });
     tabB.close();
     void tabA;
     bridge.setTabGoneListener(() => {});
   });
 
-  // …and P1-2: anonymous panels must NOT share one slot. The panel omits its
-  // identity precisely when its Web Locks lease could not be acquired — i.e.
-  // when a duplicate tab copied the sessionStorage id — so the anonymous path
-  // IS the two-tabs-one-key case, not an exotic edge.
   // The ENTRIES are keyed by tab id, not incarnation — so a takeover has to be a
   // CONVERSATION BOUNDARY, announced at the hello rather than after a grace: the
   // newcomer must not be able to reach the departed tab's answers at all.
@@ -3308,7 +3310,7 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
     const takenOver: Array<[string, string]> = [];
     bridge.setTabTakenOverListener((tabId, departed) => takenOver.push([tabId, departed]));
     const tabA = await connectPanel("wf:boundary", "wf", { tabSessionId: "browser-tab-A" });
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:boundary")).toBe(true));
+    await occupied("wf:boundary", "browser-tab-A");
     expect(takenOver).toEqual([]);
 
     const tabB = await connectPanel("wf:boundary", "wf", { tabSessionId: "browser-tab-B" });
@@ -3322,83 +3324,83 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
   // The incarnation COMPARISON (rather than merely "was someone here?") is what
   // this guards: a panel re-hellos on its own live socket — a title change, a
   // re-registration — with the old connection still in the map. Same occupant,
-  // so its conversation continues and nothing may be retired.
+  // so its conversation continues and nothing may be retired. This is also why
+  // the anonymous id must be per CONNECTION: minted per hello, a re-hello would
+  // look like a stranger to itself.
   it("a re-hello from the SAME tab on a live socket is not a takeover", async () => {
     const takenOver: string[] = [];
     bridge.setTabTakenOverListener((tabId) => takenOver.push(tabId));
-    const sock = await connectPanel("wf:rehello", "wf", { tabSessionId: "browser-tab-A" });
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:rehello")).toBe(true));
+    for (const identity of [{ tabSessionId: "browser-tab-A" }, {}]) {
+      const key = identity.tabSessionId ? "wf:rehello" : "wf:rehello-anon";
+      const sock = await connectPanel(key, "wf", identity);
+      await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === key)).toBe(true));
+      const before = bridge.tabIncarnation(key);
 
-    // Re-register on the SAME socket, without any disconnect in between.
-    sock.send(
-      JSON.stringify({
-        type: "hello",
-        tab_id: "wf:rehello",
-        title: "renamed",
-        enforces_workflow_stamp: true,
-        enforces_workflow_stamp_at_write: true,
-        tab_session_id: "browser-tab-A",
-      }),
-    );
-    await vi.waitFor(() =>
-      expect(bridge.tabs().some((t) => t.title === "renamed")).toBe(true),
-    );
-    expect(takenOver).toEqual([]);
-    sock.close();
+      // Re-register on the SAME socket, with no disconnect in between.
+      sock.send(
+        JSON.stringify({
+          type: "hello",
+          tab_id: key,
+          title: "renamed",
+          enforces_workflow_stamp: true,
+          enforces_workflow_stamp_at_write: true,
+          ...(identity.tabSessionId ? { tab_session_id: identity.tabSessionId } : {}),
+        }),
+      );
+      await vi.waitFor(() =>
+        expect(bridge.tabs().some((t) => t.tab_id === key && t.title === "renamed")).toBe(true),
+      );
+      // Same connection, same incarnation — and therefore not a takeover.
+      expect(bridge.tabIncarnation(key)).toBe(before);
+      expect(takenOver).toEqual([]);
+      sock.close();
+      await vacant(key);
+    }
     bridge.setTabTakenOverListener(() => {});
   });
 
-  it("an ordinary reload is NOT a takeover", async () => {
-    const takenOver: string[] = [];
-    bridge.setTabTakenOverListener((tabId) => takenOver.push(tabId));
-    const sock = await connectPanel("wf:same", "wf", { tabSessionId: "browser-tab-A" });
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:same")).toBe(true));
-    sock.close();
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:same")).toBe(false));
-    const back = await connectPanel("wf:same", "wf", { tabSessionId: "browser-tab-A" });
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:same")).toBe(true));
-    await new Promise((r) => setTimeout(r, 100));
-    expect(takenOver).toEqual([]); // same occupant — its conversation continues
-    back.close();
-    bridge.setTabTakenOverListener(() => {});
-  });
-
+  // …and P1-2: anonymous panels must NOT share one slot. The panel omits its
+  // identity precisely when its Web Locks lease could not be acquired — i.e.
+  // when a duplicate tab copied the sessionStorage id — so the anonymous path IS
+  // the two-tabs-one-key case, not an exotic edge.
   it("two anonymous departures on one key are both declarable", async () => {
     const gone: string[] = [];
-    bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: 1200 });
+    bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: NEVER });
     const anonA = await connectPanel("wf:anon", "wf"); // no tab_session_id
     await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:anon")).toBe(true));
     anonA.close();
-    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:anon")).toBe(false));
+    await vacant("wf:anon");
 
     const anonB = await connectPanel("wf:anon", "wf"); // also anonymous
     await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "wf:anon")).toBe(true));
     anonB.close();
-    expect(gone).toEqual([]); // neither clock has elapsed yet
+    await vacant("wf:anon");
+    expect(gone).toEqual([]);
 
     // Two unproven departures, two owed warnings — the second must not overwrite
     // or clear the first.
-    await vi.waitFor(() => expect(gone.filter((t) => t === "wf:anon")).toHaveLength(2), {
-      timeout: 6000,
-    });
+    bridge.__runTabGoneClocksForTest();
+    expect(gone.filter((t) => t === "wf:anon")).toHaveLength(2);
     bridge.setTabGoneListener(() => {});
   });
 
   it("an unidentified panel cannot prove it came back, so the clock still fires", async () => {
     const gone: string[] = [];
-    bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: 200 });
-    // No tab_session_id: an old build. Nothing can prove which tab returned, and
-    // unknown-return must let the disclosure surface.
+    bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: NEVER });
+    // No tab_session_id: the panel could not take its Web Locks lease. Nothing
+    // can prove which tab returned, and unknown-return must let the disclosure
+    // surface.
     const sock = await connectPanel("tab-anonymous", "wf");
-    await vi.waitFor(() =>
-      expect(bridge.tabs().some((t) => t.tab_id === "tab-anonymous")).toBe(true),
-    );
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-anonymous")).toBe(true));
     sock.close();
+    await vacant("tab-anonymous");
     const back = await connectPanel("tab-anonymous", "wf");
-    await vi.waitFor(() =>
-      expect(bridge.tabs().some((t) => t.tab_id === "tab-anonymous")).toBe(true),
-    );
-    await vi.waitFor(() => expect(gone).toEqual(["tab-anonymous"]), { timeout: 3000 });
+    // The "reconnect" is COMPLETE before the clock runs, so a pass proves the
+    // cancel declined rather than that the timer got there first.
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-anonymous")).toBe(true));
+
+    bridge.__runTabGoneClocksForTest();
+    expect(gone).toEqual(["tab-anonymous"]);
     back.close();
     bridge.setTabGoneListener(() => {});
   });

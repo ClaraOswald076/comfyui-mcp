@@ -1498,6 +1498,100 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     AskAnswers.setIncarnationResolver(() => OCCUPANT);
   });
 
+  // Coordinator gate P0: the debt BUCKET was keyed by incarnation but the code
+  // WRITING into it still derived an owner from the tab key. So an eviction of
+  // A's entry after B took the key filed A's loss under B — B was pushed
+  // `dropped_answers`, B's ack cleared it, and A's own lifecycle callback (which
+  // retires A's bucket) found nothing left to disclose.
+  // Coordinator gate P0: the debt BUCKET was keyed by incarnation but the code
+  // WRITING into it still derived an owner from the tab key. So an eviction of
+  // A's entry after B took the key filed A's loss under B — B was pushed
+  // `dropped_answers`, B's ack cleared it, and A's own lifecycle callback (which
+  // retires A's bucket) found nothing left to disclose.
+  // Coordinator gate P0: the debt BUCKET was keyed by incarnation but the code
+  // WRITING into it still derived an owner from the tab key — so an eviction of
+  // A's entry after B took the key filed A's loss under B. B was pushed
+  // `dropped_answers`, B's ack cleared it, and A's own lifecycle callback (which
+  // retires A's bucket) found nothing left to disclose.
+  //
+  // The arrangement matters: A's surviving entries are all HANDED OFF, so the
+  // only `pending` entry on the key is B's. That is what makes a writer that
+  // picks "any pending entry on this key" reach for B's, and a writer that files
+  // into "whoever holds the key now" reach for B's bucket.
+  it("A's eviction after B takes the key lands on A, not on the newcomer", () => {
+    let holder: string | undefined = "browser-tab-A";
+    AskAnswers.setIncarnationResolver(() => holder);
+
+    // A fills its tab to the ceiling, then everything of A's is handed off.
+    for (let i = 0; i < 48; i += 1) {
+      openAndAnswer(`pa-a-${i}`, { question: `A${i}?`, options: [{ label: "x" }, { label: "y" }] }, `A${i}`);
+    }
+    AskAnswers.deliverPending(TAB, () => true);
+    expect(AskAnswers.pending(TAB)).toHaveLength(0);
+    expect(AskAnswers.droppedFor(TAB)).toBe(0); // nothing evicted yet
+
+    // A different browser tab takes the recurring key over and asks. Its answer
+    // is the ONLY pending entry — and recording it pushes the tab over the
+    // ceiling, evicting one of A's.
+    holder = "browser-tab-B";
+    openAndAnswer("pa-b-1", SCHEDULER, "karras");
+    const bEntry = AskAnswers.entriesFor(TAB).find((e) => e.incarnation === "browser-tab-B");
+    expect(bEntry).toBeDefined();
+
+    // A's loss was NOT stamped onto B's entry…
+    expect(bEntry!.disclose ?? 0).toBe(0);
+    // …and B's delivery does not carry it.
+    const toB: AskAnswerEvent[] = [];
+    AskAnswers.deliverPending(TAB, (payload) => {
+      toB.push(payload);
+      return true;
+    });
+    expect(toB).toHaveLength(1);
+    expect(toB[0].ask_answer).toBe("karras");
+    expect(toB[0].dropped_answers).toBeUndefined();
+    // …nor is B owed anything it could report or settle.
+    expect(AskAnswers.reportDropped(TAB)).toBe(0);
+
+    // A is owed it, and only A.
+    holder = "browser-tab-A";
+    expect(AskAnswers.reportDropped(TAB)).toBeGreaterThan(0);
+    expect(AskAnswers.hasOutstanding()).toBe(true);
+    AskAnswers.setIncarnationResolver(() => OCCUPANT);
+  });
+
+  // …and the lifecycle half: a bare counter owed to A survives B entirely, and
+  // only A's own departure retires it.
+  it("a bare counter owed to A is invisible to B and retired by A's own callback", () => {
+    let holder: string | undefined = "browser-tab-A";
+    AskAnswers.setIncarnationResolver(() => holder);
+    const tokens: string[] = [];
+    AskAnswers.setTurnAttacher((_key, token) => {
+      tokens.push(token);
+      return TURN;
+    });
+
+    // The loss is A's, but it is RECORDED WHILE B HOLDS THE KEY — which is the
+    // real shape (an eviction of A's entry after the takeover). A writer that
+    // files into "whoever holds the key now" would put it in B's bucket here.
+    holder = "browser-tab-B";
+    AskAnswers.noteDroppedForTest(TAB, 4, "browser-tab-A");
+    expect(AskAnswers.droppedFor(TAB)).toBe(4); // the TAB is owed it, either way
+
+    // …but B is owed nothing and can settle nothing.
+    expect(AskAnswers.reportDropped(TAB)).toBe(0);
+    expect(tokens).toHaveLength(0); // no warning minted, so nothing for B to ack
+
+    // A is still owed it, is told, and only A's own retirement clears it.
+    holder = "browser-tab-A";
+    expect(AskAnswers.reportDropped(TAB)).toBe(4);
+    expect(AskAnswers.hasOutstanding()).toBe(true);
+    AskAnswers.retireDebt(TAB, "browser-tab-B"); // B's departure settles nothing of A's
+    expect(AskAnswers.reportDropped(TAB)).toBe(4);
+    AskAnswers.retireDebt(TAB, "browser-tab-A");
+    expect(AskAnswers.droppedFor(TAB)).toBe(0);
+    AskAnswers.setIncarnationResolver(() => OCCUPANT);
+  });
+
   it("retiring one incarnation's debt leaves the other's alone", () => {
     let holder: string | undefined = "browser-tab-A";
     AskAnswers.setIncarnationResolver(() => holder);

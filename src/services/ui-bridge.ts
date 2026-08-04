@@ -947,7 +947,10 @@ export class UiBridge {
    */
   private tabGoneGraceMs = 60_000;
   /** Armed tab-gone clocks, keyed by (tab id, incarnation) — see armTabGone. */
-  private tabGoneTimers = new Map<string, { timer: ReturnType<typeof setTimeout> }>();
+  private tabGoneTimers = new Map<
+    string,
+    { timer: ReturnType<typeof setTimeout>; tabId: string; incarnation: string }
+  >();
   /** Counter behind the synthetic `anon:<n>` incarnations. */
   private nextAnonIncarnation = 0;
   /**
@@ -1448,7 +1451,17 @@ export class UiBridge {
         // ALWAYS an identity for this connection — the panel's proven one, or a
         // fresh synthetic. See PanelConn.incarnationId for why anonymous ones must
         // be distinct rather than shared.
-        const incarnationId = incomingTabSessionId ?? `anon:${++this.nextAnonIncarnation}`;
+        // PER CONNECTION, not per hello. A panel re-hellos on its own live socket
+        // (a title change, a re-registration), and minting a fresh `anon:<n>`
+        // there would make the connection look like a stranger to itself: the
+        // takeover branch below would fire and close its own asks, after which
+        // its real conversation could neither recover nor be pushed its answers.
+        // The identity is a property of the connection; an event that can repeat
+        // on one connection must not mint a new one.
+        const incarnationId =
+          incomingTabSessionId ??
+          this.sockIncarnation.get(sock)?.incarnation ??
+          `anon:${++this.nextAnonIncarnation}`;
         this.sockIncarnation.set(sock, { tabId, incarnation: incarnationId });
         // #486 — A DIFFERENT BROWSER TAB has taken this recurring key over. That is
         // not a reconnect, it is a change of occupant: the previous tab's
@@ -2105,25 +2118,43 @@ export class UiBridge {
     const slot = tabIncarnationSlot(tabId, incarnation);
     const prev = this.tabGoneTimers.get(slot);
     if (prev) clearTimeout(prev.timer);
-    const timer = setTimeout(() => {
-      this.tabGoneTimers.delete(slot);
-      // Re-check, on the INCARNATION and not just the key: something else may
-      // now hold this recurring id, and a stranger holding the key is not this
-      // tab coming back.
-      // Re-check on the INCARNATION, not the key: something else may now hold
-      // this recurring id, and a stranger holding the key is not this tab back.
-      if (this.conns.get(tabId)?.incarnationId === incarnation) return;
-      try {
-        this.onTabGone?.(tabId, incarnation);
-      } catch (err) {
-        logger.warn(
-          `[ui-bridge] tab-gone listener threw for ${tabId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-    }, this.tabGoneGraceMs);
+    const timer = setTimeout(() => this.fireTabGone(slot, tabId, incarnation), this.tabGoneGraceMs);
     // Never hold the process open just to declare a tab gone.
     timer.unref?.();
-    this.tabGoneTimers.set(slot, { timer });
+    this.tabGoneTimers.set(slot, { timer, tabId, incarnation });
+  }
+
+  /** The clock elapsed for one (tab, incarnation). Split out so a test can run
+   *  it at a chosen moment instead of racing a wall-clock grace. */
+  private fireTabGone(slot: string, tabId: string, incarnation: string): void {
+    this.tabGoneTimers.delete(slot);
+    // Re-check on the INCARNATION, not the key: something else may now hold this
+    // recurring id, and a stranger holding the key is not this tab coming back.
+    if (this.conns.get(tabId)?.incarnationId === incarnation) return;
+    try {
+      this.onTabGone?.(tabId, incarnation);
+    } catch (err) {
+      logger.warn(
+        `[ui-bridge] tab-gone listener threw for ${tabId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * TEST ONLY — run every armed gone-clock right now.
+   *
+   * The clocks are the one part of this file whose behaviour is defined by
+   * elapsed time, and a test that races a real grace is worse than no test: too
+   * short and it fails on a correct implementation, too long and a timer that
+   * fires before the successor's hello lands makes a broken cancel look caught.
+   * Widening the window only hides the second direction. So tests wait for the
+   * state they care about to be provably reached, then run the clocks here.
+   */
+  __runTabGoneClocksForTest(): void {
+    for (const [slot, armed] of [...this.tabGoneTimers]) {
+      clearTimeout(armed.timer);
+      this.fireTabGone(slot, armed.tabId, armed.incarnation);
+    }
   }
 
   /**
