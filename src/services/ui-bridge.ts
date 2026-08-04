@@ -903,6 +903,19 @@ export class UiBridge {
   private lateAskSink: ((askId: string, result: unknown, tabId: string) => void) | null = null;
   /** See setTabGoneListener. */
   private onTabGone: ((tabId: string) => void) | null = null;
+  /**
+   * How long a tab must stay away before it counts as GONE rather than
+   * reconnecting.
+   *
+   * A reload closes the socket and re-hellos moments later, so firing on the
+   * close itself would retire live per-tab state during an ordinary F5. Sized
+   * far above any reload (and above RECONNECT_GRACE_MS, which bounds a much more
+   * urgent decision): waiting costs nothing but a little bookkeeping held
+   * slightly longer, while firing early destroys it.
+   */
+  private tabGoneGraceMs = 60_000;
+  /** Armed tab-gone timers, cancelled by a re-hello. */
+  private tabGoneTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Buffered late-but-valid ask_user answers (ask_id → result), drained by the
    *  caller via takeLateAskReply(). Bounded by a short TTL — a stale unclaimed
    *  answer is pruned rather than kept forever. */
@@ -1373,6 +1386,16 @@ export class UiBridge {
             // Already gone.
           }
         }
+        // #486 — the tab is BACK. Cancel any pending "is it gone?" clock so an
+        // ordinary reload never retires state only this tab can be told about.
+        //
+        // DEFENCE IN DEPTH: the timer re-checks `conns` before firing, so a
+        // reconnect is already safe without this and no test can fail on it. It
+        // is here because a live timer for a tab that is demonstrably present is
+        // a lie about the state of the world, and the next person to add a
+        // condition to that callback should not have to discover that the guard
+        // depends on the re-check being reached.
+        this.cancelTabGone(tabId);
         this.conns.set(tabId, {
           sock,
           tabId,
@@ -1659,17 +1682,11 @@ export class UiBridge {
           if (drivenTab === tabId) this.mirrorViewers.delete(s);
         }
         this.subscribers.delete(tabId);
-        // #486 — the tab is off the map. Anything holding per-tab state it can
-        // only ever hand to THIS tab needs to know now, while the count is still
-        // known, rather than accumulating a record for a tab that may never come
-        // back. Never let a listener's fault break the disconnect path.
-        try {
-          this.onTabGone?.(tabId);
-        } catch (err) {
-          logger.warn(
-            `[ui-bridge] tab-gone listener threw for ${tabId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
+        // #486 — a socket close is NOT evidence the tab is gone; it is evidence a
+        // socket closed, and an ordinary F5 produces exactly this. So the
+        // tab-gone listener is ARMED here and only fires if the tab stays away
+        // for the grace: a reload cancels it on the re-hello (see armTabGone).
+        this.armTabGone(tabId);
         logger.info(
           `[ui-bridge] panel tab disconnected: ${tabId.slice(0, 8)} — ${this.conns.size} tab(s) remain`,
         );
@@ -1969,8 +1986,39 @@ export class UiBridge {
    *  connection map (#486). Lets per-tab bookkeeping that can only ever be
    *  delivered to that tab be surfaced and retired, instead of accumulating for
    *  a tab that may never reconnect. */
-  setTabGoneListener(listener: (tabId: string) => void): void {
+  setTabGoneListener(listener: (tabId: string) => void, opts: { graceMs?: number } = {}): void {
     this.onTabGone = listener;
+    if (typeof opts.graceMs === "number" && opts.graceMs >= 0) this.tabGoneGraceMs = opts.graceMs;
+  }
+
+  /** Start the "is this tab actually gone?" clock. A re-hello for the same id
+   *  cancels it (cancelTabGone), so a reload never fires the listener. */
+  private armTabGone(tabId: string): void {
+    if (!this.onTabGone) return;
+    this.cancelTabGone(tabId);
+    const timer = setTimeout(() => {
+      this.tabGoneTimers.delete(tabId);
+      // Re-check: the tab may have come back under this very id.
+      if (this.conns.has(tabId)) return;
+      try {
+        this.onTabGone?.(tabId);
+      } catch (err) {
+        logger.warn(
+          `[ui-bridge] tab-gone listener threw for ${tabId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }, this.tabGoneGraceMs);
+    // Never hold the process open just to declare a tab gone.
+    timer.unref?.();
+    this.tabGoneTimers.set(tabId, timer);
+  }
+
+  /** The tab is back (or is being torn down deliberately) — it is not gone. */
+  private cancelTabGone(tabId: string): void {
+    const timer = this.tabGoneTimers.get(tabId);
+    if (!timer) return;
+    clearTimeout(timer);
+    this.tabGoneTimers.delete(tabId);
   }
 
   takeLateAskReply(askId: string): unknown | undefined {
@@ -2727,6 +2775,8 @@ export class UiBridge {
   }
 
   async stop(): Promise<void> {
+    for (const timer of this.tabGoneTimers.values()) clearTimeout(timer);
+    this.tabGoneTimers.clear();
     if (this.bindRetryTimer) {
       clearTimeout(this.bindRetryTimer);
       this.bindRetryTimer = null;

@@ -1285,6 +1285,34 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     expect(AskAnswers.droppedFor("tab-ephemeral-299")).toBe(0);
   });
 
+  // Coordinator gate P1: the debt's COUNT is tab-keyed and its outstanding
+  // disclosure TOKENS carry that same key, but the ack that settles one is bound
+  // to the agent instance — which deliberately survives a tab-id migration. A
+  // token left pointing at the old key is acked by a perfectly valid result and
+  // clears a debt nobody owes, while the real one sits under the new key forever:
+  // false outstanding debt that blocks the restart gate and later warns for
+  // nothing.
+  it("a tab-id migration moves the debt COUNT and its tokens together", () => {
+    AskAnswers.noteDroppedForTest(TAB, 4);
+    const tokens: string[] = [];
+    AskAnswers.setTurnAttacher((_key, token) => {
+      tokens.push(token);
+      return TURN;
+    });
+    expect(AskAnswers.reportDropped(TAB)).toBe(4); // a warning is riding a turn
+
+    // The tab id migrates while that warning is still in flight.
+    AskAnswers.moveKey(TAB, OTHER_TAB);
+    expect(AskAnswers.droppedFor(OTHER_TAB)).toBe(4);
+    expect(AskAnswers.droppedFor(TAB)).toBe(0);
+
+    // The carrying turn's result lands — the ack must settle the debt where it
+    // actually lives now, not under the id it was minted against.
+    AskAnswers.ack(tokens[0], { carrier: TURN });
+    expect(AskAnswers.droppedFor(OTHER_TAB)).toBe(0);
+    expect(AskAnswers.outstandingDebt()).toHaveLength(0);
+  });
+
   it("never throws when the flusher does", () => {
     AskAnswers.setFlusher(() => {
       throw new Error("no agent");

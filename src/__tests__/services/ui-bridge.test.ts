@@ -3166,6 +3166,45 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
     );
   });
 
+  // Coordinator gate P0: a socket close is NOT evidence a tab is gone — an
+  // ordinary F5 produces exactly that. Firing the tab-gone listener on the close
+  // retired live per-tab bookkeeping (the eviction-disclosure debt) during every
+  // reload, so the reconnected conversation kept the answer and lost the warning
+  // that an answer had been dropped — the worst possible split.
+  it("an ordinary reload does NOT declare the tab gone", async () => {
+    const gone: string[] = [];
+    bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: 300 });
+    const sock = await connectPanel("tab-reload", "wf");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-reload")).toBe(true));
+
+    // F5: the socket closes and the same tab re-hellos moments later.
+    sock.close();
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-reload")).toBe(false));
+    const back = await connectPanel("tab-reload", "wf");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-reload")).toBe(true));
+
+    // Well past the grace: the tab came back, so it was never gone.
+    await new Promise((r) => setTimeout(r, 600));
+    expect(gone).toEqual([]);
+    back.close();
+    bridge.setTabGoneListener(() => {});
+  });
+
+  it("a tab that stays away IS declared gone, once the grace elapses", async () => {
+    const gone: string[] = [];
+    bridge.setTabGoneListener((tabId) => gone.push(tabId), { graceMs: 150 });
+    const sock = await connectPanel("tab-really-gone", "wf");
+    await vi.waitFor(() =>
+      expect(bridge.tabs().some((t) => t.tab_id === "tab-really-gone")).toBe(true),
+    );
+    sock.close();
+    // Nothing at the moment of the close…
+    expect(gone).toEqual([]);
+    // …and only after the tab has genuinely stayed away.
+    await vi.waitFor(() => expect(gone).toEqual(["tab-really-gone"]), { timeout: 3000 });
+    bridge.setTabGoneListener(() => {});
+  });
+
   it("a throwing sink never breaks the message loop or loses the buffered answer", async () => {
     bridge.setLateAskReplySink(() => {
       throw new Error("journal exploded");

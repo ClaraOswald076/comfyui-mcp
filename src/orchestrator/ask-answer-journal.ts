@@ -1114,6 +1114,18 @@ export class AskAnswerJournalImpl {
       ticket.epoch = ticket.epoch === fromEpoch ? toEpoch : toEpoch - 1;
     }
     this.tabEpoch.delete(from);
+    // BOTH HALVES OF THE DEBT MOVE TOGETHER. The count is tab-keyed and the
+    // outstanding disclosure TOKENS carry that same key, but the ack that
+    // settles one is bound to the AGENT INSTANCE (see AskEntry.carrier) — which
+    // deliberately survives a tab-id migration. So a token left pointing at the
+    // old key is acked by a perfectly valid result and clears a debt nobody
+    // owes, while the real one sits under the new key forever: false outstanding
+    // debt that blocks the restart gate and later emits a spurious warning. That
+    // is the cry-wolf failure the acked/unacked split exists to prevent,
+    // arriving through migration.
+    for (const debt of this.debtTokens.values()) {
+      if (debt.key === from) debt.key = to;
+    }
     const lost = this.dropped.get(from);
     if (lost !== undefined) {
       this.dropped.delete(from);
@@ -1154,6 +1166,9 @@ export class AskAnswerJournalImpl {
       );
     }
     this.dropped.delete(key);
+    // Both halves together — see moveKey. A token left behind here would let a
+    // later ack clear a debt for a tab that no longer exists.
+    for (const [t, d] of [...this.debtTokens]) if (d.key === key) this.debtTokens.delete(t);
   }
 
   /**
