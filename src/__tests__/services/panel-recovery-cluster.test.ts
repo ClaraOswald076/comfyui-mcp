@@ -1256,6 +1256,28 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     expect(note).not.toMatch(/could not be examined/); // a verdict, not a crash
   });
 
+  it("no way to ASK is also not a pass — a dep set without fileDigest fails closed", async () => {
+    // The predicate that decides whether to rename a backup over canonical and
+    // then delete the staged copy must not treat "this build cannot check" as
+    // "the check passed". verifyStagedTree answers `unverifiable` for the same
+    // missing dep; these two disagreeing was the defect, independent of which
+    // default one prefers.
+    const backupDir = backupPath("0.11.34");
+    writePanelPack(backupDir, "0.11.34");
+    stageIncoming("0.11.38");
+    rmSync(join(INCOMING(), "web", "js", "comfyui-mcp-panel.js")); // husk ⇒ restore attempted
+    const h = makeDeps({});
+    h.deps.fileDigest = undefined; // no way to ask
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(h.deps);
+    // The backup is NOT restored on an unanswerable question, and nothing moved.
+    expect(note).not.toMatch(/RESTORED/);
+    expect(existsSync(PANEL_DIR())).toBe(false);
+    expect(existsSync(backupDir)).toBe(true);
+  });
+
   it("P0: an UNREADABLE backup bundle is not viable — could-not-read is not fine", async () => {
     // A backup whose bundle is a regular file but errors on read would be
     // renamed over the canonical name, after which the staged copy is removed:

@@ -2776,9 +2776,18 @@ function dirHasPanelFiles(dir: string, deps: PanelInstallerDeps): boolean {
   // name and then delete the staged copy, so answering "yes" on an unreadable
   // file leaves the user with no readable panel at all. Same fold as everywhere
   // else tonight: an unanswered question is not a positive answer.
-  if (!deps.fileDigest) return true; // dep absent ⇒ this check is not available
-  const digest = deps.fileDigest(bundle);
-  if (!digest) return false; // present but unreadable
+  // FAIL CLOSED ON THE MISSING DEP TOO. An earlier revision returned true here,
+  // which stated the principle in the comment above and then did the opposite —
+  // and disagreed with `verifyStagedTree`, which answers `unverifiable` for the
+  // identical condition. Production always wires `fileDigest` (defaultDeps, and
+  // the one spread of it in panelStatusAt), so the only callers this can refuse
+  // are dep sets that cannot occur in production; refusing them removes
+  // coverage that was passing for the wrong reason rather than losing anything
+  // real. This predicate decides whether to rename a backup over the canonical
+  // name and then delete the staged copy — it is the last place that should be
+  // guessing.
+  const digest = deps.fileDigest?.(bundle);
+  if (!digest) return false; // unreadable, or no way to ask
   return digest.size > 0;
 }
 
