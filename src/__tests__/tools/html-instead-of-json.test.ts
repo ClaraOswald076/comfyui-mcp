@@ -30,19 +30,20 @@ vi.mock("../../services/api-nodes.js", async (importOriginal) => {
 });
 
 import { registerSkillsAccessTools } from "../../tools/skills-access.js";
+import { registerTemplateSchemaTools } from "../../tools/template-schema.js";
 import { NonJsonResponseError, classifyNonJson } from "../../comfyui/json-guard.js";
 
 type ToolResult = { content: Array<{ type: string; text: string }>; isError?: boolean };
 type ToolHandler = (args: Record<string, unknown>) => Promise<ToolResult>;
 
-function getHandler(name: string): ToolHandler {
+function getHandler(name: string, register = registerSkillsAccessTools): ToolHandler {
   let handler: ToolHandler | undefined;
   const server = {
     tool: (n: string, _d: string, _s: unknown, h: ToolHandler) => {
       if (n === name) handler = h;
     },
   };
-  registerSkillsAccessTools(server as never);
+  register(server as never);
   if (!handler) throw new Error(`tool ${name} not registered`);
   return handler;
 }
@@ -211,5 +212,31 @@ describe("check_workflow_runtime must not call an answering server unreachable (
     const parsed = JSON.parse(out.content[0].text);
     expect(parsed.runtime).toBe("local");
     expect(parsed.reason).toBeUndefined();
+  });
+});
+
+describe("get_template_schema must not call an answering server unreachable (#828)", () => {
+  it("names the HTML page instead of reporting the ComfyUI server unreachable", async () => {
+    // `.json()` on an HTML body threw into a catch that reported the server
+    // UNREACHABLE — for a server that plainly answered.
+    global.fetch = vi.fn(async () => htmlResponse(200)) as unknown as typeof fetch;
+    const out = await getHandler("get_template_schema", registerTemplateSchemaTools)({
+      template: "some-template",
+    });
+    const text = out.content[0].text;
+    expect(text).not.toMatch(/server is unreachable/i);
+    expect(text).not.toMatch(/Unexpected token/);
+    expect(text).toContain("/api/workflow_templates");
+    expect(text).toContain("HTML page");
+  });
+
+  it("keeps the unreachable wording for a genuine transport failure", async () => {
+    global.fetch = vi.fn(async () => {
+      throw new Error("fetch failed");
+    }) as unknown as typeof fetch;
+    const out = await getHandler("get_template_schema", registerTemplateSchemaTools)({
+      template: "some-template",
+    });
+    expect(out.content[0].text).toMatch(/server is unreachable/i);
   });
 });

@@ -479,6 +479,29 @@ describe("rethrowWithJsonDiagnosis never asserts a cause it did not prove (#828)
     }
   });
 
+  it("redacts the STACK too — a Node stack embeds the message", async () => {
+    // Copying the stack verbatim would carry the credential straight past the
+    // message redaction and into any unhandled-rejection log.
+    authHeaders.value = { Authorization: "Bearer echoed-secret-token-here" };
+    try {
+      global.fetch = vi.fn(async () => {
+        throw new Error("fetch failed");
+      }) as unknown as typeof fetch;
+      const reflecting = new SyntaxError(
+        `Unexpected token '<', "<html>Bearer echoed-secret-token-here</html>" is not valid JSON`,
+      );
+      reflecting.stack = `SyntaxError: ${reflecting.message}\n    at somewhere`;
+      await expect(rethrowWithJsonDiagnosis(reflecting, PROBE_URL)).rejects.toSatisfy(
+        (e: unknown) =>
+          e instanceof Error &&
+          !e.message.includes("echoed-secret-token-here") &&
+          !(e.stack ?? "").includes("echoed-secret-token-here"),
+      );
+    } finally {
+      authHeaders.value = {};
+    }
+  });
+
   it("still redacts when the probe itself FAILS", async () => {
     authHeaders.value = { Authorization: "Bearer echoed-secret-token-here" };
     try {

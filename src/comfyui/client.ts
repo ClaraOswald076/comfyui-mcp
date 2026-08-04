@@ -10,7 +10,12 @@ import {
 import { logger } from "../utils/logger.js";
 import { ComfyUIError, ConnectionError, WorkflowExecutionError } from "../utils/errors.js";
 import { comfyuiFetch } from "./fetch.js";
-import { fetchComfyJson, redactErrorMessage, rethrowWithJsonDiagnosis } from "./json-guard.js";
+import {
+  fetchComfyJson,
+  looksLikeHtmlParsedAsJson,
+  redactErrorMessage,
+  rethrowWithJsonDiagnosis,
+} from "./json-guard.js";
 import * as cloudClient from "./cloud-client.js";
 import type { ObjectInfo, SystemStats, QueueStatus } from "./types.js";
 
@@ -247,7 +252,14 @@ export async function getObjectInfo(): Promise<ObjectInfo> {
         // (#828). Re-probe the endpoint ONCE to say what actually answered; if
         // the probe is inconclusive the original error is rethrown untouched —
         // an unproven cause must never be presented as the cause.
-        return await rethrowWithJsonDiagnosis(retryErr, `${getComfyUIBaseUrl()}/object_info`);
+        //
+        // Report whichever attempt PROVED a non-JSON answer. When the first
+        // request got HTML and the retry merely hit a transport blip, surfacing
+        // only the retry would downgrade a known #828 diagnosis to "server
+        // unavailable" and send the user to check whether ComfyUI is running
+        // (codex gate, round 8, finding 2).
+        const toReport = looksLikeHtmlParsedAsJson(retryErr) ? retryErr : looksLikeHtmlParsedAsJson(err) ? err : retryErr;
+        return await rethrowWithJsonDiagnosis(toReport, `${getComfyUIBaseUrl()}/object_info`);
       }
     }
   })();
