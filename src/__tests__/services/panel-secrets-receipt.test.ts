@@ -571,16 +571,27 @@ describe("slot saves report what the read-back PROVED (#826 gate round 3)", () =
   });
 
   it("masks the value a READER would use, not whichever alias it checks first", () => {
-    // A shell-set legacy alias outranks a file-set canonical one for
-    // freshSecretValue. Resolving aliases independently and taking the first
-    // would display a token consumers are not using.
+    // The CANONICAL alias wins over the legacy one whichever side it came from,
+    // so a freshly saved HF_TOKEN outranks a pre-existing shell
+    // HUGGINGFACE_TOKEN — and the mask must show the same value the readers
+    // resolve. (Resolving each alias independently and taking the first, or
+    // preferring any shell alias over any file alias, would display a token
+    // consumers are not using.)
     resetEnvFileProvenanceForTests();
-    process.env.HUGGINGFACE_TOKEN = "shell-alias-value";
-    writeFileSync(envPath, "HF_TOKEN=file-alias-value\n", { mode: 0o600 });
+    process.env.HUGGINGFACE_TOKEN = "shell-legacy-value";
+    writeFileSync(envPath, "HF_TOKEN=file-canonical-value\n", { mode: 0o600 });
     const hf = listPanelSecretsMasked().find((s) => s.id === "huggingface")!;
     expect(hf.set).toBe(true);
-    expect(hf.masked).toBe(maskSecret("shell-alias-value"));
-    expect(hf.masked).not.toBe(maskSecret("file-alias-value"));
+    expect(hf.masked).toBe(maskSecret("file-canonical-value"));
+    expect(hf.masked).not.toBe(maskSecret("shell-legacy-value"));
+  });
+
+  it("keeps the shell escape hatch WITHIN an alias — a real HF_TOKEN beats the file's", () => {
+    resetEnvFileProvenanceForTests();
+    process.env.HF_TOKEN = "shell-canonical-value";
+    writeFileSync(envPath, "HF_TOKEN=file-canonical-value\n", { mode: 0o600 });
+    const hf = listPanelSecretsMasked().find((s) => s.id === "huggingface")!;
+    expect(hf.masked).toBe(maskSecret("shell-canonical-value"));
   });
 
   it("shows a slot as SET when only its LEGACY alias is configured", () => {

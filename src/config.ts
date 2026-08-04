@@ -503,15 +503,30 @@ export const config: Config = { ...parsedConfig, resolvedPort };
 // so no call site changes. This removes the structural dependency on the respawn
 // rather than papering over it; the respawn remains, as a second path, not the
 // only one.
+// An EXPLICIT assignment still wins and still works. These fields were plain
+// writable properties before, and code (and tests) assign them; a getter-only
+// descriptor would make every such assignment throw in strict mode. The override
+// is remembered here and cleared by assigning undefined.
+const credentialOverrides: { civitaiApiToken?: string; huggingfaceToken?: string } = {};
+
 Object.defineProperty(config, "civitaiApiToken", {
-  get: () => freshSecretValue("CIVITAI_API_TOKEN"),
+  get: () => credentialOverrides.civitaiApiToken ?? freshSecretValue("CIVITAI_API_TOKEN"),
+  set: (v: string | undefined) => {
+    credentialOverrides.civitaiApiToken = v;
+  },
   enumerable: true,
   configurable: true,
 });
 Object.defineProperty(config, "huggingfaceToken", {
   // HF_TOKEN is the canonical var the huggingface_hub libs read; HUGGINGFACE_TOKEN
   // is a legacy alias we still honor as a fallback (same order as the boot parse).
-  get: () => freshSecretValue("HF_TOKEN", "HUGGINGFACE_TOKEN"),
+  // freshSecretValue resolves each alias FULLY before the next, so the canonical
+  // name wins whichever side it came from.
+  get: () =>
+    credentialOverrides.huggingfaceToken ?? freshSecretValue("HF_TOKEN", "HUGGINGFACE_TOKEN"),
+  set: (v: string | undefined) => {
+    credentialOverrides.huggingfaceToken = v;
+  },
   enumerable: true,
   configurable: true,
 });
