@@ -9,6 +9,7 @@ import type {
   UiNodeOutput,
   UiLink,
   SubgraphDefinition,
+  SubgraphInput,
   SubgraphLink,
 } from "../comfyui/types.js";
 import { logger } from "../utils/logger.js";
@@ -736,6 +737,10 @@ function materializeUeInGraph(
     dstSlot: number,
     type: string,
   ) => void,
+  /** Present for a subgraph definition: its virtual input node and input slots,
+   *  so a broadcast sourced from the definition's boundary can be registered
+   *  there and re-targeted to the outer producer during expansion. */
+  boundary?: { inputNodeId: number; inputs: SubgraphInput[] },
 ): number {
   const senders = nodes.filter((n) => typeof n.type === "string" && isUeSender(n.type));
   if (senders.length === 0) return 0;
@@ -820,8 +825,34 @@ function materializeUeInGraph(
    * A sender with no `controller` on the record can't be attributed, so it is not
    * assessed ("ok" — older lists predate the field and say nothing either way).
    */
-  const assessRecord = (raw: UeLinkEntry): "ok" | "detached" | "rewired" | "unverifiable" => {
-    if (raw.controller == null) return "ok";
+  const assessRecord = (
+    raw: UeLinkEntry,
+  ): "ok" | "detached" | "rewired" | "unverifiable" | "orphaned" => {
+    const want = realOfNode(raw.upstream, raw.upstream_slot);
+    if (!want) return "unverifiable";
+    const matches = (feedLink: number) => {
+      const real = realSourceOf(feedLink);
+      return real ? real.node === want.node && real.slot === want.slot : null;
+    };
+    // No `controller` (older lists omit the field): the record can't be tied to a
+    // particular sender — but it is NOT therefore current. Treating "cannot
+    // determine" as "determined current" is what let a stale record fabricate an
+    // edge in the first place. What IS checkable is whether ANY live broadcast
+    // node is fed by the recorded producer; if none is, no live broadcast can
+    // carry this value and the record is left over.
+    if (raw.controller == null) {
+      let anyUnresolved = false;
+      for (const s of senders) {
+        // Seed Everywhere and friends ARE their own producer.
+        if (s.id === want.node) return "ok";
+        for (const f of (s.inputs ?? []).filter((i) => i.link != null)) {
+          const m = matches(f.link as number);
+          if (m === null) anyUnresolved = true;
+          else if (m) return "ok";
+        }
+      }
+      return anyUnresolved ? "unverifiable" : "orphaned";
+    }
     // Seed Everywhere and friends: the sender IS the producer (it owns the widget),
     // so there is no incoming feed to compare against.
     if (raw.upstream === raw.controller) return "ok";
@@ -831,16 +862,11 @@ function materializeUeInGraph(
     // each with its own record — the record is current if ANY feed matches.
     const feeds = (ctrl.inputs ?? []).filter((i) => i.link != null);
     if (feeds.length === 0) return "detached";
-    const want = realOfNode(raw.upstream, raw.upstream_slot);
-    if (!want) return "unverifiable";
     let anyUnresolved = false;
     for (const f of feeds) {
-      const real = realSourceOf(f.link as number);
-      if (!real) {
-        anyUnresolved = true;
-        continue;
-      }
-      if (real.node === want.node && real.slot === want.slot) return "ok";
+      const m = matches(f.link as number);
+      if (m === null) anyUnresolved = true;
+      else if (m) return "ok";
     }
     return anyUnresolved ? "unverifiable" : "rewired";
   };
@@ -859,16 +885,21 @@ function materializeUeInGraph(
     if (dstInput.link != null) continue; // real link present — UE would not fire
     // A record whose own broadcast node is GONE — deleted outright, or that id
     // reused by an ordinary node — is left over; honoring it would fabricate a
-    // connection the live graph does not have. (An older list with no
-    // `controller` field says nothing either way, so it is not treated as stale.)
+    // connection the live graph does not have.
     if (raw.controller != null && !senderIds.has(raw.controller)) {
       warnings.push(
         `A cg-use-everywhere record in ${scope} feeding node ${dst.id} (${dst.type}) input "${inputLabel}" names broadcast node #${raw.controller}, which is no longer a broadcast node in this graph — the record is stale, so that input is left UNCONNECTED rather than wired from a broadcast that no longer exists.`,
       );
       continue;
     }
-    const src = nodesById.get(raw.upstream);
-    if (!src) {
+    // Inside a subgraph definition the producer can be the definition's virtual
+    // INPUT node: the broadcast's real source is whatever the outer component's
+    // matching input is wired to. That is a recoverable connection, not a missing
+    // producer — register the materialized edge on the boundary so the expander's
+    // input rewiring re-targets it to the outer source like any other inner link.
+    const fromBoundary = boundary != null && raw.upstream === boundary.inputNodeId;
+    const src = fromBoundary ? undefined : nodesById.get(raw.upstream);
+    if (!src && !fromBoundary) {
       warnings.push(
         `A cg-use-everywhere broadcast in ${scope} into node ${dst.id} (${dst.type}) input "${inputLabel}" names producer #${raw.upstream}, which is not in this graph — that connection is ABSENT from the stripped graph.`,
       );
@@ -878,7 +909,7 @@ function materializeUeInGraph(
     // serializes an outputs array that is too short). An absent outputs array is
     // an unknown, not a "no" — and the pack's own computed list is the authority
     // on what it wired — so it is trusted rather than silently dropped.
-    if (Array.isArray(src.outputs) && raw.upstream_slot >= src.outputs.length) {
+    if (src && Array.isArray(src.outputs) && raw.upstream_slot >= src.outputs.length) {
       warnings.push(
         `A cg-use-everywhere broadcast in ${scope} into node ${dst.id} (${dst.type}) input "${inputLabel}" names output slot ${raw.upstream_slot} of node ${src.id} (${src.type}), which only has ${src.outputs.length} output(s) — the record is stale, so that input is left UNCONNECTED rather than wired to a slot that does not exist.`,
       );
@@ -897,7 +928,9 @@ function materializeUeInGraph(
           ? `${who} no longer has any incoming connection, so it broadcasts nothing`
           : verdict === "rewired"
             ? `${who} is now fed by a different producer than the recorded node ${raw.upstream} (slot ${raw.upstream_slot})`
-            : `${who}'s own incoming connection could not be resolved, so the recorded producer node ${raw.upstream} (slot ${raw.upstream_slot}) could not be confirmed`;
+            : verdict === "orphaned"
+              ? `the record names no broadcast node of its own, and none of this graph's broadcast nodes is fed by the recorded producer node ${raw.upstream} (slot ${raw.upstream_slot})`
+              : `${who}'s own incoming connection could not be resolved, so the recorded producer node ${raw.upstream} (slot ${raw.upstream_slot}) could not be confirmed`;
       warnings.push(
         `A cg-use-everywhere record in ${scope} feeding node ${dst.id} (${dst.type}) input "${inputLabel}" is stale: ${why}. That input is left UNCONNECTED rather than wired from a broadcast the live graph does not have.`,
       );
@@ -913,8 +946,15 @@ function materializeUeInGraph(
       raw.type ?? dstInput.type ?? "*",
     );
     dstInput.link = id;
-    const srcOut = src.outputs?.[raw.upstream_slot];
-    if (srcOut) srcOut.links = [...(srcOut.links ?? []), id];
+    if (fromBoundary) {
+      // The expander walks each subgraph input's linkIds to re-point its inner
+      // consumers at the outer source; an unregistered edge would be left dangling.
+      const sgInput = boundary!.inputs[raw.upstream_slot];
+      if (sgInput) (sgInput.linkIds ??= []).push(id);
+    } else {
+      const srcOut = src!.outputs?.[raw.upstream_slot];
+      if (srcOut) srcOut.links = [...(srcOut.links ?? []), id];
+    }
     added++;
   }
   return added;
@@ -967,6 +1007,7 @@ function materializeUeLinks(
           target_slot: ds,
           type: t,
         }),
+      { inputNodeId: sg.inputNode?.id, inputs: sg.inputs ?? [] },
     );
   }
   ui.last_link_id = maxId;

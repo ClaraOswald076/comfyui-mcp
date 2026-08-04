@@ -372,6 +372,125 @@ describe("#361 — cg-use-everywhere broadcast links", () => {
     expect(joined(warnings)).toContain("no longer has any incoming connection");
   });
 
+  it("a CONTROLLERLESS record is not assumed current — a rewired one fabricates nothing", () => {
+    // Older lists omit `controller`, so the record can't be tied to a sender. That
+    // is "cannot determine", not "determined current": what is still checkable is
+    // whether ANY live broadcast node is fed by the recorded producer.
+    const g = ueGraph(true) as unknown as {
+      extra: { ue_links: Record<string, unknown>[] };
+      nodes: {
+        id: number;
+        type: string;
+        mode: number;
+        inputs?: { name: string; type: string; link: number | null }[];
+        outputs?: { name: string; type: string; links: number[] }[];
+        widgets_values: unknown[];
+      }[];
+      links: unknown[];
+    };
+    delete g.extra.ue_links[0].controller;
+    g.nodes.push({
+      id: 2,
+      type: "LoadImage",
+      mode: 0,
+      inputs: [],
+      outputs: [{ name: "IMAGE", type: "IMAGE", links: [30] }],
+      widgets_values: ["b.png"],
+    });
+    g.nodes.find((n) => n.id === 7)!.inputs![0].link = 30; // live UE broadcasts node 2
+    g.nodes.find((n) => n.id === 1)!.outputs![0].links = [];
+    g.links = [[30, 2, 0, 7, 0, "IMAGE"]];
+    const { workflow, warnings } = convertUiToApi(g as never, OBJECT_INFO);
+    expect(workflow["3"].inputs.images).toBeUndefined(); // NOT wired from the stale node 1
+    expect(joined(warnings)).toContain("names no broadcast node of its own");
+  });
+
+  it("a CONTROLLERLESS record that DOES match a live sender's feed is still materialized", () => {
+    const g = ueGraph(true) as unknown as { extra: { ue_links: Record<string, unknown>[] } };
+    delete g.extra.ue_links[0].controller;
+    const { workflow, warnings } = convertUiToApi(g as never, OBJECT_INFO);
+    expect(workflow["3"].inputs.images).toEqual(["1", 0]);
+    expect(warnings).toEqual([]);
+  });
+
+  it("a sender fed from a subgraph's INPUT boundary broadcasts the outer producer", () => {
+    // The producer of a broadcast inside a definition can be the definition's
+    // virtual input node — a recoverable connection (the outer component's
+    // matching input supplies it), not a missing producer.
+    const g = {
+      definitions: {
+        subgraphs: [
+          {
+            id: SG_ID,
+            name: "Inner",
+            inputNode: { id: -10 },
+            outputNode: { id: -20 },
+            inputs: [{ id: "i1", name: "image", type: "IMAGE", linkIds: [11] }],
+            outputs: [],
+            widgets: [],
+            extra: {
+              ue_links: [
+                {
+                  downstream: 3,
+                  downstream_slot: 0,
+                  upstream: -10,
+                  upstream_slot: 0,
+                  controller: 7,
+                  type: "IMAGE",
+                },
+              ],
+            },
+            nodes: [
+              {
+                id: 7,
+                type: "Anything Everywhere",
+                mode: 0,
+                inputs: [{ name: "anything", type: "*", link: 11 }],
+                outputs: [],
+                widgets_values: [],
+              },
+              {
+                id: 3,
+                type: "SaveImage",
+                mode: 0,
+                inputs: [{ name: "images", type: "IMAGE", link: null }],
+                outputs: [],
+                widgets_values: ["out"],
+              },
+            ],
+            links: [
+              { id: 11, origin_id: -10, origin_slot: 0, target_id: 7, target_slot: 0, type: "IMAGE" },
+            ],
+          },
+        ],
+      },
+      nodes: [
+        {
+          id: 1,
+          type: "LoadImage",
+          mode: 0,
+          inputs: [],
+          outputs: [{ name: "IMAGE", type: "IMAGE", links: [50] }],
+          widgets_values: ["a.png"],
+        },
+        {
+          id: 706,
+          type: SG_ID,
+          mode: 0,
+          properties: {},
+          inputs: [{ name: "image", type: "IMAGE", link: 50 }],
+          outputs: [],
+          widgets_values: [],
+        },
+      ],
+      links: [[50, 1, 0, 706, 0, "IMAGE"]],
+    } as never;
+    const { workflow, warnings } = convertUiToApi(g, OBJECT_INFO);
+    const save = Object.values(workflow).find((n) => n.class_type === "SaveImage")!;
+    expect(save.inputs.images).toEqual(["1", 0]);
+    expect(warnings).toEqual([]);
+  });
+
   it("a sender that IS its own producer (Seed Everywhere shape) is still materialized", () => {
     // The controller owns the widget, so it has no incoming feed to compare —
     // requiring one would drop every Seed Everywhere broadcast.
