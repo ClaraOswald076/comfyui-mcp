@@ -765,6 +765,22 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     const block = src.slice(start, src.indexOf("\n      return;", start));
     expect(block, "rewind must retire ask state").toContain("AskAnswers.closeAsks(");
 
+    // A PROVIDER SWITCH is a boundary for questions even though #468 deliberately
+    // re-addresses renders across it: a finished render is useful to whoever is
+    // on the tab now, an answer to a card the new conversation never put up is
+    // not. Both switch paths must retire the asks.
+    for (const guard of [
+      "if (providerSwitched) flushRunCompletions(panelTab);",
+      "if (prev !== reqBackend) flushRunCompletions(panelTab);",
+    ]) {
+      const at = src.indexOf(guard);
+      expect(at, `provider-switch site not found: ${guard}`).toBeGreaterThan(-1);
+      expect(
+        src.slice(at, at + 900),
+        `${guard} must retire ask state`,
+      ).toContain("AskAnswers.closeAsks(panelTab)");
+    }
+
     // The unsend hook must actually be wired, or closeAsks silently degrades to
     // "leave the stale copy queued".
     expect(src).toContain("AskAnswers.setRevoker(");

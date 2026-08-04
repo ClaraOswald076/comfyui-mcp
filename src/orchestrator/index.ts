@@ -3239,6 +3239,16 @@ export async function runPanelOrchestrator(): Promise<void> {
       // points at the NEW provider, so the completion reaches the conversation
       // the user actually switched to instead of waiting for their next message.
       if (providerSwitched) flushRunCompletions(panelTab);
+      // #486 — a provider switch IS a conversation boundary for QUESTIONS, even
+      // though it is deliberately NOT one for renders. A finished render is
+      // independently useful to whoever is on the tab now (the images are on the
+      // user's canvas either way), which is why #468 re-addresses it here. An
+      // ANSWER is not: the incoming provider's fresh conversation never put that
+      // card up, so announcing it as "a question card YOU put up" — or letting an
+      // identical re-ask recover it — hands one conversation a decision made in
+      // another. Retire the asks instead; closeAsks downgrades and unsends, it
+      // never deletes, so the answer is still reported.
+      AskAnswers.closeAsks(panelTab);
       // A headless client (mobile/remote pseudo-panel, no browser canvas) advertises
       // itself in the hello frame so its agent gets the in-turn-delivery directive.
       if ((event as { headless?: unknown }).headless === true) headlessTabs.add(panelTab);
@@ -3760,6 +3770,16 @@ export async function runPanelOrchestrator(): Promise<void> {
       // new one, so the completion reaches the conversation the user switched to
       // instead of sitting journaled until their next message.
       if (prev !== reqBackend) flushRunCompletions(panelTab);
+      // #486 — a provider switch IS a conversation boundary for QUESTIONS, even
+      // though it is deliberately NOT one for renders. A finished render is
+      // independently useful to whoever is on the tab now (the images are on the
+      // user's canvas either way), which is why #468 re-addresses it here. An
+      // ANSWER is not: the incoming provider's fresh conversation never put that
+      // card up, so announcing it as "a question card YOU put up" — or letting an
+      // identical re-ask recover it — hands one conversation a decision made in
+      // another. Retire the asks instead; closeAsks downgrades and unsends, it
+      // never deletes, so the answer is still reported.
+      AskAnswers.closeAsks(panelTab);
       // Leaving a LOCAL provider frees its VRAM (no other tab still on it) —
       // the point of switching to Claude/hosted is usually reclaiming the GPU.
       if (prev !== reqBackend) {
