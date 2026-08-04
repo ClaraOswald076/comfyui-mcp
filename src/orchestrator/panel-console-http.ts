@@ -495,13 +495,20 @@ export function startPanelConsoleHttpServer(opts: {
               : unverifiedRestore.length
                 ? `Restoring the slot could NOT be verified for ${unverifiedRestore.join(", ")} (the store was unreadable), so whether anything was half-applied is unknown — re-check before relying on it.`
                 : `The change was rolled back, so nothing was half-applied.`;
-            const hard = failed.length > 0 || stranded.length > 0;
-            sendJson(res, hard ? 500 : 200, {
-              ok: !hard,
+            // `unknown` is NOT a success. Answering 200 ok:true for a write
+            // whose read-back could not be performed asserts a definite
+            // configured state from a failed verification — the #826 shape
+            // reappearing inside the vocabulary introduced to prevent it
+            // (coordinator finding). `ok` is true only for a PROVEN save, which
+            // this branch is not, by construction.
+            const unverifiedSave = unconfirmed.filter((u) => u.persisted === "unknown");
+            sendJson(res, 500, {
+              ok: false,
               slot,
               // Key NAMES and verdicts only — never a value.
               unconfirmed,
               rolled_back: outcome.rolledBack,
+              ...(unverifiedSave.length ? { unverified_keys: unverifiedSave.map((u) => u.key) } : {}),
               ...(stranded.length ? { stranded_keys: stranded } : {}),
               ...(unverifiedRestore.length ? { unverified_restore_keys: unverifiedRestore } : {}),
               ...(failed.length
@@ -512,8 +519,8 @@ export function startPanelConsoleHttpServer(opts: {
                 : stranded.length
                   ? { error: `"${slot}" could not be saved cleanly. ${aftermath}` }
                   : {
-                      warning:
-                        `"${slot}" was written but the store could not be re-read to confirm it (${unconfirmed.map((u) => u.key).join(", ")}). Treat it as unverified. ${aftermath}`,
+                      error:
+                        `"${slot}" was written but the store could not be re-read to confirm it (${unconfirmed.map((u) => u.key).join(", ")}), so whether it is saved is UNKNOWN — do not treat it as configured. ${aftermath}`,
                     }),
             });
             return;

@@ -664,6 +664,69 @@ describe("slot saves report what the read-back PROVED (#826 gate round 3)", () =
   });
 });
 
+describe("a panel save never overwrites a REAL environment variable", () => {
+  it("stores the value but leaves the live env var and its provenance alone", () => {
+    // "A real env var wins" is this codebase's own rule. Overwriting process.env
+    // here AND calling markFileDerived on it replaced the live value and
+    // relabelled its provenance — so behaviour changed again after a restart,
+    // when the shell value came back.
+    resetEnvFileProvenanceForTests();
+    process.env.CIVITAI_API_TOKEN = "civ-from-shell";
+    writeFileSync(envPath, "CIVITAI_API_TOKEN=civ-in-file\n", { mode: 0o600 });
+
+    const r = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-from-panel");
+    expect(r.persisted).toBe("yes"); // it IS in the store
+    expect(r.shadowedByEnv).toBe(true); // but it is NOT what readers use
+    expect(process.env.CIVITAI_API_TOKEN).toBe("civ-from-shell"); // untouched
+    expect(readFileSync(envPath, "utf-8")).toContain("civ-from-panel");
+    // Still shell-provided: the file has not quietly become its authority.
+    expect(slotShellProvidedKeys("civitai")).toContain("CIVITAI_API_TOKEN");
+    expect(buildComfyuiMcpEnv({}).CIVITAI_API_TOKEN).toBe("civ-from-shell");
+  });
+
+  it("takes effect the moment the environment variable is unset", () => {
+    resetEnvFileProvenanceForTests();
+    process.env.CIVITAI_API_TOKEN = "civ-from-shell";
+    setComfyuiSecret("CIVITAI_API_TOKEN", "civ-from-panel");
+    delete process.env.CIVITAI_API_TOKEN;
+    expect(buildComfyuiMcpEnv({}).CIVITAI_API_TOKEN).toBe("civ-from-panel");
+  });
+
+  it("marks NOT shadowed when no environment variable is in the way", () => {
+    resetEnvFileProvenanceForTests();
+    const r = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-from-panel");
+    expect(r.shadowedByEnv).toBeUndefined();
+    expect(process.env.CIVITAI_API_TOKEN).toBe("civ-from-panel");
+  });
+});
+
+describe("the child env is built BY CONSTRUCTION from the resolver", () => {
+  it("drops a revoked credential the CALLER copied into the base env", () => {
+    // Object spreading can add and overwrite but never REMOVE, so a token the
+    // caller copied into `base` from raw process.env survived an external revoke
+    // that the resolver had correctly dropped — and the next child inherited the
+    // stale token unmarked, treating it as a real env override. A revoke that
+    // does not revoke.
+    resetEnvFileProvenanceForTests();
+    writeFileSync(envPath, "# revoked externally\n", { mode: 0o600 });
+    const env = buildComfyuiMcpEnv({
+      COMFYUI_URL: "http://x",
+      CIVITAI_API_TOKEN: "stale-from-base",
+      HF_TOKEN: "stale-from-base",
+    });
+    expect(env.CIVITAI_API_TOKEN).toBeUndefined();
+    expect(env.HF_TOKEN).toBeUndefined();
+    expect(env.COMFYUI_URL).toBe("http://x"); // non-credential base keys untouched
+  });
+
+  it("still lets the resolver's CURRENT value overwrite a stale base value", () => {
+    resetEnvFileProvenanceForTests();
+    writeFileSync(envPath, "CIVITAI_API_TOKEN=civ-current\n", { mode: 0o600 });
+    const env = buildComfyuiMcpEnv({ CIVITAI_API_TOKEN: "stale-from-base" });
+    expect(env.CIVITAI_API_TOKEN).toBe("civ-current");
+  });
+});
+
 describe("a blank value is REFUSED, not confirmed (#826 gate round 2)", () => {
   it("refuses a whitespace-only value that would write and read back cleanly", () => {
     // It would persist perfectly and be reported as verified, while every reader

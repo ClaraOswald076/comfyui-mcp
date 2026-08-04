@@ -20,12 +20,19 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "panel-console-"));
   process.env.COMFYUI_MCP_LORA_CATALOG = join(dir, "lora-catalog.json");
   process.env.COMFYUI_MCP_LORA_PREVIEWS = join(dir, "previews");
+  // This file only READS /api/secrets, but point the credential store at a temp
+  // path anyway: a test must never be able to touch the developer's real
+  // ~/.comfyui-mcp/.env, and the next write-shaped case added here would.
+  process.env.COMFYUI_MCP_ENV_FILE = join(dir, ".env");
+  process.env.COMFYUI_MCP_PANEL_SECRETS = join(dir, "panel-secrets.json");
   resetLoraCatalog();
 });
 
 afterEach(() => {
   delete process.env.COMFYUI_MCP_LORA_CATALOG;
   delete process.env.COMFYUI_MCP_LORA_PREVIEWS;
+  delete process.env.COMFYUI_MCP_ENV_FILE;
+  delete process.env.COMFYUI_MCP_PANEL_SECRETS;
   resetLoraCatalog();
   rmSync(dir, { recursive: true, force: true });
 });

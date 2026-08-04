@@ -257,6 +257,10 @@ export interface SecretSaveReceipt {
    *  still in effect after the rollback (a previous working value). Lets the
    *  refusal avoid the false "nothing is configured". Presence only. */
   stillConfigured?: boolean;
+  /** The value WAS stored, but a real environment variable of the same name
+   *  outranks the store, so readers use that instead. Saying "saved" without
+   *  saying this would report a configured state the tools do not use. */
+  shadowedByEnv?: boolean;
 }
 
 /**
@@ -530,11 +534,20 @@ export function setEnvSecret(
   const previous = process.env[trimmed];
   const previouslyShellProvided = isShellProvided(trimmed);
   upsertEnvFile(trimmed, value);
-  process.env[trimmed] = value; // live in-process effect (env wins over the file)
-  // The canonical file is now this key's AUTHORITY even though we just assigned
-  // process.env, so a later re-read (a rotate by another process, a revoke) wins
-  // over this in-memory copy instead of being pinned by it.
-  markFileDerived(trimmed);
+  // A REAL environment variable outranks the store — that is this codebase's own
+  // rule, and the panel does not get to break it. Overwriting process.env here
+  // (and calling markFileDerived on it) replaced the live shell value AND
+  // relabelled its provenance, so behaviour changed again after a full restart
+  // when the shell value came back (coordinator finding). The value IS written
+  // to the store, so it takes effect the moment the env var is unset; until then
+  // the receipt says plainly that it is not the value in use.
+  if (!previouslyShellProvided) {
+    process.env[trimmed] = value; // live in-process effect
+    // The canonical file is now this key's AUTHORITY even though we just assigned
+    // process.env, so a later re-read (a rotate by another process, a revoke) wins
+    // over this in-memory copy instead of being pinned by it.
+    markFileDerived(trimmed);
+  }
   // VERIFY the write by reading the canonical file back. Reporting "saved" from
   // the mere absence of a throw is how a caller ends up believing it is
   // configured while nothing downstream can see the value (#826). The comparison
@@ -593,6 +606,7 @@ export function setEnvSecret(
     path: envFilePath(),
     persisted,
     livePickup: hasLivePickup(trimmed),
+    ...(previouslyShellProvided ? { shadowedByEnv: true } : {}),
     respawn: reports.length
       ? reports.reduce(
           (a, b) => ({
@@ -842,7 +856,7 @@ export function buildComfyuiMcpEnv(base: Record<string, string>): Record<string,
   // a value that merely went stale because another writer rotated the file is
   // still file-owned (codex gate, round 2, finding 2).
   const managed = Object.keys(secrets).filter((k) => !isShellProvided(k));
-  return {
+  const out: Record<string, string> = {
     ...base,
     // PIN the canonical dotenv path into the child (#826). The child resolves
     // credentials from that file at access time, so if the orchestrator writes
@@ -857,6 +871,17 @@ export function buildComfyuiMcpEnv(base: Record<string, string>): Record<string,
     ...(managed.length ? { [MANAGED_SECRET_KEYS_ENV]: managed.join(",") } : {}),
     ...secrets,
   };
+  // The RESOLVER is authoritative for the WHOLE allowlist, not just for the keys
+  // it happens to supply. Object spreading can only add and overwrite — it can
+  // never REMOVE — so a credential the caller copied into `base` from raw
+  // process.env survived an external revoke that `loadComfyuiSecretEnv` had
+  // correctly dropped, and the next child inherited the stale token unmarked and
+  // treated it as a real env override (coordinator finding). Deleting what the
+  // resolver did not provide makes a revoke actually revoke, by construction.
+  for (const key of COMFYUI_SECRET_ENV_ALLOWLIST) {
+    if (!(key in secrets)) delete out[key];
+  }
+  return out;
 }
 
 // ── Agent-provider spawn env (tool-secret scoping) ───────────────────────────
