@@ -150,6 +150,19 @@ describe("panel_request_secret cannot report a secret the tools cannot see (#826
     expect(textOf(res)).toContain("nothing was saved");
   });
 
+  it("treats a WHITESPACE-ONLY paste as nothing entered", async () => {
+    // A blank persists and reads back perfectly, so it would be reported as a
+    // VERIFIED save while every reader treats it as absent — a confirmed save
+    // nothing downstream can use.
+    for (const blank of ["   ", "\t", "\n "]) {
+      setComfyuiSecretMock.mockClear();
+      const res = await callRequestSecret({}, blank);
+      expect(setComfyuiSecretMock).not.toHaveBeenCalled();
+      expect(textOf(res)).toContain("nothing was saved");
+      expect(res.isError).toBeFalsy();
+    }
+  });
+
   it("refuses an orchestrator provider key whose save did not land, instead of claiming a provider is enabled", async () => {
     setAgentSecretMock.mockReturnValue(
       receipt({ key: "OPENROUTER_API_KEY", persisted: "no", livePickup: true }),

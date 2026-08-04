@@ -23,8 +23,11 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import {
   comfyuiEnvFilePath,
+  freshSecretValue,
+  isShellProvided,
   markFileDerived,
   parseEnvFile,
+  unmarkFileDerived,
   MANAGED_SECRET_KEYS_ENV,
 } from "../env-file.js";
 import { logger } from "../utils/logger.js";
@@ -201,6 +204,10 @@ export interface SecretSaveReceipt {
   /** What the orchestrator's listener reported. `null` when NO listener answered
    *  — then nothing is known to be driving a respawn and we must not claim one. */
   respawn: SecretRespawnReport | null;
+  /** Only set when `persisted === "no"`: whether SOME credential for this key is
+   *  still in effect after the rollback (a previous working value). Lets the
+   *  refusal avoid the false "nothing is configured". Presence only. */
+  stillConfigured?: boolean;
 }
 
 /**
@@ -300,34 +307,62 @@ export function envFilePath(): string {
  * `encodeEnvValue` returns null when the value cannot be represented faithfully;
  * the caller REFUSES rather than writing something that reads back different.
  */
-function encodeEnvValue(value: string): string | null {
-  if (!/[\s#"'\\]/.test(value)) return value;
-  if (!value.includes("'") && !/[\n\r]/.test(value)) return `'${value}'`;
-  if (!value.includes('"') && !value.includes("\\")) {
-    return `"${value.replace(/\r/g, "\\r").replace(/\n/g, "\\n")}"`;
-  }
-  return null;
+function envValueCandidates(value: string): string[] {
+  return [
+    value, // bare — only survives when the value needs no quoting at all
+    `'${value}'`, // single-quoted: dotenv takes these literally
+    `"${value}"`, // double-quoted
+    `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`, // double-quoted, escaped
+  ];
 }
 
-/** Build the `KEY=value` line and PROVE dotenv reads it back as the same value.
- *  Throws (without ever including the value) when it cannot be represented — a
- *  refusal before the write, not a corrupt store discovered afterwards. */
+/**
+ * Build the `KEY=value` line and PROVE dotenv reads it back as the same value.
+ *
+ * Candidates are TRIED, not guessed: a hand-picked encoding plus a "does this
+ * round-trip?" check only validates the encoding it happened to choose, so a
+ * value another encoding could store faithfully would be refused for no reason
+ * (codex gate, round 2, finding 5). The first candidate dotenv reverses exactly
+ * wins; only if none does is the value refused — before the file is touched, and
+ * without ever including the value in the error.
+ */
 function encodeEnvLine(key: string, value: string): string {
-  const encoded = encodeEnvValue(value);
-  const line = encoded === null ? null : `${key}=${encoded}`;
-  if (line === null || dotenv.parse(line)[key] !== value) {
+  if (/[\n\r]/.test(value)) {
+    // A multi-line value CAN be quoted such that dotenv reverses it, but this
+    // store's upsert/remove are LINE-based: the next save of any other key would
+    // match only the value's first physical line and leave its continuation
+    // behind as garbage. Refusing is the honest option — no credential this tool
+    // accepts contains a line break, and a store that silently corrupts on the
+    // next unrelated write is worse than one that says no.
     throw new Error(
-      `The value supplied for "${key}" cannot be stored faithfully in ${envFilePath()} — ` +
-        `it contains a combination of quote, backslash and newline characters this dotenv store cannot round-trip. ` +
-        `Nothing was written. Set ${key} as a real environment variable instead (it takes precedence over the file), ` +
-        `or re-issue a token without those characters.`,
+      `The value supplied for "${key}" cannot be stored faithfully in ${envFilePath()} — it contains a line break, ` +
+        `which this line-based store cannot hold without corrupting on a later write. Nothing was written. ` +
+        `Set ${key} as a real environment variable instead (it takes precedence over the file), or re-issue it without line breaks.`,
     );
   }
-  return line;
+  for (const candidate of envValueCandidates(value)) {
+    const line = `${key}=${candidate}`;
+    try {
+      if (dotenv.parse(line)[key] === value) return line;
+    } catch {
+      // Unrepresentable in this form — try the next.
+    }
+  }
+  throw new Error(
+    `The value supplied for "${key}" cannot be stored faithfully in ${envFilePath()} — ` +
+      `no dotenv encoding of it reads back as the value given (this happens with combinations of quote, backslash and newline characters). ` +
+      `Nothing was written. Set ${key} as a real environment variable instead (it takes precedence over the file), ` +
+      `or re-issue a token without those characters.`,
+  );
 }
 
 /** Upsert `KEY=value` into the canonical .env, 0600, preserving every other line
- *  (comments included). Replaces the first uncommented `KEY=` line, else appends. */
+ *  (comments included). Replaces the FIRST uncommented `KEY=` line and DROPS any
+ *  later duplicates, else appends. Dropping the duplicates matters: dotenv lets a
+ *  later assignment win, so replacing only the first would leave a stale line
+ *  authoritative — the save would report a value the readers never resolve
+ *  (codex gate, round 2, finding 3). The read-back would catch it, but leaving
+ *  one line for the key means there is nothing to catch. */
 function upsertEnvFile(key: string, value: string): void {
   // Encode + verify BEFORE touching the file, so an unrepresentable value never
   // half-lands (it would read back different and look like tampering).
@@ -335,14 +370,19 @@ function upsertEnvFile(key: string, value: string): void {
   const p = envFilePath();
   mkdirSync(dirname(p), { recursive: true });
   const raw = existsSync(p) ? readFileSync(p, "utf-8") : "";
-  const lines = raw.length ? raw.split(/\r?\n/) : [];
+  const original = raw.length ? raw.split(/\r?\n/) : [];
   const re = new RegExp(`^\\s*${key}\\s*=`);
+  const lines: string[] = [];
   let replaced = false;
-  for (let i = 0; i < lines.length; i++) {
-    if (!replaced && re.test(lines[i])) {
-      lines[i] = line;
-      replaced = true;
+  for (const existing of original) {
+    if (re.test(existing)) {
+      if (!replaced) {
+        lines.push(line);
+        replaced = true;
+      }
+      continue; // a later duplicate would outrank the line we just wrote
     }
+    lines.push(existing);
   }
   if (!replaced) {
     // Drop a single trailing empty line so we don't accumulate blanks, then add.
@@ -403,7 +443,18 @@ export function setEnvSecret(
       `Env var "${trimmed}" is not an accepted secret. Allowed: ${[...new Set([...COMFYUI_SECRET_ENV_ALLOWLIST, ...AGENT_SECRET_ENV_ALLOWLIST])].join(", ")}.`,
     );
   }
+  if (value.trim() === "") {
+    // A blank/whitespace-only value WRITES and READS BACK fine, so the save
+    // would be confirmed — while every reader (freshSecretValue) treats a blank
+    // as absent and every request stays unauthenticated. That is precisely the
+    // #826 shape: a confirmed save nothing downstream can use (codex gate,
+    // round 2, finding 1). Refuse it up front; nothing is written.
+    throw new Error(
+      `No value was supplied for "${trimmed}" (it was empty or whitespace only). Nothing was saved — the credential is still unset.`,
+    );
+  }
   const previous = process.env[trimmed];
+  const previouslyShellProvided = isShellProvided(trimmed);
   upsertEnvFile(trimmed, value);
   process.env[trimmed] = value; // live in-process effect (env wins over the file)
   // The canonical file is now this key's AUTHORITY even though we just assigned
@@ -427,12 +478,21 @@ export function setEnvSecret(
     // the opposite false verdict).
     if (previous === undefined) delete process.env[trimmed];
     else process.env[trimmed] = previous;
+    // Restore the key's PRECEDENCE too — leaving it marked file-derived would
+    // change how the restored value resolves from here on (codex gate, round 2,
+    // finding 3).
+    if (previouslyShellProvided) unmarkFileDerived(trimmed);
     return {
       key: trimmed,
       path: envFilePath(),
       persisted,
       livePickup: hasLivePickup(trimmed),
       respawn: null,
+      // Whether a credential for this key is STILL in effect after the rollback.
+      // "Nothing is configured" is false when a previous working value survived,
+      // and telling the user that would send them hunting the wrong problem.
+      // Presence only — the value is neither returned nor logged.
+      stillConfigured: freshSecretValue(trimmed) !== undefined,
     };
   }
   // Only a COMFYUI tool secret should restart the comfyui MCP child + inject the
@@ -579,11 +639,14 @@ export function clearOAuthStatus(provider: string): void {
  *  FILTERED through the allowlist (defense in depth): even a hand-edited/corrupt
  *  panel-secrets.json can only ever contribute allowlisted credential keys. */
 export function loadComfyuiSecretEnv(): Record<string, string> {
-  // Canonical source is process.env (loaded from ~/.comfyui-mcp/.env at boot +
-  // updated live by setEnvSecret), allowlist-filtered.
+  // Resolved through freshSecretValue, allowlist-filtered: a real env var still
+  // wins, otherwise the canonical .env is re-read NOW. Reading raw process.env
+  // here would inject a value that went stale when another writer rotated the
+  // file, and the child would then pin that stale copy (codex gate, round 2,
+  // finding 2).
   const out: Record<string, string> = {};
   for (const k of COMFYUI_SECRET_ENV_ALLOWLIST) {
-    const v = process.env[k];
+    const v = freshSecretValue(k);
     if (typeof v === "string" && v) out[k] = v;
   }
   return out;
@@ -628,10 +691,12 @@ export function removeComfyuiSecret(key: string): boolean {
 /** The persisted agent-provider secrets (e.g. OPENROUTER_API_KEY), filtered
  *  through the agent allowlist. Never logged. */
 export function loadAgentSecretEnv(): Record<string, string> {
-  // Canonical source is process.env (from ~/.comfyui-mcp/.env), allowlist-filtered.
+  // Same access-time resolution as loadComfyuiSecretEnv: env wins, else the
+  // canonical .env re-read now, so the readiness/masked-slot views never report
+  // a value the file no longer carries.
   const out: Record<string, string> = {};
   for (const k of AGENT_SECRET_ENV_ALLOWLIST) {
-    const v = process.env[k];
+    const v = freshSecretValue(k);
     if (typeof v === "string" && v) out[k] = v;
   }
   return out;
@@ -694,12 +759,12 @@ export function buildComfyuiMcpEnv(base: Record<string, string>): Record<string,
   const secrets = loadComfyuiSecretEnv();
   // Which of the injected credentials does the canonical FILE own? Those must be
   // marked so the child treats its inherited copy as file-derived and a later
-  // rotate/revoke supersedes it (codex gate, round 1, finding 1). A key the file
-  // does NOT carry the same value for came from a real environment variable —
-  // the shell escape hatch — and the child must keep pinning it. Determined by
-  // comparing against the file rather than by bookkeeping, so it cannot drift.
-  const file = parseEnvFile();
-  const managed = file ? Object.keys(secrets).filter((k) => file[k] === secrets[k]) : [];
+  // rotate/revoke supersedes it (codex gate, round 1, finding 1). Only a
+  // SHELL-provided key — a real environment variable, the escape hatch — is left
+  // unmarked, so the child keeps pinning it. Provenance, not a value comparison:
+  // a value that merely went stale because another writer rotated the file is
+  // still file-owned (codex gate, round 2, finding 2).
+  const managed = Object.keys(secrets).filter((k) => !isShellProvided(k));
   return {
     ...base,
     // PIN the canonical dotenv path into the child (#826). The child resolves

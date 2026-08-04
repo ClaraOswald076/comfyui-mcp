@@ -13,29 +13,44 @@
 // Nothing here logs a secret value; the receipt itself never carries one.
 
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 // The read-back is what makes "saved" an observation instead of an assumption,
-// so the tests must be able to make the store DISAGREE with the write (a
-// concurrent writer, a read-only overlay, a filesystem that discarded it) and to
-// make it UNREADABLE. Both are properties of parseEnvFile, mocked here with a
-// pass-through default so every other test still exercises the real store.
-const store = vi.hoisted(() => ({ mode: "real" as "real" | "drop" | "tamper" | "unreadable" }));
-vi.mock("../../env-file.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../../env-file.js")>();
+// so the tests must be able to reproduce the case it exists for: the write call
+// RETURNS NORMALLY and the store does not end up carrying the value (a read-only
+// overlay, a filesystem that discarded it, another process rewriting the file).
+// That is modelled at the lowest honest level — writeFileSync becomes a no-op —
+// so the ENTIRE real read-back path runs, including env-file's own internal file
+// read, which a module-level mock of parseEnvFile would not intercept.
+const fsState = vi.hoisted(() => ({
+  /** The write returns normally but the store never takes it. */
+  swallowWrites: false,
+  /** The write lands, then the store becomes unreadable — so the read-back
+   *  cannot reach a verdict either way. */
+  breakReadsAfterWrite: false,
+  readsBroken: false,
+}));
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  const writeFileSync: typeof actual.writeFileSync = (...args) => {
+    if (fsState.swallowWrites) return;
+    const out = actual.writeFileSync(...args);
+    if (fsState.breakReadsAfterWrite) fsState.readsBroken = true;
+    return out;
+  };
+  const readFileSync: typeof actual.readFileSync = ((...args: Parameters<typeof actual.readFileSync>) => {
+    if (fsState.readsBroken && String(args[0]).endsWith(".env")) {
+      throw Object.assign(new Error("EIO: i/o error, read"), { code: "EIO" });
+    }
+    return actual.readFileSync(...args);
+  }) as typeof actual.readFileSync;
   return {
     ...actual,
-    parseEnvFile: () => {
-      if (store.mode === "unreadable") return null;
-      const real = actual.parseEnvFile();
-      if (!real || store.mode === "real") return real;
-      const copy = { ...real };
-      if (store.mode === "drop") delete copy.CIVITAI_API_TOKEN;
-      else copy.CIVITAI_API_TOKEN = "somebody-elses-value";
-      return copy;
-    },
+    default: { ...actual, writeFileSync, readFileSync },
+    writeFileSync,
+    readFileSync,
   };
 });
 
@@ -49,7 +64,10 @@ import {
   AGENT_SECRET_ENV_ALLOWLIST,
   type SecretRespawnReport,
 } from "../../services/panel-secrets.js";
-import { MANAGED_SECRET_KEYS_ENV } from "../../env-file.js";
+import {
+  resetEnvFileProvenanceForTests,
+  MANAGED_SECRET_KEYS_ENV,
+} from "../../env-file.js";
 
 const ALL_KEYS = [...new Set([...COMFYUI_SECRET_ENV_ALLOWLIST, ...AGENT_SECRET_ENV_ALLOWLIST])];
 
@@ -58,7 +76,9 @@ let envPath: string;
 let saved: Record<string, string | undefined>;
 
 beforeEach(() => {
-  store.mode = "real";
+  fsState.swallowWrites = false;
+  fsState.breakReadsAfterWrite = false;
+  fsState.readsBroken = false;
   dir = mkdtempSync(join(tmpdir(), "cmcp-receipt-"));
   envPath = join(dir, ".env");
   process.env.COMFYUI_MCP_ENV_FILE = envPath;
@@ -67,17 +87,47 @@ beforeEach(() => {
     saved[k] = process.env[k];
     delete process.env[k];
   }
+  // The file-derived marks are module-global; without this a key marked by an
+  // earlier test would still count as file-owned here.
+  resetEnvFileProvenanceForTests();
 });
 
 afterEach(() => {
-  store.mode = "real";
+  fsState.swallowWrites = false;
+  fsState.breakReadsAfterWrite = false;
+  fsState.readsBroken = false;
   delete process.env.COMFYUI_MCP_ENV_FILE;
   for (const k of ALL_KEYS) {
     if (saved[k] === undefined) delete process.env[k];
     else process.env[k] = saved[k];
   }
+  resetEnvFileProvenanceForTests();
   rmSync(dir, { recursive: true, force: true });
 });
+
+/** Reproduce "the write returned normally, the store did not take it". The store
+ *  must EXIST for this to be a "no" rather than an "unknown" — an absent file
+ *  means we could not determine anything, which is a different verdict. */
+function withSwallowedWrites<T>(fn: () => T): T {
+  if (!existsSync(envPath)) writeFileSync(envPath, "# store exists but is empty\n", { mode: 0o600 });
+  fsState.swallowWrites = true;
+  try {
+    return fn();
+  } finally {
+    fsState.swallowWrites = false;
+  }
+}
+
+/** Reproduce "the write landed, then the store could not be re-read". */
+function withUnreadableReadBack<T>(fn: () => T): T {
+  fsState.breakReadsAfterWrite = true;
+  try {
+    return fn();
+  } finally {
+    fsState.breakReadsAfterWrite = false;
+    fsState.readsBroken = false;
+  }
+}
 
 describe("secret save receipt: persistence is VERIFIED, not assumed (#826)", () => {
   it("reports persisted:'yes' only after a read-back of the canonical file agrees", () => {
@@ -92,22 +142,31 @@ describe("secret save receipt: persistence is VERIFIED, not assumed (#826)", () 
     // read-back proves the store does not have it, so the save did not take
     // effect and the caller must refuse rather than send the user back into the
     // same 401 believing it is fixed.
-    store.mode = "drop";
-    expect(setComfyuiSecret("CIVITAI_API_TOKEN", "civ-abc").persisted).toBe("no");
+    const r = withSwallowedWrites(() => setComfyuiSecret("CIVITAI_API_TOKEN", "civ-abc"));
+    expect(r.persisted).toBe("no");
   });
 
   it("reports persisted:'no' when the store carries the key with a DIFFERENT value", () => {
     // Same-key/other-value is the dangerous near-miss: a presence-only check would
     // read as success while the tools go on using somebody else's credential.
-    store.mode = "tamper";
-    expect(setComfyuiSecret("CIVITAI_API_TOKEN", "civ-second").persisted).toBe("no");
+    writeFileSync(envPath, "CIVITAI_API_TOKEN=somebody-elses-value\n", { mode: 0o600 });
+    const r = withSwallowedWrites(() => setComfyuiSecret("CIVITAI_API_TOKEN", "civ-second"));
+    expect(r.persisted).toBe("no");
   });
 
   it("reports persisted:'unknown' when the store cannot be re-read at all", () => {
     // "Could not determine" must stay undetermined — it may never harden into
     // either verdict, in either direction.
-    store.mode = "unreadable";
-    expect(setComfyuiSecret("CIVITAI_API_TOKEN", "civ-abc").persisted).toBe("unknown");
+    const r = withUnreadableReadBack(() => setComfyuiSecret("CIVITAI_API_TOKEN", "civ-abc"));
+    expect(r.persisted).toBe("unknown");
+  });
+
+  it("does NOT roll back on 'unknown' — the value may well be in place", () => {
+    // Refusing after an action that may have succeeded is its own error. An
+    // unverifiable save is DISCLOSED, not undone.
+    const r = withUnreadableReadBack(() => setComfyuiSecret("CIVITAI_API_TOKEN", "civ-abc"));
+    expect(r.persisted).toBe("unknown");
+    expect(process.env.CIVITAI_API_TOKEN).toBe("civ-abc");
   });
 
   it("ROLLS BACK process.env on persisted:'no', so 'nothing is configured' is true", () => {
@@ -116,33 +175,93 @@ describe("secret save receipt: persistence is VERIFIED, not assumed (#826)", () 
     // reported failure and told the caller not to retry: the opposite false
     // verdict to #826, and just as misleading.
     expect(process.env.CIVITAI_API_TOKEN).toBeUndefined();
-    store.mode = "drop";
-    expect(setComfyuiSecret("CIVITAI_API_TOKEN", "civ-abc").persisted).toBe("no");
+    const r = withSwallowedWrites(() => setComfyuiSecret("CIVITAI_API_TOKEN", "civ-abc"));
+    expect(r.persisted).toBe("no");
     expect(process.env.CIVITAI_API_TOKEN).toBeUndefined();
     expect(buildComfyuiMcpEnv({}).CIVITAI_API_TOKEN).toBeUndefined();
   });
 
   it("restores the PREVIOUS value on persisted:'no' rather than clearing a working one", () => {
-    store.mode = "real";
     setComfyuiSecret("CIVITAI_API_TOKEN", "civ-working");
     expect(process.env.CIVITAI_API_TOKEN).toBe("civ-working");
-    store.mode = "drop";
-    expect(setComfyuiSecret("CIVITAI_API_TOKEN", "civ-broken").persisted).toBe("no");
+    const r = withSwallowedWrites(() => setComfyuiSecret("CIVITAI_API_TOKEN", "civ-broken"));
+    expect(r.persisted).toBe("no");
     expect(process.env.CIVITAI_API_TOKEN).toBe("civ-working");
+  });
+
+  it("restores the previous value's PRECEDENCE too, not just its text", () => {
+    // The save marks the key file-derived (the file becomes its authority). A
+    // rollback must undo that as well, or a SHELL-provided credential silently
+    // becomes overridable by the file from then on — the failed save would have
+    // changed how a value it did not store resolves.
+    process.env.CIVITAI_API_TOKEN = "civ-from-shell";
+    writeFileSync(envPath, "# empty\n", { mode: 0o600 });
+    const r = withSwallowedWrites(() => setComfyuiSecret("CIVITAI_API_TOKEN", "civ-broken"));
+    expect(r.persisted).toBe("no");
+    expect(process.env.CIVITAI_API_TOKEN).toBe("civ-from-shell");
+    // The file now names a different value; the shell one must still win.
+    writeFileSync(envPath, "CIVITAI_API_TOKEN=civ-from-file\n", { mode: 0o600 });
+    expect(buildComfyuiMcpEnv({}).CIVITAI_API_TOKEN).toBe("civ-from-shell");
   });
 
   it("emits NO change event on persisted:'no' — a failed save must set nothing in motion", () => {
     const cb = vi.fn();
     const off = onComfyuiSecretsChanged(cb);
     try {
-      store.mode = "drop";
-      const r = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-abc", { requested: true });
+      const r = withSwallowedWrites(() =>
+        setComfyuiSecret("CIVITAI_API_TOKEN", "civ-abc", { requested: true }),
+      );
       expect(r.persisted).toBe("no");
       expect(r.respawn).toBeNull();
       expect(cb).not.toHaveBeenCalled();
     } finally {
       off();
     }
+  });
+});
+
+describe("a blank value is REFUSED, not confirmed (#826 gate round 2)", () => {
+  it("refuses a whitespace-only value that would write and read back cleanly", () => {
+    // It would persist perfectly and be reported as verified, while every reader
+    // (freshSecretValue) treats a blank as absent — a confirmed save nothing
+    // downstream can use, which is exactly the #826 shape.
+    expect(() => setComfyuiSecret("CIVITAI_API_TOKEN", "   ")).toThrow(
+      /empty or whitespace only/,
+    );
+    expect(() => setComfyuiSecret("CIVITAI_API_TOKEN", "")).toThrow(/empty or whitespace only/);
+  });
+
+  it("writes nothing when it refuses, leaving the credential unset", () => {
+    try {
+      setComfyuiSecret("CIVITAI_API_TOKEN", " ");
+    } catch {
+      /* expected */
+    }
+    expect(process.env.CIVITAI_API_TOKEN).toBeUndefined();
+    expect(buildComfyuiMcpEnv({}).CIVITAI_API_TOKEN).toBeUndefined();
+  });
+
+  it("does not clobber an already-working value when it refuses", () => {
+    setComfyuiSecret("CIVITAI_API_TOKEN", "civ-working");
+    expect(() => setComfyuiSecret("CIVITAI_API_TOKEN", "  ")).toThrow();
+    expect(process.env.CIVITAI_API_TOKEN).toBe("civ-working");
+  });
+});
+
+describe("a rolled-back save reports whether a credential SURVIVED (#826 gate round 2)", () => {
+  it("reports stillConfigured:false when nothing was configured before", () => {
+    const r = withSwallowedWrites(() => setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new"));
+    expect(r.persisted).toBe("no");
+    expect(r.stillConfigured).toBe(false);
+  });
+
+  it("reports stillConfigured:true when a previous working value survived the rollback", () => {
+    // "Nothing is configured" would be FALSE here, and would send the user after
+    // the wrong problem — the old credential is still the one in use.
+    setComfyuiSecret("CIVITAI_API_TOKEN", "civ-working");
+    const r = withSwallowedWrites(() => setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new"));
+    expect(r.persisted).toBe("no");
+    expect(r.stillConfigured).toBe(true);
   });
 });
 
@@ -153,34 +272,108 @@ describe("secret values must survive the dotenv round trip, or be refused (#826 
     expect(process.env.CIVITAI_API_TOKEN).toBe("a token with spaces");
   });
 
-  it("stores a value containing a hash, a quote or a backslash without corrupting it", () => {
-    for (const v of ['tok#1', 'tok"quoted', "tok\\back\\slash", "tok'single"]) {
+  it("stores awkward but representable values without corrupting them", () => {
+    // Each of these is representable in SOME dotenv encoding, so each must be
+    // stored, not refused: refusing a storable credential is its own dead end.
+    for (const v of [
+      "tok#1",
+      'tok"quoted',
+      "tok\\back\\slash",
+      "tok'single",
+      `a'b\\c`,
+      `mix'and"quotes`,
+      " leading-and-trailing ",
+      "tok=with=equals",
+    ]) {
       const r = setComfyuiSecret("CIVITAI_API_TOKEN", v);
       expect(r.persisted).toBe("yes");
       expect(process.env.CIVITAI_API_TOKEN).toBe(v);
     }
   });
 
-  it("REFUSES a value it cannot represent, rather than writing something different", () => {
-    // A value carrying both quote flavours plus a backslash has no faithful
-    // dotenv encoding. Storing a mangled copy would be the worst outcome: the
-    // save reports success and every request authenticates with the wrong token.
-    expect(() => setComfyuiSecret("CIVITAI_API_TOKEN", `a'b"c\\d`)).toThrow(
+  it("survives the round trip through the FILE, not just through process.env", () => {
+    // process.env is assigned from the in-memory value, so only re-reading the
+    // file proves the stored form decodes back to what was supplied.
+    for (const v of ["tok#1", 'tok"quoted', "tok\\back\\slash", "tok'single"]) {
+      setComfyuiSecret("CIVITAI_API_TOKEN", v);
+      expect(readFileSync(envPath, "utf-8")).not.toBe("");
+      delete process.env.CIVITAI_API_TOKEN;
+      expect(buildComfyuiMcpEnv({}).CIVITAI_API_TOKEN).toBe(v);
+    }
+  });
+
+  it("REFUSES a value no encoding can store, rather than writing something different", () => {
+    // Storing a mangled copy would be the worst outcome: the save reports
+    // success and every request then authenticates with the wrong token.
+    // (Found by exhaustive search over dotenv 16.6.1: no encoding of this
+    // combination of a single quote, a double quote and a `#` round-trips.)
+    const unstorable = `a'"#`;
+    expect(() => setComfyuiSecret("CIVITAI_API_TOKEN", unstorable)).toThrow(
       /cannot be stored faithfully/,
     );
     // ...and it says how to proceed from here.
-    expect(() => setComfyuiSecret("CIVITAI_API_TOKEN", `a'b"c\\d`)).toThrow(
+    expect(() => setComfyuiSecret("CIVITAI_API_TOKEN", unstorable)).toThrow(
       /real environment variable/,
     );
   });
 
   it("never includes the value in the refusal", () => {
     try {
-      setComfyuiSecret("CIVITAI_API_TOKEN", `secret'value"with\\everything`);
+      setComfyuiSecret("CIVITAI_API_TOKEN", `sentinelvalue'"#`);
       throw new Error("expected a refusal");
     } catch (err) {
-      expect((err as Error).message).not.toContain("secret");
+      expect((err as Error).message).not.toContain("sentinelvalue");
+      expect((err as Error).message).toContain("cannot be stored faithfully");
     }
+  });
+
+  it("either stores a value FAITHFULLY or refuses it — never stores a different value", () => {
+    // The invariant behind the whole encoder. Storing something the reader will
+    // resolve differently is the silent version of #826: the save reports
+    // success and every request then authenticates with the wrong token.
+    const nasty = [
+      "plain",
+      "tok#1",
+      'tok"quoted',
+      "tok'single",
+      "tok\\back\\slash",
+      " padded ",
+      "with=equals",
+      "with\nnewline",
+      "with\rcr",
+      "back\\slash\"and'quote",
+      `a'"#`,
+      `a'"#`,
+      `'`,
+      `"`,
+      `\\`,
+    ];
+    for (const v of nasty) {
+      let stored: string | undefined;
+      try {
+        expect(setComfyuiSecret("CIVITAI_API_TOKEN", v).persisted).toBe("yes");
+        delete process.env.CIVITAI_API_TOKEN;
+        stored = buildComfyuiMcpEnv({}).CIVITAI_API_TOKEN;
+      } catch (err) {
+        expect((err as Error).message).toMatch(/cannot be stored faithfully/);
+        continue;
+      }
+      expect(stored).toBe(v);
+    }
+  });
+
+  it("collapses DUPLICATE lines for the key, so no stale line can outrank the save", () => {
+    // dotenv lets a later assignment win. Replacing only the first occurrence
+    // would leave a stale line authoritative and the save unusable.
+    writeFileSync(envPath, "CIVITAI_API_TOKEN=old-a\n# note\nCIVITAI_API_TOKEN=old-b\n", {
+      mode: 0o600,
+    });
+    const r = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new");
+    expect(r.persisted).toBe("yes");
+    const raw = readFileSync(envPath, "utf-8");
+    expect(raw.match(/^CIVITAI_API_TOKEN=/gm)).toHaveLength(1);
+    expect(raw).toContain("# note"); // unrelated lines preserved
+    expect(raw).not.toContain("old-b");
   });
 });
 
@@ -327,5 +520,31 @@ describe("buildComfyuiMcpEnv pins the credential file into the child (#826)", ()
   it("omits the marker entirely when no credential is file-owned", () => {
     const env = buildComfyuiMcpEnv({ COMFYUI_URL: "http://x" });
     expect(MANAGED_SECRET_KEYS_ENV in env).toBe(false);
+  });
+
+  it("injects the CURRENT file value, not the copy this process happens to hold", () => {
+    // Another valid writer rotated the file after we cached the value. Injecting
+    // the stale copy would hand the child a credential the store no longer
+    // carries — configured on disk, invisible to the tools all over again.
+    setComfyuiSecret("CIVITAI_API_TOKEN", "civ-old");
+    writeFileSync(envPath, "CIVITAI_API_TOKEN=civ-rotated-elsewhere\n", { mode: 0o600 });
+    const env = buildComfyuiMcpEnv({ COMFYUI_URL: "http://x" });
+    expect(env.CIVITAI_API_TOKEN).toBe("civ-rotated-elsewhere");
+  });
+
+  it("still marks a file-owned key when the store cannot be read at spawn time", () => {
+    // The marker must follow PROVENANCE, not a comparison against the file: if
+    // the file cannot be read right now there is nothing to compare against, and
+    // dropping the marker would pin the injected copy in the child forever —
+    // once the file is readable again, a rotate or revoke would never reach it.
+    setComfyuiSecret("CIVITAI_API_TOKEN", "civ-owned");
+    fsState.readsBroken = true;
+    try {
+      const env = buildComfyuiMcpEnv({ COMFYUI_URL: "http://x" });
+      expect(env.CIVITAI_API_TOKEN).toBe("civ-owned"); // the boot copy still reaches the child
+      expect(env[MANAGED_SECRET_KEYS_ENV]?.split(",")).toContain("CIVITAI_API_TOKEN");
+    } finally {
+      fsState.readsBroken = false;
+    }
   });
 });

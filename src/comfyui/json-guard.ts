@@ -105,16 +105,25 @@ export function classifyNonJson(args: {
   const bodyPrefix = bodyPrefixOf(body);
   const html = looksLikeHtml(contentType, body);
 
+  // A STATUS alone never proves who produced it — ComfyUI, or an application
+  // layer in front of it, can emit 401/403 and 502/503/504 alike. Assert a cause
+  // only when the BODY carries the corresponding markers; otherwise name the
+  // likely candidates and say the response does not settle it (codex gate,
+  // round 2, finding 6).
   let kind: NonJsonKind;
   let cause: string;
   if (status === 401 || status === 403 || (html && looksLikeLoginPage(body))) {
     kind = "login";
     cause =
-      "an authentication gate (a sign-in page or an identity proxy such as Cloudflare Access / an SSO portal) is intercepting the request before it reaches ComfyUI";
+      html && looksLikeLoginPage(body)
+        ? "an authentication gate answered with a SIGN-IN PAGE (its markers are in the body) rather than letting the request through to ComfyUI — typically an identity proxy such as Cloudflare Access or an SSO portal"
+        : `the request was rejected with ${status} and the body is not JSON; this is most often an identity proxy or sign-in gate in front of ComfyUI, but ComfyUI behind your own auth layer can return it too, and this response does not distinguish them`;
   } else if (status === 502 || status === 503 || status === 504 || (html && looksLikeProxyErrorPage(body))) {
     kind = "proxy-error";
     cause =
-      "a reverse proxy in front of ComfyUI returned its own error page — the proxy is up but could not reach (or timed out talking to) ComfyUI itself";
+      html && looksLikeProxyErrorPage(body)
+        ? "a reverse proxy in front of ComfyUI returned its OWN error page (its markers are in the body) — the proxy is up but could not reach, or timed out talking to, ComfyUI itself"
+        : `a gateway-class status (${status}) came back with a non-JSON body; ComfyUI does not normally emit these, so something between you and it most likely did, though this response does not identify what`;
   } else if (status === 404 && html) {
     kind = "not-found";
     cause = "whatever is answering this host does not serve that route at all";
