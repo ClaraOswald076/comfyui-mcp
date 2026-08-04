@@ -4180,11 +4180,29 @@ export async function runPanelOrchestrator(): Promise<void> {
       // interrupted turn so BOTH messages get answered; a plain Stop/Ctrl+C/Esc
       // sends a bare interrupt and must NOT re-run the stopped turn.
       const requeueInFlight = (event as { requeue?: boolean }).requeue === true;
+      // #568 — report what actually happened. An interrupt addressed to a key with no
+      // live agent (the tab's agent was retired by an unprovable workflow switch, or the
+      // panel is still driving a pre-migration id) reaches nothing: no turn gate is held
+      // for it and no release fallback is armed, so nothing will ever "finish". Acking it
+      // as a plain success is exactly the could-not/did-not conflation that made the wedge
+      // unreadable — the user keeps pressing "send now" against a tab that has no agent.
+      // `ok` stays true (the orchestrator DID handle the frame); `interrupted` carries the
+      // outcome, and a miss is logged loudly rather than silently.
+      // Read the outcome SYNCHRONOUSLY (the manager resolves the key before its first
+      // await), so the ack still goes out immediately — a hung backend.interrupt() must
+      // never be able to withhold it.
+      const reached = manager.hasLiveAgent(agentKeyFor(tabId));
       void manager.interrupt(agentKeyFor(tabId), { requeueInFlight });
-      bridge.push({ type: "ack", ok: true, kind: "interrupt" }, tabId);
-      logger.info(
-        `[panel-orchestrator] tab ${tabId.slice(0, 8)} interrupted${requeueInFlight ? " (send-now: re-queue)" : ""}`,
-      );
+      bridge.push({ type: "ack", ok: true, kind: "interrupt", interrupted: reached }, tabId);
+      if (reached) {
+        logger.info(
+          `[panel-orchestrator] tab ${tabId.slice(0, 8)} interrupted${requeueInFlight ? " (send-now: re-queue)" : ""}`,
+        );
+      } else {
+        logger.warn(
+          `[panel-orchestrator] tab ${tabId.slice(0, 8)} interrupt reached NO live agent — nothing was cancelled and no recovery is armed (the tab's agent was retired, or the panel is still driving a pre-migration tab id); the next message will spawn a fresh agent`,
+        );
+      }
       return;
     }
 

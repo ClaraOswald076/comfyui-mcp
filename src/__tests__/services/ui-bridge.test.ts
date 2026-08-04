@@ -1070,6 +1070,107 @@ describe("UiBridge (multi-tab)", () => {
     sockB.close();
   });
 
+  // #568 — the last-active SELECTION is per-tab identity state and must move with a
+  // same-socket tab-id migration. Left on the retiring id it names a tab that no longer
+  // exists, so with 2+ tabs connected every no-tabId resolution reports "none is last
+  // active" and panel_set_workflow_target({mode:"current"}) — the one documented escape
+  // hatch for a stale binding — can no longer recover. That is the reported wedge:
+  // save-as with two tabs open, then nothing can rebind.
+  describe("last-active selection across a tab-id migration (#568)", () => {
+    /** Two live tabs; A has the last-active selection. Returns both sockets. */
+    async function twoTabsWithAActive(): Promise<{ sockA: WebSocket; sockB: WebSocket }> {
+      const sockA = await connectPanel();
+      autoReply(sockA, "A");
+      sockA.send(JSON.stringify({ type: "hello", tab_id: "wf:aaa" }));
+      const sockB = await connectPanel();
+      autoReply(sockB, "B");
+      sockB.send(JSON.stringify({ type: "hello", tab_id: "wf:bbb" }));
+      await vi.waitFor(() => expect(bridge.tabs()).toHaveLength(2));
+      // The user typed in A — that is what makes A the last-active tab.
+      sockA.send(JSON.stringify({ type: "user_message", text: "hi" }));
+      await vi.waitFor(() => expect(bridge.resolveActiveTabId()).toBe("wf:aaa"));
+      return { sockA, sockB };
+    }
+
+    it("a PROVEN same-socket migration moves it, so the explicit rebind still resolves", async () => {
+      const { sockA, sockB } = await twoTabsWithAActive();
+
+      // Save-as: the SAME socket re-hellos under a new wf: id. The retiring id is removed.
+      sockA.send(JSON.stringify({ type: "hello", tab_id: "wf:ccc" }));
+      await vi.waitFor(() => expect(bridge.tabs().map((t) => t.tab_id).sort()).toEqual(["wf:bbb", "wf:ccc"]));
+
+      // The selection followed the SAME BROWSER TAB onto its new id — not a guess among the
+      // live tabs, and emphatically not the unrelated wf:bbb. Without the carry this throws.
+      expect(bridge.resolveActiveTabId()).toBe("wf:ccc");
+      expect(bridge.status()).toContain("wf:ccc");
+      sockA.close();
+      sockB.close();
+    });
+
+    it("an UNPROVEN switch (revoked migration) REFUSES — it never names the switched-to tab", async () => {
+      const { sockA, sockB } = await twoTabsWithAActive();
+      sockA.send(JSON.stringify({ type: "hello", tab_id: "wf:ccc" }));
+      await vi.waitFor(() => expect(bridge.tabs().map((t) => t.tab_id).sort()).toEqual(["wf:bbb", "wf:ccc"]));
+
+      // The orchestrator classified the re-hello as a switch to a DIFFERENT workflow.
+      bridge.revokeTabMigration("wf:aaa");
+
+      // UNKNOWN gets its own answer: refuse. The distinguishing assertion is that the
+      // resolution does NOT come back as the switched-to tab — asserting only "throws"
+      // would also pass if the selection had been cleared for the wrong reason, and
+      // asserting only the tab COUNT passes in both the fixed and broken states.
+      let resolved: string | null = null;
+      try {
+        resolved = bridge.resolveActiveTabId();
+      } catch {
+        resolved = null;
+      }
+      expect(resolved).not.toBe("wf:ccc");
+      expect(resolved).toBeNull();
+      expect(() => bridge.resolveActiveTabId()).toThrow(/none is "last active"/);
+      sockA.close();
+      sockB.close();
+    });
+
+    it("does NOT revert a selection the user made in the destination after the migration", async () => {
+      const { sockA, sockB } = await twoTabsWithAActive();
+      sockA.send(JSON.stringify({ type: "hello", tab_id: "wf:ccc" }));
+      await vi.waitFor(() => expect(bridge.resolveActiveTabId()).toBe("wf:ccc"));
+
+      // The user then typed in the (switched-to) tab: a fresh, genuine selection that
+      // happens to hold the SAME value the carry wrote, so only the write SEQUENCE can
+      // tell them apart. The revoke must undo the carry, never this.
+      sockA.send(JSON.stringify({ type: "user_message", text: "typed after the switch" }));
+      await new Promise((r) => setTimeout(r, 30));
+      bridge.revokeTabMigration("wf:aaa");
+
+      expect(bridge.resolveActiveTabId()).toBe("wf:ccc");
+      sockA.close();
+      sockB.close();
+    });
+
+    it("follows a migration CHAIN, and a revoke of a superseded hop is inert", async () => {
+      const { sockA, sockB } = await twoTabsWithAActive();
+      // wf:aaa → tmp:mid → wf:ccc, all on the SAME socket (the reported id-scheme chain).
+      sockA.send(JSON.stringify({ type: "hello", tab_id: "tmp:mid" }));
+      await vi.waitFor(() => expect(bridge.resolveActiveTabId()).toBe("tmp:mid"));
+      sockA.send(JSON.stringify({ type: "hello", tab_id: "wf:ccc" }));
+      await vi.waitFor(() => expect(bridge.resolveActiveTabId()).toBe("wf:ccc"));
+
+      // Revoking the FIRST (already superseded) hop must not touch the live selection:
+      // the carry it recorded was overwritten by the second hop, and only the write
+      // SEQUENCE distinguishes "my carry is still current" from "it was superseded".
+      bridge.revokeTabMigration("wf:aaa");
+      expect(bridge.resolveActiveTabId()).toBe("wf:ccc");
+
+      // Revoking the hop that actually produced the live selection DOES clear it.
+      bridge.revokeTabMigration("tmp:mid");
+      expect(() => bridge.resolveActiveTabId()).toThrow(/none is "last active"/);
+      sockA.close();
+      sockB.close();
+    });
+  });
+
   it("follows MIGRATION CHAINS: uuid → tmp: → wf: (the exact #210 field sequence)", async () => {
     // The reported failure re-helloed TWICE: legacy random UUID, then the
     // unsaved-tab tmp:<uuid> id, then the saved wf:<hash> id. The ORIGINAL id

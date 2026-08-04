@@ -22,9 +22,10 @@ import type {
 import { CLAUDE_CAPABILITIES } from "../../orchestrator/agent-backend.js";
 
 let PanelAgent: typeof import("../../orchestrator/panel-agent.js").PanelAgent;
+let PanelAgentManager: typeof import("../../orchestrator/panel-agent.js").PanelAgentManager;
 
 beforeAll(async () => {
-  ({ PanelAgent } = await import("../../orchestrator/panel-agent.js"));
+  ({ PanelAgent, PanelAgentManager } = await import("../../orchestrator/panel-agent.js"));
 });
 
 /** A WEDGED backend: each turn hangs, and an interrupt breaks the hang (so the
@@ -56,6 +57,41 @@ class WedgedBackend implements AgentBackend {
     const brk = this.breakTurn;
     this.breakTurn = null;
     brk?.();
+  }
+
+  async listModels(): Promise<ModelChoice[]> {
+    return [];
+  }
+}
+
+/** A backend whose interrupt() HANGS until released — so stopAll()'s awaited stop()
+ *  never resolves and the closed agent stays in the manager's map indefinitely. That
+ *  unbounded window is the one where map presence and liveness diverge. */
+class HangingStopBackend implements AgentBackend {
+  readonly id = "claude" as const;
+  readonly capabilities = CLAUDE_CAPABILITIES;
+  turns: string[] = [];
+  private release: (() => void) | null = null;
+
+  async *run(opts: BackendStartOptions): AsyncGenerator<AgentEvent> {
+    yield { type: "session", sessionId: "sess-hang" };
+    for await (const turn of opts.channel) {
+      this.turns.push(turn.text);
+      yield { type: "result", ok: true, subtype: "success" };
+    }
+  }
+
+  async interrupt(): Promise<void> {
+    await new Promise<void>((resolve) => {
+      this.release = resolve;
+    });
+  }
+
+  /** Let the pending stop() finish so the test doesn't leave it dangling. */
+  releaseStop(): void {
+    const r = this.release;
+    this.release = null;
+    r?.();
   }
 
   async listModels(): Promise<ModelChoice[]> {
@@ -133,5 +169,110 @@ describe("interrupt storm does not starve the release fallback (#568 Defect 2)",
     expect(backend.turns.join("\n\n")).toContain("the follow-up");
 
     await agent.stop();
+  });
+
+  // The property that makes the net starvation-free rather than merely "eventually
+  // scheduled": the deadline set by the FIRST interrupt of an unsettled burst is an
+  // ABSOLUTE ceiling. Later interrupts refresh the guard (so it keeps naming the
+  // still-stuck turn) but must never push the deadline out. Timing it — not just
+  // "does a turn eventually start" — is what distinguishes the two: a re-arming net
+  // still fires eventually once the storm stops, so a generous bound passes in BOTH
+  // states.
+  it("releases within ONE window of the FIRST interrupt, however many follow", async () => {
+    const backend = new WedgedBackend();
+    const agent = new PanelAgent("tab-ceiling", makeDeps() as never, backend);
+    void agent.start();
+
+    agent.send("wedged first");
+    await waitFor(() => backend.turns.length === 1);
+    agent.send("the follow-up");
+
+    const firstInterruptAt = Date.now();
+    void agent.interrupt({ requeueInFlight: true });
+    // Keep hammering INSIDE the window (50ms < 150ms) — each one is a chance to
+    // postpone the net.
+    const storm = setInterval(() => {
+      void agent.interrupt({ requeueInFlight: true });
+    }, 50);
+    try {
+      await waitFor(() => backend.turns.length >= 2, 1200);
+    } finally {
+      clearInterval(storm);
+    }
+    const elapsed = Date.now() - firstInterruptAt;
+
+    // One 150ms window plus scheduling slack. A net that any later interrupt could
+    // re-arm would land far beyond this (the storm ran for the whole wait).
+    expect(elapsed).toBeLessThan(600);
+
+    await agent.stop();
+  });
+});
+
+// #568 — the two defects compound: a stale identity means the interrupt reaches no
+// live agent at all, and an interrupt that reaches nothing arms NO recovery (no turn
+// gate is held for it, no release fallback is scheduled). Reporting that as a
+// completed cancellation is a could-not/did-not conflation, and it is what left the
+// user hammering "send now" at a tab with nothing behind it. The outcome must be
+// distinguishable.
+describe("interrupt reports whether a live agent actually took it (#568)", () => {
+  it("false when the key has no agent, true once one exists", async () => {
+    const backend = new WedgedBackend();
+    const manager = new PanelAgentManager({
+      mcpServers: {},
+      systemAppend: "",
+      model: "claude-test",
+      onSay: () => {},
+      onTurn: () => {},
+      makeBackend: () => backend,
+    } as never);
+
+    const key = "tmp:no-agent::claude";
+    expect(manager.hasLiveAgent(key)).toBe(false);
+    // Nothing was cancelled — and, critically, nothing was scheduled to recover either.
+    await expect(manager.interrupt(key, { requeueInFlight: true })).resolves.toBe(false);
+
+    manager.send(key, "spawns the agent");
+    await waitFor(() => backend.turns.length === 1);
+    expect(manager.hasLiveAgent(key)).toBe(true);
+    await expect(manager.interrupt(key, { requeueInFlight: true })).resolves.toBe(true);
+
+    await manager.stopAll();
+  });
+
+  // MAP PRESENCE IS NOT LIVENESS. reset()/retire() unmap before stopping, but
+  // stopAll() sets `closed` on every agent synchronously and keeps them MAPPED until
+  // each awaited stop() resolves — and stop() awaits the backend, which can hang. The
+  // bridge is still serving the panel throughout that window, so an interrupt can land
+  // in it. Reporting it as taken would fabricate exactly the success this reporting
+  // exists to stop fabricating — the "agent exists but is closed" case one step over
+  // from "no agent at all".
+  it("reports NOT interrupted inside the shutdown window, even while still mapped", async () => {
+    const backend = new HangingStopBackend();
+    const manager = new PanelAgentManager({
+      mcpServers: {},
+      systemAppend: "",
+      model: "claude-test",
+      onSay: () => {},
+      onTurn: () => {},
+      makeBackend: () => backend,
+    } as never);
+
+    const key = "tmp:shutting-down::claude";
+    manager.send(key, "a turn");
+    await waitFor(() => backend.turns.length === 1);
+    expect(manager.hasLiveAgent(key)).toBe(true);
+
+    // Shutdown begins but does NOT complete: this backend's interrupt never settles,
+    // so the agent stays in the map indefinitely with `closed` already true.
+    const stopping = manager.stopAll();
+    expect(manager.hasLiveAgent(key)).toBe(false);
+
+    // Must answer FALSE, and must answer AT ALL — a hung backend.interrupt() cannot be
+    // allowed to stall it, which is why the predicate short-circuits before the await.
+    await expect(manager.interrupt(key, { requeueInFlight: true })).resolves.toBe(false);
+
+    backend.releaseStop();
+    await stopping;
   });
 });

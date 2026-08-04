@@ -769,7 +769,16 @@ export class UiBridge {
    *  MOVED sockets are undone, so B's OWN pre-existing viewers are untouched. */
   private migratedMirror = new Map<
     string,
-    { to: string; viewers: Set<BridgeSocket>; subs: Set<BridgeSocket> }
+    {
+      to: string;
+      viewers: Set<BridgeSocket>;
+      subs: Set<BridgeSocket>;
+      /** The `lastActiveSeq` value this migration's last-active carry produced, or
+       *  null when nothing was carried. The undo compares it so a FRESH selection
+       *  made after the carry (a user_message from the destination) is never
+       *  reverted — value equality alone cannot tell the two apart (#568). */
+      lastActiveSeq: number | null;
+    }
   >();
   /** Injected by the orchestrator: does this tabId have a live agent session?
    *  (SessionStore/PanelAgentManager live there.) Flags desktopTabs() for the
@@ -856,8 +865,13 @@ export class UiBridge {
    *  is allowed ONLY together with a token — panel #54: browsers on OTHER
    *  machines reaching a 24/7 server-side orchestrator. */
   private host: string;
-  /** Tab the user most recently typed in — the default command target. */
+  /** Tab the user most recently typed in — the default command target. Always
+   *  written through {@link setLastActiveTab} so {@link lastActiveSeq} stays in step. */
   private lastActiveTabId: string | null = null;
+  /** Monotonic counter bumped on every last-active write. Lets the tab-id-migration
+   *  undo tell "the value I carried is still the current selection" from "the same
+   *  value was re-selected since" — the two are indistinguishable by value (#568). */
+  private lastActiveSeq = 0;
   /** Resolves true once the port is bound, false if binding ultimately fails. */
   private readyPromise: Promise<boolean> | null = null;
   private readyResolve: ((ok: boolean) => void) | null = null;
@@ -1197,6 +1211,19 @@ export class UiBridge {
           // destination's own session ownership to trigger the undo).
           const movedViewers = new Set<BridgeSocket>();
           const movedSubs = new Set<BridgeSocket>();
+          // #568 — the LAST-ACTIVE selection is per-TAB identity state, so it has to move
+          // with the tab id exactly like the mirror sets below. Left pointing at the id
+          // being retired it names a tab that no longer exists, and with 2+ tabs connected
+          // resolveTarget()/resolveActiveTabId() then report "none is last active" — which
+          // disables panel_set_workflow_target({mode:"current"}), the ONE documented escape
+          // hatch for a session whose binding went stale. The reported wedge (save-as with
+          // two tabs open) is exactly that: the retiring id is removed, the selection is
+          // left on it, and nothing can rebind. Moving it is not a guess — the same SOCKET
+          // re-helloed, which is the server-observed proof that the new id and the old id
+          // are the same browser tab. OPTIMISTIC like the mirror move (the orchestrator
+          // classifies proven-vs-switch only afterwards); revokeTabMigration() undoes it.
+          const movedLastActiveSeq =
+            this.lastActiveTabId === tabId ? this.setLastActiveTab(msg.tab_id as string) : null;
           const migSubs = this.subscribers.get(tabId);
           if (migSubs) {
             this.subscribers.delete(tabId);
@@ -1215,11 +1242,12 @@ export class UiBridge {
               movedViewers.add(s);
             }
           }
-          if (movedViewers.size || movedSubs.size) {
+          if (movedViewers.size || movedSubs.size || movedLastActiveSeq !== null) {
             this.migratedMirror.set(tabId, {
               to: msg.tab_id as string,
               viewers: movedViewers,
               subs: movedSubs,
+              lastActiveSeq: movedLastActiveSeq,
             });
           }
         }
@@ -1495,7 +1523,7 @@ export class UiBridge {
         if (effectiveTab) {
           msg.tab_id = effectiveTab;
           msg.title = this.conns.get(effectiveTab)?.title;
-          if (msg.type === "user_message") this.lastActiveTabId = effectiveTab;
+          if (msg.type === "user_message") this.setLastActiveTab(effectiveTab);
         }
         this.onPanelMessage?.(msg as PanelEvent);
       }
@@ -1523,7 +1551,7 @@ export class UiBridge {
       if (tabId && this.conns.get(tabId)?.sock === sock) {
         wasPrimary = true;
         this.conns.delete(tabId);
-        if (this.lastActiveTabId === tabId) this.lastActiveTabId = null;
+        if (this.lastActiveTabId === tabId) this.setLastActiveTab(null);
         // The mirrored desktop tab is gone — detach its viewers so their input
         // reverts to their OWN session instead of routing into a dead id (and its
         // output isn't silently buffered forever). They can re-attach if it returns.
@@ -1549,6 +1577,15 @@ export class UiBridge {
         }
       }
     });
+  }
+
+  /** The ONLY writer of {@link lastActiveTabId}. Returns the sequence number this
+   *  write produced so a caller (the tab-id-migration carry) can later prove that
+   *  its own write is still the current selection before undoing it (#568). */
+  private setLastActiveTab(tabId: string | null): number {
+    this.lastActiveTabId = tabId;
+    this.lastActiveSeq += 1;
+    return this.lastActiveSeq;
   }
 
   connected(): boolean {
@@ -1706,6 +1743,17 @@ export class UiBridge {
         // Only revert a viewer we moved that is STILL pointed at this destination (it may have
         // since re-attached elsewhere, which we must not clobber).
         if (this.mirrorViewers.get(s) === moved.to) this.mirrorViewers.delete(s);
+      }
+      // #568 — undo the optimistic last-active carry too. This re-hello turned out to be a
+      // switch to a DIFFERENT workflow, so the destination is NOT the successor of the tab
+      // the selection named. Do NOT hand it back to fromId either: that id is retired. UNKNOWN
+      // gets its OWN representation (null) rather than being folded into either answer, so
+      // resolveTarget() refuses with "none is last active — pass tab_id" and an orphaned
+      // session's explicit rebind FAILS instead of silently retargeting onto a DIFFERENT
+      // workflow's canvas. Undo ONLY the exact write we made: a user_message from the
+      // destination since then is a fresh, genuine selection (same value, newer seq) and stands.
+      if (moved.lastActiveSeq !== null && this.lastActiveSeq === moved.lastActiveSeq) {
+        this.setLastActiveTab(null);
       }
     }
   }
