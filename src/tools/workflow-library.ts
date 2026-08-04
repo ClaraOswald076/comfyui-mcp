@@ -220,10 +220,15 @@ export function registerWorkflowLibraryTools(server: McpServer): void {
               type: "text",
               text:
                 `Stripped to ${Object.keys(workflow).length} nodes` +
-                (warnings.length ? ` · ${warnings.length} warning(s)` : "") +
+                (warnings.length ? ` · ⚠ ${warnings.length} conversion note(s)` : "") +
                 `\nNode types: ${summary}` +
+                // #361: these are the places the stripped graph does NOT match
+                // the source (a dropped virtual link, a substituted widget
+                // value). Label them as differences, not as background noise.
                 (warnings.length
-                  ? `\nWarnings:\n${warnings.map((w) => `- ${w}`).join("\n")}`
+                  ? `\nThe stripped graph DIFFERS from the source workflow where listed below — read these before running or rebuilding from it:\n${warnings
+                      .map((w) => `- ${w}`)
+                      .join("\n")}`
                   : ""),
             },
             { type: "text", text: JSON.stringify(workflow, null, 2) },

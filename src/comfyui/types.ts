@@ -168,6 +168,15 @@ export interface UiNode {
   widgets_values?: unknown[];
   title?: string;
   _meta?: { title?: string };
+  /**
+   * INTERNAL, never serialized: widget values resolved BY NAME during subgraph
+   * expansion — a promoted ("proxy") widget value pushed down from the subgraph
+   * node, or a virtual PrimitiveNode's literal baked onto its consumer. Applied
+   * by convertUiToApi against object_info, which is authoritative about widget
+   * names; carrying them by name avoids the positional guessing that used to
+   * drop them or land them on the wrong widget (issue #361).
+   */
+  resolvedWidgetValues?: Record<string, unknown>;
 }
 
 // link: [link_id, source_node_id, source_slot, target_node_id, target_slot, type_name]

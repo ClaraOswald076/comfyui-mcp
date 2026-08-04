@@ -144,6 +144,323 @@ describe("flattenUiWorkflow — Use-Everywhere", () => {
     expect(graph.extra?.ue_links).toBeUndefined();
   });
 
+  // #361: a ue_links record is only as current as the pack's last analysis.
+  // Materializing one without checking it against the LIVE wiring invents a
+  // connection the graph does not have — which reads as a plausible graph that is
+  // silently wrong, and is worse than an obviously missing link.
+  it("refuses a record whose sender was REWIRED, and keeps that sender in place", () => {
+    const g = ueGraph(true);
+    // The sender now takes its value from node 9, not the recorded node 1.
+    g.nodes.push(
+      node(9, "CheckpointLoaderSimple", { outputs: [{ name: "MODEL", type: "MODEL", links: [6] }] }),
+    );
+    g.nodes[0].outputs![0].links = [];
+    g.nodes[1].inputs![0].link = 6;
+    g.links = [[6, 9, 0, 2, 0, "MODEL"]];
+    const { graph, report } = flattenUiWorkflow(g);
+    const consumer = graph.nodes.find((n) => n.type === "SomeConsumer")!;
+    expect(consumer.inputs![0].link).toBeNull(); // no fabricated edge
+    expect(graph.nodes.some((n) => n.type === "Anything Everywhere")).toBe(true);
+    expect(report.warnings.join("\n")).toContain("could not be confirmed against the live graph");
+    expect(report.warnings.join("\n")).toContain("fed by a different producer");
+  });
+
+  it("refuses a record naming a sender that is gone", () => {
+    const g = ueGraph(true);
+    g.nodes = g.nodes.filter((n) => n.type !== "Anything Everywhere");
+    // Another sender keeps UE processing alive, but it is not this record's.
+    g.nodes.push(node(8, "Anything Everywhere", { inputs: [{ name: "anything", type: "*", link: null }] }));
+    const { graph, report } = flattenUiWorkflow(g);
+    const consumer = graph.nodes.find((n) => n.type === "SomeConsumer")!;
+    expect(consumer.inputs![0].link).toBeNull();
+    expect(report.warnings.join("\n")).toContain("no longer a broadcast node");
+  });
+
+  it("refuses a controllerless record unless its producer is itself a broadcast node", () => {
+    const g = ueGraph(true);
+    delete (g.extra!.ue_links as { controller?: number }[])[0].controller;
+    const { graph, report } = flattenUiWorkflow(g);
+    const consumer = graph.nodes.find((n) => n.type === "SomeConsumer")!;
+    expect(consumer.inputs![0].link).toBeNull();
+    expect(report.warnings.join("\n")).toContain("cannot be attributed to any sender");
+    // The record names no sender, so we cannot tell WHICH one has to survive —
+    // deleting any would erase the evidence of the broadcast we declined to
+    // materialize, and scrubbing ue_links would erase the record itself.
+    expect(graph.nodes.some((n) => n.type === "Anything Everywhere")).toBe(true);
+    expect(graph.extra?.ue_links).toBeDefined();
+  });
+
+  it("a confirmed record whose producer output does not exist is reported, not dropped in silence", () => {
+    // A self-producing sender skips the feed check, so this record passes
+    // confirmation and then fails to BUILD (the node serializes no outputs). The
+    // return value used to be discarded: no edge, no warning, and the sender then
+    // deletable — a could-not-determine folded into a silent loss.
+    const g: UiWorkflow = {
+      nodes: [
+        node(1, "Seed Everywhere", { widgets_values: [42] }), // no outputs array
+        node(3, "SomeConsumer", { inputs: [{ name: "seed", type: "INT", link: null }] }),
+      ],
+      links: [],
+      last_link_id: 0,
+      extra: {
+        ue_links: [
+          { downstream: 3, downstream_slot: 0, upstream: 1, upstream_slot: 0, controller: 1, type: "INT" },
+        ],
+      },
+    };
+    const { graph, report } = flattenUiWorkflow(g);
+    const consumer = graph.nodes.find((n) => n.type === "SomeConsumer")!;
+    expect(consumer.inputs![0].link).toBeNull();
+    expect(report.warnings.join("\n")).toContain("which this graph does not have");
+    expect(graph.nodes.some((n) => n.type === "Seed Everywhere")).toBe(true);
+  });
+
+  it("a LIVE broadcast whose sender is fed through a Get/Set bus is still materialized", () => {
+    // Pass 1 replaces the sender's bus-fed input with a fresh direct link; the
+    // staleness check must see that fresh link, or it reads the feed as
+    // unresolvable and refuses a broadcast that is perfectly current.
+    const g: UiWorkflow = {
+      nodes: [
+        node(1, "CheckpointLoaderSimple", { outputs: [{ name: "MODEL", type: "MODEL", links: [10] }] }),
+        node(2, "SetNode", {
+          widgets_values: ["m"],
+          inputs: [{ name: "MODEL", type: "MODEL", link: 10 }],
+          outputs: [{ name: "*", type: "*", links: [] }],
+        }),
+        node(3, "GetNode", {
+          widgets_values: ["m"],
+          outputs: [{ name: "MODEL", type: "MODEL", links: [11] }],
+        }),
+        node(4, "Anything Everywhere", { inputs: [{ name: "anything", type: "*", link: 11 }] }),
+        node(5, "SomeConsumer", { inputs: [{ name: "model", type: "MODEL", link: null }] }),
+      ],
+      links: [
+        [10, 1, 0, 2, 0, "MODEL"],
+        [11, 3, 0, 4, 0, "MODEL"],
+      ],
+      last_link_id: 11,
+      extra: {
+        ue_links: [
+          { downstream: 5, downstream_slot: 0, upstream: 1, upstream_slot: 0, controller: 4, type: "MODEL" },
+        ],
+      },
+    };
+    const { graph, report } = flattenUiWorkflow(g);
+    const consumer = graph.nodes.find((n) => n.type === "SomeConsumer")!;
+    const link = graph.links.find((l) => l[0] === consumer.inputs![0].link)!;
+    expect([link[1], link[2]]).toEqual([1, 0]);
+    expect(report.warnings).toEqual([]);
+  });
+
+  it("a record whose upstream IS the bus node resolves through it", () => {
+    // The pack sometimes records the virtual in front of the producer rather than
+    // the producer; a GetNode has no incoming link, so it must be followed over
+    // its bus, not by looking for an input.
+    const g: UiWorkflow = {
+      nodes: [
+        node(1, "CheckpointLoaderSimple", { outputs: [{ name: "MODEL", type: "MODEL", links: [10] }] }),
+        node(2, "SetNode", {
+          widgets_values: ["m"],
+          inputs: [{ name: "MODEL", type: "MODEL", link: 10 }],
+          outputs: [{ name: "*", type: "*", links: [] }],
+        }),
+        node(3, "GetNode", {
+          widgets_values: ["m"],
+          outputs: [{ name: "MODEL", type: "MODEL", links: [11] }],
+        }),
+        node(4, "Anything Everywhere", { inputs: [{ name: "anything", type: "*", link: 11 }] }),
+        node(5, "SomeConsumer", { inputs: [{ name: "model", type: "MODEL", link: null }] }),
+      ],
+      links: [
+        [10, 1, 0, 2, 0, "MODEL"],
+        [11, 3, 0, 4, 0, "MODEL"],
+      ],
+      last_link_id: 11,
+      extra: {
+        ue_links: [
+          { downstream: 5, downstream_slot: 0, upstream: 3, upstream_slot: 0, controller: 4, type: "MODEL" },
+        ],
+      },
+    };
+    const { graph, report } = flattenUiWorkflow(g);
+    const consumer = graph.nodes.find((n) => n.type === "SomeConsumer")!;
+    const link = graph.links.find((l) => l[0] === consumer.inputs![0].link)!;
+    expect([link[1], link[2]]).toEqual([1, 0]);
+    expect(report.warnings).toEqual([]);
+  });
+
+  it("an input claiming a link that does not exist is reported, not silently cleared", () => {
+    // The flattener's counterpart of the converter's dangling-reference report.
+    // The source graph claims a connection this graph does not contain; clearing
+    // it in silence is observation-failed treated as a definite no.
+    const g: UiWorkflow = {
+      nodes: [
+        node(1, "CheckpointLoaderSimple", { outputs: [{ name: "MODEL", type: "MODEL", links: [] }] }),
+        node(3, "SomeConsumer", { inputs: [{ name: "model", type: "MODEL", link: 77 }] }),
+      ],
+      links: [],
+      last_link_id: 0,
+    };
+    const { graph, report } = flattenUiWorkflow(g);
+    expect(graph.nodes.find((n) => n.id === 3)!.inputs![0].link).toBeNull();
+    expect(report.warnings.join("\n")).toContain('input "model" claims link 77');
+  });
+
+  it("a sender that is the REAL producer of a pre-existing link is never deleted", () => {
+    // Seed Everywhere #9 genuinely produces link 5 into #3. Its ue_links record
+    // adds nothing (its target #4 already has a real link, so UE would not fire),
+    // so the sender created no FRESH link and looked unused — and was deleted,
+    // taking a real connection with it and disconnecting #3 in silence.
+    const g: UiWorkflow = {
+      nodes: [
+        node(9, "Seed Everywhere", {
+          widgets_values: [42],
+          outputs: [{ name: "INT", type: "INT", links: [5] }],
+        }),
+        node(3, "SomeConsumer", { inputs: [{ name: "seed", type: "INT", link: 5 }] }),
+        node(1, "CheckpointLoaderSimple", { outputs: [{ name: "INT", type: "INT", links: [6] }] }),
+        node(4, "OtherConsumer", { inputs: [{ name: "seed", type: "INT", link: 6 }] }),
+      ],
+      links: [
+        [5, 9, 0, 3, 0, "INT"],
+        [6, 1, 0, 4, 0, "INT"],
+      ],
+      last_link_id: 6,
+      extra: {
+        ue_links: [
+          { downstream: 4, downstream_slot: 0, upstream: 9, upstream_slot: 0, controller: 9, type: "INT" },
+        ],
+      },
+    };
+    const { graph, report } = flattenUiWorkflow(g);
+    expect(graph.nodes.some((n) => n.type === "Seed Everywhere")).toBe(true);
+    const consumer = graph.nodes.find((n) => n.id === 3)!;
+    expect(consumer.inputs![0].link).toBe(5);
+    expect(report.warnings).toEqual([]);
+  });
+
+  it("an input claiming an id that belongs to a link into ANOTHER node is reported", () => {
+    // Link 10 really exists — as Producer → Reroute. The Consumer's claim on it is
+    // bogus. Keying the report on "did this id exist anywhere" suppressed it and
+    // the edge was cleared in silence; the question has to be about THIS input's
+    // claim. This is the shape that disproved an earlier "unreachable" comment.
+    const g: UiWorkflow = {
+      nodes: [
+        node(1, "CheckpointLoaderSimple", { outputs: [{ name: "MODEL", type: "MODEL", links: [10] }] }),
+        node(2, "Reroute", {
+          inputs: [{ name: "", type: "MODEL", link: 10 }],
+          outputs: [{ name: "", type: "MODEL", links: [] }],
+        }),
+        node(3, "SomeConsumer", { inputs: [{ name: "model", type: "MODEL", link: 10 }] }),
+      ],
+      links: [[10, 1, 0, 2, 0, "MODEL"]],
+      last_link_id: 10,
+    };
+    const { graph, report } = flattenUiWorkflow(g);
+    expect(graph.nodes.find((n) => n.id === 3)!.inputs![0].link).toBeNull();
+    expect(report.warnings.join("\n")).toContain('input "model" claims link 10');
+  });
+
+  it("a healthy bus reports nothing", () => {
+    // Guards the common path: every flattened bus retires the links that fed its
+    // virtual nodes, and pass 1 re-points their consumers at fresh surviving ids,
+    // so no surviving input is left claiming a retired one.
+    const g: UiWorkflow = {
+      nodes: [
+        node(1, "CheckpointLoaderSimple", { outputs: [{ name: "MODEL", type: "MODEL", links: [10] }] }),
+        node(2, "SetNode", {
+          widgets_values: ["m"],
+          inputs: [{ name: "MODEL", type: "MODEL", link: 10 }],
+          outputs: [{ name: "*", type: "*", links: [] }],
+        }),
+        node(3, "GetNode", {
+          widgets_values: ["m"],
+          outputs: [{ name: "MODEL", type: "MODEL", links: [11] }],
+        }),
+        node(4, "KSampler", { inputs: [{ name: "model", type: "MODEL", link: 11 }] }),
+      ],
+      links: [
+        [10, 1, 0, 2, 0, "MODEL"],
+        [11, 3, 0, 4, 0, "MODEL"],
+      ],
+      last_link_id: 11,
+    };
+    const { report } = flattenUiWorkflow(g);
+    expect(report.warnings).toEqual([]);
+  });
+
+  it("duplicate link ids ALREADY in the graph are repaired, and reported", () => {
+    // Not something the allocator can produce, but a graph edited by tooling that
+    // did not maintain link ids can arrive this way. Returning it unchanged
+    // propagates an ambiguous graph out of a pass whose job is to leave the
+    // wiring unambiguous — and each consumer must keep ITS OWN producer.
+    const g: UiWorkflow = {
+      nodes: [
+        node(1, "ProducerA", { outputs: [{ name: "MODEL", type: "MODEL", links: [7] }] }),
+        node(2, "ProducerB", { outputs: [{ name: "MODEL", type: "MODEL", links: [7] }] }),
+        node(3, "SomeConsumer", { inputs: [{ name: "model", type: "MODEL", link: 7 }] }),
+        node(4, "OtherConsumer", { inputs: [{ name: "model", type: "MODEL", link: 7 }] }),
+      ],
+      links: [
+        [7, 1, 0, 3, 0, "MODEL"],
+        [7, 2, 0, 4, 0, "MODEL"],
+      ],
+      last_link_id: 7,
+    };
+    const { graph, report } = flattenUiWorkflow(g);
+    const ids = graph.links.map((l) => l[0]);
+    expect(new Set(ids).size).toBe(ids.length);
+    const byId = new Map(graph.links.map((l) => [l[0], l]));
+    const feeder = (type: string) => {
+      const c = graph.nodes.find((x) => x.type === type)!;
+      const l = byId.get(c.inputs![0].link!)!;
+      return graph.nodes.find((x) => x.id === l[1])!.type;
+    };
+    expect(feeder("SomeConsumer")).toBe("ProducerA");
+    expect(feeder("OtherConsumer")).toBe("ProducerB");
+    expect(report.warnings.join("\n")).toContain("shared an id already used by another link");
+  });
+
+  it("a stale last_link_id cannot make a fresh link collide with an existing one", () => {
+    const g = ueGraph(true);
+    // An existing link sitting at exactly the id the stale header hands out next.
+    // The header is only a header, and tooling that edits a graph does not always
+    // maintain it.
+    g.nodes.push(node(9, "SomeConsumer", { inputs: [{ name: "model", type: "MODEL", link: 6 }] }));
+    g.links.push([6, 1, 0, 9, 0, "MODEL"]);
+    g.nodes[0].outputs![0].links = [5, 6];
+    g.last_link_id = 5;
+    const { graph } = flattenUiWorkflow(g);
+    const ids = graph.links.map((l) => l[0]);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it("a foreign class sharing a sender name prefix FABRICATES nothing, even when fed", () => {
+    // The fabrication direction specifically: "Seed Everywhere Helper" IS fed by
+    // node 1, so a feed check alone would confirm the stale record and emit
+    // 1 → #3. It is not a cg-use-everywhere node, so no edge may appear — and
+    // because nothing here is recognized, the backstop reports it.
+    const g: UiWorkflow = {
+      nodes: [
+        node(1, "CheckpointLoaderSimple", { outputs: [{ name: "MODEL", type: "MODEL", links: [5] }] }),
+        node(9, "Seed Everywhere Helper", { inputs: [{ name: "anything", type: "*", link: 5 }] }),
+        node(3, "SomeConsumer", { inputs: [{ name: "model", type: "MODEL", link: null }] }),
+      ],
+      links: [[5, 1, 0, 9, 0, "MODEL"]],
+      last_link_id: 5,
+      extra: {
+        ue_links: [
+          { downstream: 3, downstream_slot: 0, upstream: 1, upstream_slot: 0, controller: 9, type: "MODEL" },
+        ],
+      },
+    };
+    const { graph, report } = flattenUiWorkflow(g);
+    const consumer = graph.nodes.find((n) => n.type === "SomeConsumer")!;
+    expect(consumer.inputs![0].link).toBeNull();
+    expect(graph.nodes.some((n) => n.type === "Seed Everywhere Helper")).toBe(true);
+    expect(report.warnings.join("\n")).toContain("no node in this graph is recognized as a Use-Everywhere sender");
+  });
+
   it("keeps Seed Everywhere — it is its own real producer", () => {
     const g: UiWorkflow = {
       nodes: [
@@ -166,11 +483,69 @@ describe("flattenUiWorkflow — Use-Everywhere", () => {
     expect(link[1]).toBe(1);
   });
 
-  it("UE senders without ue_links are left in place with a loud warning", () => {
+  it("UE senders with a MISSING ue_links list are left in place with a loud warning", () => {
     const { graph, report } = flattenUiWorkflow(ueGraph(false));
     expect(report.removed.ue).toBe(0);
     expect(graph.nodes.some((n) => n.type === "Anything Everywhere")).toBe(true);
-    expect(report.warnings.some((w) => w.includes("ue_links is empty"))).toBe(true);
+    expect(report.warnings.some((w) => w.includes("ue_links is missing"))).toBe(true);
+  });
+
+  it("a PARTIAL ue_links list never deletes the sender it does not mention", () => {
+    // A non-empty list is not proof it accounts for every sender. Sender #7 has no
+    // row (the list predates it, or it reaches nothing) — deleting it would remove
+    // a node whose broadcasts were never materialized, silently and for good.
+    const g = ueGraph(true);
+    g.nodes.push(
+      node(8, "Anything Everywhere", { inputs: [{ name: "anything", type: "*", link: null }] }),
+    );
+    (g.extra!.ue_links as { controller: number }[])[0].controller = 8; // only #8 is listed
+    const { graph, report } = flattenUiWorkflow(g);
+    expect(graph.nodes.some((n) => n.id === 2)).toBe(true); // #7-equivalent survives
+    expect(report.warnings.join("\n")).toContain("no record in extra.ue_links names it");
+    expect(graph.extra?.ue_links).toBeDefined();
+  });
+
+  it("an EMPTY computed ue_links list is an answer — no warning, and nothing removed", () => {
+    // The pack analysed the graph and recorded no broadcast. Warning there invents
+    // a problem on a faithful graph (and disagreed with the converter); an empty
+    // list is also not a licence to delete the senders.
+    const g = ueGraph(true);
+    g.extra!.ue_links = [];
+    const { graph, report } = flattenUiWorkflow(g);
+    expect(report.removed.ue).toBe(0);
+    expect(graph.nodes.some((n) => n.type === "Anything Everywhere")).toBe(true);
+    expect(report.warnings).toEqual([]);
+  });
+
+  it("a Get/Set chain resolving to a producer the graph lacks is reported, not silently cleared", () => {
+    // Pass 1 resolves the bus, but the producer serializes no output slot, so no
+    // replacement link can be built. Discarding that left the virtual deleted and
+    // the consumer quietly disconnected.
+    const g: UiWorkflow = {
+      nodes: [
+        node(1, "CheckpointLoaderSimple"), // no outputs array at all
+        node(2, "SetNode", {
+          widgets_values: ["m"],
+          inputs: [{ name: "MODEL", type: "MODEL", link: 10 }],
+          outputs: [{ name: "*", type: "*", links: [] }],
+        }),
+        node(3, "GetNode", {
+          widgets_values: ["m"],
+          outputs: [{ name: "MODEL", type: "MODEL", links: [11] }],
+        }),
+        node(4, "KSampler", { inputs: [{ name: "model", type: "MODEL", link: 11 }] }),
+      ],
+      links: [
+        [10, 1, 0, 2, 0, "MODEL"],
+        [11, 3, 0, 4, 0, "MODEL"],
+      ],
+      last_link_id: 11,
+    };
+    const { graph, report } = flattenUiWorkflow(g);
+    const sampler = graph.nodes.find((n) => n.type === "KSampler")!;
+    expect(sampler.inputs![0].link).toBeNull();
+    expect(report.warnings.join("\n")).toContain("which this graph does not have");
+    expect(report.warnings.join("\n")).toContain('KSampler #4 input "model"');
   });
 
   it("skips a ue_link whose receiver input got a real link since analysis", () => {
@@ -190,10 +565,23 @@ describe("flattenUiWorkflow — Use-Everywhere", () => {
       "Anything Everywhere3",
       "Prompts Everywhere",
       "Seed Everywhere",
+      // The pack registers this one, but the predicate used to compare the
+      // "Seed Everywhere" family with equality, so it went unrecognized — and an
+      // unrecognized sender means its broadcasts are dropped with nothing said.
+      "Seed Everywhere?",
     ]) {
       expect(isUeSender(t)).toBe(true);
     }
     expect(isUeSender("KSampler")).toBe(false);
+    expect(isUeSender("SaveImage")).toBe(false);
+    // Membership is by NAME, not by name SHAPE. A prefix match briefly stood in
+    // for it and let a foreign class be treated as a sender, whose stale record
+    // then passed the feed check and fabricated an edge. An unrecognized class is
+    // now reported instead (see the no-recognized-sender backstop), so a closed
+    // set costs a disclosed unknown rather than a silent drop.
+    for (const t of ["Seed Everywhere Helper", "Anything Everywhere Deluxe", "Prompts Everywhere Pro"]) {
+      expect(isUeSender(t), `${t} must not be taken for a UE sender`).toBe(false);
+    }
   });
 });
 

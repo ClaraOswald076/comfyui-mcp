@@ -9,9 +9,11 @@ import type {
   UiNodeOutput,
   UiLink,
   SubgraphDefinition,
+  SubgraphInput,
   SubgraphLink,
 } from "../comfyui/types.js";
 import { logger } from "../utils/logger.js";
+import { isSelfProducingUeSender, isUeSender } from "./flatten-workflow.js";
 
 export interface ConversionResult {
   workflow: WorkflowJSON;
@@ -472,6 +474,8 @@ function busKey(wv: unknown): unknown {
 function deVirtualizeGraph(
   nodes: UiNode[] | undefined,
   links: unknown[] | undefined,
+  warnings: string[],
+  scope: string,
 ): void {
   if (!nodes?.length || !links?.length) return;
   const dict = !Array.isArray(links[0]);
@@ -479,6 +483,7 @@ function deVirtualizeGraph(
   const lsrc = (l: any) => (dict ? l.origin_id : l[1]);
   const lsrcSlot = (l: any) => (dict ? l.origin_slot : l[2]);
   const ltgt = (l: any) => (dict ? l.target_id : l[3]);
+  const ltgtSlot = (l: any) => (dict ? l.target_slot : l[4]);
   const setLsrc = (l: any, n: unknown, s: unknown) => {
     if (dict) { l.origin_id = n; l.origin_slot = s; }
     else { l[1] = n; l[2] = s; }
@@ -490,7 +495,19 @@ function deVirtualizeGraph(
   for (const n of nodes) {
     if (isSetVirtual(n.type)) {
       const b = busKey(n.widgets_values);
-      if (b != null) busSet.set(String(b), n);
+      if (b == null) continue;
+      // Two Set nodes on the SAME bus name: whichever we keep, the other's writer
+      // is unreachable. litegraph resolves by iteration order (last wins), so
+      // mirror that — but SAY SO, because the graph's meaning is genuinely
+      // ambiguous and the stripped result silently picks one of two producers.
+      if (busSet.has(String(b))) {
+        warnings.push(
+          `${scope}: bus "${String(b)}" is written by more than one Set node (#${
+            busSet.get(String(b))!.id
+          } and #${n.id}) — the LAST one wins when resolving its Get nodes, so the other producer is not reachable in the stripped graph.`,
+        );
+      }
+      busSet.set(String(b), n);
     }
   }
   const incoming = (node: UiNode) => {
@@ -498,24 +515,54 @@ function deVirtualizeGraph(
     const l = inp?.link != null ? linkById.get(inp.link) : undefined;
     return l ? { node: lsrc(l), slot: lsrcSlot(l) } : null;
   };
+  type Resolved =
+    | { ok: true; node: unknown; slot: unknown }
+    | { ok: false; reason: string };
   const resolveReal = (
     nodeId: unknown,
     slot: unknown,
     depth = 0,
-  ): { node: unknown; slot: unknown } | null => {
-    if (depth > 100) return null;
+  ): Resolved => {
+    if (depth > 100) {
+      return {
+        ok: false,
+        reason: `the virtual-wiring chain exceeded 100 hops (a Get/Set or Reroute cycle)`,
+      };
+    }
     const node = byId.get(nodeId as number);
-    if (!node) return { node: nodeId, slot };
+    if (!node) return { ok: true, node: nodeId, slot };
     if (node.type === "Reroute") {
       const s = incoming(node);
-      return s ? resolveReal(s.node, s.slot, depth + 1) : null;
+      return s
+        ? resolveReal(s.node, s.slot, depth + 1)
+        : { ok: false, reason: `Reroute #${node.id} has no incoming connection` };
     }
     if (isGetVirtual(node.type)) {
       const b = busKey(node.widgets_values);
-      const setN = b != null ? busSet.get(String(b)) : undefined;
-      if (!setN) return null;
+      if (b == null) {
+        return {
+          ok: false,
+          reason: `${node.type} #${node.id} has no bus name (its "Constant" widget is unset)`,
+        };
+      }
+      const setN = busSet.get(String(b));
+      if (!setN) {
+        return {
+          ok: false,
+          reason: `${node.type} #${node.id} reads bus "${String(
+            b,
+          )}" but no Set node in ${scope} writes that bus`,
+        };
+      }
       const s = incoming(setN);
-      return s ? resolveReal(s.node, s.slot, depth + 1) : null;
+      return s
+        ? resolveReal(s.node, s.slot, depth + 1)
+        : {
+            ok: false,
+            reason: `${node.type} #${node.id} reads bus "${String(b)}", whose ${
+              setN.type
+            } #${setN.id} has no incoming connection`,
+          };
     }
     // SetNode passthrough: rgthree/KJNodes Set nodes expose an output that mirrors
     // their value input, so a consumer can wire straight off the SetNode (not only
@@ -524,12 +571,17 @@ function deVirtualizeGraph(
     // the connection (issue #361: Set/Get-resolved links missing on downstream nodes).
     if (isSetVirtual(node.type)) {
       const s = incoming(node);
-      return s ? resolveReal(s.node, s.slot, depth + 1) : null;
+      return s
+        ? resolveReal(s.node, s.slot, depth + 1)
+        : {
+            ok: false,
+            reason: `${node.type} #${node.id} has no incoming connection`,
+          };
     }
-    return { node: nodeId, slot };
+    return { ok: true, node: nodeId, slot };
   };
 
-  const drop = new Set<unknown>();
+  const drop = new Map<unknown, string>();
   for (const l of links as any[]) {
     const srcType = byId.get(lsrc(l))?.type;
     if (
@@ -537,12 +589,49 @@ function deVirtualizeGraph(
       (srcType && (isGetVirtual(srcType) || isSetVirtual(srcType)))
     ) {
       const real = resolveReal(lsrc(l), lsrcSlot(l));
-      if (real && !isWiringVirtual(byId.get(real.node as number)?.type)) {
+      if (real.ok && !isWiringVirtual(byId.get(real.node as number)?.type)) {
         setLsrc(l, real.node, real.slot);
+        // Re-home the link on the RESOLVED producer's output slot. The link tuple
+        // alone is not enough: the subgraph expander treats a component node's
+        // `outputs[].links` as the authoritative list of consumers to rewire, so a
+        // `component → Set/Get → consumer` edge whose id never landed there was
+        // dropped when the component expanded away — surfacing only as an
+        // anonymous "pruned dangling reference" (codex gate, #361).
+        const producer = byId.get(real.node as number);
+        const outSlot = producer?.outputs?.[real.slot as number];
+        if (outSlot) {
+          const existing = outSlot.links ?? [];
+          if (!existing.includes(lid(l))) outSlot.links = [...existing, lid(l)];
+        }
       } else {
-        drop.add(lid(l)); // unresolved bus/reroute — drop like a dead link
+        // Unresolved bus/reroute. Dropping it silently is issue #361's actual
+        // harm: the consumer's input simply vanishes and the stripped graph looks
+        // fine. Name the consumer + the reason, and CLEAR the consumer's stale
+        // link reference so the graph stays self-consistent (an orphaned link id
+        // would otherwise resurface later as an anonymous "dangling link").
+        drop.set(
+          lid(l),
+          real.ok
+            ? `the chain resolved to another virtual wiring node, which has no executable equivalent`
+            : real.reason,
+        );
       }
     }
+  }
+  for (const [linkId, reason] of drop) {
+    const l = linkById.get(linkId);
+    if (!l) continue;
+    const consumer = byId.get(ltgt(l));
+    // A dropped link INTO a virtual node is consumed by the resolution itself —
+    // there is no surviving consumer to lose a connection, so nothing to report.
+    if (!consumer || isWiringVirtual(consumer.type)) continue;
+    const slotIdx = ltgtSlot(l) as number;
+    const inputSlot = consumer.inputs?.[slotIdx];
+    if (inputSlot && inputSlot.link === linkId) inputSlot.link = null;
+    const inputName = inputSlot?.name ?? `slot ${slotIdx}`;
+    warnings.push(
+      `Node ${consumer.id} (${consumer.type}) in ${scope}: input "${inputName}" was fed through virtual Get/Set/Reroute wiring that could NOT be resolved to a real producer — ${reason}. That connection is ABSENT from the stripped graph even though the source workflow has it.`,
+    );
   }
   const keptLinks = (links as any[]).filter((l) => {
     if (drop.has(lid(l))) return false;
@@ -557,11 +646,516 @@ function deVirtualizeGraph(
   (links as any[]).push(...keptLinks);
 }
 
-/** Strip wiring virtuals from the top-level graph and every subgraph definition. */
-function deVirtualize(ui: UiWorkflow): void {
-  deVirtualizeGraph(ui.nodes, ui.links as unknown[]);
+/**
+ * The subgraph definitions actually INSTANTIATED by this workflow, transitively.
+ * A workflow file keeps definitions that no node instantiates (deleted instances,
+ * imported libraries); nothing in them reaches the stripped graph, so reporting
+ * their unresolved wiring would be pure noise that buries the real losses
+ * (codex gate, #361).
+ */
+function reachableSubgraphs(ui: UiWorkflow): SubgraphDefinition[] {
+  const defs = ui.definitions?.subgraphs ?? [];
+  if (defs.length === 0) return [];
+  const byId = new Map(defs.map((sg) => [sg.id, sg]));
+  const reached = new Set<string>();
+  const queue: UiNode[][] = [ui.nodes ?? []];
+  while (queue.length) {
+    for (const n of queue.pop()!) {
+      if (!byId.has(n.type) || reached.has(n.type)) continue;
+      reached.add(n.type);
+      queue.push(byId.get(n.type)!.nodes ?? []);
+    }
+  }
+  return defs.filter((sg) => reached.has(sg.id));
+}
+
+/** Strip wiring virtuals from the top-level graph and every LIVE subgraph definition. */
+function deVirtualize(
+  ui: UiWorkflow,
+  warnings: string[],
+  liveSubgraphs: SubgraphDefinition[],
+): void {
+  deVirtualizeGraph(ui.nodes, ui.links as unknown[], warnings, "the top-level graph");
+  for (const sg of liveSubgraphs) {
+    deVirtualizeGraph(
+      sg.nodes,
+      sg.links as unknown[],
+      warnings,
+      `subgraph "${sg.name ?? sg.id}"`,
+    );
+  }
+}
+
+// ── cg-use-everywhere (UE) broadcast materialization ────────────────────────
+
+/**
+ * cg-use-everywhere ("Anything Everywhere", "Seed Everywhere", "Prompts
+ * Everywhere") wires its consumers with links that DO NOT EXIST in `graph.links`
+ * — the pack's browser JS injects them at queue time. A pure `links`-based
+ * conversion therefore emits a graph whose consumers have NO connection at all,
+ * with nothing said (issue #361: "virtual links from node packs that aren't
+ * ordinary graph links").
+ *
+ * The pack writes its OWN computed broadcast list to `extra.ue_links` on every
+ * graph analysis, so that list — not a re-implementation of the pack's matching
+ * rules — is the ground truth. Materialize each entry as a REAL link before
+ * de-virtualization (so a broadcast whose producer sits behind a Get/Set bus
+ * still resolves), and never overwrite an input that already has a real link
+ * (UE does not fire on a connected input).
+ *
+ * When senders exist but `extra.ue_links` does not, the broadcasts are NOT
+ * recoverable from the saved graph — that is an UNKNOWN, not an absence, so it
+ * is reported rather than quietly treated as "no broadcasts".
+ */
+interface UeLinkEntry {
+  downstream: number;
+  downstream_slot: number;
+  upstream: number;
+  upstream_slot: number;
+  /** The sender node that produced this broadcast (absent in older lists). */
+  controller?: number;
+  type?: string;
+}
+
+/**
+ * Materialize the broadcasts of ONE graph (the top level, or one subgraph
+ * definition — hence the `addLink` indirection, since a definition stores links
+ * as objects rather than tuples). Reports, never guesses.
+ */
+function materializeUeInGraph(
+  nodes: UiNode[],
+  links: ReadonlyArray<{ id: number; origin_id: number; origin_slot: number }>,
+  extra: Record<string, unknown> | undefined,
+  scope: string,
+  warnings: string[],
+  nextId: () => number,
+  addLink: (
+    id: number,
+    srcId: number,
+    srcSlot: number,
+    dstId: number,
+    dstSlot: number,
+    type: string,
+  ) => void,
+  /** Present for a subgraph definition: its virtual input node and input slots,
+   *  so a broadcast sourced from the definition's boundary can be registered
+   *  there and re-targeted to the outer producer during expansion. */
+  boundary?: { inputNodeId: number; inputs: SubgraphInput[] },
+): number {
+  const senders = nodes.filter((n) => typeof n.type === "string" && isUeSender(n.type));
+  const ueLinks = extra?.ue_links;
+  if (senders.length === 0) {
+    // Records but no recognized sender. Returning 0 here silently would be the
+    // single worst outcome this whole change exists to prevent: a real broadcast
+    // dropped with nothing said, and it is exactly what an unrecognized sender
+    // CLASS produces. We cannot tell a deleted sender (records genuinely stale,
+    // dropping them is right) from a sender class this converter doesn't know
+    // (records live, dropping them is a loss) — so this is a could-not-determine
+    // and it is reported as one.
+    if (Array.isArray(ueLinks) && ueLinks.length > 0) {
+      warnings.push(
+        `${ueLinks.length} cg-use-everywhere broadcast record(s) are present in ${scope}, but no node in it is recognized as a cg-use-everywhere broadcast node. Either those broadcast nodes were deleted (leaving the records stale) or they are a sender class this converter does not recognize — the records cannot be attributed either way, so every input they name is UNCONNECTED in the stripped graph.`,
+      );
+    }
+    return 0;
+  }
+
+  // An EMPTY computed list is an ANSWER — the pack analysed the graph and found
+  // no broadcast to record — so the stripped graph is faithful and nothing is
+  // reported. Only an ABSENT (or non-array) list is an unknown, and only that is
+  // warned about. Collapsing the two would either invent a loss or hide one.
+  if (Array.isArray(ueLinks) && ueLinks.length === 0) return 0;
+  if (!Array.isArray(ueLinks)) {
+    warnings.push(
+      `${senders.length} cg-use-everywhere broadcast node(s) (${senders
+        .map((s) => `${s.type} #${s.id}`)
+        .join(", ")}) are present in ${scope}, but it carries no computed "extra.ue_links" list. ` +
+        `Their broadcast connections are NOT ordinary graph links and CANNOT be recovered from this file, so every input they feed is UNCONNECTED in the stripped graph. ` +
+        `Open the workflow with cg-use-everywhere active and save (or queue) it once so the pack writes extra.ue_links, then strip again.`,
+    );
+    return 0;
+  }
+
+  const nodesById = new Map(nodes.map((n) => [n.id, n]));
+  const senderIds = new Set(senders.map((s) => s.id));
+
+  // ── Whole-record staleness: is the sender STILL fed by the recorded producer? ──
+  // Verifying only that `controller` is still a sender is not enough. A record
+  // left over from before its sender was DISCONNECTED or REWIRED would otherwise
+  // materialize `upstream → consumer`: an edge that does not exist live. A
+  // fabricated connection is worse than a dropped one — a missing link renders as
+  // an obviously broken graph, a fabricated one renders as a plausible graph that
+  // is silently wrong and looks deliberate to whoever opens it.
+  const linkSrc = new Map<number, { node: number; slot: number }>();
+  for (const l of links) {
+    if (l && typeof l.id === "number") {
+      linkSrc.set(l.id, { node: l.origin_id, slot: l.origin_slot });
+    }
+  }
+  const busSet = new Map<string, UiNode>();
+  for (const n of nodes) {
+    if (!isSetVirtual(n.type)) continue;
+    const b = busKey(n.widgets_values);
+    if (b != null) busSet.set(String(b), n);
+  }
+  // This runs BEFORE de-virtualization, and the pack's `upstream` is sometimes the
+  // REAL producer and sometimes the virtual node in front of it. So BOTH sides of
+  // the comparison are normalized past Reroute/Get/Set first — comparing a raw
+  // origin against a resolved one would flag a perfectly current record as stale
+  // and drop a live connection. `null` means the chain could NOT be resolved,
+  // which is distinct from "resolved to something else".
+  const realOfNode = (
+    nodeId: number,
+    slot: number,
+    depth = 0,
+  ): { node: number; slot: number } | null => {
+    if (depth > 100) return null;
+    const n = nodesById.get(nodeId);
+    if (!n) return { node: nodeId, slot }; // outside this graph — take at face value
+    if (n.type === "Reroute" || isGetVirtual(n.type) || isSetVirtual(n.type)) {
+      const via = isGetVirtual(n.type)
+        ? (() => {
+            const b = busKey(n.widgets_values);
+            const setN = b != null ? busSet.get(String(b)) : undefined;
+            return (setN?.inputs ?? []).find((i) => i.link != null);
+          })()
+        : (n.inputs ?? []).find((i) => i.link != null);
+      return via?.link != null ? realSourceOf(via.link, depth + 1) : null;
+    }
+    return { node: nodeId, slot };
+  };
+  const realSourceOf = (linkId: number, depth = 0): { node: number; slot: number } | null => {
+    if (depth > 100) return null;
+    const src = linkSrc.get(linkId);
+    if (!src) return null;
+    return realOfNode(src.node, src.slot, depth + 1);
+  };
+  /** Senders whose records were materialized but whose CHANNEL could not be
+   *  verified, because the sender carries several distinct producers and a
+   *  ue_links record does not name the sender input it came through. Disclosed
+   *  once per sender rather than per record. */
+  const multiFeedControllers = new Map<
+    number,
+    { type: string; confirmed: number; unresolved: number }
+  >();
+  /**
+   * THE single "is this producer real" question. Every uncertainty about a
+   * producer must flow through here — the record's own producer before it is
+   * materialized, AND each of the sender's feeds when counting how many distinct
+   * producers it carries. Two separate answers to the same question is how the
+   * caveat came to claim a producer was "confirmed" that the materializer would
+   * have refused.
+   *
+   * A node OUTSIDE this graph (a subgraph boundary feed) is not judged here: its
+   * real producer lives one level up and is resolved during expansion.
+   */
+  const producerConfirmed = (nodeId: number, slot: number): boolean => {
+    const nd = nodesById.get(nodeId);
+    if (!nd) return true;
+    // A node that really produces something serializes its outputs. An absent
+    // array is could-not-determine, and folding that into a definite yes is what
+    // let an executable edge be emitted to a slot nothing proved exists.
+    if (!Array.isArray(nd.outputs)) return false;
+    return slot < nd.outputs.length;
+  };
+  /**
+   * Verify the record against the sender's LIVE feed.
+   *  - "ok"          the sender is still fed by exactly this producer + slot
+   *  - "detached"    the sender has no incoming connection at all
+   *  - "rewired"     every feed resolved, none to this producer + slot
+   *  - "unverifiable" a feed exists but its chain could not be resolved
+   * A sender with no `controller` on the record can't be attributed, so it is not
+   * assessed ("ok" — older lists predate the field and say nothing either way).
+   */
+  const assessRecord = (
+    raw: UeLinkEntry,
+    /** The record's producer ALREADY normalized past any virtual wiring. Passed
+     *  in rather than recomputed so the check and the materialization provably
+     *  judge the SAME node — computing it independently in each place is exactly
+     *  how one site came to compare a raw virtual id against a normalized one. */
+    want: { node: number; slot: number },
+  ): "ok" | "detached" | "rewired" | "unverifiable" | "unattributable" => {
+    // No `controller` (older lists omit the field): the record cannot be tied to
+    // ANY sender. Scanning for "some live sender happens to be fed by this
+    // producer" reads a COINCIDENCE as evidence — the record's own sender may be
+    // long gone while an unrelated sender shares that producer and broadcasts it
+    // somewhere else entirely, which fabricates an edge the live graph lacks.
+    // The one self-attributing shape is a producer that IS itself a SELF-PRODUCING
+    // broadcast node (Seed Everywhere owns its widget): that names its own single
+    // channel unambiguously, with no attribution to guess at. It must be a
+    // self-producing class specifically — accepting any recognized sender here
+    // would skip the feed check for a relay sender, which is how an over-broad
+    // class match could turn a stale record into a fabricated edge.
+    if (raw.controller == null) {
+      const up = nodesById.get(want.node);
+      return up && isSelfProducingUeSender(up.type) ? "ok" : "unattributable";
+    }
+    // Seed Everywhere and friends: the sender IS the producer (it owns the widget),
+    // so there is no incoming feed to compare against. Same narrowing — a relay
+    // sender that merely names itself as its own upstream is not exempt from
+    // verification, it falls through to the feed check below.
+    //
+    // Compare the NORMALIZED producer, not the raw one. The pack records the
+    // virtual in front of a producer as readily as the producer, so a record like
+    // { controller: SeedEverywhere#1, upstream: Reroute#2 } is self-producing once
+    // the Reroute is followed. Testing the raw value called that a mismatch, fell
+    // through to the feed check, found a Seed has no incoming feed, and DROPPED a
+    // live broadcast. (The flattener normalizes first; this makes the two agree.)
+    if (
+      want.node === raw.controller &&
+      isSelfProducingUeSender(nodesById.get(raw.controller)?.type ?? "")
+    ) {
+      return "ok";
+    }
+    const ctrl = nodesById.get(raw.controller);
+    if (!ctrl) return "ok"; // already reported by the sender check above
+    // A sender can have SEVERAL inputs (Prompts Everywhere, Anything Everywhere3),
+    // each with its own record — the record is current if ANY feed matches.
+    //
+    // KNOWN LIMIT, and it is a limit of the DATA, not of this check. A ue_links
+    // record carries { downstream, downstream_slot, upstream, upstream_slot,
+    // controller, type } and nothing that says WHICH INPUT of the sender the
+    // broadcast came through. On a multi-input sender the producer identity is
+    // therefore the only handle on channel identity, which is what is matched
+    // here. What cannot be checked is whether that channel routes to THIS target:
+    // deciding that is the pack's own type/name matching, and re-implementing it
+    // would be a second guess layered on the first. So a list that went stale by
+    // SWAPPING two channels of one sender (positive/negative both still feeding
+    // it, just exchanged) is indistinguishable from a current one.
+    //
+    // Refusing every multi-input record would drop the broadcasts of every Prompts
+    // Everywhere / Anything Everywhere3 graph, permanently and with no remedy the
+    // user could act on — a certain loss traded for an occasional one. So the
+    // record IS materialized, and `multiFeedControllers` records the sender so the
+    // residual is DISCLOSED once per sender. Unverifiable and undisclosed are
+    // different failures; only the second one is this issue.
+    const feeds = (ctrl.inputs ?? []).filter((i) => i.link != null);
+    if (feeds.length === 0) return "detached";
+    let unresolved = 0;
+    let matched = false;
+    const distinct = new Set<string>();
+    for (const f of feeds) {
+      const real = realSourceOf(f.link as number);
+      // An UNRESOLVED input is an UNKNOWN producer, not the absence of one, and
+      // so is one whose producer this converter would REFUSE to wire from. Both
+      // count toward the channel ambiguity below; contributing nothing made a
+      // sender with one known and one unknown producer read as "one producer,
+      // nothing to confuse", silencing the caveat where the risk is highest.
+      if (!real || !producerConfirmed(real.node, real.slot)) {
+        unresolved++;
+        continue;
+      }
+      distinct.add(`${real.node}:${real.slot}`);
+      if (real.node === want.node && real.slot === want.slot) matched = true;
+    }
+    if (!matched) return unresolved > 0 ? "unverifiable" : "rewired";
+    // Confirmed live, but on a sender carrying MORE THAN ONE distinct producer the
+    // channel→target association is not recoverable from the record (see above).
+    if (distinct.size + unresolved > 1) {
+      multiFeedControllers.set(ctrl.id, {
+        type: ctrl.type,
+        confirmed: distinct.size,
+        unresolved,
+      });
+    }
+    return "ok";
+  };
+
+  let added = 0;
+  for (const raw of ueLinks as UeLinkEntry[]) {
+    const dst = nodesById.get(raw?.downstream);
+    const dstInput = dst?.inputs?.[raw?.downstream_slot];
+    if (!dst || !dstInput) {
+      warnings.push(
+        `A cg-use-everywhere broadcast in ${scope} targets node #${raw?.downstream} slot ${raw?.downstream_slot}, which no longer exists — that broadcast connection is ABSENT from the stripped graph.`,
+      );
+      continue;
+    }
+    const inputLabel = dstInput.name ?? String(raw.downstream_slot);
+    if (dstInput.link != null) continue; // real link present — UE would not fire
+    // A record whose own broadcast node is GONE — deleted outright, or that id
+    // reused by an ordinary node — is left over; honoring it would fabricate a
+    // connection the live graph does not have.
+    if (raw.controller != null && !senderIds.has(raw.controller)) {
+      warnings.push(
+        `A cg-use-everywhere record in ${scope} feeding node ${dst.id} (${dst.type}) input "${inputLabel}" names broadcast node #${raw.controller}, which is no longer a broadcast node in this graph — the record is stale, so that input is left UNCONNECTED rather than wired from a broadcast that no longer exists.`,
+      );
+      continue;
+    }
+    // NORMALIZE ONCE, HERE. The pack records the virtual node in front of a
+    // producer as readily as the producer itself, so every question asked below —
+    // is this the subgraph boundary, does this node exist, does that output slot
+    // exist, is the sender still fed by it, what do we wire from — must be asked
+    // about the REAL producer. Resolving it independently at each site is what
+    // left one check comparing a raw virtual id while its neighbour compared a
+    // normalized one, and each such pair cost a live edge.
+    const from = realOfNode(raw.upstream, raw.upstream_slot);
+    if (!from) {
+      warnings.push(
+        `A cg-use-everywhere broadcast in ${scope} into node ${dst.id} (${dst.type}) input "${inputLabel}" names producer #${raw.upstream}, whose own virtual wiring could not be resolved to a real node — that input is left UNCONNECTED rather than wired from an unknown source.`,
+      );
+      continue;
+    }
+    // Inside a subgraph definition the producer can be the definition's virtual
+    // INPUT node: the broadcast's real source is whatever the outer component's
+    // matching input is wired to. That is a recoverable connection, not a missing
+    // producer — register the materialized edge on the boundary so the expander's
+    // input rewiring re-targets it to the outer source like any other inner link.
+    const fromBoundary = boundary != null && from.node === boundary.inputNodeId;
+    const src = fromBoundary ? undefined : nodesById.get(from.node);
+    if (!src && !fromBoundary) {
+      warnings.push(
+        `A cg-use-everywhere broadcast in ${scope} into node ${dst.id} (${dst.type}) input "${inputLabel}" names producer #${raw.upstream}, which is not in this graph — that connection is ABSENT from the stripped graph.`,
+      );
+      continue;
+    }
+    // The recorded output slot must be OBSERVABLY there, on the REAL producer.
+    if (src && !producerConfirmed(from.node, from.slot)) {
+      const detail = Array.isArray(src.outputs)
+        ? `which only has ${src.outputs.length} output(s)`
+        : `but that node serializes no outputs at all, so the slot could not be confirmed to exist`;
+      warnings.push(
+        `A cg-use-everywhere broadcast in ${scope} into node ${dst.id} (${dst.type}) input "${inputLabel}" resolves to output slot ${from.slot} of node ${src.id} (${src.type}), ${detail} — that input is left UNCONNECTED rather than wired to a slot nothing proves is there.`,
+      );
+      continue;
+    }
+    // Fourth stale shape, and the only one that would produce an EDGE rather than
+    // an absence: the sender survives but is no longer fed by the recorded
+    // producer. Never materialize an unconfirmed record — say what could not be
+    // confirmed instead.
+    const verdict = assessRecord(raw, from);
+    if (verdict !== "ok") {
+      const ctrl = nodesById.get(raw.controller as number);
+      const who = `${ctrl?.type ?? "broadcast node"} #${raw.controller}`;
+      const why =
+        verdict === "detached"
+          ? `${who} no longer has any incoming connection, so it broadcasts nothing`
+          : verdict === "rewired"
+            ? `${who} is now fed by a different producer than the recorded node ${raw.upstream} (slot ${raw.upstream_slot})`
+            : verdict === "unattributable"
+              ? `the record names no broadcast node of its own (an older cg-use-everywhere list), so it cannot be attributed to any sender here and there is no way to confirm that producer node ${raw.upstream} (slot ${raw.upstream_slot}) still feeds this input — another sender sharing that producer would prove nothing about THIS target`
+              : `${who}'s own incoming connection could not be resolved, so the recorded producer node ${raw.upstream} (slot ${raw.upstream_slot}) could not be confirmed`;
+      warnings.push(
+        `A cg-use-everywhere record in ${scope} feeding node ${dst.id} (${dst.type}) input "${inputLabel}" could not be confirmed against the live graph: ${why}. That input is left UNCONNECTED rather than wired from a broadcast the live graph may not have.`,
+      );
+      continue;
+    }
+    const id = nextId();
+    // Wire from the REAL producer, the same node every check above judged.
+    addLink(
+      id,
+      from.node,
+      from.slot,
+      raw.downstream,
+      raw.downstream_slot,
+      raw.type ?? dstInput.type ?? "*",
+    );
+    dstInput.link = id;
+    if (fromBoundary) {
+      // The expander walks each subgraph input's linkIds to re-point its inner
+      // consumers at the outer source; an unregistered edge would be left dangling.
+      const sgInput = boundary!.inputs[from.slot];
+      if (sgInput) (sgInput.linkIds ??= []).push(id);
+    } else {
+      const srcOut = src!.outputs?.[from.slot];
+      if (srcOut) srcOut.links = [...(srcOut.links ?? []), id];
+    }
+    added++;
+  }
+  // A non-empty list is not proof that it accounts for EVERY sender. One that
+  // predates a sender simply has no row for it, and the broadcasts of that sender
+  // then come out unconnected — which, on a list that looked usable, is exactly
+  // the silent difference this change exists to remove. A sender that genuinely
+  // reaches nothing has no row either, and the two are indistinguishable here, so
+  // it is reported as the could-not-determine it is.
+  const attributed = new Set<number>();
+  for (const r of ueLinks as UeLinkEntry[]) {
+    if (r?.controller != null) attributed.add(r.controller);
+    else {
+      // A controllerless record still accounts for its sender when the producer
+      // IS that sender (the self-producing shape accepted above) — judged on the
+      // NORMALIZED producer, since the record may name a virtual in front of it.
+      const p = realOfNode(r?.upstream, r?.upstream_slot);
+      if (p && isSelfProducingUeSender(nodesById.get(p.node)?.type ?? "")) {
+        attributed.add(p.node);
+      }
+    }
+  }
+  for (const s of senders) {
+    if (attributed.has(s.id)) continue;
+    warnings.push(
+      `${s.type} #${s.id} in ${scope} is a cg-use-everywhere broadcast node, but no record in extra.ue_links names it. Either it currently broadcasts to nothing, or the saved list predates it — indistinguishable from the file, so nothing was wired from it and any inputs it feeds are UNCONNECTED in the stripped graph. Re-save (or queue) with cg-use-everywhere active to refresh the list.`,
+    );
+  }
+  for (const [id, info] of multiFeedControllers) {
+    // Say only what is true. This fires both when several producers were
+    // CONFIRMED and when one channel could not be resolved at all, and claiming
+    // "every producer was confirmed" in the second case is a false statement in a
+    // disclosure — which is how disclosures get ignored.
+    const carries =
+      info.unresolved > 0
+        ? `${info.confirmed} confirmed producer(s) plus ${info.unresolved} input(s) whose own source could NOT be resolved`
+        : `${info.confirmed} different confirmed producers`;
+    warnings.push(
+      `Node ${id} (${info.type}) in ${scope}: a cg-use-everywhere broadcast could not be matched to a specific sender input — this sender carries ${carries}, and a ue_links record does not name the input a broadcast came through. The wiring is materialized, but a saved list that went stale by SWAPPING this sender's channels would look identical from the file. Re-save (or queue) the workflow with cg-use-everywhere active if this sender's routing matters.`,
+    );
+  }
+  return added;
+}
+
+function materializeUeLinks(
+  ui: UiWorkflow,
+  warnings: string[],
+  liveSubgraphs: SubgraphDefinition[],
+): void {
+  // ONE id counter across the whole workflow: subgraph expansion offsets inner
+  // link ids from the global maximum, so a definition-local id that collides with
+  // a top-level one would be remapped onto a live edge.
+  let maxId = ui.last_link_id ?? 0;
+  for (const l of ui.links ?? []) if (Array.isArray(l)) maxId = Math.max(maxId, l[0]);
   for (const sg of ui.definitions?.subgraphs ?? []) {
-    deVirtualizeGraph(sg.nodes, sg.links as unknown[]);
+    for (const l of sg.links ?? []) maxId = Math.max(maxId, l?.id ?? 0);
+  }
+  const nextId = () => ++maxId;
+
+  const links = (ui.links ??= []);
+  let added = materializeUeInGraph(
+    ui.nodes ?? [],
+    // Normalize the top level's tuple links to the object shape the staleness
+    // check reads; a subgraph definition already stores them that way.
+    links
+      .filter((l) => Array.isArray(l))
+      .map((l) => ({ id: l[0], origin_id: l[1], origin_slot: l[2] })),
+    ui.extra as Record<string, unknown> | undefined,
+    "the top-level graph",
+    warnings,
+    nextId,
+    (id, s, ss, d, ds, t) => links.push([id, s, ss, d, ds, t]),
+  );
+  for (const sg of liveSubgraphs) {
+    const sgLinks = (sg.links ??= []);
+    added += materializeUeInGraph(
+      sg.nodes ?? [],
+      sgLinks,
+      sg.extra,
+      `subgraph "${sg.name ?? sg.id}"`,
+      warnings,
+      nextId,
+      (id, s, ss, d, ds, t) =>
+        sgLinks.push({
+          id,
+          origin_id: s,
+          origin_slot: ss,
+          target_id: d,
+          target_slot: ds,
+          type: t,
+        }),
+      { inputNodeId: sg.inputNode?.id, inputs: sg.inputs ?? [] },
+    );
+  }
+  ui.last_link_id = maxId;
+  if (added > 0) {
+    logger.info(`Materialized ${added} cg-use-everywhere broadcast link(s)`);
   }
 }
 
@@ -758,7 +1352,17 @@ function expandSingleComponent(
       if (compInput.link == null) continue;
 
       const outerLink = outerLinkMap.get(compInput.link);
-      if (!outerLink) continue;
+      if (!outerLink) {
+        // The slot claims a connection whose link does not exist. The inner
+        // consumers are then treated as unfed and cleared by 8b below, so the
+        // inner nodes silently fall back to their own stored values — the
+        // subgraph-boundary counterpart of a dangling input reference, and just
+        // as invisible unless it is said.
+        warnings.push(
+          `Component "${sg.name}" (node ${compNode.id}): input "${compInput.name}" claims link ${compInput.link}, which does not exist in the graph, so the connection is DROPPED and everything inside fed by that input falls back to its own stored value.`,
+        );
+        continue;
+      }
 
       const srcNodeId = outerLink[1];
       const srcSlot = outerLink[2];
@@ -772,8 +1376,22 @@ function expandSingleComponent(
         continue;
       }
 
-      // For each inner link from the virtual input node, create a new outer link
-      for (const innerLinkId of sgInput.linkIds) {
+      // Every inner link that ORIGINATES at the boundary for this input, not just
+      // the ones the definition's own `linkIds` happens to list. De-virtualization
+      // re-homes a link onto the boundary when the producer sat behind a Reroute
+      // or a Get/Set bus inside the definition, and such a link is nowhere in
+      // `linkIds` — it was silently skipped here and its consumer lost the
+      // connection, once per instance. `linkIds` remains the primary source (it
+      // carries entries even when a link's origin was rewritten elsewhere), and
+      // the two are unioned by id.
+      const boundaryLinkIds = new Set<number>(sgInput.linkIds ?? []);
+      const inputIndex = sg.inputs.indexOf(sgInput);
+      for (const il of sg.links) {
+        if (il.origin_id === inputNodeId && il.origin_slot === inputIndex) {
+          boundaryLinkIds.add(il.id);
+        }
+      }
+      for (const innerLinkId of boundaryLinkIds) {
         const il = innerLinkById.get(innerLinkId);
         if (!il || il.origin_id !== inputNodeId) continue;
         const remappedTarget = nodeRemap.get(il.target_id);
@@ -865,28 +1483,174 @@ function expandSingleComponent(
     }
   }
 
-  // ── 8. Apply proxy widget values ────────────────────────────────────────
-  const proxyWidgets: [string, string][] =
-    (compNode.properties?.proxyWidgets as [string, string][]) ?? [];
-  const widgetValues = compNode.widgets_values ?? [];
+  // ── 8. Apply promoted ("proxy") widget values ───────────────────────────
+  // A subgraph node's own widgets are PROMOTIONS: `properties.proxyWidgets` is an
+  // ordered [innerNodeId, widgetName] list parallel to `widgets_values`, and the
+  // value the user sees/edits on the subgraph node is the LIVE value — the inner
+  // node's own saved widgets_values is whatever it held when the subgraph was
+  // built. Failing to push the promoted value down means the stripped graph
+  // reports (and would run) the STALE inner value: issue #361's "returns wrong
+  // dynamic widget values".
+  //
+  // Two promotion shapes exist and BOTH were silently dropped before:
+  //   • innerNodeId "-1" — the promotion targets a SUBGRAPH INPUT slot (a widget
+  //     exposed on the subgraph boundary). Its value belongs to every inner
+  //     consumer wired from that input slot.
+  //   • a real inner node id — the promotion targets that node's named widget.
+  // The old code resolved neither reliably: it mapped the widget NAME to a
+  // POSITION with findWidgetIndex(), which counts only widgets that appear in the
+  // node's inputs[] and returns null otherwise — so a promoted value either
+  // vanished or (when inputs[] omitted some widgets) landed on the WRONG widget.
+  // Values are now carried BY NAME on `resolvedWidgetValues` and applied by the main
+  // converter against object_info, which is authoritative about widget names.
+  const proxyWidgets: [string, string][] = Array.isArray(compNode.properties?.proxyWidgets)
+    ? (compNode.properties!.proxyWidgets as [string, string][])
+    : [];
+  const rawWidgetValues = compNode.widgets_values ?? [];
+  // A subgraph instance normally serializes its promoted values POSITIONALLY,
+  // parallel to proxyWidgets. Some captures key every widget BY NAME instead (the
+  // shape the main converter already accepts). Read both, or a name-keyed capture
+  // would leave every promotion at the inner node's stale value — silently.
+  const widgetValues: unknown[] = Array.isArray(rawWidgetValues) ? rawWidgetValues : [];
+  const wvByName: Record<string, unknown> | null =
+    !Array.isArray(rawWidgetValues) && rawWidgetValues && typeof rawWidgetValues === "object"
+      ? (rawWidgetValues as unknown as Record<string, unknown>)
+      : null;
+  // A flat name→value map can only be attributed when the promoted names are
+  // UNIQUE. Two promotions of the same widget name (from different inner nodes)
+  // share one slot, so the stored value belongs to neither in particular — refuse
+  // both rather than push one control's value onto another.
+  const nameClaims = new Map<string, number>();
+  if (wvByName) {
+    for (const e of proxyWidgets) {
+      if (Array.isArray(e) && e.length >= 2) {
+        nameClaims.set(e[1], (nameClaims.get(e[1]) ?? 0) + 1);
+      }
+    }
+  }
 
+  /** Record a promoted value on an inner node BY NAME. A nested subgraph
+   *  instance has no object_info of its own, so its promotion is recorded
+   *  positionally in its OWN proxyWidgets order (the next expansion pass reads
+   *  it from there). Returns false when the target cannot carry the value. */
+  const applyPromoted = (target: UiNode, widgetName: string, value: unknown): boolean => {
+    const innerProxy = target.properties?.proxyWidgets;
+    if (Array.isArray(innerProxy) && innerProxy.length > 0) {
+      const idx = (innerProxy as [string, string][]).findIndex(
+        ([, wn]) => wn === widgetName,
+      );
+      if (idx < 0) return false;
+      const nestedWv = target.widgets_values as unknown;
+      // A nested instance may itself carry a NAME-KEYED widgets_values. Overlay
+      // the value in that representation — replacing the object with a positional
+      // array would discard the nested instance's OTHER promoted values, which
+      // its own expansion pass would then silently leave at their stale inner
+      // values (codex gate r3).
+      if (nestedWv && typeof nestedWv === "object" && !Array.isArray(nestedWv)) {
+        (nestedWv as Record<string, unknown>)[widgetName] = value;
+        return true;
+      }
+      if (!Array.isArray(target.widgets_values)) target.widgets_values = [];
+      target.widgets_values[idx] = value;
+      return true;
+    }
+    (target.resolvedWidgetValues ??= {})[widgetName] = value;
+    return true;
+  };
+
+  // NOTE: a promoted widget with no entry in widgets_values is NOT a loss and is
+  // deliberately not reported. The subgraph node's widget is a PROXY VIEW of the
+  // inner widget, so "no serialized override" means the inner node's own stored
+  // value is exactly what the subgraph node displayed — which is what we keep.
+  // (Most real subgraph instances serialize an empty widgets_values, so warning
+  // here fired on nearly every subgraph-bearing workflow and would have buried
+  // the genuine losses below.)
   for (let i = 0; i < proxyWidgets.length; i++) {
-    const [innerNodeIdStr, widgetName] = proxyWidgets[i];
-    const value = i < widgetValues.length ? widgetValues[i] : undefined;
+    const entry = proxyWidgets[i];
+    if (!Array.isArray(entry) || entry.length < 2) continue;
+    const [innerNodeIdStr, widgetName] = entry;
+    if (wvByName && (nameClaims.get(widgetName) ?? 0) > 1) {
+      warnings.push(
+        `Component "${sg.name}" (node ${compNode.id}): promoted widget "${widgetName}" could not be resolved from the name-keyed capture because more than one promotion claims that name, so the single stored value can't be attributed to the right one. Left to the inner node's own value rather than risk assigning another control's.`,
+      );
+      continue;
+    }
+    const value = wvByName
+      ? wvByName[widgetName]
+      : i < widgetValues.length
+        ? widgetValues[i]
+        : undefined;
     if (value === undefined || value === null) continue;
 
-    const innerNodeIdNum = Number(innerNodeIdStr);
-    const remapped = nodeRemap.get(innerNodeIdNum);
-    if (remapped == null) continue;
+    const remapped = nodeRemap.get(Number(innerNodeIdStr));
+    if (remapped != null) {
+      const targetNode = newNodes.find((n) => n.id === remapped);
+      if (targetNode && applyPromoted(targetNode, widgetName, value)) continue;
+      warnings.push(
+        `Component "${sg.name}" (node ${compNode.id}): promoted widget "${widgetName}" = ${JSON.stringify(
+          value,
+        )} could not be applied to inner node ${innerNodeIdStr} — the stripped graph keeps that node's own stored value instead.`,
+      );
+      continue;
+    }
 
-    const targetNode = newNodes.find((n) => n.id === remapped);
-    if (!targetNode) continue;
+    // "-1" (or any id that is not an inner node): the promotion targets a
+    // SUBGRAPH INPUT slot. Push the value to every inner consumer wired from it —
+    // but only when the OUTER slot is unconnected, since a real incoming link
+    // supplies the value at runtime and step 6 already rewired it.
+    const sgInput = sg.inputs?.find((inp) => inp.name === widgetName);
+    const outerSlot = compNode.inputs?.find((inp) => inp.name === widgetName);
+    if (outerSlot?.link != null && outerLinkMap.has(outerSlot.link)) continue;
+    if (!sgInput) {
+      warnings.push(
+        `Component "${sg.name}" (node ${compNode.id}): promoted widget "${widgetName}" = ${JSON.stringify(
+          value,
+        )} does not match any inner node or subgraph input, so it could NOT be applied — the stripped graph uses the inner node's stored value instead.`,
+      );
+      continue;
+    }
+    let applied = 0;
+    for (const innerLinkId of sgInput.linkIds ?? []) {
+      const il = innerLinkById.get(innerLinkId);
+      if (!il || il.origin_id !== inputNodeId) continue;
+      const remappedTarget = nodeRemap.get(il.target_id);
+      const targetNode =
+        remappedTarget != null ? newNodes.find((n) => n.id === remappedTarget) : undefined;
+      if (!targetNode) continue;
+      const slot = targetNode.inputs?.[il.target_slot];
+      const innerName = slot?.widget?.name ?? slot?.name;
+      // The feed came from the virtual input node (-10), which step 5 skips, so
+      // the inner slot's link id points at nothing. Clear it — the promoted value
+      // IS the connection now.
+      if (slot) slot.link = null;
+      if (!innerName || !applyPromoted(targetNode, innerName, value)) continue;
+      applied++;
+    }
+    if (applied === 0) {
+      warnings.push(
+        `Component "${sg.name}" (node ${compNode.id}): promoted widget "${widgetName}" = ${JSON.stringify(
+          value,
+        )} has no inner consumer that could receive it, so it is NOT reflected in the stripped graph.`,
+      );
+    }
+  }
 
-    // Find the widget position in widgets_values by counting widget-type inputs
-    const widgetIdx = findWidgetIndex(targetNode, widgetName);
-    if (widgetIdx != null) {
-      if (!targetNode.widgets_values) targetNode.widgets_values = [];
-      targetNode.widgets_values[widgetIdx] = value;
+  // ── 8b. Unconnected subgraph inputs ─────────────────────────────────────
+  // An inner slot fed from the virtual input node (-10) whose OUTER slot has no
+  // link references a link id that step 5 never materialized. Clear it so the
+  // graph is self-consistent — otherwise it later surfaces as an anonymous
+  // "dangling link", indistinguishable from a real dropped connection.
+  for (const sgInput of sg.inputs ?? []) {
+    const outerSlot = compNode.inputs?.find((inp) => inp.name === sgInput.name);
+    if (outerSlot?.link != null && outerLinkMap.has(outerSlot.link)) continue;
+    for (const innerLinkId of sgInput.linkIds ?? []) {
+      const il = innerLinkById.get(innerLinkId);
+      if (!il || il.origin_id !== inputNodeId) continue;
+      const remappedTarget = nodeRemap.get(il.target_id);
+      const targetNode =
+        remappedTarget != null ? newNodes.find((n) => n.id === remappedTarget) : undefined;
+      const slot = targetNode?.inputs?.[il.target_slot];
+      if (slot && slot.link === linkRemap.get(innerLinkId)) slot.link = null;
     }
   }
 
@@ -923,11 +1687,13 @@ function expandSingleComponent(
           (inp) => inp.link === link[0] && inp.widget,
         );
         if (tgtInput) {
-          const idx = findWidgetIndex(tgtNode, tgtInput.widget!.name);
-          if (idx != null) {
-            if (!tgtNode.widgets_values) tgtNode.widgets_values = [];
-            tgtNode.widgets_values[idx] = primValue;
-          }
+          // Carry the literal BY NAME. (It used to be written positionally via
+          // findWidgetIndex, which counts only the widgets present in inputs[] —
+          // so on a node whose inputs[] omits some widgets the value landed on the
+          // WRONG widget, and when the widget was absent from inputs[] entirely it
+          // was dropped outright. Same #361 wrong-widget-value class as the
+          // promoted-widget path above.)
+          (tgtNode.resolvedWidgetValues ??= {})[tgtInput.widget!.name] = primValue;
           // Clear the link so the main converter treats this as a widget value
           tgtInput.link = null;
         }
@@ -953,31 +1719,6 @@ function expandSingleComponent(
     nextLinkId,
     warnings,
   };
-}
-
-/**
- * Find the widgets_values index for a named widget on a UI node.
- * Counts widget-type inputs (those with a `widget` property) in order.
- */
-function findWidgetIndex(node: UiNode, widgetName: string): number | null {
-  if (!node.inputs) return null;
-
-  // Widget inputs on a UiNode are entries in `inputs[]` that have a `widget` property.
-  // However, not all widgets appear in `inputs[]` — some are only in `widgets_values`.
-  // We count only the widget-inputs that appear in the node's inputs array,
-  // matching by the `widget.name` field.
-  let idx = 0;
-  for (const inp of node.inputs) {
-    if (inp.widget) {
-      if (inp.widget.name === widgetName) return idx;
-      idx++;
-    }
-  }
-
-  // Fallback: if widget is not in inputs[] (pure widget, no link slot),
-  // it may be at a fixed position. Search widgets_values if we can match by name.
-  // For now, return null — the widget is likely at its default value.
-  return null;
 }
 
 // ── API → UI conversion ─────────────────────────────────────────────────────
@@ -1377,15 +2118,22 @@ export function convertUiToApi(
   ui: UiWorkflow,
   objectInfo: ObjectInfo,
 ): ConversionResult {
-  // Clone (don't mutate the caller's workflow), strip the wiring virtuals
-  // (Get/Set bus + Reroute) so the expander + converter only see real links,
-  // then expand component/subgraph nodes.
+  // Clone (don't mutate the caller's workflow), materialize the node-pack
+  // broadcast wiring that isn't in `links` at all (cg-use-everywhere), strip the
+  // wiring virtuals (Get/Set bus + Reroute) so the expander + converter only see
+  // real links, then expand component/subgraph nodes. Every step reports what it
+  // could NOT preserve into the same warnings list (#361).
+  const warnings: string[] = [];
   const cleaned = structuredClone(ui);
-  deVirtualize(cleaned);
+  // Only definitions this workflow actually instantiates can affect the result;
+  // an unused one's wiring problems are not this graph's losses.
+  const liveSubgraphs = reachableSubgraphs(cleaned);
+  materializeUeLinks(cleaned, warnings, liveSubgraphs);
+  deVirtualize(cleaned, warnings, liveSubgraphs);
   const { expanded, warnings: expandWarnings } = expandComponents(cleaned);
+  warnings.push(...expandWarnings);
 
   const workflow: WorkflowJSON = {};
-  const warnings: string[] = [...expandWarnings];
 
   // Build link lookup: linkId → LinkInfo
   const linkMap = new Map<number, LinkInfo>();
@@ -1432,39 +2180,82 @@ export function convertUiToApi(
   // sources pass through — the consumer reconnects to the bypassed node's input
   // whose type matches the requested output slot (same index first, then any
   // type match), recursing through chains of bypassed/virtual nodes.
-  const resolveSource = (
-    linkId: number,
-    depth = 0,
-  ): { id: string; slot: number } | null => {
-    if (depth > 100) return null;
+  //
+  // A failure carries WHY. `toggle` means the drop is ComfyUI's own documented
+  // mute/bypass semantics (the queue does the same thing), so it is summarized
+  // once rather than repeated per edge; anything else is a genuine loss the
+  // caller has no other way to notice, so it is reported per input (#361).
+  type SourceResult =
+    | { ok: true; id: string; slot: number }
+    | { ok: false; toggle: boolean; reason: string };
+  const resolveSource = (linkId: number, depth = 0): SourceResult => {
+    if (depth > 100) {
+      return {
+        ok: false,
+        toggle: false,
+        reason: "the upstream chain exceeded 100 hops (a cycle in the wiring)",
+      };
+    }
     const link = linkMap.get(linkId);
-    if (!link) return null;
+    if (!link) {
+      return {
+        ok: false,
+        toggle: false,
+        reason: `link ${linkId} does not exist in the graph (a dangling reference)`,
+      };
+    }
     const src = nodesById.get(link.sourceNodeId);
     if (!src) {
-      return { id: String(link.sourceNodeId), slot: link.sourceSlot };
+      return { ok: true, id: String(link.sourceNodeId), slot: link.sourceSlot };
     }
     // Virtual GetNode: follow the bus to the SetNode that wrote it.
     if (isGetType(src.type)) {
       const bus = busKey(src.widgets_values);
       const setLink = bus != null ? busSource.get(String(bus)) : undefined;
-      return setLink != null ? resolveSource(setLink, depth + 1) : null;
+      return setLink != null
+        ? resolveSource(setLink, depth + 1)
+        : {
+            ok: false,
+            toggle: false,
+            reason: `${src.type} #${src.id} reads bus "${String(
+              bus,
+            )}", which no Set node writes`,
+          };
     }
     // Virtual SetNode passthrough: follow its value input.
     if (isSetType(src.type)) {
       const inp = (src.inputs ?? []).find((i) => i.link != null);
-      return inp?.link != null ? resolveSource(inp.link, depth + 1) : null;
+      return inp?.link != null
+        ? resolveSource(inp.link, depth + 1)
+        : {
+            ok: false,
+            toggle: false,
+            reason: `${src.type} #${src.id} has no incoming connection`,
+          };
     }
     // Reroute passthrough: a virtual node that just forwards its single input to
     // all outputs — follow its input link to the real source.
     if (src.type === "Reroute") {
       const inp = (src.inputs ?? []).find((i) => i.link != null);
-      return inp?.link != null ? resolveSource(inp.link, depth + 1) : null;
+      return inp?.link != null
+        ? resolveSource(inp.link, depth + 1)
+        : {
+            ok: false,
+            toggle: false,
+            reason: `Reroute #${src.id} has no incoming connection`,
+          };
     }
     const mode = src.mode ?? 0;
     if (mode === 0) {
-      return { id: String(link.sourceNodeId), slot: link.sourceSlot };
+      return { ok: true, id: String(link.sourceNodeId), slot: link.sourceSlot };
     }
-    if (mode === 2) return null; // muted: connection dropped
+    if (mode === 2) {
+      return {
+        ok: false,
+        toggle: true,
+        reason: `its source node ${src.id} (${src.type}) is MUTED`,
+      };
+    }
     if (mode === 4) {
       // bypass: find a matching-type input to pass through
       const outType = link.typeName;
@@ -1475,11 +2266,23 @@ export function convertUiToApi(
           (i) => i.link != null && (!outType || i.type === outType),
         );
       }
-      if (!cand || cand.link == null) return null;
+      if (!cand || cand.link == null) {
+        return {
+          ok: false,
+          toggle: true,
+          reason: `its source node ${src.id} (${src.type}) is BYPASSED and has no matching input to pass through`,
+        };
+      }
       return resolveSource(cand.link, depth + 1);
     }
-    return null;
+    return {
+      ok: false,
+      toggle: false,
+      reason: `its source node ${src.id} (${src.type}) has an unrecognized mode ${mode}`,
+    };
   };
+  // Count of connections dropped by mute/bypass — summarized once at the end.
+  let toggleDropped = 0;
 
   for (const node of expanded.nodes) {
     // Muted (2) and bypassed (4) nodes are excluded from the prompt entirely;
@@ -2002,6 +2805,32 @@ export function convertUiToApi(
       }
     }
 
+    // Widget values resolved BY NAME during subgraph expansion — a promoted
+    // ("proxy") widget value from the subgraph node, or a virtual PrimitiveNode
+    // literal baked onto its consumer. These are the LIVE values the user sees on
+    // the subgraph node, so they override the inner node's own stored
+    // widgets_values (which is whatever it held when the subgraph was built).
+    // Routed through the same combo choke-point as every other widget assignment.
+    const resolved = node.resolvedWidgetValues;
+    if (resolved) {
+      for (const [name, val] of Object.entries(resolved)) {
+        if (!widgetNames.includes(name)) {
+          warnings.push(
+            `Node ${nodeId} (${classType}): a promoted/primitive-supplied value for "${name}" could not be applied — the connected server's definition of ${classType} has no widget by that name, so the node keeps its own stored value.`,
+          );
+          continue;
+        }
+        inputs[name] = validateComboWidgetValue(
+          name,
+          val,
+          def,
+          classType,
+          nodeId,
+          warnings,
+        );
+      }
+    }
+
     // Fill any required input not covered by widgets_values or a link with its
     // object_info default, so /prompt validation doesn't reject on a missing
     // required input (e.g. a node version added a required widget the saved graph
@@ -2073,8 +2902,17 @@ export function convertUiToApi(
           }
           continue;
         }
-        const resolved = resolveSource(input.link);
-        if (resolved) inputs[input.name] = [resolved.id, resolved.slot];
+        const resolvedSrc = resolveSource(input.link);
+        if (resolvedSrc.ok) {
+          inputs[input.name] = [resolvedSrc.id, resolvedSrc.slot];
+        } else if (resolvedSrc.toggle) {
+          // ComfyUI's own queue drops these too — count, don't spam.
+          toggleDropped++;
+        } else {
+          warnings.push(
+            `Node ${nodeId} (${classType}): input "${input.name}" is WIRED in the source workflow but its connection could not be resolved — ${resolvedSrc.reason}. The input is ABSENT from the stripped graph.`,
+          );
+        }
       }
     }
 
@@ -2098,6 +2936,9 @@ export function convertUiToApi(
       // whether it's an un-parented literal OR a link ref. Keeping a link ref here
       // (the previous behavior) still emitted an orphan the server would reject.
       if (!(parent in inputs)) {
+        warnings.push(
+          `Node ${nodeId} (${classType}): the nested input "${key}" was dropped — its dynamic-combo parent "${parent}" has no value in the stripped graph, so there is no selected option the leaf could belong to (ComfyUI rejects an unknown nested input).`,
+        );
         delete inputs[key];
         continue;
       }
@@ -2205,6 +3046,12 @@ export function convertUiToApi(
             warnings.push(
               `Node ${nodeId} (${classType}): the linked nested input "${key}" was dropped — its dynamic parent "${parent}" is fed by a runtime link (resolved option unknown) and not every option defines "${leaf}", so keeping the connection could orphan it under an option that omits the leaf. "${leaf}" will use the resolved option's default instead of the wired link.`,
             );
+          } else {
+            warnings.push(
+              `Node ${nodeId} (${classType}): the nested value "${key}" = ${JSON.stringify(
+                leafVal,
+              )} was dropped — its dynamic parent "${parent}" is fed by a runtime link, so the selected option is unknowable here and this value is not valid under every option it could resolve to. "${leaf}" will use the resolved option's default instead.`,
+            );
           }
           delete inputs[key];
         }
@@ -2217,6 +3064,11 @@ export function convertUiToApi(
         // it whether it's a literal OR a real-link ref (both orphan under the final
         // option; a link ref is not exempt — the previous `continue` above leaked
         // exactly this case).
+        warnings.push(
+          `Node ${nodeId} (${classType}): the nested input "${key}" was dropped — the selected option "${String(
+            inputs[parent],
+          )}" of "${parent}" does not define it, so it would be an unknown input (this happens when the parent selection changed, e.g. it is supplied by a Primitive node).`,
+        );
         delete inputs[key];
         continue;
       }
@@ -2274,8 +3126,7 @@ export function convertUiToApi(
   // component expansion didn't remap). ComfyUI errors hard ("Node X not found")
   // on these, so drop the connection like an unresolved link.
   const validIds = new Set(Object.keys(workflow));
-  let prunedRefs = 0;
-  for (const node of Object.values(workflow)) {
+  for (const [nodeId, node] of Object.entries(workflow)) {
     const ins = node.inputs as Record<string, unknown>;
     for (const [name, val] of Object.entries(ins)) {
       if (
@@ -2286,12 +3137,14 @@ export function convertUiToApi(
       ) {
         if (process.env.DEBUG_PRUNE) logger.info(`PRUNE: ${(node as {class_type?:string}).class_type}.${name} -> missing ${val[0]}`);
         delete ins[name];
-        prunedRefs++;
+        // Name the node and the input. A bare count ("pruned N references") told
+        // the caller a connection was lost but not WHICH — the same silent-loss
+        // shape as #361 itself.
+        warnings.push(
+          `Node ${nodeId} (${node.class_type}): input "${name}" pointed at node ${val[0]}, which is not in the stripped graph, so the connection was DROPPED (its producer was removed by subgraph expansion or by mute/bypass resolution).`,
+        );
       }
     }
-  }
-  if (prunedRefs > 0) {
-    warnings.push(`Pruned ${prunedRefs} dangling input reference(s) to nodes not in the prompt.`);
   }
 
   // Drop links whose source output type clearly mismatches the consuming input's
@@ -2336,6 +3189,12 @@ export function convertUiToApi(
   }
   if (droppedMismatch > 0) {
     warnings.push(`Dropped ${droppedMismatch} type-mismatched link(s).`);
+  }
+
+  if (toggleDropped > 0) {
+    warnings.push(
+      `${toggleDropped} input connection(s) were dropped because their source node is muted, or bypassed with no matching pass-through input. This mirrors what ComfyUI's queue does with the same graph, so the stripped graph is faithful — but those inputs are unconnected in it.`,
+    );
   }
 
   const nodeCount = Object.keys(workflow).length;
