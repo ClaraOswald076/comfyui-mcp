@@ -117,6 +117,7 @@ import {
   describe as describeCorrelation,
   type CompletionPayload,
 } from "./run-completion-journal.js";
+import { AskAnswers, preview as previewQuestion } from "./ask-answer-journal.js";
 import { initRunpodWatcher, getRunpodWatcher, type RunpodStatusFrame, type RunpodAlertFrame } from "../services/runpod-watch.js";
 import { getPod } from "../services/runpod-client.js";
 import { listTargetChangeRequests, consumeTargetChange, ackTargetChange, setProgressDir, CONTROL_PREFIX, newestAttemptEpochs, isSupersededAttempt, downloadAttemptKey } from "../services/download-progress.js";
@@ -2062,13 +2063,13 @@ export async function runPanelOrchestrator(): Promise<void> {
     // journal is keyed by the PANEL TAB, so a provider switch (which retires
     // `tab::old` and spawns `tab::new`) can never strand a completion.
     onEventDelivered: (_key, tokens) => {
-      for (const token of tokens) RunCompletions.ack(token);
+      for (const token of tokens) ackEventToken(token);
     },
     onEventUndelivered: (key, tokens, opts) => {
-      for (const token of tokens) RunCompletions.release(token, { carried: opts?.carried === true });
+      for (const token of tokens) releaseEventToken(token, opts?.carried === true);
       const panelTab = panelTabOf(key);
       logger.warn(
-        `[panel-orchestrator] tab ${panelTab.slice(0, 8)} handed back ${tokens.length} undelivered run completion(s) — journaled for replay (#468)`,
+        `[panel-orchestrator] tab ${panelTab.slice(0, 8)} handed back ${tokens.length} undelivered event(s) — journaled for replay (#468/#486)`,
       );
       // Try again immediately. When the agent is still alive (a stall-abandoned
       // turn, a plain Stop) this re-queues the completion into its next turn;
@@ -2076,11 +2077,13 @@ export async function runPanelOrchestrator(): Promise<void> {
       // pending for the next spawn. The refusal path returns false WITHOUT
       // calling back here, so this cannot recurse.
       flushRunCompletions(panelTab);
+      flushAskAnswers(panelTab);
     },
     // A fresh agent for this key can take mail now — replay whatever the
     // previous one never delivered.
     onAgentReady: (key) => {
       flushRunCompletions(panelTabOf(key));
+      flushAskAnswers(panelTabOf(key));
     },
     sessionStore,
     // #570 P0 — bind each persisted exact session to its tab's FULL trusted workflow
@@ -2106,6 +2109,26 @@ export async function runPanelOrchestrator(): Promise<void> {
     (panelTabId, token) => manager.revokeEvent(agentKeyFor(panelTabId), token),
     (panelTabId) => flushRunCompletions(panelTabId),
   );
+
+  // #486 — capture a VALIDATED ask answer the moment it lands, even when no tool
+  // call is left to receive it. This is the whole durability hinge: the bridge's
+  // late-reply buffer is only reachable by a caller still polling it, and the
+  // failure being fixed is precisely the one where there is none. Only answers to
+  // cards THIS journal ticketed are taken — confirm / 18+ consent / secret cards
+  // keep their own, deliberately NON-recoverable paths, because a recovered "Yes,
+  // go ahead" must never be able to authorise a different destructive operation.
+  // The journal itself decides WHEN an answer has become an orphan (the moment it
+  // lands with no handler waiting, or the moment the asking handler unwinds
+  // without having returned it) and drives the push from there, so no caller has
+  // to remember to flush.
+  AskAnswers.setFlusher((panelTabId) => flushAskAnswers(panelTabId));
+  bridge.setLateAskReplySink((askId, result, tabId) => {
+    if (!AskAnswers.tracks(askId)) return;
+    const entry = AskAnswers.record(askId, result, { tabId });
+    logger.info(
+      `[panel-orchestrator] tab ${entry.key.slice(0, 8)} — a validated ask answer landed for "${previewQuestion(entry.question)}"; journaled so it survives the tool call that asked (#486)`,
+    );
+  });
 
   /**
    * Deliver every journaled run completion for a panel tab (#468).
@@ -2140,6 +2163,15 @@ export async function runPanelOrchestrator(): Promise<void> {
         list.push(describeCorrelation(entry.correlation));
         byTab.set(entry.key, list);
       }
+      // #486 — an ask answer the user actually gave that never reached the agent
+      // dies with this process exactly as a completion does, and is at least as
+      // costly to lose. Report it in the same breath, naming the question so the
+      // record is actionable rather than a bare count.
+      for (const entry of AskAnswers.allOutstanding()) {
+        const list = byTab.get(entry.key) ?? [];
+        list.push(`the user's answer to "${previewQuestion(entry.question)}"`);
+        byTab.set(entry.key, list);
+      }
     } catch {
       return; // nothing readable — nothing to report
     }
@@ -2163,7 +2195,7 @@ export async function runPanelOrchestrator(): Promise<void> {
     const record = [...byTab]
       .map(
         ([panelTab, runs]) =>
-          `[panel-orchestrator] tab ${panelTab.slice(0, 8)} — exiting with ${runs.length} undelivered run completion(s), outcome UNDETERMINED: ${runs.join("; ")}`,
+          `[panel-orchestrator] tab ${panelTab.slice(0, 8)} — exiting with ${runs.length} undelivered render result(s)/user answer(s), outcome UNDETERMINED: ${runs.join("; ")}`,
       )
       .join("\n");
     // A FILE is the ONLY synchronous sink. A sync write to a PIPE can block
@@ -2195,8 +2227,8 @@ export async function runPanelOrchestrator(): Promise<void> {
           {
             type: "say",
             text:
-              `⚠️ The agent backend is being restarted, and ${runs.length} finished render result(s) could not be delivered ` +
-              `(${runs.join("; ")}). Their outcome is UNDETERMINED from the agent's point of view — ask it to check ` +
+              `⚠️ The agent backend is being restarted, and ${runs.length} finished render result(s) / answered question card(s) could not be delivered ` +
+              `(${runs.join("; ")}). Their outcome/content is UNDETERMINED from the agent's point of view — ask it to check ` +
               `\`get_history\` for those runs once it reconnects rather than assuming it saw them.`,
           },
           panelTab,
@@ -2219,6 +2251,50 @@ export async function runPanelOrchestrator(): Promise<void> {
         `[panel-orchestrator] tab ${panelTabId.slice(0, 8)} has no live agent for ${describeCorrelation(blockedOn.correlation)} — journaled, replayed when one comes back (#468)`,
       );
     }
+  }
+
+  /**
+   * Deliver every ORPHANED `panel_ask` answer for a panel tab (#486).
+   *
+   * An orphan is an answer the user genuinely gave that NO tool call was alive to
+   * receive — the `tools/call` that asked had already timed out or been
+   * abandoned. Its only remaining channel is the agent's event queue, so it goes
+   * through the same durable path a run completion does: correlated once at
+   * arrival, replayed at every later delivery opportunity, and cleared only when
+   * the turn that carried it ended.
+   *
+   * Answers that DID reach a tool result are never pushed here — that would
+   * double-report every ordinary ask. They stay journaled only so a re-ask of the
+   * identical question can recover one whose caller turned out to be dead.
+   */
+  function flushAskAnswers(panelTabId: string): void {
+    const key = agentKeyFor(panelTabId);
+    const { blockedOn } = AskAnswers.deliverPending(panelTabId, (payload, token) =>
+      manager.injectEvent(key, payload, { eventToken: token }),
+    );
+    if (blockedOn) {
+      logger.warn(
+        `[panel-orchestrator] tab ${panelTabId.slice(0, 8)} has no live agent for the user's answer to "${previewQuestion(blockedOn.question)}" — journaled, replayed when one comes back (#486)`,
+      );
+    }
+  }
+
+  /**
+   * Route an event token back to the journal that minted it.
+   *
+   * Two journals now share the agent's one event-token channel (#468 run
+   * completions, #486 ask answers), so the prefix is the discriminator: `rc…`
+   * and `aa…` respectively. A token from either is safe to hand to the other —
+   * both ignore an unknown token — but routing it correctly is what keeps an ack
+   * from leaving the real entry outstanding forever.
+   */
+  function ackEventToken(token: string): void {
+    if (token.startsWith("aa")) AskAnswers.ack(token);
+    else RunCompletions.ack(token);
+  }
+  function releaseEventToken(token: string, carried: boolean): void {
+    if (token.startsWith("aa")) AskAnswers.release(token, { carried });
+    else RunCompletions.release(token, { carried });
   }
 
   // Flag the mobile mirror picker's "session attached" (green) dot from live agents.
@@ -2881,6 +2957,11 @@ export async function runPanelOrchestrator(): Promise<void> {
           // exactly the misattribution the journal exists to prevent. Drop them
           // (logged per entry) rather than migrate them.
           RunCompletions.forget(migratedFrom);
+          // #486 — same reasoning for the user's ANSWERS: an answer given to a
+          // question the OLD workflow's agent asked must never be recoverable by,
+          // or pushed at, the new workflow's conversation. forget() logs every
+          // undelivered one, so the loss is disclosed rather than silent.
+          AskAnswers.forget(migratedFrom);
           manager.retire(migratedFrom + AGENT_KEY_SEP + prevBackend);
           logger.info(
             `[panel-orchestrator] same-socket re-hello ${migratedFrom.slice(0, 12)} → ${panelTab.slice(0, 12)} without proven workflow continuity — old agent retired (NOT rebound); each workflow keeps its own conversation`,
@@ -2954,7 +3035,10 @@ export async function runPanelOrchestrator(): Promise<void> {
           // PURGE, never inherit: the destination's completions belong to the tab
           // being superseded, and there is no agent left to deliver them to.
           // forget() logs each one, so the loss is disclosed, not silent.
-          if (destinationHadState) RunCompletions.forget(panelTab);
+          if (destinationHadState) {
+            RunCompletions.forget(panelTab);
+            AskAnswers.forget(panelTab); // #486 — same purge for the superseded tab's answers
+          }
           for (const b of KNOWN_BACKENDS) {
             const srcKey = migratedFrom + AGENT_KEY_SEP + b;
             const newKey = panelTab + AGENT_KEY_SEP + b;
@@ -3008,10 +3092,12 @@ export async function runPanelOrchestrator(): Promise<void> {
           // above (before anything could hand tokens back); now re-address the
           // INCOMING tab's own completions + run tickets onto the new id.
           RunCompletions.moveKey(migratedFrom, panelTab);
+          AskAnswers.moveKey(migratedFrom, panelTab);
           // rebindAgent MOVES the agent rather than spawning one, so onAgentReady
           // never fires for the new id — flush explicitly or the re-addressed
           // entries would sit pending until some unrelated later trigger.
           flushRunCompletions(panelTab);
+          flushAskAnswers(panelTab);
           // #570 — carry the PROVEN source identity forward as the tab's prior identity. The
           // rebound agent belongs to it (prevIdentity === newIdentity by sameWorkflow), but the
           // new tab id has no prior identity and the agent may have no durable record yet
@@ -4251,6 +4337,11 @@ export async function runPanelOrchestrator(): Promise<void> {
       // than as "the run YOU queued". Already-arrived completions keep the
       // verdict frozen at their arrival and are still delivered.
       RunCompletions.closeRuns(tabId);
+      // #486 — and the questions it asked. The user's answers stay journaled and
+      // are still reported, but they lose the fingerprint that let them satisfy a
+      // re-ask: an answer given to the previous conversation must never come back
+      // to the replacement one as "the answer to the question YOU just asked".
+      AskAnswers.closeAsks(tabId);
       // reset() clears the exact-tab store; the stable resume index (#570) is the
       // manager's blind spot, so drop it here too — a deliberate NEW chat must not
       // be resurrected by the unsaved-workflow fallback on the next reload.
@@ -4299,6 +4390,11 @@ export async function runPanelOrchestrator(): Promise<void> {
       // runs, so a completion landing after the switch is UNDETERMINED, not the
       // historical session's own render.
       RunCompletions.closeRuns(tabId);
+      // #486 — and the questions it asked. The user's answers stay journaled and
+      // are still reported, but they lose the fingerprint that let them satisfy a
+      // re-ask: an answer given to the previous conversation must never come back
+      // to the replacement one as "the answer to the question YOU just asked".
+      AskAnswers.closeAsks(tabId);
       if (sid) manager.setResume(key, sid);
       bridge.push({ type: "ack", ok: true, kind: "resume_session" }, tabId);
       bridge.broadcastTabList(); // live agent dropped → refresh mirror pickers
@@ -5360,6 +5456,9 @@ export async function runPanelOrchestrator(): Promise<void> {
       // would silently drop the render result the agent was promised — exactly
       // the failure this whole path exists to prevent. Wait for it to land.
       !RunCompletions.hasOutstanding() &&
+      // …and the same for an ask answer the user actually gave that has not
+      // reached the agent yet (#486). Restarting would destroy it silently.
+      !AskAnswers.hasOutstanding() &&
       !QueueMonitor.isBusy(),
     announce: (text) => void bridge.push({ type: "say", text }),
     teardown: teardownCore,

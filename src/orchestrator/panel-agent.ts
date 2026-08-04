@@ -586,6 +586,13 @@ export class PanelAgent {
       replayed?: boolean;
       dropped_completions?: number;
       possible_repeat?: boolean;
+      /** #486 - a validated `panel_ask` answer that no tool call was alive to
+       *  receive, carried together with the question it (and only it) answers. */
+      ask_question?: string | null;
+      ask_answer?: string;
+      ask_correlation?: "matched" | "foreign";
+      ask_answered_at?: number;
+      dropped_answers?: number;
     },
     opts?: { eventToken?: string },
   ): boolean {
@@ -640,6 +647,48 @@ export class PanelAgent {
       if (this.backend.capabilities.vision) {
         images = imgs.filter((i) => i.filename).map((i) => ({ ...i, type: i.type ?? "output" }));
       }
+    } else if (ev.kind === "ask_answer") {
+      // #486 — the user ANSWERED a question card, but no tool call was alive to
+      // receive it (the `tools/call` that asked had already timed out or been
+      // abandoned). The answer was journaled instead of lost; this is it.
+      //
+      // The QUESTION is always carried with the ANSWER, and the wording pins the
+      // answer to that question explicitly. Losing an answer costs a re-ask;
+      // letting one be read as the answer to a DIFFERENT question makes the
+      // agent act on a decision the user never made — so an answer that could
+      // not be tied to a question this session asked says exactly that and asks
+      // for nothing to be inferred from it.
+      const answer = typeof ev.ask_answer === "string" ? ev.ask_answer : "";
+      if (!answer) return false;
+      const ageS = Math.max(
+        0,
+        Math.round((Date.now() - (ev.ask_answered_at ?? Date.now())) / 1000),
+      );
+      text =
+        `[panel event] ` +
+        (ev.replayed
+          ? `(RE-DELIVERED — this answer could not be handed to you when it arrived.) `
+          : ``) +
+        (ev.possible_repeat
+          ? `⚠️ You may already have been given this answer — do not act on it twice. `
+          : ``) +
+        (typeof ev.dropped_answers === "number" && ev.dropped_answers > 0
+          ? `⚠️ ${ev.dropped_answers} further validated answer(s) on this tab were dropped before delivery — their content is UNDETERMINED. `
+          : ``) +
+        (ev.ask_correlation === "matched" && ev.ask_question
+          ? `The user DID answer a question card you put up ${ageS}s ago, but their answer could not be returned ` +
+            `to the panel_ask call that asked (it had already timed out), so the tool reported no answer. Here it is:\n\n` +
+            `QUESTION YOU ASKED: ${ev.ask_question}\n` +
+            `THE USER'S ANSWER: ${answer}\n\n` +
+            `This is their answer to THAT question and to nothing else — do not apply it to any other decision, ` +
+            `and do not ask it again. If you already proceeded without it, say so and reconcile. `
+          : `A user answered a question card ${ageS}s ago and the answer could NOT be tied to any question this ` +
+            `session asked — its meaning is UNDETERMINED. Reported so it is not silently discarded:\n\n` +
+            `QUESTION: ${ev.ask_question ?? "(unrecorded)"}\n` +
+            `ANSWER: ${answer}\n\n` +
+            `Do NOT treat this as the answer to anything you are currently deciding. If you need that decision, ` +
+            `ask again with panel_ask. `) +
+        `Reply with ONE short sentence and continue — no tool call is required just to acknowledge this.`;
     } else if (ev.kind === "run_error") {
       text =
         `[panel event] The user's workflow run just ERRORED: ${ev.error ?? "unknown error"}. ` +
@@ -2078,6 +2127,13 @@ export class PanelAgentManager {
       replayed?: boolean;
       dropped_completions?: number;
       possible_repeat?: boolean;
+      /** #486 - a validated `panel_ask` answer that no tool call was alive to
+       *  receive, carried together with the question it (and only it) answers. */
+      ask_question?: string | null;
+      ask_answer?: string;
+      ask_correlation?: "matched" | "foreign";
+      ask_answered_at?: number;
+      dropped_answers?: number;
     },
     opts?: { eventToken?: string },
   ): boolean {

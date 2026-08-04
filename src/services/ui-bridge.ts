@@ -890,7 +890,17 @@ export class UiBridge {
    *  caller, instead of being discarded as a "late reply for a timed-out command"
    *  (#486). Timestamped so an abandoned mapping (timeout/disconnect/send-failure
    *  whose late reply never arrives) is TTL-pruned rather than kept forever. */
-  private askRidToId = new Map<string, { askId: string; ts: number }>();
+  private askRidToId = new Map<string, { askId: string; ts: number; tabId: string }>();
+  /**
+   * Notified the instant a LATE (post-reply-timeout) ask answer validates (#486).
+   *
+   * The buffer below only helps a caller that is still alive to poll it. The
+   * whole of #486 is the case where nobody is: the `tools/call` that asked has
+   * been abandoned, so the answer would sit here unread until the TTL pruned it.
+   * This hands it to the orchestrator's ask journal at ARRIVAL, with no live
+   * caller required — after which it is durable and can be replayed or pushed.
+   */
+  private lateAskSink: ((askId: string, result: unknown, tabId: string) => void) | null = null;
   /** Buffered late-but-valid ask_user answers (ask_id → result), drained by the
    *  caller via takeLateAskReply(). Bounded by a short TTL — a stale unclaimed
    *  answer is pruned rather than kept forever. */
@@ -1488,6 +1498,18 @@ export class UiBridge {
             if (msg.ok) {
               this.pruneLateAsk();
               this.lateAskReplies.set(entry.askId, { result: msg.result, ts: Date.now() });
+              // …and hand it to the durable journal RIGHT NOW, whether or not any
+              // caller is still polling (#486). The buffer above is only reachable
+              // by a live poller; this is what makes an answer given after the
+              // tool call died survive at all. Never let a sink fault break the
+              // message loop.
+              try {
+                this.lateAskSink?.(entry.askId, msg.result, entry.tabId);
+              } catch (err) {
+                logger.warn(
+                  `[ui-bridge] late ask-answer sink threw (the answer is still buffered): ${err instanceof Error ? err.message : String(err)}`,
+                );
+              }
             }
           }
           return;
@@ -1880,6 +1902,12 @@ export class UiBridge {
    *  after the card-reply timeout, or undefined if none arrived. The panel_ask
    *  handler polls this for a bounded grace so a slow-but-valid pick is honored
    *  rather than discarded (#486). */
+  /** Wire the durable ask-answer journal to late (post-timeout) card answers
+   *  (#486). Called once at orchestrator start-up. */
+  setLateAskReplySink(sink: (askId: string, result: unknown, tabId: string) => void): void {
+    this.lateAskSink = sink;
+  }
+
   takeLateAskReply(askId: string): unknown | undefined {
     this.pruneLateAsk();
     const e = this.lateAskReplies.get(askId);
@@ -2315,7 +2343,10 @@ export class UiBridge {
     const askId = (cmd as { ask_id?: unknown }).ask_id;
     if (typeof askId === "string" && askId) {
       this.pruneLateAsk();
-      this.askRidToId.set(rid, { askId, ts: Date.now() });
+      // Carry the ROUTED tab id with the mapping: the late-reply branch runs in a
+      // scope that only knows the socket, and the journal needs the tab the card
+      // was rendered on to address the answer.
+      this.askRidToId.set(rid, { askId, ts: Date.now(), tabId: ctx.tabId });
     }
     // Rewrite an old-panel "Unknown command" rejection into an actionable
     // update-your-panel message (see makeUnknownCommandError). Applied to the

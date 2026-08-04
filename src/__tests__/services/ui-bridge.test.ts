@@ -3068,6 +3068,59 @@ describe("UiBridge (late ask_user answer buffer — #486)", () => {
     expect(bridge.takeLateAskReply("ask-xyz")).toBeUndefined(); // drained once
   });
 
+  // The buffer only helps a caller that is still alive to poll it, and #486 is
+  // exactly the case where there is none — the tools/call that asked has been
+  // abandoned. The SINK is what makes the answer durable: it fires at arrival,
+  // with the tab it was rendered on, whether or not anyone is listening.
+  it("hands a late ask_user answer to the durable sink at arrival, with its tab", async () => {
+    const seen: Array<{ askId: string; result: unknown; tabId: string }> = [];
+    bridge.setLateAskReplySink((askId, result, tabId) => seen.push({ askId, result, tabId }));
+    const sock = await connectPanel("tab-sink", "wf");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-sink")).toBe(true));
+    sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd === "ask_user") {
+        setTimeout(() => {
+          sock.send(JSON.stringify({ rid: msg.rid, ok: true, result: "Sunk Pick" }));
+        }, 80);
+      }
+    });
+    await expect(
+      bridge.send(
+        { cmd: "ask_user", ask_id: "ask-sink", question: "?", options: [] },
+        { tabId: "tab-sink", timeoutMs: 30 },
+      ),
+    ).rejects.toThrow(/did not reply/i);
+    // NOBODY polls takeLateAskReply here — that is the point.
+    await vi.waitFor(() => expect(seen).toHaveLength(1));
+    expect(seen[0]).toEqual({ askId: "ask-sink", result: "Sunk Pick", tabId: "tab-sink" });
+    bridge.setLateAskReplySink(() => {});
+  });
+
+  it("a throwing sink never breaks the message loop or loses the buffered answer", async () => {
+    bridge.setLateAskReplySink(() => {
+      throw new Error("journal exploded");
+    });
+    const sock = await connectPanel("tab-sink-bad", "wf");
+    await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-sink-bad")).toBe(true));
+    sock.on("message", (buf) => {
+      const msg = JSON.parse(buf.toString());
+      if (msg.rid && msg.cmd === "ask_user") {
+        setTimeout(() => {
+          sock.send(JSON.stringify({ rid: msg.rid, ok: true, result: "Still Here" }));
+        }, 80);
+      }
+    });
+    await expect(
+      bridge.send(
+        { cmd: "ask_user", ask_id: "ask-bad", question: "?", options: [] },
+        { tabId: "tab-sink-bad", timeoutMs: 30 },
+      ),
+    ).rejects.toThrow(/did not reply/i);
+    await vi.waitFor(() => expect(bridge.takeLateAskReply("ask-bad")).toBe("Still Here"));
+    bridge.setLateAskReplySink(() => {});
+  });
+
   it("does not buffer a non-ask command's late reply (no ask_id → dropped)", async () => {
     const sock = await connectPanel("tab-plain", "wf");
     await vi.waitFor(() => expect(bridge.tabs().some((t) => t.tab_id === "tab-plain")).toBe(true));
