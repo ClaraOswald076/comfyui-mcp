@@ -1656,6 +1656,84 @@ describe("probePortOwner — POSIX (#795: owner attributed from /proc/<pid>/fd)"
     });
   });
 
+  it("holding SOME listener on the port is not holding THE one we bracketed", async () => {
+    // The subtlest form of the substitution, and the reason the re-check asks about
+    // the specific inode rather than just the pid. Two listeners on the port, I and
+    // J. First pass: our pid holds I and is the only VISIBLE holder (another process
+    // is unreadable, which does not withdraw a single-holder finding). Second pass:
+    // our pid has released I and holds only J, while the unreadable process now holds
+    // I. Re-attribution still names our pid — it does hold *a* listener — so a check
+    // that stops at the pid would confirm a claim about a socket it no longer has.
+    const { probePortOwner, __portOwnerTestHooks } = await loadProbe();
+    mockExecSync.mockReturnValue("");
+    __portOwnerTestHooks.setProcNetReader((t) =>
+      t === "/proc/net/tcp"
+        ? v4Table([
+            { port: 8188, inode: "54321" },
+            { port: 8188, inode: "99999" },
+          ])
+        : emptyV6,
+    );
+    const tree: Record<number, Record<string, string> | NodeJS.ErrnoException> = {
+      1: eacces(), // the other holder, never readable
+      4321: { "0": "socket:[54321]" },
+    };
+    const walker = fdReader(tree);
+    let walks = 0;
+    __portOwnerTestHooks.setProcFdReader({
+      ...walker,
+      listPids: () => {
+        walks++;
+        if (walks > 1) tree[4321] = { "0": "socket:[99999]" };
+        return walker.listPids();
+      },
+    });
+
+    const probe = probePortOwner(8188);
+    expect(probe.state).toBe("unknown");
+    expect(probe).not.toMatchObject({ pid: 4321 });
+    // The reason names THIS fact — it holds another listener, which is a different
+    // finding — rather than collapsing into "changed hands (PID 4321, then PID 4321)".
+    expect(probe).toMatchObject({
+      reason: expect.stringMatching(
+        /no longer holds the socket it was identified by .* holds another listener/i,
+      ),
+    });
+  });
+
+  it("a DUAL-STACK holder is not withdrawn just because the walk reached its other socket first", async () => {
+    // The counterpart, and why the re-check asks whether the pid's COMPLETE set
+    // contains the bracketed inode rather than whether the walk selected it again. A
+    // process listening on two sockets of the same port holds both; which one an fd
+    // scan stops at is an artifact of directory order, not a change in the world.
+    // Recording only the first match would make this ordinary case fail at random.
+    const { probePortOwner, __portOwnerTestHooks } = await loadProbe();
+    __portOwnerTestHooks.setProcNetReader((t) =>
+      t === "/proc/net/tcp"
+        ? v4Table([
+            { port: 8188, inode: "54321" },
+            { port: 8188, inode: "99999" },
+          ])
+        : emptyV6,
+    );
+    const tree: Record<number, Record<string, string>> = {
+      4321: { "0": "socket:[54321]" },
+    };
+    const walker = fdReader(tree);
+    let walks = 0;
+    __portOwnerTestHooks.setProcFdReader({
+      ...walker,
+      listPids: () => {
+        walks++;
+        // Still both sockets — the OTHER one simply comes first this time.
+        if (walks > 1) tree[4321] = { "0": "socket:[99999]", "1": "socket:[54321]" };
+        return walker.listPids();
+      },
+    });
+
+    expect(probePortOwner(8188)).toEqual({ state: "owned", pid: 4321 });
+  });
+
   it("a socket that CHANGED HANDS between the scans is not attributed to the old owner", async () => {
     // The fd is passed on: the same inode is still listening, so the socket half of
     // the bracket holds — but the owner is now somebody else, and returning the

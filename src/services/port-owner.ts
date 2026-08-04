@@ -770,8 +770,19 @@ function readKernelSocketTables(port: number, host?: string): KernelTableReading
  *     regardless of owner.
  */
 type ProcAttribution =
-  /** `inode` is carried so the caller can re-verify THAT socket, not just the port. */
-  | { state: "owned"; pid: number; inode: string }
+  | {
+      state: "owned";
+      pid: number;
+      /** The socket the caller brackets on — one specific listener, not just "the port". */
+      inode: string;
+      /**
+       * EVERY listening socket on the port this pid holds, not merely the one the walk
+       * stopped at. A process listening on both address families holds two, and the
+       * re-check has to be able to ask "does it still hold I?" rather than "did the
+       * walk happen to select I again?" — the second question is about fd ordering.
+       */
+      inodes: string[];
+    }
   | { state: "unattributed"; reason: string };
 
 /** Did this read fail because the process is GONE, or because we could not look? */
@@ -797,7 +808,7 @@ function attributeInodes(inodes: string[], port: number): ProcAttribution {
       })`,
     };
   }
-  const owners = new Map<number, string>();
+  const owners = new Map<number, string[]>();
   let blind = false;
   for (const pid of pids) {
     let fds: string[];
@@ -818,14 +829,23 @@ function attributeInodes(inodes: string[], port: number): ProcAttribution {
       }
       const inode = wanted.get(link);
       if (inode !== undefined) {
-        owners.set(pid, inode);
-        break;
+        // NO EARLY BREAK. Stopping at the first match records an ARBITRARY one of the
+        // pid's listening sockets, and a later re-check asking "does it still hold I?"
+        // would then be answered by whichever socket the walk happened to reach first
+        // — so a process that released I while acquiring another listener on the same
+        // port would still look unchanged (codex gate round 11).
+        const seen = owners.get(pid);
+        if (seen) {
+          if (!seen.includes(inode)) seen.push(inode);
+        } else {
+          owners.set(pid, [inode]);
+        }
       }
     }
   }
   if (owners.size === 1) {
-    const [pid, inode] = [...owners][0];
-    return { state: "owned", pid, inode };
+    const [pid, inodes] = [...owners][0];
+    return { state: "owned", pid, inode: inodes[0], inodes };
   }
   if (owners.size > 1) {
     return {
@@ -936,25 +956,41 @@ export function probePortOwner(port: number, host?: string): PortOwnerProbe {
       // A full re-attribution costs one more `/proc` walk on the positive path — the
       // same order as the lsof spawn it replaces — and is the only form that cannot
       // certify something the first pass would have rejected.
-      // The two conditions are exactly the two halves of the claim, and no more:
-      // the socket we attributed is still listening, and re-deriving the owner still
-      // yields THIS pid — alone. Requiring the re-attribution to arrive via the same
-      // INODE was a third condition the claim does not make: a process listening on
-      // both address families holds two of them, and which one the walk stops at is
-      // an artifact of fd ordering. `stillListening` already pins the socket.
+      // THREE conditions, which together are exactly the claim and no more: the socket
+      // we attributed is still listening, re-deriving the owner still yields THIS pid
+      // alone, and that pid still holds THAT socket.
+      //
+      // The third is not the same as "the walk selected the same inode again" — which
+      // is about fd ordering and would fail a dual-stack listener spuriously. It asks
+      // whether I is in the pid's complete set. Dropping it entirely (as an earlier
+      // revision did) reopens the substitution from the other side: A could release I
+      // while holding another listener J on the same port, an unreadable B could take
+      // I, and re-attribution would return A/J alone — proving A owns *a* listener
+      // while never proving it still owns the one being bracketed (codex gate r11).
       const stillListening = after.inodes.includes(attributed.inode);
       const recheck = stillListening ? attributeInodes(after.inodes, port) : undefined;
-      if (recheck?.state === "owned" && recheck.pid === attributed.pid) {
+      if (
+        recheck?.state === "owned" &&
+        recheck.pid === attributed.pid &&
+        recheck.inodes.includes(attributed.inode)
+      ) {
         return { state: "owned", pid: attributed.pid };
       }
+      // Each way the re-check can fail is a DIFFERENT fact about the world, and the
+      // reason has to say which — "changed hands (PID 4321, then PID 4321)" is what
+      // comes out of collapsing the same-pid-different-socket case into the
+      // changed-owner one.
       procNote = !stillListening
         ? `the socket listening on port ${port} changed while its owner was being identified, ` +
           `so PID ${attributed.pid} cannot be tied to it`
-        : recheck?.state === "owned"
+        : recheck?.state === "owned" && recheck.pid !== attributed.pid
           ? `the socket listening on port ${port} changed hands while its owner was being ` +
             `identified (PID ${attributed.pid}, then PID ${recheck.pid})`
-          : `PID ${attributed.pid} could not be re-confirmed as the owner of the socket ` +
-            `listening on port ${port}: ${recheck?.reason ?? "the re-check could not be performed"}`;
+          : recheck?.state === "owned"
+            ? `PID ${attributed.pid} no longer holds the socket it was identified by on port ` +
+              `${port} — it holds another listener there, which is not the same finding`
+            : `PID ${attributed.pid} could not be re-confirmed as the owner of the socket ` +
+              `listening on port ${port}: ${recheck?.reason ?? "the re-check could not be performed"}`;
     } else {
       procNote = attributed.reason;
     }

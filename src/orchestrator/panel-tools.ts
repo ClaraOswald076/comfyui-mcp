@@ -6494,25 +6494,52 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // before. The binding for this DECISION is captured pre-await; nothing
         // downstream may reuse it (r7).
         //
-        // #814: THE GATE IS NOT THE SAME AS THE PROOF. `captureRebootHealthBase`
-        // answers "can I CERTIFY that this instance cycled?" — it requires a
-        // loopback boot base, a server-observed handshake Origin, a pathless mount.
-        // Gating the SAFETY CHECK on that same capture meant an instance we could
-        // not certify was also an instance we never assessed: the reboot went out
-        // with no evidence at all, the server stopped, nothing brought it back, and
-        // the result honestly reported that it could not confirm the return — a
-        // verdict computed after a stop it should not have made. Being unable to
-        // watch something come back is a reason for MORE care about stopping it, not
-        // less. So the assessment below now runs for ANY local target; only the
-        // certification stays bound to the tab.
+        // #814: AN UNIDENTIFIED LOCAL TARGET IS NOT SENT AN IRREVERSIBLE STOP.
+        //
+        // `captureRebootHealthBase` answers "is the instance this tab fronts provably
+        // our own local boot ComfyUI?" — loopback base, server-observed handshake
+        // Origin, pathless mount. When it cannot say yes, we do not know WHICH
+        // ComfyUI the reboot will reach: the command goes to the bound TAB, not to
+        // the orchestrator's configured target.
+        //
+        // The original code dispatched anyway and reported honestly that it could not
+        // confirm the return — a verdict computed after a stop it should not have
+        // made, and the #814 lost server. A first attempt at this ran the local
+        // preflight in that case and let a PASS proceed, which was worse in a subtle
+        // way: the assessment describes the CONFIGURED instance while the reboot hits
+        // the TAB's, so a safe local install could authorize stopping an orphaned
+        // Desktop backend in some other tab (codex gate round 11). A pass for one
+        // instance is not permission to stop another.
+        //
+        // So the assessment is consulted for ANY local target, and what it may be
+        // SPENT ON depends on the binding — asymmetrically, because the two outcomes
+        // are not equally transferable between instances:
+        //
+        //   BOUND   — it describes the very instance the reboot will reach. Both
+        //             outcomes count, exactly as before.
+        //   UNBOUND — it describes the orchestrator's CONFIGURED local target, which
+        //             may not be what the reboot reaches. A PASS therefore authorizes
+        //             nothing: proving one instance safe is not permission to stop
+        //             another, and the dispatch proceeds on the footing it always had
+        //             (honestly reported as unconfirmable), not on this evidence. A
+        //             FAIL is still acted on: the local target is the likeliest thing
+        //             a local panel tab fronts, and a refusal costs a restart while
+        //             dispatching into a proven-unrelaunchable install costs the
+        //             server. The note says which part could not be confirmed.
+        //
+        // A blanket refusal for every unbound local target was tried and is NOT what
+        // this does: `captureRebootHealthBase` also returns null for ordinary setups
+        // (an ambiguous `localhost` origin, a basePath mount, an older panel), and
+        // those are deliberately served by the honest dispatched-but-unconfirmable
+        // result. Removing that wholesale is a product decision, not a bug fix.
         const preflightHealthBase = captureRebootHealthBase(ctx);
         const preflightBound =
           preflightHealthBase != null &&
           sameHttpBase(getComfyUIBaseUrl(), preflightHealthBase);
-        // Cloud/remote targets are excluded for the reason they always were: there is
-        // no local process to assess, and the Manager reboot is their ONLY restart
-        // path — a supervised remote (the tunnelled Desktop app) restarts through it
-        // by design, so refusing there would remove a path that works.
+        // Remote and cloud are excluded for the reason they always were: there is no
+        // local process to assess, and the Manager reboot is their ONLY restart path —
+        // a supervised remote (the tunnelled Desktop app) restarts through it by
+        // design, so refusing there would remove a path that works.
         if (preflightBound || (!isRemoteMode() && !isCloudMode())) {
           // Snapshot the target GENERATION at the decision (r11): a final-state
           // base comparison (A vs A) cannot detect an intervening A→B→A
@@ -6536,16 +6563,13 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             sameHttpBase(preflightHealthBase, postPreflightHealthBase);
           const configStable =
             getComfyuiTargetGeneration() === preflightTargetGeneration;
-          // WHOM DOES THE ASSESSMENT SPEAK FOR?
-          //   • bound (r9): the instance the TAB fronts, so it holds exactly as long
-          //     as the tab still fronts that same instance — unchanged behaviour.
-          //   • unbound (#814): there was no tab binding to follow, so the assessment
-          //     speaks for the orchestrator's own local target, which is what the
-          //     reboot will reach. It applies unconditionally; whether the config
-          //     moved mid-await is handled immediately below, where an assessment
-          //     that can no longer vouch for anything refuses rather than proceeds.
-          const assessmentApplies = preflightBound ? tabFrontsSameInstance : true;
-          if (!configStable && assessmentApplies) {
+          // r10 is a BOUND-PATH guard, and only that: it exists so a PASS cannot
+          // vouch for the tab-fronted instance after the target moved mid-check. On
+          // the unbound path a pass is never spent as permission in the first place
+          // (see the block comment above), so there is nothing here for it to
+          // protect — saying so keeps the condition from carrying generality it does
+          // not have.
+          if (!configStable && preflightBound && tabFrontsSameInstance) {
             // r10: the target config moved MID-CHECK, so the preflight result
             // — pass OR fail — cannot vouch for the tab-fronted instance (a
             // PASS may have validated a different, safe install; it must never
@@ -6559,15 +6583,17 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               note:
                 "Refusing to restart ComfyUI: the ComfyUI target configuration changed " +
                 "while the restart safety check was running, so the check cannot vouch " +
-                `for a safe relaunch of the instance this restart would cycle${
-                  preflightBound ? " (the one this panel fronts)" : ""
-                }. A stop is never ` +
+                "for a safe relaunch of the instance this panel fronts. A stop is never " +
                 "sent to an instance whose relaunch is unproven — ComfyUI was NOT " +
                 "stopped (it is still running). Let the target settle, then retry " +
                 "panel_restart_comfyui.",
             });
           }
-          if (!preflight.ok && assessmentApplies) {
+          // A FAILURE applies on both paths, scoped by what it can speak for: bound,
+          // as long as the tab still fronts the instance it assessed (r9);
+          // unbound, as the likeliest description of what a local tab fronts —
+          // where declining costs a restart and proceeding could cost the server.
+          if (!preflight.ok && (preflightBound ? tabFrontsSameInstance : true)) {
             // r9: the danger proof follows the INSTANCE the tab fronts, NOT the
             // mutable runtime config — a config-only retarget mid-await must
             // not wash out the proof that the tab-fronted boot instance is
@@ -6589,7 +6615,16 @@ export function buildPanelToolDefs(): PanelToolDef[] {
                 // cannot be rebuilt (Pinokio, #742) and a Desktop instance whose
                 // supervisor has gone (#814) — and telling a Desktop user to check
                 // Pinokio would send them somewhere they have never been.
-                `Refusing to restart ComfyUI: ${preflight.reason} A restart from here would ` +
+                `Refusing to restart ComfyUI: ${preflight.reason}` +
+                // Said plainly when the tab could not be tied to the instance this
+                // describes: the refusal is still the right call (a restart costs
+                // nothing to decline, a lost server cannot be undone), but the user
+                // should know which part is inference.
+                (preflightBound
+                  ? ""
+                  : " (I could not confirm that this panel fronts that same instance, but a" +
+                    " restart is not sent to an install whose relaunch is unproven.)") +
+                " A restart from here would " +
                 "STOP ComfyUI and nothing would bring it back automatically, so it was " +
                 "refused BEFORE anything was stopped — ComfyUI is still running. Restart it " +
                 "from whatever launches it (its own launcher — e.g. Pinokio's own controls — " +
