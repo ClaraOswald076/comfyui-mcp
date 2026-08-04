@@ -289,6 +289,54 @@ describe("flattenUiWorkflow — Use-Everywhere", () => {
     expect(report.warnings).toEqual([]);
   });
 
+  it("an input claiming a link that does not exist is reported, not silently cleared", () => {
+    // The flattener's counterpart of the converter's dangling-reference report.
+    // The source graph claims a connection this graph does not contain; clearing
+    // it in silence is observation-failed treated as a definite no.
+    const g: UiWorkflow = {
+      nodes: [
+        node(1, "CheckpointLoaderSimple", { outputs: [{ name: "MODEL", type: "MODEL", links: [] }] }),
+        node(3, "SomeConsumer", { inputs: [{ name: "model", type: "MODEL", link: 77 }] }),
+      ],
+      links: [],
+      last_link_id: 0,
+    };
+    const { graph, report } = flattenUiWorkflow(g);
+    expect(graph.nodes.find((n) => n.id === 3)!.inputs![0].link).toBeNull();
+    expect(report.warnings.join("\n")).toContain('input "model" claims link 77');
+  });
+
+  it("a healthy bus, whose original links are purged on purpose, reports nothing", () => {
+    // Guards the common path against a spurious dangling-reference report. NOTE:
+    // this does NOT exercise the was-a-real-link-but-purged branch of that check
+    // — I could not construct a graph where a SURVIVING input still points at a
+    // purged id (the nodes holding those references are removed with them). That
+    // branch is therefore defensive, and is documented as such in the source
+    // rather than pinned by a test that would not fail without it.
+    const g: UiWorkflow = {
+      nodes: [
+        node(1, "CheckpointLoaderSimple", { outputs: [{ name: "MODEL", type: "MODEL", links: [10] }] }),
+        node(2, "SetNode", {
+          widgets_values: ["m"],
+          inputs: [{ name: "MODEL", type: "MODEL", link: 10 }],
+          outputs: [{ name: "*", type: "*", links: [] }],
+        }),
+        node(3, "GetNode", {
+          widgets_values: ["m"],
+          outputs: [{ name: "MODEL", type: "MODEL", links: [11] }],
+        }),
+        node(4, "KSampler", { inputs: [{ name: "model", type: "MODEL", link: 11 }] }),
+      ],
+      links: [
+        [10, 1, 0, 2, 0, "MODEL"],
+        [11, 3, 0, 4, 0, "MODEL"],
+      ],
+      last_link_id: 11,
+    };
+    const { report } = flattenUiWorkflow(g);
+    expect(report.warnings).toEqual([]);
+  });
+
   it("duplicate link ids ALREADY in the graph are repaired, and reported", () => {
     // Not something the allocator can produce, but a graph edited by tooling that
     // did not maintain link ids can arrive this way. Returning it unchanged

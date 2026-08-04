@@ -119,6 +119,12 @@ export function flattenUiWorkflow(
   const nodesById = new Map<number, UiNode>(nodes.map((n) => [n.id, n]));
   const linkMap = new Map<number, UiLink>();
   for (const l of ui.links ?? []) if (Array.isArray(l)) linkMap.set(l[0], l);
+  /** The link ids the graph ARRIVED with. Used to tell a genuinely dangling input
+   *  reference (an id that was never a link here) from one purged on purpose
+   *  because its endpoint was removed — the second is intended and already
+   *  reported by whatever removed it, the first is a real connection the source
+   *  graph claims and this one does not have. */
+  const preexistingLinkIds = new Set(linkMap.keys());
 
   // bus name (Set node's first widget) -> the link id feeding that Set's input.
   // Multiple Sets writing the same key: LAST one wins (matches litegraph's
@@ -551,8 +557,25 @@ export function flattenUiWorkflow(
   // virtual node that pass-1 already rewired keep their fresh id; anything
   // still pointing at a purged link gets cleared).
   for (const n of ui.nodes) {
-    for (const inp of n.inputs ?? []) {
-      if (inp.link != null && !survivingIds.has(inp.link)) inp.link = null;
+    for (let slot = 0; slot < (n.inputs?.length ?? 0); slot++) {
+      const inp = n.inputs![slot];
+      if (inp.link == null || survivingIds.has(inp.link)) continue;
+      // An id that was NEVER a link in this graph is a dangling reference: the
+      // source claims a connection the graph does not contain. Clearing it in
+      // silence is the same observation-failed-treated-as-no that this change
+      // removes everywhere else — and the converter already reports its
+      // equivalent. (An id that WAS a link and got purged with its endpoint is an
+      // intended removal, already reported by whatever removed it, so it stays
+      // quiet here. That second branch is DEFENSIVE: no constructible graph
+      // reaches it, because the nodes holding such a reference are removed along
+      // with the link. It is kept so the check states the right rule rather than
+      // the one that happens to be reachable today.)
+      if (!preexistingLinkIds.has(inp.link)) {
+        warnings.push(
+          `${n.type} #${n.id} input "${inp.name ?? slot}" claims link ${inp.link}, which does not exist in this graph — left unconnected`,
+        );
+      }
+      inp.link = null;
     }
     for (const out of n.outputs ?? []) {
       if (out.links) out.links = out.links.filter((id) => survivingIds.has(id));
