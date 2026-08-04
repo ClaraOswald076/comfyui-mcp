@@ -56,10 +56,19 @@ vi.mock("node:fs", async (importOriginal) => {
 
 import {
   buildComfyuiMcpEnv,
+  clearPanelSecret,
   hasLivePickup,
+  migrateSecretsToEnv,
   onComfyuiSecretsChanged,
+  panelSecretsPath,
+  removeComfyuiSecret,
   setAgentSecret,
   setComfyuiSecret,
+  setPanelSecret,
+  slotSaveConfirmed,
+  slotShellProvidedKeys,
+  slotStillResolves,
+  unconfirmedSlotKeys,
   COMFYUI_SECRET_ENV_ALLOWLIST,
   AGENT_SECRET_ENV_ALLOWLIST,
   type SecretRespawnReport,
@@ -82,6 +91,8 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "cmcp-receipt-"));
   envPath = join(dir, ".env");
   process.env.COMFYUI_MCP_ENV_FILE = envPath;
+  // Isolate the legacy JSON store too — migrateSecretsToEnv reads it.
+  process.env.COMFYUI_MCP_PANEL_SECRETS = join(dir, "panel-secrets.json");
   saved = {};
   for (const k of ALL_KEYS) {
     saved[k] = process.env[k];
@@ -97,6 +108,7 @@ afterEach(() => {
   fsState.breakReadsAfterWrite = false;
   fsState.readsBroken = false;
   delete process.env.COMFYUI_MCP_ENV_FILE;
+  delete process.env.COMFYUI_MCP_PANEL_SECRETS;
   for (const k of ALL_KEYS) {
     if (saved[k] === undefined) delete process.env[k];
     else process.env[k] = saved[k];
@@ -220,6 +232,106 @@ describe("secret save receipt: persistence is VERIFIED, not assumed (#826)", () 
   });
 });
 
+describe("`export KEY=` lines are the SAME key (#826 gate round 3)", () => {
+  it("a revoke removes the export form too, so the credential really is gone", () => {
+    // dotenv honours `export KEY=…`. Matching only `KEY=` removed the plain line
+    // and left the exported one supplying the old credential, while the revoke
+    // reported the slot cleared.
+    writeFileSync(envPath, "export CIVITAI_API_TOKEN=old-exported\n", { mode: 0o600 });
+    expect(buildComfyuiMcpEnv({}).CIVITAI_API_TOKEN).toBe("old-exported");
+    expect(removeComfyuiSecret("CIVITAI_API_TOKEN")).toBe(true);
+    expect(buildComfyuiMcpEnv({}).CIVITAI_API_TOKEN).toBeUndefined();
+    expect(readFileSync(envPath, "utf-8")).not.toContain("old-exported");
+  });
+
+  it("a save REPLACES the export form instead of appending a second assignment", () => {
+    writeFileSync(envPath, "export CIVITAI_API_TOKEN=old-exported\n", { mode: 0o600 });
+    const r = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new");
+    expect(r.persisted).toBe("yes");
+    const raw = readFileSync(envPath, "utf-8");
+    expect(raw).not.toContain("old-exported");
+    expect(raw.match(/CIVITAI_API_TOKEN\s*=/g)).toHaveLength(1);
+    delete process.env.CIVITAI_API_TOKEN;
+    expect(buildComfyuiMcpEnv({}).CIVITAI_API_TOKEN).toBe("civ-new");
+  });
+});
+
+describe("a MIGRATED legacy token keeps the file as its authority (#826 gate round 3)", () => {
+  it("marks a migrated key managed, so the child re-reads instead of pinning it", () => {
+    // migrateSecretsToEnv writes the file and assigns process.env. Without the
+    // provenance mark the value reads as SHELL-provided, gets injected unmarked,
+    // and the child pins it — a later rotate/revoke invisible to that child even
+    // though the save reports live pickup.
+    writeFileSync(
+      panelSecretsPath(),
+      JSON.stringify({ comfyuiEnv: { CIVITAI_API_TOKEN: "legacy-token" } }),
+      { mode: 0o600 },
+    );
+    expect(migrateSecretsToEnv()).toContain("CIVITAI_API_TOKEN");
+    const env = buildComfyuiMcpEnv({});
+    expect(env.CIVITAI_API_TOKEN).toBe("legacy-token");
+    expect(env[MANAGED_SECRET_KEYS_ENV]?.split(",")).toContain("CIVITAI_API_TOKEN");
+  });
+});
+
+describe("slot saves report what the read-back PROVED (#826 gate round 3)", () => {
+  it("returns one receipt per alias key of the slot", () => {
+    const receipts = setPanelSecret("huggingface", "hf-abc");
+    expect(receipts.map((r) => r.key)).toEqual(["HF_TOKEN", "HUGGINGFACE_TOKEN"]);
+    expect(slotSaveConfirmed(receipts)).toBe(true);
+    expect(unconfirmedSlotKeys(receipts)).toEqual([]);
+  });
+
+  it("is NOT confirmed when the store does not come back carrying the keys", () => {
+    const receipts = withSwallowedWrites(() => setPanelSecret("civitai", "civ-abc"));
+    expect(slotSaveConfirmed(receipts)).toBe(false);
+    expect(unconfirmedSlotKeys(receipts)).toEqual([
+      { key: "CIVITAI_API_TOKEN", persisted: "no" },
+    ]);
+  });
+
+  it("is NOT confirmed when even ONE alias of the slot failed", () => {
+    // A reader that consults the unsaved alias would find nothing, so the slot
+    // is not reliably configured — reporting it saved would be a half-truth.
+    const receipts = [
+      { key: "HF_TOKEN", path: envPath, persisted: "yes", livePickup: true, respawn: null },
+      { key: "HUGGINGFACE_TOKEN", path: envPath, persisted: "no", livePickup: true, respawn: null },
+    ] as const;
+    expect(slotSaveConfirmed([...receipts])).toBe(false);
+  });
+
+  it("treats an unverifiable save as unconfirmed rather than failed", () => {
+    const receipts = withUnreadableReadBack(() => setPanelSecret("civitai", "civ-abc"));
+    expect(slotSaveConfirmed(receipts)).toBe(false);
+    expect(unconfirmedSlotKeys(receipts)).toEqual([
+      { key: "CIVITAI_API_TOKEN", persisted: "unknown" },
+    ]);
+  });
+
+  it("slotStillResolves proves a revoke actually took effect", () => {
+    setPanelSecret("civitai", "civ-abc");
+    expect(slotStillResolves("civitai")).toBe(true);
+    clearPanelSecret("civitai");
+    expect(slotStillResolves("civitai")).toBe(false);
+  });
+
+  it("names the slot keys a REAL env var supplies, so a revoke is not called permanent", () => {
+    // This store can delete a shell-set credential from THIS process but not from
+    // the environment the process was started with — it returns on the next
+    // start. Reporting an unqualified "revoked" would claim a state never reached.
+    process.env.CIVITAI_API_TOKEN = "civ-from-shell";
+    expect(slotShellProvidedKeys("civitai")).toEqual(["CIVITAI_API_TOKEN"]);
+    clearPanelSecret("civitai");
+    // The clear DID take effect for this process...
+    expect(slotStillResolves("civitai")).toBe(false);
+  });
+
+  it("names NO shell keys for a credential this store owns", () => {
+    setPanelSecret("civitai", "civ-abc");
+    expect(slotShellProvidedKeys("civitai")).toEqual([]);
+  });
+});
+
 describe("a blank value is REFUSED, not confirmed (#826 gate round 2)", () => {
   it("refuses a whitespace-only value that would write and read back cleanly", () => {
     // It would persist perfectly and be reported as verified, while every reader
@@ -302,6 +414,26 @@ describe("secret values must survive the dotenv round trip, or be refused (#826 
     }
   });
 
+  it("REFUSES a value containing a NUL, which the file would keep but process.env would truncate", () => {
+    // dotenv round-trips a NUL happily, so the read-back would CONFIRM the save
+    // — while process.env (and therefore the spawned child) silently gets a
+    // shorter, different string. A confirmed save that delivers something else
+    // is the worst outcome of all.
+    const withNul = `civ-${String.fromCharCode(0)}-abc`;
+    expect(() => setComfyuiSecret("CIVITAI_API_TOKEN", withNul)).toThrow(
+      /control character/,
+    );
+    expect(process.env.CIVITAI_API_TOKEN).toBeUndefined();
+  });
+
+  it("REFUSES any other control character for the same reason", () => {
+    for (const code of [1, 9, 27, 31, 127]) {
+      expect(() =>
+        setComfyuiSecret("CIVITAI_API_TOKEN", `civ${String.fromCharCode(code)}abc`),
+      ).toThrow(/control character/);
+    }
+  });
+
   it("REFUSES a value no encoding can store, rather than writing something different", () => {
     // Storing a mangled copy would be the worst outcome: the save reports
     // success and every request then authenticates with the wrong token.
@@ -341,6 +473,7 @@ describe("secret values must survive the dotenv round trip, or be refused (#826 
       "with=equals",
       "with\nnewline",
       "with\rcr",
+      `civ-${String.fromCharCode(0)}-abc`,
       "back\\slash\"and'quote",
       `a'"#`,
       `a'"#`,
@@ -355,7 +488,9 @@ describe("secret values must survive the dotenv round trip, or be refused (#826 
         delete process.env.CIVITAI_API_TOKEN;
         stored = buildComfyuiMcpEnv({}).CIVITAI_API_TOKEN;
       } catch (err) {
-        expect((err as Error).message).toMatch(/cannot be stored faithfully/);
+        expect((err as Error).message).toMatch(
+          /cannot be stored faithfully|control character/,
+        );
         continue;
       }
       expect(stored).toBe(v);

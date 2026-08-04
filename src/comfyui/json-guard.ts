@@ -19,7 +19,7 @@
 // diagnosis costs more than an honest "the body is HTML; here is its first line".
 
 import { ComfyUIError } from "../utils/errors.js";
-import { getComfyUIBaseUrl } from "../config.js";
+import { getComfyUIAuthHeaders, getComfyUIBaseUrl } from "../config.js";
 import { comfyuiFetch } from "./fetch.js";
 
 /** What answered instead of the ComfyUI JSON API. */
@@ -61,9 +61,25 @@ export function isNonJsonResponseError(err: unknown): err is NonJsonResponseErro
   return err instanceof NonJsonResponseError;
 }
 
-/** Collapse a body to a short single-line prefix for the message. */
+/** Collapse a body to a short single-line prefix for the message.
+ *
+ *  The prefix is diagnostic — it is what lets a user recognise the page that
+ *  answered. But a gateway that REFLECTS the request (an "invalid token: …"
+ *  page, a debug echo) could put our own ComfyUI credential in that body, and
+ *  this prefix goes into an error the agent sees. Any configured auth header
+ *  value found in the body is therefore replaced before the prefix is built:
+ *  we know exactly which strings are secret, so this is redaction, not guessing. */
 function bodyPrefixOf(body: string): string {
-  const flat = body.replace(/\s+/g, " ").trim();
+  let text = body;
+  for (const value of Object.values(getComfyUIAuthHeaders())) {
+    if (!value) continue;
+    // The header value may be "Bearer <token>"; redact the whole thing and the
+    // bare token part, so neither form survives.
+    for (const candidate of [value, value.replace(/^\S+\s+/, "")]) {
+      if (candidate.length >= 4) text = text.split(candidate).join("«redacted»");
+    }
+  }
+  const flat = text.replace(/\s+/g, " ").trim();
   return flat.length > 160 ? `${flat.slice(0, 160)}…` : flat;
 }
 
