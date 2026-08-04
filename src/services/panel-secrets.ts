@@ -1094,10 +1094,16 @@ function restoreEnvKey(
   if (current !== null) {
     const wanted = wasShellProvided || previous === undefined ? undefined : previous;
     if (current[key] === wanted) {
-      // Keep the in-process copy and the provenance in step with the store.
+      // Keep the in-process copy AND the provenance in step with the store.
+      // Both directions matter: a shell value must stop being file-owned, and a
+      // value the FILE supplies must be marked file-owned — otherwise a key the
+      // file gained after boot would be treated as a real env override from here
+      // on, and a later legitimate rotation of that file entry would be masked
+      // (codex gate, round 10).
       if (previous === undefined) delete process.env[key];
       else process.env[key] = previous;
       if (wasShellProvided) unmarkFileDerived(key);
+      else if (previous !== undefined) markFileDerived(key);
       return "restored";
     }
   }
