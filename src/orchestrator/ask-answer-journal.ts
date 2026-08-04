@@ -228,6 +228,22 @@ export interface AskEntry {
    */
   recoverable?: boolean;
   /**
+   * Which browser-tab INCARNATION this answer belongs to, captured at arrival.
+   *
+   * Entries are keyed by panel tab id, and that id recurs — `wf:<hash>` names a
+   * saved workflow, so a second browser tab can hold it. Re-keying every entry by
+   * incarnation would break the thing tab-keying is FOR (a reload keeps its
+   * answers), so the incarnation is carried alongside and checked at the point of
+   * use instead: only the occupant this answer was given by may recover it or be
+   * pushed it. Everyone else may still be TOLD about it — a disclosure quotes its
+   * own question and cannot be misattributed.
+   *
+   * `undefined` when nothing could say who was holding the tab (no resolver
+   * wired, or the tab was not connected). Unknown provenance never satisfies a
+   * known occupant.
+   */
+  incarnation?: string;
+  /**
    * This entry's ask id stands for MORE THAN ONE card.
    *
    * Stamped on the ENTRY, not read from the ticket, because tickets are
@@ -474,6 +490,24 @@ export class AskAnswerJournalImpl {
     this.incarnationOf = resolve;
   }
 
+  /**
+   * May the tab's CURRENT occupant act on this answer — recover it, or be pushed
+   * it?
+   *
+   * Only the occupant it was given by. A different browser tab holding the same
+   * recurring key never asked the question and must not be handed its answer;
+   * unknown provenance on either side is not a match either, because "we could
+   * not tell who this belongs to" must never resolve to "it belongs to you".
+   * When NOTHING can resolve incarnations at all (no resolver wired) the check is
+   * inert and tab-keying alone governs, exactly as before.
+   */
+  private sameOccupant(entry: AskEntry): boolean {
+    if (this.incarnationOf === null) return true; // nothing to distinguish
+    const now = this.incarnationOf(entry.key);
+    if (entry.incarnation === undefined || now === undefined) return false;
+    return entry.incarnation === now;
+  }
+
   /** The debt bucket for a tab's CURRENT occupant. */
   private debtSlot(key: string): string {
     return tabIncarnationSlot(key, this.incarnationOf?.(key));
@@ -684,6 +718,10 @@ export class AskAnswerJournalImpl {
       answeredAt: Date.now(),
       correlation,
       ticketSeq: ticket?.seq ?? 0,
+      // WHO was holding the tab when this answer arrived — see AskEntry.incarnation.
+      ...(this.incarnationOf?.(ticket?.tabId ?? meta.tabId) !== undefined
+        ? { incarnation: this.incarnationOf(ticket?.tabId ?? meta.tabId) }
+        : {}),
       returned: false,
       // An answer that lands while its own handler is still running is that
       // handler's to return; one that lands afterwards has nobody left and is
@@ -803,6 +841,7 @@ export class AskAnswerJournalImpl {
         (e) =>
           e.correlation.status === "matched" &&
           e.recoverable !== false &&
+          this.sameOccupant(e) &&
           e.fingerprint !== null &&
           e.fingerprint === fingerprint &&
           now - e.answeredAt <= RECOVER_MAX_AGE_MS,
@@ -956,7 +995,13 @@ export class AskAnswerJournalImpl {
   pending(key: string): AskEntry[] {
     const out: AskEntry[] = [];
     for (const entry of this.entries.values()) {
-      if (entry.key === key && entry.delivery === "pending") out.push(entry);
+      // A different browser tab now holds this key: its conversation never put
+      // the card up, so the answer waits (for its own tab to come back) rather
+      // than being announced to a stranger. It is still disclosed by a failing
+      // ask, and still named on the way out — held, never swallowed.
+      if (entry.key === key && entry.delivery === "pending" && this.sameOccupant(entry)) {
+        out.push(entry);
+      }
     }
     return out;
   }

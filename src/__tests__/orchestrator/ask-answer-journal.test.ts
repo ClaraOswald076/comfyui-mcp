@@ -66,6 +66,9 @@ function strandEvictionDebt(): void {
  *  from anything else, so tests have to name who is acking. */
 const TURN = "pa-test-turn";
 
+/** The browser tab holding the key in these tests (see AskEntry.incarnation). */
+const OCCUPANT = "browser-tab-default";
+
 /** An ordinary successful ask: answered, handed back in a tool result, and the
  *  turn that carried it produced its own result — the ACK. This is the common
  *  path, and the only one allowed to be forgotten quietly. */
@@ -90,7 +93,7 @@ beforeEach(() => {
   AskAnswers.setFlusher(() => {});
   AskAnswers.setRevoker(() => false); // nothing queued unless a test says so
   AskAnswers.setTurnAttacher(() => TURN); // a live turn, unless a test says otherwise
-  AskAnswers.setIncarnationResolver(() => undefined); // one occupant, unless a test says otherwise
+  AskAnswers.setIncarnationResolver(() => OCCUPANT); // one browser tab, unless a test says otherwise
 });
 
 describe("ask-answer journal — an answer survives its tool call (#486)", () => {
@@ -1269,7 +1272,7 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     const answersBefore = AskAnswers.entriesFor(TAB).length;
     expect(answersBefore).toBeGreaterThan(0);
 
-    AskAnswers.retireDebt(TAB); // what the bridge's tab-gone listener calls
+    AskAnswers.retireDebt(TAB, OCCUPANT); // what the bridge's tab-gone listener calls
 
     expect(AskAnswers.droppedFor(TAB)).toBe(0);
     expect(AskAnswers.outstandingDebt().some((x) => x.key === TAB)).toBe(false);
@@ -1284,7 +1287,7 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     for (let t = 0; t < 300; t += 1) {
       const tab = `tab-ephemeral-${t}`;
       AskAnswers.noteDroppedForTest(tab, 1);
-      AskAnswers.retireDebt(tab);
+      AskAnswers.retireDebt(tab, OCCUPANT);
     }
     expect(AskAnswers.outstandingDebt()).toHaveLength(0);
     expect(AskAnswers.droppedFor("tab-ephemeral-0")).toBe(0);
@@ -1429,7 +1432,70 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     holder = "browser-tab-A";
     expect(AskAnswers.reportDropped(TAB)).toBe(2);
     expect(AskAnswers.hasOutstanding()).toBe(true);
-    AskAnswers.setIncarnationResolver(() => undefined);
+    AskAnswers.setIncarnationResolver(() => OCCUPANT);
+  });
+
+  // Gate: the immediate-takeover boundary only fires while the old connection is
+  // still in the map. If A DISCONNECTS FIRST and B arrives afterwards under the
+  // same recurring key, there is no `existing` to compare — so the boundary never
+  // fires and A's entries stayed matched and recoverable under the shared key.
+  // The occupant is therefore carried on the ENTRY and checked at the point of
+  // use, which needs no memory of who left.
+  it("a new occupant cannot recover the previous one's answer, even with no takeover event", () => {
+    let holder: string | undefined = "browser-tab-A";
+    AskAnswers.setIncarnationResolver(() => holder);
+
+    // A asks, times out, and its answer lands with nobody to receive it.
+    AskAnswers.openAsk("pa-a", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SAMPLER),
+      question: SAMPLER.question,
+    });
+    AskAnswers.closeAsk("pa-a");
+    const entry = AskAnswers.record("pa-a", "dpmpp_2m", { tabId: TAB });
+    expect(entry.incarnation).toBe("browser-tab-A");
+    expect(AskAnswers.recover(TAB, askFingerprint(SAMPLER)).status).toBe("recovered");
+
+    // A disconnects; LATER a different browser tab opens the same workflow. No
+    // takeover event fires — there was no live connection to supersede.
+    holder = "browser-tab-B";
+    const rec = AskAnswers.recover(TAB, askFingerprint(SAMPLER));
+    expect(rec.status).toBe("unattributed"); // …and B gets nothing of A's
+    if (rec.status !== "unattributed") return;
+    // Still reported, quoted with its own question — held, never swallowed.
+    expect(rec.others.some((e) => e.answer === "dpmpp_2m")).toBe(true);
+    // …and never announced into B's conversation either.
+    expect(AskAnswers.pending(TAB)).toHaveLength(0);
+
+    // A comes back: its own answer is its own again.
+    holder = "browser-tab-A";
+    expect(AskAnswers.recover(TAB, askFingerprint(SAMPLER)).status).toBe("recovered");
+    expect(AskAnswers.pending(TAB)).toHaveLength(1);
+    AskAnswers.setIncarnationResolver(() => OCCUPANT);
+  });
+
+  it("an answer of UNKNOWN provenance never satisfies a known occupant", () => {
+    // Nothing could say who was holding the tab when this landed. "We could not
+    // tell whose this is" must not resolve to "it is yours" — the honest reading
+    // is unattributed, reported, and never handed over.
+    let holder: string | undefined = undefined;
+    AskAnswers.setIncarnationResolver(() => holder);
+    AskAnswers.openAsk("pa-unknown", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SAMPLER),
+      question: SAMPLER.question,
+    });
+    AskAnswers.closeAsk("pa-unknown");
+    const entry = AskAnswers.record("pa-unknown", "dpmpp_2m", { tabId: TAB });
+    expect(entry.incarnation).toBeUndefined();
+
+    holder = "browser-tab-C";
+    const rec = AskAnswers.recover(TAB, askFingerprint(SAMPLER));
+    expect(rec.status).toBe("unattributed");
+    if (rec.status !== "unattributed") return;
+    expect(rec.others.some((e) => e.answer === "dpmpp_2m")).toBe(true);
+    expect(AskAnswers.pending(TAB)).toHaveLength(0);
+    AskAnswers.setIncarnationResolver(() => OCCUPANT);
   });
 
   it("retiring one incarnation's debt leaves the other's alone", () => {
@@ -1443,7 +1509,7 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     AskAnswers.retireDebt(TAB, "browser-tab-A"); // A's departure is disclosed
     expect(AskAnswers.droppedFor(TAB)).toBe(5); // B's survives, untouched
     expect(AskAnswers.reportDropped(TAB)).toBe(5);
-    AskAnswers.setIncarnationResolver(() => undefined);
+    AskAnswers.setIncarnationResolver(() => OCCUPANT);
   });
 
   it("never throws when the flusher does", () => {
