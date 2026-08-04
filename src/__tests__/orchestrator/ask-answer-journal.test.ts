@@ -857,6 +857,48 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     expect(entry.recoverable).toBe(false);
   });
 
+  // codex round 8, P1: "same id, same text" is only evidence of ONE observation
+  // while the id means one card. Once two cards share it, two picks that happen
+  // to read the same are two validated answers to two questions — merging them
+  // left the second question unanswered with no record at all.
+  it("two reused cards answered IDENTICALLY are both kept", () => {
+    AskAnswers.openAsk("pa-same", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SAMPLER),
+      question: SAMPLER.question,
+    });
+    AskAnswers.closeAsk("pa-same");
+    const a = AskAnswers.record("pa-same", "euler", { tabId: TAB });
+    // A second card accidentally reuses the id, for a different question.
+    AskAnswers.openAsk("pa-same", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SCHEDULER),
+      question: SCHEDULER.question,
+    });
+    AskAnswers.closeAsk("pa-same");
+    expect(AskAnswers.ticketFor("pa-same")?.reused).toBe(true);
+    // The user picks the SAME text on the second card.
+    const b = AskAnswers.record("pa-same", "euler", { tabId: TAB });
+    expect(b.token).not.toBe(a.token);
+    expect(AskAnswers.entriesFor(TAB)).toHaveLength(2);
+    expect(b.delivery).toBe("pending"); // still reported, labelled undetermined
+    expect(b.recoverable).toBe(false);
+  });
+
+  it("…but one observation seen twice is still ONE answer", () => {
+    // The grace poll and the bridge sink can both see a single card's reply. The
+    // id is not reused there, so the collapse is identity, not suppression.
+    AskAnswers.openAsk("pa-once", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SAMPLER),
+      question: SAMPLER.question,
+    });
+    AskAnswers.closeAsk("pa-once");
+    const a = AskAnswers.record("pa-once", "euler", { tabId: TAB });
+    expect(AskAnswers.record("pa-once", "euler", { tabId: TAB }).token).toBe(a.token);
+    expect(AskAnswers.entriesFor(TAB)).toHaveLength(1);
+  });
+
   it("never throws when the flusher does", () => {
     AskAnswers.setFlusher(() => {
       throw new Error("no agent");

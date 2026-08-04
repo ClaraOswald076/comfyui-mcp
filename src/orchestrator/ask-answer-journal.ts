@@ -488,7 +488,11 @@ export class AskAnswerJournalImpl {
     // SCREEN, which is what makes its ceiling unreachable in practice: otherwise
     // a long session's ordinary successful asks fill it and evict a genuinely
     // outstanding card's ticket, taking its retired-conversation marker with it.
-    if (answered) this.tickets.delete(askId);
+    // …EXCEPT under a reused id, where "an entry exists for this ask id" no
+    // longer means "this card was answered" — it may be the OTHER card's answer,
+    // and this one is still on screen. Keeping the ticket keeps its reused flag,
+    // which is what stops either answer satisfying either question.
+    if (answered && ticket?.reused !== true) this.tickets.delete(askId);
     // It is an orphan NOW — deliver it now. Leaving it merely `pending` would
     // make it wait for an unrelated later flush, and this transition happens on
     // the ask handler's unwind, where there may never be one.
@@ -509,6 +513,7 @@ export class AskAnswerJournalImpl {
   record(askId: string, reply: unknown, meta: { tabId: string }): AskEntry {
     const text = answerText(reply);
     const existing = [...this.entries.values()].find((e) => e.askId === askId);
+    const ticket = this.tickets.get(askId);
     // Collapse ONLY an identical observation. The same card's reply can be seen
     // twice (the handler's grace poll takes it out of the bridge buffer while the
     // sink has already forwarded it) and that is one answer, not two — identity,
@@ -519,15 +524,20 @@ export class AskAnswerJournalImpl {
     // discard what the user just chose, so it gets its own entry, and BOTH are
     // demoted to unattributable: nothing on the wire says which card either came
     // from, so neither may satisfy a question.
+    //
+    // …and the collapse is OFF ENTIRELY for a REUSED id. "Same id, same text" is
+    // only evidence of one observation while the id means one card; once two
+    // cards share it, two users' picks that happen to read the same ("euler" on
+    // both) are two validated answers to two questions, and merging them leaves
+    // the second question unanswered with no record at all.
     if (existing) {
-      if (existing.answer === text) return existing;
+      if (existing.answer === text && ticket?.reused !== true) return existing;
       logger.warn(
-        `[ask-answers] a SECOND, different answer arrived under ask id ${askId.slice(0, 12)} ("${text}" vs "${existing.answer}") — both are kept and both are reported as UNDETERMINED; neither can satisfy a question`,
+        `[ask-answers] a SECOND answer arrived under ask id ${askId.slice(0, 12)} ("${text}"${existing.answer === text ? " — same text, but the id is REUSED so this is a different card" : ` vs "${existing.answer}"`}) — both are kept and both are reported as UNDETERMINED; neither can satisfy a question`,
       );
       existing.correlation = { status: "foreign", askId };
       existing.recoverable = false;
     }
-    const ticket = this.tickets.get(askId);
     // A REUSED id proves nothing: the panel sends only the id, so an answer for
     // it could belong to either card. Report it as foreign — real, but
     // UNDETERMINED — rather than claiming it answers the question now open.
@@ -578,9 +588,8 @@ export class AskAnswerJournalImpl {
         `[ask-answers] a validated answer arrived for ask ${askId.slice(0, 8)} with ${ticket ? "a REUSED (ambiguous) ticket" : "no open ticket"} — journaled as UNATTRIBUTED; it can never satisfy a question, only be reported`,
       );
     }
-    // Same release as closeAsk: an answered card whose handler is already gone
-    // has no further use for its ticket, and the entry carries everything.
-    if (ticket && !ticket.awaiting) this.tickets.delete(askId);
+    // Same release as closeAsk (and the same reused-id exception).
+    if (ticket && !ticket.awaiting && ticket.reused !== true) this.tickets.delete(askId);
     this.trimEntries(entry.key);
     // Born orphaned (no handler is waiting on this ask) — push it straight away.
     if (entry.delivery === "pending") this.flush?.(entry.key);
