@@ -2458,6 +2458,29 @@ interface SwapReconcileResult {
   note?: string;
 }
 
+/**
+ * Is this directory a panel that would actually WORK if ComfyUI loaded it?
+ *
+ * Deliberately stricter than "the directory is there": recovery decisions delete
+ * things, and a husk — an emptied directory, or one left by a half-finished move
+ * — must never be mistaken for a healthy install and used to justify discarding
+ * the only good copy. Requires the panel's own pyproject identity AND the built
+ * web bundle; every uncertainty (unreadable file, indeterminate probe) answers
+ * "no".
+ */
+function dirIsUsablePanel(dir: string, deps: PanelInstallerDeps): boolean {
+  try {
+    const pyproject = join(dir, "pyproject.toml");
+    if (!deps.existsSync(pyproject)) return false;
+    if (parsePyproject(deps.readFile(pyproject)).projectName !== PANEL_REGISTRY_ID) {
+      return false;
+    }
+    return servesPanelWebAssets(dir, deps) === true;
+  } catch {
+    return false;
+  }
+}
+
 function reconcilePanelSwap(
   comfyuiPath: string,
   deps: PanelInstallerDeps,
@@ -2524,7 +2547,14 @@ function reconcilePanelSwap(
   const journal = readJournal();
   const canonicalDir =
     journal?.dir ?? join(comfyuiPath, "custom_nodes", PANEL_REGISTRY_ID);
+  // "EXISTS" IS WEAKER THAN "WORKS", and the difference decides whether we are
+  // allowed to delete anything. The discard branch below throws away the staged
+  // panel on the strength of the canonical one being fine — so the canonical one
+  // has to be PROVEN fine: a real panel pyproject and the built web bundle
+  // ComfyUI actually serves. A husk left by a half-finished move, or a directory
+  // someone emptied, would otherwise cost the user the only working copy.
   const canonicalPresent = deps.existsSync(canonicalDir);
+  const canonicalUsable = canonicalPresent && dirIsUsablePanel(canonicalDir, deps);
 
   // REPAIR ONLY UNDER THE OP LOCK. panelStatus is called from many places and
   // holds no lock, so repairing from there could move directories out from
@@ -2544,7 +2574,26 @@ function reconcilePanelSwap(
     };
   }
 
-  if (canonicalPresent) {
+  if (canonicalPresent && !canonicalUsable) {
+    // There is something at the canonical name, but it is not a working panel —
+    // so neither branch below is safe. Discarding the staged copy could remove
+    // the ONLY usable panel, and completing the move cannot rename onto an
+    // occupied name. The user is not broken in the meantime: the staged copy is
+    // dot-prefixed, so ComfyUI serves it. Report and touch nothing.
+    return {
+      ok: false,
+      note:
+        ` WARNING: a panel update was interrupted, and the directory at ${canonicalDir} ` +
+        `is present but is NOT a usable panel (no readable panel pyproject.toml, or no ` +
+        `built web bundle). Nothing has been moved: discarding the staged replacement ` +
+        `at ${incomingDir} could remove the only working copy. ComfyUI serves that ` +
+        `staged copy, so the panel still loads. Inspect ${canonicalDir}, remove it if ` +
+        `it is a leftover, then re-run ` +
+        `${describeInstallPanelAction("status", "a re-check on the ComfyUI host")}.`,
+    };
+  }
+
+  if (canonicalUsable) {
     // Interrupted BEFORE the old panel was moved aside. The working panel is
     // untouched, so the conservative repair is to ABANDON the staged copy rather
     // than complete a swap whose remaining steps were never verified. The update

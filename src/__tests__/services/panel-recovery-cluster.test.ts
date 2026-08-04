@@ -966,6 +966,35 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     expect(existsSync(INCOMING())).toBe(false);
   });
 
+  it("a canonical dir that merely EXISTS does not license discarding the staged panel", async () => {
+    // "exists" is weaker than "works". A husk at the canonical name — emptied,
+    // or left by a half-finished move — would otherwise be read as a healthy
+    // install and used to justify deleting the only usable copy.
+    mkdirSync(PANEL_DIR(), { recursive: true }); // present, but no pyproject/web
+    writePanelPack(INCOMING(), "0.11.38");
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
+    expect(note).toMatch(/NOT a usable panel/);
+    expect(note).toMatch(/Nothing has been moved/);
+    // The working copy survives, and ComfyUI still serves it.
+    expect(existsSync(INCOMING())).toBe(true);
+    expect(aPanelIsReachable()).toBe(true);
+  });
+
+  it("a canonical panel missing its BUILT BUNDLE is not treated as healthy either", async () => {
+    writePanelPack(PANEL_DIR(), "0.11.34", { web: false }); // pyproject only
+    writePanelPack(INCOMING(), "0.11.38");
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    expect(await repairInterruptedPanelSwap(makeDeps({}).deps)).toMatch(
+      /NOT a usable panel/,
+    );
+    expect(existsSync(INCOMING())).toBe(true);
+  });
+
   it("a STALE journal with no in-flight swap NEVER resurrects a deliberately removed panel", async () => {
     // A swap that COMPLETED and died before deleting its journal, after which
     // the user uninstalled the panel on purpose. "There is a journal" only ever
