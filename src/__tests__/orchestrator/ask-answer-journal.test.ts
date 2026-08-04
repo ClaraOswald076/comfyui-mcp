@@ -994,6 +994,18 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
       expect(unguarded, `${guard}: closeAsks must not run when the provider is unchanged`).toBeNull();
     }
 
+    // The FATAL-EXIT notice is an outlet like any other: it renders answer text
+    // and pushes it to whoever holds the tab, so a retired conversation's pick
+    // must be counted there, not quoted. The durable LOG still gets everything —
+    // two audiences, two buckets.
+    const exitAt2 = src.indexOf("AskAnswers.allOutstanding()");
+    expect(exitAt2, "exit disclosure not found").toBeGreaterThan(-1);
+    const exitBlock = src.slice(exitAt2, exitAt2 + 900);
+    expect(exitBlock, "the notice must gate content on the boundary").toContain(
+      "AskAnswers.mayDisclose(entry)",
+    );
+    expect(exitBlock, "…and count what it withholds").toMatch(/withheld \+= 1/);
+
     // The unsend hook must actually be wired, or closeAsks silently degrades to
     // "leave the stale copy queued"; and the turn attacher must be wired, or the
     // journal has no proof of receipt for the ordinary path and every eviction
@@ -1817,6 +1829,19 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     expect(entry.carrier).toBeNull();
     AskAnswers.ack(entry.token, { carrier: TURN });
     expect(entry.acked).toBeUndefined();
+  });
+
+  it("a retired answer may be counted but never quoted to the tab's current holder", () => {
+    openAndAnswer("pa-exit", SAMPLER, "dpmpp_2m");
+    const entry = AskAnswers.entriesFor(TAB)[0];
+    expect(AskAnswers.mayDisclose(entry)).toBe(true); // its own conversation may see it
+
+    AskAnswers.closeAsks(TAB);
+    // Still named by the exit path (it IS a loss) but no longer showable to
+    // whoever holds the tab now — the count crosses the boundary, the text does
+    // not, and the durable log keeps the text.
+    expect(AskAnswers.allOutstanding().some((e) => e.answer === "dpmpp_2m")).toBe(true);
+    expect(AskAnswers.mayDisclose(entry)).toBe(false);
   });
 
   it("never throws when the flusher does", () => {

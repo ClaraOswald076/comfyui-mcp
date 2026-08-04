@@ -648,6 +648,18 @@ export class AskAnswerJournalImpl {
     return ticket.epoch === (this.tabEpoch.get(ticket.tabId) ?? 0);
   }
 
+  /**
+   * May this answer's CONTENT be shown to whoever holds its tab right now?
+   *
+   * The public face of the boundary gate, for outlets that live outside this
+   * class. The fatal-exit notice is one: it renders answer text and pushes it to
+   * the tab, so it is a delivery like any other and a retired conversation's pick
+   * must not appear in it. Counts may always cross; content may not.
+   */
+  mayDisclose(entry: AskEntry): boolean {
+    return this.mayReachLiveTurn(entry);
+  }
+
   /** Does this journal know the ask id — i.e. is a late answer for it one of
    *  OURS? The bridge's late-answer sink is fed by every `ask_user` card
    *  (confirm/consent/secret gates included) and only `panel_ask` answers belong

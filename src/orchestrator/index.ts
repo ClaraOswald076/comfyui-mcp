@@ -2193,9 +2193,20 @@ export async function runPanelOrchestrator(): Promise<void> {
     // the user can do is give it again. Telling someone to check `get_history`
     // for a lost answer names a lever that cannot work, in the one moment they
     // are already dealing with a failure.
-    const byTab = new Map<string, { runs: string[]; answers: string[] }>();
-    const slot = (key: string): { runs: string[]; answers: string[] } => {
-      const cur = byTab.get(key) ?? { runs: [], answers: [] };
+    // Three buckets per tab, because the DURABLE RECORD and the CHAT NOTICE are
+    // not the same audience. The log is the record of last resort and gets
+    // everything, including answers that belong to a conversation that has since
+    // been replaced. The notice goes to whoever holds the tab NOW, so a retired
+    // conversation's pick may only be COUNTED there — rendering it would make the
+    // exit path the last outlet that carries content across a boundary.
+    const byTab = new Map<
+      string,
+      { runs: string[]; answers: string[]; sealed: string[]; withheld: number }
+    >();
+    const slot = (
+      key: string,
+    ): { runs: string[]; answers: string[]; sealed: string[]; withheld: number } => {
+      const cur = byTab.get(key) ?? { runs: [], answers: [], sealed: [], withheld: 0 };
       byTab.set(key, cur);
       return cur;
     };
@@ -2209,9 +2220,14 @@ export async function runPanelOrchestrator(): Promise<void> {
       // one copy left anywhere, and quoting it back is what lets the user confirm
       // it rather than be asked from scratch.
       for (const entry of AskAnswers.allOutstanding()) {
-        slot(entry.key).answers.push(
-          `“${entry.answer}” (to “${previewQuestion(entry.question)}”)${entry.returned ? " — it went into a tool call whose receipt was never confirmed" : ""}`,
-        );
+        const line = `“${entry.answer}” (to “${previewQuestion(entry.question)}”)${entry.returned ? " — it went into a tool call whose receipt was never confirmed" : ""}`;
+        const bucket = slot(entry.key);
+        // The log always gets the text…
+        bucket.sealed.push(line);
+        // …the notice only when this tab's current holder is the one it was given
+        // to. Otherwise it is counted, and the text survives only in the log.
+        if (AskAnswers.mayDisclose(entry)) bucket.answers.push(line);
+        else bucket.withheld += 1;
       }
       // …and the answers whose only surviving record is a COUNTER, because the
       // journal's bound already destroyed the text. Naming the count is the last
@@ -2241,14 +2257,14 @@ export async function runPanelOrchestrator(): Promise<void> {
     // environment, and losing the disclosure would undercut the whole
     // in-memory-journal tradeoff.)
     const record = [...byTab]
-      .map(([panelTab, { runs, answers }]) =>
+      .map(([panelTab, { runs, sealed }]) =>
         [
           `[panel-orchestrator] tab ${panelTab.slice(0, 8)} — exiting with`,
           runs.length
             ? ` ${runs.length} undelivered render result(s), outcome UNDETERMINED: ${runs.join("; ")}.`
             : "",
-          answers.length
-            ? ` ${answers.length} validated user ANSWER(S) that never reached the agent and cannot be looked up anywhere: ${answers.join("; ")}.`
+          sealed.length
+            ? ` ${sealed.length} validated user ANSWER(S) that never reached the agent and cannot be looked up anywhere: ${sealed.join("; ")}.`
             : "",
         ].join(""),
       )
@@ -2277,7 +2293,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       logger.error("[panel-orchestrator] …and no durable sink accepted that record (it may not survive)");
     }
     try {
-      for (const [panelTab, { runs, answers }] of byTab) {
+      for (const [panelTab, { runs, answers, withheld }] of byTab) {
         // Two different losses, two different remedies — never merged.
         const parts: string[] = ["⚠️ The agent backend is being restarted."];
         if (runs.length) {
@@ -2293,6 +2309,16 @@ export async function runPanelOrchestrator(): Promise<void> {
               `An answer is not a render — there is NO history to look it up in, and the agent has no way to ` +
               `recover it once this restart completes. Please tell it your choice again (or paste the text above) ` +
               `when it comes back.`,
+          );
+        }
+        if (withheld > 0) {
+          // Counted, not quoted: these were given to a conversation that has been
+          // replaced (a new chat, a rewind, a provider switch, another tab taking
+          // this workflow). Their text is in the log, not on this screen.
+          parts.push(
+            `${withheld} further answer(s) on this tab belong to an earlier conversation that has ` +
+              `since been replaced; they were never delivered either, but they are not shown here ` +
+              `because they were not given to the conversation you are in now.`,
           );
         }
         bridge.push({ type: "say", text: parts.join(" ") }, panelTab);
