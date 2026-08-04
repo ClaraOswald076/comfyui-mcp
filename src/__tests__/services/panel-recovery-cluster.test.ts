@@ -33,6 +33,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  symlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -1190,6 +1191,177 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     expect(existsSync(backupDir)).toBe(true);
   });
 
+  it("P0: a manifest listing ZERO files is unverifiable, not 'intact'", async () => {
+    // An empty file list with a matching digest is far likelier to come from a
+    // bug in our own WRITER — written before the walk, an exception swallowed
+    // mid-collection — than from anything else, and it would otherwise verify
+    // an empty directory as intact.
+    writePanelPack(backupPath("0.11.34"), "0.11.34");
+    stageIncoming("0.11.38");
+    const manifestPath = join(INCOMING(), ".comfyui-mcp-integrity.json");
+    writeFileSync(
+      manifestPath,
+      JSON.stringify({
+        version: 1,
+        files: [],
+        digest: createHash("sha256").update("", "utf-8").digest("hex"),
+      }),
+    );
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    expect(await repairInterruptedPanelSwap(makeDeps({}).deps)).toMatch(
+      /CANNOT be determined/,
+    );
+  });
+
+  it("P0: a manifest missing the panel's required entries is unverifiable", async () => {
+    writePanelPack(backupPath("0.11.34"), "0.11.34");
+    stageIncoming("0.11.38");
+    const manifestPath = join(INCOMING(), ".comfyui-mcp-integrity.json");
+    const m = JSON.parse(readFileSync(manifestPath, "utf-8"));
+    m.files = m.files.filter(
+      (f: { path: string }) => f.path !== "web/js/comfyui-mcp-panel.js",
+    );
+    const canonical = m.files
+      .map((f: { path: string; size: number; sha256: string }) =>
+        `${f.path} | ${f.size} | ${f.sha256}`,
+      )
+      .join("\n");
+    m.digest = createHash("sha256").update(canonical, "utf-8").digest("hex");
+    writeFileSync(manifestPath, JSON.stringify(m));
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    expect(await repairInterruptedPanelSwap(makeDeps({}).deps)).toMatch(
+      /CANNOT be determined/,
+    );
+  });
+
+  it("P0: a HALF-WRITTEN manifest is a disclosed verdict, never a thrown exception", async () => {
+    // `{"files":[null]}` is valid JSON and the ordinary shape of a crash during
+    // the write. Dereferencing before validating threw from inside the verifier,
+    // and the exception escaped into a catch that reported nothing at all.
+    writePanelPack(backupPath("0.11.34"), "0.11.34");
+    stageIncoming("0.11.38");
+    writeFileSync(
+      join(INCOMING(), ".comfyui-mcp-integrity.json"),
+      '{"version":1,"files":[null],"digest":"x"}',
+    );
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
+    expect(note).toMatch(/CANNOT be determined/);
+    expect(note).not.toMatch(/could not be examined/); // a verdict, not a crash
+  });
+
+  it("P0: an UNREADABLE backup bundle is not viable — could-not-read is not fine", async () => {
+    // A backup whose bundle is a regular file but errors on read would be
+    // renamed over the canonical name, after which the staged copy is removed:
+    // no readable panel left anywhere. Failing disk or ACLs, pure accident.
+    const backupDir = backupPath("0.11.34");
+    writePanelPack(backupDir, "0.11.34");
+    stageIncoming("0.11.38");
+    rmSync(join(INCOMING(), "web", "js", "comfyui-mcp-panel.js")); // husk ⇒ restore attempted
+    const h = makeDeps({});
+    const realDigest = h.deps.fileDigest!;
+    h.deps.fileDigest = (p) =>
+      p.startsWith(backupDir) && p.endsWith("comfyui-mcp-panel.js")
+        ? undefined // EIO on read
+        : realDigest(p);
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(h.deps);
+    // Not restored from the unreadable copy, and the staged one is left alone.
+    expect(note).toMatch(/No previous copy could be located|INCOMPLETE/);
+    expect(existsSync(PANEL_DIR())).toBe(false);
+    expect(existsSync(INCOMING())).toBe(true);
+  });
+
+  it("P0: a SYMLINK inside the staged tree is not followed — refuse to describe it", async () => {
+    // If the walk followed links, the manifest would verify `intact` while the
+    // served panel depended on mutable content outside `.incoming`, and a later
+    // unrelated edit there would silently change the installed panel. Junctions
+    // and git-linked dev checkouts make this ordinary on this project.
+    const outside = join(root, "outside-tree");
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(outside, "extra.js"), "export const x = 1;\n");
+    stageIncoming("0.11.38");
+    try {
+      symlinkSync(outside, join(INCOMING(), "linked"), "junction");
+    } catch {
+      return; // platform refuses link creation for this user — nothing to assert
+    }
+    writePanelPack(backupPath("0.11.34"), "0.11.34");
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    expect(await repairInterruptedPanelSwap(makeDeps({}).deps)).toMatch(
+      /CANNOT be determined/,
+    );
+  });
+
+  it("P0: tied mtimes resolve deterministically, not by readdir order", async () => {
+    const a = backupPath("0.11.20", 1700000000000);
+    const b = backupPath("0.11.34", 1700000000001);
+    writePanelPack(a, "0.11.20");
+    writePanelPack(b, "0.11.34");
+    const same = new Date(Date.now() - 60_000);
+    utimesSync(a, same, same); // identical mtimes — coarse timestamps are ordinary
+    utimesSync(b, same, same);
+    stageIncoming("0.11.38");
+    rmSync(join(INCOMING(), "web", "js", "comfyui-mcp-panel.js"));
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    await repairInterruptedPanelSwap(makeDeps({}).deps);
+    // The name tiebreak makes this reproducible rather than filesystem-dependent.
+    expect(readFileSync(join(PANEL_DIR(), "pyproject.toml"), "utf-8")).toContain("0.11.34");
+  });
+
+  it("P0: restoring an OLDER backup than the one being replaced says so", async () => {
+    const backupDir = backupPath("0.11.20");
+    writePanelPack(backupDir, "0.11.20");
+    stageIncoming("0.11.38");
+    rmSync(join(INCOMING(), "web", "js", "comfyui-mcp-panel.js"));
+    writeFileSync(
+      join(root, ".comfyui-agent-panel.swap.json"),
+      JSON.stringify({
+        dir: PANEL_DIR(),
+        backupDir,
+        staging: "x",
+        startedAt: Date.now(),
+        previousVersion: "0.11.34", // what the interrupted swap was replacing
+      }),
+    );
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
+    expect(note).toMatch(/RESTORED/);
+    expect(note).toMatch(/OLDER than the 0\.11\.34/);
+  });
+
+  it("P1: an unrelated dir at the canonical name cannot clear a stale journal", async () => {
+    const backupDir = backupPath("0.11.34");
+    writePanelPack(backupDir, "0.11.34");
+    mkdirSync(PANEL_DIR(), { recursive: true });
+    writeFileSync(join(PANEL_DIR(), "pyproject.toml"), pyproject("2.0.0", "unrelated-node"));
+    writeFileSync(
+      join(root, ".comfyui-agent-panel.swap.json"),
+      JSON.stringify({ dir: PANEL_DIR(), backupDir, staging: "x", startedAt: Date.now() }),
+    );
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
+    expect(note).toMatch(/HAS been preserved/);
+    expect(note).toContain(backupDir);
+    expect(existsSync(join(root, ".comfyui-agent-panel.swap.json"))).toBe(true);
+  });
+
   it("a DOCTORED manifest cannot vouch for a tree — the digest covers the file list", async () => {
     const backupDir = backupPath("0.11.34");
     writePanelPack(backupDir, "0.11.34");
@@ -1579,7 +1751,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     const { repairInterruptedPanelSwap } = await import(
       "../../services/panel-installer.js"
     );
-    expect(await repairInterruptedPanelSwap(h.deps)).toBeUndefined();
+    expect(await repairInterruptedPanelSwap(h.deps)).toMatch(/could not be examined/);
     expect(existsSync(INCOMING())).toBe(true); // untouched
   });
 
@@ -1591,7 +1763,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     const { repairInterruptedPanelSwap } = await import(
       "../../services/panel-installer.js"
     );
-    expect(await repairInterruptedPanelSwap(pinned)).toBeUndefined();
+    expect(await repairInterruptedPanelSwap(pinned)).toMatch(/could not be examined/);
     expect(existsSync(INCOMING())).toBe(true);
   });
 

@@ -1642,13 +1642,24 @@ export async function repairInterruptedPanelSwap(
     );
     return locked;
   } catch (err) {
-    logger.debug("panel: interrupted-swap repair skipped", {
-      err: err instanceof Error ? err.message : String(err),
-    });
+    const detail = err instanceof Error ? err.message : String(err);
+    logger.warn(`[panel] interrupted-swap repair did not complete: ${detail}`);
     // A repair that ALREADY HAPPENED is reported even though the call went on to
     // fail. Returning undefined here would hide a change to the user's install
     // behind an unrelated error.
-    return performed.note;
+    if (performed.note) return performed.note;
+    // AND SILENCE IS NOT AN OPTION EITHER. This runs on the path whose entire
+    // purpose is to tell a user their panel is missing and where the copy went;
+    // swallowing the failure into `undefined` means the caller reports nothing
+    // at all, which is the refuse-and-disclose contract failing at precisely the
+    // moment it matters. A pre-check already established there was SOMETHING to
+    // look at, so reaching here means we could not finish looking — say so.
+    return (
+      ` WARNING: an interrupted panel update was detected but could not be examined ` +
+      `(${detail}). Nothing has been changed. Check custom_nodes for ` +
+      `".comfyui-agent-panel.incoming" and custom_nodes_backup for a preserved copy, ` +
+      `then re-run ${describeInstallPanelAction("status", "a re-check on the ComfyUI host")}.`
+    );
   }
 }
 
@@ -2590,6 +2601,18 @@ interface SwapReconcileResult {
  * one, so using it to resolve the canonical panel directory let an unrelated
  * node occupying `custom_nodes/comfyui-mcp-panel` be selected as the panel.
  */
+/** The panel version recorded in a directory's pyproject, if readable. */
+function readPanelVersionAt(
+  dir: string,
+  deps: PanelInstallerDeps,
+): string | undefined {
+  try {
+    return parsePyproject(deps.readFile(join(dir, "pyproject.toml"))).version;
+  } catch {
+    return undefined;
+  }
+}
+
 function dirIsPanelByIdentity(dir: string, deps: PanelInstallerDeps): boolean {
   try {
     const pyproject = join(dir, "pyproject.toml");
@@ -2657,7 +2680,12 @@ function discoverPanelBackup(
     candidates.push({ dir, mtime });
   }
   if (candidates.length === 0) return undefined;
-  candidates.sort((a, b) => b.mtime - a.mtime);
+  // DETERMINISTIC. Filesystem timestamps are often coarse (whole seconds on
+  // some filesystems), so ties are ordinary rather than exotic — and a stable
+  // sort over `readdir`'s unspecified order would then pick a different backup
+  // on different machines, or on the same machine twice. Break ties on the name
+  // so the choice is always reproducible and explainable.
+  candidates.sort((a, b) => b.mtime - a.mtime || b.dir.localeCompare(a.dir));
   return candidates[0].dir;
 }
 
@@ -2741,8 +2769,17 @@ function dirHasPanelFiles(dir: string, deps: PanelInstallerDeps): boolean {
   // "there are bytes" and "there are none". Anything beyond that (is the
   // JavaScript complete?) is the integrity manifest's job, not a guess made
   // from content.
-  const size = deps.fileDigest?.(bundle)?.size;
-  return size === undefined ? true : size > 0;
+  //
+  // AND "COULD NOT READ" IS NOT "FINE". When the digest dep exists, a bundle it
+  // cannot read — EIO on a failing disk, EACCES from an ACL — must not be judged
+  // viable: this predicate decides whether to rename a backup over the canonical
+  // name and then delete the staged copy, so answering "yes" on an unreadable
+  // file leaves the user with no readable panel at all. Same fold as everywhere
+  // else tonight: an unanswered question is not a positive answer.
+  if (!deps.fileDigest) return true; // dep absent ⇒ this check is not available
+  const digest = deps.fileDigest(bundle);
+  if (!digest) return false; // present but unreadable
+  return digest.size > 0;
 }
 
 /**
@@ -2779,7 +2816,31 @@ interface PanelManifest {
   digest: string;
 }
 
-/** Stable digest over the file list, so a doctored manifest is detectable. */
+/**
+ * Is this a well-formed manifest entry?
+ *
+ * Checked BEFORE anything dereferences it. A manifest that was half-written when
+ * the process died can still parse as JSON — `{"files":[null]}` is valid JSON —
+ * and reaching into that throws from inside the verifier, where the exception
+ * escapes into a catch that reports nothing. A partially-written file is the
+ * ordinary crash shape here, so malformed must be a VERDICT (`unverifiable`),
+ * never an exception.
+ */
+function isManifestEntry(v: unknown): v is PanelManifestEntry {
+  if (!v || typeof v !== "object") return false;
+  const e = v as Partial<PanelManifestEntry>;
+  return (
+    typeof e.path === "string" &&
+    e.path.length > 0 &&
+    typeof e.size === "number" &&
+    Number.isFinite(e.size) &&
+    e.size >= 0 &&
+    typeof e.sha256 === "string" &&
+    e.sha256.length > 0
+  );
+}
+
+/** Stable digest over the file list. */
 function manifestDigest(files: PanelManifestEntry[], deps: PanelInstallerDeps): string {
   const canonical = files
     .map((f) => `${f.path} | ${f.size} | ${f.sha256}`)
@@ -2811,6 +2872,15 @@ function collectTreeFiles(
     if (prefix === "" && (name === ".git" || name === PANEL_MANIFEST_NAME)) continue;
     const full = join(dir, name);
     const rel = prefix === "" ? name : `${prefix}/${name}`;
+    // NEVER FOLLOW A LINK. `isDirectory` follows symlinks, so a link inside the
+    // staged tree would be walked as though its target were part of it: the
+    // manifest would verify `intact` while the served panel actually depends on
+    // mutable content OUTSIDE `.incoming`, and a later unrelated edit there
+    // would silently change the installed panel. Junctions and git-linked dev
+    // checkouts make this an ordinary situation on this project, not an exotic
+    // one. We cannot describe such a tree honestly, so we decline to describe
+    // it: the writer refuses to stage it and the verifier reports unverifiable.
+    if (deps.isSymlink(full)) return undefined;
     const isDir = deps.isDirectory(full);
     if (isDir === undefined) return undefined; // could not classify — not a complete listing
     if (isDir) {
@@ -2873,6 +2943,18 @@ function verifyStagedTree(dir: string, deps: PanelInstallerDeps): StagedTreeVerd
     return "unverifiable"; // truncated or corrupt manifest — cannot tell
   }
   if (manifest?.version !== 1 || !Array.isArray(manifest.files)) return "unverifiable";
+  // Shape before use — see isManifestEntry.
+  if (!manifest.files.every(isManifestEntry)) return "unverifiable";
+  // A PANEL IS NEVER ZERO FILES. An empty (or required-file-less) list with a
+  // matching digest is far likelier to come from a bug in our own WRITER — a
+  // manifest written before the walk, an exception swallowed mid-collection —
+  // than from anything else, and it would otherwise "verify" an empty
+  // directory as intact. This is a sanity check on what we produce, not a
+  // defence against anyone.
+  if (manifest.files.length === 0) return "unverifiable";
+  const listed = new Set(manifest.files.map((f) => f.path));
+  const requiredPaths = ["pyproject.toml", PANEL_WEB_MARKERS[0].join("/")];
+  if (!requiredPaths.every((p) => listed.has(p))) return "unverifiable";
   if (manifest.digest !== manifestDigest(manifest.files, deps)) return "unverifiable";
 
   const actual = collectTreeFiles(dir, deps);
@@ -2943,7 +3025,13 @@ function reconcilePanelSwap(
       dirHasPanelFiles(stale.backupDir, deps)
         ? stale.backupDir
         : undefined) ?? discoverPanelBackup(comfyuiPath, deps);
-    if (deps.existsSync(staleCanonical)) {
+    // IDENTITY, not existence — the fifth-question defect, guarded here for
+    // good. `resolveCanonicalPanelDir` can return a NAME that no panel
+    // occupies, and an unrelated custom node sitting at exactly that name would
+    // then read as "the panel is fine": the journal gets cleared as spent, a
+    // success is reported, and the preserved backup is never mentioned —
+    // suppressing the very disclosure this branch exists to make.
+    if (dirIsPanelByIdentity(staleCanonical, deps)) {
       // Panel present and no swap in flight — the record is simply spent.
       dropJournal();
       return { ok: true };
@@ -3004,9 +3092,15 @@ function reconcilePanelSwap(
   // would make a recoverable panel undiscoverable for no reason other than a
   // lost advisory file — in a state where `.incoming` has already PROVEN an
   // interrupted swap, so there is no ambiguity to be cautious about.
+  // The SAME predicate as discovery. These two paths were disagreeing about
+  // what counts as one of our backups — the journal route accepted any
+  // panel-shaped directory under custom_nodes_backup while discovery required
+  // the swap's own naming — so whether a given directory qualified depended on
+  // which route happened to run. One question, one answer.
   const namedBackup =
     journal?.backupDir &&
     isInsideDir(backupRootPath, journal.backupDir) &&
+    isPanelSwapBackupName(basename(journal.backupDir)) &&
     dirHasPanelFiles(journal.backupDir, deps)
       ? journal.backupDir
       : undefined;
@@ -3140,6 +3234,22 @@ function reconcilePanelSwap(
           }, remove "${incomingDir}", then restart ComfyUI.`,
       };
     }
+    // SAY SO IF THE RESTORE GOES BACKWARDS. The backup we select is the most
+    // recent one we made, but "most recent" is not "newest version" — a coarse
+    // mtime tie, or a backup left by an earlier downgrade, can mean the copy we
+    // are about to reinstate is OLDER than the one the interrupted swap was
+    // replacing. Restoring is still the right move (it is the copy we know
+    // worked), but reporting it as plain recovery would hide a version
+    // regression the user should know about.
+    const restoringVersion = readPanelVersionAt(journalBackup, deps);
+    const replacedVersion = journal?.previousVersion;
+    const wentBackwards =
+      !!restoringVersion &&
+      !!replacedVersion &&
+      SEMVER_RE.test(restoringVersion.trim()) &&
+      SEMVER_RE.test(replacedVersion.trim()) &&
+      compareSemver(restoringVersion, replacedVersion) < 0;
+
     // RESTORE FIRST, then clear the husk. Doing it the other way round would
     // leave custom_nodes with no panel at all in between, which is the state
     // this whole ordering exists to avoid.
@@ -3181,6 +3291,12 @@ function reconcilePanelSwap(
         ` NOTE: a previous panel update was interrupted and the replacement it left ` +
         `behind was INCOMPLETE (no usable panel bundle), so it was NOT installed. Your ` +
         `previous panel has been RESTORED to ${canonicalDir} — nothing was lost.` +
+        (wentBackwards
+          ? ` NOTE: the restored copy is ${restoringVersion}, which is OLDER than the ` +
+            `${replacedVersion} the interrupted update was replacing — it is the most ` +
+            `recent backup on disk, but it is a step back. Re-run the update to move ` +
+            `forward again.`
+          : ``) +
         (huskCleared
           ? ` Retry the update when convenient.`
           : ` The incomplete copy at ${incomingDir} could not be removed and may SHADOW ` +
