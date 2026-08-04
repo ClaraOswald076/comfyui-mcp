@@ -269,9 +269,6 @@ const RECOVER_MAX_AGE_MS = 10 * 60_000;
  *  those put the text into a turn the agent read, so settling risks a duplicate,
  *  never a loss. */
 const MAX_CARRIED_RELEASES = 3;
-/** How many separate tool results may report an eviction debt before it is
- *  considered said. See reportDropped(). */
-const MAX_DEBT_REPORTS = 3;
 
 /**
  * EXACT identity of a question, and the whole of the cross-question guard.
@@ -382,7 +379,9 @@ export class AskAnswerJournalImpl {
   /** How many tool results have already carried each tab's eviction debt. The
    *  debt is spent by a COUNT of reports, never by a single hand-off — see
    *  reportDropped(). */
-  private droppedReports = new Map<string, number>();
+  /** Outstanding eviction-disclosure tokens: token -> panel tab. Retired only
+   *  by the ack of the turn that carried the warning (see reportDropped). */
+  private debtTokens = new Map<string, string>();
   private seq = 0;
   private ticketSeq = 0;
   /** Deliver a tab's newly-orphaned answers (see setFlusher). */
@@ -801,19 +800,17 @@ export class AskAnswerJournalImpl {
   reportDropped(key: string): number {
     const owed = this.dropped.get(key) ?? 0;
     if (owed <= 0) return 0;
-    const said = (this.droppedReports.get(key) ?? 0) + 1;
-    // Bounded by REPORTS, not cleared on the first one. A ToolResult is a
-    // hand-off, not a receipt (that IS #486), so spending the debt on the first
-    // report would let an abandoned call take the disclosure with it — the
-    // suppression rule, one level up. Three independent tool results is the same
-    // trade MAX_CARRIED_RELEASES makes for a pushed answer: a repeated warning at
-    // worst, never a swallowed one, and it cannot repeat forever.
-    if (said >= MAX_DEBT_REPORTS) {
-      this.dropped.delete(key);
-      this.droppedReports.delete(key);
-    } else {
-      this.droppedReports.set(key, said);
-    }
+    // The debt is NOT spent by being written into a tool result. A ToolResult is
+    // a hand-off, not a receipt — that IS #486 — so counting reports (an earlier
+    // draft retired the debt after three) lets three abandoned calls carry the
+    // only disclosure away with them, and the answer's payload is already gone.
+    //
+    // It rides the SAME ack as everything else instead: a token attached to the
+    // turn this tool call is running inside, retired only when that turn produces
+    // its own result. No live turn to ride means no proof and no retirement — the
+    // debt simply stands and the next result reports it again.
+    const token = `aad${++this.seq}`;
+    if (this.attachTurn?.(key, token) === true) this.debtTokens.set(token, key);
     return owed;
   }
 
@@ -874,7 +871,6 @@ export class AskAnswerJournalImpl {
         // replayed, and the warning must go with it. Only ack() clears it.
         entry.disclose = lost;
         this.dropped.delete(key);
-        this.droppedReports.delete(key);
       }
       delivered += 1;
     }
@@ -883,6 +879,16 @@ export class AskAnswerJournalImpl {
 
   /** The turn that CARRIED this answer ended — it genuinely reached the agent. */
   ack(token: string): void {
+    // An eviction-DISCLOSURE token (see reportDropped): the turn that carried the
+    // warning produced its result, so the tab has genuinely been told.
+    const debtKey = this.debtTokens.get(token);
+    if (debtKey !== undefined) {
+      this.debtTokens.delete(token);
+      this.dropped.delete(debtKey);
+      // Any other outstanding token for the same tab is now moot.
+      for (const [t, k] of [...this.debtTokens]) if (k === debtKey) this.debtTokens.delete(t);
+      return;
+    }
     const entry = this.entries.get(token);
     if (!entry) return;
     // The push is done, but the ANSWER stays journaled while it is still within
@@ -921,6 +927,11 @@ export class AskAnswerJournalImpl {
    *    NOBODY read it. These must never count toward the bound.
    */
   release(token: string, opts: { carried?: boolean } = {}): void {
+    // A disclosure token handed back: that turn never proved it was read, so the
+    // debt STANDS and the next result reports it again. Only the token mapping
+    // goes; there is deliberately no bound on how often a warning may be repeated
+    // when nothing has confirmed it.
+    if (this.debtTokens.delete(token)) return;
     const entry = this.entries.get(token);
     if (!entry) return;
     // A TOOL-RESULT answer riding a turn (see setTurnAttacher) is not in a
@@ -1022,8 +1033,6 @@ export class AskAnswerJournalImpl {
       this.dropped.set(to, (this.dropped.get(to) ?? 0) + lost);
       // The destination inherits the DEBT but not the source's report credit:
       // those reports went to the source tab's agent, not this one's.
-      this.droppedReports.delete(from);
-      this.droppedReports.delete(to);
     }
   }
 
@@ -1143,7 +1152,7 @@ export class AskAnswerJournalImpl {
     this.tabEpoch.clear();
     this.entries.clear();
     this.dropped.clear();
-    this.droppedReports.clear();
+    this.debtTokens.clear();
     this.seq = 0;
     this.ticketSeq = 0;
   }

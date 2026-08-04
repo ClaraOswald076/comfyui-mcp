@@ -636,17 +636,41 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
   // carried the "N answers were lost" disclosure away with it. It is now spent by
   // a COUNT of reports (the same trade MAX_CARRIED_RELEASES makes for a push):
   // repeated at worst, never swallowed, and it cannot repeat forever.
-  it("an eviction debt survives a hand-off and is retired only after several reports", () => {
+  // Coordinator gate, round 2: the debt was retired after three REPORTS — but a
+  // report is a ToolResult hand-off, so three abandoned calls carried the only
+  // disclosure away with them and the evicted answers' payloads were already
+  // gone. It now rides the same ack as everything else.
+  it("an eviction debt is retired only by the ack of the turn that carried it", () => {
     strandEvictionDebt();
-    const first = AskAnswers.reportDropped(TAB);
-    expect(first).toBeGreaterThan(0);
-    // A second tool result still carries it — the first may never have landed.
-    expect(AskAnswers.reportDropped(TAB)).toBe(first);
+    const owed = AskAnswers.droppedFor(TAB);
+    expect(owed).toBeGreaterThan(0);
+
+    // No live turn to ride: nothing is retired, however many results carry it.
+    AskAnswers.setTurnAttacher(() => false);
+    for (let i = 0; i < 10; i += 1) expect(AskAnswers.reportDropped(TAB)).toBe(owed);
     expect(AskAnswers.hasOutstanding()).toBe(true);
-    // …but it does not repeat for ever.
-    expect(AskAnswers.reportDropped(TAB)).toBe(first);
-    expect(AskAnswers.reportDropped(TAB)).toBe(0);
+
+    // A turn DOES carry it, but ends without proving it was read — still owed.
+    const tokens: string[] = [];
+    AskAnswers.setTurnAttacher((_key, token) => {
+      tokens.push(token);
+      return true;
+    });
+    expect(AskAnswers.reportDropped(TAB)).toBe(owed);
+    AskAnswers.release(tokens[0], { carried: true });
+    // …and a turn that HANDED THE WARNING BACK can never settle it afterwards:
+    // its token is spent, so a late ack for it must be a no-op rather than a
+    // retroactive claim that the tab was told.
+    AskAnswers.ack(tokens[0]);
+    expect(AskAnswers.droppedFor(TAB)).toBe(owed);
+    expect(AskAnswers.reportDropped(TAB)).toBe(owed);
+    expect(AskAnswers.droppedFor(TAB)).toBe(owed);
+
+    // …and only that turn's own result settles it.
+    AskAnswers.ack(tokens[tokens.length - 1]);
     expect(AskAnswers.droppedFor(TAB)).toBe(0);
+    expect(AskAnswers.reportDropped(TAB)).toBe(0);
+    expect(AskAnswers.outstandingDebt().some((x) => x.key === TAB)).toBe(false);
   });
 
   // codex round 4, P0: `record` collapsed onto ANY existing entry for the ask id,
