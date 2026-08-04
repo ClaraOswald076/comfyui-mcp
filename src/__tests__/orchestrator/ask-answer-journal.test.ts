@@ -117,8 +117,7 @@ describe("ask-answer journal — an answer survives its tool call (#486)", () =>
       fingerprint: askFingerprint(SAMPLER),
       question: SAMPLER.question,
     });
-    AskAnswers.record("pa-ask-1", "euler", { tabId: TAB });
-    AskAnswers.markReturned("pa-ask-1");
+    AskAnswers.markReturned(AskAnswers.record("pa-ask-1", "euler", { tabId: TAB }).token);
     AskAnswers.closeAsk("pa-ask-1");
     expect(AskAnswers.hasOutstanding()).toBe(false);
     expect(AskAnswers.orphansFor(TAB)).toHaveLength(0);
@@ -360,8 +359,7 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
         fingerprint: askFingerprint(ask),
         question: ask.question,
       });
-      AskAnswers.record(`pa-ret-${i}`, `A${i}`, { tabId: TAB });
-      AskAnswers.markReturned(`pa-ret-${i}`);
+      AskAnswers.markReturned(AskAnswers.record(`pa-ret-${i}`, `A${i}`, { tabId: TAB }).token);
       AskAnswers.closeAsk(`pa-ret-${i}`);
     }
     expect(AskAnswers.droppedFor(TAB)).toBe(0);
@@ -441,8 +439,7 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
       fingerprint: askFingerprint(SAMPLER),
       question: SAMPLER.question,
     });
-    AskAnswers.record("pa-ask-1", "dpmpp_2m", { tabId: TAB });
-    AskAnswers.markReturned("pa-ask-1");
+    AskAnswers.markReturned(AskAnswers.record("pa-ask-1", "dpmpp_2m", { tabId: TAB }).token);
     AskAnswers.closeAsk("pa-ask-1");
     const entry = AskAnswers.entriesFor(TAB)[0];
     entry.answeredAt = Date.now() - ASK_RECOVER_MAX_AGE_MS * 10;
@@ -618,8 +615,7 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
       fingerprint: askFingerprint(SAMPLER),
       question: SAMPLER.question,
     });
-    AskAnswers.record("pa-ask-1", "dpmpp_2m", { tabId: TAB });
-    AskAnswers.markReturned("pa-ask-1");
+    AskAnswers.markReturned(AskAnswers.record("pa-ask-1", "dpmpp_2m", { tabId: TAB }).token);
     AskAnswers.closeAsk("pa-ask-1");
     expect(AskAnswers.hasOutstanding()).toBe(false); // restarts are not stalled
     expect(AskAnswers.allOutstanding().map((e) => e.answer)).toContain("dpmpp_2m");
@@ -843,8 +839,7 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
         fingerprint: askFingerprint(ask),
         question: ask.question,
       });
-      AskAnswers.record(`pa-done-${i}`, "a", { tabId: TAB });
-      AskAnswers.markReturned(`pa-done-${i}`);
+      AskAnswers.markReturned(AskAnswers.record(`pa-done-${i}`, "a", { tabId: TAB }).token);
       AskAnswers.closeAsk(`pa-done-${i}`);
       expect(AskAnswers.ticketFor(`pa-done-${i}`)).toBeUndefined(); // released
     }

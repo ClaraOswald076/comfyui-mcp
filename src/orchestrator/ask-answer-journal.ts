@@ -598,9 +598,12 @@ export class AskAnswerJournalImpl {
 
   /** The ask handler put this answer into its ToolResult. A hand-off, not proof
    *  of consumption — see AskEntry.returned. */
-  markReturned(askId: string): void {
-    for (const entry of this.entries.values()) {
-      if (entry.askId !== askId) continue;
+  markReturned(token: string): void {
+    // BY TOKEN, not by ask id: under a reused id one ask id can own two entries,
+    // and marking the sibling returned would quietly retire an answer nobody has
+    // been given.
+    const entry = this.entries.get(token);
+    if (entry) {
       entry.returned = true;
       // It reached A caller. Do not ALSO push it as an orphan; a re-ask can
       // still recover it if that caller was already dead.

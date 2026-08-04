@@ -4028,9 +4028,33 @@ async function askUserWithGrace(
    *  ToolResult carried it — a hand-off, NOT proof it was received — so it is not
    *  ALSO pushed to the agent, while a re-ask can still recover it if the caller
    *  was already gone. */
-  const handBack = (reply: unknown): ToolResult => {
-    AskAnswers.record(askId, reply, { tabId });
-    AskAnswers.markReturned(askId);
+  const handBack = (reply: unknown, opts: { ridCorrelated: boolean }): ToolResult => {
+    const entry = AskAnswers.record(askId, reply, { tabId });
+    // A LATE answer is claimed from a buffer keyed by `ask_id` ALONE, so if that
+    // id ever stood for two cards the buffer cannot say which one this reply came
+    // from — and returning it here would hand card B the answer the user gave to
+    // card A. The journal already knows (it correlates and demotes a reused id);
+    // consult its verdict instead of trusting the id.
+    //
+    // The rid-correlated path is exempt and deliberately so: a reply that came
+    // back on THIS send's own request id is this card's reply by construction,
+    // whatever the ask id has meant elsewhere.
+    if (!opts.ridCorrelated && entry.correlation.status !== "matched") {
+      // NOT marked returned: nobody has been given this as an answer, so it stays
+      // an orphan — pushed and disclosed — rather than quietly counting as
+      // delivered.
+      return fail(
+        withDroppedText(
+          tabId,
+          `A validated answer came back for this question card, but its ask id no longer identifies ` +
+            `a single card, so it CANNOT be attributed to the question you just asked — it may be the ` +
+            `user's answer to a different card. It is NOT being returned as your answer.\n\n` +
+            `WHAT THE USER PICKED (question UNDETERMINED): ${entry.answer}\n\n` +
+            `Ask again if you still need this decision.`,
+        ),
+      );
+    }
+    AskAnswers.markReturned(entry.token);
     // Even a clean answer carries out any eviction debt this tab is still owed —
     // an answer the journal admits it dropped must not go unmentioned merely
     // because the NEXT ask happened to succeed.
@@ -4041,11 +4065,11 @@ async function askUserWithGrace(
       tabId,
       timeoutMs: Math.max(1, Math.min(timing.deadlineMs, budgetEnd - Date.now())),
     });
-    return handBack(reply);
+    return handBack(reply, { ridCorrelated: true });
   } catch (err) {
     if (!isReplyTimeoutError(err)) return fail(err);
     const late = await pollLateAskReply(ctx.bridge, askId, timing, budgetEnd);
-    if (late !== undefined) return handBack(late);
+    if (late !== undefined) return handBack(late, { ridCorrelated: false });
     // Nothing came back on this card's own wire. An answer the user gave to this
     // EXACT question may still be journaled — from THIS card (the sink beat the
     // last poll) or from an earlier ask whose tool call died before it could

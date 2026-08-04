@@ -4374,6 +4374,41 @@ describe("panel_ask keeps a validated answer across a tool timeout (#486)", () =
     expect(askText(res)).toContain("dpmpp_2m");
   });
 
+  // codex round 9, P0: the LATE answer is claimed from a bridge buffer keyed by
+  // `ask_id` ALONE. If that id ever stood for two cards, the buffer cannot say
+  // which one the reply came from — and the handler used to return it as this
+  // question's answer regardless, handing card B the answer given to card A.
+  // The rid-correlated path is exempt: a reply on THIS send's own request id is
+  // this card's reply by construction.
+  it("a LATE answer whose ask id is ambiguous is reported, never returned as the answer", async () => {
+    let askId: string | null = null;
+    const bridge = {
+      send: async (cmd: Record<string, unknown>, opts?: { timeoutMs?: number }) => {
+        askId = String(cmd.ask_id);
+        // Make the id stand for a SECOND card before the late answer is claimed.
+        AskAnswers.openAsk(askId, {
+          tabId: TAB,
+          fingerprint: "some-other-question",
+          question: "A different question entirely?",
+        });
+        throw REPLY_TIMEOUT_ERR(String(cmd.cmd), opts?.timeoutMs ?? 0);
+      },
+      canReach: () => true,
+      isHeadless: () => false,
+      resolveActiveTabId: () => TAB,
+      takeLateAskReply: () => "dpmpp_2m",
+      push: () => 1,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx: PanelToolCtx = { bridge, tabId: TAB } as unknown as PanelToolCtx;
+    const res = await defByName("panel_ask").handler(SAMPLER as Record<string, unknown>, ctx);
+    expect(res.isError).toBe(true);
+    expect(askText(res)).toMatch(/CANNOT be attributed/i);
+    // The pick is still surfaced — reported, never swallowed — and it was not
+    // counted as delivered, so the orphan machinery still owns it.
+    expect(askText(res)).toContain("dpmpp_2m");
+    expect(AskAnswers.orphansFor(TAB).some((e) => e.answer === "dpmpp_2m")).toBe(true);
+  });
+
   it("holds the WHOLE handler under one wall-clock ceiling anchored at entry", () => {
     // The card deadline and the grace poll used to be additive on top of
     // everything else, so a bounded ask could still overrun the enclosing
