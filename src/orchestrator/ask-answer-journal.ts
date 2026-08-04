@@ -393,7 +393,18 @@ export class AskAnswerJournalImpl {
    *  reportDropped(). */
   /** Outstanding eviction-disclosure tokens: token -> panel tab. Retired only
    *  by the ack of the turn that carried the warning (see reportDropped). */
-  private debtTokens = new Map<string, { key: string; carrier: string | null }>();
+  private debtTokens = new Map<string, { key: string; carrier: string | null; upTo: number }>();
+  /**
+   * Per tab: the eviction total that has already been SURFACED and confirmed.
+   *
+   * A warning names a number, and only that number is settled when the turn
+   * carrying it ends. Without this the ack cleared the tab's whole current debt,
+   * so an eviction that happened AFTER the warning was rendered — while its turn
+   * was still running — was wiped by an ack that never mentioned it. A watermark
+   * also makes the ack idempotent: two results reporting the same total settle
+   * the same total, and a later one settles more.
+   */
+  private disclosedUpTo = new Map<string, number>();
   private seq = 0;
   private ticketSeq = 0;
   /** Deliver a tab's newly-orphaned answers (see setFlusher). */
@@ -837,7 +848,8 @@ export class AskAnswerJournalImpl {
    * than reporting it once at the first opportunity.
    */
   reportDropped(key: string): number {
-    const owed = this.dropped.get(key) ?? 0;
+    const total = this.dropped.get(key) ?? 0;
+    const owed = total - (this.disclosedUpTo.get(key) ?? 0);
     if (owed <= 0) return 0;
     // The debt is NOT spent by being written into a tool result. A ToolResult is
     // a hand-off, not a receipt — that IS #486 — so counting reports (an earlier
@@ -852,7 +864,9 @@ export class AskAnswerJournalImpl {
     const carrier = this.attachTurn?.(key, token) ?? null;
     // Bound to the turn that carried it, for the same reason an answer is: a
     // switched provider must not be able to certify a warning it never showed.
-    if (carrier !== null) this.debtTokens.set(token, { key, carrier });
+    // The token remembers the TOTAL it is showing, so its ack settles exactly
+    // that and nothing that arrives afterwards.
+    if (carrier !== null) this.debtTokens.set(token, { key, carrier, upTo: total });
     return owed;
   }
 
@@ -872,14 +886,21 @@ export class AskAnswerJournalImpl {
    * the count of answers whose TEXT is already gone is retired.
    */
   retireDebt(key: string): void {
-    const owed = this.dropped.get(key) ?? 0;
+    const owed = this.undisclosedDrop(key);
     if (owed > 0) {
       logger.error(
         `[ask-answers] tab ${key.slice(0, 8)} disconnected still owed a disclosure for ${owed} validated answer(s) whose content was already dropped — recording it here, as there is no longer anywhere to deliver it; treat those answers as UNDETERMINED`,
       );
     }
     this.dropped.delete(key);
+    this.disclosedUpTo.delete(key);
     for (const [t, d] of [...this.debtTokens]) if (d.key === key) this.debtTokens.delete(t);
+  }
+
+  /** The part of a tab's eviction total that has NOT yet been surfaced and
+   *  confirmed. See disclosedUpTo. */
+  private undisclosedDrop(key: string): number {
+    return Math.max(0, (this.dropped.get(key) ?? 0) - (this.disclosedUpTo.get(key) ?? 0));
   }
 
   /** Answers this tab lost to an eviction and has not yet been told about. */
@@ -887,7 +908,7 @@ export class AskAnswerJournalImpl {
     const carried = [...this.entries.values()]
       .filter((e) => e.key === key)
       .reduce((n, e) => n + (e.disclose ?? 0), 0);
-    return carried + (this.dropped.get(key) ?? 0);
+    return carried + this.undisclosedDrop(key);
   }
 
   /** Entries awaiting a push attempt for this key, in arrival order. */
@@ -918,7 +939,7 @@ export class AskAnswerJournalImpl {
   ): { delivered: number; blockedOn: AskEntry | null } {
     let delivered = 0;
     for (const entry of this.pending(key)) {
-      const lost = (entry.disclose ?? 0) + (this.dropped.get(key) ?? 0);
+      const lost = (entry.disclose ?? 0) + this.undisclosedDrop(key);
       const payload: AskAnswerEvent = {
         kind: "ask_answer",
         ask_question: entry.question,
@@ -939,6 +960,7 @@ export class AskAnswerJournalImpl {
         // replayed, and the warning must go with it. Only ack() clears it.
         entry.disclose = lost;
         this.dropped.delete(key);
+        this.disclosedUpTo.delete(key);
       }
       delivered += 1;
     }
@@ -953,9 +975,18 @@ export class AskAnswerJournalImpl {
     if (debt !== undefined) {
       if (!this.carriedBy(debt.carrier, from)) return;
       this.debtTokens.delete(token);
-      this.dropped.delete(debt.key);
-      // Any other outstanding token for the same tab is now moot.
-      for (const [t, d] of [...this.debtTokens]) if (d.key === debt.key) this.debtTokens.delete(t);
+      // Settle ONLY what this warning actually showed. An eviction that landed
+      // after it was rendered is not covered by it, and must still be reported.
+      const seen = Math.max(this.disclosedUpTo.get(debt.key) ?? 0, debt.upTo);
+      const total = this.dropped.get(debt.key) ?? 0;
+      if (seen >= total) {
+        // Fully told — nothing outstanding, so drop both halves.
+        this.dropped.delete(debt.key);
+        this.disclosedUpTo.delete(debt.key);
+        for (const [t, x] of [...this.debtTokens]) if (x.key === debt.key) this.debtTokens.delete(t);
+      } else {
+        this.disclosedUpTo.set(debt.key, seen);
+      }
       return;
     }
     const entry = this.entries.get(token);
@@ -1043,7 +1074,7 @@ export class AskAnswerJournalImpl {
     // answer was lost, and it is destroyed by a teardown exactly as an entry is —
     // tearing down while one is owed turns a disclosed loss back into a silent
     // one, which is the whole thing this journal exists to prevent.
-    if (this.dropped.size > 0) return true;
+    for (const key of this.dropped.keys()) if (this.undisclosedDrop(key) > 0) return true;
     return [...this.entries.values()].some(
       (e) => e.delivery !== "none" || (e.disclose ?? 0) > 0,
     );
@@ -1086,7 +1117,10 @@ export class AskAnswerJournalImpl {
    *  name a loss whose carrier is only a counter. */
   outstandingDebt(): Array<{ key: string; count: number }> {
     const byTab = new Map<string, number>();
-    for (const [key, n] of this.dropped) byTab.set(key, (byTab.get(key) ?? 0) + n);
+    for (const key of this.dropped.keys()) {
+      const owed = this.undisclosedDrop(key);
+      if (owed > 0) byTab.set(key, (byTab.get(key) ?? 0) + owed);
+    }
     for (const e of this.entries.values()) {
       if ((e.disclose ?? 0) > 0) byTab.set(e.key, (byTab.get(e.key) ?? 0) + e.disclose!);
     }
@@ -1126,9 +1160,12 @@ export class AskAnswerJournalImpl {
     for (const debt of this.debtTokens.values()) {
       if (debt.key === from) debt.key = to;
     }
-    const lost = this.dropped.get(from);
-    if (lost !== undefined) {
+    const lost = this.undisclosedDrop(from);
+    if (this.dropped.has(from)) {
       this.dropped.delete(from);
+      this.disclosedUpTo.delete(from);
+      // Carry the UNDISCLOSED remainder only — what the source tab was already
+      // told is told, and re-importing it would warn the destination twice.
       this.dropped.set(to, (this.dropped.get(to) ?? 0) + lost);
       // The destination inherits the DEBT but not the source's report credit:
       // those reports went to the source tab's agent, not this one's.
@@ -1159,13 +1196,14 @@ export class AskAnswerJournalImpl {
     // belongs to — while the newer epoch keeps it from being armed for a push at
     // a tab id no agent answers to, exactly as for a replaced conversation.
     this.tabEpoch.set(key, (this.tabEpoch.get(key) ?? 0) + 1);
-    const owed = this.dropped.get(key) ?? 0;
+    const owed = this.undisclosedDrop(key);
     if (owed > 0) {
       logger.error(
         `[ask-answers] tab ${key.slice(0, 8)} is gone still owed a disclosure for ${owed} evicted answer(s) — it will never be told`,
       );
     }
     this.dropped.delete(key);
+    this.disclosedUpTo.delete(key);
     // Both halves together — see moveKey. A token left behind here would let a
     // later ack clear a debt for a tab that no longer exists.
     for (const [t, d] of [...this.debtTokens]) if (d.key === key) this.debtTokens.delete(t);
@@ -1276,6 +1314,7 @@ export class AskAnswerJournalImpl {
     this.tabEpoch.clear();
     this.entries.clear();
     this.dropped.clear();
+    this.disclosedUpTo.clear();
     this.debtTokens.clear();
     this.seq = 0;
     this.ticketSeq = 0;

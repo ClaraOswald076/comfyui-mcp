@@ -1337,6 +1337,56 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     expect(AskAnswers.droppedFor(TAB)).toBe(0);
   });
 
+  // Coordinator gate: a warning names a NUMBER, and only that number is settled
+  // when its turn ends. The token used to record only the tab, so an eviction
+  // that landed AFTER the warning was rendered — while its turn was still
+  // running — was wiped by an ack that never mentioned it.
+  it("an ack settles only what its warning showed, not evictions that landed after", () => {
+    AskAnswers.noteDroppedForTest(TAB, 2);
+    const tokens: string[] = [];
+    AskAnswers.setTurnAttacher((_key, token) => {
+      tokens.push(token);
+      return TURN;
+    });
+    expect(AskAnswers.reportDropped(TAB)).toBe(2); // the warning says "2"
+
+    // While that turn is still running, two MORE answers are evicted.
+    AskAnswers.noteDroppedForTest(TAB, 3);
+
+    // The turn completes. It showed 2, so it settles 2 — never the 3 it never saw.
+    AskAnswers.ack(tokens[0], { carrier: TURN });
+    expect(AskAnswers.droppedFor(TAB)).toBe(3);
+    expect(AskAnswers.hasOutstanding()).toBe(true);
+    expect(AskAnswers.outstandingDebt().some((x) => x.key === TAB && x.count === 3)).toBe(true);
+
+    // The next result reports the remainder, and settling THAT clears the tab.
+    expect(AskAnswers.reportDropped(TAB)).toBe(3);
+    AskAnswers.ack(tokens[1], { carrier: TURN });
+    expect(AskAnswers.droppedFor(TAB)).toBe(0);
+    expect(AskAnswers.outstandingDebt()).toHaveLength(0);
+  });
+
+  it("two results reporting the SAME debt settle it once, not twice", () => {
+    AskAnswers.noteDroppedForTest(TAB, 2);
+    const tokens: string[] = [];
+    AskAnswers.setTurnAttacher((_key, token) => {
+      tokens.push(token);
+      return TURN;
+    });
+    // Two separate results each carry the same warning ("2 answers dropped").
+    expect(AskAnswers.reportDropped(TAB)).toBe(2);
+    expect(AskAnswers.reportDropped(TAB)).toBe(2);
+    // Three more answers are evicted before either turn finishes.
+    AskAnswers.noteDroppedForTest(TAB, 3);
+
+    // Both turns complete. Between them they showed 2 — not 4 — so 3 remain
+    // owed. A count that added instead of watermarking would swallow two of them.
+    AskAnswers.ack(tokens[0], { carrier: TURN });
+    AskAnswers.ack(tokens[1], { carrier: TURN });
+    expect(AskAnswers.droppedFor(TAB)).toBe(3);
+    expect(AskAnswers.hasOutstanding()).toBe(true);
+  });
+
   it("never throws when the flusher does", () => {
     AskAnswers.setFlusher(() => {
       throw new Error("no agent");
