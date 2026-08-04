@@ -3926,10 +3926,13 @@ function askTimeoutResult(
   // still recognised here as being about the question at hand.
   // An answer that reached a caller and belongs to a DIFFERENT question is not
   // news and stays quiet.
+  // `recovery.others` has ALREADY been gated by the journal to what this
+  // conversation may see; this only narrows it further to what is NEWS.
   const orphans =
     recovery.status === "unattributed"
       ? recovery.others.filter((e) => !e.returned || e.fingerprint === fingerprint)
       : [];
+  const withheld = recovery.status === "unattributed" ? recovery.withheld : 0;
   if (orphans.length > 0) {
     text +=
       `\n\nHOWEVER — the user DID validate ${orphans.length} answer(s) on this tab that could NOT be ` +
@@ -3944,7 +3947,18 @@ function askTimeoutResult(
         )
         .join("\n");
   }
-  return fail(withDroppedText(tabId, text));
+  if (withheld > 0) {
+    // Said, never shown. These belong to a different browser tab on this
+    // recurring key, or to a conversation that has been replaced — rendering
+    // their chosen option here would leak exactly what the boundary contains, so
+    // the count is the disclosure and the text stays in the durable log.
+    text +=
+      `\n\nAlso: ${withheld} validated answer(s) on this tab belong to a DIFFERENT conversation ` +
+      `or browser tab (a new chat, a rewind, a provider switch, or another tab holding this ` +
+      `workflow). They are not shown here and are not yours to act on — if you need this ` +
+      `decision, ask again.`;
+  }
+  return fail(text);
 }
 
 /** The tab's undisclosed eviction debt, appended to whatever is being reported.
@@ -4028,64 +4042,97 @@ async function askUserWithGrace(
    *  ToolResult carried it — a hand-off, NOT proof it was received — so it is not
    *  ALSO pushed to the agent, while a re-ask can still recover it if the caller
    *  was already gone. */
-  const handBack = (reply: unknown, opts: { ridCorrelated: boolean }): ToolResult => {
-    const entry = AskAnswers.record(askId, reply, { tabId });
+  /**
+   * THE ONE EXIT for anything this handler learned from the journal.
+   *
+   * Every outlet that can put journal state in front of a live turn goes through
+   * here — the verbatim answer, the recovered answer, the timeout report, and the
+   * eviction-debt footnote. That is deliberate and structural: the last three
+   * defects on this path were each a NEW outlet (a rid-exempt hand-back, the
+   * `others` list, the debt footnote) that reached a live turn without passing
+   * the boundary check, and auditing outlets one at a time is what let each of
+   * them ship. A single exit means a new outlet cannot be added without either
+   * routing through this gate or deleting it.
+   *
+   * The gate is: an answer belonging to a REPLACED conversation never has its
+   * CONTENT rendered, and a result that is not the live conversation's own never
+   * carries that conversation's debt footnote.
+   */
+  const deliver = (
+    outcome:
+      | { kind: "answer"; entry: AskEntry; raw: unknown; ridCorrelated: boolean }
+      | { kind: "recovered"; entry: AskEntry }
+      | { kind: "timeout"; recovery: AskRecovery },
+  ): ToolResult => {
+    // RETIRED — the conversation that asked is gone. Say so WITHOUT the pick: the
+    // replacement turn reading the old choice is the leak, and a label on it is
+    // not a fence. The text itself stays in the journal and in the durable log,
+    // for the disclosure paths that belong to the conversation it was given to.
+    if (outcome.kind !== "timeout" && outcome.entry.retired === true) {
+      return fail(
+        `The user answered this question card, but the conversation that asked it has been ` +
+          `replaced since (a new chat, a rewind, a provider switch, or a different browser tab ` +
+          `taking over this workflow). Their choice is NOT shown here and is not yours to act ` +
+          `on — it was given to a conversation that no longer exists. Ask again if you still ` +
+          `need this decision.`,
+      );
+    }
+    if (outcome.kind === "timeout") {
+      // The debt footnote rides ONLY a result the LIVE conversation will receive.
+      // `reportDropped` selects the current occupant's debt and attaches its
+      // token to the turn running now, so putting it on a result that belongs to
+      // a conversation replaced mid-ask would let the live turn's ack settle a
+      // warning that conversation never saw — the debt path reaching a live turn
+      // through a helper, which is how it slipped the gate before.
+      const body = askTimeoutResult(tabId, fingerprint, outcome.recovery);
+      return AskAnswers.askBelongsToLiveConversation(askId)
+        ? withDroppedAnswerWarning(tabId, body)
+        : body;
+    }
+    if (outcome.kind === "recovered") {
+      const body =
+        outcome.entry.askId === askId
+          ? ok(outcome.entry.answer)
+          : recoveredAskResult(outcome.entry);
+      AskAnswers.markSurfaced(outcome.entry.token);
+      return withDroppedAnswerWarning(tabId, body);
+    }
     // A LATE answer is claimed from a buffer keyed by `ask_id` ALONE, so if that
     // id ever stood for two cards the buffer cannot say which one this reply came
     // from — and returning it here would hand card B the answer the user gave to
-    // card A. The journal already knows (it correlates and demotes a reused id);
-    // consult its verdict instead of trusting the id.
-    //
-    // The rid-correlated path is exempt and deliberately so: a reply that came
-    // back on THIS send's own request id is this card's reply by construction,
-    // whatever the ask id has meant elsewhere.
-    //
-    // A CONVERSATION BOUNDARY is a different exemption, and the rid does NOT
-    // cover it. A rid proves WHICH CARD replied; it says nothing about whose
-    // conversation is live now. If this ask was retired while its request was
-    // still pending — a New chat, a rewind, a provider switch, or a different
-    // browser tab taking the recurring key over — then returning the pick here
-    // hands it straight into the conversation the boundary exists to keep it out
-    // of, through the one channel the boundary does not police.
-    //
-    // Keyed on `retired` and not `recoverable`: the latter also covers AMBIGUITY,
-    // and an ambiguous answer that arrived on THIS send's own rid is
-    // unambiguously this card's. The rid exemption is right for that axis and
-    // wrong only for this one.
-    if (entry.retired === true) {
-      return fail(
-        withDroppedText(
-          tabId,
-          `The user answered this question card, but the conversation that asked it has been ` +
-            `replaced since (a new chat, a rewind, a provider switch, or a different browser tab ` +
-            `taking over this workflow). The answer is NOT being returned as yours, because the ` +
-            `question is no longer one this conversation asked.\n\n` +
-            `WHAT THE USER PICKED (for the REPLACED conversation): ${entry.answer}\n\n` +
-            `Ask again if you still need this decision.`,
-        ),
-      );
-    }
-    if (!opts.ridCorrelated && entry.correlation.status !== "matched") {
+    // card A. The rid-correlated path is exempt and deliberately so: a reply that
+    // came back on THIS send's own request id is this card's reply by
+    // construction, whatever the ask id has meant elsewhere.
+    if (!outcome.ridCorrelated && outcome.entry.correlation.status !== "matched") {
       // NOT marked returned: nobody has been given this as an answer, so it stays
       // an orphan — pushed and disclosed — rather than quietly counting as
-      // delivered.
+      // delivered. Its own content IS shown: it is not retired, so it belongs to
+      // this conversation; only its QUESTION is undetermined.
       return fail(
         withDroppedText(
           tabId,
           `A validated answer came back for this question card, but its ask id no longer identifies ` +
             `a single card, so it CANNOT be attributed to the question you just asked — it may be the ` +
             `user's answer to a different card. It is NOT being returned as your answer.\n\n` +
-            `WHAT THE USER PICKED (question UNDETERMINED): ${entry.answer}\n\n` +
+            `WHAT THE USER PICKED (question UNDETERMINED): ${outcome.entry.answer}\n\n` +
             `Ask again if you still need this decision.`,
         ),
       );
     }
-    AskAnswers.markReturned(entry.token);
+    AskAnswers.markReturned(outcome.entry.token);
     // Even a clean answer carries out any eviction debt this tab is still owed —
     // an answer the journal admits it dropped must not go unmentioned merely
     // because the NEXT ask happened to succeed.
-    return withDroppedAnswerWarning(tabId, ok(reply));
+    return withDroppedAnswerWarning(tabId, ok(outcome.raw));
   };
+
+  const handBack = (reply: unknown, opts: { ridCorrelated: boolean }): ToolResult =>
+    deliver({
+      kind: "answer",
+      entry: AskAnswers.record(askId, reply, { tabId }),
+      raw: reply,
+      ridCorrelated: opts.ridCorrelated,
+    });
   try {
     const reply = await ctx.bridge.send(cmd as unknown as { cmd: string }, {
       tabId,
@@ -4101,22 +4148,9 @@ async function askUserWithGrace(
     // last poll) or from an earlier ask whose tool call died before it could
     // return one. Matched on the frozen fingerprint only.
     const recovery = AskAnswers.recover(tabId, fingerprint);
-    if (recovery.status === "recovered") {
-      const entry = recovery.entry;
-      // Render BEFORE marking: markSurfaced stamps `replayHint`, and the wording
-      // must describe the entry as it was when we recovered it, not as this very
-      // call has just left it.
-      //
-      // Our OWN card's answer that merely lost the poll race is not a "recovered
-      // earlier answer" — it is this ask's answer, and reads as one.
-      const body =
-        entry.askId === askId ? ok(entry.answer) : recoveredAskResult(entry);
-      // Marked handed-over, NOT deleted: this ToolResult can be abandoned too,
-      // and destroying the journal's copy here would recreate #486 one level up.
-      AskAnswers.markSurfaced(entry.token);
-      return withDroppedAnswerWarning(tabId, body);
-    }
-    return askTimeoutResult(tabId, fingerprint, recovery);
+    return recovery.status === "recovered"
+      ? deliver({ kind: "recovered", entry: recovery.entry })
+      : deliver({ kind: "timeout", recovery });
   } finally {
     // This handler is gone. Anything already journaled for this ask that we did
     // NOT hand back is now provably orphaned — arm it for the durable push so

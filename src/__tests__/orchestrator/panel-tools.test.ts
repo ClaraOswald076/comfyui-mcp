@@ -4370,8 +4370,12 @@ describe("panel_ask keeps a validated answer across a tool timeout (#486)", () =
     } as unknown as PanelToolCtx);
     expect(res.isError).toBe(true);
     expect(askText(res)).not.toContain("RECOVERED ANSWER");
-    // Still reported as unattributed rather than swallowed.
-    expect(askText(res)).toContain("dpmpp_2m");
+    // Reported as a COUNT, never as content: the pick belongs to the replaced
+    // conversation, and showing it here is the leak the boundary exists to stop.
+    expect(askText(res)).not.toContain("dpmpp_2m");
+    expect(askText(res)).toMatch(/belong to a DIFFERENT conversation/i);
+    // …and it is still on file, not swallowed.
+    expect(AskAnswers.entriesFor(TAB).some((e) => e.answer === "dpmpp_2m")).toBe(true);
   });
 
   // codex round 9, P0: the LATE answer is claimed from a bridge buffer keyed by
@@ -4436,11 +4440,72 @@ describe("panel_ask keeps a validated answer across a tool timeout (#486)", () =
     expect(askId).not.toBeNull();
     expect(res.isError).toBe(true);
     expect(askText(res)).toMatch(/conversation that asked it has been replaced/i);
-    // Reported, never swallowed — the pick is quoted, attributed to the
-    // conversation it was actually given to.
-    expect(askText(res)).toContain("dpmpp_2m");
-    // …and it was not counted as delivered to anyone.
+    // The pick is NOT shown. Labelling it "for the replaced conversation" does
+    // not stop the replacement turn from reading it — the tool result is the one
+    // channel a boundary never policed, and a label is not a fence.
+    expect(askText(res)).not.toContain("dpmpp_2m");
+    // …and it was not counted as delivered to anyone, nor swallowed.
     expect(AskAnswers.entriesFor(TAB)[0].returned).toBe(false);
+    expect(AskAnswers.entriesFor(TAB)[0].answer).toBe("dpmpp_2m");
+  });
+
+  // Gate P0-2: the timeout report rendered every same-key entry's question AND
+  // answer verbatim. `others` never went through the boundary gate, because
+  // nothing about a disclosure looked like a hand-off — so tab A's chosen option
+  // was printed into tab B's result.
+  it("a timed-out ask never prints another conversation's chosen option", async () => {
+    await askThenAnswerLate(SAMPLER, "dpmpp_2m");
+    AskAnswers.closeAsks(TAB); // the conversation that asked is replaced
+
+    const res = await defByName("panel_ask").handler(SCHEDULER as Record<string, unknown>, {
+      bridge: timingOutBridge(),
+      tabId: TAB,
+    } as unknown as PanelToolCtx);
+
+    expect(res.isError).toBe(true);
+    // The pick is NOT rendered…
+    expect(askText(res)).not.toContain("dpmpp_2m");
+    // …but the fact that something was answered IS disclosed.
+    expect(askText(res)).toMatch(/belong to a DIFFERENT conversation/i);
+    expect(AskAnswers.entriesFor(TAB).some((e) => e.answer === "dpmpp_2m")).toBe(true);
+  });
+
+  // Gate P0-3: the debt footnote is added by a helper, and the helper reported
+  // the CURRENT occupant's debt and attached its token to the CURRENT turn — so a
+  // result belonging to a conversation replaced mid-ask could carry, and have
+  // settled, a warning that conversation never saw.
+  it("a result from a replaced conversation carries no debt footnote", async () => {
+    const bridge = {
+      send: async (cmd: Record<string, unknown>, opts?: { timeoutMs?: number }) => {
+        void cmd;
+        // The boundary lands while this ask is still in flight (its own debt is
+        // surfaced and retired there)…
+        AskAnswers.closeAsks(TAB);
+        // …and the REPLACEMENT conversation then loses answers of its own. That
+        // debt is owed to it, not to the ask that is about to unwind here.
+        AskAnswers.noteDroppedForTest(TAB, 2);
+        throw REPLY_TIMEOUT_ERR("ask_user", opts?.timeoutMs ?? 0);
+      },
+      canReach: () => true,
+      isHeadless: () => false,
+      resolveActiveTabId: () => TAB,
+      takeLateAskReply: () => undefined,
+      push: () => 1,
+    } as unknown as PanelToolCtx["bridge"];
+
+    const res = await defByName("panel_ask").handler(SAMPLER as Record<string, unknown>, {
+      bridge,
+      tabId: TAB,
+    } as unknown as PanelToolCtx);
+
+    expect(res.isError).toBe(true);
+    // No "N further validated answer(s) were dropped" on a result that belongs to
+    // a conversation that no longer exists — the live turn's ack would otherwise
+    // settle a warning nobody was shown.
+    expect(askText(res)).not.toMatch(/were dropped before they/i);
+    // …and the replacement conversation is still owed it, undisturbed.
+    expect(AskAnswers.droppedFor(TAB)).toBe(2);
+    expect(AskAnswers.reportDropped(TAB)).toBe(2);
   });
 
   it("holds the WHOLE handler under one wall-clock ceiling anchored at entry", () => {

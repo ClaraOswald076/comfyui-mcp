@@ -396,10 +396,21 @@ export type AskRecovery =
   | { status: "none" }
   /**
    * Answers exist for this tab but NONE of them is provably an answer to THIS
-   * question (a different question, or too old to present as fresh). They are
-   * handed back so the caller can disclose them, quoted with their own question.
+   * question (a different question, or too old to present as fresh).
+   *
+   * `others` are the ones this conversation MAY be shown — same occupant, not
+   * retired — quoted with their own question so they cannot be misread as an
+   * answer to anything else.
+   *
+   * `withheld` counts the ones it may NOT: they belong to a different browser tab
+   * on this recurring key, or to a conversation that has been replaced. Their
+   * CONTENT is deliberately not returned — rendering a departed tab's chosen
+   * option into this conversation's result is the disclosure leaking the very
+   * thing the boundary exists to contain. The count still says something was
+   * answered, which is what keeps this a disclosure rather than a silence; the
+   * text itself is in the durable log.
    */
-  | { status: "unattributed"; others: AskEntry[] };
+  | { status: "unattributed"; others: AskEntry[]; withheld: number };
 
 export class AskAnswerJournalImpl {
   /** ask id → ticket. Ask ids are UUIDs, so exact equality is proof of identity. */
@@ -622,6 +633,21 @@ export class AskAnswerJournalImpl {
     this.trimTickets();
   }
 
+  /**
+   * Is the conversation that opened this ask STILL the one on the tab?
+   *
+   * The debt footnote rides whatever result is going back, and `reportDropped`
+   * attaches its token to the turn that is live NOW. So a result belonging to a
+   * conversation that has since been replaced must not carry it: the live turn's
+   * ack would settle a warning that conversation never saw. Unknown ticket → true,
+   * because a caller with no ticket has nothing to have been replaced.
+   */
+  askBelongsToLiveConversation(askId: string): boolean {
+    const ticket = this.tickets.get(askId);
+    if (!ticket) return true;
+    return ticket.epoch === (this.tabEpoch.get(ticket.tabId) ?? 0);
+  }
+
   /** Does this journal know the ask id — i.e. is a late answer for it one of
    *  OURS? The bridge's late-answer sink is fed by every `ask_user` card
    *  (confirm/consent/secret gates included) and only `panel_ask` answers belong
@@ -840,8 +866,14 @@ export class AskAnswerJournalImpl {
       // uselessly — an answer the current conversation was never shown. The
       // conversation boundary already marked this entry unrecoverable; it makes it
       // unackable too, so the answer stays honestly unproven.
+      // Gated on the BOUNDARY axis only. An AMBIGUOUS answer (an ask id that
+      // stopped identifying one card) is still handed to a caller, so it must
+      // still be ackable by the turn that carried it — refusing the carrier there
+      // left a delivered answer permanently unconfirmed, i.e. surfacing later as
+      // a loss that did not happen. Only a RETIRED answer, which no live turn may
+      // receive at all, gets no carrier.
       entry.carrier =
-        entry.recoverable === false ? null : (this.attachTurn?.(entry.key, token) ?? null);
+        entry.retired === true ? null : (this.attachTurn?.(entry.key, token) ?? null);
       // It reached A caller. Do not ALSO push it as an orphan; a re-ask can
       // still recover it if that caller was already dead.
       //
@@ -889,7 +921,11 @@ export class AskAnswerJournalImpl {
       )
       .sort((a, b) => b.answeredAt - a.answeredAt);
     if (eligible.length > 0) return { status: "recovered", entry: eligible[0] };
-    return { status: "unattributed", others: mine };
+    // SPLIT by what this conversation is allowed to see. `others` goes through
+    // exactly the same gate as every other outlet — nothing about a disclosure
+    // makes it exempt just because it is not a hand-off.
+    const others = mine.filter((e) => this.mayReachLiveTurn(e));
+    return { status: "unattributed", others, withheld: mine.length - others.length };
   }
 
   /**
@@ -1015,18 +1051,24 @@ export class AskAnswerJournalImpl {
     why: "disconnected" | "its conversation was replaced",
   ): void {
     const slot = tabIncarnationSlot(key, incarnation);
-    let owed = this.undisclosedDrop(slot);
-    for (const entry of this.entries.values()) {
-      if (entry.key !== key || entry.incarnation !== incarnation) continue;
-      if (!entry.disclose) continue;
-      owed += entry.disclose;
-      delete entry.disclose;
-    }
+    // COUNT FIRST, WITHOUT MUTATING. An earlier draft cleared each carrier as it
+    // totalled them, so the only consolidated copy of the debt was gone BEFORE
+    // the report — and a logger that throws would take the whole disclosure with
+    // it, leaving nothing for a later ack to re-home. Clear-then-report is not
+    // report-then-clear, and this helper exists precisely so that fixing a
+    // misattribution cannot create a silent loss.
+    const carriers = [...this.entries.values()].filter(
+      (e) => e.key === key && e.incarnation === incarnation && (e.disclose ?? 0) > 0,
+    );
+    const owed = this.undisclosedDrop(slot) + carriers.reduce((n, e) => n + e.disclose!, 0);
     if (owed > 0) {
+      // If this throws, NOTHING below has run: the debt is still whole and still
+      // owed, and the next retirement (or the next report) will surface it.
       logger.error(
         `[ask-answers] tab ${key.slice(0, 8)} ${why} still owed a disclosure for ${owed} validated answer(s) whose content was already dropped — recording it here, as there is no longer anywhere to deliver it; treat those answers as UNDETERMINED`,
       );
     }
+    for (const entry of carriers) delete entry.disclose;
     this.dropped.delete(slot);
     this.disclosedUpTo.delete(slot);
     for (const [t, x] of [...this.debtTokens]) if (x.key === slot) this.debtTokens.delete(t);

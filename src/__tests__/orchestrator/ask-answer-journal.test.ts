@@ -234,10 +234,15 @@ describe("ask-answer journal — cross-question misattribution guard (#486)", ()
     const rec = AskAnswers.recover(TAB, askFingerprint(SAMPLER));
     expect(rec.status).toBe("unattributed");
     if (rec.status !== "unattributed") return;
-    // Still reported, still quoted with its question — downgraded, not deleted.
-    expect(rec.others[0].answer).toBe("dpmpp_2m");
-    expect(rec.others[0].question).toBe(SAMPLER.question);
-    expect(rec.others[0].correlation.status).toBe("foreign");
+    // WITHHELD, not shown: its content belongs to a conversation/tab that is no
+    // longer here, and rendering the chosen option into this conversation's
+    // result is the leak the boundary exists to stop. The COUNT is the
+    // disclosure; the text stays journaled and in the durable log.
+    expect(rec.withheld).toBeGreaterThan(0);
+    expect(rec.others.some((e) => e.answer === "dpmpp_2m")).toBe(false);
+    expect(AskAnswers.entriesFor(TAB).some((e) => e.answer === "dpmpp_2m")).toBe(true);
+    expect(AskAnswers.entriesFor(TAB)[0].question).toBe(SAMPLER.question);
+    expect(AskAnswers.entriesFor(TAB)[0].correlation.status).toBe("foreign");
   });
 
   it("an answer whose ask id this session never opened is UNATTRIBUTED, never matched", () => {
@@ -592,6 +597,10 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     const rec = AskAnswers.recover(TAB, askFingerprint(SAMPLER));
     expect(rec.status).toBe("unattributed");
     if (rec.status !== "unattributed") return;
+    // This one is NOT retired and NOT another tab's — it is this conversation's
+    // own earlier answer, merely too old to present as a fresh decision. So it IS
+    // shown, with its own question attached; nothing is withheld.
+    expect(rec.withheld).toBe(0);
     expect(rec.others.some((e) => e.answer === "dpmpp_2m")).toBe(true);
   });
 
@@ -617,7 +626,13 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     const rec = AskAnswers.recover(TAB, askFingerprint(SAMPLER));
     expect(rec.status).toBe("unattributed");
     if (rec.status !== "unattributed") return;
-    expect(rec.others.some((e) => e.answer === "dpmpp_2m")).toBe(true);
+    // WITHHELD, not shown: its content belongs to a conversation/tab that is no
+    // longer here, and rendering the chosen option into this conversation's
+    // result is the leak the boundary exists to stop. The COUNT is the
+    // disclosure; the text stays journaled and in the durable log.
+    expect(rec.withheld).toBeGreaterThan(0);
+    expect(rec.others.some((e) => e.answer === "dpmpp_2m")).toBe(false);
+    expect(AskAnswers.entriesFor(TAB).some((e) => e.answer === "dpmpp_2m")).toBe(true);
   });
 
   it("an already-journaled answer stops being pushed when its conversation is replaced", () => {
@@ -878,7 +893,13 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     const rec = AskAnswers.recover(TAB, askFingerprint(SAMPLER));
     expect(rec.status).toBe("unattributed");
     if (rec.status !== "unattributed") return;
-    expect(rec.others.some((e) => e.answer === "dpmpp_2m")).toBe(true);
+    // WITHHELD, not shown: its content belongs to a conversation/tab that is no
+    // longer here, and rendering the chosen option into this conversation's
+    // result is the leak the boundary exists to stop. The COUNT is the
+    // disclosure; the text stays journaled and in the durable log.
+    expect(rec.withheld).toBeGreaterThan(0);
+    expect(rec.others.some((e) => e.answer === "dpmpp_2m")).toBe(false);
+    expect(AskAnswers.entriesFor(TAB).some((e) => e.answer === "dpmpp_2m")).toBe(true);
   });
 
   it("a revoked answer keeps the fingerprint that makes it disclosable", () => {
@@ -1464,7 +1485,13 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     expect(rec.status).toBe("unattributed"); // …and B gets nothing of A's
     if (rec.status !== "unattributed") return;
     // Still reported, quoted with its own question — held, never swallowed.
-    expect(rec.others.some((e) => e.answer === "dpmpp_2m")).toBe(true);
+    // WITHHELD, not shown: its content belongs to a conversation/tab that is no
+    // longer here, and rendering the chosen option into this conversation's
+    // result is the leak the boundary exists to stop. The COUNT is the
+    // disclosure; the text stays journaled and in the durable log.
+    expect(rec.withheld).toBeGreaterThan(0);
+    expect(rec.others.some((e) => e.answer === "dpmpp_2m")).toBe(false);
+    expect(AskAnswers.entriesFor(TAB).some((e) => e.answer === "dpmpp_2m")).toBe(true);
     // …and never announced into B's conversation either.
     expect(AskAnswers.pending(TAB)).toHaveLength(0);
 
@@ -1494,7 +1521,13 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     const rec = AskAnswers.recover(TAB, askFingerprint(SAMPLER));
     expect(rec.status).toBe("unattributed");
     if (rec.status !== "unattributed") return;
-    expect(rec.others.some((e) => e.answer === "dpmpp_2m")).toBe(true);
+    // WITHHELD, not shown: its content belongs to a conversation/tab that is no
+    // longer here, and rendering the chosen option into this conversation's
+    // result is the leak the boundary exists to stop. The COUNT is the
+    // disclosure; the text stays journaled and in the durable log.
+    expect(rec.withheld).toBeGreaterThan(0);
+    expect(rec.others.some((e) => e.answer === "dpmpp_2m")).toBe(false);
+    expect(AskAnswers.entriesFor(TAB).some((e) => e.answer === "dpmpp_2m")).toBe(true);
     expect(AskAnswers.pending(TAB)).toHaveLength(0);
     AskAnswers.setIncarnationResolver(() => OCCUPANT);
   });
@@ -1632,11 +1665,14 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     expect(AskAnswers.entriesFor(TAB)[0].delivery).toBe("none");
     expect(AskAnswers.pending(TAB)).toHaveLength(0);
     expect(AskAnswers.hasOutstanding()).toBe(false);
-    // Nothing was swallowed: it is still journaled, still disclosed, still named.
+    // Nothing was swallowed — but nothing is SHOWN to the replacement either.
+    // The count is the disclosure; the text stays journaled and in the log.
     const rec = AskAnswers.recover(TAB, askFingerprint(SAMPLER));
     expect(rec.status).toBe("unattributed");
     if (rec.status !== "unattributed") return;
-    expect(rec.others.some((e) => e.answer === "dpmpp_2m")).toBe(true);
+    expect(rec.withheld).toBeGreaterThan(0);
+    expect(rec.others.some((e) => e.answer === "dpmpp_2m")).toBe(false);
+    expect(AskAnswers.entriesFor(TAB).some((e) => e.answer === "dpmpp_2m")).toBe(true);
     expect(AskAnswers.allOutstanding().map((e) => e.answer)).toContain("dpmpp_2m");
   });
 
@@ -1705,6 +1741,82 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     expect(carrier!.disclose ?? 0).toBe(0);
     expect(AskAnswers.droppedFor(TAB)).toBe(0);
     expect(AskAnswers.reportDropped(TAB)).toBe(0);
+  });
+
+  // Gate P0-4: the retirement must REPORT before it CLEARS. An earlier draft
+  // cleared each carrier as it totalled them, so a logger that throws took the
+  // only consolidated copy of the debt with it — fixing a misattribution by
+  // creating a silent loss, which is the trade this PR refuses everywhere.
+  it("a retirement whose report THROWS keeps the debt whole", () => {
+    for (let i = 0; i < 60; i += 1) {
+      openAndAnswer(`pa-t-${i}`, { question: `T${i}?`, options: [{ label: "x" }, { label: "y" }] }, `T${i}`);
+    }
+    const owed = AskAnswers.droppedFor(TAB);
+    expect(owed).toBeGreaterThan(0);
+
+    const boom = vi.spyOn(logger, "error").mockImplementation(() => {
+      throw new Error("log sink is down");
+    });
+    expect(() => AskAnswers.closeAsks(TAB)).toThrow(/log sink is down/);
+    boom.mockRestore();
+
+    // NOTHING after the report ran, so the debt is still whole and still owed.
+    expect(AskAnswers.droppedFor(TAB)).toBe(owed);
+
+    // …and a later retirement, with a working sink, surfaces all of it.
+    const errors: string[] = [];
+    const spy = vi.spyOn(logger, "error").mockImplementation((msg: unknown) => {
+      errors.push(String(msg));
+    });
+    AskAnswers.closeAsks(TAB);
+    spy.mockRestore();
+    expect(errors.some((m) => m.includes(`${owed} validated answer(s)`))).toBe(true);
+    expect(AskAnswers.droppedFor(TAB)).toBe(0);
+  });
+
+  // P1: the two flags disagreed. The hand-back permits an AMBIGUOUS answer
+  // (checking only `retired`), while the carrier attach refused one (checking
+  // `recoverable`) — so a delivered answer could never be acked and surfaced
+  // later as an unconfirmed loss that had not happened.
+  it("an AMBIGUOUS answer is still ackable by the turn that carried it", () => {
+    AskAnswers.openAsk("pa-amb", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SAMPLER),
+      question: SAMPLER.question,
+    });
+    AskAnswers.closeAsk("pa-amb");
+    const first = AskAnswers.record("pa-amb", "euler", { tabId: TAB });
+    // A second, different answer under the same id makes both ambiguous.
+    const second = AskAnswers.record("pa-amb", "dpmpp_2m", { tabId: TAB });
+    expect(second.recoverable).toBe(false);
+    expect(second.retired).toBeUndefined();
+
+    AskAnswers.markReturned(second.token);
+    // Ambiguity is about WHICH QUESTION, not which conversation — so the turn
+    // that carried it can still prove receipt.
+    expect(second.carrier).toBe(TURN);
+    AskAnswers.ack(second.token, { carrier: TURN });
+    expect(second.acked).toBe(true);
+    // …and it stops being reported as an unconfirmed loss.
+    expect(AskAnswers.allOutstanding().some((e) => e.token === second.token)).toBe(false);
+    void first;
+  });
+
+  // A RETIRED answer, by contrast, gets no carrier at all: no live turn may
+  // receive it, so nothing may certify it either.
+  it("a RETIRED answer gets no carrier and can never be acked", () => {
+    AskAnswers.openAsk("pa-ret", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SAMPLER),
+      question: SAMPLER.question,
+    });
+    AskAnswers.closeAsk("pa-ret");
+    const entry = AskAnswers.record("pa-ret", "dpmpp_2m", { tabId: TAB });
+    AskAnswers.closeAsks(TAB);
+    AskAnswers.markReturned(entry.token);
+    expect(entry.carrier).toBeNull();
+    AskAnswers.ack(entry.token, { carrier: TURN });
+    expect(entry.acked).toBeUndefined();
   });
 
   it("never throws when the flusher does", () => {
