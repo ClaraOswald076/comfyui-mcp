@@ -14,7 +14,10 @@
 //   * no answer promises a respawn that nothing reported;
 //   * the raw secret never appears in the tool result.
 
-import { describe, expect, it, beforeEach, vi } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import type { SecretSaveReceipt } from "../../services/panel-secrets.js";
 
 const setComfyuiSecretMock = vi.fn();
@@ -79,6 +82,16 @@ const receipt = (over: Partial<SecretSaveReceipt> = {}): SecretSaveReceipt => ({
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // The setters are mocked here, so nothing should reach the store — but point
+  // it at a temp path regardless. A secret test that can write to the real
+  // ~/.comfyui-mcp/.env is one refactor away from destroying it.
+  process.env.COMFYUI_MCP_ENV_FILE = join(tmpdir(), `env-${randomUUID()}.env`);
+  process.env.COMFYUI_MCP_PANEL_SECRETS = join(tmpdir(), `secrets-${randomUUID()}.json`);
+});
+
+afterEach(() => {
+  delete process.env.COMFYUI_MCP_ENV_FILE;
+  delete process.env.COMFYUI_MCP_PANEL_SECRETS;
 });
 
 describe("panel_request_secret cannot report a secret the tools cannot see (#826)", () => {
@@ -98,6 +111,52 @@ describe("panel_request_secret cannot report a secret the tools cannot see (#826
     expect(res.isError).toBeFalsy();
     expect(textOf(res)).toContain("UNKNOWN");
     expect(textOf(res)).not.toContain("verified by reading the file back");
+  });
+
+  it("does not call an UNVERIFIABLE provider-key save saved-and-enabled", async () => {
+    // The three-valued verdict must be handled at EVERY consumer. Handling only
+    // "no" left "unknown" rendering as the key was saved and the provider is
+    // enabled — a definite configured state asserted from a failed read-back.
+    setAgentSecretMock.mockReturnValue(
+      receipt({ key: "OPENROUTER_API_KEY", persisted: "unknown" }),
+    );
+    const res = await callRequestSecret({
+      mcp_server: "orchestrator",
+      key: "OPENROUTER_API_KEY",
+    });
+    const text = textOf(res);
+    expect(text).toContain("UNKNOWN");
+    expect(text).not.toMatch(/is enabled now/);
+    expect(text).not.toMatch(/pick it in the provider list/);
+    expect(text).toContain("Do not treat the provider as configured");
+  });
+
+  it("says a save is SHADOWED when a real env var of the same name outranks the store", async () => {
+    // Storing it is not the same as it being in use. Saying "saved" without this
+    // reports a configured state the tools do not use — and the remedy (unset
+    // the environment variable) is actionable from where the caller is.
+    setComfyuiSecretMock.mockReturnValue(receipt({ shadowedByEnv: true }));
+    const res = await callRequestSecret();
+    const text = textOf(res);
+    expect(text).toContain("NOT the value in use");
+    expect(text).toContain("takes precedence over the store");
+    expect(text).toContain("unset CIVITAI_API_TOKEN");
+    // ...and it must not simultaneously claim the tools picked it up.
+    expect(text).not.toContain("Retry the action that needed this credential now");
+    expect(text).not.toContain("re-read that file each time");
+  });
+
+  it("says a provider-key save is SHADOWED too, instead of 'enabled now'", async () => {
+    setAgentSecretMock.mockReturnValue(
+      receipt({ key: "OPENROUTER_API_KEY", shadowedByEnv: true }),
+    );
+    const res = await callRequestSecret({
+      mcp_server: "orchestrator",
+      key: "OPENROUTER_API_KEY",
+    });
+    const text = textOf(res);
+    expect(text).toContain("NOT the value in use");
+    expect(text).not.toMatch(/is enabled now/);
   });
 
   it("never promises the old unconditional respawn", async () => {

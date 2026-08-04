@@ -219,9 +219,28 @@ export function secretNotPersisted(receipt: SecretSaveReceipt): Error {
   );
 }
 
+/**
+ * The one thing that outranks everything else in the ack: the value was stored,
+ * but a real environment variable of the same name outranks the store, so the
+ * readers use THAT and not what was just saved. Reporting "saved" without this
+ * is a configured state the tools do not use. Returns null when not shadowed.
+ */
+export function shadowedNote(receipt: SecretSaveReceipt): string | null {
+  if (!receipt.shadowedByEnv) return null;
+  return (
+    `⚠️ "${receipt.key}" was stored in ${receipt.path}, but it is NOT the value in use: a real environment variable named ${receipt.key} is set outside this app and takes precedence over the store. ` +
+    `Nothing changed for the tools. To make the value you just supplied take effect, unset ${receipt.key} in the environment this app was started from and restart it — or leave the environment variable as the source of truth. ` +
+    `(The value itself is never shown or logged.)`
+  );
+}
+
 /** The ack for a comfyui tool secret: what was verified, how the running tools
  *  pick it up, and the ACTUAL respawn disposition — never a promise. */
 export function describeComfyuiSecretSave(receipt: SecretSaveReceipt): string {
+  // A shadowed save has no live pickup and no useful respawn story — the readers
+  // are using the environment variable regardless. Lead with that and stop.
+  const shadowed = shadowedNote(receipt);
+  if (shadowed) return shadowed;
   const parts: string[] = [];
   parts.push(
     receipt.persisted === "yes"
@@ -6747,16 +6766,28 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           // and lists its models. NOT injected into the comfyui child.
           if (server.toLowerCase() === "orchestrator" || isAllowedAgentSecretKey(args.key as string)) {
             const receipt = setAgentSecret(args.key as string, secret);
-            if (receipt.persisted === "no") return fail(secretNotPersisted(receipt));
-            // Provider keys are read IN this process, so the save takes effect
-            // immediately — but say which provider the KEY enables rather than
-            // naming OpenRouter for every key (GLM/Kimi/Moonshot/Custom all land
-            // here too, and being told the wrong provider was enabled is the same
-            // misdirection as being told a respawn happened).
-            return ok(
-              `🔒 ${receipt.key} saved to ${receipt.path}${receipt.persisted === "unknown" ? " (the file could not be re-read to confirm — check it if the provider still reads as unconfigured)" : " (confirmed by reading the file back; the value is never shown or logged)"}. ` +
-                `The orchestrator reads provider keys in-process, so the provider this key belongs to is enabled now — pick it in the provider list.`,
-            );
+            // EXHAUSTIVE on the three-valued verdict. Handling only "no" left
+            // "unknown" rendering as saved-and-enabled — a definite configured
+            // state asserted from a failed read-back, which is the #826 defect
+            // in the very vocabulary introduced to prevent it (coordinator
+            // finding). Provider keys are read IN this process, so a PROVEN save
+            // does take effect immediately — but say which provider the KEY
+            // enables rather than naming OpenRouter for every key.
+            switch (receipt.persisted) {
+              case "no":
+                return fail(secretNotPersisted(receipt));
+              case "unknown":
+                return ok(
+                  `⚠️ ${receipt.key} was written to ${receipt.path}, but the file could not be re-read to confirm it — whether it is saved is UNKNOWN. ` +
+                    `Do not treat the provider as configured: check ${receipt.path} carries the key, and set it again if the provider still reads as unconfigured.`,
+                );
+              case "yes":
+                return ok(
+                  shadowedNote(receipt) ??
+                    `🔒 ${receipt.key} saved to ${receipt.path} (confirmed by reading the file back; the value is never shown or logged). ` +
+                      `The orchestrator reads provider keys in-process, so the provider this key belongs to is enabled now — pick it in the provider list.`,
+                );
+            }
           }
           // The BUILT-IN comfyui server is NOT in the user's ~/.claude.json — the
           // orchestrator spawns it with its own env. Route its secrets to the

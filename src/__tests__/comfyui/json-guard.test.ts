@@ -119,6 +119,51 @@ describe("classifyNonJson names what answered instead of ComfyUI (#828)", () => 
     expect(d.message).toContain("COMFYUI_AUTH_TOKEN");
   });
 
+  it("diagnoses an nginx 502 whose FOOTER links to a login page as the proxy failure", () => {
+    // A bare "login" anywhere in the body used to make this a body-CONFIRMED
+    // auth gate, sending the user to configure gateway credentials instead of
+    // diagnosing the proxy failure that actually happened.
+    const d = classifyNonJson({
+      url: URL_UNDER_TEST,
+      status: 502,
+      contentType: "text/html",
+      body: '<html><head><title>502 Bad Gateway</title></head><body><center>nginx</center><footer><a href="/login">login</a> | <a href="/help">help</a></footer></body></html>',
+    });
+    expect(d.kind).toBe("proxy-error");
+    expect(d.message).toContain("its OWN error page");
+    expect(d.message).not.toContain("SIGN-IN PAGE");
+    expect(d.message).not.toContain("belongs to that GATEWAY");
+  });
+
+  it("does not treat a stray 'authenticate' in prose as a sign-in page", () => {
+    const d = classifyNonJson({
+      url: URL_UNDER_TEST,
+      status: 200,
+      contentType: "text/html",
+      body: "<html><body><p>Use the API to authenticate your requests.</p></body></html>",
+    });
+    expect(d.kind).toBe("html-page"); // NOT "login"
+  });
+
+  it("still confirms a sign-in page from a form ACTION or a title", () => {
+    const byAction = classifyNonJson({
+      url: URL_UNDER_TEST,
+      status: 200,
+      contentType: "text/html",
+      body: '<html><form action="/oauth2/start" method="post"></form></html>',
+    });
+    expect(byAction.kind).toBe("login");
+    expect(byAction.message).toContain("SIGN-IN PAGE");
+
+    const byTitle = classifyNonJson({
+      url: URL_UNDER_TEST,
+      status: 200,
+      contentType: "text/html",
+      body: "<html><head><title>Sign in to continue</title></head></html>",
+    });
+    expect(byTitle.kind).toBe("login");
+  });
+
   it("does not assert a proxy from a 502 STATUS alone", () => {
     const d = classifyNonJson({
       url: URL_UNDER_TEST,
@@ -188,11 +233,14 @@ describe("classifyNonJson names what answered instead of ComfyUI (#828)", () => 
   });
 
   it("truncates a huge body instead of pasting a whole page into the message", () => {
+    // Ordinary markup, repeated — NOT one giant opaque run, which the
+    // secret-shape scrubber would (correctly) collapse before truncation ever
+    // came into it.
     const d = classifyNonJson({
       url: URL_UNDER_TEST,
       status: 200,
       contentType: "text/html",
-      body: `<!DOCTYPE html>${"x".repeat(5000)}`,
+      body: `<!DOCTYPE html>${"<p>hello there</p>".repeat(500)}`,
     });
     expect(d.bodyPrefix.length).toBeLessThanOrEqual(161);
     expect(d.bodyPrefix.endsWith("…")).toBe(true);
@@ -277,6 +325,94 @@ describe("the diagnostic body prefix never carries our own credential back", () 
     } finally {
       authHeaders.value = {};
     }
+  });
+
+  it("redacts a URL-ENCODED reflected token — the encoding a blocklist misses", () => {
+    // THE leak. `Authorization: Bearer abc/def…` reflected as `?token=abc%2Fdef…`
+    // matches neither the header value nor the bare token, so a known-value
+    // blocklist prints a recoverable credential in the diagnostic prefix.
+    const token = "abc/def+ghi=jkl/mno";
+    authHeaders.value = { Authorization: `Bearer ${token}` };
+    try {
+      const encoded = encodeURIComponent(token); // abc%2Fdef%2Bghi%3Djkl%2Fmno
+      const d = classifyNonJson({
+        url: URL_UNDER_TEST,
+        status: 401,
+        contentType: "text/html",
+        body: `<html><body>rejected: /verify?token=${encoded}</body></html>`,
+      });
+      expect(d.bodyPrefix).not.toContain(encoded);
+      expect(d.message).not.toContain(encoded);
+      // ...and no recoverable fragment of it either.
+      expect(d.message).not.toContain("abc%2Fdef");
+      expect(d.message).not.toContain(token);
+      expect(d.bodyPrefix).toContain("«redacted»");
+    } finally {
+      authHeaders.value = {};
+    }
+  });
+
+  it("redacts an HTML-ENTITY-encoded reflection too", () => {
+    const token = "tok&value<with>entities";
+    authHeaders.value = { "X-API-Key": token };
+    try {
+      const entity = "tok&amp;value&lt;with&gt;entities";
+      const d = classifyNonJson({
+        url: URL_UNDER_TEST,
+        status: 403,
+        contentType: "text/html",
+        body: `<html>bad key ${entity}</html>`,
+      });
+      expect(d.message).not.toContain(entity);
+      expect(d.message).not.toContain(token);
+    } finally {
+      authHeaders.value = {};
+    }
+  });
+
+  it("redacts a credential-SHAPED run even when nothing is configured", () => {
+    // The shape rule is the actual defence: a body can reflect a credential we
+    // cannot prove is ours, in an encoding we never anticipated.
+    authHeaders.value = {};
+    const d = classifyNonJson({
+      url: URL_UNDER_TEST,
+      status: 401,
+      contentType: "text/html",
+      body: "<html>denied for sk-live-9f3aQ2xR7pLmZ0vTbN4wYc8KdE1uHj6S</html>",
+    });
+    expect(d.message).not.toContain("sk-live-9f3aQ2xR7pLmZ0vTbN4wYc8KdE1uHj6S");
+    expect(d.bodyPrefix).toContain("«redacted»");
+  });
+
+  it("redacts a SHORT value introduced by its own name (token=…, api_key: …)", () => {
+    authHeaders.value = {};
+    for (const body of [
+      "<html>?token=s3cr3t99 rejected</html>",
+      '<html>api_key: "s3cr3t99"</html>',
+      "<html>Authorization: Bearer s3cr3t99</html>",
+      "<html>client_secret=s3cr3t99</html>",
+    ]) {
+      const d = classifyNonJson({
+        url: URL_UNDER_TEST,
+        status: 401,
+        contentType: "text/html",
+        body,
+      });
+      expect(d.message, body).not.toContain("s3cr3t99");
+    }
+  });
+
+  it("keeps the diagnostic value — ordinary markup survives the scrub", () => {
+    authHeaders.value = {};
+    const d = classifyNonJson({
+      url: URL_UNDER_TEST,
+      status: 502,
+      contentType: "text/html",
+      body: "<html><head><title>502 Bad Gateway</title></head><body><center>nginx</center></body></html>",
+    });
+    expect(d.bodyPrefix).toContain("502 Bad Gateway");
+    expect(d.bodyPrefix).toContain("nginx");
+    expect(d.bodyPrefix).not.toContain("«redacted»");
   });
 
   it("leaves an ordinary body untouched when no credential is configured", () => {

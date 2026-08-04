@@ -1657,10 +1657,12 @@ export async function runPanelOrchestrator(): Promise<void> {
     COMFYUI_URL: comfyuiUrl,
     COMFYUI_MCP_PROGRESS_DIR: progressDir,
     ...(comfyuiPath ? { COMFYUI_PATH: comfyuiPath } : forceRemoteEnv()),
-    // Pass through optional credentials the comfyui MCP honors, when set in the
-    // orchestrator's env — so Codex can do everything Claude can (Civitai, HF).
-    ...(process.env.CIVITAI_API_TOKEN ? { CIVITAI_API_TOKEN: process.env.CIVITAI_API_TOKEN } : {}),
-    ...(process.env.HF_TOKEN ? { HF_TOKEN: process.env.HF_TOKEN } : {}),
+    // NO credentials here. buildComfyuiMcpEnv() is the single authority for every
+    // allowlisted credential key (it resolves each from the canonical store at
+    // spawn time and DELETES any the store no longer provides). Copying raw
+    // process.env tokens into the base defeated that: spreading cannot remove,
+    // so an externally revoked token survived here and the next child inherited
+    // it as a real env override — a revoke that did not revoke.
     // Test-only tool-call trace (knowledge-parity smoke). No-op unless set.
     ...(process.env.COMFYUI_MCP_TOOL_TRACE ? { COMFYUI_MCP_TOOL_TRACE: process.env.COMFYUI_MCP_TOOL_TRACE } : {}),
   });

@@ -61,16 +61,25 @@ export function isNonJsonResponseError(err: unknown): err is NonJsonResponseErro
   return err instanceof NonJsonResponseError;
 }
 
-/** Collapse a body to a short single-line prefix for the message.
+const REDACTED = "«redacted»";
+
+/**
+ * Collapse a body to a short single-line prefix for the message.
  *
- *  The prefix is diagnostic — it is what lets a user recognise the page that
- *  answered. But a gateway that REFLECTS the request (an "invalid token: …"
- *  page, a debug echo) could put our own ComfyUI credential in that body, and
- *  this prefix goes into an error the agent sees. Any configured auth header
- *  value found in the body is therefore replaced before the prefix is built:
- *  we know exactly which strings are secret, so this is redaction, not guessing. */
+ * The prefix is diagnostic — it is what lets a user recognise the page that
+ * answered. But a gateway that REFLECTS the request (an "invalid token: …"
+ * page, a debug echo) can put our own ComfyUI credential in that body, and this
+ * prefix goes into an error the agent sees.
+ *
+ * Matching the KNOWN VALUE is a blocklist, and a proxy can percent-encode,
+ * HTML-entity-encode, case-fold or line-wrap what it echoes — so a reflected
+ * `Bearer abc/def` comes back as `?token=abc%2Fdef` and no known-value match
+ * fires. `scrubSecretShapedText` therefore redacts by SHAPE as well as by
+ * value: anything credential-shaped goes, whether or not we can prove it is
+ * ours. A diagnostic that can print a secret is not worth the diagnosis.
+ */
 export function bodyPrefixOf(body: string): string {
-  const redacted = redactComfyAuthValues(body);
+  const redacted = scrubSecretShapedText(body);
   if (redacted === null) {
     // A configured credential is present in the body but too short to replace
     // without mangling unrelated text. FAIL CLOSED: withhold the prefix rather
@@ -81,30 +90,81 @@ export function bodyPrefixOf(body: string): string {
   return flat.length > 160 ? `${flat.slice(0, 160)}…` : flat;
 }
 
+/** Every encoding of `value` a responder might plausibly echo it back in.
+ *  Not exhaustive by design — the SHAPE passes below are the real defence; this
+ *  just catches the common forms exactly, so the message keeps more context. */
+function reflectionVariants(value: string): string[] {
+  const html = value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+  return [
+    value,
+    encodeURIComponent(value),
+    encodeURI(value),
+    html,
+    value.toLowerCase(),
+    value.toUpperCase(),
+  ];
+}
+
 /**
- * Remove any CONFIGURED ComfyUI auth value from text that is about to be shown.
+ * Remove anything credential-shaped from text that is about to be shown.
  *
- * A gateway that reflects the request (an "invalid token: …" page, a debug echo)
- * can put our own credential in its body, and these bodies go into errors the
- * agent sees. We know exactly which strings are secret, so this is redaction,
- * not guessing. Returns `null` when a configured value occurs but is too SHORT
- * (< 8 chars) to substitute safely — the caller must then withhold the text
- * entirely rather than emit a partially-redacted version (codex gate, round 4,
- * finding 2).
+ * Three passes, in order:
+ *   1. KNOWN values — every configured ComfyUI auth header value, and its bare
+ *      token, in each encoding a responder might echo. Returns `null` when one
+ *      occurs but is too SHORT (< 8 chars) to substitute without mangling
+ *      unrelated text: the caller must then withhold the text entirely.
+ *   2. KEYED assignments — `token=…`, `api_key: …`, `Authorization: Bearer …`.
+ *      A secret introduced by its own name is a secret whoever it belongs to.
+ *   3. OPAQUE RUNS — any long unbroken run of credential alphabet characters.
+ *      This is what catches an encoding we did not anticipate, and it is why the
+ *      redaction is a shape rule rather than a list of known strings.
+ *
+ * Passes 2 and 3 run whether or not a credential is configured: a reflected
+ * body can carry someone else's secret too, and this text goes to an agent.
  */
-export function redactComfyAuthValues(text: string): string | null {
+export function scrubSecretShapedText(text: string): string | null {
   let out = text;
+
+  // 1. Known configured values, in every encoding we can anticipate.
   for (const headerValue of Object.values(getComfyUIAuthHeaders())) {
     if (!headerValue) continue;
     // The header value may be "Bearer <token>"; handle the whole thing and the
     // bare token, so neither form survives.
-    for (const candidate of [headerValue, headerValue.replace(/^\S+\s+/, "")]) {
-      if (!candidate || !out.includes(candidate)) continue;
-      if (candidate.length < 8) return null; // too short to replace safely
-      out = out.split(candidate).join("«redacted»");
+    for (const base of [headerValue, headerValue.replace(/^\S+\s+/, "")]) {
+      if (!base) continue;
+      for (const candidate of reflectionVariants(base)) {
+        if (!candidate || !out.includes(candidate)) continue;
+        if (candidate.length < 8) return null; // too short to replace safely
+        out = out.split(candidate).join(REDACTED);
+      }
     }
   }
+
+  // 2. Anything introduced BY NAME as a credential, however short.
+  out = out.replace(
+    /\b(authorization|auth[-_]?token|access[-_]?token|api[-_]?key|apikey|client[-_]?secret|secret|password|passwd|token|key)\b(\s*(?:[:=]|&#61;|%3D)\s*)(?:(bearer|token|basic)(\s+))?["']?([^"'\s&<>,;)]{3,})/gi,
+    (_m, name: string, sep: string, scheme: string | undefined, gap: string | undefined, _v: string) =>
+      `${name}${sep}${scheme ? `${scheme}${gap ?? " "}` : ""}${REDACTED}`,
+  );
+
+  // 3. Long opaque runs of the credential alphabet (base64 / hex / url-safe /
+  //    percent-encoded). Ordinary prose and HTML break well before 24 chars —
+  //    tags, spaces and punctuation are all outside this class.
+  out = out.replace(/[A-Za-z0-9\-._~+/=%]{24,}/g, REDACTED);
+
   return out;
+}
+
+/** Back-compat alias: the known-value redaction is now one pass of the
+ *  shape-based scrubber. Callers that only want "is this safe to print" should
+ *  use `scrubSecretShapedText`/`bodyPrefixOf`. */
+export function redactComfyAuthValues(text: string): string | null {
+  return scrubSecretShapedText(text);
 }
 
 function looksLikeHtml(contentType: string, body: string): boolean {
@@ -112,10 +172,21 @@ function looksLikeHtml(contentType: string, body: string): boolean {
   return /^\s*(<!doctype html|<html\b)/i.test(body);
 }
 
+/**
+ * Is this body ACTUALLY a sign-in page?
+ *
+ * A bare `login` / `authenticate` anywhere in the body is not evidence — an
+ * nginx 502 with a "login" link in its footer would be reported as a
+ * body-CONFIRMED auth gate, sending the user to configure gateway credentials
+ * instead of diagnosing a proxy failure. Require something only a sign-in page
+ * has: a password field, a form that posts to a sign-in route, or a title that
+ * says so.
+ */
 function looksLikeLoginPage(body: string): boolean {
   return (
     /<input[^>]+type=["']?password/i.test(body) ||
-    /\b(sign in|sign-in|log in|login|authenticate|single sign-on|sso)\b/i.test(body)
+    /<form[^>]+action=["'][^"']*(?:login|signin|sign-in|auth|sso|saml|oauth)/i.test(body) ||
+    /<title>[^<]*\b(sign[- ]?in|log[- ]?in|authentication required|single sign-on)\b/i.test(body)
   );
 }
 
@@ -150,20 +221,28 @@ export function classifyNonJson(args: {
   // only when the BODY carries the corresponding markers; otherwise name the
   // likely candidates and say the response does not settle it (codex gate,
   // round 2, finding 6).
+  // BODY EVIDENCE OUTRANKS STATUS, and a confirmed PROXY page outranks a
+  // status-only auth guess. An nginx 502 whose footer happens to link to a
+  // login page must be diagnosed as the proxy failure it is, not as a
+  // "body-confirmed" auth gate that sends the user to configure gateway
+  // credentials (coordinator finding).
+  const proxyPage = html && looksLikeProxyErrorPage(body);
+  const loginPage = html && looksLikeLoginPage(body);
+  const gatewayStatus = status === 502 || status === 503 || status === 504;
+  const authStatus = status === 401 || status === 403;
+
   let kind: NonJsonKind;
   let cause: string;
-  if (status === 401 || status === 403 || (html && looksLikeLoginPage(body))) {
-    kind = "login";
-    cause =
-      html && looksLikeLoginPage(body)
-        ? "an authentication gate answered with a SIGN-IN PAGE (its markers are in the body) rather than letting the request through to ComfyUI — typically an identity proxy such as Cloudflare Access or an SSO portal"
-        : `the request was rejected with ${status} and the body is not JSON; this is most often an identity proxy or sign-in gate in front of ComfyUI, but ComfyUI behind your own auth layer can return it too, and this response does not distinguish them`;
-  } else if (status === 502 || status === 503 || status === 504 || (html && looksLikeProxyErrorPage(body))) {
+  if (proxyPage || (gatewayStatus && !loginPage)) {
     kind = "proxy-error";
-    cause =
-      html && looksLikeProxyErrorPage(body)
-        ? "a reverse proxy in front of ComfyUI returned its OWN error page (its markers are in the body) — the proxy is up but could not reach, or timed out talking to, ComfyUI itself"
-        : `a gateway-class status (${status}) came back with a non-JSON body; ComfyUI does not normally emit these, so something between you and it most likely did, though this response does not identify what`;
+    cause = proxyPage
+      ? "a reverse proxy in front of ComfyUI returned its OWN error page (its markers are in the body) — the proxy is up but could not reach, or timed out talking to, ComfyUI itself"
+      : `a gateway-class status (${status}) came back with a non-JSON body; ComfyUI does not normally emit these, so something between you and it most likely did, though this response does not identify what`;
+  } else if (authStatus || loginPage) {
+    kind = "login";
+    cause = loginPage
+      ? "an authentication gate answered with a SIGN-IN PAGE (a password field, a sign-in form action, or a sign-in title is in the body) rather than letting the request through to ComfyUI — typically an identity proxy such as Cloudflare Access or an SSO portal"
+      : `the request was rejected with ${status} and the body is not JSON; this is most often an identity proxy or sign-in gate in front of ComfyUI, but ComfyUI behind your own auth layer can return it too, and this response does not distinguish them`;
   } else if (status === 404 && html) {
     kind = "not-found";
     cause = "whatever is answering this host does not serve that route at all";
@@ -195,7 +274,7 @@ export function classifyNonJson(args: {
     // sending the user to configure the wrong side wastes the round trip (codex
     // gate, round 5, finding 4).
     (kind === "login"
-      ? html && looksLikeLoginPage(body)
+      ? loginPage
         ? `, and the credential belongs to that GATEWAY, not to ComfyUI: set COMFYUI_AUTH_TOKEN / COMFYUI_AUTH_HEADER, or the CF_ACCESS_CLIENT_ID + CF_ACCESS_CLIENT_SECRET pair.`
         : `. Whichever layer rejected the request is the one that needs the credential — this response does not say which; the connector sends COMFYUI_AUTH_TOKEN / COMFYUI_AUTH_HEADER (and the CF_ACCESS_CLIENT_ID + CF_ACCESS_CLIENT_SECRET pair) on every ComfyUI request, so configure them for whichever layer is doing the rejecting.`
       : `.`);
