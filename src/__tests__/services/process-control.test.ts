@@ -39,6 +39,14 @@ const mockStatSync = vi.hoisted(() =>
 vi.mock("node:fs", () => ({
   existsSync: mockExistsSync,
   statSync: mockStatSync,
+  // The port probe reads the kernel socket tables and classifies a failure from its
+  // ERRNO: ENOENT ("no /proc on this host") hides nothing and leaves lsof as the
+  // only source, which is what these tests model. Omitting this entirely used to
+  // throw "readFileSync is not a function" — errno-less, i.e. "I could not look" —
+  // which would make every post-kill probe `unknown` and hang the suite.
+  readFileSync: vi.fn(() => {
+    throw Object.assign(new Error("no /proc in test"), { code: "ENOENT" });
+  }),
 }));
 
 vi.mock("../../comfyui/client.js", () => ({
@@ -68,8 +76,43 @@ import {
   stopComfyUI,
 } from "../../services/process-control.js";
 
+/**
+ * `lsof -V` STATING that nothing is listening — the port is free.
+ *
+ * The exit status alone cannot say this: lsof exits 1 both when it searched and
+ * matched nothing AND when it could not search at all, and a run that enumerates
+ * nothing for lack of permission exits 1 with BOTH streams empty. So the probe
+ * keys on the `-V` marker, which is lsof positively naming what it failed to
+ * locate. Verified against lsof 4.99.4: with `-V` and nothing listening, status is
+ * 1 and `lsof: Internet address not located: TCP:<port>` goes to STDOUT; without
+ * `-V`, status is 1 and both streams are empty — the ambiguity that makes
+ * "quiet ⇒ free" unsound, so a fixture must not model absence as mere silence.
+ *
+ * Getting this wrong is invisible on Windows (the netstat branch never reaches
+ * lsof) and HANGS the suite on POSIX: a caller waiting for the port to be released
+ * never sees a release and waits out its whole budget (#776).
+ */
+function noListener(): Error {
+  const err = new Error("no listener") as Error & {
+    status?: number;
+    stdout?: string;
+    stderr?: string;
+  };
+  err.status = 1;
+  err.stdout =
+    "lsof: Internet address not located: TCP:8188\nlsof: TCP state not located: LISTEN\n";
+  err.stderr = "";
+  return err;
+}
+
 class FakeChild extends EventEmitter {
   unref = vi.fn();
+  /**
+   * Node only leaves `pid` undefined when the spawn FAILED, so a fake that models
+   * a successful launch must carry one — 4321, matching the pid the port fixtures
+   * below report (#776 listener-ownership).
+   */
+  pid: number | undefined = 4321;
 }
 
 const ORIGINAL_ENV = { ...process.env };
@@ -95,7 +138,7 @@ function mockSpawnedChildren(): FakeChild[] {
 
 function mockNoPortProcess(): void {
   mockExecSync.mockImplementation((cmd: string) => {
-    if (cmd.includes("lsof")) throw new Error("not listening");
+    if (cmd.includes("lsof")) throw noListener();
     return "";
   });
 }
@@ -129,7 +172,19 @@ beforeEach(() => {
   mockFindComfyuiPython.mockReturnValue("/fake/ComfyUI/python_embeded/python.exe");
   mockExistsSync.mockImplementation(() => true);
   mockStatSync.mockImplementation(() => ({ isDirectory: () => true }));
+  // The listener-ownership check (#776) probes the spawned child's liveness with a
+  // signal-0 `process.kill`. These fakes model a LIVE child, so the probe must say
+  // so rather than reaching the real OS and getting ESRCH for a pid that was never
+  // real. Individual tests re-spy this where they assert on killing.
+  vi.spyOn(process, "kill").mockImplementation(() => true);
   __processControlTestHooks.reset();
+  // The identity bracket around /system_stats (#776) needs the port owner's process
+  // creation time at both ends — pid equality alone is what pid REUSE defeats. This
+  // module's child_process mock has no execFileSync, so the real reader cannot run;
+  // model the ordinary host where the stamp IS readable.
+  __processControlTestHooks.setProcessIdentityResolver(() => ({
+    startedAt: "stable-stamp",
+  }));
 });
 
 afterEach(() => {
@@ -367,16 +422,27 @@ describe("process-control crash supervision", () => {
     mockFetchOk(true);
 
     let portCheckCalls = 0;
+    let killIssued = false;
     mockExecSync.mockImplementation((cmd: string) => {
+      if (/taskkill|pkill|\bkill\b/i.test(cmd)) {
+        killIssued = true;
+        return "";
+      }
       if (cmd.includes("netstat") || cmd.includes("lsof")) {
         portCheckCalls += 1;
-        if (portCheckCalls === 3) {
+        // The first two lookups belong to start_comfyui (the already-running guard
+        // and the post-readiness PID). From then until the kill, the port is OWNED:
+        // stop_comfyui looks it up, re-confirms the server that answered still owns
+        // it, and re-checks the identity again immediately before killing (#776) —
+        // a count-based fixture would break every time that evidence chain grows.
+        // After the kill the port is free, so waitForPortFree returns at once.
+        if (portCheckCalls >= 3 && !killIssued) {
           if (cmd.includes("netstat"))
             return "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
           // `lsof -nP -iTCP:PORT -sTCP:LISTEN -Fpn` field output: p<pid> / n<addr:port>.
           return "p4321\nn127.0.0.1:8188\n";
         }
-        throw new Error("not listening");
+        throw noListener();
       }
       return "";
     });
@@ -627,7 +693,7 @@ describe("findPidByPort resilience to localized netstat state (#449)", () => {
         }
         return GERMAN_BLOB;
       }
-      if (cmd.includes("lsof")) throw new Error("not listening");
+      if (cmd.includes("lsof")) throw noListener();
       return ""; // tasklist / powershell fallback / `if exist` → nothing
     });
     mockGetSystemStats.mockResolvedValue({
@@ -649,7 +715,7 @@ describe("findPidByPort resilience to localized netstat state (#449)", () => {
     // back empty. Liveness is the reachable server, so we must NOT claim the
     // process is absent — and we must NOT take the server down (issue #449).
     mockExecSync.mockImplementation((cmd: string) => {
-      if (cmd.includes("lsof")) throw new Error("not listening");
+      if (cmd.includes("lsof")) throw noListener();
       return ""; // netstat, powershell, tasklist → nothing resolves a PID
     });
     mockGetSystemStats.mockResolvedValue({
@@ -677,7 +743,7 @@ describe("findPidByPort resilience to localized netstat state (#449)", () => {
     // (Comfy Desktop.exe) is present. We must NOT kill that shell — we can't
     // confirm it owns :8188 — so leave everything untouched and diagnose.
     mockExecSync.mockImplementation((cmd: string) => {
-      if (cmd.includes("lsof")) throw new Error("not listening");
+      if (cmd.includes("lsof")) throw noListener();
       if (/tasklist/i.test(cmd)) {
         // A Comfy Desktop shell IS running.
         return '"Comfy Desktop.exe","4242","Console","1","206,248 K"';
@@ -812,7 +878,7 @@ describe("restart truthfulness + Pinokio-shaped refusal (#742)", () => {
         return "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
       }
       if (cmd.includes("lsof")) {
-        if (killed) throw new Error("not listening");
+        if (killed) throw noListener();
         return "p4321\nn127.0.0.1:8188\n";
       }
       return ""; // tasklist / `sleep 1 && kill -9` / etc.
@@ -863,7 +929,7 @@ describe("restart truthfulness + Pinokio-shaped refusal (#742)", () => {
         return "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
       }
       if (cmd.includes("lsof")) {
-        if (killed) throw new Error("not listening");
+        if (killed) throw noListener();
         return "p4321\nn127.0.0.1:8188\n";
       }
       return ""; // tasklist / `sleep 1 && kill -9` / etc.

@@ -70,6 +70,14 @@ export class ProcessControlError extends ComfyUIError {
    */
   reachableButNoPid?: boolean;
 
+  /**
+   * Set when the server that answered could NOT be bound to the process we would
+   * act on — the instance behind the port changed while it was being identified
+   * (#776). Callers must surface the diagnostic and touch nothing: killing on an
+   * identity we could not confirm is exactly the wrong-instance hazard.
+   */
+  identityAmbiguous?: boolean;
+
   constructor(message: string, details?: unknown) {
     super(message, "PROCESS_CONTROL_ERROR", details);
     this.name = "ProcessControlError";

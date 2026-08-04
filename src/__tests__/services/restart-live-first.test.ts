@@ -15,8 +15,43 @@ import { EventEmitter } from "node:events";
 import { isAbsolute, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+/**
+ * `lsof -V` STATING that nothing is listening — the port is free.
+ *
+ * The exit status alone cannot say this: lsof exits 1 both when it searched and
+ * matched nothing AND when it could not search at all, and a run that enumerates
+ * nothing for lack of permission exits 1 with BOTH streams empty. So the probe
+ * keys on the `-V` marker, which is lsof positively naming what it failed to
+ * locate. Verified against lsof 4.99.4: with `-V` and nothing listening, status is
+ * 1 and `lsof: Internet address not located: TCP:<port>` goes to STDOUT; without
+ * `-V`, status is 1 and both streams are empty — the ambiguity that makes
+ * "quiet ⇒ free" unsound, so a fixture must not model absence as mere silence.
+ *
+ * Getting this wrong is invisible on Windows (the netstat branch never reaches
+ * lsof) and HANGS the suite on POSIX: a caller waiting for the port to be released
+ * never sees a release and waits out its whole budget (#776).
+ */
+function noListener(): Error {
+  const err = new Error("no listener") as Error & {
+    status?: number;
+    stdout?: string;
+    stderr?: string;
+  };
+  err.status = 1;
+  err.stdout =
+    "lsof: Internet address not located: TCP:8188\nlsof: TCP state not located: LISTEN\n";
+  err.stderr = "";
+  return err;
+}
+
 class FakeChild extends EventEmitter {
   unref = vi.fn();
+  /**
+   * Node only leaves `pid` undefined when the spawn FAILED, so a fake that models
+   * a successful launch must carry one — 4321, matching the pid the port fixtures
+   * below report (#776 listener-ownership).
+   */
+  pid: number | undefined = 4321;
 }
 
 const mockConfig = vi.hoisted(() => ({
@@ -59,6 +94,14 @@ vi.mock("node:fs", () => ({
   // keep a throwing stub so any un-mocked call path stays refuse-safe (#535).
   readlinkSync: vi.fn(() => {
     throw new Error("no /proc in test");
+  }),
+  // The port probe reads the kernel socket tables and classifies a failure from its
+  // ERRNO: ENOENT ("no /proc on this host") hides nothing and leaves lsof as the
+  // only source, which is what these tests model. Omitting this entirely used to
+  // throw "readFileSync is not a function" — errno-less, i.e. "I could not look" —
+  // which would make every post-kill probe `unknown` and hang the suite.
+  readFileSync: vi.fn(() => {
+    throw Object.assign(new Error("no /proc in test"), { code: "ENOENT" });
   }),
   // isRegularFile(#535) calls statSync().isFile(); throw for non-existent paths so
   // it returns false, mirroring existsSync, and honor per-test isFile overrides.
@@ -125,7 +168,7 @@ function mockLivePortThenFree(): { killed: () => boolean } {
         : "  TCP    0.0.0.0:8188   0.0.0.0:0   LISTENING       4321";
     }
     if (/lsof/i.test(cmd)) {
-      if (killed) throw new Error("not listening");
+      if (killed) throw noListener();
       // `lsof -nP -iTCP:PORT -sTCP:LISTEN -Fpn` field output: p<pid> / n<addr:port>.
       return "p4321\nn127.0.0.1:8188\n";
     }
@@ -160,6 +203,13 @@ beforeEach(() => {
     system: { argv: ["ComfyUI\\main.py", "--port", "8188"] },
   });
   __processControlTestHooks.reset();
+  // The identity bracket around /system_stats (#776) needs the port owner's process
+  // creation time at both ends — pid equality alone is what pid REUSE defeats. This
+  // module's child_process mock has no execFileSync, so the real reader cannot run;
+  // model the ordinary host where the stamp IS readable.
+  __processControlTestHooks.setProcessIdentityResolver(() => ({
+    startedAt: "stable-stamp",
+  }));
 });
 
 afterEach(() => {
@@ -191,6 +241,11 @@ describe("restart_comfyui — live-first script resolution (#476, #426)", () => 
     // It did NOT take the refuse-safe branch — it actually restarted.
     expect(result.message).not.toMatch(/refusing to restart/i);
     expect(result.stopped).toBe(true);
+    // Ownership is asserted explicitly: `started` is derived from it (#776), so
+    // pinning only `started` would report "false" without saying which evidence
+    // produced it. The port is free after the kill in this fixture, so the port
+    // owner is unmappable and ownership is honestly unconfirmed — never "not-ours".
+    expect(result.listener_ownership).toBe("unconfirmed");
     expect(result.started).toBe(true);
     expect(result.ready).toBe(true);
 
@@ -454,6 +509,8 @@ describe("restart_comfyui — explicit absolute spawn cwd, truthful refusal (#71
 
     expect(result.message).not.toMatch(/refusing to restart/i);
     expect(result.stopped).toBe(true);
+    // See the note above: pin the evidence, not just the flag derived from it.
+    expect(result.listener_ownership).toBe("unconfirmed");
     expect(result.started).toBe(true);
     expect(mockSpawn).toHaveBeenCalledTimes(1);
     const [exe, args, opts] = mockSpawn.mock.calls[0];

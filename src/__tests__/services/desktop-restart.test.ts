@@ -5,7 +5,7 @@
 // like the remote path. Everything runs through mocked comfyuiFetch + execSync +
 // spawn; no real process/port/network is touched.
 
-import { describe, expect, it, beforeEach, vi } from "vitest";
+import { describe, expect, it, afterEach, beforeEach, vi } from "vitest";
 
 const hoisted = vi.hoisted(() => ({
   remoteMode: { value: false },
@@ -54,6 +54,27 @@ import {
   restartComfyUI,
   __processControlTestHooks,
 } from "../../services/process-control.js";
+import { __portOwnerTestHooks } from "../../services/port-owner.js";
+
+/**
+ * One `/proc/net/tcp` row for a socket LISTENING on `port`, in the kernel's own
+ * format (hex big-endian address:port, state `0A` = TCP_LISTEN).
+ *
+ * On Linux the port probe consults this table BEFORE `lsof`, because it sees every
+ * socket regardless of owner. That makes it the host's answer, not the fixture's —
+ * so a test that does not state what the table says is graded against the runner's
+ * real network state, where port 8188 is idle, and the execSync port fixtures below
+ * are never reached at all (#776 CI). This file models the host it means to model:
+ * a live Desktop instance IS listening on the port, and lsof then names its owner.
+ */
+function procNetTableWithListenerOn(port: number): string {
+  const hexPort = port.toString(16).toUpperCase().padStart(4, "0");
+  return [
+    "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode",
+    `   0: 0100007F:${hexPort} 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 54321 1 0000000000000000 100 0 0 10 0`,
+    "",
+  ].join("\n");
+}
 
 type FetchCall = [string, RequestInit | undefined];
 const pathOf = (u: string): string => new URL(u).pathname;
@@ -79,6 +100,25 @@ beforeEach(() => {
     if (/lsof/i.test(cmd)) return "p4321\nn127.0.0.1:8188\n";
     return "";
   });
+  // …and state the kernel table to match, so the Linux-first branch answers from
+  // the fixture rather than from the runner's own sockets. `/proc/net/tcp6` is
+  // absent here — one readable table is a complete answer.
+  __portOwnerTestHooks.setProcNetReader((table) => {
+    if (table === "/proc/net/tcp") return procNetTableWithListenerOn(8188);
+    throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+  });
+  __processControlTestHooks.reset();
+  // The identity bracket around /system_stats (#776) runs for Desktop too — the
+  // Desktop classification is itself derived from that same possibly-stale argv, so
+  // it cannot be what decides whether to verify. It needs the port owner's creation
+  // time at both ends; model the ordinary host where that is readable.
+  __processControlTestHooks.setProcessIdentityResolver(() => ({
+    startedAt: "stable-stamp",
+  }));
+});
+
+afterEach(() => {
+  __portOwnerTestHooks.reset();
   __processControlTestHooks.reset();
 });
 

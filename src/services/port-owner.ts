@@ -7,6 +7,7 @@
 // existing tests keep importing it from there.
 
 import { execSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { platform } from "node:os";
 
 const IS_WIN = platform() === "win32";
@@ -85,7 +86,7 @@ export function parseListenerPidFromNetstat(
 }
 
 /**
- * Parse `lsof -nP -iTCP:PORT -sTCP:LISTEN -Fpn` field output. Records look like
+ * Parse `lsof -V -nP -iTCP:PORT -sTCP:LISTEN -Fpn` field output. Records look like
  *   p1234
  *   n127.0.0.1:8188
  * so we can bind the match to the ADDRESS as well as the port, which the plain
@@ -118,58 +119,569 @@ export function parseListenerPidFromLsof(
   return null;
 }
 
-export function findPidByPort(port: number, host?: string): number | null {
+/**
+ * The result of asking "who owns this port?" — with "I could not find out" kept
+ * DISTINCT from "nobody".
+ *
+ * `findPidByPort` collapses both into `null`, which is fine for "find me the pid"
+ * but dangerous for "has the port been released?": a lookup that merely FAILED
+ * would read as proof the port is free, and callers acting on that proof (tearing
+ * down supervision after a kill) would act on a server that is still running.
+ */
+export type PortOwnerProbe =
+  | { state: "owned"; pid: number }
+  | { state: "free" }
+  | { state: "unknown"; reason: string };
+
+/**
+ * Did `lsof` positively STATE that nothing is listening?
+ *
+ * Its exit status cannot answer this. Verified against the manual and by
+ * experiment: lsof "returns a one (1) if any error was detected, INCLUDING the
+ * failure to locate ... Internet addresses", so status 1 conflates "searched and
+ * found nothing" with "could not search". Worse, a run that enumerates nothing
+ * because it lacks permission also produces status 1 with EMPTY stdout and EMPTY
+ * stderr — so "quiet" is not evidence either, with or without `-w` (which only
+ * suppresses warnings and therefore makes silence less meaningful, not more).
+ *
+ * What IS a positive statement of absence is `-V`, which makes lsof say what it
+ * failed to locate: `lsof: Internet address not located: TCP:8188`. That marker,
+ * and nothing else, is treated as "free". Anything else exits to "unknown", which
+ * a caller may not spend as proof of release.
+ */
+/**
+ * lsof reporting that its own enumeration was INCOMPLETE.
+ *
+ * Any such note voids the absence marker: "I searched and did not find it" is a
+ * statement about the whole machine, but a run that could not stat or open part of
+ * `/proc` only searched the part it could see. The marker and a warning can appear
+ * TOGETHER — lsof reports what it skipped and still names what it failed to locate —
+ * and reading that combination as "free" certifies a release from an enumeration
+ * that admits it was partial.
+ */
+/**
+ * Did lsof complain about anything, i.e. admit its enumeration was incomplete?
+ *
+ * Recognised by INVERSION rather than by enumerating diagnostics. Listing the ones I
+ * could think of (`WARNING`, `permission denied`, …) missed real ones lsof documents
+ * — `lsof: can't read proc table info` among them — and every miss certifies a
+ * release from a partial search. The set of things lsof can complain about is open;
+ * the set of things it says as ITS `-V` REPORT is closed and known: `not located`
+ * lines, verified from a live run to be exactly
+ *
+ *     lsof: Internet address not located: TCP:65432
+ *     lsof: TCP state not located: LISTEN
+ *
+ * So any `lsof:`-prefixed line that is NOT part of that report is a complaint,
+ * whatever it says. `Output information may be incomplete.` is checked separately
+ * because lsof prints it without the prefix.
+ */
+function admitsIncompleteEnumeration(output: string): boolean {
+  if (/may be incomplete/i.test(output)) return true;
+  return output.split("\n").some((raw) => {
+    const line = raw.trim();
+    if (!/^lsof:/i.test(line)) return false;
+    return !/\bnot located\b/i.test(line);
+  });
+}
+
+/**
+ * What lsof said about absence — kept as THREE outcomes, not a boolean.
+ *
+ *   "stated"     — it named what it failed to locate, and reported no gaps.
+ *   "inconclusive" — it named what it failed to locate AND admitted it could not
+ *                  enumerate everything. The verdict is the same as `silent`
+ *                  (`unknown`), but the CAUSE is not, and a caller that waits out a
+ *                  budget deserves to be told which one it was.
+ *   "silent"     — it said nothing about an empty search.
+ *
+ * Collapsing the middle case into `silent` is how the verdict stayed right while the
+ * message asserted something that did not happen — lsof plainly DID report an empty
+ * search; we declined to spend it.
+ */
+type LsofAbsence = "stated" | "inconclusive" | "silent";
+
+const LSOF_INCONCLUSIVE_REASON =
+  "lsof reported nothing listening on the port but also reported that it could not enumerate everything, so its search describes only what it could see";
+
+function readLsofAbsence(output: string): LsofAbsence {
+  if (!/internet address not located/i.test(output)) return "silent";
+  return admitsIncompleteEnumeration(output) ? "inconclusive" : "stated";
+}
+
+function lsofErrorAbsence(err: unknown): LsofAbsence {
+  const e = err as NodeJS.ErrnoException & {
+    status?: number;
+    stdout?: Buffer | string;
+    stderr?: Buffer | string;
+  };
+  // A spawn-level failure (command missing, timeout) tells us nothing at all.
+  if (e?.code) return "silent";
+  if (e?.status !== 1) return "silent";
+  const text = (v: Buffer | string | undefined): string =>
+    v == null ? "" : typeof v === "string" ? v : v.toString("utf-8");
+  return readLsofAbsence(`${text(e.stdout)}\n${text(e.stderr)}`);
+}
+
+/**
+ * How the kernel socket tables are read.
+ *
+ * Injected rather than called directly so a test can drive this branch the way it
+ * already drives the `lsof` branch (through the `node:child_process` mock):
+ * present-and-listening, present-and-free, or inaccessible, on demand. Reading
+ * `readFileSync` directly made the answer depend on the HOST — on a Linux runner
+ * `/proc` genuinely exists, so the real socket table silently outranked a test's
+ * port fixtures and the assertions were graded against the runner's own network
+ * state instead (#776 CI). A suite that can only be green on a machine with
+ * nothing on port 8188 is not testing anything.
+ */
+export type ProcNetTableReader = (table: string) => string;
+
+const defaultProcNetReader: ProcNetTableReader = (table) => readFileSync(table, "utf-8");
+
+let procNetReader: ProcNetTableReader = defaultProcNetReader;
+
+export const __portOwnerTestHooks = {
+  /** Drive the kernel-table read. `null` restores the real `/proc` reader. */
+  setProcNetReader(fn: ProcNetTableReader | null): void {
+    procNetReader = fn ?? defaultProcNetReader;
+  },
+  reset(): void {
+    procNetReader = defaultProcNetReader;
+  },
+};
+
+/**
+ * Is a socket LISTENING on `port`, according to the kernel's own table?
+ *
+ * `/proc/net/tcp{,6}` lists every TCP socket on the machine regardless of owner
+ * and needs no external tool, so it answers free-vs-occupied definitively where
+ * `lsof` can only answer ambiguously (and cannot see another user's sockets at
+ * all). It does not name the owning pid — that still needs lsof (or #795's
+ * `/proc/<pid>/fd` scan) — but the safety-critical question after a kill is
+ * whether the port was RELEASED, and this settles exactly that.
+ *
+ * A POSITIVE is decisive from a single table: one LISTEN row is a socket, whatever
+ * the other table says. A NEGATIVE requires having read them BOTH — "no IPv4
+ * listener, and I could not open the IPv6 table" is not "nothing is listening", it
+ * is "I did not finish looking". Certifying that as free is the same fold this
+ * whole change exists to remove: a source that could not answer producing a
+ * definite one.
+ *
+ *   "listening"   — a LISTEN row was seen. Decisive.
+ *   "none"        — every table was read AND fully parsed, and none held a LISTEN
+ *                   row for the port. The only decisive negative.
+ *   "incomplete"  — something was read, but a table could not be opened or held a
+ *                   row that could not be parsed. A NAMED BLIND SPOT: an unreadable
+ *                   tcp6 may hold an IPv6 listener.
+ *   "unavailable" — no table could be read at all.
+ *
+ * The last two are both "not an answer", but they are NOT interchangeable once lsof
+ * then states absence. With a blind spot, lsof may simply SHARE it — an
+ * unprivileged lsof cannot see another user's sockets either, so the same listener
+ * is invisible to both and "free" would be a guess. With no table at all (every
+ * non-Linux POSIX host, where /proc/net does not exist) lsof is the only evidence
+ * there has ever been, and refusing to believe it would leave macOS permanently
+ * unable to observe a port release.
+ */
+type KernelSocketTables = "listening" | "none" | "incomplete" | "unavailable";
+
+/**
+ * Does a failed table read mean the table is ABSENT, or that we could not look?
+ *
+ * Classified from the errno, exactly as this change classifies a launcher config,
+ * because "both reads failed" is not by itself evidence of an absent source.
+ *
+ * Only ENOENT and ENOTDIR prove absence: they say this PATHNAME does not resolve to
+ * a file, so there is no table and nothing can be hiding in it. Every non-Linux
+ * POSIX host has no `/proc/net` at all, and a kernel booted with `ipv6.disable=1`
+ * has no `tcp6`.
+ *
+ * Everything else is "I could not look": a blind spot an unprivileged lsof may
+ * SHARE, which must never be spent as proof the port is free. That deliberately
+ * includes ENOSYS ("function not implemented") and ENXIO ("no such device or
+ * address") — both describe a failed OPERATION, not a pathname that resolves to
+ * nothing, so neither rules out a listener in a table we did not read. An
+ * errno-less failure is likewise a blind spot.
+ */
+function tableIsAbsent(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException)?.code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
+/**
+ * A kernel socket row: `<hex-address>:<hex-port>` (8 hex digits for IPv4, 32 for
+ * IPv6) and a two-hex-digit state. Verified against real kernel output —
+ * `0100007F:1FFC` / `00000000000000000000000001000000:49D3`, state `0A`. Requiring
+ * the SHAPE, not merely four fields, is what stops a garbled row from being
+ * silently skipped and then reported as "no listener here".
+ */
+const KERNEL_LOCAL_ENDPOINT = /^([0-9A-Fa-f]{8}|[0-9A-Fa-f]{32}):([0-9A-Fa-f]{4})$/;
+const KERNEL_STATE = /^[0-9A-Fa-f]{2}$/;
+const KERNEL_SLOT = /^(\d+):$/;
+/** The kernel's hex code for TCP_LISTEN. */
+const LISTEN_STATE = "0A";
+/**
+ * The highest TCP state these tables can print: `TCP_CLOSING` (11 = 0x0B).
+ *
+ * The enum defines two values above it, and NEITHER reaches this column:
+ *
+ *   `TCP_NEW_SYN_RECV` (12 = 0x0C) is the sk_state of a request socket, but the
+ *     seq_show path renders those through `get_openreq4`, which prints the state as
+ *     `TCP_SYN_RECV` (3). So a half-open connection appears here as `03`, never `0C`.
+ *   `TCP_BOUND_INACTIVE` (13 = 0x0D) is a pseudo-state for inet_diag, which walks the
+ *     BIND table — and these files do not. `/proc/net/tcp` iterates the listening and
+ *     established hashes only. MEASURED on 6.18: a socket bound to a port without
+ *     `listen()` produces NO row here at all, in any state.
+ *
+ * So the domain is 01..0B, and anything above it is damage rather than a socket. A
+ * future kernel printing a new state costs that host only its fast path
+ * (`incomplete`, i.e. `unknown`), never a false answer.
+ */
+const MAX_TCP_STATE = 0x0b;
+/**
+ * The socket tables, each with the address width it is DEFINED to print: one 32-bit
+ * word for IPv4, four for IPv6. Binding rows to their table is what stops a 32-hex
+ * row in `/proc/net/tcp` — impossible, and therefore evidence of nothing — from
+ * being read as either a listener or a clean negative.
+ */
+const KERNEL_TABLES: ReadonlyArray<{
+  path: string;
+  addressHexWidth: number;
+  header: RegExp;
+}> = [
+  { path: "/proc/net/tcp", addressHexWidth: 8, header: kernelHeader("rem_address") },
+  {
+    path: "/proc/net/tcp6",
+    addressHexWidth: 32,
+    header: kernelHeader("remote_address"),
+  },
+];
+const KERNEL_QUEUES = /^[0-9A-Fa-f]{8}:[0-9A-Fa-f]{8}$/;
+const KERNEL_TIMER = /^[0-9A-Fa-f]{2}:[0-9A-Fa-f]{8}$/;
+const KERNEL_HEX8 = /^[0-9A-Fa-f]{8}$/;
+const KERNEL_DECIMAL = /^\d+$/;
+
+/**
+ * The local hex port of a COMPLETE socket row, or undefined if this is not one.
+ *
+ * The row is validated through its `inode` column for the same reason the header is
+ * validated through its last column: a row cut short after `st` still has four
+ * well-formed tokens, and accepting it would mean accepting a table that EOF
+ * truncated mid-row — taking any later listener rows with it — as a clean, complete
+ * "nothing is listening". Trailing columns beyond `inode` (refcount, pointer, and
+ * the rest, which vary by kernel) are accepted without inspection.
+ *
+ * Column shapes captured from a live kernel:
+ *   0:  slot            `0:`
+ *   1:  local_address   `0100007F:1FFC` / 32-hex for IPv6
+ *   2:  rem_address     same widths
+ *   3:  st              `0A`
+ *   4:  tx_queue:rx_queue `00000000:00000000`
+ *   5:  tr:tm->when     `00:00000000`
+ *   6:  retrnsmt        `00000000`
+ *   7:  uid             decimal
+ *   8:  timeout         decimal
+ *   9:  inode           decimal
+ */
+interface KernelRow {
+  slot: number;
+  localPort: string;
+  state: string;
+}
+
+/**
+ * The first four columns — slot, local endpoint, remote endpoint, state — which are
+ * the MINIMUM that can carry a positive finding.
+ *
+ * A positive is read from this prefix rather than from a whole row, because
+ * truncation after the state cannot unmake the fields before it. But it must be the
+ * whole prefix: `cols[1]` and `cols[3]` alone would let a line like
+ * `corrupt 0100007F:1FFC garbage 0A` fabricate a listener out of bytes we have
+ * every reason to distrust. Untrustworthy input must not become a definite finding
+ * in EITHER direction.
+ */
+function parseKernelRowPrefix(
+  cols: string[],
+  addressHexWidth: number,
+): KernelRow | undefined {
+  const slot = KERNEL_SLOT.exec(cols[0] ?? "");
+  const local = KERNEL_LOCAL_ENDPOINT.exec(cols[1] ?? "");
+  const remote = KERNEL_LOCAL_ENDPOINT.exec(cols[2] ?? "");
+  const state = cols[3] ?? "";
+  if (!slot || !local || !remote || !KERNEL_STATE.test(state)) return undefined;
+  // CROSS-FIELD consistency, because four individually well-shaped tokens can still
+  // be a row no kernel ever wrote. Both endpoints must be the width THIS TABLE is
+  // defined to print — which also settles the two against each other.
+  if (local[1].length !== addressHexWidth || remote[1].length !== addressHexWidth) {
+    return undefined;
+  }
+  // The state must be one the kernel can actually be in.
+  const stateCode = parseInt(state, 16);
+  if (stateCode < 1 || stateCode > MAX_TCP_STATE) return undefined;
+  // A LISTENING socket has no peer: its remote endpoint is all zeros on port 0. The
+  // netstat parser above leans on the same invariant (#401) to tell a listener from
+  // an established connection that merely bound its local side to the port.
+  if (
+    state.toUpperCase() === LISTEN_STATE &&
+    (remote[2] !== "0000" || /[^0]/.test(remote[1]))
+  ) {
+    return undefined;
+  }
+  return { slot: Number(slot[1]), localPort: local[2], state };
+}
+
+function parseKernelRow(
+  cols: string[],
+  addressHexWidth: number,
+): KernelRow | undefined {
+  if (cols.length < 10) return undefined;
+  const prefix = parseKernelRowPrefix(cols, addressHexWidth);
+  if (
+    !prefix ||
+    !KERNEL_QUEUES.test(cols[4]) ||
+    !KERNEL_TIMER.test(cols[5]) ||
+    !KERNEL_HEX8.test(cols[6]) ||
+    !KERNEL_DECIMAL.test(cols[7]) ||
+    !KERNEL_DECIMAL.test(cols[8]) ||
+    !KERNEL_DECIMAL.test(cols[9])
+  ) {
+    return undefined;
+  }
+  return prefix;
+}
+
+/**
+ * The COMPLETE column header, matched end to end — EVERY column named in order.
+ *
+ * Anchoring only the start would accept a header truncated to `sl local_address`,
+ * and a body truncated to nothing then reads as a table with no listeners — "the
+ * header parsed" silently standing in for "the body was read". Nor is it enough to
+ * pin only the two ends and allow anything between: `sl local_address rem_address
+ * inode` would satisfy that while missing every intervening column, which is the
+ * same truncation one level in. So the whole sequence is spelled out.
+ *
+ * Captured from a live kernel: IPv4 says `rem_address`, IPv6 says `remote_address`,
+ * and the IPv4 line carries trailing padding (removed by the caller's trim). Each
+ * table gets its OWN pattern rather than accepting either spelling, because the two
+ * are not interchangeable — an IPv4-form header standing over `/proc/net/tcp6` is a
+ * table we did not really read, not a table with nothing in it.
+ *
+ * A layout this does not recognise costs that host only its fast path — the read
+ * becomes `incomplete`, which is the safe direction — never a false negative.
+ */
+function kernelHeader(remoteColumn: string): RegExp {
+  return new RegExp(
+    `^sl\\s+local_address\\s+${remoteColumn}\\s+st\\s+tx_queue\\s+rx_queue\\s+tr\\s+tm->when\\s+retrnsmt\\s+uid\\s+timeout\\s+inode$`,
+    "i",
+  );
+}
+
+function readKernelSocketTables(port: number): KernelSocketTables {
+  const wanted = port.toString(16).toUpperCase().padStart(4, "0");
+  let tablesRead = 0;
+  let blind = false;
+  for (const { path: table, addressHexWidth, header } of KERNEL_TABLES) {
+    let raw: string;
+    try {
+      raw = procNetReader(table);
+    } catch (err) {
+      // An absent table hides nothing; an unreadable one hides anything.
+      if (!tableIsAbsent(err)) blind = true;
+      continue;
+    }
+    tablesRead++;
+    // Row COUNT cannot distinguish a genuinely idle table from one truncated after
+    // its header — both have zero rows. So the table's OWN BOUNDARIES do: a real
+    // /proc/net/tcp always opens with the column header and always ends with a
+    // newline. Seeing neither end is what separates "I read the whole table and it
+    // held no listener" from "I read part of a table".
+    //
+    // A POSITIVE is unaffected and returns immediately below: a socket we can see is
+    // a socket, however much else was lost. Only the NEGATIVE needs completeness.
+    let sawHeader = false;
+    let nextSlot = 0;
+    const lines = raw.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const text = lines[i].trim();
+      // The header must OPEN the table — its first physical line. Accepting it
+      // wherever it turns up would let a table whose beginning was lost, or one with
+      // rows standing before it, pass as a table we watched from the start.
+      if (i === 0 && header.test(text)) {
+        sawHeader = true;
+        continue;
+      }
+      if (text === "") {
+        // Only the FINAL element may be blank — it is the artifact of the table's
+        // terminating newline. A blank ANYWHERE else is an empty record, which the
+        // kernel never writes: one non-empty line per entry. Treating an interior
+        // gap as ordinary structure would let a record deleted from the middle pass
+        // as a table that simply had nothing there.
+        if (i !== lines.length - 1) blind = true;
+        continue;
+      }
+      const cols = text.split(/\s+/);
+      // THE POSITIVE COMES FIRST, and needs only the fields that carry it: a local
+      // endpoint on the port we asked about, in the LISTEN state. Truncation AFTER
+      // the state cannot unmake the fields before it, so a row cut short of `inode`
+      // still proves the socket it already showed us. Putting the completeness gate
+      // ahead of this would be the same fold as everywhere else in this function,
+      // merely pointed at a positive: withholding a finding we actually made.
+      const prefix = parseKernelRowPrefix(cols, addressHexWidth);
+      if (
+        prefix &&
+        prefix.localPort.toUpperCase() === wanted &&
+        prefix.state.toUpperCase() === LISTEN_STATE
+      ) {
+        return "listening";
+      }
+      // Everything below serves the NEGATIVE, which is the half that needs the row
+      // to be whole.
+      const row = parseKernelRow(cols, addressHexWidth);
+      if (row === undefined) {
+        blind = true;
+        continue;
+      }
+      // The kernel numbers rows with a running counter from 0, so the sequence is
+      // its own continuity check: a GAP means a record between these two is missing
+      // from what we read, and a first row numbered above 0 means we picked the
+      // table up after its beginning. Neither is visible in any single row.
+      if (row.slot !== nextSlot) blind = true;
+      nextSlot = row.slot + 1;
+    }
+    // No header on the first line means we did not see where the table STARTS — rows
+    // before the point we picked it up may be missing, and a well-formed row proves
+    // only that the bytes we got were well-formed. No trailing newline means we did
+    // not see where it ENDS. Either way this read cannot support a definite negative.
+    if (!sawHeader || !raw.endsWith("\n")) blind = true;
+  }
+  // A blind spot outranks everything except a positive: it means something could
+  // still be hiding. Only when nothing could be — every table either read cleanly
+  // or provably does not exist — may this answer be spent.
+  if (blind) return "incomplete";
+  return tablesRead === 0 ? "unavailable" : "none";
+}
+
+export function probePortOwner(port: number, host?: string): PortOwnerProbe {
   if (IS_WIN) {
-    // Parse `netstat -ano` ourselves instead of piping through
-    // `findstr LISTENING` — that state word is localized and made detection fail
-    // on non-English Windows even when ComfyUI was reachable (issue #449).
+    let ranSomething = false;
+    const failures: string[] = [];
     try {
       const out = execSync(`netstat -ano -p TCP`, {
         encoding: "utf-8",
         timeout: 5000,
       });
+      ranSomething = true;
       const pid = parseListenerPidFromNetstat(out, port, host);
-      if (pid) return pid;
-    } catch {
-      // netstat unavailable / failed — fall through to the PowerShell probe.
+      if (pid) return { state: "owned", pid };
+    } catch (err) {
+      failures.push(`netstat: ${err instanceof Error ? err.message : String(err)}`);
     }
-    // Fallback: Get-NetTCPConnection maps port→owning PID structurally, with no
-    // dependence on console locale or column layout. Belt-and-suspenders for the
-    // portable/embedded-Python launch shape reported in #449. LocalAddress is
-    // selected too so the host filter still applies.
     try {
       const out = execSync(
         `powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | ForEach-Object { \\"$($_.LocalAddress) $($_.OwningProcess)\\" }"`,
         { encoding: "utf-8", timeout: 8000 },
       );
+      ranSomething = true;
       for (const raw of out.split(/\r?\n/)) {
         const [addr, pidText] = raw.trim().split(/\s+/);
         if (!addr || !pidText) continue;
         if (!addressServesHost(addr.replace(/^\[|\]$/g, ""), host)) continue;
         const pid = parseInt(pidText, 10);
-        if (!Number.isNaN(pid) && pid > 0) return pid;
+        if (!Number.isNaN(pid) && pid > 0) return { state: "owned", pid };
       }
-    } catch {
-      // PowerShell unavailable / nothing listening.
+    } catch (err) {
+      failures.push(`powershell: ${err instanceof Error ? err.message : String(err)}`);
     }
-    return null;
+    // A probe that RAN and matched nothing is real evidence the port is free.
+    // Every probe failing is not.
+    return ranSomething
+      ? { state: "free" }
+      : { state: "unknown", reason: failures.join("; ") || "no port probe available" };
   }
 
+  // THE PRECEDENCE BETWEEN THE TWO SOURCES — stated here because it is the thing a
+  // future edit will get wrong, and because getting it wrong certifies a stop that
+  // never happened:
+  //
+  //   EXISTENCE is decided by the kernel table wherever it is available.
+  //   lsof only ATTRIBUTES an existing socket to a pid.
+  //
+  // The kernel table sees every socket regardless of owner and cannot be silenced —
+  // that is the entire reason it is consulted. lsof needs privileges the table does
+  // not, so lsof failing to find or name a listener the kernel CAN see means "I
+  // could not identify it", never "it is not there". A positive existence finding is
+  // therefore never overridable by a negative from a source that sees strictly less.
+  const kernel = readKernelSocketTables(port);
+  if (kernel === "none") return { state: "free" };
+
+  const listeningButUnnamed = {
+    state: "unknown",
+    reason: "a socket is listening on the port but lsof could not name its owner",
+  } as const;
+
+  /**
+   * lsof positively STATED that nothing is listening. Believable only when the
+   * kernel has neither contradicted it nor left a blind spot lsof could share: an
+   * unprivileged lsof reports exactly this while being unable to enumerate another
+   * user's listener, so it may not be spent as proof against a table we could not
+   * finish reading.
+   */
+  const lsofReportsNothingListening = (): PortOwnerProbe => {
+    if (kernel === "listening") return listeningButUnnamed;
+    if (kernel === "incomplete") {
+      return {
+        state: "unknown",
+        reason:
+          "lsof found nothing, but a kernel socket table could not be read in full — an unreadable table may hold the listener",
+      };
+    }
+    return { state: "free" };
+  };
+
   try {
-    // LISTENER-ONLY, TCP only, and bound to the ADDRESS we actually talk to. A bare
-    // `lsof -ti :PORT` also matches processes merely CONNECTED to that port (and
-    // UDP), so it can return a client — a browser, or our own fetch — instead of the
-    // ComfyUI server. That PID is used to kill the server AND (since #401) to read
-    // the interpreter it runs, so a client must never be mistaken for it. `-Fpn`
-    // field output carries the bind address, which terse `-t` cannot express.
-    const out = execSync(`lsof -nP -iTCP:${port} -sTCP:LISTEN -Fpn`, {
+    // `-V` makes lsof STATE what it failed to locate, which is the only positive
+    // "nothing is listening" signal it offers (see readLsofAbsence).
+    //
+    // `2>&1` because lsof reports an INCOMPLETE enumeration on stderr, and on the
+    // success path `execSync` returns stdout ONLY — so without the redirect a marker
+    // on stdout beside a warning on stderr reads as a clean absence, and certifies a
+    // release from a search that admitted it was partial. The error path already sees
+    // both streams; this makes the success path see what the error path sees.
+    // Warnings do not disturb the field parser, which keys on `p`/`n` line prefixes.
+    // A host whose lsof warns routinely therefore loses the fast path — it costs a
+    // wait, never a wrong answer, which is the trade this whole probe makes.
+    const out = execSync(`lsof -V -nP -iTCP:${port} -sTCP:LISTEN -Fpn 2>&1`, {
       encoding: "utf-8",
       timeout: 5000,
     });
     const pid = parseListenerPidFromLsof(out, port, host);
-    if (pid) return pid;
-  } catch {
-    // Command failed — no process listening on that port
+    if (pid) return { state: "owned", pid };
+    const absence = readLsofAbsence(out);
+    if (absence === "stated") return lsofReportsNothingListening();
+    // It DID report an empty search; we declined to spend it. Say that, rather than
+    // reporting the one cause we know did not apply.
+    if (absence === "inconclusive") {
+      return { state: "unknown", reason: LSOF_INCONCLUSIVE_REASON };
+    }
+    // Exited 0 but named nobody, and did not say it looked and found nothing.
+    return kernel === "listening"
+      ? listeningButUnnamed
+      : { state: "unknown", reason: "lsof listed no owner and did not report an empty search" };
+  } catch (err) {
+    const absence = lsofErrorAbsence(err);
+    if (absence === "stated") return lsofReportsNothingListening();
+    if (absence === "inconclusive") {
+      return { state: "unknown", reason: LSOF_INCONCLUSIVE_REASON };
+    }
+    return {
+      state: "unknown",
+      reason: `lsof: ${err instanceof Error ? err.message : String(err)}`,
+    };
   }
-  return null;
+}
+
+export function findPidByPort(port: number, host?: string): number | null {
+  const probe = probePortOwner(port, host);
+  return probe.state === "owned" ? probe.pid : null;
 }
