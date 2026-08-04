@@ -12,6 +12,7 @@ import type {
   SubgraphLink,
 } from "../comfyui/types.js";
 import { logger } from "../utils/logger.js";
+import { isUeSender } from "./flatten-workflow.js";
 
 export interface ConversionResult {
   workflow: WorkflowJSON;
@@ -472,6 +473,8 @@ function busKey(wv: unknown): unknown {
 function deVirtualizeGraph(
   nodes: UiNode[] | undefined,
   links: unknown[] | undefined,
+  warnings: string[],
+  scope: string,
 ): void {
   if (!nodes?.length || !links?.length) return;
   const dict = !Array.isArray(links[0]);
@@ -479,6 +482,7 @@ function deVirtualizeGraph(
   const lsrc = (l: any) => (dict ? l.origin_id : l[1]);
   const lsrcSlot = (l: any) => (dict ? l.origin_slot : l[2]);
   const ltgt = (l: any) => (dict ? l.target_id : l[3]);
+  const ltgtSlot = (l: any) => (dict ? l.target_slot : l[4]);
   const setLsrc = (l: any, n: unknown, s: unknown) => {
     if (dict) { l.origin_id = n; l.origin_slot = s; }
     else { l[1] = n; l[2] = s; }
@@ -490,7 +494,19 @@ function deVirtualizeGraph(
   for (const n of nodes) {
     if (isSetVirtual(n.type)) {
       const b = busKey(n.widgets_values);
-      if (b != null) busSet.set(String(b), n);
+      if (b == null) continue;
+      // Two Set nodes on the SAME bus name: whichever we keep, the other's writer
+      // is unreachable. litegraph resolves by iteration order (last wins), so
+      // mirror that — but SAY SO, because the graph's meaning is genuinely
+      // ambiguous and the stripped result silently picks one of two producers.
+      if (busSet.has(String(b))) {
+        warnings.push(
+          `${scope}: bus "${String(b)}" is written by more than one Set node (#${
+            busSet.get(String(b))!.id
+          } and #${n.id}) — the LAST one wins when resolving its Get nodes, so the other producer is not reachable in the stripped graph.`,
+        );
+      }
+      busSet.set(String(b), n);
     }
   }
   const incoming = (node: UiNode) => {
@@ -498,24 +514,54 @@ function deVirtualizeGraph(
     const l = inp?.link != null ? linkById.get(inp.link) : undefined;
     return l ? { node: lsrc(l), slot: lsrcSlot(l) } : null;
   };
+  type Resolved =
+    | { ok: true; node: unknown; slot: unknown }
+    | { ok: false; reason: string };
   const resolveReal = (
     nodeId: unknown,
     slot: unknown,
     depth = 0,
-  ): { node: unknown; slot: unknown } | null => {
-    if (depth > 100) return null;
+  ): Resolved => {
+    if (depth > 100) {
+      return {
+        ok: false,
+        reason: `the virtual-wiring chain exceeded 100 hops (a Get/Set or Reroute cycle)`,
+      };
+    }
     const node = byId.get(nodeId as number);
-    if (!node) return { node: nodeId, slot };
+    if (!node) return { ok: true, node: nodeId, slot };
     if (node.type === "Reroute") {
       const s = incoming(node);
-      return s ? resolveReal(s.node, s.slot, depth + 1) : null;
+      return s
+        ? resolveReal(s.node, s.slot, depth + 1)
+        : { ok: false, reason: `Reroute #${node.id} has no incoming connection` };
     }
     if (isGetVirtual(node.type)) {
       const b = busKey(node.widgets_values);
-      const setN = b != null ? busSet.get(String(b)) : undefined;
-      if (!setN) return null;
+      if (b == null) {
+        return {
+          ok: false,
+          reason: `${node.type} #${node.id} has no bus name (its "Constant" widget is unset)`,
+        };
+      }
+      const setN = busSet.get(String(b));
+      if (!setN) {
+        return {
+          ok: false,
+          reason: `${node.type} #${node.id} reads bus "${String(
+            b,
+          )}" but no Set node in ${scope} writes that bus`,
+        };
+      }
       const s = incoming(setN);
-      return s ? resolveReal(s.node, s.slot, depth + 1) : null;
+      return s
+        ? resolveReal(s.node, s.slot, depth + 1)
+        : {
+            ok: false,
+            reason: `${node.type} #${node.id} reads bus "${String(b)}", whose ${
+              setN.type
+            } #${setN.id} has no incoming connection`,
+          };
     }
     // SetNode passthrough: rgthree/KJNodes Set nodes expose an output that mirrors
     // their value input, so a consumer can wire straight off the SetNode (not only
@@ -524,12 +570,17 @@ function deVirtualizeGraph(
     // the connection (issue #361: Set/Get-resolved links missing on downstream nodes).
     if (isSetVirtual(node.type)) {
       const s = incoming(node);
-      return s ? resolveReal(s.node, s.slot, depth + 1) : null;
+      return s
+        ? resolveReal(s.node, s.slot, depth + 1)
+        : {
+            ok: false,
+            reason: `${node.type} #${node.id} has no incoming connection`,
+          };
     }
-    return { node: nodeId, slot };
+    return { ok: true, node: nodeId, slot };
   };
 
-  const drop = new Set<unknown>();
+  const drop = new Map<unknown, string>();
   for (const l of links as any[]) {
     const srcType = byId.get(lsrc(l))?.type;
     if (
@@ -537,12 +588,37 @@ function deVirtualizeGraph(
       (srcType && (isGetVirtual(srcType) || isSetVirtual(srcType)))
     ) {
       const real = resolveReal(lsrc(l), lsrcSlot(l));
-      if (real && !isWiringVirtual(byId.get(real.node as number)?.type)) {
+      if (real.ok && !isWiringVirtual(byId.get(real.node as number)?.type)) {
         setLsrc(l, real.node, real.slot);
       } else {
-        drop.add(lid(l)); // unresolved bus/reroute — drop like a dead link
+        // Unresolved bus/reroute. Dropping it silently is issue #361's actual
+        // harm: the consumer's input simply vanishes and the stripped graph looks
+        // fine. Name the consumer + the reason, and CLEAR the consumer's stale
+        // link reference so the graph stays self-consistent (an orphaned link id
+        // would otherwise resurface later as an anonymous "dangling link").
+        drop.set(
+          lid(l),
+          real.ok
+            ? `the chain resolved to another virtual wiring node, which has no executable equivalent`
+            : real.reason,
+        );
       }
     }
+  }
+  for (const [linkId, reason] of drop) {
+    const l = linkById.get(linkId);
+    if (!l) continue;
+    const consumer = byId.get(ltgt(l));
+    // A dropped link INTO a virtual node is consumed by the resolution itself —
+    // there is no surviving consumer to lose a connection, so nothing to report.
+    if (!consumer || isWiringVirtual(consumer.type)) continue;
+    const slotIdx = ltgtSlot(l) as number;
+    const inputSlot = consumer.inputs?.[slotIdx];
+    if (inputSlot && inputSlot.link === linkId) inputSlot.link = null;
+    const inputName = inputSlot?.name ?? `slot ${slotIdx}`;
+    warnings.push(
+      `Node ${consumer.id} (${consumer.type}) in ${scope}: input "${inputName}" was fed through virtual Get/Set/Reroute wiring that could NOT be resolved to a real producer — ${reason}. That connection is ABSENT from the stripped graph even though the source workflow has it.`,
+    );
   }
   const keptLinks = (links as any[]).filter((l) => {
     if (drop.has(lid(l))) return false;
@@ -558,10 +634,110 @@ function deVirtualizeGraph(
 }
 
 /** Strip wiring virtuals from the top-level graph and every subgraph definition. */
-function deVirtualize(ui: UiWorkflow): void {
-  deVirtualizeGraph(ui.nodes, ui.links as unknown[]);
+function deVirtualize(ui: UiWorkflow, warnings: string[]): void {
+  deVirtualizeGraph(ui.nodes, ui.links as unknown[], warnings, "the top-level graph");
   for (const sg of ui.definitions?.subgraphs ?? []) {
-    deVirtualizeGraph(sg.nodes, sg.links as unknown[]);
+    deVirtualizeGraph(
+      sg.nodes,
+      sg.links as unknown[],
+      warnings,
+      `subgraph "${sg.name ?? sg.id}"`,
+    );
+  }
+}
+
+// ── cg-use-everywhere (UE) broadcast materialization ────────────────────────
+
+/**
+ * cg-use-everywhere ("Anything Everywhere", "Seed Everywhere", "Prompts
+ * Everywhere") wires its consumers with links that DO NOT EXIST in `graph.links`
+ * — the pack's browser JS injects them at queue time. A pure `links`-based
+ * conversion therefore emits a graph whose consumers have NO connection at all,
+ * with nothing said (issue #361: "virtual links from node packs that aren't
+ * ordinary graph links").
+ *
+ * The pack writes its OWN computed broadcast list to `extra.ue_links` on every
+ * graph analysis, so that list — not a re-implementation of the pack's matching
+ * rules — is the ground truth. Materialize each entry as a REAL link before
+ * de-virtualization (so a broadcast whose producer sits behind a Get/Set bus
+ * still resolves), and never overwrite an input that already has a real link
+ * (UE does not fire on a connected input).
+ *
+ * When senders exist but `extra.ue_links` does not, the broadcasts are NOT
+ * recoverable from the saved graph — that is an UNKNOWN, not an absence, so it
+ * is reported rather than quietly treated as "no broadcasts".
+ */
+interface UeLinkEntry {
+  downstream: number;
+  downstream_slot: number;
+  upstream: number;
+  upstream_slot: number;
+  type?: string;
+}
+
+function materializeUeLinks(ui: UiWorkflow, warnings: string[]): void {
+  const nodes = ui.nodes ?? [];
+  const senders = nodes.filter((n) => typeof n.type === "string" && isUeSender(n.type));
+  if (senders.length === 0) return;
+
+  const ueLinks = (ui.extra as Record<string, unknown> | undefined)?.ue_links;
+  if (!Array.isArray(ueLinks) || ueLinks.length === 0) {
+    warnings.push(
+      `${senders.length} cg-use-everywhere broadcast node(s) (${senders
+        .map((s) => `${s.type} #${s.id}`)
+        .join(", ")}) are present, but the graph carries no computed "extra.ue_links" list. ` +
+        `Their broadcast connections are NOT ordinary graph links and CANNOT be recovered from this file, so every input they feed is UNCONNECTED in the stripped graph. ` +
+        `Open the workflow with cg-use-everywhere active and save (or queue) it once so the pack writes extra.ue_links, then strip again.`,
+    );
+    return;
+  }
+
+  const nodesById = new Map(nodes.map((n) => [n.id, n]));
+  const links = (ui.links ??= []);
+  let nextLinkId =
+    Math.max(
+      ui.last_link_id ?? 0,
+      0,
+      ...links.filter((l) => Array.isArray(l)).map((l) => l[0]),
+    ) + 1;
+
+  let added = 0;
+  for (const raw of ueLinks as UeLinkEntry[]) {
+    const dst = nodesById.get(raw?.downstream);
+    const dstInput = dst?.inputs?.[raw?.downstream_slot];
+    if (!dst || !dstInput) {
+      warnings.push(
+        `A cg-use-everywhere broadcast targets node #${raw?.downstream} slot ${raw?.downstream_slot}, which no longer exists in this graph — that broadcast connection is ABSENT from the stripped graph.`,
+      );
+      continue;
+    }
+    if (dstInput.link != null) continue; // real link present — UE would not fire
+    const src = nodesById.get(raw.upstream);
+    const srcOut = src?.outputs?.[raw.upstream_slot];
+    if (!src) {
+      warnings.push(
+        `A cg-use-everywhere broadcast into node ${dst.id} (${dst.type}) input "${
+          dstInput.name ?? raw.downstream_slot
+        }" names producer #${raw.upstream}, which is not in this graph — that connection is ABSENT from the stripped graph.`,
+      );
+      continue;
+    }
+    const id = nextLinkId++;
+    links.push([
+      id,
+      raw.upstream,
+      raw.upstream_slot,
+      raw.downstream,
+      raw.downstream_slot,
+      raw.type ?? dstInput.type ?? "*",
+    ]);
+    dstInput.link = id;
+    if (srcOut) srcOut.links = [...(srcOut.links ?? []), id];
+    added++;
+  }
+  ui.last_link_id = nextLinkId - 1;
+  if (added > 0) {
+    logger.info(`Materialized ${added} cg-use-everywhere broadcast link(s)`);
   }
 }
 
@@ -865,28 +1041,133 @@ function expandSingleComponent(
     }
   }
 
-  // ── 8. Apply proxy widget values ────────────────────────────────────────
-  const proxyWidgets: [string, string][] =
-    (compNode.properties?.proxyWidgets as [string, string][]) ?? [];
+  // ── 8. Apply promoted ("proxy") widget values ───────────────────────────
+  // A subgraph node's own widgets are PROMOTIONS: `properties.proxyWidgets` is an
+  // ordered [innerNodeId, widgetName] list parallel to `widgets_values`, and the
+  // value the user sees/edits on the subgraph node is the LIVE value — the inner
+  // node's own saved widgets_values is whatever it held when the subgraph was
+  // built. Failing to push the promoted value down means the stripped graph
+  // reports (and would run) the STALE inner value: issue #361's "returns wrong
+  // dynamic widget values".
+  //
+  // Two promotion shapes exist and BOTH were silently dropped before:
+  //   • innerNodeId "-1" — the promotion targets a SUBGRAPH INPUT slot (a widget
+  //     exposed on the subgraph boundary). Its value belongs to every inner
+  //     consumer wired from that input slot.
+  //   • a real inner node id — the promotion targets that node's named widget.
+  // The old code resolved neither reliably: it mapped the widget NAME to a
+  // POSITION with findWidgetIndex(), which counts only widgets that appear in the
+  // node's inputs[] and returns null otherwise — so a promoted value either
+  // vanished or (when inputs[] omitted some widgets) landed on the WRONG widget.
+  // Values are now carried BY NAME on `resolvedWidgetValues` and applied by the main
+  // converter against object_info, which is authoritative about widget names.
+  const proxyWidgets: [string, string][] = Array.isArray(compNode.properties?.proxyWidgets)
+    ? (compNode.properties!.proxyWidgets as [string, string][])
+    : [];
   const widgetValues = compNode.widgets_values ?? [];
 
+  /** Record a promoted value on an inner node BY NAME. A nested subgraph
+   *  instance has no object_info of its own, so its promotion is recorded
+   *  positionally in its OWN proxyWidgets order (the next expansion pass reads
+   *  it from there). Returns false when the target cannot carry the value. */
+  const applyPromoted = (target: UiNode, widgetName: string, value: unknown): boolean => {
+    const innerProxy = target.properties?.proxyWidgets;
+    if (Array.isArray(innerProxy) && innerProxy.length > 0) {
+      const idx = (innerProxy as [string, string][]).findIndex(
+        ([, wn]) => wn === widgetName,
+      );
+      if (idx < 0) return false;
+      if (!Array.isArray(target.widgets_values)) target.widgets_values = [];
+      target.widgets_values[idx] = value;
+      return true;
+    }
+    (target.resolvedWidgetValues ??= {})[widgetName] = value;
+    return true;
+  };
+
+  // NOTE: a promoted widget with no entry in widgets_values is NOT a loss and is
+  // deliberately not reported. The subgraph node's widget is a PROXY VIEW of the
+  // inner widget, so "no serialized override" means the inner node's own stored
+  // value is exactly what the subgraph node displayed — which is what we keep.
+  // (Most real subgraph instances serialize an empty widgets_values, so warning
+  // here fired on nearly every subgraph-bearing workflow and would have buried
+  // the genuine losses below.)
   for (let i = 0; i < proxyWidgets.length; i++) {
-    const [innerNodeIdStr, widgetName] = proxyWidgets[i];
+    const entry = proxyWidgets[i];
+    if (!Array.isArray(entry) || entry.length < 2) continue;
+    const [innerNodeIdStr, widgetName] = entry;
     const value = i < widgetValues.length ? widgetValues[i] : undefined;
     if (value === undefined || value === null) continue;
 
-    const innerNodeIdNum = Number(innerNodeIdStr);
-    const remapped = nodeRemap.get(innerNodeIdNum);
-    if (remapped == null) continue;
+    const remapped = nodeRemap.get(Number(innerNodeIdStr));
+    if (remapped != null) {
+      const targetNode = newNodes.find((n) => n.id === remapped);
+      if (targetNode && applyPromoted(targetNode, widgetName, value)) continue;
+      warnings.push(
+        `Component "${sg.name}" (node ${compNode.id}): promoted widget "${widgetName}" = ${JSON.stringify(
+          value,
+        )} could not be applied to inner node ${innerNodeIdStr} — the stripped graph keeps that node's own stored value instead.`,
+      );
+      continue;
+    }
 
-    const targetNode = newNodes.find((n) => n.id === remapped);
-    if (!targetNode) continue;
+    // "-1" (or any id that is not an inner node): the promotion targets a
+    // SUBGRAPH INPUT slot. Push the value to every inner consumer wired from it —
+    // but only when the OUTER slot is unconnected, since a real incoming link
+    // supplies the value at runtime and step 6 already rewired it.
+    const sgInput = sg.inputs?.find((inp) => inp.name === widgetName);
+    const outerSlot = compNode.inputs?.find((inp) => inp.name === widgetName);
+    if (outerSlot?.link != null && outerLinkMap.has(outerSlot.link)) continue;
+    if (!sgInput) {
+      warnings.push(
+        `Component "${sg.name}" (node ${compNode.id}): promoted widget "${widgetName}" = ${JSON.stringify(
+          value,
+        )} does not match any inner node or subgraph input, so it could NOT be applied — the stripped graph uses the inner node's stored value instead.`,
+      );
+      continue;
+    }
+    let applied = 0;
+    for (const innerLinkId of sgInput.linkIds ?? []) {
+      const il = innerLinkById.get(innerLinkId);
+      if (!il || il.origin_id !== inputNodeId) continue;
+      const remappedTarget = nodeRemap.get(il.target_id);
+      const targetNode =
+        remappedTarget != null ? newNodes.find((n) => n.id === remappedTarget) : undefined;
+      if (!targetNode) continue;
+      const slot = targetNode.inputs?.[il.target_slot];
+      const innerName = slot?.widget?.name ?? slot?.name;
+      // The feed came from the virtual input node (-10), which step 5 skips, so
+      // the inner slot's link id points at nothing. Clear it — the promoted value
+      // IS the connection now.
+      if (slot) slot.link = null;
+      if (!innerName || !applyPromoted(targetNode, innerName, value)) continue;
+      applied++;
+    }
+    if (applied === 0) {
+      warnings.push(
+        `Component "${sg.name}" (node ${compNode.id}): promoted widget "${widgetName}" = ${JSON.stringify(
+          value,
+        )} has no inner consumer that could receive it, so it is NOT reflected in the stripped graph.`,
+      );
+    }
+  }
 
-    // Find the widget position in widgets_values by counting widget-type inputs
-    const widgetIdx = findWidgetIndex(targetNode, widgetName);
-    if (widgetIdx != null) {
-      if (!targetNode.widgets_values) targetNode.widgets_values = [];
-      targetNode.widgets_values[widgetIdx] = value;
+  // ── 8b. Unconnected subgraph inputs ─────────────────────────────────────
+  // An inner slot fed from the virtual input node (-10) whose OUTER slot has no
+  // link references a link id that step 5 never materialized. Clear it so the
+  // graph is self-consistent — otherwise it later surfaces as an anonymous
+  // "dangling link", indistinguishable from a real dropped connection.
+  for (const sgInput of sg.inputs ?? []) {
+    const outerSlot = compNode.inputs?.find((inp) => inp.name === sgInput.name);
+    if (outerSlot?.link != null && outerLinkMap.has(outerSlot.link)) continue;
+    for (const innerLinkId of sgInput.linkIds ?? []) {
+      const il = innerLinkById.get(innerLinkId);
+      if (!il || il.origin_id !== inputNodeId) continue;
+      const remappedTarget = nodeRemap.get(il.target_id);
+      const targetNode =
+        remappedTarget != null ? newNodes.find((n) => n.id === remappedTarget) : undefined;
+      const slot = targetNode?.inputs?.[il.target_slot];
+      if (slot && slot.link === linkRemap.get(innerLinkId)) slot.link = null;
     }
   }
 
@@ -923,11 +1204,13 @@ function expandSingleComponent(
           (inp) => inp.link === link[0] && inp.widget,
         );
         if (tgtInput) {
-          const idx = findWidgetIndex(tgtNode, tgtInput.widget!.name);
-          if (idx != null) {
-            if (!tgtNode.widgets_values) tgtNode.widgets_values = [];
-            tgtNode.widgets_values[idx] = primValue;
-          }
+          // Carry the literal BY NAME. (It used to be written positionally via
+          // findWidgetIndex, which counts only the widgets present in inputs[] —
+          // so on a node whose inputs[] omits some widgets the value landed on the
+          // WRONG widget, and when the widget was absent from inputs[] entirely it
+          // was dropped outright. Same #361 wrong-widget-value class as the
+          // promoted-widget path above.)
+          (tgtNode.resolvedWidgetValues ??= {})[tgtInput.widget!.name] = primValue;
           // Clear the link so the main converter treats this as a widget value
           tgtInput.link = null;
         }
@@ -953,31 +1236,6 @@ function expandSingleComponent(
     nextLinkId,
     warnings,
   };
-}
-
-/**
- * Find the widgets_values index for a named widget on a UI node.
- * Counts widget-type inputs (those with a `widget` property) in order.
- */
-function findWidgetIndex(node: UiNode, widgetName: string): number | null {
-  if (!node.inputs) return null;
-
-  // Widget inputs on a UiNode are entries in `inputs[]` that have a `widget` property.
-  // However, not all widgets appear in `inputs[]` — some are only in `widgets_values`.
-  // We count only the widget-inputs that appear in the node's inputs array,
-  // matching by the `widget.name` field.
-  let idx = 0;
-  for (const inp of node.inputs) {
-    if (inp.widget) {
-      if (inp.widget.name === widgetName) return idx;
-      idx++;
-    }
-  }
-
-  // Fallback: if widget is not in inputs[] (pure widget, no link slot),
-  // it may be at a fixed position. Search widgets_values if we can match by name.
-  // For now, return null — the widget is likely at its default value.
-  return null;
 }
 
 // ── API → UI conversion ─────────────────────────────────────────────────────
@@ -1377,15 +1635,19 @@ export function convertUiToApi(
   ui: UiWorkflow,
   objectInfo: ObjectInfo,
 ): ConversionResult {
-  // Clone (don't mutate the caller's workflow), strip the wiring virtuals
-  // (Get/Set bus + Reroute) so the expander + converter only see real links,
-  // then expand component/subgraph nodes.
+  // Clone (don't mutate the caller's workflow), materialize the node-pack
+  // broadcast wiring that isn't in `links` at all (cg-use-everywhere), strip the
+  // wiring virtuals (Get/Set bus + Reroute) so the expander + converter only see
+  // real links, then expand component/subgraph nodes. Every step reports what it
+  // could NOT preserve into the same warnings list (#361).
+  const warnings: string[] = [];
   const cleaned = structuredClone(ui);
-  deVirtualize(cleaned);
+  materializeUeLinks(cleaned, warnings);
+  deVirtualize(cleaned, warnings);
   const { expanded, warnings: expandWarnings } = expandComponents(cleaned);
+  warnings.push(...expandWarnings);
 
   const workflow: WorkflowJSON = {};
-  const warnings: string[] = [...expandWarnings];
 
   // Build link lookup: linkId → LinkInfo
   const linkMap = new Map<number, LinkInfo>();
@@ -1432,39 +1694,82 @@ export function convertUiToApi(
   // sources pass through — the consumer reconnects to the bypassed node's input
   // whose type matches the requested output slot (same index first, then any
   // type match), recursing through chains of bypassed/virtual nodes.
-  const resolveSource = (
-    linkId: number,
-    depth = 0,
-  ): { id: string; slot: number } | null => {
-    if (depth > 100) return null;
+  //
+  // A failure carries WHY. `toggle` means the drop is ComfyUI's own documented
+  // mute/bypass semantics (the queue does the same thing), so it is summarized
+  // once rather than repeated per edge; anything else is a genuine loss the
+  // caller has no other way to notice, so it is reported per input (#361).
+  type SourceResult =
+    | { ok: true; id: string; slot: number }
+    | { ok: false; toggle: boolean; reason: string };
+  const resolveSource = (linkId: number, depth = 0): SourceResult => {
+    if (depth > 100) {
+      return {
+        ok: false,
+        toggle: false,
+        reason: "the upstream chain exceeded 100 hops (a cycle in the wiring)",
+      };
+    }
     const link = linkMap.get(linkId);
-    if (!link) return null;
+    if (!link) {
+      return {
+        ok: false,
+        toggle: false,
+        reason: `link ${linkId} does not exist in the graph (a dangling reference)`,
+      };
+    }
     const src = nodesById.get(link.sourceNodeId);
     if (!src) {
-      return { id: String(link.sourceNodeId), slot: link.sourceSlot };
+      return { ok: true, id: String(link.sourceNodeId), slot: link.sourceSlot };
     }
     // Virtual GetNode: follow the bus to the SetNode that wrote it.
     if (isGetType(src.type)) {
       const bus = busKey(src.widgets_values);
       const setLink = bus != null ? busSource.get(String(bus)) : undefined;
-      return setLink != null ? resolveSource(setLink, depth + 1) : null;
+      return setLink != null
+        ? resolveSource(setLink, depth + 1)
+        : {
+            ok: false,
+            toggle: false,
+            reason: `${src.type} #${src.id} reads bus "${String(
+              bus,
+            )}", which no Set node writes`,
+          };
     }
     // Virtual SetNode passthrough: follow its value input.
     if (isSetType(src.type)) {
       const inp = (src.inputs ?? []).find((i) => i.link != null);
-      return inp?.link != null ? resolveSource(inp.link, depth + 1) : null;
+      return inp?.link != null
+        ? resolveSource(inp.link, depth + 1)
+        : {
+            ok: false,
+            toggle: false,
+            reason: `${src.type} #${src.id} has no incoming connection`,
+          };
     }
     // Reroute passthrough: a virtual node that just forwards its single input to
     // all outputs — follow its input link to the real source.
     if (src.type === "Reroute") {
       const inp = (src.inputs ?? []).find((i) => i.link != null);
-      return inp?.link != null ? resolveSource(inp.link, depth + 1) : null;
+      return inp?.link != null
+        ? resolveSource(inp.link, depth + 1)
+        : {
+            ok: false,
+            toggle: false,
+            reason: `Reroute #${src.id} has no incoming connection`,
+          };
     }
     const mode = src.mode ?? 0;
     if (mode === 0) {
-      return { id: String(link.sourceNodeId), slot: link.sourceSlot };
+      return { ok: true, id: String(link.sourceNodeId), slot: link.sourceSlot };
     }
-    if (mode === 2) return null; // muted: connection dropped
+    if (mode === 2) {
+      return {
+        ok: false,
+        toggle: true,
+        reason: `its source node ${src.id} (${src.type}) is MUTED`,
+      };
+    }
     if (mode === 4) {
       // bypass: find a matching-type input to pass through
       const outType = link.typeName;
@@ -1475,11 +1780,23 @@ export function convertUiToApi(
           (i) => i.link != null && (!outType || i.type === outType),
         );
       }
-      if (!cand || cand.link == null) return null;
+      if (!cand || cand.link == null) {
+        return {
+          ok: false,
+          toggle: true,
+          reason: `its source node ${src.id} (${src.type}) is BYPASSED and has no matching input to pass through`,
+        };
+      }
       return resolveSource(cand.link, depth + 1);
     }
-    return null;
+    return {
+      ok: false,
+      toggle: false,
+      reason: `its source node ${src.id} (${src.type}) has an unrecognized mode ${mode}`,
+    };
   };
+  // Count of connections dropped by mute/bypass — summarized once at the end.
+  let toggleDropped = 0;
 
   for (const node of expanded.nodes) {
     // Muted (2) and bypassed (4) nodes are excluded from the prompt entirely;
@@ -2002,6 +2319,32 @@ export function convertUiToApi(
       }
     }
 
+    // Widget values resolved BY NAME during subgraph expansion — a promoted
+    // ("proxy") widget value from the subgraph node, or a virtual PrimitiveNode
+    // literal baked onto its consumer. These are the LIVE values the user sees on
+    // the subgraph node, so they override the inner node's own stored
+    // widgets_values (which is whatever it held when the subgraph was built).
+    // Routed through the same combo choke-point as every other widget assignment.
+    const resolved = node.resolvedWidgetValues;
+    if (resolved) {
+      for (const [name, val] of Object.entries(resolved)) {
+        if (!widgetNames.includes(name)) {
+          warnings.push(
+            `Node ${nodeId} (${classType}): a promoted/primitive-supplied value for "${name}" could not be applied — the connected server's definition of ${classType} has no widget by that name, so the node keeps its own stored value.`,
+          );
+          continue;
+        }
+        inputs[name] = validateComboWidgetValue(
+          name,
+          val,
+          def,
+          classType,
+          nodeId,
+          warnings,
+        );
+      }
+    }
+
     // Fill any required input not covered by widgets_values or a link with its
     // object_info default, so /prompt validation doesn't reject on a missing
     // required input (e.g. a node version added a required widget the saved graph
@@ -2073,8 +2416,17 @@ export function convertUiToApi(
           }
           continue;
         }
-        const resolved = resolveSource(input.link);
-        if (resolved) inputs[input.name] = [resolved.id, resolved.slot];
+        const resolvedSrc = resolveSource(input.link);
+        if (resolvedSrc.ok) {
+          inputs[input.name] = [resolvedSrc.id, resolvedSrc.slot];
+        } else if (resolvedSrc.toggle) {
+          // ComfyUI's own queue drops these too — count, don't spam.
+          toggleDropped++;
+        } else {
+          warnings.push(
+            `Node ${nodeId} (${classType}): input "${input.name}" is WIRED in the source workflow but its connection could not be resolved — ${resolvedSrc.reason}. The input is ABSENT from the stripped graph.`,
+          );
+        }
       }
     }
 
@@ -2098,6 +2450,9 @@ export function convertUiToApi(
       // whether it's an un-parented literal OR a link ref. Keeping a link ref here
       // (the previous behavior) still emitted an orphan the server would reject.
       if (!(parent in inputs)) {
+        warnings.push(
+          `Node ${nodeId} (${classType}): the nested input "${key}" was dropped — its dynamic-combo parent "${parent}" has no value in the stripped graph, so there is no selected option the leaf could belong to (ComfyUI rejects an unknown nested input).`,
+        );
         delete inputs[key];
         continue;
       }
@@ -2205,6 +2560,12 @@ export function convertUiToApi(
             warnings.push(
               `Node ${nodeId} (${classType}): the linked nested input "${key}" was dropped — its dynamic parent "${parent}" is fed by a runtime link (resolved option unknown) and not every option defines "${leaf}", so keeping the connection could orphan it under an option that omits the leaf. "${leaf}" will use the resolved option's default instead of the wired link.`,
             );
+          } else {
+            warnings.push(
+              `Node ${nodeId} (${classType}): the nested value "${key}" = ${JSON.stringify(
+                leafVal,
+              )} was dropped — its dynamic parent "${parent}" is fed by a runtime link, so the selected option is unknowable here and this value is not valid under every option it could resolve to. "${leaf}" will use the resolved option's default instead.`,
+            );
           }
           delete inputs[key];
         }
@@ -2217,6 +2578,11 @@ export function convertUiToApi(
         // it whether it's a literal OR a real-link ref (both orphan under the final
         // option; a link ref is not exempt — the previous `continue` above leaked
         // exactly this case).
+        warnings.push(
+          `Node ${nodeId} (${classType}): the nested input "${key}" was dropped — the selected option "${String(
+            inputs[parent],
+          )}" of "${parent}" does not define it, so it would be an unknown input (this happens when the parent selection changed, e.g. it is supplied by a Primitive node).`,
+        );
         delete inputs[key];
         continue;
       }
@@ -2336,6 +2702,12 @@ export function convertUiToApi(
   }
   if (droppedMismatch > 0) {
     warnings.push(`Dropped ${droppedMismatch} type-mismatched link(s).`);
+  }
+
+  if (toggleDropped > 0) {
+    warnings.push(
+      `${toggleDropped} input connection(s) were dropped because their source node is muted, or bypassed with no matching pass-through input. This mirrors what ComfyUI's queue does with the same graph, so the stripped graph is faithful — but those inputs are unconnected in it.`,
+    );
   }
 
   const nodeCount = Object.keys(workflow).length;

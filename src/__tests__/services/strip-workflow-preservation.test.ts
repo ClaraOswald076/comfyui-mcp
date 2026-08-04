@@ -1,0 +1,572 @@
+// Issue #361: panel_strip_workflow / strip_workflow returned WRONG dynamic
+// widget values and DROPPED Set/Get (and other node-pack "virtual") links —
+// silently, so the caller got a graph that looks fine and renders differently.
+//
+// Two independent defects, both covered here:
+//   1. Promoted ("proxy") subgraph widget values were resolved POSITIONALLY via
+//      the widget's index among the inputs[] entries that carry a `widget` field.
+//      A widget absent from inputs[] resolved to nothing (value dropped), and a
+//      subgraph-input promotion (proxy id "-1") never resolved at all — so the
+//      stripped graph reported the inner node's STALE stored value.
+//   2. Virtual wiring that cannot be resolved (an orphan Get bus, a dead Reroute)
+//      was dropped with NO warning, and cg-use-everywhere broadcasts — which are
+//      not ordinary graph links at all — were never materialized.
+//
+// The invariant these tests defend: whatever the stripped graph cannot preserve,
+// it must SAY SO.
+import { describe, it, expect } from "vitest";
+import { convertUiToApi } from "../../services/workflow-converter.js";
+
+const OBJECT_INFO = {
+  LoadImage: { input: { required: { image: [["a.png", "b.png"]] } } },
+  SaveImage: {
+    input: { required: { images: ["IMAGE"], filename_prefix: ["STRING", { default: "x" }] } },
+  },
+  EmptyLatentImage: {
+    input: {
+      required: {
+        width: ["INT", { default: 512 }],
+        height: ["INT", { default: 512 }],
+        batch_size: ["INT", { default: 1 }],
+      },
+    },
+  },
+  CheckpointLoaderSimple: {
+    input: { required: { ckpt_name: [["installed.safetensors"]] } },
+  },
+  "Anything Everywhere": { input: { required: {}, optional: { anything: ["*"] } } },
+  PrimitiveInt: { input: { required: { value: ["INT", { default: 0 }] } }, output: ["INT"] },
+} as never;
+
+const joined = (warnings: string[]) => warnings.join("\n");
+
+// ── 1. Set/Get buses ────────────────────────────────────────────────────────
+
+describe("#361 — Set/Get bus links", () => {
+  /** SaveImage(3) fed from GetNode(5) on bus `bus`; SetNode(4) writes `writes`. */
+  function busGraph(writes: string | null, bus: string) {
+    const nodes: unknown[] = [
+      {
+        id: 1,
+        type: "LoadImage",
+        mode: 0,
+        inputs: [],
+        outputs: [{ name: "IMAGE", type: "IMAGE", links: writes == null ? [] : [11] }],
+        widgets_values: ["a.png"],
+      },
+      {
+        id: 5,
+        type: "GetNode",
+        mode: 0,
+        inputs: [],
+        outputs: [{ name: "IMAGE", type: "IMAGE", links: [10] }],
+        widgets_values: [bus],
+      },
+      {
+        id: 3,
+        type: "SaveImage",
+        mode: 0,
+        inputs: [{ name: "images", type: "IMAGE", link: 10 }],
+        outputs: [],
+        widgets_values: ["out"],
+      },
+    ];
+    const links: unknown[] = [[10, 5, 0, 3, 0, "IMAGE"]];
+    if (writes != null) {
+      nodes.push({
+        id: 4,
+        type: "SetNode",
+        mode: 0,
+        inputs: [{ name: "value", type: "IMAGE", link: 11 }],
+        outputs: [{ name: "*", type: "IMAGE", links: [] }],
+        widgets_values: [writes],
+      });
+      links.push([11, 1, 0, 4, 0, "IMAGE"]);
+    }
+    return { nodes, links } as never;
+  }
+
+  it("a RESOLVABLE bus still becomes a real link, with nothing reported as lost", () => {
+    const { workflow, warnings } = convertUiToApi(busGraph("img", "img"), OBJECT_INFO);
+    expect(workflow["3"].inputs.images).toEqual(["1", 0]);
+    expect(warnings).toEqual([]);
+  });
+
+  it("an ORPHAN Get bus names the consumer, the input, the bus, and says the connection is absent", () => {
+    const { workflow, warnings } = convertUiToApi(busGraph(null, "missing_bus"), OBJECT_INFO);
+    // The connection genuinely cannot be recovered — but it must be REPORTED.
+    expect(workflow["3"].inputs.images).toBeUndefined();
+    const text = joined(warnings);
+    expect(text).toContain("Node 3 (SaveImage)");
+    expect(text).toContain('input "images"');
+    expect(text).toContain("missing_bus");
+    expect(text).toContain("ABSENT from the stripped graph");
+  });
+
+  it("a Get bus whose Set node has no incoming connection says so", () => {
+    const g = busGraph("img", "img") as unknown as {
+      nodes: { id: number; inputs?: { link: number | null }[] }[];
+      links: unknown[];
+    };
+    // Cut the SetNode's feed.
+    g.nodes.find((n) => n.id === 4)!.inputs![0].link = null;
+    g.links = g.links.filter((l) => (l as number[])[0] !== 11);
+    const { warnings } = convertUiToApi(g as never, OBJECT_INFO);
+    expect(joined(warnings)).toContain("has no incoming connection");
+  });
+
+  it("two Set nodes on one bus is reported as ambiguous (last one wins)", () => {
+    const g = busGraph("img", "img") as unknown as { nodes: unknown[]; links: unknown[] };
+    g.nodes.push({
+      id: 6,
+      type: "SetNode",
+      mode: 0,
+      inputs: [{ name: "value", type: "IMAGE", link: 12 }],
+      outputs: [],
+      widgets_values: ["img"],
+    });
+    g.links.push([12, 1, 0, 6, 0, "IMAGE"]);
+    const { warnings } = convertUiToApi(g as never, OBJECT_INFO);
+    expect(joined(warnings)).toContain('bus "img" is written by more than one Set node');
+  });
+
+  it("a Reroute with no incoming connection is reported, not silently dropped", () => {
+    const g = {
+      nodes: [
+        {
+          id: 9,
+          type: "Reroute",
+          mode: 0,
+          inputs: [{ name: "", type: "IMAGE", link: null }],
+          outputs: [{ name: "", type: "IMAGE", links: [30] }],
+          widgets_values: [],
+        },
+        {
+          id: 3,
+          type: "SaveImage",
+          mode: 0,
+          inputs: [{ name: "images", type: "IMAGE", link: 30 }],
+          outputs: [],
+          widgets_values: ["out"],
+        },
+      ],
+      links: [[30, 9, 0, 3, 0, "IMAGE"]],
+    } as never;
+    const { warnings } = convertUiToApi(g, OBJECT_INFO);
+    expect(joined(warnings)).toContain("Reroute #9 has no incoming connection");
+    expect(joined(warnings)).toContain('input "images"');
+  });
+});
+
+// ── 2. cg-use-everywhere broadcasts ─────────────────────────────────────────
+
+describe("#361 — cg-use-everywhere broadcast links", () => {
+  function ueGraph(withUeLinks: boolean) {
+    return {
+      extra: withUeLinks
+        ? {
+            ue_links: [
+              {
+                downstream: 3,
+                downstream_slot: 0,
+                upstream: 1,
+                upstream_slot: 0,
+                controller: 7,
+                type: "IMAGE",
+              },
+            ],
+          }
+        : {},
+      nodes: [
+        {
+          id: 1,
+          type: "LoadImage",
+          mode: 0,
+          inputs: [],
+          outputs: [{ name: "IMAGE", type: "IMAGE", links: [20] }],
+          widgets_values: ["a.png"],
+        },
+        {
+          id: 7,
+          type: "Anything Everywhere",
+          mode: 0,
+          inputs: [{ name: "anything", type: "*", link: 20 }],
+          outputs: [],
+          widgets_values: [],
+        },
+        {
+          id: 3,
+          type: "SaveImage",
+          mode: 0,
+          inputs: [{ name: "images", type: "IMAGE", link: null }],
+          outputs: [],
+          widgets_values: ["out"],
+        },
+      ],
+      links: [[20, 1, 0, 7, 0, "IMAGE"]],
+    } as never;
+  }
+
+  it("materializes a broadcast from the pack's own extra.ue_links", () => {
+    const { workflow, warnings } = convertUiToApi(ueGraph(true), OBJECT_INFO);
+    expect(workflow["3"].inputs.images).toEqual(["1", 0]);
+    expect(warnings).toEqual([]);
+  });
+
+  it("senders with NO extra.ue_links: refuses to guess, and says the connections are unrecoverable", () => {
+    const { workflow, warnings } = convertUiToApi(ueGraph(false), OBJECT_INFO);
+    expect(workflow["3"].inputs.images).toBeUndefined(); // never fabricated
+    const text = joined(warnings);
+    expect(text).toContain("Anything Everywhere #7");
+    expect(text).toContain("CANNOT be recovered");
+    expect(text).toContain("extra.ue_links");
+  });
+
+  it("a broadcast whose producer sits behind a Set/Get bus resolves to the real producer", () => {
+    const g = {
+      extra: {
+        ue_links: [
+          {
+            downstream: 3,
+            downstream_slot: 0,
+            upstream: 5,
+            upstream_slot: 0,
+            controller: 7,
+            type: "IMAGE",
+          },
+        ],
+      },
+      nodes: [
+        {
+          id: 1,
+          type: "LoadImage",
+          mode: 0,
+          inputs: [],
+          outputs: [{ name: "IMAGE", type: "IMAGE", links: [21] }],
+          widgets_values: ["a.png"],
+        },
+        {
+          id: 4,
+          type: "SetNode",
+          mode: 0,
+          inputs: [{ name: "value", type: "IMAGE", link: 21 }],
+          outputs: [],
+          widgets_values: ["img"],
+        },
+        {
+          id: 5,
+          type: "GetNode",
+          mode: 0,
+          inputs: [],
+          outputs: [{ name: "IMAGE", type: "IMAGE", links: [] }],
+          widgets_values: ["img"],
+        },
+        {
+          id: 7,
+          type: "Anything Everywhere",
+          mode: 0,
+          inputs: [{ name: "anything", type: "*", link: null }],
+          outputs: [],
+          widgets_values: [],
+        },
+        {
+          id: 3,
+          type: "SaveImage",
+          mode: 0,
+          inputs: [{ name: "images", type: "IMAGE", link: null }],
+          outputs: [],
+          widgets_values: ["out"],
+        },
+      ],
+      links: [[21, 1, 0, 4, 0, "IMAGE"]],
+    } as never;
+    const { workflow } = convertUiToApi(g, OBJECT_INFO);
+    expect(workflow["3"].inputs.images).toEqual(["1", 0]);
+  });
+
+  it("a broadcast into a node that no longer exists is reported", () => {
+    const g = ueGraph(true) as unknown as {
+      extra: { ue_links: { downstream: number }[] };
+    };
+    g.extra.ue_links[0].downstream = 999;
+    const { warnings } = convertUiToApi(g as never, OBJECT_INFO);
+    expect(joined(warnings)).toContain("no longer exists");
+  });
+});
+
+// ── 3. Promoted ("proxy") subgraph widget values ────────────────────────────
+
+const SG_ID = "sg-uuid";
+
+/**
+ * One subgraph instance (706) wrapping EmptyLatentImage(50).
+ *  - `proxy` is the properties.proxyWidgets list,
+ *  - `values` is the instance's widgets_values (parallel to proxy),
+ *  - `linkWidth` wires a real producer into the instance's `width` slot.
+ */
+function subgraphGraph(opts: {
+  proxy: [string, string][];
+  values: unknown[];
+  innerInputs?: unknown[];
+  linkWidth?: boolean;
+}) {
+  const innerInputs = opts.innerInputs ?? [
+    { name: "width", type: "INT", widget: { name: "width" }, link: 101 },
+  ];
+  return {
+    definitions: {
+      subgraphs: [
+        {
+          id: SG_ID,
+          name: "Latent",
+          inputNode: { id: -10 },
+          outputNode: { id: -20 },
+          inputs: [{ id: "i1", name: "width", type: "INT", linkIds: [101] }],
+          outputs: [{ id: "o1", name: "LATENT", type: "LATENT", linkIds: [102] }],
+          widgets: [],
+          nodes: [
+            {
+              id: 50,
+              type: "EmptyLatentImage",
+              mode: 0,
+              inputs: innerInputs,
+              outputs: [{ name: "LATENT", type: "LATENT", links: [102] }],
+              widgets_values: [512, 512, 1],
+            },
+          ],
+          links: [
+            { id: 101, origin_id: -10, origin_slot: 0, target_id: 50, target_slot: 0, type: "INT" },
+            { id: 102, origin_id: 50, origin_slot: 0, target_id: -20, target_slot: 0, type: "LATENT" },
+          ],
+        },
+      ],
+    },
+    nodes: [
+      ...(opts.linkWidth
+        ? [
+            {
+              id: 60,
+              type: "PrimitiveInt",
+              mode: 0,
+              inputs: [],
+              outputs: [{ name: "INT", type: "INT", links: [200] }],
+              widgets_values: [64],
+            },
+          ]
+        : []),
+      {
+        id: 706,
+        type: SG_ID,
+        mode: 0,
+        properties: { proxyWidgets: opts.proxy },
+        inputs: [
+          {
+            name: "width",
+            type: "INT",
+            widget: { name: "width" },
+            link: opts.linkWidth ? 200 : null,
+          },
+        ],
+        outputs: [{ name: "LATENT", type: "LATENT", links: [] }],
+        widgets_values: opts.values,
+      },
+    ],
+    links: opts.linkWidth ? [[200, 60, 0, 706, 0, "INT"]] : [],
+  } as never;
+}
+
+/** The single expanded inner node (its id is remapped during expansion). */
+const onlyInner = (workflow: Record<string, { class_type: string; inputs: Record<string, unknown> }>) =>
+  Object.values(workflow).find((n) => n.class_type === "EmptyLatentImage" && "batch_size" in n.inputs)!;
+
+describe("#361 — promoted subgraph widget values", () => {
+  it("a subgraph-input promotion (proxy id '-1') reaches the inner node instead of its stale stored value", () => {
+    const { workflow, warnings } = convertUiToApi(
+      subgraphGraph({ proxy: [["-1", "width"]], values: [1920] }),
+      OBJECT_INFO,
+    );
+    // Before the fix this was 512 — the inner node's stored value — with NO warning.
+    expect(onlyInner(workflow as never).inputs.width).toBe(1920);
+    expect(warnings).toEqual([]);
+  });
+
+  it("a REAL incoming link on the promoted slot still wins over the promoted widget value", () => {
+    const { workflow } = convertUiToApi(
+      subgraphGraph({ proxy: [["-1", "width"]], values: [1920], linkWidth: true }),
+      OBJECT_INFO,
+    );
+    expect(onlyInner(workflow as never).inputs.width).toEqual(["60", 0]);
+  });
+
+  it("an inner-node promotion applies BY NAME even when the widget is absent from inputs[]", () => {
+    // `height` has no inputs[] entry at all: the old index-counting resolver
+    // returned null here and dropped the value outright.
+    const { workflow, warnings } = convertUiToApi(
+      subgraphGraph({ proxy: [["50", "height"]], values: [1088] }),
+      OBJECT_INFO,
+    );
+    expect(onlyInner(workflow as never).inputs.height).toBe(1088);
+    expect(warnings).toEqual([]);
+  });
+
+  it("an inner-node promotion lands on the NAMED widget, not on a mis-counted position", () => {
+    // `width` occupies an inputs[] slot but carries no `widget` marker, so the old
+    // index-counting resolver made `batch_size` the FIRST widget-input (index 0)
+    // and wrote the promoted 4 over widgets_values[0] — which is `width`.
+    const { workflow } = convertUiToApi(
+      subgraphGraph({
+        proxy: [["50", "batch_size"]],
+        values: [4],
+        innerInputs: [
+          { name: "width", type: "INT", link: 101 },
+          { name: "batch_size", type: "INT", widget: { name: "batch_size" }, link: null },
+        ],
+      }),
+      OBJECT_INFO,
+    );
+    const inner = onlyInner(workflow as never);
+    expect(inner.inputs.batch_size).toBe(4);
+    expect(inner.inputs.width).toBe(512); // NOT clobbered by the promotion
+  });
+
+  it("a promoted widget the server's node definition does not declare is reported, not dropped in silence", () => {
+    const { warnings } = convertUiToApi(
+      subgraphGraph({ proxy: [["50", "not_a_widget"]], values: [7] }),
+      OBJECT_INFO,
+    );
+    expect(joined(warnings)).toContain('"not_a_widget"');
+    expect(joined(warnings)).toContain("could not be applied");
+  });
+
+  it("a promoted widget with NO serialized value keeps the inner node's own value, silently", () => {
+    // Not a loss: the subgraph node's widget is a proxy VIEW of the inner widget,
+    // so no serialized override means the inner value is what was displayed.
+    // Warning here would fire on nearly every subgraph workflow and bury the
+    // genuine losses.
+    const { workflow, warnings } = convertUiToApi(
+      subgraphGraph({ proxy: [["-1", "width"], ["50", "height"]], values: [1920] }),
+      OBJECT_INFO,
+    );
+    const inner = onlyInner(workflow as never);
+    expect(inner.inputs.width).toBe(1920); // promoted
+    expect(inner.inputs.height).toBe(512); // no override → inner's own value
+    expect(warnings).toEqual([]);
+  });
+
+  it("a promoted value goes through the same combo validation as any other widget", () => {
+    // A promoted asset value the server does not have must be PRESERVED + warned
+    // (#407/#504), never silently swapped for the first installed option.
+    const g = {
+      definitions: {
+        subgraphs: [
+          {
+            id: SG_ID,
+            name: "Loader",
+            inputNode: { id: -10 },
+            outputNode: { id: -20 },
+            inputs: [],
+            outputs: [{ id: "o1", name: "MODEL", type: "MODEL", linkIds: [] }],
+            widgets: [],
+            nodes: [
+              {
+                id: 51,
+                type: "CheckpointLoaderSimple",
+                mode: 0,
+                inputs: [],
+                outputs: [{ name: "MODEL", type: "MODEL", links: [] }],
+                widgets_values: ["installed.safetensors"],
+              },
+            ],
+            links: [],
+          },
+        ],
+      },
+      nodes: [
+        {
+          id: 707,
+          type: SG_ID,
+          mode: 0,
+          properties: { proxyWidgets: [["51", "ckpt_name"]] },
+          inputs: [],
+          outputs: [],
+          widgets_values: ["not_installed.safetensors"],
+        },
+      ],
+      links: [],
+    } as never;
+    const { workflow, warnings } = convertUiToApi(g, OBJECT_INFO);
+    const loader = Object.values(workflow).find((n) => n.class_type === "CheckpointLoaderSimple")!;
+    expect(loader.inputs.ckpt_name).toBe("not_installed.safetensors");
+    expect(joined(warnings)).toContain("not installed on the connected server");
+  });
+});
+
+// ── 4. Other unresolvable connections ───────────────────────────────────────
+
+describe("#361 — unresolved ordinary links", () => {
+  it("an input wired to a link id that does not exist is reported", () => {
+    const g = {
+      nodes: [
+        {
+          id: 3,
+          type: "SaveImage",
+          mode: 0,
+          inputs: [{ name: "images", type: "IMAGE", link: 77 }],
+          outputs: [],
+          widgets_values: ["out"],
+        },
+        {
+          id: 1,
+          type: "LoadImage",
+          mode: 0,
+          inputs: [],
+          outputs: [{ name: "IMAGE", type: "IMAGE", links: [] }],
+          widgets_values: ["a.png"],
+        },
+      ],
+      links: [],
+    } as never;
+    const { warnings } = convertUiToApi(g, OBJECT_INFO);
+    expect(joined(warnings)).toContain("dangling reference");
+    expect(joined(warnings)).toContain('input "images"');
+  });
+
+  it("mute/bypass drops are summarized once rather than reported per edge", () => {
+    const g = {
+      nodes: [
+        {
+          id: 1,
+          type: "LoadImage",
+          mode: 2, // muted
+          inputs: [],
+          outputs: [{ name: "IMAGE", type: "IMAGE", links: [1, 2] }],
+          widgets_values: ["a.png"],
+        },
+        {
+          id: 3,
+          type: "SaveImage",
+          mode: 0,
+          inputs: [{ name: "images", type: "IMAGE", link: 1 }],
+          outputs: [],
+          widgets_values: ["out"],
+        },
+        {
+          id: 4,
+          type: "SaveImage",
+          mode: 0,
+          inputs: [{ name: "images", type: "IMAGE", link: 2 }],
+          outputs: [],
+          widgets_values: ["out2"],
+        },
+      ],
+      links: [
+        [1, 1, 0, 3, 0, "IMAGE"],
+        [2, 1, 0, 4, 0, "IMAGE"],
+      ],
+    } as never;
+    const { warnings } = convertUiToApi(g, OBJECT_INFO);
+    const toggleWarnings = warnings.filter((w) => w.includes("muted, or bypassed"));
+    expect(toggleWarnings).toHaveLength(1);
+    expect(toggleWarnings[0]).toContain("2 input connection(s)");
+  });
+});

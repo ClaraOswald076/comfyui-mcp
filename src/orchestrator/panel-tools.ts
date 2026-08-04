@@ -4315,10 +4315,16 @@ export function buildPanelToolDefs(): PanelToolDef[] {
 
         return ok(
           `Stripped to ${Object.keys(workflow).length} nodes` +
-            (warnings.length ? ` · ${warnings.length} warning(s)` : "") +
+            (warnings.length ? ` · ⚠ ${warnings.length} conversion note(s)` : "") +
             `\nNode types: ${summary}` +
+            // #361: a strip that quietly loses a Set/Get link or substitutes a
+            // widget value produces a graph that LOOKS fine and renders
+            // differently. Say plainly that these are places the stripped graph
+            // does NOT match the source, so they are not skimmed as noise.
             (warnings.length
-              ? `\nWarnings:\n${warnings.map((w) => `- ${w}`).join("\n")}`
+              ? `\nThe stripped graph DIFFERS from the source workflow where listed below — read these before running or rebuilding from it:\n${warnings
+                  .map((w) => `- ${w}`)
+                  .join("\n")}`
               : "") +
             `\n\n${JSON.stringify(workflow, null, 2)}`,
         );
