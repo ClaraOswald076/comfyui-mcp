@@ -655,64 +655,39 @@ describe("panel_restart_comfyui — Pinokio-style refuse-safe preflight (#742)",
     expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
   });
 
-  it("#814: a LOCAL target the tab cannot be bound to is REFUSED, never dispatched", async () => {
-    // THE #814 DEFECT, pinned — and the second attempt at it, also pinned.
+  it("#814: a LOCAL target the tab cannot be bound to is REFUSED, whatever the local check says", async () => {
+    // THE #814 DEFECT, pinned — together with two wrong answers to it.
     //
-    // Originally the safety check was gated on the same capture as the
-    // CERTIFICATION, so an instance we could not certify was also never assessed:
-    // the reboot went out with no evidence, the server stopped, nothing brought it
-    // back, and the result honestly said it could not confirm the return.
+    // Originally the safety check was gated on the same capture as the CERTIFICATION,
+    // so an instance we could not certify was also never assessed: the reboot went out
+    // with no evidence, the server stopped, nothing brought it back, and the result
+    // honestly said it could not confirm the return.
     //
-    // The first fix ran the local preflight in that case and let a PASS proceed.
-    // That was wrong in a subtler way: the assessment describes the CONFIGURED
-    // instance while the reboot goes to the bound TAB's, so a safe local install
-    // could authorize stopping an orphaned backend in some other tab. A pass for one
-    // instance is not permission to stop another.
+    // The first fix ran the local preflight anyway and let a PASS proceed. But the
+    // assessment describes the orchestrator CONFIGURED instance while the reboot goes
+    // to the bound TAB, so a safe local install could authorize stopping an orphaned
+    // backend in some other tab. The second tried to keep only the FAIL half, which is
+    // incoherent: if the configured target is a good enough proxy to refuse on, it is
+    // good enough to proceed on.
     //
-    // So the two outcomes are spent asymmetrically when unbound: a FAIL refuses (a
-    // restart costs nothing to decline), while a PASS authorizes nothing and the
-    // dispatch proceeds on the footing it always had — see the companion test below.
-    const preflight = vi.fn(async () => ({
-      ok: false,
-      reason: "no Desktop app is still supervising it.",
-    }));
-    __panelToolsTestHooks.setLocalRestartPreflight(preflight);
-    const { ctx, sends } = makeCtx({ confirm: "yes", frontsBoot: false });
-
-    const out = parse(await restartTool().handler({}, ctx));
-
-    expect(preflight).toHaveBeenCalled();
-    expect(out.refused).toBe(true);
-    expect(out.rebooting).toBe(false);
-    expect(String(out.note)).toMatch(/no Desktop app is still supervising it/);
-    // The inference is DISCLOSED rather than hidden: the refusal is right, but the
-    // user is told which part could not be confirmed.
-    expect(String(out.note)).toMatch(/could not confirm that this panel fronts that same instance/i);
-    // CRITICAL: nothing was dispatched, so nothing was stopped.
-    expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
-  });
-
-  it("#814: an unbindable LOCAL target's PASS authorizes nothing — it is not spent as permission", async () => {
-    // The other half of the asymmetry, and codex round 11's finding: the assessment
-    // describes the CONFIGURED instance while the reboot goes to the bound TAB's, so
-    // a safe local install must not become permission to stop a different one. The
-    // dispatch here proceeds on the footing it always had — honestly reported as
-    // unconfirmable — NOT on the strength of this pass.
-    //
-    // What pins that distinction is the refusal above: were the pass being spent as
-    // permission, the FAIL would have to be too, and it is (it refuses). Here the
-    // result must carry no claim that anything was verified.
+    // So an unbindable LOCAL target is refused outright — and the local assessment is
+    // not consulted at all, because nothing it could say may be spent on a different
+    // instance.
     const preflight = vi.fn(async () => ({ ok: true }));
     __panelToolsTestHooks.setLocalRestartPreflight(preflight);
     const { ctx, sends } = makeCtx({ confirm: "yes", frontsBoot: false });
 
     const out = parse(await restartTool().handler({}, ctx));
 
-    expect(out.rebooting).toBe(true);
-    expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(true);
-    // Unconfirmable, and it says so — no proxy certification from the local pass.
-    expect(out.confirmed_cycle).toBe(false);
-    expect(String(out.note)).toMatch(/can't confirm|could not confirm|verify/i);
+    expect(out.refused).toBe(true);
+    expect(out.rebooting).toBe(false);
+    expect(String(out.note)).toMatch(/cannot tell which server the restart would stop/i);
+    expect(String(out.note)).toMatch(/still running/i);
+    // A PASSING local assessment did not launder permission for a target it does not
+    // describe — and was never even asked.
+    expect(preflight).not.toHaveBeenCalled();
+    // CRITICAL: nothing was dispatched, so nothing was stopped.
+    expect(sends.some((c) => c.cmd === "comfy_reboot")).toBe(false);
   });
 
   it("#814: a BOUND local target with a failing assessment refuses with its reason", async () => {

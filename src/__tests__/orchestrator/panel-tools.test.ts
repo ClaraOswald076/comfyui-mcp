@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
 import { getNsfwConsent, setNsfwConsent } from "../../services/panel-settings.js";
+import { getBootLocalComfyUIBaseUrl } from "../../config.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   buildPanelToolDefs,
@@ -3678,6 +3679,7 @@ describe("confirm-card timeout is honest, bounded, and late-answer-safe (#360)",
     __panelAskTestHooks.setAskTiming(null);
     __panelToolsTestHooks.setHealthProbe(null);
     __panelToolsTestHooks.setLocalRestartPreflight(null);
+    __panelToolsTestHooks.setPanelRebootTiming(null);
   });
 
   // FAIL-BEFORE: the old confirm swallowed a card-reply timeout as `false`, so an
@@ -3792,6 +3794,16 @@ describe("confirm-card timeout is honest, bounded, and late-answer-safe (#360)",
   // #404: a normally-confirmed restart still proceeds to dispatch the reboot — the bound
   // is on the WAIT only; a real "yes" is honored exactly as before.
   it("panel_restart_comfyui still dispatches the reboot on a normal 'yes' confirmation (#404)", async () => {
+    // A BOUND tab (below) means the handler also observes recovery on the boot
+    // endpoint, so give it a fast, deterministic budget — this test asserts that the
+    // confirmation is honored and the reboot dispatched, not what the recovery says.
+    __panelToolsTestHooks.setPanelRebootTiming({
+      settleMs: 0,
+      budgetMs: 30,
+      intervalMs: 5,
+      probeTimeoutMs: 10,
+    });
+    __panelToolsTestHooks.setHealthProbe(async () => false);
     const dispatched: Array<Record<string, unknown>> = [];
     const bridge = {
       send: async (cmd: Record<string, unknown>) => {
@@ -3799,6 +3811,12 @@ describe("confirm-card timeout is honest, bounded, and late-answer-safe (#360)",
         dispatched.push(cmd);
         return { rebooting: true };
       },
+      // BOUND to our own boot instance (#814): a LOCAL target the panel cannot tie
+      // to the instance this server accounts for is refused before dispatch, since a
+      // reboot STOPS a server and it must know which one. This test is about the
+      // CONFIRMATION being honored, so it models the ordinary local panel.
+      tabIsLocal: () => true,
+      tabServerOrigin: () => (getBootLocalComfyUIBaseUrl() ?? "http://127.0.0.1:8188").replace(/[/]+$/, ""),
     } as unknown as PanelToolCtx["bridge"];
     const ctx = makePanelToolCtx(bridge, "abcd1234");
 

@@ -20,6 +20,13 @@ const { buildPanelToolDefs, rebootConfirmed, __panelToolsTestHooks } = await imp
 );
 import type { PanelToolCtx } from "../../orchestrator/panel-tools.js";
 import type { ToolResult } from "../../orchestrator/panel-tools.js";
+import { getBootLocalComfyUIBaseUrl } from "../../config.js";
+
+/** The orchestrator own boot endpoint — what a local tab must front to be bound. */
+const BOOT_BASE = (getBootLocalComfyUIBaseUrl() ?? "http://127.0.0.1:8188").replace(
+  /[/]+$/,
+  "",
+);
 
 function ctxReplying(reply: unknown): PanelToolCtx {
   // comfy_reboot is dispatched via ctx.bridge.send (pinned, no rebind); readiness
@@ -32,7 +39,11 @@ function ctxReplying(reply: unknown): PanelToolCtx {
     bridge: {
       send: async () => reply,
       tabOrigin: () => undefined,
-      tabIsLocal: () => false,
+      // BOUND to our own boot instance (#814): a LOCAL target the panel cannot be
+      // tied to is now refused before any dispatch, so a suite about what happens
+      // AFTER the dispatch has to model the ordinary local panel.
+      tabIsLocal: () => true,
+      tabServerOrigin: () => BOOT_BASE,
       tabSockId: () => "s0",
       canReach: () => false,
     } as unknown as PanelToolCtx["bridge"],
