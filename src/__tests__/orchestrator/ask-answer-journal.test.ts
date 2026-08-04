@@ -65,6 +65,7 @@ function strandEvictionDebt(): void {
 beforeEach(() => {
   AskAnswers.reset();
   AskAnswers.setFlusher(() => {});
+  AskAnswers.setRevoker(() => false); // nothing queued unless a test says so
 });
 
 describe("ask-answer journal — an answer survives its tool call (#486)", () => {
@@ -768,6 +769,11 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
     const block = src.slice(start, src.indexOf("\n      return;", start));
     expect(block, "rewind must retire ask state").toContain("AskAnswers.closeAsks(");
 
+    // The unsend hook must actually be wired, or closeAsks silently degrades to
+    // "leave the stale copy queued".
+    expect(src).toContain("AskAnswers.setRevoker(");
+    expect(src).toContain("AskAnswers.setFlusher(");
+
     // …and every OTHER boundary is defined by where the run journal draws one.
     // Pairing the two journals structurally is what stops the next boundary from
     // being added to one and forgotten in the other — which is exactly how a late
@@ -786,6 +792,69 @@ describe("ask-answer journal — bounds may LABEL, never silently lose (#486)", 
         expect(near, `${m[0]} is not paired with ${want}`).toContain(want);
       }
     }
+  });
+
+  // codex round 7, P1: an answer already QUEUED into an agent carries wording
+  // that claims the reader put the card up. If the conversation is replaced
+  // before that item is read, the sentence is false of the fork — so the queued
+  // copy has to be pulled back, exactly as #468 does for a downgraded completion.
+  it("a replaced conversation unsends an answer that is still queued and unread", () => {
+    const revoked: string[] = [];
+    AskAnswers.setRevoker((_key, token) => {
+      revoked.push(token);
+      return true;
+    });
+    openAndAnswer("pa-ask-1", SAMPLER, "dpmpp_2m");
+    AskAnswers.deliverPending(TAB, () => true);
+    const token = AskAnswers.entriesFor(TAB)[0].token;
+    expect(AskAnswers.entriesFor(TAB)[0].delivery).toBe("handed_off");
+    AskAnswers.closeAsks(TAB);
+    expect(revoked).toEqual([token]);
+    expect(AskAnswers.entriesFor(TAB)[0].delivery).toBe("none");
+    AskAnswers.setRevoker(() => false);
+  });
+
+  it("an answer already being READ cannot be recalled, and is not pretended otherwise", () => {
+    AskAnswers.setRevoker(() => false); // the carrying turn already started
+    openAndAnswer("pa-ask-1", SAMPLER, "dpmpp_2m");
+    AskAnswers.deliverPending(TAB, () => true);
+    AskAnswers.closeAsks(TAB);
+    // Still marked handed_off — the text is in the model's context; claiming we
+    // pulled it back would be a lie.
+    expect(AskAnswers.entriesFor(TAB)[0].delivery).toBe("handed_off");
+  });
+
+  // codex round 7, P1: the ticket map used to keep a ticket for every ask ever
+  // made, so a long session's ordinary successful asks filled it and evicted a
+  // genuinely OUTSTANDING card's ticket — taking its retired-conversation marker
+  // with it, after which a late click landed in the replacement conversation.
+  it("an ANSWERED card releases its ticket, so the ceiling only counts cards on screen", () => {
+    AskAnswers.openAsk("pa-outstanding", {
+      tabId: TAB,
+      fingerprint: askFingerprint(SAMPLER),
+      question: SAMPLER.question,
+    });
+    AskAnswers.closeAsk("pa-outstanding"); // timed out; card still on screen
+    // …and now 2000 ordinary, ANSWERED asks go by.
+    for (let i = 0; i < 2000; i += 1) {
+      const ask = { question: `Q${i}?`, options: [{ label: "a" }, { label: "b" }] };
+      AskAnswers.openAsk(`pa-done-${i}`, {
+        tabId: TAB,
+        fingerprint: askFingerprint(ask),
+        question: ask.question,
+      });
+      AskAnswers.record(`pa-done-${i}`, "a", { tabId: TAB });
+      AskAnswers.markReturned(`pa-done-${i}`);
+      AskAnswers.closeAsk(`pa-done-${i}`);
+      expect(AskAnswers.ticketFor(`pa-done-${i}`)).toBeUndefined(); // released
+    }
+    // The outstanding card's ticket — and with it the conversation generation
+    // that protects the replacement conversation — is still there.
+    expect(AskAnswers.ticketFor("pa-outstanding")).toBeDefined();
+    AskAnswers.closeAsks(TAB);
+    const entry = AskAnswers.record("pa-outstanding", "dpmpp_2m", { tabId: TAB });
+    expect(entry.delivery).toBe("none");
+    expect(entry.recoverable).toBe(false);
   });
 
   it("never throws when the flusher does", () => {

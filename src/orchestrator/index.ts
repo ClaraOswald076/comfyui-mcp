@@ -2122,6 +2122,12 @@ export async function runPanelOrchestrator(): Promise<void> {
   // without having returned it) and drives the push from there, so no caller has
   // to remember to flush.
   AskAnswers.setFlusher((panelTabId) => flushAskAnswers(panelTabId));
+  // …and let it UNSEND a queued answer whose conversation was replaced before the
+  // agent read it. The wording ("a question card YOU put up") is baked in at
+  // queue time, so without this the fork reads a sentence that is false of it.
+  AskAnswers.setRevoker((panelTabId, token) =>
+    manager.revokeEvent(agentKeyFor(panelTabId), token),
+  );
   bridge.setLateAskReplySink((askId, result, tabId) => {
     if (!AskAnswers.tracks(askId)) return;
     const entry = AskAnswers.record(askId, result, { tabId });

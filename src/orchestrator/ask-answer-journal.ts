@@ -365,6 +365,8 @@ export class AskAnswerJournalImpl {
   private ticketSeq = 0;
   /** Deliver a tab's newly-orphaned answers (see setFlusher). */
   private flush: ((key: string) => void) | null = null;
+  /** Pull a still-queued answer event back off its agent (see setRevoker). */
+  private revoke: ((key: string, token: string) => boolean) | null = null;
 
   /**
    * Wire the push channel (#486).
@@ -377,6 +379,19 @@ export class AskAnswerJournalImpl {
    */
   setFlusher(flush: (key: string) => void): void {
     this.flush = flush;
+  }
+
+  /**
+   * Wire the "unsend" hook, mirroring #468's.
+   *
+   * An answer's WORDING is materialised when it is queued into an agent, and it
+   * says "a question card YOU put up". If the conversation is replaced before
+   * that item is read, the sentence becomes false — the fork never put that card
+   * up. This pulls the stale copy back while it is still unread. Nothing is
+   * re-delivered afterwards: the addressee is gone, which is the whole point.
+   */
+  setRevoker(revoke: (key: string, token: string) => boolean): void {
+    this.revoke = revoke;
   }
 
   /**
@@ -457,13 +472,23 @@ export class AskAnswerJournalImpl {
     const ticket = this.tickets.get(askId);
     if (ticket) ticket.awaiting = false;
     let armed: AskEntry | null = null;
+    let answered = false;
     for (const entry of this.entries.values()) {
       if (entry.askId !== askId) continue;
+      answered = true;
       if (!entry.returned && entry.delivery === "none") {
         entry.delivery = "pending";
         armed = entry;
       }
     }
+    // The card has been ANSWERED and its handler has finished, so this ticket can
+    // never be needed again — the panel removes an answered card, and everything
+    // the ticket carried (tab, question, fingerprint, conversation generation) is
+    // frozen onto the entry. Releasing it keeps the ticket map to CARDS STILL ON
+    // SCREEN, which is what makes its ceiling unreachable in practice: otherwise
+    // a long session's ordinary successful asks fill it and evict a genuinely
+    // outstanding card's ticket, taking its retired-conversation marker with it.
+    if (answered) this.tickets.delete(askId);
     // It is an orphan NOW — deliver it now. Leaving it merely `pending` would
     // make it wait for an unrelated later flush, and this transition happens on
     // the ask handler's unwind, where there may never be one.
@@ -553,6 +578,9 @@ export class AskAnswerJournalImpl {
         `[ask-answers] a validated answer arrived for ask ${askId.slice(0, 8)} with ${ticket ? "a REUSED (ambiguous) ticket" : "no open ticket"} — journaled as UNATTRIBUTED; it can never satisfy a question, only be reported`,
       );
     }
+    // Same release as closeAsk: an answered card whose handler is already gone
+    // has no further use for its ticket, and the entry carries everything.
+    if (ticket && !ticket.awaiting) this.tickets.delete(askId);
     this.trimEntries(entry.key);
     // Born orphaned (no handler is waiting on this ask) — push it straight away.
     if (entry.delivery === "pending") this.flush?.(entry.key);
@@ -874,6 +902,10 @@ export class AskAnswerJournalImpl {
     for (const [token, entry] of [...this.entries]) {
       if (entry.key !== key) continue;
       this.entries.delete(token);
+      // …and its queued copy goes with it: the journal's record and the agent's
+      // queue must be dropped together, or the text outlives the entry that was
+      // supposed to bound it.
+      if (entry.delivery === "handed_off") this.revoke?.(entry.key, entry.token);
       // EVERY answer is logged, returned ones included: "it went into a
       // ToolResult" is not proof it was received, so a returned answer inside
       // the recovery window is still the only copy of a decision that may never
@@ -938,10 +970,19 @@ export class AskAnswerJournalImpl {
       // NOT a silent discard: the entry stays journaled (so a later ask on this
       // tab that times out still reports it, quoted with its own question) and
       // the loss of the push is logged here.
-      if (entry.delivery === "pending") {
+      // PENDING is easy — it has not been queued anywhere yet. HANDED_OFF has
+      // already been materialised into the agent's queue with wording that claims
+      // the reader put the card up, so it must be pulled back; only once the
+      // carrying turn has STARTED is the text beyond recall.
+      const stale = entry.delivery;
+      if (stale === "pending" || (stale === "handed_off" && this.revoke?.(entry.key, entry.token))) {
         entry.delivery = "none";
         logger.warn(
           `[ask-answers] the conversation that asked "${preview(entry.question)}" on tab ${key.slice(0, 8)} was replaced — the user's answer ("${entry.answer}") will NOT be announced to the replacement conversation; it is kept only for disclosure`,
+        );
+      } else if (stale === "handed_off") {
+        logger.warn(
+          `[ask-answers] tab ${key.slice(0, 8)}: the user's answer to "${preview(entry.question)}" was already being read when the conversation was replaced — it could not be recalled`,
         );
       }
     }
