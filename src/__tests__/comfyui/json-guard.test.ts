@@ -453,6 +453,49 @@ describe("rethrowWithJsonDiagnosis never asserts a cause it did not prove (#828)
     await expect(rethrowWithJsonDiagnosis(ORIGINAL, PROBE_URL)).rejects.toBe(ORIGINAL);
   });
 
+  it("still redacts a reflected credential when the probe is INCONCLUSIVE", async () => {
+    // The redaction must not depend on the probe happening to succeed — the raw
+    // parse message quotes the body either way, and it is what gets rethrown.
+    authHeaders.value = { Authorization: "Bearer echoed-secret-token-here" };
+    try {
+      global.fetch = vi.fn(
+        async () =>
+          new Response('{"ok":true}', {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+      ) as unknown as typeof fetch;
+      const reflecting = new SyntaxError(
+        `Unexpected token '<', "<html>Bearer echoed-secret-token-here</html>" is not valid JSON`,
+      );
+      await expect(rethrowWithJsonDiagnosis(reflecting, PROBE_URL)).rejects.toSatisfy(
+        (e: unknown) =>
+          e instanceof Error &&
+          !e.message.includes("echoed-secret-token-here") &&
+          e.message.includes("«redacted»"),
+      );
+    } finally {
+      authHeaders.value = {};
+    }
+  });
+
+  it("still redacts when the probe itself FAILS", async () => {
+    authHeaders.value = { Authorization: "Bearer echoed-secret-token-here" };
+    try {
+      global.fetch = vi.fn(async () => {
+        throw new Error("fetch failed");
+      }) as unknown as typeof fetch;
+      const reflecting = new SyntaxError(
+        `Unexpected token '<', "<html>Bearer echoed-secret-token-here</html>" is not valid JSON`,
+      );
+      await expect(rethrowWithJsonDiagnosis(reflecting, PROBE_URL)).rejects.toSatisfy(
+        (e: unknown) => e instanceof Error && !e.message.includes("echoed-secret-token-here"),
+      );
+    } finally {
+      authHeaders.value = {};
+    }
+  });
+
   it("rethrows the ORIGINAL untouched when the probe itself fails", async () => {
     global.fetch = vi.fn(async () => {
       throw new Error("fetch failed");

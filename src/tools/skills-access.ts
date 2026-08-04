@@ -11,7 +11,9 @@ import {
   bodyPrefixOf,
   classifyNonJson,
   isNonJsonResponseError,
+  looksLikeHtmlParsedAsJson,
   readComfyJson,
+  redactErrorMessage,
 } from "../comfyui/json-guard.js";
 
 // Optional, opt-in observability hook for the knowledge-parity smoke test: when
@@ -533,7 +535,15 @@ export function registerSkillsAccessTools(server: McpServer): void {
           // REACHED; calling that "could not reach the server" (#828) sends the
           // user to check that ComfyUI is running when the real problem is a
           // proxy or a sign-in gate in front of it.
-          const nonJson = isNonJsonResponseError(probeErr);
+          // A diagnosed non-JSON response is the clearest case. But a RAW
+          // markup-parse failure also proves the server answered with something
+          // that is not JSON, even when the follow-up probe was inconclusive —
+          // filing that under "unavailable" loses the #828 diagnosis and sends
+          // the user to check that ComfyUI is running (codex gate, round 6).
+          // The message is redacted either way: it quotes the body it choked on.
+          const diagnosed = isNonJsonResponseError(probeErr);
+          const nonJson = diagnosed || looksLikeHtmlParsedAsJson(probeErr);
+          const detail = redactErrorMessage(probeErr);
           return {
             content: [
               {
@@ -545,8 +555,8 @@ export function registerSkillsAccessTools(server: McpServer): void {
                     classTypes,
                     reason: nonJson ? "non_json_response" : "object_info_unavailable",
                     note: nonJson
-                      ? `Could not classify the nodes: the ComfyUI server was reached but /object_info did not return JSON. ${(probeErr as Error).message} Until that is fixed the runtime is genuinely UNDETERMINED — treat this workflow as POSSIBLY paid and ask the user before spending credits.`
-                      : `Could not classify the nodes: /object_info was unavailable (${(probeErr as Error).message}). API-node detection needs a reachable ComfyUI. If unsure, treat ad-hoc workflows as POSSIBLY paid and ask the user before spending credits.`,
+                      ? `Could not classify the nodes: the ComfyUI server was reached but /object_info did not return JSON. ${detail}${diagnosed ? "" : " (The response could not be re-probed, so what answered is not identified.)"} Until that is fixed the runtime is genuinely UNDETERMINED — treat this workflow as POSSIBLY paid and ask the user before spending credits.`
+                      : `Could not classify the nodes: /object_info was unavailable (${detail}). API-node detection needs a reachable ComfyUI. If unsure, treat ad-hoc workflows as POSSIBLY paid and ask the user before spending credits.`,
                   },
                   null,
                   2,

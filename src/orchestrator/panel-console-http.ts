@@ -461,7 +461,12 @@ export function startPanelConsoleHttpServer(opts: {
               // a "cleared for this session" note (codex gate, round 4,
               // finding 5).
               cleared: removed,
+              // Scoped claim: it no longer resolves HERE. A tool session that
+              // was already running keeps the value it was spawned with until it
+              // is rebuilt — the clear schedules that rebuild, it does not
+              // perform it, so the two are reported separately.
               still_resolves: false,
+              live_sessions_rebuild_at_idle: true,
               ...(shellKeys.length
                 ? {
                     warning:

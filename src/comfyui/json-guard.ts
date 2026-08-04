@@ -288,6 +288,28 @@ export function redactErrorMessage(err: unknown): string {
 }
 
 /**
+ * The error itself, safe to propagate: the SAME object when its message carries
+ * no configured credential (so identity, type and stack survive for callers that
+ * match on them), and a redacted copy when it does.
+ *
+ * Every rethrow path must go through this. Redacting only the branch that builds
+ * a diagnosis left the inconclusive-probe branch rethrowing the library's raw
+ * parse message — which quotes the body — straight into a tool result (codex
+ * gate, round 6, finding 2).
+ */
+export function redactedError(err: unknown): unknown {
+  const raw = err instanceof Error ? err.message : String(err);
+  const safe = redactErrorMessage(err);
+  if (safe === raw) return err;
+  const copy = new Error(safe);
+  if (err instanceof Error) {
+    copy.name = err.name;
+    copy.stack = err.stack;
+  }
+  return copy;
+}
+
+/**
  * True when an error looks like `JSON.parse` choking on a markup body — the
  * signature of a client library that called `res.json()` itself and so gave us
  * no URL, status, or content type to report.
@@ -333,7 +355,10 @@ export async function diagnoseComfyEndpoint(url: string): Promise<NonJsonDiagnos
 /**
  * Wrap an error thrown by a client library that parsed JSON internally. When it
  * smells like markup-parsed-as-JSON, re-probe `url` and rethrow the precise
- * diagnosis; otherwise rethrow the original untouched.
+ * diagnosis; otherwise rethrow the original, unchanged except that a configured
+ * credential is redacted out of its message (the message quotes the body, and
+ * the body may reflect our own token — that must not depend on whether the probe
+ * happened to be conclusive).
  */
 export async function rethrowWithJsonDiagnosis(err: unknown, url: string): Promise<never> {
   if (looksLikeHtmlParsedAsJson(err)) {
@@ -357,5 +382,5 @@ export async function rethrowWithJsonDiagnosis(err: unknown, url: string): Promi
       });
     }
   }
-  throw err;
+  throw redactedError(err);
 }
