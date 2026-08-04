@@ -1891,9 +1891,16 @@ export class PanelAgentManager {
   /** Whether a live agent (session) exists for this composite key — used to flag
    *  the mobile mirror picker's "session attached" dot, and as the SYNCHRONOUS half
    *  of {@link interrupt}'s outcome for callers that must report it without waiting
-   *  on the backend's (possibly slow, possibly hung) interrupt round-trip (#568). */
+   *  on the backend's (possibly slow, possibly hung) interrupt round-trip (#568).
+   *
+   *  LIVE means live, not merely mapped. reset()/retire() unmap through unbindAgent()
+   *  BEFORE stopping, but stopAll() sets `closed` on every agent and keeps them mapped
+   *  until each awaited stop() resolves — an unbounded window when a backend hangs.
+   *  A closed agent takes no message, runs no turn and accepts no interrupt, so every
+   *  caller of this ("is there an agent I can act on?") must see through that window. */
   hasLiveAgent(key: string): boolean {
-    return this.agents.has(key);
+    const agent = this.agents.get(key);
+    return !!agent && !agent.isStopped;
   }
 
   /** #570 P0 — true when this key holds ANY per-tab live/queued state that reset() would
@@ -2593,7 +2600,13 @@ export class PanelAgentManager {
    *  made #568 look like a wedge nobody could explain. */
   async interrupt(tabId: string, opts: { requeueInFlight?: boolean } = {}): Promise<boolean> {
     const agent = this.agents.get(tabId);
-    if (!agent) return false;
+    // MAP PRESENCE IS NOT LIVENESS. stopAll() sets `closed` synchronously on every
+    // agent but keeps them MAPPED until each awaited stop() resolves — and stop()
+    // awaits the backend, which can hang. An interrupt arriving in that window has
+    // nothing that can take it, so returning true here would fabricate exactly the
+    // success this method exists to stop fabricating. Bail without awaiting, too: a
+    // hung backend.interrupt() must not be able to stall the answer.
+    if (!agent || agent.isStopped) return false;
     await agent.interrupt(opts);
     return true;
   }

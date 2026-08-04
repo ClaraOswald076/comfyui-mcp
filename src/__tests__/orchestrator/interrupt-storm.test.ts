@@ -64,6 +64,41 @@ class WedgedBackend implements AgentBackend {
   }
 }
 
+/** A backend whose interrupt() HANGS until released — so stopAll()'s awaited stop()
+ *  never resolves and the closed agent stays in the manager's map indefinitely. That
+ *  unbounded window is the one where map presence and liveness diverge. */
+class HangingStopBackend implements AgentBackend {
+  readonly id = "claude" as const;
+  readonly capabilities = CLAUDE_CAPABILITIES;
+  turns: string[] = [];
+  private release: (() => void) | null = null;
+
+  async *run(opts: BackendStartOptions): AsyncGenerator<AgentEvent> {
+    yield { type: "session", sessionId: "sess-hang" };
+    for await (const turn of opts.channel) {
+      this.turns.push(turn.text);
+      yield { type: "result", ok: true, subtype: "success" };
+    }
+  }
+
+  async interrupt(): Promise<void> {
+    await new Promise<void>((resolve) => {
+      this.release = resolve;
+    });
+  }
+
+  /** Let the pending stop() finish so the test doesn't leave it dangling. */
+  releaseStop(): void {
+    const r = this.release;
+    this.release = null;
+    r?.();
+  }
+
+  async listModels(): Promise<ModelChoice[]> {
+    return [];
+  }
+}
+
 function makeDeps() {
   return {
     mcpServers: {},
@@ -203,5 +238,41 @@ describe("interrupt reports whether a live agent actually took it (#568)", () =>
     await expect(manager.interrupt(key, { requeueInFlight: true })).resolves.toBe(true);
 
     await manager.stopAll();
+  });
+
+  // MAP PRESENCE IS NOT LIVENESS. reset()/retire() unmap before stopping, but
+  // stopAll() sets `closed` on every agent synchronously and keeps them MAPPED until
+  // each awaited stop() resolves — and stop() awaits the backend, which can hang. The
+  // bridge is still serving the panel throughout that window, so an interrupt can land
+  // in it. Reporting it as taken would fabricate exactly the success this reporting
+  // exists to stop fabricating — the "agent exists but is closed" case one step over
+  // from "no agent at all".
+  it("reports NOT interrupted inside the shutdown window, even while still mapped", async () => {
+    const backend = new HangingStopBackend();
+    const manager = new PanelAgentManager({
+      mcpServers: {},
+      systemAppend: "",
+      model: "claude-test",
+      onSay: () => {},
+      onTurn: () => {},
+      makeBackend: () => backend,
+    } as never);
+
+    const key = "tmp:shutting-down::claude";
+    manager.send(key, "a turn");
+    await waitFor(() => backend.turns.length === 1);
+    expect(manager.hasLiveAgent(key)).toBe(true);
+
+    // Shutdown begins but does NOT complete: this backend's interrupt never settles,
+    // so the agent stays in the map indefinitely with `closed` already true.
+    const stopping = manager.stopAll();
+    expect(manager.hasLiveAgent(key)).toBe(false);
+
+    // Must answer FALSE, and must answer AT ALL — a hung backend.interrupt() cannot be
+    // allowed to stall it, which is why the predicate short-circuits before the await.
+    await expect(manager.interrupt(key, { requeueInFlight: true })).resolves.toBe(false);
+
+    backend.releaseStop();
+    await stopping;
   });
 });
