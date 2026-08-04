@@ -56,8 +56,13 @@ vi.mock("node:fs", () => ({
   readlinkSync: vi.fn(() => {
     throw new Error("no /proc in test");
   }),
+  // ENOENT, not a bare Error: the port probe classifies a failed kernel-table read
+  // from its ERRNO. "The table does not exist" (this host has no /proc) hides
+  // nothing and leaves lsof as the only source, which is the host these tests
+  // model; an errno-less failure reads as "I could not look" — a blind spot that
+  // would make every lsof answer here `unknown`.
   readFileSync: vi.fn(() => {
-    throw new Error("no /proc in test");
+    throw Object.assign(new Error("no /proc in test"), { code: "ENOENT" });
   }),
   statSync: vi.fn((p: string) => {
     if (!mockExistsSync(String(p))) throw new Error("ENOENT");

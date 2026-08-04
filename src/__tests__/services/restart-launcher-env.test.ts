@@ -176,13 +176,26 @@ const BENIGN_PINOKIO_PY = join(PINOKIO_BIN, "comfy", "venv", "bin", "python");
 const ORIGINAL_ENV = { ...process.env };
 
 /**
- * `lsof` exiting 1 with no output — its convention for "ran fine, matched
- * nothing". Distinct from a spawn failure (which carries a `code`), because the
- * port probe must not read "I could not look" as "the port is free".
+ * `lsof -V` STATING that nothing is listening — the port is free.
+ *
+ * Distinct from a spawn failure (which carries a `code`), because the port probe
+ * must not read "I could not look" as "the port is free". The exit status alone
+ * cannot carry that distinction either: lsof exits 1 both when it searched and
+ * matched nothing AND when it could not search, and a permission-restricted run
+ * exits 1 with BOTH streams empty. The `-V` marker — lsof naming what it failed to
+ * locate — is the only positive statement of absence, verified against lsof 4.99.4
+ * (it lands on STDOUT, with status 1).
  */
 function noListener(): Error {
-  const err = new Error("no listener") as Error & { status?: number };
+  const err = new Error("no listener") as Error & {
+    status?: number;
+    stdout?: string;
+    stderr?: string;
+  };
   err.status = 1;
+  err.stdout =
+    "lsof: Internet address not located: TCP:8188\nlsof: TCP state not located: LISTEN\n";
+  err.stderr = "";
   return err;
 }
 
@@ -1880,7 +1893,7 @@ describe("restart_comfyui — plain installs are unchanged (#776)", () => {
     let killed = false;
     let relaunched = false;
     mockExecSync.mockImplementation((cmd: string) => {
-      if (/taskkill|pkill|kill/i.test(cmd)) {
+      if (/taskkill|pkill|\bkill\b/i.test(cmd)) {
         killed = true;
         return "";
       }

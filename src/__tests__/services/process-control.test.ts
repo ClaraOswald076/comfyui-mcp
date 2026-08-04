@@ -39,6 +39,14 @@ const mockStatSync = vi.hoisted(() =>
 vi.mock("node:fs", () => ({
   existsSync: mockExistsSync,
   statSync: mockStatSync,
+  // The port probe reads the kernel socket tables and classifies a failure from its
+  // ERRNO: ENOENT ("no /proc on this host") hides nothing and leaves lsof as the
+  // only source, which is what these tests model. Omitting this entirely used to
+  // throw "readFileSync is not a function" — errno-less, i.e. "I could not look" —
+  // which would make every post-kill probe `unknown` and hang the suite.
+  readFileSync: vi.fn(() => {
+    throw Object.assign(new Error("no /proc in test"), { code: "ENOENT" });
+  }),
 }));
 
 vi.mock("../../comfyui/client.js", () => ({
@@ -69,16 +77,31 @@ import {
 } from "../../services/process-control.js";
 
 /**
- * `lsof` exiting 1 with no output — its convention for "ran fine, matched
- * nothing", which the port probe reads as definite evidence the port is free.
- * A bare `Error` carries neither an exit status nor an errno, so it means
- * "I could not look" instead, and a caller waiting for the port to be released
- * would wait out its whole budget. That difference is invisible on Windows (the
- * netstat branch never reaches lsof) and hangs the suite on POSIX (#776).
+ * `lsof -V` STATING that nothing is listening — the port is free.
+ *
+ * The exit status alone cannot say this: lsof exits 1 both when it searched and
+ * matched nothing AND when it could not search at all, and a run that enumerates
+ * nothing for lack of permission exits 1 with BOTH streams empty. So the probe
+ * keys on the `-V` marker, which is lsof positively naming what it failed to
+ * locate. Verified against lsof 4.99.4: with `-V` and nothing listening, status is
+ * 1 and `lsof: Internet address not located: TCP:<port>` goes to STDOUT; without
+ * `-V`, status is 1 and both streams are empty — the ambiguity that makes
+ * "quiet ⇒ free" unsound, so a fixture must not model absence as mere silence.
+ *
+ * Getting this wrong is invisible on Windows (the netstat branch never reaches
+ * lsof) and HANGS the suite on POSIX: a caller waiting for the port to be released
+ * never sees a release and waits out its whole budget (#776).
  */
 function noListener(): Error {
-  const err = new Error("no listener") as Error & { status?: number };
+  const err = new Error("no listener") as Error & {
+    status?: number;
+    stdout?: string;
+    stderr?: string;
+  };
   err.status = 1;
+  err.stdout =
+    "lsof: Internet address not located: TCP:8188\nlsof: TCP state not located: LISTEN\n";
+  err.stderr = "";
   return err;
 }
 
