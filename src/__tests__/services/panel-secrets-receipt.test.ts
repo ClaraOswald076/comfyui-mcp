@@ -484,6 +484,30 @@ describe("slot saves report what the read-back PROVED (#826 gate round 3)", () =
     }
   });
 
+  it("marks a FILE-sourced restored value file-owned, so a later rotation still wins", () => {
+    // The rollback puts the previous value back into process.env. If it did not
+    // also mark the file as that value's authority, the key would read as a real
+    // env override from then on and a later legitimate rotation of the file
+    // entry would be masked — a configured credential the readers never use.
+    // Fail the FIRST alias, so the SECOND is never written and reaches the
+    // rollback's "already as it was" branch without any prior marking — that is
+    // the branch under test.
+    resetEnvFileProvenanceForTests();
+    writeFileSync(envPath, "HF_TOKEN=hf-old\nHUGGINGFACE_TOKEN=hf-old\n", { mode: 0o600 });
+    let call = 0;
+    fsState.failWriteOnCall = () => ++call === 1;
+    try {
+      const outcome = setPanelSecret("huggingface", "hf-new");
+      expect(outcome.rolledBack).toBe(true);
+    } finally {
+      fsState.failWriteOnCall = null;
+    }
+    expect(process.env.HUGGINGFACE_TOKEN).toBe("hf-old"); // restored in-process
+    // Another writer rotates the file. The restored value must NOT outrank it.
+    writeFileSync(envPath, "HF_TOKEN=hf-rotated\nHUGGINGFACE_TOKEN=hf-rotated\n", { mode: 0o600 });
+    expect(buildComfyuiMcpEnv({}).HUGGINGFACE_TOKEN).toBe("hf-rotated");
+  });
+
   it("restores the earlier alias before re-throwing a per-key validation failure", () => {
     // A control character is rejected per key. The FIRST alias would already
     // have been written when the second is rejected, so the throw must not leave
