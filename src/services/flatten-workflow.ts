@@ -315,6 +315,18 @@ export function flattenUiWorkflow(
         number,
         { type: string; confirmed: number; unresolved: number }
       >();
+      /**
+       * THE single "is this producer real" question — the same one addDirectLink
+       * asks before it will build an edge. Counting a producer as confirmed here
+       * that the materializer would refuse is how the channel caveat came to
+       * claim confirmation it did not have.
+       */
+      const producerConfirmed = (nodeId: number, slot: number): boolean => {
+        const nd = nodesById.get(nodeId);
+        if (!nd) return true; // outside this graph — nothing to judge here
+        if (!Array.isArray(nd.outputs)) return false;
+        return slot < nd.outputs.length;
+      };
       /** null = confirmed against the live graph; otherwise the reason it is not. */
       const unconfirmedReason = (uel: UeLink, srcId: number, srcSlot: number): string | null => {
         const ctrlId = uel.controller;
@@ -346,12 +358,13 @@ export function flattenUiWorkflow(
         const distinct = new Set<string>();
         for (const f of feeds) {
           const r = resolveReal(f.link as number);
-          if (!r) {
-            // An UNRESOLVED input is not "no producer" — it is an unknown one, so
-            // it counts toward the channel ambiguity. Letting it contribute
-            // nothing made a sender with one known and one unknown producer read
-            // as "one producer, nothing to confuse", silencing the caveat exactly
-            // where the risk is highest.
+          // An UNRESOLVED input is not "no producer" — it is an unknown one, and
+          // so is one whose producer this flattener would REFUSE to wire from.
+          // Both count toward the channel ambiguity; letting them contribute
+          // nothing made a sender with one known and one unknown producer read as
+          // "one producer, nothing to confuse", silencing the caveat exactly
+          // where the risk is highest.
+          if (!r || !producerConfirmed(r.id, r.slot)) {
             unresolved++;
             continue;
           }
@@ -495,6 +508,41 @@ export function flattenUiWorkflow(
   const survivingLinks = [...(ui.links ?? []), ...freshLinks].filter(
     (l) => Array.isArray(l) && !removedIds.has(l[1]) && !removedIds.has(l[3]),
   );
+  // Two links sharing an id make the graph ambiguous: every consumer input and
+  // producer output list keyed by that id could mean either. The fresh-id
+  // allocator can no longer create one, but a graph edited by tooling that did
+  // not maintain link ids can arrive with one already — and returning it
+  // unchanged propagates the ambiguity from a pass whose whole job is to leave
+  // the wiring unambiguous. Repair it (re-point exactly the one consumer input
+  // and producer output slot involved) and say so; never fix it silently.
+  const seenLinkIds = new Set<number>();
+  const repairedIds: number[] = [];
+  for (const l of survivingLinks) {
+    if (!seenLinkIds.has(l[0])) {
+      seenLinkIds.add(l[0]);
+      continue;
+    }
+    const clashing = l[0];
+    const fresh = nextLinkId++;
+    const tgtInput = nodesById.get(l[3])?.inputs?.[l[4]];
+    if (tgtInput?.link === clashing) tgtInput.link = fresh;
+    const srcOut = nodesById.get(l[1])?.outputs?.[l[2]];
+    if (srcOut?.links) {
+      const at = srcOut.links.indexOf(clashing);
+      if (at >= 0) srcOut.links[at] = fresh;
+    }
+    l[0] = fresh;
+    seenLinkIds.add(fresh);
+    repairedIds.push(clashing);
+  }
+  if (repairedIds.length > 0) {
+    warnings.push(
+      `${repairedIds.length} link(s) in the source graph shared an id already used by another link (${[
+        ...new Set(repairedIds),
+      ].join(", ")}) — each duplicate was given a fresh id so the flattened graph is unambiguous, but the original file is malformed and anything else reading it by link id may disagree`,
+    );
+  }
+
   const survivingIds = new Set(survivingLinks.map((l) => l[0]));
   ui.links = survivingLinks;
   ui.last_link_id = nextLinkId - 1;

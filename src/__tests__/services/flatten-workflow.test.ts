@@ -289,6 +289,38 @@ describe("flattenUiWorkflow — Use-Everywhere", () => {
     expect(report.warnings).toEqual([]);
   });
 
+  it("duplicate link ids ALREADY in the graph are repaired, and reported", () => {
+    // Not something the allocator can produce, but a graph edited by tooling that
+    // did not maintain link ids can arrive this way. Returning it unchanged
+    // propagates an ambiguous graph out of a pass whose job is to leave the
+    // wiring unambiguous — and each consumer must keep ITS OWN producer.
+    const g: UiWorkflow = {
+      nodes: [
+        node(1, "ProducerA", { outputs: [{ name: "MODEL", type: "MODEL", links: [7] }] }),
+        node(2, "ProducerB", { outputs: [{ name: "MODEL", type: "MODEL", links: [7] }] }),
+        node(3, "SomeConsumer", { inputs: [{ name: "model", type: "MODEL", link: 7 }] }),
+        node(4, "OtherConsumer", { inputs: [{ name: "model", type: "MODEL", link: 7 }] }),
+      ],
+      links: [
+        [7, 1, 0, 3, 0, "MODEL"],
+        [7, 2, 0, 4, 0, "MODEL"],
+      ],
+      last_link_id: 7,
+    };
+    const { graph, report } = flattenUiWorkflow(g);
+    const ids = graph.links.map((l) => l[0]);
+    expect(new Set(ids).size).toBe(ids.length);
+    const byId = new Map(graph.links.map((l) => [l[0], l]));
+    const feeder = (type: string) => {
+      const c = graph.nodes.find((x) => x.type === type)!;
+      const l = byId.get(c.inputs![0].link!)!;
+      return graph.nodes.find((x) => x.id === l[1])!.type;
+    };
+    expect(feeder("SomeConsumer")).toBe("ProducerA");
+    expect(feeder("OtherConsumer")).toBe("ProducerB");
+    expect(report.warnings.join("\n")).toContain("shared an id already used by another link");
+  });
+
   it("a stale last_link_id cannot make a fresh link collide with an existing one", () => {
     const g = ueGraph(true);
     // An existing link sitting at exactly the id the stale header hands out next.

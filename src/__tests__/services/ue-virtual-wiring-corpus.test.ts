@@ -563,6 +563,41 @@ const CORPUS: Case[] = [
     },
   },
   {
+    name: "multi-input sender whose second producer CANNOT be confirmed",
+    why: "the caveat must count what the materializer would actually accept. ProducerB's output slot is unconfirmable under the absent-outputs rule, so calling it a confirmed producer states something the same code would refuse — a false fact inside a disclosure.",
+    graph: () => {
+      const pb = producer(2, "ProducerB", [27]);
+      delete (pb as { outputs?: unknown }).outputs;
+      return graph(
+        [
+          producer(1, "ProducerA", [26]),
+          pb,
+          sender(7, "Anything Everywhere3", [26, 27]),
+          consumer(3, "Consumer", null),
+        ],
+        [
+          [26, 1, 0, 7, 0, "IMAGE"],
+          [27, 2, 0, 7, 1, "IMAGE"],
+        ],
+        { ue_links: [rec(3, 1, 7)] },
+      );
+    },
+    api: {
+      wiring: { "Consumer.image": "ProducerA" },
+      discloses: [
+        /could not be matched to a specific sender input/,
+        /1 confirmed producer\(s\) plus 1 input\(s\)/,
+      ],
+    },
+    flat: {
+      wiring: { "Consumer.image": "ProducerA" },
+      discloses: [
+        /could not be matched to a specific sender input/,
+        /1 confirmed producer\(s\) plus 1 input\(s\)/,
+      ],
+    },
+  },
+  {
     name: "multi-input sender, ONE producer on every channel",
     why: "no channel to confuse — the caveat must NOT fire, or it becomes noise on every multi-input graph and gets ignored.",
     graph: () =>
@@ -722,6 +757,177 @@ const CORPUS: Case[] = [
       "the flattener does NOT expand subgraph definitions — it flattens virtual wiring in the graph it is given and keeps every real node in place, so the consumers stay wired to the instances. The converter emits an executable prompt, which requires expanding them. Both are correct for their contract, and neither loses a connection.",
   },
   {
+    name: "record names a virtual that serializes NO outputs key",
+    why: "the absent-outputs rule is right but must be applied to the REAL producer. Judging the Reroute — which has no outputs of its own — refused a live edge in one tool while the other resolved past it and kept it.",
+    graph: () => {
+      const reroute = n(2, "Reroute", { inputs: [{ name: "", type: "IMAGE", link: 41 }] });
+      delete (reroute as { outputs?: unknown }).outputs;
+      return graph(
+        [
+          n(1, "Seed Everywhere", { outputs: [{ name: "IMAGE", type: "IMAGE", links: [41] }] }),
+          reroute,
+          consumer(3, "Consumer", null),
+        ],
+        [[41, 1, 0, 2, 0, "IMAGE"]],
+        { ue_links: [{ downstream: 3, downstream_slot: 0, upstream: 2, upstream_slot: 0, controller: 1, type: "IMAGE" }] },
+      );
+    },
+    api: { wiring: { "Consumer.image": "Seed Everywhere" }, silent: true },
+    flat: { wiring: { "Consumer.image": "Seed Everywhere" }, silent: true },
+  },
+  {
+    name: "record resolves through a CHAIN of two virtuals (Reroute → Get/Set bus)",
+    why: "normalization has to be transitive, not one hop. A single-hop resolver reaches the SetNode and stops there.",
+    graph: () =>
+      graph(
+        [
+          producer(1, "ProducerA", [60]),
+          n(4, "SetNode", {
+            widgets_values: ["bus"],
+            inputs: [{ name: "value", type: "IMAGE", link: 60 }],
+            outputs: [{ name: "*", type: "*", links: [] }],
+          }),
+          n(5, "GetNode", {
+            widgets_values: ["bus"],
+            outputs: [{ name: "IMAGE", type: "IMAGE", links: [61] }],
+          }),
+          n(6, "Reroute", {
+            inputs: [{ name: "", type: "IMAGE", link: 61 }],
+            outputs: [{ name: "", type: "IMAGE", links: [62] }],
+          }),
+          sender(7, "Anything Everywhere", [62]),
+          consumer(3, "Consumer", null),
+        ],
+        [
+          [60, 1, 0, 4, 0, "IMAGE"],
+          [61, 5, 0, 6, 0, "IMAGE"],
+          [62, 6, 0, 7, 0, "IMAGE"],
+        ],
+        { ue_links: [{ downstream: 3, downstream_slot: 0, upstream: 6, upstream_slot: 0, controller: 7, type: "IMAGE" }] },
+      ),
+    api: { wiring: { "Consumer.image": "ProducerA" }, silent: true },
+    flat: { wiring: { "Consumer.image": "ProducerA" }, silent: true },
+  },
+  {
+    name: "record whose producer chain is a CYCLE",
+    why: "a malformed graph must terminate and disclose, not hang and not quietly wire something.",
+    graph: () =>
+      graph(
+        [
+          n(2, "Reroute", {
+            inputs: [{ name: "", type: "IMAGE", link: 71 }],
+            outputs: [{ name: "", type: "IMAGE", links: [70] }],
+          }),
+          n(3, "Reroute", {
+            inputs: [{ name: "", type: "IMAGE", link: 70 }],
+            outputs: [{ name: "", type: "IMAGE", links: [71] }],
+          }),
+          sender(7, "Anything Everywhere", [70]),
+          consumer(4, "Consumer", null),
+        ],
+        [
+          [70, 2, 0, 3, 0, "IMAGE"],
+          [71, 3, 0, 2, 0, "IMAGE"],
+        ],
+        { ue_links: [{ downstream: 4, downstream_slot: 0, upstream: 2, upstream_slot: 0, controller: 7, type: "IMAGE" }] },
+      ),
+    api: { wiring: { "Consumer.image": null }, discloses: [/could not be resolved|cycle/i] },
+    flat: { wiring: { "Consumer.image": null }, discloses: [/could not be resolved|dangling/i] },
+  },
+  {
+    name: "subgraph boundary feed THROUGH a virtual, definition instantiated twice",
+    why: "the hardest shape here: boundary + virtual wiring + UE + two instances at once. The boundary test compared a raw virtual id, so the materialized edge was never registered on the boundary and BOTH instances lost it — and a wrong fix would cross-wire instance A's consumer to instance B's producer.",
+    graph: () => {
+      const SG = "subgraph:Bus";
+      const g = graph(
+        [
+          producer(1, "ProducerA", [50]),
+          producer(9, "ProducerB", [51]),
+          n(706, SG, { inputs: [{ name: "image", type: "IMAGE", link: 50 }] }),
+          n(707, SG, { inputs: [{ name: "image", type: "IMAGE", link: 51 }] }),
+        ],
+        [
+          [50, 1, 0, 706, 0, "IMAGE"],
+          [51, 9, 0, 707, 0, "IMAGE"],
+        ],
+      );
+      (g as UiWorkflow).definitions = {
+        subgraphs: [
+          {
+            id: SG,
+            name: "Bus",
+            inputNode: { id: -10 },
+            outputNode: { id: -20 },
+            inputs: [{ id: "i1", name: "image", type: "IMAGE", linkIds: [11] }],
+            outputs: [],
+            widgets: [],
+            extra: {
+              ue_links: [
+                { downstream: 3, downstream_slot: 0, upstream: 2, upstream_slot: 0, controller: 7, type: "IMAGE" },
+              ],
+            },
+            nodes: [
+              n(2, "Reroute", {
+                inputs: [{ name: "", type: "IMAGE", link: 11 }],
+                outputs: [{ name: "", type: "IMAGE", links: [12] }],
+              }),
+              sender(7, "Anything Everywhere", [12]),
+              consumer(3, "Consumer", null),
+            ],
+            links: [
+              { id: 11, origin_id: -10, origin_slot: 0, target_id: 2, target_slot: 0, type: "IMAGE" },
+              { id: 12, origin_id: 2, origin_slot: 0, target_id: 7, target_slot: 0, type: "IMAGE" },
+            ],
+          },
+        ],
+      };
+      return g;
+    },
+    // Both instances resolve to their OWN outer producer. `producerOf` reads the
+    // first match, so the cross-instance check is the dedicated test below.
+    api: { wiring: { "Consumer.image": "ProducerA" }, silent: true },
+    flat: { wiring: { "Consumer.image": "<absent>" }, silent: true, keeps: ["subgraph:Bus"] },
+    wiringDiverges: true,
+    divergence:
+      "the flattener does not expand subgraph definitions, so the inner Consumer never appears in the graph it returns at all (hence <absent>) and the instances stay in place untouched. The converter must expand them, once per instance. Neither loses a connection from the graph it is contracted to produce.",
+  },
+  {
+    name: "SELF-PRODUCING sender inside a subgraph instantiated twice",
+    why: "each instance must broadcast from its OWN expanded Seed. Sharing one would hand both consumers the same node and look perfectly plausible.",
+    graph: () => {
+      const SG = "subgraph:Seeded";
+      const g = graph(
+        [n(706, SG, { inputs: [] }), n(707, SG, { inputs: [] })],
+        [],
+      );
+      (g as UiWorkflow).definitions = {
+        subgraphs: [
+          {
+            id: SG,
+            name: "Seeded",
+            inputNode: { id: -10 },
+            outputNode: { id: -20 },
+            inputs: [],
+            outputs: [],
+            widgets: [],
+            extra: { ue_links: [rec(3, 9, 9)] },
+            nodes: [
+              n(9, "Seed Everywhere", { outputs: [{ name: "IMAGE", type: "IMAGE", links: [] }] }),
+              consumer(3, "Consumer", null),
+            ],
+            links: [],
+          },
+        ],
+      };
+      return g;
+    },
+    api: { wiring: { "Consumer.image": "Seed Everywhere" }, silent: true },
+    flat: { wiring: { "Consumer.image": "<absent>" }, silent: true, keeps: ["subgraph:Seeded"] },
+    wiringDiverges: true,
+    divergence:
+      "same expansion asymmetry: the inner Consumer is not in the flattened graph at all, so there is nothing there to materialize and nothing lost from what the flattener returns.",
+  },
+  {
     name: "MISSING ue_links list with senders present",
     why: "an unknown, not an answer: the broadcasts are unrecoverable from the file and the caller needs the remedy.",
     graph: () =>
@@ -794,6 +1000,36 @@ describe("virtual-wiring corpus — cross-tool invariants", () => {
       }
     });
   }
+
+  it("the flattener never returns two links sharing an id, for ANY corpus shape", () => {
+    // A duplicate id makes every consumer input and producer output list keyed by
+    // it ambiguous. Asserted across the whole table rather than per row, because
+    // it is a property of the output, not of any one input shape.
+    for (const c of CORPUS) {
+      const { graph: out } = flattenUiWorkflow(structuredClone(c.graph()));
+      const ids = (out.links ?? []).filter((l) => Array.isArray(l)).map((l) => l[0]);
+      expect(new Set(ids).size, `${c.name} produced duplicate link ids`).toBe(ids.length);
+    }
+  });
+
+  it("two instances of one definition never share or cross-wire a broadcast", () => {
+    // `producerOf` reads the first matching consumer, so a table row cannot say
+    // "instance A got A's producer and B got B's". A cross-wire here would look
+    // entirely plausible in the result: every consumer connected, to the wrong
+    // producer. Asserted directly.
+    const c = CORPUS.find(
+      (x) => x.name === "subgraph boundary feed THROUGH a virtual, definition instantiated twice",
+    )!;
+    const { workflow } = convertUiToApi(structuredClone(c.graph()), OBJECT_INFO);
+    const feeders = Object.values(workflow)
+      .filter((node) => node.class_type === "Consumer")
+      .map((node) => {
+        const v = (node.inputs as Record<string, unknown>).image;
+        return Array.isArray(v) ? workflow[String(v[0])]?.class_type : null;
+      });
+    expect(feeders).toHaveLength(2);
+    expect([...feeders].sort()).toEqual(["ProducerA", "ProducerB"]);
+  });
 
   it("every case that loses a connection says so in BOTH tools", () => {
     const gaps: string[] = [];

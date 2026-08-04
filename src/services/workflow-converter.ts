@@ -839,6 +839,26 @@ function materializeUeInGraph(
     { type: string; confirmed: number; unresolved: number }
   >();
   /**
+   * THE single "is this producer real" question. Every uncertainty about a
+   * producer must flow through here — the record's own producer before it is
+   * materialized, AND each of the sender's feeds when counting how many distinct
+   * producers it carries. Two separate answers to the same question is how the
+   * caveat came to claim a producer was "confirmed" that the materializer would
+   * have refused.
+   *
+   * A node OUTSIDE this graph (a subgraph boundary feed) is not judged here: its
+   * real producer lives one level up and is resolved during expansion.
+   */
+  const producerConfirmed = (nodeId: number, slot: number): boolean => {
+    const nd = nodesById.get(nodeId);
+    if (!nd) return true;
+    // A node that really produces something serializes its outputs. An absent
+    // array is could-not-determine, and folding that into a definite yes is what
+    // let an executable edge be emitted to a slot nothing proved exists.
+    if (!Array.isArray(nd.outputs)) return false;
+    return slot < nd.outputs.length;
+  };
+  /**
    * Verify the record against the sender's LIVE feed.
    *  - "ok"          the sender is still fed by exactly this producer + slot
    *  - "detached"    the sender has no incoming connection at all
@@ -849,9 +869,12 @@ function materializeUeInGraph(
    */
   const assessRecord = (
     raw: UeLinkEntry,
+    /** The record's producer ALREADY normalized past any virtual wiring. Passed
+     *  in rather than recomputed so the check and the materialization provably
+     *  judge the SAME node — computing it independently in each place is exactly
+     *  how one site came to compare a raw virtual id against a normalized one. */
+    want: { node: number; slot: number },
   ): "ok" | "detached" | "rewired" | "unverifiable" | "unattributable" => {
-    const want = realOfNode(raw.upstream, raw.upstream_slot);
-    if (!want) return "unverifiable";
     // No `controller` (older lists omit the field): the record cannot be tied to
     // ANY sender. Scanning for "some live sender happens to be fed by this
     // producer" reads a COINCIDENCE as evidence — the record's own sender may be
@@ -913,12 +936,12 @@ function materializeUeInGraph(
     const distinct = new Set<string>();
     for (const f of feeds) {
       const real = realSourceOf(f.link as number);
-      if (!real) {
-        // An UNRESOLVED input is an UNKNOWN producer, not the absence of one, so
-        // it counts toward the channel ambiguity below. Contributing nothing made
-        // a sender with one known and one unknown producer read as "one producer,
-        // nothing to confuse" — silencing the caveat exactly where the risk is
-        // highest.
+      // An UNRESOLVED input is an UNKNOWN producer, not the absence of one, and
+      // so is one whose producer this converter would REFUSE to wire from. Both
+      // count toward the channel ambiguity below; contributing nothing made a
+      // sender with one known and one unknown producer read as "one producer,
+      // nothing to confuse", silencing the caveat where the risk is highest.
+      if (!real || !producerConfirmed(real.node, real.slot)) {
         unresolved++;
         continue;
       }
@@ -959,34 +982,40 @@ function materializeUeInGraph(
       );
       continue;
     }
+    // NORMALIZE ONCE, HERE. The pack records the virtual node in front of a
+    // producer as readily as the producer itself, so every question asked below —
+    // is this the subgraph boundary, does this node exist, does that output slot
+    // exist, is the sender still fed by it, what do we wire from — must be asked
+    // about the REAL producer. Resolving it independently at each site is what
+    // left one check comparing a raw virtual id while its neighbour compared a
+    // normalized one, and each such pair cost a live edge.
+    const from = realOfNode(raw.upstream, raw.upstream_slot);
+    if (!from) {
+      warnings.push(
+        `A cg-use-everywhere broadcast in ${scope} into node ${dst.id} (${dst.type}) input "${inputLabel}" names producer #${raw.upstream}, whose own virtual wiring could not be resolved to a real node — that input is left UNCONNECTED rather than wired from an unknown source.`,
+      );
+      continue;
+    }
     // Inside a subgraph definition the producer can be the definition's virtual
     // INPUT node: the broadcast's real source is whatever the outer component's
     // matching input is wired to. That is a recoverable connection, not a missing
     // producer — register the materialized edge on the boundary so the expander's
     // input rewiring re-targets it to the outer source like any other inner link.
-    const fromBoundary = boundary != null && raw.upstream === boundary.inputNodeId;
-    const src = fromBoundary ? undefined : nodesById.get(raw.upstream);
+    const fromBoundary = boundary != null && from.node === boundary.inputNodeId;
+    const src = fromBoundary ? undefined : nodesById.get(from.node);
     if (!src && !fromBoundary) {
       warnings.push(
         `A cg-use-everywhere broadcast in ${scope} into node ${dst.id} (${dst.type}) input "${inputLabel}" names producer #${raw.upstream}, which is not in this graph — that connection is ABSENT from the stripped graph.`,
       );
       continue;
     }
-    // The recorded output slot must be OBSERVABLY there. An absent outputs array
-    // was previously trusted, on the grounds that the pack's list is the authority
-    // and absence is an unknown — but that folds the unknown into a definite YES
-    // and emits an executable edge from it. Unknown gets its own outcome instead:
-    // refuse and say so. (The flattener already declined this shape; the two now
-    // agree.) A node that really produces something serializes its outputs.
-    if (src && !Array.isArray(src.outputs)) {
+    // The recorded output slot must be OBSERVABLY there, on the REAL producer.
+    if (src && !producerConfirmed(from.node, from.slot)) {
+      const detail = Array.isArray(src.outputs)
+        ? `which only has ${src.outputs.length} output(s)`
+        : `but that node serializes no outputs at all, so the slot could not be confirmed to exist`;
       warnings.push(
-        `A cg-use-everywhere broadcast in ${scope} into node ${dst.id} (${dst.type}) input "${inputLabel}" names node ${src.id} (${src.type}) as its producer, but that node serializes no outputs at all, so the recorded output slot ${raw.upstream_slot} could not be confirmed to exist. That input is left UNCONNECTED rather than wired to a slot that may not be there.`,
-      );
-      continue;
-    }
-    if (src && raw.upstream_slot >= src.outputs!.length) {
-      warnings.push(
-        `A cg-use-everywhere broadcast in ${scope} into node ${dst.id} (${dst.type}) input "${inputLabel}" names output slot ${raw.upstream_slot} of node ${src.id} (${src.type}), which only has ${src.outputs!.length} output(s) — the record is stale, so that input is left UNCONNECTED rather than wired to a slot that does not exist.`,
+        `A cg-use-everywhere broadcast in ${scope} into node ${dst.id} (${dst.type}) input "${inputLabel}" resolves to output slot ${from.slot} of node ${src.id} (${src.type}), ${detail} — that input is left UNCONNECTED rather than wired to a slot nothing proves is there.`,
       );
       continue;
     }
@@ -994,7 +1023,7 @@ function materializeUeInGraph(
     // an absence: the sender survives but is no longer fed by the recorded
     // producer. Never materialize an unconfirmed record — say what could not be
     // confirmed instead.
-    const verdict = assessRecord(raw);
+    const verdict = assessRecord(raw, from);
     if (verdict !== "ok") {
       const ctrl = nodesById.get(raw.controller as number);
       const who = `${ctrl?.type ?? "broadcast node"} #${raw.controller}`;
@@ -1012,10 +1041,11 @@ function materializeUeInGraph(
       continue;
     }
     const id = nextId();
+    // Wire from the REAL producer, the same node every check above judged.
     addLink(
       id,
-      raw.upstream,
-      raw.upstream_slot,
+      from.node,
+      from.slot,
       raw.downstream,
       raw.downstream_slot,
       raw.type ?? dstInput.type ?? "*",
@@ -1024,10 +1054,10 @@ function materializeUeInGraph(
     if (fromBoundary) {
       // The expander walks each subgraph input's linkIds to re-point its inner
       // consumers at the outer source; an unregistered edge would be left dangling.
-      const sgInput = boundary!.inputs[raw.upstream_slot];
+      const sgInput = boundary!.inputs[from.slot];
       if (sgInput) (sgInput.linkIds ??= []).push(id);
     } else {
-      const srcOut = src!.outputs?.[raw.upstream_slot];
+      const srcOut = src!.outputs?.[from.slot];
       if (srcOut) srcOut.links = [...(srcOut.links ?? []), id];
     }
     added++;
@@ -1041,10 +1071,14 @@ function materializeUeInGraph(
   const attributed = new Set<number>();
   for (const r of ueLinks as UeLinkEntry[]) {
     if (r?.controller != null) attributed.add(r.controller);
-    // A controllerless record still accounts for its sender when the producer IS
-    // that sender (the self-producing shape accepted above).
-    else if (isSelfProducingUeSender(nodesById.get(r?.upstream)?.type ?? "")) {
-      attributed.add(r.upstream);
+    else {
+      // A controllerless record still accounts for its sender when the producer
+      // IS that sender (the self-producing shape accepted above) — judged on the
+      // NORMALIZED producer, since the record may name a virtual in front of it.
+      const p = realOfNode(r?.upstream, r?.upstream_slot);
+      if (p && isSelfProducingUeSender(nodesById.get(p.node)?.type ?? "")) {
+        attributed.add(p.node);
+      }
     }
   }
   for (const s of senders) {
@@ -1342,8 +1376,22 @@ function expandSingleComponent(
         continue;
       }
 
-      // For each inner link from the virtual input node, create a new outer link
-      for (const innerLinkId of sgInput.linkIds) {
+      // Every inner link that ORIGINATES at the boundary for this input, not just
+      // the ones the definition's own `linkIds` happens to list. De-virtualization
+      // re-homes a link onto the boundary when the producer sat behind a Reroute
+      // or a Get/Set bus inside the definition, and such a link is nowhere in
+      // `linkIds` — it was silently skipped here and its consumer lost the
+      // connection, once per instance. `linkIds` remains the primary source (it
+      // carries entries even when a link's origin was rewritten elsewhere), and
+      // the two are unioned by id.
+      const boundaryLinkIds = new Set<number>(sgInput.linkIds ?? []);
+      const inputIndex = sg.inputs.indexOf(sgInput);
+      for (const il of sg.links) {
+        if (il.origin_id === inputNodeId && il.origin_slot === inputIndex) {
+          boundaryLinkIds.add(il.id);
+        }
+      }
+      for (const innerLinkId of boundaryLinkIds) {
         const il = innerLinkById.get(innerLinkId);
         if (!il || il.origin_id !== inputNodeId) continue;
         const remappedTarget = nodeRemap.get(il.target_id);
