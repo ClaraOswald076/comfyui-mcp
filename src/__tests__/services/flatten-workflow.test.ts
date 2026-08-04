@@ -303,27 +303,30 @@ describe("flattenUiWorkflow — Use-Everywhere", () => {
     expect(new Set(ids).size).toBe(ids.length);
   });
 
-  it("a class merely SHARING a sender name prefix cannot skip the feed check", () => {
-    // Recognition is generous on purpose, so a foreign "Seed Everywhere …" class
-    // is treated as a sender — but it must not inherit the self-producing
-    // exemption that skips verification.
+  it("a foreign class sharing a sender name prefix FABRICATES nothing, even when fed", () => {
+    // The fabrication direction specifically: "Seed Everywhere Helper" IS fed by
+    // node 1, so a feed check alone would confirm the stale record and emit
+    // 1 → #3. It is not a cg-use-everywhere node, so no edge may appear — and
+    // because nothing here is recognized, the backstop reports it.
     const g: UiWorkflow = {
       nodes: [
-        node(1, "Seed Everywhere Helper", { outputs: [{ name: "INT", type: "INT", links: [] }] }),
-        node(3, "SomeConsumer", { inputs: [{ name: "seed", type: "INT", link: null }] }),
+        node(1, "CheckpointLoaderSimple", { outputs: [{ name: "MODEL", type: "MODEL", links: [5] }] }),
+        node(9, "Seed Everywhere Helper", { inputs: [{ name: "anything", type: "*", link: 5 }] }),
+        node(3, "SomeConsumer", { inputs: [{ name: "model", type: "MODEL", link: null }] }),
       ],
-      links: [],
-      last_link_id: 0,
+      links: [[5, 1, 0, 9, 0, "MODEL"]],
+      last_link_id: 5,
       extra: {
         ue_links: [
-          { downstream: 3, downstream_slot: 0, upstream: 1, upstream_slot: 0, controller: 1, type: "INT" },
+          { downstream: 3, downstream_slot: 0, upstream: 1, upstream_slot: 0, controller: 9, type: "MODEL" },
         ],
       },
     };
     const { graph, report } = flattenUiWorkflow(g);
     const consumer = graph.nodes.find((n) => n.type === "SomeConsumer")!;
     expect(consumer.inputs![0].link).toBeNull();
-    expect(report.warnings.join("\n")).toContain("no longer has any incoming connection");
+    expect(graph.nodes.some((n) => n.type === "Seed Everywhere Helper")).toBe(true);
+    expect(report.warnings.join("\n")).toContain("no node in this graph is recognized as a Use-Everywhere sender");
   });
 
   it("keeps Seed Everywhere — it is its own real producer", () => {
@@ -429,7 +432,6 @@ describe("flattenUiWorkflow — Use-Everywhere", () => {
       "Anything Everywhere?",
       "Anything Everywhere3",
       "Prompts Everywhere",
-      "Prompts Everywhere?",
       "Seed Everywhere",
       // The pack registers this one, but the predicate used to compare the
       // "Seed Everywhere" family with equality, so it went unrecognized — and an
@@ -440,6 +442,14 @@ describe("flattenUiWorkflow — Use-Everywhere", () => {
     }
     expect(isUeSender("KSampler")).toBe(false);
     expect(isUeSender("SaveImage")).toBe(false);
+    // Membership is by NAME, not by name SHAPE. A prefix match briefly stood in
+    // for it and let a foreign class be treated as a sender, whose stale record
+    // then passed the feed check and fabricated an edge. An unrecognized class is
+    // now reported instead (see the no-recognized-sender backstop), so a closed
+    // set costs a disclosed unknown rather than a silent drop.
+    for (const t of ["Seed Everywhere Helper", "Anything Everywhere Deluxe", "Prompts Everywhere Pro"]) {
+      expect(isUeSender(t), `${t} must not be taken for a UE sender`).toBe(false);
+    }
   });
 });
 

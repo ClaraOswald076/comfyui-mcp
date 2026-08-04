@@ -36,30 +36,38 @@ const isRerouteType = (t: string) => t === "Reroute";
 const isWiringVirtual = (t: string) => isRerouteType(t) || GET_SET_TYPES.has(t);
 
 /**
- * cg-use-everywhere sender detection. The pack's own is_UEnode() prefix-matches
- * "Anything Everywhere" (so the "?" and "3" variants are covered) but compares
- * the other two families with EQUALITY — which misses the registered
- * "Seed Everywhere?" class. That asymmetry is an oversight, and here it is a
- * silent-loss bug: an unrecognized sender makes the materializer conclude there
- * are no broadcasts at all, dropping real ones with nothing said. Under-matching
- * costs a dropped connection; over-matching at worst asks the user to re-save.
- * All three families are therefore prefix-matched.
+ * cg-use-everywhere sender detection — the registered classes, by name.
+ *
+ * This was briefly a PREFIX match, to avoid missing a variant like the registered
+ * "Seed Everywhere?" that the pack's own is_UEnode() overlooks. That traded one
+ * failure for a worse one: a foreign class merely NAMED "Seed Everywhere Helper"
+ * was classified as a sender, and a stale record naming it then satisfied the
+ * feed check and FABRICATED an edge. Membership cannot be inferred from a name,
+ * and no feed check can rescue a wrong classification.
+ *
+ * A closed set is now safe because an unrecognized class no longer disappears
+ * quietly: records present with no recognized sender are REPORTED by both tools.
+ * So a future variant degrades to a disclosed unknown, which is the failure we
+ * can live with, while a name-alike foreign class can no longer invent wiring.
  */
-export const isUeSender = (t: string): boolean =>
-  t.startsWith("Anything Everywhere") ||
-  t.startsWith("Seed Everywhere") ||
-  t.startsWith("Prompts Everywhere");
+const UE_SENDER_CLASSES = new Set([
+  "Anything Everywhere",
+  "Anything Everywhere?",
+  "Anything Everywhere3",
+  "Prompts Everywhere",
+  "Seed Everywhere",
+  "Seed Everywhere?",
+]);
+export const isUeSender = (t: string): boolean => UE_SENDER_CLASSES.has(t);
 
 /**
  * The UE senders that OWN the value they broadcast instead of relaying an input —
  * the Seed Everywhere family holds its seed in a widget and IS its own producer.
  * Every other sender relays whatever is wired into it.
  *
- * Deliberately a CLOSED set, unlike isUeSender's prefix match. Recognition should
- * be generous (an unrecognized sender silently loses its broadcasts), but this
- * predicate gates the one path that accepts a record WITHOUT verifying the
- * sender's incoming feed, and an exception that skips verification has to be
- * narrow. A future self-producing variant that is not listed here simply takes
+ * This gates the one path that accepts a record WITHOUT verifying the sender's
+ * incoming feed, so it stays the narrower of the two sets. A future
+ * self-producing variant that is not listed here simply takes
  * the ordinary feed check and is refused with a warning — disclosed, not silent.
  */
 export const isSelfProducingUeSender = (t: string): boolean =>
@@ -181,6 +189,14 @@ export function flattenUiWorkflow(
   let nextLinkId = Math.max(ui.last_link_id ?? 0, 0, ...linkMap.keys()) + 1;
   const freshLinks: UiLink[] = [];
   let rewired = 0;
+  /** node id → how many of its inputs pass 1 disconnected because their virtual
+   *  chain could not be resolved. Pass 2 needs this: it runs AFTER pass 1, so a
+   *  sender whose second channel came through a dead chain would otherwise look
+   *  single-fed and lose its channel caveat — while the converter, which
+   *  validates before de-virtualizing, still sees two. Same graph, same answer. */
+  const clearedInputs = new Map<number, number>();
+  const noteCleared = (nodeId: number) =>
+    clearedInputs.set(nodeId, (clearedInputs.get(nodeId) ?? 0) + 1);
 
   const addDirectLink = (
     srcId: number,
@@ -221,6 +237,7 @@ export function flattenUiWorkflow(
         const resolved = resolveReal(inp.link);
         if (!resolved) {
           inp.link = null;
+          noteCleared(node.id);
           warnings.push(
             `${node.type} #${node.id} input "${inp.name ?? slot}" fed by a dangling ${origin.type} chain — left unconnected`,
           );
@@ -233,6 +250,7 @@ export function flattenUiWorkflow(
           // deleted, no replacement link, and the final scrub quietly clearing the
           // consumer: a real connection gone with nothing said.
           inp.link = null;
+          noteCleared(node.id);
           const producer = nodesById.get(resolved.id);
           warnings.push(
             `${node.type} #${node.id} input "${inp.name ?? slot}" resolves through ${origin.type} #${origin.id} to node #${resolved.id}${
@@ -249,8 +267,21 @@ export function flattenUiWorkflow(
   // ── Pass 2: materialize UE broadcasts from the pack's own computed list ───
   const ueSenders = nodes.filter((n) => isUeSender(n.type));
   const ueDeletable = new Set<number>();
+  const allUeLinks = (ui.extra?.ue_links as UeLink[] | undefined) ?? null;
+  if (includeUe && ueSenders.length === 0 && Array.isArray(allUeLinks) && allUeLinks.length > 0) {
+    // Records but no recognized sender. Skipping UE processing in silence is the
+    // worst outcome available: a real broadcast dropped with nothing said, and
+    // exactly what an unrecognized sender CLASS produces. A deleted sender
+    // (records genuinely stale) and an unknown class (records live) cannot be told
+    // apart here, so it is reported as the could-not-determine it is. The
+    // converter has the same backstop — a graph must not be disclosed by one tool
+    // and passed over in silence by the other.
+    warnings.push(
+      `${allUeLinks.length} Use-Everywhere broadcast record(s) present but no node in this graph is recognized as a Use-Everywhere sender — either those senders were deleted (records stale) or they are a class this flattener does not know, so NOTHING was materialized from them and the inputs they name are left unconnected`,
+    );
+  }
   if (includeUe && ueSenders.length) {
-    const ueLinks = (ui.extra?.ue_links as UeLink[] | undefined) ?? null;
+    const ueLinks = allUeLinks;
     // An EMPTY computed list is an ANSWER — the pack analysed the graph and
     // recorded no broadcast — so there is nothing to materialize and nothing to
     // report. Only an ABSENT (or non-array) list is an unknown. Folding the two
@@ -305,23 +336,30 @@ export function flattenUiWorkflow(
         if (feeds.length === 0) {
           return `${ctrl.type} #${ctrl.id} no longer has any incoming connection, so it broadcasts nothing`;
         }
-        let unresolved = false;
+        // Inputs pass 1 already disconnected count as unknown producers, not as
+        // absent ones — the record may well have belonged to one of them.
+        let unresolved = clearedInputs.get(ctrl.id) ?? 0;
         let matched = false;
         const distinct = new Set<string>();
         for (const f of feeds) {
           const r = resolveReal(f.link as number);
           if (!r) {
-            unresolved = true;
+            // An UNRESOLVED input is not "no producer" — it is an unknown one, so
+            // it counts toward the channel ambiguity. Letting it contribute
+            // nothing made a sender with one known and one unknown producer read
+            // as "one producer, nothing to confuse", silencing the caveat exactly
+            // where the risk is highest.
+            unresolved++;
             continue;
           }
           distinct.add(`${r.id}:${r.slot}`);
           if (r.id === srcId && r.slot === srcSlot) matched = true;
         }
         if (matched) {
-          if (distinct.size > 1) multiFeed.set(ctrl.id, ctrl.type);
+          if (distinct.size + unresolved > 1) multiFeed.set(ctrl.id, ctrl.type);
           return null;
         }
-        return unresolved
+        return unresolved > 0
           ? `${ctrl.type} #${ctrl.id}'s own incoming connection could not be resolved, so the recorded producer node ${srcId} could not be confirmed`
           : `${ctrl.type} #${ctrl.id} is now fed by a different producer than the recorded node ${srcId}`;
       };

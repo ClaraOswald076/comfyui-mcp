@@ -868,8 +868,15 @@ function materializeUeInGraph(
     // so there is no incoming feed to compare against. Same narrowing — a relay
     // sender that merely names itself as its own upstream is not exempt from
     // verification, it falls through to the feed check below.
+    //
+    // Compare the NORMALIZED producer, not the raw one. The pack records the
+    // virtual in front of a producer as readily as the producer, so a record like
+    // { controller: SeedEverywhere#1, upstream: Reroute#2 } is self-producing once
+    // the Reroute is followed. Testing the raw value called that a mismatch, fell
+    // through to the feed check, found a Seed has no incoming feed, and DROPPED a
+    // live broadcast. (The flattener normalizes first; this makes the two agree.)
     if (
-      raw.upstream === raw.controller &&
+      want.node === raw.controller &&
       isSelfProducingUeSender(nodesById.get(raw.controller)?.type ?? "")
     ) {
       return "ok";
@@ -898,22 +905,27 @@ function materializeUeInGraph(
     // different failures; only the second one is this issue.
     const feeds = (ctrl.inputs ?? []).filter((i) => i.link != null);
     if (feeds.length === 0) return "detached";
-    let anyUnresolved = false;
+    let unresolved = 0;
     let matched = false;
     const distinct = new Set<string>();
     for (const f of feeds) {
       const real = realSourceOf(f.link as number);
       if (!real) {
-        anyUnresolved = true;
+        // An UNRESOLVED input is an UNKNOWN producer, not the absence of one, so
+        // it counts toward the channel ambiguity below. Contributing nothing made
+        // a sender with one known and one unknown producer read as "one producer,
+        // nothing to confuse" — silencing the caveat exactly where the risk is
+        // highest.
+        unresolved++;
         continue;
       }
       distinct.add(`${real.node}:${real.slot}`);
       if (real.node === want.node && real.slot === want.slot) matched = true;
     }
-    if (!matched) return anyUnresolved ? "unverifiable" : "rewired";
+    if (!matched) return unresolved > 0 ? "unverifiable" : "rewired";
     // Confirmed live, but on a sender carrying MORE THAN ONE distinct producer the
     // channel→target association is not recoverable from the record (see above).
-    if (distinct.size > 1) multiFeedControllers.set(ctrl.id, ctrl.type);
+    if (distinct.size + unresolved > 1) multiFeedControllers.set(ctrl.id, ctrl.type);
     return "ok";
   };
 
@@ -951,13 +963,21 @@ function materializeUeInGraph(
       );
       continue;
     }
-    // Only reject the slot when we can POSITIVELY observe it is gone (the node
-    // serializes an outputs array that is too short). An absent outputs array is
-    // an unknown, not a "no" — and the pack's own computed list is the authority
-    // on what it wired — so it is trusted rather than silently dropped.
-    if (src && Array.isArray(src.outputs) && raw.upstream_slot >= src.outputs.length) {
+    // The recorded output slot must be OBSERVABLY there. An absent outputs array
+    // was previously trusted, on the grounds that the pack's list is the authority
+    // and absence is an unknown — but that folds the unknown into a definite YES
+    // and emits an executable edge from it. Unknown gets its own outcome instead:
+    // refuse and say so. (The flattener already declined this shape; the two now
+    // agree.) A node that really produces something serializes its outputs.
+    if (src && !Array.isArray(src.outputs)) {
       warnings.push(
-        `A cg-use-everywhere broadcast in ${scope} into node ${dst.id} (${dst.type}) input "${inputLabel}" names output slot ${raw.upstream_slot} of node ${src.id} (${src.type}), which only has ${src.outputs.length} output(s) — the record is stale, so that input is left UNCONNECTED rather than wired to a slot that does not exist.`,
+        `A cg-use-everywhere broadcast in ${scope} into node ${dst.id} (${dst.type}) input "${inputLabel}" names node ${src.id} (${src.type}) as its producer, but that node serializes no outputs at all, so the recorded output slot ${raw.upstream_slot} could not be confirmed to exist. That input is left UNCONNECTED rather than wired to a slot that may not be there.`,
+      );
+      continue;
+    }
+    if (src && raw.upstream_slot >= src.outputs!.length) {
+      warnings.push(
+        `A cg-use-everywhere broadcast in ${scope} into node ${dst.id} (${dst.type}) input "${inputLabel}" names output slot ${raw.upstream_slot} of node ${src.id} (${src.type}), which only has ${src.outputs!.length} output(s) — the record is stale, so that input is left UNCONNECTED rather than wired to a slot that does not exist.`,
       );
       continue;
     }

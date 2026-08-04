@@ -878,25 +878,33 @@ describe("#361 — cg-use-everywhere broadcast links", () => {
     expect(joined(warnings)).toContain("SWAPPING");
   });
 
-  it("a non-UE class sharing a sender name PREFIX cannot skip the feed check", () => {
-    // Recognition is generous on purpose (an unrecognized sender loses its
-    // broadcasts silently), so a foreign "Seed Everywhere …" class can be
-    // classified as a sender. It must NOT therefore inherit the self-producing
-    // exemption that skips feed verification, or a stale record naming it would
-    // be materialized unchecked.
+  it("a foreign class sharing a sender name PREFIX fabricates nothing, even when fed", () => {
+    // The fabrication direction: node 9 IS fed by node 1, so a feed check alone
+    // would confirm this stale record and emit 1 → SaveImage#3. Membership cannot
+    // be inferred from a name shape, and no feed check rescues a wrong
+    // classification — so the class is not a sender, nothing is wired, and the
+    // records are reported by the no-recognized-sender backstop.
     const g = {
       extra: {
         ue_links: [
-          { downstream: 3, downstream_slot: 0, upstream: 9, upstream_slot: 0, type: "IMAGE" },
+          { downstream: 3, downstream_slot: 0, upstream: 1, upstream_slot: 0, controller: 9, type: "IMAGE" },
         ],
       },
       nodes: [
         {
+          id: 1,
+          type: "LoadImage",
+          mode: 0,
+          inputs: [],
+          outputs: [{ name: "IMAGE", type: "IMAGE", links: [70] }],
+          widgets_values: ["a.png"],
+        },
+        {
           id: 9,
           type: "Seed Everywhere Helper",
           mode: 0,
-          inputs: [],
-          outputs: [{ name: "IMAGE", type: "IMAGE", links: [] }],
+          inputs: [{ name: "anything", type: "*", link: 70 }],
+          outputs: [],
           widgets_values: [1],
         },
         {
@@ -908,17 +916,16 @@ describe("#361 — cg-use-everywhere broadcast links", () => {
           widgets_values: ["out"],
         },
       ],
-      links: [],
+      links: [[70, 1, 0, 9, 0, "IMAGE"]],
     } as never;
     const { workflow, warnings } = convertUiToApi(g, {
       ...(OBJECT_INFO as object),
       "Seed Everywhere Helper": {
-        input: { required: { seed: ["INT", { default: 0 }] } },
-        output: ["IMAGE"],
+        input: { required: {}, optional: { anything: ["*"] } },
       },
     } as never);
     expect(workflow["3"].inputs.images).toBeUndefined();
-    expect(joined(warnings)).toContain("could not be confirmed against the live graph");
+    expect(joined(warnings)).toContain("no node in it is recognized as a cg-use-everywhere broadcast node");
   });
 
   it("a live sender that the ue_links list does not mention is reported", () => {
