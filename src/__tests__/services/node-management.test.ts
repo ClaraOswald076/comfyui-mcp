@@ -134,6 +134,7 @@ import {
   enableCustomNode,
   uninstallCustomNode,
   normalizeGitUrlInstallArgs,
+  nodesInstallCommandArgs,
   listInstalledNodes,
   syncNodeDependencies,
   setQueueTimingForTests,
@@ -1501,6 +1502,32 @@ describe("node-management service", () => {
     });
   });
 
+  describe("nodesInstallCommandArgs (#789 dispatch shape)", () => {
+    const URL = "https://github.com/ltdrdata/ComfyUI-Impact-Pack";
+
+    it("the dispatched command drops `id` for a URL-as-id target — no ??-merge can restore it", () => {
+      const out = nodesInstallCommandArgs({ id: URL, version: "latest", mode: "remote" });
+      expect(out.id).toBeUndefined();
+      expect(out.repository).toBe(URL);
+      expect(out.version).toBe("nightly");
+      expect(out.mode).toBe("remote");
+      expect(out.note).toBeTruthy();
+      expect(out.conflict).toBeUndefined();
+    });
+
+    it("passes a plain registry id through untouched", () => {
+      const out = nodesInstallCommandArgs({ id: "comfyui-kjnodes", version: "latest" });
+      expect(out.id).toBe("comfyui-kjnodes");
+      expect(out.version).toBe("latest");
+      expect(out.repository).toBeUndefined();
+    });
+
+    it("surfaces the id+repository conflict", () => {
+      const out = nodesInstallCommandArgs({ id: "comfyui-kjnodes", repository: URL });
+      expect(out.conflict).toMatch(/BOTH/);
+    });
+  });
+
 
   // ---- list --------------------------------------------------------------
 
@@ -1581,6 +1608,28 @@ describe("node-management service", () => {
           if (path.startsWith("/v2/customnode/installed")) {
             // Parses as an object — but its values are scalars, not pack records.
             return jsonResponse({ error: "temporary failure" });
+          }
+          return new Response("", { status: 200 });
+        }),
+      );
+      await expect(listInstalledNodes()).rejects.toThrow(/unreadable payload/);
+    });
+
+    it("a NESTED error envelope ({\"error\": {\"message\": …}}) is unreadable, not a pack named 'error'", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const path = new URL(url).pathname;
+          if (path === "/v2/manager/queue/status") {
+            return jsonResponse({
+              total_count: 1,
+              done_count: 1,
+              in_progress_count: 0,
+              is_processing: false,
+            });
+          }
+          if (path.startsWith("/v2/customnode/installed")) {
+            return jsonResponse({ error: { message: "temporary failure" } });
           }
           return new Response("", { status: 200 });
         }),

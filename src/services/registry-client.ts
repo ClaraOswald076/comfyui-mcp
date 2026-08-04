@@ -126,8 +126,10 @@ export async function searchNodes(
   // direct pack-details endpoint with the query normalized to a registry-id
   // slug before reporting no matches. The fallback can only ADD a result; only
   // an observed 404 leaves the honest empty answer — any other failure means
-  // absence was never established and is refused with the reason.
-  if (lowerQuery && filtered.length === 0) {
+  // absence was never established and is refused with the reason. PAGE 1 ONLY:
+  // the fallback has no pagination of its own, so it must not answer for a
+  // later page (an out-of-window exact match would otherwise surface ON page 2).
+  if (lowerQuery && filtered.length === 0 && page === 1) {
     const candidate = registryIdCandidateFromQuery(query);
     if (candidate) {
       try {

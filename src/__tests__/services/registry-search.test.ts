@@ -189,6 +189,21 @@ describe("searchNodes exact-id fallback (#773)", () => {
     expect(results.length).toBeGreaterThan(0);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+
+  it("the fallback only answers for page 1 (it has no pagination of its own)", async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ nodes: NODES }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const results = await searchNodes("comfyui kjnodes", { page: 2 });
+    expect(results).toEqual([]);
+    // Only the window fetch — no /nodes/<id> call for a later page.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("extractVersionString (registry version is an object, not a string)", () => {

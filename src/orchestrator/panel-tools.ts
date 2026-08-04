@@ -37,7 +37,7 @@ import { extname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { comfyuiFetch } from "../comfyui/fetch.js";
 import { assertPanelNotTargetedUnverifiable } from "../services/panel-pin-guard.js";
-import { normalizeGitUrlInstallArgs } from "../services/node-management.js";
+import { nodesInstallCommandArgs } from "../services/node-management.js";
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { parse as parseYaml } from "yaml";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
@@ -7805,23 +7805,16 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // Manager resolves that as a registry version and rejects it ("not
         // available node: <repo>@<version>"). Route it as the from-source
         // repository install that works, and disclose the rewrite.
-        const norm = normalizeGitUrlInstallArgs(args);
-        if (norm.conflict) return fail(norm.conflict);
+        const { conflict, note, ...cmdArgs } = nodesInstallCommandArgs(args);
+        if (conflict) return fail(conflict);
         const res = await ctx.call(
-          {
-            cmd: "nodes_install",
-            id: norm.id ?? args.id,
-            repository: norm.repository ?? args.repository,
-            version: norm.version ?? args.version,
-            channel: args.channel,
-            mode: args.mode,
-          },
+          { cmd: "nodes_install", ...cmdArgs },
           30000,
         );
-        if (norm.note) {
+        if (note) {
           const text = res.content.find((c) => c.type === "text");
           if (text && text.type === "text") {
-            text.text += `\n\nNOTE: ${norm.note}`;
+            text.text += `\n\nNOTE: ${note}`;
           }
         }
         return res;

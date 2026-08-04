@@ -3298,6 +3298,40 @@ export function normalizeGitUrlInstallArgs(
   return out;
 }
 
+/**
+ * The FINAL dispatch fields for the panel's `nodes_install` command, after
+ * #789 normalization. Built here — not by `??`-merging with the raw args at
+ * the call site — because a rerouted git URL must DROP `id`, and a
+ * `norm.id ?? args.id` merge silently restores it (codex gate round 4).
+ */
+export function nodesInstallCommandArgs(args: {
+  id?: string;
+  repository?: string;
+  version?: string;
+  channel?: string;
+  mode?: string;
+}): {
+  id?: string;
+  repository?: string;
+  version?: string;
+  channel?: string;
+  mode?: string;
+  note?: string;
+  conflict?: string;
+} {
+  const norm = normalizeGitUrlInstallArgs(args);
+  if (norm.conflict) return { conflict: norm.conflict };
+  const rerouted = norm.repository !== undefined;
+  return {
+    id: rerouted ? norm.id : args.id,
+    repository: rerouted ? norm.repository : args.repository,
+    version: rerouted ? norm.version : args.version,
+    channel: args.channel,
+    mode: args.mode,
+    ...(norm.note ? { note: norm.note } : {}),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // list installed
 // ---------------------------------------------------------------------------
@@ -3337,22 +3371,30 @@ async function listInstalledNodesAt(
     { base },
   );
   // A 200 with an empty or non-JSON body parses to undefined / a raw string in
-  // managerFetch, and an ERROR ENVELOPE like {"error": "…"} parses to an object
-  // whose values are scalars — parseInstalled would silently turn ALL of these
-  // into [], an EMPTY list, which downstream gates read as "the pack is
-  // absent". An unreadable payload is NOT an empty list: refuse to answer
-  // from it. ({} is a legitimate "nothing installed".)
-  const readable =
-    raw !== undefined &&
-    raw !== null &&
-    typeof raw === "object" &&
-    (Array.isArray(raw)
-      ? // parseInstalled only understands entry OBJECTS — a bare string element
-        // (["temporary failure"]) would be silently dropped, reading as empty.
-        raw.every((el) => el !== null && typeof el === "object" && !Array.isArray(el))
-      : Object.values(raw as Record<string, unknown>).every(
-          (v) => v !== null && typeof v === "object" && !Array.isArray(v),
-        ));
+  // managerFetch, and an ERROR ENVELOPE parses to an object whose values are
+  // scalars ({"error": "…"}) or an object keyed by "error"/"detail"
+  // ({"error": {"message": …}}, FastAPI's {"detail": …}) — parseInstalled
+  // would silently turn ALL of these into an empty or junk list, which
+  // downstream gates read as "the pack is absent". An unreadable payload is
+  // NOT an empty list: refuse to answer from it. ({} is a legitimate
+  // "nothing installed"; a module literally named "error" is the pathological
+  // case accepted as collateral.)
+  let readable = false;
+  if (Array.isArray(raw)) {
+    // parseInstalled only understands entry OBJECTS — a bare string element
+    // (["temporary failure"]) would be silently dropped, reading as empty.
+    readable = raw.every(
+      (el) => el !== null && typeof el === "object" && !Array.isArray(el),
+    );
+  } else if (raw !== undefined && raw !== null && typeof raw === "object") {
+    const rec = raw as Record<string, unknown>;
+    readable =
+      !("error" in rec) &&
+      !("detail" in rec) &&
+      Object.values(rec).every(
+        (v) => v !== null && typeof v === "object" && !Array.isArray(v),
+      );
+  }
   if (!readable) {
     throw new NodeManagementError(
       `ComfyUI-Manager's installed-pack list returned an unreadable payload ` +
