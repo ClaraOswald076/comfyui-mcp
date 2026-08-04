@@ -31,11 +31,14 @@ const fsState = vi.hoisted(() => ({
    *  cannot reach a verdict either way. */
   breakReadsAfterWrite: false,
   readsBroken: false,
+  /** Swallow only SOME writes — used to fail one alias of a slot fan-out. */
+  failWriteOnCall: null as null | (() => boolean),
 }));
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   const writeFileSync: typeof actual.writeFileSync = (...args) => {
     if (fsState.swallowWrites) return;
+    if (fsState.failWriteOnCall?.()) return; // this write silently does not land
     const out = actual.writeFileSync(...args);
     if (fsState.breakReadsAfterWrite) fsState.readsBroken = true;
     return out;
@@ -58,6 +61,7 @@ import {
   buildComfyuiMcpEnv,
   clearPanelSecret,
   hasLivePickup,
+  listPanelSecretsMasked,
   migrateSecretsToEnv,
   onComfyuiSecretsChanged,
   panelSecretsPath,
@@ -88,6 +92,7 @@ beforeEach(() => {
   fsState.swallowWrites = false;
   fsState.breakReadsAfterWrite = false;
   fsState.readsBroken = false;
+  fsState.failWriteOnCall = null;
   dir = mkdtempSync(join(tmpdir(), "cmcp-receipt-"));
   envPath = join(dir, ".env");
   process.env.COMFYUI_MCP_ENV_FILE = envPath;
@@ -107,6 +112,7 @@ afterEach(() => {
   fsState.swallowWrites = false;
   fsState.breakReadsAfterWrite = false;
   fsState.readsBroken = false;
+  fsState.failWriteOnCall = null;
   delete process.env.COMFYUI_MCP_ENV_FILE;
   delete process.env.COMFYUI_MCP_PANEL_SECRETS;
   for (const k of ALL_KEYS) {
@@ -244,6 +250,29 @@ describe("`export KEY=` lines are the SAME key (#826 gate round 3)", () => {
     expect(readFileSync(envPath, "utf-8")).not.toContain("old-exported");
   });
 
+  it("a revoke removes the COLON form dotenv also accepts", () => {
+    writeFileSync(envPath, "CIVITAI_API_TOKEN: old-colon\n", { mode: 0o600 });
+    expect(buildComfyuiMcpEnv({}).CIVITAI_API_TOKEN).toBe("old-colon");
+    expect(removeComfyuiSecret("CIVITAI_API_TOKEN")).toBe(true);
+    expect(buildComfyuiMcpEnv({}).CIVITAI_API_TOKEN).toBeUndefined();
+  });
+
+  it("a save REPLACES the colon form instead of appending a second assignment", () => {
+    writeFileSync(envPath, "CIVITAI_API_TOKEN: old-colon\n", { mode: 0o600 });
+    expect(setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new").persisted).toBe("yes");
+    expect(readFileSync(envPath, "utf-8")).not.toContain("old-colon");
+    delete process.env.CIVITAI_API_TOKEN;
+    expect(buildComfyuiMcpEnv({}).CIVITAI_API_TOKEN).toBe("civ-new");
+  });
+
+  it("does NOT treat a DIFFERENT key that merely starts with this one as the same key", () => {
+    writeFileSync(envPath, "HF_TOKEN_EXTRA=keep-me\nHF_TOKEN=replace-me\n", { mode: 0o600 });
+    setComfyuiSecret("HF_TOKEN", "hf-new");
+    const raw = readFileSync(envPath, "utf-8");
+    expect(raw).toContain("HF_TOKEN_EXTRA=keep-me");
+    expect(raw).not.toContain("replace-me");
+  });
+
   it("a save REPLACES the export form instead of appending a second assignment", () => {
     writeFileSync(envPath, "export CIVITAI_API_TOKEN=old-exported\n", { mode: 0o600 });
     const r = setComfyuiSecret("CIVITAI_API_TOKEN", "civ-new");
@@ -276,36 +305,85 @@ describe("a MIGRATED legacy token keeps the file as its authority (#826 gate rou
 
 describe("slot saves report what the read-back PROVED (#826 gate round 3)", () => {
   it("returns one receipt per alias key of the slot", () => {
-    const receipts = setPanelSecret("huggingface", "hf-abc");
-    expect(receipts.map((r) => r.key)).toEqual(["HF_TOKEN", "HUGGINGFACE_TOKEN"]);
-    expect(slotSaveConfirmed(receipts)).toBe(true);
-    expect(unconfirmedSlotKeys(receipts)).toEqual([]);
+    const outcome = setPanelSecret("huggingface", "hf-abc");
+    expect(outcome.receipts.map((r) => r.key)).toEqual(["HF_TOKEN", "HUGGINGFACE_TOKEN"]);
+    expect(slotSaveConfirmed(outcome)).toBe(true);
+    expect(unconfirmedSlotKeys(outcome.receipts)).toEqual([]);
   });
 
   it("is NOT confirmed when the store does not come back carrying the keys", () => {
-    const receipts = withSwallowedWrites(() => setPanelSecret("civitai", "civ-abc"));
-    expect(slotSaveConfirmed(receipts)).toBe(false);
-    expect(unconfirmedSlotKeys(receipts)).toEqual([
+    const outcome = withSwallowedWrites(() => setPanelSecret("civitai", "civ-abc"));
+    expect(slotSaveConfirmed(outcome)).toBe(false);
+    expect(unconfirmedSlotKeys(outcome.receipts)).toEqual([
       { key: "CIVITAI_API_TOKEN", persisted: "no" },
     ]);
   });
 
-  it("is NOT confirmed when even ONE alias of the slot failed", () => {
-    // A reader that consults the unsaved alias would find nothing, so the slot
-    // is not reliably configured — reporting it saved would be a half-truth.
-    const receipts = [
-      { key: "HF_TOKEN", path: envPath, persisted: "yes", livePickup: true, respawn: null },
-      { key: "HUGGINGFACE_TOKEN", path: envPath, persisted: "no", livePickup: true, respawn: null },
-    ] as const;
-    expect(slotSaveConfirmed([...receipts])).toBe(false);
-  });
-
   it("treats an unverifiable save as unconfirmed rather than failed", () => {
-    const receipts = withUnreadableReadBack(() => setPanelSecret("civitai", "civ-abc"));
-    expect(slotSaveConfirmed(receipts)).toBe(false);
-    expect(unconfirmedSlotKeys(receipts)).toEqual([
+    const outcome = withUnreadableReadBack(() => setPanelSecret("civitai", "civ-abc"));
+    expect(slotSaveConfirmed(outcome)).toBe(false);
+    expect(unconfirmedSlotKeys(outcome.receipts)).toEqual([
       { key: "CIVITAI_API_TOKEN", persisted: "unknown" },
     ]);
+  });
+
+  it("stops at the FIRST unconfirmed alias instead of layering more unverified writes", () => {
+    const outcome = withSwallowedWrites(() => setPanelSecret("huggingface", "hf-abc"));
+    expect(outcome.confirmed).toBe(false);
+    expect(outcome.receipts.map((r) => r.key)).toEqual(["HF_TOKEN"]);
+  });
+
+  it("ROLLS BACK an alias that DID land when a later alias fails", () => {
+    // The fan-out is serial, so HF_TOKEN can land and HUGGINGFACE_TOKEN fail.
+    // Leaving the first alias live while reporting failure — and claiming
+    // nothing was half-applied — is the round-4 defect.
+    setPanelSecret("huggingface", "hf-old");
+    let call = 0;
+    const realWrite = writeFileSync;
+    expect(typeof realWrite).toBe("function");
+    // Fail only the SECOND alias's write.
+    fsState.failWriteOnCall = () => ++call === 2;
+    let outcome: ReturnType<typeof setPanelSecret>;
+    try {
+      outcome = setPanelSecret("huggingface", "hf-new");
+    } finally {
+      fsState.failWriteOnCall = null;
+    }
+    expect(outcome.confirmed).toBe(false);
+    expect(outcome.rolledBack).toBe(true);
+    expect(outcome.strandedKeys).toEqual([]);
+    // Both aliases are back on the PREVIOUS value — neither is half-applied.
+    const env = buildComfyuiMcpEnv({});
+    expect(env.HF_TOKEN).toBe("hf-old");
+    expect(env.HUGGINGFACE_TOKEN).toBe("hf-old");
+  });
+
+  it("leaves NO alias carrying the new value when the slot had none before", () => {
+    let call = 0;
+    fsState.failWriteOnCall = () => ++call === 2;
+    let outcome: ReturnType<typeof setPanelSecret>;
+    try {
+      outcome = setPanelSecret("huggingface", "hf-new");
+    } finally {
+      fsState.failWriteOnCall = null;
+    }
+    expect(outcome.confirmed).toBe(false);
+    expect(outcome.rolledBack).toBe(true);
+    const env = buildComfyuiMcpEnv({});
+    expect(env.HF_TOKEN).toBeUndefined();
+    expect(env.HUGGINGFACE_TOKEN).toBeUndefined();
+  });
+
+  it("restores the earlier alias before re-throwing a per-key validation failure", () => {
+    // A control character is rejected per key. The FIRST alias would already
+    // have been written when the second is rejected, so the throw must not leave
+    // the slot half-updated.
+    setPanelSecret("huggingface", "hf-old");
+    const badValue = `hf-${String.fromCharCode(0)}-new`;
+    expect(() => setPanelSecret("huggingface", badValue)).toThrow(/control character/);
+    const env = buildComfyuiMcpEnv({});
+    expect(env.HF_TOKEN).toBe("hf-old");
+    expect(env.HUGGINGFACE_TOKEN).toBe("hf-old");
   });
 
   it("slotStillResolves proves a revoke actually took effect", () => {
@@ -329,6 +407,19 @@ describe("slot saves report what the read-back PROVED (#826 gate round 3)", () =
   it("names NO shell keys for a credential this store owns", () => {
     setPanelSecret("civitai", "civ-abc");
     expect(slotShellProvidedKeys("civitai")).toEqual([]);
+  });
+
+  it("shows a slot as SET when only its LEGACY alias is configured", () => {
+    // Checking the primary alias alone reported "not configured" for a
+    // credential that is in effect — the opposite false verdict to #826, and
+    // the state a user is most likely to be in after an old install.
+    writeFileSync(envPath, "HUGGINGFACE_TOKEN=hf-legacy-value\n", { mode: 0o600 });
+    const hf = listPanelSecretsMasked().find((s) => s.id === "huggingface")!;
+    expect(hf.set).toBe(true);
+    expect(hf.masked).not.toBeNull();
+    // The mask is derived from the alias that actually resolves, and shows only
+    // the first four and last three characters.
+    expect(hf.masked).not.toContain("legacy-val");
   });
 });
 

@@ -24,6 +24,7 @@ import { dirname, join } from "node:path";
 import {
   comfyuiEnvFilePath,
   freshSecretValue,
+  freshSecretValues,
   isShellProvided,
   markFileDerived,
   parseEnvFile,
@@ -373,7 +374,15 @@ function encodeEnvLine(key: string, value: string): string {
  * so they can never disagree about what "a line for this key" means.
  */
 function envKeyLinePattern(key: string): RegExp {
-  return new RegExp(`^\\s*(?:export\\s+)?${key}\\s*=`);
+  // Mirrors dotenv's own assignment forms: optional leading whitespace, an
+  // optional `export `, then either `KEY=` (with optional space around the `=`)
+  // or `KEY: ` — the colon form dotenv also accepts (codex gate, round 4,
+  // finding 3). Missing the colon form meant an upsert APPENDED a second
+  // assignment and a revoke left the colon line supplying the old credential.
+  // The key is escaped even though every caller passes an allowlisted shell
+  // identifier, so this can never become a pattern-injection surface.
+  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^\\s*(?:export\\s+)?${escaped}(?:\\s*=|:\\s)`);
 }
 
 /** Upsert `KEY=value` into the canonical .env, 0600, preserving every other line
@@ -667,17 +676,13 @@ export function clearOAuthStatus(provider: string): void {
  *  FILTERED through the allowlist (defense in depth): even a hand-edited/corrupt
  *  panel-secrets.json can only ever contribute allowlisted credential keys. */
 export function loadComfyuiSecretEnv(): Record<string, string> {
-  // Resolved through freshSecretValue, allowlist-filtered: a real env var still
-  // wins, otherwise the canonical .env is re-read NOW. Reading raw process.env
-  // here would inject a value that went stale when another writer rotated the
-  // file, and the child would then pin that stale copy (codex gate, round 2,
-  // finding 2).
-  const out: Record<string, string> = {};
-  for (const k of COMFYUI_SECRET_ENV_ALLOWLIST) {
-    const v = freshSecretValue(k);
-    if (typeof v === "string" && v) out[k] = v;
-  }
-  return out;
+  // Resolved through the env-file snapshot, allowlist-filtered: a real env var
+  // still wins, otherwise the canonical .env is re-read NOW. Reading raw
+  // process.env here would inject a value that went stale when another writer
+  // rotated the file, and the child would then pin that stale copy (codex gate,
+  // round 2, finding 2). ONE snapshot for all keys, so a rotation landing
+  // mid-build cannot produce a half-old/half-new env (round 4, finding 6).
+  return freshSecretValues(COMFYUI_SECRET_ENV_ALLOWLIST);
 }
 
 /** The env-var KEYS currently stored (e.g. for a redacted log line). No values. */
@@ -719,15 +724,10 @@ export function removeComfyuiSecret(key: string): boolean {
 /** The persisted agent-provider secrets (e.g. OPENROUTER_API_KEY), filtered
  *  through the agent allowlist. Never logged. */
 export function loadAgentSecretEnv(): Record<string, string> {
-  // Same access-time resolution as loadComfyuiSecretEnv: env wins, else the
-  // canonical .env re-read now, so the readiness/masked-slot views never report
-  // a value the file no longer carries.
-  const out: Record<string, string> = {};
-  for (const k of AGENT_SECRET_ENV_ALLOWLIST) {
-    const v = freshSecretValue(k);
-    if (typeof v === "string" && v) out[k] = v;
-  }
-  return out;
+  // Same access-time resolution as loadComfyuiSecretEnv, from one snapshot: env
+  // wins, else the canonical .env re-read now, so the readiness/masked-slot
+  // views never report a value the file no longer carries.
+  return freshSecretValues(AGENT_SECRET_ENV_ALLOWLIST);
 }
 
 /**
@@ -884,27 +884,102 @@ export function maskSecret(v: string): string {
   return `${v.slice(0, 4)}…${v.slice(-3)}`;
 }
 
+/** The OBSERVED outcome of a slot save across all of the slot's alias keys. */
+export interface SlotSaveOutcome {
+  slot: string;
+  receipts: SecretSaveReceipt[];
+  /** Every alias landed, proven by read-back. */
+  confirmed: boolean;
+  /** The slot was left exactly as it was before this call (no alias carries the
+   *  new value). Only meaningful when `confirmed` is false. */
+  rolledBack: boolean;
+  /** Aliases left carrying the NEW value despite the overall failure, because
+   *  restoring them did not itself take effect. Non-empty means the slot is in a
+   *  MIXED state and the caller must say so — claiming "nothing was
+   *  half-applied" over this is the round-4 defect. */
+  strandedKeys: string[];
+}
+
 /**
- * Set every env key of a slot (alias fan-out) into its store, and return the
- * RECEIPT for each. Throws on unknown slot.
+ * Set every env key of a slot (alias fan-out) into its store.
  *
- * The receipts are the point: this is the Settings-panel path, and it used to
- * discard them, so the exact read-back-proven failure `panel_request_secret`
- * refuses was still answered `{ok:true}` here (codex gate, round 3, finding 3).
- * The caller must inspect `persisted` before telling the user it saved.
+ * ALL-OR-NOTHING across the aliases. The fan-out is serial, so a slot like
+ * HuggingFace could land HF_TOKEN and then fail on HUGGINGFACE_TOKEN — leaving
+ * the first alias live and effective while the caller reported failure and said
+ * nothing was half-applied (codex gate, round 4, finding 1). On any failure the
+ * aliases this call changed are restored to their previous values, and any that
+ * could NOT be restored are reported as stranded rather than glossed over.
+ *
+ * Throws on unknown slot, and re-throws a per-key validation failure (a control
+ * character, an unrepresentable value) AFTER restoring — so the caller still
+ * gets the specific reason.
  */
-export function setPanelSecret(slotId: string, value: string): SecretSaveReceipt[] {
+export function setPanelSecret(slotId: string, value: string): SlotSaveOutcome {
   const slot = SLOT_BY_ID.get(slotId);
   if (!slot) throw new Error(`unknown credential slot "${slotId}"`);
   const set = slot.store === "agent" ? setAgentSecret : setComfyuiSecret;
-  return slot.envKeys.map((key) => set(key, value));
+  const remove = slot.store === "agent" ? removeAgentSecret : removeComfyuiSecret;
+  const before = slot.envKeys.map((key) => ({ key, previous: freshSecretValue(key) }));
+
+  const receipts: SecretSaveReceipt[] = [];
+  let thrown: unknown = null;
+  let failed = false;
+  for (const key of slot.envKeys) {
+    try {
+      const receipt = set(key, value);
+      receipts.push(receipt);
+      if (receipt.persisted !== "yes") {
+        // "unknown" is not a proven failure, but it is not a proven success
+        // either — stop here rather than layering more unverified writes on it.
+        failed = true;
+        break;
+      }
+    } catch (err) {
+      thrown = err;
+      failed = true;
+      break;
+    }
+  }
+  if (!failed) {
+    return { slot: slotId, receipts, confirmed: true, rolledBack: false, strandedKeys: [] };
+  }
+
+  // Restore every alias this call actually changed.
+  const strandedKeys: string[] = [];
+  for (const { key, previous } of before) {
+    if (freshSecretValue(key) === previous) continue; // untouched by this call
+    try {
+      if (previous === undefined) remove(key);
+      else set(key, previous);
+      if (freshSecretValue(key) !== previous) strandedKeys.push(key);
+    } catch {
+      strandedKeys.push(key);
+    }
+  }
+  if (thrown) {
+    if (strandedKeys.length) {
+      throw new Error(
+        `${thrown instanceof Error ? thrown.message : String(thrown)} ` +
+          `Restoring the slot did not fully take effect: ${strandedKeys.join(", ")} still carr${strandedKeys.length > 1 ? "y" : "ies"} the new value. ` +
+          `Set "${slotId}" again, or clear it, before relying on it.`,
+      );
+    }
+    throw thrown;
+  }
+  return {
+    slot: slotId,
+    receipts,
+    confirmed: false,
+    rolledBack: strandedKeys.length === 0,
+    strandedKeys,
+  };
 }
 
 /** True when EVERY key of a slot save is proven to have landed. A single alias
  *  that did not persist means the slot is not reliably configured — the reader
  *  that happens to consult that alias would find nothing. */
-export function slotSaveConfirmed(receipts: SecretSaveReceipt[]): boolean {
-  return receipts.length > 0 && receipts.every((r) => r.persisted === "yes");
+export function slotSaveConfirmed(outcome: SlotSaveOutcome): boolean {
+  return outcome.confirmed;
 }
 
 /** The keys of a slot save whose persistence could NOT be confirmed, with their
@@ -949,14 +1024,17 @@ export function slotShellProvidedKeys(slotId: string): string[] {
   return slot.envKeys.filter((k) => isShellProvided(k));
 }
 
-/** Masked per-slot state: set = the slot's PRIMARY (first) env key has a stored value. */
+/** Masked per-slot state: set = ANY of the slot's alias env keys resolves.
+ *  Checking only the PRIMARY alias reported a slot as unset when only its legacy
+ *  alias was configured (e.g. HUGGINGFACE_TOKEN without HF_TOKEN) — a "not
+ *  configured" verdict for a credential that is in effect (codex gate, round 4,
+ *  answer B). The mask shows the alias that actually resolves. */
 export function listPanelSecretsMasked(): { id: string; label: string; set: boolean; masked: string | null }[] {
   const comfyui = loadComfyuiSecretEnv();
   const agent = loadAgentSecretEnv();
   return CREDENTIAL_SLOTS.map((slot) => {
     const store = slot.store === "agent" ? agent : comfyui;
-    const primary = slot.envKeys[0];
-    const val = store[primary];
+    const val = slot.envKeys.map((k) => store[k]).find((v) => typeof v === "string" && v);
     return { id: slot.id, label: slot.label, set: !!val, masked: val ? maskSecret(val) : null };
   });
 }

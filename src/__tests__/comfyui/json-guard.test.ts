@@ -227,6 +227,40 @@ describe("the diagnostic body prefix never carries our own credential back", () 
     }
   });
 
+  it("WITHHOLDS the body entirely when the credential is too short to redact safely", () => {
+    // Substituting a 3-character token would mangle unrelated text, and emitting
+    // it unredacted would hand our own credential back through a tool result.
+    // Fail closed instead of choosing between two bad options.
+    authHeaders.value = { "X-API-Key": "abc" };
+    try {
+      const d = classifyNonJson({
+        url: URL_UNDER_TEST,
+        status: 401,
+        contentType: "text/html",
+        body: "<html>rejected key abc</html>",
+      });
+      expect(d.bodyPrefix).toBe("(body withheld: it contains the configured ComfyUI credential)");
+      expect(d.message).not.toContain("rejected key abc");
+    } finally {
+      authHeaders.value = {};
+    }
+  });
+
+  it("does not withhold when a short credential does NOT appear in the body", () => {
+    authHeaders.value = { "X-API-Key": "abc" };
+    try {
+      const d = classifyNonJson({
+        url: URL_UNDER_TEST,
+        status: 500,
+        contentType: "text/html",
+        body: "<html>internal error</html>",
+      });
+      expect(d.bodyPrefix).toBe("<html>internal error</html>");
+    } finally {
+      authHeaders.value = {};
+    }
+  });
+
   it("leaves an ordinary body untouched when no credential is configured", () => {
     authHeaders.value = {};
     const d = classifyNonJson({
