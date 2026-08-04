@@ -2764,18 +2764,45 @@ interface SwapReconcileResult {
  *
  * `subject` is the noun phrase the base clause just established ("that staged
  * copy", "your panel at <dir>"), so the appended sentence has an antecedent.
+ *
+ * AND IT MUST BE THIS TREE THAT WAS CORROBORATED — the same rule, and the same
+ * reasoning, as `swapTreeIsCorroborated`. Asking only "is the CURRENT
+ * resolution live-derived?" answers a question about NOW, while the path this
+ * sentence names was pinned earlier. A retarget in between (status pins A, the
+ * target moves to B, a live probe caches B) would let an observation
+ * identifying server B certify a sentence about server A's tree — the guard
+ * built to stop us claiming an unverified root doing exactly that, on somebody
+ * else's evidence. The resolution's base and the path being described have to
+ * be the same directory.
  */
 function servingQualifier(
   deps: PanelInstallerDeps,
   comfyuiPath: string,
   subject: string,
 ): string {
-  const confirmed = !isRealDeps(deps) || isLiveDerivedBase(lastPanelBaseResolution());
-  return confirmed
-    ? ` The running ComfyUI loads its panel from ${comfyuiPath}, so ${subject} is in ` +
+  const resolution = isRealDeps(deps) ? lastPanelBaseResolution() : undefined;
+  const liveBase = isLiveDerivedBase(resolution) ? resolution?.base : undefined;
+  const confirmed =
+    !isRealDeps(deps) || (!!liveBase && samePathCI(comfyuiPath, liveBase, deps));
+  if (confirmed) {
+    return (
+      ` The running ComfyUI loads its panel from ${comfyuiPath}, so ${subject} is in ` +
       `the tree it serves.`
-    : ` Whether the running ComfyUI loads its panel from ${comfyuiPath} could NOT be ` +
-      `confirmed here, so whether ${subject} is in the tree it serves is unknown.`;
+    );
+  }
+  // NAME THE MISMATCH WHEN THERE IS ONE. "Could not be confirmed" is true of
+  // both failures, but they are different situations and only one of them puts
+  // a second tree in front of the user — which on a Comfy Desktop split install
+  // (#766) is the whole diagnosis. Still no assertion of the negative: a
+  // resolution taken after a retarget describes a different server, not proof
+  // that this tree is unserved.
+  const mismatch = liveBase
+    ? ` — the only live reading available describes a DIFFERENT tree (${liveBase})`
+    : ``;
+  return (
+    ` Whether the running ComfyUI loads its panel from ${comfyuiPath} could NOT be ` +
+    `confirmed here${mismatch}, so whether ${subject} is in the tree it serves is unknown.`
+  );
 }
 
 export type DirPresence =
@@ -2976,8 +3003,10 @@ type PanelShapeVerdict =
   | "usable"
   /** Positively established: identity or bundle is wrong/absent/empty. */
   | "not-a-panel"
-  /** An input could not be read, so nothing was established either way. */
-  | "unreadable";
+  /** An input could not be READ at all, so nothing was established either way. */
+  | "unreadable"
+  /** The pyproject WAS read; its contents would not parse. See PanelIdentityVerdict. */
+  | "malformed";
 
 /**
  * The same split, one question earlier: WHY the identity test said no.
@@ -2988,14 +3017,23 @@ type PanelShapeVerdict =
  * panel at <path>" about a directory whose identity was never established. The
  * probe failed; it established nothing. So callers that SPEAK ask this, and
  * callers that ACT keep the boolean.
+ *
+ * AND "UNREADABLE" IS A CAUSE, NOT A BUCKET. Folding a parse failure into it
+ * repeats this round's own defect inside the vocabulary introduced to fix it: a
+ * present, readable, but MALFORMED pyproject.toml made the note say the file
+ * "could not be read" and "the probe failed". It was read; it did not parse.
+ * The two point the user at different remedies — a permissions problem versus a
+ * damaged file — so they are different answers.
  */
 type PanelIdentityVerdict =
   /** Positively established: the pyproject names the panel pack. */
   | "panel"
   /** Positively established: readable, and it is something else (or absent). */
   | "not-a-panel"
-  /** The pyproject could not be read or parsed — nothing was established. */
-  | "unreadable";
+  /** The pyproject could not be READ (probe failed, or the read threw). */
+  | "unreadable"
+  /** The pyproject WAS read, and its contents would not parse. */
+  | "malformed";
 
 function panelIdentityVerdict(
   dir: string,
@@ -3005,13 +3043,70 @@ function panelIdentityVerdict(
   const pyprobe = deps.probeFile(pyproject);
   if (pyprobe === undefined) return "unreadable";
   if (pyprobe !== true) return "not-a-panel";
+  // TWO STEPS, TWO ANSWERS. One try/catch around both the read and the parse
+  // cannot tell them apart, and the sentence built from it then narrated a
+  // failure that did not happen.
+  let raw: string;
+  try {
+    raw = deps.readFile(pyproject);
+  } catch {
+    return "unreadable"; // present, but the read itself failed
+  }
   let identity: string | undefined;
   try {
-    identity = parsePyproject(deps.readFile(pyproject)).projectName;
+    identity = parsePyproject(raw).projectName;
   } catch {
-    return "unreadable"; // present but could not be read/parsed
+    return "malformed"; // read fine; the CONTENTS are damaged
   }
   return identity === PANEL_REGISTRY_ID ? "panel" : "not-a-panel";
+}
+
+/**
+ * ONE SENTENCE PER VERDICT, WRITTEN ONCE.
+ *
+ * Two messages narrate this verdict, and each did it with a two-way conditional
+ * over a four-way answer — so `usable` and `malformed` both fell through into
+ * "does NOT look like a working panel", stating the fail-closed DECISION as
+ * though it were the observation. Rendering lives here so the two cannot drift
+ * and so a new verdict value cannot be silently absorbed by an `else`.
+ *
+ * Every clause begins with a lowercase word (never the path), so a caller can
+ * either open a sentence with it or splice it after "…interrupted, and ".
+ */
+function describePanelShape(dir: string, verdict: PanelShapeVerdict): string {
+  switch (verdict) {
+    case "usable":
+      // The speaking verdict CONTRADICTS the fail-closed decision that routed us
+      // here (the two reads were taken at different moments). Repeating the
+      // decision as an observation would assert something this probe denies.
+      return (
+        `a re-check of ${dir} DID find a complete panel there — a readable panel ` +
+        `pyproject.toml and a non-empty web bundle — disagreeing with the check this ` +
+        `refusal was decided on, so nothing is being moved while the two readings differ`
+      );
+    case "not-a-panel":
+      return (
+        `the directory at ${dir} is present but does NOT hold a working panel (no ` +
+        `readable panel pyproject.toml, or no built web bundle)`
+      );
+    case "malformed":
+      return (
+        `whether the directory at ${dir} holds a working panel could NOT be determined ` +
+        `— its pyproject.toml was read, but its contents would not parse, so this is ` +
+        `not a finding that it is broken`
+      );
+    case "unreadable":
+      return (
+        `whether the directory at ${dir} holds a working panel could NOT be determined ` +
+        `— one of its files could not be read, so this is not a finding that it is broken`
+      );
+  }
+}
+
+/** Open a sentence with a clause that deliberately starts lowercase. */
+function startSentence(clause: string): string {
+  const first = clause.charAt(0);
+  return first >= "a" && first <= "z" ? first.toUpperCase() + clause.slice(1) : clause;
 }
 
 function panelShapeVerdict(dir: string, deps: PanelInstallerDeps): PanelShapeVerdict {
@@ -3393,41 +3488,73 @@ function reconcilePanelSwap(
       staleIdentity === "not-a-panel"
         ? `there is NO panel at ${staleCanonical}`
         : staleIdentity === "unreadable"
-          ? `whether a panel remains at ${staleCanonical} could NOT be determined (that ` +
-            `directory could not be read)`
-          : `a re-read of ${staleCanonical} DID find the panel's pyproject.toml there, ` +
-            `disagreeing with the check this refusal was decided on`;
+          ? `whether a panel remains at ${staleCanonical} could NOT be determined (its ` +
+            `pyproject.toml could not be read)`
+          : staleIdentity === "malformed"
+            ? `whether a panel remains at ${staleCanonical} could NOT be determined (its ` +
+              `pyproject.toml was read, but its contents would not parse)`
+            : `a re-read of ${staleCanonical} DID find the panel's pyproject.toml there, ` +
+              `disagreeing with the check this refusal was decided on`;
     // Its own sentence, not an aside inside the first one — an em-dash caveat
     // wedged mid-clause is exactly the shape a reader skims past.
     const staleCanonicalCaveat =
       staleIdentity === "not-a-panel"
         ? ``
         : staleIdentity === "unreadable"
-          ? ` Do not read that as the panel being gone: the probe failed, so nothing was ` +
-            `established either way.`
-          : ` Treat the panel at that path as possibly intact — nothing is being moved ` +
-            `while two readings of it disagree.`;
-    // AND SO DOES EVERY INSTRUCTION DERIVED FROM IT. `mv` onto a path that may
-    // still hold a panel is not the same act as `mv` onto an empty one, so both
-    // commands below — restore-the-backup AND bring-your-own-copy — are gated on
-    // the emptiness actually having been established. Guarding one of a pair is
-    // the pointwise mistake this file keeps paying for.
-    const canonicalProvenEmpty = staleIdentity === "not-a-panel";
+          ? ` Do not read that as the panel being gone: the file could not be opened, so ` +
+            `nothing was established either way — check permissions on that directory.`
+          : staleIdentity === "malformed"
+            ? ` Do not read that as the panel being gone: the file is there and readable, ` +
+              `it is its CONTENTS that are damaged — repairing or replacing that ` +
+              `pyproject.toml is the remedy, not a permissions change.`
+            : ` Treat the panel at that path as possibly intact — nothing is being moved ` +
+              `while two readings of it disagree.`;
+    // "NOT THE PANEL" IS NOT "NOT THERE", and the commands care about the second.
+    // Identity answers which pack is at that path; it establishes NOTHING about
+    // whether the path is free. An unrelated package sitting at
+    // custom_nodes/comfyui-mcp-panel yields a correct `not-a-panel`, and the
+    // ungated `mv backup canonical` then NESTS the backup inside that directory
+    // instead of restoring it — after which the `&&` is satisfied and `rm` wipes
+    // the swap record on the strength of a restore that did not happen. So both
+    // commands are gated on PRESENCE, the only observation that speaks to it,
+    // and only a confirmed absence counts. Gating one of a pair is the pointwise
+    // mistake this file keeps paying for; this is its third instance.
+    const staleCanonicalPresence = dirPresence(staleCanonical, deps);
+    const canonicalProvenEmpty = staleCanonicalPresence === "absent";
+    // Purely what was seen — no identity claim, so it composes with any of the
+    // four clauses above without contradicting one.
+    const occupancyNote =
+      staleCanonicalPresence === "directory"
+        ? ` A directory still exists at ${staleCanonical}.`
+        : staleCanonicalPresence === "other"
+          ? ` A regular FILE still exists at ${staleCanonical}.`
+          : staleCanonicalPresence === "unknown"
+            ? ` Whether anything still exists at ${staleCanonical} could not be determined.`
+            : ``;
+    // The warning names the thing THIS branch is moving — "the backup" has no
+    // antecedent in the branch where no backup was found — and only the restore
+    // command carries the `&&` that would clear the record.
+    const nestingWarning = (moved: string) =>
+      `Moving onto a path that still exists nests ${moved} INSIDE it rather than ` +
+      `replacing what is there.`;
     const restoreCommand = canonicalProvenEmpty
       ? `To put it back: mv "${staleBackup}" "${staleCanonical}" && rm "${journalPath}" — ` +
         `then restart ComfyUI.`
-      : `ONLY once you have confirmed ${staleCanonical} holds no panel, put it back with: ` +
-        `mv "${staleBackup}" "${staleCanonical}" && rm "${journalPath}" — then restart ComfyUI.`;
+      : `${nestingWarning("the backup")} The "&&" would then count that as success and ` +
+        `delete the swap record too. ONLY once nothing remains at ${staleCanonical}, put ` +
+        `it back with: mv "${staleBackup}" "${staleCanonical}" && rm "${journalPath}" — ` +
+        `then restart ComfyUI.`;
     const elsewhereCommand = canonicalProvenEmpty
       ? `If you have a copy elsewhere, move it to "${staleCanonical}"`
-      : `If you confirm ${staleCanonical} holds no panel and you have a copy elsewhere, ` +
-        `move that copy to "${staleCanonical}"`;
+      : `${nestingWarning("that copy")} So only once nothing remains at ` +
+        `${staleCanonical}, and if you have a copy elsewhere, move that copy to ` +
+        `"${staleCanonical}"`;
     return {
       ok: false,
       note: backupPresent
         ? ` WARNING: ${staleCanonicalClause}, and a swap journal is still ` +
-          `present at ${journalPath}.${staleCanonicalCaveat} Your previous panel HAS been ` +
-          `preserved — it is at ` +
+          `present at ${journalPath}.${staleCanonicalCaveat}${occupancyNote} Your previous ` +
+          `panel HAS been preserved — it is at ` +
           `${staleBackup}. Nothing has been moved back automatically, because this ` +
           `state cannot be told apart from a completed update followed by a DELIBERATE ` +
           `uninstall, and restoring would then resurrect something you removed on ` +
@@ -3435,7 +3562,8 @@ function reconcilePanelSwap(
           `"${journalPath}" and run ${reinstall}.`
         : ` WARNING: ${staleCanonicalClause}, a swap journal is still present ` +
           `at ${journalPath}, and no preserved copy of the panel could be found under ` +
-          `${join(comfyuiPath, "custom_nodes_backup")}.${staleCanonicalCaveat} Nothing has ` +
+          `${join(comfyuiPath, "custom_nodes_backup")}.${staleCanonicalCaveat}` +
+          `${occupancyNote} Nothing has ` +
           `been moved. ${elsewhereCommand}; otherwise delete ` +
           `"${journalPath}" and run ${reinstall}.`,
     };
@@ -3555,12 +3683,7 @@ function reconcilePanelSwap(
                 `directory could not be inspected, so do not read this as it being absent. ` +
                 `${backupSentence}.`
               : canonicalPresent
-                ? canonicalShape === "unreadable"
-                  ? `The directory at ${canonicalDir} is present, but whether it is a ` +
-                    `working panel could NOT be determined — one of its files could not ` +
-                    `be read. Do not read that as it being broken.`
-                  : `The directory at ${canonicalDir} is present but does NOT look like a ` +
-                    `working panel.`
+                ? `${startSentence(describePanelShape(canonicalDir, canonicalShape))}.`
                 : stagedVerdictForReport === "intact"
                   ? `${canonicalGoneClause}. The staged copy verifies intact, and ` +
                     `${backupSentence}.${stagedServing}`
@@ -3587,22 +3710,28 @@ function reconcilePanelSwap(
     // directory "is NOT a usable panel" then states a verdict the read never
     // reached. Same action/message split as everywhere else: refuse either way,
     // but only claim what was established.
-    const canonicalClause =
-      canonicalShape === "unreadable"
-        ? `whether the directory at ${canonicalDir} is a usable panel could NOT be ` +
-          `determined — one of its files could not be read, so this is not a finding ` +
-          `that it is broken`
-        : `the directory at ${canonicalDir} is present but is NOT a usable panel (no ` +
-          `readable panel pyproject.toml, or no built web bundle)`;
+    // AND SO DOES THE INSTRUCTION. "Remove it if it is a leftover" is advice to
+    // DELETE, and only `not-a-panel` establishes that there is nothing there
+    // worth keeping. On an unread, unparsed or contradicting verdict it would be
+    // inviting the user to delete a directory we just said we could not judge.
+    const recheck = describeInstallPanelAction(
+      "status",
+      "a re-check on the ComfyUI host",
+    );
+    const nextStep =
+      canonicalShape === "not-a-panel"
+        ? `Inspect ${canonicalDir}, remove it if it is a leftover, then re-run ${recheck}.`
+        : `Inspect ${canonicalDir} yourself before removing anything, then re-run ` +
+          `${recheck}.`;
     return {
       ok: false,
       note:
-        ` WARNING: a panel update was interrupted, and ${canonicalClause}. Nothing has ` +
+        ` WARNING: a panel update was interrupted, and ` +
+        `${describePanelShape(canonicalDir, canonicalShape)}. Nothing has ` +
         `been moved: discarding the staged replacement at ${incomingDir} could remove ` +
         `the only working copy.` +
         servingQualifier(deps, comfyuiPath, `that staged copy`) +
-        ` Inspect ${canonicalDir}, remove it if it is a leftover, then re-run ` +
-        `${describeInstallPanelAction("status", "a re-check on the ComfyUI host")}.`,
+        ` ${nextStep}`,
     };
   }
 

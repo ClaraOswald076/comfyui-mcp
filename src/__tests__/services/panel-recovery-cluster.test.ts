@@ -1522,7 +1522,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     // The complete copy must NOT be discarded on the strength of a husk.
     expect(existsSync(INCOMING())).toBe(true);
     expect(readFileSync(join(INCOMING(), "pyproject.toml"), "utf-8")).toContain("0.11.38");
-    expect(note).toMatch(/NOT a usable panel/);
+    expect(note).toMatch(/does NOT hold a working panel/);
   });
 
   it("P0: the INITIAL swap refuses a staged clone that would not load", async () => {
@@ -1741,7 +1741,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
       "../../services/panel-installer.js"
     );
     const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
-    expect(note).toMatch(/NOT a usable panel/);
+    expect(note).toMatch(/does NOT hold a working panel/);
     expect(note).toMatch(/Nothing has been moved/);
     // The working copy survives, and ComfyUI still serves it.
     expect(existsSync(INCOMING())).toBe(true);
@@ -1755,7 +1755,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
       "../../services/panel-installer.js"
     );
     expect(await repairInterruptedPanelSwap(makeDeps({}).deps)).toMatch(
-      /NOT a usable panel/,
+      /does NOT hold a working panel/,
     );
     expect(existsSync(INCOMING())).toBe(true);
   });
@@ -1889,7 +1889,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
 
     // THE SENTENCE stays honest: undetermined, not negative.
     expect(status.note).toMatch(/could NOT be determined/);
-    expect(status.note).toMatch(/Do not read that as it being broken/);
+    expect(status.note).toMatch(/not a finding that it is broken/);
     expect(status.note).not.toMatch(/does NOT look like a working panel/);
 
     // THE DECISION still fails closed: the staged copy is not discarded on the
@@ -2044,7 +2044,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     expect(status.note).not.toMatch(/There is no panel at/);
   });
 
-  it("an unreadable canonical dir is refused WITHOUT being called 'NOT a usable panel'", async () => {
+  it("an unreadable canonical dir is refused WITHOUT being called not-a-working-panel", async () => {
     // Both halves of the split in one assertion: the decision stays fail-closed
     // (nothing is moved), and the sentence stops stating a verdict the read
     // never reached.
@@ -2060,9 +2060,133 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     const note = await repairInterruptedPanelSwap(h.deps);
     expect(note).toMatch(/could NOT be determined/);
     expect(note).toMatch(/not a finding that it is broken/);
-    expect(note).not.toMatch(/is NOT a usable panel/);
+    expect(note).not.toMatch(/does NOT hold a working panel/);
     expect(existsSync(INCOMING())).toBe(true); // decision unchanged: refused
     expect(existsSync(PANEL_DIR())).toBe(true);
+    // …and it must not invite a delete it cannot justify.
+    expect(note).toMatch(/before removing anything/);
+    expect(note).not.toMatch(/remove it if it is a leftover/);
+  });
+
+  it("a speaking verdict of 'usable' is disclosed as a disagreement, not restated as the refusal", async () => {
+    // The fail-closed `dirHasPanelFiles` reads false (its existsSync gate misses
+    // the pyproject) while `panelShapeVerdict` reads pyproject AND bundle fine
+    // and answers `usable`. The refusal is still correct; announcing the
+    // directory holds no working panel would contradict the verdict it just
+    // consulted.
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    stageIncoming("0.11.38");
+    const h = makeDeps({});
+    const pyprojectPath = join(PANEL_DIR(), "pyproject.toml");
+    h.deps.existsSync = (p) => (p === pyprojectPath ? false : existsSync(p));
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(h.deps);
+    expect(note).toMatch(/DID find a complete panel there/);
+    expect(note).toMatch(/disagreeing with the check this refusal was decided on/);
+    expect(note).not.toMatch(/does NOT hold a working panel/);
+    expect(note).toMatch(/before removing anything/);
+    expect(note).not.toMatch(/remove it if it is a leftover/);
+    // Decision unchanged: still refuses, moves nothing.
+    expect(existsSync(INCOMING())).toBe(true);
+    expect(existsSync(PANEL_DIR())).toBe(true);
+  });
+
+  it("a pyproject that was READ but would not PARSE is not reported as unreadable", async () => {
+    // `unreadable` is a CAUSE, not a bucket: "could not be opened" and "opened
+    // fine, contents damaged" point at different remedies (permissions vs a
+    // corrupt file). NOTE: `parsePyproject` is regex-based and does not throw on
+    // ordinary garbage — it answers `projectName: undefined`, which is honestly
+    // `not-a-panel` — so this fixture makes the PARSE itself throw, which is the
+    // only way into that branch and exactly the state it narrates: the read
+    // succeeded and the parse did not.
+    const backupDir = backupPath("0.11.34");
+    writePanelPack(backupDir, "0.11.34");
+    writePanelPack(PANEL_DIR(), "0.11.34");
+    writeFileSync(
+      join(root, ".comfyui-agent-panel.swap.json"),
+      JSON.stringify({ dir: PANEL_DIR(), backupDir, staging: "x", startedAt: Date.now() }),
+    );
+    const h = makeDeps({});
+    const realRead = h.deps.readFile;
+    const pyprojectPath = join(PANEL_DIR(), "pyproject.toml");
+    const unparseable = {
+      match() {
+        throw new Error("damaged pyproject");
+      },
+    } as unknown as string;
+    h.deps.readFile = (p) => (p === pyprojectPath ? unparseable : realRead(p));
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(h.deps);
+    expect(note).toMatch(/was read, but its contents would not parse/);
+    expect(note).toMatch(/it is its CONTENTS that are damaged/);
+    // The wrong cause, and the wrong remedy, must both be absent.
+    expect(note).not.toMatch(/could not be read/);
+    expect(note).not.toMatch(/check permissions/);
+    expect(note).not.toMatch(/the probe failed/);
+  });
+
+  it("'not the panel' is not 'not there' — the restore command is gated on the path being free", async () => {
+    // An unrelated package occupies the canonical name. Identity correctly says
+    // not-a-panel; that establishes NOTHING about the path being free, and the
+    // ungated `mv backup canonical && rm journal` would nest the backup inside
+    // that directory and then delete the recovery record on the strength of it.
+    const backupDir = backupPath("0.11.34");
+    writePanelPack(backupDir, "0.11.34");
+    mkdirSync(PANEL_DIR(), { recursive: true });
+    writeFileSync(
+      join(PANEL_DIR(), "pyproject.toml"),
+      pyproject("2.0.0", "unrelated-node"),
+    );
+    writeFileSync(
+      join(root, ".comfyui-agent-panel.swap.json"),
+      JSON.stringify({ dir: PANEL_DIR(), backupDir, staging: "x", startedAt: Date.now() }),
+    );
+    const { repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const note = await repairInterruptedPanelSwap(makeDeps({}).deps);
+    expect(note).toMatch(/there is NO panel at/); // the identity clause is right
+    expect(note).toMatch(/A directory still exists at/); // and presence is stated
+    expect(note).toMatch(/nests the backup INSIDE it/);
+    expect(note).toMatch(/ONLY once nothing remains at/);
+    // The ungated form must not be reachable here.
+    expect(note).not.toMatch(/To put it back: mv/);
+    expect(existsSync(join(root, ".comfyui-agent-panel.swap.json"))).toBe(true);
+  });
+
+  it("a live reading of a DIFFERENT tree does not certify the tree being described", async () => {
+    // The guard doing the thing the guard exists to prevent. `isLiveDerivedBase`
+    // asks a question about NOW; the path the sentence names was pinned earlier.
+    // A retarget in between would let an observation identifying server B
+    // certify a sentence about server A's tree.
+    stageIncoming("0.11.38");
+    rmSync(join(INCOMING(), ".comfyui-mcp-integrity.json")); // a branch that only reports
+    __setPanelBaseForTests(root, "live-argv-root"); // A, live-derived
+    const { pinPanelBase, repairInterruptedPanelSwap } = await import(
+      "../../services/panel-installer.js"
+    );
+    const pinned = await pinPanelBase(defaultDeps);
+    expect(pinned.comfyuiPath()).toBe(root);
+    const otherRoot = mkdtempSync(join(tmpdir(), "cmcp-other-"));
+    try {
+      // …and now the target moves, and a live probe caches the OTHER install.
+      __setPanelBaseForTests(otherRoot, "live-argv-root");
+      const note = await repairInterruptedPanelSwap(pinned);
+      expect(note).toMatch(/could NOT be confirmed here/);
+      expect(note).toMatch(
+        new RegExp(`describes a DIFFERENT tree \\(${escapeRe(otherRoot)}\\)`),
+      );
+      // The present-tense certification must not appear for the pinned tree.
+      expect(note).not.toMatch(/The running ComfyUI loads its panel from/);
+      // Nor may it assert the negative from a reading taken after a retarget.
+      expect(note).not.toMatch(/is NOT in the tree/);
+    } finally {
+      rmSync(otherRoot, { recursive: true, force: true });
+    }
   });
 
   it("a failed identity probe is not reported as 'there is NO panel'", async () => {
@@ -2090,7 +2214,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     expect(note).not.toMatch(/there is NO panel at/);
     // …and the instruction derived from that undetermined state says so too,
     // rather than telling someone to mv over a path that may hold their panel.
-    expect(note).toMatch(/ONLY once you have confirmed .* holds no panel/);
+    expect(note).toMatch(/ONLY once nothing remains at/);
     expect(note).toContain(backupDir);
     // Still refuses to move anything — the ruling is untouched.
     expect(existsSync(join(root, ".comfyui-agent-panel.swap.json"))).toBe(true);
@@ -2124,7 +2248,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     );
     const note = await repairInterruptedPanelSwap(h.deps);
     expect(note).toMatch(/could NOT be determined/);
-    expect(note).toMatch(/If you confirm .* holds no panel and you have a copy elsewhere/);
+    expect(note).toMatch(/So only once nothing remains at .* and if you have a copy elsewhere/);
     // The unconditional form must be gone from this branch.
     expect(note).not.toMatch(/Nothing has been moved\. If you have a copy elsewhere/);
     expect(existsSync(pyprojectPath)).toBe(true); // and nothing was touched
@@ -2156,7 +2280,7 @@ describe("the registry-zip reinstall refuses everything it cannot prove", () => 
     expect(note).not.toMatch(/could not be read/);
     expect(note).not.toMatch(/there is NO panel at/);
     // The refusal is unchanged: the journal stays, nothing moves.
-    expect(note).toMatch(/ONLY once you have confirmed/);
+    expect(note).toMatch(/ONLY once nothing remains at/);
     expect(existsSync(join(root, ".comfyui-agent-panel.swap.json"))).toBe(true);
     expect(existsSync(PANEL_DIR())).toBe(true);
     expect(existsSync(backupDir)).toBe(true);
