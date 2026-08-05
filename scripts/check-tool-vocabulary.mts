@@ -147,6 +147,32 @@ const SELF = new Set([
   "docs/design/tool-surface.txt",
   // Same reasoning for the panel baseline.
   "docs/design/panel-surface.txt",
+  // The tool-reach benchmark's own ledgers. Like tool-surface.txt above, these
+  // exist BECAUSE the names are retired: the whole exercise is measuring whether
+  // folding 154 names into 33 helps or hurts, which is impossible to express
+  // without both vocabularies present.
+  //
+  //   tool-reach-foldmap.mjs   old flat name → the (tool, action) it becomes.
+  //                            The migration table, as data — a mapping AWAY
+  //                            from each name, never an instruction to call it.
+  //   tool-reach-requests.mjs  every request names its target by the ORIGINAL
+  //                            flat name, because that is the only key stable
+  //                            across all three arms; the runner resolves it per
+  //                            surface. Request TEXT never names a tool at all —
+  //                            checkRequestSet() rejects that outright.
+  //   tool-reach-score.mjs     the header quotes the regenerate/generate_image
+  //                            collision, which is the specific false-acceptance
+  //                            the scorer is shaped to prevent.
+  //
+  // Exact paths, never a `scripts/tool-reach-*` glob: the runner and the MCP
+  // stub deliberately spell no tool names and must stay under the gate.
+  // Per-occurrence `allowedIn` is the wrong instrument here — it would need one
+  // entry per name in DEAD_NAMES, added by whichever slice retires that name,
+  // so every slice would collide on this benchmark's exceptions.
+  "scripts/tool-reach-foldmap.mjs",
+  "scripts/tool-reach-requests.mjs",
+  "scripts/tool-reach-score.mjs",
+  "src/__tests__/tool-reach-score.test.ts",
 ]);
 
 /** Extensions that are never worth scanning as text. */
