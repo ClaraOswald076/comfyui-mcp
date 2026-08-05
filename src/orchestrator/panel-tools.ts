@@ -2212,28 +2212,50 @@ const RELOAD_TAB_REMEDY =
  *                      in the opposite direction.
  *  - `not_recovered` — the session is STILL fenced by a stamp that does not name
  *                      the live canvas. The caller must not report success.
+ *
+ * `canMutate` is `bridge.tabCanMutateGraph(tabId)` — the SEPARATE question of
+ * whether this panel build advertises the two write-boundary fences a graph
+ * MUTATION requires (codex gate). A stamp is necessary but NOT sufficient: an
+ * older bundle can report a perfectly good workflow uuid and still have every
+ * mutation refused at dispatch. Reporting `bound` off the stamp alone answered
+ * a question nobody asked. `undefined` means the capability is not determinable
+ * from this context (a lightweight test ctx) — that is an unknown, so it does
+ * NOT downgrade, and it does not claim either.
  */
-function describeFenceRebind(r: WorkflowFenceRebind): {
+function describeFenceRebind(
+  r: WorkflowFenceRebind,
+  canMutate: boolean | undefined,
+): {
   binding: "bound" | "reads_only" | "not_recovered";
   note: string;
 } {
+  // A panel that cannot fence a WRITE gives reads only, however good the stamp is.
+  const mutationsRefused = canMutate === false;
+  const mutationCaveat = mutationsRefused
+    ? `\n\nBUT graph MUTATIONS are still refused for this tab: its panel build does not ` +
+      `advertise the write-boundary workflow fence a graph edit requires, which no rebind can ` +
+      `add. Reads work now. To make edits work, UPDATE the comfyui-mcp-panel pack, then ` +
+      `${RELOAD_TAB_REMEDY}`
+    : "";
   switch (r.status) {
     case "refreshed":
       return {
-        binding: "bound",
+        binding: mutationsRefused ? "reads_only" : "bound",
         note:
           ` Rebound the graph command fence onto the live canvas (workflow instance ${r.uuid})` +
-          `${r.previous ? `, replacing the stale ${r.previous}` : ""} — graph tools will now ` +
-          `target the workflow that is in view.`,
+          `${r.previous ? `, replacing the stale ${r.previous}` : ""} — graph ` +
+          `${mutationsRefused ? "READS" : "tools"} will now target the workflow that is in ` +
+          `view.${mutationCaveat}`,
       };
     case "already_current":
       return {
-        binding: "bound",
+        binding: mutationsRefused ? "reads_only" : "bound",
         note:
           ` The graph command fence already named the live canvas (workflow instance ${r.uuid}), ` +
           `so nothing needed rebinding. If graph tools are still failing with a workflow-instance ` +
           `mismatch, this session and the panel AGREE on the target and the mismatch is coming ` +
-          `from the panel, not from this binding.\n\nWHAT TO DO: ${RELOAD_TAB_REMEDY}`,
+          `from the panel, not from this binding.${mutationCaveat}` +
+          (mutationsRefused ? "" : `\n\nWHAT TO DO: ${RELOAD_TAB_REMEDY}`),
       };
     case "rejected":
       return {
@@ -5977,14 +5999,20 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // genuinely stalled render is caught by the turn-start stall notice, which
         // does the staleness gating and keeps the interrupt guidance.
         // #772 — never report a dispatch history the caller did not see. When the scoped
-        // run only queued on the SECOND dispatch, say so: exactly one render is in the
-        // queue, and the agent must not read the earlier refusal (if it surfaces in a
-        // log) as a separate queued job.
+        // run only queued on the SECOND dispatch, say so, so the agent does not read the
+        // earlier refusal (if it surfaces in a log) as a separate queued job.
+        //
+        // It says only what was OBSERVED (codex gate). An earlier draft said "exactly one
+        // render was queued" — but `batch_count` is "times to queue", so a successful
+        // dispatch can enqueue several, and the panel reports one prompt id, not a count.
+        // The certified fact is about DISPATCHES, not renders: the first queued nothing,
+        // so everything in the queue came from the second. State that and stop.
         const retryNote = scopeRebuilt
           ? "\n\n[NOTE] The first dispatch of this scoped run was refused by the panel's run-to-node " +
             "graph-stamp race (the graph changed between dispatch and apply); the panel certified that " +
             "nothing was queued, so the scope was rebuilt and re-issued once, and THAT is the run above. " +
-            "Exactly one render was queued."
+            "The first dispatch contributed NOTHING to the queue, so whatever this run queued was " +
+            "queued once, not twice."
           : "";
         let warn = "";
         if (pre.connected && pre.running) {
@@ -6901,7 +6929,42 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // the failure text's "APPLIED (do not repeat this part)" literally true: the
         // target write is already committed and pushed by the time we can fail.
         if (mode === "current" && ctx.rebindToActiveTab && !deferredBind) {
+          const tabBeforeProbe = ctx.tabId;
           fenceRebind = await rebindWorkflowFence(ctx);
+          // The probe itself can MOVE this session (codex gate). `workflow_list` is
+          // retry-safe, so a transient reconnect inside ctx.call sleeps, calls
+          // ensureReachable — which may rebind ctx.tabId onto a different tab — and
+          // retries there. The fence we just adopted then belongs to the NEW tab,
+          // while the `mode:"current"` record we wrote belongs to the OLD one. If the
+          // new tab already carries a PIN (ordinary with two agents on one machine),
+          // the next graph command routes through that pin, and reporting "following
+          // the user's current workflow tab" would name a state that is not the case.
+          //
+          // Do NOT silently overwrite the new tab's pin — that is someone else's
+          // binding, and clobbering it is the very failure the ordering fix above
+          // exists to prevent. Adopt the target onto the new tab only when doing so
+          // takes nothing away (no entry, or already current); otherwise say plainly
+          // what happened and hand back a call the caller can actually make.
+          if (ctx.tabId !== tabBeforeProbe) {
+            const onNewTab = ctx.workflowTarget.get(ctx.tabId);
+            if (onNewTab?.mode === "pinned") {
+              return fail(
+                `panel_set_workflow_target({mode:"current"}) did NOT take effect on the tab this ` +
+                  `session is now bound to.\n\nWHAT HAPPENED: the panel dropped mid-call, so this ` +
+                  `session was rebound from tab ${tabBeforeProbe} onto tab ${ctx.tabId} while the ` +
+                  `request was in flight. Your mode:"current" was recorded against the PREVIOUS ` +
+                  `tab. The tab you are on now is PINNED to "${onNewTab.filename ?? onNewTab.path}" ` +
+                  `— left untouched, because another session may own that pin.\n\nWHAT TO DO: ` +
+                  `call panel_set_workflow_target({mode:"current"}) again now that the binding ` +
+                  `has settled; it will apply to this tab. If the pin is yours and you want it, ` +
+                  `do nothing — graph tools will target "${onNewTab.filename ?? onNewTab.path}".`,
+              );
+            }
+            // Nothing to take away — re-apply the caller's request where it now counts.
+            const moved = ctx.workflowTarget.set(ctx.tabId, { mode: "current" });
+            ctx.bridge.push({ type: "workflow_target", target: moved }, ctx.tabId);
+            rebindNote += ` The panel dropped mid-call: this session moved from tab ${tabBeforeProbe} onto tab ${ctx.tabId}, and mode:"current" was applied there too.`;
+          }
         }
         const hint =
           target.mode === "pinned"
@@ -6916,7 +6979,17 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // thing it must never say when it did not. `graph_binding` carries the same
         // verdict machine-readably, and `graph_binding_status` the specific cause, so a
         // caller never has to infer four different remedies from one sentence.
-        const fence = fenceRebind ? describeFenceRebind(fenceRebind) : undefined;
+        // A stamp is necessary but not sufficient for a graph EDIT — the panel build
+        // must also advertise the write-boundary fence. Ask that question separately
+        // (codex gate) so `bound` never overstates a read-only panel. A ctx that
+        // cannot answer leaves it undefined: an unknown, which downgrades nothing.
+        let canMutateNow: boolean | undefined;
+        try {
+          canMutateNow = ctx.tabCanMutateGraph?.();
+        } catch {
+          canMutateNow = undefined; // a guard that can throw is not a guard
+        }
+        const fence = fenceRebind ? describeFenceRebind(fenceRebind, canMutateNow) : undefined;
         if (fence && fence.binding === "not_recovered") {
           return fail(
             `panel_set_workflow_target({mode:"current"}) did NOT restore this session's graph ` +

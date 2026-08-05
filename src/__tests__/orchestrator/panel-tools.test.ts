@@ -4854,6 +4854,133 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
     expect(refresh).not.toHaveBeenCalled();
   });
 
+  it("does NOT report `bound` when the panel cannot fence a WRITE — a stamp is not a capability", async () => {
+    // tabCanMutateGraph requires the panel to advertise BOTH write-boundary fences
+    // ON TOP of a valid stamp. An older bundle can report a perfectly good workflow
+    // uuid and still have every mutation refused at dispatch, so reporting "graph
+    // tools will now target the workflow in view" off the stamp alone answers a
+    // question nobody asked.
+    const { bridge, refresh, tab } = fenceBridge({
+      fence: STALE,
+      active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
+    });
+    const ctx = makePanelToolCtx(bridge, tab, new WorkflowTargetStore());
+    ctx.tabCanMutateGraph = () => false; // stamp adopted, capability absent
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    const text = (res.content[0] as { text: string }).text;
+
+    // The fence WAS repaired — that part really happened and is reported.
+    expect(res.isError).toBeFalsy();
+    expect(refresh).toHaveBeenCalledExactlyOnceWith(tab, LIVE);
+    expect(JSON.parse(text).graph_binding_status).toBe("refreshed");
+    // …but the session is read-only, and the remedy is the one that exists.
+    expect(JSON.parse(text).graph_binding).toBe("reads_only");
+    expect(text).toMatch(/graph MUTATIONS are still refused for this tab/);
+    expect(text).toMatch(/UPDATE the comfyui-mcp-panel pack/);
+    expect(text).toMatch(/which no rebind can add/);
+  });
+
+  it("reports `bound` when the panel DOES advertise the write fence", async () => {
+    const { bridge, tab } = fenceBridge({
+      fence: STALE,
+      active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
+    });
+    const ctx = makePanelToolCtx(bridge, tab, new WorkflowTargetStore());
+    ctx.tabCanMutateGraph = () => true;
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    const text = (res.content[0] as { text: string }).text;
+
+    expect(JSON.parse(text).graph_binding).toBe("bound");
+    expect(text).not.toMatch(/graph MUTATIONS are still refused/);
+  });
+
+  it("REFUSES to claim mode:'current' when the probe moved this session onto a PINNED tab", async () => {
+    // workflow_list is retry-safe: a transient drop makes ctx.call rebind onto
+    // another tab and retry there. The fence then belongs to the NEW tab while the
+    // mode:"current" record belongs to the OLD one — and if the new tab carries
+    // someone else's pin, the next graph command routes through that pin. Claiming
+    // "following the user's current workflow tab" would name a state that is not
+    // the case, and overwriting the pin would clobber another session's binding.
+    const store = new WorkflowTargetStore();
+    const OLD = "wf:workflows/old.json";
+    const NEW = "wf:workflows/new.json";
+    store.set(NEW, { mode: "pinned", path: "workflows/other.json", filename: "other.json" });
+    let live = OLD;
+    let dropped = false;
+    const bridge = {
+      send: async (cmd: Record<string, unknown>, opts?: { tabId?: string }) => {
+        if (cmd.cmd === "workflow_list" && !dropped) {
+          dropped = true;
+          live = NEW; // the old tab is gone; a different one is live now
+          throw new Error(`no connected tab with id "${opts?.tabId}". Connected: none`);
+        }
+        if (cmd.cmd === "workflow_list") {
+          return { active: { path: "workflows/new.json", workflow_uuid: LIVE } };
+        }
+        return { ok: true };
+      },
+      push: () => 1,
+      canReach: (id: string) => id === live,
+      isHeadless: () => false,
+      tabs: () => [{ tab_id: live, title: "wf", connected_at: 0 }],
+      resolveActiveTabId: () => live,
+      refreshWorkflowUuid: () => true,
+      workflowUuidFor: () => STALE,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, OLD, store);
+
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    const text = (res.content[0] as { text: string }).text;
+
+    expect(res.isError).toBe(true);
+    expect(ctx.tabId).toBe(NEW);
+    // The other session's pin is LEFT ALONE.
+    expect(store.get(NEW)).toMatchObject({ mode: "pinned", path: "workflows/other.json" });
+    expect(text).toMatch(/did NOT take effect on the tab this session is now bound to/);
+    expect(text).toMatch(/rebound from tab wf:workflows\/old\.json onto tab wf:workflows\/new\.json/);
+    expect(text).toMatch(/left untouched, because another session may own that pin/);
+    // …and the remedy is a call the caller can make right now.
+    expect(text).toMatch(/call panel_set_workflow_target\(\{mode:"current"\}\) again/);
+  });
+
+  it("re-applies mode:'current' onto the moved-to tab when that takes nothing away", async () => {
+    const store = new WorkflowTargetStore();
+    const OLD = "wf:workflows/old.json";
+    const NEW = "wf:workflows/new.json";
+    let live = OLD;
+    let dropped = false;
+    const bridge = {
+      send: async (cmd: Record<string, unknown>, opts?: { tabId?: string }) => {
+        if (cmd.cmd === "workflow_list" && !dropped) {
+          dropped = true;
+          live = NEW;
+          throw new Error(`no connected tab with id "${opts?.tabId}". Connected: none`);
+        }
+        if (cmd.cmd === "workflow_list") {
+          return { active: { path: "workflows/new.json", workflow_uuid: LIVE } };
+        }
+        return { ok: true };
+      },
+      push: () => 1,
+      canReach: (id: string) => id === live,
+      isHeadless: () => false,
+      tabs: () => [{ tab_id: live, title: "wf", connected_at: 0 }],
+      resolveActiveTabId: () => live,
+      refreshWorkflowUuid: () => true,
+      workflowUuidFor: () => STALE,
+    } as unknown as PanelToolCtx["bridge"];
+    const ctx = makePanelToolCtx(bridge, OLD, store);
+
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    const text = (res.content[0] as { text: string }).text;
+
+    expect(res.isError).toBeFalsy();
+    // The record now governs the tab the session is actually on…
+    expect(store.get(NEW)).toMatchObject({ mode: "current" });
+    // …and the move is DISCLOSED, not silently absorbed.
+    expect(text).toMatch(/moved from tab wf:workflows\/old\.json onto tab wf:workflows\/new\.json/);
+  });
+
   it("COMMITS the target store BEFORE the live-canvas round trip, so a concurrent pin isn't clobbered", async () => {
     // The store is shared by every session bound to this tab. An await placed
     // between the decision and the write widens the window in which THIS call's
@@ -4936,15 +5063,29 @@ describe("panel-tools: panel_run scoped-run stamp-race retry (#772)", () => {
 
   const runText = (r: ToolResult) => (r.content[0] as { text: string }).text;
 
-  it("re-issues the scoped run EXACTLY ONCE and discloses that only one render was queued", async () => {
+  it("re-issues the scoped run EXACTLY ONCE and discloses the extra dispatch", async () => {
     const { ctx, runs } = runCtx([{ error: RACE }, { queued: true, prompt_id: "p1" }]);
     const res = await defByName("panel_run").handler({ to_node_id: 650 }, ctx);
 
     expect(res.isError).toBeFalsy();
     expect(runs).toHaveLength(2);
     expect(runs[1]).toMatchObject({ cmd: "graph_run", to_node_id: 650 }); // same scope
-    expect(runText(res)).toMatch(/Exactly one render was queued/);
     expect(runText(res)).toMatch(/re-issued once/);
+    expect(runText(res)).toMatch(/first dispatch contributed NOTHING to the queue/);
+  });
+
+  it("does NOT claim a render COUNT — batch_count means the second dispatch can queue several", async () => {
+    // `batch_count` is "times to queue", and the panel reports one prompt id, not a
+    // count. The certified fact is about DISPATCHES ("the first queued nothing"),
+    // not renders. Naming a number would be an unobserved state.
+    const { ctx, runs } = runCtx([{ error: RACE }, { queued: true, prompt_id: "p1" }]);
+    const res = await defByName("panel_run").handler({ to_node_id: 650, batch_count: 3 }, ctx);
+
+    expect(res.isError).toBeFalsy();
+    expect(runs).toHaveLength(2);
+    expect(runs[1]).toMatchObject({ batch_count: 3 }); // the batch is preserved, not dropped
+    expect(runText(res)).not.toMatch(/Exactly one render/i);
+    expect(runText(res)).toMatch(/queued once, not twice/);
   });
 
   it("does NOT retry a rejection that is not the certified race (validation failure)", async () => {
