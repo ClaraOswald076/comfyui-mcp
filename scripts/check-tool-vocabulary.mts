@@ -143,6 +143,17 @@ const SELF = new Set([
   // names are in DEAD_NAMES with their exact `download_model` /
   // `list_local_models` action replacements.
   "src/__tests__/tools/models-consolidated.test.ts",
+  // Same, for 0.50.0 slice 14: each asserts as FIXTURES that the names its tool
+  // replaced are in DEAD_NAMES (create_workflow ← 3, visualize_workflow ← 4,
+  // get_workflow ← 7 and save_workflow ← 2).
+  "src/__tests__/tools/workflow-compose.test.ts",
+  "src/__tests__/tools/workflow-visualize.test.ts",
+  "src/__tests__/tools/workflow-library.test.ts",
+  // Same slice, one layer out: this passes three retired names to
+  // callToolAdmission as FIXTURES and asserts the direct channel REFUSES them by
+  // name. They are call arguments under test — the assertion is that nothing
+  // serves them — not guidance to call anything.
+  "src/__tests__/orchestrator/call-tool-admission.test.ts",
   // Same, for the #659 retired-name error: these pass dead names to call_tool /
   // the ollama dispatch as FIXTURES and assert the error quotes the ledger's
   // replacement — the names are call arguments under test, not live guidance.

@@ -119,7 +119,7 @@ export async function loadBatch(batchId: string): Promise<BatchRecord> {
 export interface SubmitBatchInput {
   workflows?: WorkflowJSON[];
   workflow?: WorkflowJSON;
-  /** Param sweep: one job per override set, applied like modify_workflow's
+  /** Param sweep: one job per override set, applied like create_workflow's modify
    *  flat input overrides (every node that already has the input gets it). */
   sweep?: Array<Record<string, unknown>>;
   disable_random_seed?: boolean;

@@ -30,7 +30,7 @@ faster). Frame interpolation is **RIFE** (or FILM) via
 > ⚠️ Verification note: every node/pack/model name below was confirmed against the
 > GitHub repos and the ComfyUI registry / Manager as of June 2026. Where a name is
 > approximate or version-dependent it is flagged. Do not substitute a node you
-> can't confirm is installed — check with `list_installed_nodes` / `get_node_info`.
+> can't confirm is installed — check with `list_installed_nodes` / `create_workflow (action:"node_info")`.
 
 ---
 

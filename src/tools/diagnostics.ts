@@ -331,7 +331,7 @@ export function registerDiagnosticsTools(server: McpServer): void {
         lines.push(...formatRunOutcome(entry));
 
         // 2. Re-validate the exact graph that ran, so we can name what's missing.
-        //    Reuses the same validator behind validate_workflow — the graph is the
+        //    Reuses the same validator behind create_workflow (action:"validate") — the graph is the
         //    one ComfyUI recorded, so this reflects what actually executed.
         const graph = extractWorkflowGraph(entry);
         if (!graph) {

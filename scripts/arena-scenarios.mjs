@@ -55,7 +55,9 @@ export const SCENARIOS = [
       "after starting it, check its job status until it has finished, then tell me the output filename or asset id.",
     primary: ["generate_image", "enqueue_workflow"],
     // right family but incomplete execution (built a workflow, never enqueued)
-    partial: ["create_workflow", "dsl_to_workflow"],
+    // 0.50.0 slice 14: the DSL conversion is now visualize_workflow
+    // (action:"from_dsl"), and the harness matches on the TOOL name only.
+    partial: ["create_workflow", "visualize_workflow"],
     followup: ["queue", "get_history", "list_output_images", "view_image", "list_assets", "generation_stats"],
     verify: async (call, t) => {
       // ground truth: the prompt_id the model started must be done with outputs
@@ -80,7 +82,7 @@ export const SCENARIOS = [
       "Render a txt2img image with the checkpoint v1-5-pruned-emaonly-fp16.safetensors, EXACTLY 12 sampling steps, " +
       "EXACTLY 384x384 pixels, positive prompt 'a green pear on a table'. Wait until it finishes, then report the prompt_id.",
     primary: ["generate_image", "enqueue_workflow"],
-    partial: ["create_workflow", "dsl_to_workflow"],
+    partial: ["create_workflow", "visualize_workflow"],
     verify: async (_call, t) => {
       // ground truth from ComfyUI itself: the EXECUTED graph must carry the
       // exact parameters, and the job must have completed with outputs.
@@ -158,7 +160,9 @@ export const SCENARIOS = [
       "pipes that image through a 2x upscale so the SAME run saves TWO outputs: the 512x512 original and a 1024x1024 " +
       "version. No template does this — compose the graph yourself. Wait for completion and report the prompt_id.",
     primary: ["enqueue_workflow"],
-    partial: ["create_workflow", "dsl_to_workflow", "generate_image", "modify_workflow"],
+    // The compose-then-modify pair folded into create_workflow, so the two
+    // entries collapse to one name.
+    partial: ["create_workflow", "visualize_workflow", "generate_image"],
     verify: async (_call, t) => {
       const base = process.env.COMFYUI_URL ?? "http://127.0.0.1:8188";
       const ids = [...new Set([...t.toolText.matchAll(/"prompt_id":\s*"([0-9a-f-]{8,})"/g)].map((m) => m[1]))];

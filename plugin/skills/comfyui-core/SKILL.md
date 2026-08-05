@@ -49,20 +49,20 @@ ComfyUI workflows are JSON objects mapping **string node IDs** to node definitio
 
 ### Important: API Format vs Web UI Format
 
-- **API format** (for execution/analysis): `{ "1": { class_type, inputs }, "2": { ... } }` — compact, used by `enqueue_workflow`, `validate_workflow`, `modify_workflow`, etc.
+- **API format** (for execution/analysis): `{ "1": { class_type, inputs }, "2": { ... } }` — compact, used by `enqueue_workflow`, `create_workflow (action:"validate")`, `create_workflow (action:"modify")`, etc.
 - **Web UI format** (for saving and frontend editing): `{ "nodes": [...], "links": [...] }` — includes layout positions, sizes, groups, and visual metadata so ComfyUI's canvas can open and edit it
 - Execution tools expect and return **API format**
-- **Save in Web UI format** so saved workflows stay readable and editable in the ComfyUI frontend. A raw API-format save is NOT canvas-editable — it "exists" in the library but loads blank in the canvas, which strands users (and tempts agents into creating yet another new workflow instead of reopening the old one). Because of this, `save_workflow` auto-converts API-format input to Web UI format with a generated layout — but prefer passing real Web UI format (from `get_workflow format="ui"`) since a generated layout loses the original node positions/groups <!-- API-vs-UI save-format clarification adapted from 1696762169/comfyui-mcp@3da56c9 -->
+- **Save in Web UI format** so saved workflows stay readable and editable in the ComfyUI frontend. A raw API-format save is NOT canvas-editable — it "exists" in the library but loads blank in the canvas, which strands users (and tempts agents into creating yet another new workflow instead of reopening the old one). Because of this, `save_workflow` auto-converts API-format input to Web UI format with a generated layout — but prefer passing real Web UI format (from `get_workflow(action="get", filename=…, format="ui")`) since a generated layout loses the original node positions/groups <!-- API-vs-UI save-format clarification adapted from 1696762169/comfyui-mcp@3da56c9 -->
 - `get_workflow` defaults to `format="api"` for analysis/execution; use `format="ui"` when loading a workflow to re-save or edit in the canvas
 - Muted/bypassed nodes are preserved with `_meta.mode: "muted"` — these are inactive but visible for understanding the workflow
 - Get/Set virtual wire nodes are preserved with `_meta.title` and `Constant` key for tracing data flow
 
 ### Workflow Library Tools
 
-- **`analyze_workflow(filename)`** — **use this first** to understand any saved workflow. Returns a structured text summary with sections, node IDs, key settings, virtual wires, and connection graph. No raw JSON — just what you need to reason about the workflow. Supports views: summary (default), overview (mermaid), detail (section mermaid), list, flat.
-- **`list_workflows`** — list all saved workflows in ComfyUI's user library
-- **`get_workflow(filename)`** — load raw workflow JSON. Only use when you need the actual JSON for `enqueue_workflow`, `modify_workflow`, or `save_workflow`. Use `analyze_workflow` instead for understanding. **For `save_workflow`, request `format="ui"`** so the workflow stays editable in the frontend.
-- **`save_workflow(filename, workflow)`** — save a workflow to the user library. **Pass Web UI format (`{ nodes, links }`)** so it keeps its real layout in ComfyUI's canvas. API-format graphs are accepted and are **auto-converted to Web UI format** (with a generated layout) precisely because a raw API-format save is not canvas-editable — the frontend cannot open it. When re-saving an existing workflow, load it with `get_workflow format="ui"` and edit that, so positions/groups survive.
+- **`get_workflow(action="analyze", filename=…)`** — **use this first** to understand any saved workflow. Returns a structured text summary with sections, node IDs, key settings, virtual wires, and connection graph. No raw JSON — just what you need to reason about the workflow. Supports views: summary (default), overview (mermaid), detail (section mermaid), list, flat.
+- **`get_workflow (action:"list")`** — list all saved workflows in ComfyUI's user library
+- **`get_workflow(action="get", filename=…)`** — load raw workflow JSON. Only use when you need the actual JSON for `enqueue_workflow`, `create_workflow (action:"modify")`, or `save_workflow`. Use `action="analyze"` instead for understanding. **When the JSON is headed back to `save_workflow`, request `format="ui"`** so the workflow stays editable in the frontend.
+- **`save_workflow(action="save", filename=…, workflow=…)`** — save a workflow to the user library. **Pass Web UI format (`{ nodes, links }`)** so it keeps its real layout in ComfyUI's canvas. API-format graphs are accepted and are **auto-converted to Web UI format** (with a generated layout) precisely because a raw API-format save is not canvas-editable — the frontend cannot open it. When re-saving an existing workflow, load it with `get_workflow(action="get", filename=…, format="ui")` and edit that, so positions/groups survive.
 
 ## Data Types
 
@@ -136,14 +136,14 @@ SetLatentNoiseMask (samples, mask) → LATENT → KSampler.latent_image
 
 ### Inspect & Modify
 
-- `get_node_info` — query what nodes are available and their schemas
-- `modify_workflow` — patch an existing workflow (set_input, add_node, remove_node, connect, insert_between)
+- `create_workflow (action:"node_info")` — query what nodes are available and their schemas
+- `create_workflow (action:"modify")` — patch an existing workflow (set_input, add_node, remove_node, connect, insert_between)
 - `visualize_workflow` — see a workflow as a mermaid diagram
 
 ### Reverse Engineering
 
 - `visualize_workflow` — workflow JSON → mermaid diagram
-- `mermaid_to_workflow` — mermaid diagram → workflow JSON (uses `/object_info` for schema resolution)
+- `visualize_workflow (action:"mermaid")` — mermaid diagram → workflow JSON (uses `/object_info` for schema resolution)
 
 ### Model Management
 
@@ -256,12 +256,12 @@ The `visualize_workflow` tool produces mermaid flowcharts with:
 - **Node labels** showing class_type and optionally widget values
 - **Direction**: `LR` (left-to-right) by default, `TB` (top-to-bottom) for large workflows
 
-The `mermaid_to_workflow` tool parses mermaid back into workflow JSON, using connection type labels to resolve the correct input/output slots via `/object_info` schemas.
+The `visualize_workflow (action:"mermaid")` tool parses mermaid back into workflow JSON, using connection type labels to resolve the correct input/output slots via `/object_info` schemas.
 
 ## Common Mistakes to Avoid
 
 1. **Wrong connection format**: Use `["1", 0]` not `[1, 0]` — node IDs are strings
 2. **Web UI format**: Don't pass `{ nodes: [], links: [] }` — use API format
 3. **Missing VAE**: CheckpointLoaderSimple has 3 outputs — MODEL(0), CLIP(1), VAE(2)
-4. **Wrong output index**: Check the node's output list order via `get_node_info`
+4. **Wrong output index**: Check the node's output list order via `create_workflow (action:"node_info")`
 5. **Seed handling**: `enqueue_workflow` randomizes seeds by default unless `disable_random_seed: true`
