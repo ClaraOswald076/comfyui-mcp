@@ -11,13 +11,42 @@ vi.mock("../../config.js", () => ({
 // (a Docker/forwarded server's container path must NOT be treated as host-local).
 // Control existence per test; default true so the live-root paths resolve.
 let liveRootExists = true;
+/** Per-PATH existence, for the #851 inventory corroboration: it asks whether each file
+ *  the SERVER lists is present under `<base>/models/<category>`, which the flat boolean
+ *  cannot express. Default keeps every pre-existing test on the boolean. */
+let existsFor: ((p: string) => boolean) | undefined;
+/** `<base>/models` stat for the #851 check: a directory, absent, or unreadable. */
+let modelsDirStat: "dir" | "file" | "enoent" | "eacces" = "dir";
 vi.mock("node:fs", () => ({
-  existsSync: () => liveRootExists,
+  existsSync: (p: string) => (existsFor ? existsFor(String(p)) : liveRootExists),
+  statSync: (p: string) => {
+    if (modelsDirStat === "enoent" || modelsDirStat === "eacces") {
+      const err = new Error(`stat ${String(p)}`) as NodeJS.ErrnoException;
+      err.code = modelsDirStat === "enoent" ? "ENOENT" : "EACCES";
+      throw err;
+    }
+    return { isDirectory: () => modelsDirStat === "dir" };
+  },
 }));
 
 const getSystemStats = vi.fn();
+/** The server's own model inventory: category → filenames it reports seeing. */
+let serverInventory: Record<string, string[]> | undefined;
+const fetchApi = vi.fn(async (path: string) => {
+  if (!serverInventory) return { ok: false, status: 404, json: async () => ({}) };
+  if (path === "/models") {
+    return { ok: true, status: 200, json: async () => Object.keys(serverInventory as object) };
+  }
+  const m = path.match(/^\/models\/(.+)$/);
+  const cat = m ? decodeURIComponent(m[1]) : undefined;
+  if (cat && serverInventory[cat]) {
+    return { ok: true, status: 200, json: async () => serverInventory![cat] };
+  }
+  return { ok: false, status: 404, json: async () => ({}) };
+});
 vi.mock("../../comfyui/client.js", () => ({
   getSystemStats: (...a: unknown[]) => getSystemStats(...a),
+  getClient: () => ({ fetchApi: (...a: unknown[]) => fetchApi(...(a as [string])) }),
 }));
 
 // resolveModelsDir's local fallback (COMFYUI_PATH → default workspace) is resolved
@@ -91,6 +120,10 @@ beforeEach(() => {
   observedLiveRoot = undefined;
   baseHasEntrypoint = false;
   hasEntrypointFor = undefined;
+  existsFor = undefined;
+  modelsDirStat = "dir";
+  serverInventory = undefined;
+  fetchApi.mockClear();
 });
 
 afterEach(() => {
@@ -668,5 +701,115 @@ describe("resolveInputDir", () => {
   it("falls back to <COMFYUI_PATH>/input when /system_stats is unreachable", async () => {
     getSystemStats.mockRejectedValue(new Error("ECONNREFUSED"));
     expect(await resolveInputDir()).toBe(resolve("/comfy", "input"));
+  });
+});
+
+describe("models dir — corroborating a data-dir base by the server's own inventory (#851)", () => {
+  // The Docker/data-dir shape from the report: ComfyUI runs in a container as
+  // `python3 main.py` (relative argv, no cwd), and COMFYUI_PATH is the HOST bind-mount
+  // holding models/ input/ output/ custom_nodes/ — with no main.py anywhere near it,
+  // because the code lives inside the container.
+  //
+  // anchorRelativeEntrypointOnBase cannot rescue this and should not be extended to: it
+  // corroborates using the CODE layout, and in this deployment that evidence genuinely
+  // does not exist. Adding a third layout branch would just wait for a fourth shape.
+  // What DOES exist is the server's own /models listing, which is it telling us what it
+  // can see.
+  const DATA_DIR = "/home/gradispo/comfyui-data";
+
+  function dockerServer(): void {
+    getSystemStats.mockResolvedValue({
+      system: { argv: ["python3", "main.py", "--listen", "0.0.0.0", "--port", "8188"] },
+    });
+    (config as { comfyuiPath?: string }).comfyuiPath = DATA_DIR;
+    baseHasEntrypoint = false; // no main.py at or under the host data dir
+    hasEntrypointFor = () => false;
+  }
+
+  /** Only the files the server lists exist, under `<DATA_DIR>/models/<category>`. */
+  function onDisk(files: string[]): void {
+    const present = new Set(files.map((f) => resolve(f)));
+    existsFor = (p) => present.has(resolve(p));
+  }
+
+  it("accepts the data dir when the server's model listing is fully present under it", async () => {
+    dockerServer();
+    serverInventory = {
+      diffusion_models: ["qwen-image-edit.safetensors", "sub/wan22.safetensors"],
+    };
+    onDisk([
+      join(DATA_DIR, "models", "diffusion_models", "qwen-image-edit.safetensors"),
+      join(DATA_DIR, "models", "diffusion_models", "sub/wan22.safetensors"),
+    ]);
+
+    const res = await resolveModelsDirWithBases();
+    expect(res.modelsDir).toBe(resolve(DATA_DIR, "models"));
+    // Reported as corroborated LOCAL CONFIG, not as a path the server named — the
+    // distinction downstream writers use.
+    expect(res.source).toBe("base-inventory-corroborated");
+    expect(res.baseDirs).toContain(resolve(DATA_DIR));
+  });
+
+  it("REFUSES when the base explains only PART of what the server sees", async () => {
+    // One reported file missing means the server also reads somewhere else, so this
+    // directory is not established as its models root. A partial match is not proof, and
+    // guessing here is the #369 harm.
+    dockerServer();
+    serverInventory = { diffusion_models: ["present.safetensors", "elsewhere.safetensors"] };
+    onDisk([join(DATA_DIR, "models", "diffusion_models", "present.safetensors")]);
+
+    await expect(resolveModelsDirWithBases()).rejects.toThrow(
+      /could not be determined/,
+    );
+    // …and the refusal SAYS the inventory check ran and what it found, rather than
+    // resting on the code-layout reason alone.
+    await expect(resolveModelsDirWithBases()).rejects.toThrow(
+      /asking the running server what models it can SEE did not corroborate it/,
+    );
+    await expect(resolveModelsDirWithBases()).rejects.toThrow(/elsewhere\.safetensors/);
+  });
+
+  it("REFUSES when the server reports categories but every one is empty", async () => {
+    // Nothing to compare is not a match. An empty listing would otherwise "corroborate"
+    // any directory at all — the emptiest possible false positive.
+    dockerServer();
+    serverInventory = { diffusion_models: [], loras: [] };
+    onDisk([]);
+
+    await expect(resolveModelsDirWithBases()).rejects.toThrow(
+      /no non-empty model category to compare against/,
+    );
+  });
+
+  it("does not claim absence when <base>/models cannot be inspected", async () => {
+    dockerServer();
+    modelsDirStat = "eacces";
+    serverInventory = { diffusion_models: ["a.safetensors"] };
+
+    await expect(resolveModelsDirWithBases()).rejects.toThrow(
+      /could not be inspected \(EACCES\), so nothing was established either way/,
+    );
+  });
+
+  it("says plainly when the base simply has no models directory", async () => {
+    dockerServer();
+    modelsDirStat = "enoent";
+    serverInventory = { diffusion_models: ["a.safetensors"] };
+
+    await expect(resolveModelsDirWithBases()).rejects.toThrow(/has no "models" directory/);
+  });
+
+  it("never runs the inventory probe when the destination already resolved", async () => {
+    // The corroboration must be a rescue for a refusal, never a second opinion that
+    // could redirect a download that already had a live-authoritative answer.
+    getSystemStats.mockResolvedValue({
+      system: { argv: ["python", "/live/ComfyUI/main.py"] },
+    });
+    (config as { comfyuiPath?: string }).comfyuiPath = DATA_DIR;
+    serverInventory = { diffusion_models: ["a.safetensors"] };
+
+    const res = await resolveModelsDirWithBases();
+    expect(res.source).toBe("live-root");
+    expect(fetchApi).not.toHaveBeenCalled();
   });
 });

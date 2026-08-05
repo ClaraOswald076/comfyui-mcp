@@ -1,7 +1,7 @@
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { config, isRemoteMode } from "../config.js";
-import { getSystemStats } from "../comfyui/client.js";
+import { getClient, getSystemStats } from "../comfyui/client.js";
 import {
   resolveEffectiveComfyUIBase,
   liveRootFromArgv,
@@ -66,6 +66,7 @@ export type ModelsDirSource =
   | "live-root"
   | "observed-root"
   | "base-anchored"
+  | "base-inventory-corroborated"
   | "configured-base";
 
 /** True when the models dir was established from the RUNNING server rather than
@@ -346,6 +347,115 @@ function anchorRelativeEntrypointOnBase(base: string, relDir: string): string | 
   return hasComfyUIEntrypoint(nested) ? nested : undefined;
 }
 
+/**
+ * Corroborate a configured base by asking the SERVER what models it can SEE (#851).
+ *
+ * `anchorRelativeEntrypointOnBase` corroborates using ComfyUI's CODE layout — it needs a
+ * `main.py` at or under the base. That is an assumption about what an install LOOKS
+ * like, and every deployment shape that does not match produces another false refusal:
+ * #813 was the Windows portable shape, #851 is the Docker/data-dir shape, where
+ * `COMFYUI_PATH` is a bind-mounted host directory holding `models/ input/ output/
+ * custom_nodes/` and the code lives inside the container at a path that does not exist
+ * on the host at all. No amount of layout-matching reaches that, because the evidence it
+ * looks for is genuinely not there — and "I could not determine which install this is"
+ * was being reported as "I determined it is a DIFFERENT install".
+ *
+ * But the question is "where does this server read MODELS from?", and for that there IS
+ * decisive evidence the running server volunteers: `/models/<category>` is ComfyUI
+ * listing the model files it can actually see. If everything it reports for a category
+ * is present under `<base>/models/<category>`, then that directory is (or is mounted as)
+ * the models root the server reads — established by the server, not by us recognising a
+ * layout. That is the same principle #813 used, applied to the evidence that exists in
+ * this deployment rather than the evidence that does not.
+ *
+ * Deliberately conservative, because this decides where multi-gigabyte files land:
+ *  - it runs ONLY where the alternative is today's hard refusal, so it can convert a
+ *    refusal into a corroborated destination but can never redirect a download that
+ *    already resolved;
+ *  - it requires a NON-EMPTY category that the base explains COMPLETELY. One reported
+ *    file missing from disk means the server is reading from somewhere else too, and the
+ *    match is not proof;
+ *  - anything unreadable, empty, or ambiguous returns a reason and the caller refuses.
+ *
+ * Residual, stated rather than hidden: a stale second install holding an identical copy
+ * of the same model files would also match. The source is reported as
+ * `base-inventory-corroborated` (NOT live-authoritative) precisely so downstream keeps
+ * treating the destination as local configuration that was corroborated, not as a path
+ * the server named.
+ */
+async function corroborateBaseByModelInventory(
+  base: string,
+): Promise<
+  | { ok: true; modelsDir: string; category: string; matched: number }
+  | { ok: false; reason: string }
+> {
+  const modelsDir = resolve(base, "models");
+  let modelsDirIsDir: boolean;
+  try {
+    modelsDirIsDir = statSync(modelsDir).isDirectory();
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    return {
+      ok: false,
+      reason:
+        code === "ENOENT" || code === "ENOTDIR"
+          ? `it has no "models" directory`
+          : `its "models" directory could not be inspected (${code ?? "unknown error"}), so nothing was established either way`,
+    };
+  }
+  if (!modelsDirIsDir) return { ok: false, reason: `its "models" entry is not a directory` };
+
+  let categories: string[];
+  try {
+    const client = getClient();
+    const res = await client.fetchApi("/models");
+    if (!res.ok) return { ok: false, reason: `the server's /models listing returned HTTP ${res.status}` };
+    const json = (await res.json()) as unknown;
+    if (!Array.isArray(json)) return { ok: false, reason: "the server's /models listing was not a list" };
+    categories = json.filter((c): c is string => typeof c === "string" && c.trim() !== "");
+  } catch (err) {
+    return {
+      ok: false,
+      reason: `the server's /models listing could not be read (${err instanceof Error ? err.message : String(err)})`,
+    };
+  }
+  if (categories.length === 0) return { ok: false, reason: "the server reported no model categories" };
+
+  // Bounded: stop at the first category that yields a COMPLETE match, and never walk
+  // the whole list — this sits in front of a download, not in a background job.
+  let checked = 0;
+  let lastReason = "the server reported no non-empty model category to compare against";
+  for (const category of categories) {
+    if (checked >= MAX_INVENTORY_CATEGORIES) break;
+    let files: string[];
+    try {
+      const client = getClient();
+      const res = await client.fetchApi(`/models/${encodeURIComponent(category)}`);
+      if (!res.ok) continue;
+      const json = (await res.json()) as unknown;
+      if (!Array.isArray(json)) continue;
+      files = json.filter((n): n is string => typeof n === "string" && n.trim() !== "");
+    } catch {
+      continue;
+    }
+    if (files.length === 0) continue;
+    checked += 1;
+    const categoryDir = join(modelsDir, category);
+    const missing = files.filter((name) => !existsSync(join(categoryDir, name)));
+    if (missing.length === 0) {
+      return { ok: true, modelsDir, category, matched: files.length };
+    }
+    lastReason =
+      `the server lists ${files.length} file(s) under "${category}" and ${missing.length} of them ` +
+      `are not under "${categoryDir}" (e.g. "${missing[0]}"), so this base does not explain what the server sees`;
+  }
+  return { ok: false, reason: lastReason };
+}
+
+/** How many non-empty categories the inventory corroboration will compare before
+ *  giving up. One complete match is proof; scanning further only costs latency. */
+const MAX_INVENTORY_CATEGORIES = 4;
+
 export async function resolveModelsDirWithBases(): Promise<{
   modelsDir: string;
   baseDirs: string[];
@@ -465,6 +575,24 @@ export async function resolveModelsDirWithBases(): Promise<{
         { modelsDir, relDir: live?.relDir, anchored },
       );
     } else if (snapshot.reachable && !isRemoteMode() && live?.source === "unresolved" && live.relDir !== undefined) {
+      // Before refusing: the code-layout corroboration above needed a `main.py` at or
+      // under the base, and a Docker/data-dir deployment genuinely has none — the code
+      // lives inside the container (#851). Ask the SERVER what models it can see and
+      // accept the base only if it explains that completely. Runs only here, so it can
+      // rescue a refusal but never redirect a download that already resolved.
+      const inventory = base
+        ? await corroborateBaseByModelInventory(base)
+        : { ok: false as const, reason: "no COMFYUI_PATH or default workspace is configured" };
+      if (inventory.ok) {
+        modelsDir = inventory.modelsDir;
+        source = "base-inventory-corroborated";
+        baseDirs.add(resolve(base as string));
+        logger.info(
+          "Corroborated the configured base against the running server's own model inventory",
+          { modelsDir, category: inventory.category, matched: inventory.matched },
+        );
+        return { modelsDir, baseDirs: [...baseDirs], snapshot, source };
+      }
       throw new ValidationError(
         "The models directory of the CONNECTED ComfyUI could not be determined, so a " +
           "download has no verified destination. What could not be determined:\n" +
@@ -475,8 +603,9 @@ export async function resolveModelsDirWithBases(): Promise<{
               ? `the configured local base "${base}" corroborates neither reading of that path: it does not contain "${join(live.relDir, "main.py")}" (the ComfyUI Desktop / launcher-root shape), and it is not itself "${live.relDir}" holding "main.py" (the portable shape where COMFYUI_PATH already points at the ComfyUI directory) — so it is a DIFFERENT install than the one that is running`
               : "no COMFYUI_PATH or default workspace is configured"
           }.\n` +
+          `  - asking the running server what models it can SEE did not corroborate it either: ${inventory.reason} (this is the check that covers a Docker/data-dir COMFYUI_PATH, which holds models/ but no main.py).\n` +
           "Refusing to write to a guessed directory (that is how a model lands in a stale install and is reported as a success). " +
-          "Fix by launching ComfyUI with an ABSOLUTE --base-directory, or set COMFYUI_PATH to the install that is actually running.",
+          "Fix by launching ComfyUI with an ABSOLUTE --base-directory, or set COMFYUI_PATH to the directory whose models/ the server actually reads.",
       );
     } else if (base) {
       modelsDir = resolve(base, "models");
