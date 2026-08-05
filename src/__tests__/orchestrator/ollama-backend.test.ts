@@ -891,3 +891,25 @@ describe("panel_ask survives a slow human answer (#325)", () => {
     expect(PANEL_TOOL_MCP_TIMEOUT_MS).toBeGreaterThan(300_000);
   });
 });
+
+describe("panel-router retraction rides the mode-varying prompt (main↔#788 merge seam)", () => {
+  it("no panel router → the system prompt retracts the panel tools; router present → no retraction", async () => {
+    const { client: comfy } = fakeMcpClient(COMFY_META);
+    // Without a panel client the three panel_* routers don't exist — the prompt
+    // must say so rather than promise them (#841 lineage, kept through the merge).
+    let backend = new OllamaBackend({ model: "gemma4:e4b", connectToolClients: async () => ({ comfyui: comfy }) });
+    chatScript.push([{ message: { content: "hi" }, done: true }]);
+    await collect(backend, turnsOf({ text: "hello" }));
+    let sys = chatRequests.at(-1)!.messages[0] as { role: string; content: string };
+    expect(sys.role).toBe("system");
+    expect(sys.content).toContain("CORRECTION");
+    expect(sys.content).toContain("DO NOT EXIST");
+
+    const { client: panel } = fakeMcpClient([{ name: "panel_run", description: "Run." }]);
+    backend = new OllamaBackend({ model: "gemma4:e4b", connectToolClients: async () => ({ comfyui: comfy, panel }) });
+    chatScript.push([{ message: { content: "hi" }, done: true }]);
+    await collect(backend, turnsOf({ text: "hello" }));
+    sys = chatRequests.at(-1)!.messages[0] as { role: string; content: string };
+    expect(sys.content).not.toContain("CORRECTION");
+  });
+});
