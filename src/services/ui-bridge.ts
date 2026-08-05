@@ -3093,7 +3093,7 @@ export class UiBridge {
       ctx.reject(
         markReplyTimeout(
           new Error(
-            `Panel tab ${conn.tabId.slice(0, 8)} did not reply to "${cmd.cmd}" within ${ctx.timeoutMs} ms — the ComfyUI tab may be backgrounded or frozen`,
+            `Panel tab ${conn.tabId} did not reply to "${cmd.cmd}" within ${ctx.timeoutMs} ms — the ComfyUI tab may be backgrounded or frozen`,
           ),
         ),
       );
@@ -3149,11 +3149,20 @@ export class UiBridge {
       // dispatched:true so a mutating caller (e.g. comfy_reboot readiness) treats it as an
       // accepted-but-unacked dispatch and verifies by observation, rather than mistaking a
       // genuinely-sent command for one that never went out (#509).
+      //
+      // #803 — name the FULL tab id, never the log-style 8-char slice. Routing tab
+      // ids are `wf:<path>` / `tmp:<key>`, so an 8-char slice renders EVERY workflow
+      // tab as the identical, alarming-looking `wf:workf`: two tabs timing out are
+      // indistinguishable in the transcript and the id reads like a corrupted key
+      // (it sent one diagnosis down a wrong path outright). Same call as the #709
+      // refusal above. `isAckTimeout`/`isReplyTimeoutError` both segment the id with
+      // a lazy `.+?` bounded by the fixed ` did not reply to "` delimiter, so a full
+      // id CONTAINING SPACES (`wf:workflows/Untitled 2026-08-04.json`) still matches.
       ctx.reject(
         markReplyTimeout(
           markDispatched(
             new Error(
-              `Panel tab ${conn.tabId.slice(0, 8)} did not reply to "${cmd.cmd}" within ${ctx.timeoutMs} ms — the ComfyUI tab may be backgrounded or frozen`,
+              `Panel tab ${conn.tabId} did not reply to "${cmd.cmd}" within ${ctx.timeoutMs} ms — the ComfyUI tab may be backgrounded or frozen`,
             ),
             true,
           ),
@@ -3332,6 +3341,29 @@ export class UiBridge {
    */
   refreshWorkflowUuid(tabId: string, workflowUuid: string): boolean {
     return this.refreshTabWorkflowUuid?.(tabId, workflowUuid) ?? false;
+  }
+
+  /**
+   * #770/#803 — READ the trusted command stamp currently fencing `tabId`, or
+   * `undefined` when this tab has none (no resolver injected, old panel, or an
+   * identity regression cleared it).
+   *
+   * Exists so a rebind can tell the three DIFFERENT answers apart instead of
+   * folding them into one verdict: "the fence was stale and has been replaced",
+   * "the fence already named the live canvas", and "there was never a fence to
+   * repair". Those have three different remedies, and reporting any of them as
+   * the others is how a recovery came to claim success it had not achieved.
+   *
+   * Never throws: the resolver is orchestrator-supplied, and a guard that can
+   * throw is not a guard.
+   */
+  workflowUuidFor(tabId: string): string | undefined {
+    try {
+      const uuid = this.resolveTabWorkflowUuid?.(tabId);
+      return typeof uuid === "string" && uuid.length > 0 ? uuid : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   /** The open DESKTOP tabs (non-headless primaries) for the mobile mirror picker. */
