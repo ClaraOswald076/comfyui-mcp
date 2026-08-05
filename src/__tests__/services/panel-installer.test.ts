@@ -37,6 +37,7 @@ import {
   findPanelShadows,
   looksLikePanelBackupName,
   readQueueCounts,
+  isProvenQuiescentQueue,
   PanelInstallError,
   PANEL_REGISTRY_ID,
   PANEL_VERSION,
@@ -915,18 +916,99 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
     expect(h.gitPulls).toEqual([]);
   });
 
-  it("incoherent queue signature (done>total) -> fallback REFUSED: not the proven empty queue, no merge", async () => {
+  it("#824: incoherent-but-idle queue signature (done>total) + HEAD at upstream → verified already-current, no stale-3.x claim", async () => {
     const h = makeDeps({
       comfyuiPath: COMFY,
       files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
       revs: { [dir]: REV_A },
       updateDetails: { total_count: 0, done_count: 2, in_progress_count: 0, pending_count: 0, is_processing: false },
+      onGitPull: () => "Already up to date.",
+    });
+    const r = await runPanelAction("update", h.deps);
+    // The pinned merge ran and found nothing to do — that IS the verification.
+    expect(h.gitPulls).toEqual([dir]);
+    expect(r.restartRequired).toBe(false);
+    expect(r.message).toMatch(/already at the upstream tip/);
+    // The cause named must be the incoherent counts, never the unproven stale-3.x no-op.
+    expect(r.message).toMatch(/incoherent/);
+    expect(r.message).not.toMatch(/stale legacy 3\.x/);
+    expect(r.result.message).toBe(r.message);
+  });
+
+  it("#824: the report's exact signature (total 0, done 1) + HEAD BEHIND upstream → pinned ff-only applies the update, verified", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      // The queue signature from the #824 report.
+      updateDetails: { total_count: 0, done_count: 1, in_progress_count: 0, pending_count: 0, is_processing: false },
+      upstreamRev: REV_B,
+      onGitPull: ({ files, revs }) => {
+        files[pyPath] = pyproject(PANEL_REGISTRY_ID, "0.11.35");
+        revs[dir] = REV_B;
+        return "Updating aaaaaaaa..bbbbbbbb\nFast-forward";
+      },
+    });
+    const r = await runPanelAction("update", h.deps);
+    expect(h.updates).toEqual([{ id: PANEL_REGISTRY_ID }]);
+    expect(h.gitPulls).toEqual([dir]);
+    expect(r.previousVersion).toBe("0.11.32");
+    expect(r.installedVersion).toBe("0.11.35");
+    expect(r.restartRequired).toBe(true);
+    expect(r.message).toMatch(/git merge --ff-only/);
+    expect(r.message).toMatch(/incoherent/);
+    expect(r.message).not.toMatch(/stale legacy 3\.x/);
+  });
+
+  it("#824: incoherent-but-idle signature on a v2 (Manager 4.x) host → verification still fires (its warrant is git's proof, not the Manager signature)", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: { total_count: 0, done_count: 1, in_progress_count: 0, pending_count: 0, is_processing: false },
+      dialect: "v2",
+      upstreamRev: REV_B,
+      onGitPull: ({ files, revs }) => {
+        files[pyPath] = pyproject(PANEL_REGISTRY_ID, "0.11.35");
+        revs[dir] = REV_B;
+        return "Updating aaaaaaaa..bbbbbbbb\nFast-forward";
+      },
+    });
+    const r = await runPanelAction("update", h.deps);
+    expect(h.gitPulls).toEqual([dir]);
+    expect(r.installedVersion).toBe("0.11.35");
+  });
+
+  it("#824: incoherent signature with live work NOT disproven (pending 1) → verification REFUSED, no git mutation", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: { total_count: 0, done_count: 1, in_progress_count: 0, pending_count: 1, is_processing: false },
       onGitPull: () => "merge output",
     });
     const err = await runPanelAction("update", h.deps).catch((e) => e);
     expect(err).toBeInstanceOf(PanelInstallError);
-    expect(String(err?.message ?? err)).toMatch(/did NOT apply|empty-queue signature/);
-    // An incoherent signature is a diagnostic, never proof: no git mutation.
+    expect(String(err?.message ?? err)).toMatch(/did NOT apply/);
+    expect(String(err?.message ?? err)).toMatch(/not disproven|provably idle/);
+    expect(h.gitPulls).toEqual([]);
+  });
+
+  it("#824: incoherent-but-idle signature + DIRTY checkout → verification REFUSED before any pull", async () => {
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: { total_count: 0, done_count: 1, in_progress_count: 0, pending_count: 0, is_processing: false },
+      gitStatus: " M web/js/comfyui-mcp-panel.js",
+      onGitPull: () => "merge output",
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    expect(String(err?.message ?? err)).toMatch(/UNCOMMITTED|dirty checkout/);
+    // The refusal must not assert the stale-3.x cause it cannot prove.
+    expect(String(err?.message ?? err)).toMatch(/incoherent/);
+    expect(String(err?.message ?? err)).not.toMatch(/stale legacy 3\.x/);
     expect(h.gitPulls).toEqual([]);
   });
 
@@ -2081,6 +2163,38 @@ describe("classifyPanelUpdate (#639 verification core)", () => {
     expect(looksLikeManagerNoOp({ total_count: 2, done_count: 2 })).toBe(false);
     expect(looksLikeManagerNoOp(undefined)).toBe(false); // no counts → not a proven no-op
     expect(looksLikeManagerNoOp("cm-cli text")).toBe(false);
+  });
+
+  it("isProvenQuiescentQueue requires all three LIVE indicators reported clear (#824)", () => {
+    // The #824 signature: historical counters contradict (done > total) but
+    // every live indicator is present and clear → provably idle.
+    expect(
+      isProvenQuiescentQueue({
+        total_count: 0,
+        done_count: 1,
+        pending_count: 0,
+        in_progress_count: 0,
+        is_processing: false,
+      }),
+    ).toBe(true);
+    // Live work reported → not quiescent.
+    expect(
+      isProvenQuiescentQueue({ pending_count: 1, in_progress_count: 0, is_processing: false }),
+    ).toBe(false);
+    expect(
+      isProvenQuiescentQueue({ pending_count: 0, in_progress_count: 1, is_processing: false }),
+    ).toBe(false);
+    expect(
+      isProvenQuiescentQueue({ pending_count: 0, in_progress_count: 0, is_processing: true }),
+    ).toBe(false);
+    // A missing/malformed live field is UNPROVEN, never a default-safe zero.
+    expect(isProvenQuiescentQueue({ pending_count: 0, in_progress_count: 0 })).toBe(false);
+    expect(isProvenQuiescentQueue({ total_count: 0, done_count: 0 })).toBe(false);
+    expect(
+      isProvenQuiescentQueue({ pending_count: "0", in_progress_count: 0, is_processing: false }),
+    ).toBe(false);
+    expect(isProvenQuiescentQueue(undefined)).toBe(false);
+    expect(isProvenQuiescentQueue("cm-cli text")).toBe(false);
   });
 
   it("readQueueCounts ignores non-object details", () => {

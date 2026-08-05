@@ -262,10 +262,13 @@ export interface PanelInstallerDeps {
   readPin: () => PanelPinState;
   /**
    * Detect the connected Manager's API dialect ("legacy" 3.x | "v2"/"v2-batch" v4).
-   * The #724 git fallback fires ONLY on "legacy": an empty-queue signature is
-   * indistinguishable from an outage/failed enqueue on other dialects, and a git
-   * mutation is only warranted on the PROVEN stale-3.x host (codex gate). Default
-   * is the real detectManagerApi; tests stub it.
+   * Consulted ONLY on the proven legacy empty-queue signature (#724): that
+   * signature means "stale Manager 3.x" solely on a legacy host — on a v4 host
+   * (or unproven) it is an outage/failed enqueue and does not authorize the
+   * git fallback (codex gate). The #824 path (incoherent-but-provably-idle
+   * counts) does NOT consult it: that verification's warrant is the checkout's
+   * own git state, so the dialect is irrelevant there. Default is the real
+   * detectManagerApi; tests stub it.
    */
   detectManagerDialect?: ((base?: string) => Promise<"v2" | "v2-batch" | "legacy" | undefined>) | undefined;
   /** Is the target ComfyUI reachable right now? Never throws. */
@@ -2039,6 +2042,23 @@ export function isProvenLegacyEmptyQueue(details: unknown): boolean {
   return true;
 }
 
+/**
+ * #824 — the LIVE queue-idle proof. pending_count, in_progress_count and
+ * is_processing are the Manager's live work indicators, unlike total/done,
+ * which are historical drain counters and can contradict each other (the
+ * incoherent done > total signature). All three must be PRESENT and report no
+ * queued or running work — a missing field is unproven, never a default-safe
+ * zero (the same discipline as isProvenLegacyEmptyQueue). A provably idle
+ * queue means no Manager task is in flight against the checkout, so a direct
+ * git verification (fetch + compare, then a pinned fast-forward when behind)
+ * races nothing the Manager is doing, and its warrant comes from the
+ * checkout's own state rather than from any Manager signature.
+ */
+export function isProvenQuiescentQueue(details: unknown): boolean {
+  const c = readQueueCounts(details);
+  return c.pending === 0 && c.inProgress === 0 && c.processing === false;
+}
+
 export type UpdateOutcome =
   | "updated" // version OR git-HEAD moved on disk → the update definitely applied.
   | "downgraded" // the version PROVABLY went backwards — applied, but not an update.
@@ -2269,12 +2289,16 @@ function finalizeUpdate(
 }
 
 /**
- * The #724 fallback for the update path: ComfyUI-Manager provably no-op'd the
- * update (the stale legacy-3.x signature), but the panel dir is a REAL git
- * checkout — so update it without the Manager, exactly like the manual
- * workaround from the issue (`git pull --ff-only` in the panel repo), then run
+ * The #724/#824 fallback for the update path: the Manager produced no usable
+ * verdict — either it provably no-op'd the update (the stale legacy-3.x
+ * signature) or its drained-queue counts are incoherent yet provably idle
+ * (#824) — and the panel dir is a REAL git checkout. Update it (or prove it
+ * already current) without the Manager, exactly like the manual workaround
+ * from the issues (`git pull --ff-only` in the panel repo), then run
  * the SAME #639 verification over the result (fresh on-disk re-read, #641
  * shadow scan, proven movement) rather than trusting git's output text.
+ * Every message narrates the caller-supplied `managerReason`, so the cause
+ * asserted is the one the caller actually proved — never a guessed one.
  *
  * Two refusals guard the pull itself:
  *  - DIRTY WORKTREE: a fast-forward only refuses local edits it OVERLAPS, so
@@ -2327,13 +2351,22 @@ async function updateViaGitCheckoutFallback(opts: {
   previousRev?: string;
   result: NodeOpResult;
   /**
+   * The Manager-side clause every message here narrates around — WHY the
+   * Manager path produced no usable verdict (e.g. the proven stale-3.x silent
+   * no-op, or an incoherent drained-queue signature). A bucket narrated as a
+   * cause is the defect class this repo keeps shipping, so the caller — which
+   * knows what the Manager actually reported — supplies the words rather than
+   * this helper asserting a cause it cannot prove.
+   */
+  managerReason: string;
+  /**
    * Refuse if the orchestrator retargeted mid-operation. This helper MUTATES a
    * checkout and then reports the result, so both must belong to the ComfyUI the
    * request was made for — see the note on runPanelActionInner's binding.
    */
   assertSameTarget: (stage: string) => void;
 }): Promise<PanelActionResult> {
-  const { deps, dir, previousVersion, previousRev, result, assertSameTarget } = opts;
+  const { deps, dir, previousVersion, previousRev, result, managerReason, assertSameTarget } = opts;
 
   // PRE-PULL REVISION GATE — the post-Manager detection's HEAD must be
   // readable before we mutate. An unreadable revision at this point means the
@@ -2363,8 +2396,7 @@ async function updateViaGitCheckoutFallback(opts: {
     worktreeRoot = deps.gitWorktreeRoot(dir);
   } catch (err) {
     throw new PanelInstallError(
-      `Panel update did NOT apply: ComfyUI-Manager never enqueued the update (the ` +
-        `stale legacy 3.x silent no-op, #639/#724), and the git fallback is ` +
+      `Panel update did NOT apply: ${managerReason}, and the git fallback is ` +
         `REFUSED: could not prove ${dir} is the panel repo's worktree root (git ` +
         `rev-parse failed — ${err instanceof Error ? err.message : String(err)}). ` +
         `Update the panel repo manually, then RESTART ComfyUI.`,
@@ -2387,8 +2419,7 @@ async function updateViaGitCheckoutFallback(opts: {
     porcelain = deps.gitStatusPorcelain(dir).trim();
   } catch (err) {
     throw new PanelInstallError(
-      `Panel update did NOT apply: ComfyUI-Manager never enqueued the update (the ` +
-        `stale legacy 3.x silent no-op, #639/#724), and the git fallback is ` +
+      `Panel update did NOT apply: ${managerReason}, and the git fallback is ` +
         `REFUSED: could not confirm the panel repo at ${dir} is clean (git ` +
         `status failed — ${err instanceof Error ? err.message : String(err)}). ` +
         `Update the panel repo manually (git pull in ${dir}), then RESTART ComfyUI.`,
@@ -2401,10 +2432,9 @@ async function updateViaGitCheckoutFallback(opts: {
         `${porcelain}\ncomfyui-mcp never mutates a dirty checkout — a ` +
         `fast-forward could carry or clobber that local state. Commit, stash, or ` +
         `discard the changes (or update the panel repo manually), then retry. ` +
-        `(ComfyUI-Manager also no-op'd this update — the stale legacy 3.x ` +
-        `signature, #639/#724 — so updating it on the host restores the Manager ` +
-        `path: git pull in custom_nodes/ComfyUI-Manager, or pip install -U ` +
-        `comfyui_manager.)`,
+        `(The Manager path also produced no update here — ${managerReason} — so ` +
+        `updating ComfyUI-Manager on the host restores that path: git pull in ` +
+        `custom_nodes/ComfyUI-Manager, or pip install -U comfyui_manager.)`,
     );
   }
 
@@ -2419,8 +2449,7 @@ async function updateViaGitCheckoutFallback(opts: {
     targetRev = deps.gitUpstreamRev(dir);
   } catch (err) {
     throw new PanelInstallError(
-      `Panel update did NOT apply: ComfyUI-Manager never enqueued the update (the ` +
-        `stale legacy 3.x silent no-op, #639/#724), and the git fallback is ` +
+      `Panel update did NOT apply: ${managerReason}, and the git fallback is ` +
         `REFUSED: could not fetch/resolve the upstream revision for ${dir} ` +
         `(${err instanceof Error ? err.message : String(err)}). Update the ` +
         `panel repo manually (git pull in ${dir}), then RESTART ComfyUI.`,
@@ -2437,8 +2466,7 @@ async function updateViaGitCheckoutFallback(opts: {
     ignoredConflicts = deps.gitIgnoredPullConflicts(dir, targetRev);
   } catch (err) {
     throw new PanelInstallError(
-      `Panel update did NOT apply: ComfyUI-Manager never enqueued the update (the ` +
-        `stale legacy 3.x silent no-op, #639/#724), and the git fallback is ` +
+      `Panel update did NOT apply: ${managerReason}, and the git fallback is ` +
         `REFUSED: could not prove the pull would not silently overwrite ignored ` +
         `local files in ${dir} (${err instanceof Error ? err.message : String(err)}). ` +
         `Update the panel repo manually (git pull in ${dir}), then RESTART ComfyUI.`,
@@ -2452,8 +2480,8 @@ async function updateViaGitCheckoutFallback(opts: {
         `file(s) in ${dir} would be SILENTLY OVERWRITTEN by the fast-forward ` +
         `(git protects untracked files from checkout, but not ignored ones): ` +
         `${shown}${more}. Move or delete them (or git add them), then retry — ` +
-        `or update the panel repo manually. (ComfyUI-Manager also no-op'd this ` +
-        `update — the stale legacy 3.x signature, #639/#724.)`,
+        `or update the panel repo manually. (The Manager path produced no ` +
+        `update here — ${managerReason}.)`,
     );
   }
 
@@ -2462,11 +2490,10 @@ async function updateViaGitCheckoutFallback(opts: {
     assertSameTarget("before fast-forwarding the panel checkout");
     gitOutput = deps.gitMergeFfOnly(dir, targetRev);
   } catch (err) {
-    // The Manager no-op'd AND the direct merge failed — name both, truthfully.
+    // The Manager path failed AND the direct merge failed — name both, truthfully.
     throw new PanelInstallError(
       `Panel update did NOT apply: nothing changed on disk at ${dir} (installed ` +
-        `version still ${previousVersion ?? "unknown"}). ComfyUI-Manager never ` +
-        `enqueued the update (the stale legacy 3.x silent no-op, #639/#724), and ` +
+        `version still ${previousVersion ?? "unknown"}). ${managerReason}, and ` +
         `the direct git fallback on the panel repo failed too — ` +
         `${err instanceof Error ? err.message : String(err)}. ` +
         `Fix: update ComfyUI-Manager on the host (git pull in custom_nodes/` +
@@ -2544,9 +2571,8 @@ async function updateViaGitCheckoutFallback(opts: {
     assertSameTarget("before reporting the fast-forward");
     const fallbackMessage =
       `Panel updated (${from} → ${to}) via a pinned git merge --ff-only on the panel repo ` +
-      `(${dir}), verified on disk: ComfyUI-Manager no-op'd the update (stale ` +
-      `legacy 3.x, #724), so the update was applied directly from git. RESTART ` +
-      `ComfyUI to load the updated panel node.`;
+      `(${dir}), verified on disk: ${managerReason}, so the update was applied ` +
+      `directly from git. RESTART ComfyUI to load the updated panel node.`;
     const honestResult = { ...result, message: fallbackMessage };
     return {
       action: "update",
@@ -2584,10 +2610,10 @@ async function updateViaGitCheckoutFallback(opts: {
   // report never credits the Manager for a verification git did (codex gate).
   assertSameTarget("before reporting the checkout as current");
   const atTipMessage =
-    `Panel is already at the upstream tip (${post.version}) — ComfyUI-Manager ` +
-    `no-op'd the update (stale legacy 3.x, #724), but a pinned git merge ` +
-    `--ff-only on ${dir} verified the checkout is current (git: ` +
-    `${gitOutput || "no output"}). Nothing changed on disk; no restart needed.`;
+    `Panel is already at the upstream tip (${post.version}) — ${managerReason}, ` +
+    `but a pinned git merge --ff-only on ${dir} verified the checkout is ` +
+    `current (git: ${gitOutput || "no output"}). Nothing changed on disk; no ` +
+    `restart needed.`;
   return {
     action: "update",
     result: { ...result, message: atTipMessage },
@@ -5079,6 +5105,7 @@ async function runPanelActionCore(
           previousVersion: freshVersion,
           previousRev: freshRev,
           assertSameTarget,
+          managerReason,
           // Synthesize the shape the fallback reports around; there is no real
           // Manager result because the Manager call failed.
           result: {
@@ -5154,59 +5181,82 @@ async function runPanelActionCore(
       assertSameTarget("before reporting the update verdict");
       return finalizeUpdate(verdict, post, result); // throws, honestly
     }
-    // #724 — the Manager PROVABLY no-op'd (the stale legacy-3.x signature), and
+    // #724/#824 — the Manager produced no usable verdict (the proven stale
+    // legacy-3.x no-op, OR an incoherent-but-provably-idle drained queue), and
     // the panel dir is a real git checkout (a pre-op HEAD resolved; a registry
     // zip has no .git, and a dev symlink was refused above). The verified
-    // Manager path is a dead end on that host tier, so fall back to
+    // Manager path is a dead end here, so fall back to
     // a pinned `git merge --ff-only` on the panel repo and verify THAT the same way
     // instead of only surfacing the error.
     if (verdict.outcome === "no-op" && previousRev && post.dir) {
-      // SIGNATURE GATE — only the PROVEN empty queue (total 0 AND done 0,
-      // nothing pending/in-progress, not processing) authorizes a git
-      // mutation. The broader no-op signature also matches incoherent counts
-      // (done > total): a malformed or contradictory response is a failure
-      // diagnostic, never proof of the stale-3.x state this fallback exists
-      // to repair (codex gate).
-      if (!isProvenLegacyEmptyQueue(result.details)) {
-        const c = readQueueCounts(result.details);
-        throw new PanelInstallError(
-          `Panel update did NOT apply: nothing changed on disk, and the Manager's ` +
-          `queue counts are NOT the proven legacy-3.x empty-queue signature ` +
-          `(need total 0 AND done 0 with nothing pending/in-progress; got ` +
-          `total=${c.total ?? "?"}, done=${c.done ?? "?"}, pending=${c.pending ?? "?"}, ` +
-          `in_progress=${c.inProgress ?? "?"}) — the git fallback does not fire on ` +
-          `an incoherent or partial signature. Update ComfyUI-Manager on the host ` +
-          `and retry, or update the panel repo manually (git pull in ${post.dir}), ` +
-          `then RESTART ComfyUI.`,
-        );
-      }
-      // DIALECT GATE — the empty-queue signature only MEANS "stale Manager 3.x"
-      // on a legacy host. On a v4 host (or with the dialect unproven) the same
-      // signature is an outage/failed enqueue, and a git mutation is not
-      // warranted (codex gate): report the unverified no-op instead of pulling.
-      // Probe the dialect of the SAME Manager the update call used — the
-      // base travels back on the result (a mid-op retarget must not let a
-      // v2-host outage read as 'legacy' from another endpoint, codex gate).
-      let dialect: string | undefined;
-      if (deps.detectManagerDialect) {
-        dialect = await deps.detectManagerDialect(result.managerBase);
-      } else {
-        try {
-          const { detectManagerApi } = await import("./node-management.js");
-          dialect = await detectManagerApi(result.managerBase);
-        } catch {
-          dialect = undefined;
+      const c = readQueueCounts(result.details);
+      const provenLegacyEmptyQueue = isProvenLegacyEmptyQueue(result.details);
+      // The Manager-side clause every fallback message narrates around — the
+      // caller knows what the Manager actually reported; the fallback must not
+      // assert the stale-3.x cause for a signature that doesn't prove it.
+      const managerReason = provenLegacyEmptyQueue
+        ? `ComfyUI-Manager never enqueued the update (the stale legacy 3.x silent no-op, #639/#724)`
+        : `ComfyUI-Manager's drained-queue counts are incoherent (total=` +
+          `${c.total ?? "?"}, done=${c.done ?? "?"}, pending=${c.pending ?? "?"}, ` +
+          `in_progress=${c.inProgress ?? "?"}) and can neither confirm nor explain the no-op`;
+      if (!provenLegacyEmptyQueue) {
+        // #824 — SIGNATURE GATE, second form. An incoherent/partial signature
+        // (e.g. total 0, done 1) is not proof of the stale-3.x no-op, so it
+        // cannot authorize a git mutation ON THAT PREMISE. But the no-op
+        // verdict still has two truthfully different meanings — "already at
+        // the upstream tip" vs "behind, the update genuinely did not apply" —
+        // and a clean, corroborated git checkout can distinguish them DIRECTLY
+        // (fetch + compare, then a pinned ff-only when behind), independent of
+        // what the Manager claimed. That verification is only safe when the
+        // queue is PROVABLY idle (pending/in-progress/is-processing all
+        // reported clear): with live Manager work not disproven, a direct git
+        // operation could race a task still writing to the checkout, so refuse.
+        if (!isProvenQuiescentQueue(result.details)) {
+          throw new PanelInstallError(
+            `Panel update did NOT apply: nothing changed on disk, and the Manager's ` +
+              `queue counts are neither the proven legacy-3.x empty-queue signature ` +
+              `nor provably idle (got total=${c.total ?? "?"}, done=${c.done ?? "?"}, ` +
+              `pending=${c.pending ?? "?"}, in_progress=${c.inProgress ?? "?"}, ` +
+              `is_processing=${c.processing ?? "?"}) — with live Manager work not ` +
+              `disproven, a direct git verification could race a task still in ` +
+              `flight, so the git fallback does not fire. Update ComfyUI-Manager ` +
+              `on the host and retry, or update the panel repo manually (git pull ` +
+              `in ${post.dir}), then RESTART ComfyUI.`,
+          );
         }
-      }
-      if (dialect !== "legacy") {
-        throw new PanelInstallError(
-          `Panel update did NOT apply: nothing changed on disk, and the Manager's ` +
-            `API dialect here is ${dialect ?? "unproven"}, NOT the legacy 3.x whose ` +
-            `silent no-op this matches (#724) — so the git fallback does not fire ` +
-            `(an empty queue on this host is an outage or a failed enqueue, not the ` +
-            `stale-3.x signature). Update ComfyUI-Manager on the host and retry, or ` +
-            `update the panel repo manually (git pull in ${post.dir}), then RESTART ComfyUI.`,
-        );
+        // The DIALECT gate below is skipped on purpose: the git verification's
+        // warrant comes from the checkout's own state (clean, corroborated,
+        // behind-or-at-tip proven against the fetched upstream), not from any
+        // Manager signature, so the Manager's API dialect is irrelevant to it.
+      } else {
+        // DIALECT GATE — the empty-queue signature only MEANS "stale Manager 3.x"
+        // on a legacy host. On a v4 host (or with the dialect unproven) the same
+        // signature is an outage/failed enqueue, and a git mutation is not
+        // warranted (codex gate): report the unverified no-op instead of pulling.
+        // Probe the dialect of the SAME Manager the update call used — the
+        // base travels back on the result (a mid-op retarget must not let a
+        // v2-host outage read as 'legacy' from another endpoint, codex gate).
+        let dialect: string | undefined;
+        if (deps.detectManagerDialect) {
+          dialect = await deps.detectManagerDialect(result.managerBase);
+        } else {
+          try {
+            const { detectManagerApi } = await import("./node-management.js");
+            dialect = await detectManagerApi(result.managerBase);
+          } catch {
+            dialect = undefined;
+          }
+        }
+        if (dialect !== "legacy") {
+          throw new PanelInstallError(
+            `Panel update did NOT apply: nothing changed on disk, and the Manager's ` +
+              `API dialect here is ${dialect ?? "unproven"}, NOT the legacy 3.x whose ` +
+              `silent no-op this matches (#724) — so the git fallback does not fire ` +
+              `(an empty queue on this host is an outage or a failed enqueue, not the ` +
+              `stale-3.x signature). Update ComfyUI-Manager on the host and retry, or ` +
+              `update the panel repo manually (git pull in ${post.dir}), then RESTART ComfyUI.`,
+          );
+        }
       }
 
       // Bind the fallback to ONE directory: the git proof (previousRev) belongs
@@ -5216,8 +5266,7 @@ async function runPanelActionCore(
       // pulling there could mutate a repo we never proved, so refuse.
       if (!detection.dir || !samePathCI(detection.dir, post.dir, deps)) {
         throw new PanelInstallError(
-          `Panel update did NOT apply: ComfyUI-Manager never enqueued the update ` +
-            `(the stale legacy 3.x silent no-op, #639/#724), and the git fallback ` +
+          `Panel update did NOT apply: ${managerReason}, and the git fallback ` +
             `is REFUSED: the panel dir re-detected after the Manager call ` +
             `(${post.dir}) is not the checkout the pre-update git proof belongs ` +
             `to (${detection.dir ?? "unresolved"}). Pulling it could mutate the ` +
@@ -5227,18 +5276,14 @@ async function runPanelActionCore(
       }
       // Same corroboration the ZIP swap demands: a DIRECT mutation must act on
       // a tree the running server named, not merely on a configured one (#766).
-      assertSwapTreeCorroborated(
-        deps,
-        comfyPath,
-        "the git fallback",
-        "ComfyUI-Manager never enqueued the update (the stale legacy 3.x silent no-op)",
-      );
+      assertSwapTreeCorroborated(deps, comfyPath, "the git fallback", managerReason);
       return updateViaGitCheckoutFallback({
         deps,
         dir: detection.dir,
         previousVersion,
         previousRev,
         result,
+        managerReason,
         assertSameTarget,
       });
     }
