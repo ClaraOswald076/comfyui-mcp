@@ -280,14 +280,6 @@ const CATALOG_LOCK_WAIT_MS = 2_000;
  *  safe (see there). */
 const CATALOG_LOCK_STALE_MS = 30_000;
 
-/**
- * A reclaim CLAIM is held for a few syscalls. One this old belongs to a
- * reclaimer that died mid-decision, and leaving it would disable reclaim for
- * good. Sweeping one wrongly costs only the serialization it provides — i.e.
- * the behaviour before that serialization existed — never a stolen lock.
- */
-const CATALOG_RECLAIM_CLAIM_STALE_MS = 60_000;
-
 /** Cross-platform pid liveness. EPERM means a process with that number EXISTS
  *  and is simply not ours to signal — alive, not dead. Reading it as dead is
  *  what would let a live holder's lock be reclaimed out from under it. */
@@ -306,31 +298,103 @@ function napSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-/** Whoever holds the lock, as far as the file can say. An unreadable or
- *  truncated record names NO holder — which is not evidence of an abandoned
- *  lock, only an absence of evidence: the age check below is what licenses a
- *  reclaim. */
-function readCatalogLockPid(lockPath: string): number | undefined {
+/** Whoever holds a lock or claim, as far as the file can say. An unreadable or
+ *  truncated record names NO holder — which is not evidence of abandonment,
+ *  only an absence of evidence, and nothing here may act on it as if it were
+ *  the former. */
+function readLockRecord(path: string): { pid?: number; token?: string } {
   try {
-    const rec = JSON.parse(readFileSync(lockPath, "utf-8")) as { pid?: unknown };
-    return typeof rec.pid === "number" ? rec.pid : undefined;
+    const rec = JSON.parse(readFileSync(path, "utf-8")) as { pid?: unknown; token?: unknown };
+    return {
+      pid: typeof rec.pid === "number" ? rec.pid : undefined,
+      token: typeof rec.token === "string" ? rec.token : undefined,
+    };
   } catch {
-    return undefined;
+    return {};
   }
 }
 
+/** The bytes that make a lock or claim attributable. */
+function lockRecordBytes(token: string): string {
+  return JSON.stringify({ pid: process.pid, token, at: new Date().toISOString() });
+}
+
 /**
- * Sweep a reclaim claim whose holder died mid-decision. Only the exact instance
- * observed, and only when it is far older than the few syscalls a claim covers.
+ * Take the reclaim claim that serializes reclaimers, or answer undefined.
+ *
+ * A dead claimant's claim is removed by the SAME rule as the main lock — a
+ * recorded pid that is provably not running — and by no other. An age rule here
+ * would be the fold the main lock just stopped committing, one level down: a
+ * reclaimer paused inside its claim is not a dead one, and deleting its claim
+ * lets a second reclaimer run concurrently, which is the sequence the claim
+ * exists to prevent.
+ *
+ * WHERE THE REGRESS STOPS: two processes may still remove the same DEAD claim
+ * and reclaim concurrently. That is exactly the behaviour before this claim
+ * existed — the claim narrows a race, it never grants an authority — so it does
+ * not need a claim of its own.
  */
-function sweepStaleReclaimClaim(claimPath: string): void {
+function takeReclaimClaim(claimPath: string): string | undefined {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const token = randomUUID();
+    try {
+      const fd = openSync(claimPath, "wx");
+      try {
+        try {
+          writeFileSync(fd, lockRecordBytes(token));
+        } finally {
+          closeSync(fd);
+        }
+      } catch (initErr) {
+        // A claim nothing can attribute is one no later reclaimer can ever
+        // prove dead — remove our own husk rather than create that state.
+        try {
+          rmSync(claimPath, { force: true });
+        } catch {
+          // The init failure is the one that matters.
+        }
+        throw initErr;
+      }
+      return token;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") return undefined;
+      if (!removeDeadReclaimClaim(claimPath)) return undefined;
+    }
+  }
+  return undefined;
+}
+
+/** Remove a reclaim claim only when its recorded owner is provably gone. */
+function removeDeadReclaimClaim(claimPath: string): boolean {
+  let observed: number;
   try {
-    const observed = statSync(claimPath).mtimeMs;
-    if (Date.now() - observed < CATALOG_RECLAIM_CLAIM_STALE_MS) return;
-    if (statSync(claimPath).mtimeMs !== observed) return;
+    observed = statSync(claimPath).mtimeMs;
+  } catch {
+    return true; // already gone
+  }
+  if (Date.now() - observed < CATALOG_LOCK_STALE_MS) return false;
+  const { pid } = readLockRecord(claimPath);
+  if (pid === undefined || catalogLockOwnerAlive(pid)) return false;
+  try {
+    // Only the exact instance judged: a claim taken in the gap is brand new, so
+    // its mtime cannot match one already CATALOG_LOCK_STALE_MS old.
+    if (statSync(claimPath).mtimeMs !== observed) return false;
+    rmSync(claimPath, { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Give up the reclaim claim this call took — and only that one. */
+function releaseReclaimClaim(claimPath: string, token: string): void {
+  const holder = readLockRecord(claimPath).token;
+  if (holder !== undefined && holder !== token) return; // a later reclaimer's
+  try {
     rmSync(claimPath, { force: true });
   } catch {
-    // Gone, replaced, or unreadable — a claim is advisory; leave it.
+    // It records this process's pid, so it clears when this process exits —
+    // and until then reclaim is merely serialized behind it, not blocked.
   }
 }
 
@@ -366,24 +430,15 @@ function sweepStaleReclaimClaim(claimPath: string): void {
  */
 function reclaimAbandonedCatalogLock(lockPath: string): boolean {
   const claimPath = `${lockPath}.reclaim`;
-  try {
-    closeSync(openSync(claimPath, "wx"));
-  } catch (err) {
-    // Another reclaimer is deciding right now, or the claim cannot be created
-    // at all. Either way, acting concurrently is the thing that breaks
-    // exclusion — wait instead.
-    if ((err as NodeJS.ErrnoException)?.code === "EEXIST") sweepStaleReclaimClaim(claimPath);
-    return false;
-  }
+  // Another reclaimer is deciding right now, or the claim cannot be created at
+  // all. Either way, acting concurrently is the thing that breaks exclusion —
+  // wait instead.
+  const claim = takeReclaimClaim(claimPath);
+  if (claim === undefined) return false;
   try {
     return reclaimUnderClaim(lockPath);
   } finally {
-    try {
-      rmSync(claimPath, { force: true });
-    } catch {
-      // Best effort; a leftover claim only costs reclaim serialization, and
-      // sweepStaleReclaimClaim clears it.
-    }
+    releaseReclaimClaim(claimPath, claim);
   }
 }
 
@@ -396,7 +451,7 @@ function reclaimUnderClaim(lockPath: string): boolean {
   }
   const ageMs = Date.now() - observed;
   if (ageMs < CATALOG_LOCK_STALE_MS) return false;
-  const pid = readCatalogLockPid(lockPath);
+  const { pid } = readLockRecord(lockPath);
   if (pid === undefined || catalogLockOwnerAlive(pid)) return false;
 
   const aside = `${lockPath}.stale-${randomUUID()}`;
@@ -442,6 +497,38 @@ function reclaimUnderClaim(lockPath: string): boolean {
   return false;
 }
 
+/**
+ * Locks THIS process created and could not remove — a transient rmSync failure
+ * (a scanner holding the handle open on Windows, say) after the write itself
+ * completed and was reported as saved.
+ *
+ * Nothing else can ever clear one: reclaim requires a provably dead owner, and
+ * the owner is this very process, alive. So without this the next write refuses,
+ * and so does every write after it, for the life of the server. The token is
+ * what makes clearing it provable rather than assumed — it identifies the file
+ * at the path as the lock this process already finished with.
+ */
+const unreleasedOwnLocks = new Map<string, string>();
+
+/** Retry removing a lock this process took and failed to release. */
+function dropOwnUnreleasedLock(lockPath: string): boolean {
+  const token = unreleasedOwnLocks.get(lockPath);
+  if (token === undefined) return false;
+  if (readLockRecord(lockPath).token !== token) {
+    // Somebody else's lock is at the path now, so ours is long gone.
+    unreleasedOwnLocks.delete(lockPath);
+    return false;
+  }
+  try {
+    rmSync(lockPath, { force: true });
+    unreleasedOwnLocks.delete(lockPath);
+    logger.warn(`[lora-catalog] cleared this process's own unreleased write lock at ${lockPath}.`);
+    return true;
+  } catch {
+    return false; // still stuck — the caller reports the refusal
+  }
+}
+
 /** Take the catalog write lock, or THROW. Refuse-vs-disclose: nothing has been
  *  written yet, so a failure here refuses the change outright and says so. */
 function acquireCatalogLock(path: string): { lockPath: string; token: string } {
@@ -454,7 +541,7 @@ function acquireCatalogLock(path: string): { lockPath: string; token: string } {
       const fd = openSync(lockPath, "wx");
       try {
         try {
-          writeFileSync(fd, JSON.stringify({ pid: process.pid, token, at: new Date().toISOString() }));
+          writeFileSync(fd, lockRecordBytes(token));
         } finally {
           closeSync(fd);
         }
@@ -481,6 +568,9 @@ function acquireCatalogLock(path: string): { lockPath: string; token: string } {
             `(${err instanceof Error ? err.message : String(err)}). This change was NOT saved.`,
         );
       }
+      // Ours from a failed release, before anything else: it is the one state
+      // reclaim can never resolve, because this process is alive.
+      if (dropOwnUnreleasedLock(lockPath)) continue;
       if (reclaimAbandonedCatalogLock(lockPath)) continue;
       if (Date.now() >= deadline) {
         // Reclaim deliberately refuses the two states a pid cannot settle (no
@@ -488,7 +578,7 @@ function acquireCatalogLock(path: string): { lockPath: string; token: string } {
         // there means two writers and a silent loss. So the refusal has to hand
         // over what it DOES know: a person can settle in one look what this
         // process cannot settle at all.
-        const pid = readCatalogLockPid(lockPath);
+        const { pid } = readLockRecord(lockPath);
         let ageNote = "";
         try {
           ageNote = ` (${Math.round((Date.now() - statSync(lockPath).mtimeMs) / 1000)}s old)`;
@@ -520,13 +610,7 @@ function releaseCatalogLock(lockPath: string, token: string): void {
   // taken and replaced. The token check makes that reasoning checkable instead
   // of assumed: if what is at the path is somehow not ours, leave it alone
   // rather than free a path another writer owns.
-  let holder: string | undefined;
-  try {
-    holder = (JSON.parse(readFileSync(lockPath, "utf-8")) as { token?: string }).token;
-  } catch {
-    // Unreadable: no other writer could have put it there (see above), and
-    // leaving it would stall every write for CATALOG_LOCK_STALE_MS.
-  }
+  const holder = readLockRecord(lockPath).token;
   if (holder !== undefined && holder !== token) {
     logger.warn(
       `[lora-catalog] the write lock at ${lockPath} is no longer the one this write took; ` +
@@ -536,11 +620,17 @@ function releaseCatalogLock(lockPath: string, token: string): void {
   }
   try {
     rmSync(lockPath, { force: true });
+    unreleasedOwnLocks.delete(lockPath);
   } catch (err) {
+    // NOT "it will age out": reclaim requires a provably dead owner and this
+    // process is alive, so nothing external will ever clear this. Remember it
+    // instead, and let the next write in this process clear it on the token —
+    // otherwise one transient failure refuses every catalog write from here on.
+    unreleasedOwnLocks.set(lockPath, token);
     logger.warn(
       `[lora-catalog] could not release the write lock at ${lockPath} ` +
-        `(${err instanceof Error ? err.message : String(err)}). Catalog writes will wait ` +
-        `and then refuse until it is removed or ages out.`,
+        `(${err instanceof Error ? err.message : String(err)}). The write itself is saved; ` +
+        `the next catalog write will clear this lock.`,
     );
   }
 }
