@@ -2723,12 +2723,41 @@ async function updateViaGitCheckoutFallback(opts: {
     assertSameTarget("before fast-forwarding the panel checkout");
     gitOutput = deps.gitMergeFfOnly(dir, targetRev);
   } catch (err) {
-    // The Manager path failed AND the direct merge failed — name both, truthfully.
+    // The Manager path failed AND the direct merge failed — name both,
+    // truthfully. "Truthfully" is the whole point of the re-read below: a
+    // failed `merge --ff-only` USUALLY leaves the tree exactly as it was, but
+    // "usually" is not "provably", and the very thing most likely to make it
+    // fail here is another writer landing in this checkout — which by
+    // definition already changed it. Asserting "nothing changed on disk" from
+    // the merge's exit status alone would be a bucket ("the merge failed")
+    // narrated as a fact about the disk (codex gate). So OBSERVE it: report
+    // unchanged only when a fresh read says so, report what moved when it did,
+    // and say UNKNOWN when the read itself fails.
+    let treeNote: string;
+    try {
+      const afterRev = deps.gitRevision(dir);
+      const afterPorcelain = deps.gitStatusPorcelain(dir).trim();
+      treeNote =
+        afterRev === prePullRev && afterPorcelain === ""
+          ? `The checkout was re-read afterwards and is unchanged (HEAD still ` +
+            `${prePullRev.slice(0, 8)}, worktree clean), so the installed version is ` +
+            `still ${previousVersion ?? "unknown"}.`
+          : `The checkout was re-read afterwards and is NOT what it was before the ` +
+            `attempt — ` +
+            `${afterRev !== prePullRev ? `HEAD is ${afterRev ? afterRev.slice(0, 8) : "unreadable"}, not ${prePullRev.slice(0, 8)}` : `the worktree is dirty:\n${afterPorcelain}`}. ` +
+            `Something changed ${dir}; inspect it (git status / git log) before ` +
+            `retrying, and do NOT assume the pre-update state.`;
+    } catch (readErr) {
+      treeNote =
+        `The checkout could not be re-read afterwards ` +
+        `(${readErr instanceof Error ? readErr.message : String(readErr)}), so ` +
+        `whether anything changed in ${dir} is UNKNOWN — inspect it (git status / ` +
+        `git log) before retrying.`;
+    }
     throw new PanelInstallError(
-      `Panel update did NOT apply: nothing changed on disk at ${dir} (installed ` +
-        `version still ${previousVersion ?? "unknown"}). ${managerReason}, and ` +
-        `the direct git fallback on the panel repo failed too — ` +
-        `${err instanceof Error ? err.message : String(err)}. ` +
+      `Panel update did NOT apply: ${managerReason}, and the direct git fallback ` +
+        `on the panel repo failed too — ` +
+        `${err instanceof Error ? err.message : String(err)}. ${treeNote} ` +
         `Fix: update ComfyUI-Manager on the host (git pull in custom_nodes/` +
         `ComfyUI-Manager, or pip install -U comfyui_manager) and retry, or update ` +
         `the panel repo manually (git pull in ${dir}), then RESTART ComfyUI.`,
@@ -2898,11 +2927,19 @@ async function updateViaGitCheckoutFallback(opts: {
   // from the Manager call that no-op'd — override its message too, so the
   // report never credits the Manager for a verification git did (codex gate).
   assertSameTarget("before reporting the checkout as current");
+  // Scope the closing claim to what was actually established. HEAD equalling
+  // the FETCHED upstream proves the tracked checkout is current; it does not
+  // prove the directory was untouched — `git status --porcelain` never reports
+  // ignored paths, and nothing is observed after the final read. So say what
+  // this fallback did (nothing: there was nothing to fast-forward) rather than
+  // issuing a whole-disk guarantee it is not in a position to make (codex gate).
   const atTipMessage =
     `Panel is already at the upstream tip (${post.version}) — ${managerReason}, ` +
     `but a pinned git merge --ff-only on ${dir} verified the checkout is ` +
-    `current (git: ${gitOutput || "no output"}). Nothing changed on disk; no ` +
-    `restart needed.`;
+    `current (git: ${gitOutput || "no output"}). HEAD already WAS the fetched ` +
+    `upstream, so this fallback fast-forwarded nothing and moved nothing itself; ` +
+    `no restart is needed on its account. (That verifies the TRACKED checkout — ` +
+    `git does not compare ignored files.)`;
   return {
     action: "update",
     result: { ...result, message: atTipMessage },

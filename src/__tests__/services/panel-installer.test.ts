@@ -133,6 +133,13 @@ function makeDeps(opts: {
    */
   gitStatusSeq?: string[];
   /**
+   * Zero-based `git status --porcelain` call index at which the mock THROWS —
+   * how a case models a checkout that cannot be read at all at one specific
+   * point (the guard is itself an operation that can fail). Index 2 is the
+   * fallback's post-merge re-read.
+   */
+  gitStatusThrowsAt?: number;
+  /**
    * Fires from the ignored-file gate — the LAST read the fallback takes before
    * its pre-merge compare-and-swap. How a case models a concurrent writer
    * acting inside exactly the window the CAS exists to catch.
@@ -166,10 +173,15 @@ function makeDeps(opts: {
     readdir: (p) => (p === CUSTOM_NODES ? dirs : []),
     readFile: (p) => files[p] ?? "",
     gitRevision: (dir) => revs[dir],
-    gitStatusPorcelain: () =>
-      statusCalls < (opts.gitStatusSeq?.length ?? 0)
+    gitStatusPorcelain: () => {
+      if (statusCalls === opts.gitStatusThrowsAt) {
+        statusCalls++;
+        throw new Error("fatal: not a git repository (or any parent up to mount point)");
+      }
+      return statusCalls < (opts.gitStatusSeq?.length ?? 0)
         ? (opts.gitStatusSeq as string[])[statusCalls++]
-        : ((statusCalls++, opts.gitStatus) ?? ""),
+        : ((statusCalls++, opts.gitStatus) ?? "");
+    },
     fetchLiveQueueCounts: async () => {
       const i = counters.liveQueueProbes++;
       const seq = opts.liveQueue;
@@ -1250,6 +1262,129 @@ describe("runPanelAction #724 git fallback (legacy Manager 3.x no-op)", () => {
     expect(msg).toMatch(/is_processing=true/);
     expect(h.gitPulls).toEqual([dir]);
     expect(h.counters.liveQueueProbes).toBe(2);
+  });
+
+  it("#824 P0: the merge leaves a THIRD HEAD on a clean tree -> disclosed, never reported as success", async () => {
+    // The dirty-worktree case above cannot reach this guard: here the tree ends
+    // CLEAN, so only the HEAD comparison can catch it. A fast-forward pinned to
+    // REV_B leaves HEAD at REV_B (or, if it was already there, unmoved) — a
+    // third revision means somebody else's commit landed inside the window.
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: IDLE_SNAPSHOT,
+      upstreamRev: REV_B,
+      onGitPull: ({ files, revs }) => {
+        files[pyPath] = pyproject(PANEL_REGISTRY_ID, "0.11.35");
+        revs[dir] = REV_C; // NOT the pinned target, NOT the pre-merge rev
+        return FF;
+      },
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    const msg = String(err?.message ?? err);
+    expect(msg).toMatch(/ALREADY RAN/);
+    expect(msg).toMatch(/neither the merged upstream/);
+    expect(msg).toMatch(/may now be INCONSISTENT/);
+    // The merge ran — refusal language would be a lie about a mutation.
+    expect(msg).not.toMatch(/NO git mutation was made/);
+    expect(h.gitPulls).toEqual([dir]);
+  });
+
+  it("#824 P0: the checkout cannot be re-read AFTER the merge -> disclosed as UNKNOWN, not as success", async () => {
+    // The post-merge guard is itself an operation that can fail. Failing to
+    // read is "could not determine whether anything else wrote here", which is
+    // not "nothing else did" — and the merge has run, so the honest register is
+    // disclosure, not a claim that nothing happened.
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: IDLE_SNAPSHOT,
+      upstreamRev: REV_B,
+      // 0 = cleanliness gate, 1 = pre-merge CAS, 2 = the post-merge re-read.
+      gitStatusThrowsAt: 2,
+      onGitPull: ({ files, revs }) => {
+        files[pyPath] = pyproject(PANEL_REGISTRY_ID, "0.11.35");
+        revs[dir] = REV_B;
+        return FF;
+      },
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    const msg = String(err?.message ?? err);
+    expect(msg).toMatch(/ALREADY RAN/);
+    expect(msg).toMatch(/could not be re-read afterwards/);
+    expect(msg).toMatch(/is UNKNOWN/);
+    expect(msg).not.toMatch(/NO git mutation was made/);
+    expect(h.gitPulls).toEqual([dir]);
+  });
+
+  it("#824: a FAILED merge does not get to claim the disk is unchanged — it re-reads and says what moved", async () => {
+    // "The merge exited non-zero" is a bucket; "nothing changed on disk" is a
+    // fact about the disk. The first does not establish the second — and the
+    // likeliest cause of the failure (another writer in this checkout) is
+    // precisely the case where the second is FALSE.
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: IDLE_SNAPSHOT,
+      upstreamRev: REV_B,
+      // 0 = cleanliness gate, 1 = pre-merge CAS, 2 = the post-failure re-read.
+      gitStatusSeq: ["", "", " M web/js/comfyui-mcp-panel.js"],
+      // onGitPull omitted -> the pinned merge THROWS.
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    const msg = String(err?.message ?? err);
+    expect(msg).toMatch(/did NOT apply/);
+    expect(msg).toMatch(/NOT what it was before the attempt/);
+    expect(msg).toMatch(/the worktree is dirty/);
+    expect(msg).not.toMatch(/nothing changed on disk/);
+    expect(h.gitPulls).toEqual([dir]);
+  });
+
+  it("#824: a FAILED merge that re-reads UNCHANGED still reports the version unchanged (no false alarm)", async () => {
+    // The other side of the same guard: observing an untouched tree is exactly
+    // what licenses the reassuring wording, so it must still be given. A fix
+    // that refused to say anything here would have overshot into alarm.
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: IDLE_SNAPSHOT,
+      upstreamRev: REV_B,
+      // onGitPull omitted -> the pinned merge THROWS; the tree stays clean.
+    });
+    const err = await runPanelAction("update", h.deps).catch((e) => e);
+    expect(err).toBeInstanceOf(PanelInstallError);
+    const msg = String(err?.message ?? err);
+    expect(msg).toMatch(/re-read afterwards and is unchanged/);
+    expect(msg).toMatch(/installed version is still 0\.11\.32/);
+    expect(msg).not.toMatch(/NOT what it was before/);
+  });
+
+  it("#824: 'already at the upstream tip' claims only what git proved, not an untouched directory", async () => {
+    // HEAD === the FETCHED upstream proves the TRACKED checkout is current. It
+    // does not prove the directory was untouched: porcelain never reports
+    // ignored paths, and nothing is observed after the final read.
+    const h = makeDeps({
+      comfyuiPath: COMFY,
+      files: { [pyPath]: pyproject(PANEL_REGISTRY_ID, "0.11.32") },
+      revs: { [dir]: REV_A },
+      updateDetails: IDLE_SNAPSHOT,
+      upstreamRev: REV_A, // HEAD already IS the upstream tip
+      onGitPull: () => "Already up to date.",
+    });
+    const r = await runPanelAction("update", h.deps);
+    expect(r.restartRequired).toBe(false);
+    expect(r.message).toMatch(/already at the upstream tip/);
+    expect(r.message).toMatch(/fast-forwarded nothing and moved nothing itself/);
+    expect(r.message).toMatch(/git does not compare ignored files/);
+    // The overclaim this replaced.
+    expect(r.message).not.toMatch(/Nothing changed on disk/);
   });
 
   it("#824: a genuinely quiescent window brackets the merge - probed before AND after", async () => {
