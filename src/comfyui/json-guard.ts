@@ -180,6 +180,40 @@ function reflectionPatterns(value: string): { pattern: RegExp; length: number }[
       length: hex.length,
     });
   }
+
+  // HTML ENTITIES: another family that cannot be enumerated. Only the five
+  // NAMED entities were generated, so a responder that emits the numeric forms
+  // — `&#38;` or `&#x26;`, which any HTML escaper may — got a reflected
+  // credential through in recoverable form (codex gate). And the choice is
+  // PER CHARACTER, so the list would again be exponential. Each character
+  // becomes "itself, or any entity spelling of itself"; a match is therefore
+  // always exactly this value, however it was escaped.
+  const NAMED: Record<string, string> = {
+    "&": "amp",
+    "<": "lt",
+    ">": "gt",
+    '"': "quot",
+    "'": "apos",
+  };
+  const chars = [...value];
+  if (chars.some((c) => NAMED[c] !== undefined || c.charCodeAt(0) < 128)) {
+    const atoms = chars.map((c) => {
+      const code = c.codePointAt(0)!;
+      const alts = [
+        reEscape(c),
+        `&#0*${code};`, // decimal, with the leading zeros some escapers emit
+        `&#[xX]0*${[...code.toString(16)].map(eitherCase).join("")};`, // hex, case-free
+      ];
+      if (NAMED[c]) alts.push(`&${NAMED[c]};`);
+      return `(?:${alts.join("|")})`;
+    });
+    out.push({
+      // The shortest possible match is the value written out literally, so that
+      // is the length the "too short to substitute safely" rule must use.
+      pattern: new RegExp(atoms.join(""), "g"),
+      length: value.length,
+    });
+  }
   return out;
 }
 
