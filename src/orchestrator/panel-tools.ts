@@ -26,6 +26,13 @@
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import type { Stats } from "node:fs";
+import {
+  forwardedByReferenceNote,
+  oversizedInlineRefusal,
+  resolveServableViewRef,
+  type ForwardedByReference,
+} from "../services/comfy-view-ref.js";
 import { extname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { comfyuiFetch } from "../comfyui/fetch.js";
@@ -7777,6 +7784,8 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         const MAX_BYTES = 20 * 1024 * 1024; // 20 MB
 
         const resolved: Array<Record<string, unknown>> = [];
+        /** Oversized items that took the /view reference route instead (#648). */
+        const forwarded: ForwardedByReference[] = [];
         for (const item of items) {
           const src = item.source;
           if ("path" in src) {
@@ -7785,32 +7794,93 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             if (!isAbsolute(p)) {
               return fail("path must be absolute: " + p);
             }
-            if (!existsSync(p)) {
-              return fail("file not found: " + p);
+            // ONE stat, three distinct outcomes. existsSync + statSync split the
+            // question across two syscalls and left the third case unhandled: a
+            // file that EXISTS but cannot be stat'ed (permissions, a broken
+            // symlink, an unreachable share) threw straight out of the handler
+            // as an opaque transport error. "Could not read it" is neither "not
+            // found" nor "too large", and reporting it as either sends the
+            // caller to fix the wrong thing.
+            let stat: Stats;
+            try {
+              stat = statSync(p);
+            } catch (err) {
+              const code = (err as NodeJS.ErrnoException)?.code;
+              if (code === "ENOENT") {
+                return fail("file not found: " + p);
+              }
+              return fail(
+                "could not read file metadata for " +
+                  p +
+                  ": " +
+                  (err instanceof Error ? err.message : String(err)) +
+                  " — that is not the same as the file being absent, and it is not a size limit; " +
+                  "check permissions and that the path is reachable, then retry",
+              );
             }
-            const stat = statSync(p);
             if (!stat.isFile()) {
               return fail("not a regular file: " + p);
             }
-            if (stat.size > MAX_BYTES) {
-              return fail(
-                "file too large (" + (stat.size / 1024 / 1024).toFixed(1) + " MB > 20 MB): " + p,
-              );
-            }
+            // Type BEFORE size: a file this tool can never display is refused for
+            // what is actually wrong with it, and only real media is considered
+            // for the reference route.
             const ext = extname(p).toLowerCase();
             let mime: string;
+            let kind: "image" | "video";
             if (IMAGE_EXTS.has(ext)) {
               mime = ext === ".jpg" ? "image/jpeg" : "image/" + ext.slice(1);
+              kind = "image";
             } else if (VIDEO_EXTS.has(ext)) {
               mime = "video/" + ext.slice(1);
+              kind = "video";
             } else {
               return fail(
                 "unsupported file type \"" + ext + "\" (allowed: " + [...IMAGE_EXTS, ...VIDEO_EXTS].join(", ") + "): " + p,
               );
             }
-            const buf = readFileSync(p);
+            if (stat.size > MAX_BYTES) {
+              // Too big to INLINE is not the same as too big to SHOW. When the
+              // file already sits under a directory ComfyUI serves, the panel
+              // can fetch it same-origin with no cap at all — so forward a ref
+              // rather than dead-ending the caller at a ceiling it cannot pass.
+              // MAX_BYTES stays exactly where it is; it guards the inline path,
+              // which this route does not use.
+              const servable = await resolveServableViewRef(p);
+              if (servable.status === "servable") {
+                resolved.push({
+                  kind: "viewRef",
+                  viewRef: servable.ref,
+                  filename: servable.ref.filename,
+                  caption: item.caption,
+                });
+                forwarded.push({ path: p, sizeBytes: stat.size, kind, ref: servable.ref });
+                continue;
+              }
+              return fail(
+                oversizedInlineRefusal({
+                  path: p,
+                  sizeBytes: stat.size,
+                  capBytes: MAX_BYTES,
+                  kind,
+                  resolution: servable,
+                }),
+              );
+            }
+            let buf: Buffer;
+            try {
+              buf = readFileSync(p);
+            } catch (err) {
+              // The file was stat-able a moment ago, so this is a read failure —
+              // not a missing file, and not a size problem.
+              return fail(
+                "could not read file contents for " +
+                  p +
+                  ": " +
+                  (err instanceof Error ? err.message : String(err)) +
+                  " — it was readable a moment ago, so this is not an absent file and not a size limit",
+              );
+            }
             const dataUrl = "data:" + mime + ";base64," + buf.toString("base64");
-            const kind = IMAGE_EXTS.has(ext) ? "image" : "video";
             const filename = p.replace(/.*[\/]/, "");
             resolved.push({ kind, dataUrl, filename, caption: item.caption });
           } else {
@@ -7858,7 +7928,18 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           }
         }
 
-        return ctx.call({ cmd: "show_media", items: resolved }, 60000);
+        const res = await ctx.call({ cmd: "show_media", items: resolved }, 60000);
+        // Why an item the caller passed as a PATH came back described as a
+        // reference — the panel cannot say, because it never saw the path or the
+        // size. Appended as a separate block so the panel's own reply (which is
+        // the only thing that knows what was actually painted) is left intact.
+        if (forwarded.length > 0 && !res.isError) {
+          res.content.push({
+            type: "text",
+            text: forwardedByReferenceNote(forwarded, MAX_BYTES),
+          });
+        }
+        return res;
       },
     ),
     def(
