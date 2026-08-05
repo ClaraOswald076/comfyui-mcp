@@ -102,9 +102,9 @@ standalone MCP server's default is unchanged.
 
 ## Audio input
 
-Audio attachments reach the model on this lane, and **only** where the model
-actually reports it can hear. Before sending, the backend asks
-`POST /api/show` for the model's capabilities:
+**On the `ollama` backend (native `/api/chat`)**, audio reaches the model only
+where the model actually reports it can hear. Before sending, the backend asks
+`POST /api/show` for that model's capabilities:
 
 ```bash
 ollama pull gemma4:e2b      # capabilities: completion, vision, audio, tools, thinking
@@ -116,9 +116,12 @@ for a model that can hear — rather than being dropped into the request where
 the model would answer from your text alone. The same applies to a file that
 isn't an audio format, or that is present but zero bytes.
 
-If the capability probe itself can't run, the audio is sent anyway with an
-explicit "I can't confirm this reached the model" note: a guard that fails is
-not a verdict.
+**On the OpenAI-compatible backends** (LM Studio, llama.cpp, OpenRouter,
+custom) there is no capability endpoint to ask. Audio is sent as an
+`input_audio` content part and the turn carries an explicit *"I cannot confirm
+the model actually receives them"* line. Refusing would deny audio to every
+endpoint that simply has no capability API; a guard that cannot run is not a
+verdict — but it is also not a confirmation, and the wording says so.
 
 See [Backends → Audio input](./backends#audio-input-which-backends-honestly)
 for what every other provider does.

@@ -346,12 +346,14 @@ export class OllamaBackend implements AgentBackend {
   /** Wire dialect (see OllamaBackendDeps.api). */
   protected api: "ollama" | "openai";
   protected apiKey: string | undefined;
-  /** Server-reported capabilities per model id (#790). Successful probes only —
-   *  see probeModelCapabilities for why a failure is never memoised. */
-  protected modelCapabilities = new Map<string, string[]>();
-  /** The tool-mode decision the comfyui child was spawned with (#788), kept so
-   *  the active mode and its REASON are visible rather than inferred. */
+  /** The tool-mode decision the comfyui child was ACTUALLY spawned with (#788),
+   *  kept so the active mode and its REASON are visible rather than inferred.
+   *  Never updated speculatively: it must always describe the live surface, so a
+   *  model switch only rewrites it once the child has really been respawned. */
   protected toolModeDecision: ToolModeDecision | null = null;
+  /** The comfyui child's spawn-spec env, retained so a live model switch can
+   *  re-decide the tool mode against the same caller-level pins (#788). */
+  protected comfySpecEnv: Record<string, string> | undefined;
 
   constructor(deps: OllamaBackendDeps = {}) {
     this.deps = deps;
@@ -464,6 +466,7 @@ export class OllamaBackend implements AgentBackend {
             // #788 — record WHY this surface is what it is, so the ready line can
             // say it. "compact was applied" and "compact was applied because of
             // the model" are different facts and the user is owed the second one.
+            this.comfySpecEnv = spec.env;
             this.toolModeDecision = comfyuiSpawnToolMode(spec.env, process.env, this.model);
             const { StdioClientTransport } = await import("@modelcontextprotocol/sdk/client/stdio.js");
             await client.connect(
@@ -975,13 +978,14 @@ export class OllamaBackend implements AgentBackend {
    * operation that failed, not a capability verdict — callers must degrade to
    * "attempt and say it is unconfirmed", not to a refusal.
    *
-   * Only successful probes are memoised; caching a failure would make one bad
-   * moment permanent for the life of the backend.
+   * Deliberately NOT memoised. An Ollama tag is MUTABLE — `ollama pull` replaces
+   * the weights under the same name — so a cached verdict can outlive the model
+   * it described, and the dangerous direction is silent: audio sent to a model
+   * that can no longer hear it and reported as delivered. This runs only on a
+   * turn that actually carries audio, and it is one local HTTP request.
    */
   protected async probeModelCapabilities(): Promise<string[] | null> {
     if (this.api !== "ollama") return null; // no capability endpoint on this dialect
-    const cached = this.modelCapabilities.get(this.model);
-    if (cached) return cached;
     try {
       const res = await fetch(`${this.host}/api/show`, {
         method: "POST",
@@ -998,9 +1002,7 @@ export class OllamaBackend implements AgentBackend {
         logger.warn(`[ollama-backend] /api/show for ${this.model} carried no capabilities array — unknown`);
         return null;
       }
-      const caps = body.capabilities.filter((c): c is string => typeof c === "string");
-      this.modelCapabilities.set(this.model, caps);
-      return caps;
+      return body.capabilities.filter((c): c is string => typeof c === "string");
     } catch (err) {
       logger.warn(`[ollama-backend] /api/show probe failed for ${this.model}: ${msgOf(err)} — model capabilities unknown`);
       return null;
@@ -1068,6 +1070,10 @@ export class OllamaBackend implements AgentBackend {
   private async *runTurn(turn: NeutralTurn, opts: BackendStartOptions): AsyncIterable<AgentEvent> {
     const abort = new AbortController();
     this.turnAbort = abort;
+    // #788 — a live model switch may have changed which tool surface this model
+    // should get. Reconcile BEFORE buildModelTools reads the catalog, and here
+    // rather than in setModel because nothing is in flight at this point.
+    await this.reconcileToolModeForModel();
     const tools = this.buildModelTools();
     // Vision is a per-MODEL property (gemma4 sees images, qwen3 doesn't;
     // DeepSeek's API rejects image parts outright), so ALWAYS attempt delivery:
@@ -1160,14 +1166,24 @@ export class OllamaBackend implements AgentBackend {
             );
             this.stripImagesFromHistory();
             // #790 — the correction for an attachment we had already told the
-            // user was on the request. Naming the SENSE that was lost matters:
-            // "can't see it" after an audio rejection would be a second wrong
-            // statement on top of the first.
+            // user was on the request. Two things must stay honest here.
+            //
+            // The SENSE that was lost: "can't see it" after an audio rejection
+            // would be a second wrong statement on top of the first.
+            //
+            // The CAUSE: the endpoint's error carries no attribution, so when
+            // the request carried BOTH kinds we do not know which one it
+            // objected to — and must not pick one. The wording below is about
+            // what we OBSERVED (the request carrying X was rejected, X is now
+            // gone) rather than a diagnosis we cannot make.
             yield {
               type: "assistant",
-              text: hadAudio
-                ? `🔇 ${this.model} rejected the audio attachment, so I'm continuing without it — I did NOT hear it and won't describe it. Switch to an audio-capable model (\`ollama pull gemma4:e4b\`), or ask me to run a ComfyUI audio-analysis node over the file instead.`
-                : `📎 ${this.model} rejected image input, so I'm continuing without the attachment — I can't see the image. Describe it in words, or switch to a vision-capable model.`,
+              text:
+                hadAudio && hadImages
+                  ? `📎🔇 ${this.model} rejected the request carrying the attachments, so I'm continuing without them — I did NOT see the image and did NOT hear the audio, and the endpoint didn't say which one it objected to. Describe the image in words, and switch to a model that reports audio support (\`ollama pull gemma4:e4b\`) if you need me to listen.`
+                  : hadAudio
+                    ? `🔇 ${this.model} rejected the request carrying the audio attachment, so I'm continuing without it — I did NOT hear it and won't describe it. Switch to an audio-capable model (\`ollama pull gemma4:e4b\`), or ask me to run a ComfyUI audio-analysis node over the file instead.`
+                    : `📎 ${this.model} rejected image input, so I'm continuing without the attachment — I can't see the image. Describe it in words, or switch to a vision-capable model.`,
             };
             round--; // the rejected request didn't count as a tool round
             continue;
@@ -1350,8 +1366,54 @@ export class OllamaBackend implements AgentBackend {
   }
 
   async setModel(model: string): Promise<void> {
-    // Ollama picks the model per request — a live switch is just bookkeeping.
-    if (isOllamaModel(model)) this.model = model;
+    // Ollama picks the model per request — a live switch is just bookkeeping for
+    // the CHAT side. The TOOL SURFACE is not: the comfyui child was spawned with
+    // a mode chosen for the previous model (#788), so switching 4B → 70B (or
+    // back) would otherwise leave the new model on the old model's surface while
+    // the ready line still explained the old decision. Flag it here and let the
+    // next turn re-spawn at a point where nothing is in flight.
+    if (!isOllamaModel(model)) return;
+    this.model = model;
+  }
+
+  /**
+   * Re-spawn the comfyui child when the ACTIVE model wants a different tool
+   * surface than the one it is running (#788).
+   *
+   * Called at the top of a turn, which is the only safe point: no request is in
+   * flight, so tearing the MCP client down cannot orphan a call. If the re-spawn
+   * fails the old decision is left in place — `toolModeDecision` must always
+   * describe the surface that actually exists, never the one we wanted.
+   */
+  protected async reconcileToolModeForModel(): Promise<void> {
+    if (!this.deps.mcpServers || !this.toolModeDecision) return; // nothing spawned by us
+    const next = comfyuiSpawnToolMode(this.comfySpecEnv, process.env, this.model);
+    if (next.mode === this.toolModeDecision.mode) {
+      // Same surface — only the explanation needs to catch up to the new model.
+      this.toolModeDecision = next;
+      return;
+    }
+    const previous = this.toolModeDecision;
+    logger.info(
+      `[ollama-backend] model is now ${this.model}; tool surface ${previous.mode} → ${next.mode} — respawning the comfyui tool server`,
+    );
+    const staleComfy = this.comfy;
+    const stalePanel = this.panel;
+    this.comfy = null;
+    this.panel = null;
+    this.comfyTools = [];
+    this.panelTools = [];
+    await staleComfy?.close().catch(() => {});
+    await stalePanel?.close().catch(() => {});
+    try {
+      await this.connectTools();
+    } catch (err) {
+      // Leave the decision describing what is actually running. connectTools
+      // re-sets toolModeDecision on success; on failure we have no surface at
+      // all, and saying so beats claiming the new one.
+      this.toolModeDecision = null;
+      logger.warn(`[ollama-backend] tool-server respawn failed after model switch: ${msgOf(err)}`);
+    }
   }
 
   async listModels(): Promise<ModelChoice[]> {

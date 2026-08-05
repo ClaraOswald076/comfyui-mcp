@@ -294,7 +294,7 @@ describe("#790 — an endpoint that rejects the request after we attached audio"
     rejectNextChatWith = "unsupported media type";
     const events = await collect(nativeBackend(), turnsOf(AUDIO_TURN));
     const said = assistantText(events);
-    expect(said).toContain("rejected the audio attachment");
+    expect(said).toContain("rejected the request carrying the audio attachment");
     expect(said).toContain("did NOT hear it");
     expect(said).not.toContain("I can't see the image");
     // The retry carries no audio, and the model is told why.
@@ -304,6 +304,115 @@ describe("#790 — an endpoint that rejects the request after we attached audio"
     };
     expect(retried.images).toBeUndefined();
     expect(retried.content).toContain("did NOT hear it");
+  });
+});
+
+describe("#790 — a request carrying BOTH an image and audio is rejected", () => {
+  it("does not pick a cause the endpoint never gave, and names BOTH lost senses", async () => {
+    // The endpoint's error carries no attribution. Blaming the audio (or the
+    // image) would be a diagnosis we cannot make — a fabricated observation.
+    viewContentType = "image/png";
+    rejectNextChatWith = "cannot process input";
+    const backend = nativeBackend();
+    const events = await collect(
+      backend,
+      turnsOf({
+        text: "compare these",
+        images: [{ filename: "shot.png", type: "input" }],
+        audio: [{ filename: "song.wav", type: "input" }],
+      }),
+    );
+    const said = assistantText(events);
+    expect(said).toContain("didn't say which one it objected to");
+    expect(said).toContain("did NOT see the image");
+    expect(said).toContain("did NOT hear the audio");
+    // …and it must NOT assert the audio-only story.
+    expect(said).not.toContain("rejected the request carrying the audio attachment,");
+  });
+});
+
+describe("#788 — a live model switch reconciles the tool surface", () => {
+  it("respawns the comfyui tool server when the new model wants a different surface", async () => {
+    let connects = 0;
+    const backend = new OllamaBackend({
+      model: "qwen3:4b",
+      comfyuiUrl: "http://127.0.0.1:8188",
+      // Exercise the real decision path: an mcpServers spec is what makes the
+      // backend own the child (and therefore the tool mode) at all.
+      mcpServers: { comfyui: { transport: "stdio", command: "node", args: [], env: {} } },
+    });
+    // Stub the spawn so the test drives reconciliation, not a real child.
+    const anyBackend = backend as unknown as {
+      connectTools: () => Promise<void>;
+      comfyTools: unknown[];
+      comfySpecEnv: Record<string, string> | undefined;
+      toolModeDecision: { mode: string; source: string } | null;
+      model: string;
+    };
+    anyBackend.connectTools = async () => {
+      connects++;
+      anyBackend.comfySpecEnv = {};
+      const { comfyuiSpawnToolMode } = await import("../../orchestrator/ollama-backend.js");
+      anyBackend.toolModeDecision = comfyuiSpawnToolMode({}, {}, anyBackend.model);
+      anyBackend.comfyTools = [];
+    };
+    await backend.prepare();
+    expect(connects).toBe(1);
+    expect(anyBackend.toolModeDecision?.mode).toBe("compact");
+
+    await backend.setModel("llama3.3:70b");
+    await collect(backend, turnsOf({ text: "hi" }));
+    // The surface the 4B model was given must not be what the 70B one runs on.
+    expect(connects).toBe(2);
+    expect(anyBackend.toolModeDecision?.mode).toBe("full");
+    expect(anyBackend.toolModeDecision?.source).toBe("model-parameters");
+  });
+
+  it("does NOT respawn when the new model wants the same surface", async () => {
+    let connects = 0;
+    const backend = new OllamaBackend({
+      model: "qwen3:4b",
+      mcpServers: { comfyui: { transport: "stdio", command: "node", args: [], env: {} } },
+    });
+    const anyBackend = backend as unknown as {
+      connectTools: () => Promise<void>;
+      comfyTools: unknown[];
+      comfySpecEnv: Record<string, string> | undefined;
+      toolModeDecision: { mode: string; model?: string } | null;
+      model: string;
+    };
+    anyBackend.connectTools = async () => {
+      connects++;
+      anyBackend.comfySpecEnv = {};
+      const { comfyuiSpawnToolMode } = await import("../../orchestrator/ollama-backend.js");
+      anyBackend.toolModeDecision = comfyuiSpawnToolMode({}, {}, anyBackend.model);
+      anyBackend.comfyTools = [];
+    };
+    await backend.prepare();
+    await backend.setModel("gemma4:e2b"); // also small → still compact
+    await collect(backend, turnsOf({ text: "hi" }));
+    expect(connects).toBe(1);
+    // The explanation still catches up to the model actually in use.
+    expect(anyBackend.toolModeDecision?.model).toBe("gemma4:e2b");
+  });
+});
+
+describe("#790 — the capability probe is never memoised", () => {
+  it("re-asks on every audio turn, because an ollama tag can be re-pulled", async () => {
+    const backend = nativeBackend();
+    showCapabilities = ["completion", "audio"];
+    await collect(backend, turnsOf(AUDIO_TURN));
+    const afterFirst = showCalls;
+    expect(afterFirst).toBeGreaterThan(0);
+    // The tag now points at different weights that can no longer hear.
+    showCapabilities = ["completion", "tools"];
+    const second = await collect(backend, turnsOf(AUDIO_TURN));
+    expect(showCalls).toBeGreaterThan(afterFirst);
+    expect(assistantText(second)).toContain("no audio");
+    // The SECOND turn's user message (history carries the first one too).
+    const users = (chatRequests[1].messages as Array<Record<string, unknown>>).filter((m) => m.role === "user");
+    const user = users[users.length - 1] as { images?: string[] };
+    expect(user.images).toBeUndefined();
   });
 });
 

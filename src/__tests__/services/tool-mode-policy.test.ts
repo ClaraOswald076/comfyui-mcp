@@ -172,9 +172,11 @@ describe("the explanation is user-facing and #726-proof", () => {
       resolveToolModeForModel({ model: "x", env: { COMFYUI_MCP_TOOL_MODE: "full" } }).explain,
     ];
     for (const t of texts) {
-      expect(t).not.toMatch(/~?\d+\s*(tools|schemas)/i);
+      // Every shape a count can take: "3 tools", "~200 schemas", "3-tool router".
+      expect(t).not.toMatch(/~?\d+[\s-]*(tool|schema)/i);
       expect(t).not.toContain("list_tools");
       expect(t).not.toContain("describe_tool");
+      expect(t).not.toContain("call_tool");
     }
   });
 });

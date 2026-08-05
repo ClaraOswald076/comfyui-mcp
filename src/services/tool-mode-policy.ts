@@ -203,7 +203,7 @@ export function resolveToolModeForModel(opts: ResolveToolModeOptions = {}): Tool
     paramsB,
     explain:
       mode === "full"
-        ? `Tool mode: full — chosen for this MODEL: "${model}" is ~${paramsB}B parameters, at or above the ${threshold}B full-surface threshold. Set COMFYUI_MCP_TOOL_MODE=compact to force the 3-tool router.`
+        ? `Tool mode: full — chosen for this MODEL: "${model}" is ~${paramsB}B parameters, at or above the ${threshold}B full-surface threshold. Set COMFYUI_MCP_TOOL_MODE=compact to force the on-demand router instead.`
         : `Tool mode: compact — chosen for this MODEL: "${model}" is ~${paramsB}B parameters, below the ${threshold}B full-surface threshold, so tools load on demand instead of all at once. Set COMFYUI_MCP_TOOL_MODE=full to force the full surface (or raise COMFYUI_MCP_FULL_SURFACE_MIN_PARAMS_B).`,
   };
 }
