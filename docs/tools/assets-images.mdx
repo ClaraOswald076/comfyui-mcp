@@ -53,7 +53,7 @@ Fetch a generated image from ComfyUI and return it as an inline image. Video/aud
   Subfolder within the directory, if any
 </ParamField>
 <ParamField path="save_dir" type="string">
-  Absolute local directory to save the file in. Defaults to a 'comfyui-images' folder inside the platform temp directory (os.tmpdir()), which is created if missing. A RELATIVE value is resolved against this MCP process's working directory, which is the client's choice and may not be writable — prefer an absolute path.
+  Absolute local directory to save the file in. Defaults to a 'comfyui-images' folder inside the platform temp directory (os.tmpdir()), which is created if missing. A RELATIVE value is resolved against this MCP process's working directory, which is the client's choice and may not be writable. On Windows a drive-less path like \out is resolved against this process's CURRENT DRIVE, not a drive you chose. Prefer a fully-qualified path (C:\... or \\server\share); the returned 'Saved to:' line always names the resolved absolute path.
 </ParamField>
 
 ### Example

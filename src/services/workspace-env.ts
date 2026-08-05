@@ -1178,9 +1178,13 @@ async function probePipPackages(
     }
   }
   // A parsed record IS pip speaking, so the run is self-evident. With none, only pip's
-  // own not-found warning proves it looked.
+  // own not-found warning proves it looked — and it has to be pip's STRUCTURED line,
+  // anchored at the start of a line with the WARNING prefix and trailing colon. A bare
+  // substring match would be satisfied by any traceback or wrapper message that merely
+  // quotes the phrase, and that would license the "none of these are installed" claim
+  // off a `pip show` that never ran.
   if (Object.keys(found).length > 0) return { ran: true, packages: found };
-  return { ran: /Package\(s\) not found/i.test(out), packages: found };
+  return { ran: /^\s*WARNING:\s*Package\(s\) not found:/im.test(out), packages: found };
 }
 
 async function probeGitRev(
