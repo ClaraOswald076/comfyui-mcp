@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { logger } from "../utils/logger.js";
@@ -188,11 +188,20 @@ export class SessionStore {
   }
 
   private read(): { sessions: Record<string, Entry>; dirty: boolean } {
-    try {
-      return this.parse(readFileSync(this.path, "utf8"));
-    } catch {
-      // Missing or corrupt at the NEW location — try the pre-#884 tmpdir file so
-      // an upgrade carries existing conversations over (location migration).
+    // The legacy tmpdir file is consulted ONLY when the new-location file does
+    // not EXIST (the one-shot location migration). An existing-but-corrupt home
+    // file must start EMPTY, never fall back to the stale pre-migration store —
+    // that would silently resurrect sessions the user has since replaced or
+    // cleared (a wrong resume; codex round 1, P1). Missing ≠ corrupt.
+    if (existsSync(this.path)) {
+      try {
+        return this.parse(readFileSync(this.path, "utf8"));
+      } catch (err) {
+        logger.warn(
+          `[session-store] ${this.path} is unreadable/corrupt — starting empty (NOT falling back to the pre-migration tmpdir store): ${String(err)}`,
+        );
+        return { sessions: {}, dirty: false };
+      }
     }
     try {
       if (existsSync(this.legacyPath)) {
@@ -211,11 +220,23 @@ export class SessionStore {
   }
 
   private flush(): void {
+    // Atomic-ish write (temp + rename): this file is the session store of
+    // record now, and a truncated in-place write surviving a crash would read
+    // as corrupt on the next boot (an empty start — a lost resume). rename
+    // replaces the destination on POSIX and on Windows via Node's MoveFileEx
+    // semantics; on any rename failure fall back to the in-place write rather
+    // than not persisting at all.
+    const payload = JSON.stringify({ v: 2, sessions: this.sessions } satisfies StoreFileV2);
+    const tmp = `${this.path}.tmp`;
     try {
-      const payload: StoreFileV2 = { v: 2, sessions: this.sessions };
-      writeFileSync(this.path, JSON.stringify(payload));
-    } catch (err) {
-      logger.debug(`[session-store] write failed: ${String(err)}`);
+      writeFileSync(tmp, payload);
+      renameSync(tmp, this.path);
+    } catch {
+      try {
+        writeFileSync(this.path, payload);
+      } catch (err) {
+        logger.debug(`[session-store] write failed: ${String(err)}`);
+      }
     }
   }
 

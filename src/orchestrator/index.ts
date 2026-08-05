@@ -1506,11 +1506,15 @@ export async function runPanelOrchestrator(): Promise<void> {
   // Set from each hello's trusted identity; #716 lets a successful explicit
   // open/re-pin refresh it between hellos.
   const tabCommandWorkflowUuid = new Map<string, string>();
-  // #884 — the tab the user last SENT A MESSAGE from. Used for the spawn-time
-  // COMFYUI_MCP_TAB stamp (download self-scoping, #547) and the per-message
-  // workflow-origin note; conversation ROUTING itself uses the bridge's own
-  // last-active resolution (UiBridge.resolveTarget on the shared scope).
-  let lastFocusTab: string | undefined;
+  // #884 — the trusted workflow uuid of the workflow the CURRENT TURN was
+  // ISSUED FOR, captured at user-message dispatch (and refreshed by #716's
+  // explicit-open path). This is what a SHARED-SCOPE command is STAMPED with:
+  // #570's issue-time rule at conversation level. If the user switches to a
+  // different workflow mid-turn, a late scope mutation still carries THIS
+  // uuid and the panel (now showing another workflow) declines it — the fence
+  // must never be re-resolved from whatever tab happens to be active at
+  // dispatch, which would silently re-aim the mutation (codex round 1, P0).
+  let lastDispatchedTurnUuid: string | undefined;
   // #884 — each shared conversation's last message origin (tab + workflow uuid),
   // so a message sent from a DIFFERENT workflow than the previous one carries a
   // one-line context note: session-bound agents keep knowledge of which canvas
@@ -2087,9 +2091,12 @@ export async function runPanelOrchestrator(): Promise<void> {
   // (persisted by panel-secrets) lands in the comfyui server's spawn env. The
   // comfyui server is declared LAST so it always wins over any user entry that
   // slipped through (defensive — the reader already filters comfyui-mcp entries).
-  // `panelTab` (when given) stamps the spawn — #884: the FOCUS tab (the tab the
-  // user last messaged from), since the agent itself is tab-independent now.
-  const buildMcpServers = (panelTab?: string) => ({
+  // `agentKey` (when given) stamps the spawn's download rows — #884: the row
+  // must name the CONVERSATION that started the download (the agent key), not a
+  // tab id, because a tab can switch backends while the download runs and its
+  // current-backend resolution would then wake the WRONG conversation (codex
+  // round 1, P1). Legacy rows carrying a tab id still resolve via fallback.
+  const buildMcpServers = (agentKey?: string) => ({
     // The user's inherited servers first… (re-read so a panel_add_mcp is picked
     // up on the same in-process respawn, mirroring a soft reload).
     ...readUserMcpServers(),
@@ -2101,11 +2108,10 @@ export async function runPanelOrchestrator(): Promise<void> {
         COMFYUI_URL: comfyuiUrl,
         // Where download_model writes live progress for the panel tray.
         COMFYUI_MCP_PROGRESS_DIR: progressDir,
-        // Stamp downloads with the focus tab so the orchestrator can wake the
-        // agent when a download settles (#547) — the child stamps its own
-        // COMFYUI_MCP_TAB into each progress row; any tab id resolves to the
-        // shared agent under #884.
-        ...(panelTab ? { COMFYUI_MCP_TAB: panelTab } : {}),
+        // Self-scope downloads to the owning CONVERSATION (#547/#884) — the
+        // child stamps its own COMFYUI_MCP_TAB into each progress row, and the
+        // settle path resolves an agent-key-shaped stamp directly.
+        ...(agentKey ? { COMFYUI_MCP_TAB: agentKey } : {}),
         // Local mode → enables download_model, apply_manifest (installer packs),
         // and model scans so the agent installs the right way instead of curl.
         ...(comfyuiPath ? { COMFYUI_PATH: comfyuiPath } : forceRemoteEnv()),
@@ -2134,9 +2140,10 @@ export async function runPanelOrchestrator(): Promise<void> {
         ? createPanelMcpServer(bridge, SHARED_SESSION_SCOPE, workflowTargets)
         : undefined,
     mcpServers: buildMcpServers(),
-    // Per-KEY factory — spawns must reflect live state (the Blind gate, the
-    // focus-tab download stamp); the static set above stays as the fallback.
-    makeMcpServers: () => buildMcpServers(lastFocusTab),
+    // Per-KEY factory — spawns must reflect live state (the Blind gate) and
+    // stamp downloads with the OWNING agent key; the static set above stays as
+    // the fallback.
+    makeMcpServers: (key) => buildMcpServers(key),
     // NOTE: manager callbacks fire with the composite agent key
     // `orchestrator::<backend>`; pushToConversation fans each frame out to every
     // connected tab participating in that backend's conversation (#884) — the
@@ -2587,14 +2594,18 @@ export async function runPanelOrchestrator(): Promise<void> {
   // (the generation-bound-command leak). Resolved from the CALLER's tab id: during the switch
   // race the retiring tab still maps to its own uuid, so a late command stamps the ORIGIN
   // workflow's uuid and the panel (now showing the new one) fails it closed.
-  // #884 — the SHARED SCOPE has no workflow of its own; a scope caller resolves
-  // to the ACTIVE tab first (the bridge's send path already passes the resolved
-  // conn's id for scope callers — this covers the direct capability probes).
+  // #884 — a SHARED-SCOPE caller's stamp is the workflow the CURRENT TURN was
+  // issued for (lastDispatchedTurnUuid — captured at user-message dispatch,
+  // refreshed by #716's explicit open/re-pin), NOT the active tab's current
+  // workflow: re-resolving at dispatch would let a mutation conceived on
+  // workflow A silently land on workflow B after a mid-turn switch (codex
+  // round 1, P0). A real-tab caller keeps the per-tab stamp.
   const scopeToRealTab = (tabId: string): string | undefined =>
     isSharedScopeId(tabId) ? bridge.resolveSharedTabId() : panelTabOf(tabId);
   bridge.setTabWorkflowUuidResolver(
     (tabId) => {
-      const t = scopeToRealTab(tabId);
+      if (isSharedScopeId(tabId)) return lastDispatchedTurnUuid;
+      const t = panelTabOf(tabId);
       return t ? tabCommandWorkflowUuid.get(t) : undefined;
     },
     (tabId, workflowUuid) => {
@@ -2615,6 +2626,12 @@ export async function runPanelOrchestrator(): Promise<void> {
       });
       if (!identity) return false;
       tabCommandWorkflowUuid.set(panelTab, identity.uuid);
+      // #716/#884 — an explicit, VALIDATED open/re-pin from the shared agent is
+      // the agent deliberately moving its turn to another workflow: refresh the
+      // TURN's issue-time stamp too, so its subsequent edits target the
+      // workflow it just opened instead of being declined until the next user
+      // message.
+      if (isSharedScopeId(tabId)) lastDispatchedTurnUuid = identity.uuid;
       return true;
     },
   );
@@ -3226,7 +3243,6 @@ export async function runPanelOrchestrator(): Promise<void> {
         AskAnswers.moveKey(migratedFrom, panelTab);
         flushRunCompletions(panelTab);
         flushAskAnswers(panelTab);
-        if (lastFocusTab === migratedFrom) lastFocusTab = panelTab;
         // The OLD id's command stamp dies with it: a straggler command issued
         // for the old workflow must keep failing the panel's fence rather than
         // mutate the newly-shown one. The new id is stamped from THIS hello
@@ -4510,13 +4526,15 @@ export async function runPanelOrchestrator(): Promise<void> {
         `[panel-orchestrator] queue-note check failed (ignored): ${err instanceof Error ? err.message : String(err)}`,
       );
     }
-    // #884 — focus follows the user's messages: remember the sending tab (the
-    // spawn-time COMFYUI_MCP_TAB stamp + offline buffering hint), and when the
-    // message's ORIGIN workflow differs from the previous message's in this
-    // conversation, prepend a one-line note. This is how one session keeps
-    // "knowledge of all open workflows": the agent is told, mechanically and
-    // only on a change, which canvas it is now operating on.
-    lastFocusTab = event.tab_id;
+    // #884 — the turn's ORIGIN: when this message's workflow differs from the
+    // previous message's in this conversation, prepend a one-line note. This is
+    // how one session keeps "knowledge of all open workflows": the agent is
+    // told, mechanically and only on a change, which canvas it is operating on.
+    // #884 — capture the workflow this TURN is issued for. Scope-addressed
+    // mutations are stamped with THIS value (never re-resolved at dispatch), so
+    // a mid-turn switch to another workflow makes late edits fail the panel's
+    // fence loudly instead of silently re-aiming (codex round 1, P0).
+    lastDispatchedTurnUuid = tabCommandWorkflowUuid.get(event.tab_id);
     {
       const originKey = agentKeyFor(event.tab_id);
       const origin = messageOrigin(event.tab_id, tabCommandWorkflowUuid.get(event.tab_id));
@@ -4648,18 +4666,20 @@ export async function runPanelOrchestrator(): Promise<void> {
       flushAt: number;
     }
   >();
-  // Resolve which agent to wake for a settled download row: the stamped tab's
-  // agent when it's still live; else the SINGLE live agent (pre-fix/in-process
-  // rows carry no tab, AND a tab-id migration/backend change can leave the
-  // stamped tab's key no longer resolving to the live agent — codex); else none —
-  // never fan out to unrelated tabs (#547).
+  // Resolve which agent to wake for a settled download row (#547/#884). New
+  // rows are stamped with the OWNING agent key (`orchestrator::<backend>`) —
+  // resolved directly, so the download wakes the conversation that STARTED it
+  // even if the stamping tab has since switched backends (codex round 1, P1).
+  // Legacy rows (pre-#884 processes) carry a panel tab id — resolved via that
+  // tab's CURRENT backend, best-effort. Else the SINGLE live agent (rows with
+  // no stamp); else none — never fan out to unrelated conversations.
   const resolveDownloadAgentKey = (row: Record<string, unknown>): string | null => {
     const tab = typeof row.tab === "string" ? row.tab.trim() : "";
     if (tab) {
-      const key = agentKeyFor(tab);
+      const key = tab.startsWith(SHARED_SESSION_SCOPE + AGENT_KEY_SEP) ? tab : agentKeyFor(tab);
       if (manager.hasLiveAgent(key)) return key;
-      // Stamped tab's agent is gone (migration/backend switch) — fall through to
-      // the single-live-agent fallback rather than silently dropping the event.
+      // The owning agent is gone (provider retired) — fall through to the
+      // single-live-agent fallback rather than silently dropping the event.
     }
     const live = manager.liveKeys();
     return live.length === 1 ? live[0] : null;

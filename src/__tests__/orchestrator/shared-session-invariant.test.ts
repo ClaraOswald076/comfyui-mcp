@@ -127,6 +127,24 @@ describe("sessions are orchestrator-scoped, never workflow-scoped (#884)", () =>
     }
   });
 
+  it("SOURCE: scope mutations are stamped with the TURN's issue-time workflow, never re-resolved (codex r1 P0)", () => {
+    const src = indexSrc();
+    // Captured at user-message dispatch…
+    expect(src).toContain("lastDispatchedTurnUuid = tabCommandWorkflowUuid.get(event.tab_id)");
+    // …answered to scope callers by the stamp resolver…
+    expect(src).toContain("if (isSharedScopeId(tabId)) return lastDispatchedTurnUuid;");
+    // …and refreshed only by #716's validated explicit-open path.
+    expect(src).toContain("if (isSharedScopeId(tabId)) lastDispatchedTurnUuid = identity.uuid;");
+  });
+
+  it("SOURCE: download rows are stamped with the OWNING agent key, and resolved as such (codex r1 P1)", () => {
+    const src = indexSrc();
+    expect(src).toContain("COMFYUI_MCP_TAB: agentKey");
+    expect(src).toContain(
+      "tab.startsWith(SHARED_SESSION_SCOPE + AGENT_KEY_SEP) ? tab : agentKeyFor(tab)",
+    );
+  });
+
   it("SOURCE: hello.resume is a last-resort hint — the orchestrator's disk store wins", () => {
     const src = indexSrc();
     const at = src.indexOf("manager.setResume(key, resumeHint)");

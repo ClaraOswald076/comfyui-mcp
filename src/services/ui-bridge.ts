@@ -3055,13 +3055,13 @@ export class UiBridge {
     // own workflow into their own workflow (self-attack, no privacy boundary). See the
     // enforcesWorkflowStamp field doc. Deliberately no attestation.
     if (requiresWorkflowStampEnforcement(cmd)) {
-      // #884 — a SHARED-SCOPE caller has no workflow of its own: its command is
-      // for whatever workflow the resolved (active) tab is showing, so the stamp
-      // comes from the RESOLVED conn. A real-tab caller keeps the #570 rule:
-      // stamp the workflow the command was ISSUED FOR (the caller's tab), so a
-      // late command after a switch is declined by the panel's fence.
-      const stampTab = !opts.tabId || isSharedScopeId(opts.tabId) ? conn.tabId : opts.tabId;
-      const stamp = this.resolveTabWorkflowUuid?.(stampTab);
+      // #884 — the resolver is passed the CALLER's id, including the SHARED
+      // SCOPE: the orchestrator answers a scope caller with the workflow the
+      // CURRENT TURN was issued for (captured at user-message dispatch, #570's
+      // issue-time rule preserved), so a mutation conceived while the user was
+      // on workflow A is still declined by the panel after a switch to B —
+      // never silently re-aimed at whatever the active tab shows now.
+      const stamp = this.resolveTabWorkflowUuid?.(opts.tabId ?? conn.tabId);
       const hasTrustedStamp = typeof stamp === "string" && stamp.length > 0;
       if (!conn.enforcesWorkflowStamp || !conn.enforcesWorkflowStampAtWrite || !hasTrustedStamp) {
         // The two CAPABILITY branches (missing panel fences) are typed so the tool
@@ -3213,13 +3213,10 @@ export class UiBridge {
         // #570 — resolve from the CALLER'S intended tab (opts.tabId), NOT the canonical
         // conn.tabId: after a same-socket switch the two differ, and we must stamp the
         // workflow the command was ISSUED FOR (so the panel, now showing a different one,
-        // declines it) — never the workflow it happens to have landed on.
-        // #884 — a SHARED-SCOPE caller has no workflow of its own; its stamp is the
-        // resolved (active) tab's, exactly like the pre-dispatch fence above.
-        workflowUuid:
-          this.resolveTabWorkflowUuid?.(
-            !opts.tabId || isSharedScopeId(opts.tabId) ? conn.tabId : opts.tabId,
-          ) ?? undefined,
+        // declines it) — never the workflow it happens to have landed on. #884: for the
+        // SHARED SCOPE the orchestrator's resolver answers with the current TURN's
+        // issue-time workflow — same rule, conversation-level.
+        workflowUuid: this.resolveTabWorkflowUuid?.(opts.tabId ?? conn.tabId) ?? undefined,
         onDispatchedRid: opts.onDispatchedRid,
       };
       this.dispatch(conn, ctx);

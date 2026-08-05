@@ -166,6 +166,21 @@ describe("SessionStore", () => {
       expect(onDisk.sessions["wf:a.json::claude"].s).toBe("sess-tmpdir");
     });
 
+    it("an existing-but-CORRUPT home file starts EMPTY — never resurrects the tmpdir store", () => {
+      // Missing ≠ corrupt (codex round 1, P1): after the one-shot migration the
+      // tmpdir file is stale by definition. If a later truncated write corrupts
+      // the home file, falling back to tmpdir would resume sessions the user
+      // has since replaced or cleared — a WRONG resume, worse than a lost one.
+      const dir = scratchDir();
+      writeFileSync(
+        LEGACY_FILE,
+        JSON.stringify({ v: 2, sessions: { "orchestrator::claude": { s: "sess-stale", t: Date.now() } } }),
+      );
+      writeFileSync(fileFor(dir), "{truncated-mid-wri"); // corrupt, but EXISTS
+      const store = new SessionStore(PORT, { dir });
+      expect(store.get("orchestrator::claude")).toBeUndefined();
+    });
+
     it("the new location, once present, WINS over the tmpdir file", () => {
       const dir = scratchDir();
       writeFileSync(

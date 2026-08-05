@@ -1011,12 +1011,26 @@ describe("UiBridge (multi-tab)", () => {
       ).rejects.toThrow(/no trusted identity/);
 
       // 3) #884: the agent's session is bound to the SHARED SCOPE, not a tab id.
-      //    A scope-addressed write resolves to the live (migrated) conn and is
-      //    stamped from THAT conn's registry entry — no carry, no browser
-      //    refresh, and the panel still fences on the trusted uuid.
+      //    A scope-addressed write resolves to the live (migrated) conn for
+      //    ROUTING, but its STAMP comes from the SCOPE's registry entry — the
+      //    orchestrator answers a scope caller with the workflow the CURRENT
+      //    TURN was issued for. No carry, no browser refresh, and the panel
+      //    still fences on the trusted uuid.
+      stamps.set(SHARED_SESSION_SCOPE, UUID); // the orchestrator's turn capture
       const after = await bridge.send({ cmd: "graph_add_node" }, { tabId: SHARED_SESSION_SCOPE });
       expect(after).toMatchObject({ ok: true });
       expect(frames.pop()?.workflow_uuid).toBe(UUID);
+
+      // 4) ISSUE-TIME WINS (codex round 1, P0): if the turn was issued for a
+      //    DIFFERENT workflow than the one the active tab now shows, the frame
+      //    must carry the ISSUE-TIME uuid — the panel (comparing against its
+      //    active workflow) then DECLINES, instead of the stamp silently
+      //    re-aiming the mutation at whatever is on screen.
+      const TURN_UUID = "33333333-3333-4333-8333-333333333333";
+      stamps.set(SHARED_SESSION_SCOPE, TURN_UUID);
+      const reaimed = await bridge.send({ cmd: "graph_add_node" }, { tabId: SHARED_SESSION_SCOPE });
+      expect(reaimed).toMatchObject({ ok: true }); // this mock panel accepts; a real one fences
+      expect(frames.pop()?.workflow_uuid).toBe(TURN_UUID); // NOT the conn's own UUID
 
       sock.close();
     });
