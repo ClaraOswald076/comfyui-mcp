@@ -11,6 +11,7 @@ import {
   modelLacksAudioText,
   noAudioPartText,
   openAiAudioFormat,
+  dedupeAudioRefs,
   splitAudioAttachments,
   supportedAudioFormats,
   unsupportedFormatText,
@@ -293,5 +294,39 @@ describe("fetchAudioAttachment", () => {
   it("REFUSES when no ComfyUI URL is configured, rather than returning nothing", async () => {
     const r = await fetchAudioAttachment(undefined, { filename: "a.wav" });
     expect(r.ok === false && r.outcome.status === "refused" && r.outcome.reason).toBe("fetch-failed");
+  });
+});
+
+describe("dedupeAudioRefs — one file attached on two carriers is ONE attachment", () => {
+  it("collapses the same ComfyUI file arriving in both `images` and `audio`", () => {
+    // The panel has two carriers. A composer that populates both would otherwise
+    // spend two of the turn's slots on one sound, and the SECOND copy comes back
+    // to the user as "only 2 audio file(s) fit on one turn" — a refusal of a file
+    // that is already on the request.
+    const refs = [
+      { filename: "song.wav", type: "input" },
+      { filename: "song.wav", type: "input" },
+      { filename: "voice.mp3", type: "input" },
+    ];
+    expect(dedupeAudioRefs(refs)).toEqual([
+      { filename: "song.wav", type: "input" },
+      { filename: "voice.mp3", type: "input" },
+    ]);
+  });
+
+  it("treats an absent `type` as the fetcher's own default, not as a different file", () => {
+    // fetchAudioAttachment sends type=input when the ref omits it, so these two
+    // refs address byte-for-byte the same /view response.
+    expect(dedupeAudioRefs([{ filename: "song.wav" }, { filename: "song.wav", type: "input" }])).toHaveLength(1);
+  });
+
+  it("keeps files that really are different — same name, different folder or type", () => {
+    expect(
+      dedupeAudioRefs([
+        { filename: "song.wav", type: "input" },
+        { filename: "song.wav", type: "output" },
+        { filename: "song.wav", subfolder: "takes", type: "input" },
+      ]),
+    ).toHaveLength(3);
   });
 });
