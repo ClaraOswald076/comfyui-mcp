@@ -3,6 +3,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { logger } from "../utils/logger.js";
 import { SHARED_SESSION_SCOPE } from "../services/session-scope.js";
+import { runningUnderTestRunner } from "../services/panel-secrets.js";
 
 /**
  * Durable SDK session ids, so an agent's memory survives the orchestrator
@@ -95,6 +96,17 @@ export class SessionStore {
   private sessions: Record<string, Entry>;
 
   constructor(port: number, opts: { dir?: string } = {}) {
+    // #866 — guard at the WRITE, not per-test: this store lives in the user's
+    // real ~/.comfyui-mcp, so a test that forgets to pass { dir } must refuse
+    // loudly instead of silently polluting (and then reading back) real state.
+    // Detection keys off the runner's own globals; when uncertain, the write is
+    // allowed — a real user must never be refused their own store.
+    if (!opts.dir && runningUnderTestRunner()) {
+      throw new Error(
+        "Refusing to open the real ~/.comfyui-mcp/sessions store from a test run: " +
+          "pass { dir: <temp dir> } to SessionStore (see #866 — guard at the write, not per-test).",
+      );
+    }
     const dir = opts.dir ?? join(homedir(), ".comfyui-mcp", "sessions");
     this.path = join(dir, `panel-sessions-${port}.json`);
     this.legacyPath = join(tmpdir(), `comfyui-mcp-panel-sessions-${port}.json`);

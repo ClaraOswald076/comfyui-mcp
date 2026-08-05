@@ -54,6 +54,12 @@ afterEach(() => {
 const fileFor = (dir: string, port = PORT) => join(dir, `panel-sessions-${port}.json`);
 
 describe("SessionStore", () => {
+  it("#866 — REFUSES the real-home default under the test runner (guard at the write)", () => {
+    // The store lives in the user's real ~/.comfyui-mcp; a test constructing it
+    // without an explicit { dir } must fail loudly, never silently pollute.
+    expect(() => new SessionStore(PORT)).toThrow(/Refusing to open the real/);
+  });
+
   it("starts empty when no file exists", () => {
     const dir = scratchDir();
     const store = new SessionStore(PORT, { dir });
