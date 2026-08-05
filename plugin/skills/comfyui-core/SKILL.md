@@ -226,8 +226,8 @@ One tool, `queue`, driven by its `action` parameter:
 
 **When ComfyUI is unresponsive or crashed:**
 1. Try `get_system_stats` — if it fails, ComfyUI is down
-2. Use `restart_comfyui` to restart it (preserves launch args from prior `stop_comfyui`)
-3. If restart fails (no saved process info), use `start_comfyui` or ask the user to start it manually
+2. Use `restart_comfyui` with `action: "restart"` (preserves launch args from a prior `action: "stop"`)
+3. If restart fails (no saved process info), use `restart_comfyui` with `action: "start"` or ask the user to start it manually
 4. After ComfyUI is back, re-enqueue any failed/lost workflows
 
 **When a job appears hung (monitor shows `[STALL]`):**

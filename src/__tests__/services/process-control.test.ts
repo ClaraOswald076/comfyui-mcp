@@ -507,7 +507,7 @@ describe("process-control startup readiness", () => {
 });
 
 describe("process-control crash supervision", () => {
-  it("does not restart a supervised child after deliberate stop_comfyui", async () => {
+  it("does not restart a supervised child after deliberate restart_comfyui (action:\"stop\")", async () => {
     process.env.COMFYUI_ALWAYS_RESTART = "1";
     setLaunchInfo();
     const children = mockSpawnedChildren();
@@ -522,9 +522,9 @@ describe("process-control crash supervision", () => {
       }
       if (cmd.includes("netstat") || cmd.includes("lsof")) {
         portCheckCalls += 1;
-        // The first two lookups belong to start_comfyui (the already-running guard
+        // The first two lookups belong to restart_comfyui (action:"start") (the already-running guard
         // and the post-readiness PID). From then until the kill, the port is OWNED:
-        // stop_comfyui looks it up, re-confirms the server that answered still owns
+        // restart_comfyui (action:"stop") looks it up, re-confirms the server that answered still owns
         // it, and re-checks the identity again immediately before killing (#776) —
         // a count-based fixture would break every time that evidence chain grows.
         // After the kill the port is free, so waitForPortFree returns at once.
@@ -760,7 +760,7 @@ describe("findPidByPort resilience to localized netstat state (#449)", () => {
   // platform. (The reachable-diagnostic tests below are platform-agnostic: they
   // resolve no PID on either branch.)
   const winIt = process.platform === "win32" ? it : it.skip;
-  winIt("stop_comfyui finds the listener PID even on non-English Windows", async () => {
+  winIt("restart_comfyui (action:\"stop\") finds the listener PID even on non-English Windows", async () => {
     // Realistic German netstat -ano blob: state column is 'ABHÖREN', not
     // 'LISTENING'. The mock emulates the actual shell pipeline — a chained
     // `findstr LISTENING` (the OLD detector) would filter every line out,

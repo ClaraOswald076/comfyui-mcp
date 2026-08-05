@@ -687,25 +687,15 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
   // -------------------------------------------------------------------------
   // Process Control
   // -------------------------------------------------------------------------
-  start_comfyui: {
-    examples: [
-      {
-        ask: "Start ComfyUI.",
-        args: {},
-        returns:
-          "It launches the server and waits until it is answering, then tells " +
-          "you the URL. Only works for a ComfyUI on this machine.",
-      },
-    ],
-  },
   restart_comfyui: {
     gloss:
-      "The standard next step after installing a node pack — new nodes are not " +
-      "loaded until ComfyUI starts again.",
+      "Starting, stopping and restarting ComfyUI, chosen with `action`. " +
+      "Restarting is the standard next step after installing a node pack — new " +
+      "nodes are not loaded until ComfyUI starts again.",
     examples: [
       {
         ask: "Restart it so the new nodes load.",
-        args: {},
+        args: { action: "restart" },
         returns:
           "The server stops and comes back up, and you are told when it is " +
           "answering again.",
@@ -713,15 +703,18 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
           "Anything queued or rendering is lost. Check the queue is empty first " +
           "if a long job is in flight.",
       },
-    ],
-  },
-  stop_comfyui: {
-    examples: [
       {
         ask: "Shut ComfyUI down, I need the VRAM.",
-        args: {},
+        args: { action: "stop" },
         returns: "Confirmation that the process stopped.",
         caution: "Any running or queued render is lost.",
+      },
+      {
+        ask: "Start ComfyUI again.",
+        args: { action: "start" },
+        returns:
+          "It launches the server and waits until it is answering, then tells " +
+          "you the URL. Only works for a ComfyUI on this machine.",
       },
     ],
   },
@@ -730,28 +723,35 @@ export const TOOL_DOC_EXAMPLES: Readonly<Record<string, ToolDocEntry>> = {
   // Defaults
   // -------------------------------------------------------------------------
   get_defaults: {
+    gloss:
+      "Two separate sets of settings behind one tool, told apart by `action`. " +
+      "`get`/`set` are the values the agent falls back to when you do not say " +
+      "one — stop repeating yourself and set them once. `get_ui`/`set_ui` are " +
+      "ComfyUI's OWN interface settings, the ones its Settings panel writes; " +
+      "changing those changes the ComfyUI web UI, not what the agent renders.",
     examples: [
       {
         ask: "What settings do you use when I don't say?",
-        args: {},
+        args: { action: "get" },
         returns:
           "The current fallback size, steps, cfg, sampler and checkpoint, and " +
           "where each came from.",
       },
-    ],
-  },
-  set_defaults: {
-    gloss:
-      "Stop repeating yourself. Set the values you always want once, and leave " +
-      "them out of every later request.",
-    examples: [
       {
         ask: "Always use 1024 by 1024 and 30 steps, permanently.",
-        args: { values: { width: 1024, height: 1024, steps: 30 }, persist: true },
+        args: { action: "set", values: { width: 1024, height: 1024, steps: 30 }, persist: true },
         returns:
           "Confirmation of the new defaults. `persist: true` writes them to your " +
           "config file so they survive a restart; without it they last only for " +
           "this session.",
+      },
+      {
+        ask: "ComfyUI keeps refusing to open this workflow — loosen its validation.",
+        args: { action: "set_ui", id: "Comfy.Validation.Workflows", value: false },
+        returns:
+          "The old and new value of that ComfyUI interface setting, so you can " +
+          "put it back. Reload the ComfyUI tab for it to take effect — an " +
+          "already-open tab keeps the old value.",
       },
     ],
   },

@@ -170,7 +170,7 @@ const CATEGORIES: Array<{
     slug: "api-nodes",
     icon: "cloud",
     description: "Discover and run hosted partner / API nodes (comfy.org).",
-    tools: ["list_api_nodes", "get_api_node_schema", "generate_with_api_node"],
+    tools: ["list_api_nodes"],
   },
   {
     group: "Install & Environment",
@@ -188,7 +188,7 @@ const CATEGORIES: Array<{
     slug: "process-control",
     icon: "power",
     description: "Start, stop, and restart the ComfyUI process.",
-    tools: ["start_comfyui", "stop_comfyui", "restart_comfyui"],
+    tools: ["restart_comfyui"],
   },
   {
     group: "Defaults, Stats & Skills",
@@ -196,7 +196,7 @@ const CATEGORIES: Array<{
     icon: "sliders",
     description: "Generation defaults, ComfyUI frontend UI settings, history-based suggestions, and skill generation.",
     tools: [
-      "get_defaults", "set_defaults", "get_comfyui_settings", "set_comfyui_setting",
+      "get_defaults",
       "suggest_settings", "generation_stats", "generate_node_skill",
     ],
   },

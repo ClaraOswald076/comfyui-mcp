@@ -74,7 +74,7 @@ async function resolveCheckpointOrThrow(
   if (!checkpoint) {
     throw new ValidationError(
       "No checkpoint specified, defaulted, or found locally. " +
-        "Pass `checkpoint`, set a default via set_defaults, or download one with download_model.",
+        "Pass `checkpoint`, set a default via get_defaults (action:\"set\"), or download one with download_model.",
     );
   }
   return checkpoint;

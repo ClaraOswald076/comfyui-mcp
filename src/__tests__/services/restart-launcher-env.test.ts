@@ -794,10 +794,10 @@ describe("restart_comfyui — irreproducible launcher environments (#776)", () =
     expect(result.isDesktopApp).toBe(false);
   });
 
-  it("does NOT refuse from start_comfyui when the server is ALREADY down — it launches and warns", async () => {
+  it("does NOT refuse from restart_comfyui (action:\"start\") when the server is ALREADY down — it launches and warns", async () => {
     // The refusal exists to protect a RUNNING server. Once ComfyUI is already
     // stopped, refusing would leave it down forever — the one outcome worse than a
-    // possibly-degraded launch. So start_comfyui launches and says so plainly.
+    // possibly-degraded launch. So restart_comfyui (action:"start") launches and says so plainly.
     usePinokio();
     mockLivePortThenFree();
     spawnCapturingChildren();
@@ -2376,7 +2376,7 @@ n127.0.0.1:8188
 
   it("states listener ownership on EVERY return path, including 'another launcher took the port'", async () => {
     // After our stop, a different launcher binds the port during the settle delay,
-    // so start_comfyui exits via its "already running" branch. That branch used to
+    // so restart_comfyui (action:"start") exits via its "already running" branch. That branch used to
     // carry no ownership at all — and since JSON.stringify DROPS undefined, the
     // payload was indistinguishable from an old build that never had the field.
     usePlainInstall();
@@ -2459,9 +2459,9 @@ n127.0.0.1:8188
   // relaunch aimed somewhere else.
   // -------------------------------------------------------------------------
 
-  it("stop_comfyui REFUSES when the target moved while it resolved the instance", async () => {
+  it("restart_comfyui (action:\"stop\") REFUSES when the target moved while it resolved the instance", async () => {
     // A DIRECT stop had no fence at all, and its saved launch record does not repair
-    // the loss: start_comfyui afterwards consults the NEW live target, so it can
+    // the loss: restart_comfyui (action:"start") afterwards consults the NEW live target, so it can
     // refuse as remote or find that port occupied rather than relaunch what was
     // killed (codex gate round 12).
     usePlainInstall();
