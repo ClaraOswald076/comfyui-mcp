@@ -2883,10 +2883,16 @@ describe("defaultBridgeTimeoutMs — tolerant read timeout (#357)", () => {
 
     // The resolver ANSWERS with no stamp → an observed CANNOT (nothing to fence).
     bridge.setTabWorkflowUuidResolver(() => undefined);
+    // A modern panel that advertises both fences but has NO trusted stamp is a
+    // BINDING problem, not an old-pack one: reads work and a rebind fixes it.
+    // Labelling it "capability" sent it to the one remedy that cannot help —
+    // update the pack, hard-refresh — for a pack that was already correct
+    // (codex gate). `canMutate` is a conjunction of four unrelated conditions and
+    // each has to answer for itself.
     expect(bridge.tabGraphMutationCapability(tabId)).toEqual({
       known: true,
       canMutate: false,
-      because: "capability",
+      because: "no_identity",
     });
     expect(bridge.tabCanMutateGraph(tabId)).toBe(false);
 
@@ -2908,6 +2914,27 @@ describe("defaultBridgeTimeoutMs — tolerant read timeout (#357)", () => {
     // so the recovery told users to update their panel pack and hard-refresh
     // when the tab was simply gone and their READS were failing too (codex gate
     // P1). Same boolean, opposite remedy: the cause is what separates them.
+    // A socket that is CLOSING is reachable but cannot carry a write. That is a
+    // transport state, not an old panel — folding it into "capability" told the
+    // user to update a pack that was already correct (codex gate).
+    bridge.setTabWorkflowUuidResolver(() => "11111111-1111-4111-8111-111111111111");
+    const sock = (bridge as unknown as { conns: Map<string, { sock: { readyState: number } }> });
+    const conn = sock.conns?.get(tabId);
+    if (conn) {
+      Object.defineProperty(conn.sock, "readyState", {
+        value: 2 /* CLOSING */,
+        configurable: true,
+      });
+      expect(bridge.tabGraphMutationCapability(tabId)).toEqual({
+        known: true,
+        canMutate: false,
+        because: "disconnected",
+      });
+      Object.defineProperty(conn.sock, "readyState", { value: 1, configurable: true });
+    } else {
+      throw new Error("test setup: expected a live connection for " + tabId);
+    }
+
     const unroutable = bridge.tabGraphMutationCapability("no-such-tab");
     expect(unroutable).toEqual({ known: true, canMutate: false, because: "unroutable" });
     // The load-bearing assertion is that these two do NOT compare equal.

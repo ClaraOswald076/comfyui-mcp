@@ -2251,7 +2251,11 @@ export class UiBridge {
     tabId: string,
   ):
     | { known: true; canMutate: true }
-    | { known: true; canMutate: false; because: "unroutable" | "capability" }
+    | {
+        known: true;
+        canMutate: false;
+        because: "unroutable" | "disconnected" | "no_identity" | "capability";
+      }
     | { known: false; reason: string } {
     let conn: Conn;
     try {
@@ -2268,15 +2272,23 @@ export class UiBridge {
     }
     try {
       const stamp = this.resolveTabWorkflowUuid?.(tabId);
-      const canMutate =
-        conn.sock.readyState === WebSocket.OPEN &&
-        conn.enforcesWorkflowStamp &&
-        conn.enforcesWorkflowStampAtWrite &&
-        typeof stamp === "string" &&
-        stamp.length > 0;
-      return canMutate
-        ? { known: true, canMutate: true }
-        : { known: true, canMutate: false, because: "capability" };
+      // `canMutate` is a conjunction of four unrelated conditions, and folding
+      // all four into "capability" sent three of them to the one remedy that
+      // cannot help (codex gate). Each is reported as itself, most transient
+      // first — a closing socket is not an old panel, and a modern panel with no
+      // trusted stamp is a BINDING problem that reads survive and a rebind fixes.
+      if (conn.sock.readyState !== WebSocket.OPEN) {
+        return { known: true, canMutate: false, because: "disconnected" };
+      }
+      if (!conn.enforcesWorkflowStamp || !conn.enforcesWorkflowStampAtWrite) {
+        // The only genuinely version-shaped cause: this build does not advertise
+        // the write-boundary fence, and no retry can add it.
+        return { known: true, canMutate: false, because: "capability" };
+      }
+      if (typeof stamp !== "string" || stamp.length === 0) {
+        return { known: true, canMutate: false, because: "no_identity" };
+      }
+      return { known: true, canMutate: true };
     } catch (err) {
       // The stamp resolver threw: the capability inputs could not be read, so the
       // answer is unknown — NOT "the panel lacks the capability".

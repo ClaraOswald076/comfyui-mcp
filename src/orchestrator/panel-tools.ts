@@ -2431,7 +2431,7 @@ function describeFenceRebind(
    * both yield `canMutate:false` but need opposite advice, and narrating the
    * first as the second is a bucket standing in for a cause (codex gate P1).
    */
-  refusalCause?: "unroutable" | "capability",
+  refusalCause?: "unroutable" | "disconnected" | "no_identity" | "capability",
 ): {
   binding: "bound" | "reads_only" | "unverified" | "not_recovered";
   note: string;
@@ -2452,7 +2452,21 @@ function describeFenceRebind(
   // Its own remedy, NOT the reload sentence: re-calling this tool cannot add a
   // missing panel capability, so telling the caller to "call this again" here
   // would be another instruction that provably cannot work.
-  const mutationCaveat = mutationsRefused && refusalCause === "unroutable"
+  const mutationCaveat = mutationsRefused && refusalCause === "disconnected"
+    ? `\n\nBUT this tab's panel socket is CLOSING or already closed, so graph mutations are ` +
+      `refused. That is a transport state, not a panel-version problem: the pack is fine and ` +
+      `hard-refreshing is not the fix. Reads through this session are unreliable until it ` +
+      `reconnects.` +
+      `\n\nWHAT TO DO: wait for the panel to reconnect — it does so on its own — then call ` +
+      `this again.`
+    : mutationsRefused && refusalCause === "no_identity"
+    ? `\n\nBUT graph MUTATIONS are refused because this session has no trusted workflow ` +
+      `identity for the tab to fence a write against. The panel build is FINE — it advertises ` +
+      `the write fence — so updating the pack and hard-refreshing will not help. Reads work.` +
+      `\n\nWHAT TO DO: call this tool again to bind an identity. If it keeps coming back ` +
+      `without one, have the user click into the workflow tab so the panel reports an active ` +
+      `canvas, then call this again.`
+    : mutationsRefused && refusalCause === "unroutable"
     ? `\n\nBUT this tab is NOT REACHABLE from the orchestrator right now, so graph mutations ` +
       `are refused — and reads are not working either, whatever this note says about them. ` +
       `This is NOT a panel-version problem: updating the pack and hard-refreshing cannot help, ` +
@@ -3033,18 +3047,37 @@ function identityVerdict(rec: OpenWorkflowRecord, activeObj: unknown): boolean |
   // contradicted one, and it could mint the very instance-mismatch wedge this
   // recovery exists to clear.
   //
-  // Only SAME-FIELD pairs can contradict. The cross pairs below (key↔routing_key)
-  // are alias attempts: their agreement is evidence, but their disagreement means
-  // only "these two namespaces differ", which is ordinary. Treating that as a
-  // contradiction would be this same fold pointed the other way — a false refusal
-  // of a real match.
-  const sameField: Array<[unknown, unknown]> = [
-    [r.key, a.key],
-    [r.path, a.path],
-    [r.routing_key, a.routing_key],
+  // Only SAME-FIELD pairs can contradict DECISIVELY here. The cross pairs below
+  // (key↔routing_key) are alias attempts: their agreement is evidence, but their
+  // disagreement means only "these two namespaces differ", which is ordinary.
+  //
+  // Note what the tail of this function still does: when the ONLY comparable
+  // pairs were cross ones and none agreed, it returns `false` rather than
+  // `undefined`. That is deliberately conservative — `false` refuses the
+  // adoption, and refusing to replace a command fence on an uncorroborated
+  // reading is the safe direction. It is not a claim that the two identities
+  // were proven different, and nothing downstream may read it as one.
+  // Compared through the SAME canonicalizer the rest of this file uses, not as
+  // raw strings (codex gate). `./workflows/a.json` and `workflows/a.json` are one
+  // saved identity; declaring them a contradiction would refuse a legitimate
+  // recovery — this defect class pointed the other way, which is exactly what the
+  // contradiction check was added to avoid committing.
+  //
+  // `key` is compared raw because it is an opaque panel handle with no path
+  // syntax to normalize; the other two are paths and are normalized as such.
+  const sameField: Array<[unknown, unknown, (v: unknown) => string | null]> = [
+    [r.key, a.key, (v) => (nonEmpty(v) ? v : null)],
+    [r.path, a.path, canonicalSavedWorkflowPath],
+    [r.routing_key, a.routing_key, canonicalSavedWorkflowRoutingIdentity],
   ];
-  for (const [x, y] of sameField) {
-    if (nonEmpty(x) && nonEmpty(y) && x !== y) return false;
+  for (const [x, y, canon] of sameField) {
+    if (!nonEmpty(x) || !nonEmpty(y)) continue;
+    const cx = canon(x);
+    const cy = canon(y);
+    // If either side does not canonicalize, we could not compare them — which is
+    // not the same as finding them different. Leave it to the pair loop below.
+    if (cx === null || cy === null) continue;
+    if (cx !== cy) return false;
   }
 
   let comparable = false;
@@ -4026,7 +4059,11 @@ export interface PanelToolCtx {
    */
   tabGraphMutationCapability?: () =>
     | { known: true; canMutate: true }
-    | { known: true; canMutate: false; because: "unroutable" | "capability" }
+    | {
+        known: true;
+        canMutate: false;
+        because: "unroutable" | "disconnected" | "no_identity" | "capability";
+      }
     | { known: false; reason: string };
 }
 
@@ -7355,7 +7392,7 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         // fence" — a claim about the panel built from our own failure to look
         // (codex gate). Only an OBSERVED negative may say that.
         let canMutateNow: boolean | undefined;
-        let refusalCause: "unroutable" | "capability" | undefined;
+        let refusalCause: "unroutable" | "disconnected" | "no_identity" | "capability" | undefined;
         try {
           if (ctx.tabGraphMutationCapability) {
             const cap = ctx.tabGraphMutationCapability();

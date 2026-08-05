@@ -4706,6 +4706,29 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
   // uncorroborated top-level `active` "is never a safe source for replacing a
   // command fence". These cases hold the rebind to it.
 
+  it("ADOPTS when the identities differ only in path SYNTAX — a contradiction check must not refuse a real match", async () => {
+    // The contradiction check compares through the same canonicalizer the rest of
+    // this file uses. Comparing raw strings would call "./workflows/a.json" and
+    // "workflows/a.json" a contradiction and refuse a legitimate recovery — this
+    // defect class pointed the other way, which is precisely what the check was
+    // added to avoid committing (codex gate).
+    const { bridge, refresh, tab } = fenceBridge({
+      fence: STALE,
+      active: {
+        path: "./workflows/a.json",
+        routing_key: "wf:workflows/a.json",
+        workflow_uuid: LIVE,
+      },
+      workflows: [
+        { path: "workflows/a.json", routing_key: "wf:workflows/a.json", active: true },
+      ],
+    });
+    const { res } = await setCurrent(bridge, tab);
+
+    expect(refresh).toHaveBeenCalledExactlyOnceWith(tab, LIVE);
+    expect(res.isError).toBeFalsy();
+  });
+
   it("REFUSES a PARTIAL contradiction — one matching field never outvotes a conflicting one", async () => {
     const OTHER = "33333333-3333-4333-8333-333333333333";
     const { bridge, refresh, tab, currentStamp } = fenceBridge({
@@ -5101,6 +5124,52 @@ describe("panel-tools: mode:'current' re-derives the workflow command fence (#77
     // And it must not leave "reads work" standing, which is false for a tab that
     // cannot be routed to at all.
     expect(text).toMatch(/reads are not working either/);
+  });
+
+  it("does NOT blame the panel version when the socket is merely CLOSING", async () => {
+    // Transport, not version. Folding this into "capability" told the user to
+    // update a pack that was already correct (codex gate).
+    const { bridge, tab } = fenceBridge({
+      fence: STALE,
+      active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
+    });
+    const ctx = makePanelToolCtx(bridge, tab, new WorkflowTargetStore());
+    ctx.tabGraphMutationCapability = () => ({
+      known: true,
+      canMutate: false,
+      because: "disconnected" as const,
+    });
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    const text = (res.content[0] as { text: string }).text;
+
+    expect(text).toMatch(/socket is CLOSING/);
+    expect(text).not.toMatch(/update the comfyui-mcp-panel pack/);
+    expect(text).toMatch(/wait for the panel to reconnect/);
+  });
+
+  it("does NOT blame the panel version when only the workflow IDENTITY is missing", async () => {
+    // A modern panel advertising both fences, with no trusted stamp. Reads work
+    // and a rebind is the fix — so "no rebind can add it" and "update the pack"
+    // are both false here (codex gate).
+    const { bridge, tab } = fenceBridge({
+      fence: STALE,
+      active: { path: "workflows/a.json", routing_key: "wf:workflows/a.json", workflow_uuid: LIVE },
+    });
+    const ctx = makePanelToolCtx(bridge, tab, new WorkflowTargetStore());
+    ctx.tabGraphMutationCapability = () => ({
+      known: true,
+      canMutate: false,
+      because: "no_identity" as const,
+    });
+    const res = await defByName("panel_set_workflow_target").handler({ mode: "current" }, ctx);
+    const text = (res.content[0] as { text: string }).text;
+
+    expect(text).toMatch(/no trusted workflow identity/);
+    expect(text).toMatch(/panel build is FINE/);
+    expect(text).not.toMatch(/update the comfyui-mcp-panel pack/);
+    // The old wording actively told the caller a retry could not help. It can.
+    expect(text).not.toMatch(/including calling this tool again — can add it/);
+    expect(text).toMatch(/call this tool again to bind an identity/);
   });
 
   it("reports `unverified` — not `bound` — when the write capability cannot be determined", async () => {
