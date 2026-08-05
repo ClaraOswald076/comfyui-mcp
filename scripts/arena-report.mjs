@@ -39,8 +39,10 @@ export function suspectScenarioLines(data) {
   // meaningful WITHIN one known version: pool the majority cohort, exclude
   // unversioned entries (their version is unknown, not "the same") and any
   // minority-version ones. An all-legacy board yields no suspects at all.
-  const versionOf = (m) =>
-    m.mcpVersion ?? (Array.isArray(m.mcpVersions) && m.mcpVersions.length === 1 ? m.mcpVersions[0] : undefined);
+  // Only a direct mcpVersion stamp counts: a best-of range that MIXED a
+  // stamped and an unstamped run keeps mcpVersions but drops mcpVersion, and
+  // that range is not safely one version.
+  const versionOf = (m) => m.mcpVersion;
   const cohorts = new Map();
   for (const m of board) {
     const v = versionOf(m);

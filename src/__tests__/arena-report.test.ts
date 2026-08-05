@@ -167,6 +167,17 @@ describe("arena-report (#792)", () => {
     };
     expect(suspectScenarioLines(withPartial)).toHaveLength(1);
 
+    // a best-of range that MIXED a stamped and an unstamped run keeps
+    // mcpVersions but drops mcpVersion — it is NOT safely one version
+    const mixedRange = {
+      ...data,
+      leaderboard: [
+        entry({ model: "a", mcpVersion: undefined, mcpVersions: ["0.49.6"], results: [mkFail("panel_screenshot")] }),
+        entry({ model: "b", mcpVersion: undefined, mcpVersions: ["0.49.6"], results: [mkFail("panel_screenshot")] }),
+      ],
+    };
+    expect(suspectScenarioLines(mixedRange)).toHaveLength(0);
+
     // two models on DIFFERENT comfyui-mcp versions are not one field —
     // tool descriptions may differ between versions
     const crossVersion = {
