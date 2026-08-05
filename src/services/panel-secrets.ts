@@ -1690,6 +1690,8 @@ export function setPanelSecret(slotId: string, value: string): SlotSaveOutcome {
   let damaged = false;
   let strandedKeys: string[] = [];
   let unverifiedKeys: string[] = [];
+  /** Credentials the ROLLBACK's own writes cost, on top of the fan-out's. */
+  const restoreLostKeys = new Set<string>();
   /** Aggregated once, here, so no consumer of a slot save has to reach into the
    *  receipts to learn that the store lost credentials. */
   const lostKeysOf = (rs: SecretSaveReceipt[]) => [
@@ -1752,9 +1754,14 @@ export function setPanelSecret(slotId: string, value: string): SlotSaveOutcome {
       // the in-process copy when the store is unreadable and would therefore
       // "confirm" a restore that never reached disk.
       for (const { key, previous, wasShellProvided } of before) {
-        const state = restoreEnvKey(key, previous, wasShellProvided);
+        const { state, lostKeys } = restoreEnvKey(key, previous, wasShellProvided);
         if (state === "stranded") strandedKeys.push(key);
         else if (state === "unverified") unverifiedKeys.push(key);
+        // A ROLLBACK is a store write like any other, so it can lose credentials
+        // like any other — and dropping that here because the headline is
+        // already a failure would hide the worse half of what happened. Same
+        // rule, same place, no second mechanism.
+        for (const k of lostKeys) restoreLostKeys.add(k);
       }
       return {
         slot: slotId,
@@ -1763,7 +1770,7 @@ export function setPanelSecret(slotId: string, value: string): SlotSaveOutcome {
         rolledBack: strandedKeys.length === 0 && unverifiedKeys.length === 0,
         strandedKeys,
         unverifiedKeys,
-        lostKeys: lostKeysOf(receipts),
+        lostKeys: [...new Set([...lostKeysOf(receipts), ...restoreLostKeys])],
       };
     },
     (result) => {
@@ -1803,12 +1810,23 @@ export function setPanelSecret(slotId: string, value: string): SlotSaveOutcome {
  *   "stranded"   — the store proves it still carries the new value.
  *   "unverified" — the store could not be read, so neither is established.
  * Never collapses "unverified" into either verdict.
+ *
+ * Also returns any OTHER credentials the restore's own writes cost. A rollback
+ * is a store rewrite like any other and can lose keys like any other; the
+ * caller folds these into the slot outcome so a rollback's damage travels the
+ * same path as a save's rather than needing its own reporting.
  */
 function restoreEnvKey(
   key: string,
   previous: string | undefined,
   wasShellProvided: boolean,
-): "restored" | "stranded" | "unverified" {
+): { state: "restored" | "stranded" | "unverified"; lostKeys: string[] } {
+  const lostKeys = new Set<string>();
+  const done = (state: "restored" | "stranded" | "unverified") => ({
+    state,
+    // A key this restore is itself putting back is not collateral.
+    lostKeys: [...lostKeys].filter((k) => k !== key),
+  });
   // Already as it was? Then this call never changed it — rewriting would be a
   // pointless write that can itself fail and manufacture a "stranded" verdict
   // for a key that was never touched.
@@ -1826,31 +1844,31 @@ function restoreEnvKey(
       else process.env[key] = previous;
       if (wasShellProvided) unmarkFileDerived(key);
       else if (previous !== undefined) markFileDerived(key);
-      return "restored";
+      return done("restored");
     }
   }
   try {
     if (wasShellProvided) {
       // The value belongs to the ENVIRONMENT, not to the store: drop whatever we
       // wrote and hand precedence back, rather than persisting a shell secret.
-      removeEnvFileKey(key);
+      for (const k of removeEnvFileKey(key).lostKeys) lostKeys.add(k);
       if (previous === undefined) delete process.env[key];
       else process.env[key] = previous;
       unmarkFileDerived(key);
     } else if (previous === undefined) {
-      removeEnvSecret(key);
+      for (const k of removeEnvSecret(key).lostKeys) lostKeys.add(k);
     } else {
-      setEnvSecret(key, previous);
+      for (const k of setEnvSecret(key, previous).lostKeys ?? []) lostKeys.add(k);
     }
   } catch {
-    return "stranded";
+    return done("stranded");
   }
   const parsed = parseEnvFile();
-  if (parsed === null) return "unverified";
+  if (parsed === null) return done("unverified");
   const inStore = parsed[key];
-  if (wasShellProvided) return inStore === undefined ? "restored" : "stranded";
-  if (previous === undefined) return inStore === undefined ? "restored" : "stranded";
-  return inStore === previous ? "restored" : "stranded";
+  if (wasShellProvided) return done(inStore === undefined ? "restored" : "stranded");
+  if (previous === undefined) return done(inStore === undefined ? "restored" : "stranded");
+  return done(inStore === previous ? "restored" : "stranded");
 }
 
 /** True when EVERY key of a slot save is proven to have landed. A single alias
