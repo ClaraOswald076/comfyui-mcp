@@ -70,6 +70,34 @@ describe("splitAudioAttachments", () => {
     expect(audio.map((a) => a.filename)).toEqual(["song.mp3", "voice.wav"]);
   });
 
+  it("claims the audio containers people actually have, not just the obvious four", () => {
+    // A missed extension is not a cosmetic gap: the file goes down the IMAGE
+    // path, whose fetcher relabels the bytes image/png, and the user is told we
+    // could not SEE their audiobook rather than how to convert it.
+    const { audio, images } = splitAudioAttachments([
+      { filename: "book.m4b" },
+      { filename: "set.mka" },
+      { filename: "track.mpga" },
+      { filename: "voice.spx" },
+      { filename: "clip.weba" },
+      { filename: "shot.png" },
+    ]);
+    expect(audio.map((a) => a.filename)).toEqual([
+      "book.m4b",
+      "set.mka",
+      "track.mpga",
+      "voice.spx",
+      "clip.weba",
+    ]);
+    expect(images.map((i) => i.filename)).toEqual(["shot.png"]);
+    // m4b/mpga/weba are real containers we CAN encode; mka/spx are not.
+    expect(audioMimeForFilename("book.m4b")).toBe("audio/mp4");
+    expect(audioMimeForFilename("track.mpga")).toBe("audio/mpeg");
+    expect(audioMimeForFilename("clip.weba")).toBe("audio/webm");
+    expect(audioMimeForFilename("set.mka")).toBeNull();
+    expect(audioMimeForFilename("voice.spx")).toBeNull();
+  });
+
   it("handles an undefined list without inventing entries", () => {
     expect(splitAudioAttachments(undefined)).toEqual({ images: [], audio: [] });
   });

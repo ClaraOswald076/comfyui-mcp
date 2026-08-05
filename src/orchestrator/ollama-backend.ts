@@ -1599,6 +1599,17 @@ export class OllamaBackend implements AgentBackend {
       logger.warn(`[ollama-backend] tool-server respawn failed after model switch: ${msgOf(err)}`);
     }
     if (this.toolModeDecision) {
+      // The system prompt is written once, when a session opens — but a LIVE
+      // model switch changes the surface underneath an existing conversation.
+      // Leaving the old prompt in history is not a cosmetic mismatch: it tells a
+      // model now holding the whole catalog that it "has exactly six tools" and
+      // must go through call_tool, so the auto-selected surface goes unused.
+      // Rewrite it to match what was actually spawned. resolvePrompt still
+      // returns a USER override unchanged, so a customised prompt is untouched.
+      const system = this.history[0];
+      if (system?.role === "system") {
+        system.content = resolvePrompt("backend.ollama", ollamaSystemPrompt(this.toolModeDecision.mode));
+      }
       logger.info(`[ollama-backend] ${this.toolModeDecision.explain}`);
     } else {
       // connectTools swallows a connect failure, so an absent decision here is

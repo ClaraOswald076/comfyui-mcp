@@ -667,6 +667,46 @@ describe("#788 — a live model switch reconciles the tool surface", () => {
     expect(anyBackend.toolModeDecision?.source).toBe("model-parameters");
   });
 
+  it("rewrites the system prompt of a LIVE conversation when the surface changes", async () => {
+    // The prompt is written once, when the session opens. A live switch changes
+    // the surface underneath an existing conversation, so leaving the old text
+    // in history tells a model now holding the whole catalog that it "has
+    // exactly six tools" - and the auto-selected surface goes unused.
+    const backend = new OllamaBackend({
+      model: "qwen3:4b",
+      mcpServers: { comfyui: { transport: "stdio", command: "node", args: [], env: {} } },
+    });
+    const anyBackend = backend as unknown as {
+      connectTools: () => Promise<void>;
+      comfy: unknown;
+      comfyTools: unknown[];
+      comfySpecEnv: Record<string, string> | undefined;
+      toolModeDecision: unknown;
+      model: string;
+    };
+    anyBackend.connectTools = async () => {
+      anyBackend.comfySpecEnv = {};
+      anyBackend.comfy = fakeMcpClient();
+      const { comfyuiSpawnToolMode } = await import("../../orchestrator/ollama-backend.js");
+      anyBackend.toolModeDecision = comfyuiSpawnToolMode({}, {}, anyBackend.model);
+      anyBackend.comfyTools = [];
+    };
+    await backend.prepare();
+    await collect(backend, turnsOf({ text: "first" })); // opens the session on COMPACT
+    const firstSystem = (chatRequests[0].messages as Array<Record<string, unknown>>).find(
+      (m) => m.role === "system",
+    ) as { content: string };
+    expect(firstSystem.content).toContain("exactly six tools");
+
+    await backend.setModel("llama3.3:70b"); // same conversation, new surface
+    await collect(backend, turnsOf({ text: "second" }));
+    const laterSystem = (chatRequests.at(-1)!.messages as Array<Record<string, unknown>>).find(
+      (m) => m.role === "system",
+    ) as { content: string };
+    expect(laterSystem.content).toContain("advertised to you DIRECTLY");
+    expect(laterSystem.content).not.toContain("exactly six tools");
+  });
+
   it("a FAILED respawn is retried on the next turn instead of being treated as done", async () => {
     let connects = 0;
     let failNext = false;

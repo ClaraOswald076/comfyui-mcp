@@ -55,8 +55,12 @@ export const AUDIO_MIME_BY_EXT: Readonly<Record<string, string>> = Object.freeze
   opus: "audio/opus",
   flac: "audio/flac",
   m4a: "audio/mp4",
+  m4b: "audio/mp4",
   aac: "audio/aac",
+  mpga: "audio/mpeg",
+  mp2: "audio/mpeg",
   webm: "audio/webm",
+  weba: "audio/webm",
 });
 
 /**
@@ -89,6 +93,13 @@ export const AUDIO_EXT_NOT_ENCODABLE: readonly string[] = Object.freeze([
   "caf",
   "voc",
   "8svx",
+  "mka",
+  "m4p",
+  "spx",
+  "awb",
+  "aa",
+  "aax",
+  "qcp",
 ]);
 
 /** True when a filename is audio-SHAPED, whether or not we can encode it. Used
