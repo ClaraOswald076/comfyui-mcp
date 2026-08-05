@@ -897,6 +897,67 @@ describe("getEnvironment", () => {
     }
   });
 
+  it("says the comparison could NOT BE MADE, not that it failed, when the server reports no python", async () => {
+    // `pythonVersionsAgree` returns false when EITHER side is missing, so an unreported
+    // server python fell into the mismatch branch and the reason read "does not match the
+    // running ComfyUI python (unreported)" — asserting a disagreement nobody observed.
+    // One verdict, two causes, and the message named the wrong one; a user reading it
+    // would go hunting for a version conflict that does not exist.
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    try {
+      mockGetSystemStats.mockResolvedValueOnce({
+        system: { os: "nt", comfyui_version: "0.27.1", embedded_python: false, argv: [] },
+        devices: [],
+      });
+      h.mockLiveInterpreter.mockReturnValue({ python: exe, source: "process-table", pid: 77 });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version")) return { stdout: "Python 3.13.12\n" };
+        if (args.includes("pip")) return { stdout: "Name: torch\nVersion: 9.9.9\n" };
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      // Still fail-closed — an unverified match is not a verified one.
+      expect(env.local.python_probe_trusted).toBe(false);
+      expect(env.local.packages).toBeUndefined();
+      // …but the REASON must describe what actually happened. Asserting only the state
+      // would pass on the old, wrong message too.
+      expect(env.local.python_probe_reason).toMatch(/could\s+NOT be compared/);
+      expect(env.local.python_probe_reason).toMatch(/unverified match, not a mismatch/);
+      expect(env.local.python_probe_reason).not.toMatch(/does not match the running/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("trusts a launched-by-us interpreter even when no cross-check was possible", async () => {
+    // The other direction. We CHOSE this interpreter and spawned the process; a
+    // corroboration we never needed being unavailable is not a reason to withhold a
+    // package list we genuinely know.
+    const dir = await tmpDir();
+    const exe = await stageWorkspace(dir);
+    try {
+      mockGetSystemStats.mockResolvedValueOnce({
+        system: { os: "nt", comfyui_version: "0.27.1", embedded_python: false, argv: [] },
+        devices: [],
+      });
+      h.mockLiveInterpreter.mockReturnValue({ python: exe, source: "launched-by-us", pid: 78 });
+      setExecFileResponder((_cmd, args) => {
+        if (args.includes("--version")) return { stdout: "Python 3.13.12\n" };
+        if (args.includes("pip")) return { stdout: "Name: torch\nVersion: 2.9.0\n" };
+        return new Error("nope");
+      });
+
+      const env = await getEnvironment();
+      expect(env.local.python_probe_trusted).toBe(true);
+      expect(env.local.packages?.torch).toBe("2.9.0");
+      expect(env.local.python_probe_reason).toMatch(/no\s+cross-check was possible/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("compares the FULL python version, not just major.minor", async () => {
     const dir = await tmpDir();
     const exe = await stageWorkspace(dir);

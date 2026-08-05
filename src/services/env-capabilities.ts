@@ -24,6 +24,7 @@ import { isForceRemoteFlagSet } from "../config.js";
 import { resolveComfyuiPython, pythonVersionsAgree } from "./workspace-env.js";
 import { resolveLiveInterpreter } from "./live-interpreter.js";
 import { parsePyproject } from "./node-authoring.js";
+import { logger } from "../utils/logger.js";
 
 // The interpreter resolver lives in workspace-env (which owns ComfyUI-base
 // resolution) so get_environment and this panel probe share ONE live-first
@@ -417,6 +418,72 @@ export function probeTritonSage(
 }
 
 /**
+ * Packages the RUNNING server's own launch flags PROVE are importable in whatever
+ * environment it is actually using (#401 recurrence, 0.49.4).
+ *
+ * This is an observation, not an inference. ComfyUI does not merely *prefer* these
+ * backends — it calls `exit(-1)` during startup when the flag is given and the module
+ * cannot be imported (`comfy/ldm/modules/attention.py`: "To use the
+ * `--use-sage-attention` feature, the `sageattention` package must be installed
+ * first."). So a server that is UP, answering `/system_stats`, and reporting the flag in
+ * its OWN `sys.argv` has already demonstrated the import succeeded. `argv` here is the
+ * server's self-report, which is exactly the right question — "what is the process that
+ * answered me running with?" — not a layout guess.
+ *
+ * Only flags with that hard fail-fast contract belong here. A flag that merely enables an
+ * optional path would make this fabricate a positive.
+ */
+const ARGV_PROVEN_PACKAGES: ReadonlyArray<{
+  pkg: "triton" | "sageattention";
+  flag: string;
+}> = [{ pkg: "sageattention", flag: "--use-sage-attention" }];
+
+/**
+ * Which of the packages we report are proven present by the running server's argv.
+ * Tolerant of `--flag=value` spellings and of argv entries that are not strings.
+ */
+export function packagesProvenByServerArgv(
+  argv: string[] | undefined,
+): Set<"triton" | "sageattention"> {
+  const proven = new Set<"triton" | "sageattention">();
+  if (!Array.isArray(argv)) return proven;
+  const tokens = argv
+    .filter((t): t is string => typeof t === "string")
+    .map((t) => t.trim().split("=")[0].toLowerCase());
+  for (const { pkg, flag } of ARGV_PROVEN_PACKAGES) {
+    if (tokens.includes(flag)) proven.add(pkg);
+  }
+  return proven;
+}
+
+/**
+ * Did the interpreter we probed CONTRADICT something the running server proved?
+ *
+ * Returns the name of the first contradicted package, or undefined. A contradiction is
+ * decisive evidence about the SOURCE, not just about that one datum: an interpreter that
+ * reports "sageattention is absent" for a server that could not have started without
+ * sageattention is provably not the environment the server imports from, so every
+ * negative it produced is worthless — including the ones nothing happens to contradict.
+ *
+ * This is the hole the 0.49.4 recurrence fell through. The previous guard cross-checked
+ * the probe's python version against `/system_stats`, but a venv reports the SAME
+ * `sys.version` as the base interpreter it was created from — by construction. So the
+ * version check can never separate a venv from its base, which is precisely the confusion
+ * that produces a wrong-environment probe, and "versions agree" was read as corroboration
+ * when it carried no information at all.
+ */
+export function contradictedPackage(
+  probe: { triton: TriState; sageattention: TriState } | undefined,
+  proven: Set<"triton" | "sageattention">,
+): "triton" | "sageattention" | undefined {
+  if (!probe) return undefined;
+  for (const pkg of proven) {
+    if (probe[pkg] === "not-installed") return pkg;
+  }
+  return undefined;
+}
+
+/**
  * Reconcile a raw import-probe tri-state against how much we trust the interpreter
  * we probed (#401). A definitive "not-installed" is only believable when we probed
  * ComfyUI's OWN python — i.e. the LIVE interpreter resolved from the running server's
@@ -685,14 +752,38 @@ export async function gatherEnvCapabilities(opts: GatherOptions): Promise<EnvCap
   // the false negative that made an agent disable working acceleration (#401).
   // A positive ("installed") always passes through: it can't be a harmful false
   // negative, and the log-marker check below only ever reinforces a positive.
+  //
+  // Before any of that: if the probe contradicts something the SERVER's own launch flags
+  // prove, the probe is looking at the wrong environment and every negative it produced
+  // is void — not just the contradicted one. That is the 0.49.4 recurrence exactly: a
+  // server running with --use-sage-attention (which it could not have started without)
+  // while the probed interpreter reported BOTH sageattention and triton absent. Voiding
+  // only sageattention would have left the false "Triton: not installed" standing, which
+  // is the finding that made an agent strip working acceleration in the first place.
+  const provenByArgv = packagesProvenByServerArgv(statsArgv);
+  const contradicted = contradictedPackage(ts, provenByArgv);
+  if (contradicted) {
+    logger.info(
+      "Discarding this interpreter's negative capability results: it contradicts the running ComfyUI's own launch flags",
+      {
+        contradicted,
+        probePython: ts?.pythonVersion ?? "(unreported)",
+        runningPython: statsPythonRaw ?? "(unreported)",
+      },
+    );
+  }
   const reconcile = (state: TriState | undefined): TriState =>
     reconcileProbeState(state, {
-      observed,
+      observed: observed && !contradicted,
       runningPython: statsPythonRaw ?? caps.python,
       probePython: ts?.pythonVersion,
     });
   caps.triton = reconcile(ts?.triton);
   caps.sageattention = reconcile(ts?.sageattention);
+  // The launch flag is a stronger observation than any local import probe — it is the
+  // running process telling us what it loaded. Applied after reconcile so it can only
+  // ever raise a state to "installed", never lower one.
+  for (const pkg of provenByArgv) caps[pkg] = "installed";
 
   // A positive signal from the ComfyUI HOST's log wins over the local python probe:
   // in remote mode (pod) the probe can't reach the host, and even locally the log
@@ -745,10 +836,24 @@ export function applyStats(caps: EnvCapabilities, stats: SystemStatsLike): void 
 // formatEnvBlock — PURE: caps → compact single-line block (unit tested)
 // ---------------------------------------------------------------------------
 
+/**
+ * Render one capability tri-state for the banner.
+ *
+ * "unknown" USED to be omitted, which is where the whole three-state model was thrown
+ * away: an omitted Triton line and a Triton line that says "absent" are the same text to
+ * the reader, and the guidance sentence below tells the agent that absence means "default
+ * to sdpa + no torch.compile". So every careful degrade-to-unknown upstream landed on the
+ * agent as the false negative it was avoiding. "unknown" is now SAID, and said in a form
+ * that cannot be skimmed as a negative.
+ *
+ * `undefined` (the field was never populated at all) is still omitted — that is a
+ * different thing from a probe that ran and could not decide.
+ */
 function triLabel(state: TriState | undefined): string | undefined {
   if (state === "installed") return "installed";
   if (state === "not-installed") return "not installed";
-  return undefined; // unknown → omit
+  if (state === "unknown") return "UNKNOWN (probe could not verify — NOT a negative)";
+  return undefined;
 }
 
 /**
@@ -812,8 +917,12 @@ export function formatEnvBlock(caps: EnvCapabilities): string {
   const head = `ENVIRONMENT (live, this machine): ${parts.join(" · ")}.`;
   const guidance =
     " Use this for model/precision/VRAM choices, OS-correct install commands, and the" +
-    " acceleration decision — if Triton/SageAttention are absent, default to sdpa + no" +
-    " torch.compile (see the triton-sageattention skill) and offer to install.";
+    " acceleration decision — default to sdpa + no torch.compile (see the" +
+    " triton-sageattention skill) and offer to install ONLY where this line says" +
+    " \"not installed\". \"UNKNOWN\" means the probe could not verify which interpreter the" +
+    " running ComfyUI uses; it is NOT a report of absence. Never disable Triton/" +
+    "SageAttention or edit a user's workflow on an UNKNOWN — call get_environment" +
+    " (python_probe_reason says what could not be established) or ask the user first.";
   return head + guidance;
 }
 
