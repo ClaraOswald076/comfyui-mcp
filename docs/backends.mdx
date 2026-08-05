@@ -154,7 +154,84 @@ the features a provider can't do:
 | In-process MCP tools | ✅ | ❌ | ❌ | ❌ (router over MCP clients) |
 | Model enumeration | ✅ | ✅ (`config/read`) | static catalog | ✅ (`/api/tags` or `/models`) |
 | Vision (image input) | ✅ | ✅ | ✅ | ❌ (model-dependent; off for now) |
+| Audio input | ❌ | ❌ | ❌ | ✅ Ollama (checked) · ⚠️ others (unverified) |
 | Provider slash commands | ✅ | ❌ | ❌ | ❌ |
+
+### Audio input — which backends, honestly
+
+The agent can drive ComfyUI's audio tools on every backend. **Hearing** an
+audio file is narrower, and the table above is deliberately conservative
+because a silently dropped attachment is worse than a refused one:
+
+- **Ollama (the `ollama` backend, native `/api/chat`) — supported, capability-
+  checked, and verified end to end.** Audio rides the `images[]` array, which
+  is Ollama's own carrier for audio rather than a hack. Confirmed live against
+  a local Ollama with `gemma4:e2b`, which transcribed a real WAV.
+  - **Per-model, not per-provider.** Before sending anything, the backend asks
+    `POST /api/show` whether *this* model reports the `audio` capability. If it
+    doesn't, the attachment is refused by name, the reported capability list is
+    quoted back to you, and you're told which models can hear
+    (`ollama pull gemma4:e2b` / `gemma4:e4b` / `nemotron3:33b`). Note `GET
+    /api/tags` also returns a `capabilities` array and is **not** the same
+    answer — the same model reported no audio there and audio from `/api/show`
+    — so only `/api/show` is consulted.
+  - The capability is re-checked on every turn that carries audio, because an
+    Ollama tag is mutable: `ollama pull` can replace the weights under the same
+    name, and a cached verdict could outlive the model it described.
+- **LM Studio / llama.cpp / OpenRouter / GLM / Kimi / Moonshot / MiniMax /
+  Copilot / custom OpenAI-compatible endpoints — attempted, NOT
+  capability-checked.** These all speak `/v1/chat/completions`,
+  which has no capability endpoint to ask, so audio is sent as an `input_audio`
+  content part and you are told, on that turn, that the delivery is
+  **unconfirmed**: *"I cannot confirm the model actually receives them — if the
+  reply does not reflect what is in the file, it did not hear it."* Refusing
+  instead would deny audio to every endpoint that simply has no capability API;
+  a guard that cannot run is not a verdict. The `input_audio` shape itself was
+  verified against Ollama's OpenAI-compatible endpoint; whether any *given*
+  third-party host honours it is not something we can check, and we don't claim
+  to.
+- **Claude, ChatGPT (Codex), Codex CLI, Gemini, Grok, Antigravity, pi** — no
+  audio input in this build. Attaching audio is refused before the turn is
+  built, and both you and the model are told, naming the provider and what
+  would work instead.
+
+  On Gemini/Grok this is a deliberate omission rather than a protocol gap: ACP
+  *does* define an `audio` ContentBlock, but it requires the agent to advertise
+  an `audio` prompt capability first, and neither CLI has been observed doing
+  so. A send path that can never be exercised, whose failure mode is an
+  attachment the user is never told did not arrive, is worse than an honest
+  refusal — so it isn't shipped.
+
+The **Blind** toggle is about *pixels*: it withholds images and does **not**
+withhold audio.
+
+#### How an audio file gets onto a turn
+
+The orchestrator accepts audio on a panel `message` frame in two ways:
+
+```jsonc
+{ "type": "message", "text": "what key is this in?",
+  "audio":  [{ "filename": "song.mp3", "type": "input" }],   // preferred
+  "images": [{ "filename": "song.mp3", "type": "input" }] }  // also routed to audio
+```
+
+The second form exists because a panel build that only knows about `images`
+would otherwise hand an audio file to a vision content part. Anything with an
+audio extension is moved to the audio path automatically — including formats we
+cannot encode (`.wma`, `.mid`, `.aiff`), so you get "convert it to one of…"
+rather than an image error.
+
+<Note>
+A **composer control** for picking an audio file lives in the panel
+(`comfyui-mcp-panel`), which is a separate repository — that part is not in this
+release. Until it lands, the wire contract above is what a client sends, and the
+route is exercised end to end from the orchestrator side.
+</Note>
+
+Only the native-Ollama path above is verified end to end, and it is the only
+one where "this model can hear" is established rather than assumed. The
+OpenAI-compatible path is an honest attempt with an honest caveat; everything
+else in this section describes a refusal, not a capability.
 
 **Conversation-rollback** (forking the chat back to a past turn) is
 Claude-only; the **code/graph** rollback (`/revert`, double-Esc, per-turn

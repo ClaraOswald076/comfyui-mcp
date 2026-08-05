@@ -574,7 +574,7 @@ export class GrokBackend implements AgentBackend {
       return this.resolvedDirect ? this.resolvedDirect.capabilities : GROK_CAPABILITIES;
     }
     const directReachable = !!this.deps.resolveGrokOAuth || existsSync(grokTokenFile);
-    return directReachable ? { ...GROK_CAPABILITIES, vision: false } : GROK_CAPABILITIES;
+    return directReachable ? { ...GROK_CAPABILITIES, vision: false, audio: false } : GROK_CAPABILITIES;
   }
 
   /**
@@ -1319,6 +1319,7 @@ const GROK_DIRECT_CAPABILITIES = {
   slashCommands: false,
   hooks: false,
   vision: false, // the 6-tool router is text-only (mirrors Ollama/ChatGPT); NeutralTurn.images unused here
+  audio: false, // xAI's audio-input contract is unverified, and an over-claim here means a SILENTLY unheard attachment (#790)
   // This adapter DOES stamp turn markers (see stampTurn in run() below), so it
   // must say so: #468's run-completion ack trusts the declaration, and a backend
   // that stamps but declares otherwise would let an unmarked straggler ack a

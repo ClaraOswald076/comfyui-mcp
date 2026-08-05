@@ -29,6 +29,24 @@ import { dirname, join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { SCENARIOS } from "./arena-scenarios.mjs";
+import { buildArenaReport } from "./arena-report.mjs";
+import { probeModelFacts } from "./arena-probe.mjs";
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+/** Our own version, stamped onto every recorded run (#792): absolute arena
+ *  scores move when the tool surface changes (the #726 consolidation), so a
+ *  result without a version can never be compared safely. When the version
+ *  can't be READ, the stamp is omitted — an unobserved version must stay
+ *  unversioned, never become a literal "unknown" that the report would treat
+ *  as a known, comparable version. */
+const MCP_VERSION = (() => {
+  try {
+    const v = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")).version;
+    return typeof v === "string" && v ? v : undefined;
+  } catch {
+    return undefined;
+  }
+})();
 
 const OLLAMA = process.env.OLLAMA_HOST ?? "http://127.0.0.1:11434";
 const MODELS = (process.env.ARENA_MODELS ?? "gemma4:e4b,gemma4:e2b,qwen3:8b,qwen3:4b,llama3.1:8b")
@@ -40,7 +58,6 @@ const MAX_ROUNDS = Number(process.env.ARENA_MAX_ROUNDS ?? 22);
  *  so the merged leaderboard can compare classes. */
 const TIER = process.env.ARENA_TIER ?? "local";
 const SCENARIO_TIMEOUT_MS = Number(process.env.ARENA_SCENARIO_TIMEOUT_MS ?? 360_000);
-const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const OUT_DIR = process.env.ARENA_OUT ?? join(process.cwd(), "arena-results");
 
 const SYSTEM =
@@ -122,6 +139,15 @@ function textOf(result) {
     .join("\n");
 }
 
+/**
+ * The #792 axes for one model, probed from Ollama AFTER its run (the model is
+ * still resident). Ollama-dialect only — a hosted endpoint has neither.
+ */
+async function probeModel(model) {
+  if (API !== "ollama") return {};
+  return probeModelFacts(OLLAMA, model);
+}
+
 async function runScenario(mcp, ollamaTools, model, scenario) {
   const messages = [
     { role: "system", content: SYSTEM },
@@ -176,9 +202,14 @@ async function runScenario(mcp, ollamaTools, model, scenario) {
         text = `MCP error: ${err.message}`;
       }
       if (name === "call_tool") {
-        const inner = args?.name ?? args?.tool_name ?? "?";
-        t.calls.push({ tool: inner, ok });
-        console.log(`      ${inner} ${ok ? "ok" : "ERR"}`);
+        const inner = args?.name ?? args?.tool_name;
+        // Only an IDENTIFIABLE selection is recorded — a malformed call_tool
+        // whose target name never parsed is not evidence about any tool's
+        // description, and must not be able to form a suspect pattern.
+        if (typeof inner === "string" && inner) {
+          t.calls.push({ tool: inner, ok });
+          console.log(`      ${inner} ${ok ? "ok" : "ERR"}`);
+        }
       }
       t.toolText += `\n${text}`;
       messages.push(toolResultMessage(tc, name, text.slice(0, 12000)));
@@ -213,6 +244,11 @@ async function runScenario(mcp, ollamaTools, model, scenario) {
     nudges: t.nudges,
     seconds: Math.round((Date.now() - started) / 1000),
     okTools,
+    // #792 methodology guard: EVERY tool the model reached for (in order,
+    // deduped), not just the ones that succeeded — a failure's wrong selection
+    // is what separates "model chose wrong" from "our description made wrong
+    // look right".
+    attemptedTools: [...new Set(t.calls.map((c) => c.tool))],
     finalAnswer: t.finalAnswer.slice(0, 400),
     transcript: messages,
   };
@@ -265,7 +301,10 @@ for (const model of MODELS) {
     );
     delete r.transcript;
   }
-  all.push({ model, tier: TIER, total, max: SCENARIOS.length * 2, results });
+  // #792 — quantization / parameter size / resident VRAM, probed while the
+  // model is still loaded; absent when the probe can't answer (never guessed).
+  const facts = await probeModel(model);
+  all.push({ model, tier: TIER, total, max: SCENARIOS.length * 2, mcpVersion: MCP_VERSION, ...facts, results });
   console.log(`  Σ ${model}: ${total}/${SCENARIOS.length * 2}`);
 }
 
@@ -298,34 +337,17 @@ all.sort(
     roundsOf(a) - roundsOf(b) ||
     secondsOf(a) - secondsOf(b),
 );
-writeFileSync(resultsPath, JSON.stringify({ gpu, scenarios: SCENARIOS.map((s) => ({ id: s.id, title: s.title, task: s.task })), leaderboard: all }, null, 2));
+writeFileSync(resultsPath, JSON.stringify({
+  gpu,
+  mcpVersion: MCP_VERSION,
+  // primary/partial ride along so the report's wrong-tool suspect analysis
+  // (#792) can be computed from this file alone, including by arena-bestof.mjs
+  // regenerating the report after a merge.
+  scenarios: SCENARIOS.map((s) => ({ id: s.id, title: s.title, task: s.task, primary: s.primary, partial: s.partial ?? [] })),
+  leaderboard: all,
+}, null, 2));
 
-const md = [];
-md.push(`# ComfyUI LLM Arena`);
-md.push("");
-md.push(
-  `Local models driving a real ComfyUI (${gpu}) through [comfyui-mcp](https://github.com/artokun/comfyui-mcp)'s ` +
-    `compact tool mode — 3 meta-tools instead of ~200 schemas, so even small models can play. ` +
-    `Each model gets the identical task set; results are verified against the ComfyUI server, not the model's claims.`,
-);
-md.push("");
-const header = ["Model", "Tier", ...SCENARIOS.map((s) => s.id), "Score", "Nudges", "Rounds", "Time"];
-md.push(`| ${header.join(" | ")} |`);
-md.push(`|${header.map(() => "---").join("|")}|`);
-const icon = { 2: "✅", 1: "🟡", 0: "❌" };
-for (const m of all) {
-  const cells = m.results.map((r) => icon[r.score]);
-  md.push(
-    `| \`${m.model}\` | ${m.tier ?? "local"} | ${cells.join(" | ")} | **${m.total}/${m.max}** | ${nudgesOf(m)} | ${roundsOf(m)} | ${secondsOf(m)}s |`,
-  );
-}
-md.push("");
-md.push(`Scenarios: ${SCENARIOS.map((s) => `**${s.id}** (${s.title.toLowerCase()})`).join(" · ")}`);
-md.push("");
-md.push(`✅ task completed & verified · 🟡 right tool, incomplete outcome · ❌ failed`);
-md.push("");
-md.push("Reproduce: `npm run build && node scripts/llm-arena.mjs` — bring your own models via `ARENA_MODELS=...`");
-writeFileSync(join(OUT_DIR, "arena-report.md"), `${md.join("\n")}\n`);
+writeFileSync(join(OUT_DIR, "arena-report.md"), buildArenaReport({ gpu, mcpVersion: MCP_VERSION, scenarios: SCENARIOS.map((s) => ({ id: s.id, title: s.title, primary: s.primary, partial: s.partial ?? [] })), leaderboard: all }));
 
 console.log(`\n══════ LEADERBOARD ══════`);
 for (const m of all) console.log(`${String(m.total).padStart(2)}/${m.max}  ${m.model}`);

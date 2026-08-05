@@ -8,6 +8,7 @@
 // interrupt, model enumeration, session resume/fork — to an injected AgentBackend.
 
 import type { ImageRef } from "./panel-agent.js";
+import type { AudioRef } from "./audio-attachment.js";
 
 export type BackendId =
   | "claude"
@@ -36,6 +37,11 @@ export interface NeutralTurn {
   text: string;
   /** ComfyUI image refs to deliver inline (vision), resolved by the backend. */
   images?: ImageRef[];
+  /** ComfyUI audio refs to deliver inline (hearing, #790), resolved by the
+   *  backend. Only reaches a backend whose `AgentCapabilities.audio` is true —
+   *  PanelAgent refuses centrally (and visibly) for the rest, so an audio-less
+   *  adapter can never receive an attachment it would quietly discard. */
+  audio?: AudioRef[];
 }
 
 /**
@@ -62,6 +68,22 @@ export interface AgentCapabilities {
   /** Accepts inline image input in a user turn (vision). When false, image refs
    *  the panel sends are ignored by the backend (text-only). */
   vision: boolean;
+  /**
+   * This backend has an audio content part IMPLEMENTED for its wire protocol
+   * (#790). It is a statement about OUR code, not about any model: whether the
+   * selected model can actually hear is established per-turn by the backend
+   * (Ollama `/api/show` capabilities; the ACP `audio` prompt capability), and a
+   * model that cannot gets an explicit refusal naming what would work.
+   *
+   * false is the honest default for an adapter with no audio part at all —
+   * PanelAgent then refuses the attachment centrally and tells the user AND the
+   * model, rather than letting the bytes vanish into a text-only turn.
+   *
+   * Optional so an out-of-tree backend that omits it is treated as audio-less,
+   * which is the only safe reading: the failure mode of a wrong `true` is a
+   * silently unheard attachment.
+   */
+  audio?: boolean;
   /**
    * Stamps the #728 TURN MARKER (`AgentEvent.turn`) on the events it emits for a
    * submitted turn. DECLARED, never inferred: #468's run-completion ack requires
@@ -201,6 +223,8 @@ export interface BackendStartOptions {
 
 export interface SendMeta {
   images?: ImageRef[];
+  /** Audio attachments for this turn (#790). */
+  audio?: AudioRef[];
   title?: string;
   mid?: string;
 }
@@ -253,6 +277,7 @@ export const CLAUDE_CAPABILITIES: AgentCapabilities = {
   slashCommands: true,
   hooks: true,
   vision: true, // resolves image refs to inline base64 blocks (shapeTurn)
+  audio: false, // the Anthropic Messages API has no audio input block (#790)
   turnMarkers: true, // claude-backend stamps every event from the #745 per-turn trace FIFO
 };
 
@@ -267,6 +292,7 @@ export const CODEX_CAPABILITIES: AgentCapabilities = {
   slashCommands: false,
   hooks: false,
   vision: true, // gpt-5.5 sees images; delivered as `localImage` turn input items
+  audio: false, // codex app-server turn input accepts text + localImage only (#790)
   turnMarkers: true, // stampTurn() wraps each per-turn stream
 };
 
@@ -285,6 +311,14 @@ export const GEMINI_CAPABILITIES: AgentCapabilities = {
   slashCommands: false,
   hooks: false,
   vision: true, // gemini-2.5 sees images; delivered as inline base64 image ContentBlocks
+  // ACP defines an `audio` ContentBlock and requires the agent to advertise the
+  // `audio` prompt capability before a client may send one. Neither CLI has been
+  // observed advertising it, so the send path could never be exercised — and its
+  // failure mode (session/prompt rejecting after the bytes were attached) would
+  // surface as a generic error, i.e. an attachment the user is never told did not
+  // arrive. Shipping that is the overclaim #790 exists to remove, so this is false
+  // and the attachment is refused centrally, naming a path that works.
+  audio: false,
   turnMarkers: true, // stampTurn() wraps each per-turn stream
 };
 
@@ -306,6 +340,7 @@ export const ANTIGRAVITY_CAPABILITIES: AgentCapabilities = {
   slashCommands: false,
   hooks: false,
   vision: false, // no documented image input in -p mode
+  audio: false, // `agy -p` has no documented media input at all (#790)
   turnMarkers: true, // stampTurn() wraps each per-turn stream
 };
 
@@ -328,6 +363,7 @@ export const PI_CAPABILITIES: AgentCapabilities = {
   slashCommands: false,
   hooks: false,
   vision: false, // no documented headless image input
+  audio: false, // pi's JSON mode has no documented media input (#790)
   turnMarkers: true, // stampTurn() wraps each per-turn stream
 };
 
@@ -344,6 +380,14 @@ export const GROK_CAPABILITIES: AgentCapabilities = {
   slashCommands: false,
   hooks: false,
   vision: true,
+  // ACP defines an `audio` ContentBlock and requires the agent to advertise the
+  // `audio` prompt capability before a client may send one. Neither CLI has been
+  // observed advertising it, so the send path could never be exercised — and its
+  // failure mode (session/prompt rejecting after the bytes were attached) would
+  // surface as a generic error, i.e. an attachment the user is never told did not
+  // arrive. Shipping that is the overclaim #790 exists to remove, so this is false
+  // and the attachment is refused centrally, naming a path that works.
+  audio: false,
   turnMarkers: true, // stampTurn() wraps each per-turn stream
 };
 
@@ -367,6 +411,7 @@ export const OLLAMA_CAPABILITIES: AgentCapabilities = {
   slashCommands: false,
   hooks: false,
   vision: true, // attempted for every model; graceful strip-and-retry on rejection
+  audio: true, // native /api/chat images[] and openai input_audio, both live-verified; per-model gate via /api/show (#790)
   turnMarkers: true, // stampTurn() wraps each per-turn stream
 };
 
@@ -382,6 +427,7 @@ export const CHATGPT_CAPABILITIES: AgentCapabilities = {
   slashCommands: false,
   hooks: false,
   vision: true, // Responses input_image data URLs; strip-and-retry on rejection (#218)
+  audio: false, // the Codex Responses models take input_text/input_image only (#790)
   turnMarkers: true, // stampTurn() wraps each per-turn stream
 };
 

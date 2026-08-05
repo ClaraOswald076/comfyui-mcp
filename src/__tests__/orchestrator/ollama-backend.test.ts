@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { OllamaBackend, comfyuiSpawnEnv, isOllamaModel, type McpToolClient } from "../../orchestrator/ollama-backend.js";
+import {
+  OllamaBackend,
+  comfyuiSpawnEnv,
+  comfyuiSpawnToolMode,
+  acceptsModelId,
+  isOllamaModel,
+  ollamaSystemPrompt,
+  type McpToolClient,
+} from "../../orchestrator/ollama-backend.js";
 import { PANEL_TOOL_MCP_TIMEOUT_MS, __panelAskTestHooks } from "../../orchestrator/panel-tools.js";
 import type { AgentEvent, NeutralTurn } from "../../orchestrator/agent-backend.js";
 
@@ -569,7 +577,10 @@ describe("inline image delivery (per-model vision, graceful degradation)", () =>
     };
     expect(first.images).toHaveLength(1);
     expect(second.images).toBeUndefined();
-    expect(second.content).toContain("rejected image input");
+    // Model-facing note: it must be told it received NOTHING, in the wording
+    // that also covers a mixed image+audio strip (#790).
+    expect(second.content).toContain("did NOT receive them");
+    expect(second.content).toContain("did not see any image");
     // the user was told, and the turn still completed successfully
     const notes = events.filter((e) => e.type === "assistant").map((e) => (e as { text: string }).text);
     expect(notes.some((t) => t.includes("rejected image input"))).toBe(true);
@@ -605,6 +616,86 @@ describe("inline image delivery (per-model vision, graceful degradation)", () =>
   });
 });
 
+describe("the system prompt describes the surface that was actually advertised (#788)", () => {
+  it("compact says six tools and routes through call_tool", () => {
+    const p = ollamaSystemPrompt("compact");
+    expect(p).toContain("exactly six tools");
+    expect(p).toContain("list_tools / describe_tool / call_tool");
+  });
+
+  it("FULL does NOT claim there are six tools, nor that comfyui goes through the router", () => {
+    // Auto-selecting full while telling the model the tools do not exist would
+    // make the new selection worse than the old default: the model keeps calling
+    // a router that is no longer the way in.
+    const p = ollamaSystemPrompt("full");
+    expect(p).not.toContain("exactly six tools");
+    expect(p).toContain("advertised to you DIRECTLY");
+    // The panel router IS still a router, and must still be described as one.
+    expect(p).toContain("panel_list_tools");
+    // No tool COUNT is stated for the full surface (#726 rewrites it).
+    expect(p).not.toMatch(/\d+\s*(comfyui )?tools are advertised/i);
+  });
+
+  it("both modes keep the same operating rules", () => {
+    for (const mode of ["compact", "full"] as const) {
+      expect(ollamaSystemPrompt(mode)).toContain("never invent results");
+      expect(ollamaSystemPrompt(mode)).toContain("PAID credits");
+    }
+  });
+});
+
+describe("acceptsModelId — a live switch must not be silently ignored (#788)", () => {
+  it("takes any id the OpenAI-compatible endpoint's own catalog can return", () => {
+    // LM Studio and friends name models whatever they like: `local-model-70b`
+    // has neither a colon nor a slash. Refusing those meant the picker recorded
+    // and displayed the new model while the backend kept running the old one on
+    // the old tool surface — the wrong-model confusion model-keyed selection is
+    // supposed to prevent.
+    expect(acceptsModelId("local-model-70b", "openai")).toBe(true);
+    expect(acceptsModelId("Meta-Llama-3.1-405B-Instruct", "openai")).toBe(true);
+    expect(acceptsModelId("deepseek/deepseek-v4-pro", "openai")).toBe(true);
+  });
+
+  it("keeps the Ollama-tag shape rule on the NATIVE dialect", () => {
+    expect(acceptsModelId("qwen3:4b", "ollama")).toBe(true);
+    expect(acceptsModelId("artokun/gemma4-comfyui-mcp:e4b", "ollama")).toBe(true);
+    expect(acceptsModelId("local-model-70b", "ollama")).toBe(false); // not a tag
+  });
+
+  it("still refuses the hosted frontier ids PanelAgent passes through, on BOTH dialects", () => {
+    // This is the one thing the guard actually exists for.
+    for (const api of ["ollama", "openai"] as const) {
+      expect(acceptsModelId("claude-opus-5", api)).toBe(false);
+      expect(acceptsModelId("gpt-5.6-terra", api)).toBe(false);
+      expect(acceptsModelId("gemini-3-pro", api)).toBe(false);
+      expect(acceptsModelId("", api)).toBe(false);
+      expect(acceptsModelId("   ", api)).toBe(false);
+    }
+  });
+
+  it("gpt-oss is local, on both dialects", () => {
+    expect(acceptsModelId("gpt-oss:120b", "ollama")).toBe(true);
+    expect(acceptsModelId("gpt-oss-120b", "openai")).toBe(true);
+  });
+});
+
+describe("isOllamaModel — gpt-oss is a LOCAL family, not a hosted OpenAI model", () => {
+  it("accepts gpt-oss tags so a live switch to one actually takes effect (#788)", () => {
+    // #788 names gpt-oss:120b as a model that auto-selects the full surface. A
+    // blanket ^gpt exclusion refused the switch, leaving the panel showing one
+    // model while the backend ran another — wrong-model confusion exactly where
+    // model-keyed selection is the promise.
+    expect(isOllamaModel("gpt-oss:120b")).toBe(true);
+    expect(isOllamaModel("gpt-oss:20b")).toBe(true);
+  });
+
+  it("still refuses the hosted OpenAI/Claude/Gemini ids the guard exists for", () => {
+    expect(isOllamaModel("gpt-5.6-terra")).toBe(false);
+    expect(isOllamaModel("claude-opus-5")).toBe(false);
+    expect(isOllamaModel("gemini-3-pro")).toBe(false);
+  });
+});
+
 describe("comfyuiSpawnEnv (#667)", () => {
   // The ollama path spawns the headless comfyui MCP COMPACT by default (small
   // local models choke on the full ~200-schema list), but an EXPLICIT user
@@ -630,6 +721,40 @@ describe("comfyuiSpawnEnv (#667)", () => {
   it("unset env AND no spec mode gets the documented compact default", () => {
     const env = comfyuiSpawnEnv(undefined, {});
     expect(env.COMFYUI_MCP_TOOL_MODE).toBe("compact");
+  });
+
+  // #788 — with nobody having chosen, the MODEL decides rather than the provider.
+  it("a LARGE local model gets the full surface when nobody has chosen (#788)", () => {
+    expect(comfyuiSpawnEnv(undefined, {}, "llama3.3:70b").COMFYUI_MCP_TOOL_MODE).toBe("full");
+    const d = comfyuiSpawnToolMode(undefined, {}, "llama3.3:70b");
+    // The REASON matters: the same "full" would also come out of an override.
+    expect(d.source).toBe("model-parameters");
+  });
+
+  it("a SMALL local model keeps compact, attributed to the model (#788)", () => {
+    expect(comfyuiSpawnEnv(undefined, {}, "qwen3:4b").COMFYUI_MCP_TOOL_MODE).toBe("compact");
+    expect(comfyuiSpawnToolMode(undefined, {}, "qwen3:4b").source).toBe("model-parameters");
+  });
+
+  it("an explicit user choice still beats the model rule, in BOTH directions (#788)", () => {
+    expect(
+      comfyuiSpawnEnv(undefined, { COMFYUI_MCP_TOOL_MODE: "compact" }, "llama3.3:70b").COMFYUI_MCP_TOOL_MODE,
+    ).toBe("compact");
+    expect(comfyuiSpawnToolMode(undefined, { COMFYUI_MCP_TOOL_MODE: "compact" }, "llama3.3:70b").source).toBe(
+      "user-explicit",
+    );
+    expect(comfyuiSpawnEnv(undefined, { COMFYUI_MCP_TOOL_MODE: "full" }, "qwen3:4b").COMFYUI_MCP_TOOL_MODE).toBe(
+      "full",
+    );
+    expect(comfyuiSpawnToolMode(undefined, { COMFYUI_MCP_TOOL_MODE: "full" }, "qwen3:4b").source).toBe(
+      "user-explicit",
+    );
+  });
+
+  it("a spec-pinned mode (the HTTP lane's #291 value) still outranks the model rule", () => {
+    const d = comfyuiSpawnToolMode({ COMFYUI_MCP_TOOL_MODE: "compact" }, {}, "llama3.3:70b");
+    expect(d.mode).toBe("compact");
+    expect(d.source).toBe("caller-explicit");
   });
 });
 
@@ -764,5 +889,27 @@ describe("panel_ask survives a slow human answer (#325)", () => {
     // timeout must exceed BOTH or one can still be killed client-side mid-answer.
     expect(PANEL_TOOL_MCP_TIMEOUT_MS).toBeGreaterThan(__panelAskTestHooks.ASK_TOTAL_BUDGET_CAP_MS);
     expect(PANEL_TOOL_MCP_TIMEOUT_MS).toBeGreaterThan(300_000);
+  });
+});
+
+describe("panel-router retraction rides the mode-varying prompt (main↔#788 merge seam)", () => {
+  it("no panel router → the system prompt retracts the panel tools; router present → no retraction", async () => {
+    const { client: comfy } = fakeMcpClient(COMFY_META);
+    // Without a panel client the three panel_* routers don't exist — the prompt
+    // must say so rather than promise them (#841 lineage, kept through the merge).
+    let backend = new OllamaBackend({ model: "gemma4:e4b", connectToolClients: async () => ({ comfyui: comfy }) });
+    chatScript.push([{ message: { content: "hi" }, done: true }]);
+    await collect(backend, turnsOf({ text: "hello" }));
+    let sys = chatRequests.at(-1)!.messages[0] as { role: string; content: string };
+    expect(sys.role).toBe("system");
+    expect(sys.content).toContain("CORRECTION");
+    expect(sys.content).toContain("DO NOT EXIST");
+
+    const { client: panel } = fakeMcpClient([{ name: "panel_run", description: "Run." }]);
+    backend = new OllamaBackend({ model: "gemma4:e4b", connectToolClients: async () => ({ comfyui: comfy, panel }) });
+    chatScript.push([{ message: { content: "hi" }, done: true }]);
+    await collect(backend, turnsOf({ text: "hello" }));
+    sys = chatRequests.at(-1)!.messages[0] as { role: string; content: string };
+    expect(sys.content).not.toContain("CORRECTION");
   });
 });
